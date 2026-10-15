@@ -89,9 +89,7 @@ pub fn from_user_access(e: UserAccessError) -> KError {
         // "the user pointer was not usable".
         UserAccessError::BadAddress | UserAccessError::Fault => KError::FaultFromUser,
         // Misalignment / missing terminator are malformed arguments.
-        UserAccessError::Misaligned | UserAccessError::NoTerminator => {
-            KError::InvalidArgument
-        }
+        UserAccessError::Misaligned | UserAccessError::NoTerminator => KError::InvalidArgument,
     }
 }
 
@@ -147,9 +145,6 @@ mod tests {
         assert_eq!(from_user_access(UserAccessError::BadAddress), KError::FaultFromUser);
         assert_eq!(from_user_access(UserAccessError::Fault), KError::FaultFromUser);
         assert_eq!(from_user_access(UserAccessError::Misaligned), KError::InvalidArgument);
-        assert_eq!(
-            from_user_access(UserAccessError::NoTerminator),
-            KError::InvalidArgument
-        );
+        assert_eq!(from_user_access(UserAccessError::NoTerminator), KError::InvalidArgument);
     }
 }

@@ -698,11 +698,7 @@ impl Theme {
                 // TOML string, so a bare one is a file this reader and a real TOML reader
                 // disagree about — and `unquote` accepts a bare value, which is what makes the
                 // check explicit here rather than implied.
-                "font_ui" | "font_mono" | "wallpaper" | "wallpaper_mode"
-                    if !raw.starts_with('"') =>
-                {
-                    false
-                }
+                "font_ui" | "font_mono" | "wallpaper" | "wallpaper_mode" if !raw.starts_with('"') => false,
                 "font_ui" => set_path(&mut t.font_ui, value),
                 "font_mono" => set_path(&mut t.font_mono, value),
                 // **An empty string is "no wallpaper", not a bad path.** `to_config` writes one
@@ -1061,9 +1057,7 @@ mod tests {
 
     #[test]
     fn a_file_overrides_what_it_names_and_nothing_else() {
-        let (t, issues) = Theme::from_config(
-            "# my theme\nbackground = \"#102030\"\n\nfont_px = 13.5   # smaller\n",
-        );
+        let (t, issues) = Theme::from_config("# my theme\nbackground = \"#102030\"\n\nfont_px = 13.5   # smaller\n");
         assert_eq!(t.background, Rgb::new(0x10, 0x20, 0x30));
         assert_eq!(t.font_px, 13.5);
         assert_eq!(t.face, Theme::light().face, "a key the file did not name keeps its default");
@@ -1111,9 +1105,9 @@ mod tests {
         // and `trim_matches('"')` made that false in two ways nobody would notice until a real
         // parser read the file back (PR #263 review, optional 3).
         for bad in [
-            "background = \"#102030",   // one quote
-            "background = #102030\"",   // the other
-            "font_px = \"14\"",         // TOML types this as a string, not a number
+            "background = \"#102030", // one quote
+            "background = #102030\"", // the other
+            "font_px = \"14\"",       // TOML types this as a string, not a number
         ] {
             let (t, issues) = Theme::from_config(bad);
             assert_eq!(t, Theme::light(), "{bad:?} changed something");
@@ -1299,18 +1293,10 @@ mod tests {
 
         // **Bare is refused**, the mirror of `font_px` refusing quotes: a path is a TOML string,
         // and a file this reader accepts must be a file a TOML reader agrees with.
-        for bad in [
-            "font_ui = /home/Fancy.ttf\n",
-            "font_ui = \"Fancy.ttf\"\n",
-            "font_mono = \"\"\n",
-        ] {
+        for bad in ["font_ui = /home/Fancy.ttf\n", "font_ui = \"Fancy.ttf\"\n", "font_mono = \"\"\n"] {
             let (t, issues) = Theme::from_config(bad);
             assert_eq!(t, Theme::light(), "{bad:?} left the theme alone");
-            assert_eq!(
-                issues,
-                [Issue { line: 1, kind: IssueKind::BadValue }],
-                "{bad:?} was named as a bad value"
-            );
+            assert_eq!(issues, [Issue { line: 1, kind: IssueKind::BadValue }], "{bad:?} was named as a bad value");
         }
     }
 
@@ -1382,10 +1368,7 @@ mod tests {
 
         // **Order does not matter**, in either direction: an override above the scheme line is
         // not thrown away by it, and one below is not either.
-        for text in [
-            "accent = \"#102030\"\nscheme = \"dark\"\n",
-            "scheme = \"dark\"\naccent = \"#102030\"\n",
-        ] {
+        for text in ["accent = \"#102030\"\nscheme = \"dark\"\n", "scheme = \"dark\"\naccent = \"#102030\"\n"] {
             let (t, issues) = Theme::from_config(text);
             assert!(issues.is_empty(), "{text:?} {issues:?}");
             assert_eq!(t.accent, Rgb::new(0x10, 0x20, 0x30), "{text:?}");

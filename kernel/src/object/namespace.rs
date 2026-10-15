@@ -27,11 +27,11 @@
 use crate::libkern::handle::{
     KObjectType, NS_ENTRY_PATH_MAX, NS_KIND_DIRECT, NS_KIND_KERNEL, NS_KIND_MOUNT, NsEntry, Rights,
 };
+use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
 use crate::object::kernel_server::KernelServerId;
-use crate::libkern::lockrank::LockRank;
 
 /// Maximum namespace path length in bytes (see the design doc § Path grammar).
 pub const NS_PATH_MAX: usize = 1024;
@@ -211,12 +211,7 @@ impl Namespace {
     /// path; on any error the `target` is **handed back** in the tuple so the
     /// caller drops it outside the lock (never dropped here — see "Mutation
     /// discipline").
-    pub fn bind(
-        &self,
-        path: &[u8],
-        target: ObjectRef,
-        rights: Rights,
-    ) -> Result<(), (ObjectRef, NsError)> {
+    pub fn bind(&self, path: &[u8], target: ObjectRef, rights: Rights) -> Result<(), (ObjectRef, NsError)> {
         if let Err(e) = validate_path(path) {
             return Err((target, e));
         }
@@ -237,11 +232,7 @@ impl Namespace {
         }
         guard
             .bindings
-            .try_push(Binding {
-                path: p,
-                target: BindingTarget::DirectHandle(target),
-                rights,
-            })
+            .try_push(Binding { path: p, target: BindingTarget::DirectHandle(target), rights })
             .expect("slot reserved above");
         // A mutation may change what any cached path resolves to; flush the whole
         // cache (cheap: byte-only `KVec`s, no `ObjectRef` drops). Mutations are rare.
@@ -256,12 +247,7 @@ impl Namespace {
     /// exact path.
     ///
     /// [`bind`]: Namespace::bind
-    pub fn bind_kernel_server(
-        &self,
-        path: &[u8],
-        id: KernelServerId,
-        rights: Rights,
-    ) -> Result<(), NsError> {
+    pub fn bind_kernel_server(&self, path: &[u8], id: KernelServerId, rights: Rights) -> Result<(), NsError> {
         validate_path(path)?;
         let mut guard = self.inner.lock();
         if guard.bindings.iter().any(|b| &b.path[..] == path) {
@@ -279,11 +265,7 @@ impl Namespace {
         }
         guard
             .bindings
-            .try_push(Binding {
-                path: p,
-                target: BindingTarget::KernelServer(id),
-                rights,
-            })
+            .try_push(Binding { path: p, target: BindingTarget::KernelServer(id), rights })
             .expect("slot reserved above");
         guard.cache.clear();
         Ok(())
@@ -325,11 +307,7 @@ impl Namespace {
         }
         guard
             .bindings
-            .try_push(Binding {
-                path: p,
-                target: BindingTarget::UserspaceServer(reg, base),
-                rights,
-            })
+            .try_push(Binding { path: p, target: BindingTarget::UserspaceServer(reg, base), rights })
             .expect("slot reserved above");
         guard.cache.clear();
         Ok(())
@@ -371,15 +349,10 @@ impl Namespace {
 
         // Cache fast path: an exact prior lookup of this path. The cached index is
         // valid (mutations flush the cache), so recompute the suffix and return.
-        if let Some(idx) = guard
-            .cache
-            .iter()
-            .find(|e| &e.path[..] == path)
-            .map(|e| e.binding_index)
-        {
+        if let Some(idx) = guard.cache.iter().find(|e| &e.path[..] == path).map(|e| e.binding_index) {
             let b = &guard.bindings[idx];
-            let off = match_suffix_offset(&b.path, path)
-                .expect("a cached binding still prefix-matches its cached path");
+            let off =
+                match_suffix_offset(&b.path, path).expect("a cached binding still prefix-matches its cached path");
             return Some((resolve_target(&b.target), b.rights, &path[off..]));
         }
 
@@ -520,9 +493,7 @@ fn resolve_target(t: &BindingTarget) -> ResolvedTarget {
     match t {
         BindingTarget::DirectHandle(obj) => ResolvedTarget::DirectHandle(obj.clone()),
         BindingTarget::KernelServer(id) => ResolvedTarget::KernelServer(*id),
-        BindingTarget::UserspaceServer(reg, base) => {
-            ResolvedTarget::UserspaceServer(reg.clone(), *base)
-        }
+        BindingTarget::UserspaceServer(reg, base) => ResolvedTarget::UserspaceServer(reg.clone(), *base),
     }
 }
 
@@ -541,9 +512,7 @@ fn copy_bindings(from: &KVec<Binding>, into: &mut KVec<Binding>) -> Result<(), A
         let target = match &b.target {
             BindingTarget::DirectHandle(obj) => BindingTarget::DirectHandle(obj.clone()),
             BindingTarget::KernelServer(id) => BindingTarget::KernelServer(*id),
-            BindingTarget::UserspaceServer(reg, base) => {
-                BindingTarget::UserspaceServer(reg.clone(), *base)
-            }
+            BindingTarget::UserspaceServer(reg, base) => BindingTarget::UserspaceServer(reg.clone(), *base),
         };
         into.try_push(Binding { path, target, rights: b.rights }).expect("slot reserved above");
     }
@@ -583,10 +552,7 @@ mod tests {
     fn target() -> ObjectRef {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut (),
-                KObjectType::Timer,
-            )
+            ObjectRef::from_raw(KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut (), KObjectType::Timer)
         }
     }
 
@@ -601,8 +567,7 @@ mod tests {
         let n = ns();
         // A DirectHandle binding, then a KernelServer binding (insertion order).
         n.bind(b"/store", target(), Rights::LOOKUP | Rights::INSPECT).unwrap();
-        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
-            .unwrap();
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ).unwrap();
 
         let mut e = NsEntry::zeroed();
         assert!(n.enumerate(0, &mut e));
@@ -625,12 +590,12 @@ mod tests {
         assert!(validate_path(b"/dev/log").is_ok());
         for bad in [
             &b""[..],
-            b"dev",      // relative
-            b"/dev/",    // trailing slash
-            b"//dev",    // empty component
-            b"/./x",     // dot
-            b"/../x",    // dotdot
-            b"/a//b",    // empty interior component
+            b"dev",   // relative
+            b"/dev/", // trailing slash
+            b"//dev", // empty component
+            b"/./x",  // dot
+            b"/../x", // dotdot
+            b"/a//b", // empty interior component
         ] {
             assert_eq!(validate_path(bad), Err(NsError::InvalidPath), "{bad:?}");
         }
@@ -809,8 +774,7 @@ mod tests {
     #[test]
     fn bind_kernel_server_resolves_to_the_id() {
         let n = ns();
-        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
-            .unwrap();
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ).unwrap();
         // Exact match → empty suffix, the kernel-server target, its rights.
         let (target, rights, suf) = n.resolve(b"/dev/entropy").unwrap();
         assert_eq!(suf, b"");
@@ -831,12 +795,8 @@ mod tests {
     #[test]
     fn bind_kernel_server_rejects_invalid_and_duplicate() {
         let n = ns();
-        assert_eq!(
-            n.bind_kernel_server(b"bad", KernelServerId::Entropy, Rights::READ),
-            Err(NsError::InvalidPath)
-        );
-        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
-            .unwrap();
+        assert_eq!(n.bind_kernel_server(b"bad", KernelServerId::Entropy, Rights::READ), Err(NsError::InvalidPath));
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ).unwrap();
         assert_eq!(
             n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ),
             Err(NsError::AlreadyBound)
@@ -847,16 +807,9 @@ mod tests {
     fn direct_and_kernel_server_bindings_coexist() {
         let n = ns();
         n.bind(b"/dev/log", target(), Rights::LOOKUP).unwrap();
-        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
-            .unwrap();
-        assert!(matches!(
-            n.resolve(b"/dev/log").unwrap().0,
-            ResolvedTarget::DirectHandle(_)
-        ));
-        assert!(matches!(
-            n.resolve(b"/dev/entropy").unwrap().0,
-            ResolvedTarget::KernelServer(_)
-        ));
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ).unwrap();
+        assert!(matches!(n.resolve(b"/dev/log").unwrap().0, ResolvedTarget::DirectHandle(_)));
+        assert!(matches!(n.resolve(b"/dev/entropy").unwrap().0, ResolvedTarget::KernelServer(_)));
     }
 
     /// A live `UserspaceServerReg` (owning a fresh IPC endpoint), adopted into an
@@ -865,32 +818,18 @@ mod tests {
         use crate::object::{IpcChannel, UserspaceServerReg};
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
         // SAFETY: adopt the kernel endpoint's creation reference; drop the peer's.
-        let endpoint = unsafe {
-            ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel)
-        };
-        drop(unsafe {
-            ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel)
-        });
+        let endpoint = unsafe { ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel) };
+        drop(unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel) });
         let reg = UserspaceServerReg::try_new(endpoint).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(reg).as_ptr() as *mut (),
-                KObjectType::UserspaceServerReg,
-            )
-        }
+        unsafe { ObjectRef::from_raw(KBox::into_raw(reg).as_ptr() as *mut (), KObjectType::UserspaceServerReg) }
     }
 
     #[test]
     fn bind_userspace_server_resolves_to_the_registration() {
         let n = ns();
-        n.bind_userspace_server(
-            b"/fs",
-            us_reg_target(),
-            Rights::LOOKUP | Rights::MAP_READ,
-            SubtreeBase::empty(),
-        )
-        .unwrap();
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP | Rights::MAP_READ, SubtreeBase::empty())
+            .unwrap();
         // Exact match → empty suffix, the userspace-server target, its rights.
         let (target, rights, suf) = n.resolve(b"/fs").unwrap();
         assert_eq!(suf, b"");
@@ -932,8 +871,7 @@ mod tests {
     fn bind_userspace_server_carries_subtree_base() {
         let n = ns();
         let base = SubtreeBase::from_path(b"/home/alice").unwrap();
-        n.bind_userspace_server(b"/home", us_reg_target(), Rights::LOOKUP | Rights::WRITE, base)
-            .unwrap();
+        n.bind_userspace_server(b"/home", us_reg_target(), Rights::LOOKUP | Rights::WRITE, base).unwrap();
         // Resolving through the binding carries the base out to the caller (which
         // prepends it to the suffix before forwarding). The suffix itself is
         // unchanged — the join is the syscall layer's job.
@@ -985,10 +923,7 @@ mod tests {
         assert_eq!(ssuf, b"current-generation");
 
         match (direct, scoped) {
-            (
-                ResolvedTarget::UserspaceServer(a, abase),
-                ResolvedTarget::UserspaceServer(b, bbase),
-            ) => {
+            (ResolvedTarget::UserspaceServer(a, abase), ResolvedTarget::UserspaceServer(b, bbase)) => {
                 // True by construction (see the doc comment) — stated, not checked.
                 assert_eq!(a.as_ptr() as usize, addr);
                 assert_eq!(b.as_ptr() as usize, addr);
@@ -1005,18 +940,15 @@ mod tests {
     fn bind_userspace_server_hands_back_target_on_error() {
         let n = ns();
         // Invalid path: the registration ref is handed back to drop outside the lock.
-        let (t, e) = n
-            .bind_userspace_server(b"bad", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
-            .unwrap_err();
+        let (t, e) =
+            n.bind_userspace_server(b"bad", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap_err();
         assert_eq!(e, NsError::InvalidPath);
         assert_eq!(t.object_type(), KObjectType::UserspaceServerReg);
         drop(t);
         // Duplicate exact path.
-        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
-            .unwrap();
-        let (t, e) = n
-            .bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
-            .unwrap_err();
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap();
+        let (t, e) =
+            n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap_err();
         assert_eq!(e, NsError::AlreadyBound);
         drop(t);
     }
@@ -1024,8 +956,7 @@ mod tests {
     #[test]
     fn unbind_userspace_server_returns_the_registration_ref() {
         let n = ns();
-        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
-            .unwrap();
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap();
         match n.unbind(b"/fs").expect("was bound") {
             BindingTarget::UserspaceServer(reg, _) => {
                 assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
@@ -1039,8 +970,7 @@ mod tests {
     #[test]
     fn unbind_kernel_server_returns_drop_free_target() {
         let n = ns();
-        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
-            .unwrap();
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ).unwrap();
         match n.unbind(b"/dev/entropy").expect("was bound") {
             BindingTarget::KernelServer(id) => assert_eq!(id, KernelServerId::Entropy),
             BindingTarget::DirectHandle(_) | BindingTarget::UserspaceServer(..) => {
@@ -1123,8 +1053,7 @@ mod tests {
         let n = Namespace::try_new().unwrap();
         n.bind(b"/a", target(), Rights::LOOKUP).unwrap();
         n.bind(b"/b", target(), Rights::LOOKUP).unwrap();
-        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
-            .unwrap();
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap();
         let d = n.try_derive().unwrap();
 
         drop(n);

@@ -7,10 +7,10 @@ use libinittoml::manifest::{self, Mode};
 use libkern::device::{DeviceKind, DeviceRecord, NO_PARENT};
 use libstream::wire::{Table, Value};
 
-use crate::probe::{Found, fat_label, probe};
-use crate::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot, partuuid, source_device};
 use crate::labels;
 use crate::mounts::{EjectRefusal, Plan, Refusal, Server, at, automount, eject, explicit, in_use};
+use crate::probe::{Found, fat_label, probe};
+use crate::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot, partuuid, source_device};
 use crate::suffix::{self, Asked, session_only};
 use crate::table::{self, By, Device, Mounted};
 
@@ -215,11 +215,7 @@ fn an_ext4_its_server_would_refuse_is_nothing() {
 
 #[test]
 fn fat_and_nothing_are_found_on_a_device() {
-    let esp = Found::Fat {
-        label: String::from("NITROX_ESP"),
-        clean: Some(true),
-        refused: Some(String::from(SMALL)),
-    };
+    let esp = Found::Fat { label: String::from("NITROX_ESP"), clean: Some(true), refused: Some(String::from(SMALL)) };
     assert_eq!(probe(&with_sector(FAT32)), esp, "the image builder's ESP, which fs-server-fat refuses");
     assert_eq!(probe(&with_sector(PROTECTIVE_MBR)), Found::Nothing);
     assert_eq!(probe(&Image(RefCell::new(std::vec![0u8; 8192]))), Found::Nothing);
@@ -410,7 +406,9 @@ fn a_label_is_printable_ascii_a_person_can_type() {
     for ok in ["nitrox-root", "NITROX_ESP", "My Disk", "a", &"x".repeat(labels::MAX)] {
         assert!(labels::valid(ok), "{ok:?}");
     }
-    for bad in ["", ".hidden", "..", " lead", "trail ", "a/b", "tab\there", "\u{7f}", "ümlaut", &"x".repeat(labels::MAX + 1)] {
+    for bad in
+        ["", ".hidden", "..", " lead", "trail ", "a/b", "tab\there", "\u{7f}", "ümlaut", &"x".repeat(labels::MAX + 1)]
+    {
         assert!(!labels::valid(bad), "{bad:?}");
     }
 }
@@ -513,7 +511,10 @@ fn the_installers_source_is_passed_over_and_nothing_else() {
         std::vec![
             dev(rec(3, DeviceKind::Disk, 0, 1, "QEMU HARDDISK", 1_048_576), Found::Nothing),
             dev(rec(5, DeviceKind::RamDisk, 1, NO_PARENT, "root.img", 57_344), Found::Nothing),
-            dev(rec(6, DeviceKind::RamDisk, 2, NO_PARENT, "install-esp.img", 67_584), Found::Fat { label: String::new(), clean: Some(true), refused: Some(String::from(SMALL)) }),
+            dev(
+                rec(6, DeviceKind::RamDisk, 2, NO_PARENT, "install-esp.img", 67_584),
+                Found::Fat { label: String::new(), clean: Some(true), refused: Some(String::from(SMALL)) }
+            ),
             dev(rec(7, DeviceKind::RamDisk, 3, NO_PARENT, "install-root.img", 24_576), Found::Nothing),
             dev(rec(8, DeviceKind::Partition, 4, 3, "nitrox-root", 196_541), ext4("")),
             dev(rec(9, DeviceKind::Partition, 5, 5, "nitrox-live", 53_248), ext4("")),
@@ -595,7 +596,11 @@ fn an_administrators_mount_is_refused_for_each_reason() {
     ];
     assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-9", ""), Err(Refusal::NoSuchDevice));
     assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-3", ""), Err(Refusal::AlreadyMounted), "init's root");
-    assert_eq!(explicit(&ds, &mounted, &[], true, true, "blk-4", ""), Err(Refusal::AlreadyMounted), "the service's own");
+    assert_eq!(
+        explicit(&ds, &mounted, &[], true, true, "blk-4", ""),
+        Err(Refusal::AlreadyMounted),
+        "the service's own"
+    );
     assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-2", ""), Err(Refusal::NothingToServe), "FAT");
     assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-0", ""), Err(Refusal::NothingToServe), "a disk");
     assert_eq!(explicit(&ds, &init_root(), &[], true, true, "blk-4", ".x"), Err(Refusal::BadLabel));
@@ -620,7 +625,10 @@ fn nothing_on_the_boot_medium_is_mounted_and_its_disk_is_in_use() {
     stick.flags |= libkern::device::BOOT;
     let ds = std::vec![
         dev(stick, Found::Nothing),
-        dev(rec(21, DeviceKind::Partition, 9, 20, "NITROX_ESP", 32_768), Found::Fat { label: String::new(), clean: Some(true), refused: Some(String::from(SMALL)) }),
+        dev(
+            rec(21, DeviceKind::Partition, 9, 20, "NITROX_ESP", 32_768),
+            Found::Fat { label: String::new(), clean: Some(true), refused: Some(String::from(SMALL)) }
+        ),
         dev(rec(22, DeviceKind::Partition, 10, 20, "data", 16_384), ext4("data")),
         dev(rec(30, DeviceKind::Disk, 11, 29, "another stick", 16_384), ext4("other")),
     ];
@@ -646,7 +654,11 @@ fn an_arrival_is_planned_alone_beside_the_mounts_there_are() {
     let taken = std::vec![String::from("stick")];
     let plan = crate::mounts::arrival(core::slice::from_ref(&new), &all, &[], &taken, true, true);
     assert_eq!(plan, [Plan { device: 40, label: String::from("stick-2"), mode: Mode::Ro, server: Server::Ext4 }]);
-    assert_eq!(crate::mounts::arrival(core::slice::from_ref(&new), &all, &[], &[], false, false), [], "init's mounts unknown");
+    assert_eq!(
+        crate::mounts::arrival(core::slice::from_ref(&new), &all, &[], &[], false, false),
+        [],
+        "init's mounts unknown"
+    );
 }
 
 /// **What is in use is every mounted device and the disk that holds it** — never a partition's
@@ -677,7 +689,10 @@ fn a_fat_is_read_by_its_servers_own_check() {
     assert_eq!(probe(&served), Found::Fat { label: String::from("NXSTICK"), clean: Some(true), refused: None });
     assert_eq!(probe(&served).server(), Some(Server::Fat));
     let small = mkfs_fat(2048, &["-F", "12", "-s", "1"]);
-    assert_eq!(probe(&small), Found::Fat { label: String::new(), clean: Some(true), refused: Some(String::from(SMALL)) });
+    assert_eq!(
+        probe(&small),
+        Found::Fat { label: String::new(), clean: Some(true), refused: Some(String::from(SMALL)) }
+    );
     assert_eq!(probe(&small).server(), None, "refused, so nothing would serve it");
     let mut wide = *FAT32;
     wide[11..13].copy_from_slice(&4096u16.to_le_bytes());
@@ -716,10 +731,15 @@ fn a_fat_is_auto_mounted_on_a_removable_disk_alone() {
     ];
     assert!(!crate::mounts::removable(&ds[1], &ds) && crate::mounts::removable(&ds[4], &ds));
     let plan = automount(&ds, &[], true, true);
-    let got: Vec<(u32, &str, Mode, Server)> = plan.iter().map(|p| (p.device, p.label.as_str(), p.mode, p.server)).collect();
+    let got: Vec<(u32, &str, Mode, Server)> =
+        plan.iter().map(|p| (p.device, p.label.as_str(), p.mode, p.server)).collect();
     assert_eq!(
         got,
-        [(5, "data", Mode::Ro, Server::Ext4), (21, "NXSTICK", Mode::Rw, Server::Fat), (30, "WHOLE", Mode::Rw, Server::Fat)]
+        [
+            (5, "data", Mode::Ro, Server::Ext4),
+            (21, "NXSTICK", Mode::Rw, Server::Fat),
+            (30, "WHOLE", Mode::Rw, Server::Fat)
+        ]
     );
     let mut on_sata = ds.clone();
     on_sata[3].record.driver = [0; 16];
@@ -735,7 +755,11 @@ fn an_administrator_mounts_an_internal_fat_but_not_one_its_server_refuses() {
     ds[2].found = Found::Fat { label: String::from("BIGESP"), clean: Some(true), refused: None };
     let plan = explicit(&ds, &init_root(), &[], true, true, "blk-2", "").unwrap();
     assert_eq!(plan, Plan { device: 6, label: String::from("BIGESP"), mode: Mode::Rw, server: Server::Fat });
-    assert_eq!(explicit(&devices(), &init_root(), &[], true, true, "blk-2", ""), Err(Refusal::NothingToServe), "512-byte clusters");
+    assert_eq!(
+        explicit(&devices(), &init_root(), &[], true, true, "blk-2", ""),
+        Err(Refusal::NothingToServe),
+        "512-byte clusters"
+    );
 }
 
 /// The servers are spawned from the store's copies.
@@ -772,7 +796,10 @@ fn a_whole_disk_with_partition_entries_is_never_mounted_whole() {
     mbr_entry_over(&stale, 0x83, 2048, (blocks - 2048) as u32);
     let disk = on_usb(rec(20, DeviceKind::Disk, 3, 19, "a stick", blocks));
     let found = probe_record(&stale, &disk);
-    assert_eq!(found, Found::Fat { label: String::from("OLDFAT"), clean: Some(true), refused: Some(String::from(STALE_FAT)) });
+    assert_eq!(
+        found,
+        Found::Fat { label: String::from("OLDFAT"), clean: Some(true), refused: Some(String::from(STALE_FAT)) }
+    );
     let ds = std::vec![Device { record: disk, found }];
     assert_eq!(automount(&ds, &[], false, true), [], "not mounted by itself");
     assert_eq!(explicit(&ds, &[], &[], true, true, "blk-3", ""), Err(Refusal::NothingToServe), "nor as asked");
@@ -898,11 +925,8 @@ fn the_table_says_what_is_removable() {
         })
         .collect();
     let internal = ["blk-0", "blk-1", "blk-2", "blk-3", "blk-4"].map(|n| (n, false));
-    let want: Vec<(String, bool)> = internal
-        .into_iter()
-        .chain([("blk-5", true), ("blk-6", true)])
-        .map(|(n, b)| (String::from(n), b))
-        .collect();
+    let want: Vec<(String, bool)> =
+        internal.into_iter().chain([("blk-5", true), ("blk-6", true)]).map(|(n, b)| (String::from(n), b)).collect();
     assert_eq!(removable, want);
 }
 
@@ -931,7 +955,15 @@ fn the_watches_keep_the_living_and_free_the_gone() {
     for e in 0..32 {
         assert_eq!(w.add(e, |_| panic!("not full yet: nobody is pinged")), Ok(std::vec![]));
     }
-    let gone = |e: u64| if e % 10 == 3 { Sent::Gone } else if e % 2 == 0 { Sent::Full } else { Sent::Queued };
+    let gone = |e: u64| {
+        if e % 10 == 3 {
+            Sent::Gone
+        } else if e % 2 == 0 {
+            Sent::Full
+        } else {
+            Sent::Queued
+        }
+    };
     assert_eq!(w.add(100, gone), Ok(std::vec![3, 13, 23]), "full: every watcher pinged, the gone freed");
     assert_eq!(w.ends().len(), MAX_WATCHES - 2);
     assert!(w.ends().contains(&100) && w.ends().contains(&4), "the new one in, a full one kept");
@@ -940,10 +972,13 @@ fn the_watches_keep_the_living_and_free_the_gone() {
     }
     assert_eq!(w.add(999, |_| Sent::Queued), Err(()), "full of the living");
     let mut pinged = 0;
-    assert_eq!(w.changed(|_| {
-        pinged += 1;
-        Sent::Queued
-    }), std::vec![] as std::vec::Vec<u64>);
+    assert_eq!(
+        w.changed(|_| {
+            pinged += 1;
+            Sent::Queued
+        }),
+        std::vec![] as std::vec::Vec<u64>
+    );
     assert_eq!(pinged, MAX_WATCHES, "a change pings every watcher");
 }
 
@@ -1006,10 +1041,14 @@ fn a_device_read_again_is_planned_as_an_arrival() {
         dev(stick, Found::Nothing),
         dev(rec(21, DeviceKind::Partition, 4, 20, "partition 1 (unlabelled)", 4_192_256), Found::Nothing),
     ];
-    let arrival = |ds: &[Device], i: usize| crate::mounts::arrival(core::slice::from_ref(&ds[i]), ds, &[], &[], false, true);
+    let arrival =
+        |ds: &[Device], i: usize| crate::mounts::arrival(core::slice::from_ref(&ds[i]), ds, &[], &[], false, true);
     assert_eq!(arrival(&ds, 3), [], "nothing on it yet");
     ds[3].found = fat.clone();
-    assert_eq!(arrival(&ds, 3), [Plan { device: 21, label: String::from("NITROX"), mode: Mode::Rw, server: Server::Fat }]);
+    assert_eq!(
+        arrival(&ds, 3),
+        [Plan { device: 21, label: String::from("NITROX"), mode: Mode::Rw, server: Server::Fat }]
+    );
     ds[1].found = fat;
     assert_eq!(arrival(&ds, 1), []);
     assert_eq!(crate::mounts::note(&ds[1], &ds, None).as_deref(), Some("not removable, so not mounted"));

@@ -25,15 +25,15 @@
 use core::fmt;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::libkern::device::{
-    BOOT, CacheCounts, DEPARTED, DeviceKind, DeviceRecord, IO_MAGIC, IO_VERSION, IoHeader, IoRecord,
-    MAX_DRIVER_NAME, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED, OUTCOME_DECLINED, OUTCOME_NONE,
-    REGISTRY_MAGIC, REGISTRY_VERSION, RegistryHeader,
-};
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
+use crate::libkern::device::{
+    BOOT, CacheCounts, DEPARTED, DeviceKind, DeviceRecord, IO_MAGIC, IO_VERSION, IoHeader, IoRecord, MAX_DRIVER_NAME,
+    NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED, OUTCOME_DECLINED, OUTCOME_NONE, REGISTRY_MAGIC, REGISTRY_VERSION,
+    RegistryHeader,
+};
+use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KVec, SpinLock};
-use crate::libkern::handle::KObjectType;
 use crate::object::device_node::{CharBackend, DeviceClass, DeviceNode, ResourceDescriptor};
 use crate::object::{MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
@@ -210,11 +210,8 @@ impl Registry {
     /// Append a block node that belongs to `parent`, a node already in the table: a partition and
     /// its disk. A `parent` the table does not hold records no parent.
     pub fn add_block_child(&mut self, node: ObjectRef, parent: &ObjectRef, driver: &'static str) -> bool {
-        let parent = self
-            .entries
-            .iter()
-            .position(|e| e.node.as_ptr() == parent.as_ptr())
-            .map_or(NO_PARENT, |i| i as u32);
+        let parent =
+            self.entries.iter().position(|e| e.node.as_ptr() == parent.as_ptr()).map_or(NO_PARENT, |i| i as u32);
         self.add_block_under(node, parent, driver)
     }
 
@@ -232,13 +229,7 @@ impl Registry {
     }
 
     /// Append a character node: the console, or an i8042 device at `/dev/input/raw/<served>`.
-    pub fn add_char(
-        &mut self,
-        node: ObjectRef,
-        kind: DeviceKind,
-        served: u32,
-        driver: &'static str,
-    ) -> bool {
+    pub fn add_char(&mut self, node: ObjectRef, kind: DeviceKind, served: u32, driver: &'static str) -> bool {
         self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None, departed: false, boot: false })
     }
 
@@ -255,7 +246,8 @@ impl Registry {
     ) -> Option<u32> {
         let served = self.next_input_index();
         let parent = parent.unwrap_or(NO_PARENT);
-        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false, boot: false }).then_some(served)
+        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false, boot: false })
+            .then_some(served)
     }
 
     /// The index after every input node's: the next `/dev/input/raw/<n>`.
@@ -650,9 +642,7 @@ pub fn registry_snapshot() -> Result<KVec<u8>, AllocError> {
             outcomes.try_push(o).expect("within reserved capacity");
         }
     }
-    DEVICES.lock().snapshot_bytes(|d| {
-        outcomes.iter().find(|(a, _)| *a == address(d)).map(|&(_, o)| o)
-    })
+    DEVICES.lock().snapshot_bytes(|d| outcomes.iter().find(|(a, _)| *a == address(d)).map(|&(_, o)| o))
 }
 
 /// What `/dev/registry/io` serves (Phase 6 Part H.2): the page cache's counters and every disk's.
@@ -863,8 +853,7 @@ fn address(desc: &ResourceDescriptor) -> Address {
 
 /// Every outcome a driver has reported. Lock rank: `Registry` (it allocates while held), like
 /// [`DEVICES`], and never held with it.
-static OUTCOMES: SpinLock<KVec<(Address, Outcome)>> =
-    SpinLock::new(LockRank::Registry, KVec::new());
+static OUTCOMES: SpinLock<KVec<(Address, Outcome)>> = SpinLock::new(LockRank::Registry, KVec::new());
 
 /// Record what a driver did with the function `desc` describes. Boot-time, from
 /// `drivers::probe`.
@@ -971,13 +960,25 @@ mod tests {
     /// until the PR #333 review found no boot does that.
     fn booted() -> (Registry, ObjectRef, ObjectRef) {
         let mut r = Registry::new();
-        assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0, 0), BlockGeometry::ZERO).unwrap())));
-        assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0x1f, 2), BlockGeometry::ZERO).unwrap())));
-        assert!(r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0x02, 0), BlockGeometry::ZERO).unwrap())));
+        assert!(
+            r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0, 0), BlockGeometry::ZERO).unwrap()))
+        );
+        assert!(
+            r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0x1f, 2), BlockGeometry::ZERO).unwrap()))
+        );
+        assert!(
+            r.add_pci(adopt(DeviceNode::try_new(DeviceClass::Other, pci_at(0, 0x02, 0), BlockGeometry::ZERO).unwrap()))
+        );
         let disk = block(pci_at(0, 0x1f, 2), BlockKind::Disk, b"QEMU HARDDISK (QM00001)", 1 << 20);
         assert!(r.add_block(disk.clone(), "ahci"));
-        assert!(r.add_block(block(ResourceDescriptor::ZERO, BlockKind::RamDisk, b"module 0 (root.img)", 64), "ramdisk"));
-        assert!(r.add_block_child(block(pci_at(0, 0x1f, 2), BlockKind::Partition, b"nitrox-root", 1 << 19), &disk, "gpt"));
+        assert!(
+            r.add_block(block(ResourceDescriptor::ZERO, BlockKind::RamDisk, b"module 0 (root.img)", 64), "ramdisk")
+        );
+        assert!(r.add_block_child(
+            block(pci_at(0, 0x1f, 2), BlockKind::Partition, b"nitrox-root", 1 << 19),
+            &disk,
+            "gpt"
+        ));
         assert!(r.add_char(char_node(), DeviceKind::Console, NOT_SERVED, "console"));
         let keyboard = char_node();
         assert!(r.add_char(keyboard.clone(), DeviceKind::Keyboard, 0, "i8042"));
@@ -1383,21 +1384,16 @@ mod tests {
             format!("{}", OutcomeLine { desc: &ahci, outcome: Some(claimed) }),
             "drivers: 00:1f.2 claimed by ahci, MSI vec 0x32"
         );
-        let intx =
-            Outcome::Claimed { driver: "ahci", signal: Signal::Intx { gsi: 16, vector: 0x40 } };
+        let intx = Outcome::Claimed { driver: "ahci", signal: Signal::Intx { gsi: 16, vector: 0x40 } };
         assert_eq!(
             format!("{}", OutcomeLine { desc: &ahci, outcome: Some(intx) }),
             "drivers: 00:1f.2 claimed by ahci, INTx GSI 16 vec 0x40"
         );
-        let declined =
-            Outcome::Declined { driver: "ahci", why: "no SATA disk on any implemented port" };
+        let declined = Outcome::Declined { driver: "ahci", why: "no SATA disk on any implemented port" };
         assert_eq!(
             format!("{}", OutcomeLine { desc: &ahci, outcome: Some(declined) }),
             "drivers: 00:1f.2 declined by ahci: no SATA disk on any implemented port"
         );
-        assert_eq!(
-            format!("{}", OutcomeLine { desc: &at(0, 0x14, 0), outcome: None }),
-            "drivers: 00:14.0 no driver"
-        );
+        assert_eq!(format!("{}", OutcomeLine { desc: &at(0, 0x14, 0), outcome: None }), "drivers: 00:14.0 no driver");
     }
 }

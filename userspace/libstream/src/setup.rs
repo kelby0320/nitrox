@@ -41,8 +41,7 @@ pub const SETUP_PAYLOAD_MAX: usize = 4096 - 24 - 8 * 8;
 const _: () = assert!(SETUP_PAYLOAD_MAX == libkern::abi::IPC_PAYLOAD_SIZE);
 
 use crate::wire::{
-    ByteSource, Record, Result, Schema, TypeModifiers, TypeTag, Value, WireError, read_value,
-    write_value,
+    ByteSource, Record, Result, Schema, TypeModifiers, TypeTag, Value, WireError, read_value, write_value,
 };
 
 // --- The `arg0` bootstrap descriptor ---------------------------------------
@@ -117,10 +116,7 @@ impl Streams {
     /// the sender packs them into the message and [`from_bitmap`](Self::from_bitmap)
     /// reads them back.
     pub fn ordered(&self) -> Vec<u64> {
-        [self.stdin, self.stdout, self.stderr]
-            .into_iter()
-            .flatten()
-            .collect()
+        [self.stdin, self.stdout, self.stderr].into_iter().flatten().collect()
     }
 
     /// Pair a presence `bitmap` with the ordered transferred `handles`, producing the
@@ -188,10 +184,7 @@ pub struct SetupPayload {
 /// inside *it* says nothing about whether a handle was actually transferred. A payload claiming
 /// a terminal with none attached read back as `Some(0)`, and a shell would then run its whole
 /// REPL against handle 0 (PR #194 review, finding 6).
-pub fn split_handles(
-    payload: &SetupPayload,
-    handles: &[u64],
-) -> Result<(Streams, Option<u64>)> {
+pub fn split_handles(payload: &SetupPayload, handles: &[u64]) -> Result<(Streams, Option<u64>)> {
     let n = (payload.streams & STREAM_MASK).count_ones() as usize;
     if n + usize::from(payload.terminal) > handles.len() {
         return Err(WireError::SchemaMismatch);
@@ -254,12 +247,7 @@ impl SetupPayload {
             argv.push(String::from(item.as_str().ok_or(WireError::SchemaMismatch)?));
         }
         // Absent `env` ⇒ empty, so an older sender is not an error case.
-        let env = record
-            .values
-            .get(2)
-            .and_then(|v| v.as_record())
-            .cloned()
-            .unwrap_or_default();
+        let env = record.values.get(2).and_then(|v| v.as_record()).cloned().unwrap_or_default();
         // Absent `terminal` ⇒ none, so a sender that predates it is not an error case —
         // the same rule as `env`, one field along.
         let terminal = record.values.get(3).and_then(|v| v.as_int()).unwrap_or(0) != 0;
@@ -270,9 +258,7 @@ impl SetupPayload {
 // --- Syscall-backed stage runtime (Tier-1 spawn + bootstrap) ----------------
 
 #[cfg(feature = "io")]
-pub use self::io_stage::{
-    Bootstrap, Setup, bootstrap, pipe, send_setup, send_setup_env, send_setup_full,
-};
+pub use self::io_stage::{Bootstrap, Setup, bootstrap, pipe, send_setup, send_setup_env, send_setup_full};
 
 /// The sender (a shell spawning a stage) and receiver (`bootstrap().setup()`) sides of
 /// the setup message, over real IPC. Gated behind `io` so the pure protocol above stays
@@ -287,8 +273,8 @@ mod io_stage {
     use alloc::vec::Vec;
     use libkern::abi::{IPC_HANDLE_MAX, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, SENDMODE_BLOCK};
     use libkern::syscall::{
-        SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT,
-        syscall1, syscall4, syscall6,
+        SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4,
+        syscall6,
     };
 
     const E_WOULDBLOCK: i64 = -11; // KError::WouldBlock
@@ -298,11 +284,7 @@ mod io_stage {
     const OFF_PAYLOAD: usize = 24;
 
     fn map_err(r: i64) -> WireError {
-        if r == E_PEERCLOSED {
-            WireError::PeerClosed
-        } else {
-            WireError::SinkFull
-        }
+        if r == E_PEERCLOSED { WireError::PeerClosed } else { WireError::SinkFull }
     }
 
     /// Create a pipe (an IPC channel pair) of queue depth `depth`, returning both
@@ -311,15 +293,7 @@ mod io_stage {
         let mut a = 0u64;
         let mut b = 0u64;
         // SAFETY: `a`/`b` are valid writable out-params.
-        let r = unsafe {
-            syscall4(
-                SYS_CHANNEL_CREATE,
-                (&raw mut a) as u64,
-                (&raw mut b) as u64,
-                depth as u64,
-                0,
-            )
-        };
+        let r = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut a) as u64, (&raw mut b) as u64, depth as u64, 0) };
         if r != 0 {
             return Err(WireError::SinkFull);
         }
@@ -337,12 +311,7 @@ mod io_stage {
     ///
     /// Kept as a separate entry point so every existing caller stays correct without
     /// edits — a spawn that has no environment to pass is not obliged to say so.
-    pub fn send_setup_env(
-        channel: u64,
-        streams: &Streams,
-        argv: &[&str],
-        env: &Record,
-    ) -> Result<()> {
+    pub fn send_setup_env(channel: u64, streams: &Streams, argv: &[&str], env: &Record) -> Result<()> {
         send_setup_full(channel, streams, None, argv, env)
     }
 
@@ -360,23 +329,18 @@ mod io_stage {
         env: &Record,
     ) -> Result<()> {
         let owned: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
-        let payload = SetupPayload {
-            streams: streams.bitmap(),
-            argv: owned,
-            env: env.clone(),
-            terminal: terminal.is_some(),
-        }
-        // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge` — deliberately
-        // not `SinkFull`, since a full channel is a transport condition a caller may retry
-        // and this never will be.
-        .encode()?;
+        let payload =
+            SetupPayload { streams: streams.bitmap(), argv: owned, env: env.clone(), terminal: terminal.is_some() }
+                // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge` — deliberately
+                // not `SinkFull`, since a full channel is a transport condition a caller may retry
+                // and this never will be.
+                .encode()?;
         let mut handles = streams.ordered();
         if let Some(t) = terminal {
             handles.push(t);
         }
         let mut buf: Box<[u8; IPC_MSG_SIZE]> = Box::new([0u8; IPC_MSG_SIZE]);
-        buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
-            .copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         buf[OFF_HANDLE_COUNT] = handles.len() as u8;
         buf[OFF_PAYLOAD..OFF_PAYLOAD + payload.len()].copy_from_slice(&payload);
         // SAFETY: valid IPC_MSG_SIZE buffer + handle array; Block mode returns a
@@ -399,8 +363,7 @@ mod io_stage {
         let wh = [po];
         let mut result = [0u8; 24];
         // SAFETY: valid handle + result out-buffers.
-        let waited =
-            unsafe { syscall4(SYS_WAIT, wh.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX) };
+        let waited = unsafe { syscall4(SYS_WAIT, wh.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX) };
         // SAFETY: closing the PO we own.
         unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
         if waited < 1 {
@@ -445,12 +408,7 @@ mod io_stage {
 
     /// Wrap a process's four bootstrap registers (as received by `_start`).
     pub fn bootstrap(notif: u64, namespace: u64, endpoint: u64, arg0: u64) -> Bootstrap {
-        Bootstrap {
-            notif,
-            namespace,
-            endpoint,
-            arg0,
-        }
+        Bootstrap { notif, namespace, endpoint, arg0 }
     }
 
     impl Bootstrap {
@@ -502,9 +460,8 @@ mod io_stage {
                     let wh = [self.endpoint];
                     let mut result = [0u8; 24];
                     // SAFETY: valid handle + result out-buffers.
-                    let waited = unsafe {
-                        syscall4(SYS_WAIT, wh.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX)
-                    };
+                    let waited =
+                        unsafe { syscall4(SYS_WAIT, wh.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX) };
                     if waited < 1 {
                         return Err(WireError::PeerClosed);
                     }
@@ -526,19 +483,13 @@ mod io_stage {
             // is by the bitmap's population count rather than by the handle count, which
             // includes both.
             let (streams, terminal) = super::split_handles(&payload, &handles[..count])?;
-            Ok(Setup {
-                streams,
-                argv: payload.argv,
-                env: payload.env,
-                terminal,
-            })
+            Ok(Setup { streams, argv: payload.argv, env: payload.env, terminal })
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-
 
     /// The refusal is its own error, and it is asserted — an earlier pass added the
     /// variant with a justification and nothing that checked it, which a control caught by
@@ -549,12 +500,8 @@ mod tests {
         // so being inside it proves nothing; only the transferred `count` does. A shell handed
         // `Some(0)` would run its entire REPL against handle 0 and every read would fail in a
         // way that looks like a dead terminal rather than a bad message.
-        let claims = SetupPayload {
-            streams: STREAM_STDOUT,
-            argv: alloc::vec![],
-            env: Record::default(),
-            terminal: true,
-        };
+        let claims =
+            SetupPayload { streams: STREAM_STDOUT, argv: alloc::vec![], env: Record::default(), terminal: true };
         assert!(split_handles(&claims, &[7]).is_err(), "one handle is the stream's");
         let (streams, terminal) = split_handles(&claims, &[7, 9]).expect("both transferred");
         assert_eq!(streams.stdout, Some(7));
@@ -564,12 +511,7 @@ mod tests {
     #[test]
     fn a_payload_with_no_terminal_ignores_a_handle_beyond_its_streams() {
         // The other direction: extra handles are not silently adopted as a terminal.
-        let none = SetupPayload {
-            streams: STREAM_STDIN,
-            argv: alloc::vec![],
-            env: Record::default(),
-            terminal: false,
-        };
+        let none = SetupPayload { streams: STREAM_STDIN, argv: alloc::vec![], env: Record::default(), terminal: false };
         let (streams, terminal) = split_handles(&none, &[3, 4]).expect("ok");
         assert_eq!(streams.stdin, Some(3));
         assert_eq!(terminal, None);
@@ -648,20 +590,14 @@ mod tests {
     // --- env on the wire (Milestone 3.5 Part A) -----------------------------
 
     fn env_record() -> Record {
-        let schema = Schema::new()
-            .field("PWD", TypeTag::String, TypeModifiers::NONE)
-            .field("PATH", TypeTag::List, TypeModifiers::NONE);
-        let path: Vec<Value> = alloc::vec![
-            Value::Str(String::from("/bin")),
-            Value::Str(String::from("/initramfs/sbin")),
-        ];
-        Record {
-            schema,
-            values: alloc::vec![
-                Value::Str(String::from("/home/alice")),
-                Value::List(Arc::from(path)),
-            ],
-        }
+        let schema = Schema::new().field("PWD", TypeTag::String, TypeModifiers::NONE).field(
+            "PATH",
+            TypeTag::List,
+            TypeModifiers::NONE,
+        );
+        let path: Vec<Value> =
+            alloc::vec![Value::Str(String::from("/bin")), Value::Str(String::from("/initramfs/sbin")),];
+        Record { schema, values: alloc::vec![Value::Str(String::from("/home/alice")), Value::List(Arc::from(path)),] }
     }
 
     #[test]
@@ -685,12 +621,8 @@ mod tests {
     /// A sender with nothing to pass produces an empty env, not a special case.
     #[test]
     fn an_absent_environment_is_empty_not_an_error() {
-        let p = SetupPayload {
-            terminal: false,
-            streams: 0,
-            argv: alloc::vec![String::from("x")],
-            env: Record::default(),
-        };
+        let p =
+            SetupPayload { terminal: false, streams: 0, argv: alloc::vec![String::from("x")], env: Record::default() };
         let back = SetupPayload::decode(&p.encode().expect("encodes")).expect("decodes");
         assert!(back.env.values.is_empty());
     }
@@ -703,14 +635,13 @@ mod tests {
     /// what every stage in the image is doing until it is rebuilt.
     #[test]
     fn an_old_two_field_payload_still_decodes() {
-        let schema = Schema::new()
-            .field("streams", TypeTag::Int, TypeModifiers::NONE)
-            .field("argv", TypeTag::List, TypeModifiers::NONE);
+        let schema = Schema::new().field("streams", TypeTag::Int, TypeModifiers::NONE).field(
+            "argv",
+            TypeTag::List,
+            TypeModifiers::NONE,
+        );
         let argv: Vec<Value> = alloc::vec![Value::Str(String::from("old"))];
-        let old = Record {
-            schema,
-            values: alloc::vec![Value::Int(0b101), Value::List(Arc::from(argv))],
-        };
+        let old = Record { schema, values: alloc::vec![Value::Int(0b101), Value::List(Arc::from(argv))] };
         let mut buf = Vec::new();
         write_value(&mut buf, &Value::Record(Arc::new(old))).expect("encodes");
 
@@ -762,15 +693,9 @@ mod tests {
     #[test]
     fn from_bitmap_rejects_bad_input() {
         // Handle count disagrees with the bitmap.
-        assert_eq!(
-            Streams::from_bitmap(STREAM_STDIN | STREAM_STDOUT, &[0x1]),
-            Err(WireError::SchemaMismatch)
-        );
+        assert_eq!(Streams::from_bitmap(STREAM_STDIN | STREAM_STDOUT, &[0x1]), Err(WireError::SchemaMismatch));
         // An unknown presence bit.
-        assert_eq!(
-            Streams::from_bitmap(1 << 5, &[0x1]),
-            Err(WireError::SchemaMismatch)
-        );
+        assert_eq!(Streams::from_bitmap(1 << 5, &[0x1]), Err(WireError::SchemaMismatch));
     }
 
     #[test]
@@ -781,8 +706,8 @@ mod tests {
             vec![String::from("copy"), String::from("/a"), String::from("/b")],
             vec![String::from("echo"), String::from(""), String::from("héllo")],
         ] {
-            let p = SetupPayload {
-            terminal: false, streams: STREAM_STDOUT | STREAM_STDERR, argv, env: Record::default() };
+            let p =
+                SetupPayload { terminal: false, streams: STREAM_STDOUT | STREAM_STDERR, argv, env: Record::default() };
             let bytes = p.encode().unwrap();
             assert_eq!(SetupPayload::decode(&bytes).unwrap(), p);
         }

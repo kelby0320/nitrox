@@ -65,16 +65,16 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
-use libkern::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
-use libkern::debug::Line;
-use libkern::error::KError;
-use libkern::{exit, kprint};
 use coreutils::format::{self, Fs, Label, Plan, Scheme};
+use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libfsserver::BlockWriter;
 use libfsserver::disk::PartitionIo;
 use libgpt::{mbr, table};
 use libkern::abi::{BlockDeviceInfo, IO_OPCODE_FLUSH, IoOp};
+use libkern::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
+use libkern::debug::Line;
+use libkern::error::KError;
+use libkern::{exit, kprint};
 use librsproto::storage::{OP_STORAGE_EJECT, OP_STORAGE_MOUNT, OP_STORAGE_REREAD, OP_STORAGE_UNMOUNT, build_mount};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
@@ -160,7 +160,9 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let (mbr, gpt) = (args.has("mbr"), args.has("gpt"));
     let writes = verbs[4] || verbs[5];
     let code = match (verbs, ops.as_slice()) {
-        _ if (mbr || gpt) && !writes => stage.die(b"disk: --mbr and --gpt go with --partition or --format\n", EXIT_USAGE),
+        _ if (mbr || gpt) && !writes => {
+            stage.die(b"disk: --mbr and --gpt go with --partition or --format\n", EXIT_USAGE)
+        }
         ([true, false, false, false, false, false], []) => list(&stage),
         ([false, true, false, false, false, false], [device]) => mount(&stage, device, ""),
         ([false, true, false, false, false, false], [device, label]) => mount(&stage, device, label),
@@ -364,9 +366,11 @@ fn unmount(stage: &Stage, label: &str) -> i64 {
     }
     match stage.streams.stdout {
         Some(h) => {
-            let schema = Schema::new()
-                .field("label", TypeTag::String, TypeModifiers::NONE)
-                .field("unmounted", TypeTag::Bool, TypeModifiers::NONE);
+            let schema = Schema::new().field("label", TypeTag::String, TypeModifiers::NONE).field(
+                "unmounted",
+                TypeTag::Bool,
+                TypeModifiers::NONE,
+            );
             write_table(stage, h, &schema, &[alloc::vec![Value::Str(String::from(label)), Value::Bool(true)]]);
         }
         // Not "and left clean": a read-only mount leaves a filesystem as it found it. `--list`
@@ -396,9 +400,11 @@ fn eject(stage: &Stage, name: &str) -> i64 {
     let said = names.join(", ");
     match stage.streams.stdout {
         Some(h) => {
-            let schema = Schema::new()
-                .field("name", TypeTag::String, TypeModifiers::NONE)
-                .field("ejected", TypeTag::Bool, TypeModifiers::NONE);
+            let schema = Schema::new().field("name", TypeTag::String, TypeModifiers::NONE).field(
+                "ejected",
+                TypeTag::Bool,
+                TypeModifiers::NONE,
+            );
             let rows: Vec<Vec<Value>> =
                 names.iter().map(|n| alloc::vec![Value::Str(n.clone()), Value::Bool(true)]).collect();
             write_table(stage, h, &schema, &rows);
@@ -476,7 +482,8 @@ fn device_info(ns: u64, path: &str) -> Option<BlockDeviceInfo> {
         return None;
     }
     // SAFETY: register-only syscall; `h` is ours.
-    let addr = unsafe { libkern::syscall::syscall4(libkern::syscall::SYS_MEMORY_MAP, h, 0, 4096, libkern::RIGHT_MAP_READ) };
+    let addr =
+        unsafe { libkern::syscall::syscall4(libkern::syscall::SYS_MEMORY_MAP, h, 0, 4096, libkern::RIGHT_MAP_READ) };
     close(h);
     if addr < 0 {
         return None;
@@ -499,7 +506,11 @@ fn now_secs() -> i64 {
     let mut nanos: u64 = 0;
     // SAFETY: a valid writable `u64` out-param.
     let r = unsafe {
-        libkern::syscall::syscall2(libkern::syscall::SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64)
+        libkern::syscall::syscall2(
+            libkern::syscall::SYS_CLOCK_READ,
+            libkern::abi::CLOCK_REALTIME,
+            (&raw mut nanos) as u64,
+        )
     };
     if r < 0 { 0 } else { (nanos / 1_000_000_000) as i64 }
 }
@@ -508,7 +519,13 @@ fn now_secs() -> i64 {
 fn monotonic_ns() -> u64 {
     let mut now = 0u64;
     // SAFETY: a valid writable `u64` out-param.
-    unsafe { libkern::syscall::syscall2(libkern::syscall::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    unsafe {
+        libkern::syscall::syscall2(
+            libkern::syscall::SYS_CLOCK_READ,
+            libkern::abi::CLOCK_MONOTONIC,
+            (&raw mut now) as u64,
+        )
+    };
     now
 }
 
@@ -516,7 +533,8 @@ fn monotonic_ns() -> u64 {
 fn flush(device: u64) -> bool {
     let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
     // SAFETY: `device` is a block device handle with WRITE; `&op` is a valid `IoOp`.
-    let po = unsafe { libkern::syscall::syscall2(libkern::syscall::SYS_IO_SUBMIT, device, (&op as *const IoOp) as u64) };
+    let po =
+        unsafe { libkern::syscall::syscall2(libkern::syscall::SYS_IO_SUBMIT, device, (&op as *const IoOp) as u64) };
     po >= 0 && libfsserver::disk::po_wait(po as u64).0 == 0
 }
 
@@ -527,7 +545,13 @@ fn wait_ping(watch: u64, deadline: u64) -> bool {
     let mut results = [0u8; 24];
     // SAFETY: a valid one-entry handle array and result buffer on this frame.
     let waited = unsafe {
-        libkern::syscall::syscall4(libkern::syscall::SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, deadline)
+        libkern::syscall::syscall4(
+            libkern::syscall::SYS_WAIT,
+            handles.as_ptr() as u64,
+            1,
+            results.as_mut_ptr() as u64,
+            deadline,
+        )
     };
     if waited != 1 {
         return false;
@@ -606,10 +630,18 @@ impl Ids {
 
 /// **Write `plan` to the device `handle`** of `t`: the wipes and the table, then the filesystem in
 /// its partition, then the drive's cache flushed. `name` is the GPT partition's name.
-fn write_plan(stage: &Stage, handle: u64, t: &format::Target, plan: &Plan, ids: &Ids, name: &[u8]) -> Result<(), String> {
+fn write_plan(
+    stage: &Stage,
+    handle: u64,
+    t: &format::Target,
+    plan: &Plan,
+    ids: &Ids,
+    name: &[u8],
+) -> Result<(), String> {
     let fs = plan.fs.map(|(fs, ..)| fs);
     if let Some((scheme, first, n)) = plan.table {
-        let disk = PartitionIo::new(handle, 0, t.sectors * format::SECTOR).ok_or("no transfer buffer for the device")?;
+        let disk =
+            PartitionIo::new(handle, 0, t.sectors * format::SECTOR).ok_or("no transfer buffer for the device")?;
         for (at, len) in format::wipes(t.sectors) {
             zero(&disk, at, len)?;
         }
@@ -617,14 +649,21 @@ fn write_plan(stage: &Stage, handle: u64, t: &format::Target, plan: &Plan, ids: 
             Scheme::Mbr => {
                 let fat = match plan.fs {
                     Some((Fs::Fat, Label::Fat(label), _, len)) => {
-                        let p = fs_server_fat::mkfs::Params { sectors: len / format::SECTOR, label, volume_id: 0, hidden: 0, now: 0 };
+                        let p = fs_server_fat::mkfs::Params {
+                            sectors: len / format::SECTOR,
+                            label,
+                            volume_id: 0,
+                            hidden: 0,
+                            now: 0,
+                        };
                         fs_server_fat::mkfs::plan(&p).ok().map(|g| g.kind)
                     }
                     _ => None,
                 };
                 let entry = mbr::Partition { kind: format::mbr_type(fs, fat), first_lba: first, blocks: n };
                 let mut sector = [0u8; mbr::LEN];
-                mbr::build(t.sectors, ids.disk_id, &[entry], &mut sector).map_err(|e| format!("the MBR would not build: {e:?}"))?;
+                mbr::build(t.sectors, ids.disk_id, &[entry], &mut sector)
+                    .map_err(|e| format!("the MBR would not build: {e:?}"))?;
                 disk.write_at(0, &sector).map_err(|_| "writing the MBR failed")?;
             }
             Scheme::Gpt => {
@@ -646,7 +685,13 @@ fn write_plan(stage: &Stage, handle: u64, t: &format::Target, plan: &Plan, ids: 
                 // The hidden sectors are where the partition starts on its disk where `disk` wrote
                 // the table, and 0 where it did not; only booting reads them.
                 let hidden = (at / format::SECTOR) as u32;
-                let p = fs_server_fat::mkfs::Params { sectors: len / format::SECTOR, label, volume_id: ids.volume_id, hidden, now };
+                let p = fs_server_fat::mkfs::Params {
+                    sectors: len / format::SECTOR,
+                    label,
+                    volume_id: ids.volume_id,
+                    hidden,
+                    now,
+                };
                 fs_server_fat::mkfs::format(&io, &p, &mut progress(stage, "zeroing the FATs"))
                     .map_err(|e| format!("the FAT would not lay out: {e:?}"))?;
             }
@@ -767,7 +812,9 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
 
     // **Read again**, then, for a disk, the new partition waited for.
     let mounted = match ask(stage, ADMIN, OP_STORAGE_REREAD, name.as_bytes()) {
-        Ok(reply) => librsproto::storage::ejected_names(&reply).map(|n| String::from_utf8_lossy(n).into_owned()).collect::<Vec<_>>(),
+        Ok(reply) => librsproto::storage::ejected_names(&reply)
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect::<Vec<_>>(),
         Err(f) => {
             watch.map(close);
             let why = match f {
@@ -792,7 +839,8 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
         // **Its row, once there**: a row is put in the table in the turn its partition arrived,
         // with its mount made, so the first one seen says all there is to say.
         let found = loop {
-            let new = device_rows(ns).and_then(|rows| format::partitions_of(&rows, &name).into_iter().find(|p| !before.contains(p)));
+            let new = device_rows(ns)
+                .and_then(|rows| format::partitions_of(&rows, &name).into_iter().find(|p| !before.contains(p)));
             let row = new.and_then(|p| storage_rows(ns)?.into_iter().find(|h| h.name == p));
             if row.is_some() || !wait_ping(watch, deadline) {
                 break row;
@@ -800,7 +848,10 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
         };
         close(watch);
         let Some(row) = found else {
-            say(stage, &format!("disk: {name} {verb} {what}, but its new partition did not arrive in time: see disk --list\n"));
+            say(
+                stage,
+                &format!("disk: {name} {verb} {what}, but its new partition did not arrive in time: see disk --list\n"),
+            );
             return EXIT_FAILURE;
         };
         (Some(row.name.clone()), Some(row))

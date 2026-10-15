@@ -23,18 +23,15 @@
 //! shape; a future task-based caller can drive the same codecs over `libos::Op`.
 
 use crate::file::{
-    DIR_ENTRY_PREFIX_LEN, DirEntry, name_request, parse_read_dir_reply, read_dir_request,
-    rename_request,
+    DIR_ENTRY_PREFIX_LEN, DirEntry, name_request, parse_read_dir_reply, read_dir_request, rename_request,
 };
 use crate::{
-    OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH,
-    OP_FILE_UNLINK, RS_HEADER_LEN,
+    OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH, OP_FILE_UNLINK, RS_HEADER_LEN,
 };
 use libkern::abi::{IPC_MSG_SIZE, SENDMODE_NOBLOCK};
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
 use libkern::syscall::{
-    SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_WAIT, syscall1,
-    syscall4, syscall5,
+    SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall4, syscall5,
 };
 
 /// Byte offset of the rsproto payload within an `IpcMsg` (the IPC header precedes it).
@@ -93,15 +90,7 @@ impl<'a> Dir<'a> {
             return Err(DirError::Protocol);
         }
         // SAFETY: `path` is a valid readable slice; `ns` is a handle we hold.
-        let po = unsafe {
-            syscall4(
-                SYS_NS_LOOKUP,
-                ns,
-                path.as_ptr() as u64,
-                path.len() as u64,
-                DIR_SESSION_RIGHTS,
-            )
-        };
+        let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, DIR_SESSION_RIGHTS) };
         if po < 0 {
             return Err(DirError::Transport(po as i32));
         }
@@ -112,11 +101,7 @@ impl<'a> Dir<'a> {
         if resolved == 0 {
             return Err(DirError::Protocol);
         }
-        Ok(Dir {
-            endpoint: resolved,
-            buf,
-            next_request_id: 1,
-        })
+        Ok(Dir { endpoint: resolved, buf, next_request_id: 1 })
     }
 
     /// Wrap an already-resolved session endpoint (a handle received rather than looked
@@ -125,11 +110,7 @@ impl<'a> Dir<'a> {
         if buf.len() < IPC_MSG_SIZE {
             return Err(DirError::Protocol);
         }
-        Ok(Dir {
-            endpoint,
-            buf,
-            next_request_id: 1,
-        })
+        Ok(Dir { endpoint, buf, next_request_id: 1 })
     }
 
     /// The underlying endpoint handle (for `sys_wait` alongside other handles).
@@ -283,23 +264,13 @@ pub fn round_trip(
 ) -> core::result::Result<usize, WireError> {
     let region = &mut buf[PAYLOAD_OFF..];
     let rs_len = crate::encode(region, op, request_id, 0, body, 0).ok_or(WireError::Protocol)?;
-    buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
-        .copy_from_slice(&(rs_len as u32).to_le_bytes());
+    buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(rs_len as u32).to_le_bytes());
     buf[OFF_HANDLE_COUNT] = 0;
 
     // A session reply is one message on a channel we are the sole client of, so the
     // ring always has room: a non-blocking send is correct and avoids a PO round trip.
     // SAFETY: `buf` is a valid IPC_MSG_SIZE buffer; no handles accompany the request.
-    let sent = unsafe {
-        syscall5(
-            SYS_CHANNEL_SEND,
-            endpoint,
-            buf.as_ptr() as u64,
-            0,
-            0,
-            SENDMODE_NOBLOCK,
-        )
-    };
+    let sent = unsafe { syscall5(SYS_CHANNEL_SEND, endpoint, buf.as_ptr() as u64, 0, 0, SENDMODE_NOBLOCK) };
     if sent != 0 {
         return Err(WireError::Transport(sent as i32));
     }
@@ -309,15 +280,7 @@ pub fn round_trip(
     let handles = [endpoint];
     let mut results = [0u8; 24];
     // SAFETY: valid handle array + result out-buffer for one waiter.
-    let waited = unsafe {
-        syscall4(
-            SYS_WAIT,
-            handles.as_ptr() as u64,
-            1,
-            results.as_mut_ptr() as u64,
-            u64::MAX,
-        )
-    };
+    let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
     if waited != 1 {
         return Err(WireError::Transport(waited as i32));
     }
@@ -372,9 +335,7 @@ pub(crate) fn po_wait(po: u64) -> (i32, u64) {
     let handles = [po];
     let mut r = [0u8; 24];
     // SAFETY: valid handle array + result out-buffer for one waiter.
-    let waited = unsafe {
-        syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, r.as_mut_ptr() as u64, u64::MAX)
-    };
+    let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
     // SAFETY: closing the PO we own (a resolved handle is separate).
     unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
     if waited != 1 {

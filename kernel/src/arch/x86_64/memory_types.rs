@@ -107,9 +107,7 @@ fn type_for(phys: u64, ranges: &[Range], default: MemoryType, enabled: bool) -> 
         }
         found = Some(match (found, r.kind) {
             (None, k) => k,
-            (Some(MemoryType::Uncacheable), _) | (_, MemoryType::Uncacheable) => {
-                MemoryType::Uncacheable
-            }
+            (Some(MemoryType::Uncacheable), _) | (_, MemoryType::Uncacheable) => MemoryType::Uncacheable,
             (Some(MemoryType::WriteBack), MemoryType::WriteThrough)
             | (Some(MemoryType::WriteThrough), MemoryType::WriteBack) => MemoryType::WriteThrough,
             (Some(first), _) => first,
@@ -132,16 +130,12 @@ unsafe fn read_ranges(out: &mut [Range; MAX_RANGES]) -> usize {
         // SAFETY: the first `VCNT` pairs from `IA32_MTRR_PHYSBASE0` are implemented, and `cap`
         // said how many there are.
         let (base, mask) = unsafe {
-            (
-                regs::rdmsr(MSR_MTRR_PHYSBASE0 + 2 * i as u32),
-                regs::rdmsr(MSR_MTRR_PHYSBASE0 + 2 * i as u32 + 1),
-            )
+            (regs::rdmsr(MSR_MTRR_PHYSBASE0 + 2 * i as u32), regs::rdmsr(MSR_MTRR_PHYSBASE0 + 2 * i as u32 + 1))
         };
         if mask & PHYSMASK_VALID == 0 {
             continue;
         }
-        out[used] =
-            Range { base: base & ADDR_MASK, mask: mask & ADDR_MASK, kind: decode((base & 0xFF) as u8) };
+        out[used] = Range { base: base & ADDR_MASK, mask: mask & ADDR_MASK, kind: decode((base & 0xFF) as u8) };
         used += 1;
     }
     used
@@ -189,8 +183,7 @@ impl ArchMemoryTypes for X86MemoryTypes {
         use crate::arch::paging::ArchPaging;
         let root = super::paging::X86Paging::active_root();
         // SAFETY: the active root is live and reachable through the HHDM.
-        let index =
-            unsafe { super::paging::X86Paging::attribute_index(root, crate::mm::VirtAddr::new(virt)) }?;
+        let index = unsafe { super::paging::X86Paging::attribute_index(root, crate::mm::VirtAddr::new(virt)) }?;
         // SAFETY: CPUID advertises the attribute table, so `IA32_PAT` is implemented.
         let pat = unsafe { regs::rdmsr(MSR_PAT) };
         Some(decode((pat >> (8 * index as u32) & 0xFF) as u8))
@@ -243,8 +236,7 @@ impl ArchMemoryTypes for X86MemoryTypes {
             crate::kprintln!("cache policy: no range registers on this CPU");
         } else {
             // SAFETY: CPUID advertises the range registers.
-            let (cap, def) =
-                unsafe { (regs::rdmsr(MSR_MTRRCAP), regs::rdmsr(MSR_MTRR_DEF_TYPE)) };
+            let (cap, def) = unsafe { (regs::rdmsr(MSR_MTRRCAP), regs::rdmsr(MSR_MTRR_DEF_TYPE)) };
             crate::kprintln!(
                 "cache policy: {} variable range(s), default {}, ranges {}, fixed {}",
                 cap & 0xFF,
@@ -306,32 +298,19 @@ mod tests {
 
     #[test]
     fn a_range_that_covers_the_address_decides_it() {
-        let ranges = [
-            range(0, 0x8000_0000, MemoryType::WriteBack),
-            range(0xa000_0000, 0x1000_0000, MemoryType::WriteCombining),
-        ];
-        assert_eq!(
-            type_for(0xa000_0000, &ranges, MemoryType::Uncacheable, true),
-            MemoryType::WriteCombining
-        );
+        let ranges =
+            [range(0, 0x8000_0000, MemoryType::WriteBack), range(0xa000_0000, 0x1000_0000, MemoryType::WriteCombining)];
+        assert_eq!(type_for(0xa000_0000, &ranges, MemoryType::Uncacheable, true), MemoryType::WriteCombining);
         // The last byte of the range, and the first byte past it.
-        assert_eq!(
-            type_for(0xafff_f000, &ranges, MemoryType::Uncacheable, true),
-            MemoryType::WriteCombining
-        );
-        assert_eq!(
-            type_for(0xb000_0000, &ranges, MemoryType::Uncacheable, true),
-            MemoryType::Uncacheable
-        );
+        assert_eq!(type_for(0xafff_f000, &ranges, MemoryType::Uncacheable, true), MemoryType::WriteCombining);
+        assert_eq!(type_for(0xb000_0000, &ranges, MemoryType::Uncacheable, true), MemoryType::Uncacheable);
     }
 
     /// The architecture's overlap rules, which are not "the last one wins".
     #[test]
     fn overlapping_ranges_follow_the_architectures_precedence() {
-        let uc_over_wb = [
-            range(0, 0x1_0000_0000, MemoryType::WriteBack),
-            range(0xa000_0000, 0x1000_0000, MemoryType::Uncacheable),
-        ];
+        let uc_over_wb =
+            [range(0, 0x1_0000_0000, MemoryType::WriteBack), range(0xa000_0000, 0x1000_0000, MemoryType::Uncacheable)];
         assert_eq!(
             type_for(0xa000_0000, &uc_over_wb, MemoryType::WriteBack, true),
             MemoryType::Uncacheable,
@@ -339,14 +318,9 @@ mod tests {
         );
         // And in the other order, since a table walked in a different order must not differ.
         let wb_over_uc = [uc_over_wb[1], uc_over_wb[0]];
-        assert_eq!(
-            type_for(0xa000_0000, &wb_over_uc, MemoryType::WriteBack, true),
-            MemoryType::Uncacheable
-        );
-        let wt_and_wb = [
-            range(0, 0x1_0000_0000, MemoryType::WriteBack),
-            range(0xa000_0000, 0x1000_0000, MemoryType::WriteThrough),
-        ];
+        assert_eq!(type_for(0xa000_0000, &wb_over_uc, MemoryType::WriteBack, true), MemoryType::Uncacheable);
+        let wt_and_wb =
+            [range(0, 0x1_0000_0000, MemoryType::WriteBack), range(0xa000_0000, 0x1000_0000, MemoryType::WriteThrough)];
         assert_eq!(
             type_for(0xa000_0000, &wt_and_wb, MemoryType::WriteBack, true),
             MemoryType::WriteThrough,
@@ -359,10 +333,7 @@ mod tests {
     #[test]
     fn disabled_range_registers_make_everything_uncacheable() {
         let ranges = [range(0, 0x1_0000_0000, MemoryType::WriteBack)];
-        assert_eq!(
-            type_for(0x1000, &ranges, MemoryType::WriteBack, false),
-            MemoryType::Uncacheable
-        );
+        assert_eq!(type_for(0x1000, &ranges, MemoryType::WriteBack, false), MemoryType::Uncacheable);
     }
 
     #[test]

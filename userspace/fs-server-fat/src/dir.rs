@@ -62,12 +62,22 @@ impl Dir {
 }
 
 /// **The byte at which slot `slot` of `dir` is**, or `None` past the directory's end.
-pub fn slot_byte<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir, slot: u32) -> Result<Option<u64>, FsError> {
+pub fn slot_byte<R: BlockReader>(
+    r: &R,
+    g: &Geometry,
+    cache: &mut Cache,
+    dir: Dir,
+    slot: u32,
+) -> Result<Option<u64>, FsError> {
     match dir {
-        Dir::Root => Ok((slot < g.root_entries).then(|| g.root_start as u64 * SECTOR as u64 + slot as u64 * ENTRY as u64)),
+        Dir::Root => {
+            Ok((slot < g.root_entries).then(|| g.root_start as u64 * SECTOR as u64 + slot as u64 * ENTRY as u64))
+        }
         Dir::Chain(first) => {
             let per = g.cluster_bytes() / ENTRY;
-            Ok(cache.nth(r, g, first, slot / per)?.map(|c| g.cluster_sector(c) * SECTOR as u64 + (slot % per) as u64 * ENTRY as u64))
+            Ok(cache
+                .nth(r, g, first, slot / per)?
+                .map(|c| g.cluster_sector(c) * SECTOR as u64 + (slot % per) as u64 * ENTRY as u64))
         }
     }
 }
@@ -652,7 +662,13 @@ pub fn parent<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir) 
 
 /// **Whether `dir` is the directory whose chain begins `ancestor`, or within it**: its `..`
 /// followed to the root, bounded as a chain is.
-pub fn within<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir, ancestor: u32) -> Result<bool, FsError> {
+pub fn within<R: BlockReader>(
+    r: &R,
+    g: &Geometry,
+    cache: &mut Cache,
+    dir: Dir,
+    ancestor: u32,
+) -> Result<bool, FsError> {
     let mut d = dir;
     for _ in 0..g.clusters {
         if d == Dir::Chain(ancestor) {

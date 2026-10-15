@@ -98,13 +98,7 @@ unsafe fn write_reg(idx: u32, val: u32) {
 /// Encode a redirection-table entry into its `(low, high)` 32-bit dwords:
 /// fixed delivery, physical destination mode, with the given vector, polarity,
 /// trigger, mask bit, and destination local-APIC id (bits 56:63).
-fn encode_rte(
-    vector: u8,
-    dest: u8,
-    polarity: Polarity,
-    trigger: TriggerMode,
-    masked: bool,
-) -> (u32, u32) {
+fn encode_rte(vector: u8, dest: u8, polarity: Polarity, trigger: TriggerMode, masked: bool) -> (u32, u32) {
     // low dword: vector[7:0], delivery mode[10:8]=000 (fixed), dest mode[11]=0
     // (physical), polarity[13], trigger[15], mask[16].
     let mut low = vector as u32;
@@ -131,16 +125,8 @@ fn resolve_isa_irq(irq: u8, overrides: &[acpi::SourceOverride]) -> (u32, Polarit
         if ov.source_irq == irq {
             // MPS INTI flags: polarity in bits 1:0, trigger in bits 3:2;
             // `00` means "conforms to the bus default" — ISA = high / edge.
-            let polarity = if ov.flags & 0b11 == 0b11 {
-                Polarity::ActiveLow
-            } else {
-                Polarity::ActiveHigh
-            };
-            let trigger = if (ov.flags >> 2) & 0b11 == 0b11 {
-                TriggerMode::Level
-            } else {
-                TriggerMode::Edge
-            };
+            let polarity = if ov.flags & 0b11 == 0b11 { Polarity::ActiveLow } else { Polarity::ActiveHigh };
+            let trigger = if (ov.flags >> 2) & 0b11 == 0b11 { TriggerMode::Level } else { TriggerMode::Edge };
             return (ov.gsi, polarity, trigger);
         }
     }
@@ -151,11 +137,7 @@ fn resolve_isa_irq(irq: u8, overrides: &[acpi::SourceOverride]) -> (u32, Polarit
 fn rte_index(gsi: u32) -> Option<u32> {
     let base = IOAPIC_GSI_BASE.load(Ordering::Relaxed);
     let max = IOAPIC_MAX_ENTRIES.load(Ordering::Relaxed);
-    if gsi >= base && gsi < base + max {
-        Some(gsi - base)
-    } else {
-        None
-    }
+    if gsi >= base && gsi < base + max { Some(gsi - base) } else { None }
 }
 
 /// Set or clear an entry's mask bit in place. # Safety: ring-0, post-`init`.
@@ -219,8 +201,7 @@ impl ArchIrqRouter for X86IoApic {
         // SAFETY: `va` is a fresh kernel-vmap page; `io.addr` is the IOAPIC MMIO
         // frame from the MADT; mapping into the boot root is visible from every
         // address space (shared kernel-half PDPTs).
-        unsafe { Paging::map_page(Paging::active_root(), va, io.addr, flags) }
-            .map_err(|_| AllocError)?;
+        unsafe { Paging::map_page(Paging::active_root(), va, io.addr, flags) }.map_err(|_| AllocError)?;
         IOAPIC_BASE.store(va.as_u64(), Ordering::Relaxed);
         IOAPIC_GSI_BASE.store(io.gsi_base, Ordering::Relaxed);
 
@@ -230,8 +211,7 @@ impl ArchIrqRouter for X86IoApic {
         IOAPIC_MAX_ENTRIES.store(max_entries, Ordering::Relaxed);
 
         // Mask every redirection entry (bring-up: nothing is routed yet).
-        let (masked_low, masked_high) =
-            encode_rte(0, 0, Polarity::ActiveHigh, TriggerMode::Edge, true);
+        let (masked_low, masked_high) = encode_rte(0, 0, Polarity::ActiveHigh, TriggerMode::Edge, true);
         for idx in 0..max_entries {
             // SAFETY: idx < max_entries; MMIO mapped.
             unsafe {

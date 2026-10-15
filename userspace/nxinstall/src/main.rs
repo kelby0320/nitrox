@@ -64,10 +64,8 @@ use libkern::abi::{
 };
 use libkern::handle::{RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, RIGHT_WRITE};
 use libkern::syscall::{
-    SYS_CLOCK_READ, SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
-    SYS_MEMORY_CREATE,
-    SYS_CHANNEL_SEND, SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1,
-    syscall2, syscall4, syscall6,
+    SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall4, syscall6,
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort, MsgPort};
@@ -147,13 +145,7 @@ fn po_wait(po: u64) -> (i32, u64) {
     // SAFETY: valid single-waiter buffers; the PO handle is ours.
     let waited = unsafe {
         WAIT_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // SAFETY: closing the PO we own.
     unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
@@ -172,9 +164,7 @@ fn po_wait(po: u64) -> (i32, u64) {
 /// Resolve `path` in `ns` asking for `rights`, or `None`.
 fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     // SAFETY: valid namespace handle and path slice.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
-    };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
     if po < 0 {
         return None;
     }
@@ -325,10 +315,8 @@ impl Io {
 /// answer — where probing `/dev/blk/0`, `1`, … stopped at the first gap, and a view granted one
 /// disk has one. An empty result is the ordinary answer in an ordinary session, not an error.
 fn devices(ns: u64) -> Vec<Device> {
-    let mut indices: Vec<usize> = libfs::ns_children(ns, b"/dev/blk")
-        .iter()
-        .filter_map(|(name, _)| nxinstall::block_index(name))
-        .collect();
+    let mut indices: Vec<usize> =
+        libfs::ns_children(ns, b"/dev/blk").iter().filter_map(|(name, _)| nxinstall::block_index(name)).collect();
     indices.sort_unstable();
     indices.dedup();
     let mut out = Vec::new();
@@ -351,9 +339,7 @@ fn devices(ns: u64) -> Vec<Device> {
                     return None;
                 }
                 // SAFETY: `addr` maps a page read-only and `size` is under it.
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(addr as u64 as *const u8, size as usize)
-                };
+                let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size as usize) };
                 BlockDeviceInfo::read(bytes)
             })
             // A device whose info would not map is still a device, and it reads as `Unknown` —
@@ -407,9 +393,7 @@ fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
         }
         // A FAT boot sector: the signature at the end of block 0, and one of the two places the
         // family name is written (FAT32 at 82, FAT12/16 at 54).
-        let fat = front[510] == 0x55
-            && front[511] == 0xAA
-            && (&front[82..87] == b"FAT32" || &front[54..57] == b"FAT");
+        let fat = front[510] == 0x55 && front[511] == 0xAA && (&front[82..87] == b"FAT32" || &front[54..57] == b"FAT");
         if fat && esp.is_none() {
             esp = Some(d);
             continue;
@@ -453,10 +437,8 @@ fn copy(
         let n = core::cmp::min(CHUNK, bytes - done);
         // Straight through the one buffer: read fills it, write drains it. Nothing is staged in
         // this process's heap, so the copy costs `CHUNK` of memory whatever the disk's size.
-        io.submit(IO_OPCODE_READ, src.handle, src_at + done, n)
-            .map_err(|e| format!("reading {what}: {e}"))?;
-        io.submit(IO_OPCODE_WRITE, dst.handle, dst_at + done, n)
-            .map_err(|e| format!("writing {what}: {e}"))?;
+        io.submit(IO_OPCODE_READ, src.handle, src_at + done, n).map_err(|e| format!("reading {what}: {e}"))?;
+        io.submit(IO_OPCODE_WRITE, dst.handle, dst_at + done, n).map_err(|e| format!("writing {what}: {e}"))?;
         done += n;
         if done - reported >= 8 * 1024 * 1024 || done == bytes {
             reported = done;
@@ -535,33 +517,14 @@ fn install(
     ));
     // SAFETY: single-threaded program; these statics have no other reader.
     let (front, back) = unsafe { (&mut *(&raw mut FRONT), &mut *(&raw mut BACK)) };
-    table::build(
-        target.info.block_count,
-        disk_guid,
-        &layout.partitions(esp_guid, root_guid),
-        front,
-        back,
-    )
-    .map_err(|e| format!("the partition table would not build: {e:?}. Nothing was written."))?;
-    target
-        .write_at(io, 0, front)
-        .map_err(|e| format!("writing the partition table: {e}"))?;
+    table::build(target.info.block_count, disk_guid, &layout.partitions(esp_guid, root_guid), front, back)
+        .map_err(|e| format!("the partition table would not build: {e:?}. Nothing was written."))?;
+    target.write_at(io, 0, front).map_err(|e| format!("writing the partition table: {e}"))?;
     let back_at = (target.info.block_count - table::ARRAY_BLOCKS - 1) * BLOCK as u64;
-    target
-        .write_at(io, back_at, back)
-        .map_err(|e| format!("writing the backup partition table: {e}"))?;
+    target.write_at(io, back_at, back).map_err(|e| format!("writing the backup partition table: {e}"))?;
 
     say(&format!("copying the boot partition ({})", human(esp_bytes)));
-    copy(
-        io,
-        srcs.esp,
-        0,
-        target,
-        layout.esp_first * BLOCK as u64,
-        esp_bytes,
-        "boot",
-        say,
-    )?;
+    copy(io, srcs.esp, 0, target, layout.esp_first * BLOCK as u64, esp_bytes, "boot", say)?;
 
     // **A filesystem the size of the partition, then its contents** (Phase 5 Part H.2).
     // H.1 copied the live root's sectors here, which put a 24 MiB filesystem on a partition
@@ -599,8 +562,12 @@ fn install(
             }
         },
     )
-    .map_err(|e| format!("the filesystem would not lay out: {e:?}. The disk is partitioned \
-                          and its boot partition written; nothing readable is on the root."))?;
+    .map_err(|e| {
+        format!(
+            "the filesystem would not lay out: {e:?}. The disk is partitioned \
+                          and its boot partition written; nothing readable is on the root."
+        )
+    })?;
     say(&format!("  {} inodes across {} group(s)", geom.inodes_count, geom.groups));
 
     // The source is the pristine root's partition *inside* its RAM disk, read as the bytes on the
@@ -616,19 +583,10 @@ fn install(
     say("copying the root filesystem");
     // **Which root, in the system log** (administration Part G.1): the pristine copy, not the live
     // root the session is running from — the difference `check-install` asserts.
-    log(&format!(
-        "copying the root from {}'s {}",
-        srcs.root.path(),
-        String::from_utf8_lossy(SOURCE_LABEL)
-    ));
+    log(&format!("copying the root from {}'s {}", srcs.root.path(), String::from_utf8_lossy(SOURCE_LABEL)));
     let copied = nxinstall::copy::copy_tree(&src, &dst, now, nxinstall::account::PASS_OVER, say)
         .map_err(|e| format!("copying the root filesystem failed: {e:?}"))?;
-    say(&format!(
-        "  {} director(ies), {} file(s), {}",
-        copied.dirs,
-        copied.files,
-        human(copied.bytes)
-    ));
+    say(&format!("  {} director(ies), {} file(s), {}", copied.dirs, copied.files, human(copied.bytes)));
 
     // **The machine's own account** (administration Part G.2), where the copy passed over the
     // build's: its record, the policy that makes it the administrator, and its home.
@@ -636,10 +594,7 @@ fn install(
     let salt = random_guid().ok_or("the kernel would not give out random bytes for a salt")?;
     nxinstall::account::write(&dst, &account.name, &account.password, &salt, now)
         .map_err(|e| format!("writing the first account failed: {e}"))?;
-    log(&format!(
-        "the first account is {}, its administrator",
-        String::from_utf8_lossy(&account.name)
-    ));
+    log(&format!("the first account is {}, its administrator", String::from_utf8_lossy(&account.name)));
 
     log(&format!(
         "wrote the partition table, the boot partition, and a {} root holding {} file(s)",
@@ -672,9 +627,7 @@ fn flush(device: u64) -> Result<(), &'static str> {
 fn wall_clock_seconds() -> i64 {
     let mut nanos: u64 = 0;
     // SAFETY: a valid writable `u64` out-param.
-    let r = unsafe {
-        syscall2(SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64)
-    };
+    let r = unsafe { syscall2(SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64) };
     if r < 0 { 0 } else { (nanos / 1_000_000_000) as i64 }
 }
 
@@ -733,9 +686,7 @@ fn ask_account(term: u64, stderr: Option<u64>) -> Result<Account, nxinstall::Out
 /// to say, and the listing is what it was.
 fn withheld_disks(ns: u64, reachable: &[String]) -> Vec<nxinstall::withheld::Withheld> {
     use nxinstall::withheld::{Device as Row, Mount, withheld};
-    let read = |path: &[u8]| {
-        libfs::read_file(ns, path).ok().and_then(|b| libstream::wire::Table::decode(&b).ok())
-    };
+    let read = |path: &[u8]| libfs::read_file(ns, path).ok().and_then(|b| libstream::wire::Table::decode(&b).ok());
     let (Some(devices), Some(storage)) = (read(b"/dev/devices/all.tsm"), read(b"/dev/storage/all.tsm")) else {
         return Vec::new();
     };
@@ -763,7 +714,11 @@ fn withheld_disks(ns: u64, reachable: &[String]) -> Vec<nxinstall::withheld::Wit
         })
         .collect();
     let mounts: Vec<Mount> = (0..storage.rows.len())
-        .map(|r| Mount { name: cell(&storage, r, "name"), at: cell(&storage, r, "mounted"), by: cell(&storage, r, "by") })
+        .map(|r| Mount {
+            name: cell(&storage, r, "name"),
+            at: cell(&storage, r, "mounted"),
+            by: cell(&storage, r, "by"),
+        })
         .collect();
     let reachable: Vec<&str> = reachable.iter().map(|p| p.as_str()).collect();
     withheld(&rows, &mounts, &reachable)
@@ -899,10 +854,8 @@ fn run(
 
     if operands.is_empty() {
         if devs.is_empty() {
-            say(
-                "no block devices in this view. Installing needs the disks granted: run it as \
-                 `with admin nxinstall`, from the live image's \"install to this machine\" entry.",
-            );
+            say("no block devices in this view. Installing needs the disks granted: run it as \
+                 `with admin nxinstall`, from the live image's \"install to this machine\" entry.");
             for w in &withheld {
                 warn(&w.message());
             }
@@ -975,9 +928,7 @@ fn run(
             return Outcome::NotInstalled;
         }
         BlockKind::Unknown => {
-            say(&format!(
-                "{wanted} does not say what it is, so this installer will not write to it."
-            ));
+            say(&format!("{wanted} does not say what it is, so this installer will not write to it."));
             refuse(&target.path(), "it does not say what it is");
             return Outcome::NotInstalled;
         }

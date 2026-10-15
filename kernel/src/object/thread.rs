@@ -22,15 +22,15 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use crate::arch::paging::ArchPaging;
 use crate::arch::{ArchFpuState, ArchThreadContext, fabricate_frame, thread_trampoline};
 use crate::libkern::handle::KObjectType;
-use crate::arch::paging::ArchPaging;
 use crate::libkern::{AllocError, KBox};
 use crate::mm::PhysAddr;
 use crate::mm::kstack::KernelStack;
+use crate::object::ObjectRef;
 use crate::object::Process;
 use crate::object::header::KObjectHeader;
-use crate::object::ObjectRef;
 
 /// Maximum number of handles one `sys_wait` call may block on. Bounds the
 /// per-thread wait arrays (so registration never allocates under the scheduler
@@ -153,7 +153,6 @@ const _: () = assert!(
     "MAX_CPUS > 8 does not fit Thread::cpu_mask (u8) — widen the field, the `1 << c` shifts \
      in sched.rs, and sys_thread_set_affinity's mask trim together"
 );
-
 
 /// A thread kernel object.
 ///
@@ -454,8 +453,7 @@ impl Thread {
         let (owner_pid, root) = {
             let p = process.as_ptr() as *const Process;
             let pid = unsafe { (*p).pid() };
-            let root = unsafe { (*p).address_space_root() }
-                .expect("user process must have an address space");
+            let root = unsafe { (*p).address_space_root() }.expect("user process must have an address space");
             (pid, root)
         };
         // The kernel stack maps into the shared kernel vmap (visible from
@@ -826,12 +824,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn entry_and_arg(obj: *mut ()) -> (ThreadEntry, usize) {
         let p = obj as *mut Thread;
-        unsafe {
-            (
-                core::ptr::read(&raw const (*p).entry),
-                core::ptr::read(&raw const (*p).arg),
-            )
-        }
+        unsafe { (core::ptr::read(&raw const (*p).entry), core::ptr::read(&raw const (*p).arg)) }
     }
 
     /// The page-table root to load when scheduling this thread in, or `None`
@@ -992,12 +985,7 @@ impl Thread {
         // CAS it is sound even though other fields are SCHED-serialised.
         unsafe {
             (*p).wait_phase
-                .compare_exchange(
-                    WaitPhase::Waiting as u8,
-                    WaitPhase::Woken as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(WaitPhase::Waiting as u8, WaitPhase::Woken as u8, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         }
     }
@@ -1054,9 +1042,7 @@ mod tests {
             Thread::set_state(obj, ThreadState::Exited);
             assert_eq!(Thread::state(obj), ThreadState::Exited);
             // Reclaim the leaked allocation.
-            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(
-                obj as *mut Thread,
-            )));
+            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
         }
     }
 
@@ -1070,9 +1056,7 @@ mod tests {
             assert_eq!(Thread::saved_sp(obj), 0);
             *Thread::saved_sp_mut_ptr(obj) = 0xDEAD_0000;
             assert_eq!(Thread::saved_sp(obj), 0xDEAD_0000);
-            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(
-                obj as *mut Thread,
-            )));
+            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
         }
     }
 
@@ -1145,9 +1129,7 @@ mod tests {
         unsafe {
             assert_eq!(Thread::user_entry(obj), Some((0x40_0000, 0x7fff_f000)));
             assert_eq!(Thread::addr_space_root(obj), Some(root));
-            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(
-                obj as *mut Thread,
-            )));
+            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
         }
     }
 
@@ -1213,9 +1195,7 @@ mod tests {
             assert!(!Thread::wait_has_deadline(obj));
             assert_eq!(Thread::wait_snapshot(obj, &mut out), 0);
 
-            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(
-                obj as *mut Thread,
-            )));
+            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
         }
     }
 }

@@ -76,12 +76,7 @@ impl Ring {
     /// would be 63 KiB of code doing what the loader already does.
     pub const fn new() -> Ring {
         // `[Slot::new(); CLIP_RING]` needs `Copy`, which a 4 KiB slot should not have.
-        Ring {
-            slots: [const { Slot::new() }; CLIP_RING],
-            head: 0,
-            len: 0,
-            serial: 0,
-        }
+        Ring { slots: [const { Slot::new() }; CLIP_RING], head: 0, len: 0, serial: 0 }
     }
 
     /// The ring's serial — [`CLIP_ANY_SERIAL`] exactly while nothing has ever been copied.

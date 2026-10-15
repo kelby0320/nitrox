@@ -29,8 +29,8 @@ use crate::libkern::{AllocError, KBox, KVec};
 use crate::mm::{PhysAddr, VirtAddr, kvmap};
 use crate::object::ObjectRef;
 use crate::object::device_node::{
-    BAR_FLAG_64, BAR_FLAG_PREFETCH, BAR_IO, BAR_MMIO, BAR_NONE, BarWindow, BlockGeometry,
-    DeviceClass, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
+    BAR_FLAG_64, BAR_FLAG_PREFETCH, BAR_IO, BAR_MMIO, BAR_NONE, BarWindow, BlockGeometry, DeviceClass, DeviceIdentity,
+    DeviceNode, InterruptSpec, ResourceDescriptor,
 };
 
 // PCI configuration-space register offsets (dword-aligned).
@@ -82,9 +82,7 @@ impl Cfg for MmioCfg {
 
 /// Physical base of `(bus, dev, func)`'s 4 KiB config space within `region`.
 fn func_phys(region: &EcamRegion, bus: u8, dev: u8, func: u8) -> PhysAddr {
-    let off = (((bus - region.bus_start) as u64) << 20)
-        | ((dev as u64) << 15)
-        | ((func as u64) << 12);
+    let off = (((bus - region.bus_start) as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12);
     PhysAddr(region.base.as_u64() + off)
 }
 
@@ -113,15 +111,7 @@ fn read_interrupt<C: Cfg>(cfg: &C) -> InterruptSpec {
     let d = cfg.read32(REG_INTERRUPT);
     let line = (d & 0xFF) as u8;
     let pin = ((d >> 8) & 0xFF) as u8;
-    InterruptSpec {
-        gsi: 0,
-        trigger: 0,
-        polarity: 0,
-        line,
-        pin,
-        present: (pin != 0) as u8,
-        _pad: 0,
-    }
+    InterruptSpec { gsi: 0, trigger: 0, polarity: 0, line, pin, present: (pin != 0) as u8, _pad: 0 }
 }
 
 /// Size every BAR of a header-type-0 function. Standard protocol: disable the
@@ -270,9 +260,7 @@ fn probe_function(
     if unsafe { kvmap::remap_mmio_page(win, func_phys(region, bus, dev, func)) }.is_err() {
         return Probe::Absent;
     }
-    let cfg = MmioCfg {
-        base: win.as_u64() as *mut u8,
-    };
+    let cfg = MmioCfg { base: win.as_u64() as *mut u8 };
     if (cfg.read32(REG_ID) & 0xFFFF) as u16 == VENDOR_ABSENT {
         return Probe::Absent;
     }
@@ -284,9 +272,7 @@ fn probe_function(
             log_function(&desc, &caps);
             // SAFETY: `into_raw` yields the single creation reference; adopt it
             // as an `ObjectRef` of the matching type.
-            let r = unsafe {
-                ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode)
-            };
+            let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
             if out.try_push(r).is_ok() {
                 *found += 1;
             }
@@ -298,17 +284,8 @@ fn probe_function(
 
 /// Probe every function of one device slot (function 0, then 1..8 if the slot
 /// reports multi-function).
-fn scan_device(
-    region: &EcamRegion,
-    win: VirtAddr,
-    bus: u8,
-    dev: u8,
-    out: &mut KVec<ObjectRef>,
-    found: &mut usize,
-) {
-    if let Probe::Present { multifunction } =
-        probe_function(region, win, bus, dev, 0, out, found)
-    {
+fn scan_device(region: &EcamRegion, win: VirtAddr, bus: u8, dev: u8, out: &mut KVec<ObjectRef>, found: &mut usize) {
+    if let Probe::Present { multifunction } = probe_function(region, win, bus, dev, 0, out, found) {
         if multifunction {
             for func in 1u8..8 {
                 probe_function(region, win, bus, dev, func, out, found);
@@ -395,11 +372,7 @@ impl Config {
         // SAFETY: `phys` is a 4 KiB-aligned config-space frame inside a firmware
         // -described ECAM window, which is device memory and never RAM.
         let va = unsafe { kvmap::map_mmio(phys, 1) }.map_err(ConfigError::Unmappable)?;
-        Ok(Config {
-            inner: MmioCfg {
-                base: va.as_u64() as *mut u8,
-            },
-        })
+        Ok(Config { inner: MmioCfg { base: va.as_u64() as *mut u8 } })
     }
 }
 
@@ -680,11 +653,7 @@ pub(crate) fn enable_bus_master<C: Cfg>(cfg: &C) -> bool {
 /// both — and the IOAPIC entry the INTx path routed is still live.
 pub(crate) fn set_intx_disabled<C: Cfg>(cfg: &C, disabled: bool) {
     let cs = cfg.read32(REG_COMMAND);
-    let next = if disabled {
-        cs | CMD_INTX_DISABLE
-    } else {
-        cs & !CMD_INTX_DISABLE
-    };
+    let next = if disabled { cs | CMD_INTX_DISABLE } else { cs & !CMD_INTX_DISABLE };
     if next != cs {
         write_command(cfg, next as u16);
     }
@@ -769,11 +738,7 @@ mod tests {
 
     impl FakeCfg {
         fn new() -> Self {
-            FakeCfg {
-                normal: RefCell::new([0; 64]),
-                sizing: [0; 64],
-                armed: RefCell::new([false; 64]),
-            }
+            FakeCfg { normal: RefCell::new([0; 64]), sizing: [0; 64], armed: RefCell::new([false; 64]) }
         }
         fn set(&mut self, off: u16, val: u32) {
             self.normal.borrow_mut()[(off / 4) as usize] = val;
@@ -786,11 +751,7 @@ mod tests {
     impl Cfg for FakeCfg {
         fn read32(&self, off: u16) -> u32 {
             let idx = (off / 4) as usize;
-            if self.armed.borrow()[idx] {
-                self.sizing[idx]
-            } else {
-                self.normal.borrow()[idx]
-            }
+            if self.armed.borrow()[idx] { self.sizing[idx] } else { self.normal.borrow()[idx] }
         }
         fn write32(&self, off: u16, val: u32) {
             let idx = (off / 4) as usize;
@@ -1060,13 +1021,19 @@ mod tests {
         // property that matters: the *value we write* carries no ones above bit 15.
         const LATCHED: u32 = (1 << 13) | (1 << 15); // target abort, parity error
         for (what, run) in [
-            ("enable_bus_master", &(|c: &FakeCfg| {
-                enable_bus_master(c);
-            }) as &dyn Fn(&FakeCfg)),
+            (
+                "enable_bus_master",
+                &(|c: &FakeCfg| {
+                    enable_bus_master(c);
+                }) as &dyn Fn(&FakeCfg),
+            ),
             ("set_intx_disabled", &(|c: &FakeCfg| set_intx_disabled(c, true))),
-            ("size_bars", &(|c: &FakeCfg| {
-                size_bars(c);
-            })),
+            (
+                "size_bars",
+                &(|c: &FakeCfg| {
+                    size_bars(c);
+                }),
+            ),
         ] {
             let mut c = FakeCfg::new();
             c.set(REG_COMMAND, 0x0003 | (LATCHED << 16));

@@ -46,7 +46,7 @@ use crate::arch::timer::ArchTimer;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpOp, IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
-use crate::libkern::block::{BlockKind, NameBuf, MAX_DEVICE_NAME};
+use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, KBox, KVec};
@@ -101,9 +101,7 @@ impl RamDisk {
         let mut backing: KVec<u8> = KVec::new();
         backing.try_reserve(RAMDISK_BYTES)?;
         for i in 0..RAMDISK_BYTES {
-            backing
-                .try_push(Self::pattern_byte(i))
-                .expect("within reserved ramdisk capacity");
+            backing.try_push(Self::pattern_byte(i)).expect("within reserved ramdisk capacity");
         }
         KBox::try_new(RamDisk {
             backing: Backing::Owned(backing),
@@ -181,10 +179,7 @@ impl RamDisk {
         };
         let dev_off = irp.offset;
         let len = irp.length;
-        if dev_off
-            .checked_add(len)
-            .map_or(true, |end| end > self.capacity() as u64)
-        {
+        if dev_off.checked_add(len).map_or(true, |end| end > self.capacity() as u64) {
             return (KError::InvalidArgument as i32, 0);
         }
         let _busy = self.busy.lock();
@@ -196,9 +191,7 @@ impl RamDisk {
         } else {
             // SAFETY: `irp.buffer.frags` points at a `[PhysFrag; count]` owned by the
             // IRP's box for the IRP's lifetime (see `io::block`).
-            unsafe {
-                core::slice::from_raw_parts(irp.buffer.frags as *const PhysFrag, irp.buffer.count as usize)
-            }
+            unsafe { core::slice::from_raw_parts(irp.buffer.frags as *const PhysFrag, irp.buffer.count as usize) }
         };
         let hhdm = crate::mm::heap::hhdm_offset();
         let mut dev_pos = dev_off;
@@ -288,14 +281,7 @@ pub fn try_new_device(rd: &'static RamDisk, name: &[u8]) -> Result<KBox<DeviceNo
         block_count: (rd.capacity() / rd.block_size() as usize) as u64,
     };
     let descriptor = ResourceDescriptor {
-        identity: DeviceIdentity {
-            vendor: 0,
-            device: 0,
-            class: 0,
-            subclass: 0,
-            prog_if: 0,
-            revision: 0,
-        },
+        identity: DeviceIdentity { vendor: 0, device: 0, class: 0, subclass: 0, prog_if: 0, revision: 0 },
         bars: [BarWindow::ZERO; 6],
         interrupt: InterruptSpec::NONE,
         seg: 0,
@@ -378,18 +364,12 @@ pub fn publish_modules() {
             }
         };
         // SAFETY: adopt the creation reference; the device table takes ownership below.
-        let node_ref = unsafe {
-            ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode)
-        };
+        let node_ref =
+            unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
         crate::device::register(node_ref.clone(), "ramdisk");
         // SAFETY: `node_ref` was just registered, and the table holds it for the kernel's lifetime.
         unsafe { rd.counted().attach(&node_ref) };
-        crate::kprintln!(
-            "ramdisk: module {} ({}), {} bytes, as a block device",
-            disk.index,
-            path,
-            disk.len
-        );
+        crate::kprintln!("ramdisk: module {} ({}), {} bytes, as a block device", disk.index, path, disk.len);
     }
 }
 
@@ -403,8 +383,7 @@ mod tests {
     /// is simply a host address.
     fn irp(op: IrpOp, offset: u64, frags: &[PhysFrag]) -> Irp {
         let length = frags.iter().map(|f| f.len).sum();
-        let buffer =
-            IrpBuffer { kind: IRP_BUF_FRAGS, count: frags.len() as u32, frags: frags.as_ptr() as u64 };
+        let buffer = IrpBuffer { kind: IRP_BUF_FRAGS, count: frags.len() as u32, frags: frags.as_ptr() as u64 };
         Irp::new_block(op, core::ptr::null(), offset, length, buffer, core::ptr::null_mut(), 0)
     }
 

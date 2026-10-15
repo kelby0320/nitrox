@@ -187,9 +187,7 @@ pub fn set_wall_clock_seconds(secs: i64) -> bool {
         }
         write_reg(REG_STATUS_B, status_b);
     }
-    read_stable(century)
-        .and_then(|(raw, status_b)| decode(raw, status_b))
-        .is_some_and(|read| (read - secs).abs() <= 2)
+    read_stable(century).and_then(|(raw, status_b)| decode(raw, status_b)).is_some_and(|read| (read - secs).abs() <= 2)
 }
 
 /// One stable reading of the time registers, and status B: wait out an update,
@@ -271,12 +269,7 @@ fn decode(raw: Raw, status_b: u8) -> Option<i64> {
     let century = raw.century.and_then(conv).filter(|c| (19..=21).contains(c)).unwrap_or(20);
     let year = century as i64 * 100 + year2 as i64;
 
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
 
@@ -411,10 +404,7 @@ mod tests {
     fn decodes_binary_24_hour() {
         // Same instant with the chip in binary mode.
         let r = raw(30, 45, 13, 24, 7, 26);
-        assert_eq!(
-            decode(r, STATUS_B_24_HOUR | STATUS_B_BINARY),
-            Some(1_784_900_730)
-        );
+        assert_eq!(decode(r, STATUS_B_24_HOUR | STATUS_B_BINARY), Some(1_784_900_730));
     }
 
     #[test]
@@ -505,11 +495,11 @@ mod tests {
     fn what_is_written_reads_back() {
         let instants = [
             946_684_800i64, // 2000-01-01 00:00:00
-            951_782_400,   // 2000-02-29 00:00:00, a leap day in a century year
-            1_784_900_730, // 2026-07-24 13:45:30
-            1_790_605_800, // 2026-09-28 14:30:00
-            1_925_078_400, // 2031-01-02 00:00:00
-            4_102_444_799, // 2099-12-31 23:59:59, the last second the chip holds without a century
+            951_782_400,    // 2000-02-29 00:00:00, a leap day in a century year
+            1_784_900_730,  // 2026-07-24 13:45:30
+            1_790_605_800,  // 2026-09-28 14:30:00
+            1_925_078_400,  // 2031-01-02 00:00:00
+            4_102_444_799,  // 2099-12-31 23:59:59, the last second the chip holds without a century
         ];
         for &t in &instants {
             for hour_of_day in [0, 1, 11, 12, 13, 23] {

@@ -167,7 +167,6 @@ pub fn cut(s: &mut String, max: usize) {
     s.shrink_to_fit();
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

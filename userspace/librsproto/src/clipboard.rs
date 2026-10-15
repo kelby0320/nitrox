@@ -462,13 +462,7 @@ impl<'a> Clipboard<'a> {
         let path = b"/dev/clipboard";
         // SAFETY: a valid path slice and a namespace handle this process holds.
         let po = unsafe {
-            syscall4(
-                SYS_NS_LOOKUP,
-                ns,
-                path.as_ptr() as u64,
-                path.len() as u64,
-                crate::session::DIR_SESSION_RIGHTS,
-            )
+            syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, crate::session::DIR_SESSION_RIGHTS)
         };
         if po < 0 {
             return Err(ClipError::Transport(po as i32));
@@ -501,11 +495,10 @@ impl<'a> Clipboard<'a> {
     fn request(&mut self, op: u16, body: &[u8], out: &mut [u8]) -> Result<usize, ClipError> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-        let len = crate::session::round_trip(self.endpoint, self.buf, request_id, op, body)
-            .map_err(|e| match e {
-                crate::session::WireError::Transport(c) => ClipError::Transport(c),
-                crate::session::WireError::Protocol => ClipError::Protocol,
-            })?;
+        let len = crate::session::round_trip(self.endpoint, self.buf, request_id, op, body).map_err(|e| match e {
+            crate::session::WireError::Transport(c) => ClipError::Transport(c),
+            crate::session::WireError::Protocol => ClipError::Protocol,
+        })?;
         let off = crate::session::PAYLOAD_OFF;
         let payload = &self.buf[off..off + len];
         let msg = crate::decode(payload).map_err(|_| ClipError::Transport(0))?;
@@ -531,9 +524,7 @@ impl<'a> Clipboard<'a> {
         }
         let mut body = [0u8; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES];
         // The serial field is the server's to fill; a copy has nothing to say about it.
-        let n = ClipEntry { serial: 0, kind, bytes }
-            .write(&mut body)
-            .ok_or(ClipError::Protocol)?;
+        let n = ClipEntry { serial: 0, kind, bytes }.write(&mut body).ok_or(ClipError::Protocol)?;
         let mut out = [0u8; 8];
         let got = self.request(OP_CLIP_COPY, &body[..n], &mut out)?;
         if got < 8 {
@@ -548,12 +539,7 @@ impl<'a> Clipboard<'a> {
     /// too small to hold it — a caller that silently pasted a truncated entry would be the
     /// quietest possible way to corrupt somebody's text, so the number to compare against `out`
     /// comes back rather than being inferred.
-    pub fn paste(
-        &mut self,
-        index: u32,
-        expect: u64,
-        out: &mut [u8],
-    ) -> Result<(u64, u16, usize), ClipError> {
+    pub fn paste(&mut self, index: u32, expect: u64, out: &mut [u8]) -> Result<(u64, u16, usize), ClipError> {
         let mut body = [0u8; CLIP_PASTE_LEN];
         let n = ClipPaste { index, expect }.write(&mut body).ok_or(ClipError::Protocol)?;
         let mut reply = [0u8; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES];
@@ -593,8 +579,7 @@ mod tests {
     #[test]
     fn paths_round_trip() {
         let mut buf = [0u8; 256];
-        let n = encode_paths(PathVerb::Cut, &["/home/a.txt", "/home/b"], &mut buf)
-            .expect("it fits");
+        let n = encode_paths(PathVerb::Cut, &["/home/a.txt", "/home/b"], &mut buf).expect("it fits");
         let got = Paths::read(&buf[..n]).expect("it reads");
         assert_eq!(got.verb, PathVerb::Cut);
         let mut seen = got.iter();
@@ -640,9 +625,7 @@ mod tests {
     #[test]
     fn an_entry_round_trips() {
         let mut buf = [0u8; 256];
-        let n = ClipEntry { serial: 7, kind: CLIP_KIND_TEXT, bytes: b"hello" }
-            .write(&mut buf)
-            .unwrap();
+        let n = ClipEntry { serial: 7, kind: CLIP_KIND_TEXT, bytes: b"hello" }.write(&mut buf).unwrap();
         assert_eq!(n, CLIP_ENTRY_HEAD + 5);
         let e = ClipEntry::read(&buf[..n]).unwrap();
         assert_eq!(e.serial, 7);
@@ -689,10 +672,7 @@ mod tests {
         let mut buf = [0u8; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES + 1];
         ClipEntry { serial: 1, kind: CLIP_KIND_TEXT, bytes: b"abcd" }.write(&mut buf).unwrap();
         put_u32(&mut buf, 10, (MAX_CLIP_BYTES + 1) as u32);
-        assert!(
-            buf.len() >= CLIP_ENTRY_HEAD + MAX_CLIP_BYTES + 1,
-            "the arrival bound must not be what refuses this"
-        );
+        assert!(buf.len() >= CLIP_ENTRY_HEAD + MAX_CLIP_BYTES + 1, "the arrival bound must not be what refuses this");
         assert_eq!(ClipEntry::read(&buf), None);
     }
 
@@ -721,10 +701,7 @@ mod tests {
 
     #[test]
     fn a_list_round_trips_and_a_declared_count_past_the_body_is_refused() {
-        let rows = [
-            ClipInfo { kind: CLIP_KIND_TEXT, len: 12 },
-            ClipInfo { kind: CLIP_KIND_TEXT, len: 0 },
-        ];
+        let rows = [ClipInfo { kind: CLIP_KIND_TEXT, len: 12 }, ClipInfo { kind: CLIP_KIND_TEXT, len: 0 }];
         let mut buf = [0u8; 64];
         let n = write_list(&mut buf, 5, &rows).unwrap();
         let l = ClipList::read(&buf[..n]).unwrap();

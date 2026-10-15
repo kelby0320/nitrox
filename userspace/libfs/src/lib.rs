@@ -39,17 +39,17 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE};
 use libkern::abi::{HandleInfo, NS_ENTRY_PATH_MAX, NS_KIND_MOUNT, NsEntry};
 use libkern::error::KError;
 use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_MAP_WRITE};
 use libkern::syscall::{
-    SYS_FILE_CREATE, SYS_FILE_RENAME, SYS_FILE_SYNC, SYS_FILE_TRUNCATE, SYS_HANDLE_CLOSE,
-    SYS_HANDLE_STAT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_ENUMERATE, SYS_NS_LOOKUP,
-    SYS_WAIT, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6,
+    SYS_FILE_CREATE, SYS_FILE_RENAME, SYS_FILE_SYNC, SYS_FILE_TRUNCATE, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT,
+    SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_ENUMERATE, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall3,
+    syscall4, syscall5, syscall6,
 };
-use librsproto::namespace::RENAME_REPLACE;
 use librsproto::file::OwnedEntry;
+use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE};
+use librsproto::namespace::RENAME_REPLACE;
 use librsproto::session::{Dir, DirError};
 
 /// What a file operation can fail with.
@@ -89,12 +89,7 @@ pub const MAX_COPY: u64 = 8 * 1024 * 1024;
 /// object, so this is `None` for one (ask [`librsproto::session::Dir::open`] instead).
 pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
     let handle = lookup(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT).ok()?;
-    let mut info = HandleInfo {
-        rights: 0,
-        object_type: 0,
-        generation: 0,
-        size: 0,
-    };
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `info` is a valid, correctly sized `HandleInfo` out-param. (Never a
     // hand-sized byte array — see the 2026-07-24 stack-smash entry in the decision log.)
     let r = unsafe { syscall2(SYS_HANDLE_STAT, handle, (&raw mut info) as u64) };
@@ -131,7 +126,6 @@ pub fn copy_file(ns: u64, src: &[u8], dst: &[u8], overwrite: bool) -> Result<u64
             if file_size(ns, dst) != Some(size) {
                 return Err(FileError::TruncateFailed);
             }
-
         }
     }
 
@@ -171,9 +165,7 @@ fn map_copy(src_handle: u64, dst_handle: u64, size: u64) -> Result<(), FileError
         return Err(FileError::Io(src_addr as i32));
     }
     // SAFETY: as above; the destination was created with MAP_READ | MAP_WRITE.
-    let dst_addr = unsafe {
-        syscall4(SYS_MEMORY_MAP, dst_handle, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-    };
+    let dst_addr = unsafe { syscall4(SYS_MEMORY_MAP, dst_handle, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if dst_addr < 0 {
         // SAFETY: unmapping the mapping we just made.
         unsafe { syscall2(SYS_MEMORY_UNMAP, src_addr as u64, size) };
@@ -185,11 +177,7 @@ fn map_copy(src_handle: u64, dst_handle: u64, size: u64) -> Result<(), FileError
     // ranges cannot overlap.
     // SAFETY: `size` bytes are mapped at both addresses, and the regions are disjoint.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            src_addr as *const u8,
-            dst_addr as *mut u8,
-            size as usize,
-        );
+        core::ptr::copy_nonoverlapping(src_addr as *const u8, dst_addr as *mut u8, size as usize);
     }
 
     // Unmap, then flush through the handle: without the flush the copy lives only in the page
@@ -214,14 +202,7 @@ fn map_copy(src_handle: u64, dst_handle: u64, size: u64) -> Result<(), FileError
 fn truncate(ns: u64, path: &[u8], size: u64) -> Result<(), FileError> {
     // SAFETY: valid path slice + namespace handle.
     let po = unsafe {
-        syscall5(
-            SYS_FILE_TRUNCATE,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
-            size,
-        )
+        syscall5(SYS_FILE_TRUNCATE, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE, size)
     };
     if po < 0 {
         return Err(FileError::Io(po as i32));
@@ -327,9 +308,7 @@ pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
     }
     let handle = create(ns, path, size)?;
     // SAFETY: mapping an object created with MAP_READ | MAP_WRITE.
-    let addr = unsafe {
-        syscall4(SYS_MEMORY_MAP, handle, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-    };
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if addr < 0 {
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
@@ -368,14 +347,7 @@ pub fn create_file(ns: u64, path: &[u8]) -> Result<(), FileError> {
 fn create(ns: u64, path: &[u8], size: u64) -> Result<u64, FileError> {
     // SAFETY: valid path slice + namespace handle.
     let po = unsafe {
-        syscall5(
-            SYS_FILE_CREATE,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
-            size,
-        )
+        syscall5(SYS_FILE_CREATE, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE, size)
     };
     if po < 0 {
         return Err(FileError::Io(po as i32));
@@ -424,14 +396,7 @@ pub fn ns_children(ns: u64, path: &[u8]) -> Vec<(String, u8)> {
     let mut entry = NsEntry::zeroed();
     for index in 0u64.. {
         // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
-        let r = unsafe {
-            syscall3(
-                SYS_NS_ENUMERATE,
-                ns,
-                index,
-                (&raw mut entry) as *mut NsEntry as u64,
-            )
-        };
+        let r = unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut NsEntry as u64) };
         if r != 0 {
             break; // NotFound ends the walk
         }
@@ -450,11 +415,7 @@ pub fn ns_children(ns: u64, path: &[u8]) -> Vec<(String, u8)> {
         };
         // An intermediate component is a directory by construction; a leaf binding is a
         // directory only if it is a filesystem mount.
-        let kind = if deeper || entry.kind == NS_KIND_MOUNT {
-            DIRENT_KIND_DIR
-        } else {
-            DIRENT_KIND_FILE
-        };
+        let kind = if deeper || entry.kind == NS_KIND_MOUNT { DIRENT_KIND_DIR } else { DIRENT_KIND_FILE };
         if !out.iter().any(|(n, _)| *n == name) {
             out.push((name, kind));
         }
@@ -527,9 +488,7 @@ pub fn lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
 /// Resolve `path` to a handle with `rights`.
 fn lookup(ns: u64, path: &[u8], rights: u64) -> Result<u64, i32> {
     // SAFETY: valid path slice + namespace handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
-    };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
     if po < 0 {
         return Err(po as i32);
     }
@@ -545,8 +504,7 @@ fn po_wait(po: u64) -> (i32, u64) {
     let handles = [po];
     let mut r = [0u8; 24];
     // SAFETY: valid handle array + result out-buffer for a single waiter.
-    let waited =
-        unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
+    let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
     // SAFETY: closing the PO we own (a resolved handle is separate).
     unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
     if waited != 1 {
@@ -643,12 +601,8 @@ pub fn sort<T: Listed>(entries: &mut [T], order: Order) {
         b.sort_is_dir().cmp(&a.sort_is_dir()).then_with(|| match order {
             Order::NameAsc => a.sort_name().cmp(b.sort_name()),
             Order::NameDesc => b.sort_name().cmp(a.sort_name()),
-            Order::OldestFirst => {
-                a.sort_mtime().cmp(&b.sort_mtime()).then_with(|| a.sort_name().cmp(b.sort_name()))
-            }
-            Order::NewestFirst => {
-                b.sort_mtime().cmp(&a.sort_mtime()).then_with(|| a.sort_name().cmp(b.sort_name()))
-            }
+            Order::OldestFirst => a.sort_mtime().cmp(&b.sort_mtime()).then_with(|| a.sort_name().cmp(b.sort_name())),
+            Order::NewestFirst => b.sort_mtime().cmp(&a.sort_mtime()).then_with(|| a.sort_name().cmp(b.sort_name())),
         })
     });
 }
@@ -878,11 +832,7 @@ mod tests {
 
     /// An entry with a name, a kind and an mtime — everything `sort` reads.
     fn ent(name: &str, dir: bool, mtime: i64) -> OwnedEntry {
-        let kind = if dir {
-            librsproto::file::DIRENT_KIND_DIR
-        } else {
-            librsproto::file::DIRENT_KIND_FILE
-        };
+        let kind = if dir { librsproto::file::DIRENT_KIND_DIR } else { librsproto::file::DIRENT_KIND_FILE };
         let mut e = OwnedEntry::binding(name.as_bytes(), kind);
         e.mtime = mtime;
         e
@@ -917,15 +867,17 @@ mod tests {
             }
         }
 
-        let fixture = [("beta.txt", false, 10), ("alpha", true, 20), ("acme.txt", false, 30),
-                       ("zeta", true, 5), ("undated", false, 0)];
+        let fixture = [
+            ("beta.txt", false, 10),
+            ("alpha", true, 20),
+            ("acme.txt", false, 30),
+            ("zeta", true, 5),
+            ("undated", false, 0),
+        ];
         for order in [Order::NameAsc, Order::NameDesc, Order::OldestFirst, Order::NewestFirst] {
-            let mut wire: Vec<OwnedEntry> =
-                fixture.iter().map(|&(n, d, m)| ent(n, d, m)).collect();
-            let mut rows: Vec<Row> = fixture
-                .iter()
-                .map(|&(n, d, m)| Row { label: String::from(n), folder: d, when: m })
-                .collect();
+            let mut wire: Vec<OwnedEntry> = fixture.iter().map(|&(n, d, m)| ent(n, d, m)).collect();
+            let mut rows: Vec<Row> =
+                fixture.iter().map(|&(n, d, m)| Row { label: String::from(n), folder: d, when: m }).collect();
             sort(&mut wire, order);
             sort(&mut rows, order);
             let a = names(&wire);
@@ -959,11 +911,7 @@ mod tests {
 
     #[test]
     fn the_four_orders_are_the_four_orders() {
-        let mut v = alloc::vec![
-            ent("b.txt", false, 200),
-            ent("a.txt", false, 300),
-            ent("c.txt", false, 100),
-        ];
+        let mut v = alloc::vec![ent("b.txt", false, 200), ent("a.txt", false, 300), ent("c.txt", false, 100),];
         sort(&mut v, Order::NameAsc);
         assert_eq!(names(&v), ["a.txt", "b.txt", "c.txt"]);
         sort(&mut v, Order::NameDesc);
@@ -1111,20 +1059,11 @@ fn copy_tree_at(
 /// The caller is responsible for refusing a `path` that is a **namespace binding**: this
 /// walks what is beneath a path, and cannot tell whether the path itself was handed to it
 /// by mistake. See `remove`'s operand check.
-pub fn remove_tree(
-    ns: u64,
-    path: &[u8],
-    on_entry: &mut impl FnMut(&[u8], bool),
-) -> Result<(), TreeError> {
+pub fn remove_tree(ns: u64, path: &[u8], on_entry: &mut impl FnMut(&[u8], bool)) -> Result<(), TreeError> {
     remove_tree_at(ns, path, 0, on_entry)
 }
 
-fn remove_tree_at(
-    ns: u64,
-    path: &[u8],
-    depth: u32,
-    on_entry: &mut impl FnMut(&[u8], bool),
-) -> Result<(), TreeError> {
+fn remove_tree_at(ns: u64, path: &[u8], depth: u32, on_entry: &mut impl FnMut(&[u8], bool)) -> Result<(), TreeError> {
     if depth > MAX_TREE_DEPTH {
         return Err(TreeError::TooDeep);
     }

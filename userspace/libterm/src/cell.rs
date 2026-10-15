@@ -280,10 +280,8 @@ pub struct Cell {
 
 impl Cell {
     /// A space in the default attributes — what erasing produces and what a new line is.
-    pub const BLANK: Cell = Cell {
-        ch: ' ',
-        attrs: Attributes { fg: Colour::Default, bg: Colour::Default, flags: Flags::NONE },
-    };
+    pub const BLANK: Cell =
+        Cell { ch: ' ', attrs: Attributes { fg: Colour::Default, bg: Colour::Default, flags: Flags::NONE } };
 
     /// A cell holding `ch` with `attrs`.
     pub const fn new(ch: char, attrs: Attributes) -> Cell {
@@ -410,11 +408,7 @@ mod tests {
     #[test]
     fn bold_does_not_touch_the_background() {
         let p = Palette::default();
-        let a = Attributes {
-            fg: Colour::Ansi(Ansi::Red),
-            bg: Colour::Ansi(Ansi::Blue),
-            flags: Flags::BOLD,
-        };
+        let a = Attributes { fg: Colour::Ansi(Ansi::Red), bg: Colour::Ansi(Ansi::Blue), flags: Flags::BOLD };
         assert_eq!(a.resolve(&p).1, p.ansi[Ansi::Blue.index()]);
     }
 
@@ -471,10 +465,6 @@ mod tests {
         // 80x24 is 1,920 cells before any scrollback, and the scrollback ring multiplies that
         // by the number of retained lines. Not a hard requirement — an assertion so that a
         // field added without thinking shows up as a decision rather than as memory.
-        assert!(
-            core::mem::size_of::<Cell>() <= 8,
-            "a cell is {} bytes",
-            core::mem::size_of::<Cell>()
-        );
+        assert!(core::mem::size_of::<Cell>() <= 8, "a cell is {} bytes", core::mem::size_of::<Cell>());
     }
 }

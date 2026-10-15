@@ -55,7 +55,10 @@ impl Default for Cache {
 impl Cache {
     /// An empty cache.
     pub const fn new() -> Cache {
-        Cache { slots: [Slot { sector: u32::MAX, used: 0, dirty: false, data: [0; SECTOR as usize] }; CACHE_SECTORS], clock: 0 }
+        Cache {
+            slots: [Slot { sector: u32::MAX, used: 0, dirty: false, data: [0; SECTOR as usize] }; CACHE_SECTORS],
+            clock: 0,
+        }
     }
 
     /// **Forget everything held**, written or not: after a failed write, so what is held never
@@ -328,7 +331,12 @@ impl Cache {
 
     /// **Free the chain from `first`**, every cluster of it, bounded as a walk is. A freed cluster
     /// is forgotten by a metadata cache, since it may next be a file's (Phase 6 Part H.4).
-    pub fn free_chain<RW: BlockReader + BlockWriter>(&mut self, rw: &RW, g: &Geometry, first: u32) -> Result<(), FsError> {
+    pub fn free_chain<RW: BlockReader + BlockWriter>(
+        &mut self,
+        rw: &RW,
+        g: &Geometry,
+        first: u32,
+    ) -> Result<(), FsError> {
         let mut c = first;
         for _ in 0..g.clusters {
             let next = self.next_rw(rw, g, c)?;

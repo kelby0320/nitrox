@@ -41,8 +41,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use libfs::{FileError, TreeError};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use libfs::{FileError, TreeError};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort};
@@ -149,19 +149,11 @@ fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<C
     // called a success.
     match r {
         Ok(()) => {}
-        Err(TreeError::TooDeep) => {
-            stage.die(b"copy: maximum recursion depth exceeded\n", EXIT_FAILURE)
-        }
+        Err(TreeError::TooDeep) => stage.die(b"copy: maximum recursion depth exceeded\n", EXIT_FAILURE),
         Err(TreeError::Copy(e)) => stage.die(describe(src, dst, e).as_bytes(), EXIT_FAILURE),
-        Err(TreeError::MakeDir(_)) => {
-            stage.die(b"copy: cannot create the destination directory\n", EXIT_FAILURE)
-        }
-        Err(TreeError::OpenDir) => {
-            stage.die(b"copy: cannot open a directory on the path\n", EXIT_FAILURE)
-        }
-        Err(TreeError::ReadDir) => {
-            stage.die(b"copy: cannot enumerate the source directory\n", EXIT_FAILURE)
-        }
+        Err(TreeError::MakeDir(_)) => stage.die(b"copy: cannot create the destination directory\n", EXIT_FAILURE),
+        Err(TreeError::OpenDir) => stage.die(b"copy: cannot open a directory on the path\n", EXIT_FAILURE),
+        Err(TreeError::ReadDir) => stage.die(b"copy: cannot enumerate the source directory\n", EXIT_FAILURE),
         Err(_) => stage.die(b"copy: cannot copy\n", EXIT_FAILURE),
     }
 }

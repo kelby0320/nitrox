@@ -31,18 +31,15 @@
 #![no_main]
 
 use clipboard_server::{Ring, RingError};
+use libkern::control::Control;
 use libkern::debug::Line;
 use libkern::*;
-use libkern::control::Control;
 use librsproto::clipboard::{
-    CLIP_ENTRY_HEAD, CLIP_ERR_MALFORMED, CLIP_ERR_STALE, CLIP_INFO_LEN, CLIP_LIST_HEAD, CLIP_RING,
-    ClipEntry, ClipInfo, ClipPaste, MAX_CLIP_BYTES, OP_CLIP_COPY, OP_CLIP_LIST, OP_CLIP_PASTE,
-    write_list,
+    CLIP_ENTRY_HEAD, CLIP_ERR_MALFORMED, CLIP_ERR_STALE, CLIP_INFO_LEN, CLIP_LIST_HEAD, CLIP_RING, ClipEntry, ClipInfo,
+    ClipPaste, MAX_CLIP_BYTES, OP_CLIP_COPY, OP_CLIP_LIST, OP_CLIP_PASTE, write_list,
 };
 use librsproto::error::error_body;
-use librsproto::namespace::{
-    OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply,
-};
+use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply};
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
@@ -77,15 +74,12 @@ static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi:
 static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
-    [0; libkern::abi::MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
-    [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 static mut CH_OUT0: u64 = 0;
 static mut CH_OUT1: u64 = 0;
 /// Where a reply body is built. Big enough for the largest of the three: an entry at the cap.
-static mut REPLY_BODY: [u8; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES] =
-    [0; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES];
+static mut REPLY_BODY: [u8; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES] = [0; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES];
 
 /// Emit `msg` to the serial console.
 fn kprint(msg: &[u8]) {
@@ -105,9 +99,7 @@ fn exit(code: i64) -> ! {
 /// Create a connected channel pair (depth 4). Returns `(client_end, serve_end)`.
 fn make_channel() -> Option<(u64, u64)> {
     // SAFETY: CH_OUT0/CH_OUT1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0) };
     if cr != 0 {
         return None;
     }
@@ -123,14 +115,7 @@ fn send_ready(control: u64, client_end: u64) -> bool {
     };
     // SAFETY: REPLY_MSG is a valid 4 KiB buffer; the rsproto message goes at offset 24.
     let rs_len = unsafe {
-        match encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            librsproto::OP_READY,
-            0,
-            0,
-            &body[..body_len],
-            1,
-        ) {
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1) {
             Some(n) => n,
             None => return false,
         }
@@ -161,8 +146,7 @@ fn send_reply(ch: u64, op: u16, request_id: u64, body: &[u8], error: bool) {
     let flags = if error { RS_FLAG_REPLY | RS_FLAG_ERROR } else { RS_FLAG_REPLY };
     // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at PAYLOAD_OFF.
     unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, 0)
-        else {
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, 0) else {
             return;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -208,8 +192,7 @@ fn serve_resolve(serve_end: u64) {
     }
     // SAFETY: bounded read-only slice over the payload the kernel just wrote.
     let (op, request_id, bare) = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -261,14 +244,8 @@ fn reply_session_handle(serve_end: u64, request_id: u64, client_end: u64) -> boo
     // SAFETY: REPLY_MSG is a valid buffer; the reply goes at PAYLOAD_OFF and the transferred
     // handle in REPLY_HANDLES[0].
     unsafe {
-        let Some(rs_len) = encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            OP_NS_RESOLVE,
-            request_id,
-            RS_FLAG_REPLY,
-            &body,
-            1,
-        ) else {
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
+        else {
             return false;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -319,8 +296,7 @@ fn serve_session(ch: u64) {
     // SAFETY: bounded read-only slice over the payload the kernel just wrote. The borrow ends
     // before anything writes to `RECV_MSG` again — nothing below receives.
     let msg = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -359,9 +335,7 @@ fn serve_copy(ch: u64, request_id: u64, body: &[u8]) {
                 .i(serial as i64)
                 .end();
         }
-        Err(RingError::TooLarge) => {
-            refuse(ch, OP_CLIP_COPY, request_id, KError::TooLarge.as_i32(), 0)
-        }
+        Err(RingError::TooLarge) => refuse(ch, OP_CLIP_COPY, request_id, KError::TooLarge.as_i32(), 0),
         // `push` returns nothing else; an arm rather than an `unreachable!()` because this is a
         // server and a panic here takes the clipboard down for every client.
         Err(_) => refuse(ch, OP_CLIP_COPY, request_id, KError::KernelError.as_i32(), 0),
@@ -393,13 +367,9 @@ fn serve_paste(ch: u64, request_id: u64, body: &[u8]) {
             let out = unsafe { &(&*(&raw const REPLY_BODY))[..n] };
             send_reply(ch, OP_CLIP_PASTE, request_id, out, false);
         }
-        Err(RingError::Stale) => refuse(
-            ch,
-            OP_CLIP_PASTE,
-            request_id,
-            KError::InvalidArgument.as_i32(),
-            CLIP_ERR_STALE,
-        ),
+        Err(RingError::Stale) => {
+            refuse(ch, OP_CLIP_PASTE, request_id, KError::InvalidArgument.as_i32(), CLIP_ERR_STALE)
+        }
         Err(_) => refuse(ch, OP_CLIP_PASTE, request_id, KError::NotFound.as_i32(), 0),
     }
 }
@@ -439,13 +409,7 @@ fn serve_loop(serve_end: u64, mut control: u64) -> ! {
                     n += 1;
                 }
             }
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                n as u64,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             continue;

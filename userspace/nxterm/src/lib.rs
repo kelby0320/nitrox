@@ -26,25 +26,22 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use libdraw::geom::{Rect, Size};
+use libkern::abi::BTN_LEFT;
+use librsproto::surface::{
+    KEY_DOWN, KEY_REPEAT, KeyEvent, POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED, PointerEvent, RESIZE_BOTTOM,
+    RESIZE_RIGHT, WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
+};
 use libterm::cell::Palette;
 use libterm::grid::Grid;
 use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
-use libkern::abi::BTN_LEFT;
-use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, POINTER_BUTTON, POINTER_MOTION,
-    POINTER_PRESSED, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT, WINDOW_STATE_MAXIMIZED,
-    WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
-};
 use libui::element::{Edge, Element, Insets, custom, dock, docked, padding, sized};
-use libui::widget::{
-    GRIP_W, TITLE_BAR_H, TitleButtons, WINDOW_CONTENT_X, WINDOW_CONTENT_Y, resize_grip,
-    title_bar, window_frame_with_grip,
-};
 use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::widget::{
-    TAB_STRIP_H, TextFieldState, Theme as UiTheme, ScrollState, WidgetState, scrollbar, text_field,
+    GRIP_W, TITLE_BAR_H, TitleButtons, WINDOW_CONTENT_X, WINDOW_CONTENT_Y, resize_grip, title_bar,
+    window_frame_with_grip,
 };
+use libui::widget::{ScrollState, TAB_STRIP_H, TextFieldState, Theme as UiTheme, WidgetState, scrollbar, text_field};
 
 /// The `custom` node the grid is drawn into.
 pub const GRID_KIND: u32 = 0x4772_6964;
@@ -308,7 +305,6 @@ pub struct Resized {
     /// Logical lines the ring dropped during the rewrap.
     pub evicted: usize,
 }
-
 
 /// The most tabs one window can hold, **derived rather than chosen**.
 ///
@@ -656,7 +652,8 @@ impl App {
 
     /// Follow the output again, repainting if that moved the view.
     pub fn snap_to_bottom(&mut self) {
-        if self.tab_mut().view_top.is_some_and(|t| self.tab_mut().grid.clamp_view(t) != self.tab_mut().grid.top_line()) {
+        if self.tab_mut().view_top.is_some_and(|t| self.tab_mut().grid.clamp_view(t) != self.tab_mut().grid.top_line())
+        {
             self.tab_mut().view_moved = true;
         }
         self.tab_mut().view_top = None;
@@ -730,11 +727,7 @@ impl App {
         // and nothing tells this application that yet — the shell would have to set a title. A
         // number is the honest label until it does, and it is the one thing that distinguishes
         // two tabs showing the same prompt.
-        self.tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.key, alloc::format!("Terminal {}", i + 1)))
-            .collect()
+        self.tabs.iter().enumerate().map(|(i, t)| (t.key, alloc::format!("Terminal {}", i + 1))).collect()
     }
 
     /// Which tab is current.
@@ -852,9 +845,12 @@ impl App {
         // because before M14 Part A exactly two of them remembered to do it and the rest were a
         // row away from forgetting. A message that is not a row leaves it alone, which is what
         // keeps `MenuBar` able to open one.
-        if self.menu_table().iter().flat_map(|m| m.items.iter()).any(
-            |it| matches!(it, Item::Action { msg: m, .. } if *m == msg),
-        ) {
+        if self
+            .menu_table()
+            .iter()
+            .flat_map(|m| m.items.iter())
+            .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
+        {
             self.menus.close();
         }
         match msg {
@@ -1130,8 +1126,7 @@ impl App {
     /// the oldest line when it runs out, because a terminal's history is a loop a person scrolls
     /// rather than a document with an end.
     fn find_next(&mut self) {
-        let Some(needle) = self.find.as_ref().map(|f| alloc::string::String::from(f.text()))
-        else {
+        let Some(needle) = self.find.as_ref().map(|f| alloc::string::String::from(f.text())) else {
             return;
         };
         if needle.is_empty() {
@@ -1145,9 +1140,7 @@ impl App {
             }
             None => (g.oldest_line(), 0),
         };
-        let hit = g
-            .find_from(&needle, from_line, from_col)
-            .or_else(|| g.find_from(&needle, g.oldest_line(), 0));
+        let hit = g.find_from(&needle, from_line, from_col).or_else(|| g.find_from(&needle, g.oldest_line(), 0));
         let Some((line, col)) = hit else { return };
         let n = needle.chars().count();
         let t = self.tab_mut();
@@ -1204,11 +1197,7 @@ impl App {
         let top = self.view_line();
         // Positive is down, so it moves the viewport's first line forward. `scroll_to_line`
         // clamps, which is what makes running off either end stop rather than wrap.
-        let want = if lines < 0 {
-            top.saturating_sub(lines.unsigned_abs())
-        } else {
-            top.saturating_add(lines as u64)
-        };
+        let want = if lines < 0 { top.saturating_sub(lines.unsigned_abs()) } else { top.saturating_add(lines as u64) };
         self.scroll_to_line(want);
     }
 
@@ -1232,11 +1221,7 @@ impl App {
         let rows = self.tab().grid.rows() as u32;
         let oldest = self.tab().grid.oldest_line();
         let back = (self.tab().grid.top_line() - oldest) as u32;
-        ScrollState {
-            offset: (self.view_line() - oldest) as u32,
-            visible: rows,
-            total: back + rows,
-        }
+        ScrollState { offset: (self.view_line() - oldest) as u32, visible: rows, total: back + rows }
     }
 
     /// The height the scrollbar's track is laid out at.
@@ -1270,9 +1255,7 @@ impl App {
     /// one count, and a test walks the whole bar through it.
     pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
         let n = self.menu_count();
-        self.menus.set_anchors(
-            (0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect(),
-        );
+        self.menus.set_anchors((0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect());
     }
 
     /// How many menus the bar has — **derived from the table, never declared**.
@@ -1311,17 +1294,9 @@ impl App {
                     // **Enabled on the last tab too**, unlike `nxfiles`: there closing the last
                     // tab is a no-op, so the row would offer nothing; here it closes the window,
                     // which is what the chord means everywhere else it exists.
-                    Item::new(
-                        "Close Tab",
-                        Accel::ctrl_shift(CLOSE_TAB_KEYCODE, "W"),
-                        Msg::CloseTab(self.current),
-                    ),
+                    Item::new("Close Tab", Accel::ctrl_shift(CLOSE_TAB_KEYCODE, "W"), Msg::CloseTab(self.current)),
                     Item::Separator,
-                    Item::new(
-                        "New Window",
-                        Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"),
-                        Msg::NewWindow,
-                    ),
+                    Item::new("New Window", Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"), Msg::NewWindow),
                     Item::Separator,
                     Item::plain("Close Window", Msg::Close),
                     Item::new("Quit", Accel::ctrl_shift(QUIT_KEYCODE, "Q"), Msg::Quit),
@@ -1338,24 +1313,16 @@ impl App {
                     Item::new("Paste", Accel::ctrl_shift(PASTE_KEYCODE, "V"), Msg::Paste),
                     // **Offered whenever there is anything to select**, which is not the same as
                     // "there is a selection": Select All's whole job is to make one.
-                    Item::new(
-                        "Select All",
-                        Accel::ctrl_shift(SELECT_ALL_KEYCODE, "A"),
-                        Msg::SelectAll,
-                    )
-                    // **Offered when there is anything to select.** The old test here compared
-                    // `oldest_line() <= top_line()`, which is true by construction — `select_all`
-                    // is the one that knows, and it says so by returning `false`.
-                    .enabled(self.tab().grid.line_text(self.tab().grid.top_line()).is_some()),
+                    Item::new("Select All", Accel::ctrl_shift(SELECT_ALL_KEYCODE, "A"), Msg::SelectAll)
+                        // **Offered when there is anything to select.** The old test here compared
+                        // `oldest_line() <= top_line()`, which is true by construction — `select_all`
+                        // is the one that knows, and it says so by returning `false`.
+                        .enabled(self.tab().grid.line_text(self.tab().grid.top_line()).is_some()),
                     Item::new("Find", Accel::ctrl_shift(FIND_KEYCODE, "F"), Msg::Find),
                     // **Offered only when there is history to drop**, which is what `enabled` is
                     // for: a row that looks available and does nothing reads as a broken menu.
-                    Item::new(
-                        "Clear Scrollback",
-                        Accel::ctrl_shift(CLEAR_KEYCODE, "K"),
-                        Msg::ClearScrollback,
-                    )
-                    .enabled(self.tab().grid.oldest_line() < self.tab().grid.top_line()),
+                    Item::new("Clear Scrollback", Accel::ctrl_shift(CLEAR_KEYCODE, "K"), Msg::ClearScrollback)
+                        .enabled(self.tab().grid.oldest_line() < self.tab().grid.top_line()),
                     Item::Separator,
                     Item::plain("Clear", Msg::Clear),
                     Item::plain("Reset", Msg::Reset),
@@ -1367,21 +1334,12 @@ impl App {
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
     pub fn view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-
         let grid_px = self.metrics.pixel_size(self.tab().grid.cols(), self.tab().grid.rows());
 
         // **The bar is `libui::menu`'s, and so is what hangs off it.** It was one hand-rolled
         // `button` labelled "Terminal"; the word a menu bar carries is not a button, and the
         // popup under it was a second copy of `nxfiles`'s.
-        let bar = libui::menu::bar(
-            &self.menu_table(),
-            &self.menus,
-            MENU_BAR_KEY,
-            hovered,
-            Msg::MenuBar,
-            &ui,
-            BAR_H,
-        );
+        let bar = libui::menu::bar(&self.menu_table(), &self.menus, MENU_BAR_KEY, hovered, Msg::MenuBar, &ui, BAR_H);
         // **The tab strip, below the menu bar and above the grid** (M14 Part B). Same order as
         // `nxedit` and `nxfiles`, which is the point: a person who learned where the tabs are in
         // one window should not have to look somewhere else in the next.
@@ -1390,10 +1348,8 @@ impl App {
         // second tab would move every row of the grid down the moment you opened one — a terminal
         // reflowing its scrollback because you pressed a chord.
         let labels = self.tab_labels();
-        let tabs: Vec<libui::widget::Tab<'_>> = labels
-            .iter()
-            .map(|(key, label)| libui::widget::Tab { key: *key, label, marked: false })
-            .collect();
+        let tabs: Vec<libui::widget::Tab<'_>> =
+            labels.iter().map(|(key, label)| libui::widget::Tab { key: *key, label, marked: false }).collect();
         // **The find field takes the tab strip's row rather than adding one** (M14 Part E). A
         // strip of its own is where a find bar conventionally goes and would have changed the
         // grid's height — which is the number every gate that measures this terminal asserts, and
@@ -1460,44 +1416,43 @@ impl App {
             title,
             dock(
                 vec![
-                docked(Edge::Top, bar.key(BAR_KEY)),
-                // `tab_strip` already returns itself `sized` to `TAB_STRIP_H`, so this only
-                // needs the key (PR #282 review, optional 9).
-                docked(Edge::Top, strip.key(TAB_STRIP_KEY)),
-                docked(
-                    Edge::Right,
-                    // **Sized, so the bar ends where the grip begins.** The dock's right slot
-                    // is the full remaining height; without this the scrollbar is laid out
-                    // under the grip and the bottom `GRIP_W` of its track is unpressable — see
-                    // [`track_h`](Self::track_h).
-                    // The key goes on the wrapper, because the diff requires a container's
-                    // children to be all keyed or all unkeyed and this one's siblings are keyed.
-                    sized(
-                        Size::new(SCROLL_W, self.track_h()),
-                        // **Drawn only when there is history to reach** (desktop refresh,
-                        // Part K). The design's terminal shows no scrollbar at all, and ours
-                        // drew a full-height thumb in `border` down the right of a near-black
-                        // pane whether or not anything had scrolled off — a light strip against
-                        // the darkest surface on the screen, so the one thing the eye found in
-                        // an empty terminal was a control that did nothing.
-                        //
-                        // **The column is kept, not removed.** Taking `SCROLL_W` out of
-                        // `CHROME_W` when there is nothing to scroll would give the grid a
-                        // wider box, and the grid would reflow the first time output ran off
-                        // the top — a terminal rewrapping its screen because a command printed
-                        // one line too many. That is the tab strip's argument one widget over.
-                        // So the slot stays and carries the terminal's own ground, which is
-                        // what the pane beside it is filled with: the pane simply looks that
-                        // much wider until there is a bar to put there.
-                        if self.scroll().scrollable() {
-                            scrollbar(self.scroll(), SCROLL_W, self.track_h(), &ui)
-                                .on_pointer(Msg::Scroll)
-                        } else {
-                            libui::element::fill(self.palette.background)
-                        },
-                    )
-                    .key(SCROLLBAR_KEY),
-                ),
+                    docked(Edge::Top, bar.key(BAR_KEY)),
+                    // `tab_strip` already returns itself `sized` to `TAB_STRIP_H`, so this only
+                    // needs the key (PR #282 review, optional 9).
+                    docked(Edge::Top, strip.key(TAB_STRIP_KEY)),
+                    docked(
+                        Edge::Right,
+                        // **Sized, so the bar ends where the grip begins.** The dock's right slot
+                        // is the full remaining height; without this the scrollbar is laid out
+                        // under the grip and the bottom `GRIP_W` of its track is unpressable — see
+                        // [`track_h`](Self::track_h).
+                        // The key goes on the wrapper, because the diff requires a container's
+                        // children to be all keyed or all unkeyed and this one's siblings are keyed.
+                        sized(
+                            Size::new(SCROLL_W, self.track_h()),
+                            // **Drawn only when there is history to reach** (desktop refresh,
+                            // Part K). The design's terminal shows no scrollbar at all, and ours
+                            // drew a full-height thumb in `border` down the right of a near-black
+                            // pane whether or not anything had scrolled off — a light strip against
+                            // the darkest surface on the screen, so the one thing the eye found in
+                            // an empty terminal was a control that did nothing.
+                            //
+                            // **The column is kept, not removed.** Taking `SCROLL_W` out of
+                            // `CHROME_W` when there is nothing to scroll would give the grid a
+                            // wider box, and the grid would reflow the first time output ran off
+                            // the top — a terminal rewrapping its screen because a command printed
+                            // one line too many. That is the tab strip's argument one widget over.
+                            // So the slot stays and carries the terminal's own ground, which is
+                            // what the pane beside it is filled with: the pane simply looks that
+                            // much wider until there is a bar to put there.
+                            if self.scroll().scrollable() {
+                                scrollbar(self.scroll(), SCROLL_W, self.track_h(), &ui).on_pointer(Msg::Scroll)
+                            } else {
+                                libui::element::fill(self.palette.background)
+                            },
+                        )
+                        .key(SCROLLBAR_KEY),
+                    ),
                 ],
                 // **The pane: the terminal's own ground, and the cells inside its margin**
                 // (desktop refresh, Part B). A custom node takes the size it declares, so the
@@ -1535,7 +1490,6 @@ impl App {
             self.focused,
             &ui,
         );
-
 
         // **The menu is not in this tree.** It used to be a `Stack` layer over the whole
         // window — a layer inside the 24-pixel bar would have been clipped to 24 pixels, so it
@@ -1627,10 +1581,7 @@ mod tests {
         a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
         a.update(Msg::GridPointer(ptr(POINTER_MOTION, 1, 0, 5 * w, h / 2)));
         press(&mut a, COPY_KEYCODE, MOD_CTRL | MOD_SHIFT);
-        assert_eq!(
-            a.take_clip_request(),
-            Some(ClipRequest::Copy(alloc::string::String::from("hello")))
-        );
+        assert_eq!(a.take_clip_request(), Some(ClipRequest::Copy(alloc::string::String::from("hello"))));
         // …and the chord did not reach the shell as an interrupt.
         assert!(a.take_outbox().is_empty(), "the chord was consumed, not typed");
     }
@@ -1722,10 +1673,7 @@ mod tests {
         let h = a.metrics.cell_h as i32;
         a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
         let rows = a.damage_rows();
-        assert!(
-            rows.contains(&0),
-            "the top viewport row is scrollback and has to repaint; got {rows:?}"
-        );
+        assert!(rows.contains(&0), "the top viewport row is scrollback and has to repaint; got {rows:?}");
     }
 
     #[test]
@@ -1764,10 +1712,7 @@ mod tests {
         let l = layout(&e, bounds, &FixedCell { w: 8, h: 16 });
         let bar = locate(&e, &l, SCROLLBAR_KEY).expect("the scrollbar is keyed");
         let grip = locate(&e, &l, GRIP_KEY).expect("the grip is keyed");
-        assert!(
-            bar.intersect(&grip).is_none(),
-            "the grip {grip:?} overlaps the scrollbar {bar:?}"
-        );
+        assert!(bar.intersect(&grip).is_none(), "the grip {grip:?} overlaps the scrollbar {bar:?}");
         // **And it ends where the grip begins**, not short of it. Not overlapping is half of it: a
         // bar sized against the wrong box stopped 19 pixels above the grip and left a patch of the
         // window's face between them, which the half above passes (PR #313 review, finding 2).
@@ -1829,10 +1774,7 @@ mod tests {
         let bare = reach(&a);
         a.feed(b"\x1b]7;/home/alice\x07");
         let with_place = reach(&a);
-        assert!(
-            with_place > bare,
-            "the bar reached {with_place} with a directory and {bare} without — no subtitle"
-        );
+        assert!(with_place > bare, "the bar reached {with_place} with a directory and {bare} without — no subtitle");
 
         // **A second tab has its own shell and its own answer.** A directory kept on the
         // window rather than on the tab passes everything above and shows the first tab's
@@ -1911,10 +1853,7 @@ mod tests {
             for y in bar.origin.y as u32..bar.bottom() as u32 {
                 for x in bar.origin.x as u32..bar.right() as u32 {
                     let c = fb.get_pixel(x, y);
-                    if c.is_some()
-                        && c != Some(a.palette.background)
-                        && c != Some(ui.background)
-                        && c != Some(ui.face)
+                    if c.is_some() && c != Some(a.palette.background) && c != Some(ui.background) && c != Some(ui.face)
                     {
                         n += 1;
                     }
@@ -2082,9 +2021,8 @@ mod tests {
     /// asks what the user can see. The two are the same thing while the view follows the
     /// bottom, which is every test written before scrollback existed.
     fn line(a: &App, row: usize) -> alloc::string::String {
-        let s: alloc::string::String = (0..a.grid().cols())
-            .map(|c| a.grid().view_cell(a.view_line(), row, c).map_or(' ', |x| x.ch))
-            .collect();
+        let s: alloc::string::String =
+            (0..a.grid().cols()).map(|c| a.grid().view_cell(a.view_line(), row, c).map_or(' ', |x| x.ch)).collect();
         s.trim_end().into()
     }
 
@@ -2245,9 +2183,7 @@ mod tests {
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
         let view = a.view(&UiTheme::default(), None);
         let l = layout(&view, bounds, &cell);
-        a.menus.set_anchors(
-            (0..a.menu_count()).map(|i| locate(&view, &l, MENU_BAR_KEY + i as u64)).collect(),
-        );
+        a.menus.set_anchors((0..a.menu_count()).map(|i| locate(&view, &l, MENU_BAR_KEY + i as u64)).collect());
 
         let measure = |a: &App| {
             libui::layout::measure(
@@ -2266,10 +2202,7 @@ mod tests {
         // **Different, not ordered.** File was one row when this was written and is five now;
         // what the popup rebuild depends on is that the two menus measure *differently*, which is
         // the property, and asserting which is taller made it a fact about today's menus.
-        assert_ne!(
-            edit_size, file_size,
-            "the two menus measure the same, so a rebuild would be undetectable here"
-        );
+        assert_ne!(edit_size, file_size, "the two menus measure the same, so a rebuild would be undetectable here");
     }
 
     /// The chord a menu row advertises does what choosing that row does.
@@ -2339,25 +2272,13 @@ mod tests {
             by_chord.update(Msg::Key(ev));
             // Each digest exactly once: it drains the clipboard outbox, which is the only way to
             // see it, so a second call on the same terminal reports its own emptiness.
-            let (by_row, by_chord, untouched) =
-                (digest(&mut by_row), digest(&mut by_chord), digest(&mut selected()));
-            assert_eq!(
-                by_chord, by_row,
-                "{label}: {} does not do what choosing the row does",
-                acc.label()
-            );
+            let (by_row, by_chord, untouched) = (digest(&mut by_row), digest(&mut by_chord), digest(&mut selected()));
+            assert_eq!(by_chord, by_row, "{label}: {} does not do what choosing the row does", acc.label());
             // **The negative control**: the two agreeing is only evidence if the row moved
             // something. A terminal that ignored both would pass the assertion above.
-            assert_ne!(
-                by_row, untouched,
-                "{label} changes nothing, so this row proves nothing about routing"
-            );
+            assert_ne!(by_row, untouched, "{label} changes nothing, so this row proves nothing about routing");
         }
-        assert_eq!(
-            checked,
-            8,
-            "the four tab and clipboard rows, Select All and Find, plus New Window and Quit"
-        );
+        assert_eq!(checked, 8, "the four tab and clipboard rows, Select All and Find, plus New Window and Quit");
     }
     // --- Find, Clear Scrollback and the click runs (M14 Part E) --------------
 
@@ -2375,19 +2296,13 @@ mod tests {
         assert!(a.find.is_some(), "the field is open");
 
         for c in "hello".bytes() {
-            let code = (1u16..=90)
-                .find(|k| libinput::keymap::to_char(*k, 0) == Some(c))
-                .expect("a keycode");
+            let code = (1u16..=90).find(|k| libinput::keymap::to_char(*k, 0) == Some(c)).expect("a keycode");
             a.update(Msg::Key(KeyEvent::new(1, code, KEY_DOWN as u16, 0)));
         }
         assert_eq!(a.find.as_ref().map(|f| f.text()), Some("hello"), "the keys went to the field");
 
         a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN as u16, 0)));
-        assert_eq!(
-            a.grid().selected_text().as_deref(),
-            Some("hello"),
-            "Enter selected the match"
-        );
+        assert_eq!(a.grid().selected_text().as_deref(), Some("hello"), "Enter selected the match");
 
         a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN as u16, 0)));
         assert!(a.find.is_none(), "Esc closed it");
@@ -2411,20 +2326,14 @@ mod tests {
 
         a.update(Msg::Find);
         for c in "needle".bytes() {
-            let code = (1u16..=90)
-                .find(|k| libinput::keymap::to_char(*k, 0) == Some(c))
-                .expect("a keycode");
+            let code = (1u16..=90).find(|k| libinput::keymap::to_char(*k, 0) == Some(c)).expect("a keycode");
             a.update(Msg::Key(KeyEvent::new(1, code, KEY_DOWN as u16, 0)));
         }
         a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN as u16, 0)));
 
         assert_eq!(a.grid().selected_text().as_deref(), Some("needle"), "it found the match");
         assert_ne!(a.view_line(), a.grid().top_line(), "and scrolled back to show it");
-        assert_eq!(
-            a.damage_rows().len(),
-            a.grid().rows(),
-            "a viewport that moved repaints all of itself"
-        );
+        assert_eq!(a.damage_rows().len(), a.grid().rows(), "a viewport that moved repaints all of itself");
     }
 
     /// A second press takes a word and a third takes the line; a fourth starts again.
@@ -2497,11 +2406,7 @@ mod tests {
         // whether or not the view was reset — the difference a person sees is whether anything is
         // *redrawn*, and a viewport that moved from history to the screen without damage leaves
         // every pixel stale (PR #287 review, worth fixing 6, second attempt).
-        assert_eq!(
-            a.damage_rows().len(),
-            a.grid().rows(),
-            "moving the viewport repaints all of it"
-        );
+        assert_eq!(a.damage_rows().len(), a.grid().rows(), "moving the viewport repaints all of it");
     }
 
     /// `check-terminal` clicks the Edit menu's `Clear` by number; this is that number.
@@ -2515,11 +2420,7 @@ mod tests {
         // The constant in `tools/xtask/src/main.rs`, as `MENU_ROW_KEY + n`.
         const CLEAR_ROW: usize = 6;
         let a = app();
-        let edit = a
-            .menu_table()
-            .into_iter()
-            .find(|m| m.title == "Edit")
-            .expect("an Edit menu");
+        let edit = a.menu_table().into_iter().find(|m| m.title == "Edit").expect("an Edit menu");
         match &edit.items[CLEAR_ROW] {
             Item::Action { label, msg, .. } => {
                 assert_eq!(*label, "Clear", "check-terminal's CLEAR_ROW is not Clear any more");
@@ -2537,11 +2438,7 @@ mod tests {
     /// body and nothing else.
     #[test]
     fn the_menu_is_not_a_layer_in_the_windows_tree() {
-        for (open, anchor) in [
-            (false, None),
-            (true, Some(Rect::new(4, 0, 60, BAR_H))),
-            (true, None),
-        ] {
+        for (open, anchor) in [(false, None), (true, Some(Rect::new(4, 0, 60, BAR_H))), (true, None)] {
             let mut a = app();
             if open {
                 a.menus.toggle(0);
@@ -2591,19 +2488,12 @@ mod tests {
         // the chrome moves this with it.
         let bar_top = (WINDOW_CONTENT_Y + TITLE_BAR_H) as i32;
         assert!(item.origin.y >= bar_top, "the item is below the title bar");
-        assert!(
-            item.bottom() <= (bar_top as u32 + BAR_H) as i64,
-            "the item is inside the menu bar"
-        );
+        assert!(item.bottom() <= (bar_top as u32 + BAR_H) as i64, "the item is inside the menu bar");
 
         // And the menu it will hold has a real size to be created at — measured, not guessed,
         // because a popup window needs its extent before it exists.
         let menu = a.menu_view(&UiTheme::default(), None);
-        let size = libui::layout::measure(
-            &menu,
-            libui::layout::Constraints::loose(bounds.size),
-            &cell,
-        );
+        let size = libui::layout::measure(&menu, libui::layout::Constraints::loose(bounds.size), &cell);
         assert!(size.w > 0 && size.h > 0, "the menu measures to something");
         assert!(
             item.bottom() + size.h as i64 > BAR_H as i64,
@@ -2793,11 +2683,7 @@ mod tests {
         let _ = a.damage_rows(); // start from a clean frame
 
         turn(&mut a, -1);
-        assert_eq!(
-            a.damage_rows().len(),
-            a.grid().rows(),
-            "the viewport moved and nothing was repainted"
-        );
+        assert_eq!(a.damage_rows().len(), a.grid().rows(), "the viewport moved and nothing was repainted");
     }
 
     #[test]
@@ -2873,12 +2759,10 @@ mod tests {
         let mut a = app();
         produce(&mut a, 40);
         grab(&mut a, 0);
-        let showing: alloc::vec::Vec<alloc::string::String> =
-            (0..a.grid().rows()).map(|r| line(&a, r)).collect();
+        let showing: alloc::vec::Vec<alloc::string::String> = (0..a.grid().rows()).map(|r| line(&a, r)).collect();
 
         a.feed(b"more\r\nand more\r\n");
-        let after: alloc::vec::Vec<alloc::string::String> =
-            (0..a.grid().rows()).map(|r| line(&a, r)).collect();
+        let after: alloc::vec::Vec<alloc::string::String> = (0..a.grid().rows()).map(|r| line(&a, r)).collect();
         assert_eq!(showing, after, "the view moved under the reader");
     }
 
@@ -3118,12 +3002,7 @@ mod tests {
         let m = &a.metrics;
         let o = a.grid_origin();
         // The whole grid.
-        let all = rows_in(
-            Rect::new(0, o.y, 100, m.cell_h * 6),
-            o,
-            m,
-            6,
-        );
+        let all = rows_in(Rect::new(0, o.y, 100, m.cell_h * 6), o, m, 6);
         assert_eq!(all, alloc::vec![0, 1, 2, 3, 4, 5]);
 
         // Exactly one row, and the *right* one: a clip on row 2's first pixel is row 2.
@@ -3316,11 +3195,7 @@ mod tests {
         // Nothing has happened to tab one's grid since it was last drawn, so its *own* damage is
         // empty — which is exactly why the switch has to declare it.
         a.update(Msg::SelectTab(one));
-        assert_eq!(
-            a.damage_rows().len(),
-            a.grid().rows(),
-            "switching tabs left the other tab's pixels on screen"
-        );
+        assert_eq!(a.damage_rows().len(), a.grid().rows(), "switching tabs left the other tab's pixels on screen");
     }
 
     /// Closing a tab repaints too: the survivor's pixels are as stale as a switch's.
@@ -3383,12 +3258,8 @@ mod tests {
         assert_eq!(a.tabs().len(), MAX_TABS, "the cap did not hold");
         assert!(MAX_TABS < libkern::abi::MAX_WAIT_HANDLES, "…and it leaves room for the window");
         // The refusal is visible: the last one said so in the grid rather than doing nothing.
-        assert!(
-            (0..a.grid().rows()).any(|r| line(&a, r).contains("no more tabs")),
-            "the refusal was silent"
-        );
+        assert!((0..a.grid().rows()).any(|r| line(&a, r).contains("no more tabs")), "the refusal was silent");
     }
-
 
     /// **Every** menu in the bar can be opened, not just the ones a test happened to name.
     ///
@@ -3419,5 +3290,4 @@ mod tests {
             a.menus.close();
         }
     }
-
 }

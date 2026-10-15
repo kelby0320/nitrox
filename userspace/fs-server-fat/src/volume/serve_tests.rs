@@ -45,8 +45,15 @@ fn resolve<V: Volume>(vol: &V, suffix: &[u8]) -> Result<Blocks, i32> {
             assert_eq!(rr.object_kind, OBJECT_KIND_FILE_BLOCKS);
             let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
             let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
-            let runs = (0..u32_at(12) as usize).map(|i| 32 + 24 * i).map(|at| (u64_at(at), u64_at(at + 8), u32_at(at + 16)));
-            Ok(Blocks { size: rr.content_len, block_size: u32_at(8), runs: runs.collect(), id: u64_at(16), flags: u32_at(24) })
+            let runs =
+                (0..u32_at(12) as usize).map(|i| 32 + 24 * i).map(|at| (u64_at(at), u64_at(at + 8), u32_at(at + 16)));
+            Ok(Blocks {
+                size: rr.content_len,
+                block_size: u32_at(8),
+                runs: runs.collect(),
+                id: u64_at(16),
+                flags: u32_at(24),
+            })
         }
         Served::Error { reply_len } => {
             let m = decode(&reply[..reply_len]).unwrap();

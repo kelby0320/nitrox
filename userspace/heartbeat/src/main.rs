@@ -27,8 +27,8 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use libkern::*;
 use libkern::control::Control;
+use libkern::*;
 use liblog::Logger;
 use libstream::wire::Result as StreamResult;
 use libstream::{Schema, SliceSink, TableWriter, TypeModifiers, TypeTag, TypedRecord, Value, WireError};
@@ -56,11 +56,7 @@ impl TypedRecord for Beat {
     }
 
     fn to_values(&self) -> Vec<Value> {
-        vec![
-            Value::Int(self.seq),
-            Value::Int(self.uptime_ns),
-            Value::Bool(self.healthy),
-        ]
+        vec![Value::Int(self.seq), Value::Int(self.uptime_ns), Value::Bool(self.healthy)]
     }
 
     fn from_values(v: &[Value]) -> StreamResult<Self> {
@@ -162,14 +158,7 @@ fn emit_beat_typed(log_ep: u64, beat: &Beat) {
     // SAFETY: `buf` is a valid IpcMsg (header + `body_len` payload bytes at offset 24);
     // no transferred handles; NoBlock so a slow/full sink never blocks the beat loop.
     unsafe {
-        syscall5(
-            SYS_CHANNEL_SEND,
-            log_ep,
-            buf.as_ptr() as u64,
-            no_handles.as_ptr() as u64,
-            0,
-            SENDMODE_NOBLOCK,
-        );
+        syscall5(SYS_CHANNEL_SEND, log_ep, buf.as_ptr() as u64, no_handles.as_ptr() as u64, 0, SENDMODE_NOBLOCK);
     }
 }
 
@@ -187,13 +176,7 @@ fn recv_log_handoff(control: u64) -> u64 {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     let waited = unsafe {
         WAIT_HANDLES[0] = control;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            deadline,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
     };
     if waited < 1 {
         return 0; // no handoff (e.g. no logging service) — run without structured logging
@@ -213,11 +196,7 @@ fn recv_log_handoff(control: u64) -> u64 {
     }
     // SAFETY: the kernel wrote the transferred-handle count + values.
     let count = unsafe { (&raw const RECV_COUNT).read() };
-    if count >= 1 {
-        unsafe { (&raw const RECV_HANDLES[0]).read() }
-    } else {
-        0
-    }
+    if count >= 1 { unsafe { (&raw const RECV_HANDLES[0]).read() } } else { 0 }
 }
 
 /// The daemon loop: beat on a deadline, exit on a control shutdown. Beats emit as log
@@ -239,14 +218,7 @@ fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
     // Emit the first typed beat immediately (before the timed loop), so the typed path is
     // demonstrated even under a fast boot where the verdict ends the run within one beat
     // interval. Subsequent beats fire on the timer below.
-    emit_beat_typed(
-        log_ep,
-        &Beat {
-            seq: beat,
-            uptime_ns: 0,
-            healthy: true,
-        },
-    );
+    emit_beat_typed(log_ep, &Beat { seq: beat, uptime_ns: 0, healthy: true });
     beat += 1;
     loop {
         // Arm the beat deadline (absolute monotonic) and wait on the control endpoint.
@@ -255,13 +227,7 @@ fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
         let waited = unsafe {
             WAIT_HANDLES[0] = control;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                deadline,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
         };
         if waited >= 1 {
             // The control endpoint signalled — a message is waiting.
@@ -281,14 +247,7 @@ fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
             }
         } else {
             // Deadline reached, no control message — emit a typed beat.
-            emit_beat_typed(
-                log_ep,
-                &Beat {
-                    seq: beat,
-                    uptime_ns: now.saturating_sub(start_ns) as i64,
-                    healthy: true,
-                },
-            );
+            emit_beat_typed(log_ep, &Beat { seq: beat, uptime_ns: now.saturating_sub(start_ns) as i64, healthy: true });
             beat = beat.wrapping_add(1);
         }
     }

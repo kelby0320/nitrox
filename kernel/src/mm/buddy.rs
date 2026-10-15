@@ -109,10 +109,7 @@ impl BuddyAllocator {
                 }
             });
         }
-        assert!(
-            min_base < max_end,
-            "buddy: no usable RAM above 1 MiB in Limine memory map"
-        );
+        assert!(min_base < max_end, "buddy: no usable RAM above 1 MiB in Limine memory map");
 
         // The bit-index formula `(frame - base_frame) >> (order + 1)`
         // assumes `base_frame` aligns with the natural pair structure at
@@ -240,11 +237,7 @@ impl BuddyAllocator {
     /// originally passed to `alloc`.
     pub fn free(&mut self, addr: PhysAddr, order: usize) {
         debug_assert!(order <= MAX_ORDER, "buddy: free order {order} > MAX_ORDER");
-        debug_assert!(
-            addr.is_page_aligned(),
-            "buddy: free of unaligned address {:#x}",
-            addr.as_u64()
-        );
+        debug_assert!(addr.is_page_aligned(), "buddy: free of unaligned address {:#x}", addr.as_u64());
         let frame = addr.frame();
         debug_assert!(
             frame >= self.base_frame && frame < self.base_frame + self.num_frames,
@@ -256,11 +249,7 @@ impl BuddyAllocator {
     /// Smallest order whose block size is `>= size` bytes. `size == 0`
     /// returns 0 (single-page allocation).
     pub const fn order_for_size(size: usize) -> usize {
-        let pages = if size == 0 {
-            1
-        } else {
-            (size + PAGE_SIZE - 1) / PAGE_SIZE
-        };
+        let pages = if size == 0 { 1 } else { (size + PAGE_SIZE - 1) / PAGE_SIZE };
         let mut o = 0usize;
         let mut covered = 1usize;
         while covered < pages {
@@ -286,11 +275,7 @@ impl BuddyAllocator {
         let buddy_frame = frame ^ (1 << order);
         let buddy_addr = PhysAddr((buddy_frame as u64) << PAGE_SHIFT);
         let removed = self.remove_from_free_list(buddy_addr, order);
-        debug_assert!(
-            removed,
-            "buddy: coalesce expected buddy {:#x} on free_lists[{order}]",
-            buddy_addr.as_u64()
-        );
+        debug_assert!(removed, "buddy: coalesce expected buddy {:#x} on free_lists[{order}]", buddy_addr.as_u64());
         let parent_frame = frame & !(1usize << order);
         let parent_addr = PhysAddr((parent_frame as u64) << PAGE_SHIFT);
         self.free_frame(parent_addr, order + 1);
@@ -386,11 +371,7 @@ impl BuddyAllocator {
         let ptr = (addr.as_u64() + self.hhdm_offset) as *const u64;
         // SAFETY: per the function-level contract.
         let v = unsafe { core::ptr::read_volatile(ptr) };
-        if v == NEXT_SENTINEL {
-            None
-        } else {
-            Some(PhysAddr(v))
-        }
+        if v == NEXT_SENTINEL { None } else { Some(PhysAddr(v)) }
     }
 }
 
@@ -401,10 +382,7 @@ impl BuddyAllocator {
 /// # Safety
 /// `memory_map` must be a valid Limine response (see
 /// `BuddyAllocator::new`).
-unsafe fn for_each_usable<F: FnMut(&MemoryMapEntry)>(
-    memory_map: &MemoryMapResponse,
-    mut f: F,
-) {
+unsafe fn for_each_usable<F: FnMut(&MemoryMapEntry)>(memory_map: &MemoryMapResponse, mut f: F) {
     let count = memory_map.entry_count as usize;
     let mut i = 0;
     while i < count {
@@ -434,11 +412,7 @@ fn clip_to_managed(entry: &MemoryMapEntry) -> (u64, u64) {
     let start_raw = entry.base.max(LOW_MEMORY_LIMIT);
     let start = (start_raw + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
     let end = end & !(PAGE_SIZE as u64 - 1);
-    if end <= start {
-        (0, 0)
-    } else {
-        (start, end)
-    }
+    if end <= start { (0, 0) } else { (start, end) }
 }
 
 /// Find a page-aligned, above-1-MiB physical address inside some Usable
@@ -448,10 +422,7 @@ fn clip_to_managed(entry: &MemoryMapEntry) -> (u64, u64) {
 ///
 /// # Safety
 /// `memory_map` must be a valid Limine response.
-unsafe fn find_bitmap_region(
-    memory_map: &MemoryMapResponse,
-    reservation_bytes: u64,
-) -> Option<u64> {
+unsafe fn find_bitmap_region(memory_map: &MemoryMapResponse, reservation_bytes: u64) -> Option<u64> {
     let mut chosen: Option<u64> = None;
     // SAFETY: caller asserts `memory_map` is valid.
     unsafe {
@@ -505,32 +476,16 @@ mod tests {
             let mut backing = vec![0u8; bytes + 2 * PAGE_SIZE];
             let raw = backing.as_mut_ptr() as u64;
             let aligned = (raw + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
-            assert!(
-                aligned >= LOW_MEMORY_LIMIT,
-                "host buffer at {aligned:#x} should sit above 1 MiB"
-            );
+            assert!(aligned >= LOW_MEMORY_LIMIT, "host buffer at {aligned:#x} should sit above 1 MiB");
 
-            let mut entries = vec![MemoryMapEntry {
-                base: aligned,
-                length: bytes as u64,
-                kind: MEMMAP_USABLE,
-            }];
+            let mut entries = vec![MemoryMapEntry { base: aligned, length: bytes as u64, kind: MEMMAP_USABLE }];
             let entries_ptr: *mut MemoryMapEntry = entries.as_mut_ptr();
             let mut entry_ptrs: Vec<*mut MemoryMapEntry> = vec![entries_ptr];
             let entry_ptrs_ptr = entry_ptrs.as_mut_ptr();
 
-            let response = Box::new(MemoryMapResponse {
-                revision: 0,
-                entry_count: 1,
-                entries: entry_ptrs_ptr,
-            });
+            let response = Box::new(MemoryMapResponse { revision: 0, entry_count: 1, entries: entry_ptrs_ptr });
 
-            Self {
-                _backing: backing,
-                _entries: entries,
-                _entry_ptrs: entry_ptrs,
-                response,
-            }
+            Self { _backing: backing, _entries: entries, _entry_ptrs: entry_ptrs, response }
         }
 
         fn memmap(&self) -> &MemoryMapResponse {
@@ -557,10 +512,7 @@ mod tests {
         assert_eq!(BuddyAllocator::order_for_size(PAGE_SIZE * 2), 1);
         assert_eq!(BuddyAllocator::order_for_size(PAGE_SIZE * 3), 2);
         assert_eq!(BuddyAllocator::order_for_size(PAGE_SIZE * 4), 2);
-        assert_eq!(
-            BuddyAllocator::order_for_size(PAGE_SIZE << MAX_ORDER),
-            MAX_ORDER
-        );
+        assert_eq!(BuddyAllocator::order_for_size(PAGE_SIZE << MAX_ORDER), MAX_ORDER);
     }
 
     #[test]
@@ -579,10 +531,7 @@ mod tests {
             assert!(handed_out < 1024, "runaway allocation loop");
         }
         assert!(handed_out > 0, "should hand out at least one page");
-        assert!(
-            a.alloc(0).is_none(),
-            "alloc after exhaustion must be None"
-        );
+        assert!(a.alloc(0).is_none(), "alloc after exhaustion must be None");
     }
 
     #[test]
@@ -591,10 +540,7 @@ mod tests {
         let p = a.alloc(0).expect("alloc 0");
         a.free(p, 0);
         let q = a.alloc(0).expect("alloc 0 after free");
-        assert_eq!(
-            p, q,
-            "LIFO free list should return the just-freed block"
-        );
+        assert_eq!(p, q, "LIFO free list should return the just-freed block");
     }
 
     #[test]
@@ -606,19 +552,12 @@ mod tests {
         // must coalesce back into a single order-1 block at the lower
         // half's address.
         let block = a.alloc(1).expect("alloc order 1");
-        assert_eq!(
-            block.frame() & 1,
-            0,
-            "order-1 block must be order-1-aligned"
-        );
+        assert_eq!(block.frame() & 1, 0, "order-1 block must be order-1-aligned");
         let hi = PhysAddr(block.as_u64() + PAGE_SIZE as u64);
         a.free(block, 0);
         a.free(hi, 0);
         let merged = a.alloc(1).expect("coalesced order-1 alloc");
-        assert_eq!(
-            merged, block,
-            "coalesced block should start at the lower buddy"
-        );
+        assert_eq!(merged, block, "coalesced block should start at the lower buddy");
     }
 
     #[test]
@@ -634,23 +573,14 @@ mod tests {
         let mut observed_buddy_pair = false;
         while let Some(cur) = a.alloc(0) {
             if let Some(prev) = last {
-                let (lo, hi) = if prev.as_u64() < cur.as_u64() {
-                    (prev, cur)
-                } else {
-                    (cur, prev)
-                };
-                if hi.as_u64() - lo.as_u64() == PAGE_SIZE as u64
-                    && (lo.frame() & 1) == 0
-                {
+                let (lo, hi) = if prev.as_u64() < cur.as_u64() { (prev, cur) } else { (cur, prev) };
+                if hi.as_u64() - lo.as_u64() == PAGE_SIZE as u64 && (lo.frame() & 1) == 0 {
                     observed_buddy_pair = true;
                     break;
                 }
             }
             last = Some(cur);
         }
-        assert!(
-            observed_buddy_pair,
-            "split path should produce at least one consecutive buddy pair"
-        );
+        assert!(observed_buddy_pair, "split path should produce at least one consecutive buddy pair");
     }
 }

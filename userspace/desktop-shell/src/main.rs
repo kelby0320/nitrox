@@ -78,24 +78,22 @@ const HOTKEY_SWITCH_BASE: u32 = 10;
 const HOTKEY_MOVE_BASE: u32 = 20;
 /// `EV_KEY` code for `1`. `2`, `3` and `4` follow it.
 const KEY_1: u16 = 2;
-use librsproto::surface::{
-    CreateWindowRequest, Edge, MgrLayout, OP_MGR_QUERY_LAYOUT, OP_MGR_SET_WINDOW_DESKTOP, Role,
-    STICKY_DESKTOP,
-};
-use libsurface::{Session, Transport};
-use libsurface::ipc::ChannelTransport;
-use libui::element::{Element, Insets, custom, fill, offset, padding, row, sized, stack, text};
-use libui::layout::layout;
-use desktop_shell::{
-    Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, Screen, ShownDesktop,
-    parse_entry,
-};
 use desktop_shell::ending::{Asked, Closing, Ending, Next, POWER_PROGRAM, POWER_VIEW, Refusal, failed};
 use desktop_shell::panel::{self, BottomMsg, EndingMsg, MenuMsg, RefusalMsg, TopMsg};
+use desktop_shell::{
+    Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, Screen, ShownDesktop, parse_entry,
+};
+use librsproto::surface::{
+    CreateWindowRequest, Edge, MgrLayout, OP_MGR_QUERY_LAYOUT, OP_MGR_SET_WINDOW_DESKTOP, Role, STICKY_DESKTOP,
+};
+use libsurface::ipc::ChannelTransport;
+use libsurface::{Session, Transport};
+use libui::element::{Element, Insets, custom, fill, offset, padding, row, sized, stack, text};
+use libui::layout::layout;
 use libui::menu::{Item, KeyOutcome, MenuState};
-use libui::window::Child;
 use libui::paint::{FontMetrics, Theme, paint_over};
 use libui::widget::TextFieldState;
+use libui::window::Child;
 
 /// `alloc` backing: the toolkit builds an element tree per frame.
 #[global_allocator]
@@ -114,13 +112,8 @@ static ALLOC: libheap::Heap = libheap::Heap;
 fn clock_text() -> alloc::string::String {
     let mut nanos = 0u64;
     // SAFETY: `&mut nanos` is a valid writable u64 out-param for the clock read.
-    let r = unsafe {
-        libkern::syscall2(
-            libkern::SYS_CLOCK_READ,
-            libkern::abi::CLOCK_REALTIME,
-            (&raw mut nanos) as u64,
-        )
-    };
+    let r =
+        unsafe { libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64) };
     if r < 0 {
         return alloc::string::String::new();
     }
@@ -139,13 +132,8 @@ fn clock_text() -> alloc::string::String {
 fn next_minute(now: u64) -> u64 {
     let mut nanos = 0u64;
     // SAFETY: as above.
-    let r = unsafe {
-        libkern::syscall2(
-            libkern::SYS_CLOCK_READ,
-            libkern::abi::CLOCK_REALTIME,
-            (&raw mut nanos) as u64,
-        )
-    };
+    let r =
+        unsafe { libkern::syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_REALTIME, (&raw mut nanos) as u64) };
     const MINUTE: u64 = 60 * 1_000_000_000;
     if r < 0 {
         // No clock to follow. Wake in a minute anyway, so a clock that is set later appears
@@ -439,10 +427,7 @@ fn bottom_view(
     let visible = visible_entries(entries, current, cap);
     // **The title, or the id when there is none** — a window that has not named itself still
     // needs a button to click. The serial log's markers are not drawn: the dot says it.
-    let titles: alloc::vec::Vec<alloc::string::String> = visible
-        .iter()
-        .map(|e| entry_title(e))
-        .collect();
+    let titles: alloc::vec::Vec<alloc::string::String> = visible.iter().map(|e| entry_title(e)).collect();
     let tasks: alloc::vec::Vec<panel::Task<'_>> = visible
         .iter()
         .zip(titles.iter())
@@ -499,7 +484,6 @@ fn read_applications(ns: u64) -> alloc::vec::Vec<Application> {
     apps
 }
 
-
 /// `theme`, as the overview wears it: light ink for a card's caption, on no ground of its own.
 ///
 /// **Ink only.** The overview's ground is a fill at an alpha, and every card draws its own; what
@@ -518,11 +502,7 @@ fn read_applications(ns: u64) -> alloc::vec::Vec<Application> {
 /// screendump, because nothing renders this surface on the host (see `desktop-refresh.md`).
 fn overview_ink(theme: &Theme) -> Theme {
     let paper = theme.background;
-    Theme {
-        foreground: paper,
-        foreground_dim: paper.blend(OVERVIEW_GROUND, CAPTION_DIM),
-        ..*theme
-    }
+    Theme { foreground: paper, foreground_dim: paper.blend(OVERVIEW_GROUND, CAPTION_DIM), ..*theme }
 }
 
 /// How much of the caption's ink the window count keeps: the design's 60%.
@@ -560,23 +540,12 @@ fn window_count(entries: &[WinEntry], desktop: u32) -> alloc::string::String {
 /// **One function for the two places that blit** — a card's wallpaper ground and a window's
 /// capture. They were the same loop written twice, and the first of them honoured the clip while
 /// the second did not, which only showed when a card ran under another.
-fn blit_clipped(
-    fb: &mut MemFramebuffer,
-    src: &[u8],
-    g: Geometry,
-    x: i32,
-    y: i32,
-    clip: Rect,
-) {
+fn blit_clipped(fb: &mut MemFramebuffer, src: &[u8], g: Geometry, x: i32, y: i32, clip: Rect) {
     use libdraw::framebuffer::Framebuffer as _;
     for sy in 0..g.height {
         for sx in 0..g.width {
             let (dx, dy) = (x + sx as i32, y + sy as i32);
-            if dx < clip.origin.x
-                || dy < clip.origin.y
-                || dx >= clip.right() as i32
-                || dy >= clip.bottom() as i32
-            {
+            if dx < clip.origin.x || dy < clip.origin.y || dx >= clip.right() as i32 || dy >= clip.bottom() as i32 {
                 continue;
             }
             let off = sy as usize * g.pitch + sx as usize * 4;
@@ -601,12 +570,7 @@ fn panel(theme: &Theme) -> Theme {
 
 /// A string field of an environment record, by name.
 fn env_str<'a>(env: &'a libstream::wire::Record, name: &str) -> Option<&'a str> {
-    env.schema
-        .fields
-        .iter()
-        .position(|f| f.name == name)
-        .and_then(|i| env.values.get(i))
-        .and_then(|v| v.as_str())
+    env.schema.fields.iter().position(|f| f.name == name).and_then(|i| env.values.get(i)).and_then(|v| v.as_str())
 }
 
 /// Unmap a buffer this process mapped with [`shared_buffer`], and forget the pointer.
@@ -636,9 +600,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
         return None;
     }
     // SAFETY: maps the object read/write at a kernel-chosen address.
-    let base = unsafe {
-        syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-    };
+    let base = unsafe { syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if base < 0 {
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
@@ -769,8 +731,7 @@ fn verify_app_namespace(
         // SAFETY: closing a session this check minted; the application will make its own.
         unsafe { syscall1(SYS_HANDLE_CLOSE, new_h) };
     }
-    let (manage_st, manage_h) =
-        ns_lookup(ns, b"/dev/draw/manage", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    let (manage_st, manage_h) = ns_lookup(ns, b"/dev/draw/manage", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if manage_h != 0 {
         // SAFETY: closing a handle this check should never have obtained.
         unsafe { syscall1(SYS_HANDLE_CLOSE, manage_h) };
@@ -915,15 +876,13 @@ fn bound_in(ns: u64, path: &str) -> bool {
     let mut entry = libkern::abi::NsEntry::zeroed();
     for index in 0u64.. {
         // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
-        let r =
-            unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut _ as u64) };
+        let r = unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut _ as u64) };
         if r != 0 {
             return false; // NotFound ends the walk
         }
         let len = (entry.path_len as usize).min(libkern::abi::NS_ENTRY_PATH_MAX);
         // SAFETY: the kernel wrote the binding path; `len` is clamped to the buffer.
-        let bound =
-            unsafe { core::slice::from_raw_parts((&raw const entry.path) as *const u8, len) };
+        let bound = unsafe { core::slice::from_raw_parts((&raw const entry.path) as *const u8, len) };
         if bound == path.as_bytes() {
             return true;
         }
@@ -940,9 +899,7 @@ fn bound_in(ns: u64, path: &str) -> bool {
 /// status.
 fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
-    };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
     if po < 0 {
         return (po as i32, 0);
     }
@@ -954,12 +911,16 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     // SAFETY: the kernel wrote one 24-byte IoResult: status at 8, handle at 16.
     let (status, handle) = unsafe {
         (
-            i32::from_le_bytes([
-                WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11],
-            ]),
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                WAIT_RESULTS[16],
+                WAIT_RESULTS[17],
+                WAIT_RESULTS[18],
+                WAIT_RESULTS[19],
+                WAIT_RESULTS[20],
+                WAIT_RESULTS[21],
+                WAIT_RESULTS[22],
+                WAIT_RESULTS[23],
             ]),
         )
     };
@@ -992,9 +953,7 @@ fn recv_handle(ch: u64) -> u64 {
         return 0;
     }
     // SAFETY: the kernel wrote `RECV_COUNT` transferred handles into `RECV_HANDLES`.
-    unsafe {
-        if RECV_COUNT == 0 { 0 } else { RECV_HANDLES[0] }
-    }
+    unsafe { if RECV_COUNT == 0 { 0 } else { RECV_HANDLES[0] } }
 }
 
 /// Block until `h` is signalled.
@@ -1177,13 +1136,7 @@ fn launch(l: &Launcher<'_>, program: &str, args: &[&str]) -> bool {
     let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(1 + args.len());
     argv.push(program);
     argv.extend_from_slice(args);
-    let sent = libstream::setup::send_setup_env(
-        setup_ours,
-        &libstream::setup::Streams::default(),
-        &argv,
-        env,
-    )
-    .is_ok();
+    let sent = libstream::setup::send_setup_env(setup_ours, &libstream::setup::Streams::default(), &argv, env).is_ok();
     // SAFETY: closing our end of the setup channel.
     unsafe { syscall1(SYS_HANDLE_CLOSE, setup_ours) };
     if !sent {
@@ -1262,12 +1215,7 @@ fn open_wallpaper(
     let image = match libdraw::png::decode(&bytes) {
         Ok(i) => i,
         Err(e) => {
-            Line::new()
-                .s(b"desktop-shell: wallpaper ")
-                .s(path.as_str().as_bytes())
-                .s(b" ")
-                .s(e.why().as_bytes())
-                .end();
+            Line::new().s(b"desktop-shell: wallpaper ").s(path.as_str().as_bytes()).s(b" ").s(e.why().as_bytes()).end();
             return None;
         }
     };
@@ -1276,22 +1224,18 @@ fn open_wallpaper(
     let plan = theme.wallpaper_mode.plan(Size::new(image.width(), image.height()), size);
     let pitch = screen.pitch();
     let len = pitch * screen.height as usize;
-    let Some(geometry) =
-        Geometry::with_pitch(screen.width, screen.height, pitch, PixelFormat::XRGB8888)
-    else {
+    let Some(geometry) = Geometry::with_pitch(screen.width, screen.height, pitch, PixelFormat::XRGB8888) else {
         kprint(b"desktop-shell: the wallpaper geometry is unusable\n");
         return None;
     };
     let mut picture = alloc::vec![0u8; len];
-    if !libdraw::scale::place(&image.pixels, image.geometry, plan, theme.desktop, &mut picture, geometry)
-    {
+    if !libdraw::scale::place(&image.pixels, image.geometry, plan, theme.desktop, &mut picture, geometry) {
         kprint(b"desktop-shell: the wallpaper could not be placed\n");
         return None;
     }
 
     let role = Role::Panel { dock: Edge::Top, reserve: 0 };
-    let id = match session.create(&CreateWindowRequest::new(screen.width, screen.height, role), BUFFERS)
-    {
+    let id = match session.create(&CreateWindowRequest::new(screen.width, screen.height, role), BUFFERS) {
         Ok(id) => id,
         Err(_) => {
             kprint(b"desktop-shell: wallpaper CreateWindow FAILED\n");
@@ -1490,8 +1434,7 @@ static mut NOTIF: Notification = Notification::zeroed();
 /// Every other server in this tree already sizes it this way (`compositor`,
 /// `logging-service`, `fs-server-ext4`); `session-mgr` waits on exactly one handle, where one
 /// record is right. Found by the PR #257 reviewer while reading something else.
-static mut WAIT_RESULTS: [u8; 24 * (5 + MAX_DESKTOP_SESSIONS)] =
-    [0; 24 * (5 + MAX_DESKTOP_SESSIONS)];
+static mut WAIT_RESULTS: [u8; 24 * (5 + MAX_DESKTOP_SESSIONS)] = [0; 24 * (5 + MAX_DESKTOP_SESSIONS)];
 
 /// Bootstrap registers, as `libsession::spawn_leader` fills them: `rdi` = notification
 /// channel, `rsi` = the **session** namespace, `rdx` = the Tier-1 setup channel carrying
@@ -1599,12 +1542,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         Ok(s) => Screen { width: s.width, height: s.height },
         Err(_) => fail(b"desktop-shell: /dev/draw/screen unreadable; cannot lay out the desktop\n"),
     };
-    Line::new()
-        .s(b"desktop-shell: screen ")
-        .u(screen.width as u64)
-        .s(b"x")
-        .u(screen.height as u64)
-        .end();
+    Line::new().s(b"desktop-shell: screen ").u(screen.width as u64).s(b"x").u(screen.height as u64).end();
 
     // **The wallpaper, before anything else this shell creates** (M12 Part F). Creation order
     // is bottom-first in the compositor's stack, so making it first is what makes it bottom-most
@@ -1750,8 +1688,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     let mut list_dirty = true;
     // **One desktop to start, which is also the scratch slot** — empty and unnamed, so the
     // first window created lands on it and `normalize_desktops` appends its successor.
-    let mut desktops: alloc::vec::Vec<Desktop> =
-        alloc::vec![Desktop { id: 1, name: alloc::string::String::new() }];
+    let mut desktops: alloc::vec::Vec<Desktop> = alloc::vec![Desktop { id: 1, name: alloc::string::String::new() }];
     let mut next_desktop_id: u32 = 2;
     let mut current_desktop: u32 = 1;
     // What the compositor was last told is current — its own starting value, 1. See
@@ -1912,10 +1849,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // **The gate could not have caught it**: `check-login` asserts the wallpaper line once,
         // at startup, and its `Super+2` comes hundreds of lines later. What catches it is the
         // step added below.
-        for surface in [Some(window), bottom, Some(wallpaper_window).filter(|&w| w != 0)]
-            .into_iter()
-            .flatten()
-        {
+        for surface in [Some(window), bottom, Some(wallpaper_window).filter(|&w| w != 0)].into_iter().flatten() {
             if window_value(m, OP_MGR_SET_WINDOW_DESKTOP, surface, STICKY_DESKTOP) {
                 Line::new().s(b"desktop-shell: surface ").u(surface as u64).s(b" is sticky").end();
             } else {
@@ -1931,28 +1865,28 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         && let Some(m) = manager.as_mut()
     {
         place_window(m, id, 0, screen.window_list_y());
-        Line::new()
-            .s(b"desktop-shell: bottom bar placed at 0,")
-            .i(screen.window_list_y() as i64)
-            .end();
+        Line::new().s(b"desktop-shell: bottom bar placed at 0,").i(screen.window_list_y() as i64).end();
     }
     // **Its first frame, now that it is where it belongs** — not at the loop's first pass, which
     // may sit in `sys_wait` until something happens.
     present_bottom(
-        &mut session, bottom_bar.as_mut(), &entries, &desktops, current_desktop, &shown, &theme,
-        &panel_theme, &font, screen,
+        &mut session,
+        bottom_bar.as_mut(),
+        &entries,
+        &desktops,
+        current_desktop,
+        &shown,
+        &theme,
+        &panel_theme,
+        &font,
+        screen,
     );
-
 
     // The Applications menu's entries, read once. `desktop-shell.md` §4: they are desktop
     // entries, and that falls out of decisions already made — they are ordinary files in the
     // namespace, so type-to-filter runs over them with no special mechanism.
     let programs = read_applications(session_ns);
-    Line::new()
-        .s(b"desktop-shell: /applications lists ")
-        .u(programs.len() as u64)
-        .s(b" application(s)")
-        .end();
+    Line::new().s(b"desktop-shell: /applications lists ").u(programs.len() as u64).s(b" application(s)").end();
     // **The Places menu's, from the home an application sees** — the `HOME` this shell forwards,
     // which is `/home` inside an application's namespace — because a place is launched *into*
     // one. The session's own `argv[1]` spelling of the home is true only here.
@@ -2114,8 +2048,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 _ => end_session(asked),
             }
         }
-        let deadline =
-            if sent_request || session.events_pending() > 0 { 0 } else { next_tick.min(ending_deadline) };
+        let deadline = if sent_request || session.events_pending() > 0 { 0 } else { next_tick.min(ending_deadline) };
         sent_request = false;
         let mgr_h = manager.as_ref().map(|m| m.wait_handle()).unwrap_or(0);
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for the whole set.
@@ -2148,13 +2081,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 WAIT_HANDLES[n as usize] = ch;
                 n += 1;
             }
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                n,
-                (&raw mut WAIT_RESULTS) as u64,
-                deadline,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n, (&raw mut WAIT_RESULTS) as u64, deadline)
         };
         // SAFETY: single-threaded; set once at startup.
         let notif = unsafe { SHELL_NOTIF };
@@ -2250,10 +2177,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 refused.as_ref().map_or(0, |(c, _, _)| c.id()),
             ];
             let mut fired = alloc::vec::Vec::new();
-            let mut states: alloc::vec::Vec<librsproto::surface::WindowState> =
-                alloc::vec::Vec::new();
-            let mut dropped: alloc::vec::Vec<librsproto::surface::ConfigureEvent> =
-                alloc::vec::Vec::new();
+            let mut states: alloc::vec::Vec<librsproto::surface::WindowState> = alloc::vec::Vec::new();
+            let mut dropped: alloc::vec::Vec<librsproto::surface::ConfigureEvent> = alloc::vec::Vec::new();
             list_dirty |= place_new_windows(
                 m,
                 &mut next_origin,
@@ -2290,19 +2215,14 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // `Configure` to a rectangle only this process can compute, because only this
             // process knows what a maximised window should return to.
             for s in states {
-                use librsproto::surface::{
-                    WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
-                };
+                use librsproto::surface::{WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL};
                 let Some(e) = entries.iter_mut().find(|e| e.id == s.window) else { continue };
                 match s.state {
                     WINDOW_STATE_MINIMIZED => {
                         if minimize_window(m, e) {
                             sent_request = true;
                             list_dirty = true;
-                            Line::new()
-                                .s(b"desktop-shell: client asked to minimize window ")
-                                .u(s.window as u64)
-                                .end();
+                            Line::new().s(b"desktop-shell: client asked to minimize window ").u(s.window as u64).end();
                         }
                     }
                     WINDOW_STATE_MAXIMIZED => {
@@ -2320,10 +2240,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         // already-maximised window must not overwrite where it came from with
                         // the work area itself, which is a restore that does nothing.
                         if !restore.iter().any(|(id, _)| *id == s.window) {
-                            restore.push((
-                                s.window,
-                                (e.origin.0, e.origin.1, e.size.0, e.size.1),
-                            ));
+                            restore.push((s.window, (e.origin.0, e.origin.1, e.size.0, e.size.1)));
                         }
                         sent_request = true;
                         // **What was asked for, not what happened.** A `Configure` is a request
@@ -2360,12 +2277,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
 
             // A window arriving or leaving can empty or fill a desktop, so the rule is
             // reconsidered after every drain rather than only where a desktop is switched.
-            list_dirty |= normalize_desktops(
-                &mut desktops,
-                &entries,
-                &mut current_desktop,
-                &mut next_desktop_id,
-            );
+            list_dirty |= normalize_desktops(&mut desktops, &entries, &mut current_desktop, &mut next_desktop_id);
             for id in fired {
                 // **Bounded exactly as the click is**, and the reason is the bar's capacity's own
                 // (`task_capacity`): an entry past it is neither drawn nor clickable, so minimizing one would take
@@ -2383,12 +2295,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         if switch_desktop(m, &desktops, &mut current_desktop, &mut told_desktop, to) {
                             sent_request = true;
                             list_dirty = true;
-                            normalize_desktops(
-                                &mut desktops,
-                                &entries,
-                                &mut current_desktop,
-                                &mut next_desktop_id,
-                            );
+                            normalize_desktops(&mut desktops, &entries, &mut current_desktop, &mut next_desktop_id);
                             // **An open overview follows the switch.** A chord works while it
                             // is up — it is a popup, not a modal grab — and leaving it showing
                             // the desktop you just left is a lie on screen rather than a
@@ -2421,12 +2328,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             // already invalidated — a full-width panel blit showing a stale
                             // count, immediately followed by another with the right one
                             // (PR #243 review, finding 6).
-                            normalize_desktops(
-                                &mut desktops,
-                                &entries,
-                                &mut current_desktop,
-                                &mut next_desktop_id,
-                            );
+                            normalize_desktops(&mut desktops, &entries, &mut current_desktop, &mut next_desktop_id);
                             list_dirty = true;
                         } else {
                             kprint(b"desktop-shell: SetWindowDesktop was refused\n");
@@ -2487,17 +2389,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 let shown_now: alloc::vec::Vec<u32> =
                     visible_entries(&entries, current_desktop, cap).iter().map(|e| e.id).collect();
                 if id == HOTKEY_MINIMIZE
-                    && let Some(e) = entries
-                        .iter_mut()
-                        .find(|e| shown_now.contains(&e.id) && e.focused && !e.minimized)
+                    && let Some(e) = entries.iter_mut().find(|e| shown_now.contains(&e.id) && e.focused && !e.minimized)
                 {
                     let wid = e.id;
                     sent_request = true;
                     if minimize_window(m, e) {
-                        Line::new()
-                            .s(b"desktop-shell: Super+H minimized window ")
-                            .u(wid as u64)
-                            .end();
+                        Line::new().s(b"desktop-shell: Super+H minimized window ").u(wid as u64).end();
                         list_dirty = true;
                     }
                 }
@@ -2515,9 +2412,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // **A chord to minimize what has the keyboard**, registered once the manager exists.
         // The bar gives you a window back; this is how you put one away without reaching for
         // it, which is the half a taskbar alone does not cover.
-        if !hotkey_done
-            && let Some(m) = manager.as_mut()
-        {
+        if !hotkey_done && let Some(m) = manager.as_mut() {
             hotkey_done = true;
             sent_request = true;
             use librsproto::surface::{MOD_META, MOD_SHIFT, MgrHotkey, OP_MGR_REGISTER_HOTKEY};
@@ -2527,9 +2422,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // which is what makes the move available without the overview open.
             for n in 1..=CHORD_DESKTOPS {
                 let code = KEY_1 + (n as u16 - 1);
-                for (base, mods) in
-                    [(HOTKEY_SWITCH_BASE, MOD_META), (HOTKEY_MOVE_BASE, MOD_META | MOD_SHIFT)]
-                {
+                for (base, mods) in [(HOTKEY_SWITCH_BASE, MOD_META), (HOTKEY_MOVE_BASE, MOD_META | MOD_SHIFT)] {
                     let chord = MgrHotkey { id: base + n, mods, code };
                     let mut b = [0u8; core::mem::size_of::<MgrHotkey>()];
                     if chord.write(&mut b).is_none() {
@@ -2615,10 +2508,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 //
                 // `InputLost` is neither of these — that is queue overflow, and reading it as one
                 // would close the menu on a burst of pointer motion.
-                if matches!(
-                    event,
-                    libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)
-                ) {
+                if matches!(event, libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)) {
                     bar.close(&mut session);
                     continue;
                 }
@@ -2631,18 +2521,18 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         // **From the outcome, not from `open()`** — choosing closes, so the open
                         // menu is only named here (PR #280 review, blocking 1).
                         KeyOutcome::Chose { menu, item } => {
-                            chosen = table.get(menu).and_then(|m| m.items.get(item)).and_then(|it| {
-                                match it {
-                                    Item::Action { msg, enabled: true, .. } => Some(*msg),
-                                    _ => None,
-                                }
+                            chosen = table.get(menu).and_then(|m| m.items.get(item)).and_then(|it| match it {
+                                Item::Action { msg, enabled: true, .. } => Some(*msg),
+                                _ => None,
                             });
                             finished = true;
                         }
                         KeyOutcome::Dismissed => finished = true,
                         // Left and Right move to the other menu; Up and Down move the lit row.
                         KeyOutcome::Changed => {
-                            if let (Some(id), Some(m)) = (bar.sync(&mut session, window, &theme, &font), manager.as_mut()) {
+                            if let (Some(id), Some(m)) =
+                                (bar.sync(&mut session, window, &theme, &font), manager.as_mut())
+                            {
                                 stick(m, id, bar.what().as_bytes());
                             }
                         }
@@ -2664,9 +2554,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                 // a keystroke lost to a dropped PS/2 batch has to be visible —
                                 // and what somebody types into a launcher is a program they
                                 // are about to run, so the number is logged and not the text.
-                                let listed = table
-                                    .get(panel::APPS)
-                                    .map_or(0, |m| m.items.iter().filter(|it| matches!(it, Item::Action { enabled: true, .. })).count());
+                                let listed = table.get(panel::APPS).map_or(0, |m| {
+                                    m.items.iter().filter(|it| matches!(it, Item::Action { enabled: true, .. })).count()
+                                });
                                 Line::new().s(b"desktop-shell: applications menu listing ").u(listed as u64).end();
                             }
                         }
@@ -2714,7 +2604,14 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             let refusal = ending.power_args().and_then(|_| power_refusal(session_ns));
                             match refusal {
                                 Some(r) => show_refusal(
-                                    &mut session, &mut refused, ending, r, window, ending_anchor, &theme, &font,
+                                    &mut session,
+                                    &mut refused,
+                                    ending,
+                                    r,
+                                    window,
+                                    ending_anchor,
+                                    &theme,
+                                    &font,
                                 ),
                                 None => closing = Some(Closing::begin(Asked::Person(ending), now_ns().unwrap_or(0))),
                             }
@@ -2810,10 +2707,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             // **The name prompt's own input.** Typing names; Enter keeps it; Escape, a press
             // elsewhere, or losing the keyboard puts it away unnamed.
             if prompt.as_ref().map(|c| c.id()) == Some(w) {
-                if matches!(
-                    event,
-                    libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)
-                ) {
+                if matches!(event, libsurface::WindowEvent::Dismissed | libsurface::WindowEvent::Focus(false)) {
                     close_prompt(&mut session, &mut prompt, &mut name);
                     continue;
                 }
@@ -2842,19 +2736,11 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             d.name.clear();
                             d.name.push_str(&chosen);
                         }
-                        Line::new()
-                            .s(b"desktop-shell: named this desktop ")
-                            .untrusted(chosen.as_bytes())
-                            .end();
+                        Line::new().s(b"desktop-shell: named this desktop ").untrusted(chosen.as_bytes()).end();
                         list_dirty = true;
                         close_prompt(&mut session, &mut prompt, &mut name);
                         // Naming changes which desktops survive, so the rule applies here too.
-                        normalize_desktops(
-                            &mut desktops,
-                            &entries,
-                            &mut current_desktop,
-                            &mut next_desktop_id,
-                        );
+                        normalize_desktops(&mut desktops, &entries, &mut current_desktop, &mut next_desktop_id);
                     } else if name.apply(k.keycode, k.modifiers, k.locks) {
                         // **A receipt per character.** Injection is relative and unacknowledged,
                         // so a dropped PS/2 batch silently eats a keystroke — a desktop named
@@ -2893,10 +2779,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         // that this drag does not need what it is about.
                         dragging = window_in_card_at(p.x, p.y, &desktops, &entries, screen);
                         if let Some(id) = dragging {
-                            Line::new()
-                                .s(b"desktop-shell: dragging window ")
-                                .u(id as u64)
-                                .end();
+                            Line::new().s(b"desktop-shell: dragging window ").u(id as u64).end();
                         }
                     } else {
                         // **Release: which of three gestures this was.** A press over a
@@ -2943,8 +2826,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             // window that is most of the card, which is also most of the area
                             // "click a card to switch" was supposed to cover.
                             (Some(wid), _) if under == Some(wid) => {
-                                let home =
-                                    entries.iter().find(|e| e.id == wid).map(|e| e.desktop);
+                                let home = entries.iter().find(|e| e.id == wid).map(|e| e.desktop);
                                 if let Some(m) = manager.as_mut()
                                     && let Some(home) = home
                                 {
@@ -2957,23 +2839,13 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                                     // slot is untouched — which is the one thing that call is
                                     // for.
                                     let there = home == current_desktop
-                                        || switch_desktop(
-                                            m,
-                                            &desktops,
-                                            &mut current_desktop,
-                                            &mut told_desktop,
-                                            home,
-                                        );
+                                        || switch_desktop(m, &desktops, &mut current_desktop, &mut told_desktop, home);
                                     if there
-                                        && let Some(e) =
-                                            entries.iter_mut().find(|e| e.id == wid)
+                                        && let Some(e) = entries.iter_mut().find(|e| e.id == wid)
                                         && raise_window(m, e)
                                     {
                                         list_dirty = true;
-                                        Line::new()
-                                            .s(b"desktop-shell: overview raised window ")
-                                            .u(wid as u64)
-                                            .end();
+                                        Line::new().s(b"desktop-shell: overview raised window ").u(wid as u64).end();
                                         close_overview(
                                             &mut session,
                                             &mut overview,
@@ -3108,9 +2980,8 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 && let Some(bb) = bottom_bar.as_mut()
             {
                 let lit = shown.as_ref().is_some_and(|s| s.desktop == current_desktop);
-                let view = bottom_view(
-                    &entries, &desktops, current_desktop, lit, bb.hovered_key(), &theme, &font, screen,
-                );
+                let view =
+                    bottom_view(&entries, &desktops, current_desktop, lit, bb.hovered_key(), &theme, &font, screen);
                 // Presented before it is routed, for the top bar's reason: the manager's events
                 // earlier in this pass may have changed the windows it shows.
                 bb.present(&mut session, &view, &font, &panel_theme);
@@ -3143,11 +3014,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             } else if raise_window(m, e) {
                                 Line::new().s(b"desktop-shell: raised window ").u(wid as u64).end();
                             } else {
-                                Line::new()
-                                    .s(b"desktop-shell: raising window ")
-                                    .u(wid as u64)
-                                    .s(b" was refused")
-                                    .end();
+                                Line::new().s(b"desktop-shell: raising window ").u(wid as u64).s(b" was refused").end();
                             }
                             list_dirty = true;
                         }
@@ -3174,12 +3041,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             sent_request = true;
                             if switch_desktop(m, &desktops, &mut current_desktop, &mut told_desktop, to) {
                                 list_dirty = true;
-                                normalize_desktops(
-                                    &mut desktops,
-                                    &entries,
-                                    &mut current_desktop,
-                                    &mut next_desktop_id,
-                                );
+                                normalize_desktops(&mut desktops, &entries, &mut current_desktop, &mut next_desktop_id);
                                 overview_dirty = overview.is_some();
                             }
                         }
@@ -3194,9 +3056,17 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
                             recapture(m, &entries, current_desktop, &mut shots, cap, screen);
                             overview = open_overview(
-                                &mut session, window, &theme, &font, &shots, &desktops,
-                                current_desktop, &entries, &mut over_addrs,
-                                wallpaper.as_ref().map(|w| w.picture.as_slice()), screen,
+                                &mut session,
+                                window,
+                                &theme,
+                                &font,
+                                &shots,
+                                &desktops,
+                                current_desktop,
+                                &entries,
+                                &mut over_addrs,
+                                wallpaper.as_ref().map(|w| w.picture.as_slice()),
+                                screen,
                             );
                             if let Some(id) = overview {
                                 stick(m, id, b"the overview");
@@ -3274,8 +3144,16 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         // **The bottom bar, every pass, as the top one is** — `Child::present` diffs and commits
         // only what changed, so a pass that changed nothing costs a layout and no frame.
         present_bottom(
-            &mut session, bottom_bar.as_mut(), &entries, &desktops, current_desktop, &shown, &theme,
-            &panel_theme, &font, screen,
+            &mut session,
+            bottom_bar.as_mut(),
+            &entries,
+            &desktops,
+            current_desktop,
+            &shown,
+            &theme,
+            &panel_theme,
+            &font,
+            screen,
         );
 
         // **Re-render an open overview whose desktop changed.** Its thumbnails are of one
@@ -3291,9 +3169,17 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
                 recapture(m, &entries, current_desktop, &mut shots, cap, screen);
                 present_overview(
-                    &mut session, id, &theme, &font, &shots, &desktops, current_desktop,
-                    &entries, &over_addrs,
-                    wallpaper.as_ref().map(|w| w.picture.as_slice()), screen,
+                    &mut session,
+                    id,
+                    &theme,
+                    &font,
+                    &shots,
+                    &desktops,
+                    current_desktop,
+                    &entries,
+                    &over_addrs,
+                    wallpaper.as_ref().map(|w| w.picture.as_slice()),
+                    screen,
                 );
                 Line::new()
                     .s(b"desktop-shell: overview now showing ")
@@ -3322,11 +3208,7 @@ static mut CLOCK_BUF: u64 = 0;
 fn now_ns() -> Option<u64> {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     let r = unsafe {
-        libkern::syscall::syscall2(
-            libkern::SYS_CLOCK_READ,
-            libkern::abi::CLOCK_MONOTONIC,
-            (&raw mut CLOCK_BUF) as u64,
-        )
+        libkern::syscall::syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64)
     };
     if r != 0 {
         return None;
@@ -3365,15 +3247,9 @@ const INSIST_WINDOW_NS: u64 = 5_000_000_000;
 ///
 /// A window that goes away on its own leaves the entry that named it, so the ordinary case never
 /// reaches `Manage::Close` at all.
-fn ask_to_close(
-    mgr: &mut ChannelTransport,
-    window: u32,
-    asked: &mut alloc::vec::Vec<(u32, u64)>,
-) {
+fn ask_to_close(mgr: &mut ChannelTransport, window: u32, asked: &mut alloc::vec::Vec<(u32, u64)>) {
     let now = now_ns();
-    let armed = asked
-        .iter()
-        .position(|&(id, until)| id == window && now.is_some_and(|n| n < until));
+    let armed = asked.iter().position(|&(id, until)| id == window && now.is_some_and(|n| n < until));
     if let Some(i) = armed {
         if insist_on_close(mgr, window) {
             asked.remove(i);
@@ -3423,11 +3299,7 @@ fn insist_on_close(mgr: &mut ChannelTransport, window: u32) -> bool {
         Line::new().s(b"desktop-shell: Close refused for window ").u(window as u64).end();
         return false;
     }
-    Line::new()
-        .s(b"desktop-shell: window ")
-        .u(window as u64)
-        .s(b" did not answer; closed it")
-        .end();
+    Line::new().s(b"desktop-shell: window ").u(window as u64).s(b" did not answer; closed it").end();
     true
 }
 
@@ -3467,11 +3339,7 @@ fn register_snap_zones(mgr: &mut ChannelTransport, work: &MgrLayout) -> bool {
         (1u32, (x, y, band, band), (x, y, hw, hh)),
         (2, (x + w as i32 - b, y, band, band), (x + hw as i32, y, w - hw, hh)),
         (3, (x, y + h as i32 - b, band, band), (x, y + hh as i32, hw, h - hh)),
-        (
-            4,
-            (x + w as i32 - b, y + h as i32 - b, band, band),
-            (x + hw as i32, y + hh as i32, w - hw, h - hh),
-        ),
+        (4, (x + w as i32 - b, y + h as i32 - b, band, band), (x + hw as i32, y + hh as i32, w - hw, h - hh)),
         (5, (x, y, band, h), (x, y, hw, h)),
         (6, (x + w as i32 - b, y, band, h), (x + hw as i32, y, w - hw, h)),
         (7, (x, y, w, band), (x, y, w, hh)),
@@ -3492,8 +3360,8 @@ fn register_snap_zones(mgr: &mut ChannelTransport, work: &MgrLayout) -> bool {
         };
         let mut body = [0u8; 36];
         let mut reply = [0u8; 8];
-        let ok = z.write(&mut body).is_some()
-            && mgr.request(OP_MGR_REGISTER_SNAP_ZONE, &body, None, &mut reply).is_ok();
+        let ok =
+            z.write(&mut body).is_some() && mgr.request(OP_MGR_REGISTER_SNAP_ZONE, &body, None, &mut reply).is_ok();
         if !ok {
             Line::new().s(b"desktop-shell: snap zone ").u(id as u64).s(b" was refused").end();
             all = false;
@@ -3514,15 +3382,7 @@ fn register_snap_zones(mgr: &mut ChannelTransport, work: &MgrLayout) -> bool {
     all
 }
 
-fn configure_window(
-    mgr: &mut ChannelTransport,
-    window: u32,
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    why: &[u8],
-) {
+fn configure_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32, w: u32, h: u32, why: &[u8]) {
     use librsproto::surface::{ConfigureEvent, OP_MGR_CONFIGURE};
     let mut body = [0u8; core::mem::size_of::<ConfigureEvent>()];
     let ev = ConfigureEvent { window, width: w, height: h, x, y };
@@ -3699,9 +3559,8 @@ fn render_overview(
     wallpaper: Option<&[u8]>,
     screen: Screen,
 ) -> MemFramebuffer {
-    let geometry =
-        Geometry::with_pitch(screen.width, screen.height, screen.pitch(), PixelFormat::ARGB8888)
-            .unwrap_or_else(|| fail(b"desktop-shell: bad overview geometry\n"));
+    let geometry = Geometry::with_pitch(screen.width, screen.height, screen.pitch(), PixelFormat::ARGB8888)
+        .unwrap_or_else(|| fail(b"desktop-shell: bad overview geometry\n"));
     use libdraw::framebuffer::Framebuffer as _;
     let mut fb = MemFramebuffer::new(geometry);
     // **A translucent ground, so the overview sits *on* the desktop rather than replacing it**
@@ -3757,12 +3616,7 @@ fn render_overview(
             sized(libdraw::geom::Size::new(CARD_CAPTION_GAP, 0), text("")),
             libui::element::ink(ink.foreground_dim, text(count)),
         ]);
-        let cap_rect = Rect::new(
-            cx,
-            cy + ch as i32 + CARD_CAPTION_GAP as i32,
-            cw,
-            CARD_CAPTION_H,
-        );
+        let cap_rect = Rect::new(cx, cy + ch as i32 + CARD_CAPTION_GAP as i32, cw, CARD_CAPTION_H);
         let cl = layout(&caption, cap_rect, &metrics);
         paint_over(&mut fb, font, &ink, &caption, &cl, cap_rect, &mut |_, _, _, _: &mut MemFramebuffer| {});
     }
@@ -3867,12 +3721,8 @@ fn open_overview(
     screen: Screen,
 ) -> Option<u32> {
     let len = screen.pitch() * screen.height as usize;
-    let id = session
-        .create(
-            &CreateWindowRequest::new(screen.width, screen.height, Role::Popup { parent }),
-            BUFFERS,
-        )
-        .ok()?;
+    let id =
+        session.create(&CreateWindowRequest::new(screen.width, screen.height, Role::Popup { parent }), BUFFERS).ok()?;
     // **Every failure past `create` destroys the window**, which the modal's `open_modal` said
     // from PR #237 and this function did not. Returning `None` without it leaves the
     // compositor holding a popup whose id this process has forgotten — never closable, never
@@ -3926,9 +3776,7 @@ fn open_overview(
     } else {
         kprint(b"desktop-shell: overview ground is the desktop colour\n");
     }
-    present_overview(
-        session, id, theme, font, shots, desktops, current, entries, addrs, wallpaper, screen,
-    );
+    present_overview(session, id, theme, font, shots, desktops, current, entries, addrs, wallpaper, screen);
     Some(id)
 }
 
@@ -3948,8 +3796,7 @@ fn present_overview(
     screen: Screen,
 ) {
     let len = screen.pitch() * screen.height as usize;
-    let bytes = render_overview(theme, font, shots, desktops, current, entries, wallpaper, screen)
-        .into_bytes();
+    let bytes = render_overview(theme, font, shots, desktops, current, entries, wallpaper, screen).into_bytes();
     if bytes.len() != len {
         return;
     }
@@ -4030,11 +3877,7 @@ fn desktop_card(
     // wallpaper it scaled once.
     layers.push(padding(
         Insets::all(CARD_BORDER),
-        if wallpaper {
-            custom(MINI_KIND, libdraw::geom::Size::new(iw, ih))
-        } else {
-            fill(theme.desktop)
-        },
+        if wallpaper { custom(MINI_KIND, libdraw::geom::Size::new(iw, ih)) } else { fill(theme.desktop) },
     ));
     // The top bar, at the card's own scale — so a card is the whole screen and not just the part
     // of it windows live in.
@@ -4064,10 +3907,7 @@ fn desktop_card(
 /// beside it.
 fn window_mini(e: &WinEntry, face: libdraw::format::Rgb, theme: &Theme, screen: Screen) -> Element<()> {
     let strip = screen.scaled_to_card(libui::widget::TITLE_BAR_H).max(1);
-    let (bw, bh) = (
-        screen.scaled_to_card(e.size.0).max(2),
-        screen.scaled_to_card(e.size.1).max(2),
-    );
+    let (bw, bh) = (screen.scaled_to_card(e.size.0).max(2), screen.scaled_to_card(e.size.1).max(2));
     let mut layers = alloc::vec::Vec::with_capacity(3);
     layers.push(fill(theme.border));
     layers.push(padding(Insets::all(1), fill(face)));
@@ -4124,13 +3964,7 @@ const OVERVIEW_GROUND_ALPHA: u8 = 210;
 /// `desktop_card` stacks windows in `entries` order, so the last one drawn is on top and is the
 /// one a press means; walking forwards would hand a press to whichever overlapping window
 /// happened to be first in the list.
-fn window_in_card_at(
-    x: i32,
-    y: i32,
-    desktops: &[Desktop],
-    entries: &[WinEntry],
-    screen: Screen,
-) -> Option<u32> {
+fn window_in_card_at(x: i32, y: i32, desktops: &[Desktop], entries: &[WinEntry], screen: Screen) -> Option<u32> {
     let i = desktop_shell::card_at(x, y, desktops.len(), screen)?;
     let card = desktop_shell::card_rect(i, desktops.len(), screen);
     let d = desktops[i].id;
@@ -4198,11 +4032,7 @@ fn capture_window(
     release_buffer(&mut addr, len);
     let lit = px.chunks_exact(4).filter(|c| c != &[0, 0, 0, 0]).count();
     if lit == 0 {
-        Line::new()
-            .s(b"desktop-shell: capture of window ")
-            .u(window as u64)
-            .s(b" came back blank")
-            .end();
+        Line::new().s(b"desktop-shell: capture of window ").u(window as u64).s(b" came back blank").end();
         return None;
     }
     Line::new()
@@ -4233,8 +4063,8 @@ fn serve_desktop_session(
 ) -> bool {
     use librsproto::decode;
     use librsproto::desktop::{
-        DesktopEntry, DesktopIndex, MAX_DESKTOP_NAME, MAX_LISTED, MAX_OPEN_PATH, OP_DESKTOP_LIST,
-        OP_DESKTOP_NAME, OP_DESKTOP_OPEN, OP_DESKTOP_SWITCH, write_list,
+        DesktopEntry, DesktopIndex, MAX_DESKTOP_NAME, MAX_LISTED, MAX_OPEN_PATH, OP_DESKTOP_LIST, OP_DESKTOP_NAME,
+        OP_DESKTOP_OPEN, OP_DESKTOP_SWITCH, write_list,
     };
     // SAFETY: valid recv out-params, sized from `IPC_HANDLE_MAX`.
     let rr = unsafe {
@@ -4275,10 +4105,7 @@ fn serve_desktop_session(
     // SAFETY: bounded read-only slice over the message just received.
     let (op, request_id, body) = unsafe {
         let payload_len = u32::from_le_bytes([DS_MSG[4], DS_MSG[5], DS_MSG[6], DS_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            ((&raw const DS_MSG) as *const u8).add(24),
-            payload_len.min(4096 - 24),
-        );
+        let req = core::slice::from_raw_parts(((&raw const DS_MSG) as *const u8).add(24), payload_len.min(4096 - 24));
         match decode(req) {
             Ok(m) => (m.op, m.request_id, m.body.to_vec()),
             Err(_) => return false,
@@ -4293,15 +4120,10 @@ fn serve_desktop_session(
     match op {
         OP_DESKTOP_LIST => {
             let cur = desktops.iter().position(|d| d.id == *current).map(|i| i + 1).unwrap_or(0);
-            let listed: alloc::vec::Vec<DesktopEntry<'_>> = desktops
-                .iter()
-                .take(MAX_LISTED)
-                .map(|d| DesktopEntry { id: d.id, name: d.name.as_str() })
-                .collect();
+            let listed: alloc::vec::Vec<DesktopEntry<'_>> =
+                desktops.iter().take(MAX_LISTED).map(|d| DesktopEntry { id: d.id, name: d.name.as_str() }).collect();
             let mut out = [0u8; 1024];
-            let Some(n) =
-                write_list(&mut out, cur as u32, &listed, desktops.len() > MAX_LISTED)
-            else {
+            let Some(n) = write_list(&mut out, cur as u32, &listed, desktops.len() > MAX_LISTED) else {
                 // Server-side data this server cannot encode — not a kernel fault, which is
                 // what `KernelError` claims and what a caller would chase.
                 kprint(b"desktop-shell: a desktop list would not serialise\n");
@@ -4334,8 +4156,7 @@ fn serve_desktop_session(
             if name.len() > MAX_DESKTOP_NAME {
                 return bad(KError::InvalidArgument);
             }
-            let Some(d) = (req.index as usize).checked_sub(1).and_then(|i| desktops.get_mut(i))
-            else {
+            let Some(d) = (req.index as usize).checked_sub(1).and_then(|i| desktops.get_mut(i)) else {
                 return bad(KError::NotFound);
             };
             d.name.clear();
@@ -4418,10 +4239,7 @@ fn serve_desktop_endpoint() {
     // SAFETY: bounded read-only slice over the message just received.
     let (op, request_id, bare) = unsafe {
         let payload_len = u32::from_le_bytes([DS_MSG[4], DS_MSG[5], DS_MSG[6], DS_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            ((&raw const DS_MSG) as *const u8).add(24),
-            payload_len.min(4096 - 24),
-        );
+        let req = core::slice::from_raw_parts(((&raw const DS_MSG) as *const u8).add(24), payload_len.min(4096 - 24));
         match decode(req) {
             // **An empty suffix only.** `/dev/desktop` is the resource itself; a suffix names
             // something beneath it, and the per-object paths composition §2a sketches are not
@@ -4502,9 +4320,7 @@ static mut CH_OUT1: u64 = 0;
 /// Create a channel pair. `(client_end, server_end)`.
 fn make_channel() -> Option<(u64, u64)> {
     // SAFETY: CH_OUT0/CH_OUT1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0) };
     if cr != 0 {
         return None;
     }
@@ -4519,9 +4335,7 @@ fn ds_reply(ch: u64, op: u16, request_id: u64, body: &[u8], handle: u64, err: bo
     let hcount = u64::from(handle != 0);
     // SAFETY: DS_REPLY/DS_REPLY_HANDLES are valid buffers owned by this process.
     unsafe {
-        let Some(rs_len) =
-            librsproto::encode(&mut DS_REPLY[24..], op, request_id, flags, body, hcount as u16)
-        else {
+        let Some(rs_len) = librsproto::encode(&mut DS_REPLY[24..], op, request_id, flags, body, hcount as u16) else {
             return false;
         };
         DS_REPLY[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -4584,10 +4398,7 @@ fn switch_desktop(
     }
     *current = to;
     *told = to;
-    Line::new()
-        .s(b"desktop-shell: switched to ")
-        .untrusted(desktop_label(desktops, to).as_bytes())
-        .end();
+    Line::new().s(b"desktop-shell: switched to ").untrusted(desktop_label(desktops, to).as_bytes()).end();
     true
 }
 
@@ -4701,10 +4512,9 @@ fn place_new_windows(
     screen: Screen,
 ) -> bool {
     use librsproto::surface::{
-        FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY,
-        OP_MGR_LAYOUT_CHANGED, OP_MGR_PLACE, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
-        OP_MGR_DRAG_ENDED, OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
-        OP_MGR_WINDOW_STATE_REQUEST, OP_MGR_WINDOW_TITLE, ROLE_DIALOG, ROLE_NORMAL,
+        FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_DRAG_ENDED, OP_MGR_HOTKEY,
+        OP_MGR_LAYOUT_CHANGED, OP_MGR_PLACE, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED, OP_MGR_WINDOW_FOCUS,
+        OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_STATE_REQUEST, OP_MGR_WINDOW_TITLE, ROLE_DIALOG, ROLE_NORMAL,
     };
     let mut dirty = false;
     // **Four bytes more than `MAX_TITLE`, which is what a title record actually is.** A
@@ -4901,10 +4711,7 @@ fn place_new_windows(
             }
             let mut reply = [0u8; 64];
             if mgr.request(OP_MGR_PLACE, &body, None, &mut reply).is_err() {
-                Line::new()
-                    .s(b"desktop-shell: Place refused for dialog ")
-                    .u(created.window as u64)
-                    .end();
+                Line::new().s(b"desktop-shell: Place refused for dialog ").u(created.window as u64).end();
                 continue;
             }
             // **Where it went, because a gate has no other way to find it.** `check-login`
@@ -4975,10 +4782,7 @@ fn place_new_windows(
         }
         let mut reply = [0u8; 64];
         if mgr.request(OP_MGR_PLACE, &body, None, &mut reply).is_err() {
-            Line::new()
-                .s(b"desktop-shell: Place refused for window ")
-                .u(created.window as u64)
-                .end();
+            Line::new().s(b"desktop-shell: Place refused for window ").u(created.window as u64).end();
             continue;
         }
         // **`x`, not a literal zero.** This said `at 0,` because the cascade always started at
@@ -5024,12 +4828,7 @@ fn present_bottom(
 fn windows_of(entries: &[WinEntry]) -> alloc::vec::Vec<desktop_shell::Window> {
     entries
         .iter()
-        .map(|e| desktop_shell::Window {
-            id: e.id,
-            desktop: e.desktop,
-            minimized: e.minimized,
-            focused: e.focused,
-        })
+        .map(|e| desktop_shell::Window { id: e.id, desktop: e.desktop, minimized: e.minimized, focused: e.focused })
         .collect()
 }
 
@@ -5228,12 +5027,7 @@ impl BarMenus<'_> {
     }
 
     /// Route a pointer event through the popup, returning the row it chose.
-    fn route(
-        &mut self,
-        font: &Font,
-        theme: &Theme,
-        event: &libsurface::WindowEvent,
-    ) -> alloc::vec::Vec<MenuMsg> {
+    fn route(&mut self, font: &Font, theme: &Theme, event: &libsurface::WindowEvent) -> alloc::vec::Vec<MenuMsg> {
         let table = panel::menus(self.programs, self.query.text(), self.places, self.home, theme);
         let Some((which, c)) = self.win.as_mut() else { return alloc::vec::Vec::new() };
         let view = panel::menu_view(*which, &table, &self.state, c.hovered_key(), &self.query, theme);
@@ -5253,9 +5047,8 @@ fn menu_anchors(clock: &str, theme: &Theme, font: &Font, screen: Screen) -> [(i3
     let l = layout(&view, Rect::new(0, 0, screen.width, BAR_H), &metrics);
     let fallback = (panel::MENU_INSET_X, BAR_H as i32 + panel::MENU_DROP);
     let at = |key| libui::layout::locate(&view, &l, key).map_or(fallback, panel::menu_anchor);
-    let power = libui::layout::locate(&view, &l, panel::POWER_KEY).map_or(fallback, |word| {
-        panel::menu_anchor_right(word, popup_width(&panel::power_menu(), theme, &metrics))
-    });
+    let power = libui::layout::locate(&view, &l, panel::POWER_KEY)
+        .map_or(fallback, |word| panel::menu_anchor_right(word, popup_width(&panel::power_menu(), theme, &metrics)));
     [at(panel::APPS_KEY), at(panel::PLACES_KEY), power]
 }
 
@@ -5442,12 +5235,7 @@ fn show_refusal(
     font: &Font,
 ) {
     // Escaped: a broker's reason can quote the policy's own text back.
-    Line::new()
-        .s(b"desktop-shell: ")
-        .s(ending.title().as_bytes())
-        .s(b" ")
-        .untrusted(refusal.log().as_bytes())
-        .end();
+    Line::new().s(b"desktop-shell: ").s(ending.title().as_bytes()).s(b" ").untrusted(refusal.log().as_bytes()).end();
     if let Some((d, _, _)) = slot.take() {
         d.close(session);
     }
@@ -5508,11 +5296,7 @@ fn open_prompt(
 }
 
 /// Destroy the name prompt, forgetting what was typed into it.
-fn close_prompt(
-    session: &mut Session<ChannelTransport>,
-    prompt: &mut Option<Child>,
-    name: &mut TextFieldState,
-) {
+fn close_prompt(session: &mut Session<ChannelTransport>, prompt: &mut Option<Child>, name: &mut TextFieldState) {
     if let Some(c) = prompt.take() {
         let id = c.id();
         c.close(session);

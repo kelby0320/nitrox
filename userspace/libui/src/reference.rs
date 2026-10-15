@@ -51,12 +51,12 @@ use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
 
-use crate::element::{Edge, Element, Insets, custom, docked, dock, padding, text};
+use crate::element::{Edge, Element, Insets, custom, dock, docked, padding, text};
 use crate::layout::layout;
 use crate::paint::{FontMetrics, Theme, paint};
 use crate::widget::{
-    ListRow, ListState, ScrollState, TextAreaState, TextFieldState, WidgetState, button,
-    list_view, menu_bar, menu_item, scrollbar, text_area, text_field,
+    ListRow, ListState, ScrollState, TextAreaState, TextFieldState, WidgetState, button, list_view, menu_bar,
+    menu_item, scrollbar, text_area, text_field,
 };
 
 /// The reference UI's width, in pixels.
@@ -156,10 +156,7 @@ pub fn view_with(theme: &Theme) -> Element<Msg> {
                 // reference did, and it went unnoticed until buttons grew an edge in M15 and the
                 // picture showed two boxed words where a menu bar should be.
                 menu_bar(
-                    vec![
-                        menu_item("File", Msg::File, false, &theme),
-                        menu_item("Edit", Msg::Edit, true, &theme),
-                    ],
+                    vec![menu_item("File", Msg::File, false, &theme), menu_item("Edit", Msg::Edit, true, &theme)],
                     24,
                     &theme,
                 ),
@@ -173,8 +170,7 @@ pub fn view_with(theme: &Theme) -> Element<Msg> {
                 text("widget toolkit"),
                 // `active`, so the focus ring is drawn. A button at rest would paint the same
                 // whether or not the ring code exists.
-                button("Run", Msg::Run, WidgetState { active: true, ..Default::default() }, &theme)
-                    .flex(0),
+                button("Run", Msg::Run, WidgetState { active: true, ..Default::default() }, &theme).flex(0),
                 // **An open menu, drawn inline rather than as a window** (M14 Part A). The
                 // widget is a function of values; that it is normally hosted in a `popup` is the
                 // application's business and not what needs pinning. What this catches is the
@@ -256,16 +252,8 @@ fn reference_area(theme: &Theme) -> Element<Msg> {
     // **On `me`, which the selection also covers**, because a run under a highlight is the case
     // worth having in a picture: it is where the two colours have to compose rather than one
     // replacing the other.
-    let ink = [crate::widget::InkRun {
-        line: 0,
-        start: 7,
-        end: 9,
-        colour: theme.syntax_keyword,
-    }];
-    crate::element::sized(
-        Size::new(0, AREA_H),
-        text_area(&mut a, AREA_H, ROW_H, true, &ink, None, theme),
-    )
+    let ink = [crate::widget::InkRun { line: 0, start: 7, end: 9, colour: theme.syntax_keyword }];
+    crate::element::sized(Size::new(0, AREA_H), text_area(&mut a, AREA_H, ROW_H, true, &ink, None, theme))
 }
 
 /// The open menu the reference draws: two rows with chords, a separator, and a disabled row.
@@ -362,8 +350,7 @@ mod tests {
         // The failure `scene` warns about: a picture that compares fine and proves nothing.
         let fb = render(&font());
         let first = Framebuffer::get_pixel(&fb, 0, 0).unwrap();
-        let varied = (0..HEIGHT)
-            .any(|y| (0..WIDTH).any(|x| Framebuffer::get_pixel(&fb, x, y).unwrap() != first));
+        let varied = (0..HEIGHT).any(|y| (0..WIDTH).any(|x| Framebuffer::get_pixel(&fb, x, y).unwrap() != first));
         assert!(varied, "the reference UI painted a single colour");
     }
 
@@ -384,13 +371,7 @@ mod tests {
         let fb = render(&f);
         let theme = Theme::default();
         // The widgets' own flat colours are not ink.
-        let chrome = [
-            Theme::default().background,
-            theme.face,
-            theme.accent,
-            theme.track,
-            theme.thumb,
-        ];
+        let chrome = [Theme::default().background, theme.face, theme.accent, theme.track, theme.thumb];
         // **And nor is the custom node's pattern**, which is 18,688 of the 20,012 non-chrome
         // pixels in this picture. Counting "not chrome" without excluding it gives a test that
         // passes with no text drawn at all — which the first attempt at this fix did.
@@ -431,14 +412,7 @@ mod tests {
         // finding two different non-theme colours on one row means the callback ran.
         let fb = render(&font());
         let theme = Theme::default();
-        let known = [
-            theme.background,
-            theme.foreground,
-            theme.face,
-            theme.accent,
-            theme.track,
-            theme.thumb,
-        ];
+        let known = [theme.background, theme.foreground, theme.face, theme.accent, theme.track, theme.thumb];
         let n = (0..HEIGHT)
             .map(|y| {
                 (0..WIDTH)

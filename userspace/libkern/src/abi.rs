@@ -275,11 +275,8 @@ pub struct IpcMsg {
 
 impl IpcMsg {
     /// An all-zero one-page message (a valid send/recv buffer).
-    pub const ZEROED: IpcMsg = IpcMsg {
-        header: IpcMsgHeader::ZEROED,
-        payload: [0; IPC_PAYLOAD_SIZE],
-        handles: [0; IPC_HANDLE_MAX],
-    };
+    pub const ZEROED: IpcMsg =
+        IpcMsg { header: IpcMsgHeader::ZEROED, payload: [0; IPC_PAYLOAD_SIZE], handles: [0; IPC_HANDLE_MAX] };
 }
 
 const _: () = assert!(size_of::<IpcMsgHeader>() == IPC_HEADER_SIZE);
@@ -628,11 +625,8 @@ impl FramebufferInfo {
             return None;
         }
         let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-        let u64_at = |o: usize| {
-            u64::from_le_bytes([
-                b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
-            ])
-        };
+        let u64_at =
+            |o: usize| u64::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]]);
         Some(Self {
             width: u32_at(0),
             height: u32_at(4),
@@ -717,7 +711,6 @@ pub const REL_Y: u16 = 0x01;
 /// `docs/spec/rsproto-input-ops.md` beside `REL_Y`'s note, because a wheel that scrolls the
 /// wrong way is a one-character mistake and an unmistakable symptom.
 pub const REL_WHEEL: u16 = 0x08;
-
 
 /// Keycodes — `EV_KEY` codes for keyboard keys. Identical to the kernel's table, which
 /// takes them from Linux; for `0x01..=0x53` they equal the AT set-1 scancode.

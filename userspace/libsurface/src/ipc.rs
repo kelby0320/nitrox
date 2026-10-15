@@ -6,8 +6,8 @@
 
 use libkern::error::KError;
 use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_WAIT,
-    abi::CLOCK_MONOTONIC, syscall2, syscall4, syscall5,
+    SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_WAIT, abi::CLOCK_MONOTONIC, syscall2,
+    syscall4, syscall5,
 };
 use librsproto::surface::OP_RELEASE;
 use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -149,13 +149,10 @@ impl ChannelTransport {
         use libos::{Handle, Namespace, NsReadOnly, Only, Resource, block_on};
 
         // SAFETY: the caller guarantees `root_ns` is live and owned; `borrow` never closes.
-        let ns =
-            unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
+        let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
         // SAFETY: both paths resolve to a channel endpoint, asserted by the type arguments.
-        let ch = block_on(unsafe {
-            ns.lookup::<Resource, Only>(path, Rights::SEND | Rights::RECV | Rights::WAIT)
-        })
-        .map_err(|_| UiError::Transport)?;
+        let ch = block_on(unsafe { ns.lookup::<Resource, Only>(path, Rights::SEND | Rights::RECV | Rights::WAIT) })
+            .map_err(|_| UiError::Transport)?;
         // SAFETY: a live endpoint this process now owns.
         Ok(unsafe { Self::new(ch.into_raw().0) })
     }
@@ -196,11 +193,7 @@ impl ChannelTransport {
     /// deadline a fraction of a second after boot — permanently in the past, so every wait
     /// returns `TimedOut` at once and the call silently degrades to a non-blocking poll that
     /// still *looks* like it works wherever the event happened to be queued already.
-    pub fn wait_event_timeout(
-        &mut self,
-        buf: &mut [u8],
-        timeout_ns: u64,
-    ) -> Result<Option<(u16, usize)>, UiError> {
+    pub fn wait_event_timeout(&mut self, buf: &mut [u8], timeout_ns: u64) -> Result<Option<(u16, usize)>, UiError> {
         let mut now: u64 = 0;
         // SAFETY: a valid out-pointer for one u64; `sys_clock_read` writes exactly that.
         unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
@@ -215,15 +208,8 @@ impl ChannelTransport {
             let mut results = [0u8; 24];
             // SAFETY: a valid handle array and result buffer for one waiter. `sys_wait` is
             // where the thread blocks — never inside the recv.
-            let waited = unsafe {
-                syscall4(
-                    SYS_WAIT,
-                    handles.as_ptr() as u64,
-                    1,
-                    results.as_mut_ptr() as u64,
-                    deadline,
-                )
-            };
+            let waited =
+                unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, deadline) };
             if waited == KError::TimedOut.as_i32() as i64 {
                 // The deadline, not a failure. Poll once more: an event that landed between
                 // the poll above and the wait would otherwise be reported as a timeout.
@@ -295,8 +281,7 @@ impl Transport for ChannelTransport {
         self.request_id = self.request_id.wrapping_add(1);
 
         let hcount = if handle.is_some() { 1u16 } else { 0 };
-        let rs_len = encode(&mut self.msg[PAYLOAD_OFF..], op, id, 0, body, hcount)
-            .ok_or(UiError::Malformed)?;
+        let rs_len = encode(&mut self.msg[PAYLOAD_OFF..], op, id, 0, body, hcount).ok_or(UiError::Malformed)?;
         self.msg[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         self.msg[8] = hcount as u8;
         if let Some(h) = handle {
@@ -334,15 +319,8 @@ impl Transport for ChannelTransport {
             let handles = [self.channel];
             let mut results = [0u8; 24];
             // SAFETY: a valid handle array and result buffer for one waiter.
-            let waited = unsafe {
-                syscall4(
-                    SYS_WAIT,
-                    handles.as_ptr() as u64,
-                    1,
-                    results.as_mut_ptr() as u64,
-                    u64::MAX,
-                )
-            };
+            let waited =
+                unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
             if waited != 1 {
                 return Err(UiError::Transport);
             }
@@ -362,14 +340,9 @@ impl Transport for ChannelTransport {
             if rr != 0 {
                 return Err(UiError::Transport);
             }
-            let payload_len = u32::from_le_bytes([
-                self.recv_msg[4],
-                self.recv_msg[5],
-                self.recv_msg[6],
-                self.recv_msg[7],
-            ]) as usize;
-            let req =
-                &self.recv_msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(MSG_LEN - PAYLOAD_OFF)];
+            let payload_len =
+                u32::from_le_bytes([self.recv_msg[4], self.recv_msg[5], self.recv_msg[6], self.recv_msg[7]]) as usize;
+            let req = &self.recv_msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(MSG_LEN - PAYLOAD_OFF)];
             let m = decode(req).map_err(|_| UiError::BadReply)?;
 
             // Our reply: matched by request id, not merely by op, so a stale reply for an
@@ -459,12 +432,8 @@ impl Transport for ChannelTransport {
         if rr != 0 {
             return Err(UiError::Transport);
         }
-        let payload_len = u32::from_le_bytes([
-            self.recv_msg[4],
-            self.recv_msg[5],
-            self.recv_msg[6],
-            self.recv_msg[7],
-        ]) as usize;
+        let payload_len =
+            u32::from_le_bytes([self.recv_msg[4], self.recv_msg[5], self.recv_msg[6], self.recv_msg[7]]) as usize;
         let req = &self.recv_msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(MSG_LEN - PAYLOAD_OFF)];
         let m = decode(req).map_err(|_| UiError::BadReply)?;
         // **A body that does not fit is a loss, not a shorter body.** Shortening it is the worst
@@ -554,8 +523,7 @@ mod tests {
         let got = drain(&mut t);
         assert_eq!(got.len(), MAX_PARKED, "still exactly full");
         // The three oldest went; the rest kept their order and the newest survived.
-        let expected: alloc::vec::Vec<u16> =
-            (3..(MAX_PARKED as u16 + 3)).map(|n| 0x8000 | n).collect();
+        let expected: alloc::vec::Vec<u16> = (3..(MAX_PARKED as u16 + 3)).map(|n| 0x8000 | n).collect();
         assert_eq!(got, expected);
     }
 

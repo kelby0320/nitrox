@@ -23,8 +23,7 @@ use libdraw::framebuffer::{Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
 use libui::element::{
-    Element, Insets, TextSize, bold, center_v, column, ink, padding, row, scaled, sized, text,
-    with_spacing,
+    Element, Insets, TextSize, bold, center_v, column, ink, padding, row, scaled, sized, text, with_spacing,
 };
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme, paint};
@@ -107,12 +106,7 @@ pub const KEY_ENTER: u16 = 28;
 impl Greeter {
     /// An empty greeter, caret in the username field.
     pub fn new() -> Self {
-        Self {
-            user: TextFieldState::new(),
-            password: TextFieldState::new(),
-            focus: Focus::User,
-            denied: false,
-        }
+        Self { user: TextFieldState::new(), password: TextFieldState::new(), focus: Focus::User, denied: false }
     }
 
     /// The element tree for the current state.
@@ -138,11 +132,7 @@ impl Greeter {
         // where a field actually landed rather than recompute where it ought to have.
         let labelled = |label: &str, f: Element<()>, keys: (u64, u64)| {
             row(alloc::vec![
-                sized(
-                    Size::new(LABEL_W, FIELD_H),
-                    center_v(ink(theme.foreground_dim, text(label))),
-                )
-                .key(keys.0),
+                sized(Size::new(LABEL_W, FIELD_H), center_v(ink(theme.foreground_dim, text(label))),).key(keys.0),
                 f.flex(1).key(keys.1),
             ])
         };
@@ -155,10 +145,7 @@ impl Greeter {
         // serial column prints `login incorrect` for the same reason a window does, that a
         // refusal a user cannot see is a login that appears to have done nothing.
         let refusal = if self.denied { "login incorrect" } else { "" };
-        rows.push(sized(
-            Size::new(0, REFUSAL_H),
-            center_v(ink(theme.deny, scaled(TextSize::Small, text(refusal)))),
-        ));
+        rows.push(sized(Size::new(0, REFUSAL_H), center_v(ink(theme.deny, scaled(TextSize::Small, text(refusal))))));
         rows.push(labelled("username", field(&self.user, false, Focus::User), USER_KEYS));
         let password = field(&self.password, true, Focus::Password);
         rows.push(labelled("password", password, PASSWORD_KEYS));
@@ -218,9 +205,8 @@ impl Greeter {
 
     /// Render the current state into a fresh framebuffer.
     pub fn render(&self, font: &Font) -> MemFramebuffer {
-        let geometry =
-            Geometry::with_pitch(GREETER_W, GREETER_H, GREETER_PITCH, PixelFormat::XRGB8888)
-                .expect("the greeter pitch is wide enough for a row");
+        let geometry = Geometry::with_pitch(GREETER_W, GREETER_H, GREETER_PITCH, PixelFormat::XRGB8888)
+            .expect("the greeter pitch is wide enough for a row");
         let mut fb = MemFramebuffer::new(geometry);
         // Built once and used for both the tree and the paint, so one frame is never two themes.
         let theme = greeter_theme();
@@ -232,7 +218,6 @@ impl Greeter {
         fb
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -361,11 +346,7 @@ mod tests {
         let t = greeter_theme();
         let m = FontMetrics::new(&f, t.font_px);
         let measure = |g: &Greeter| {
-            libui::layout::measure(
-                &g.view(&t),
-                libui::layout::Constraints::loose(Size::new(4000, 4000)),
-                &m,
-            )
+            libui::layout::measure(&g.view(&t), libui::layout::Constraints::loose(Size::new(4000, 4000)), &m)
         };
         let mut g = Greeter::new();
         assert_eq!(measure(&g).h, GREETER_H, "the window is the height of what is in it");
@@ -385,11 +366,7 @@ mod tests {
         let e = g.view(&t);
         let l = libui::layout::layout(&e, bounds, &m);
         let field = libui::layout::locate(&e, &l, USER_KEYS.1).expect("the username field");
-        assert!(
-            field.size.w >= MIN_FIELD_W,
-            "a field laid out {} wide is too narrow to type in",
-            field.size.w
-        );
+        assert!(field.size.w >= MIN_FIELD_W, "a field laid out {} wide is too narrow to type in", field.size.w);
         assert!(
             field.origin.x + field.size.w as i32 <= (GREETER_W - CARD_PAD) as i32,
             "the field runs past the card's padding: {field:?}"

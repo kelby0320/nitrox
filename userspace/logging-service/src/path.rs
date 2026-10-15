@@ -59,11 +59,7 @@ mod tests {
     fn system_principal_with_source() {
         assert_eq!(
             classify("system/heartbeat/worker"),
-            Some(Classified {
-                tier: TIER_SYSTEM,
-                principal: "heartbeat",
-                source: Some("worker"),
-            })
+            Some(Classified { tier: TIER_SYSTEM, principal: "heartbeat", source: Some("worker") })
         );
     }
 

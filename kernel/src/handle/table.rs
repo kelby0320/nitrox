@@ -18,9 +18,7 @@ use super::grace::GraceTracker;
 use super::prng::Xorshift64;
 use super::segment::{SegmentEntries, SegmentMeta, free_entries, try_alloc_initialised};
 use super::type_rights::is_rights_compatible;
-use super::{
-    DIRECTORY_LEN, SEGMENT_LEN, current_ctx_id, release_refcount, try_acquire_refcount,
-};
+use super::{DIRECTORY_LEN, SEGMENT_LEN, current_ctx_id, release_refcount, try_acquire_refcount};
 use crate::libkern::lockrank::LockRank;
 
 /// Number of deferred-close entries the per-table ring can hold
@@ -211,11 +209,7 @@ impl DeferredQueue {
         for _ in 0..capacity {
             buf.try_push(None)?;
         }
-        Ok(Self {
-            buf,
-            head: 0,
-            len: 0,
-        })
+        Ok(Self { buf, head: 0, len: 0 })
     }
 
     fn capacity(&self) -> usize {
@@ -273,12 +267,15 @@ impl HandleTable {
             directory: [const { AtomicPtr::new(ptr::null_mut()) }; DIRECTORY_LEN],
             next_segment_hint: AtomicU32::new(0),
             grace: GraceTracker::new(),
-            inner: SpinLock::new(LockRank::HandleTable, Inner {
-                segment_meta: [SegmentMeta::empty(); DIRECTORY_LEN],
-                segments_count: 0,
-                defer_ring,
-                prng: Xorshift64::new(seed),
-            }),
+            inner: SpinLock::new(
+                LockRank::HandleTable,
+                Inner {
+                    segment_meta: [SegmentMeta::empty(); DIRECTORY_LEN],
+                    segments_count: 0,
+                    defer_ring,
+                    prng: Xorshift64::new(seed),
+                },
+            ),
         };
         table.grow_one()?;
         Ok(table)
@@ -314,11 +311,7 @@ impl HandleTable {
         // A concurrent grower may have published the same slot
         // (directory entry non-null) or grown past us
         // (segments_count moved beyond our `next_seg`).
-        if guard.segments_count > next_seg
-            || !self.directory[next_seg as usize]
-                .load(Ordering::Relaxed)
-                .is_null()
-        {
+        if guard.segments_count > next_seg || !self.directory[next_seg as usize].load(Ordering::Relaxed).is_null() {
             drop(guard);
             // SAFETY: `entries` came from `try_alloc_initialised`
             // above; nothing else has a reference because the pointer
@@ -378,8 +371,8 @@ impl HandleTable {
                 let segments_count = guard.segments_count as usize;
                 // Walk segments starting from the hint (wraps via two
                 // chained ranges so a hint past the end retries from 0).
-                let hint = (self.next_segment_hint.load(Ordering::Relaxed) as usize)
-                    .min(segments_count.saturating_sub(1));
+                let hint =
+                    (self.next_segment_hint.load(Ordering::Relaxed) as usize).min(segments_count.saturating_sub(1));
                 let scan = (hint..segments_count).chain(0..hint);
                 let mut chosen: Option<(u32, u32, u32)> = None; // (seg_id, slot_id, new_gen)
                 for seg_id in scan {
@@ -393,8 +386,7 @@ impl HandleTable {
                         // SAFETY: directory entry is non-null (debug
                         // assertion); segments published once outlive the
                         // table.
-                        let entry =
-                            unsafe { &(*entries_ptr)[slot_id as usize] };
+                        let entry = unsafe { &(*entries_ptr)[slot_id as usize] };
                         let next_head = entry.free_next.load(Ordering::Relaxed);
                         guard.segment_meta[seg_id].free_head = next_head;
                         guard.segment_meta[seg_id].free_count -= 1;
@@ -408,19 +400,14 @@ impl HandleTable {
                         // and only within the same owning process) is accepted.
                         // See docs/spec/handle-encoding.md § "Generation
                         // counter behavior".
-                        let new_gen = entry
-                            .generation
-                            .load(Ordering::Relaxed)
-                            .wrapping_add(1)
-                            & RawHandle::GENERATION_MAX;
+                        let new_gen =
+                            entry.generation.load(Ordering::Relaxed).wrapping_add(1) & RawHandle::GENERATION_MAX;
                         {
                             let _wg = WriteGuard::new(entry);
                             entry.generation.store(new_gen, Ordering::Relaxed);
                             entry.owner_pid.store(owner_pid, Ordering::Relaxed);
                             entry.rights.store(rights.bits(), Ordering::Relaxed);
-                            entry
-                                .object_type
-                                .store(object_type as u32, Ordering::Relaxed);
+                            entry.object_type.store(object_type as u32, Ordering::Relaxed);
                             entry.next_owned.store(RawHandle::NULL.bits(), Ordering::Relaxed);
                             // Publish the object pointer LAST: a reader
                             // that sees `object != null` is also
@@ -449,12 +436,7 @@ impl HandleTable {
     /// `required` is the rights subset the caller needs to perform
     /// its operation; pass [`Rights::empty()`] to merely confirm the
     /// handle is live.
-    pub fn lookup(
-        &self,
-        h: RawHandle,
-        caller_pid: u32,
-        required: Rights,
-    ) -> Result<LookupOk, HandleError> {
+    pub fn lookup(&self, h: RawHandle, caller_pid: u32, required: Rights) -> Result<LookupOk, HandleError> {
         // Step 0: enter a read-side critical section. The guard is
         // dropped on every exit path; while held, the table will not
         // recycle any slot we might still hold a reference into.
@@ -520,10 +502,7 @@ impl HandleTable {
             if s2 != snap.seq || (s2 & 1) != 0 {
                 release_refcount(obj, object_type);
                 retries += 1;
-                debug_assert!(
-                    retries < 1024,
-                    "handle table lookup spinning past 1024 retries — logic bug",
-                );
+                debug_assert!(retries < 1024, "handle table lookup spinning past 1024 retries — logic bug",);
                 continue;
             }
 
@@ -650,12 +629,7 @@ impl HandleTable {
     /// `existing & new_rights`; the spec forbids amplification, so
     /// extra bits in `new_rights` that the handle does not currently
     /// hold are silently dropped.
-    pub fn restrict(
-        &self,
-        h: RawHandle,
-        caller_pid: u32,
-        new_rights: Rights,
-    ) -> Result<(), HandleError> {
+    pub fn restrict(&self, h: RawHandle, caller_pid: u32, new_rights: Rights) -> Result<(), HandleError> {
         if h.is_null() {
             return Err(HandleError::NullHandle);
         }
@@ -708,12 +682,7 @@ impl HandleTable {
     /// transferred reference is reclaimed and released. See
     /// `docs/architecture/handle-system.md` and the kernel-object
     /// substrate in [`crate::object`].
-    pub fn duplicate(
-        &self,
-        h: RawHandle,
-        caller_pid: u32,
-        new_rights: Rights,
-    ) -> Result<RawHandle, HandleError> {
+    pub fn duplicate(&self, h: RawHandle, caller_pid: u32, new_rights: Rights) -> Result<RawHandle, HandleError> {
         let info = self.lookup(h, caller_pid, Rights::DUPLICATE)?;
         let dup_rights = info.rights & new_rights;
         // Transfer the looked-up reference out of the `ObjectRef` without
@@ -837,8 +806,8 @@ impl HandleTable {
                 // SAFETY: as in `close` — segments are published once and outlive
                 // the table; the rank-3 lock excludes every other writer.
                 let entry = unsafe { &(*entries_ptr)[cursor.slot] };
-                let matches = entry.owner_pid.load(Ordering::Relaxed) == pid
-                    && !entry.object.load(Ordering::Acquire).is_null();
+                let matches =
+                    entry.owner_pid.load(Ordering::Relaxed) == pid && !entry.object.load(Ordering::Acquire).is_null();
                 if !matches {
                     cursor.slot += 1;
                     continue;
@@ -847,23 +816,19 @@ impl HandleTable {
                     return (n, true); // batch full — resume at this same slot
                 }
                 let obj = entry.object.load(Ordering::Acquire);
-                let object_type =
-                    match KObjectType::from_u32(entry.object_type.load(Ordering::Relaxed)) {
-                        Some(t) => t,
-                        None => {
-                            // A malformed entry must not stall the sweep: skip it
-                            // rather than leaving the process half-reclaimed.
-                            cursor.slot += 1;
-                            continue;
-                        }
-                    };
+                let object_type = match KObjectType::from_u32(entry.object_type.load(Ordering::Relaxed)) {
+                    Some(t) => t,
+                    None => {
+                        // A malformed entry must not stall the sweep: skip it
+                        // rather than leaving the process half-reclaimed.
+                        cursor.slot += 1;
+                        continue;
+                    }
+                };
                 // Reconstruct this slot's handle to schedule its deferred
                 // reclamation, exactly as `close` does.
-                let handle = RawHandle::encode(
-                    cursor.seg as u32,
-                    cursor.slot as u32,
-                    entry.generation.load(Ordering::Relaxed),
-                );
+                let handle =
+                    RawHandle::encode(cursor.seg as u32, cursor.slot as u32, entry.generation.load(Ordering::Relaxed));
                 let epoch = self.grace.current_epoch();
                 if guard.defer_ring.push(DeferredClose { handle, epoch }).is_err() {
                     // The ring is full and nothing more has expired. Stop here
@@ -1135,11 +1100,7 @@ mod tests {
         // deferrals and hands one back.
         let h = t.allocate(6, mk_process(6), KObjectType::Process, sig()).unwrap();
         close_release(&t, h, 6).unwrap();
-        assert_eq!(
-            t.allocated_count(),
-            before,
-            "swept slots were not returned to the freelist"
-        );
+        assert_eq!(t.allocated_count(), before, "swept slots were not returned to the freelist");
     }
 
     #[test]
@@ -1148,9 +1109,7 @@ mod tests {
         // `MAP_WRITE` is principal-band but not on Process's allow-list.
         // `allocate` rejects before storing, so a fake (never
         // refcounted) pointer is safe here.
-        let err = t
-            .allocate(1, fake_obj(0x1000), KObjectType::Process, Rights::MAP_WRITE)
-            .unwrap_err();
+        let err = t.allocate(1, fake_obj(0x1000), KObjectType::Process, Rights::MAP_WRITE).unwrap_err();
         assert_eq!(err, HandleError::BadRights);
     }
 
@@ -1159,9 +1118,7 @@ mod tests {
         let t = fresh_table();
         let mut handles = [RawHandle::NULL; 32];
         for (i, h) in handles.iter_mut().enumerate() {
-            *h = t
-                .allocate(1, mk_process(i as u32), KObjectType::Process, sig())
-                .unwrap();
+            *h = t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap();
         }
         // All distinct.
         for i in 0..handles.len() {
@@ -1181,10 +1138,7 @@ mod tests {
     fn lookup_wrong_owner_pid_returns_not_owner() {
         let t = fresh_table();
         let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
-        assert_eq!(
-            t.lookup(h, 2, Rights::empty()).unwrap_err(),
-            HandleError::NotOwner
-        );
+        assert_eq!(t.lookup(h, 2, Rights::empty()).unwrap_err(), HandleError::NotOwner);
         close_release(&t, h, 1).unwrap();
     }
 
@@ -1202,10 +1156,7 @@ mod tests {
     fn lookup_insufficient_rights_returns_no_access() {
         let t = fresh_table();
         let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
-        assert_eq!(
-            t.lookup(h, 1, Rights::TERMINATE).unwrap_err(),
-            HandleError::NoAccess
-        );
+        assert_eq!(t.lookup(h, 1, Rights::TERMINATE).unwrap_err(), HandleError::NoAccess);
         close_release(&t, h, 1).unwrap();
     }
 
@@ -1213,10 +1164,7 @@ mod tests {
     fn lookup_superset_rights_request_returns_no_access() {
         let t = fresh_table();
         let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
-        assert_eq!(
-            t.lookup(h, 1, sigterm()).unwrap_err(),
-            HandleError::NoAccess,
-        );
+        assert_eq!(t.lookup(h, 1, sigterm()).unwrap_err(), HandleError::NoAccess,);
         close_release(&t, h, 1).unwrap();
     }
 
@@ -1236,10 +1184,7 @@ mod tests {
     #[test]
     fn null_handle_lookup_returns_null_handle() {
         let t = fresh_table();
-        assert_eq!(
-            t.lookup(RawHandle::NULL, 0, Rights::empty()).unwrap_err(),
-            HandleError::NullHandle,
-        );
+        assert_eq!(t.lookup(RawHandle::NULL, 0, Rights::empty()).unwrap_err(), HandleError::NullHandle,);
     }
 
     #[test]
@@ -1247,10 +1192,7 @@ mod tests {
         let t = fresh_table();
         let bogus = RawHandle::encode((DIRECTORY_LEN - 1) as u32, 0, 1);
         // Segment exists but slot 0 was never allocated.
-        assert_eq!(
-            t.lookup(bogus, 0, Rights::empty()).unwrap_err(),
-            HandleError::InvalidHandle,
-        );
+        assert_eq!(t.lookup(bogus, 0, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
     }
 
     // --- Close -------------------------------------------------------
@@ -1265,10 +1207,7 @@ mod tests {
         assert_eq!(prev.1, KObjectType::Process);
         // Release the handle's reference (destroys the object).
         drop(unsafe { ObjectRef::from_raw(prev.0, prev.1) });
-        assert_eq!(
-            t.lookup(h, 1, Rights::empty()).unwrap_err(),
-            HandleError::InvalidHandle,
-        );
+        assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
     }
 
     #[test]
@@ -1304,10 +1243,7 @@ mod tests {
         // reason that helper asserts too.
         assert_eq!((seg1, slot1), (seg2, slot2), "the freed slot must be the one reused");
         assert_ne!(gen1, gen2, "generation must bump on slot reuse");
-        assert_eq!(
-            t.lookup(h1, 1, Rights::empty()).unwrap_err(),
-            HandleError::InvalidHandle,
-        );
+        assert_eq!(t.lookup(h1, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
         assert!(t.lookup(h2, 1, sig()).is_ok());
         close_release(&t, h2, 1).unwrap();
     }
@@ -1328,16 +1264,11 @@ mod tests {
             // rank-3 lock so we are the only writer.
             let entry = unsafe { &(*entries_ptr)[slot as usize] };
             let _wg = WriteGuard::new(entry);
-            entry
-                .generation
-                .store(RawHandle::GENERATION_MAX, Ordering::Relaxed);
+            entry.generation.store(RawHandle::GENERATION_MAX, Ordering::Relaxed);
         }
         let h_max = RawHandle::encode(seg, slot, RawHandle::GENERATION_MAX);
         // A max-generation handle still has bit 63 clear — never a negative isize.
-        assert!(
-            (h_max.bits() as i64) >= 0,
-            "max-generation handle aliases an error code",
-        );
+        assert!((h_max.bits() as i64) >= 0, "max-generation handle aliases an error code",);
         assert!(t.lookup(h_max, 1, sig()).is_ok());
 
         // Close it and reallocate: the slot is RECYCLED (not retired), and its
@@ -1349,10 +1280,7 @@ mod tests {
         assert_eq!(ngen, 0, "generation wraps from GENERATION_MAX to 0");
         assert!((h_next.bits() as i64) >= 0, "wrapped handle stays non-negative");
         // The stale max-generation handle no longer validates (generation moved).
-        assert_eq!(
-            t.lookup(h_max, 1, sig()).unwrap_err(),
-            HandleError::InvalidHandle,
-        );
+        assert_eq!(t.lookup(h_max, 1, sig()).unwrap_err(), HandleError::InvalidHandle,);
         close_release(&t, h_next, 1).unwrap();
     }
 
@@ -1365,10 +1293,7 @@ mod tests {
         // Ask to "add" TERMINATE — the intersection with current rights
         // (just SIGNAL) is empty for that bit.
         t.restrict(h, 1, Rights::TERMINATE).unwrap();
-        assert_eq!(
-            t.lookup(h, 1, Rights::SIGNAL).unwrap_err(),
-            HandleError::NoAccess,
-        );
+        assert_eq!(t.lookup(h, 1, Rights::SIGNAL).unwrap_err(), HandleError::NoAccess,);
         assert!(t.lookup(h, 1, Rights::empty()).is_ok());
         close_release(&t, h, 1).unwrap();
     }
@@ -1379,10 +1304,7 @@ mod tests {
         let h = t.allocate(1, mk_process(1), KObjectType::Process, sigterm()).unwrap();
         t.restrict(h, 1, Rights::SIGNAL).unwrap();
         assert!(t.lookup(h, 1, Rights::SIGNAL).is_ok());
-        assert_eq!(
-            t.lookup(h, 1, Rights::TERMINATE).unwrap_err(),
-            HandleError::NoAccess,
-        );
+        assert_eq!(t.lookup(h, 1, Rights::TERMINATE).unwrap_err(), HandleError::NoAccess,);
         close_release(&t, h, 1).unwrap();
     }
 
@@ -1496,15 +1418,9 @@ mod tests {
     #[test]
     fn the_null_handle_is_rejected_by_lookup_close_and_restrict() {
         let t = fresh_table();
-        assert_eq!(
-            t.lookup(RawHandle::NULL, 1, Rights::empty()).unwrap_err(),
-            HandleError::NullHandle,
-        );
+        assert_eq!(t.lookup(RawHandle::NULL, 1, Rights::empty()).unwrap_err(), HandleError::NullHandle,);
         assert_eq!(t.close(RawHandle::NULL, 1).unwrap_err(), HandleError::NullHandle);
-        assert_eq!(
-            t.restrict(RawHandle::NULL, 1, Rights::empty()).unwrap_err(),
-            HandleError::NullHandle,
-        );
+        assert_eq!(t.restrict(RawHandle::NULL, 1, Rights::empty()).unwrap_err(), HandleError::NullHandle,);
     }
 
     /// Segment and slot indices past the end of the table, on all three entry points.
@@ -1518,15 +1434,9 @@ mod tests {
         let bad_seg = RawHandle::encode(DIRECTORY_LEN as u32, 0, 1);
         let bad_slot = RawHandle::encode(0, SEGMENT_LEN as u32, 1);
         for h in [bad_seg, bad_slot] {
-            assert_eq!(
-                t.lookup(h, 1, Rights::empty()).unwrap_err(),
-                HandleError::InvalidHandle,
-            );
+            assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
             assert_eq!(t.close(h, 1).unwrap_err(), HandleError::InvalidHandle);
-            assert_eq!(
-                t.restrict(h, 1, Rights::empty()).unwrap_err(),
-                HandleError::InvalidHandle,
-            );
+            assert_eq!(t.restrict(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
         }
     }
 
@@ -1539,15 +1449,9 @@ mod tests {
         let t = fresh_table();
         assert_eq!(t.segments_allocated(), 1, "the fixture must leave segment 1 absent");
         let h = RawHandle::encode(1, 0, 1);
-        assert_eq!(
-            t.lookup(h, 1, Rights::empty()).unwrap_err(),
-            HandleError::InvalidHandle,
-        );
+        assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
         assert_eq!(t.close(h, 1).unwrap_err(), HandleError::InvalidHandle);
-        assert_eq!(
-            t.restrict(h, 1, Rights::empty()).unwrap_err(),
-            HandleError::InvalidHandle,
-        );
+        assert_eq!(t.restrict(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
     }
 
     // --- Duplicate ---------------------------------------------------
@@ -1556,10 +1460,7 @@ mod tests {
     fn duplicate_requires_duplicate_right() {
         let t = fresh_table();
         let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
-        assert_eq!(
-            t.duplicate(h, 1, sig()).unwrap_err(),
-            HandleError::NoAccess,
-        );
+        assert_eq!(t.duplicate(h, 1, sig()).unwrap_err(), HandleError::NoAccess,);
         close_release(&t, h, 1).unwrap();
     }
 
@@ -1567,24 +1468,14 @@ mod tests {
     fn duplicate_yields_independent_handle_with_intersected_rights() {
         let t = fresh_table();
         let original = t
-            .allocate(
-                1,
-                mk_process(1),
-                KObjectType::Process,
-                Rights::SIGNAL | Rights::TERMINATE | Rights::DUPLICATE,
-            )
+            .allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL | Rights::TERMINATE | Rights::DUPLICATE)
             .unwrap();
         // Duplicate dropping TERMINATE.
-        let copy = t
-            .duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE)
-            .unwrap();
+        let copy = t.duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE).unwrap();
         assert_ne!(copy, original);
         // Copy can SIGNAL but not TERMINATE.
         assert!(t.lookup(copy, 1, Rights::SIGNAL).is_ok());
-        assert_eq!(
-            t.lookup(copy, 1, Rights::TERMINATE).unwrap_err(),
-            HandleError::NoAccess,
-        );
+        assert_eq!(t.lookup(copy, 1, Rights::TERMINATE).unwrap_err(), HandleError::NoAccess,);
         // Original retains both.
         assert!(t.lookup(original, 1, Rights::TERMINATE).is_ok());
         // Closing one doesn't affect the other.
@@ -1597,17 +1488,8 @@ mod tests {
     fn duplicate_refcount_accounting_destroys_once_at_last_close() {
         let t = fresh_table();
         test_probe::reset();
-        let original = t
-            .allocate(
-                1,
-                mk_process(1),
-                KObjectType::Process,
-                Rights::SIGNAL | Rights::DUPLICATE,
-            )
-            .unwrap(); // object refcount = 1 (one handle)
-        let copy = t
-            .duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE)
-            .unwrap(); // refcount = 2 (two handles)
+        let original = t.allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL | Rights::DUPLICATE).unwrap(); // object refcount = 1 (one handle)
+        let copy = t.duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE).unwrap(); // refcount = 2 (two handles)
         // Closing one handle must not destroy the object.
         close_release(&t, copy, 1).unwrap();
         assert_eq!(test_probe::process_destroys(), 0, "destroyed while a handle remains");
@@ -1620,21 +1502,10 @@ mod tests {
     fn duplicate_allocate_error_reclaims_ref() {
         let t = fresh_table();
         test_probe::reset();
-        let original = t
-            .allocate(
-                1,
-                mk_process(1),
-                KObjectType::Process,
-                Rights::SIGNAL | Rights::DUPLICATE,
-            )
-            .unwrap(); // refcount = 1
+        let original = t.allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL | Rights::DUPLICATE).unwrap(); // refcount = 1
         // Force the duplicate's internal `allocate` to fail.
         FAIL_NEXT_ALLOCATE.with(|f| f.set(true));
-        assert_eq!(
-            t.duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE)
-                .unwrap_err(),
-            HandleError::OutOfMemory,
-        );
+        assert_eq!(t.duplicate(original, 1, Rights::SIGNAL | Rights::DUPLICATE).unwrap_err(), HandleError::OutOfMemory,);
         // The reference the lookup took must have been reclaimed (back to
         // 1, owned by the original handle) — not leaked, not over-freed.
         assert_eq!(test_probe::process_destroys(), 0);
@@ -1679,14 +1550,7 @@ mod tests {
     #[test]
     fn stat_returns_snapshot_when_inspect_granted() {
         let t = fresh_table();
-        let h = t
-            .allocate(
-                42,
-                mk_process(42),
-                KObjectType::Process,
-                Rights::SIGNAL | Rights::INSPECT,
-            )
-            .unwrap();
+        let h = t.allocate(42, mk_process(42), KObjectType::Process, Rights::SIGNAL | Rights::INSPECT).unwrap();
         let s = t.stat(h, 42).unwrap();
         assert_eq!(s.object_type, KObjectType::Process);
         assert!(s.rights.contains(Rights::SIGNAL));
@@ -1713,12 +1577,7 @@ mod tests {
         handles.try_reserve(SEGMENT_LEN + 1).unwrap();
         // Fill segment 0 exactly.
         for i in 0..SEGMENT_LEN {
-            handles
-                .try_push(
-                    t.allocate(1, mk_process(i as u32), KObjectType::Process, sig())
-                        .unwrap(),
-                )
-                .unwrap();
+            handles.try_push(t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap()).unwrap();
         }
         assert_eq!(t.segments_allocated(), 1);
         // One more allocation triggers grow.
@@ -1739,9 +1598,7 @@ mod tests {
         let t = fresh_table();
         let mut handles = [RawHandle::NULL; 64];
         for i in 0..64 {
-            handles[i] = t
-                .allocate(1, mk_process(i as u32), KObjectType::Process, sig())
-                .unwrap();
+            handles[i] = t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap();
         }
         for i in (0..64).step_by(2) {
             close_release(&t, handles[i], 1).unwrap();
@@ -1779,10 +1636,7 @@ mod tests {
         let h = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
         // Force step 7 to fail on the next lookup *on this thread*.
         FAIL_NEXT_ACQUIRE.with(|f| f.set(true));
-        assert_eq!(
-            t.lookup(h, 1, sig()).unwrap_err(),
-            HandleError::InvalidHandle,
-        );
+        assert_eq!(t.lookup(h, 1, sig()).unwrap_err(), HandleError::InvalidHandle,);
         // Flag is one-shot; the subsequent lookup succeeds.
         assert!(t.lookup(h, 1, sig()).is_ok());
         close_release(&t, h, 1).unwrap();
@@ -1825,19 +1679,14 @@ mod tests {
                     test_probe::reset();
                     for i in 0..ITERS {
                         let obj = mk_process(my_pid * 1_000_000 + i as u32);
-                        let h = t
-                            .allocate(my_pid, obj, KObjectType::Process, sig())
-                            .expect("allocate");
+                        let h = t.allocate(my_pid, obj, KObjectType::Process, sig()).expect("allocate");
                         // Owner can look up; pinned object is intact.
                         let ok = t.lookup(h, my_pid, sig()).expect("lookup");
                         assert!(process_magic_ok(&ok.object));
                         drop(ok);
                         // Wrong owner cannot.
                         let other_pid = if my_pid == 1 { 2 } else { 1 };
-                        assert_eq!(
-                            t.lookup(h, other_pid, sig()).unwrap_err(),
-                            HandleError::NotOwner,
-                        );
+                        assert_eq!(t.lookup(h, other_pid, sig()).unwrap_err(), HandleError::NotOwner,);
                         close_release(&t, h, my_pid).expect("close");
                     }
                     // Each object was created and destroyed on this same
@@ -1854,11 +1703,7 @@ mod tests {
         // Allow the grace-period drain to catch up via a final cycle.
         let h = t.allocate(99, mk_process(99), KObjectType::Process, sig()).unwrap();
         close_release(&t, h, 99).unwrap();
-        assert!(
-            t.allocated_count() <= 1,
-            "stray handles after stress: {}",
-            t.allocated_count()
-        );
+        assert!(t.allocated_count() <= 1, "stray handles after stress: {}", t.allocated_count());
     }
 
     /// Many threads hammer one slot: one writer closing-and-reallocating
@@ -1958,14 +1803,7 @@ mod tests {
         test_probe::reset();
         // `RawHandle` is a plain `u64` wrapper (Send), so worker closures
         // capture it directly.
-        let h0 = t
-            .allocate(
-                1,
-                mk_process(1),
-                KObjectType::Process,
-                Rights::SIGNAL | Rights::DUPLICATE,
-            )
-            .unwrap();
+        let h0 = t.allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL | Rights::DUPLICATE).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
 
         // Duplicators: duplicate H, verify, close the duplicate.
@@ -2023,11 +1861,7 @@ mod tests {
         // once.
         test_probe::reset();
         close_release(&t, h0, 1).unwrap();
-        assert_eq!(
-            test_probe::process_destroys(),
-            1,
-            "final destroy did not happen exactly once"
-        );
+        assert_eq!(test_probe::process_destroys(), 1, "final destroy did not happen exactly once");
     }
 
     // --- Single-context defer drain ---------------------------------

@@ -141,24 +141,21 @@ impl<R: BlockReader + BlockWriter> Volume for Ext4<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libfsserver::serve::{MAX_REASON, Served, encode_refusal, serve, serve_resolve};
-    use librsproto::namespace::{OBJECT_KIND_MEMOBJ, RESOLVE_FILE_LAZY};
-    use librsproto::{OP_FILE_READ_RANGE, OP_NS_RESOLVE, RS_FLAG_ERROR, decode, encode};
-    use libkern::KError;
     use crate::test_support::{ImageReader, fixture};
-    use librsproto::file::{parse_read_range_reply, read_range_request};
-    use librsproto::namespace::{RESOLVE_FILE_AS_MEMOBJ, parse_resolve_reply, resolve_request};
+    use libfsserver::serve::{MAX_REASON, Served, encode_refusal, serve, serve_resolve};
+    use libkern::KError;
     use librsproto::error::parse_error;
+    use librsproto::file::{parse_read_range_reply, read_range_request};
+    use librsproto::namespace::{OBJECT_KIND_MEMOBJ, RESOLVE_FILE_LAZY};
+    use librsproto::namespace::{RESOLVE_FILE_AS_MEMOBJ, parse_resolve_reply, resolve_request};
+    use librsproto::{OP_FILE_READ_RANGE, OP_NS_RESOLVE, RS_FLAG_ERROR, decode, encode};
 
     /// Build a `Namespace::Resolve` request for `suffix` (the kernel's wire form).
     fn make_request(request_id: u64, suffix: &[u8]) -> ([u8; 512], usize) {
         let mut body = [0u8; 256];
-        let body_len =
-            resolve_request(&mut body, /*requested_rights*/ 0x8000, RESOLVE_FILE_AS_MEMOBJ, suffix)
-                .unwrap();
+        let body_len = resolve_request(&mut body, /*requested_rights*/ 0x8000, RESOLVE_FILE_AS_MEMOBJ, suffix).unwrap();
         let mut buf = [0u8; 512];
-        let n = encode(&mut buf, OP_NS_RESOLVE, request_id, /*flags*/ 0, &body[..body_len], 0)
-            .unwrap();
+        let n = encode(&mut buf, OP_NS_RESOLVE, request_id, /*flags*/ 0, &body[..body_len], 0).unwrap();
         (buf, n)
     }
 
@@ -261,8 +258,7 @@ mod tests {
     /// Build a `RESOLVE_FILE_LAZY` resolve request (the slice-8 kernel's form).
     fn make_lazy_request(request_id: u64, suffix: &[u8]) -> ([u8; 512], usize) {
         let mut body = [0u8; 256];
-        let body_len =
-            resolve_request(&mut body, 0x8000, RESOLVE_FILE_LAZY, suffix).unwrap();
+        let body_len = resolve_request(&mut body, 0x8000, RESOLVE_FILE_LAZY, suffix).unwrap();
         let mut buf = [0u8; 512];
         let n = encode(&mut buf, OP_NS_RESOLVE, request_id, 0, &body[..body_len], 0).unwrap();
         (buf, n)

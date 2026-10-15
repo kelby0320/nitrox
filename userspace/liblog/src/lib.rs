@@ -15,9 +15,7 @@
 use libkern::*;
 use librsproto::log::encode_append;
 
-pub use librsproto::log::{
-    LEVEL_CRITICAL, LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN,
-};
+pub use librsproto::log::{LEVEL_CRITICAL, LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN};
 
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
@@ -119,32 +117,19 @@ pub fn open_source(ns: u64, path: &[u8]) -> Logger {
     // Resolve with SEND | TRANSFER (the logging service replies a channel endpoint; the
     // client only sends). Stack buffers — reentrant, no statics.
     // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall4(
-            SYS_NS_LOOKUP,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            RIGHT_SEND | RIGHT_TRANSFER,
-        )
-    };
+    let po =
+        unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_SEND | RIGHT_TRANSFER) };
     if po < 0 {
         return Logger::new(0);
     }
     let wh = [po as u64];
     let mut wr = [0u8; 24];
     // SAFETY: `wh`/`wr` are valid buffers for a single waiter.
-    let waited = unsafe {
-        syscall4(SYS_WAIT, wh.as_ptr() as u64, 1, wr.as_mut_ptr() as u64, u64::MAX)
-    };
+    let waited = unsafe { syscall4(SYS_WAIT, wh.as_ptr() as u64, 1, wr.as_mut_ptr() as u64, u64::MAX) };
     // IoResult: status @8..12, resolved handle @16..24.
     let status = i32::from_le_bytes([wr[8], wr[9], wr[10], wr[11]]);
     let handle = u64::from_le_bytes([wr[16], wr[17], wr[18], wr[19], wr[20], wr[21], wr[22], wr[23]]);
     // SAFETY: closing our own PO handle (the resolved handle is separate).
     unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-    if waited != 1 || status != 0 {
-        Logger::new(0)
-    } else {
-        Logger::new(handle)
-    }
+    if waited != 1 || status != 0 { Logger::new(0) } else { Logger::new(handle) }
 }

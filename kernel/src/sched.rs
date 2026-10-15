@@ -55,17 +55,17 @@ use crate::arch::paging::ArchPaging;
 use crate::arch::timer::ArchTimer;
 use crate::arch::{Cpu, MAX_CPUS, Paging, context_switch};
 use crate::libkern::handle::{KObjectType, Rights};
-use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
-use crate::mm::PhysAddr;
-use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::libkern::ipc::IPC_HANDLE_MAX;
-use crate::object::{
-    BlockSendOutcome, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel,
-    ObjectRef, PendingOperation, ReclaimedSend, RecvState, SchedClass, SendOutcome, StoredMsg,
-    Thread, ThreadEntry, ThreadState, Timer, TransferRef, UserspaceServerReg,
-};
-use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
 use crate::libkern::lockrank::LockRank;
+use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
+use crate::libkern::{ExitKind, ExitStatus, Notification};
+use crate::mm::PhysAddr;
+use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
+use crate::object::{
+    BlockSendOutcome, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef, PendingOperation,
+    ReclaimedSend, RecvState, SchedClass, SendOutcome, StoredMsg, Thread, ThreadEntry, ThreadState, Timer, TransferRef,
+    UserspaceServerReg,
+};
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
 // monotonic clock is reached via the full path `crate::arch::Timer::read_ns()`
@@ -243,10 +243,7 @@ mod deadline {
     /// is re-armed (drop its stale entry), or a `BlockBounded` send is delivered
     /// early / its endpoint closes (drop its pending-send deadline).
     pub(super) fn remove(h: &mut KVec<Entry>, target: usize, kind: DeadlineKind) -> bool {
-        let Some(i) = h
-            .iter()
-            .position(|e| e.target == target && e.kind == kind)
-        else {
+        let Some(i) = h.iter().position(|e| e.target == target && e.kind == kind) else {
             return false;
         };
         let n = h.len();
@@ -339,13 +336,7 @@ pub mod stats {
 
     impl Counters {
         /// All-zero counters (`const` — usable in the `SCHED` static initializer).
-        pub const ZERO: Counters = Counters {
-            switches: 0,
-            steals: 0,
-            placed: 0,
-            resched_ipis: 0,
-            ticks: 0,
-        };
+        pub const ZERO: Counters = Counters { switches: 0, steals: 0, placed: 0, resched_ipis: 0, ticks: 0 };
     }
 
     /// One CPU's row in a [`Snapshot`]: its [`Counters`] plus instantaneous
@@ -364,12 +355,7 @@ pub mod stats {
 
     impl CpuSnapshot {
         /// A never-onlined CPU's row (`const` — the snapshot array initializer).
-        pub const OFFLINE: CpuSnapshot = CpuSnapshot {
-            online: false,
-            idle: false,
-            ready: 0,
-            counters: Counters::ZERO,
-        };
+        pub const OFFLINE: CpuSnapshot = CpuSnapshot { online: false, idle: false, ready: 0, counters: Counters::ZERO };
     }
 
     /// A consistent point-in-time copy of every CPU's scheduler statistics,
@@ -809,8 +795,7 @@ pub fn preempt_enable() {
         "preempt_enable with no matching preempt_disable — the counter would have wrapped \
          to u32::MAX and this CPU would never preempt again"
     );
-    let replay =
-        depth_before == 1 && with_resched_pending(me, |c| c.swap(false, Ordering::AcqRel));
+    let replay = depth_before == 1 && with_resched_pending(me, |c| c.swap(false, Ordering::AcqRel));
     preempt_irqs_restore(prev);
     if replay {
         // Mirror `on_reschedule_ipi`: resume an idle CPU into the scheduler; a
@@ -963,25 +948,28 @@ struct SchedState {
     reaper: Option<ObjectRef>,
 }
 
-static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(LockRank::Sched, SchedState {
-    ready: [const { KVec::new() }; MAX_CPUS],
-    cpu_online: [false; MAX_CPUS],
-    current: [const { None }; MAX_CPUS],
-    reap: [const { KVec::new() }; MAX_CPUS],
-    suspended: KVec::new(),
-    next_tid: 1,
-    next_pid: 2,
-    quantum: [QUANTUM_TICKS; MAX_CPUS],
-    min_vruntime: [0; MAX_CPUS],
-    idle: [const { None }; MAX_CPUS],
-    idle_addr: [0; MAX_CPUS],
-    blocked: KVec::new(),
-    deadlines: KVec::new(),
-    stats: [stats::Counters::ZERO; MAX_CPUS],
-    deferred_drops: KVec::new(),
-    ended_pids: KVec::new(),
-    reaper: None,
-});
+static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(
+    LockRank::Sched,
+    SchedState {
+        ready: [const { KVec::new() }; MAX_CPUS],
+        cpu_online: [false; MAX_CPUS],
+        current: [const { None }; MAX_CPUS],
+        reap: [const { KVec::new() }; MAX_CPUS],
+        suspended: KVec::new(),
+        next_tid: 1,
+        next_pid: 2,
+        quantum: [QUANTUM_TICKS; MAX_CPUS],
+        min_vruntime: [0; MAX_CPUS],
+        idle: [const { None }; MAX_CPUS],
+        idle_addr: [0; MAX_CPUS],
+        blocked: KVec::new(),
+        deadlines: KVec::new(),
+        stats: [stats::Counters::ZERO; MAX_CPUS],
+        deferred_drops: KVec::new(),
+        ended_pids: KVec::new(),
+        reaper: None,
+    },
+);
 
 impl SchedState {
     /// Dense index of the running CPU's per-CPU scheduler slots (`current`/`idle`/
@@ -1143,10 +1131,7 @@ pub fn ap_run() -> ! {
     // tick can schedule. Arm preemption, then retire the boot thread into the
     // run loop (the AP continues as its idle thread until `ready` has work).
     unsafe { Cpu::interrupts_enable() };
-    exit_thread(ExitStatus {
-        kind: ExitKind::Normal as u32,
-        code: 0,
-    });
+    exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
 }
 
 /// Per-CPU scheduler-context setup for an AP: a boot thread (adopting the running
@@ -1285,24 +1270,10 @@ fn spawn_inner(
 /// namespace, first installed handle, `arg0`; `[0; 4]` for the boot/`hello`
 /// path). The kernel stack + frame fabrication happen before the (brief) enqueue
 /// lock.
-pub fn spawn_user(
-    process: ObjectRef,
-    entry: u64,
-    user_sp: u64,
-    boot_args: [u64; 4],
-) -> Result<ObjectRef, AllocError> {
+pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64, boot_args: [u64; 4]) -> Result<ObjectRef, AllocError> {
     // Default scheduling: TimeShared, nice 0, no affinity restriction — the behavior
     // every caller had before scheduling params were exposed via `ThreadArgs`.
-    spawn_user_sched(
-        process,
-        entry,
-        user_sp,
-        boot_args,
-        SchedClass::TimeShared,
-        0,
-        0,
-        u8::MAX,
-    )
+    spawn_user_sched(process, entry, user_sp, boot_args, SchedClass::TimeShared, 0, 0, u8::MAX)
 }
 
 /// As [`spawn_user`], but with explicit scheduling parameters (from a user thread's
@@ -1467,9 +1438,7 @@ pub fn resched_if_idle() {
 /// `true` if this CPU's current thread is its idle thread (its object address equals
 /// this CPU's `idle_addr`). Caller holds `SCHED`.
 fn current_is_idle(g: &SchedState) -> bool {
-    g.cur_ref()
-        .as_ref()
-        .is_some_and(|c| c.as_ptr() as usize == g.idle_addr())
+    g.cur_ref().as_ref().is_some_and(|c| c.as_ptr() as usize == g.idle_addr())
 }
 
 /// Capture a consistent point-in-time copy of every CPU's scheduler statistics
@@ -1484,9 +1453,7 @@ pub fn stats_snapshot() -> stats::Snapshot {
     for (c, slot) in cpus.iter_mut().enumerate() {
         *slot = stats::CpuSnapshot {
             online: g.cpu_online[c],
-            idle: g.current[c]
-                .as_ref()
-                .is_some_and(|t| t.as_ptr() as usize == g.idle_addr[c]),
+            idle: g.current[c].as_ref().is_some_and(|t| t.as_ptr() as usize == g.idle_addr[c]),
             ready: g.ready[c].len() as u32,
             counters: g.stats[c],
         };
@@ -1637,9 +1604,7 @@ unsafe fn obj_type(obj: *mut ()) -> KObjectType {
 unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
     match unsafe { obj_type(obj) } {
         KObjectType::Timer => unsafe { Timer::already_signaled(obj, now) },
-        KObjectType::NotificationChannel => unsafe {
-            NotificationChannel::already_signaled(obj)
-        },
+        KObjectType::NotificationChannel => unsafe { NotificationChannel::already_signaled(obj) },
         KObjectType::IpcChannel => unsafe { IpcChannel::already_signaled(obj) },
         KObjectType::PendingOperation => unsafe { PendingOperation::already_signaled(obj) },
         KObjectType::InterruptObject => unsafe { InterruptObject::already_signaled(obj) },
@@ -1939,9 +1904,8 @@ pub fn us_forward_originate(
     let mut g = SCHED.lock();
     // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
     // held. Reserve the pending slot + assign a request id (None ⇒ already busy).
-    let request_id =
-        match unsafe { UserspaceServerReg::begin_forward(reg, po, owner_pid, requested, suffix, fwd) } {
-            Some(id) => id,
+    let request_id = match unsafe { UserspaceServerReg::begin_forward(reg, po, owner_pid, requested, suffix, fwd) } {
+        Some(id) => id,
         None => return ForwardOutcome::Busy,
     };
     // Stamp the assigned id into the request envelope (the body was built by the
@@ -1970,11 +1934,7 @@ pub fn us_forward_originate(
             let pl = unsafe { UserspaceServerReg::take_pending_matching(reg, request_id) };
             drop(g);
             drop(pl);
-            if outcome == SendOutcome::Full {
-                ForwardOutcome::Full
-            } else {
-                ForwardOutcome::PeerClosed
-            }
+            if outcome == SendOutcome::Full { ForwardOutcome::Full } else { ForwardOutcome::PeerClosed }
         }
     }
 }
@@ -2000,11 +1960,10 @@ pub fn us_forward_originate_fill(
     let mut g = SCHED.lock();
     // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
     // held. Reserve the pending-fill slot + assign a request id (None ⇒ busy).
-    let request_id =
-        match unsafe { UserspaceServerReg::begin_fill(reg, po, file_obj, frame, index) } {
-            Some(id) => id,
-            None => return ForwardOutcome::Busy,
-        };
+    let request_id = match unsafe { UserspaceServerReg::begin_fill(reg, po, file_obj, frame, index) } {
+        Some(id) => id,
+        None => return ForwardOutcome::Busy,
+    };
     crate::rsproto::stamp_request_id(&mut msg.payload, request_id);
     // SAFETY: `reg` live, `SCHED` held — the kernel endpoint is pinned by `reg`.
     let endpoint = unsafe { UserspaceServerReg::endpoint_ptr(reg) };
@@ -2029,11 +1988,7 @@ pub fn us_forward_originate_fill(
             let pf = unsafe { UserspaceServerReg::take_pending_fill_matching(reg, request_id) };
             drop(g);
             drop(pf);
-            if outcome == SendOutcome::Full {
-                ForwardOutcome::Full
-            } else {
-                ForwardOutcome::PeerClosed
-            }
+            if outcome == SendOutcome::Full { ForwardOutcome::Full } else { ForwardOutcome::PeerClosed }
         }
     }
 }
@@ -2094,11 +2049,7 @@ pub fn us_reg_detach(reg: *mut ()) {
     let mut n_orphans = 0usize;
     // SAFETY: as above; `SCHED` held.
     while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg) } {
-        signal_pending_op(
-            &mut g,
-            pl.po.as_ptr(),
-            crate::syscall::error::KError::PeerClosed as i32,
-        );
+        signal_pending_op(&mut g, pl.po.as_ptr(), crate::syscall::error::KError::PeerClosed as i32);
         orphans[n_orphans] = Some(pl.po);
         n_orphans += 1;
     }
@@ -2274,11 +2225,7 @@ pub fn ipc_recv_pop_into(
     if let Some(ref po) = promoted {
         // Delivered before its deadline: drop its pending-send deadline entry
         // (idempotent — a plain `Block` send registered none), then complete it.
-        deadline::remove(
-            &mut g.deadlines,
-            po.as_ptr() as usize,
-            deadline::DeadlineKind::PendingSend,
-        );
+        deadline::remove(&mut g.deadlines, po.as_ptr() as usize, deadline::DeadlineKind::PendingSend);
         signal_pending_op(&mut g, po.as_ptr(), 0);
     }
     (true, promoted)
@@ -2768,12 +2715,7 @@ pub fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(
     if deadline_ns != 0 {
         if deadline::push(
             &mut g.deadlines,
-            deadline::Entry {
-                deadline_ns,
-                target: timer as usize,
-                kind: deadline::DeadlineKind::Timer,
-                channel: 0,
-            },
+            deadline::Entry { deadline_ns, target: timer as usize, kind: deadline::DeadlineKind::Timer, channel: 0 },
         )
         .is_err()
         {
@@ -2796,13 +2738,8 @@ pub fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(
 /// idle→idle) would be pointless churn.
 fn tick_quantum(quantum: u32, ready_nonempty: bool) -> (u32, bool) {
     let q = quantum.saturating_sub(1);
-    if q == 0 {
-        (QUANTUM_TICKS, ready_nonempty)
-    } else {
-        (q, false)
-    }
+    if q == 0 { (QUANTUM_TICKS, ready_nonempty) } else { (q, false) }
 }
-
 
 /// The shared switch core used by [`yield_now`] and [`on_timer_tick`]: the
 /// outgoing `current` is re-homed (re-enqueued, or re-parked if it is the idle
@@ -3146,9 +3083,7 @@ pub fn exit_process(status: ExitStatus) -> ! {
 /// (pid/tid from the thread; kind/addr from the `Notification`), staying out of the
 /// arch-private `ExceptionFrame`.
 fn report_stranded_fault(me_obj: *mut (), notif: &Notification) {
-    use crate::libkern::notification::{
-        KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, KIND_STACK_OVERFLOW,
-    };
+    use crate::libkern::notification::{KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, KIND_STACK_OVERFLOW};
     use core::fmt::Write;
     // SAFETY: `me_obj` is the running (faulting) thread, pinned, `SCHED` held.
     let th = unsafe { &*(me_obj as *const Thread) };
@@ -3685,8 +3620,7 @@ fn steal_one(g: &mut SchedState) -> Option<ObjectRef> {
         }
         // The first thread on this candidate that is stealable to this CPU.
         // SAFETY: each entry pins a live Thread; `SCHED` held.
-        let stealable =
-            (0..g.ready[c].len()).find(|&i| unsafe { stealable_to(g.ready[c][i].as_ptr(), me) });
+        let stealable = (0..g.ready[c].len()).find(|&i| unsafe { stealable_to(g.ready[c][i].as_ptr(), me) });
         if let Some(pos) = stealable {
             victim = c;
             victim_pos = pos;
@@ -3769,11 +3703,7 @@ fn seed_vruntime(g: &SchedState, obj: *mut (), cpu: usize, woken: bool) {
         return;
     }
     let base = g.min_vruntime[cpu];
-    let floor = if woken {
-        base.saturating_sub(TICK_NS)
-    } else {
-        base
-    };
+    let floor = if woken { base.saturating_sub(TICK_NS) } else { base };
     // SAFETY: as above. A spawned thread (vruntime 0) jumps to the floor; a waker
     // keeps its (higher) accrued vruntime if already ahead of the boosted floor.
     unsafe {
@@ -4012,8 +3942,7 @@ pub(crate) extern "C" fn thread_enter() -> ! {
         // SAFETY: `current` is pinned alive and we hold the lock.
         match unsafe { Thread::user_entry(obj) } {
             Some((entry, user_sp)) => {
-                let ktop = unsafe { Thread::kstack_top(obj) }
-                    .expect("a user thread has a kernel stack");
+                let ktop = unsafe { Thread::kstack_top(obj) }.expect("a user thread has a kernel stack");
                 let boot = unsafe { Thread::user_boot_args(obj) };
                 Some((entry, user_sp, ktop, boot))
             }
@@ -4386,11 +4315,7 @@ mod tests {
         // CPU 2 parks: gone from the online set, still `true` in `cpu_online[]`.
         let parked = all_up(4) & !(1u64 << 2);
         assert!(st.cpu_online[2], "the park cannot clear this, which is why the bug existed");
-        assert_eq!(
-            pick_target_cpu(&st, t.as_ptr(), parked),
-            3,
-            "placed on a CPU that will never run"
-        );
+        assert_eq!(pick_target_cpu(&st, t.as_ptr(), parked), 3, "placed on a CPU that will never run");
 
         // A waking thread whose home is the parked CPU goes elsewhere too.
         unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
@@ -4407,10 +4332,7 @@ mod tests {
 
         // Host `this_cpu()` is 0. Both paths must reach a parked CPU's queue: gating either
         // on `cpu_accepts_work` strands the thread sitting on CPU 2 forever.
-        assert!(
-            steal_available(&st, 0),
-            "a parked CPU's queue must stay drainable, or this fix strands what it holds"
-        );
+        assert!(steal_available(&st, 0), "a parked CPU's queue must stay drainable, or this fix strands what it holds");
         let stolen = steal_one(&mut st).expect("steal_one must reach a parked CPU's queue");
         assert_eq!(unsafe { &*(stolen.as_ptr() as *const Thread) }.tid(), 12);
         assert!(st.ready[2].is_empty(), "the parked CPU's queue was not drained");
@@ -4453,10 +4375,7 @@ mod tests {
             st.ready[1].try_push(inert_ref(100 + i as u32)).unwrap();
         }
         let chosen = pick_target_cpu(&st, t.as_ptr(), parked);
-        assert!(
-            cpu_accepts_work(&st, chosen, parked),
-            "fallback picked cpu {chosen}, which does not accept work"
-        );
+        assert!(cpu_accepts_work(&st, chosen, parked), "fallback picked cpu {chosen}, which does not accept work");
         assert!(
             st.ready[chosen].len() < st.ready[chosen].capacity(),
             "fallback picked cpu {chosen}, whose queue is at reserve — place_thread would \
@@ -4469,10 +4388,7 @@ mod tests {
         // asserts the delegation and nothing more.)
         unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
         let woken = pick_wake_cpu(&st, t.as_ptr(), parked);
-        assert!(
-            cpu_accepts_work(&st, woken, parked),
-            "wake fallback picked cpu {woken}, which does not accept work"
-        );
+        assert!(cpu_accepts_work(&st, woken, parked), "wake fallback picked cpu {woken}, which does not accept work");
     }
 
     #[test]
@@ -4499,11 +4415,7 @@ mod tests {
         unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 5) };
         let chosen = pick_target_cpu(&st, a.as_ptr(), all_up(4));
         assert!(cpu_accepts_work(&st, chosen, all_up(4)), "fallback chose cpu {chosen}");
-        assert_eq!(
-            st.ready[chosen].len(),
-            0,
-            "fallback chose loaded cpu {chosen} while an empty one accepted work"
-        );
+        assert_eq!(st.ready[chosen].len(), 0, "fallback chose loaded cpu {chosen} while an empty one accepted work");
     }
 
     #[test]
@@ -4626,11 +4538,7 @@ mod tests {
 
     /// A snapshot with the given rows online (all other CPUs offline).
     fn snap_with(rows: &[(usize, stats::CpuSnapshot)]) -> stats::Snapshot {
-        let mut s = stats::Snapshot {
-            cpus: [stats::CpuSnapshot::OFFLINE; MAX_CPUS],
-            reaper_closed: 0,
-            exit_closed: 0,
-        };
+        let mut s = stats::Snapshot { cpus: [stats::CpuSnapshot::OFFLINE; MAX_CPUS], reaper_closed: 0, exit_closed: 0 };
         for &(c, row) in rows {
             s.cpus[c] = row;
         }
@@ -4647,13 +4555,7 @@ mod tests {
                     online: true,
                     idle: false,
                     ready: 1,
-                    counters: stats::Counters {
-                        switches: 1342,
-                        steals: 3,
-                        placed: 57,
-                        resched_ipis: 12,
-                        ticks: 4096,
-                    },
+                    counters: stats::Counters { switches: 1342, steals: 3, placed: 57, resched_ipis: 12, ticks: 4096 },
                 },
             ),
             (
@@ -4662,13 +4564,7 @@ mod tests {
                     online: true,
                     idle: true,
                     ready: 0,
-                    counters: stats::Counters {
-                        switches: 987,
-                        steals: 11,
-                        placed: 40,
-                        resched_ipis: 9,
-                        ticks: 4080,
-                    },
+                    counters: stats::Counters { switches: 987, steals: 11, placed: 40, resched_ipis: 9, ticks: 4080 },
                 },
             ),
         ]);
@@ -4687,12 +4583,7 @@ mod tests {
     #[test]
     fn stats_format_omits_offline_cpus_preserving_indices() {
         init_global_heap();
-        let row = stats::CpuSnapshot {
-            online: true,
-            idle: true,
-            ready: 0,
-            counters: stats::Counters::ZERO,
-        };
+        let row = stats::CpuSnapshot { online: true, idle: true, ready: 0, counters: stats::Counters::ZERO };
         // CPUs 0 and 2 online, 1 offline: rows keep their dense indices.
         let snap = snap_with(&[(0, row), (2, row)]);
         let text = stats::format(&snap).unwrap();
@@ -4709,12 +4600,7 @@ mod tests {
     // --- Deadline min-heap (pure) -------------------------------------
 
     fn entry(deadline_ns: u64, target: usize) -> deadline::Entry {
-        deadline::Entry {
-            deadline_ns,
-            target,
-            kind: deadline::DeadlineKind::Timer,
-            channel: 0,
-        }
+        deadline::Entry { deadline_ns, target, kind: deadline::DeadlineKind::Timer, channel: 0 }
     }
 
     #[test]
@@ -4761,12 +4647,7 @@ mod tests {
         // independently by `(target, kind)`.
         deadline::push(
             &mut h,
-            deadline::Entry {
-                deadline_ns: 10,
-                target: 0xA,
-                kind: deadline::DeadlineKind::Thread,
-                channel: 0,
-            },
+            deadline::Entry { deadline_ns: 10, target: 0xA, kind: deadline::DeadlineKind::Thread, channel: 0 },
         )
         .unwrap();
         deadline::push(
@@ -4840,11 +4721,7 @@ mod tests {
             // No destroys while the refs are held.
             assert_eq!(test_probe::thread_destroys(), 0);
         } // st dropped here — every ObjectRef drops its one reference.
-        assert_eq!(
-            test_probe::thread_destroys(),
-            7,
-            "each queued/current/reaped thread destroyed exactly once",
-        );
+        assert_eq!(test_probe::thread_destroys(), 7, "each queued/current/reaped thread destroyed exactly once",);
     }
 
     /// Build an inert Thread tagged with `owner_pid = pid` (and no owning

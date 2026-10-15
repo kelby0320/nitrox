@@ -130,11 +130,7 @@ impl Rgb {
             let (src, dst, a) = (src as u32, dst as u32, a as u32);
             ((src * a + dst * (255 - a) + 127) / 255) as u8
         }
-        Rgb::new(
-            mix(self.r, under.r, coverage),
-            mix(self.g, under.g, coverage),
-            mix(self.b, under.b, coverage),
-        )
+        Rgb::new(mix(self.r, under.r, coverage), mix(self.g, under.g, coverage), mix(self.b, under.b, coverage))
     }
 }
 
@@ -282,11 +278,7 @@ impl PixelFormat {
 
     /// Unpack a colour from this format's pixel word.
     pub const fn decode(&self, pixel: u32) -> Rgb {
-        Rgb {
-            r: self.red.decode(pixel),
-            g: self.green.decode(pixel),
-            b: self.blue.decode(pixel),
-        }
+        Rgb { r: self.red.decode(pixel), g: self.green.decode(pixel), b: self.blue.decode(pixel) }
     }
 }
 
@@ -304,12 +296,7 @@ mod tests {
     #[test]
     fn encoding_round_trips_through_decoding() {
         for fmt in [PixelFormat::XRGB8888, PixelFormat::XBGR8888] {
-            for c in [
-                Rgb::new(0, 0, 0),
-                Rgb::new(255, 255, 255),
-                Rgb::new(1, 128, 254),
-                Rgb::new(0x12, 0x34, 0x56),
-            ] {
+            for c in [Rgb::new(0, 0, 0), Rgb::new(255, 255, 255), Rgb::new(1, 128, 254), Rgb::new(0x12, 0x34, 0x56)] {
                 assert_eq!(fmt.decode(fmt.encode(c)), c, "{fmt:?} {c:?}");
             }
         }
@@ -487,7 +474,10 @@ mod tests {
         }
         // A format without the channel discards the opacity rather than refusing it — a caller
         // drawing into an opaque surface should not have to branch on the format to do it.
-        assert_eq!(PixelFormat::XRGB8888.encode_alpha(Rgb::new(1, 2, 3), 7), PixelFormat::XRGB8888.encode(Rgb::new(1, 2, 3)));
+        assert_eq!(
+            PixelFormat::XRGB8888.encode_alpha(Rgb::new(1, 2, 3), 7),
+            PixelFormat::XRGB8888.encode(Rgb::new(1, 2, 3))
+        );
     }
 
     #[test]

@@ -234,10 +234,7 @@ pub fn init() {
     }
 
     // 3. Load this CPU's GDT, reload the segment registers, load its TSS.
-    let ptr = GdtPointer {
-        limit: (size_of::<[u64; GDT_LEN]>() - 1) as u16,
-        base: gdt_ptr as usize as u64,
-    };
+    let ptr = GdtPointer { limit: (size_of::<[u64; GDT_LEN]>() - 1) as u16, base: gdt_ptr as usize as u64 };
     // SAFETY: `ptr` describes the GDT just populated; the selector constants
     // match the table indices; `TSS_SELECTOR` indexes the TSS descriptor written
     // in step 2.

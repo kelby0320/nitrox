@@ -18,12 +18,10 @@
 use libkern::abi::SpawnArgs;
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_TRANSFER, RIGHT_WAIT};
 use libkern::{
-    SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP,
-    SYS_PROCESS_SPAWN, SYS_WAIT, kprint, syscall1, syscall4, syscall5,
+    SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN,
+    SYS_WAIT, kprint, syscall1, syscall4, syscall5,
 };
-use librsproto::{
-    OP_TTY_ATTACH_BACKEND, OP_TTY_INPUT, OP_TTY_OUTPUT, RS_FLAG_REPLY, decode, encode,
-};
+use librsproto::{OP_TTY_ATTACH_BACKEND, OP_TTY_INPUT, OP_TTY_OUTPUT, RS_FLAG_REPLY, decode, encode};
 
 /// IPC payload starts after the 24-byte header.
 const PAYLOAD_OFF: usize = 24;
@@ -80,22 +78,20 @@ fn po_wait(po: u64) -> (i32, u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     let waited = unsafe {
         WAIT_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     let (status, value) = unsafe {
         (
-            i32::from_le_bytes([
-                WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11],
-            ]),
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                WAIT_RESULTS[16],
+                WAIT_RESULTS[17],
+                WAIT_RESULTS[18],
+                WAIT_RESULTS[19],
+                WAIT_RESULTS[20],
+                WAIT_RESULTS[21],
+                WAIT_RESULTS[22],
+                WAIT_RESULTS[23],
             ]),
         )
     };
@@ -107,8 +103,7 @@ fn po_wait(po: u64) -> (i32, u64) {
 /// Resolve `path` in `ns` requesting `rights`; `0` on failure.
 fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     // SAFETY: valid path pointer + namespace handle.
-    let po =
-        unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
     if po < 0 {
         return 0;
     }
@@ -119,9 +114,7 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
 /// A connected channel pair, or `None`.
 fn make_channel() -> Option<(u64, u64)> {
     // SAFETY: CH0/CH1 are valid writable out-params.
-    let r = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CH0) as u64, (&raw mut CH1) as u64, 8, 0)
-    };
+    let r = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CH0) as u64, (&raw mut CH1) as u64, 8, 0) };
     if r != 0 {
         return None;
     }
@@ -191,13 +184,7 @@ pub unsafe fn attach(root_ns: u64) -> Option<(u64, Backend)> {
     // SAFETY: valid wait buffers; one waiter on the terminal channel.
     let waited = unsafe {
         WAIT_HANDLES[0] = tty;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     if waited != 1 || !recv_is_ok(tty) {
         kprint(b"nxterm: AttachBackend refused\n");
@@ -215,13 +202,7 @@ pub unsafe fn attach(root_ns: u64) -> Option<(u64, Backend)> {
 fn recv_is_ok(ch: u64) -> bool {
     // SAFETY: valid recv out-params.
     let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            (&raw mut MSG) as u64,
-            (&raw mut HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
+        syscall4(SYS_CHANNEL_RECV, ch, (&raw mut MSG) as u64, (&raw mut HANDLES) as u64, (&raw mut RECV_COUNT) as u64)
     };
     if rr != 0 {
         return false;
@@ -353,14 +334,7 @@ pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Re
         return child;
     }
     let streams = libstream::setup::Streams::default();
-    let sent = libstream::setup::send_setup_full(
-        setup_ours,
-        &streams,
-        Some(terminal),
-        &["nxsh"],
-        env,
-    )
-    .is_ok();
+    let sent = libstream::setup::send_setup_full(setup_ours, &streams, Some(terminal), &["nxsh"], env).is_ok();
     if sent {
         // **Reported here, beside the send, rather than where the environment arrived.** This
         // number is what a launched terminal hands its shell, and it is the only part of the

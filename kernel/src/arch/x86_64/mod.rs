@@ -10,21 +10,21 @@ pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod ioapic;
-pub mod memory_types;
 pub mod irq_install;
+pub mod memory_types;
 pub mod paging;
+pub mod ps2;
 /// QEMU integration-test exit primitive — only under the `test-harness` feature.
 #[cfg(feature = "test-harness")]
 pub mod qemu;
 pub mod registers;
 pub mod regs;
+pub mod resched;
 pub mod reset;
-pub mod ps2;
 pub mod rtc;
 pub mod serial;
 pub mod smp;
 pub mod syscall;
-pub mod resched;
 pub mod timer;
 pub mod tlb;
 pub mod user_access;

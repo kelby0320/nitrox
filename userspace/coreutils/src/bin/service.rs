@@ -103,7 +103,9 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         ([false, true, false, false], [name]) => act(&stage, Verb::Start, name),
         ([false, false, true, false], [name]) => act(&stage, Verb::Stop, name),
         ([false, false, false, true], [name]) => act(&stage, Verb::Restart, name),
-        _ => stage.die(b"service: one of --list, --start NAME, --stop NAME or --restart NAME (try --help)\n", EXIT_USAGE),
+        _ => {
+            stage.die(b"service: one of --list, --start NAME, --stop NAME or --restart NAME (try --help)\n", EXIT_USAGE)
+        }
     };
     exit(code)
 }
@@ -274,7 +276,9 @@ fn act(stage: &Stage, verb: Verb, name: &str) -> i64 {
             Failure::NoGrant => format!(
                 "service: cannot {word} here -- starting and stopping need the services grant: `with admin service --{word} ...`\n"
             ),
-            Failure::Unopened(e) => format!("service: {name} not {}: service-mgr opened no admin session ({e:?})\n", verb.done()),
+            Failure::Unopened(e) => {
+                format!("service: {name} not {}: service-mgr opened no admin session ({e:?})\n", verb.done())
+            }
             Failure::Transport => format!("service: lost service-mgr while asking to {word} {name}\n"),
             Failure::Refused(why) => format!("service: {name} not {}: {why}\n", verb.done()),
         };
@@ -283,9 +287,11 @@ fn act(stage: &Stage, verb: Verb, name: &str) -> i64 {
     }
     match stage.streams.stdout {
         Some(h) => {
-            let schema = Schema::new()
-                .field("name", TypeTag::String, TypeModifiers::NONE)
-                .field("state", TypeTag::String, TypeModifiers::NONE);
+            let schema = Schema::new().field("name", TypeTag::String, TypeModifiers::NONE).field(
+                "state",
+                TypeTag::String,
+                TypeModifiers::NONE,
+            );
             let row = alloc::vec![Value::Str(String::from(name)), Value::Str(String::from(verb.state()))];
             write_table(stage, h, &schema, &[row]);
         }

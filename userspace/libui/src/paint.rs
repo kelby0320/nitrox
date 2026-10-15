@@ -131,13 +131,7 @@ pub fn paint_over<F, Msg, C>(
 /// proportionate if the title bar's height ever changes — which it will, the day chrome metrics
 /// follow the type scale. The strokes are two pixels so they read at the sizes this chrome
 /// actually uses; one pixel disappears against a bevelled face.
-fn draw_icon<F: Framebuffer + ?Sized>(
-    fb: &mut F,
-    kind: IconKind,
-    rect: Rect,
-    clip: Rect,
-    ink: libdraw::format::Rgb,
-) {
+fn draw_icon<F: Framebuffer + ?Sized>(fb: &mut F, kind: IconKind, rect: Rect, clip: Rect, ink: libdraw::format::Rgb) {
     const STROKE: u32 = 2;
     // A square glyph box, a little under half the smaller dimension, centred.
     let side = (rect.size.w.min(rect.size.h) * 4 / 10).max(STROKE * 2);
@@ -294,13 +288,13 @@ fn draw<F, Msg, C>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libdraw::format::Rgb;
     use crate::diff::Tree;
     use crate::element::{column, custom as custom_node, fill as fill_node, sized, stack, text};
     use crate::layout::layout;
     use alloc::vec;
     use alloc::vec::Vec;
     use libdraw::format::PixelFormat;
+    use libdraw::format::Rgb;
     use libdraw::framebuffer::{Geometry, MemFramebuffer};
     use libdraw::geom::Size;
 
@@ -371,9 +365,7 @@ mod tests {
         let m = FontMetrics::new(&f, t.font_px);
         // What the element asks for: a column arranges its children across its whole width, so
         // a laid-out rectangle would compare the column's width rather than the text's.
-        let at = |e: &Element<Msg>| {
-            crate::layout::measure(e, crate::layout::Constraints::loose(Size::new(W, H)), &m)
-        };
+        let at = |e: &Element<Msg>| crate::layout::measure(e, crate::layout::Constraints::loose(Size::new(W, H)), &m);
         let body = at(&column(vec![text("Hello")]));
         let small = at(&column(vec![scaled(TextSize::Small, text("Hello"))]));
         let large = at(&column(vec![scaled(TextSize::Large, text("Hello"))]));
@@ -507,9 +499,7 @@ mod tests {
         use crate::element::{TextSize, scaled};
         let (f, t) = (font(), Theme::default());
         let m = FontMetrics::new(&f, t.font_px);
-        let view = |step| -> Element<Msg> {
-            sized(Size::new(120, 30), scaled(step, text("status")))
-        };
+        let view = |step| -> Element<Msg> { sized(Size::new(120, 30), scaled(step, text("status"))) };
         let mut tree = Tree::new();
         let a = view(TextSize::Body);
         let _ = tree.update(&a, &layout(&a, Rect::new(0, 0, W, H), &m));
@@ -691,10 +681,7 @@ mod tests {
         let c = painted(&b, &t);
         assert!(any_reddish(&c), "the outer text lost its ink through the column");
         assert!(any_greenish(&c), "the inner ink did not override the outer");
-        assert!(
-            !c.iter().any(|p| *p == t.foreground),
-            "something was still drawn in the theme's ink"
-        );
+        assert!(!c.iter().any(|p| *p == t.foreground), "something was still drawn in the theme's ink");
     }
 
     /// An ink node changes no geometry.
@@ -708,16 +695,9 @@ mod tests {
         let m = FontMetrics::new(&f, t.font_px);
         let bare: Element<Msg> = column(vec![text("measure me")]);
         let wrapped: Element<Msg> = column(vec![crate::element::ink(RED, text("measure me"))]);
-        let (a, b) = (
-            layout(&bare, Rect::new(0, 0, W, H), &m),
-            layout(&wrapped, Rect::new(0, 0, W, H), &m),
-        );
+        let (a, b) = (layout(&bare, Rect::new(0, 0, W, H), &m), layout(&wrapped, Rect::new(0, 0, W, H), &m));
         assert_eq!(a.children[0].rect, b.children[0].rect, "the wrapper is not its child's size");
-        assert_eq!(
-            a.children[0].rect,
-            b.children[0].children[0].rect,
-            "the text inside the wrapper moved or resized"
-        );
+        assert_eq!(a.children[0].rect, b.children[0].children[0].rect, "the text inside the wrapper moved or resized");
     }
 
     #[test]
@@ -842,10 +822,7 @@ mod tests {
         // see the thing you can click.
         let (f, t) = (font(), Theme::default());
         let mut b = fb();
-        let e: Element<Msg> = stack(vec![
-            custom_node(1, Size::new(0, 0)),
-            custom_node(2, Size::new(0, 0)),
-        ]);
+        let e: Element<Msg> = stack(vec![custom_node(1, Size::new(0, 0)), custom_node(2, Size::new(0, 0))]);
         let l = layout(&e, Rect::new(0, 0, W, H), &FontMetrics::new(&f, t.font_px));
         let mut order: Vec<u32> = Vec::new();
         paint(&mut b, &f, &t, &e, &l, Rect::new(0, 0, W, H), &mut |k, _, _, _: &mut MemFramebuffer| {

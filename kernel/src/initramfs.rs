@@ -76,11 +76,7 @@ fn hex8(field: &[u8]) -> Option<u32> {
 /// Strip a leading `./` (cpio often stores `./etc/foo`) so callers can pass a
 /// plain relative path (`etc/foo`).
 fn normalize(name: &[u8]) -> &[u8] {
-    if let [b'.', b'/', rest @ ..] = name {
-        rest
-    } else {
-        name
-    }
+    if let [b'.', b'/', rest @ ..] = name { rest } else { name }
 }
 
 /// Look up `name` (a path relative to the archive root, no leading `/`) in the
@@ -140,19 +136,19 @@ mod tests {
         hdr.extend_from_slice(b"070701");
         // 13 eight-hex fields; only filesize (idx 6) and namesize (idx 11) matter.
         let fields = [
-            1u32,                // ino
-            0o100644,            // mode
-            0,                   // uid
-            0,                   // gid
-            1,                   // nlink
-            0,                   // mtime
-            data.len() as u32,   // filesize
-            0,                   // devmajor
-            0,                   // devminor
-            0,                   // rdevmajor
-            0,                   // rdevminor
-            namesize as u32,     // namesize
-            0,                   // check
+            1u32,              // ino
+            0o100644,          // mode
+            0,                 // uid
+            0,                 // gid
+            1,                 // nlink
+            0,                 // mtime
+            data.len() as u32, // filesize
+            0,                 // devmajor
+            0,                 // devminor
+            0,                 // rdevmajor
+            0,                 // rdevminor
+            namesize as u32,   // namesize
+            0,                 // check
         ];
         for f in fields {
             hdr.extend_from_slice(format!("{f:08x}").as_bytes());
@@ -181,10 +177,7 @@ mod tests {
 
     #[test]
     fn finds_files_and_misses() {
-        let cpio = archive(&[
-            ("etc/init.toml", b"[[mount]]\n"),
-            ("sbin/init", b"\x7fELFstub"),
-        ]);
+        let cpio = archive(&[("etc/init.toml", b"[[mount]]\n"), ("sbin/init", b"\x7fELFstub")]);
         assert_eq!(lookup(&cpio, b"etc/init.toml"), Some(&b"[[mount]]\n"[..]));
         assert_eq!(lookup(&cpio, b"sbin/init"), Some(&b"\x7fELFstub"[..]));
         assert_eq!(lookup(&cpio, b"nope"), None);

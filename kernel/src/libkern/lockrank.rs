@@ -230,9 +230,7 @@ pub fn classify(rank: LockRank, held: &[u8], taken: Taken) -> Acquisition {
 /// Debug-build enforcement. Compiled out in release builds, and in host unit tests (see
 /// the module docs — the per-CPU model does not hold there).
 #[cfg(all(debug_assertions, not(test)))]
-pub use tracker::{
-    IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing,
-};
+pub use tracker::{IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing};
 
 /// Release builds and host tests: every hook vanishes.
 #[cfg(not(all(debug_assertions, not(test))))]
@@ -258,9 +256,7 @@ mod inert {
 }
 
 #[cfg(not(all(debug_assertions, not(test))))]
-pub use inert::{
-    IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing,
-};
+pub use inert::{IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing};
 
 #[cfg(all(debug_assertions, not(test)))]
 mod tracker {
@@ -628,8 +624,7 @@ mod tests {
             self.depth += 1;
             match verdict {
                 super::Acquisition::Ok => Ok(()),
-                super::Acquisition::ContractBroken { held }
-                | super::Acquisition::Inverted { held } => Err(held),
+                super::Acquisition::ContractBroken { held } | super::Acquisition::Inverted { held } => Err(held),
             }
         }
 
@@ -679,17 +674,11 @@ mod tests {
             (LockRank::TlbShootdown as u8) > sched,
             "the premise: this is not a rank inversion, which is why the branch exists"
         );
-        assert_eq!(
-            classify(LockRank::TlbShootdown, &[sched], Waiting),
-            Acquisition::ContractBroken { held: sched }
-        );
+        assert_eq!(classify(LockRank::TlbShootdown, &[sched], Waiting), Acquisition::ContractBroken { held: sched });
 
         // A different lock over `Sched` is an ordinary inversion, not a contract break —
         // so the branch is specific to the shootdown lock rather than to a held stack.
-        assert_eq!(
-            classify(LockRank::Sched, &[sched], Waiting),
-            Acquisition::Inverted { held: sched }
-        );
+        assert_eq!(classify(LockRank::Sched, &[sched], Waiting), Acquisition::Inverted { held: sched });
     }
 
     /// The panic path's shape: a driver panics holding its `Leaf` lock, and the panic tees

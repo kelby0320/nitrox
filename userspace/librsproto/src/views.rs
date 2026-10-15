@@ -369,10 +369,7 @@ pub fn push_row(out: &mut [u8], at: &mut usize, row: &Row<'_>) -> Option<()> {
         return None;
     }
     let need = 2 + row.view.len() + 2 + row.run.len() + 1;
-    if row.view.len() > u16::MAX as usize
-        || row.run.len() > u16::MAX as usize
-        || out.len() < *at + need
-    {
+    if row.view.len() > u16::MAX as usize || row.run.len() > u16::MAX as usize || out.len() < *at + need {
         return None;
     }
     let count = get_u16(out, 0).checked_add(1)?;
@@ -590,8 +587,7 @@ mod tests {
     fn a_request_carries_a_token_or_none() {
         let token = [7u8; TTY_TOKEN_LEN];
         let mut with = [0u8; 128];
-        let n = build_request(&mut with, REQ_TERMINAL, b"admin", b"disk", &[b"--list"], b"E", Some(&token))
-            .unwrap();
+        let n = build_request(&mut with, REQ_TERMINAL, b"admin", b"disk", &[b"--list"], b"E", Some(&token)).unwrap();
         let r = parse_request(&with[..n]).unwrap();
         assert_eq!(r.token, Some(token));
         assert_eq!((r.view, r.program, r.env), (&b"admin"[..], &b"disk"[..], &b"E"[..]));
@@ -673,11 +669,9 @@ mod tests {
         let mut buf = [0u8; 128];
         let mut at = 2;
         push_row(&mut buf, &mut at, &Row { view: b"admin", run: b"*", password: true }).unwrap();
-        push_row(&mut buf, &mut at, &Row { view: b"power", run: b"shutdown", password: false })
-            .unwrap();
+        push_row(&mut buf, &mut at, &Row { view: b"power", run: b"shutdown", password: false }).unwrap();
         let mut seen = Vec::new();
-        let n =
-            parse_rows(&buf[..at], |r| seen.push((r.view.to_vec(), r.run.to_vec(), r.password)));
+        let n = parse_rows(&buf[..at], |r| seen.push((r.view.to_vec(), r.run.to_vec(), r.password)));
         assert_eq!(n, Some(2));
         assert_eq!(seen[1], (b"power".to_vec(), b"shutdown".to_vec(), false));
 

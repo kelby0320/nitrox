@@ -30,9 +30,9 @@
 
 use crate::arch::Paging;
 use crate::arch::paging::{ArchPaging, PageFlags};
+use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
-use crate::libkern::lockrank::LockRank;
 
 /// Inclusive lower bound of the kernel vmap region per
 /// `docs/architecture/overview.md`.
@@ -86,9 +86,7 @@ pub unsafe fn init() {
 /// pointer would overflow `KERNEL_VMAP_END`, which won't happen at
 /// realistic workloads).
 pub fn vmap_alloc_pages(n_pages: u64) -> Result<VirtAddr, AllocError> {
-    let bytes = n_pages
-        .checked_mul(PAGE_SIZE as u64)
-        .ok_or(AllocError)?;
+    let bytes = n_pages.checked_mul(PAGE_SIZE as u64).ok_or(AllocError)?;
     let mut next = VMAP_NEXT.lock();
     let start = *next;
     let end = start.checked_add(bytes).ok_or(AllocError)?;
@@ -168,16 +166,8 @@ mod tests {
     fn allocations_are_page_aligned_and_in_vmap_region() {
         let v = vmap_alloc_pages(1).unwrap();
         assert!(v.is_page_aligned(), "vmap allocation not page-aligned");
-        assert!(
-            v.as_u64() >= KERNEL_VMAP_START,
-            "vmap allocation below region: {:#x}",
-            v.as_u64()
-        );
-        assert!(
-            v.as_u64() < KERNEL_VMAP_END,
-            "vmap allocation past region: {:#x}",
-            v.as_u64()
-        );
+        assert!(v.as_u64() >= KERNEL_VMAP_START, "vmap allocation below region: {:#x}", v.as_u64());
+        assert!(v.as_u64() < KERNEL_VMAP_END, "vmap allocation past region: {:#x}", v.as_u64());
     }
 
     #[test]

@@ -394,8 +394,7 @@ impl<'a> Iterator for ReadRecords<'a> {
 /// or its principal is empty.
 fn record_at(records: &[u8], off: usize) -> Option<ReadRecord<'_>> {
     let fixed = records.get(off..off.checked_add(RECORD_HEADER_LEN)?)?;
-    let (plen, slen, mlen) =
-        (get_u16(fixed, 26) as usize, get_u16(fixed, 28) as usize, get_u16(fixed, 30) as usize);
+    let (plen, slen, mlen) = (get_u16(fixed, 26) as usize, get_u16(fixed, 28) as usize, get_u16(fixed, 30) as usize);
     let start = off + RECORD_HEADER_LEN;
     let strings = records.get(start..start + plen + slen + mlen)?;
     if plen == 0 {
@@ -581,15 +580,9 @@ mod tests {
     #[test]
     fn full_record_round_trips() {
         let mut buf = [0u8; 256];
-        let n = encode_append(
-            &mut buf,
-            LEVEL_ERROR,
-            b"disk full",
-            Some(0xABCD),
-            Some(0x1234_5678),
-            Some(b"foo.worker"),
-        )
-        .unwrap();
+        let n =
+            encode_append(&mut buf, LEVEL_ERROR, b"disk full", Some(0xABCD), Some(0x1234_5678), Some(b"foo.worker"))
+                .unwrap();
         let r = parse_append(&buf[..n]).unwrap();
         assert_eq!(r.level, LEVEL_ERROR);
         assert_eq!(r.message, b"disk full");

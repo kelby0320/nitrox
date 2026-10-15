@@ -54,9 +54,7 @@ pub fn parse_entry(text: &str) -> Option<Application> {
         }
     }
     match (name, exec) {
-        (Some(name), Some(exec)) if !name.is_empty() && !exec.is_empty() => {
-            Some(Application { name, exec })
-        }
+        (Some(name), Some(exec)) if !name.is_empty() && !exec.is_empty() => Some(Application { name, exec }),
         _ => None,
     }
 }
@@ -356,9 +354,7 @@ impl ShownDesktop {
     /// button, a new one, one moved here — and then "bring back what the first press put away" is
     /// no longer a coherent request. The button's light is this answer.
     pub fn holds(&self, windows: &[Window]) -> bool {
-        windows
-            .iter()
-            .all(|w| w.desktop != self.desktop || w.minimized || self.left_up.contains(&w.id))
+        windows.iter().all(|w| w.desktop != self.desktop || w.minimized || self.left_up.contains(&w.id))
     }
 }
 
@@ -482,11 +478,7 @@ mod tests {
         // overlay.
         let page = Screen { width: 1440, height: 900 };
         assert_eq!(page.card_w(), 330);
-        assert!(
-            page.card_h().abs_diff(208) <= 2,
-            "the page's card box is 208; ours is {}",
-            page.card_h()
-        );
+        assert!(page.card_h().abs_diff(208) <= 2, "the page's card box is 208; ours is {}", page.card_h());
         assert_eq!(page.card_cols(), 3, "the page fits three across");
     }
 
@@ -519,10 +511,7 @@ mod tests {
         let two = cols + 1;
         let top = card_rect(0, two, s);
         let orphan = card_rect(cols, two, s);
-        assert!(
-            (orphan.0 as u32 + orphan.2 / 2).abs_diff(s.width / 2) <= 1,
-            "the last row is not centred"
-        );
+        assert!((orphan.0 as u32 + orphan.2 / 2).abs_diff(s.width / 2) <= 1, "the last row is not centred");
         assert!(orphan.1 > top.1, "the second row is not below the first");
         assert_eq!(orphan.1 - top.1, (s.card_total_h() + CARD_GAP) as i32);
     }
@@ -545,10 +534,7 @@ mod tests {
                 let (_, y, _, _) = card_rect(n - 1, n, s);
                 let foot = y as u32 + s.card_total_h();
                 if n == 1 {
-                    assert!(
-                        foot <= height - BAR_H,
-                        "{width}x{height}: a card runs into the window list at {foot}"
-                    );
+                    assert!(foot <= height - BAR_H, "{width}x{height}: a card runs into the window list at {foot}");
                 }
             }
         }
@@ -654,12 +640,12 @@ mod tests {
     fn a_malformed_entry_is_refused_rather_than_half_read() {
         // **Each of these would otherwise become a menu row that launches nothing.**
         for bad in [
-            "name = \"Files\"\n",                    // no exec
-            "exec = \"nxfiles\"\n",                  // no name
+            "name = \"Files\"\n",                   // no exec
+            "exec = \"nxfiles\"\n",                 // no name
             "name = Files\nexec = nxfiles\n",       // unquoted
-            "name = \"Files\nexec = \"nxfiles\"\n",  // one quote — the trap `theme.rs` records
-            "name = \"\"\nexec = \"nxfiles\"\n",     // empty name
-            "name = \"Files\"\nexec = \"\"\n",       // empty exec
+            "name = \"Files\nexec = \"nxfiles\"\n", // one quote — the trap `theme.rs` records
+            "name = \"\"\nexec = \"nxfiles\"\n",    // empty name
+            "name = \"Files\"\nexec = \"\"\n",      // empty exec
             "",
         ] {
             assert!(parse_entry(bad).is_none(), "accepted {bad:?}");

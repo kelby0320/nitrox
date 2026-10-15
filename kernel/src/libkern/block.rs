@@ -118,12 +118,7 @@ impl BlockDeviceInfo {
     /// **Cut rather than refused**: a name is for recognising a device, and a device with an
     /// over-long model is still a device somebody has to choose. Nothing parses this field.
     pub fn new(kind: BlockKind, logical_block_size: u32, block_count: u64, name: &[u8]) -> Self {
-        let mut info = Self {
-            kind: kind.as_u32(),
-            logical_block_size,
-            block_count,
-            ..Self::default()
-        };
+        let mut info = Self { kind: kind.as_u32(), logical_block_size, block_count, ..Self::default() };
         let n = name.len().min(MAX_DEVICE_NAME);
         info.name[..n].copy_from_slice(&name[..n]);
         info.name_len = n as u32;

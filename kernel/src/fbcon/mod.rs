@@ -47,11 +47,11 @@ pub mod text;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::arch::smp::ArchSmp;
+use crate::arch::timer::ArchTimer;
 use crate::libkern::IrqSpinLock;
 use crate::libkern::lockrank::LockRank;
 use crate::limine::Framebuffer;
 use glyphs::{BLANK, GLYPH_W};
-use crate::arch::timer::ArchTimer;
 use text::{CELLS, Geometry, Grid, INK, MAX_COLS, PAPER};
 
 /// A linear framebuffer of 32-bit pixels, and the console's two colours packed for it.
@@ -80,13 +80,7 @@ impl Screen {
     ///
     /// `base` must address `pitch * height` writable bytes of 32-bit framebuffer, mapped for as
     /// long as the returned value is used and written by nothing else while the console owns it.
-    pub unsafe fn new(
-        base: *mut u8,
-        width: usize,
-        height: usize,
-        pitch: usize,
-        shifts: [u8; 3],
-    ) -> Option<Self> {
+    pub unsafe fn new(base: *mut u8, width: usize, height: usize, pitch: usize, shifts: [u8; 3]) -> Option<Self> {
         let min_pitch = width.checked_mul(4)?;
         if base.is_null() || (base as usize) % 4 != 0 || width == 0 || height == 0 {
             return None;
@@ -94,9 +88,7 @@ impl Screen {
         if pitch < min_pitch || pitch % 4 != 0 || shifts.iter().any(|&s| s > 24) {
             return None;
         }
-        let pack = |c: [u8; 3]| {
-            (c[0] as u32) << shifts[0] | (c[1] as u32) << shifts[1] | (c[2] as u32) << shifts[2]
-        };
+        let pack = |c: [u8; 3]| (c[0] as u32) << shifts[0] | (c[1] as u32) << shifts[1] | (c[2] as u32) << shifts[2];
         Some(Self { base, width, height, pitch, ink: pack(INK), paper: pack(PAPER) })
     }
 
@@ -185,13 +177,7 @@ pub struct Console {
 impl Console {
     /// A console with no screen.
     pub const fn new() -> Self {
-        Self {
-            screen: None,
-            grid: Grid::new(),
-            page: Grid::new(),
-            shown: [BLANK; CELLS],
-            owner: Owner::Kernel,
-        }
+        Self { screen: None, grid: Grid::new(), page: Grid::new(), shown: [BLANK; CELLS], owner: Owner::Kernel }
     }
 
     /// Start drawing on `screen`, clearing it. `None`, and no screen, when not one cell fits.
@@ -417,9 +403,7 @@ pub unsafe fn init(fb: &Framebuffer) -> Option<Geometry> {
     let shifts = [fb.red_mask_shift, fb.green_mask_shift, fb.blue_mask_shift];
     // SAFETY: forwarded from this function's contract; Limine's descriptor states the geometry
     // of the mapping at `address`, and nothing else draws on it until userspace is handed it.
-    let screen = unsafe {
-        Screen::new(fb.address, fb.width as usize, fb.height as usize, fb.pitch as usize, shifts)
-    }?;
+    let screen = unsafe { Screen::new(fb.address, fb.width as usize, fb.height as usize, fb.pitch as usize, shifts) }?;
     let mut geometry = None;
     with_console(|c| geometry = c.attach(screen));
     geometry
@@ -689,10 +673,12 @@ mod tests {
         for i in 0..23 {
             console.write(format!("{}{i}\n", "x".repeat(i % 7)).as_bytes());
         }
-        let expect: Vec<String> = (0..g.rows).map(|r| {
-            let s: String = (0..g.cols).map(|c| glyphs::char_of(console.grid().glyph_at(r, c)).unwrap()).collect();
-            s.trim_end().to_string()
-        }).collect();
+        let expect: Vec<String> = (0..g.rows)
+            .map(|r| {
+                let s: String = (0..g.cols).map(|c| glyphs::char_of(console.grid().glyph_at(r, c)).unwrap()).collect();
+                s.trim_end().to_string()
+            })
+            .collect();
         assert_eq!(fake.read(g), expect);
         // Rows 4 and a jump of 1: after the last newline the cursor sits on a cleared bottom row.
         assert_eq!(expect, ["xxxxxx20", "21", "x22", ""], "and the grid holds what was written");

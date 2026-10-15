@@ -277,19 +277,14 @@ impl Tree {
     /// [`DiffError`] the tree is left **unchanged** and no damage is reported: a rejected
     /// frame must not leave half a tree paired, or the next frame diffs against a state
     /// neither the application nor the toolkit believes in.
-    pub fn update<Msg>(
-        &mut self,
-        element: &Element<Msg>,
-        layout: &Layout,
-    ) -> Result<Option<Rect>, DiffError> {
+    pub fn update<Msg>(&mut self, element: &Element<Msg>, layout: &Layout) -> Result<Option<Rect>, DiffError> {
         let mut damage = Damage::new();
         let mut path = Vec::new();
         // `next_id` advances into a local and is committed only on success, alongside the
         // tree — a rejected frame must not burn ids either, or the counter tells a story
         // about widgets that were never created.
         let mut ids = self.next_id;
-        let next =
-            reconcile(self.root.as_ref(), element, layout, &mut damage, &mut path, &mut ids)?;
+        let next = reconcile(self.root.as_ref(), element, layout, &mut damage, &mut path, &mut ids)?;
         self.root = Some(next);
         self.next_id = ids;
         Ok(damage.take())
@@ -426,10 +421,7 @@ fn reconcile_children<Msg>(
         for (i, a) in elems.iter().enumerate() {
             for b in &elems[i + 1..] {
                 if a.key == b.key {
-                    return Err(DiffError::DuplicateKey {
-                        path: path.clone(),
-                        key: a.key.expect("keyed"),
-                    });
+                    return Err(DiffError::DuplicateKey { path: path.clone(), key: a.key.expect("keyed") });
                 }
             }
         }
@@ -474,8 +466,9 @@ mod tests {
     /// Part A's tests carry no messages, and `()` is the simplest inhabited `Msg`. Part B's
     /// routing tests use a real enum; these are about shape, not about what a click means.
     type Msg = ();
-    use crate::element::{Edge, Insets, column, custom, dock, docked, fill, offset, padding,
-                         row, sized, stack, text, with_spacing};
+    use crate::element::{
+        Edge, Insets, column, custom, dock, docked, fill, offset, padding, row, sized, stack, text, with_spacing,
+    };
     use crate::layout::{FixedCell, Layout, layout};
     use alloc::vec;
     use libdraw::format::Rgb;
@@ -494,10 +487,7 @@ mod tests {
     fn a_keyed_element_can_be_found_by_its_key_and_an_absent_one_is_none() {
         // What lets a window say which widget starts with the keyboard. `locate` answers
         // "where"; this answers "which", and the router takes the latter.
-        let e: Element<()> = column(vec![
-            text("a").key(7),
-            row(vec![text("b").key(9)]).key(8),
-        ]);
+        let e: Element<()> = column(vec![text("a").key(7), row(vec![text("b").key(9)]).key(8)]);
         let l = layout(&e, SCREEN, &CELL);
         let mut t = Tree::new();
         t.update(&e, &l).expect("a clean frame");
@@ -655,8 +645,6 @@ mod tests {
         assert!(d.bottom() >= 48, "and the row \"b\" vacated, got {d:?}");
     }
 
-
-
     #[test]
     fn mixing_keyed_and_unkeyed_children_is_an_error() {
         let mut t = Tree::new();
@@ -706,20 +694,14 @@ mod tests {
         // Keys are scoped to a parent. Requiring global uniqueness would make every list
         // need to know about every other list.
         let mut t = Tree::new();
-        let e = row(vec![
-            column(vec![text("a").key(1)]),
-            column(vec![text("b").key(1)]),
-        ]);
+        let e = row(vec![column(vec![text("a").key(1)]), column(vec![text("b").key(1)])]);
         assert!(go(&mut t, &e).is_ok());
     }
 
     #[test]
     fn an_error_names_the_offending_parent() {
         let mut t = Tree::new();
-        let e = column(vec![
-            text("top"),
-            row(vec![text("x").key(1), text("y")]),
-        ]);
+        let e = column(vec![text("top"), row(vec![text("x").key(1), text("y")])]);
         // Path is to the parent: child 1 of the root.
         assert_eq!(go(&mut t, &e), Err(DiffError::MixedKeying { path: vec![1] }));
     }
@@ -779,15 +761,10 @@ mod tests {
         // in the toolkit — and the check above was blind to it because no tree here had one.
         // "The sort of thing one node kind quietly stops honouring" turned out to be literal
         // (PR #192 review, finding 6).
-        let overhang: Element<Msg> = stack(vec![
-            sized(
-                Size::new(100, 100),
-                stack(vec![
-                    fill(libdraw::format::Rgb::new(0, 0, 0)),
-                    offset(90, 90, sized(Size::new(50, 50), text("x"))),
-                ]),
-            ),
-        ]);
+        let overhang: Element<Msg> = stack(vec![sized(
+            Size::new(100, 100),
+            stack(vec![fill(libdraw::format::Rgb::new(0, 0, 0)), offset(90, 90, sized(Size::new(50, 50), text("x")))]),
+        )]);
         let l = layout(&overhang, SCREEN, &CELL);
         check(&l);
         // ...and it is clipped rather than merely reported as contained: a zero-size rect would
@@ -864,15 +841,10 @@ mod tests {
         // dropped as redundant; this test stays, because the property is the thing worth
         // holding and it should not matter which mechanism provides it.
         let mut t = Tree::new();
-        let at = |dx: i32| -> Element<Msg> {
-            stack(vec![fill(Rgb::new(1, 2, 3)), offset(dx, 20, text("File"))])
-        };
+        let at = |dx: i32| -> Element<Msg> { stack(vec![fill(Rgb::new(1, 2, 3)), offset(dx, 20, text("File"))]) };
         go(&mut t, &at(0)).expect("ok");
         assert_eq!(go(&mut t, &at(0)).expect("ok"), None, "an unchanged frame is clean");
-        assert!(
-            go(&mut t, &at(40)).expect("ok").is_some(),
-            "a popup that moved reported no damage"
-        );
+        assert!(go(&mut t, &at(40)).expect("ok").is_some(), "a popup that moved reported no damage");
     }
 
     #[test]
@@ -884,5 +856,4 @@ mod tests {
         d.add(Rect::new(0, 0, 0, 0));
         assert_eq!(d.take(), Some(Rect::new(100, 100, 10, 10)));
     }
-
 }

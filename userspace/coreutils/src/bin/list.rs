@@ -104,10 +104,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             None => owned(DEFAULT_PATH),
         });
     }
-    let paths: Vec<String> = paths
-        .iter()
-        .map(|p| String::from_utf8_lossy(&stage.path(p.as_bytes())).into_owned())
-        .collect();
+    let paths: Vec<String> =
+        paths.iter().map(|p| String::from_utf8_lossy(&stage.path(p.as_bytes())).into_owned()).collect();
 
     let mut rows: Vec<(String, OwnedEntry)> = Vec::new();
     for path in &paths {

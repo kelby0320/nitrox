@@ -75,16 +75,12 @@ pub struct CpuLocal {
 
 /// Zeroed initial block. Named so the `[CONST; N]` array initialiser below works
 /// without requiring `CpuLocal: Copy`.
-const CPU_LOCAL_INIT: CpuLocal = CpuLocal {
-    rsp_scratch: 0,
-    kstack_top: 0,
-};
+const CPU_LOCAL_INIT: CpuLocal = CpuLocal { rsp_scratch: 0, kstack_top: 0 };
 
 /// One [`CpuLocal`] per CPU, indexed by the dense `current_cpu()` id; each CPU
 /// programs its `KERNEL_GS_BASE` to its own slot (see [`this_cpu_block`]). Only
 /// slot 0 is live until APs start (slice 1).
-static mut CPUS: [CpuLocal; crate::arch::smp::MAX_CPUS] =
-    [CPU_LOCAL_INIT; crate::arch::smp::MAX_CPUS];
+static mut CPUS: [CpuLocal; crate::arch::smp::MAX_CPUS] = [CPU_LOCAL_INIT; crate::arch::smp::MAX_CPUS];
 
 const OFF_SCRATCH: usize = offset_of!(CpuLocal, rsp_scratch);
 const OFF_KSTACK: usize = offset_of!(CpuLocal, kstack_top);
@@ -427,14 +423,7 @@ extern "C" fn syscall_entry() -> ! {
 /// writable in the active address space; [`init_syscall_entry`] must have
 /// run; the active CR3 must be the process address space.
 #[unsafe(naked)]
-pub unsafe extern "C" fn enter_user(
-    entry: u64,
-    user_sp: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> ! {
+pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> ! {
     // SAFETY: naked. SysV: rdi=entry, rsi=user_sp, rdx=a0, rcx=a1, r8=a2, r9=a3.
     // Build the iretq frame (consuming rdi/rsi), then move the bootstrap args
     // into the user's rdi/rsi/rdx/rcx and zero every other GPR so no kernel value

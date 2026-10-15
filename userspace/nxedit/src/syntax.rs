@@ -168,8 +168,8 @@ pub const NXSH: Language = Language {
         StringRule { delim: '\'', escape: false, multiline: false },
     ],
     keywords: &[
-        "if", "else", "elif", "while", "for", "in", "match", "try", "catch", "fn", "let",
-        "return", "break", "continue", "and", "or", "not", "true", "false", "def", "end",
+        "if", "else", "elif", "while", "for", "in", "match", "try", "catch", "fn", "let", "return", "break",
+        "continue", "and", "or", "not", "true", "false", "def", "end",
     ],
     numbers: true,
     variable: Some('$'),
@@ -210,10 +210,9 @@ pub const RUST: Language = Language {
     block_comment: Some(("/*", "*/")),
     strings: &[StringRule { delim: '"', escape: true, multiline: true }],
     keywords: &[
-        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
-        "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
-        "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
-        "trait", "true", "type", "unsafe", "use", "where", "while",
+        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn",
+        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self",
+        "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
     ],
     numbers: true,
     variable: None,
@@ -239,10 +238,7 @@ pub const MARKDOWN: Language = Language {
     keywords: &[],
     numbers: false,
     variable: None,
-    line_prefixes: &[
-        ("#", Kind::Heading),
-        (">", Kind::Comment),
-    ],
+    line_prefixes: &[("#", Kind::Heading), (">", Kind::Comment)],
     fence: Some("```"),
     code_span: Some('`'),
     assignment: None,
@@ -353,9 +349,7 @@ pub fn scan(lang: &Language, line: &str, start: State) -> (Vec<Run>, State) {
         let name = &line[..at];
         let trimmed_name = name.trim();
         let plain_name = !trimmed_name.is_empty()
-            && trimmed_name
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ' ');
+            && trimmed_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ' ');
         if plain_name {
             let from = name.len() - name.trim_start().len();
             push(&mut out, from, from + trimmed_name.len(), Kind::Key);
@@ -367,13 +361,7 @@ pub fn scan(lang: &Language, line: &str, start: State) -> (Vec<Run>, State) {
 }
 
 /// The ordinary scan of `line` from byte `at`, with `out` already holding earlier runs.
-fn scan_from(
-    lang: &Language,
-    line: &str,
-    at: usize,
-    mut state: State,
-    mut out: Vec<Run>,
-) -> (Vec<Run>, State) {
+fn scan_from(lang: &Language, line: &str, at: usize, mut state: State, mut out: Vec<Run>) -> (Vec<Run>, State) {
     let b = line.as_bytes();
     let mut i = at;
     while i < line.len() {
@@ -562,12 +550,7 @@ mod tests {
     fn a_shell_line_colours_its_keyword_its_variable_and_its_comment() {
         assert_eq!(
             runs(&NXSH, "if $HOME { echo 1 } # done"),
-            vec![
-                ("if", Kind::Keyword),
-                ("$HOME", Kind::Variable),
-                ("1", Kind::Number),
-                ("# done", Kind::Comment),
-            ]
+            vec![("if", Kind::Keyword), ("$HOME", Kind::Variable), ("1", Kind::Number), ("# done", Kind::Comment),]
         );
         assert_eq!(runs(&NXSH, "echo ${WHAT}x"), vec![("${WHAT}", Kind::Variable)]);
     }
@@ -608,10 +591,7 @@ mod tests {
 
     #[test]
     fn an_escaped_quote_does_not_close_a_string() {
-        assert_eq!(runs(&RUST, r#"let s = "a\"b";"#), vec![
-            ("let", Kind::Keyword),
-            (r#""a\"b""#, Kind::Str),
-        ]);
+        assert_eq!(runs(&RUST, r#"let s = "a\"b";"#), vec![("let", Kind::Keyword), (r#""a\"b""#, Kind::Str),]);
         // …and a language without escapes takes the backslash literally, which is what a
         // single-quoted shell string does.
         assert_eq!(runs(&NXSH, r"echo 'a\'"), vec![(r"'a\'", Kind::Str)]);
@@ -663,21 +643,13 @@ mod tests {
     fn a_decimal_point_joins_a_number_and_nothing_else() {
         // **The name is a `Key` since the refresh's Part J**, which is why it leads each of
         // these: the value's colouring is what this test is about and is unchanged.
-        assert_eq!(
-            runs(&TOML, "timeout = 1.5"),
-            vec![("timeout", Kind::Key), ("1.5", Kind::Number)]
-        );
-        assert_eq!(runs(&RUST, "let x = 1.0;"), vec![
-            ("let", Kind::Keyword),
-            ("1.0", Kind::Number),
-        ]);
+        assert_eq!(runs(&TOML, "timeout = 1.5"), vec![("timeout", Kind::Key), ("1.5", Kind::Number)]);
+        assert_eq!(runs(&RUST, "let x = 1.0;"), vec![("let", Kind::Keyword), ("1.0", Kind::Number),]);
         // A point with no digit after it ends the number, so Rust's range is two of them.
-        assert_eq!(runs(&RUST, "for i in 1..2 {"), vec![
-            ("for", Kind::Keyword),
-            ("in", Kind::Keyword),
-            ("1", Kind::Number),
-            ("2", Kind::Number),
-        ]);
+        assert_eq!(
+            runs(&RUST, "for i in 1..2 {"),
+            vec![("for", Kind::Keyword), ("in", Kind::Keyword), ("1", Kind::Number), ("2", Kind::Number),]
+        );
         // …and a point after an *identifier* is not part of anything: the keyword still ends at
         // it, which is what makes `self.foo` work.
         assert_eq!(runs(&RUST, "self.field"), vec![("self", Kind::Keyword)]);
@@ -735,10 +707,7 @@ mod tests {
             runs(&TOML, "port = 8080 # the usual"),
             vec![("port", Kind::Key), ("8080", Kind::Number), ("# the usual", Kind::Comment)]
         );
-        assert_eq!(
-            runs(&TOML, "enabled = true"),
-            vec![("enabled", Kind::Key), ("true", Kind::Keyword)]
-        );
+        assert_eq!(runs(&TOML, "enabled = true"), vec![("enabled", Kind::Key), ("true", Kind::Keyword)]);
     }
 
     #[test]
@@ -802,8 +771,7 @@ mod tests {
         // **Which language, not merely that there is one.** A `.toml` read as Markdown colours
         // nothing and looks exactly like a scanner that never ran, so the mapping is what the
         // assertion is about.
-        for (file, want) in
-            [("build.nx", "nxsh"), ("init.toml", "toml"), ("lib.rs", "rust"), ("README.md", "markdown")]
+        for (file, want) in [("build.nx", "nxsh"), ("init.toml", "toml"), ("lib.rs", "rust"), ("README.md", "markdown")]
         {
             assert_eq!(name_of(for_name(file)), want, "{file}");
         }

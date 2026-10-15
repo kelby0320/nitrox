@@ -132,12 +132,7 @@ pub trait ArchPaging {
     ///   caller is responsible for the consequences.
     /// - Mapping an address in the kernel range with the wrong `flags`,
     ///   or over live kernel state, can corrupt the running kernel.
-    unsafe fn map_page(
-        root: PhysAddr,
-        virt: VirtAddr,
-        phys: PhysAddr,
-        flags: PageFlags,
-    ) -> Result<(), MapError>;
+    unsafe fn map_page(root: PhysAddr, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), MapError>;
 
     /// Remove the 4 KiB leaf mapping for `virt` from the tree rooted at
     /// `root`, returning the physical frame it referenced so the caller
@@ -220,10 +215,7 @@ pub trait ArchPaging {
     /// the HHDM that the caller is permitted to mutate. Returns
     /// [`MapError::OutOfMemory`] if the intermediate frame cannot be
     /// allocated.
-    unsafe fn ensure_kernel_intermediate(
-        root: PhysAddr,
-        virt: VirtAddr,
-    ) -> Result<(), MapError>;
+    unsafe fn ensure_kernel_intermediate(root: PhysAddr, virt: VirtAddr) -> Result<(), MapError>;
 
     /// Software-walk the page-table tree rooted at `root` and return the
     /// physical address `virt` maps to, or `None` if it is not mapped (or

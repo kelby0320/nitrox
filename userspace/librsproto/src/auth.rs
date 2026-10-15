@@ -34,11 +34,7 @@ pub struct AuthenticateRequest<'a> {
 
 /// Write an `AuthenticateRequest` body; returns its length. `None` if a field is
 /// longer than `u16::MAX` or `out` is too small.
-pub fn build_authenticate_request(
-    out: &mut [u8],
-    username: &[u8],
-    password: &[u8],
-) -> Option<usize> {
+pub fn build_authenticate_request(out: &mut [u8], username: &[u8], password: &[u8]) -> Option<usize> {
     if username.len() > u16::MAX as usize || password.len() > u16::MAX as usize {
         return None;
     }
@@ -66,10 +62,7 @@ pub fn parse_authenticate_request(body: &[u8]) -> Option<AuthenticateRequest<'_>
     if body.len() < p_end {
         return None;
     }
-    Some(AuthenticateRequest {
-        username: &body[AUTH_REQUEST_PREFIX_LEN..u_end],
-        password: &body[u_end..p_end],
-    })
+    Some(AuthenticateRequest { username: &body[AUTH_REQUEST_PREFIX_LEN..u_end], password: &body[u_end..p_end] })
 }
 
 // --- Authenticate reply -----------------------------------------------------
@@ -93,12 +86,7 @@ impl AuthenticateReply<'_> {
 
 /// Write an `AuthenticateReply` body; returns its length. On `DENIED`, pass empty
 /// `principal` / `home`. `None` if a field is too long or `out` is too small.
-pub fn build_authenticate_reply(
-    out: &mut [u8],
-    result: u16,
-    principal: &[u8],
-    home: &[u8],
-) -> Option<usize> {
+pub fn build_authenticate_reply(out: &mut [u8], result: u16, principal: &[u8], home: &[u8]) -> Option<usize> {
     if principal.len() > u16::MAX as usize || home.len() > u16::MAX as usize {
         return None;
     }
@@ -135,11 +123,7 @@ pub fn parse_authenticate_reply(body: &[u8]) -> Option<AuthenticateReply<'_>> {
     if body.len() < h_end {
         return None;
     }
-    Some(AuthenticateReply {
-        result,
-        principal: &body[AUTH_REPLY_PREFIX_LEN..p_end],
-        home: &body[p_end..h_end],
-    })
+    Some(AuthenticateReply { result, principal: &body[AUTH_REPLY_PREFIX_LEN..p_end], home: &body[p_end..h_end] })
 }
 
 // --- Administration (administration Part D.1) -------------------------------
@@ -344,9 +328,7 @@ mod tests {
     #[test]
     fn reply_authenticated_round_trip() {
         let mut buf = [0u8; 64];
-        let n =
-            build_authenticate_reply(&mut buf, AUTH_RESULT_AUTHENTICATED, b"alice", b"/home/alice")
-                .unwrap();
+        let n = build_authenticate_reply(&mut buf, AUTH_RESULT_AUTHENTICATED, b"alice", b"/home/alice").unwrap();
         let r = parse_authenticate_reply(&buf[..n]).unwrap();
         assert!(r.is_authenticated());
         assert_eq!(r.principal, b"alice");

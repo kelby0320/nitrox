@@ -354,18 +354,8 @@ impl HandleInfo {
     /// Build the user-facing info from a handle's metadata snapshot. Takes
     /// primitives (not the table's `HandleStat`) so this type keeps its
     /// no-allocator, no-table dependency and can be shared with userspace.
-    pub const fn from_stat(
-        object_type: KObjectType,
-        rights: Rights,
-        generation: u32,
-        size: u64,
-    ) -> Self {
-        Self {
-            rights: rights.bits(),
-            object_type: object_type as u32,
-            generation,
-            size,
-        }
+    pub const fn from_stat(object_type: KObjectType, rights: Rights, generation: u32, size: u64) -> Self {
+        Self { rights: rights.bits(), object_type: object_type as u32, generation, size }
     }
 }
 
@@ -439,11 +429,7 @@ mod tests {
             (0, (1 << 20) - 1, 0),
         ] {
             let h = RawHandle::encode(seg, slot, generation);
-            assert_eq!(
-                h.decode(),
-                (seg, slot, generation),
-                "round trip for {seg:?},{slot:?},{generation:?}",
-            );
+            assert_eq!(h.decode(), (seg, slot, generation), "round trip for {seg:?},{slot:?},{generation:?}",);
         }
     }
 

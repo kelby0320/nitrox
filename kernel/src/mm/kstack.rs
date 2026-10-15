@@ -23,8 +23,8 @@
 //! churn heavily (they shouldn't — a stack lives as long as its
 //! thread), a vmap freelist is a local addition.
 
-use crate::arch::paging::{ArchPaging, PageFlags};
 use crate::arch::Paging;
+use crate::arch::paging::{ArchPaging, PageFlags};
 use crate::libkern::AllocError;
 use crate::mm::kvmap;
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
@@ -105,9 +105,7 @@ impl KernelStack {
                 Ok(()) => installed += 1,
                 Err(_) => {
                     for j in 0..installed {
-                        let v = VirtAddr::new(
-                            base.as_u64() + (j as u64) * (PAGE_SIZE as u64),
-                        );
+                        let v = VirtAddr::new(base.as_u64() + (j as u64) * (PAGE_SIZE as u64));
                         // SAFETY: we just installed this PTE; unmap
                         // returns the frame we mapped.
                         let _ = unsafe { Paging::unmap_page(root, v) };
@@ -143,12 +141,7 @@ impl KernelStack {
             watermark::paint(base, KERNEL_STACK_BYTES);
         }
 
-        Ok(KernelStack {
-            top,
-            base,
-            frames,
-            root,
-        })
+        Ok(KernelStack { top, base, frames, root })
     }
 
     /// Exclusive top of the stack — the value to load into RSP when
@@ -260,11 +253,7 @@ pub mod watermark {
     /// the thread that reached it)`. All zero before any sample.
     pub fn deepest() -> (u64, u64, u32) {
         let used = DEEPEST.load(Ordering::Relaxed);
-        (
-            used,
-            used * 100 / KERNEL_STACK_BYTES,
-            DEEPEST_PID.load(Ordering::Relaxed),
-        )
+        (used, used * 100 / KERNEL_STACK_BYTES, DEEPEST_PID.load(Ordering::Relaxed))
     }
 }
 
@@ -329,10 +318,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let stack = KernelStack::new(asp.root()).unwrap();
-        assert_eq!(
-            stack.top.as_u64() - stack.base.as_u64(),
-            KERNEL_STACK_BYTES
-        );
+        assert_eq!(stack.top.as_u64() - stack.base.as_u64(), KERNEL_STACK_BYTES);
     }
 
     #[test]
@@ -340,10 +326,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let stack = KernelStack::new(asp.root()).unwrap();
-        assert_eq!(
-            stack.base.as_u64() - stack.guard_page().as_u64(),
-            PAGE_SIZE as u64
-        );
+        assert_eq!(stack.base.as_u64() - stack.guard_page().as_u64(), PAGE_SIZE as u64);
     }
 
     #[test]
@@ -355,11 +338,7 @@ mod tests {
         // The vmap bump allocator hands out monotonically-increasing
         // ranges, so whichever was allocated first must end before
         // the other begins (no overlap).
-        let (lo, hi) = if s1.base.as_u64() < s2.base.as_u64() {
-            (&s1, &s2)
-        } else {
-            (&s2, &s1)
-        };
+        let (lo, hi) = if s1.base.as_u64() < s2.base.as_u64() { (&s1, &s2) } else { (&s2, &s1) };
         assert!(
             lo.top.as_u64() <= hi.guard_page().as_u64(),
             "stacks overlap: lo.top={:#x}, hi.guard={:#x}",
@@ -382,9 +361,6 @@ mod tests {
             stack.base
         }; // stack dropped here
         // SAFETY: read-only walk against the now-cleared mapping.
-        assert!(
-            unsafe { Paging::translate(asp.root(), base) }.is_none(),
-            "stack base must be unmapped after drop"
-        );
+        assert!(unsafe { Paging::translate(asp.root(), base) }.is_none(), "stack base must be unmapped after drop");
     }
 }

@@ -673,7 +673,14 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
             let mut made = || -> Result<(), FsError> {
                 let mut s = [0u8; SECTOR as usize];
                 s[..32].copy_from_slice(&dir::short_entry(g.kind, DOT, ATTR_DIR, new, 0, now));
-                s[32..64].copy_from_slice(&dir::short_entry(g.kind, DOTDOT, ATTR_DIR, dir::dotdot_cluster(g, d), 0, now));
+                s[32..64].copy_from_slice(&dir::short_entry(
+                    g.kind,
+                    DOTDOT,
+                    ATTR_DIR,
+                    dir::dotdot_cluster(g, d),
+                    0,
+                    now,
+                ));
                 let at = g.cluster_sector(new) * SECTOR as u64;
                 self.r.write_at(at, &s)?;
                 let mut z = Zeroer::new(self.r);
@@ -959,12 +966,12 @@ impl<R: BlockReader + BlockWriter> Volume for Fat<'_, R> {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
-mod write_tests;
-#[cfg(test)]
-mod serve_tests;
+mod crash_tests;
 #[cfg(test)]
 mod hostile_tests;
 #[cfg(test)]
-mod crash_tests;
+mod serve_tests;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod write_tests;

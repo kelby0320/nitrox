@@ -76,22 +76,12 @@ impl EvalError {
     }
 
     fn of(kind: &str, message: impl Into<String>) -> EvalError {
-        EvalError {
-            message: message.into(),
-            kind: String::from(kind),
-            stages: None,
-            exit: None,
-        }
+        EvalError { message: message.into(), kind: String::from(kind), stages: None, exit: None }
     }
 
     /// `exit N` — see the field.
     fn exiting(status: i32) -> EvalError {
-        EvalError {
-            message: String::from("exit"),
-            kind: String::from(ERROR),
-            stages: None,
-            exit: Some(status),
-        }
+        EvalError { message: String::from("exit"), kind: String::from(ERROR), stages: None, exit: Some(status) }
     }
 
     pub fn is_exit(&self) -> bool {
@@ -104,11 +94,12 @@ impl EvalError {
     /// grammar — and built here, once, so the vocabulary cannot drift between the sites
     /// that raise it.
     fn to_record(&self) -> Val {
-        let mut schema = Schema::new()
-            .field("kind", libstream::wire::TypeTag::String, TypeModifiers::NONE)
-            .field("message", libstream::wire::TypeTag::String, TypeModifiers::NONE);
-        let mut values =
-            alloc::vec![Value::Str(self.kind.clone()), Value::Str(self.message.clone())];
+        let mut schema = Schema::new().field("kind", libstream::wire::TypeTag::String, TypeModifiers::NONE).field(
+            "message",
+            libstream::wire::TypeTag::String,
+            TypeModifiers::NONE,
+        );
+        let mut values = alloc::vec![Value::Str(self.kind.clone()), Value::Str(self.message.clone())];
         if let Some(stages) = &self.stages {
             schema = schema.field("stages", libstream::wire::TypeTag::List, TypeModifiers::NONE);
             values.push(stages.clone());
@@ -246,12 +237,8 @@ impl Interp {
     /// arguments are passed through as written; see [`Host::run`].
     fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
         let mut buf = [0u8; 1024];
-        let out = librsproto::path::resolve(
-            self.cwd().map(str::as_bytes),
-            path.as_bytes(),
-            &mut buf,
-        )
-        .map_err(|e| EvalError::new(alloc::format!("`{path}`: {}", e.message())))?;
+        let out = librsproto::path::resolve(self.cwd().map(str::as_bytes), path.as_bytes(), &mut buf)
+            .map_err(|e| EvalError::new(alloc::format!("`{path}`: {}", e.message())))?;
         Ok(alloc::string::String::from_utf8_lossy(out).into_owned())
     }
 
@@ -290,8 +277,7 @@ impl Interp {
     /// for `use` is the same one — an explicit relative path rather than a search. So the
     /// slash decides before the position does.
     pub fn complete(&mut self, line: &str) -> crate::complete::Completion {
-        use crate::complete::{Completion, Where, matching_names, matching_paths, split_path,
-                              word_at_end};
+        use crate::complete::{Completion, Where, matching_names, matching_paths, split_path, word_at_end};
         let w = word_at_end(line);
         let as_path = w.at == Where::Argument || w.text.contains('/');
         if !as_path {
@@ -328,8 +314,6 @@ impl Interp {
         &mut *self.host
     }
 
-
-
     /// Run a whole script, returning the value of its last expression statement.
     ///
     /// A script discards bare expression values (§11e) — this returns the last one anyway
@@ -349,8 +333,8 @@ impl Interp {
     /// not visible inside a function or a script, so real code still has no ambient state
     /// to read.
     pub fn run_line(&mut self, src: &str) -> Result<Option<alloc::string::String>> {
-        let script = crate::parse_script(src)
-            .map_err(|e| EvalError::new(alloc::format!("line {}: {}", e.line, e.message)))?;
+        let script =
+            crate::parse_script(src).map_err(|e| EvalError::new(alloc::format!("line {}: {}", e.line, e.message)))?;
         // **Hoist, exactly as a block does.** `exec` treats `Stmt::Def` as a no-op because
         // definitions are registered here, not executed (§5a — hoisting is what makes
         // mutual recursion possible). `exec_block` had the only call, so a whole script
@@ -384,7 +368,11 @@ impl Interp {
         }
         let status = self.last_status.clone().unwrap_or(Val::NULL);
         let schema = Schema::new()
-            .field("value", value.as_data().and_then(|v| v.type_tag()).unwrap_or(libstream::wire::TypeTag::Null), TypeModifiers::NONE)
+            .field(
+                "value",
+                value.as_data().and_then(|v| v.type_tag()).unwrap_or(libstream::wire::TypeTag::Null),
+                TypeModifiers::NONE,
+            )
             .field("status", libstream::wire::TypeTag::Record, TypeModifiers::NONE);
         let values = alloc::vec![
             value.as_data().cloned().unwrap_or(Value::Null),
@@ -402,8 +390,8 @@ impl Interp {
 
     /// Convenience for tests and `nxsh -c`: parse and run.
     pub fn eval_str(src: &str) -> Result<Val> {
-        let script = crate::parse_script(src)
-            .map_err(|e| EvalError::new(alloc::format!("line {}: {}", e.line, e.message)))?;
+        let script =
+            crate::parse_script(src).map_err(|e| EvalError::new(alloc::format!("line {}: {}", e.line, e.message)))?;
         Interp::new().run(&script)
     }
 
@@ -418,10 +406,7 @@ impl Interp {
     }
 
     fn lookup(&self, name: &str) -> Option<&Slot> {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|s| s.iter().rev().find(|(n, _)| n == name).map(|(_, slot)| slot))
+        self.scopes.iter().rev().find_map(|s| s.iter().rev().find(|(n, _)| n == name).map(|(_, slot)| slot))
     }
 
     /// A binding, or failing that a hoisted function.
@@ -433,9 +418,7 @@ impl Interp {
     }
 
     fn lookup_mut(&mut self, name: &str) -> Option<&mut Slot> {
-        self.scopes.iter_mut().rev().find_map(|s| {
-            s.iter_mut().rev().find(|(n, _)| n == name).map(|(_, slot)| slot)
-        })
+        self.scopes.iter_mut().rev().find_map(|s| s.iter_mut().rev().find(|(n, _)| n == name).map(|(_, slot)| slot))
     }
 
     fn bind(&mut self, name: &str, val: Val, mutable: bool, constant: bool) -> Result<()> {
@@ -470,11 +453,7 @@ impl Interp {
                 Flow::Break => return Ok(Flow::Break),
                 Flow::Continue => return Ok(Flow::Continue),
                 Flow::Normal(v) => {
-                    last = if i + 1 == stmts.len() && s.is_expression_shaped() {
-                        v
-                    } else {
-                        Val::NULL
-                    };
+                    last = if i + 1 == stmts.len() && s.is_expression_shaped() { v } else { Val::NULL };
                 }
             }
         }
@@ -577,13 +556,8 @@ impl Interp {
                     // on more than a message. It must carry one, though: an error whose
                     // `message` is missing is the vague failure §6 spends its diff on.
                     Some(Value::Record(r)) => {
-                        let field = |n: &str| {
-                            r.schema
-                                .fields
-                                .iter()
-                                .position(|f| f.name == n)
-                                .and_then(|i| r.values.get(i))
-                        };
+                        let field =
+                            |n: &str| r.schema.fields.iter().position(|f| f.name == n).and_then(|i| r.values.get(i));
                         let Some(Value::Str(message)) = field("message") else {
                             return Err(EvalError::new(
                                 "`fail` takes a message — a Record raised as an error must \
@@ -609,9 +583,7 @@ impl Interp {
             // `try` is an expression, but in statement position its control flow must
             // still reach the enclosing loop or function — so it is unwrapped here rather
             // than going through `eval`, which can only return a value.
-            Stmt::Expr(Expr::Try { body, catch_binding, catch_body }) => {
-                self.exec_try(body, catch_binding, catch_body)
-            }
+            Stmt::Expr(Expr::Try { body, catch_binding, catch_body }) => self.exec_try(body, catch_binding, catch_body),
             Stmt::Expr(e) => Ok(Flow::Normal(self.eval(e)?)),
             // Already bound by `hoist_defs` at block entry (§5a), so the declaration
             // itself does nothing further.
@@ -645,12 +617,7 @@ impl Interp {
     /// with `expression_value`, which is where a `break` in *value* position is refused
     /// (`TODO(control-flow-in-expression-position)`). Making `try` an expression is
     /// exactly the change that entry predicted would bite here.
-    fn exec_try(
-        &mut self,
-        body: &[Stmt],
-        catch_binding: &Option<String>,
-        catch_body: &[Stmt],
-    ) -> Result<Flow> {
+    fn exec_try(&mut self, body: &[Stmt], catch_binding: &Option<String>, catch_body: &[Stmt]) -> Result<Flow> {
         let e = match self.scoped_block(body) {
             Ok(flow) => return Ok(flow),
             Err(e) => e,
@@ -714,18 +681,11 @@ impl Interp {
                 }
                 Ok(out)
             }
-            Val::Data(Value::List(items)) => {
-                Ok(items.iter().map(|v| Val::Data(v.clone())).collect())
-            }
+            Val::Data(Value::List(items)) => Ok(items.iter().map(|v| Val::Data(v.clone())).collect()),
             Val::Data(Value::Table(t)) => Ok(t
                 .rows
                 .iter()
-                .map(|row| {
-                    Val::Data(Value::Record(Arc::new(Record {
-                        schema: t.schema.clone(),
-                        values: row.clone(),
-                    })))
-                })
+                .map(|row| Val::Data(Value::Record(Arc::new(Record { schema: t.schema.clone(), values: row.clone() }))))
                 .collect()),
             _ => Err(EvalError::new(alloc::format!(
                 "cannot iterate a {} — `for` walks a Range, a List or a Table",
@@ -746,9 +706,7 @@ impl Interp {
             });
         }
         let root = target.root.clone();
-        let slot = self.lookup_mut(&root).ok_or_else(|| {
-            EvalError::new(alloc::format!("`{root}` is not bound"))
-        })?;
+        let slot = self.lookup_mut(&root).ok_or_else(|| EvalError::new(alloc::format!("`{root}` is not bound")))?;
         if !slot.mutable {
             return Err(EvalError::new(alloc::format!(
                 "`{root}` was bound with `let` — only a `mut` binding can be assigned to"
@@ -761,10 +719,7 @@ impl Interp {
         let mut data = match &slot.val {
             Val::Data(v) => v.clone(),
             other => {
-                return Err(EvalError::new(alloc::format!(
-                    "cannot assign into a {}",
-                    other.type_name()
-                )));
+                return Err(EvalError::new(alloc::format!("cannot assign into a {}", other.type_name())));
             }
         };
         set_path(&mut data, &steps, value.into_data().map_err(EvalError::new)?)?;
@@ -777,10 +732,9 @@ impl Interp {
         match v {
             Val::Data(Value::Int(i)) => Ok(IndexKey::Pos(i)),
             Val::Data(Value::Str(s)) => Ok(IndexKey::Name(s)),
-            other => Err(EvalError::new(alloc::format!(
-                "an index must be an Int or a String, got {}",
-                other.type_name()
-            ))),
+            other => {
+                Err(EvalError::new(alloc::format!("an index must be an Int or a String, got {}", other.type_name())))
+            }
         }
     }
 
@@ -797,9 +751,7 @@ impl Interp {
             // it is still the placeholder it has always been.
             Expr::Underscore => match self.lookup_any(UNDERSCORE) {
                 Some(v) => Ok(v),
-                None => Err(EvalError::new(
-                    "`_` is a pipeline placeholder and has no value on its own",
-                )),
+                None => Err(EvalError::new("`_` is a pipeline placeholder and has no value on its own")),
             },
             // A `/pattern/` literal is its source text; `~=` compiles it. Keeping it a
             // String means a pattern can equally be built at run time, which a filter over
@@ -845,11 +797,9 @@ impl Interp {
                 let s = self.eval(start)?;
                 let e2 = self.eval(end)?;
                 match (s.as_data(), e2.as_data()) {
-                    (Some(Value::Int(a)), Some(Value::Int(b))) => Ok(Val::Range {
-                        start: *a,
-                        end: *b,
-                        inclusive: *inclusive,
-                    }),
+                    (Some(Value::Int(a)), Some(Value::Int(b))) => {
+                        Ok(Val::Range { start: *a, end: *b, inclusive: *inclusive })
+                    }
                     _ => Err(EvalError::new(alloc::format!(
                         "a range needs Int bounds, got {}..{}",
                         s.type_name(),
@@ -870,8 +820,10 @@ impl Interp {
                 for (name, e) in fields {
                     let v = self.eval(e)?.into_data().map_err(EvalError::new)?;
                     let tag = v.type_tag().ok_or_else(|| {
-                        EvalError::new("a Table cannot be a record field — it is a stream, \
-                                        not a cell")
+                        EvalError::new(
+                            "a Table cannot be a record field — it is a stream, \
+                                        not a cell",
+                        )
                     })?;
                     schema = schema.field(name, tag, TypeModifiers::NONE);
                     values.push(v);
@@ -888,12 +840,7 @@ impl Interp {
                         captured.push((n.clone(), slot.val.clone()));
                     }
                 }
-                Ok(Val::Func(Arc::new(Func {
-                    name: None,
-                    params: params.clone(),
-                    body: body.clone(),
-                    captured,
-                })))
+                Ok(Val::Func(Arc::new(Func { name: None, params: params.clone(), body: body.clone(), captured })))
             }
             Expr::Block(stmts) => expression_value(self.scoped_block(stmts)?),
             Expr::If { cond, then, otherwise } => {
@@ -951,10 +898,9 @@ impl Interp {
                 match v.as_bool() {
                     Some(true) => Ok(Val::NULL),
                     Some(false) => Err(EvalError::of(ASSERTION_FAILED, "assertion failed")),
-                    None => Err(EvalError::new(alloc::format!(
-                        "`assert` needs a Bool predicate, got {}",
-                        v.type_name()
-                    ))),
+                    None => {
+                        Err(EvalError::new(alloc::format!("`assert` needs a Bool predicate, got {}", v.type_name())))
+                    }
                 }
             }
             Expr::Pipeline(stages) => self.pipeline(stages),
@@ -992,9 +938,6 @@ impl Interp {
             }
         }
     }
-
-
-
 
     // --- functions (Part E) -------------------------------------------------
 
@@ -1081,10 +1024,8 @@ impl Interp {
                 }
                 continue;
             }
-            let supplied = positional
-                .get(i)
-                .cloned()
-                .or_else(|| named.iter().find(|(n, _)| n == &p.name).map(|(_, v)| v.clone()));
+            let supplied =
+                positional.get(i).cloned().or_else(|| named.iter().find(|(n, _)| n == &p.name).map(|(_, v)| v.clone()));
             let value = match supplied {
                 Some(v) => v,
                 None => match &p.default {
@@ -1124,8 +1065,7 @@ impl Interp {
 
         // An unknown named argument is an error, not silently ignored (§5b).
         if result.is_ok() {
-            if let Some((n, _)) = named.iter().find(|(n, _)| !f.params.iter().any(|p| &p.name == n))
-            {
+            if let Some((n, _)) = named.iter().find(|(n, _)| !f.params.iter().any(|p| &p.name == n)) {
                 result = Err(EvalError::new(alloc::format!(
                     "`{}` has no parameter `{n}`",
                     f.name.as_deref().unwrap_or("this function")
@@ -1148,10 +1088,7 @@ impl Interp {
             return Err(EvalError::new(alloc::format!("`{}` is not a function", c.name)));
         };
         let Val::Func(f) = v else {
-            return Err(EvalError::new(alloc::format!(
-                "`{}` is not something callable",
-                c.name
-            )));
+            return Err(EvalError::new(alloc::format!("`{}` is not something callable", c.name)));
         };
         let mut positional = Vec::new();
         let mut named = Vec::new();
@@ -1213,18 +1150,10 @@ impl Interp {
         // §6 already made that call for the type system generally. A value hitting no arm
         // is a runtime `MatchError`, styled like a `TypeError`, rather than falling
         // through silently.
-        Err(EvalError::new(alloc::format!(
-            "MatchError: no arm matched a {} value",
-            v.type_name()
-        )))
+        Err(EvalError::new(alloc::format!("MatchError: no arm matched a {} value", v.type_name())))
     }
 
-    fn pattern_matches(
-        &mut self,
-        p: &Pattern,
-        v: &Val,
-        out: &mut Vec<(String, Val)>,
-    ) -> Result<bool> {
+    fn pattern_matches(&mut self, p: &Pattern, v: &Val, out: &mut Vec<(String, Val)>) -> Result<bool> {
         Ok(match p {
             Pattern::Wildcard => true,
             Pattern::Bind(n) => {
@@ -1324,14 +1253,12 @@ impl Interp {
     /// Explicit relative path only, no search algorithm — §9h rejects `PATH`-like
     /// resolution for the same reason the system rejects ambient env and ambient
     /// authority: a name crossing a boundary should be visible at the crossing.
-    fn exec_use(&mut self, path: &str, names: &Option<Vec<String>>, alias: &Option<String>)
-    -> Result<()> {
+    fn exec_use(&mut self, path: &str, names: &Option<Vec<String>>, alias: &Option<String>) -> Result<()> {
         let bytes = self.host.read_file(path).map_err(EvalError::new)?;
         let src = alloc::string::String::from_utf8(bytes)
             .map_err(|_| EvalError::new(alloc::format!("`{path}` is not valid UTF-8")))?;
-        let module = crate::parse_script(&src).map_err(|e| {
-            EvalError::new(alloc::format!("{path} line {}: {}", e.line, e.message))
-        })?;
+        let module = crate::parse_script(&src)
+            .map_err(|e| EvalError::new(alloc::format!("{path} line {}: {}", e.line, e.message)))?;
 
         // Run the module in a scope of its own, then take only what it exported. Its
         // `def`s land in `functions` rather than the scope (see `hoist_defs`), so both
@@ -1390,9 +1317,7 @@ impl Interp {
                 }
             }
             (None, None) => {
-                return Err(EvalError::new(
-                    "`use` needs `{ names }` or `as alias` — there is no wildcard import",
-                ));
+                return Err(EvalError::new("`use` needs `{ names }` or `as alias` — there is no wildcard import"));
             }
         }
         Ok(())
@@ -1475,9 +1400,7 @@ impl Interp {
                     None => match self.env_str("HOME") {
                         Some(h) => h,
                         None => {
-                            return Err(EvalError::new(
-                                "`cd` with no argument goes to HOME, and HOME is not set",
-                            ));
+                            return Err(EvalError::new("`cd` with no argument goes to HOME, and HOME is not set"));
                         }
                     },
                     Some(_) => return Err(EvalError::new("`cd` takes one path")),
@@ -1487,9 +1410,7 @@ impl Interp {
                 // real when you went there", not "PWD is whatever you typed" — otherwise
                 // every later relative path fails somewhere far from the mistake.
                 if !self.path_exists(&resolved) {
-                    return Err(EvalError::new(alloc::format!(
-                        "`{resolved}` does not exist, so PWD was left alone"
-                    )));
+                    return Err(EvalError::new(alloc::format!("`{resolved}` does not exist, so PWD was left alone")));
                 }
                 self.set_env_entry("PWD", Value::Str(resolved));
                 Ok(Val::NULL)
@@ -1517,9 +1438,7 @@ impl Interp {
                             Some(Value::Str(t)) => match scan_number(t) {
                                 Some(Val::Data(Value::Int(n))) => n as i32,
                                 _ => {
-                                    return Err(EvalError::new(alloc::format!(
-                                        "`exit` takes a status Int, got {t:?}"
-                                    )));
+                                    return Err(EvalError::new(alloc::format!("`exit` takes a status Int, got {t:?}")));
                                 }
                             },
                             _ => {
@@ -1578,10 +1497,7 @@ impl Interp {
         for a in &c.args {
             match a {
                 Arg::Positional(Expr::Closure { params, body }) => {
-                    closures.push(self.eval(&Expr::Closure {
-                        params: params.clone(),
-                        body: body.clone(),
-                    })?);
+                    closures.push(self.eval(&Expr::Closure { params: params.clone(), body: body.clone() })?);
                 }
                 Arg::Positional(e) => raw.push(e),
                 Arg::Flag(f, None) => flags.push(f.as_str()),
@@ -1618,9 +1534,7 @@ impl Interp {
                 ))
             })
         };
-        let wrap = |r: core::result::Result<Val, alloc::string::String>| -> Result<Val> {
-            r.map_err(EvalError::new)
-        };
+        let wrap = |r: core::result::Result<Val, alloc::string::String>| -> Result<Val> { r.map_err(EvalError::new) };
         // A bare name read as a **column**, not evaluated.
         let field_names: Vec<alloc::string::String> = raw
             .iter()
@@ -1633,8 +1547,7 @@ impl Interp {
         match name {
             "count" => wrap(ops::count(&need(operand)?)),
             // §10b Part E. Argument-free scalar operators: the operand is the whole input.
-            "trim" | "upper" | "lower" | "keys" | "values" | "round" | "floor" | "ceil"
-            | "trunc" | "abs" => {
+            "trim" | "upper" | "lower" | "keys" | "values" | "round" | "floor" | "ceil" | "trunc" | "abs" => {
                 let v = need(operand)?;
                 wrap(match name {
                     "trim" => ops::trim(&v),
@@ -1654,18 +1567,12 @@ impl Interp {
                 let Some(sep) = field_names.first() else {
                     return Err(EvalError::new(alloc::format!("`{name}` needs a separator")));
                 };
-                wrap(if name == "split" {
-                    ops::split(&v, sep)
-                } else {
-                    ops::join(&v, sep)
-                })
+                wrap(if name == "split" { ops::split(&v, sep) } else { ops::join(&v, sep) })
             }
             "replace" => {
                 let v = need(operand)?;
                 let (Some(from), Some(to)) = (field_names.first(), field_names.get(1)) else {
-                    return Err(EvalError::new(
-                        "`replace` needs what to replace and what to replace it with",
-                    ));
+                    return Err(EvalError::new("`replace` needs what to replace and what to replace it with"));
                 };
                 wrap(ops::replace(&v, from, to))
             }
@@ -1679,10 +1586,7 @@ impl Interp {
             "capture" => {
                 let v = need(operand)?;
                 let Some(Value::Str(text)) = v.as_data() else {
-                    return Err(EvalError::new(alloc::format!(
-                        "`capture` works on a String, got {}",
-                        v.type_name()
-                    )));
+                    return Err(EvalError::new(alloc::format!("`capture` works on a String, got {}", v.type_name())));
                 };
                 let Some(pattern) = raw.first() else {
                     return Err(EvalError::new("`capture` needs a pattern"));
@@ -1702,9 +1606,7 @@ impl Interp {
                                 // A group that did not participate is Null, not "" —
                                 // "did not match" is not "matched nothing".
                                 None => Value::Null,
-                                Some((a, b)) => {
-                                    Value::Str(chars[*a..*b].iter().collect())
-                                }
+                                Some((a, b)) => Value::Str(chars[*a..*b].iter().collect()),
                             })
                             .collect::<Vec<_>>(),
                     ))),
@@ -1768,9 +1670,7 @@ impl Interp {
                 let n = match first.as_ref().and_then(|a| a.as_data()) {
                     Some(Value::Int(n)) => *n,
                     _ => {
-                        return Err(EvalError::new(alloc::format!(
-                            "`{name}` needs a row count"
-                        )));
+                        return Err(EvalError::new(alloc::format!("`{name}` needs a row count")));
                     }
                 };
                 wrap(match name {
@@ -1941,10 +1841,7 @@ impl Interp {
                     None => None,
                 };
                 let strict = self.strict;
-                let outcome = self
-                    .host
-                    .run(&run, input.as_deref(), strict, &self.env)
-                    .map_err(EvalError::new)?;
+                let outcome = self.host.run(&run, input.as_deref(), strict, &self.env).map_err(EvalError::new)?;
                 carried = decode_output(&outcome)?;
                 statuses.extend(outcome.stages.iter().cloned());
                 continue;
@@ -1982,10 +1879,7 @@ impl Interp {
             // their own, so the operand is bound to `_` for the length of the stage and
             // `Expr::Underscore` picks it up — no separate operand channel, and
             // `assert (count > 0)` works because a nullary operator finds `_` too.
-            if matches!(
-                &stages[i],
-                Expr::Expect(..) | Expr::Parse(..) | Expr::Assert(_)
-            ) {
+            if matches!(&stages[i], Expr::Expect(..) | Expr::Parse(..) | Expr::Assert(_)) {
                 let operand = carried.take().ok_or_else(|| {
                     EvalError::new(
                         "this stage checks the value arriving from the left of a pipe,                          and nothing is arriving",
@@ -2011,10 +1905,7 @@ impl Interp {
             }
             return Err(match &stages[i] {
                 Expr::Call(c) => unavailable(c),
-                other => EvalError::new(alloc::format!(
-                    "a {} cannot be a pipeline stage",
-                    describe_expr(other)
-                )),
+                other => EvalError::new(alloc::format!("a {} cannot be a pipeline stage", describe_expr(other))),
             });
         }
 
@@ -2075,10 +1966,7 @@ impl Interp {
             if at_head && self.lookup(name).is_some() {
                 return Ok(None);
             }
-            return Ok(Some(StageSpec {
-                program: name.clone(),
-                argv: alloc::vec![name.clone()],
-            }));
+            return Ok(Some(StageSpec { program: name.clone(), argv: alloc::vec![name.clone()] }));
         }
         let Expr::Call(c) = stage else { return Ok(None) };
         if c.kind != CallKind::External {
@@ -2180,7 +2068,6 @@ fn unavailable(c: &Call) -> EvalError {
     ))
 }
 
-
 /// Encode a value as a TSM1 stream for a stage's `stdin`.
 ///
 /// **Text is wrapped rather than refused**, which is what `StreamFlags::TEXT_FALLBACK` is for:
@@ -2205,8 +2092,7 @@ fn encode_stream(v: &Val) -> Result<Vec<u8>> {
         )));
     };
     let mut buf: Vec<u8> = Vec::new();
-    t.encode(&mut buf)
-        .map_err(|_| EvalError::new("could not encode the piped table"))?;
+    t.encode(&mut buf).map_err(|_| EvalError::new("could not encode the piped table"))?;
     Ok(buf)
 }
 
@@ -2284,13 +2170,12 @@ fn stage_rows(stages: &[StageStatus]) -> Value {
 
 fn pipeline_status(stages: &[StageStatus]) -> Val {
     let all_ok = stages.iter().all(|s| s.succeeded());
-    let schema = Schema::new()
-        .field("stages", libstream::wire::TypeTag::List, TypeModifiers::NONE)
-        .field("all_ok", libstream::wire::TypeTag::Bool, TypeModifiers::NONE);
-    Val::Data(Value::Record(Arc::new(Record {
-        schema,
-        values: alloc::vec![stage_rows(stages), Value::Bool(all_ok)],
-    })))
+    let schema = Schema::new().field("stages", libstream::wire::TypeTag::List, TypeModifiers::NONE).field(
+        "all_ok",
+        libstream::wire::TypeTag::Bool,
+        TypeModifiers::NONE,
+    );
+    Val::Data(Value::Record(Arc::new(Record { schema, values: alloc::vec![stage_rows(stages), Value::Bool(all_ok)] })))
 }
 
 fn describe_expr(e: &Expr) -> &'static str {
@@ -2340,9 +2225,7 @@ fn set_path(data: &mut Value, steps: &[Step], value: Value) -> Result<()> {
                 .fields
                 .iter()
                 .position(|f| &f.name == name)
-                .ok_or_else(|| {
-                    EvalError::new(alloc::format!("record has no field `{name}`"))
-                })?;
+                .ok_or_else(|| EvalError::new(alloc::format!("record has no field `{name}`")))?;
             set_path(&mut r.values[idx], rest, value)
         }
         (Step::Index(IndexKey::Name(name)), Value::Record(rec)) => {
@@ -2352,9 +2235,7 @@ fn set_path(data: &mut Value, steps: &[Step], value: Value) -> Result<()> {
                 .fields
                 .iter()
                 .position(|f| &f.name == name)
-                .ok_or_else(|| {
-                    EvalError::new(alloc::format!("record has no field `{name}`"))
-                })?;
+                .ok_or_else(|| EvalError::new(alloc::format!("record has no field `{name}`")))?;
             set_path(&mut r.values[idx], rest, value)
         }
         (Step::Index(IndexKey::Pos(i)), Value::List(items)) => {
@@ -2368,10 +2249,9 @@ fn set_path(data: &mut Value, steps: &[Step], value: Value) -> Result<()> {
             "cannot set field `{name}` on a {}",
             Val::Data(other.clone()).type_name()
         ))),
-        (Step::Index(_), other) => Err(EvalError::new(alloc::format!(
-            "cannot index into a {}",
-            Val::Data(other.clone()).type_name()
-        ))),
+        (Step::Index(_), other) => {
+            Err(EvalError::new(alloc::format!("cannot index into a {}", Val::Data(other.clone()).type_name())))
+        }
     }
 }
 
@@ -2390,24 +2270,19 @@ fn bounded_index(i: i64, len: usize) -> Result<usize> {
 /// than failing — §9e's "handle the absent case" reading of `?`.
 fn field_of(base: &Val, name: &str, lenient: bool) -> Result<Val> {
     match base {
-        Val::Data(Value::Record(r)) => {
-            match r.schema.fields.iter().position(|f| f.name == name) {
-                Some(i) => Ok(Val::Data(r.values.get(i).cloned().unwrap_or(Value::Null))),
-                None if lenient => Ok(Val::NULL),
-                None => Err(EvalError::new(alloc::format!(
-                    "record has no field `{name}` — it has [{}]",
-                    field_names(&r.schema)
-                ))),
-            }
-        }
+        Val::Data(Value::Record(r)) => match r.schema.fields.iter().position(|f| f.name == name) {
+            Some(i) => Ok(Val::Data(r.values.get(i).cloned().unwrap_or(Value::Null))),
+            None if lenient => Ok(Val::NULL),
+            None => Err(EvalError::new(alloc::format!(
+                "record has no field `{name}` — it has [{}]",
+                field_names(&r.schema)
+            ))),
+        },
         other if lenient => {
             let _ = other;
             Ok(Val::NULL)
         }
-        other => Err(EvalError::new(alloc::format!(
-            "cannot read field `{name}` from a {}",
-            other.type_name()
-        ))),
+        other => Err(EvalError::new(alloc::format!("cannot read field `{name}` from a {}", other.type_name()))),
     }
 }
 
@@ -2430,10 +2305,7 @@ fn index_of(base: &Val, key: &IndexKey) -> Result<Val> {
         }
         (Val::Data(Value::Table(t)), IndexKey::Pos(i)) => {
             let idx = bounded_index(*i, t.rows.len())?;
-            Ok(Val::Data(Value::Record(Arc::new(Record {
-                schema: t.schema.clone(),
-                values: t.rows[idx].clone(),
-            }))))
+            Ok(Val::Data(Value::Record(Arc::new(Record { schema: t.schema.clone(), values: t.rows[idx].clone() }))))
         }
         (Val::Data(Value::Record(_)), IndexKey::Name(n)) => field_of(base, n, false),
         (Val::Data(Value::Str(s)), IndexKey::Pos(i)) => {
@@ -2441,14 +2313,8 @@ fn index_of(base: &Val, key: &IndexKey) -> Result<Val> {
             let idx = bounded_index(*i, chars.len())?;
             Ok(Val::str(chars[idx].to_string()))
         }
-        (b, IndexKey::Pos(_)) => Err(EvalError::new(alloc::format!(
-            "cannot index a {} by position",
-            b.type_name()
-        ))),
-        (b, IndexKey::Name(_)) => Err(EvalError::new(alloc::format!(
-            "cannot index a {} by name",
-            b.type_name()
-        ))),
+        (b, IndexKey::Pos(_)) => Err(EvalError::new(alloc::format!("cannot index a {} by position", b.type_name()))),
+        (b, IndexKey::Name(_)) => Err(EvalError::new(alloc::format!("cannot index a {} by name", b.type_name()))),
     }
 }
 
@@ -2503,7 +2369,8 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
     let (name, nullable) = match t {
         TypeExpr::Named { name, nullable, .. } => (name.as_str(), *nullable),
         TypeExpr::Record { .. } => {
-            return Err(EvalError::of(PARSE_ERROR,
+            return Err(EvalError::of(
+                PARSE_ERROR,
                 "`parse` converts to a scalar type — checking a record *shape* is what \
                  `expect` is for (§6)",
             ));
@@ -2546,9 +2413,7 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
                     "cannot parse {s:?} as Int — it reads as a Float; `parse Float` it, or \
                      round it"
                 ))),
-                _ => Err(bad(alloc::format!(
-                    "cannot parse {s:?} as {name}"
-                ))),
+                _ => Err(bad(alloc::format!("cannot parse {s:?} as {name}"))),
             }
         }
         // No `1`/`yes`/`on`. That list is where every configuration language has gone
@@ -2556,9 +2421,7 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
         (Some(Value::Str(s)), "Bool") => match s.as_str() {
             "true" => Ok(Val::bool(true)),
             "false" => Ok(Val::bool(false)),
-            _ => Err(bad(alloc::format!(
-                "cannot parse {s:?} as Bool — only \"true\" and \"false\""
-            ))),
+            _ => Err(bad(alloc::format!("cannot parse {s:?} as Bool — only \"true\" and \"false\""))),
         },
         (Some(Value::Bytes(b)), "String") => match core::str::from_utf8(b) {
             Ok(s) => Ok(Val::str(s)),
@@ -2572,10 +2435,7 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
             // Widening is lossless up to 2^53 and silently lossy past it, which is a
             // fabricated number by any other name (§8a).
             if f as i64 != *i {
-                return Err(bad(alloc::format!(
-                    "cannot parse {} as Float without losing precision",
-                    render_i64(*i)
-                )));
+                return Err(bad(alloc::format!("cannot parse {} as Float without losing precision", render_i64(*i))));
             }
             Ok(Val::float(f))
         }
@@ -2584,9 +2444,7 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
             "cannot parse {got} as String — rendering a value as text is `format(\"{{}}\", …)` \
              (§8d)"
         ))),
-        _ => Err(bad(alloc::format!(
-            "cannot parse {got} as {name}"
-        ))),
+        _ => Err(bad(alloc::format!("cannot parse {got} as {name}"))),
     }
 }
 
@@ -2622,20 +2480,13 @@ fn bool_operand(v: &Val, op: &str) -> Result<bool> {
 
 fn unary(op: UnOp, v: Val) -> Result<Val> {
     match (op, &v) {
-        (UnOp::Neg, Val::Data(Value::Int(i))) => i
-            .checked_neg()
-            .map(Val::int)
-            .ok_or_else(|| EvalError::new("negation overflows an Int")),
+        (UnOp::Neg, Val::Data(Value::Int(i))) => {
+            i.checked_neg().map(Val::int).ok_or_else(|| EvalError::new("negation overflows an Int"))
+        }
         (UnOp::Neg, Val::Data(Value::Float(f))) => Ok(Val::float(-f)),
         (UnOp::Not, Val::Data(Value::Bool(b))) => Ok(Val::bool(!b)),
-        (UnOp::Neg, other) => Err(EvalError::new(alloc::format!(
-            "cannot negate a {}",
-            other.type_name()
-        ))),
-        (UnOp::Not, other) => Err(EvalError::new(alloc::format!(
-            "`!` needs a Bool, got {}",
-            other.type_name()
-        ))),
+        (UnOp::Neg, other) => Err(EvalError::new(alloc::format!("cannot negate a {}", other.type_name()))),
+        (UnOp::Not, other) => Err(EvalError::new(alloc::format!("`!` needs a Bool, got {}", other.type_name()))),
     }
 }
 
@@ -2699,8 +2550,7 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
         }
         // §10b: the gap `grep` left was a missing *operator*, not a missing program.
         Match => {
-            let (Some(Value::Str(text)), Some(Value::Str(pattern))) = (l.as_data(), r.as_data())
-            else {
+            let (Some(Value::Str(text)), Some(Value::Str(pattern))) = (l.as_data(), r.as_data()) else {
                 return Err(EvalError::new(alloc::format!(
                     "`~=` matches a String against a pattern, got {} and {}",
                     l.type_name(),
@@ -2738,10 +2588,7 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
                 "`+` does not join strings — use `++` (§8a), which is a separate operator \
                  so that arithmetic and concatenation never look alike",
             )),
-            _ => Err(EvalError::new(alloc::format!(
-                "cannot apply {} to two Strings",
-                op_name(op)
-            ))),
+            _ => Err(EvalError::new(alloc::format!("cannot apply {} to two Strings", op_name(op)))),
         };
     }
 
@@ -2792,10 +2639,7 @@ fn int_op(op: BinOp, x: i64, y: i64) -> Result<Val> {
         Le => Ok(Val::bool(x <= y)),
         Gt => Ok(Val::bool(x > y)),
         Ge => Ok(Val::bool(x >= y)),
-        _ => Err(EvalError::new(alloc::format!(
-            "cannot apply {} to two Ints",
-            op_name(op)
-        ))),
+        _ => Err(EvalError::new(alloc::format!("cannot apply {} to two Ints", op_name(op)))),
     }
 }
 
@@ -2824,10 +2668,7 @@ fn float_op(op: BinOp, x: f64, y: f64) -> Result<Val> {
         Le => Ok(Val::bool(x <= y)),
         Gt => Ok(Val::bool(x > y)),
         Ge => Ok(Val::bool(x >= y)),
-        _ => Err(EvalError::new(alloc::format!(
-            "cannot apply {} to two Floats",
-            op_name(op)
-        ))),
+        _ => Err(EvalError::new(alloc::format!("cannot apply {} to two Floats", op_name(op)))),
     }
 }
 
@@ -2836,8 +2677,7 @@ fn float_op(op: BinOp, x: f64, y: f64) -> Result<Val> {
 /// different — but they still render differently and still ascribe differently.
 fn values_equal(l: &Val, r: &Val) -> bool {
     match (l.as_data(), r.as_data()) {
-        (Some(Value::Int(a)), Some(Value::Float(b)))
-        | (Some(Value::Float(b)), Some(Value::Int(a))) => *a as f64 == *b,
+        (Some(Value::Int(a)), Some(Value::Float(b))) | (Some(Value::Float(b)), Some(Value::Int(a))) => *a as f64 == *b,
         _ => l == r,
     }
 }
@@ -2877,10 +2717,9 @@ fn check_type(v: &Val, t: &TypeExpr) -> Result<()> {
             }
             return match v {
                 Val::Data(Value::Record(_)) => Ok(()),
-                other => Err(EvalError::of(TYPE_ERROR, alloc::format!(
-                    "expected a record shape, got {}",
-                    other.type_name()
-                ))),
+                other => {
+                    Err(EvalError::of(TYPE_ERROR, alloc::format!("expected a record shape, got {}", other.type_name())))
+                }
             };
         }
     };
@@ -2891,10 +2730,13 @@ fn check_type(v: &Val, t: &TypeExpr) -> Result<()> {
         return if nullable {
             Ok(())
         } else {
-            Err(EvalError::of(TYPE_ERROR, alloc::format!(
-                "expected {name}, got Null — annotate `{name}?` if the value is genuinely \
+            Err(EvalError::of(
+                TYPE_ERROR,
+                alloc::format!(
+                    "expected {name}, got Null — annotate `{name}?` if the value is genuinely \
                  optional"
-            )))
+                ),
+            ))
         };
     }
     let actual = v.type_name();
@@ -2903,9 +2745,7 @@ fn check_type(v: &Val, t: &TypeExpr) -> Result<()> {
     if actual == name {
         return Ok(());
     }
-    Err(EvalError::of(TYPE_ERROR, alloc::format!(
-        "expected {name}, got {actual}"
-    )))
+    Err(EvalError::of(TYPE_ERROR, alloc::format!("expected {name}, got {actual}")))
 }
 
 #[cfg(test)]
@@ -3147,10 +2987,7 @@ mod tests {
     fn field_and_index_assignment_reach_into_collections() {
         assert_eq!(rendered("mut r = { a: 1 }\nr.a = 5\nr.a"), "5");
         assert_eq!(rendered("mut l = [1, 2, 3]\nl[0] = 9\nl"), "[9, 2, 3]");
-        assert_eq!(
-            rendered("mut r = { inner: { v: 1 } }\nr.inner.v = 7\nr.inner.v"),
-            "7"
-        );
+        assert_eq!(rendered("mut r = { inner: { v: 1 } }\nr.inner.v = 7\nr.inner.v"), "7");
     }
 
     /// The collections are persistent and `Arc`-shared, so a write through one binding
@@ -3158,10 +2995,7 @@ mod tests {
     #[test]
     fn assignment_does_not_leak_through_a_shared_copy() {
         assert_eq!(rendered("mut a = [1, 2]\nlet b = a\na[0] = 9\nb"), "[1, 2]");
-        assert_eq!(
-            rendered("mut a = { v: 1 }\nlet b = a\na.v = 9\nb.v"),
-            "1"
-        );
+        assert_eq!(rendered("mut a = { v: 1 }\nlet b = a\na.v = 9\nb.v"), "1");
     }
 
     #[test]
@@ -3200,10 +3034,7 @@ mod tests {
     fn later_parts_report_themselves_rather_than_misbehaving() {
         // With no host attached, a command says so rather than pretending to run.
         assert!(err("ls").contains("no host attached"));
-
-
     }
-
 
     // --- pipelines, against a mock host (Part C) ----------------------------
 
@@ -3231,10 +3062,7 @@ mod tests {
     fn run_with(
         host: MockHost,
         src: &str,
-    ) -> (
-        core::result::Result<Val, EvalError>,
-        alloc::rc::Rc<core::cell::RefCell<crate::host::MockLog>>,
-    ) {
+    ) -> (core::result::Result<Val, EvalError>, alloc::rc::Rc<core::cell::RefCell<crate::host::MockLog>>) {
         let log = host.log();
         let script = crate::parse_script(src).expect("parses");
         let mut interp = Interp::with_host(Box::new(host), Mode::Script);
@@ -3258,9 +3086,11 @@ mod tests {
         let mut host = MockHost::new().with_program("list", Some(stream("n", &[1]))).with_clock(2_000_000_000);
         let io = {
             use libstream::wire::{StreamFlags, Table, TypeTag};
-            let schema = Schema::new()
-                .field("name", TypeTag::String, TypeModifiers::NONE)
-                .field("reads", TypeTag::Int, TypeModifiers::NONE);
+            let schema = Schema::new().field("name", TypeTag::String, TypeModifiers::NONE).field(
+                "reads",
+                TypeTag::Int,
+                TypeModifiers::NONE,
+            );
             let rows = alloc::vec![alloc::vec![Value::Str("blk-0".into()), Value::Int(5)]];
             let mut buf = alloc::vec::Vec::new();
             Table { flags: StreamFlags::NONE, schema, rows }.encode(&mut buf).expect("encodes");
@@ -3371,9 +3201,7 @@ mod tests {
     /// backpressure; running them one at a time would serialise what should stream.
     #[test]
     fn consecutive_external_stages_are_handed_over_as_one_chain() {
-        let host = MockHost::new()
-            .with_program("list", None)
-            .with_program("xform", Some(stream("n", &[7])));
+        let host = MockHost::new().with_program("list", None).with_program("xform", Some(stream("n", &[7])));
         let (r, log) = run_with(host, "list | xform | xform");
         r.expect("runs");
         assert_eq!(log.borrow().runs.len(), 1, "one chain, not three");
@@ -3385,10 +3213,7 @@ mod tests {
         let host = MockHost::new().with_program("list", None);
         let (r, log) = run_with(host, "list --long -rf /system");
         r.expect("runs");
-        assert_eq!(
-            log.borrow().runs[0][0].argv,
-            alloc::vec!["list", "--long", "-rf", "/system"]
-        );
+        assert_eq!(log.borrow().runs[0][0].argv, alloc::vec!["list", "--long", "-rf", "/system"]);
     }
 
     /// §1: fail loud, don't fail silent — a non-zero stage anywhere fails the pipeline.
@@ -3427,10 +3252,7 @@ mod tests {
     #[test]
     fn a_script_can_read_which_stage_failed() {
         let host = MockHost::new().with_failing("nope", 3);
-        let (r, _log) = run_with(
-            host,
-            "try { nope } catch (e) { e.stages | filter exit_status != 0 | count }",
-        );
+        let (r, _log) = run_with(host, "try { nope } catch (e) { e.stages | filter exit_status != 0 | count }");
         assert_eq!(r.expect("caught").render(), "1");
     }
 
@@ -3449,32 +3271,22 @@ mod tests {
     /// to preserve.
     #[test]
     fn strict_cancels_the_remaining_stages() {
-        let host = MockHost::new()
-            .with_failing("bad", 1)
-            .with_program("after", None);
+        let host = MockHost::new().with_failing("bad", 1).with_program("after", None);
         let (r, _log) = run_with(host, "bad | after");
         // Without `strict`, `after` still ran.
         assert!(r.is_err());
 
-        let host = MockHost::new()
-            .with_failing("bad", 1)
-            .with_program("after", None);
+        let host = MockHost::new().with_failing("bad", 1).with_program("after", None);
         let (r, _log) = run_with(host, "strict {\n bad | after\n}");
         let e = r.expect_err("should fail");
-        assert!(
-            e.message.contains("exited 1") || e.message.contains("cancelled"),
-            "{}",
-            e.message
-        );
+        assert!(e.message.contains("exited 1") || e.message.contains("cancelled"), "{}", e.message);
     }
 
     /// The value flowing between two external runs is re-encoded as a stream. Here the
     /// first stage's table is handed to the second run's `stdin`.
     #[test]
     fn a_value_piped_into_a_program_is_encoded_as_a_stream() {
-        let host = MockHost::new()
-            .with_program("src", Some(stream("n", &[1, 2])))
-            .with_program("sink", None);
+        let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2]))).with_program("sink", None);
         // Two separate runs would need an in-process stage between them, which is Part D;
         // this checks the single-chain case still threads input correctly when there is
         // none.
@@ -3511,16 +3323,10 @@ mod tests {
         // place the rule applies. A first attempt used `list /system` — a call with
         // arguments, which never reaches the branch at all, so deleting the rule left the
         // test passing. A control caught it.
-        let host = MockHost::new()
-            .with_program("src", Some(stream("n", &[1])))
-            .with_program("sink", None);
+        let host = MockHost::new().with_program("src", Some(stream("n", &[1]))).with_program("sink", None);
         let (r, log) = run_with(host, "let sink = 5\nsrc | sink");
         r.expect("runs");
-        assert_eq!(
-            log.borrow().runs[0].len(),
-            2,
-            "the second stage ran as a command, not as the binding"
-        );
+        assert_eq!(log.borrow().runs[0].len(), 2, "the second stage ran as a command, not as the binding");
     }
 
     /// …and at the *head* the precedence is the other way round: a bare name that is
@@ -3548,11 +3354,8 @@ mod tests {
             let (r, log) = run_with(host, source);
             r.unwrap_or_else(|e| panic!("{source}: {}", e.message));
             let inputs = log.borrow().inputs.clone();
-            let bytes = inputs
-                .first()
-                .cloned()
-                .flatten()
-                .unwrap_or_else(|| panic!("{source}: the stage got no stream"));
+            let bytes =
+                inputs.first().cloned().flatten().unwrap_or_else(|| panic!("{source}: the stage got no stream"));
             let t = libstream::wire::Table::decode(&bytes).expect("a TSM1 stream");
             assert!(
                 t.flags.contains(libstream::StreamFlags::TEXT_FALLBACK),
@@ -3572,7 +3375,6 @@ mod tests {
         let e = r.expect_err("a mixed list is not text");
         assert!(e.message.contains("only a Table or text can be piped"), "{}", e.message);
     }
-
 
     // --- generic value operators, end to end (Part D) -----------------------
 
@@ -3651,8 +3453,13 @@ src | filter { |row| row.n > threshold } | count",
     /// so the message says which kind of thing went wrong.
     #[test]
     fn expect_and_assert_are_different_checks() {
-        assert_eq!(rendered("let x: Int = 5
-x"), "5");
+        assert_eq!(
+            rendered(
+                "let x: Int = 5
+x"
+            ),
+            "5"
+        );
         assert!(err("assert (1 == 2)").contains("assertion failed"));
         assert!(err("assert (5)").contains("needs a Bool"));
     }
@@ -3674,24 +3481,25 @@ x"), "5");
     /// §4: several paths concatenate into one stream — which is what absorbed `cat`.
     #[test]
     fn open_concatenates_several_paths() {
-        let host = MockHost::new()
-            .with_file("/tmp/a.txt", "one\n")
-            .with_file("/tmp/b.txt", "two\nthree\n");
+        let host = MockHost::new().with_file("/tmp/a.txt", "one\n").with_file("/tmp/b.txt", "two\nthree\n");
         let (r, _log) = run_env(host, env_with(&[("PWD", "/tmp")]), "open ./a.txt ./b.txt | count");
         assert_eq!(r.expect("opens").render(), "3");
     }
-
 
     // --- functions (Part E, §5b) --------------------------------------------
 
     #[test]
     fn a_def_is_callable_with_positional_and_named_arguments() {
         assert_eq!(
-            rendered("def greet(name: String, loud: Bool = false) -> String {\n                       if loud { name ++ \"!\" } else { name ++ \".\" }\n}\ngreet(\"a\")"),
+            rendered(
+                "def greet(name: String, loud: Bool = false) -> String {\n                       if loud { name ++ \"!\" } else { name ++ \".\" }\n}\ngreet(\"a\")"
+            ),
             "a."
         );
         assert_eq!(
-            rendered("def greet(name: String, loud: Bool = false) -> String {\n                       if loud { name ++ \"!\" } else { name ++ \".\" }\n}\n                      greet(\"a\", loud: true)"),
+            rendered(
+                "def greet(name: String, loud: Bool = false) -> String {\n                       if loud { name ++ \"!\" } else { name ++ \".\" }\n}\n                      greet(\"a\", loud: true)"
+            ),
             "a!"
         );
     }
@@ -3715,10 +3523,7 @@ x"), "5");
 
     #[test]
     fn variadic_parameters_collect_the_rest() {
-        assert_eq!(
-            rendered("def n(...rest: List<Int>) -> Int { rest | count }\nn(1, 2, 3)"),
-            "3"
-        );
+        assert_eq!(rendered("def n(...rest: List<Int>) -> Int { rest | count }\nn(1, 2, 3)"), "3");
     }
 
     /// §5a: `def` bindings hoist, so two functions can call each other regardless of
@@ -3770,10 +3575,7 @@ x"), "5");
         assert_eq!(rendered("match 1 { 1 | 2 => \"low\"\n _ => \"high\" }"), "low");
         assert_eq!(rendered("match 7 { Int => \"an int\"\n _ => \"other\" }"), "an int");
         assert_eq!(rendered("match 7 { n => n + 1 }"), "8");
-        assert_eq!(
-            rendered("match { name: \"a\", size: 2 } { { name } => name\n _ => \"?\" }"),
-            "a"
-        );
+        assert_eq!(rendered("match { name: \"a\", size: 2 } { { name } => name\n _ => \"?\" }"), "a");
     }
 
     /// A guard runs with the arm's bindings in scope — the point of
@@ -3816,21 +3618,17 @@ x"), "5");
 
         // §9h: `pub` is what crosses the file boundary — the same recurring rule as env
         // vars crossing a process boundary or data crossing IPC.
-        let host = MockHost::new()
-            .with_file("./lib.nx", "def hidden() -> Int { 0 }\n");
+        let host = MockHost::new().with_file("./lib.nx", "def hidden() -> Int { 0 }\n");
         let (r, _l) = run_with(host, "use \"./lib.nx\" { hidden }\nhidden()");
         assert!(r.expect_err("not exported").message.contains("pub"));
     }
 
     #[test]
     fn use_as_binds_a_qualified_name() {
-        let host = MockHost::new()
-            .with_file("./lib.nx", "pub def helper(x: Int) -> Int { x * 2 }\n");
+        let host = MockHost::new().with_file("./lib.nx", "pub def helper(x: Int) -> Int { x * 2 }\n");
         let (r, _l) = run_with(host, "use \"./lib.nx\" as utils\nutils.helper(4)");
         assert_eq!(r.expect("imports").render(), "8");
     }
-
-
 
     // --- `~=` (Part G, §10b) ------------------------------------------------
 
@@ -3870,7 +3668,6 @@ x"), "5");
         assert!(err("\"x\" ~= /a{2}/").contains("counted repetition"));
     }
 
-
     // --- environment and `cd` (Milestone 3.5 Part C) ------------------------
 
     fn env_with(pairs: &[(&str, &str)]) -> libstream::wire::Record {
@@ -3904,11 +3701,7 @@ x"), "5");
     /// A host with a `/bin`, a `PWD` and something under it, for completion.
     fn completing_host() -> MockHost {
         let mut h = MockHost::new();
-        h.commands = alloc::vec![
-            String::from("list"),
-            String::from("copy"),
-            String::from("whoami"),
-        ];
+        h.commands = alloc::vec![String::from("list"), String::from("copy"), String::from("whoami"),];
         h.entries = alloc::vec![
             (
                 String::from("/home"),
@@ -3919,10 +3712,7 @@ x"), "5");
                 ],
             ),
             (String::from("/bin"), alloc::vec![(String::from("list"), false)]),
-            (
-                String::from("/"),
-                alloc::vec![(String::from("bin"), true), (String::from("home"), true)],
-            ),
+            (String::from("/"), alloc::vec![(String::from("bin"), true), (String::from("home"), true)],),
         ];
         h
     }
@@ -3978,10 +3768,7 @@ x"), "5");
         );
         // Absolute: the directory part comes back on every candidate, so replacing the
         // whole word with one is right.
-        assert_eq!(
-            i.complete("list /home/n").candidates,
-            alloc::vec![String::from("/home/notes.txt")],
-        );
+        assert_eq!(i.complete("list /home/n").candidates, alloc::vec![String::from("/home/notes.txt")],);
         // A directory the mock does not know is not an error, it is nothing to offer.
         assert!(i.complete("list /nowhere/x").candidates.is_empty());
     }
@@ -3998,15 +3785,9 @@ x"), "5");
         assert_eq!(i.complete("cd ..").candidates, alloc::vec![String::from("../")]);
         // …and the slash is what makes the next Tab a listing of the parent, which from
         // `/home` is the root.
-        assert_eq!(
-            i.complete("cd ../").candidates,
-            alloc::vec![String::from("../bin/"), String::from("../home/")],
-        );
+        assert_eq!(i.complete("cd ../").candidates, alloc::vec![String::from("../bin/"), String::from("../home/")],);
         // A dot alone is the start of both, and `.` is a real place to name.
-        assert_eq!(
-            i.complete("cd .").candidates,
-            alloc::vec![String::from("../"), String::from("./")],
-        );
+        assert_eq!(i.complete("cd .").candidates, alloc::vec![String::from("../"), String::from("./")],);
         // Through a `..` to something under it.
         assert_eq!(i.complete("cd ../ho").candidates, alloc::vec![String::from("../home/")]);
     }
@@ -4021,10 +3802,7 @@ x"), "5");
         let mut h = completing_host();
         h.entries.push((
             String::from("/home/notes"),
-            alloc::vec![
-                (String::from("caf\u{e9}.txt"), false),
-                (String::from("caf\u{e8}.txt"), false),
-            ],
+            alloc::vec![(String::from("caf\u{e9}.txt"), false), (String::from("caf\u{e8}.txt"), false),],
         ));
         let mut i = Interp::with_host(Box::new(h), Mode::Repl);
         i.set_env(env_with(&[("PWD", "/home")]));
@@ -4134,13 +3912,9 @@ x"), "5");
     /// function object or a name.
     #[test]
     fn a_call_in_an_argument_list_is_evaluated() {
-        let out = repl(&[
-            "def my_age() { 41 }",
-            "def age_plus_n(a, n) { a + n }",
-            "let x = age_plus_n(my_age(), 3)",
-            "x",
-        ])
-        .expect("the report's own script should run");
+        let out =
+            repl(&["def my_age() { 41 }", "def age_plus_n(a, n) { a + n }", "let x = age_plus_n(my_age(), 3)", "x"])
+                .expect("the report's own script should run");
         assert_eq!(out.as_deref(), Some("44"));
 
         // Nested into an operator, and two deep, so the argument is not merely passed
@@ -4171,8 +3945,7 @@ x"), "5");
             .run_line(r#"for i in 1..4 { copy /src (format("/dst-{}.png", i)) }"#)
             .expect("a loop with a computed destination should run");
         let runs = log.borrow().runs.clone();
-        let argv: alloc::vec::Vec<alloc::vec::Vec<String>> =
-            runs.iter().map(|r| r[0].argv.clone()).collect();
+        let argv: alloc::vec::Vec<alloc::vec::Vec<String>> = runs.iter().map(|r| r[0].argv.clone()).collect();
         assert_eq!(argv.len(), 3, "one spawn per iteration");
         assert_eq!(argv[0], ["copy", "/src", "/dst-1.png"]);
         assert_eq!(argv[2], ["copy", "/src", "/dst-3.png"]);
@@ -4266,10 +4039,7 @@ x"), "5");
         host: MockHost,
         env: libstream::wire::Record,
         src: &str,
-    ) -> (
-        core::result::Result<Val, EvalError>,
-        alloc::rc::Rc<core::cell::RefCell<crate::host::MockLog>>,
-    ) {
+    ) -> (core::result::Result<Val, EvalError>, alloc::rc::Rc<core::cell::RefCell<crate::host::MockLog>>) {
         let log = host.log();
         let script = crate::parse_script(src).expect("parses");
         let mut interp = Interp::with_host(Box::new(host), Mode::Script);
@@ -4330,11 +4100,7 @@ x"), "5");
     #[test]
     fn bare_cd_goes_home_or_explains() {
         let host = MockHost::new().with_dir("/home/alice");
-        let (r, _l) = run_env(
-            host,
-            env_with(&[("PWD", "/"), ("HOME", "/home/alice")]),
-            "cd\n$env.PWD",
-        );
+        let (r, _l) = run_env(host, env_with(&[("PWD", "/"), ("HOME", "/home/alice")]), "cd\n$env.PWD");
         assert_eq!(r.expect("cd home").render(), "/home/alice");
 
         let (r, _l) = run_env(MockHost::new(), env_with(&[("PWD", "/")]), "cd");
@@ -4346,11 +4112,7 @@ x"), "5");
     #[test]
     fn the_shell_resolves_its_own_relative_paths() {
         let host = MockHost::new().with_file("/home/alice/notes.txt", "one\ntwo\n");
-        let (r, _l) = run_env(
-            host,
-            env_with(&[("PWD", "/home/alice")]),
-            "open ./notes.txt | count",
-        );
+        let (r, _l) = run_env(host, env_with(&[("PWD", "/home/alice")]), "open ./notes.txt | count");
         assert_eq!(r.expect("opens").render(), "2");
     }
 
@@ -4385,15 +4147,9 @@ x"), "5");
     #[test]
     fn break_and_continue_do_what_they_say() {
         // `break`: 0 + 1 + 2, then out.
-        assert_eq!(
-            rendered("mut t = 0\nfor x in 0..10 {\n if x == 3 { break }\n t = t + x\n}\nt"),
-            "3"
-        );
+        assert_eq!(rendered("mut t = 0\nfor x in 0..10 {\n if x == 3 { break }\n t = t + x\n}\nt"), "3");
         // `continue`: the odd values only.
-        assert_eq!(
-            rendered("mut t = 0\nfor x in 0..5 {\n if x % 2 == 0 { continue }\n t = t + x\n}\nt"),
-            "4"
-        );
+        assert_eq!(rendered("mut t = 0\nfor x in 0..5 {\n if x % 2 == 0 { continue }\n t = t + x\n}\nt"), "4");
         // …and in a `while`, where `break` is the only way out of `true`.
         assert_eq!(rendered("mut i = 0\nwhile true {\n i = i + 1\n if i == 3 { break }\n}\ni"), "3");
     }
@@ -4402,10 +4158,7 @@ x"), "5");
     /// which is the behaviour a reader assumes and therefore the one worth pinning.
     #[test]
     fn break_leaves_only_the_innermost_loop() {
-        assert_eq!(
-            rendered("mut n = 0\nfor x in 0..3 {\n for y in 0..3 { break }\n n = n + 1\n}\nn"),
-            "3"
-        );
+        assert_eq!(rendered("mut n = 0\nfor x in 0..3 {\n for y in 0..3 { break }\n n = n + 1\n}\nn"), "3");
     }
 
     /// The regression that matters for the `Flow` change: `return` still travels *past* a
@@ -4413,7 +4166,9 @@ x"), "5");
     #[test]
     fn return_still_escapes_a_loop_and_its_function() {
         assert_eq!(
-            rendered("def first_odd(xs) {\n for x in xs {\n if x % 2 == 1 { return x }\n }\n -1\n}\nfirst_odd([2, 4, 5, 6])"),
+            rendered(
+                "def first_odd(xs) {\n for x in xs {\n if x % 2 == 1 { return x }\n }\n -1\n}\nfirst_odd([2, 4, 5, 6])"
+            ),
             "5"
         );
         // …and a loop that never returns still falls through to the last expression.
@@ -4451,9 +4206,7 @@ x"), "5");
         assert!(e.message.contains("iteration limit"), "{}", e.message);
 
         // The sibling guard, on materialising a range.
-        let e = i
-            .run(&crate::parse::parse_script("for x in 0..100000 { }").unwrap())
-            .expect_err("an absurd range");
+        let e = i.run(&crate::parse::parse_script("for x in 0..100000 { }").unwrap()).expect_err("an absurd range");
         assert!(e.message.contains("too large to iterate"), "{}", e.message);
     }
 
@@ -4578,13 +4331,12 @@ x"), "5");
     /// whose message is permanently "assertion failed".
     #[test]
     fn fail_raises_a_catchable_error_with_a_message() {
-        assert_eq!(
-            rendered("try { fail \"bad path\" } catch (e) { e.message }"),
-            "bad path"
-        );
+        assert_eq!(rendered("try { fail \"bad path\" } catch (e) { e.message }"), "bad path");
         // …and it travels out of a `def`, which is the case that matters.
         assert_eq!(
-            rendered("def check(n) {\n if n < 0 { fail \"negative\" }\n n\n}\ntry { check(-1) } catch (e) { e.message }"),
+            rendered(
+                "def check(n) {\n if n < 0 { fail \"negative\" }\n n\n}\ntry { check(-1) } catch (e) { e.message }"
+            ),
             "negative"
         );
     }
@@ -4598,7 +4350,10 @@ x"), "5");
             rendered("try { fail { kind: \"NotFound\", message: \"no such user\" } } catch (e) { e.kind }"),
             "NotFound"
         );
-        assert!(err("fail { code: 2 }").contains("must \\\n                                 carry") || err("fail { code: 2 }").contains("message"));
+        assert!(
+            err("fail { code: 2 }").contains("must \\\n                                 carry")
+                || err("fail { code: 2 }").contains("message")
+        );
         assert!(err("fail 42").contains("String message or a Record"));
     }
 
@@ -4637,9 +4392,7 @@ x"), "5");
         assert_eq!(e.exit, Some(0));
         // …and it leaves a `def` too, rather than stopping at the boundary.
         let mut i = Interp::new();
-        let e = i
-            .run(&crate::parse::parse_script("def quit() { exit 7 }\nquit()").unwrap())
-            .expect_err("exit");
+        let e = i.run(&crate::parse::parse_script("def quit() { exit 7 }\nquit()").unwrap()).expect_err("exit");
         assert_eq!(e.exit, Some(7));
     }
 
@@ -4675,15 +4428,9 @@ x"), "5");
             "0"
         );
         // `return` from a try body leaves the function.
-        assert_eq!(
-            rendered("def f() {\n try { return 5 } catch { 0 }\n 9\n}\nf()"),
-            "5"
-        );
+        assert_eq!(rendered("def f() {\n try { return 5 } catch { 0 }\n 9\n}\nf()"), "5");
         // `break` from a catch leaves the loop.
-        assert_eq!(
-            rendered("mut n = 0\nfor x in 0..4 {\n n = n + 1\n try { fail \"x\" } catch { break }\n}\nn"),
-            "1"
-        );
+        assert_eq!(rendered("mut n = 0\nfor x in 0..4 {\n n = n + 1\n try { fail \"x\" } catch { break }\n}\nn"), "1");
     }
 
     /// …and in *value* position it is refused rather than silently dropped, which is the
@@ -4777,10 +4524,7 @@ x"), "5");
         assert_eq!(rendered("[] | reduce --from 10 { |a, b| a + b }"), "10");
         assert!(err("[] | reduce { |a, b| a + b }").contains("has no value"));
         // …and it is not numeric-only: folding text is the same operation.
-        assert_eq!(
-            rendered("[\"a\", \"b\", \"c\"] | reduce { |a, b| a ++ \"-\" ++ b }"),
-            "a-b-c"
-        );
+        assert_eq!(rendered("[\"a\", \"b\", \"c\"] | reduce { |a, b| a ++ \"-\" ++ b }"), "a-b-c");
     }
 
     /// `sort` uses **every** key it is given: the second is a tie-break within the first.
@@ -4788,18 +4532,12 @@ x"), "5");
     #[test]
     fn sort_uses_every_key_it_is_given() {
         let src = "[{ d: 2, n: \"b\" }, { d: 1, n: \"z\" }, { d: 2, n: \"a\" }]";
-        assert_eq!(
-            rendered(&alloc::format!("{src} | sort d n | map {{ |r| r.n }}")),
-            "[\"z\", \"a\", \"b\"]"
-        );
+        assert_eq!(rendered(&alloc::format!("{src} | sort d n | map {{ |r| r.n }}")), "[\"z\", \"a\", \"b\"]");
         // **The pair is what makes this test mean anything.** With only the first key the
         // sort is stable, so the two `d: 2` rows keep their input order — a different
         // answer, and exactly the one the multi-key case would give if the second key were
         // being silently dropped.
-        assert_eq!(
-            rendered(&alloc::format!("{src} | sort d | map {{ |r| r.n }}")),
-            "[\"z\", \"b\", \"a\"]"
-        );
+        assert_eq!(rendered(&alloc::format!("{src} | sort d | map {{ |r| r.n }}")), "[\"z\", \"b\", \"a\"]");
     }
 
     /// `format` in stage position formats the value flowing past it. It used to ignore the
@@ -4852,10 +4590,7 @@ x"), "5");
         assert_eq!(rendered("{ a: 1, b: 2 } | values"), "[1, 2]");
         // The right operand wins a conflict; the result schema is the union, and a merge
         // does not reorder what it did not change.
-        assert_eq!(
-            rendered("{ a: 1, b: 2 } | merge { b: 9, c: 3 }"),
-            "{ a: 1, b: 9, c: 3 }"
-        );
+        assert_eq!(rendered("{ a: 1, b: 2 } | merge { b: 9, c: 3 }"), "{ a: 1, b: 9, c: 3 }");
         // …and `keys` is what makes a record walkable at all, since `for` deliberately
         // does not iterate one (§10b).
         assert_eq!(rendered("{ a: 1, b: 2 } | keys | join \"+\""), "a+b");
@@ -4904,20 +4639,14 @@ x"), "5");
 
         // **The pair that matters**: both `in`s in one script. `for` consumes its own
         // before any expression is parsed, which is true until someone reorders the parser.
-        assert_eq!(
-            rendered("mut hits = 0\nfor x in [1, 2, 3] {\n if x in [2, 3] { hits = hits + 1 }\n}\nhits"),
-            "2"
-        );
+        assert_eq!(rendered("mut hits = 0\nfor x in [1, 2, 3] {\n if x in [2, 3] { hits = hits + 1 }\n}\nhits"), "2");
     }
 
     /// It composes with the reductions, which is the point of having both: a question about
     /// a stream reads as one line rather than a loop.
     #[test]
     fn membership_composes_with_the_rest() {
-        assert_eq!(
-            rendered("[{ n: \"a\" }, { n: \"b\" }] | filter { |r| r.n in [\"b\"] } | count"),
-            "1"
-        );
+        assert_eq!(rendered("[{ n: \"a\" }, { n: \"b\" }] | filter { |r| r.n in [\"b\"] } | count"), "1");
     }
 
     // --- `capture` (§10b, Part F) -------------------------------------------
@@ -4927,10 +4656,7 @@ x"), "5");
     #[test]
     fn capture_returns_the_match_and_its_groups() {
         assert_eq!(rendered("\"a12b\" | capture /(\\d+)/"), "[\"12\", \"12\"]");
-        assert_eq!(
-            rendered("\"12-345\" | capture /(\\d+)-(\\d+)/"),
-            "[\"12-345\", \"12\", \"345\"]"
-        );
+        assert_eq!(rendered("\"12-345\" | capture /(\\d+)-(\\d+)/"), "[\"12-345\", \"12\", \"345\"]");
         // Element 0 is always the whole match, even with no groups at all.
         assert_eq!(rendered("\"abc\" | capture /b./"), "[\"bc\"]");
     }
@@ -4942,10 +4668,7 @@ x"), "5");
         assert_eq!(rendered("\"abc\" | capture /(\\d+)/"), "null");
         assert_eq!(rendered("(\"abc\" | capture /(\\d+)/) ?? [\"none\"]"), "[\"none\"]");
         // The shape §10b writes: capture, then read a group, then convert it.
-        assert_eq!(
-            rendered("let g = \"port 8080\" | capture /(\\d+)/\ng[1] | parse Int"),
-            "8080"
-        );
+        assert_eq!(rendered("let g = \"port 8080\" | capture /(\\d+)/\ng[1] | parse Int"), "8080");
     }
 
     /// A group that did not participate is `null`. "Did not match" is not "matched
@@ -4997,8 +4720,7 @@ x"), "5");
     /// script responds to things that happen to it.
     #[test]
     fn an_interrupt_is_catchable_unlike_exit() {
-        let mut i =
-            Interp::with_host(Box::new(MockHost::new().with_interrupt_after(4)), Mode::Script);
+        let mut i = Interp::with_host(Box::new(MockHost::new().with_interrupt_after(4)), Mode::Script);
         let v = i
             .run(&crate::parse::parse_script("try { while true { } } catch (e) { e.kind }").unwrap())
             .expect("the catch runs");
@@ -5009,8 +4731,7 @@ x"), "5");
     /// checkpoint is a question, not a poll that can fire late.
     #[test]
     fn an_evaluation_that_finishes_first_is_untouched() {
-        let mut i =
-            Interp::with_host(Box::new(MockHost::new().with_interrupt_after(1000)), Mode::Script);
+        let mut i = Interp::with_host(Box::new(MockHost::new().with_interrupt_after(1000)), Mode::Script);
         let v = i.run(&crate::parse::parse_script("1 + 1").unwrap()).expect("no interrupt");
         assert_eq!(v.render(), "2");
     }

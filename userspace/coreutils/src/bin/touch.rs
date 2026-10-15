@@ -154,9 +154,11 @@ fn as_string(path: &[u8]) -> String {
 
 /// Write the rows as a TSM1 table on the `stdout` stream.
 fn emit(stage: &Stage, stdout: u64, done: &[Touched]) {
-    let schema = Schema::new()
-        .field("path", TypeTag::String, TypeModifiers::NONE)
-        .field("created", TypeTag::Bool, TypeModifiers::NONE);
+    let schema = Schema::new().field("path", TypeTag::String, TypeModifiers::NONE).field(
+        "created",
+        TypeTag::Bool,
+        TypeModifiers::NONE,
+    );
 
     let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {

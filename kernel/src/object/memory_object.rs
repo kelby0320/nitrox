@@ -21,7 +21,7 @@ use core::ptr;
 
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec};
-use crate::mm::{PAGE_SHIFT, PAGE_SIZE, PhysAddr, heap, Caching};
+use crate::mm::{Caching, PAGE_SHIFT, PAGE_SIZE, PhysAddr, heap};
 use crate::object::header::KObjectHeader;
 
 /// Whether a [`MemoryObject`]'s frames belong to it.
@@ -156,20 +156,14 @@ impl MemoryObject {
     /// address space for the lifetime of every handle derived from this object, and
     /// must not overlap any frame the buddy allocator manages. Passing ordinary RAM
     /// here would create an object that aliases allocatable memory and never frees it.
-    pub unsafe fn try_new_borrowed(
-        base: PhysAddr,
-        size: usize,
-        caching: Caching,
-    ) -> Result<KBox<Self>, AllocError> {
+    pub unsafe fn try_new_borrowed(base: PhysAddr, size: usize, caching: Caching) -> Result<KBox<Self>, AllocError> {
         let size = (size.max(1) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let npages = size >> PAGE_SHIFT;
 
         let mut frames: KVec<PhysAddr> = KVec::new();
         frames.try_reserve(npages)?;
         for i in 0..npages {
-            frames
-                .try_push(PhysAddr::new(base.as_u64() + (i << PAGE_SHIFT) as u64))
-                .expect("within reserved capacity");
+            frames.try_push(PhysAddr::new(base.as_u64() + (i << PAGE_SHIFT) as u64)).expect("within reserved capacity");
         }
 
         KBox::try_new(Self {
@@ -210,11 +204,7 @@ impl MemoryObject {
             // SAFETY: `f` is a live, HHDM-reachable frame owned by `obj`, not
             // aliased; we copy `n ≤ PAGE_SIZE` bytes into it from a valid source.
             unsafe {
-                ptr::copy_nonoverlapping(
-                    bytes.as_ptr().add(copied),
-                    (f.as_u64() + heap::hhdm_offset()) as *mut u8,
-                    n,
-                );
+                ptr::copy_nonoverlapping(bytes.as_ptr().add(copied), (f.as_u64() + heap::hhdm_offset()) as *mut u8, n);
             }
             copied += n;
         }
@@ -274,9 +264,7 @@ impl MemoryObject {
             let n = core::cmp::min(PAGE_SIZE, remaining);
             // SAFETY: `f` is a live, HHDM-reachable frame owned by `self`, not aliased;
             // reading `n <= PAGE_SIZE` bytes from its HHDM mapping is sound.
-            let page = unsafe {
-                core::slice::from_raw_parts((f.as_u64() + heap::hhdm_offset()) as *const u8, n)
-            };
+            let page = unsafe { core::slice::from_raw_parts((f.as_u64() + heap::hhdm_offset()) as *const u8, n) };
             buf.try_extend_from_slice(page)?;
             remaining -= n;
         }
@@ -374,12 +362,7 @@ mod tests {
         // SAFETY: test-only. Nothing maps or dereferences these frames; the object
         // only records their addresses, and Borrowed drop must not touch them.
         let m = unsafe {
-            MemoryObject::try_new_borrowed(
-                PhysAddr::new(APERTURE),
-                PAGES * PAGE_SIZE,
-                Caching::WriteCombining,
-            )
-            .unwrap()
+            MemoryObject::try_new_borrowed(PhysAddr::new(APERTURE), PAGES * PAGE_SIZE, Caching::WriteCombining).unwrap()
         };
         drop(m);
 
@@ -479,8 +462,7 @@ mod tests {
         const APERTURE: u64 = 0xF000_0000;
         // SAFETY: a made-up physical range no test maps or frees; nothing reads through it.
         let device = unsafe {
-            MemoryObject::try_new_borrowed(PhysAddr::new(APERTURE), PAGE_SIZE, Caching::WriteCombining)
-                .unwrap()
+            MemoryObject::try_new_borrowed(PhysAddr::new(APERTURE), PAGE_SIZE, Caching::WriteCombining).unwrap()
         };
         assert_eq!(device.caching(), Caching::WriteCombining);
         assert_eq!(MemoryObject::try_new(PAGE_SIZE).unwrap().caching(), Caching::Normal);

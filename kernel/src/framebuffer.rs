@@ -40,8 +40,7 @@ pub struct FramebufferAperture {
 /// The captured aperture, or `None` if no usable framebuffer was reported.
 /// `Leaf` rank: taken while holding nothing, and nothing is taken while it is held —
 /// the read path copies the facts out and releases immediately.
-static APERTURE: IrqSpinLock<Option<FramebufferAperture>> =
-    IrqSpinLock::new(LockRank::Leaf, None);
+static APERTURE: IrqSpinLock<Option<FramebufferAperture>> = IrqSpinLock::new(LockRank::Leaf, None);
 
 /// Record Limine's framebuffer as a userspace-mappable aperture.
 ///
@@ -77,11 +76,7 @@ pub unsafe fn record_aperture(fb: &Framebuffer, hhdm_offset: u64, caching: Cachi
         blue_shift: fb.blue_mask_shift,
         blue_size: fb.blue_mask_size,
     };
-    *APERTURE.lock() = Some(FramebufferAperture {
-        phys_base: PhysAddr::new(virt - hhdm_offset),
-        info,
-        caching,
-    });
+    *APERTURE.lock() = Some(FramebufferAperture { phys_base: PhysAddr::new(virt - hhdm_offset), info, caching });
     true
 }
 

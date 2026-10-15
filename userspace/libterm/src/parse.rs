@@ -583,10 +583,7 @@ impl Parser {
             // `CUP`, and `HVP` (`f`) which is the same operation under a different name.
             // **One-based on the wire, zero-based here**: the conversion belongs at the
             // boundary, so nothing below this line has to remember which convention it is in.
-            b'H' | b'f' => one(
-                Op::MoveTo { row: self.count_at(0) - 1, col: self.count_at(1) - 1 },
-                out,
-            ),
+            b'H' | b'f' => one(Op::MoveTo { row: self.count_at(0) - 1, col: self.count_at(1) - 1 }, out),
             b'J' => one(Op::EraseInDisplay(self.erase_at(0)), out),
             b'K' => one(Op::EraseInLine(self.erase_at(0)), out),
             b'm' => self.sgr(out),
@@ -692,7 +689,6 @@ mod tests {
             .collect()
     }
 
-
     #[test]
     fn plain_text_is_printed_one_character_at_a_time() {
         assert_eq!(run("hi"), alloc::vec![Op::Print('h'), Op::Print('i')]);
@@ -700,10 +696,7 @@ mod tests {
 
     #[test]
     fn the_c0_controls_this_build_acts_on() {
-        assert_eq!(
-            run("\r\n\x08\t"),
-            alloc::vec![Op::CarriageReturn, Op::LineFeed, Op::Backspace, Op::Tab]
-        );
+        assert_eq!(run("\r\n\x08\t"), alloc::vec![Op::CarriageReturn, Op::LineFeed, Op::Backspace, Op::Tab]);
     }
 
     #[test]
@@ -798,10 +791,7 @@ mod tests {
     fn an_unknown_sgr_parameter_is_skipped_and_its_neighbours_survive() {
         // `3` is italic and there is none here. Abandoning the sequence would lose the red,
         // which is the visible half.
-        assert_eq!(
-            run("\x1b[3;31m"),
-            alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red)))]
-        );
+        assert_eq!(run("\x1b[3;31m"), alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red)))]);
     }
 
     #[test]
@@ -849,11 +839,11 @@ mod tests {
         // that sets a window title emits one — and treating its introducer as an ordinary
         // two-byte escape dumped the payload into the grid on every redraw.
         for seq in [
-            "\x1b]0;my title\x07",     // OSC, BEL-terminated
-            "\x1b]0;my title\x1b\\",   // OSC, ST-terminated
-            "\x1bP1;2q#0\x1b\\",       // DCS
-            "\x1b^private\x1b\\",      // PM
-            "\x1b_app\x1b\\",          // APC
+            "\x1b]0;my title\x07",   // OSC, BEL-terminated
+            "\x1b]0;my title\x1b\\", // OSC, ST-terminated
+            "\x1bP1;2q#0\x1b\\",     // DCS
+            "\x1b^private\x1b\\",    // PM
+            "\x1b_app\x1b\\",        // APC
         ] {
             assert_eq!(printed(&run(&alloc::format!("a{seq}Z"))), "aZ", "{seq:?} leaked");
         }
@@ -896,12 +886,12 @@ mod tests {
         // Every one of these is a payload a program might send. None of them may become a
         // place, and none may leak into the grid.
         for seq in [
-            "\x1b]0;a title\x07",           // a window title, not a directory
-            "\x1b]77;/home/alice\x07",      // a number that merely starts with 7
-            "\x1b]7;relative/path\x07",     // not a path this could name
-            "\x1b]7;\x07",                  // empty
-            "\x1b]7;/home/a\nb\x07",        // a control, on its way to a title bar
-            "\x1bP7;/home/alice\x1b\\",     // a DCS wearing OSC 7's clothes
+            "\x1b]0;a title\x07",       // a window title, not a directory
+            "\x1b]77;/home/alice\x07",  // a number that merely starts with 7
+            "\x1b]7;relative/path\x07", // not a path this could name
+            "\x1b]7;\x07",              // empty
+            "\x1b]7;/home/a\nb\x07",    // a control, on its way to a title bar
+            "\x1bP7;/home/alice\x1b\\", // a DCS wearing OSC 7's clothes
         ] {
             let p = parse(&alloc::format!("\x1b]7;/start\x07{seq}"));
             assert_eq!(p.directory(), Some("/start"), "{seq:?} was taken for a place");
@@ -963,10 +953,7 @@ mod tests {
             let ops = run_bytes(bytes);
             assert_eq!(ops.len(), 1, "{bytes:x?} produced {ops:?}");
             match ops[0] {
-                Op::Print(c) => assert!(
-                    !is_control(c),
-                    "{bytes:x?} put control {c:?} in a cell"
-                ),
+                Op::Print(c) => assert!(!is_control(c), "{bytes:x?} put control {c:?} in a cell"),
                 ref o => panic!("{bytes:x?} produced {o:?}"),
             }
         }
@@ -1079,11 +1066,7 @@ mod tests {
         }
         assert_eq!(
             all,
-            alloc::vec![
-                Op::Attr(Sgr::Bold),
-                Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red))),
-                Op::Print('!'),
-            ]
+            alloc::vec![Op::Attr(Sgr::Bold), Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red))), Op::Print('!'),]
         );
     }
 
@@ -1139,9 +1122,6 @@ mod tests {
         // second sequence eaten by the first. `ESC` is not in the CSI's accepted set, so the
         // malformed branch ends the old sequence — and the new `ESC` is the next byte fed.
         let ops = run("\x1b[1\x1b[31mX");
-        assert_eq!(
-            ops,
-            alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red))), Op::Print('X')]
-        );
+        assert_eq!(ops, alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red))), Op::Print('X')]);
     }
 }

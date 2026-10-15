@@ -35,8 +35,8 @@ use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Point, Rect};
 use libdraw::theme::Theme;
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role,
-    SURFACE_FORMAT_ARGB8888, SURFACE_FORMAT_XRGB8888, STICKY_DESKTOP, WINDOW_FLAG_MINIMIZED,
+    AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role, STICKY_DESKTOP, SURFACE_FORMAT_ARGB8888,
+    SURFACE_FORMAT_XRGB8888, WINDOW_FLAG_MINIMIZED,
 };
 
 /// Where a window's pixels are, for a given (window, buffer) pair.
@@ -207,9 +207,7 @@ impl Window {
     /// "has pixels" is a different question from "is visible", and hit-testing wants the
     /// window that is there rather than the one that has drawn.
     pub fn visible_on(&self, current: u32) -> bool {
-        self.configured
-            && !self.minimized
-            && (self.desktop == STICKY_DESKTOP || self.desktop == current)
+        self.configured && !self.minimized && (self.desktop == STICKY_DESKTOP || self.desktop == current)
     }
 }
 
@@ -640,10 +638,7 @@ impl Repeat {
 /// Pure, and here rather than in the server, because "did focus change" is a question about
 /// two values and the boot gate can only observe that *a* focus event arrived — not that
 /// exactly one did (PR #183's lesson, applied before the review).
-pub fn focus_transition(
-    prev: Option<u32>,
-    now: Option<u32>,
-) -> Option<(Option<u32>, Option<u32>)> {
+pub fn focus_transition(prev: Option<u32>, now: Option<u32>) -> Option<(Option<u32>, Option<u32>)> {
     (prev != now).then_some((prev, now))
 }
 
@@ -907,7 +902,6 @@ impl WindowStack {
         true
     }
 
-
     /// Move a window's top-left corner, returning the region that must be repainted.
     ///
     /// **The damage comes back from the mutation, rather than being computed after it.** That is
@@ -995,12 +989,7 @@ impl WindowStack {
     /// `Err(NoSuchWindow)` if it has gone; `Err(TooManyAcceptors)` when the table is full, which is a
     /// refusal rather than an eviction: dropping the *oldest* acceptor would silently stop a
     /// window taking what it still says it takes.
-    pub fn declare_acceptor(
-        &mut self,
-        id: u32,
-        name: &str,
-        kinds: u32,
-    ) -> Result<(), StackError> {
+    pub fn declare_acceptor(&mut self, id: u32, name: &str, kinds: u32) -> Result<(), StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         if let Some(a) = w.acceptors.iter_mut().find(|a| a.name == name) {
             a.kinds = kinds;
@@ -1083,13 +1072,9 @@ impl WindowStack {
             SURFACE_FORMAT_XRGB8888 => PixelFormat::XRGB8888,
             _ => return Err(StackError::BadGeometry),
         };
-        let geometry = Geometry::with_pitch(req.width, req.height, req.pitch as usize, format)
-            .ok_or(StackError::BadGeometry)?;
-        let w = self
-            .windows
-            .iter_mut()
-            .find(|w| w.id == req.window)
-            .ok_or(StackError::NoSuchWindow)?;
+        let geometry =
+            Geometry::with_pitch(req.width, req.height, req.pitch as usize, format).ok_or(StackError::BadGeometry)?;
+        let w = self.windows.iter_mut().find(|w| w.id == req.window).ok_or(StackError::NoSuchWindow)?;
         // **Re-attaching an id replaces it, and that is how a client resizes** (M9 Part D). A
         // resize needs buffers of the new size and the protocol has no detach, so the
         // alternative was a fresh id per resize — which grows this list, and the compositor's
@@ -1116,11 +1101,7 @@ impl WindowStack {
     /// the memory the compositor is about to read, which is the tearing this protocol
     /// exists to prevent.
     pub fn commit(&mut self, req: &CommitRequest) -> Result<Option<u32>, StackError> {
-        let w = self
-            .windows
-            .iter_mut()
-            .find(|w| w.id == req.window)
-            .ok_or(StackError::NoSuchWindow)?;
+        let w = self.windows.iter_mut().find(|w| w.id == req.window).ok_or(StackError::NoSuchWindow)?;
         if !w.buffers.iter().any(|b| b.id == req.buffer) {
             return Err(StackError::NoSuchBuffer);
         }
@@ -1377,11 +1358,7 @@ impl WindowStack {
         // goes on top of the stack, so without this it becomes the candidate the instant it is
         // created — before anyone has placed it, and for as long as its configure is held
         // (PR #218 review, finding 3).
-        self.windows
-            .iter()
-            .rev()
-            .find(|w| w.visible_on(self.current_desktop) && w.role.takes_focus())
-            .map(|w| w.id)
+        self.windows.iter().rev().find(|w| w.visible_on(self.current_desktop) && w.role.takes_focus()).map(|w| w.id)
     }
 
     /// Composite the stack into `fb`, repainting `damage` — **without the cursor**.
@@ -1423,8 +1400,7 @@ impl WindowStack {
                 continue;
             }
             let bounds = Rect::new(w.origin.x, w.origin.y, b.geometry.width, b.geometry.height);
-            let surface =
-                SurfaceRef::new(b.geometry, w.origin, px).with_corner(corner_of(w.role, bounds, screen));
+            let surface = SurfaceRef::new(b.geometry, w.origin, px).with_corner(corner_of(w.role, bounds, screen));
             surfaces.push(match w.shadow {
                 Some(sh) => surface.with_shadow(sh),
                 None => surface,
@@ -1594,11 +1570,7 @@ impl<F: Framebuffer> Screen<F> {
 /// only as a full-screen blit behind every one-pixel drag. There is nothing to assert on a screen;
 /// the work done has to be measured directly.
 #[must_use]
-fn copy_damage<F: Framebuffer + ?Sized>(
-    display: &mut F,
-    shadow: &MemFramebuffer,
-    damage: &[Rect],
-) -> usize {
+fn copy_damage<F: Framebuffer + ?Sized>(display: &mut F, shadow: &MemFramebuffer, damage: &[Rect]) -> usize {
     let g = display.geometry();
     let bounds = g.bounds();
     let mut copied = 0;
@@ -1630,8 +1602,8 @@ fn copy_damage<F: Framebuffer + ?Sized>(
 mod tests {
     use super::*;
     use libkern::abi::{
-        KEY_CAPSLOCK, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_NUMLOCK, KEY_RIGHTALT,
-        KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT,
+        KEY_CAPSLOCK, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_NUMLOCK, KEY_RIGHTALT, KEY_RIGHTCTRL,
+        KEY_RIGHTMETA, KEY_RIGHTSHIFT,
     };
 
     /// Two ordinary (non-modifier) keycodes — `a` and `b` in the Linux table `libkern::abi`
@@ -1707,10 +1679,7 @@ mod tests {
         // repaint will not restore.
         for r in [Rect::new(5, 5, 1, 40), Rect::new(5, 5, 40, 1), Rect::new(5, 5, 0, 0)] {
             for strip in outline_edges(r) {
-                assert!(
-                    strip.is_empty() || strip.intersect(&r) == Some(strip),
-                    "{strip:?} leaves {r:?}"
-                );
+                assert!(strip.is_empty() || strip.intersect(&r) == Some(strip), "{strip:?} leaves {r:?}");
             }
         }
     }
@@ -1753,14 +1722,7 @@ mod tests {
         let mut fb = big_screen();
         let outline = Rect::new(20, 20, 60, 40);
         let corners = [Rect::new(20, 20, 4, 4), Rect::new(76, 56, 4, 4)];
-        s.present_into(
-            &mut fb,
-            Rgb::BLACK,
-            &src,
-            &corners,
-            Point::new(200, 200),
-            Some(outline),
-        );
+        s.present_into(&mut fb, Rgb::BLACK, &src, &corners, Point::new(200, 200), Some(outline));
         for c in corners {
             let painted = (c.origin.y..c.bottom() as i32)
                 .flat_map(|y| (c.origin.x..c.right() as i32).map(move |x| (x, y)))
@@ -1911,14 +1873,7 @@ mod tests {
     }
 
     fn attach(window: u32, buffer: u32, w: u32, h: u32) -> AttachBufferRequest {
-        AttachBufferRequest {
-            window,
-            buffer,
-            width: w,
-            height: h,
-            pitch: w * 4,
-            format: SURFACE_FORMAT_XRGB8888,
-        }
+        AttachBufferRequest { window, buffer, width: w, height: h, pitch: w * 4, format: SURFACE_FORMAT_XRGB8888 }
     }
 
     /// Create a window and mark it configured — which is what the bin does the instant a
@@ -1934,14 +1889,7 @@ mod tests {
     }
 
     fn commit(window: u32, buffer: u32) -> CommitRequest {
-        CommitRequest {
-            window,
-            buffer,
-            damage_x: 0,
-            damage_y: 0,
-            damage_w: 0,
-            damage_h: 0,
-        }
+        CommitRequest { window, buffer, damage_x: 0, damage_y: 0, damage_w: 0, damage_h: 0 }
     }
 
     fn screen() -> MemFramebuffer {
@@ -2053,10 +2001,7 @@ mod tests {
         assert!(!s.note_state_request(w, 2), "the same ask again is not");
         assert!(s.note_state_request(w, 0), "and a different one is");
         assert!(!s.note_state_request(w, 0));
-        assert!(
-            !s.note_state_request(w + 100, 1),
-            "a window that does not exist has nobody to tell about it"
-        );
+        assert!(!s.note_state_request(w + 100, 1), "a window that does not exist has nobody to tell about it");
     }
 
     #[test]
@@ -2068,11 +2013,7 @@ mod tests {
         assert_eq!(s.work_area(screen), screen, "no panels, no reservation");
         let _ = shown(&mut s, &CreateWindowRequest::new(100, 10, Role::Panel { dock: Edge::Top, reserve: 10 }));
         let _ = shown(&mut s, &CreateWindowRequest::new(100, 8, Role::Panel { dock: Edge::Bottom, reserve: 8 }));
-        assert_eq!(
-            s.work_area(screen),
-            Rect::new(0, 10, 100, 82),
-            "both struts, not just the first"
-        );
+        assert_eq!(s.work_area(screen), Rect::new(0, 10, 100, 82), "both struts, not just the first");
     }
 
     #[test]
@@ -2099,12 +2040,8 @@ mod tests {
     #[test]
     fn a_created_window_gets_a_fresh_id_and_keeps_its_role() {
         let mut s = WindowStack::new();
-        let a = s
-            .create(&CreateWindowRequest::new(8, 8, Role::Normal))
-            .unwrap();
-        let b = s
-            .create(&CreateWindowRequest::new(32, 4, Role::Panel { dock: Edge::Top, reserve: 4 }))
-            .unwrap();
+        let a = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        let b = s.create(&CreateWindowRequest::new(32, 4, Role::Panel { dock: Edge::Top, reserve: 4 })).unwrap();
         assert_ne!(a, b, "ids must be unique");
         assert_eq!(s.window(a).unwrap().role, Role::Normal);
         assert_eq!(s.window(b).unwrap().role, Role::Panel { dock: Edge::Top, reserve: 4 });
@@ -2117,27 +2054,16 @@ mod tests {
             s.create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: 99 })),
             Err(StackError::NoSuchParent)
         );
-        let p = s
-            .create(&CreateWindowRequest::new(8, 8, Role::Normal))
-            .unwrap();
-        assert!(
-            s.create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: p }))
-            .is_ok()
-        );
+        let p = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        assert!(s.create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: p })).is_ok());
     }
 
     #[test]
     fn destroying_a_parent_takes_its_popups_with_it() {
         let mut s = WindowStack::new();
-        let p = s
-            .create(&CreateWindowRequest::new(8, 8, Role::Normal))
-            .unwrap();
-        let menu = s
-            .create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: p }))
-            .unwrap();
-        let other = s
-            .create(&CreateWindowRequest::new(8, 8, Role::Normal))
-            .unwrap();
+        let p = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
+        let menu = s.create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: p })).unwrap();
+        let other = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         s.destroy(p).unwrap();
         assert!(s.window(menu).is_none(), "an orphaned popup has no defined stacking position");
         assert!(s.window(other).is_some(), "unrelated windows are untouched");
@@ -2148,9 +2074,7 @@ mod tests {
         // Releasing the newly committed buffer would hand the client back memory the
         // compositor is about to read — the tearing this protocol exists to prevent.
         let mut s = WindowStack::new();
-        let w = s
-            .create(&CreateWindowRequest::new(4, 4, Role::Normal))
-            .unwrap();
+        let w = s.create(&CreateWindowRequest::new(4, 4, Role::Normal)).unwrap();
         s.attach(&attach(w, 0, 4, 4)).unwrap();
         s.attach(&attach(w, 1, 4, 4)).unwrap();
 
@@ -2164,9 +2088,7 @@ mod tests {
     #[test]
     fn committing_an_unattached_buffer_is_refused() {
         let mut s = WindowStack::new();
-        let w = s
-            .create(&CreateWindowRequest::new(4, 4, Role::Normal))
-            .unwrap();
+        let w = s.create(&CreateWindowRequest::new(4, 4, Role::Normal)).unwrap();
         assert_eq!(s.commit(&commit(w, 7)), Err(StackError::NoSuchBuffer));
         assert_eq!(s.commit(&commit(99, 0)), Err(StackError::NoSuchWindow));
     }
@@ -2182,9 +2104,7 @@ mod tests {
         // exists to make unrepresentable. A double-buffered client always has a free buffer to
         // replace first, so nothing an honest resize does is refused.
         let mut s = WindowStack::new();
-        let w = s
-            .create(&CreateWindowRequest::new(4, 4, Role::Normal))
-            .unwrap();
+        let w = s.create(&CreateWindowRequest::new(4, 4, Role::Normal)).unwrap();
         s.attach(&attach(w, 0, 4, 4)).unwrap();
         s.attach(&attach(w, 1, 4, 4)).unwrap();
         assert_eq!(s.windows()[0].buffers.len(), 2);
@@ -2192,11 +2112,7 @@ mod tests {
         s.attach(&attach(w, 0, 8, 8)).expect("a free buffer takes new memory under its own id");
         assert_eq!(s.windows()[0].buffers.len(), 2, "replaced, not added");
         let g = s.windows()[0].buffers.iter().find(|b| b.id == 0).unwrap().geometry;
-        assert_eq!(
-            (g.width, g.height),
-            (8, 8),
-            "and the new geometry is what the compositor will read it at"
-        );
+        assert_eq!((g.width, g.height), (8, 8), "and the new geometry is what the compositor will read it at");
 
         s.commit(&commit(w, 0)).unwrap();
         assert_eq!(
@@ -2213,10 +2129,8 @@ mod tests {
         let screen = Rect::new(0, 0, 100, 50);
         assert_eq!(s.work_area(screen), screen, "no panels, no reservation");
 
-        s.create(&CreateWindowRequest::new(100, 8, Role::Panel { dock: Edge::Top, reserve: 8 }))
-        .unwrap();
-        s.create(&CreateWindowRequest::new(100, 6, Role::Panel { dock: Edge::Bottom, reserve: 6 }))
-        .unwrap();
+        s.create(&CreateWindowRequest::new(100, 8, Role::Panel { dock: Edge::Top, reserve: 8 })).unwrap();
+        s.create(&CreateWindowRequest::new(100, 6, Role::Panel { dock: Edge::Bottom, reserve: 6 })).unwrap();
         s.create(&CreateWindowRequest::new(40, 40, Role::Normal)).unwrap();
 
         assert_eq!(s.work_area(screen), Rect::new(0, 8, 100, 36));
@@ -2225,11 +2139,8 @@ mod tests {
     #[test]
     fn every_edge_reserves_on_its_own_axis() {
         let mut s = WindowStack::new();
-        for (edge, reserve) in
-            [(Edge::Left, 3u32), (Edge::Right, 5), (Edge::Top, 2), (Edge::Bottom, 4)]
-        {
-            s.create(&CreateWindowRequest::new(1, 1, Role::Panel { dock: edge, reserve }))
-            .unwrap();
+        for (edge, reserve) in [(Edge::Left, 3u32), (Edge::Right, 5), (Edge::Top, 2), (Edge::Bottom, 4)] {
+            s.create(&CreateWindowRequest::new(1, 1, Role::Panel { dock: edge, reserve })).unwrap();
         }
         assert_eq!(s.work_area(Rect::new(0, 0, 100, 50)), Rect::new(3, 2, 92, 44));
     }
@@ -2237,8 +2148,7 @@ mod tests {
     #[test]
     fn over_reservation_empties_the_work_area_rather_than_inverting_it() {
         let mut s = WindowStack::new();
-        s.create(&CreateWindowRequest::new(1, 1, Role::Panel { dock: Edge::Top, reserve: 90 }))
-        .unwrap();
+        s.create(&CreateWindowRequest::new(1, 1, Role::Panel { dock: Edge::Top, reserve: 90 })).unwrap();
         let wa = s.work_area(Rect::new(0, 0, 100, 50));
         assert_eq!(wa.size.h, 0, "a negative height would be a clipping catastrophe");
         assert!(wa.is_empty());
@@ -2249,8 +2159,7 @@ mod tests {
         let mut s = WindowStack::new();
         let a = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
         let b = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
-        s.create(&CreateWindowRequest::new(32, 4, Role::Panel { dock: Edge::Top, reserve: 4 }))
-        .unwrap();
+        s.create(&CreateWindowRequest::new(32, 4, Role::Panel { dock: Edge::Top, reserve: 4 })).unwrap();
         // The panel is topmost, but must not take focus.
         assert_eq!(s.focus_candidate(), Some(b));
         s.raise(a).unwrap();
@@ -2260,8 +2169,7 @@ mod tests {
     #[test]
     fn a_stack_with_only_panels_has_nothing_to_focus() {
         let mut s = WindowStack::new();
-        s.create(&CreateWindowRequest::new(32, 4, Role::Panel { dock: Edge::Top, reserve: 4 }))
-        .unwrap();
+        s.create(&CreateWindowRequest::new(32, 4, Role::Panel { dock: Edge::Top, reserve: 4 })).unwrap();
         assert_eq!(s.focus_candidate(), None);
     }
 
@@ -2301,10 +2209,7 @@ mod tests {
 
         // A move that changes nothing still names the window's own rectangle rather than
         // nothing — the union of a rect with itself — which is correct and costs one window.
-        assert_eq!(
-            s.place(w, Point::new(20, 10)).unwrap().rect(),
-            shadow.around(Rect::new(20, 10, 8, 8))
-        );
+        assert_eq!(s.place(w, Point::new(20, 10)).unwrap().rect(), shadow.around(Rect::new(20, 10, 8, 8)));
     }
 
     #[test]
@@ -2343,11 +2248,7 @@ mod tests {
     #[test]
     fn lower_sends_a_window_under_everything_and_raise_brings_it_back() {
         let mut s = WindowStack::new();
-        let ids: Vec<u32> = (0..3)
-            .map(|_| {
-                s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap()
-            })
-            .collect();
+        let ids: Vec<u32> = (0..3).map(|_| s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap()).collect();
         assert_eq!(order(&s), ids, "creation order is bottom-first");
 
         s.lower(ids[2]).unwrap();
@@ -2363,11 +2264,7 @@ mod tests {
         // between, which the user sees as the rest of the stack shuffling behind the one they
         // asked for.
         let mut s = WindowStack::new();
-        let ids: Vec<u32> = (0..4)
-            .map(|_| {
-                s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap()
-            })
-            .collect();
+        let ids: Vec<u32> = (0..4).map(|_| s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap()).collect();
 
         // Move the bottom window to just above the second — the case where removing it shifts
         // the target's index, which an index captured before the removal gets wrong by one.
@@ -2458,15 +2355,9 @@ mod tests {
         // alive with a dead parent — still compositing, still eligible for focus.
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
-        let menu =
-            s.create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: w }))
-                .unwrap();
-        let sub = s
-            .create(&CreateWindowRequest::new(2, 2, Role::Popup { parent: menu }))
-            .unwrap();
-        let dlg = s
-            .create(&CreateWindowRequest::new(2, 2, Role::Dialog { parent: sub }))
-            .unwrap();
+        let menu = s.create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: w })).unwrap();
+        let sub = s.create(&CreateWindowRequest::new(2, 2, Role::Popup { parent: menu })).unwrap();
+        let dlg = s.create(&CreateWindowRequest::new(2, 2, Role::Dialog { parent: sub })).unwrap();
         // Configured, because the last assertion is about focus and since B4 a window that is
         // not on screen is not a focus candidate.
         let other = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
@@ -2496,12 +2387,7 @@ mod tests {
             // silently returns the full screen. `u32::MAX - 1` twice wraps to a still-huge
             // number the clamp handles anyway, so it proves nothing; that was this test's
             // second wrong version.
-            s.create(&CreateWindowRequest::new(
-                1,
-                1,
-                Role::Panel { dock: Edge::Top, reserve: 0x8000_0000 },
-            ))
-            .unwrap();
+            s.create(&CreateWindowRequest::new(1, 1, Role::Panel { dock: Edge::Top, reserve: 0x8000_0000 })).unwrap();
         }
         let wa = s.work_area(Rect::new(0, 0, 100, 50));
         assert_eq!(wa.size.h, 0, "the work area must clamp to empty, not wrap open");
@@ -2512,10 +2398,8 @@ mod tests {
     fn a_realistic_pair_of_bars_still_leaves_a_work_area() {
         // The saturation guard must not swallow ordinary values.
         let mut s = WindowStack::new();
-        s.create(&CreateWindowRequest::new(100, 32, Role::Panel { dock: Edge::Top, reserve: 32 }))
-        .unwrap();
-        s.create(&CreateWindowRequest::new(100, 28, Role::Panel { dock: Edge::Bottom, reserve: 28 }))
-        .unwrap();
+        s.create(&CreateWindowRequest::new(100, 32, Role::Panel { dock: Edge::Top, reserve: 32 })).unwrap();
+        s.create(&CreateWindowRequest::new(100, 28, Role::Panel { dock: Edge::Bottom, reserve: 28 })).unwrap();
         assert_eq!(s.work_area(Rect::new(0, 0, 200, 100)), Rect::new(0, 32, 200, 40));
     }
 
@@ -2576,15 +2460,13 @@ mod tests {
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
         let screen = big_screen().geometry().bounds();
-        let bar = shown(&mut s, &CreateWindowRequest::new(screen.size.w, 10, Role::Panel { dock: Edge::Top, reserve: 10 }));
+        let bar =
+            shown(&mut s, &CreateWindowRequest::new(screen.size.w, 10, Role::Panel { dock: Edge::Top, reserve: 10 }));
         s.attach(&attach(bar, 0, screen.size.w, 10)).unwrap();
         let bar_ink = Rgb::new(215, 214, 212);
         src.put(bar, 0, geom(screen.size.w, 10), bar_ink);
         s.commit(&commit(bar, 0)).unwrap();
-        let cover = shown(
-            &mut s,
-            &CreateWindowRequest::new(screen.size.w, screen.size.h, Role::Popup { parent: bar }),
-        );
+        let cover = shown(&mut s, &CreateWindowRequest::new(screen.size.w, screen.size.h, Role::Popup { parent: bar }));
         s.attach(&attach(cover, 0, screen.size.w, screen.size.h)).unwrap();
         let cover_ink = Rgb::new(42, 42, 41);
         src.put(cover, 0, geom(screen.size.w, screen.size.h), cover_ink);
@@ -2933,29 +2815,16 @@ mod tests {
         let now = 1_000;
 
         // Holding a modifier with nothing repeating starts nothing.
-        assert_eq!(
-            Repeat::after_key(None, KEY_LEFTCTRL, true, 0, 0, Some(7), now),
-            None,
-            "a modifier armed a repeat"
-        );
+        assert_eq!(Repeat::after_key(None, KEY_LEFTCTRL, true, 0, 0, Some(7), now), None, "a modifier armed a repeat");
 
         // Pressing a modifier while `a` repeats leaves `a`'s run exactly as it was...
         let run = Repeat::armed(KEY_A, 0, 0, 7, now);
-        let after_shift_down =
-            Repeat::after_key(Some(run), KEY_LEFTSHIFT, true, 0, 0, Some(7), now + 50);
+        let after_shift_down = Repeat::after_key(Some(run), KEY_LEFTSHIFT, true, 0, 0, Some(7), now + 50);
         assert_eq!(after_shift_down, Some(run), "a modifier press hijacked the repeat");
 
         // ...and releasing it leaves the run alone too, which is the half that was already
         // guarded — it only held because the press half no longer overwrites `keycode`.
-        let after_shift_up = Repeat::after_key(
-            after_shift_down,
-            KEY_LEFTSHIFT,
-            false,
-            0,
-            0,
-            Some(7),
-            now + 90,
-        );
+        let after_shift_up = Repeat::after_key(after_shift_down, KEY_LEFTSHIFT, false, 0, 0, Some(7), now + 90);
         assert_eq!(after_shift_up, Some(run), "a modifier release stopped the repeat");
 
         // The held key's own release still stops it.
@@ -2980,17 +2849,10 @@ mod tests {
             KEY_LEFTMETA,
             KEY_RIGHTMETA,
         ] {
-            assert_eq!(
-                Repeat::after_key(None, code, true, 0, 0, Some(1), 0),
-                None,
-                "keycode {code} armed a repeat"
-            );
+            assert_eq!(Repeat::after_key(None, code, true, 0, 0, Some(1), 0), None, "keycode {code} armed a repeat");
         }
         // And an ordinary key still does, or the exclusion is too wide.
-        assert!(
-            Repeat::after_key(None, KEY_A, true, 0, 0, Some(1), 0).is_some(),
-            "an ordinary key stopped repeating"
-        );
+        assert!(Repeat::after_key(None, KEY_A, true, 0, 0, Some(1), 0).is_some(), "an ordinary key stopped repeating");
     }
 
     /// **A lock key neither repeats nor takes a run** (Phase 6 Part B.5): Caps Lock held is not a key
@@ -3058,10 +2920,7 @@ mod tests {
         let full = fb.geometry().bounds();
         s.present_into(&mut fb, Rgb::BLACK, &src, &[full], pointer, None);
 
-        assert!(
-            body_pixels(&fb, pointer) > 0,
-            "the pointer is not on screen over the window it is above"
-        );
+        assert!(body_pixels(&fb, pointer) > 0, "the pointer is not on screen over the window it is above");
         // And the window is still underneath it, rather than the cursor having replaced a
         // recompose that never happened.
         // `(10, 10)`: inside the window's rounded corner (Part B), and clear of the sprite at 20.
@@ -3093,18 +2952,8 @@ mod tests {
         let pointer = Point::new(40, 40);
         let mut fb = big_screen();
         let elsewhere = Rect::new(0, 0, 8, 8);
-        s.present_into(
-            &mut fb,
-            Rgb::BLACK,
-            &src,
-            &[elsewhere, cursor_rect(pointer)],
-            pointer,
-            None,
-        );
-        assert!(
-            body_pixels(&fb, pointer) > 0,
-            "the pointer was not drawn into the second damage rectangle"
-        );
+        s.present_into(&mut fb, Rgb::BLACK, &src, &[elsewhere, cursor_rect(pointer)], pointer, None);
+        assert!(body_pixels(&fb, pointer) > 0, "the pointer was not drawn into the second damage rectangle");
     }
 
     #[test]
@@ -3117,9 +2966,7 @@ mod tests {
         // 268 is not 64*4. The padding is the point: a source stride computed from the
         // width instead of the pitch skews every row after the first, and the two numbers
         // agreeing would hide it. Keep this in step with `libdraw::scene::SCREEN_PITCH`.
-        let mut fb = MemFramebuffer::new(
-            Geometry::with_pitch(1280, 800, 5120, PixelFormat::XRGB8888).unwrap(),
-        );
+        let mut fb = MemFramebuffer::new(Geometry::with_pitch(1280, 800, 5120, PixelFormat::XRGB8888).unwrap());
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
         let w = shown(&mut s, &CreateWindowRequest::new(64, 32, Role::Normal));
@@ -3146,11 +2993,7 @@ mod tests {
         // Each of these names the source row it must have come from. Read at pitch 256,
         // screen row 5 lands in source row 4 and row 31 in source row 29 — different
         // colours, so the skew is a failure rather than a coincidence.
-        assert_eq!(
-            fb.get_pixel(6, 5),
-            Some(row_colour(5)),
-            "the client's surface must reach the screen, row for row"
-        );
+        assert_eq!(fb.get_pixel(6, 5), Some(row_colour(5)), "the client's surface must reach the screen, row for row");
         // **Its first and last pixels are outside its rounded corners** since the desktop
         // refresh's Part B, so the ends of the copy are checked where the surface is still square:
         // the last row up to the curve, and the right edge down to it — the same two boundaries a
@@ -3338,11 +3181,7 @@ mod tests {
         for d in [1u32, 2, 99] {
             s.set_current_desktop(d).unwrap();
             s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
-            assert_eq!(
-                fb.get_pixel(4, 4),
-                Some(Rgb::new(0xFF, 0xFF, 0xFF)),
-                "a sticky window is on desktop {d} too"
-            );
+            assert_eq!(fb.get_pixel(4, 4), Some(Rgb::new(0xFF, 0xFF, 0xFF)), "a sticky window is on desktop {d} too");
         }
     }
 
@@ -3445,9 +3284,7 @@ mod tests {
         let parent = shown(&mut s, &CreateWindowRequest::new(200, 100, Role::Normal));
         let _ = s.place(parent, Point::new(30, 40)).unwrap();
 
-        let menu = s
-            .create(&CreateWindowRequest::at(60, 80, Role::Popup { parent }, 5, 24))
-            .unwrap();
+        let menu = s.create(&CreateWindowRequest::at(60, 80, Role::Popup { parent }, 5, 24)).unwrap();
         assert_eq!(
             s.window(menu).unwrap().origin,
             Point::new(35, 64),
@@ -3486,9 +3323,7 @@ mod tests {
         assert_eq!(s.window(plain).unwrap().origin, Point::new(77, 88), "the request was dropped");
 
         // A dialog names a parent and is still not placed relative to it.
-        let dlg = s
-            .create(&CreateWindowRequest::at(10, 10, Role::Dialog { parent }, 77, 88))
-            .unwrap();
+        let dlg = s.create(&CreateWindowRequest::at(10, 10, Role::Dialog { parent }, 77, 88)).unwrap();
         assert_eq!(
             s.window(dlg).unwrap().origin,
             Point::new(77, 88),
@@ -3497,15 +3332,8 @@ mod tests {
 
         // **A panel ignores it**: its role says which edge it docks to, and an offset would be a
         // second answer to that question.
-        let bar = s
-            .create(&CreateWindowRequest::at(
-                10,
-                10,
-                Role::Panel { dock: Edge::Top, reserve: 10 },
-                77,
-                88,
-            ))
-            .unwrap();
+        let bar =
+            s.create(&CreateWindowRequest::at(10, 10, Role::Panel { dock: Edge::Top, reserve: 10 }, 77, 88)).unwrap();
         assert_eq!(s.window(bar).unwrap().origin, Point::new(0, 0), "a panel took an offset");
 
         // **And the default is unchanged**, which is what keeps every existing caller where it
@@ -3514,9 +3342,7 @@ mod tests {
         assert_eq!(s.window(plain0).unwrap().origin, Point::new(0, 0));
 
         // A popup is offset from its parent, and still is.
-        let menu = s
-            .create(&CreateWindowRequest::at(10, 10, Role::Popup { parent }, 5, 6))
-            .unwrap();
+        let menu = s.create(&CreateWindowRequest::at(10, 10, Role::Popup { parent }, 5, 6)).unwrap();
         assert_eq!(s.window(menu).unwrap().origin, Point::new(65, 76), "the popup is");
     }
 
@@ -3540,9 +3366,7 @@ mod tests {
         src.put(parent, 0, geom(8, 8), Rgb::new(0x20, 0x20, 0x20));
         s.commit(&commit(parent, 0)).unwrap();
 
-        let menu = s
-            .create(&CreateWindowRequest::at(32, 32, Role::Popup { parent }, -12, -12))
-            .unwrap();
+        let menu = s.create(&CreateWindowRequest::at(32, 32, Role::Popup { parent }, -12, -12)).unwrap();
         s.mark_configured(menu);
         s.attach(&attach(menu, 0, 32, 32)).unwrap();
         src.put(menu, 0, geom(32, 32), Rgb::new(0xFF, 0xFF, 0xFF));
@@ -3577,9 +3401,7 @@ mod tests {
         // **32 across, not 16**, since the desktop refresh's Part B rounds a popup's corners: at
         // 16 the radius clamps to 8, the popup is a circle, and the visible quarter is all curve.
         // At 32 the clipped part keeps straight edges, which is what this test reads the rows off.
-        let menu = s
-            .create(&CreateWindowRequest::at(32, 32, Role::Popup { parent }, -8, -8))
-            .unwrap();
+        let menu = s.create(&CreateWindowRequest::at(32, 32, Role::Popup { parent }, -8, -8)).unwrap();
         assert_eq!(s.window(menu).unwrap().origin, Point::new(-8, -8));
         s.mark_configured(menu);
         s.attach(&attach(menu, 0, 32, 32)).unwrap();
@@ -3623,16 +3445,12 @@ mod tests {
     #[test]
     fn info_carries_the_role_and_its_extra_fields() {
         let mut s = WindowStack::new();
-        let p = s
-            .create(&CreateWindowRequest::new(100, 24, Role::Panel { dock: Edge::Bottom, reserve: 24 }))
-            .unwrap();
+        let p = s.create(&CreateWindowRequest::new(100, 24, Role::Panel { dock: Edge::Bottom, reserve: 24 })).unwrap();
         let info = s.info(p).unwrap();
         assert_eq!(info.role, librsproto::surface::ROLE_PANEL);
         assert_eq!(info.reserve, 24);
 
-        let child = s
-            .create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: p }))
-            .unwrap();
+        let child = s.create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: p })).unwrap();
         assert_eq!(s.info(child).unwrap().parent, p);
         assert!(s.info(9999).is_none(), "a window that does not exist has no info");
     }
@@ -3657,19 +3475,11 @@ mod tests {
     #[test]
     fn take_removed_reports_the_whole_subtree_parent_first_then_drains() {
         let mut s = WindowStack::new();
-        let root = s
-            .create(&CreateWindowRequest::new(100, 80, Role::Normal))
-            .unwrap();
-        let menu = s
-            .create(&CreateWindowRequest::new(40, 20, Role::Popup { parent: root }))
-            .unwrap();
-        let submenu = s
-            .create(&CreateWindowRequest::new(30, 15, Role::Popup { parent: menu }))
-            .unwrap();
+        let root = s.create(&CreateWindowRequest::new(100, 80, Role::Normal)).unwrap();
+        let menu = s.create(&CreateWindowRequest::new(40, 20, Role::Popup { parent: root })).unwrap();
+        let submenu = s.create(&CreateWindowRequest::new(30, 15, Role::Popup { parent: menu })).unwrap();
         // An unrelated window must not appear in the removed set.
-        let other = s
-            .create(&CreateWindowRequest::new(10, 10, Role::Normal))
-            .unwrap();
+        let other = s.create(&CreateWindowRequest::new(10, 10, Role::Normal)).unwrap();
 
         assert!(s.take_removed().is_empty(), "nothing has been destroyed yet");
 
@@ -3682,9 +3492,6 @@ mod tests {
         assert!(!gone.contains(&other), "an unrelated window is not reported");
         assert_eq!(gone.len(), 3, "exactly the subtree, no duplicates");
         assert!(s.window(other).is_some(), "the unrelated window survives");
-        assert!(
-            s.take_removed().is_empty(),
-            "the log drained: a second read must not re-announce the same subtree"
-        );
+        assert!(s.take_removed().is_empty(), "the log drained: a second read must not re-announce the same subtree");
     }
 }

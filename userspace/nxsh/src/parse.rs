@@ -55,12 +55,10 @@ use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 /// background suffix, `^` the force-external prefix.
 /// TODO(shell-bitwise): `docs/rationale/deferred-decisions.md`.
 pub(crate) const OPERATORS: &[&str] = &[
-    "filter", "sort", "select", "save", "open", "each", "map", "display", "format", "last",
-    "skip", "dedupe", "take", "count", "sum", "min", "max", "avg", "reduce",
-    // §10b's Part E families: strings, records, numbers.
-    "split", "join", "trim", "replace", "upper", "lower",
-    "keys", "values", "merge",
-    "round", "floor", "ceil", "trunc", "abs", "capture",
+    "filter", "sort", "select", "save", "open", "each", "map", "display", "format", "last", "skip", "dedupe", "take",
+    "count", "sum", "min", "max", "avg", "reduce", // §10b's Part E families: strings, records, numbers.
+    "split", "join", "trim", "replace", "upper", "lower", "keys", "values", "merge", "round", "floor", "ceil", "trunc",
+    "abs", "capture",
 ];
 
 /// Shell-state builtins (§3): they mutate the shell's own process state, which an
@@ -86,10 +84,8 @@ const BRACE_ARG_OPERATORS: &[&str] = &["filter", "each", "map", "reduce", "merge
 /// Knowing this at parse time is what lets `(count > 0)` read as a comparison rather than
 /// as `count` applied to `> 0`. Without it a paren could not open a pipeline whose first
 /// stage is a command — `(list /system | …)` — because the fix for one broke the other.
-const NULLARY_OPERATORS: &[&str] = &[
-    "count", "dedupe", "trim", "upper", "lower", "keys", "values", "round", "floor", "ceil",
-    "trunc", "abs",
-];
+const NULLARY_OPERATORS: &[&str] =
+    &["count", "dedupe", "trim", "upper", "lower", "keys", "values", "round", "floor", "ceil", "trunc", "abs"];
 
 /// Deepest nesting the parser will descend (D5). A recursive-descent parser recurses on
 /// user input on a fixed userspace stack, so a pathological expression must be an error
@@ -708,12 +704,7 @@ impl<'a> Parser<'a> {
                     let name = alloc::format!("{root}.{field}");
                     self.bump()?;
                     let args = self.paren_args()?;
-                    Expr::Call(Box::new(Call {
-                        name,
-                        kind: CallKind::Def,
-                        args,
-                        forced_external: false,
-                    }))
+                    Expr::Call(Box::new(Call { name, kind: CallKind::Def, args, forced_external: false }))
                 }
                 Tok::Question => {
                     self.bump()?;
@@ -892,11 +883,7 @@ impl<'a> Parser<'a> {
                 return Ok(Expr::Record(fields));
             }
             let name = self.ident("expected a field name")?;
-            let value = if self.eat(&Tok::Colon)? {
-                self.expr()?
-            } else {
-                Expr::Ident(name.clone())
-            };
+            let value = if self.eat(&Tok::Colon)? { self.expr()? } else { Expr::Ident(name.clone()) };
             fields.push((name, value));
             self.skip_newlines()?;
             if self.eat(&Tok::Comma)? {
@@ -928,11 +915,7 @@ impl<'a> Parser<'a> {
             let pattern = self.pattern()?;
             let guard = if self.eat(&Tok::If)? { Some(self.or_expr()?) } else { None };
             self.expect(&Tok::FatArrow, "expected `=>` in a match arm")?;
-            let body = if self.peek()? == Tok::LBrace {
-                self.block()?
-            } else {
-                alloc::vec![Stmt::Expr(self.expr()?)]
-            };
+            let body = if self.peek()? == Tok::LBrace { self.block()? } else { alloc::vec![Stmt::Expr(self.expr()?)] };
             arms.push(MatchArm { pattern, guard, body });
         }
     }
@@ -956,18 +939,11 @@ impl<'a> Parser<'a> {
         if at_head || forced_external {
             let w = self.lx.peek(crate::lex::Mode::Word)?;
             if let Tok::Word(text) = &w.tok {
-                if text.contains('-')
-                    && text.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic())
-                {
+                if text.contains('-') && text.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic()) {
                     let name = text.clone();
                     self.lx.bump(crate::lex::Mode::Word)?;
                     let args = self.word_args()?;
-                    return Ok(Expr::Call(Box::new(Call {
-                        name,
-                        kind: CallKind::External,
-                        args,
-                        forced_external,
-                    })));
+                    return Ok(Expr::Call(Box::new(Call { name, kind: CallKind::External, args, forced_external })));
                 }
             }
         }
@@ -1013,21 +989,11 @@ impl<'a> Parser<'a> {
             // and `/system` a division. Word mode is the same reading an external program
             // gets, which is the right one for a path.
             let args = self.word_args()?;
-            return Ok(Expr::Call(Box::new(Call {
-                name,
-                kind: CallKind::Builtin,
-                args,
-                forced_external,
-            })));
+            return Ok(Expr::Call(Box::new(Call { name, kind: CallKind::Builtin, args, forced_external })));
         }
         if is_operator {
             let args = self.operator_args(&name)?;
-            return Ok(Expr::Call(Box::new(Call {
-                name,
-                kind: CallKind::Operator,
-                args,
-                forced_external,
-            })));
+            return Ok(Expr::Call(Box::new(Call { name, kind: CallKind::Operator, args, forced_external })));
         }
 
         // Not a keyword, builtin or operator: either a variable or an external command,
@@ -1169,8 +1135,7 @@ impl<'a> Parser<'a> {
         self.in_op_args += 1;
         loop {
             match self.peek()? {
-                Tok::Pipe | Tok::Newline | Tok::Eof | Tok::RParen | Tok::RBrace
-                | Tok::RBracket | Tok::Comma => break,
+                Tok::Pipe | Tok::Newline | Tok::Eof | Tok::RParen | Tok::RBrace | Tok::RBracket | Tok::Comma => break,
                 // `=` never begins an argument, so an operator name followed by one is an
                 // assignment to a binding that happens to share the name. Found by a test
                 // that used `last` as a variable — which is both a §10b operator and an
@@ -1216,8 +1181,14 @@ impl<'a> Parser<'a> {
         loop {
             let s = self.lx.peek(Mode::Word)?;
             match s.tok {
-                Tok::Pipe | Tok::OrOr | Tok::AndAnd | Tok::Newline | Tok::Eof
-                | Tok::RParen | Tok::RBrace | Tok::RBracket => return Ok(args),
+                Tok::Pipe
+                | Tok::OrOr
+                | Tok::AndAnd
+                | Tok::Newline
+                | Tok::Eof
+                | Tok::RParen
+                | Tok::RBrace
+                | Tok::RBracket => return Ok(args),
                 Tok::Flag(f) => {
                     self.lx.bump(Mode::Word)?;
                     args.push(Arg::Flag(f, None));
@@ -1278,11 +1249,7 @@ impl<'a> Parser<'a> {
                         return Ok(Pattern::Record(fields));
                     }
                     let name = self.ident("expected a field name in a record pattern")?;
-                    let sub = if self.eat(&Tok::Colon)? {
-                        Some(self.pattern_single()?)
-                    } else {
-                        None
-                    };
+                    let sub = if self.eat(&Tok::Colon)? { Some(self.pattern_single()?) } else { None };
                     fields.push((name, sub));
                     if self.eat(&Tok::Comma)? {
                         continue;
@@ -1320,8 +1287,7 @@ impl<'a> Parser<'a> {
                 }
                 Ok(Pattern::Bind(name))
             }
-            Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Minus | Tok::True | Tok::False
-            | Tok::Null => {
+            Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Minus | Tok::True | Tok::False | Tok::Null => {
                 let lit = self.pattern_literal()?;
                 let inclusive = match self.peek()? {
                     Tok::DotDot => false,
@@ -1434,12 +1400,7 @@ fn desugar_predicate(args: &mut Vec<Arg>) {
     }
     let body = field_shorthand(e.clone());
     args[0] = Arg::Positional(Expr::Closure {
-        params: alloc::vec![Param {
-            name: String::from("it"),
-            ty: None,
-            default: None,
-            variadic: false,
-        }],
+        params: alloc::vec![Param { name: String::from("it"), ty: None, default: None, variadic: false }],
         body: alloc::vec![Stmt::Expr(body)],
     });
 }
@@ -1449,18 +1410,11 @@ fn field_shorthand(e: Expr) -> Expr {
     match e {
         Expr::Ident(name) => Expr::Field(Box::new(Expr::Ident(String::from("it"))), name),
         Expr::Unary(op, a) => Expr::Unary(op, Box::new(field_shorthand(*a))),
-        Expr::Binary(op, a, b) => Expr::Binary(
-            op,
-            Box::new(field_shorthand(*a)),
-            Box::new(field_shorthand(*b)),
-        ),
+        Expr::Binary(op, a, b) => Expr::Binary(op, Box::new(field_shorthand(*a)), Box::new(field_shorthand(*b))),
         // A field access already names its base explicitly; only the base is rewritten.
         Expr::Field(a, f) => Expr::Field(Box::new(field_shorthand(*a)), f),
         Expr::TryField(a, f) => Expr::TryField(Box::new(field_shorthand(*a)), f),
-        Expr::Index(a, i) => Expr::Index(
-            Box::new(field_shorthand(*a)),
-            Box::new(field_shorthand(*i)),
-        ),
+        Expr::Index(a, i) => Expr::Index(Box::new(field_shorthand(*a)), Box::new(field_shorthand(*i))),
         other => other,
     }
 }
@@ -1619,9 +1573,7 @@ mod tests {
     fn an_explicit_closure_is_left_alone() {
         let e = one_expr("filter { |row| row.size > 1000 }");
         let Expr::Call(c) = e else { panic!("expected a call") };
-        let Arg::Positional(Expr::Closure { params, .. }) = &c.args[0] else {
-            panic!("expected a closure")
-        };
+        let Arg::Positional(Expr::Closure { params, .. }) = &c.args[0] else { panic!("expected a closure") };
         assert_eq!(params[0].name, "row");
     }
 
@@ -1714,9 +1666,7 @@ mod tests {
 
     #[test]
     fn a_def_carries_defaults_variadics_and_a_return_type() {
-        let s = script(
-            "def greet(name: String, loud: Bool = false, ...rest: List<String>) -> String { name }",
-        );
+        let s = script("def greet(name: String, loud: Bool = false, ...rest: List<String>) -> String { name }");
         let Stmt::Def { name, params, ret, .. } = &s.stmts[0] else { panic!() };
         assert_eq!(name, "greet");
         assert_eq!(params.len(), 3);
@@ -1851,9 +1801,7 @@ mod tests {
 
         // `size?: Int` inside a record shape is sugar for `size: Int?`.
         let b = script("let x: { size?: Int } = y");
-        let Stmt::Bind { ty: Some(TypeExpr::Record { fields, .. }), .. } = &b.stmts[0] else {
-            panic!()
-        };
+        let Stmt::Bind { ty: Some(TypeExpr::Record { fields, .. }), .. } = &b.stmts[0] else { panic!() };
         assert_eq!(fields[0].1, TypeExpr::Named { name: "Int".into(), params: alloc::vec![], nullable: true });
     }
 

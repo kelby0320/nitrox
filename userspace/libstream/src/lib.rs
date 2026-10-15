@@ -46,6 +46,6 @@ pub mod wire;
 pub use record::TypedRecord;
 pub use table::{Item, TableReader, TableWriter, write_text_fallback};
 pub use wire::{
-    ByteSink, ByteSource, FieldDef, Record, Schema, SliceSink, StreamFlags, Table, TypeModifiers,
-    TypeTag, Value, WireError, WireErrorRecord,
+    ByteSink, ByteSource, FieldDef, Record, Schema, SliceSink, StreamFlags, Table, TypeModifiers, TypeTag, Value,
+    WireError, WireErrorRecord,
 };

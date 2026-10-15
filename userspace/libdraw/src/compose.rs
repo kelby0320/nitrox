@@ -144,8 +144,7 @@ pub struct ShadowLayer {
 
 impl ShadowLayer {
     /// A layer that draws nothing — the second layer of a [`Shadow::single`].
-    pub const NONE: ShadowLayer =
-        ShadowLayer { radius: 0, offset: Point::new(0, 0), colour: Rgb::BLACK, strength: 0 };
+    pub const NONE: ShadowLayer = ShadowLayer { radius: 0, offset: Point::new(0, 0), colour: Rgb::BLACK, strength: 0 };
 
     /// Whether this layer paints anything at all.
     pub const fn is_visible(&self) -> bool {
@@ -222,26 +221,14 @@ const fn max_i32(a: i32, b: i32) -> i32 {
 /// outside the curve the blit leaves the pixel alone, so the shadow is all it will get, and on the
 /// curve the blit blends the window's edge over whatever is there, which has to include the
 /// shadow. At `corner == 0` both reduce exactly to the square case.
-pub fn draw_shadow<F: Framebuffer + ?Sized>(
-    fb: &mut F,
-    bounds: Rect,
-    corner: u32,
-    shadow: &Shadow,
-    clip: &Rect,
-) {
+pub fn draw_shadow<F: Framebuffer + ?Sized>(fb: &mut F, bounds: Rect, corner: u32, shadow: &Shadow, clip: &Rect) {
     for layer in &shadow.layers {
         draw_layer(fb, bounds, corner, layer, clip);
     }
 }
 
 /// One layer of [`draw_shadow`].
-fn draw_layer<F: Framebuffer + ?Sized>(
-    fb: &mut F,
-    bounds: Rect,
-    corner: u32,
-    shadow: &ShadowLayer,
-    clip: &Rect,
-) {
+fn draw_layer<F: Framebuffer + ?Sized>(fb: &mut F, bounds: Rect, corner: u32, shadow: &ShadowLayer, clip: &Rect) {
     if !shadow.is_visible() {
         return;
     }
@@ -320,12 +307,7 @@ fn draw_layer<F: Framebuffer + ?Sized>(
 /// allocation order, no dependence on which client committed first. The one subtlety
 /// is that a damaged region is *cleared before* the surfaces are drawn, so a pixel no
 /// surface covers is `background` rather than whatever it previously held.
-pub fn compose<F: Framebuffer + ?Sized>(
-    fb: &mut F,
-    background: Rgb,
-    surfaces: &[SurfaceRef<'_>],
-    damage: &[Rect],
-) {
+pub fn compose<F: Framebuffer + ?Sized>(fb: &mut F, background: Rgb, surfaces: &[SurfaceRef<'_>], damage: &[Rect]) {
     let screen = fb.geometry().bounds();
     for area in damage {
         let Some(area) = area.intersect(&screen) else { continue };
@@ -538,11 +520,7 @@ fn subtract_from(region: &mut [Option<Rect>], cut: &Rect) {
 
 /// Composite over the whole screen. Equivalent to [`compose`] with one full-screen
 /// damage rectangle; the shape a first frame takes, before anything is incremental.
-pub fn compose_full<F: Framebuffer + ?Sized>(
-    fb: &mut F,
-    background: Rgb,
-    surfaces: &[SurfaceRef<'_>],
-) {
+pub fn compose_full<F: Framebuffer + ?Sized>(fb: &mut F, background: Rgb, surfaces: &[SurfaceRef<'_>]) {
     let screen = fb.geometry().bounds();
     compose(fb, background, surfaces, &[screen]);
 }
@@ -716,10 +694,9 @@ fn blit_rows<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visi
     for row in 0..visible.size.h {
         let dst_y = visible.origin.y + row as i32;
         let src_y = (dst_y - surface.origin.y) as u32;
-        let (Some(soff), Some(doff)) = (
-            src.offset_of(src_x, src_y),
-            dst.offset_of(visible.origin.x as u32, dst_y as u32),
-        ) else {
+        let (Some(soff), Some(doff)) =
+            (src.offset_of(src_x, src_y), dst.offset_of(visible.origin.x as u32, dst_y as u32))
+        else {
             continue;
         };
         let want = visible.size.w as usize * bpp;
@@ -812,12 +789,7 @@ mod tests {
 
     /// The shadow the tests below cast: reaching 6px, dropped 2px, black.
     fn shade() -> Shadow {
-        Shadow::single(ShadowLayer {
-            radius: 6,
-            offset: Point::new(0, 2),
-            colour: Rgb::new(0, 0, 0),
-            strength: 160,
-        })
+        Shadow::single(ShadowLayer { radius: 6, offset: Point::new(0, 2), colour: Rgb::new(0, 0, 0), strength: 160 })
     }
 
     #[test]
@@ -907,10 +879,7 @@ mod tests {
         let over = Rgb::new(200, 30, 30);
         let (ug, upx, uo) = surface(4, 4, 40, 30, under);
         let (og, opx, oo) = surface(20, 16, 12, 10, over);
-        let surfaces = [
-            SurfaceRef::new(ug, uo, &upx),
-            SurfaceRef::new(og, oo, &opx).with_shadow(shade()),
-        ];
+        let surfaces = [SurfaceRef::new(ug, uo, &upx), SurfaceRef::new(og, oo, &opx).with_shadow(shade())];
 
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         compose(&mut fb, bg, &surfaces, &[g.bounds()]);
@@ -932,10 +901,8 @@ mod tests {
         let stale = Rgb::new(240, 0, 240);
         let (ag, apx, ao) = surface(4, 4, 20, 16, Rgb::new(80, 160, 80));
         let (bg2, bpx, bo) = surface(26, 18, 20, 16, Rgb::new(200, 30, 30));
-        let surfaces = [
-            SurfaceRef::new(ag, ao, &apx).with_shadow(shade()),
-            SurfaceRef::new(bg2, bo, &bpx).with_shadow(shade()),
-        ];
+        let surfaces =
+            [SurfaceRef::new(ag, ao, &apx).with_shadow(shade()), SurfaceRef::new(bg2, bo, &bpx).with_shadow(shade())];
 
         let mut plain = crate::framebuffer::MemFramebuffer::new(g);
         plain.clear(stale);
@@ -957,8 +924,7 @@ mod tests {
         let (sg, px, o) = surface(20, 16, 12, 10, Rgb::new(200, 30, 30));
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         fb.clear(bg);
-        compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(shade())],
-                &[Rect::new(20, 16, 12, 10)]);
+        compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(shade())], &[Rect::new(20, 16, 12, 10)]);
         // Only the surface's own rectangle was damaged, so its shadow is nowhere.
         assert_eq!(fb.get_pixel(19, 20), Some(bg), "the shadow escaped the damage rectangle");
     }
@@ -1005,14 +971,7 @@ mod tests {
     // ---- alpha (M13 Part B) ----
 
     /// A `w`x`h` `ARGB8888` surface at `(x, y)`, one colour at one opacity.
-    fn translucent(
-        x: i32,
-        y: i32,
-        w: u32,
-        h: u32,
-        c: Rgb,
-        alpha: u8,
-    ) -> (Geometry, alloc::vec::Vec<u8>, Point) {
+    fn translucent(x: i32, y: i32, w: u32, h: u32, c: Rgb, alpha: u8) -> (Geometry, alloc::vec::Vec<u8>, Point) {
         let g = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::ARGB8888).unwrap();
         let word = g.format.encode_alpha(c, alpha).to_le_bytes();
         let mut px = alloc::vec![0u8; g.pitch * h as usize];
@@ -1161,12 +1120,8 @@ mod tests {
             let mut out = alloc::vec::Vec::new();
             for y in 0..24 {
                 for x in 0..24 {
-                    let inside = |r: &Rect| {
-                        x >= r.origin.x
-                            && y >= r.origin.y
-                            && x < r.right() as i32
-                            && y < r.bottom() as i32
-                    };
+                    let inside =
+                        |r: &Rect| x >= r.origin.x && y >= r.origin.y && x < r.right() as i32 && y < r.bottom() as i32;
                     if region.iter().flatten().any(inside) {
                         out.push((x, y));
                     }
@@ -1200,10 +1155,7 @@ mod tests {
                         && p.1 >= cut.origin.y
                         && p.0 < cut.right() as i32
                         && p.1 < cut.bottom() as i32;
-                    assert!(
-                        after.contains(p) || taken,
-                        "cap {cap}: {p:?} was dropped — background nothing will paint"
-                    );
+                    assert!(after.contains(p) || taken, "cap {cap}: {p:?} was dropped — background nothing will paint");
                 }
                 for p in &after {
                     assert!(before.contains(p), "cap {cap}: {p:?} appeared from nowhere");
@@ -1351,10 +1303,7 @@ mod tests {
             // The surface exactly covers the damage: the fill should vanish entirely.
             (Point::new(4, 4), Point::new(40, 40), alloc::vec![Rect::new(4, 4, 20, 16)]),
             // A drag: where it was, and where it is.
-            (Point::new(9, 4), Point::new(40, 40), alloc::vec![
-                Rect::new(8, 4, 20, 16),
-                Rect::new(9, 4, 20, 16),
-            ]),
+            (Point::new(9, 4), Point::new(40, 40), alloc::vec![Rect::new(8, 4, 20, 16), Rect::new(9, 4, 20, 16),]),
             // Damage nothing covers.
             (Point::new(4, 4), Point::new(40, 40), alloc::vec![Rect::new(50, 30, 10, 10)]),
             // Two surfaces overlapping each other inside one damage rectangle.
@@ -1362,10 +1311,7 @@ mod tests {
             // Partly off-screen, so the clip and the subtraction interact.
             (Point::new(-6, -4), Point::new(56, 40), alloc::vec![Rect::new(0, 0, 64, 48)]),
         ] {
-            let surfaces = [
-                SurfaceRef::new(sg, origin_a, &spx),
-                SurfaceRef::new(tg, origin_b, &tpx),
-            ];
+            let surfaces = [SurfaceRef::new(sg, origin_a, &spx), SurfaceRef::new(tg, origin_b, &tpx)];
             let mut a = crate::framebuffer::MemFramebuffer::new(g);
             let mut b = crate::framebuffer::MemFramebuffer::new(g);
             compose(&mut a, bg, &surfaces, &damage);
@@ -1430,7 +1376,9 @@ mod tests {
                 ShadowLayer { radius: 3, offset: Point::new(0, 9), colour: Rgb::BLACK, strength: 255 },
             ] {
                 for bounds in [Rect::new(14, 10, 30, 20), Rect::new(20, 12, 12, 12), Rect::new(-5, 30, 24, 25)] {
-                    for clip in [g.bounds(), Rect::new(20, 0, 9, 48), Rect::new(0, 15, 64, 4), Rect::new(30, 22, 30, 30)] {
+                    for clip in
+                        [g.bounds(), Rect::new(20, 0, 9, 48), Rect::new(0, 15, 64, 4), Rect::new(30, 22, 30, 30)]
+                    {
                         let draw = |f: fn(&mut crate::framebuffer::MemFramebuffer, Rect, u32, &ShadowLayer, &Rect)| {
                             let mut fb = crate::framebuffer::MemFramebuffer::new(pg);
                             fb.bytes_mut().copy_from_slice(&ground);
@@ -1615,19 +1563,14 @@ mod tests {
         let (tg, tpx) = patterned(24, 24, 24 * 4, 0xC0);
         for (a_at, b_at, damage) in [
             (Point::new(4, 4), Point::new(40, 40), alloc::vec![Rect::new(4, 4, 20, 16)]),
-            (Point::new(9, 4), Point::new(40, 40), alloc::vec![
-                Rect::new(8, 4, 20, 16),
-                Rect::new(9, 4, 20, 16),
-            ]),
+            (Point::new(9, 4), Point::new(40, 40), alloc::vec![Rect::new(8, 4, 20, 16), Rect::new(9, 4, 20, 16),]),
             // Overlapping, so one window's corner shows the other rather than the background.
             (Point::new(4, 4), Point::new(14, 10), alloc::vec![Rect::new(0, 0, 40, 40)]),
             (Point::new(-6, -4), Point::new(56, 40), alloc::vec![Rect::new(0, 0, 64, 48)]),
         ] {
             for shadow in [None, Some(shade())] {
-                let mut surfaces = [
-                    SurfaceRef::new(sg, a_at, &spx).with_corner(6),
-                    SurfaceRef::new(tg, b_at, &tpx).with_corner(6),
-                ];
+                let mut surfaces =
+                    [SurfaceRef::new(sg, a_at, &spx).with_corner(6), SurfaceRef::new(tg, b_at, &tpx).with_corner(6)];
                 if let Some(sh) = shadow {
                     surfaces = surfaces.map(|s| s.with_shadow(sh));
                 }
@@ -1838,11 +1781,7 @@ mod tests {
             for x in 0..4u32 {
                 let off = g.offset_of(x, y).unwrap();
                 let word = u32::from_le_bytes([px[off], px[off + 1], px[off + 2], px[off + 3]]);
-                assert_eq!(
-                    fb.get_pixel(x + 2, y + 1),
-                    Some(g.format.decode(word)),
-                    "surface pixel ({x},{y})"
-                );
+                assert_eq!(fb.get_pixel(x + 2, y + 1), Some(g.format.decode(word)), "surface pixel ({x},{y})");
             }
         }
         // Outside the surface stays background.
@@ -1858,10 +1797,7 @@ mod tests {
         compose_full(
             &mut fb,
             Rgb::BLACK,
-            &[
-                SurfaceRef::new(ga, Point::new(0, 0), &pa),
-                SurfaceRef::new(gb, Point::new(3, 3), &pb),
-            ],
+            &[SurfaceRef::new(ga, Point::new(0, 0), &pa), SurfaceRef::new(gb, Point::new(3, 3), &pb)],
         );
         // In the overlap, the top surface wins.
         let off = gb.offset_of(0, 0).unwrap();
@@ -1936,10 +1872,7 @@ mod tests {
         // §7 in one assertion: the gate cannot exist without this.
         let (ga, pa) = patterned(9, 7, 40, 0x21);
         let (gb, pb) = patterned(5, 11, 20, 0x8C);
-        let surfaces = [
-            SurfaceRef::new(ga, Point::new(-2, 3), &pa),
-            SurfaceRef::new(gb, Point::new(27, 9), &pb),
-        ];
+        let surfaces = [SurfaceRef::new(ga, Point::new(-2, 3), &pa), SurfaceRef::new(gb, Point::new(27, 9), &pb)];
         let mut a = screen();
         let mut b = screen();
         compose_full(&mut a, Rgb::new(3, 5, 7), &surfaces);
@@ -1967,12 +1900,7 @@ mod tests {
         let (g, px) = patterned(4, 4, 16, 0x11);
         let mut fb = screen();
         let before = fb.clone();
-        compose(
-            &mut fb,
-            Rgb::new(1, 2, 3),
-            &[SurfaceRef::new(g, Point::new(0, 0), &px)],
-            &[Rect::new(200, 200, 8, 8)],
-        );
+        compose(&mut fb, Rgb::new(1, 2, 3), &[SurfaceRef::new(g, Point::new(0, 0), &px)], &[Rect::new(200, 200, 8, 8)]);
         assert_eq!(fb, before);
     }
 }

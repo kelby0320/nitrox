@@ -32,11 +32,7 @@ impl MemFlags {
     /// [`KNOWN_BITS`](Self::KNOWN_BITS). Returns `None` on an unknown bit so
     /// the syscall layer can map it to `InvalidArgument`.
     pub const fn from_bits(bits: u64) -> Option<Self> {
-        if bits & !Self::KNOWN_BITS != 0 {
-            None
-        } else {
-            Some(MemFlags(bits))
-        }
+        if bits & !Self::KNOWN_BITS != 0 { None } else { Some(MemFlags(bits)) }
     }
 
     /// Parse a raw bit pattern, silently dropping unknown bits. For callers

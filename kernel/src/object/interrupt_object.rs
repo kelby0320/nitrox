@@ -186,10 +186,7 @@ impl Drop for InterruptObject {
         // (each waiter is removed before it unparks). Mirror `PendingOperation`.
         // SAFETY: `&mut self` is exclusive; no `SCHED` contention at drop.
         let inner = self.inner.get_mut();
-        debug_assert!(
-            inner.waiters.is_empty(),
-            "InterruptObject dropped with waiters still parked"
-        );
+        debug_assert!(inner.waiters.is_empty(), "InterruptObject dropped with waiters still parked");
     }
 }
 

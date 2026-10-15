@@ -2,8 +2,8 @@
 //! install, the boot-time memory-protection enables (NX, SMEP, SMAP), the
 //! trap kernel-stack setter, halting, and CPUID feature queries.
 
-use core::sync::atomic::Ordering;
 use core::arch::asm;
+use core::sync::atomic::Ordering;
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::x86_64::{gdt, idt, regs};
@@ -265,11 +265,8 @@ fn decode_signature(eax: u32) -> (u32, u32, u32) {
     let base_model = (eax >> 4) & 0xF;
     let base_family = (eax >> 8) & 0xF;
     let family = if base_family == 0xF { base_family + ((eax >> 20) & 0xFF) } else { base_family };
-    let model = if base_family == 0x6 || base_family == 0xF {
-        ((eax >> 16) & 0xF) << 4 | base_model
-    } else {
-        base_model
-    };
+    let model =
+        if base_family == 0x6 || base_family == 0xF { ((eax >> 16) & 0xF) << 4 | base_model } else { base_model };
     (family, model, stepping)
 }
 
@@ -338,11 +335,7 @@ fn log_identity() {
     let edx_ext1 = if max_ext >= 0x8000_0001 { regs::cpuid(0x8000_0001, 0).3 } else { 0 };
     let edx_ext7 = if max_ext >= 0x8000_0007 { regs::cpuid(0x8000_0007, 0).3 } else { 0 };
     let brand = if max_ext >= 0x8000_0004 {
-        brand_bytes([
-            regs::cpuid(0x8000_0002, 0),
-            regs::cpuid(0x8000_0003, 0),
-            regs::cpuid(0x8000_0004, 0),
-        ])
+        brand_bytes([regs::cpuid(0x8000_0002, 0), regs::cpuid(0x8000_0003, 0), regs::cpuid(0x8000_0004, 0)])
     } else {
         [0u8; 48]
     };

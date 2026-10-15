@@ -73,10 +73,7 @@ pub fn run(page_wait_secs: u32) {
     let mut shown = 0;
     for (index, page) in fbcon::text::Pages::new(log, geometry.cols, rows).enumerate() {
         let mut prompt = PromptBuf::new();
-        let _ = core::fmt::Write::write_fmt(
-            &mut prompt,
-            format_args!("— page {}/{} — any key —", index + 1, pages),
-        );
+        let _ = core::fmt::Write::write_fmt(&mut prompt, format_args!("— page {}/{} — any key —", index + 1, pages));
         fbcon::show_page(page, prompt.as_bytes());
         shown += 1;
         if !wait_for_key(wait_ns) {
@@ -93,11 +90,7 @@ pub fn run(page_wait_secs: u32) {
     fbcon::end_report();
     ps2::drain_keyboard();
     crate::drivers::xhci::hid::drain_keyboards();
-    crate::kprintln!(
-        "report: done, {} of {} page(s) shown; the keys that turned them were discarded",
-        shown,
-        pages
-    );
+    crate::kprintln!("report: done, {} of {} page(s) shown; the keys that turned them were discarded", shown, pages);
 }
 
 /// Wait until a key is pressed or `wait_ns` passes. Returns whether a key was pressed.

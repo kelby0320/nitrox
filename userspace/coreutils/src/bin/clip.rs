@@ -113,9 +113,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         // clipboard, a server that did not start, and a malformed reply are different repairs,
         // and "clipboard unavailable" for all three is the diagnosis-of-the-operand mistake
         // this tree keeps finding.
-        Err(ClipError::Transport(_)) => {
-            stage.die(b"clip: no /dev/clipboard in this namespace\n", EXIT_FAILURE)
-        }
+        Err(ClipError::Transport(_)) => stage.die(b"clip: no /dev/clipboard in this namespace\n", EXIT_FAILURE),
         Err(_) => stage.die(b"clip: the clipboard did not answer\n", EXIT_FAILURE),
     };
 
@@ -212,11 +210,7 @@ fn do_list(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
             let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(h), IPC_PAYLOAD_SIZE));
             let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
                 for (i, r) in rows[..n].iter().enumerate() {
-                    tw.write_row(&[
-                        Value::Int(i as i64),
-                        Value::Int(r.kind as i64),
-                        Value::Int(r.len as i64),
-                    ])?;
+                    tw.write_row(&[Value::Int(i as i64), Value::Int(r.kind as i64), Value::Int(r.len as i64)])?;
                 }
                 tw.finish_with_status(0)
             });

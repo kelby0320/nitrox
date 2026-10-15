@@ -184,10 +184,18 @@ mod tests {
     fn boot_buttons_press_and_release_on_change() {
         let b = &Layout::BOOT;
         assert_eq!(run(b, 0, &[0b001, 0, 0]), Some((vec![(EV_KEY, BTN_LEFT, KEY_PRESS), SYN], 0b001)));
-        assert_eq!(run(b, 0b001, &[0b110, 0, 0]), Some((
-            vec![(EV_KEY, BTN_LEFT, KEY_RELEASE), (EV_KEY, BTN_RIGHT, KEY_PRESS), (EV_KEY, BTN_MIDDLE, KEY_PRESS), SYN],
-            0b110
-        )));
+        assert_eq!(
+            run(b, 0b001, &[0b110, 0, 0]),
+            Some((
+                vec![
+                    (EV_KEY, BTN_LEFT, KEY_RELEASE),
+                    (EV_KEY, BTN_RIGHT, KEY_PRESS),
+                    (EV_KEY, BTN_MIDDLE, KEY_PRESS),
+                    SYN
+                ],
+                0b110
+            ))
+        );
         assert_eq!(run(b, 0b110, &[0b110, 0, 0]), Some((vec![], 0b110)), "nothing changed");
     }
 
@@ -221,7 +229,10 @@ mod tests {
     #[test]
     fn a_report_id_selects_and_prefixes() {
         let numbered = Layout { report_id: Some(2), ..Layout::BOOT };
-        assert_eq!(run(&numbered, 0, &[2, 1, 3, 0]), Some((vec![(EV_KEY, BTN_LEFT, KEY_PRESS), (EV_REL, REL_X, 3), SYN], 1)));
+        assert_eq!(
+            run(&numbered, 0, &[2, 1, 3, 0]),
+            Some((vec![(EV_KEY, BTN_LEFT, KEY_PRESS), (EV_REL, REL_X, 3), SYN], 1))
+        );
         assert_eq!(run(&numbered, 0, &[1, 1, 3, 0]), None, "another report");
     }
 

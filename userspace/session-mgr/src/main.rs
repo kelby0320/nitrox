@@ -57,9 +57,6 @@ static mut RECV_COUNT: usize = 0;
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
 
-
-
-
 /// Emit `msg` to the serial console.
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
@@ -158,9 +155,8 @@ fn wait_one(handle: u64) -> bool {
             return true;
         }
         // SAFETY: `waited` 24-byte results were written; the handle is the first word of each.
-        let fired = |h: u64| unsafe {
-            (0..waited as usize).any(|k| WAIT_RESULTS[24 * k..24 * k + 8] == h.to_le_bytes())
-        };
+        let fired =
+            |h: u64| unsafe { (0..waited as usize).any(|k| WAIT_RESULTS[24 * k..24 * k + 8] == h.to_le_bytes()) };
         if fired(notif) && libsession::drain_for_stop(notif) {
             stop();
         }
@@ -198,8 +194,6 @@ fn recv_handoff(ctrl: u64) -> u64 {
 // moved to `libsession` in M7 Part B — the shared session core both supervisors run. What
 // stays here is the *greeter*: prompting on a terminal, which is where the two columns
 // genuinely differ (`docs/architecture/graphical-session.md` §4).
-
-
 
 /// Bootstrap registers: `rdi` = notification channel (reaps the user shell), `rsi` =
 /// the inherited (LOOKUP-only) root namespace, `rdx` = the control channel service-mgr
@@ -247,8 +241,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // `RIGHT_WAIT` is not optional: `libsession::authenticate` blocks on this channel for
     // the reply, and a handle without it makes `sys_wait` reject the whole set — which
     // presents as a login that prompts, takes the password, and then never answers.
-    let (auth_status, auth_ch) =
-        ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    let (auth_status, auth_ch) = ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if auth_status != 0 || auth_ch == 0 {
         kprint(b"session-mgr: /svc/auth resolve FAIL; no session can authenticate\n");
     }
@@ -288,137 +281,135 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // forever — so typing `exit` left a machine with no prompt and no way back short of a
     // reboot. A login that cannot be repeated is not a login.
     loop {
-    // One terminal per session: it serves the login prompt, is bound into the session's
-    // namespace for the shell, and is closed when the session ends.
-    let tty = tty_open(root_ns);
+        // One terminal per session: it serves the login prompt, is bound into the session's
+        // namespace for the shell, and is closed when the session ends.
+        let tty = tty_open(root_ns);
 
-    match login(tty, auth_ch, &mut home, &mut user) {
-        Some((hl, ul)) => {
-            Line::new().s(b"session-mgr: login ok -> home=").s(&home[..hl]).end();
-            // **A session with the view broker, before the namespace** — its base is part of what
-            // the namespace binds. `None` builds the session without `/dev/views`.
-            let mut views_base = [0u8; 24];
-            let views = if views_sup != 0 {
-                libsession::views_open_session(views_sup, &user[..ul], &mut views_base)
-            } else {
-                None
-            };
-            let session_ns = libsession::build_namespace(&NamespaceSpec {
-                root_ns,
-                fs_endpoint,
-                profile_endpoint,
-                tty_endpoint,
-                clipboard_endpoint,
-                home: &home[..hl],
-                user: &user[..ul],
-                // A serial session renders no text, so it takes no fonts.
-                bind_fonts: false,
-                // The console *is* this column's terminal, so the serial session binds it.
-                // The graphical column will pass `false` — governing decision 3.
-                bind_console: true,
-                views_endpoint: if views.is_some() { views_endpoint } else { 0 },
-                views_base: &views_base[..views.map_or(0, |v| v.1)],
-                devices_endpoint,
-                storage_endpoint,
-                services_endpoint,
-                // A session lists its desktop entries; the window pieces are an application's.
-                bind_applications: true,
-                draw_endpoint: 0,
-                desktop_endpoint: 0,
-            });
-            if session_ns == 0 {
-                kprint(b"session-mgr: session namespace FAIL\n");
+        match login(tty, auth_ch, &mut home, &mut user) {
+            Some((hl, ul)) => {
+                Line::new().s(b"session-mgr: login ok -> home=").s(&home[..hl]).end();
+                // **A session with the view broker, before the namespace** — its base is part of what
+                // the namespace binds. `None` builds the session without `/dev/views`.
+                let mut views_base = [0u8; 24];
+                let views = if views_sup != 0 {
+                    libsession::views_open_session(views_sup, &user[..ul], &mut views_base)
+                } else {
+                    None
+                };
+                let session_ns = libsession::build_namespace(&NamespaceSpec {
+                    root_ns,
+                    fs_endpoint,
+                    profile_endpoint,
+                    tty_endpoint,
+                    clipboard_endpoint,
+                    home: &home[..hl],
+                    user: &user[..ul],
+                    // A serial session renders no text, so it takes no fonts.
+                    bind_fonts: false,
+                    // The console *is* this column's terminal, so the serial session binds it.
+                    // The graphical column will pass `false` — governing decision 3.
+                    bind_console: true,
+                    views_endpoint: if views.is_some() { views_endpoint } else { 0 },
+                    views_base: &views_base[..views.map_or(0, |v| v.1)],
+                    devices_endpoint,
+                    storage_endpoint,
+                    services_endpoint,
+                    // A session lists its desktop entries; the window pieces are an application's.
+                    bind_applications: true,
+                    draw_endpoint: 0,
+                    desktop_endpoint: 0,
+                });
+                if session_ns == 0 {
+                    kprint(b"session-mgr: session namespace FAIL\n");
+                    if let Some((id, _)) = views {
+                        libsession::views_close_session(views_sup, id);
+                    }
+                    // One bad session: go back to the prompt rather than bricking the console,
+                    // since a permanent park is a worse answer than letting someone try again.
+                    continue;
+                }
+                kprint(b"session-mgr: session namespace built (/home subtree + /dev/console");
+                // Named separately because it is the one member that can be absent, and a
+                // run with the bind disabled proved the unconditional message would announce
+                // a `/bin` that was not there — the log has to be able to say "no".
+                if session_has_bin() {
+                    kprint(b" + /bin");
+                }
+                if session_has_tty() {
+                    kprint(b" + /dev/tty");
+                }
+                if libsession::session_has_views() {
+                    kprint(b" + /dev/views");
+                }
+                if libsession::session_has_devices() {
+                    kprint(b" + /dev/devices");
+                }
+                if libsession::session_has_storage() {
+                    kprint(b" + /storage");
+                }
+                kprint(b")\n");
+                // The payoff: an unprivileged shell in the per-user namespace writes to home.
+                // `nxsh` here; the graphical column will pass `desktop-shell`. Everything
+                // else about the spawn -- the empty syscaps, the session namespace, the Tier-1
+                // setup channel carrying argv and the environment -- is identical, which is what
+                // made it worth sharing.
+                let code = spawn_leader(root_ns, session_ns, notif, "nxsh", &[], 0, &[]);
+                // **Tell the broker the session ended**, before the namespace goes: it asks whatever
+                // it started for this session to stop, and takes back their grants.
                 if let Some((id, _)) = views {
                     libsession::views_close_session(views_sup, id);
                 }
-                // One bad session: go back to the prompt rather than bricking the console,
-                // since a permanent park is a worse answer than letting someone try again.
-                continue;
-            }
-            kprint(b"session-mgr: session namespace built (/home subtree + /dev/console");
-            // Named separately because it is the one member that can be absent, and a
-            // run with the bind disabled proved the unconditional message would announce
-            // a `/bin` that was not there — the log has to be able to say "no".
-            if session_has_bin() {
-                kprint(b" + /bin");
-            }
-            if session_has_tty() {
-                kprint(b" + /dev/tty");
-            }
-            if libsession::session_has_views() {
-                kprint(b" + /dev/views");
-            }
-            if libsession::session_has_devices() {
-                kprint(b" + /dev/devices");
-            }
-            if libsession::session_has_storage() {
-                kprint(b" + /storage");
-            }
-            kprint(b")\n");
-            // The payoff: an unprivileged shell in the per-user namespace writes to home.
-            // `nxsh` here; the graphical column will pass `desktop-shell`. Everything
-            // else about the spawn -- the empty syscaps, the session namespace, the Tier-1
-            // setup channel carrying argv and the environment -- is identical, which is what
-            // made it worth sharing.
-            let code = spawn_leader(root_ns, session_ns, notif, "nxsh", &[], 0, &[]);
-            // **Tell the broker the session ended**, before the namespace goes: it asks whatever
-            // it started for this session to stop, and takes back their grants.
-            if let Some((id, _)) = views {
-                libsession::views_close_session(views_sup, id);
-            }
 
-            // Tear the session down. The shell has been reaped, so this drops the last
-            // reference to the namespace and with it every binding in it — the `/home`
-            // and `/bin` registrations and the `/session/user` snapshot. Without it each
-            // logout would leak a namespace, which is only harmless while there is
-            // exactly one login per boot.
-            // SAFETY: closing the namespace we created for this session.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
-            // And the terminal. `Close` is the revocation — a process that outlived the
-            // session cannot have its handle taken back, so the server declining to serve
-            // is what ends the terminal.
-            if tty != 0 {
-                tty_close(tty);
-            }
-
-            // The shell exited because the user asked it to. Say what happened and nothing
-            // more — this used to sit beside a harness branch claiming "verified its
-            // environment + wrote to home", a check an interactive session never ran.
-            {
-                // **One `kprint`, not four.** The console is shared, so a line assembled
-                // from several calls can be torn by any other process that logs between
-                // them — this one came back as `session ended (shell exit tty-server:
-                // terminal closed\n3)`, because the tty server logs the close while the
-                // status is being written. A log line that another writer can split down
-                // the middle is not a log line; assemble it, then emit it once.
-                let mut line = alloc::string::String::from(
-                    "session-mgr: session ended (shell exit ",
-                );
-                let mut buf = [0u8; 20];
-                if code < 0 {
-                    line.push('-');
+                // Tear the session down. The shell has been reaped, so this drops the last
+                // reference to the namespace and with it every binding in it — the `/home`
+                // and `/bin` registrations and the `/session/user` snapshot. Without it each
+                // logout would leak a namespace, which is only harmless while there is
+                // exactly one login per boot.
+                // SAFETY: closing the namespace we created for this session.
+                unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
+                // And the terminal. `Close` is the revocation — a process that outlived the
+                // session cannot have its handle taken back, so the server declining to serve
+                // is what ends the terminal.
+                if tty != 0 {
+                    tty_close(tty);
                 }
-                let digits = libkern::debug::fmt_u64(code.unsigned_abs() as u64, &mut buf);
-                line.push_str(core::str::from_utf8(digits).unwrap_or("?"));
-                line.push_str(")\n");
-                kprint(line.as_bytes());
+
+                // The shell exited because the user asked it to. Say what happened and nothing
+                // more — this used to sit beside a harness branch claiming "verified its
+                // environment + wrote to home", a check an interactive session never ran.
+                {
+                    // **One `kprint`, not four.** The console is shared, so a line assembled
+                    // from several calls can be torn by any other process that logs between
+                    // them — this one came back as `session ended (shell exit tty-server:
+                    // terminal closed\n3)`, because the tty server logs the close while the
+                    // status is being written. A log line that another writer can split down
+                    // the middle is not a log line; assemble it, then emit it once.
+                    let mut line = alloc::string::String::from("session-mgr: session ended (shell exit ");
+                    let mut buf = [0u8; 20];
+                    if code < 0 {
+                        line.push('-');
+                    }
+                    let digits = libkern::debug::fmt_u64(code.unsigned_abs() as u64, &mut buf);
+                    line.push_str(core::str::from_utf8(digits).unwrap_or("?"));
+                    line.push_str(")\n");
+                    kprint(line.as_bytes());
+                }
+                // **A shutdown ended this session** (administration Part E.4c): no prompt after it.
+                if libsession::stop_asked() {
+                    stop();
+                }
             }
-            // **A shutdown ended this session** (administration Part E.4c): no prompt after it.
-            if libsession::stop_asked() {
-                stop();
+            None => {
+                kprint(b"session-mgr: login denied\n");
+                if tty != 0 {
+                    tty_close(tty);
+                }
+                // Re-prompt rather than locking out. A serial console has no second way in,
+                // so a lockout bricks the machine; the pause is what keeps repeated failure
+                // from being a free brute-force oracle.
+                sleep_ms(2000);
             }
         }
-        None => {
-            kprint(b"session-mgr: login denied\n");
-            if tty != 0 {
-                tty_close(tty);
-            }
-            // Re-prompt rather than locking out. A serial console has no second way in,
-            // so a lockout bricks the machine; the pause is what keeps repeated failure
-            // from being a free brute-force oracle.
-            sleep_ms(2000);
-        }
-    }
     }
 }
 
@@ -515,8 +506,7 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
     }
     // SAFETY: bounded read-only slice over the reply.
     unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let rep = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -566,7 +556,6 @@ fn tty_close(ch: u64) {
     // SAFETY: closing our own channel handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, ch) };
 }
-
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

@@ -35,11 +35,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use libkern::debug::Line;
 use libkern::*;
-use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply};
 use librsproto::auth::{
     OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE, OP_AUTH_SET_PASSWORD, build_account_request, parse_account_list,
     parse_account_request,
 };
+use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply};
 use librsproto::storage::{OP_STORAGE_IN_USE, parse_in_use};
 use librsproto::views::*;
 use librsproto::{OP_NS_RESOLVE, OP_TTY_REDEEM, RS_FLAG_ERROR, RS_FLAG_REPLY, TTY_TOKEN_LEN, decode, encode};
@@ -139,8 +139,18 @@ enum State {
     Password(Pending),
     /// A `ChangePassword` held until the session's delay from its last failure has passed: the
     /// request to answer, the current password and the new one (administration Part D.3).
-    Changing { request_id: u64, current: Vec<u8>, new: Vec<u8> },
-    Running { process: u64, life: u64, view_ns: u64, view: String, program: String },
+    Changing {
+        request_id: u64,
+        current: Vec<u8>,
+        new: Vec<u8>,
+    },
+    Running {
+        process: u64,
+        life: u64,
+        view_ns: u64,
+        view: String,
+        program: String,
+    },
     Done,
 }
 
@@ -226,8 +236,7 @@ struct Broker {
 fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
     unsafe {
-        let Some(rs_len) =
-            encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
         else {
             return false;
         };
@@ -495,22 +504,24 @@ impl Broker {
         }
         let deadline = now_ns().saturating_add(REDEEM_WAIT_NS);
         let backend = send(tty, OP_TTY_REDEEM, 1, 0, token, &[])
-            .then(|| loop {
-                match recv_full(tty) {
-                    // **An error reply is not an answer, by its flag.** Today its body is twelve
-                    // bytes and would not read as a backend id anyway, but that is the error
-                    // format's length rather than this check: were a refusal ever read as an id,
-                    // every token the server refused would name the same made-up terminal, and a
-                    // window opened under it would cover them all.
-                    Ok(Some((op, 1, flags, body))) if op == OP_TTY_REDEEM => {
-                        break (flags & RS_FLAG_ERROR == 0)
-                            .then(|| <[u8; 4]>::try_from(body.as_slice()).ok().map(u32::from_le_bytes))
-                            .flatten();
+            .then(|| {
+                loop {
+                    match recv_full(tty) {
+                        // **An error reply is not an answer, by its flag.** Today its body is twelve
+                        // bytes and would not read as a backend id anyway, but that is the error
+                        // format's length rather than this check: were a refusal ever read as an id,
+                        // every token the server refused would name the same made-up terminal, and a
+                        // window opened under it would cover them all.
+                        Ok(Some((op, 1, flags, body))) if op == OP_TTY_REDEEM => {
+                            break (flags & RS_FLAG_ERROR == 0)
+                                .then(|| <[u8; 4]>::try_from(body.as_slice()).ok().map(u32::from_le_bytes))
+                                .flatten();
+                        }
+                        // A stray, or the error reply: nothing else is asked on this terminal.
+                        Ok(Some(_)) => received().into_iter().for_each(close),
+                        Ok(None) if wait_until(tty, deadline) => {}
+                        _ => break None,
                     }
-                    // A stray, or the error reply: nothing else is asked on this terminal.
-                    Ok(Some(_)) => received().into_iter().for_each(close),
-                    Ok(None) if wait_until(tty, deadline) => {}
-                    _ => break None,
                 }
             })
             .flatten();
@@ -706,12 +717,14 @@ impl Broker {
         unsafe { scrub(&mut *(&raw mut REPLY_MSG)) };
         let deadline = now_ns().saturating_add(ACCOUNTS_WAIT_NS);
         let answer = asked
-            .then(|| loop {
-                match recv_full(admin) {
-                    Ok(Some((o, 1, flags, body))) if o == op => break Some((flags & RS_FLAG_ERROR != 0, body)),
-                    Ok(Some(_)) => received().into_iter().for_each(close),
-                    Ok(None) if wait_until(admin, deadline) => {}
-                    _ => break None,
+            .then(|| {
+                loop {
+                    match recv_full(admin) {
+                        Ok(Some((o, 1, flags, body))) if o == op => break Some((flags & RS_FLAG_ERROR != 0, body)),
+                        Ok(Some(_)) => received().into_iter().for_each(close),
+                        Ok(None) if wait_until(admin, deadline) => {}
+                        _ => break None,
+                    }
                 }
             })
             .flatten();
@@ -964,9 +977,9 @@ impl Broker {
                 // password would be asked: a request that needs none says nothing about a window.
                 pending.backend = token.and_then(|t| self.redeem(&t));
                 let session = self.clients[i].session;
-                let remembered = pending.backend.is_some_and(|b| {
-                    self.sessions.get(session).is_some_and(|s| s.grace.covers(b, view, now_ns()))
-                });
+                let remembered = pending
+                    .backend
+                    .is_some_and(|b| self.sessions.get(session).is_some_and(|s| s.grace.covers(b, view, now_ns())));
                 if remembered {
                     self.audit(&alloc::format!("view: {what} — allowed, within the grace period"));
                     return self.start(i, OP_VIEWS_REQUEST, request_id, pending, principal);
@@ -1264,9 +1277,7 @@ impl Broker {
                 accounts::Settled::Done => {}
                 accounts::Settled::NotDone => return Err(why),
                 accounts::Settled::Unknown => {
-                    return Err(alloc::format!(
-                        "{why}; whether {name} was removed cannot be said, so {home} is kept"
-                    ));
+                    return Err(alloc::format!("{why}; whether {name} was removed cannot be said, so {home} is kept"));
                 }
             }
         }
@@ -1362,7 +1373,13 @@ impl Broker {
                     // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
                     let bound = endpoint != 0
                         && unsafe {
-                            syscall4(SYS_NS_BIND, view_ns, STORAGE_GRANT.as_ptr() as u64, STORAGE_GRANT.len() as u64, endpoint)
+                            syscall4(
+                                SYS_NS_BIND,
+                                view_ns,
+                                STORAGE_GRANT.as_ptr() as u64,
+                                STORAGE_GRANT.len() as u64,
+                                endpoint,
+                            )
                         } == 0;
                     if !bound {
                         close(view_ns);
@@ -1525,13 +1542,8 @@ impl Broker {
             unsafe { syscall1(SYS_PROCESS_TERMINATE, process as u64) };
         }
         self.audit(&alloc::format!("view: {what} — started"));
-        self.clients[i].state = State::Running {
-            process: process as u64,
-            life: life_ours,
-            view_ns,
-            view: p.view,
-            program: p.program,
-        };
+        self.clients[i].state =
+            State::Running { process: process as u64, life: life_ours, view_ns, view: p.view, program: p.program };
         reply_outcome(ch, op, request_id, Outcome::Started, "");
     }
 
@@ -1627,7 +1639,9 @@ impl Broker {
             let Some((life, code, crashed)) = self.exits.next(running) else {
                 break;
             };
-            let Some(i) = self.clients.iter().position(|c| matches!(c.state, State::Running { life: l, .. } if l == life)) else {
+            let Some(i) =
+                self.clients.iter().position(|c| matches!(c.state, State::Running { life: l, .. } if l == life))
+            else {
                 continue;
             };
             let session = self.clients[i].session;

@@ -43,11 +43,10 @@
 //! initramfs subsystem arrives (Phase 2) the same loader will accept
 //! bytes read from CPIO.
 
-use crate::arch::abi::{
-    DEFAULT_USER_STACK_SIZE as STACK_SIZE, DEFAULT_USER_STACK_TOP as STACK_TOP, E_MACHINE,
-    USER_VIRT_END,
-};
 use crate::arch::Paging;
+use crate::arch::abi::{
+    DEFAULT_USER_STACK_SIZE as STACK_SIZE, DEFAULT_USER_STACK_TOP as STACK_TOP, E_MACHINE, USER_VIRT_END,
+};
 use crate::arch::paging::ArchPaging;
 use crate::libkern::KBox;
 use crate::mm::addr_space::{AddressSpace, MapError};
@@ -129,10 +128,8 @@ pub fn load_elf(asp: &AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLoadEr
     // Walk program headers: detect PT_INTERP (reject), load PT_LOAD,
     // ignore everything else.
     for i in 0..ehdr.e_phnum {
-        let off = ehdr
-            .e_phoff
-            .checked_add((i as u64).wrapping_mul(ELF64_PHDR_SIZE as u64))
-            .ok_or(ElfLoadError::Truncated)?;
+        let off =
+            ehdr.e_phoff.checked_add((i as u64).wrapping_mul(ELF64_PHDR_SIZE as u64)).ok_or(ElfLoadError::Truncated)?;
         let phdr = parse_phdr(bytes, off as usize)?;
         match phdr.p_type {
             PT_INTERP => return Err(ElfLoadError::HasInterpreter),
@@ -148,17 +145,10 @@ pub fn load_elf(asp: &AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLoadEr
     // register-based — no argv/envp/auxv is placed on the stack). PT_LOAD
     // segments below stay eager because the loader copies file bytes into their
     // frames. See docs/architecture and docs/rationale/deferred-decisions.md.
-    let stack_range = VAddrRange::new(
-        VirtAddr::new(STACK_TOP - STACK_SIZE),
-        VirtAddr::new(STACK_TOP),
-    )
-    .expect("stack range constants are valid by construction");
-    let stack_vma = KBox::try_new(Vma::new(
-        stack_range,
-        Protection::WRITE | Protection::USER,
-        MappingKind::Anonymous,
-    ))
-    .map_err(|_| ElfLoadError::OutOfMemory)?;
+    let stack_range = VAddrRange::new(VirtAddr::new(STACK_TOP - STACK_SIZE), VirtAddr::new(STACK_TOP))
+        .expect("stack range constants are valid by construction");
+    let stack_vma = KBox::try_new(Vma::new(stack_range, Protection::WRITE | Protection::USER, MappingKind::Anonymous))
+        .map_err(|_| ElfLoadError::OutOfMemory)?;
     match asp.map_vma_lazy(stack_vma) {
         Ok(()) => {}
         // map_vma_lazy allocates nothing, so OutOfMemory cannot occur; the
@@ -170,10 +160,7 @@ pub fn load_elf(asp: &AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLoadEr
         }
     }
 
-    Ok(EntryInfo {
-        entry_point: VirtAddr::new(ehdr.e_entry),
-        stack_top: VirtAddr::new(STACK_TOP),
-    })
+    Ok(EntryInfo { entry_point: VirtAddr::new(ehdr.e_entry), stack_top: VirtAddr::new(STACK_TOP) })
 }
 
 // ----- Parsed header types -----
@@ -229,11 +216,7 @@ fn parse_ehdr(bytes: &[u8]) -> Result<Ehdr, ElfLoadError> {
     if e_phnum != 0 && (e_phentsize as usize) != ELF64_PHDR_SIZE {
         return Err(ElfLoadError::Truncated);
     }
-    Ok(Ehdr {
-        e_entry,
-        e_phoff,
-        e_phnum,
-    })
+    Ok(Ehdr { e_entry, e_phoff, e_phnum })
 }
 
 fn parse_phdr(bytes: &[u8], off: usize) -> Result<Phdr, ElfLoadError> {
@@ -251,36 +234,23 @@ fn parse_phdr(bytes: &[u8], off: usize) -> Result<Phdr, ElfLoadError> {
 }
 
 fn read_u16(bytes: &[u8], off: usize) -> Result<u16, ElfLoadError> {
-    let slice: [u8; 2] = bytes
-        .get(off..off + 2)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(ElfLoadError::Truncated)?;
+    let slice: [u8; 2] = bytes.get(off..off + 2).and_then(|s| s.try_into().ok()).ok_or(ElfLoadError::Truncated)?;
     Ok(u16::from_le_bytes(slice))
 }
 
 fn read_u32(bytes: &[u8], off: usize) -> Result<u32, ElfLoadError> {
-    let slice: [u8; 4] = bytes
-        .get(off..off + 4)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(ElfLoadError::Truncated)?;
+    let slice: [u8; 4] = bytes.get(off..off + 4).and_then(|s| s.try_into().ok()).ok_or(ElfLoadError::Truncated)?;
     Ok(u32::from_le_bytes(slice))
 }
 
 fn read_u64(bytes: &[u8], off: usize) -> Result<u64, ElfLoadError> {
-    let slice: [u8; 8] = bytes
-        .get(off..off + 8)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(ElfLoadError::Truncated)?;
+    let slice: [u8; 8] = bytes.get(off..off + 8).and_then(|s| s.try_into().ok()).ok_or(ElfLoadError::Truncated)?;
     Ok(u64::from_le_bytes(slice))
 }
 
 // ----- Segment loading -----
 
-fn map_load_segment(
-    asp: &AddressSpace,
-    bytes: &[u8],
-    phdr: &Phdr,
-) -> Result<(), ElfLoadError> {
+fn map_load_segment(asp: &AddressSpace, bytes: &[u8], phdr: &Phdr) -> Result<(), ElfLoadError> {
     let page = PAGE_SIZE as u64;
 
     // p_vaddr % PAGE == p_offset % PAGE is mandatory: it's the only
@@ -294,15 +264,9 @@ fn map_load_segment(
     }
 
     // Page-aligned VMA range covering [p_vaddr, p_vaddr + p_memsz).
-    let v_end = phdr
-        .p_vaddr
-        .checked_add(phdr.p_memsz)
-        .ok_or(ElfLoadError::BadSegmentRange)?;
+    let v_end = phdr.p_vaddr.checked_add(phdr.p_memsz).ok_or(ElfLoadError::BadSegmentRange)?;
     let aligned_start = phdr.p_vaddr & !(page - 1);
-    let aligned_end = v_end
-        .checked_add(page - 1)
-        .ok_or(ElfLoadError::BadSegmentRange)?
-        & !(page - 1);
+    let aligned_end = v_end.checked_add(page - 1).ok_or(ElfLoadError::BadSegmentRange)? & !(page - 1);
     if aligned_end > USER_VIRT_END {
         return Err(ElfLoadError::BadSegmentRange);
     }
@@ -318,8 +282,7 @@ fn map_load_segment(
         prot = prot | Protection::EXEC;
     }
 
-    let vma = KBox::try_new(Vma::new(range, prot, MappingKind::Anonymous))
-        .map_err(|_| ElfLoadError::OutOfMemory)?;
+    let vma = KBox::try_new(Vma::new(range, prot, MappingKind::Anonymous)).map_err(|_| ElfLoadError::OutOfMemory)?;
     match asp.map_vma(vma) {
         Ok(()) => {}
         Err((_, MapError::OutOfMemory)) => return Err(ElfLoadError::OutOfMemory),
@@ -336,10 +299,7 @@ fn map_load_segment(
     if phdr.p_filesz == 0 {
         return Ok(());
     }
-    let file_end = phdr
-        .p_offset
-        .checked_add(phdr.p_filesz)
-        .ok_or(ElfLoadError::Truncated)?;
+    let file_end = phdr.p_offset.checked_add(phdr.p_filesz).ok_or(ElfLoadError::Truncated)?;
     if (file_end as usize) > bytes.len() {
         return Err(ElfLoadError::Truncated);
     }
@@ -356,8 +316,8 @@ fn map_load_segment(
         // we just mapped (validated `aligned_start..aligned_end`
         // covers `[p_vaddr, p_vaddr + p_memsz)`), so translate must
         // succeed.
-        let phys = unsafe { Paging::translate(root, VirtAddr::new(va)) }
-            .expect("just-mapped virtual address must translate");
+        let phys =
+            unsafe { Paging::translate(root, VirtAddr::new(va)) }.expect("just-mapped virtual address must translate");
 
         // SAFETY: `phys` is a freshly-allocated frame owned by `asp`;
         // HHDM gives a writable view; `chunk` does not exceed the
@@ -439,23 +399,11 @@ mod tests {
         }
 
         fn load_segment(mut self, p_vaddr: u64, p_flags: u32, data: Vec<u8>, p_memsz: u64) -> Self {
-            self.segments.push(TestSegment {
-                p_type: PT_LOAD,
-                p_flags,
-                p_vaddr,
-                p_memsz,
-                data,
-            });
+            self.segments.push(TestSegment { p_type: PT_LOAD, p_flags, p_vaddr, p_memsz, data });
             self
         }
         fn interp_segment(mut self, p_vaddr: u64) -> Self {
-            self.segments.push(TestSegment {
-                p_type: PT_INTERP,
-                p_flags: 0,
-                p_vaddr,
-                p_memsz: 0,
-                data: Vec::new(),
-            });
+            self.segments.push(TestSegment { p_type: PT_INTERP, p_flags: 0, p_vaddr, p_memsz: 0, data: Vec::new() });
             self
         }
 
@@ -506,11 +454,9 @@ mod tests {
                 bytes[base + 8..base + 16].copy_from_slice(&seg_offsets[i].to_le_bytes());
                 bytes[base + 16..base + 24].copy_from_slice(&seg.p_vaddr.to_le_bytes());
                 // p_paddr (24..32): 0
-                bytes[base + 32..base + 40]
-                    .copy_from_slice(&(seg.data.len() as u64).to_le_bytes()); // p_filesz
+                bytes[base + 32..base + 40].copy_from_slice(&(seg.data.len() as u64).to_le_bytes()); // p_filesz
                 bytes[base + 40..base + 48].copy_from_slice(&seg.p_memsz.to_le_bytes());
-                bytes[base + 48..base + 56]
-                    .copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // p_align
+                bytes[base + 48..base + 56].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // p_align
             }
 
             bytes
@@ -518,8 +464,8 @@ mod tests {
     }
 
     fn read_user_byte(asp: &AddressSpace, virt: VirtAddr) -> u8 {
-        let phys = unsafe { Paging::translate(asp.root(), virt) }
-            .expect("address must be mapped for the test to read it");
+        let phys =
+            unsafe { Paging::translate(asp.root(), virt) }.expect("address must be mapped for the test to read it");
         unsafe { *((phys.as_u64() + heap::hhdm_offset()) as *const u8) }
     }
 
@@ -558,9 +504,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         // Any value that differs from the host's E_MACHINE rejects.
-        let bytes = ElfBuilder::new()
-            .machine(E_MACHINE.wrapping_add(1))
-            .build();
+        let bytes = ElfBuilder::new().machine(E_MACHINE.wrapping_add(1)).build();
         assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::WrongMachine));
         let bytes = ElfBuilder::new().e_type(3).build(); // ET_DYN
         assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::NotExecutable));
@@ -584,10 +528,7 @@ mod tests {
         for i in 0..0x80 {
             content.push((i as u8).wrapping_mul(7));
         }
-        let bytes = ElfBuilder::new()
-            .entry(0x400010)
-            .load_segment(0x400000, PF_R, content.clone(), 0x100)
-            .build();
+        let bytes = ElfBuilder::new().entry(0x400010).load_segment(0x400000, PF_R, content.clone(), 0x100).build();
 
         let info = load_elf(&asp, &bytes).expect("load must succeed");
         assert_eq!(info.entry_point, VirtAddr::new(0x400010));
@@ -616,10 +557,8 @@ mod tests {
         for i in 0..0x80 {
             content.push(0xA0 | (i as u8));
         }
-        let bytes = ElfBuilder::new()
-            .entry(0x400100)
-            .load_segment(0x400100, PF_R | PF_W, content.clone(), 0x80)
-            .build();
+        let bytes =
+            ElfBuilder::new().entry(0x400100).load_segment(0x400100, PF_R | PF_W, content.clone(), 0x80).build();
         load_elf(&asp, &bytes).expect("load must succeed");
 
         // Bytes below p_vaddr in the VMA's first page are zero (we
@@ -645,19 +584,12 @@ mod tests {
         for i in 0..size {
             content.push((i & 0xFF) as u8);
         }
-        let bytes = ElfBuilder::new()
-            .load_segment(0x400000, PF_R | PF_W, content.clone(), size)
-            .build();
+        let bytes = ElfBuilder::new().load_segment(0x400000, PF_R | PF_W, content.clone(), size).build();
         load_elf(&asp, &bytes).expect("load must succeed");
 
         // Sample first byte, last-of-first-page, first-of-second-page,
         // last byte.
-        let probes: &[u64] = &[
-            0,
-            (PAGE_SIZE as u64) - 1,
-            PAGE_SIZE as u64,
-            size - 1,
-        ];
+        let probes: &[u64] = &[0, (PAGE_SIZE as u64) - 1, PAGE_SIZE as u64, size - 1];
         for &off in probes {
             let got = read_user_byte(&asp, VirtAddr::new(0x400000 + off));
             assert_eq!(got, content[off as usize], "mismatch at offset {off:#x}");
@@ -669,18 +601,13 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         // Build manually with mismatched p_offset / p_vaddr mod PAGE.
-        let mut bytes = ElfBuilder::new()
-            .load_segment(0x400000, PF_R, vec![0u8; 4], 4)
-            .build();
+        let mut bytes = ElfBuilder::new().load_segment(0x400000, PF_R, vec![0u8; 4], 4).build();
         // Patch p_vaddr to 0x400123 (no matching adjustment to
         // p_offset, which the builder placed at PAGE-aligned).
         let phdr_base = ELF64_EHDR_SIZE;
         let bad_vaddr = 0x400123u64;
         bytes[phdr_base + 16..phdr_base + 24].copy_from_slice(&bad_vaddr.to_le_bytes());
-        assert_eq!(
-            load_elf(&asp, &bytes),
-            Err(ElfLoadError::BadSegmentAlignment)
-        );
+        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::BadSegmentAlignment));
     }
 
     #[test]
@@ -688,9 +615,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         // p_vaddr in the kernel half.
-        let bytes = ElfBuilder::new()
-            .load_segment(0xFFFF_8000_0000_0000, PF_R, vec![0u8; 4], 4)
-            .build();
+        let bytes = ElfBuilder::new().load_segment(0xFFFF_8000_0000_0000, PF_R, vec![0u8; 4], 4).build();
         assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::BadSegmentRange));
     }
 
@@ -712,9 +637,7 @@ mod tests {
         use crate::mm::vmm::FaultAccess;
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
-        let bytes = ElfBuilder::new()
-            .load_segment(0x400000, PF_R | PF_W, vec![0xCC; 0x40], 0x40)
-            .build();
+        let bytes = ElfBuilder::new().load_segment(0x400000, PF_R | PF_W, vec![0xCC; 0x40], 0x40).build();
         let info = load_elf(&asp, &bytes).expect("load must succeed");
         assert_eq!(info.stack_top, VirtAddr::new(STACK_TOP));
 

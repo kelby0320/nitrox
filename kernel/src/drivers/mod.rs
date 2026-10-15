@@ -8,18 +8,18 @@
 pub mod ahci;
 pub mod console;
 pub mod gpt;
-pub mod partitions;
 pub mod hid;
 pub mod input;
+pub mod partitions;
 pub mod ps2;
 pub mod xhci;
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::timer::ArchTimer;
 use crate::io::block::dispatch_block_irp;
+use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::io_op::IoOpcode;
-use crate::libkern::KBox;
 use crate::object::device_node::DeviceClass;
 use crate::object::{DeviceNode, MemoryObject, ObjectRef, PendingOperation};
 
@@ -138,11 +138,7 @@ pub fn self_test() {
 
     let (status, result) = crate::sched::pending_op_completion(po_check.as_ptr());
     if status != 0 || result != 512 {
-        crate::kprintln!(
-            "ahci: read self-test FAIL (status {} result {})",
-            status,
-            result
-        );
+        crate::kprintln!("ahci: read self-test FAIL (status {} result {})", status, result);
         return;
     }
 
@@ -151,13 +147,8 @@ pub fn self_test() {
     if sig == 0xAA55 {
         crate::kprintln!("ahci: read self-test OK (sector 0 boot sig 0x55AA, {})", how);
     } else {
-        crate::kprintln!(
-            "ahci: read self-test: sector 0 read OK ({}) but sig {:#06x} (no 0x55AA)",
-            how,
-            sig
-        );
+        crate::kprintln!("ahci: read self-test: sector 0 read OK ({}) but sig {:#06x} (no 0x55AA)", how, sig);
     }
-
 }
 
 /// Boot self-test: a transfer needing more fragments than the device can describe in one
@@ -202,15 +193,10 @@ fn oversize_refused(disk: &ObjectRef) {
         Err(_) => return,
     };
     match dispatch_block_irp(disk, &big, &po, IoOpcode::Read, 0, 0, bytes as u64) {
-        Err(crate::syscall::error::KError::InvalidArgument) => crate::kprintln!(
-            "ahci: oversize self-test OK ({} frags > {} refused)",
-            pages,
-            backend.max_frags
-        ),
-        Err(e) => crate::kprintln!(
-            "ahci: oversize self-test FAIL (refused, but with {:?} not InvalidArgument)",
-            e
-        ),
+        Err(crate::syscall::error::KError::InvalidArgument) => {
+            crate::kprintln!("ahci: oversize self-test OK ({} frags > {} refused)", pages, backend.max_frags)
+        }
+        Err(e) => crate::kprintln!("ahci: oversize self-test FAIL (refused, but with {:?} not InvalidArgument)", e),
         // It was accepted: the command was built past the end of its table.
         Ok(()) => crate::kprintln!(
             "ahci: oversize self-test FAIL ({} frags accepted, table holds {})",

@@ -48,11 +48,7 @@ pub struct IrpBuffer {
 
 impl IrpBuffer {
     /// An absent buffer.
-    pub const NONE: IrpBuffer = IrpBuffer {
-        kind: IRP_BUF_NONE,
-        count: 0,
-        frags: 0,
-    };
+    pub const NONE: IrpBuffer = IrpBuffer { kind: IRP_BUF_NONE, count: 0, frags: 0 };
 }
 
 /// One driver-stack frame: which `DeviceNode` this layer targets, an optional
@@ -71,11 +67,7 @@ pub struct IrpStackFrame {
 
 impl IrpStackFrame {
     /// An empty stack frame.
-    pub const EMPTY: IrpStackFrame = IrpStackFrame {
-        device: 0,
-        completion: 0,
-        context: 0,
-    };
+    pub const EMPTY: IrpStackFrame = IrpStackFrame { device: 0, completion: 0, context: 0 };
 }
 
 /// `IrpOp` — the operation an IRP carries. Kept numerically aligned with
@@ -150,11 +142,7 @@ impl Irp {
         initiator: u64,
     ) -> Self {
         let mut stack = [IrpStackFrame::EMPTY; IRP_MAX_STACK];
-        stack[0] = IrpStackFrame {
-            device: device as u64,
-            completion: 0,
-            context: 0,
-        };
+        stack[0] = IrpStackFrame { device: device as u64, completion: 0, context: 0 };
         Irp {
             op: op as u32,
             status: IrpStatus::Pending as i32,
@@ -246,8 +234,7 @@ mod tests {
 
     #[test]
     fn set_completion_records_status_and_count() {
-        let mut irp =
-            Irp::new_block(IrpOp::Read, core::ptr::null(), 0, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0);
+        let mut irp = Irp::new_block(IrpOp::Read, core::ptr::null(), 0, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0);
         irp.set_completion(IrpStatus::Success as i32, 512);
         assert_eq!(irp.status, 0);
         assert_eq!(irp.transferred, 512);

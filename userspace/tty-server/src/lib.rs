@@ -306,9 +306,8 @@ pub mod routing {
     // `librsproto` for exactly this reason.
     use libkern::error::KError;
     use librsproto::{
-        OP_TTY_INTERRUPT as OP_INTERRUPT, OP_TTY_READ as OP_READ,
-        OP_TTY_READ_LINE as OP_READ_LINE, OP_TTY_SET_MODE as OP_SET_MODE,
-        OP_TTY_WRITE as OP_WRITE,
+        OP_TTY_INTERRUPT as OP_INTERRUPT, OP_TTY_READ as OP_READ, OP_TTY_READ_LINE as OP_READ_LINE,
+        OP_TTY_SET_MODE as OP_SET_MODE, OP_TTY_WRITE as OP_WRITE,
     };
 
     /// Where a terminal's bytes come from and go to.
@@ -400,11 +399,7 @@ pub mod routing {
         /// A registry holding only the console backend.
         pub fn new() -> Registry {
             Registry {
-                backends: alloc::vec![Backend {
-                    id: CONSOLE,
-                    sink: Sink::Console,
-                    pending: VecDeque::new(),
-                }],
+                backends: alloc::vec![Backend { id: CONSOLE, sink: Sink::Console, pending: VecDeque::new() }],
                 ttys: Vec::new(),
                 next_backend: CONSOLE + 1,
             }
@@ -471,13 +466,7 @@ pub mod routing {
             let Some(backend) = self.ttys.iter().find(|t| t.ch == of).map(|t| t.backend) else {
                 return false;
             };
-            self.ttys.push(Tty {
-                ch,
-                disc: Discipline::new(),
-                waiting: None,
-                interrupt_pending: false,
-                backend,
-            });
+            self.ttys.push(Tty { ch, disc: Discipline::new(), waiting: None, interrupt_pending: false, backend });
             true
         }
 
@@ -567,8 +556,7 @@ pub mod routing {
                     self.interrupt(id, &mut acts);
                     continue;
                 }
-                let Some(i) = self.ttys.iter().position(|t| t.backend == id && t.waiting.is_some())
-                else {
+                let Some(i) = self.ttys.iter().position(|t| t.backend == id && t.waiting.is_some()) else {
                     return acts; // nobody on this backend is reading; hold the bytes
                 };
                 if let Some((rid, ReadKind::Raw)) = self.ttys[i].waiting {
@@ -588,12 +576,7 @@ pub mod routing {
                         out.push(q.pop_front().expect("non-empty"));
                     }
                     self.ttys[i].waiting = None;
-                    acts.push(Act::Reply {
-                        ch: self.ttys[i].ch,
-                        op: OP_READ,
-                        request_id: rid,
-                        body: out,
-                    });
+                    acts.push(Act::Reply { ch: self.ttys[i].ch, op: OP_READ, request_id: rid, body: out });
                     continue;
                 }
                 let b = self.backends[bi].pending.pop_front().expect("non-empty");
@@ -603,12 +586,7 @@ pub mod routing {
                     Step::Line { bytes, echo } => {
                         acts.push(Act::Write(sink, echo));
                         let (rid, _) = self.ttys[i].waiting.take().expect("waiting");
-                        acts.push(Act::Reply {
-                            ch: self.ttys[i].ch,
-                            op: OP_READ_LINE,
-                            request_id: rid,
-                            body: bytes,
-                        });
+                        acts.push(Act::Reply { ch: self.ttys[i].ch, op: OP_READ_LINE, request_id: rid, body: bytes });
                     }
                     // Canonical mode has no history to recall, so a cursor key is nothing here.
                     // A client that wants them reads raw and runs the discipline itself.
@@ -643,12 +621,7 @@ pub mod routing {
         /// business interrupting a program in another.
         fn interrupt(&mut self, id: u32, acts: &mut Vec<Act>) {
             for t in self.ttys.iter_mut().filter(|t| t.backend == id) {
-                acts.push(Act::Reply {
-                    ch: t.ch,
-                    op: OP_INTERRUPT,
-                    request_id: 0,
-                    body: Vec::new(),
-                });
+                acts.push(Act::Reply { ch: t.ch, op: OP_INTERRUPT, request_id: 0, body: Vec::new() });
                 // **An outstanding read is completed, empty.** Otherwise a client sitting at a
                 // prompt stays blocked on a read whose byte just became an event, and could not
                 // redraw until the user typed something else. A raw read otherwise only ever
@@ -721,10 +694,7 @@ pub mod routing {
         /// A `Write` request from terminal `ch`.
         pub fn write(&mut self, ch: u64, request_id: u64, body: &[u8]) -> Vec<Act> {
             let Some(sink) = self.sink_of(ch) else { return Vec::new() };
-            alloc::vec![
-                Act::Write(sink, body.to_vec()),
-                Act::Reply { ch, op: OP_WRITE, request_id, body: Vec::new() },
-            ]
+            alloc::vec![Act::Write(sink, body.to_vec()), Act::Reply { ch, op: OP_WRITE, request_id, body: Vec::new() },]
         }
 
         /// A `SetMode` request from terminal `ch`.
@@ -764,7 +734,6 @@ pub mod routing {
 
     /// Bytes a single raw read takes at most.
     const RAW_CHUNK: usize = 64;
-
 }
 
 /// **One-time tokens naming a terminal's backend** — `Tty::Token` and `Tty::Redeem` (laptop polish
@@ -1092,10 +1061,7 @@ mod routing_tests {
         let mut r = console_ttys(1);
         r.read(1, 1, ReadKind::Line);
         let acts = r.read(1, 2, ReadKind::Line);
-        assert!(
-            matches!(acts.as_slice(), [Act::Fail { request_id: 2, .. }]),
-            "expected a refusal, got {acts:?}",
-        );
+        assert!(matches!(acts.as_slice(), [Act::Fail { request_id: 2, .. }]), "expected a refusal, got {acts:?}",);
     }
 
     #[test]
@@ -1107,10 +1073,7 @@ mod routing_tests {
         let acts = r.feed(CONSOLE, b"ab\x03cd");
         let got = replies_to(&acts, 1);
         assert_eq!(got[0], (OP_TTY_READ, b"ab".to_vec()), "the bytes before the interrupt");
-        assert!(
-            got.iter().any(|(op, _)| *op == OP_TTY_INTERRUPT),
-            "the interrupt was swallowed as data: {got:?}",
-        );
+        assert!(got.iter().any(|(op, _)| *op == OP_TTY_INTERRUPT), "the interrupt was swallowed as data: {got:?}",);
     }
 
     #[test]
@@ -1444,12 +1407,12 @@ mod tests {
         // **The bug this state machine shipped with.** `ESC [ 3 ~` is Delete on every real
         // terminal; ending the sequence at the `3` left the `~` to be typed and echoed.
         for seq in [
-            &b"\x1b[3~"[..], // Delete
-            &b"\x1b[2~"[..], // Insert
-            &b"\x1b[5~"[..], // PageUp
-            &b"\x1b[6~"[..], // PageDown
-            &b"\x1b[H"[..],  // Home
-            &b"\x1b[F"[..],  // End
+            &b"\x1b[3~"[..],   // Delete
+            &b"\x1b[2~"[..],   // Insert
+            &b"\x1b[5~"[..],   // PageUp
+            &b"\x1b[6~"[..],   // PageDown
+            &b"\x1b[H"[..],    // Home
+            &b"\x1b[F"[..],    // End
             &b"\x1b[1;5D"[..], // a modified cursor key: two parameters and a separator
         ] {
             let mut d = Discipline::new();

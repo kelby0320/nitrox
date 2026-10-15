@@ -10,8 +10,9 @@ const HEADER: &str = "# Nitrox user database (auth-service).\n# name:salt_hex:it
 
 fn line(name: &str, password: &str, salt: &[u8]) -> String {
     let mut out = [0u8; MAX_FILE];
-    let n = write_record_with(&mut out, name.as_bytes(), format!("/home/{name}").as_bytes(), password.as_bytes(), salt, IT)
-        .unwrap();
+    let n =
+        write_record_with(&mut out, name.as_bytes(), format!("/home/{name}").as_bytes(), password.as_bytes(), salt, IT)
+            .unwrap();
     String::from_utf8(out[..n].to_vec()).unwrap()
 }
 
@@ -55,11 +56,8 @@ fn a_record_in_the_old_hand_written_form_still_verifies() {
 /// one name is the one found.
 #[test]
 fn only_well_formed_lines_are_records() {
-    let text = format!(
-        "{HEADER}\n  \nnot a record\nx:zz:1:zz\n{}{}",
-        line("alice", "a", b"s1"),
-        line("alice", "b", b"s2")
-    );
+    let text =
+        format!("{HEADER}\n  \nnot a record\nx:zz:1:zz\n{}{}", line("alice", "a", b"s1"), line("alice", "b", b"s2"));
     let names: Vec<&[u8]> = records(text.as_bytes()).map(|r| r.name).collect();
     assert_eq!(names, [&b"alice"[..], b"alice"]);
     assert!(find(text.as_bytes(), b"alice").unwrap().verifies(b"a"), "the first");
@@ -199,14 +197,8 @@ fn a_new_password_replaces_the_record_in_place() {
     assert!(!r.verifies(b"old"));
     assert_eq!(r.home, b"/home/bob");
     assert_eq!(records(out.as_bytes()).count(), 3);
-    assert_eq!(
-        edit(|o| set_password_with(file.as_bytes(), o, b"dave", b"x", b"s", IT)),
-        Err(Refusal::NoSuchAccount)
-    );
-    assert_eq!(
-        edit(|o| set_password_with(file.as_bytes(), o, b"bob", b"", b"s", IT)),
-        Err(Refusal::BadPassword)
-    );
+    assert_eq!(edit(|o| set_password_with(file.as_bytes(), o, b"dave", b"x", b"s", IT)), Err(Refusal::NoSuchAccount));
+    assert_eq!(edit(|o| set_password_with(file.as_bytes(), o, b"bob", b"", b"s", IT)), Err(Refusal::BadPassword));
 }
 
 /// **The record's home is kept as the file has it**, not recomputed from the name: a home an
@@ -238,10 +230,7 @@ fn an_add_is_bounded_at_exactly_max_file() {
     let out = edit(|o| add_with(fits.as_bytes(), o, b"bob", b"b", b"0123456789abcdef", IT)).unwrap();
     assert_eq!(out.len(), MAX_FILE);
     let over = padded_to(MAX_FILE - bob.len() + 1, &alice);
-    assert_eq!(
-        edit(|o| add_with(over.as_bytes(), o, b"bob", b"b", b"0123456789abcdef", IT)),
-        Err(Refusal::TooLarge)
-    );
+    assert_eq!(edit(|o| add_with(over.as_bytes(), o, b"bob", b"b", b"0123456789abcdef", IT)), Err(Refusal::TooLarge));
 }
 
 /// **A longer salt grows the record, and the bound holds for a password change too** — the case

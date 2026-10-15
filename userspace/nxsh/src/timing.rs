@@ -179,7 +179,11 @@ mod tests {
     /// nothing.
     #[test]
     fn the_line_names_what_moved() {
-        let before = [row("blk-0", 100, 1 << 20, 10, 4096, 5_000_000), row("blk-2", 7, 512, 0, 0, 1), row("page-cache", 50, 50 * 4096, 2, 8192, 0)];
+        let before = [
+            row("blk-0", 100, 1 << 20, 10, 4096, 5_000_000),
+            row("blk-2", 7, 512, 0, 0, 1),
+            row("page-cache", 50, 50 * 4096, 2, 8192, 0),
+        ];
         let after = [
             row("blk-0", 1300, (1 << 20) + 5_033_164, 310, 4096 + (5 << 20), 3_215_000_000),
             row("blk-2", 7, 512, 0, 0, 1),
@@ -207,31 +211,67 @@ mod tests {
     #[test]
     fn rows_read_from_the_table_and_its_nulls_as_zero() {
         let int = |s: Schema, n: &str| s.field(n, TypeTag::Int, TypeModifiers::NULLABLE);
-        let schema = ["reads", "writes", "flushes", "errors", "read_bytes", "written_bytes", "busy_ns", "hits", "holes"]
-            .into_iter()
-            .fold(Schema::new().field("name", TypeTag::String, TypeModifiers::NONE), int);
+        let schema =
+            ["reads", "writes", "flushes", "errors", "read_bytes", "written_bytes", "busy_ns", "hits", "holes"]
+                .into_iter()
+                .fold(Schema::new().field("name", TypeTag::String, TypeModifiers::NONE), int);
         let n = |v: i64| Value::Int(v);
         let t = Table {
             flags: StreamFlags::NONE,
             schema,
             rows: vec![
                 vec![Value::Str("blk-0".into()), n(3), n(4), n(5), n(0), n(6), n(7), n(8), Value::Null, Value::Null],
-                vec![Value::Str("page-cache".into()), n(9), n(1), Value::Null, Value::Null, n(2), n(3), n(4), n(10), n(11)],
+                vec![
+                    Value::Str("page-cache".into()),
+                    n(9),
+                    n(1),
+                    Value::Null,
+                    Value::Null,
+                    n(2),
+                    n(3),
+                    n(4),
+                    n(10),
+                    n(11),
+                ],
             ],
         };
         let mut bytes = Vec::new();
         t.encode(&mut bytes).unwrap();
         let r = rows(&bytes).unwrap();
-        assert_eq!(r[0], IoRow { name: "blk-0".into(), reads: 3, writes: 4, flushes: 5, read_bytes: 6, written_bytes: 7, busy_ns: 8, ..Default::default() });
+        assert_eq!(
+            r[0],
+            IoRow {
+                name: "blk-0".into(),
+                reads: 3,
+                writes: 4,
+                flushes: 5,
+                read_bytes: 6,
+                written_bytes: 7,
+                busy_ns: 8,
+                ..Default::default()
+            }
+        );
         assert_eq!((r[1].flushes, r[1].hits), (0, 10));
         assert!(rows(b"not a table").is_none());
     }
 
     #[test]
     fn sizes_and_counts_read_as_a_person_reads_them() {
-        assert_eq!((group(0), group(999), group(1000), group(1_234_567)), ("0".into(), "999".into(), "1,000".into(), "1,234,567".into()));
-        assert_eq!((bytes(1023), bytes(1024), bytes(1536), bytes(3 << 30)), ("1023 B".into(), "1.0 KiB".into(), "1.5 KiB".into(), "3.0 GiB".into()));
-        assert_eq!((duration(499), duration(1_499_999), duration(61_004_999_999)), ("0 us".into(), "1 ms".into(), "61.00 s".into()));
-        assert_eq!((duration(500), duration(999_999_999), duration(1_005_000_000)), ("1 us".into(), "1000 ms".into(), "1.01 s".into()));
+        assert_eq!(
+            (group(0), group(999), group(1000), group(1_234_567)),
+            ("0".into(), "999".into(), "1,000".into(), "1,234,567".into())
+        );
+        assert_eq!(
+            (bytes(1023), bytes(1024), bytes(1536), bytes(3 << 30)),
+            ("1023 B".into(), "1.0 KiB".into(), "1.5 KiB".into(), "3.0 GiB".into())
+        );
+        assert_eq!(
+            (duration(499), duration(1_499_999), duration(61_004_999_999)),
+            ("0 us".into(), "1 ms".into(), "61.00 s".into())
+        );
+        assert_eq!(
+            (duration(500), duration(999_999_999), duration(1_005_000_000)),
+            ("1 us".into(), "1000 ms".into(), "1.01 s".into())
+        );
     }
 }

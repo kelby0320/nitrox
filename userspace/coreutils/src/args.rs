@@ -133,19 +133,11 @@ fn set(out: &mut Args, long: &'static str) {
 }
 
 fn lookup_long(name: &str, flags: &[Flag]) -> Option<Flag> {
-    flags
-        .iter()
-        .chain(UNIVERSAL_FLAGS.iter())
-        .find(|f| f.long == name)
-        .copied()
+    flags.iter().chain(UNIVERSAL_FLAGS.iter()).find(|f| f.long == name).copied()
 }
 
 fn lookup_short(c: char, flags: &[Flag]) -> Option<Flag> {
-    flags
-        .iter()
-        .chain(UNIVERSAL_FLAGS.iter())
-        .find(|f| f.short == c && c != '\0')
-        .copied()
+    flags.iter().chain(UNIVERSAL_FLAGS.iter()).find(|f| f.short == c && c != '\0').copied()
 }
 
 #[cfg(test)]
@@ -163,11 +155,7 @@ mod tests {
 
     #[test]
     fn parses_long_short_and_operands() {
-        let a = parse(
-            &argv(&["copy", "--recursive", "-f", "/src", "/dst"]),
-            &[RECURSIVE, FORCE],
-        )
-        .unwrap();
+        let a = parse(&argv(&["copy", "--recursive", "-f", "/src", "/dst"]), &[RECURSIVE, FORCE]).unwrap();
         assert!(a.has("recursive") && a.has("force"));
         assert_eq!(a.operands, vec![String::from("/src"), String::from("/dst")]);
     }
@@ -201,15 +189,9 @@ mod tests {
             parse(&argv(&["list", "--recusive"]), &[RECURSIVE]),
             Err(ArgError::UnknownLong(String::from("recusive")))
         );
-        assert_eq!(
-            parse(&argv(&["list", "-z"]), &[RECURSIVE]),
-            Err(ArgError::UnknownShort('z'))
-        );
+        assert_eq!(parse(&argv(&["list", "-z"]), &[RECURSIVE]), Err(ArgError::UnknownShort('z')));
         // A cluster fails on the offending letter even if the others are valid.
-        assert_eq!(
-            parse(&argv(&["remove", "-rz"]), &[RECURSIVE]),
-            Err(ArgError::UnknownShort('z'))
-        );
+        assert_eq!(parse(&argv(&["remove", "-rz"]), &[RECURSIVE]), Err(ArgError::UnknownShort('z')));
     }
 
     #[test]

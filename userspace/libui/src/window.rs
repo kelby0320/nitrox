@@ -53,7 +53,7 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
-use librsproto::surface::{CreateWindowRequest, Role, KeyEvent};
+use librsproto::surface::{CreateWindowRequest, KeyEvent, Role};
 use libsurface::buffers::BufferPool;
 use libsurface::{Session, Transport, WindowEvent};
 
@@ -168,9 +168,7 @@ impl Child {
         if size.w == 0 || size.h == 0 || size.w >= MEASURE_MAX || size.h >= MEASURE_MAX {
             return None;
         }
-        let id = session
-            .create(&CreateWindowRequest::at(size.w, size.h, role, at.0, at.1), buffers)
-            .ok()?;
+        let id = session.create(&CreateWindowRequest::at(size.w, size.h, role, at.0, at.1), buffers).ok()?;
         let built = (|| {
             let scratch = compose_buffer(size)?;
             let pool = BufferPool::new(&mut session.window(id)?, size, buffers)?;
@@ -264,9 +262,7 @@ impl Child {
         if size.w == 0 || size.h == 0 {
             return None;
         }
-        let id = session
-            .create(&CreateWindowRequest::at(size.w, size.h, role, at.0, at.1), buffers)
-            .ok()?;
+        let id = session.create(&CreateWindowRequest::at(size.w, size.h, role, at.0, at.1), buffers).ok()?;
         let built = (|| {
             let scratch = compose_buffer(size)?;
             let pool = BufferPool::new(&mut session.window(id)?, size, buffers)?;
@@ -457,8 +453,7 @@ impl Child {
             && let Ok(b) = self.pool.acquire(&mut w, self.size)
             && self.pool.write(b, self.scratch.bytes())
         {
-            let region =
-                (damage.origin.x as u32, damage.origin.y as u32, damage.size.w, damage.size.h);
+            let region = (damage.origin.x as u32, damage.origin.y as u32, damage.size.w, damage.size.h);
             drawn = session.window(self.id).is_some_and(|mut w| w.commit(b, region).is_ok());
         }
         if !drawn {
@@ -488,9 +483,7 @@ impl Child {
         event: &WindowEvent,
     ) -> Vec<Msg> {
         match event {
-            WindowEvent::Key(k) => {
-                self.router.key(&self.tree, content, *k).into_iter().collect()
-            }
+            WindowEvent::Key(k) => self.router.key(&self.tree, content, *k).into_iter().collect(),
             WindowEvent::Pointer(p) => {
                 let bounds = Rect::new(0, 0, self.size.w, self.size.h);
                 let l = layout(content, bounds, &FontMetrics::new(font, theme.font_px));
@@ -532,13 +525,7 @@ impl Child {
     ///
     /// `l` must be the layout `content` was presented with — see
     /// [`present_laid_out`](Self::present_laid_out) for why a main window has one to hand.
-    pub fn drop_at<Msg: Clone>(
-        &mut self,
-        content: &Element<Msg>,
-        l: &Layout,
-        x: i32,
-        y: i32,
-    ) -> bool {
+    pub fn drop_at<Msg: Clone>(&mut self, content: &Element<Msg>, l: &Layout, x: i32, y: i32) -> bool {
         self.router.drop_at(&self.tree, content, l, x, y).is_some()
     }
 
@@ -705,9 +692,8 @@ mod tests {
         };
         // **The shipped decision, not a copy of it.** `Child::hovered_key` delegates to this, so
         // breaking the rule fails this test — which the first version of it did not.
-        let seen = |router: &Router, live: Option<u64>, shown: Option<u64>| {
-            reported_hover(router.grabbed(), live, shown)
-        };
+        let seen =
+            |router: &Router, live: Option<u64>, shown: Option<u64>| reported_hover(router.grabbed(), live, shown);
 
         // Frame one, drawn with nothing hovered.
         let ui = menu(seen(&router, live, shown));

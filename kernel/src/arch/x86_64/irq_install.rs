@@ -52,11 +52,7 @@ fn compose(vector: u8, dest: u32) -> Option<MsiMessage> {
     if dest > MSI_MAX_DEST {
         return None;
     }
-    Some(MsiMessage {
-        address: MSI_ADDR_BASE | ((dest as u64) << MSI_ADDR_DEST_SHIFT),
-        data: vector as u16,
-        vector,
-    })
+    Some(MsiMessage { address: MSI_ADDR_BASE | ((dest as u64) << MSI_ADDR_DEST_SHIFT), data: vector as u16, vector })
 }
 
 impl ArchIrqInstall for X86IrqInstall {

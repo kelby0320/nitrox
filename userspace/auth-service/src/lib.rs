@@ -16,9 +16,8 @@
 
 use libkern::KError;
 use librsproto::auth::{
-    AUTH_RESULT_AUTHENTICATED, AccountListWriter, OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE,
-    OP_AUTH_SET_PASSWORD, build_authenticate_reply, build_denied_reply, parse_account_request,
-    parse_authenticate_request,
+    AUTH_RESULT_AUTHENTICATED, AccountListWriter, OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE, OP_AUTH_SET_PASSWORD,
+    build_authenticate_reply, build_denied_reply, parse_account_request, parse_authenticate_request,
 };
 
 /// The PBKDF2 verifier length (one SHA-256 block), matching `libcrypto`.
@@ -42,9 +41,7 @@ const DUMMY_VERIFIER: [u8; VERIFIER_LEN] = [0u8; VERIFIER_LEN];
 /// runs a dummy verify (constant work) and returns [`AuthOutcome::Denied`].
 pub fn authenticate<'a>(db: &'a [u8], username: &[u8], password: &[u8]) -> AuthOutcome<'a> {
     match libusers::find(db, username) {
-        Some(rec) if rec.verifies(password) => {
-            AuthOutcome::Authenticated { principal: rec.name, home: rec.home }
-        }
+        Some(rec) if rec.verifies(password) => AuthOutcome::Authenticated { principal: rec.name, home: rec.home },
         Some(_) => AuthOutcome::Denied,
         None => {
             // Unknown user: run an equivalent derivation so timing does not distinguish it.
@@ -106,9 +103,7 @@ impl Refused {
     pub fn kerror(self) -> KError {
         use libusers::Refusal;
         match self {
-            Refused::Edit(Refusal::BadName | Refusal::BadPassword) | Refused::Malformed => {
-                KError::InvalidArgument
-            }
+            Refused::Edit(Refusal::BadName | Refusal::BadPassword) | Refused::Malformed => KError::InvalidArgument,
             Refused::Edit(Refusal::Exists) => KError::AlreadyExists,
             Refused::Edit(Refusal::NoSuchAccount) => KError::NotFound,
             Refused::Edit(Refusal::TooLarge) | Refused::ListTooLong => KError::TooLarge,
@@ -193,8 +188,7 @@ mod tests {
     /// real KDF (so the test exercises the same path the seeder + verifier do).
     fn db_line(user: &str, password: &str, salt: &[u8], home: &str) -> std::string::String {
         let mut out = [0u8; libusers::MAX_FILE];
-        let n = libusers::write_record(&mut out, user.as_bytes(), home.as_bytes(), password.as_bytes(), salt)
-            .unwrap();
+        let n = libusers::write_record(&mut out, user.as_bytes(), home.as_bytes(), password.as_bytes(), salt).unwrap();
         std::string::String::from_utf8(out[..n].to_vec()).unwrap()
     }
 
@@ -235,9 +229,7 @@ mod tests {
 
     #[test]
     fn serve_builds_authenticated_then_denied_replies() {
-        use librsproto::auth::{
-            build_authenticate_request, parse_authenticate_reply, AUTH_RESULT_DENIED,
-        };
+        use librsproto::auth::{AUTH_RESULT_DENIED, build_authenticate_request, parse_authenticate_reply};
         let db = db_line("alice", "hunter2", b"\x10\x20\x30\x40", "/home/alice");
 
         let mut req = [0u8; 128];

@@ -47,21 +47,11 @@ pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; BL
     let mut state = [0u32; 16];
     state[0..4].copy_from_slice(&CONSTANTS);
     for i in 0..8 {
-        state[4 + i] = u32::from_le_bytes([
-            key[4 * i],
-            key[4 * i + 1],
-            key[4 * i + 2],
-            key[4 * i + 3],
-        ]);
+        state[4 + i] = u32::from_le_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]]);
     }
     state[12] = counter;
     for i in 0..3 {
-        state[13 + i] = u32::from_le_bytes([
-            nonce[4 * i],
-            nonce[4 * i + 1],
-            nonce[4 * i + 2],
-            nonce[4 * i + 3],
-        ]);
+        state[13 + i] = u32::from_le_bytes([nonce[4 * i], nonce[4 * i + 1], nonce[4 * i + 2], nonce[4 * i + 3]]);
     }
 
     // 20 rounds = 10 double-rounds (column rounds then diagonal rounds).

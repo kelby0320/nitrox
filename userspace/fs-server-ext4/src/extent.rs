@@ -779,9 +779,9 @@ fn fold<RW: BlockReader + BlockWriter>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BlockRun;
     use crate::ext4::{self, inode_offset, read_superblock, resolve_path_ino};
     use crate::test_support::{Failing, ImageReader, RwImage, TEST_NOW, assert_e2fsck_clean, fixture_blocks};
-    use crate::BlockRun;
     use std::cell::RefCell;
 
     /// How many levels the tree at `path` has below its inode.
@@ -817,10 +817,7 @@ mod tests {
         let mut runs = vec![BlockRun::default(); 8192];
         let m = ext4::map_file(r, path, &mut runs).unwrap();
         merged(
-            runs[..m.runs]
-                .iter()
-                .filter(|r| r.device_lba != 0)
-                .map(|r| (r.file_block, r.device_lba, r.length as u64)),
+            runs[..m.runs].iter().filter(|r| r.device_lba != 0).map(|r| (r.file_block, r.device_lba, r.length as u64)),
         )
     }
 

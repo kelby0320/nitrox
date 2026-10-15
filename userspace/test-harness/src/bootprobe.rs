@@ -35,21 +35,18 @@ extern crate alloc;
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-use libkern::debug::Line;
 use libkern::abi::HandleInfo;
+use libkern::debug::Line;
 use libkern::{
-    RIGHT_LOOKUP, RIGHT_TRANSFER, RIGHT_UNBIND, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT,
-    SYS_NS_DERIVE, SYS_NS_UNBIND,
+    IO_OPCODE_READ, IoOp, RIGHT_READ, SYS_FILE_TRUNCATE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE, SYS_NS_SYNC, syscall6,
 };
 use libkern::{
-    IO_OPCODE_READ, IoOp, RIGHT_READ, SYS_FILE_TRUNCATE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE,
-    SYS_NS_SYNC, syscall6,
+    RIGHT_LOOKUP, RIGHT_TRANSFER, RIGHT_UNBIND, SYS_HANDLE_DUPLICATE, SYS_HANDLE_STAT, SYS_NS_DERIVE, SYS_NS_UNBIND,
 };
 use libkern::{
-    RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_FILE_GROW, SYS_FILE_SYNC,
-    SYS_HANDLE_CLOSE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_TEST_EXIT, SYS_WAIT,
-    TEST_EXIT_FAILURE, TEST_EXIT_SUCCESS, exit, kprint, syscall1, syscall2, syscall4,
-    syscall5,
+    RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_FILE_GROW, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_MEMORY_MAP,
+    SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_TEST_EXIT, SYS_WAIT, TEST_EXIT_FAILURE, TEST_EXIT_SUCCESS, exit, kprint,
+    syscall1, syscall2, syscall4, syscall5,
 };
 
 /// Page size, for the mapped-file checks below.
@@ -86,8 +83,14 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                WAIT_RESULTS[16],
+                WAIT_RESULTS[17],
+                WAIT_RESULTS[18],
+                WAIT_RESULTS[19],
+                WAIT_RESULTS[20],
+                WAIT_RESULTS[21],
+                WAIT_RESULTS[22],
+                WAIT_RESULTS[23],
             ]),
         )
     };
@@ -340,11 +343,7 @@ fn sched_gate(root_ns: u64) -> bool {
 /// instead: doing so once stranded a thread and deadlocked every later TLB shootdown.
 fn verdict(ok: bool) {
     let code = if ok { TEST_EXIT_SUCCESS } else { TEST_EXIT_FAILURE };
-    kprint(if ok {
-        b"boot-probe: test-harness verdict PASS\n"
-    } else {
-        b"boot-probe: test-harness verdict FAIL\n"
-    });
+    kprint(if ok { b"boot-probe: test-harness verdict PASS\n" } else { b"boot-probe: test-harness verdict FAIL\n" });
     // SAFETY: SYS_TEST_EXIT takes the verdict in a0; under the kernel test-harness build
     // it writes isa-debug-exit and QEMU terminates (so this does not return in practice).
     unsafe { syscall1(SYS_TEST_EXIT, code as u64) };
@@ -409,8 +408,7 @@ impl RootDevice {
     /// The root partition, by the label this boot mounted it by — the disk image's or the live
     /// image's.
     fn open(ns: u64) -> Option<RootDevice> {
-        let labels: [&[u8]; 2] =
-            [b"/dev/disk/by-partlabel/nitrox-root", b"/dev/disk/by-partlabel/nitrox-live"];
+        let labels: [&[u8]; 2] = [b"/dev/disk/by-partlabel/nitrox-root", b"/dev/disk/by-partlabel/nitrox-live"];
         labels.iter().find_map(|p| RootDevice::on(ns, p))
     }
 
@@ -458,7 +456,8 @@ impl fs_server_ext4::BlockReader for RootDevice {
             let intra = (at - start) as usize;
             let take = (buf.len() - done).min(PAGE as usize - intra);
             let span = (intra + take).div_ceil(SECTOR as usize) as u64 * SECTOR;
-            let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: self.mem, buf_offset: 0, offset: start, length: span };
+            let op =
+                IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: self.mem, buf_offset: 0, offset: start, length: span };
             // SAFETY: `device` is a block device handle this process holds; `&op` is a valid
             // `IoOp` naming a `MemoryObject` it owns.
             let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
@@ -492,8 +491,14 @@ fn po_wait(po: u64) -> (i32, u64) {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                WAIT_RESULTS[16],
+                WAIT_RESULTS[17],
+                WAIT_RESULTS[18],
+                WAIT_RESULTS[19],
+                WAIT_RESULTS[20],
+                WAIT_RESULTS[21],
+                WAIT_RESULTS[22],
+                WAIT_RESULTS[23],
             ]),
         )
     };
@@ -505,9 +510,8 @@ fn po_wait(po: u64) -> (i32, u64) {
 /// returning the file's handle.
 fn file_resize(nr: u64, ns: u64, path: &[u8], size: u64) -> Option<u64> {
     // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall5(nr, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE, size)
-    };
+    let po =
+        unsafe { syscall5(nr, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE, size) };
     if po < 0 {
         return None;
     }
@@ -598,9 +602,8 @@ fn file_cache_test(root_ns: u64) -> bool {
     let sync_path = b"/system";
     // SAFETY: valid path pointer + namespace handle.
     let written = unsafe { syscall4(SYS_NS_SYNC, root_ns, sync_path.as_ptr() as u64, sync_path.len() as u64, 0) };
-    let synced = written >= 1
-        && on_device(0, 64) == Some(pattern(0, 64))
-        && on_device(PAGE, 64) == Some(pattern(1, 64));
+    let synced =
+        written >= 1 && on_device(0, 64) == Some(pattern(0, 64)) && on_device(PAGE, 64) == Some(pattern(1, 64));
     if kept && synced {
         kprint(b"boot-probe: c1 an unsynced write closed reaches the device on sys_ns_sync ok\n");
     } else {
@@ -614,8 +617,10 @@ fn file_cache_test(root_ns: u64) -> bool {
         return false;
     };
     // SAFETY: inside the mapping; faults both pages in.
-    let resident = unsafe { ((ha + 1) as *const u8).read_volatile() == c1_byte(0, 1)
-        && ((ha + PAGE + 1) as *const u8).read_volatile() == c1_byte(1, 1) };
+    let resident = unsafe {
+        ((ha + 1) as *const u8).read_volatile() == c1_byte(0, 1)
+            && ((ha + PAGE + 1) as *const u8).read_volatile() == c1_byte(1, 1)
+    };
     let truncated = file_resize(SYS_FILE_TRUNCATE, root_ns, path, 10).map(close).is_some();
     let g = file_resize(SYS_FILE_GROW, root_ns, path, size);
     let ga = g.and_then(|g| map_file(g, size, RIGHT_MAP_READ));
@@ -623,9 +628,8 @@ fn file_cache_test(root_ns: u64) -> bool {
     if let Some(ga) = ga {
         for i in 0..64 {
             // SAFETY: inside the read-only mapping of the regrown file.
-            let (a, b) = unsafe {
-                (((ga + i) as *const u8).read_volatile(), ((ga + PAGE + i) as *const u8).read_volatile())
-            };
+            let (a, b) =
+                unsafe { (((ga + i) as *const u8).read_volatile(), ((ga + PAGE + i) as *const u8).read_volatile()) };
             regrown &= a == if i < 10 { c1_byte(0, i) } else { 0 } && b == 0;
         }
     }
@@ -933,7 +937,14 @@ fn reply_subnamespace(ch: u64, request_id: u64, consumed: u16, base: &[u8], ns: 
     let mut body = [0u8; librsproto::namespace::SUBNAMESPACE_PREFIX_LEN + 64];
     let mut msg = [0u8; 4096];
     let encoded = librsproto::namespace::subnamespace_reply(&mut body, consumed, base).and_then(|n| {
-        librsproto::encode(&mut msg[24..], librsproto::OP_NS_RESOLVE, request_id, librsproto::RS_FLAG_REPLY, &body[..n], 1)
+        librsproto::encode(
+            &mut msg[24..],
+            librsproto::OP_NS_RESOLVE,
+            request_id,
+            librsproto::RS_FLAG_REPLY,
+            &body[..n],
+            1,
+        )
     });
     let Some(len) = encoded else {
         close(dup as u64);
@@ -944,7 +955,14 @@ fn reply_subnamespace(ch: u64, request_id: u64, consumed: u16, base: &[u8], ns: 
     let handles = [dup as u64];
     // SAFETY: valid message buffer and one transferred handle.
     let sr = unsafe {
-        syscall5(libkern::SYS_CHANNEL_SEND, ch, msg.as_ptr() as u64, handles.as_ptr() as u64, 1, libkern::SENDMODE_NOBLOCK)
+        syscall5(
+            libkern::SYS_CHANNEL_SEND,
+            ch,
+            msg.as_ptr() as u64,
+            handles.as_ptr() as u64,
+            1,
+            libkern::SENDMODE_NOBLOCK,
+        )
     };
     sr == 0
 }
@@ -1021,7 +1039,8 @@ fn continuation_test(root_ns: u64) -> bool {
             }
             let req = receive(ours, clock_ns() + 200_000_000);
             if let Some(req) = req {
-                if req.op != librsproto::OP_NS_RESOLVE || !reply_subnamespace(ours, req.request_id, consumed, base, ns) {
+                if req.op != librsproto::OP_NS_RESOLVE || !reply_subnamespace(ours, req.request_id, consumed, base, ns)
+                {
                     close(po);
                     return None;
                 }
@@ -1061,13 +1080,12 @@ fn continuation_test(root_ns: u64) -> bool {
     let c = b"/cont/fs/l1/system/c4-created";
     // SAFETY: valid path + namespace handle.
     let po = unsafe { syscall5(SYS_FILE_CREATE, a, c.as_ptr() as u64, c.len() as u64, rw, 100) };
-    let created = matches!(serve_until(po, 5, b"/", b), Some(((0, h), 1)) if { close(h); true })
-        && {
-            let (st, h) = ns_lookup(root_ns, b"/system/c4-created", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
-            let size = if st == 0 { stat(h).map(|i| i.size) } else { None };
-            close(h);
-            size == Some(100)
-        };
+    let created = matches!(serve_until(po, 5, b"/", b), Some(((0, h), 1)) if { close(h); true }) && {
+        let (st, h) = ns_lookup(root_ns, b"/system/c4-created", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
+        let size = if st == 0 { stat(h).map(|i| i.size) } else { None };
+        close(h);
+        size == Some(100)
+    };
     if !created {
         return fail(b"a create did not carry its size on");
     }
@@ -1095,12 +1113,11 @@ fn continuation_test(root_ns: u64) -> bool {
     let po = unsafe {
         syscall6(SYS_FILE_RENAME, a, d.as_ptr() as u64, d.len() as u64, x.as_ptr() as u64, x.len() as u64, 0)
     };
-    let left = matches!(serve_until(po, 5, b"/", b), Some(((st, _), 1)) if st == KError::Unsupported.as_i32())
-        && {
-            let (st, h) = ns_lookup(root_ns, b"/system/c4-renamed", RIGHT_MAP_READ);
-            close(h);
-            st == 0
-        };
+    let left = matches!(serve_until(po, 5, b"/", b), Some(((st, _), 1)) if st == KError::Unsupported.as_i32()) && {
+        let (st, h) = ns_lookup(root_ns, b"/system/c4-renamed", RIGHT_MAP_READ);
+        close(h);
+        st == 0
+    };
     if !left {
         return fail(b"a rename leaving the prefix was not refused, or moved the file");
     }
@@ -1213,18 +1230,17 @@ fn grow_test(root_ns: u64) -> bool {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
     let (st, fh) = unsafe {
         WAIT_HANDLES[0] = po as u64;
-        let w = syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        );
-        let status =
-            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
+        let w = syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
+        let status = i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
         let handle = u64::from_le_bytes([
-            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            WAIT_RESULTS[16],
+            WAIT_RESULTS[17],
+            WAIT_RESULTS[18],
+            WAIT_RESULTS[19],
+            WAIT_RESULTS[20],
+            WAIT_RESULTS[21],
+            WAIT_RESULTS[22],
+            WAIT_RESULTS[23],
         ]);
         syscall1(SYS_HANDLE_CLOSE, po as u64);
         if w != 1 { (-1, 0) } else { (status, handle) }
@@ -1254,9 +1270,7 @@ fn grow_test(root_ns: u64) -> bool {
 
     // 3. Read the device — through the file's new extent, so the metadata is checked too —
     //    and verify the appended data.
-    let ok = RootDevice::open(root_ns)
-        .and_then(|d| d.read_file(path, PAGE, marker.len()))
-        .is_some_and(|b| b == marker);
+    let ok = RootDevice::open(root_ns).and_then(|d| d.read_file(path, PAGE, marker.len())).is_some_and(|b| b == marker);
     if ok {
         kprint(b"boot-probe: grow appended a block + persisted + verified ok\n");
         true
@@ -1294,18 +1308,17 @@ fn create_test(root_ns: u64) -> bool {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
     let (st, fh) = unsafe {
         WAIT_HANDLES[0] = po as u64;
-        let w = syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        );
-        let status =
-            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
+        let w = syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
+        let status = i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
         let handle = u64::from_le_bytes([
-            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            WAIT_RESULTS[16],
+            WAIT_RESULTS[17],
+            WAIT_RESULTS[18],
+            WAIT_RESULTS[19],
+            WAIT_RESULTS[20],
+            WAIT_RESULTS[21],
+            WAIT_RESULTS[22],
+            WAIT_RESULTS[23],
         ]);
         syscall1(SYS_HANDLE_CLOSE, po as u64);
         if w != 1 { (-1, 0) } else { (status, handle) }
@@ -1335,9 +1348,7 @@ fn create_test(root_ns: u64) -> bool {
 
     // 3. Read the device through the path: the directory entry is on disk (a path that did
     //    not exist before now resolves there) and so is the data.
-    let ok = RootDevice::open(root_ns)
-        .and_then(|d| d.read_file(path, 0, marker.len()))
-        .is_some_and(|b| b == marker);
+    let ok = RootDevice::open(root_ns).and_then(|d| d.read_file(path, 0, marker.len())).is_some_and(|b| b == marker);
     if ok {
         kprint(b"boot-probe: create new file + persisted + verified ok\n");
         true
@@ -1359,8 +1370,7 @@ fn read_large_file(root_ns: u64) -> bool {
         return false;
     }
     // Map the whole file lazily (a FileBacked VMA — no frames until faulted).
-    let addr =
-        unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, LARGE_FILE_BYTES as u64, RIGHT_MAP_READ) };
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, LARGE_FILE_BYTES as u64, RIGHT_MAP_READ) };
     if addr < 0 {
         kprint(b"boot-probe: large.bin map FAIL\n");
         // SAFETY: closing our own handle.
@@ -1454,7 +1464,6 @@ fn subtree_bind_test(root_ns: u64) -> bool {
         false
     }
 }
-
 
 /// Bootstrap registers, as `service-mgr`'s `SPAWN_SERVICE` fills them: `rdi` = this
 /// process's notification channel, `rsi` = the inherited LOOKUP-only root namespace,
@@ -1819,7 +1828,6 @@ fn read_all(h: u64) -> Option<alloc::vec::Vec<u8>> {
     Some(bytes)
 }
 
-
 /// Close `h` if it is a handle at all.
 fn close(h: u64) {
     if h != 0 {
@@ -1987,7 +1995,8 @@ fn view_broker_test(root_ns: u64) -> bool {
     let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
     let (mut out_w, mut out_r) = (0u64, 0u64);
     // SAFETY: valid writable out-params.
-    let piped = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut out_w) as u64, (&raw mut out_r) as u64, 16, 0) } == 0;
+    let piped =
+        unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut out_w) as u64, (&raw mut out_r) as u64, 16, 0) } == 0;
     if st != 0 || cli == 0 || copy <= 0 || !piped {
         return fail(b"a client, a copy and a pipe to ask what disks leaves out");
     }
@@ -2032,9 +2041,19 @@ fn view_broker_test(root_ns: u64) -> bool {
     if !decoded || code != Some((0, false)) {
         return fail(b"nxinstall's listing in the admin view did not read");
     }
-    for (what, p) in [(&b"the disk holding init's root"[..], &disk), (b"init's root", &root), (b"the mounted scratch disk", &scratch)] {
+    for (what, p) in [
+        (&b"the disk holding init's root"[..], &disk),
+        (b"init's root", &root),
+        (b"the mounted scratch disk", &scratch),
+    ] {
         if granted.contains(p) {
-            Line::new().s(b"boot-probe: view broker: disks granted ").s(what).s(b", ").s(p.as_bytes()).s(b", which is in use").end();
+            Line::new()
+                .s(b"boot-probe: view broker: disks granted ")
+                .s(what)
+                .s(b", ")
+                .s(p.as_bytes())
+                .s(b", which is in use")
+                .end();
             return fail(b"the disks grant handed over a device in use");
         }
     }
@@ -2058,7 +2077,12 @@ fn view_broker_test(root_ns: u64) -> bool {
         }
     };
     if refused != libkern::KError::WouldBlock.as_i32() {
-        Line::new().s(b"boot-probe: view broker: client ").u(filled.len() as u64 + 1).s(b" refused with ").i(refused as i64).end();
+        Line::new()
+            .s(b"boot-probe: view broker: client ")
+            .u(filled.len() as u64 + 1)
+            .s(b" refused with ")
+            .i(refused as i64)
+            .end();
         return fail(b"a client was refused for something other than room");
     }
     let Some(&last) = filled.last() else {
@@ -2069,7 +2093,9 @@ fn view_broker_test(root_ns: u64) -> bool {
     let Some(n) = build_request(&mut req, 0, b"admin", b"nxinstall", &[], b"", None) else {
         return fail(b"build a request");
     };
-    if copy <= 0 || !matches!(views_call(last, OP_VIEWS_REQUEST, 8, &req[..n], &[copy as u64], &mut exited), Some((false, _))) {
+    if copy <= 0
+        || !matches!(views_call(last, OP_VIEWS_REQUEST, 8, &req[..n], &[copy as u64], &mut exited), Some((false, _)))
+    {
         return fail(b"the last client's request");
     }
     match views_call(last, OP_VIEWS_PASSWORD, 9, DEMO_PASSWORD, &[], &mut exited) {
@@ -2107,9 +2133,7 @@ fn view_broker_test(root_ns: u64) -> bool {
         *slot = ch;
     }
     let [b, c] = pair;
-    let retry = |r: Option<(bool, alloc::vec::Vec<u8>)>| {
-        matches!(r, Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { retry: true }, _))))
-    };
+    let retry = |r: Option<(bool, alloc::vec::Vec<u8>)>| matches!(r, Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Denied { retry: true }, _))));
     if !retry(views_call(b, OP_VIEWS_PASSWORD, 20, b"wrong", &[], &mut exited)) {
         return fail(b"the paced pair's first wrong password");
     }
@@ -2126,7 +2150,13 @@ fn view_broker_test(root_ns: u64) -> bool {
     }
     let t2 = clock_ns();
     if t1.saturating_sub(t0) < 1_900_000_000 || t2.saturating_sub(t1) < 1_900_000_000 {
-        Line::new().s(b"boot-probe: view broker: held answers after ").u((t1 - t0) / 1_000_000).s(b" ms and ").u(t2.saturating_sub(t1) / 1_000_000).s(b" ms").end();
+        Line::new()
+            .s(b"boot-probe: view broker: held answers after ")
+            .u((t1 - t0) / 1_000_000)
+            .s(b" ms and ")
+            .u(t2.saturating_sub(t1) / 1_000_000)
+            .s(b" ms")
+            .end();
         return fail(b"two passwords held in one delay were checked together");
     }
     // SAFETY: closing our own handles; the broker drops what they asked for.
@@ -2160,7 +2190,8 @@ fn view_broker_test(root_ns: u64) -> bool {
     for (k, op) in [OP_VIEWS_STOP, OP_VIEWS_LIST, OP_VIEWS_CHECK].into_iter().enumerate() {
         let (mut ours, mut theirs) = (0u64, 0u64);
         // SAFETY: valid writable out-params.
-        let r = unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 1, 0) };
+        let r =
+            unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 1, 0) };
         if r != 0 {
             return fail(b"a channel to send the broker");
         }
@@ -2172,7 +2203,13 @@ fn view_broker_test(root_ns: u64) -> bool {
         let mut count = 0usize;
         // SAFETY: valid recv out-params; `ours` is this process's.
         let rr = unsafe {
-            let rr = syscall4(libkern::SYS_CHANNEL_RECV, ours, buf.as_mut_ptr() as u64, hs.as_mut_ptr() as u64, (&raw mut count) as u64);
+            let rr = syscall4(
+                libkern::SYS_CHANNEL_RECV,
+                ours,
+                buf.as_mut_ptr() as u64,
+                hs.as_mut_ptr() as u64,
+                (&raw mut count) as u64,
+            );
             syscall1(SYS_HANDLE_CLOSE, ours);
             rr
         };
@@ -2205,7 +2242,6 @@ fn view_broker_test(root_ns: u64) -> bool {
     kprint(b"boot-probe: view broker: password held, one per delay, grant arrived, exit heard when full, policy refused, stray handles closed, session closed ok\n");
     true
 }
-
 
 /// **The device registry, through its binding** (administration Part B.1). The kernel's host tests
 /// see its table as a value; this sees `/dev/registry` as a process does, and holds it to the
@@ -2392,7 +2428,16 @@ fn registry_test(root_ns: u64) -> bool {
                 let at = alloc::format!(
                     "boot-probe: registry: usb port {}, {:04x}:{:04x} class {:02x}/{:02x}/{:02x}, speed {}, \
                      under {:02x}:{:02x}.{}, \"",
-                    r.port, r.vendor, r.device, r.pci_class, r.subclass, r.prog_if, r.speed, c.bus, c.dev, c.func
+                    r.port,
+                    r.vendor,
+                    r.device,
+                    r.pci_class,
+                    r.subclass,
+                    r.prog_if,
+                    r.speed,
+                    c.bus,
+                    c.dev,
+                    c.func
                 );
                 Line::new().s(at.as_bytes()).untrusted(r.name()).s(b"\"").end();
             }
@@ -2411,7 +2456,13 @@ fn registry_test(root_ns: u64) -> bool {
         probed += 1;
     }
     if probed != blocks {
-        Line::new().s(b"boot-probe: registry: ").u(blocks as u64).s(b" block records, ").u(probed as u64).s(b" probed").end();
+        Line::new()
+            .s(b"boot-probe: registry: ")
+            .u(blocks as u64)
+            .s(b" block records, ")
+            .u(probed as u64)
+            .s(b" probed")
+            .end();
         return fail(b"the block records are not what /dev/blk serves");
     }
     if !keyboard || !mouse {
@@ -2422,7 +2473,11 @@ fn registry_test(root_ns: u64) -> bool {
     let mut boot = all.iter().filter(|r| r.is_boot_medium());
     match (boot.next(), boot.next()) {
         (Some(d), None) if d.kind() == DeviceKind::Disk && !d.is_departed() => {
-            Line::new().s(b"boot-probe: registry: the boot disk is blk-").u(d.served as u64).s(b", and nothing else is flagged").end();
+            Line::new()
+                .s(b"boot-probe: registry: the boot disk is blk-")
+                .u(d.served as u64)
+                .s(b", and nothing else is flagged")
+                .end();
         }
         (None, _) => return fail(b"no record is flagged as the disk the machine started from"),
         _ => return fail(b"the boot flag is on more than one record, or on one that is not a present disk"),
@@ -2650,9 +2705,9 @@ fn devices_test(root_ns: u64) -> bool {
         let (st, h) = ns_lookup(root_ns, path.as_bytes(), RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
         let bytes = if st == 0 { read_all(h) } else { None };
         close(h);
-        let row = bytes.and_then(|b| libstream::wire::Table::decode(&b).ok()).and_then(|mut t| {
-            (t.rows.len() == 1).then(|| t.rows.remove(0))
-        });
+        let row = bytes
+            .and_then(|b| libstream::wire::Table::decode(&b).ok())
+            .and_then(|mut t| (t.rows.len() == 1).then(|| t.rows.remove(0)));
         let says = |i: usize, want: &str| {
             row.as_ref().and_then(|r| r.get(i)) == Some(&libstream::wire::Value::Str(alloc::string::String::from(want)))
         };
@@ -2756,7 +2811,8 @@ fn storage_mount_test(root_ns: u64) -> bool {
     if synced != 0 {
         return fail(b"the file made through /svc/storage would not sync");
     }
-    let Some(t) = read(root_ns, b"/svc/storage/info/all.tsm").and_then(|b| libstream::wire::Table::decode(&b).ok()) else {
+    let Some(t) = read(root_ns, b"/svc/storage/info/all.tsm").and_then(|b| libstream::wire::Table::decode(&b).ok())
+    else {
         return fail(b"all.tsm would not read");
     };
     let name_c = t.schema.fields.iter().position(|f| f.name == "name");
@@ -2794,7 +2850,15 @@ fn storage_mount_test(root_ns: u64) -> bool {
     let bind = |at: &[u8], base: &[u8]| {
         // SAFETY: a namespace this process created, valid path and base, an endpoint it holds.
         let r = unsafe {
-            syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, endpoint, base.as_ptr() as u64, base.len() as u64)
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                at.as_ptr() as u64,
+                at.len() as u64,
+                endpoint,
+                base.as_ptr() as u64,
+                base.len() as u64,
+            )
         };
         r == 0
     };
@@ -2805,7 +2869,8 @@ fn storage_mount_test(root_ns: u64) -> bool {
         return fail(b"the session endpoint would not bind as a supervisor binds it");
     }
     let readme = read(ns, b"/storage/nitrox-scratch/README");
-    let rows = read(ns, b"/dev/storage/all.tsm").and_then(|b| libstream::wire::Table::decode(&b).ok()).map(|t| t.rows.len());
+    let rows =
+        read(ns, b"/dev/storage/all.tsm").and_then(|b| libstream::wire::Table::decode(&b).ok()).map(|t| t.rows.len());
     let (minted, other) = ns_lookup(ns, b"/raw/session-endpoint", chan);
     close(other);
     close(ns);
@@ -2869,7 +2934,8 @@ fn io_counters_test(root_ns: u64) -> bool {
     };
     let col = |t: &Table, name: &str| t.schema.fields.iter().position(|f| f.name == name);
     let cell = |t: &Table, row: usize, name: &str| col(t, name).map(|c| t.rows[row][c].clone());
-    let row_named = |t: &Table, name: &str| (0..t.rows.len()).find(|&r| cell(t, r, "name") == Some(Value::Str(name.into())));
+    let row_named =
+        |t: &Table, name: &str| (0..t.rows.len()).find(|&r| cell(t, r, "name") == Some(Value::Str(name.into())));
     let num = |t: &Table, name: &str, column: &str| match row_named(t, name).and_then(|r| cell(t, r, column)) {
         Some(Value::Int(v)) => Some(v.max(0) as u64),
         _ => None,
@@ -2880,11 +2946,14 @@ fn io_counters_test(root_ns: u64) -> bool {
     };
 
     // The scratch disk by its label, and the disk the root is on by what is mounted at `/`.
-    let (Some(storage), Some(devices)) = (table(b"/svc/storage/info/all.tsm"), table(b"/svc/devices/info/all.tsm")) else {
+    let (Some(storage), Some(devices)) = (table(b"/svc/storage/info/all.tsm"), table(b"/svc/devices/info/all.tsm"))
+    else {
         return fail(b"the storage or device table would not read");
     };
     let named_where = |column: &str, value: &str| {
-        (0..storage.rows.len()).find(|&r| text(cell(&storage, r, column)).as_deref() == Some(value)).and_then(|r| text(cell(&storage, r, "name")))
+        (0..storage.rows.len())
+            .find(|&r| text(cell(&storage, r, column)).as_deref() == Some(value))
+            .and_then(|r| text(cell(&storage, r, "name")))
     };
     let (Some(scratch), Some(root)) = (named_where("label", "nitrox-scratch"), named_where("mounted", "/")) else {
         return fail(b"the storage table has no scratch disk or root");
@@ -3069,7 +3138,8 @@ fn long_listing_test(root_ns: u64) -> bool {
         };
         close(h);
     }
-    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/fs/nitrox-scratch/probe-many", &mut buf) else {
+    let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/fs/nitrox-scratch/probe-many", &mut buf)
+    else {
         return fail(b"probe-many would not open as a directory");
     };
     let mut listed = 0usize;
@@ -3079,7 +3149,13 @@ fn long_listing_test(root_ns: u64) -> bool {
     });
     dir.close();
     if read.is_err() || listed != FILES {
-        Line::new().s(b"boot-probe: long listing: ").u(listed as u64).s(b" of ").u(FILES as u64).s(b" listed FAIL").end();
+        Line::new()
+            .s(b"boot-probe: long listing: ")
+            .u(listed as u64)
+            .s(b" of ")
+            .u(FILES as u64)
+            .s(b" listed FAIL")
+            .end();
         return false;
     }
     Line::new()
@@ -3147,16 +3223,22 @@ fn storage_admin_test(root_ns: u64) -> bool {
         Some(Value::Str(s)) => Some(alloc::string::String::from(s.as_str())),
         _ => None,
     };
-    let row_where = |t: &Table, c: &str, v: &str| (0..t.rows.len()).find(|&i| text(t, i, col(t, c)).as_deref() == Some(v));
-    let (Some(scratch), Some(root), Some(esp)) = (row_where(&t, "label", "nitrox-scratch"), row_where(&t, "mounted", "/"), row_where(&t, "filesystem", "fat")) else {
+    let row_where =
+        |t: &Table, c: &str, v: &str| (0..t.rows.len()).find(|&i| text(t, i, col(t, c)).as_deref() == Some(v));
+    let (Some(scratch), Some(root), Some(esp)) =
+        (row_where(&t, "label", "nitrox-scratch"), row_where(&t, "mounted", "/"), row_where(&t, "filesystem", "fat"))
+    else {
         return fail(b"the table has no scratch disk, root or ESP to work with");
     };
-    let names: alloc::vec::Vec<alloc::string::String> = [scratch, root, esp].iter().map(|&r| text(&t, r, col(&t, "name")).unwrap_or_default()).collect();
+    let names: alloc::vec::Vec<alloc::string::String> =
+        [scratch, root, esp].iter().map(|&r| text(&t, r, col(&t, "name")).unwrap_or_default()).collect();
     let Some(registry) = registry_records(root_ns) else {
         return fail(b"the registry does not read");
     };
-    let id_of = |name: &str| registry.iter().find(|r| r.block_index().is_some_and(|n| alloc::format!("blk-{n}") == name));
-    let (Some(scratch_rec), Some(root_rec), Some(esp_rec)) = (id_of(&names[0]), id_of(&names[1]), id_of(&names[2])) else {
+    let id_of =
+        |name: &str| registry.iter().find(|r| r.block_index().is_some_and(|n| alloc::format!("blk-{n}") == name));
+    let (Some(scratch_rec), Some(root_rec), Some(esp_rec)) = (id_of(&names[0]), id_of(&names[1]), id_of(&names[2]))
+    else {
         return fail(b"a table name matches no registry record");
     };
 
@@ -3197,7 +3279,9 @@ fn storage_admin_test(root_ns: u64) -> bool {
         }
     };
     let refused = |m: &Option<Received>, err: KError| {
-        m.as_ref().is_some_and(|m| m.error && librsproto::error::parse_error(&m.body).is_some_and(|e| e.kerror == err.as_i32()))
+        m.as_ref().is_some_and(|m| {
+            m.error && librsproto::error::parse_error(&m.body).is_some_and(|e| e.kerror == err.as_i32())
+        })
     };
     let answered = |m: &Option<Received>| m.as_ref().is_some_and(|m| !m.error);
     let finish = |ok: bool| {
@@ -3221,7 +3305,8 @@ fn storage_admin_test(root_ns: u64) -> bool {
         }
         Some(m.handles[0])
     };
-    let (watch, media) = if st == 0 && endpoint != 0 { (open(b"info/watch"), open(b"info/media")) } else { (None, None) };
+    let (watch, media) =
+        if st == 0 && endpoint != 0 { (open(b"info/watch"), open(b"info/media")) } else { (None, None) };
     close(endpoint);
     let (Some(watch), Some(media)) = (watch, media) else {
         watch.into_iter().chain(media).for_each(close);
@@ -3252,7 +3337,9 @@ fn storage_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"InUse was not answered"));
     }
     let disk_of_root = root_rec.parent;
-    if !(ids.contains(&scratch_rec.id) && ids.contains(&root_rec.id) && ids.contains(&disk_of_root)) || ids.contains(&esp_rec.id) {
+    if !(ids.contains(&scratch_rec.id) && ids.contains(&root_rec.id) && ids.contains(&disk_of_root))
+        || ids.contains(&esp_rec.id)
+    {
         return finish(fail(b"InUse is not the scratch disk, the root and its disk, without the ESP"));
     }
 
@@ -3306,7 +3393,9 @@ fn storage_admin_test(root_ns: u64) -> bool {
     if st != KError::NotFound.as_i32() {
         return finish(fail(b"the label still resolved once unmounted"));
     }
-    if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mounted")))) != Some(None) {
+    if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mounted"))))
+        != Some(None)
+    {
         return finish(fail(b"the table still shows the scratch disk mounted"));
     }
 
@@ -3358,7 +3447,9 @@ fn storage_admin_test(root_ns: u64) -> bool {
     if read(root_ns, b"/svc/storage/fs/nitrox-scratch/unsynced").as_deref() != Some(&want[..]) {
         return finish(fail(b"the remounted filesystem does not hold the unsynced file"));
     }
-    if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mode")))) != Some(Some(alloc::string::String::from("rw"))) {
+    if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mode"))))
+        != Some(Some(alloc::string::String::from("rw")))
+    {
         return finish(fail(b"the remount is not writable"));
     }
 
@@ -3417,7 +3508,9 @@ fn storage_admin_test(root_ns: u64) -> bool {
     if !answered(&ask(OP_STORAGE_IN_USE, &[])) || pinged(0) {
         return finish(fail(b"an eject refused pinged the watch"));
     }
-    if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mode")))) != Some(Some(alloc::string::String::from("rw"))) {
+    if table().and_then(|t| row_where(&t, "label", "nitrox-scratch").map(|r| text(&t, r, col(&t, "mode"))))
+        != Some(Some(alloc::string::String::from("rw")))
+    {
         return finish(fail(b"a refused eject unmounted the scratch disk"));
     }
 
@@ -3435,7 +3528,9 @@ fn storage_admin_test(root_ns: u64) -> bool {
             && !mounted_ids.contains(&r.id)
     });
     let (Some(root_disk), Some(boot_part)) = (root_disk, boot_part) else {
-        return finish(fail(b"no disk holding init's root, or no unmounted partition of the boot disk, to ask Reread of"));
+        return finish(fail(
+            b"no disk holding init's root, or no unmounted partition of the boot disk, to ask Reread of",
+        ));
     };
     let rereads: [(&[u8], alloc::string::String, KError); 4] = [
         (b"the mounted scratch disk", names[0].clone(), KError::WouldBlock),
@@ -3460,7 +3555,9 @@ fn storage_admin_test(root_ns: u64) -> bool {
             && r.driver() == b"usb-storage"
             && !r.is_boot_medium()
             && !r.is_departed()
-            && registry.iter().any(|p| p.parent == r.id && p.kind() == libkern::device::DeviceKind::Partition && !p.is_departed())
+            && registry
+                .iter()
+                .any(|p| p.parent == r.id && p.kind() == libkern::device::DeviceKind::Partition && !p.is_departed())
     });
     // **And every other disk refuses a `Rescan` sent to it directly**: the SATA disk's AHCI and the
     // scratch disk's RAM disk, whatever is mounted on them — a rescan is refused before it looks.
@@ -3471,7 +3568,9 @@ fn storage_admin_test(root_ns: u64) -> bool {
         close(node);
         status
     };
-    let sata = registry.iter().find(|r| r.kind() == libkern::device::DeviceKind::Disk && r.driver() == b"ahci" && !r.is_departed());
+    let sata = registry
+        .iter()
+        .find(|r| r.kind() == libkern::device::DeviceKind::Disk && r.driver() == b"ahci" && !r.is_departed());
     for (what, rec) in [(b"the SATA disk".as_slice(), sata), (b"the scratch RAM disk", Some(scratch_rec))] {
         let Some(rec) = rec else {
             return finish(fail(b"no SATA disk to send a Rescan to"));
@@ -3577,7 +3676,10 @@ fn past_two_tib_test(root_ns: u64) -> bool {
         return fail(b"the registry does not read");
     };
     let Some(r) = all.iter().find(|r| {
-        r.kind() == DeviceKind::Disk && !r.is_departed() && r.driver() == b"usb-storage" && r.block_count > u32::MAX as u64
+        r.kind() == DeviceKind::Disk
+            && !r.is_departed()
+            && r.driver() == b"usb-storage"
+            && r.block_count > u32::MAX as u64
     }) else {
         kprint(b"boot-probe: past 2 TiB: no USB disk of more than 2^32 blocks here; test-qemu attaches one\n");
         return true;
@@ -3590,7 +3692,11 @@ fn past_two_tib_test(root_ns: u64) -> bool {
     // SAFETY: register-only syscall.
     let page = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
     // SAFETY: register-only syscall; `page` is ours.
-    let addr = if page > 0 { unsafe { syscall4(SYS_MEMORY_MAP, page as u64, 0, PAGE, RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) } } else { -1 };
+    let addr = if page > 0 {
+        unsafe { syscall4(SYS_MEMORY_MAP, page as u64, 0, PAGE, RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) }
+    } else {
+        -1
+    };
     if addr <= 0 {
         close(dev);
         if page > 0 {
@@ -3599,7 +3705,9 @@ fn past_two_tib_test(root_ns: u64) -> bool {
         return fail(b"no page to move it through");
     }
     let (page, addr) = (page as u64, addr as u64);
-    let want: alloc::vec::Vec<u8> = (0..512u32).map(|i| if (i as usize) < PAST_TWO_TIB.len() { PAST_TWO_TIB[i as usize] } else { (i * 31 + 7) as u8 }).collect();
+    let want: alloc::vec::Vec<u8> = (0..512u32)
+        .map(|i| if (i as usize) < PAST_TWO_TIB.len() { PAST_TWO_TIB[i as usize] } else { (i * 31 + 7) as u8 })
+        .collect();
     // SAFETY: `addr` maps PAGE writable bytes, and 512 are written.
     let buf = unsafe { core::slice::from_raw_parts_mut(addr as *mut u8, 512) };
     let io = |opcode: u32| {
@@ -3716,9 +3824,9 @@ fn storage_grant_test(root_ns: u64) -> bool {
     };
     let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
     let mut exited = alloc::vec::Vec::new();
-    let Some(scratch) = registry_records(root_ns)
-        .and_then(|r| r.iter().find(|r| r.kind() == libkern::device::DeviceKind::RamDisk).and_then(|r| r.block_index()))
-    else {
+    let Some(scratch) = registry_records(root_ns).and_then(|r| {
+        r.iter().find(|r| r.kind() == libkern::device::DeviceKind::RamDisk).and_then(|r| r.block_index())
+    }) else {
         return fail(b"no scratch disk in the registry");
     };
     let (st, sup) = ns_lookup(root_ns, b"/svc/views/session", chan);
@@ -3878,7 +3986,10 @@ fn grace_test(root_ns: u64) -> bool {
     };
     // A request for `program` in `view`, carrying `token`, on a client channel of its own: the
     // outcome, and the channel, still open.
-    let ask = |view: &[u8], program: &[u8], args: &[&[u8]], token: Option<[u8; TTY_TOKEN_LEN]>,
+    let ask = |view: &[u8],
+               program: &[u8],
+               args: &[&[u8]],
+               token: Option<[u8; TTY_TOKEN_LEN]>,
                exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>|
      -> Option<(Outcome, u64)> {
         let (cst, cli) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{session}").as_bytes(), chan);
@@ -3996,9 +4107,8 @@ fn grace_test(root_ns: u64) -> bool {
     let (wst, window) = ns_lookup(root_ns, b"/dev/tty", chan);
     let (mut ours, mut theirs) = (0u64, 0u64);
     // SAFETY: valid writable out-params.
-    let made = unsafe {
-        syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 4, 0)
-    } == 0;
+    let made =
+        unsafe { syscall4(libkern::SYS_CHANNEL_CREATE, (&raw mut ours) as u64, (&raw mut theirs) as u64, 4, 0) } == 0;
     if wst != 0 || window == 0 || !made {
         return finish(fail(b"a second terminal and a backend channel"), &[window, ours, theirs]);
     }
@@ -4029,7 +4139,10 @@ fn grace_test(root_ns: u64) -> bool {
         return finish(fail(b"no token after the refusals"), &[window, ours]);
     };
     if !started(ask(b"admin", b"sleep", sleep, Some(still), &mut exited), &mut exited) {
-        return finish(fail(b"the window closed while the refusals were asked, so they prove nothing"), &[window, ours]);
+        return finish(
+            fail(b"the window closed while the refusals were asked, so they prove nothing"),
+            &[window, ours],
+        );
     }
     // 8b. **A refused password forgets every window of the session** (PR #351 review): a request
     //     from the other terminal, which has no window and so is asked, is answered wrong — and
@@ -4058,7 +4171,10 @@ fn grace_test(root_ns: u64) -> bool {
         return finish(fail(b"no token after the wrong password"), &[window, ours]);
     };
     if !asked(ask(b"admin", b"sleep", sleep, Some(after_wrong), &mut exited)) {
-        return finish(fail(b"a refused password at another terminal left this terminal's window open"), &[window, ours]);
+        return finish(
+            fail(b"a refused password at another terminal left this terminal's window open"),
+            &[window, ours],
+        );
     }
     // **Opened again**, so that `Forget` below has a window to forget — and shown to be open.
     let Some(again) = token(tty) else {
@@ -4142,8 +4258,8 @@ fn grace_test(root_ns: u64) -> bool {
 /// - A closed session's policy channel is closed with it, and a session that is not open has no
 ///   policy endpoint.
 fn policy_test(root_ns: u64) -> bool {
-    use librsproto::views::*;
     use libkern::KError;
+    use librsproto::views::*;
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: policy: ").s(what).s(b" FAIL").end();
         false
@@ -4201,9 +4317,8 @@ fn policy_test(root_ns: u64) -> bool {
         views_call(ch, op, next.get(), body, &[], &mut exited)
     };
     let outcome_of = |r: Option<(bool, alloc::vec::Vec<u8>)>| {
-        r.filter(|(err, _)| !err).and_then(|(_, b)| {
-            parse_outcome(&b).map(|(o, why)| (o == Outcome::Started, alloc::vec::Vec::from(why)))
-        })
+        r.filter(|(err, _)| !err)
+            .and_then(|(_, b)| parse_outcome(&b).map(|(o, why)| (o == Outcome::Started, alloc::vec::Vec::from(why))))
     };
     let says = |text: &[u8], what: &[u8]| text.windows(what.len()).any(|w| w == what);
 
@@ -4223,7 +4338,10 @@ fn policy_test(root_ns: u64) -> bool {
     // Two policies nobody could administer, refused by `Check` and by `Install`, the file kept.
     let lost_views = b"[profile.admin]\ngrants = [\"disks\", \"storage\"]\n\n[[rule]]\nwho = [\"alice\"]\nuse = [\"admin\"]\nrun = [\"*\"]\nauth = \"password\"\n";
     let nobody = b"[profile.admin]\ngrants = [\"disks\", \"storage\", \"views\"]\n\n[[rule]]\nwho = [\"kelby\"]\nuse = [\"admin\"]\nrun = [\"*\"]\nauth = \"password\"\n";
-    for (bad, what) in [(&lost_views[..], &b"an admin profile without views"[..]), (&nobody[..], b"a rule naming no account that exists")] {
+    for (bad, what) in [
+        (&lost_views[..], &b"an admin profile without views"[..]),
+        (&nobody[..], b"a rule naming no account that exists"),
+    ] {
         match outcome_of(ask(cli, OP_VIEWS_CHECK, bad)) {
             Some((false, why)) if says(&why, b"views") => {}
             _ => return finish(fail(b"Check passed a policy nobody could administer")),
@@ -4249,7 +4367,9 @@ fn policy_test(root_ns: u64) -> bool {
     if outcome_of(ask(pol, OP_VIEWS_INSTALL, &more)).map(|o| o.0) != Some(true) {
         return finish(fail(b"a policy with one more view was not installed"));
     }
-    if ask(pol, OP_VIEWS_SHOW, &[]).map(|(_, b)| b).as_deref() != Some(&more[..]) || on_device().as_deref() != Some(&more[..]) {
+    if ask(pol, OP_VIEWS_SHOW, &[]).map(|(_, b)| b).as_deref() != Some(&more[..])
+        || on_device().as_deref() != Some(&more[..])
+    {
         return finish(fail(b"the installed policy is not what Show and the device hold"));
     }
     let lists = |r: Option<(bool, alloc::vec::Vec<u8>)>, view: &[u8]| {
@@ -4356,7 +4476,13 @@ fn restart_test(root_ns: u64) -> bool {
                 // SAFETY: arming our own timer, then a one-entry wait on it, bounded besides.
                 unsafe {
                     syscall4(libkern::SYS_TIMER_SET, timer as u64, at, 0, 0);
-                    syscall4(libkern::SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, at + 1_000_000_000);
+                    syscall4(
+                        libkern::SYS_WAIT,
+                        handles.as_ptr() as u64,
+                        1,
+                        results.as_mut_ptr() as u64,
+                        at + 1_000_000_000,
+                    );
                 }
             }
             _ => {}
@@ -4461,7 +4587,9 @@ fn services_test(root_ns: u64) -> bool {
         }
     };
     let refused = |m: &Option<Received>, err: KError| {
-        m.as_ref().is_some_and(|m| m.error && librsproto::error::parse_error(&m.body).is_some_and(|e| e.kerror == err.as_i32()))
+        m.as_ref().is_some_and(|m| {
+            m.error && librsproto::error::parse_error(&m.body).is_some_and(|e| e.kerror == err.as_i32())
+        })
     };
     let answered = |m: &Option<Received>| m.as_ref().is_some_and(|m| !m.error);
     let finish = |ok: bool| {
@@ -4535,7 +4663,13 @@ fn services_test(root_ns: u64) -> bool {
                 // SAFETY: arming our own timer, then a one-entry wait on it, bounded besides.
                 unsafe {
                     syscall4(libkern::SYS_TIMER_SET, timer as u64, at, 0, 0);
-                    syscall4(libkern::SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, at + 1_000_000_000);
+                    syscall4(
+                        libkern::SYS_WAIT,
+                        handles.as_ptr() as u64,
+                        1,
+                        results.as_mut_ptr() as u64,
+                        at + 1_000_000_000,
+                    );
                 }
             }
             _ => {}
@@ -4545,7 +4679,9 @@ fn services_test(root_ns: u64) -> bool {
     if !restarted {
         return finish(fail(b"a restart whose session closed at once did not start clipboard-server again"));
     }
-    kprint(b"boot-probe: services: listed, clipboard-server stopped, started and restarted, each answered once done ok\n");
+    kprint(
+        b"boot-probe: services: listed, clipboard-server stopped, started and restarted, each answered once done ok\n",
+    );
     kprint(b"boot-probe: services: an essential stop, an unknown name and a second start refused ok\n");
     kprint(b"boot-probe: services: a restart whose session closed at once still started it again ok\n");
     finish(true)
@@ -4606,7 +4742,11 @@ fn power_endpoint_test(root_ns: u64) -> bool {
             let m = receive(session, deadline)?;
             m.handles.iter().for_each(|&h| close(h));
             if m.request_id == id {
-                return Some(if m.error { librsproto::error::parse_error(&m.body).map_or(-1, |e| e.kerror) } else { 0 });
+                return Some(if m.error {
+                    librsproto::error::parse_error(&m.body).map_or(-1, |e| e.kerror)
+                } else {
+                    0
+                });
             }
         }
     };
@@ -5065,11 +5205,11 @@ fn accounts_test(root_ns: u64) -> bool {
 /// line is the same bytes throughout. Each refusal is its own, and a suffix the service does not
 /// serve is `NotFound` — the whole error body, where a short one once arrived as `KernelError`.
 fn auth_admin_test(root_ns: u64) -> bool {
+    use libkern::KError;
     use librsproto::auth::{
         OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE, OP_AUTH_SET_PASSWORD, build_account_request,
         build_authenticate_request, parse_account_list, parse_authenticate_reply,
     };
-    use libkern::KError;
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: auth admin: ").s(what).s(b" FAIL").end();
         false
@@ -5114,8 +5254,7 @@ fn auth_admin_test(root_ns: u64) -> bool {
         b[..n].to_vec()
     };
     let refused_with = |m: Option<Received>| {
-        m.filter(|m| m.error)
-            .and_then(|m| librsproto::error::parse_error(&m.body).map(|e| e.kerror))
+        m.filter(|m| m.error).and_then(|m| librsproto::error::parse_error(&m.body).map(|e| e.kerror))
     };
     // `Some(home)` if the oracle authenticates `name` with `pw`, `None` if it refuses.
     let authenticates = |name: &[u8], pw: &[u8]| -> Option<alloc::vec::Vec<u8>> {
@@ -5145,9 +5284,8 @@ fn auth_admin_test(root_ns: u64) -> bool {
 
     // `List`: alice, and her home.
     let listed = |m: Option<Received>, name: &[u8]| {
-        m.filter(|m| !m.error).is_some_and(|m| {
-            parse_account_list(&m.body).is_some_and(|l| l.iter().any(|(n, _)| n == name))
-        })
+        m.filter(|m| !m.error)
+            .is_some_and(|m| parse_account_list(&m.body).is_some_and(|l| l.iter().any(|(n, _)| n == name)))
     };
     if !listed(ask(admin, OP_AUTH_LIST, &[]), b"alice") {
         return finish(fail(b"List does not name alice"));
@@ -5270,11 +5408,19 @@ fn storage_test(root_ns: u64) -> bool {
     let want: alloc::vec::Vec<String> = block.iter().map(|r| name(r)).collect();
     let got: alloc::vec::Vec<&str> = (0..t.rows.len()).map(|i| text(i, name_c).unwrap_or("")).collect();
     if got != want {
-        Line::new().s(b"boot-probe: storage: ").u(got.len() as u64).s(b" rows for ").u(want.len() as u64).s(b" block records").end();
+        Line::new()
+            .s(b"boot-probe: storage: ")
+            .u(got.len() as u64)
+            .s(b" rows for ")
+            .u(want.len() as u64)
+            .s(b" block records")
+            .end();
         return fail(b"all.tsm is not a row per block record, in registry order");
     }
     let row = |r: &DeviceRecord| want.iter().position(|n| *n == name(r));
-    let find = |kind: DeviceKind, label: &[u8]| block.iter().find(|r| r.kind() == kind && (label.is_empty() || r.name() == label)).and_then(|r| row(r));
+    let find = |kind: DeviceKind, label: &[u8]| {
+        block.iter().find(|r| r.kind() == kind && (label.is_empty() || r.name() == label)).and_then(|r| row(r))
+    };
 
     let Some(root) = find(DeviceKind::Partition, b"nitrox-root") else {
         return fail(b"no nitrox-root partition to check the root against");

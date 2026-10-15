@@ -44,8 +44,7 @@ static ALLOC: libheap::Heap = libheap::Heap;
 const KERR_TIMED_OUT: i32 = KError::TimedOut.as_i32();
 
 /// The full rights set an IPC endpoint carries, handed to each child.
-const ENDPOINT_RIGHTS: u64 =
-    RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
+const ENDPOINT_RIGHTS: u64 = RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
 
 /// One page; the worker thread's stack size.
 const PAGE: u64 = 4096;
@@ -119,7 +118,7 @@ const STREAM_STACK_PAGES: u64 = 8;
 /// (the stage's bootstrap endpoint = the setup channel), `arg0` set at runtime to the
 /// bootstrap descriptor. Inherits parent's LOOKUP-only namespace.
 static mut SPAWN_STAGE: SpawnArgs = SpawnArgs {
-    image: 0,     // resolved at spawn from /bin/test-stage
+    image: 0, // resolved at spawn from /bin/test-stage
     handle_count: 1,
     move_mask: 1, // move handle 0 (the setup channel) to the stage
     arg0: 0,      // set to `bootstrap_arg0(true)` at runtime
@@ -141,15 +140,11 @@ extern "C" fn stream_producer() -> ! {
 
     // SAFETY: main initialised STREAM_E0 before creating this thread.
     let e0 = unsafe { (&raw const STREAM_E0).read() };
-    let schema = Schema::new()
-        .field("i", TypeTag::Int, TypeModifiers::NONE)
-        .field("name", TypeTag::String, TypeModifiers::NONE);
+    let schema =
+        Schema::new().field("i", TypeTag::Int, TypeModifiers::NONE).field("name", TypeTag::String, TypeModifiers::NONE);
     let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(e0), IPC_PAYLOAD_SIZE));
     let ok = tw.write_schema(StreamFlags::NONE, &schema).is_ok()
-        && (0..STREAM_ROWS).all(|i| {
-            tw.write_row(&[Value::Int(i), Value::Str(String::from("row"))])
-                .is_ok()
-        })
+        && (0..STREAM_ROWS).all(|i| tw.write_row(&[Value::Int(i), Value::Str(String::from("row"))]).is_ok())
         && tw.finish_with_status(0).is_ok()
         && tw.into_sink().finish().is_ok();
     let _ = ok; // a mismatch surfaces as the consumer's fail-loud verdict
@@ -176,9 +171,7 @@ fn stream_transport_demo() {
 
     // 1. A depth-4 pipe: small on purpose, so a 2000-row stream overflows the ring.
     // SAFETY: END0/END1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0) };
     if cr != 0 {
         kprint(b"test-harness: stream chan create FAIL\n");
         exit(1);
@@ -195,9 +188,7 @@ fn stream_transport_demo() {
         exit(1);
     }
     // SAFETY: maps the stack object read/write at a kernel-chosen address.
-    let base = unsafe {
-        syscall4(SYS_MEMORY_MAP, mem as u64, 0, stack_bytes, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-    };
+    let base = unsafe { syscall4(SYS_MEMORY_MAP, mem as u64, 0, stack_bytes, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if base < 0 {
         kprint(b"test-harness: stream stack map FAIL\n");
         exit(1);
@@ -328,11 +319,7 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
     };
 
     // 4. Send the setup message: transfer `stage_stdin` as stdin, carry `argv`.
-    let streams = Streams {
-        stdin: Some(stage_stdin),
-        stdout: None,
-        stderr: None,
-    };
+    let streams = Streams { stdin: Some(stage_stdin), stdout: None, stderr: None };
     if send_setup(setup_shell, &streams, &["stage", "500"]).is_err() {
         kprint(b"test-harness: stage send_setup FAIL\n");
         exit(1);
@@ -341,15 +328,11 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
     // 5. Produce the stdin stream on `prod` (the stage drains it concurrently). It waits
     //    for the terminator before verifying, so `finish` completes before it exits — no
     //    PeerClosed race.
-    let schema = Schema::new()
-        .field("i", TypeTag::Int, TypeModifiers::NONE)
-        .field("name", TypeTag::String, TypeModifiers::NONE);
+    let schema =
+        Schema::new().field("i", TypeTag::Int, TypeModifiers::NONE).field("name", TypeTag::String, TypeModifiers::NONE);
     let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(prod), IPC_PAYLOAD_SIZE));
     let ok = tw.write_schema(StreamFlags::NONE, &schema).is_ok()
-        && (0..STAGE_ROWS).all(|i| {
-            tw.write_row(&[Value::Int(i), Value::Str(String::from("row"))])
-                .is_ok()
-        })
+        && (0..STAGE_ROWS).all(|i| tw.write_row(&[Value::Int(i), Value::Str(String::from("row"))]).is_ok())
         && tw.finish_with_status(0).is_ok()
         && tw.into_sink().finish().is_ok();
     if !ok {
@@ -363,13 +346,7 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
         let waited = unsafe {
             WAIT_HANDLES[0] = notif;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             continue;
@@ -443,9 +420,7 @@ fn worker_exception_demo(notif: u64) {
         exit(1);
     }
     // SAFETY: maps the memory object read/write at a kernel-chosen address.
-    let base = unsafe {
-        syscall4(SYS_MEMORY_MAP, mem as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-    };
+    let base = unsafe { syscall4(SYS_MEMORY_MAP, mem as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if base < 0 {
         kprint(b"test-harness: worker stack map FAIL\n");
         exit(1);
@@ -478,13 +453,7 @@ fn worker_exception_demo(notif: u64) {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
         let waited = unsafe {
             WAIT_HANDLES[0] = notif;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             kprint(b"test-harness: wait FAIL\n");
@@ -505,9 +474,7 @@ fn worker_exception_demo(notif: u64) {
 
     // 4. Read the faulting thread's registers and report the faulting rip.
     // SAFETY: WORKER_REGS is a valid writable RegisterValues out-param.
-    let gr = unsafe {
-        syscall4(SYS_THREAD_GET_REGISTERS, worker.raw().0, (&raw mut WORKER_REGS) as u64, 0, 0)
-    };
+    let gr = unsafe { syscall4(SYS_THREAD_GET_REGISTERS, worker.raw().0, (&raw mut WORKER_REGS) as u64, 0, 0) };
     if gr != 0 {
         kprint(b"test-harness: get_registers FAIL\n");
         exit(1);
@@ -518,9 +485,7 @@ fn worker_exception_demo(notif: u64) {
 
     // 5. Terminate the worker (resume with the Terminate disposition, code 7).
     // SAFETY: register-only syscall.
-    let er = unsafe {
-        syscall4(SYS_EXCEPTION_RESUME, worker.raw().0, DISPOSITION_TERMINATE, 7, 0)
-    };
+    let er = unsafe { syscall4(SYS_EXCEPTION_RESUME, worker.raw().0, DISPOSITION_TERMINATE, 7, 0) };
     if er != 0 {
         kprint(b"test-harness: exception_resume FAIL\n");
         exit(1);
@@ -540,9 +505,7 @@ fn worker_exception_demo(notif: u64) {
 fn block_send_demo() {
     // Fresh channel pair, depth 4, both ends held here.
     // SAFETY: END0/END1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0) };
     if cr != 0 {
         kprint(b"test-harness: block-demo channel create FAIL\n");
         return;
@@ -554,9 +517,7 @@ fn block_send_demo() {
     let mut filled = 0u64;
     loop {
         // SAFETY: valid endpoint + zeroed message; count 0 (no transfers).
-        let r = unsafe {
-            syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_NOBLOCK)
-        };
+        let r = unsafe { syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_NOBLOCK) };
         if r == 0 {
             filled += 1;
         } else {
@@ -567,9 +528,7 @@ fn block_send_demo() {
     // One more, blocking: the ring is full, so this returns a PendingOperation
     // handle (>= 0) rather than blocking inside the syscall.
     // SAFETY: as above, with Block mode.
-    let po = unsafe {
-        syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_BLOCK)
-    };
+    let po = unsafe { syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_BLOCK) };
     if po < 0 {
         kprint(b"test-harness: block send FAIL\n");
         return;
@@ -591,18 +550,10 @@ fn block_send_demo() {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult.status` is the i32 at bytes 8..12 of the 16-byte record.
-    let status = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     if waited == 1 && status == 0 {
         Line::new()
             .s(b"test-harness: blocking send completed via PendingOperation (")
@@ -617,7 +568,13 @@ fn block_send_demo() {
     loop {
         // SAFETY: valid out-params.
         let r = unsafe {
-            syscall4(SYS_CHANNEL_RECV, b, (&raw mut MSGBUF) as u64, (&raw mut HBUF) as u64, (&raw mut RECV_COUNT) as u64)
+            syscall4(
+                SYS_CHANNEL_RECV,
+                b,
+                (&raw mut MSGBUF) as u64,
+                (&raw mut HBUF) as u64,
+                (&raw mut RECV_COUNT) as u64,
+            )
         };
         if r != 0 {
             break;
@@ -638,9 +595,7 @@ fn block_send_demo() {
 /// completes `TimedOut` — `sys_wait` reports that status.
 fn block_bounded_demo() {
     // SAFETY: END0/END1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0) };
     if cr != 0 {
         kprint(b"test-harness: block-bounded channel create FAIL\n");
         return;
@@ -651,9 +606,7 @@ fn block_bounded_demo() {
     // Fill b's receive ring so the next send must be held.
     loop {
         // SAFETY: valid endpoint + zeroed message; count 0 (no transfers).
-        let r = unsafe {
-            syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_NOBLOCK)
-        };
+        let r = unsafe { syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_NOBLOCK) };
         if r != 0 {
             break; // WouldBlock: full
         }
@@ -662,9 +615,7 @@ fn block_bounded_demo() {
     // BlockBounded send, deadline `1` (already in the past) → held now, timed out
     // on the next tick. The deadline is the 6th arg.
     // SAFETY: as above, BlockBounded mode + a past deadline.
-    let po = unsafe {
-        syscall6(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_BLOCKBOUNDED, 1)
-    };
+    let po = unsafe { syscall6(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_BLOCKBOUNDED, 1) };
     if po < 0 {
         kprint(b"test-harness: block-bounded send FAIL\n");
         return;
@@ -675,18 +626,10 @@ fn block_bounded_demo() {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult.status` is the i32 at bytes 8..12 of the 16-byte record.
-    let status = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     if waited == 1 && status == KERR_TIMED_OUT {
         kprint(b"test-harness: blocking send timed out via PendingOperation (BlockBounded)\n");
     } else {
@@ -750,13 +693,7 @@ fn ns_demo() {
     //     IoResult.result.
     // SAFETY: valid path pointer + handle.
     let po = unsafe {
-        syscall4(
-            SYS_NS_LOOKUP,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
-        )
+        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
     };
     if po < 0 {
         kprint(b"test-harness: ns_lookup FAIL\n");
@@ -765,22 +702,20 @@ fn ns_demo() {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = po as u64;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult`: status at bytes 8..12, result (resolved handle) at 16..24.
-    let status = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     let resolved = unsafe {
         u64::from_le_bytes([
-            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            WAIT_RESULTS[16],
+            WAIT_RESULTS[17],
+            WAIT_RESULTS[18],
+            WAIT_RESULTS[19],
+            WAIT_RESULTS[20],
+            WAIT_RESULTS[21],
+            WAIT_RESULTS[22],
+            WAIT_RESULTS[23],
         ])
     };
     if waited != 1 || status != 0 || resolved == 0 {
@@ -792,9 +727,7 @@ fn ns_demo() {
     // (f) Use the resolved handle: map it read/write — proves the binding handed
     //     back a usable, rights-attenuated MemoryObject handle.
     // SAFETY: `resolved` is a MemoryObject handle carrying MAP_READ|MAP_WRITE.
-    let mapped = unsafe {
-        syscall4(SYS_MEMORY_MAP, resolved, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-    };
+    let mapped = unsafe { syscall4(SYS_MEMORY_MAP, resolved, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if mapped < 0 {
         kprint(b"test-harness: ns-demo map resolved FAIL\n");
         return;
@@ -804,17 +737,13 @@ fn ns_demo() {
     // (g) sys_ns_unbind: remove "/store"; a follow-up lookup must complete the PO
     //     with a NotFound status (error delivered through the PO, not the syscall).
     // SAFETY: valid path pointer + handle.
-    let ur = unsafe {
-        syscall4(SYS_NS_UNBIND, ns, path.as_ptr() as u64, path.len() as u64, 0)
-    };
+    let ur = unsafe { syscall4(SYS_NS_UNBIND, ns, path.as_ptr() as u64, path.len() as u64, 0) };
     if ur != 0 {
         kprint(b"test-harness: ns_unbind FAIL\n");
         return;
     }
     // SAFETY: valid path pointer + handle.
-    let po2 = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
-    };
+    let po2 = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ) };
     if po2 < 0 {
         kprint(b"test-harness: ns_lookup-after-unbind FAIL\n");
         return;
@@ -822,17 +751,9 @@ fn ns_demo() {
     // SAFETY: valid wait buffers.
     let waited2 = unsafe {
         WAIT_HANDLES[0] = po2 as u64;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    let status2 = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status2 = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     // KError::NotFound = -10.
     if waited2 == 1 && status2 == -10 {
         kprint(b"test-harness: ns_unbind ok (lookup-after-unbind -> NotFound)\n");
@@ -915,9 +836,7 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
     let path = b"/dev/entropy";
     // sys_ns_lookup → PendingOperation; the resolved handle arrives in IoResult.
     // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, root_ns, path.as_ptr() as u64, path.len() as u64, RIGHT_READ)
-    };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, root_ns, path.as_ptr() as u64, path.len() as u64, RIGHT_READ) };
     if po < 0 {
         kprint(b"test-harness: /dev/entropy lookup FAIL\n");
         return;
@@ -925,22 +844,20 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = po as u64;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult`: status at bytes 8..12, result (resolved handle) at 16..24.
-    let status = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     let resolved = unsafe {
         u64::from_le_bytes([
-            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            WAIT_RESULTS[16],
+            WAIT_RESULTS[17],
+            WAIT_RESULTS[18],
+            WAIT_RESULTS[19],
+            WAIT_RESULTS[20],
+            WAIT_RESULTS[21],
+            WAIT_RESULTS[22],
+            WAIT_RESULTS[23],
         ])
     };
     if waited != 1 || status != 0 || resolved == 0 {
@@ -974,30 +891,26 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
 /// caller owns `resolved_handle`.
 fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
-    };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
     if po < 0 {
         return (po as i32, 0);
     }
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = po as u64;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    let status = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     let resolved = unsafe {
         u64::from_le_bytes([
-            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            WAIT_RESULTS[16],
+            WAIT_RESULTS[17],
+            WAIT_RESULTS[18],
+            WAIT_RESULTS[19],
+            WAIT_RESULTS[20],
+            WAIT_RESULTS[21],
+            WAIT_RESULTS[22],
+            WAIT_RESULTS[23],
         ])
     };
     // SAFETY: closing our own PO handle (the resolved handle is separate).
@@ -1205,13 +1118,7 @@ fn exit_storm_demo(root_ns: u64, notif: u64) {
             // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
             let waited = unsafe {
                 WAIT_HANDLES[0] = notif;
-                syscall4(
-                    SYS_WAIT,
-                    (&raw const WAIT_HANDLES) as u64,
-                    1,
-                    (&raw mut WAIT_RESULTS) as u64,
-                    u64::MAX,
-                )
+                syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
             };
             if waited < 1 {
                 kprint(b"test-harness: exit-storm wait FAIL\n");
@@ -1432,7 +1339,7 @@ const LIST_FIXTURE_PATH_STR: &str = "/system/nx-list";
 
 /// Spawn args for a `list` stage: one moved handle (its bootstrap/setup endpoint).
 static mut SPAWN_LIST: SpawnArgs = SpawnArgs {
-    image: 0,     // resolved at spawn from /bin/list
+    image: 0, // resolved at spawn from /bin/list
     handle_count: 1,
     move_mask: 1, // move handle 0 (the setup channel) to the stage
     arg0: 0,      // set to `bootstrap_arg0(true)` at runtime
@@ -1520,12 +1427,8 @@ fn list_pipeline_demo(root_ns: u64, notif: u64) {
     };
     // The schema *is* the contract this coreutil publishes; check it field by field.
     let schema = tr.schema();
-    let expect: [(&str, TypeTag); 4] = [
-        ("name", TypeTag::String),
-        ("size", TypeTag::Int),
-        ("kind", TypeTag::String),
-        ("modified", TypeTag::Int),
-    ];
+    let expect: [(&str, TypeTag); 4] =
+        [("name", TypeTag::String), ("size", TypeTag::Int), ("kind", TypeTag::String), ("modified", TypeTag::Int)];
     if schema.fields.len() != expect.len() {
         return_fail(b"test-harness: list schema field count wrong\n");
     }
@@ -1640,13 +1543,7 @@ fn run_list(root_ns: u64, notif: u64, argv: &[&str], consume: bool) -> alloc::ve
 /// so a stream of more than one message cannot complete without the consumer draining.
 /// That is what makes `list`'s backpressure assertion meaningful, and it costs the other
 /// callers nothing.
-fn run_coreutil_capture(
-    root_ns: u64,
-    notif: u64,
-    image: &[u8],
-    argv: &[&str],
-    consume: bool,
-) -> alloc::vec::Vec<u8> {
+fn run_coreutil_capture(root_ns: u64, notif: u64, image: &[u8], argv: &[&str], consume: bool) -> alloc::vec::Vec<u8> {
     run_coreutil_capture_in(root_ns, notif, image, argv, consume, 0)
 }
 
@@ -1736,13 +1633,7 @@ fn reap_child_exit(notif: u64) -> i32 {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
         let waited = unsafe {
             WAIT_HANDLES[0] = notif;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             continue;
@@ -1965,11 +1856,7 @@ fn copy_demo(root_ns: u64, notif: u64) {
     // --- teardown ------------------------------------------------------------
     unlink_all(root_ns, b"/system/nx-copy/sub", &[b"b.txt"]);
     unlink_all(root_ns, b"/system/nx-copy/sub2", &[b"b.txt"]);
-    unlink_all(
-        root_ns,
-        b"/system/nx-copy",
-        &[b"a.txt", b"c.txt", b"long.txt"],
-    );
+    unlink_all(root_ns, b"/system/nx-copy", &[b"a.txt", b"c.txt", b"long.txt"]);
     {
         let mut b3 = [0u8; 4096];
         let mut d = match Dir::open(root_ns, b"/system/nx-copy", &mut b3) {
@@ -1998,8 +1885,7 @@ fn copy_demo(root_ns: u64, notif: u64) {
 /// step 4 hits the no-truncate refusal.
 const COPY_CONTENT_A: &[u8] = b"alpha content, fixed length.\n";
 const COPY_CONTENT_B: &[u8] = b"bravo content, fixed length.\n";
-const COPY_CONTENT_LONG: &[u8] =
-    b"a much longer destination whose tail would survive a short overwrite\n";
+const COPY_CONTENT_LONG: &[u8] = b"a much longer destination whose tail would survive a short overwrite\n";
 
 /// Spawn `copy` with `argv` as a Tier-1 stage (stdout wired, so its report table is
 /// produced and drained) and return its exit code.
@@ -2122,8 +2008,8 @@ fn mkdir_remove_demo(root_ns: u64, notif: u64) {
 /// - a cross-mount `move` must *detect* the case and not destroy the source when the
 ///   fallback cannot complete.
 fn rename_move_demo(root_ns: u64, notif: u64) {
-    use libstream::table::{Item, TableReader};
     use libstream::Value;
+    use libstream::table::{Item, TableReader};
 
     kprint(b"test-harness: rename/move demo (Milestone 2 Part B)\n");
     const RN: &[u8] = b"/bin/rename";
@@ -2164,7 +2050,8 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
     if !path_exists(root_ns, b"/system/nx-b2/three.txt") {
         return_fail(b"test-harness: refused rename still moved the source\n");
     }
-    if run_coreutil(root_ns, notif, RN, &["rename", "--force", "/system/nx-b2/three.txt", "/system/nx-b/keep.txt"]) != 0 {
+    if run_coreutil(root_ns, notif, RN, &["rename", "--force", "/system/nx-b2/three.txt", "/system/nx-b/keep.txt"]) != 0
+    {
         return_fail(b"test-harness: rename --force exited non-zero\n");
     }
 
@@ -2172,13 +2059,8 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
     // The assertion with teeth: read the published table and require
     // `method = "rename"`. Checking only that the file arrived would pass an
     // implementation that copied every time.
-    let bytes = run_coreutil_capture(
-        root_ns,
-        notif,
-        MV,
-        &["move", "/system/nx-b/keep.txt", "/system/nx-b2/moved.txt"],
-        true,
-    );
+    let bytes =
+        run_coreutil_capture(root_ns, notif, MV, &["move", "/system/nx-b/keep.txt", "/system/nx-b2/moved.txt"], true);
     let mut method_seen = false;
     if let Ok(mut tr) = TableReader::new(&bytes) {
         while let Some(Ok(item)) = tr.next() {
@@ -2214,13 +2096,8 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
     // the source-survives rule but never that the fallback *works* — the copy always
     // failed. `/scratch` is the same fs-server bound a second time with its own subtree
     // base, which is exactly what the kernel's rename test keys on.
-    let bytes = run_coreutil_capture(
-        root_ns,
-        notif,
-        MV,
-        &["move", "/system/nx-b2/moved.txt", "/scratch/landed.txt"],
-        true,
-    );
+    let bytes =
+        run_coreutil_capture(root_ns, notif, MV, &["move", "/system/nx-b2/moved.txt", "/scratch/landed.txt"], true);
     // `method = "copy"`, and specifically *not* "rename": if the second binding failed to
     // register as a distinct mount, the kernel would rename and this would still relocate
     // the file — passing while testing nothing.
@@ -2412,8 +2289,8 @@ fn touch_demo(root_ns: u64, notif: u64) {
 /// - `sleep` genuinely **waits**. That is the assertion with teeth: exiting zero proves
 ///   nothing, since a `sleep` that returned immediately would do that too.
 fn date_sleep_demo(root_ns: u64, notif: u64) {
-    use libstream::table::{Item, TableReader};
     use libstream::Value;
+    use libstream::table::{Item, TableReader};
 
     kprint(b"test-harness: date/sleep demo (Milestone 2 Part D)\n");
     const DATE: &[u8] = b"/bin/date";
@@ -2512,8 +2389,8 @@ fn monotonic_ns() -> u64 {
 /// belongs to the login flow; constructing both shapes is also the only way to test the
 /// absent case at all.
 fn whoami_demo(root_ns: u64, notif: u64) {
-    use libstream::table::{Item, TableReader};
     use libstream::Value;
+    use libstream::table::{Item, TableReader};
 
     kprint(b"test-harness: whoami demo (Milestone 2 Part E)\n");
     const WHOAMI: &[u8] = b"/bin/whoami";
@@ -2633,9 +2510,7 @@ fn error_granularity_demo(root_ns: u64) {
             Err(DirError::Server(k)) if k == KError::InvalidArgument.as_i32() => {
                 return_fail(b"test-harness: mkdir collision still collapses to InvalidArgument\n")
             }
-            _ => return_fail(
-                b"test-harness: mkdir over an existing name did not report AlreadyExists\n",
-            ),
+            _ => return_fail(b"test-harness: mkdir over an existing name did not report AlreadyExists\n"),
         }
         dir.close();
     }
@@ -2662,9 +2537,7 @@ fn error_granularity_demo(root_ns: u64) {
             Err(DirError::Server(k)) if k == KError::InvalidArgument.as_i32() => {
                 return_fail(b"test-harness: rmdir of a populated directory still collapses\n")
             }
-            _ => return_fail(
-                b"test-harness: rmdir of a populated directory did not report NotEmpty\n",
-            ),
+            _ => return_fail(b"test-harness: rmdir of a populated directory did not report NotEmpty\n"),
         }
         dir.close();
     }
@@ -2698,7 +2571,6 @@ fn error_granularity_demo(root_ns: u64) {
     kprint(b"test-harness: error granularity ok (AlreadyExists and NotEmpty cross both boundaries)\n");
 }
 
-
 /// **Milestone 3 Parts C and D — `nxsh` runs a real script against real processes.**
 ///
 /// The language is exercised by the host suite (95 tests) and pipeline *semantics* — stage
@@ -2712,12 +2584,7 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
     // 1. The language, evaluated in ring 3. The script computes with mixed Int/Float and
     //    compares its own answer, so a wrong result is a non-zero exit rather than a
     //    passing run that asserted nothing.
-    let ok = run_coreutil(
-        root_ns,
-        notif,
-        NXSH,
-        &["nxsh", "-c", "let x = 2 + 3\nlet y = x * 1.5\nif y != 7.5 { bad }"],
-    );
+    let ok = run_coreutil(root_ns, notif, NXSH, &["nxsh", "-c", "let x = 2 + 3\nlet y = x * 1.5\nif y != 7.5 { bad }"]);
     if ok != 0 {
         return_fail(b"test-harness: nxsh -c did not evaluate correctly\n");
     }
@@ -2725,12 +2592,8 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
     // 2. A real external stage: `nxsh` resolves `list`, spawns it, wires a pipe, reads
     //    the TSM1 stream back, and the script indexes into the resulting table. Every
     //    step of the process boundary is load-bearing for the exit code.
-    let ran = run_coreutil(
-        root_ns,
-        notif,
-        NXSH,
-        &["nxsh", "-c", "let t = list /system\nif (t[0]).name == \"\" { bad }"],
-    );
+    let ran =
+        run_coreutil(root_ns, notif, NXSH, &["nxsh", "-c", "let t = list /system\nif (t[0]).name == \"\" { bad }"]);
     if ran != 0 {
         return_fail(b"test-harness: nxsh could not run a real pipeline stage\n");
     }
@@ -2740,12 +2603,7 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
     //     lexes as one path word, but a lone `/` after a command head was read as
     //     division and the line died with "expected an expression". Found by typing it at
     //     a real prompt, which is the only place it had ever been typed.
-    let root = run_coreutil(
-        root_ns,
-        notif,
-        NXSH,
-        &["nxsh", "-c", "if (list / | count) < 1 { bad }"],
-    );
+    let root = run_coreutil(root_ns, notif, NXSH, &["nxsh", "-c", "if (list / | count) < 1 { bad }"]);
     if root != 0 {
         return_fail(b"test-harness: nxsh could not list the root directory\n");
     }
@@ -2760,12 +2618,7 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
     // 3. A failing stage fails the script (§1: fail loud, don't fail silent). `remove` on
     //    a path that does not exist exits non-zero, and that must reach the exit code
     //    rather than being swallowed.
-    let failed = run_coreutil(
-        root_ns,
-        notif,
-        NXSH,
-        &["nxsh", "-c", "remove /system/nx-does-not-exist"],
-    );
+    let failed = run_coreutil(root_ns, notif, NXSH, &["nxsh", "-c", "remove /system/nx-does-not-exist"]);
     if failed == 0 {
         return_fail(b"test-harness: a failing stage did not fail the script\n");
     }
@@ -2782,11 +2635,7 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
         root_ns,
         notif,
         NXSH,
-        &[
-            "nxsh",
-            "-c",
-            "let n = list /system | filter size > 0 | sort size | take 2 | count\nif n != 2 { bad }",
-        ],
+        &["nxsh", "-c", "let n = list /system | filter size > 0 | sort size | take 2 | count\nif n != 2 { bad }"],
     );
     if piped != 0 {
         return_fail(b"test-harness: nxsh generic-operator pipeline failed\n");
@@ -2829,16 +2678,7 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
     // 8. **Part F**: the REPL's language side. The console loop itself needs a device and
     //    a person, but everything that decides *what the loop does* — continuation, the
     //    auto-display rule, `$last` — is language logic, and that is what runs here.
-    let repl = run_coreutil(
-        root_ns,
-        notif,
-        NXSH,
-        &[
-            "nxsh",
-            "-c",
-            "let n = list /system | count\nif n < 1 { bad }",
-        ],
-    );
+    let repl = run_coreutil(root_ns, notif, NXSH, &["nxsh", "-c", "let n = list /system | count\nif n < 1 { bad }"]);
     if repl != 0 {
         return_fail(b"test-harness: nxsh repl-line evaluation failed\n");
     }
@@ -2908,9 +2748,7 @@ fn publish_session_user(ns: u64, name: &[u8]) {
     }
     let path = b"/session/user";
     // SAFETY: valid namespace handle, path, and object handle (direct-handle bind).
-    let br = unsafe {
-        syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, mem, 0, 0)
-    };
+    let br = unsafe { syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, mem, 0, 0) };
     // SAFETY: closing our own handle; the bind cloned its own reference.
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
     if br != 0 {
@@ -2967,11 +2805,7 @@ fn run_coreutil_in(root_ns: u64, notif: u64, image: &[u8], argv: &[&str], child_
         Ok(p) => p,
         Err(_) => return_fail(b"test-harness: coreutil spawn FAIL\n"),
     };
-    let streams = Streams {
-        stdin: None,
-        stdout: Some(stdout),
-        stderr: None,
-    };
+    let streams = Streams { stdin: None, stdout: Some(stdout), stderr: None };
     if send_setup(setup_shell, &streams, argv).is_err() {
         return_fail(b"test-harness: copy send_setup FAIL\n");
     }
@@ -3162,13 +2996,7 @@ fn dead_log_source_demo(root_ns: u64) {
         }
     }
     if best + 1 < online {
-        Line::new()
-            .s(b"test-harness: only ")
-            .u(best)
-            .s(b" of ")
-            .u(online)
-            .s(b" CPUs ever went idle")
-            .end();
+        Line::new().s(b"test-harness: only ").u(best).s(b" of ").u(online).s(b" CPUs ever went idle").end();
         return_fail(b"test-harness: a closed log source left a CPU spinning\n");
     }
     Line::new()
@@ -3251,8 +3079,17 @@ fn bin_listing_demo(root_ns: u64, notif: u64) {
     // 1. Every program the profile provides is listed. Checking one name would pass on a
     //    listing that lost a whole package.
     for prog in [
-        b"list".as_slice(), b"copy", b"mkdir", b"remove", b"rename", b"move",
-        b"touch", b"date", b"sleep", b"whoami", b"nxsh",
+        b"list".as_slice(),
+        b"copy",
+        b"mkdir",
+        b"remove",
+        b"rename",
+        b"move",
+        b"touch",
+        b"date",
+        b"sleep",
+        b"whoami",
+        b"nxsh",
     ] {
         if !contains(&out, prog) {
             return_fail(b"test-harness: a profiled program is missing from `list /bin`\n");
@@ -3414,8 +3251,7 @@ fn tty_demo(root_ns: u64, notif: u64) {
 fn tty_request(ch: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
     // SAFETY: TTY_MSG is a valid buffer; the rsproto message goes at offset 24.
     let sent = unsafe {
-        let Some(rs_len) = librsproto::encode(&mut TTY_MSG[24..], op, request_id, 0, body, 0)
-        else {
+        let Some(rs_len) = librsproto::encode(&mut TTY_MSG[24..], op, request_id, 0, body, 0) else {
             return false;
         };
         TTY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -3436,13 +3272,7 @@ fn tty_request(ch: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     let waited = unsafe {
         WAIT_HANDLES[0] = ch;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     if waited < 1 {
         return false;
@@ -3462,12 +3292,8 @@ fn tty_request(ch: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
     }
     // SAFETY: bounded read-only slice over the reply.
     unsafe {
-        let payload_len =
-            u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
-        let rep = core::slice::from_raw_parts(
-            ((&raw const TTY_MSG) as *const u8).add(24),
-            payload_len.min(4096 - 24),
-        );
+        let payload_len = u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
+        let rep = core::slice::from_raw_parts(((&raw const TTY_MSG) as *const u8).add(24), payload_len.min(4096 - 24));
         match librsproto::decode(rep) {
             Ok(m) => m.op == op && !m.is_error(),
             Err(_) => false,
@@ -3682,10 +3508,7 @@ fn session_fanout_demo(root_ns: u64) {
         if st != 0 || h == 0 {
             // Report how far we got: "stopped at 7" and "stopped at 20" are very
             // different failures, and the count is the whole diagnosis.
-            Line::new()
-                .s(b"test-harness: session fan-out stopped early at session ")
-                .x(i as u64)
-                .end();
+            Line::new().s(b"test-harness: session fan-out stopped early at session ").x(i as u64).end();
             return_fail(b"test-harness: could not open the full session table\n");
         }
         *slot = h;
@@ -3867,12 +3690,7 @@ fn rename_demo(root_ns: u64) {
     }
 
     // --- 4. RENAME_REPLACE overwrites ----------------------------------------
-    let st = rename_wait(
-        root_ns,
-        b"/system/nx-ren/sub/a3.txt",
-        b"/system/nx-ren/b.txt",
-        RENAME_REPLACE as u64,
-    );
+    let st = rename_wait(root_ns, b"/system/nx-ren/sub/a3.txt", b"/system/nx-ren/b.txt", RENAME_REPLACE as u64);
     if st != 0 {
         return_fail(b"test-harness: RENAME_REPLACE FAILED\n");
     }
@@ -3964,18 +3782,10 @@ fn rename_wait(ns: u64, src: &[u8], dst: &[u8], flags: u64) -> i32 {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     unsafe {
         WAIT_HANDLES[0] = po as u64;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        );
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
     }
     // SAFETY: the wait wrote one 24-byte `IoResult`; `status` is at offset 8.
-    let status = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     // SAFETY: closing our own PO handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
     status
@@ -3997,14 +3807,7 @@ fn write_file(ns: u64, path: &[u8], content: &[u8]) {
     let size = content.len() as u64;
     // SAFETY: valid path slice + namespace handle.
     let po = unsafe {
-        syscall5(
-            SYS_FILE_CREATE,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
-            size,
-        )
+        syscall5(SYS_FILE_CREATE, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE, size)
     };
     if po < 0 {
         return_fail(b"test-harness: fixture create FAIL\n");
@@ -4014,9 +3817,7 @@ fn write_file(ns: u64, path: &[u8], content: &[u8]) {
         return_fail(b"test-harness: fixture create FAIL\n");
     }
     // SAFETY: mapping our own writable file handle.
-    let addr = unsafe {
-        syscall4(SYS_MEMORY_MAP, fh, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-    };
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if addr < 0 {
         return_fail(b"test-harness: fixture map FAIL\n");
     }
@@ -4041,12 +3842,7 @@ fn file_matches(ns: u64, path: &[u8], expect: &[u8]) -> bool {
     if st != 0 || fh == 0 {
         return false;
     }
-    let mut info = HandleInfo {
-        rights: 0,
-        object_type: 0,
-        generation: 0,
-        size: 0,
-    };
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: a real, correctly sized `HandleInfo` out-param.
     let r = unsafe { syscall2(SYS_HANDLE_STAT, fh, (&raw mut info) as u64) };
     if r != 0 || info.size != expect.len() as u64 {
@@ -4167,20 +3963,20 @@ fn po_wait_pair(po: u64) -> (i32, u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid single-waiter buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     let (status, result) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                WAIT_RESULTS[16],
+                WAIT_RESULTS[17],
+                WAIT_RESULTS[18],
+                WAIT_RESULTS[19],
+                WAIT_RESULTS[20],
+                WAIT_RESULTS[21],
+                WAIT_RESULTS[22],
+                WAIT_RESULTS[23],
             ]),
         )
     };
@@ -4261,13 +4057,7 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
         let waited = unsafe {
             WAIT_HANDLES[0] = notif;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             kprint(b"test-harness: hard-float wait FAIL\n");
@@ -4280,15 +4070,11 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
                 break; // WouldBlock: drained
             }
             // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-            let (kind, b) =
-                unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+            let (kind, b) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
             if kind == KIND_CHILD_EXITED {
                 let code = i32::from_le_bytes([b[8], b[9], b[10], b[11]]);
                 if code != 0 {
-                    Line::new()
-                        .s(b"test-harness: hard-float worker FAILED code=")
-                        .i(code as i64)
-                        .end();
+                    Line::new().s(b"test-harness: hard-float worker FAILED code=").i(code as i64).end();
                     exit(1);
                 }
                 got += 1;
@@ -4372,11 +4158,7 @@ fn sched_stats_demo(root_ns: u64) {
             // Echo the winning snapshot into the boot log (grep-visible
             // evidence of the milestone, alongside the machine-checked gate).
             let len = text.iter().position(|&b| b == 0).unwrap_or(text.len());
-            Line::new()
-                .s(b"test-harness: /proc/sched/stats ok (")
-                .u(active)
-                .s(b" CPUs with switches>0):")
-                .end();
+            Line::new().s(b"test-harness: /proc/sched/stats ok (").u(active).s(b" CPUs with switches>0):").end();
             kprint(&text[..len]);
         }
         // SAFETY: unmapping the page mapped above (`text` is not used past
@@ -4403,21 +4185,19 @@ fn po_wait(po: u64) -> (i32, u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    let status = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     let result = unsafe {
         u64::from_le_bytes([
-            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            WAIT_RESULTS[16],
+            WAIT_RESULTS[17],
+            WAIT_RESULTS[18],
+            WAIT_RESULTS[19],
+            WAIT_RESULTS[20],
+            WAIT_RESULTS[21],
+            WAIT_RESULTS[22],
+            WAIT_RESULTS[23],
         ])
     };
     // SAFETY: closing our own PO handle.
@@ -4442,19 +4222,10 @@ fn read_block_sector0(root_ns: u64, path: &[u8]) -> i32 {
     }
     // The controller DMAs the sector into the buffer (MAP_WRITE); MAP_READ to verify.
     // SAFETY: `buf` is a fresh MemoryObject handle with full MAP rights.
-    let addr = unsafe {
-        syscall4(SYS_MEMORY_MAP, buf as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-    };
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, buf as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     let mut sig: i32 = -1;
     if addr >= 0 {
-        let op = IoOp {
-            opcode: IO_OPCODE_READ,
-            flags: 0,
-            buffer: buf as u64,
-            buf_offset: 0,
-            offset: 0,
-            length: 512,
-        };
+        let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: buf as u64, buf_offset: 0, offset: 0, length: 512 };
         // SAFETY: `dev` is a block DeviceNode with READ; `&op` is a valid IoOp.
         let po = unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) };
         if po >= 0 {
@@ -4519,7 +4290,11 @@ fn block_demo(root_ns: u64) {
     // asserted here, where a boot can check them.
     let path = |n: u32, leaf: &str| alloc::format!("/dev/blk/{n}{leaf}");
     for &(n, _) in &blocks {
-        report_block_info(root_ns, path(n, "/info").as_bytes(), path(n, "").replacen("/dev", "test-harness: /dev", 1).as_bytes());
+        report_block_info(
+            root_ns,
+            path(n, "/info").as_bytes(),
+            path(n, "").replacen("/dev", "test-harness: /dev", 1).as_bytes(),
+        );
     }
     for (kind, word) in [(DeviceKind::Disk, "disk"), (DeviceKind::Partition, "partition")] {
         match blocks.iter().find(|&&(_, k)| k == kind) {
@@ -4625,9 +4400,7 @@ fn forward_demo() {
     // 1. Channel pair: one end becomes the kernel forwarding endpoint, the other
     //    is the end this process serves requests on.
     // SAFETY: FWD_KEND/FWD_SEND are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut FWD_KEND) as u64, (&raw mut FWD_SEND) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut FWD_KEND) as u64, (&raw mut FWD_SEND) as u64, 4, 0) };
     if cr != 0 {
         kprint(b"test-harness: fwd channel create FAIL\n");
         return;
@@ -4645,9 +4418,7 @@ fn forward_demo() {
     let mount = b"/fs";
     // SAFETY: valid path pointer + namespace/endpoint handles. Binding an
     // `IpcChannel` makes the kernel adopt it as a Userspace Server.
-    let br = unsafe {
-        syscall4(SYS_NS_BIND, ns, mount.as_ptr() as u64, mount.len() as u64, kend)
-    };
+    let br = unsafe { syscall4(SYS_NS_BIND, ns, mount.as_ptr() as u64, mount.len() as u64, kend) };
     if br != 0 {
         kprint(b"test-harness: fwd bind FAIL\n");
         return;
@@ -4656,9 +4427,7 @@ fn forward_demo() {
     // 3. Async lookup of /fs/hello — the kernel forwards a Resolve to us.
     let path = b"/fs/hello";
     // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
-    };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ) };
     if po < 0 {
         kprint(b"test-harness: fwd lookup submit FAIL\n");
         return;
@@ -4682,9 +4451,7 @@ fn forward_demo() {
     }
 
     // 5. Parse the request via librsproto (IpcMsg: payload_len @4, payload @24).
-    let payload_len = unsafe {
-        u32::from_le_bytes([FWD_REQ[4], FWD_REQ[5], FWD_REQ[6], FWD_REQ[7]]) as usize
-    };
+    let payload_len = unsafe { u32::from_le_bytes([FWD_REQ[4], FWD_REQ[5], FWD_REQ[6], FWD_REQ[7]]) as usize };
     // SAFETY: payload_len ≤ 4072; the slice stays within FWD_REQ.
     let req_payload = unsafe { &FWD_REQ[24..24 + payload_len] };
     let request = match librsproto::decode(req_payload) {
@@ -4714,8 +4481,7 @@ fn forward_demo() {
     }
     // SAFETY: `addr` is a page the kernel mapped R/W into our address space.
     unsafe {
-        core::slice::from_raw_parts_mut(addr as u64 as *mut u8, CONTENT.len())
-            .copy_from_slice(CONTENT);
+        core::slice::from_raw_parts_mut(addr as u64 as *mut u8, CONTENT.len()).copy_from_slice(CONTENT);
     }
 
     // 7. Build the rsproto reply (echo request_id; REPLY flag; ResolveReply body)
@@ -4791,9 +4557,7 @@ fn forward_demo() {
         return;
     }
     // SAFETY: `raddr` is the mapped, kernel-installed MemoryObject.
-    let matches = unsafe {
-        core::slice::from_raw_parts(raddr as u64 as *const u8, CONTENT.len()) == CONTENT
-    };
+    let matches = unsafe { core::slice::from_raw_parts(raddr as u64 as *const u8, CONTENT.len()) == CONTENT };
     if matches {
         kprint(b"test-harness: forwarded lookup returned 'STUB' via fs-server ok\n");
     } else {
@@ -4925,7 +4689,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //     look a path up through it, serve the kernel-forwarded Resolve, and map
     //     the returned MemoryObject — the slice-7 transparent-forwarding proof.
     forward_demo();
-
 
     // 4. The concurrent-exit stress: waves of exiting children race teardown
     // against spawn, the login chain, and each other (substrate-hardening

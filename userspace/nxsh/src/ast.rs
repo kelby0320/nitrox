@@ -95,7 +95,11 @@ pub enum Expr {
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// `a .. b` / `a ..= b`. Language-only, never a `Value` (§8c).
-    Range { start: Box<Expr>, end: Box<Expr>, inclusive: bool },
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        inclusive: bool,
+    },
     /// `a | b | c`. Stages in order; always at least two.
     Pipeline(Vec<Expr>),
 
@@ -113,19 +117,33 @@ pub enum Expr {
     /// This variant previously held `x?`, which retired in v1.2: propagation needs a
     /// `Result` *value* to mark, §6 forbids one, and a raise already crosses every
     /// boundary — so `?` had nothing to mark and was the identity function.
-    Try { body: Vec<Stmt>, catch_binding: Option<String>, catch_body: Vec<Stmt> },
+    Try {
+        body: Vec<Stmt>,
+        catch_binding: Option<String>,
+        catch_body: Vec<Stmt>,
+    },
 
     List(Vec<Expr>),
     Record(Vec<(String, Expr)>),
     /// `{ |a, b| … }`. Pipes are mandatory even when empty, which is what disambiguates a
     /// closure from a record literal (§8c).
-    Closure { params: Vec<Param>, body: Vec<Stmt> },
+    Closure {
+        params: Vec<Param>,
+        body: Vec<Stmt>,
+    },
 
     /// A block in expression position; its value is the last expression-shaped statement
     /// (§9a).
     Block(Vec<Stmt>),
-    If { cond: Box<Expr>, then: Vec<Stmt>, otherwise: Option<Vec<Stmt>> },
-    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },
+    If {
+        cond: Box<Expr>,
+        then: Vec<Stmt>,
+        otherwise: Option<Vec<Stmt>>,
+    },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
     /// `expect T` — ascription in expression position (§6).
     Expect(Box<Expr>, TypeExpr),
     /// `parse T` — conversion, `expect`'s converting sibling (§6). Same grammar, same

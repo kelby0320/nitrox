@@ -37,9 +37,7 @@
 use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
-use crate::libkern::ipc::{
-    IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader,
-};
+use crate::libkern::ipc::{IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader};
 use crate::libkern::{AllocError, KBox, KVec};
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
@@ -110,10 +108,7 @@ struct RingSlot {
 
 impl RingSlot {
     fn empty() -> Self {
-        RingSlot {
-            msg: StoredMsg::zeroed(),
-            transfers: core::array::from_fn(|_| None),
-        }
+        RingSlot { msg: StoredMsg::zeroed(), transfers: core::array::from_fn(|_| None) }
     }
 }
 
@@ -159,11 +154,7 @@ impl MsgRing {
     /// Copy `src` into the tail slot and **move** any `transfers` into it
     /// (`take`-ing them from the caller's array). Returns `false` if full (and
     /// leaves `transfers` untouched for the caller to reclaim).
-    fn push_from(
-        &mut self,
-        src: &StoredMsg,
-        transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    ) -> bool {
+    fn push_from(&mut self, src: &StoredMsg, transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX]) -> bool {
         if self.is_full() {
             return false;
         }
@@ -180,11 +171,7 @@ impl MsgRing {
 
     /// Copy the head slot's bytes into `dst`, **move** its transfers into `out`,
     /// and advance. Returns `false` if empty.
-    fn pop_into(
-        &mut self,
-        dst: &mut StoredMsg,
-        out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-    ) -> bool {
+    fn pop_into(&mut self, dst: &mut StoredMsg, out: &mut [Option<TransferRef>; IPC_HANDLE_MAX]) -> bool {
         if self.is_empty() {
             return false;
         }
@@ -591,12 +578,7 @@ impl IpcChannel {
         // C.1(c) describes, found while sweeping the six the review named.
         peer_inner
             .pending_sends
-            .push_within_capacity(PendingSend {
-                msg: *msg,
-                transfers: held,
-                po: po.clone(),
-                cancelled: false,
-            })
+            .push_within_capacity(PendingSend { msg: *msg, transfers: held, po: po.clone(), cancelled: false })
             .unwrap_or_else(|held| {
                 // Unreachable: reserved at construction and length-checked above. Do not let
                 // `held` drop here — it owns an `ObjectRef` and `SCHED` is held.
@@ -698,10 +680,7 @@ impl Drop for IpcChannel {
     /// endpoint references are released only outside `SCHED` (see module docs).
     fn drop(&mut self) {
         crate::sched::ipc_endpoint_closing(self as *mut Self as *mut ());
-        debug_assert!(
-            self.inner.get_mut().recv_waiters.is_empty(),
-            "IpcChannel dropped with live receivers"
-        );
+        debug_assert!(self.inner.get_mut().recv_waiters.is_empty(), "IpcChannel dropped with live receivers");
     }
 }
 
@@ -715,10 +694,7 @@ mod tests {
 
     fn new_pair() -> (*mut (), *mut ()) {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
-        (
-            KBox::into_raw(a).as_ptr() as *mut (),
-            KBox::into_raw(b).as_ptr() as *mut (),
-        )
+        (KBox::into_raw(a).as_ptr() as *mut (), KBox::into_raw(b).as_ptr() as *mut ())
     }
 
     /// Adopt the creation reference and drop it (running `IpcChannel::drop`,
@@ -801,10 +777,7 @@ mod tests {
         // SAFETY: live endpoints, single-threaded test.
         unsafe {
             for _ in 0..4 {
-                assert!(matches!(
-                    push_no_xfer(a, &a_msg(0xAB, 1)),
-                    SendOutcome::Sent { .. }
-                ));
+                assert!(matches!(push_no_xfer(a, &a_msg(0xAB, 1)), SendOutcome::Sent { .. }));
             }
             // Fifth send: b's inbox (depth 4) is full.
             assert_eq!(push_no_xfer(a, &a_msg(0xAB, 1)), SendOutcome::Full);
@@ -877,8 +850,7 @@ mod tests {
         let (a, b) = new_pair();
         // SAFETY: live endpoints, single-threaded test.
         unsafe {
-            let ths: [*mut (); IpcChannel::MAX_WAITERS] =
-                core::array::from_fn(|i| (0x1000 + i) as *mut ());
+            let ths: [*mut (); IpcChannel::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
             for &t in &ths {
                 assert!(IpcChannel::add_waiter(a, t).is_ok());
             }
@@ -920,10 +892,7 @@ mod tests {
             let mut msg = a_msg(0, 0);
             msg.header.handle_count = 1;
             // Send on a → b's inbox; the transfer moves into the queued slot.
-            assert!(matches!(
-                IpcChannel::send_push(a, &msg, &mut send_t),
-                SendOutcome::Sent { .. }
-            ));
+            assert!(matches!(IpcChannel::send_push(a, &msg, &mut send_t), SendOutcome::Sent { .. }));
             assert!(send_t[0].is_none(), "transfer moved into the queue");
             // Pop on b → the transfer moves back out.
             let mut got = StoredMsg::zeroed();
@@ -981,8 +950,7 @@ mod tests {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         unsafe {
             ObjectRef::from_raw(
-                KBox::into_raw(crate::object::PendingOperation::try_new().unwrap()).as_ptr()
-                    as *mut (),
+                KBox::into_raw(crate::object::PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
                 KObjectType::PendingOperation,
             )
         }
@@ -1032,10 +1000,7 @@ mod tests {
             }
             // 5th send: ring full → held in b's pending-send queue.
             let mut t = empty_xfer();
-            assert_eq!(
-                IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po),
-                BlockSendOutcome::Queued
-            );
+            assert_eq!(IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po), BlockSendOutcome::Queued);
             // Receive one (frees a slot): FIFO byte 0.
             let mut d = a_msg(0, 0);
             assert!(pop_no_xfer(b, &mut d));
@@ -1070,10 +1035,7 @@ mod tests {
                 push_no_xfer(a, &a_msg(i, 1));
             }
             let mut t = empty_xfer();
-            assert_eq!(
-                IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po),
-                BlockSendOutcome::Queued
-            );
+            assert_eq!(IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po), BlockSendOutcome::Queued);
             // The held sender is visible to the closing path.
             let mut pos = [core::ptr::null_mut(); IpcChannel::MAX_PENDING_SENDS];
             assert_eq!(IpcChannel::pending_send_pos(b, &mut pos), 1);
@@ -1099,10 +1061,7 @@ mod tests {
                 push_no_xfer(a, &a_msg(i, 1));
             }
             let mut t = empty_xfer();
-            assert_eq!(
-                IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po),
-                BlockSendOutcome::Queued
-            );
+            assert_eq!(IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po), BlockSendOutcome::Queued);
             // Cancel finds the held send by its PO; an unknown PO is a no-op.
             assert!(!IpcChannel::cancel_pending_send(b, 0xDEAD as *mut ()));
             assert!(IpcChannel::cancel_pending_send(b, po.as_ptr()));
@@ -1126,15 +1085,9 @@ mod tests {
                 push_no_xfer(a, &a_msg(i, 1));
             }
             let mut t1 = empty_xfer();
-            assert_eq!(
-                IpcChannel::send_or_queue(a, &a_msg(50, 1), &mut t1, &po1),
-                BlockSendOutcome::Queued
-            );
+            assert_eq!(IpcChannel::send_or_queue(a, &a_msg(50, 1), &mut t1, &po1), BlockSendOutcome::Queued);
             let mut t2 = empty_xfer();
-            assert_eq!(
-                IpcChannel::send_or_queue(a, &a_msg(51, 1), &mut t2, &po2),
-                BlockSendOutcome::Queued
-            );
+            assert_eq!(IpcChannel::send_or_queue(a, &a_msg(51, 1), &mut t2, &po2), BlockSendOutcome::Queued);
             // po1 times out.
             assert!(IpcChannel::cancel_pending_send(b, po1.as_ptr()));
             // A recv frees a slot: promote sweeps the cancelled po1 (reclaimed)

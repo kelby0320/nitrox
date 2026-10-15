@@ -361,9 +361,7 @@ pub mod policy {
             if l.starts_with('[') {
                 return Err(err(line, format!("`{l}` is not a section this file has")));
             }
-            let (key, value) = l
-                .split_once('=')
-                .ok_or_else(|| err(line, format!("`{l}` is not `key = value`")))?;
+            let (key, value) = l.split_once('=').ok_or_else(|| err(line, format!("`{l}` is not `key = value`")))?;
             let key = key.trim();
             let value = parse_value(value, line)?;
             match &mut section {
@@ -382,8 +380,7 @@ pub mod policy {
                         let grant = Grant::from_name(&g).ok_or_else(|| {
                             let known: Vec<&str> = KNOWN_GRANTS.iter().map(|g| g.name()).collect();
                             let known = known.join(", ");
-                            let msg =
-                                format!("`{g}` is not a grant this system has (it has: {known})");
+                            let msg = format!("`{g}` is not a grant this system has (it has: {known})");
                             err(line, msg)
                         })?;
                         if !profile.grants.contains(&grant) {
@@ -426,18 +423,12 @@ pub mod policy {
                                 Value::Str(s) if s == "password" => Auth::Password,
                                 Value::Str(s) if s == "none" => Auth::None,
                                 _ => {
-                                    return Err(err(
-                                        line,
-                                        String::from("`auth` is \"password\" or \"none\""),
-                                    ));
+                                    return Err(err(line, String::from("`auth` is \"password\" or \"none\"")));
                                 }
                             });
                         }
                         _ => {
-                            return Err(err(
-                                line,
-                                format!("a rule has `who`, `use`, `run` and `auth`, not `{key}`"),
-                            ));
+                            return Err(err(line, format!("a rule has `who`, `use`, `run` and `auth`, not `{key}`")));
                         }
                     }
                 }
@@ -577,16 +568,15 @@ pub mod policy {
         /// that exist count**: `who = ["kelby"]` names nobody if `kelby` has no account, and
         /// `who = ["*"]` names every account there is. In the order `accounts` gives them.
         pub fn administrators<'a>(&self, accounts: &[&'a str]) -> Vec<&'a str> {
-            let grants_views = |view: &String| {
-                self.profiles.iter().any(|p| &p.name == view && p.grants.contains(&Grant::Views))
-            };
+            let grants_views =
+                |view: &String| self.profiles.iter().any(|p| &p.name == view && p.grants.contains(&Grant::Views));
             accounts
                 .iter()
                 .copied()
                 .filter(|a| {
-                    self.rules.iter().any(|r| {
-                        r.run == Names::Any && r.who.allows(a) && r.views.iter().any(grants_views)
-                    })
+                    self.rules
+                        .iter()
+                        .any(|r| r.run == Names::Any && r.who.allows(a) && r.views.iter().any(grants_views))
                 })
                 .collect()
         }
@@ -700,11 +690,7 @@ pub mod pacing {
 
         /// The soonest a held check may run, if any is held: when to wake.
         pub fn next_due(&self, sessions: &Sessions, now: u64) -> Option<u64> {
-            self.waiting
-                .iter()
-                .filter_map(|&(_, session)| sessions.get(session))
-                .map(|s| s.pacing.check_at(now))
-                .min()
+            self.waiting.iter().filter_map(|&(_, session)| sessions.get(session)).map(|s| s.pacing.check_at(now)).min()
         }
     }
 }
@@ -1248,10 +1234,7 @@ auth = "password"
     #[test]
     fn a_denial_says_whether_the_view_or_the_program_was_the_problem() {
         let p = parse(SEED).unwrap();
-        assert_eq!(
-            p.decide("bob", "install", "nxsh"),
-            Decision::Deny("`install` does not let bob run `nxsh`".into()),
-        );
+        assert_eq!(p.decide("bob", "install", "nxsh"), Decision::Deny("`install` does not let bob run `nxsh`".into()),);
         let deny = |s: &str| Decision::Deny(s.into());
         assert_eq!(p.decide("bob", "admin", "nxsh"), deny("no rule lets bob use `admin`"));
         assert_eq!(p.decide("alice", "nope", "x"), deny("there is no view called `nope`"));
@@ -1614,8 +1597,7 @@ auth = "password"
         assert_eq!(suffix::parse(b"s/7"), Suffix::Client(7));
         assert_eq!(suffix::parse(b"s/18446744073709551615"), Suffix::Client(u64::MAX));
         let overflow = b"s/18446744073709551616";
-        let bads =
-            [&b""[..], b"s/", b"s/0", b"s/07", b"s/7x", b"s/-1", overflow, b"sessions", b"x/7"];
+        let bads = [&b""[..], b"s/", b"s/0", b"s/07", b"s/7x", b"s/-1", overflow, b"sessions", b"x/7"];
         for bad in bads {
             assert_eq!(suffix::parse(bad), Suffix::Unknown, "{:?}", core::str::from_utf8(bad));
         }

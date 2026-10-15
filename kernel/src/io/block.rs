@@ -89,11 +89,7 @@ pub(crate) struct IrpBox {
 /// buf_offset + length)` across `frames` (each one page), splitting at page
 /// boundaries — the PRDT-style description of exactly this transfer's region.
 /// The caller has already validated `buf_offset + length <= frames.len() * PAGE`.
-fn build_frags(
-    frames: &[PhysAddr],
-    buf_offset: u64,
-    length: u64,
-) -> Result<KVec<PhysFrag>, KError> {
+fn build_frags(frames: &[PhysAddr], buf_offset: u64, length: u64) -> Result<KVec<PhysFrag>, KError> {
     let mut frags: KVec<PhysFrag> = KVec::new();
     let mut pos = buf_offset;
     let mut remaining = length;
@@ -106,10 +102,7 @@ fn build_frags(
         let intra = pos % PAGE_SIZE as u64;
         let in_page = (PAGE_SIZE as u64 - intra).min(remaining);
         frags
-            .try_push(PhysFrag {
-                base: frames[page].as_u64() + intra,
-                len: in_page,
-            })
+            .try_push(PhysFrag { base: frames[page].as_u64() + intra, len: in_page })
             .map_err(|_| KError::OutOfMemory)?;
         pos += in_page;
         remaining -= in_page;
@@ -190,11 +183,8 @@ pub fn dispatch_block_irp(
     // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned `IrpBox`.
     let irp_ptr = unsafe {
         let bx = &mut *bx_ptr;
-        bx.irp.buffer = IrpBuffer {
-            kind: IRP_BUF_FRAGS,
-            count: bx.frags.len() as u32,
-            frags: bx.frags.as_ptr() as u64,
-        };
+        bx.irp.buffer =
+            IrpBuffer { kind: IRP_BUF_FRAGS, count: bx.frags.len() as u32, frags: bx.frags.as_ptr() as u64 };
         bx.irp.dpc = Dpc::new(irp_complete_dpc, bx_ptr as *mut ());
         &mut bx.irp as *mut Irp
     };
@@ -279,11 +269,8 @@ pub fn dispatch_block_irp_into_frames(
     // the now-stable `frags`, arm the completion DPC at the box (irp is the first field).
     let irp_ptr = unsafe {
         let bx = &mut *bx_ptr;
-        bx.irp.buffer = IrpBuffer {
-            kind: IRP_BUF_FRAGS,
-            count: bx.frags.len() as u32,
-            frags: bx.frags.as_ptr() as u64,
-        };
+        bx.irp.buffer =
+            IrpBuffer { kind: IRP_BUF_FRAGS, count: bx.frags.len() as u32, frags: bx.frags.as_ptr() as u64 };
         bx.irp.dpc = Dpc::new(irp_complete_dpc, bx_ptr as *mut ());
         &mut bx.irp as *mut Irp
     };
@@ -333,8 +320,7 @@ pub fn dispatch_block_control(device: &ObjectRef, po: &ObjectRef, op: IrpOp) -> 
 ///
 /// An `IrqSpinLock` because [`irp_complete_dpc`] pushes from the interrupt-dispatch tail:
 /// masking interrupts is allocation-free, which is the whole constraint here.
-static RECLAIM: IrqSpinLock<ReclaimHead> =
-    IrqSpinLock::new(LockRank::Leaf, ReclaimHead(core::ptr::null_mut()));
+static RECLAIM: IrqSpinLock<ReclaimHead> = IrqSpinLock::new(LockRank::Leaf, ReclaimHead(core::ptr::null_mut()));
 
 /// Head of the intrusive reclaim list.
 struct ReclaimHead(*mut IrpBox);
@@ -448,12 +434,13 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
         return false;
     };
     let po_ref = unsafe {
-        ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), crate::libkern::handle::KObjectType::PendingOperation)
+        ObjectRef::from_raw(
+            KBox::into_raw(po).as_ptr() as *mut (),
+            crate::libkern::handle::KObjectType::PendingOperation,
+        )
     };
 
-    if dispatch_block_irp(device, &buf_ref, &po_ref, IoOpcode::Read, offset, 0, len as u64)
-        .is_err()
-    {
+    if dispatch_block_irp(device, &buf_ref, &po_ref, IoOpcode::Read, offset, 0, len as u64).is_err() {
         return false;
     }
     // Poll the in-flight command to completion + run its DPC (no interrupts).
@@ -581,13 +568,7 @@ fn window_refusal(p: &Partition, op: u32) -> Option<KError> {
 /// Translate a partition-relative byte `offset` (length `length`) into a
 /// disk-absolute offset, or `None` if the request falls outside the partition
 /// `[0, block_count * sector_size)`. The core of the two-layer block stack.
-fn partition_rebase(
-    offset: u64,
-    length: u64,
-    start_lba: u64,
-    block_count: u64,
-    sector_size: u64,
-) -> Option<u64> {
+fn partition_rebase(offset: u64, length: u64, start_lba: u64, block_count: u64, sector_size: u64) -> Option<u64> {
     let span = block_count.checked_mul(sector_size)?;
     let end = offset.checked_add(length)?;
     if end > span {
@@ -624,12 +605,7 @@ impl Partition {
     /// block device `disk` (a `DeviceNode` with a backend). Returns the leaked
     /// `'static` partition + a backend over it, or `None` if `disk` is not a block
     /// device. The caller publishes a block `DeviceNode` backed by the backend.
-    pub fn new(
-        disk: &ObjectRef,
-        start_lba: u64,
-        block_count: u64,
-        sector_size: u64,
-    ) -> Option<&'static Partition> {
+    pub fn new(disk: &ObjectRef, start_lba: u64, block_count: u64, sector_size: u64) -> Option<&'static Partition> {
         // SAFETY: `disk` pins a live `DeviceNode`.
         let dn: &DeviceNode = unsafe { &*(disk.as_ptr() as *const DeviceNode) };
         let disk_backend = dn.block_backend()?;
@@ -699,10 +675,7 @@ mod tests {
         // Partition byte offset 8192 → disk (2048 * 512) + 8192.
         assert_eq!(partition_rebase(8192, 512, start, count, ss), Some(2048 * 512 + 8192));
         // The last sector is in bounds.
-        assert_eq!(
-            partition_rebase((count - 1) * ss, ss, start, count, ss),
-            Some((start + count - 1) * ss)
-        );
+        assert_eq!(partition_rebase((count - 1) * ss, ss, start, count, ss), Some((start + count - 1) * ss));
         // One byte past the end is rejected.
         assert_eq!(partition_rebase((count - 1) * ss, ss + 1, start, count, ss), None);
         assert_eq!(partition_rebase(count * ss, ss, start, count, ss), None);
@@ -761,13 +734,18 @@ mod tests {
         let adopt = |node: KBox<DeviceNode>| {
             // SAFETY: `into_raw` yields the single creation reference, which the test adopts.
             unsafe {
-                ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), crate::libkern::handle::KObjectType::DeviceNode)
+                ObjectRef::from_raw(
+                    KBox::into_raw(node).as_ptr() as *mut (),
+                    crate::libkern::handle::KObjectType::DeviceNode,
+                )
             }
         };
         let geometry = |blocks| BlockGeometry { logical_block_size: 512, block_count: blocks };
-        let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+        let backend =
+            BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
         let disk = adopt(
-            DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(8192), BlockKind::Disk, b"disk", backend).unwrap(),
+            DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(8192), BlockKind::Disk, b"disk", backend)
+                .unwrap(),
         );
         let window = Partition::new(&disk, 2048, 100, 512).unwrap();
         let wb = partition_backend(window);
@@ -825,9 +803,11 @@ mod tests {
         }
         fn disk_poll(_: *mut ()) {}
         let seen = Seen(RefCell::new(std::vec::Vec::new()));
-        let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+        let backend =
+            BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 8192 };
-        let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
+        let node =
+            DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
         // SAFETY: `into_raw` yields each single creation reference, which the test adopts.
         let (disk, po) = unsafe {
             (

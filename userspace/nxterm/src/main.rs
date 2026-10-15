@@ -19,25 +19,24 @@ extern crate alloc;
 
 mod backend;
 
-
 use libdraw::framebuffer::{Framebuffer, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, load_mono, load_ui};
 use libkern::debug::Line;
 use libkern::{exit, kprint};
 use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT, Clipboard, MAX_CLIP_BYTES};
-use librsproto::surface::{Role};
+use librsproto::surface::Role;
 
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libterm::render::Metrics;
 
 use libui::damage::union_opt;
-use libui::layout::{layout};
+use libui::layout::layout;
 use libui::paint::FontMetrics;
-use libui::paint::{Theme};
+use libui::paint::Theme;
 
-use libui::window::Child;
 use libui::menu::{Item, KeyOutcome, Menu};
+use libui::window::Child;
 use nxterm::{App, GRID_KEY, GRID_KIND, Msg, rows_in};
 
 /// `alloc` backing — the element tree, the grid and the render all allocate.
@@ -51,8 +50,6 @@ const BUFFERS: usize = 2;
 /// The terminal's size in cells **at startup**. A `Configure` changes it (M9 Part D).
 const COLS: usize = 80;
 const ROWS: usize = 24;
-
-
 
 /// Report and end the run.
 fn fail(msg: &[u8]) -> ! {
@@ -98,7 +95,6 @@ fn chose(msg: Msg) {
         libkern::debug::Line::new().s(b"nxterm: menu chose ").s(name).end();
     }
 }
-
 
 /// Print the text of grid row `row`, trailing blanks trimmed.
 ///
@@ -318,16 +314,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // lives in there, so a second window is a second value rather than a second copy of this loop.
     let top = {
         let ui = app.view(&theme, None);
-        match Child::open_sized(
-            &mut win,
-            Role::Normal,
-            (0, 0),
-            size,
-            &ui,
-            &ui_font,
-            &theme,
-            BUFFERS,
-        ) {
+        match Child::open_sized(&mut win, Role::Normal, (0, 0), size, &ui, &ui_font, &theme, BUFFERS) {
             Some(t) => t,
             None => fail(b"nxterm: CreateWindow FAILED\n"),
         }
@@ -404,8 +391,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     ) -> Option<Win> {
         let size = app.window_size();
         let ui = app.view(theme, None);
-        let top =
-            Child::open_sized(win, Role::Normal, (0, 0), size, &ui, ui_font, theme, BUFFERS)?;
+        let top = Child::open_sized(win, Role::Normal, (0, 0), size, &ui, ui_font, theme, BUFFERS)?;
         dress(win, top.id());
         let mut backends = alloc::vec::Vec::new();
         // SAFETY: the caller's contract — `root_ns` is this process's live root namespace.
@@ -463,12 +449,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // there was one backend for the life of the process nothing ever dropped one, and a raw
         // handle dropped silently would leak a terminal and a shell per closed tab.
         backends.retain(|b| app.tabs().iter().any(|t| t.key() == b.key));
-        let want: alloc::vec::Vec<u64> = app
-            .tabs()
-            .iter()
-            .map(|t| t.key())
-            .filter(|k| !backends.iter().any(|b| b.key == *k))
-            .collect();
+        let want: alloc::vec::Vec<u64> =
+            app.tabs().iter().map(|t| t.key()).filter(|k| !backends.iter().any(|b| b.key == *k)).collect();
         for key in want {
             // SAFETY: the caller's contract — `root_ns` is this process's live root namespace.
             match unsafe { backend::attach(root_ns) } {
@@ -496,15 +478,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let mut backends: alloc::vec::Vec<TabBackend> = alloc::vec::Vec::new();
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     unsafe { reconcile_backends(&mut app, &mut backends, root_ns, &env) };
-    let mut wins = alloc::vec![Win {
-        top,
-        app,
-        backends,
-        bounds,
-        popup,
-        menu_shown,
-        menu_hovered,
-    }];
+    let mut wins = alloc::vec![Win { top, app, backends, bounds, popup, menu_shown, menu_hovered }];
 
     loop {
         // **Every window this process owns, each serviced exactly as one used to be.**
@@ -512,340 +486,340 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Destructured rather than dotted through, which is what keeps this loop readable across
         // the conversion: every name below means what it meant when there was one window.
         for wi in 0..wins.len() {
-        let Win { top, app, backends, bounds, popup, menu_shown, menu_hovered } = &mut wins[wi];
-        let window_id = top.id();
-        // ---- render ----
-        // **The widget under the pointer, from the router that already knew.** `Router::inside`
-        // has reported it since M4; nothing had ever asked, so nothing in this system reacted to
-        // the pointer moving over it (M11 Part E batch 3).
-        let ui = app.view(&theme, top.hovered_key());
-        let l = layout(&ui, *bounds, &FontMetrics::new(&ui_font, theme.font_px));
-        // The anchors for the next frame's popup — **one per bar word**. Read every frame rather
-        // than only when a menu opens: a word's position is a fact about the layout, not about
-        // the menu, and reading it on open means reading it before the first layout exists.
-        app.place_menus(&ui, &l);
+            let Win { top, app, backends, bounds, popup, menu_shown, menu_hovered } = &mut wins[wi];
+            let window_id = top.id();
+            // ---- render ----
+            // **The widget under the pointer, from the router that already knew.** `Router::inside`
+            // has reported it since M4; nothing had ever asked, so nothing in this system reacted to
+            // the pointer moving over it (M11 Part E batch 3).
+            let ui = app.view(&theme, top.hovered_key());
+            let l = layout(&ui, *bounds, &FontMetrics::new(&ui_font, theme.font_px));
+            // The anchors for the next frame's popup — **one per bar word**. Read every frame rather
+            // than only when a menu opens: a word's position is a fact about the layout, not about
+            // the menu, and reading it on open means reading it before the first layout exists.
+            app.place_menus(&ui, &l);
 
-        // ---- the menu's window ----
-        //
-        // **Opened and destroyed with the menu**, because `popup` is a transient role: the
-        // compositor takes it with its parent, it takes keyboard focus while it is up, and a
-        // hidden one would still be a window in the stack. The anchor has to exist first —
-        // before the first layout there is nowhere to put it, which is why this reads the
-        // anchor computed just above rather than the one from when the menu was toggled.
-        //
-        // **Which menu, not whether one is open** (PR #280 review, blocking 2). The discriminator
-        // was `open().is_some()`, so switching from File to Edit — which `MenuState::key` does on
-        // Left and Right — left the existing window at the old word and, worse, at the size
-        // measured for the old menu: `Child::present` lays the new tree into a rectangle fixed at
-        // `Child::open`, so the rows a five-row menu grew were simply clipped away. It was
-        // unreachable before this part, because this terminal had one menu and no arrow keys.
-        if *menu_shown != app.menus.open() {
-            if let Some(p) = popup.take() {
-                p.close(&mut win);
-            }
-            // The window is gone, so nothing is under the pointer in it. Left set, the next menu
-            // would open believing a row was already highlighted and report no change when one
-            // really was.
-            *menu_hovered = None;
-            *menu_shown = app.menus.open();
-        }
-        match (menu_shown.is_some(), popup.is_some(), app.menus.anchor()) {
-            (true, false, Some(anchor)) => {
-                // **Measured from the menu with no hover**, because the pointer is over the
-                // *bar* item that opened this rather than over the popup — and a highlight does
-                // not change what a menu measures.
-                let menu = app.menu_view(&theme, None);
-                *popup = Child::open(
-                    &mut win,
-                    Role::Popup { parent: window_id },
-                    anchor,
-                    &menu,
-                    &ui_font,
-                    &theme,
-                    BUFFERS,
-                );
-                // **Where it is and how big**, because the gate has no other way to see a
-                // second window: it reads the serial log, and this is the only thing that
-                // says the menu became a window rather than a layer. The origin is in screen
-                // coordinates, which is what a click has to be aimed at.
-                #[cfg(feature = "test-harness")]
-                if let Some(p) = popup.as_ref() {
-                    let o = win
-                        .window(p.id())
-                        .and_then(|w| w.configured())
-                        .map_or((0, 0), |c| (c.x, c.y));
-                    libkern::debug::Line::new()
-                        .s(b"nxterm: menu popup ").u(p.id() as u64)
-                        .s(b" at ").i(o.0 as i64).s(b",").i(o.1 as i64)
-                        .s(b" ").u(p.size().w as u64).s(b"x").u(p.size().h as u64)
-                        .end();
-                }
-                if popup.is_none() {
-                    // Not fatal: the terminal is still usable without its menu, and saying so
-                    // beats a window that silently never appears.
-                    kprint(b"nxterm: could not open the menu popup\n");
-                    app.menus.close();
-                    *menu_shown = None;
-                }
-            }
-            (false, true, _) => {
+            // ---- the menu's window ----
+            //
+            // **Opened and destroyed with the menu**, because `popup` is a transient role: the
+            // compositor takes it with its parent, it takes keyboard focus while it is up, and a
+            // hidden one would still be a window in the stack. The anchor has to exist first —
+            // before the first layout there is nowhere to put it, which is why this reads the
+            // anchor computed just above rather than the one from when the menu was toggled.
+            //
+            // **Which menu, not whether one is open** (PR #280 review, blocking 2). The discriminator
+            // was `open().is_some()`, so switching from File to Edit — which `MenuState::key` does on
+            // Left and Right — left the existing window at the old word and, worse, at the size
+            // measured for the old menu: `Child::present` lays the new tree into a rectangle fixed at
+            // `Child::open`, so the rows a five-row menu grew were simply clipped away. It was
+            // unreachable before this part, because this terminal had one menu and no arrow keys.
+            if *menu_shown != app.menus.open() {
                 if let Some(p) = popup.take() {
                     p.close(&mut win);
                 }
+                // The window is gone, so nothing is under the pointer in it. Left set, the next menu
+                // would open believing a row was already highlighted and report no change when one
+                // really was.
                 *menu_hovered = None;
+                *menu_shown = app.menus.open();
             }
-            _ => {}
-        }
-        if let Some(p) = popup.as_mut() {
-            let now = p.hovered_key();
-            if now != *menu_hovered {
-                *menu_hovered = now;
-                // The item's key, which is a number this program chose — not a label, and not a
-                // position. There is nothing here a person typed.
-                #[cfg(feature = "test-harness")]
-                {
-                    let mut l = libkern::debug::Line::new();
-                    l.s(b"nxterm: menu hover ");
-                    match now {
-                        Some(k) => {
-                            l.u(k);
-                        }
-                        None => {
-                            l.s(b"none");
-                        }
+            match (menu_shown.is_some(), popup.is_some(), app.menus.anchor()) {
+                (true, false, Some(anchor)) => {
+                    // **Measured from the menu with no hover**, because the pointer is over the
+                    // *bar* item that opened this rather than over the popup — and a highlight does
+                    // not change what a menu measures.
+                    let menu = app.menu_view(&theme, None);
+                    *popup = Child::open(
+                        &mut win,
+                        Role::Popup { parent: window_id },
+                        anchor,
+                        &menu,
+                        &ui_font,
+                        &theme,
+                        BUFFERS,
+                    );
+                    // **Where it is and how big**, because the gate has no other way to see a
+                    // second window: it reads the serial log, and this is the only thing that
+                    // says the menu became a window rather than a layer. The origin is in screen
+                    // coordinates, which is what a click has to be aimed at.
+                    #[cfg(feature = "test-harness")]
+                    if let Some(p) = popup.as_ref() {
+                        let o = win.window(p.id()).and_then(|w| w.configured()).map_or((0, 0), |c| (c.x, c.y));
+                        libkern::debug::Line::new()
+                            .s(b"nxterm: menu popup ")
+                            .u(p.id() as u64)
+                            .s(b" at ")
+                            .i(o.0 as i64)
+                            .s(b",")
+                            .i(o.1 as i64)
+                            .s(b" ")
+                            .u(p.size().w as u64)
+                            .s(b"x")
+                            .u(p.size().h as u64)
+                            .end();
                     }
-                    l.end();
+                    if popup.is_none() {
+                        // Not fatal: the terminal is still usable without its menu, and saying so
+                        // beats a window that silently never appears.
+                        kprint(b"nxterm: could not open the menu popup\n");
+                        app.menus.close();
+                        *menu_shown = None;
+                    }
                 }
-            }
-            let menu = app.menu_view(&theme, now);
-            if !p.present(&mut win, &menu, &ui_font, &theme) {
-                kprint(b"nxterm: the menu popup could not be drawn\n");
-            }
-        }
-
-        // **The grid holds the keyboard whenever the menu is not open.** Focus has to start
-        // somewhere, and the toolkit will not guess: `focus_next` lands on the menu button,
-        // being first in tree order. Re-asserted every frame rather than only on the first,
-        // because clicking a button takes focus — and a terminal whose keyboard stays with the
-        // menu after you used it is a terminal you have to click back into.
-        if app.menus.open().is_none() {
-            top.focus_key(&ui, GRID_KEY);
-        }
-
-        // The grid's own rows, in window coordinates. **Damage the diff cannot see**: a `custom`
-        // node is fingerprinted by its kind and size, so rows `libterm` wrote report nothing.
-        // **Viewport rows** — the translation from the grid's screen rows is `App::damage_rows`',
-        // because it is the half that knows where the view is anchored.
-        let mut extra = None;
-        let origin = app.grid_origin();
-        let cols = app.grid().cols();
-        for row in app.damage_rows() {
-            let r = app.metrics.row_rect(row, cols);
-            let r = Rect::new(origin.x + r.origin.x, origin.y + r.origin.y, r.size.w, r.size.h);
-            extra = union_opt(extra, Some(r));
-        }
-
-        let ok = {
-            let (m, palette, view_top) = (app.metrics, app.palette, app.view_line());
-            let grid = app.grid();
-            top.present_custom(&mut win, &ui, &l, &ui_font, &theme, extra, &mut |kind, rect, clip, fb: &mut MemFramebuffer| {
-                if kind != GRID_KIND {
-                    return;
+                (false, true, _) => {
+                    if let Some(p) = popup.take() {
+                        p.close(&mut win);
+                    }
+                    *menu_hovered = None;
                 }
-                // **The cells do not always fill the node** (M9 Part D). A maximised window is
-                // exactly the work area and the grid is the whole cells that fit, so up to a
-                // cell's width and height of the node is not covered by any row — and
-                // `render_view` paints cells, nothing else. Left alone that margin holds whatever
-                // the last frame put there, which after a resize is a strip of the old window.
-                let cells = m.pixel_size(grid.cols(), grid.rows());
-                if rect.size.w > cells.w || rect.size.h > cells.h {
-                    fb.fill_rect(clip, palette.background);
-                }
-                let rows = rows_in(clip, origin, &m, grid.rows());
-                libterm::render::render_view(fb, grid, &mono_font, &m, &palette, origin, view_top, &rows);
-            })
-        };
-        if !ok {
-            fail(b"nxterm: the window could not be drawn\n");
-        }
-
-        // **Asked to close, by its own button or by the shell.** Exiting is the whole of it: the
-        // kernel closes this process's handles, the compositor sees the session go and destroys
-        // the windows on it, and the shell hears `WindowDestroyed` like any other close.
-        if app.closing() {
-            kprint(b"nxterm: closing\n");
-            exit(0);
-        }
-
-        // **The title bar was dragged.** Performed here rather than in `update`, which has no
-        // syscalls — and performed *before* the frame below, so the compositor is already moving
-        // the window while this client is still painting.
-        if app.take_move_request()
-            && let Some(mut w) = win.window(window_id)
-        {
-            match w.start_move() {
-                Ok(()) => kprint(b"nxterm: dragging its own title bar\n"),
-                // Refused when the grab is not this window's, which is a press that arrived
-                // through some path other than a real one. Not fatal, and not silent.
-                Err(_) => kprint(b"nxterm: the compositor refused the move\n"),
+                _ => {}
             }
-        }
-
-        // **The corner grip.** Asked for, not done — like the move above and for the same
-        // reason: the compositor holds the grab this press opened, and it is the only
-        // participant that can follow a pointer without a round trip per motion. What comes
-        // back is an ordinary `Configure` at the end of the gesture, from the shell.
-        if let Some(edges) = app.take_resize_request()
-            && let Some(mut w) = win.window(window_id)
-        {
-            match w.start_resize(edges) {
-                Ok(()) => kprint(b"nxterm: dragging its own corner\n"),
-                Err(_) => kprint(b"nxterm: the compositor refused the resize\n"),
-            }
-        }
-
-        // **A title-bar button.** Asked for, not done: minimising and maximising are the
-        // manager's, and the reply says the compositor forwarded the question rather than that
-        // anything happened — a shell may decide otherwise, and this terminal will find out the
-        // way it finds out about any other geometry, through `Configure`.
-        // **Taken before the window is looked up, deliberately** — the same shape as the move
-        // request above. A request for a window that has gone is dropped rather than retried:
-        // there is nothing to ask about, and holding it would mean asking on behalf of a window
-        // whose id the compositor may have moved past.
-        if let Some(state) = app.take_state_request()
-            && let Some(mut w) = win.window(window_id)
-        {
-            match w.request_state(state) {
-                Ok(()) => {
-                    libkern::debug::Line::new()
-                        .s(b"nxterm: asked the shell for window state ")
-                        .u(state as u64)
-                        .end();
-                }
-                Err(_) => kprint(b"nxterm: the state request was refused\n"),
-            }
-        }
-
-        // ---- the clipboard ----
-        //
-        // **Here rather than in `update`**, for the reason every other syscall in this loop is:
-        // `App::update` is a function of values, and `/dev/clipboard` is IPC. A copy is one
-        // round trip; a paste is one round trip and then the bytes go down the pty exactly as
-        // if they had been typed.
-        if let Some(req) = app.take_clip_request() {
-            match req {
-                nxterm::ClipRequest::Copy(text) => match clipboard_copy(root_ns, text.as_bytes()) {
-                    // **A length, never the text** — this is a terminal, and what a person
-                    // selected is as much theirs as what they typed.
-                    Ok(()) => Line::new()
-                        .s(b"nxterm: copied ")
-                        .u(text.len() as u64)
-                        .s(b" bytes")
-                        .end(),
-                    Err(why) => Line::new().s(b"nxterm: the copy failed: ").s(why.as_bytes()).end(),
-                },
-                nxterm::ClipRequest::Paste => {
-                    let mut got = [0u8; MAX_CLIP_BYTES];
-                    match clipboard_paste(root_ns, &mut got) {
-                        Ok(n) => {
-                            if let Ok(text) = core::str::from_utf8(&got[..n]) {
-                                app.pasted(text);
-                                Line::new()
-                                    .s(b"nxterm: pasted ")
-                                    .u(n as u64)
-                                    .s(b" bytes")
-                                    .end();
-                            } else {
-                                kprint(b"nxterm: the clipboard entry is not text\n");
+            if let Some(p) = popup.as_mut() {
+                let now = p.hovered_key();
+                if now != *menu_hovered {
+                    *menu_hovered = now;
+                    // The item's key, which is a number this program chose — not a label, and not a
+                    // position. There is nothing here a person typed.
+                    #[cfg(feature = "test-harness")]
+                    {
+                        let mut l = libkern::debug::Line::new();
+                        l.s(b"nxterm: menu hover ");
+                        match now {
+                            Some(k) => {
+                                l.u(k);
+                            }
+                            None => {
+                                l.s(b"none");
                             }
                         }
-                        Err(why) => Line::new().s(b"nxterm: the paste failed: ").s(why.as_bytes()).end(),
+                        l.end();
                     }
                 }
+                let menu = app.menu_view(&theme, now);
+                if !p.present(&mut win, &menu, &ui_font, &theme) {
+                    kprint(b"nxterm: the menu popup could not be drawn\n");
+                }
             }
-            continue; // round again: a paste has put bytes in the outbox
-        }
 
-        // ---- the tty ----
-        //
-        // **Both directions, every frame.** What the user typed goes out; whatever the server
-        // has sent comes in and goes through the parser. Done here rather than in the event
-        // arm because output arrives unprompted — the shell prints when it likes, and a
-        // terminal that only looked after a keystroke would show a prompt one keypress late.
-        // **Every tab, both directions.** What was typed goes out to the tab it was typed into;
-        // whatever any shell has sent comes in and goes through *that tab's* parser. A background
-        // tab's output is drawn into its own grid and shows the moment you switch to it — which is
-        // the whole of what having tabs means here.
-        //
-        // Done here rather than in the event arm because output arrives unprompted: a shell prints
-        // when it likes, and a terminal that only looked after a keystroke would show a prompt one
-        // keypress late.
-        let mut ended: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-        for tb in backends.iter_mut() {
-            let out = app
-                .tabs_mut()
-                .iter_mut()
-                .find(|t| t.key() == tb.key)
-                .map(|t| t.take_outbox())
-                .unwrap_or_default();
-            if !out.is_empty() && !tb.backend.typed(&out) {
-                kprint(b"nxterm: input did not reach the tty\n");
+            // **The grid holds the keyboard whenever the menu is not open.** Focus has to start
+            // somewhere, and the toolkit will not guess: `focus_next` lands on the menu button,
+            // being first in tree order. Re-asserted every frame rather than only on the first,
+            // because clicking a button takes focus — and a terminal whose keyboard stays with the
+            // menu after you used it is a terminal you have to click back into.
+            if app.menus.open().is_none() {
+                top.focus_key(&ui, GRID_KEY);
             }
-            while let Some(bytes) = tb.backend.output() {
-                #[cfg(feature = "test-harness")]
-                let before = app.grid().cursor().0;
-                #[cfg(feature = "test-harness")]
-                let current = tb.key == app.current_tab();
-                app.feed_tab(tb.key, bytes);
-                // Under the harness only: report a line once the cursor has left it, which is
-                // what makes `check-terminal` able to assert on the grid's *contents*. **The
-                // current tab only** — the gate reads one grid, and reporting a background tab's
-                // rows into the same stream would make "what is on screen" ambiguous.
-                #[cfg(feature = "test-harness")]
-                if current {
-                    // **Every row the cursor passed**, not just the one it started on: a single
-                    // message routinely completes several lines, and reporting only the first
-                    // prints a blank when the chunk begins with a newline — which is exactly what
-                    // the shell's banner does.
-                    //
-                    // **Rows the cursor left, and the row it is on.** Both, because they answer
-                    // different questions and the gate asks both: a line the shell *finished* is
-                    // only in the first set (the banner, which arrives in a chunk that ends two
-                    // rows below it), and a line still being typed is only in the second
-                    // (`/> whoami`, which never completes until Enter).
-                    let now = app.grid().cursor().0;
-                    for row in before..now {
-                        report_row(&app, row);
-                    }
-                    report_row(&app, now);
+
+            // The grid's own rows, in window coordinates. **Damage the diff cannot see**: a `custom`
+            // node is fingerprinted by its kind and size, so rows `libterm` wrote report nothing.
+            // **Viewport rows** — the translation from the grid's screen rows is `App::damage_rows`',
+            // because it is the half that knows where the view is anchored.
+            let mut extra = None;
+            let origin = app.grid_origin();
+            let cols = app.grid().cols();
+            for row in app.damage_rows() {
+                let r = app.metrics.row_rect(row, cols);
+                let r = Rect::new(origin.x + r.origin.x, origin.y + r.origin.y, r.size.w, r.size.h);
+                extra = union_opt(extra, Some(r));
+            }
+
+            let ok = {
+                let (m, palette, view_top) = (app.metrics, app.palette, app.view_line());
+                let grid = app.grid();
+                top.present_custom(
+                    &mut win,
+                    &ui,
+                    &l,
+                    &ui_font,
+                    &theme,
+                    extra,
+                    &mut |kind, rect, clip, fb: &mut MemFramebuffer| {
+                        if kind != GRID_KIND {
+                            return;
+                        }
+                        // **The cells do not always fill the node** (M9 Part D). A maximised window is
+                        // exactly the work area and the grid is the whole cells that fit, so up to a
+                        // cell's width and height of the node is not covered by any row — and
+                        // `render_view` paints cells, nothing else. Left alone that margin holds whatever
+                        // the last frame put there, which after a resize is a strip of the old window.
+                        let cells = m.pixel_size(grid.cols(), grid.rows());
+                        if rect.size.w > cells.w || rect.size.h > cells.h {
+                            fb.fill_rect(clip, palette.background);
+                        }
+                        let rows = rows_in(clip, origin, &m, grid.rows());
+                        libterm::render::render_view(fb, grid, &mono_font, &m, &palette, origin, view_top, &rows);
+                    },
+                )
+            };
+            if !ok {
+                fail(b"nxterm: the window could not be drawn\n");
+            }
+
+            // **Asked to close, by its own button or by the shell.** Exiting is the whole of it: the
+            // kernel closes this process's handles, the compositor sees the session go and destroys
+            // the windows on it, and the shell hears `WindowDestroyed` like any other close.
+            if app.closing() {
+                kprint(b"nxterm: closing\n");
+                exit(0);
+            }
+
+            // **The title bar was dragged.** Performed here rather than in `update`, which has no
+            // syscalls — and performed *before* the frame below, so the compositor is already moving
+            // the window while this client is still painting.
+            if app.take_move_request()
+                && let Some(mut w) = win.window(window_id)
+            {
+                match w.start_move() {
+                    Ok(()) => kprint(b"nxterm: dragging its own title bar\n"),
+                    // Refused when the grab is not this window's, which is a press that arrived
+                    // through some path other than a real one. Not fatal, and not silent.
+                    Err(_) => kprint(b"nxterm: the compositor refused the move\n"),
                 }
             }
-            // **Where the shell in this tab says it is**, once per change (desktop refresh,
-            // Part K). `nxsh` announces it beside every prompt as `OSC 7`, `libterm` reads it
-            // and `nxterm` puts it in the window's title bar — three crates that cannot test
-            // their agreement on the host, so this line is what `cargo xtask check-terminal`
-            // asserts on. **Not what anyone typed**: the path is the shell's own answer, and
-            // it is already on screen in the prompt and in the title bar.
-            if let Some(t) = app.tabs_mut().iter_mut().find(|t| t.key() == tb.key)
-                && t.take_directory_change()
-                && let Some(dir) = t.directory()
+
+            // **The corner grip.** Asked for, not done — like the move above and for the same
+            // reason: the compositor holds the grab this press opened, and it is the only
+            // participant that can follow a pointer without a round trip per motion. What comes
+            // back is an ordinary `Configure` at the end of the gesture, from the shell.
+            if let Some(edges) = app.take_resize_request()
+                && let Some(mut w) = win.window(window_id)
             {
-                libkern::debug::Line::new().s(b"nxterm: shell is at ").s(dir.as_bytes()).end();
+                match w.start_resize(edges) {
+                    Ok(()) => kprint(b"nxterm: dragging its own corner\n"),
+                    Err(_) => kprint(b"nxterm: the compositor refused the resize\n"),
+                }
             }
-            if tb.backend.is_gone() {
-                ended.push(tb.key);
+
+            // **A title-bar button.** Asked for, not done: minimising and maximising are the
+            // manager's, and the reply says the compositor forwarded the question rather than that
+            // anything happened — a shell may decide otherwise, and this terminal will find out the
+            // way it finds out about any other geometry, through `Configure`.
+            // **Taken before the window is looked up, deliberately** — the same shape as the move
+            // request above. A request for a window that has gone is dropped rather than retried:
+            // there is nothing to ask about, and holding it would mean asking on behalf of a window
+            // whose id the compositor may have moved past.
+            if let Some(state) = app.take_state_request()
+                && let Some(mut w) = win.window(window_id)
+            {
+                match w.request_state(state) {
+                    Ok(()) => {
+                        libkern::debug::Line::new()
+                            .s(b"nxterm: asked the shell for window state ")
+                            .u(state as u64)
+                            .end();
+                    }
+                    Err(_) => kprint(b"nxterm: the state request was refused\n"),
+                }
             }
-        }
-        // **A shell that exited closes its tab**, and the last one closes the window — which is
-        // the same rule `Msg::CloseTab` follows, reached from the other side. Before tabs this
-        // was an unconditional `exit(0)`, and that is still what happens when the last tab's
-        // shell ends.
-        for key in ended {
-            kprint(b"nxterm: the terminal ended\n");
-            app.update(Msg::CloseTab(key));
-        }
-        // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-        unsafe { reconcile_backends(app, backends, root_ns, &env) };
+
+            // ---- the clipboard ----
+            //
+            // **Here rather than in `update`**, for the reason every other syscall in this loop is:
+            // `App::update` is a function of values, and `/dev/clipboard` is IPC. A copy is one
+            // round trip; a paste is one round trip and then the bytes go down the pty exactly as
+            // if they had been typed.
+            if let Some(req) = app.take_clip_request() {
+                match req {
+                    nxterm::ClipRequest::Copy(text) => match clipboard_copy(root_ns, text.as_bytes()) {
+                        // **A length, never the text** — this is a terminal, and what a person
+                        // selected is as much theirs as what they typed.
+                        Ok(()) => Line::new().s(b"nxterm: copied ").u(text.len() as u64).s(b" bytes").end(),
+                        Err(why) => Line::new().s(b"nxterm: the copy failed: ").s(why.as_bytes()).end(),
+                    },
+                    nxterm::ClipRequest::Paste => {
+                        let mut got = [0u8; MAX_CLIP_BYTES];
+                        match clipboard_paste(root_ns, &mut got) {
+                            Ok(n) => {
+                                if let Ok(text) = core::str::from_utf8(&got[..n]) {
+                                    app.pasted(text);
+                                    Line::new().s(b"nxterm: pasted ").u(n as u64).s(b" bytes").end();
+                                } else {
+                                    kprint(b"nxterm: the clipboard entry is not text\n");
+                                }
+                            }
+                            Err(why) => Line::new().s(b"nxterm: the paste failed: ").s(why.as_bytes()).end(),
+                        }
+                    }
+                }
+                continue; // round again: a paste has put bytes in the outbox
+            }
+
+            // ---- the tty ----
+            //
+            // **Both directions, every frame.** What the user typed goes out; whatever the server
+            // has sent comes in and goes through the parser. Done here rather than in the event
+            // arm because output arrives unprompted — the shell prints when it likes, and a
+            // terminal that only looked after a keystroke would show a prompt one keypress late.
+            // **Every tab, both directions.** What was typed goes out to the tab it was typed into;
+            // whatever any shell has sent comes in and goes through *that tab's* parser. A background
+            // tab's output is drawn into its own grid and shows the moment you switch to it — which is
+            // the whole of what having tabs means here.
+            //
+            // Done here rather than in the event arm because output arrives unprompted: a shell prints
+            // when it likes, and a terminal that only looked after a keystroke would show a prompt one
+            // keypress late.
+            let mut ended: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+            for tb in backends.iter_mut() {
+                let out =
+                    app.tabs_mut().iter_mut().find(|t| t.key() == tb.key).map(|t| t.take_outbox()).unwrap_or_default();
+                if !out.is_empty() && !tb.backend.typed(&out) {
+                    kprint(b"nxterm: input did not reach the tty\n");
+                }
+                while let Some(bytes) = tb.backend.output() {
+                    #[cfg(feature = "test-harness")]
+                    let before = app.grid().cursor().0;
+                    #[cfg(feature = "test-harness")]
+                    let current = tb.key == app.current_tab();
+                    app.feed_tab(tb.key, bytes);
+                    // Under the harness only: report a line once the cursor has left it, which is
+                    // what makes `check-terminal` able to assert on the grid's *contents*. **The
+                    // current tab only** — the gate reads one grid, and reporting a background tab's
+                    // rows into the same stream would make "what is on screen" ambiguous.
+                    #[cfg(feature = "test-harness")]
+                    if current {
+                        // **Every row the cursor passed**, not just the one it started on: a single
+                        // message routinely completes several lines, and reporting only the first
+                        // prints a blank when the chunk begins with a newline — which is exactly what
+                        // the shell's banner does.
+                        //
+                        // **Rows the cursor left, and the row it is on.** Both, because they answer
+                        // different questions and the gate asks both: a line the shell *finished* is
+                        // only in the first set (the banner, which arrives in a chunk that ends two
+                        // rows below it), and a line still being typed is only in the second
+                        // (`/> whoami`, which never completes until Enter).
+                        let now = app.grid().cursor().0;
+                        for row in before..now {
+                            report_row(&app, row);
+                        }
+                        report_row(&app, now);
+                    }
+                }
+                // **Where the shell in this tab says it is**, once per change (desktop refresh,
+                // Part K). `nxsh` announces it beside every prompt as `OSC 7`, `libterm` reads it
+                // and `nxterm` puts it in the window's title bar — three crates that cannot test
+                // their agreement on the host, so this line is what `cargo xtask check-terminal`
+                // asserts on. **Not what anyone typed**: the path is the shell's own answer, and
+                // it is already on screen in the prompt and in the title bar.
+                if let Some(t) = app.tabs_mut().iter_mut().find(|t| t.key() == tb.key)
+                    && t.take_directory_change()
+                    && let Some(dir) = t.directory()
+                {
+                    libkern::debug::Line::new().s(b"nxterm: shell is at ").s(dir.as_bytes()).end();
+                }
+                if tb.backend.is_gone() {
+                    ended.push(tb.key);
+                }
+            }
+            // **A shell that exited closes its tab**, and the last one closes the window — which is
+            // the same rule `Msg::CloseTab` follows, reached from the other side. Before tabs this
+            // was an unconditional `exit(0)`, and that is still what happens when the last tab's
+            // shell ends.
+            for key in ended {
+                kprint(b"nxterm: the terminal ended\n");
+                app.update(Msg::CloseTab(key));
+            }
+            // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+            unsafe { reconcile_backends(app, backends, root_ns, &env) };
         }
 
         // ---- what the windows asked for ----
@@ -867,9 +841,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // you have running are this window's, and a second window that inherited them would
             // be two views of one session.
             // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-            match unsafe {
-                open_window(&mut win, App::new(COLS, ROWS, metrics), &ui_font, &theme, root_ns, &env)
-            } {
+            match unsafe { open_window(&mut win, App::new(COLS, ROWS, metrics), &ui_font, &theme, root_ns, &env) } {
                 Some(w) => {
                     kprint(b"nxterm: opened another window\n");
                     wins.push(w);
@@ -957,13 +929,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         for (from, event) in events {
             // **Which window is this for?** A record naming none of them is dropped rather than
             // routed into whichever window happened to be first.
-            let Some(wi) = wins.iter().position(|w| {
-                w.top.id() == from || w.popup.as_ref().is_some_and(|p| p.id() == from)
-            }) else {
+            let Some(wi) =
+                wins.iter().position(|w| w.top.id() == from || w.popup.as_ref().is_some_and(|p| p.id() == from))
+            else {
                 continue;
             };
-            let Win { top, app, backends: _, bounds, popup, menu_shown: _, menu_hovered: _ } =
-                &mut wins[wi];
+            let Win { top, app, backends: _, bounds, popup, menu_shown: _, menu_hovered: _ } = &mut wins[wi];
             let window_id = top.id();
             // Rebuilt for *this* window: routing is against this window's tree, and another
             // window's would report a widget that is not the one under the pointer. **No layout
@@ -973,214 +944,208 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // `Configure` left it set for every later event in the same batch — and those belong
             // to *other* windows, each of which would then be told to repaint its whole grid.
             let mut resized = false;
-        // **The menu's window routes through the menu's tree.** Same `App`, so an item's `Msg`
-        // updates the same state; different tree, layout and router, because they describe a
-        // different window. A record for a window that is not one of these two is not possible
-        // — `Session` filtered it — but a stale one for a popup just destroyed is, and it is
-        // dropped rather than routed into the terminal.
-        if popup.as_ref().is_some_and(|p| p.id() == from) {
-            // **A press landed outside the menu, so it goes away** (M11 Part E batch 5). This is
-            // the one thing a popup's owner cannot work out for itself: it never sees a press
-            // aimed at another window, and until the compositor said so a menu stayed open over
-            // whatever was clicked next.
-            //
-            // **Answered here rather than in `Child::route`**, because what a dismissal *means*
-            // is the caller's: this menu goes away, where another client's child window might
-            // save something first.
-            if matches!(event, WindowEvent::Dismissed) {
-                app.menus.close();
-                continue;
-            }
-            // **Arrows, Esc and Enter drive the open menu**, which is possible only here: the
-            // popup holds the keyboard while it is up, so these keys arrive naming *its* window
-            // and never reach the terminal's router below. `KeyOutcome` says what the press did,
-            // and `Chose` carries the menu and the row, so the message comes from the same table
-            // — not from a second list that could disagree about which row is which.
-            if let WindowEvent::Key(k) = event {
-                let table = app.menu_table();
-                match app.menus.key(&k, &table) {
-                    KeyOutcome::Chose { menu, item } => {
-                        // **The menu comes from the outcome, not from the state**: choosing
-                        // closes, so `app.menus.open()` is already `None` here and asking it
-                        // would drop every message Enter produces (PR #280 review, blocking 1).
-                        if let Some(m) = chosen(&table, Some(menu), item) {
-                            chose(m);
-                            app.update(m);
-                        }
-                        continue;
-                    }
-                    // Dismissed already closed it; Changed moved the cursor and the frame above
-                    // will redraw with it. Both are handled, and neither reaches the grid.
-                    KeyOutcome::Dismissed | KeyOutcome::Changed => continue,
-                    KeyOutcome::Ignored => {}
-                }
-            }
-            let menu = app.menu_view(&theme, popup.as_ref().and_then(|p| p.hovered_key()));
-            let msgs = popup
-                .as_mut()
-                .map(|p| p.route(&menu, &ui_font, &theme, &event))
-                .unwrap_or_default();
-            for msg in msgs {
-                // **The routing proof.** A record arrived naming the popup's window, was routed
-                // through the popup's own tree, and produced a message — three things that were
-                // each impossible before C3's parts 1 and 2.
-                chose(msg);
-                // The menu closes itself: `App::update` asks the table whether the message is a
-                // row's, so neither this loop nor any `update` arm has to remember.
-                app.update(msg);
-            }
-            continue;
-        }
-        if from != window_id {
-            continue;
-        }
-        match event {
-            // **Everything goes through the router**, including the keys that end up as text:
-            // the grid is a focusable widget with an `on_key`, so "typed a character" and
-            // "pressed a menu accelerator" are the same path with a different widget claiming
-            // it. Whether a key types at all — a repeat does, a release does not — is
-            // `App::key`'s, because it is a fact about terminals and not about routing.
-            WindowEvent::Key(k) => {
-                // **F1 opens the menu, under the harness only.** The gate cannot click the bar
-                // button that normally opens it: `nxterm` is created before `ui-testclient`'s
-                // windows, so its top-left is underneath them. A key it can inject, and doing
-                // it on the gate's schedule matters — an open menu is topmost and takes the
-                // keyboard, so opening it earlier would swallow everything typed at the shell.
-                #[cfg(feature = "test-harness")]
-                if k.keycode == 59 && k.pressed != 0 {
-                    // **A plain toggle since PR #280's review.** It was a one-shot, guarded so
-                    // the menu could not open before the gate had finished typing at the shell —
-                    // but *when* it opens is the gate's schedule, not this flag's, and the
-                    // one-shot meant the menu could never be reopened. The keyboard half of an
-                    // open menu had no coverage at all as a result, which is where both of that
-                    // review's blocking findings were living.
-                    app.update(Msg::MenuBar(nxterm::HARNESS_MENU));
+            // **The menu's window routes through the menu's tree.** Same `App`, so an item's `Msg`
+            // updates the same state; different tree, layout and router, because they describe a
+            // different window. A record for a window that is not one of these two is not possible
+            // — `Session` filtered it — but a stale one for a popup just destroyed is, and it is
+            // dropped rather than routed into the terminal.
+            if popup.as_ref().is_some_and(|p| p.id() == from) {
+                // **A press landed outside the menu, so it goes away** (M11 Part E batch 5). This is
+                // the one thing a popup's owner cannot work out for itself: it never sees a press
+                // aimed at another window, and until the compositor said so a menu stayed open over
+                // whatever was clicked next.
+                //
+                // **Answered here rather than in `Child::route`**, because what a dismissal *means*
+                // is the caller's: this menu goes away, where another client's child window might
+                // save something first.
+                if matches!(event, WindowEvent::Dismissed) {
+                    app.menus.close();
                     continue;
                 }
-                if let Some(msg) = top.route_key(&ui, k) {
+                // **Arrows, Esc and Enter drive the open menu**, which is possible only here: the
+                // popup holds the keyboard while it is up, so these keys arrive naming *its* window
+                // and never reach the terminal's router below. `KeyOutcome` says what the press did,
+                // and `Chose` carries the menu and the row, so the message comes from the same table
+                // — not from a second list that could disagree about which row is which.
+                if let WindowEvent::Key(k) = event {
+                    let table = app.menu_table();
+                    match app.menus.key(&k, &table) {
+                        KeyOutcome::Chose { menu, item } => {
+                            // **The menu comes from the outcome, not from the state**: choosing
+                            // closes, so `app.menus.open()` is already `None` here and asking it
+                            // would drop every message Enter produces (PR #280 review, blocking 1).
+                            if let Some(m) = chosen(&table, Some(menu), item) {
+                                chose(m);
+                                app.update(m);
+                            }
+                            continue;
+                        }
+                        // Dismissed already closed it; Changed moved the cursor and the frame above
+                        // will redraw with it. Both are handled, and neither reaches the grid.
+                        KeyOutcome::Dismissed | KeyOutcome::Changed => continue,
+                        KeyOutcome::Ignored => {}
+                    }
+                }
+                let menu = app.menu_view(&theme, popup.as_ref().and_then(|p| p.hovered_key()));
+                let msgs = popup.as_mut().map(|p| p.route(&menu, &ui_font, &theme, &event)).unwrap_or_default();
+                for msg in msgs {
+                    // **The routing proof.** A record arrived naming the popup's window, was routed
+                    // through the popup's own tree, and produced a message — three things that were
+                    // each impossible before C3's parts 1 and 2.
+                    chose(msg);
+                    // The menu closes itself: `App::update` asks the table whether the message is a
+                    // row's, so neither this loop nor any `update` arm has to remember.
                     app.update(msg);
                 }
+                continue;
             }
-            WindowEvent::Pointer(p) => {
-                // A button press means the compositor decided this window is under the cursor
-                // — and, since click-to-focus raises, that it is now the topmost focusable one
-                // and will get the keyboard. Reported under the harness because that is the
-                // only evidence a gate has that its click landed *here*: nothing else changes
-                // observably, and a focus *change* is not sent when the window already had it.
-                #[cfg(feature = "test-harness")]
-                if p.kind == librsproto::surface::POINTER_BUTTON
-                    && p.flags & librsproto::surface::POINTER_PRESSED != 0
-                {
-                    kprint(b"nxterm: clicked\n");
+            if from != window_id {
+                continue;
+            }
+            match event {
+                // **Everything goes through the router**, including the keys that end up as text:
+                // the grid is a focusable widget with an `on_key`, so "typed a character" and
+                // "pressed a menu accelerator" are the same path with a different widget claiming
+                // it. Whether a key types at all — a repeat does, a release does not — is
+                // `App::key`'s, because it is a fact about terminals and not about routing.
+                WindowEvent::Key(k) => {
+                    // **F1 opens the menu, under the harness only.** The gate cannot click the bar
+                    // button that normally opens it: `nxterm` is created before `ui-testclient`'s
+                    // windows, so its top-left is underneath them. A key it can inject, and doing
+                    // it on the gate's schedule matters — an open menu is topmost and takes the
+                    // keyboard, so opening it earlier would swallow everything typed at the shell.
+                    #[cfg(feature = "test-harness")]
+                    if k.keycode == 59 && k.pressed != 0 {
+                        // **A plain toggle since PR #280's review.** It was a one-shot, guarded so
+                        // the menu could not open before the gate had finished typing at the shell —
+                        // but *when* it opens is the gate's schedule, not this flag's, and the
+                        // one-shot meant the menu could never be reopened. The keyboard half of an
+                        // open menu had no coverage at all as a result, which is where both of that
+                        // review's blocking findings were living.
+                        app.update(Msg::MenuBar(nxterm::HARNESS_MENU));
+                        continue;
+                    }
+                    if let Some(msg) = top.route_key(&ui, k) {
+                        app.update(msg);
+                    }
                 }
-                // **Counted before the event is routed** (M14 Part E), so the press it produces
-                // can ask what number the click was.
+                WindowEvent::Pointer(p) => {
+                    // A button press means the compositor decided this window is under the cursor
+                    // — and, since click-to-focus raises, that it is now the topmost focusable one
+                    // and will get the keyboard. Reported under the harness because that is the
+                    // only evidence a gate has that its click landed *here*: nothing else changes
+                    // observably, and a focus *change* is not sent when the window already had it.
+                    #[cfg(feature = "test-harness")]
+                    if p.kind == librsproto::surface::POINTER_BUTTON
+                        && p.flags & librsproto::surface::POINTER_PRESSED != 0
+                    {
+                        kprint(b"nxterm: clicked\n");
+                    }
+                    // **Counted before the event is routed** (M14 Part E), so the press it produces
+                    // can ask what number the click was.
+                    //
+                    // **The record's own time, since Part I.** It was this process's clock read at
+                    // delivery until the wire carried one, which measured when *this* loop got round
+                    // to the press rather than when the press happened — so a client stalled between
+                    // two deliberate single clicks read them as a double.
+                    if p.kind == librsproto::surface::POINTER_BUTTON
+                        && p.flags & librsproto::surface::POINTER_PRESSED != 0
+                        && p.button == libkern::abi::BTN_LEFT
+                    {
+                        app.note_press(libdraw::geom::Point::new(p.x, p.y), p.time_ms);
+                    }
+                    let msgs = top.route(&ui, &ui_font, &theme, &WindowEvent::Pointer(p));
+                    for m in msgs {
+                        app.update(m);
+                    }
+                }
+                WindowEvent::Focus(f) => {
+                    // Reported under the harness because a gate that types has to know the
+                    // keyboard arrived first: the compositor sends keys to the topmost focusable
+                    // window, and `nxterm` is created first — so it is at the *bottom* until a
+                    // click raises it. Without waiting for this, the gate injects a click and six
+                    // keystrokes back to back and the keys race the raise.
+                    #[cfg(feature = "test-harness")]
+                    libkern::debug::Line::new().s(b"nxterm: focus=").u(u64::from(f)).end();
+                    top.route(&ui, &ui_font, &theme, &WindowEvent::Focus(f));
+                    // The title bar shows which window has the keyboard, so this is content as well
+                    // as routing state.
+                    app.focused = f;
+                }
+                // A `normal` window is not dismissed by a press elsewhere — the event is a popup's.
+                WindowEvent::Dismissed => {}
+                // **The shell asking, answered the same way the close button is.** There is nothing
+                // to refuse with and nothing to save: what a client with unsaved work would do here
+                // is open a dialog, which is why this arrives as a request rather than a destruction.
+                WindowEvent::CloseRequested => {
+                    kprint(b"nxterm: asked to close, exiting\n");
+                    app.update(Msg::Close);
+                }
+                // Everything accumulated about held keys is a guess now. This client keeps none —
+                // modifiers arrive on each event — so there is nothing to discard, and saying so
+                // is the point: a client that silently ignored this would be wrong the moment it
+                // started tracking anything.
+                // **A terminal declares no acceptor, so this never arrives** — the compositor
+                // matches before it highlights. The arm exists because the match is exhaustive, and
+                // that is the point: every client now has to decide what a drop means to it rather
+                // than inheriting a default. What a dropped file should do here — type its path? open
+                // it? — is a shell question this milestone deliberately does not answer.
+                WindowEvent::Drop { .. } => kprint(b"nxterm: a drop arrived; this window takes none\n"),
+                WindowEvent::InputLost => kprint(b"nxterm: input dropped\n"),
+                // **Accepted, as of M9 Part D.** Declining stayed legal and this client did it for
+                // three milestones — "a different problem, not a parameter of this one" — which
+                // made maximise, snap and every other sized gesture a no-op on the only application
+                // there is. Now the window becomes exactly the size asked for, the grid becomes the
+                // cells that fit inside it, and the history rewraps.
                 //
-                // **The record's own time, since Part I.** It was this process's clock read at
-                // delivery until the wire carried one, which measured when *this* loop got round
-                // to the press rather than when the press happened — so a client stalled between
-                // two deliberate single clicks read them as a double.
-                if p.kind == librsproto::surface::POINTER_BUTTON
-                    && p.flags & librsproto::surface::POINTER_PRESSED != 0
-                    && p.button == libkern::abi::BTN_LEFT
-                {
-                    app.note_press(libdraw::geom::Point::new(p.x, p.y), p.time_ms);
-                }
-                let msgs = top.route(&ui, &ui_font, &theme, &WindowEvent::Pointer(p));
-                for m in msgs {
-                    app.update(m);
-                }
-            }
-            WindowEvent::Focus(f) => {
-                // Reported under the harness because a gate that types has to know the
-                // keyboard arrived first: the compositor sends keys to the topmost focusable
-                // window, and `nxterm` is created first — so it is at the *bottom* until a
-                // click raises it. Without waiting for this, the gate injects a click and six
-                // keystrokes back to back and the keys race the raise.
-                #[cfg(feature = "test-harness")]
-                libkern::debug::Line::new()
-                    .s(b"nxterm: focus=")
-                    .u(u64::from(f))
-                    .end();
-                top.route(&ui, &ui_font, &theme, &WindowEvent::Focus(f));
-                // The title bar shows which window has the keyboard, so this is content as well
-                // as routing state.
-                app.focused = f;
-            }
-            // A `normal` window is not dismissed by a press elsewhere — the event is a popup's.
-            WindowEvent::Dismissed => {}
-            // **The shell asking, answered the same way the close button is.** There is nothing
-            // to refuse with and nothing to save: what a client with unsaved work would do here
-            // is open a dialog, which is why this arrives as a request rather than a destruction.
-            WindowEvent::CloseRequested => {
-                kprint(b"nxterm: asked to close, exiting\n");
-                app.update(Msg::Close);
-            }
-            // Everything accumulated about held keys is a guess now. This client keeps none —
-            // modifiers arrive on each event — so there is nothing to discard, and saying so
-            // is the point: a client that silently ignored this would be wrong the moment it
-            // started tracking anything.
-            // **A terminal declares no acceptor, so this never arrives** — the compositor
-            // matches before it highlights. The arm exists because the match is exhaustive, and
-            // that is the point: every client now has to decide what a drop means to it rather
-            // than inheriting a default. What a dropped file should do here — type its path? open
-            // it? — is a shell question this milestone deliberately does not answer.
-            WindowEvent::Drop { .. } => kprint(b"nxterm: a drop arrived; this window takes none\n"),
-            WindowEvent::InputLost => kprint(b"nxterm: input dropped\n"),
-            // **Accepted, as of M9 Part D.** Declining stayed legal and this client did it for
-            // three milestones — "a different problem, not a parameter of this one" — which
-            // made maximise, snap and every other sized gesture a no-op on the only application
-            // there is. Now the window becomes exactly the size asked for, the grid becomes the
-            // cells that fit inside it, and the history rewraps.
-            //
-            // **Same size is the ordinary case and costs nothing**: a `Configure` follows every
-            // *move* as well, carrying the origin, and reallocating a window's buffers each
-            // time it was dragged would be a resize per pointer motion.
-            WindowEvent::Configure { width, height, .. } => {
-                // **Counted before, reported beside what it became.** A rewrap moves where the
-                // line breaks are and must not create or destroy *lines* — so these two numbers
-                // are equal, and an implementation that joined every adjacent row would collapse
-                // the history to one and say so here. It is the only assertion about the reflow
-                // that a gate on a release image can make: a terminal's rows are somebody's
-                // session, and the serial log is not the place for them.
-                let lines_before = app.grid().logical_lines();
-                if let Some(r) = app.resize(Size::new(width, height)) {
-                    resized = true;
-                    libkern::debug::Line::new()
-                        .s(b"nxterm: resized to ")
-                        .u(u64::from(width))
-                        .s(b"x")
-                        .u(u64::from(height))
-                        .s(b", grid ")
-                        .u(app.grid().cols() as u64)
-                        .s(b"x")
-                        .u(app.grid().rows() as u64)
-                        .s(b", lines ")
-                        .u(lines_before as u64)
-                        .s(b"->")
-                        .u(app.grid().logical_lines() as u64)
-                        // **The eviction, because without it the difference is unattributable.**
-                        // Narrowing makes more rows out of the same text, so a deep history
-                        // loses its oldest to the ring rather than to the rewrap — and a reader
-                        // of this line who could not tell those apart would go looking for a
-                        // reflow bug that is not there (PR #252 review, finding 2).
-                        .s(b", ")
-                        .u(r.evicted as u64)
-                        .s(b" evicted")
-                        .end();
+                // **Same size is the ordinary case and costs nothing**: a `Configure` follows every
+                // *move* as well, carrying the origin, and reallocating a window's buffers each
+                // time it was dragged would be a resize per pointer motion.
+                WindowEvent::Configure { width, height, .. } => {
+                    // **Counted before, reported beside what it became.** A rewrap moves where the
+                    // line breaks are and must not create or destroy *lines* — so these two numbers
+                    // are equal, and an implementation that joined every adjacent row would collapse
+                    // the history to one and say so here. It is the only assertion about the reflow
+                    // that a gate on a release image can make: a terminal's rows are somebody's
+                    // session, and the serial log is not the place for them.
+                    let lines_before = app.grid().logical_lines();
+                    if let Some(r) = app.resize(Size::new(width, height)) {
+                        resized = true;
+                        libkern::debug::Line::new()
+                            .s(b"nxterm: resized to ")
+                            .u(u64::from(width))
+                            .s(b"x")
+                            .u(u64::from(height))
+                            .s(b", grid ")
+                            .u(app.grid().cols() as u64)
+                            .s(b"x")
+                            .u(app.grid().rows() as u64)
+                            .s(b", lines ")
+                            .u(lines_before as u64)
+                            .s(b"->")
+                            .u(app.grid().logical_lines() as u64)
+                            // **The eviction, because without it the difference is unattributable.**
+                            // Narrowing makes more rows out of the same text, so a deep history
+                            // loses its oldest to the ring rather than to the rewrap — and a reader
+                            // of this line who could not tell those apart would go looking for a
+                            // reflow bug that is not there (PR #252 review, finding 2).
+                            .s(b", ")
+                            .u(r.evicted as u64)
+                            .s(b" evicted")
+                            .end();
+                    }
                 }
             }
-        }
 
-        // **The window changed shape, so everything about the frame does.** The compose buffer
-        // is a different size, the layout has a different rect to fill, the diff's record
-        // describes a tree laid out at the old one, and the grid has different rows. Each of
-        // those is cheap and none of them is optional; a frame that missed one would paint the
-        // new size through the old arithmetic.
-        //
-        // Done at the end of the iteration, so the render at the top of the next one is the
-        // first to see the new size — and the buffers themselves are replaced there, by
-        // `BufferPool::acquire`, because that is where a *free* one is in hand.
+            // **The window changed shape, so everything about the frame does.** The compose buffer
+            // is a different size, the layout has a different rect to fill, the diff's record
+            // describes a tree laid out at the old one, and the grid has different rows. Each of
+            // those is cheap and none of them is optional; a frame that missed one would paint the
+            // new size through the old arithmetic.
+            //
+            // Done at the end of the iteration, so the render at the top of the next one is the
+            // first to see the new size — and the buffers themselves are replaced there, by
+            // `BufferPool::acquire`, because that is where a *free* one is in hand.
             if resized {
                 let size = app.window_size();
                 // `Child::resize` throws the retained tree away: a tree diffed against a layout

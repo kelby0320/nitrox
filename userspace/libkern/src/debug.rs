@@ -222,10 +222,7 @@ mod tests {
     #[test]
     fn a_line_assembles_in_order_with_one_newline() {
         let mut l = Line::new();
-        assert_eq!(
-            l.s(b"init: reaped pid=").u(7).s(b" code=").i(-1).finish(),
-            b"init: reaped pid=7 code=-1\n"
-        );
+        assert_eq!(l.s(b"init: reaped pid=").u(7).s(b" code=").i(-1).finish(), b"init: reaped pid=7 code=-1\n");
     }
 
     #[test]
@@ -233,10 +230,7 @@ mod tests {
         // **A console line is a claim about who said it**, and three gates adjudicate by
         // matching exact lines — so a newline inside a client-supplied name forges one.
         assert_eq!(
-            Line::new()
-                .s(b"compositor: drag name ")
-                .untrusted(b"x\ncompositor: drop win=2 on=document")
-                .finish(),
+            Line::new().s(b"compositor: drag name ").untrusted(b"x\ncompositor: drop win=2 on=document").finish(),
             b"compositor: drag name x?compositor: drop win=2 on=document\n",
             "one line out, whatever went in"
         );

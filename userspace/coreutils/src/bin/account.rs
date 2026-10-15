@@ -46,19 +46,19 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use libprompt::ipc::{call, lookup};
-use libprompt::{ask_new_password, ask_password};
-use libviews::outcome;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::debug::Line;
 use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, exit, scrub};
+use libprompt::ipc::{call, lookup};
+use libprompt::{ask_new_password, ask_password};
 use librsproto::auth::build_account_request;
 use librsproto::views::*;
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::diag::Level;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
+use libviews::outcome;
 
 /// `alloc` backing: the TSM1 encoder allocates.
 #[global_allocator]

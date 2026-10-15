@@ -55,8 +55,8 @@ use crate::arch::paging::ArchPaging;
 use crate::arch::smp::ArchSmp;
 use crate::arch::{Cpu, MAX_CPUS, Paging, Smp, send_shootdown_ipi};
 use crate::libkern::SpinLock;
-use crate::mm::VirtAddr;
 use crate::libkern::lockrank::LockRank;
+use crate::mm::VirtAddr;
 
 /// Serialises shootdown initiators: only one request is in flight system-wide, so
 /// the single global request block below is unambiguous. A **plain** spinlock (not
@@ -187,8 +187,7 @@ fn shootdown(va: Option<VirtAddr>) {
         // use a stale translation, so the invalidation it never performed cannot be
         // observed. This is *not* a timeout: a live CPU that is merely late is still in the
         // mask and is still waited for, however long it takes.
-        while !wait_satisfied(online, ACKED.load(Ordering::Acquire), crate::sched::online_mask())
-        {
+        while !wait_satisfied(online, ACKED.load(Ordering::Acquire), crate::sched::online_mask()) {
             core::hint::spin_loop();
         }
     }

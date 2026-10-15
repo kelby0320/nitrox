@@ -91,9 +91,7 @@ impl ArchFpuState {
     /// `MXCSR` unmasks every SIMD exception, and a zeroed `FCW` is not the
     /// architectural default control word).
     pub const fn zeroed() -> Self {
-        Self {
-            bytes: [0; FPU_AREA_BYTES],
-        }
+        Self { bytes: [0; FPU_AREA_BYTES] }
     }
 }
 
@@ -233,10 +231,7 @@ pub fn init_cpu() {
         // SAFETY: `CR4.OSXSAVE` is set, so `XGETBV` is not `#UD`.
         let live = unsafe { regs::read_xcr0() };
         assert_eq!(live, xcr0, "XCR0 did not accept the requested component set");
-        VECTOR_BITS.store(
-            if live & XCR0_AVX != 0 { 256 } else { 128 },
-            Ordering::Relaxed,
-        );
+        VECTOR_BITS.store(if live & XCR0_AVX != 0 { 256 } else { 128 }, Ordering::Relaxed);
         // EBX of subleaf 0 reports the area size required by the *enabled* XCR0,
         // so it must be re-read after the XSETBV above.
         let (_, ebx, _, _) = regs::cpuid(CPUID_XSTATE_LEAF, 0);
@@ -248,10 +243,7 @@ pub fn init_cpu() {
         512
     };
 
-    assert!(
-        area <= FPU_AREA_BYTES,
-        "FPU save area needs more than FPU_AREA_BYTES — raise the constant"
-    );
+    assert!(area <= FPU_AREA_BYTES, "FPU save area needs more than FPU_AREA_BYTES — raise the constant");
     AREA_BYTES.store(area, Ordering::Relaxed);
 }
 
@@ -290,9 +282,7 @@ pub unsafe fn init_area(area: *mut ArchFpuState) {
         // Unaligned writes: the fields sit at fixed architectural offsets that
         // carry no alignment guarantee of their own.
         base.add(FCW_OFFSET).cast::<u16>().write_unaligned(FCW_DEFAULT);
-        base.add(MXCSR_OFFSET)
-            .cast::<u32>()
-            .write_unaligned(MXCSR_DEFAULT);
+        base.add(MXCSR_OFFSET).cast::<u32>().write_unaligned(MXCSR_DEFAULT);
     }
 }
 
@@ -390,9 +380,7 @@ pub struct VectorRegsImage {
 impl VectorRegsImage {
     /// A zeroed image.
     pub const fn zeroed() -> Self {
-        Self {
-            bytes: [0; SELFTEST_REGS * SELFTEST_REG_STRIDE],
-        }
+        Self { bytes: [0; SELFTEST_REGS * SELFTEST_REG_STRIDE] }
     }
 
     /// The slot for register `i`, as a byte slice of the full stride.
@@ -559,15 +547,8 @@ mod tests {
 
         let fcw = u16::from_le_bytes([state.bytes[FCW_OFFSET], state.bytes[FCW_OFFSET + 1]]);
         assert_eq!(fcw, FCW_DEFAULT, "FCW must be the architectural default");
-        let mxcsr = u32::from_le_bytes(
-            state.bytes[MXCSR_OFFSET..MXCSR_OFFSET + 4]
-                .try_into()
-                .expect("4 bytes"),
-        );
-        assert_eq!(
-            mxcsr, MXCSR_DEFAULT,
-            "MXCSR must mask every SIMD exception, not be left zeroed"
-        );
+        let mxcsr = u32::from_le_bytes(state.bytes[MXCSR_OFFSET..MXCSR_OFFSET + 4].try_into().expect("4 bytes"));
+        assert_eq!(mxcsr, MXCSR_DEFAULT, "MXCSR must mask every SIMD exception, not be left zeroed");
         assert_eq!(state.bytes[900], 0, "the rest of the area must be zeroed");
     }
 

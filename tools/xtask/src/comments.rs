@@ -561,7 +561,8 @@ mod tests {
 
     #[test]
     fn a_line_of_code_holding_comment_marks_is_code() {
-        let t = tally(&change(&["let s = \"// not a comment\";", "let t = \"/* nor this */\";", "x(); // trailing"], &[]));
+        let t =
+            tally(&change(&["let s = \"// not a comment\";", "let t = \"/* nor this */\";", "x(); // trailing"], &[]));
         assert_eq!((t.new_comments, t.new_code), (0, 3));
     }
 
@@ -613,7 +614,8 @@ mod tests {
 
     #[test]
     fn a_reference_wrapped_across_two_lines_is_found_on_the_second() {
-        let t = tally(&change(&["// written when set (administration Part", "// E.5) and read back", "let x = 1;"], &[]));
+        let t =
+            tally(&change(&["// written when set (administration Part", "// E.5) and read back", "let x = 1;"], &[]));
         assert_eq!(t.references, [("a.rs".to_string(), 2, "Part E.5".to_string())]);
         let two_files = Change {
             added: vec![

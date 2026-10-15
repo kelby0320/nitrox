@@ -18,14 +18,14 @@
 
 use super::partitions::{self, PartKind, Scheme, Table, Unread};
 use crate::io::block::{Partition, partition_backend, read_blocking};
-use crate::libkern::block::{BlockKind, NameBuf, MAX_DEVICE_NAME};
+use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME, NameBuf};
 use crate::libkern::handle::KObjectType;
+use crate::libkern::lockrank::LockRank;
 use crate::libkern::{KBox, KVec, Rights, SpinLock};
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
 use crate::object::{Namespace, ObjectRef};
-use crate::libkern::lockrank::LockRank;
 
 const SECTOR: u64 = partitions::BLOCK as u64;
 
@@ -101,7 +101,10 @@ pub fn publish(disk: &ObjectRef, table: Result<Table, Unread>, names: Names) -> 
     }
     crate::kprintln!("{what}: {} partition(s)", found);
     if table.extended > 0 {
-        crate::kprintln!("mbr: {} extended partition(s) passed over: their logical partitions are not read", table.extended);
+        crate::kprintln!(
+            "mbr: {} extended partition(s) passed over: their logical partitions are not read",
+            table.extended
+        );
     }
     found
 }
@@ -132,10 +135,7 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bo
         func: dd.func,
         _pad: [0; 3],
     };
-    let geometry = BlockGeometry {
-        logical_block_size: SECTOR as u32,
-        block_count: p.count,
-    };
+    let geometry = BlockGeometry { logical_block_size: SECTOR as u32, block_count: p.count };
     let (gpt, mbr_kind) = match &p.kind {
         PartKind::Gpt { guid, name } => (Some((guid, name)), 0),
         PartKind::Mbr { kind } => (None, *kind),
@@ -163,27 +163,16 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bo
             // listing, the firmware's `HD(1,GPT,…)`. The disk list on the laptop showed
             // `partition 0`, `partition 1`, `partition 2` against a Debian install whose
             // own tools call the same three 1, 2 and 3 (2026-09-17).
-            let _ = core::fmt::Write::write_fmt(
-                &mut w,
-                format_args!("partition {} (unlabelled)", p.number),
-            );
+            let _ = core::fmt::Write::write_fmt(&mut w, format_args!("partition {} (unlabelled)", p.number));
             w.len()
         }
     };
-    let node = match DeviceNode::try_new_block(
-        descriptor,
-        geometry,
-        BlockKind::Partition,
-        &name[..name_len],
-        backend,
-    ) {
+    let node = match DeviceNode::try_new_block(descriptor, geometry, BlockKind::Partition, &name[..name_len], backend) {
         Ok(n) => n,
         Err(_) => return false,
     };
     // SAFETY: adopt the creation reference.
-    let node_ref = unsafe {
-        ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode)
-    };
+    let node_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
 
     let (first, last) = (p.first_lba, p.first_lba + p.count - 1);
     // 1-based, to agree with the name above and with every other tool. The boot log and a disk
@@ -204,10 +193,8 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bo
     // `gpt-partlabel:`), and until Phase 5 Part C no line said which labels a disk carried — so a
     // live boot could not show it had found `nitrox-live`, and the laptop's hardware report could
     // not list what is on its own disk.
-    let label = by_partlabel
-        .as_ref()
-        .and_then(|p| core::str::from_utf8(&p[PARTLABEL_PREFIX.len()..]).ok())
-        .unwrap_or("");
+    let label =
+        by_partlabel.as_ref().and_then(|p| core::str::from_utf8(&p[PARTLABEL_PREFIX.len()..]).ok()).unwrap_or("");
     crate::kprintln!(
         "gpt:  partition {} lba {}..{} ({} sectors) label \"{}\" -> block node",
         p.number,
@@ -242,8 +229,7 @@ fn record(entry: PartEntry) {
 pub fn bind_partition_names(ns: &Namespace) {
     // READ + WRITE (the RW fs-server writes filesystem metadata to its partition) + the
     // generic band (DUPLICATE lets it hand a device copy to the kernel for the data path).
-    let rights =
-        Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    let rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     // Snapshot under the lock (clone refs + copy path bytes), then bind without
     // holding the registry lock across the namespace lock.
     let mut snapshot: KVec<(ObjectRef, KVec<u8>, Option<KVec<u8>>)> = KVec::new();
@@ -256,9 +242,7 @@ pub fn bind_partition_names(ns: &Namespace) {
             let uuid = copy_bytes(&pe.by_partuuid);
             let label = pe.by_partlabel.as_ref().and_then(copy_bytes_opt);
             if let Some(uuid) = uuid {
-                snapshot
-                    .try_push((pe.node.clone(), uuid, label))
-                    .expect("within reserved capacity");
+                snapshot.try_push((pe.node.clone(), uuid, label)).expect("within reserved capacity");
             }
         }
     }
@@ -359,10 +343,7 @@ mod tests {
             0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, // node (BE)
         ];
         let p = format_partuuid(&guid).unwrap();
-        assert_eq!(
-            &p[..],
-            &b"/dev/disk/by-partuuid/12345678-9abc-def0-1234-56789abcdef0"[..]
-        );
+        assert_eq!(&p[..], &b"/dev/disk/by-partuuid/12345678-9abc-def0-1234-56789abcdef0"[..]);
     }
 
     #[test]

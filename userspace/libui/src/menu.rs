@@ -30,8 +30,8 @@ use libdraw::format::Rgb;
 use libdraw::geom::{Rect, Size};
 
 use crate::element::{
-    Element, Insets, TextSize, center_v, column, fill, ink, padding, rounded_fill, row, scaled,
-    sized, stack, text, wash,
+    Element, Insets, TextSize, center_v, column, fill, ink, padding, rounded_fill, row, scaled, sized, stack, text,
+    wash,
 };
 use crate::widget::{Theme, menu_bar, menu_item, popup_frame};
 
@@ -159,16 +159,7 @@ impl<Msg> Item<Msg> {
 
     /// The one place every field of a row is named, so a field added later is added here.
     fn row(label: Cow<'static, str>, accel: Option<Accel>, msg: Msg) -> Self {
-        Item::Action {
-            label,
-            accel,
-            hint: None,
-            swatch: None,
-            msg,
-            enabled: true,
-            marked: false,
-            destructive: false,
-        }
+        Item::Action { label, accel, hint: None, swatch: None, msg, enabled: true, marked: false, destructive: false }
     }
 
     /// The same row, greyed and unpressable.
@@ -366,9 +357,7 @@ fn step<Msg>(items: &[Item<Msg>], from: Option<usize>, d: isize) -> Option<usize
     if n == 0 {
         return None;
     }
-    let start = from.map_or(if d > 0 { 0 } else { n - 1 }, |i| {
-        ((i as isize + d).rem_euclid(n as isize)) as usize
-    });
+    let start = from.map_or(if d > 0 { 0 } else { n - 1 }, |i| ((i as isize + d).rem_euclid(n as isize)) as usize);
     let mut i = start;
     for _ in 0..n {
         if matches!(items[i], Item::Action { enabled: true, .. }) {
@@ -394,9 +383,7 @@ pub fn accel_match<Msg: Clone>(menus: &[Menu<Msg>], ev: &KeyEvent) -> Option<Msg
         return None;
     }
     menus.iter().flat_map(|m| m.items.iter()).find_map(|it| match it {
-        Item::Action { accel: Some(a), msg, enabled: true, .. } if a.matches(ev) => {
-            Some(msg.clone())
-        }
+        Item::Action { accel: Some(a), msg, enabled: true, .. } if a.matches(ev) => Some(msg.clone()),
         _ => None,
     })
 }
@@ -502,11 +489,8 @@ fn rows<Msg: Clone>(
             // **The design's `--lineSoft`**: `border` at half strength over the menu's ground,
             // edge to edge — the derivation Part A measured in both palettes.
             Item::Separator => rows.push(
-                padding(
-                    SEPARATOR_PAD,
-                    sized(Size::new(0, 1), fill(theme.border.blend(theme.background, 128))),
-                )
-                .key(key),
+                padding(SEPARATOR_PAD, sized(Size::new(0, 1), fill(theme.border.blend(theme.background, 128))))
+                    .key(key),
             ),
             Item::Action { label, accel, hint, swatch, msg, enabled, marked, destructive } => {
                 let lit = *enabled && (hovered == Some(key) || state.cursor() == Some(i));
@@ -544,10 +528,7 @@ fn rows<Msg: Clone>(
                         text("").flex(1),
                         // Small as well as dim (Part G): the design sets its hints a step below
                         // the row, and centring it down the row keeps it on the label's line.
-                        padding(
-                            ACCEL_PAD,
-                            center_v(scaled(TextSize::Small, ink(theme.foreground_dim, text(r)))),
-                        ),
+                        padding(ACCEL_PAD, center_v(scaled(TextSize::Small, ink(theme.foreground_dim, text(r)))),),
                     ]),
                     None => row(alloc::vec![lead, text(label.as_ref()), text("").flex(1)]),
                 };
@@ -650,10 +631,8 @@ mod tests {
                 labels(c, out);
             }
         }
-        let menu = |marked: bool| Menu {
-            title: "View",
-            items: alloc::vec![Item::plain("Newest First", 1u32).marked(marked)],
-        };
+        let menu =
+            |marked: bool| Menu { title: "View", items: alloc::vec![Item::plain("Newest First", 1u32).marked(marked)] };
         let theme = Theme::default();
         let st = MenuState::new(1);
 
@@ -693,7 +672,12 @@ mod tests {
     /// Each text in the popup, with the innermost ink wrapped round it — or `None` for the
     /// theme's foreground — and the popup's washes.
     fn inks_and_washes(e: &Element<u8>) -> (Vec<(String, Option<Rgb>)>, Vec<(Rgb, u8)>) {
-        fn walk(e: &Element<u8>, ink: Option<Rgb>, texts: &mut Vec<(String, Option<Rgb>)>, washes: &mut Vec<(Rgb, u8)>) {
+        fn walk(
+            e: &Element<u8>,
+            ink: Option<Rgb>,
+            texts: &mut Vec<(String, Option<Rgb>)>,
+            washes: &mut Vec<(Rgb, u8)>,
+        ) {
             let ink = match &e.node {
                 crate::element::Node::Ink { colour, .. } => Some(*colour),
                 _ => ink,
@@ -870,10 +854,7 @@ mod tests {
     /// Carrying the index in the outcome is what makes that unrepresentable.
     #[test]
     fn choosing_names_the_menu_it_chose_from_even_though_it_has_closed() {
-        let menus = alloc::vec![
-            Menu { title: "File", items: alloc::vec![Item::plain("Close", 9u8)] },
-            menu(),
-        ];
+        let menus = alloc::vec![Menu { title: "File", items: alloc::vec![Item::plain("Close", 9u8)] }, menu(),];
         let mut s = MenuState::new(2);
         s.toggle(1);
         s.key(&ev(KEY_DOWN, 0), &menus);
@@ -882,19 +863,13 @@ mod tests {
         let KeyOutcome::Chose { menu, item } = out else { panic!("Enter chose nothing: {out:?}") };
         assert_eq!(menu, 1, "the second menu was open, and the outcome still says so");
         // …and the pair addresses the row a caller means, rather than the first menu's.
-        assert!(
-            matches!(menus[menu].items[item], Item::Action { msg: 1, .. }),
-            "the pair does not address New Tab"
-        );
+        assert!(matches!(menus[menu].items[item], Item::Action { msg: 1, .. }), "the pair does not address New Tab");
     }
 
     /// Left and Right move between menus, which is what makes a popup rebuild necessary.
     #[test]
     fn arrowing_sideways_moves_which_menu_is_open() {
-        let menus = alloc::vec![
-            Menu { title: "File", items: alloc::vec![Item::plain("Close", 9u8)] },
-            menu(),
-        ];
+        let menus = alloc::vec![Menu { title: "File", items: alloc::vec![Item::plain("Close", 9u8)] }, menu(),];
         let mut s = MenuState::new(2);
         s.toggle(0);
         assert_eq!(s.key(&ev(KEY_RIGHT, 0), &menus), KeyOutcome::Changed);
@@ -968,10 +943,8 @@ mod tests {
     fn a_swatch_widens_the_leading_column_for_the_whole_menu() {
         let theme = Theme::default();
         let red = Rgb::new(200, 0, 0);
-        let m = Menu {
-            title: "Places",
-            items: alloc::vec![Item::plain("Home", 1u8).swatch(red), Item::plain("Other", 2)],
-        };
+        let m =
+            Menu { title: "Places", items: alloc::vec![Item::plain("Home", 1u8).swatch(red), Item::plain("Other", 2)] };
         let cell = crate::layout::FixedCell { w: 8, h: 16 };
         let e = popup(&m, &MenuState::new(1), 0, None, &theme);
         let l = crate::layout::layout(&e, Rect::new(0, 0, 300, 200), &cell);

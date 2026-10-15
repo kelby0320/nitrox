@@ -113,14 +113,7 @@ pub fn civil_from_unix(unix_nanos: u64) -> Civil {
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400); // second of day, [0, 86_399]
     let (year, month, day) = civil_from_days(days);
-    Civil {
-        year,
-        month,
-        day,
-        hour: (sod / 3600) as u32,
-        minute: ((sod % 3600) / 60) as u32,
-        second: (sod % 60) as u32,
-    }
+    Civil { year, month, day, hour: (sod / 3600) as u32, minute: ((sod % 3600) / 60) as u32, second: (sod % 60) as u32 }
 }
 
 /// `YYYY-MM-DD HH:MM:SS` (UTC), the display form `date` prints without a stream.
@@ -281,8 +274,8 @@ mod tests {
         for bad in [
             "",
             "2026-09-28",
-            "2026-09-28 14:30:00Z",   // a space for the `T`
-            "2026-09-28T14:30:00",    // no `Z`
+            "2026-09-28 14:30:00Z", // a space for the `T`
+            "2026-09-28T14:30:00",  // no `Z`
             "2026-09-28T14:30:00+00:00",
             "2026-09-28t14:30:00z",
             "2026-09-28T14:30:00.5Z", // a fraction
@@ -291,12 +284,12 @@ mod tests {
             "2026-13-28T14:30:00Z",
             "2026-00-28T14:30:00Z",
             "2026-09-00T14:30:00Z",
-            "2026-09-31T14:30:00Z",   // September has 30
-            "2026-02-29T14:30:00Z",   // 2026 is common
-            "2100-02-29T14:30:00Z",   // and so is 2100
+            "2026-09-31T14:30:00Z", // September has 30
+            "2026-02-29T14:30:00Z", // 2026 is common
+            "2100-02-29T14:30:00Z", // and so is 2100
             "2026-09-28T24:00:00Z",
             "2026-09-28T14:60:00Z",
-            "2026-09-28T14:30:60Z",   // no leap second
+            "2026-09-28T14:30:60Z", // no leap second
         ] {
             assert_eq!(parse_utc(bad), None, "{bad:?}");
         }

@@ -48,24 +48,15 @@ pub fn rows(v: &Val) -> OpResult<Vec<Val>> {
         Val::Data(Value::Table(t)) => Ok(t
             .rows
             .iter()
-            .map(|r| {
-                Val::Data(Value::Record(Arc::new(Record {
-                    schema: t.schema.clone(),
-                    values: r.clone(),
-                })))
-            })
+            .map(|r| Val::Data(Value::Record(Arc::new(Record { schema: t.schema.clone(), values: r.clone() }))))
             .collect()),
-        Val::Data(Value::List(items)) => {
-            Ok(items.iter().map(|i| Val::Data(i.clone())).collect())
-        }
+        Val::Data(Value::List(items)) => Ok(items.iter().map(|i| Val::Data(i.clone())).collect()),
         // **A String is a sequence of its characters** (§10b). This is where length,
         // substring and slicing come from — `count`, `take`, `skip`, `last` over text —
         // rather than from a second vocabulary of string-only verbs. Characters, not
         // bytes: `"abc"[0]` already indexes characters, and two answers to "what is an
         // element of a String" is one too many.
-        Val::Data(Value::Str(text)) => {
-            Ok(text.chars().map(|c| Val::str(alloc::string::String::from(c))).collect())
-        }
+        Val::Data(Value::Str(text)) => Ok(text.chars().map(|c| Val::str(alloc::string::String::from(c))).collect()),
         // A Range's elements are its values. It stays language-only (§8c) — materialising
         // one here is exactly what it means to put it in front of an operator.
         Val::Range { start, end, inclusive } => {
@@ -152,11 +143,7 @@ pub fn table_from_records(out: Vec<Val>) -> OpResult<Val> {
             _ => return as_list(out),
         }
     }
-    Ok(Val::Data(Value::Table(Arc::new(Table {
-        flags: StreamFlags::NONE,
-        schema,
-        rows: table_rows,
-    }))))
+    Ok(Val::Data(Value::Table(Arc::new(Table { flags: StreamFlags::NONE, schema, rows: table_rows }))))
 }
 
 /// `take N` / `skip N` / `last N` (§10b).
@@ -214,8 +201,10 @@ pub fn sum(v: &Val, field: Option<&str>) -> OpResult<Val> {
                     float_total += i as f64;
                 } else {
                     int_total = int_total.checked_add(i).ok_or_else(|| {
-                        String::from("`sum` overflows an Int — Nitrox does not wrap, \
-                                     because a wrapped total is a fabricated number")
+                        String::from(
+                            "`sum` overflows an Int — Nitrox does not wrap, \
+                                     because a wrapped total is a fabricated number",
+                        )
                     })?;
                 }
             }
@@ -279,9 +268,8 @@ fn extreme(v: &Val, field: Option<&str>, op: &str, want: i32) -> OpResult<Val> {
             }
         });
     }
-    best.map(Val::Data).ok_or_else(|| {
-        alloc::format!("`{op}` of nothing has no value — an empty sequence has no extreme")
-    })
+    best.map(Val::Data)
+        .ok_or_else(|| alloc::format!("`{op}` of nothing has no value — an empty sequence has no extreme"))
 }
 
 fn not_a_number(op: &str, v: &Value) -> String {
@@ -330,8 +318,7 @@ pub fn split(v: &Val, sep: &str) -> OpResult<Val> {
              sequence of them",
         ));
     }
-    let parts: Vec<Value> =
-        s.split(sep).map(|p| Value::Str(String::from(p))).collect();
+    let parts: Vec<Value> = s.split(sep).map(|p| Value::Str(String::from(p))).collect();
     Ok(Val::Data(Value::List(Arc::from(parts))))
 }
 
@@ -397,8 +384,7 @@ fn as_str<'a>(v: &'a Val, op: &str) -> OpResult<&'a str> {
 /// that arrived at runtime.
 pub fn keys(v: &Val) -> OpResult<Val> {
     let r = as_record(v, "keys")?;
-    let out: Vec<Value> =
-        r.schema.fields.iter().map(|f| Value::Str(f.name.clone())).collect();
+    let out: Vec<Value> = r.schema.fields.iter().map(|f| Value::Str(f.name.clone())).collect();
     Ok(Val::Data(Value::List(Arc::from(out))))
 }
 
@@ -416,12 +402,7 @@ pub fn merge(a: &Val, b: &Val) -> OpResult<Val> {
     for (i, f) in left.schema.fields.iter().enumerate() {
         // A field the right operand also carries takes its value from there, and keeps the
         // left's position — a merge should not reorder what it did not change.
-        let from_right = right
-            .schema
-            .fields
-            .iter()
-            .position(|g| g.name == f.name)
-            .and_then(|j| right.values.get(j));
+        let from_right = right.schema.fields.iter().position(|g| g.name == f.name).and_then(|j| right.values.get(j));
         let (tag, value) = match from_right {
             Some(v) => (v.type_tag().unwrap_or(TypeTag::Null), v.clone()),
             None => (f.ty, left.values.get(i).cloned().unwrap_or(Value::Null)),
@@ -467,9 +448,7 @@ pub fn round(v: &Val) -> OpResult<Val> {
     } else {
         0
     };
-    t.checked_add(away)
-        .map(Val::int)
-        .ok_or_else(|| String::from("`round` overflows an Int"))
+    t.checked_add(away).map(Val::int).ok_or_else(|| String::from("`round` overflows an Int"))
 }
 
 pub fn floor(v: &Val) -> OpResult<Val> {
@@ -494,10 +473,7 @@ pub fn abs(v: &Val) -> OpResult<Val> {
     match v.as_data() {
         // `-i64::MIN` has no positive counterpart, so it is an error rather than itself
         // (§8a: no wrapping, because a wrapped result is a fabricated number).
-        Some(Value::Int(i)) => i
-            .checked_abs()
-            .map(Val::int)
-            .ok_or_else(|| String::from("`abs` overflows an Int")),
+        Some(Value::Int(i)) => i.checked_abs().map(Val::int).ok_or_else(|| String::from("`abs` overflows an Int")),
         Some(Value::Float(f)) => Ok(Val::float(if *f < 0.0 { -f } else { *f })),
         _ => Err(alloc::format!("`abs` needs a number, got {}", v.type_name())),
     }
@@ -514,10 +490,7 @@ fn as_f64(v: &Val, op: &str) -> OpResult<f64> {
 /// Toward zero, refusing anything an `Int` cannot hold.
 fn trunc_f64(x: f64, op: &str) -> OpResult<i64> {
     if !(x.is_finite() && x > -9.3e18 && x < 9.3e18) {
-        return Err(alloc::format!(
-            "`{op}` cannot turn {} into an Int",
-            crate::value::render_f64(x)
-        ));
+        return Err(alloc::format!("`{op}` cannot turn {} into an Int", crate::value::render_f64(x)));
     }
     Ok(x as i64)
 }
@@ -534,20 +507,17 @@ pub fn select(v: &Val, fields: &[String]) -> OpResult<Val> {
     let mut out = Vec::with_capacity(r.len());
     for row in &r {
         let Val::Data(Value::Record(rec)) = row else {
-            return Err(alloc::format!(
-                "`select` needs rows with fields, got {}",
-                row.type_name()
-            ));
+            return Err(alloc::format!("`select` needs rows with fields, got {}", row.type_name()));
         };
         let mut schema = Schema::new();
         let mut values = Vec::with_capacity(fields.len());
         for f in fields {
-            let idx = rec.schema.fields.iter().position(|d| &d.name == f).ok_or_else(|| {
-                alloc::format!(
-                    "no field `{f}` — this row has [{}]",
-                    field_names(&rec.schema)
-                )
-            })?;
+            let idx = rec
+                .schema
+                .fields
+                .iter()
+                .position(|d| &d.name == f)
+                .ok_or_else(|| alloc::format!("no field `{f}` — this row has [{}]", field_names(&rec.schema)))?;
             let def = &rec.schema.fields[idx];
             schema = schema.field(&def.name, def.ty, def.modifiers);
             values.push(rec.values.get(idx).cloned().unwrap_or(Value::Null));
@@ -633,20 +603,17 @@ fn sort_key(row: &Val, field: Option<&str>) -> OpResult<Value> {
 /// `sum size` and `sort size` fail the same way on a row that has no such field.
 fn key_of(row: &Val, field: Option<&str>, op: &str) -> OpResult<Value> {
     match field {
-        None => row
-            .as_data()
-            .cloned()
-            .ok_or_else(|| alloc::format!("cannot `{op}` a value TSM1 cannot represent")),
+        None => row.as_data().cloned().ok_or_else(|| alloc::format!("cannot `{op}` a value TSM1 cannot represent")),
         Some(f) => {
             let Val::Data(Value::Record(rec)) = row else {
-                return Err(alloc::format!(
-                    "`{op} {f}` needs rows with fields, got {}",
-                    row.type_name()
-                ));
+                return Err(alloc::format!("`{op} {f}` needs rows with fields, got {}", row.type_name()));
             };
-            let idx = rec.schema.fields.iter().position(|d| &d.name == f).ok_or_else(|| {
-                alloc::format!("no field `{f}` — this row has [{}]", field_names(&rec.schema))
-            })?;
+            let idx = rec
+                .schema
+                .fields
+                .iter()
+                .position(|d| &d.name == f)
+                .ok_or_else(|| alloc::format!("no field `{f}` — this row has [{}]", field_names(&rec.schema)))?;
             Ok(rec.values.get(idx).cloned().unwrap_or(Value::Null))
         }
     }
@@ -740,8 +707,7 @@ pub fn format(template: &str, args: &[Val]) -> OpResult<String> {
                     next_positional += 1;
                     n
                 } else {
-                    spec.parse::<usize>()
-                        .map_err(|_| alloc::format!("`{{{spec}}}` is not a positional index"))?
+                    spec.parse::<usize>().map_err(|_| alloc::format!("`{{{spec}}}` is not a positional index"))?
                 };
                 let v = args.get(idx).ok_or_else(|| {
                     alloc::format!(
@@ -924,18 +890,11 @@ pub fn decode_from(path: &str, bytes: &[u8]) -> OpResult<Val> {
         let t = Table::decode(bytes).map_err(|_| alloc::format!("`{path}` is not a TSM1 stream"))?;
         return Ok(Val::Data(Value::Table(Arc::new(t))));
     }
-    let text = core::str::from_utf8(libfs::unpadded(bytes))
-        .map_err(|_| alloc::format!("`{path}` is not valid UTF-8"))?;
+    let text =
+        core::str::from_utf8(libfs::unpadded(bytes)).map_err(|_| alloc::format!("`{path}` is not valid UTF-8"))?;
     let schema = Schema::new().field("line", TypeTag::String, TypeModifiers::NONE);
-    let rows: Vec<Vec<Value>> = text
-        .lines()
-        .map(|l| alloc::vec![Value::Str(l.to_string())])
-        .collect();
-    Ok(Val::Data(Value::Table(Arc::new(Table {
-        flags: StreamFlags::NONE,
-        schema,
-        rows,
-    }))))
+    let rows: Vec<Vec<Value>> = text.lines().map(|l| alloc::vec![Value::Str(l.to_string())]).collect();
+    Ok(Val::Data(Value::Table(Arc::new(Table { flags: StreamFlags::NONE, schema, rows }))))
 }
 
 /// Concatenate two streams for `open a b` — §4's multi-path form.
@@ -944,17 +903,11 @@ pub fn concat(a: Val, b: Val) -> OpResult<Val> {
         return Err(String::from("`open` concatenates streams"));
     };
     if ta.schema != tb.schema {
-        return Err(String::from(
-            "`open` cannot concatenate files with different shapes — their schemas differ",
-        ));
+        return Err(String::from("`open` cannot concatenate files with different shapes — their schemas differ"));
     }
     let mut rows = ta.rows.clone();
     rows.extend(tb.rows.iter().cloned());
-    Ok(Val::Data(Value::Table(Arc::new(Table {
-        flags: ta.flags,
-        schema: ta.schema.clone(),
-        rows,
-    }))))
+    Ok(Val::Data(Value::Table(Arc::new(Table { flags: ta.flags, schema: ta.schema.clone(), rows }))))
 }
 
 #[cfg(test)]
@@ -977,10 +930,7 @@ mod tests {
     fn a_text_fallback_stream_displays_as_text_and_a_plain_table_keeps_its_header() {
         // **The flag had no reader for four milestones** — `clip` is the first producer in the
         // tree (M12 Part E), and what it produced printed `line` above somebody's pasted text.
-        assert_eq!(
-            display(&text_stream(StreamFlags::TEXT_FALLBACK, &["one", "two"]), false),
-            "one\ntwo\n"
-        );
+        assert_eq!(display(&text_stream(StreamFlags::TEXT_FALLBACK, &["one", "two"]), false), "one\ntwo\n");
         // The control: the identical rows *without* the flag are a table, and a table has
         // columns. Without this the test above would pass for a `display` that dropped every
         // header.
@@ -992,9 +942,11 @@ mod tests {
         // A producer that sets the bit on a table that is not one `String` column is wrong, and
         // rendering its first column as "the text" would hide the rest. Two columns here: the
         // header comes back.
-        let schema = Schema::new()
-            .field("line", TypeTag::String, TypeModifiers::NONE)
-            .field("n", TypeTag::Int, TypeModifiers::NONE);
+        let schema = Schema::new().field("line", TypeTag::String, TypeModifiers::NONE).field(
+            "n",
+            TypeTag::Int,
+            TypeModifiers::NONE,
+        );
         let v = Val::Data(Value::Table(alloc::sync::Arc::new(Table {
             flags: StreamFlags::TEXT_FALLBACK,
             schema,
@@ -1012,14 +964,12 @@ mod tests {
     use alloc::vec;
 
     fn table(names: &[&str], sizes: &[i64]) -> Val {
-        let schema = Schema::new()
-            .field("name", TypeTag::String, TypeModifiers::NONE)
-            .field("size", TypeTag::Int, TypeModifiers::NONE);
-        let rows = names
-            .iter()
-            .zip(sizes)
-            .map(|(n, s)| vec![Value::Str(n.to_string()), Value::Int(*s)])
-            .collect();
+        let schema = Schema::new().field("name", TypeTag::String, TypeModifiers::NONE).field(
+            "size",
+            TypeTag::Int,
+            TypeModifiers::NONE,
+        );
+        let rows = names.iter().zip(sizes).map(|(n, s)| vec![Value::Str(n.to_string()), Value::Int(*s)]).collect();
         Val::Data(Value::Table(Arc::new(Table { flags: StreamFlags::NONE, schema, rows })))
     }
 
@@ -1098,15 +1048,9 @@ mod tests {
     #[test]
     fn format_is_positional_and_indexed_only() {
         assert_eq!(format("hello {}", &[Val::str("world")]).unwrap(), "hello world");
-        assert_eq!(
-            format("{1}, you are {0}", &[Val::int(30), Val::str("bob")]).unwrap(),
-            "bob, you are 30"
-        );
+        assert_eq!(format("{1}, you are {0}", &[Val::int(30), Val::str("bob")]).unwrap(), "bob, you are 30");
         // An index may repeat — the reason indexed form exists at all.
-        assert_eq!(
-            format("{0} met {0}", &[Val::str("ann")]).unwrap(),
-            "ann met ann"
-        );
+        assert_eq!(format("{0} met {0}", &[Val::str("ann")]).unwrap(), "ann met ann");
     }
 
     #[test]

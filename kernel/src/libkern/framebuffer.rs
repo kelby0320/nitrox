@@ -118,9 +118,6 @@ mod tests {
         // uninitialised padding out to userspace.
         let zeroed = FramebufferInfo::default();
         assert!(zeroed.as_bytes().iter().all(|&b| b == 0));
-        assert_eq!(
-            size_of::<u32>() * 2 + size_of::<u64>() * 2 + size_of::<u16>() + 6,
-            size_of::<FramebufferInfo>()
-        );
+        assert_eq!(size_of::<u32>() * 2 + size_of::<u64>() * 2 + size_of::<u16>() + 6, size_of::<FramebufferInfo>());
     }
 }

@@ -126,11 +126,7 @@ pub fn ask_new_password(term: u64, prompt: &[u8]) -> Result<Vec<u8>, NewPassword
 /// [`ask_new_password`], calling `asked` with `1` and then `2` as each read is ready, echo off —
 /// the receipts [`ask_password_then`] gives, once per copy. Echo goes back on between the two
 /// reads, so one receipt for both would let the second copy be typed while it was on.
-pub fn ask_new_password_then(
-    term: u64,
-    prompt: &[u8],
-    asked: &mut dyn FnMut(u8),
-) -> Result<Vec<u8>, NewPassword> {
+pub fn ask_new_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut(u8)) -> Result<Vec<u8>, NewPassword> {
     let mut first = ask_password_then(term, prompt, &mut || asked(1)).ok_or(NewPassword::Cancelled)?;
     let Some(second) = ask_password_then(term, b"again: ", &mut || asked(2)) else {
         scrub(&mut first);

@@ -38,11 +38,7 @@ pub struct BaseRevision {
 
 impl BaseRevision {
     pub const fn new(revision: u64) -> Self {
-        Self {
-            magic_0: 0xf9562b2d5c95a6c8,
-            magic_1: 0x6a7b384944536bdc,
-            revision,
-        }
+        Self { magic_0: 0xf9562b2d5c95a6c8, magic_1: 0x6a7b384944536bdc, revision }
     }
 
     /// `true` if the bootloader honoured our requested revision.
@@ -68,12 +64,7 @@ pub struct RequestsStartMarker(pub [u64; 4]);
 
 impl RequestsStartMarker {
     pub const fn new() -> Self {
-        Self([
-            0xf6b8f4b39de7d1ae,
-            0xfab91a6940fcb9cf,
-            0x785c6ed015d3e316,
-            0x181e920a7852b9d9,
-        ])
+        Self([0xf6b8f4b39de7d1ae, 0xfab91a6940fcb9cf, 0x785c6ed015d3e316, 0x181e920a7852b9d9])
     }
 }
 
@@ -110,11 +101,7 @@ unsafe impl Sync for FramebufferRequest {}
 
 impl FramebufferRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, FB_ID_2, FB_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-        }
+        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, FB_ID_2, FB_ID_3], revision: 0, response: ptr::null_mut() }
     }
 }
 
@@ -192,11 +179,7 @@ unsafe impl Sync for MemoryMapRequest {}
 
 impl MemoryMapRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, MEMMAP_ID_2, MEMMAP_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-        }
+        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, MEMMAP_ID_2, MEMMAP_ID_3], revision: 0, response: ptr::null_mut() }
     }
 }
 
@@ -239,11 +222,7 @@ unsafe impl Sync for HhdmRequest {}
 
 impl HhdmRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, HHDM_ID_2, HHDM_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-        }
+        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, HHDM_ID_2, HHDM_ID_3], revision: 0, response: ptr::null_mut() }
     }
 }
 
@@ -276,11 +255,7 @@ unsafe impl Sync for ModuleRequest {}
 
 impl ModuleRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, MODULE_ID_2, MODULE_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-        }
+        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, MODULE_ID_2, MODULE_ID_3], revision: 0, response: ptr::null_mut() }
     }
 }
 
@@ -413,11 +388,7 @@ unsafe impl Sync for RsdpRequest {}
 
 impl RsdpRequest {
     pub const fn new() -> Self {
-        Self {
-            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, RSDP_ID_2, RSDP_ID_3],
-            revision: 0,
-            response: ptr::null_mut(),
-        }
+        Self { id: [COMMON_MAGIC_0, COMMON_MAGIC_1, RSDP_ID_2, RSDP_ID_3], revision: 0, response: ptr::null_mut() }
     }
 }
 

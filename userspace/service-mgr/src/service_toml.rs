@@ -63,8 +63,8 @@ impl Default for RestartConfig {
             policy: RestartPolicy::Never,
             max_attempts: 0,
             backoff: Backoff::Exponential,
-            initial_ns: 1_000_000_000,   // 1s
-            max_ns: 300_000_000_000,     // 5min
+            initial_ns: 1_000_000_000, // 1s
+            max_ns: 300_000_000_000,   // 5min
         }
     }
 }
@@ -255,10 +255,7 @@ fn parse_string_array(v: &str) -> Vec<String> {
     let Some(inner) = v.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
         return Vec::new();
     };
-    inner
-        .split(',')
-        .filter_map(|e| unquote(e.trim()).map(String::from))
-        .collect()
+    inner.split(',').filter_map(|e| unquote(e.trim()).map(String::from)).collect()
 }
 
 /// Parse a duration string (`"200ms"`, `"1s"`, `"5min"`) to nanoseconds. `None` on a
@@ -359,9 +356,7 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
             let why = match (&n, &e) {
                 (None, _) => None,
                 (Some(_), None) => Some(SkipReason::NoExecutable),
-                (Some(n), Some(_)) if out.iter().any(|d: &ServiceDecl| &d.name == n) => {
-                    Some(SkipReason::Duplicate)
-                }
+                (Some(n), Some(_)) if out.iter().any(|d: &ServiceDecl| &d.name == n) => Some(SkipReason::Duplicate),
                 (Some(_), Some(_)) if matches!(endpoint, Some(None)) => Some(SkipReason::BadEndpoint),
                 _ => None,
             };
@@ -425,9 +420,7 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
                     section = Section::Root;
                 }
                 // `[service.<name>.restart]` for the service we're parsing.
-                (Some("service"), Some(svc), Some("restart"), None)
-                    if name.as_deref() == Some(svc) =>
-                {
+                (Some("service"), Some(svc), Some("restart"), None) if name.as_deref() == Some(svc) => {
                     section = Section::Restart;
                 }
                 // Any other section (unknown, or another service's subtable): ignore.
@@ -638,9 +631,7 @@ backoff_max = \"2s\"\n";
     /// A `[service.<other>.restart]` table is not this service's, even mid-file.
     #[test]
     fn a_restart_table_naming_another_service_is_ignored() {
-        let v = parse_all(
-            "[service.a]\nexecutable=\"/a\"\n[service.b.restart]\npolicy=\"always\"\n",
-        );
+        let v = parse_all("[service.a]\nexecutable=\"/a\"\n[service.b.restart]\npolicy=\"always\"\n");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].name, "a");
         assert_eq!(v[0].restart.policy, RestartPolicy::Never);
@@ -685,13 +676,11 @@ backoff_max = \"2s\"\n";
     /// silently changed the policy (PR #226 review, finding 2).
     #[test]
     fn a_repeated_restart_key_keeps_the_first() {
-        let d = one(
-            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
+        let d = one("[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
              policy=\"never\"\nmax_attempts=1\nbackoff=\"none\"\n\
              backoff_initial=\"1ms\"\nbackoff_max=\"2ms\"\n\
              policy=\"always\"\nmax_attempts=99\nbackoff=\"linear\"\n\
-             backoff_initial=\"9s\"\nbackoff_max=\"9min\"\n",
-        );
+             backoff_initial=\"9s\"\nbackoff_max=\"9min\"\n");
         assert_eq!(d.restart.policy, RestartPolicy::Never);
         assert_eq!(d.restart.max_attempts, 1);
         assert_eq!(d.restart.backoff, Backoff::None);
@@ -704,10 +693,8 @@ backoff_max = \"2s\"\n";
     /// anything new.
     #[test]
     fn an_appended_restart_table_cannot_change_a_policy() {
-        let d = one(
-            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\npolicy=\"never\"\n\
-             [service.a.restart]\npolicy=\"always\"\n",
-        );
+        let d = one("[service.a]\nexecutable=\"/a\"\n[service.a.restart]\npolicy=\"never\"\n\
+             [service.a.restart]\npolicy=\"always\"\n");
         assert_eq!(d.restart.policy, RestartPolicy::Never);
     }
 
@@ -716,16 +703,12 @@ backoff_max = \"2s\"\n";
     /// is why [`RestartSeen`] is flags rather than a comparison against the default.
     #[test]
     fn a_key_set_to_its_default_still_consumes_the_slot() {
-        let d = one(
-            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
-             policy=\"never\"\npolicy=\"always\"\n",
-        );
+        let d = one("[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
+             policy=\"never\"\npolicy=\"always\"\n");
         assert_eq!(d.restart.policy, RestartPolicy::Never);
         // And `backoff`, whose default is `Exponential`, behaves the same way.
-        let e = one(
-            "[service.b]\nexecutable=\"/b\"\n[service.b.restart]\n\
-             backoff=\"exponential\"\nbackoff=\"none\"\n",
-        );
+        let e = one("[service.b]\nexecutable=\"/b\"\n[service.b.restart]\n\
+             backoff=\"exponential\"\nbackoff=\"none\"\n");
         assert_eq!(e.restart.backoff, Backoff::Exponential);
     }
 
@@ -756,10 +739,8 @@ backoff_max = \"2s\"\n";
     /// its default and nothing would say so.
     #[test]
     fn a_malformed_value_does_not_consume_the_slot() {
-        let d = one(
-            "[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
-             max_attempts=\"oops\"\nmax_attempts=7\n",
-        );
+        let d = one("[service.a]\nexecutable=\"/a\"\n[service.a.restart]\n\
+             max_attempts=\"oops\"\nmax_attempts=7\n");
         assert_eq!(d.restart.max_attempts, 7);
     }
 
@@ -767,9 +748,7 @@ backoff_max = \"2s\"\n";
     /// discarding the declaration in progress.
     #[test]
     fn an_unknown_section_between_services_is_ignored() {
-        let v = parse_all(
-            "[service.a]\nexecutable=\"/a\"\n[totally.unknown]\nkey=1\n[service.b]\nexecutable=\"/b\"\n",
-        );
+        let v = parse_all("[service.a]\nexecutable=\"/a\"\n[totally.unknown]\nkey=1\n[service.b]\nexecutable=\"/b\"\n");
         assert_eq!(v.len(), 2);
         assert_eq!(v[1].name, "b");
     }
@@ -826,9 +805,7 @@ backoff_max = \"2s\"\n";
         let e = one("[service.b]\nexecutable=\"/b\"\nafter=[]\nafter=[\"sneaked-in\"]\n");
         assert!(e.after.is_empty(), "an appended line supplied a dependency");
         // Same for `syscaps`, where the appended line is an authority grant.
-        let f = one(
-            "[service.c]\nexecutable=\"/c\"\nsyscaps=[]\nsyscaps=[\"BIND_NAMESPACE\"]\n",
-        );
+        let f = one("[service.c]\nexecutable=\"/c\"\nsyscaps=[]\nsyscaps=[\"BIND_NAMESPACE\"]\n");
         assert_eq!(f.syscaps, 0, "an appended line supplied a capability");
     }
 
@@ -838,9 +815,7 @@ backoff_max = \"2s\"\n";
     /// authority downgrade looks like from three subsystems away.
     #[test]
     fn syscaps_names_map_to_bits_and_unknown_names_are_reported() {
-        let d = one(
-            "[service.a]\nexecutable=\"/a\"\nsyscaps=[\"BIND_NAMESPACE\", \"REAL_TIME\"]\n",
-        );
+        let d = one("[service.a]\nexecutable=\"/a\"\nsyscaps=[\"BIND_NAMESPACE\", \"REAL_TIME\"]\n");
         assert_eq!(d.syscaps, (1 << 1) | (1 << 3));
         assert!(d.unknown_syscaps.is_empty());
 
@@ -908,14 +883,7 @@ backoff_max = \"2s\"\n";
     /// started with nowhere to bind would be running and unreachable.
     #[test]
     fn a_declaration_with_a_bad_endpoint_is_skipped_and_the_next_is_not() {
-        let bads = [
-            "\"svc/auth\"",
-            "\"/\"",
-            "\"/svc/../auth\"",
-            "\"/svc//auth\"",
-            "\"/svc/ auth\"",
-            "/svc/auth",
-        ];
+        let bads = ["\"svc/auth\"", "\"/\"", "\"/svc/../auth\"", "\"/svc//auth\"", "\"/svc/ auth\"", "/svc/auth"];
         for bad in bads {
             let v = parse_all(&alloc::format!(
                 "[service.a]\nexecutable=\"/a\"\nendpoint={bad}\n[service.b]\nexecutable=\"/b\"\n"

@@ -36,15 +36,13 @@ pub enum ResolveOp {
     /// cross-filesystem rename.
     Rename { dest_ptr: u64, dest_len: usize, flags: u16 },
 }
-use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
-use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
-use crate::libkern::spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
 use crate::arch::RegisterValues;
 use crate::arch::registers::ArchRegisters;
+use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
 use crate::libkern::io_op::{IoOp, IoOpcode};
-use crate::libkern::{
-    ExitKind, ExitStatus, IoResult, KBox, MemFlags, Notification, SendMode, ThreadArgs, TimerFlags,
-};
+use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
+use crate::libkern::spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
+use crate::libkern::{ExitKind, ExitStatus, IoResult, KBox, MemFlags, Notification, SendMode, ThreadArgs, TimerFlags};
 use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::elf::load_elf;
 use crate::mm::user_access::{
@@ -54,15 +52,14 @@ use crate::mm::vmm::{Protection, VAddrRange};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 // `Timer` (the arch hardware-clock alias) is imported above; the Timer kernel
 // object is referenced as `TimerObject` to avoid the name clash.
+use crate::object::device_node::DeviceClass;
 use crate::object::kernel_server::{self, OpStatus};
 use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, SubtreeBase, validate_path};
-use crate::object::device_node::DeviceClass;
 use crate::object::userspace_server::{Forward, ForwardOp};
 use crate::object::{
-    BlockSendOutcome, DeviceNode, EntropyObject, FileObject, IpcChannel, MAX_WAIT_HANDLES,
-    MemoryObject, Namespace, NotificationChannel, NsError, ObjectRef, PendingOperation, Process,
-    ReclaimedSend, RecvState, SendOutcome, StoredMsg, Timer as TimerObject, TransferRef,
-    UserspaceServerReg,
+    BlockSendOutcome, DeviceNode, EntropyObject, FileObject, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, Namespace,
+    NotificationChannel, NsError, ObjectRef, PendingOperation, Process, ReclaimedSend, RecvState, SendOutcome,
+    StoredMsg, Timer as TimerObject, TransferRef, UserspaceServerReg,
 };
 
 // --- Stable ABI syscall numbers -----------------------------------------
@@ -299,9 +296,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_POWER => encode(sys_power(a0, a1)),
         SYS_CLOCK_SET => encode(sys_clock_set(a0, a1)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
-        SYS_FILE_GROW => {
-            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow)))
-        }
+        SYS_FILE_GROW => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow))),
         SYS_FILE_CREATE => {
             encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Create)))
         }
@@ -388,12 +383,7 @@ fn sys_thread_exit(status: i32) -> ! {
 /// failure before the commit (the child thread enqueue) leaves no handles
 /// tagged to a process that will never run. `ns_h` is the child's namespace
 /// handle (`RawHandle::NULL` if none was installed).
-fn spawn_rollback_child_handles(
-    child_pid: u32,
-    notif_h: RawHandle,
-    ns_h: RawHandle,
-    installed: &[RawHandle],
-) {
+fn spawn_rollback_child_handles(child_pid: u32, notif_h: RawHandle, ns_h: RawHandle, installed: &[RawHandle]) {
     close_and_release(notif_h, child_pid);
     if !ns_h.is_null() {
         close_and_release(ns_h, child_pid);
@@ -422,10 +412,8 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
     let r = sys_process_spawn_inner(args_ptr, spawn_started);
     // Record even a failed spawn: a spawn that fails after materialising the image has
     // still paid for it, and hiding those would flatter the average.
-    spawn_stats::SPAWN_NS.fetch_add(
-        Timer::read_ns().saturating_sub(spawn_started),
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    spawn_stats::SPAWN_NS
+        .fetch_add(Timer::read_ns().saturating_sub(spawn_started), core::sync::atomic::Ordering::Relaxed);
     r
 }
 
@@ -442,23 +430,20 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     // the executable path in userspace). Requires the caller hold it with `MAP_READ`.
     // Accept a `MemoryObject` (eager — e.g. an initramfs file) or a `FileObject` (a
     // demand-paged file on the fs-server — e.g. a program in the content-addressed store).
-    let img = global::get()
-        .lookup(RawHandle(args.image.bits()), parent_pid, Rights::MAP_READ)
-        .map_err(map_handle_err)?;
+    let img =
+        global::get().lookup(RawHandle(args.image.bits()), parent_pid, Rights::MAP_READ).map_err(map_handle_err)?;
     // The ELF loader needs one contiguous slice; materialize the image's bytes into one.
     // (A `MemoryObject`'s frames are page-fragmented; a `FileObject`'s pages are filled
     // on demand. Deferred: map the frames into a temporary kernel VMA instead of copying.)
     let image_started = Timer::read_ns();
     let img_bytes = match img.object.object_type() {
         // SAFETY: type checked above; `img.object` pins it live.
-        KObjectType::MemoryObject => unsafe { &*(img.object.as_ptr() as *const MemoryObject) }
-            .copy_to_kvec()
-            .map_err(|_| KError::OutOfMemory)?,
+        KObjectType::MemoryObject => {
+            unsafe { &*(img.object.as_ptr() as *const MemoryObject) }.copy_to_kvec().map_err(|_| KError::OutOfMemory)?
+        }
         // Drives the fs-server producer per page, blocking on each fill — sound here on
         // the syscall thread (holds no AS/cache lock).
-        KObjectType::FileObject => {
-            FileObject::read_to_kvec(&img.object).map_err(|_| KError::OutOfMemory)?
-        }
+        KObjectType::FileObject => FileObject::read_to_kvec(&img.object).map_err(|_| KError::OutOfMemory)?,
         _ => return Err(KError::InvalidArgument),
     };
     spawn_stats::record(
@@ -491,13 +476,10 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
 
     // Build the child Process (owns the AS); record the parent's notification
     // channel as its `ChildExited` target.
-    let mut proc_box =
-        Process::try_new_user(child_pid, asp, child_syscaps).map_err(|_| KError::OutOfMemory)?;
+    let mut proc_box = Process::try_new_user(child_pid, asp, child_syscaps).map_err(|_| KError::OutOfMemory)?;
     if let Some(parent_proc) = crate::sched::current_process() {
         // SAFETY: `parent_proc` pins a live Process; clone its channel ref.
-        if let Some(c) =
-            unsafe { &*(parent_proc.as_ptr() as *const Process) }.notification_channel_ref()
-        {
+        if let Some(c) = unsafe { &*(parent_proc.as_ptr() as *const Process) }.notification_channel_ref() {
             proc_box.set_parent_notif(c);
         }
     }
@@ -527,8 +509,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     // it resolves names but cannot rebind its root. `None` ⇒ the parent has no
     // namespace and supplied none (degenerate; pid 1 always has one).
     let ns_source: Option<ObjectRef> = if !args.namespace.is_null() {
-        match lookup_typed(args.namespace.bits(), parent_pid, Rights::LOOKUP, KObjectType::Namespace)
-        {
+        match lookup_typed(args.namespace.bits(), parent_pid, Rights::LOOKUP, KObjectType::Namespace) {
             Ok(ok) => Some(ok.object.clone()),
             Err(e) => {
                 // SAFETY: reclaim the child's notif handle; `proc_box` drops the AS.
@@ -599,9 +580,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     // (rdi=notif, rsi=namespace, rdx=installed[0], rcx=arg0).
     let endpoint_h = if count > 0 { installed[0].bits() } else { 0 };
     let boot = [notif_h.bits(), child_ns_h.bits(), endpoint_h, args.arg0];
-    if crate::sched::spawn_user(proc_obj, info.entry_point.as_u64(), info.stack_top.as_u64(), boot)
-        .is_err()
-    {
+    if crate::sched::spawn_user(proc_obj, info.entry_point.as_u64(), info.stack_top.as_u64(), boot).is_err() {
         // `spawn_user` consumed (and dropped) `proc_obj`; release the clone to
         // free the Process + AS, and roll back the child handles.
         drop(proc_for_handle);
@@ -611,17 +590,16 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
 
     // Allocate the parent's handle to the child Process.
     let (pp, pt) = proc_for_handle.into_raw();
-    let parent_handle =
-        match global::get().allocate(parent_pid, pp, pt, Rights::SIGNAL | Rights::TERMINATE) {
-            Ok(h) => h,
-            Err(e) => {
-                // The child is already running; reclaim only the process-handle
-                // reference (the child stays alive, just unreferenced by us).
-                // SAFETY: adopt + drop the reference yielded by `into_raw`.
-                drop(unsafe { ObjectRef::from_raw(pp, pt) });
-                return Err(map_handle_err(e));
-            }
-        };
+    let parent_handle = match global::get().allocate(parent_pid, pp, pt, Rights::SIGNAL | Rights::TERMINATE) {
+        Ok(h) => h,
+        Err(e) => {
+            // The child is already running; reclaim only the process-handle
+            // reference (the child stays alive, just unreferenced by us).
+            // SAFETY: adopt + drop the reference yielded by `into_raw`.
+            drop(unsafe { ObjectRef::from_raw(pp, pt) });
+            return Err(map_handle_err(e));
+        }
+    };
 
     // The spawn committed: finalise moves by closing the parent's source handle
     // for each move-marked entry (its reference already lives in the child).
@@ -728,8 +706,7 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
 
     // Install a handle to it in the caller's table.
     let (tp, tt) = th.into_raw();
-    let rights =
-        Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE;
+    let rights = Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE;
     match global::get().allocate(pid, tp, tt, rights) {
         Ok(h) => Ok(h.bits() as isize),
         Err(e) => {
@@ -759,8 +736,7 @@ pub fn sys_thread_get_registers(thread_h: u64, out_ptr: u64) -> SysResult {
     let ok = lookup_typed(thread_h, pid, Rights::SIGNAL, KObjectType::Thread)?;
 
     // Must be suspended on a fault — yields the captured frame's address.
-    let frame_ptr = crate::sched::thread_exception_frame(ok.object.as_ptr())
-        .ok_or(KError::InvalidArgument)?;
+    let frame_ptr = crate::sched::thread_exception_frame(ok.object.as_ptr()).ok_or(KError::InvalidArgument)?;
     // Decode the registers out of the frame (SCHED already released), then copy
     // out to user memory (never under a lock).
     let regs: RegisterValues = crate::arch::Registers::read_from_exception_frame(frame_ptr);
@@ -907,9 +883,7 @@ pub fn sys_kprint(ptr: u64, len: usize) -> SysResult {
 /// the precise `NotOwner` for telemetry — see `HandleError`.)
 fn map_handle_err(e: HandleError) -> KError {
     match e {
-        HandleError::NullHandle | HandleError::InvalidHandle | HandleError::NotOwner => {
-            KError::InvalidHandle
-        }
+        HandleError::NullHandle | HandleError::InvalidHandle | HandleError::NotOwner => KError::InvalidHandle,
         HandleError::NoAccess => KError::NoAccess,
         HandleError::OutOfHandles => KError::OutOfHandles,
         HandleError::OutOfMemory => KError::OutOfMemory,
@@ -925,15 +899,8 @@ fn map_handle_err(e: HandleError) -> KError {
 /// `KObjectType` → `InvalidArgument`) cannot be forgotten on a new handler.
 /// Returns the pinned [`LookupOk`]; its `ObjectRef` keeps the object alive
 /// until the caller drops it, and `rights` carries the handle's full rights.
-fn lookup_typed(
-    h: u64,
-    pid: u32,
-    required: Rights,
-    expected: KObjectType,
-) -> Result<LookupOk, KError> {
-    let ok = global::get()
-        .lookup(RawHandle(h), pid, required)
-        .map_err(map_handle_err)?;
+fn lookup_typed(h: u64, pid: u32, required: Rights, expected: KObjectType) -> Result<LookupOk, KError> {
+    let ok = global::get().lookup(RawHandle(h), pid, required).map_err(map_handle_err)?;
     if ok.object.object_type() != expected {
         return Err(KError::InvalidArgument);
     }
@@ -993,14 +960,10 @@ fn stat_on(t: &HandleTable, h: RawHandle, pid: u32) -> Result<HandleInfo, KError
 fn object_byte_size(ty: KObjectType, obj: &ObjectRef) -> u64 {
     match ty {
         // SAFETY: `obj` pins a live object of the matched type.
-        KObjectType::MemoryObject => {
-            unsafe { &*(obj.as_ptr() as *const MemoryObject) }.size() as u64
-        }
+        KObjectType::MemoryObject => unsafe { &*(obj.as_ptr() as *const MemoryObject) }.size() as u64,
         KObjectType::FileObject => unsafe { &*(obj.as_ptr() as *const FileObject) }.size() as u64,
         // SAFETY: as above.
-        KObjectType::DeviceNode => {
-            unsafe { &*(obj.as_ptr() as *const DeviceNode) }.block_info().byte_capacity()
-        }
+        KObjectType::DeviceNode => unsafe { &*(obj.as_ptr() as *const DeviceNode) }.block_info().byte_capacity(),
         _ => 0,
     }
 }
@@ -1018,12 +981,7 @@ pub fn sys_handle_close(h: u64) -> SysResult {
 /// `DUPLICATE` on `h`. Returns the new handle value.
 pub fn sys_handle_duplicate(h: u64, new_rights: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
-    duplicate_on(
-        global::get(),
-        RawHandle(h),
-        pid,
-        Rights::from_bits_truncate(new_rights),
-    )
+    duplicate_on(global::get(), RawHandle(h), pid, Rights::from_bits_truncate(new_rights))
 }
 
 /// `sys_handle_restrict(h, new_rights)` — attenuate `h`'s rights in place to
@@ -1031,12 +989,7 @@ pub fn sys_handle_duplicate(h: u64, new_rights: u64) -> SysResult {
 /// (self-attenuation). Returns 0.
 pub fn sys_handle_restrict(h: u64, new_rights: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
-    restrict_on(
-        global::get(),
-        RawHandle(h),
-        pid,
-        Rights::from_bits_truncate(new_rights),
-    )
+    restrict_on(global::get(), RawHandle(h), pid, Rights::from_bits_truncate(new_rights))
 }
 
 /// `sys_handle_stat(h, out)` — write `HandleInfo` for `h` to user memory at
@@ -1060,20 +1013,13 @@ pub fn sys_handle_stat(h: u64, out: u64) -> SysResult {
 /// `MAP_*` band is valid on a `MemoryObject` (see `handle/type_rights.rs`), so
 /// including them would make `allocate` reject the set as `BadRights`.
 fn full_mem_rights() -> Rights {
-    Rights::MAP_READ
-        | Rights::MAP_WRITE
-        | Rights::MAP_EXEC
-        | Rights::DUPLICATE
-        | Rights::INSPECT
-        | Rights::TRANSFER
+    Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER
 }
 
 /// Map an [`AddressSpace`] mapping failure into the syscall error space.
 fn map_mem_map_err(e: MapError) -> KError {
     match e {
-        MapError::Overlap | MapError::NotCanonical | MapError::NotUserHalf => {
-            KError::InvalidArgument
-        }
+        MapError::Overlap | MapError::NotCanonical | MapError::NotUserHalf => KError::InvalidArgument,
         MapError::OutOfMemory => KError::OutOfMemory,
     }
 }
@@ -1144,18 +1090,14 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
     // paged) `FileObject`; both accept the `MAP_*` rights band. Look the handle up
     // generically — a non-mappable type lacks the `MAP_*` right `required`, so it
     // fails here — then branch on the object type for the size cap + the mapping.
-    let ok = global::get()
-        .lookup(RawHandle(obj_h), pid, required)
-        .map_err(map_handle_err)?;
+    let ok = global::get().lookup(RawHandle(obj_h), pid, required).map_err(map_handle_err)?;
     let obj_ty = ok.object.object_type();
     // The object's mappable extent in bytes (page-rounded). The size requested
     // must not exceed it.
     let max_bytes = match obj_ty {
         // SAFETY: type-confirmed live object pinned by `lookup`; read its size.
         KObjectType::MemoryObject => unsafe { &*(ok.object.as_ptr() as *const MemoryObject) }.size(),
-        KObjectType::FileObject => {
-            unsafe { &*(ok.object.as_ptr() as *const FileObject) }.npages() * PAGE_SIZE
-        }
+        KObjectType::FileObject => unsafe { &*(ok.object.as_ptr() as *const FileObject) }.npages() * PAGE_SIZE,
         // Not a mappable object (and it should not have reached here without a
         // `MAP_*` right, which only Memory/File objects carry).
         _ => return Err(KError::InvalidHandle),
@@ -1248,9 +1190,7 @@ pub fn sys_memory_unmap(addr: u64, _size: u64) -> SysResult {
         match asp.unmap_covering_deferred(va, &mut frames) {
             Ok(Some(vma)) => break vma,
             Ok(None) => return Err(KError::InvalidArgument),
-            Err(pages) => frames
-                .try_reserve(pages as usize)
-                .map_err(|_| KError::OutOfMemory)?,
+            Err(pages) => frames.try_reserve(pages as usize).map_err(|_| KError::OutOfMemory)?,
         }
     };
     // The PTEs are cleared, but another CPU running this address space may
@@ -1289,10 +1229,7 @@ pub fn sys_memory_unmap(addr: u64, _size: u64) -> SysResult {
 /// TODO(sched-acct): `ProcessCpu`/`ThreadCpu` need per-thread CPU accounting
 /// from the scheduler tick (none yet). See docs/planning/implementation-plan.md.
 pub fn sys_clock_read(clock: u64, out: u64) -> SysResult {
-    let id = u32::try_from(clock)
-        .ok()
-        .and_then(ClockId::from_u32)
-        .ok_or(KError::InvalidArgument)?;
+    let id = u32::try_from(clock).ok().and_then(ClockId::from_u32).ok_or(KError::InvalidArgument)?;
     let uptr = UserMutPtr::<u64>::new(out).map_err(from_user_access)?;
     let ns = match id {
         ClockId::Monotonic => Timer::read_ns(),
@@ -1369,12 +1306,7 @@ fn pending_op_rights() -> Rights {
 /// waitable, so no `WAIT`. (`UNBIND` is a modifier-band right, already
 /// allocatable on a `Namespace` — `handle/type_rights.rs`.)
 fn namespace_rights() -> Rights {
-    Rights::LOOKUP
-        | Rights::BIND
-        | Rights::UNBIND
-        | Rights::DUPLICATE
-        | Rights::TRANSFER
-        | Rights::INSPECT
+    Rights::LOOKUP | Rights::BIND | Rights::UNBIND | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT
 }
 
 /// Map a [`NsError`] to the user-facing [`KError`]. `InvalidPath` is a caller
@@ -1399,11 +1331,7 @@ fn map_ns_err(e: NsError) -> KError {
 /// returning the populated byte slice. `path_len` must be in `1..=NS_PATH_MAX`
 /// (`InvalidArgument` / `TooLarge` otherwise). Validation of the path *grammar*
 /// is the caller's job (via [`validate_path`] / `Namespace::bind`).
-fn copy_ns_path<'a>(
-    path_ptr: u64,
-    path_len: usize,
-    buf: &'a mut [u8; NS_PATH_MAX],
-) -> Result<&'a [u8], KError> {
+fn copy_ns_path<'a>(path_ptr: u64, path_len: usize, buf: &'a mut [u8; NS_PATH_MAX]) -> Result<&'a [u8], KError> {
     if path_len == 0 {
         return Err(KError::InvalidArgument);
     }
@@ -1445,8 +1373,7 @@ pub fn sys_timer_set(timer_h: u64, deadline_ns: u64, interval_ns: u64) -> SysRes
     let pid = crate::sched::current_owner_pid();
     let ok = lookup_typed(timer_h, pid, Rights::empty(), KObjectType::Timer)?;
     // `ok.object` (an ObjectRef) is held across the arm, keeping the Timer alive.
-    crate::sched::timer_arm(ok.object.as_ptr(), deadline_ns, interval_ns)
-        .map_err(|()| KError::OutOfMemory)?;
+    crate::sched::timer_arm(ok.object.as_ptr(), deadline_ns, interval_ns).map_err(|()| KError::OutOfMemory)?;
     Ok(0)
 }
 
@@ -1515,11 +1442,7 @@ fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
     let proc = crate::sched::current_process().ok_or(KError::KernelError)?;
     // SAFETY: `proc` pins a live `Process`; read its immutable syscap set.
     let held = unsafe { &*(proc.as_ptr() as *const Process) }.syscaps();
-    if held.contains(cap) {
-        Ok(())
-    } else {
-        Err(KError::NoAccess)
-    }
+    if held.contains(cap) { Ok(()) } else { Err(KError::NoAccess) }
 }
 
 /// Whether a handle carrying `rights` may be bound as a **direct handle**: only one that may leave
@@ -1573,9 +1496,7 @@ pub fn sys_ns_bind(
 
     // Resolve the resource handle (any type; ownership is the authority, and a direct handle's
     // `TRANSFER` is checked below).
-    let res_ok = global::get()
-        .lookup(RawHandle(resource_h), pid, Rights::empty())
-        .map_err(map_handle_err)?;
+    let res_ok = global::get().lookup(RawHandle(resource_h), pid, Rights::empty()).map_err(map_handle_err)?;
     let rights = res_ok.rights;
     // SAFETY: `ns_ok.object` addresses a live `Namespace` — `lookup_typed`
     // verified the type tag and the refcount pins it for this call.
@@ -1603,14 +1524,10 @@ pub fn sys_ns_bind(
             };
         }
         // First bind of this endpoint: wrap a clone of it in a fresh registration.
-        let reg_box = UserspaceServerReg::try_new(res_ok.object.clone())
-            .map_err(|_| KError::OutOfMemory)?;
+        let reg_box = UserspaceServerReg::try_new(res_ok.object.clone()).map_err(|_| KError::OutOfMemory)?;
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let reg_ref = unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(reg_box).as_ptr() as *mut (),
-                KObjectType::UserspaceServerReg,
-            )
+            ObjectRef::from_raw(KBox::into_raw(reg_box).as_ptr() as *mut (), KObjectType::UserspaceServerReg)
         };
         let reg_ptr = reg_ref.as_ptr();
         return match ns.bind_userspace_server(path, reg_ref, rights, base) {
@@ -1806,13 +1723,7 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
 /// Argument / permission / allocation failures return **synchronously** (a
 /// negative isize, no PO). Resolution failures (no covering binding, or a
 /// non-empty suffix on a direct-handle leaf) are delivered **through** the PO.
-pub fn sys_ns_lookup(
-    ns_h: u64,
-    path_ptr: u64,
-    path_len: usize,
-    rights_bits: u64,
-    op: ResolveOp,
-) -> SysResult {
+pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64, op: ResolveOp) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     // --- synchronous validation (no PO created on these) ---
     let requested = Rights::from_bits_truncate(rights_bits);
@@ -1841,12 +1752,7 @@ pub fn sys_ns_lookup(
     // until the server's reply completes it.
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    let po_ref = unsafe {
-        ObjectRef::from_raw(
-            KBox::into_raw(po).as_ptr() as *mut (),
-            KObjectType::PendingOperation,
-        )
-    };
+    let po_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
     let po_ptr = po_ref.as_ptr();
     let (pp, pt) = po_ref.clone().into_raw();
     let po_h = match global::get().allocate(pid, pp, pt, pending_op_rights()) {
@@ -2045,11 +1951,7 @@ fn join_subtree<'o>(base: &[u8], suffix: &[u8], out: &'o mut [u8]) -> Option<&'o
     // `base` is a validated absolute path (leading `/`, non-root), so `base[1..]` is
     // its non-empty server-relative form.
     let base_rel = &base[1..];
-    let joined_len = if suffix.is_empty() {
-        base_rel.len()
-    } else {
-        base_rel.len() + 1 + suffix.len()
-    };
+    let joined_len = if suffix.is_empty() { base_rel.len() } else { base_rel.len() + 1 + suffix.len() };
     if joined_len > out.len() {
         return None;
     }
@@ -2088,23 +1990,13 @@ fn forward_userspace_lookup(
         Err(_) => return Some((KError::OutOfMemory as i32, 0)),
     };
     let built = match fwd.op {
-        ForwardOp::Size(new_size, change) => crate::rsproto::build_resolve_request_sized(
-            &mut msg.payload,
-            requested.bits(),
-            suffix,
-            new_size,
-            change,
-        ),
-        ForwardOp::Rename { flags } => crate::rsproto::build_resolve_request_rename(
-            &mut msg.payload,
-            requested.bits(),
-            suffix,
-            fwd.dest,
-            flags,
-        ),
-        ForwardOp::Plain => {
-            crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix)
+        ForwardOp::Size(new_size, change) => {
+            crate::rsproto::build_resolve_request_sized(&mut msg.payload, requested.bits(), suffix, new_size, change)
         }
+        ForwardOp::Rename { flags } => {
+            crate::rsproto::build_resolve_request_rename(&mut msg.payload, requested.bits(), suffix, fwd.dest, flags)
+        }
+        ForwardOp::Plain => crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix),
     };
     let body_len = match built {
         Some(n) => n,
@@ -2119,9 +2011,7 @@ fn forward_userspace_lookup(
     // page-cache producer, and so a `SUBNAMESPACE` reply can continue it.
     match crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested, suffix, fwd) {
         crate::sched::ForwardOutcome::Pending => None,
-        crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => {
-            Some((KError::WouldBlock as i32, 0))
-        }
+        crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => Some((KError::WouldBlock as i32, 0)),
         crate::sched::ForwardOutcome::PeerClosed => Some((KError::PeerClosed as i32, 0)),
     }
     // `reg` / `msg` drop here, outside the namespace lock.
@@ -2160,10 +2050,7 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     // Bounds-check the buffer range (sync error).
     // SAFETY: `buf_ok` pins a live `MemoryObject`.
     let buffer_size = unsafe { &*(buf_ok.object.as_ptr() as *const MemoryObject) }.size() as u64;
-    let buf_end = op
-        .buf_offset
-        .checked_add(op.length)
-        .ok_or(KError::InvalidArgument)?;
+    let buf_end = op.buf_offset.checked_add(op.length).ok_or(KError::InvalidArgument)?;
     if buf_end > buffer_size {
         return Err(KError::InvalidArgument);
     }
@@ -2172,12 +2059,8 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     // the IRP dispatch, hand one to the caller's table.
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     // SAFETY: adopt the single creation reference.
-    let po_ref = unsafe {
-        ObjectRef::from_raw(
-            KBox::into_raw(po_box).as_ptr() as *mut (),
-            KObjectType::PendingOperation,
-        )
-    };
+    let po_ref =
+        unsafe { ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation) };
     let (tptr, tty) = po_ref.clone().into_raw();
     let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
         Ok(h) => h,
@@ -2220,14 +2103,9 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
             }
         }
         DeviceClass::Char if opcode == IoOpcode::Read => match dn.char_backend() {
-            Some(backend) => (backend.submit_read)(
-                &buf_ok.object,
-                &po_ref,
-                op.buf_offset,
-                op.offset,
-                op.length,
-                backend.ctx,
-            ),
+            Some(backend) => {
+                (backend.submit_read)(&buf_ok.object, &po_ref, op.buf_offset, op.offset, op.length, backend.ctx)
+            }
             None => Err(KError::Unsupported),
         },
         DeviceClass::Char | DeviceClass::Other => Err(KError::Unsupported),
@@ -2262,9 +2140,8 @@ fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::
     }
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     // SAFETY: adopt the single creation reference.
-    let po_ref = unsafe {
-        ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation)
-    };
+    let po_ref =
+        unsafe { ObjectRef::from_raw(KBox::into_raw(po_box).as_ptr() as *mut (), KObjectType::PendingOperation) };
     let (tptr, tty) = po_ref.clone().into_raw();
     let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
         Ok(h) => h,
@@ -2321,9 +2198,7 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
     let mut objs = [0usize; MAX_WAIT_HANDLES];
     let mut types = [KObjectType::Invalid; MAX_WAIT_HANDLES];
     for i in 0..count {
-        let ok = global::get()
-            .lookup(RawHandle(handles[i]), pid, Rights::WAIT)
-            .map_err(map_handle_err)?;
+        let ok = global::get().lookup(RawHandle(handles[i]), pid, Rights::WAIT).map_err(map_handle_err)?;
         match ok.object.object_type() {
             KObjectType::Timer
             | KObjectType::NotificationChannel
@@ -2357,8 +2232,7 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
                     // still pins the object, so reading the (one-shot, now-stable)
                     // completion is sound.
                     out[k] = if types[i] == KObjectType::PendingOperation {
-                        let (status, result) =
-                            crate::sched::pending_op_completion(objs[i] as *mut ());
+                        let (status, result) = crate::sched::pending_op_completion(objs[i] as *mut ());
                         IoResult::completed_with_result(handles[i], status, result)
                     } else {
                         // An `InterruptObject` consumes one pending interrupt on
@@ -2376,12 +2250,8 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
             // SAFETY: `IoResult` is `#[repr(C)]` with every byte initialised and
             // no padding (asserted in `libkern::io_result`); reinterpret the
             // first `k` records as a byte slice to copy out.
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    out.as_ptr() as *const u8,
-                    k * core::mem::size_of::<IoResult>(),
-                )
-            };
+            let bytes =
+                unsafe { core::slice::from_raw_parts(out.as_ptr() as *const u8, k * core::mem::size_of::<IoResult>()) };
             copy_slice_to_user(rptr, bytes).map_err(from_user_access)?;
             Ok(k as isize)
         }
@@ -2420,12 +2290,7 @@ pub fn sys_notif_recv(channel_h: u64, out: u64) -> SysResult {
 /// (`docs/spec/ipc-message-format.md` § "Channel creation"). The creator
 /// attenuates before handing an endpoint to another party.
 fn channel_endpoint_rights() -> Rights {
-    Rights::SEND
-        | Rights::RECV
-        | Rights::DUPLICATE
-        | Rights::TRANSFER
-        | Rights::INSPECT
-        | Rights::WAIT
+    Rights::SEND | Rights::RECV | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT | Rights::WAIT
 }
 
 /// Close a handle the kernel just allocated and release the reference it held —
@@ -2509,14 +2374,7 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
 ///   queue if the ring is full). `BlockBounded` additionally completes the PO
 ///   `TimedOut` (reclaiming the message) if undelivered by `deadline` (absolute
 ///   monotonic ns); `deadline` is ignored for `NoBlock`/`Block`.
-pub fn sys_channel_send(
-    ch: u64,
-    msg: u64,
-    handles: u64,
-    count: u64,
-    mode: u64,
-    deadline: u64,
-) -> SysResult {
+pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, deadline: u64) -> SysResult {
     // Mode gating first (host-reachable, no pointer/lock use). `deadline` (absolute
     // monotonic ns) is consumed only by `BlockBounded`; ignored for `NoBlock`/`Block`.
     let send_mode = match SendMode::from_u32(mode as u32) {
@@ -2549,9 +2407,7 @@ pub fn sys_channel_send(
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     for i in 0..count {
         let h = RawHandle(h_raw[i]);
-        let t = global::get()
-            .lookup(h, pid, Rights::TRANSFER)
-            .map_err(map_handle_err)?;
+        let t = global::get().lookup(h, pid, Rights::TRANSFER).map_err(map_handle_err)?;
         transfers[i] = Some(TransferRef { obj: t.object, rights: t.rights });
     }
 
@@ -2559,8 +2415,7 @@ pub fn sys_channel_send(
     // user copy may fault). One heap slot per send; optimisation target later.
     // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
     // in place — a stack temporary here would be 4 KiB on every send.
-    let mut bounce =
-        unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
+    let mut bounce = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
     copy_slice_from_user(bounce.as_bytes_mut(), mptr).map_err(from_user_access)?;
     if bounce.header.payload_len as usize > IPC_PAYLOAD_SIZE {
         return Err(KError::InvalidArgument);
@@ -2597,18 +2452,16 @@ pub fn sys_channel_send(
         // Synchronous attempt: `Sent` commits the transfer move (close the
         // sender's handles); a full ring / dead peer leaves the transfers untaken
         // (they drop here, outside SCHED) so no capability is lost.
-        SendMode::NoBlock => {
-            match crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) {
-                SendOutcome::Sent { .. } => {
-                    for i in 0..count {
-                        close_and_release(RawHandle(h_raw[i]), pid);
-                    }
-                    Ok(0)
+        SendMode::NoBlock => match crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) {
+            SendOutcome::Sent { .. } => {
+                for i in 0..count {
+                    close_and_release(RawHandle(h_raw[i]), pid);
                 }
-                SendOutcome::Full => Err(KError::WouldBlock),
-                SendOutcome::PeerClosed => Err(KError::PeerClosed),
+                Ok(0)
             }
-        }
+            SendOutcome::Full => Err(KError::WouldBlock),
+            SendOutcome::PeerClosed => Err(KError::PeerClosed),
+        },
         // Blocking: return a `PendingOperation` that completes when the message
         // is delivered — immediately if the ring has space, else when the peer
         // next receives. The message is committed either way, so the transfer
@@ -2617,19 +2470,11 @@ pub fn sys_channel_send(
         // `BlockBounded` additionally times out (PO completes `TimedOut`, message
         // reclaimed) if undelivered by `deadline`; `Block` waits unbounded.
         SendMode::Block | SendMode::BlockBounded => {
-            let deadline_ns = if send_mode == SendMode::BlockBounded {
-                deadline
-            } else {
-                u64::MAX
-            };
+            let deadline_ns = if send_mode == SendMode::BlockBounded { deadline } else { u64::MAX };
             let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
             // SAFETY: `into_raw` yields the single creation reference; adopt it.
-            let po_ref = unsafe {
-                ObjectRef::from_raw(
-                    KBox::into_raw(po).as_ptr() as *mut (),
-                    KObjectType::PendingOperation,
-                )
-            };
+            let po_ref =
+                unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
             match crate::sched::ipc_send_push_blocking(
                 ok.object.as_ptr(),
                 &bounce,
@@ -2686,8 +2531,7 @@ fn answer_forget(reg: *mut (), file_id: u64, pid: u32) -> SysResult {
     use crate::object::{Forgotten, UserspaceServerReg};
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    let answer =
-        unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
+    let answer = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
     // SAFETY: `reg` addresses the live registration the send arrived through.
     let Some(reg_ref) = (unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) }) else {
         return Err(KError::KernelError);
@@ -2770,9 +2614,8 @@ fn complete_resolve_reply(
     payload_len: usize,
 ) -> SysResult {
     use crate::rsproto::{
-        OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ,
-        OBJECT_KIND_NONE, OBJECT_KIND_SUBNAMESPACE,
-        ReplyKind, parse_reply,
+        OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ, OBJECT_KIND_NONE,
+        OBJECT_KIND_SUBNAMESPACE, ReplyKind, parse_reply,
     };
 
     // Parse the reply (recovers the `request_id` even on a malformed body).
@@ -2808,9 +2651,7 @@ fn complete_resolve_reply(
             // A Model A (block-fs) lazy file: `handles[0]` is the device, and the body carries
             // the block size + the initial `BlockRun` map. Build a page-cache object the kernel
             // fills zero-copy from the device.
-            ReplyKind::Success { object_kind, content_len }
-                if object_kind == OBJECT_KIND_FILE_BLOCKS =>
-            {
+            ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE_BLOCKS => {
                 build_and_install_file_blocks(reg, &pl, content_len, &bounce.payload[..payload_len], transfers)
             }
             // A mutating resolve (rename): the work is done and there is nothing to install.
@@ -2944,8 +2785,7 @@ fn sys_ns_sync(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
         None => return Err(KError::NotFound),
     };
     // SAFETY: `reg` pins a live `UserspaceServerReg`.
-    let r: &crate::object::UserspaceServerReg =
-        unsafe { &*(reg.as_ptr() as *const crate::object::UserspaceServerReg) };
+    let r: &crate::object::UserspaceServerReg = unsafe { &*(reg.as_ptr() as *const crate::object::UserspaceServerReg) };
     // The references are taken under the cache's lock and dropped after it is released —
     // each may be the last, and its `Drop` takes that lock.
     let files = r.cache_objects().map_err(|_| KError::OutOfMemory)?;
@@ -3002,8 +2842,7 @@ fn sys_ns_held(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
         None => return Err(KError::NotFound),
     };
     // SAFETY: `reg` pins a live `UserspaceServerReg`.
-    let r: &crate::object::UserspaceServerReg =
-        unsafe { &*(reg.as_ptr() as *const crate::object::UserspaceServerReg) };
+    let r: &crate::object::UserspaceServerReg = unsafe { &*(reg.as_ptr() as *const crate::object::UserspaceServerReg) };
     // Thread context, no lock held: the finished IRPs' boxes may drop here.
     crate::io::block::reclaim_completed();
     // The references are taken under the cache's lock and dropped after it is released: each
@@ -3056,8 +2895,7 @@ fn notify_file_touched(file_obj: &ObjectRef) {
     // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed in
     // place — the by-value form would put 4 KiB in this frame, on a sync path that is
     // already among the deepest in the kernel.
-    let Ok(mut msg) = (unsafe { KBox::<crate::object::ipc_channel::StoredMsg>::try_new_zeroed() })
-    else {
+    let Ok(mut msg) = (unsafe { KBox::<crate::object::ipc_channel::StoredMsg>::try_new_zeroed() }) else {
         return;
     };
     let Some(body_len) = crate::rsproto::build_touch_request(&mut msg.payload, file_id) else {
@@ -3089,23 +2927,16 @@ fn build_and_install_file(
     // Pin the registration in the producer (so it outlives the file). The reg is
     // live — we reached it through the send's endpoint peer.
     // SAFETY: `reg` addresses the live `UserspaceServerReg` for this send.
-    let reg_ref = match unsafe {
-        ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg)
-    } {
+    let reg_ref = match unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) } {
         Some(r) => r,
         None => return (KError::KernelError as i32, 0),
     };
-    let fobj = match FileObject::try_new(
-        content_len as usize,
-        Producer::FsServer { reg: reg_ref, suffix: kstr },
-    ) {
+    let fobj = match FileObject::try_new(content_len as usize, Producer::FsServer { reg: reg_ref, suffix: kstr }) {
         Ok(f) => f,
         Err(_) => return (KError::OutOfMemory as i32, 0),
     };
     // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    let fref = unsafe {
-        ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject)
-    };
+    let fref = unsafe { ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject) };
     let (op, ot) = fref.into_raw();
     // Grant `INSPECT` alongside the requested rights so a client can `sys_handle_stat`
     // the lazy file for its size before mapping (e.g. eshell `cat`) — `INSPECT` is a
@@ -3155,19 +2986,18 @@ fn build_and_install_file_blocks(
     };
 
     // SAFETY: `reg` addresses the live `UserspaceServerReg` this reply arrived through.
-    let Some(reg_ref) = (unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) })
-    else {
+    let Some(reg_ref) = (unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) }) else {
         return (KError::KernelError as i32, 0);
     };
     // **One object per file** (administration Part C.1): a file this registration already
     // caches is resized in place — a grow, create or truncate of it, or simply its size and
     // map as the server now reports them — and every resolve of it shares that object. A file
     // id of `0` names nothing, and gets an object of its own, uncached.
-    let candidate =
-        match new_block_file(content_len, device, header.block_size, reg_ref.clone(), header.file_id, runs) {
-            Ok(f) => f,
-            Err(e) => return (e as i32, 0),
-        };
+    let candidate = match new_block_file(content_len, device, header.block_size, reg_ref.clone(), header.file_id, runs)
+    {
+        Ok(f) => f,
+        Err(e) => return (e as i32, 0),
+    };
     let fref = if header.file_id == 0 {
         candidate
     } else {
@@ -3461,8 +3291,7 @@ fn complete_read_range_reply(
 fn copy_fill_into_frame(src: &ObjectRef, dst: crate::mm::PhysAddr, n: usize) {
     use crate::mm::{PAGE_SIZE, heap};
     // SAFETY: `src` pins the live `MemoryObject` (header at offset 0).
-    let mo: &crate::object::MemoryObject =
-        unsafe { &*(src.as_ptr() as *const crate::object::MemoryObject) };
+    let mo: &crate::object::MemoryObject = unsafe { &*(src.as_ptr() as *const crate::object::MemoryObject) };
     let frames = mo.frames();
     let n = n.min(PAGE_SIZE);
     if frames.is_empty() || n == 0 {
@@ -3509,22 +3338,16 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     }
     // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed in
     // place — a stack temporary here would be 4 KiB on every recv.
-    let mut bounce =
-        unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
+    let mut bounce = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     // Popping frees a ring slot, so a held blocking sender may be promoted into
     // it; `_promoted_po` is that sender's now-completed `PendingOperation`, and
     // `_reclaimed` collects any timed-out (`BlockBounded`) sends swept out of the
     // queue. Both drop here at scope exit — **outside** `SCHED` (no `ObjectRef`
     // Drop under the lock).
-    let mut _reclaimed: [Option<ReclaimedSend>; IpcChannel::MAX_PENDING_SENDS] =
-        core::array::from_fn(|_| None);
-    let (popped, _promoted_po) = crate::sched::ipc_recv_pop_into(
-        ok.object.as_ptr(),
-        &mut bounce,
-        &mut transfers,
-        &mut _reclaimed,
-    );
+    let mut _reclaimed: [Option<ReclaimedSend>; IpcChannel::MAX_PENDING_SENDS] = core::array::from_fn(|_| None);
+    let (popped, _promoted_po) =
+        crate::sched::ipc_recv_pop_into(ok.object.as_ptr(), &mut bounce, &mut transfers, &mut _reclaimed);
     if !popped {
         // Drained between the peek and the pop (only possible under future SMP).
         return Err(KError::WouldBlock);
@@ -3630,7 +3453,16 @@ mod tests {
             true
         };
         let ok_run = [(0, 2048, 8)];
-        for (bs, taken) in [(0, false), (256, false), (511, false), (512, true), (1024, true), (3000, false), (4096, true), (8192, false)] {
+        for (bs, taken) in [
+            (0, false),
+            (256, false),
+            (511, false),
+            (512, true),
+            (1024, true),
+            (3000, false),
+            (4096, true),
+            (8192, false),
+        ] {
             assert_eq!(used(&body(bs, &ok_run)), taken, "block size {bs}");
         }
         let top = u64::MAX;
@@ -3645,7 +3477,11 @@ mod tests {
         ] {
             assert_eq!(used(&body(512, &[run])), taken, "{what}");
         }
-        assert_eq!(block_map(&body(512, &[(0, 2048, 8)])[..32 + 23]).err(), Some(KError::KernelError), "a run cut short");
+        assert_eq!(
+            block_map(&body(512, &[(0, 2048, 8)])[..32 + 23]).err(),
+            Some(KError::KernelError),
+            "a run cut short"
+        );
     }
 
     #[test]
@@ -3657,17 +3493,11 @@ mod tests {
     fn join_subtree_prepends_base_stripping_leading_slash() {
         let mut out = [0u8; NS_PATH_MAX];
         // base + non-empty suffix → `<base-relative>/<suffix>`.
-        assert_eq!(
-            join_subtree(b"/home/alice", b"notes.txt", &mut out),
-            Some(&b"home/alice/notes.txt"[..])
-        );
+        assert_eq!(join_subtree(b"/home/alice", b"notes.txt", &mut out), Some(&b"home/alice/notes.txt"[..]));
         // Empty suffix (an exact lookup of the mount point) → just the base-relative.
         assert_eq!(join_subtree(b"/home/alice", b"", &mut out), Some(&b"home/alice"[..]));
         // A deep base + deep suffix.
-        assert_eq!(
-            join_subtree(b"/a/b", b"c/d/e", &mut out),
-            Some(&b"a/b/c/d/e"[..])
-        );
+        assert_eq!(join_subtree(b"/a/b", b"c/d/e", &mut out), Some(&b"a/b/c/d/e"[..]));
     }
 
     #[test]
@@ -3687,10 +3517,7 @@ mod tests {
         // An unknown ClockId is rejected before the pointer is examined, so the
         // `out` address is never touched (host-reachable).
         assert_eq!(sys_clock_read(99, 0xDEAD_BEEF), Err(KError::InvalidArgument));
-        assert_eq!(
-            dispatch(SYS_CLOCK_READ, 99, 0xDEAD_BEEF, 0, 0, 0, 0),
-            KError::InvalidArgument.as_isize(),
-        );
+        assert_eq!(dispatch(SYS_CLOCK_READ, 99, 0xDEAD_BEEF, 0, 0, 0, 0), KError::InvalidArgument.as_isize(),);
     }
 
     #[test]
@@ -3716,10 +3543,7 @@ mod tests {
         }
         assert_eq!(sys_clock_set(1, 946_684_799 * 1_000_000_000), Err(KError::InvalidArgument));
         assert_eq!(sys_clock_set(1, 4_102_444_800 * 1_000_000_000), Err(KError::InvalidArgument));
-        assert_eq!(
-            dispatch(SYS_CLOCK_SET, 0, ok_ns, 0, 0, 0, 0),
-            KError::InvalidArgument.as_isize(),
-        );
+        assert_eq!(dispatch(SYS_CLOCK_SET, 0, ok_ns, 0, 0, 0, 0), KError::InvalidArgument.as_isize(),);
     }
 
     #[test]
@@ -3727,20 +3551,14 @@ mod tests {
         // Unknown flag bits are rejected before `current_owner_pid` (which needs
         // a running thread), so this is host-reachable.
         assert_eq!(sys_timer_create(1), Err(KError::InvalidArgument));
-        assert_eq!(
-            dispatch(SYS_TIMER_CREATE, 0x8000_0000, 0, 0, 0, 0, 0),
-            KError::InvalidArgument.as_isize(),
-        );
+        assert_eq!(dispatch(SYS_TIMER_CREATE, 0x8000_0000, 0, 0, 0, 0, 0), KError::InvalidArgument.as_isize(),);
     }
 
     #[test]
     fn wait_rejects_bad_count() {
         // count == 0 and count > MAX are checked before any lock / pointer use.
         assert_eq!(sys_wait(0xDEAD, 0, 0xBEEF, 0), Err(KError::InvalidArgument));
-        assert_eq!(
-            sys_wait(0xDEAD, MAX_WAIT_HANDLES + 1, 0xBEEF, 0),
-            Err(KError::TooLarge),
-        );
+        assert_eq!(sys_wait(0xDEAD, MAX_WAIT_HANDLES + 1, 0xBEEF, 0), Err(KError::TooLarge),);
     }
 
     #[test]
@@ -3760,9 +3578,7 @@ mod tests {
         let t = HandleTable::try_new(0x1234_5678_9ABC_DEF0).unwrap();
         let timer = crate::object::Timer::try_new().unwrap();
         let ptr = KBox::into_raw(timer).as_ptr() as *mut ();
-        let h = t
-            .allocate(1, ptr, KObjectType::Timer, timer_rights())
-            .expect("timer_rights must be valid for a Timer");
+        let h = t.allocate(1, ptr, KObjectType::Timer, timer_rights()).expect("timer_rights must be valid for a Timer");
         // Clean up: close releases the handle's ref, freeing the object.
         let co = t.close(h, 1).unwrap();
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
@@ -3858,10 +3674,7 @@ mod tests {
         // The length bounds are checked before the handle lookup / pointer use, so
         // these are host-reachable (no running thread needed).
         assert_eq!(sys_entropy_read(0xDEAD, 0x1000, 0), Ok(0));
-        assert_eq!(
-            sys_entropy_read(0xDEAD, 0x1000, ENTROPY_READ_MAX + 1),
-            Err(KError::TooLarge),
-        );
+        assert_eq!(sys_entropy_read(0xDEAD, 0x1000, ENTROPY_READ_MAX + 1), Err(KError::TooLarge),);
     }
 
     #[test]
@@ -3870,10 +3683,7 @@ mod tests {
         // Distinct from `InvalidPath`: a bind onto a taken path is a well-formed
         // request the namespace already answers, not a malformed one.
         assert_eq!(map_ns_err(NsError::AlreadyBound), KError::AlreadyExists);
-        assert_ne!(
-            map_ns_err(NsError::AlreadyBound),
-            map_ns_err(NsError::InvalidPath)
-        );
+        assert_ne!(map_ns_err(NsError::AlreadyBound), map_ns_err(NsError::InvalidPath));
         assert_eq!(map_ns_err(NsError::NotBound), KError::NotFound);
         assert_eq!(map_ns_err(NsError::OutOfMemory), KError::OutOfMemory);
     }
@@ -3884,29 +3694,17 @@ mod tests {
         // so a dummy pointer/buffer suffices (host-reachable).
         let mut buf = [0u8; NS_PATH_MAX];
         assert_eq!(copy_ns_path(0x1000, 0, &mut buf), Err(KError::InvalidArgument));
-        assert_eq!(
-            copy_ns_path(0x1000, NS_PATH_MAX + 1, &mut buf),
-            Err(KError::TooLarge),
-        );
+        assert_eq!(copy_ns_path(0x1000, NS_PATH_MAX + 1, &mut buf), Err(KError::TooLarge),);
     }
 
     #[test]
     fn channel_create_rejects_bad_pointer_and_oversize_depth() {
         // The out-pointers are validated first (USER_VIRT_END is out of range),
         // then the depth bound — both before `current_owner_pid`/allocation.
-        assert_eq!(
-            sys_channel_create(USER_VIRT_END, 0x1000, 4),
-            Err(KError::FaultFromUser),
-        );
-        assert_eq!(
-            sys_channel_create(0x1000, USER_VIRT_END, 4),
-            Err(KError::FaultFromUser),
-        );
+        assert_eq!(sys_channel_create(USER_VIRT_END, 0x1000, 4), Err(KError::FaultFromUser),);
+        assert_eq!(sys_channel_create(0x1000, USER_VIRT_END, 4), Err(KError::FaultFromUser),);
         // Valid pointers + a depth past the cap → InvalidArgument.
-        assert_eq!(
-            sys_channel_create(0x1000, 0x1000, IPC_MAX_QUEUE_DEPTH as u64 + 1),
-            Err(KError::InvalidArgument),
-        );
+        assert_eq!(sys_channel_create(0x1000, 0x1000, IPC_MAX_QUEUE_DEPTH as u64 + 1), Err(KError::InvalidArgument),);
     }
 
     #[test]
@@ -3915,25 +3713,16 @@ mod tests {
         // All three real modes (NoBlock/Block/BlockBounded) proceed past gating —
         // exercised end-to-end in the QEMU demo, not here. The deadline arg (6th)
         // is ignored at this stage.
-        assert_eq!(
-            sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 99, 0),
-            Err(KError::InvalidArgument),
-        );
+        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 99, 0), Err(KError::InvalidArgument),);
         // More transferred handles than a message can carry → TooLarge (checked
         // before any pointer use).
-        assert_eq!(
-            sys_channel_send(0xDEAD, 0xDEAD, 0, (IPC_HANDLE_MAX + 1) as u64, 1, 0),
-            Err(KError::TooLarge),
-        );
+        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, (IPC_HANDLE_MAX + 1) as u64, 1, 0), Err(KError::TooLarge),);
     }
 
     #[test]
     fn channel_send_rejects_bad_message_pointer() {
         // NoBlock + count 0, then a bad `msg` pointer fails before lookup/lock.
-        assert_eq!(
-            sys_channel_send(0xDEAD, USER_VIRT_END, 0, 0, 1, 0),
-            Err(KError::FaultFromUser),
-        );
+        assert_eq!(sys_channel_send(0xDEAD, USER_VIRT_END, 0, 0, 1, 0), Err(KError::FaultFromUser),);
     }
 
     #[test]
@@ -3965,10 +3754,7 @@ mod tests {
         // The `SpawnArgs` pointer is validated first (before `current_owner_pid`
         // / the embedded image), so an out-of-range pointer is host-reachable.
         assert_eq!(sys_process_spawn(USER_VIRT_END), Err(KError::FaultFromUser));
-        assert_eq!(
-            dispatch(SYS_PROCESS_SPAWN, USER_VIRT_END, 0, 0, 0, 0, 0),
-            KError::FaultFromUser.as_isize(),
-        );
+        assert_eq!(dispatch(SYS_PROCESS_SPAWN, USER_VIRT_END, 0, 0, 0, 0, 0), KError::FaultFromUser.as_isize(),);
     }
 
     #[test]
@@ -3976,24 +3762,15 @@ mod tests {
         // The `ThreadArgs` pointer is validated before `current_process` / the
         // scheduler, so an out-of-range pointer is host-reachable.
         assert_eq!(sys_thread_create(USER_VIRT_END), Err(KError::FaultFromUser));
-        assert_eq!(
-            dispatch(SYS_THREAD_CREATE, USER_VIRT_END, 0, 0, 0, 0, 0),
-            KError::FaultFromUser.as_isize(),
-        );
+        assert_eq!(dispatch(SYS_THREAD_CREATE, USER_VIRT_END, 0, 0, 0, 0, 0), KError::FaultFromUser.as_isize(),);
     }
 
     #[test]
     fn thread_get_registers_rejects_bad_out_pointer() {
         // The output pointer is validated first (before the handle lookup needs
         // a running thread), so a kernel-half pointer is host-reachable.
-        assert_eq!(
-            sys_thread_get_registers(0, USER_VIRT_END),
-            Err(KError::FaultFromUser),
-        );
-        assert_eq!(
-            dispatch(SYS_THREAD_GET_REGISTERS, 0, USER_VIRT_END, 0, 0, 0, 0),
-            KError::FaultFromUser.as_isize(),
-        );
+        assert_eq!(sys_thread_get_registers(0, USER_VIRT_END), Err(KError::FaultFromUser),);
+        assert_eq!(dispatch(SYS_THREAD_GET_REGISTERS, 0, USER_VIRT_END, 0, 0, 0, 0), KError::FaultFromUser.as_isize(),);
     }
 
     #[test]
@@ -4003,10 +3780,7 @@ mod tests {
         // 1 (ResumeSkip) and 3+ are Phase 2 / reserved → Unsupported.
         assert_eq!(sys_exception_resume(0, 1, 0), Err(KError::Unsupported));
         assert_eq!(sys_exception_resume(0, 9, 0), Err(KError::Unsupported));
-        assert_eq!(
-            dispatch(SYS_EXCEPTION_RESUME, 0, 5, 0, 0, 0, 0),
-            KError::Unsupported.as_isize(),
-        );
+        assert_eq!(dispatch(SYS_EXCEPTION_RESUME, 0, 5, 0, 0, 0, 0), KError::Unsupported.as_isize(),);
     }
 
     #[test]
@@ -4019,10 +3793,7 @@ mod tests {
     #[test]
     fn kprint_oversize_is_too_large_without_touching_memory() {
         let too_big = (KPRINT_MAX + 1) as u64;
-        assert_eq!(
-            dispatch(SYS_DEBUG_KPRINT, 0xDEAD_BEEF, too_big, 0, 0, 0, 0),
-            KError::TooLarge.as_isize(),
-        );
+        assert_eq!(dispatch(SYS_DEBUG_KPRINT, 0xDEAD_BEEF, too_big, 0, 0, 0, 0), KError::TooLarge.as_isize(),);
         assert_eq!(sys_kprint(0xDEAD_BEEF, KPRINT_MAX + 1), Err(KError::TooLarge));
     }
 
@@ -4125,22 +3896,15 @@ mod tests {
     #[test]
     fn close_on_success_invalidates_handle() {
         let t = fresh_table();
-        let h = t
-            .allocate(1, mk_process(1), KObjectType::Process, full())
-            .unwrap();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, full()).unwrap();
         assert_eq!(close_on(&t, h, 1), Ok(0));
-        assert_eq!(
-            t.lookup(h, 1, Rights::empty()).unwrap_err(),
-            HandleError::InvalidHandle,
-        );
+        assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
     }
 
     #[test]
     fn close_on_wrong_owner_is_invalid_handle() {
         let t = fresh_table();
-        let h = t
-            .allocate(1, mk_process(1), KObjectType::Process, full())
-            .unwrap();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, full()).unwrap();
         assert_eq!(close_on(&t, h, 2), Err(KError::InvalidHandle));
         // Still valid for the real owner; clean up.
         assert_eq!(close_on(&t, h, 1), Ok(0));
@@ -4155,9 +3919,7 @@ mod tests {
     #[test]
     fn duplicate_on_returns_new_handle_with_intersected_rights() {
         let t = fresh_table();
-        let h = t
-            .allocate(1, mk_process(1), KObjectType::Process, full())
-            .unwrap();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, full()).unwrap();
         let ret = duplicate_on(&t, h, 1, Rights::DUPLICATE | Rights::INSPECT).unwrap();
         assert!(ret >= 0, "a valid handle value is non-negative");
         let dup = RawHandle(ret as u64);
@@ -4174,14 +3936,7 @@ mod tests {
     #[test]
     fn duplicate_on_without_duplicate_right_is_no_access() {
         let t = fresh_table();
-        let h = t
-            .allocate(
-                1,
-                mk_process(1),
-                KObjectType::Process,
-                Rights::INSPECT | Rights::SIGNAL,
-            )
-            .unwrap();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::INSPECT | Rights::SIGNAL).unwrap();
         assert_eq!(duplicate_on(&t, h, 1, Rights::INSPECT), Err(KError::NoAccess));
         close_on(&t, h, 1).unwrap();
     }
@@ -4189,9 +3944,7 @@ mod tests {
     #[test]
     fn restrict_on_attenuates_in_place() {
         let t = fresh_table();
-        let h = t
-            .allocate(1, mk_process(1), KObjectType::Process, full())
-            .unwrap();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, full()).unwrap();
         assert_eq!(restrict_on(&t, h, 1, Rights::INSPECT), Ok(0));
         // INSPECT survives (so stat still works); everything else is gone.
         let info = stat_on(&t, h, 1).unwrap();
@@ -4202,9 +3955,7 @@ mod tests {
     #[test]
     fn restrict_on_cannot_amplify() {
         let t = fresh_table();
-        let h = t
-            .allocate(1, mk_process(1), KObjectType::Process, Rights::INSPECT)
-            .unwrap();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::INSPECT).unwrap();
         // Requesting SIGNAL (not currently held) cannot add it.
         assert_eq!(restrict_on(&t, h, 1, Rights::SIGNAL | Rights::INSPECT), Ok(0));
         let info = stat_on(&t, h, 1).unwrap();
@@ -4216,9 +3967,7 @@ mod tests {
     fn stat_on_reports_type_rights_generation() {
         let t = fresh_table();
         let rights = Rights::INSPECT | Rights::SIGNAL;
-        let h = t
-            .allocate(1, mk_process(1), KObjectType::Process, rights)
-            .unwrap();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, rights).unwrap();
         let info = stat_on(&t, h, 1).unwrap();
         assert_eq!(info.object_type, KObjectType::Process as u32);
         assert_eq!(info.rights, rights.bits());
@@ -4230,9 +3979,7 @@ mod tests {
     #[test]
     fn stat_on_without_inspect_is_no_access() {
         let t = fresh_table();
-        let h = t
-            .allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL)
-            .unwrap();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::SIGNAL).unwrap();
         assert_eq!(stat_on(&t, h, 1), Err(KError::NoAccess));
         close_on(&t, h, 1).unwrap();
     }
@@ -4240,9 +3987,7 @@ mod tests {
     #[test]
     fn stat_on_wrong_owner_is_invalid_handle() {
         let t = fresh_table();
-        let h = t
-            .allocate(1, mk_process(1), KObjectType::Process, Rights::INSPECT)
-            .unwrap();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, Rights::INSPECT).unwrap();
         assert_eq!(stat_on(&t, h, 2), Err(KError::InvalidHandle));
         close_on(&t, h, 1).unwrap();
     }

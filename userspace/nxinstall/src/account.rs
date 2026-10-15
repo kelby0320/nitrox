@@ -156,8 +156,7 @@ mod tests {
         let mut users = Vec::from(USERS_HEADER);
         users.extend_from_slice(&line[..n]);
         copy::put_file(&src, b"/system", b"users", &users, NOW).unwrap();
-        copy::put_file(&src, b"/system", b"views.toml", view_broker::policy::seed("alice").as_bytes(), NOW)
-            .unwrap();
+        copy::put_file(&src, b"/system", b"views.toml", view_broker::policy::seed("alice").as_bytes(), NOW).unwrap();
         copy::put_file(&src, b"/system", b"services.toml", b"# the services\n", NOW).unwrap();
         src
     }

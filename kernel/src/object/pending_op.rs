@@ -91,12 +91,7 @@ impl PendingOperation {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::PendingOperation),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(PendingOpInner {
-                signaled: false,
-                status: 0,
-                result: 0,
-                waiters,
-            }),
+            inner: UnsafeCell::new(PendingOpInner { signaled: false, status: 0, result: 0, waiters }),
         })
     }
 
@@ -231,10 +226,7 @@ impl Drop for PendingOperation {
     /// `sys_wait`), so the last reference cannot drop while waiters remain — the
     /// assert documents that invariant. The `KVec` storage frees with the `KBox`.
     fn drop(&mut self) {
-        debug_assert!(
-            self.inner.get_mut().waiters.is_empty(),
-            "PendingOperation dropped with live waiters"
-        );
+        debug_assert!(self.inner.get_mut().waiters.is_empty(), "PendingOperation dropped with live waiters");
     }
 }
 
@@ -253,9 +245,7 @@ mod tests {
     fn free(obj: *mut ()) {
         // SAFETY: `obj` carries the single creation reference and has no waiters.
         unsafe {
-            drop(KBox::<PendingOperation>::from_raw(
-                core::ptr::NonNull::new_unchecked(obj as *mut PendingOperation),
-            ));
+            drop(KBox::<PendingOperation>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut PendingOperation)));
         }
     }
 
@@ -326,8 +316,7 @@ mod tests {
         let obj = fresh();
         // SAFETY: live PO, single-threaded test.
         unsafe {
-            let ths: [*mut (); PendingOperation::MAX_WAITERS] =
-                core::array::from_fn(|i| (0x1000 + i) as *mut ());
+            let ths: [*mut (); PendingOperation::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
             for &t in &ths {
                 assert!(PendingOperation::add_waiter(obj, t).is_ok());
             }
@@ -335,10 +324,7 @@ mod tests {
             PendingOperation::remove_waiter(obj, ths[1]);
             assert!(PendingOperation::add_waiter(obj, 0xBEEF as *mut ()).is_ok());
             let mut buf = [core::ptr::null_mut(); PendingOperation::MAX_WAITERS];
-            assert_eq!(
-                PendingOperation::take_waiters(obj, &mut buf),
-                PendingOperation::MAX_WAITERS
-            );
+            assert_eq!(PendingOperation::take_waiters(obj, &mut buf), PendingOperation::MAX_WAITERS);
             // Empty after drain (so Drop's assert holds).
             let mut buf2 = [core::ptr::null_mut(); PendingOperation::MAX_WAITERS];
             assert_eq!(PendingOperation::take_waiters(obj, &mut buf2), 0);

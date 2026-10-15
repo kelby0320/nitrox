@@ -264,16 +264,19 @@ fn read(
     max_len: usize,
 ) -> Result<(), KError> {
     let mut tmp = [0u8; DRAIN_MAX];
-    let found = input::read_or_park(|| reclaim(ps2), || {
-        let now = crate::arch::Timer::read_ns();
-        let mut g = ps2.lock();
-        let dev = &mut g.devices[index];
-        let found = dev.read_now(&mut tmp[..max_len], now);
-        if found == ReadNow::Empty {
-            dev.park(ParkedRead::new(po, buffer, buf_offset, max_len));
-        }
-        found
-    });
+    let found = input::read_or_park(
+        || reclaim(ps2),
+        || {
+            let now = crate::arch::Timer::read_ns();
+            let mut g = ps2.lock();
+            let dev = &mut g.devices[index];
+            let found = dev.read_now(&mut tmp[..max_len], now);
+            if found == ReadNow::Empty {
+                dev.park(ParkedRead::new(po, buffer, buf_offset, max_len));
+            }
+            found
+        },
+    );
     match found {
         Submitted::Drained(n) => input::deliver_now(buffer, po, buf_offset, &tmp[..n]),
         Submitted::Parked => {}
@@ -361,7 +364,9 @@ fn reclaim(ps2: &IrqSpinLock<Inner>) {
         }
         let waited = g.lights_unreported.is_some();
         g.report_lights();
-        if waited && g.lights_unreported.is_none() && g.lights.is_none()
+        if waited
+            && g.lights_unreported.is_none()
+            && g.lights.is_none()
             && let Some((po, lights)) = g.lights_next.take()
         {
             let now = crate::arch::Timer::read_ns();
@@ -468,13 +473,9 @@ fn drain_controller() -> bool {
                     if pressed && code == crate::libkern::input::KEY_F1 + 8 {
                         HOLD_UNTIL.store(now + HOLD_NS, Ordering::Relaxed);
                     }
-                    let value = if pressed {
-                        crate::libkern::input::KEY_PRESS
-                    } else {
-                        crate::libkern::input::KEY_RELEASE
-                    };
-                    let group =
-                        [InputEvent::key(code, value, now), InputEvent::syn(now)];
+                    let value =
+                        if pressed { crate::libkern::input::KEY_PRESS } else { crate::libkern::input::KEY_RELEASE };
+                    let group = [InputEvent::key(code, value, now), InputEvent::syn(now)];
                     g.devices[DEV_KEYBOARD].ring.push_group(&group);
                 }
             }
@@ -620,9 +621,8 @@ pub fn init() {
                 // the index is this driver's, and the table records it as the node's served
                 // index, which is also what `/dev/registry` reports (administration Part B).
                 // SAFETY: `into_raw` yields the single creation reference; the table adopts it.
-                let r = unsafe {
-                    ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode)
-                };
+                let r =
+                    unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
                 let kind = if index == DEV_KEYBOARD {
                     crate::libkern::device::DeviceKind::Keyboard
                 } else {

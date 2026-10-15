@@ -21,8 +21,8 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::libkern::{AllocError, IrqSpinLock, KVec};
 use crate::libkern::lockrank::LockRank;
+use crate::libkern::{AllocError, IrqSpinLock, KVec};
 
 /// Capacity of the DPC queue. Bounded by the number of distinct `Dpc` objects
 /// (each is queued at most once, via its `queued` flag), so a small fixed
@@ -51,11 +51,7 @@ unsafe impl Send for Dpc {}
 impl Dpc {
     /// A DPC that runs `handler(ctx)` when drained.
     pub const fn new(handler: fn(*mut ()), ctx: *mut ()) -> Self {
-        Self {
-            handler,
-            ctx,
-            queued: AtomicBool::new(false),
-        }
+        Self { handler, ctx, queued: AtomicBool::new(false) }
     }
 }
 

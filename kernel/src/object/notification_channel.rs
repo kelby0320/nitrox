@@ -149,11 +149,7 @@ impl NotificationChannel {
             inner.dropped = 0;
             return Some(Notification::notifications_dropped(count));
         }
-        if inner.queue.is_empty() {
-            None
-        } else {
-            Some(inner.queue.remove(0))
-        }
+        if inner.queue.is_empty() { None } else { Some(inner.queue.remove(0)) }
     }
 
     /// `true` iff a recv would return something (queue non-empty or a drop is
@@ -222,10 +218,7 @@ impl Drop for NotificationChannel {
     /// A live waiter pins this channel (each holds an `ObjectRef` on it across
     /// `sys_wait`), so the last reference cannot drop while waiters remain.
     fn drop(&mut self) {
-        debug_assert!(
-            self.inner.get_mut().waiters.is_empty(),
-            "NotificationChannel dropped with live waiters"
-        );
+        debug_assert!(self.inner.get_mut().waiters.is_empty(), "NotificationChannel dropped with live waiters");
     }
 }
 
@@ -244,9 +237,7 @@ mod tests {
     fn drop_chan(obj: *mut ()) {
         // SAFETY: single creation reference; reclaim it.
         drop(unsafe {
-            KBox::<NotificationChannel>::from_raw(core::ptr::NonNull::new_unchecked(
-                obj as *mut NotificationChannel,
-            ))
+            KBox::<NotificationChannel>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut NotificationChannel))
         });
     }
 
@@ -263,10 +254,14 @@ mod tests {
             assert!(!NotificationChannel::enqueue(obj, Notification::illegal_insn(2, 0x20)));
             assert!(NotificationChannel::already_signaled(obj));
             // FIFO order.
-            assert_eq!(NotificationChannel::try_recv(obj).unwrap().kind(),
-                crate::libkern::notification::KIND_DIVIDE_BY_ZERO);
-            assert_eq!(NotificationChannel::try_recv(obj).unwrap().kind(),
-                crate::libkern::notification::KIND_ILLEGAL_INSN);
+            assert_eq!(
+                NotificationChannel::try_recv(obj).unwrap().kind(),
+                crate::libkern::notification::KIND_DIVIDE_BY_ZERO
+            );
+            assert_eq!(
+                NotificationChannel::try_recv(obj).unwrap().kind(),
+                crate::libkern::notification::KIND_ILLEGAL_INSN
+            );
             assert!(NotificationChannel::try_recv(obj).is_none());
         }
         drop_chan(obj);
@@ -352,8 +347,7 @@ mod tests {
         let obj = new_chan();
         // SAFETY: live channel, single-threaded test.
         unsafe {
-            let ths: [*mut (); NotificationChannel::MAX_WAITERS] =
-                core::array::from_fn(|i| (0x1000 + i) as *mut ());
+            let ths: [*mut (); NotificationChannel::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
             for &t in &ths {
                 assert!(NotificationChannel::add_waiter(obj, t).is_ok());
             }

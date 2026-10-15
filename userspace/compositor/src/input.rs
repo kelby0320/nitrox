@@ -24,13 +24,13 @@ use alloc::vec::Vec;
 use libdraw::geom::{Point, Rect};
 use libinput::Logical;
 use librsproto::surface::{
-    KeyEvent, MAX_HOTKEYS, MAX_SNAP_ZONES, MgrHotkey, MgrSnapZone, POINTER_BUTTON, POINTER_ENTER,
-    POINTER_LEAVE, POINTER_MOTION, POINTER_PRESSED, POINTER_WHEEL, PointerEvent, RESIZE_BOTTOM,
-    RESIZE_LEFT, RESIZE_RIGHT, RESIZE_TOP, StartResize,
+    KeyEvent, MAX_HOTKEYS, MAX_SNAP_ZONES, MgrHotkey, MgrSnapZone, POINTER_BUTTON, POINTER_ENTER, POINTER_LEAVE,
+    POINTER_MOTION, POINTER_PRESSED, POINTER_WHEEL, PointerEvent, RESIZE_BOTTOM, RESIZE_LEFT, RESIZE_RIGHT, RESIZE_TOP,
+    StartResize,
 };
 
-use crate::{Damage, StackError, WindowStack};
 use crate::outbox::Outbound;
+use crate::{Damage, StackError, WindowStack};
 
 /// What routing one event did, beyond what it put in `out`.
 ///
@@ -323,10 +323,8 @@ impl InputRouter {
     /// The centre rather than the origin because `(0, 0)` is a corner a panel usually
     /// occupies, and starting inside a window would owe an enter event nobody sent.
     pub fn new(screen: Rect) -> Self {
-        let pointer = Point::new(
-            screen.origin.x + (screen.size.w / 2) as i32,
-            screen.origin.y + (screen.size.h / 2) as i32,
-        );
+        let pointer =
+            Point::new(screen.origin.x + (screen.size.w / 2) as i32, screen.origin.y + (screen.size.h / 2) as i32);
         Self {
             pointer,
             screen,
@@ -392,12 +390,7 @@ impl InputRouter {
     ///
     /// The [`Routed`] it returns names the region a restack disturbed — a press raises the window
     /// it lands on, and the caller has to recompose exactly that much when it does.
-    pub fn route(
-        &mut self,
-        ev: &Logical,
-        stack: &mut WindowStack,
-        out: &mut Vec<Outbound>,
-    ) -> Routed {
+    pub fn route(&mut self, ev: &Logical, stack: &mut WindowStack, out: &mut Vec<Outbound>) -> Routed {
         // Mirror the interpreter's state before anything is emitted. Enter and leave are
         // generated *by* the router rather than arriving as events, so they have no state of
         // their own to read; taking it from the event that provoked them is what lets every
@@ -616,13 +609,7 @@ impl InputRouter {
                     self.grab_broken = false;
                     self.update_crossing(stack, out);
                 }
-                Routed {
-                    restacked,
-                    resized: ended,
-                    outline: outline_gone,
-                    dismissed,
-                    ..Routed::default()
-                }
+                Routed { restacked, resized: ended, outline: outline_gone, dismissed, ..Routed::default() }
             }
 
             // **The wheel goes where the pointer is**, like every other pointer record and
@@ -790,11 +777,7 @@ impl InputRouter {
     /// already running (PR #248 review, blocking 1).
     ///
     /// Returns the region the catch-up disturbed, which the caller must repaint.
-    pub fn start_move(
-        &mut self,
-        window: u32,
-        stack: &mut WindowStack,
-    ) -> Result<Option<Rect>, StackError> {
+    pub fn start_move(&mut self, window: u32, stack: &mut WindowStack) -> Result<Option<Rect>, StackError> {
         if self.grab != Some(window) || self.resize.is_some() || self.carrying.is_some() {
             return Err(StackError::NoSuchWindow);
         }
@@ -912,10 +895,7 @@ impl InputRouter {
         // **The source window is skipped.** A drag out of a window that also accepts drops would
         // otherwise highlight itself the instant it began, which is a gesture nobody is making —
         // and dropping a thing back where it came from is the definition of a no-op.
-        let found = self
-            .hit(stack)
-            .filter(|&w| w != c.window)
-            .filter(|&w| stack.acceptor_for(w, c.kind).is_some());
+        let found = self.hit(stack).filter(|&w| w != c.window).filter(|&w| stack.acceptor_for(w, c.kind).is_some());
         if found == self.over {
             return None;
         }
@@ -934,11 +914,7 @@ impl InputRouter {
     /// was a guess is a file opened by a window nobody dropped it on.
     ///
     /// Returns the event to deliver (if any) and the highlight to take down.
-    fn stop_carrying(
-        &mut self,
-        stack: &WindowStack,
-        finished: bool,
-    ) -> (Option<Outbound>, Option<Outline>) {
+    fn stop_carrying(&mut self, stack: &WindowStack, finished: bool) -> (Option<Outbound>, Option<Outline>) {
         let Some(c) = self.carrying.take() else { return (None, None) };
         let target = self.over.take();
         let gone = self.outline.take().map(|was| Outline { was: Some(was), now: None });
@@ -1059,11 +1035,7 @@ impl InputRouter {
     /// the button. `Logical::Dropped` is the clearest case: it means events were lost upstream
     /// and the pointer position is a guess, which is exactly the state not to derive a new
     /// window rectangle from (PR #253 review, finding 5).
-    fn stop_resize(
-        &mut self,
-        stack: &mut WindowStack,
-        finished: bool,
-    ) -> (Option<(u32, Rect)>, Option<Outline>) {
+    fn stop_resize(&mut self, stack: &mut WindowStack, finished: bool) -> (Option<(u32, Rect)>, Option<Outline>) {
         // **Read before the state is taken**, because that is what it is derived from.
         let Some(r) = self.resize else { return (None, None) };
         let final_rect = self.outline_now();
@@ -1083,11 +1055,8 @@ impl InputRouter {
         // And the rectangle actually changed. A gesture that ended where it started is an
         // ordinary click on the grip: the manager's queue does not coalesce, and a `Configure`
         // to the size a window already has is a round trip through the client for no change.
-        let on_screen = stack
-            .window(r.window)
-            .is_some_and(|w| w.visible_on(stack.current_desktop()));
-        let rect =
-            (finished && final_rect != r.rect && on_screen).then_some((r.window, final_rect));
+        let on_screen = stack.window(r.window).is_some_and(|w| w.visible_on(stack.current_desktop()));
+        let rect = (finished && final_rect != r.rect && on_screen).then_some((r.window, final_rect));
         (rect, gone)
     }
 
@@ -1099,11 +1068,7 @@ impl InputRouter {
     /// what it was derived from is the defect those two arms already exist to prevent. Left
     /// behind, the window went on following a pointer with nothing held, and every `Place`
     /// naming it was refused until the next click (PR #248 review, blocking 2).
-    fn stop_drag(
-        &mut self,
-        stack: &mut WindowStack,
-        finished: bool,
-    ) -> (Option<(u32, Rect)>, Option<Outline>) {
+    fn stop_drag(&mut self, stack: &mut WindowStack, finished: bool) -> (Option<(u32, Rect)>, Option<Outline>) {
         let Some(d) = self.drag.take() else { return (None, None) };
         stack.end_drag();
         // **The zone the drag ended in, if it ended in one and the user ended it** (M9 Part F).
@@ -1129,10 +1094,7 @@ impl InputRouter {
     /// the button still down is ordinary, not an error.
     fn drag_to_pointer(&mut self, stack: &mut WindowStack) -> Option<Rect> {
         let d = self.drag?;
-        let origin = Point::new(
-            d.origin.x + (self.pointer.x - d.from.x),
-            d.origin.y + (self.pointer.y - d.from.y),
-        );
+        let origin = Point::new(d.origin.x + (self.pointer.x - d.from.x), d.origin.y + (self.pointer.y - d.from.y));
         match stack.drag_to(d.window, origin) {
             Ok(damage) => Some(damage.rect()),
             Err(_) => {
@@ -1195,8 +1157,7 @@ impl InputRouter {
             // optional 5).
             if self.in_zone == Some(z.id) {
                 let was = self.outline;
-                self.outline =
-                    Some(Rect::new(z.target_x, z.target_y, z.target_w, z.target_h));
+                self.outline = Some(Rect::new(z.target_x, z.target_y, z.target_w, z.target_h));
                 return Ok(Some(Outline { was, now: self.outline }));
             }
             return Ok(None);
@@ -1229,9 +1190,10 @@ impl InputRouter {
     /// table, and a compositor arbitrating between two of its rectangles would be making the
     /// policy this design keeps out of here.
     fn zone_at(&self, at: Point) -> Option<MgrSnapZone> {
-        self.zones.iter().copied().find(|z| {
-            Rect::new(z.trigger_x, z.trigger_y, z.trigger_w, z.trigger_h).contains(at.x, at.y)
-        })
+        self.zones
+            .iter()
+            .copied()
+            .find(|z| Rect::new(z.trigger_x, z.trigger_y, z.trigger_w, z.trigger_h).contains(at.x, at.y))
     }
 
     /// Take the chords matched since this was last called.
@@ -1264,8 +1226,7 @@ impl InputRouter {
         if self.held.contains(&keycode) {
             return false;
         }
-        let Some(hk) = self.hotkeys.iter().find(|h| h.code == keycode && h.mods == modifiers)
-        else {
+        let Some(hk) = self.hotkeys.iter().find(|h| h.code == keycode && h.mods == modifiers) else {
             if !self.held.contains(&keycode) {
                 self.held.push(keycode);
             }
@@ -1308,10 +1269,7 @@ impl InputRouter {
             // finding 3). Since M8 Part A the same is true of a minimized window and of one on
             // another desktop, and all three clauses are `visible_on` so that this and
             // `compose_into` cannot answer differently.
-            .find(|w| {
-                w.visible_on(stack.current_desktop())
-                    && w.bounds().contains(self.pointer.x, self.pointer.y)
-            })
+            .find(|w| w.visible_on(stack.current_desktop()) && w.bounds().contains(self.pointer.x, self.pointer.y))
             .map(|w| w.id)
     }
 
@@ -1353,15 +1311,7 @@ impl InputRouter {
     }
 
     /// Build one pointer record with the cursor in `window`'s coordinates.
-    fn emit(
-        &self,
-        window: u32,
-        kind: u16,
-        button: u16,
-        flags: u16,
-        stack: &WindowStack,
-        out: &mut Vec<Outbound>,
-    ) {
+    fn emit(&self, window: u32, kind: u16, button: u16, flags: u16, stack: &WindowStack, out: &mut Vec<Outbound>) {
         if let Some(event) = self.record(window, kind, button, flags, stack) {
             out.push(Outbound::Pointer { event });
         }
@@ -1385,14 +1335,7 @@ impl InputRouter {
     }
 
     /// One pointer record for `window`, or `None` if the window is not in the stack.
-    fn record(
-        &self,
-        window: u32,
-        kind: u16,
-        button: u16,
-        flags: u16,
-        stack: &WindowStack,
-    ) -> Option<PointerEvent> {
+    fn record(&self, window: u32, kind: u16, button: u16, flags: u16, stack: &WindowStack) -> Option<PointerEvent> {
         let w = stack.window(window)?;
         let origin = w.bounds().origin;
         Some(PointerEvent::new(
@@ -1420,8 +1363,8 @@ impl InputRouter {
 mod tests {
     use super::*;
     use librsproto::surface::{
-        AttachBufferRequest, CommitRequest, CreateWindowRequest, DROP_KIND_DIR, DROP_KIND_FILE,
-        Edge, MOD_SHIFT, Role, SURFACE_FORMAT_XRGB8888,
+        AttachBufferRequest, CommitRequest, CreateWindowRequest, DROP_KIND_DIR, DROP_KIND_FILE, Edge, MOD_SHIFT, Role,
+        SURFACE_FORMAT_XRGB8888,
     };
 
     const SCREEN: Rect = Rect::new(0, 0, 640, 480);
@@ -1434,9 +1377,7 @@ mod tests {
     /// not: a held window occupies its rectangle in the stack but is not drawn, and routing a
     /// click or a keystroke to it would send input somewhere nobody can see.
     fn win(stack: &mut WindowStack, role: Role, x: i32, y: i32, w: u32, h: u32) -> u32 {
-        let id = stack
-            .create(&CreateWindowRequest::new(w, h, role))
-            .expect("create");
+        let id = stack.create(&CreateWindowRequest::new(w, h, role)).expect("create");
         stack.mark_configured(id);
         // Damage ignored: this helper positions a window for a routing test, and nothing
         // in these tests paints.
@@ -1452,14 +1393,7 @@ mod tests {
             })
             .expect("attach");
         stack
-            .commit(&CommitRequest {
-                window: id,
-                buffer: 1,
-                damage_x: 0,
-                damage_y: 0,
-                damage_w: w,
-                damage_h: h,
-            })
+            .commit(&CommitRequest { window: id, buffer: 1, damage_x: 0, damage_y: 0, damage_w: w, damage_h: h })
             .expect("commit");
         id
     }
@@ -1521,13 +1455,7 @@ mod tests {
     }
 
     /// Press inside `src`, ask to carry `kind`, and drag to `(x, y)`.
-    fn begin_drag(
-        r: &mut InputRouter,
-        s: &mut WindowStack,
-        src: u32,
-        kind: u32,
-        to: (i32, i32),
-    ) -> Option<Outline> {
+    fn begin_drag(r: &mut InputRouter, s: &mut WindowStack, src: u32, kind: u32, to: (i32, i32)) -> Option<Outline> {
         warp(r, s, 20, 20);
         go(r, s, button(true));
         let started = r.start_drag(src, kind, "/home/a.txt", "a.txt", s).expect("the grab is held");
@@ -1549,20 +1477,17 @@ mod tests {
         let mut r = InputRouter::new(SCREEN);
 
         begin_drag(&mut r, &mut s, src, DROP_KIND_FILE, (450, 60));
-        assert_eq!(
-            r.outline(),
-            Some(Rect::new(400, 0, 200, 200)),
-            "the window that would take it is outlined"
-        );
+        assert_eq!(r.outline(), Some(Rect::new(400, 0, 200, 200)), "the window that would take it is outlined");
 
         let out = go(&mut r, &mut s, button(false));
-        let Some(Outbound::Dropped { window, acceptor, kind, path, name, x, y }) = drop_of(&out)
-        else {
+        let Some(Outbound::Dropped { window, acceptor, kind, path, name, x, y }) = drop_of(&out) else {
             panic!("no drop was delivered: {out:?}");
         };
         assert_eq!(*window, dst);
-        assert_eq!((acceptor.as_str(), kind, path.as_str(), name.as_str()),
-            ("document", &DROP_KIND_FILE, "/home/a.txt", "a.txt"));
+        assert_eq!(
+            (acceptor.as_str(), kind, path.as_str(), name.as_str()),
+            ("document", &DROP_KIND_FILE, "/home/a.txt", "a.txt")
+        );
         // **Window-local, like a press's**, which is what lets the client route it to a widget.
         assert_eq!((*x, *y), (50, 60), "the pointer, relative to the window it landed on");
         assert_eq!(r.outline(), None, "and the highlight goes with the gesture");
@@ -1912,20 +1837,11 @@ mod tests {
         for i in 2..=MAX_HOTKEYS as u32 {
             r.register_hotkey(MgrHotkey { id: i, mods: 0, code: i as u16 }).unwrap();
         }
-        assert_eq!(
-            r.register_hotkey(MgrHotkey { id: 99, mods: 0, code: 99 }),
-            Err(HotkeyError::TableFull)
-        );
+        assert_eq!(r.register_hotkey(MgrHotkey { id: 99, mods: 0, code: 99 }), Err(HotkeyError::TableFull));
     }
 
     fn button(pressed: bool) -> Logical {
-        Logical::Button {
-            button: BTN_LEFT,
-            pressed,
-            buttons: if pressed { 1 } else { 0 },
-            modifiers: 0,
-            time_ns: T,
-        }
+        Logical::Button { button: BTN_LEFT, pressed, buttons: if pressed { 1 } else { 0 }, modifiers: 0, time_ns: T }
     }
 
     #[test]
@@ -1973,9 +1889,7 @@ mod tests {
         let visible = win(&mut s, Role::Normal, 0, 0, 200, 200);
         // Created *over* the visible one and never configured — a launch in progress. Built
         // with `create` rather than `win`, precisely because `win` configures.
-        let held = s
-            .create(&CreateWindowRequest::new(200, 200, Role::Normal))
-            .expect("create");
+        let held = s.create(&CreateWindowRequest::new(200, 200, Role::Normal)).expect("create");
         // No commit needed: `bounds()` falls back to the requested size, which is exactly the
         // rectangle a held window occupies in the stack and the reason it could be clicked.
 
@@ -2149,10 +2063,14 @@ mod tests {
         s.set_minimized(over, true).unwrap();
         let out = go(&mut r, &mut s, motion(1, 1));
 
-        let leave = out.iter().any(|o| matches!(
-            o, Outbound::Pointer { event } if event.window == over && event.kind == POINTER_LEAVE));
-        let enter = out.iter().any(|o| matches!(
-            o, Outbound::Pointer { event } if event.window == under && event.kind == POINTER_ENTER));
+        let leave = out.iter().any(|o| {
+            matches!(
+            o, Outbound::Pointer { event } if event.window == over && event.kind == POINTER_LEAVE)
+        });
+        let enter = out.iter().any(|o| {
+            matches!(
+            o, Outbound::Pointer { event } if event.window == under && event.kind == POINTER_ENTER)
+        });
         assert!(leave, "the window that lost the cursor is owed a leave");
         assert!(enter, "and the one that gained it an enter");
     }
@@ -2211,13 +2129,7 @@ mod tests {
         go(
             &mut r,
             &mut s,
-            Logical::Button {
-                button: BTN_LEFT,
-                pressed: true,
-                buttons: 1,
-                modifiers: MOD_SHIFT,
-                time_ns: T,
-            },
+            Logical::Button { button: BTN_LEFT, pressed: true, buttons: 1, modifiers: MOD_SHIFT, time_ns: T },
         );
 
         s.set_minimized(w, true).unwrap();
@@ -2225,13 +2137,7 @@ mod tests {
         let out = go(
             &mut r,
             &mut s,
-            Logical::Button {
-                button: BTN_LEFT,
-                pressed: false,
-                buttons: 0,
-                modifiers: 0,
-                time_ns: T,
-            },
+            Logical::Button { button: BTN_LEFT, pressed: false, buttons: 0, modifiers: 0, time_ns: T },
         );
         for o in &out {
             let Outbound::Pointer { event } = o else { continue };
@@ -2316,11 +2222,7 @@ mod tests {
             want.origin.x < 0 && want.size.w > 100,
             "the premise: a raised window's damage includes its shadow, got {want:?}"
         );
-        assert_eq!(
-            routed.restacked,
-            Some(want),
-            "the caller must recompose, and only where the raised window is"
-        );
+        assert_eq!(routed.restacked, Some(want), "the caller must recompose, and only where the raised window is");
         assert_eq!(s.focus_candidate(), Some(lower), "the raise *is* the focus change");
 
         // **And the second click on the same window recomposes nothing.** Click-to-focus
@@ -2378,11 +2280,7 @@ mod tests {
         let after_first = s.window(w).expect("there").origin;
 
         r.start_move(w, &mut s).expect("still grabbed");
-        assert_eq!(
-            s.window(w).expect("there").origin,
-            after_first,
-            "the second request moved the window again"
-        );
+        assert_eq!(s.window(w).expect("there").origin, after_first, "the second request moved the window again");
     }
 
     #[test]
@@ -2672,15 +2570,8 @@ mod tests {
                 s.set_minimized(w, true).expect("put away mid-drag");
                 go_routed(&mut r, &mut s, key(30, true))
             };
-            assert!(
-                routed.resized.is_none(),
-                "loss={interrupted_by_loss}: an unfinished drag asked for a snap"
-            );
-            assert_eq!(
-                routed.outline.expect("the preview is taken down").now,
-                None,
-                "loss={interrupted_by_loss}"
-            );
+            assert!(routed.resized.is_none(), "loss={interrupted_by_loss}: an unfinished drag asked for a snap");
+            assert_eq!(routed.outline.expect("the preview is taken down").now, None, "loss={interrupted_by_loss}");
         }
     }
 
@@ -2756,11 +2647,7 @@ mod tests {
         // Opposite edges together is no gesture — nobody drags a window's left and right at
         // once — and neither is naming none, which would hold a grab and change nothing.
         for edges in [0, RESIZE_LEFT | RESIZE_RIGHT, RESIZE_TOP | RESIZE_BOTTOM, 1 << 9] {
-            assert_eq!(
-                r.start_resize(b, edges, &mut s),
-                Err(StackError::BadGeometry),
-                "edges {edges:#x}"
-            );
+            assert_eq!(r.start_resize(b, edges, &mut s), Err(StackError::BadGeometry), "edges {edges:#x}");
         }
         assert!(r.start_resize(b, RESIZE_RIGHT | RESIZE_BOTTOM, &mut s).is_ok());
     }
@@ -3105,25 +2992,17 @@ mod tests {
         let mut r = InputRouter::new(SCREEN);
         warp(&mut r, &mut s, 50, 50);
 
-        let out = go(&mut r, &mut s, Logical::Button {
-            button: BTN_LEFT,
-            pressed: true,
-            buttons: 1,
-            modifiers: MOD_SHIFT,
-            time_ns: T,
-        });
+        let out = go(
+            &mut r,
+            &mut s,
+            Logical::Button { button: BTN_LEFT, pressed: true, buttons: 1, modifiers: MOD_SHIFT, time_ns: T },
+        );
         for o in &out {
             let Outbound::Pointer { event, .. } = o else { unreachable!() };
             assert_eq!((event.buttons, event.modifiers), (1, MOD_SHIFT), "kind {}", event.kind);
         }
 
-        let out = go(&mut r, &mut s, Logical::Motion {
-            dx: 200,
-            dy: 0,
-            buttons: 1,
-            modifiers: MOD_SHIFT,
-            time_ns: T,
-        });
+        let out = go(&mut r, &mut s, Logical::Motion { dx: 200, dy: 0, buttons: 1, modifiers: MOD_SHIFT, time_ns: T });
         let Outbound::Pointer { event, .. } = out
             .iter()
             .find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION))
@@ -3132,20 +3011,14 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!(
-            (event.buttons, event.modifiers),
-            (1, MOD_SHIFT),
-            "a shift-drag is expressible from one record"
-        );
+        assert_eq!((event.buttons, event.modifiers), (1, MOD_SHIFT), "a shift-drag is expressible from one record");
 
         // And the release's crossing into `b`, which the router synthesises, agrees.
-        let out = go(&mut r, &mut s, Logical::Button {
-            button: BTN_LEFT,
-            pressed: false,
-            buttons: 0,
-            modifiers: MOD_SHIFT,
-            time_ns: T,
-        });
+        let out = go(
+            &mut r,
+            &mut s,
+            Logical::Button { button: BTN_LEFT, pressed: false, buttons: 0, modifiers: MOD_SHIFT, time_ns: T },
+        );
         let entered = out
             .iter()
             .find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_ENTER))
@@ -3185,8 +3058,11 @@ mod tests {
         warp(&mut r, &mut s, 250, 130);
 
         let out = go(&mut r, &mut s, motion(5, 5));
-        let Outbound::Pointer { event } =
-            out.iter().find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION)).cloned().expect("a motion")
+        let Outbound::Pointer { event } = out
+            .iter()
+            .find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION))
+            .cloned()
+            .expect("a motion")
         else {
             unreachable!()
         };
@@ -3211,10 +3087,7 @@ mod tests {
             s.window(b).expect("b").bounds().contains(r.pointer().x, r.pointer().y),
             "the cursor really did reach b — so the grab is what redirects, not geometry"
         );
-        assert!(
-            moved.iter().all(|o| o.window() == a),
-            "everything mid-drag still goes to the grab holder"
-        );
+        assert!(moved.iter().all(|o| o.window() == a), "everything mid-drag still goes to the grab holder");
 
         let out = go(&mut r, &mut s, button(false));
         let released = out
@@ -3265,9 +3138,7 @@ mod tests {
         let crossings: Vec<_> = out
             .iter()
             .filter_map(|o| match o {
-                Outbound::Pointer { event }
-                    if event.kind == POINTER_LEAVE || event.kind == POINTER_ENTER =>
-                {
+                Outbound::Pointer { event } if event.kind == POINTER_LEAVE || event.kind == POINTER_ENTER => {
                     Some((event.window, event.kind))
                 }
                 _ => None,
@@ -3438,12 +3309,7 @@ mod tests {
         let mut r = InputRouter::new(SCREEN);
         warp(&mut r, &mut s, 50, 50);
 
-        let out = go(&mut r, &mut s, Logical::Wheel {
-            dz: 1,
-            buttons: 0,
-            modifiers: MOD_SHIFT,
-            time_ns: T,
-        });
+        let out = go(&mut r, &mut s, Logical::Wheel { dz: 1, buttons: 0, modifiers: MOD_SHIFT, time_ns: T });
         let Outbound::Pointer { event } = &out[0] else { panic!("a pointer record") };
         assert_eq!(event.modifiers, MOD_SHIFT);
         assert_eq!(event.time_ms, T_MS);

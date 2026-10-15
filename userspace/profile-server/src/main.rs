@@ -25,12 +25,10 @@ use alloc::vec::Vec;
 
 use libkern::*;
 use librsproto::error::error_body;
-use librsproto::namespace::{
-    OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, parse_resolve_request, resolve_reply,
-};
-use profile_server::projection::split_suffix;
+use librsproto::namespace::{OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, parse_resolve_request, resolve_reply};
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use profile_server::manifest::{self, Package};
+use profile_server::projection::split_suffix;
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -83,10 +81,8 @@ static mut SESSION_DIR: [&str; MAX_SESSIONS] = ["bin"; MAX_SESSIONS];
 /// The projection the resolve currently being answered asked for, handed to
 /// [`open_dir_session`] a few lines later in the same loop iteration.
 static mut PENDING_DIR: &str = "bin";
-static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
-    [0; libkern::abi::MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
-    [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 
@@ -117,31 +113,27 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     let waited = unsafe {
         WAIT_HANDLES[0] = po as u64;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // IoResult: status @8..12, resolved handle @16..24.
     let (status, handle) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                WAIT_RESULTS[16],
+                WAIT_RESULTS[17],
+                WAIT_RESULTS[18],
+                WAIT_RESULTS[19],
+                WAIT_RESULTS[20],
+                WAIT_RESULTS[21],
+                WAIT_RESULTS[22],
+                WAIT_RESULTS[23],
             ]),
         )
     };
     // SAFETY: closing our own PO handle (the resolved handle is separate).
     unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-    if waited != 1 || status != 0 {
-        0
-    } else {
-        handle
-    }
+    if waited != 1 || status != 0 { 0 } else { handle }
 }
 
 /// Read + parse the system profile manifest, **from the root filesystem** at
@@ -165,9 +157,7 @@ fn read_manifest(root_ns: u64) -> Vec<Package> {
     // SAFETY: `addr` is a MAP_READ page holding the manifest bytes + zero padding.
     let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
     let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    let packages = core::str::from_utf8(&bytes[..len])
-        .map(manifest::parse)
-        .unwrap_or_default();
+    let packages = core::str::from_utf8(&bytes[..len]).map(manifest::parse).unwrap_or_default();
     // SAFETY: closing our own handle (the mapping persists via its own reference).
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
     packages
@@ -178,9 +168,7 @@ fn read_manifest(root_ns: u64) -> Vec<Package> {
 /// serves on `serve_end`. `None` on failure.
 fn make_channel() -> Option<(u64, u64)> {
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 4, 0) };
     if cr != 0 {
         return None;
     }
@@ -311,7 +299,6 @@ fn index(root_ns: u64, packages: &[Package], dir: &str) -> &'static [Entry] {
     }
 }
 
-
 /// Resolve `suffix` (e.g. `heartbeat`) to its store `FileObject` handle (requested rights
 /// + `TRANSFER`, so it can be re-exported). `0` if the profile provides no such program.
 ///
@@ -365,14 +352,7 @@ fn reply_dir_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     // SAFETY: REPLY_MSG is a valid buffer; the reply goes at PAYLOAD_OFF and the
     // transferred handle in REPLY_HANDLES[0].
     unsafe {
-        let rs_len = match encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            OP_NS_RESOLVE,
-            request_id,
-            RS_FLAG_REPLY,
-            &body,
-            1,
-        ) {
+        let rs_len = match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
             Some(n) => n,
             None => return false,
         };
@@ -471,8 +451,7 @@ fn serve_session(root_ns: u64, packages: &[Package], session_ch: u64) {
         }
         // SAFETY: bounded read-only slice over the just-received message.
         let (op, request_id, cursor, ok) = unsafe {
-            let payload_len =
-                u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             let req = core::slice::from_raw_parts(
                 ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
                 payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -561,14 +540,7 @@ fn reply_error(serve_end: u64, request_id: u64, op: u16, kerror: i32) {
     let elen = error_body(&mut ebody, kerror, 0, b"").unwrap_or(0);
     // SAFETY: REPLY_MSG is a valid buffer.
     let rs_len = unsafe {
-        match encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            op,
-            request_id,
-            RS_FLAG_REPLY | RS_FLAG_ERROR,
-            &ebody[..elen],
-            0,
-        ) {
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &ebody[..elen], 0) {
             Some(n) => n,
             None => return,
         }
@@ -625,9 +597,14 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
             // SAFETY: `waited` records were written; `off + 8` stays inside WAIT_RESULTS.
             let h = unsafe {
                 u64::from_le_bytes([
-                    WAIT_RESULTS[off], WAIT_RESULTS[off + 1], WAIT_RESULTS[off + 2],
-                    WAIT_RESULTS[off + 3], WAIT_RESULTS[off + 4], WAIT_RESULTS[off + 5],
-                    WAIT_RESULTS[off + 6], WAIT_RESULTS[off + 7],
+                    WAIT_RESULTS[off],
+                    WAIT_RESULTS[off + 1],
+                    WAIT_RESULTS[off + 2],
+                    WAIT_RESULTS[off + 3],
+                    WAIT_RESULTS[off + 4],
+                    WAIT_RESULTS[off + 5],
+                    WAIT_RESULTS[off + 6],
+                    WAIT_RESULTS[off + 7],
                 ])
             };
             if h == serve_end {
@@ -656,8 +633,7 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
         // Decode the rsproto request from the IpcMsg payload (offset 24, `payload_len`).
         // SAFETY: read the header length + form a bounded read-only slice over RECV_MSG.
         let (op, request_id, handle, ok) = unsafe {
-            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]])
-                as usize;
+            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             let req = core::slice::from_raw_parts(
                 ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
                 payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -676,10 +652,7 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
                             .is_some_and(|(_, name)| name.is_empty()) =>
                     {
                         // Remember which view this session will list.
-                        let d = core::str::from_utf8(r.suffix)
-                            .ok()
-                            .and_then(split_suffix)
-                            .map_or("bin", |(d, _)| d);
+                        let d = core::str::from_utf8(r.suffix).ok().and_then(split_suffix).map_or("bin", |(d, _)| d);
                         // Already inside this block's `unsafe`; single-threaded, read back by
                         // `open_dir_session` a few lines below.
                         PENDING_DIR = d;

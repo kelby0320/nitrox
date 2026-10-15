@@ -34,13 +34,11 @@ use alloc::vec::Vec;
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::Geometry;
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, OP_ATTACH_BUFFER,
-    OP_COMMIT, OP_CONFIGURE,
-    FocusEvent, KeyEvent, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_FOCUS_EVENT, OP_KEY_EVENT,
-    OP_POINTER_EVENT, OP_RELEASE, PointerEvent, Role, SURFACE_FORMAT_ARGB8888,
-    SURFACE_FORMAT_XRGB8888,
-    build_attach_buffer_request, build_commit_request, build_create_window_request,
-    build_destroy_window_request, parse_create_window_reply, parse_release_event,
+    AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, FocusEvent, KeyEvent, OP_ATTACH_BUFFER,
+    OP_COMMIT, OP_CONFIGURE, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_FOCUS_EVENT, OP_KEY_EVENT, OP_POINTER_EVENT,
+    OP_RELEASE, PointerEvent, Role, SURFACE_FORMAT_ARGB8888, SURFACE_FORMAT_XRGB8888, build_attach_buffer_request,
+    build_commit_request, build_create_window_request, build_destroy_window_request, parse_create_window_reply,
+    parse_release_event,
 };
 
 pub mod buffers;
@@ -361,21 +359,14 @@ impl<T: Transport> Session<T> {
     /// **Records that arrive for other windows while it blocks are routed to them**, not lost.
     /// The old one-window-per-connection API could not do that, and it is the reason a client
     /// may now open a menu without stalling the window underneath it.
-    pub fn create(
-        &mut self,
-        req: &CreateWindowRequest,
-        buffers: usize,
-    ) -> Result<u32, UiError> {
+    pub fn create(&mut self, req: &CreateWindowRequest, buffers: usize) -> Result<u32, UiError> {
         if buffers < 2 {
             return Err(UiError::TooFewBuffers);
         }
         let mut body = [0u8; 32];
         let n = build_create_window_request(&mut body, req).ok_or(UiError::Malformed)?;
         let mut reply = [0u8; 32];
-        let len = self
-            .transport
-            .request(OP_CREATE_WINDOW, &body[..n], None, &mut reply)?
-            .ok_or(UiError::BadReply)?;
+        let len = self.transport.request(OP_CREATE_WINDOW, &body[..n], None, &mut reply)?.ok_or(UiError::BadReply)?;
         let id = parse_create_window_reply(&reply[..len]).ok_or(UiError::BadReply)?;
         self.windows.push(WindowState {
             id,
@@ -562,8 +553,7 @@ impl<T: Transport> Session<T> {
                 }
             }
             librsproto::surface::OP_DROPPED => {
-                if let Some((e, acceptor, path, name)) =
-                    librsproto::surface::DroppedEvent::read(body)
+                if let Some((e, acceptor, path, name)) = librsproto::surface::DroppedEvent::read(body)
                     && let Some(i) = self.idx(e.window)
                 {
                     self.enqueue(
@@ -602,15 +592,7 @@ impl<T: Transport> Session<T> {
                     // application event; only later ones are. A client that saw the first as an
                     // event would act on a size it has not yet committed anything at.
                     if self.windows[i].mapped {
-                        self.enqueue(
-                            i,
-                            WindowEvent::Configure {
-                                width: e.width,
-                                height: e.height,
-                                x: e.x,
-                                y: e.y,
-                            },
-                        );
+                        self.enqueue(i, WindowEvent::Configure { width: e.width, height: e.height, x: e.x, y: e.y });
                     }
                     self.windows[i].mapped = true;
                 }
@@ -679,14 +661,7 @@ impl<T: Transport> WindowRef<'_, T> {
     /// The compositor refuses this for the buffer it is currently displaying, so a caller
     /// replaces a **free** buffer — [`BufferPool`](crate::buffers::BufferPool) is the piece
     /// that gets that sequence right.
-    pub fn attach(
-        &mut self,
-        buffer_id: u32,
-        width: u32,
-        height: u32,
-        pitch: u32,
-        handle: u64,
-    ) -> Result<(), UiError> {
+    pub fn attach(&mut self, buffer_id: u32, width: u32, height: u32, pitch: u32, handle: u64) -> Result<(), UiError> {
         self.attach_with_format(buffer_id, width, height, pitch, handle, PixelFormat::XRGB8888)
     }
 
@@ -731,19 +706,11 @@ impl<T: Transport> WindowRef<'_, T> {
         } else {
             return Err(UiError::UnsupportedFormat);
         };
-        let geometry =
-            Geometry::with_pitch(width, height, pitch as usize, format).ok_or(UiError::Malformed)?;
+        let geometry = Geometry::with_pitch(width, height, pitch as usize, format).ok_or(UiError::Malformed)?;
         let mut body = [0u8; 32];
         let n = build_attach_buffer_request(
             &mut body,
-            &AttachBufferRequest {
-                window: self.id(),
-                buffer: buffer_id,
-                width,
-                height,
-                pitch,
-                format: tag,
-            },
+            &AttachBufferRequest { window: self.id(), buffer: buffer_id, width, height, pitch, format: tag },
         )
         .ok_or(UiError::Malformed)?;
         self.session.transport.request(OP_ATTACH_BUFFER, &body[..n], Some(handle), &mut [])?;
@@ -751,9 +718,7 @@ impl<T: Transport> WindowRef<'_, T> {
         // compositor's rather than growing by one per resize.
         match self.state_mut().buffers.iter_mut().find(|b| b.id == buffer_id) {
             Some(b) => b.geometry = geometry,
-            None => {
-                self.state_mut().buffers.push(ClientBuffer { id: buffer_id, geometry, busy: false })
-            }
+            None => self.state_mut().buffers.push(ClientBuffer { id: buffer_id, geometry, busy: false }),
         }
         Ok(())
     }
@@ -799,11 +764,7 @@ impl<T: Transport> WindowRef<'_, T> {
     }
 
     /// Commit `buffer_id` with a damage rectangle, marking it busy.
-    pub fn commit(
-        &mut self,
-        buffer_id: u32,
-        damage: (u32, u32, u32, u32),
-    ) -> Result<(), UiError> {
+    pub fn commit(&mut self, buffer_id: u32, damage: (u32, u32, u32, u32)) -> Result<(), UiError> {
         if !self.state().buffers.iter().any(|b| b.id == buffer_id) {
             return Err(UiError::NoSuchBuffer);
         }
@@ -841,14 +802,8 @@ impl<T: Transport> WindowRef<'_, T> {
     /// see `docs/spec/rsproto-surface-ops.md`.
     pub fn set_title(&mut self, title: &str) -> Result<(), UiError> {
         let mut body = [0u8; 4 + librsproto::surface::MAX_TITLE];
-        let n = librsproto::surface::title::write(self.id(), title, &mut body)
-            .ok_or(UiError::Malformed)?;
-        self.session.transport.request(
-            librsproto::surface::OP_SET_TITLE,
-            &body[..n],
-            None,
-            &mut [],
-        )?;
+        let n = librsproto::surface::title::write(self.id(), title, &mut body).ok_or(UiError::Malformed)?;
+        self.session.transport.request(librsproto::surface::OP_SET_TITLE, &body[..n], None, &mut [])?;
         Ok(())
     }
 
@@ -863,15 +818,8 @@ impl<T: Transport> WindowRef<'_, T> {
     /// deliberately: the compositor is the one that knows when the button was released.
     pub fn start_move(&mut self) -> Result<(), UiError> {
         let mut body = [0u8; 4];
-        let n = librsproto::surface::StartMove { window: self.id() }
-            .write(&mut body)
-            .ok_or(UiError::Malformed)?;
-        self.session.transport.request(
-            librsproto::surface::OP_START_MOVE,
-            &body[..n],
-            None,
-            &mut [],
-        )?;
+        let n = librsproto::surface::StartMove { window: self.id() }.write(&mut body).ok_or(UiError::Malformed)?;
+        self.session.transport.request(librsproto::surface::OP_START_MOVE, &body[..n], None, &mut [])?;
         Ok(())
     }
 
@@ -891,15 +839,9 @@ impl<T: Transport> WindowRef<'_, T> {
     /// both of an opposite pair, is `InvalidArgument`.
     pub fn start_resize(&mut self, edges: u32) -> Result<(), UiError> {
         let mut body = [0u8; 8];
-        let n = librsproto::surface::StartResize { window: self.id(), edges }
-            .write(&mut body)
-            .ok_or(UiError::Malformed)?;
-        self.session.transport.request(
-            librsproto::surface::OP_START_RESIZE,
-            &body[..n],
-            None,
-            &mut [],
-        )?;
+        let n =
+            librsproto::surface::StartResize { window: self.id(), edges }.write(&mut body).ok_or(UiError::Malformed)?;
+        self.session.transport.request(librsproto::surface::OP_START_RESIZE, &body[..n], None, &mut [])?;
         Ok(())
     }
 
@@ -922,17 +864,11 @@ impl<T: Transport> WindowRef<'_, T> {
     ///
     /// Re-declaring a name replaces it. Cleared with the window.
     pub fn declare_acceptor(&mut self, name: &str, kinds: u32) -> Result<(), UiError> {
-        let mut body = [0u8; librsproto::surface::DeclareAcceptor::HEAD
-            + librsproto::surface::MAX_ACCEPTOR_NAME];
+        let mut body = [0u8; librsproto::surface::DeclareAcceptor::HEAD + librsproto::surface::MAX_ACCEPTOR_NAME];
         let n = librsproto::surface::DeclareAcceptor { window: self.id(), kinds }
             .write(&mut body, name.as_bytes())
             .ok_or(UiError::Malformed)?;
-        self.session.transport.request(
-            librsproto::surface::OP_DECLARE_ACCEPTOR,
-            &body[..n],
-            None,
-            &mut [],
-        )?;
+        self.session.transport.request(librsproto::surface::OP_DECLARE_ACCEPTOR, &body[..n], None, &mut [])?;
         Ok(())
     }
 
@@ -957,12 +893,7 @@ impl<T: Transport> WindowRef<'_, T> {
         let n = StartDrag { window: self.id(), kind, path_len: 0 }
             .write(&mut body, path.as_bytes(), name.as_bytes())
             .ok_or(UiError::Malformed)?;
-        self.session.transport.request(
-            librsproto::surface::OP_START_DRAG,
-            &body[..n],
-            None,
-            &mut [],
-        )?;
+        self.session.transport.request(librsproto::surface::OP_START_DRAG, &body[..n], None, &mut [])?;
         Ok(())
     }
 
@@ -978,15 +909,9 @@ impl<T: Transport> WindowRef<'_, T> {
     /// view rebuilt every frame costs nothing.
     pub fn request_state(&mut self, state: u32) -> Result<(), UiError> {
         let mut body = [0u8; 8];
-        let n = librsproto::surface::WindowState { window: self.id(), state }
-            .write(&mut body)
-            .ok_or(UiError::Malformed)?;
-        self.session.transport.request(
-            librsproto::surface::OP_REQUEST_STATE,
-            &body[..n],
-            None,
-            &mut [],
-        )?;
+        let n =
+            librsproto::surface::WindowState { window: self.id(), state }.write(&mut body).ok_or(UiError::Malformed)?;
+        self.session.transport.request(librsproto::surface::OP_REQUEST_STATE, &body[..n], None, &mut [])?;
         Ok(())
     }
 
@@ -1083,18 +1008,11 @@ mod tests {
                 // an id and nothing else would hang every test — which is the contract being
                 // modelled rather than an accommodation of it. The geometry echoes the request,
                 // as a compositor with no manager attached does.
-                let req = librsproto::surface::parse_create_window_request(body)
-                    .ok_or(UiError::Malformed)?;
+                let req = librsproto::surface::parse_create_window_request(body).ok_or(UiError::Malformed)?;
                 let mut cfg = [0u8; 20];
-                ConfigureEvent {
-                    window: self.next_window,
-                    width: req.width,
-                    height: req.height,
-                    x: 0,
-                    y: 0,
-                }
-                .write(&mut cfg)
-                .ok_or(UiError::Malformed)?;
+                ConfigureEvent { window: self.next_window, width: req.width, height: req.height, x: 0, y: 0 }
+                    .write(&mut cfg)
+                    .ok_or(UiError::Malformed)?;
                 self.events.insert(0, (OP_CONFIGURE, cfg.to_vec()));
                 return Ok(Some(n));
             }
@@ -1184,14 +1102,7 @@ mod tests {
         fn queue_drop(&mut self, window: u32, acceptor: &str, path: &str, name: &str) {
             use librsproto::surface::{DROP_KIND_FILE, DroppedEvent, MAX_EVENT_BODY, OP_DROPPED};
             let mut b = alloc::vec![0u8; MAX_EVENT_BODY];
-            let ev = DroppedEvent {
-                window,
-                kind: DROP_KIND_FILE,
-                x: 3,
-                y: 4,
-                acceptor_len: 0,
-                path_len: 0,
-            };
+            let ev = DroppedEvent { window, kind: DROP_KIND_FILE, x: 3, y: 4, acceptor_len: 0, path_len: 0 };
             let n = ev
                 .write(&mut b, acceptor.as_bytes(), path.as_bytes(), name.as_bytes())
                 .expect("within the protocol's caps");
@@ -1223,9 +1134,7 @@ mod tests {
     fn two_windows_on_one_session_each_get_their_own_input() {
         let mut s = Session::new(MockTransport::default());
         let parent = s.create(&CreateWindowRequest::new(200, 100, Role::Normal), 2).unwrap();
-        let menu = s
-            .create(&CreateWindowRequest::at(40, 60, Role::Popup { parent }, 4, 24), 2)
-            .unwrap();
+        let menu = s.create(&CreateWindowRequest::at(40, 60, Role::Popup { parent }, 4, 24), 2).unwrap();
         assert_ne!(parent, menu, "two distinct windows on one connection");
 
         s.transport.queue_key_for(menu, 30, true, 0);
@@ -1233,14 +1142,8 @@ mod tests {
         assert_eq!(s.pump().expect("pump"), 2);
 
         // Scanned in creation order, so the parent's comes first — and each carries its window.
-        assert_eq!(
-            s.next_event(),
-            Some((parent, WindowEvent::Key(KeyEvent::new(parent, 31, 1, 0)))),
-        );
-        assert_eq!(
-            s.next_event(),
-            Some((menu, WindowEvent::Key(KeyEvent::new(menu, 30, 1, 0)))),
-        );
+        assert_eq!(s.next_event(), Some((parent, WindowEvent::Key(KeyEvent::new(parent, 31, 1, 0)))),);
+        assert_eq!(s.next_event(), Some((menu, WindowEvent::Key(KeyEvent::new(menu, 30, 1, 0)))),);
         assert_eq!(s.next_event(), None);
     }
 
@@ -1253,12 +1156,8 @@ mod tests {
     fn destroying_a_parent_forgets_the_windows_that_went_with_it() {
         let mut s = Session::new(MockTransport::default());
         let parent = s.create(&CreateWindowRequest::new(200, 100, Role::Normal), 2).unwrap();
-        let menu = s
-            .create(&CreateWindowRequest::at(40, 60, Role::Popup { parent }, 0, 0), 2)
-            .unwrap();
-        let submenu = s
-            .create(&CreateWindowRequest::at(20, 20, Role::Popup { parent: menu }, 0, 0), 2)
-            .unwrap();
+        let menu = s.create(&CreateWindowRequest::at(40, 60, Role::Popup { parent }, 0, 0), 2).unwrap();
+        let submenu = s.create(&CreateWindowRequest::at(20, 20, Role::Popup { parent: menu }, 0, 0), 2).unwrap();
         let other = s.create(&CreateWindowRequest::new(10, 10, Role::Normal), 2).unwrap();
         assert_eq!(s.window_ids().len(), 4);
 
@@ -1283,9 +1182,7 @@ mod tests {
         // On the wire before the menu's handshake, so `create`'s wait loop is what consumes it.
         s.transport.queue_key_for(parent, 42, true, 0);
 
-        let menu = s
-            .create(&CreateWindowRequest::at(40, 60, Role::Popup { parent }, 0, 0), 2)
-            .unwrap();
+        let menu = s.create(&CreateWindowRequest::at(40, 60, Role::Popup { parent }, 0, 0), 2).unwrap();
 
         assert_eq!(
             s.next_event(),
@@ -1307,10 +1204,7 @@ mod tests {
         // The create request is answered; the wait for the configure is not.
         t.fail_after_create = true;
         let mut s = Session::new(t);
-        assert!(
-            s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).is_err(),
-            "the handshake failed"
-        );
+        assert!(s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).is_err(), "the handshake failed");
         assert!(s.window_ids().is_empty(), "and the session kept no half-made window");
     }
 
@@ -1489,14 +1383,7 @@ mod tests {
         fn acquire(&mut self) -> Result<u32, UiError> {
             self.w().acquire()
         }
-        fn attach(
-            &mut self,
-            b: u32,
-            width: u32,
-            height: u32,
-            pitch: u32,
-            handle: u64,
-        ) -> Result<(), UiError> {
+        fn attach(&mut self, b: u32, width: u32, height: u32, pitch: u32, handle: u64) -> Result<(), UiError> {
             self.w().attach(b, width, height, pitch, handle)
         }
         fn commit(&mut self, b: u32, d: (u32, u32, u32, u32)) -> Result<(), UiError> {
@@ -1506,9 +1393,7 @@ mod tests {
 
     fn window(count: usize) -> One {
         let mut s = Session::new(MockTransport::default());
-        let id = s
-            .create(&CreateWindowRequest::new(64, 32, Role::Normal), count)
-            .expect("created");
+        let id = s.create(&CreateWindowRequest::new(64, 32, Role::Normal), count).expect("created");
         let mut one = One { s, id };
         for i in 0..count {
             one.attach(i as u32, 64, 32, 64 * 4, 100 + i as u64).unwrap();
@@ -1529,11 +1414,15 @@ mod tests {
         // the buffer the compositor is reading.
         for count in [0, 1] {
             assert_eq!(
-                Session::new(MockTransport::default()).create(&CreateWindowRequest::new(8, 8, Role::Normal), count).err(),
+                Session::new(MockTransport::default())
+                    .create(&CreateWindowRequest::new(8, 8, Role::Normal), count)
+                    .err(),
                 Some(UiError::TooFewBuffers)
             );
         }
-        assert!(Session::new(MockTransport::default()).create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).is_ok());
+        assert!(
+            Session::new(MockTransport::default()).create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).is_ok()
+        );
     }
 
     #[test]
@@ -1564,12 +1453,7 @@ mod tests {
         w.commit(0, (0, 0, 64, 32)).unwrap();
         w.attach(0, 128, 64, 128 * 4, 201).unwrap();
         w.commit(1, (0, 0, 64, 32)).unwrap();
-        assert_eq!(
-            w.next_free(),
-            None,
-            "both buffers are committed, so nothing is free: {:?}",
-            w.buffers()
-        );
+        assert_eq!(w.next_free(), None, "both buffers are committed, so nothing is free: {:?}", w.buffers());
     }
 
     #[test]
@@ -1580,13 +1464,11 @@ mod tests {
         w.commit(0, (0, 0, 64, 32)).unwrap();
         w.commit(1, (0, 0, 64, 32)).unwrap();
 
-        let attaches: Vec<_> =
-            w.s.transport.sent.iter().filter(|(op, _, _)| *op == OP_ATTACH_BUFFER).collect();
+        let attaches: Vec<_> = w.s.transport.sent.iter().filter(|(op, _, _)| *op == OP_ATTACH_BUFFER).collect();
         assert_eq!(attaches.len(), 2);
         assert!(attaches.iter().all(|(_, _, h)| h.is_some()), "attach must carry a handle");
 
-        let commits: Vec<_> =
-            w.s.transport.sent.iter().filter(|(op, _, _)| *op == OP_COMMIT).collect();
+        let commits: Vec<_> = w.s.transport.sent.iter().filter(|(op, _, _)| *op == OP_COMMIT).collect();
         assert_eq!(commits.len(), 2);
         assert!(commits.iter().all(|(_, _, h)| h.is_none()), "a commit transfers nothing");
     }
@@ -1599,8 +1481,7 @@ mod tests {
         // back opaque. Byte 20 of the attach body is the format word — see
         // `docs/spec/rsproto-surface-ops.md`.
         fn tag_of(w: &One) -> u32 {
-            let (_, body, _) =
-                w.s.transport.sent.iter().rev().find(|(op, _, _)| *op == OP_ATTACH_BUFFER).unwrap();
+            let (_, body, _) = w.s.transport.sent.iter().rev().find(|(op, _, _)| *op == OP_ATTACH_BUFFER).unwrap();
             u32::from_le_bytes(body[20..24].try_into().unwrap())
         }
 
@@ -1733,9 +1614,7 @@ mod tests {
 
         // A second one is a manager changing its mind, and that *is* an event.
         let mut cfg = [0u8; 20];
-        ConfigureEvent { window: id, width: 100, height: 50, x: 7, y: 9 }
-            .write(&mut cfg)
-            .unwrap();
+        ConfigureEvent { window: id, width: 100, height: 50, x: 7, y: 9 }.write(&mut cfg).unwrap();
         s.transport.events.push((OP_CONFIGURE, cfg.to_vec()));
         assert_eq!(
             s.poll_event().expect("ok"),
@@ -1755,9 +1634,7 @@ mod tests {
         let before = s.window(id).unwrap().configured().unwrap();
 
         let mut cfg = [0u8; 20];
-        ConfigureEvent { window: id + 1, width: 999, height: 999, x: 1, y: 1 }
-            .write(&mut cfg)
-            .unwrap();
+        ConfigureEvent { window: id + 1, width: 999, height: 999, x: 1, y: 1 }.write(&mut cfg).unwrap();
         s.transport.events.push((OP_CONFIGURE, cfg.to_vec()));
         assert!(s.poll_event().expect("ok").is_none(), "somebody else's configure was queued");
         assert_eq!(s.window(id).unwrap().configured().unwrap(), before, "and it did not overwrite ours");
@@ -1833,8 +1710,7 @@ mod tests {
     fn the_damage_rectangle_reaches_the_wire_unchanged() {
         let mut w = window(2);
         w.commit(0, (3, 5, 17, 9)).unwrap();
-        let (_, body, _) =
-            w.s.transport.sent.iter().rev().find(|(op, _, _)| *op == OP_COMMIT).unwrap();
+        let (_, body, _) = w.s.transport.sent.iter().rev().find(|(op, _, _)| *op == OP_COMMIT).unwrap();
         let req = librsproto::surface::parse_commit_request(body).unwrap();
         assert_eq!((req.damage_x, req.damage_y, req.damage_w, req.damage_h), (3, 5, 17, 9));
     }
@@ -1926,10 +1802,7 @@ mod tests {
         w.s.transport.queue_pointer(POINTER_MOTION, -7, 12);
         assert_eq!(w.pump().expect("pump"), 2);
 
-        assert_eq!(
-            w.next_event(),
-            Some(WindowEvent::Key(KeyEvent::new(w.id(), 30, 1, MOD_SHIFT)))
-        );
+        assert_eq!(w.next_event(), Some(WindowEvent::Key(KeyEvent::new(w.id(), 30, 1, MOD_SHIFT))));
         // Signed coordinates survive the round trip — an unsigned read here is the
         // "pointer teleports on a leftward drag" bug, one layer further out.
         assert_eq!(
@@ -1998,10 +1871,7 @@ mod tests {
         });
 
         assert!(matches!(w.wait_event(), Ok(WindowEvent::Key(_))));
-        assert!(
-            !w.buffers().iter().find(|x| x.id == b).unwrap().busy,
-            "the release was applied, not thrown away"
-        );
+        assert!(!w.buffers().iter().find(|x| x.id == b).unwrap().busy, "the release was applied, not thrown away");
     }
 
     #[test]
@@ -2052,5 +1922,4 @@ mod tests {
         assert_eq!(w.events_pending(), 1, "the short pointer record was dropped");
         assert!(matches!(w.next_event(), Some(WindowEvent::Key(_))));
     }
-
 }

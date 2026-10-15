@@ -234,10 +234,7 @@ mod tests {
 
     #[test]
     fn child_exited_writes_spec_offsets() {
-        let n = Notification::child_exited(
-            42,
-            ExitStatus { kind: ExitKind::Crashed as u32, code: -7 },
-        );
+        let n = Notification::child_exited(42, ExitStatus { kind: ExitKind::Crashed as u32, code: -7 });
         let b = n.as_bytes();
         assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), KIND_CHILD_EXITED);
         // child pid @ body+0 (overall +4).
@@ -277,13 +274,9 @@ mod tests {
         // It is not a fault, so nothing on the exception path should pick it up.
         assert!(!n.is_exception());
         // And it is distinct from every other kind a process may already be handling.
-        for other in [
-            KIND_CHILD_EXITED,
-            KIND_PEER_CLOSED,
-            KIND_HANDLE_INVALIDATED,
-            KIND_NOTIFICATIONS_DROPPED,
-            KIND_SEG_FAULT,
-        ] {
+        for other in
+            [KIND_CHILD_EXITED, KIND_PEER_CLOSED, KIND_HANDLE_INVALIDATED, KIND_NOTIFICATIONS_DROPPED, KIND_SEG_FAULT]
+        {
             assert_ne!(KIND_TERMINATE_REQUESTED, other);
         }
     }

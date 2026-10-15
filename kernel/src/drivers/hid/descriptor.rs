@@ -354,8 +354,9 @@ pub fn mouse_layout(desc: &[u8]) -> Option<Layout> {
 pub fn keyboard_layout(desc: &[u8]) -> Option<keyboard::Layout> {
     let mut within = Within::default();
     let mut keys = Keys::default();
-    let is_keyboard =
-        |u: u32| u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYBOARD) || u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYPAD);
+    let is_keyboard = |u: u32| {
+        u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYBOARD) || u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYPAD)
+    };
     let uses_ids = walk(desc, |event| {
         let inside = within.follow(&event, is_keyboard);
         if let Event::Item(item) = event
@@ -668,7 +669,11 @@ mod tests {
         ];
         let l = mouse_layout(&d).expect("a plain mouse");
         assert_eq!(l.report_id, Some(2));
-        assert_eq!(l.buttons, [Some(Field::bit(0)), Some(Field::bit(1)), Some(Field::bit(2))], "the first three of sixteen");
+        assert_eq!(
+            l.buttons,
+            [Some(Field::bit(0)), Some(Field::bit(1)), Some(Field::bit(2))],
+            "the first three of sixteen"
+        );
         assert_eq!((l.x, l.y), (signed(16, 12), signed(28, 12)));
         assert_eq!(l.wheel, Some(signed(40, 8)));
     }
@@ -777,7 +782,12 @@ mod tests {
         assert_eq!(l.report_id, Some(1));
         assert_eq!(
             l.bits,
-            [Some(Bits { offset: 0, first: 0xE0, count: 8 }), Some(Bits { offset: 8, first: 0, count: 152 }), None, None]
+            [
+                Some(Bits { offset: 0, first: 0xE0, count: 8 }),
+                Some(Bits { offset: 8, first: 0, count: 152 }),
+                None,
+                None
+            ]
         );
         assert_eq!(l.array, None);
         assert_eq!(l.lights, Some(Lights { report_id: Some(1) }));
@@ -822,7 +832,8 @@ mod tests {
             let mut out = [InputEvent::default(); keyboard::EVENTS_MAX];
             let (n, more) = keyboard::decode(&layout, &mut held, r, 7, &mut out).expect("its keyboard report");
             assert!(!more);
-            let keys: Vec<(u16, i32)> = out[..n].iter().filter(|e| e.kind == EV_KEY).map(|e| (e.code, e.value)).collect();
+            let keys: Vec<(u16, i32)> =
+                out[..n].iter().filter(|e| e.kind == EV_KEY).map(|e| (e.code, e.value)).collect();
             assert_eq!(keys, want, "report {r:02x?}");
         }
         assert_eq!(held, keyboard::Held::NONE, "nothing held at the end");

@@ -10,9 +10,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::wire::{
-    ByteSink, ByteSource, REC_DATA, REC_ERROR, REC_TERMINATOR, Result, Schema, StreamFlags,
-    TypeModifiers, TypeTag, Value, WireError, WireErrorRecord, decode_header, encode_header,
-    encode_terminator, put_u8, read_row_values, write_row_values,
+    ByteSink, ByteSource, REC_DATA, REC_ERROR, REC_TERMINATOR, Result, Schema, StreamFlags, TypeModifiers, TypeTag,
+    Value, WireError, WireErrorRecord, decode_header, encode_header, encode_terminator, put_u8, read_row_values,
+    write_row_values,
 };
 
 /// Writes a typed stream to a [`ByteSink`]: one header (magic + flags + schema), then a
@@ -42,12 +42,7 @@ pub struct TableWriter<W: ByteSink> {
 impl<W: ByteSink> TableWriter<W> {
     /// Wrap a sink. Nothing is written until [`write_schema`](Self::write_schema).
     pub fn new(sink: W) -> Self {
-        TableWriter {
-            sink,
-            schema: Schema::new(),
-            begun: false,
-            finished: false,
-        }
+        TableWriter { sink, schema: Schema::new(), begun: false, finished: false }
     }
 
     /// Write the header (magic + `flags` + `schema`). Must be called exactly once,
@@ -125,12 +120,7 @@ impl<'a> TableReader<'a> {
     pub fn new(buf: &'a [u8]) -> Result<Self> {
         let mut src = ByteSource::new(buf);
         let (flags, schema) = decode_header(&mut src)?;
-        Ok(TableReader {
-            src,
-            schema,
-            flags,
-            ended: false,
-        })
+        Ok(TableReader { src, schema, flags, ended: false })
     }
 
     /// The stream's flags (e.g. [`StreamFlags::TEXT_FALLBACK`]).
@@ -181,11 +171,7 @@ impl<'a> TableReader<'a> {
 /// `{ line: String }`, one row per line, then the terminator. This is how a plain-text
 /// producer's output is wrapped so it flows through the same typed pipeline (the "Unix
 /// floor" — every generic operator still works on it).
-pub fn write_text_fallback(
-    sink: &mut impl ByteSink,
-    lines: &[&str],
-    exit_status: i32,
-) -> Result<()> {
+pub fn write_text_fallback(sink: &mut impl ByteSink, lines: &[&str], exit_status: i32) -> Result<()> {
     let schema = Schema::new().field("line", TypeTag::String, TypeModifiers::NONE);
     let mut tw = TableWriter::new(sink);
     tw.write_schema(StreamFlags::TEXT_FALLBACK, &schema)?;
@@ -213,12 +199,7 @@ mod tests {
     fn writer_reader_round_trip_with_nullable() {
         let schema = demo_schema();
         let rows = [
-            vec![
-                Value::Int(1),
-                Value::Str(String::from("init")),
-                Value::Bool(true),
-                Value::Handle(0x40),
-            ],
+            vec![Value::Int(1), Value::Str(String::from("init")), Value::Bool(true), Value::Handle(0x40)],
             vec![
                 Value::Int(2),
                 Value::Str(String::from("svc-mgr")),
@@ -248,11 +229,7 @@ mod tests {
     #[test]
     fn error_record_in_stream() {
         let schema = Schema::new().field("x", TypeTag::Int, TypeModifiers::NONE);
-        let err = WireErrorRecord {
-            code: -13,
-            message: String::from("bad row"),
-            field_name: String::from("x"),
-        };
+        let err = WireErrorRecord { code: -13, message: String::from("bad row"), field_name: String::from("x") };
         let mut buf = Vec::new();
         {
             let mut tw = TableWriter::new(&mut buf);
@@ -271,9 +248,11 @@ mod tests {
 
     #[test]
     fn schema_mismatch_is_caught() {
-        let schema = Schema::new()
-            .field("a", TypeTag::Int, TypeModifiers::NONE)
-            .field("b", TypeTag::String, TypeModifiers::NONE);
+        let schema = Schema::new().field("a", TypeTag::Int, TypeModifiers::NONE).field(
+            "b",
+            TypeTag::String,
+            TypeModifiers::NONE,
+        );
         let mut buf = Vec::new();
         let mut tw = TableWriter::new(&mut buf);
         // Row before schema.
@@ -282,15 +261,9 @@ mod tests {
         // Wrong field count.
         assert_eq!(tw.write_row(&[Value::Int(1)]), Err(WireError::SchemaMismatch));
         // Wrong type in column b (Int where String expected).
-        assert_eq!(
-            tw.write_row(&[Value::Int(1), Value::Int(2)]),
-            Err(WireError::SchemaMismatch)
-        );
+        assert_eq!(tw.write_row(&[Value::Int(1), Value::Int(2)]), Err(WireError::SchemaMismatch));
         // Null in a non-nullable column.
-        assert_eq!(
-            tw.write_row(&[Value::Null, Value::Str(String::from("x"))]),
-            Err(WireError::SchemaMismatch)
-        );
+        assert_eq!(tw.write_row(&[Value::Null, Value::Str(String::from("x"))]), Err(WireError::SchemaMismatch));
     }
 
     #[test]
@@ -308,19 +281,13 @@ mod tests {
             bytes_len = tw.into_sink().len();
         }
         let mut tr = TableReader::new(&store[..bytes_len]).unwrap();
-        assert_eq!(
-            tr.next().unwrap().unwrap(),
-            Item::Row(vec![Value::Int(0x1122_3344)])
-        );
+        assert_eq!(tr.next().unwrap().unwrap(), Item::Row(vec![Value::Int(0x1122_3344)]));
         assert_eq!(tr.next().unwrap().unwrap(), Item::End(0));
 
         // Tiny buffer: the header alone overflows → SinkFull (backpressure, no truncation).
         let mut tiny = [0u8; 4];
         let mut tw = TableWriter::new(SliceSink::new(&mut tiny));
-        assert_eq!(
-            tw.write_schema(StreamFlags::NONE, &schema),
-            Err(WireError::SinkFull)
-        );
+        assert_eq!(tw.write_schema(StreamFlags::NONE, &schema), Err(WireError::SinkFull));
     }
 
     #[test]
@@ -332,14 +299,8 @@ mod tests {
         assert!(tr.flags().contains(StreamFlags::TEXT_FALLBACK));
         assert_eq!(tr.schema().fields.len(), 1);
         assert_eq!(tr.schema().fields[0].name, "line");
-        assert_eq!(
-            tr.next().unwrap().unwrap(),
-            Item::Row(vec![Value::Str(String::from("hello"))])
-        );
-        assert_eq!(
-            tr.next().unwrap().unwrap(),
-            Item::Row(vec![Value::Str(String::from("world"))])
-        );
+        assert_eq!(tr.next().unwrap().unwrap(), Item::Row(vec![Value::Str(String::from("hello"))]));
+        assert_eq!(tr.next().unwrap().unwrap(), Item::Row(vec![Value::Str(String::from("world"))]));
         assert_eq!(tr.next().unwrap().unwrap(), Item::End(0));
     }
 

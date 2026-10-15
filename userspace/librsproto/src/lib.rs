@@ -22,19 +22,19 @@
 pub mod auth;
 pub mod clipboard;
 pub mod desktop;
+pub mod devices;
 pub mod error;
 pub mod file;
 pub mod log;
 pub mod meta;
 pub mod namespace;
 pub mod path;
+pub mod services;
 #[cfg(feature = "io")]
 pub mod session;
+pub mod storage;
 pub mod surface;
 pub mod views;
-pub mod devices;
-pub mod storage;
-pub mod services;
 
 // --- Envelope (RsMsgHeader) -------------------------------------------------
 
@@ -289,14 +289,7 @@ impl Message<'_> {
 /// send**, a body over [`RS_MAX_BODY`], which the kernel would refuse with nothing to tell the
 /// receiver. The caller sets `IpcMsg.header.payload_len` to the returned length and
 /// `handle_count` itself.
-pub fn encode(
-    out: &mut [u8],
-    op: u16,
-    request_id: u64,
-    flags: u32,
-    body: &[u8],
-    handle_count: u16,
-) -> Option<usize> {
+pub fn encode(out: &mut [u8], op: u16, request_id: u64, flags: u32, body: &[u8], handle_count: u16) -> Option<usize> {
     let total = RS_HEADER_LEN.checked_add(body.len())?;
     if out.len() < total || total > RS_MAX_PAYLOAD {
         return None;

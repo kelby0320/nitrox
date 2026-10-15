@@ -102,7 +102,10 @@ pub enum Action {
 enum State {
     Ground,
     /// Inside a UTF-8 sequence: the bits so far, and how many continuation bytes are still owed.
-    Utf8 { cp: u32, owed: u8 },
+    Utf8 {
+        cp: u32,
+        owed: u8,
+    },
     /// After `ESC`.
     Escape,
     /// After `ESC [`, until a final byte.
@@ -143,7 +146,9 @@ impl Decoder {
                     let cp = (cp << 6) | (byte & 0x3F) as u32;
                     if owed == 1 {
                         self.state = State::Ground;
-                        out(Action::Glyph(char::from_u32(cp).map_or(glyphs::REPLACEMENT, glyphs::index_or_replacement)));
+                        out(Action::Glyph(
+                            char::from_u32(cp).map_or(glyphs::REPLACEMENT, glyphs::index_or_replacement),
+                        ));
                     } else {
                         self.state = State::Utf8 { cp, owed: owed - 1 };
                     }
@@ -247,11 +252,8 @@ impl Grid {
     /// Clear to `geometry`, with the cursor at the top-left. A geometry larger than the storage
     /// is clamped to it.
     pub fn reset(&mut self, geometry: Geometry) {
-        self.geometry = Geometry {
-            scale: geometry.scale,
-            cols: geometry.cols.min(MAX_COLS),
-            rows: geometry.rows.min(MAX_ROWS),
-        };
+        self.geometry =
+            Geometry { scale: geometry.scale, cols: geometry.cols.min(MAX_COLS), rows: geometry.rows.min(MAX_ROWS) };
         self.cells = [BLANK; CELLS];
         self.top = 0;
         self.row = 0;
@@ -450,9 +452,8 @@ mod tests {
 
     /// Logical row `row` as text, trailing blanks trimmed.
     fn line(g: &Grid, row: usize) -> String {
-        let s: String = (0..g.geometry().cols)
-            .map(|c| glyphs::char_of(g.glyph_at(row, c)).unwrap_or('\u{FFFD}'))
-            .collect();
+        let s: String =
+            (0..g.geometry().cols).map(|c| glyphs::char_of(g.glyph_at(row, c)).unwrap_or('\u{FFFD}')).collect();
         s.trim_end().to_string()
     }
 
@@ -626,10 +627,7 @@ mod tests {
         let log = b"one\ntwo\nthree\nfour\nfive\n";
         let pages: Vec<&[u8]> = Pages::new(log, 10, 2).collect();
         assert_eq!(pages, [&b"one\ntwo"[..], b"three\nfour", b"five\n"]);
-        assert_eq!(
-            draw_pages(log, 10, 2),
-            [vec!["one", "two"], vec!["three", "four"], vec!["five", ""]]
-        );
+        assert_eq!(draw_pages(log, 10, 2), [vec!["one", "two"], vec!["three", "four"], vec!["five", ""]]);
     }
 
     #[test]

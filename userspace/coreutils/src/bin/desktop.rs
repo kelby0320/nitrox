@@ -50,8 +50,8 @@ use alloc::string::String;
 
 use coreutils::args::parse;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
-use libkern::{exit, kprint};
 use libkern::debug::Line;
+use libkern::{exit, kprint};
 use librsproto::desktop::{Desktop, DesktopError};
 
 /// `alloc` backing.
@@ -93,10 +93,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
     let Ok(mut desktop) = Desktop::connect(ns, &mut buf) else {
         kprint(b"desktop: /dev/desktop did not resolve\n");
-        stage.die(
-            b"desktop: no /dev/desktop in this namespace -- not a graphical session\n",
-            EXIT_FAILURE,
-        );
+        stage.die(b"desktop: no /dev/desktop in this namespace -- not a graphical session\n", EXIT_FAILURE);
     };
 
     let ops: alloc::vec::Vec<&str> = args.operands.iter().map(|s| s.as_str()).collect();
@@ -175,13 +172,7 @@ fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i64 {
     // image renders no grid, so the table's bytes are invisible from the host and both branches
     // otherwise print the identical line — an assertion that would have passed just as well for
     // the stderr version this replaced. `check-login` matches on `(table)`.
-    Line::new()
-        .s(b"desktop: listed ")
-        .u(list.count as u64)
-        .s(b" desktops (")
-        .s(sink)
-        .s(b")")
-        .end();
+    Line::new().s(b"desktop: listed ").u(list.count as u64).s(b" desktops (").s(sink).s(b")").end();
     EXIT_OK
 }
 

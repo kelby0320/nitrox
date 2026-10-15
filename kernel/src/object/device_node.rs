@@ -75,12 +75,7 @@ pub struct BarWindow {
 
 impl BarWindow {
     /// An absent BAR slot, for array initialisation.
-    pub const ZERO: BarWindow = BarWindow {
-        base: 0,
-        size: 0,
-        kind: BAR_NONE,
-        flags: 0,
-    };
+    pub const ZERO: BarWindow = BarWindow { base: 0, size: 0, kind: BAR_NONE, flags: 0 };
 }
 
 /// The device's interrupt, as far as enumeration can determine it.
@@ -111,15 +106,8 @@ pub struct InterruptSpec {
 
 impl InterruptSpec {
     /// A function with no interrupt assigned.
-    pub const NONE: InterruptSpec = InterruptSpec {
-        gsi: 0,
-        trigger: 0,
-        polarity: 0,
-        line: 0,
-        pin: 0,
-        present: 0,
-        _pad: 0,
-    };
+    pub const NONE: InterruptSpec =
+        InterruptSpec { gsi: 0, trigger: 0, polarity: 0, line: 0, pin: 0, present: 0, _pad: 0 };
 }
 
 /// The full resource descriptor a driver consumes to drive a device.
@@ -152,14 +140,7 @@ impl ResourceDescriptor {
     /// A synthetic, all-zero descriptor (vendor `0xFFFF` = "no PCI device") for a
     /// node that is not a discovered PCI function — e.g. the serial console.
     pub const ZERO: ResourceDescriptor = ResourceDescriptor {
-        identity: DeviceIdentity {
-            vendor: 0xFFFF,
-            device: 0,
-            class: 0,
-            subclass: 0,
-            prog_if: 0,
-            revision: 0,
-        },
+        identity: DeviceIdentity { vendor: 0xFFFF, device: 0, class: 0, subclass: 0, prog_if: 0, revision: 0 },
         bars: [BarWindow::ZERO; 6],
         interrupt: InterruptSpec::NONE,
         seg: 0,
@@ -252,10 +233,7 @@ pub struct BlockGeometry {
 
 impl BlockGeometry {
     /// Zero geometry, for a non-block node.
-    pub const ZERO: BlockGeometry = BlockGeometry {
-        logical_block_size: 0,
-        block_count: 0,
-    };
+    pub const ZERO: BlockGeometry = BlockGeometry { logical_block_size: 0, block_count: 0 };
 }
 
 /// A discovered device.
@@ -314,10 +292,7 @@ impl DeviceNode {
     /// Allocate a [`DeviceClass::Char`] node backed by `backend` (the serial
     /// console). `geometry` is zeroed (meaningless for a char device); the
     /// descriptor is synthetic ([`ResourceDescriptor::ZERO`] is fine).
-    pub fn try_new_char(
-        descriptor: ResourceDescriptor,
-        backend: CharBackend,
-    ) -> Result<KBox<Self>, AllocError> {
+    pub fn try_new_char(descriptor: ResourceDescriptor, backend: CharBackend) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::DeviceNode),
             magic: Self::MAGIC,
@@ -350,12 +325,7 @@ impl DeviceNode {
             // whole disks, the partitions found on them and memory published as a disk, and a
             // program that cannot tell them apart writes a partition table over a mounted root
             // (Phase 5 Part H.1).
-            block_info: BlockDeviceInfo::new(
-                kind,
-                geometry.logical_block_size,
-                geometry.block_count,
-                name,
-            ),
+            block_info: BlockDeviceInfo::new(kind, geometry.logical_block_size, geometry.block_count, name),
             block_backend: Some(backend),
             char_backend: None,
             io: IoStats::new(),
@@ -437,8 +407,7 @@ mod tests {
     #[test]
     fn try_new_has_magic_and_fields() {
         init_global_heap();
-        let n = DeviceNode::try_new(DeviceClass::Other, sample_descriptor(), BlockGeometry::ZERO)
-            .unwrap();
+        let n = DeviceNode::try_new(DeviceClass::Other, sample_descriptor(), BlockGeometry::ZERO).unwrap();
         assert!(n.magic_ok());
         assert_eq!(n.class(), DeviceClass::Other);
         assert_eq!(n.descriptor().identity.vendor, 0x8086);
@@ -462,8 +431,7 @@ mod tests {
         let r = unsafe {
             ObjectRef::from_raw(
                 KBox::into_raw(
-                    DeviceNode::try_new(DeviceClass::Other, sample_descriptor(), BlockGeometry::ZERO)
-                        .unwrap(),
+                    DeviceNode::try_new(DeviceClass::Other, sample_descriptor(), BlockGeometry::ZERO).unwrap(),
                 )
                 .as_ptr() as *mut (),
                 KObjectType::DeviceNode,

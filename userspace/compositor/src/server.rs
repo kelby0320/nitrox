@@ -21,10 +21,8 @@
 use alloc::vec::Vec;
 
 use librsproto::surface::{
-    ConfigureEvent, OP_ATTACH_BUFFER, OP_COMMIT, OP_CREATE_WINDOW, OP_DESTROY_WINDOW,
-    OP_SET_TITLE,
-    build_create_window_reply,
-    parse_attach_buffer_request, parse_commit_request, parse_create_window_request,
+    ConfigureEvent, OP_ATTACH_BUFFER, OP_COMMIT, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_SET_TITLE,
+    build_create_window_reply, parse_attach_buffer_request, parse_commit_request, parse_create_window_request,
     parse_destroy_window_request,
 };
 
@@ -180,13 +178,7 @@ fn note_title_truncated(len: usize) {
 ///
 /// `body` is the request body (the envelope is the caller's concern, as in `fs-server`).
 /// A reply body, when there is one, is written into `reply`.
-pub fn dispatch(
-    conn: &mut Connection,
-    stack: &mut WindowStack,
-    op: u16,
-    body: &[u8],
-    reply: &mut [u8],
-) -> Outcome {
+pub fn dispatch(conn: &mut Connection, stack: &mut WindowStack, op: u16, body: &[u8], reply: &mut [u8]) -> Outcome {
     match op {
         OP_CREATE_WINDOW => {
             let Some(req) = parse_create_window_request(body) else {
@@ -292,12 +284,7 @@ pub fn dispatch(
                     // — unclipped, every commit is a full-screen recomposite, which is exactly
                     // the cost this change exists to remove (PR #192 review, finding 4).
                     let dirty = stack.window(req.window).map(|w| {
-                        let local = Rect::new(
-                            req.damage_x as i32,
-                            req.damage_y as i32,
-                            req.damage_w,
-                            req.damage_h,
-                        );
+                        let local = Rect::new(req.damage_x as i32, req.damage_y as i32, req.damage_w, req.damage_h);
                         let bounds = w.bounds();
                         // **A window nothing has drawn yet repaints all of itself, shadow and
                         // all**, whatever damage it named: the client is describing what changed
@@ -365,8 +352,7 @@ pub fn dispatch(
             if !conn.owns(window) {
                 return Outcome::Failed(SurfaceError::NotFound);
             }
-            let before: Vec<(u32, Rect)> =
-                stack.windows().iter().map(|w| (w.id, w.painted_bounds())).collect();
+            let before: Vec<(u32, Rect)> = stack.windows().iter().map(|w| (w.id, w.painted_bounds())).collect();
             match stack.destroy(window) {
                 Ok(()) => {
                     // Destroy is transitive, so this connection's descendants of `window`
@@ -411,8 +397,7 @@ pub fn disconnect(conn: &mut Connection, stack: &mut WindowStack) {
 /// The parent a role names, if it names one.
 fn parent_of(role: &librsproto::surface::Role) -> Option<u32> {
     match role {
-        librsproto::surface::Role::Popup { parent }
-        | librsproto::surface::Role::Dialog { parent } => Some(*parent),
+        librsproto::surface::Role::Popup { parent } | librsproto::surface::Role::Dialog { parent } => Some(*parent),
         _ => None,
     }
 }
@@ -442,16 +427,12 @@ mod tests {
         }
     }
     use librsproto::surface::{
-        ATTACH_BUFFER_REQUEST_LEN, AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge,
-        Role, SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request,
-        build_create_window_request, build_destroy_window_request, parse_create_window_reply,
+        ATTACH_BUFFER_REQUEST_LEN, AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role,
+        SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request, build_create_window_request,
+        build_destroy_window_request, parse_create_window_reply,
     };
 
-    pub(super) fn create(
-        conn: &mut Connection,
-        stack: &mut WindowStack,
-        role: Role,
-    ) -> Result<u32, SurfaceError> {
+    pub(super) fn create(conn: &mut Connection, stack: &mut WindowStack, role: Role) -> Result<u32, SurfaceError> {
         create_sized(conn, stack, role, 8, 8)
     }
 
@@ -465,11 +446,7 @@ mod tests {
         height: u32,
     ) -> Result<u32, SurfaceError> {
         let mut body = [0u8; 32];
-        let n = build_create_window_request(
-            &mut body,
-            &CreateWindowRequest::new(width, height, role),
-        )
-        .unwrap();
+        let n = build_create_window_request(&mut body, &CreateWindowRequest::new(width, height, role)).unwrap();
         let mut reply = [0u8; 32];
         match dispatch(conn, stack, OP_CREATE_WINDOW, &body[..n], &mut reply) {
             // Create answers with a reply *and* the window's first `Configure` — the ordering
@@ -506,14 +483,7 @@ mod tests {
         let mut body = [0u8; ATTACH_BUFFER_REQUEST_LEN];
         let n = build_attach_buffer_request(
             &mut body,
-            &AttachBufferRequest {
-                window,
-                buffer,
-                width,
-                height,
-                pitch: width * 4,
-                format: SURFACE_FORMAT_XRGB8888,
-            },
+            &AttachBufferRequest { window, buffer, width, height, pitch: width * 4, format: SURFACE_FORMAT_XRGB8888 },
         )
         .unwrap();
         let mut reply = [0u8; 8];
@@ -531,14 +501,7 @@ mod tests {
         let mut body = [0u8; 32];
         let n = build_commit_request(
             &mut body,
-            &CommitRequest {
-                window,
-                buffer,
-                damage_x: d.0,
-                damage_y: d.1,
-                damage_w: d.2,
-                damage_h: d.3,
-            },
+            &CommitRequest { window, buffer, damage_x: d.0, damage_y: d.1, damage_w: d.2, damage_h: d.3 },
         )
         .unwrap();
         let mut reply = [0u8; 8];
@@ -549,14 +512,7 @@ mod tests {
         let mut body = [0u8; 32];
         let n = build_commit_request(
             &mut body,
-            &CommitRequest {
-                window,
-                buffer,
-                damage_x: 0,
-                damage_y: 0,
-                damage_w: 8,
-                damage_h: 8,
-            },
+            &CommitRequest { window, buffer, damage_x: 0, damage_y: 0, damage_w: 8, damage_h: 8 },
         )
         .unwrap();
         let mut reply = [0u8; 8];
@@ -704,8 +660,7 @@ mod tests {
         // A 4×4 buffer replaces the 8×8 one. The client honestly damages its whole new buffer.
         assert_applied(attach_sized(&mut a, &mut stack, w, 1, 4, 4), None);
         let before = stack.window(w).expect("in the stack").painted_bounds();
-        let d = dirty_of(commit_damage(&mut a, &mut stack, w, 1, (0, 0, 4, 4)))
-            .expect("a commit names a region");
+        let d = dirty_of(commit_damage(&mut a, &mut stack, w, 1, (0, 0, 4, 4))).expect("a commit names a region");
         let after = stack.window(w).expect("in the stack").painted_bounds();
         // The union of what it painted before and what it paints now — the shadow moved in with
         // the shape, so both sides are painted bounds (M13 Part C).
@@ -734,8 +689,7 @@ mod tests {
         let mut stack = WindowStack::new();
         let mut conn = Connection::new();
         for i in 0..MAX_WINDOWS_PER_CONNECTION {
-            create(&mut conn, &mut stack, Role::Normal)
-                .unwrap_or_else(|e| panic!("window {i} refused: {e:?}"));
+            create(&mut conn, &mut stack, Role::Normal).unwrap_or_else(|e| panic!("window {i} refused: {e:?}"));
         }
         assert_eq!(
             create(&mut conn, &mut stack, Role::Normal),
@@ -794,20 +748,14 @@ mod tests {
         assert_eq!(stack.focus_candidate(), Some(first));
 
         let mut body = [0u8; 32];
-        let n = build_create_window_request(
-            &mut body,
-            &CreateWindowRequest::new(8, 8, Role::Normal),
-        )
-        .unwrap();
+        let n = build_create_window_request(&mut body, &CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         let mut reply = [0u8; 32];
         let outcome = dispatch(&mut a, &mut stack, OP_CREATE_WINDOW, &body[..n], &mut reply);
         assert!(
             !matches!(outcome, Outcome::Applied { .. }),
             "a create is not an Applied, so anything keyed on Applied misses it: {outcome:?}"
         );
-        let Outcome::Created { reply_len, configure } = outcome else {
-            panic!("unexpected {outcome:?}")
-        };
+        let Outcome::Created { reply_len, configure } = outcome else { panic!("unexpected {outcome:?}") };
         let second = parse_create_window_reply(&reply[..reply_len]).unwrap();
         assert_eq!(configure.window, second, "the configure names the window just created");
 
@@ -930,10 +878,7 @@ mod tests {
         let mut stack = WindowStack::new();
         let mut a = Connection::new();
         let mut reply = [0u8; 32];
-        assert_eq!(
-            dispatch(&mut a, &mut stack, 0x09FE, &[], &mut reply),
-            Outcome::Failed(SurfaceError::Unsupported)
-        );
+        assert_eq!(dispatch(&mut a, &mut stack, 0x09FE, &[], &mut reply), Outcome::Failed(SurfaceError::Unsupported));
     }
 
     #[test]
@@ -942,8 +887,7 @@ mod tests {
         let mut a = Connection::new();
         let p = create(&mut a, &mut stack, Role::Panel { dock: Edge::Top, reserve: 24 }).unwrap();
         assert!(a.owns(p));
-        assert_eq!(stack.work_area(libdraw::geom::Rect::new(0, 0, 100, 50)),
-            libdraw::geom::Rect::new(0, 24, 100, 26));
+        assert_eq!(stack.work_area(libdraw::geom::Rect::new(0, 0, 100, 50)), libdraw::geom::Rect::new(0, 24, 100, 26));
     }
 }
 
@@ -955,12 +899,7 @@ mod title_tests {
     use librsproto::surface::{MAX_TITLE, title};
 
     /// Build a `SetTitle` body and dispatch it.
-    fn set_title(
-        conn: &mut Connection,
-        stack: &mut WindowStack,
-        window: u32,
-        s: &str,
-    ) -> Outcome {
+    fn set_title(conn: &mut Connection, stack: &mut WindowStack, window: u32, s: &str) -> Outcome {
         let mut body = alloc::vec![0u8; 4 + s.len()];
         let n = title::write(window, s, &mut body).expect("fits");
         let mut reply = [0u8; 32];
@@ -1001,16 +940,10 @@ mod title_tests {
         let mut a = Connection::new();
         let mut b = Connection::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
-        assert!(matches!(
-            set_title(&mut b, &mut stack, w, "mine now"),
-            Outcome::Failed(SurfaceError::NotFound)
-        ));
+        assert!(matches!(set_title(&mut b, &mut stack, w, "mine now"), Outcome::Failed(SurfaceError::NotFound)));
         assert_eq!(stack.window(w).unwrap().title, "", "the window was renamed anyway");
         // A window that never existed answers the same thing.
-        assert!(matches!(
-            set_title(&mut b, &mut stack, w + 99, "ghost"),
-            Outcome::Failed(SurfaceError::NotFound)
-        ));
+        assert!(matches!(set_title(&mut b, &mut stack, w + 99, "ghost"), Outcome::Failed(SurfaceError::NotFound)));
     }
 
     /// Stored truncated, so a window's cost stays finite however chatty its client is.
@@ -1043,4 +976,3 @@ mod title_tests {
         ));
     }
 }
-

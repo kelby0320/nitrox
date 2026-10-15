@@ -51,10 +51,10 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libkern::SpinLock;
+use crate::libkern::lockrank::LockRank;
 use crate::mm::buddy::BuddyAllocator;
 use crate::mm::heap::{BuddyPager, HeapBuddy};
 use crate::mm::{PAGE_SIZE, PhysAddr};
-use crate::libkern::lockrank::LockRank;
 
 /// Bytes per slab. Matches `PAGE_SIZE` — every slab is exactly one buddy
 /// order-0 block.
@@ -141,14 +141,17 @@ impl SlabCache {
     /// called before [`SlabCache::alloc`] or [`SlabCache::free`].
     pub const fn new() -> Self {
         Self {
-            state: SpinLock::new(LockRank::SlabCache, SlabCacheState {
-                partial: ptr::null_mut(),
-                full: ptr::null_mut(),
-                obj_size: 0,
-                obj_align: 0,
-                obj_offset: 0,
-                objs_per_slab: 0,
-            }),
+            state: SpinLock::new(
+                LockRank::SlabCache,
+                SlabCacheState {
+                    partial: ptr::null_mut(),
+                    full: ptr::null_mut(),
+                    obj_size: 0,
+                    obj_align: 0,
+                    obj_offset: 0,
+                    objs_per_slab: 0,
+                },
+            ),
         }
     }
 
@@ -165,18 +168,9 @@ impl SlabCache {
         let usable = SLAB_SIZE.saturating_sub(obj_offset);
         let objs_per_slab = usable / obj_size;
 
-        assert!(
-            obj_offset >= header,
-            "slab init: obj_offset < SlabDescriptor size"
-        );
-        assert!(
-            obj_offset.is_multiple_of(obj_align),
-            "slab init: obj_offset misaligned"
-        );
-        assert!(
-            objs_per_slab >= 1,
-            "slab init: obj_size too large for SLAB_SIZE"
-        );
+        assert!(obj_offset >= header, "slab init: obj_offset < SlabDescriptor size");
+        assert!(obj_offset.is_multiple_of(obj_align), "slab init: obj_offset misaligned");
+        assert!(objs_per_slab >= 1, "slab init: obj_size too large for SLAB_SIZE");
 
         let mut state = self.state.lock();
         state.obj_size = obj_size;
@@ -269,10 +263,7 @@ impl SlabCache {
             None => return ptr::null_mut(),
         };
         let virt = (phys.as_u64() + pager.hhdm_offset()) as *mut u8;
-        debug_assert!(
-            (virt as usize) & (SLAB_SIZE - 1) == 0,
-            "slab: buddy returned a non-SLAB_SIZE-aligned page"
-        );
+        debug_assert!((virt as usize) & (SLAB_SIZE - 1) == 0, "slab: buddy returned a non-SLAB_SIZE-aligned page");
         let desc = virt as *mut SlabDescriptor;
         // SAFETY: `virt` points to a freshly-allocated, owned page; we
         // are the sole writer.
@@ -297,11 +288,7 @@ impl SlabCache {
             let mut i = 0;
             while i < n {
                 let slot = first.add(i * stride);
-                let next = if i + 1 == n {
-                    ptr::null_mut()
-                } else {
-                    first.add((i + 1) * stride)
-                };
+                let next = if i + 1 == n { ptr::null_mut() } else { first.add((i + 1) * stride) };
                 *(slot as *mut *mut u8) = next;
                 i += 1;
             }
@@ -316,10 +303,7 @@ impl SlabCache {
     ///
     /// # Safety
     /// Caller holds the cache lock; `desc` is on `state.full`.
-    unsafe fn move_full_to_partial(
-        state: &mut SlabCacheState,
-        desc: *mut SlabDescriptor,
-    ) {
+    unsafe fn move_full_to_partial(state: &mut SlabCacheState, desc: *mut SlabDescriptor) {
         // SAFETY: traversing the full list under the cache lock; all
         // pointers in the list are valid slab descriptors we own.
         unsafe {
@@ -339,10 +323,7 @@ impl SlabCache {
                 prev = cur;
                 cur = (*cur).next;
             }
-            debug_assert!(
-                false,
-                "slab: full-to-partial scan failed to locate descriptor"
-            );
+            debug_assert!(false, "slab: full-to-partial scan failed to locate descriptor");
         }
     }
 }
@@ -369,10 +350,7 @@ static SLAB_INITIALISED: AtomicBool = AtomicBool::new(false);
 /// Initialise the seven size-bucket caches. Call exactly once during
 /// boot, after [`crate::mm::heap::init_buddy`].
 pub fn slab_init() {
-    assert!(
-        !SLAB_INITIALISED.swap(true, Ordering::AcqRel),
-        "slab_init called twice"
-    );
+    assert!(!SLAB_INITIALISED.swap(true, Ordering::AcqRel), "slab_init called twice");
     let mut i = 0;
     while i < SIZE_CLASSES.len() {
         // Bucket alignment is capped at `MAX_BUCKET_ALIGN`: bumping align
@@ -566,25 +544,12 @@ mod tests {
             // buddy allocator's low-memory cutoff does not reject the
             // region.
             assert!(aligned >= 0x10_0000);
-            let mut entries = vec![MemoryMapEntry {
-                base: aligned,
-                length: bytes as u64,
-                kind: MEMMAP_USABLE,
-            }];
+            let mut entries = vec![MemoryMapEntry { base: aligned, length: bytes as u64, kind: MEMMAP_USABLE }];
             let entries_ptr: *mut MemoryMapEntry = entries.as_mut_ptr();
             let mut entry_ptrs: Vec<*mut MemoryMapEntry> = vec![entries_ptr];
             let entry_ptrs_ptr = entry_ptrs.as_mut_ptr();
-            let response = Box::new(MemoryMapResponse {
-                revision: 0,
-                entry_count: 1,
-                entries: entry_ptrs_ptr,
-            });
-            Self {
-                _backing: backing,
-                _entries: entries,
-                _entry_ptrs: entry_ptrs,
-                response,
-            }
+            let response = Box::new(MemoryMapResponse { revision: 0, entry_count: 1, entries: entry_ptrs_ptr });
+            Self { _backing: backing, _entries: entries, _entry_ptrs: entry_ptrs, response }
         }
 
         fn memmap(&self) -> &MemoryMapResponse {
@@ -619,10 +584,7 @@ mod tests {
         // because the fake "physical" addresses double as host virtual
         // addresses inside `mem._backing`.
         let buddy = unsafe { BuddyAllocator::new(mem.memmap(), 0) };
-        let pager = LocalBuddy {
-            inner: RefCell::new(buddy),
-            hhdm: 0,
-        };
+        let pager = LocalBuddy { inner: RefCell::new(buddy), hhdm: 0 };
         (mem, pager)
     }
 

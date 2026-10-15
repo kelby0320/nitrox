@@ -32,8 +32,7 @@ use alloc::vec::Vec;
 
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
-    KeyEvent, POINTER_BUTTON, POINTER_ENTER, POINTER_LEAVE, POINTER_PRESSED, POINTER_WHEEL,
-    PointerEvent,
+    KeyEvent, POINTER_BUTTON, POINTER_ENTER, POINTER_LEAVE, POINTER_PRESSED, POINTER_WHEEL, PointerEvent,
 };
 
 use crate::diff::{Tree, Widget};
@@ -106,13 +105,7 @@ impl Router {
     /// the compositor's first `FocusEvent` corrects this within a frame. Starting `false`
     /// would make a client's first paint dim.
     pub fn new() -> Self {
-        Self {
-            focus: None,
-            capture: None,
-            capture_button: None,
-            inside: None,
-            window_focused: true,
-        }
+        Self { focus: None, capture: None, capture_button: None, inside: None, window_focused: true }
     }
 
     /// The focused widget's id, if any.
@@ -192,10 +185,7 @@ impl Router {
 
     /// How `widget` should paint itself.
     pub fn focus_of(&self, widget: u64) -> Focus {
-        Focus {
-            widget_focused: self.focus == Some(widget),
-            window_focused: self.window_focused,
-        }
+        Focus { widget_focused: self.focus == Some(widget), window_focused: self.window_focused }
     }
 
     /// Give focus to `widget` if the tree says it can take it.
@@ -225,12 +215,7 @@ impl Router {
         self.step_focus(tree, element, -1)
     }
 
-    fn step_focus(
-        &mut self,
-        tree: &Tree,
-        element: &Element<impl Sized>,
-        by: isize,
-    ) -> Option<u64> {
+    fn step_focus(&mut self, tree: &Tree, element: &Element<impl Sized>, by: isize) -> Option<u64> {
         let order = focusable_ids(tree, element);
         if order.is_empty() {
             self.focus = None;
@@ -297,12 +282,7 @@ impl Router {
     /// happens to be over, which would make typing depend on where the mouse rests. And a key
     /// nothing claims returns `None` — the caller *is* the application, and it still holds
     /// the event it passed in, so there is no separate "reaches the application" path.
-    pub fn key<Msg>(
-        &self,
-        tree: &Tree,
-        element: &Element<Msg>,
-        event: KeyEvent,
-    ) -> Option<Msg> {
+    pub fn key<Msg>(&self, tree: &Tree, element: &Element<Msg>, event: KeyEvent) -> Option<Msg> {
         let focused = self.focus?;
         let path = path_to_id(tree.root(), focused)?;
         // From the focused widget outward: `path`, then its parent, and so on to the root.
@@ -343,7 +323,6 @@ impl Router {
         let path = path_to_id(tree.root(), id)?;
         (0..=path.len()).rev().find_map(|n| element_at(element, &path[..n])?.on_drop.clone())
     }
-
 
     /// Route a pointer event, returning the messages it produced.
     ///
@@ -400,8 +379,7 @@ impl Router {
             // **Searching from the hit itself**, so a
             // widget that handles its own events — `nxterm`'s grid is a `custom` node with
             // `on_pointer` — captures exactly what it captured before.
-            self.capture =
-                hit_now.map(|hit| handling_ancestor(tree, element, hit).unwrap_or(hit));
+            self.capture = hit_now.map(|hit| handling_ancestor(tree, element, hit).unwrap_or(hit));
             self.capture_button = Some(event.button);
         }
         let target = self.capture.or(hit_now);
@@ -502,8 +480,8 @@ impl Router {
                 && let Some((n_down, e_down)) = nearest(&|e: &Element<Msg>| e.on_press_down.is_some())
                 && let Some(msg) = e_down.on_press_down.clone()
             {
-                let shadowed = nearest(&|e: &Element<Msg>| e.on_press.is_some())
-                    .is_some_and(|(n_click, _)| n_click > n_down);
+                let shadowed =
+                    nearest(&|e: &Element<Msg>| e.on_press.is_some()).is_some_and(|(n_click, _)| n_click > n_down);
                 if !shadowed {
                     out.push(msg);
                 }
@@ -647,11 +625,7 @@ impl Router {
 /// where in *itself* it was clicked; the coordinates are signed, and mid-capture they are
 /// routinely negative.
 fn localise(event: PointerEvent, rect: Rect) -> PointerEvent {
-    PointerEvent {
-        x: event.x.saturating_sub(rect.origin.x),
-        y: event.y.saturating_sub(rect.origin.y),
-        ..event
-    }
+    PointerEvent { x: event.x.saturating_sub(rect.origin.x), y: event.y.saturating_sub(rect.origin.y), ..event }
 }
 
 /// Every focusable widget's id, in tree order.
@@ -855,8 +829,7 @@ mod tests {
     }
 
     fn release(x: i32, y: i32) -> PointerEvent {
-        PointerEvent { kind: POINTER_BUTTON, button: 0x110, buttons: 0, flags: 0, x, y,
-                       ..Default::default() }
+        PointerEvent { kind: POINTER_BUTTON, button: 0x110, buttons: 0, flags: 0, x, y, ..Default::default() }
     }
 
     fn motion(x: i32, y: i32) -> PointerEvent {
@@ -929,8 +902,7 @@ mod tests {
         // The same walk a press does, and for the same reason: a widget drawn out of smaller
         // pieces carries its handler on the outside, so a drop onto a line of text inside a
         // document area is the area's drop.
-        let ui: Element<Msg> =
-            stack(vec![row(vec![text("a line"), text("another")])]).on_drop(Msg::Pressed(4));
+        let ui: Element<Msg> = stack(vec![row(vec![text("a line"), text("another")])]).on_drop(Msg::Pressed(4));
         let (t, l) = build(&ui);
         let r = Router::new();
         assert_eq!(r.drop_at(&t, &ui, &l, 4, 4), Some(Msg::Pressed(4)));
@@ -987,11 +959,7 @@ mod tests {
         let (_, _) = r.pointer(&t, &e, &l, press(at_x, at_y));
         let (msgs, _) = r.pointer(&t, &e, &l, release(at_x, at_y));
         assert_eq!(msgs, vec![Msg::Pressed(1)], "the button still fires");
-        assert_eq!(
-            r.key(&t, &e, key(31)),
-            Some(Msg::Key(key(31))),
-            "and the grid still has the keyboard"
-        );
+        assert_eq!(r.key(&t, &e, key(31)), Some(Msg::Key(key(31))), "and the grid still has the keyboard");
     }
 
     /// A press inside a `button` in a padded column inside a stack produces its message.
@@ -1001,9 +969,9 @@ mod tests {
     /// to the button under the cursor.
     #[test]
     fn a_press_on_a_button_in_a_padded_column_produces_its_message() {
+        use crate::element::Insets;
         use crate::element::padding;
         use crate::widget::{WidgetState, button};
-        use crate::element::Insets;
 
         let p = crate::paint::Theme::default();
         let e: Element<Msg> = stack(vec![
@@ -1144,9 +1112,7 @@ mod tests {
         // release left. Without checking which button, the right release fires `on_press`
         // and the left release fires it again — two clicks for one press-and-release of the
         // button the user actually clicked (PR #184 re-review, finding 2).
-        let e: Element<Msg> = column(vec![
-            custom(1, Size::new(0, 0)).on_press(Msg::Pressed(1)).flex(1),
-        ]);
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).on_press(Msg::Pressed(1)).flex(1)]);
         let (t, l) = build(&e);
         let mut r = Router::new();
 
@@ -1155,12 +1121,22 @@ mod tests {
 
         // Right button down (both held) and up again, without moving.
         let right_down = PointerEvent {
-            kind: POINTER_BUTTON, button: 0x111, buttons: 3, flags: POINTER_PRESSED,
-            x: 10, y: 10, ..Default::default()
+            kind: POINTER_BUTTON,
+            button: 0x111,
+            buttons: 3,
+            flags: POINTER_PRESSED,
+            x: 10,
+            y: 10,
+            ..Default::default()
         };
         let right_up = PointerEvent {
-            kind: POINTER_BUTTON, button: 0x111, buttons: 1, flags: 0,
-            x: 10, y: 10, ..Default::default()
+            kind: POINTER_BUTTON,
+            button: 0x111,
+            buttons: 1,
+            flags: 0,
+            x: 10,
+            y: 10,
+            ..Default::default()
         };
         let (msgs, _) = r.pointer(&t, &e, &l, right_down);
         assert!(msgs.is_empty(), "a second press is not a click");
@@ -1193,8 +1169,7 @@ mod tests {
     #[test]
     fn an_unhandled_key_bubbles_to_an_ancestor() {
         // How a menu accelerator works without every widget knowing about menus.
-        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).focusable()])
-            .on_key(|k| Some(Msg::Key(k)));
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).focusable()]).on_key(|k| Some(Msg::Key(k)));
         let (t, l) = build(&e);
         let _ = l;
         let leaf = t.root().unwrap().children[0].id;
@@ -1210,23 +1185,16 @@ mod tests {
         // handling — so a focused text field swallowed every accelerator and "unhandled keys
         // reach the menu" was unreachable. Here the leaf takes ordinary keys and declines
         // keycode 24, which the ancestor claims.
-        let e: Element<Msg> = column(vec![
-            custom(1, Size::new(0, 0))
-                .on_key(|k| (k.keycode != 24).then_some(Msg::Key(k)))
-                .flex(1),
-        ])
-        .on_key(|k| Some(Msg::Pressed(k.keycode as u8)));
+        let e: Element<Msg> =
+            column(vec![custom(1, Size::new(0, 0)).on_key(|k| (k.keycode != 24).then_some(Msg::Key(k))).flex(1)])
+                .on_key(|k| Some(Msg::Pressed(k.keycode as u8)));
         let (t, _) = build(&e);
         let leaf = t.root().unwrap().children[0].id;
         let mut r = Router::new();
         assert!(r.focus(&t, &e, leaf));
 
         assert_eq!(r.key(&t, &e, key(30)), Some(Msg::Key(key(30))), "an ordinary key stays");
-        assert_eq!(
-            r.key(&t, &e, key(24)),
-            Some(Msg::Pressed(24)),
-            "the declined one reached the ancestor"
-        );
+        assert_eq!(r.key(&t, &e, key(24)), Some(Msg::Pressed(24)), "the declined one reached the ancestor");
     }
 
     #[test]
@@ -1367,11 +1335,7 @@ mod tests {
         let lit: Element<Msg> = column(vec![control(true)]);
         let l2 = layout(&lit, SCREEN, &CELL);
         t.update(&lit, &l2).expect("a clean frame");
-        assert_ne!(
-            ids(&t),
-            before,
-            "the highlight did not re-identify anything, so this test proves nothing"
-        );
+        assert_ne!(ids(&t), before, "the highlight did not re-identify anything, so this test proves nothing");
 
         // …and the release, in that new frame, is still a click on the control it pressed.
         let (msgs, _) = r.pointer(&t, &lit, &l2, release(10, 10));
@@ -1397,9 +1361,7 @@ mod tests {
     fn focus_and_capture_are_dropped_when_their_widgets_go() {
         // The router is not on the destroy path, so it asks the tree — which cannot go out
         // of date the way a callback can.
-        let e: Element<Msg> = column(vec![
-            custom(1, Size::new(0, 0)).focusable().on_pointer(Msg::Ptr).flex(1),
-        ]);
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).focusable().on_pointer(Msg::Ptr).flex(1)]);
         let (mut t, l) = build(&e);
         let leaf = t.root().unwrap().children[0].id;
         let mut r = Router::new();
@@ -1577,13 +1539,7 @@ mod tests {
     // ---- the wheel (M14 Part I) ----
 
     fn turn(x: i32, y: i32, dz: i16) -> PointerEvent {
-        PointerEvent {
-            kind: librsproto::surface::POINTER_WHEEL,
-            wheel: dz,
-            x,
-            y,
-            ..Default::default()
-        }
+        PointerEvent { kind: librsproto::surface::POINTER_WHEEL, wheel: dz, x, y, ..Default::default() }
     }
 
     /// A wheel walks up to the nearest `on_wheel`, past widgets that only track the pointer.
@@ -1594,9 +1550,10 @@ mod tests {
     /// scroll, with nothing to say why.
     #[test]
     fn a_wheel_bubbles_past_a_pointer_handler_to_the_nearest_wheel_handler() {
-        let e: Element<Msg> = sized(Size::new(400, 400), stack(vec![
-            sized(Size::new(200, 200), custom(1, Size::new(0, 0))).on_pointer(Msg::Ptr),
-        ]))
+        let e: Element<Msg> = sized(
+            Size::new(400, 400),
+            stack(vec![sized(Size::new(200, 200), custom(1, Size::new(0, 0))).on_pointer(Msg::Ptr)]),
+        )
         .on_wheel(Msg::Wheel);
         let (t, l) = build(&e);
         let mut r = Router::new();
@@ -1615,8 +1572,7 @@ mod tests {
     /// a widget scroll twice — once from its own handler and once from the pane's.
     #[test]
     fn a_pointer_handler_never_receives_a_wheel() {
-        let e: Element<Msg> =
-            sized(Size::new(400, 400), custom(1, Size::new(0, 0))).on_pointer(Msg::Ptr);
+        let e: Element<Msg> = sized(Size::new(400, 400), custom(1, Size::new(0, 0))).on_pointer(Msg::Ptr);
         let (t, l) = build(&e);
         let mut r = Router::new();
         let (msgs, _) = r.pointer(&t, &e, &l, turn(10, 10, 1));
@@ -1631,9 +1587,7 @@ mod tests {
     fn a_wheel_opens_no_gesture_and_moves_no_focus() {
         let e: Element<Msg> = row(vec![
             sized(Size::new(200, 480), custom(1, Size::new(0, 0)).on_key(|k| Some(Msg::Key(k)))),
-            sized(Size::new(200, 480), custom(2, Size::new(0, 0)))
-                .on_press(Msg::Pressed(9))
-                .on_wheel(Msg::Wheel),
+            sized(Size::new(200, 480), custom(2, Size::new(0, 0))).on_press(Msg::Pressed(9)).on_wheel(Msg::Wheel),
         ]);
         let (t, l) = build(&e);
         let mut r = Router::new();

@@ -170,8 +170,18 @@ pub mod scsi {
         [
             if write { 0x8A } else { 0x88 },
             0,
-            l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7],
-            c[0], c[1], c[2], c[3],
+            l[0],
+            l[1],
+            l[2],
+            l[3],
+            l[4],
+            l[5],
+            l[6],
+            l[7],
+            c[0],
+            c[1],
+            c[2],
+            c[3],
             0,
             0,
         ]
@@ -628,8 +638,13 @@ impl Dev {
             side.push_td(&data[..frags.len()], |_, _| {});
         }
         let dci = if !no_data && input { self.in_dci } else { self.out_dci };
-        self.inflight =
-            Some(Command { owner, tag: self.tag, stage: Stage::Data { dci }, deadline: now + DEADLINE_NS, started: now });
+        self.inflight = Some(Command {
+            owner,
+            tag: self.tag,
+            stage: Stage::Data { dci },
+            deadline: now + DEADLINE_NS,
+            started: now,
+        });
         self.ring(self.out_dci);
         if !no_data && input {
             self.ring(self.in_dci);
@@ -1179,7 +1194,8 @@ impl Binding<'_> {
         let table = read_table(self.x, self.i, port, lun, unit, self.mem);
         let backend = BlockBackend { submit, poll, ctx: context(self.i, lun, self.epoch), max_frags: MAX_FRAGS };
         let geometry = BlockGeometry { logical_block_size: u.block_len, block_count: u.blocks };
-        let Ok(node) = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, &name[..name_len], backend)
+        let Ok(node) =
+            DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, &name[..name_len], backend)
         else {
             crate::kprintln!("usb: port {port}: no memory for its disk's node");
             return false;
@@ -1359,7 +1375,9 @@ fn run(x: &Xhci, i: usize, lun: u8, cdb: &[u8], out: &mut [u8], mem: &mut Device
     let result = match run_once(i, lun, cdb, len, false) {
         Err(e) => Err(e),
         Ok(HubResult::Status(s)) => Ok(s),
-        Ok(HubResult::Fault(Fault::Transfer { dci, code: code::STALL })) if len > 0 && dci == dev_field(i, |d| d.in_dci) => {
+        Ok(HubResult::Fault(Fault::Transfer { dci, code: code::STALL }))
+            if len > 0 && dci == dev_field(i, |d| d.in_dci) =>
+        {
             clear_halt(x, i, dci, mem)?;
             match run_once(i, lun, cdb, 0, true) {
                 Ok(HubResult::Status(s)) => Ok(s),
@@ -1404,8 +1422,10 @@ fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Resul
         return Err(Failed::Device("its device has gone"));
     }
     let at = crate::arch::Timer::read_ns();
-    let signalled =
-        matches!(crate::sched::wait_on(&[po.as_ptr() as usize], at + BIND_NS, at), crate::sched::WaitResult::Signaled(_));
+    let signalled = matches!(
+        crate::sched::wait_on(&[po.as_ptr() as usize], at + BIND_NS, at),
+        crate::sched::WaitResult::Signaled(_)
+    );
     if !signalled {
         match DISKS.take_back(i) {
             TakeBack::Taken => return Err(Failed::Timeout),
@@ -1716,7 +1736,9 @@ pub(super) fn recover(x: &Xhci, i: usize, mem: &mut DeviceMem) -> Recovered {
             }
             _ => Err(()),
         },
-        Fault::Transfer { dci, code: code::STALL } if dci == dev_field(i, |d| if cmd.input { d.in_dci } else { d.out_dci }) => {
+        Fault::Transfer { dci, code: code::STALL }
+            if dci == dev_field(i, |d| if cmd.input { d.in_dci } else { d.out_dci }) =>
+        {
             match clear_halt(x, i, dci, mem).and_then(|_| run_once(i, cmd.lun, &[], 0, true)) {
                 Ok(_) => Ok(Some(KError::IoError as i32)),
                 Err(_) => reset_recovery(x, i, mem).map(|_| Some(KError::IoError as i32)).map_err(|_| ()),
@@ -1955,7 +1977,12 @@ mod tests {
 
     impl Fake {
         fn new() -> Fake {
-            Fake { rings: [zeroed(RING_TRBS * 2), zeroed(RING_TRBS * 2)], wrap: zeroed(512), data: zeroed(BIND_DATA / 8), db: zeroed(32) }
+            Fake {
+                rings: [zeroed(RING_TRBS * 2), zeroed(RING_TRBS * 2)],
+                wrap: zeroed(512),
+                data: zeroed(BIND_DATA / 8),
+                db: zeroed(32),
+            }
         }
 
         fn dev(&mut self, slot: u8) -> Dev {
@@ -2060,9 +2087,17 @@ mod tests {
 
         let mut second = irp(IrpOp::Write, 0, 512, &frags[..1]);
         assert_eq!(disks.submit(&mut second, ctx, 0), Action::None, "queued");
-        assert_eq!(disks.on_transfer(9, 4, code::SUCCESS, 0x99, 1), Some(Action::None), "OUT's event is not the data's");
+        assert_eq!(
+            disks.on_transfer(9, 4, code::SUCCESS, 0x99, 1),
+            Some(Action::None),
+            "OUT's event is not the data's"
+        );
         assert_eq!(fake.trb(0, 2), Trb::default(), "so no status yet");
-        assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, 0x10_000, 1), Some(Action::None), "the data stage ends short");
+        assert_eq!(
+            disks.on_transfer(9, 3, code::SHORT_PACKET, 0x10_000, 1),
+            Some(Action::None),
+            "the data stage ends short"
+        );
         assert_eq!(fake.trb(0, 2).0[2] & 0x1_FFFF, CSW_LEN as u32, "and the status is asked for");
         fake.answer(1, 0);
         let at = csw_trb(&disks, i);
@@ -2249,7 +2284,11 @@ mod tests {
         let mut a = irp(IrpOp::Flush, 0, 0, &[]);
         disks.submit(&mut a, ctx, 0);
         assert_eq!(fake.trb(1, 0).0[3] & (1 << 5), 1 << 5, "with no data, the command wrapper interrupts");
-        assert_eq!(disks.on_transfer(2, 4, code::SUCCESS, 0, 1), Some(Action::None), "and its event asks for the status");
+        assert_eq!(
+            disks.on_transfer(2, 4, code::SUCCESS, 0, 1),
+            Some(Action::None),
+            "and its event asks for the status"
+        );
         fake.answer(1, 1);
         assert_eq!(disks.on_transfer(2, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Wake));
         assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Status(Status::Failed)));
@@ -2494,7 +2533,10 @@ mod tests {
         assert_eq!(q[0], Some(&mut queued as *mut Irp), "the queue handed back");
         assert_eq!(f, [Some(&mut inflight as *mut Irp), None, None], "and the command in flight");
         let mut late = irp(IrpOp::Flush, 0, 0, &[]);
-        assert_eq!(disks.submit(&mut late, old, 0), Action::Complete { irp: &mut late, status: KError::PeerClosed as i32, transferred: 0 });
+        assert_eq!(
+            disks.submit(&mut late, old, 0),
+            Action::Complete { irp: &mut late, status: KError::PeerClosed as i32, transferred: 0 }
+        );
 
         let (again, new_epoch) = disks.take(fake.dev(50)).unwrap();
         assert_eq!(again, i, "the departed device's slot");

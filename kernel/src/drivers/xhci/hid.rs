@@ -15,7 +15,7 @@
 //! old node is refused rather than served the next device's ring. The served index above it is
 //! never reissued.
 
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use super::context;
 use super::hub::{self, DeviceMem, Failed};
@@ -24,14 +24,14 @@ use super::{RING_TRBS, Xhci, write32};
 use crate::arch::timer::ArchTimer;
 use crate::drivers::hid::{keyboard, mouse};
 use crate::drivers::input::{self, DRAIN_MAX, ParkedRead, ReadNow, Reader, Submitted};
+use crate::libkern::IrqSpinLock;
 use crate::libkern::device::DeviceKind;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::input::{EV_KEY, InputEvent, KEY_PRESS};
 use crate::libkern::lockrank::LockRank;
-use crate::libkern::IrqSpinLock;
 use crate::mm::dma::DmaBuffer;
-use crate::object::device_node::{CharBackend, DeviceNode, ResourceDescriptor};
 use crate::object::ObjectRef;
+use crate::object::device_node::{CharBackend, DeviceNode, ResourceDescriptor};
 use crate::syscall::error::KError;
 
 /// USB input nodes a boot can publish.
@@ -215,19 +215,22 @@ impl Nodes {
         }
         let max_len = input::read_len(max_len)?;
         let mut tmp = [0u8; DRAIN_MAX];
-        let found = input::read_or_park(|| self.reclaim(), || {
-            let mut r = self.readers[index].lock();
-            // **Under the node's lock**, against which a reused slot's reset is ordered: a node from an
-            // earlier epoch reads none of the next device's ring.
-            if !self.current(ctx) {
-                return ReadNow::Gone;
-            }
-            let found = r.read_now(&mut tmp[..max_len], now);
-            if found == ReadNow::Empty {
-                r.park(ParkedRead::new(po, buffer, buf_offset, max_len));
-            }
-            found
-        });
+        let found = input::read_or_park(
+            || self.reclaim(),
+            || {
+                let mut r = self.readers[index].lock();
+                // **Under the node's lock**, against which a reused slot's reset is ordered: a node from an
+                // earlier epoch reads none of the next device's ring.
+                if !self.current(ctx) {
+                    return ReadNow::Gone;
+                }
+                let found = r.read_now(&mut tmp[..max_len], now);
+                if found == ReadNow::Empty {
+                    r.park(ParkedRead::new(po, buffer, buf_offset, max_len));
+                }
+                found
+            },
+        );
         match found {
             Submitted::Drained(n) => input::deliver_now(buffer, po, buf_offset, &tmp[..n]),
             Submitted::Parked => {}
@@ -476,8 +479,14 @@ pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]
             ring: ring_phys,
             cycle: producer.cycle(),
         };
-        prepared[i] =
-            Some(Prepared { c, producer, ring_virt, ring_phys, buf_phys: buf.phys().as_u64(), buf_virt: buf.virt() as u64 });
+        prepared[i] = Some(Prepared {
+            c,
+            producer,
+            ring_virt,
+            ring_phys,
+            buf_phys: buf.phys().as_u64(),
+            buf_virt: buf.virt() as u64,
+        });
         // **The device's memory**: freed with it, and only after its slot is disabled.
         if mem.class.try_push(ring).is_err() || mem.class.try_push(buf).is_err() {
             crate::kprintln!("usb: port {port}: no memory for its endpoints; not bound");
@@ -656,11 +665,19 @@ impl core::fmt::Display for Said<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let tries = match *self.0 {
             Described::Layout(Layout::Mouse(l), t) => {
-                f.write_str(if l.wheel.is_some() { ", report protocol, with a wheel" } else { ", report protocol, with no wheel" })?;
+                f.write_str(if l.wheel.is_some() {
+                    ", report protocol, with a wheel"
+                } else {
+                    ", report protocol, with no wheel"
+                })?;
                 t
             }
             Described::Layout(Layout::Keyboard(l), t) => {
-                f.write_str(if l.array.is_none() { ", report protocol, its keys a bitmap" } else { ", report protocol" })?;
+                f.write_str(if l.array.is_none() {
+                    ", report protocol, its keys a bitmap"
+                } else {
+                    ", report protocol"
+                })?;
                 t
             }
             Described::None => return f.write_str(", boot protocol: it has no report descriptor"),
@@ -824,7 +841,8 @@ pub(super) fn on_transfer(x: &Xhci, trb: &Trb) {
     let mut halted = false;
     let target = {
         let mut t = x.hid.lock();
-        let Some(b) = t.entries.iter_mut().flatten().find(|b| b.slot == trb.slot_id() && b.dci == trb.endpoint_id()) else {
+        let Some(b) = t.entries.iter_mut().flatten().find(|b| b.slot == trb.slot_id() && b.dci == trb.endpoint_id())
+        else {
             return;
         };
         match trb.completion_code() {

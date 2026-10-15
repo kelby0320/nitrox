@@ -52,11 +52,7 @@ pub fn parse_error(body: &[u8]) -> Option<ErrorView<'_>> {
     if body.len() < end {
         return None;
     }
-    Some(ErrorView {
-        kerror: get_u32(body, 0) as i32,
-        server_code: get_u32(body, 4),
-        msg: &body[ERROR_BODY_LEN..end],
-    })
+    Some(ErrorView { kerror: get_u32(body, 0) as i32, server_code: get_u32(body, 4), msg: &body[ERROR_BODY_LEN..end] })
 }
 
 #[cfg(test)]

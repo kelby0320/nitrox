@@ -124,40 +124,20 @@ fn elements() -> [Element; 6] {
     let argb = PixelFormat::ARGB8888;
     [
         // Fully on-screen, padded stride of its own.
-        Element {
-            geometry: Geometry::with_pitch(24, 14, 112, xrgb).unwrap(),
-            origin: Point::new(6, 5),
-            seed: 0x21,
-        },
+        Element { geometry: Geometry::with_pitch(24, 14, 112, xrgb).unwrap(), origin: Point::new(6, 5), seed: 0x21 },
         // Overlaps the first, and is drawn over it.
-        Element {
-            geometry: Geometry::with_pitch(20, 12, 84, xrgb).unwrap(),
-            origin: Point::new(18, 11),
-            seed: 0x8C,
-        },
+        Element { geometry: Geometry::with_pitch(20, 12, 84, xrgb).unwrap(), origin: Point::new(18, 11), seed: 0x8C },
         // Hangs off the left edge: negative origin.
-        Element {
-            geometry: Geometry::packed(18, 10, xrgb),
-            origin: Point::new(-7, 20),
-            seed: 0x4D,
-        },
+        Element { geometry: Geometry::packed(18, 10, xrgb), origin: Point::new(-7, 20), seed: 0x4D },
         // Hangs off the bottom-right corner, and is in the *opposite* channel order.
-        Element {
-            geometry: Geometry::with_pitch(14, 9, 60, xbgr).unwrap(),
-            origin: Point::new(54, 25),
-            seed: 0xB6,
-        },
+        Element { geometry: Geometry::with_pitch(14, 9, 60, xbgr).unwrap(), origin: Point::new(54, 25), seed: 0xB6 },
         // **Translucent, and placed over two other surfaces and the background** (M13 Part B).
         // Topmost so that what it blends with is settled: the pixels beneath it are the first
         // two elements and the ground, so this one number covers blending against a surface and
         // blending against the background. It also has a padded stride of its own, because the
         // per-pixel blend path reads its source with different arithmetic from the row copy and
         // would not inherit the stride coverage the opaque elements give.
-        Element {
-            geometry: Geometry::with_pitch(22, 13, 100, argb).unwrap(),
-            origin: Point::new(12, 8),
-            seed: 0x5A,
-        },
+        Element { geometry: Geometry::with_pitch(22, 13, 100, argb).unwrap(), origin: Point::new(12, 8), seed: 0x5A },
         // Entirely off-screen: must contribute nothing. **Last on purpose** — the test that
         // drops it drops the final element, so a new element goes above this line.
         Element {
@@ -175,13 +155,9 @@ fn elements() -> [Element; 6] {
 pub fn render_reference() -> MemFramebuffer {
     let mut fb = MemFramebuffer::new(screen_geometry());
     let elements = elements();
-    let pixels: Vec<Vec<u8>> =
-        elements.iter().map(|e| fill_pattern(e.geometry, e.seed)).collect();
-    let surfaces: Vec<SurfaceRef<'_>> = elements
-        .iter()
-        .zip(pixels.iter())
-        .map(|(e, px)| SurfaceRef::new(e.geometry, e.origin, px))
-        .collect();
+    let pixels: Vec<Vec<u8>> = elements.iter().map(|e| fill_pattern(e.geometry, e.seed)).collect();
+    let surfaces: Vec<SurfaceRef<'_>> =
+        elements.iter().zip(pixels.iter()).map(|(e, px)| SurfaceRef::new(e.geometry, e.origin, px)).collect();
     compose_full(&mut fb, BACKGROUND, &surfaces);
     fb
 }
@@ -264,8 +240,7 @@ mod tests {
         // Re-render without the last element and confirm the picture is identical.
         let mut fb = MemFramebuffer::new(screen_geometry());
         let elements = elements();
-        let pixels: Vec<Vec<u8>> =
-            elements.iter().map(|e| fill_pattern(e.geometry, e.seed)).collect();
+        let pixels: Vec<Vec<u8>> = elements.iter().map(|e| fill_pattern(e.geometry, e.seed)).collect();
         let surfaces: Vec<SurfaceRef<'_>> = elements
             .iter()
             .zip(pixels.iter())

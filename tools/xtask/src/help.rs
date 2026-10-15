@@ -80,8 +80,12 @@ mod tests {
         let dispatch = &dispatch[..dispatch.find("Some(other) =>").unwrap()];
         let help = include_str!("help.rs");
         let help = &help[help.find("fn print_help()").unwrap()..help.find("#[cfg(test)]").unwrap()];
-        let commands: Vec<&str> =
-            dispatch.split("Some(\"").skip(1).filter_map(|s| s.split('"').next()).filter(|c| !c.starts_with('-')).collect();
+        let commands: Vec<&str> = dispatch
+            .split("Some(\"")
+            .skip(1)
+            .filter_map(|s| s.split('"').next())
+            .filter(|c| !c.starts_with('-'))
+            .collect();
         assert!(commands.len() > 30, "{commands:?}");
         for cmd in commands {
             assert!(help.contains(&format!(" {cmd} ")), "`cargo xtask {cmd}` is missing from print_help");

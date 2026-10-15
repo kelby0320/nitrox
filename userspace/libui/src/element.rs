@@ -585,8 +585,7 @@ impl<Msg> Element<Msg> {
         // One iterator type for every shape, so callers do not each re-derive the match.
         // `Dock` yields its edge children before the filler, which is also the order layout
         // consumes them in and the order they are painted.
-        let (a, b, c): (&[Element<Msg>], Option<&Element<Msg>>, Option<&Element<Msg>>) =
-            match &self.node {
+        let (a, b, c): (&[Element<Msg>], Option<&Element<Msg>>, Option<&Element<Msg>>) = match &self.node {
             Node::Text(_)
             | Node::Fill(_)
             | Node::Bevel(_)
@@ -612,10 +611,7 @@ impl<Msg> Element<Msg> {
             Node::Dock { edges, .. } => Some(edges),
             _ => None,
         };
-        a.iter()
-            .chain(docked.into_iter().flatten().map(|d| &d.element))
-            .chain(b)
-            .chain(c)
+        a.iter().chain(docked.into_iter().flatten().map(|d| &d.element)).chain(b).chain(c)
     }
 }
 
@@ -694,10 +690,7 @@ pub fn icon<Msg>(kind: IconKind) -> Element<Msg> {
 
 /// Text at another step of the size scale — see [`Node::Scale`].
 pub fn scaled<Msg>(size: TextSize, child: Element<Msg>) -> Element<Msg> {
-    Element::new(Node::Scale {
-        size,
-        child: Box::new(child),
-    })
+    Element::new(Node::Scale { size, child: Box::new(child) })
 }
 
 /// Text in the fixed-advance face — see [`Node::Mono`].
@@ -707,9 +700,7 @@ pub fn mono<Msg>(child: Element<Msg>) -> Element<Msg> {
 
 /// Text inside `child`, in the face's bold. See [`Node::Bold`].
 pub fn bold<Msg>(child: Element<Msg>) -> Element<Msg> {
-    Element::new(Node::Bold {
-        child: Box::new(child),
-    })
+    Element::new(Node::Bold { child: Box::new(child) })
 }
 
 /// A child in the middle of its parent's rectangle — see [`Node::Center`].
@@ -818,8 +809,7 @@ mod tests {
         // this too, so a different order here would silently re-pair every docked child
         // with the filler.
         let d: Element<Msg> =
-            dock(vec![docked(Edge::Top, text("bar")), docked(Edge::Right, text("scroll"))],
-                 text("fill"));
+            dock(vec![docked(Edge::Top, text("bar")), docked(Edge::Right, text("scroll"))], text("fill"));
         let kinds: Vec<&str> = d
             .children()
             .map(|c| match &c.node {

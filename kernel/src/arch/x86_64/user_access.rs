@@ -36,11 +36,7 @@
 ///   case the recovery path converts the fault into the `true`
 ///   return.
 #[cfg(not(test))]
-pub(crate) unsafe fn copy_bytes_raw(
-    dst: *mut u8,
-    src: *const u8,
-    len: usize,
-) -> bool {
+pub(crate) unsafe fn copy_bytes_raw(dst: *mut u8, src: *const u8, len: usize) -> bool {
     if len == 0 {
         return false;
     }
@@ -97,11 +93,7 @@ pub(crate) unsafe fn copy_bytes_raw(
 }
 
 #[cfg(test)]
-pub(crate) unsafe fn copy_bytes_raw(
-    dst: *mut u8,
-    src: *const u8,
-    len: usize,
-) -> bool {
+pub(crate) unsafe fn copy_bytes_raw(dst: *mut u8, src: *const u8, len: usize) -> bool {
     // Host stub. No SMAP, no exception table; the asm body is what
     // the integration test will eventually exercise. The mm-layer
     // wrapper tests use this to verify validation plumbing without
@@ -135,11 +127,7 @@ pub enum CstrCopyOutcome {
 /// memory, `dst` provides `max_len` writable kernel bytes, SMAP is
 /// enabled.
 #[cfg(not(test))]
-pub(crate) unsafe fn copy_cstr_raw(
-    dst: *mut u8,
-    src: *const u8,
-    max_len: usize,
-) -> CstrCopyOutcome {
+pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize) -> CstrCopyOutcome {
     let result_code: u64;
     let count: u64;
     // SAFETY: forwarded from this function's contract. The asm uses
@@ -219,11 +207,7 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) unsafe fn copy_cstr_raw(
-    dst: *mut u8,
-    src: *const u8,
-    max_len: usize,
-) -> CstrCopyOutcome {
+pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize) -> CstrCopyOutcome {
     if FAIL_NEXT_CSTR_COPY.with(|f| f.replace(false)) {
         return CstrCopyOutcome::Fault;
     }

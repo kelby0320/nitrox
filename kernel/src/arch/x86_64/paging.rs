@@ -19,8 +19,8 @@
 use crate::arch::paging::{ArchPaging, MapError, PageFlags, UnmapError};
 use crate::arch::x86_64::regs;
 use crate::libkern::SpinLock;
-use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
 use crate::libkern::lockrank::LockRank;
+use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
 
 /// Entries per page table at every level. A 4 KiB frame of 8-byte entries.
 const PAGE_TABLE_ENTRIES: usize = 512;
@@ -55,7 +55,6 @@ const PTE_NX: u64 = 1 << 63;
 
 /// Physical-address field of an entry: bits 51:12.
 const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-
 
 // --- Page-table entry ---------------------------------------------------
 
@@ -387,12 +386,7 @@ unsafe fn write_kernel_half_entries(root: PhysAddr, entries: &[u64; KERNEL_PML4_
 pub struct X86Paging;
 
 impl ArchPaging for X86Paging {
-    unsafe fn map_page(
-        root: PhysAddr,
-        virt: VirtAddr,
-        phys: PhysAddr,
-        flags: PageFlags,
-    ) -> Result<(), MapError> {
+    unsafe fn map_page(root: PhysAddr, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), MapError> {
         if !virt.is_canonical() || !virt.is_page_aligned() || !phys.is_page_aligned() {
             return Err(MapError::Misaligned);
         }
@@ -480,9 +474,7 @@ impl ArchPaging for X86Paging {
 
     unsafe fn inherit_kernel_mappings(root: PhysAddr) {
         let template = KERNEL_TEMPLATE.lock();
-        let entries = template
-            .as_ref()
-            .expect("inherit_kernel_mappings called before init_kernel_template");
+        let entries = template.as_ref().expect("inherit_kernel_mappings called before init_kernel_template");
         // SAFETY: forwarded from `ArchPaging::inherit_kernel_mappings` —
         // `root` is a writable PML4 owned by the caller, reachable via
         // HHDM. We touch only entries 256..512 (the kernel half);
@@ -492,10 +484,7 @@ impl ArchPaging for X86Paging {
         }
     }
 
-    unsafe fn ensure_kernel_intermediate(
-        root: PhysAddr,
-        virt: VirtAddr,
-    ) -> Result<(), MapError> {
+    unsafe fn ensure_kernel_intermediate(root: PhysAddr, virt: VirtAddr) -> Result<(), MapError> {
         let index = pml4_index(virt);
         // SAFETY: forwarded from `ArchPaging::ensure_kernel_intermediate` —
         // `root` is a valid PML4 reachable through HHDM.
@@ -653,10 +642,7 @@ mod tests {
         // SAFETY: see `map_translate_unmap_round_trip`.
         unsafe {
             X86Paging::map_page(root, virt, phys, PageFlags::empty()).unwrap();
-            assert_eq!(
-                X86Paging::map_page(root, virt, phys, PageFlags::empty()),
-                Err(MapError::AlreadyMapped),
-            );
+            assert_eq!(X86Paging::map_page(root, virt, phys, PageFlags::empty()), Err(MapError::AlreadyMapped),);
         }
     }
 
@@ -700,22 +686,12 @@ mod tests {
                 "unaligned virtual address",
             );
             assert_eq!(
-                X86Paging::map_page(
-                    root,
-                    VirtAddr::new(0x0001_0000_0000_0000),
-                    phys,
-                    PageFlags::empty(),
-                ),
+                X86Paging::map_page(root, VirtAddr::new(0x0001_0000_0000_0000), phys, PageFlags::empty(),),
                 Err(MapError::Misaligned),
                 "non-canonical virtual address",
             );
             assert_eq!(
-                X86Paging::map_page(
-                    root,
-                    VirtAddr::new(0x1000),
-                    PhysAddr::new(0x800),
-                    PageFlags::empty(),
-                ),
+                X86Paging::map_page(root, VirtAddr::new(0x1000), PhysAddr::new(0x800), PageFlags::empty(),),
                 Err(MapError::Misaligned),
                 "unaligned physical address",
             );
@@ -784,10 +760,10 @@ mod tests {
         let captured = unsafe { read_kernel_half_entries(source) };
 
         for i in 0..KERNEL_PML4_COUNT {
-            let expected = 0xDEAD_0000_0000_0000u64
-                .wrapping_add((KERNEL_PML4_BASE + i) as u64);
+            let expected = 0xDEAD_0000_0000_0000u64.wrapping_add((KERNEL_PML4_BASE + i) as u64);
             assert_eq!(
-                captured[i], expected,
+                captured[i],
+                expected,
                 "kernel entry {i} (PML4 slot {}): expected {expected:#x}, got {:#x}",
                 KERNEL_PML4_BASE + i,
                 captured[i]
@@ -815,11 +791,7 @@ mod tests {
             assert_eq!(after[i], expected, "user-half entry {i} was modified");
         }
         for i in 0..KERNEL_PML4_COUNT {
-            assert_eq!(
-                after[KERNEL_PML4_BASE + i],
-                entries[i],
-                "kernel-half entry {i} was not written"
-            );
+            assert_eq!(after[KERNEL_PML4_BASE + i], entries[i], "kernel-half entry {i} was not written");
         }
     }
 
@@ -845,13 +817,8 @@ mod tests {
             assert_eq!(after[i], 0, "user half not zero at entry {i}");
         }
         for i in 0..KERNEL_PML4_COUNT {
-            let expected = 0xFEED_0000_0000_0000u64
-                .wrapping_add((KERNEL_PML4_BASE + i) as u64);
-            assert_eq!(
-                after[KERNEL_PML4_BASE + i],
-                expected,
-                "round-trip mismatch at kernel entry {i}"
-            );
+            let expected = 0xFEED_0000_0000_0000u64.wrapping_add((KERNEL_PML4_BASE + i) as u64);
+            assert_eq!(after[KERNEL_PML4_BASE + i], expected, "round-trip mismatch at kernel entry {i}");
         }
     }
 

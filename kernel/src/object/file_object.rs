@@ -50,14 +50,14 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use crate::dpc::Dpc;
 use crate::arch::timer::ArchTimer;
+use crate::dpc::Dpc;
 use crate::libkern::handle::KObjectType;
+use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
 use crate::object::header::KObjectHeader;
 use crate::object::{ObjectRef, PendingOperation, StoredMsg};
-use crate::libkern::lockrank::LockRank;
 
 /// How a [`FileObject`] **fills** a cache page on a fault — the producer behind the
 /// page cache's fill seam. The real producer is [`FsServer`](Producer::FsServer)
@@ -404,11 +404,7 @@ impl FileObject {
     }
 
     /// As [`try_new`](Self::try_new), for a Model A file whose blocks `runs` maps.
-    pub fn try_new_with_runs(
-        size: usize,
-        producer: Producer,
-        runs: KVec<BlockRun>,
-    ) -> Result<KBox<Self>, AllocError> {
+    pub fn try_new_with_runs(size: usize, producer: Producer, runs: KVec<BlockRun>) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::FileObject),
             magic: Self::MAGIC,
@@ -588,10 +584,7 @@ impl FileObject {
         debug_assert_eq!(candidate.object_type(), KObjectType::FileObject);
         // SAFETY: both references pin live objects of the asserted types (header at offset 0).
         let (r, cand) = unsafe {
-            (
-                &*(reg.as_ptr() as *const crate::object::UserspaceServerReg),
-                &*(candidate.as_ptr() as *const FileObject),
-            )
+            (&*(reg.as_ptr() as *const crate::object::UserspaceServerReg), &*(candidate.as_ptr() as *const FileObject))
         };
         let id = cand.file_id().expect("a cached object has an id");
         match r.cache_get_or_insert(id, &candidate).map_err(|_| CacheInError::OutOfMemory)? {
@@ -804,10 +797,7 @@ impl FileObject {
     /// Look up page `index`: its frame + [`PageState`] if cached, else `None`.
     pub fn lookup(&self, index: usize) -> Option<(PhysAddr, PageState)> {
         let g = self.inner.lock();
-        g.pages
-            .iter()
-            .find(|p| p.index == index)
-            .map(|p| (p.frame, p.state))
+        g.pages.iter().find(|p| p.index == index).map(|p| (p.frame, p.state))
     }
 
     /// Reserve page `index` for the fault path. A cache hit returns
@@ -924,7 +914,6 @@ impl FileObject {
         }
     }
 
-
     /// **Fault page `index` in**, blocking until it is resident: a cache hit returns
     /// at once; a miss reserves a frame, starts the producer fill (asynchronous), and
     /// **parks the calling thread** on the fill's `PendingOperation` until it
@@ -1017,13 +1006,9 @@ impl FileObject {
                     // A hole completes its PO synchronously with no device I/O; counting
                     // it as a fill would understate what a real fill costs.
                     if started_kind == FillStart::Hole {
-                        fill_stats::HOLE_FILLS
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        fill_stats::HOLE_FILLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     } else {
-                        fill_stats::record_fill(
-                            crate::arch::Timer::read_ns().saturating_sub(started),
-                            pages as u64,
-                        );
+                        fill_stats::record_fill(crate::arch::Timer::read_ns().saturating_sub(started), pages as u64);
                     }
                     // Loop: the page is now `Ready` → return its frame.
                 }
@@ -1097,7 +1082,12 @@ impl FileObject {
     /// [`begin_write`](Self::begin_write) decides, at most `max`, handed over as its frames, the
     /// device byte offset and the length, `issue` answering the IRP's completion status. Apart so a
     /// host test can drive it with a device that records what reached it.
-    fn write_runs(&self, block_size: u32, max: usize, mut issue: impl FnMut(&[PhysAddr], u64, u64) -> i32) -> WriteBack {
+    fn write_runs(
+        &self,
+        block_size: u32,
+        max: usize,
+        mut issue: impl FnMut(&[PhysAddr], u64, u64) -> i32,
+    ) -> WriteBack {
         // Which pages are resident, under the lock, in order; each run is then decided afresh as
         // its IRP is issued, so a `Forget` stops the write-back before its next run and a resize
         // redirects it.
@@ -1208,9 +1198,7 @@ impl FileObject {
             let n = core::cmp::min(PAGE_SIZE, remaining);
             // SAFETY: `fault_in_page` returned a resident, HHDM-reachable frame for page
             // `i`; reading `n <= PAGE_SIZE` bytes from its HHDM mapping is sound.
-            let page = unsafe {
-                core::slice::from_raw_parts((frame.as_u64() + heap::hhdm_offset()) as *const u8, n)
-            };
+            let page = unsafe { core::slice::from_raw_parts((frame.as_u64() + heap::hhdm_offset()) as *const u8, n) };
             buf.try_extend_from_slice(page)?;
             remaining -= n;
         }
@@ -1335,11 +1323,11 @@ impl FileObject {
             Ok(m) => m,
             Err(_) => return false,
         };
-        let body_len =
-            match crate::rsproto::build_read_range_request(&mut msg.payload, offset, len, suffix.as_bytes()) {
-                Some(n) => n,
-                None => return false,
-            };
+        let body_len = match crate::rsproto::build_read_range_request(&mut msg.payload, offset, len, suffix.as_bytes())
+        {
+            Some(n) => n,
+            None => return false,
+        };
         msg.header.payload_len = body_len as u32;
         msg.header.handle_count = 0;
         // Originate: records the pending fill on `reg` and pushes the request. The
@@ -1428,13 +1416,7 @@ struct StubFillBox {
 /// drained at the next interrupt-dispatch tail — so the faulting thread genuinely
 /// parks and resumes. `false` on box-allocation failure. `file_obj` is the object's
 /// reference; the box clones it (and `po`) so they outlive the deferred fill.
-fn stub_start_fill(
-    file_obj: &ObjectRef,
-    index: usize,
-    frame: PhysAddr,
-    po: &ObjectRef,
-    base: u8,
-) -> bool {
+fn stub_start_fill(file_obj: &ObjectRef, index: usize, frame: PhysAddr, po: &ObjectRef, base: u8) -> bool {
     let bx = match KBox::try_new(StubFillBox {
         dpc: Dpc::new(stub_fill_dpc, core::ptr::null_mut()),
         file_obj: file_obj.clone(),
@@ -1471,11 +1453,7 @@ fn stub_fill_dpc(ctx: *mut ()) {
     // SAFETY: `frame` is a live, HHDM-reachable cache frame owned by `file_obj`
     // (which `bx` keeps alive); fill the whole page with the stub byte.
     unsafe {
-        core::ptr::write_bytes(
-            (bx.frame.as_u64() + heap::hhdm_offset()) as *mut u8,
-            bx.fill_byte,
-            PAGE_SIZE,
-        );
+        core::ptr::write_bytes((bx.frame.as_u64() + heap::hhdm_offset()) as *mut u8, bx.fill_byte, PAGE_SIZE);
     }
     // SAFETY: `bx.file_obj` pins a live `FileObject`.
     let fo: &FileObject = unsafe { &*(bx.file_obj.as_ptr() as *const FileObject) };
@@ -1635,9 +1613,18 @@ mod tests {
     fn distinct_pages_get_distinct_frames() {
         init_global_heap();
         let f = fobj(8 * PAGE_SIZE);
-        let a = match f.reserve(0) { Reserve::New(fr) => fr, o => panic!("{o:?}") };
-        let b = match f.reserve(5) { Reserve::New(fr) => fr, o => panic!("{o:?}") };
-        let c = match f.reserve(3) { Reserve::New(fr) => fr, o => panic!("{o:?}") };
+        let a = match f.reserve(0) {
+            Reserve::New(fr) => fr,
+            o => panic!("{o:?}"),
+        };
+        let b = match f.reserve(5) {
+            Reserve::New(fr) => fr,
+            o => panic!("{o:?}"),
+        };
+        let c = match f.reserve(3) {
+            Reserve::New(fr) => fr,
+            o => panic!("{o:?}"),
+        };
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(b, c);
@@ -1694,8 +1681,9 @@ mod tests {
         let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let device = unsafe { ObjectRef::from_raw(KBox::into_raw(dev).as_ptr() as *mut (), KObjectType::DeviceNode) };
-        let f = FileObject::try_new(size, Producer::FsServerBlocks { device, block_size, reg: reg.clone(), file_id: id })
-            .unwrap();
+        let f =
+            FileObject::try_new(size, Producer::FsServerBlocks { device, block_size, reg: reg.clone(), file_id: id })
+                .unwrap();
         // SAFETY: as above.
         unsafe { ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject) }
     }
@@ -1707,7 +1695,10 @@ mod tests {
 
     /// Fill page `index` with `byte` and mark it ready, as a fault and its fill would.
     fn fill(f: &FileObject, index: usize, byte: u8) -> PhysAddr {
-        let frame = match f.reserve(index) { Reserve::New(fr) => fr, o => panic!("{o:?}") };
+        let frame = match f.reserve(index) {
+            Reserve::New(fr) => fr,
+            o => panic!("{o:?}"),
+        };
         for off in 0..PAGE_SIZE {
             write_frame_byte(frame, off, byte);
         }
@@ -1953,7 +1944,10 @@ mod tests {
         assert_eq!(read_one(file_of(&f), 1, 4096), 0, "a grown block is not");
         assert_eq!(read_one(file_of(&f), 2, 4096), 0);
         fill(file_of(&f), 1, 0xB1);
-        assert!(matches!(file_of(&f).begin_write(1, 4096, 1, &mut KVec::new()), WriteStep::Go(101, 1)), "but is written back");
+        assert!(
+            matches!(file_of(&f).begin_write(1, 4096, 1, &mut KVec::new()), WriteStep::Go(101, 1)),
+            "but is written back"
+        );
         file_of(&f).end_io();
 
         // One-KiB blocks, four to a page: page 0 holds the old block and three of the grow's, page 1
@@ -2010,7 +2004,12 @@ mod tests {
     }
 
     /// The IRP that writes pages `pages` from device block `block` of `block_size` bytes.
-    fn irp(frames: &std::collections::BTreeMap<usize, PhysAddr>, pages: core::ops::Range<usize>, block: u64, block_size: u64) -> Irp {
+    fn irp(
+        frames: &std::collections::BTreeMap<usize, PhysAddr>,
+        pages: core::ops::Range<usize>,
+        block: u64,
+        block_size: u64,
+    ) -> Irp {
         let length = (pages.len() * PAGE_SIZE) as u64;
         (pages.map(|i| frames[&i]).collect(), block * block_size, length)
     }
@@ -2178,7 +2177,10 @@ mod tests {
         for (k, &fr) in frames.iter().enumerate().skip(1) {
             assert_eq!(fo.lookup(k), Some((fr, PageState::Loading)), "page {k} reserved into its frame");
         }
-        assert!(matches!(fo.reserve_fault(5), Fault::Wait(w) if w.as_ptr() == fill_po.as_ptr()), "a fault on one waits on the fill");
+        assert!(
+            matches!(fo.reserve_fault(5), Fault::Wait(w) if w.as_ptr() == fill_po.as_ptr()),
+            "a fault on one waits on the fill"
+        );
         assert!(matches!(fo.forget(&po()), Forgotten::Later(_)), "one IRP in flight");
         let (f, _) = mapped_file(&reg, 8, 100, 4096, &[(0, 1000, 40), (40, 5000, 64)], 0..0);
         let fo = file_of(&f);
@@ -2260,9 +2262,11 @@ mod tests {
         }
         fn disk_poll(_: *mut ()) {}
         let seen = Seen(RefCell::new(std::vec::Vec::new()));
-        let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
+        let backend =
+            BlockBackend { submit: disk_submit, poll: disk_poll, ctx: &seen as *const Seen as *mut (), max_frags: 8 };
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
-        let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
+        let node =
+            DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let device = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
         let reg = registration();
@@ -2283,7 +2287,11 @@ mod tests {
         let (op, offset, length) = unsafe { ((*irp).op, (*irp).offset, (*irp).length) };
         assert_eq!((op, offset, length), (crate::io::irp::IrpOp::Read as u32, 1000 * 4096, 8 * PAGE_SIZE as u64));
         let expected: std::vec::Vec<u64> = (0..8).map(|i| file_of(&f).lookup(i).unwrap().0.as_u64()).collect();
-        assert_eq!(frags.iter().map(|fr| fr.base).collect::<std::vec::Vec<_>>(), expected, "a fragment a page, in order");
+        assert_eq!(
+            frags.iter().map(|fr| fr.base).collect::<std::vec::Vec<_>>(),
+            expected,
+            "a fragment a page, in order"
+        );
         assert_eq!(expected[0], frame.as_u64());
         // SAFETY: as above; the device's side of a completion, a success of the whole length.
         unsafe { ((*irp).status, (*irp).transferred) = (0, length) };
@@ -2317,9 +2325,11 @@ mod tests {
             unsafe { (*(ctx as *const Held)).0.borrow_mut().push(irp) };
         }
         fn disk_poll(_: *mut ()) {}
-        let backend = BlockBackend { submit: disk_submit, poll: disk_poll, ctx: held as *const Held as *mut (), max_frags: 8 };
+        let backend =
+            BlockBackend { submit: disk_submit, poll: disk_poll, ctx: held as *const Held as *mut (), max_frags: 8 };
         let geometry = BlockGeometry { logical_block_size: 512, block_count: 1 << 20 };
-        let node = DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
+        let node =
+            DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let device = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
         let reg = registration();
@@ -2337,7 +2347,12 @@ mod tests {
     /// **The disk's side, then the scheduler's**: every IRP `held` completes, failed if it reads
     /// page `bad`, each recorded in `reads` as (first page, pages); then whether `po`'s fill
     /// succeeded, as a fault woken from it learns.
-    fn complete_held(held: &Held, reads: &core::cell::RefCell<std::vec::Vec<(u64, u64)>>, bad: u64, po: &ObjectRef) -> bool {
+    fn complete_held(
+        held: &Held,
+        reads: &core::cell::RefCell<std::vec::Vec<(u64, u64)>>,
+        bad: u64,
+        po: &ObjectRef,
+    ) -> bool {
         let irps: std::vec::Vec<_> = held.0.borrow_mut().drain(..).collect();
         for irp in irps {
             // SAFETY: the IRP is live until it is completed here; this is the device's side.
@@ -2483,7 +2498,10 @@ mod tests {
         let reg = registration();
         let a = two_block_file(&reg, 7);
         let fo = file_of(&a);
-        assert!(matches!(fo.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)), "page 0's IRP is issued");
+        assert!(
+            matches!(fo.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)),
+            "page 0's IRP is issued"
+        );
         let answer = po();
         let Forgotten::Later(wait_on) = fo.forget(&answer) else { panic!("an IRP is in flight") };
         assert_eq!(wait_on.as_ptr(), answer.as_ptr());
@@ -2506,7 +2524,10 @@ mod tests {
         let reg = registration();
         let a = two_block_file(&reg, 7);
         let fo = file_of(&a);
-        assert!(matches!(fo.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)), "page 0's IRP is issued");
+        assert!(
+            matches!(fo.begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)),
+            "page 0's IRP is issued"
+        );
         let answer = po();
         let Forgotten::Later(first) = reg_of(&reg).forget_file(7, &answer) else { panic!("an IRP is in flight") };
         assert_eq!(first.as_ptr(), answer.as_ptr());
@@ -2533,10 +2554,7 @@ mod tests {
         assert_eq!(reg_of(&reg).cache_objects().unwrap().len(), 0, "no sync sees it");
         let again = resolve(&reg, 7, PAGE_SIZE);
         assert_ne!(again.as_ptr(), a.as_ptr(), "a resolve gets a new object");
-        assert!(
-            matches!(reg_of(&reg).forget_file(7, &po()), Forgotten::Now),
-            "the new file has nothing in flight"
-        );
+        assert!(matches!(reg_of(&reg).forget_file(7, &po()), Forgotten::Now), "the new file has nothing in flight");
         assert!(file_of(&again).is_dead(), "and it is the one forgotten");
         assert_eq!(
             file_of(&a).end_io().map(|p| p.as_ptr()),
@@ -2609,7 +2627,11 @@ mod tests {
         init_global_heap();
         assert_eq!(WriteBack::of(0), WriteBack::Written);
         assert_eq!(WriteBack::of(crate::syscall::error::KError::PeerClosed as i32), WriteBack::Gone);
-        assert_eq!(WriteBack::of(crate::syscall::error::KError::IoError as i32), WriteBack::Failed, "a disk that may answer again");
+        assert_eq!(
+            WriteBack::of(crate::syscall::error::KError::IoError as i32),
+            WriteBack::Failed,
+            "a disk that may answer again"
+        );
         let reg = registration();
         let a = two_block_file(&reg, 7);
         FileObject::writable_mapped(&a);

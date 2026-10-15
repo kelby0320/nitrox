@@ -216,7 +216,11 @@ fn a_chain_shorter_than_its_file_is_corrupt_to_read() {
     let mut runs = [BlockRun::default(); 64];
     assert_eq!(fat.map_file(b"/short.bin", &mut runs).err(), Some(FsError::Corrupt));
     assert_eq!(fat.read_file(b"/short.bin", &mut buf), Err(FsError::Corrupt));
-    assert_eq!(fat.read_file_range(b"/short.bin", 8192, 4096, &mut buf), Err(FsError::Corrupt), "wholly past the chain");
+    assert_eq!(
+        fat.read_file_range(b"/short.bin", 8192, 4096, &mut buf),
+        Err(FsError::Corrupt),
+        "wholly past the chain"
+    );
     assert_eq!(fat.read_file_range(b"/short.bin", 0, 100, &mut buf), Ok(100), "within the chain, a read is a read");
 }
 

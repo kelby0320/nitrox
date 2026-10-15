@@ -41,13 +41,7 @@ pub fn wait_until(handles: &[u64], deadline: u64) -> Option<usize> {
     }
     // SAFETY: valid buffers; at most four handles.
     let n = unsafe {
-        syscall4(
-            SYS_WAIT,
-            handles.as_ptr() as u64,
-            handles.len() as u64,
-            results.as_mut_ptr() as u64,
-            deadline,
-        )
+        syscall4(SYS_WAIT, handles.as_ptr() as u64, handles.len() as u64, results.as_mut_ptr() as u64, deadline)
     };
     if n < 1 {
         return None;
@@ -65,13 +59,7 @@ pub fn recv(ch: u64) -> Result<Option<Msg>, ()> {
     let mut count = 0usize;
     // SAFETY: valid recv out-params.
     let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            ch,
-            buf.as_mut_ptr() as u64,
-            hs.as_mut_ptr() as u64,
-            (&raw mut count) as u64,
-        )
+        syscall4(SYS_CHANNEL_RECV, ch, buf.as_mut_ptr() as u64, hs.as_mut_ptr() as u64, (&raw mut count) as u64)
     };
     if rr == KError::PeerClosed.as_i32() as i64 {
         return Err(());

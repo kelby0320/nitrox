@@ -26,8 +26,8 @@ extern crate alloc;
 
 use core::arch::asm;
 use libkern::{
-    CLOCK_MONOTONIC, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT,
-    exit, kprint, syscall1, syscall2, syscall4,
+    CLOCK_MONOTONIC, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, exit, kprint,
+    syscall1, syscall2, syscall4,
 };
 
 /// `alloc` backing for the C3 setup-message stage path (`run_stream_stage`).

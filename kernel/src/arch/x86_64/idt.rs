@@ -49,19 +49,17 @@ use core::arch::asm;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use super::registers::RegisterValues;
 use crate::arch::Cpu;
+use crate::arch::Paging;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::irq::{ArchIrq, SPURIOUS_VECTOR, TIMER_VECTOR};
-use crate::arch::x86_64::gdt::KERNEL_CODE_SELECTOR;
 use crate::arch::paging::ArchPaging;
+use crate::arch::x86_64::gdt::KERNEL_CODE_SELECTOR;
 use crate::arch::x86_64::regs;
-use crate::arch::Paging;
-use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
 use crate::arch::x86_64::serial;
-use crate::libkern::notification::{
-    FaultKind, KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, Notification,
-};
-use super::registers::RegisterValues;
+use crate::libkern::notification::{FaultKind, KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, Notification};
+use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
 
 /// A 64-bit IDT gate descriptor (16 bytes).
 #[repr(C)]
@@ -80,15 +78,8 @@ const _: () = assert!(size_of::<IdtEntry>() == 16);
 
 impl IdtEntry {
     /// An empty (not-present) gate.
-    const EMPTY: IdtEntry = IdtEntry {
-        offset_low: 0,
-        selector: 0,
-        ist: 0,
-        type_attr: 0,
-        offset_mid: 0,
-        offset_high: 0,
-        reserved: 0,
-    };
+    const EMPTY: IdtEntry =
+        IdtEntry { offset_low: 0, selector: 0, ist: 0, type_attr: 0, offset_mid: 0, offset_high: 0, reserved: 0 };
 
     /// Point this gate at `handler`, running on IST slot `ist` (0 = none,
     /// i.e. use the stack the CPU was already on). Marks the gate present,
@@ -605,8 +596,7 @@ const DEVICE_IRQ_COUNT: usize = 8;
 /// Registered handler per device vector, as a function pointer stored in a
 /// `usize` (`0` = none). Written once at registration (boot), read in IRQ
 /// context — lock-free.
-static DEVICE_HANDLERS: [AtomicUsize; DEVICE_IRQ_COUNT] =
-    [const { AtomicUsize::new(0) }; DEVICE_IRQ_COUNT];
+static DEVICE_HANDLERS: [AtomicUsize; DEVICE_IRQ_COUNT] = [const { AtomicUsize::new(0) }; DEVICE_IRQ_COUNT];
 /// Next free device-vector slot, handed out by [`register_device_handler`].
 static NEXT_DEVICE_SLOT: AtomicUsize = AtomicUsize::new(0);
 
@@ -706,17 +696,15 @@ device_irq_stub!(dev_irq_36, "0x36");
 device_irq_stub!(dev_irq_37, "0x37");
 
 /// Device-IRQ entry stubs, indexed by `vector - DEVICE_IRQ_BASE`.
-const DEVICE_STUBS: [extern "C" fn(); DEVICE_IRQ_COUNT] = [
-    dev_irq_30, dev_irq_31, dev_irq_32, dev_irq_33, dev_irq_34, dev_irq_35, dev_irq_36, dev_irq_37,
-];
+const DEVICE_STUBS: [extern "C" fn(); DEVICE_IRQ_COUNT] =
+    [dev_irq_30, dev_irq_31, dev_irq_32, dev_irq_33, dev_irq_34, dev_irq_35, dev_irq_36, dev_irq_37];
 
 /// Entry stubs for CPU exception vectors 0-31, indexed by vector number. Each
 /// `iretq`s on the ring-3 fault→`Resume` path (see [`exception_stub`]) and
 /// otherwise diverges, so the type is `extern "C" fn()` (not `-> !`).
 const STUBS: [extern "C" fn(); 32] = [
-    vec0, vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, vec9, vec10, vec11, vec12, vec13, vec14,
-    vec15, vec16, vec17, vec18, vec19, vec20, vec21, vec22, vec23, vec24, vec25, vec26, vec27,
-    vec28, vec29, vec30, vec31,
+    vec0, vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, vec9, vec10, vec11, vec12, vec13, vec14, vec15, vec16, vec17,
+    vec18, vec19, vec20, vec21, vec22, vec23, vec24, vec25, vec26, vec27, vec28, vec29, vec30, vec31,
 ];
 
 /// Short mnemonic for a CPU exception vector.

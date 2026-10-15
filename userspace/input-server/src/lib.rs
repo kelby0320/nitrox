@@ -13,8 +13,7 @@
 #![deny(missing_docs)]
 
 use libkern::abi::{
-    EV_REL, EV_SYN, InputEvent, LIGHT_CAPS, LIGHT_NUM, LIGHT_SCROLL, REL_WHEEL, REL_X, REL_Y, SYN_DROPPED,
-    SYN_REPORT,
+    EV_REL, EV_SYN, InputEvent, LIGHT_CAPS, LIGHT_NUM, LIGHT_SCROLL, REL_WHEEL, REL_X, REL_Y, SYN_DROPPED, SYN_REPORT,
 };
 
 /// Events buffered from one device per wakeup.
@@ -270,12 +269,7 @@ impl Consumer {
         }
         let mut n = 0;
         if self.lost > 0 {
-            out[0] = InputEvent {
-                kind: EV_SYN,
-                code: SYN_DROPPED,
-                value: self.lost as i32,
-                time_ns: now_ns,
-            };
+            out[0] = InputEvent { kind: EV_SYN, code: SYN_DROPPED, value: self.lost as i32, time_ns: now_ns };
             n = 1;
             self.lost = 0;
         }
@@ -397,8 +391,7 @@ pub mod devices {
     use super::MAX_DEVICES;
     use libkern::device::{DeviceKind, DeviceRecord};
     use librsproto::devices::{
-        OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, parse_arrived, parse_departed,
-        parse_settled,
+        OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, parse_arrived, parse_departed, parse_settled,
     };
 
     /// A message on the subscription, classified.
@@ -440,9 +433,7 @@ pub mod devices {
                 None => Notice::Malformed,
             },
             OP_DEVICES_SETTLED if handles == 0 => parse_settled(body).map_or(Notice::Malformed, Notice::Settled),
-            OP_DEVICES_DEPARTED if handles == 0 => {
-                parse_departed(body).map_or(Notice::Malformed, Notice::Departed)
-            }
+            OP_DEVICES_DEPARTED if handles == 0 => parse_departed(body).map_or(Notice::Malformed, Notice::Departed),
             _ => Notice::Malformed,
         }
     }
@@ -664,8 +655,9 @@ mod tests {
     #[test]
     fn a_long_harvest_is_split_only_between_groups() {
         // Groups of three records: a batch of eight holds two, never two and two-thirds.
-        let events: Vec<InputEvent> =
-            (0..5u64).flat_map(|t| [rel(1, t), InputEvent { kind: EV_REL, code: REL_Y, value: 1, time_ns: t }, syn(t)]).collect();
+        let events: Vec<InputEvent> = (0..5u64)
+            .flat_map(|t| [rel(1, t), InputEvent { kind: EV_REL, code: REL_Y, value: 1, time_ns: t }, syn(t)])
+            .collect();
         let runs: Vec<core::ops::Range<usize>> = batches(&events, 8).collect();
         assert_eq!(runs, vec![0..6, 6..12, 12..15]);
         for r in &runs {
@@ -689,8 +681,7 @@ mod tests {
         use crate::devices::{Arrival, Notice, Table, notice};
         use libkern::device::{DeviceKind, DeviceRecord};
         use librsproto::devices::{
-            OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, build_arrived, build_departed,
-            build_settled,
+            OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, build_arrived, build_departed, build_settled,
         };
 
         fn arrived(id: u32, kind: DeviceKind) -> Vec<u8> {
@@ -924,13 +915,7 @@ mod tests {
         // is deferred again — so an undersized buffer is not a truncation but a consumer that
         // never receives anything again.
         let mut c = Consumer::new();
-        c.defer(&[
-            key(30, 1),
-            rel_code(REL_X, 1, 1),
-            rel_code(REL_Y, 1, 1),
-            rel_code(REL_WHEEL, 1, 1),
-            syn(1),
-        ]);
+        c.defer(&[key(30, 1), rel_code(REL_X, 1, 1), rel_code(REL_Y, 1, 1), rel_code(REL_WHEEL, 1, 1), syn(1)]);
         let batch = [InputEvent::default(); BATCH_MAX];
         let mut out = [InputEvent::default(); FRAME_MAX];
         assert_eq!(c.frame(&batch, 99, &mut out), Some(FRAME_MAX));

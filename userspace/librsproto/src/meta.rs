@@ -65,11 +65,7 @@ pub fn parse_hello_reply(body: &[u8]) -> Option<HelloReply> {
     if body.len() < HELLO_REPLY_LEN {
         return None;
     }
-    Some(HelloReply {
-        agreed_version: get_u16(body, 0),
-        server_caps: get_u32(body, 2),
-        server_flags: get_u32(body, 6),
-    })
+    Some(HelloReply { agreed_version: get_u16(body, 0), server_caps: get_u32(body, 2), server_flags: get_u32(body, 6) })
 }
 
 // --- Ping (liveness) --------------------------------------------------------

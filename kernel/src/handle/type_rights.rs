@@ -38,21 +38,17 @@ const PRINCIPAL_MASK: Rights = Rights::from_bits_truncate(
 );
 
 /// Principal rights valid on [`KObjectType::Process`] handles.
-const PROCESS_PRINCIPALS: Rights =
-    Rights::from_bits_truncate(Rights::SIGNAL.bits() | Rights::TERMINATE.bits());
+const PROCESS_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::SIGNAL.bits() | Rights::TERMINATE.bits());
 
 /// Principal rights valid on [`KObjectType::Thread`] handles.
-const THREAD_PRINCIPALS: Rights =
-    Rights::from_bits_truncate(Rights::SIGNAL.bits() | Rights::TERMINATE.bits());
+const THREAD_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::SIGNAL.bits() | Rights::TERMINATE.bits());
 
 /// Principal rights valid on [`KObjectType::Namespace`] handles.
-const NAMESPACE_PRINCIPALS: Rights =
-    Rights::from_bits_truncate(Rights::LOOKUP.bits() | Rights::BIND.bits());
+const NAMESPACE_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::LOOKUP.bits() | Rights::BIND.bits());
 
 /// Principal rights valid on [`KObjectType::MemoryObject`] handles.
-const MEMORY_OBJECT_PRINCIPALS: Rights = Rights::from_bits_truncate(
-    Rights::MAP_READ.bits() | Rights::MAP_WRITE.bits() | Rights::MAP_EXEC.bits(),
-);
+const MEMORY_OBJECT_PRINCIPALS: Rights =
+    Rights::from_bits_truncate(Rights::MAP_READ.bits() | Rights::MAP_WRITE.bits() | Rights::MAP_EXEC.bits());
 
 /// Principal rights valid on [`KObjectType::FileObject`] handles. A mapped file is
 /// mappable like a `MemoryObject` (the `MAP_*` band); the actual grant is attenuated
@@ -61,14 +57,12 @@ const MEMORY_OBJECT_PRINCIPALS: Rights = Rights::from_bits_truncate(
 const FILE_OBJECT_PRINCIPALS: Rights = MEMORY_OBJECT_PRINCIPALS;
 
 /// Principal rights valid on [`KObjectType::IpcChannel`] handles.
-const IPC_CHANNEL_PRINCIPALS: Rights =
-    Rights::from_bits_truncate(Rights::SEND.bits() | Rights::RECV.bits());
+const IPC_CHANNEL_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::SEND.bits() | Rights::RECV.bits());
 
 /// Principal rights valid on [`KObjectType::IoRing`] handles. The
 /// SQE/CQE memory regions need read and write for the producer and
 /// consumer halves of the ring.
-const IO_RING_PRINCIPALS: Rights =
-    Rights::from_bits_truncate(Rights::READ.bits() | Rights::WRITE.bits());
+const IO_RING_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::READ.bits() | Rights::WRITE.bits());
 
 /// Principal rights valid on [`KObjectType::EntropyObject`] handles.
 const ENTROPY_PRINCIPALS: Rights = Rights::READ;
@@ -143,20 +137,14 @@ mod tests {
     #[test]
     fn invalid_and_userspace_server_reg_always_rejected() {
         assert!(!is_rights_compatible(KObjectType::Invalid, Rights::empty()));
-        assert!(!is_rights_compatible(
-            KObjectType::UserspaceServerReg,
-            Rights::empty(),
-        ));
+        assert!(!is_rights_compatible(KObjectType::UserspaceServerReg, Rights::empty(),));
     }
 
     #[test]
     fn process_accepts_signal_terminate_only() {
         assert!(is_rights_compatible(KObjectType::Process, Rights::SIGNAL));
         assert!(is_rights_compatible(KObjectType::Process, Rights::TERMINATE));
-        assert!(is_rights_compatible(
-            KObjectType::Process,
-            Rights::SIGNAL | Rights::TERMINATE,
-        ));
+        assert!(is_rights_compatible(KObjectType::Process, Rights::SIGNAL | Rights::TERMINATE,));
         // READ is a principal right not in Process's mask.
         assert!(!is_rights_compatible(KObjectType::Process, Rights::READ));
         // MAP_WRITE is principal — the spec's own example of a

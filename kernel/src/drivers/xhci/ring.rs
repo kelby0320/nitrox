@@ -533,7 +533,12 @@ mod tests {
     /// A Transfer Event's endpoint and residual, from dwords 3 and 2.
     #[test]
     fn a_transfer_events_endpoint_and_residual_read_from_their_bits() {
-        let ev = Trb([0x2000, 0, (code::SHORT_PACKET as u32) << 24 | 46, 4 << 24 | 1 << 16 | kind::TRANSFER_EVENT << 10 | 1]);
+        let ev = Trb([
+            0x2000,
+            0,
+            (code::SHORT_PACKET as u32) << 24 | 46,
+            4 << 24 | 1 << 16 | kind::TRANSFER_EVENT << 10 | 1,
+        ]);
         assert_eq!((ev.slot_id(), ev.endpoint_id(), ev.residual()), (4, 1, 46));
         assert_eq!(ev.completion_code(), code::SHORT_PACKET);
     }
@@ -553,7 +558,12 @@ mod tests {
     /// by field.
     #[test]
     fn an_events_fields_read_from_their_dwords() {
-        let ev = Trb([0x1234_5670, 0x0000_0001, (code::SUCCESS as u32) << 24 | 7, 3 << 24 | kind::COMMAND_COMPLETION << 10 | 1]);
+        let ev = Trb([
+            0x1234_5670,
+            0x0000_0001,
+            (code::SUCCESS as u32) << 24 | 7,
+            3 << 24 | kind::COMMAND_COMPLETION << 10 | 1,
+        ]);
         assert_eq!(ev.kind(), kind::COMMAND_COMPLETION);
         assert_eq!(ev.pointer(), 0x1_1234_5670);
         assert_eq!(ev.completion_code(), code::SUCCESS);
