@@ -63,7 +63,10 @@ fn failures(files: &[(String, usize)], baseline: &Baseline) -> Vec<String> {
     }
     for path in baseline.keys() {
         if !files.iter().any(|(p, _)| p == path) {
-            out.push(format!("{path}: listed but gone: run `cargo xtask check-size --update`"));
+            out.push(format!(
+                "{path}: listed but gone: if it moved, `cargo xtask check-size --rename {path} <new path>`; \
+                 if it went, `cargo xtask check-size --update`"
+            ));
         }
     }
     out
@@ -81,6 +84,35 @@ fn updated(files: &[(String, usize)], baseline: &Baseline) -> Baseline {
     out
 }
 
+/// Moves `old`'s entry to `new`, the file it became: at most its old allowance, and none when `new`
+/// is 1,000 lines or fewer.
+fn renamed(files: &[(String, usize)], baseline: &Baseline, old: &str, new: &str) -> R<Baseline> {
+    let entry = *baseline.get(old).ok_or_else(|| format!("{old} has no entry to move"))?;
+    if files.iter().any(|(p, _)| p == old) {
+        return Err(format!("{old} still exists: a rename moves an entry from a file that has gone").into());
+    }
+    if baseline.contains_key(new) {
+        return Err(format!("{new} already has an entry").into());
+    }
+    let (_, lines) = files.iter().find(|(p, _)| p == new).ok_or_else(|| format!("{new} is not a tracked Rust file"))?;
+    let mut out = baseline.clone();
+    out.remove(old);
+    if *lines > LIMIT {
+        out.insert(new.to_string(), entry.min(*lines));
+    }
+    Ok(out)
+}
+
+/// The paths a NUL-separated `git ls-files` listing names, once each: a conflicted merge lists a
+/// path once per stage.
+fn rs_paths(listing: &[u8]) -> Vec<String> {
+    let mut paths: Vec<String> =
+        String::from_utf8_lossy(listing).split('\0').filter(|p| !p.is_empty()).map(String::from).collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn measure() -> R<Vec<(String, usize)>> {
     let root = crate::repo_root();
     let out = Command::new("git")
@@ -91,11 +123,11 @@ fn measure() -> R<Vec<(String, usize)>> {
         return Err(format!("git ls-files: {}", String::from_utf8_lossy(&out.stderr)).into());
     }
     let mut files = Vec::new();
-    for path in String::from_utf8_lossy(&out.stdout).split('\0').filter(|p| !p.is_empty()) {
-        let full = root.join(path);
+    for path in rs_paths(&out.stdout) {
+        let full = root.join(&path);
         if full.is_file() {
-            let lines = std::fs::read(&full)?.iter().filter(|&&b| b == b'\n').count();
-            files.push((path.to_string(), lines));
+            let bytes = std::fs::read(&full).map_err(|e| format!("{}: {e}", full.display()))?;
+            files.push((path, bytes.iter().filter(|&&b| b == b'\n').count()));
         }
     }
     Ok(files)
@@ -104,7 +136,15 @@ fn measure() -> R<Vec<(String, usize)>> {
 pub(crate) fn cmd_check_size(args: &[String]) -> R<()> {
     let files = measure()?;
     let path = crate::repo_root().join(BASELINE);
-    let mut baseline = parse_baseline(&std::fs::read_to_string(&path)?)?;
+    let mut baseline = parse_baseline(&crate::read_text(&path)?)?;
+    if let Some(i) = args.iter().position(|a| a == "--rename") {
+        let (Some(old), Some(new)) = (args.get(i + 1), args.get(i + 2)) else {
+            return Err("check-size --rename takes OLD NEW".into());
+        };
+        baseline = renamed(&files, &baseline, old, new)?;
+        std::fs::write(&path, format_baseline(&baseline))?;
+        println!("check-size: {old} -> {new}");
+    }
     if args.iter().any(|a| a == "--update") {
         let new = updated(&files, &baseline);
         for (file, old) in &baseline {
@@ -170,6 +210,35 @@ mod tests {
         let b = base(&[("lower.rs", 1500), ("small.rs", 1200), ("gone.rs", 1100), ("grew.rs", 1100)]);
         let f = files(&[("lower.rs", 1400), ("small.rs", 1000), ("grew.rs", 1300), ("new.rs", 2000)]);
         assert_eq!(updated(&f, &b), base(&[("lower.rs", 1400), ("grew.rs", 1100)]));
+    }
+
+    #[test]
+    fn a_rename_moves_the_entry_with_its_file() {
+        let b = base(&[("old.rs", 1500), ("other.rs", 1200)]);
+        let moved = renamed(&files(&[("new.rs", 1400), ("other.rs", 1200)]), &b, "old.rs", "new.rs").unwrap();
+        assert_eq!(moved, base(&[("new.rs", 1400), ("other.rs", 1200)]));
+        let grew = renamed(&files(&[("new.rs", 1600)]), &base(&[("old.rs", 1500)]), "old.rs", "new.rs").unwrap();
+        assert_eq!(grew, base(&[("new.rs", 1500)]), "a rename never raises the allowance");
+        let small = renamed(&files(&[("new.rs", 1000)]), &base(&[("old.rs", 1500)]), "old.rs", "new.rs").unwrap();
+        assert_eq!(small, base(&[]));
+    }
+
+    #[test]
+    fn a_rename_is_refused_unless_it_is_one() {
+        let b = base(&[("old.rs", 1500), ("listed.rs", 1200)]);
+        for (f, old, new) in [
+            (files(&[("old.rs", 1500), ("new.rs", 1400)]), "old.rs", "new.rs"),
+            (files(&[("listed.rs", 1200)]), "old.rs", "listed.rs"),
+            (files(&[]), "old.rs", "new.rs"),
+            (files(&[("new.rs", 1400)]), "unlisted.rs", "new.rs"),
+        ] {
+            assert!(renamed(&f, &b, old, new).is_err(), "{old} -> {new}");
+        }
+    }
+
+    #[test]
+    fn a_path_listed_once_a_merge_stage_is_measured_once() {
+        assert_eq!(rs_paths(b"x.rs\0x.rs\0x.rs\0a.rs\0"), ["a.rs", "x.rs"]);
     }
 
     #[test]

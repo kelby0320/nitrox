@@ -1,28 +1,6 @@
 //! Nitrox build orchestrator.
 //!
-//! Subcommands:
-//!   build           build the kernel ELF
-//!   image           build kernel + assemble a UEFI-bootable GPT/FAT32 image
-//!   qemu            build + launch QEMU with OVMF
-//!   qemu-debug      build + launch QEMU paused for GDB on :1234
-//!   test            host-side unit tests (kernel lib + tools workspace)
-//!   test-qemu       boot a headless self-test image; adjudicate via isa-debug-exit
-//!   check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry
-//!   check-docs      fail if a doc links to, or cites, a path that does not exist
-//!   check-images    fail if a test image and a release image differ by anything new
-//!   preview         render the toolkit on the host to a PNG; no boot
-//!   check-display   boot + screendump; compare the screen against a libdraw render
-//!   check-terminal  boot + type into the GUI terminal; assert the shell answered
-//!   check-login     boot the release image + drive the graphical greeter to a session
-//!   check-logout    log out from the desktop's power menu, waiting on the editor's question
-//!   check-fbcon     boot with no serial port; read the boot, the handover and a panic off the screen
-//!   check-live      boot the live image as a USB stick with no disk; mount, greeter, and a write
-//!   check-media     the live desktop: a stick plugged in, shown in Files, saved to, ejected
-//!   throughput-stick write the image of the stick Phase 6 Part H's copies are timed with; `--check`
-//!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
-//!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
-//!   fetch-limine    download the pinned limine-binary tarball into the cache
-//!   clean           remove all build outputs and caches
+//! `cargo xtask help` lists its commands.
 //!
 //! **Host tooling, and the kernel's rules do not reach it.** No "stable Rust only" and no
 //! "no external crates": both are about what runs on the target. What applies here is written
@@ -41,7 +19,11 @@ use std::process::{Command, ExitCode};
 
 mod comments;
 mod docs;
+mod files;
+mod help;
 mod size;
+
+use files::read_text;
 
 /// The kernel console's glyphs and layout, compiled here by path so that `check-fbcon` reads a
 /// screendump back into text with the code the kernel drew it with — the same face, palette and
@@ -576,7 +558,7 @@ fn main() -> ExitCode {
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
         Some("clean") => cmd_clean(),
         Some("help") | Some("--help") | Some("-h") | None => {
-            print_help();
+            help::print_help();
             Ok(())
         }
         Some(other) => Err(format!("unknown subcommand: {other}").into()),
@@ -591,68 +573,6 @@ fn main() -> ExitCode {
     }
 }
 
-fn print_help() {
-    println!(
-        "Nitrox build orchestrator.\n\
-         \n\
-         Usage: cargo xtask <command> [args]\n\
-         \n\
-         Commands:\n  \
-           build         build the kernel ELF\n  \
-           image         build + assemble a UEFI-bootable disk image\n  \
-           qemu          build + launch QEMU with OVMF\n  \
-           qemu-debug    build + launch QEMU paused for GDB on :1234\n  \
-           test          host-side unit tests (kernel lib + tools)\n  \
-           test-qemu     boot a headless self-test image; pass/fail via isa-debug-exit\n  \
-           test-interactive  boot the release image and drive a real login + shell\n  \
-           check-terminal    click into nxterm, type, and check the shell's answer renders\n  \
-           check-login       type a wrong then a right password at the graphical greeter\n  \
-           check-logout      log out from the power menu: an editor's question, Cancel, the greeter\n  \
-           check-fbcon       boot with no serial port; read the boot and a panic off the screen\n  \
-           check-live        boot the live image as a USB stick: no disk, a RAM-disk root, a write\n  \
-           check-report      pick the live menu's hardware report with no serial port; read its pages\n  \
-           check-install     install to a blank disk from the live menu, then boot that disk\n  \
-           check-recovery    reset a password on an installed disk from the live image, then boot it\n  \
-           check-resolutions run four display gates at five screen sizes; on demand, not in CI\n  \
-           check-input       inject a key and a click; check both reach a userspace client\n  \
-           \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
-           \x20                tick-driven recovery sweep is the only path input takes\n  \
-           \x20                `--usb` (here, `check-login`, `check-report`): no i8042, and a\n  \
-           \x20                USB keyboard and mouse, so every key and click is USB's\n  \
-           check-display     boot + screendump; compare the screen to a libdraw render\n  \
-           bench-compose     what composing a drag costs, and where (M13 Part A)\n  \
-           throughput-stick  write the stick Part H's copies are timed with; `--check IMAGE`\n  \
-           \x20                reads one back and checks every file by its pattern\n  \
-           preview           render the toolkit here and write a PNG; `preview ui|ui-dark|term|all`\n  \
-           shot              boot the release image and photograph the desktop; `shot all`, or\n  \
-           \x20                one of greeter|desktop|apps|windows|terminal|hover|files|editor|overview\n  \
-           check-arch    fail if kernel code outside arch/ uses arch internals\n  \
-           check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
-           check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
-           check-docs      fail if a doc links to, or cites, a path that does not exist\n  \
-           check-images    fail if a test image and a release image differ by anything new\n  \
-           check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope\n  \
-           abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI\n  \
-           fetch-limine  download the pinned Limine binary tarball\n  \
-           clean         remove build outputs and caches\n  \
-           help          show this message\n\
-         \n\
-         `--selftest` (build/image/qemu) compiles + runs the boot self-tests / demos;\n         \
-         without it the build boots straight to userspace.\n         \
-         `--grab` (qemu/qemu-debug) hands the window the pointer and keyboard. The\n         \
-         guest has a relative mouse and no absolute one, so ungrabbed its cursor and\n         \
-         yours are two independent cursors that never line up, and every `Super`\n         \
-         chord belongs to your desktop instead. Ctrl-Alt-G releases the grab.\n         \
-         `--kvm` (any command that boots a guest) runs under hardware virtualisation\n         \
-         instead of TCG — faster, and required on a host whose QEMU predates 9.0 (TCG\n         \
-         emulates x2APIC only from 9.0, and this kernel is x2APIC-only).\n         \
-         `--size WxH` (the screen gates, `shot`, `bench-compose`, `qemu`/`qemu-debug`)\n         \
-         sets the screen QEMU boots. The gates default to 1360x768 and `qemu` to\n         \
-         QEMU's 1280x800. The width must be a multiple of 8, or QEMU shears every row;\n         \
-         `check-resolutions` runs the display gates at five sizes.\n         \
-         Other args after `qemu` / `qemu-debug` are forwarded to QEMU.\n"
-    );
-}
 
 // --- Paths --------------------------------------------------------------
 

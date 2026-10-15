@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{repo_root, R};
+use crate::{read_text, repo_root, R};
 
 /// `cargo xtask check-docs` — the documentation cannot point at things that do not exist.
 ///
@@ -78,7 +78,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
         md_files.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from)).collect();
 
     let mut check = |path: &Path| -> R<()> {
-        let text = fs::read_to_string(path)?;
+        let text = read_text(path)?;
         let dir = path.parent().unwrap_or(&root).to_path_buf();
         for (i, line) in text.lines().enumerate() {
             let at = |m: &str| format!("{}:{}: {m}", path.display(), i + 1);
@@ -202,7 +202,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
         let known = match anchor_cache.get(&target) {
             Some(a) => a,
             None => {
-                let a = heading_anchors(&fs::read_to_string(&target)?);
+                let a = heading_anchors(&read_text(&target)?);
                 anchor_cache.entry(target.clone()).or_insert(a)
             }
         };
@@ -231,7 +231,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
             let path = entry?.path();
             if path.extension().map_or(false, |e| e == "md") {
                 arch_docs += 1;
-                let text = fs::read_to_string(&path)?;
+                let text = read_text(&path)?;
                 let has_status = text.lines().take(20).any(|l| {
                     let t = l
                         .trim_start_matches('#')
@@ -264,8 +264,8 @@ pub(crate) fn cmd_check_docs() -> R<()> {
         ("syscall", "kernel/src/syscall/table.rs", "docs/spec/syscall-abi.md"),
         ("error code", "kernel/src/syscall/error.rs", "docs/reference/error-codes.md"),
     ] {
-        let src_text = fs::read_to_string(root.join(src_rel))?;
-        let doc_text = fs::read_to_string(root.join(doc_rel))?;
+        let src_text = read_text(&root.join(src_rel))?;
+        let doc_text = read_text(&root.join(doc_rel))?;
 
         // `12`, or `0xFFFF_0000` for the debug-only range.
         let parse_num = |t: &str| -> Option<i64> {
@@ -402,7 +402,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
         .filter(|p| p.file_name().is_some_and(|n| n == "CLAUDE.md"))
         .filter_map(|p| p.strip_prefix(&root).ok()?.to_str().map(String::from))
         .collect();
-    violations.extend(root_claude_md(&fs::read_to_string(root.join("CLAUDE.md"))?, &claude_mds));
+    violations.extend(root_claude_md(&read_text(&root.join("CLAUDE.md"))?, &claude_mds));
 
     if violations.is_empty() {
         println!(

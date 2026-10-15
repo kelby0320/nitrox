@@ -158,8 +158,8 @@ the relevant one before significant work. `cargo xtask check-docs` holds this li
 - **`#[repr(C)]` for any type crossing the kernel/userspace boundary.** Layout must be predictable.
 - **Document `unsafe` blocks.** Every `unsafe` block needs a `// SAFETY:` comment explaining why the operation is sound.
 - **Comments say what the code cannot** — a non-obvious why, an invariant, a `SAFETY` argument —
-  and cite no PR, review, phase or part: `cargo xtask check-comments`, at 0.15 of new code.
-- **A Rust file stays under 1,000 lines**; those over it only shrink: `cargo xtask check-size`.
+  and cite no PR, review, phase or part. **A Rust file stays at 1,000 lines or fewer.** CI checks
+  both: [`comments-and-size.md`](docs/conventions/comments-and-size.md).
 
 ## Forbidden patterns
 

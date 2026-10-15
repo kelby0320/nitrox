@@ -23,7 +23,7 @@ for (const bad of [undefined, {}, { ...USER, paths: [] }, { ...USER, id: 'F S' }
 }
 
 let r = await run(USER, () => scope({ ok: false, stop_reason: 'no such path' }))
-check('a scope that stops ends the run', r.calls.length === 1 && r.result?.stopped === 'no such path')
+check('a scope that stops ends the run, and says why', r.calls.length === 1 && r.result?.stopped === 'no such path' && r.logs.includes('Stopped: no such path'))
 
 r = await run(KERNEL, (l) => {
   if (l === 'scope') return scope()
@@ -36,6 +36,8 @@ r = await run(KERNEL, (l) => {
 check('a kernel subsystem with boot findings: 8 agents, the architecture lens among them', r.calls.length === 8 && r.calls.some(c => c.label === 'hunt:architecture'), r.calls.map(c => c.label).join(','))
 const rf = reportFindings(r)
 check('a booted finding is demonstrated and keeps its duplicate', rf.find(x => x.file === 'b.rs')?.demonstrated === true && rf.find(x => x.file === 'b.rs')?.duplicate_of === 'logic-1')
+check('a booted finding takes the verifier\'s severity', rf.find(x => x.file === 'b.rs')?.severity === 'high')
+check('what held up reaches the report', rp(r).includes('trust-boundary: held'))
 check('a refuted boot finding is dropped', !rf.some(x => x.file === 'c.rs') && r.result?.counts.refuted === 1)
 check('a verdict for a finding not given to the verifier is ignored', rf.find(x => x.file === 'd.rs')?.verdict === 'unverified' && r.logs.some(m => /logic-1, which it was not given/.test(m)))
 check('the section is returned', r.result?.section === 'SECTION' && r.result?.head === 'hhhh1234')
@@ -47,6 +49,13 @@ check('a userspace subsystem has no architecture lens and no boot', !r.calls.som
 
 r = await run(USER, l => l === 'scope' ? scope() : l === 'hunt:error-paths' ? null : l.startsWith('hunt:') ? hunt([]) : 'SECTION')
 check('a dead lens is named to the report and returned', /Lenses that returned nothing: error-paths/.test(rp(r)) && r.result?.lenses_missing.join() === 'error-paths')
+check('a dead lens is not among those that hunted', /Lenses that hunted: logic, trust-boundary, tests\./.test(rp(r)))
+
+const boot = f('b.rs', 2, { needs_boot: true, severity: 'low' })
+r = await run(USER, l => l === 'scope' ? scope() : l === 'hunt:logic' ? hunt([boot]) : l.startsWith('hunt:') ? hunt([]) : l === 'verify:boot' ? { verdicts: [] } : 'SECTION')
+check('a boot finding the verifier did not answer stays, unverified', reportFindings(r).find(x => x.file === 'b.rs')?.verdict === 'unverified' && r.result?.counts.refuted === 0)
+r = await run(USER, l => l === 'scope' ? scope() : l === 'hunt:logic' ? hunt([boot]) : l.startsWith('hunt:') ? hunt([]) : l === 'verify:boot' ? null : 'SECTION')
+check('every boot finding stays, unverified, when the verifier dies', reportFindings(r).find(x => x.file === 'b.rs')?.verdict === 'unverified' && r.result?.counts.refuted === 0)
 r = await run(USER, l => l === 'scope' ? scope() : l.startsWith('hunt:') ? null : 'NO HUNT')
 check('every lens dead: an error, worktrees still removed', !!r.error && /NO HUNT/.test(rp(r)) && rp(r).includes(WT), r.error)
 r = await run(USER, l => l === 'scope' ? scope({ worktree: '/home/kelby/src/nitrox' }) : l.startsWith('hunt:') ? hunt([]) : 'SECTION')

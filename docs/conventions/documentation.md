@@ -45,9 +45,18 @@ Every doc under `architecture/` carries a **Status** line naming what is actuall
 when it was last checked. Trust it over the body's tense, and correct it when you find it
 wrong.
 
-`cargo xtask check-docs` (in CI) enforces the mechanical part: every relative doc link
-resolves, every backticked `kernel/…`/`userspace/…`/`tools/…` path cited by a
-current-behaviour doc exists, and every `architecture/` doc has a Status line. It cannot
-tell whether prose is *true* — that part is on review. A deliberate reference to a path
+`cargo xtask check-docs` (in CI) enforces the mechanical part:
+
+- every relative doc link resolves, and every heading a link names exists;
+- every doc cited in prose, as a backticked `docs/…` path or a bare `*.md` name, exists;
+- every backticked `kernel/…`/`userspace/…`/`tools/…` `.rs` or `.toml` path cited by a
+  current-behaviour doc exists;
+- every `architecture/` and `design/` doc has a Status line in its first 20 lines;
+- the syscall table in `docs/spec/syscall-abi.md` and the error codes in
+  `docs/reference/error-codes.md` agree with the kernel's;
+- the root `CLAUDE.md` is at most 200 lines, and its index names every other `CLAUDE.md` git
+  lists, and nothing else.
+
+It cannot tell whether prose is *true* — that part is on review. A deliberate reference to a path
 that does not exist (an honest forward reference, or a record of a deletion) is exempted by
 marking the line `<!-- check-docs: allow-missing -->`.

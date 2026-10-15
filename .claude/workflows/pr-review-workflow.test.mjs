@@ -8,13 +8,13 @@ const run = (args, behave) => runBody(body, args, behave)
 const WT = '/r/.claude/worktrees/wf_run1-'
 const scope = (o = {}) => ({ ok: true, stop_reason: '', worktree: WT + '1', head: 'hhhh1234', base: 'b', files: ['a.rs'], claude_md: [], tests: [], touches_kernel_or_abi: false, summary: 's', ...o })
 const f = (file, line, o = {}) => ({ file, line, defect: 'd', scenario: 's', evidence: 'e', demonstrated: true, needs_boot: false, severity: 'worth-fixing', ...o })
-const rev = findings => ({ held_up: [], findings })
+const rev = findings => ({ held_up: ['held'], findings })
 const rp = r => r.calls.find(c => c.label === 'report')?.prompt || ''
 const reportFindings = r => { const p = rp(r); const i = p.indexOf('severity:\n'); return i < 0 ? [] : JSON.parse(p.slice(i + 10, p.indexOf('\n\nYour final message'))) }
 const { check, done } = checker()
 
 let r = await run({ pr: 5 }, () => ({ ...scope(), ok: false, stop_reason: 'CI red' }))
-check('CI red stops at the scope', r.calls.length === 1 && r.result?.stopped === 'CI red')
+check('CI red stops at the scope, and says why', r.calls.length === 1 && r.result?.stopped === 'CI red' && r.logs.includes('Stopped: CI red'))
 
 r = await run({ pr: 5 }, (l, p) => {
   if (l === 'scope') return scope({ touches_kernel_or_abi: true })
@@ -27,12 +27,17 @@ r = await run({ pr: 5 }, (l, p) => {
 check('a kernel PR with boot findings: 8 agents', r.calls.length === 8, r.calls.map(c => c.label).join(','))
 const rf = reportFindings(r)
 check('#7 a booted finding is demonstrated and keeps duplicate_of', rf.find(x => x.file === 'b.rs')?.demonstrated === true && rf.find(x => x.file === 'b.rs')?.duplicate_of === 'logic-1')
+check('a booted finding takes the verifier\'s severity', rf.find(x => x.file === 'b.rs')?.severity === 'blocking')
+check('what held up reaches the report', rp(r).includes('tests: held'))
 check('a refuted boot finding is dropped', !rf.some(x => x.file === 'c.rs') && r.result?.counts.refuted === 1)
 check('an undemonstrated finding is reported unverified', rf.find(x => x.file === 'd.rs')?.verdict === 'unverified')
 check('the report returns its body', r.result?.posted === 'BODY')
 
 r = await run({ pr: 1 }, l => l === 'scope' ? scope() : l === 'review:error-paths' ? null : l.startsWith('review:') ? rev([]) : 'BODY')
 check('#1 a dead lens is named to the report', /Lenses that returned nothing: error-paths/.test(rp(r)) && r.result?.lenses_missing.join() === 'error-paths')
+check('a dead lens is not among those that reviewed', /Lenses reviewed: logic, tests, rules-and-docs\./.test(rp(r)))
+r = await run({ pr: 1 }, l => l === 'scope' ? scope() : l === 'review:logic' ? rev([f('b.rs', 2, { needs_boot: true })]) : l.startsWith('review:') ? rev([]) : l === 'verify:boot' ? null : 'BODY')
+check('every boot finding stays, unverified, when the verifier dies', reportFindings(r).find(x => x.file === 'b.rs')?.verdict === 'unverified' && r.result?.counts.refuted === 0)
 r = await run({ pr: 1 }, l => l === 'scope' ? scope() : l.startsWith('review:') ? null : 'NO REVIEW')
 check('#1 every lens dead: nothing posted, an error, worktrees still removed', !!r.error && /Post nothing/.test(rp(r)) && rp(r).includes(WT), r.error)
 

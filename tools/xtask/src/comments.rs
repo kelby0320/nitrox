@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::path::Path;
 use std::process::{Command, ExitCode};
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
@@ -67,12 +68,12 @@ impl Change {
         change
     }
 
-    fn from_texts(file: &str, old: &str, new: &str) -> Change {
+    fn from_texts(file: &str, first: usize, old: &str, new: &str) -> Change {
         Change {
             added: new
                 .lines()
                 .enumerate()
-                .map(|(i, t)| Added { file: file.to_string(), line: i + 1, text: t.to_string() })
+                .map(|(i, t)| Added { file: file.to_string(), line: first + i, text: t.to_string() })
                 .collect(),
             removed: old.lines().map(str::to_string).collect(),
         }
@@ -100,6 +101,7 @@ fn tally(change: &Change) -> Tally {
         ..Tally::default()
     };
     let mut run: Option<(String, usize, usize)> = None;
+    let mut prev: Option<&Added> = None;
     for a in &change.added {
         let k = kind(&a.text);
         if k == Kind::Comment {
@@ -116,7 +118,12 @@ fn tally(change: &Change) -> Tally {
         let new_comment = !moved && k == Kind::Comment;
         if new_comment {
             t.new_comments += 1;
-            if let Some(why) = reference(trimmed) {
+            let wrapped = || {
+                let p = prev.filter(|p| p.file == a.file && p.line + 1 == a.line && kind(&p.text) == Kind::Comment)?;
+                let joined = reference(&format!("{} {}", body(&p.text), body(trimmed)));
+                joined.filter(|_| reference(&p.text).is_none())
+            };
+            if let Some(why) = reference(trimmed).or_else(wrapped) {
                 t.references.push((a.file.clone(), a.line, why));
             }
             run = match run {
@@ -129,6 +136,7 @@ fn tally(change: &Change) -> Tally {
         } else if !moved && k == Kind::Code {
             t.new_code += 1;
         }
+        prev = Some(a);
     }
     t.runs.extend(run);
     t.runs.sort_by(|a, b| b.2.cmp(&a.2));
@@ -140,28 +148,42 @@ fn over_limit(t: &Tally) -> bool {
 }
 
 fn over_nudge(t: &Tally) -> bool {
-    t.new_comments >= NUDGE_MIN && t.new_comments * 100 > NUDGE_PERCENT * t.new_code
+    t.added_comments > t.removed_comments
+        && t.new_comments >= NUDGE_MIN
+        && t.new_comments * 100 > NUDGE_PERCENT * t.new_code
 }
 
-/// The reference a comment makes to a PR, an issue, a review finding, a phase, a part, a milestone's
-/// part or a slice, if it makes one.
+fn body(comment: &str) -> &str {
+    comment.trim().trim_start_matches('/').trim_start_matches('!').trim()
+}
+
+/// The reference a comment makes to a PR, an issue, a review finding, a phase, a part, a milestone
+/// or a slice, if it makes one.
 fn reference(comment: &str) -> Option<String> {
     fn clean(w: &str) -> &str {
-        w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '#' || c == '.')).trim_end_matches('.')
+        let w = w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '#'));
+        w.strip_suffix("'s").or_else(|| w.strip_suffix("’s")).unwrap_or(w)
     }
     let number = |w: &str| w.trim_start_matches('#').starts_with(|c: char| c.is_ascii_digit());
+    let digits = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit());
+    let letter = |c: Option<char>| c.is_some_and(|c| c.is_ascii_uppercase());
     let part = |w: &str| {
-        let mut c = w.chars();
-        c.next().is_some_and(|c| ('A'..='H').contains(&c))
-            && c.as_str().split('.').skip(1).all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-            && (c.as_str().is_empty() || c.as_str().starts_with('.'))
+        let mut chars = w.chars();
+        if !letter(chars.next()) {
+            return false;
+        }
+        let rest = chars.as_str();
+        match rest.strip_prefix(['-', '–']) {
+            Some(to) => to.chars().count() == 1 && letter(to.chars().next()),
+            None => rest.is_empty() || rest.strip_prefix('.').is_some_and(|r| r.split('.').all(digits)),
+        }
     };
     let words: Vec<&str> = comment.split_whitespace().map(clean).collect();
     for pair in words.windows(2) {
         let (w, next) = (pair[0], pair[1]);
         let milestone = w.len() > 1 && w.starts_with('M') && w[1..].chars().all(|c| c.is_ascii_digit());
         let hit = match w {
-            "PR" | "PRs" | "slice" | "finding" | "issue" | "ticket" => number(next),
+            "PR" | "PRs" | "slice" | "finding" | "issue" | "ticket" | "Milestone" => number(next),
             "Phase" => next.starts_with(|c: char| c.is_ascii_digit()),
             "Part" | "Parts" => part(next),
             _ => milestone && next == "Part",
@@ -189,19 +211,7 @@ pub(crate) fn cmd_check_comments(args: &[String]) -> R<()> {
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_else(|| "origin/main".to_string());
-    let git = |args: &[&str]| -> R<String> {
-        let out = Command::new("git").args(args).output()?;
-        if !out.status.success() {
-            return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr)).into());
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let merge_base = git(&["merge-base", &base, "HEAD"])?.trim().to_string();
-    let diff = git(&["diff", "-U0", "--no-color", "--no-ext-diff", &merge_base, "--", "*.rs"])?;
-    let mut change = Change::from_diff(&diff);
-    for file in git(&["ls-files", "--others", "--exclude-standard", "--", "*.rs"])?.lines() {
-        change.added.extend(Change::from_texts(file, "", &std::fs::read_to_string(file)?).added);
-    }
+    let (merge_base, change) = change_since(&crate::repo_root(), &base)?;
     let t = tally(&change);
     let mut failures = Vec::new();
     for (file, line, cited) in &t.references {
@@ -236,6 +246,25 @@ pub(crate) fn cmd_check_comments(args: &[String]) -> R<()> {
     Err(format!("check-comments: {} failure(s)", failures.len()).into())
 }
 
+/// Everything a branch adds to the Rust files under `root` since its merge base with `base`,
+/// untracked files whole.
+fn change_since(root: &Path, base: &str) -> R<(String, Change)> {
+    let git = |args: &[&str]| -> R<String> {
+        let out = Command::new("git").args(args).current_dir(root).output()?;
+        if !out.status.success() {
+            return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr)).into());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let merge_base = git(&["merge-base", base, "HEAD"])?.trim().to_string();
+    let diff = git(&["diff", "-U0", "--no-color", "--no-ext-diff", &merge_base, "--", "*.rs"])?;
+    let mut change = Change::from_diff(&diff);
+    for file in git(&["ls-files", "--others", "--exclude-standard", "--", "*.rs"])?.lines() {
+        change.added.extend(Change::from_texts(file, 1, "", &crate::read_text(&root.join(file))?).added);
+    }
+    Ok((merge_base, change))
+}
+
 /// The edit hook: never fails and never blocks; on a comment-heavy or history-citing edit of a Rust
 /// file, it prints the nudge for the author.
 pub(crate) fn hook_main() -> ExitCode {
@@ -256,12 +285,14 @@ fn hook(input: &str) -> Option<String> {
     if !file.ends_with(".rs") {
         return None;
     }
+    let original = event.get("tool_response").and_then(|r| r.get("originalFile")).and_then(Json::str);
     let change = match tool {
-        "Edit" => Change::from_texts(file, args.get("old_string")?.str()?, args.get("new_string")?.str()?),
-        "Write" => {
-            let old = event.get("tool_response").and_then(|r| r.get("originalFile")).and_then(Json::str);
-            Change::from_texts(file, old.unwrap_or(""), args.get("content")?.str()?)
+        "Edit" => {
+            let old = args.get("old_string")?.str()?;
+            let first = original.and_then(|f| Some(f[..f.find(old)?].matches('\n').count() + 1)).unwrap_or(1);
+            Change::from_texts(file, first, old, args.get("new_string")?.str()?)
         }
+        "Write" => Change::from_texts(file, 1, original.unwrap_or(""), args.get("content")?.str()?),
         _ => return None,
     };
     let t = tally(&change);
@@ -538,7 +569,7 @@ mod tests {
     fn references_to_history_are_found() {
         for (text, cited) in [
             ("// as PR #371 found", "PR #371"),
-            ("// PR 12's review", "PR 12's"),
+            ("// PR 12's review", "PR 12"),
             ("// fixed (#123) later", "(#123)"),
             ("/// Phase 6 added it", "Phase 6"),
             ("// since Part H.4", "Part H.4"),
@@ -546,6 +577,16 @@ mod tests {
             ("// M14 Part B built it", "M14 Part"),
             ("// slice 3 of the plan", "slice 3"),
             ("// the review's finding 2", "finding 2"),
+            ("// as planned (Part A).", "Part A"),
+            ("// set and read back (administration Part E.3).", "Part E.3"),
+            ("// in Part B.2's design", "Part B.2"),
+            ("// the refresh's Part K built it", "Part K"),
+            ("// Parts A-G built it", "Parts A-G"),
+            ("// Parts A–K, all eleven", "Parts A–K"),
+            ("// Parts A and B", "Parts A"),
+            ("// Milestone 7's greeter", "Milestone 7"),
+            ("// PR#12 found it", "PR#12"),
+            ("// fixed (#12345) later", "(#12345)"),
         ] {
             assert_eq!(reference(text).as_deref(), Some(cited), "{text}");
         }
@@ -562,9 +603,38 @@ mod tests {
             "// Part Ten",
             "// PR is the abbreviation",
             "// (#)",
+            "// (#123456) is no PR",
+            "// phase 3 refuses to drain",
+            "// Part AB of the name",
         ] {
             assert_eq!(reference(text), None, "{text}");
         }
+    }
+
+    #[test]
+    fn a_reference_wrapped_across_two_lines_is_found_on_the_second() {
+        let t = tally(&change(&["// written when set (administration Part", "// E.5) and read back", "let x = 1;"], &[]));
+        assert_eq!(t.references, [("a.rs".to_string(), 2, "Part E.5".to_string())]);
+        let two_files = Change {
+            added: vec![
+                Added { file: "a.rs".into(), line: 1, text: "// see Part".into() },
+                Added { file: "b.rs".into(), line: 2, text: "// E.5 in b".into() },
+            ],
+            removed: vec![],
+        };
+        assert!(tally(&two_files).references.is_empty());
+    }
+
+    #[test]
+    fn a_run_of_new_comment_does_not_cross_files() {
+        let two_files = Change {
+            added: vec![
+                Added { file: "a.rs".into(), line: 1, text: "// a".into() },
+                Added { file: "b.rs".into(), line: 2, text: "// b".into() },
+            ],
+            removed: vec![],
+        };
+        assert_eq!(tally(&two_files).runs.len(), 2);
     }
 
     #[test]
@@ -603,6 +673,55 @@ mod tests {
         assert_eq!(hook(&EDIT.replace("    // Three.\\n", "")), None);
         assert_eq!(hook(&EDIT.replace("/r/a.rs", "/r/a.md")), None);
         assert_eq!(hook("not json"), None);
+    }
+
+    #[test]
+    fn the_hook_is_silent_when_an_edit_shortens_a_comment() {
+        let shrink = r#"{"tool_name":"Edit","tool_input":{"file_path":"/r/a.rs","old_string":"// one\n// two\n// three\n// four\n// five\n// six\nlet x = 1;","new_string":"// uno\n// dos\n// tres\nlet x = 1;"}}"#;
+        assert_eq!(hook(shrink), None);
+    }
+
+    #[test]
+    fn the_hook_names_the_line_in_the_file() {
+        let at = r#"{"tool_name":"Edit","tool_input":{"file_path":"/r/a.rs","old_string":"    let y = 2;","new_string":"    // as Part H.4 found\n    let y = 2;"},"tool_response":{"originalFile":"fn a() {\n    let x = 1;\n    let y = 2;\n}\n"}}"#;
+        assert!(hook(at).is_some_and(|o| o.contains("Line 3 cites `Part H.4`")), "{:?}", hook(at));
+    }
+
+    #[test]
+    fn the_json_reader_takes_every_number_and_the_writer_escapes_controls() {
+        let j = Json::parse(r#"{"a":-1.5e3,"b":2E-2,"c":+0,"d":[true,false,null],"e":"x"}"#).unwrap();
+        assert_eq!(j.get("e").and_then(Json::str), Some("x"));
+        assert_eq!(json_string("a\tb\rc\u{1}\"\\"), r#""a\tb\rc\u0001\"\\""#);
+        assert_eq!(Json::parse(&json_string("a\tb\rc\u{1}")).as_ref().and_then(Json::str), Some("a\tb\rc\u{1}"));
+    }
+
+    #[test]
+    fn the_change_is_measured_from_the_repository_root_wherever_it_runs() {
+        let root = std::env::temp_dir().join(format!("xtask-comments-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "a.rs"]);
+        git(&["commit", "-qm", "a"]);
+        std::fs::write(root.join("a.rs"), "// tracked, changed\nfn a() {}\n").unwrap();
+        std::fs::write(root.join("sub/b.rs"), "// as Part H.4 found\nfn b() {}\n").unwrap();
+        let (_, change) = change_since(&root, "HEAD").unwrap();
+        let t = tally(&change);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!((t.new_comments, t.new_code), (2, 1));
+        assert_eq!(t.references, [("sub/b.rs".to_string(), 1, "Part H.4".to_string())]);
     }
 
     #[test]

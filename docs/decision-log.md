@@ -36033,3 +36033,38 @@ Part A's second PR: A.3, A.4, A.5 and A.7, a commit each.
   `tools/xtask/src/docs.rs`. The author caught one gap in the first — a listed entry at or under
   1,000 lines whose file sat at it passed, against the brief — and the implementer flagged an
   orphaned doc comment in the second, which went.
+
+## 2026-10-14 — Before Phase 7, PR #375's review: the citations it missed, and a rename
+
+The review's 15 findings, all reproduced first; 14 fixed with a control each, and one form of the
+second declined.
+
+- **`check-comments` missed the commonest citation**: a part cited before a full stop, `(Part
+  E.3).`, kept its `)` and matched nothing — 316 of 704 such lines in the tree. It now also takes
+  any capital after `Part` (the desktop refresh ran to K), a possessive, a range (`Parts A–G`),
+  `Milestone N`, and a citation wrapped across two comment lines. Run over every comment in the
+  tree, the new forms find 167 lines, all real citations. **Declined: lowercase `phase N`** — all
+  six in the tree are the steps of a test, not a project's phases.
+- **`check-comments` ran its `git` in the caller's directory**, so from `tools/` a `*.rs` pathspec
+  saw only that subtree and passed a branch CI fails. It runs at the repository root, as every
+  other `git` call in xtask already did; a host test runs it on a scratch repository from
+  elsewhere.
+- **The hook nudged for shortening a comment**: it now has the gate's guard, a change adding no
+  more comment lines than it removes being quiet. It names the line in the file, not in the edit.
+- **`check-size --rename OLD NEW`**: a renamed file's entry follows it, at no more than its old
+  allowance; without it a rename was a dead end, `--update` dropping the old entry and never adding
+  the new. The listing is deduplicated, as `check-docs`'s already was. **Splitting one listed file
+  into several still over the limit, and a reformat that lengthens one, are Part B's to decide**:
+  `--rename` is one-to-one and nothing raises an entry.
+- **The fixes met A.4's own rule**: they grew `main.rs` past its entry, so the help moved to
+  `help.rs` and the file-reading helper to `files.rs`, and `main.rs`'s entry fell to 20,496. The
+  help gained the six commands it lacked, and a host test fails when a dispatched command is
+  missing from it; the module header's copy of the list, which drifted the same way, became a
+  pointer to `cargo xtask help`.
+- **Read errors name their file**, in `check-comments`, `check-size` and `check-docs`.
+- **A current home for the rules**: `docs/conventions/comments-and-size.md`, which the root
+  `CLAUDE.md` links; and `documentation.md` lists every check `check-docs` makes.
+- **The workflows' tests**: the bug bash's now pin a boot finding the verifier left unanswered or
+  died before answering, the verifier's severity, what held up reaching the report, the lenses
+  that hunted and the logged stop; the same sweep found three of those unpinned in the review's
+  own, now pinned.
