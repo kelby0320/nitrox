@@ -14,3 +14,18 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-14	374	884eae0d	13	logic	optional	unverified	fixed	307ad9e0	scope needs at least one CI run
 2026-10-14	374	884eae0d	14	error-paths	optional	unverified	fixed	307ad9e0	outcomes recorded after the fixing commit
 2026-10-14	374	884eae0d	15	error-paths	optional	unverified	fixed	307ad9e0	head column added
+2026-10-14	375	cf5e2c88	1	logic	blocking	demonstrated	fixed	54e76271	"(Part X)." trimmed to letters, digits and #
+2026-10-14	375	cf5e2c88	2	logic	worth-fixing	demonstrated	fixed	54e76271	any capital, possessive, range, Milestone, wrapped; lowercase "phase N" declined (test steps)
+2026-10-14	375	cf5e2c88	3	logic+error-paths	worth-fixing	demonstrated	fixed	54e76271	git runs at the repository root
+2026-10-14	375	cf5e2c88	4	logic	worth-fixing	demonstrated	fixed	54e76271	nudge has the gate's added>removed guard
+2026-10-14	375	cf5e2c88	5	error-paths	worth-fixing	demonstrated	fixed	54e76271	unanswered and dead boot verifier pinned
+2026-10-14	375	cf5e2c88	6	tests	worth-fixing	demonstrated	fixed	54e76271	severity, held_up, hunted lenses, stop log pinned; review test swept
+2026-10-14	375	cf5e2c88	7	rules-and-docs	worth-fixing	demonstrated	fixed	54e76271	six commands added; dispatch-vs-help test; header points at help
+2026-10-14	375	cf5e2c88	8	rules-and-docs	worth-fixing	demonstrated	fixed	54e76271	documentation.md lists every check-docs check
+2026-10-14	375	cf5e2c88	9	logic	optional	demonstrated	fixed	54e76271	line from the edit's original file
+2026-10-14	375	cf5e2c88	10	logic+error-paths	optional	demonstrated	fixed	54e76271	listing deduplicated
+2026-10-14	375	cf5e2c88	11	error-paths	optional	demonstrated	fixed	54e76271	check-size --rename; splits and reformat left to Part B
+2026-10-14	375	cf5e2c88	12	error-paths	optional	demonstrated	fixed	54e76271	read errors name the file, swept into check-docs
+2026-10-14	375	cf5e2c88	13	tests	optional	demonstrated	fixed	54e76271	PR#N, Parts, (#N) bound, cross-file runs pinned
+2026-10-14	375	cf5e2c88	14	tests	optional	demonstrated	fixed	54e76271	JSON numbers and control escapes pinned
+2026-10-14	375	cf5e2c88	15	rules-and-docs	optional	demonstrated	fixed	54e76271	docs/conventions/comments-and-size.md
