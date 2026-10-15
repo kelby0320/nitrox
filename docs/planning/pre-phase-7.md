@@ -113,16 +113,18 @@ author's session. A commit a sub-part.
   reading `reviewer.md` and every lens itself. It reviews the first PR, whose own `pr-review` is <!-- check-docs: allow-missing -->
   the new launcher, and it stays the cheaper review when tokens are short.
 
-**Each agent in its own worktree.** A worktree-isolated agent starts in
-`.claude/worktrees/agent-<id>`, on a new branch at the author session's commit, with no build output
-(probed 2026-10-14). So each agent's first step is to fetch `pull/<N>/head` and check out the head
-the scope agent named, and its first host-test build costs seconds. `.claude/worktrees/` goes in
+**Each agent in its own worktree.** A workflow's agent starts in `.claude/worktrees/wf_<run>-<n>`,
+on a branch `worktree-wf_<run>-<n>` at `main` — not at the author session's commit, as this said
+until PR #374's review: the first probe ran with the session on `main` — and with no build output.
+So the rules a review's agents read are `main`'s: a PR that changes them is reviewed by the rules it
+would replace. So each agent's first step is to fetch `pull/<N>/head` and check out the head the
+scope agent named, and its first host-test build costs seconds. `.claude/worktrees/` goes in
 `.gitignore`, and **`check-docs` lists its files with git**
 (`git ls-files --cached --others --exclude-standard`) rather than walking the disk, where it reads
 `.claude/` and a review's worktree under it as the repo's own docs (found by PR #373's review, a
 worktree failing it in the author's checkout). The listing brings in the root `CLAUDE.md`, which the
 walk never read; its two deliberate examples of a missing doc take the `allow-missing` marker. The
-runtime removes a worktree left unchanged; the report agent removes any other the review left.
+report agent removes the run's worktrees, found by the scope's own path, and their branches.
 
 **The stages, at most ten agents.**
 

@@ -8,8 +8,9 @@ You are the first agent of a review. You read and change nothing, and you check 
    commit.
 2. **The base is `git merge-base <baseRefOid> <head>`** — not `origin/main`, where a head already
    merged has an empty diff.
-3. **CI on the head**: `gh api repos/{owner}/{repo}/commits/<head>/check-runs`. Every run must be
-   completed and successful. If one is not, stop: return `ok: false` and why. A review of a head
+3. **CI on the head**: `gh api repos/{owner}/{repo}/commits/<head>/check-runs`. There must be at
+   least one run (`total_count` above zero), and every run completed and successful: none yet
+   means CI has not built the head. Otherwise stop: return `ok: false` and why. A review of a head
    that does not build wastes the review.
 4. From `git diff --stat <base> <head>` and the diff:
    - the files changed;
@@ -18,3 +19,5 @@ You are the first agent of a review. You read and change nothing, and you check 
    - whether the change touches the kernel, a syscall, the ABI or a wire format: `kernel/`,
      `userspace/libkern/`, `userspace/librsproto/`, a `#[repr(C)]` type, or `docs/spec/`.
 5. What the change does, in your own words, in three to six sentences, for the reviewers.
+6. This worktree's absolute path (`pwd`): the other agents' worktrees are named beside it, and the
+   report removes them by it.

@@ -397,7 +397,8 @@ starts it and passes it nothing, and while it runs changes nothing on the branch
 or QEMU. **`/pr-review-solo`** is the same review by one agent in a second session, and cheaper. The
 author acts on a review with **`/address-review`**: reproduce each finding, fix it with a control,
 sweep its class, and record the outcome in `.claude/review-outcomes.tsv`. The reviewers' rules are
-in `.claude/skills/pr-review/`.
+in `.claude/skills/pr-review/`, and the workflow's control flow has tests with its agents stubbed:
+`node .claude/workflows/pr-review-workflow.test.mjs`.
 
 ## Who does the work
 

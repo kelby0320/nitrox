@@ -35944,3 +35944,34 @@ settled, beyond the plan:
   after the reviewers; reviewers now give each finding its severity. At most eight agents. The
   report agent, which returned a summary in place of what it posted, is told its last message is the
   body.
+
+## 2026-10-14 — Before Phase 7, PR #374's review: how the review workflow fails
+
+- **The workflow's first review of an unmerged PR**, #374 itself: six agents, nine minutes, about
+  560,000 tokens; 15 findings — one blocking, three worth fixing, eleven optional — all about how
+  the workflow fails, the outcomes file, or `check-docs`'s new listing. **Each reproduced first**,
+  and each fixed with a check that fails without the fix; one half of one declined.
+- **How the workflow fails, now said**: a lens that returns nothing is named to the report, which
+  calls the review incomplete rather than sound, and with every lens gone nothing is posted and the
+  run is an error; a boot verdict counts only for a finding the verifier was given; a pinned head
+  the scope does not return is an error; the architecture lens follows the changed paths as well as
+  the scope's word; a boot-checked finding takes the verifier's demonstration and its duplicate; the
+  eight-agent cap is checked; a report that returns nothing is an error.
+- **Worktrees removed by the run, not by what agents say**: the scope returns its own path, the
+  run's prefix comes from it, and the report removes that prefix's worktrees and their branches, so
+  a dead agent's worktree goes too and no other path can be named. Each of the three runs had left
+  its `worktree-wf_*` branches — twenty, all reachable from `main`, now deleted.
+- **Corrected: a workflow's worktrees start at `main`**, not at the author session's commit as the
+  Part A detail entry above says: every branch the three runs left was at `main`'s commit, the PR
+  branch's not, and the first probe had run with the session on `main`. So a review's agents read
+  the rules `main` has — a PR changing them is reviewed by the rules it would replace — and #374's
+  own reviewers, finding none there, read them from the author's checkout.
+- **The rest**: the scope requires at least one CI run on the head, since none at all was vacuously
+  green; the outcomes file gains a `head` column, and `/address-review` records outcomes after the
+  fixing commit exists. `check-docs` refuses a listing without the root `CLAUDE.md` — from a copy
+  inside an ignored directory git listed nothing and every check passed — and lists a file once
+  however many merge stages name it; host tests hold both, and one the real listing. Declined: that
+  it needs git, which every checkout and CI has.
+- **The workflow's checks are kept beside it**, `.claude/workflows/pr-review-workflow.test.mjs`, run
+  with `node`: 19 checks with every agent stubbed, each fix's undoing failing one; nothing in CI
+  runs them.

@@ -17341,6 +17341,7 @@ fn cmd_check_docs() -> R<()> {
     // paths as `docs/` does. Listed by git, not walked, so an ignored review worktree under
     // `.claude/worktrees/` is never read as this repo's docs.
     let md_files = git_md_files(&root)?;
+    md_listing_has_root(&md_files, &root)?;
 
     // Every `*.md` basename in the repo, so a bare backticked filename can be resolved.
     let known_md: Vec<String> =
@@ -18148,13 +18149,33 @@ fn git_md_files(root: &Path) -> R<Vec<PathBuf>> {
     if !out.status.success() {
         return Err(format!("git ls-files: {}", String::from_utf8_lossy(&out.stderr)).into());
     }
-    Ok(out
-        .stdout
+    Ok(md_paths(root, &out.stdout).into_iter().filter(|p| p.is_file()).collect())
+}
+
+/// The paths in `git ls-files -z` output, each once: a file unmerged mid-merge is listed once a stage.
+fn md_paths(root: &Path, listing: &[u8]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = listing
         .split(|&b| b == 0)
         .filter(|p| !p.is_empty())
         .map(|p| root.join(String::from_utf8_lossy(p).as_ref()))
-        .filter(|p| p.is_file())
-        .collect())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// A listing without the root `CLAUDE.md` is not this repository's: run from outside a checkout of
+/// it, git lists nothing, and every check would pass on no files.
+fn md_listing_has_root(files: &[PathBuf], root: &Path) -> R<()> {
+    if files.iter().any(|p| *p == root.join("CLAUDE.md")) {
+        return Ok(());
+    }
+    Err(format!(
+        "check-docs: git listed {} Markdown file(s) under {} and not its CLAUDE.md; run it from a git checkout",
+        files.len(),
+        root.display()
+    )
+    .into())
 }
 
 /// Recursively visit every `.rs` file under `dir`, calling `f` on each. Like
@@ -19804,6 +19825,30 @@ fn format_cmd(cmd: &Command) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_listed_once_a_merge_stage_is_checked_once() {
+        let root = std::path::Path::new("/r");
+        let paths = super::md_paths(root, b"docs/a.md\0x.md\0x.md\0x.md\0");
+        assert_eq!(paths, [root.join("docs/a.md"), root.join("x.md")]);
+    }
+
+    #[test]
+    fn a_listing_without_the_root_claude_md_is_refused() {
+        let root = std::path::Path::new("/r");
+        assert!(super::md_listing_has_root(&[], root).is_err());
+        assert!(super::md_listing_has_root(&[root.join("docs/CLAUDE.md")], root).is_err());
+        assert!(super::md_listing_has_root(&[root.join("docs/a.md"), root.join("CLAUDE.md")], root).is_ok());
+    }
+
+    #[test]
+    fn this_checkout_lists_its_docs_and_none_of_its_build_output() {
+        let root = super::repo_root();
+        let files = super::git_md_files(&root).unwrap();
+        assert!(files.contains(&root.join("CLAUDE.md")));
+        assert!(files.contains(&root.join("docs/decision-log.md")));
+        assert!(!files.iter().any(|p| p.components().any(|c| c.as_os_str() == "target")));
+    }
+
     use super::*;
 
     /// **The throughput stick's tree**: its three parts at the sizes the plan names, 384 MiB in all,

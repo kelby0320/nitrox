@@ -16,6 +16,7 @@ const DIR = '.claude/skills/pr-review'
 // The session's model (Opus) where a lens finds subtle defects; Sonnet for mechanical or
 // reproduction-heavy stages.
 const SONNET = 'sonnet'
+const KERNEL_OR_ABI = ['kernel/', 'userspace/libkern/', 'userspace/librsproto/', 'docs/spec/']
 
 const pr = Number(args && args.pr)
 if (!Number.isInteger(pr) || pr <= 0) {
@@ -23,13 +24,17 @@ if (!Number.isInteger(pr) || pr <= 0) {
 }
 const pinned = args.head ? String(args.head) : null
 
+const touchesKernelOrAbi = s =>
+  s.touches_kernel_or_abi || s.files.some(f => KERNEL_OR_ABI.some(p => f.startsWith(p)))
+
 const LENSES = [
   { key: 'logic', title: 'logic and boundaries' },
   { key: 'error-paths', title: 'error paths and partial state' },
   { key: 'tests', title: 'tests', model: SONNET },
   { key: 'rules-and-docs', title: 'rules and docs', model: SONNET },
-  { key: 'architecture', title: 'architecture and the ABI', only: s => s.touches_kernel_or_abi },
+  { key: 'architecture', title: 'architecture and the ABI', only: touchesKernelOrAbi },
 ]
+if (1 + LENSES.length + 1 + 1 > MAX_AGENTS) throw new Error(`more than ${MAX_AGENTS} agents planned`)
 
 const strings = { type: 'array', items: { type: 'string' } }
 
@@ -38,6 +43,7 @@ const SCOPE = {
   properties: {
     ok: { type: 'boolean' },
     stop_reason: { type: 'string' },
+    worktree: { type: 'string' },
     head: { type: 'string' },
     base: { type: 'string' },
     files: strings,
@@ -46,13 +52,14 @@ const SCOPE = {
     touches_kernel_or_abi: { type: 'boolean' },
     summary: { type: 'string' },
   },
-  required: ['ok', 'stop_reason', 'head', 'base', 'files', 'claude_md', 'tests', 'touches_kernel_or_abi', 'summary'],
+  required: [
+    'ok', 'stop_reason', 'worktree', 'head', 'base', 'files', 'claude_md', 'tests', 'touches_kernel_or_abi', 'summary',
+  ],
 }
 
 const FOUND = {
   type: 'object',
   properties: {
-    worktree: { type: 'string' },
     held_up: strings,
     findings: {
       type: 'array',
@@ -72,13 +79,12 @@ const FOUND = {
       },
     },
   },
-  required: ['worktree', 'held_up', 'findings'],
+  required: ['held_up', 'findings'],
 }
 
 const VERIFIED = {
   type: 'object',
   properties: {
-    worktree: { type: 'string' },
     verdicts: {
       type: 'array',
       items: {
@@ -94,7 +100,7 @@ const VERIFIED = {
       },
     },
   },
-  required: ['worktree', 'verdicts'],
+  required: ['verdicts'],
 }
 
 phase('Scope')
@@ -108,6 +114,14 @@ if (!scope.ok) {
   log(`Stopped: ${scope.stop_reason}`)
   return { pr, stopped: scope.stop_reason }
 }
+if (pinned && !scope.head.startsWith(pinned) && !pinned.startsWith(scope.head)) {
+  throw new Error(`asked to review ${pinned}, but the scope named ${scope.head}`)
+}
+
+// Every agent's worktree is a sibling of the scope's, named for this run: `wf_<run>-<n>`.
+const run = scope.worktree.match(/^(.*\/\.claude\/worktrees\/)(wf_[^/]+-)\d+\/?$/)
+const worktreePrefix = run ? run[1] + run[2] : null
+if (!worktreePrefix) log(`The scope's worktree ${scope.worktree} is not a run's; no worktree will be removed`)
 
 const context = [
   `PR #${pr}: head ${scope.head}, base ${scope.base}.`,
@@ -124,7 +138,7 @@ const setup = file =>
 
 phase('Review')
 const lenses = LENSES.filter(l => !l.only || l.only(scope))
-// A barrier: every lens's findings are needed together to share them out among the verifiers.
+// A barrier: the report needs every lens's findings, and which lenses returned none.
 const reviews = await parallel(
   lenses.map(l => () =>
     agent(
@@ -138,26 +152,26 @@ const reviews = await parallel(
         `them: no one checks your findings before the author, who reproduces each. ` +
         `Do not boot QEMU; a finding only a boot can show is needs_boot. ` +
         `In held_up, list briefly what you checked that held, such as a mutation a test caught. ` +
-        `Restore every probe. Return this worktree's absolute path.`,
+        `Restore every probe.`,
       { label: `review:${l.key}`, phase: 'Review', schema: FOUND, isolation: 'worktree', model: l.model },
     ),
   ),
 )
 
-const worktrees = []
 const findings = []
 const heldUp = []
+const missing = []
 reviews.forEach((r, i) => {
   const key = lenses[i].key
   if (!r) {
+    missing.push(key)
     log(`The ${key} reviewer returned nothing`)
     return
   }
-  if (r.worktree) worktrees.push(r.worktree)
   heldUp.push(...r.held_up.map(h => `${key}: ${h}`))
   r.findings.forEach((f, j) => findings.push({ ...f, id: `${key}-${j + 1}`, lens: key }))
 })
-log(`${findings.length} findings from ${lenses.length} reviewers`)
+log(`${findings.length} findings from ${lenses.length - missing.length} of ${lenses.length} reviewers`)
 
 phase('Verify')
 const boot = findings.filter(f => f.needs_boot)
@@ -167,37 +181,61 @@ const booted = boot.length
       `You verify findings from a review of Nitrox PR #${pr} that only a QEMU boot can show. ` +
         `${setup(`${DIR}/verify.md`)}\n\n${context}\n\n` +
         `You alone in this review boot QEMU, one gate at a time; nothing else runs beside you. ` +
-        `Restore every probe. Return this worktree's absolute path and one verdict for each finding, by id.\n\n` +
+        `Restore every probe. Return one verdict for each finding, by id.\n\n` +
         `Findings:\n${JSON.stringify(boot, null, 1)}`,
       { label: 'verify:boot', phase: 'Verify', schema: VERIFIED, isolation: 'worktree', model: SONNET },
     )
   : null
+const bootIds = new Set(boot.map(f => f.id))
 const verdicts = new Map()
-if (booted) {
-  if (booted.worktree) worktrees.push(booted.worktree)
-  for (const v of booted.verdicts) verdicts.set(v.id, v)
+for (const v of booted ? booted.verdicts : []) {
+  if (bootIds.has(v.id)) verdicts.set(v.id, v)
+  else log(`The boot verifier answered ${v.id}, which it was not given; ignored`)
 }
 const judged = findings.map(f => {
+  if (!f.needs_boot) return { ...f, verdict: f.demonstrated ? 'demonstrated' : 'unverified' }
   const v = verdicts.get(f.id)
-  if (v) return { ...f, verdict: v.verdict, severity: v.severity, verification: v.evidence }
-  if (f.needs_boot) return { ...f, verdict: 'unverified', verification: 'the boot verifier returned no verdict for it' }
-  return { ...f, verdict: f.demonstrated ? 'demonstrated' : 'unverified' }
+  if (!v) return { ...f, verdict: 'unverified', verification: 'the boot verifier returned no verdict for it' }
+  return {
+    ...f,
+    demonstrated: v.verdict === 'demonstrated',
+    verdict: v.verdict,
+    severity: v.severity,
+    verification: v.evidence,
+    duplicate_of: v.duplicate_of,
+  }
 })
 const reported = judged.filter(f => f.verdict !== 'refuted')
 const counts = { found: findings.length, refuted: judged.length - reported.length, reported: reported.length }
 log(`${counts.found} found, ${counts.refuted} refuted by a boot, ${counts.reported} to report`)
 
 phase('Report')
+const cleanup = worktreePrefix
+  ? `Remove this run's worktrees and their branches as report.md says: those whose path starts ${worktreePrefix}.`
+  : 'Remove no worktree: this run did not name its own.'
+const nobody = missing.length === lenses.length
 const posted = await agent(
-  `You write and post the review of Nitrox PR #${pr}. Read ${DIR}/reviewer.md and ${DIR}/report.md, and follow ` +
-    `report.md. Check nothing out and change no file in this checkout: the comment's body is the only file you ` +
-    `write, in a temporary directory.\n\n${context}\n\n` +
-    `Counts: ${counts.found} found, ${counts.refuted} refuted by a boot, ${counts.reported} to report.\n` +
-    `Worktrees to remove: ${worktrees.join(' ') || 'none'}\n\n` +
-    `What the reviewers checked that held:\n${heldUp.join('\n') || 'nothing listed'}\n\n` +
-    `Findings, each with its reviewer's evidence and severity:\n${JSON.stringify(reported, null, 1)}\n\n` +
-    `Your final message is the comment's body exactly as posted, with nothing before or after it.`,
+  nobody
+    ? `Every reviewer of Nitrox PR #${pr} returned nothing, so there is no review. Post nothing. Read ` +
+        `${DIR}/report.md for how to remove worktrees. ${cleanup} Then your final message is the single line NO REVIEW.`
+    : `You write and post the review of Nitrox PR #${pr}. Read ${DIR}/reviewer.md and ${DIR}/report.md, and ` +
+        `follow report.md. Check nothing out and change no file in this checkout: the comment's body is the only ` +
+        `file you write, in a temporary directory.\n\n${context}\n\n` +
+        `Lenses reviewed: ${lenses.filter(l => !missing.includes(l.key)).map(l => l.key).join(', ')}.\n` +
+        `Lenses that returned nothing: ${missing.join(', ') || 'none'}.\n` +
+        `Counts: ${counts.found} found, ${counts.refuted} refuted by a boot, ${counts.reported} to report.\n` +
+        `${cleanup}\n\n` +
+        `What the reviewers checked that held:\n${heldUp.join('\n') || 'nothing listed'}\n\n` +
+        `Findings, each with its reviewer's evidence and severity:\n${JSON.stringify(reported, null, 1)}\n\n` +
+        `Your final message is the comment's body exactly as posted, with nothing before or after it.`,
   { label: 'report', phase: 'Report', model: SONNET, effort: 'medium' },
 )
+if (nobody) throw new Error(`every reviewer of PR #${pr} returned nothing; no review was posted`)
+if (!posted) {
+  throw new Error(
+    `the report agent returned nothing: check PR #${pr} for a comment, and ` +
+      `${worktreePrefix || '.claude/worktrees/'}* for worktrees left behind`,
+  )
+}
 
-return { pr, head: scope.head, base: scope.base, counts, posted }
+return { pr, head: scope.head, base: scope.base, counts, lenses_missing: missing, posted }
