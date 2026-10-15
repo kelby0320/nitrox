@@ -3,8 +3,8 @@
 Code right on the happy path and wrong when its second step fails is where this project's recent
 bugs have been.
 
-For each operation the diff adds or changes that changes state in more than one step — writes a
-disk, a table and a count; sends, then records; allocates, then links:
+For each operation under review that changes state in more than one step — writes a disk, a
+table and a count; sends, then records; allocates, then links:
 
 1. List the steps and, for each, what is true if it fails there: what was written, what was
    freed, what still points at what.

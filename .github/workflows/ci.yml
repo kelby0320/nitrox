@@ -72,6 +72,12 @@ jobs:
       - name: cargo xtask check-size
         run: cargo xtask check-size
 
+      # The review and bug-bash workflows' control flow, every agent stubbed. No workflow runs.
+      - name: workflow checks
+        run: |
+          node .claude/workflows/pr-review-workflow.test.mjs
+          node .claude/workflows/bug-bash-workflow.test.mjs
+
       # A `TODO(tag)` in shipping source must have an entry in
       # docs/rationale/deferred-decisions.md. Three deferrals that cost real time to
       # rediscover were each recorded outside that list; this makes the code half

@@ -1,0 +1,112 @@
+# The subsystems a bug bash covers, riskiest first. `/bug-bash <name>` hands one entry to the
+# workflow. Its paths are where the hunt starts, not a fence: a reviewer follows the code out of
+# them. `id` prefixes the subsystem's findings in docs/planning/bug-bash.md, as in `kobj-3`.
+
+[[subsystem]]
+name = "kernel-objects"
+id = "kobj"
+what = "the syscall boundary, handles and their rights, and the kernel's objects"
+paths = [
+  "kernel/src/syscall/",
+  "kernel/src/object/",
+  "kernel/src/handle/",
+  "kernel/src/libkern/",
+  "userspace/libkern/",
+]
+
+[[subsystem]]
+name = "kernel-memory"
+id = "kmem"
+what = "physical and virtual memory, user copies, memory objects and the page cache, TLB shootdown"
+paths = [
+  "kernel/src/mm/",
+  "kernel/src/tlb.rs",
+  "kernel/src/arch/paging.rs",
+  "kernel/src/arch/user_access.rs",
+  "kernel/src/arch/x86_64/paging.rs",
+  "kernel/src/arch/x86_64/user_access.rs",
+  "kernel/src/arch/x86_64/tlb.rs",
+  "kernel/src/object/memory_object.rs",
+  "kernel/src/object/file_object.rs",
+]
+
+[[subsystem]]
+name = "filesystems"
+id = "fs"
+what = "the ext4 and FAT servers and the library they share"
+paths = [
+  "userspace/fs-server-ext4/",
+  "userspace/fs-server-fat/",
+  "userspace/libfsserver/",
+  "userspace/libfs/",
+]
+
+[[subsystem]]
+name = "drivers"
+id = "drv"
+what = "xHCI, USB HID and storage, AHCI, PS/2, PCI, and the block and IRP layer"
+paths = [
+  "kernel/src/drivers/",
+  "kernel/src/pci/",
+  "kernel/src/io/",
+  "kernel/src/device.rs",
+  "kernel/src/arch/x86_64/ps2.rs",
+]
+
+[[subsystem]]
+name = "protocols"
+id = "proto"
+what = "the resource-server wire format, streams, and partition tables read off a disk"
+paths = [
+  "userspace/librsproto/",
+  "userspace/libstream/",
+  "kernel/src/rsproto.rs",
+  "userspace/libgpt/",
+]
+
+[[subsystem]]
+name = "security"
+id = "sec"
+what = "authentication, the view broker and elevation, sessions, the user database"
+paths = [
+  "userspace/auth-service/",
+  "userspace/view-broker/",
+  "userspace/session-mgr/",
+  "userspace/libsession/",
+  "userspace/libusers/",
+  "userspace/libcrypto/",
+  "userspace/libviews/",
+  "userspace/libprompt/",
+]
+
+[[subsystem]]
+name = "scheduler"
+id = "sched"
+what = "threads, scheduling across CPUs, waiting, timers, DPCs and locks"
+paths = [
+  "kernel/src/sched.rs",
+  "kernel/src/dpc.rs",
+  "kernel/src/clock.rs",
+  "kernel/src/object/pending_op.rs",
+  "kernel/src/object/notification_channel.rs",
+  "kernel/src/object/timer.rs",
+  "kernel/src/libkern/spinlock.rs",
+  "kernel/src/libkern/lockrank.rs",
+  "kernel/src/arch/smp.rs",
+  "kernel/src/arch/x86_64/smp.rs",
+  "kernel/src/arch/x86_64/context.rs",
+  "kernel/src/arch/x86_64/resched.rs",
+  "kernel/src/arch/x86_64/timer.rs",
+]
+
+[[subsystem]]
+name = "supervision"
+id = "sup"
+what = "init, the service and device managers, and the storage service"
+paths = [
+  "userspace/init/",
+  "userspace/libinittoml/",
+  "userspace/service-mgr/",
+  "userspace/device-mgr/",
+  "userspace/storage-service/",
+]

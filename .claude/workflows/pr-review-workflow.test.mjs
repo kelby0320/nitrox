@@ -1,26 +1,17 @@
 // The review workflow's control flow, with every agent stubbed: `node pr-review-workflow.test.mjs`,
-// or with a copy of the workflow's path to test that instead. Nothing here or in CI runs a workflow.
-import { readFileSync } from 'node:fs'
+// or with a copy of the workflow's path to test that instead.
 import { fileURLToPath } from 'node:url'
+import { load, run as runBody, checker } from './harness.mjs'
 const file = process.argv[2] || fileURLToPath(new URL('./pr-review-workflow.js', import.meta.url))
-const src = readFileSync(file, 'utf8').replace('export const meta', 'const meta')
-const body = new (Object.getPrototypeOf(async function () {}).constructor)('args', 'agent', 'parallel', 'pipeline', 'phase', 'log', src)
-async function run(args, behave) {
-  const calls = [], logs = []
-  const agent = async (prompt, opts) => { calls.push({ label: opts.label, opts, prompt }); return behave(opts.label, prompt, opts) }
-  const parallel = async thunks => Promise.all(thunks.map(t => t().catch(() => null)))
-  let result, error
-  try { result = await body(args, agent, parallel, null, () => {}, m => logs.push(m)) } catch (e) { error = e.message }
-  return { calls, logs, result, error }
-}
+const { src: src2, body } = load(file)
+const run = (args, behave) => runBody(body, args, behave)
 const WT = '/r/.claude/worktrees/wf_run1-'
 const scope = (o = {}) => ({ ok: true, stop_reason: '', worktree: WT + '1', head: 'hhhh1234', base: 'b', files: ['a.rs'], claude_md: [], tests: [], touches_kernel_or_abi: false, summary: 's', ...o })
 const f = (file, line, o = {}) => ({ file, line, defect: 'd', scenario: 's', evidence: 'e', demonstrated: true, needs_boot: false, severity: 'worth-fixing', ...o })
 const rev = findings => ({ held_up: [], findings })
 const rp = r => r.calls.find(c => c.label === 'report')?.prompt || ''
 const reportFindings = r => { const p = rp(r); const i = p.indexOf('severity:\n'); return i < 0 ? [] : JSON.parse(p.slice(i + 10, p.indexOf('\n\nYour final message'))) }
-let failed = 0
-const check = (name, ok, detail = '') => { console.log(`${ok ? 'ok  ' : 'FAIL'} ${name}${detail ? ': ' + detail : ''}`); if (!ok) failed++ }
+const { check, done } = checker()
 
 let r = await run({ pr: 5 }, () => ({ ...scope(), ok: false, stop_reason: 'CI red' }))
 check('CI red stops at the scope', r.calls.length === 1 && r.result?.stopped === 'CI red')
@@ -65,7 +56,6 @@ check('#6 kernel paths bring in the architecture lens without the boolean', r.ca
 r = await run({ pr: 1 }, l => l === 'scope' ? scope({ files: ['userspace/nxsh/src/eval.rs'] }) : l.startsWith('review:') ? rev([]) : 'BODY')
 check('#6 other paths do not', !r.calls.some(c => c.label === 'review:architecture'))
 
-const src2 = readFileSync(file, 'utf8')
 check('#8 MAX_AGENTS is used', (src2.match(/MAX_AGENTS/g) || []).length >= 2)
 
 const want = { scope: 'sonnet', 'review:logic': undefined, 'review:error-paths': undefined, 'review:architecture': undefined, 'review:tests': 'sonnet', 'review:rules-and-docs': 'sonnet', 'verify:boot': 'sonnet', report: 'sonnet' }
@@ -73,4 +63,4 @@ r = await run({ pr: 5 }, l => l === 'scope' ? scope({ touches_kernel_or_abi: tru
 check('each stage on its model', r.calls.every(c => want[c.label] === c.opts.model))
 r = await run({ pr: 'x' }, () => null)
 check('bad args refused', !!r.error && r.calls.length === 0, r.error)
-process.exitCode = failed ? 1 : 0
+done()
