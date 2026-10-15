@@ -1531,10 +1531,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 /// chords, kept for the path where there is no manager channel to serve them on.
 fn park(notif: u64) -> ! {
     loop {
-        // SAFETY: waiting on this process's own notification handle, which nothing
-        // signals; the deadline is infinite, so this parks rather than spins.
         let handles = [notif];
         let mut results = [0u8; 24];
+        // SAFETY: waiting on this process's own notification handle, which nothing
+        // signals; the deadline is infinite, so this parks rather than spins
         unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
     }
 }

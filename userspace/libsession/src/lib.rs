@@ -887,8 +887,8 @@ pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -
             // cannot hand on with write, not a reason to stop at the next.
             continue;
         }
-        // SAFETY: valid namespace handle, path pointer and device handle — a direct-handle bind,
-        // so no subtree base.
+        // SAFETY: valid namespace handle, path pointer and device handle — a direct-handle bind, so
+        // no subtree base.
         let br = unsafe { syscall6(SYS_NS_BIND, to_ns, path.as_ptr() as u64, path.len() as u64, dev, 0, 0) };
         // SAFETY: the bind took its own reference; close ours.
         unsafe { syscall1(SYS_HANDLE_CLOSE, dev) };
@@ -1105,8 +1105,7 @@ static mut SESSION_HAS_TTY: bool = false;
 /// Non-fatal: a session whose identity could not be published is still a usable session,
 /// and failing the login over it would trade a working shell for a missing `whoami`.
 fn bind_session_user(ns: u64, user: &[u8]) {
-    // SAFETY: a page-sized anonymous object; the syscall returns a handle or a negative
-    // error.
+    // SAFETY: a page-sized anonymous object; the syscall returns a handle or a negative error.
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
     if mem < 0 {
         kprint(b"libsession: /session/user create FAIL\n");
@@ -1155,6 +1154,7 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
         unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
         return (-1, 0);
     }
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let (status, handle) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
@@ -1460,6 +1460,8 @@ pub fn spawn_leader(
             if r != 0 {
                 break;
             }
+            // SAFETY: the recv above returned 0, so the kernel wrote a whole Notification into
+            // NOTIF; this thread owns the static
             let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
             if kind == KIND_CHILD_EXITED {
                 let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);

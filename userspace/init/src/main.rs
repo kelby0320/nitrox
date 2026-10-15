@@ -181,7 +181,9 @@ fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po as u64;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let resolved = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],
@@ -218,6 +220,7 @@ unsafe fn spawn_program(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> i64 
     }
     // SAFETY: caller guarantees `args` is a valid writable SpawnArgs.
     unsafe { (*args).image = img };
+    // SAFETY: `args` is the SpawnArgs the caller guarantees valid, with its image stamped by the line above
     let h = unsafe { syscall1(SYS_PROCESS_SPAWN, args as u64) };
     // SAFETY: closing our own handle to the image object (the child has its own copy).
     unsafe { syscall1(SYS_HANDLE_CLOSE, img) };
@@ -353,8 +356,8 @@ fn bind_one(root_ns: u64, b: &BindSpec, endpoints: &[(&str, u64)]) -> bool {
     };
     // `/` scopes to the whole tree, which the kernel spells as no base at all.
     let base: &[u8] = if b.subtree == "/" { b"" } else { b.subtree.as_bytes() };
-    // SAFETY: valid namespace handle, path/base pointers and lengths, and an endpoint handle
-    // init holds.
+    // SAFETY: valid namespace handle, path/base pointers and lengths, and an endpoint handle init
+    // holds.
     let r = unsafe {
         syscall6(
             SYS_NS_BIND,
@@ -411,6 +414,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     // SAFETY: CTRL0/CTRL1 are valid writable out-params.
     let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0) };
     if cr != 0 {
+        // SAFETY: closing our own handle; the channel just failed to create
         unsafe { syscall1(SYS_HANDLE_CLOSE, device) };
         return None;
     }
@@ -426,6 +430,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     };
     if fs_h < 0 {
         kprint(b"init: fs-server spawn FAIL\n");
+        // SAFETY: closing our own handles; neither moved because the spawn failed
         unsafe {
             syscall1(SYS_HANDLE_CLOSE, device);
             syscall1(SYS_HANDLE_CLOSE, ctrl_init);
@@ -452,6 +457,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     if sr != 0 {
         kprint(b"init: device handoff FAIL\n");
         // The device handle was not moved (send failed) — close it + the rest.
+        // SAFETY: closing our own handles; the failed send did not move the device
         unsafe {
             syscall1(SYS_HANDLE_CLOSE, device);
             syscall1(SYS_HANDLE_CLOSE, ctrl_init);
@@ -465,6 +471,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     let endpoint = match wait_ready(ctrl_init, &who) {
         Some(e) => e,
         None => {
+            // SAFETY: closing our own control endpoint; the handshake failed
             unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return None;
         }
@@ -687,8 +694,8 @@ fn read_current_generation(root_ns: u64) {
     // SAFETY: `root_ns` is init's live root namespace, owned for its whole run; a
     // borrowed Handle is a non-owning view and never closes it.
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-    // SAFETY: the path resolves to a read-mappable file object (asserted by the
-    // `Memory, MapRead` type arguments).
+    // SAFETY: the path resolves to a read-mappable file object (asserted by the `Memory, MapRead`
+    // type arguments).
     let mem = match block_on(unsafe { ns.lookup::<Memory, MapRead>("/system/current-generation", Rights::MAP_READ) }) {
         Ok(m) => m,
         Err(_) => {
@@ -773,6 +780,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         unsafe { close_retained_endpoints() };
         return -1;
     }
+    // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded
     let (init_end, child_end) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // SAFETY: single-threaded init; stamp the handoff end into the (moved) handle slot,
@@ -844,8 +852,8 @@ fn send_handle(ctrl: u64, handle: u64) {
     };
     if sr != 0 {
         kprint(b"init: handoff send FAIL\n");
-        // SAFETY: the transfer did not happen; reclaim the handle.
         if handle != 0 {
+            // SAFETY: the transfer did not happen; reclaim the handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
         }
     }

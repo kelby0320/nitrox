@@ -119,6 +119,7 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // IoResult: status @8..12, resolved handle @16..24.
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let (status, handle) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
@@ -211,8 +212,8 @@ fn send_ready(control: u64, client_end: u64) -> bool {
         REPLY_MSG[8] = 1;
         REPLY_HANDLES[0] = client_end;
     }
-    // SAFETY: valid endpoint + message + 1-handle transfer. NoBlock: the control inbox
-    // starts empty.
+    // SAFETY: valid endpoint + message + 1-handle transfer. NoBlock: the control inbox starts
+    // empty.
     let sr = unsafe {
         syscall5(
             SYS_CHANNEL_SEND,
@@ -682,8 +683,8 @@ fn free_session(ch: u64) {
 fn reply_session_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     let mut body = [0u8; RESOLVE_REPLY_LEN];
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
-    // SAFETY: REPLY_MSG is a valid buffer; the reply goes at PAYLOAD_OFF and the transferred
-    // handle in REPLY_HANDLES[0].
+    // SAFETY: REPLY_MSG is a valid buffer; the reply goes at PAYLOAD_OFF and the transferred handle
+    // in REPLY_HANDLES[0].
     unsafe {
         let rs_len = match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
             Some(n) => n,

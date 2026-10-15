@@ -80,6 +80,7 @@ fn po_wait(po: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let (status, value) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),

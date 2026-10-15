@@ -553,6 +553,7 @@ fn block_send_demo() {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult.status` is the i32 at bytes 8..12 of the 16-byte record.
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     if waited == 1 && status == 0 {
         Line::new()
@@ -629,6 +630,7 @@ fn block_bounded_demo() {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult.status` is the i32 at bytes 8..12 of the 16-byte record.
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     if waited == 1 && status == KERR_TIMED_OUT {
         kprint(b"test-harness: blocking send timed out via PendingOperation (BlockBounded)\n");
@@ -705,7 +707,9 @@ fn ns_demo() {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult`: status at bytes 8..12, result (resolved handle) at 16..24.
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let resolved = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],
@@ -753,6 +757,7 @@ fn ns_demo() {
         WAIT_HANDLES[0] = po2 as u64;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let status2 = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     // KError::NotFound = -10.
     if waited2 == 1 && status2 == -10 {
@@ -791,11 +796,13 @@ fn entropy_demo() {
     let mut b = [0u8; 32];
     // SAFETY: valid writable 32-byte buffers; `len` ≤ ENTROPY_READ_MAX.
     let r1 = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut a) as u64, 32, 0) };
+    // SAFETY: `b` is a valid writable 32-byte buffer; `len` <= ENTROPY_READ_MAX
     let r2 = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut b) as u64, 32, 0) };
     if r1 != 0 || r2 != 0 {
         // A positive return would mean "unseeded, wait on the PO" — not expected
         // here (the pool seeds at boot). Report and bail.
         kprint(b"test-harness: entropy read not synchronous (unseeded?)\n");
+        // SAFETY: closing our own handle
         unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
         return;
     }
@@ -847,7 +854,9 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult`: status at bytes 8..12, result (resolved handle) at 16..24.
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let resolved = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],
@@ -872,6 +881,7 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
     let r = unsafe { syscall4(SYS_ENTROPY_READ, resolved, (&raw mut a) as u64, 32, 0) };
     if r != 0 {
         kprint(b"test-harness: /dev/entropy read not synchronous\n");
+        // SAFETY: closing our own handle
         unsafe { syscall1(SYS_HANDLE_CLOSE, resolved) };
         return;
     }
@@ -900,7 +910,9 @@ fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po as u64;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let resolved = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],
@@ -1056,6 +1068,7 @@ fn timer_sleep_ms(ms: u64) {
     let th = th as u64;
     // SAFETY: CLOCK_BUF is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: CLOCK_BUF was just written by the clock read above; this thread owns the static
     let now = unsafe { (&raw const CLOCK_BUF).read() };
     let fire_at = now + ms * 1_000_000;
     // SAFETY: arming our own timer handle (absolute monotonic, one-shot).
@@ -2397,6 +2410,7 @@ fn whoami_demo(root_ns: u64, notif: u64) {
     const NAME: &[u8] = b"harness-user";
 
     // --- a namespace that looks like a session -------------------------------
+    // SAFETY: register-only syscall creating a namespace we own
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
         return_fail(b"test-harness: whoami ns_create FAIL\n");
@@ -2429,6 +2443,7 @@ fn whoami_demo(root_ns: u64, notif: u64) {
     }
 
     // --- 2. no session → an error, not a fabricated default ------------------
+    // SAFETY: register-only syscall creating a namespace we own
     let bare = unsafe { syscall0(SYS_NS_CREATE) };
     if bare < 0 {
         return_fail(b"test-harness: whoami bare ns_create FAIL\n");
@@ -2462,6 +2477,7 @@ fn error_granularity_demo(root_ns: u64) {
     // pass, which left a supervisor unable to tell a name collision from a bad name.
     // SAFETY: a page-sized anonymous object, and a fresh namespace to bind it into.
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
+    // SAFETY: register-only syscall creating a namespace we own
     let ns = unsafe { syscall4(SYS_NS_CREATE, 0, 0, 0, 0) };
     if mem < 0 || ns < 0 {
         return_fail(b"test-harness: error-granularity setup FAIL\n");
@@ -3965,6 +3981,7 @@ fn po_wait_pair(po: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let (status, result) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
@@ -4127,8 +4144,8 @@ fn sched_stats_demo(root_ns: u64) {
         exit(1);
     }
     Line::new().s(b"test-harness: /proc/self/status ok pid=").u(pid).s(b" tid=").u(tid).end();
-    // SAFETY: unmapping the page we mapped above (`text` is not used past here);
-    // closing our own handle.
+    // SAFETY: unmapping the page we mapped above (`text` is not used past here); closing our own
+    // handle.
     unsafe {
         syscall2(SYS_MEMORY_UNMAP, addr as u64, 0);
         syscall1(SYS_HANDLE_CLOSE, mem);
@@ -4187,7 +4204,9 @@ fn po_wait(po: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
     let result = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],
@@ -4217,6 +4236,7 @@ fn read_block_sector0(root_ns: u64, path: &[u8]) -> i32 {
     // SAFETY: register-only syscall.
     let buf = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
     if buf < 0 {
+        // SAFETY: closing our own handle
         unsafe { syscall1(SYS_HANDLE_CLOSE, dev) };
         return -1;
     }
@@ -4409,6 +4429,7 @@ fn forward_demo() {
     let (kend, send_end) = unsafe { ((&raw const FWD_KEND).read(), (&raw const FWD_SEND).read()) };
 
     // 2. Fresh namespace; bind the kernel end at /fs as a Userspace Server.
+    // SAFETY: register-only syscall creating a namespace we own
     let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
     if ns < 0 {
         kprint(b"test-harness: fwd ns create FAIL\n");
@@ -4451,6 +4472,7 @@ fn forward_demo() {
     }
 
     // 5. Parse the request via librsproto (IpcMsg: payload_len @4, payload @24).
+    // SAFETY: FWD_REQ was filled by the recv above and bytes 4..8 are within it; this thread owns the static
     let payload_len = unsafe { u32::from_le_bytes([FWD_REQ[4], FWD_REQ[5], FWD_REQ[6], FWD_REQ[7]]) as usize };
     // SAFETY: payload_len ≤ 4072; the slice stays within FWD_REQ.
     let req_payload = unsafe { &FWD_REQ[24..24 + payload_len] };
@@ -4468,12 +4490,14 @@ fn forward_demo() {
     let request_id = request.request_id;
 
     // 6. Build a read-only MemoryObject holding the stub content.
+    // SAFETY: register-only syscall creating a memory object we own
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
     if mem < 0 {
         kprint(b"test-harness: fwd memobj create FAIL\n");
         return;
     }
     let mem = mem as u64;
+    // SAFETY: mapping the memory object we just created, to fill it
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if addr < 0 {
         kprint(b"test-harness: fwd memobj map FAIL\n");
@@ -4516,8 +4540,8 @@ fn forward_demo() {
             }
         }
     };
-    // SAFETY: set the IpcMsg header's payload_len (@4) + handle_count (@8) and the
-    // transferred-handle slot.
+    // SAFETY: set the IpcMsg header's payload_len (@4) + handle_count (@8) and the transferred-
+    // handle slot.
     unsafe {
         FWD_REPLY[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         FWD_REPLY[8] = 1;
@@ -4551,6 +4575,7 @@ fn forward_demo() {
     }
 
     // 10. Map the resolved MemoryObject and verify the content round-tripped.
+    // SAFETY: mapping the resolved memory object, read-only; the result is checked below
     let raddr = unsafe { syscall4(SYS_MEMORY_MAP, resolved, 0, PAGE, RIGHT_MAP_READ) };
     if raddr < 0 {
         kprint(b"test-harness: fwd map resolved FAIL\n");

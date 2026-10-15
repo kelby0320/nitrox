@@ -451,6 +451,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // the raw stream. That mattered when a refused send was simply dropped; since M3 Part D3
     // the compositor parks and retries, so the phases are sequenced now for clarity rather
     // than for safety — and phase 3 below exercises the parking deliberately.
+    // SAFETY: `root_ns` is this process's live root namespace handle
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
         Ok(t) => t,
         Err(_) => {

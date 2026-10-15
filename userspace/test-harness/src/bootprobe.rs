@@ -314,8 +314,8 @@ fn sched_gate(root_ns: u64) -> bool {
     // text (zero-padded to the page).
     let text = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, 4096) };
     let active = cpus_with_switches(text);
-    // SAFETY: unmapping the page mapped above (`text` is not used past here);
-    // closing our own handle.
+    // SAFETY: unmapping the page mapped above (`text` is not used past here); closing our own
+    // handle.
     unsafe {
         syscall2(SYS_MEMORY_UNMAP, addr as u64, 0);
         syscall1(SYS_HANDLE_CLOSE, mem);
@@ -1168,6 +1168,7 @@ fn overwrite_test(root_ns: u64) -> bool {
         kprint(b"boot-probe: rwtest lookup FAIL\n");
         return false;
     }
+    // SAFETY: mapping a file handle we hold with the rights it was resolved with; the result is checked below
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if addr < 0 {
         kprint(b"boot-probe: rwtest map FAIL\n");
@@ -1178,8 +1179,8 @@ fn overwrite_test(root_ns: u64) -> bool {
     let base = addr as u64;
     // SAFETY: byte 8 is within the mapped page; read the original (== 8) to compare later.
     let orig8 = unsafe { ((base + 8) as *const u8).read_volatile() };
-    // SAFETY: bytes 0..4 are within the writable mapping — the write dirties the page.
     for (i, m) in marker.iter().enumerate() {
+        // SAFETY: bytes 0..4 are within the writable mapping; the write dirties the page
         unsafe { ((base + i as u64) as *mut u8).write_volatile(*m) };
     }
     // 2. Flush the mapping's pages to disk (Model A write IRPs to the existing LBAs).
@@ -1213,6 +1214,7 @@ fn grow_test(root_ns: u64) -> bool {
 
     // 1. Grow-resolve: the fs-server grows the file, then replies its (2-block) map. The
     //    lookup returns a PO; wait for the handle.
+    // SAFETY: `path` outlives the call and `root_ns` is a namespace handle we hold
     let po = unsafe {
         syscall5(
             SYS_FILE_GROW,
@@ -1251,6 +1253,7 @@ fn grow_test(root_ns: u64) -> bool {
     }
 
     // 2. Map the grown file; write a marker in the **new** region (the appended 2nd block).
+    // SAFETY: mapping a file handle we hold with the rights it was resolved with; the result is checked below
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, new_size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if addr < 0 {
         kprint(b"boot-probe: grow map FAIL\n");
@@ -1291,6 +1294,7 @@ fn create_test(root_ns: u64) -> bool {
     let new_size: u64 = 4096; // fresh file → 1 block.
 
     // 1. Create-resolve: the fs-server creates the file, grows it, then replies its map.
+    // SAFETY: `path` outlives the call and `root_ns` is a namespace handle we hold
     let po = unsafe {
         syscall5(
             SYS_FILE_CREATE,
@@ -1329,6 +1333,7 @@ fn create_test(root_ns: u64) -> bool {
     }
 
     // 2. Map the new file; write a marker at the start.
+    // SAFETY: mapping a file handle we hold with the rights it was resolved with; the result is checked below
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, new_size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if addr < 0 {
         kprint(b"boot-probe: create map FAIL\n");
@@ -1370,6 +1375,7 @@ fn read_large_file(root_ns: u64) -> bool {
         return false;
     }
     // Map the whole file lazily (a FileBacked VMA — no frames until faulted).
+    // SAFETY: mapping a file handle we hold, read-only and lazily; the result is checked below
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, LARGE_FILE_BYTES as u64, RIGHT_MAP_READ) };
     if addr < 0 {
         kprint(b"boot-probe: large.bin map FAIL\n");
@@ -1422,6 +1428,7 @@ fn subtree_bind_test(root_ns: u64) -> bool {
         if st != 0 || fh == 0 {
             return 0;
         }
+        // SAFETY: mapping a file handle we hold, read-only; the result is checked below
         let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, PAGE, RIGHT_MAP_READ) };
         // The mapping pins its own reference to the object; close the handle.
         // SAFETY: closing our own handle.
@@ -1441,6 +1448,7 @@ fn subtree_bind_test(root_ns: u64) -> bool {
     for i in 0..64u64 {
         // SAFETY: both addresses map a full page; `i < 64 < PAGE`.
         let a = unsafe { ((direct + i) as *const u8).read_volatile() };
+        // SAFETY: `via_sub` maps a full page and `i < 64 < PAGE`
         let b = unsafe { ((via_sub + i) as *const u8).read_volatile() };
         if a != b {
             same = false;
@@ -3691,8 +3699,8 @@ fn past_two_tib_test(root_ns: u64) -> bool {
     }
     // SAFETY: register-only syscall.
     let page = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    // SAFETY: register-only syscall; `page` is ours.
     let addr = if page > 0 {
+        // SAFETY: `page` is a memory object we just created; the result is checked below
         unsafe { syscall4(SYS_MEMORY_MAP, page as u64, 0, PAGE, RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) }
     } else {
         -1

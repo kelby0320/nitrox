@@ -167,6 +167,7 @@ fn timer_nap_ms(ms: u64) {
     let th = th as u64;
     // SAFETY: FP_CLOCK is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut FP_CLOCK) as u64) };
+    // SAFETY: FP_CLOCK was just written by the clock read above; this thread owns the static
     let now = unsafe { (&raw const FP_CLOCK).read() };
     let fire_at = now + ms * 1_000_000;
     // SAFETY: arming our own timer handle (absolute monotonic, one-shot).

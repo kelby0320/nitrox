@@ -1438,10 +1438,10 @@ impl Broker {
                 // nothing more.
                 Grant::KernelLog => {
                     let snapshot = ns_lookup(self.root_ns, KERNEL_LOG, RIGHT_MAP_READ | RIGHT_INSPECT | RIGHT_TRANSFER);
-                    // SAFETY: a namespace this broker made, a valid path, and a handle it holds — a
-                    // direct-handle bind, so no subtree base.
                     let result = match snapshot {
                         0 => -1,
+                        // SAFETY: a namespace this broker made, a valid path, and a handle it holds; a direct-handle
+                        // bind, so no subtree base
                         _ => unsafe {
                             let (p, l) = (KERNEL_LOG.as_ptr() as u64, KERNEL_LOG.len() as u64);
                             syscall6(SYS_NS_BIND, view_ns, p, l, snapshot, 0, 0)

@@ -423,6 +423,7 @@ impl Host for NitroxHost {
         //
         // The flag is left set: the checkpoint reads it after the pipeline, as it does for an
         // interrupt drained in the waits.
+        // SAFETY: INTERRUPTED is a process-wide flag read and written only from this thread
         if unsafe { (&raw const INTERRUPTED).read() } {
             for &c in &children {
                 // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
@@ -889,8 +890,8 @@ fn reap(
         }
         out.push(StageStatus { command: s.program.clone(), exit_status: code, crashed, cancelled: false });
     }
-    // SAFETY: the shell's own handles, no longer needed now every stage has exited.
     for &c in children {
+        // SAFETY: the shell's own handles, no longer needed now every stage has exited
         unsafe { syscall1(SYS_HANDLE_CLOSE, c) };
     }
     out
