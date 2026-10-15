@@ -39,6 +39,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod comments;
+
 /// The kernel console's glyphs and layout, compiled here by path so that `check-fbcon` reads a
 /// screendump back into text with the code the kernel drew it with — the same face, palette and
 /// geometry, not a copy of them. The pair names nothing outside itself: `text` reaches `glyphs`
@@ -382,6 +384,10 @@ fn built_from_line() -> String {
 const COMMIT_ENV: &str = "NITROX_COMMIT";
 
 fn main() -> ExitCode {
+    // Run by an edit hook, outside `cargo`: before anything that needs `CARGO_MANIFEST_DIR`.
+    if env::args().nth(1).as_deref() == Some("hook-comments") {
+        return comments::hook_main();
+    }
     // **Set once, for every child**: each cargo this process runs inherits it, so no build path —
     // kernel, userspace, host tests — can forget to pass it. Before any thread exists.
     // SAFETY: single-threaded at this point; nothing reads the environment concurrently.
@@ -529,6 +535,7 @@ fn main() -> ExitCode {
         Some("check-nightly") => cmd_check_nightly(),
         Some("check-deferrals") => cmd_check_deferrals(),
         Some("check-docs") => cmd_check_docs(),
+        Some("check-comments") => comments::cmd_check_comments(&qargs),
         Some("check-images") => cmd_check_images(),
         // **The first *positional* argument, not the first argument.** `qargs` has the global
         // flags stripped, and anything else beginning with `-` is a flag this command does not

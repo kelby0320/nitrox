@@ -17,7 +17,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # The whole history: check-comments diffs the branch from its merge base with main.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Two toolchains, on purpose. The kernel and tools stay on **stable** with the
       # built-in bare target. Userspace pins a **nightly** in
@@ -58,6 +61,11 @@ jobs:
       # nightly language or library feature, keeping the exception narrow.
       - name: cargo xtask check-nightly
         run: cargo xtask check-nightly
+
+      # New comments at most 0.15 of new code plus 3, and none citing a PR, review, phase or part.
+      # A pull request is measured from its base branch, a push to main by the merge it made.
+      - name: cargo xtask check-comments
+        run: cargo xtask check-comments --base ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD^1' }}
 
       # A `TODO(tag)` in shipping source must have an entry in
       # docs/rationale/deferred-decisions.md. Three deferrals that cost real time to

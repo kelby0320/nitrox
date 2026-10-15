@@ -14,7 +14,20 @@
 
   "_comment_commands": "Project-specific custom commands available via /command-name in Claude Code sessions. Add custom commands as files in .claude/commands/ if needed.",
 
-  "_comment_hooks": "Reserved for future use. Hooks like InstructionsLoaded can be useful for debugging which CLAUDE.md files are being loaded; uncomment when needed.",
+  "_comment_hooks": "After each edit of a Rust file, the built xtask's hook-comments nudges the author when the edit adds comments over 0.1 of its code or one cites a PR, review, phase or part. It never blocks, and an unbuilt xtask means silence. See cargo xtask check-comments.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/tools/target/release/xtask hook-comments 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  },
 
   "_comment_subagents": "Subagent definitions are in .claude/agents/: implementer, the Sonnet agent the author session hands bounded work to (see CLAUDE.md, Who does the work)."
 }
