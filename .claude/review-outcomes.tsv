@@ -1,1 +1,16 @@
 date	pr	head	finding	lens	severity	verdict	outcome	commit	note
+2026-10-14	374	884eae0d	1	error-paths+logic	blocking	demonstrated	fixed	307ad9e0	missing lenses named; all dead posts nothing and throws
+2026-10-14	374	884eae0d	2	logic	worth-fixing	demonstrated	fixed	307ad9e0	boot verdicts only for boot findings
+2026-10-14	374	884eae0d	3	error-paths	worth-fixing	demonstrated	fixed	307ad9e0	report deletes the run's branches; 20 old ones deleted; next run confirms
+2026-10-14	374	884eae0d	4	error-paths	worth-fixing	demonstrated	fixed	307ad9e0	cleanup by the scope's run prefix; a null report throws
+2026-10-14	374	884eae0d	5	logic	optional	demonstrated	fixed	307ad9e0	pinned head checked against the scope's
+2026-10-14	374	884eae0d	6	logic	optional	demonstrated	fixed	307ad9e0	architecture lens also follows kernel/ABI paths
+2026-10-14	374	884eae0d	7	logic	optional	demonstrated	fixed	307ad9e0	booted finding takes demonstrated and duplicate_of
+2026-10-14	374	884eae0d	8	logic+rules-and-docs	optional	demonstrated	fixed	307ad9e0	MAX_AGENTS checked
+2026-10-14	374	884eae0d	9	error-paths	optional	unverified	fixed	307ad9e0	no agent-named path removed; only the run prefix
+2026-10-14	374	884eae0d	10	error-paths	optional	demonstrated	fixed	307ad9e0	check-docs refuses a listing without the root CLAUDE.md
+2026-10-14	374	884eae0d	11	logic	optional	demonstrated	fixed	307ad9e0	merge stages deduplicated
+2026-10-14	374	884eae0d	12	tests+rules-and-docs	optional	unverified	fixed	307ad9e0	host tests added; needing git declined
+2026-10-14	374	884eae0d	13	logic	optional	unverified	fixed	307ad9e0	scope needs at least one CI run
+2026-10-14	374	884eae0d	14	error-paths	optional	unverified	fixed	307ad9e0	outcomes recorded after the fixing commit
+2026-10-14	374	884eae0d	15	error-paths	optional	unverified	fixed	307ad9e0	head column added
