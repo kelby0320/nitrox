@@ -1333,7 +1333,8 @@ impl FileObject {
         // Originate: records the pending fill on `reg` and pushes the request. The
         // reply completes `po`; `Busy`/`Full`/`PeerClosed` fail this fault.
         matches!(
-            crate::sched::us_forward_originate_fill(reg.as_ptr(), &mut msg, po, file_obj, frame, index),
+            // SAFETY: `reg` is a live `UserspaceServerReg` reference held across the call.
+            unsafe { crate::sched::us_forward_originate_fill(reg.as_ptr(), &mut msg, po, file_obj, frame, index) },
             crate::sched::ForwardOutcome::Pending
         )
     }
@@ -1346,7 +1347,8 @@ impl FileObject {
 /// check, which a `PendingOperation` answers from its flag.
 fn wait_status(po: &ObjectRef) -> i32 {
     match crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) {
-        crate::sched::WaitResult::Signaled(_) => crate::sched::pending_op_completion(po.as_ptr()).0,
+        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+        crate::sched::WaitResult::Signaled(_) => unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0,
         // OutOfMemory (waiter registration failed); TimedOut cannot occur (no deadline).
         _ => crate::syscall::error::KError::OutOfMemory as i32,
     }
@@ -1383,7 +1385,8 @@ fn wait_for_fill(po: &ObjectRef) -> bool {
     loop {
         match crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) {
             crate::sched::WaitResult::Signaled(_) => {
-                return crate::sched::pending_op_completion(po.as_ptr()).0 == 0;
+                // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+                return unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0 == 0;
             }
             _ => park_briefly(),
         }
@@ -2296,7 +2299,12 @@ mod tests {
         // SAFETY: as above; the device's side of a completion, a success of the whole length.
         unsafe { ((*irp).status, (*irp).transferred) = (0, length) };
         crate::io::block::complete_for_test(irp);
-        assert_eq!(crate::sched::pending_op_completion(fill_po.as_ptr()), (0, length), "the fault's PO completed");
+        // SAFETY: `fill_po` is a live `PendingOperation` reference held across the call.
+        assert_eq!(
+            unsafe { crate::sched::pending_op_completion(fill_po.as_ptr()) },
+            (0, length),
+            "the fault's PO completed"
+        );
 
         let (frame, fill_po) = miss(file_of(&f), 8);
         assert_eq!(file_of(&f).start_fill(&f, 8, frame, &fill_po, false), FillStart::DeviceIo(1));
@@ -2368,7 +2376,8 @@ mod tests {
             crate::io::block::complete_for_test(irp);
         }
         assert!(reads.borrow().len() < 16, "a fault that never gives up");
-        crate::sched::pending_op_completion(po.as_ptr()).0 == 0
+        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+        unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0 == 0
     }
 
     /// **A fault waiting on another's read-ahead is not failed by a page it never asked for** (PR

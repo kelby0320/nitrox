@@ -705,7 +705,8 @@ fn on_event(x: &Xhci, trb: &Trb) {
     match trb.kind() {
         kind::PORT_STATUS_CHANGE => {
             x.port_changes.fetch_add(1, Ordering::Relaxed);
-            crate::sched::signal_interrupt(x.hub_wake.as_ptr());
+            // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
+            unsafe { crate::sched::signal_interrupt(x.hub_wake.as_ptr()) };
         }
         kind::COMMAND_COMPLETION => complete_if(
             x,

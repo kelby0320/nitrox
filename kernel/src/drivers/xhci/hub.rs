@@ -173,7 +173,8 @@ pub(super) extern "C" fn main(_arg: usize) {
         let now = crate::arch::Timer::read_ns();
         let until = super::storage::bound(now);
         match crate::sched::wait_on(&[x.hub_wake.as_ptr() as usize], until.unwrap_or(u64::MAX), now) {
-            crate::sched::WaitResult::Signaled(_) => crate::sched::interrupt_consume(x.hub_wake.as_ptr()),
+            // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
+            crate::sched::WaitResult::Signaled(_) => unsafe { crate::sched::interrupt_consume(x.hub_wake.as_ptr()) },
             _ if until.is_some() => {}
             _ => sleep(1_000_000),
         }
@@ -851,7 +852,8 @@ fn wait(x: &Xhci, po: &ObjectRef, bound_ns: u64) -> Option<(u8, u64)> {
             sleep(1_000_000);
         }
     }
-    let (status, result) = crate::sched::pending_op_completion(po.as_ptr());
+    // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+    let (status, result) = unsafe { crate::sched::pending_op_completion(po.as_ptr()) };
     Some((status as u8, result))
 }
 

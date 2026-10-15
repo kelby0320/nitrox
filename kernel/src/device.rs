@@ -1364,14 +1364,21 @@ mod tests {
 
         let behind = po();
         assert_eq!(read(&behind, 4, 7), Err(KError::InvalidArgument), "shorter than its answer");
-        assert!(!crate::sched::pending_op_is_signaled(behind.as_ptr()));
+        // SAFETY: `behind` is a live `PendingOperation` reference held across the call.
+        assert!(!unsafe { crate::sched::pending_op_is_signaled(behind.as_ptr()) });
         assert_eq!(read(&behind, 4, 8), Ok(()));
-        assert_eq!(crate::sched::pending_op_completion(behind.as_ptr()), (0, 8), "behind, so answered at once");
+        // SAFETY: `behind` is a live `PendingOperation` reference held across the call.
+        assert_eq!(
+            unsafe { crate::sched::pending_op_completion(behind.as_ptr()) },
+            (0, 8),
+            "behind, so answered at once"
+        );
 
         let ahead: [ObjectRef; WAITERS_MAX] = core::array::from_fn(|_| po());
         for p in &ahead {
             assert_eq!(read(p, 5, 8), Ok(()));
-            assert!(!crate::sched::pending_op_is_signaled(p.as_ptr()), "5 is not past 5: it waits");
+            // SAFETY: `p` is a live `PendingOperation` reference held across the call.
+            assert!(!unsafe { crate::sched::pending_op_is_signaled(p.as_ptr()) }, "5 is not past 5: it waits");
         }
         assert_eq!(read(&po(), 5, 8), Err(KError::WouldBlock), "a fifth place to wait");
     }

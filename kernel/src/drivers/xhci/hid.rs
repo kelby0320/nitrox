@@ -277,7 +277,8 @@ impl Nodes {
             drop(old);
         }
         x.hid_lights.store(true, Ordering::Release);
-        crate::sched::signal_interrupt(x.hub_wake.as_ptr());
+        // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
+        unsafe { crate::sched::signal_interrupt(x.hub_wake.as_ptr()) };
         Ok(())
     }
 
@@ -871,7 +872,8 @@ pub(super) fn on_transfer(x: &Xhci, trb: &Trb) {
     // project builds panics on the other order (PR #358 review, probed with a halt simulated).
     if halted {
         x.hid_halted.store(true, Ordering::Release);
-        crate::sched::signal_interrupt(x.hub_wake.as_ptr());
+        // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
+        unsafe { crate::sched::signal_interrupt(x.hub_wake.as_ptr()) };
     }
     let Some((node, epoch)) = target else { return };
     // **Each batch decoded under the table's lock and pushed after it**: one, unless a bitmap

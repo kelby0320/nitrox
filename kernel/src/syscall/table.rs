@@ -624,7 +624,8 @@ pub fn sys_thread_set_affinity(thread_h: u64, cpu_mask: u64) -> SysResult {
     if mask == 0 {
         return Err(KError::InvalidArgument);
     }
-    crate::sched::set_thread_affinity(ok.object.as_ptr(), mask);
+    // SAFETY: `ok.object` is the live `Thread` its lookup type-checked, held across the call.
+    unsafe { crate::sched::set_thread_affinity(ok.object.as_ptr(), mask) };
     Ok(0)
 }
 
@@ -736,7 +737,9 @@ pub fn sys_thread_get_registers(thread_h: u64, out_ptr: u64) -> SysResult {
     let ok = lookup_typed(thread_h, pid, Rights::SIGNAL, KObjectType::Thread)?;
 
     // Must be suspended on a fault — yields the captured frame's address.
-    let frame_ptr = crate::sched::thread_exception_frame(ok.object.as_ptr()).ok_or(KError::InvalidArgument)?;
+    // SAFETY: `ok.object` is the live `Thread` its lookup type-checked, held across the call.
+    let frame_ptr =
+        unsafe { crate::sched::thread_exception_frame(ok.object.as_ptr()) }.ok_or(KError::InvalidArgument)?;
     // Decode the registers out of the frame (SCHED already released), then copy
     // out to user memory (never under a lock).
     let regs: RegisterValues = crate::arch::Registers::read_from_exception_frame(frame_ptr);
@@ -762,7 +765,8 @@ pub fn sys_exception_resume(thread_h: u64, disposition: u64, code: u64) -> SysRe
 
     let pid = crate::sched::current_owner_pid();
     let ok = lookup_typed(thread_h, pid, Rights::SIGNAL, KObjectType::Thread)?;
-    if !crate::sched::resume_suspended(ok.object.as_ptr(), tag, code as i32) {
+    // SAFETY: `ok.object` is the live `Thread` its lookup type-checked, held across the call.
+    if !unsafe { crate::sched::resume_suspended(ok.object.as_ptr(), tag, code as i32) } {
         // Not currently suspended (already resumed, or never faulted).
         return Err(KError::InvalidArgument);
     }
@@ -1373,7 +1377,9 @@ pub fn sys_timer_set(timer_h: u64, deadline_ns: u64, interval_ns: u64) -> SysRes
     let pid = crate::sched::current_owner_pid();
     let ok = lookup_typed(timer_h, pid, Rights::empty(), KObjectType::Timer)?;
     // `ok.object` (an ObjectRef) is held across the arm, keeping the Timer alive.
-    crate::sched::timer_arm(ok.object.as_ptr(), deadline_ns, interval_ns).map_err(|()| KError::OutOfMemory)?;
+    // SAFETY: `ok.object` is the live `Timer` its lookup type-checked, held across the call.
+    unsafe { crate::sched::timer_arm(ok.object.as_ptr(), deadline_ns, interval_ns) }
+        .map_err(|()| KError::OutOfMemory)?;
     Ok(0)
 }
 
@@ -1513,7 +1519,8 @@ pub fn sys_ns_bind(
         // rights. Minting a rival registration would clobber the endpoint→reg
         // reply-routing back-pointer (the second bind would hijack the first's
         // replies). See docs/architecture/namespace-and-resource-servers.md.
-        if let Some(existing) = crate::sched::us_forward_existing_reg(res_ok.object.as_ptr()) {
+        // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+        if let Some(existing) = unsafe { crate::sched::us_forward_existing_reg(res_ok.object.as_ptr()) } {
             return match ns.bind_userspace_server(path, existing, rights, base) {
                 Ok(()) => Ok(0),
                 Err((returned, e)) => {
@@ -1535,7 +1542,9 @@ pub fn sys_ns_bind(
                 // Now that the binding owns the registration, record the endpoint →
                 // registration back-pointer so the server's reply reaches it. (Set
                 // only on success: on failure no back-pointer is left dangling.)
-                crate::sched::us_server_attach(res_ok.object.as_ptr(), reg_ptr);
+                // SAFETY: `res_ok.object` is the live `IpcChannel` its lookup checked, and `reg_ptr` the
+                // registration the binding now owns, both held across the call.
+                unsafe { crate::sched::us_server_attach(res_ok.object.as_ptr(), reg_ptr) };
                 Ok(0)
             }
             Err((returned, e)) => {
@@ -2009,7 +2018,8 @@ fn forward_userspace_lookup(
     // Originate (assigns the request id, records the pending lookup + its suffix and
     // request, sends). The suffix is stored so a lazy `FILE` reply can name the file in the
     // page-cache producer, and so a `SUBNAMESPACE` reply can continue it.
-    match crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested, suffix, fwd) {
+    // SAFETY: `reg` is a live `UserspaceServerReg` reference held across the call.
+    match unsafe { crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested, suffix, fwd) } {
         crate::sched::ForwardOutcome::Pending => None,
         crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => Some((KError::WouldBlock as i32, 0)),
         crate::sched::ForwardOutcome::PeerClosed => Some((KError::PeerClosed as i32, 0)),
@@ -2232,7 +2242,8 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
                     // still pins the object, so reading the (one-shot, now-stable)
                     // completion is sound.
                     out[k] = if types[i] == KObjectType::PendingOperation {
-                        let (status, result) = crate::sched::pending_op_completion(objs[i] as *mut ());
+                        // SAFETY: `objs[i]` is the `PendingOperation` its waited handle still pins.
+                        let (status, result) = unsafe { crate::sched::pending_op_completion(objs[i] as *mut ()) };
                         IoResult::completed_with_result(handles[i], status, result)
                     } else {
                         // An `InterruptObject` consumes one pending interrupt on
@@ -2240,7 +2251,8 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
                         // per interrupt; the edge-style waitables are an
                         // unconditional "ready".
                         if types[i] == KObjectType::InterruptObject {
-                            crate::sched::interrupt_consume(objs[i] as *mut ());
+                            // SAFETY: `objs[i]` is the `InterruptObject` its waited handle still pins.
+                            unsafe { crate::sched::interrupt_consume(objs[i] as *mut ()) };
                         }
                         IoResult::ready(handles[i])
                     };
@@ -2281,7 +2293,8 @@ pub fn sys_notif_recv(channel_h: u64, out: u64) -> SysResult {
     // Pop under SCHED into a kernel-local notification; `ok.object` (held here)
     // pins the channel across the pop. Copy out AFTER the lock is released
     // (never hold the IrqSpinLock across a faulting user copy).
-    let n = crate::sched::notif_try_recv(ok.object.as_ptr()).ok_or(KError::WouldBlock)?;
+    // SAFETY: `ok.object` is the live `NotificationChannel` its lookup type-checked, held across the call.
+    let n = unsafe { crate::sched::notif_try_recv(ok.object.as_ptr()) }.ok_or(KError::WouldBlock)?;
     copy_to_user(uptr, &n).map_err(from_user_access)?;
     Ok(0)
 }
@@ -2432,7 +2445,8 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
     // (cross-context install + PO signal) rather than enqueuing it — nothing in the
     // kernel receives that ring. The reply is consumed regardless of `send_mode`
     // (servers reply `NoBlock`). See `docs/spec/rsproto-namespace-ops.md`.
-    if let Some(reg) = crate::sched::us_forward_reg_for_send(ok.object.as_ptr()) {
+    // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+    if let Some(reg) = unsafe { crate::sched::us_forward_reg_for_send(ok.object.as_ptr()) } {
         // The one request a server sends the kernel: `File::Forget`, answered through the
         // blocking send's `PendingOperation` (administration Part C.1b).
         let payload_len = (bounce.header.payload_len as usize).min(IPC_PAYLOAD_SIZE);
@@ -2452,16 +2466,19 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
         // Synchronous attempt: `Sent` commits the transfer move (close the
         // sender's handles); a full ring / dead peer leaves the transfers untaken
         // (they drop here, outside SCHED) so no capability is lost.
-        SendMode::NoBlock => match crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) {
-            SendOutcome::Sent { .. } => {
-                for i in 0..count {
-                    close_and_release(RawHandle(h_raw[i]), pid);
+        SendMode::NoBlock => {
+            // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+            match unsafe { crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) } {
+                SendOutcome::Sent { .. } => {
+                    for i in 0..count {
+                        close_and_release(RawHandle(h_raw[i]), pid);
+                    }
+                    Ok(0)
                 }
-                Ok(0)
+                SendOutcome::Full => Err(KError::WouldBlock),
+                SendOutcome::PeerClosed => Err(KError::PeerClosed),
             }
-            SendOutcome::Full => Err(KError::WouldBlock),
-            SendOutcome::PeerClosed => Err(KError::PeerClosed),
-        },
+        }
         // Blocking: return a `PendingOperation` that completes when the message
         // is delivered — immediately if the ring has space, else when the peer
         // next receives. The message is committed either way, so the transfer
@@ -2475,13 +2492,10 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
             // SAFETY: `into_raw` yields the single creation reference; adopt it.
             let po_ref =
                 unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
-            match crate::sched::ipc_send_push_blocking(
-                ok.object.as_ptr(),
-                &bounce,
-                &mut transfers,
-                &po_ref,
-                deadline_ns,
-            ) {
+            // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+            match unsafe {
+                crate::sched::ipc_send_push_blocking(ok.object.as_ptr(), &bounce, &mut transfers, &po_ref, deadline_ns)
+            } {
                 BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
                     // Message committed (delivered or held) — commit the transfers.
                     for i in 0..count {
@@ -2621,7 +2635,8 @@ fn complete_resolve_reply(
     // Parse the reply (recovers the `request_id` even on a malformed body).
     let reply = parse_reply(&bounce.payload[..payload_len]);
     let pl = match reply {
-        Some(r) => crate::sched::us_forward_take_pending(reg, r.request_id),
+        // SAFETY: `reg` is the registration the send's live peer endpoint pins for this call.
+        Some(r) => unsafe { crate::sched::us_forward_take_pending(reg, r.request_id) },
         None => None,
     };
     let Some(pl) = pl else {
@@ -2903,7 +2918,8 @@ fn notify_file_touched(file_obj: &ObjectRef) {
     };
     msg.header.payload_len = body_len as u32;
     msg.header.handle_count = 0;
-    crate::sched::us_forward_notify(reg.as_ptr(), &mut msg);
+    // SAFETY: `reg` is a live `UserspaceServerReg` reference held across the call.
+    unsafe { crate::sched::us_forward_notify(reg.as_ptr(), &mut msg) };
 }
 
 fn build_and_install_file(
@@ -3240,7 +3256,8 @@ fn complete_read_range_reply(
 
     let reply = parse_read_range_reply(&bounce.payload[..payload_len]);
     let pf = match reply {
-        Some(r) => crate::sched::us_forward_take_pending_fill(reg, r.request_id),
+        // SAFETY: `reg` is the registration the send's live peer endpoint pins for this call.
+        Some(r) => unsafe { crate::sched::us_forward_take_pending_fill(reg, r.request_id) },
         None => None,
     };
     let Some(pf) = pf else {
@@ -3331,7 +3348,8 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     let ok = lookup_typed(ch, pid, Rights::RECV, KObjectType::IpcChannel)?;
 
     // Peek under SCHED so the empty-poll path allocates no bounce buffer.
-    match crate::sched::ipc_recv_peek(ok.object.as_ptr()) {
+    // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+    match unsafe { crate::sched::ipc_recv_peek(ok.object.as_ptr()) } {
         RecvState::Empty => return Err(KError::WouldBlock),
         RecvState::PeerClosed => return Err(KError::PeerClosed),
         RecvState::HasMsg => {}
@@ -3347,7 +3365,8 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     // Drop under the lock).
     let mut _reclaimed: [Option<ReclaimedSend>; IpcChannel::MAX_PENDING_SENDS] = core::array::from_fn(|_| None);
     let (popped, _promoted_po) =
-        crate::sched::ipc_recv_pop_into(ok.object.as_ptr(), &mut bounce, &mut transfers, &mut _reclaimed);
+        // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
+        unsafe { crate::sched::ipc_recv_pop_into(ok.object.as_ptr(), &mut bounce, &mut transfers, &mut _reclaimed) };
     if !popped {
         // Drained between the peek and the pop (only possible under future SMP).
         return Err(KError::WouldBlock);

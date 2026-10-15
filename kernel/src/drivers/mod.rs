@@ -123,7 +123,8 @@ pub fn self_test() {
     // SAFETY: ring-0; IF was 0 here and is restored to 0 below.
     unsafe { crate::arch::Cpu::interrupts_enable() };
     while crate::arch::Timer::read_ns().wrapping_sub(start) < 200_000_000 {
-        if crate::sched::pending_op_is_signaled(po_check.as_ptr()) {
+        // SAFETY: `po_check` is a live `PendingOperation` reference held across the call.
+        if unsafe { crate::sched::pending_op_is_signaled(po_check.as_ptr()) } {
             via_irq = true;
             break;
         }
@@ -136,7 +137,8 @@ pub fn self_test() {
         ahci::poll_complete_inflight();
     }
 
-    let (status, result) = crate::sched::pending_op_completion(po_check.as_ptr());
+    // SAFETY: `po_check` is a live `PendingOperation` reference held across the call.
+    let (status, result) = unsafe { crate::sched::pending_op_completion(po_check.as_ptr()) };
     if status != 0 || result != 512 {
         crate::kprintln!("ahci: read self-test FAIL (status {} result {})", status, result);
         return;

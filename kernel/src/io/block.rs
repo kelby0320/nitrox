@@ -446,7 +446,8 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
     // Poll the in-flight command to completion + run its DPC (no interrupts).
     (backend.poll)(backend.ctx);
 
-    let (status, _result) = crate::sched::pending_op_completion(po_ref.as_ptr());
+    // SAFETY: `po_ref` is a live `PendingOperation` reference held across the call.
+    let (status, _result) = unsafe { crate::sched::pending_op_completion(po_ref.as_ptr()) };
     if status != 0 {
         return false;
     }

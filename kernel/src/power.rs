@@ -114,7 +114,8 @@ fn flush_every_disk() {
         let mut waiting = [0usize; MAX_WAIT_HANDLES];
         let mut n = 0;
         for (_, po) in flushing.iter() {
-            if n < MAX_WAIT_HANDLES && !crate::sched::pending_op_is_signaled(po.as_ptr()) {
+            // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+            if n < MAX_WAIT_HANDLES && !unsafe { crate::sched::pending_op_is_signaled(po.as_ptr()) } {
                 waiting[n] = po.as_ptr() as usize;
                 n += 1;
             }
@@ -133,12 +134,14 @@ fn flush_every_disk() {
 
     let mut flushed = 0usize;
     for (index, po) in flushing.iter() {
-        if !crate::sched::pending_op_is_signaled(po.as_ptr()) {
+        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+        if !unsafe { crate::sched::pending_op_is_signaled(po.as_ptr()) } {
             let bound = FLUSH_BOUND_NS / 1_000_000_000;
             crate::kprintln!("power: /dev/blk/{index} did not finish flushing in {bound} s");
             continue;
         }
-        match crate::sched::pending_op_completion(po.as_ptr()).0 {
+        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+        match unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0 {
             0 => flushed += 1,
             status => crate::kprintln!("power: /dev/blk/{index} failed to flush (status {status})"),
         }

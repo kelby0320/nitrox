@@ -975,8 +975,8 @@ fn ahci_poll(_ctx: *mut ()) {
 fn ahci_intr_dpc(_ctx: *mut ()) {
     let disk = AHCI.load(Ordering::Acquire);
     if !disk.is_null() {
-        // SAFETY: live published state; `intr` pins a live InterruptObject.
-        crate::sched::signal_interrupt(unsafe { (*disk).intr });
+        // SAFETY: `disk` is live published state, and its `intr` a live `InterruptObject`.
+        unsafe { crate::sched::signal_interrupt((*disk).intr) };
     }
 }
 

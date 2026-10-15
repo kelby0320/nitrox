@@ -26,7 +26,8 @@ use crate::object::{InterruptObject, MemoryObject, ObjectRef, PendingOperation};
 /// The DPC handler for the [`InterruptObject`] self-test: signal the object whose
 /// pointer is its `ctx`, exactly as a device ISR's completion DPC would.
 fn intr_test_dpc(ctx: *mut ()) {
-    crate::sched::signal_interrupt(ctx);
+    // SAFETY: the self-test queued this DPC with its live `InterruptObject` as `ctx`.
+    unsafe { crate::sched::signal_interrupt(ctx) };
 }
 
 /// Boot self-test for the I/O spine (Phase 2 slice 5, Part 2). Proves, without
@@ -96,7 +97,8 @@ fn block_irp_self_test() {
     // interrupt-dispatch tail).
     crate::dpc::run_pending();
 
-    let (status, result) = crate::sched::pending_op_completion(po_check.as_ptr());
+    // SAFETY: `po_check` is a live `PendingOperation` reference held across the call.
+    let (status, result) = unsafe { crate::sched::pending_op_completion(po_check.as_ptr()) };
     if status != 0 || result != LEN as u64 {
         crate::kprintln!("io: block-read self-test FAIL (status {} result {})", status, result);
         return;
@@ -148,12 +150,15 @@ fn interrupt_object_self_test() {
     crate::dpc::enqueue(&dpc);
     crate::dpc::run_pending();
 
-    if !crate::sched::interrupt_pending(irq.as_ptr()) {
+    // SAFETY: `irq` is a live `InterruptObject` reference held across the call.
+    if !unsafe { crate::sched::interrupt_pending(irq.as_ptr()) } {
         crate::kprintln!("io: interrupt self-test FAIL (not latched after DPC)");
         return;
     }
-    crate::sched::interrupt_consume(irq.as_ptr());
-    if crate::sched::interrupt_pending(irq.as_ptr()) {
+    // SAFETY: `irq` is a live `InterruptObject` reference held across the call.
+    unsafe { crate::sched::interrupt_consume(irq.as_ptr()) };
+    // SAFETY: `irq` is a live `InterruptObject` reference held across the call.
+    if unsafe { crate::sched::interrupt_pending(irq.as_ptr()) } {
         crate::kprintln!("io: interrupt self-test FAIL (still latched after consume)");
         return;
     }

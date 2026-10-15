@@ -549,7 +549,8 @@ impl Drop for UserspaceServerReg {
     /// that follow then release the endpoint, and if that is its last reference
     /// `ipc_endpoint_closing` runs and correctly finds nothing to drain.
     fn drop(&mut self) {
-        crate::sched::us_reg_detach(self as *mut Self as *mut ());
+        // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
+        unsafe { crate::sched::us_reg_detach(self as *mut Self as *mut ()) };
         // Poison the sentinel last, once nothing here needs the accessors. A dangling
         // pointer that survives this — via a path not yet known — then fails
         // `is_live` and is caught at the dereference, instead of reading a recycled

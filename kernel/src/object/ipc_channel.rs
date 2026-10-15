@@ -679,7 +679,8 @@ impl Drop for IpcChannel {
     /// cannot drop while receivers remain). Reaches `SCHED`; sound because
     /// endpoint references are released only outside `SCHED` (see module docs).
     fn drop(&mut self) {
-        crate::sched::ipc_endpoint_closing(self as *mut Self as *mut ());
+        // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
+        unsafe { crate::sched::ipc_endpoint_closing(self as *mut Self as *mut ()) };
         debug_assert!(self.inner.get_mut().recv_waiters.is_empty(), "IpcChannel dropped with live receivers");
     }
 }

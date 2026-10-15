@@ -891,7 +891,8 @@ fn act(a: Action, x: Option<&Xhci>) {
         Action::Hub { po } => crate::sched::complete_pending_op(po, 0, 0),
         Action::Wake => {
             if let Some(x) = x {
-                crate::sched::signal_interrupt(x.hub_wake.as_ptr());
+                // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
+                unsafe { crate::sched::signal_interrupt(x.hub_wake.as_ptr()) };
             }
         }
     }
