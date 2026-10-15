@@ -681,7 +681,7 @@ const BUILD_COMMIT: &str = match option_env!("NITROX_COMMIT") {
 ///
 /// Returns the command line's bytes (empty when there is none), for [`parse_cmdline`].
 fn log_handoff() -> &'static [u8] {
-    // SAFETY (every request read below): the statics are written by Limine before `_start` and
+    // SAFETY: for every request read below, the statics are written by Limine before `_start` and
     // only read afterwards; reading through a raw-pointer copy stops the optimiser folding the
     // pre-Limine null. A non-null response is a valid response of its type, and its strings
     // live in bootloader-reclaimable memory, which this kernel never reclaims.
@@ -851,8 +851,6 @@ fn record_framebuffer() {
         }
     };
 
-    // SAFETY: `fb` is Limine's live descriptor and `hhdm_offset()` is the offset Limine
-    // reported for this boot, so `address - offset` is the aperture's physical base.
     // **The aperture is a framebuffer, so it is write-combining** (Phase 5 Part G.3) — said once,
     // here, and read by everything that maps it: the `MemoryObject` `/dev/framebuffer` mints, and
     // the measurement below.
@@ -864,6 +862,8 @@ fn record_framebuffer() {
         true => nitrox_kernel::mm::Caching::WriteCombining,
         false => nitrox_kernel::mm::Caching::Normal,
     };
+    // SAFETY: `fb` is Limine's live descriptor and `hhdm_offset()` is the offset Limine
+    // reported for this boot, so `address - offset` is the aperture's physical base.
     if unsafe { framebuffer::record_aperture(fb, nitrox_kernel::mm::heap::hhdm_offset(), caching) } {
         // **The padding, as a number** (Phase 5 Part D.1): the bytes each row carries past its
         // last pixel. The laptop's is 40, and a reader should not have to subtract to see it.
@@ -1413,6 +1413,7 @@ fn init_memory() -> bool {
     if memmap_resp.is_null() {
         return false;
     }
+    // SAFETY: as above.
     let hhdm_resp = unsafe { (&raw const HHDM_REQUEST).read().response };
     if hhdm_resp.is_null() {
         return false;
@@ -1421,6 +1422,7 @@ fn init_memory() -> bool {
     // a valid response of the corresponding type. The responses live in
     // bootloader-reclaimable memory which we have not yet reclaimed.
     let memmap = unsafe { &*memmap_resp };
+    // SAFETY: as above.
     let hhdm_offset = unsafe { (*hhdm_resp).offset };
     // SAFETY: `memmap` is a live Limine response and `hhdm_offset` is
     // the bootloader's HHDM base — together they satisfy the contract

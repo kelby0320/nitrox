@@ -446,13 +446,11 @@ impl Thread {
         user_sp: u64,
         boot_args: [u64; 4],
     ) -> Result<KBox<Self>, AllocError> {
-        // Read the owning process's identity + address-space root through
-        // the ObjectRef. SAFETY: `process` is a live Process kernel object
-        // (KObjectType::Process) the caller holds a reference to; reading
-        // these fields is sound (no concurrent mutation of them).
         let (owner_pid, root) = {
             let p = process.as_ptr() as *const Process;
+            // SAFETY: `process` pins a live `Process`, whose pid and root nothing mutates.
             let pid = unsafe { (*p).pid() };
+            // SAFETY: as above.
             let root = unsafe { (*p).address_space_root() }.expect("user process must have an address space");
             (pid, root)
         };
@@ -548,6 +546,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn set_state(obj: *mut (), s: ThreadState) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::write(&raw mut (*p).state, s) }
     }
 
@@ -558,6 +557,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn set_process_ended(obj: *mut ()) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::write(&raw mut (*p).process_ended, true) }
     }
 
@@ -568,6 +568,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn process_ended(obj: *mut ()) -> bool {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).process_ended) }
     }
 
@@ -577,6 +578,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn sched_class(obj: *mut ()) -> SchedClass {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).class) }
     }
 
@@ -586,6 +588,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn rt_priority(obj: *mut ()) -> u8 {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).rt_priority) }
     }
 
@@ -595,6 +598,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn nice(obj: *mut ()) -> i8 {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).nice) }
     }
 
@@ -604,6 +608,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn vruntime(obj: *mut ()) -> u64 {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).vruntime) }
     }
 
@@ -613,6 +618,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn set_vruntime(obj: *mut (), v: u64) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::write(&raw mut (*p).vruntime, v) }
     }
 
@@ -622,6 +628,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn set_sched(obj: *mut (), class: SchedClass, rt_priority: u8, nice: i8) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe {
             core::ptr::write(&raw mut (*p).class, class);
             core::ptr::write(&raw mut (*p).rt_priority, rt_priority);
@@ -635,6 +642,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn last_cpu(obj: *mut ()) -> u8 {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).last_cpu) }
     }
 
@@ -644,6 +652,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn set_last_cpu(obj: *mut (), cpu: u8) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::write(&raw mut (*p).last_cpu, cpu) }
     }
 
@@ -653,6 +662,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn cpu_mask(obj: *mut ()) -> u8 {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).cpu_mask) }
     }
 
@@ -662,6 +672,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn set_cpu_mask(obj: *mut (), mask: u8) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::write(&raw mut (*p).cpu_mask, mask) }
     }
 
@@ -672,6 +683,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn state_now(obj: *mut ()) -> ThreadState {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).state) }
     }
 
@@ -682,6 +694,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn set_exception_frame(obj: *mut (), frame: usize) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::write(&raw mut (*p).exception_frame, frame) }
     }
 
@@ -692,6 +705,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn exception_frame(obj: *mut ()) -> Option<usize> {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         let v = unsafe { core::ptr::read(&raw const (*p).exception_frame) };
         if v == 0 { None } else { Some(v) }
     }
@@ -703,6 +717,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn set_disposition(obj: *mut (), tag: u8, code: i32) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe {
             core::ptr::write(&raw mut (*p).disp_tag, tag);
             core::ptr::write(&raw mut (*p).disp_code, code);
@@ -717,6 +732,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn take_disposition(obj: *mut ()) -> (u8, i32) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe {
             let tag = core::ptr::read(&raw const (*p).disp_tag);
             let code = core::ptr::read(&raw const (*p).disp_code);
@@ -824,6 +840,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn entry_and_arg(obj: *mut ()) -> (ThreadEntry, usize) {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { (core::ptr::read(&raw const (*p).entry), core::ptr::read(&raw const (*p).arg)) }
     }
 
@@ -834,6 +851,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn addr_space_root(obj: *mut ()) -> Option<PhysAddr> {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).addr_space_root) }
     }
 
@@ -844,6 +862,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn user_entry(obj: *mut ()) -> Option<(u64, u64)> {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).user_entry) }
     }
 
@@ -854,6 +873,7 @@ impl Thread {
     /// See the accessor contract above.
     pub(crate) unsafe fn user_boot_args(obj: *mut ()) -> [u64; 4] {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).user_boot_args) }
     }
 

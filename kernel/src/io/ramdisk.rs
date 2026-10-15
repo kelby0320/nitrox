@@ -83,6 +83,7 @@ pub struct RamDisk {
 // exclusively for the kernel's lifetime (`over_memory`'s contract), and every access to its bytes
 // goes through `transfer`, under `busy`.
 unsafe impl Send for RamDisk {}
+// SAFETY: as above.
 unsafe impl Sync for RamDisk {}
 
 impl RamDisk {

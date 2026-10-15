@@ -26,6 +26,7 @@ pub struct KBox<T> {
 // Moving the box between threads is sound when `T: Send`; sharing a
 // `&KBox` (which only yields `&T`) is sound when `T: Sync`.
 unsafe impl<T: Send> Send for KBox<T> {}
+// SAFETY: as above.
 unsafe impl<T: Sync> Sync for KBox<T> {}
 
 impl<T> KBox<T> {

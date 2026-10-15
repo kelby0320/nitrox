@@ -437,8 +437,8 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     // on demand. Deferred: map the frames into a temporary kernel VMA instead of copying.)
     let image_started = Timer::read_ns();
     let img_bytes = match img.object.object_type() {
-        // SAFETY: type checked above; `img.object` pins it live.
         KObjectType::MemoryObject => {
+            // SAFETY: type checked above; `img.object` pins it live.
             unsafe { &*(img.object.as_ptr() as *const MemoryObject) }.copy_to_kvec().map_err(|_| KError::OutOfMemory)?
         }
         // Drives the fs-server producer per page, blocking on each fill — sound here on
@@ -965,6 +965,7 @@ fn object_byte_size(ty: KObjectType, obj: &ObjectRef) -> u64 {
     match ty {
         // SAFETY: `obj` pins a live object of the matched type.
         KObjectType::MemoryObject => unsafe { &*(obj.as_ptr() as *const MemoryObject) }.size() as u64,
+        // SAFETY: as above.
         KObjectType::FileObject => unsafe { &*(obj.as_ptr() as *const FileObject) }.size() as u64,
         // SAFETY: as above.
         KObjectType::DeviceNode => unsafe { &*(obj.as_ptr() as *const DeviceNode) }.block_info().byte_capacity(),
@@ -1101,6 +1102,7 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
     let max_bytes = match obj_ty {
         // SAFETY: type-confirmed live object pinned by `lookup`; read its size.
         KObjectType::MemoryObject => unsafe { &*(ok.object.as_ptr() as *const MemoryObject) }.size(),
+        // SAFETY: as above.
         KObjectType::FileObject => unsafe { &*(ok.object.as_ptr() as *const FileObject) }.npages() * PAGE_SIZE,
         // Not a mappable object (and it should not have reached here without a
         // `MAP_*` right, which only Memory/File objects carry).
@@ -2344,6 +2346,7 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
         Err(e) => {
             // SAFETY: each pointer still owns its single creation reference.
             drop(unsafe { ObjectRef::from_raw(a_ptr, KObjectType::IpcChannel) });
+            // SAFETY: as above.
             drop(unsafe { ObjectRef::from_raw(b_ptr, KObjectType::IpcChannel) });
             return Err(map_handle_err(e));
         }
@@ -2510,8 +2513,9 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
                         // just can't hand back the PO. Drop our creation ref — a
                         // `Queued` PO stays alive via the pending-send queue's ref
                         // (signalled on delivery); a `Sent` PO was pre-signalled
-                        // and is reclaimed here. SAFETY: reclaim `into_raw`'s ref.
+                        // and is reclaimed here.
                         Err(e) => {
+                            // SAFETY: reclaims the reference `into_raw` gave up.
                             drop(unsafe { ObjectRef::from_raw(op, ot) });
                             Err(map_handle_err(e))
                         }

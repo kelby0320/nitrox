@@ -723,7 +723,7 @@ impl VmaTree {
     /// one level up (case 2). When the mark reaches a red node or the
     /// root, it is absorbed.
     fn delete_fixup(&mut self, mut x: Option<NonNull<Vma>>, mut x_parent: Option<NonNull<Vma>>, mut x_is_left: bool) {
-        // SAFETY of the loop body: every link pointer dereferenced is
+        // SAFETY: in the loop body, every link pointer dereferenced is
         // either `x_parent`, `x_parent`'s sibling, or those siblings'
         // children — all of which are live tree nodes. The fixup
         // invariant guarantees the sibling `w` exists (a black `None`
@@ -965,7 +965,7 @@ impl VmaTree {
     /// uncle), mirrored for left vs. right parent.
     fn insert_fixup(&mut self, z: NonNull<Vma>) {
         let mut z = z;
-        // SAFETY of the loop body: every pointer dereferenced is either
+        // SAFETY: in the loop body, every pointer dereferenced is either
         // `z` itself or reached through `z`'s `parent` / grandparent /
         // uncle chain. Each is a live tree node — `z` because we just
         // inserted it, the rest because they exist as ancestors. The

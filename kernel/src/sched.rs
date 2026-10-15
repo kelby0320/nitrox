@@ -842,6 +842,7 @@ fn preempt_irqs_restore(prev: bool) {
 /// # Safety
 /// `obj` is a live, pinned `Thread`.
 unsafe fn resolve_root(obj: *mut ()) -> PhysAddr {
+    // SAFETY: this function's contract: `obj` is a live, pinned `Thread`.
     match unsafe { Thread::addr_space_root(obj) } {
         Some(root) => root,
         None => PhysAddr::new(BOOT_ROOT.load(Ordering::Relaxed)),
@@ -1606,39 +1607,51 @@ unsafe fn obj_type(obj: *mut ()) -> KObjectType {
 /// Is this waitable currently signaled? (Timer deadline elapsed / channel non-empty.)
 /// # Safety: live waitable, `SCHED` held.
 unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
-    match unsafe { obj_type(obj) } {
-        KObjectType::Timer => unsafe { Timer::already_signaled(obj, now) },
-        KObjectType::NotificationChannel => unsafe { NotificationChannel::already_signaled(obj) },
-        KObjectType::IpcChannel => unsafe { IpcChannel::already_signaled(obj) },
-        KObjectType::PendingOperation => unsafe { PendingOperation::already_signaled(obj) },
-        KObjectType::InterruptObject => unsafe { InterruptObject::already_signaled(obj) },
-        _ => false,
+    // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
+    // `SCHED` is held.
+    unsafe {
+        match obj_type(obj) {
+            KObjectType::Timer => Timer::already_signaled(obj, now),
+            KObjectType::NotificationChannel => NotificationChannel::already_signaled(obj),
+            KObjectType::IpcChannel => IpcChannel::already_signaled(obj),
+            KObjectType::PendingOperation => PendingOperation::already_signaled(obj),
+            KObjectType::InterruptObject => InterruptObject::already_signaled(obj),
+            _ => false,
+        }
     }
 }
 
 /// Register the current thread as a waiter. `Err` over the object's reserve.
 /// # Safety: live waitable, `SCHED` held.
 unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
-    match unsafe { obj_type(obj) } {
-        KObjectType::Timer => unsafe { Timer::add_waiter(obj, th) },
-        KObjectType::NotificationChannel => unsafe { NotificationChannel::add_waiter(obj, th) },
-        KObjectType::IpcChannel => unsafe { IpcChannel::add_waiter(obj, th) },
-        KObjectType::PendingOperation => unsafe { PendingOperation::add_waiter(obj, th) },
-        KObjectType::InterruptObject => unsafe { InterruptObject::add_waiter(obj, th) },
-        _ => Err(()),
+    // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
+    // `SCHED` is held.
+    unsafe {
+        match obj_type(obj) {
+            KObjectType::Timer => Timer::add_waiter(obj, th),
+            KObjectType::NotificationChannel => NotificationChannel::add_waiter(obj, th),
+            KObjectType::IpcChannel => IpcChannel::add_waiter(obj, th),
+            KObjectType::PendingOperation => PendingOperation::add_waiter(obj, th),
+            KObjectType::InterruptObject => InterruptObject::add_waiter(obj, th),
+            _ => Err(()),
+        }
     }
 }
 
 /// Unregister a waiter (idempotent).
 /// # Safety: live waitable, `SCHED` held.
 unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
-    match unsafe { obj_type(obj) } {
-        KObjectType::Timer => unsafe { Timer::remove_waiter(obj, th) },
-        KObjectType::NotificationChannel => unsafe { NotificationChannel::remove_waiter(obj, th) },
-        KObjectType::IpcChannel => unsafe { IpcChannel::remove_waiter(obj, th) },
-        KObjectType::PendingOperation => unsafe { PendingOperation::remove_waiter(obj, th) },
-        KObjectType::InterruptObject => unsafe { InterruptObject::remove_waiter(obj, th) },
-        _ => {}
+    // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
+    // `SCHED` is held.
+    unsafe {
+        match obj_type(obj) {
+            KObjectType::Timer => Timer::remove_waiter(obj, th),
+            KObjectType::NotificationChannel => NotificationChannel::remove_waiter(obj, th),
+            KObjectType::IpcChannel => IpcChannel::remove_waiter(obj, th),
+            KObjectType::PendingOperation => PendingOperation::remove_waiter(obj, th),
+            KObjectType::InterruptObject => InterruptObject::remove_waiter(obj, th),
+            _ => {}
+        }
     }
 }
 
@@ -2501,6 +2514,7 @@ unsafe fn switch_into(
     // SAFETY: `next_obj` is pinned (now `current`) and `SCHED` is still held
     // here, satisfying the Thread accessor contract for these reads.
     let next_sp = unsafe { Thread::saved_sp(next_obj) };
+    // SAFETY: as above.
     let next_root = unsafe { resolve_root(next_obj) };
     // Record the CPU this thread is about to run on, so a later wake re-homes it here
     // (cache-warm, minimal migration). SAFETY: `next_obj` pinned (now current); `SCHED`
@@ -2515,6 +2529,7 @@ unsafe fn switch_into(
     // invariant; see `Thread::on_cpu` and `steal_one`).
     // SAFETY: `out_obj` is the pinned outgoing thread; `SCHED` still held.
     unsafe { Thread::set_on_cpu(out_obj, true) };
+    // SAFETY: as above.
     let out_on_cpu = unsafe { Thread::on_cpu_ptr(out_obj) };
     // Drop the lock but keep interrupts masked across the switch. `saved_if`
     // is this thread's prior interrupt state, restored when it next resumes.
@@ -2608,6 +2623,7 @@ fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
         Thread::set_state(prev_obj, ThreadState::Blocked);
         Thread::set_state(next_obj, ThreadState::Running);
     }
+    // SAFETY: as above.
     let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
 
     // Park prev in `blocked` (NOT ready/idle) — its `ObjectRef` keeps it alive.
@@ -2799,6 +2815,7 @@ pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> R
     // SAFETY: live Timer (caller holds its `ObjectRef`), `SCHED` held.
     if unsafe { Timer::in_heap(timer) } {
         deadline::remove(&mut g.deadlines, timer as usize, deadline::DeadlineKind::Timer);
+        // SAFETY: as above.
         unsafe { Timer::set_in_heap(timer, false) };
     }
     // SAFETY: live Timer, `SCHED` held.
@@ -2863,6 +2880,7 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
         Thread::set_state(prev_obj, ThreadState::Ready);
         Thread::set_state(next_obj, ThreadState::Running);
     }
+    // SAFETY: as above.
     let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
 
     // Re-home prev: the idle thread parks in its slot (never in `ready`); every
@@ -3031,6 +3049,7 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     // SAFETY: `me` is the running thread, pinned, lock held. (The idle thread
     // never exits, so `me` is never the idle thread.)
     unsafe { Thread::set_state(me_obj, ThreadState::Exited) };
+    // SAFETY: as above.
     let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
     // Park self for deferred reclamation.
     push_reserved(g.reap_slot(), me, "reap list (self)");
@@ -3236,6 +3255,7 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
             Thread::set_exception_frame(me_obj, frame_ptr);
             Thread::set_state(me_obj, ThreadState::Suspended);
         }
+        // SAFETY: as above.
         let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
         push_reserved(&mut g.suspended, me, "suspended list");
 
@@ -3483,10 +3503,13 @@ fn vruntime_delta(nice: i8) -> u64 {
 /// # Safety
 /// `obj` is a live, pinned `Thread`; the caller holds `SCHED`.
 unsafe fn sched_key(obj: *mut ()) -> (u8, u8, u64) {
-    match unsafe { Thread::sched_class(obj) } {
-        SchedClass::RealTime => (0, unsafe { Thread::rt_priority(obj) }, 0),
-        SchedClass::TimeShared => (1, 0, unsafe { Thread::vruntime(obj) }),
-        SchedClass::Idle => (2, 0, u64::MAX),
+    // SAFETY: this function's contract: `obj` is a live, pinned `Thread`, and `SCHED` is held.
+    unsafe {
+        match Thread::sched_class(obj) {
+            SchedClass::RealTime => (0, Thread::rt_priority(obj), 0),
+            SchedClass::TimeShared => (1, 0, Thread::vruntime(obj)),
+            SchedClass::Idle => (2, 0, u64::MAX),
+        }
     }
 }
 
@@ -3640,6 +3663,7 @@ fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
 fn pick_wake_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let home = unsafe { Thread::last_cpu(obj) } as usize;
+    // SAFETY: as above.
     let mask = unsafe { Thread::cpu_mask(obj) };
     if home < MAX_CPUS
         && cpu_accepts_work(g, home, online)
@@ -3758,6 +3782,7 @@ unsafe fn stealable_to(obj: *mut (), me: usize) -> bool {
     // stale/garbage frame and double-run it. It stays on the victim's queue and
     // becomes stealable on the next round once the switch completes (the SMP
     // `on_cpu` invariant; see `Thread::on_cpu` / `switch_into`).
+    // SAFETY: this function's contract: `obj` is a live, pinned `Thread`, and `SCHED` is held.
     unsafe { !Thread::is_on_cpu(obj) && Thread::cpu_mask(obj) & (1 << me) != 0 }
 }
 
@@ -3985,6 +4010,7 @@ fn park_reaper() {
         Thread::set_state(me_obj, ThreadState::Blocked);
         Thread::set_state(next_obj, ThreadState::Running);
     }
+    // SAFETY: as above.
     let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
     // Park in the reaper slot — not `blocked`, so no generic waker can find it, and not
     // `ready`, so it does not spin. `wake_reaper` is the only way back.
@@ -4046,7 +4072,9 @@ pub(crate) extern "C" fn thread_enter() -> ! {
         // SAFETY: `current` is pinned alive and we hold the lock.
         match unsafe { Thread::user_entry(obj) } {
             Some((entry, user_sp)) => {
+                // SAFETY: as above.
                 let ktop = unsafe { Thread::kstack_top(obj) }.expect("a user thread has a kernel stack");
+                // SAFETY: as above.
                 let boot = unsafe { Thread::user_boot_args(obj) };
                 Some((entry, user_sp, ktop, boot))
             }

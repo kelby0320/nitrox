@@ -155,10 +155,10 @@ impl BuddyAllocator {
         let bitmap_phys_end = bitmap_phys + bitmap_reservation;
 
         // Zero the bitmap through the HHDM.
+        let bitmap_ptr = (bitmap_phys + hhdm_offset) as *mut u64;
         // SAFETY: `bitmap_phys..+bitmap_bytes` was returned by
         // `find_bitmap_region` from a Usable entry; the HHDM maps that
         // physical range, and no other code has touched it yet.
-        let bitmap_ptr = (bitmap_phys + hhdm_offset) as *mut u64;
         unsafe {
             core::ptr::write_bytes(bitmap_ptr as *mut u8, 0, bitmap_bytes);
         }

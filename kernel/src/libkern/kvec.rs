@@ -34,6 +34,7 @@ pub struct KVec<T> {
 // the vec is sound when `T: Send`; sharing a `&KVec` yields only `&[T]`,
 // sound when `T: Sync`.
 unsafe impl<T: Send> Send for KVec<T> {}
+// SAFETY: as above.
 unsafe impl<T: Sync> Sync for KVec<T> {}
 
 impl<T> KVec<T> {

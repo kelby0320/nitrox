@@ -104,12 +104,14 @@ impl Timer {
         // `UnsafeCell`, then a `&mut TimerInner` through it, is exactly the
         // interior-mutability contract — sound while `SCHED` serialises access.
         let t = unsafe { &*(obj as *const Timer) };
+        // SAFETY: as above.
         unsafe { &mut *t.inner.get() }
     }
 
     /// Arm (or disarm, with `deadline_ns == 0`) the timer.
     /// # Safety: see the accessor contract.
     pub(crate) unsafe fn set_armed(obj: *mut (), deadline_ns: u64, interval_ns: u64) {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         inner.deadline_ns = deadline_ns;
         inner.interval_ns = interval_ns;
@@ -126,18 +128,21 @@ impl Timer {
     /// The re-arm interval (`0` = one-shot).
     /// # Safety: see the accessor contract.
     pub(crate) unsafe fn interval(obj: *mut ()) -> u64 {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.interval_ns
     }
 
     /// Set the "present in the deadline heap" flag.
     /// # Safety: see the accessor contract.
     pub(crate) unsafe fn set_in_heap(obj: *mut (), v: bool) {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.in_heap = v;
     }
 
     /// `true` iff this timer has a live deadline-heap entry.
     /// # Safety: see the accessor contract.
     pub(crate) unsafe fn in_heap(obj: *mut ()) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.in_heap
     }
 
@@ -146,6 +151,7 @@ impl Timer {
     /// grows the vector under the lock.
     /// # Safety: see the accessor contract.
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if inner.waiters.len() < Self::MAX_WAITERS {
             inner
@@ -167,6 +173,7 @@ impl Timer {
     /// Remove `thread` from the waiter set if present (idempotent).
     /// # Safety: see the accessor contract.
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if let Some(i) = inner.waiters.iter().position(|&w| w == thread) {
             inner.waiters.remove(i);
@@ -176,6 +183,7 @@ impl Timer {
     /// `true` iff the timer is armed and its deadline is at or before `now`.
     /// # Safety: see the accessor contract.
     pub(crate) unsafe fn already_signaled(obj: *mut (), now_ns: u64) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         inner.deadline_ns != 0 && inner.deadline_ns <= now_ns
     }
@@ -184,6 +192,7 @@ impl Timer {
     /// `out` must be at least [`MAX_WAITERS`](Self::MAX_WAITERS) long.
     /// # Safety: see the accessor contract.
     pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         let n = inner.waiters.len();
         debug_assert!(out.len() >= n);

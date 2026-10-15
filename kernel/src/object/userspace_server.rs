@@ -387,11 +387,13 @@ impl UserspaceServerReg {
     unsafe fn inner<'a>(reg: *mut ()) -> &'a mut Inner {
         // The sentinel is cheap and catches a stale back-pointer at the moment it is
         // followed, rather than as garbage read out of the pending table.
+        // SAFETY: the accessor contract makes `reg` a registration's memory, so readable.
         debug_assert!(unsafe { Self::is_live(reg) }, "UserspaceServerReg accessor on a dead/stale registration");
         // SAFETY: forming a shared `&UserspaceServerReg` to reach the `UnsafeCell`,
         // then a `&mut Inner` through it, is the interior-mutability contract —
         // sound while `SCHED` serialises access.
         let r = unsafe { &*(reg as *const UserspaceServerReg) };
+        // SAFETY: as above.
         unsafe { &mut *r.inner.get() }
     }
 
@@ -401,6 +403,7 @@ impl UserspaceServerReg {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn endpoint_ptr(reg: *mut ()) -> *mut () {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(reg) }.endpoint.as_ptr()
     }
 
@@ -437,6 +440,7 @@ impl UserspaceServerReg {
         suffix: &[u8],
         fwd: Forward<'_>,
     ) -> Option<u64> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         // First free slot, or `None` when the table is full (all in flight).
         let slot = inner.pending.iter().position(Option::is_none)?;
@@ -480,6 +484,7 @@ impl UserspaceServerReg {
         frame: PhysAddr,
         index: usize,
     ) -> Option<u64> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         let slot = inner.pending_fill.iter().position(Option::is_none)?;
         let request_id = inner.next_id;
@@ -497,6 +502,7 @@ impl UserspaceServerReg {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_pending_fill_matching(reg: *mut (), request_id: u64) -> Option<PendingFill> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         let slot = inner.pending_fill.iter().position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
         inner.pending_fill[slot].take()
@@ -510,6 +516,7 @@ impl UserspaceServerReg {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_pending_matching(reg: *mut (), request_id: u64) -> Option<PendingLookup> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         let slot = inner.pending.iter().position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
         inner.pending[slot].take()
@@ -522,6 +529,7 @@ impl UserspaceServerReg {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_pending_next(reg: *mut ()) -> Option<PendingLookup> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         let slot = inner.pending.iter().position(Option::is_some)?;
         inner.pending[slot].take()
