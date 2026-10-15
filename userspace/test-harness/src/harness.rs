@@ -553,7 +553,8 @@ fn block_send_demo() {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult.status` is the i32 at bytes 8..12 of the 16-byte record.
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     if waited == 1 && status == 0 {
         Line::new()
@@ -630,7 +631,8 @@ fn block_bounded_demo() {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult.status` is the i32 at bytes 8..12 of the 16-byte record.
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     if waited == 1 && status == KERR_TIMED_OUT {
         kprint(b"test-harness: blocking send timed out via PendingOperation (BlockBounded)\n");
@@ -707,9 +709,11 @@ fn ns_demo() {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult`: status at bytes 8..12, result (resolved handle) at 16..24.
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let resolved = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],
@@ -757,7 +761,8 @@ fn ns_demo() {
         WAIT_HANDLES[0] = po2 as u64;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let status2 = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     // KError::NotFound = -10.
     if waited2 == 1 && status2 == -10 {
@@ -854,9 +859,11 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // `IoResult`: status at bytes 8..12, result (resolved handle) at 16..24.
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let resolved = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],
@@ -910,9 +917,11 @@ fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po as u64;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let resolved = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],
@@ -1068,7 +1077,8 @@ fn timer_sleep_ms(ms: u64) {
     let th = th as u64;
     // SAFETY: CLOCK_BUF is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: CLOCK_BUF was just written by the clock read above; this thread owns the static
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     let now = unsafe { (&raw const CLOCK_BUF).read() };
     let fire_at = now + ms * 1_000_000;
     // SAFETY: arming our own timer handle (absolute monotonic, one-shot).
@@ -2382,7 +2392,8 @@ fn date_sleep_demo(root_ns: u64, notif: u64) {
 fn monotonic_ns() -> u64 {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: written by the syscall above.
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     unsafe { (&raw const CLOCK_BUF).read() }
 }
 
@@ -3800,7 +3811,8 @@ fn rename_wait(ns: u64, src: &[u8], dst: &[u8], flags: u64) -> i32 {
         WAIT_HANDLES[0] = po as u64;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
     }
-    // SAFETY: the wait wrote one 24-byte `IoResult`; `status` is at offset 8.
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     // SAFETY: closing our own PO handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
@@ -3981,7 +3993,8 @@ fn po_wait_pair(po: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let (status, result) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
@@ -4204,9 +4217,11 @@ fn po_wait(po: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let result = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],

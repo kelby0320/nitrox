@@ -176,7 +176,8 @@ pub extern "C" fn _start() -> ! {
     // Read t0, arm for t0 + 50 ms (absolute monotonic, one-shot), wait on it.
     // SAFETY: CLOCK_BUF is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: CLOCK_BUF was just written by the clock read above; this thread owns the static
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     let t0 = unsafe { (&raw const CLOCK_BUF).read() };
     let fire_at = t0 + 50_000_000; // +50 ms
     // SAFETY: arming our own timer handle.
@@ -191,7 +192,8 @@ pub extern "C" fn _start() -> ! {
     let woke_handle = unsafe { (&raw const WAIT_RESULTS.handle).read() };
     // SAFETY: CLOCK_BUF is a writable u64 out-param
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: CLOCK_BUF was just written by the clock read above; this thread owns the static
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     let t_after = unsafe { (&raw const CLOCK_BUF).read() };
     if sr == 0 && waited == 1 && woke_handle == th && t_after >= fire_at {
         kprint(b"timer: waited and woke ok\n");
@@ -219,7 +221,8 @@ pub extern "C" fn _start() -> ! {
         // 4e. Pure timeout: arm far in the future, wait with a near deadline.
         // SAFETY: CLOCK_BUF is a writable u64 out-param
         unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-        // SAFETY: CLOCK_BUF was just written by the clock read above; this thread owns the static
+        // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+        // leaves its last value.
         let now = unsafe { (&raw const CLOCK_BUF).read() };
         // SAFETY: arming our own timer handle
         unsafe { syscall4(SYS_TIMER_SET, th2, now + 10_000_000_000, 0, 0) }; // +10 s

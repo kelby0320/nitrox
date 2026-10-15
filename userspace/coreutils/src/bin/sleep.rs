@@ -96,7 +96,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     // between the read and the arm is inside the wait rather than added to it.
     // SAFETY: `CLOCK_BUF` is a valid writable `u64` out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: written by the syscall above.
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     let now = unsafe { (&raw const CLOCK_BUF).read() };
     let fire_at = now.saturating_add(nanos);
 
@@ -137,7 +138,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         // clock, since a notification wake says nothing about the deadline.
         // SAFETY: valid clock out-param.
         unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-        // SAFETY: written by the syscall above.
+        // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+        // leaves its last value.
         if unsafe { (&raw const CLOCK_BUF).read() } >= fire_at {
             break;
         }

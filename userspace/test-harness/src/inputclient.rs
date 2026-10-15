@@ -715,7 +715,8 @@ const IDLE_LIMIT_NS: u64 = 20_000_000_000;
 fn deadline_ns(ns: u64) -> u64 {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: the kernel wrote the ns count.
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns)
 }
 
@@ -761,7 +762,8 @@ fn wait_event_before(
 fn sleep_ns(notif: u64, ns: u64) {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: the kernel wrote the ns count.
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     let deadline = unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns);
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     unsafe {

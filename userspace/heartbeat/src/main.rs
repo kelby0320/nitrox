@@ -120,7 +120,8 @@ fn exit(code: i64) -> ! {
 fn clock_now() -> u64 {
     // SAFETY: CLOCK_BUF is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: the kernel wrote the ns count into CLOCK_BUF.
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     unsafe { (&raw const CLOCK_BUF).read() }
 }
 
@@ -170,7 +171,8 @@ fn emit_beat_typed(log_ep: u64, beat: &Beat) {
 fn recv_log_handoff(control: u64) -> u64 {
     // SAFETY: CLOCK_BUF is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: the kernel wrote the ns count into CLOCK_BUF.
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     let now = unsafe { (&raw const CLOCK_BUF).read() };
     let deadline = now.saturating_add(2_000_000_000); // 2 s
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.

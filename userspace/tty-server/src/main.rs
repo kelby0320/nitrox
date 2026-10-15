@@ -182,7 +182,8 @@ fn po_wait(po: u64) -> (i32, u64) {
         PO_HANDLES[0] = po;
         syscall4(SYS_WAIT, (&raw const PO_HANDLES) as u64, 1, (&raw mut PO_RESULTS) as u64, u64::MAX)
     };
-    // SAFETY: the wait above returned and the kernel wrote the IoResult into PO_RESULTS; this thread owns the static
+    // SAFETY: bytes 8..24 are inside `PO_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let (status, value) = unsafe {
         (
             i32::from_le_bytes([PO_RESULTS[8], PO_RESULTS[9], PO_RESULTS[10], PO_RESULTS[11]]),
