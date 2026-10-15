@@ -36156,3 +36156,37 @@ second declined.
   to 146 lines, 54 lowered, and `compositor/src/server.rs` (now 978 lines) removed — 63 entries.
 - **`cargo fmt --check` holds each workspace in CI**, and the rule never to run `cargo fmt` ends:
   root `CLAUDE.md` says to run it, and the `implementer` is told to.
+
+## 2026-10-15 — Before Phase 7, Part B.2's first PR: `clippy`'s errors, and `SAFETY` everywhere
+
+- **Measured again on the pinned toolchains**, as B.1 said it would be: 390 findings across 62
+  lints besides the `unsafe` blocks, 46 of them errors in four lints, and **231 `unsafe` blocks**
+  with no `SAFETY` comment `clippy` recognises — 139 in the kernel, 92 in userspace, where 1.95
+  counted 142 and 91.
+- **`not_unsafe_ptr_arg_deref`: 24 public functions of `kernel/src/sched.rs` are `unsafe fn`**,
+  each with a `# Safety` section — the pointer names a live object of its type, pinned for the
+  call by a reference the caller holds, or, for the two `Drop` callers, the object being dropped —
+  and its 48 call sites answer it in a `SAFETY` comment. Each function's prose already said its
+  caller pinned the object; the signature now says it. **The plan's other option**, taking what a
+  caller can vouch for, needs a checked typed accessor on `ObjectRef` the kernel lacks, and the
+  syscall table it would reshape is Part E's: it is left to Part E.
+- **The other three errors**, each judged: `libfsserver`'s `PartitionIo::scratch` made a `&mut`
+  from a `&self`, so two calls could hold two mutable slices of one mapping — it became `copy_out`
+  and `copy_in`, which copy within the call, as `SectorDisk` already did; `service-mgr`'s two loops
+  on a handle that cannot change became an `if` around a `loop` and a `while let`; and
+  `copy_from_user`'s zero-sized branch keeps its `assume_init`, sound for every inhabited `T` with
+  no caller passing another, the lint allowed at that line with its reason.
+- **Every `unsafe` block has a `SAFETY` comment**: the kernel's by the author, userspace's by the
+  `implementer` from a brief, read before commit — two of its comments said a count was written by
+  a receive whose result is checked only after the read, and were corrected. Most of the kernel's
+  were accessors in the object files, whose comment names the contract each file states once; a
+  block a comment one statement up already covers says "as above". Four functions in `sched.rs`
+  that dispatched on a type with a block an arm are one block each, under the function's contract.
+- **`check-comments` counts a `SAFETY` comment and a `# Safety` section as neither comment nor
+  code** (the maintainer's call in PR #376), and the size baseline is raised by hand for the
+  eighteen files the comments lengthened, by 272 lines — 132 of them `sched.rs`'s, mostly its 24
+  new `# Safety` sections.
+- **CI denies `clippy::undocumented_unsafe_blocks` and `clippy::correctness`** in each workspace,
+  on the command line rather than only in a manifest, so a crate with no `[lints]` line is held
+  too. A `SAFETY` comment removed from the kernel or userspace fails the step. Warnings pass until
+  the second PR, which fixes them, lints the test targets, and adds `-D warnings`.
