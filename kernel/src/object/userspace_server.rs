@@ -136,11 +136,7 @@ impl PendingLookup {
     /// for it cannot recover the path).
     pub(crate) fn suffix(&self) -> Option<&[u8]> {
         let n = self.suffix_len as usize;
-        if n > LOOKUP_SUFFIX_MAX {
-            None
-        } else {
-            Some(&self.suffix[..n])
-        }
+        if n > LOOKUP_SUFFIX_MAX { None } else { Some(&self.suffix[..n]) }
     }
 }
 
@@ -289,10 +285,8 @@ impl UserspaceServerReg {
     pub fn forget_file(&self, id: u64, answer: &ObjectRef) -> Forgotten {
         let obj = {
             let mut g = self.files.lock();
-            let Some(i) = g
-                .iter()
-                .position(|e| e.id == id && !e.forgotten)
-                .or_else(|| g.iter().rposition(|e| e.id == id))
+            let Some(i) =
+                g.iter().position(|e| e.id == id && !e.forgotten).or_else(|| g.iter().rposition(|e| e.id == id))
             else {
                 return Forgotten::Now;
             };
@@ -381,9 +375,7 @@ impl UserspaceServerReg {
         // SAFETY: the caller guarantees readable memory; `magic` sits at a fixed
         // offset in the `#[repr(C)]` header layout, and any bit pattern is a valid
         // `u64`, so this cannot form an invalid value.
-        let magic = unsafe {
-            core::ptr::addr_of!((*(reg as *const UserspaceServerReg)).magic).read_volatile()
-        };
+        let magic = unsafe { core::ptr::addr_of!((*(reg as *const UserspaceServerReg)).magic).read_volatile() };
         magic == Self::MAGIC
     }
 
@@ -395,10 +387,7 @@ impl UserspaceServerReg {
     unsafe fn inner<'a>(reg: *mut ()) -> &'a mut Inner {
         // The sentinel is cheap and catches a stale back-pointer at the moment it is
         // followed, rather than as garbage read out of the pending table.
-        debug_assert!(
-            unsafe { Self::is_live(reg) },
-            "UserspaceServerReg accessor on a dead/stale registration"
-        );
+        debug_assert!(unsafe { Self::is_live(reg) }, "UserspaceServerReg accessor on a dead/stale registration");
         // SAFETY: forming a shared `&UserspaceServerReg` to reach the `UnsafeCell`,
         // then a `&mut Inner` through it, is the interior-mutability contract —
         // sound while `SCHED` serialises access.
@@ -495,13 +484,8 @@ impl UserspaceServerReg {
         let slot = inner.pending_fill.iter().position(Option::is_none)?;
         let request_id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
-        inner.pending_fill[slot] = Some(PendingFill {
-            request_id,
-            po: po.clone(),
-            file_obj: file_obj.clone(),
-            frame,
-            index,
-        });
+        inner.pending_fill[slot] =
+            Some(PendingFill { request_id, po: po.clone(), file_obj: file_obj.clone(), frame, index });
         Some(request_id)
     }
 
@@ -512,15 +496,9 @@ impl UserspaceServerReg {
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_pending_fill_matching(
-        reg: *mut (),
-        request_id: u64,
-    ) -> Option<PendingFill> {
+    pub(crate) unsafe fn take_pending_fill_matching(reg: *mut (), request_id: u64) -> Option<PendingFill> {
         let inner = unsafe { Self::inner(reg) };
-        let slot = inner
-            .pending_fill
-            .iter()
-            .position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
+        let slot = inner.pending_fill.iter().position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
         inner.pending_fill[slot].take()
     }
 
@@ -531,15 +509,9 @@ impl UserspaceServerReg {
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_pending_matching(
-        reg: *mut (),
-        request_id: u64,
-    ) -> Option<PendingLookup> {
+    pub(crate) unsafe fn take_pending_matching(reg: *mut (), request_id: u64) -> Option<PendingLookup> {
         let inner = unsafe { Self::inner(reg) };
-        let slot = inner
-            .pending
-            .iter()
-            .position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
+        let slot = inner.pending.iter().position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
         inner.pending[slot].take()
     }
 
@@ -601,13 +573,9 @@ mod tests {
     fn endpoint() -> ObjectRef {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let a_ref = unsafe {
-            ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel)
-        };
+        let a_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel) };
         // Drop the peer's creation reference (nulls `a`'s peer — fine here).
-        drop(unsafe {
-            ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel)
-        });
+        drop(unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel) });
         a_ref
     }
 
@@ -626,12 +594,7 @@ mod tests {
         let r = UserspaceServerReg::try_new(endpoint()).unwrap();
         assert!(r.magic_ok());
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(r).as_ptr() as *mut (),
-                KObjectType::UserspaceServerReg,
-            )
-        }
+        unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) }
     }
 
     /// The regression this file's `Drop` exists for. An endpoint can outlive its
@@ -656,12 +619,8 @@ mod tests {
 
         let r = UserspaceServerReg::try_new(ep_ref).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let reg_ref = unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(r).as_ptr() as *mut (),
-                KObjectType::UserspaceServerReg,
-            )
-        };
+        let reg_ref =
+            unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
         // Wire the back-pointer the way `us_server_attach` does at bind time.
         // SAFETY: both objects are live and this test is single-threaded.
         unsafe { IpcChannel::set_us_reg(ep, reg_ref.as_ptr()) };
@@ -694,12 +653,8 @@ mod tests {
 
         let old = UserspaceServerReg::try_new(ep_ref).unwrap();
         // SAFETY: adopt the creation reference.
-        let old_ref = unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(old).as_ptr() as *mut (),
-                KObjectType::UserspaceServerReg,
-            )
-        };
+        let old_ref =
+            unsafe { ObjectRef::from_raw(KBox::into_raw(old).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
         // A successor takes over the endpoint's back-pointer.
         let successor = 0xdead_beef_usize as *mut ();
         // SAFETY: single-threaded test; the value is only compared, never dereferenced.
@@ -730,10 +685,7 @@ mod tests {
             assert_eq!(id, Some(expect));
         }
         // The table is now full → the next `begin` is `None` (caller: WouldBlock).
-        assert_eq!(
-            unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") },
-            None
-        );
+        assert_eq!(unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") }, None);
         // Free one slot; a `begin` succeeds again with the next id.
         let taken = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) };
         assert_eq!(taken.as_ref().map(|p| p.request_id), Some(1));
@@ -778,10 +730,8 @@ mod tests {
         let r = reg();
         let po = make_po();
         // Two lookups in flight at once (impossible under the old N = 1 slot).
-        let a = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"one") }
-            .unwrap();
-        let b = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 2, Rights::MAP_READ, b"two") }
-            .unwrap();
+        let a = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"one") }.unwrap();
+        let b = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 2, Rights::MAP_READ, b"two") }.unwrap();
         assert_ne!(a, b);
         // Replies arrive out of order: each takes exactly its own entry.
         let tb = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), b) }.unwrap();
@@ -821,9 +771,7 @@ mod tests {
         use crate::object::{FileObject, Producer};
         let f = FileObject::try_new(4096, Producer::Stub { base: 0 }).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject)
-        }
+        unsafe { ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject) }
     }
 
     #[test]
@@ -847,18 +795,12 @@ mod tests {
         let fo = file_obj();
         let frame = PhysAddr::new(0x5000);
         // A lookup and a fill can coexist (separate slots, shared id counter).
-        let lid = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"x") }
-            .unwrap();
-        let fid =
-            unsafe { UserspaceServerReg::begin_fill(r.as_ptr(), &po, &fo, frame, 2) }.unwrap();
+        let lid = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"x") }.unwrap();
+        let fid = unsafe { UserspaceServerReg::begin_fill(r.as_ptr(), &po, &fo, frame, 2) }.unwrap();
         assert_ne!(lid, fid); // distinct request ids
         // A mismatched id leaves the fill in place; the matching id takes it.
-        assert!(
-            unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid ^ 0xFF) }
-                .is_none()
-        );
-        let pf =
-            unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid) }.unwrap();
+        assert!(unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid ^ 0xFF) }.is_none());
+        let pf = unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid) }.unwrap();
         assert_eq!(pf.request_id, fid);
         assert_eq!(pf.frame, frame);
         assert_eq!(pf.index, 2);

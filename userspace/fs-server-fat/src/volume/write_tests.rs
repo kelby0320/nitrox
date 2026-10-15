@@ -289,7 +289,11 @@ fn a_directory_moved_has_its_dotdot_repointed() {
         assert_eq!(parent_of(b"/sub"), root, "{what}: the root");
         settle(&fat, what);
         assert_eq!(fat.rename_path(b"/b", b"/sub/b", false, NOW), Ok(None));
-        assert_eq!(fat.rename_path(b"/sub", b"/sub/b/sub", false, NOW), Err(FsError::Unsupported), "{what}: into itself");
+        assert_eq!(
+            fat.rename_path(b"/sub", b"/sub/b/sub", false, NOW),
+            Err(FsError::Unsupported),
+            "{what}: into itself"
+        );
         settle(&fat, what);
         let want: BTreeSet<String> = ["a/", "sub/", "sub/b/", "sub/f.txt"].into_iter().map(str::to_string).collect();
         assert_eq!(mdir_all(&img), want, "{what}");
@@ -500,9 +504,13 @@ fn a_change_bigger_than_the_fat_cache_evicts_and_stays_clean() {
     let free = Cache::count_free(&disk, &g).unwrap();
     make(&fat, "/", "big.bin", b"");
     let steps: [(&str, &dyn Fn()); 3] = [
-        ("a 100 MiB grow", &|| { fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap(); }),
+        ("a 100 MiB grow", &|| {
+            fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap();
+        }),
         ("a shrink to 10 MiB", &|| assert_eq!(fat.truncate_file(b"/big.bin", 10 << 20, NOW), Ok(None))),
-        ("a regrow", &|| { fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap(); }),
+        ("a regrow", &|| {
+            fat.grow_file(b"/big.bin", 100 << 20, NOW).unwrap();
+        }),
     ];
     for (what, step) in steps {
         step();
@@ -686,11 +694,13 @@ fn what_fat_frees_leaves_the_metadata_cache() {
     }
     let g = fat.geometry().unwrap().clone();
     let mut clusters = Vec::new();
-    fat.cache.borrow_mut().walk(&cached, &g, d as u32, |_, c| {
-        clusters.push(c);
-        true
-    })
-    .unwrap();
+    fat.cache
+        .borrow_mut()
+        .walk(&cached, &g, d as u32, |_, c| {
+            clusters.push(c);
+            true
+        })
+        .unwrap();
     fat.read_dir(d, 0, |_| true).unwrap();
     let at = |c: u32| g.cluster_sector(c) * 512;
     assert!(clusters.len() > 1, "a directory of {} clusters", clusters.len());

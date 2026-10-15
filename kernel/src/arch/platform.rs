@@ -44,12 +44,7 @@ pub struct EcamRegion {
 
 impl EcamRegion {
     /// All-zero region, for fixed-size static-array initialisation.
-    pub const ZERO: EcamRegion = EcamRegion {
-        base: PhysAddr(0),
-        segment: 0,
-        bus_start: 0,
-        bus_end: 0,
-    };
+    pub const ZERO: EcamRegion = EcamRegion { base: PhysAddr(0), segment: 0, bus_start: 0, bus_end: 0 };
 }
 
 /// Neutral platform-discovery operations, backed by the active architecture's

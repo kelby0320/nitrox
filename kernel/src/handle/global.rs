@@ -37,10 +37,7 @@ struct GlobalTable {
 // initialisation, which single-CPU boot cannot race.
 unsafe impl Sync for GlobalTable {}
 
-static GLOBAL: GlobalTable = GlobalTable {
-    state: AtomicU8::new(UNINIT),
-    slot: UnsafeCell::new(MaybeUninit::uninit()),
-};
+static GLOBAL: GlobalTable = GlobalTable { state: AtomicU8::new(UNINIT), slot: UnsafeCell::new(MaybeUninit::uninit()) };
 
 /// Initialise the global handle table exactly once. Must run **after the
 /// heap is up** (it eagerly allocates segment 0), **after** the entropy
@@ -50,11 +47,7 @@ static GLOBAL: GlobalTable = GlobalTable {
 pub fn init() -> Result<(), HandleError> {
     // Single-CPU boot can't actually race, but a CAS makes the
     // initialise-once invariant explicit (and SMP-ready).
-    if GLOBAL
-        .state
-        .compare_exchange(UNINIT, INITIALISING, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    if GLOBAL.state.compare_exchange(UNINIT, INITIALISING, Ordering::AcqRel, Ordering::Acquire).is_err() {
         debug_assert!(false, "handle::global::init called more than once");
         return Ok(());
     }
@@ -75,11 +68,7 @@ pub fn init() -> Result<(), HandleError> {
 
 /// The global handle table. Panics in debug builds if called before [`init`].
 pub fn get() -> &'static HandleTable {
-    debug_assert_eq!(
-        GLOBAL.state.load(Ordering::Acquire),
-        READY,
-        "handle::global::get before init",
-    );
+    debug_assert_eq!(GLOBAL.state.load(Ordering::Acquire), READY, "handle::global::get before init",);
     // SAFETY: `READY` (observed with `Acquire`) was published with a `Release`
     // store after the table was fully written; the table is never moved or
     // dropped for the kernel's lifetime, so a `'static` shared borrow is

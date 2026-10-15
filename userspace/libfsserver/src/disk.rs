@@ -34,7 +34,14 @@ pub fn po_wait(po: u64) -> (i32, u64) {
     let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
     let status = i32::from_le_bytes([results[8], results[9], results[10], results[11]]);
     let result = u64::from_le_bytes([
-        results[16], results[17], results[18], results[19], results[20], results[21], results[22], results[23],
+        results[16],
+        results[17],
+        results[18],
+        results[19],
+        results[20],
+        results[21],
+        results[22],
+        results[23],
     ]);
     // SAFETY: closing our own PO handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
@@ -182,7 +189,8 @@ impl BlockWriter for Disk {
         let mut at = whole.start;
         while at < whole.end {
             let n = (whole.end - at).min(SPAN as u64);
-            let op = IoOp { opcode: IO_OPCODE_WRITE, flags: 0, buffer: self.zeroes, buf_offset: 0, offset: at, length: n };
+            let op =
+                IoOp { opcode: IO_OPCODE_WRITE, flags: 0, buffer: self.zeroes, buf_offset: 0, offset: at, length: n };
             // SAFETY: `device` is a block DeviceNode with WRITE; `&op` is a valid IoOp.
             let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
             if po < 0 {
@@ -286,7 +294,9 @@ impl SectorDisk {
         assert!(from + dst.len() <= SPAN);
         // SAFETY: `scratch_addr` maps `SPAN` bytes R/W for this process's life, and the range is
         // within it; `dst` is a distinct buffer of the caller's.
-        unsafe { core::ptr::copy_nonoverlapping((self.scratch_addr as *const u8).add(from), dst.as_mut_ptr(), dst.len()) };
+        unsafe {
+            core::ptr::copy_nonoverlapping((self.scratch_addr as *const u8).add(from), dst.as_mut_ptr(), dst.len())
+        };
     }
 
     /// Copy `src` into scratch bytes `[from, from + src.len())`.
@@ -390,7 +400,8 @@ impl PartitionIo {
         }
         let scratch = scratch as u64;
         // SAFETY: register-only syscall; `scratch` is ours.
-        let addr = unsafe { syscall4(SYS_MEMORY_MAP, scratch, 0, WINDOW_SPAN as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+        let addr =
+            unsafe { syscall4(SYS_MEMORY_MAP, scratch, 0, WINDOW_SPAN as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
         if addr < 0 {
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, scratch) };
@@ -447,7 +458,8 @@ impl BlockReader for PartitionIo {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
         let mut done = 0usize;
         while done < buf.len() {
-            let (start, span, intra) = window(self.base, self.len, WINDOW_SPAN, offset + done as u64, buf.len() - done)?;
+            let (start, span, intra) =
+                window(self.base, self.len, WINDOW_SPAN, offset + done as u64, buf.len() - done)?;
             self.submit(IO_OPCODE_READ, start, span)?;
             let take = (buf.len() - done).min(span as usize - intra);
             buf[done..done + take].copy_from_slice(&self.scratch(span as usize)[intra..intra + take]);
@@ -461,7 +473,8 @@ impl BlockWriter for PartitionIo {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
         let mut done = 0usize;
         while done < buf.len() {
-            let (start, span, intra) = window(self.base, self.len, WINDOW_SPAN, offset + done as u64, buf.len() - done)?;
+            let (start, span, intra) =
+                window(self.base, self.len, WINDOW_SPAN, offset + done as u64, buf.len() - done)?;
             let take = (buf.len() - done).min(span as usize - intra);
             // **Read first unless the write covers whole sectors**: a partial sector written without
             // its surroundings replaces bytes the filesystem is still using.
@@ -514,7 +527,9 @@ mod tests {
     /// one sector, and a request just over a span.
     #[test]
     fn a_request_is_covered_by_aligned_chunks_of_at_most_a_span() {
-        for (offset, len) in [(0, 512), (100, 70_000), (512, SPAN), (511, 2), (1000, SPAN + 1), (4096, 3 * SPAN), (7, 1)] {
+        for (offset, len) in
+            [(0, 512), (100, 70_000), (512, SPAN), (511, 2), (1000, SPAN + 1), (4096, 3 * SPAN), (7, 1)]
+        {
             let mut next = offset - offset % SECTOR;
             let mut covered = 0usize;
             SectorDisk::chunks(offset, len, |at, n, from, take| {

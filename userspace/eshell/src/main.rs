@@ -34,21 +34,19 @@ fn po_wait(po: u64) -> (i32, u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     let waited = unsafe {
         WAIT_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    let status = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     let result = unsafe {
         u64::from_le_bytes([
-            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            WAIT_RESULTS[16],
+            WAIT_RESULTS[17],
+            WAIT_RESULTS[18],
+            WAIT_RESULTS[19],
+            WAIT_RESULTS[20],
+            WAIT_RESULTS[21],
+            WAIT_RESULTS[22],
+            WAIT_RESULTS[23],
         ])
     };
     // SAFETY: closing our own PO handle.
@@ -348,8 +346,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _h0: u64, _a0: u64) -> ! {
     }
     let buf_h = buf_h as u64;
     // SAFETY: `buf_h` is a fresh MemoryObject handle with full MAP rights.
-    let buf_addr =
-        unsafe { syscall4(SYS_MEMORY_MAP, buf_h, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    let buf_addr = unsafe { syscall4(SYS_MEMORY_MAP, buf_h, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if buf_addr < 0 {
         kprint(b"eshell: read buffer map failed\r\n");
         halt();
@@ -363,14 +360,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _h0: u64, _a0: u64) -> ! {
     // The read/edit loop. Each console read returns ≥1 raw byte; eshell echoes and
     // line-edits, running a command on each CR/LF.
     loop {
-        let op = IoOp {
-            opcode: IO_OPCODE_READ,
-            flags: 0,
-            buffer: buf_h,
-            buf_offset: 0,
-            offset: 0,
-            length: READ_LEN,
-        };
+        let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: buf_h, buf_offset: 0, offset: 0, length: READ_LEN };
         // SAFETY: `console` is a char DeviceNode with READ; `&op` is a valid IoOp.
         let po = unsafe { syscall2(SYS_IO_SUBMIT, console, (&op as *const IoOp) as u64) };
         if po < 0 {

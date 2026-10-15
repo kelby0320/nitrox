@@ -626,11 +626,7 @@ fn read_list(src: &mut ByteSource) -> Result<Value> {
 /// where the column declares it, then the value's bytes. Errors on a count / type /
 /// nullness mismatch. Shared by data rows ([`TableWriter`](crate::table::TableWriter)),
 /// [`Value::Record`], and [`Table`] rows so all three frame values identically.
-pub fn write_row_values(
-    sink: &mut impl ByteSink,
-    schema: &Schema,
-    values: &[Value],
-) -> Result<()> {
+pub fn write_row_values(sink: &mut impl ByteSink, schema: &Schema, values: &[Value]) -> Result<()> {
     if values.len() != schema.fields.len() {
         return Err(WireError::SchemaMismatch);
     }
@@ -661,11 +657,7 @@ pub fn read_row_values(src: &mut ByteSource, schema: &Schema) -> Result<Vec<Valu
     let mut out = Vec::with_capacity(schema.fields.len().min(SCHEMA_FIELD_HINT_CAP));
     for f in &schema.fields {
         let nullable = f.modifiers.contains(TypeModifiers::NULLABLE);
-        let value = if nullable && src.u8()? == 0 {
-            Value::Null
-        } else {
-            read_value(src, f.ty)?
-        };
+        let value = if nullable && src.u8()? == 0 { Value::Null } else { read_value(src, f.ty)? };
         out.push(value);
     }
     Ok(out)
@@ -701,11 +693,7 @@ impl Table {
                 other => return Err(WireError::BadRecordTag(other)),
             }
         }
-        Ok(Table {
-            flags,
-            schema,
-            rows,
-        })
+        Ok(Table { flags, schema, rows })
     }
 }
 
@@ -738,11 +726,7 @@ impl Schema {
 
     /// Builder: append a column and return `self`.
     pub fn field(mut self, name: &str, ty: TypeTag, modifiers: TypeModifiers) -> Self {
-        self.fields.push(FieldDef {
-            name: String::from(name),
-            ty,
-            modifiers,
-        });
+        self.fields.push(FieldDef { name: String::from(name), ty, modifiers });
         self
     }
 
@@ -764,9 +748,7 @@ impl Schema {
         let mut fields = Vec::with_capacity(count.min(SCHEMA_FIELD_HINT_CAP));
         for _ in 0..count {
             let name_len = src.u16()? as usize;
-            let name = core::str::from_utf8(src.take(name_len)?)
-                .map_err(|_| WireError::BadUtf8)?
-                .into();
+            let name = core::str::from_utf8(src.take(name_len)?).map_err(|_| WireError::BadUtf8)?.into();
             let ty_byte = src.u8()?;
             let ty = TypeTag::from_u8(ty_byte).ok_or(WireError::BadTypeTag(ty_byte))?;
             let modifiers = TypeModifiers(src.u8()?);
@@ -833,14 +815,8 @@ impl WireErrorRecord {
         let code = src.i32()?;
         let message = src.string()?;
         let field_name_len = src.u16()? as usize;
-        let field_name = core::str::from_utf8(src.take(field_name_len)?)
-            .map_err(|_| WireError::BadUtf8)?
-            .into();
-        Ok(WireErrorRecord {
-            code,
-            message,
-            field_name,
-        })
+        let field_name = core::str::from_utf8(src.take(field_name_len)?).map_err(|_| WireError::BadUtf8)?.into();
+        Ok(WireErrorRecord { code, message, field_name })
     }
 }
 
@@ -907,9 +883,7 @@ mod tests {
     fn list_values_round_trip() {
         // Empty, homogeneous, heterogeneous, and nested lists.
         value_round_trip(Value::List(Arc::from(&[][..])));
-        value_round_trip(Value::List(Arc::from(
-            &[Value::Int(1), Value::Int(2), Value::Int(3)][..],
-        )));
+        value_round_trip(Value::List(Arc::from(&[Value::Int(1), Value::Int(2), Value::Int(3)][..])));
         value_round_trip(Value::List(Arc::from(
             &[Value::Int(7), Value::Str(String::from("mix")), Value::Bool(true), Value::Null][..],
         )));
@@ -938,9 +912,7 @@ mod tests {
         let nested = Schema::new().field("tags", TypeTag::List, TypeModifiers::NONE);
         value_round_trip(Value::Record(Arc::new(Record {
             schema: nested,
-            values: vec![Value::List(Arc::from(
-                &[Value::Str(String::from("x")), Value::Str(String::from("y"))][..],
-            ))],
+            values: vec![Value::List(Arc::from(&[Value::Str(String::from("x")), Value::Str(String::from("y"))][..]))],
         })));
     }
 
@@ -980,10 +952,7 @@ mod tests {
     fn error_value_tag_is_unsupported() {
         let buf = [0u8; 8];
         let mut src = ByteSource::new(&buf);
-        assert_eq!(
-            read_value(&mut src, TypeTag::Error),
-            Err(WireError::Unsupported(TypeTag::Error))
-        );
+        assert_eq!(read_value(&mut src, TypeTag::Error), Err(WireError::Unsupported(TypeTag::Error)));
     }
 
     #[test]
@@ -1061,11 +1030,8 @@ mod tests {
 
     #[test]
     fn error_record_round_trips() {
-        let rec = WireErrorRecord {
-            code: -13,
-            message: String::from("type mismatch"),
-            field_name: String::from("cpu"),
-        };
+        let rec =
+            WireErrorRecord { code: -13, message: String::from("type mismatch"), field_name: String::from("cpu") };
         let mut buf = Vec::new();
         rec.encode(&mut buf).unwrap();
         let mut src = ByteSource::new(&buf);

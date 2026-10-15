@@ -402,10 +402,7 @@ pub fn parse_reply(buf: &[u8]) -> Option<ReplyView> {
     } else if body.len() < RESOLVE_REPLY_LEN {
         ReplyKind::Malformed
     } else {
-        ReplyKind::Success {
-            object_kind: get_u16(body, 0),
-            content_len: get_u32(body, 4),
-        }
+        ReplyKind::Success { object_kind: get_u16(body, 0), content_len: get_u32(body, 4) }
     };
     Some(ReplyView { request_id, kind })
 }
@@ -488,12 +485,7 @@ pub fn build_touch_request(out: &mut [u8], file_id: u64) -> Option<usize> {
 /// page), `suffix` the path naming the file (the fill is stateless). The
 /// `request_id` is written `0`; the caller stamps it with [`stamp_request_id`].
 /// The filled bytes come back in the reply's `handles[0]` (a `MemoryObject`).
-pub fn build_read_range_request(
-    out: &mut [u8],
-    offset: u64,
-    len: u32,
-    suffix: &[u8],
-) -> Option<usize> {
+pub fn build_read_range_request(out: &mut [u8], offset: u64, len: u32, suffix: &[u8]) -> Option<usize> {
     if suffix.len() > u16::MAX as usize {
         return None;
     }
@@ -655,10 +647,7 @@ mod tests {
         let buf = make_reply(42, RS_FLAG_REPLY, &body);
         let r = parse_reply(&buf[..RS_HEADER_LEN + RESOLVE_REPLY_LEN]).unwrap();
         assert_eq!(r.request_id, 42);
-        assert_eq!(
-            r.kind,
-            ReplyKind::Success { object_kind: OBJECT_KIND_MEMOBJ, content_len: 4096 }
-        );
+        assert_eq!(r.kind, ReplyKind::Success { object_kind: OBJECT_KIND_MEMOBJ, content_len: 4096 });
     }
 
     #[test]
@@ -749,7 +738,12 @@ mod tests {
         let h = file_blocks_reply_header(&body).unwrap();
         assert_eq!(
             h,
-            FileBlocksHeader { block_size: 4096, run_count: 1, file_id: 0x1234_5678_9abc, flags: FILE_BLOCKS_READ_ONLY }
+            FileBlocksHeader {
+                block_size: 4096,
+                run_count: 1,
+                file_id: 0x1234_5678_9abc,
+                flags: FILE_BLOCKS_READ_ONLY
+            }
         );
         assert_eq!(file_blocks_run(&body, 0), Some((0, 777, 2, 0)));
         assert_eq!(file_blocks_run(&body, 1), None, "one run, not two");

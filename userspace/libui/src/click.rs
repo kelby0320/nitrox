@@ -95,9 +95,7 @@ impl Clicks {
 /// elapsed and continues the run, rather than wrapping to an enormous interval that silently ends
 /// every run for ever.
 fn continues(was: Point, then: u64, at: Point, at_ms: u64) -> bool {
-    at_ms.saturating_sub(then) <= RUN_MS
-        && (at.x - was.x).abs() <= SLOP
-        && (at.y - was.y).abs() <= SLOP
+    at_ms.saturating_sub(then) <= RUN_MS && (at.x - was.x).abs() <= SLOP && (at.y - was.y).abs() <= SLOP
 }
 
 #[cfg(test)]
@@ -123,11 +121,7 @@ mod tests {
     fn time_and_distance_each_end_a_run_by_themselves() {
         let mut c = Clicks::new();
         c.press(AT, 1_000);
-        assert_eq!(
-            c.press(AT, 1_000 + RUN_MS + 1),
-            1,
-            "same place, too late — the interval alone must end the run"
-        );
+        assert_eq!(c.press(AT, 1_000 + RUN_MS + 1), 1, "same place, too late — the interval alone must end the run");
 
         let mut c = Clicks::new();
         c.press(AT, 1_000);

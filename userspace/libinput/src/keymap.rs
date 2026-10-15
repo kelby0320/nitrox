@@ -135,8 +135,7 @@ pub fn to_char(keycode: u16, modifiers: u16) -> Option<u8> {
 /// Cheaper than [`to_char`] when the answer is all a caller wants, and clearer at a call
 /// site than comparing against `None`.
 pub fn is_text(keycode: u16) -> bool {
-    US.iter().any(|(k, _, _)| *k == keycode)
-        || KEYPAD_NUM.iter().chain(KEYPAD_OPS).any(|(k, _)| *k == keycode)
+    US.iter().any(|(k, _, _)| *k == keycode) || KEYPAD_NUM.iter().chain(KEYPAD_OPS).any(|(k, _)| *k == keycode)
 }
 
 #[cfg(test)]
@@ -240,13 +239,14 @@ mod tests {
     #[test]
     fn the_keypad_is_text_under_num_lock() {
         let num = LOCK_NUM;
-        assert_eq!([71, 72, 73, 75, 76, 77, 79, 80, 81, 82, 83].map(|k| text(k, 0, num)),
-            [b'7', b'8', b'9', b'4', b'5', b'6', b'1', b'2', b'3', b'0', b'.'].map(Some));
+        assert_eq!(
+            [71, 72, 73, 75, 76, 77, 79, 80, 81, 82, 83].map(|k| text(k, 0, num)),
+            [b'7', b'8', b'9', b'4', b'5', b'6', b'1', b'2', b'3', b'0', b'.'].map(Some)
+        );
         assert_eq!(text(79, 0, 0), None, "keypad 1 with Num Lock off");
         assert_eq!(text(79, MOD_SHIFT, num | LOCK_CAPS), Some(b'1'));
         assert_eq!([98, 55, 74, 78].map(|k| text(k, 0, 0)), [b'/', b'*', b'-', b'+'].map(Some));
         assert_eq!(text(55, MOD_CTRL, num), Some(b'*'), "an operator is not folded");
         assert!(is_text(79) && is_text(78));
     }
-
 }

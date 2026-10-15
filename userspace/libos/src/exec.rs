@@ -23,12 +23,7 @@ const MAX_WAIT: usize = 8;
 
 /// An `[IoResult; N]` of zeroes (no `Copy`/`Default` bound needed).
 fn zeroed_results<const N: usize>() -> [IoResult; N] {
-    core::array::from_fn(|_| IoResult {
-        handle: 0,
-        status: 0,
-        reserved: 0,
-        result: 0,
-    })
+    core::array::from_fn(|_| IoResult { handle: 0, status: 0, reserved: 0, result: 0 })
 }
 
 // --- the reactor: which handles a Pending future wants waited on ----------
@@ -48,12 +43,7 @@ struct Reactor {
 
 impl Reactor {
     fn new() -> Self {
-        Reactor {
-            reg: Cell::new(Registry {
-                handles: [0; MAX_WAIT],
-                count: 0,
-            }),
-        }
+        Reactor { reg: Cell::new(Registry { handles: [0; MAX_WAIT], count: 0 }) }
     }
 
     /// Register a waitable handle for this poll round (deduplicated; capped at
@@ -73,10 +63,7 @@ impl Reactor {
     /// Take and clear the round's registrations.
     fn take(&self) -> Registry {
         let r = self.reg.get();
-        self.reg.set(Registry {
-            handles: [0; MAX_WAIT],
-            count: 0,
-        });
+        self.reg.set(Registry { handles: [0; MAX_WAIT], count: 0 });
         r
     }
 }
@@ -205,14 +192,7 @@ mod tests {
     use libkern::{IO_OPCODE_READ, IoOp};
 
     fn read_op() -> IoOp {
-        IoOp {
-            opcode: IO_OPCODE_READ,
-            flags: 0,
-            buffer: 0,
-            buf_offset: 0,
-            offset: 0,
-            length: 0,
-        }
+        IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 }
     }
 
     #[test]

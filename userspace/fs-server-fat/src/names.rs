@@ -239,7 +239,22 @@ mod tests {
         for ok in ["a", "README.TXT", "a long name.tar.gz", ".hidden", "naïve"] {
             assert!(valid(ok.as_bytes()), "{ok}");
         }
-        for bad in ["", ".", "..", "a:b", "a*", "q?", "x|y", "t\"", "<", ">", "back\\slash", "tab\tname", "trailing ", "trailing."] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a:b",
+            "a*",
+            "q?",
+            "x|y",
+            "t\"",
+            "<",
+            ">",
+            "back\\slash",
+            "tab\tname",
+            "trailing ",
+            "trailing.",
+        ] {
             assert!(!valid(bad.as_bytes()), "{bad:?}");
         }
     }

@@ -190,13 +190,7 @@ pub fn home_for(name: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// **Write one record's line**, `\n` included, into `out`: `password` derived under `salt` with
 /// [`ITERATIONS`]. Its length, or why not.
-pub fn write_record(
-    out: &mut [u8],
-    name: &[u8],
-    home: &[u8],
-    password: &[u8],
-    salt: &[u8],
-) -> Result<usize, Refusal> {
+pub fn write_record(out: &mut [u8], name: &[u8], home: &[u8], password: &[u8], salt: &[u8]) -> Result<usize, Refusal> {
     write_record_with(out, name, home, password, salt, ITERATIONS)
 }
 
@@ -278,13 +272,7 @@ pub fn remove(file: &[u8], out: &mut [u8], name: &[u8]) -> Result<usize, Refusal
 /// place, keeping its name and home. Every other line is kept byte for byte. The line grows when
 /// the new salt is longer than the old — the build's 8 bytes against [`SALT_LEN`]'s 16 — so this
 /// can be refused as [`Refusal::TooLarge`] too.
-pub fn set_password(
-    file: &[u8],
-    out: &mut [u8],
-    name: &[u8],
-    password: &[u8],
-    salt: &[u8],
-) -> Result<usize, Refusal> {
+pub fn set_password(file: &[u8], out: &mut [u8], name: &[u8], password: &[u8], salt: &[u8]) -> Result<usize, Refusal> {
     set_password_with(file, out, name, password, salt, ITERATIONS)
 }
 

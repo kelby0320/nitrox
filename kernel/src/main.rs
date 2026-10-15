@@ -39,9 +39,9 @@ use nitrox_kernel::framebuffer;
 use nitrox_kernel::kprintln;
 use nitrox_kernel::libkern::printable::{Printable, c_bytes};
 use nitrox_kernel::limine::{
-    BaseRevision, BootloaderInfoRequest, DateAtBootRequest, ExecutableCmdlineRequest,
-    FirmwareTypeRequest, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
-    Framebuffer, RequestsEndMarker, RequestsStartMarker, SmpInfo, SmpRequest,
+    BaseRevision, BootloaderInfoRequest, DateAtBootRequest, ExecutableCmdlineRequest, FirmwareTypeRequest, Framebuffer,
+    FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker, SmpInfo,
+    SmpRequest,
 };
 use nitrox_kernel::mm;
 use nitrox_kernel::sched;
@@ -428,10 +428,7 @@ fn sched_bringup() {
         arch::Timer::start_periodic(sched::TICK_NS);
         arch::Cpu::interrupts_enable();
     }
-    kprintln!(
-        "preemption armed (IF=1, {} Hz tick)",
-        1_000_000_000 / sched::TICK_NS
-    );
+    kprintln!("preemption armed (IF=1, {} Hz tick)", 1_000_000_000 / sched::TICK_NS);
 }
 
 /// Count of application processors that have finished bring-up (each AP bumps
@@ -598,8 +595,7 @@ fn bring_up_aps() {
         arch::bind_cpu_identity(idx, info.lapic_id);
         // Launch the parked AP: the release store to `goto_address` makes it jump
         // to `ap_entry` (and pairs with the AP's acquire of the identity map).
-        info.goto_address
-            .store(ap_entry as *const () as u64, Ordering::Release);
+        info.goto_address.store(ap_entry as *const () as u64, Ordering::Release);
     }
 
     let launched = next_idx - 1;
@@ -705,13 +701,9 @@ fn log_handoff() -> &'static [u8] {
         nitrox_kernel::handoff::firmware_name(unsafe { (*firmware).firmware_type })
     };
     match BASE_REVISION.loaded() {
-        Some(rev) => kprintln!(
-            "boot: {} {} on {}, base revision {}",
-            Printable(name),
-            Printable(version),
-            firmware,
-            rev
-        ),
+        Some(rev) => {
+            kprintln!("boot: {} {} on {}, base revision {}", Printable(name), Printable(version), firmware, rev)
+        }
         None => kprintln!(
             "boot: {} {} on {}, base revision {} (loaded revision unreported)",
             Printable(name),
@@ -779,10 +771,9 @@ fn parse_cmdline(line: &'static [u8]) -> nitrox_kernel::cmdline::Flags {
         // — `install` was `session-mgr`'s from Phase 5 Part H.1 until administration Part G.3.
         // Saying "ignoring" of a word that might decide what the machine does would be the log
         // lying about the boot; saying userspace reads it, when nothing does today, would be too.
-        Ignored::Unknown(word) => kprintln!(
-            "cmdline: \"{}\" is not a kernel flag; it is served whole at /proc/cmdline",
-            Printable(word)
-        ),
+        Ignored::Unknown(word) => {
+            kprintln!("cmdline: \"{}\" is not a kernel flag; it is served whole at /proc/cmdline", Printable(word))
+        }
         Ignored::BadValue(word) => kprintln!(
             "cmdline: \"{}\" has no readable number of seconds — using {}",
             Printable(word),
@@ -923,10 +914,7 @@ fn report_framebuffer_cost(console_virt: u64) {
                 _ => " — the stronger of the two wins, so a plain mapping pays that",
             }
         ),
-        None => kprintln!(
-            "framebuffer: {:#x} has no memory type of its own; the page table decides",
-            phys.as_u64()
-        ),
+        None => kprintln!("framebuffer: {:#x} has no memory type of its own; the page table decides", phys.as_u64()),
     }
 
     // A second mapping of the aperture, made as a `/dev/framebuffer` mapping is: the same
@@ -964,9 +952,7 @@ fn report_framebuffer_cost(console_virt: u64) {
         unsafe { unmap_plain(v, pages) };
     }
     let Some(f) = measured else { return };
-    let rate = |ns: u64| -> u64 {
-        if ns == 0 { 0 } else { (f.bytes as u64) * 1_000_000_000 / ns / (1024 * 1024) }
-    };
+    let rate = |ns: u64| -> u64 { if ns == 0 { 0 } else { (f.bytes as u64) * 1_000_000_000 / ns / (1024 * 1024) } };
     kprintln!(
         "framebuffer: a full-screen fill of {} KiB took {} us ({} MiB/s) through the console's mapping",
         f.bytes / 1024,
@@ -1057,9 +1043,7 @@ fn run_first_userspace() {
     use nitrox_kernel::libkern::KBox;
     use nitrox_kernel::libkern::handle::{KObjectType, Rights};
     use nitrox_kernel::object::kernel_server::KernelServerId;
-    use nitrox_kernel::object::{
-        Namespace, NotificationChannel, ObjectRef, Process,
-    };
+    use nitrox_kernel::object::{Namespace, NotificationChannel, ObjectRef, Process};
 
     // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
     // per-thread (by the scheduler's `thread_enter`), not here.
@@ -1076,15 +1060,14 @@ fn run_first_userspace() {
     };
     // Load `/sbin/init` from the initramfs CPIO (a contiguous `&[u8]` into the
     // HHDM-mapped Limine module — `init_initramfs` ran in `kmain` before this).
-    let init_bytes = match nitrox_kernel::initramfs::blob()
-        .and_then(|blob| nitrox_kernel::initramfs::lookup(blob, b"sbin/init"))
-    {
-        Some(bytes) => bytes,
-        None => {
-            kprintln!("init: /sbin/init not found in initramfs — halting");
-            return;
-        }
-    };
+    let init_bytes =
+        match nitrox_kernel::initramfs::blob().and_then(|blob| nitrox_kernel::initramfs::lookup(blob, b"sbin/init")) {
+            Some(bytes) => bytes,
+            None => {
+                kprintln!("init: /sbin/init not found in initramfs — halting");
+                return;
+            }
+        };
     let info = match load_elf(&aspace, init_bytes) {
         Ok(i) => i,
         Err(e) => {
@@ -1096,8 +1079,7 @@ fn run_first_userspace() {
     // Build the parent process (pid 1 = init; it is the root — no `parent_notif`).
     // The **capability bootstrap**: init holds the full syscap set, and all authority
     // in the system traces to this initial kernel grant (docs/architecture/syscaps.md).
-    let mut proc_box = match Process::try_new_user(1, aspace, nitrox_kernel::libkern::SysCaps::all())
-    {
+    let mut proc_box = match Process::try_new_user(1, aspace, nitrox_kernel::libkern::SysCaps::all()) {
         Ok(p) => p,
         Err(_) => {
             kprintln!("init: process alloc failed");
@@ -1151,12 +1133,8 @@ fn run_first_userspace() {
     // `EntropyObject` (see `object::kernel_server`). Its binding rights are the
     // band `sys_entropy_create` mints (`entropy_rights`): `READ` + the generic
     // management band, so a full-rights lookup yields exactly that.
-    let entropy_binding_rights =
-        Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    if ns
-        .bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, entropy_binding_rights)
-        .is_err()
-    {
+    let entropy_binding_rights = Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, entropy_binding_rights).is_err() {
         kprintln!("init: binding /dev/entropy failed");
         return;
     }
@@ -1165,12 +1143,8 @@ fn run_first_userspace() {
     // keyboard input with `sys_io_submit(Read)`. Input-only in Phase 2, so the
     // binding grants `READ` + the generic management band (DUPLICATE/INSPECT so a
     // client can `stat` it; TRANSFER so init can hand it to eshell at spawn).
-    let console_binding_rights =
-        Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    if ns
-        .bind_kernel_server(b"/dev/console", KernelServerId::Console, console_binding_rights)
-        .is_err()
-    {
+    let console_binding_rights = Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns.bind_kernel_server(b"/dev/console", KernelServerId::Console, console_binding_rights).is_err() {
         kprintln!("init: binding /dev/console failed");
         return;
     }
@@ -1178,12 +1152,8 @@ fn run_first_userspace() {
     // `/dev/log` — the kernel log ring, served as a read-only `MemoryObject`
     // snapshot (`cat /dev/log` = dmesg). The caller maps + stats it, so the binding
     // grants `MAP_READ` + the generic management band (INSPECT for `stat`).
-    let log_binding_rights =
-        Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    if ns
-        .bind_kernel_server(b"/dev/log", KernelServerId::Log, log_binding_rights)
-        .is_err()
-    {
+    let log_binding_rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns.bind_kernel_server(b"/dev/log", KernelServerId::Log, log_binding_rights).is_err() {
         kprintln!("init: binding /dev/log failed");
         return;
     }
@@ -1198,19 +1168,9 @@ fn run_first_userspace() {
     // process that will actually drive the display. No `READ`/`WRITE` — only the `MAP_*`
     // band is valid on a `MemoryObject`, and including them would be rejected as
     // `BadRights`.
-    let framebuffer_binding_rights = Rights::MAP_READ
-        | Rights::MAP_WRITE
-        | Rights::DUPLICATE
-        | Rights::INSPECT
-        | Rights::TRANSFER;
-    if ns
-        .bind_kernel_server(
-            b"/dev/framebuffer",
-            KernelServerId::Framebuffer,
-            framebuffer_binding_rights,
-        )
-        .is_err()
-    {
+    let framebuffer_binding_rights =
+        Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns.bind_kernel_server(b"/dev/framebuffer", KernelServerId::Framebuffer, framebuffer_binding_rights).is_err() {
         // Non-fatal: a system with no usable framebuffer still boots to a serial
         // console, and every existing test path is serial. The display arm is the only
         // consumer.
@@ -1223,51 +1183,26 @@ fn run_first_userspace() {
     // therefore shared by all callers/descendants. Per-leaf bindings (not one
     // `/proc/self` prefix) because the returned types — Process / Thread / Namespace
     // — carry disjoint principal rights, so each needs its own type-correct cap.
-    let proc_self_principal_rights = Rights::SIGNAL
-        | Rights::TERMINATE
-        | Rights::DUPLICATE
-        | Rights::INSPECT
-        | Rights::TRANSFER;
+    let proc_self_principal_rights =
+        Rights::SIGNAL | Rights::TERMINATE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     // The namespace view is LOOKUP-only (a resolve view; self already holds a
     // full-rights root-namespace handle via `rsi`). No BIND — granting self-bind
     // ambiently would be a capability-escalation smell.
-    let proc_self_namespace_rights =
-        Rights::LOOKUP | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    let proc_self_namespace_rights = Rights::LOOKUP | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     // `/proc/self/status` returns a synthesized read-only `MemoryObject` text
     // snapshot (numeric pid/tid), so its cap is the snapshot-server shape
     // (`MAP_READ` + the generic band), not a principal-object cap.
-    let proc_self_status_rights =
-        Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    let proc_self_status_rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     let proc_self_binds = [
-        (
-            &b"/proc/self/process"[..],
-            KernelServerId::ProcSelfProcess,
-            proc_self_principal_rights,
-        ),
-        (
-            &b"/proc/self/thread"[..],
-            KernelServerId::ProcSelfThread,
-            proc_self_principal_rights,
-        ),
-        (
-            &b"/proc/self/namespace"[..],
-            KernelServerId::ProcSelfNamespace,
-            proc_self_namespace_rights,
-        ),
-        (
-            &b"/proc/self/status"[..],
-            KernelServerId::ProcSelfStatus,
-            proc_self_status_rights,
-        ),
+        (&b"/proc/self/process"[..], KernelServerId::ProcSelfProcess, proc_self_principal_rights),
+        (&b"/proc/self/thread"[..], KernelServerId::ProcSelfThread, proc_self_principal_rights),
+        (&b"/proc/self/namespace"[..], KernelServerId::ProcSelfNamespace, proc_self_namespace_rights),
+        (&b"/proc/self/status"[..], KernelServerId::ProcSelfStatus, proc_self_status_rights),
         // `/proc/cmdline` — the line this boot was given, as text. Not under `/proc/self`: it is
         // one fact about the machine, the same for every reader, and a person debugging a boot
         // wants to see it. (`session-mgr` looked for `install` in it from Phase 5 Part H.1 until
         // administration Part G.3.)
-        (
-            &b"/proc/cmdline"[..],
-            KernelServerId::ProcCmdline,
-            proc_self_status_rights,
-        ),
+        (&b"/proc/cmdline"[..], KernelServerId::ProcCmdline, proc_self_status_rights),
     ];
     for (path, id, rights) in proc_self_binds {
         if ns.bind_kernel_server(path, id, rights).is_err() {
@@ -1281,16 +1216,8 @@ fn run_first_userspace() {
     // maps + stats it, so the binding grants `MAP_READ` + the generic management
     // band. Reachability is by namespace construction, like all of `/proc` — a
     // supervisor may omit it from a sandbox's namespace.
-    let sched_stats_binding_rights =
-        Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    if ns
-        .bind_kernel_server(
-            b"/proc/sched/stats",
-            KernelServerId::SchedStats,
-            sched_stats_binding_rights,
-        )
-        .is_err()
-    {
+    let sched_stats_binding_rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns.bind_kernel_server(b"/proc/sched/stats", KernelServerId::SchedStats, sched_stats_binding_rights).is_err() {
         kprintln!("init: binding /proc/sched/stats failed");
         return;
     }
@@ -1298,12 +1225,8 @@ fn run_first_userspace() {
     // `/initramfs/<path>` — a subtree server returning a read-only `MemoryObject`
     // copy of a file from the boot CPIO blob. The caller maps it `MAP_READ`, so
     // the binding grants `MAP_READ` + the generic management band.
-    let initramfs_binding_rights =
-        Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    if ns
-        .bind_kernel_server(b"/initramfs", KernelServerId::Initramfs, initramfs_binding_rights)
-        .is_err()
-    {
+    let initramfs_binding_rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns.bind_kernel_server(b"/initramfs", KernelServerId::Initramfs, initramfs_binding_rights).is_err() {
         kprintln!("init: binding /initramfs failed");
         return;
     }
@@ -1318,16 +1241,9 @@ fn run_first_userspace() {
     // read-only `MemoryObject`, and a lookup attenuates to the binding's rights, so without this
     // the record resolves and cannot be read. `MAP_READ` on a `DeviceNode` means nothing — a
     // device is not mappable — so this widens only what the leaf serves.
-    let block_binding_rights = Rights::READ
-        | Rights::WRITE
-        | Rights::MAP_READ
-        | Rights::DUPLICATE
-        | Rights::INSPECT
-        | Rights::TRANSFER;
-    if ns
-        .bind_kernel_server(b"/dev/blk", KernelServerId::BlockDevice, block_binding_rights)
-        .is_err()
-    {
+    let block_binding_rights =
+        Rights::READ | Rights::WRITE | Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns.bind_kernel_server(b"/dev/blk", KernelServerId::BlockDevice, block_binding_rights).is_err() {
         kprintln!("init: binding /dev/blk failed");
         return;
     }
@@ -1340,12 +1256,8 @@ fn run_first_userspace() {
     // **Bound into the root namespace only.** This is the authority to read one input
     // device unfiltered — a keylogger, if it reaches the wrong process — so no session
     // namespace should ever project it (`docs/architecture/input-subsystem.md` §5).
-    let raw_input_binding_rights =
-        Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    if ns
-        .bind_kernel_server(b"/dev/input/raw", KernelServerId::RawInput, raw_input_binding_rights)
-        .is_err()
-    {
+    let raw_input_binding_rights = Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns.bind_kernel_server(b"/dev/input/raw", KernelServerId::RawInput, raw_input_binding_rights).is_err() {
         kprintln!("init: binding /dev/input/raw failed");
         return;
     }
@@ -1354,10 +1266,7 @@ fn run_first_userspace() {
     // (administration Part B). **The root namespace only**, like `/dev/input/raw`: `<id>` is every
     // raw device the kernel has, so it is the union of the two subtree bindings' authority —
     // `/dev/blk`'s rights, whose `MAP_READ` is what lets the snapshot be read.
-    if ns
-        .bind_kernel_server(b"/dev/registry", KernelServerId::Registry, block_binding_rights)
-        .is_err()
-    {
+    if ns.bind_kernel_server(b"/dev/registry", KernelServerId::Registry, block_binding_rights).is_err() {
         kprintln!("init: binding /dev/registry failed");
         return;
     }
@@ -1375,12 +1284,8 @@ fn run_first_userspace() {
     let (np, nt) = ns_ref.into_raw();
     // Full namespace rights — kept in sync with `syscall::table::namespace_rights`
     // (LOOKUP|BIND principals + the UNBIND modifier + the generic band).
-    let ns_rights = Rights::LOOKUP
-        | Rights::BIND
-        | Rights::UNBIND
-        | Rights::DUPLICATE
-        | Rights::TRANSFER
-        | Rights::INSPECT;
+    let ns_rights =
+        Rights::LOOKUP | Rights::BIND | Rights::UNBIND | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT;
     let ns_h = match global::get().allocate(1, np, nt, ns_rights) {
         Ok(h) => h,
         Err(_) => {
@@ -1559,9 +1464,7 @@ fn paging_init() {
     let policy = unsafe { arch::MemoryTypes::install_policy() };
     ATTRIBUTE_TABLE.store(policy != Policy::NoTable, core::sync::atomic::Ordering::Relaxed);
     match policy {
-        Policy::Unchanged => kprintln!(
-            "cache policy: the kernel's table is installed; the bootloader's was the same"
-        ),
+        Policy::Unchanged => kprintln!("cache policy: the kernel's table is installed; the bootloader's was the same"),
         Policy::Replaced => kprintln!(
             "cache policy: the kernel's table is installed; the bootloader's DIFFERED — mappings \
              it made, including the console's, chose entries from another table"

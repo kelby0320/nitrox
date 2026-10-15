@@ -36,9 +36,8 @@ use core::sync::atomic::{AtomicUsize, Ordering, fence};
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::object::{
-    DeviceNode, EntropyObject, FileObject, InterruptObject, IpcChannel, MemoryObject, Namespace,
-    NotificationChannel, PendingOperation, Process, SystemControl, Thread, Timer,
-    UserspaceServerReg,
+    DeviceNode, EntropyObject, FileObject, InterruptObject, IpcChannel, MemoryObject, Namespace, NotificationChannel,
+    PendingOperation, Process, SystemControl, Thread, Timer, UserspaceServerReg,
 };
 
 /// Upper bound on the refcount. Exceeding it means ~2^62 leaked
@@ -63,10 +62,7 @@ impl KObjectHeader {
     /// Construct a header for a freshly created object with a refcount of
     /// one — the reference the creating handle (or `KBox`) holds.
     pub const fn new(object_type: KObjectType) -> Self {
-        Self {
-            refcount: AtomicUsize::new(1),
-            object_type,
-        }
+        Self { refcount: AtomicUsize::new(1), object_type }
     }
 
     /// The object's type tag.
@@ -87,12 +83,7 @@ impl KObjectHeader {
             if cur > MAX_REFCOUNT {
                 panic!("kobject refcount overflow");
             }
-            match self.refcount.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self.refcount.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => return true,
                 Err(actual) => cur = actual,
             }
@@ -167,10 +158,7 @@ impl ObjectRef {
         let header = unsafe { &*(obj as *const KObjectHeader) };
         if header.try_acquire() {
             // SAFETY: `obj` is non-null per the caller's contract.
-            Some(ObjectRef {
-                obj: unsafe { NonNull::new_unchecked(obj) },
-                object_type: ty,
-            })
+            Some(ObjectRef { obj: unsafe { NonNull::new_unchecked(obj) }, object_type: ty })
         } else {
             None
         }
@@ -223,10 +211,7 @@ impl Clone for ObjectRef {
         // its count is at least one; `bump` cannot resurrect a zero.
         let header = unsafe { &*(self.obj.as_ptr() as *const KObjectHeader) };
         header.bump();
-        ObjectRef {
-            obj: self.obj,
-            object_type: self.object_type,
-        }
+        ObjectRef { obj: self.obj, object_type: self.object_type }
     }
 }
 
@@ -274,9 +259,7 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
         KObjectType::MemoryObject => {
             // SAFETY: last ref to a `MemoryObject` produced by KBox::into_raw.
             // Dropping the box runs `MemoryObject::Drop`, freeing its frames.
-            drop(unsafe {
-                KBox::<MemoryObject>::from_raw(NonNull::new_unchecked(ptr as *mut MemoryObject))
-            });
+            drop(unsafe { KBox::<MemoryObject>::from_raw(NonNull::new_unchecked(ptr as *mut MemoryObject)) });
             #[cfg(test)]
             test_probe::note(KObjectType::MemoryObject);
         }
@@ -289,9 +272,7 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
         KObjectType::NotificationChannel => {
             // SAFETY: last ref to a `NotificationChannel` produced by KBox::into_raw.
             drop(unsafe {
-                KBox::<NotificationChannel>::from_raw(NonNull::new_unchecked(
-                    ptr as *mut NotificationChannel,
-                ))
+                KBox::<NotificationChannel>::from_raw(NonNull::new_unchecked(ptr as *mut NotificationChannel))
             });
             #[cfg(test)]
             test_probe::note(KObjectType::NotificationChannel);
@@ -299,56 +280,40 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
         KObjectType::IpcChannel => {
             // SAFETY: last ref to an `IpcChannel` produced by KBox::into_raw.
             // Dropping the box runs `IpcChannel::Drop`, which unlinks the peer.
-            drop(unsafe {
-                KBox::<IpcChannel>::from_raw(NonNull::new_unchecked(ptr as *mut IpcChannel))
-            });
+            drop(unsafe { KBox::<IpcChannel>::from_raw(NonNull::new_unchecked(ptr as *mut IpcChannel)) });
             #[cfg(test)]
             test_probe::note(KObjectType::IpcChannel);
         }
         KObjectType::PendingOperation => {
             // SAFETY: last ref to a `PendingOperation` produced by KBox::into_raw.
-            drop(unsafe {
-                KBox::<PendingOperation>::from_raw(NonNull::new_unchecked(
-                    ptr as *mut PendingOperation,
-                ))
-            });
+            drop(unsafe { KBox::<PendingOperation>::from_raw(NonNull::new_unchecked(ptr as *mut PendingOperation)) });
             #[cfg(test)]
             test_probe::note(KObjectType::PendingOperation);
         }
         KObjectType::Namespace => {
             // SAFETY: last ref to a `Namespace` produced by KBox::into_raw.
             // Dropping the box releases every binding's target `ObjectRef`.
-            drop(unsafe {
-                KBox::<Namespace>::from_raw(NonNull::new_unchecked(ptr as *mut Namespace))
-            });
+            drop(unsafe { KBox::<Namespace>::from_raw(NonNull::new_unchecked(ptr as *mut Namespace)) });
             #[cfg(test)]
             test_probe::note(KObjectType::Namespace);
         }
         KObjectType::EntropyObject => {
             // SAFETY: last ref to an `EntropyObject` produced by KBox::into_raw.
             // The object owns nothing; the box drop frees its allocation.
-            drop(unsafe {
-                KBox::<EntropyObject>::from_raw(NonNull::new_unchecked(ptr as *mut EntropyObject))
-            });
+            drop(unsafe { KBox::<EntropyObject>::from_raw(NonNull::new_unchecked(ptr as *mut EntropyObject)) });
             #[cfg(test)]
             test_probe::note(KObjectType::EntropyObject);
         }
         KObjectType::DeviceNode => {
             // SAFETY: last ref to a `DeviceNode` produced by KBox::into_raw.
             // The object owns nothing out-of-line; the box drop frees it.
-            drop(unsafe {
-                KBox::<DeviceNode>::from_raw(NonNull::new_unchecked(ptr as *mut DeviceNode))
-            });
+            drop(unsafe { KBox::<DeviceNode>::from_raw(NonNull::new_unchecked(ptr as *mut DeviceNode)) });
             #[cfg(test)]
             test_probe::note(KObjectType::DeviceNode);
         }
         KObjectType::InterruptObject => {
             // SAFETY: last ref to an `InterruptObject` produced by KBox::into_raw.
-            drop(unsafe {
-                KBox::<InterruptObject>::from_raw(NonNull::new_unchecked(
-                    ptr as *mut InterruptObject,
-                ))
-            });
+            drop(unsafe { KBox::<InterruptObject>::from_raw(NonNull::new_unchecked(ptr as *mut InterruptObject)) });
             #[cfg(test)]
             test_probe::note(KObjectType::InterruptObject);
         }
@@ -357,9 +322,7 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
             // Dropping the box releases its owned endpoint `ObjectRef` (whose
             // `IpcChannel::drop` unlinks the peer) and any pending lookup's PO.
             drop(unsafe {
-                KBox::<UserspaceServerReg>::from_raw(NonNull::new_unchecked(
-                    ptr as *mut UserspaceServerReg,
-                ))
+                KBox::<UserspaceServerReg>::from_raw(NonNull::new_unchecked(ptr as *mut UserspaceServerReg))
             });
             #[cfg(test)]
             test_probe::note(KObjectType::UserspaceServerReg);
@@ -367,18 +330,14 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
         KObjectType::FileObject => {
             // SAFETY: last ref to a `FileObject` produced by KBox::into_raw.
             // Dropping the box runs `FileObject::Drop`, freeing its cached frames.
-            drop(unsafe {
-                KBox::<FileObject>::from_raw(NonNull::new_unchecked(ptr as *mut FileObject))
-            });
+            drop(unsafe { KBox::<FileObject>::from_raw(NonNull::new_unchecked(ptr as *mut FileObject)) });
             #[cfg(test)]
             test_probe::note(KObjectType::FileObject);
         }
         KObjectType::SystemControl => {
             // SAFETY: last ref to a `SystemControl` produced by KBox::into_raw.
             // The object owns nothing; the box drop frees its allocation.
-            drop(unsafe {
-                KBox::<SystemControl>::from_raw(NonNull::new_unchecked(ptr as *mut SystemControl))
-            });
+            drop(unsafe { KBox::<SystemControl>::from_raw(NonNull::new_unchecked(ptr as *mut SystemControl)) });
             #[cfg(test)]
             test_probe::note(KObjectType::SystemControl);
         }
@@ -421,24 +380,16 @@ pub(crate) mod test_probe {
         match ty {
             KObjectType::Process => PROCESS_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::Thread => THREAD_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::MemoryObject => {
-                MEMORY_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1))
-            }
+            KObjectType::MemoryObject => MEMORY_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::Timer => TIMER_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::NotificationChannel => {
-                NOTIFICATION_CHANNEL_DESTROYS.with(|c| c.set(c.get() + 1))
-            }
+            KObjectType::NotificationChannel => NOTIFICATION_CHANNEL_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::IpcChannel => IPC_CHANNEL_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::PendingOperation => PENDING_OP_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::Namespace => NAMESPACE_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::EntropyObject => ENTROPY_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::DeviceNode => DEVICE_NODE_DESTROYS.with(|c| c.set(c.get() + 1)),
-            KObjectType::InterruptObject => {
-                INTERRUPT_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1))
-            }
-            KObjectType::UserspaceServerReg => {
-                USERSPACE_SERVER_REG_DESTROYS.with(|c| c.set(c.get() + 1))
-            }
+            KObjectType::InterruptObject => INTERRUPT_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
+            KObjectType::UserspaceServerReg => USERSPACE_SERVER_REG_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::FileObject => FILE_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::SystemControl => SYSTEM_CONTROL_DESTROYS.with(|c| c.set(c.get() + 1)),
             _ => {}

@@ -39,24 +39,13 @@ pub fn init_global_heap() {
         let backing: &'static mut [u8] = vec![0u8; HEAP_BYTES + 2 * PAGE_SIZE].leak();
         let base = backing.as_mut_ptr() as usize;
         let aligned = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        assert!(
-            aligned as u64 >= 0x10_0000,
-            "host buffer sits below the buddy's 1 MiB cutoff"
-        );
+        assert!(aligned as u64 >= 0x10_0000, "host buffer sits below the buddy's 1 MiB cutoff");
 
-        let entries: &'static mut [MemoryMapEntry] = vec![MemoryMapEntry {
-            base: aligned as u64,
-            length: HEAP_BYTES as u64,
-            kind: MEMMAP_USABLE,
-        }]
-        .leak();
-        let entry_ptrs: &'static mut [*mut MemoryMapEntry] =
-            vec![entries.as_mut_ptr()].leak();
-        let response: &'static MemoryMapResponse = Box::leak(Box::new(MemoryMapResponse {
-            revision: 0,
-            entry_count: 1,
-            entries: entry_ptrs.as_mut_ptr(),
-        }));
+        let entries: &'static mut [MemoryMapEntry] =
+            vec![MemoryMapEntry { base: aligned as u64, length: HEAP_BYTES as u64, kind: MEMMAP_USABLE }].leak();
+        let entry_ptrs: &'static mut [*mut MemoryMapEntry] = vec![entries.as_mut_ptr()].leak();
+        let response: &'static MemoryMapResponse =
+            Box::leak(Box::new(MemoryMapResponse { revision: 0, entry_count: 1, entries: entry_ptrs.as_mut_ptr() }));
 
         // SAFETY: `response` describes one usable region that is a live,
         // leaked, page-aligned host allocation; an HHDM offset of 0 is
@@ -71,8 +60,7 @@ pub fn init_global_heap() {
         // `inherit_kernel_mappings` call not to panic. The 8 KiB
         // leaked allocation gives us a page-aligned base regardless
         // of what the host allocator returned for `vec`.
-        let template_backing: &'static mut [u8] =
-            vec![0u8; 2 * PAGE_SIZE].leak();
+        let template_backing: &'static mut [u8] = vec![0u8; 2 * PAGE_SIZE].leak();
         let raw = template_backing.as_mut_ptr() as usize;
         let aligned = (raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         // SAFETY: `aligned` points at a leaked, zeroed, page-aligned

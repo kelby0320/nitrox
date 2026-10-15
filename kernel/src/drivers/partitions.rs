@@ -246,7 +246,11 @@ pub struct Guid<'a>(pub &'a [u8; 16]);
 impl core::fmt::Display for Guid<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let g = self.0;
-        write!(f, "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-", g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6])?;
+        write!(
+            f,
+            "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-",
+            g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6]
+        )?;
         write!(f, "{:02X}{:02X}-", g[8], g[9])?;
         g[10..].iter().try_for_each(|b| write!(f, "{b:02X}"))
     }
@@ -316,7 +320,8 @@ mod tests {
         img.at(510)[..2].copy_from_slice(&[0x55, 0xAA]);
     }
 
-    const DISK_GUID: [u8; 16] = [0x7f, 0x38, 0xe3, 0x54, 0x6e, 0x15, 0xd0, 0x4c, 0xa6, 0x89, 0xe2, 0x07, 0x58, 0xfe, 0xea, 0xb8];
+    const DISK_GUID: [u8; 16] =
+        [0x7f, 0x38, 0xe3, 0x54, 0x6e, 0x15, 0xd0, 0x4c, 0xa6, 0x89, 0xe2, 0x07, 0x58, 0xfe, 0xea, 0xb8];
 
     /// A GPT: a header at block 1 naming `entries` entries of 128 bytes at block 2, and the entries
     /// given, each as (type byte, first, last, name).
@@ -348,7 +353,8 @@ mod tests {
     #[test]
     fn a_gpt_gives_its_entries_in_use_and_its_disk_guid() {
         init_global_heap();
-        let img = gpt_image(4096, 128, &[(0xEF, 2048, 2559, "NITROX_ESP"), (0, 0, 0, ""), (0x83, 2560, 4000, "nitrox-root")]);
+        let img =
+            gpt_image(4096, 128, &[(0xEF, 2048, 2559, "NITROX_ESP"), (0, 0, 0, ""), (0x83, 2560, 4000, "nitrox-root")]);
         let t = img.read().unwrap();
         assert_eq!(t.scheme, Scheme::Gpt { disk_guid: DISK_GUID });
         assert_eq!(t.parts.len(), 2);
@@ -364,14 +370,18 @@ mod tests {
     #[test]
     fn a_gpt_entry_off_the_disk_is_passed_over() {
         init_global_heap();
-        let img = gpt_image(4096, 8, &[
-            (0x83, 2048, 4095, "fits"),
-            (0x83, 2048, 4096, "past"),
-            (0x83, 3000, 2999, "back"),
-            // **Every LBA there could be** (PR #363 review): its count overflows, and must not panic.
-            (0x83, 0, u64::MAX, "all"),
-            (0x83, 1, u64::MAX, "rest"),
-        ]);
+        let img = gpt_image(
+            4096,
+            8,
+            &[
+                (0x83, 2048, 4095, "fits"),
+                (0x83, 2048, 4096, "past"),
+                (0x83, 3000, 2999, "back"),
+                // **Every LBA there could be** (PR #363 review): its count overflows, and must not panic.
+                (0x83, 0, u64::MAX, "all"),
+                (0x83, 1, u64::MAX, "rest"),
+            ],
+        );
         let t = img.read().unwrap();
         assert_eq!(t.parts.len(), 1);
         assert_eq!(t.parts[0].count, 2048, "the last block is the disk's last");

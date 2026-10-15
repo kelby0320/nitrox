@@ -37,12 +37,12 @@
 
 extern crate alloc;
 
+pub mod chooser;
+pub mod click;
 pub mod damage;
 pub mod diff;
 pub mod element;
 pub mod layout;
-pub mod chooser;
-pub mod click;
 pub mod menu;
 pub mod paint;
 pub mod reference;

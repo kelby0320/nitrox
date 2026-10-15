@@ -81,11 +81,9 @@ static mut NEW_DB: [u8; DB_MAX] = [0; DB_MAX];
 /// An admin reply's body — the account list is the long one.
 static mut ADMIN_REPLY: [u8; MSG_LEN - PAYLOAD_OFF - 64] = [0; MSG_LEN - PAYLOAD_OFF - 64];
 
-static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
-    [0; libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
 /// One 24-byte `IoResult` per signalled handle, the handle at offset 0.
-static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
-    [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 static mut CH_OUT0: u64 = 0;
 static mut CH_OUT1: u64 = 0;
 /// The user database, copied from `/system/users` at startup.
@@ -125,8 +123,14 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                WAIT_RESULTS[16],
+                WAIT_RESULTS[17],
+                WAIT_RESULTS[18],
+                WAIT_RESULTS[19],
+                WAIT_RESULTS[20],
+                WAIT_RESULTS[21],
+                WAIT_RESULTS[22],
+                WAIT_RESULTS[23],
             ]),
         )
     };
@@ -178,9 +182,7 @@ fn load_db(root_ns: u64) -> bool {
 /// the server serves on `serve_end`. `None` on failure.
 fn make_channel() -> Option<(u64, u64)> {
     // SAFETY: CH_OUT0/CH_OUT1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0) };
     if cr != 0 {
         return None;
     }
@@ -278,13 +280,7 @@ fn serve_loop(serve_end: u64, mut control: u64) -> ! {
                     n += 1;
                 }
             }
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                n as u64,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             continue;
@@ -294,9 +290,14 @@ fn serve_loop(serve_end: u64, mut control: u64) -> ! {
             // SAFETY: `waited` records were written; `off + 8` stays inside WAIT_RESULTS.
             let h = unsafe {
                 u64::from_le_bytes([
-                    WAIT_RESULTS[off], WAIT_RESULTS[off + 1], WAIT_RESULTS[off + 2],
-                    WAIT_RESULTS[off + 3], WAIT_RESULTS[off + 4], WAIT_RESULTS[off + 5],
-                    WAIT_RESULTS[off + 6], WAIT_RESULTS[off + 7],
+                    WAIT_RESULTS[off],
+                    WAIT_RESULTS[off + 1],
+                    WAIT_RESULTS[off + 2],
+                    WAIT_RESULTS[off + 3],
+                    WAIT_RESULTS[off + 4],
+                    WAIT_RESULTS[off + 5],
+                    WAIT_RESULTS[off + 6],
+                    WAIT_RESULTS[off + 7],
                 ])
             };
             if h == serve_end {
@@ -339,8 +340,7 @@ fn serve_resolve(serve_end: u64) {
     }
     // SAFETY: bounded read-only slice over the payload the kernel just wrote.
     let (op, request_id, ok) = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -400,19 +400,19 @@ fn open_auth_session(serve_end: u64, request_id: u64, admin: bool) {
 fn serve_session(ch: u64) {
     // SAFETY: valid recv out-params (an Authenticate carries no transferred handles).
     let rr = unsafe {
-    syscall4(
-        SYS_CHANNEL_RECV,
-        ch,
-        (&raw mut RECV_MSG) as u64,
-        (&raw mut RECV_HANDLES) as u64,
-        (&raw mut RECV_COUNT) as u64,
-    )
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ch,
+            (&raw mut RECV_MSG) as u64,
+            (&raw mut RECV_HANDLES) as u64,
+            (&raw mut RECV_COUNT) as u64,
+        )
     };
     if rr != 0 {
-    // **A closed peer frees the slot.** Without this a supervisor that exited would hold
-    // one forever, and the set of clients would shrink by one per logout.
-    free_session(ch);
-    return;
+        // **A closed peer frees the slot.** Without this a supervisor that exited would hold
+        // one forever, and the set of clients would shrink by one per logout.
+        free_session(ch);
+        return;
     }
     let serve_end = ch;
     // SAFETY: single-threaded read of the session table.
@@ -429,8 +429,7 @@ fn serve_session(ch: u64) {
     // SAFETY: read the header length + form a bounded read-only slice over RECV_MSG;
     // `USER_DB`/`USER_DB_LEN` are read-only here (written once at startup).
     let (request_id, reply_len, error) = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -686,11 +685,10 @@ fn reply_session_handle(serve_end: u64, request_id: u64, client_end: u64) -> boo
     // SAFETY: REPLY_MSG is a valid buffer; the reply goes at PAYLOAD_OFF and the transferred
     // handle in REPLY_HANDLES[0].
     unsafe {
-        let rs_len =
-            match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
-                Some(n) => n,
-                None => return false,
-            };
+        let rs_len = match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
+            Some(n) => n,
+            None => return false,
+        };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         REPLY_MSG[8] = 1;
         REPLY_HANDLES[0] = client_end;
@@ -715,17 +713,11 @@ fn reply_resolve_error(serve_end: u64, request_id: u64, op: u16, code: i32) {
     let _ = librsproto::error::error_body(&mut body, code, 0, b"");
     // SAFETY: REPLY_MSG is a valid buffer.
     unsafe {
-        let rs_len = match encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            op,
-            request_id,
-            RS_FLAG_REPLY | RS_FLAG_ERROR,
-            &body,
-            0,
-        ) {
-            Some(n) => n,
-            None => return,
-        };
+        let rs_len =
+            match encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body, 0) {
+                Some(n) => n,
+                None => return,
+            };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         REPLY_MSG[8] = 0;
         syscall5(

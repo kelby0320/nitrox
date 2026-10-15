@@ -30,23 +30,21 @@ pub mod syntax;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use alloc::vec;
 use libdraw::geom::{Rect, Size};
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, PointerEvent, RESIZE_BOTTOM,
-    RESIZE_RIGHT, WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
+    WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
-use alloc::vec;
 use libui::chooser::{self, ChooserState};
-use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, center_v, column, dock, docked, fill, mono, padding, row, sized,
-    stack, text, with_spacing,
+    Edge, Element, Insets, center_v, column, dock, docked, fill, mono, padding, row, sized, stack, text, with_spacing,
 };
+use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::widget::{
-    InkRun, PILL_H, STATUS_GAP, TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextAreaState,
-    TextFieldState, Theme as UiTheme, TitleButtons, WINDOW_FRAME_H, WidgetState, button,
-    dialog_frame, pill, resize_grip, scrollbar, status_bar, status_separator, status_text,
-    tab_strip, text_area, text_field, title_bar, window_frame_with_grip,
+    InkRun, PILL_H, STATUS_GAP, TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextAreaState, TextFieldState, Theme as UiTheme,
+    TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, pill, resize_grip, scrollbar, status_bar,
+    status_separator, status_text, tab_strip, text_area, text_field, title_bar, window_frame_with_grip,
 };
 
 /// The status bar's height in pixels — one row of chrome along the window's foot since the
@@ -93,11 +91,8 @@ pub const AREA_PANE_KEY: u64 = 25;
 /// being different faces is a caret that lands further from the pointer the further into the
 /// line it goes, and nothing about the press looks wrong — so the pair is named here and
 /// `the_buffer_is_drawn_in_the_style_the_caret_is_measured_in` pins that the view agrees.
-pub const BUFFER_STYLE: libui::element::TextStyle = libui::element::TextStyle {
-    size: libui::element::TextSize::Body,
-    bold: false,
-    mono: true,
-};
+pub const BUFFER_STYLE: libui::element::TextStyle =
+    libui::element::TextStyle { size: libui::element::TextSize::Body, bold: false, mono: true };
 
 /// The document's own key inside the area's dock — see [`AREA_KEY`].
 ///
@@ -171,8 +166,8 @@ pub const CONFIRM_KEEP_KEY: u64 = 14;
 /// moved down to [`libui::widget`] where both dialogs share one table. What stays here is what
 /// this dialog *says*.
 pub use libui::widget::{
-    DIALOG_BUTTON_CY as CONFIRM_BUTTON_CY, DIALOG_H as CONFIRM_H, DIALOG_LEFT_CX,
-    DIALOG_RIGHT_CX, DIALOG_W as CONFIRM_W,
+    DIALOG_BUTTON_CY as CONFIRM_BUTTON_CY, DIALOG_H as CONFIRM_H, DIALOG_LEFT_CX, DIALOG_RIGHT_CX,
+    DIALOG_W as CONFIRM_W,
 };
 
 /// The window's size in pixels at startup, before any manager places it.
@@ -877,10 +872,7 @@ impl App {
     /// buffer. Panicking here would be a `no_std` client dying in front of somebody, so it falls
     /// back to the first — a wrong buffer is recoverable and a dead editor is not.
     fn buf(&self) -> &Buffer {
-        self.buffers
-            .iter()
-            .find(|b| b.key == self.current)
-            .unwrap_or(&self.buffers[0])
+        self.buffers.iter().find(|b| b.key == self.current).unwrap_or(&self.buffers[0])
     }
 
     /// The current buffer, mutably. See [`buf`](Self::buf) for why this cannot be `None`.
@@ -906,11 +898,7 @@ impl App {
         self.buffers
             .iter()
             .map(|b| {
-                let name = if b.name.is_empty() {
-                    String::from("untitled")
-                } else {
-                    b.name.clone()
-                };
+                let name = if b.name.is_empty() { String::from("untitled") } else { b.name.clone() };
                 (b.key, name, b.modified())
             })
             .collect()
@@ -1030,10 +1018,7 @@ impl App {
     pub fn position_text(&self) -> String {
         let t = &self.buf().text;
         let (line, col) = t.cursor();
-        let chars = t
-            .lines()
-            .get(line)
-            .map_or(0, |l| l.get(..col).map_or(0, |head| head.chars().count()));
+        let chars = t.lines().get(line).map_or(0, |l| l.get(..col).map_or(0, |head| head.chars().count()));
         alloc::format!("line {}, col {}", line + 1, chars + 1)
     }
 
@@ -1442,9 +1427,7 @@ impl App {
         // **buffer**, and while a field is open the buffer is not what is being addressed — a
         // `Ctrl+S` mid-name would ask to save the thing that has no name yet, which is exactly
         // what is already being answered.
-        if k.modifiers & MOD_CTRL != 0
-            && matches!(k.keycode, NEW_TAB_KEYCODE | CLOSE_TAB_KEYCODE)
-        {
+        if k.modifiers & MOD_CTRL != 0 && matches!(k.keycode, NEW_TAB_KEYCODE | CLOSE_TAB_KEYCODE) {
             if k.keycode == NEW_TAB_KEYCODE {
                 self.update(Msg::NewTab);
             } else {
@@ -1477,8 +1460,7 @@ impl App {
                     // **Owned**, so the field's borrow ends here rather than spanning the
                     // buffer work below. `TextFieldState::text` hands back a `&str` into the
                     // field, which is exactly the borrow that must not be alive.
-                    let typed: String =
-                        self.field.as_ref().map(|(_, f)| String::from(f.text())).unwrap_or_default();
+                    let typed: String = self.field.as_ref().map(|(_, f)| String::from(f.text())).unwrap_or_default();
                     match which {
                         Field::Naming => {
                             let name = typed.trim().to_string();
@@ -1499,11 +1481,8 @@ impl App {
                         Field::Finding => {
                             let hit = self.buf_mut().text.find(&typed);
                             let line = self.buf().text.cursor().0;
-                            self.status = if hit {
-                                alloc::format!("found {typed}")
-                            } else {
-                                alloc::format!("no {typed}")
-                            };
+                            self.status =
+                                if hit { alloc::format!("found {typed}") } else { alloc::format!("no {typed}") };
                             self.find_report = Some(hit.then_some(line));
                         }
                         // **The first stage answers with a needle and finds it**, so the person
@@ -1619,9 +1598,7 @@ impl App {
     /// one count, and a test walks the whole bar through it.
     pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
         let n = self.menu_count();
-        self.menus.set_anchors(
-            (0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect(),
-        );
+        self.menus.set_anchors((0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect());
     }
 
     /// How many menus the bar has — **derived from the table, never declared**.
@@ -1657,11 +1634,7 @@ impl App {
                 title: "File",
                 items: vec![
                     act(Item::new("New Tab", Accel::ctrl(NEW_TAB_KEYCODE, "T"), Msg::NewTab)),
-                    act(Item::new(
-                        "Close Tab",
-                        Accel::ctrl(CLOSE_TAB_KEYCODE, "W"),
-                        Msg::CloseTab(self.current),
-                    )),
+                    act(Item::new("Close Tab", Accel::ctrl(CLOSE_TAB_KEYCODE, "W"), Msg::CloseTab(self.current))),
                     Item::Separator,
                     // **Enabled on a clean buffer too.** Saving one is a no-op on disk, but an
                     // untitled buffer is "dirty or not" independently of whether it has a path,
@@ -1670,17 +1643,9 @@ impl App {
                     // visible; this is not.
                     act(Item::new("Open…", Accel::ctrl(OPEN_KEYCODE, "O"), Msg::OpenFile)),
                     act(Item::new("Save", Accel::ctrl(SAVE_KEYCODE, "S"), Msg::Save)),
-                    act(Item::new(
-                        "Save As…",
-                        Accel::ctrl_shift(SAVE_AS_KEYCODE, "S"),
-                        Msg::SaveAs,
-                    )),
+                    act(Item::new("Save As…", Accel::ctrl_shift(SAVE_AS_KEYCODE, "S"), Msg::SaveAs)),
                     Item::Separator,
-                    act(Item::new(
-                        "New Window",
-                        Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"),
-                        Msg::NewWindow,
-                    )),
+                    act(Item::new("New Window", Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"), Msg::NewWindow)),
                     Item::Separator,
                     act(Item::plain("Close Window", Msg::Close)),
                     act(Item::new("Quit", Accel::ctrl(QUIT_KEYCODE, "Q"), Msg::Quit)),
@@ -1692,10 +1657,8 @@ impl App {
                     act(Item::new("Undo", Accel::ctrl(UNDO_KEYCODE, "Z"), Msg::Undo)),
                     act(Item::new("Redo", Accel::ctrl(REDO_KEYCODE, "Y"), Msg::Redo)),
                     Item::Separator,
-                    Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::Cut)
-                        .enabled(free && has_selection),
-                    Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::Copy)
-                        .enabled(free && has_selection),
+                    Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::Cut).enabled(free && has_selection),
+                    Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::Copy).enabled(free && has_selection),
                     act(Item::new("Paste", Accel::ctrl(PASTE_KEYCODE, "V"), Msg::Paste)),
                     // **Offered whenever the buffer holds anything**, which is not the same as
                     // "there is a selection": making one is what this row is for.
@@ -1707,16 +1670,8 @@ impl App {
                         .enabled(free && self.buf().text.lines().iter().any(|l| !l.is_empty())),
                     Item::Separator,
                     act(Item::new("Find", Accel::ctrl(FIND_KEYCODE, "F"), Msg::Find)),
-                    act(Item::new(
-                        "Replace\u{2026}",
-                        Accel::ctrl(REPLACE_KEYCODE, "H"),
-                        Msg::Replace,
-                    )),
-                    act(Item::new(
-                        "Go to Line\u{2026}",
-                        Accel::ctrl(GO_TO_KEYCODE, "G"),
-                        Msg::GoTo,
-                    )),
+                    act(Item::new("Replace\u{2026}", Accel::ctrl(REPLACE_KEYCODE, "H"), Msg::Replace)),
+                    act(Item::new("Go to Line\u{2026}", Accel::ctrl(GO_TO_KEYCODE, "G"), Msg::GoTo)),
                 ],
             },
         ]
@@ -1807,8 +1762,8 @@ impl App {
     /// Answers whether anything changed, so the caller can decide to redraw.
     pub fn take_area_pointer(&mut self, width: impl Fn(&str) -> u32) -> bool {
         let Some(p) = self.area_pointer.take() else { return false };
-        let pressed = p.kind == librsproto::surface::POINTER_BUTTON
-            && p.flags & librsproto::surface::POINTER_PRESSED != 0;
+        let pressed =
+            p.kind == librsproto::surface::POINTER_BUTTON && p.flags & librsproto::surface::POINTER_PRESSED != 0;
         let dragging = p.kind == librsproto::surface::POINTER_MOTION && p.buttons & 1 != 0;
         if !pressed && !dragging {
             return false;
@@ -1846,9 +1801,7 @@ impl App {
         let menus = self.menu_table();
         match menus.get(which) {
             Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
-            None => {
-                libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui)
-            }
+            None => libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui),
         }
     }
 
@@ -2163,9 +2116,7 @@ impl App {
         // covers the *bar*. Subtracting it left a 16-pixel band of bare window face between the
         // document and the bar, and one line of the file that the window had room for and did
         // not show. `nxfiles::list_h` dropped it in Part I for the same reason.
-        self.window.h.saturating_sub(
-            TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + STATUS_H + WINDOW_FRAME_H,
-        )
+        self.window.h.saturating_sub(TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + STATUS_H + WINDOW_FRAME_H)
     }
 
     /// What the title bar shows: the file's name, marked when the buffer differs from the disk.
@@ -2178,17 +2129,9 @@ impl App {
         if self.buf().name.is_empty() {
             // **Named for what it is, not left blank.** A window whose title bar says nothing
             // reads as a window that failed to load something.
-            return if self.modified() {
-                String::from("* untitled")
-            } else {
-                String::from("untitled")
-            };
+            return if self.modified() { String::from("* untitled") } else { String::from("untitled") };
         }
-        if self.modified() {
-            alloc::format!("* {}", self.buf().name)
-        } else {
-            self.buf().name.clone()
-        }
+        if self.modified() { alloc::format!("* {}", self.buf().name) } else { self.buf().name.clone() }
     }
 
     /// The element tree for the current state.
@@ -2202,7 +2145,6 @@ impl App {
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
     pub fn view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-
         let title = title_bar(
             &self.title(),
             // The design names the kind of window beside the file it holds.
@@ -2243,12 +2185,7 @@ impl App {
             status_separator(&ui),
             mono(status_text(self.position_text(), &ui)),
         ]);
-        let strip = status_bar(
-            reading.key(STATUS_KEY),
-            Some(position.key(POSITION_KEY)),
-            Edge::Top,
-            &ui,
-        );
+        let strip = status_bar(reading.key(STATUS_KEY), Some(position.key(POSITION_KEY)), Edge::Top, &ui);
 
         // **The tab strip, drawn whatever the count.** A strip that appeared with the second
         // tab would move everything below it the moment a file was dropped in — the window's
@@ -2256,11 +2193,7 @@ impl App {
         let tabs: Vec<(u64, String, bool)> = self.tabs();
         let items: Vec<libui::widget::Tab<'_>> = tabs
             .iter()
-            .map(|(k, name, marked)| libui::widget::Tab {
-                key: *k,
-                label: name.as_str(),
-                marked: *marked,
-            })
+            .map(|(k, name, marked)| libui::widget::Tab { key: *k, label: name.as_str(), marked: *marked })
             .collect();
         // **The file's own controls ride on the tab strip** (desktop refresh, Part J), which is
         // where the design puts them: how big the buffer is, and the one action that changes it.
@@ -2269,12 +2202,7 @@ impl App {
             sized(Size::new(STATUS_GAP, 0), text("")).key(BYTES_GAP_KEY),
             center_v(sized(
                 Size::new(0, PILL_H),
-                pill(
-                    "Save",
-                    Msg::Save,
-                    WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() },
-                    &ui,
-                ),
+                pill("Save", Msg::Save, WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() }, &ui,),
             ))
             .key(SAVE_KEY),
         ]);
@@ -2309,17 +2237,9 @@ impl App {
         // The chrome around it stays proportional — `mono` wraps what is inside it and nothing
         // else, which is how a window comes to be painted in two faces at once.
         let area = mono(
-            text_area(
-                &mut self.buf_mut().text,
-                h,
-                ROW_H,
-                focused,
-                &ink,
-                Some(Msg::AreaPointer),
-                &ui,
-            )
-            .on_drop(Msg::Dropped)
-            .on_wheel(Msg::AreaWheel),
+            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ink, Some(Msg::AreaPointer), &ui)
+                .on_drop(Msg::Dropped)
+                .on_wheel(Msg::AreaWheel),
         );
         // **The line-number gutter** (desktop refresh, Part J): 36 pixels on `face_hover` with a
         // rule down its right edge, the numbers right-aligned a little clear of it in the dim
@@ -2365,10 +2285,7 @@ impl App {
             Size::new(GUTTER_W, 0),
             stack(alloc::vec![
                 fill(ui.face_hover),
-                dock(
-                    alloc::vec![docked(Edge::Right, sized(Size::new(1, 0), fill(ui.border)))],
-                    text(""),
-                ),
+                dock(alloc::vec![docked(Edge::Right, sized(Size::new(1, 0), fill(ui.border)))], text(""),),
                 padding(
                     Insets { top: libui::widget::TEXT_AREA_PAD.top, right: 0, bottom: 0, left: 0 },
                     column(numbers),
@@ -2423,17 +2340,14 @@ impl App {
                         )
                         .key(BAR_KEY),
                     ),
-                    docked(
-                        Edge::Top,
-                        sized(Size::new(0, TAB_STRIP_H), strip_tabs).key(TAB_STRIP_KEY),
-                    ),
+                    docked(Edge::Top, sized(Size::new(0, TAB_STRIP_H), strip_tabs).key(TAB_STRIP_KEY),),
                     // **At the foot since Part J**, where it was under the chrome: a status bar
                     // is a floor, and the design draws it along the bottom of the window.
                     docked(Edge::Bottom, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY)),
                 ],
-            // Sized to the height it was built for, like every scrolling widget in this tree:
-            // the dock's flex child otherwise gets whatever is left, and the widget would build
-            // rows for one height and be drawn at another.
+                // Sized to the height it was built for, like every scrolling widget in this tree:
+                // the dock's flex child otherwise gets whatever is left, and the widget would build
+                // rows for one height and be drawn at another.
                 sized(Size::new(0, h), area).key(AREA_KEY),
             ),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
@@ -2466,11 +2380,7 @@ impl App {
             // M8's overview shipped three of, and `title_bar` draws only the buttons it is given
             // a message for. Closing the question is *keep editing* — the dialog's own frame
             // must not be a third way to discard a buffer.
-            TitleButtons {
-                minimise: None,
-                maximise: None,
-                close: Some(Msg::KeepEditing),
-            },
+            TitleButtons { minimise: None, maximise: None, close: Some(Msg::KeepEditing) },
             hovered,
             ui,
         )
@@ -2483,15 +2393,10 @@ impl App {
             Some(Closing::Tab(k)) => self.buffers.iter().find(|b| b.key == k),
             _ => Some(self.buf()),
         };
-        let name = subject
-            .map(|b| if b.name.is_empty() { "untitled" } else { b.name.as_str() })
-            .unwrap_or("untitled");
+        let name = subject.map(|b| if b.name.is_empty() { "untitled" } else { b.name.as_str() }).unwrap_or("untitled");
         let question = padding(
             Insets::all(libui::widget::DIALOG_PAD),
-            column(alloc::vec![
-                text("Discard unsaved changes?"),
-                text(String::from(name)),
-            ]),
+            column(alloc::vec![text("Discard unsaved changes?"), text(String::from(name)),]),
         )
         .key(CONFIRM_TEXT_KEY);
 
@@ -2504,14 +2409,7 @@ impl App {
         // obvious third, and it is not a button: an untitled buffer has nowhere to save to, so
         // it is the naming field's flow and then a close. See `deferred-decisions.md`.
         let answer = |label: &str, msg: Msg, key: u64| {
-            button(
-                label,
-                msg,
-                WidgetState { hovered: hovered == Some(key), ..Default::default() },
-                ui,
-            )
-            .key(key)
-            .flex(1)
+            button(label, msg, WidgetState { hovered: hovered == Some(key), ..Default::default() }, ui).key(key).flex(1)
         };
         let buttons = with_spacing(
             row(alloc::vec![
@@ -2747,12 +2645,8 @@ mod tests {
             };
             // Exactly the first row, so the second line's ink cannot be mistaken for it.
             let band = (doc.origin.y as u32, doc.origin.y as u32 + ROW_H);
-            let number = foot_ink(
-                gutter.origin.x as u32,
-                (gutter.origin.x + gutter.size.w as i32) as u32 - 2,
-                band.0,
-                band.1,
-            );
+            let number =
+                foot_ink(gutter.origin.x as u32, (gutter.origin.x + gutter.size.w as i32) as u32 - 2, band.0, band.1);
             let line = foot_ink(doc.origin.x as u32 + 4, doc.origin.x as u32 + 60, band.0, band.1);
             let number = number.expect("a number is drawn");
             let line = line.expect("a line is drawn");
@@ -2767,8 +2661,7 @@ mod tests {
             // body size like the lines they number — the design's are — so this asserts the
             // rule rather than one of its consequences (PR #321 review, worth fixing 3).
             fn scaled_inside<M>(e: &Element<M>) -> bool {
-                matches!(e.node, libui::element::Node::Scale { .. })
-                    || e.children().any(scaled_inside)
+                matches!(e.node, libui::element::Node::Scale { .. }) || e.children().any(scaled_inside)
             }
             fn keyed<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
                 if e.key == Some(key) {
@@ -2777,10 +2670,7 @@ mod tests {
                 e.children().find_map(|c| keyed(c, key))
             }
             let g = keyed(&e, GUTTER_KEY).expect("the gutter is keyed");
-            assert!(
-                !scaled_inside(g),
-                "a number set at another step than its line, at font_px {font_px}"
-            );
+            assert!(!scaled_inside(g), "a number set at another step than its line, at font_px {font_px}");
         }
     }
 
@@ -2800,16 +2690,8 @@ mod tests {
         let l = libui::layout::layout(&e, Rect::new(0, 0, 600, 400), &CELL);
         let at = |key: u64| libui::layout::locate(&e, &l, key).expect("keyed");
         let (area, strip, gutter) = (at(AREA_KEY), at(STRIP_KEY), at(GUTTER_KEY));
-        assert_eq!(
-            area.origin.y + area.size.h as i32,
-            strip.origin.y,
-            "the document stops short of the status bar"
-        );
-        assert_eq!(
-            gutter.origin.y + gutter.size.h as i32,
-            strip.origin.y,
-            "and so does the gutter's own column"
-        );
+        assert_eq!(area.origin.y + area.size.h as i32, strip.origin.y, "the document stops short of the status bar");
+        assert_eq!(gutter.origin.y + gutter.size.h as i32, strip.origin.y, "and so does the gutter's own column");
         // The grip still sits over chrome rather than over a row: it is in the bar's band.
         let grip = at(GRIP_KEY);
         assert!(
@@ -2827,8 +2709,7 @@ mod tests {
     #[test]
     fn the_gutter_numbers_the_lines_that_are_showing() {
         let mut a = App::new("/home/long.txt", "/home");
-        let body: String =
-            (1..=40).map(|n| alloc::format!("line {n}\n")).collect::<Vec<_>>().concat();
+        let body: String = (1..=40).map(|n| alloc::format!("line {n}\n")).collect::<Vec<_>>().concat();
         a.loaded(&body, body.as_bytes());
         // Tall enough to show a dozen lines: the default window fits one, and a gutter with one
         // number in it cannot say whether it follows the scroll.
@@ -2867,11 +2748,7 @@ mod tests {
         let visible = top.len();
         a.buf_mut().text.scroll_to(10, visible);
         let scrolled = numbers(&mut a);
-        assert_eq!(
-            scrolled.first().map(String::as_str),
-            Some("11"),
-            "ten lines down, the gutter starts at eleven"
-        );
+        assert_eq!(scrolled.first().map(String::as_str), Some("11"), "ten lines down, the gutter starts at eleven");
         // **And it stops at the end of the file rather than numbering past it** — the buffer's
         // own count, which is 41 here because a file ending in a newline has an empty last line.
         let lines = a.buf().text.lines().len();
@@ -2882,10 +2759,7 @@ mod tests {
             Some(alloc::format!("{lines}").as_str()),
             "the last number is the last line"
         );
-        assert!(
-            last.len() <= visible,
-            "and the gutter does not number past the end: {last:?}"
-        );
+        assert!(last.len() <= visible, "and the gutter does not number past the end: {last:?}");
         // **A file shorter than the window**, which is the case that actually exercises the
         // guard and the common one (PR #321 review, worth fixing 4): scrolling a long file
         // clamps the offset, so the visible rows never run past the last line and an
@@ -2928,10 +2802,7 @@ mod tests {
         // too. Searching from there, this assertion was satisfied by the gutter, and deleting
         // the wrapper from the document left all 103 tests passing.
         let area = keyed(&e, AREA_INNER_KEY).expect("the document is keyed");
-        assert!(
-            has_mono(area),
-            "the document is not drawn in the face the caret is measured in"
-        );
+        assert!(has_mono(area), "the document is not drawn in the face the caret is measured in");
         // **And the gutter is outside it**, which is what makes the search above mean the
         // document: if the two ever nest, this test goes back to passing for the wrong reason.
         assert!(
@@ -3021,10 +2892,7 @@ mod tests {
         let theme = UiTheme::default();
         use libui::layout::Metrics as _;
         let m = libui::paint::FontMetrics::new(&face, theme.font_px);
-        let in_buffer = libui::element::TextStyle {
-            mono: true,
-            ..libui::element::TextStyle::default()
-        };
+        let in_buffer = libui::element::TextStyle { mono: true, ..libui::element::TextStyle::default() };
         // A line of `i`s and `m`s: in the fixed-advance face they are the same width, and in the
         // proportional one an `m` is more than twice an `i`. Pressing past the `i`s is what
         // separates the two.
@@ -3083,15 +2951,7 @@ mod tests {
         let mut tree = libui::diff::Tree::new();
         tree.update(&e, &l).expect("diffable");
         let mut r = libui::route::Router::new();
-        let p = librsproto::surface::PointerEvent {
-            kind,
-            button: 0x110,
-            buttons,
-            flags,
-            x,
-            y,
-            ..Default::default()
-        };
+        let p = librsproto::surface::PointerEvent { kind, button: 0x110, buttons, flags, x, y, ..Default::default() };
         for m in r.pointer(&tree, &e, &l, p).0 {
             a.update(m);
         }
@@ -3122,8 +2982,14 @@ mod tests {
 
         let (ox, oy) = area_origin(&mut a);
         // Four characters into the second row.
-        area_event(&mut a, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED, 1,
-                   ox + 6 + 4 * 8, oy + 4 + ROW_H as i32);
+        area_event(
+            &mut a,
+            librsproto::surface::POINTER_BUTTON,
+            librsproto::surface::POINTER_PRESSED,
+            1,
+            ox + 6 + 4 * 8,
+            oy + 4 + ROW_H as i32,
+        );
         assert_eq!(a.buf().text.cursor(), (1, 4), "the press did not move the caret");
         assert!(a.buf().text.selection().is_none(), "a press selects nothing");
     }
@@ -3137,11 +3003,7 @@ mod tests {
         let y = oy + 4;
         area_event(&mut a, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED, 1, ox + 6, y);
         area_event(&mut a, librsproto::surface::POINTER_MOTION, 0, 1, ox + 6 + 5 * 8, y);
-        assert_eq!(
-            a.buf().text.selected_text().as_deref(),
-            Some("hello"),
-            "the drag did not select from the press"
-        );
+        assert_eq!(a.buf().text.selected_text().as_deref(), Some("hello"), "the drag did not select from the press");
 
         // A motion with nothing held is a hover, and must not move anything.
         let before = a.buf().text.cursor();
@@ -3175,7 +3037,10 @@ mod tests {
             ..Default::default()
         };
         let mid = bar.origin.y + bar.size.h as i32 / 2;
-        for m in r.pointer(&tree, &e, &l, at(mid, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED)).0 {
+        for m in r
+            .pointer(&tree, &e, &l, at(mid, librsproto::surface::POINTER_BUTTON, librsproto::surface::POINTER_PRESSED))
+            .0
+        {
             a.update(m);
         }
         assert!(a.buf().text.offset() > 0, "a press on the bar's middle scrolled nowhere");
@@ -3215,11 +3080,7 @@ mod tests {
         // come back to it, which is what every editor does.
         type_into(&mut a, "a");
         a.buf_mut().text.ensure_visible(visible);
-        assert_eq!(
-            a.buf().text.offset(),
-            0,
-            "the character went into a line the person cannot see"
-        );
+        assert_eq!(a.buf().text.offset(), 0, "the character went into a line the person cannot see");
 
         // And moving the caret does the same, even without changing its line.
         a.buf_mut().text.scroll_to(142, visible);
@@ -3267,11 +3128,7 @@ mod tests {
         assert!(scrolled > 0, "the press on the bar scrolled nowhere");
 
         frame(&mut a, &mut tree);
-        assert_eq!(
-            a.buf().text.offset(),
-            scrolled,
-            "the repaint put the document back where its caret is"
-        );
+        assert_eq!(a.buf().text.offset(), scrolled, "the repaint put the document back where its caret is");
     }
 
     // ---- syntax highlighting (M14 Part G) ----
@@ -3305,10 +3162,7 @@ mod tests {
     fn ink_of(a: &mut App) -> Vec<(usize, String, libdraw::format::Rgb)> {
         let ui = UiTheme::default();
         let lines: Vec<String> = a.buf().text.lines().to_vec();
-        a.ink(&ui, 40)
-            .iter()
-            .map(|r| (r.line, String::from(&lines[r.line][r.start..r.end]), r.colour))
-            .collect()
+        a.ink(&ui, 40).iter().map(|r| (r.line, String::from(&lines[r.line][r.start..r.end]), r.colour)).collect()
     }
 
     #[test]
@@ -3358,9 +3212,7 @@ mod tests {
     fn opening_a_block_comment_recolours_the_lines_below_the_edit() {
         let ui = UiTheme::default();
         let mut a = coloured("lib.rs", "\nlet a = 1;\nlet b = 2;\n");
-        let keywords = |a: &mut App| {
-            ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count()
-        };
+        let keywords = |a: &mut App| ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count();
         assert_eq!(keywords(&mut a), 2, "precondition: two `let`s are coloured");
 
         // Type `/*` at the very start, which is where the cursor is.
@@ -3421,18 +3273,12 @@ mod tests {
     #[test]
     fn a_pasted_block_comment_recolours_the_lines_below_it() {
         let ui = UiTheme::default();
-        let keywords = |a: &mut App| {
-            ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count()
-        };
+        let keywords = |a: &mut App| ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count();
         let mut a = coloured("lib.rs", "let a = 1;\nlet b = 2;\n");
         assert_eq!(keywords(&mut a), 2, "precondition: a frame has been drawn");
 
         a.pasted("/*\n", 0, 1);
-        assert_eq!(
-            keywords(&mut a),
-            0,
-            "the lines below the paste kept the colours they had before it"
-        );
+        assert_eq!(keywords(&mut a), 0, "the lines below the paste kept the colours they had before it");
 
         // **A paste that adds no line, below the top**, which is the case the fallback alone
         // cannot answer: with the line count unchanged the scan may exit at the first state
@@ -3469,9 +3315,7 @@ mod tests {
     #[test]
     fn an_edit_that_says_nothing_about_where_it_landed_still_recolours_below_itself() {
         let ui = UiTheme::default();
-        let keywords = |a: &mut App| {
-            ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count()
-        };
+        let keywords = |a: &mut App| ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count();
         let mut a = coloured("lib.rs", "fn f() {\nx\n    let a = 1;\n}\n");
         assert_eq!(keywords(&mut a), 2, "precondition: `fn` and `let`");
 
@@ -3495,9 +3339,7 @@ mod tests {
     fn inserting_a_line_above_a_block_comment_does_not_shift_the_cache_under_it() {
         let ui = UiTheme::default();
         let mut a = coloured("lib.rs", "let a = 1;\n/*\nstill\n*/\n");
-        let closer = |a: &mut App| {
-            ink_of(a).iter().filter(|(_, t, c)| t == "*/" && *c == ui.syntax_comment).count()
-        };
+        let closer = |a: &mut App| ink_of(a).iter().filter(|(_, t, c)| t == "*/" && *c == ui.syntax_comment).count();
         assert_eq!(closer(&mut a), 1, "precondition: the closer is part of the comment");
 
         press_key(&mut a, libkern::abi::KEY_ENTER);
@@ -3713,11 +3555,7 @@ mod tests {
         let mut a = app();
         key(&mut a, SAVE_KEYCODE, MOD_CTRL);
         assert_eq!(a.text(), "hello", "nothing was typed");
-        assert_eq!(
-            a.take_save().map(|(_, _, t)| t).as_deref(),
-            Some("hello"),
-            "and a save is owed"
-        );
+        assert_eq!(a.take_save().map(|(_, _, t)| t).as_deref(), Some("hello"), "and a save is owed");
 
         // **A digit, because a letter proves nothing here.** `libinput`'s keymap folds
         // `Ctrl`+letter to a control byte, which `TextAreaState::apply` already declines — so a
@@ -3963,11 +3801,7 @@ mod tests {
         let mut a = app();
         a.loaded("one\ntwo\nthree", b"one\ntwo\nthree");
         a.update(Msg::SelectAll);
-        assert_eq!(
-            a.buf().text.selected_text().as_deref(),
-            Some("one\ntwo\nthree"),
-            "every line, including the last"
-        );
+        assert_eq!(a.buf().text.selected_text().as_deref(), Some("one\ntwo\nthree"), "every line, including the last");
 
         // **An empty buffer selects nothing** — and this holds without a guard in `SelectAll`,
         // because `TextAreaState::selection` returns `None` for a collapsed range. The guard that
@@ -3986,11 +3820,7 @@ mod tests {
         let mut c = app();
         c.loaded("one\néxy", "one\néxy".as_bytes());
         c.update(Msg::SelectAll);
-        assert_eq!(
-            c.buf().text.selected_text().as_deref(),
-            Some("one\néxy"),
-            "the last character is not dropped"
-        );
+        assert_eq!(c.buf().text.selected_text().as_deref(), Some("one\néxy"), "the last character is not dropped");
     }
 
     /// Replace asks what, then with what, and each Enter takes the next match.
@@ -4221,19 +4051,11 @@ mod tests {
             // clipboard and save outboxes, which is the only way to see them. Calling it twice
             // on one editor reports the second call's emptiness as a difference — which is what
             // the first version of this test did, and it read as "Save changes nothing".
-            let (by_row, by_chord, untouched) =
-                (digest(&mut by_row), digest(&mut by_chord), digest(&mut untouched));
-            assert_eq!(
-                by_chord, by_row,
-                "{label}: {} does not do what choosing the row does",
-                acc.label()
-            );
+            let (by_row, by_chord, untouched) = (digest(&mut by_row), digest(&mut by_chord), digest(&mut untouched));
+            assert_eq!(by_chord, by_row, "{label}: {} does not do what choosing the row does", acc.label());
             // **The negative control**: the two agreeing is only evidence if the row moved
             // something. An editor that ignored both would pass the assertion above.
-            assert_ne!(
-                by_row, untouched,
-                "{label} changes nothing, so this row proves nothing about routing"
-            );
+            assert_ne!(by_row, untouched, "{label} changes nothing, so this row proves nothing about routing");
         }
         assert_eq!(checked, 16, "every row but Close Window carries a chord");
     }
@@ -4752,14 +4574,8 @@ mod tests {
             r.pointer(&tree, &ui, &l, at(0, 0)).0
         };
 
-        assert_eq!(
-            click(&mut router, DIALOG_LEFT_CX, CONFIRM_BUTTON_CY),
-            alloc::vec![Msg::Discard],
-        );
-        assert_eq!(
-            click(&mut router, DIALOG_RIGHT_CX, CONFIRM_BUTTON_CY),
-            alloc::vec![Msg::KeepEditing],
-        );
+        assert_eq!(click(&mut router, DIALOG_LEFT_CX, CONFIRM_BUTTON_CY), alloc::vec![Msg::Discard],);
+        assert_eq!(click(&mut router, DIALOG_RIGHT_CX, CONFIRM_BUTTON_CY), alloc::vec![Msg::KeepEditing],);
     }
 
     #[test]
@@ -4865,17 +4681,11 @@ mod tests {
         a.update(Msg::OpenFile);
         let _ = a.take_chooser_list();
         // More rows than the dialog shows, or the offset clamps straight back to zero.
-        a.show_chooser(
-            "/home",
-            (0..60).map(|i| (alloc::format!("f{i}.txt"), false)).collect(),
-        );
+        a.show_chooser("/home", (0..60).map(|i| (alloc::format!("f{i}.txt"), false)).collect());
 
         let ui = a.chooser_view(&UiTheme::default(), None);
-        let l = libui::layout::layout(
-            &ui,
-            Rect::new(0, 0, libui::chooser::CHOOSER_W, libui::chooser::CHOOSER_H),
-            &CELL,
-        );
+        let l =
+            libui::layout::layout(&ui, Rect::new(0, 0, libui::chooser::CHOOSER_W, libui::chooser::CHOOSER_H), &CELL);
         let mut tree = libui::diff::Tree::new();
         tree.update(&ui, &l).expect("the chooser is diffable");
         let mut router = libui::route::Router::new();
@@ -4891,10 +4701,7 @@ mod tests {
         for m in msgs {
             a.update(m);
         }
-        assert_eq!(
-            a.chooser().expect("still open").state.list.offset,
-            libui::click::WHEEL_UNITS as usize,
-        );
+        assert_eq!(a.chooser().expect("still open").state.list.offset, libui::click::WHEEL_UNITS as usize,);
     }
 
     /// The chooser can leave the directory it opened in.
@@ -4940,11 +4747,7 @@ mod tests {
 
         a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_BACKSPACE, 1, 0));
         assert_eq!(a.take_chooser_list(), None, "saving navigated instead of editing");
-        assert_eq!(
-            a.chooser().expect("open").state.name.text().len(),
-            before.len() - 1,
-            "the name was not edited"
-        );
+        assert_eq!(a.chooser().expect("open").state.name.text().len(), before.len() - 1, "the name was not edited");
     }
 
     /// Opening walks into directories and answers with a file.
@@ -4953,10 +4756,7 @@ mod tests {
         let mut a = app();
         a.update(Msg::OpenFile);
         let _ = a.take_chooser_list();
-        a.show_chooser("/home", alloc::vec![
-            (String::from("papers"), true),
-            (String::from("notes.txt"), false),
-        ]);
+        a.show_chooser("/home", alloc::vec![(String::from("papers"), true), (String::from("notes.txt"), false),]);
 
         // A directory row asks for its listing rather than answering.
         a.update(Msg::ChooserRow(CHOOSER_ROW_KEY));
@@ -5005,10 +4805,7 @@ mod tests {
         let mut a = app();
         a.update(Msg::OpenFile);
         let _ = a.take_chooser_list();
-        a.show_chooser("/home", alloc::vec![
-            (String::from("papers"), true),
-            (String::from("notes.txt"), false),
-        ]);
+        a.show_chooser("/home", alloc::vec![(String::from("papers"), true), (String::from("notes.txt"), false),]);
 
         // Arrow onto the directory and press Enter.
         a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_DOWN, 1, 0));
@@ -5039,8 +4836,7 @@ mod tests {
     #[test]
     fn the_chooser_reads_the_keyboard_itself() {
         let ev = |code: u16, pressed: u16| KeyEvent::new(1, code, pressed, 0);
-        let listing =
-            || alloc::vec![(String::from("a.txt"), false), (String::from("b.txt"), false)];
+        let listing = || alloc::vec![(String::from("a.txt"), false), (String::from("b.txt"), false)];
 
         // Nothing to drive when nothing is being chosen — and *false*, so a caller can tell that
         // the key is still its own.
@@ -5118,5 +4914,4 @@ mod tests {
             a.menus.close();
         }
     }
-
 }

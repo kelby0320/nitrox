@@ -33,8 +33,8 @@ extern crate alloc;
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::{
-    RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
-    syscall2, syscall4, syscall5,
+    RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4,
+    syscall5,
 };
 use librsproto::surface::{CreateWindowRequest, KeyEvent, PointerEvent, Role};
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
@@ -150,25 +150,14 @@ fn po_wait(po: u64) -> (i32, u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     let waited = unsafe {
         WAIT_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     if waited != 1 {
         return (-1, 0);
     }
     // SAFETY: the kernel filled one 24-byte result record.
     unsafe {
-        let st = i32::from_le_bytes([
-            WAIT_RESULTS[8],
-            WAIT_RESULTS[9],
-            WAIT_RESULTS[10],
-            WAIT_RESULTS[11],
-        ]);
+        let st = i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
         let res = u64::from_le_bytes([
             WAIT_RESULTS[16],
             WAIT_RESULTS[17],
@@ -212,14 +201,7 @@ impl Stream {
     /// Resolve `/dev/input/new`, which mints a per-consumer channel.
     fn open(root_ns: u64) -> Option<Self> {
         let channel = lookup(root_ns, b"/dev/input/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT)?;
-        Some(Self {
-            channel,
-            msg: [0; 4096],
-            handles: [0; 8],
-            count: 0,
-            start_requested: false,
-            timed_out: false,
-        })
+        Some(Self { channel, msg: [0; 4096], handles: [0; 8], count: 0, start_requested: false, timed_out: false })
     }
 
     /// Sum the relative motion **between a button press and its release**.
@@ -259,13 +241,7 @@ impl Stream {
             // SAFETY: waiting on this process's own channel handle.
             let waited = unsafe {
                 WAIT_HANDLES[0] = self.channel;
-                syscall4(
-                    SYS_WAIT,
-                    (&raw const WAIT_HANDLES) as u64,
-                    1,
-                    (&raw mut WAIT_RESULTS) as u64,
-                    deadline,
-                )
+                syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
             };
             if waited != 1 {
                 return (dx, dy, announced, widest); // quiet for long enough
@@ -286,8 +262,7 @@ impl Stream {
             if rr != 0 {
                 return (dx, dy, announced, widest);
             }
-            let payload_len =
-                u32::from_le_bytes([self.msg[4], self.msg[5], self.msg[6], self.msg[7]]) as usize;
+            let payload_len = u32::from_le_bytes([self.msg[4], self.msg[5], self.msg[6], self.msg[7]]) as usize;
             let req = &self.msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(4096 - PAYLOAD_OFF)];
             let Ok(m) = librsproto::decode(req) else { return (dx, dy, announced, widest) };
             if m.op != librsproto::OP_INPUT_EVENTS {
@@ -327,14 +302,7 @@ impl Stream {
             // SAFETY: waiting on this process's own channel handle.
             let waited = unsafe {
                 WAIT_HANDLES[0] = self.channel;
-                syscall5(
-                    SYS_WAIT,
-                    (&raw const WAIT_HANDLES) as u64,
-                    1,
-                    (&raw mut WAIT_RESULTS) as u64,
-                    deadline,
-                    0,
-                )
+                syscall5(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline, 0)
             };
             if waited != 1 {
                 self.timed_out = deadline_ns(0) >= deadline;
@@ -356,8 +324,7 @@ impl Stream {
             if rr != 0 {
                 return None;
             }
-            let payload_len =
-                u32::from_le_bytes([self.msg[4], self.msg[5], self.msg[6], self.msg[7]]) as usize;
+            let payload_len = u32::from_le_bytes([self.msg[4], self.msg[5], self.msg[6], self.msg[7]]) as usize;
             let req = &self.msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(4096 - PAYLOAD_OFF)];
             let Ok(m) = librsproto::decode(req) else { return None };
             if m.op != librsproto::OP_INPUT_EVENTS {
@@ -609,10 +576,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                     // A held key repeating. Reported separately from a press so the gate can
                     // tell them apart — a client counting presses must not count a held key
                     // forever, which is the whole reason the value is distinct.
-                    Line::new()
-                        .s(b"input-testclient: win repeat code=")
-                        .u(k.keycode as u64)
-                        .end();
+                    Line::new().s(b"input-testclient: win repeat code=").u(k.keycode as u64).end();
                 }
                 // ...and through the toolkit, which is the part Part B is about.
                 if let Some(Msg::Key(rk)) = router.key(&tree, &view, k) {
@@ -653,10 +617,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                                 .end();
                         }
                         Msg::Wheel(rp) => {
-                            Line::new()
-                                .s(b"input-testclient: widget wheel dz=")
-                                .i(rp.wheel as i64)
-                                .end();
+                            Line::new().s(b"input-testclient: widget wheel dz=").i(rp.wheel as i64).end();
                         }
                         Msg::Key(_) => {}
                     }
@@ -752,9 +713,7 @@ const IDLE_LIMIT_NS: u64 = 20_000_000_000;
 /// An absolute monotonic deadline `ns` from now.
 fn deadline_ns(ns: u64) -> u64 {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    unsafe {
-        syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64)
-    };
+    unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
     // SAFETY: the kernel wrote the ns count.
     unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns)
 }
@@ -786,14 +745,7 @@ fn wait_event_before(
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
         let waited = unsafe {
             WAIT_HANDLES[0] = h;
-            syscall5(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                deadline,
-                0,
-            )
+            syscall5(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline, 0)
         };
         if waited < 1 {
             return None; // the deadline passed
@@ -813,14 +765,7 @@ fn sleep_ns(notif: u64, ns: u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     unsafe {
         WAIT_HANDLES[0] = notif;
-        syscall5(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            deadline,
-            0,
-        );
+        syscall5(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline, 0);
     }
 }
 

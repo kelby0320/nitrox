@@ -47,11 +47,10 @@ use libkern::debug::Line;
 use libkern::device::DeviceKind;
 use libkern::error::KError;
 use libkern::{
-    CLOCK_MONOTONIC, IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_RECV,
-    RIGHT_SEND, RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV,
-    SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE,
-    SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4,
-    syscall5,
+    CLOCK_MONOTONIC, IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_RECV, RIGHT_SEND,
+    RIGHT_WAIT, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ,
+    SYS_HANDLE_CLOSE, SYS_IO_SUBMIT, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT,
+    exit, kprint, syscall2, syscall4, syscall5,
 };
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::{OP_INPUT_LIGHTS, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -144,10 +143,8 @@ static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi:
 static mut RECV_COUNT: u64 = 0;
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
-static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
-    [0; libkern::abi::MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
-    [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 
 /// Close `h` if it is a handle at all.
 fn close(h: u64) {
@@ -186,9 +183,7 @@ impl Device {
             return None;
         }
         // SAFETY: a fresh `MemoryObject` handle with full MAP rights.
-        let addr = unsafe {
-            syscall4(SYS_MEMORY_MAP, buf_h as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-        };
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, buf_h as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
         if addr <= 0 {
             close(buf_h as u64);
             close(node);
@@ -307,13 +302,7 @@ fn wait_one(h: u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers for one waiter.
     unsafe {
         WAIT_HANDLES[0] = h;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        );
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
     }
 }
 
@@ -333,25 +322,14 @@ fn po_completion(po: u64) -> (i32, u64) {
     // SAFETY: one waiter, valid buffers; a completed PO is already signalled.
     let n = unsafe {
         WAIT_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            0,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, 0)
     };
     if n != 1 {
         return (-1, 0);
     }
     // SAFETY: the kernel wrote one 24-byte result record.
     unsafe {
-        let st = i32::from_le_bytes([
-            WAIT_RESULTS[8],
-            WAIT_RESULTS[9],
-            WAIT_RESULTS[10],
-            WAIT_RESULTS[11],
-        ]);
+        let st = i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
         let res = u64::from_le_bytes([
             WAIT_RESULTS[16],
             WAIT_RESULTS[17],
@@ -370,15 +348,8 @@ fn po_completion(po: u64) -> (i32, u64) {
 /// serve_end)`.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(
-            SYS_CHANNEL_CREATE,
-            (&raw mut CTRL_OUT0) as u64,
-            (&raw mut CTRL_OUT1) as u64,
-            depth,
-            0,
-        )
-    };
+    let cr =
+        unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, depth, 0) };
     if cr != 0 {
         return None;
     }
@@ -392,8 +363,7 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
     let Some(body_len) = librsproto::meta::ready(&mut body, b"input-server") else { return false };
     // SAFETY: SEND_MSG is a valid buffer; the rsproto message goes at PAYLOAD_OFF.
     let rs_len = unsafe {
-        match encode(&mut SEND_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1)
-        {
+        match encode(&mut SEND_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1) {
             Some(n) => n,
             None => return false,
         }
@@ -422,8 +392,7 @@ fn reply_session(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     }
     // SAFETY: SEND_MSG/SEND_HANDLES are valid; one handle rides the reply.
     unsafe {
-        let Some(rs_len) =
-            encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
+        let Some(rs_len) = encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
         else {
             return false;
         };
@@ -488,8 +457,7 @@ fn send_events(channel: u64, events: &[InputEvent]) -> bool {
     }
     // SAFETY: SEND_MSG is valid; no handles transferred.
     unsafe {
-        let Some(rs_len) =
-            encode(&mut SEND_MSG[PAYLOAD_OFF..], librsproto::OP_INPUT_EVENTS, 0, 0, &body[..n], 0)
+        let Some(rs_len) = encode(&mut SEND_MSG[PAYLOAD_OFF..], librsproto::OP_INPUT_EVENTS, 0, 0, &body[..n], 0)
         else {
             return false;
         };
@@ -873,17 +841,14 @@ fn serve_forward(serve_end: u64, srv: &mut Server) -> bool {
     }
     // SAFETY: bounded read of the payload, then of the resolve's suffix.
     let (request_id, is_new, ok) = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
         );
         match decode(req) {
             Ok(m) if m.op == OP_NS_RESOLVE => {
-                let suffix = librsproto::namespace::parse_resolve_request(m.body)
-                    .map(|r| r.suffix)
-                    .unwrap_or(b"");
+                let suffix = librsproto::namespace::parse_resolve_request(m.body).map(|r| r.suffix).unwrap_or(b"");
                 // **The empty suffix is the match**, not `b"new"`. This server is bound
                 // at the *leaf* `/dev/input/new`, so a resolve of that path arrives with
                 // nothing left over. The compositor's `b"new"` check looks similar and is
@@ -956,13 +921,7 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                 Some(t) => t.saturating_add(FLUSH_INTERVAL_NS),
                 None => u64::MAX,
             };
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                n as u64,
-                (&raw mut WAIT_RESULTS) as u64,
-                deadline,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, deadline)
         };
         if waited < 1 {
             // **A timeout is the flush pass**, not an error: the deadline above is set only

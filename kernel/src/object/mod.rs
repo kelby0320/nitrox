@@ -42,9 +42,7 @@ pub use entropy_object::EntropyObject;
 pub use file_object::{BlockRun, FileObject, Forgotten, PageState, Producer, Reserve};
 pub use header::{KObjectHeader, ObjectRef};
 pub use interrupt_object::InterruptObject;
-pub use ipc_channel::{
-    BlockSendOutcome, IpcChannel, ReclaimedSend, RecvState, SendOutcome, StoredMsg, TransferRef,
-};
+pub use ipc_channel::{BlockSendOutcome, IpcChannel, ReclaimedSend, RecvState, SendOutcome, StoredMsg, TransferRef};
 pub use kernel_server::{KernelServerId, OpStatus};
 pub use memory_object::MemoryObject;
 pub use namespace::{BindingTarget, Namespace, NsError, ResolvedTarget};

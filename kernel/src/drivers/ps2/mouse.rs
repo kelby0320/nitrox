@@ -179,11 +179,9 @@ impl Decoder {
             }
         };
 
-        for (now, was, code) in [
-            (p.left, prev.left, BTN_LEFT),
-            (p.right, prev.right, BTN_RIGHT),
-            (p.middle, prev.middle, BTN_MIDDLE),
-        ] {
+        for (now, was, code) in
+            [(p.left, prev.left, BTN_LEFT), (p.right, prev.right, BTN_RIGHT), (p.middle, prev.middle, BTN_MIDDLE)]
+        {
             if now != was {
                 push(InputEvent::key(code, if now { KEY_PRESS } else { KEY_RELEASE }, time_ns), &mut n);
             }

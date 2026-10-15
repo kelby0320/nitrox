@@ -24,14 +24,14 @@ use alloc::vec::Vec;
 use libdraw::format::Rgb;
 use libdraw::geom::Size;
 use libui::element::{
-    Element, IconKind, Insets, TextSize, center, center_v, column, fill, icon, ink, padding,
-    rounded_fill, row, scaled, sized, stack, text, wash, with_spacing,
+    Element, IconKind, Insets, TextSize, center, center_v, column, fill, icon, ink, padding, rounded_fill, row, scaled,
+    sized, stack, text, wash, with_spacing,
 };
 use libui::layout::{Constraints, Metrics, measure};
 use libui::menu::{Item, Menu, MenuState, popup, popup_headed};
 use libui::widget::{
-    CONTROL_RADIUS, DIALOG_GAP, DIALOG_PAD, TextFieldState, Theme, TitleButtons, WidgetState, button,
-    dialog_frame, popup_frame, text_field, title_bar,
+    CONTROL_RADIUS, DIALOG_GAP, DIALOG_PAD, TextFieldState, Theme, TitleButtons, WidgetState, button, dialog_frame,
+    popup_frame, text_field, title_bar,
 };
 
 use crate::ending::{Ending, Refusal};
@@ -144,10 +144,7 @@ pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &T
         padding(
             APPS_PAD,
             with_spacing(
-                row(alloc::vec![
-                    center_v(dot),
-                    center_v(scaled(TextSize::Large, text("Applications"))),
-                ]),
+                row(alloc::vec![center_v(dot), center_v(scaled(TextSize::Large, text("Applications"))),]),
                 APPS_GAP,
             ),
         ),
@@ -155,9 +152,8 @@ pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &T
     .on_press(TopMsg::Menu(APPS))
     .key(APPS_KEY);
     let words = center_v(scaled(TextSize::Large, text("Places")));
-    let places = face(lit(PLACES_KEY, PLACES), padding(PLACES_PAD, words))
-        .on_press(TopMsg::Menu(PLACES))
-        .key(PLACES_KEY);
+    let places =
+        face(lit(PLACES_KEY, PLACES), padding(PLACES_PAD, words)).on_press(TopMsg::Menu(PLACES)).key(PLACES_KEY);
 
     // **Above the rule, not over it**: a lit word's wash would otherwise run across the rule's
     // pixel and break the line under it.
@@ -173,10 +169,8 @@ pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &T
         above_rule,
         row(alloc::vec![apps, places, sized(Size::new(0, 0), text("")).flex(1).key(REST_KEY), power]),
     );
-    let rule = column(alloc::vec![
-        sized(Size::new(0, 0), text("")).flex(1),
-        sized(Size::new(0, 1), fill(theme.border)),
-    ]);
+    let rule =
+        column(alloc::vec![sized(Size::new(0, 0), text("")).flex(1), sized(Size::new(0, 1), fill(theme.border)),]);
     // **Centred on the screen, not on what the words leave** — a layer of its own spanning the
     // bar, which is what the balancing slot the old bar carried was approximating. Beneath the
     // words in the stack, so a press over the clock lands on the empty stretch rather than on a
@@ -287,8 +281,7 @@ pub fn menu_view(
     if which == APPS {
         // **Active whenever the menu is up**: the popup holds the keyboard, and every key the
         // menu does not claim is the field's.
-        let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, theme)
-            .key(FILTER_KEY);
+        let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, theme).key(FILTER_KEY);
         sized(Size::new(APPS_MENU_W, 0), popup_headed(menu, state, ROW_KEY_BASE, hovered, field, theme))
     } else {
         popup(menu, state, ROW_KEY_BASE, hovered, theme)
@@ -302,14 +295,8 @@ pub fn menu_view(
 /// naming a desktop.
 pub fn name_prompt(name: &TextFieldState, theme: &Theme) -> Element<()> {
     let field = text_field(name, false, WidgetState { active: true, ..Default::default() }, theme);
-    let body = with_spacing(
-        column(alloc::vec![ink(theme.foreground_dim, text("Name this desktop")), field]),
-        6,
-    );
-    sized(
-        Size::new(PROMPT_W, 0),
-        popup_frame(padding(Insets { top: 8, right: 12, bottom: 10, left: 12 }, body), theme),
-    )
+    let body = with_spacing(column(alloc::vec![ink(theme.foreground_dim, text("Name this desktop")), field]), 6);
+    sized(Size::new(PROMPT_W, 0), popup_frame(padding(Insets { top: 8, right: 12, bottom: 10, left: 12 }, body), theme))
 }
 
 /// Where the menu at `which` hangs, in the top bar's coordinates — which, the bar being at the
@@ -361,17 +348,12 @@ pub fn ending_dialog(
     theme: &Theme,
 ) -> Element<EndingMsg> {
     let buttons = TitleButtons { minimise: None, maximise: None, close: Some(EndingMsg::Cancel) };
-    let bar = title_bar(ending.title(), None, true, EndingMsg::Nothing, buttons, hovered, theme)
-        .key(ENDING_TITLE_KEY);
-    let lines = padding(
-        Insets::all(DIALOG_PAD),
-        column(alloc::vec![text(question.0.clone()), text(question.1.clone())]),
-    )
-    .key(ENDING_TEXT_KEY);
+    let bar = title_bar(ending.title(), None, true, EndingMsg::Nothing, buttons, hovered, theme).key(ENDING_TITLE_KEY);
+    let lines =
+        padding(Insets::all(DIALOG_PAD), column(alloc::vec![text(question.0.clone()), text(question.1.clone())]))
+            .key(ENDING_TEXT_KEY);
     let answer = |label: &'static str, msg: EndingMsg, key: u64| {
-        button(label, msg, WidgetState { hovered: hovered == Some(key), ..Default::default() }, theme)
-            .key(key)
-            .flex(1)
+        button(label, msg, WidgetState { hovered: hovered == Some(key), ..Default::default() }, theme).key(key).flex(1)
     };
     let answers = with_spacing(
         row(alloc::vec![
@@ -407,18 +389,12 @@ pub const REFUSAL_CLOSE_KEY: u64 = 213;
 /// lines, and **Close**. A report, not a question, so it has one answer, in the right-hand half
 /// where the waiting dialog's Cancel is — `DIALOG_RIGHT_CX` names it — and closing the frame means
 /// the same. Hung where the waiting dialog is, under the power button.
-pub fn refusal_dialog(
-    ending: Ending,
-    refusal: &Refusal,
-    hovered: Option<u64>,
-    theme: &Theme,
-) -> Element<RefusalMsg> {
+pub fn refusal_dialog(ending: Ending, refusal: &Refusal, hovered: Option<u64>, theme: &Theme) -> Element<RefusalMsg> {
     let buttons = TitleButtons { minimise: None, maximise: None, close: Some(RefusalMsg::Close) };
-    let bar = title_bar(ending.title(), None, true, RefusalMsg::Nothing, buttons, hovered, theme)
-        .key(REFUSAL_TITLE_KEY);
+    let bar =
+        title_bar(ending.title(), None, true, RefusalMsg::Nothing, buttons, hovered, theme).key(REFUSAL_TITLE_KEY);
     let (first, second) = refusal.lines(ending);
-    let lines =
-        padding(Insets::all(DIALOG_PAD), column(alloc::vec![text(first), text(second)])).key(REFUSAL_TEXT_KEY);
+    let lines = padding(Insets::all(DIALOG_PAD), column(alloc::vec![text(first), text(second)])).key(REFUSAL_TEXT_KEY);
     let close = button(
         "Close",
         RefusalMsg::Close,
@@ -615,21 +591,14 @@ pub fn bottom_bar(
     // The glyph: a 12×9 window, its top edge three pixels thick.
     let glyph = sized(
         Size::new(12, 9),
-        stack(alloc::vec![
-            fill(fg),
-            padding(Insets { top: 3, right: 1, bottom: 1, left: 1 }, fill(bg)),
-        ]),
+        stack(alloc::vec![fill(fg), padding(Insets { top: 3, right: 1, bottom: 1, left: 1 }, fill(bg)),]),
     );
     let mut sd = boxed(Some(bd), Some(bg), CONTROL_RADIUS, theme.panel);
     sd.push(center(glyph));
-    let show = center_v(sized(Size::new(SHOW_W, CONTROL_H), stack(sd)))
-        .on_press(BottomMsg::ShowDesktop)
-        .key(SHOW_KEY);
-    let rule = center_v(padding(
-        Insets { top: 0, right: 3, bottom: 0, left: 3 },
-        sized(Size::new(1, 18), fill(line_soft)),
-    ))
-    .key(RULE_KEY);
+    let show = center_v(sized(Size::new(SHOW_W, CONTROL_H), stack(sd))).on_press(BottomMsg::ShowDesktop).key(SHOW_KEY);
+    let rule =
+        center_v(padding(Insets { top: 0, right: 3, bottom: 0, left: 3 }, sized(Size::new(1, 18), fill(line_soft))))
+            .key(RULE_KEY);
 
     let mut items = alloc::vec![show, rule];
     for t in tasks {
@@ -665,24 +634,17 @@ pub fn bottom_bar(
             ),
         ));
         items.push(
-            center_v(sized(Size::new(TASK_W, CONTROL_H), stack(layers)))
-                .on_press(BottomMsg::Task(t.id))
-                .key(key),
+            center_v(sized(Size::new(TASK_W, CONTROL_H), stack(layers))).on_press(BottomMsg::Task(t.id)).key(key),
         );
     }
     items.push(sized(Size::new(0, 0), text("")).flex(1).key(SPREAD_KEY));
     items.push(switcher(desktops, hovered, theme).key(SWITCHER_KEY));
 
-    let rule_top = column(alloc::vec![
-        sized(Size::new(0, 1), fill(theme.border)),
-        sized(Size::new(0, 0), text("")).flex(1),
-    ]);
+    let rule_top =
+        column(alloc::vec![sized(Size::new(0, 1), fill(theme.border)), sized(Size::new(0, 0), text("")).flex(1),]);
     stack(alloc::vec![
         rule_top,
-        padding(
-            Insets { top: 1, right: BAR_PAD_X, bottom: 0, left: BAR_PAD_X },
-            with_spacing(row(items), BAR_GAP),
-        ),
+        padding(Insets { top: 1, right: BAR_PAD_X, bottom: 0, left: BAR_PAD_X }, with_spacing(row(items), BAR_GAP),),
     ])
 }
 
@@ -733,9 +695,7 @@ fn switcher(d: &Desktops<'_>, hovered: Option<u64>, theme: &Theme) -> Element<Bo
         );
     }
     let name_ink = if hovered == Some(NAME_KEY) { theme.accent } else { theme.foreground };
-    let name = padding(NAME_PAD, center_v(ink(name_ink, text(d.label))))
-        .on_press(BottomMsg::Overview)
-        .key(NAME_KEY);
+    let name = padding(NAME_PAD, center_v(ink(name_ink, text(d.label)))).on_press(BottomMsg::Overview).key(NAME_KEY);
 
     let parts = with_spacing(
         row(alloc::vec![
@@ -758,11 +718,11 @@ mod tests {
     use super::*;
     use libdraw::geom::Rect;
     use libdraw::text::Font;
+    use librsproto::surface::{POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED, PointerEvent};
     use libui::diff::Tree;
     use libui::layout::{layout, locate};
     use libui::paint::FontMetrics;
     use libui::route::Router;
-    use librsproto::surface::{POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED, PointerEvent};
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
 
@@ -851,8 +811,7 @@ mod tests {
             // The press lands well inside the word, not against an edge of it.
             let bar = top_bar("12:34", None, None, &theme);
             let l = layout(&bar, Rect::new(0, 0, 1360, BAR_H), &m);
-            let aims =
-                [(APPS_CLICK, APPS_KEY, "APPS_CLICK"), (PLACES_CLICK, PLACES_KEY, "PLACES_CLICK")];
+            let aims = [(APPS_CLICK, APPS_KEY, "APPS_CLICK"), (PLACES_CLICK, PLACES_KEY, "PLACES_CLICK")];
             for (aim, key, what) in aims {
                 let w = locate(&bar, &l, key).expect("the word");
                 let (left, right) = (w.origin.x, w.origin.x + w.size.w as i32);
@@ -1072,7 +1031,9 @@ mod tests {
         let m = FontMetrics::new(&f, theme.font_px);
         let bounds = Rect::new(0, 0, 1360, BAR_H);
         let mut tree = Tree::new();
-        for (open, hovered) in [(None, None), (None, Some(APPS_KEY)), (Some(APPS), None), (Some(PLACES), Some(PLACES_KEY)), (None, None)] {
+        for (open, hovered) in
+            [(None, None), (None, Some(APPS_KEY)), (Some(APPS), None), (Some(PLACES), Some(PLACES_KEY)), (None, None)]
+        {
             let bar = top_bar("12:34", open, hovered, &theme);
             let l = layout(&bar, bounds, &m);
             assert!(tree.update(&bar, &l).is_ok(), "the bar stopped diffing at {open:?}/{hovered:?}");
@@ -1125,9 +1086,7 @@ mod tests {
             .items
             .iter()
             .filter_map(|it| match it {
-                Item::Action { label, hint, swatch, .. } => {
-                    Some((label.as_ref(), hint.as_deref(), *swatch))
-                }
+                Item::Action { label, hint, swatch, .. } => Some((label.as_ref(), hint.as_deref(), *swatch)),
                 _ => None,
             })
             .collect();
@@ -1213,9 +1172,7 @@ mod tests {
     // --- the bottom bar -------------------------------------------------------------------------
 
     fn tasks(n: usize) -> Vec<Task<'static>> {
-        (0..n)
-            .map(|i| Task { id: 10 + i as u32, title: "nxterm", focused: i == 0, minimized: false })
-            .collect()
+        (0..n).map(|i| Task { id: 10 + i as u32, title: "nxterm", focused: i == 0, minimized: false }).collect()
     }
 
     /// The plan's rule: `min(3, total)` cells, the current one in the middle where it can be.
@@ -1311,11 +1268,7 @@ mod tests {
                 // …and from the second desktop, named `Desktop 2`, the first cell and the back arrow.
                 let d = Desktops { occupied: &occupied, current: 1, label: "Desktop 2" };
                 let bar = bottom_bar(&[], false, &d, None, &theme);
-                assert_eq!(
-                    click(&bar, bounds, &m, w - FIRST_CELL_FROM_RIGHT, y),
-                    [BottomMsg::Desktop(0)],
-                    "{width}"
-                );
+                assert_eq!(click(&bar, bounds, &m, w - FIRST_CELL_FROM_RIGHT, y), [BottomMsg::Desktop(0)], "{width}");
             }
         }
     }
@@ -1386,8 +1339,10 @@ mod tests {
         let mut lit = Vec::new();
         fills(&bottom_bar(&[], true, &d, None, &theme), &mut lit);
         let soft = theme.accent.blend(theme.panel, theme.scheme.hover_coverage());
-        assert!(lit.iter().filter(|c| **c == theme.accent).count() > quiet.iter().filter(|c| **c == theme.accent).count(),
-            "show-desktop is lit in the accent while it is holding windows");
+        assert!(
+            lit.iter().filter(|c| **c == theme.accent).count() > quiet.iter().filter(|c| **c == theme.accent).count(),
+            "show-desktop is lit in the accent while it is holding windows"
+        );
         assert!(lit.contains(&soft) && quiet.contains(&theme.face_hover));
     }
 

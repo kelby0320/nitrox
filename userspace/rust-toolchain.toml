@@ -12,8 +12,8 @@
 # The rule is therefore narrowed, not abandoned: **no nightly language or library
 # features** — no `#![feature(...)]` anywhere, enforced by `cargo xtask
 # check-nightly` — and a nightly toolchain *solely* to rebuild the sysroot for a
-# custom target. The kernel and tools workspaces have no toolchain file and stay
-# on stable.
+# custom target. The kernel and tools build on the exact stable the root
+# `rust-toolchain.toml` names.
 #
 # Pinned exactly, not floating: an unpinned `nightly` would make every build a
 # fresh roll of the dice on compiler regressions. Bump deliberately.

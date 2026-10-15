@@ -78,12 +78,7 @@ impl Timer {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Timer),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(TimerInner {
-                deadline_ns: 0,
-                interval_ns: 0,
-                in_heap: false,
-                waiters,
-            }),
+            inner: UnsafeCell::new(TimerInner { deadline_ns: 0, interval_ns: 0, in_heap: false, waiters }),
         })
     }
 
@@ -206,10 +201,7 @@ impl Drop for Timer {
     /// the assert documents that invariant. The `KVec` storage frees with the
     /// `KBox`.
     fn drop(&mut self) {
-        debug_assert!(
-            self.inner.get_mut().waiters.is_empty(),
-            "Timer dropped with live waiters"
-        );
+        debug_assert!(self.inner.get_mut().waiters.is_empty(), "Timer dropped with live waiters");
     }
 }
 
@@ -232,9 +224,7 @@ mod tests {
             assert_eq!(Timer::interval(obj), 0);
             assert!(!Timer::in_heap(obj));
             assert!(!Timer::already_signaled(obj, u64::MAX));
-            drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(
-                obj as *mut Timer,
-            )));
+            drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Timer)));
         }
     }
 
@@ -251,9 +241,7 @@ mod tests {
             assert!(Timer::already_signaled(obj, 1001));
             Timer::set_armed(obj, 0, 0); // disarm
             assert!(!Timer::already_signaled(obj, u64::MAX));
-            drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(
-                obj as *mut Timer,
-            )));
+            drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Timer)));
         }
     }
 
@@ -263,8 +251,7 @@ mod tests {
         let obj = KBox::into_raw(Timer::try_new().unwrap()).as_ptr() as *mut ();
         // SAFETY: live Timer, single-threaded test.
         unsafe {
-            let ths: [*mut (); Timer::MAX_WAITERS] =
-                core::array::from_fn(|i| (0x1000 + i) as *mut ());
+            let ths: [*mut (); Timer::MAX_WAITERS] = core::array::from_fn(|i| (0x1000 + i) as *mut ());
             for &t in &ths {
                 assert!(Timer::add_waiter(obj, t).is_ok());
             }
@@ -280,9 +267,7 @@ mod tests {
             // Empty after drain (so Drop's assert holds).
             let mut buf2 = [core::ptr::null_mut(); Timer::MAX_WAITERS];
             assert_eq!(Timer::take_waiters(obj, &mut buf2), 0);
-            drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(
-                obj as *mut Timer,
-            )));
+            drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Timer)));
         }
     }
 

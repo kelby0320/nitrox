@@ -128,11 +128,7 @@ const fn fabricated_sp(top: u64) -> u64 {
 /// `on_cpu` byte. Passing anything else corrupts the stack and is undefined
 /// behaviour.
 #[unsafe(naked)]
-pub unsafe extern "C" fn context_switch(
-    prev_sp_slot: *mut u64,
-    next_sp: u64,
-    prev_on_cpu: *mut u8,
-) {
+pub unsafe extern "C" fn context_switch(prev_sp_slot: *mut u64, next_sp: u64, prev_on_cpu: *mut u8) {
     // SAFETY: naked — no prologue/epilogue; every register effect is
     // written explicitly. Reached only via a normal `call` from
     // `sched::yield_now`/`exit`, so on entry SysV holds: rdi is a live,
@@ -240,9 +236,7 @@ pub unsafe fn fabricate_frame(top: u64, trampoline: u64) -> ArchThreadContext {
         core::ptr::write(p.sub(6), 0); // r14
         core::ptr::write(p.sub(7), 0); // r15
     }
-    ArchThreadContext {
-        sp: fabricated_sp(top),
-    }
+    ArchThreadContext { sp: fabricated_sp(top) }
 }
 
 #[cfg(test)]

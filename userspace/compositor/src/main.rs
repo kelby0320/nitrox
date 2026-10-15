@@ -34,30 +34,26 @@ extern crate alloc;
 
 use compositor::Screen;
 use compositor::input::InputRouter;
-use compositor::outbox::{MgrEvent, MgrOutbox, Outbound, Outbox};
 use compositor::manager::{self, MgrOutcome};
+use compositor::outbox::{MgrEvent, MgrOutbox, Outbound, Outbox};
 use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch};
 use compositor::{BufferSource, WindowStack};
 use libdraw::format::Rgb;
 use libdraw::framebuffer::RawFramebuffer;
 use libdraw::geom::{Point, Rect};
 use libinput::Interpreter;
-use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::abi::CLOCK_MONOTONIC;
-use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ,
-    SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint,
-    syscall2,
-    syscall4, syscall5,
-};
+use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::error::KError;
+use libkern::{
+    SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE,
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
+};
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
-    ConfigureEvent, FocusEvent, KeyEvent, MgrCapture, OP_ATTACH_BUFFER, OP_CONFIGURE,
-    OP_FOCUS_EVENT, OP_KEY_EVENT, OP_MGR_CAPTURE,
-    OP_POINTER_EVENT,
-    OP_RELEASE, PointerEvent,
+    ConfigureEvent, FocusEvent, KeyEvent, MgrCapture, OP_ATTACH_BUFFER, OP_CONFIGURE, OP_FOCUS_EVENT, OP_KEY_EVENT,
+    OP_MGR_CAPTURE, OP_POINTER_EVENT, OP_RELEASE, PointerEvent,
 };
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
@@ -153,12 +149,10 @@ static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 /// therefore let any client with a session overrun this static by 32 bytes into whatever
 /// the linker placed next, by sending eight transfers (PR #175 review, finding 1). Every
 /// other resource server in the tree already sizes it this way.
-static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] =
-    [0; libkern::abi::IPC_HANDLE_MAX];
+static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
 static mut RECV_COUNT: u64 = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] =
-    [0; libkern::abi::IPC_HANDLE_MAX];
+static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
 /// The manager's channel, or `0` when nobody is managing.
 ///
@@ -202,10 +196,8 @@ const CONFIGURE_DEADLINE_NS: u64 = 200_000_000;
 /// rejections before a churn probe buried every other service's output. A wedged client with
 /// a key held at repeat rate is tens of lines a second on a shared console.
 const MAX_LOGGED_OVERFLOWS: u32 = 8;
-static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
-    [0; libkern::abi::MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
-    [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 
 /// A client buffer the compositor has mapped.
 struct MappedBuffer {
@@ -342,15 +334,8 @@ fn now_ns() -> u64 {
 /// Create a connected channel pair with a `depth`-slot ring each. Returns `(a, b)`.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(
-            SYS_CHANNEL_CREATE,
-            (&raw mut CTRL_OUT0) as u64,
-            (&raw mut CTRL_OUT1) as u64,
-            depth,
-            0,
-        )
-    };
+    let cr =
+        unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, depth, 0) };
     if cr != 0 {
         return None;
     }
@@ -364,8 +349,7 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
     let Some(body_len) = librsproto::meta::ready(&mut body, b"compositor") else { return false };
     // SAFETY: REPLY_MSG is a valid buffer; the rsproto message goes at PAYLOAD_OFF.
     let rs_len = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1)
-        {
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1) {
             Some(n) => n,
             None => return false,
         }
@@ -399,8 +383,7 @@ fn reply_session(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid; one handle rides the reply.
     unsafe {
-        let Some(rs_len) =
-            encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
         else {
             return false;
         };
@@ -455,9 +438,7 @@ fn reply_resolve_error(serve_end: u64, request_id: u64, err: KError) -> bool {
 fn reply_on_session(session: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
     // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
     unsafe {
-        let Some(rs_len) =
-            encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY, body, 0)
-        else {
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY, body, 0) else {
             return false;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -779,13 +760,7 @@ fn drain_stack_events(srv: &mut Server) {
         // just below; a rectangle for a window that no longer exists is not.
         let Some(w) = srv.stack.window(window) else { continue };
         let b = w.bounds();
-        let ev = ConfigureEvent {
-            window,
-            width: b.size.w,
-            height: b.size.h,
-            x: b.origin.x,
-            y: b.origin.y,
-        };
+        let ev = ConfigureEvent { window, width: b.size.w, height: b.size.h, x: b.origin.x, y: b.origin.y };
         mgr_emit(srv, MgrEvent::Geometry(ev));
     }
     for window in srv.stack.take_removed() {
@@ -853,12 +828,8 @@ fn fire_configure_deadlines(srv: &mut Server, screen: &mut Screen<RawFramebuffer
         return false;
     }
     let now = now_ns();
-    let due: alloc::vec::Vec<u32> = srv
-        .pending_configure
-        .iter()
-        .filter(|&&(_, at)| at <= now)
-        .map(|&(w, _)| w)
-        .collect();
+    let due: alloc::vec::Vec<u32> =
+        srv.pending_configure.iter().filter(|&&(_, at)| at <= now).map(|&(w, _)| w).collect();
     let fired = !due.is_empty();
     for window in due {
         let mut l = Line::new();
@@ -909,9 +880,8 @@ fn unserialisable(what: &[u8]) -> bool {
 /// Send one queued manager event. `false` if the channel would not take it.
 fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     use librsproto::surface::{
-        MgrHotkey, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY, OP_MGR_WINDOW_CREATED,
-        OP_MGR_WINDOW_DESTROYED, OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
-        OP_MGR_WINDOW_TITLE,
+        MgrHotkey, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
+        OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_TITLE,
     };
     // Sized **from the types**, not from the byte counts the spec publishes — the same rule
     // `send_outbound` states and for the same reason: widening `PointerEvent` left a
@@ -959,9 +929,7 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
         MgrEvent::StateRequest(s) => {
             let mut body = [0u8; core::mem::size_of::<librsproto::surface::WindowState>()];
             match s.write(&mut body) {
-                Some(n) => {
-                    send_input(ch, librsproto::surface::OP_MGR_WINDOW_STATE_REQUEST, &body[..n])
-                }
+                Some(n) => send_input(ch, librsproto::surface::OP_MGR_WINDOW_STATE_REQUEST, &body[..n]),
                 None => unserialisable(b"WindowStateRequest"),
             }
         }
@@ -1050,14 +1018,7 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
             // drift: a sender that can emit more than a receiver can take is a record that
             // vanishes on delivery, which is what PR #260's review found here.
             let mut body = [0u8; MAX_EVENT_BODY];
-            let ev = DroppedEvent {
-                window: *window,
-                kind: *kind,
-                x: *x,
-                y: *y,
-                acceptor_len: 0,
-                path_len: 0,
-            };
+            let ev = DroppedEvent { window: *window, kind: *kind, x: *x, y: *y, acceptor_len: 0, path_len: 0 };
             match ev.write(&mut body, acceptor.as_bytes(), path.as_bytes(), name.as_bytes()) {
                 Some(n) => send_input(ch, OP_DROPPED, &body[..n]),
                 // Unreachable with the caps enforced at both edges — and reported rather than
@@ -1071,13 +1032,7 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
         }
         Outbound::Configure { window, width, height, x, y } => {
             let mut body = [0u8; 20];
-            let ev = ConfigureEvent {
-                window: *window,
-                width: *width,
-                height: *height,
-                x: *x,
-                y: *y,
-            };
+            let ev = ConfigureEvent { window: *window, width: *width, height: *height, x: *x, y: *y };
             match ev.write(&mut body) {
                 Some(_) => send_input(ch, OP_CONFIGURE, &body),
                 None => true,
@@ -1099,10 +1054,9 @@ fn connect_input(root_ns: u64) -> Option<u64> {
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: `/dev/input/new` resolves to a channel endpoint — the input server mints one
     // consumer per resolve, exactly as `/dev/draw/new` mints one session.
-    let ch = block_on(unsafe {
-        ns.lookup::<Resource, Only>("/dev/input/new", Rights::RECV | Rights::SEND | Rights::WAIT)
-    })
-    .ok()?;
+    let ch =
+        block_on(unsafe { ns.lookup::<Resource, Only>("/dev/input/new", Rights::RECV | Rights::SEND | Rights::WAIT) })
+            .ok()?;
     Some(ch.into_raw().0)
 }
 
@@ -1225,8 +1179,7 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
         }
         // SAFETY: bounded read of the payload the kernel just wrote.
         let payload = unsafe {
-            let payload_len =
-                u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             core::slice::from_raw_parts(
                 (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
                 payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -1388,8 +1341,7 @@ fn route_one_batch(
                 // down is not, and it is the whole of what this question needs.
                 let meta_change = match *l {
                     libinput::Logical::Key { keycode, pressed, .. }
-                        if keycode == libkern::abi::KEY_LEFTMETA
-                            || keycode == libkern::abi::KEY_RIGHTMETA =>
+                        if keycode == libkern::abi::KEY_LEFTMETA || keycode == libkern::abi::KEY_RIGHTMETA =>
                     {
                         Some(pressed)
                     }
@@ -1402,10 +1354,7 @@ fn route_one_batch(
                 // nothing in the transcript to say which it was. A button is not a keystroke, so
                 // this logs no more about a person than the press beside it already did.
                 let diag = meta_change.is_some()
-                    || matches!(
-                        *l,
-                        libinput::Logical::Button { .. } | libinput::Logical::Dropped { .. }
-                    );
+                    || matches!(*l, libinput::Logical::Button { .. } | libinput::Logical::Dropped { .. });
                 // Already inside the enclosing `unsafe` block, so no inner one: the
                 // justification is that this is a single-threaded server and the counter is
                 // touched only from the serve loop, as `ROUTES_LOGGED` is.
@@ -1433,8 +1382,7 @@ fn route_one_batch(
                         }
                         _ => {
                             let p = srv.router.pointer();
-                            let down =
-                                matches!(*l, libinput::Logical::Button { pressed: true, .. });
+                            let down = matches!(*l, libinput::Logical::Button { pressed: true, .. });
                             pl.s(if down {
                                 b"compositor: press at x=".as_slice()
                             } else {
@@ -1486,7 +1434,6 @@ fn route_one_batch(
             }
         }
     }
-
 }
 
 /// What a forwarded resolve under `/dev/draw` is asking for.
@@ -1567,10 +1514,7 @@ fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> 
 /// Answer a `screen` resolve with a `MemoryObject` holding the screen's size
 /// (`rsproto-surface-ops.md`, "Reading the screen's size").
 fn reply_screen_info(serve_end: u64, request_id: u64, srv: &Server) -> bool {
-    let info = librsproto::surface::ScreenInfo {
-        width: srv.screen.size.w,
-        height: srv.screen.size.h,
-    };
+    let info = librsproto::surface::ScreenInfo { width: srv.screen.size.w, height: srv.screen.size.h };
     let mut bytes = [0u8; librsproto::surface::SCREEN_INFO_LEN];
     if info.write(&mut bytes).is_none() {
         return reply_resolve_error(serve_end, request_id, KError::KernelError);
@@ -1588,13 +1532,7 @@ fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) -> bool {
     }
     // SAFETY: mapping an object this process just created, to fill it.
     let addr = unsafe {
-        syscall4(
-            SYS_MEMORY_MAP,
-            obj as u64,
-            0,
-            bytes.len() as u64,
-            libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE,
-        )
+        syscall4(SYS_MEMORY_MAP, obj as u64, 0, bytes.len() as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE)
     };
     if addr <= 0 {
         // SAFETY: closing the object we just made and cannot use.
@@ -1612,23 +1550,15 @@ fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) -> bool {
     unsafe { syscall2(libkern::SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
 
     let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
-    if resolve_reply(&mut body, librsproto::namespace::OBJECT_KIND_MEMOBJ, bytes.len() as u32)
-        .is_none()
-    {
+    if resolve_reply(&mut body, librsproto::namespace::OBJECT_KIND_MEMOBJ, bytes.len() as u32).is_none() {
         // SAFETY: nothing was sent, so the object is still ours to drop.
         unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
         return reply_resolve_error(serve_end, request_id, KError::KernelError);
     }
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid; the object rides the reply.
     let sent = unsafe {
-        let Some(rs_len) = encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            OP_NS_RESOLVE,
-            request_id,
-            RS_FLAG_REPLY,
-            &body,
-            1,
-        ) else {
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
+        else {
             // SAFETY: nothing was sent, so the object is still ours to drop.
             syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0);
             return false;
@@ -1694,23 +1624,13 @@ fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
 /// never resized, with nothing logged and the manager told it had succeeded. Every other
 /// server-initiated record goes through the outbox precisely so it holds its place and is
 /// retried (PR #216 review, finding 4).
-fn configure_window(
-    srv: &mut Server,
-    window: u32,
-    width: u32,
-    height: u32,
-    origin: Point,
-) -> bool {
+fn configure_window(srv: &mut Server, window: u32, width: u32, height: u32, origin: Point) -> bool {
     let Some(slot) = srv.session_of(window) else { return false };
     // SAFETY: reading our own slot table.
     if unsafe { SESSION_CH[slot] } == 0 {
         return false;
     }
-    enqueue(
-        srv,
-        slot,
-        Outbound::Configure { window, width, height, x: origin.x, y: origin.y },
-    );
+    enqueue(srv, slot, Outbound::Configure { window, width, height, x: origin.x, y: origin.y });
     true
 }
 
@@ -1750,15 +1670,8 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
     };
     let len = dst_geom.byte_len();
     // SAFETY: mapping an object the manager sent, writable, for exactly its own length.
-    let addr = unsafe {
-        syscall4(
-            SYS_MEMORY_MAP,
-            obj,
-            0,
-            len as u64,
-            libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE,
-        )
-    };
+    let addr =
+        unsafe { syscall4(SYS_MEMORY_MAP, obj, 0, len as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE) };
     if addr <= 0 {
         return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
     }
@@ -1836,8 +1749,7 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
         // manager would not
         // do that" is not a bound.
         let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -1890,11 +1802,7 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
             return reply_error_on_session(ch, op, request_id, KError::NotFound);
         };
         enqueue(srv, slot, Outbound::CloseRequested { window: req.window });
-        Line::new()
-            .s(b"compositor: asked window ")
-            .u(req.window as u64)
-            .s(b" to close")
-            .end();
+        Line::new().s(b"compositor: asked window ").u(req.window as u64).s(b" to close").end();
         return reply_on_session(ch, op, request_id, &[]);
     }
     if op == librsproto::surface::OP_MGR_QUERY_LAYOUT {
@@ -1923,9 +1831,7 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
     // client told it had succeeded (PR #249 review, blocking 1).
     //
     // Cleared here rather than in each op, so the next manager op added cannot forget to.
-    if let MgrOutcome::Applied { window: Some(w), .. } | MgrOutcome::Configure { window: w, .. } =
-        mgr_outcome
-    {
+    if let MgrOutcome::Applied { window: Some(w), .. } | MgrOutcome::Configure { window: w, .. } = mgr_outcome {
         srv.stack.clear_state_request(w);
     }
     drain_stack_events(srv);
@@ -1964,8 +1870,7 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
                     // outline with it; anything else disturbs no pixels.
                     if let Some(o) = disturbed {
                         srv.outline = o.now;
-                        for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges)
-                        {
+                        for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
                             if !r.is_empty() {
                                 repaint_region(srv, screen, r);
                             }
@@ -2230,12 +2135,7 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
         unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
         return false;
     }
-    srv.buffers.push(MappedBuffer {
-        window: req.window,
-        buffer: req.buffer,
-        addr: addr as *mut u8,
-        len,
-    });
+    srv.buffers.push(MappedBuffer { window: req.window, buffer: req.buffer, addr: addr as *mut u8, len });
     // The mapping holds its own reference to the object, so the handle can go.
     // SAFETY: closing our reference; the mapping outlives it.
     unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
@@ -2329,14 +2229,9 @@ fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -
     let elen = librsproto::error::error_body(&mut ebody, err.as_i32(), 0, b"").unwrap_or(0);
     // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
     unsafe {
-        let Some(rs_len) = encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            op,
-            request_id,
-            RS_FLAG_REPLY | RS_FLAG_ERROR,
-            &ebody[..elen],
-            0,
-        ) else {
+        let Some(rs_len) =
+            encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &ebody[..elen], 0)
+        else {
             return false;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -2374,20 +2269,14 @@ fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuff
 
 /// Handle the request [`serve_session`] has just received into `RECV_MSG`. Returns `false` if
 /// the session should close.
-fn handle_session_request(
-    slot: usize,
-    ch: u64,
-    srv: &mut Server,
-    screen: &mut Screen<RawFramebuffer>,
-) -> bool {
+fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     // Copy the body out rather than holding a borrow of `RECV_MSG` across dispatch; the
     // alternative is two live `static mut` borrows at once. `MAX_BODY` is sized so a whole
     // `SetTitle` fits — this `min` is a bounds check, not a policy, and when it *was* a policy
     // it silently shortened titles to 60 bytes.
     let mut body_buf = [0u8; MAX_BODY];
     let (op, request_id, body_len, handle) = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -2403,8 +2292,7 @@ fn handle_session_request(
         // surplus is closed immediately: it can never be wanted, and leaving it was the
         // same unbounded leak as the three fixed above, differing only in how it arrived
         // (PR #175 review, finding 2).
-        let hcount =
-            ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
+        let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
         for i in 1..hcount {
             // SAFETY: closing a handle this process owns and no op can name.
             syscall4(SYS_HANDLE_CLOSE, RECV_HANDLES[i], 0, 0, 0);
@@ -2447,10 +2335,7 @@ fn handle_session_request(
                     if let Some(r) = damage.filter(|r| !r.is_empty()) {
                         repaint_region(srv, screen, r);
                     }
-                    Line::new()
-                        .s(b"compositor: interactive move of window ")
-                        .u(req.window as u64)
-                        .end();
+                    Line::new().s(b"compositor: interactive move of window ").u(req.window as u64).end();
                     None
                 }
                 // The caller does not hold the grab, or the window has gone. One answer for
@@ -2543,30 +2428,28 @@ fn handle_session_request(
         let err = match librsproto::surface::DeclareAcceptor::read(body) {
             None => Some(KError::InvalidArgument),
             Some((req, _)) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
-            Some((req, name)) => {
-                match srv.stack.declare_acceptor(req.window, name, req.kinds) {
-                    Ok(()) => {
-                        Line::new()
-                            .s(b"compositor: window ")
-                            .u(req.window as u64)
-                            .s(b" accepts ")
-                            .untrusted(name.as_bytes())
-                            .s(b" kinds ")
-                            .u(req.kinds as u64)
-                            .end();
-                        None
-                    }
-                    Err(compositor::StackError::TooManyAcceptors) => {
-                        Line::new()
-                            .s(b"compositor: window ")
-                            .u(req.window as u64)
-                            .s(b" has no room for another acceptor")
-                            .end();
-                        Some(KError::Unsupported)
-                    }
-                    Err(_) => Some(KError::NotFound),
+            Some((req, name)) => match srv.stack.declare_acceptor(req.window, name, req.kinds) {
+                Ok(()) => {
+                    Line::new()
+                        .s(b"compositor: window ")
+                        .u(req.window as u64)
+                        .s(b" accepts ")
+                        .untrusted(name.as_bytes())
+                        .s(b" kinds ")
+                        .u(req.kinds as u64)
+                        .end();
+                    None
                 }
-            }
+                Err(compositor::StackError::TooManyAcceptors) => {
+                    Line::new()
+                        .s(b"compositor: window ")
+                        .u(req.window as u64)
+                        .s(b" has no room for another acceptor")
+                        .end();
+                    Some(KError::Unsupported)
+                }
+                Err(_) => Some(KError::NotFound),
+            },
         };
         return match err {
             Some(e) => reply_error_on_session(ch, op, request_id, e),
@@ -2634,9 +2517,7 @@ fn handle_session_request(
         }
         let err = match librsproto::surface::WindowState::read(body) {
             None => Some(KError::InvalidArgument),
-            Some(req) if req.state > librsproto::surface::WINDOW_STATE_MAXIMIZED => {
-                Some(KError::InvalidArgument)
-            }
+            Some(req) if req.state > librsproto::surface::WINDOW_STATE_MAXIMIZED => Some(KError::InvalidArgument),
             Some(req) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
             Some(req) => {
                 // **Repeats produce nothing**, which is the bound this event needs: it is the
@@ -2661,15 +2542,8 @@ fn handle_session_request(
     }
 
     // SAFETY: a bounded mutable slice over the reply buffer; `body` is a local copy.
-    let outcome = unsafe {
-        dispatch(
-            &mut srv.conns[slot],
-            &mut srv.stack,
-            op,
-            body,
-            &mut REPLY_MSG[PAYLOAD_OFF + 16..],
-        )
-    };
+    let outcome =
+        unsafe { dispatch(&mut srv.conns[slot], &mut srv.stack, op, body, &mut REPLY_MSG[PAYLOAD_OFF + 16..]) };
     drain_stack_events(srv);
 
     // **Map only after `dispatch` accepted the attach.** Mapping first would record the
@@ -2773,13 +2647,11 @@ fn handle_session_request(
                 let mut now: u64 = 0;
                 // SAFETY: a valid out-pointer for one u64.
                 unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
-                srv.pending_configure
-                    .push((configure.window, now.saturating_add(CONFIGURE_DEADLINE_NS)));
+                srv.pending_configure.push((configure.window, now.saturating_add(CONFIGURE_DEADLINE_NS)));
             } else {
                 let mut cfg = [0u8; core::mem::size_of::<ConfigureEvent>()];
                 srv.stack.mark_configured(configure.window);
-                if sent && configure.write(&mut cfg).is_some() && !send_input(ch, OP_CONFIGURE, &cfg)
-                {
+                if sent && configure.write(&mut cfg).is_some() && !send_input(ch, OP_CONFIGURE, &cfg) {
                     // The client will wait for this and nothing else will produce it, so a
                     // silent failure parks it forever — the same reason the reply above says so.
                     kprint(b"compositor: a window's first configure did not send\n");
@@ -2864,12 +2736,7 @@ fn handle_session_request(
 }
 
 /// The serve loop: the forwarding endpoint plus every open session.
-fn serve_loop(
-    serve_end: u64,
-    mut screen: Screen<RawFramebuffer>,
-    srv: &mut Server,
-    mut control: u64,
-) -> ! {
+fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Server, mut control: u64) -> ! {
     kprint(b"compositor: serving /dev/draw\n");
     let mut parked = false;
     loop {
@@ -2927,13 +2794,7 @@ fn serve_loop(
             for &(_, at) in &srv.pending_configure {
                 deadline = deadline.min(at);
             }
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                n as u64,
-                (&raw mut WAIT_RESULTS) as u64,
-                deadline,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, deadline)
         };
         if waited < 1 {
             // `TimedOut` is a tick, not an error: whichever deadline expired, do its work
@@ -3034,17 +2895,14 @@ fn serve_loop(
         }
         // SAFETY: bounded read of the payload, then of the resolve's suffix.
         let (request_id, resolved, ok) = unsafe {
-            let payload_len =
-                u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             let req = core::slice::from_raw_parts(
                 (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
                 payload_len.min(MSG_LEN - PAYLOAD_OFF),
             );
             match decode(req) {
                 Ok(m) if m.op == OP_NS_RESOLVE => {
-                    let suffix = librsproto::namespace::parse_resolve_request(m.body)
-                        .map(|r| r.suffix)
-                        .unwrap_or(b"");
+                    let suffix = librsproto::namespace::parse_resolve_request(m.body).map(|r| r.suffix).unwrap_or(b"");
                     (m.request_id, classify(suffix), true)
                 }
                 Ok(m) => (m.request_id, Resolved::Unknown, true),
@@ -3089,21 +2947,20 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     // does not take the screen; only `acquire` does.
     //
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let shadow = match unsafe { libdraw::acquire::read_info(root_ns) }
-        .and_then(|info| libdraw::acquire::geometry_from(&info))
-    {
-        Ok(geometry) => match libdraw::framebuffer::MemFramebuffer::try_new(geometry) {
-            Some(shadow) => shadow,
-            None => {
-                kprint(b"compositor: no memory for a shadow buffer -- cannot serve\n");
+    let shadow =
+        match unsafe { libdraw::acquire::read_info(root_ns) }.and_then(|info| libdraw::acquire::geometry_from(&info)) {
+            Ok(geometry) => match libdraw::framebuffer::MemFramebuffer::try_new(geometry) {
+                Some(shadow) => shadow,
+                None => {
+                    kprint(b"compositor: no memory for a shadow buffer -- cannot serve\n");
+                    exit(1);
+                }
+            },
+            Err(_) => {
+                kprint(b"compositor: cannot read the framebuffer's shape -- cannot serve\n");
                 exit(1);
             }
-        },
-        Err(_) => {
-            kprint(b"compositor: cannot read the framebuffer's shape -- cannot serve\n");
-            exit(1);
-        }
-    };
+        };
 
     // Authority is the binding: a compositor is a process whose namespace has this.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.

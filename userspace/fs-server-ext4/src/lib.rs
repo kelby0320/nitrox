@@ -213,25 +213,16 @@ pub(crate) mod test_support {
     /// `bytes_per_inode` is `mke2fs -i`, or `0` to let it choose. A large ratio gives *few*
     /// inodes per group, which is how a test can exhaust group 0's inodes by creating a
     /// couple of hundred files instead of eight thousand.
-    pub(crate) fn fixture_blocks(
-        block_size: u32,
-        blocks: u32,
-        bytes_per_inode: u32,
-        content: &[u8],
-    ) -> Vec<u8> {
+    pub(crate) fn fixture_blocks(block_size: u32, blocks: u32, bytes_per_inode: u32, content: &[u8]) -> Vec<u8> {
         // A unique dir per call (cargo runs tests in parallel threads) so they
         // never share / remove each other's staging tree.
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("nitrox-ext4-fix-{}-{}", std::process::id(), id));
+        let dir = std::env::temp_dir().join(format!("nitrox-ext4-fix-{}-{}", std::process::id(), id));
         let sysdir = dir.join("system");
         std::fs::create_dir_all(&sysdir).unwrap();
-        std::fs::File::create(sysdir.join("current-generation"))
-            .unwrap()
-            .write_all(content)
-            .unwrap();
+        std::fs::File::create(sysdir.join("current-generation")).unwrap().write_all(content).unwrap();
         let img = dir.join("rootfs.ext4");
         let mut cmd = Command::new("mke2fs");
         cmd.args(["-q", "-F", "-t", "ext4"])
@@ -255,8 +246,7 @@ pub(crate) mod test_support {
 
     /// **`e2fsck -fn` finds nothing** in the image `img`.
     pub(crate) fn assert_e2fsck_clean(img: &[u8], tag: &str) {
-        let dir = std::env::temp_dir()
-            .join(format!("nitrox-{}-{}", tag, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nitrox-{}-{}", tag, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("img.ext4");
         std::fs::write(&p, img).unwrap();
@@ -271,15 +261,8 @@ pub(crate) mod test_support {
     /// how the status-only check below survived being noticed; a third copy would be the same
     /// mistake with the ink still wet (PR #310 review).
     pub(crate) fn assert_e2fsck_clean_path(p: &std::path::Path, tag: &str) {
-        let out = std::process::Command::new("e2fsck")
-            .args(["-fn", p.to_str().unwrap()])
-            .output()
-            .unwrap();
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = std::process::Command::new("e2fsck").args(["-fn", p.to_str().unwrap()]).output().unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         // **The exit status is not the oracle; the output is.** Measured against e2fsck
         // 1.47.0: a filesystem whose superblock free-block count is wrong by 7 prints
         // "Free blocks count wrong (7669, counted=7662). Fix? no" and **exits 0**. This
@@ -300,8 +283,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::test_support::{
-        Counting, ImageReader, RwImage, TEST_NOW, assert_e2fsck_clean, assert_e2fsck_clean_path,
-        fixture, fixture_blocks,
+        Counting, ImageReader, RwImage, TEST_NOW, assert_e2fsck_clean, assert_e2fsck_clean_path, fixture,
+        fixture_blocks,
     };
 
     #[test]
@@ -360,8 +343,10 @@ mod tests {
         let r = ImageReader(fixture(1024, b"gen\n"));
         let names = list_dir(&r, b"/system");
         // ext4 `file_type` 1 = regular file.
-        assert!(names.iter().any(|(n, ft)| n == "current-generation" && *ft == 1),
-            "expected current-generation as a regular file, got {names:?}");
+        assert!(
+            names.iter().any(|(n, ft)| n == "current-generation" && *ft == 1),
+            "expected current-generation as a regular file, got {names:?}"
+        );
         assert!(names.iter().any(|(n, _)| n == "."), "must include .");
         assert!(names.iter().any(|(n, _)| n == ".."), "must include ..");
     }
@@ -370,8 +355,10 @@ mod tests {
     fn read_dir_lists_root_directory() {
         let r = ImageReader(fixture(4096, b"gen\n"));
         let names = list_dir(&r, b"/");
-        assert!(names.iter().any(|(n, ft)| n == "system" && *ft == ext4::EXT4_FT_DIR),
-            "root must contain the `system` subdirectory, got {names:?}");
+        assert!(
+            names.iter().any(|(n, ft)| n == "system" && *ft == ext4::EXT4_FT_DIR),
+            "root must contain the `system` subdirectory, got {names:?}"
+        );
     }
 
     /// `(mtime, size)` of `name` inside the directory `dir`, via the stat-bearing walk.
@@ -646,10 +633,7 @@ mod tests {
         ext4::grow_file(&rw, b"/system/victim", 3000, TEST_NOW).unwrap();
 
         // Without `replace` the destination is untouched — fail loud, as everywhere else.
-        assert_eq!(
-            ext4::rename_path(&rw, b"/system/src", b"/system/victim", false, TEST_NOW),
-            Err(FsError::Exists)
-        );
+        assert_eq!(ext4::rename_path(&rw, b"/system/src", b"/system/victim", false, TEST_NOW), Err(FsError::Exists));
         assert_eq!(ext4::stat_file(&rw, b"/system/victim"), Ok(3000));
         assert_eq!(ext4::stat_file(&rw, b"/system/src"), Ok(1200));
 
@@ -664,11 +648,7 @@ mod tests {
         assert_eq!(ext4::stat_file(&rw, b"/system/src"), Err(FsError::NotFound));
         assert_eq!(free_inodes(&rw), free_before, "not freed before the release");
         ext4::release_inode(&rw, victim, TEST_NOW).unwrap();
-        assert_eq!(
-            free_inodes(&rw),
-            free_before + 1,
-            "the replaced inode must be freed, not orphaned"
-        );
+        assert_eq!(free_inodes(&rw), free_before + 1, "the replaced inode must be freed, not orphaned");
         assert_e2fsck_clean(&rw.0.into_inner(), "rename-replace");
     }
 
@@ -683,8 +663,7 @@ mod tests {
         ext4::create_file(&rw, b"/system/outer", b"payload", TEST_NOW).unwrap();
         let _ = outer;
 
-        ext4::rename_path(&rw, b"/system/outer", b"/system/target/inner", false, TEST_NOW)
-            .unwrap();
+        ext4::rename_path(&rw, b"/system/outer", b"/system/target/inner", false, TEST_NOW).unwrap();
 
         // The directory and its contents moved wholesale…
         assert!(ext4::resolve_dir(&rw, b"/system/target/inner").is_ok());
@@ -705,20 +684,11 @@ mod tests {
         ext4::create_file(&rw, b"/system", b"f", TEST_NOW).unwrap();
 
         // Moving a directory inside itself would detach the subtree from the root.
-        assert_eq!(
-            ext4::rename_path(&rw, b"/system/d", b"/system/d/self", false, TEST_NOW),
-            Err(FsError::Unsupported)
-        );
+        assert_eq!(ext4::rename_path(&rw, b"/system/d", b"/system/d/self", false, TEST_NOW), Err(FsError::Unsupported));
         // Replacing a directory needs rmdir's emptiness + link bookkeeping; deferred.
-        assert_eq!(
-            ext4::rename_path(&rw, b"/system/f", b"/system/e", true, TEST_NOW),
-            Err(FsError::Unsupported)
-        );
+        assert_eq!(ext4::rename_path(&rw, b"/system/f", b"/system/e", true, TEST_NOW), Err(FsError::Unsupported));
         // A missing source is NotFound, not a silent success.
-        assert_eq!(
-            ext4::rename_path(&rw, b"/system/ghost", b"/system/g", false, TEST_NOW),
-            Err(FsError::NotFound)
-        );
+        assert_eq!(ext4::rename_path(&rw, b"/system/ghost", b"/system/g", false, TEST_NOW), Err(FsError::NotFound));
         // Renaming onto itself is a no-op, and must not unlink the file.
         ext4::rename_path(&rw, b"/system/f", b"/system/f", false, TEST_NOW).unwrap();
         assert_eq!(ext4::stat_file(&rw, b"/system/f"), Ok(0));
@@ -799,10 +769,7 @@ mod tests {
         // only works if the emptiness scan reaches past block 0.
         let outer = ext4::resolve_dir(&rw, name_path(&name_of(11)).as_bytes()).unwrap();
         ext4::mkdir_at(&rw, outer, b"inner", TEST_NOW).unwrap();
-        assert_eq!(
-            ext4::rmdir_at(&rw, sys, name_of(11).as_bytes(), TEST_NOW),
-            Err(FsError::NotEmpty)
-        );
+        assert_eq!(ext4::rmdir_at(&rw, sys, name_of(11).as_bytes(), TEST_NOW), Err(FsError::NotEmpty));
         ext4::rmdir_at(&rw, outer, b"inner", TEST_NOW).unwrap();
 
         for i in 0..12 {
@@ -810,10 +777,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("rmdir {i} failed: {e:?}"));
         }
         let listed = list_dir(&ImageReader(rw.0.borrow().clone()), b"/system");
-        assert!(
-            !listed.iter().any(|(n, _)| n.starts_with('g')),
-            "entries survived removal: {listed:?}"
-        );
+        assert!(!listed.iter().any(|(n, _)| n.starts_with('g')), "entries survived removal: {listed:?}");
         assert_e2fsck_clean(&rw.0.into_inner(), "dirgrow-rm");
     }
 
@@ -917,10 +881,7 @@ mod tests {
         })
         .unwrap();
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
         let (_, file) = entries.iter().find(|(n, _)| n == "current-generation").unwrap();
         assert_eq!(file.size, content.len() as u64, "exact file size, not a block count");
@@ -928,11 +889,7 @@ mod tests {
         assert_ne!(file.mode & 0o777, 0, "permission bits must survive");
         // The fixture is built moments ago: a plausible, non-zero, non-future timestamp
         // catches a mis-decoded field (a zeroed or byte-swapped mtime fails this).
-        assert!(
-            file.mtime > now - 3600 && file.mtime <= now + 60,
-            "mtime {} is not near now ({now})",
-            file.mtime
-        );
+        assert!(file.mtime > now - 3600 && file.mtime <= now + 60, "mtime {} is not near now ({now})", file.mtime);
 
         let (_, dot) = entries.iter().find(|(n, _)| n == ".").unwrap();
         assert_eq!(dot.mode & 0xF000, 0x4000, "S_IFDIR for the directory itself");
@@ -1036,8 +993,7 @@ mod tests {
         let r = ImageReader(fixture(1024, &content));
         let mut out = [0u8; 2048];
         // A 2000-byte window starting at 1500 spans blocks 1..4 (1 KiB blocks).
-        let n = ext4::read_file_range(&r, b"/system/current-generation", 1500, 2000, &mut out)
-            .unwrap();
+        let n = ext4::read_file_range(&r, b"/system/current-generation", 1500, 2000, &mut out).unwrap();
         assert_eq!(n, 2000);
         assert_eq!(&out[..n], &content[1500..3500]);
     }
@@ -1216,10 +1172,7 @@ mod tests {
         assert_eq!(free(&rw), full, "the create gave its inode back");
         // 220 bytes: no record has the room, and the removed one's is 208.
         let longer = std::format!("{}{}", long(0), "y".repeat(20));
-        assert_eq!(
-            ext4::rename_at(&rw, d, long(0).as_bytes(), longer.as_bytes(), TEST_NOW),
-            Err(FsError::TooLarge)
-        );
+        assert_eq!(ext4::rename_at(&rw, d, long(0).as_bytes(), longer.as_bytes(), TEST_NOW), Err(FsError::TooLarge));
         assert_eq!(ext4::stat_file(&rw, std::format!("/d/{}", long(0)).as_bytes()), Ok(0), "the old name");
         assert_eq!(ext4::stat_file(&rw, std::format!("/d/{longer}").as_bytes()), Err(FsError::NotFound));
         assert_e2fsck_clean(&rw.0.borrow(), "full-create-rename");
@@ -1287,27 +1240,20 @@ mod tests {
     #[test]
     fn the_feature_set_is_exactly_what_the_module_says_it_makes() {
         let (img, _) = format_image(16384, 4096);
-        let dir = std::env::temp_dir()
-            .join(std::format!("nitrox-mkfs-feat-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(std::format!("nitrox-mkfs-feat-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("img.ext4");
         std::fs::write(&p, &img).unwrap();
-        let out = std::process::Command::new("dumpe2fs")
-            .args(["-h", p.to_str().unwrap()])
-            .output()
-            .unwrap();
+        let out = std::process::Command::new("dumpe2fs").args(["-h", p.to_str().unwrap()]).output().unwrap();
         std::fs::remove_dir_all(&dir).ok();
         let text = String::from_utf8_lossy(&out.stdout);
-        let line = text
-            .lines()
-            .find(|l| l.starts_with("Filesystem features:"))
-            .expect("dumpe2fs printed no feature line");
+        let line =
+            text.lines().find(|l| l.starts_with("Filesystem features:")).expect("dumpe2fs printed no feature line");
         let mut got: Vec<&str> = line["Filesystem features:".len()..].split_whitespace().collect();
         got.sort_unstable();
         assert_eq!(
             got,
-            ["dir_nlink", "extent", "extra_isize", "filetype", "huge_file", "large_file",
-             "sparse_super"],
+            ["dir_nlink", "extent", "extra_isize", "filetype", "huge_file", "large_file", "sparse_super"],
             "the declared set drifted from the module doc: {line}"
         );
         // And the two that are deliberately absent, named so their absence is deliberate
@@ -1354,20 +1300,13 @@ mod tests {
             }
         }
 
-        let dir = std::env::temp_dir()
-            .join(std::format!("nitrox-mkfs-wide-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(std::format!("nitrox-mkfs-wide-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wide.ext4");
         // 70 groups at 1 KiB blocks: 3 blocks of descriptors, and backups in 0, 1, 3, 5, 7,
         // 9, 25, 27, 49 — nine copies of a table that is not one block.
         let blocks = 70u64 * 8192;
-        let f = std::fs::File::options()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let f = std::fs::File::options().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
         f.set_len(blocks * 1024).unwrap();
         let img = SparseFile(std::cell::RefCell::new(f));
         let geom = crate::mkfs::format(
@@ -1384,11 +1323,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(geom.groups, 70);
-        assert!(
-            geom.gdt_blocks > 1,
-            "this test means nothing with a one-block table ({} blocks)",
-            geom.gdt_blocks
-        );
+        assert!(geom.gdt_blocks > 1, "this test means nothing with a one-block table ({} blocks)", geom.gdt_blocks);
 
         // **The last group's descriptor, read back, before the oracle is asked.** A table
         // truncated at its first block leaves this one zeroed — and `e2fsck` on a filesystem
@@ -1400,14 +1335,9 @@ mod tests {
         // the private helper that wrote it: a group's metadata starts after its superblock
         // copy and descriptor table, if it has one.
         let last = geom.groups - 1;
-        let expect = geom.group_start(last)
-            + if geom.has_super(last) { 1 + geom.gdt_blocks as u64 } else { 0 };
+        let expect = geom.group_start(last) + if geom.has_super(last) { 1 + geom.gdt_blocks as u64 } else { 0 };
         let mut d = [0u8; 32];
-        img.read_at(
-            (geom.first_data_block as u64 + 1) * 1024 + last as u64 * 32,
-            &mut d,
-        )
-        .unwrap();
+        img.read_at((geom.first_data_block as u64 + 1) * 1024 + last as u64 * 32, &mut d).unwrap();
         let bitmap = u32::from_le_bytes([d[0], d[1], d[2], d[3]]) as u64;
         assert_eq!(
             bitmap, expect,
@@ -1437,8 +1367,7 @@ mod tests {
         assert!(!geom.has_super(2) && !geom.has_super(4) && !geom.has_super(6));
         assert_e2fsck_clean(&img, "mkfs-backups");
 
-        let dir = std::env::temp_dir()
-            .join(std::format!("nitrox-mkfs-backup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(std::format!("nitrox-mkfs-backup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("img.ext4");
         std::fs::write(&p, &img).unwrap();
@@ -1478,7 +1407,6 @@ mod tests {
         }
         names
     }
-
 
     #[test]
     fn mkdir_rename_rmdir_sequence_stays_readable_and_e2fsck_clean() {
@@ -1953,10 +1881,7 @@ mod tests {
 
         // A directory is not truncatable — its size is its data, not a byte count a
         // caller may set.
-        assert_eq!(
-            ext4::truncate_file(&rw, b"/system", 0, TEST_NOW),
-            Err(FsError::NotFound)
-        );
+        assert_eq!(ext4::truncate_file(&rw, b"/system", 0, TEST_NOW), Err(FsError::NotFound));
     }
 
     /// The superblock's free-block count — what proves a freed block reached the

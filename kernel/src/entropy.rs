@@ -25,9 +25,9 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::libkern::lockrank::LockRank;
 use crate::libkern::{ChaCha20Rng, IrqSpinLock, KVec};
 use crate::object::ObjectRef;
-use crate::libkern::lockrank::LockRank;
 
 /// Pool size in bytes. Sized to one ChaCha key — the pool *is* the CSPRNG key
 /// material once conditioned by the key schedule.
@@ -266,9 +266,7 @@ pub fn init() {
         HwRngSource::Drbg => "RDRAND",
         HwRngSource::None => "none (jitter-only)",
     };
-    crate::kprintln!(
-        "entropy: source {src}, {hw} hw draws, seeded={seeded}",
-    );
+    crate::kprintln!("entropy: source {src}, {hw} hw draws, seeded={seeded}",);
 }
 
 /// Absorb one interrupt-timing jitter sample (a raw cycle count) from IRQ context.
@@ -421,10 +419,7 @@ mod tests {
             s.draw(&mut chunk);
             total += chunk.len() as u32;
         }
-        assert!(
-            s.bytes_since_reseed < RESEED_BYTES,
-            "the byte-threshold reseed reset the counter",
-        );
+        assert!(s.bytes_since_reseed < RESEED_BYTES, "the byte-threshold reseed reset the counter",);
     }
 
     /// A live `PendingOperation`, adopted into an `ObjectRef`, as a seed-waiter.

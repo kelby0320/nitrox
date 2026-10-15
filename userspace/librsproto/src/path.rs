@@ -37,7 +37,6 @@
 //! implementation is also the correct one. If symlinks ever land, this comment is the
 //! thing that should stop someone assuming this still holds.
 
-
 /// Why a path could not be resolved.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PathError {
@@ -78,11 +77,7 @@ impl PathError {
 /// in a directory the caller never named.
 ///
 /// Returns the populated prefix of `out`. `out` should be at least `NS_PATH_MAX` (1024).
-pub fn resolve<'a>(
-    cwd: Option<&[u8]>,
-    path: &[u8],
-    out: &'a mut [u8],
-) -> Result<&'a [u8], PathError> {
+pub fn resolve<'a>(cwd: Option<&[u8]>, path: &[u8], out: &'a mut [u8]) -> Result<&'a [u8], PathError> {
     if path.is_empty() {
         return Err(PathError::Empty);
     }
@@ -121,10 +116,7 @@ fn fold(path: &[u8], out: &mut [u8], mut len: usize) -> Result<usize, PathError>
                 if len == 0 {
                     return Err(PathError::AboveRoot);
                 }
-                len = out[..len]
-                    .iter()
-                    .rposition(|&c| c == b'/')
-                    .ok_or(PathError::AboveRoot)?;
+                len = out[..len].iter().rposition(|&c| c == b'/').ok_or(PathError::AboveRoot)?;
             }
             c => {
                 if len + 1 + c.len() > out.len() {
@@ -147,9 +139,7 @@ pub fn needs_resolution(path: &[u8]) -> bool {
     if path.is_empty() || path[0] != b'/' {
         return true;
     }
-    path.split(|&c| c == b'/')
-        .skip(1)
-        .any(|c| c.is_empty() || c == b"." || c == b"..")
+    path.split(|&c| c == b'/').skip(1).any(|c| c.is_empty() || c == b"." || c == b"..")
 }
 
 #[cfg(test)]

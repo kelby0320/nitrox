@@ -22,8 +22,8 @@ use libdraw::geom::Size;
 
 use crate::element::{Element, Insets, center_v, column, padding, row, sized, text};
 use crate::widget::{
-    DIALOG_BUTTON_H, DIALOG_PAD, ListRow, ListState, Theme, WINDOW_BORDER, WINDOW_FRAME, button,
-    dialog_frame_sized, list_view, text_field, TextFieldState, WidgetState,
+    DIALOG_BUTTON_H, DIALOG_PAD, ListRow, ListState, TextFieldState, Theme, WINDOW_BORDER, WINDOW_FRAME, WidgetState,
+    button, dialog_frame_sized, list_view, text_field,
 };
 
 /// Which job the chooser is doing.
@@ -71,10 +71,7 @@ impl ChooserState {
     /// A chooser opened to save `name` — the buffer's current name, so Save As starts from what
     /// the file is called rather than from nothing.
     pub fn saving(name: &str) -> Self {
-        Self {
-            list: ListState::at(None, 0),
-            name: TextFieldState::with_text(name),
-        }
+        Self { list: ListState::at(None, 0), name: TextFieldState::with_text(name) }
     }
 }
 
@@ -127,10 +124,13 @@ pub fn view<Msg: Clone>(
     focused: bool,
     theme: &Theme,
 ) -> Element<Msg> {
-    let title = padding(Insets::all(DIALOG_PAD), text(match mode {
-        Mode::Open => "Open File",
-        Mode::Save => "Save As",
-    }));
+    let title = padding(
+        Insets::all(DIALOG_PAD),
+        text(match mode {
+            Mode::Open => "Open File",
+            Mode::Save => "Save As",
+        }),
+    );
     // **Where you are, always shown.** A chooser that only listed names would leave the person
     // guessing which directory they are about to write into, which is the one thing a Save dialog
     // must not be vague about.
@@ -155,12 +155,15 @@ pub fn view<Msg: Clone>(
         sized(
             Size::new(0, UP_H),
             row(alloc::vec![
-                sized(Size::new(UP_W, 0), button(
-                    "\u{2191}",
-                    up,
-                    WidgetState { hovered: hovered == Some(key_base + 7), ..Default::default() },
-                    theme,
-                ))
+                sized(
+                    Size::new(UP_W, 0),
+                    button(
+                        "\u{2191}",
+                        up,
+                        WidgetState { hovered: hovered == Some(key_base + 7), ..Default::default() },
+                        theme,
+                    )
+                )
                 .key(key_base + 7),
                 // Centred *down* rather than padded, so the path sits on the button's middle
                 // whatever the theme's text size is. Not across: a `center` on both axes puts a
@@ -188,8 +191,7 @@ pub fn view<Msg: Clone>(
     // drawn at rest — no caret, no focus ring — is a live control that looks disabled. Every other
     // in-application field passes `active: true`; this one passed the default (PR #284 review,
     // finding 4).
-    let name_field =
-        text_field(&state.name, false, WidgetState { active: true, ..Default::default() }, theme);
+    let name_field = text_field(&state.name, false, WidgetState { active: true, ..Default::default() }, theme);
     let mut body: Vec<Element<Msg>> = alloc::vec![here, rows];
     if mode == Mode::Save {
         // **The field is below the list, not above it.** What you type is the answer; the list is
@@ -205,13 +207,8 @@ pub fn view<Msg: Clone>(
     }
     let answers = row(alloc::vec![
         text("").flex(1).key(key_base + 5),
-        button(
-            "Cancel",
-            cancel,
-            WidgetState { hovered: hovered == Some(key_base + 2), ..Default::default() },
-            theme,
-        )
-        .key(key_base + 2),
+        button("Cancel", cancel, WidgetState { hovered: hovered == Some(key_base + 2), ..Default::default() }, theme,)
+            .key(key_base + 2),
         // **The key goes on the child of the row, not on the button inside it.** The diff looks
         // at a parent's direct children; a keyed button wrapped in an unkeyed `padding` leaves the
         // row mixed, which is the same undiffable-dialog failure as an unkeyed sibling and took a
@@ -229,14 +226,7 @@ pub fn view<Msg: Clone>(
     ]);
     // `dialog_frame_sized` docks the question beside a strip it wraps itself, so the question
     // carries a key — its own doc says so, and the diff enforces it.
-    dialog_frame_sized(
-        Size::new(CHOOSER_W, CHOOSER_H),
-        title,
-        column(body).key(key_base + 6),
-        answers,
-        focused,
-        theme,
-    )
+    dialog_frame_sized(Size::new(CHOOSER_W, CHOOSER_H), title, column(body).key(key_base + 6), answers, focused, theme)
 }
 
 /// How wide the chooser's window is.
@@ -280,9 +270,9 @@ const FIELD_GAP: u32 = 4;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::string::String;
     use crate::diff::Tree;
     use crate::layout::{FixedCell, Layout, layout, locate};
+    use alloc::string::String;
     use libdraw::geom::Rect;
 
     const CELL: FixedCell = FixedCell { w: 8, h: 16 };
@@ -405,12 +395,7 @@ mod tests {
             // The key sits on the *padded* field, which is the gap above it plus the field —
             // so this is `FIELD_H` seen through the wrapper the tree actually carries a key on.
             let field = crate::layout::locate(&e, &l, 101).expect("the field is keyed 101");
-            assert_eq!(
-                field.size.h,
-                FIELD_GAP + FIELD_H,
-                "cell height {h}: the name field is {}px tall",
-                field.size.h
-            );
+            assert_eq!(field.size.h, FIELD_GAP + FIELD_H, "cell height {h}: the name field is {}px tall", field.size.h);
         }
     }
 
@@ -427,12 +412,8 @@ mod tests {
         }
         let theme = Theme::default();
         let mut st = ChooserState::saving(SEEDED);
-        let lit = nodes(&text_field::<Msg>(
-            &st.name,
-            false,
-            WidgetState { active: true, ..Default::default() },
-            &theme,
-        ));
+        let lit =
+            nodes(&text_field::<Msg>(&st.name, false, WidgetState { active: true, ..Default::default() }, &theme));
         let rest = nodes(&text_field::<Msg>(&st.name, false, WidgetState::default(), &theme));
         assert!(lit > rest, "an active field should cost more nodes than a resting one");
 
@@ -507,9 +488,6 @@ mod tests {
         // Down: on the button's middle, within the rounding `Center` leaves at the bottom.
         let path_mid = path.origin.y + (path.size.h / 2) as i32;
         let up_mid = up.origin.y + (up.size.h / 2) as i32;
-        assert!(
-            (path_mid - up_mid).abs() <= 1,
-            "the path's middle is at {path_mid} and the button's at {up_mid}"
-        );
+        assert!((path_mid - up_mid).abs() <= 1, "the path's middle is at {path_mid} and the button's at {up_mid}");
     }
 }

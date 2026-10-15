@@ -32,8 +32,7 @@ use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use coreutils::time::parse_duration;
 use libkern::abi::CLOCK_MONOTONIC;
 use libkern::syscall::{
-    SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, syscall1,
-    syscall2, syscall4,
+    SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, syscall1, syscall2, syscall4,
 };
 use libkern::{exit, kprint};
 
@@ -121,13 +120,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         let waited = unsafe {
             WAIT_HANDLES[0] = th;
             WAIT_HANDLES[1] = stage.notif;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                2,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 2, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             // SAFETY: closing our own handle.

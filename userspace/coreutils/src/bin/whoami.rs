@@ -135,10 +135,7 @@ fn read_session_user(stage: &Stage) -> Option<String> {
     // SAFETY: `base` is a live read-only mapping of at least one page; the read is
     // bounded by `NAME_MAX` and stops at the first NUL or newline.
     let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, NAME_MAX) };
-    let end = bytes
-        .iter()
-        .position(|&b| b == 0 || b == b'\n')
-        .unwrap_or(NAME_MAX);
+    let end = bytes.iter().position(|&b| b == 0 || b == b'\n').unwrap_or(NAME_MAX);
     let name = String::from_utf8_lossy(&bytes[..end]).into_owned();
 
     // SAFETY: unmapping the mapping made above, then closing our own handle.

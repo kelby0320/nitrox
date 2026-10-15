@@ -225,9 +225,8 @@ impl Outbox {
         // **A wheel is added to the one already queued rather than replacing it.** A detent is a
         // delta, so the newest record is only the last part of the truth — see the module docs.
         if let Some((w, dz, mods, buttons)) = rec.as_wheel() {
-            let same = |q: &Outbound| {
-                matches!(q.as_wheel(), Some((qw, _, qm, qb)) if qw == w && qm == mods && qb == buttons)
-            };
+            let same =
+                |q: &Outbound| matches!(q.as_wheel(), Some((qw, _, qm, qb)) if qw == w && qm == mods && qb == buttons);
             if let Some(i) = self.q.iter().position(same) {
                 let carried = self.q.remove(i).as_wheel().map_or(0, |(_, dz, _, _)| dz);
                 if let Outbound::Pointer { event } = &mut rec {
@@ -294,9 +293,7 @@ mod tests {
     use librsproto::surface::{MOD_CTRL, POINTER_BUTTON, POINTER_ENTER};
 
     fn motion(window: u32, x: i32) -> Outbound {
-        Outbound::Pointer {
-            event: PointerEvent { window, kind: POINTER_MOTION, x, ..Default::default() },
-        }
+        Outbound::Pointer { event: PointerEvent { window, kind: POINTER_MOTION, x, ..Default::default() } }
     }
 
     fn key(window: u32, keycode: u16) -> Outbound {
@@ -356,25 +353,15 @@ mod tests {
         for k in 0..5 {
             o.push(key(1, k));
         }
-        o.push(Outbound::Pointer {
-            event: PointerEvent { window: 1, kind: POINTER_ENTER, ..Default::default() },
-        });
-        o.push(Outbound::Pointer {
-            event: PointerEvent { window: 1, kind: POINTER_BUTTON, ..Default::default() },
-        });
+        o.push(Outbound::Pointer { event: PointerEvent { window: 1, kind: POINTER_ENTER, ..Default::default() } });
+        o.push(Outbound::Pointer { event: PointerEvent { window: 1, kind: POINTER_BUTTON, ..Default::default() } });
         assert_eq!(o.len(), 7);
     }
 
     /// A wheel record for `window`, `dz` detents, turned with `mods` held.
     fn wheel(window: u32, dz: i16, mods: u16) -> Outbound {
         Outbound::Pointer {
-            event: PointerEvent {
-                window,
-                kind: POINTER_WHEEL,
-                wheel: dz,
-                modifiers: mods,
-                ..Default::default()
-            },
+            event: PointerEvent { window, kind: POINTER_WHEEL, wheel: dz, modifiers: mods, ..Default::default() },
         }
     }
 
@@ -482,11 +469,7 @@ mod tests {
             o.push(motion(1, x));
         }
         assert_eq!(o.len(), 2);
-        assert_eq!(
-            drain(&mut o),
-            [Outbound::Release { window: 1, buffer: 7 }, motion(1, 99)],
-            "and it is still first"
-        );
+        assert_eq!(drain(&mut o), [Outbound::Release { window: 1, buffer: 7 }, motion(1, 99)], "and it is still first");
     }
 
     #[test]

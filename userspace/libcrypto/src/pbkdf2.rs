@@ -86,10 +86,7 @@ mod tests {
         // Widely-published vector: P="password", S="salt", c=4096, dkLen=32.
         let mut out = [0u8; 32];
         pbkdf2_hmac_sha256(b"password", b"salt", 4096, &mut out);
-        assert_eq!(
-            hex(&out),
-            "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
-        );
+        assert_eq!(hex(&out), "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a");
     }
 
     #[test]

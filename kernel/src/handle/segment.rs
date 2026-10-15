@@ -59,10 +59,7 @@ pub(crate) struct SegmentMeta {
 impl SegmentMeta {
     /// Initial state for an unallocated segment slot.
     pub(crate) const fn empty() -> Self {
-        Self {
-            free_head: FREE_NEXT_TAIL,
-            free_count: 0,
-        }
+        Self { free_head: FREE_NEXT_TAIL, free_count: 0 }
     }
 }
 
@@ -80,9 +77,7 @@ impl SegmentMeta {
 /// This function does **not** take the rank-3 lock; in fact callers
 /// must drop it before allocating. See `kernel/CLAUDE.md` §
 /// "Forbidden patterns": no allocations while holding a spinlock.
-pub(crate) fn try_alloc_initialised(
-    seed: u64,
-) -> Result<(NonNull<SegmentEntries>, SegmentMeta), AllocError> {
+pub(crate) fn try_alloc_initialised(seed: u64) -> Result<(NonNull<SegmentEntries>, SegmentMeta), AllocError> {
     // --- Allocate the 256 KiB entries block. ---
     let entries_bytes = core::mem::size_of::<SegmentEntries>();
     let entries_align = core::mem::align_of::<SegmentEntries>();
@@ -148,9 +143,7 @@ pub(crate) fn try_alloc_initialised(
             entries[cur].free_next.store(next, Ordering::Relaxed);
         }
         let tail = perm[SEGMENT_LEN - 1] as usize;
-        entries[tail]
-            .free_next
-            .store(FREE_NEXT_TAIL, Ordering::Relaxed);
+        entries[tail].free_next.store(FREE_NEXT_TAIL, Ordering::Relaxed);
     }
 
     let free_head = {
@@ -162,13 +155,7 @@ pub(crate) fn try_alloc_initialised(
     // with it and hold no live references.
     kfree(perm_raw as *mut u8);
 
-    Ok((
-        entries_ptr,
-        SegmentMeta {
-            free_head,
-            free_count: SEGMENT_LEN as u32,
-        },
-    ))
+    Ok((entries_ptr, SegmentMeta { free_head, free_count: SEGMENT_LEN as u32 }))
 }
 
 /// Free a segment previously returned by [`try_alloc_initialised`].
@@ -209,10 +196,7 @@ mod tests {
         let mut idx = meta.free_head;
         let mut count = 0usize;
         while idx != FREE_NEXT_TAIL {
-            assert!(
-                !seen[idx as usize],
-                "freelist revisited slot {idx} — chain has a cycle"
-            );
+            assert!(!seen[idx as usize], "freelist revisited slot {idx} — chain has a cycle");
             seen[idx as usize] = true;
             count += 1;
             assert!(count <= SEGMENT_LEN, "freelist longer than the segment");

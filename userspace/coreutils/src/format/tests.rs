@@ -163,7 +163,10 @@ fn a_filesystem_too_small_or_a_bad_label_is_refused_before_a_table() {
 #[test]
 fn a_plan_puts_the_filesystem_in_its_one_partition() {
     let disk = 4_194_304;
-    assert_eq!(partition(&t("blk-4"), false, false), Ok(Plan { table: Some((Scheme::Mbr, 2048, disk - 2048)), fs: None }));
+    assert_eq!(
+        partition(&t("blk-4"), false, false),
+        Ok(Plan { table: Some((Scheme::Mbr, 2048, disk - 2048)), fs: None })
+    );
     let gpt_n = disk - 33 - 2048;
     let fat = Label::Fat(*b"NITROX     ");
     let ext4 = Label::Ext4(*b"nitrox\0\0\0\0\0\0\0\0\0\0");
@@ -173,10 +176,16 @@ fn a_plan_puts_the_filesystem_in_its_one_partition() {
     );
     assert_eq!(
         format(&t("blk-4"), Fs::Fat, None, false, false),
-        Ok(Plan { table: Some((Scheme::Mbr, 2048, disk - 2048)), fs: Some((Fs::Fat, fat, 1 << 20, (disk - 2048) * 512)) })
+        Ok(Plan {
+            table: Some((Scheme::Mbr, 2048, disk - 2048)),
+            fs: Some((Fs::Fat, fat, 1 << 20, (disk - 2048) * 512))
+        })
     );
     let part = (2u64 << 30) - (1 << 20);
-    assert_eq!(format(&t("blk-5"), Fs::Fat, None, false, false), Ok(Plan { table: None, fs: Some((Fs::Fat, fat, 0, part)) }));
+    assert_eq!(
+        format(&t("blk-5"), Fs::Fat, None, false, false),
+        Ok(Plan { table: None, fs: Some((Fs::Fat, fat, 0, part)) })
+    );
 }
 
 /// The type a partition is given: by the FAT to be made, for an MBR; basic data or Linux, for a GPT.

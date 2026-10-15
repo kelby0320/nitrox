@@ -34,13 +34,12 @@ use libkern::debug::Line;
 use libkern::*;
 use service_mgr::bringup::{self, Entry, Failed, Step};
 use service_mgr::registry;
-use service_mgr::services;
 use service_mgr::service_toml::{self, Backoff, RestartConfig, RestartPolicy, ServiceDecl};
+use service_mgr::services;
 
 /// The freeing userspace heap (slice 4), backing `alloc` for the declaration parser.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
-
 
 /// How many declared services this supervisor holds at once.
 ///
@@ -88,7 +87,6 @@ static mut RDY_COUNT: usize = 0;
 
 /// Bounded wait for a spawned server's Ready.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
-
 
 /// Spawn args for `session-mgr`: its control endpoint is moved in at `rdx`
 /// (`handles[0]`), over which service-mgr hands it the fs-server endpoint + the auth
@@ -160,40 +158,34 @@ fn restart_name(p: RestartPolicy) -> &'static [u8] {
 /// program-image `MemoryObject`s (passed to spawn as `SpawnArgs.image`).
 fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
-    };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
     if po < 0 {
         return 0;
     }
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     let waited = unsafe {
         WAIT_HANDLES[0] = po as u64;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // IoResult: status at bytes 8..12, resolved handle at 16..24.
     let (status, handle) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                WAIT_RESULTS[16],
+                WAIT_RESULTS[17],
+                WAIT_RESULTS[18],
+                WAIT_RESULTS[19],
+                WAIT_RESULTS[20],
+                WAIT_RESULTS[21],
+                WAIT_RESULTS[22],
+                WAIT_RESULTS[23],
             ]),
         )
     };
     // SAFETY: closing our own PO handle (the resolved handle is separate).
     unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-    if waited != 1 || status != 0 {
-        0
-    } else {
-        handle
-    }
+    if waited != 1 || status != 0 { 0 } else { handle }
 }
 
 /// Resolve the service's System-tier log endpoint — `/log/<name>` under the logging
@@ -214,11 +206,7 @@ fn compute_backoff(cfg: &RestartConfig, attempts: u32) -> u64 {
     match cfg.backoff {
         Backoff::None => 0,
         Backoff::Linear => cfg.initial_ns,
-        Backoff::Exponential => cfg
-            .initial_ns
-            .checked_shl(attempts)
-            .unwrap_or(u64::MAX)
-            .min(cfg.max_ns),
+        Backoff::Exponential => cfg.initial_ns.checked_shl(attempts).unwrap_or(u64::MAX).min(cfg.max_ns),
     }
 }
 
@@ -253,9 +241,7 @@ fn create_control_channel() -> Option<(u64, u64)> {
     // `libsession::spawn_leader` carries the same warning from the same failure in M7 Part F —
     // which is what named this one on sight.
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 10, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 10, 0) };
     if cr != 0 {
         return None;
     }
@@ -560,7 +546,6 @@ fn spawn_with_control(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> (i64, 
     (h, smgr_end)
 }
 
-
 /// Receive one handle from init's handoff channel: an empty message carrying at most one
 /// transferred handle. Returns `0` if the message was empty (init had that endpoint
 /// missing) or the receive failed.
@@ -656,17 +641,7 @@ impl ChainEndpoints {
     /// Every handle, in the order `desktop-session-mgr` receives them; `session-mgr` receives the
     /// same with no `draw`.
     fn all(&self) -> [u64; 9] {
-        [
-            self.fs,
-            self.profile,
-            self.tty,
-            self.draw,
-            self.clip,
-            self.views,
-            self.devices,
-            self.storage,
-            self.services,
-        ]
+        [self.fs, self.profile, self.tty, self.draw, self.clip, self.views, self.devices, self.storage, self.services]
     }
 
     /// A second set of everything but `draw`, which only one column takes. `TRANSFER |
@@ -761,8 +736,7 @@ fn bring_up_desktop_session(root_ns: u64, set: ChainEndpoints) -> bool {
         set.close();
         return false;
     }
-    let (h, ctrl) =
-        spawn_with_control(root_ns, b"/bin/desktop-session-mgr", &raw mut SPAWN_DESKTOP_SESSION);
+    let (h, ctrl) = spawn_with_control(root_ns, b"/bin/desktop-session-mgr", &raw mut SPAWN_DESKTOP_SESSION);
     if h < 0 || ctrl == 0 {
         kprint(b"service-mgr: desktop-session-mgr spawn FAIL\n");
         set.close();
@@ -1114,8 +1088,7 @@ fn take_ready(ctrl: u64) -> Ready {
     // SAFETY: the kernel wrote the count and the handles it installed.
     let count = unsafe { (&raw const RDY_COUNT).read() }.min(8);
     // SAFETY: as above.
-    let handles: alloc::vec::Vec<u64> =
-        (0..count).map(|k| unsafe { (&raw const RDY_HANDLES[k]).read() }).collect();
+    let handles: alloc::vec::Vec<u64> = (0..count).map(|k| unsafe { (&raw const RDY_HANDLES[k]).read() }).collect();
     // SAFETY: bounded read of the payload the kernel just wrote.
     let msg = unsafe {
         let len = u32::from_le_bytes([RDY_MSG[4], RDY_MSG[5], RDY_MSG[6], RDY_MSG[7]]) as usize;
@@ -1127,9 +1100,7 @@ fn take_ready(ctrl: u64) -> Ready {
         Ready::Refused(alloc::string::String::from_utf8_lossy(why).into_owned())
     };
     match decoded {
-        Some((op, flags, body))
-            if op == librsproto::OP_READY && flags & librsproto::RS_FLAG_ERROR != 0 =>
-        {
+        Some((op, flags, body)) if op == librsproto::OP_READY && flags & librsproto::RS_FLAG_ERROR != 0 => {
             let why = librsproto::error::parse_error(&body).map(|e| e.msg).unwrap_or(b"");
             let why: &[u8] = if why.is_empty() { b"it refused, and gave no reason" } else { why };
             refused(why, &handles)
@@ -1138,9 +1109,7 @@ fn take_ready(ctrl: u64) -> Ready {
             handles[1..].iter().for_each(|&h| close(h));
             Ready::Endpoint(handles[0])
         }
-        Some((op, _, _)) if op == librsproto::OP_READY => {
-            refused(b"a Ready with no endpoint in it", &handles)
-        }
+        Some((op, _, _)) if op == librsproto::OP_READY => refused(b"a Ready with no endpoint in it", &handles),
         _ => refused(b"its first message was not a Ready", &handles),
     }
 }
@@ -1502,11 +1471,7 @@ impl Mgr {
         match self.after_until {
             _ if waiting.is_empty() => {
                 if self.after_until.take().is_some() {
-                    Line::new()
-                        .s(b"service-mgr: what '")
-                        .s(name.as_bytes())
-                        .s(b"' waited for has finished")
-                        .end();
+                    Line::new().s(b"service-mgr: what '").s(name.as_bytes()).s(b"' waited for has finished").end();
                 }
                 true
             }
@@ -1644,12 +1609,10 @@ impl Mgr {
         }
         let mut results = [0u8; 24 * WAIT_MAX];
         // SAFETY: valid wait arrays on this frame, `n` entries.
-        let w = unsafe {
-            syscall4(SYS_WAIT, handles.as_ptr() as u64, n as u64, results.as_mut_ptr() as u64, deadline)
-        };
-        (0..w.max(0) as usize).map(|k| &results[24 * k..24 * (k + 1)]).find_map(|e| {
-            (u64::from_le_bytes(e[..8].try_into().ok()?) == h).then(|| e.try_into().ok()).flatten()
-        })
+        let w = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, n as u64, results.as_mut_ptr() as u64, deadline) };
+        (0..w.max(0) as usize)
+            .map(|k| &results[24 * k..24 * (k + 1)])
+            .find_map(|e| (u64::from_le_bytes(e[..8].try_into().ok()?) == h).then(|| e.try_into().ok()).flatten())
     }
 
     /// Resolve `path` in `ns`, **answering resolves until it completes** or `deadline` passes:
@@ -1810,9 +1773,7 @@ impl Mgr {
     /// for a login supervisor, while something is bound there; `0` otherwise, and the sessions
     /// bind nothing.
     fn route_copy(&self, name: &str, through: Option<&str>) -> u64 {
-        let found = self.routes.iter().find(|r| {
-            r.live && r.through == through && self.svcs[r.svc].decl.name == name
-        });
+        let found = self.routes.iter().find(|r| r.live && r.through == through && self.svcs[r.svc].decl.name == name);
         match found {
             // SAFETY: a channel end this process holds.
             Some(r) => unsafe { dup_endpoint(r.client) },
@@ -1848,11 +1809,7 @@ impl Mgr {
                 self.ask_for_the_emergency_shell();
             }
             Failed::Continue => {
-                Line::new()
-                    .s(b"service-mgr: '")
-                    .s(name.as_bytes())
-                    .s(b"' did not come up; going on without it")
-                    .end();
+                Line::new().s(b"service-mgr: '").s(name.as_bytes()).s(b"' did not come up; going on without it").end();
             }
         }
     }
@@ -1943,10 +1900,7 @@ impl Mgr {
         }
         let backoff = compute_backoff(&s.decl.restart, s.attempts);
         let mut l = Line::new();
-        l.s(b"service-mgr: restarting '")
-            .s(s.decl.name.as_bytes())
-            .s(b"' (attempt ")
-            .u((s.attempts + 1) as u64);
+        l.s(b"service-mgr: restarting '").s(s.decl.name.as_bytes()).s(b"' (attempt ").u((s.attempts + 1) as u64);
         if s.decl.restart.max_attempts != 0 {
             l.s(b" of ").u(s.decl.restart.max_attempts as u64);
         }
@@ -2041,9 +1995,7 @@ impl Mgr {
                 self.services.session_client = client;
                 self.services.session_serve = serve;
             }
-            None => {
-                kprint(b"service-mgr: services session endpoint create FAIL -- no /dev/services\n")
-            }
+            None => kprint(b"service-mgr: services session endpoint create FAIL -- no /dev/services\n"),
         }
     }
 
@@ -2131,9 +2083,7 @@ impl Mgr {
         let root = self.services.serve;
         while root != 0 {
             match recv_request(root) {
-                Ok(Some((op, request_id, body))) => {
-                    self.answer_resolve(root, op, request_id, &body, false)
-                }
+                Ok(Some((op, request_id, body))) => self.answer_resolve(root, op, request_id, &body, false),
                 Ok(None) => break,
                 Err(()) => {
                     close(root);
@@ -2147,9 +2097,7 @@ impl Mgr {
         let session = self.services.session_serve;
         while session != 0 {
             match recv_request(session) {
-                Ok(Some((op, request_id, body))) => {
-                    self.answer_resolve(session, op, request_id, &body, true)
-                }
+                Ok(Some((op, request_id, body))) => self.answer_resolve(session, op, request_id, &body, true),
                 _ => break,
             }
         }
@@ -2409,11 +2357,7 @@ impl Mgr {
         let name = self.svcs[i].decl.name.clone();
         match action {
             services::Action::CancelRestart => {
-                Line::new()
-                    .s(b"service-mgr: '")
-                    .s(name.as_bytes())
-                    .s(b"' will not be restarted, as asked")
-                    .end();
+                Line::new().s(b"service-mgr: '").s(name.as_bytes()).s(b"' will not be restarted, as asked").end();
                 let s = &mut self.svcs[i];
                 s.restart_at = None;
                 s.requested_shutdown = true;
@@ -2547,8 +2491,7 @@ fn drain_codes(notif: u64, codes: &mut alloc::vec::Vec<i32>) {
             break; // WouldBlock: drained
         }
         // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-        let (kind, body) =
-            unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+        let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
         if kind != KIND_CHILD_EXITED {
             continue;
         }

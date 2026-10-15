@@ -285,7 +285,8 @@ pub unsafe fn init() -> Present {
         return found;
     }
     let Some(config) = read_data() else { return found };
-    let new = (config | CONFIG_TRANSLATE) & !(CONFIG_KBD_IRQ | CONFIG_AUX_IRQ)
+    let new = (config | CONFIG_TRANSLATE)
+        & !(CONFIG_KBD_IRQ | CONFIG_AUX_IRQ)
         & !(CONFIG_KBD_CLOCK_OFF | CONFIG_AUX_CLOCK_OFF);
     if !command(CMD_WRITE_CONFIG) || !write_data(new) {
         return found;

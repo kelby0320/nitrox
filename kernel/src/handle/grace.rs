@@ -63,10 +63,7 @@ impl GraceTracker {
     pub(crate) const fn new() -> Self {
         // `[const { ... }; N]` is the stable-Rust way to construct an
         // array of non-`Copy` const-initialised values.
-        Self {
-            current_epoch: AtomicU64::new(0),
-            ctx_observed: [const { AtomicU64::new(INITIAL_OBSERVED) }; MAX_CTX],
-        }
+        Self { current_epoch: AtomicU64::new(0), ctx_observed: [const { AtomicU64::new(INITIAL_OBSERVED) }; MAX_CTX] }
     }
 
     /// Enter a read-side critical section. Returns a guard that marks
@@ -84,10 +81,7 @@ impl GraceTracker {
         // Pairs with the Release in `drain_expired` so the read-side
         // section observes the closes scheduled at earlier epochs.
         fence(Ordering::Acquire);
-        ReadGuard {
-            tracker: self,
-            ctx_id,
-        }
+        ReadGuard { tracker: self, ctx_id }
     }
 
     /// Mark a context quiescent without holding a guard. Used by
@@ -122,11 +116,7 @@ impl GraceTracker {
     pub(crate) fn is_grace_period_past(&self, deferred_epoch: u64) -> bool {
         (0..MAX_CTX).all(|i| {
             let v = self.ctx_observed[i].load(Ordering::Acquire);
-            if v & QUIESCED_BIT != 0 {
-                true
-            } else {
-                (v & !QUIESCED_BIT) > deferred_epoch
-            }
+            if v & QUIESCED_BIT != 0 { true } else { (v & !QUIESCED_BIT) > deferred_epoch }
         })
     }
 }
@@ -145,8 +135,7 @@ impl Drop for ReadGuard<'_> {
         // last active at epoch X" while also seeing "and has now
         // quiesced".
         let v = self.tracker.ctx_observed[self.ctx_id as usize].load(Ordering::Relaxed);
-        self.tracker.ctx_observed[self.ctx_id as usize]
-            .store(v | QUIESCED_BIT, Ordering::Release);
+        self.tracker.ctx_observed[self.ctx_id as usize].store(v | QUIESCED_BIT, Ordering::Release);
     }
 }
 

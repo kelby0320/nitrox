@@ -87,11 +87,7 @@ impl KError {
 /// The thin convenience the safe wrappers are built from: a negative return is a
 /// `KError` discriminant, a non-negative is the operation's value (count/handle/0).
 pub fn from_raw(ret: i64) -> Result<i64, KError> {
-    if ret < 0 {
-        Err(KError::from_i32(ret as i32))
-    } else {
-        Ok(ret)
-    }
+    if ret < 0 { Err(KError::from_i32(ret as i32)) } else { Ok(ret) }
 }
 
 #[cfg(test)]

@@ -28,12 +28,12 @@ use super::context::{self, DCI_EP0, speed};
 use super::desc;
 use super::hid::LightsTo;
 use super::ring::{Producer, Trb, code, kind};
-use super::{Awaited, CommandRing, DmaSlots, PoPtr, Waiting, Xhci, XHCI, read32, write32};
+use super::{Awaited, CommandRing, DmaSlots, PoPtr, Waiting, XHCI, Xhci, read32, write32};
 use crate::arch::timer::ArchTimer;
 use crate::device::UsbFacts;
-use crate::libkern::handle::KObjectType;
 use crate::libkern::KVec;
 use crate::libkern::block::MAX_DEVICE_NAME;
+use crate::libkern::handle::KObjectType;
 use crate::libkern::printable::Printable;
 use crate::mm::dma::DmaBuffer;
 use crate::object::device_node::{BlockGeometry, DeviceClass, DeviceNode, ResourceDescriptor};
@@ -69,7 +69,8 @@ const PORT_CHANGES: u32 = 0x7F << 17;
 /// The bits a write must carry back so as to change nothing else: the read-only ones and the
 /// ones that keep their value (Linux's `XHCI_PORT_RO | XHCI_PORT_RWS`). Writing `PED` as one would
 /// disable the port, and a change bit as one would clear it.
-const PORT_KEEP: u32 = (1 << 0) | (1 << 3) | (0xF << 10) | (1 << 30) | (0xF << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
+const PORT_KEEP: u32 =
+    (1 << 0) | (1 << 3) | (0xF << 10) | (1 << 30) | (0xF << 5) | (1 << 9) | (0x3 << 14) | (0x7 << 25);
 
 /// Why a device was not enumerated, or a step did not complete.
 #[derive(Copy, Clone, Debug)]
@@ -359,7 +360,16 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
 /// a second would reset the first class's endpoints (USB 2.0 §9.1.1.5) — then each class's own
 /// requests. A failure in the device's steps ends the whole binding.
 #[allow(clippy::too_many_arguments)]
-fn bind(x: &Xhci, port: u8, slot: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8], record: Option<u32>, serial: &[u8]) {
+fn bind(
+    x: &Xhci,
+    port: u8,
+    slot: u8,
+    speed_id: u8,
+    mem: &mut DeviceMem,
+    config: &[u8],
+    record: Option<u32>,
+    serial: &[u8],
+) {
     let hid = super::hid::prepare(port, speed_id, mem, config);
     let storage = super::storage::prepare(port, mem, config);
     if hid.is_none() && storage.is_none() {
@@ -505,7 +515,11 @@ fn address_and_read(
         );
     }
     let name_len = if name_len > 0 { name_len } else { desc::ids_into(dev.vendor, dev.product, &mut name) };
-    Ok((UsbFacts { vendor: dev.vendor, product: dev.product, class, port, speed: speed_id, name, name_len }, config_len, serial_len))
+    Ok((
+        UsbFacts { vendor: dev.vendor, product: dev.product, class, port, speed: speed_id, name, name_len },
+        config_len,
+        serial_len,
+    ))
 }
 
 /// The product string, then ` (serial)` if it fits, into `out`. The length written; zero when the
@@ -540,7 +554,9 @@ fn name_of(
     }
     let mut s = 0;
     if dev.serial != 0 {
-        s = string(x, port, slot, mem, dev.serial, lang)?.and_then(|b| desc::string_into(b, &mut serial[..])).unwrap_or(0);
+        s = string(x, port, slot, mem, dev.serial, lang)?
+            .and_then(|b| desc::string_into(b, &mut serial[..]))
+            .unwrap_or(0);
         if s > 0 && n + s + 3 <= out.len() {
             if n > 0 {
                 out[n..n + 2].copy_from_slice(b" (");
@@ -558,12 +574,21 @@ fn name_of(
 
 /// **String descriptor `index`**, in language `lang`: its bytes, or `None` if the device stalled the
 /// request and its default endpoint was recovered. Any other failure is the device's end.
-fn string<'m>(x: &Xhci, port: u8, slot: u8, mem: &'m mut DeviceMem, index: u8, lang: u16) -> Result<Option<&'m [u8]>, (&'static str, Failed)> {
+fn string<'m>(
+    x: &Xhci,
+    port: u8,
+    slot: u8,
+    mem: &'m mut DeviceMem,
+    index: u8,
+    lang: u16,
+) -> Result<Option<&'m [u8]>, (&'static str, Failed)> {
     match control_in(x, slot, mem, get_descriptor(desc::kind::STRING, index, lang, 255), 255) {
         Ok(_) => Ok(Some(data_bytes(mem, 255))),
         Err(Failed::Code(code::STALL)) => {
             recover_ep0(x, slot, mem).map_err(|e| ("recovering its default endpoint after a stall", e))?;
-            crate::kprintln!("usb: port {port}: string {index} stalled; its endpoint is recovered, and it is named without it");
+            crate::kprintln!(
+                "usb: port {port}: string {index} stalled; its endpoint is recovered, and it is named without it"
+            );
             Ok(None)
         }
         Err(e) => Err(("reading its strings", e)),
@@ -583,7 +608,15 @@ pub(super) fn recover_ep0(x: &Xhci, slot: u8, mem: &DeviceMem) -> Result<(), Fai
 /// **A GET_DESCRIPTOR** of `kind`, index `index`, in language `lang`, up to `len` bytes, on the
 /// device's default endpoint. The bytes, which are as many as asked: a device that sent fewer
 /// left the rest zero, and the descriptor's own lengths say how much is real.
-fn read_descriptor<'m>(x: &Xhci, slot: u8, mem: &'m mut DeviceMem, kind: u8, index: u8, lang: u16, len: u16) -> Result<&'m [u8], Failed> {
+fn read_descriptor<'m>(
+    x: &Xhci,
+    slot: u8,
+    mem: &'m mut DeviceMem,
+    kind: u8,
+    index: u8,
+    lang: u16,
+    len: u16,
+) -> Result<&'m [u8], Failed> {
     control_in(x, slot, mem, get_descriptor(kind, index, lang, len), len)?;
     Ok(data_bytes(mem, len))
 }
@@ -788,7 +821,9 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
         Some((c, _)) => Err(Failed::Code(c)),
         None => {
             if !x.wedged.swap(true, Ordering::Relaxed) {
-                crate::kprintln!("usb: a command went unanswered for a second; nothing more is asked of the controller");
+                crate::kprintln!(
+                    "usb: a command went unanswered for a second; nothing more is asked of the controller"
+                );
             }
             Err(Failed::Timeout)
         }
@@ -809,7 +844,10 @@ fn wait(x: &Xhci, po: &ObjectRef, bound_ns: u64) -> Option<(u8, u64)> {
         if x.waiting.lock().take().is_some() {
             return None;
         }
-        while !matches!(crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0), crate::sched::WaitResult::Signaled(_)) {
+        while !matches!(
+            crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0),
+            crate::sched::WaitResult::Signaled(_)
+        ) {
             sleep(1_000_000);
         }
     }

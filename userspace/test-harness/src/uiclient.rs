@@ -71,16 +71,12 @@ extern crate alloc;
 use libdraw::framebuffer::Framebuffer;
 use libdraw::scene;
 use libkern::debug::Line;
-use libkern::{
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint,
-    syscall2, syscall4,
-};
+use libkern::{SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2, syscall4};
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, FocusEvent,
-    MgrWindowCreated, OP_CONFIGURE, OP_FOCUS_EVENT,
-    MgrWindowRef, OP_ATTACH_BUFFER, OP_COMMIT, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
-    OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, ROLE_NORMAL, Role,
-    SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request,
+    AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, FocusEvent, MgrWindowCreated,
+    MgrWindowRef, OP_ATTACH_BUFFER, OP_COMMIT, OP_CONFIGURE, OP_FOCUS_EVENT, OP_MGR_WINDOW_CREATED,
+    OP_MGR_WINDOW_DESTROYED, OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, ROLE_NORMAL, Role, SURFACE_FORMAT_XRGB8888,
+    build_attach_buffer_request, build_commit_request,
 };
 use libsurface::{Session, Transport, ipc::ChannelTransport};
 
@@ -141,14 +137,7 @@ impl Win {
         self.session.window(self.id).expect("this session's only window")
     }
 
-    fn attach(
-        &mut self,
-        b: u32,
-        width: u32,
-        height: u32,
-        pitch: u32,
-        handle: u64,
-    ) -> Result<(), libsurface::UiError> {
+    fn attach(&mut self, b: u32, width: u32, height: u32, pitch: u32, handle: u64) -> Result<(), libsurface::UiError> {
         self.w().attach(b, width, height, pitch, handle)
     }
 
@@ -169,7 +158,6 @@ impl Win {
     }
 }
 
-
 /// Create a `MemoryObject` of `len` bytes and map it read-write.
 ///
 /// Returns `(handle, address)`. The handle is transferred to the compositor on attach; the
@@ -182,13 +170,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     }
     // SAFETY: mapping an object this process just created, read-write.
     let addr = unsafe {
-        syscall4(
-            SYS_MEMORY_MAP,
-            h as u64,
-            0,
-            len as u64,
-            libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE,
-        )
+        syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE)
     };
     if addr <= 0 {
         // SAFETY: the map failed, so nothing references the object; closing our only
@@ -234,8 +216,7 @@ fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::Window
     let path = core::str::from_utf8(&path[..n]).ok()?;
 
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let ns =
-        unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
+    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: the path resolves to a read-mappable object holding one `WindowInfo`.
     let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ) }).ok()?;
     // **The constant, not the literal it used to equal.** `WindowInfo` grew from 32 to 40 bytes
@@ -269,10 +250,7 @@ fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
         .u(info.role as u64)
         .end();
 
-    info.id == id
-        && info.width == want_w
-        && info.height == want_h
-        && info.role == librsproto::surface::ROLE_NORMAL
+    info.id == id && info.width == want_w && info.height == want_h && info.role == librsproto::surface::ROLE_NORMAL
 }
 
 /// Open and close windows in a loop, proving the compositor gives the memory back.
@@ -377,10 +355,7 @@ fn churn(root_ns: u64) -> bool {
         match t.request(bogus_op, &req[..rn], Some(bogus_handle), &mut reply) {
             Err(libsurface::UiError::Server) => {}
             _ => {
-                Line::new()
-                    .s(b"churn: bogus request was not refused at cycle ")
-                    .u(cycle as u64)
-                    .end();
+                Line::new().s(b"churn: bogus request was not refused at cycle ").u(cycle as u64).end();
                 return false;
             }
         }
@@ -425,12 +400,7 @@ fn load_face(root_ns: u64, face: Face) -> libdraw::text::Font {
             f
         }
         Err(e) => {
-            Line::new()
-                .s(b"ui-testclient: ")
-                .s(wanted.as_str().as_bytes())
-                .s(b" ")
-                .s(e.why())
-                .end();
+            Line::new().s(b"ui-testclient: ").s(wanted.as_str().as_bytes()).s(b" ").s(e.why()).end();
             fail(b"ui-testclient: font load FAILED\n");
         }
     }
@@ -453,10 +423,7 @@ enum Face {
 /// window, and the picture leaves the screen.
 ///
 /// Every failure here is fatal to the run, for the reason [`load_face`] gives.
-fn present_reference_ui(
-    root_ns: u64,
-    font: &libdraw::text::Font,
-) -> Win {
+fn present_reference_ui(root_ns: u64, font: &libdraw::text::Font) -> Win {
     let (w, h) = (libui::reference::WIDTH, libui::reference::HEIGHT);
     let pitch = libui::reference::PITCH;
     let len = pitch * h as usize;
@@ -519,10 +486,7 @@ fn present_reference_ui(
 /// first frame is deterministic but shows a boot banner — one plain line — whereas this stream
 /// is built so each of its lines fails differently. A gate should compare the picture that
 /// discriminates.
-fn present_reference_term(
-    root_ns: u64,
-    font: &libdraw::text::Font,
-) -> Win {
+fn present_reference_term(root_ns: u64, font: &libdraw::text::Font) -> Win {
     use libterm::render::reference;
 
     let size = reference::size(font);
@@ -623,8 +587,8 @@ fn raise_window(mgr: &mut ChannelTransport, window: u32) -> bool {
 /// compares — the round trip is the assertion, not a state left behind.
 fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32) {
     use librsproto::surface::{
-        MgrDesktop, MgrWindowValue, OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_MINIMIZED,
-        OP_MGR_SET_WINDOW_DESKTOP, STICKY_DESKTOP, WINDOW_FLAG_MINIMIZED,
+        MgrDesktop, MgrWindowValue, OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_MINIMIZED, OP_MGR_SET_WINDOW_DESKTOP,
+        STICKY_DESKTOP, WINDOW_FLAG_MINIMIZED,
     };
 
     /// Send one `window`+`value` request; `false` if the compositor did not answer `Ok`.
@@ -832,11 +796,8 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
     // 1. Create, without waiting for the configure.
     let (bw, bh) = (40u32, 20u32);
     let mut req = [0u8; librsproto::surface::CREATE_WINDOW_REQUEST_LEN];
-    if librsproto::surface::build_create_window_request(
-        &mut req,
-        &CreateWindowRequest::new(bw, bh, Role::Normal),
-    )
-    .is_none()
+    if librsproto::surface::build_create_window_request(&mut req, &CreateWindowRequest::new(bw, bh, Role::Normal))
+        .is_none()
     {
         fail(b"ui-testclient: B4 could not build CreateWindow\n");
     }
@@ -869,9 +830,7 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
         if op == OP_CONFIGURE {
             fail(b"ui-testclient: a configure arrived before the manager had answered\n");
         }
-        if op == OP_FOCUS_EVENT
-            && FocusEvent::read(&buf[..n]).is_some_and(|f| f.window == id && f.focused != 0)
-        {
+        if op == OP_FOCUS_EVENT && FocusEvent::read(&buf[..n]).is_some_and(|f| f.window == id && f.focused != 0) {
             fail(b"ui-testclient: a held window was given the keyboard before it was on screen\n");
         }
     }
@@ -918,9 +877,17 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
     };
     if cfg.window != id || cfg.x != px || cfg.y != py {
         Line::new()
-            .s(b"ui-testclient: configure for ").u(cfg.window as u64)
-            .s(b" at ").i(cfg.x as i64).s(b",").i(cfg.y as i64)
-            .s(b", placed ").i(px as i64).s(b",").i(py as i64).end();
+            .s(b"ui-testclient: configure for ")
+            .u(cfg.window as u64)
+            .s(b" at ")
+            .i(cfg.x as i64)
+            .s(b",")
+            .i(cfg.y as i64)
+            .s(b", placed ")
+            .i(px as i64)
+            .s(b",")
+            .i(py as i64)
+            .end();
         fail(b"ui-testclient: the first configure did not carry the manager's placement\n");
     }
 
@@ -970,11 +937,7 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     //    do that would not be a menu. That it is *drawn* there is C2's host test, which reads
     //    pixels; this checks the geometry the compositor recorded.
     let (ox, oy) = (-14i32, 90i32);
-    let popup = raw_create(
-        &mut t,
-        &CreateWindowRequest::at(40, 30, Role::Popup { parent }, ox, oy),
-        b"C1 popup",
-    );
+    let popup = raw_create(&mut t, &CreateWindowRequest::at(40, 30, Role::Popup { parent }, ox, oy), b"C1 popup");
 
     // 3. **Not held.** Nothing here answered as the manager, so a popup that was held would
     //    still be waiting. Bounded by *elapsed time*, not by iterations — see
@@ -991,20 +954,16 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     let mut empty_slices = 0;
     loop {
         match t.wait_event_timeout(&mut buf, POPUP_CONFIGURE_SLICE_NS) {
-            Ok(Some((OP_CONFIGURE, n))) => {
-                match ConfigureEvent::read(&buf[..n]) {
-                    Some(c) if c.window == popup => break,
-                    _ => {}
-                }
-            }
+            Ok(Some((OP_CONFIGURE, n))) => match ConfigureEvent::read(&buf[..n]) {
+                Some(c) if c.window == popup => break,
+                _ => {}
+            },
             // Somebody else's record. It cost no time, so it costs no budget.
             Ok(Some(_)) => {}
             Ok(None) => {
                 empty_slices += 1;
                 if empty_slices >= POPUP_CONFIGURE_SLICES {
-                    fail(
-                        b"ui-testclient: a popup waited for the manager, which never places popups\n",
-                    );
+                    fail(b"ui-testclient: a popup waited for the manager, which never places popups\n");
                 }
             }
             Err(_) => fail(b"ui-testclient: C1 session channel error\n"),
@@ -1017,8 +976,15 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     };
     if (info.x, info.y) != (px + ox, py + oy) {
         Line::new()
-            .s(b"ui-testclient: popup at ").i(info.x as i64).s(b",").i(info.y as i64)
-            .s(b", wanted ").i((px + ox) as i64).s(b",").i((py + oy) as i64).end();
+            .s(b"ui-testclient: popup at ")
+            .i(info.x as i64)
+            .s(b",")
+            .i(info.y as i64)
+            .s(b", wanted ")
+            .i((px + ox) as i64)
+            .s(b",")
+            .i((py + oy) as i64)
+            .end();
         fail(b"ui-testclient: the popup was not placed at its offset from the parent\n");
     }
 
@@ -1033,11 +999,7 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     //    `#![no_main]` bin, which `cargo test -p compositor --lib` does not build. Without this
     //    the two roles could be merged back into one arm and every gate would stay green
     //    (PR #220 review, finding 2).
-    let dialog = raw_create(
-        &mut t,
-        &CreateWindowRequest::at(24, 18, Role::Dialog { parent }, 500, 400),
-        b"C1 dialog",
-    );
+    let dialog = raw_create(&mut t, &CreateWindowRequest::at(24, 18, Role::Dialog { parent }, 500, 400), b"C1 dialog");
 
     // Held: nothing answers as the manager yet, so no configure may arrive for it.
     let mut slices = 0;
@@ -1080,8 +1042,15 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     };
     if (got.x, got.y) != (dx, dy) {
         Line::new()
-            .s(b"ui-testclient: dialog at ").i(got.x as i64).s(b",").i(got.y as i64)
-            .s(b", manager placed ").i(dx as i64).s(b",").i(dy as i64).end();
+            .s(b"ui-testclient: dialog at ")
+            .i(got.x as i64)
+            .s(b",")
+            .i(got.y as i64)
+            .s(b", manager placed ")
+            .i(dx as i64)
+            .s(b",")
+            .i(dy as i64)
+            .end();
         fail(b"ui-testclient: a dialog took its creator's offset instead of the placement\n");
     }
 
@@ -1132,10 +1101,7 @@ fn raw_create(t: &mut ChannelTransport, req: &CreateWindowRequest, what: &[u8]) 
 /// The *transitive* removed set — a popup going with its parent — is covered by the host
 /// test `take_removed_reports_the_whole_subtree_parent_first_then_drains`. What only a
 /// booted guest can show is that these records are framed, queued and delivered at all.
-fn verify_manager_events(
-    mgr: &mut ChannelTransport,
-    root_ns: u64,
-) -> alloc::boxed::Box<ChannelTransport> {
+fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::boxed::Box<ChannelTransport> {
     // Everything the reference placements above queued is not this probe's business.
     drain_mgr(mgr);
 
@@ -1237,15 +1203,30 @@ fn verify_manager_events(
     };
     if g.x != px || g.y != py {
         Line::new()
-            .s(b"ui-testclient: WindowGeometry ").u(g.window as u64)
-            .s(b" at ").i(g.x as i64).s(b",").i(g.y as i64).end();
+            .s(b"ui-testclient: WindowGeometry ")
+            .u(g.window as u64)
+            .s(b" at ")
+            .i(g.x as i64)
+            .s(b",")
+            .i(g.y as i64)
+            .end();
         fail(b"ui-testclient: WindowGeometry did not report the position placed\n");
     }
     if (g.width, g.height) != (cw, ch) {
         Line::new()
-            .s(b"ui-testclient: WindowGeometry size ").u(g.width as u64).s(b"x").u(g.height as u64)
-            .s(b", committed ").u(cw as u64).s(b"x").u(ch as u64)
-            .s(b", requested ").u(pw as u64).s(b"x").u(ph as u64).end();
+            .s(b"ui-testclient: WindowGeometry size ")
+            .u(g.width as u64)
+            .s(b"x")
+            .u(g.height as u64)
+            .s(b", committed ")
+            .u(cw as u64)
+            .s(b"x")
+            .u(ch as u64)
+            .s(b", requested ")
+            .u(pw as u64)
+            .s(b"x")
+            .u(ph as u64)
+            .end();
         fail(b"ui-testclient: WindowGeometry reported a size that is not what is on screen\n");
     }
 
@@ -1276,7 +1257,6 @@ fn verify_manager_events(
     // channel open just means the probe's *cleanup* is not the last thing to touch the screen.
     w.into_transport()
 }
-
 
 /// Report failure and end the run.
 ///
@@ -1387,9 +1367,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 let c = Framebuffer::get_pixel(&rendered, x, y).unwrap_or_default();
                 let word = libdraw::format::PixelFormat::XRGB8888.encode(c);
                 // SAFETY: `addr` maps `len` writable bytes; `y*pitch + x*4 + 4 <= len`.
-                unsafe {
-                    (addr.add(y as usize * pitch + x as usize * 4) as *mut u32).write(word)
-                };
+                unsafe { (addr.add(y as usize * pitch + x as usize * 4) as *mut u32).write(word) };
             }
         }
         maps[i] = addr;
@@ -1410,11 +1388,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             Err(_) => {
                 // Built here rather than split across `fail`, which prints its argument as
                 // given: the frame number and the reason are one line.
-                Line::new()
-                    .s(b"ui-testclient: STALLED at frame ")
-                    .u(frame as u64)
-                    .s(b" -- no buffer released")
-                    .end();
+                Line::new().s(b"ui-testclient: STALLED at frame ").u(frame as u64).s(b" -- no buffer released").end();
                 fail(b"");
             }
         };
@@ -1561,15 +1535,7 @@ fn park(notif: u64) -> ! {
         // signals; the deadline is infinite, so this parks rather than spins.
         let handles = [notif];
         let mut results = [0u8; 24];
-        unsafe {
-            syscall4(
-                SYS_WAIT,
-                handles.as_ptr() as u64,
-                1,
-                results.as_mut_ptr() as u64,
-                u64::MAX,
-            )
-        };
+        unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
     }
 }
 
@@ -1648,10 +1614,7 @@ fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
                 if !set_current_desktop(mgr, current) {
                     fail(b"ui-testclient: SetCurrentDesktop was refused\n");
                 }
-                Line::new()
-                    .s(b"ui-testclient: hotkey fired -> desktop ")
-                    .u(current as u64)
-                    .end();
+                Line::new().s(b"ui-testclient: hotkey fired -> desktop ").u(current as u64).end();
             }
             Ok(_) => {}
             Err(_) => fail(b"ui-testclient: manager channel error while waiting for a chord\n"),

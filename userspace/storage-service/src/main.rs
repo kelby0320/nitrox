@@ -60,11 +60,11 @@ use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, OBJECT_KIND_MEMOBJ, RESOLVE_REPLY_LEN, SUBNAMESPACE_PREFIX_LEN, parse_resolve_request,
     resolve_reply, subnamespace_reply,
 };
-use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use librsproto::storage::{
     OP_STORAGE_CHANGED, OP_STORAGE_EJECT, OP_STORAGE_IN_USE, OP_STORAGE_MOUNT, OP_STORAGE_REREAD, OP_STORAGE_UNMOUNT,
     build_in_use, parse_mount,
 };
+use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 use storage_service::mounts::{self, Plan, Reread, RereadRefusal, automount, explicit, in_use};
 use storage_service::probe::{Found, probe_record};
 use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
@@ -190,8 +190,7 @@ fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u
 fn send_raw(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> i64 {
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
     unsafe {
-        let Some(rs_len) =
-            encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
         else {
             return KError::InvalidArgument.as_i32() as i64;
         };
@@ -323,10 +322,15 @@ fn recv(ch: u64) -> Result<Option<Received>, ()> {
     // SAFETY: bounded read of the payload the kernel just wrote.
     let msg = unsafe {
         let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        core::slice::from_raw_parts(((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF), len.min(MSG_LEN - PAYLOAD_OFF))
+        core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            len.min(MSG_LEN - PAYLOAD_OFF),
+        )
     };
     match decode(msg) {
-        Ok(m) => Ok(Some(Received { op: m.op, flags: m.flags, request_id: m.request_id, body: m.body.to_vec(), handles })),
+        Ok(m) => {
+            Ok(Some(Received { op: m.op, flags: m.flags, request_id: m.request_id, body: m.body.to_vec(), handles }))
+        }
         Err(_) => {
             handles.iter().for_each(|&h| close(h));
             Ok(None)
@@ -425,7 +429,14 @@ impl BlockReader for DeviceIo<'_> {
             let intra = (at - start) as usize;
             let want = (buf.len() - done).min(SCRATCH - intra);
             let span = ((intra + want) as u64).div_ceil(self.sector) * self.sector;
-            let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: self.scratch.mem, buf_offset: 0, offset: start, length: span };
+            let op = IoOp {
+                opcode: IO_OPCODE_READ,
+                flags: 0,
+                buffer: self.scratch.mem,
+                buf_offset: 0,
+                offset: start,
+                length: span,
+            };
             // SAFETY: `node` is a block device handle this process holds with READ; `&op` names a
             // memory object this process owns.
             let po = unsafe { syscall2(SYS_IO_SUBMIT, self.node, (&op as *const IoOp) as u64) };
@@ -1100,7 +1111,10 @@ impl Service {
                 // root it could not place, and the view broker would hand that disk over raw. The
                 // broker refuses `disks` when this goes unanswered.
                 if !self.init_known {
-                    return refuse(KError::NoAccess, b"init's mounts are not all known, so what is in use cannot be said");
+                    return refuse(
+                        KError::NoAccess,
+                        b"init's mounts are not all known, so what is in use cannot be said",
+                    );
                 }
                 let ids = in_use(&self.devices, &self.all_mounts());
                 let mut body = alloc::vec![0u8; 4 + 4 * ids.len()];
@@ -1144,7 +1158,13 @@ impl Service {
         };
         if let Reread::Disk(_) = what {
             match rescan(node) {
-                Ok(n) => Line::new().s(b"storage-service: ").s(name.as_bytes()).s(b" rescanned, as asked: ").u(n).s(b" partition(s)").end(),
+                Ok(n) => Line::new()
+                    .s(b"storage-service: ")
+                    .s(name.as_bytes())
+                    .s(b" rescanned, as asked: ")
+                    .u(n)
+                    .s(b" partition(s)")
+                    .end(),
                 Err(KError::Unsupported) => {
                     let r = RereadRefusal::CannotRescan;
                     return Err((r.kerror(), r.why()));
@@ -1165,11 +1185,22 @@ impl Service {
     /// one read again — through `node`; the names it was mounted under. A mount that fails is said.
     fn mount_as_arrival(&mut self, d: &Device, node: u64) -> Vec<String> {
         let taken: Vec<String> = self.mounted.iter().map(|m| m.label.clone()).collect();
-        let plan = mounts::arrival(core::slice::from_ref(d), &self.devices, &self.all_mounts(), &taken, self.live, self.init_known);
+        let plan = mounts::arrival(
+            core::slice::from_ref(d),
+            &self.devices,
+            &self.all_mounts(),
+            &taken,
+            self.live,
+            self.init_known,
+        );
         let mut names = Vec::new();
         for p in plan {
             if self.mounted.len() >= MAX_MOUNTS {
-                Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: every mount slot is in use").end();
+                Line::new()
+                    .s(b"storage-service: ")
+                    .untrusted(p.label.as_bytes())
+                    .s(b" did not mount: every mount slot is in use")
+                    .end();
                 break;
             }
             match mount(self.root_ns, &p, node) {
@@ -1177,7 +1208,12 @@ impl Service {
                     names.push(m.label.clone());
                     self.mounted.push(m);
                 }
-                Err(why) => Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: ").s(why).end(),
+                Err(why) => Line::new()
+                    .s(b"storage-service: ")
+                    .untrusted(p.label.as_bytes())
+                    .s(b" did not mount: ")
+                    .s(why)
+                    .end(),
             }
         }
         names
@@ -1225,7 +1261,10 @@ impl Service {
         close(x.control);
         close(x.process);
         if !recorded {
-            return Err((KError::IoError, b"its server did not record it clean, and the filesystem was not left clean"));
+            return Err((
+                KError::IoError,
+                b"its server did not record it clean, and the filesystem was not left clean",
+            ));
         }
         // 5. **The drive's cache written to its medium**: a writable mount's writes are only
         //    durable once it is. A read-only mount wrote nothing.
@@ -1375,7 +1414,11 @@ impl Service {
                     },
                     (OP_DEVICES_DEPARTED, &[]) if let Some(id) = parse_departed(&m.body) => self.departed(id),
                     _ => {
-                        Line::new().s(b"storage-service: the device manager sent op ").u(m.op as u64).s(b" it does not read; ignored").end();
+                        Line::new()
+                            .s(b"storage-service: the device manager sent op ")
+                            .u(m.op as u64)
+                            .s(b" it does not read; ignored")
+                            .end();
                         m.handles.iter().for_each(|&h| close(h));
                     }
                 },
@@ -1431,7 +1474,9 @@ impl Service {
         let root = b"/";
         // SAFETY: a namespace handle this process holds, and a valid path.
         let _ = unsafe { syscall3(SYS_NS_SYNC, x.ns, root.as_ptr() as u64, root.len() as u64) };
-        if send(x.control, OP_UNMOUNT, 1, 0, &[], &[]) && wait_until(x.control, now_ns().saturating_add(READY_TIMEOUT_NS)) {
+        if send(x.control, OP_UNMOUNT, 1, 0, &[], &[])
+            && wait_until(x.control, now_ns().saturating_add(READY_TIMEOUT_NS))
+        {
             if let Ok(Some(a)) = recv(x.control) {
                 a.handles.iter().for_each(|&h| close(h));
             }
@@ -1592,12 +1637,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         };
         match mount(root_ns, p, node) {
             Ok(m) => mounted.push(m),
-            Err(why) => Line::new()
-                .s(b"storage-service: ")
-                .untrusted(p.label.as_bytes())
-                .s(b" did not mount: ")
-                .s(why)
-                .end(),
+            Err(why) => {
+                Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: ").s(why).end()
+            }
         }
     }
 

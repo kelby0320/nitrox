@@ -37,9 +37,9 @@
 
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
-use libstream::wire::Record;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use libstream::wire::Record;
 
 /// One external stage: a program and its argument vector.
 #[derive(Clone, PartialEq, Debug)]
@@ -63,12 +63,7 @@ pub struct StageStatus {
 
 impl StageStatus {
     pub fn ok(command: impl Into<String>) -> StageStatus {
-        StageStatus {
-            command: command.into(),
-            exit_status: 0,
-            crashed: false,
-            cancelled: false,
-        }
+        StageStatus { command: command.into(), exit_status: 0, crashed: false, cancelled: false }
     }
 
     /// Whether this stage counts as having succeeded.
@@ -220,9 +215,7 @@ impl Host for NullHost {
         _strict: bool,
         _env: &Record,
     ) -> Result<PipelineRun, String> {
-        Err(String::from(
-            "this interpreter has no host attached, so it cannot run a program",
-        ))
+        Err(String::from("this interpreter has no host attached, so it cannot run a program"))
     }
 
     fn read_file(&mut self, _path: &str) -> Result<Vec<u8>, String> {
@@ -359,10 +352,7 @@ impl MockHost {
     }
 
     fn lookup(&self, name: &str) -> Option<(i32, Option<Vec<u8>>)> {
-        self.programs
-            .iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, s, o)| (*s, o.clone()))
+        self.programs.iter().find(|(n, _, _)| n == name).map(|(_, s, o)| (*s, o.clone()))
     }
 }
 
@@ -372,11 +362,7 @@ impl Host for MockHost {
     }
 
     fn list_dir(&mut self, dir: &str) -> Vec<(String, bool)> {
-        self.entries
-            .iter()
-            .find(|(d, _)| d == dir)
-            .map(|(_, e)| e.clone())
-            .unwrap_or_default()
+        self.entries.iter().find(|(d, _)| d == dir).map(|(_, e)| e.clone()).unwrap_or_default()
     }
 
     fn interrupted(&mut self) -> bool {

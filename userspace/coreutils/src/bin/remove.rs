@@ -39,8 +39,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use libfs::TreeError;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use libfs::TreeError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
 use libkern::{exit, kprint};
@@ -154,26 +154,20 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 /// cannot tell whether the path it was handed was a mistake.
 fn remove_tree(stage: &Stage, path: &[u8], out: &mut Vec<Removed>) {
     let r = libfs::remove_tree(stage.namespace, path, &mut |p, is_dir| {
-        out.push(Removed {
-            path: as_string(p),
-            kind: if is_dir { "directory" } else { "file" },
-        });
+        out.push(Removed { path: as_string(p), kind: if is_dir { "directory" } else { "file" } });
     });
     match r {
         Ok(()) => {}
-        Err(TreeError::TooDeep) => {
-            stage.die(b"remove: maximum recursion depth exceeded\n", EXIT_FAILURE)
-        }
+        Err(TreeError::TooDeep) => stage.die(b"remove: maximum recursion depth exceeded\n", EXIT_FAILURE),
         Err(TreeError::OpenDir) => stage.die(b"remove: cannot open directory\n", EXIT_FAILURE),
         Err(TreeError::ReadDir) => stage.die(b"remove: cannot read directory\n", EXIT_FAILURE),
         Err(TreeError::Unlink) => stage.die(b"remove: cannot remove file\n", EXIT_FAILURE),
         // This descent emptied the directory before asking for it, so `NotEmpty` is not
         // "you forgot --recursive" — something else added an entry while the walk was in
         // progress. Naming the race beats reporting an unexplained failure.
-        Err(TreeError::Rmdir(k)) if k == KError::NotEmpty.as_i32() => stage.die(
-            b"remove: directory was refilled while being emptied\n",
-            EXIT_FAILURE,
-        ),
+        Err(TreeError::Rmdir(k)) if k == KError::NotEmpty.as_i32() => {
+            stage.die(b"remove: directory was refilled while being emptied\n", EXIT_FAILURE)
+        }
         Err(_) => stage.die(b"remove: cannot remove directory\n", EXIT_FAILURE),
     }
 }
@@ -200,9 +194,7 @@ fn classify(stage: &Stage, path: &[u8]) -> What {
 /// bindings, which is where a mount point appears.
 fn is_binding(stage: &Stage, path: &[u8]) -> bool {
     let name = libfs::basename(path);
-    libfs::ns_children(stage.namespace, libfs::parent(path))
-        .iter()
-        .any(|(n, _)| n.as_bytes() == name)
+    libfs::ns_children(stage.namespace, libfs::parent(path)).iter().any(|(n, _)| n.as_bytes() == name)
 }
 
 /// Drop trailing slashes so `remove /a/b/` names the same entry as `remove /a/b`.
@@ -220,9 +212,11 @@ fn as_string(path: &[u8]) -> String {
 
 /// Write the rows as a TSM1 table on the `stdout` stream.
 fn emit(stage: &Stage, stdout: u64, removed: &[Removed]) {
-    let schema = Schema::new()
-        .field("path", TypeTag::String, TypeModifiers::NONE)
-        .field("kind", TypeTag::String, TypeModifiers::NONE);
+    let schema = Schema::new().field("path", TypeTag::String, TypeModifiers::NONE).field(
+        "kind",
+        TypeTag::String,
+        TypeModifiers::NONE,
+    );
 
     let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {

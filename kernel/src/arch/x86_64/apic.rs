@@ -137,10 +137,7 @@ pub(crate) fn is_initialised() -> bool {
 /// Ring-0. The CPU must advertise x2APIC (asserted here); `IA32_APIC_BASE` is
 /// architectural. Runs once per CPU before that CPU programs its timer / EOIs.
 pub(crate) unsafe fn enable_this_cpu() {
-    assert!(
-        X86Cpu::has_apic(),
-        "no on-chip local APIC — the kernel requires one (CPUID.01H:EDX.9)."
-    );
+    assert!(X86Cpu::has_apic(), "no on-chip local APIC — the kernel requires one (CPUID.01H:EDX.9).");
     assert!(has_x2apic(), "CPU lacks x2APIC (CPUID.01H:ECX.21) — required.");
 
     // SAFETY: IA32_APIC_BASE is architectural. If not already in x2APIC, enter it
@@ -151,14 +148,8 @@ pub(crate) unsafe fn enable_this_cpu() {
     unsafe {
         let base = regs::rdmsr(MSR_IA32_APIC_BASE);
         if base & APIC_BASE_X2APIC_ENABLE == 0 {
-            regs::wrmsr(
-                MSR_IA32_APIC_BASE,
-                (base | APIC_BASE_GLOBAL_ENABLE) & !APIC_BASE_X2APIC_ENABLE,
-            );
-            regs::wrmsr(
-                MSR_IA32_APIC_BASE,
-                base | APIC_BASE_GLOBAL_ENABLE | APIC_BASE_X2APIC_ENABLE,
-            );
+            regs::wrmsr(MSR_IA32_APIC_BASE, (base | APIC_BASE_GLOBAL_ENABLE) & !APIC_BASE_X2APIC_ENABLE);
+            regs::wrmsr(MSR_IA32_APIC_BASE, base | APIC_BASE_GLOBAL_ENABLE | APIC_BASE_X2APIC_ENABLE);
         }
     }
     ENABLED.store(true, Ordering::Relaxed);

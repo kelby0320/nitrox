@@ -319,11 +319,7 @@ impl Grid {
 
     /// The cell at `(row, col)`, or `None` outside the screen.
     pub fn cell(&self, row: usize, col: usize) -> Option<Cell> {
-        if row < self.rows && col < self.cols {
-            Some(self.cells[row * self.cols + col])
-        } else {
-            None
-        }
+        if row < self.rows && col < self.cols { Some(self.cells[row * self.cols + col]) } else { None }
     }
 
     /// Lines that have scrolled off, oldest first.
@@ -679,8 +675,7 @@ impl Grid {
             self.touch(self.row);
             self.cursor_drawn = (self.row, self.col);
         }
-        let rows: Vec<usize> =
-            self.dirty.iter().enumerate().filter(|(_, d)| **d).map(|(i, _)| i).collect();
+        let rows: Vec<usize> = self.dirty.iter().enumerate().filter(|(_, d)| **d).map(|(i, _)| i).collect();
         self.dirty.iter_mut().for_each(|d| *d = false);
         rows
     }
@@ -716,13 +711,7 @@ impl Grid {
     pub fn resize(&mut self, cols: usize, rows: usize) -> Reflow {
         let (cols, rows) = (cols.max(1), rows.max(1));
         if cols == self.cols && rows == self.rows {
-            return Reflow {
-                base: self.oldest_line(),
-                at: Vec::new(),
-                lines: Vec::new(),
-                cols,
-                evicted: 0,
-            };
+            return Reflow { base: self.oldest_line(), at: Vec::new(), lines: Vec::new(), cols, evicted: 0 };
         }
         let base = self.oldest_line();
 
@@ -787,8 +776,7 @@ impl Grid {
         // selection alike.
         let screen_start = lines.len().saturating_sub(rows);
         let at = pos.clone();
-        let line_spans: Vec<(usize, usize)> =
-            start.iter().zip(height.iter()).map(|(&s, &h)| (s, h)).collect();
+        let line_spans: Vec<(usize, usize)> = start.iter().zip(height.iter()).map(|(&s, &h)| (s, h)).collect();
 
         // 4. The bottom `rows` become the screen; the rest is history.
         self.cells = vec![blank; cols * rows];
@@ -1297,8 +1285,7 @@ mod tests {
 
     /// A row's characters, trailing blanks trimmed.
     fn line(g: &Grid, row: usize) -> alloc::string::String {
-        let s: alloc::string::String =
-            (0..g.cols()).map(|c| g.cell(row, c).unwrap().ch).collect();
+        let s: alloc::string::String = (0..g.cols()).map(|c| g.cell(row, c).unwrap().ch).collect();
         s.trim_end().into()
     }
 
@@ -1616,8 +1603,7 @@ mod tests {
         assert_eq!(line(&g, 0), "two");
         assert_eq!(line(&g, 1), "six", "the third line did not land on the bottom row");
         assert_eq!(g.scrollback().len(), 1);
-        let first: alloc::string::String =
-            g.scrollback().next().unwrap().cells.iter().map(|c| c.ch).collect();
+        let first: alloc::string::String = g.scrollback().next().unwrap().cells.iter().map(|c| c.ch).collect();
         assert_eq!(first.trim_end(), "one");
     }
 
@@ -1648,11 +1634,7 @@ mod tests {
         let at = |top: u64, row: usize| g.view_cell(top, row, 0).map(|c| c.ch);
         assert_eq!((at(5, 0), at(5, 1)), (Some('5'), Some(' ')), "the bottom: the live screen");
         assert_eq!((at(3, 0), at(3, 1)), (Some('3'), Some('4')), "wholly in the scrollback");
-        assert_eq!(
-            (at(4, 0), at(4, 1)),
-            (Some('4'), Some('5')),
-            "straddling: history above, screen below",
-        );
+        assert_eq!((at(4, 0), at(4, 1)), (Some('4'), Some('5')), "straddling: history above, screen below",);
     }
 
     #[test]
@@ -1664,14 +1646,12 @@ mod tests {
         for i in 0..6 {
             feed(&mut g, &alloc::format!("{i}\r\n"));
         }
-        let before: alloc::vec::Vec<Option<char>> =
-            (0..2).map(|r| g.view_cell(2, r, 0).map(|c| c.ch)).collect();
+        let before: alloc::vec::Vec<Option<char>> = (0..2).map(|r| g.view_cell(2, r, 0).map(|c| c.ch)).collect();
 
         for i in 6..9 {
             feed(&mut g, &alloc::format!("{i}\r\n"));
         }
-        let after: alloc::vec::Vec<Option<char>> =
-            (0..2).map(|r| g.view_cell(2, r, 0).map(|c| c.ch)).collect();
+        let after: alloc::vec::Vec<Option<char>> = (0..2).map(|r| g.view_cell(2, r, 0).map(|c| c.ch)).collect();
         assert_eq!(before, after, "the anchored view moved when output arrived");
         assert_eq!(before, [Some('2'), Some('3')]);
     }
@@ -2128,5 +2108,4 @@ mod tests {
         assert_eq!(g.selected_text(), None);
         assert!(!g.has_selection());
     }
-
 }

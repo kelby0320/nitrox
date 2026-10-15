@@ -71,8 +71,7 @@ impl Metrics {
             // **The baseline moves down with the extra room**, so the leading is split above and
             // below the glyphs rather than all piling under them: a line sitting hard against
             // the top of a tall cell reads as a line with a gap after it, not as a line.
-            ascent: libm::ceilf(v.ascent).max(0.0) as u32
-                + leading.saturating_sub(natural) / 2,
+            ascent: libm::ceilf(v.ascent).max(0.0) as u32 + leading.saturating_sub(natural) / 2,
             px,
         }
     }
@@ -84,12 +83,7 @@ impl Metrics {
 
     /// The rectangle one cell occupies, relative to the grid's top-left.
     pub fn cell_rect(&self, row: usize, col: usize) -> Rect {
-        Rect::new(
-            (col as u32 * self.cell_w) as i32,
-            (row as u32 * self.cell_h) as i32,
-            self.cell_w,
-            self.cell_h,
-        )
+        Rect::new((col as u32 * self.cell_w) as i32, (row as u32 * self.cell_h) as i32, self.cell_w, self.cell_h)
     }
 
     /// The rectangle one row occupies, `cols` wide.
@@ -205,10 +199,8 @@ fn render_each<F: Framebuffer + ?Sized>(
             // **The cursor wins where they overlap** — inverting twice is not inverting, so a
             // cursor inside a selection would appear as a hole in it. The cursor is the more
             // urgent of the two: it says where typing goes.
-            let selected = !cursor
-                && selection.is_some_and(|s| {
-                    top.checked_add(row as u64).is_some_and(|l| s.contains(l, col))
-                });
+            let selected =
+                !cursor && selection.is_some_and(|s| top.checked_add(row as u64).is_some_and(|l| s.contains(l, col)));
             draw_cell(fb, font, m, palette, origin, row, col, cell, cursor || selected);
         }
     }
@@ -399,24 +391,12 @@ mod tests {
         // **A row is the design's leading, and the glyphs sit in the middle of it** (desktop
         // refresh, Part K). Nothing pinned `cell_h` before this, so multiplying it by 1.6 broke
         // no test at all.
-        assert_eq!(
-            m.cell_h,
-            libm::ceilf(m.px * LINE_HEIGHT) as u32,
-            "a row is {LINE_HEIGHT} times the text's size"
-        );
+        assert_eq!(m.cell_h, libm::ceilf(m.px * LINE_HEIGHT) as u32, "a row is {LINE_HEIGHT} times the text's size");
         let natural = libm::ceilf(font().v_metrics(m.px).line_height) as u32;
-        assert!(
-            m.cell_h > natural,
-            "the leading adds room: {} against the face's own {natural}",
-            m.cell_h
-        );
+        assert!(m.cell_h > natural, "the leading adds room: {} against the face's own {natural}", m.cell_h);
         // The extra room is split, so the text is not hard against the top of its cell.
         let bare = libm::ceilf(font().v_metrics(m.px).ascent) as u32;
-        assert!(
-            m.ascent > bare,
-            "the baseline moved down with the leading: {} against {bare}",
-            m.ascent
-        );
+        assert!(m.ascent > bare, "the baseline moved down with the leading: {} against {bare}", m.ascent);
         assert!(m.cell_h >= m.ascent, "the baseline is below the cell: {m:?}");
         assert!(m.cell_w > 0 && m.cell_h > 0);
         // A monospace font gives every glyph the same advance, which is the assumption the
@@ -489,10 +469,7 @@ mod tests {
         let mut fb = fb_for(&m, 2, 1);
         render(&mut fb, &g, &f, &m, &p, Point::new(0, 0));
 
-        assert!(
-            is_inverted(&fb, m.cell_rect(0, 1), &p),
-            "the cursor cell is not drawn inverted"
-        );
+        assert!(is_inverted(&fb, m.cell_rect(0, 1), &p), "the cursor cell is not drawn inverted");
         let elsewhere = colours(&fb, m.cell_rect(0, 0));
         assert!(elsewhere.contains(&p.background), "the non-cursor cell lost its background");
     }
@@ -517,10 +494,7 @@ mod tests {
 
         assert!(is_inverted(&fb, m.cell_rect(0, 0), &p), "column 0 is selected");
         assert!(is_inverted(&fb, m.cell_rect(0, 1), &p), "column 1 is selected");
-        assert!(
-            !is_inverted(&fb, m.cell_rect(0, 2), &p),
-            "column 2 is past the head and must not be highlighted"
-        );
+        assert!(!is_inverted(&fb, m.cell_rect(0, 2), &p), "column 2 is past the head and must not be highlighted");
     }
 
     #[test]
@@ -565,16 +539,8 @@ mod tests {
         render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &[1]);
 
         assert_eq!(fb.get_pixel(1, 1), Some(marker), "row 0 was drawn and should not have been");
-        assert_ne!(
-            fb.get_pixel(1, m.cell_h + 1),
-            Some(marker),
-            "row 1 was not drawn and should have been"
-        );
-        assert_eq!(
-            fb.get_pixel(1, m.cell_h * 2 + 1),
-            Some(marker),
-            "row 2 was drawn and should not have been"
-        );
+        assert_ne!(fb.get_pixel(1, m.cell_h + 1), Some(marker), "row 1 was not drawn and should have been");
+        assert_eq!(fb.get_pixel(1, m.cell_h * 2 + 1), Some(marker), "row 2 was drawn and should not have been");
     }
 
     #[test]
@@ -599,14 +565,8 @@ mod tests {
         g.apply(Op::Print('e'));
         let d = g.take_damage();
         render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &d);
-        assert!(
-            is_inverted(&fb, m.cell_rect(1, 1), &p),
-            "the cursor did not appear on the row it wrapped to"
-        );
-        assert!(
-            !is_inverted(&fb, m.cell_rect(0, 3), &p),
-            "a phantom cursor block was left at the end of row 0"
-        );
+        assert!(is_inverted(&fb, m.cell_rect(1, 1), &p), "the cursor did not appear on the row it wrapped to");
+        assert!(!is_inverted(&fb, m.cell_rect(0, 3), &p), "a phantom cursor block was left at the end of row 0");
     }
 
     #[test]
@@ -627,10 +587,7 @@ mod tests {
         g.apply(Op::MoveBy { rows: 0, cols: -1 });
         let d = g.take_damage();
         render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &d);
-        assert!(
-            !is_inverted(&fb, m.cell_rect(0, 2), &p),
-            "the cursor block stayed where it was"
-        );
+        assert!(!is_inverted(&fb, m.cell_rect(0, 2), &p), "the cursor block stayed where it was");
         assert!(is_inverted(&fb, m.cell_rect(0, 1), &p), "the cursor did not arrive");
     }
 
@@ -651,10 +608,7 @@ mod tests {
         let m = Metrics::new(&f, 16.0);
         let p = Palette::default();
         let mut g = Grid::new(2, 1);
-        g.apply_all(&[
-            Op::Attr(Sgr::Background(Colour::Ansi(Ansi::Red))),
-            Op::Print(' '),
-        ]);
+        g.apply_all(&[Op::Attr(Sgr::Background(Colour::Ansi(Ansi::Red))), Op::Print(' ')]);
         let s = m.pixel_size(3, 2);
         let mut fb = MemFramebuffer::new(Geometry::packed(s.w, s.h, PixelFormat::XRGB8888));
         let marker = Rgb::new(0x00, 0xFF, 0x00);
@@ -714,12 +668,7 @@ mod tests {
         m.cell_h = m.ascent; // baseline flush with the bottom of the cell
         let p = Palette::default();
         let mut g = Grid::new(1, 2);
-        g.apply_all(&[
-            Op::Attr(Sgr::Underline),
-            Op::Print(' '),
-            Op::CarriageReturn,
-            Op::LineFeed,
-        ]);
+        g.apply_all(&[Op::Attr(Sgr::Underline), Op::Print(' '), Op::CarriageReturn, Op::LineFeed]);
         let mut fb = fb_for(&m, 1, 2);
         render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &[0]);
         // Row 1 was not drawn at all, so any ink there came from row 0's underline.
@@ -767,15 +716,11 @@ mod tests {
     #[test]
     fn the_reference_render_is_deterministic_and_not_a_flat_fill() {
         let f = font();
-        assert_eq!(
-            reference::render_with(&f).into_bytes(),
-            reference::render_with(&f).into_bytes()
-        );
+        assert_eq!(reference::render_with(&f).into_bytes(), reference::render_with(&f).into_bytes());
         let fb = reference::render_with(&f);
         let g = fb.geometry();
         let first = fb.get_pixel(0, 0).unwrap();
-        let varied =
-            (0..g.height).any(|y| (0..g.width).any(|x| fb.get_pixel(x, y).unwrap() != first));
+        let varied = (0..g.height).any(|y| (0..g.width).any(|x| fb.get_pixel(x, y).unwrap() != first));
         assert!(varied, "the reference render is one colour");
     }
 
@@ -790,4 +735,3 @@ mod tests {
         assert!(fb.geometry().pitch > fb.geometry().width as usize * 4);
     }
 }
-

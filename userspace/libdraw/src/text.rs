@@ -322,10 +322,8 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
     // non-owning view that never closes it.
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: the path resolves to a read-mappable file object, or it does not resolve.
-    let obj = block_on(unsafe {
-        ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ | Rights::INSPECT)
-    })
-    .map_err(|_| LoadError::NoBinding)?;
+    let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ | Rights::INSPECT) })
+        .map_err(|_| LoadError::NoBinding)?;
 
     // The exact byte length. Mapping is page-granular, so without this the parser would be
     // handed however much zero padding the last page carries.
@@ -365,11 +363,7 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
 ///
 /// As [`load`]: `root_ns` must be a live namespace handle owned by the caller.
 #[cfg(feature = "io")]
-pub unsafe fn load_ui(
-    root_ns: u64,
-    theme: &crate::theme::Theme,
-    who: &[u8],
-) -> Result<(Font, ThemePath), LoadError> {
+pub unsafe fn load_ui(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> Result<(Font, ThemePath), LoadError> {
     let builtin = crate::theme::Theme::light().font_ui;
     // SAFETY: forwarded from this function's own contract.
     let (face, from) = unsafe { load_themed(root_ns, theme.font_ui, builtin, who) }?;
@@ -403,11 +397,7 @@ pub unsafe fn load_ui(
 ///
 /// As [`load`]: `root_ns` must be a live namespace handle owned by the caller.
 #[cfg(feature = "io")]
-pub unsafe fn load_mono(
-    root_ns: u64,
-    theme: &crate::theme::Theme,
-    who: &[u8],
-) -> Result<(Font, ThemePath), LoadError> {
+pub unsafe fn load_mono(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> Result<(Font, ThemePath), LoadError> {
     // SAFETY: forwarded from this function's own contract.
     unsafe { load_themed(root_ns, theme.font_mono, crate::theme::Theme::light().font_mono, who) }
 }
@@ -530,7 +520,6 @@ mod tests {
         }
         assert!(w > 0, "a zero advance would stack every glyph on the first");
     }
-
 
     #[test]
     fn width_counts_characters_not_bytes() {
@@ -659,10 +648,7 @@ mod tests {
             }
         }
         assert!(solid > 0, "no pixel reached full coverage — the glyph did not draw");
-        assert!(
-            partial > solid / 4,
-            "only {partial} partial pixels against {solid} solid: this looks thresholded"
-        );
+        assert!(partial > solid / 4, "only {partial} partial pixels against {solid} solid: this looks thresholded");
     }
 
     #[test]

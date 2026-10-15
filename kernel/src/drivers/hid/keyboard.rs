@@ -389,7 +389,11 @@ mod tests {
     fn the_worst_report_fits_its_buffer() {
         let before = [0xFF, 0, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
         let after = [0x00, 0, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F];
-        assert_eq!(run(before, after).unwrap().len(), EVENTS_MAX, "six keys and eight modifiers released, six pressed, SYN");
+        assert_eq!(
+            run(before, after).unwrap().len(),
+            EVENTS_MAX,
+            "six keys and eight modifiers released, six pressed, SYN"
+        );
         let mods_on = [0xFF, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(run(after, mods_on).unwrap().len(), 6 + 8 + 1);
     }
@@ -447,7 +451,10 @@ mod tests {
         let shift_ab = bitmap(0x02, &[0x04, 0x05]);
         assert_eq!(run_all(&BITMAP, &mut held, &shift_ab), Some(vec![press(KEY_LEFTSHIFT), press(48), SYN]));
         let none = bitmap(0, &[]);
-        assert_eq!(run_all(&BITMAP, &mut held, &none), Some(vec![release(30), release(48), release(KEY_LEFTSHIFT), SYN]));
+        assert_eq!(
+            run_all(&BITMAP, &mut held, &none),
+            Some(vec![release(30), release(48), release(KEY_LEFTSHIFT), SYN])
+        );
         assert_eq!(BITMAP.report_bytes(), 21, "its ID, the modifiers and 19 bytes of bits");
         assert_eq!(Layout::BOOT.report_bytes(), 8);
     }

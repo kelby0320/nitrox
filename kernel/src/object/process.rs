@@ -90,11 +90,7 @@ impl Process {
     /// space (the ELF loader fills it before this is called), holding the ambient
     /// `syscaps`. Refcount one. init is created with [`SysCaps::all`] (the boot grant);
     /// a spawned child with `parent.syscaps & args.syscaps`.
-    pub fn try_new_user(
-        pid: u32,
-        address_space: AddressSpace,
-        syscaps: SysCaps,
-    ) -> Result<KBox<Self>, AllocError> {
+    pub fn try_new_user(pid: u32, address_space: AddressSpace, syscaps: SysCaps) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Process),
             pid,

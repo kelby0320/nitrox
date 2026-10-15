@@ -91,11 +91,7 @@ impl VAddrRange {
     pub fn intersect(self, other: VAddrRange) -> Option<VAddrRange> {
         let start = core::cmp::max(self.start, other.start);
         let end = core::cmp::min(self.end, other.end);
-        if end <= start {
-            None
-        } else {
-            Some(VAddrRange { start, end })
-        }
+        if end <= start { None } else { Some(VAddrRange { start, end }) }
     }
 }
 
@@ -224,8 +220,7 @@ enum RbColor {
 fn is_red(node: Option<NonNull<Vma>>) -> bool {
     // SAFETY: when `Some`, the link pointer references a live tree
     // node by the invariants documented on `VmaTree`.
-    node.map(|n| unsafe { n.as_ref().link.color } == RbColor::Red)
-        .unwrap_or(false)
+    node.map(|n| unsafe { n.as_ref().link.color } == RbColor::Red).unwrap_or(false)
 }
 
 /// Intrusive red-black-tree link embedded in every [`Vma`].
@@ -264,13 +259,7 @@ impl RbLink {
     /// ends at `end`. New nodes are red — the standard RB-tree insertion
     /// convention; the insert fixup recolours as needed.
     const fn new(end: VirtAddr) -> Self {
-        Self {
-            parent: None,
-            left: None,
-            right: None,
-            color: RbColor::Red,
-            subtree_max_end: end,
-        }
+        Self { parent: None, left: None, right: None, color: RbColor::Red, subtree_max_end: end }
     }
 }
 
@@ -328,24 +317,12 @@ impl Drop for Vma {
 
 impl Vma {
     pub const fn new(range: VAddrRange, prot: Protection, mapping: MappingKind) -> Self {
-        Self {
-            range,
-            prot,
-            mapping,
-            caching: crate::mm::Caching::Normal,
-            object: None,
-            link: RbLink::new(range.end()),
-        }
+        Self { range, prot, mapping, caching: crate::mm::Caching::Normal, object: None, link: RbLink::new(range.end()) }
     }
 
     /// Construct an object-backed VMA holding `object` alive for its lifetime.
     /// Not `const` because it stores a (non-`const`) [`ObjectRef`].
-    pub fn new_object(
-        range: VAddrRange,
-        prot: Protection,
-        object: ObjectRef,
-        caching: crate::mm::Caching,
-    ) -> Self {
+    pub fn new_object(range: VAddrRange, prot: Protection, object: ObjectRef, caching: crate::mm::Caching) -> Self {
         Self {
             range,
             prot,
@@ -538,12 +515,7 @@ impl VmaTree {
     /// range is page-aligned: the cursor starts at `min` (a page-aligned
     /// base) and only ever advances to a VMA's `range.end()`, which the
     /// [`VAddrRange`] invariant keeps page-aligned.
-    pub fn find_free_range(
-        &self,
-        min: VirtAddr,
-        max: VirtAddr,
-        size: u64,
-    ) -> Option<VAddrRange> {
+    pub fn find_free_range(&self, min: VirtAddr, max: VirtAddr, size: u64) -> Option<VAddrRange> {
         let max = max.as_u64();
         let mut cursor = min.as_u64();
         for v in self.iter() {
@@ -573,10 +545,7 @@ impl VmaTree {
     /// In-order iterator over every `Vma` in the tree, by ascending
     /// `range.start`.
     pub fn iter(&self) -> Iter<'_> {
-        Iter {
-            cur: leftmost_of(self.root),
-            _tree: core::marker::PhantomData,
-        }
+        Iter { cur: leftmost_of(self.root), _tree: core::marker::PhantomData }
     }
 
     /// In-order iterator over every `Vma` whose range overlaps `query`,
@@ -639,20 +608,14 @@ impl VmaTree {
                 // 0 or 1 (right) child: x = z.right takes z's spot.
                 let x = z_right;
                 let x_parent = (*zp).link.parent;
-                let x_is_left = matches!(
-                    x_parent.map(|p| (*p.as_ptr()).link.left == Some(z)),
-                    Some(true),
-                );
+                let x_is_left = matches!(x_parent.map(|p| (*p.as_ptr()).link.left == Some(z)), Some(true),);
                 self.transplant(z, x);
                 (x, x_parent, x_is_left, (*zp).link.color)
             } else if z_right.is_none() {
                 // 1 (left) child: x = z.left takes z's spot.
                 let x = z_left;
                 let x_parent = (*zp).link.parent;
-                let x_is_left = matches!(
-                    x_parent.map(|p| (*p.as_ptr()).link.left == Some(z)),
-                    Some(true),
-                );
+                let x_is_left = matches!(x_parent.map(|p| (*p.as_ptr()).link.left == Some(z)), Some(true),);
                 self.transplant(z, x);
                 (x, x_parent, x_is_left, (*zp).link.color)
             } else {
@@ -759,12 +722,7 @@ impl VmaTree {
     /// black (cases 1/3/4 → break), or moves the "doubly-black" mark
     /// one level up (case 2). When the mark reaches a red node or the
     /// root, it is absorbed.
-    fn delete_fixup(
-        &mut self,
-        mut x: Option<NonNull<Vma>>,
-        mut x_parent: Option<NonNull<Vma>>,
-        mut x_is_left: bool,
-    ) {
+    fn delete_fixup(&mut self, mut x: Option<NonNull<Vma>>, mut x_parent: Option<NonNull<Vma>>, mut x_is_left: bool) {
         // SAFETY of the loop body: every link pointer dereferenced is
         // either `x_parent`, `x_parent`'s sibling, or those siblings'
         // children — all of which are live tree nodes. The fixup
@@ -802,8 +760,7 @@ impl VmaTree {
                         x = x_parent;
                         x_parent = (*pp).link.parent;
                         if let Some(new_parent) = x_parent {
-                            x_is_left =
-                                (*new_parent.as_ptr()).link.left == x;
+                            x_is_left = (*new_parent.as_ptr()).link.left == x;
                         }
                     } else {
                         if w_right_black {
@@ -846,8 +803,7 @@ impl VmaTree {
                         x = x_parent;
                         x_parent = (*pp).link.parent;
                         if let Some(new_parent) = x_parent {
-                            x_is_left =
-                                (*new_parent.as_ptr()).link.left == x;
+                            x_is_left = (*new_parent.as_ptr()).link.left == x;
                         }
                     } else {
                         if w_left_black {
@@ -933,10 +889,7 @@ impl VmaTree {
         // SAFETY: forwarded from this function's contract.
         unsafe {
             let xp = x.as_ptr();
-            let y = (*xp)
-                .link
-                .right
-                .expect("rotate_left precondition: right child");
+            let y = (*xp).link.right.expect("rotate_left precondition: right child");
             let yp = y.as_ptr();
 
             // y's left subtree becomes x's right subtree.
@@ -977,10 +930,7 @@ impl VmaTree {
         // SAFETY: forwarded from this function's contract.
         unsafe {
             let yp = y.as_ptr();
-            let x = (*yp)
-                .link
-                .left
-                .expect("rotate_right precondition: left child");
+            let x = (*yp).link.left.expect("rotate_right precondition: left child");
             let xp = x.as_ptr();
 
             (*yp).link.left = (*xp).link.right;
@@ -1027,11 +977,7 @@ impl VmaTree {
                 if zparent.as_ref().link.color != RbColor::Red {
                     break;
                 }
-                let zgp = zparent
-                    .as_ref()
-                    .link
-                    .parent
-                    .expect("red parent implies grandparent exists");
+                let zgp = zparent.as_ref().link.parent.expect("red parent implies grandparent exists");
                 let gpp = zgp.as_ptr();
                 if (*gpp).link.left == Some(zparent) {
                     let uncle = (*gpp).link.right;
@@ -1226,8 +1172,7 @@ mod tests {
     }
 
     fn anon_box(r: VAddrRange) -> KBox<Vma> {
-        KBox::try_new(Vma::new(r, Protection::empty(), MappingKind::Anonymous))
-            .expect("test heap exhausted")
+        KBox::try_new(Vma::new(r, Protection::empty(), MappingKind::Anonymous)).expect("test heap exhausted")
     }
 
     fn insert_or_panic(tree: &mut VmaTree, r: VAddrRange) {
@@ -1279,11 +1224,7 @@ mod tests {
                 max_end = r_max_end;
             }
         }
-        assert_eq!(
-            v.link.subtree_max_end, max_end,
-            "augmentation violation at node starting {:?}",
-            v.range.start()
-        );
+        assert_eq!(v.link.subtree_max_end, max_end, "augmentation violation at node starting {:?}", v.range.start());
         max_end
     }
 
@@ -1299,20 +1240,11 @@ mod tests {
         // SAFETY: live link.
         let v = unsafe { n.as_ref() };
         if v.link.color == RbColor::Red {
-            assert_ne!(
-                parent_color,
-                RbColor::Red,
-                "red-red violation at node starting {:?}",
-                v.range.start()
-            );
+            assert_ne!(parent_color, RbColor::Red, "red-red violation at node starting {:?}", v.range.start());
         }
         let lbh = check_rb(v.link.left, v.link.color);
         let rbh = check_rb(v.link.right, v.link.color);
-        assert_eq!(
-            lbh, rbh,
-            "black-height mismatch at node starting {:?}: left={lbh}, right={rbh}",
-            v.range.start()
-        );
+        assert_eq!(lbh, rbh, "black-height mismatch at node starting {:?}: left={lbh}, right={rbh}", v.range.start());
         lbh + match v.link.color {
             RbColor::Black => 1,
             RbColor::Red => 0,
@@ -1553,9 +1485,7 @@ mod tests {
         // Fisher-Yates with the LCG.
         let mut lcg: u64 = 0xDEAD_BEEF_CAFE_F00D;
         for i in (1..n).rev() {
-            lcg = lcg
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             let j = (lcg as usize) % (i + 1);
             order.swap(i, j);
         }
@@ -1663,9 +1593,7 @@ mod tests {
 
         fn shuffle(arr: &mut [usize], mut lcg: u64) {
             for i in (1..arr.len()).rev() {
-                lcg = lcg
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let j = (lcg as usize) % (i + 1);
                 arr.swap(i, j);
             }
@@ -1683,9 +1611,7 @@ mod tests {
 
         for (count, &idx) in remove_order.iter().enumerate() {
             let start = (idx as u64 * 4) * PAGE;
-            let removed = tree
-                .remove_covering(va(start + PAGE))
-                .expect("must find every inserted range");
+            let removed = tree.remove_covering(va(start + PAGE)).expect("must find every inserted range");
             assert_eq!(removed.range.start(), va(start));
             verify(&tree);
             assert_eq!(tree.len(), n - count - 1);
@@ -1711,10 +1637,7 @@ mod tests {
     fn iter_on_empty_tree_yields_nothing() {
         let tree = VmaTree::new();
         assert_eq!(tree.iter().count(), 0);
-        assert_eq!(
-            tree.iter_overlapping(range(0, PAGE * 16)).count(),
-            0
-        );
+        assert_eq!(tree.iter_overlapping(range(0, PAGE * 16)).count(), 0);
     }
 
     #[test]
@@ -1733,10 +1656,7 @@ mod tests {
             }
             arr
         };
-        assert_eq!(
-            collected,
-            [va(0), va(10 * PAGE), va(20 * PAGE), va(30 * PAGE), va(40 * PAGE)]
-        );
+        assert_eq!(collected, [va(0), va(10 * PAGE), va(20 * PAGE), va(30 * PAGE), va(40 * PAGE)]);
     }
 
     #[test]
@@ -1764,20 +1684,11 @@ mod tests {
         // Before all VMAs.
         assert!(tree.find_first_overlapping(range(0, 8 * PAGE)).is_none());
         // In a gap.
-        assert!(
-            tree.find_first_overlapping(range(14 * PAGE, 18 * PAGE))
-                .is_none()
-        );
+        assert!(tree.find_first_overlapping(range(14 * PAGE, 18 * PAGE)).is_none());
         // After all VMAs.
-        assert!(
-            tree.find_first_overlapping(range(30 * PAGE, 40 * PAGE))
-                .is_none()
-        );
+        assert!(tree.find_first_overlapping(range(30 * PAGE, 40 * PAGE)).is_none());
         // Exactly adjacent (half-open): no overlap.
-        assert!(
-            tree.find_first_overlapping(range(12 * PAGE, 14 * PAGE))
-                .is_none()
-        );
+        assert!(tree.find_first_overlapping(range(12 * PAGE, 14 * PAGE)).is_none());
     }
 
     #[test]
@@ -1799,10 +1710,7 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 3);
-        assert_eq!(
-            got,
-            [va(10 * PAGE), va(20 * PAGE), va(30 * PAGE)]
-        );
+        assert_eq!(got, [va(10 * PAGE), va(20 * PAGE), va(30 * PAGE)]);
     }
 
     #[test]

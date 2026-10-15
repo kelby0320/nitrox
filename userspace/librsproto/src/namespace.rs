@@ -89,12 +89,7 @@ pub struct ResolveRequest<'a> {
 }
 
 /// Write a `ResolveRequest` body; returns its length.
-pub fn resolve_request(
-    out: &mut [u8],
-    requested_rights: u64,
-    flags: u32,
-    suffix: &[u8],
-) -> Option<usize> {
+pub fn resolve_request(out: &mut [u8], requested_rights: u64, flags: u32, suffix: &[u8]) -> Option<usize> {
     if suffix.len() > u16::MAX as usize {
         return None;
     }
@@ -228,10 +223,7 @@ pub fn parse_resolve_reply(body: &[u8]) -> Option<ResolveReply> {
     if body.len() < RESOLVE_REPLY_LEN {
         return None;
     }
-    Some(ResolveReply {
-        object_kind: get_u16(body, 0),
-        content_len: get_u32(body, 4),
-    })
+    Some(ResolveReply { object_kind: get_u16(body, 0), content_len: get_u32(body, 4) })
 }
 
 #[cfg(test)]
@@ -241,8 +233,7 @@ mod tests {
     #[test]
     fn resolve_request_round_trips() {
         let mut buf = [0u8; 128];
-        let n = resolve_request(&mut buf, 0x4, RESOLVE_FILE_AS_MEMOBJ, b"system/current-generation")
-            .unwrap();
+        let n = resolve_request(&mut buf, 0x4, RESOLVE_FILE_AS_MEMOBJ, b"system/current-generation").unwrap();
         assert_eq!(n, RESOLVE_REQUEST_PREFIX_LEN + 25);
         let r = parse_resolve_request(&buf[..n]).unwrap();
         assert_eq!(r.requested_rights, 0x4);
@@ -270,8 +261,7 @@ mod tests {
     #[test]
     fn a_file_blocks_prefix_is_laid_out_as_the_spec_draws_it() {
         let mut buf = [0xAAu8; 40];
-        let n = file_blocks_prefix(&mut buf, 8192, 4096, 3, 0x0102_0304_0506_0708, FILE_BLOCKS_READ_ONLY)
-            .unwrap();
+        let n = file_blocks_prefix(&mut buf, 8192, 4096, 3, 0x0102_0304_0506_0708, FILE_BLOCKS_READ_ONLY).unwrap();
         assert_eq!(n, 32);
         assert_eq!(&buf[0..2], &OBJECT_KIND_FILE_BLOCKS.to_le_bytes());
         assert_eq!(&buf[2..4], &[0, 0]);

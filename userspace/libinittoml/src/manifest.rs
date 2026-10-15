@@ -168,11 +168,7 @@ pub fn parse(input: &str) -> Result<Manifest, ManifestError> {
 
 /// Fetch a required string field, distinguishing "absent" from "present but not
 /// a string".
-fn required_str<'a>(
-    t: &'a Table,
-    field: &'static str,
-    index: usize,
-) -> Result<&'a str, ManifestError> {
+fn required_str<'a>(t: &'a Table, field: &'static str, index: usize) -> Result<&'a str, ManifestError> {
     match t.get(field) {
         None => Err(ManifestError::MissingField { index, field }),
         Some(v) => v.as_str().ok_or(ManifestError::NotAString { index, field }),
@@ -303,10 +299,7 @@ data_journal = true
         let m = parse(src).unwrap().mounts;
         let opts = m[0].options.as_ref().unwrap();
         assert_eq!(opts.get_str("fs_server"), None);
-        assert_eq!(
-            opts.get("data_journal"),
-            Some(&toml_lite::Value::Boolean(true))
-        );
+        assert_eq!(opts.get("data_journal"), Some(&toml_lite::Value::Boolean(true)));
     }
 
     #[test]
@@ -319,10 +312,7 @@ device=\"d\"
 mount_point=\"/\"
 required_for=\"boot\"
 ";
-        assert_eq!(
-            parse(src),
-            Err(ManifestError::MissingField { index: 0, field: "mode" })
-        );
+        assert_eq!(parse(src), Err(ManifestError::MissingField { index: 0, field: "mode" }));
     }
 
     #[test]
@@ -331,19 +321,13 @@ required_for=\"boot\"
         assert_eq!(parse(&bad_mode), Err(ManifestError::BadMode { index: 0 }));
 
         let bad_req = SINGLE_ROOT.replace("\"boot\"", "\"lazy\"");
-        assert_eq!(
-            parse(&bad_req),
-            Err(ManifestError::UnsupportedRequiredFor { index: 0 })
-        );
+        assert_eq!(parse(&bad_req), Err(ManifestError::UnsupportedRequiredFor { index: 0 }));
     }
 
     #[test]
     fn non_absolute_mount_point_rejected() {
         let bad = SINGLE_ROOT.replace("\"/\"", "\"store\"");
-        assert_eq!(
-            parse(&bad),
-            Err(ManifestError::NonAbsoluteMountPoint { index: 0 })
-        );
+        assert_eq!(parse(&bad), Err(ManifestError::NonAbsoluteMountPoint { index: 0 }));
     }
 
     /// The test image's shape: the root mount, and two binds over it (Part C.1).
@@ -402,10 +386,7 @@ subtree = \"/scratch\"
 
     #[test]
     fn device_ns_path_maps_schemes() {
-        assert_eq!(
-            device_ns_path("gpt-partlabel:nitrox-root").as_deref(),
-            Some("/dev/disk/by-partlabel/nitrox-root")
-        );
+        assert_eq!(device_ns_path("gpt-partlabel:nitrox-root").as_deref(), Some("/dev/disk/by-partlabel/nitrox-root"));
         assert_eq!(
             device_ns_path("gpt-partuuid:01234567-89ab").as_deref(),
             Some("/dev/disk/by-partuuid/01234567-89ab")

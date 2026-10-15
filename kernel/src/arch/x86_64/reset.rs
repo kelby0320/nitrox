@@ -174,17 +174,14 @@ unsafe fn triple_fault() -> ! {
     let empty = Idtr { limit: 0, base: 0 };
     // SAFETY: `lidt` reads the ten bytes at `empty`, which live on this stack; the `int3` after it
     // cannot be delivered, which is the point. Neither returns.
-    unsafe {
-        asm!("lidt [{}]", "int3", "2: hlt", "jmp 2b", in(reg) &empty, options(noreturn, nostack))
-    }
+    unsafe { asm!("lidt [{}]", "int3", "2: hlt", "jmp 2b", in(reg) &empty, options(noreturn, nostack)) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const IO: Gas =
-        Gas { space: GAS_SYSTEM_IO, bit_width: 8, bit_offset: 0, access_size: 1, address: 0xcf9 };
+    const IO: Gas = Gas { space: GAS_SYSTEM_IO, bit_width: 8, bit_offset: 0, access_size: 1, address: 0xcf9 };
 
     fn with_reset(reset: Option<(Gas, u8)>) -> Option<Fadt> {
         Some(Fadt { reset, ..Fadt::default() })

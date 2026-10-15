@@ -64,9 +64,7 @@ use libdraw::format::{PixelFormat, Rgb};
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Point, Rect};
 use libkern::debug::Line;
-use libkern::syscall::{
-    SYS_CLOCK_READ, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_TEST_EXIT, syscall1, syscall4,
-};
+use libkern::syscall::{SYS_CLOCK_READ, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_TEST_EXIT, syscall1, syscall4};
 use libkern::{exit, kprint};
 
 /// `alloc` backing: the shadow buffer and the surfaces.
@@ -96,15 +94,7 @@ const STEP: i32 = 1;
 fn now_ns() -> u64 {
     let mut out: u64 = 0;
     // SAFETY: `&mut out` is a valid writable `u64` out-param, which is what the ABI asks for.
-    let r = unsafe {
-        syscall4(
-            SYS_CLOCK_READ,
-            libkern::abi::CLOCK_MONOTONIC,
-            (&mut out as *mut u64) as u64,
-            0,
-            0,
-        )
-    };
+    let r = unsafe { syscall4(SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&mut out as *mut u64) as u64, 0, 0) };
     if r < 0 { 0 } else { out }
 }
 
@@ -147,12 +137,7 @@ unsafe fn write_throughput(dst: *mut u8, len: usize, rounds: usize, label: &[u8]
             }
         }
         let dt = now_ns().saturating_sub(t0);
-        Line::new()
-            .s(b"compose-bench: e1 ")
-            .s(label)
-            .s(b" ")
-            .u(dt)
-            .end();
+        Line::new().s(b"compose-bench: e1 ").s(label).s(b" ").u(dt).end();
     }
 }
 
@@ -176,11 +161,7 @@ fn damage(prev: Rect, next: Rect) -> [Rect; 2] {
 }
 
 /// **E2** — one frame composed straight into `fb`.
-fn frame_in_place<F: Framebuffer + ?Sized>(
-    fb: &mut F,
-    surfaces: &[SurfaceRef<'_>],
-    dmg: &[Rect],
-) -> u64 {
+fn frame_in_place<F: Framebuffer + ?Sized>(fb: &mut F, surfaces: &[SurfaceRef<'_>], dmg: &[Rect]) -> u64 {
     let t0 = now_ns();
     compose(fb, Rgb::new(0x2A, 0x55, 0x70), surfaces, dmg);
     now_ns().saturating_sub(t0)
@@ -192,11 +173,7 @@ fn frame_in_place<F: Framebuffer + ?Sized>(
 /// as background and once as the window, and [`compose_exposed`] writes them once. It is the same
 /// insight the shadow buffer rests on, from the other side — **the fill is the flash** — so this
 /// measures whether removing the fill pays for the copy that removing the flicker costs.
-fn frame_exposed<F: Framebuffer + ?Sized>(
-    fb: &mut F,
-    surfaces: &[SurfaceRef<'_>],
-    dmg: &[Rect],
-) -> u64 {
+fn frame_exposed<F: Framebuffer + ?Sized>(fb: &mut F, surfaces: &[SurfaceRef<'_>], dmg: &[Rect]) -> u64 {
     let t0 = now_ns();
     compose_exposed(fb, Rgb::new(0x2A, 0x55, 0x70), surfaces, dmg);
     now_ns().saturating_sub(t0)
@@ -304,12 +281,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _a: u64, _b: u64) -> ! {
 
     // ---- E2: in place versus shadow, on a drag ----
     let screen = geometry.bounds();
-    let win_geom = match Geometry::with_pitch(
-        WIN_W,
-        WIN_H,
-        WIN_W as usize * 4,
-        PixelFormat::XRGB8888,
-    ) {
+    let win_geom = match Geometry::with_pitch(WIN_W, WIN_H, WIN_W as usize * 4, PixelFormat::XRGB8888) {
         Some(g) => g,
         None => verdict(false),
     };
@@ -371,19 +343,12 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _a: u64, _b: u64) -> ! {
 /// amounts as the window moves, and nanoseconds per frame without the area is a number that
 /// drifts for a reason unrelated to either arm.
 fn dmg_area(dmg: &[Rect], screen: Rect) -> usize {
-    dmg.iter()
-        .filter_map(|r| r.intersect(&screen))
-        .map(|r| r.size.w as usize * r.size.h as usize)
-        .sum()
+    dmg.iter().filter_map(|r| r.intersect(&screen)).map(|r| r.size.w as usize * r.size.h as usize).sum()
 }
 
 /// Fire the boot verdict and terminate QEMU.
 fn verdict(pass: bool) -> ! {
-    let code = if pass {
-        libkern::syscall::TEST_EXIT_SUCCESS
-    } else {
-        libkern::syscall::TEST_EXIT_FAILURE
-    };
+    let code = if pass { libkern::syscall::TEST_EXIT_SUCCESS } else { libkern::syscall::TEST_EXIT_FAILURE };
     // SAFETY: `SYS_TEST_EXIT` takes the verdict in a0; under the kernel's test-harness build it
     // writes the `isa-debug-exit` device and does not return.
     unsafe { syscall1(SYS_TEST_EXIT, code as u64) };

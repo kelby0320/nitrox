@@ -28,15 +28,14 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use libkern::*;
 use libkern::control::Control;
+use libkern::*;
 use librsproto::error::error_body;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
 use librsproto::{
-    OP_NS_RESOLVE, OP_TTY_ATTACH_BACKEND, OP_TTY_CLOSE, OP_TTY_INPUT, OP_TTY_OPEN_SIBLING,
-    OP_TTY_OUTPUT, OP_TTY_READ, OP_TTY_READ_LINE, OP_TTY_REDEEM, OP_TTY_SET_MODE, OP_TTY_TOKEN,
-    OP_TTY_WRITE, RS_FLAG_ERROR,
-    RS_FLAG_REPLY, TTY_MODE_ECHO, decode, encode,
+    OP_NS_RESOLVE, OP_TTY_ATTACH_BACKEND, OP_TTY_CLOSE, OP_TTY_INPUT, OP_TTY_OPEN_SIBLING, OP_TTY_OUTPUT, OP_TTY_READ,
+    OP_TTY_READ_LINE, OP_TTY_REDEEM, OP_TTY_SET_MODE, OP_TTY_TOKEN, OP_TTY_WRITE, RS_FLAG_ERROR, RS_FLAG_REPLY,
+    TTY_MODE_ECHO, decode, encode,
 };
 use tty_server::routing::{Act, CONSOLE, ReadKind, Registry, Sink};
 use tty_server::tokens::Tokens;
@@ -61,10 +60,8 @@ static mut RECV_HANDLES: [u64; 8] = [0; 8];
 static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
-    [0; libkern::abi::MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
-    [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
+static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 /// A separate pair for [`po_wait`], which waits *inside* the dispatch of a record the serve
 /// loop is still iterating.
 ///
@@ -124,9 +121,7 @@ const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 fn send_output(ch: u64, body: &[u8]) {
     // SAFETY: REPLY_MSG is a valid buffer owned by this module.
     let po = unsafe {
-        let Some(rs_len) =
-            encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_TTY_OUTPUT, 0, 0, body, 0)
-        else {
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_TTY_OUTPUT, 0, 0, body, 0) else {
             return;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -171,9 +166,7 @@ fn exit(code: i64) -> ! {
 /// Resolve `path` in `ns` requesting `rights`; `0` on failure.
 fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
-    };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
     if po < 0 {
         return 0;
     }
@@ -187,20 +180,20 @@ fn po_wait(po: u64) -> (i32, u64) {
     // waiter. Deliberately **not** the serve loop's buffers — see their declaration.
     let waited = unsafe {
         PO_HANDLES[0] = po;
-        syscall4(
-            SYS_WAIT,
-            (&raw const PO_HANDLES) as u64,
-            1,
-            (&raw mut PO_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const PO_HANDLES) as u64, 1, (&raw mut PO_RESULTS) as u64, u64::MAX)
     };
     let (status, value) = unsafe {
         (
             i32::from_le_bytes([PO_RESULTS[8], PO_RESULTS[9], PO_RESULTS[10], PO_RESULTS[11]]),
             u64::from_le_bytes([
-                PO_RESULTS[16], PO_RESULTS[17], PO_RESULTS[18], PO_RESULTS[19],
-                PO_RESULTS[20], PO_RESULTS[21], PO_RESULTS[22], PO_RESULTS[23],
+                PO_RESULTS[16],
+                PO_RESULTS[17],
+                PO_RESULTS[18],
+                PO_RESULTS[19],
+                PO_RESULTS[20],
+                PO_RESULTS[21],
+                PO_RESULTS[22],
+                PO_RESULTS[23],
             ]),
         )
     };
@@ -243,9 +236,7 @@ fn random_token() -> Option<[u8; tty_server::tokens::LEN]> {
 /// A connected channel pair, or `None`.
 fn make_channel() -> Option<(u64, u64)> {
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 4, 0) };
     if cr != 0 {
         return None;
     }
@@ -261,14 +252,8 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
     };
     // SAFETY: REPLY_MSG is a valid buffer; the rsproto message goes at offset 24.
     unsafe {
-        let Some(rs_len) = encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            librsproto::OP_READY,
-            0,
-            0,
-            &body[..body_len],
-            1,
-        ) else {
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1)
+        else {
             return false;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -289,8 +274,7 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
 fn reply(ch: u64, op: u16, request_id: u64, body: &[u8]) {
     // SAFETY: REPLY_MSG is a valid buffer; no transferred handles.
     unsafe {
-        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY, body, 0)
-        else {
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY, body, 0) else {
             return;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -312,14 +296,9 @@ fn reply_error(ch: u64, op: u16, request_id: u64, kerror: i32) {
     let elen = error_body(&mut ebody, kerror, 0, b"").unwrap_or(0);
     // SAFETY: REPLY_MSG is a valid buffer.
     unsafe {
-        let Some(rs_len) = encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            op,
-            request_id,
-            RS_FLAG_REPLY | RS_FLAG_ERROR,
-            &ebody[..elen],
-            0,
-        ) else {
+        let Some(rs_len) =
+            encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &ebody[..elen], 0)
+        else {
             return;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -349,14 +328,8 @@ fn open_tty(serve_end: u64, request_id: u64, reg: &mut Registry) {
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
     // SAFETY: REPLY_MSG is a valid buffer; the channel rides in handles[0].
     let sent = unsafe {
-        let Some(rs_len) = encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            OP_NS_RESOLVE,
-            request_id,
-            RS_FLAG_REPLY,
-            &body,
-            1,
-        ) else {
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
+        else {
             return;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -413,14 +386,7 @@ fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
     }
     // SAFETY: REPLY_MSG is a valid buffer; the new terminal's channel rides in handles[0].
     let sent = unsafe {
-        match encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            OP_TTY_OPEN_SIBLING,
-            request_id,
-            RS_FLAG_REPLY,
-            &[],
-            1,
-        ) {
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_TTY_OPEN_SIBLING, request_id, RS_FLAG_REPLY, &[], 1) {
             Some(rs_len) => {
                 REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
                 REPLY_MSG[8] = 1;
@@ -495,8 +461,7 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
     }
     // SAFETY: bounded read-only slice over the just-received message.
     let (op, request_id, body) = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -518,9 +483,7 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
         }
         OP_TTY_ATTACH_BACKEND => {
             // SAFETY: the kernel wrote `RECV_COUNT` handles into `RECV_HANDLES`.
-            let handle = unsafe {
-                if RECV_COUNT >= 1 { RECV_HANDLES[0] } else { 0 }
-            };
+            let handle = unsafe { if RECV_COUNT >= 1 { RECV_HANDLES[0] } else { 0 } };
             if handle == 0 {
                 // No handle moved: there is nothing to attach, and silently succeeding would
                 // leave the emulator waiting for output that goes to the console.
@@ -584,8 +547,7 @@ fn serve_backend(reg: &mut Registry, id: u32, ch: u64) -> bool {
     }
     // SAFETY: bounded read-only slice over the just-received message.
     let (op, body) = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -638,9 +600,7 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
                 length: READ_CHUNK,
             };
             // SAFETY: `console` is a char DeviceNode with READ; `&op` is a valid IoOp.
-            let po = unsafe {
-                syscall2(SYS_IO_SUBMIT, console, (&op as *const libkern::abi::IoOp) as u64)
-            };
+            let po = unsafe { syscall2(SYS_IO_SUBMIT, console, (&op as *const libkern::abi::IoOp) as u64) };
             if po >= 0 {
                 read_po = po as u64;
             }
@@ -682,13 +642,7 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
         };
         // SAFETY: valid wait buffers sized for `count`.
         let waited = unsafe {
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                count as u64,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, count as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             continue;
@@ -699,9 +653,14 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
             // SAFETY: `waited` records were written; `off + 8` is inside WAIT_RESULTS.
             let h = unsafe {
                 u64::from_le_bytes([
-                    WAIT_RESULTS[off], WAIT_RESULTS[off + 1], WAIT_RESULTS[off + 2],
-                    WAIT_RESULTS[off + 3], WAIT_RESULTS[off + 4], WAIT_RESULTS[off + 5],
-                    WAIT_RESULTS[off + 6], WAIT_RESULTS[off + 7],
+                    WAIT_RESULTS[off],
+                    WAIT_RESULTS[off + 1],
+                    WAIT_RESULTS[off + 2],
+                    WAIT_RESULTS[off + 3],
+                    WAIT_RESULTS[off + 4],
+                    WAIT_RESULTS[off + 5],
+                    WAIT_RESULTS[off + 6],
+                    WAIT_RESULTS[off + 7],
                 ])
             };
             if h == serve_end {
@@ -751,16 +710,23 @@ fn console_bytes(off: usize) -> u64 {
     // SAFETY: the record at `off` was written by the wait.
     unsafe {
         let status = i32::from_le_bytes([
-            WAIT_RESULTS[off + 8], WAIT_RESULTS[off + 9],
-            WAIT_RESULTS[off + 10], WAIT_RESULTS[off + 11],
+            WAIT_RESULTS[off + 8],
+            WAIT_RESULTS[off + 9],
+            WAIT_RESULTS[off + 10],
+            WAIT_RESULTS[off + 11],
         ]);
         if status != 0 {
             return 0;
         }
         u64::from_le_bytes([
-            WAIT_RESULTS[off + 16], WAIT_RESULTS[off + 17], WAIT_RESULTS[off + 18],
-            WAIT_RESULTS[off + 19], WAIT_RESULTS[off + 20], WAIT_RESULTS[off + 21],
-            WAIT_RESULTS[off + 22], WAIT_RESULTS[off + 23],
+            WAIT_RESULTS[off + 16],
+            WAIT_RESULTS[off + 17],
+            WAIT_RESULTS[off + 18],
+            WAIT_RESULTS[off + 19],
+            WAIT_RESULTS[off + 20],
+            WAIT_RESULTS[off + 21],
+            WAIT_RESULTS[off + 22],
+            WAIT_RESULTS[off + 23],
         ])
         .min(READ_CHUNK)
     }
@@ -784,8 +750,7 @@ fn drain_resolves(serve_end: u64, reg: &mut Registry) {
         }
         // SAFETY: bounded read-only slice over the received message.
         let (op, request_id, ok) = unsafe {
-            let payload_len =
-                u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             let req = core::slice::from_raw_parts(
                 ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
                 payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -834,8 +799,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         exit(1);
     }
     let buf_h = buf_h as u64;
-    let buf_addr =
-        unsafe { syscall4(SYS_MEMORY_MAP, buf_h, 0, 4096, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    let buf_addr = unsafe { syscall4(SYS_MEMORY_MAP, buf_h, 0, 4096, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if buf_addr < 0 {
         kprint(b"tty-server: read buffer map FAIL\n");
         exit(1);

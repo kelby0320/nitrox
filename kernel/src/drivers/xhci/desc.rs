@@ -220,7 +220,8 @@ pub fn hid_interfaces(b: &[u8]) -> impl Iterator<Item = HidInterface> {
                     n += 1;
                 }
                 if d[3] == 0 && d[5] == 0x03 {
-                    current = Some(HidInterface { number: d[2], class: (d[5], d[6], d[7]), endpoint: None, report_len: 0 });
+                    current =
+                        Some(HidInterface { number: d[2], class: (d[5], d[6], d[7]), endpoint: None, report_len: 0 });
                 }
                 after_endpoint = false;
             }
@@ -244,9 +245,7 @@ pub fn hid_interfaces(b: &[u8]) -> impl Iterator<Item = HidInterface> {
                 }
             }
             kind::SS_COMPANION if d.len() >= 6 => {
-                if after_endpoint
-                    && let Some(e) = current.as_mut().and_then(|h| h.endpoint.as_mut())
-                {
+                if after_endpoint && let Some(e) = current.as_mut().and_then(|h| h.endpoint.as_mut()) {
                     e.burst = d[2];
                 }
                 after_endpoint = false;
@@ -429,8 +428,7 @@ mod tests {
 
     /// A high-speed keyboard's device descriptor, as the USB 2.0 layout gives it: class zero
     /// (each interface says), a 64-byte default endpoint, strings 1, 2 and 3.
-    const KEYBOARD: [u8; 18] =
-        [18, 1, 0x00, 0x02, 0, 0, 0, 64, 0x27, 0x06, 0x01, 0x00, 0x00, 0x00, 1, 2, 3, 1];
+    const KEYBOARD: [u8; 18] = [18, 1, 0x00, 0x02, 0, 0, 0, 64, 0x27, 0x06, 0x01, 0x00, 0x00, 0x00, 1, 2, 3, 1];
 
     /// Its configuration: the configuration, a HID boot keyboard interface, its HID descriptor and
     /// its interrupt-IN endpoint. 34 bytes.
@@ -544,18 +542,14 @@ mod tests {
     #[test]
     fn qemus_devices_read_as_they_enumerated() {
         let kbd = device(&hex("120100020000004027060100000001040b01")).unwrap();
-        let kbd_config = hex(
-            "09022200010108a032090400000103010100092111010001223f0007058103080007",
-        );
+        let kbd_config = hex("09022200010108a032090400000103010100092111010001223f0007058103080007");
         assert_eq!((kbd.vendor, kbd.product, kbd.max_packet0), (0x0627, 0x0001, 64));
         assert_eq!((kbd.product_string, kbd.serial), (4, 11));
         assert_eq!(class_match(&kbd, &kbd_config), Match::BootKeyboard);
         assert_eq!(max_packet0(false, kbd.max_packet0), Some(64), "high speed's default: no evaluation");
 
         let mouse = device(&hex("120100020000000827060100000001020901")).unwrap();
-        let mouse_config = hex(
-            "09022200010106a0320904000001030102000921010000012234000705810304000a",
-        );
+        let mouse_config = hex("09022200010106a0320904000001030102000921010000012234000705810304000a");
         assert_eq!(class_match(&mouse, &mouse_config), Match::BootMouse);
         assert_eq!(record_class(&mouse, &mouse_config), (3, 1, 2));
 

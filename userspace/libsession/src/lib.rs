@@ -295,9 +295,8 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
     let mut body = [0u8; 512];
     let body_len = build_authenticate_request(&mut body, user, pass);
     // SAFETY: SEND_MSG is a valid 4 KiB buffer; the envelope goes at offset 24.
-    let rs_len = body_len.and_then(|n| unsafe {
-        encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_AUTHENTICATE, 1, 0, &body[..n], 0)
-    });
+    let rs_len =
+        body_len.and_then(|n| unsafe { encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_AUTHENTICATE, 1, 0, &body[..n], 0) });
     // **Both copies of the password go as soon as it is sent**, sent or not: `body` is this
     // frame's, and `SEND_MSG` is the crate's and outlives it — every later message here restamps
     // only as much as it needs. A supervisor and the view broker both live as long as the machine.
@@ -343,8 +342,7 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
     }
     // SAFETY: read payload_len + form a bounded slice over the reply payload.
     let (result_ok, home_len) = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let reply = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -516,7 +514,15 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         let base = b"/new";
         // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
         let dr = unsafe {
-            syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, draw_endpoint, base.as_ptr() as u64, base.len() as u64)
+            syscall6(
+                SYS_NS_BIND,
+                ns,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                draw_endpoint,
+                base.as_ptr() as u64,
+                base.len() as u64,
+            )
         };
         if dr != 0 {
             return give_up(b"libsession: /dev/draw/new bind FAIL\n");
@@ -660,9 +666,7 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         //
         // Sharing init's registration, exactly as `/home` shares the fs-server's.
         // SAFETY: valid namespace handle, path pointer, and endpoint handle; no base.
-        let tr = unsafe {
-            syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, tty_endpoint, 0, 0)
-        };
+        let tr = unsafe { syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, tty_endpoint, 0, 0) };
         if tr != 0 {
             kprint(b"libsession: /dev/tty bind FAIL\n");
         }
@@ -681,17 +685,7 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
     if clipboard_endpoint != 0 {
         let dev = b"/dev/clipboard";
         // SAFETY: valid namespace handle, path pointer, and endpoint handle; no base.
-        let cr = unsafe {
-            syscall6(
-                SYS_NS_BIND,
-                ns,
-                dev.as_ptr() as u64,
-                dev.len() as u64,
-                clipboard_endpoint,
-                0,
-                0,
-            )
-        };
+        let cr = unsafe { syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, clipboard_endpoint, 0, 0) };
         if cr != 0 {
             // Non-fatal: the session exists, copy and paste do nothing in it.
             kprint(b"libsession: /dev/clipboard bind FAIL (no copy and paste)\n");
@@ -759,7 +753,15 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         && [(&b"/storage"[..], &b"/fs"[..]), (b"/dev/storage", b"/info")].iter().all(|&(at, base)| {
             // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
             let r = unsafe {
-                syscall6(SYS_NS_BIND, ns, at.as_ptr() as u64, at.len() as u64, storage_endpoint, base.as_ptr() as u64, base.len() as u64)
+                syscall6(
+                    SYS_NS_BIND,
+                    ns,
+                    at.as_ptr() as u64,
+                    at.len() as u64,
+                    storage_endpoint,
+                    base.as_ptr() as u64,
+                    base.len() as u64,
+                )
             };
             r == 0
         });
@@ -809,18 +811,13 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
     // **Skipped entirely for a graphical session** — see [`NamespaceSpec::bind_console`]. Not
     // "bound and then unused": a binding a session holds is authority it has, and the console
     // is shared with every other session on the machine.
-    let (cst, console) = if bind_console {
-        ns_lookup(root_ns, b"/dev/console", RIGHT_READ | RIGHT_TRANSFER)
-    } else {
-        (0, 0)
-    };
+    let (cst, console) =
+        if bind_console { ns_lookup(root_ns, b"/dev/console", RIGHT_READ | RIGHT_TRANSFER) } else { (0, 0) };
     if cst == 0 && console != 0 {
         let dev = b"/dev/console";
         // SAFETY: valid namespace handle, path pointer, and console handle (a device
         // node → a direct-handle bind; no subtree base).
-        let cr = unsafe {
-            syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, console, 0, 0)
-        };
+        let cr = unsafe { syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, console, 0, 0) };
         // The bind cloned its own reference; drop ours.
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, console) };
@@ -892,9 +889,7 @@ pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -
         }
         // SAFETY: valid namespace handle, path pointer and device handle — a direct-handle bind,
         // so no subtree base.
-        let br = unsafe {
-            syscall6(SYS_NS_BIND, to_ns, path.as_ptr() as u64, path.len() as u64, dev, 0, 0)
-        };
+        let br = unsafe { syscall6(SYS_NS_BIND, to_ns, path.as_ptr() as u64, path.len() as u64, dev, 0, 0) };
         // SAFETY: the bind took its own reference; close ours.
         unsafe { syscall1(SYS_HANDLE_CLOSE, dev) };
         if br != 0 {
@@ -905,9 +900,8 @@ pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -
         let (ist, info) = ns_lookup(from_ns, info_path.as_bytes(), RIGHT_MAP_READ | RIGHT_TRANSFER);
         if ist == 0 && info != 0 {
             // SAFETY: as above; the info snapshot binds as a direct handle too.
-            let ir = unsafe {
-                syscall6(SYS_NS_BIND, to_ns, info_path.as_ptr() as u64, info_path.len() as u64, info, 0, 0)
-            };
+            let ir =
+                unsafe { syscall6(SYS_NS_BIND, to_ns, info_path.as_ptr() as u64, info_path.len() as u64, info, 0, 0) };
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, info) };
             if ir != 0 {
@@ -916,11 +910,7 @@ pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -
         }
     }
     if bound > 0 {
-        Line::new()
-            .s(b"libsession: ")
-            .u(bound as u64)
-            .s(b" block device(s) handed to a namespace")
-            .end();
+        Line::new().s(b"libsession: ").u(bound as u64).s(b" block device(s) handed to a namespace").end();
     }
     bound
 }
@@ -1144,9 +1134,7 @@ fn bind_session_user(ns: u64, user: &[u8]) {
     let path = b"/session/user";
     // SAFETY: valid namespace handle, path pointer, and object handle (a direct-handle
     // bind — no subtree base).
-    let br = unsafe {
-        syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, mem, 0, 0)
-    };
+    let br = unsafe { syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, mem, 0, 0) };
     // The bind cloned its own reference; drop ours either way.
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
@@ -1171,8 +1159,14 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                WAIT_RESULTS[16],
+                WAIT_RESULTS[17],
+                WAIT_RESULTS[18],
+                WAIT_RESULTS[19],
+                WAIT_RESULTS[20],
+                WAIT_RESULTS[21],
+                WAIT_RESULTS[22],
+                WAIT_RESULTS[23],
             ]),
         )
     };
@@ -1224,8 +1218,7 @@ pub fn session_env() -> libstream::wire::Record {
         .field("HOME", TypeTag::String, TypeModifiers::NONE)
         .field("PWD", TypeTag::String, TypeModifiers::NONE)
         .field("PATH", TypeTag::List, TypeModifiers::NONE);
-    let path: alloc::vec::Vec<Value> =
-        alloc::vec![Value::Str(alloc::string::String::from("/bin"))];
+    let path: alloc::vec::Vec<Value> = alloc::vec![Value::Str(alloc::string::String::from("/bin"))];
     Record {
         schema,
         values: alloc::vec![
@@ -1467,8 +1460,7 @@ pub fn spawn_leader(
             if r != 0 {
                 break;
             }
-            let (kind, body) =
-                unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+            let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
             if kind == KIND_CHILD_EXITED {
                 let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
                 // SAFETY: closing our reference to the exited shell (reaping).

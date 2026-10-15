@@ -144,10 +144,7 @@ pub fn fit(image: Size, screen: Size) -> Fit {
         size,
         // Integer division truncates, so an odd leftover puts the extra pixel on the right and
         // bottom. Consistent, and half a pixel is not a placement anybody can see.
-        origin: Point::new(
-            ((screen.w - size.w) / 2) as i32,
-            ((screen.h - size.h) / 2) as i32,
-        ),
+        origin: Point::new(((screen.w - size.w) / 2) as i32, ((screen.h - size.h) / 2) as i32),
         scaled: size != image,
     }
 }
@@ -187,10 +184,7 @@ pub fn fill(image: Size, screen: Size) -> Fit {
         size,
         // Truncating toward zero on a negative overhang puts the extra pixel off the left or top,
         // the mirror of `fit`'s leftover going right and bottom. Half a pixel either way.
-        origin: Point::new(
-            (screen.w as i32 - size.w as i32) / 2,
-            (screen.h as i32 - size.h as i32) / 2,
-        ),
+        origin: Point::new((screen.w as i32 - size.w as i32) / 2, (screen.h as i32 - size.h as i32) / 2),
         scaled: size != image,
     }
 }
@@ -214,14 +208,7 @@ pub fn fill(image: Size, screen: Size) -> Fit {
 /// Downscales internally when the plan says so, allocating the intermediate. Returns `false` if
 /// a geometry is unusable, the formats differ, or `dst` is shorter than its own geometry claims
 /// — the same refusal [`box_downscale`] makes, and for the same reason.
-pub fn place(
-    image: &[u8],
-    image_geom: Geometry,
-    plan: Fit,
-    ground: Rgb,
-    dst: &mut [u8],
-    dst_geom: Geometry,
-) -> bool {
+pub fn place(image: &[u8], image_geom: Geometry, plan: Fit, ground: Rgb, dst: &mut [u8], dst_geom: Geometry) -> bool {
     if dst_geom.width == 0 || dst_geom.height == 0 || image_geom.format != dst_geom.format {
         return false;
     }
@@ -248,12 +235,8 @@ pub fn place(
     // case allocates nothing.
     let scaled;
     let (src, src_geom) = if plan.scaled {
-        let Some(g) = Geometry::with_pitch(
-            plan.size.w,
-            plan.size.h,
-            plan.size.w as usize * 4,
-            image_geom.format,
-        ) else {
+        let Some(g) = Geometry::with_pitch(plan.size.w, plan.size.h, plan.size.w as usize * 4, image_geom.format)
+        else {
             return false;
         };
         let mut buf = alloc::vec![0u8; g.pitch * g.height as usize];
@@ -286,7 +269,6 @@ pub fn place(
     }
     true
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -373,7 +355,6 @@ mod tests {
         assert!(!place(&img, ig, fit(Size::new(2, 2), Size::new(4, 4)), Rgb::new(0, 0, 0), &mut dst, dg));
     }
 
-
     #[test]
     fn a_picture_smaller_than_the_screen_is_centred_at_its_own_size() {
         let f = fit(Size::new(400, 300), Size::new(1280, 800));
@@ -437,8 +418,7 @@ mod tests {
         let mut dst = alloc::vec![0u8; (f.size.w * f.size.h * 4) as usize];
         let src = alloc::vec![0u8; 4000 * 3 * 4];
         let sg = Geometry::with_pitch(4000, 3, 4000 * 4, PixelFormat::XRGB8888).unwrap();
-        let dg = Geometry::with_pitch(f.size.w, f.size.h, (f.size.w * 4) as usize, PixelFormat::XRGB8888)
-            .unwrap();
+        let dg = Geometry::with_pitch(f.size.w, f.size.h, (f.size.w * 4) as usize, PixelFormat::XRGB8888).unwrap();
         assert!(box_downscale(&src, sg, &mut dst, dg), "the planned size is one it accepts");
     }
 
@@ -625,5 +605,4 @@ mod tests {
         let mut dst = alloc::vec![0u8; dg.byte_len() - 1];
         assert!(!box_downscale(&src, g, &mut dst, dg));
     }
-
 }

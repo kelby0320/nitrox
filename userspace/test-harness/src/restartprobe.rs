@@ -16,13 +16,10 @@
 
 use libkern::debug::Line;
 use libkern::{
-    CLOCK_MONOTONIC, KError, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV,
-    SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_WAIT, exit, kprint, syscall1, syscall2,
-    syscall4, syscall5,
+    CLOCK_MONOTONIC, KError, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ,
+    SYS_HANDLE_CLOSE, SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4, syscall5,
 };
-use librsproto::namespace::{
-    OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply,
-};
+use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, parse_resolve_request, resolve_reply};
 use librsproto::{OP_NS_RESOLVE, OP_READY, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 static mut MSG: [u8; 4096] = [0; 4096];

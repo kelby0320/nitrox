@@ -116,18 +116,8 @@ mod tests {
     #[test]
     fn typed_write_read_round_trip() {
         let beats = [
-            Beat {
-                seq: 1,
-                source: String::from("worker"),
-                healthy: true,
-                note: Some(String::from("ok")),
-            },
-            Beat {
-                seq: 2,
-                source: String::from("worker"),
-                healthy: false,
-                note: None,
-            },
+            Beat { seq: 1, source: String::from("worker"), healthy: true, note: Some(String::from("ok")) },
+            Beat { seq: 2, source: String::from("worker"), healthy: false, note: None },
         ];
 
         let mut buf = Vec::new();
@@ -150,12 +140,7 @@ mod tests {
     #[test]
     fn from_values_rejects_mismatch() {
         // A `Str` where `seq` (Int) is expected.
-        let bad = [
-            Value::Str(String::from("x")),
-            Value::Str(String::from("s")),
-            Value::Bool(true),
-            Value::Null,
-        ];
+        let bad = [Value::Str(String::from("x")), Value::Str(String::from("s")), Value::Bool(true), Value::Null];
         assert_eq!(Beat::from_values(&bad), Err(WireError::SchemaMismatch));
         // Wrong field count.
         assert_eq!(Beat::from_values(&[Value::Int(1)]), Err(WireError::SchemaMismatch));

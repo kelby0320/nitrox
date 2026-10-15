@@ -28,11 +28,11 @@
 
 use core::arch::asm;
 use libkern::{
-    CLOCK_MONOTONIC, HandleInfo, IoResult, IpcMsg, KError, KOBJ_MEMORY_OBJECT, RIGHT_DUPLICATE,
-    RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_MAP_WRITE, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE,
-    SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
-    SYS_HANDLE_RESTRICT, SYS_HANDLE_STAT, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP,
-    SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4, syscall5,
+    CLOCK_MONOTONIC, HandleInfo, IoResult, IpcMsg, KError, KOBJ_MEMORY_OBJECT, RIGHT_DUPLICATE, RIGHT_INSPECT,
+    RIGHT_MAP_READ, RIGHT_MAP_WRITE, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND,
+    SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_HANDLE_RESTRICT, SYS_HANDLE_STAT, SYS_MEMORY_CREATE,
+    SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, exit, kprint, syscall1, syscall2,
+    syscall4, syscall5,
 };
 
 const PAGE: u64 = 4096;
@@ -183,13 +183,7 @@ pub extern "C" fn _start() -> ! {
     let waited = unsafe {
         WAIT_HANDLES[0] = th;
         // Generous 5 s overall deadline so the timer (not the deadline) wakes us.
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            t0 + 5_000_000_000,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, t0 + 5_000_000_000)
     };
     // SAFETY: on success (waited == 1) the kernel wrote one IoResult.
     let woke_handle = unsafe { (&raw const WAIT_RESULTS.handle).read() };
@@ -253,9 +247,7 @@ pub extern "C" fn _start() -> ! {
     //     (Cross-process IPC + handle transfer arrive with process spawn.)
     let mut ipc_ok = true;
     // SAFETY: END0/END1 are valid writable u64 out-params; depth 4.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0) };
     // SAFETY: on success the kernel wrote both endpoint handles.
     let (e0, e1) = unsafe { ((&raw const END0).read(), (&raw const END1).read()) };
     if cr != 0 {
@@ -274,18 +266,14 @@ pub extern "C" fn _start() -> ! {
         }
     }
     // SAFETY: valid endpoint handle + message pointer; NoBlock, no handles.
-    let sr = unsafe {
-        syscall5(SYS_CHANNEL_SEND, e0, (&raw const SEND_MSG) as u64, 0, 0, SENDMODE_NOBLOCK)
-    };
+    let sr = unsafe { syscall5(SYS_CHANNEL_SEND, e0, (&raw const SEND_MSG) as u64, 0, 0, SENDMODE_NOBLOCK) };
     if sr != 0 {
         ipc_ok = false;
     }
 
     // Polling end0 finds nothing — the message went to end1's inbox, not end0's.
     // SAFETY: RECV_MSG / RECV_COUNT are valid writable out-params; handles unused.
-    let pr = unsafe {
-        syscall4(SYS_CHANNEL_RECV, e0, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64)
-    };
+    let pr = unsafe { syscall4(SYS_CHANNEL_RECV, e0, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64) };
     if pr == E_WOULD_BLOCK {
         kprint(b"ipc: empty-endpoint would-block ok\n");
     } else {
@@ -296,25 +284,13 @@ pub extern "C" fn _start() -> ! {
     // SAFETY: WAIT_HANDLES / WAIT_RESULTS are valid writable buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = e1;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // SAFETY: valid endpoint handle + writable out-params.
-    let rr = unsafe {
-        syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64)
-    };
+    let rr = unsafe { syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64) };
     // SAFETY: on success the kernel wrote a full message into RECV_MSG.
-    let (rsp, rlen) = unsafe {
-        (
-            (&raw const RECV_MSG.header.sender_pid).read(),
-            (&raw const RECV_MSG.header.payload_len).read(),
-        )
-    };
+    let (rsp, rlen) =
+        unsafe { ((&raw const RECV_MSG.header.sender_pid).read(), (&raw const RECV_MSG.header.payload_len).read()) };
     // SAFETY: RECV_MSG.payload is initialised; compare the echoed bytes.
     let payload_match = unsafe {
         let mut ok = rlen as usize == IPC_PING.len();
@@ -335,9 +311,7 @@ pub extern "C" fn _start() -> ! {
 
     // A second recv on the now-drained end1 would block.
     // SAFETY: valid out-params.
-    let dr = unsafe {
-        syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64)
-    };
+    let dr = unsafe { syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64) };
     if dr == E_WOULD_BLOCK {
         kprint(b"ipc: drained would-block ok\n");
     } else {
@@ -348,9 +322,7 @@ pub extern "C" fn _start() -> ! {
     // SAFETY: closing our own endpoint handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, e0) };
     // SAFETY: valid out-params.
-    let pc = unsafe {
-        syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64)
-    };
+    let pc = unsafe { syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64) };
     if pc == E_PEER_CLOSED {
         kprint(b"ipc: peer-closed detected ok\n");
     } else {

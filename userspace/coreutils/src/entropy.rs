@@ -2,7 +2,9 @@
 //! `disk`'s volume IDs, UUIDs and partition GUIDs. It was `account`'s own until `disk` needed it
 //! too.
 
-use libkern::syscall::{SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_WAIT, syscall0, syscall1, syscall3, syscall4};
+use libkern::syscall::{
+    SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_WAIT, syscall0, syscall1, syscall3, syscall4,
+};
 
 /// **Fill `buf`** from the kernel's entropy source — which may answer with a pending operation to
 /// wait on before it has been seeded, and is read again after it. `false` if it would not answer;

@@ -1,0 +1,8 @@
+# The kernel and tools build on one exact stable, pinned as userspace's nightly is: a floating
+# stable would turn `main` red with no code change once `clippy -D warnings` holds. A bump is a PR
+# of its own. Userspace has its own toolchain file, which wins in its directory.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-none"]

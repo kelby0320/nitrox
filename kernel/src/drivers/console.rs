@@ -30,13 +30,13 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::dpc::Dpc;
 use crate::drivers::input::{self, ReadNow, Submitted};
-use crate::libkern::KBox;
 use crate::libkern::IrqSpinLock;
+use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
+use crate::libkern::lockrank::LockRank;
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
 use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
-use crate::libkern::lockrank::LockRank;
 
 /// Capacity of the RX ring — ample for an interactive command line; excess input
 /// (rare) is dropped rather than blocking the ISR.
@@ -173,14 +173,17 @@ fn read(
 ) -> Result<(), KError> {
     let mut tmp = [0u8; RING_CAP];
     // Decide under the lock; do the copy + PO completion after releasing it.
-    let found = input::read_or_park(|| reclaim(console), || {
-        let mut g = console.lock();
-        let found = g.read_now(&mut tmp[..max_len]);
-        if found == ReadNow::Empty {
-            g.parked = Some(ParkedRead { po: po.clone(), buffer: buffer.clone(), buf_offset, max_len });
-        }
-        found
-    });
+    let found = input::read_or_park(
+        || reclaim(console),
+        || {
+            let mut g = console.lock();
+            let found = g.read_now(&mut tmp[..max_len]);
+            if found == ReadNow::Empty {
+                g.parked = Some(ParkedRead { po: po.clone(), buffer: buffer.clone(), buf_offset, max_len });
+            }
+            found
+        },
+    );
     match found {
         Submitted::Drained(n) => {
             // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.

@@ -163,12 +163,7 @@ static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
     move_mask: 1, // move handle 0 (the handoff channel) to service-mgr
     arg0: 0,
     handles: [0; 4], // handles[0] = the handoff channel end, set at spawn
-    rights: [
-        RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_TRANSFER | RIGHT_DUPLICATE,
-        0,
-        0,
-        0,
-    ],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_TRANSFER | RIGHT_DUPLICATE, 0, 0, 0],
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE | SYSCAP_SYSTEM_CLOCK,
 };
@@ -177,30 +172,26 @@ static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
 /// `(status, resolved_handle)` (`IoResult`: status at bytes 8..12, handle 16..24).
 fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
-    };
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
     if po < 0 {
         return (po as i32, 0);
     }
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = po as u64;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    let status = unsafe {
-        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-    };
+    let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
     let resolved = unsafe {
         u64::from_le_bytes([
-            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            WAIT_RESULTS[16],
+            WAIT_RESULTS[17],
+            WAIT_RESULTS[18],
+            WAIT_RESULTS[19],
+            WAIT_RESULTS[20],
+            WAIT_RESULTS[21],
+            WAIT_RESULTS[22],
+            WAIT_RESULTS[23],
         ])
     };
     // SAFETY: closing our own PO handle (the resolved handle is separate).
@@ -403,21 +394,14 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     let dev_path = match manifest::device_ns_path(&m.device) {
         Some(p) => p,
         None => {
-            Line::new()
-                .s(b"init: unsupported device scheme '")
-                .s(m.device.as_bytes())
-                .s(b"'")
-                .end();
+            Line::new().s(b"init: unsupported device scheme '").s(m.device.as_bytes()).s(b"'").end();
             return None;
         }
     };
     // READ+WRITE (the RW fs-server writes filesystem metadata) + TRANSFER (hand it to the
     // server) + DUPLICATE (the server hands a copy to the kernel for the Model A data path).
-    let (st, device) = ns_lookup_wait(
-        root_ns,
-        dev_path.as_bytes(),
-        RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER | RIGHT_DUPLICATE,
-    );
+    let (st, device) =
+        ns_lookup_wait(root_ns, dev_path.as_bytes(), RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER | RIGHT_DUPLICATE);
     if st != 0 || device == 0 {
         Line::new().s(b"init: device ").s(dev_path.as_bytes()).s(b" not found").end();
         return None;
@@ -493,15 +477,8 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     //    binding takes its own reference; the endpoint goes back to `mount_all`, which
     //    may bind it again for a `[[bind]]` before closing it or handing it on.
     // SAFETY: valid namespace handle + path pointer + endpoint handle.
-    let br = unsafe {
-        syscall4(
-            SYS_NS_BIND,
-            root_ns,
-            m.mount_point.as_ptr() as u64,
-            m.mount_point.len() as u64,
-            endpoint,
-        )
-    };
+    let br =
+        unsafe { syscall4(SYS_NS_BIND, root_ns, m.mount_point.as_ptr() as u64, m.mount_point.len() as u64, endpoint) };
     if br != 0 {
         Line::new().s(b"init: bind FAIL at ").s(m.mount_point.as_bytes()).end();
         // SAFETY: closing our own handles; nothing was bound with them.
@@ -551,13 +528,7 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter, with deadline.
     let waited = unsafe {
         WAIT_HANDLES[0] = ctrl;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            deadline,
-        )
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
     };
     if waited == KError::TimedOut as i64 {
         say(b" sent no Ready within ").u(READY_TIMEOUT_NS / 1_000_000_000).s(b" s").end();
@@ -605,9 +576,7 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
     match first {
         init::ready::First::Ready => return Some(handles[0]),
         // A reason crossed the wire, so it is printed as one; `Line` marks it if it is cut.
-        init::ready::First::Refused(reason) if !reason.is_empty() => {
-            say(b" refused: ").untrusted(reason).end()
-        }
+        init::ready::First::Refused(reason) if !reason.is_empty() => say(b" refused: ").untrusted(reason).end(),
         init::ready::First::Refused(_) => say(b" refused, giving no reason init could read").end(),
         init::ready::First::Unexpected => say(b" sent something other than a Ready").end(),
     }
@@ -624,9 +593,7 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
 fn bind_profile_server(root_ns: u64) -> bool {
     // 1. Create the control channel (init keeps end 0, the server gets end 1).
     // SAFETY: CTRL0/CTRL1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0) };
     if cr != 0 {
         return false;
     }
@@ -669,9 +636,7 @@ fn bind_profile_server(root_ns: u64) -> bool {
     //    `TRANSFER | DUPLICATE` are the rights the hand-down needs and all it needs: this
     //    copy is carried and re-bound, never sent on.
     // SAFETY: duplicating our own endpoint handle with attenuated rights.
-    let retained = unsafe {
-        syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE)
-    };
+    let retained = unsafe { syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE) };
     if retained < 0 {
         kprint(b"init: profile endpoint duplicate FAIL\n");
         // SAFETY: closing our own endpoint handle.
@@ -690,17 +655,8 @@ fn bind_profile_server(root_ns: u64) -> bool {
     // `/bin/applications` would forward as a bare `applications` and reach the *applications*
     // projection, which is an alias nobody asked for.
     // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
-    let br = unsafe {
-        syscall6(
-            SYS_NS_BIND,
-            root_ns,
-            b"/bin".as_ptr() as u64,
-            4,
-            endpoint,
-            b"/bin".as_ptr() as u64,
-            4,
-        )
-    };
+    let br =
+        unsafe { syscall6(SYS_NS_BIND, root_ns, b"/bin".as_ptr() as u64, 4, endpoint, b"/bin".as_ptr() as u64, 4) };
     // SAFETY: closing init's endpoint handle (the binding holds its own reference).
     unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
     if br != 0 {
@@ -733,9 +689,7 @@ fn read_current_generation(root_ns: u64) {
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: the path resolves to a read-mappable file object (asserted by the
     // `Memory, MapRead` type arguments).
-    let mem = match block_on(unsafe {
-        ns.lookup::<Memory, MapRead>("/system/current-generation", Rights::MAP_READ)
-    }) {
+    let mem = match block_on(unsafe { ns.lookup::<Memory, MapRead>("/system/current-generation", Rights::MAP_READ) }) {
         Ok(m) => m,
         Err(_) => {
             kprint(b"init: /system/current-generation lookup FAIL\n");
@@ -776,11 +730,7 @@ fn read_current_generation(root_ns: u64) {
 /// path identical to the tested one. `init` only ever fires **FAIL** — PASS is `boot-probe`'s.
 fn test_exit(ok: bool) {
     let code = if ok { TEST_EXIT_SUCCESS } else { TEST_EXIT_FAILURE };
-    kprint(if ok {
-        b"init: test-harness verdict PASS\n"
-    } else {
-        b"init: test-harness verdict FAIL\n"
-    });
+    kprint(if ok { b"init: test-harness verdict PASS\n" } else { b"init: test-harness verdict FAIL\n" });
     // SAFETY: SYS_TEST_EXIT takes the verdict code in a0; under the kernel's
     // test-harness build it writes `isa-debug-exit` and QEMU terminates (so in
     // practice this syscall does not return).
@@ -816,9 +766,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     // **The terminal channel.** Depth 4: three handoffs, queued before `service-mgr` runs — a ring
     // shorter than the sends drops the last one silently — and then the ops it sends back.
     // SAFETY: CTRL0/CTRL1 are valid writable out-params (mounts are long done).
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
-    };
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0) };
     if cr != 0 {
         kprint(b"init: service-mgr handoff channel FAIL\n");
         // SAFETY: nothing was handed off; the endpoints are ours to close.
@@ -922,7 +870,6 @@ unsafe fn close_retained_endpoints() {
     }
 }
 
-
 /// The healthy supervise path. **Normally**, hand off to the service manager: spawn
 /// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
 /// reap_loop drops to the emergency console as the interim recovery, until a reboot
@@ -1003,13 +950,7 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
         let waited = unsafe {
             WAIT_HANDLES[0] = notif;
             WAIT_HANDLES[1] = terminal;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                count,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, count, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             continue;
@@ -1022,8 +963,7 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
                 break; // WouldBlock: drained
             }
             // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-            let (kind, body) =
-                unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+            let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
             if kind == KIND_CHILD_EXITED {
                 let cpid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);

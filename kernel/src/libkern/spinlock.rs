@@ -66,11 +66,7 @@ impl<T> SpinLock<T> {
     /// that reasoning explicit at the definition site. Picking one is the first step of
     /// `kernel/docs/lock-ordering.md` § Adding a new lock.
     pub const fn new(rank: LockRank, value: T) -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-            rank,
-            data: UnsafeCell::new(value),
-        }
+        Self { locked: AtomicBool::new(false), rank, data: UnsafeCell::new(value) }
     }
 
     /// Acquire the lock, spinning until it becomes available. Returns a
@@ -91,11 +87,7 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         crate::sched::preempt_disable();
         loop {
-            if self
-                .locked
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
+            if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 crate::libkern::lockrank::acquired(self.rank, Taken::Waiting);
                 return SpinLockGuard { lock: self };
             }
@@ -268,11 +260,7 @@ impl<T> IrqSpinLock<T> {
     /// Construct a new lock around `value` at `rank`. Available in `const` context.
     /// The rank is mandatory for the reason given on [`SpinLock::new`].
     pub const fn new(rank: LockRank, value: T) -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-            rank,
-            data: UnsafeCell::new(value),
-        }
+        Self { locked: AtomicBool::new(false), rank, data: UnsafeCell::new(value) }
     }
 
     /// Acquire the lock with interrupts masked. Masks **before** spinning so
@@ -285,11 +273,7 @@ impl<T> IrqSpinLock<T> {
         // interrupted (single-CPU deadlock-freedom).
         let prev_if = irq_backend::disable();
         loop {
-            if self
-                .locked
-                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
+            if self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 crate::libkern::lockrank::acquired(self.rank, Taken::Waiting);
                 return IrqSpinLockGuard { lock: self, prev_if };
             }
@@ -310,11 +294,7 @@ impl<T> IrqSpinLock<T> {
     /// that waits is ordered. That is what lets the panic path tee from under any lock.
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
         let prev_if = irq_backend::disable();
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
+        if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             crate::libkern::lockrank::acquired(self.rank, Taken::WithoutWaiting);
             Some(IrqSpinLockGuard { lock: self, prev_if })
         } else {

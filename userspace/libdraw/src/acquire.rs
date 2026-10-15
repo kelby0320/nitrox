@@ -58,17 +58,13 @@ pub unsafe fn read_info(root_ns: u64) -> Result<FramebufferInfo, AcquireError> {
     // non-owning view that never closes it.
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: the path resolves to a read-mappable object holding one FramebufferInfo.
-    let obj = block_on(unsafe {
-        ns.lookup::<Memory, MapRead>(FRAMEBUFFER_INFO_PATH, Rights::MAP_READ)
-    })
-    .map_err(|_| AcquireError::NoBinding)?;
+    let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(FRAMEBUFFER_INFO_PATH, Rights::MAP_READ) })
+        .map_err(|_| AcquireError::NoBinding)?;
 
     let addr = obj.map(core::mem::size_of::<FramebufferInfo>()).map_err(|_| AcquireError::InfoUnmappable)?;
     // SAFETY: `map` returned a mapping of at least the requested length, and the
     // kernel serves this leaf as exactly one `FramebufferInfo` followed by zero padding.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(addr as *const u8, core::mem::size_of::<FramebufferInfo>())
-    };
+    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, core::mem::size_of::<FramebufferInfo>()) };
     FramebufferInfo::from_bytes(bytes).ok_or(AcquireError::InfoTruncated)
 }
 
@@ -91,8 +87,7 @@ pub fn geometry_from(info: &FramebufferInfo) -> Result<Geometry, AcquireError> {
         // is to say paint nothing at all.
         alpha: None,
     };
-    Geometry::with_pitch(info.width, info.height, info.pitch as usize, format)
-        .ok_or(AcquireError::ImpossibleGeometry)
+    Geometry::with_pitch(info.width, info.height, info.pitch as usize, format).ok_or(AcquireError::ImpossibleGeometry)
 }
 
 /// Map the framebuffer and wrap it as a writable [`RawFramebuffer`].
@@ -114,13 +109,9 @@ pub unsafe fn acquire(root_ns: u64) -> Result<(RawFramebuffer, FramebufferInfo),
     // SAFETY: as above — borrowed, never closed.
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: the path resolves to a read/write-mappable MemoryObject over the aperture.
-    let obj = block_on(unsafe {
-        ns.lookup::<Memory, MapReadWrite>(
-            FRAMEBUFFER_PATH,
-            Rights::MAP_READ | Rights::MAP_WRITE,
-        )
-    })
-    .map_err(|_| AcquireError::NoBinding)?;
+    let obj =
+        block_on(unsafe { ns.lookup::<Memory, MapReadWrite>(FRAMEBUFFER_PATH, Rights::MAP_READ | Rights::MAP_WRITE) })
+            .map_err(|_| AcquireError::NoBinding)?;
 
     let addr = obj.map(info.byte_len as usize).map_err(|_| AcquireError::ApertureUnmappable)?;
     // SAFETY: `addr` maps `byte_len` writable bytes of the aperture, which stays mapped

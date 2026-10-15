@@ -47,8 +47,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use libfs::FileError;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use libfs::FileError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort};
@@ -124,11 +124,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             stage.die(b"move: source and destination are the same file\n", EXIT_USAGE);
         }
         let method = move_one(&stage, src, target.as_bytes(), force);
-        done.push(Moved {
-            from: String::from_utf8_lossy(src).into_owned(),
-            to: target,
-            method,
-        });
+        done.push(Moved { from: String::from_utf8_lossy(src).into_owned(), to: target, method });
     }
 
     match stage.streams.stdout {
@@ -180,10 +176,7 @@ fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str 
         libfs::unlink_at(stage.namespace, src).is_ok()
     };
     if !removed {
-        stage.die(
-            b"move: copied, but could not remove the original (both now exist)\n",
-            EXIT_FAILURE,
-        );
+        stage.die(b"move: copied, but could not remove the original (both now exist)\n", EXIT_FAILURE);
     }
     "copy"
 }
@@ -193,9 +186,7 @@ fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str 
 /// same reason: this program can now delete a tree.
 fn is_binding(stage: &Stage, path: &[u8]) -> bool {
     let name = libfs::basename(path);
-    libfs::ns_children(stage.namespace, libfs::parent(path))
-        .iter()
-        .any(|(n, _)| n.as_bytes() == name)
+    libfs::ns_children(stage.namespace, libfs::parent(path)).iter().any(|(n, _)| n.as_bytes() == name)
 }
 
 /// Write the rows as a TSM1 table on the `stdout` stream.
@@ -208,11 +199,7 @@ fn emit(stage: &Stage, stdout: u64, done: &[Moved]) {
     let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for m in done {
-            tw.write_row(&[
-                Value::Str(m.from.clone()),
-                Value::Str(m.to.clone()),
-                Value::Str(String::from(m.method)),
-            ])?;
+            tw.write_row(&[Value::Str(m.from.clone()), Value::Str(m.to.clone()), Value::Str(String::from(m.method))])?;
         }
         tw.finish_with_status(0)
     });

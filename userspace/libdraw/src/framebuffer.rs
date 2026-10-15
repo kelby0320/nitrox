@@ -55,12 +55,7 @@ impl Geometry {
     /// on the last pixel of a row. Refusing the geometry makes that unreachable instead of
     /// latent. (`from_limine` refuses non-32-bpp too, but nothing forces a `Geometry` to
     /// come from firmware.)
-    pub const fn with_pitch(
-        width: u32,
-        height: u32,
-        pitch: usize,
-        format: PixelFormat,
-    ) -> Option<Self> {
+    pub const fn with_pitch(width: u32, height: u32, pitch: usize, format: PixelFormat) -> Option<Self> {
         if format.bits_per_pixel != 32 {
             return None;
         }

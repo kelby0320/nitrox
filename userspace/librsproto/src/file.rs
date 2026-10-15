@@ -248,30 +248,14 @@ impl OwnedEntry {
         let mut buf = [0u8; MAX_NAME];
         let n = name.len().min(MAX_NAME);
         buf[..n].copy_from_slice(&name[..n]);
-        OwnedEntry {
-            inode: 0,
-            kind,
-            mode: 0,
-            size: 0,
-            mtime: 0,
-            name: buf,
-            name_len: n as u8,
-        }
+        OwnedEntry { inode: 0, kind, mode: 0, size: 0, mtime: 0, name: buf, name_len: n as u8 }
     }
 
     pub fn from_entry(e: &DirEntry<'_>) -> OwnedEntry {
         let mut name = [0u8; MAX_NAME];
         let n = e.name.len().min(MAX_NAME);
         name[..n].copy_from_slice(&e.name[..n]);
-        OwnedEntry {
-            inode: e.inode,
-            kind: e.kind,
-            mode: e.mode,
-            size: e.size,
-            mtime: e.mtime,
-            name,
-            name_len: n as u8,
-        }
+        OwnedEntry { inode: e.inode, kind: e.kind, mode: e.mode, size: e.size, mtime: e.mtime, name, name_len: n as u8 }
     }
 
     /// The entry's name.
@@ -318,15 +302,7 @@ impl<'a> DirReplyWriter<'a> {
     ///
     /// `mode`/`size`/`mtime` are the entry's inode metadata; a server that does not track
     /// one passes `0` (see [`DirEntry`]).
-    pub fn push(
-        &mut self,
-        inode: u32,
-        kind: u8,
-        mode: u16,
-        size: u64,
-        mtime: i64,
-        name: &[u8],
-    ) -> bool {
+    pub fn push(&mut self, inode: u32, kind: u8, mode: u16, size: u64, mtime: i64, name: &[u8]) -> bool {
         if name.len() > u8::MAX as usize {
             return false;
         }
@@ -367,14 +343,8 @@ pub fn parse_read_dir_reply(body: &[u8]) -> Option<(ReadDirReplyHeader, DirEntry
     if body.len() < READ_DIR_REPLY_HEADER_LEN {
         return None;
     }
-    let header = ReadDirReplyHeader {
-        next_cursor: get_u64(body, 0),
-        entry_count: get_u16(body, 8),
-    };
-    Some((
-        header,
-        DirEntryIter { body: &body[READ_DIR_REPLY_HEADER_LEN..], remaining: header.entry_count },
-    ))
+    let header = ReadDirReplyHeader { next_cursor: get_u64(body, 0), entry_count: get_u16(body, 8) };
+    Some((header, DirEntryIter { body: &body[READ_DIR_REPLY_HEADER_LEN..], remaining: header.entry_count }))
 }
 
 /// Iterator over the packed entries of a `ReadDirReply`. Yields `None` early (ending the
@@ -540,16 +510,17 @@ mod tests {
         let (h, iter) = parse_read_dir_reply(&buf[..n]).unwrap();
         assert_eq!(h.next_cursor, 0);
         assert_eq!(h.entry_count, 4);
-        let got: Vec<_> = iter
-            .map(|e| (e.inode, e.kind, e.mode, e.size, e.mtime, e.name.to_vec()))
-            .collect();
-        assert_eq!(got, vec![
-            (2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b".".to_vec()),
-            (2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b"..".to_vec()),
-            (11, DIRENT_KIND_FILE, 0o100644, 13, 1_800_000_001, b"hello.txt".to_vec()),
-            // A server with no metadata to report zeroes the fields.
-            (12, DIRENT_KIND_DIR, 0, 0, 0, b"subdir".to_vec()),
-        ]);
+        let got: Vec<_> = iter.map(|e| (e.inode, e.kind, e.mode, e.size, e.mtime, e.name.to_vec())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b".".to_vec()),
+                (2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b"..".to_vec()),
+                (11, DIRENT_KIND_FILE, 0o100644, 13, 1_800_000_001, b"hello.txt".to_vec()),
+                // A server with no metadata to report zeroes the fields.
+                (12, DIRENT_KIND_DIR, 0, 0, 0, b"subdir".to_vec()),
+            ]
+        );
     }
 
     #[test]
@@ -577,14 +548,7 @@ mod tests {
         // `name_len` is a u8, so 255 bytes is the longest name a server can send; it must
         // survive the copy whole rather than losing a byte to an off-by-one.
         let long = [b'x'; MAX_NAME];
-        let e = DirEntry {
-            inode: 1,
-            kind: DIRENT_KIND_DIR,
-            mode: 0,
-            size: 0,
-            mtime: 0,
-            name: &long,
-        };
+        let e = DirEntry { inode: 1, kind: DIRENT_KIND_DIR, mode: 0, size: 0, mtime: 0, name: &long };
         let owned = OwnedEntry::from_entry(&e);
         assert_eq!(owned.name(), &long[..]);
     }

@@ -28,8 +28,8 @@ extern crate alloc;
 use alloc::string::String;
 
 use coreutils::args::{Flag, parse};
-use libfs::FileError;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use libfs::FileError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelSink, IpcPort};
@@ -85,10 +85,9 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         // The one error worth naming specifically: it is not a failure of the filesystem
         // but a statement that this operation cannot express what was asked, and the
         // caller has a different tool for it.
-        Err(FileError::CrossDevice) => stage.die(
-            b"rename: source and destination are on different mounts (use `move`)\n",
-            EXIT_FAILURE,
-        ),
+        Err(FileError::CrossDevice) => {
+            stage.die(b"rename: source and destination are on different mounts (use `move`)\n", EXIT_FAILURE)
+        }
         Err(FileError::NotFound) => stage.die(b"rename: no such path\n", EXIT_FAILURE),
         Err(_) => stage.die(b"rename: cannot rename\n", EXIT_FAILURE),
     }
@@ -111,9 +110,11 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Write the single row as a TSM1 table on the `stdout` stream.
 fn emit(stage: &Stage, stdout: u64, from: &str, to: &str) {
-    let schema = Schema::new()
-        .field("from", TypeTag::String, TypeModifiers::NONE)
-        .field("to", TypeTag::String, TypeModifiers::NONE);
+    let schema = Schema::new().field("from", TypeTag::String, TypeModifiers::NONE).field(
+        "to",
+        TypeTag::String,
+        TypeModifiers::NONE,
+    );
 
     let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {

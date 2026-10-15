@@ -443,11 +443,9 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     let Some(scratch) = scratchpads_for(scratchpads, &dcbaa) else {
         return declined(OUT_OF_MEMORY);
     };
-    let (Ok(cmd_mem), Ok(ev_mem), Ok(erst)) = (
-        DmaBuffer::alloc(RING_TRBS * 16),
-        DmaBuffer::alloc(RING_TRBS * 16),
-        DmaBuffer::alloc(16),
-    ) else {
+    let (Ok(cmd_mem), Ok(ev_mem), Ok(erst)) =
+        (DmaBuffer::alloc(RING_TRBS * 16), DmaBuffer::alloc(RING_TRBS * 16), DmaBuffer::alloc(16))
+    else {
         return declined(OUT_OF_MEMORY);
     };
     let cmd_ring = Producer::new(&mut DmaSlots(&cmd_mem), cmd_mem.phys().as_u64());
@@ -724,7 +722,8 @@ fn on_event(x: &Xhci, trb: &Trb) {
             }
         }
         kind::TRANSFER_EVENT => {
-            let done = ep0_event(&mut x.waiting.lock(), trb.slot_id(), trb.pointer(), trb.completion_code(), trb.residual());
+            let done =
+                ep0_event(&mut x.waiting.lock(), trb.slot_id(), trb.pointer(), trb.completion_code(), trb.residual());
             if let Some((w, code, result)) = done {
                 crate::sched::complete_pending_op(w.po.0, code as i32, result);
             }
@@ -740,7 +739,13 @@ fn on_event(x: &Xhci, trb: &Trb) {
 /// its Data stage fell short by. The Status stage's event, or an error on any stage, ends it; an
 /// error's result is its own TRB's residual. An event for another slot, or with no transfer
 /// waiting, changes nothing.
-fn ep0_event(waiting: &mut Option<Waiting>, slot: u8, pointer: u64, code: u8, residual: u32) -> Option<(Waiting, u8, u64)> {
+fn ep0_event(
+    waiting: &mut Option<Waiting>,
+    slot: u8,
+    pointer: u64,
+    code: u8,
+    residual: u32,
+) -> Option<(Waiting, u8, u64)> {
     let w = waiting.as_mut()?;
     let Awaited::Transfer { slot: awaited, status } = w.awaited else { return None };
     if awaited != slot {

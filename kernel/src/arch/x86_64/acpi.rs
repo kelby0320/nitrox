@@ -62,11 +62,7 @@ pub(crate) struct IoApic {
 }
 
 impl IoApic {
-    const ZERO: IoApic = IoApic {
-        id: 0,
-        addr: PhysAddr(0),
-        gsi_base: 0,
-    };
+    const ZERO: IoApic = IoApic { id: 0, addr: PhysAddr(0), gsi_base: 0 };
 }
 
 /// An ISA-IRQ → GSI interrupt source override from the MADT (arch-internal).
@@ -81,11 +77,7 @@ pub(crate) struct SourceOverride {
 }
 
 impl SourceOverride {
-    const ZERO: SourceOverride = SourceOverride {
-        source_irq: 0,
-        gsi: 0,
-        flags: 0,
-    };
+    const ZERO: SourceOverride = SourceOverride { source_irq: 0, gsi: 0, flags: 0 };
 }
 
 // --- Static caches: written once by `init` at boot, read-only thereafter ---
@@ -112,9 +104,7 @@ fn rd_u32(b: &[u8], o: usize) -> u32 {
 }
 #[inline]
 fn rd_u64(b: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes([
-        b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
-    ])
+    u64::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]])
 }
 
 /// ACPI checksum: the bytes sum to zero (mod 256).
@@ -124,11 +114,7 @@ fn checksum_ok(b: &[u8]) -> bool {
 
 /// The common 36-byte System Description Table header is present.
 fn sdt_signature(b: &[u8]) -> Option<[u8; 4]> {
-    if b.len() < 36 {
-        None
-    } else {
-        Some([b[0], b[1], b[2], b[3]])
-    }
+    if b.len() < 36 { None } else { Some([b[0], b[1], b[2], b[3]]) }
 }
 
 /// Total length of an SDT (header field at offset 4). Caller must have ≥ 36 bytes.
@@ -157,37 +143,21 @@ fn parse_rsdp(rsdp: &[u8]) -> Option<RsdpInfo> {
         if (20..=rsdp.len()).contains(&length) && checksum_ok(&rsdp[0..length]) {
             let xsdt = rd_u64(rsdp, 24);
             if xsdt != 0 {
-                return Some(RsdpInfo {
-                    revision,
-                    sdt_phys: PhysAddr(xsdt),
-                    use_xsdt: true,
-                });
+                return Some(RsdpInfo { revision, sdt_phys: PhysAddr(xsdt), use_xsdt: true });
             }
         }
     }
-    Some(RsdpInfo {
-        revision,
-        sdt_phys: PhysAddr(rd_u32(rsdp, 16) as u64),
-        use_xsdt: false,
-    })
+    Some(RsdpInfo { revision, sdt_phys: PhysAddr(rd_u32(rsdp, 16) as u64), use_xsdt: false })
 }
 
 /// Iterate the physical addresses of the tables an RSDT/XSDT points at.
 fn sdt_pointers(sdt: &[u8], use_xsdt: bool) -> impl Iterator<Item = PhysAddr> + '_ {
     let stride = if use_xsdt { 8 } else { 4 };
-    let len = if sdt.len() >= 36 {
-        sdt_length(sdt).min(sdt.len())
-    } else {
-        0
-    };
+    let len = if sdt.len() >= 36 { sdt_length(sdt).min(sdt.len()) } else { 0 };
     let count = len.saturating_sub(36) / stride;
     (0..count).map(move |i| {
         let off = 36 + i * stride;
-        if use_xsdt {
-            PhysAddr(rd_u64(sdt, off))
-        } else {
-            PhysAddr(rd_u32(sdt, off) as u64)
-        }
+        if use_xsdt { PhysAddr(rd_u64(sdt, off)) } else { PhysAddr(rd_u32(sdt, off) as u64) }
     })
 }
 
@@ -271,28 +241,20 @@ fn madt_entries(madt: &[u8]) -> impl Iterator<Item = MadtEntry> + '_ {
                 apic_id: e[3] as u32,
                 state: CpuState::from_flags(rd_u32(e, 4)),
             },
-            1 if elen >= 12 => MadtEntry::IoApic(IoApic {
-                id: e[2],
-                addr: PhysAddr(rd_u32(e, 4) as u64),
-                gsi_base: rd_u32(e, 8),
-            }),
-            2 if elen >= 10 => MadtEntry::Override(SourceOverride {
-                source_irq: e[3],
-                gsi: rd_u32(e, 4),
-                flags: rd_u16(e, 8),
-            }),
-            4 if elen >= 6 => {
-                MadtEntry::Nmi { x2apic: false, uid: e[2] as u32, flags: rd_u16(e, 3), lint: e[5] }
+            1 if elen >= 12 => {
+                MadtEntry::IoApic(IoApic { id: e[2], addr: PhysAddr(rd_u32(e, 4) as u64), gsi_base: rd_u32(e, 8) })
             }
+            2 if elen >= 10 => {
+                MadtEntry::Override(SourceOverride { source_irq: e[3], gsi: rd_u32(e, 4), flags: rd_u16(e, 8) })
+            }
+            4 if elen >= 6 => MadtEntry::Nmi { x2apic: false, uid: e[2] as u32, flags: rd_u16(e, 3), lint: e[5] },
             9 if elen >= 16 => MadtEntry::Cpu {
                 x2apic: true,
                 apic_id: rd_u32(e, 4),
                 state: CpuState::from_flags(rd_u32(e, 8)),
                 uid: rd_u32(e, 12),
             },
-            0xA if elen >= 12 => {
-                MadtEntry::Nmi { x2apic: true, flags: rd_u16(e, 2), uid: rd_u32(e, 4), lint: e[8] }
-            }
+            0xA if elen >= 12 => MadtEntry::Nmi { x2apic: true, flags: rd_u16(e, 2), uid: rd_u32(e, 4), lint: e[8] },
             _ => MadtEntry::Other { etype, len: elen as u8 },
         })
     })
@@ -379,18 +341,12 @@ fn log_madt_entry(entry: &MadtEntry, has_lapic_cpus: bool) {
             if not_counted(entry, has_lapic_cpus).is_some() { " — not counted: " } else { "" },
             not_counted(entry, has_lapic_cpus).unwrap_or("")
         ),
-        MadtEntry::IoApic(io) => crate::kprintln!(
-            "madt: ioapic {} @{:#x} gsi {}",
-            io.id,
-            io.addr.as_u64(),
-            io.gsi_base
-        ),
-        MadtEntry::Override(ov) => crate::kprintln!(
-            "madt: override irq {} -> gsi {} flags {:#x}",
-            ov.source_irq,
-            ov.gsi,
-            ov.flags
-        ),
+        MadtEntry::IoApic(io) => {
+            crate::kprintln!("madt: ioapic {} @{:#x} gsi {}", io.id, io.addr.as_u64(), io.gsi_base)
+        }
+        MadtEntry::Override(ov) => {
+            crate::kprintln!("madt: override irq {} -> gsi {} flags {:#x}", ov.source_irq, ov.gsi, ov.flags)
+        }
         MadtEntry::Nmi { x2apic, uid, lint, flags } => crate::kprintln!(
             "madt: {} uid {:#x} lint {} flags {:#x}",
             if x2apic { "x2apic-nmi" } else { "lapic-nmi" },
@@ -412,12 +368,7 @@ fn parse_mcfg(mcfg: &[u8], out: &mut [EcamRegion]) -> usize {
     let mut off = 44;
     while off + 16 <= mcfg.len() && n < out.len() {
         let e = &mcfg[off..off + 16];
-        out[n] = EcamRegion {
-            base: PhysAddr(rd_u64(e, 0)),
-            segment: rd_u16(e, 8),
-            bus_start: e[10],
-            bus_end: e[11],
-        };
+        out[n] = EcamRegion { base: PhysAddr(rd_u64(e, 0)), segment: rd_u16(e, 8), bus_start: e[10], bus_end: e[11] };
         n += 1;
         off += 16;
     }
@@ -693,21 +644,9 @@ impl ArchPlatform for X86Platform {
                 log_madt_entry(&entry, has_lapic);
             }
         }
-        crate::kprintln!(
-            "acpi: {} IOAPIC, {} src-override, {} CPU; {} ECAM region",
-            ni,
-            no,
-            nc,
-            ne,
-        );
+        crate::kprintln!("acpi: {} IOAPIC, {} src-override, {} CPU; {} ECAM region", ni, no, nc, ne,);
         for e in &ecam[..ne] {
-            crate::kprintln!(
-                "acpi: ECAM @{:#x} seg {} bus {}-{}",
-                e.base.as_u64(),
-                e.segment,
-                e.bus_start,
-                e.bus_end
-            );
+            crate::kprintln!("acpi: ECAM @{:#x} seg {} bus {}-{}", e.base.as_u64(), e.segment, e.bus_start, e.bus_end);
         }
         match &fadt {
             Some(f) => log_fadt(f),
@@ -870,10 +809,7 @@ mod tests {
         let mut cpus = [0u32; 4];
         let (ni, no, nc) = parse_madt(&madt, &mut ioapics, &mut overrides, &mut cpus);
         assert_eq!((ni, no, nc), (1, 1, 1));
-        assert_eq!(
-            ioapics[0],
-            IoApic { id: 2, addr: PhysAddr(0xFEC0_0000), gsi_base: 0 }
-        );
+        assert_eq!(ioapics[0], IoApic { id: 2, addr: PhysAddr(0xFEC0_0000), gsi_base: 0 });
         assert_eq!(overrides[0], SourceOverride { source_irq: 0, gsi: 2, flags: 0 });
         assert_eq!(cpus[0], 5); // only the enabled CPU
     }
@@ -881,6 +817,7 @@ mod tests {
     /// QEMU q35's MADT at `-smp 4`, as the kernel read it (captured 2026-09-14 by a
     /// temporary hex dump in `X86Platform::init` under `cargo xtask test-qemu`, then removed).
     /// Checksum-valid as captured.
+    #[rustfmt::skip]
     const QEMU_MADT: [u8; 144] = [
         0x41, 0x50, 0x49, 0x43, 0x90, 0x00, 0x00, 0x00, 0x03, 0x49, 0x42, 0x4f,
         0x43, 0x48, 0x53, 0x20, 0x42, 0x58, 0x50, 0x43, 0x20, 0x20, 0x20, 0x20,
@@ -901,9 +838,7 @@ mod tests {
         assert!(checksum_ok(&QEMU_MADT), "the capture is a whole, valid table");
         assert_eq!(madt_header(&QEMU_MADT), Some((0xFEE0_0000, 1)));
         let cpu = |n: u32| MadtEntry::Cpu { x2apic: false, uid: n, apic_id: n, state: CpuState::Enabled };
-        let level_high = |irq: u8| {
-            MadtEntry::Override(SourceOverride { source_irq: irq, gsi: irq as u32, flags: 0xD })
-        };
+        let level_high = |irq: u8| MadtEntry::Override(SourceOverride { source_irq: irq, gsi: irq as u32, flags: 0xD });
         let got: Vec<MadtEntry> = madt_entries(&QEMU_MADT).collect();
         assert_eq!(
             got,
@@ -1075,10 +1010,7 @@ mod tests {
         let mut ecam = [EcamRegion::ZERO; 4];
         let n = parse_mcfg(&mcfg, &mut ecam);
         assert_eq!(n, 1);
-        assert_eq!(
-            ecam[0],
-            EcamRegion { base: PhysAddr(0xB000_0000), segment: 0, bus_start: 0, bus_end: 255 }
-        );
+        assert_eq!(ecam[0], EcamRegion { base: PhysAddr(0xB000_0000), segment: 0, bus_start: 0, bus_end: 255 });
     }
 
     #[test]

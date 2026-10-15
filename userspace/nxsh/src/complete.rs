@@ -96,10 +96,7 @@ fn position(line: &str, start: usize) -> Where {
         // and let the real preceding token decide. `needs_continuation` is the language's own
         // answer to that and lexes properly, so a brace inside a string does not open
         // anything; asking it here is what keeps this from being a second implementation.
-        if i > 0
-            && b[i - 1] == b'\n'
-            && crate::repl::needs_continuation(&line[..i - 1]) != crate::repl::Continue::No
-        {
+        if i > 0 && b[i - 1] == b'\n' && crate::repl::needs_continuation(&line[..i - 1]) != crate::repl::Continue::No {
             i -= 1;
             continue;
         }
@@ -171,8 +168,7 @@ pub fn matching_paths(dir: &str, frag: &str, names: &[(String, bool)]) -> Vec<St
 
 /// The names that begin with `frag`, sorted and deduplicated.
 pub fn matching_names<'a>(frag: &str, names: impl Iterator<Item = &'a str>) -> Vec<String> {
-    let mut out: Vec<String> =
-        names.filter(|n| n.starts_with(frag)).map(|n| n.to_string()).collect();
+    let mut out: Vec<String> = names.filter(|n| n.starts_with(frag)).map(|n| n.to_string()).collect();
     out.sort();
     out.dedup();
     out
@@ -483,10 +479,7 @@ mod tests {
     #[test]
     fn a_bare_tab_does_not_offer_dot_entries() {
         let entries = names(&[("Documents", true), ("notes.txt", false)]);
-        assert_eq!(
-            matching_paths("", "", &entries),
-            vec![String::from("Documents/"), String::from("notes.txt")],
-        );
+        assert_eq!(matching_paths("", "", &entries), vec![String::from("Documents/"), String::from("notes.txt")],);
         // Nor does a fragment that is not itself dotted, even one containing a dot.
         assert_eq!(matching_paths("", "notes.", &entries), vec![String::from("notes.txt")]);
     }
@@ -511,35 +504,20 @@ mod tests {
     #[test]
     fn every_outcome_of_a_tab_press() {
         let start = 5;
-        let c = |names: &[&str]| Completion {
-            start,
-            candidates: names.iter().map(|n| String::from(*n)).collect(),
-        };
+        let c = |names: &[&str]| Completion { start, candidates: names.iter().map(|n| String::from(*n)).collect() };
 
         // Nothing matched.
         assert_eq!(c(&[]).action("list zz"), Action::Nothing);
 
         // One match, and something to add: typed for you, with a space to start the next word.
-        assert_eq!(
-            c(&["notes.txt"]).action("list not"),
-            Action::Replace(String::from("list notes.txt "))
-        );
+        assert_eq!(c(&["notes.txt"]).action("list not"), Action::Replace(String::from("list notes.txt ")));
         // One match that is a directory: a slash, not a space, so a second Tab descends.
-        assert_eq!(
-            c(&["Documents/"]).action("list Doc"),
-            Action::Replace(String::from("list Documents/"))
-        );
+        assert_eq!(c(&["Documents/"]).action("list Doc"), Action::Replace(String::from("list Documents/")));
         // **One match, already fully typed**: still the space, and this is what fell through.
-        assert_eq!(
-            c(&["notes.txt"]).action("list notes.txt"),
-            Action::Replace(String::from("list notes.txt "))
-        );
+        assert_eq!(c(&["notes.txt"]).action("list notes.txt"), Action::Replace(String::from("list notes.txt ")));
 
         // Several, with something they all agree on: type that much and stop.
-        assert_eq!(
-            c(&["Documents/", "Downloads/"]).action("list D"),
-            Action::Replace(String::from("list Do"))
-        );
+        assert_eq!(c(&["Documents/", "Downloads/"]).action("list D"), Action::Replace(String::from("list Do")));
         // Several, agreeing on nothing more: the choice is the only useful answer.
         assert_eq!(c(&["Documents/", "Downloads/"]).action("list Do"), Action::List);
         // A directory already complete with several under it also lists rather than sitting
@@ -593,10 +571,7 @@ mod tests {
             // The pair that motivated it, as whole path candidates.
             ("/home/café.txt", "/home/cafè.txt", "/home/caf"),
         ] {
-            let c = Completion {
-                start: 0,
-                candidates: vec![String::from(a), String::from(b)],
-            };
+            let c = Completion { start: 0, candidates: vec![String::from(a), String::from(b)] };
             assert_eq!(c.common_prefix(), want, "for {a:?} and {b:?}");
         }
     }
@@ -610,11 +585,7 @@ mod tests {
     fn a_candidate_that_is_a_prefix_of_the_others_bounds_it() {
         let c = Completion {
             start: 0,
-            candidates: vec![
-                String::from("note"),
-                String::from("notes"),
-                String::from("notebook"),
-            ],
+            candidates: vec![String::from("note"), String::from("notes"), String::from("notebook")],
         };
         assert_eq!(c.common_prefix(), "note");
     }
@@ -660,10 +631,7 @@ mod tests {
         let out = String::from_utf8(listing(&names)).expect("text");
         assert!(out.contains("... and 7 more"), "the remainder was dropped silently: {out:?}");
         assert!(out.contains("n0"), "the first candidate should still be shown");
-        assert!(
-            !out.contains(&alloc::format!("n{}", MAX_LISTED)),
-            "a candidate past the cap was shown"
-        );
+        assert!(!out.contains(&alloc::format!("n{}", MAX_LISTED)), "a candidate past the cap was shown");
     }
 
     /// Nothing to list is not a crash — `listing` is called with what `complete` found.

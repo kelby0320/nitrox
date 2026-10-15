@@ -20,22 +20,22 @@ use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
 use crate::libkern::printable::Printable;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
+use crate::arch::irq_install::ArchIrqInstall;
+use crate::arch::timer::ArchTimer;
 use crate::device::{Outcome, Signal};
 use crate::dpc::Dpc;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpStatus, PhysFrag};
 use crate::io::stats::Counted;
 use crate::libkern::handle::KObjectType;
+use crate::libkern::lockrank::LockRank;
 use crate::libkern::{IrqSpinLock, KBox};
 use crate::mm::dma::DmaBuffer;
 use crate::mm::{PhysAddr, kvmap};
-use crate::arch::irq_install::ArchIrqInstall;
-use crate::arch::timer::ArchTimer;
 use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
 use crate::object::{InterruptObject, ObjectRef};
-use crate::libkern::lockrank::LockRank;
 
 // --- HBA / port register offsets (AHCI 1.3) ---------------------------------
 
@@ -372,12 +372,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     start_port(port_base);
 
     let intr = match InterruptObject::try_new() {
-        Ok(io) => unsafe {
-            ObjectRef::from_raw(
-                KBox::into_raw(io).as_ptr() as *mut (),
-                KObjectType::InterruptObject,
-            )
-        },
+        Ok(io) => unsafe { ObjectRef::from_raw(KBox::into_raw(io).as_ptr() as *mut (), KObjectType::InterruptObject) },
         Err(_) => return declined(OUT_OF_MEMORY),
     };
     let intr_ptr = intr.as_ptr();
@@ -467,9 +462,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
                     "ahci: MSI declined — the capability cannot hold the message address; \
                      falling back"
                 ),
-                None => crate::kprintln!(
-                    "ahci: MSI declined — this CPU cannot be named in a message; falling back"
-                ),
+                None => crate::kprintln!("ahci: MSI declined — this CPU cannot be named in a message; falling back"),
             }
         }
     }
@@ -556,10 +549,7 @@ fn wait_clear(pb: u64, off: u64, mask: u32) {
 /// `disk` is the live, brought-up disk state; called at bring-up with no IRQ.
 unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Option<(u64, usize, u8)> {
     let data = DmaBuffer::alloc(SECTOR_SIZE as usize).ok()?;
-    let frags = [PhysFrag {
-        base: data.phys().as_u64(),
-        len: SECTOR_SIZE as u64,
-    }];
+    let frags = [PhysFrag { base: data.phys().as_u64(), len: SECTOR_SIZE as u64 }];
     build_command(disk, ATA_IDENTIFY, 0, 0, &frags, false);
     issue(disk);
     if !wait_command_polled(disk) {
@@ -737,10 +727,7 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut Ah
         // One command table, one page, so one command describes this many fragments.
         max_frags: MAX_PRDT_ENTRIES,
     };
-    let geometry = BlockGeometry {
-        logical_block_size: SECTOR_SIZE,
-        block_count: sectors,
-    };
+    let geometry = BlockGeometry { logical_block_size: SECTOR_SIZE, block_count: sectors };
     let descriptor = ResourceDescriptor {
         identity: DeviceIdentity {
             vendor: cdesc.identity.vendor,
@@ -761,12 +748,7 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut Ah
     match DeviceNode::try_new_block(descriptor, geometry, BlockKind::Disk, name, backend) {
         Ok(node) => {
             // SAFETY: adopt the creation reference into the device table.
-            let r = unsafe {
-                ObjectRef::from_raw(
-                    KBox::into_raw(node).as_ptr() as *mut (),
-                    KObjectType::DeviceNode,
-                )
-            };
+            let r = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
             crate::device::register(r.clone(), "ahci");
             // SAFETY: `disk` is the live published state; `r` was just registered, and the table
             // holds it for the kernel's lifetime.
@@ -891,11 +873,7 @@ unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool) {
     let ns = crate::arch::Timer::read_ns().saturating_sub(d.issued_at.load(Ordering::Relaxed));
     // SAFETY: as the contract says.
     unsafe {
-        let status = if err {
-            crate::syscall::error::KError::IoError as i32
-        } else {
-            IrpStatus::Success as i32
-        };
+        let status = if err { crate::syscall::error::KError::IoError as i32 } else { IrpStatus::Success as i32 };
         let transferred = if err { 0 } else { (*irp).length };
         d.counted.record((*irp).op, !err, transferred, ns);
         (*irp).set_completion(status, transferred);
@@ -1131,11 +1109,7 @@ mod tests {
     #[test]
     fn a_right_justified_field_loses_its_padding_too() {
         // The laptop's drive, as it actually reports itself.
-        assert_identity(
-            b"ST1000LM035-1RK172",
-            b"            WDELGVZ3",
-            b"ST1000LM035-1RK172 (WDELGVZ3)",
-        );
+        assert_identity(b"ST1000LM035-1RK172", b"            WDELGVZ3", b"ST1000LM035-1RK172 (WDELGVZ3)");
         // The control: a left-justified serial, which is what QEMU reports and is the only
         // shape that ever worked.
         assert_identity(b"QEMU HARDDISK", b"QM00001", b"QEMU HARDDISK (QM00001)");

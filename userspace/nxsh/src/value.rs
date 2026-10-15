@@ -333,12 +333,7 @@ mod tests {
     fn language_only_values_are_refused_by_tsm1_containers() {
         let r = Val::list(vec![Val::Range { start: 0, end: 3, inclusive: false }]);
         assert!(r.is_err());
-        let f = Val::Func(Arc::new(Func {
-            name: None,
-            params: vec![],
-            body: vec![],
-            captured: vec![],
-        }));
+        let f = Val::Func(Arc::new(Func { name: None, params: vec![], body: vec![], captured: vec![] }));
         assert!(Val::list(vec![f]).is_err());
     }
 

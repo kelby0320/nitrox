@@ -17,9 +17,9 @@ pub mod ramdisk;
 pub mod stats;
 
 use crate::dpc::Dpc;
+use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::io_op::IoOpcode;
-use crate::libkern::KBox;
 use crate::mm::heap::hhdm_offset;
 use crate::object::{InterruptObject, MemoryObject, ObjectRef, PendingOperation};
 
@@ -87,9 +87,7 @@ fn block_irp_self_test() {
     let po_check = po.clone();
 
     // Submit a read of the first `LEN` bytes into the buffer.
-    if let Err(e) =
-        block::dispatch_block_irp(&device, &buffer, &po, IoOpcode::Read, 0, 0, LEN as u64)
-    {
+    if let Err(e) = block::dispatch_block_irp(&device, &buffer, &po, IoOpcode::Read, 0, 0, LEN as u64) {
         crate::kprintln!("io: self-test FAIL (dispatch err {:?})", e);
         return;
     }
@@ -100,11 +98,7 @@ fn block_irp_self_test() {
 
     let (status, result) = crate::sched::pending_op_completion(po_check.as_ptr());
     if status != 0 || result != LEN as u64 {
-        crate::kprintln!(
-            "io: block-read self-test FAIL (status {} result {})",
-            status,
-            result
-        );
+        crate::kprintln!("io: block-read self-test FAIL (status {} result {})", status, result);
         return;
     }
 

@@ -110,12 +110,7 @@ impl Rect {
         if right <= left as i64 || bottom <= top as i64 {
             return None;
         }
-        Some(Rect::new(
-            left,
-            top,
-            (right - left as i64) as u32,
-            (bottom - top as i64) as u32,
-        ))
+        Some(Rect::new(left, top, (right - left as i64) as u32, (bottom - top as i64) as u32))
     }
 
     /// True when `(x, y)` lies inside the rectangle.

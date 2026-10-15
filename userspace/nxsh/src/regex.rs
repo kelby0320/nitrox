@@ -85,7 +85,10 @@ enum Class {
     Literal(char),
     Any,
     /// `[abc]`, `[a-z]`, `[^…]` — ranges plus singles, optionally negated.
-    Set { ranges: Vec<(char, char)>, negated: bool },
+    Set {
+        ranges: Vec<(char, char)>,
+        negated: bool,
+    },
 }
 
 impl Class {
@@ -105,14 +108,10 @@ impl Class {
 impl Regex {
     /// Compile a pattern, or say precisely what is not supported.
     pub fn new(pattern: &str) -> Result<Regex, String> {
-        let mut p =
-            Parser { src: pattern.chars().collect(), pos: 0, prog: Vec::new(), groups: 0 };
+        let mut p = Parser { src: pattern.chars().collect(), pos: 0, prog: Vec::new(), groups: 0 };
         let frag = p.alternation()?;
         if p.pos < p.src.len() {
-            return Err(alloc::format!(
-                "unexpected `{}` in a regex — an unmatched `)`?",
-                p.src[p.pos]
-            ));
+            return Err(alloc::format!("unexpected `{}` in a regex — an unmatched `)`?", p.src[p.pos]));
         }
         let mut prog = p.prog;
         // Patch the fragment's dangling exits to a final `Match`.
@@ -213,14 +212,7 @@ impl Regex {
                     }
                     Inst::Char(class, then) => {
                         if at < chars.len() && class.matches(chars[at]) {
-                            self.add_capturing(
-                                &mut next,
-                                &mut on_next,
-                                *then,
-                                at + 1,
-                                &chars,
-                                slots,
-                            );
+                            self.add_capturing(&mut next, &mut on_next, *then, at + 1, &chars, slots);
                         }
                     }
                     _ => {}
@@ -343,10 +335,7 @@ fn patch(prog: &mut [Inst], holes: &[Hole], target: usize) {
         match *h {
             // Fill the instruction's successor *field*; never replace the instruction.
             Hole::Next(i) => match &mut prog[i] {
-                Inst::Char(_, then)
-                | Inst::AssertStart(then)
-                | Inst::AssertEnd(then)
-                | Inst::Save(_, then) => {
+                Inst::Char(_, then) | Inst::AssertStart(then) | Inst::AssertEnd(then) | Inst::Save(_, then) => {
                     *then = target;
                 }
                 _ => {}
@@ -600,22 +589,10 @@ fn escape_class(e: char) -> Result<Class, String> {
     Ok(match e {
         'd' => Class::Set { ranges: alloc::vec![('0', '9')], negated: false },
         'D' => Class::Set { ranges: alloc::vec![('0', '9')], negated: true },
-        'w' => Class::Set {
-            ranges: alloc::vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
-            negated: false,
-        },
-        'W' => Class::Set {
-            ranges: alloc::vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')],
-            negated: true,
-        },
-        's' => Class::Set {
-            ranges: alloc::vec![(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')],
-            negated: false,
-        },
-        'S' => Class::Set {
-            ranges: alloc::vec![(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')],
-            negated: true,
-        },
+        'w' => Class::Set { ranges: alloc::vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')], negated: false },
+        'W' => Class::Set { ranges: alloc::vec![('a', 'z'), ('A', 'Z'), ('0', '9'), ('_', '_')], negated: true },
+        's' => Class::Set { ranges: alloc::vec![(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')], negated: false },
+        'S' => Class::Set { ranges: alloc::vec![(' ', ' '), ('\t', '\t'), ('\n', '\n'), ('\r', '\r')], negated: true },
         'n' => Class::Literal('\n'),
         't' => Class::Literal('\t'),
         'r' => Class::Literal('\r'),
@@ -638,9 +615,7 @@ mod tests {
     use super::*;
 
     fn m(pattern: &str, text: &str) -> bool {
-        Regex::new(pattern)
-            .unwrap_or_else(|e| panic!("compiling `{pattern}`: {e}"))
-            .is_match(text)
+        Regex::new(pattern).unwrap_or_else(|e| panic!("compiling `{pattern}`: {e}")).is_match(text)
     }
 
     #[test]
@@ -718,21 +693,14 @@ mod tests {
     /// means the same thing forever.
     #[test]
     fn unsupported_constructs_are_named_errors() {
-        let cases = [
-            (r"(a)\1", "backreference"),
-            ("a{2,3}", "counted repetition"),
-            ("a*?", "lazy"),
-            ("(?=a)", "lookaround"),
-        ];
+        let cases =
+            [(r"(a)\1", "backreference"), ("a{2,3}", "counted repetition"), ("a*?", "lazy"), ("(?=a)", "lookaround")];
         for (pattern, expect) in cases {
             let e = match Regex::new(pattern) {
                 Ok(_) => panic!("`{pattern}` should not compile"),
                 Err(e) => e,
             };
-            assert!(
-                e.to_lowercase().contains(expect),
-                "compiling `{pattern}` should mention {expect}, said: {e}"
-            );
+            assert!(e.to_lowercase().contains(expect), "compiling `{pattern}` should mention {expect}, said: {e}");
         }
     }
 
@@ -769,12 +737,7 @@ mod tests {
     fn caps(pattern: &str, text: &str) -> Option<Vec<Option<alloc::string::String>>> {
         let re = Regex::new(pattern).expect("compiles");
         let chars: Vec<char> = text.chars().collect();
-        re.captures(text).map(|groups| {
-            groups
-                .iter()
-                .map(|g| g.map(|(a, b)| chars[a..b].iter().collect()))
-                .collect()
-        })
+        re.captures(text).map(|groups| groups.iter().map(|g| g.map(|(a, b)| chars[a..b].iter().collect())).collect())
     }
 
     fn text(pattern: &str, input: &str) -> Vec<alloc::string::String> {

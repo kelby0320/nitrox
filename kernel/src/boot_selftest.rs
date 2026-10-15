@@ -147,10 +147,7 @@ fn fp_fill_pattern(img: &mut arch::VectorRegsImage, seed: u64, live: usize) {
         for b in 0..live {
             // Mixes the worker seed, the register index, and the byte offset, so a
             // whole-register or whole-file cross-wire is caught as surely as a byte flip.
-            let v = seed
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add((r as u64) << 8)
-                .wrapping_add(b as u64);
+            let v = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add((r as u64) << 8).wrapping_add(b as u64);
             slot[b] = (v ^ (v >> 29)) as u8;
         }
     }
@@ -294,8 +291,7 @@ fn measure_switch_cycles() -> u64 {
 /// not to stretch the boot.
 const SWITCH_YIELDS: u64 = 2000;
 
-static SWITCH_PARTNER_RUN: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static SWITCH_PARTNER_RUN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static SWITCH_DONE: AtomicU32 = AtomicU32::new(0);
 static SWITCH_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -320,10 +316,7 @@ extern "C" fn switch_measurer(_arg: usize) {
     }
     let t1 = arch::selftest_read_cycles();
     // Two switches per yield (out and back).
-    SWITCH_CYCLES.store(
-        t1.wrapping_sub(t0) / (SWITCH_YIELDS * 2),
-        Ordering::Release,
-    );
+    SWITCH_CYCLES.store(t1.wrapping_sub(t0) / (SWITCH_YIELDS * 2), Ordering::Release);
     SWITCH_PARTNER_RUN.store(false, Ordering::Release);
     SWITCH_DONE.fetch_add(1, Ordering::Release);
 }
@@ -384,9 +377,7 @@ fn sched_class_demo() {
         kprintln!("sched: RT demo spawn failed");
     }
     for nice in [0i8, 10] {
-        if sched::spawn_with_class(ts_demo_worker, nice as usize, SchedClass::TimeShared, 0, nice)
-            .is_err()
-        {
+        if sched::spawn_with_class(ts_demo_worker, nice as usize, SchedClass::TimeShared, 0, nice).is_err() {
             kprintln!("sched: TS demo spawn (nice {}) failed", nice);
         }
     }
@@ -484,8 +475,7 @@ extern "C" fn dist_worker(arg: usize) {
 /// Workers finished / the CPU each affinity worker actually ran on (worker `i` pinned
 /// to CPU `i`).
 static AFFINITY_DONE: AtomicU32 = AtomicU32::new(0);
-static AFFINITY_RAN_ON: [AtomicU32; arch::MAX_CPUS] =
-    [const { AtomicU32::new(u32::MAX) }; arch::MAX_CPUS];
+static AFFINITY_RAN_ON: [AtomicU32; arch::MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; arch::MAX_CPUS];
 
 /// Prove **CPU affinity**: one worker per online CPU, each pinned to a distinct CPU;
 /// confirm every worker ran on exactly the CPU it was pinned to.
@@ -518,11 +508,7 @@ fn smp_affinity_demo() {
     kprintln!(
         "smp: affinity demo complete — {} worker(s), {}",
         n,
-        if all_pinned {
-            "each ran on its pinned CPU"
-        } else {
-            "MISMATCH (see above)"
-        }
+        if all_pinned { "each ran on its pinned CPU" } else { "MISMATCH (see above)" }
     );
 }
 
@@ -548,15 +534,8 @@ fn paging_smoke_test() {
     // SAFETY: `root` is the live top-level page table the CPU is using, reachable via
     // the HHDM. `translate` only reads page-table memory.
     match unsafe { arch::Paging::translate(root, probe) } {
-        Some(phys) => kprintln!(
-            "paging: NX enabled; translate {:#x} -> {:#x}",
-            probe.as_u64(),
-            phys.as_u64()
-        ),
-        None => kprintln!(
-            "paging: translate {:#x} -> UNMAPPED — walk disagrees with hardware",
-            probe.as_u64()
-        ),
+        Some(phys) => kprintln!("paging: NX enabled; translate {:#x} -> {:#x}", probe.as_u64(), phys.as_u64()),
+        None => kprintln!("paging: translate {:#x} -> UNMAPPED — walk disagrees with hardware", probe.as_u64()),
     }
 }
 
@@ -575,11 +554,7 @@ fn demand_paging_smoke_test() {
     let base = 0x4000_0000u64;
     let range = VAddrRange::new(mm::VirtAddr::new(base), mm::VirtAddr::new(base + 2 * page))
         .expect("smoke-test range is valid by construction");
-    let Ok(vma) = KBox::try_new(Vma::new(
-        range,
-        Protection::WRITE | Protection::USER,
-        MappingKind::Anonymous,
-    )) else {
+    let Ok(vma) = KBox::try_new(Vma::new(range, Protection::WRITE | Protection::USER, MappingKind::Anonymous)) else {
         kprintln!("demand-paging: smoke test skipped (VMA alloc failed)");
         return;
     };
@@ -601,10 +576,7 @@ fn demand_paging_smoke_test() {
             mm::demand_fault_count()
         );
     } else {
-        kprintln!(
-            "demand-paging: smoke test FAILED (before={:?} after={:?} r0={:?} r1={:?})",
-            before, after, r0, r1
-        );
+        kprintln!("demand-paging: smoke test FAILED (before={:?} after={:?} r0={:?} r1={:?})", before, after, r0, r1);
     }
 }
 
@@ -627,9 +599,7 @@ fn dma_smoke_test() {
     buf.as_mut_slice()[len - 1] = 0xA7;
 
     // SAFETY: read-only walk of the live top-level page table via the HHDM.
-    let mapped = unsafe {
-        arch::Paging::translate(arch::Paging::active_root(), mm::VirtAddr::new(buf.virt() as u64))
-    };
+    let mapped = unsafe { arch::Paging::translate(arch::Paging::active_root(), mm::VirtAddr::new(buf.virt() as u64)) };
 
     if zeroed && phys.is_page_aligned() && phys.as_u64() != 0 && mapped == Some(phys) {
         kprintln!(

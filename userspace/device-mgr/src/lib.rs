@@ -530,9 +530,7 @@ mod tests {
     use super::names::{name, path};
     use super::suffix::{self, Asked, info_only};
     use super::table;
-    use libkern::device::{
-        DeviceKind, DeviceRecord, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED, OUTCOME_DECLINED,
-    };
+    use libkern::device::{DeviceKind, DeviceRecord, NO_PARENT, NOT_SERVED, OUTCOME_CLAIMED, OUTCOME_DECLINED};
     use libstream::wire::{Table, Value};
 
     fn rec(id: u32, kind: DeviceKind, served: u32, parent: u32, name: &str) -> DeviceRecord {
@@ -599,10 +597,7 @@ mod tests {
     fn a_device_is_named_by_the_path_that_serves_it() {
         let b = boot();
         let named: Vec<String> = b.iter().map(name).collect();
-        assert_eq!(
-            named,
-            ["pci-00.1f.2", "pci-00.02.0", "blk-0", "blk-1", "blk-2", "console", "input-0", "input-1"]
-        );
+        assert_eq!(named, ["pci-00.1f.2", "pci-00.02.0", "blk-0", "blk-1", "blk-2", "console", "input-0", "input-1"]);
         assert_eq!(path(&b[3]).as_deref(), Some("/dev/blk/1"));
         assert_eq!(path(&b[7]).as_deref(), Some("/dev/input/raw/1"));
         assert_eq!(path(&b[0]), None, "a PCI function has no path");
@@ -756,7 +751,15 @@ mod tests {
     fn io_has_a_row_per_present_disk_and_one_for_the_page_cache() {
         use libkern::device::{CacheCounts, DEPARTED, IoRecord};
         let mut b = boot();
-        let disk = IoRecord { id: 2, reads: 10, read_bytes: 40960, writes: 3, written_bytes: 1536, busy_ns: 999, ..Default::default() };
+        let disk = IoRecord {
+            id: 2,
+            reads: 10,
+            read_bytes: 40960,
+            writes: 3,
+            written_bytes: 1536,
+            busy_ns: 999,
+            ..Default::default()
+        };
         let ram = IoRecord { id: 4, reads: 1, read_bytes: 512, ..Default::default() };
         let late = IoRecord { id: 9, reads: 5, ..Default::default() };
         let cache = CacheCounts {
@@ -773,12 +776,24 @@ mod tests {
         let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name).unwrap();
         let cell = |row: usize, name: &str| t.rows[row][col(name)].clone();
         assert_eq!(t.rows.len(), 3, "the disk, the RAM disk and the page cache; not the late one");
-        assert_eq!((cell(0, "name"), cell(0, "reads"), cell(0, "read_bytes")), (Value::Str("blk-0".into()), Value::Int(10), Value::Int(40960)));
-        assert_eq!((cell(0, "written_bytes"), cell(0, "busy_ns"), cell(0, "hits")), (Value::Int(1536), Value::Int(999), Value::Null));
+        assert_eq!(
+            (cell(0, "name"), cell(0, "reads"), cell(0, "read_bytes")),
+            (Value::Str("blk-0".into()), Value::Int(10), Value::Int(40960))
+        );
+        assert_eq!(
+            (cell(0, "written_bytes"), cell(0, "busy_ns"), cell(0, "hits")),
+            (Value::Int(1536), Value::Int(999), Value::Null)
+        );
         assert_eq!(cell(1, "name"), Value::Str("blk-2".into()));
         assert_eq!(cell(2, "name"), Value::Str("page-cache".into()));
-        assert_eq!((cell(2, "reads"), cell(2, "read_bytes"), cell(2, "writes")), (Value::Int(7), Value::Int(40 * 4096), Value::Int(3)));
-        assert_eq!((cell(2, "busy_ns"), cell(2, "hits"), cell(2, "holes"), cell(2, "flushes")), (Value::Int(100), Value::Int(100), Value::Int(2), Value::Null));
+        assert_eq!(
+            (cell(2, "reads"), cell(2, "read_bytes"), cell(2, "writes")),
+            (Value::Int(7), Value::Int(40 * 4096), Value::Int(3))
+        );
+        assert_eq!(
+            (cell(2, "busy_ns"), cell(2, "hits"), cell(2, "holes"), cell(2, "flushes")),
+            (Value::Int(100), Value::Int(100), Value::Int(2), Value::Null)
+        );
 
         // The disk departs: its row goes, whichever side says so.
         b[2].flags = DEPARTED;

@@ -27,10 +27,7 @@ impl EntropyObject {
 
     /// Allocate an entropy-source token with a refcount of one.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
-        KBox::try_new(Self {
-            header: KObjectHeader::new(KObjectType::EntropyObject),
-            magic: Self::MAGIC,
-        })
+        KBox::try_new(Self { header: KObjectHeader::new(KObjectType::EntropyObject), magic: Self::MAGIC })
     }
 
     /// `true` iff the self-check sentinel is intact.

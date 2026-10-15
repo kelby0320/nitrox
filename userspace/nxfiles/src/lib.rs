@@ -24,23 +24,21 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use alloc::vec;
 use libdraw::geom::{Rect, Size};
 use librsproto::file::{DIRENT_KIND_DIR, OwnedEntry};
 use librsproto::surface::{
     KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
     WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
-use alloc::vec;
-use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::element::{
-    Edge, Element, Insets, center_v, column, dock, docked, ink, padding, row, sized, text,
-    with_spacing,
+    Edge, Element, Insets, center_v, column, dock, docked, ink, padding, row, sized, text, with_spacing,
 };
+use libui::menu::{Accel, Item, Menu, MenuState};
 use libui::widget::{
-    ColumnAlign, DIALOG_GAP, ListColumn, ListRow, ListState, RowButton, STATUS_BAR_H, Swatch,
-    TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextFieldState, Theme as UiTheme, TitleButtons,
-    WINDOW_FRAME_H, WidgetState, button, dialog_frame, list_view, popup_frame, resize_grip,
-    status_bar, status_separator, status_text, tab_strip, text_field, title_bar,
+    ColumnAlign, DIALOG_GAP, ListColumn, ListRow, ListState, RowButton, STATUS_BAR_H, Swatch, TAB_STRIP_H, TITLE_BAR_H,
+    TabExtras, TextFieldState, Theme as UiTheme, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame,
+    list_view, popup_frame, resize_grip, status_bar, status_separator, status_text, tab_strip, text_field, title_bar,
     window_frame_with_grip,
 };
 
@@ -338,7 +336,6 @@ pub const CONFIRM_TEXT_KEY: u64 = 21;
 pub const CONFIRM_DELETE_KEY: u64 = 22;
 /// The element key on its *keep* answer — the right button.
 pub const CONFIRM_KEEP_KEY: u64 = 23;
-
 
 /// What a menu row asks for.
 ///
@@ -1206,12 +1203,7 @@ impl App {
         if name.is_empty() {
             return None;
         }
-        Some(Entry {
-            name,
-            is_dir: e.kind == DIRENT_KIND_DIR,
-            mtime: e.mtime,
-            size: e.size,
-        })
+        Some(Entry { name, is_dir: e.kind == DIRENT_KIND_DIR, mtime: e.mtime, size: e.size })
     }
 
     /// The path a row press leads to, or `None` for a row that is not a directory.
@@ -1297,9 +1289,8 @@ impl App {
             // next: a release makes it a click, and enough movement makes it a drag.
             Msg::Grab(key) => {
                 // Resolved here, while the listing this key came from is still the listing.
-                self.pressed = list_row_of(key)
-                    .and_then(|i| self.pane().entries.get(i))
-                    .map(|e| (e.name.clone(), 0, 0));
+                self.pressed =
+                    list_row_of(key).and_then(|i| self.pane().entries.get(i)).map(|e| (e.name.clone(), 0, 0));
             }
             // **The drag converts through the widget's own arithmetic** — `ListState::bar` and
             // `ScrollGrab`, the same pair `nxterm` uses for its grid — so a list and a terminal
@@ -1435,8 +1426,7 @@ impl App {
                 // the same rule `Target` follows. A path pasted later is read by whoever reads
                 // it, and a relative one would name a file in *their* directory.
                 let dir = self.pane().path.clone();
-                let paths: Vec<String> =
-                    self.selection().iter().map(|e| join(&dir, &e.name)).collect();
+                let paths: Vec<String> = self.selection().iter().map(|e| join(&dir, &e.name)).collect();
                 if paths.is_empty() {
                     self.notice = Some(String::from("nothing is selected"));
                     return;
@@ -1468,11 +1458,7 @@ impl App {
                 // **A relative path is joined to where the tab is**, which is what a location bar
                 // is for — typing `papers` from `/home` should go where typing it into a shell
                 // would. An absolute one replaces it outright.
-                let to = if typed.starts_with('/') {
-                    typed
-                } else {
-                    join(&self.pane().path, &typed)
-                };
+                let to = if typed.starts_with('/') { typed } else { join(&self.pane().path, &typed) };
                 self.location = None;
                 self.goto = Some(to);
             }
@@ -1483,8 +1469,7 @@ impl App {
                 let p = self.pane_mut();
                 if p.order != order {
                     p.order = order;
-                    let picked =
-                        p.list.selected.and_then(|i| p.entries.get(i)).map(|e| e.name.clone());
+                    let picked = p.list.selected.and_then(|i| p.entries.get(i)).map(|e| e.name.clone());
                     libfs::sort(&mut p.entries, order);
                     p.list.selected = match picked {
                         Some(name) => p.entries.iter().position(|e| e.name == name),
@@ -1524,8 +1509,7 @@ impl App {
     /// rather than the only one — and it stays, because a caller reaching `choose` some other
     /// way must get the same answer as one reaching it from a menu.
     fn choose(&mut self, a: Action) {
-        let selected =
-            self.pane().list.selected.and_then(|i| self.pane().entries.get(i)).cloned();
+        let selected = self.pane().list.selected.and_then(|i| self.pane().entries.get(i)).cloned();
         if a.needs_selection() && selected.is_none() {
             self.notice = Some(String::from("nothing is selected"));
             return;
@@ -1628,12 +1612,7 @@ impl App {
         // — the function whose whole reason is that "two would disagree" — kept the old chrome.
         // A drop then resolved to the row above the one it was released over, and with two tabs
         // to the row below; the drag tests aim *through* this function, so they agreed with it.
-        libui::widget::WINDOW_CONTENT_Y
-            + TITLE_BAR_H
-            + MENU_BAR_H
-            + self.tab_strip_h()
-            + PATH_H
-            + HEADER_H
+        libui::widget::WINDOW_CONTENT_Y + TITLE_BAR_H + MENU_BAR_H + self.tab_strip_h() + PATH_H + HEADER_H
     }
 
     /// How many rows the list actually draws — what `list_view` builds from the height it is
@@ -1906,9 +1885,7 @@ impl App {
     }
 
     /// Paths the binary owes a clipboard push for. Clears the record.
-    pub fn take_clip_push(
-        &mut self,
-    ) -> Option<(librsproto::clipboard::PathVerb, Vec<String>)> {
+    pub fn take_clip_push(&mut self) -> Option<(librsproto::clipboard::PathVerb, Vec<String>)> {
         self.clip_push.take()
     }
 
@@ -1941,9 +1918,7 @@ impl App {
             }
             queued += 1;
             self.ops.push(match verb {
-                librsproto::clipboard::PathVerb::Cut => {
-                    FileOp::MoveInto { from: String::from(*from), to }
-                }
+                librsproto::clipboard::PathVerb::Cut => FileOp::MoveInto { from: String::from(*from), to },
                 // **Whether it is a directory comes from the binary**, which asked the
                 // filesystem — the clipboard carries paths and nothing else, and this crate makes
                 // no syscalls. A copy queued as a file copy for a *folder* reaches
@@ -1951,11 +1926,7 @@ impl App {
                 // got, so it reported "could not copy it" for an ordinary request. `Duplicate`
                 // has carried `dir` for exactly this reason since M12; the paste path bypassed it
                 // (PR #285 review, worth fixing 3).
-                librsproto::clipboard::PathVerb::Copy => FileOp::Copy {
-                    from: String::from(*from),
-                    to,
-                    dir: *is_dir,
-                },
+                librsproto::clipboard::PathVerb::Copy => FileOp::Copy { from: String::from(*from), to, dir: *is_dir },
             });
         }
         if queued == 0 {
@@ -1995,18 +1966,12 @@ impl App {
         // up, the entries between them include files the listing is not showing, and a sweep
         // that picked those would act on what nobody can see.
         let shown = self.visible_indices();
-        let (Some(a), Some(b)) = (
-            shown.iter().position(|&x| x == from),
-            shown.iter().position(|&x| x == i),
-        ) else {
+        let (Some(a), Some(b)) = (shown.iter().position(|&x| x == from), shown.iter().position(|&x| x == i)) else {
             return;
         };
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let names: Vec<String> = shown[lo..=hi]
-            .iter()
-            .filter_map(|&e| self.pane().entries.get(e))
-            .map(|e| e.name.clone())
-            .collect();
+        let names: Vec<String> =
+            shown[lo..=hi].iter().filter_map(|&e| self.pane().entries.get(e)).map(|e| e.name.clone()).collect();
         self.pane_mut().list.selected = Some(from);
         self.marked = names.into_iter().filter(|n| Some(n.as_str()) != self.selected_name()).collect();
     }
@@ -2043,7 +2008,9 @@ impl App {
             .map(|(i, e)| libui::widget::ListRow {
                 key: LIST_ROW_KEY + i as u64,
                 label: e.name.as_str(),
-                marked: self.marked.contains(&e.name), ..Default::default() })
+                marked: self.marked.contains(&e.name),
+                ..Default::default()
+            })
             .collect()
     }
 
@@ -2121,8 +2088,7 @@ impl App {
         if !self.inside(x, y) {
             return self.drag_moved(x, y, &name);
         }
-        self.over =
-            self.row_at(y).filter(|&i| self.pane().entries.get(i).is_some_and(|e| e.is_dir));
+        self.over = self.row_at(y).filter(|&i| self.pane().entries.get(i).is_some_and(|e| e.is_dir));
         Gesture::Moved
     }
 
@@ -2147,8 +2113,7 @@ impl App {
         // **Only a directory is a target**, so the highlight never offers a landing place that
         // would do nothing — the same rule the compositor follows for windows that do not take
         // the payload.
-        self.over =
-            self.row_at(y).filter(|&i| self.pane().entries.get(i).is_some_and(|e| e.is_dir));
+        self.over = self.row_at(y).filter(|&i| self.pane().entries.get(i).is_some_and(|e| e.is_dir));
         if was == self.over { Gesture::None } else { Gesture::Moved }
     }
 
@@ -2214,9 +2179,7 @@ impl App {
     /// one count, and a test walks the whole bar through it.
     pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
         let n = self.menu_count();
-        self.menus.set_anchors(
-            (0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect(),
-        );
+        self.menus.set_anchors((0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect());
     }
 
     /// How many menus the bar has — **derived from the table, never declared**.
@@ -2243,36 +2206,22 @@ impl App {
             Item::plain(label, Msg::Choose(a)).enabled(!a.needs_selection() || selected)
         };
         let here = self.pane().order;
-        let order_row = |label: &'static str, o: libfs::Order| {
-            Item::plain(label, Msg::SetOrder(o)).marked(o == here)
-        };
+        let order_row = |label: &'static str, o: libfs::Order| Item::plain(label, Msg::SetOrder(o)).marked(o == here);
         vec![
             Menu {
                 title: "File",
                 items: vec![
                     Item::new("New Tab", Accel::ctrl(NEW_TAB_KEYCODE, "T"), Msg::NewTab),
-                    Item::new(
-                        "Close Tab",
-                        Accel::ctrl(CLOSE_TAB_KEYCODE, "W"),
-                        Msg::CloseTab(self.current),
-                    )
-                    // **The last tab does not close**, which is the strip's existing rule said
-                    // out loud: `CloseTab` on a lone tab is already a no-op, and a row that
-                    // silently did nothing was the half of the affordance that was missing.
-                    .enabled(self.panes.len() > 1),
+                    Item::new("Close Tab", Accel::ctrl(CLOSE_TAB_KEYCODE, "W"), Msg::CloseTab(self.current))
+                        // **The last tab does not close**, which is the strip's existing rule said
+                        // out loud: `CloseTab` on a lone tab is already a no-op, and a row that
+                        // silently did nothing was the half of the affordance that was missing.
+                        .enabled(self.panes.len() > 1),
                     // **After the tab pair, not between it.** New Tab and Close Tab are one
                     // thought, and a row wedged between them reads as part of neither.
-                    Item::new(
-                        "Go to Location\u{2026}",
-                        Accel::ctrl(LOCATION_KEYCODE, "L"),
-                        Msg::OpenLocation,
-                    ),
+                    Item::new("Go to Location\u{2026}", Accel::ctrl(LOCATION_KEYCODE, "L"), Msg::OpenLocation),
                     Item::Separator,
-                    Item::new(
-                        "New Window",
-                        Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"),
-                        Msg::NewWindow,
-                    ),
+                    Item::new("New Window", Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"), Msg::NewWindow),
                     Item::new("Quit", Accel::ctrl(QUIT_KEYCODE, "Q"), Msg::Quit),
                     Item::Separator,
                     act("New File", Action::NewFile),
@@ -2284,12 +2233,8 @@ impl App {
                     // **Last, and after the destructive row rather than before it.** Properties
                     // is the one row here that changes nothing, so it sits where a mis-aimed
                     // press lands on it instead of on Delete.
-                    Item::new(
-                        "Properties",
-                        Accel::ctrl(PROPERTIES_KEYCODE, "I"),
-                        Msg::Choose(Action::Properties),
-                    )
-                    .enabled(selected),
+                    Item::new("Properties", Accel::ctrl(PROPERTIES_KEYCODE, "I"), Msg::Choose(Action::Properties))
+                        .enabled(selected),
                 ],
             },
             // **Cut, Copy and Paste are the clipboard's**, and Duplicate is the older row that
@@ -2299,10 +2244,8 @@ impl App {
             Menu {
                 title: "Edit",
                 items: vec![
-                    Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::CutFiles)
-                        .enabled(selected),
-                    Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::CopyFiles)
-                        .enabled(selected),
+                    Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::CutFiles).enabled(selected),
+                    Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::CopyFiles).enabled(selected),
                     // **Paste is offered whatever is on the ring**, because a browser cannot know
                     // what is there without reading it, and reading it is a syscall this crate
                     // does not make. A paste of text says so instead.
@@ -2323,12 +2266,8 @@ impl App {
                     order_row("Oldest First", libfs::Order::OldestFirst),
                     order_row("Newest First", libfs::Order::NewestFirst),
                     Item::Separator,
-                    Item::new(
-                        "Show Hidden Files",
-                        Accel::ctrl(HIDDEN_KEYCODE, "H"),
-                        Msg::ToggleHidden,
-                    )
-                    .marked(self.pane().show_hidden),
+                    Item::new("Show Hidden Files", Accel::ctrl(HIDDEN_KEYCODE, "H"), Msg::ToggleHidden)
+                        .marked(self.pane().show_hidden),
                     // **In View rather than in File**, where it was first written: this row
                     // changes *which rows are shown*, which is what the rest of this menu does —
                     // and the File menu's rows are indexed by `check-login`, so a row wedged
@@ -2409,8 +2348,7 @@ impl App {
                 if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
                     return None;
                 }
-                matches!(k.keycode, libkern::abi::KEY_ESC | libkern::abi::KEY_ENTER)
-                    .then_some(Msg::CloseProperties)
+                matches!(k.keycode, libkern::abi::KEY_ESC | libkern::abi::KEY_ENTER).then_some(Msg::CloseProperties)
             }
             None => None,
         }
@@ -2546,13 +2484,7 @@ impl App {
         // shorter — one row of arithmetic off, which this method's own reason for existing is to
         // prevent.
         self.window.h.saturating_sub(
-            TITLE_BAR_H
-                + MENU_BAR_H
-                + self.tab_strip_h()
-                + PATH_H
-                + HEADER_H
-                + STATUS_BAR_H
-                + WINDOW_FRAME_H,
+            TITLE_BAR_H + MENU_BAR_H + self.tab_strip_h() + PATH_H + HEADER_H + STATUS_BAR_H + WINDOW_FRAME_H,
         )
     }
 
@@ -2604,7 +2536,6 @@ impl App {
     /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
     /// handed down, rather than being fetched from a default in the middle of a view.
     pub fn view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-
         let title = title_bar(
             TITLE,
             // **What this window is showing**, which for a browser is where it is looking.
@@ -2636,15 +2567,8 @@ impl App {
         // The menu bar: two names, each of which drops a list of things to do. **The toolkit's
         // since M14 Part A** — the words were `button`s here, which is not what a menu bar's
         // word is, and the popup under them was a second copy of `nxterm`'s.
-        let bar = libui::menu::bar(
-            &self.menu_table(),
-            &self.menus,
-            MENU_BAR_KEY,
-            hovered,
-            Msg::MenuBar,
-            &ui,
-            MENU_BAR_H,
-        );
+        let bar =
+            libui::menu::bar(&self.menu_table(), &self.menus, MENU_BAR_KEY, hovered, Msg::MenuBar, &ui, MENU_BAR_H);
 
         // The path strip: where you are, and the one control that leaves it — **or the name
         // being typed**, which replaces the path rather than sitting beside it. The strip is one
@@ -2713,13 +2637,8 @@ impl App {
             ]),
         };
         let mut strip_items = alloc::vec![
-            button(
-                "^",
-                Msg::Up,
-                WidgetState { hovered: hovered == Some(UP_KEY), ..Default::default() },
-                &ui,
-            )
-            .key(UP_KEY),
+            button("^", Msg::Up, WidgetState { hovered: hovered == Some(UP_KEY), ..Default::default() }, &ui,)
+                .key(UP_KEY),
             middle.key(STRIP_INNER_KEY).flex(1),
         ];
         // **The search field only while it is open**, which is the honest version of the
@@ -2762,8 +2681,7 @@ impl App {
         // its original index, so opening, dragging and renaming resolve to the same file whether
         // or not a search is narrowing what is on screen.
         let shown = self.visible_indices();
-        let labels: Vec<String> =
-            shown.iter().map(|i| self.pane().entries[*i].label()).collect();
+        let labels: Vec<String> = shown.iter().map(|i| self.pane().entries[*i].label()).collect();
         // **The three facts beside each name** (desktop refresh, Part I), built as owned strings
         // first because a `ListRow` borrows its cells: one `Vec` of them, then a `Vec` of
         // borrows into it, which is the same two-step the labels above already take.
@@ -2771,15 +2689,10 @@ impl App {
             .iter()
             .map(|i| &self.pane().entries[*i])
             .map(|e| {
-                [
-                    column_size(e.size),
-                    column_kind(e.name.as_str(), e.is_dir),
-                    column_modified(e.mtime, self.now_nanos),
-                ]
+                [column_size(e.size), column_kind(e.name.as_str(), e.is_dir), column_modified(e.mtime, self.now_nanos)]
             })
             .collect();
-        let cells: Vec<[&str; 3]> =
-            facts.iter().map(|f| [f[0].as_str(), f[1].as_str(), f[2].as_str()]).collect();
+        let cells: Vec<[&str; 3]> = facts.iter().map(|f| [f[0].as_str(), f[1].as_str(), f[2].as_str()]).collect();
         let mut rows: Vec<ListRow<'_>> = Vec::with_capacity(labels.len());
         for (n, l) in labels.iter().enumerate() {
             let i = shown[n];
@@ -2945,14 +2858,9 @@ impl App {
         // draws no tab strip at all; tabs are ours, and a strip holding one tab can only say
         // where you already are. A zero-height box still paints its children — the tab and the
         // `+` drew over the chrome below it — so the edge has to be absent from the dock.
-        let mut edges = alloc::vec![
-            docked(Edge::Top, sized(Size::new(0, MENU_BAR_H), bar).key(BAR_KEY)),
-        ];
+        let mut edges = alloc::vec![docked(Edge::Top, sized(Size::new(0, MENU_BAR_H), bar).key(BAR_KEY)),];
         if self.tab_strip_h() > 0 {
-            edges.push(docked(
-                Edge::Top,
-                sized(Size::new(0, TAB_STRIP_H), tabs).key(TAB_STRIP_KEY),
-            ));
+            edges.push(docked(Edge::Top, sized(Size::new(0, TAB_STRIP_H), tabs).key(TAB_STRIP_KEY)));
         }
         edges.extend(alloc::vec![
             docked(Edge::Top, sized(Size::new(0, PATH_H), strip).key(STRIP_KEY)),
@@ -2981,11 +2889,11 @@ impl App {
             title,
             dock(
                 edges,
-            // **Sized to the height it was built for.** `list_view` does not size itself, and
-            // the dock's flex child otherwise gets everything left over — so the widget would
-            // build rows for one height and be drawn at another, leaving `visible` off by one
-            // for the scroll arithmetic and a dead row at the bottom. Its own doc names this
-            // wrapper as the reliable way to keep the two in step.
+                // **Sized to the height it was built for.** `list_view` does not size itself, and
+                // the dock's flex child otherwise gets everything left over — so the widget would
+                // build rows for one height and be drawn at another, leaving `visible` off by one
+                // for the scroll arithmetic and a dead row at the bottom. Its own doc names this
+                // wrapper as the reliable way to keep the two in step.
                 dock(
                     alloc::vec![docked(
                         Edge::Top,
@@ -3066,14 +2974,7 @@ impl App {
         )
         .key(CONFIRM_TEXT_KEY);
         let answer = |label: &str, msg: Msg, key: u64| {
-            button(
-                label,
-                msg,
-                WidgetState { hovered: hovered == Some(key), ..Default::default() },
-                ui,
-            )
-            .key(key)
-            .flex(1)
+            button(label, msg, WidgetState { hovered: hovered == Some(key), ..Default::default() }, ui).key(key).flex(1)
         };
         let buttons = with_spacing(
             row(alloc::vec![
@@ -3125,8 +3026,7 @@ impl App {
         line(3, "Size", if e.is_dir { String::from("—") } else { size_text(e.size) });
         line(4, "Modified", modified_text(e.mtime));
 
-        let body = padding(Insets::all(libui::widget::DIALOG_PAD), column(rows))
-            .key(PROPS_KEY + 1);
+        let body = padding(Insets::all(libui::widget::DIALOG_PAD), column(rows)).key(PROPS_KEY + 1);
         let buttons = row(alloc::vec![
             text("").flex(1).key(PROPS_KEY + 30),
             button(
@@ -3137,14 +3037,7 @@ impl App {
             )
             .key(PROPS_KEY + 31),
         ]);
-        libui::widget::dialog_frame_sized(
-            Size::new(PROPS_W, PROPS_H),
-            title,
-            body,
-            buttons,
-            self.dialog_focused,
-            ui,
-        )
+        libui::widget::dialog_frame_sized(Size::new(PROPS_W, PROPS_H), title, body, buttons, self.dialog_focused, ui)
     }
 }
 
@@ -3165,11 +3058,7 @@ pub fn breadcrumb<Msg>(path: &str, theme: &UiTheme) -> Vec<Element<Msg>> {
         out.push(sep(theme));
         // The last segment is where you are; the ones before it are how you got here.
         let last = i + 1 == names.len();
-        out.push(if last {
-            text(String::from(*name))
-        } else {
-            ink(theme.foreground_dim, text(String::from(*name)))
-        });
+        out.push(if last { text(String::from(*name)) } else { ink(theme.foreground_dim, text(String::from(*name))) });
     }
     out
 }
@@ -3223,8 +3112,7 @@ pub fn column_kind(name: &str, is_dir: bool) -> String {
 /// `0` is "unreported" rather than 1970 — [`modified_text`] carries the reasoning — and shows as
 /// nothing at all, because a column of `unknown` is a column of noise.
 pub fn column_modified(mtime: i64, now_nanos: u64) -> String {
-    let Some(nanos) = u64::try_from(mtime).ok().filter(|s| *s > 0).and_then(|s| s.checked_mul(1_000_000_000))
-    else {
+    let Some(nanos) = u64::try_from(mtime).ok().filter(|s| *s > 0).and_then(|s| s.checked_mul(1_000_000_000)) else {
         return String::new();
     };
     let when = libtime::civil_from_unix(nanos);
@@ -3265,8 +3153,7 @@ pub fn size_text(bytes: u64) -> String {
 /// 1970-01-01 as a fact about a file created this morning. `fs-server-ext4` carries the same note
 /// at the other end of the wire.
 pub fn modified_text(mtime: i64) -> String {
-    let Some(nanos) = u64::try_from(mtime).ok().filter(|s| *s > 0).and_then(|s| s.checked_mul(1_000_000_000))
-    else {
+    let Some(nanos) = u64::try_from(mtime).ok().filter(|s| *s > 0).and_then(|s| s.checked_mul(1_000_000_000)) else {
         return String::from("unknown");
     };
     let mut out = libtime::format_civil(&libtime::civil_from_unix(nanos));
@@ -3344,12 +3231,7 @@ mod tests {
         let mut a = App::new("/home");
         a.show(
             "/home",
-            alloc::vec![
-                Entry::file("notes.txt"),
-                Entry::dir("work"),
-                Entry::file("a.txt"),
-                Entry::dir("archive"),
-            ],
+            alloc::vec![Entry::file("notes.txt"), Entry::dir("work"), Entry::file("a.txt"), Entry::dir("archive"),],
         );
         a
     }
@@ -3383,9 +3265,7 @@ mod tests {
     /// A listing long enough to scroll.
     fn big() -> App {
         let mut a = App::new("/big");
-        let rows: Vec<Entry> = (0..40)
-            .map(|i| Entry::file(&alloc::format!("f{i:02}")))
-            .collect();
+        let rows: Vec<Entry> = (0..40).map(|i| Entry::file(&alloc::format!("f{i:02}"))).collect();
         a.show("/big", rows);
         a
     }
@@ -3419,7 +3299,8 @@ mod tests {
         up(&mut a);
         let _ = a.view(&UiTheme::default(), None);
         assert_eq!(
-            a.list_offset(), scrolled,
+            a.list_offset(),
+            scrolled,
             "the selection moved up inside the visible rows, so the list must not have moved"
         );
         assert_eq!(a.list_selected(), Some(18));
@@ -3491,11 +3372,7 @@ mod tests {
         let mut a = app();
         a.update(Msg::Grab(row(2))); // a.txt
         assert_eq!(a.pointer_moved(100, 100, 1), Gesture::None, "the first motion fixes the origin");
-        assert_eq!(
-            a.pointer_moved(100 + DRAG_SLOP - 1, 100, 1),
-            Gesture::None,
-            "a nudge is not a drag"
-        );
+        assert_eq!(a.pointer_moved(100 + DRAG_SLOP - 1, 100, 1), Gesture::None, "a nudge is not a drag");
         assert_eq!(a.pointer_moved(100 + DRAG_SLOP, 100, 1), Gesture::Moved, "and travelling is");
 
         // **And travelling does not reach the compositor** (M12 Part B): the drag is this
@@ -3532,11 +3409,7 @@ mod tests {
         assert_eq!(a.pointer_moved(10, 10, 1), Gesture::None, "the press is recorded");
 
         a.show("/", alloc::vec![Entry::dir("bin"), Entry::dir("dev"), Entry::file("zzz")]);
-        assert_eq!(
-            a.pointer_moved(10 + DRAG_SLOP, 10, 1),
-            Gesture::None,
-            "the row it was on is gone"
-        );
+        assert_eq!(a.pointer_moved(10 + DRAG_SLOP, 10, 1), Gesture::None, "the row it was on is gone");
         assert_eq!(a.pointer_moved(OUTSIDE.0, OUTSIDE.1, 1), Gesture::None, "so nothing leaves");
         assert_eq!(a.take_drag(), None, "and nothing is offered");
 
@@ -3616,10 +3489,7 @@ mod tests {
             assert!(a.take_op().is_none(), "{action:?} did something with nothing selected");
             assert!(a.confirming().is_none(), "{action:?} asked about nothing");
             let ui: Element<Msg> = a.view(&UiTheme::default(), None);
-            assert!(
-                labelled(&ui, NOTICE_KEY).contains("nothing is selected"),
-                "{action:?} said nothing"
-            );
+            assert!(labelled(&ui, NOTICE_KEY).contains("nothing is selected"), "{action:?} said nothing");
         }
         // And the two that make something do not need one.
         a.update(Msg::Choose(Action::NewFolder));
@@ -3639,24 +3509,14 @@ mod tests {
 
         press_key(&mut a, KEY_X);
         press_key(&mut a, libkern::abi::KEY_ENTER);
-        assert_eq!(
-            a.take_op(),
-            Some(FileOp::Rename { from: "/home/a.txt".into(), to: "/home/x".into() })
-        );
+        assert_eq!(a.take_op(), Some(FileOp::Rename { from: "/home/a.txt".into(), to: "/home/x".into() }));
 
         // Copy is the same shape and a different operation — the one that reaches `copy_file`.
         select(&mut a, 2);
         a.update(Msg::Choose(Action::Duplicate));
         press_key(&mut a, KEY_X);
         press_key(&mut a, libkern::abi::KEY_ENTER);
-        assert_eq!(
-            a.take_op(),
-            Some(FileOp::Copy {
-                from: "/home/a.txt".into(),
-                to: "/home/x".into(),
-                dir: false
-            })
-        );
+        assert_eq!(a.take_op(), Some(FileOp::Copy { from: "/home/a.txt".into(), to: "/home/x".into(), dir: false }));
     }
 
     #[test]
@@ -3720,19 +3580,13 @@ mod tests {
         a.update(Msg::Choose(Action::Delete));
         a.update(Msg::ConfirmDelete);
         assert!(a.confirming().is_none(), "the question goes when it is answered");
-        assert_eq!(
-            a.take_op(),
-            Some(FileOp::Delete { path: "/home/a.txt".into(), dir: false })
-        );
+        assert_eq!(a.take_op(), Some(FileOp::Delete { path: "/home/a.txt".into(), dir: false }));
 
         // A directory carries `dir`, which is what decides whether the removal descends.
         let mut a = app();
         a.update(Msg::Choose(Action::Delete)); // row 0 is `archive/`
         a.update(Msg::ConfirmDelete);
-        assert_eq!(
-            a.take_op(),
-            Some(FileOp::Delete { path: "/home/archive".into(), dir: true })
-        );
+        assert_eq!(a.take_op(), Some(FileOp::Delete { path: "/home/archive".into(), dir: true }));
     }
 
     #[test]
@@ -3758,10 +3612,7 @@ mod tests {
         // Over `work/`, which is a directory and therefore a target.
         assert_eq!(a.pointer_moved(100 + DRAG_SLOP, row_y(&a, 1), 1), Gesture::Moved);
         assert_eq!(a.pointer_moved(100 + DRAG_SLOP, row_y(&a, 1), 0), Gesture::Dropped);
-        assert_eq!(
-            a.take_op(),
-            Some(FileOp::MoveInto { from: "/home/a.txt".into(), to: "/home/work/a.txt".into() })
-        );
+        assert_eq!(a.take_op(), Some(FileOp::MoveInto { from: "/home/a.txt".into(), to: "/home/work/a.txt".into() }));
         assert_eq!(a.take_drag(), None, "and the compositor was never told");
     }
 
@@ -3847,12 +3698,7 @@ mod tests {
         // they are a pair that holds something between two gestures, which is a clipboard however
         // it is spelled, so an Edit menu that grew them before M12 Part E built the real one would
         // have shipped a second clipboard. Part E built it and M14 Part D gave it a path kind.
-        for (i, item) in [
-            (0, "CutCtrl+X"),
-            (1, "CopyCtrl+C"),
-            (2, "PasteCtrl+V"),
-            (4, "Duplicate\u{2026}"),
-        ] {
+        for (i, item) in [(0, "CutCtrl+X"), (1, "CopyCtrl+C"), (2, "PasteCtrl+V"), (4, "Duplicate\u{2026}")] {
             assert_eq!(labelled(&edit, MENU_ROW_KEY + i), item, "the Edit menu's row {i}");
         }
         assert_eq!(labelled(&edit, MENU_ROW_KEY + 3), "", "row 3 is a rule");
@@ -3878,9 +3724,7 @@ mod tests {
                 .items
                 .iter()
                 .filter_map(|it| match it {
-                    Item::Action { msg: Msg::Choose(act), enabled, .. } => {
-                        act.needs_selection().then_some(*enabled)
-                    }
+                    Item::Action { msg: Msg::Choose(act), enabled, .. } => act.needs_selection().then_some(*enabled),
                     _ => None,
                 })
                 .collect()
@@ -3898,10 +3742,7 @@ mod tests {
         assert_eq!(needs(&a, "Edit"), alloc::vec![true]);
         // …and the ones that do not need a selection were never affected either way.
         let file = a.menu_table().into_iter().next().expect("File");
-        assert!(
-            matches!(file.items[7], Item::Action { enabled: true, .. }),
-            "New File does not act on a selection"
-        );
+        assert!(matches!(file.items[7], Item::Action { enabled: true, .. }), "New File does not act on a selection");
     }
 
     /// Close Tab is offered only when closing one leaves a browser behind.
@@ -3962,9 +3803,7 @@ mod tests {
         // highlighted, so a file moved into a folder the person could not see (PR #268 review,
         // blocking 1).
         let mut a = App::new("/big");
-        let mut rows: alloc::vec::Vec<Entry> = (1..=20)
-            .map(|i| Entry::dir(&alloc::format!("d{i:02}")))
-            .collect();
+        let mut rows: alloc::vec::Vec<Entry> = (1..=20).map(|i| Entry::dir(&alloc::format!("d{i:02}"))).collect();
         rows.extend((1..=21).map(|i| Entry::file(&alloc::format!("f{i:02}"))));
         a.show("/big", rows);
         assert!(a.entries().len() > a.visible_rows(), "more entries than the window draws");
@@ -4076,14 +3915,7 @@ mod tests {
         a.update(Msg::Choose(Action::Duplicate));
         press_key(&mut a, KEY_X);
         press_key(&mut a, libkern::abi::KEY_ENTER);
-        assert_eq!(
-            a.take_op(),
-            Some(FileOp::Copy {
-                from: "/home/archive".into(),
-                to: "/home/x".into(),
-                dir: true
-            })
-        );
+        assert_eq!(a.take_op(), Some(FileOp::Copy { from: "/home/archive".into(), to: "/home/x".into(), dir: true }));
     }
 
     /// The keys of the listing rows drawn with a selection wash over them.
@@ -4130,14 +3962,7 @@ mod tests {
         const KEY_T: u16 = 20;
         const KEY_H: u16 = 35;
         let mut a = App::new("/home");
-        a.show(
-            "/home",
-            alloc::vec![
-                Entry::dir("Documents"),
-                Entry::file("Notes.txt"),
-                Entry::file("other.txt"),
-            ],
-        );
+        a.show("/home", alloc::vec![Entry::dir("Documents"), Entry::file("Notes.txt"), Entry::file("other.txt"),]);
         a.update(Msg::OpenSearch);
         press_key(&mut a, KEY_T);
         press_key(&mut a, KEY_H);
@@ -4213,18 +4038,11 @@ mod tests {
         // file the person did not pick. The selection survives either way, thanks to the
         // translation back; the *highlight* is the half that needs both.
         let framed = c.view(&theme, None);
-        let _ = libui::layout::layout(
-            &framed,
-            Rect::new(0, 0, size.w, size.h),
-            &libui::layout::FixedCell { w: 8, h: 16 },
-        );
+        let _ =
+            libui::layout::layout(&framed, Rect::new(0, 0, size.w, size.h), &libui::layout::FixedCell { w: 8, h: 16 });
         assert_eq!(washed_rows(&framed), Vec::<u64>::new(), "no row is lit while none is shown");
         press_key(&mut c, libkern::abi::KEY_ESC);
-        assert_eq!(
-            c.selected_name(),
-            Some("Documents"),
-            "the selection survived a search that hid it"
-        );
+        assert_eq!(c.selected_name(), Some("Documents"), "the selection survived a search that hid it");
     }
 
     /// `list_top` is where the first row is actually drawn — asked of the laid-out tree.
@@ -4264,14 +4082,7 @@ mod tests {
         const KEY_T: u16 = 20;
         const KEY_H: u16 = 35;
         let mut a = App::new("/home");
-        a.show(
-            "/home",
-            alloc::vec![
-                Entry::dir("Documents"),
-                Entry::file("Notes.txt"),
-                Entry::file("other.txt"),
-            ],
-        );
+        a.show("/home", alloc::vec![Entry::dir("Documents"), Entry::file("Notes.txt"), Entry::file("other.txt"),]);
         assert_eq!(a.visible_indices(), alloc::vec![0, 1, 2], "unfiltered, every row shows");
         a.update(Msg::OpenSearch);
         assert_eq!(a.search_text(), Some(""), "the field opens empty");
@@ -4377,12 +4188,7 @@ mod tests {
         };
         assert_eq!(
             inks("/home/alice"),
-            alloc::vec![
-                Some(ui.border),
-                Some(ui.foreground_dim),
-                Some(ui.border),
-                None,
-            ],
+            alloc::vec![Some(ui.border), Some(ui.foreground_dim), Some(ui.border), None,],
             "separators in the line colour, the parent dim, and where you are in the body ink"
         );
     }
@@ -4531,10 +4337,7 @@ mod tests {
     #[test]
     fn a_listing_row_does_not_light_the_chrome() {
         let mut a = app();
-        a.show(
-            "/home",
-            (0..8).map(|i| Entry::file(&alloc::format!("f{i}.txt"))).collect(),
-        );
+        a.show("/home", (0..8).map(|i| Entry::file(&alloc::format!("f{i}.txt"))).collect());
         let ui = UiTheme::default();
         // Every row's key, as the tree carries it.
         let keys: Vec<u64> = a.list_rows().iter().map(|r| r.key).collect();
@@ -4669,11 +4472,7 @@ mod tests {
         let second = a.take_op().expect("and the second");
         assert_eq!(
             first,
-            FileOp::Copy {
-                from: String::from("/home/a.txt"),
-                to: String::from("/home/papers/a.txt"),
-                dir: false
-            }
+            FileOp::Copy { from: String::from("/home/a.txt"), to: String::from("/home/papers/a.txt"), dir: false }
         );
         assert!(matches!(second, FileOp::Copy { .. }));
         assert_eq!(a.take_op(), None, "and no more than that");
@@ -4709,11 +4508,7 @@ mod tests {
         a.pasted(PathVerb::Copy, &[("/home/work", true)]);
         assert_eq!(
             a.take_op(),
-            Some(FileOp::Copy {
-                from: String::from("/home/work"),
-                to: String::from("/home/papers/work"),
-                dir: true
-            })
+            Some(FileOp::Copy { from: String::from("/home/work"), to: String::from("/home/papers/work"), dir: true })
         );
 
         // …and a file is still a file copy, which is the control: a version that always said
@@ -4972,8 +4767,17 @@ mod tests {
         let s = |v: &str| Value::Str(String::from(v));
         let row = |n: &str, fs: Value, label: Value, at: Value, removable: bool| {
             alloc::vec![
-                s(n), s("partition"), Value::Null, Value::Int(1 << 20), fs, label, at,
-                Value::Null, Value::Null, Value::Null, Value::Bool(removable),
+                s(n),
+                s("partition"),
+                Value::Null,
+                Value::Int(1 << 20),
+                fs,
+                label,
+                at,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Bool(removable),
             ]
         };
         let rows = alloc::vec![
@@ -5204,10 +5008,25 @@ mod tests {
         }
         assert!(DRIVE_ROW_KEY + top < DRIVE_EJECT_KEY, "rows and buttons never meet");
         for k in [PLACES_KEY, DRIVES_HEADING_KEY, DRIVES_KEY] {
-            for chrome in [LIST_KEY, UP_KEY, TITLE_KEY, GRIP_KEY, STRIP_KEY, PATH_KEY, NOTICE_KEY, SIDEBAR_KEY,
-                PROPS_KEY, HEADER_KEY, STATUS_KEY, LIST_PANE_KEY, SEARCH_KEY, TAB_STRIP_KEY, BAR_KEY, PROMPT_KEY,
-                STRIP_INNER_KEY]
-            {
+            for chrome in [
+                LIST_KEY,
+                UP_KEY,
+                TITLE_KEY,
+                GRIP_KEY,
+                STRIP_KEY,
+                PATH_KEY,
+                NOTICE_KEY,
+                SIDEBAR_KEY,
+                PROPS_KEY,
+                HEADER_KEY,
+                STATUS_KEY,
+                LIST_PANE_KEY,
+                SEARCH_KEY,
+                TAB_STRIP_KEY,
+                BAR_KEY,
+                PROMPT_KEY,
+                STRIP_INNER_KEY,
+            ] {
                 assert_ne!(k, chrome);
             }
         }
@@ -5260,10 +5079,10 @@ mod tests {
     #[test]
     fn properties_reports_the_entry_it_was_opened_on() {
         let mut a = app();
-        a.show("/home", alloc::vec![
-            Entry { mtime: 1_000_000_000, size: 1536, ..Entry::file("notes.txt") },
-            Entry::dir("work"),
-        ]);
+        a.show(
+            "/home",
+            alloc::vec![Entry { mtime: 1_000_000_000, size: 1536, ..Entry::file("notes.txt") }, Entry::dir("work"),],
+        );
         // Row 0 is the directory; row 1 is the file.
         a.update(Msg::Press(row(1)));
         a.update(Msg::Choose(Action::Properties));
@@ -5354,10 +5173,7 @@ mod tests {
         // already means and what the manager's request has to mean too.
         assert_eq!(a.dialog_dismissed(), Some(Msg::KeepIt));
         // `Esc` is the only key that answers, and it answers the same way.
-        assert_eq!(
-            a.dialog_key(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN, 0)),
-            Some(Msg::KeepIt)
-        );
+        assert_eq!(a.dialog_key(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN, 0)), Some(Msg::KeepIt));
         assert_eq!(
             a.dialog_key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN, 0)),
             None,
@@ -5378,11 +5194,7 @@ mod tests {
         assert!(a.location_text().is_none(), "closed to begin with");
 
         a.update(Msg::Key(KeyEvent::new(1, LOCATION_KEYCODE, KEY_DOWN, MOD_CTRL)));
-        assert_eq!(
-            a.location_text().as_deref(),
-            Some("/home"),
-            "seeded with where the tab is, not left blank"
-        );
+        assert_eq!(a.location_text().as_deref(), Some("/home"), "seeded with where the tab is, not left blank");
 
         // Replace it with somewhere else and go.
         a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN, 0)));
@@ -5563,11 +5375,7 @@ mod tests {
         a.update(Msg::Grab(row(0)));
         a.pointer_moved(40, 60, 1);
         // Past the slop in one step, which is the motion that arms the drag.
-        assert_eq!(
-            a.pointer_moved(40 + DRAG_SLOP, 60, 1),
-            Gesture::Moved,
-            "travelling past the slop is a drag"
-        );
+        assert_eq!(a.pointer_moved(40 + DRAG_SLOP, 60, 1), Gesture::Moved, "travelling past the slop is a drag");
         a.pointer_moved(40 + DRAG_SLOP, 60, 0);
         a.note_press(libdraw::geom::Point::new(40, 60), 1_150, 0);
         a.update(Msg::Press(row(0)));
@@ -5633,11 +5441,7 @@ mod tests {
         a.update(Msg::SetOrder(libfs::Order::NewestFirst));
         assert_eq!(a.take_goto(), None, "a re-order is not a navigation");
         assert_eq!(names(&a), alloc::vec!["beta.txt", "alpha.txt"], "newest first");
-        assert_eq!(
-            picked(&a),
-            "alpha.txt",
-            "the selection followed the file rather than staying on row 0"
-        );
+        assert_eq!(picked(&a), "alpha.txt", "the selection followed the file rather than staying on row 0");
 
         // And the same order chosen twice is not a change.
         a.update(Msg::SetOrder(libfs::Order::NewestFirst));
@@ -5675,10 +5479,7 @@ mod tests {
         );
 
         a.update(Msg::ToggleHidden);
-        assert_eq!(
-            marked(&a),
-            alloc::vec![String::from("Oldest First"), String::from("Show Hidden Files")]
-        );
+        assert_eq!(marked(&a), alloc::vec![String::from("Oldest First"), String::from("Show Hidden Files")]);
         a.update(Msg::ToggleHidden);
         assert_eq!(marked(&a), alloc::vec![String::from("Oldest First")], "and back off again");
     }
@@ -5829,10 +5630,8 @@ mod tests {
         let size = a.window_size();
         let view = a.view(&UiTheme::default(), None);
         let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
-        let file =
-            libui::layout::locate(&view, &l, MENU_BAR_KEY).expect("the File word is keyed");
-        let edit =
-            libui::layout::locate(&view, &l, MENU_BAR_KEY + 1).expect("the Edit word is keyed");
+        let file = libui::layout::locate(&view, &l, MENU_BAR_KEY).expect("the File word is keyed");
+        let edit = libui::layout::locate(&view, &l, MENU_BAR_KEY + 1).expect("the Edit word is keyed");
 
         // The gate's own arithmetic, in window-local coordinates.
         let (ax, ay) = (20, 1 + TITLE_BAR_H as i32 + MENU_BAR_H as i32 / 2);
@@ -5841,10 +5640,7 @@ mod tests {
             "check-login aims at ({ax}, {ay}) for the File menu and the word is at {file:?}"
         );
         // …and it is not so close to Edit that a pixel of drift chooses the other menu.
-        assert!(
-            !edit.contains(ax, ay),
-            "the aim point is inside Edit as well: File {file:?}, Edit {edit:?}"
-        );
+        assert!(!edit.contains(ax, ay), "the aim point is inside Edit as well: File {file:?}, Edit {edit:?}");
     }
 
     /// Every widget id in the tree, in walk order.
@@ -5913,11 +5709,7 @@ mod tests {
         let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
         let box_ = libui::layout::locate(&e, &l, SIDEBAR_KEY).expect("the sidebar is keyed");
         let row = libui::layout::locate(&e, &l, SIDEBAR_ROW_KEY).expect("its first row is keyed");
-        assert_eq!(
-            row.origin.x - box_.origin.x,
-            SIDEBAR_PAD as i32,
-            "the panel is flush with the window's edge"
-        );
+        assert_eq!(row.origin.x - box_.origin.x, SIDEBAR_PAD as i32, "the panel is flush with the window's edge");
         assert_eq!(
             (box_.origin.x + box_.size.w as i32) - (row.origin.x + row.size.w as i32),
             SIDEBAR_PAD as i32,
@@ -5932,11 +5724,7 @@ mod tests {
         );
         // And the listing's own pane reaches it too.
         let pane = libui::layout::locate(&e, &l, LIST_PANE_KEY).expect("the pane is keyed");
-        assert_eq!(
-            pane.origin.y + pane.size.h as i32,
-            status.origin.y,
-            "the listing stops short of the status bar"
-        );
+        assert_eq!(pane.origin.y + pane.size.h as i32, status.origin.y, "the listing stops short of the status bar");
     }
 
     /// A scrollbar drag survives the repaint that follows it.
@@ -5981,11 +5769,7 @@ mod tests {
         assert!(scrolled > 0, "the press on the bar scrolled nowhere");
 
         frame(&mut a, &mut tree);
-        assert_eq!(
-            a.pane().list.offset,
-            scrolled,
-            "the repaint put the listing back where its selection is"
-        );
+        assert_eq!(a.pane().list.offset, scrolled, "the repaint put the listing back where its selection is");
     }
 
     /// The wheel scrolls the listing, **through the real tree and router**.
@@ -6066,8 +5850,7 @@ mod tests {
             y: at.1,
             ..Default::default()
         };
-        let (msgs, _) =
-            router.pointer(&tree, &rest, &l, ev(librsproto::surface::POINTER_PRESSED, 1));
+        let (msgs, _) = router.pointer(&tree, &rest, &l, ev(librsproto::surface::POINTER_PRESSED, 1));
         assert!(msgs.is_empty(), "a press is not a click");
 
         // Frame 2: a repaint between the two halves, with the word lit. **Lit explicitly, not
@@ -6203,5 +5986,4 @@ mod tests {
             Item::Separator => panic!("check-login's RENAME_ROW is a rule, not a row"),
         }
     }
-
 }

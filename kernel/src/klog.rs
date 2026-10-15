@@ -144,11 +144,7 @@ impl Klog {
 
     /// Index of the oldest live ring byte.
     fn ring_start(&self) -> usize {
-        if self.ring_len < RING_CAP {
-            0
-        } else {
-            self.head
-        }
+        if self.ring_len < RING_CAP { 0 } else { self.head }
     }
 
     /// Total bytes a linearised snapshot occupies: prefix + elision notice + ring.
@@ -224,14 +220,7 @@ fn format_notice(elided: usize, out: &mut [u8; NOTICE_MAX]) -> usize {
 
 static KLOG: IrqSpinLock<Klog> = IrqSpinLock::new(
     LockRank::Klog,
-    Klog {
-        prefix: [0; PREFIX_CAP],
-        prefix_len: 0,
-        ring: [0; RING_CAP],
-        head: 0,
-        ring_len: 0,
-        elided: 0,
-    },
+    Klog { prefix: [0; PREFIX_CAP], prefix_len: 0, ring: [0; RING_CAP], head: 0, ring_len: 0, elided: 0 },
 );
 
 /// Append `bytes` to the kernel log (called from the serial `write_str` tee).
@@ -312,14 +301,7 @@ mod tests {
     use super::*;
 
     fn fresh() -> Klog {
-        Klog {
-            prefix: [0; PREFIX_CAP],
-            prefix_len: 0,
-            ring: [0; RING_CAP],
-            head: 0,
-            ring_len: 0,
-            elided: 0,
-        }
+        Klog { prefix: [0; PREFIX_CAP], prefix_len: 0, ring: [0; RING_CAP], head: 0, ring_len: 0, elided: 0 }
     }
 
     /// Concatenate the snapshot exactly as `copy_into_frames` would, by walking the

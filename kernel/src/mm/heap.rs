@@ -20,10 +20,10 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::libkern::SpinLock;
+use crate::libkern::lockrank::LockRank;
 use crate::limine::MemoryMapResponse;
 use crate::mm::PhysAddr;
 use crate::mm::buddy::BuddyAllocator;
-use crate::libkern::lockrank::LockRank;
 
 /// The single global buddy allocator. `None` until [`init_buddy`].
 static BUDDY: SpinLock<Option<BuddyAllocator>> = SpinLock::new(LockRank::Buddy, None);
@@ -44,10 +44,7 @@ static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// bootloader's HHDM base.
 pub unsafe fn init_buddy(memory_map: &MemoryMapResponse, hhdm_offset: u64) {
     let mut slot = BUDDY.lock();
-    assert!(
-        slot.is_none(),
-        "heap::init_buddy called twice; the buddy allocator must be initialised exactly once"
-    );
+    assert!(slot.is_none(), "heap::init_buddy called twice; the buddy allocator must be initialised exactly once");
     // SAFETY: forwarded from the caller per the function-level contract.
     let allocator = unsafe { BuddyAllocator::new(memory_map, hhdm_offset) };
     *slot = Some(allocator);
@@ -59,9 +56,7 @@ pub unsafe fn init_buddy(memory_map: &MemoryMapResponse, hhdm_offset: u64) {
 /// Panics if [`init_buddy`] has not run.
 pub fn buddy_alloc(order: usize) -> Option<PhysAddr> {
     let mut slot = BUDDY.lock();
-    slot.as_mut()
-        .expect("heap::buddy_alloc called before init_buddy")
-        .alloc(order)
+    slot.as_mut().expect("heap::buddy_alloc called before init_buddy").alloc(order)
 }
 
 /// Return frames previously obtained from [`buddy_alloc`]. `order` must
@@ -70,9 +65,7 @@ pub fn buddy_alloc(order: usize) -> Option<PhysAddr> {
 /// Panics if [`init_buddy`] has not run.
 pub fn buddy_free(addr: PhysAddr, order: usize) {
     let mut slot = BUDDY.lock();
-    slot.as_mut()
-        .expect("heap::buddy_free called before init_buddy")
-        .free(addr, order);
+    slot.as_mut().expect("heap::buddy_free called before init_buddy").free(addr, order);
 }
 
 /// HHDM offset captured at [`init_buddy`] time. Returns `0` if init has

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{read_text, repo_root, R};
+use crate::{R, read_text, repo_root};
 
 /// `cargo xtask check-docs` — the documentation cannot point at things that do not exist.
 ///
@@ -44,9 +44,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
     // are excluded from the source-path check for the reason in the doc comment above.
     let describes_current = |p: &Path| {
         let s = p.to_string_lossy().replace('\\', "/");
-        ["/docs/spec/", "/docs/reference/", "/docs/architecture/", "/docs/conventions/"]
-            .iter()
-            .any(|d| s.contains(d))
+        ["/docs/spec/", "/docs/reference/", "/docs/architecture/", "/docs/conventions/"].iter().any(|d| s.contains(d))
     };
 
     // Append-only records. Their backticked path mentions describe the world as it was —
@@ -113,15 +111,9 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                     && !(anchor.starts_with('L')
                         && anchor[1..].chars().all(|c| c.is_ascii_digit() || c == '-' || c == 'L'))
                 {
-                    let target_file =
-                        if file.is_empty() { path.to_path_buf() } else { dir.join(file) };
+                    let target_file = if file.is_empty() { path.to_path_buf() } else { dir.join(file) };
                     if target_file.extension().map_or(false, |e| e == "md") {
-                        anchor_refs.push((
-                            path.to_path_buf(),
-                            i + 1,
-                            target_file,
-                            anchor.to_string(),
-                        ));
+                        anchor_refs.push((path.to_path_buf(), i + 1, target_file, anchor.to_string()));
                     }
                 }
                 if file.is_empty() || !file.ends_with(".md") {
@@ -154,9 +146,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                         // the bare one does not. Dissolving `docs/history/` left 11 of them.
                         paths += 1;
                         if !known_md.iter().any(|k| k == piece) {
-                            violations.push(at(&format!(
-                                "cited doc does not exist anywhere in the repo: {piece}"
-                            )));
+                            violations.push(at(&format!("cited doc does not exist anywhere in the repo: {piece}")));
                         }
                     }
                 }
@@ -165,9 +155,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
             // 2. Backticked repo-relative source paths, in current-behaviour docs only.
             if describes_current(path) && !line.contains(ALLOW) {
                 for piece in line.split('`').skip(1).step_by(2) {
-                    let ok_prefix = ["kernel/", "userspace/", "tools/"]
-                        .iter()
-                        .any(|p| piece.starts_with(p));
+                    let ok_prefix = ["kernel/", "userspace/", "tools/"].iter().any(|p| piece.starts_with(p));
                     let ok_suffix = piece.ends_with(".rs") || piece.ends_with(".toml");
                     // `kernel/src/arch/<arch>/registers.rs` is a template, not a path.
                     let placeholder = piece.contains('<') || piece.contains('>');
@@ -192,8 +180,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
     }
 
     // 1b (continued). Resolve the collected heading links, reading each target once.
-    let mut anchor_cache: std::collections::BTreeMap<PathBuf, Vec<String>> =
-        std::collections::BTreeMap::new();
+    let mut anchor_cache: std::collections::BTreeMap<PathBuf, Vec<String>> = std::collections::BTreeMap::new();
     let anchors = anchor_refs.len();
     for (src, line, target, anchor) in anchor_refs {
         if !target.exists() {
@@ -212,10 +199,8 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                 .find(|k| k.starts_with(anchor.split('-').next().unwrap_or(&anchor)))
                 .map(|k| format!(" (did you mean #{k}?)"))
                 .unwrap_or_default();
-            violations.push(format!(
-                "{}:{line}: link to a heading that does not exist: #{anchor}{near}",
-                src.display()
-            ));
+            violations
+                .push(format!("{}:{line}: link to a heading that does not exist: #{anchor}{near}", src.display()));
         }
     }
 
@@ -331,9 +316,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
             if what == "syscall" && line.starts_with("- ") {
                 let cells: Vec<&str> = line.split('`').skip(1).step_by(2).collect();
                 let name = cells.iter().find_map(|c| {
-                    c.strip_prefix("sys_")
-                        .and_then(|r| r.split_once('('))
-                        .map(|(n, _)| format!("sys_{n}"))
+                    c.strip_prefix("sys_").and_then(|r| r.split_once('(')).map(|(n, _)| format!("sys_{n}"))
                 });
                 let num = cells.iter().find(|c| c.starts_with("0x")).and_then(|c| parse_num(c));
                 if let (Some(name), Some(num)) = (name, num) {
@@ -380,9 +363,8 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                     "{doc_rel}: {what} {n} (`{name}`) is defined in {src_rel} but missing \
                      from the table"
                 )),
-                Some((_, dname)) if dname != name => violations.push(format!(
-                    "{doc_rel}: {what} {n} is `{name}` in {src_rel} but `{dname}` in the table"
-                )),
+                Some((_, dname)) if dname != name => violations
+                    .push(format!("{doc_rel}: {what} {n} is `{name}` in {src_rel} but `{dname}` in the table")),
                 Some(_) => {}
             }
         }

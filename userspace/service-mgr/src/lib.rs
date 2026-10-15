@@ -123,8 +123,7 @@ pub mod registry {
     /// notification channel, [`MAX_ROUTES`] routes and the services' handles, within the kernel's
     /// 32. One more starting at once is still seen, on the next pass: the wait is level-triggered
     /// and looks at everything.
-    pub const STARTING_ROOM: usize =
-        libkern::abi::MAX_WAIT_HANDLES - 1 - MAX_ROUTES - crate::services::SLOTS;
+    pub const STARTING_ROOM: usize = libkern::abi::MAX_WAIT_HANDLES - 1 - MAX_ROUTES - crate::services::SLOTS;
 
     /// **Endpoints a server mints for sessions**, each reached through a route of its own
     /// (Part E.1b): `(server, suffix)` — resolving `suffix` on the server answers a forwarding
@@ -134,8 +133,7 @@ pub mod registry {
     /// - `device-mgr`'s `info-endpoint` answers its tables and never a class (Part B.4);
     /// - `storage-service`'s `session-endpoint` answers the filesystems and the tables and never an
     ///   admin endpoint (Part C.6).
-    pub const DERIVED: &[(&str, &str)] =
-        &[("device-mgr", "info-endpoint"), ("storage-service", "session-endpoint")];
+    pub const DERIVED: &[(&str, &str)] = &[("device-mgr", "info-endpoint"), ("storage-service", "session-endpoint")];
 
     /// The suffixes `name` derives endpoints from, in [`DERIVED`]'s order.
     pub fn derives(name: &str) -> impl Iterator<Item = &'static str> + '_ {
@@ -217,8 +215,7 @@ pub mod services {
     pub const MAX_POWER_SESSIONS: usize = 2;
     /// Wait-set slots the services take: `/svc/services`' own endpoint, the session endpoint, and
     /// the admin and power endpoints and sessions.
-    pub const SLOTS: usize =
-        2 + MAX_ADMIN_ENDPOINTS + MAX_ADMIN_SESSIONS + MAX_POWER_ENDPOINTS + MAX_POWER_SESSIONS;
+    pub const SLOTS: usize = 2 + MAX_ADMIN_ENDPOINTS + MAX_ADMIN_SESSIONS + MAX_POWER_ENDPOINTS + MAX_POWER_SESSIONS;
 
     /// Where a service is, as the table says it.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -251,13 +248,7 @@ pub mod services {
     ///
     /// **Running and not usable is `failed`** (PR #341 review, finding 7): a server that refused,
     /// or sent no `Meta::Ready` in time, is still a process, and its path answers `NotFound`.
-    pub fn state(
-        running: bool,
-        starting: bool,
-        usable: bool,
-        requested: bool,
-        exited: Option<Option<i32>>,
-    ) -> State {
+    pub fn state(running: bool, starting: bool, usable: bool, requested: bool, exited: Option<Option<i32>>) -> State {
         match (running, starting, usable) {
             (true, true, _) => State::Starting,
             (true, false, true) => State::Running,
@@ -372,9 +363,7 @@ pub mod services {
 #[cfg(test)]
 mod tests {
     use super::bringup::{Entry, Failed, Step, chain_at, failed_at_boot, next};
-    use super::registry::{
-        DERIVED, MAX_ROUTES, STARTING_ROOM, base, derived, derives, valid_name,
-    };
+    use super::registry::{DERIVED, MAX_ROUTES, STARTING_ROOM, base, derived, derives, valid_name};
 
     const S: Entry = Entry { server: true, critical: false };
     const C: Entry = Entry { server: true, critical: true };
@@ -399,10 +388,7 @@ mod tests {
     #[test]
     fn the_login_chain_starts_after_the_last_server_and_before_the_rest() {
         use Step::*;
-        assert_eq!(
-            order(&[C, S, S, N, N]),
-            [Start(0), Start(1), Start(2), LoginChain, Start(3), Start(4), Done]
-        );
+        assert_eq!(order(&[C, S, S, N, N]), [Start(0), Start(1), Start(2), LoginChain, Start(3), Start(4), Done]);
         assert_eq!(chain_at(&[C, S, S, N, N]), 3);
         // A server declared after a non-server still counts: the chain waits for it.
         assert_eq!(order(&[S, N, S, N]), [Start(0), Start(1), Start(2), LoginChain, Start(3), Done]);
@@ -416,10 +402,10 @@ mod tests {
     #[test]
     fn an_admin_request_is_decided_by_the_service_it_names() {
         use super::services::{Action, Found, decide};
+        use libkern::error::KError;
         use librsproto::services::{
             OP_SERVICES_RESTART as RESTART, OP_SERVICES_START as START, OP_SERVICES_STOP as STOP,
         };
-        use libkern::error::KError;
         let found = |essential, running, restart_due| Some(Found { essential, running, restart_due });
         let (plain_up, plain_down) = (found(false, true, false), found(false, false, false));
         let essential_up = found(true, true, false);

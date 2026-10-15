@@ -78,12 +78,7 @@ impl<P: MsgPort> ChannelSink<P> {
     /// (`max_chunk` must be non-zero — the real port passes `IPC_PAYLOAD_SIZE`).
     pub fn new(port: P, max_chunk: usize) -> Self {
         debug_assert!(max_chunk > 0, "max_chunk must be non-zero");
-        ChannelSink {
-            port,
-            buf: Vec::new(),
-            max_chunk,
-            finished: false,
-        }
+        ChannelSink { port, buf: Vec::new(), max_chunk, finished: false }
     }
 
     /// Emit every buffered full chunk as a (non-`last`) message, leaving `< max_chunk`
@@ -170,8 +165,7 @@ mod io_port {
     use alloc::vec::Vec;
     use libkern::abi::{IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, SENDMODE_BLOCK};
     use libkern::syscall::{
-        SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4,
-        syscall6,
+        SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall6,
     };
 
     // `KError` discriminants we distinguish (see `libkern::error::KError`).
@@ -200,10 +194,7 @@ mod io_port {
     impl IpcPort {
         /// Wrap a channel-endpoint handle.
         pub fn new(endpoint: u64) -> Self {
-            IpcPort {
-                endpoint,
-                buf: Box::new([0u8; IPC_MSG_SIZE]),
-            }
+            IpcPort { endpoint, buf: Box::new([0u8; IPC_MSG_SIZE]) }
         }
         /// The endpoint handle this port sends/receives on.
         pub fn endpoint(&self) -> u64 {
@@ -224,8 +215,7 @@ mod io_port {
                 return Err(WireError::SinkFull);
             }
             let flags: u16 = if last { MSG_FLAG_LAST } else { 0 };
-            self.buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
-                .copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            self.buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
             self.buf[OFF_HANDLE_COUNT] = 0;
             self.buf[OFF_FLAGS..OFF_FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
             self.buf[OFF_PAYLOAD..OFF_PAYLOAD + payload.len()].copy_from_slice(payload);
@@ -255,15 +245,8 @@ mod io_port {
             let wait_handles = [po];
             let mut result = [0u8; 24]; // one IoResult
             // SAFETY: valid handle + result out-buffers.
-            let waited = unsafe {
-                syscall4(
-                    SYS_WAIT,
-                    wait_handles.as_ptr() as u64,
-                    1,
-                    result.as_mut_ptr() as u64,
-                    u64::MAX,
-                )
-            };
+            let waited =
+                unsafe { syscall4(SYS_WAIT, wait_handles.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX) };
             // SAFETY: closing the PO handle we own.
             unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
             if waited < 1 {
@@ -311,13 +294,7 @@ mod io_port {
                     let mut result = [0u8; 24];
                     // SAFETY: valid handle + result out-buffers.
                     let waited = unsafe {
-                        syscall4(
-                            SYS_WAIT,
-                            wait_handles.as_ptr() as u64,
-                            1,
-                            result.as_mut_ptr() as u64,
-                            u64::MAX,
-                        )
+                        syscall4(SYS_WAIT, wait_handles.as_ptr() as u64, 1, result.as_mut_ptr() as u64, u64::MAX)
                     };
                     if waited < 1 {
                         return Err(WireError::PeerClosed);
@@ -430,9 +407,11 @@ mod tests {
 
     #[test]
     fn full_tsm1_stream_round_trips_over_the_transport() {
-        let schema = Schema::new()
-            .field("pid", TypeTag::Int, TypeModifiers::NONE)
-            .field("name", TypeTag::String, TypeModifiers::NONE);
+        let schema = Schema::new().field("pid", TypeTag::Int, TypeModifiers::NONE).field(
+            "name",
+            TypeTag::String,
+            TypeModifiers::NONE,
+        );
         // Small max_chunk forces multi-message framing of a real TSM1 stream.
         let mut tw = TableWriter::new(ChannelSink::new(Loopback::default(), 7));
         tw.write_schema(StreamFlags::NONE, &schema).unwrap();

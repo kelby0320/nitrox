@@ -47,21 +47,11 @@ pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; BL
     let mut state = [0u32; 16];
     state[0..4].copy_from_slice(&CONSTANTS);
     for i in 0..8 {
-        state[4 + i] = u32::from_le_bytes([
-            key[4 * i],
-            key[4 * i + 1],
-            key[4 * i + 2],
-            key[4 * i + 3],
-        ]);
+        state[4 + i] = u32::from_le_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]]);
     }
     state[12] = counter;
     for i in 0..3 {
-        state[13 + i] = u32::from_le_bytes([
-            nonce[4 * i],
-            nonce[4 * i + 1],
-            nonce[4 * i + 2],
-            nonce[4 * i + 3],
-        ]);
+        state[13 + i] = u32::from_le_bytes([nonce[4 * i], nonce[4 * i + 1], nonce[4 * i + 2], nonce[4 * i + 3]]);
     }
 
     // 20 rounds = 10 double-rounds (column rounds then diagonal rounds).
@@ -182,6 +172,7 @@ mod tests {
         }
         let nonce = [0, 0, 0, 9, 0, 0, 0, 0x4a, 0, 0, 0, 0];
         let block = chacha20_block(&key, 1, &nonce);
+        #[rustfmt::skip]
         let expected: [u8; 64] = [
             0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15, 0x50, 0x0f, 0xdd, 0x1f, 0xa3, 0x20,
             0x71, 0xc4, 0xc7, 0xd1, 0xf4, 0xc7, 0x33, 0xc0, 0x68, 0x03, 0x04, 0x22, 0xaa, 0x9a,

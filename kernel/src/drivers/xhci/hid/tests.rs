@@ -141,7 +141,6 @@ fn a_bind_line_says_how_its_descriptor_went() {
     );
 }
 
-
 /// **A new node takes a slot no node has had, then one whose device has departed** (Phase 6 Part
 /// C), and none while every slot is bound: sixteen bound devices, not sixteen ever attached.
 #[test]

@@ -38,10 +38,10 @@ use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use libfs::TreeError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
 use libkern::{exit, kprint};
-use libfs::TreeError;
 use librsproto::session::{Dir, DirError};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
@@ -130,9 +130,7 @@ fn make_one(stage: &Stage, path: &[u8]) -> bool {
         Err(TreeError::MakeDir(k)) if k == KError::AlreadyExists.as_i32() => {
             stage.die(b"mkdir: path already exists (use --parents to allow it)\n", EXIT_FAILURE)
         }
-        Err(TreeError::OpenDir) => {
-            stage.die(b"mkdir: parent directory does not exist\n", EXIT_FAILURE)
-        }
+        Err(TreeError::OpenDir) => stage.die(b"mkdir: parent directory does not exist\n", EXIT_FAILURE),
         Err(_) => stage.die(b"mkdir: cannot create directory\n", EXIT_FAILURE),
     }
 }
@@ -172,10 +170,7 @@ fn make_parents(stage: &Stage, path: &[u8]) -> bool {
                 // wearing the name does not satisfy that, and silently continuing would
                 // report success for a tree that was never built.
                 if !libfs::is_dir(stage.namespace, prefix) {
-                    stage.die(
-                        b"mkdir: path exists and is not a directory\n",
-                        EXIT_FAILURE,
-                    );
+                    stage.die(b"mkdir: path exists and is not a directory\n", EXIT_FAILURE);
                 }
                 false
             }
@@ -223,9 +218,11 @@ fn trim_trailing_slashes(path: &[u8]) -> &[u8] {
 
 /// Write the rows as a TSM1 table on the `stdout` stream.
 fn emit(stage: &Stage, stdout: u64, made: &[Made]) {
-    let schema = Schema::new()
-        .field("path", TypeTag::String, TypeModifiers::NONE)
-        .field("created", TypeTag::Bool, TypeModifiers::NONE);
+    let schema = Schema::new().field("path", TypeTag::String, TypeModifiers::NONE).field(
+        "created",
+        TypeTag::Bool,
+        TypeModifiers::NONE,
+    );
 
     let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {

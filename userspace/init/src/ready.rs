@@ -40,10 +40,7 @@ pub enum First<'a> {
 /// Parse the rsproto message in an `IpcMsg`'s payload (`payload`, already cut to the header's
 /// `payload_len`) that arrived with `handles` transferred handles.
 pub fn parse(payload: &[u8], handles: usize) -> First<'_> {
-    if payload.len() < HEADER_LEN
-        || u32_at(payload, 0) != RS_MAGIC
-        || u16_at(payload, 6) != OP_READY
-    {
+    if payload.len() < HEADER_LEN || u32_at(payload, 0) != RS_MAGIC || u16_at(payload, 6) != OP_READY {
         return First::Unexpected;
     }
     if u32_at(payload, 16) & FLAG_ERROR == 0 {

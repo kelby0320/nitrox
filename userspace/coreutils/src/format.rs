@@ -130,7 +130,8 @@ pub fn target(rows: &[Row], name: &str) -> Option<Target> {
         "ramdisk" => Kind::RamDisk,
         _ => return None,
     };
-    let disk = if kind == Kind::Partition { r.parent.as_ref().and_then(|p| rows.iter().find(|d| &d.name == p)) } else { None };
+    let disk =
+        if kind == Kind::Partition { r.parent.as_ref().and_then(|p| rows.iter().find(|d| &d.name == p)) } else { None };
     let usb = |r: &Row| r.driver.as_deref() == Some(USB_STORAGE);
     Some(Target {
         name: r.name.clone(),
@@ -183,10 +184,14 @@ impl core::fmt::Display for Refusal {
                 "it is not a removable disk: only a USB disk's table is read again, and an internal disk is partitioned by nxinstall"
             ),
             Refusal::NotADisk => write!(f, "it is a partition: a partition table goes on a disk"),
-            Refusal::TableOnPartition => write!(f, "it is a partition, whose table is its disk's: --mbr and --gpt are for a disk"),
+            Refusal::TableOnPartition => {
+                write!(f, "it is a partition, whose table is its disk's: --mbr and --gpt are for a disk")
+            }
             Refusal::BothTables => write!(f, "--mbr and --gpt are one or the other"),
             Refusal::MbrTooLarge => write!(f, "an MBR cannot count past 2 TiB, and this disk is larger: use --gpt"),
-            Refusal::SectorSize(n) => write!(f, "its sectors are {n} bytes, and only 512-byte sectors are written here"),
+            Refusal::SectorSize(n) => {
+                write!(f, "its sectors are {n} bytes, and only 512-byte sectors are written here")
+            }
             Refusal::TooSmall(why) | Refusal::Label(why) => write!(f, "{why}"),
         }
     }
@@ -312,7 +317,8 @@ pub enum Label {
 pub fn partition(t: &Target, mbr: bool, gpt: bool) -> Result<Plan, Refusal> {
     check(t, true)?;
     let s = scheme(None, t.sectors, mbr, gpt)?;
-    let (first, n) = extent(s, t.sectors).ok_or_else(|| Refusal::TooSmall(String::from("it is too small for a partition at 1 MiB")))?;
+    let (first, n) = extent(s, t.sectors)
+        .ok_or_else(|| Refusal::TooSmall(String::from("it is too small for a partition at 1 MiB")))?;
     Ok(Plan { table: Some((s, first, n)), fs: None })
 }
 
@@ -328,8 +334,8 @@ pub fn format(t: &Target, fs: Fs, label: Option<&str>, mbr: bool, gpt: bool) -> 
         (None, 0, t.sectors)
     } else {
         let s = scheme(Some(fs), t.sectors, mbr, gpt)?;
-        let (first, n) =
-            extent(s, t.sectors).ok_or_else(|| Refusal::TooSmall(String::from("it is too small for a partition at 1 MiB")))?;
+        let (first, n) = extent(s, t.sectors)
+            .ok_or_else(|| Refusal::TooSmall(String::from("it is too small for a partition at 1 MiB")))?;
         (Some((s, first, n)), first * SECTOR, n)
     };
     let label = match fs {

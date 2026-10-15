@@ -32,8 +32,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use libkern::debug::Line;
 use libkern::{
-    KError, RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_HANDLE_CLOSE, SYS_MEMORY_MAP,
-    SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4, syscall5,
+    KError, RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_HANDLE_CLOSE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP,
+    SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4, syscall5,
 };
 
 #[global_allocator]
@@ -104,8 +104,7 @@ fn write(ns: u64, path: &[u8]) -> i64 {
         return 1;
     }
     // SAFETY: mapping the file this call created, with the rights it was created with.
-    let addr =
-        unsafe { syscall4(SYS_MEMORY_MAP, file, 0, LEN as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, file, 0, LEN as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if addr < 0 {
         // SAFETY: closing the handle this call created.
         unsafe { syscall1(SYS_HANDLE_CLOSE, file) };
@@ -237,8 +236,7 @@ fn po_wait(po: u64) -> (i32, u64) {
     let handles = [po];
     let mut r = [0u8; 24];
     // SAFETY: a valid one-entry handle array and result buffer.
-    let waited =
-        unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
+    let waited = unsafe { syscall4(SYS_WAIT, handles.as_ptr() as u64, 1, r.as_mut_ptr() as u64, u64::MAX) };
     // SAFETY: closing the PO this process owns; a created file is a separate handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
     if waited != 1 {

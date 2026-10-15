@@ -33,16 +33,19 @@ pub const FIRST_USABLE: u64 = 2 + ARRAY_BLOCKS;
 pub const BLOCK: usize = 512;
 
 /// The EFI system partition's type GUID, `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`.
+#[rustfmt::skip]
 pub const TYPE_EFI_SYSTEM: [u8; 16] = [
     0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
 ];
 /// The Linux filesystem type GUID, `0FC63DAF-8483-4772-8E79-3D69D8477DE4` — what `mke2fs` images
 /// and every Linux root carry, and what this system's own images already use.
+#[rustfmt::skip]
 pub const TYPE_LINUX_FS: [u8; 16] = [
     0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
 ];
 /// Microsoft basic data, `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7` — what a FAT on a GPT is typed, by
 /// Windows, macOS and Linux alike (Phase 6 Part G.2).
+#[rustfmt::skip]
 pub const TYPE_BASIC_DATA: [u8; 16] = [
     0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
 ];
@@ -105,14 +108,7 @@ pub struct Partition {
 impl Partition {
     /// A partition of `type_guid` spanning `first_lba..=last_lba`, labelled `name` (cut to 36).
     pub fn new(type_guid: [u8; 16], unique_guid: [u8; 16], first_lba: u64, last_lba: u64, name: &[u8]) -> Self {
-        let mut p = Self {
-            type_guid,
-            unique_guid,
-            first_lba,
-            last_lba,
-            name: [0; 36],
-            name_len: 0,
-        };
+        let mut p = Self { type_guid, unique_guid, first_lba, last_lba, name: [0; 36], name_len: 0 };
         let n = name.len().min(36);
         p.name[..n].copy_from_slice(&name[..n]);
         p.name_len = n;
@@ -189,9 +185,7 @@ pub fn build(
         return Err(BuildError::BufferTooSmall);
     }
     // The backup header takes the last block, the backup array the blocks before it.
-    let last_usable = disk_blocks
-        .checked_sub(ARRAY_BLOCKS + 2)
-        .ok_or(BuildError::DiskTooSmall)?;
+    let last_usable = disk_blocks.checked_sub(ARRAY_BLOCKS + 2).ok_or(BuildError::DiskTooSmall)?;
     if last_usable < FIRST_USABLE {
         return Err(BuildError::DiskTooSmall);
     }
@@ -238,15 +232,7 @@ pub fn build(
 
     // The two headers differ in three fields: which block each lives at, where the other is, and
     // where its own array starts.
-    write_header(
-        &mut front[BLOCK..2 * BLOCK],
-        1,
-        disk_blocks - 1,
-        2,
-        disk_guid,
-        last_usable,
-        entries_crc,
-    );
+    write_header(&mut front[BLOCK..2 * BLOCK], 1, disk_blocks - 1, 2, disk_guid, last_usable, entries_crc);
     write_header(
         &mut back[array_len..array_len + BLOCK],
         disk_blocks - 1,
@@ -394,7 +380,6 @@ pub fn read(front: &[u8]) -> Result<Table, ReadError> {
     Ok(table)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,19 +434,12 @@ mod tests {
         assert_eq!(&backup[0..8], SIGNATURE);
         assert_eq!(u64::from_le_bytes(backup[24..32].try_into().unwrap()), DISK - 1, "its own block");
         assert_eq!(u64::from_le_bytes(backup[32..40].try_into().unwrap()), 1, "the primary's");
-        assert_eq!(
-            u64::from_le_bytes(backup[72..80].try_into().unwrap()),
-            DISK - 1 - ARRAY_BLOCKS,
-            "its own array"
-        );
+        assert_eq!(u64::from_le_bytes(backup[72..80].try_into().unwrap()), DISK - 1 - ARRAY_BLOCKS, "its own array");
         // Its self-checksum verifies the same way the primary's does.
         let mut scratch = [0u8; BLOCK];
         scratch[..HEADER_LEN].copy_from_slice(&backup[..HEADER_LEN]);
         scratch[16..20].copy_from_slice(&0u32.to_le_bytes());
-        assert_eq!(
-            crc32(&scratch[..HEADER_LEN]),
-            u32::from_le_bytes(backup[16..20].try_into().unwrap())
-        );
+        assert_eq!(crc32(&scratch[..HEADER_LEN]), u32::from_le_bytes(backup[16..20].try_into().unwrap()));
     }
 
     #[test]
@@ -523,10 +501,7 @@ mod tests {
 
         let parts = two_partitions();
         assert_eq!(build(64, GUID, &parts, &mut front, &mut back), Err(BuildError::DiskTooSmall));
-        assert_eq!(
-            build(DISK, GUID, &parts, &mut front[..10], &mut back),
-            Err(BuildError::BufferTooSmall)
-        );
+        assert_eq!(build(DISK, GUID, &parts, &mut front[..10], &mut back), Err(BuildError::BufferTooSmall));
     }
 
     // ---- `sgdisk` as the oracle ----
@@ -579,7 +554,8 @@ mod tests {
     #[test]
     fn sgdisk_names_the_basic_data_type() {
         let path = scratch("basic");
-        std::fs::write(&path, build_disk(&[Partition::new(TYPE_BASIC_DATA, [0x44; 16], 2048, DISK - 40, b"NITROX")])).unwrap();
+        std::fs::write(&path, build_disk(&[Partition::new(TYPE_BASIC_DATA, [0x44; 16], 2048, DISK - 40, b"NITROX")]))
+            .unwrap();
         let info = sgdisk(&["-i", "1"], &path);
         let out = String::from_utf8_lossy(&info.stdout);
         assert!(out.contains("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 (Microsoft basic data)"), "{out}");
@@ -589,15 +565,22 @@ mod tests {
     #[test]
     fn this_crate_reads_a_table_sgdisk_wrote() {
         let path = scratch("read");
-        std::fs::File::create(&path)
-            .unwrap()
-            .set_len(DISK * BLOCK as u64)
-            .unwrap();
+        std::fs::File::create(&path).unwrap().set_len(DISK * BLOCK as u64).unwrap();
         let made = sgdisk(
             &[
                 "--clear",
-                "-n", "1:2048:+48M", "-t", "1:ef00", "-c", "1:NITROX_ESP",
-                "-n", "2:0:0", "-t", "2:8300", "-c", "2:nitrox-root",
+                "-n",
+                "1:2048:+48M",
+                "-t",
+                "1:ef00",
+                "-c",
+                "1:NITROX_ESP",
+                "-n",
+                "2:0:0",
+                "-t",
+                "2:8300",
+                "-c",
+                "2:nitrox-root",
             ],
             &path,
         );
@@ -654,13 +637,7 @@ mod tests {
     fn a_table_with_more_partitions_than_fit_is_refused_not_cut() {
         let mut parts = Vec::new();
         for i in 0..(MAX_PARTITIONS + 1) as u64 {
-            parts.push(Partition::new(
-                TYPE_LINUX_FS,
-                [0x33; 16],
-                2048 + i * 1000,
-                2048 + i * 1000 + 500,
-                b"p",
-            ));
+            parts.push(Partition::new(TYPE_LINUX_FS, [0x33; 16], 2048 + i * 1000, 2048 + i * 1000 + 500, b"p"));
         }
         let mut front = vec![0u8; FRONT_BYTES];
         let mut back = vec![0u8; BACK_BYTES];

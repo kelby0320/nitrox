@@ -48,12 +48,7 @@ pub struct EventRing {
 impl EventRing {
     /// An empty ring.
     pub const fn new() -> Self {
-        Self {
-            buf: [InputEvent { kind: 0, code: 0, value: 0, time_ns: 0 }; RING_EVENTS],
-            head: 0,
-            len: 0,
-            lost: 0,
-        }
+        Self { buf: [InputEvent { kind: 0, code: 0, value: 0, time_ns: 0 }; RING_EVENTS], head: 0, len: 0, lost: 0 }
     }
 
     /// Events currently buffered.
@@ -260,12 +255,7 @@ mod tests {
         let mut r = EventRing::new();
         for i in 0..RING_EVENTS as u16 * 3 {
             r.push(ev(i));
-            assert!(
-                r.lost == 0 || r.len() == RING_EVENTS,
-                "after {i} pushes: lost={} with len={}",
-                r.lost,
-                r.len()
-            );
+            assert!(r.lost == 0 || r.len() == RING_EVENTS, "after {i} pushes: lost={} with len={}", r.lost, r.len());
         }
         assert!(r.lost > 0, "the run overflowed, so the invariant was actually exercised");
     }

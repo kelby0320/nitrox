@@ -125,12 +125,7 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
 }
 
 /// [`measure`], in the text style the enclosing [`Node::Scale`] and [`Node::Bold`] set.
-fn measure_in<M: Metrics + ?Sized, Msg>(
-    e: &Element<Msg>,
-    c: Constraints,
-    m: &M,
-    at: TextStyle,
-) -> Size {
+fn measure_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M, at: TextStyle) -> Size {
     let size = match &e.node {
         Node::Text(s) => m.text_size_as(s, at),
         // Scale and bold change no geometry of their own: their child measures in the new style.
@@ -163,18 +158,12 @@ fn measure_in<M: Metrics + ?Sized, Msg>(
         // to its layers would still contain the popup.
         Node::Offset { dx, dy, child } => {
             let inner = measure_in(child, c, m, at);
-            Size::new(
-                inner.w.saturating_add((*dx).max(0) as u32),
-                inner.h.saturating_add((*dy).max(0) as u32),
-            )
+            Size::new(inner.w.saturating_add((*dx).max(0) as u32), inner.h.saturating_add((*dy).max(0) as u32))
         }
         Node::Sized { size, child } => {
             // Zero means unconstrained, so the child's own measure stands on that axis.
             let inner = measure_in(child, c, m, at);
-            Size::new(
-                if size.w == 0 { inner.w } else { size.w },
-                if size.h == 0 { inner.h } else { size.h },
-            )
+            Size::new(if size.w == 0 { inner.w } else { size.w }, if size.h == 0 { inner.h } else { size.h })
         }
         // Ink changes no geometry, so it measures as its child does.
         Node::Ink { child, .. } => measure_in(child, c, m, at),
@@ -183,10 +172,7 @@ fn measure_in<M: Metrics + ?Sized, Msg>(
         Node::Center { child, .. } => measure_in(child, c, m, at),
         Node::Padding { insets, child } => {
             let inner = measure_in(child, c.shrink(insets.horizontal(), insets.vertical()), m, at);
-            Size::new(
-                inner.w.saturating_add(insets.horizontal()),
-                inner.h.saturating_add(insets.vertical()),
-            )
+            Size::new(inner.w.saturating_add(insets.horizontal()), inner.h.saturating_add(insets.vertical()))
         }
         Node::Column { spacing, children } => {
             let gaps = spacing.saturating_mul(children.len().saturating_sub(1) as u32);
@@ -232,12 +218,7 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
 }
 
 /// [`arrange`], in the text style the enclosing [`Node::Scale`] and [`Node::Bold`] set.
-fn arrange_in<M: Metrics + ?Sized, Msg>(
-    e: &Element<Msg>,
-    rect: Rect,
-    m: &M,
-    at: TextStyle,
-) -> Layout {
+fn arrange_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M, at: TextStyle) -> Layout {
     // `Sized` and `Offset` are the two nodes that change their *own* rectangle rather than
     // only their children's. They have to: hit-testing and damage both read a node's rect, so
     // constraining only the child would leave a 12-pixel scrollbar claiming the whole overlay
@@ -256,12 +237,8 @@ fn arrange_in<M: Metrics + ?Sized, Msg>(
             // what distinguishes this from `Padding`, which shrinks a child into the
             // remainder. A popup is as big as its contents wherever it lands.
             let want = measure_in(child, Constraints::loose(rect.size), m, at);
-            let placed = Rect::new(
-                rect.origin.x.saturating_add(*dx),
-                rect.origin.y.saturating_add(*dy),
-                want.w,
-                want.h,
-            );
+            let placed =
+                Rect::new(rect.origin.x.saturating_add(*dx), rect.origin.y.saturating_add(*dy), want.w, want.h);
             // **Clipped to the parent**, which is what keeps the containment invariant true for
             // this node too. Shifting a child's own rect was enough for the child; the offset
             // node itself could still overhang, and `paint` skips a whole subtree whose rect
@@ -335,12 +312,8 @@ fn arrange_in<M: Metrics + ?Sized, Msg>(
             children.iter().map(|ch| arrange_in(ch, rect, m, at)).collect()
         }
 
-        Node::Column { spacing, children } => {
-            arrange_linear(children, *spacing, rect, m, Axis::Vertical, at)
-        }
-        Node::Row { spacing, children } => {
-            arrange_linear(children, *spacing, rect, m, Axis::Horizontal, at)
-        }
+        Node::Column { spacing, children } => arrange_linear(children, *spacing, rect, m, Axis::Vertical, at),
+        Node::Row { spacing, children } => arrange_linear(children, *spacing, rect, m, Axis::Horizontal, at),
 
         Node::Dock { edges, fill } => {
             let mut remaining = rect;
@@ -523,8 +496,10 @@ mod tests {
     fn meas(e: &Element<Msg>, c: Constraints) -> Size {
         measure(e, c, &CELL)
     }
-    use crate::element::{Insets, center, center_v, column, custom, dock, docked, fill, offset,
-                         padding, row, sized, stack, text, with_spacing};
+    use crate::element::{
+        Insets, center, center_v, column, custom, dock, docked, fill, offset, padding, row, sized, stack, text,
+        with_spacing,
+    };
     use alloc::vec;
     use libdraw::format::Rgb;
 
@@ -566,10 +541,7 @@ mod tests {
 
         // 100 tall, two 16-tall fixed children, two gaps of 4 → the flexed child gets
         // 100 - 32 - 8 = 60. Counting three gaps would leave it 56 and the container short.
-        let c = with_spacing(
-            column(vec![text("a"), text("b"), custom(1, Size::new(0, 0)).flex(1)]),
-            4,
-        );
+        let c = with_spacing(column(vec![text("a"), text("b"), custom(1, Size::new(0, 0)).flex(1)]), 4);
         let l = lay(&c, Rect::new(0, 0, 50, 100));
         assert_eq!(l.children[2].rect, Rect::new(0, 40, 50, 60));
     }
@@ -623,13 +595,17 @@ mod tests {
         // Right-then-top and top-then-right divide the same area differently, and both are
         // correct — which is why the order is the list's, not a fixed precedence.
         let top_first = dock(
-            vec![docked(Edge::Top, sized(Size::new(0, 16), text(""))),
-                 docked(Edge::Right, sized(Size::new(12, 0), text("")))],
+            vec![
+                docked(Edge::Top, sized(Size::new(0, 16), text(""))),
+                docked(Edge::Right, sized(Size::new(12, 0), text(""))),
+            ],
             text(""),
         );
         let right_first = dock(
-            vec![docked(Edge::Right, sized(Size::new(12, 0), text(""))),
-                 docked(Edge::Top, sized(Size::new(0, 16), text("")))],
+            vec![
+                docked(Edge::Right, sized(Size::new(12, 0), text(""))),
+                docked(Edge::Top, sized(Size::new(0, 16), text(""))),
+            ],
             text(""),
         );
         let a = lay(&top_first, Rect::new(0, 0, 100, 100));
@@ -643,10 +619,7 @@ mod tests {
         // Measuring a dock as the sum of its children would leave the filler nothing to
         // fill, which defeats the only reason the node exists.
         let d = dock(vec![docked(Edge::Top, text("x"))], text("y"));
-        assert_eq!(
-            meas(&d, Constraints::loose(Size::new(200, 100))),
-            Size::new(200, 100)
-        );
+        assert_eq!(meas(&d, Constraints::loose(Size::new(200, 100))), Size::new(200, 100));
     }
 
     #[test]
@@ -715,10 +688,7 @@ mod tests {
         assert_eq!(l.children[0].rect, Rect::new(5, 5, 40, 30));
         assert_eq!(l.children[1].rect, Rect::new(5, 5, 40, 30));
         // And it measures as the union, so a menu popup does not shrink its host.
-        assert_eq!(
-            meas(&s, Constraints::loose(Size::new(640, 480))),
-            Size::new(20, 20)
-        );
+        assert_eq!(meas(&s, Constraints::loose(Size::new(640, 480))), Size::new(20, 20));
     }
 
     #[test]
@@ -738,10 +708,7 @@ mod tests {
 
     #[test]
     fn an_offset_child_is_placed_at_its_shift_and_keeps_its_measured_size() {
-        let e: Element<Msg> = stack(vec![
-            fill(Rgb::BLACK),
-            offset(30, 12, sized(Size::new(40, 8), fill(Rgb::BLACK))),
-        ]);
+        let e: Element<Msg> = stack(vec![fill(Rgb::BLACK), offset(30, 12, sized(Size::new(40, 8), fill(Rgb::BLACK)))]);
         let l = lay(&e, Rect::new(0, 0, 200, 100));
         let popup = &l.children[1];
         assert_eq!(popup.rect, Rect::new(30, 12, 40, 8));
@@ -765,8 +732,7 @@ mod tests {
     fn an_offset_is_relative_to_the_parent_not_the_screen() {
         // A popup in a window-level stack must move with the window. Nested inside a padding
         // so the parent's origin is not the screen's.
-        let e: Element<Msg> =
-            padding(Insets::all(5), offset(10, 4, sized(Size::new(8, 8), fill(Rgb::BLACK))));
+        let e: Element<Msg> = padding(Insets::all(5), offset(10, 4, sized(Size::new(8, 8), fill(Rgb::BLACK))));
         let l = lay(&e, Rect::new(100, 200, 80, 60));
         assert_eq!(l.children[0].rect.origin, Point::new(115, 209));
     }
@@ -795,10 +761,13 @@ mod tests {
         let e: Element<Msg> = dock(
             vec![docked(
                 Edge::Top,
-                sized(Size::new(0, 20), row(vec![
-                    sized(Size::new(30, 0), fill(Rgb::BLACK)).key(1),
-                    sized(Size::new(40, 0), fill(Rgb::BLACK)).key(2),
-                ])),
+                sized(
+                    Size::new(0, 20),
+                    row(vec![
+                        sized(Size::new(30, 0), fill(Rgb::BLACK)).key(1),
+                        sized(Size::new(40, 0), fill(Rgb::BLACK)).key(2),
+                    ]),
+                ),
             )],
             fill(Rgb::BLACK),
         );
@@ -825,10 +794,8 @@ mod tests {
         let l0 = lay(&b, Rect::new(0, 0, 200, 100));
         let item = locate(&b, &l0, 2).expect("the item is in the tree");
 
-        let ui: Element<Msg> = stack(vec![
-            bar(),
-            offset(item.origin.x, item.bottom() as i32, sized(Size::new(60, 50), fill(Rgb::BLACK))),
-        ]);
+        let ui: Element<Msg> =
+            stack(vec![bar(), offset(item.origin.x, item.bottom() as i32, sized(Size::new(60, 50), fill(Rgb::BLACK)))]);
         let l = lay(&ui, Rect::new(0, 0, 200, 100));
         let popup = l.children[1].rect;
         assert_eq!(popup.origin, Point::new(30, 20), "the popup is not under its item");

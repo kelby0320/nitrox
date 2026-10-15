@@ -21,21 +21,20 @@
 
 extern crate alloc;
 
-
 use libdraw::geom::{Rect, Size};
 use libdraw::text::{Font, load_mono, load_ui};
 use libkern::debug::Line;
 use libkern::{exit, kprint};
 use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT, Clipboard, MAX_CLIP_BYTES};
-use librsproto::surface::{Role};
+use librsproto::surface::Role;
 
 use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 
 use libui::layout::{Metrics as _, layout};
 use libui::paint::{FontMetrics, Theme};
 
-use libui::window::Child;
 use libui::menu::{Item, KeyOutcome};
+use libui::window::Child;
 use nxedit::{App, Msg, to_bytes};
 
 use alloc::boxed::Box;
@@ -48,7 +47,6 @@ static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Buffers shared with the compositor. Two is the minimum the protocol permits.
 const BUFFERS: usize = 2;
-
 
 /// The suffix a save's temporary carries.
 ///
@@ -65,7 +63,6 @@ fn fail(msg: &[u8]) -> ! {
     unsafe { libkern::syscall1(libkern::SYS_TEST_EXIT, libkern::TEST_EXIT_FAILURE as u64) };
     exit(1);
 }
-
 
 /// Read the file into `app`, or say why it could not be.
 ///
@@ -144,21 +141,12 @@ fn save(ns: u64, path: &str, bytes: &[u8]) -> Result<usize, &'static str> {
     Ok(bytes.len())
 }
 
-
 /// Block until the compositor has something to say.
 fn wait_one(h: u64) {
     let handles = [h];
     let mut results = [0u8; 24];
     // SAFETY: a valid one-handle array and a result buffer sized for one record.
-    unsafe {
-        libkern::syscall4(
-            libkern::SYS_WAIT,
-            handles.as_ptr() as u64,
-            1,
-            results.as_mut_ptr() as u64,
-            u64::MAX,
-        )
-    };
+    unsafe { libkern::syscall4(libkern::SYS_WAIT, handles.as_ptr() as u64, 1, results.as_mut_ptr() as u64, u64::MAX) };
 }
 
 /// Tell the compositor what a newly created window of this editor is.
@@ -220,12 +208,7 @@ fn clip_copy(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
 /// that has walked off the end of it. `Err` carries a sentence the status strip can show, and
 /// **the stale case gets its own**, because a client's answer to it is to start again rather
 /// than to stop.
-fn clip_read(
-    ns: u64,
-    index: u32,
-    expect: u64,
-    out: &mut [u8],
-) -> Result<Option<(u64, usize)>, &'static str> {
+fn clip_read(ns: u64, index: u32, expect: u64, out: &mut [u8]) -> Result<Option<(u64, usize)>, &'static str> {
     let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
     let mut clip = Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
     let r = clip.paste(index, expect, out);
@@ -259,9 +242,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // Where an untitled buffer is saved. The session hands every application its `HOME`; an
     // editor started outside one keeps `/home`, which is what a namespace without a user's
     // subtree still has.
-    let home = alloc::string::String::from(
-        env.field_str("HOME").filter(|h| !h.is_empty()).unwrap_or("/home"),
-    );
+    let home = alloc::string::String::from(env.field_str("HOME").filter(|h| !h.is_empty()).unwrap_or("/home"));
 
     // **From the environment, not from a default** (M11 Part C), and read *before* the font,
     // because since M11 Part D the theme is what names the file to load. It used to sit further
@@ -310,16 +291,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // one is a second value rather than a second copy of this loop.
     let top = {
         let ui = app.view(&theme, None);
-        match Child::open_sized(
-            &mut win,
-            Role::Normal,
-            (0, 0),
-            size,
-            &ui,
-            &font,
-            &theme,
-            BUFFERS,
-        ) {
+        match Child::open_sized(&mut win, Role::Normal, (0, 0), size, &ui, &font, &theme, BUFFERS) {
             Some(t) => t,
             None => fail(b"nxedit: CreateWindow FAILED\n"),
         }
@@ -449,484 +421,473 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // Set by a window that owes a frame *now* — see the sites that set it.
         let mut redraw_now = false;
         for wi in 0..wins.len() {
-        let Win {
-            top,
-            app,
-            // The resize acts on the window whose `Configure` it was, in the dispatch below.
-            size: _,
-            bounds,
-            confirm,
-            confirm_hovered,
-            chooser,
-            chooser_hovered,
-            menu,
-            menu_shown,
-            menu_hovered,
-            reported,
-            reported_name,
-            reported_title,
-            reported_tab,
-        } = &mut wins[wi];
-        let window_id = top.id();
-        // **One line per edit, and it carries a count rather than the text.** A gate driving a
-        // release image cannot read this window — the pixels are the only echo an editor has —
-        // so without a receipt it would type at whatever speed it liked and discover a dropped
-        // keystroke as a wrong file three steps later. What somebody types into an editor is
-        // theirs; the number says a keystroke landed and nothing else.
-        let rev = app.revision();
-        if rev != *reported {
-            *reported = rev;
-            libkern::debug::Line::new().s(b"nxedit: buffer rev ").u(rev).end();
-        }
-        // **And the same for the name field**, which `revision` cannot see: naming a buffer is
-        // not editing it. Without this the seven keystrokes that name an untitled buffer are
-        // unacknowledged, and a dropped one arrives as a file with the wrong name.
-        // Retitled only when it changes, which is what keeps this one message per *switch*
-        // rather than one per frame.
-        let want_title = String::from(window_title(app.path()));
-        if want_title != *reported_title
-            && let Some(mut w) = win.window(window_id)
-        {
-            if w.set_title(&want_title).is_err() {
-                kprint(b"nxedit: SetTitle refused\n");
+            let Win {
+                top,
+                app,
+                // The resize acts on the window whose `Configure` it was, in the dispatch below.
+                size: _,
+                bounds,
+                confirm,
+                confirm_hovered,
+                chooser,
+                chooser_hovered,
+                menu,
+                menu_shown,
+                menu_hovered,
+                reported,
+                reported_name,
+                reported_title,
+                reported_tab,
+            } = &mut wins[wi];
+            let window_id = top.id();
+            // **One line per edit, and it carries a count rather than the text.** A gate driving a
+            // release image cannot read this window — the pixels are the only echo an editor has —
+            // so without a receipt it would type at whatever speed it liked and discover a dropped
+            // keystroke as a wrong file three steps later. What somebody types into an editor is
+            // theirs; the number says a keystroke landed and nothing else.
+            let rev = app.revision();
+            if rev != *reported {
+                *reported = rev;
+                libkern::debug::Line::new().s(b"nxedit: buffer rev ").u(rev).end();
             }
-            *reported_title = want_title;
-        }
-        // **One line per tab the person lands on.** A gate driving a release image cannot see a
-        // strip; what it can see is which file the editor says it is showing, which is the only
-        // thing a tab switch changes that anybody outside can check.
-        let showing = app.current_tab();
-        if showing != *reported_tab {
-            *reported_tab = showing;
-            libkern::debug::Line::new()
-                .s(b"nxedit: tab ")
-                .u(showing)
-                .s(b" showing ")
-                .untrusted(app.path().as_bytes())
-                .end();
-        }
-        let named = app.naming_len();
-        if named != *reported_name {
-            *reported_name = named;
-            if let Some(n) = named {
-                // **The field says which it is** (M12 Part C), because there are two of them
-                // now and a gate waiting on "name so far" while somebody is typing a search
-                // would wait for ever. `Field::label` is the one place that spelling lives.
-                let what = app.field_kind().map_or("field", nxedit::Field::label);
-                libkern::debug::Line::new()
-                    .s(b"nxedit: ")
-                    .s(what.as_bytes())
-                    .s(b" so far ")
-                    .u(n as u64)
-                    .s(b" chars")
-                    .end();
-            }
-        }
-        // ---- render ----
-        // The widget under the pointer, from the router that has always known and that nothing
-        // had ever asked (M11 Part E batch 3).
-        let ui = app.view(&theme, top.hovered_key());
-        let l = layout(&ui, *bounds, &FontMetrics::new(&font, theme.font_px));
-        // Where each menu drops from, read every frame rather than when one opens: a bar word's
-        // position is a fact about the layout, and before the first one there is nowhere to put a
-        // popup at all — which is exactly what "could not open the menu" means without this.
-        app.place_menus(&ui, &l);
-        // **The window is a `libui::window::Child` since M14 Part B**, top-level role and all —
-        // the same value the menu and the dialog below have always been. What this loop keeps is
-        // what a *main* window has and they do not: the `sys_wait`, a `Configure` to answer, and
-        // the layout, which the menu bar's anchors are read from and which is therefore computed
-        // here and handed on rather than computed twice.
-        if !top.present_laid_out(&mut win, &ui, &l, &font, &theme) {
-            fail(b"nxedit: the window could not be drawn\n");
-        }
-
-        // **What a search found, as a line number.** `check-login` boots the release image and
-        // has no rendered window to read; the needle stays the person's business, so the receipt
-        // is where it landed rather than what it was.
-        if let Some(hit) = app.take_find_report() {
-            let mut l = libkern::debug::Line::new();
-            match hit {
-                Some(line) => {
-                    l.s(b"nxedit: find hit at line ").u(line as u64);
-                }
-                None => {
-                    l.s(b"nxedit: find no match");
-                }
-            }
-            l.end();
-        }
-
-        // ---- the menu's window ----
-        //
-        // Opened and destroyed with the menu, and rebuilt when *which* menu is open changes.
-        if *menu_shown != app.menus.open() {
-            if let Some(m) = menu.take() {
-                m.close(&mut win);
-            }
-            *menu_hovered = None;
-            *menu_shown = app.menus.open();
-            if let Some(which) = menu_shown {
-                match app.menus.anchor() {
-                    Some(at) => {
-                        // Measured with no hover: the pointer is over the *bar word* that opened
-                        // this rather than over the popup, and a highlight does not change what a
-                        // menu measures.
-                        let view = app.menu_view(*which, &theme, None);
-                        *menu = Child::open(
-                            &mut win,
-                            Role::Popup { parent: window_id },
-                            at,
-                            &view,
-                            &font,
-                            &theme,
-                            BUFFERS,
-                        );
-                    }
-                    // No anchor yet means no layout yet, which cannot happen after the first
-                    // frame — and if it did, an unplaced menu is better than one at the origin.
-                    None => *menu = None,
-                }
-                if menu.is_none() {
-                    // Not fatal: the editor is usable without its menu, and saying so beats a
-                    // window that silently never appears.
-                    kprint(b"nxedit: could not open the menu\n");
-                    app.menus.close();
-                    *menu_shown = None;
-                }
-            }
-        }
-        if let Some(m) = menu.as_mut() {
-            let now = m.hovered_key();
-            *menu_hovered = now;
-            if let Some(which) = menu_shown {
-                let view = app.menu_view(*which, &theme, now);
-                if !m.present(&mut win, &view, &font, &theme) {
-                    kprint(b"nxedit: the menu could not be drawn\n");
-                }
-            }
-        }
-
-        // ---- the chooser's window ----
-        //
-        // **Listed here, drawn there** (M14 decision 3): `libui::chooser` renders over entries it
-        // is given, and reading a directory is a syscall it cannot make. So the application says
-        // which directory it wants and this does the listing — the same seam the tabs use for
-        // their ttys and `nxfiles` uses for its own panes.
-        // **A chosen file opens in a tab**, which is what `accept_drop` already decided a file
-        // arriving from outside means: the buffers you have open are not given up for it.
-        if let Some(path) = app.take_open()
-            && app.accept_drop(&path)
-        {
-            open_into(app, root_ns, &path);
-        }
-        if let Some(dir) = app.take_chooser_list() {
-            let rows = match libfs::list_dir(root_ns, dir.as_bytes()) {
-                Ok(mut entries) => {
-                    // **Ordered by `libfs`**, which is the point of putting the order there:
-                    // this chooser and the browser cannot come to disagree about one.
-                    libfs::sort(&mut entries, libfs::Order::NameAsc);
-                    entries
-                        .iter()
-                        .filter_map(|e| {
-                            let name = String::from_utf8_lossy(e.name()).into_owned();
-                            // **A leading dot is not shown here either** (M14 Part D). The
-                            // comment above says this chooser and the browser cannot disagree
-                            // about an *order*; they must not disagree about the *set* either,
-                            // and they did the moment `nxfiles` learned to hide — one directory
-                            // listed two ways by two windows of one desktop.
-                            //
-                            // TODO(chooser-hidden): no way to reach one from here. The browser
-                            // has `Ctrl+H`; this has no menu to hang it on and needs its own
-                            // chooser-level toggle. Tracked in the Part D list.
-                            let hidden = name.starts_with('.');
-                            (!name.is_empty() && !hidden).then_some((
-                                name,
-                                e.kind == librsproto::file::DIRENT_KIND_DIR,
-                            ))
-                        })
-                        .collect()
-                }
-                // **An unreadable directory is shown empty rather than refused.** The chooser is
-                // already open and the path strip says where it is looking; closing it would
-                // lose the person's place for a directory they can simply back out of.
-                Err(_) => {
-                    kprint(b"nxedit: could not list that directory\n");
-                    alloc::vec::Vec::new()
-                }
-            };
-            app.show_chooser(&dir, rows);
-            // **And a receipt when an open chooser moves** — Up, or a directory row — which said
-            // nothing until Phase 6 Part F's gate walked one to a stick: the first listing is
-            // announced below with the window it opens, and a move opens no window.
-            if chooser.is_some()
-                && let Some(c) = app.chooser()
+            // **And the same for the name field**, which `revision` cannot see: naming a buffer is
+            // not editing it. Without this the seven keystrokes that name an untitled buffer are
+            // unacknowledged, and a dropped one arrives as a file with the wrong name.
+            // Retitled only when it changes, which is what keeps this one message per *switch*
+            // rather than one per frame.
+            let want_title = String::from(window_title(app.path()));
+            if want_title != *reported_title
+                && let Some(mut w) = win.window(window_id)
             {
+                if w.set_title(&want_title).is_err() {
+                    kprint(b"nxedit: SetTitle refused\n");
+                }
+                *reported_title = want_title;
+            }
+            // **One line per tab the person lands on.** A gate driving a release image cannot see a
+            // strip; what it can see is which file the editor says it is showing, which is the only
+            // thing a tab switch changes that anybody outside can check.
+            let showing = app.current_tab();
+            if showing != *reported_tab {
+                *reported_tab = showing;
                 libkern::debug::Line::new()
-                    .s(b"nxedit: the chooser moved to ")
-                    .untrusted(c.dir.as_bytes())
-                    .s(b" - ")
-                    .u(c.entries.len() as u64)
-                    .s(b" entries")
+                    .s(b"nxedit: tab ")
+                    .u(showing)
+                    .s(b" showing ")
+                    .untrusted(app.path().as_bytes())
                     .end();
             }
-        }
-        match (app.chooser().is_some(), chooser.is_some()) {
-            (true, false) => {
-                // **The receipt names the directory and counts what is in it**, because a chooser
-                // that listed nothing draws exactly like one that listed a directory and opened
-                // over it — the unreadable case above is *deliberately* an empty list. A gate
-                // matching on "a chooser opened" would pass for the failure it exists to catch.
-                if let Some(c) = app.chooser() {
+            let named = app.naming_len();
+            if named != *reported_name {
+                *reported_name = named;
+                if let Some(n) = named {
+                    // **The field says which it is** (M12 Part C), because there are two of them
+                    // now and a gate waiting on "name so far" while somebody is typing a search
+                    // would wait for ever. `Field::label` is the one place that spelling lives.
+                    let what = app.field_kind().map_or("field", nxedit::Field::label);
                     libkern::debug::Line::new()
-                        .s(b"nxedit: choosing a file in ")
+                        .s(b"nxedit: ")
+                        .s(what.as_bytes())
+                        .s(b" so far ")
+                        .u(n as u64)
+                        .s(b" chars")
+                        .end();
+                }
+            }
+            // ---- render ----
+            // The widget under the pointer, from the router that has always known and that nothing
+            // had ever asked (M11 Part E batch 3).
+            let ui = app.view(&theme, top.hovered_key());
+            let l = layout(&ui, *bounds, &FontMetrics::new(&font, theme.font_px));
+            // Where each menu drops from, read every frame rather than when one opens: a bar word's
+            // position is a fact about the layout, and before the first one there is nowhere to put a
+            // popup at all — which is exactly what "could not open the menu" means without this.
+            app.place_menus(&ui, &l);
+            // **The window is a `libui::window::Child` since M14 Part B**, top-level role and all —
+            // the same value the menu and the dialog below have always been. What this loop keeps is
+            // what a *main* window has and they do not: the `sys_wait`, a `Configure` to answer, and
+            // the layout, which the menu bar's anchors are read from and which is therefore computed
+            // here and handed on rather than computed twice.
+            if !top.present_laid_out(&mut win, &ui, &l, &font, &theme) {
+                fail(b"nxedit: the window could not be drawn\n");
+            }
+
+            // **What a search found, as a line number.** `check-login` boots the release image and
+            // has no rendered window to read; the needle stays the person's business, so the receipt
+            // is where it landed rather than what it was.
+            if let Some(hit) = app.take_find_report() {
+                let mut l = libkern::debug::Line::new();
+                match hit {
+                    Some(line) => {
+                        l.s(b"nxedit: find hit at line ").u(line as u64);
+                    }
+                    None => {
+                        l.s(b"nxedit: find no match");
+                    }
+                }
+                l.end();
+            }
+
+            // ---- the menu's window ----
+            //
+            // Opened and destroyed with the menu, and rebuilt when *which* menu is open changes.
+            if *menu_shown != app.menus.open() {
+                if let Some(m) = menu.take() {
+                    m.close(&mut win);
+                }
+                *menu_hovered = None;
+                *menu_shown = app.menus.open();
+                if let Some(which) = menu_shown {
+                    match app.menus.anchor() {
+                        Some(at) => {
+                            // Measured with no hover: the pointer is over the *bar word* that opened
+                            // this rather than over the popup, and a highlight does not change what a
+                            // menu measures.
+                            let view = app.menu_view(*which, &theme, None);
+                            *menu = Child::open(
+                                &mut win,
+                                Role::Popup { parent: window_id },
+                                at,
+                                &view,
+                                &font,
+                                &theme,
+                                BUFFERS,
+                            );
+                        }
+                        // No anchor yet means no layout yet, which cannot happen after the first
+                        // frame — and if it did, an unplaced menu is better than one at the origin.
+                        None => *menu = None,
+                    }
+                    if menu.is_none() {
+                        // Not fatal: the editor is usable without its menu, and saying so beats a
+                        // window that silently never appears.
+                        kprint(b"nxedit: could not open the menu\n");
+                        app.menus.close();
+                        *menu_shown = None;
+                    }
+                }
+            }
+            if let Some(m) = menu.as_mut() {
+                let now = m.hovered_key();
+                *menu_hovered = now;
+                if let Some(which) = menu_shown {
+                    let view = app.menu_view(*which, &theme, now);
+                    if !m.present(&mut win, &view, &font, &theme) {
+                        kprint(b"nxedit: the menu could not be drawn\n");
+                    }
+                }
+            }
+
+            // ---- the chooser's window ----
+            //
+            // **Listed here, drawn there** (M14 decision 3): `libui::chooser` renders over entries it
+            // is given, and reading a directory is a syscall it cannot make. So the application says
+            // which directory it wants and this does the listing — the same seam the tabs use for
+            // their ttys and `nxfiles` uses for its own panes.
+            // **A chosen file opens in a tab**, which is what `accept_drop` already decided a file
+            // arriving from outside means: the buffers you have open are not given up for it.
+            if let Some(path) = app.take_open()
+                && app.accept_drop(&path)
+            {
+                open_into(app, root_ns, &path);
+            }
+            if let Some(dir) = app.take_chooser_list() {
+                let rows = match libfs::list_dir(root_ns, dir.as_bytes()) {
+                    Ok(mut entries) => {
+                        // **Ordered by `libfs`**, which is the point of putting the order there:
+                        // this chooser and the browser cannot come to disagree about one.
+                        libfs::sort(&mut entries, libfs::Order::NameAsc);
+                        entries
+                            .iter()
+                            .filter_map(|e| {
+                                let name = String::from_utf8_lossy(e.name()).into_owned();
+                                // **A leading dot is not shown here either** (M14 Part D). The
+                                // comment above says this chooser and the browser cannot disagree
+                                // about an *order*; they must not disagree about the *set* either,
+                                // and they did the moment `nxfiles` learned to hide — one directory
+                                // listed two ways by two windows of one desktop.
+                                //
+                                // TODO(chooser-hidden): no way to reach one from here. The browser
+                                // has `Ctrl+H`; this has no menu to hang it on and needs its own
+                                // chooser-level toggle. Tracked in the Part D list.
+                                let hidden = name.starts_with('.');
+                                (!name.is_empty() && !hidden)
+                                    .then_some((name, e.kind == librsproto::file::DIRENT_KIND_DIR))
+                            })
+                            .collect()
+                    }
+                    // **An unreadable directory is shown empty rather than refused.** The chooser is
+                    // already open and the path strip says where it is looking; closing it would
+                    // lose the person's place for a directory they can simply back out of.
+                    Err(_) => {
+                        kprint(b"nxedit: could not list that directory\n");
+                        alloc::vec::Vec::new()
+                    }
+                };
+                app.show_chooser(&dir, rows);
+                // **And a receipt when an open chooser moves** — Up, or a directory row — which said
+                // nothing until Phase 6 Part F's gate walked one to a stick: the first listing is
+                // announced below with the window it opens, and a move opens no window.
+                if chooser.is_some()
+                    && let Some(c) = app.chooser()
+                {
+                    libkern::debug::Line::new()
+                        .s(b"nxedit: the chooser moved to ")
                         .untrusted(c.dir.as_bytes())
                         .s(b" - ")
                         .u(c.entries.len() as u64)
                         .s(b" entries")
                         .end();
                 }
-                let view = app.chooser_view(&theme, None);
-                *chooser = Child::open(
-                    &mut win,
-                    Role::Dialog { parent: window_id },
-                    (0, 0),
-                    &view,
-                    &font,
-                    &theme,
-                    BUFFERS,
-                );
-                if chooser.is_none() {
-                    kprint(b"nxedit: could not open the chooser\n");
-                    app.update(Msg::ChooserCancel);
-                }
             }
-            (false, true) => {
-                if let Some(c) = chooser.take() {
-                    c.close(&mut win);
-                }
-                *chooser_hovered = None;
-            }
-            _ => {}
-        }
-        if let Some(c) = chooser.as_mut() {
-            let now = c.hovered_key();
-            *chooser_hovered = now;
-            let view = app.chooser_view(&theme, now);
-            if !c.present(&mut win, &view, &font, &theme) {
-                kprint(b"nxedit: the chooser could not be drawn\n");
-            }
-        }
-
-        // ---- the question's window ----
-        //
-        // **Opened and destroyed with the question**, not shown and hidden: the role is
-        // transient, and there is nothing to keep alive between two closes of the same window.
-        // Reconciled here rather than where `Msg::Close` is handled so that there is exactly one
-        // place that turns `App::confirming` into a window — the alternative is a flag and a
-        // window that can disagree about whether a question is being asked.
-        match (app.confirming(), confirm.is_some()) {
-            (true, false) => {
-                // **Said before the window is asked for, not after it exists.** This used to
-                // carry the dialog's id, which meant printing it once `Child::open` returned —
-                // and that return is *downstream of the shell*, because a dialog's first
-                // `Configure` is held until a manager places it. So the editor's line and the
-                // shell's placement were two processes racing, and which won depended on the
-                // accelerator: TCG gave the shell both, KVM gave the client the second one and
-                // failed the gate that had watched TCG order twice (CI, PR #267).
-                //
-                // Printed here the order is a fact: the editor decides to ask, *then* asks for
-                // a window. The id belongs in the shell's line anyway — it is the shell that
-                // knows where the thing went.
-                kprint(b"nxedit: unsaved buffer - asking before closing\n");
-                // No hover yet: the pointer is wherever it was when the close was asked for, and
-                // this call only measures — which a highlight does not change.
-                let ask = app.confirm_view(&theme, None);
-                *confirm = Child::open(
-                    &mut win,
-                    Role::Dialog { parent: window_id },
-                    // **(0, 0), because this client does not know where it is.** A dialog's
-                    // offset is a *preference* a manager overrides, and `rsproto-surface-ops.md`
-                    // is explicit that a manager can centre a dialog on its parent from what it
-                    // already tracks. A client that guessed would be guessing about a screen it
-                    // has never been told the shape of.
-                    (0, 0),
-                    &ask,
-                    &font,
-                    &theme,
-                    BUFFERS,
-                );
-                // **Unconditional, because `check-login` boots the release image.** A
-                // `test-harness` line does not exist in the binary that gate runs, and the line
-                // above is the only thing that says the editor asked rather than exited. It
-                // names neither the window nor the file: what is on screen is the person's
-                // business, and the path is already in the `opened` line above.
-                if confirm.is_none() {
-                    kprint(b"nxedit: could not open the confirmation dialog\n");
-                    app.confirm_failed();
-                }
-            }
-            (false, true) => {
-                if let Some(c) = confirm.take() {
-                    c.close(&mut win);
-                }
-                // The window is gone, so nothing in it is under the pointer.
-                *confirm_hovered = None;
-            }
-            _ => {}
-        }
-        if let Some(c) = confirm.as_mut() {
-            let now = c.hovered_key();
-            *confirm_hovered = now;
-            let ask = app.confirm_view(&theme, now);
-            if !c.present(&mut win, &ask, &font, &theme) {
-                kprint(b"nxedit: the confirmation dialog could not be drawn\n");
-            }
-        }
-
-        // ---- the requests this frame owes ----
-        if app.take_move_request()
-            && let Some(mut w) = win.window(window_id)
-            && w.start_move().is_err()
-        {
-            kprint(b"nxedit: the compositor refused the move\n");
-        }
-        if let Some(edges) = app.take_resize_request()
-            && let Some(mut w) = win.window(window_id)
-            && w.start_resize(edges).is_err()
-        {
-            kprint(b"nxedit: the compositor refused the resize\n");
-        }
-        // **The dialog's own title bar, on the dialog's own window.** A `StartMove` names a
-        // window id, so this cannot share the branch above: one flag would have moved whichever
-        // window the argument happened to be.
-        if app.take_confirm_move()
-            && let Some(c) = confirm.as_ref()
-            && let Some(mut w) = win.window(c.id())
-            && w.start_move().is_err()
-        {
-            kprint(b"nxedit: the compositor refused the dialog's move\n");
-        }
-        if let Some(state) = app.take_state_request()
-            && let Some(mut w) = win.window(window_id)
-            && w.request_state(state).is_err()
-        {
-            kprint(b"nxedit: the state request was refused\n");
-        }
-        // ---- the clipboard ----
-        //
-        // **Here rather than in `update`**, for the save's reason below: `App::update` is a
-        // function of values and `/dev/clipboard` is IPC.
-        if let Some(req) = app.take_clip_request() {
-            match req {
-                nxedit::ClipRequest::Copy(text) => match clip_copy(root_ns, text.as_bytes()) {
-                    // **A count, never the text.** An editor's buffer is a person's document
-                    // and the serial console is a log file — the same rule the compositor
-                    // follows for keystrokes.
-                    Ok(()) => Line::new()
-                        .s(b"nxedit: copied ")
-                        .u(text.len() as u64)
-                        .s(b" bytes")
-                        .end(),
-                    Err(why) => Line::new().s(b"nxedit: the copy failed: ").s(why.as_bytes()).end(),
-                },
-                // A plain paste always takes the newest, with no serial — decision 3's ordinary
-                // case: copy in one application, paste in another.
-                nxedit::ClipRequest::Paste => {
-                    let mut got = [0u8; MAX_CLIP_BYTES];
-                    match clip_read(root_ns, 0, CLIP_ANY_SERIAL, &mut got) {
-                        Ok(Some((serial, n))) => match core::str::from_utf8(&got[..n]) {
-                            Ok(text) => {
-                                app.pasted(text, 0, serial);
-                                Line::new().s(b"nxedit: pasted ").u(n as u64).s(b" bytes").end();
-                            }
-                            Err(_) => app.cycle_ended("the clipboard is not text"),
-                        },
-                        Ok(None) => app.cycle_ended("the clipboard is empty"),
-                        Err(why) => {
-                            app.cycle_ended("the clipboard refused");
-                            Line::new().s(b"nxedit: the paste failed: ").s(why.as_bytes()).end();
-                        }
+            match (app.chooser().is_some(), chooser.is_some()) {
+                (true, false) => {
+                    // **The receipt names the directory and counts what is in it**, because a chooser
+                    // that listed nothing draws exactly like one that listed a directory and opened
+                    // over it — the unreadable case above is *deliberately* an empty list. A gate
+                    // matching on "a chooser opened" would pass for the failure it exists to catch.
+                    if let Some(c) = app.chooser() {
+                        libkern::debug::Line::new()
+                            .s(b"nxedit: choosing a file in ")
+                            .untrusted(c.dir.as_bytes())
+                            .s(b" - ")
+                            .u(c.entries.len() as u64)
+                            .s(b" entries")
+                            .end();
+                    }
+                    let view = app.chooser_view(&theme, None);
+                    *chooser = Child::open(
+                        &mut win,
+                        Role::Dialog { parent: window_id },
+                        (0, 0),
+                        &view,
+                        &font,
+                        &theme,
+                        BUFFERS,
+                    );
+                    if chooser.is_none() {
+                        kprint(b"nxedit: could not open the chooser\n");
+                        app.update(Msg::ChooserCancel);
                     }
                 }
-                // **A cycle carries the serial it last saw** — decision 3. If the ring moved
-                // under it (a pipeline pushed while somebody was mid-cycle) the server refuses
-                // and the sequence ends here, visibly, rather than pasting a different entry.
-                nxedit::ClipRequest::Cycle => match app.cycling() {
-                    None => app.cycle_ended("nothing to cycle"),
-                    Some(c) => {
+                (false, true) => {
+                    if let Some(c) = chooser.take() {
+                        c.close(&mut win);
+                    }
+                    *chooser_hovered = None;
+                }
+                _ => {}
+            }
+            if let Some(c) = chooser.as_mut() {
+                let now = c.hovered_key();
+                *chooser_hovered = now;
+                let view = app.chooser_view(&theme, now);
+                if !c.present(&mut win, &view, &font, &theme) {
+                    kprint(b"nxedit: the chooser could not be drawn\n");
+                }
+            }
+
+            // ---- the question's window ----
+            //
+            // **Opened and destroyed with the question**, not shown and hidden: the role is
+            // transient, and there is nothing to keep alive between two closes of the same window.
+            // Reconciled here rather than where `Msg::Close` is handled so that there is exactly one
+            // place that turns `App::confirming` into a window — the alternative is a flag and a
+            // window that can disagree about whether a question is being asked.
+            match (app.confirming(), confirm.is_some()) {
+                (true, false) => {
+                    // **Said before the window is asked for, not after it exists.** This used to
+                    // carry the dialog's id, which meant printing it once `Child::open` returned —
+                    // and that return is *downstream of the shell*, because a dialog's first
+                    // `Configure` is held until a manager places it. So the editor's line and the
+                    // shell's placement were two processes racing, and which won depended on the
+                    // accelerator: TCG gave the shell both, KVM gave the client the second one and
+                    // failed the gate that had watched TCG order twice (CI, PR #267).
+                    //
+                    // Printed here the order is a fact: the editor decides to ask, *then* asks for
+                    // a window. The id belongs in the shell's line anyway — it is the shell that
+                    // knows where the thing went.
+                    kprint(b"nxedit: unsaved buffer - asking before closing\n");
+                    // No hover yet: the pointer is wherever it was when the close was asked for, and
+                    // this call only measures — which a highlight does not change.
+                    let ask = app.confirm_view(&theme, None);
+                    *confirm = Child::open(
+                        &mut win,
+                        Role::Dialog { parent: window_id },
+                        // **(0, 0), because this client does not know where it is.** A dialog's
+                        // offset is a *preference* a manager overrides, and `rsproto-surface-ops.md`
+                        // is explicit that a manager can centre a dialog on its parent from what it
+                        // already tracks. A client that guessed would be guessing about a screen it
+                        // has never been told the shape of.
+                        (0, 0),
+                        &ask,
+                        &font,
+                        &theme,
+                        BUFFERS,
+                    );
+                    // **Unconditional, because `check-login` boots the release image.** A
+                    // `test-harness` line does not exist in the binary that gate runs, and the line
+                    // above is the only thing that says the editor asked rather than exited. It
+                    // names neither the window nor the file: what is on screen is the person's
+                    // business, and the path is already in the `opened` line above.
+                    if confirm.is_none() {
+                        kprint(b"nxedit: could not open the confirmation dialog\n");
+                        app.confirm_failed();
+                    }
+                }
+                (false, true) => {
+                    if let Some(c) = confirm.take() {
+                        c.close(&mut win);
+                    }
+                    // The window is gone, so nothing in it is under the pointer.
+                    *confirm_hovered = None;
+                }
+                _ => {}
+            }
+            if let Some(c) = confirm.as_mut() {
+                let now = c.hovered_key();
+                *confirm_hovered = now;
+                let ask = app.confirm_view(&theme, now);
+                if !c.present(&mut win, &ask, &font, &theme) {
+                    kprint(b"nxedit: the confirmation dialog could not be drawn\n");
+                }
+            }
+
+            // ---- the requests this frame owes ----
+            if app.take_move_request()
+                && let Some(mut w) = win.window(window_id)
+                && w.start_move().is_err()
+            {
+                kprint(b"nxedit: the compositor refused the move\n");
+            }
+            if let Some(edges) = app.take_resize_request()
+                && let Some(mut w) = win.window(window_id)
+                && w.start_resize(edges).is_err()
+            {
+                kprint(b"nxedit: the compositor refused the resize\n");
+            }
+            // **The dialog's own title bar, on the dialog's own window.** A `StartMove` names a
+            // window id, so this cannot share the branch above: one flag would have moved whichever
+            // window the argument happened to be.
+            if app.take_confirm_move()
+                && let Some(c) = confirm.as_ref()
+                && let Some(mut w) = win.window(c.id())
+                && w.start_move().is_err()
+            {
+                kprint(b"nxedit: the compositor refused the dialog's move\n");
+            }
+            if let Some(state) = app.take_state_request()
+                && let Some(mut w) = win.window(window_id)
+                && w.request_state(state).is_err()
+            {
+                kprint(b"nxedit: the state request was refused\n");
+            }
+            // ---- the clipboard ----
+            //
+            // **Here rather than in `update`**, for the save's reason below: `App::update` is a
+            // function of values and `/dev/clipboard` is IPC.
+            if let Some(req) = app.take_clip_request() {
+                match req {
+                    nxedit::ClipRequest::Copy(text) => match clip_copy(root_ns, text.as_bytes()) {
+                        // **A count, never the text.** An editor's buffer is a person's document
+                        // and the serial console is a log file — the same rule the compositor
+                        // follows for keystrokes.
+                        Ok(()) => Line::new().s(b"nxedit: copied ").u(text.len() as u64).s(b" bytes").end(),
+                        Err(why) => Line::new().s(b"nxedit: the copy failed: ").s(why.as_bytes()).end(),
+                    },
+                    // A plain paste always takes the newest, with no serial — decision 3's ordinary
+                    // case: copy in one application, paste in another.
+                    nxedit::ClipRequest::Paste => {
                         let mut got = [0u8; MAX_CLIP_BYTES];
-                        let next = c.index + 1;
-                        match clip_read(root_ns, next, c.serial, &mut got) {
+                        match clip_read(root_ns, 0, CLIP_ANY_SERIAL, &mut got) {
                             Ok(Some((serial, n))) => match core::str::from_utf8(&got[..n]) {
                                 Ok(text) => {
-                                    app.cycled(text, next, serial);
-                                    Line::new()
-                                        .s(b"nxedit: cycled to entry ")
-                                        .u(next as u64)
-                                        .end();
+                                    app.pasted(text, 0, serial);
+                                    Line::new().s(b"nxedit: pasted ").u(n as u64).s(b" bytes").end();
                                 }
-                                Err(_) => app.cycle_ended("that entry is not text"),
+                                Err(_) => app.cycle_ended("the clipboard is not text"),
                             },
-                            Ok(None) => app.cycle_ended("no older entry"),
+                            Ok(None) => app.cycle_ended("the clipboard is empty"),
                             Err(why) => {
-                                app.cycle_ended(why);
-                                kprint(b"nxedit: the cycle ended\n");
+                                app.cycle_ended("the clipboard refused");
+                                Line::new().s(b"nxedit: the paste failed: ").s(why.as_bytes()).end();
                             }
                         }
                     }
-                },
+                    // **A cycle carries the serial it last saw** — decision 3. If the ring moved
+                    // under it (a pipeline pushed while somebody was mid-cycle) the server refuses
+                    // and the sequence ends here, visibly, rather than pasting a different entry.
+                    nxedit::ClipRequest::Cycle => match app.cycling() {
+                        None => app.cycle_ended("nothing to cycle"),
+                        Some(c) => {
+                            let mut got = [0u8; MAX_CLIP_BYTES];
+                            let next = c.index + 1;
+                            match clip_read(root_ns, next, c.serial, &mut got) {
+                                Ok(Some((serial, n))) => match core::str::from_utf8(&got[..n]) {
+                                    Ok(text) => {
+                                        app.cycled(text, next, serial);
+                                        Line::new().s(b"nxedit: cycled to entry ").u(next as u64).end();
+                                    }
+                                    Err(_) => app.cycle_ended("that entry is not text"),
+                                },
+                                Ok(None) => app.cycle_ended("no older entry"),
+                                Err(why) => {
+                                    app.cycle_ended(why);
+                                    kprint(b"nxedit: the cycle ended\n");
+                                }
+                            }
+                        }
+                    },
+                }
+                // Round again rather than waiting: the buffer or the status strip has changed and
+                // nothing else is going to arrive to prompt a redraw.
+                // **Round again without waiting**, which is what this `continue` meant
+                // when the body serviced one window. Inside the per-window loop it means
+                // "next window", and the wait below would then block with a frame owed —
+                // the stale-listing bug PR #257 removed, reintroduced by the conversion
+                // (PR #283 review, worth fixing 4). The flag is what carries the old
+                // meaning across the new shape.
+                redraw_now = true;
+                continue;
             }
-            // Round again rather than waiting: the buffer or the status strip has changed and
-            // nothing else is going to arrive to prompt a redraw.
-            // **Round again without waiting**, which is what this `continue` meant
-            // when the body serviced one window. Inside the per-window loop it means
-            // "next window", and the wait below would then block with a frame owed —
-            // the stale-listing bug PR #257 removed, reintroduced by the conversion
-            // (PR #283 review, worth fixing 4). The flag is what carries the old
-            // meaning across the new shape.
-            redraw_now = true;
-            continue;
-        }
 
-        // **The write happens here, not in `update`.** `update` is a function of values; writing
-        // a file is a syscall, so the application says it wants to save and the `main` that owns
-        // the namespace performs it — the same outbox `nxfiles` uses for a directory read.
-        if let Some((key, editing, text)) = app.take_save() {
-            // **The path comes back with the bytes**, from the buffer that asked to be saved.
-            // Reading `app.path()` here answers for whatever tab is current *now* — the top of
-            // the iteration after the whole batch was applied — so a `Ctrl+S` and a tab click in
-            // one drain wrote the other tab's bytes to the other tab's path (PR #270 review).
-            let bytes = to_bytes(&text);
-            let result = save(root_ns, &editing, &bytes);
-            match result {
-                Ok(n) => libkern::debug::Line::new()
-                    .s(b"nxedit: saved ")
-                    .untrusted(editing.as_bytes())
-                    .s(b" - ")
-                    .u(n as u64)
-                    .s(b" bytes")
-                    .end(),
-                Err(why) => libkern::debug::Line::new()
-                    .s(b"nxedit: save FAILED for ")
-                    .untrusted(editing.as_bytes())
-                    .s(b" - ")
-                    .s(why.as_bytes())
-                    .end(),
+            // **The write happens here, not in `update`.** `update` is a function of values; writing
+            // a file is a syscall, so the application says it wants to save and the `main` that owns
+            // the namespace performs it — the same outbox `nxfiles` uses for a directory read.
+            if let Some((key, editing, text)) = app.take_save() {
+                // **The path comes back with the bytes**, from the buffer that asked to be saved.
+                // Reading `app.path()` here answers for whatever tab is current *now* — the top of
+                // the iteration after the whole batch was applied — so a `Ctrl+S` and a tab click in
+                // one drain wrote the other tab's bytes to the other tab's path (PR #270 review).
+                let bytes = to_bytes(&text);
+                let result = save(root_ns, &editing, &bytes);
+                match result {
+                    Ok(n) => libkern::debug::Line::new()
+                        .s(b"nxedit: saved ")
+                        .untrusted(editing.as_bytes())
+                        .s(b" - ")
+                        .u(n as u64)
+                        .s(b" bytes")
+                        .end(),
+                    Err(why) => libkern::debug::Line::new()
+                        .s(b"nxedit: save FAILED for ")
+                        .untrusted(editing.as_bytes())
+                        .s(b" - ")
+                        .s(why.as_bytes())
+                        .end(),
+                }
+                app.saved(key, result);
+                // Round again rather than waiting: the status strip has changed and nothing else is
+                // going to arrive to prompt a redraw.
+                // **Round again without waiting**, which is what this `continue` meant
+                // when the body serviced one window. Inside the per-window loop it means
+                // "next window", and the wait below would then block with a frame owed —
+                // the stale-listing bug PR #257 removed, reintroduced by the conversion
+                // (PR #283 review, worth fixing 4). The flag is what carries the old
+                // meaning across the new shape.
+                redraw_now = true;
+                continue;
             }
-            app.saved(key, result);
-            // Round again rather than waiting: the status strip has changed and nothing else is
-            // going to arrive to prompt a redraw.
-            // **Round again without waiting**, which is what this `continue` meant
-            // when the body serviced one window. Inside the per-window loop it means
-            // "next window", and the wait below would then block with a frame owed —
-            // the stale-listing bug PR #257 removed, reintroduced by the conversion
-            // (PR #283 review, worth fixing 4). The flag is what carries the old
-            // meaning across the new shape.
-            redraw_now = true;
-            continue;
-        }
-
-
         }
 
         // ---- what the windows asked for ----
@@ -1079,14 +1040,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         KeyOutcome::Chose { menu, item: i } => {
                             // **From the outcome rather than from `menu_shown`**, which happened
                             // to be right here and is a second copy of the same fact.
-                            if let Some(msg) = table
-                                .get(menu)
-                                .and_then(|m| m.items.get(i))
-                                .and_then(|it| match it {
-                                    Item::Action { msg, enabled: true, .. } => Some(msg.clone()),
-                                    _ => None,
-                                })
-                            {
+                            if let Some(msg) = table.get(menu).and_then(|m| m.items.get(i)).and_then(|it| match it {
+                                Item::Action { msg, enabled: true, .. } => Some(msg.clone()),
+                                _ => None,
+                            }) {
                                 app.update(msg);
                             }
                             continue;
@@ -1307,15 +1264,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 WindowEvent::InputLost => kprint(b"nxedit: input dropped\n"),
             }
             if resized {
-            *size = app.window_size();
-            // **`Child::resize` reallocates and throws the retained tree away**, which is what a
-            // resize means: a tree diffed against a layout from the old bounds reports damage in
-            // the old coordinates. `Some(false)` is the memory refusing, which leaves the window
-            // at its old size and still drawing.
-            if top.resize(*size) == Some(false) {
-                fail(b"nxedit: impossible window geometry\n");
-            }
-            *bounds = Rect::new(0, 0, size.w, size.h);
+                *size = app.window_size();
+                // **`Child::resize` reallocates and throws the retained tree away**, which is what a
+                // resize means: a tree diffed against a layout from the old bounds reports damage in
+                // the old coordinates. `Some(false)` is the memory refusing, which leaves the window
+                // at its old size and still drawing.
+                if top.resize(*size) == Some(false) {
+                    fail(b"nxedit: impossible window geometry\n");
+                }
+                *bounds = Rect::new(0, 0, size.w, size.h);
             }
         }
     }

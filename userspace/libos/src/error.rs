@@ -23,9 +23,7 @@ impl Error {
     /// or a syscall return). A non-negative `status` is not an error and should not
     /// reach here.
     pub fn from_status(status: i32) -> Error {
-        Error {
-            code: KError::from_i32(status),
-        }
+        Error { code: KError::from_i32(status) }
     }
 
     /// The underlying kernel error.
@@ -93,10 +91,9 @@ impl ErrorKind {
             KError::PeerClosed => ErrorKind::BrokenPipe,
             KError::AlreadyExists => ErrorKind::AlreadyExists,
             KError::NotEmpty => ErrorKind::DirectoryNotEmpty,
-            KError::InvalidHandle
-            | KError::InvalidArgument
-            | KError::FaultFromUser
-            | KError::TooLarge => ErrorKind::InvalidInput,
+            KError::InvalidHandle | KError::InvalidArgument | KError::FaultFromUser | KError::TooLarge => {
+                ErrorKind::InvalidInput
+            }
             KError::OutOfMemory | KError::OutOfHandles => ErrorKind::OutOfMemory,
             KError::Unsupported => ErrorKind::Unsupported,
             KError::IoError | KError::KernelError => ErrorKind::Other,

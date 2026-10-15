@@ -30,7 +30,7 @@
 
 use alloc::vec::Vec;
 
-use fs_server_ext4::{BlockReader, BlockWriter, BlockRun, FsError, ext4};
+use fs_server_ext4::{BlockReader, BlockRun, BlockWriter, FsError, ext4};
 
 /// `ext4_dir_entry_2`'s type byte for a regular file.
 const FT_REG: u8 = 1;
@@ -126,11 +126,7 @@ where
                 _ => return Err(FsError::Unsupported),
             }
         }
-        say(&alloc::format!(
-            "  {} ({} file(s) so far)",
-            core::str::from_utf8(&dir).unwrap_or("?"),
-            out.files
-        ));
+        say(&alloc::format!("  {} ({} file(s) so far)", core::str::from_utf8(&dir).unwrap_or("?"), out.files));
     }
     Ok(out)
 }

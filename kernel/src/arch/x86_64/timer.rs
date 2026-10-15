@@ -73,19 +73,14 @@ pub struct X86Timer;
 
 impl ArchTimer for X86Timer {
     unsafe fn init() {
-        debug_assert!(
-            apic::is_initialised(),
-            "ArchTimer::init before Irq::init — LAPIC MMIO not mapped"
-        );
+        debug_assert!(apic::is_initialised(), "ArchTimer::init before Irq::init — LAPIC MMIO not mapped");
 
         // Warn (do not fail) if the CPU does not advertise an invariant TSC: on
         // such hardware the monotonic clock could drift with P-states. QEMU/TCG
         // does provide a stable TSC, so this is informational in the dev loop.
         let (_, _, _, edx) = regs::cpuid(CPUID_INVARIANT_TSC_LEAF, 0);
         if edx & CPUID_INVARIANT_TSC_BIT == 0 {
-            crate::kprintln!(
-                "timer: WARNING — CPU reports no invariant TSC; monotonic clock may drift"
-            );
+            crate::kprintln!("timer: WARNING — CPU reports no invariant TSC; monotonic clock may drift");
         }
 
         // Free-run the LAPIC timer from max so its current-count decrements
@@ -355,10 +350,7 @@ mod tests {
                 let secs = want / 1_000_000_000 + 1;
                 let tol = secs + 1; // ≤ 1 ns/s, plus a floor-boundary unit
                 let diff = got.abs_diff(want);
-                assert!(
-                    diff <= tol,
-                    "tsc_hz={tsc_hz} delta={delta}: got {got}, want {want}, diff {diff} > tol {tol}"
-                );
+                assert!(diff <= tol, "tsc_hz={tsc_hz} delta={delta}: got {got}, want {want}, diff {diff} > tol {tol}");
             }
         }
     }

@@ -354,8 +354,9 @@ pub fn mouse_layout(desc: &[u8]) -> Option<Layout> {
 pub fn keyboard_layout(desc: &[u8]) -> Option<keyboard::Layout> {
     let mut within = Within::default();
     let mut keys = Keys::default();
-    let is_keyboard =
-        |u: u32| u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYBOARD) || u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYPAD);
+    let is_keyboard = |u: u32| {
+        u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYBOARD) || u == usage_of(PAGE_GENERIC_DESKTOP, USAGE_KEYPAD)
+    };
     let uses_ids = walk(desc, |event| {
         let inside = within.follow(&event, is_keyboard);
         if let Event::Item(item) = event
@@ -595,6 +596,7 @@ mod tests {
 
     /// **QEMU's `usb-mouse`** (`qemu_mouse_hid_report_descriptor`, `hw/usb/dev-hid.c`): five
     /// buttons, three bits of padding, then X, Y and the wheel as signed bytes, with no report ID.
+    #[rustfmt::skip]
     const QEMU_MOUSE: [u8; 52] = [
         0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x05,
         0x15, 0x00, 0x25, 0x01, 0x95, 0x05, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x03, 0x81, 0x01,
@@ -603,6 +605,7 @@ mod tests {
     ];
 
     /// QEMU's `usb-kbd`: a keyboard, not a mouse.
+    #[rustfmt::skip]
     const QEMU_KEYBOARD: [u8; 63] = [
         0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x75, 0x01, 0x95, 0x08, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,
         0x15, 0x00, 0x25, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x05, 0x75, 0x01,
@@ -615,6 +618,7 @@ mod tests {
     /// for each usage 0x00–0x97, and Num, Caps and Scroll Lock as an output — then consumer keys as
     /// report 2, two vendor reports, and a mouse as report 5. It answers boot protocol and sends
     /// report 1 regardless, which is what Part B.7 reads it by.
+    #[rustfmt::skip]
     const K70: [u8; 192] = [
         0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
         0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x19, 0x00, 0x29, 0x97, 0x15, 0x00, 0x25, 0x01,
@@ -653,6 +657,7 @@ mod tests {
     /// — which is walked past.
     #[test]
     fn a_numbered_report_with_twelve_bit_axes() {
+        #[rustfmt::skip]
         let d = [
             0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, // ID 2, Pointer
             0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x95, 0x10, 0x75, 0x01, 0x81, 0x02, // 16 buttons
@@ -664,7 +669,11 @@ mod tests {
         ];
         let l = mouse_layout(&d).expect("a plain mouse");
         assert_eq!(l.report_id, Some(2));
-        assert_eq!(l.buttons, [Some(Field::bit(0)), Some(Field::bit(1)), Some(Field::bit(2))], "the first three of sixteen");
+        assert_eq!(
+            l.buttons,
+            [Some(Field::bit(0)), Some(Field::bit(1)), Some(Field::bit(2))],
+            "the first three of sixteen"
+        );
         assert_eq!((l.x, l.y), (signed(16, 12), signed(28, 12)));
         assert_eq!(l.wheel, Some(signed(40, 8)));
     }
@@ -672,6 +681,7 @@ mod tests {
     /// **16-bit axes and no wheel**: still a mouse, without one.
     #[test]
     fn sixteen_bit_axes_and_no_wheel() {
+        #[rustfmt::skip]
         let d = [
             0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00,
             0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
@@ -772,7 +782,12 @@ mod tests {
         assert_eq!(l.report_id, Some(1));
         assert_eq!(
             l.bits,
-            [Some(Bits { offset: 0, first: 0xE0, count: 8 }), Some(Bits { offset: 8, first: 0, count: 152 }), None, None]
+            [
+                Some(Bits { offset: 0, first: 0xE0, count: 8 }),
+                Some(Bits { offset: 8, first: 0, count: 152 }),
+                None,
+                None
+            ]
         );
         assert_eq!(l.array, None);
         assert_eq!(l.lights, Some(Lights { report_id: Some(1) }));
@@ -817,7 +832,8 @@ mod tests {
             let mut out = [InputEvent::default(); keyboard::EVENTS_MAX];
             let (n, more) = keyboard::decode(&layout, &mut held, r, 7, &mut out).expect("its keyboard report");
             assert!(!more);
-            let keys: Vec<(u16, i32)> = out[..n].iter().filter(|e| e.kind == EV_KEY).map(|e| (e.code, e.value)).collect();
+            let keys: Vec<(u16, i32)> =
+                out[..n].iter().filter(|e| e.kind == EV_KEY).map(|e| (e.code, e.value)).collect();
             assert_eq!(keys, want, "report {r:02x?}");
         }
         assert_eq!(held, keyboard::Held::NONE, "nothing held at the end");
@@ -885,6 +901,7 @@ mod tests {
     /// 1's modifiers and slots.
     #[test]
     fn the_keys_are_the_first_reports() {
+        #[rustfmt::skip]
         let d = [
             0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, // keyboard, report 1
             0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, // modifiers

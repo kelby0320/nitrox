@@ -138,13 +138,7 @@ impl<T, M> Handle<T, M> {
     /// check `M` statically; where cheap, callers should confirm the object type via
     /// `sys_handle_stat` first.
     pub unsafe fn from_raw(raw: RawHandle, extra: Rights) -> Self {
-        Handle {
-            raw,
-            extra,
-            owned: true,
-            _t: PhantomData,
-            _m: PhantomData,
-        }
+        Handle { raw, extra, owned: true, _t: PhantomData, _m: PhantomData }
     }
 
     /// Wrap a raw handle as a typed **borrowed** `Handle` — a non-owning view that is
@@ -156,13 +150,7 @@ impl<T, M> Handle<T, M> {
     /// caller must keep `raw` live for at least as long as the returned borrow, and
     /// must not attenuate it (that would mutate the owner's capability in place).
     pub unsafe fn borrow(raw: RawHandle, extra: Rights) -> Self {
-        Handle {
-            raw,
-            extra,
-            owned: false,
-            _t: PhantomData,
-            _m: PhantomData,
-        }
+        Handle { raw, extra, owned: false, _t: PhantomData, _m: PhantomData }
     }
 
     /// The raw handle (for the raw paths that still need it — spawn ABIs, IPC handle
@@ -195,13 +183,7 @@ impl<T, M> Handle<T, M> {
         let extra = Rights::from_bits(self.extra.bits() & mask);
         let owned = self.owned;
         core::mem::forget(self); // keep the (now-restricted) capability alive under M2
-        Ok(Handle {
-            raw,
-            extra,
-            owned,
-            _t: PhantomData,
-            _m: PhantomData,
-        })
+        Ok(Handle { raw, extra, owned, _t: PhantomData, _m: PhantomData })
     }
 
     /// Drop the `TRANSFER` right (this handle can no longer be sent over IPC).
@@ -274,12 +256,7 @@ mod tests {
     fn attenuation_issues_a_restrict_and_keeps_the_handle() {
         sys::reset();
         // SAFETY: test handle.
-        let h = unsafe {
-            Handle::<Memory, MapReadWrite>::from_raw(
-                RawHandle(5),
-                Rights::TRANSFER | Rights::DUPLICATE,
-            )
-        };
+        let h = unsafe { Handle::<Memory, MapReadWrite>::from_raw(RawHandle(5), Rights::TRANSFER | Rights::DUPLICATE) };
         let h = h.without_transfer().unwrap();
         assert!(!h.extra_rights().contains(Rights::TRANSFER));
         assert!(h.extra_rights().contains(Rights::DUPLICATE));
@@ -295,12 +272,7 @@ mod tests {
     fn into_read_only_drops_map_write() {
         sys::reset();
         // SAFETY: test handle.
-        let h = unsafe {
-            Handle::<Memory, MapReadWrite>::from_raw(
-                RawHandle(9),
-                Rights::MAP_READ | Rights::MAP_WRITE,
-            )
-        };
+        let h = unsafe { Handle::<Memory, MapReadWrite>::from_raw(RawHandle(9), Rights::MAP_READ | Rights::MAP_WRITE) };
         let _ro: Handle<Memory, MapRead> = h.into_read_only().unwrap();
         // Type is now Handle<Memory, MapRead> — a `write` op would not compile.
     }

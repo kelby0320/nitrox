@@ -183,12 +183,7 @@ fn align_up(blocks: u64) -> u64 {
 /// **the rest of the disk** rather than that size: the filesystem inside it stays as big as it
 /// was — growing it is Part H.2's job — and a partition sized to today's filesystem would have
 /// to be moved before it could ever be grown.
-pub fn plan(
-    disk_blocks: u64,
-    block_size: u32,
-    esp_blocks: u64,
-    root_min_blocks: u64,
-) -> Result<Layout, PlanError> {
+pub fn plan(disk_blocks: u64, block_size: u32, esp_blocks: u64, root_min_blocks: u64) -> Result<Layout, PlanError> {
     if block_size != LOGICAL_BLOCK {
         return Err(PlanError::BlockSize(block_size));
     }
@@ -483,10 +478,7 @@ mod tests {
     /// invisible until the firmware reads a table at the wrong offset.
     #[test]
     fn a_disk_that_does_not_address_512_byte_blocks_is_refused() {
-        assert_eq!(
-            plan(2 * 1024 * 1024, 4096, 33 * 2048, 24 * 2048),
-            Err(PlanError::BlockSize(4096))
-        );
+        assert_eq!(plan(2 * 1024 * 1024, 4096, 33 * 2048, 24 * 2048), Err(PlanError::BlockSize(4096)));
     }
 
     use super::withheld::{Device, Mount, Why, Withheld, withheld};
@@ -523,11 +515,8 @@ mod tests {
             dev("blk-7", "partition", "/dev/blk/7", "nitrox-source", "blk-3"),
             dev("kbd-0", "keyboard", "", "", ""),
         ];
-        let mounts = [
-            mount("blk-5", "/storage/nitrox-root", "storage"),
-            mount("blk-6", "/", "init"),
-            mount("blk-7", "", ""),
-        ];
+        let mounts =
+            [mount("blk-5", "/storage/nitrox-root", "storage"), mount("blk-6", "/", "init"), mount("blk-7", "", "")];
         let reachable = ["/dev/blk/2", "/dev/blk/3", "/dev/blk/7"];
         let w = withheld(&devices, &mounts, &reachable);
         assert_eq!(

@@ -21,16 +21,14 @@
 
 extern crate alloc;
 
+use desktop_session_mgr::{GREETER_H, GREETER_PITCH, GREETER_W, Greeter, KEY_ENTER, greeter_theme};
 use libdraw::text::Font;
 use libkern::debug::Line;
 use libkern::*;
 use librsproto::surface::{CreateWindowRequest, Role};
+use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_leader};
 use libsurface::Session;
 use libsurface::ipc::ChannelTransport;
-use desktop_session_mgr::{
-    GREETER_H, GREETER_PITCH, GREETER_W, Greeter, KEY_ENTER, greeter_theme,
-};
-use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_leader};
 
 /// `alloc` backing: the toolkit builds an element tree per frame and `libsession` builds the
 /// session's environment record.
@@ -85,9 +83,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
         return None;
     }
     // SAFETY: maps the object read/write at a kernel-chosen address.
-    let base = unsafe {
-        syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-    };
+    let base = unsafe { syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if base < 0 {
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
@@ -124,9 +120,7 @@ fn recv_handoff(ctrl: u64) -> u64 {
         return 0;
     }
     // SAFETY: the kernel wrote `RECV_COUNT` transferred handles into `RECV_HANDLES`.
-    unsafe {
-        if RECV_COUNT == 0 { 0 } else { RECV_HANDLES[0] }
-    }
+    unsafe { if RECV_COUNT == 0 { 0 } else { RECV_HANDLES[0] } }
 }
 
 /// Buffers for the endpoint handoff.
@@ -168,11 +162,7 @@ fn run_session(
     // namespace binds, here and in every application the shell launches. `None` builds the session
     // without `/dev/views`.
     let mut views_base = [0u8; 24];
-    let opened = if views_sup != 0 {
-        libsession::views_open_session(views_sup, user, &mut views_base)
-    } else {
-        None
-    };
+    let opened = if views_sup != 0 { libsession::views_open_session(views_sup, user, &mut views_base) } else { None };
     let base_len = opened.map_or(0, |v| v.1);
 
     // **No `/dev/console` in a graphical session** — governing decision 3, and this is that
@@ -217,9 +207,7 @@ fn run_session(
     if draw != 0 {
         let path = b"/dev/draw";
         // SAFETY: valid namespace handle, path pointer and endpoint handle.
-        let dr = unsafe {
-            syscall4(SYS_NS_BIND, session_ns, path.as_ptr() as u64, path.len() as u64, draw)
-        };
+        let dr = unsafe { syscall4(SYS_NS_BIND, session_ns, path.as_ptr() as u64, path.len() as u64, draw) };
         if dr != 0 {
             // Non-fatal: the session exists, the shell just cannot draw in it. Say so rather
             // than failing a login the user completed.
@@ -374,8 +362,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // failing here reports the real cause rather than an empty window.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let theme = greeter_theme();
-    let (font, _) = match unsafe { libdraw::text::load_ui(root_ns, &theme, b"desktop-session-mgr") }
-    {
+    let (font, _) = match unsafe { libdraw::text::load_ui(root_ns, &theme, b"desktop-session-mgr") } {
         Ok(loaded) => loaded,
         Err(e) => {
             libkern::debug::Line::new().s(b"desktop-session-mgr: the UI font ").s(e.why()).end();
@@ -459,13 +446,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         unsafe {
             WAIT_HANDLES[0] = ev;
             WAIT_HANDLES[1] = notif;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                2,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 2, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if libsession::drain_for_stop(notif) {
             stop();
@@ -520,9 +501,21 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 let _ = w.destroy();
             }
             let ok = run_session(
-                root_ns, notif, auth_ch, fs_endpoint, profile_endpoint, tty_endpoint,
-                draw_endpoint, clipboard_endpoint, views_endpoint, views_sup, devices_endpoint,
-                storage_endpoint, services_endpoint, &user[..ul], &pass[..pl],
+                root_ns,
+                notif,
+                auth_ch,
+                fs_endpoint,
+                profile_endpoint,
+                tty_endpoint,
+                draw_endpoint,
+                clipboard_endpoint,
+                views_endpoint,
+                views_sup,
+                devices_endpoint,
+                storage_endpoint,
+                services_endpoint,
+                &user[..ul],
+                &pass[..pl],
             );
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.
@@ -585,9 +578,7 @@ fn open_greeter(
     // would is what this window exists to let somebody start — so a `normal` window's origin is
     // its own request, honoured when the compositor gives up waiting for a manager.
     let (x, y) = origin;
-    let window = session
-        .create(&CreateWindowRequest::at(GREETER_W, GREETER_H, Role::Normal, x, y), BUFFERS)
-        .ok()?;
+    let window = session.create(&CreateWindowRequest::at(GREETER_W, GREETER_H, Role::Normal, x, y), BUFFERS).ok()?;
     for i in 0..BUFFERS {
         let (handle, addr) = shared_buffer(len)?;
         addrs[i] = addr;

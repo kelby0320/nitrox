@@ -9,9 +9,9 @@
 //! is the sort of stale rule a reader hits before they find the reasoning (PR #261 review,
 //! finding 1).
 
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -180,14 +180,8 @@ const WITH_WRONG_PASSWORD: &str = "not-the-password-4271";
 /// **Every password `test-interactive` types**, none of which may appear in what the guest prints:
 /// each is typed at a prompt with echo off, and a copy on the console is a copy in every log.
 /// Step 20b checks its two early, so a failure there names the step; this is the whole run's.
-const TYPED_PASSWORDS: &[&str] = &[
-    DEMO_PASSWORD,
-    LOGIN_WRONG_PASSWORD,
-    WITH_WRONG_PASSWORD,
-    BOB_PASSWORD,
-    BOB_NEW_PASSWORD,
-    BOB_MISTYPED_PASSWORD,
-];
+const TYPED_PASSWORDS: &[&str] =
+    &[DEMO_PASSWORD, LOGIN_WRONG_PASSWORD, WITH_WRONG_PASSWORD, BOB_PASSWORD, BOB_NEW_PASSWORD, BOB_MISTYPED_PASSWORD];
 
 /// The greeter's window, `GREETER_W`×`GREETER_H` — **this file's own copy** of
 /// `desktop-session-mgr`'s pair, as every chrome metric here is a copy (M11 decision 2).
@@ -288,9 +282,7 @@ impl BuildMode {
         match self {
             BuildMode::Normal | BuildMode::FbconGate => None,
             BuildMode::Selftest => Some("selftest"),
-            BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq | BuildMode::Bench => {
-                Some("test-harness")
-            }
+            BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq | BuildMode::Bench => Some("test-harness"),
         }
     }
 
@@ -312,10 +304,7 @@ impl BuildMode {
     /// gate asserts comes from `nxterm` — but it made "the same image" false at the point the
     /// comments claimed it.
     fn is_test_harness(self) -> bool {
-        matches!(
-            self,
-            BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq | BuildMode::Bench
-        )
+        matches!(self, BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq | BuildMode::Bench)
     }
 
     /// The same, for the **kernel**, which has one feature userspace does not.
@@ -480,11 +469,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let accel = if rest.iter().any(|a| a == "--kvm") {
-        Accel::Kvm
-    } else {
-        Accel::Tcg
-    };
+    let accel = if rest.iter().any(|a| a == "--kvm") { Accel::Kvm } else { Accel::Tcg };
     let qargs: Vec<String> = rest
         .iter()
         .enumerate()
@@ -500,11 +485,7 @@ fn main() -> ExitCode {
         })
         .map(|(_, a)| a.clone())
         .collect();
-    let mode = if selftest {
-        BuildMode::Selftest
-    } else {
-        BuildMode::Normal
-    };
+    let mode = if selftest { BuildMode::Selftest } else { BuildMode::Normal };
 
     let result = match cmd.as_deref() {
         Some("build") => cmd_build(mode),
@@ -527,16 +508,12 @@ fn main() -> ExitCode {
         // have — landing one in the name slot reports "no preview called `--offline`", which
         // names the wrong problem (PR #261 review, optional 3).
         Some("tune") => cmd_tune(&qargs),
-        Some("preview") => cmd_preview(
-            qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
-        ),
+        Some("preview") => cmd_preview(qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all")),
         // Same positional-argument rule as `preview`, and for the same reason: `--kvm` in the
         // name slot would be reported as "no shot called `--kvm`".
-        Some("shot") => cmd_shot(
-            qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"),
-            accel,
-            gate_size,
-        ),
+        Some("shot") => {
+            cmd_shot(qargs.iter().find(|a| !a.starts_with('-')).map(String::as_str).unwrap_or("all"), accel, gate_size)
+        }
         Some("check-display") => cmd_check_display(accel, gate_size),
         Some("check-terminal") => cmd_check_terminal(accel, gate_size),
         Some("check-login") => cmd_check_login(accel, usb, gate_size),
@@ -573,7 +550,6 @@ fn main() -> ExitCode {
     }
 }
 
-
 // --- Paths --------------------------------------------------------------
 
 fn repo_root() -> PathBuf {
@@ -595,12 +571,7 @@ fn limine_dir() -> PathBuf {
 }
 
 fn kernel_elf() -> PathBuf {
-    repo_root()
-        .join("kernel")
-        .join("target")
-        .join("x86_64-unknown-none")
-        .join("debug")
-        .join("nitrox-kernel")
+    repo_root().join("kernel").join("target").join("x86_64-unknown-none").join("debug").join("nitrox-kernel")
 }
 
 fn image_path() -> PathBuf {
@@ -636,8 +607,7 @@ const COREUTILS: &[&str] = &[
     "service",
     // Stopping or restarting the machine (administration Part E.4d), through the `power` grant the
     // seeded policy gives everyone for it.
-    "shutdown",
-    // Reading the service log back (administration Part E.6), through the `logs` grant.
+    "shutdown", // Reading the service log back (administration Part E.6), through the `logs` grant.
     "log",
 ];
 
@@ -786,10 +756,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // must not have it, because a terminal narrating itself to the kernel log undoes the point
     // of the tty server owning output. A first version passed it unconditionally, so every
     // image shipped the instrumentation (PR #194 review, finding 3).
-    build_userspace_bin(
-        "nxterm",
-        mode.is_test_harness().then_some("test-harness"),
-    )?;
+    build_userspace_bin("nxterm", mode.is_test_harness().then_some("test-harness"))?;
     // The file browser (M10 Part B). A lib/bin split like `nxterm`: the listing, the view and
     // the update are host-tested, the bin is the window and the event pump. No `test-harness`
     // feature — what its gate asserts is the line it prints when it lists a directory, which a
@@ -848,9 +815,7 @@ const USERSPACE_TARGET: &str = "x86_64-unknown-nitrox";
 /// re-resolution.
 fn userspace_cargo() -> Command {
     let mut c = Command::new("cargo");
-    c.env_remove("RUSTUP_TOOLCHAIN")
-        .env_remove("RUSTC")
-        .env_remove("RUSTDOC");
+    c.env_remove("RUSTUP_TOOLCHAIN").env_remove("RUSTC").env_remove("RUSTDOC");
     c
 }
 
@@ -873,10 +838,7 @@ fn arg_userspace_target(c: &mut Command) {
 
 /// Directory holding built userspace release artifacts.
 fn userspace_release_dir() -> PathBuf {
-    repo_root()
-        .join("userspace/target")
-        .join(USERSPACE_TARGET)
-        .join("release")
+    repo_root().join("userspace/target").join(USERSPACE_TARGET).join("release")
 }
 
 /// Path to the built `hello` userspace ELF (release; the kernel embeds this).
@@ -963,14 +925,7 @@ fn cmd_image(mode: BuildMode) -> R<()> {
     let bootx64 = find_bootx64(&limine_root)?;
     let initramfs = initramfs_path();
     build_initramfs(&initramfs, mode)?;
-    assemble_image(
-        &bootx64,
-        &kernel_elf(),
-        &limine_conf(),
-        &initramfs,
-        &image_path(),
-        mode,
-    )?;
+    assemble_image(&bootx64, &kernel_elf(), &limine_conf(), &initramfs, &image_path(), mode)?;
     println!("xtask: image at {}", image_path().display());
     Ok(())
 }
@@ -1165,9 +1120,7 @@ impl DisplaySize {
 
     /// A card's miniature box, border included — the strip is the top bar at the card's scale.
     fn card_h(self) -> i32 {
-        self.scaled_to_card(Self::BAR_H)
-            + self.scaled_to_card(self.h as i32 - Self::BAR_H)
-            + Self::CARD_BORDER * 2
+        self.scaled_to_card(Self::BAR_H) + self.scaled_to_card(self.h as i32 - Self::BAR_H) + Self::CARD_BORDER * 2
     }
 
     /// A whole card: its box, the gap, and the caption beneath.
@@ -1214,8 +1167,7 @@ impl DisplaySize {
     fn window_in_card(self, i: i32, n: i32, w: (i32, i32, u32, u32)) -> (i32, i32) {
         let (cx, cy) = self.card_origin(i, n);
         let sx = self.scaled_to_card(w.0.max(0));
-        let sy = self.scaled_to_card(Self::BAR_H)
-            + self.scaled_to_card(w.1.max(Self::BAR_H) - Self::BAR_H);
+        let sy = self.scaled_to_card(Self::BAR_H) + self.scaled_to_card(w.1.max(Self::BAR_H) - Self::BAR_H);
         let sw = self.scaled_to_card(w.2 as i32).max(2);
         let sh = self.scaled_to_card(w.3 as i32).max(2);
         (cx + Self::CARD_BORDER + sx + sw / 2, cy + Self::CARD_BORDER + sy + sh / 2)
@@ -1723,10 +1675,9 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("tty-server: terminal opened beside another, ")?;
     let open_at_8 = s.rest_of_line()?;
     if open_at_8 != open_at_5 {
-        return Err(format!(
-            "a stage's terminal outlived its stage: {open_at_5} at step 5, {open_at_8} at step 8"
-        )
-        .into());
+        return Err(
+            format!("a stage's terminal outlived its stage: {open_at_5} at step 5, {open_at_8} at step 8").into()
+        );
     }
     s.expect("alice")?;
     s.expect("/home>")?;
@@ -2092,10 +2043,9 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         }
     }
     if !listing.lines().any(|l| l.contains("/dev/blk/0 (") && l.contains("holds the running system")) {
-        return Err(format!(
-            "`with admin nxinstall` did not say /dev/blk/0 holds the running system: {listing:?}"
-        )
-        .into());
+        return Err(
+            format!("`with admin nxinstall` did not say /dev/blk/0 holds the running system: {listing:?}").into()
+        );
     }
     //          **And it said so on the terminal, not on the kernel log.** On this serial console the
     //          two look alike: a program with no `stderr` writes to `kprint`, which is COM1 too, so
@@ -2255,9 +2205,8 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send(DEMO_PASSWORD)?;
     s.expect("shown=")?;
     let counts = s.rest_of_line()?;
-    let read = |label: &str| {
-        counts.split_whitespace().find_map(|w| w.strip_prefix(label)).and_then(|n| n.parse::<u64>().ok())
-    };
+    let read =
+        |label: &str| counts.split_whitespace().find_map(|w| w.strip_prefix(label)).and_then(|n| n.parse::<u64>().ok());
     match (read(""), read("saved=")) {
         (Some(shown), Some(saved)) if shown == saved && shown > 0 => {
             println!("  ok: `with --show` wrote the policy to `stdout`, {shown} lines as its saved copy");
@@ -2293,16 +2242,24 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
         s.expect("/home>")?;
         Ok(())
     };
-    part(s, "e1.txt", &[
-        "[profile.admin]",
-        "grants = [\"disks\", \"storage\", \"views\", \"accounts\"]",
-        "[profile.install]",
-        "grants = [\"disks\"]",
-        "[profile.d2test]",
-        "grants = []",
-    ])?;
+    part(
+        s,
+        "e1.txt",
+        &[
+            "[profile.admin]",
+            "grants = [\"disks\", \"storage\", \"views\", \"accounts\"]",
+            "[profile.install]",
+            "grants = [\"disks\"]",
+            "[profile.d2test]",
+            "grants = []",
+        ],
+    )?;
     part(s, "e2.txt", &["[[rule]]", "who = [\"alice\"]", "use = [\"admin\"]", "run = [\"*\"]", "auth = \"password\""])?;
-    part(s, "e3.txt", &["[[rule]]", "who = [\"alice\"]", "use = [\"install\"]", "run = [\"nxinstall\"]", "auth = \"password\""])?;
+    part(
+        s,
+        "e3.txt",
+        &["[[rule]]", "who = [\"alice\"]", "use = [\"install\"]", "run = [\"nxinstall\"]", "auth = \"password\""],
+    )?;
     part(s, "e4.txt", &["[[rule]]", "who = [\"alice\"]", "use = [\"d2test\"]", "run = [\"nxsh\"]", "auth = \"none\""])?;
     s.send("open ./e1.txt ./e2.txt ./e3.txt ./e4.txt | map { |r| r.line } | save ./edited.txt")?;
     s.expect("/home>")?;
@@ -2315,15 +2272,19 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("d2test-rows=1")?;
     s.expect("/home>")?;
     //      (e) **A copy nobody could administer is refused**: its admin profile has lost `views`.
-    part(s, "orphaned.txt", &[
-        "[profile.admin]",
-        "grants = [\"disks\", \"storage\"]",
-        "[[rule]]",
-        "who = [\"alice\"]",
-        "use = [\"admin\"]",
-        "run = [\"*\"]",
-        "auth = \"password\"",
-    ])?;
+    part(
+        s,
+        "orphaned.txt",
+        &[
+            "[profile.admin]",
+            "grants = [\"disks\", \"storage\"]",
+            "[[rule]]",
+            "who = [\"alice\"]",
+            "use = [\"admin\"]",
+            "run = [\"*\"]",
+            "auth = \"password\"",
+        ],
+    )?;
     admin(s, "with --install ./orphaned.txt")?;
     s.expect("no account that exists could use `views` for every program")?;
     s.expect("/home>")?;
@@ -2594,11 +2555,7 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, usb: bool, size: DisplaySize)
     // sweep itself was added 2026-08-13 for the i8042's one-byte output buffer losing edges —
     // a bug that made every input gate intermittently flaky and was written off as flakiness
     // for weeks.
-    cmd_image(if no_ps2_irq {
-        BuildMode::TestHarnessNoPs2Irq
-    } else {
-        BuildMode::TestHarness
-    })?;
+    cmd_image(if no_ps2_irq { BuildMode::TestHarnessNoPs2Irq } else { BuildMode::TestHarness })?;
     let ovmf = locate_ovmf()?;
     let qmp_sock = build_cache().join("check-input.qmp");
     fs::create_dir_all(build_cache())?;
@@ -2752,8 +2709,6 @@ fn cmd_check_input(accel: Accel, no_ps2_irq: bool, usb: bool, size: DisplaySize)
         .into());
     }
     println!("  ok: {BURST} motions across a stalled consumer arrived in full (widest fold {widest:?})");
-
-
 
     // A key down and up. `a` is scancode 0x1E in set 1, so keycode 30 — chosen because it
     // is in the identity range the decoder relies on, and because a wrong `E0` or release
@@ -3112,14 +3067,7 @@ fn parse_dialog_placement(tail: &str) -> Option<(u32, u32, i32, i32, u32, u32)> 
     let (origin, size) = rest.split_once(' ')?;
     let (x, y) = origin.split_once(',')?;
     let (w, h) = size.trim().split_once('x')?;
-    Some((
-        id.parse().ok()?,
-        parent.parse().ok()?,
-        x.parse().ok()?,
-        y.parse().ok()?,
-        w.parse().ok()?,
-        h.parse().ok()?,
-    ))
+    Some((id.parse().ok()?, parent.parse().ok()?, x.parse().ok()?, y.parse().ok()?, w.parse().ok()?, h.parse().ok()?))
 }
 
 /// Which slot of the taskbar `id` occupies, from the shell's own window-list line.
@@ -3130,9 +3078,7 @@ fn parse_dialog_placement(tail: &str) -> Option<(u32, u32, i32, i32, u32, u32)> 
 /// happened several times. The line is `… [20:nxfiles] [21:notes.txt*]`, so the slot is the
 /// position of the group whose id matches.
 fn taskbar_slot(list: &str, id: u32) -> Option<usize> {
-    list.split('[')
-        .skip(1)
-        .position(|group| group.split_once(':').is_some_and(|(n, _)| n.trim() == id.to_string()))
+    list.split('[').skip(1).position(|group| group.split_once(':').is_some_and(|(n, _)| n.trim() == id.to_string()))
 }
 
 /// Type `text` into the Applications menu's filter, one character at a time, waiting for each.
@@ -3224,14 +3170,7 @@ fn parse_work_area(rest: &str) -> Option<(i32, i32, u32, u32, u32, u32)> {
         return None;
     }
     let (sw, sh) = it.next()?.split_once('x')?;
-    Some((
-        x.parse().ok()?,
-        y.parse().ok()?,
-        w.parse().ok()?,
-        h.parse().ok()?,
-        sw.parse().ok()?,
-        sh.parse().ok()?,
-    ))
+    Some((x.parse().ok()?, y.parse().ok()?, w.parse().ok()?, h.parse().ok()?, sw.parse().ok()?, sh.parse().ok()?))
 }
 
 /// Read `<id> at 0,<y>` — the tail of the shell's placement line. Returns `(id, y)`.
@@ -3298,8 +3237,7 @@ fn parse_geometry_line(rest: &str) -> Option<(u32, i32, i32, u32, u32)> {
 fn next_geometry(session: &mut Session) -> R<(u32, i32, i32, u32, u32)> {
     session.expect("desktop-shell: window ")?;
     let line = session.rest_of_line()?;
-    parse_geometry_line(&line)
-        .ok_or_else(|| format!("could not read a window geometry from {line:?}").into())
+    parse_geometry_line(&line).ok_or_else(|| format!("could not read a window geometry from {line:?}").into())
 }
 
 /// Pin the pointer to the bottom-right corner, then walk it to `(x, y)`.
@@ -3410,17 +3348,12 @@ fn cmd_bench_compose(accel: Accel, size: DisplaySize) -> R<()> {
     // **A generous deadline, because this is deliberately slow work.** Four hundred composed
     // frames under TCG is tens of seconds, and a run that timed out mid-distribution would report
     // a percentile over a truncated tail — which reads as a result rather than as a failure.
-    let done = session
-        .expect_within("compose-bench: done", std::time::Duration::from_secs(300))?;
+    let done = session.expect_within("compose-bench: done", std::time::Duration::from_secs(300))?;
     let transcript = session.finish();
     let path = build_cache().join("guest-transcript-bench-compose.log");
     let _ = fs::write(&path, &transcript);
     if !done {
-        return Err(format!(
-            "the bench did not finish; transcript at {}",
-            path.display()
-        )
-        .into());
+        return Err(format!("the bench did not finish; transcript at {}", path.display()).into());
     }
     report_bench(&transcript)
 }
@@ -3650,9 +3583,8 @@ fn cmd_check_install(accel: Accel, size: DisplaySize) -> R<()> {
     // records a milestone; this asserts none names that device. The assertion is an absence, and
     // what makes an absence mean something here is that the install which followed it succeeded
     // — the same pairing `check-live` and this gate's step 5 make across two gates.
-    if let Some(line) = transcript
-        .lines()
-        .find(|l| l.contains("nxinstall: installing to") && !l.contains("installing to /dev/blk/0 "))
+    if let Some(line) =
+        transcript.lines().find(|l| l.contains("nxinstall: installing to") && !l.contains("installing to /dev/blk/0 "))
     {
         println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
         return Err(format!(
@@ -3751,7 +3683,8 @@ fn check_installed_account(disk: &Path, work: &Path) -> R<()> {
     }
     println!("  ok: /system/users holds {INSTALL_ACCOUNT} alone, at {home}");
     let policy_text = String::from_utf8(read("/system/views.toml")?)?;
-    let policy = view_broker::policy::parse(&policy_text).map_err(|e| format!("/system/views.toml does not read: {e}"))?;
+    let policy =
+        view_broker::policy::parse(&policy_text).map_err(|e| format!("/system/views.toml does not read: {e}"))?;
     let admins = policy.administrators(&[INSTALL_ACCOUNT, DEMO_USER]);
     if admins != [INSTALL_ACCOUNT] {
         return Err(format!("the installed policy makes {admins:?} administrators, not {INSTALL_ACCOUNT} alone").into());
@@ -3832,18 +3765,15 @@ fn check_installed_root(disk: &Path, work: &Path) -> R<()> {
 
     // (1) The oracle. `e2fsck -fn` **exits 0 while reporting problems**, so the output is what
     // is read — the same lesson the crate's own test helper learned (Phase 5 Part H.2).
-    let out = Command::new("e2fsck").args(["-fn", &fs.display().to_string()]).output()
+    let out = Command::new("e2fsck")
+        .args(["-fn", &fs.display().to_string()])
+        .output()
         .map_err(|e| format!("run e2fsck: {e}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if text.contains("? no") || !text.contains(" files (") {
-        return Err(format!(
-            "e2fsck is not happy with the root this install made (partition at LBA {lba}):\n{text}"
-        )
-        .into());
+        return Err(
+            format!("e2fsck is not happy with the root this install made (partition at LBA {lba}):\n{text}").into()
+        );
     }
     println!("  ok: the installed root is e2fsck-clean");
 
@@ -3896,8 +3826,7 @@ fn check_installed_root(disk: &Path, work: &Path) -> R<()> {
         ),
     })?;
     let mut runs = [fs_server_ext4::BlockRun::default(); 8];
-    let n = ext4::map_range(&img, b"/past-group-0", 0, big / 4096 + 1, &mut runs)
-        .map_err(|e| format!("map: {e:?}"))?;
+    let n = ext4::map_range(&img, b"/past-group-0", 0, big / 4096 + 1, &mut runs).map_err(|e| format!("map: {e:?}"))?;
     let highest = runs[..n]
         .iter()
         .filter(|r| r.device_lba != 0)
@@ -3913,18 +3842,15 @@ fn check_installed_root(disk: &Path, work: &Path) -> R<()> {
     }
     let grown = work.join("installed-root-grown.ext4");
     fs::write(&grown, img.0.into_inner())?;
-    let out = Command::new("e2fsck").args(["-fn", &grown.display().to_string()]).output()
+    let out = Command::new("e2fsck")
+        .args(["-fn", &grown.display().to_string()])
+        .output()
         .map_err(|e| format!("run e2fsck: {e}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if text.contains("? no") || !text.contains(" files (") {
         return Err(format!("e2fsck after a cross-group write:\n{text}").into());
     }
-    println!("  ok: a {} file reached block {highest}, past group 0, and stays clean",
-             human_bytes(big));
+    println!("  ok: a {} file reached block {highest}, past group 0, and stays clean", human_bytes(big));
     Ok(())
 }
 
@@ -3940,12 +3866,7 @@ fn human_bytes(n: u64) -> String {
 }
 
 /// The first boot: choose the installer entry, log in graphically, and run the installer.
-fn run_install_steps(
-    session: &mut Session,
-    qmp: &mut Qmp,
-    dump: &Path,
-    identity: &str,
-) -> R<()> {
+fn run_install_steps(session: &mut Session, qmp: &mut Qmp, dump: &Path, identity: &str) -> R<()> {
     // 1. Limine's menu, and its **third** entry.
     let look = |qmp: &mut Qmp| -> R<(u32, u32, Vec<u8>)> {
         qmp.screendump(dump)?;
@@ -4377,11 +4298,7 @@ fn run_live_steps(s: &mut Session) -> R<()> {
         )
         .into());
     }
-    println!(
-        "  ok: mount to greeter in {} ms, within {} ms",
-        took.as_millis(),
-        LIVE_MOUNT_TO_GREETER.as_millis()
-    );
+    println!("  ok: mount to greeter in {} ms, within {} ms", took.as_millis(), LIVE_MOUNT_TO_GREETER.as_millis());
 
     // 4. A login writes, and reads back. **Wait for the prompt by searching the whole
     //    transcript**, not with `expect`: the serial column's `nitrox login:` and the greeter start
@@ -4527,9 +4444,7 @@ fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    println!(
-        "xtask: storage gate — booting the test live image beside a copy of the release disk…\n"
-    );
+    println!("xtask: storage gate — booting the test live image beside a copy of the release disk…\n");
     let mut session = Session::spawn(cmd, "check-storage")?;
     let result = run_storage_steps(&mut session, &disk, &work).and_then(|()| {
         let mut qmp = Qmp::connect(&qmp_sock)?;
@@ -4571,10 +4486,16 @@ const SERVED_EXT4_FEATURES: &str = "^has_journal,^64bit,^metadata_csum,^resize_i
 fn served_ext4(path: &Path, blocks: u64, label: &str) -> R<()> {
     require_tool("mke2fs")?;
     run(Command::new("mke2fs")
-        .arg("-q").arg("-F").arg("-t").arg("ext4")
-        .arg("-O").arg(SERVED_EXT4_FEATURES)
-        .arg("-b").arg("4096")
-        .arg("-L").arg(label)
+        .arg("-q")
+        .arg("-F")
+        .arg("-t")
+        .arg("ext4")
+        .arg("-O")
+        .arg(SERVED_EXT4_FEATURES)
+        .arg("-b")
+        .arg("4096")
+        .arg("-L")
+        .arg(label)
         .arg(path)
         .arg(blocks.to_string()))
 }
@@ -4662,10 +4583,15 @@ fn fat32_stick(path: &Path, work: &Path) -> R<()> {
     write_mbr(path, 2048, count, 0x0C)?;
     let at = format!("{}@@{MIB}", path.display());
     run(mtools_cmd("mformat")
-        .arg("-i").arg(&at)
-        .arg("-F").arg("-c").arg("8")
-        .arg("-T").arg(count.to_string())
-        .arg("-v").arg(STICK_FAT_LABEL)
+        .arg("-i")
+        .arg(&at)
+        .arg("-F")
+        .arg("-c")
+        .arg("8")
+        .arg("-T")
+        .arg(count.to_string())
+        .arg("-v")
+        .arg(STICK_FAT_LABEL)
         .arg("::"))?;
     let mut boot = [0u8; 512];
     let mut f = fs::File::open(path)?;
@@ -4781,10 +4707,15 @@ fn cmd_throughput_stick(args: &[String]) -> R<()> {
     write_mbr(&path, 2048, count, 0x0C)?;
     let at = format!("{}@@{MIB}", path.display());
     run(mtools_cmd("mformat")
-        .arg("-i").arg(&at)
-        .arg("-F").arg("-c").arg("8")
-        .arg("-T").arg(count.to_string())
-        .arg("-v").arg(THROUGHPUT_LABEL)
+        .arg("-i")
+        .arg(&at)
+        .arg("-F")
+        .arg("-c")
+        .arg("8")
+        .arg("-T")
+        .arg(count.to_string())
+        .arg("-v")
+        .arg(THROUGHPUT_LABEL)
         .arg("::"))?;
     let src = build_cache().join("throughput-src");
     let _ = fs::remove_dir_all(&src);
@@ -4867,10 +4798,8 @@ fn check_throughput_stick(img: &Path) -> R<()> {
             bad.push(p.strip_prefix(&out).unwrap_or(p).display().to_string());
         }
     }
-    let present: std::collections::HashSet<String> = found
-        .iter()
-        .filter_map(|p| p.strip_prefix(&out).ok()?.to_str().map(str::to_ascii_uppercase))
-        .collect();
+    let present: std::collections::HashSet<String> =
+        found.iter().filter_map(|p| p.strip_prefix(&out).ok()?.to_str().map(str::to_ascii_uppercase)).collect();
     let missing: Vec<String> = throughput_files()
         .iter()
         .map(|(dir, name, _)| format!("{dir}/{name}"))
@@ -4920,16 +4849,24 @@ fn add_internal_fat(disk: &Path) -> R<()> {
     // The backup GPT to the new end, then the partition in the space between.
     run(Command::new("sgdisk").arg("-e").arg(disk))?;
     run(Command::new("sgdisk")
-        .arg("-n").arg("3:0:0")
-        .arg("-t").arg("3:0700")
-        .arg("-c").arg(format!("3:{INTERNAL_FAT_PARTLABEL}"))
+        .arg("-n")
+        .arg("3:0:0")
+        .arg("-t")
+        .arg("3:0700")
+        .arg("-c")
+        .arg(format!("3:{INTERNAL_FAT_PARTLABEL}"))
         .arg(disk))?;
     let (lba, sectors) = partition_extent(disk, 3)?;
     run(mtools_cmd("mformat")
-        .arg("-i").arg(format!("{}@@{}", disk.display(), lba * 512))
-        .arg("-F").arg("-c").arg("8")
-        .arg("-T").arg(sectors.to_string())
-        .arg("-v").arg(INTERNAL_FAT_LABEL)
+        .arg("-i")
+        .arg(format!("{}@@{}", disk.display(), lba * 512))
+        .arg("-F")
+        .arg("-c")
+        .arg("8")
+        .arg("-T")
+        .arg(sectors.to_string())
+        .arg("-v")
+        .arg(INTERNAL_FAT_LABEL)
         .arg("::"))
 }
 
@@ -5085,9 +5022,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     let admin = |s: &mut Session, command: &str| -> R<()> { with_admin_asked(s, command) };
     admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
     s.expect("fs-server: unmounted; a read-only mount wrote nothing")?;
-    s.expect(&format!(
-        "storage-service: unmounted {ROOT_PARTLABEL}, not left clean (read-only, so as it was found)"
-    ))?;
+    s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, not left clean (read-only, so as it was found)"))?;
     s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
     s.expect("/home>")?;
     // **Still not clean**, and the table says so: it reads the device, not the unmount's word.
@@ -5121,7 +5056,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
                 "{path} is not on the disk at all after `test-pattern --write`: the server's \
                  create did not reach it, so the absence of the pattern would prove nothing"
             )
-            .into())
+            .into());
         }
         Some(b) if b.len() != STORAGE_PATTERN_LEN => {
             return Err(format!(
@@ -5129,14 +5064,14 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
                  with",
                 b.len()
             )
-            .into())
+            .into());
         }
         Some(b) if b == pattern => {
             return Err(format!(
                 "{path} already holds the pattern before any sync or unmount — something wrote it \
                  back, so this gate cannot show that the unmount does"
             )
-            .into())
+            .into());
         }
         Some(_) => {}
     }
@@ -5226,7 +5161,9 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     if !boot.contains("gpt: the disk the machine started from") {
         return Err("the kernel did not flag the live stick as the disk the machine started from".into());
     }
-    if !boot.lines().any(|l| l.contains("storage-service: blk-") && l.contains("; on the disk the machine started from, passed over")) {
+    if !boot.lines().any(|l| {
+        l.contains("storage-service: blk-") && l.contains("; on the disk the machine started from, passed over")
+    }) {
         return Err("the storage service did not say it passed the boot stick over".into());
     }
     println!("  ok: the boot stick is flagged, and passed over");
@@ -5240,11 +5177,14 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     if !boot.lines().any(|l| l.contains("storage-service: blk-") && l.contains(&internal)) {
         return Err(format!("no report of the internal FAT left unmounted: {internal:?}").into());
     }
-    let esp = "(partition NITROX_ESP): fat 'NITROX_ESP', left clean; not served: 512-byte clusters, smaller than a page";
+    let esp =
+        "(partition NITROX_ESP): fat 'NITROX_ESP', left clean; not served: 512-byte clusters, smaller than a page";
     if !boot.lines().any(|l| l.contains("storage-service: blk-") && l.contains(esp)) {
         return Err(format!("no report of the release disk's ESP refused for its clusters: {esp:?}").into());
     }
-    println!("  ok: the internal FAT is servable and not mounted, not being removable; the ESP is refused for its clusters");
+    println!(
+        "  ok: the internal FAT is servable and not mounted, not being removable; the ESP is refused for its clusters"
+    );
 
     // 2. The MBR stick.
     let mbr_img = build_cache().join("check-storage").join("stick-mbr.img");
@@ -5258,15 +5198,29 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
         .ok_or_else(|| format!("no port in {disk_line:?}"))?
         .to_string();
     s.line_since(from, "mbr:  partition 1 lba 2048..", any, secs(60))?;
-    let mounted = line_of(s, from, &format!("(partition partition 1 (unlabelled)): ext4 '{STICK_MBR_LABEL}'; mounted at /storage/{STICK_MBR_LABEL} (rw)"))?;
+    let mounted = line_of(
+        s,
+        from,
+        &format!(
+            "(partition partition 1 (unlabelled)): ext4 '{STICK_MBR_LABEL}'; mounted at /storage/{STICK_MBR_LABEL} (rw)"
+        ),
+    )?;
     let index = blk_of(&mounted)?;
-    line_of(s, from, &format!("(partition partition 2 (unlabelled)): ext4 '{STICK_MBR_LABEL_2}'; mounted at /storage/{STICK_MBR_LABEL_2} (rw)"))?;
+    line_of(
+        s,
+        from,
+        &format!(
+            "(partition partition 2 (unlabelled)): ext4 '{STICK_MBR_LABEL_2}'; mounted at /storage/{STICK_MBR_LABEL_2} (rw)"
+        ),
+    )?;
     println!("  ok: an MBR stick plugged in: its two partitions read, each ext4 mounted writable on a live boot");
     // A pattern on each, written through a mapping and not synced, for the eject to write back.
     let ats = [STICK_MBR_LABEL, STICK_MBR_LABEL_2].map(|l| format!("/storage/{l}/{STORAGE_PATTERN_FILE}"));
     for at in &ats {
         s.send(&format!("test-pattern --write {at}"))?;
-        s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
+        s.expect(&format!(
+            "test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"
+        ))?;
         s.expect("/home>")?;
     }
     // **Refused while a file on the stick is held** — on its *other* partition (PR #367 review):
@@ -5306,7 +5260,8 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
         .ok_or_else(|| format!("no port in {disk_line:?}"))?
         .to_string();
     s.line_since(from, "partitions: no table: neither a GPT nor an MBR", any, secs(60))?;
-    let mounted = line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}'; mounted at /storage/{STICK_WHOLE_LABEL} (rw)"))?;
+    let mounted =
+        line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}'; mounted at /storage/{STICK_WHOLE_LABEL} (rw)"))?;
     let whole = blk_of(&mounted)?;
     println!("  ok: a whole-disk stick plugged in, read as no table, and its ext4 mounted writable as the disk");
     let at = format!("/storage/{STICK_WHOLE_LABEL}/{STORAGE_PATTERN_FILE}");
@@ -5321,7 +5276,12 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     // filesystem clean.
     s.line_since(from, "file: its device has gone; a dirty file and its ", any, secs(30))?;
     s.line_since(from, "fs-server: unmounted, but the filesystem could not be recorded clean", any, secs(30))?;
-    s.line_since(from, &format!("storage-service: {STICK_WHOLE_LABEL} left while mounted; what had not been written back is gone"), any, secs(30))?;
+    s.line_since(
+        from,
+        &format!("storage-service: {STICK_WHOLE_LABEL} left while mounted; what had not been written back is gone"),
+        any,
+        secs(30),
+    )?;
     s.line_since(from, &format!("storage-service: blk-{whole} departed"), any, secs(30))?;
     // **The stick as the pull left it, copied now**, for the host to find still marked in use: the
     // same stick plugged in again below is mounted writable, which marks it in use whatever the
@@ -5333,12 +5293,15 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     if s.transcript()[from..].lines().skip(1).any(|l| l.contains(STICK_WHOLE_LABEL)) {
         return Err(format!("/storage still lists {STICK_WHOLE_LABEL} after its stick was pulled").into());
     }
-    println!("  ok: pulled while mounted: the dirty file let go, the server gone, the label gone, the session going on");
+    println!(
+        "  ok: pulled while mounted: the dirty file let go, the server gone, the label gone, the session going on"
+    );
 
     // 4. Plugged in again: a new disk, a new index, mounted again.
     let from = s.transcript().len();
     plug(qmp, "stickwhole2", "stickwhole")?;
-    let mounted = line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}'; mounted at /storage/{STICK_WHOLE_LABEL} (rw)"))?;
+    let mounted =
+        line_of(s, from, &format!("): ext4 '{STICK_WHOLE_LABEL}'; mounted at /storage/{STICK_WHOLE_LABEL} (rw)"))?;
     let again = blk_of(&mounted)?;
     if again.parse::<u32>().ok() <= whole.parse::<u32>().ok() {
         return Err(format!("plugged in again, the stick took blk-{again}, not an index past blk-{whole}").into());
@@ -5354,7 +5317,9 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     let mounted = line_of(
         s,
         from,
-        &format!("(partition partition 1 (unlabelled)): fat '{STICK_FAT_LABEL}'; mounted at /storage/{STICK_FAT_LABEL} (rw)"),
+        &format!(
+            "(partition partition 1 (unlabelled)): fat '{STICK_FAT_LABEL}'; mounted at /storage/{STICK_FAT_LABEL} (rw)"
+        ),
     )?;
     let fat = blk_of(&mounted)?;
     s.line_since(from, "fs-server: ready (fat, read-write)", any, secs(30))?;
@@ -5393,7 +5358,9 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     s.send(&format!("test-pattern --check {at}"))?;
     s.expect(&format!("test-pattern: {at} holds the pattern, {STORAGE_PATTERN_LEN} bytes ok"))?;
     s.expect("/home>")?;
-    println!("  ok: the host's names listed — long, Unicode, nested — with their sizes, and its pattern read through a mapping");
+    println!(
+        "  ok: the host's names listed — long, Unicode, nested — with their sizes, and its pattern read through a mapping"
+    );
 
     // 6. **Written**, with no remount: a directory made, the Unicode-named file copied into it
     //    under a longer name built from its own — the serial line carries ASCII alone, so the name
@@ -5411,7 +5378,8 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
         // A refusal is a line naming the program, or the shell's own; what each prints on success
         // (`mkdir`'s table of what it created, say) is the host's to judge, after the eject.
         let said = output(s, &command)?;
-        let program = command.split_whitespace().find(|w| ["mkdir", "copy", "rename", "remove"].contains(w)).unwrap_or("nxsh");
+        let program =
+            command.split_whitespace().find(|w| ["mkdir", "copy", "rename", "remove"].contains(w)).unwrap_or("nxsh");
         if said.lines().any(|l| l.contains(&format!("{program}: ")) || l.contains("nxsh: ")) {
             return Err(format!("`{command}` was refused:\n{said}").into());
         }
@@ -5425,7 +5393,9 @@ fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     if !made_names.contains(&copied) || !made_names.contains(&format!("entry={FAT_RENAMED}|file|")) {
         return Err(format!("`list {made}` is not the copy and the rename:\n{made_names}").into());
     }
-    println!("  ok: a directory, a copy to a long Unicode name, a rename and a removal; a file written through a mapping");
+    println!(
+        "  ok: a directory, a copy to a long Unicode name, a rename and a removal; a file written through a mapping"
+    );
 
     // 7. **Ejected and pulled**: the eject writes back and records the filesystem clean.
     eject_stick(s, &[STICK_FAT_LABEL])?;
@@ -5478,16 +5448,19 @@ fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R<()> {
     let secs = std::time::Duration::from_secs;
     let any = |_: &str| true;
     let boot = s.transcript();
-    let report = |part: &str| {
-        boot.lines().find(|l| l.contains("storage-service: blk-") && l.contains(part)).map(str::to_string)
-    };
+    let report =
+        |part: &str| boot.lines().find(|l| l.contains("storage-service: blk-") && l.contains(part)).map(str::to_string);
     let internal = report(&format!("(partition {INTERNAL_FAT_PARTLABEL}):")).ok_or("no report of the internal FAT")?;
     let internal = blk_in(&internal)?;
     // **A partition of the boot stick**, by its parent in `/dev/devices`: the report names the disk
     // as passed over, and its partition by what is in it — the live stick's ESP, by its clusters.
     let boot_disk = boot
         .lines()
-        .find(|l| l.contains("storage-service: blk-") && l.contains("(disk ") && l.contains("; on the disk the machine started from, passed over"))
+        .find(|l| {
+            l.contains("storage-service: blk-")
+                && l.contains("(disk ")
+                && l.contains("; on the disk the machine started from, passed over")
+        })
         .ok_or("no report of the boot stick, passed over")?;
     let boot_disk = blk_in(boot_disk)?;
     s.send(&format!(
@@ -5503,7 +5476,9 @@ fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R<()> {
     };
 
     // 4. The note.
-    s.send(&format!("disk --list | filter name == \"blk-{internal}\" | map {{ |r| format(\"note-is={{}}\", r.note) }}"))?;
+    s.send(&format!(
+        "disk --list | filter name == \"blk-{internal}\" | map {{ |r| format(\"note-is={{}}\", r.note) }}"
+    ))?;
     s.expect("note-is=not removable, so not mounted")?;
     s.expect("/home>")?;
     println!("  ok: `disk --list`'s note says why the internal FAT is not mounted");
@@ -5511,12 +5486,16 @@ fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R<()> {
     // 5. The boot stick, refused before anything is written.
     let from = s.transcript().len();
     with_admin_asked(s, &format!("disk --format blk-{on_stick} fat"))?;
-    s.expect(&format!("disk: blk-{on_stick} not formatted: it is on the disk the machine started from; nothing was written"))?;
+    s.expect(&format!(
+        "disk: blk-{on_stick} not formatted: it is on the disk the machine started from; nothing was written"
+    ))?;
     s.expect("/home>")?;
     if s.transcript()[from..].contains("disk: wrote ") {
         return Err(format!("`disk --format blk-{on_stick}` wrote to the boot stick").into());
     }
-    println!("  ok: a partition of the boot stick is refused before anything is written, naming the disk the machine started from");
+    println!(
+        "  ok: a partition of the boot stick is refused before anything is written, naming the disk the machine started from"
+    );
 
     // 1. The blank stick, formatted ext4 whole.
     let blank = work.join(BLANK_STICK);
@@ -5537,12 +5516,24 @@ fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R<()> {
     let from = s.transcript().len();
     with_admin_asked(s, &format!("disk --format blk-{disk} ext4"))?;
     s.line_since(from, &format!("disk: wrote blk-{disk} ext4 (gpt)"), any, secs(300))?;
-    s.line_since(from, &format!("usb: port {port}: LUN 0: rescanned: 0 partition(s) departed, 1 published"), any, secs(60))?;
+    s.line_since(
+        from,
+        &format!("usb: port {port}: LUN 0: rescanned: 0 partition(s) departed, 1 published"),
+        any,
+        secs(60),
+    )?;
     let mounted = line_after(s, from, "(partition nitrox): ext4 'nitrox'; mounted at /storage/nitrox (rw)")?;
     let gpt_part = blk_in(&mounted)?;
-    s.line_since(from, &format!("disk: blk-{disk} formatted ext4 (gpt): blk-{gpt_part}, mounted at /storage/nitrox"), any, secs(60))?;
+    s.line_since(
+        from,
+        &format!("disk: blk-{disk} formatted ext4 (gpt): blk-{gpt_part}, mounted at /storage/nitrox"),
+        any,
+        secs(60),
+    )?;
     s.expect("/home>")?;
-    println!("  ok: `disk --format blk-{disk} ext4`: a GPT, its partition published by a rescan, an ext4 mounted writable");
+    println!(
+        "  ok: `disk --format blk-{disk} ext4`: a GPT, its partition published by a rescan, an ext4 mounted writable"
+    );
     let at = format!("/storage/nitrox/{STORAGE_PATTERN_FILE}");
     s.send(&format!("test-pattern --write {at}"))?;
     s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
@@ -5555,19 +5546,30 @@ fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R<()> {
     let from = s.transcript().len();
     with_admin_asked(s, &format!("disk --partition blk-{disk}"))?;
     s.line_since(from, &format!("disk: wrote blk-{disk} (mbr)"), any, secs(120))?;
-    s.line_since(from, &format!("usb: port {port}: LUN 0: rescanned: 1 partition(s) departed, 1 published"), any, secs(60))?;
+    s.line_since(
+        from,
+        &format!("usb: port {port}: LUN 0: rescanned: 1 partition(s) departed, 1 published"),
+        any,
+        secs(60),
+    )?;
     s.line_since(from, &format!("storage-service: blk-{gpt_part} departed"), any, secs(60))?;
     let arrived = line_after(s, from, "(partition partition 1 (unlabelled)): no filesystem")?;
     let part = blk_in(&arrived)?;
     s.line_since(from, &format!("disk: blk-{disk} partitioned (mbr): blk-{part}, holding nothing"), any, secs(60))?;
     s.expect("/home>")?;
-    println!("  ok: `disk --partition blk-{disk}`: an MBR, the GPT's blk-{gpt_part} departed, blk-{part} arrived holding nothing");
+    println!(
+        "  ok: `disk --partition blk-{disk}`: an MBR, the GPT's blk-{gpt_part} departed, blk-{part} arrived holding nothing"
+    );
 
     // 3. The partition formatted FAT, written, refused while mounted, ejected, pulled.
     let from = s.transcript().len();
     with_admin_asked(s, &format!("disk --format blk-{part} fat"))?;
     s.line_since(from, &format!("disk: wrote blk-{part} fat"), any, secs(300))?;
-    line_after(s, from, &format!("blk-{part} (partition partition 1 (unlabelled)): fat 'NITROX'; mounted at /storage/NITROX (rw)"))?;
+    line_after(
+        s,
+        from,
+        &format!("blk-{part} (partition partition 1 (unlabelled)): fat 'NITROX'; mounted at /storage/NITROX (rw)"),
+    )?;
     s.line_since(from, &format!("disk: blk-{part} formatted fat: mounted at /storage/NITROX"), any, secs(60))?;
     s.expect("/home>")?;
     println!("  ok: `disk --format blk-{part} fat`: read again and mounted writable by fs-server-fat");
@@ -5643,7 +5645,11 @@ fn check_formatted_stick(ext4_copy: &Path, stick: &Path, work: &Path) -> R<()> {
     let first = u64::from_le_bytes(entry[32..40].try_into()?);
     let last = u64::from_le_bytes(entry[40..48].try_into()?);
     if entry[..16] != linux || first != 2048 || last != sectors - 34 {
-        return Err(format!("the GPT's first entry is not a Linux filesystem from 2048 to {}: {first}..{last}", sectors - 34).into());
+        return Err(format!(
+            "the GPT's first entry is not a Linux filesystem from 2048 to {}: {first}..{last}",
+            sectors - 34
+        )
+        .into());
     }
     // **Every other entry unused** (PR #369 review): entries are 128 bytes, four to a sector, so the
     // second is at LBA 2 + 128 — sixteen zero bytes at LBA 3 are the fifth's type.
@@ -5652,7 +5658,9 @@ fn check_formatted_stick(ext4_copy: &Path, stick: &Path, work: &Path) -> R<()> {
     if let Some(n) = (1..128).find(|&n| array[n * 128..n * 128 + 16] != [0u8; 16]) {
         return Err(format!("the GPT has a partition in entry {n}, beside the one `disk --format` wrote").into());
     }
-    println!("  ok: the ext4 format's table is a GPT, one Linux filesystem partition from 1 MiB to the last usable sector");
+    println!(
+        "  ok: the ext4 format's table is a GPT, one Linux filesystem partition from 1 MiB to the last usable sector"
+    );
     let part = work.join("stick-blank-ext4-part.img");
     carve_sparse(ext4_copy, first * 512, (last - first + 1) * 512, &part)?;
     check_ext4_clean(&part, "the stick's ext4")?;
@@ -5666,7 +5674,10 @@ fn check_formatted_stick(ext4_copy: &Path, stick: &Path, work: &Path) -> R<()> {
     let (kind, first, count) =
         (e[4], u32::from_le_bytes(e[8..12].try_into()?) as u64, u32::from_le_bytes(e[12..16].try_into()?) as u64);
     if mbr[510..512] != [0x55, 0xAA] || kind != 0x0C || first != 2048 || count != sectors - 2048 {
-        return Err(format!("the stick's MBR is not one FAT32 partition from 2048 to the end: type {kind:#04x}, {first}+{count}").into());
+        return Err(format!(
+            "the stick's MBR is not one FAT32 partition from 2048 to the end: type {kind:#04x}, {first}+{count}"
+        )
+        .into());
     }
     if mbr[0x1CE..0x1FE].iter().any(|&b| b != 0) {
         return Err("the stick's MBR names more than one partition".into());
@@ -5674,7 +5685,9 @@ fn check_formatted_stick(ext4_copy: &Path, stick: &Path, work: &Path) -> R<()> {
     if &sector(stick, 1)?[..8] == b"EFI PART" || &sector(stick, sectors - 1)?[..8] == b"EFI PART" {
         return Err("a GPT header outlived the MBR: the kernel could read the stale table".into());
     }
-    println!("  ok: the stick's table is an MBR, one FAT32 partition from 1 MiB, and no GPT header is left at either end");
+    println!(
+        "  ok: the stick's table is an MBR, one FAT32 partition from 1 MiB, and no GPT header is left at either end"
+    );
     let fat = work.join("stick-blank-fat-part.img");
     carve_fat_clean(stick, &fat, "the stick's FAT")?;
     let out = mtools_cmd("mtype").arg("-i").arg(&fat).arg(format!("::{STORAGE_PATTERN_FILE}")).output()?;
@@ -5731,9 +5744,18 @@ fn check_sticks(mbr: &Path, whole: &Path, work: &Path) -> R<()> {
         fs::write(&part, buf)?;
         check_ext4_clean(&part, &format!("the ejected stick's {label}"))?;
         match debugfs_cat(&part, &format!("/{STORAGE_PATTERN_FILE}"))? {
-            Some(b) if b == pattern => println!("  ok: the ejected stick's {label} holds the pattern, read with debugfs"),
-            Some(b) => return Err(format!("the ejected stick's {label} file is {} bytes and not the pattern", b.len()).into()),
-            None => return Err(format!("the ejected stick's {label} has no pattern file: the eject did not write it back").into()),
+            Some(b) if b == pattern => {
+                println!("  ok: the ejected stick's {label} holds the pattern, read with debugfs")
+            }
+            Some(b) => {
+                return Err(format!("the ejected stick's {label} file is {} bytes and not the pattern", b.len()).into());
+            }
+            None => {
+                return Err(format!(
+                    "the ejected stick's {label} has no pattern file: the eject did not write it back"
+                )
+                .into());
+            }
         }
     }
     let state = ext4_s_state(whole)?;
@@ -5832,7 +5854,10 @@ fn check_fat_stick(stick: &Path, work: &Path) -> R<()> {
     }
     let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
     if read(FAT_WRITTEN)? != pattern {
-        return Err(format!("{FAT_WRITTEN} on the FAT stick does not hold the pattern: the eject did not write it back").into());
+        return Err(format!(
+            "{FAT_WRITTEN} on the FAT stick does not hold the pattern: the eject did not write it back"
+        )
+        .into());
     }
     println!("  ok: mdir lists the guest's names, long and Unicode; mtype reads the copy, the rename and the pattern");
     Ok(())
@@ -5960,7 +5985,9 @@ fn cmd_check_media(accel: Accel, size: DisplaySize) -> R<()> {
         .into());
     }
     println!("  ok: mtype reads back what was typed into the editor");
-    println!("\nxtask: a stick plugged into the live desktop appeared in Files, took a file from the editor, and ejected clean ✓");
+    println!(
+        "\nxtask: a stick plugged into the live desktop appeared in Files, took a file from the editor, and ejected clean ✓"
+    );
     Ok(())
 }
 
@@ -5975,10 +6002,15 @@ fn media_stick(path: &Path) -> R<()> {
     write_mbr(path, 2048, count, 0x0C)?;
     let at = format!("{}@@{MIB}", path.display());
     run(mtools_cmd("mformat")
-        .arg("-i").arg(&at)
-        .arg("-F").arg("-c").arg("8")
-        .arg("-T").arg(count.to_string())
-        .arg("-v").arg(MEDIA_LABEL)
+        .arg("-i")
+        .arg(&at)
+        .arg("-F")
+        .arg("-c")
+        .arg("8")
+        .arg("-T")
+        .arg(count.to_string())
+        .arg("-v")
+        .arg(MEDIA_LABEL)
         .arg("::"))?;
     Ok(())
 }
@@ -6061,7 +6093,9 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
         stick.display()
     ))?;
     let from = s.transcript().len();
-    qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"media","bus":"xhci.0","drive":"media"}}"#)?;
+    qmp.execute(
+        r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"media","bus":"xhci.0","drive":"media"}}"#,
+    )?;
     // **No "left clean" on a writable mount's line**, which says nothing of how it was found: the
     // mount has marked it in use (`storage.md` §9).
     s.line_since(from, &format!("fat '{MEDIA_LABEL}'; mounted at /storage/{MEDIA_LABEL} (rw)"), any, secs(60))?;
@@ -6370,9 +6404,7 @@ fn run_shutdown_halt(s: &mut Session, disk: &Path, work: &Path, qmp_sock: &Path,
     shutdown_login(s)?;
     let at = format!("/home/{SHUTDOWN_PATTERN_FILE}");
     s.send(&format!("test-pattern --write {at}"))?;
-    s.expect(&format!(
-        "test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"
-    ))?;
+    s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
     s.expect("/home>")?;
     // **On the host, the file is on the disk and the pattern is not**, as in `check-storage`: so
     // what the host finds after the shutdown, the shutdown put there.
@@ -6386,14 +6418,14 @@ fn run_shutdown_halt(s: &mut Session, disk: &Path, work: &Path, qmp_sock: &Path,
                 "{path} is not on the disk at all after `test-pattern --write`, so the absence of \
                  the pattern would prove nothing"
             )
-            .into())
+            .into());
         }
         Some(b) if b == pattern => {
             return Err(format!(
                 "{path} already holds the pattern before any shutdown — something wrote it back, so \
                  this gate cannot show that the shutdown does"
             )
-            .into())
+            .into());
         }
         Some(_) => {}
     }
@@ -6524,11 +6556,9 @@ fn run_shutdown_reboot(s: &mut Session) -> R<()> {
     s.expect("init: mounted fs-server-ext4 at /")?;
     let after = s.transcript()[reset_at..].to_string();
     if after.contains("the filesystem was not cleanly unmounted last time") {
-        return Err(
-            "the second boot found the root not cleanly unmounted: the reboot's shutdown did not \
+        return Err("the second boot found the root not cleanly unmounted: the reboot's shutdown did not \
              leave it clean"
-                .into(),
-        );
+            .into());
     }
     println!(
         "  ok: `with power shutdown --reboot` reset the machine, and the second boot mounted the \
@@ -6552,11 +6582,7 @@ fn check_ext4_clean(fs_img: &Path, what: &str) -> R<()> {
         .args(["-fn", &fs_img.display().to_string()])
         .output()
         .map_err(|e| format!("run e2fsck: {e}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if text.contains("? no") || !text.contains(" files (") {
         return Err(format!("e2fsck is not happy with {what}:\n{text}").into());
     }
@@ -6967,7 +6993,9 @@ fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
                     press(&mut qmp, "spc")?;
                     deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
                 } else if index > pages.len() + 1 {
-                    return Err(format!("page {index}/{of} came up after page {} — one went by unread", pages.len()).into());
+                    return Err(
+                        format!("page {index}/{of} came up after page {} — one went by unread", pages.len()).into()
+                    );
                 }
             }
         } else if console_seen && frame.text_cells == 0 {
@@ -6997,8 +7025,7 @@ fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // 3. The facts, from the pages alone — the framebuffer's at the size this gate booted, with no
     //    padding, which is all QEMU can give (`DisplaySize`).
     let lines: Vec<&str> = pages.iter().flatten().map(String::as_str).collect();
-    let framebuffer =
-        format!("framebuffer: {}x{} pitch {} padding 0 bpp 32", size.w, size.h, size.w * 4);
+    let framebuffer = format!("framebuffer: {}x{} pitch {} padding 0 bpp 32", size.w, size.h, size.w * 4);
     let framebuffer: &[&str] = &[&framebuffer];
     // Under `--usb` the machine has no i8042 and a keyboard and mouse beside the stick, so the
     // FADT's fact and the first round's count are the other ones.
@@ -7007,12 +7034,22 @@ fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     let usb_facts: &[&[&str]] = if usb { USB_INPUT_FACTS } else { &[] };
     let missing = missing_facts(
         &lines,
-        EMULATED_MACHINE_FACTS.iter().chain(REPORT_FACTS).filter(replaced).chain(usb_facts).copied().chain([framebuffer]),
+        EMULATED_MACHINE_FACTS
+            .iter()
+            .chain(REPORT_FACTS)
+            .filter(replaced)
+            .chain(usb_facts)
+            .copied()
+            .chain([framebuffer]),
     );
     if !missing.is_empty() {
         let read: Vec<String> =
             pages.iter().enumerate().map(|(i, p)| format!("--- page {} ---\n{}", i + 1, p.join("\n"))).collect();
-        return Err(format!("the report's {n} page(s) do not say: {missing:?}. The pages as read:\n{}", read.join("\n")).into());
+        return Err(format!(
+            "the report's {n} page(s) do not say: {missing:?}. The pages as read:\n{}",
+            read.join("\n")
+        )
+        .into());
     }
     println!(
         "  ok: the pages say what this machine is — a declined AHCI controller, the module disk, the stick \
@@ -7050,7 +7087,9 @@ fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     println!("  ok: after the last page the boot went on, and the console handed the screen over");
 
     let _ = fs::remove_file(&qmp_sock);
-    println!("\nxtask: the hardware report is chosen from the menu, held a page at a time, and read with no serial port ✓");
+    println!(
+        "\nxtask: the hardware report is chosen from the menu, held a page at a time, and read with no serial port ✓"
+    );
     Ok(())
 }
 
@@ -7094,9 +7133,7 @@ fn cmd_check_resolutions(accel: Accel) -> R<()> {
             if matches!(accel, Accel::Kvm) {
                 cmd.arg("--kvm");
             }
-            cmd.env("NITROX_KEEP_TRANSCRIPT", &transcript_path)
-                .stdout(out.try_clone()?)
-                .stderr(out);
+            cmd.env("NITROX_KEEP_TRANSCRIPT", &transcript_path).stdout(out.try_clone()?).stderr(out);
             let started = std::time::Instant::now();
             let passed = cmd.status().map_err(|e| format!("run {gate}: {e}"))?.success();
             let transcript = fs::read_to_string(&transcript_path).unwrap_or_default();
@@ -7134,8 +7171,7 @@ fn cmd_check_resolutions(accel: Accel) -> R<()> {
         println!("\nxtask: every gate passed at every size ✓");
         Ok(())
     } else {
-        Err(format!("{} run(s) failed: {} — see {}", failed.len(), failed.join(", "), dir.display())
-            .into())
+        Err(format!("{} run(s) failed: {} — see {}", failed.len(), failed.join(", "), dir.display()).into())
     }
 }
 
@@ -7429,9 +7465,7 @@ fn logout_gate_stopped_in_time(transcript: &str) -> R<()> {
     if transcript.contains("desktop-shell is still running after it was asked to stop")
         || !transcript.contains("desktop-shell: asked to stop, exiting")
     {
-        return Err(
-            "the shell outlived its supervisor's bound: its own wait for the windows must end first".into(),
-        );
+        return Err("the shell outlived its supervisor's bound: its own wait for the windows must end first".into());
     }
     Ok(())
 }
@@ -7624,7 +7658,9 @@ fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
         )
         .into());
     }
-    println!("  ok: held at the handout — a line init printed bringing its services up, and \"compositor: up\", on one screen");
+    println!(
+        "  ok: held at the handout — a line init printed bringing its services up, and \"compositor: up\", on one screen"
+    );
 
     // 2. The console let go. Every service keeps printing through all of this — the greeter's
     //    redraws, the heartbeat — so a console still drawing would put text over the desktop.
@@ -7645,7 +7681,10 @@ fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
             .into());
         }
     }
-    println!("  ok: the compositor has the screen, and {dumps} dumps over {}s found no console text on it", SETTLE.as_secs());
+    println!(
+        "  ok: the compositor has the screen, and {dumps} dumps over {}s found no console text on it",
+        SETTLE.as_secs()
+    );
 
     // 3. A stop takes it back.
     qmp.send_key("f10", true)?;
@@ -8008,8 +8047,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // are not being counted and every maximised window will sit under the bars.
     session.expect("desktop-shell: work area ")?;
     let work_line = session.rest_of_line()?;
-    let work = parse_work_area(&work_line)
-        .ok_or_else(|| format!("could not read the work area from {work_line:?}"))?;
+    let work = parse_work_area(&work_line).ok_or_else(|| format!("could not read the work area from {work_line:?}"))?;
     if work.3 >= work.5 {
         return Err(format!(
             "the work area is as tall as the screen ({work_line}) — the shell's bars declare \
@@ -8029,9 +8067,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // distinguishes desktop entries from the `/bin` listing they replaced: a regression to
     // listing every program would still open the menu, still match `nxterm`, and still launch it,
     // so every other expectation in this gate holds under both behaviours.
-    session.expect(&format!(
-        "desktop-shell: /applications lists {STAGED_APPLICATIONS} application(s)"
-    ))?;
+    session.expect(&format!("desktop-shell: /applications lists {STAGED_APPLICATIONS} application(s)"))?;
     // After it, because the chord is registered on the loop's first pass and the entries
     // are read before the loop. `expect` scans forward, so asserting these out of order times
     // out on a line already behind the cursor.
@@ -8115,8 +8151,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // `<id> at 0,<y>`; nothing moves this window between here and there — a desktop change and a
     // minimise leave the origin alone — so this is its origin at that point.
     let placed = session.rest_of_line()?;
-    let (term_id, term_x, term_y) = parse_placement(&placed)
-        .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
+    let (term_id, term_x, term_y) =
+        parse_placement(&placed).ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
     // Its width, which the title bar's buttons are measured from — **before the window-list
     // line**, which follows it: an `expect` scans forward, so asserting the list first would
     // consume past the geometry this needs.
@@ -8156,10 +8192,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     click_at(&mut qmp, &mut session, maximise_at.0, maximise_at.1)?;
     // **In any order**: `nxterm` logs its request after the compositor answers, and the compositor
     // answers once it has forwarded it, so the shell's line can come first (PR #353's CI).
-    let maximised = format!(
-        "desktop-shell: maximize window {term_id} to {},{} {}x{}",
-        work.0, work.1, work.2, work.3
-    );
+    let maximised = format!("desktop-shell: maximize window {term_id} to {},{} {}x{}", work.0, work.1, work.2, work.3);
     session.expect_all(&["nxterm: asked the shell for window state 2", &maximised])?;
     println!("  ok: maximise asked for the work area, not the screen");
 
@@ -8176,10 +8209,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // is printed when the `Configure` arrives; the window is still its old size until the frame
     // after that is drawn and committed. Clicking on the strength of the first line lands
     // outside the window — `win=none` — which is what the first run of this step did.
-    session.expect(&format!(
-        "desktop-shell: window {term_id} geometry {},{} {}x{}",
-        work.0, work.1, work.2, work.3
-    ))?;
+    session.expect(&format!("desktop-shell: window {term_id} geometry {},{} {}x{}", work.0, work.1, work.2, work.3))?;
     click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - chrome::MAXIMISE_X, work.1 + chrome::TITLE_Y)?;
     // **In any order**: `nxterm` logs its request after the compositor answers, and the compositor
     // answers once it has forwarded it, so the shell's line can come first (PR #353's CI).
@@ -8282,13 +8312,12 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     session.expect("desktop-shell: placed window ")?;
     let replaced = session.rest_of_line()?;
-    let (term_id, term_x, term_y) = parse_placement(&replaced).ok_or_else(|| {
-        format!("could not read the replacement terminal's placement from {replaced:?}")
-    })?;
+    let (term_id, term_x, term_y) = parse_placement(&replaced)
+        .ok_or_else(|| format!("could not read the replacement terminal's placement from {replaced:?}"))?;
     session.expect(&format!("desktop-shell: window {term_id} geometry "))?;
     let regeom = session.rest_of_line()?;
-    let (term_w, _term_h) = parse_geometry(&regeom)
-        .ok_or_else(|| format!("could not read the replacement's geometry from {regeom:?}"))?;
+    let (term_w, _term_h) =
+        parse_geometry(&regeom).ok_or_else(|| format!("could not read the replacement's geometry from {regeom:?}"))?;
 
     // 6. **And the top bar still works.** The modal used to be opened once and never closed,
     //    so it stayed on top of whatever was launched and the bar's click handler — gated on
@@ -8345,7 +8374,6 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // when the routed record is delivered — so the dismissal comes *first*, and `click_at`'s own
     // position assertion has already scanned past it. Same rule this gate applies to every line
     // whose order is an implementation detail rather than a claim.
-
 
     click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: minimized window ")?;
@@ -8817,11 +8845,15 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // **From where it started, not from zero.** A drag moves a window by what was injected, and
     // the destination is its origin plus that — which was the same number only while the cascade
     // placed every window at x=0 (M11 Part E batch 4).
-    expect_after_pointer(&mut qmp, &mut session, &format!(
-        "desktop-shell: window {term_id} geometry {},{} ",
-        term_x + DRAG_STEPS * DRAG_DX,
-        term_y + DRAG_STEPS * DRAG_DY
-    ))?;
+    expect_after_pointer(
+        &mut qmp,
+        &mut session,
+        &format!(
+            "desktop-shell: window {term_id} geometry {},{} ",
+            term_x + DRAG_STEPS * DRAG_DX,
+            term_y + DRAG_STEPS * DRAG_DY
+        ),
+    )?;
     println!("  ok: the terminal moved with its own title bar, offset by where it was grabbed");
 
     // **And maximising it now *moves* it, which is the half a `Configure` was not applying.**
@@ -8857,21 +8889,14 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // The client's line says what it did with the size *and* what that came to in cells, which
     // is the difference between a window that grew and a terminal that can use the room: a grid
     // still 80x24 in a 1280x752 window would satisfy every other line here.
-    let maximised = format!(
-        "desktop-shell: maximize window {term_id} to {},{} {}x{}",
-        work.0, work.1, work.2, work.3
-    );
+    let maximised = format!("desktop-shell: maximize window {term_id} to {},{} {}x{}", work.0, work.1, work.2, work.3);
     let moved = format!("desktop-shell: window {term_id} geometry {},{} ", work.0, work.1);
     let took = format!("nxterm: resized to {}x{}, grid ", work.2, work.3);
     session.expect_all(&["nxterm: asked the shell for window state 2", &maximised, &moved, &took])?;
     // And the committed geometry — the one the compositor reports and `/dev/draw/<id>/info`
     // answers with — is the work area exactly, not the work area rounded down to whole cells.
-    session.expect(&format!(
-        "desktop-shell: window {term_id} geometry {},{} {}x{}",
-        work.0, work.1, work.2, work.3
-    ))?;
+    session.expect(&format!("desktop-shell: window {term_id} geometry {},{} {}x{}", work.0, work.1, work.2, work.3))?;
     println!("  ok: maximise moved the window and the client committed the work area exactly");
-
 
     // 6j. **The window is dragged smaller by its own corner** (M9 Part E). The grip is pixels
     //     `nxterm` committed, like the title bar; what crosses the wire is one `StartResize`,
@@ -8910,29 +8935,26 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
         qmp.send_motion(RESIZE_DX, RESIZE_DY)?;
     }
     qmp.send_button("left", false)?;
-    qmp.pointer = Some((
-        grip_at.0 + RESIZE_STEPS * RESIZE_DX,
-        grip_at.1 + RESIZE_STEPS * RESIZE_DY,
-    ));
-    expect_after_pointer(&mut qmp, &mut session, &format!(
-        "compositor: interactive resize of window {term_id} ended at {},{} {resized_w}x{resized_h}",
-        work.0, work.1
-    ))?;
+    qmp.pointer = Some((grip_at.0 + RESIZE_STEPS * RESIZE_DX, grip_at.1 + RESIZE_STEPS * RESIZE_DY));
+    expect_after_pointer(
+        &mut qmp,
+        &mut session,
+        &format!(
+            "compositor: interactive resize of window {term_id} ended at {},{} {resized_w}x{resized_h}",
+            work.0, work.1
+        ),
+    )?;
     // **The shell is what resizes the client**, which is the whole reason the gesture ends in an
     // event rather than in a `Configure` from the compositor: one path to a window's geometry
     // rather than two that can disagree. It says `drop` rather than `resize` because since
     // Part F one event ends both gestures, so the shell has one word for what it is answering —
     // the user let go, and this is the rectangle.
-    session.expect(&format!(
-        "desktop-shell: drop window {term_id} to {},{} {resized_w}x{resized_h}",
-        work.0, work.1
-    ))?;
+    session
+        .expect(&format!("desktop-shell: drop window {term_id} to {},{} {resized_w}x{resized_h}", work.0, work.1))?;
     session.expect(&format!("nxterm: resized to {resized_w}x{resized_h}, grid "))?;
     // And the committed geometry, which is the assertion a release that commits nothing fails.
-    session.expect(&format!(
-        "desktop-shell: window {term_id} geometry {},{} {resized_w}x{resized_h}",
-        work.0, work.1
-    ))?;
+    session
+        .expect(&format!("desktop-shell: window {term_id} geometry {},{} {resized_w}x{resized_h}", work.0, work.1))?;
     println!("  ok: the terminal was dragged smaller by its corner, and committed it");
 
     // 6k. **A window thrown at the left edge snaps to half the work area** (M9 Part F). The
@@ -8970,13 +8992,17 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     qmp.send_button("left", false)?;
     let passed_to = (press_at.0 + walked.0, press_at.1 + walked.1);
     qmp.pointer = Some(passed_to);
-    expect_after_pointer(&mut qmp, &mut session, &format!(
-        "desktop-shell: window {term_id} geometry {},{} {}x{}",
-        work.0 + walked.0,
-        work.1 + walked.1,
-        resized_w,
-        resized_h
-    ))?;
+    expect_after_pointer(
+        &mut qmp,
+        &mut session,
+        &format!(
+            "desktop-shell: window {term_id} geometry {},{} {}x{}",
+            work.0 + walked.0,
+            work.1 + walked.1,
+            resized_w,
+            resized_h
+        ),
+    )?;
     println!("  ok: a drag through the zone and out again moved the window and snapped nothing");
 
     // Then the drop itself, from the title bar where the window now is.
@@ -9021,13 +9047,11 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     qmp.pointer = Some((press_at.0 + step * 6, press_at.1 + 180));
     // The compositor asks for the zone's target; the shell answers with the `Configure`; the
     // client commits it. Half the **work area**, at its origin.
-    expect_after_pointer(&mut qmp, &mut session, &format!(
-        "desktop-shell: drop window {term_id} to {},{} {}x{}",
-        work.0,
-        work.1,
-        work.2 / 2,
-        work.3
-    ))?;
+    expect_after_pointer(
+        &mut qmp,
+        &mut session,
+        &format!("desktop-shell: drop window {term_id} to {},{} {}x{}", work.0, work.1, work.2 / 2, work.3),
+    )?;
     session.expect(&format!("nxterm: resized to {}x{}, grid ", work.2 / 2, work.3))?;
     session.expect(&format!(
         "desktop-shell: window {term_id} geometry {},{} {}x{}",
@@ -9155,7 +9179,6 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     let listed = session.rest_of_line()?;
     println!("  ok: nxfiles started at HOME and listed it ({})", listed.trim());
 
-
     // **Where the shell put it**, read after the listing rather than before it: a client lists
     // its directory *then* creates its window, so the shell's geometry line comes second — and
     // asking for it first consumed the listing this step asserts. The gate presses on a row
@@ -9244,10 +9267,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     let props_window = session.transcript()[before_props..].to_string();
     if props_window.contains("could not be drawn") || props_window.contains("could not open") {
         let _ = session.child.kill();
-        return Err(format!(
-            "the properties dialog opened and complained: {props_window:?}"
-        )
-        .into());
+        return Err(format!("the properties dialog opened and complained: {props_window:?}").into());
     }
     println!("  ok: Ctrl+I showed the properties dialog, and Esc closed it");
 
@@ -9411,8 +9431,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // shipped binary ran `syntax::for_name` at all. `.txt` is plain text, which is a supported
     // answer rather than a gap — the four languages this system contains are host-tested, and
     // what only a boot can add is that the dispatch happens in the binary that ships.
-    let opened =
-        String::from("nxedit: opened /home/papers/notes.txt - 0 bytes, highlighted as plain");
+    let opened = String::from("nxedit: opened /home/papers/notes.txt - 0 bytes, highlighted as plain");
     session.expect_all(&[&asked, &opened])?;
     // After the open, for the reason the browser's is read after its listing: the editor reads
     // its file before it has a window to place.
@@ -9546,13 +9565,17 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     }
     qmp.send_button("left", false)?;
     qmp.pointer = None;
-    expect_after_pointer(&mut qmp, &mut session, &format!(
-        "desktop-shell: drop window {edit_id} to {},{} {}x{}",
-        work.0 + (work.2 / 2) as i32,
-        work.1,
-        work.2 / 2,
-        work.3
-    ))?;
+    expect_after_pointer(
+        &mut qmp,
+        &mut session,
+        &format!(
+            "desktop-shell: drop window {edit_id} to {},{} {}x{}",
+            work.0 + (work.2 / 2) as i32,
+            work.1,
+            work.2 / 2,
+            work.3
+        ),
+    )?;
     session.expect(&format!("nxedit: resized to {}x{}", work.2 / 2, work.3))?;
     println!("  ok: the editor snapped to the right half, clear of the browser");
 
@@ -9588,12 +9611,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // places, a press one strip out goes somewhere; over the listing, the worst a slip can do is
     // select a row, because descending takes a second click. An inert click should be inert
     // under a mistake as well as under a correct sum.
-    click_at(
-        &mut qmp,
-        &mut session,
-        fx + SIDEBAR_W + 60,
-        fy + 1 + TITLE_BAR_H + MENU_BAR_H + PATH_H / 2,
-    )?;
+    click_at(&mut qmp, &mut session, fx + SIDEBAR_W + 60, fy + 1 + TITLE_BAR_H + MENU_BAR_H + PATH_H / 2)?;
     press(&mut qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
     // **The third step to depend on which row a fresh listing selects**, and the one that never
@@ -9636,10 +9654,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // the menus, the path strip and the column header — plus a row and a half. **No tab strip**,
     // which the browser leaves out for a single tab (desktop refresh, Part I), and **a header**,
     // which it gained in the same part.
-    let row1 = (
-        fx + SIDEBAR_W + 120,
-        fy + TITLE_BAR_H + MENU_BAR_H + PATH_H + browser::HEADER_H + ROW_H + ROW_H / 2,
-    );
+    let row1 = (fx + SIDEBAR_W + 120, fy + TITLE_BAR_H + MENU_BAR_H + PATH_H + browser::HEADER_H + ROW_H + ROW_H / 2);
     move_pointer_to(&mut qmp, row1.0, row1.1)?;
     qmp.pointer = Some(row1);
     qmp.send_button("left", true)?;
@@ -9673,10 +9688,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // the half of the screen it now occupies.
     let onto = (work.0 + work.2 as i32 * 3 / 4, work.1 + work.3 as i32 / 2);
     while at != onto {
-        let step = (
-            (onto.0 - at.0).clamp(-100, 100),
-            (onto.1 - at.1).clamp(-100, 100),
-        );
+        let step = ((onto.0 - at.0).clamp(-100, 100), (onto.1 - at.1).clamp(-100, 100));
         qmp.send_motion(step.0, step.1)?;
         at = (at.0 + step.0, at.1 + step.1);
     }
@@ -9953,8 +9965,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     let any = |_: &str| true;
     let wait = std::time::Duration::from_secs(45);
     let placed = session.line_since(launched, "desktop-shell: placed window ", any, wait)?;
-    let (_, tx, ty) = parse_placement(&placed)
-        .ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
+    let (_, tx, ty) =
+        parse_placement(&placed).ok_or_else(|| format!("could not read the terminal's placement from {placed:?}"))?;
     // Below the title bar and the terminal's own menu bar, and well inside the frame.
     // **Wait for the shell before clicking, not after**, and both halves of that are load-bearing.
     //
@@ -10020,9 +10032,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     let mut made = false;
     for _ in 0..10 {
         session.send("list .")?;
-        if session
-            .expect_within(&format!("{TYPED}.clip"), std::time::Duration::from_secs(3))?
-        {
+        if session.expect_within(&format!("{TYPED}.clip"), std::time::Duration::from_secs(3))? {
             made = true;
             break;
         }
@@ -10103,8 +10113,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     click_at(&mut qmp, &mut session, file_menu.0, file_menu.1)?;
     session.expect("nxfiles: menu popup ")?;
     let popup = session.rest_of_line()?;
-    let (_, px, py, _pw, ph) = parse_menu_popup(&popup)
-        .ok_or_else(|| format!("could not read the menu's placement from {popup:?}"))?;
+    let (_, px, py, _pw, ph) =
+        parse_menu_popup(&popup).ok_or_else(|| format!("could not read the menu's placement from {popup:?}"))?;
 
     // **The row is found rather than computed** (M14 Part A). This used to divide the popup's
     // height by a row count, which was already careful about not deriving a row height from the
@@ -10337,10 +10347,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // cascade — is about placements this gate has no opinion on. This one it does: "centred on
     // its parent, kept inside the work area" is the claim M12 Part A makes, and reading the
     // number back without checking it would assert only that some number was printed.
-    let want_x = (untitled_x + (EDITOR_W - CONFIRM_W) / 2)
-        .clamp(work.0, work.0 + work.2 as i32 - CONFIRM_W);
-    let want_y = (untitled_y + (EDITOR_H - CONFIRM_H) / 2)
-        .clamp(work.1, work.1 + work.3 as i32 - CONFIRM_H);
+    let want_x = (untitled_x + (EDITOR_W - CONFIRM_W) / 2).clamp(work.0, work.0 + work.2 as i32 - CONFIRM_W);
+    let want_y = (untitled_y + (EDITOR_H - CONFIRM_H) / 2).clamp(work.1, work.1 + work.3 as i32 - CONFIRM_H);
     if (dx, dy) != (want_x, want_y) {
         return Err(format!(
             "the dialog landed at {dx},{dy}; centred on window {untitled_id} at \
@@ -10364,9 +10372,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: placed dialog ")?;
     let placed_again = session.rest_of_line()?;
     let (_, _, dx2, dy2, _, _) = parse_dialog_placement(&placed_again)
-        .ok_or_else(|| {
-            format!("could not read the second dialog placement from {placed_again:?}")
-        })?;
+        .ok_or_else(|| format!("could not read the second dialog placement from {placed_again:?}"))?;
     let from = session.transcript().len();
     click_at(&mut qmp, &mut session, dx2 + CONFIRM_DISCARD_CX, dy2 + CONFIRM_BUTTON_CY)?;
     session.expect("nxedit: discarding the unsaved buffer")?;
@@ -10388,9 +10394,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
         std::time::Duration::from_secs(45),
     )?;
     let slot = taskbar_slot(&after_close, edit_id).ok_or_else(|| {
-        format!(
-            "window {edit_id} is not in the taskbar list {after_close:?}, so it cannot be clicked"
-        )
+        format!("window {edit_id} is not in the taskbar list {after_close:?}, so it cannot be clicked")
     })?;
     println!("  ok: `discard` was the only thing that ended the run");
 
@@ -11191,14 +11195,7 @@ fn wait_ps2_lights(log: &Path, want: &[u8], what: &str) -> R<()> {
 /// followed by `shows` — which `line` then is. The echo is the pacing, as in `check-terminal`'s
 /// first typing. **A row is reported with its trailing blanks trimmed**, so a space is waited for
 /// as the row before it, reported again.
-fn key_echoed(
-    qmp: &mut Qmp,
-    session: &mut Session,
-    line: &mut String,
-    qcode: &str,
-    shift: bool,
-    shows: &str,
-) -> R<()> {
+fn key_echoed(qmp: &mut Qmp, session: &mut Session, line: &mut String, qcode: &str, shift: bool, shows: &str) -> R<()> {
     if shift {
         qmp.send_key("shift", true)?;
     }
@@ -11379,12 +11376,11 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     {
         session.expect("nxterm: grid font ")?;
         let line = session.rest_of_line()?;
-        let (path, rest) = line.trim().split_once(", cell ").ok_or_else(|| {
-            format!("nxterm's grid line is not in the form this gate reads: {line:?}")
-        })?;
-        let (dims, px) = rest.split_once(" at ").ok_or_else(|| {
-            format!("nxterm's grid line has no size: {line:?}")
-        })?;
+        let (path, rest) = line
+            .trim()
+            .split_once(", cell ")
+            .ok_or_else(|| format!("nxterm's grid line is not in the form this gate reads: {line:?}"))?;
+        let (dims, px) = rest.split_once(" at ").ok_or_else(|| format!("nxterm's grid line has no size: {line:?}"))?;
         let (w, h) = dims.split_once('x').ok_or_else(|| format!("no cell size: {line:?}"))?;
         let (w, h): (u32, u32) = (w.parse()?, h.parse()?);
         let px: f32 = px.trim_end_matches("px").parse()?;
@@ -11473,7 +11469,6 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     // than consistent. A focus *change* is not usable as the signal here, because the window
     // may already have had focus and no event is sent for that.
     session.expect("nxterm: clicked")?;
-
 
     // **One character at a time, each waited for.** Two reasons, and the second is the one
     // that cost an afternoon.
@@ -11696,12 +11691,8 @@ fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
         // was the third — `nxterm: the menu popup could not be drawn`, twenty times over,
         // because the tree was not diffable — and a message that said only "never saw 103"
         // pointed at the walk rather than at the widget.
-        let seen: Vec<String> = session
-            .transcript()
-            .lines()
-            .filter(|l| l.contains("nxterm: menu"))
-            .map(str::to_string)
-            .collect();
+        let seen: Vec<String> =
+            session.transcript().lines().filter(|l| l.contains("nxterm: menu")).map(str::to_string).collect();
         return Err(format!(
             "the pointer walked {}..{} down the menu popup and the guest never reported row \
              {CLEAR_ROW} under it; it reported: {}",
@@ -11900,8 +11891,7 @@ fn settle_and_capture(qmp: &mut Qmp, shot: &Path) -> R<Vec<u8>> {
     let mut prev: Option<Vec<u8>> = None;
     for _ in 0..SCREEN_SETTLE_TRIES {
         qmp.screendump(shot)?;
-        let bytes =
-            fs::read(shot).map_err(|e| format!("read screendump {}: {e}", shot.display()))?;
+        let bytes = fs::read(shot).map_err(|e| format!("read screendump {}: {e}", shot.display()))?;
         if prev.as_deref() == Some(bytes.as_slice()) {
             return Ok(bytes);
         }
@@ -11958,11 +11948,7 @@ fn cmd_preview(what: &str) -> R<()> {
     if what != "all" && !names.contains(&what) {
         // Checked before anything is drawn: the first version reported this by rendering both
         // references a second time purely to list their names.
-        return Err(format!(
-            "no preview called {what:?} — try `all` or one of: {}",
-            names.join(", ")
-        )
-        .into());
+        return Err(format!("no preview called {what:?} — try `all` or one of: {}", names.join(", ")).into());
     }
     for (name, frame) in &frames {
         if what != "all" && what != *name {
@@ -12018,11 +12004,8 @@ fn cmd_tune(args: &[String]) -> R<()> {
             None => Ok(default),
         }
     };
-    let scheme = if args.iter().any(|a| a == "--dark") {
-        libdraw::theme::Scheme::Dark
-    } else {
-        libdraw::theme::Scheme::Light
-    };
+    let scheme =
+        if args.iter().any(|a| a == "--dark") { libdraw::theme::Scheme::Dark } else { libdraw::theme::Scheme::Light };
     let [wide, contact] = libdraw::theme::window_shadow(scheme).layers;
     let shadow = Shadow {
         layers: [
@@ -12071,8 +12054,7 @@ fn cmd_tune(args: &[String]) -> R<()> {
             for y in 0..sh {
                 for x in 0..sw {
                     let off = wg.offset_of(x, y).unwrap_or(0);
-                    let word =
-                        u32::from_le_bytes([px[off], px[off + 1], px[off + 2], px[off + 3]]);
+                    let word = u32::from_le_bytes([px[off], px[off + 1], px[off + 2], px[off + 3]]);
                     desktop.put_pixel(x, y, wg.format.decode(word));
                 }
             }
@@ -12103,9 +12085,10 @@ fn cmd_tune(args: &[String]) -> R<()> {
     let a = SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120, 140), ui.bytes())
         .with_shadow(shadow)
         .with_corner(corner);
-    let b = SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120 + uw as i32 / 2, 140 + uh as i32 / 2), ui.bytes())
-        .with_shadow(shadow)
-        .with_corner(corner);
+    let b =
+        SurfaceRef::new(Framebuffer::geometry(&ui), Point::new(120 + uw as i32 / 2, 140 + uh as i32 / 2), ui.bytes())
+            .with_shadow(shadow)
+            .with_corner(corner);
     compose_exposed(&mut shot_fb, Rgb::new(0x2A, 0x55, 0x70), &[wall, bar, a, b], &[g.bounds()]);
     let (w1, h1, rgb1) = rgb_of(&shot_fb);
     let p1 = dir.join("tune-shadow.png");
@@ -12154,7 +12137,11 @@ fn cmd_tune(args: &[String]) -> R<()> {
     println!(
         "xtask: overview ground {ground_alpha} sidebar {side_alpha}  ->  {}{}",
         p2.display(),
-        if from_shot.is_some() { "  (over the real screendump)" } else { "  (over the wallpaper — run `xtask shot` for the real desktop)" }
+        if from_shot.is_some() {
+            "  (over the real screendump)"
+        } else {
+            "  (over the wallpaper — run `xtask shot` for the real desktop)"
+        }
     );
     Ok(())
 }
@@ -12163,10 +12150,7 @@ fn cmd_tune(args: &[String]) -> R<()> {
 ///
 /// The same crop the image build stages and the same downscale the shell performs, so the ground
 /// under a preview is the ground the guest would show.
-fn wallpaper_for_screen(
-    sw: u32,
-    sh: u32,
-) -> R<(Vec<u8>, libdraw::framebuffer::Geometry)> {
+fn wallpaper_for_screen(sw: u32, sh: u32) -> R<(Vec<u8>, libdraw::framebuffer::Geometry)> {
     use libdraw::format::{PixelFormat, Rgb};
     use libdraw::framebuffer::Geometry;
     let path = repo_root().join(WALLPAPER_ASSET);
@@ -12186,10 +12170,8 @@ fn wallpaper_for_screen(
     // the screen, which is what this did until Phase 5 Part E and what no desktop ever showed.
     let dst_g = Geometry::packed(sw, sh, PixelFormat::XRGB8888);
     let mut dst = vec![0u8; dst_g.byte_len()];
-    let plan = libdraw::theme::WallpaperMode::Fill.plan(
-        libdraw::geom::Size::new(src_g.width, src_g.height),
-        libdraw::geom::Size::new(sw, sh),
-    );
+    let plan = libdraw::theme::WallpaperMode::Fill
+        .plan(libdraw::geom::Size::new(src_g.width, src_g.height), libdraw::geom::Size::new(sw, sh));
     let ground = libdraw::theme::Theme::light().desktop;
     if !libdraw::scale::place(&src, src_g, plan, ground, &mut dst, dst_g) {
         return Err("the wallpaper would not place on the preview screen".into());
@@ -12258,15 +12240,10 @@ fn read_rgb_png(path: &std::path::Path) -> R<(u32, u32, Vec<u8>)> {
 /// desktop rather than of a blank screen, which is the one failure that would otherwise be
 /// mistaken for a design opinion.
 fn cmd_shot(what: &str, accel: Accel, size: DisplaySize) -> R<()> {
-    const MOMENTS: [&str; 9] = [
-        "greeter", "desktop", "apps", "windows", "terminal", "hover", "files", "editor", "overview",
-    ];
+    const MOMENTS: [&str; 9] =
+        ["greeter", "desktop", "apps", "windows", "terminal", "hover", "files", "editor", "overview"];
     if what != "all" && !MOMENTS.contains(&what) {
-        return Err(format!(
-            "no shot called {what:?} — try `all` or one of: {}",
-            MOMENTS.join(", ")
-        )
-        .into());
+        return Err(format!("no shot called {what:?} — try `all` or one of: {}", MOMENTS.join(", ")).into());
     }
     preflight_accel(accel)?;
     cmd_image(BuildMode::Normal)?;
@@ -12442,13 +12419,12 @@ fn launch_from_menu(qmp: &mut Qmp, session: &mut Session, program: &str) -> R<(i
 fn placed_window(session: &mut Session) -> R<(i32, i32, u32, u32)> {
     session.expect("desktop-shell: placed window ")?;
     let placed = session.rest_of_line()?;
-    let (id, _, _) = parse_placement(&placed)
-        .ok_or_else(|| format!("could not read a placement from {placed:?}"))?;
+    let (id, _, _) = parse_placement(&placed).ok_or_else(|| format!("could not read a placement from {placed:?}"))?;
     session.expect(&format!("desktop-shell: window {id} geometry "))?;
     let rest = session.rest_of_line()?;
     let line = format!("{id} geometry {rest}");
-    let (_, x, y, w, h) = parse_geometry_line(&line)
-        .ok_or_else(|| format!("could not read window {id}'s geometry from {rest:?}"))?;
+    let (_, x, y, w, h) =
+        parse_geometry_line(&line).ok_or_else(|| format!("could not read window {id}'s geometry from {rest:?}"))?;
     Ok((x, y, w, h))
 }
 
@@ -12538,10 +12514,8 @@ const FONT_DIR: &str = "/system/fonts/";
 /// One host-side face, loaded from the path a theme names.
 fn host_font(guest_path: &str) -> R<libdraw::text::Font> {
     let path = font_asset(guest_path)?;
-    libdraw::text::Font::from_bytes(
-        fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?,
-    )
-    .ok_or_else(|| format!("{} did not parse on the host", path.display()).into())
+    libdraw::text::Font::from_bytes(fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?)
+        .ok_or_else(|| format!("{} did not parse on the host", path.display()).into())
 }
 
 /// Both faces the built-in theme names, in the order [`preview_frames`] wants them — the
@@ -12668,8 +12642,7 @@ fn staged_theme() -> R<(libdraw::theme::Theme, String)> {
     // a wallpaper is a file a person supplies and a default would make the desktop's ground
     // depend on whatever the build happened to stage.
     shipped.wallpaper = Some(
-        libdraw::theme::ThemePath::parse(WALLPAPER_PATH)
-            .ok_or("the staged wallpaper path does not fit a ThemePath")?,
+        libdraw::theme::ThemePath::parse(WALLPAPER_PATH).ok_or("the staged wallpaper path does not fit a ThemePath")?,
     );
     // **Filled, not fitted** (Phase 5 Part E): the picture is 16:10 and the laptop is 16:9, and
     // a fitted picture leaves bars of bare ground down both sides of the screen.
@@ -12712,12 +12685,8 @@ fn staged_theme() -> R<(libdraw::theme::Theme, String)> {
 fn wallpaper_png() -> R<Vec<u8>> {
     let path = repo_root().join(WALLPAPER_ASSET);
     // `BufRead`, which the decoder wants: it reads chunk headers a few bytes at a time.
-    let file = std::io::BufReader::new(
-        fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
-    );
-    let mut reader = png::Decoder::new(file)
-        .read_info()
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let file = std::io::BufReader::new(fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?);
+    let mut reader = png::Decoder::new(file).read_info().map_err(|e| format!("read {}: {e}", path.display()))?;
     let info = reader.info().clone();
     if info.color_type != png::ColorType::Rgb || info.bit_depth != png::BitDepth::Eight {
         return Err(format!(
@@ -12734,9 +12703,8 @@ fn wallpaper_png() -> R<Vec<u8>> {
     // through — which is fine here, since the guest's decoder is the one that refuses
     // interlacing and this is a host-side crop. The first version of this comment said the
     // opposite (PR #273 review, optional 4).
-    let size = reader
-        .output_buffer_size()
-        .ok_or_else(|| format!("{}: the decoder cannot size this image", path.display()))?;
+    let size =
+        reader.output_buffer_size().ok_or_else(|| format!("{}: the decoder cannot size this image", path.display()))?;
     let mut src = vec![0u8; size];
     let frame = reader.next_frame(&mut src).map_err(|e| format!("decode: {e}"))?;
     let (sw, sh) = (frame.width, frame.height);
@@ -12942,10 +12910,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     }
     if cursor_px == 0 {
         let _ = session.child.kill();
-        return Err(format!(
-            "no cursor at the screen centre ({cx},{cy}): the pointer sprite is not being drawn"
-        )
-        .into());
+        return Err(format!("no cursor at the screen centre ({cx},{cy}): the pointer sprite is not being drawn").into());
     }
     println!("  ok: cursor visible at ({cx},{cy}) — {cursor_px} body pixels");
 
@@ -13017,9 +12982,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
             shadow: libdraw::compose::Shadow,
             radius: u32,
         ) -> SurfaceRef<'a> {
-            SurfaceRef::new(Framebuffer::geometry(fb), origin, fb.bytes())
-                .with_shadow(shadow)
-                .with_corner(radius)
+            SurfaceRef::new(Framebuffer::geometry(fb), origin, fb.bytes()).with_shadow(shadow).with_corner(radius)
         }
         let mut out = libdraw::framebuffer::MemFramebuffer::new(libdraw::framebuffer::Geometry::packed(
             uw,
@@ -13028,11 +12991,8 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         ));
         // Bottom first, as `ui-testclient` created them — the nesting above is what makes this
         // the guest's order.
-        let stack = [
-            at(&ui, origin, shadow, radius),
-            at(&term, origin, shadow, radius),
-            at(&expected, origin, shadow, radius),
-        ];
+        let stack =
+            [at(&ui, origin, shadow, radius), at(&term, origin, shadow, radius), at(&expected, origin, shadow, radius)];
         libdraw::compose::compose_full(&mut out, libdraw::scene::BACKGROUND, &stack);
         out
     };
@@ -13045,9 +13005,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     // show only windows this gate *does* render, and those are compared exactly — which is what
     // proves the guest rounds at all. The first run of the rounded gate failed on exactly these
     // pixels, first at the shared corner (0,0).
-    let unknown_beneath = move |x: u32, y: u32| {
-        (x < radius || x >= uw - radius) && (y < radius || y >= uh - radius)
-    };
+    let unknown_beneath = move |x: u32, y: u32| (x < radius || x >= uw - radius) && (y < radius || y >= uh - radius);
     // One pass, counted per window so a failure still says which picture it was in.
     let region = |x: u32, y: u32| {
         if x < sw && y < sh {
@@ -13121,10 +13079,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         .into());
     }
     if w < tw || h < th {
-        return Err(
-            format!("guest display is {w}x{h}, smaller than the {tw}x{th} reference terminal")
-                .into(),
-        );
+        return Err(format!("guest display is {w}x{h}, smaller than the {tw}x{th} reference terminal").into());
     }
     if term_mismatches > 0 {
         let (x, y, got, want) = term_first.expect("a mismatch was counted");
@@ -13139,10 +13094,7 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
         .into());
     }
     if w < uw || h < uh {
-        return Err(format!(
-            "guest display is {w}x{h}, smaller than the {uw}x{uh} reference UI"
-        )
-        .into());
+        return Err(format!("guest display is {w}x{h}, smaller than the {uw}x{uh} reference UI").into());
     }
     if ui_mismatches > 0 {
         let (x, y, got, want) = ui_first.expect("a mismatch was counted");
@@ -13445,9 +13397,7 @@ impl Qmp {
     /// next line as the answer would eventually read an event and misreport success.
     fn execute(&mut self, json: &str) -> R<String> {
         use std::io::Write as _;
-        self.stream
-            .write_all(format!("{json}\n").as_bytes())
-            .map_err(|e| format!("qmp write: {e}"))?;
+        self.stream.write_all(format!("{json}\n").as_bytes()).map_err(|e| format!("qmp write: {e}"))?;
         self.stream.flush().map_err(|e| format!("qmp flush: {e}"))?;
         loop {
             let line = self.read_line()?;
@@ -13471,9 +13421,8 @@ impl Qmp {
     /// cpus` — and QMP has no structured equivalent for most of them.
     fn hmp(&mut self, cmd: &str) -> R<String> {
         let escaped = cmd.replace('\\', "\\\\").replace('"', "\\\"");
-        let reply = self.execute(&format!(
-            r#"{{"execute":"human-monitor-command","arguments":{{"command-line":"{escaped}"}}}}"#
-        ))?;
+        let reply = self
+            .execute(&format!(r#"{{"execute":"human-monitor-command","arguments":{{"command-line":"{escaped}"}}}}"#))?;
         Ok(unescape_json_return(&reply))
     }
 
@@ -13536,7 +13485,6 @@ impl Qmp {
         Ok(())
     }
 }
-
 
 /// Pull the string value of a QMP `"return"` field out of a reply line and undo the JSON
 /// escaping. Hand-rolled because xtask carries no JSON dependency, and the shape here is
@@ -13778,17 +13726,15 @@ fn dump_guest_state(qmp: &mut Qmp) {
                 }
                 // The monitor prints `RIP=<hex>` on the register dump's second line.
                 if let Some(pos) = line.find("RIP=") {
-                    let hex: String =
-                        line[pos + 4..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                    let hex: String = line[pos + 4..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
                     if let Ok(rip) = u64::from_str_radix(&hex, 16) {
-                        let where_ = resolve_symbol(&syms, rip)
-                            .unwrap_or_else(|| {
-                                if rip >= 0xFFFF_8000_0000_0000 {
-                                    "<kernel, no symbol>".to_string()
-                                } else {
-                                    "<userspace>".to_string()
-                                }
-                            });
+                        let where_ = resolve_symbol(&syms, rip).unwrap_or_else(|| {
+                            if rip >= 0xFFFF_8000_0000_0000 {
+                                "<kernel, no symbol>".to_string()
+                            } else {
+                                "<userspace>".to_string()
+                            }
+                        });
                         println!("  CPU#{cpu}  RIP={rip:#018x}  {where_}");
                         cpu_state.push((cpu, rip, last_rbx, last_rsp));
                     }
@@ -14219,10 +14165,8 @@ impl Session {
         loop {
             {
                 let g = self.out.lock().map_err(|_| "transcript lock")?;
-                let found: Vec<(usize, &str)> = pats
-                    .iter()
-                    .filter_map(|p| g[self.cursor..].find(p).map(|i| (i + p.len(), *p)))
-                    .collect();
+                let found: Vec<(usize, &str)> =
+                    pats.iter().filter_map(|p| g[self.cursor..].find(p).map(|i| (i + p.len(), *p))).collect();
                 if found.len() == pats.len() {
                     // **Past the last of them, not the first.** The cursor is what stops a
                     // later step matching a line this one already accounted for, and the whole
@@ -14239,8 +14183,7 @@ impl Session {
             }
             if std::time::Instant::now() > deadline {
                 let g = self.out.lock().map_err(|_| "transcript lock")?;
-                let missing: Vec<&str> =
-                    pats.iter().copied().filter(|p| !g[self.cursor..].contains(p)).collect();
+                let missing: Vec<&str> = pats.iter().copied().filter(|p| !g[self.cursor..].contains(p)).collect();
                 drop(g);
                 // Naming the ones that *did* arrive is the point: an unordered wait that times
                 // out with one of two lines present is a different fault from one with neither.
@@ -14275,15 +14218,10 @@ impl Session {
                  build-cache/nitrox.hdd will do it; check with `pgrep -a qemu`)"
             ));
         }
-        let tail: String =
-            g.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+        let tail: String = g.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
         let path = build_cache().join(format!("guest-transcript-{}.log", self.gate));
         let saved = fs::write(&path, g.as_str()).is_ok();
-        let where_ = if saved {
-            format!("\n\nthe full transcript is at {}", path.display())
-        } else {
-            String::new()
-        };
+        let where_ = if saved { format!("\n\nthe full transcript is at {}", path.display()) } else { String::new() };
         Ok(format!("timed out after {timeout:?} waiting for {waiting_for}; last output was:\n{tail}{where_}"))
     }
 
@@ -14305,9 +14243,7 @@ impl Session {
         use std::io::Write as _;
         self.sent_since_match.push(line.to_string());
         let stdin = self.child.stdin.as_mut().ok_or("qemu stdin")?;
-        stdin
-            .write_all(format!("{line}\n").as_bytes())
-            .map_err(|e| format!("write to guest: {e}"))?;
+        stdin.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("write to guest: {e}"))?;
         stdin.flush().map_err(|e| format!("flush: {e}"))?;
         Ok(())
     }
@@ -14412,7 +14348,9 @@ impl HotPlug {
             0 => {
                 let Some(at) = text.find(USB_FIRST_ROUND) else { return Ok(()) };
                 let qmp = self.qmp.insert(Qmp::connect(qmp_sock)?);
-                qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-kbd","id":"hotkbd","bus":"xhci.0"}}"#)?;
+                qmp.execute(
+                    r#"{"execute":"device_add","arguments":{"driver":"usb-kbd","id":"hotkbd","bus":"xhci.0"}}"#,
+                )?;
                 self.from = at;
                 self.stage = 1;
             }
@@ -14497,7 +14435,9 @@ fn check_hot_plug(transcript: &[u8], hot: &HotPlug) -> R<()> {
             } else {
                 "a replug the hub thread does not take as a departure and an arrival keeps the old device"
             };
-            return Err(format!("after the keyboard's arrival on port {port}, no line for {what} ({want:?}): {why}").into());
+            return Err(
+                format!("after the keyboard's arrival on port {port}, no line for {what} ({want:?}): {why}").into()
+            );
         };
         let found = rest[at..].lines().next().unwrap_or("");
         if want == gone && !found.contains("disabled") {
@@ -14544,7 +14484,8 @@ fn check_usb_listed(transcript: &[u8]) -> R<()> {
     // beside the i8042's two, which `test-qemu`'s machine has. At least: a hot-plugged keyboard bound
     // before the manager's read is handed over too.
     let at_round = text.find(USB_FIRST_ROUND).unwrap_or(0);
-    let bound = text[..at_round].lines().filter(|l| l.starts_with("usb: port ") && l.contains(" at /dev/input/raw/")).count();
+    let bound =
+        text[..at_round].lines().filter(|l| l.starts_with("usb: port ") && l.contains(" at /dev/input/raw/")).count();
     let handed = text
         .lines()
         .find_map(|l| {
@@ -15001,9 +14942,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }
-        Some(code) => {
-            Err(format!("integration tests FAILED (qemu exit {code}; expected {PASS_EXIT})").into())
-        }
+        Some(code) => Err(format!("integration tests FAILED (qemu exit {code}; expected {PASS_EXIT})").into()),
         None => Err("qemu terminated by a signal with no exit code".into()),
     }
 }
@@ -15095,7 +15034,10 @@ const TEST_QEMU_FACTS: &[&[&str]] = &[
     // pinged for though nothing is mounted on it.
     &["usb: port 3: LUN 0: rescanned: 1 partition(s) departed, 1 published"],
     &["storage-service: blk-", " rescanned, as asked: 1 partition(s)"],
-    &["boot-probe: storage admin: a Reread of blk-", " rescanned it: its partition replaced, the old one's node refused after, and the watch pinged with no mount changed ok"],
+    &[
+        "boot-probe: storage admin: a Reread of blk-",
+        " rescanned it: its partition replaced, the old one's node refused after, and the watch pinged with no mount changed ok",
+    ],
     // **Reported, with its clusters, as not served** (Phase 6 Part E.6): 512-byte clusters, which
     // `fs-server-fat` refuses, so the boot's mounts — what `boot-probe` checks — are as they were.
     &[
@@ -15185,10 +15127,7 @@ fn missing_facts<'a>(lines: &[&str], wanted: impl IntoIterator<Item = &'a [&'a s
 fn check_hardware_facts(transcript: &[u8]) -> R<()> {
     let text = String::from_utf8_lossy(transcript);
     let lines: Vec<&str> = text.lines().collect();
-    let limine = format!(
-        "boot: Limine {} on UEFI (64-bit), base revision 6",
-        LIMINE_VERSION.trim_start_matches('v')
-    );
+    let limine = format!("boot: Limine {} on UEFI (64-bit), base revision 6", LIMINE_VERSION.trim_start_matches('v'));
     let bootloader: &[&str] = &[&limine];
     // **The build it is** (the laptop polish's Part D): the commit this process built from.
     let built_from = built_from_line();
@@ -15205,7 +15144,9 @@ fn check_hardware_facts(transcript: &[u8]) -> R<()> {
         )
         .into());
     }
-    println!("xtask: the boot reported QEMU's machine as it is — tables, CPUs, IOAPIC, framebuffer, a claimed AHCI and xHCI, COM1 ✓");
+    println!(
+        "xtask: the boot reported QEMU's machine as it is — tables, CPUs, IOAPIC, framebuffer, a claimed AHCI and xHCI, COM1 ✓"
+    );
     Ok(())
 }
 
@@ -15535,26 +15476,14 @@ fn cmd_fetch_limine() -> R<PathBuf> {
     }
     fs::create_dir_all(&dir)?;
 
-    let url = format!(
-        "https://github.com/limine-bootloader/limine/releases/download/{LIMINE_VERSION}/limine-binary.tar.gz"
-    );
+    let url =
+        format!("https://github.com/limine-bootloader/limine/releases/download/{LIMINE_VERSION}/limine-binary.tar.gz");
     let tarball = build_cache().join("limine-binary.tar.gz");
     fs::create_dir_all(build_cache())?;
     println!("xtask: fetching {url}");
-    run(Command::new("curl")
-        .arg("-fL")
-        .arg("--retry")
-        .arg("3")
-        .arg("-o")
-        .arg(&tarball)
-        .arg(&url))?;
+    run(Command::new("curl").arg("-fL").arg("--retry").arg("3").arg("-o").arg(&tarball).arg(&url))?;
 
-    run(Command::new("tar")
-        .arg("-xzf")
-        .arg(&tarball)
-        .arg("-C")
-        .arg(&dir)
-        .arg("--strip-components=1"))?;
+    run(Command::new("tar").arg("-xzf").arg(&tarball).arg("-C").arg(&dir).arg("--strip-components=1"))?;
 
     fs::remove_file(&tarball).ok();
     fs::write(&marker, LIMINE_VERSION)?;
@@ -15577,10 +15506,7 @@ fn cmd_clean() -> R<()> {
 fn cmd_test() -> R<()> {
     // Tools workspace tests (xtask itself, image-builder helpers, etc.).
     let tools_manifest = repo_root().join("tools").join("Cargo.toml");
-    run(Command::new("cargo")
-        .arg("test")
-        .arg("--manifest-path")
-        .arg(&tools_manifest))?;
+    run(Command::new("cargo").arg("test").arg("--manifest-path").arg(&tools_manifest))?;
 
     // Kernel host tests. The kernel's `.cargo/config.toml` pins the
     // build target to `x86_64-unknown-none`, which can't link the
@@ -15588,12 +15514,7 @@ fn cmd_test() -> R<()> {
     // skips the `[[bin]]` (it's `#![no_main]`, unbuildable on host).
     let host = host_triple()?;
     let kernel_dir = repo_root().join("kernel");
-    run(Command::new("cargo")
-        .arg("test")
-        .arg("--lib")
-        .arg("--target")
-        .arg(&host)
-        .current_dir(&kernel_dir))?;
+    run(Command::new("cargo").arg("test").arg("--lib").arg("--target").arg(&host).current_dir(&kernel_dir))?;
 
     // Userspace `libkern` host tests. From the userspace workspace dir libkern
     // builds for the host (it has no per-crate `.cargo/config.toml` pinning the
@@ -16196,9 +16117,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         kernel_file: "kernel/src/syscall/table.rs",
         user_file: "userspace/libkern/src/syscall.rs",
         shape: AbiShape::U64Const,
-        one_sided: &[
-            ("SYS_TEST_EXIT", "kernel test-harness builds only; userspace mirrors it for the harness"),
-        ],
+        one_sided: &[("SYS_TEST_EXIT", "kernel test-harness builds only; userspace mirrors it for the harness")],
     },
     AbiFamily {
         what: "KError discriminants",
@@ -16282,24 +16201,9 @@ const ABI_FAMILIES: &[AbiFamily] = &[
 /// These are the ones that bit in practice: `MAX_WAIT_HANDLES` and the IPC limits are
 /// hand-copied values with no compile-time tie between the two sides at all.
 const ABI_PAIRS: &[(&str, &str, &str, &str)] = &[
-    (
-        "kernel/src/object/thread.rs",
-        "MAX_WAIT_HANDLES",
-        "userspace/libkern/src/abi.rs",
-        "MAX_WAIT_HANDLES",
-    ),
-    (
-        "kernel/src/libkern/ipc.rs",
-        "IPC_HANDLE_MAX",
-        "userspace/libkern/src/abi.rs",
-        "IPC_HANDLE_MAX",
-    ),
-    (
-        "kernel/src/libkern/ipc.rs",
-        "IPC_MAX_QUEUE_DEPTH",
-        "userspace/libkern/src/abi.rs",
-        "IPC_MAX_QUEUE_DEPTH",
-    ),
+    ("kernel/src/object/thread.rs", "MAX_WAIT_HANDLES", "userspace/libkern/src/abi.rs", "MAX_WAIT_HANDLES"),
+    ("kernel/src/libkern/ipc.rs", "IPC_HANDLE_MAX", "userspace/libkern/src/abi.rs", "IPC_HANDLE_MAX"),
+    ("kernel/src/libkern/ipc.rs", "IPC_MAX_QUEUE_DEPTH", "userspace/libkern/src/abi.rs", "IPC_MAX_QUEUE_DEPTH"),
 ];
 
 /// Pull `name -> value` pairs of one `shape` out of a source file.
@@ -16370,8 +16274,7 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                     continue;
                 }
                 let Some((_, shifted)) = tail.split_once("1 <<") else { continue };
-                let digits: String =
-                    shifted.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                let digits: String = shifted.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(k) = digits.parse::<u32>() {
                     out.insert(name.trim().to_string(), 1i128 << k);
                 }
@@ -16422,10 +16325,9 @@ fn cmd_abi_sync_check() -> R<()> {
     let mut compared = 0usize;
 
     for fam in ABI_FAMILIES {
-        let kt = fs::read_to_string(root.join(fam.kernel_file))
-            .map_err(|e| format!("read {}: {e}", fam.kernel_file))?;
-        let ut = fs::read_to_string(root.join(fam.user_file))
-            .map_err(|e| format!("read {}: {e}", fam.user_file))?;
+        let kt =
+            fs::read_to_string(root.join(fam.kernel_file)).map_err(|e| format!("read {}: {e}", fam.kernel_file))?;
+        let ut = fs::read_to_string(root.join(fam.user_file)).map_err(|e| format!("read {}: {e}", fam.user_file))?;
         let k = extract_consts(&kt, fam.shape);
         let u = extract_consts(&ut, fam.shape);
         if k.is_empty() {
@@ -16466,9 +16368,7 @@ fn cmd_abi_sync_check() -> R<()> {
         let ut = fs::read_to_string(root.join(uf)).map_err(|e| format!("read {uf}: {e}"))?;
         match (extract_named(&kt, kn), extract_named(&ut, un)) {
             (Some(a), Some(b)) if a == b => compared += 1,
-            (Some(a), Some(b)) => problems.push(format!(
-                "shared limit: {kn} is {a} in {kf} but {un} is {b} in {uf}"
-            )),
+            (Some(a), Some(b)) => problems.push(format!("shared limit: {kn} is {a} in {kf} but {un} is {b} in {uf}")),
             (a, _) => problems.push(format!(
                 "shared limit: could not read {} — the checker's pattern has gone stale",
                 if a.is_none() { format!("{kn} in {kf}") } else { format!("{un} in {uf}") }
@@ -16509,9 +16409,7 @@ fn check_kerror_decode_table(root: &Path) -> Result<usize, Vec<String>> {
     const KERNEL: &str = "kernel/src/syscall/error.rs";
     const USER: &str = "userspace/libkern/src/error.rs";
 
-    let read = |p: &str| {
-        fs::read_to_string(root.join(p)).map_err(|e| vec![format!("KError decode: read {p}: {e}")])
-    };
+    let read = |p: &str| fs::read_to_string(root.join(p)).map_err(|e| vec![format!("KError decode: read {p}: {e}")]);
     let kt = read(KERNEL)?;
     let ut = read(USER)?;
 
@@ -16571,21 +16469,12 @@ fn check_kerror_decode_table(root: &Path) -> Result<usize, Vec<String>> {
             )),
         }
     }
-    if problems.is_empty() {
-        Ok(kernel.len())
-    } else {
-        Err(problems)
-    }
+    if problems.is_empty() { Ok(kernel.len()) } else { Err(problems) }
 }
 
 fn cmd_check_deferrals() -> R<()> {
-    let doc_path = repo_root()
-        .join("docs")
-        .join("rationale")
-        .join("deferred-decisions.md");
-    let doc = fs::read_to_string(&doc_path)
-        .map_err(|e| format!("read {}: {e}", doc_path.display()))?
-        .to_lowercase();
+    let doc_path = repo_root().join("docs").join("rationale").join("deferred-decisions.md");
+    let doc = fs::read_to_string(&doc_path).map_err(|e| format!("read {}: {e}", doc_path.display()))?.to_lowercase();
 
     let mut violations: Vec<String> = Vec::new();
     let mut tags: Vec<String> = Vec::new();
@@ -16616,8 +16505,7 @@ fn cmd_check_deferrals() -> R<()> {
     // deleted or never written is one nobody trips over while editing the code, which is the
     // whole reason the markers exist. Audit D.5(b) measured 9 of 28 open entries binding to
     // nothing, four of them appearing nowhere else in the repository.
-    let raw = fs::read_to_string(&doc_path)
-        .map_err(|e| format!("read {}: {e}", doc_path.display()))?;
+    let raw = fs::read_to_string(&doc_path).map_err(|e| format!("read {}: {e}", doc_path.display()))?;
     let open_tags = open_section_tags(&raw);
     let exempt_count = open_tags.iter().filter(|(_, e)| *e).count();
     for (tag, exempt) in &open_tags {
@@ -16758,10 +16646,7 @@ fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
         )
         .into());
     }
-    println!(
-        "check-images: {what} initramfs is {base} one but for etc/init.toml ({} files) ✓",
-        r.len()
-    );
+    println!("check-images: {what} initramfs is {base} one but for etc/init.toml ({} files) ✓", r.len());
 
     require_tool("debugfs")?;
     cmd_image(mode)?;
@@ -16788,10 +16673,7 @@ fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
         )
         .into());
     }
-    println!(
-        "check-images: {what} root.img holds {base} root's {} entries, byte for byte ✓",
-        release_tree.len()
-    );
+    println!("check-images: {what} root.img holds {base} root's {} entries, byte for byte ✓", release_tree.len());
 
     // **The pristine root is the root too** (administration Part G.1). `install-root.img` is what
     // the installer copies onto a disk, so it is held to the same tree as `root.img` — and its one
@@ -16860,10 +16742,7 @@ fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
         )
         .into());
     }
-    println!(
-        "check-images: the installable ESP module is the release ESP's {} entries ✓",
-        release_esp_tree.len()
-    );
+    println!("check-images: the installable ESP module is the release ESP's {} entries ✓", release_esp_tree.len());
     Ok(())
 }
 
@@ -17125,8 +17004,7 @@ fn cmd_check_images() -> R<()> {
 
     let mut differ: Vec<&String> = r.iter().filter(|(k, v)| t.get(*k) != Some(v)).map(|(k, _)| k).collect();
     differ.sort();
-    let unexpected: Vec<&&String> =
-        differ.iter().filter(|k| !IMAGE_DIVERGENCE_ALLOWED.contains(&k.as_str())).collect();
+    let unexpected: Vec<&&String> = differ.iter().filter(|k| !IMAGE_DIVERGENCE_ALLOWED.contains(&k.as_str())).collect();
     if !unexpected.is_empty() {
         return Err(format!(
             "a test image and a release image now differ in {unexpected:?}, which is not on the \
@@ -17327,17 +17205,9 @@ fn cmd_check_irq_scope() -> R<()> {
             let trimmed = line.trim();
 
             if let Some(rest) = line.split("dispatch = sym").nth(1) {
-                let name: String = rest
-                    .trim()
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
+                let name: String = rest.trim().chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
                 if !name.is_empty() {
-                    called.push((
-                        format!("{}:{}", path.display(), i + 1),
-                        path.display().to_string(),
-                        name,
-                    ));
+                    called.push((format!("{}:{}", path.display(), i + 1), path.display().to_string(), name));
                 }
             }
 
@@ -17371,24 +17241,16 @@ fn cmd_check_irq_scope() -> R<()> {
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
                     .collect();
-                if !operand.is_empty()
-                    && !target.is_empty()
-                    && !SYM_OPERAND_ALLOWLIST.contains(&target.as_str())
-                {
-                    stray_sym.push((
-                        format!("{}:{}", path.display(), i + 1),
-                        format!("{operand} = sym {target}"),
-                    ));
+                if !operand.is_empty() && !target.is_empty() && !SYM_OPERAND_ALLOWLIST.contains(&target.as_str()) {
+                    stray_sym.push((format!("{}:{}", path.display(), i + 1), format!("{operand} = sym {target}")));
                 }
             }
 
             if trimmed.starts_with("irq_dispatcher!") {
                 pending_macro_body = true;
             } else if pending_macro_body && trimmed.starts_with("fn ") {
-                let name: String = trimmed[3..]
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
+                let name: String =
+                    trimmed[3..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
                 generated.push((path.display().to_string(), name));
                 pending_macro_body = false;
             }
@@ -17396,19 +17258,10 @@ fn cmd_check_irq_scope() -> R<()> {
             // A plain `fn NAME(` whose body asserts the ring-3 entry invariant. Scanned to
             // the next column-0 `}`, which ends a top-level function.
             if let Some(after) = trimmed.strip_prefix("fn ").or_else(|| {
-                trimmed
-                    .strip_prefix("unsafe extern \"C\" fn ")
-                    .or_else(|| trimmed.strip_prefix("extern \"C\" fn "))
+                trimmed.strip_prefix("unsafe extern \"C\" fn ").or_else(|| trimmed.strip_prefix("extern \"C\" fn "))
             }) {
-                let name: String = after
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
-                let body_end = lines[i..]
-                    .iter()
-                    .position(|l| *l == "}")
-                    .map(|o| i + o)
-                    .unwrap_or(lines.len());
+                let name: String = after.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                let body_end = lines[i..].iter().position(|l| *l == "}").map(|o| i + o).unwrap_or(lines.len());
                 // **Code only, and this file only.** Matched textually anywhere in the
                 // function it would be satisfied by a doc comment that merely mentions the
                 // assertion; pooled across files it would exempt a dispatcher because some
@@ -17425,10 +17278,7 @@ fn cmd_check_irq_scope() -> R<()> {
                 // The expansion is short; the scope call is within a few lines.
                 let end = (i + 12).min(lines.len());
                 let scope_line = lines[i..end].iter().find(|l| l.contains("enter_interrupt"));
-                macro_defs.push((
-                    format!("{}:{}", path.display(), i + 1),
-                    scope_line.map(|l| scope_binding(l)),
-                ));
+                macro_defs.push((format!("{}:{}", path.display(), i + 1), scope_line.map(|l| scope_binding(l))));
             }
         }
         Ok(())
@@ -17566,11 +17416,7 @@ fn cmd_check_arch() -> R<()> {
 /// Recursively visit every `.rs` file under `dir`, calling `f` on each. Like
 /// [`visit_rs_files`], but pruning any directory whose name is in `skip` (e.g. build
 /// output trees, which can be enormous and are not project source).
-fn visit_rs_files_skipping(
-    dir: &Path,
-    skip: &[&str],
-    f: &mut dyn FnMut(&Path) -> R<()>,
-) -> R<()> {
+fn visit_rs_files_skipping(dir: &Path, skip: &[&str], f: &mut dyn FnMut(&Path) -> R<()>) -> R<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
@@ -17605,8 +17451,7 @@ fn host_triple() -> R<String> {
         return Err(format!("rustc -vV exited {}", out.status).into());
     }
     let text = String::from_utf8(out.stdout)?;
-    parse_host_from_rustc_vv(&text)
-        .ok_or_else(|| "rustc -vV did not contain a `host:` line".into())
+    parse_host_from_rustc_vv(&text).ok_or_else(|| "rustc -vV did not contain a `host:` line".into())
 }
 
 /// Find the `host:` line in `rustc -vV` output and return the triple.
@@ -17641,11 +17486,7 @@ fn find_bootx64(limine_root: &Path) -> R<PathBuf> {
     if let Some(found) = walk_for(limine_root, "BOOTX64.EFI")? {
         return Ok(found);
     }
-    Err(format!(
-        "BOOTX64.EFI not found under {}; tarball layout may have changed",
-        limine_root.display()
-    )
-    .into())
+    Err(format!("BOOTX64.EFI not found under {}; tarball layout may have changed", limine_root.display()).into())
 }
 
 fn walk_for(root: &Path, name: &str) -> R<Option<PathBuf>> {
@@ -18096,9 +17937,7 @@ fn cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
     out.extend_from_slice(b"070701");
     // 13 eight-hex fields: ino, mode, uid, gid, nlink, mtime, filesize,
     // devmajor, devminor, rdevmajor, rdevminor, namesize, check.
-    for f in [
-        ino, 0o100644, 0, 0, 1, 0, data.len() as u32, 0, 0, 0, 0, namesize as u32, 0,
-    ] {
+    for f in [ino, 0o100644, 0, 0, 1, 0, data.len() as u32, 0, 0, 0, 0, namesize as u32, 0] {
         out.extend_from_slice(format!("{f:08x}").as_bytes());
     }
     out.extend_from_slice(name.as_bytes());
@@ -18152,8 +17991,7 @@ fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
     }
     for b in bins {
         bytes.extend_from_slice(
-            &fs::read(userspace_bin_path(b))
-                .map_err(|e| format!("read {b} ELF for store hash: {e}"))?,
+            &fs::read(userspace_bin_path(b)).map_err(|e| format!("read {b} ELF for store hash: {e}"))?,
         );
     }
     Ok(format!("/store/{}-{}-{}", store_hash(&bytes), name, version))
@@ -18264,8 +18102,7 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
     let mut ino = 2u32;
     for (name, _why) in INITRAMFS_PROGRAMS {
         let elf = userspace_bin_path(name);
-        let bytes =
-            fs::read(&elf).map_err(|e| format!("read {name} ELF {}: {e}", elf.display()))?;
+        let bytes = fs::read(&elf).map_err(|e| format!("read {name} ELF {}: {e}", elf.display()))?;
         cpio_entry(&mut buf, ino, &format!("sbin/{name}"), &bytes);
         ino += 1;
     }
@@ -18284,22 +18121,11 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
         .into());
     }
     fs::write(out, &buf)?;
-    println!(
-        "xtask: built initramfs ({} of {INITRAMFS_MAX_BYTES} bytes) at {}",
-        buf.len(),
-        out.display()
-    );
+    println!("xtask: built initramfs ({} of {INITRAMFS_MAX_BYTES} bytes) at {}", buf.len(), out.display());
     Ok(())
 }
 
-fn assemble_image(
-    bootx64: &Path,
-    kernel: &Path,
-    conf: &Path,
-    initramfs: &Path,
-    out: &Path,
-    mode: BuildMode,
-) -> R<()> {
+fn assemble_image(bootx64: &Path, kernel: &Path, conf: &Path, initramfs: &Path, out: &Path, mode: BuildMode) -> R<()> {
     require_tool("sgdisk")?;
     require_tool("mformat")?;
     require_tool("mcopy")?;
@@ -18323,12 +18149,18 @@ fn assemble_image(
     //    rides the existing boot disk; no separate QEMU drive is needed.
     run(Command::new("sgdisk")
         .arg("--clear")
-        .arg("-n").arg(format!("1:2048:+{ESP_SIZE_MIB}M")) // ESP: LBA 2048 (1 MiB), bounded
-        .arg("-t").arg("1:ef00")                            // EFI System
-        .arg("-c").arg("1:NITROX_ESP")
-        .arg("-n").arg("2:0:0")                             // nitrox-root: next aligned → end
-        .arg("-t").arg("2:8300")                            // Linux filesystem
-        .arg("-c").arg("2:nitrox-root")
+        .arg("-n")
+        .arg(format!("1:2048:+{ESP_SIZE_MIB}M")) // ESP: LBA 2048 (1 MiB), bounded
+        .arg("-t")
+        .arg("1:ef00") // EFI System
+        .arg("-c")
+        .arg("1:NITROX_ESP")
+        .arg("-n")
+        .arg("2:0:0") // nitrox-root: next aligned → end
+        .arg("-t")
+        .arg("2:8300") // Linux filesystem
+        .arg("-c")
+        .arg("2:nitrox-root")
         .arg(out))?;
 
     // Query each partition's on-disk extent (robust to GPT's end-of-disk reserve).
@@ -18377,10 +18209,16 @@ fn assemble_image(
     let rootfs = work.join("rootfs.ext4");
     let blocks = (root_sectors * 512) / 4096; // 4 KiB block count
     run(Command::new("mke2fs")
-        .arg("-q").arg("-F").arg("-t").arg("ext4")
-        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
-        .arg("-b").arg("4096")
-        .arg("-d").arg(&staging)
+        .arg("-q")
+        .arg("-F")
+        .arg("-t")
+        .arg("ext4")
+        .arg("-O")
+        .arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b")
+        .arg("4096")
+        .arg("-d")
+        .arg(&staging)
         .arg(&rootfs)
         .arg(blocks.to_string()))?;
     splice_into(out, root_lba * 512, &rootfs)?;
@@ -18408,8 +18246,12 @@ fn build_esp(
     let espf = esp.display().to_string();
     run(Command::new("mformat").arg("-i").arg(&espf).arg("-F").arg("-v").arg("NITROX_ESP"))?;
     run(Command::new("mmd")
-        .arg("-i").arg(&espf)
-        .arg("::/EFI").arg("::/EFI/BOOT").arg("::/boot").arg("::/boot/limine"))?;
+        .arg("-i")
+        .arg(&espf)
+        .arg("::/EFI")
+        .arg("::/EFI/BOOT")
+        .arg("::/boot")
+        .arg("::/boot/limine"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(bootx64).arg("::/EFI/BOOT/BOOTX64.EFI"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(conf).arg("::/boot/limine/limine.conf"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(kernel).arg("::/boot/kernel"))?;
@@ -18456,15 +18298,25 @@ fn build_scratch_fs(out: &Path) -> R<()> {
     }
     fs::create_dir_all(&staging)?;
     fs::write(staging.join("README"), SCRATCH_README)?;
-    fs::write(staging.join(SCRATCH_AHEAD), (0..SCRATCH_AHEAD_PAGES * 4096).map(|i| (i % 251) as u8).collect::<Vec<u8>>())?;
+    fs::write(
+        staging.join(SCRATCH_AHEAD),
+        (0..SCRATCH_AHEAD_PAGES * 4096).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+    )?;
     let _ = fs::remove_file(out);
     fs::File::create(out)?.set_len(SCRATCH_MIB * 1024 * 1024)?;
     run(Command::new("mke2fs")
-        .arg("-q").arg("-F").arg("-t").arg("ext4")
-        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
-        .arg("-b").arg("4096")
-        .arg("-L").arg(SCRATCH_LABEL)
-        .arg("-d").arg(&staging)
+        .arg("-q")
+        .arg("-F")
+        .arg("-t")
+        .arg("ext4")
+        .arg("-O")
+        .arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b")
+        .arg("4096")
+        .arg("-L")
+        .arg(SCRATCH_LABEL)
+        .arg("-d")
+        .arg(&staging)
         .arg(out)
         .arg((SCRATCH_MIB * 1024 * 1024 / 4096).to_string()))?;
     Ok(())
@@ -18509,13 +18361,7 @@ fn cmd_image_live_for(mode: BuildMode) -> R<()> {
 /// Assemble the live image at `out`: a GPT disk with one ESP holding everything, `root.img`
 /// included. `root.img` is itself a GPT image with one `nitrox-live` partition, whose ext4
 /// filesystem is built from [`stage_rootfs`] for `mode` — the release root, in RAM, or a test one.
-fn assemble_live_image(
-    bootx64: &Path,
-    kernel: &Path,
-    initramfs: &Path,
-    out: &Path,
-    mode: BuildMode,
-) -> R<()> {
+fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Path, mode: BuildMode) -> R<()> {
     const MIB: u64 = 1024 * 1024;
     require_tool("sgdisk")?;
     require_tool("mformat")?;
@@ -18547,17 +18393,26 @@ fn assemble_live_image(
     fs::File::create(&root_img)?.set_len(root_img_mib * MIB)?;
     run(Command::new("sgdisk")
         .arg("--clear")
-        .arg("-n").arg("1:2048:0")
-        .arg("-t").arg("1:8300")
-        .arg("-c").arg(format!("1:{LIVE_ROOT_PARTLABEL}"))
+        .arg("-n")
+        .arg("1:2048:0")
+        .arg("-t")
+        .arg("1:8300")
+        .arg("-c")
+        .arg(format!("1:{LIVE_ROOT_PARTLABEL}"))
         .arg(&root_img))?;
     let (root_lba, root_sectors) = partition_extent(&root_img, 1)?;
     let rootfs = work.join("rootfs.ext4");
     run(Command::new("mke2fs")
-        .arg("-q").arg("-F").arg("-t").arg("ext4")
-        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
-        .arg("-b").arg("4096")
-        .arg("-d").arg(&staging)
+        .arg("-q")
+        .arg("-F")
+        .arg("-t")
+        .arg("ext4")
+        .arg("-O")
+        .arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b")
+        .arg("4096")
+        .arg("-d")
+        .arg(&staging)
         .arg(&rootfs)
         .arg(((root_sectors * 512) / 4096).to_string()))?;
     splice_into(&root_img, root_lba * 512, &rootfs)?;
@@ -18574,17 +18429,26 @@ fn assemble_live_image(
     fs::File::create(&install_root)?.set_len((source_mib + 2) * MIB)?;
     run(Command::new("sgdisk")
         .arg("--clear")
-        .arg("-n").arg("1:2048:0")
-        .arg("-t").arg("1:8300")
-        .arg("-c").arg(format!("1:{}", libgpt::INSTALL_SOURCE_LABEL))
+        .arg("-n")
+        .arg("1:2048:0")
+        .arg("-t")
+        .arg("1:8300")
+        .arg("-c")
+        .arg(format!("1:{}", libgpt::INSTALL_SOURCE_LABEL))
         .arg(&install_root))?;
     let (source_lba, source_sectors) = partition_extent(&install_root, 1)?;
     let sourcefs = work.join("install-root.ext4");
     run(Command::new("mke2fs")
-        .arg("-q").arg("-F").arg("-t").arg("ext4")
-        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
-        .arg("-b").arg("4096")
-        .arg("-d").arg(&staging)
+        .arg("-q")
+        .arg("-F")
+        .arg("-t")
+        .arg("ext4")
+        .arg("-O")
+        .arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b")
+        .arg("4096")
+        .arg("-d")
+        .arg(&staging)
         .arg(&sourcefs)
         .arg(((source_sectors * 512) / 4096).to_string()))?;
     splice_into(&install_root, source_lba * 512, &sourcefs)?;
@@ -18619,15 +18483,7 @@ fn assemble_live_image(
         .map(|p| fs::metadata(p).map(|m| m.len()))
         .sum::<Result<u64, _>>()?;
     let install_esp_mib = FAT32_MIN_MIB.max(esp_payload.div_ceil(MIB) + 8);
-    build_esp(
-        &install_esp,
-        install_esp_mib * MIB / 512,
-        bootx64,
-        &limine_conf(),
-        kernel,
-        &install_initramfs,
-        &[],
-    )?;
+    build_esp(&install_esp, install_esp_mib * MIB / 512, bootx64, &limine_conf(), kernel, &install_initramfs, &[])?;
 
     // 3. Limine's configuration: the release one, with `root.img` as a module and a menu with a
     //    hardware-report entry and an installer entry, which alone loads the installable ESP and
@@ -18647,9 +18503,12 @@ fn assemble_live_image(
     fs::File::create(out)?.set_len((esp_mib + 2) * MIB)?;
     run(Command::new("sgdisk")
         .arg("--clear")
-        .arg("-n").arg(format!("1:2048:+{esp_mib}M"))
-        .arg("-t").arg("1:ef00")
-        .arg("-c").arg("1:NITROX_ESP")
+        .arg("-n")
+        .arg(format!("1:2048:+{esp_mib}M"))
+        .arg("-t")
+        .arg("1:ef00")
+        .arg("-c")
+        .arg("1:NITROX_ESP")
         .arg(out))?;
     let (esp_lba, esp_sectors) = partition_extent(out, 1)?;
     let esp = work.join("esp.img");
@@ -18709,18 +18568,16 @@ fn live_limine_conf(base: &str) -> R<String> {
     if base[entry_start + entry_line.len()..].contains("\n/") {
         return Err("boot/limine.conf has a second entry; the live menu adds its own".into());
     }
-    let with_root = base.replacen(
-        initramfs_line,
-        &format!("{initramfs_line}    module_path: boot():/boot/root.img\n"),
-        1,
-    );
-    let with_timeout =
-        with_root.replacen(timeout_line, &format!("timeout: {LIVE_MENU_TIMEOUT_SECS}"), 1);
+    let with_root =
+        base.replacen(initramfs_line, &format!("{initramfs_line}    module_path: boot():/boot/root.img\n"), 1);
+    let with_timeout = with_root.replacen(timeout_line, &format!("timeout: {LIVE_MENU_TIMEOUT_SECS}"), 1);
     let entry_start = with_timeout.find(entry_line).expect("checked above");
     let default_entry = with_timeout[entry_start..].trim_end().to_string();
-    let report_entry = default_entry
-        .replacen("/Nitrox", &format!("/{LIVE_REPORT_ENTRY}"), 1)
-        .replacen("\n    path:", "\n    cmdline: hwreport\n    path:", 1);
+    let report_entry = default_entry.replacen("/Nitrox", &format!("/{LIVE_REPORT_ENTRY}"), 1).replacen(
+        "\n    path:",
+        "\n    cmdline: hwreport\n    path:",
+        1,
+    );
     if !report_entry.contains("cmdline: hwreport") {
         return Err("boot/limine.conf's entry has no `path:` line to put the command line beside".into());
     }
@@ -18737,8 +18594,7 @@ fn live_limine_conf(base: &str) -> R<String> {
     // devices no session can use. The plan's worry about what firmware reads before the kernel
     // runs is therefore a worry about *installing*, which is the one boot where paying it buys
     // something.
-    let install_entry = default_entry
-        .replacen("/Nitrox", &format!("/{LIVE_INSTALL_ENTRY}"), 1)
+    let install_entry = default_entry.replacen("/Nitrox", &format!("/{LIVE_INSTALL_ENTRY}"), 1)
         + "\n    module_path: boot():/boot/install-esp.img"
         + "\n    module_path: boot():/boot/install-root.img";
     Ok(format!("{}\n\n{report_entry}\n\n{install_entry}\n", with_timeout.trim_end()))
@@ -18773,10 +18629,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // ever run. Empty here; a test image's `init.toml` binds it (`TEST_BINDS_TOML`) and the harness
     // populates it.
     fs::create_dir_all(staging.join("scratch"))?;
-    fs::write(
-        staging.join("system").join("current-generation"),
-        b"nitrox-rootfs generation 1\n",
-    )?;
+    fs::write(staging.join("system").join("current-generation"), b"nitrox-rootfs generation 1\n")?;
     // **The declarations and the profile manifest** (administration Part E.1c): read by
     // `service-mgr` and the profile server after `init` has mounted this filesystem. The only two
     // files, beside the test package, in which a test root may differ from a release one
@@ -18824,9 +18677,8 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
     // seeded line is one the service reads by construction, where it was formatted by hand here
     // until then.
     {
-        let mut users = Vec::from(
-            &b"# Nitrox user database (auth-service).\n# name:salt_hex:iterations:verifier_hex:home\n"[..],
-        );
+        let mut users =
+            Vec::from(&b"# Nitrox user database (auth-service).\n# name:salt_hex:iterations:verifier_hex:home\n"[..]);
         let mut line = [0u8; libusers::MAX_FILE];
         let n = libusers::write_record(
             &mut line,
@@ -18868,9 +18720,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         let bytes = wallpaper_png()?;
         let n = bytes.len();
         fs::write(&path, &bytes).map_err(|e| format!("stage {}: {e}", path.display()))?;
-        println!(
-            "xtask: seeded {WALLPAPER_PATH} ({WALLPAPER_W}x{WALLPAPER_H}, {n} bytes)"
-        );
+        println!("xtask: seeded {WALLPAPER_PATH} ({WALLPAPER_W}x{WALLPAPER_H}, {n} bytes)");
     }
     // **The folders the browser's sidebar offers** (M14 Part D). Staged here for the demo home.
     // Whoever makes a home makes them: the view broker for every account an administrator adds
@@ -18907,10 +18757,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         fs::copy(userspace_bin_path(prog), cu_bin.join(prog))
             .map_err(|e| format!("stage {prog} into the store: {e}"))?;
     }
-    println!(
-        "xtask: store package {cu_store}/bin/ ({} programs)",
-        programs.len()
-    );
+    println!("xtask: store package {cu_store}/bin/ ({} programs)", programs.len());
 
     // **The desktop entries** — one per graphical application, in the same package as the
     // binaries they name, projected at `/applications` the way `bin/` is projected at `/bin`
@@ -18943,10 +18790,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         )
         .map_err(|e| format!("stage the {exec} desktop entry: {e}"))?;
     }
-    println!(
-        "xtask: store package {cu_store}/applications/ ({} entries)",
-        GRAPHICAL_APPLICATIONS.len()
-    );
+    println!("xtask: store package {cu_store}/applications/ ({} entries)", GRAPHICAL_APPLICATIONS.len());
 
     // The `system` package: the services. Everything init and service-mgr spawn after the
     // root is mounted now resolves through `/bin` like any other program.
@@ -18957,10 +18801,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         fs::copy(userspace_bin_path(prog), sys_bin.join(prog))
             .map_err(|e| format!("stage {prog} into the store: {e}"))?;
     }
-    println!(
-        "xtask: store package {sys_store}/bin/ ({} services)",
-        SYSTEM_SERVICES.len()
-    );
+    println!("xtask: store package {sys_store}/bin/ ({} services)", SYSTEM_SERVICES.len());
 
     // The `test` package: the guest-side gates and the programs they drive. Absent from a
     // release image — `cmd_build` does not even build them outside selftest modes.
@@ -19017,8 +18858,7 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         let mut total = 0u64;
         for from in &faces {
             let name = from.file_name().ok_or("a font asset with no file name")?;
-            total += fs::copy(from, fonts.join(name))
-                .map_err(|e| format!("stage {}: {e}", from.display()))?;
+            total += fs::copy(from, fonts.join(name)).map_err(|e| format!("stage {}: {e}", from.display()))?;
         }
         println!("xtask: seeded /system/fonts ({} files, {total} bytes)", faces.len());
     }
@@ -19028,7 +18868,9 @@ fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
 /// Parse `sgdisk -i <n> <disk>` for partition `n`'s first LBA and sector count.
 fn partition_extent(disk: &Path, n: u32) -> R<(u64, u64)> {
     let out = Command::new("sgdisk")
-        .arg("-i").arg(n.to_string()).arg(disk)
+        .arg("-i")
+        .arg(n.to_string())
+        .arg(disk)
         .output()
         .map_err(|e| format!("failed to run sgdisk -i {n}: {e}"))?;
     if !out.status.success() {
@@ -19092,46 +18934,24 @@ fn locate_ovmf() -> R<Firmware> {
     // i386-named) VARS template; the `/usr/local` paths are a from-source/tarball
     // QEMU install's bundled edk2 firmware.
     let split = [
-        (
-            "/usr/local/share/qemu/edk2-x86_64-code.fd",
-            "/usr/local/share/qemu/edk2-i386-vars.fd",
-        ),
-        (
-            "/usr/share/qemu/edk2-x86_64-code.fd",
-            "/usr/share/qemu/edk2-i386-vars.fd",
-        ),
+        ("/usr/local/share/qemu/edk2-x86_64-code.fd", "/usr/local/share/qemu/edk2-i386-vars.fd"),
+        ("/usr/share/qemu/edk2-x86_64-code.fd", "/usr/share/qemu/edk2-i386-vars.fd"),
         // Debian/Ubuntu's `ovmf` package has shipped the 4 MB build under these names
         // since 22.04, and on current releases they are the *only* ones present — the
         // unsuffixed pair below is older layouts (and the `/usr/share/ovmf/OVMF.fd`
         // single image at the end is older still). Ordered newest-first so a machine
         // with both prefers the split pair, which gives a writable VARS store.
-        (
-            "/usr/share/OVMF/OVMF_CODE_4M.fd",
-            "/usr/share/OVMF/OVMF_VARS_4M.fd",
-        ),
-        (
-            "/usr/share/OVMF/OVMF_CODE.fd",
-            "/usr/share/OVMF/OVMF_VARS.fd",
-        ),
-        (
-            "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
-            "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
-        ),
+        ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+        ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+        ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
     ];
     for (code, vars) in split {
         if Path::new(code).exists() && Path::new(vars).exists() {
-            return Ok(Firmware::Split {
-                code: PathBuf::from(code),
-                vars_template: PathBuf::from(vars),
-            });
+            return Ok(Firmware::Split { code: PathBuf::from(code), vars_template: PathBuf::from(vars) });
         }
     }
     // Legacy single combined image.
-    let single = [
-        "/usr/share/ovmf/OVMF.fd",
-        "/usr/share/qemu/OVMF.fd",
-        "/usr/share/edk2-ovmf/x64/OVMF.fd",
-    ];
+    let single = ["/usr/share/ovmf/OVMF.fd", "/usr/share/qemu/OVMF.fd", "/usr/share/edk2-ovmf/x64/OVMF.fd"];
     for c in single {
         if Path::new(c).exists() {
             return Ok(Firmware::Single(PathBuf::from(c)));
@@ -19148,19 +18968,13 @@ fn locate_ovmf() -> R<Firmware> {
 /// read-only), emitted as `unit=0` CODE (ro) + `unit=1` VARS (rw).
 fn firmware_pflash_args(firmware: &Firmware) -> R<Vec<String>> {
     match firmware {
-        Firmware::Single(code) => Ok(vec![
-            "-drive".into(),
-            format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
-        ]),
+        Firmware::Single(code) => {
+            Ok(vec!["-drive".into(), format!("if=pflash,format=raw,readonly=on,file={}", code.display())])
+        }
         Firmware::Split { code, vars_template } => {
             let vars = build_cache().join("ovmf-vars.fd");
-            fs::copy(vars_template, &vars).map_err(|e| {
-                format!(
-                    "copy OVMF vars {} -> {}: {e}",
-                    vars_template.display(),
-                    vars.display()
-                )
-            })?;
+            fs::copy(vars_template, &vars)
+                .map_err(|e| format!("copy OVMF vars {} -> {}: {e}", vars_template.display(), vars.display()))?;
             Ok(vec![
                 "-drive".into(),
                 format!("if=pflash,unit=0,format=raw,readonly=on,file={}", code.display()),
@@ -19181,10 +18995,7 @@ fn require_tool(name: &str) -> R<()> {
         .status();
     match status {
         Ok(s) if s.success() => Ok(()),
-        _ => Err(format!(
-            "required host tool `{name}` is missing — install it and retry"
-        )
-        .into()),
+        _ => Err(format!("required host tool `{name}` is missing — install it and retry").into()),
     }
 }
 
@@ -19222,8 +19033,10 @@ mod tests {
         assert_eq!(files.iter().map(|f| f.2).sum::<u64>(), 384 << 20);
         let names: std::collections::HashSet<&String> = files.iter().map(|f| &f.1).collect();
         assert_eq!(names.len(), files.len(), "a name twice could not be checked by its name");
-        let short = |n: &str| n.split_once('.').is_some_and(|(b, e)| b.len() <= 8 && e.len() == 3)
-            && n.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'.');
+        let short = |n: &str| {
+            n.split_once('.').is_some_and(|(b, e)| b.len() <= 8 && e.len() == 3)
+                && n.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'.')
+        };
         assert!(files.iter().all(|f| short(&f.1)), "every name a FAT short name, as mcopy needs");
     }
 
@@ -19463,11 +19276,7 @@ mod tests {
                 )
             })
         };
-        assert_eq!(
-            (get("W"), get("H")),
-            GREETER,
-            "the greeter's window and this file's copy of it have drifted"
-        );
+        assert_eq!((get("W"), get("H")), GREETER, "the greeter's window and this file's copy of it have drifted");
     }
 
     /// The gate's copy of the overview's card metrics is the shell's.
@@ -19540,10 +19349,7 @@ mod tests {
     fn the_menu_mark_exists_in_the_shipped_face() {
         let (ui, _) = host_faces().expect("the built-in theme's faces load on the host");
         let mark = libui::menu::MARK.chars().next().expect("MARK is not empty");
-        assert!(
-            ui.has_glyph(mark),
-            "the UI face has no glyph for {mark:?} — a marked menu row would draw a blank"
-        );
+        assert!(ui.has_glyph(mark), "the UI face has no glyph for {mark:?} — a marked menu row would draw a blank");
         assert!(!ui.has_glyph('\u{E000}'), "a private-use codepoint should be absent");
     }
 
@@ -19570,10 +19376,8 @@ mod tests {
         let faces = host_faces().expect("the vendored fonts");
         let frames = preview_frames(&faces);
 
-        let sizes: Vec<(&str, u32, u32)> = frames
-            .iter()
-            .map(|(n, f)| (*n, f.geometry().width, f.geometry().height))
-            .collect();
+        let sizes: Vec<(&str, u32, u32)> =
+            frames.iter().map(|(n, f)| (*n, f.geometry().width, f.geometry().height)).collect();
         let term = libterm::render::reference::size(&faces.1);
         assert_eq!(
             sizes,
@@ -19645,17 +19449,11 @@ mod tests {
         assert_eq!(markers_in_line(&format!("// {}", m("alpha"))), ["alpha"]);
 
         // Two on one line — the case that produced a false failure.
-        assert_eq!(
-            markers_in_line(&format!("// {} and {}: see the doc.", m("alpha"), m("beta"))),
-            ["alpha", "beta"]
-        );
+        assert_eq!(markers_in_line(&format!("// {} and {}: see the doc.", m("alpha"), m("beta"))), ["alpha", "beta"]);
 
         // A bracketed placeholder is skipped and does not stop the scan: a real marker
         // after it on the same line is still found.
-        assert_eq!(
-            markers_in_line(&format!("// spelt {} not {}", m("<tag>"), m("tag"))),
-            ["tag"]
-        );
+        assert_eq!(markers_in_line(&format!("// spelt {} not {}", m("<tag>"), m("tag"))), ["tag"]);
 
         // Not markers.
         assert_eq!(markers_in_line(&format!("// {}", m("has space"))), Vec::<&str>::new());
@@ -19720,8 +19518,7 @@ mod tests {
         assert_eq!(names, ["alpha", "beta", "gamma", "delta", "epsilon", "theta"]);
 
         // Only the marked line is exempt.
-        let exempt: Vec<&str> =
-            got.iter().filter(|(_, e)| *e).map(|(t, _)| t.as_str()).collect();
+        let exempt: Vec<&str> = got.iter().filter(|(_, e)| *e).map(|(t, _)| t.as_str()).collect();
         // `theta` is named on an earlier line as a cross-reference and exempted on its own
         // line below — the geometry `tty-server` -> `session-metadata-server` already has in
         // the real document. First-occurrence-wins drops the exemption and fails the gate
@@ -19773,9 +19570,7 @@ mod tests {
         assert_eq!(echo_source(&two, "alice"), None, "the answer is in neither command");
 
         // The regression, both directions.
-        let step14 = [String::from(
-            "try { fail \"boom\" } catch (e) { format(\"caught={}\", e.message) }",
-        )];
+        let step14 = [String::from("try { fail \"boom\" } catch (e) { format(\"caught={}\", e.message) }")];
         assert!(echo_source(&step14, "boom").is_some(), "the old pattern must be refused");
         assert_eq!(echo_source(&step14, "caught=boom"), None, "the new one must be allowed");
     }
@@ -19824,12 +19619,7 @@ mod tests {
     impl TmpDir {
         fn new(tag: &str) -> Self {
             let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = env::temp_dir().join(format!(
-                "nitrox-xtask-{}-{}-{}",
-                tag,
-                std::process::id(),
-                n
-            ));
+            let path = env::temp_dir().join(format!("nitrox-xtask-{}-{}-{}", tag, std::process::id(), n));
             if path.exists() {
                 fs::remove_dir_all(&path).expect("clear stale tmp");
             }
@@ -19922,19 +19712,13 @@ host: x86_64-unknown-linux-gnu
 release: 1.95.0
 LLVM version: 22.1.2
 ";
-        assert_eq!(
-            parse_host_from_rustc_vv(sample).as_deref(),
-            Some("x86_64-unknown-linux-gnu")
-        );
+        assert_eq!(parse_host_from_rustc_vv(sample).as_deref(), Some("x86_64-unknown-linux-gnu"));
     }
 
     #[test]
     fn parse_host_extracts_macos_triple() {
         let sample = "rustc 1.95.0\nhost: aarch64-apple-darwin\n";
-        assert_eq!(
-            parse_host_from_rustc_vv(sample).as_deref(),
-            Some("aarch64-apple-darwin")
-        );
+        assert_eq!(parse_host_from_rustc_vv(sample).as_deref(), Some("aarch64-apple-darwin"));
     }
 
     #[test]
@@ -20094,7 +19878,10 @@ mod diag_tests {
         assert_eq!(old.centre(), (640, 400));
         assert_eq!((old.bottom_bar_y(), old.bottom_bar_click_y()), (770, 785));
         assert_eq!(old.desktop_name_click(), (1250, 785));
-        assert_eq!((old.task_click(0), old.task_click(1), old.show_desktop_click()), ((141, 785), (331, 785), (20, 785)));
+        assert_eq!(
+            (old.task_click(0), old.task_click(1), old.show_desktop_click()),
+            ((141, 785), (331, 785), (20, 785))
+        );
         assert_eq!(old.card_w(), 293, "the design's 330 on 1440, at this width");
         assert_eq!(old.pin_motions(), 20, "the pin the gates always used at this size");
         let big = DisplaySize::parse("2560x1440").unwrap();
@@ -20387,16 +20174,10 @@ mod diag_tests {
         // because the assertion beside it is that the dialog was centred *on that window* — a
         // parser that dropped the parent would leave the gate checking arithmetic against a
         // window it had not identified.
-        assert_eq!(
-            parse_dialog_placement(" 21 of window 20 at 490,214 340x132"),
-            Some((21, 20, 490, 214, 340, 132))
-        );
+        assert_eq!(parse_dialog_placement(" 21 of window 20 at 490,214 340x132"), Some((21, 20, 490, 214, 340, 132)));
         // A negative origin is legal: the clamp keeps a dialog inside the work area, and the
         // work area's own origin is not the screen's.
-        assert_eq!(
-            parse_dialog_placement("3 of window 2 at -4,24 100x50"),
-            Some((3, 2, -4, 24, 100, 50))
-        );
+        assert_eq!(parse_dialog_placement("3 of window 2 at -4,24 100x50"), Some((3, 2, -4, 24, 100, 50)));
         // And the shapes that must not silently parse as something else.
         assert_eq!(parse_dialog_placement("21 at 490,214 340x132"), None, "no parent");
         assert_eq!(parse_dialog_placement("21 of window 20 at 490 340x132"), None, "no comma");
@@ -20445,11 +20226,8 @@ mod diag_tests {
     #[test]
     fn qmp_connect_reads_past_events_to_the_greeting() {
         const GREETING: &str = "{\"QMP\": {\"version\": {}, \"capabilities\": []}}\n";
-        const RESUME: &str =
-            "{\"timestamp\": {\"seconds\": 1, \"microseconds\": 2}, \"event\": \"RESUME\"}\n";
-        let connect = |events: usize| {
-            super::Qmp::connect(&fake_qmp(format!("{}{GREETING}", RESUME.repeat(events))))
-        };
+        const RESUME: &str = "{\"timestamp\": {\"seconds\": 1, \"microseconds\": 2}, \"event\": \"RESUME\"}\n";
+        let connect = |events: usize| super::Qmp::connect(&fake_qmp(format!("{}{GREETING}", RESUME.repeat(events))));
         assert!(connect(0).is_ok(), "the ordinary order");
         assert!(connect(1).is_ok(), "an event first");
         assert!(connect(super::MAX_EVENTS_BEFORE_GREETING).is_ok(), "as many as allowed");
@@ -20492,5 +20270,4 @@ mod diag_tests {
         assert_eq!(last_window_list(&ended), Some("3 [21:  Files] [23:  notes.txt] [24:  window 24]"));
         assert_eq!(last_window_list("desktop-shell: window list on cli of 3 [21:  Files]"), None);
     }
-
 }

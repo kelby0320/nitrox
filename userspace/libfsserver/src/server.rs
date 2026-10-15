@@ -27,6 +27,7 @@
 
 use crate::serve::{MAX_FILE, MAX_SUFFIX, Served, encode_error, encode_refusal, kerror, reason, serve, serve_grown};
 use crate::{DirEntry, FsError, Refusal, Volume};
+use libkern::*;
 use librsproto::file::{
     DirReplyWriter, forget_request, parse_name_request, parse_read_dir_request, parse_rename_request,
     parse_touch_request,
@@ -40,7 +41,6 @@ use librsproto::{
     OP_FILE_FORGET, OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH, OP_FILE_UNLINK,
     OP_NS_RESOLVE, OP_UNMOUNT, RS_FLAG_REPLY,
 };
-use libkern::*;
 
 /// One page; the memory-object granularity.
 const PAGE: u64 = 4096;
@@ -432,7 +432,10 @@ unsafe fn received() -> &'static [u8] {
     // payload length, itself clamped to the buffer.
     unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        core::slice::from_raw_parts(((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF), payload_len.min(MSG_LEN - PAYLOAD_OFF))
+        core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            payload_len.min(MSG_LEN - PAYLOAD_OFF),
+        )
     }
 }
 
@@ -634,7 +637,8 @@ fn reply_resolve_none(serve_end: u64, request_id: u64) {
     // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset PAYLOAD_OFF.
     let count = unsafe {
         let rs_len =
-            match librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 0) {
+            match librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 0)
+            {
                 Some(n) => n,
                 None => return,
             };
@@ -665,7 +669,8 @@ fn reply_resolve_error(serve_end: u64, request_id: u64, kerror: i32) {
 fn reply_resolve_error_why(serve_end: u64, request_id: u64, kerror: i32, why: &[u8]) {
     // SAFETY: disjoint reply region.
     let elen = unsafe {
-        let reply = core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
+        let reply =
+            core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
         encode_error(reply, request_id, kerror, OP_NS_RESOLVE, why)
     };
     let count = stage_reply(elen, None);
@@ -685,7 +690,8 @@ fn reply_dir_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     // and the transferred handle in REPLY_HANDLES[0].
     unsafe {
         let rs_len =
-            match librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
+            match librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
+            {
                 Some(n) => n,
                 None => return false,
             };
@@ -777,9 +783,7 @@ fn serve_session<V: Volume>(vol: &V, session_ch: u64, serve_end: u64) {
                 let cursor = parse_read_dir_request(body).map(|r| r.cursor).unwrap_or(0);
                 match build_readdir_reply(vol, dir, cursor) {
                     Some(bl) => send_session_reply(session_ch, request_id, bl),
-                    None => {
-                        reply_session_error(session_ch, request_id, OP_FILE_READ_DIR, KError::KernelError.as_i32())
-                    }
+                    None => reply_session_error(session_ch, request_id, OP_FILE_READ_DIR, KError::KernelError.as_i32()),
                 }
             }
             // The name-addressed mutations: each names an entry in the bound directory, so a
@@ -919,7 +923,8 @@ fn reply_session_error(session_ch: u64, request_id: u64, op: u16, kerror: i32) {
 fn reply_session_error_why(session_ch: u64, request_id: u64, op: u16, kerror: i32, why: &[u8]) {
     // SAFETY: disjoint reply region.
     let elen = unsafe {
-        let reply = core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
+        let reply =
+            core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
         encode_error(reply, request_id, kerror, op, why)
     };
     let count = stage_reply(elen, None);
@@ -1048,15 +1053,18 @@ fn serve_control<V: Volume>(vol: &V) {
         let count = match marked {
             Ok(()) => {
                 // SAFETY: REPLY_MSG is a valid buffer; an empty-body reply.
-                let rs_len =
-                    unsafe { librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_UNMOUNT, request_id, RS_FLAG_REPLY, &[], 0) };
+                let rs_len = unsafe {
+                    librsproto::encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_UNMOUNT, request_id, RS_FLAG_REPLY, &[], 0)
+                };
                 rs_len.map_or(0, |n| stage_reply(n, None))
             }
             Err(e) => {
                 // SAFETY: disjoint reply region.
                 let elen = unsafe {
-                    let reply =
-                        core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
+                    let reply = core::slice::from_raw_parts_mut(
+                        ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
+                        MSG_LEN - PAYLOAD_OFF,
+                    );
                     encode_error(reply, request_id, kerror(e).as_i32(), OP_UNMOUNT, b"the state could not be written")
                 };
                 stage_reply(elen, None)
@@ -1110,7 +1118,8 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
         let req = received();
         request_id = librsproto::decode(req).map(|m| m.request_id).unwrap_or(0);
         let content = core::slice::from_raw_parts_mut((&raw mut CONTENT) as *mut u8, MAX_FILE);
-        let reply = core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
+        let reply =
+            core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
         let op = librsproto::decode(req).map(|m| m.op).unwrap_or(0);
         served_op = op;
         // Model A grow-on-resolve: a RESOLVE_GROW request grows the file first, so the map
@@ -1134,8 +1143,10 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
             None => {
                 // SAFETY: disjoint static; reply region as above.
                 let elen = unsafe {
-                    let reply =
-                        core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
+                    let reply = core::slice::from_raw_parts_mut(
+                        ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
+                        MSG_LEN - PAYLOAD_OFF,
+                    );
                     encode_error(reply, request_id, KError::OutOfMemory.as_i32(), served_op, b"")
                 };
                 stage_reply(elen, None)
@@ -1150,8 +1161,10 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
                 // Can't share the device — degrade to an error reply.
                 // SAFETY: disjoint static; reply region as above.
                 let elen = unsafe {
-                    let reply =
-                        core::slice::from_raw_parts_mut(((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF), MSG_LEN - PAYLOAD_OFF);
+                    let reply = core::slice::from_raw_parts_mut(
+                        ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
+                        MSG_LEN - PAYLOAD_OFF,
+                    );
                     encode_error(reply, request_id, KError::KernelError.as_i32(), served_op, b"")
                 };
                 stage_reply(elen, None)

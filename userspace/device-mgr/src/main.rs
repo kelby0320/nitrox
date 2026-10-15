@@ -26,9 +26,9 @@ use alloc::format;
 use alloc::vec::Vec;
 use device_mgr::classes::{Class, Owners, replay};
 use device_mgr::follow::{Change, diff};
+use device_mgr::io as io_table;
 use device_mgr::suffix::{self, Asked};
 use device_mgr::table;
-use device_mgr::io as io_table;
 use libkern::debug::Line;
 use libkern::device::{CacheCounts, DeviceRecord, IoRecord, io, records};
 use libkern::*;
@@ -82,8 +82,7 @@ fn close(h: u64) {
 fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
     unsafe {
-        let Some(rs_len) =
-            encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
+        let Some(rs_len) = encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, flags, body, handles.len() as u16)
         else {
             return false;
         };

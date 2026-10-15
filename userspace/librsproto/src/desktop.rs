@@ -156,12 +156,7 @@ impl<'a> DesktopList<'a> {
         if b.len() < 12 {
             return None;
         }
-        Some(Self {
-            body: &b[12..],
-            count: get_u32(b, 0),
-            current: get_u32(b, 4),
-            truncated: get_u32(b, 8) != 0,
-        })
+        Some(Self { body: &b[12..], count: get_u32(b, 0), current: get_u32(b, 4), truncated: get_u32(b, 8) != 0 })
     }
 
     /// Walk the entries. Stops early on a malformed one rather than guessing at its length.
@@ -235,13 +230,7 @@ impl<'a> Desktop<'a> {
         let path = b"/dev/desktop";
         // SAFETY: a valid path slice and a namespace handle this process holds.
         let po = unsafe {
-            syscall4(
-                SYS_NS_LOOKUP,
-                ns,
-                path.as_ptr() as u64,
-                path.len() as u64,
-                crate::session::DIR_SESSION_RIGHTS,
-            )
+            syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, crate::session::DIR_SESSION_RIGHTS)
         };
         if po < 0 {
             return Err(DesktopError::Transport(po as i32));
@@ -277,11 +266,10 @@ impl<'a> Desktop<'a> {
     pub fn request(&mut self, op: u16, body: &[u8], out: &mut [u8]) -> Result<usize, DesktopError> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-        let len = crate::session::round_trip(self.endpoint, self.buf, request_id, op, body)
-            .map_err(|e| match e {
-                crate::session::WireError::Transport(c) => DesktopError::Transport(c),
-                crate::session::WireError::Protocol => DesktopError::Protocol,
-            })?;
+        let len = crate::session::round_trip(self.endpoint, self.buf, request_id, op, body).map_err(|e| match e {
+            crate::session::WireError::Transport(c) => DesktopError::Transport(c),
+            crate::session::WireError::Protocol => DesktopError::Protocol,
+        })?;
         // `PAYLOAD_OFF`, not a literal: the bound that makes this slice safe is `round_trip`'s
         // own `PAYLOAD_OFF + payload_len > buf.len()` check, and two constants that agree by
         // coincidence are a seam in the one module built to stop implementations diverging
@@ -291,8 +279,8 @@ impl<'a> Desktop<'a> {
         let msg = crate::decode(payload).map_err(|_| DesktopError::Transport(0))?;
         if msg.flags & crate::RS_FLAG_ERROR != 0 {
             // The shell's error reply is its `KError` as four little-endian bytes.
-            let code = (msg.body.len() >= 4)
-                .then(|| i32::from_le_bytes([msg.body[0], msg.body[1], msg.body[2], msg.body[3]]));
+            let code =
+                (msg.body.len() >= 4).then(|| i32::from_le_bytes([msg.body[0], msg.body[1], msg.body[2], msg.body[3]]));
             return Err(DesktopError::Refused(code));
         }
         let n = msg.body.len().min(out.len());
@@ -320,8 +308,7 @@ mod tests {
     #[test]
     fn a_list_round_trips_with_names_and_without() {
         let mut buf = [0u8; 256];
-        let entries =
-            [DesktopEntry { id: 4, name: "work" }, DesktopEntry { id: 7, name: "" }];
+        let entries = [DesktopEntry { id: 4, name: "work" }, DesktopEntry { id: 7, name: "" }];
         let n = write_list(&mut buf, 1, &entries, false).unwrap();
         let list = DesktopList::read(&buf[..n]).unwrap();
         assert_eq!(list.count, 2);

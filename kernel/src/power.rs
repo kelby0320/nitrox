@@ -150,9 +150,7 @@ fn flush_every_disk() {
 fn start_flush(device: &ObjectRef) -> Result<ObjectRef, i32> {
     let po = PendingOperation::try_new().map_err(|_| crate::syscall::KError::OutOfMemory as i32)?;
     // SAFETY: `into_raw` yields the single creation reference; adopt it.
-    let po = unsafe {
-        ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation)
-    };
+    let po = unsafe { ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), KObjectType::PendingOperation) };
     crate::io::block::dispatch_block_flush(device, &po).map_err(|e| e as i32)?;
     Ok(po)
 }

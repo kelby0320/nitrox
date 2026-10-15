@@ -73,8 +73,7 @@ static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
-static mut WAIT_RESULTS: [u8; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE] =
-    [0; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE];
+static mut WAIT_RESULTS: [u8; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE] = [0; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE];
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut SRC_OUT0: u64 = 0;
@@ -220,8 +219,7 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
     };
     // SAFETY: REPLY_MSG is a valid 4 KiB buffer; the rsproto message goes at offset 24.
     let rs_len = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1)
-        {
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], librsproto::OP_READY, 0, 0, &body[..body_len], 1) {
             Some(n) => n,
             None => return false,
         }
@@ -256,8 +254,7 @@ fn reply_channel(serve_end: u64, request_id: u64, write_end: u64) -> bool {
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
     // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset 24.
     let rs_len = unsafe {
-        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1)
-        {
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
             Some(n) => n,
             None => return false,
         }
@@ -285,14 +282,7 @@ fn reply_error(serve_end: u64, request_id: u64, op: u16, kerror: i32) {
     let elen = error_body(&mut ebody, kerror, 0, b"").unwrap_or(0);
     // SAFETY: REPLY_MSG is a valid buffer.
     let rs_len = unsafe {
-        match encode(
-            &mut REPLY_MSG[PAYLOAD_OFF..],
-            op,
-            request_id,
-            RS_FLAG_REPLY | RS_FLAG_ERROR,
-            &ebody[..elen],
-            0,
-        ) {
+        match encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &ebody[..elen], 0) {
             Some(n) => n,
             None => return,
         }
@@ -327,8 +317,7 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>, read_ends: &mut Ve
     // Decode the rsproto request from the IpcMsg payload (offset 24, payload_len).
     // SAFETY: read the header length + form a bounded read-only slice over RECV_MSG.
     let (request_id, asked) = unsafe {
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -395,13 +384,8 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>, read_ends: &mut Ve
     // Transfer the write end to the resolving client; keep the read end tagged.
     if reply_channel(serve_end, request_id, write_end) {
         match &label {
-            Some(l) => kprint(
-                format!("logging-service: opened {}/{}/{}\n", tier_name(tier), principal, l)
-                    .as_bytes(),
-            ),
-            None => {
-                kprint(format!("logging-service: opened {}/{}\n", tier_name(tier), principal).as_bytes())
-            }
+            Some(l) => kprint(format!("logging-service: opened {}/{}/{}\n", tier_name(tier), principal, l).as_bytes()),
+            None => kprint(format!("logging-service: opened {}/{}\n", tier_name(tier), principal).as_bytes()),
         }
         sources.push(Source { handle: read_end, principal, tier, label });
     } else {
@@ -446,8 +430,7 @@ fn received() -> Option<librsproto::Message<'static>> {
             close(RECV_HANDLES[i]);
         }
         RECV_COUNT = 0;
-        let payload_len =
-            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
             ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -662,8 +645,7 @@ fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
         }
         // SAFETY: read payload_len, then a bounded read-only slice over RECV_MSG.
         let body: &[u8] = unsafe {
-            let payload_len =
-                u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             core::slice::from_raw_parts(
                 ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
                 payload_len.min(MSG_LEN - PAYLOAD_OFF),
@@ -720,13 +702,7 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
         };
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for `count`.
         let waited = unsafe {
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                count as u64,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, count as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited < 1 {
             continue;
@@ -738,9 +714,14 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
                 // SAFETY: `waited` records were written; `off + 8` stays inside WAIT_RESULTS.
                 unsafe {
                     u64::from_le_bytes([
-                        WAIT_RESULTS[off], WAIT_RESULTS[off + 1], WAIT_RESULTS[off + 2],
-                        WAIT_RESULTS[off + 3], WAIT_RESULTS[off + 4], WAIT_RESULTS[off + 5],
-                        WAIT_RESULTS[off + 6], WAIT_RESULTS[off + 7],
+                        WAIT_RESULTS[off],
+                        WAIT_RESULTS[off + 1],
+                        WAIT_RESULTS[off + 2],
+                        WAIT_RESULTS[off + 3],
+                        WAIT_RESULTS[off + 4],
+                        WAIT_RESULTS[off + 5],
+                        WAIT_RESULTS[off + 6],
+                        WAIT_RESULTS[off + 7],
                     ])
                 }
             })

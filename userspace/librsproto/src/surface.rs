@@ -250,19 +250,7 @@ impl WindowInfo {
         // `desktop` and `flags` are set by the caller after construction: this constructor
         // takes what `CreateWindow` fixes, and both of those are mutable state the compositor
         // owns rather than creation parameters.
-        Self {
-            id,
-            width,
-            height,
-            x,
-            y,
-            role: role.tag(),
-            dock,
-            reserve,
-            parent,
-            desktop: STICKY_DESKTOP,
-            flags: 0,
-        }
+        Self { id, width, height, x, y, role: role.tag(), dock, reserve, parent, desktop: STICKY_DESKTOP, flags: 0 }
     }
 
     /// Serialise into `out`; returns the length written.
@@ -492,9 +480,7 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
     // writer zeroes is harmless; *not* reading one it sends is a request silently discarded,
     // which is what a centred greeter ran into.
     let (offset_x, offset_y) = match role {
-        Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => {
-            (get_u32(body, 16) as i32, get_u32(body, 20) as i32)
-        }
+        Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => (get_u32(body, 16) as i32, get_u32(body, 20) as i32),
         Role::Panel { .. } => (0, 0),
     };
     Some(CreateWindowRequest { width, height, role, offset_x, offset_y })
@@ -690,7 +676,6 @@ pub fn parse_destroy_window_request(body: &[u8]) -> Option<u32> {
     }
     Some(get_u32(body, 0))
 }
-
 
 // ---------------------------------------------------------------------------
 // Input delivered to a window (M3 Part C).
@@ -1381,8 +1366,7 @@ pub const MAX_DROP_NAME: usize = 64;
 /// So the size lives here, beside the caps it is derived from, and both ends spell it the same
 /// way: the compositor's send buffer and every client receive buffer are this expression rather
 /// than a number that happened to agree.
-pub const MAX_EVENT_BODY: usize =
-    DroppedEvent::HEAD + MAX_ACCEPTOR_NAME + MAX_DROP_PATH + MAX_DROP_NAME;
+pub const MAX_EVENT_BODY: usize = DroppedEvent::HEAD + MAX_ACCEPTOR_NAME + MAX_DROP_PATH + MAX_DROP_NAME;
 
 /// The longest window title accepted, in bytes.
 ///
@@ -1460,12 +1444,7 @@ impl MgrCapture {
         if b.len() < 16 {
             return None;
         }
-        Some(Self {
-            window: get_u32(b, 0),
-            width: get_u32(b, 4),
-            height: get_u32(b, 8),
-            pitch: get_u32(b, 12),
-        })
+        Some(Self { window: get_u32(b, 0), width: get_u32(b, 4), height: get_u32(b, 8), pitch: get_u32(b, 12) })
     }
 }
 
@@ -1905,12 +1884,8 @@ impl StartDrag {
         if b.len() < Self::HEAD {
             return None;
         }
-        let head =
-            Self { window: get_u32(b, 0), kind: get_u32(b, 4), path_len: get_u32(b, 8) };
-        if head.kind == 0
-            || head.kind & !DROP_KINDS_KNOWN != 0
-            || !head.kind.is_power_of_two()
-        {
+        let head = Self { window: get_u32(b, 0), kind: get_u32(b, 4), path_len: get_u32(b, 8) };
+        if head.kind == 0 || head.kind & !DROP_KINDS_KNOWN != 0 || !head.kind.is_power_of_two() {
             return None;
         }
         let len = head.path_len as usize;
@@ -1951,13 +1926,7 @@ impl DroppedEvent {
     pub const HEAD: usize = 24;
 
     /// Serialise the head and the three names into `out`; returns the length written.
-    pub fn write(
-        &self,
-        out: &mut [u8],
-        acceptor: &[u8],
-        path: &[u8],
-        name: &[u8],
-    ) -> Option<usize> {
+    pub fn write(&self, out: &mut [u8], acceptor: &[u8], path: &[u8], name: &[u8]) -> Option<usize> {
         if acceptor.is_empty()
             || acceptor.len() > MAX_ACCEPTOR_NAME
             || path.is_empty()
@@ -2413,9 +2382,7 @@ impl PointerEvent {
             wheel: i16::from_le_bytes([b[14], b[15]]),
             x: i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
             y: i32::from_le_bytes([b[20], b[21], b[22], b[23]]),
-            time_ms: u64::from_le_bytes([
-                b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31],
-            ]),
+            time_ms: u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]]),
         })
     }
 }
@@ -2435,8 +2402,7 @@ mod tests {
     fn a_panel_discards_an_offset_and_the_other_roles_carry_it() {
         let mut buf = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
         let panel = Role::Panel { dock: Edge::Top, reserve: 4 };
-        build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, panel, 77, 88))
-            .expect("encodes");
+        build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, panel, 77, 88)).expect("encodes");
         assert_eq!(&buf[16..24], &[0u8; 8], "a panel put an offset on the wire");
 
         // **Then put an offset there by hand.** Parsing the buffer the correct encoder just
@@ -2446,23 +2412,14 @@ mod tests {
         put_u32(&mut buf, 16, 77);
         put_u32(&mut buf, 20, 88);
         let back = parse_create_window_request(&buf).expect("parses");
-        assert_eq!(
-            (back.offset_x, back.offset_y),
-            (0, 0),
-            "a panel took an offset that was on the wire"
-        );
+        assert_eq!((back.offset_x, back.offset_y), (0, 0), "a panel took an offset that was on the wire");
 
         // And the roles that carry one, round-tripped.
         for role in [Role::Normal, Role::Dialog { parent: 9 }] {
             let mut buf = [0u8; CREATE_WINDOW_REQUEST_LEN];
-            build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, role, 77, -88))
-                .expect("encodes");
+            build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, role, 77, -88)).expect("encodes");
             let back = parse_create_window_request(&buf).expect("parses");
-            assert_eq!(
-                (back.offset_x, back.offset_y),
-                (77, -88),
-                "{role:?} lost the origin it asked for"
-            );
+            assert_eq!((back.offset_x, back.offset_y), (77, -88), "{role:?} lost the origin it asked for");
         }
 
         // And the one role that does.
@@ -2492,8 +2449,7 @@ mod tests {
             Role::Dialog { parent: 9 },
         ] {
             let mut req = [0u8; CREATE_WINDOW_REQUEST_LEN];
-            build_create_window_request(&mut req, &CreateWindowRequest::new(640, 480, role))
-            .expect("request encodes");
+            build_create_window_request(&mut req, &CreateWindowRequest::new(640, 480, role)).expect("request encodes");
 
             let ev = MgrWindowCreated::for_role(3, role, 640, 480);
             assert_eq!(ev.role, get_u16(&req, 8), "role tag for {role:?}");
@@ -2711,18 +2667,10 @@ mod tests {
     #[test]
     fn attach_rejects_an_unknown_pixel_format() {
         let mut buf = [0u8; ATTACH_BUFFER_REQUEST_LEN];
-        let req = AttachBufferRequest {
-            window: 1,
-            buffer: 0,
-            width: 8,
-            height: 8,
-            pitch: 32,
-            format: 7,
-        };
+        let req = AttachBufferRequest { window: 1, buffer: 0, width: 8, height: 8, pitch: 32, format: 7 };
         build_attach_buffer_request(&mut buf, &req).unwrap();
         assert!(parse_attach_buffer_request(&buf).is_none());
     }
-
 
     #[test]
     fn a_key_event_sits_at_the_offsets_the_spec_publishes() {
@@ -2976,14 +2924,7 @@ mod tests {
     #[test]
     fn commit_and_release_round_trip() {
         let mut buf = [0u8; 32];
-        let c = CommitRequest {
-            window: 3,
-            buffer: 1,
-            damage_x: 4,
-            damage_y: 5,
-            damage_w: 16,
-            damage_h: 9,
-        };
+        let c = CommitRequest { window: 3, buffer: 1, damage_x: 4, damage_y: 5, damage_w: 16, damage_h: 9 };
         let n = build_commit_request(&mut buf, &c).unwrap();
         let got = parse_commit_request(&buf[..n]).unwrap();
         assert_eq!((got.window, got.buffer), (3, 1));
@@ -3001,14 +2942,7 @@ mod tests {
         for short in 0..n {
             assert!(parse_create_window_request(&buf[..short]).is_none(), "len {short}");
         }
-        let c = CommitRequest {
-            window: 1,
-            buffer: 0,
-            damage_x: 0,
-            damage_y: 0,
-            damage_w: 1,
-            damage_h: 1,
-        };
+        let c = CommitRequest { window: 1, buffer: 0, damage_x: 0, damage_y: 0, damage_w: 1, damage_h: 1 };
         let n = build_commit_request(&mut buf, &c).unwrap();
         for short in 0..n {
             assert!(parse_commit_request(&buf[..short]).is_none(), "len {short}");
@@ -3028,8 +2962,7 @@ mod tests {
     fn the_three_drop_records_round_trip() {
         let mut b = [0u8; 256];
 
-        let n = DeclareAcceptor { window: 7, kinds: DROP_KIND_FILE }.write(&mut b, b"editor")
-            .unwrap();
+        let n = DeclareAcceptor { window: 7, kinds: DROP_KIND_FILE }.write(&mut b, b"editor").unwrap();
         let (head, name) = DeclareAcceptor::read(&b[..n]).unwrap();
         assert_eq!((head.window, head.kinds, name), (7, DROP_KIND_FILE, "editor"));
 
@@ -3040,14 +2973,7 @@ mod tests {
         assert_eq!((head.window, head.kind), (3, DROP_KIND_DIR));
         assert_eq!((path, label), ("/home/papers", "papers"));
 
-        let ev = DroppedEvent {
-            window: 9,
-            kind: DROP_KIND_FILE,
-            x: -4,
-            y: 11,
-            acceptor_len: 0,
-            path_len: 0,
-        };
+        let ev = DroppedEvent { window: 9, kind: DROP_KIND_FILE, x: -4, y: 11, acceptor_len: 0, path_len: 0 };
         let n = ev.write(&mut b, b"editor", b"/home/a.txt", b"a.txt").unwrap();
         let (head, acceptor, path, label) = DroppedEvent::read(&b[..n]).unwrap();
         assert_eq!((head.window, head.kind, head.x, head.y), (9, DROP_KIND_FILE, -4, 11));
@@ -3074,9 +3000,7 @@ mod tests {
         // **Hand-built bytes, because a round trip only ever tests the writer.** Every case here
         // is one a correct sender cannot emit and a hostile or broken one can.
         let mut b = [0u8; 64];
-        let n = StartDrag { window: 1, kind: DROP_KIND_FILE, path_len: 0 }
-            .write(&mut b, b"/a", b"a")
-            .unwrap();
+        let n = StartDrag { window: 1, kind: DROP_KIND_FILE, path_len: 0 }.write(&mut b, b"/a", b"a").unwrap();
 
         put_u32(&mut b, 8, 0); // a path of nothing
         assert!(StartDrag::read(&b[..n]).is_none());
@@ -3086,14 +3010,7 @@ mod tests {
         assert!(StartDrag::read(&b[..n]).is_none());
 
         let mut d = [0u8; 128];
-        let ev = DroppedEvent {
-            window: 1,
-            kind: DROP_KIND_FILE,
-            x: 0,
-            y: 0,
-            acceptor_len: 0,
-            path_len: 0,
-        };
+        let ev = DroppedEvent { window: 1, kind: DROP_KIND_FILE, x: 0, y: 0, acceptor_len: 0, path_len: 0 };
         let n = ev.write(&mut d, b"e", b"/a", b"a").unwrap();
         // Each length fits on its own; together they run past the end.
         put_u32(&mut d, 16, 20);
@@ -3122,17 +3039,14 @@ mod tests {
         // matched against and answered with, so a shortened one names a different acceptor.
         let long = [b'x'; MAX_ACCEPTOR_NAME + 1];
         let mut wide = [0u8; 128];
-        assert_eq!(
-            DeclareAcceptor { window: 1, kinds: DROP_KIND_FILE }.write(&mut wide, &long),
-            None
-        );
+        assert_eq!(DeclareAcceptor { window: 1, kinds: DROP_KIND_FILE }.write(&mut wide, &long), None);
     }
 }
 
 #[cfg(test)]
 mod title_tests {
-    use super::title::{read, truncate_title, write};
     use super::MAX_TITLE;
+    use super::title::{read, truncate_title, write};
 
     /// The body's own length carries the title's, so a round trip must not need a length field.
     #[test]

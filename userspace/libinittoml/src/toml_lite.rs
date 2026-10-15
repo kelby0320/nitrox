@@ -95,10 +95,7 @@ pub struct ArrayEntry {
 impl ArrayEntry {
     /// The named subtable, if present (e.g. `entry.subtable("options")`).
     pub fn subtable(&self, name: &str) -> Option<&Table> {
-        self.subtables
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, t)| t)
+        self.subtables.iter().find(|(n, _)| n == name).map(|(_, t)| t)
     }
 }
 
@@ -112,11 +109,7 @@ pub struct Document {
 impl Document {
     /// The elements of the `[[name]]` table array (empty slice if none).
     pub fn array(&self, name: &str) -> &[ArrayEntry] {
-        self.arrays
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.as_slice())
-            .unwrap_or(&[])
+        self.arrays.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice()).unwrap_or(&[])
     }
 
     fn array_index(&self, name: &str) -> Option<usize> {
@@ -183,10 +176,7 @@ pub fn parse(input: &str) -> Result<Document, ParseError> {
 
         if let Some(rest) = line.strip_prefix("[[") {
             // Table-array header: `[[name]]`.
-            let name = rest
-                .strip_suffix("]]")
-                .ok_or(err(lineno, ErrorKind::BadHeader))?
-                .trim();
+            let name = rest.strip_suffix("]]").ok_or(err(lineno, ErrorKind::BadHeader))?.trim();
             if name.is_empty() || !is_bare_key(name) {
                 return Err(err(lineno, ErrorKind::BadHeader));
             }
@@ -195,10 +185,7 @@ pub fn parse(input: &str) -> Result<Document, ParseError> {
         } else if let Some(rest) = line.strip_prefix('[') {
             // Table header: `[name.sub]` (one level) — the only `[...]` form init
             // uses. `[name]` (top-level table) is not needed and is rejected.
-            let inner = rest
-                .strip_suffix(']')
-                .ok_or(err(lineno, ErrorKind::BadHeader))?
-                .trim();
+            let inner = rest.strip_suffix(']').ok_or(err(lineno, ErrorKind::BadHeader))?.trim();
             let mut segs = inner.split('.');
             let parent = segs.next().unwrap_or("").trim();
             let sub = segs.next().map(str::trim);
@@ -218,9 +205,7 @@ pub fn parse(input: &str) -> Result<Document, ParseError> {
                 .filter(|&a| !doc.arrays[a].1.is_empty())
                 .ok_or(err(lineno, ErrorKind::UnknownSubtableParent))?;
             let entry = doc.arrays[arr].1.len() - 1;
-            doc.arrays[arr].1[entry]
-                .subtables
-                .push((String::from(sub), Table::new()));
+            doc.arrays[arr].1[entry].subtables.push((String::from(sub), Table::new()));
             let sub_idx = doc.arrays[arr].1[entry].subtables.len() - 1;
             cursor = Cursor::ArraySub { arr, entry, sub: sub_idx };
         } else {
@@ -234,9 +219,7 @@ pub fn parse(input: &str) -> Result<Document, ParseError> {
             let table = match cursor {
                 Cursor::Top => &mut doc.top,
                 Cursor::ArrayMain { arr, entry } => &mut doc.arrays[arr].1[entry].table,
-                Cursor::ArraySub { arr, entry, sub } => {
-                    &mut doc.arrays[arr].1[entry].subtables[sub].1
-                }
+                Cursor::ArraySub { arr, entry, sub } => &mut doc.arrays[arr].1[entry].subtables[sub].1,
             };
             table.insert(String::from(key), value);
         }
@@ -251,9 +234,7 @@ const fn err(line: usize, kind: ErrorKind) -> ParseError {
 
 /// A bare key / header name: non-empty, ASCII alphanumeric plus `_` and `-`.
 fn is_bare_key(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Drop a trailing `# comment`, but not a `#` inside a double-quoted string.
@@ -286,8 +267,7 @@ fn parse_value(s: &str, line: usize) -> Result<Value, ParseError> {
         return Ok(Value::Boolean(false));
     }
     // Integer: decimal, optional leading sign, `_` separators allowed.
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'+')
-    {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'_' || b == b'-' || b == b'+') {
         let mut digits = String::new();
         for b in s.bytes() {
             if b != b'_' {
@@ -352,10 +332,7 @@ mount_point = \"/store\"
 device = \"gpt-partlabel:root\"  # trailing comment
 ";
         let doc = parse(src).unwrap();
-        assert_eq!(
-            doc.array("mount")[0].table.get_str("device"),
-            Some("gpt-partlabel:root")
-        );
+        assert_eq!(doc.array("mount")[0].table.get_str("device"), Some("gpt-partlabel:root"));
     }
 
     #[test]
@@ -374,25 +351,13 @@ device = \"gpt-partlabel:root\"  # trailing comment
 
     #[test]
     fn errors_carry_line_numbers() {
-        assert_eq!(
-            parse("[[mount]]\nbroken\n"),
-            Err(ParseError { line: 2, kind: ErrorKind::MissingEquals })
-        );
-        assert_eq!(
-            parse("[[mount]]\nx = \"oops\n"),
-            Err(ParseError { line: 2, kind: ErrorKind::UnterminatedString })
-        );
+        assert_eq!(parse("[[mount]]\nbroken\n"), Err(ParseError { line: 2, kind: ErrorKind::MissingEquals }));
+        assert_eq!(parse("[[mount]]\nx = \"oops\n"), Err(ParseError { line: 2, kind: ErrorKind::UnterminatedString }));
         assert_eq!(
             parse("[mount.options]\nx = 1\n"),
             Err(ParseError { line: 1, kind: ErrorKind::UnknownSubtableParent })
         );
-        assert_eq!(
-            parse("[[m]]\n[a.b.c]\n"),
-            Err(ParseError { line: 2, kind: ErrorKind::NestingTooDeep })
-        );
-        assert_eq!(
-            parse("[plain]\n"),
-            Err(ParseError { line: 1, kind: ErrorKind::BadHeader })
-        );
+        assert_eq!(parse("[[m]]\n[a.b.c]\n"), Err(ParseError { line: 2, kind: ErrorKind::NestingTooDeep }));
+        assert_eq!(parse("[plain]\n"), Err(ParseError { line: 1, kind: ErrorKind::BadHeader }));
     }
 }

@@ -5,16 +5,13 @@
 //! (`create`/`map`, `enumerate`, `recv`) return directly. Op availability is gated by
 //! the sealed capability traits in [`crate::handle`], so misuse is a compile error.
 
-use libkern::{
-    IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, NsEntry, Notification, RawHandle, Rights, SpawnArgs,
-    ThreadArgs,
-};
+use libkern::{IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, Notification, NsEntry, RawHandle, Rights, SpawnArgs, ThreadArgs};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::exec::Op;
 use crate::handle::{
-    CanBind, CanLookup, CanMapRead, CanMapWrite, CanRead, CanWrite, Handle, MapReadWrite, MemMode,
-    Memory, Namespace, Notify, Only, Process, Resource, Thread,
+    CanBind, CanLookup, CanMapRead, CanMapWrite, CanRead, CanWrite, Handle, MapReadWrite, MemMode, Memory, Namespace,
+    Notify, Only, Process, Resource, Thread,
 };
 use crate::sys;
 
@@ -65,14 +62,7 @@ impl<M: CanRead> Handle<Resource, M> {
         offset: u64,
         len: u64,
     ) -> Result<usize> {
-        let op = IoOp {
-            opcode: IO_OPCODE_READ,
-            flags: 0,
-            buffer: buf.raw().0,
-            buf_offset,
-            offset,
-            length: len,
-        };
+        let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: buf.raw().0, buf_offset, offset, length: len };
         let done = Op::submit(self.raw(), &op)?.await?;
         Ok(done.result as usize)
     }
@@ -88,14 +78,7 @@ impl<M: CanWrite> Handle<Resource, M> {
         offset: u64,
         len: u64,
     ) -> Result<usize> {
-        let op = IoOp {
-            opcode: IO_OPCODE_WRITE,
-            flags: 0,
-            buffer: buf.raw().0,
-            buf_offset,
-            offset,
-            length: len,
-        };
+        let op = IoOp { opcode: IO_OPCODE_WRITE, flags: 0, buffer: buf.raw().0, buf_offset, offset, length: len };
         let done = Op::submit(self.raw(), &op)?.await?;
         Ok(done.result as usize)
     }
@@ -110,11 +93,7 @@ impl<M: CanLookup> Handle<Namespace, M> {
     /// # Safety
     /// The caller asserts the resolved object is of type `T2` with mode `M2` (the same
     /// trust assertion as [`Handle::from_raw`]).
-    pub async unsafe fn lookup<T2, M2>(
-        &self,
-        path: &str,
-        rights: Rights,
-    ) -> Result<Handle<T2, M2>> {
+    pub async unsafe fn lookup<T2, M2>(&self, path: &str, rights: Rights) -> Result<Handle<T2, M2>> {
         let po = sys::ns_lookup(self.raw().0, path.as_ptr() as u64, path.len() as u64, rights.bits());
         if po < 0 {
             return Err(Error::from_status(po as i32));
@@ -133,11 +112,7 @@ impl<M: CanLookup> Handle<Namespace, M> {
         let r = sys::ns_enumerate(self.raw().0, index as u64, out as *mut NsEntry as u64);
         if r < 0 {
             let e = Error::from_status(r as i32);
-            return if e.kind() == ErrorKind::NotFound {
-                Ok(false)
-            } else {
-                Err(e)
-            };
+            return if e.kind() == ErrorKind::NotFound { Ok(false) } else { Err(e) };
         }
         Ok(true)
     }
@@ -153,11 +128,7 @@ impl Handle<Notify, Only> {
         let r = sys::notif_recv(self.raw().0, out as *mut Notification as u64);
         if r < 0 {
             let e = Error::from_status(r as i32);
-            return if e.kind() == ErrorKind::WouldBlock {
-                Ok(false)
-            } else {
-                Err(e)
-            };
+            return if e.kind() == ErrorKind::WouldBlock { Ok(false) } else { Err(e) };
         }
         Ok(true)
     }
@@ -169,12 +140,7 @@ impl<M: CanBind> Handle<Namespace, M> {
     /// — a caller without it gets `Err` with [`ErrorKind::PermissionDenied`]. See
     /// `docs/architecture/syscaps.md`.
     pub fn bind(&self, path: &str, resource: RawHandle) -> Result<()> {
-        let r = sys::ns_bind(
-            self.raw().0,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            resource.0,
-        );
+        let r = sys::ns_bind(self.raw().0, path.as_ptr() as u64, path.len() as u64, resource.0);
         if r < 0 {
             return Err(Error::from_status(r as i32));
         }
@@ -206,10 +172,7 @@ pub fn thread_create(args: &ThreadArgs) -> Result<Handle<Thread, Only>> {
     }
     // SAFETY: `sys_thread_create` returned a fresh thread handle we own.
     Ok(unsafe {
-        Handle::from_raw(
-            RawHandle(h as u64),
-            Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE,
-        )
+        Handle::from_raw(RawHandle(h as u64), Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE)
     })
 }
 
@@ -289,12 +252,9 @@ mod tests {
         sys::reset();
         // The lookup PO completes with `result` = the resolved handle (777).
         sys::script_next(0, 777, false);
-        let ns = unsafe {
-            Handle::<Namespace, crate::handle::NsReadOnly>::from_raw(RawHandle(1), Rights::LOOKUP)
-        };
+        let ns = unsafe { Handle::<Namespace, crate::handle::NsReadOnly>::from_raw(RawHandle(1), Rights::LOOKUP) };
         let resolved: Handle<Resource, ReadOnly> =
-            block_on(unsafe { ns.lookup::<Resource, ReadOnly>("/dev/console", Rights::READ) })
-                .unwrap();
+            block_on(unsafe { ns.lookup::<Resource, ReadOnly>("/dev/console", Rights::READ) }).unwrap();
         assert_eq!(resolved.raw(), RawHandle(777));
     }
 
@@ -302,8 +262,7 @@ mod tests {
     fn read_builds_an_op_and_completes() {
         sys::reset();
         sys::script_next(0, 12, true); // 12 bytes read, ready immediately
-        let res =
-            unsafe { Handle::<Resource, ReadOnly>::from_raw(RawHandle(1), Rights::READ) };
+        let res = unsafe { Handle::<Resource, ReadOnly>::from_raw(RawHandle(1), Rights::READ) };
         let buf = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
         let n = block_on(res.read(&buf, 0, 0, 64)).unwrap();
         assert_eq!(n, 12);

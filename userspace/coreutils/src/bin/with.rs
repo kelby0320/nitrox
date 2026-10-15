@@ -37,7 +37,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use libprompt::ask_password;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::{IPC_PAYLOAD_SIZE, KIND_TERMINATE_REQUESTED, Notification};
 use libkern::scrub;
@@ -45,13 +44,14 @@ use libkern::syscall::{
     SYS_CLOCK_READ, SYS_HANDLE_DUPLICATE, SYS_NOTIF_RECV, SYS_NS_DERIVE, syscall1, syscall2, syscall4,
 };
 use libkern::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, exit};
+use libprompt::ask_password;
+use libprompt::ipc::{call, close, lookup, recv, send, wait};
 use librsproto::views::*;
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::diag::Level;
 use libstream::table::TableWriter;
 use libstream::wire::{Value, write_value};
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag};
-use libprompt::ipc::{call, close, lookup, recv, send, wait};
 use libviews::outcome;
 use libviews::{Handed, REQUEST_ID};
 
@@ -379,8 +379,7 @@ fn wait_for_exit(stage: &Stage, ch: u64) -> ! {
             // A request to stop, from the shell: pass it on, once. The program decides.
             loop {
                 // SAFETY: NOTIF is a valid 64-byte out-param.
-                let r =
-                    unsafe { syscall4(SYS_NOTIF_RECV, stage.notif, (&raw mut NOTIF) as u64, 0, 0) };
+                let r = unsafe { syscall4(SYS_NOTIF_RECV, stage.notif, (&raw mut NOTIF) as u64, 0, 0) };
                 if r != 0 {
                     break;
                 }

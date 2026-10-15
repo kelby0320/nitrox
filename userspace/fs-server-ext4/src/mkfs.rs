@@ -163,11 +163,8 @@ impl Geometry {
         // group — see the loop at the end of this function, which is why `blocks_count` is a
         // variable rather than `p.blocks`.
         let mut blocks_count = p.blocks;
-        let mut groups =
-            blocks_count.saturating_sub(first_data_block as u64).div_ceil(blocks_per_group as u64)
-                as u32;
-        let mut gdt_blocks =
-            (groups as u64 * DESC_SIZE as u64).div_ceil(p.block_size as u64) as u32;
+        let mut groups = blocks_count.saturating_sub(first_data_block as u64).div_ceil(blocks_per_group as u64) as u32;
+        let mut gdt_blocks = (groups as u64 * DESC_SIZE as u64).div_ceil(p.block_size as u64) as u32;
 
         // **Inodes: the ratio, then a cap.** The table is written out in full — there is no
         // `lazy_itable_init` without `metadata_csum` — so every inode costs 256 bytes of
@@ -175,10 +172,7 @@ impl Geometry {
         // 61 million of them, which is 16 GiB to write before the first file exists. A
         // million inodes is a generous ceiling for a personal machine's root and costs 256
         // MiB, so that is the cap.
-        let by_ratio = p
-            .blocks
-            .saturating_mul(p.block_size as u64)
-            / p.bytes_per_inode.max(1) as u64;
+        let by_ratio = p.blocks.saturating_mul(p.block_size as u64) / p.bytes_per_inode.max(1) as u64;
         let wanted = by_ratio.clamp(FIRST_INO as u64 + 1, MAX_INODES);
         // Round the per-group count so an inode table is a whole number of blocks, and keep
         // it at least one block: a group with a fraction of a block of inodes has nowhere to
@@ -225,9 +219,7 @@ impl Geometry {
                 blocks_per_group,
                 groups,
                 inodes_per_group,
-                inodes_count: inodes_per_group
-                    .checked_mul(groups)
-                    .ok_or(MkfsError::TooLarge)?,
+                inodes_count: inodes_per_group.checked_mul(groups).ok_or(MkfsError::TooLarge)?,
                 itable_blocks,
                 gdt_blocks,
             };
@@ -243,8 +235,7 @@ impl Geometry {
             // Cut the filesystem at the start of the group being dropped.
             blocks_count = g.group_start(last);
             groups -= 1;
-            gdt_blocks =
-                (groups as u64 * DESC_SIZE as u64).div_ceil(p.block_size as u64) as u32;
+            gdt_blocks = (groups as u64 * DESC_SIZE as u64).div_ceil(p.block_size as u64) as u32;
         };
         Ok(g)
     }
@@ -315,11 +306,7 @@ const MAX_INODES: u64 = 1 << 20;
 /// immediately, and zeroing a terabyte to make an empty filesystem is time spent for nothing.
 /// Every structure a reader or `e2fsck` looks at *is* written, including the parts of a
 /// bitmap and an inode table that describe nothing yet, because those are read.
-pub fn format<W: BlockWriter>(
-    w: &W,
-    p: &Params,
-    progress: &mut dyn FnMut(u32, u32),
-) -> Result<Geometry, FsError> {
+pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u32)) -> Result<Geometry, FsError> {
     let g = Geometry::new(p).map_err(MkfsError::fs_error)?;
     let bs = p.block_size as usize;
 
@@ -479,11 +466,7 @@ fn descriptor(g: &Geometry, group: u32) -> [u8; DESC_SIZE as usize] {
 ///
 /// A backup's `s_block_group_nr` names its own group, which is how `e2fsck -b` knows which
 /// copy it is reading.
-fn write_super_and_gdt<W: BlockWriter>(
-    w: &W,
-    g: &Geometry,
-    sb: &[u8; 1024],
-) -> Result<(), FsError> {
+fn write_super_and_gdt<W: BlockWriter>(w: &W, g: &Geometry, sb: &[u8; 1024]) -> Result<(), FsError> {
     let bs = g.block_size as u64;
     // **A block of descriptors at a time**, filled from [`descriptor`]. The table is 59 blocks
     // on a terabyte, and this library holds one block of scratch.
@@ -512,8 +495,7 @@ fn write_super_and_gdt<W: BlockWriter>(
                     break;
                 }
                 let at = i * DESC_SIZE as usize;
-                block[at..at + DESC_SIZE as usize]
-                    .copy_from_slice(&descriptor(g, described));
+                block[at..at + DESC_SIZE as usize].copy_from_slice(&descriptor(g, described));
             }
             w.write_at(gdt_at + b as u64 * bs, &block[..g.block_size as usize])?;
         }
@@ -567,11 +549,7 @@ mod tests {
     fn backups_land_on_0_1_and_the_powers_of_3_5_and_7() {
         let g = Geometry::new(&params(1 << 20, 4096)).unwrap();
         let with: Vec<u32> = (0..400u32).filter(|&n| g.has_super(n)).collect();
-        assert_eq!(
-            with,
-            [0, 1, 3, 5, 7, 9, 25, 27, 49, 81, 125, 243, 343],
-            "0 and 1 always, then 3^n, 5^n and 7^n"
-        );
+        assert_eq!(with, [0, 1, 3, 5, 7, 9, 25, 27, 49, 81, 125, 243, 343], "0 and 1 always, then 3^n, 5^n and 7^n");
     }
 
     /// The last group is short whenever the size does not divide, and every other group is
@@ -666,10 +644,7 @@ mod tests {
 
     #[test]
     fn a_filesystem_too_small_to_hold_its_own_metadata_is_refused() {
-        assert_eq!(
-            Geometry::new(&params(16, 1024)),
-            Err(MkfsError::TooSmall { have: 16, need: MIN_BLOCKS })
-        );
+        assert_eq!(Geometry::new(&params(16, 1024)), Err(MkfsError::TooSmall { have: 16, need: MIN_BLOCKS }));
         assert!(matches!(Geometry::new(&params(4096, 512)), Err(MkfsError::BlockSize(512))));
         assert_eq!(Geometry::new(&params(1 << 33, 4096)), Err(MkfsError::TooLarge));
     }

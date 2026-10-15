@@ -50,16 +50,14 @@
 use core::ptr;
 
 use crate::arch::Paging;
-use crate::arch::abi::{
-    DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_STACK_GUARD_SIZE, USER_VIRT_END,
-};
+use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_STACK_GUARD_SIZE, USER_VIRT_END};
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::handle::KObjectType;
+use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{Caching, PAGE_SIZE, PhysAddr, VirtAddr, heap};
 use crate::object::{FileObject, MemoryObject, ObjectRef};
-use crate::libkern::lockrank::LockRank;
 
 /// Base of the `hint == 0` ("anywhere") mapping window for
 /// [`AddressSpace::find_free_range`]: above the ELF image (loaded at
@@ -168,12 +166,7 @@ impl AddressSpace {
             ptr::write_bytes(virt, 0, PAGE_SIZE);
             Paging::inherit_kernel_mappings(root);
         }
-        Ok(AddressSpace {
-            inner: SpinLock::new(LockRank::KernelObject, Inner {
-                vma_tree: VmaTree::new(),
-                root,
-            }),
-        })
+        Ok(AddressSpace { inner: SpinLock::new(LockRank::KernelObject, Inner { vma_tree: VmaTree::new(), root }) })
     }
 
     /// Physical base of this address space's top-level page table. The
@@ -258,16 +251,12 @@ impl AddressSpace {
                 Err(ArchMapError::AlreadyMapped) => {
                     // Impossible: we hold the AS lock and pre-checked
                     // overlap; a PTE for this virt can't already exist.
-                    unreachable!(
-                        "ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check"
-                    );
+                    unreachable!("ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check");
                 }
                 Err(ArchMapError::Misaligned) => {
                     // Impossible: VAddrRange enforces page alignment,
                     // and the per-page virt is start + i*PAGE_SIZE.
-                    unreachable!(
-                        "ArchPaging::map_page returned Misaligned for a page-aligned per-page address"
-                    );
+                    unreachable!("ArchPaging::map_page returned Misaligned for a page-aligned per-page address");
                 }
             }
         }
@@ -298,11 +287,7 @@ impl AddressSpace {
     /// box is returned on any rejection. Allocates nothing, so the only error
     /// is a structural rejection — never [`OutOfMemory`](MapError::OutOfMemory).
     pub fn map_vma_lazy(&self, boxed: KBox<Vma>) -> Result<(), (KBox<Vma>, MapError)> {
-        debug_assert_eq!(
-            boxed.mapping,
-            MappingKind::Anonymous,
-            "map_vma_lazy is for anonymous mappings only"
-        );
+        debug_assert_eq!(boxed.mapping, MappingKind::Anonymous, "map_vma_lazy is for anonymous mappings only");
         let range = boxed.range;
 
         // Endpoint canonicality (same reasoning as map_vma: test end-1).
@@ -398,9 +383,7 @@ impl AddressSpace {
                     // `page_base` is page-aligned by construction.
                     Err(ArchMapError::AlreadyMapped | ArchMapError::Misaligned) => {
                         heap::buddy_free(phys, 0);
-                        unreachable!(
-                            "fault_in: map_page rejected a fresh page-aligned not-present mapping"
-                        );
+                        unreachable!("fault_in: map_page rejected a fresh page-aligned not-present mapping");
                     }
                 }
                 // SAFETY: ring-0 `invlpg` evicting the not-present entry the
@@ -501,15 +484,11 @@ impl AddressSpace {
                 }
                 Err(ArchMapError::AlreadyMapped) => {
                     // Impossible: overlap was pre-checked under the lock.
-                    unreachable!(
-                        "ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check"
-                    );
+                    unreachable!("ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check");
                 }
                 Err(ArchMapError::Misaligned) => {
                     // Impossible: VAddrRange enforces page alignment.
-                    unreachable!(
-                        "ArchPaging::map_page returned Misaligned for a page-aligned per-page address"
-                    );
+                    unreachable!("ArchPaging::map_page returned Misaligned for a page-aligned per-page address");
                 }
             }
         }
@@ -520,10 +499,7 @@ impl AddressSpace {
             Ok(()) => Ok(()),
             Err(mut b) => {
                 rollback_object_map(root, range.start(), installed);
-                let object = b
-                    .object
-                    .take()
-                    .expect("object-backed VMA carries its ObjectRef");
+                let object = b.object.take().expect("object-backed VMA carries its ObjectRef");
                 Err((object, MapError::Overlap))
             }
         }
@@ -584,10 +560,7 @@ impl AddressSpace {
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
             Err(mut b) => {
-                let object = b
-                    .object
-                    .take()
-                    .expect("file-backed VMA carries its ObjectRef");
+                let object = b.object.take().expect("file-backed VMA carries its ObjectRef");
                 drop(guard);
                 refused(object, MapError::Overlap)
             }
@@ -627,9 +600,7 @@ impl AddressSpace {
         let Some(vma) = guard.vma_tree.find_covering(addr) else {
             return false;
         };
-        if vma.mapping != MappingKind::FileBacked
-            || vma.object.as_ref().map(|o| o.as_ptr()) != Some(object.as_ptr())
-        {
+        if vma.mapping != MappingKind::FileBacked || vma.object.as_ref().map(|o| o.as_ptr()) != Some(object.as_ptr()) {
             return false;
         }
         let flags = page_flags_for(vma.prot, vma.caching);
@@ -671,9 +642,7 @@ impl AddressSpace {
     /// mapping window (`[MMAP_BASE, MMAP_MAX)`), for `sys_memory_map(hint=0)`.
     pub fn find_free_range(&self, size: u64) -> Option<VAddrRange> {
         let guard = self.inner.lock();
-        guard
-            .vma_tree
-            .find_free_range(VirtAddr::new(MMAP_BASE), VirtAddr::new(MMAP_MAX), size)
+        guard.vma_tree.find_free_range(VirtAddr::new(MMAP_BASE), VirtAddr::new(MMAP_MAX), size)
     }
 
     /// Remove the VMA covering `addr`: drop it from the tree, then walk
@@ -725,10 +694,7 @@ impl AddressSpace {
         if ((frames.capacity() - frames.len()) as u64) < pages {
             return Err(pages);
         }
-        let boxed = guard
-            .vma_tree
-            .remove_covering(addr)
-            .expect("find_covering matched under the same hold");
+        let boxed = guard.vma_tree.remove_covering(addr).expect("find_covering matched under the same hold");
         for i in 0..boxed.range.pages() {
             let virt = VirtAddr::new(boxed.range.start().as_u64() + i * (PAGE_SIZE as u64));
             // SAFETY: every page in the range was mapped by a prior `map_vma`
@@ -737,9 +703,7 @@ impl AddressSpace {
             let r = unsafe { Paging::unmap_page(guard.root, virt) };
             if let Ok(phys) = r {
                 if matches!(boxed.mapping, MappingKind::Anonymous) {
-                    frames
-                        .try_push(phys)
-                        .expect("within the spare capacity checked above");
+                    frames.try_push(phys).expect("within the spare capacity checked above");
                 }
             }
         }
@@ -897,27 +861,18 @@ mod tests {
     fn in_stack_guard_catches_overlap_not_adjacency() {
         let page = PAGE_SIZE as u64;
         // Wholly inside.
-        assert!(AddressSpace::in_stack_guard(
-            USER_STACK_GUARD_BOTTOM + page,
-            USER_STACK_GUARD_BOTTOM + 2 * page
-        ));
+        assert!(AddressSpace::in_stack_guard(USER_STACK_GUARD_BOTTOM + page, USER_STACK_GUARD_BOTTOM + 2 * page));
         // Straddling the bottom edge, which is the case a "contains the start" test misses.
         assert!(AddressSpace::in_stack_guard(USER_STACK_GUARD_BOTTOM - page, USER_STACK_BOTTOM));
         // Straddling the top edge, into the stack itself.
         assert!(AddressSpace::in_stack_guard(USER_STACK_BOTTOM - page, USER_STACK_BOTTOM + page));
         // Spanning the whole gap without either endpoint inside it — the case a
         // "contains an endpoint" test misses, and the one a large mapping actually takes.
-        assert!(AddressSpace::in_stack_guard(
-            USER_STACK_GUARD_BOTTOM - page,
-            USER_STACK_BOTTOM + page
-        ));
+        assert!(AddressSpace::in_stack_guard(USER_STACK_GUARD_BOTTOM - page, USER_STACK_BOTTOM + page));
 
         // Ending exactly at the gap's first byte is *not* an overlap; refusing it would
         // make the window one page smaller than it says it is.
-        assert!(!AddressSpace::in_stack_guard(
-            USER_STACK_GUARD_BOTTOM - page,
-            USER_STACK_GUARD_BOTTOM
-        ));
+        assert!(!AddressSpace::in_stack_guard(USER_STACK_GUARD_BOTTOM - page, USER_STACK_GUARD_BOTTOM));
         // Starting exactly at the stack's first byte is above the gap, not in it.
         assert!(!AddressSpace::in_stack_guard(USER_STACK_BOTTOM, USER_STACK_BOTTOM + page));
         // Far below.
@@ -950,8 +905,7 @@ mod tests {
     }
 
     fn anon_box(r: VAddrRange, prot: Protection) -> KBox<Vma> {
-        KBox::try_new(Vma::new(r, prot, MappingKind::Anonymous))
-            .expect("test heap exhausted")
+        KBox::try_new(Vma::new(r, prot, MappingKind::Anonymous)).expect("test heap exhausted")
     }
 
     #[test]
@@ -971,8 +925,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().expect("new must succeed");
         let r = range(PAGE * 4, PAGE * 5);
-        asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER))
-            .expect("map must succeed");
+        asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect("map must succeed");
 
         // SAFETY: translate is read-only against the live tables we
         // just populated. The root is owned by `asp`.
@@ -989,8 +942,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().expect("new must succeed");
         let r = range(PAGE * 8, PAGE * 16);
-        asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER))
-            .expect("map must succeed");
+        asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect("map must succeed");
 
         // Each page in the range is mapped; the addresses immediately
         // before and after are not.
@@ -1009,12 +961,9 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().expect("new must succeed");
         let r = range(PAGE * 4, PAGE * 8);
-        asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER))
-            .expect("map must succeed");
+        asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect("map must succeed");
 
-        let removed = asp
-            .unmap_covering(va(PAGE * 5))
-            .expect("unmap must find covering vma");
+        let removed = asp.unmap_covering(va(PAGE * 5)).expect("unmap must find covering vma");
         assert_eq!(removed.range, r);
         assert!(asp.is_empty());
 
@@ -1028,17 +977,11 @@ mod tests {
     fn map_rejects_overlap_with_existing_vma() {
         init_global_heap();
         let asp = AddressSpace::new().expect("new must succeed");
-        asp.map_vma(anon_box(
-            range(PAGE * 4, PAGE * 8),
-            Protection::WRITE | Protection::USER,
-        ))
-        .expect("first map must succeed");
+        asp.map_vma(anon_box(range(PAGE * 4, PAGE * 8), Protection::WRITE | Protection::USER))
+            .expect("first map must succeed");
 
         let err = asp
-            .map_vma(anon_box(
-                range(PAGE * 6, PAGE * 10),
-                Protection::WRITE | Protection::USER,
-            ))
+            .map_vma(anon_box(range(PAGE * 6, PAGE * 10), Protection::WRITE | Protection::USER))
             .expect_err("overlapping map must fail");
         assert_eq!(err.1, MapError::Overlap);
         // The returned box should still carry the rejected range.
@@ -1056,20 +999,13 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().expect("new must succeed");
         // A range that ends past USER_VIRT_END is rejected.
-        let r = VAddrRange::new(
-            va(USER_VIRT_END - PAGE),
-            va(USER_VIRT_END + PAGE),
-        )
-        .unwrap();
+        let r = VAddrRange::new(va(USER_VIRT_END - PAGE), va(USER_VIRT_END + PAGE)).unwrap();
         let err = asp
             .map_vma(anon_box(r, Protection::WRITE | Protection::USER))
             .expect_err("kernel-half range must be rejected");
         // The error is NotUserHalf, or NotCanonical depending on which
         // check triggers first — both are acceptable rejections.
-        assert!(matches!(
-            err.1,
-            MapError::NotUserHalf | MapError::NotCanonical
-        ));
+        assert!(matches!(err.1, MapError::NotUserHalf | MapError::NotCanonical));
     }
 
     #[test]
@@ -1078,11 +1014,7 @@ mod tests {
         let asp = AddressSpace::new().expect("new must succeed");
         assert!(asp.unmap_covering(va(PAGE * 100)).is_none());
         // Even with one mapped VMA, an addr not covered returns None.
-        asp.map_vma(anon_box(
-            range(PAGE * 4, PAGE * 8),
-            Protection::WRITE | Protection::USER,
-        ))
-        .unwrap();
+        asp.map_vma(anon_box(range(PAGE * 4, PAGE * 8), Protection::WRITE | Protection::USER)).unwrap();
         assert!(asp.unmap_covering(va(PAGE * 20)).is_none());
         assert_eq!(asp.len(), 1);
     }
@@ -1098,11 +1030,8 @@ mod tests {
             let asp = AddressSpace::new().expect("new must succeed");
             for i in 0..4u64 {
                 let start = (i * 8) * PAGE;
-                asp.map_vma(anon_box(
-                    range(start, start + PAGE * 4),
-                    Protection::WRITE | Protection::USER,
-                ))
-                .expect("map must succeed");
+                asp.map_vma(anon_box(range(start, start + PAGE * 4), Protection::WRITE | Protection::USER))
+                    .expect("map must succeed");
             }
             // Drop runs at end of iteration.
         }
@@ -1115,9 +1044,7 @@ mod tests {
     /// Adopt a `MemoryObject`'s creation reference into an `ObjectRef`.
     fn into_obj(m: KBox<MemoryObject>) -> ObjectRef {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(KBox::into_raw(m).as_ptr() as *mut (), KObjectType::MemoryObject)
-        }
+        unsafe { ObjectRef::from_raw(KBox::into_raw(m).as_ptr() as *mut (), KObjectType::MemoryObject) }
     }
 
     fn uprot() -> Protection {
@@ -1132,14 +1059,12 @@ mod tests {
         let frames = [m.frames()[0], m.frames()[1], m.frames()[2]];
         let obj = into_obj(m);
 
-        asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj)
-            .expect("map_object must succeed");
+        asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_object must succeed");
 
         // Each mapped page translates to the object's own frame — not a
         // freshly allocated one (this is what makes the object shareable).
         for i in 0..3u64 {
-            let phys = unsafe { Paging::translate(asp.root(), va(PAGE * (4 + i))) }
-                .expect("page must be mapped");
+            let phys = unsafe { Paging::translate(asp.root(), va(PAGE * (4 + i))) }.expect("page must be mapped");
             assert_eq!(phys, frames[i as usize], "page {i} not pointing at object frame");
         }
         assert_eq!(asp.len(), 1);
@@ -1176,9 +1101,7 @@ mod tests {
         let keep = obj.clone();
 
         asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
-        let removed = asp
-            .unmap_covering(va(PAGE * 4))
-            .expect("unmap must find the covering vma");
+        let removed = asp.unmap_covering(va(PAGE * 4)).expect("unmap must find the covering vma");
         // PTE is gone.
         assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_none());
         // Dropping the removed VMA releases its object reference, but `keep`
@@ -1207,9 +1130,7 @@ mod tests {
     /// Adopt a `FileObject`'s creation reference into an `ObjectRef`.
     fn into_file(f: KBox<FileObject>) -> ObjectRef {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        unsafe {
-            ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject)
-        }
+        unsafe { ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject) }
     }
 
     /// **Dropping an address space must release its file-backed VMAs without a lock-order
@@ -1242,8 +1163,7 @@ mod tests {
         let asp = AddressSpace::new().unwrap();
         test_probe::reset();
         let obj = into_file(FileObject::try_new(3 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
-        asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj)
-            .expect("map_file must succeed");
+        asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_file must succeed");
         // The VMA is now the only reference: `obj` was moved into it above.
         assert_eq!(test_probe::file_object_destroys(), 0, "the mapping holds the file alive");
         drop(asp);
@@ -1258,8 +1178,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let obj = into_file(FileObject::try_new(3 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
-        asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj)
-            .expect("map_file must succeed");
+        asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_file must succeed");
         assert_eq!(asp.len(), 1, "the VMA is reserved");
         // No frame is backed yet — every page is lazy.
         for i in 0..3u64 {
@@ -1281,9 +1200,7 @@ mod tests {
         // file_backing returns the same object + the page index within the file
         // (the VMA maps the file from offset 0, so VMA page i == file page i).
         for (vma_page, want_index) in [(4u64, 0usize), (5, 1), (7, 3)] {
-            let (got_obj, index) = asp
-                .file_backing(va(PAGE * vma_page))
-                .expect("covered by the file mapping");
+            let (got_obj, index) = asp.file_backing(va(PAGE * vma_page)).expect("covered by the file mapping");
             assert_eq!(got_obj.as_ptr(), obj_ptr, "same backing object");
             assert_eq!(index, want_index, "page index for vma page {vma_page}");
         }
@@ -1307,8 +1224,7 @@ mod tests {
 
         // File page 1 lives at VMA page 5 (range starts at page 4). Map it.
         assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
-        let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) }
-            .expect("page must now be mapped");
+        let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) }.expect("page must now be mapped");
         assert_eq!(phys, frame, "PTE points at the cache frame");
         // Idempotent: a racing re-map of the same page still reports present.
         assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
@@ -1411,8 +1327,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let r = range(PAGE * 4, PAGE * 8);
-        asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER))
-            .expect("lazy reserve must succeed");
+        asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER)).expect("lazy reserve must succeed");
         // The VMA is in the tree...
         assert_eq!(asp.len(), 1);
         // ...but no page is backed yet.
@@ -1426,8 +1341,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let r = range(PAGE * 4, PAGE * 8);
-        asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER))
-            .unwrap();
+        asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER)).unwrap();
 
         // Fault in only the page at PAGE*5 (a sub-page-aligned address rounds
         // down to its page base).
@@ -1451,8 +1365,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         // USER but not WRITE: a read-only user mapping.
-        asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 5), Protection::USER))
-            .unwrap();
+        asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 5), Protection::USER)).unwrap();
         assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Write), FaultIn::Protection);
         // Refused — still unbacked.
         assert!(!is_mapped(&asp, va(PAGE * 4)));
@@ -1466,11 +1379,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         // WRITE|USER but not EXEC.
-        asp.map_vma_lazy(anon_box(
-            range(PAGE * 4, PAGE * 5),
-            Protection::WRITE | Protection::USER,
-        ))
-        .unwrap();
+        asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 5), Protection::WRITE | Protection::USER)).unwrap();
         assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Execute), FaultIn::Protection);
         assert!(!is_mapped(&asp, va(PAGE * 4)));
     }
@@ -1483,8 +1392,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let r = range(PAGE * 4, PAGE * 8);
-        asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER))
-            .unwrap();
+        asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER)).unwrap();
         assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Write), FaultIn::Mapped);
         assert_eq!(asp.fault_in(va(PAGE * 6), FaultAccess::Write), FaultIn::Mapped);
 
@@ -1504,11 +1412,7 @@ mod tests {
         init_global_heap();
         for _ in 0..8 {
             let asp = AddressSpace::new().unwrap();
-            asp.map_vma_lazy(anon_box(
-                range(PAGE * 4, PAGE * 12),
-                Protection::WRITE | Protection::USER,
-            ))
-            .unwrap();
+            asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 12), Protection::WRITE | Protection::USER)).unwrap();
             for i in 4..12u64 {
                 assert_eq!(asp.fault_in(va(PAGE * i), FaultAccess::Write), FaultIn::Mapped);
             }
@@ -1548,18 +1452,11 @@ mod tests {
 
         // SAFETY: a physical range no test reads or frees; only its page-table entries are read.
         let device = unsafe {
-            MemoryObject::try_new_borrowed(
-                PhysAddr::new(APERTURE),
-                PAGE as usize,
-                Caching::WriteCombining,
-            )
-            .unwrap()
+            MemoryObject::try_new_borrowed(PhysAddr::new(APERTURE), PAGE as usize, Caching::WriteCombining).unwrap()
         };
-        asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), into_obj(device))
-            .expect("map_object must succeed");
+        asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), into_obj(device)).expect("map_object must succeed");
         let ordinary = MemoryObject::try_new(PAGE as usize).unwrap();
-        asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(ordinary))
-            .expect("map_object must succeed");
+        asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(ordinary)).expect("map_object must succeed");
 
         // Entry 5 is write-combining and entry 0 is write-back in the table the kernel programs
         // (`KERNEL_PAT`); the numbers are the architecture's, so they are read here rather than

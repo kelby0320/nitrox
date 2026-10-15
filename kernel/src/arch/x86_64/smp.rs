@@ -22,8 +22,7 @@ const APIC_UNSET: u32 = u32::MAX;
 /// stable by construction — a core can never end up sharing another core's index
 /// (and thus its per-CPU GDT/TSS/scheduler slots), which is the failure mode a
 /// racy `extra_argument` / reset-default-0 scheme allowed.
-static DENSE_TO_APIC: [AtomicU32; MAX_CPUS] =
-    [const { AtomicU32::new(APIC_UNSET) }; MAX_CPUS];
+static DENSE_TO_APIC: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(APIC_UNSET) }; MAX_CPUS];
 
 /// This core's hardware APIC id, read from `CPUID.01H:EBX[31:24]` (the initial
 /// xAPIC id). Available on every core from its first instruction — before x2APIC

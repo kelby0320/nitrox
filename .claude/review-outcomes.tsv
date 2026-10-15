@@ -50,3 +50,7 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-15	377	e1c2ab09	4	tests	optional	demonstrated	fixed	c8ad2b55	order logged; reorder fails
 2026-10-15	377	e1c2ab09	5	rules-and-docs	optional	unverified	declined		now stamps only a drop marker; the parameter enables host tests
 2026-10-15	377	e1c2ab09	6	architecture	optional	unverified	fixed	c8ad2b55	dpc.rs: one queue, every CPU; a DPC can run twice at once
+2026-10-15	378	1900ba15	1	architecture	optional	demonstrated	fixed	a0862b70	edition = "2024": direct rustfmt agrees on every file
+2026-10-15	378	1900ba15	2	error-paths	optional	unverified	fixed	a0862b70	both filters run on the 12 build inputs; tests/workflows.rs
+2026-10-15	378	1900ba15	3	tests	optional	demonstrated	declined		both let-else forms are fixed points; --check holds either
+2026-10-15	378	1900ba15	4	rules-and-docs	optional	unverified	refuted		memory index already held the new entry alone

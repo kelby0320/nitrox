@@ -307,8 +307,7 @@ impl<'a> Lexer<'a> {
         let t = self.peek(mode)?;
         self.pending = None;
         if t.tok != Tok::Eof {
-            self.after_match_op = t.tok == Tok::Match_
-                || matches!(&t.tok, Tok::Ident(n) if n == "capture");
+            self.after_match_op = t.tok == Tok::Match_ || matches!(&t.tok, Tok::Ident(n) if n == "capture");
             self.prev = Some(t.tok.clone());
         }
         Ok(t)
@@ -471,9 +470,7 @@ impl<'a> Lexer<'a> {
         if c == b'/' && is_path_char(self.at(start + 1)) {
             return Ok(Tok::Word(self.scan_bareword(start)));
         }
-        if c == b'.' && (self.at(start + 1) == b'/'
-            || (self.at(start + 1) == b'.' && self.at(start + 2) == b'/'))
-        {
+        if c == b'.' && (self.at(start + 1) == b'/' || (self.at(start + 1) == b'.' && self.at(start + 2) == b'/')) {
             return Ok(Tok::Word(self.scan_bareword(start)));
         }
 
@@ -828,17 +825,12 @@ fn is_path_char(c: u8) -> bool {
 /// reads as two tokens, or — the way round it actually failed — splice a candidate into the
 /// middle of a word the person had typed.
 pub(crate) fn is_word_char(c: u8) -> bool {
-    !matches!(
-        c,
-        0 | b' ' | b'\t' | b'\r' | b'\n' | b'|' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"'
-    )
+    !matches!(c, 0 | b' ' | b'\t' | b'\r' | b'\n' | b'|' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"')
 }
 
 /// Whether `s` begins with `kw` as a whole word.
 fn starts_keyword(s: &[u8], kw: &[u8]) -> bool {
-    s.len() >= kw.len()
-        && &s[..kw.len()] == kw
-        && (s.len() == kw.len() || !is_ident_char(s[kw.len()]))
+    s.len() >= kw.len() && &s[..kw.len()] == kw && (s.len() == kw.len() || !is_ident_char(s[kw.len()]))
 }
 
 /// The language's keywords, and the token each becomes.
@@ -952,11 +944,7 @@ fn parse_f64(s: &str) -> Option<f64> {
     // is not representable, so `2675 * 0.001` is not `2.675`, while `2675.0 / 1000.0` is
     // correctly rounded. Same reasoning as scaling `parse_duration`'s fractions as
     // integers — do the exact operation, not the convenient one.
-    Some(if scale < 0 {
-        mantissa as f64 / pow10(-scale)
-    } else {
-        mantissa as f64 * pow10(scale)
-    })
+    Some(if scale < 0 { mantissa as f64 / pow10(-scale) } else { mantissa as f64 * pow10(scale) })
 }
 
 fn pow10(mut e: i32) -> f64 {
@@ -1002,10 +990,7 @@ mod tests {
     #[test]
     fn a_dot_only_starts_a_float_before_a_digit() {
         assert_eq!(toks("1..5"), vec![Tok::Int(1), Tok::DotDot, Tok::Int(5), Tok::Eof]);
-        assert_eq!(
-            toks("x.size"),
-            vec![Tok::Ident("x".into()), Tok::Dot, Tok::Ident("size".into()), Tok::Eof]
-        );
+        assert_eq!(toks("x.size"), vec![Tok::Ident("x".into()), Tok::Dot, Tok::Ident("size".into()), Tok::Eof]);
     }
 
     #[test]
@@ -1029,10 +1014,7 @@ mod tests {
         assert_eq!(toks("./data.csv"), vec![Tok::Word("./data.csv".into()), Tok::Eof]);
         assert_eq!(toks("../x"), vec![Tok::Word("../x".into()), Tok::Eof]);
         // …but a `/` with a left operand is still division.
-        assert_eq!(
-            toks("a / b"),
-            vec![Tok::Ident("a".into()), Tok::Slash, Tok::Ident("b".into()), Tok::Eof]
-        );
+        assert_eq!(toks("a / b"), vec![Tok::Ident("a".into()), Tok::Slash, Tok::Ident("b".into()), Tok::Eof]);
     }
 
     /// The rule that makes D3 decidable: a regex is lexed only after `~=`.
@@ -1040,12 +1022,7 @@ mod tests {
     fn a_regex_literal_needs_the_match_operator_before_it() {
         assert_eq!(
             toks("name ~= /\\.rs$/"),
-            vec![
-                Tok::Ident("name".into()),
-                Tok::Match_,
-                Tok::Regex("\\.rs$".into()),
-                Tok::Eof
-            ]
+            vec![Tok::Ident("name".into()), Tok::Match_, Tok::Regex("\\.rs$".into()), Tok::Eof]
         );
         // Without `~=` the same text is a path — which is the whole point of the rule.
         assert!(matches!(toks("/x/")[0], Tok::Word(_)));
@@ -1067,15 +1044,7 @@ mod tests {
     /// the parser knows which.
     #[test]
     fn the_same_text_lexes_differently_per_mode() {
-        assert_eq!(
-            toks("README.md"),
-            vec![
-                Tok::Ident("README".into()),
-                Tok::Dot,
-                Tok::Ident("md".into()),
-                Tok::Eof
-            ]
-        );
+        assert_eq!(toks("README.md"), vec![Tok::Ident("README".into()), Tok::Dot, Tok::Ident("md".into()), Tok::Eof]);
         let mut lx = Lexer::new("README.md");
         assert_eq!(lx.bump(Mode::Word).unwrap().tok, Tok::Word("README.md".into()));
     }
@@ -1113,22 +1082,13 @@ mod tests {
 
     #[test]
     fn a_newline_ends_a_statement() {
-        assert_eq!(
-            toks("a\nb"),
-            vec![Tok::Ident("a".into()), Tok::Newline, Tok::Ident("b".into()), Tok::Eof]
-        );
+        assert_eq!(toks("a\nb"), vec![Tok::Ident("a".into()), Tok::Newline, Tok::Ident("b".into()), Tok::Eof]);
     }
 
     #[test]
     fn a_trailing_operator_continues_the_line() {
-        assert_eq!(
-            toks("a |\nb"),
-            vec![Tok::Ident("a".into()), Tok::Pipe, Tok::Ident("b".into()), Tok::Eof]
-        );
-        assert_eq!(
-            toks("a +\nb"),
-            vec![Tok::Ident("a".into()), Tok::Plus, Tok::Ident("b".into()), Tok::Eof]
-        );
+        assert_eq!(toks("a |\nb"), vec![Tok::Ident("a".into()), Tok::Pipe, Tok::Ident("b".into()), Tok::Eof]);
+        assert_eq!(toks("a +\nb"), vec![Tok::Ident("a".into()), Tok::Plus, Tok::Ident("b".into()), Tok::Eof]);
     }
 
     /// §11b asserts that a whole script parses leading-`|` style unambiguously without
@@ -1137,22 +1097,12 @@ mod tests {
     fn a_leading_pipe_on_the_next_line_continues_the_previous_one() {
         assert_eq!(
             toks("ls\n  | filter"),
-            vec![
-                Tok::Ident("ls".into()),
-                Tok::Pipe,
-                Tok::Ident("filter".into()),
-                Tok::Eof
-            ]
+            vec![Tok::Ident("ls".into()), Tok::Pipe, Tok::Ident("filter".into()), Tok::Eof]
         );
         // Even across a comment and a blank line.
         assert_eq!(
             toks("ls\n  # why\n\n  | filter"),
-            vec![
-                Tok::Ident("ls".into()),
-                Tok::Pipe,
-                Tok::Ident("filter".into()),
-                Tok::Eof
-            ]
+            vec![Tok::Ident("ls".into()), Tok::Pipe, Tok::Ident("filter".into()), Tok::Eof]
         );
     }
 
@@ -1163,35 +1113,19 @@ mod tests {
         let t = toks("}\ncatch");
         assert_eq!(t, vec![Tok::RBrace, Tok::Catch, Tok::Eof]);
         // But an identifier that merely *starts* with `else` is not the keyword.
-        assert_eq!(
-            toks("}\nelsewhere"),
-            vec![Tok::RBrace, Tok::Newline, Tok::Ident("elsewhere".into()), Tok::Eof]
-        );
+        assert_eq!(toks("}\nelsewhere"), vec![Tok::RBrace, Tok::Newline, Tok::Ident("elsewhere".into()), Tok::Eof]);
     }
 
     #[test]
     fn newlines_are_whitespace_inside_parens_and_brackets_but_not_braces() {
         assert_eq!(
             toks("(a\nb)"),
-            vec![
-                Tok::LParen,
-                Tok::Ident("a".into()),
-                Tok::Ident("b".into()),
-                Tok::RParen,
-                Tok::Eof
-            ]
+            vec![Tok::LParen, Tok::Ident("a".into()), Tok::Ident("b".into()), Tok::RParen, Tok::Eof]
         );
         // A block's statements need their separators.
         assert_eq!(
             toks("{a\nb}"),
-            vec![
-                Tok::LBrace,
-                Tok::Ident("a".into()),
-                Tok::Newline,
-                Tok::Ident("b".into()),
-                Tok::RBrace,
-                Tok::Eof
-            ]
+            vec![Tok::LBrace, Tok::Ident("a".into()), Tok::Newline, Tok::Ident("b".into()), Tok::RBrace, Tok::Eof]
         );
     }
 
@@ -1228,10 +1162,7 @@ mod tests {
     fn strings_escape_but_never_interpolate() {
         assert_eq!(toks(r#""a\nb""#), vec![Tok::Str("a\nb".into()), Tok::Eof]);
         // §8d: no interpolation, so braces inside a string are just characters.
-        assert_eq!(
-            toks(r#""hello {}""#),
-            vec![Tok::Str("hello {}".into()), Tok::Eof]
-        );
+        assert_eq!(toks(r#""hello {}""#), vec![Tok::Str("hello {}".into()), Tok::Eof]);
     }
 
     #[test]
@@ -1251,15 +1182,9 @@ mod tests {
     #[test]
     fn a_dollar_may_begin_an_identifier() {
         assert_eq!(toks("$last"), vec![Tok::Ident("$last".into()), Tok::Eof]);
-        assert_eq!(
-            toks("$env.PWD"),
-            vec![Tok::Ident("$env".into()), Tok::Dot, Tok::Ident("PWD".into()), Tok::Eof]
-        );
+        assert_eq!(toks("$env.PWD"), vec![Tok::Ident("$env".into()), Tok::Dot, Tok::Ident("PWD".into()), Tok::Eof]);
         // …but only at the start: `a$b` is not one name.
-        assert_eq!(
-            toks("a$b"),
-            vec![Tok::Ident("a".into()), Tok::Ident("$b".into()), Tok::Eof]
-        );
+        assert_eq!(toks("a$b"), vec![Tok::Ident("a".into()), Tok::Ident("$b".into()), Tok::Eof]);
     }
 
     #[test]

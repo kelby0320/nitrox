@@ -190,8 +190,7 @@ pub fn decode(bytes: &[u8]) -> Result<Image, PngError> {
         if at + 8 > bytes.len() {
             return Err(PngError::Truncated);
         }
-        let len = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-            as usize;
+        let len = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize;
         let kind = &bytes[at + 4..at + 8];
         let start = at + 8;
         // **Plain arithmetic, and the assertion above is what makes it safe.** `len` comes from
@@ -232,8 +231,7 @@ pub fn decode(bytes: &[u8]) -> Result<Image, PngError> {
     // unbounded `decompress_to_vec` would allocate all of it before anything here saw a byte.
     // One filter byte plus a row of samples, per row, is exactly what `unfilter` reads.
     let expect = h.height as usize * (1 + h.width as usize * h.bpp);
-    let raw = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&idat, expect)
-        .map_err(|_| PngError::Inflate)?;
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&idat, expect).map_err(|_| PngError::Inflate)?;
     let unfiltered = unfilter(&raw, &h)?;
     // **Dropped before the XRGB buffer is asked for**, so the two moments where two buffers are
     // alive do not add. That is what makes `PEAK_BYTES_PER_PIXEL` eight rather than twelve, and
@@ -422,12 +420,7 @@ mod tests {
     /// The pixel at `(x, y)` as `(r, g, b)`.
     fn px(img: &Image, x: u32, y: u32) -> (u8, u8, u8) {
         let off = y as usize * img.geometry.pitch + x as usize * 4;
-        let word = u32::from_le_bytes([
-            img.pixels[off],
-            img.pixels[off + 1],
-            img.pixels[off + 2],
-            img.pixels[off + 3],
-        ]);
+        let word = u32::from_le_bytes([img.pixels[off], img.pixels[off + 1], img.pixels[off + 2], img.pixels[off + 3]]);
         let c = img.geometry.format.decode(word);
         (c.r, c.g, c.b)
     }

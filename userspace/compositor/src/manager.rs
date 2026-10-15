@@ -18,14 +18,13 @@
 //! application namespace. See `docs/architecture/graphical-session.md` §3.
 
 use libdraw::geom::{Point, Rect};
-use librsproto::surface::{
-    MgrDesktop, MgrHotkey, MgrPlace, MgrWindowRef, MgrWindowValue, OP_MGR_CONFIGURE,
-    OP_MGR_CLOSE, OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE,
-    OP_MGR_REGISTER_HOTKEY, OP_MGR_REGISTER_SNAP_ZONE,
-    OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED,
-    OP_MGR_SET_SCHEME, OP_MGR_SET_WINDOW_DESKTOP, MgrScheme, SCHEME_DARK, SCHEME_LIGHT,
-};
 use libdraw::theme::Scheme;
+use librsproto::surface::{
+    MgrDesktop, MgrHotkey, MgrPlace, MgrScheme, MgrWindowRef, MgrWindowValue, OP_MGR_CLOSE, OP_MGR_CONFIGURE,
+    OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE, OP_MGR_REGISTER_HOTKEY, OP_MGR_REGISTER_SNAP_ZONE,
+    OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED, OP_MGR_SET_SCHEME, OP_MGR_SET_WINDOW_DESKTOP,
+    SCHEME_DARK, SCHEME_LIGHT,
+};
 
 use crate::server::SurfaceError;
 use crate::{StackError, WindowStack};
@@ -235,9 +234,7 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 // repaint per such request would make a shell that tidies windows in the
                 // background repaint the screen for each one.
                 Ok(true) => MgrOutcome::Applied { window: Some(req.window), dirty: None },
-                Ok(false) => {
-                    MgrOutcome::Applied { window: Some(req.window), dirty: Some(Rect::new(0, 0, 0, 0)) }
-                }
+                Ok(false) => MgrOutcome::Applied { window: Some(req.window), dirty: Some(Rect::new(0, 0, 0, 0)) },
                 Err(e) => refused(e),
             }
         }
@@ -250,9 +247,7 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 // one, and `Applied.window` exists so the caller can release that window's held
                 // initial `Configure`; this one releases none, and neither does `SetScheme`.
                 Ok(true) => MgrOutcome::Applied { window: None, dirty: None },
-                Ok(false) => {
-                    MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) }
-                }
+                Ok(false) => MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) },
                 Err(e) => refused(e),
             }
         }
@@ -304,9 +299,7 @@ mod tests {
         let mut s = WindowStack::new();
         let ids = (0..n)
             .map(|_| {
-                let id =
-                    s.create(&CreateWindowRequest::new(8, 8, Role::Normal))
-                        .unwrap();
+                let id = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
                 // Configured: a manager acts on windows that are on screen, and since B4
                 // `focus_candidate` does not consider one that is not.
                 s.mark_configured(id);
@@ -349,8 +342,7 @@ mod tests {
         // and its first `Commit`, when the window is not on screen at all. Reporting a region
         // there would repaint on every window launch.
         let (mut s, ids) = stack_with(1);
-        let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, OP_MGR_PLACE, &place_body(ids[0], 5, 5))
-        else {
+        let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, OP_MGR_PLACE, &place_body(ids[0], 5, 5)) else {
             panic!("expected Applied")
         };
         let d = dirty.expect("a place names its region");
@@ -374,9 +366,7 @@ mod tests {
             // Painted bounds: a restacked window repaints its shadow too (M13 Part C).
             let want = s.window(id).expect("in the stack").painted_bounds();
             assert!(want.size.w > 8, "the premise: the damage includes the shadow");
-            let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, op, &body) else {
-                panic!("expected Applied")
-            };
+            let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, op, &body) else { panic!("expected Applied") };
             assert_eq!(dirty, Some(want), "op {op:#06x} must name the window it moved");
         }
     }
@@ -389,8 +379,7 @@ mod tests {
         // "repaint everything" — so the caller paints neither.
         let (mut s, ids) = stack_with(3);
         let top = *ids.last().expect("three windows");
-        let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, OP_MGR_RAISE, &ref_body(top, 0))
-        else {
+        let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, OP_MGR_RAISE, &ref_body(top, 0)) else {
             panic!("expected Applied")
         };
         let d = dirty.expect("named, not `everything`");
@@ -408,9 +397,7 @@ mod tests {
         // Painted bounds: closing a window repaints its shadow too (M13 Part C).
         let want = s.window(ids[0]).expect("in the stack").painted_bounds();
         assert!(want.origin.x < 0, "the premise: the region reaches outside the window");
-        let MgrOutcome::Applied { window, dirty } =
-            dispatch(&mut s, OP_MGR_CLOSE, &ref_body(ids[0], 0))
-        else {
+        let MgrOutcome::Applied { window, dirty } = dispatch(&mut s, OP_MGR_CLOSE, &ref_body(ids[0], 0)) else {
             panic!("expected Applied")
         };
         assert_eq!(window, Some(ids[0]));
@@ -435,26 +422,15 @@ mod tests {
         // review demonstrated exactly this.
         let (mut s, ids) = stack_with(1);
         let parent = ids[0];
-        let popup = s
-            .create(&CreateWindowRequest::at(8, 8, Role::Popup { parent }, 100, 100))
-            .unwrap();
+        let popup = s.create(&CreateWindowRequest::at(8, 8, Role::Popup { parent }, 100, 100)).unwrap();
         s.mark_configured(popup);
-        let want = crate::union(
-            s.window(parent).unwrap().painted_bounds(),
-            s.window(popup).unwrap().painted_bounds(),
-        );
+        let want = crate::union(s.window(parent).unwrap().painted_bounds(), s.window(popup).unwrap().painted_bounds());
 
-        let MgrOutcome::Applied { dirty, .. } =
-            dispatch(&mut s, OP_MGR_CLOSE, &ref_body(parent, 0))
-        else {
+        let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, OP_MGR_CLOSE, &ref_body(parent, 0)) else {
             panic!("expected Applied")
         };
         assert!(s.window(popup).is_none(), "the popup went with its parent");
-        assert_eq!(
-            dirty,
-            Some(want),
-            "the union of everything that vanished, not just the named window"
-        );
+        assert_eq!(dirty, Some(want), "the union of everything that vanished, not just the named window");
     }
 
     #[test]
@@ -490,17 +466,10 @@ mod tests {
         // changes nothing on screen by itself: the client's next commit does.
         let (mut s, ids) = stack_with(1);
         let mut body = [0u8; 20];
-        ConfigureEvent { window: ids[0], width: 300, height: 200, x: 10, y: 20 }
-            .write(&mut body)
-            .unwrap();
+        ConfigureEvent { window: ids[0], width: 300, height: 200, x: 10, y: 20 }.write(&mut body).unwrap();
         assert_eq!(
             dispatch(&mut s, OP_MGR_CONFIGURE, &body),
-            MgrOutcome::Configure {
-                window: ids[0],
-                width: 300,
-                height: 200,
-                origin: Point::new(10, 20),
-            },
+            MgrOutcome::Configure { window: ids[0], width: 300, height: 200, origin: Point::new(10, 20) },
         );
         let w = s.window(ids[0]).unwrap();
         assert_eq!(w.size, (8, 8), "the stack is untouched until the client commits");
@@ -590,10 +559,7 @@ mod tests {
         let (mut s, _) = stack_with(1);
         let mut b = [0u8; 4];
         MgrDesktop { desktop: 5 }.write(&mut b).unwrap();
-        assert_eq!(
-            dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b),
-            MgrOutcome::Applied { window: None, dirty: None },
-        );
+        assert_eq!(dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b), MgrOutcome::Applied { window: None, dirty: None },);
         assert_eq!(s.current_desktop(), 5);
 
         // Switching to the desktop already current changes nothing on screen.
@@ -612,10 +578,7 @@ mod tests {
         let (mut s, _) = stack_with(1);
         let mut b = [0u8; 4];
         MgrDesktop { desktop: librsproto::surface::STICKY_DESKTOP }.write(&mut b).unwrap();
-        assert_eq!(
-            dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b),
-            MgrOutcome::Failed(SurfaceError::Malformed),
-        );
+        assert_eq!(dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b), MgrOutcome::Failed(SurfaceError::Malformed),);
         assert_eq!(s.current_desktop(), 1, "and the current desktop is untouched");
     }
 

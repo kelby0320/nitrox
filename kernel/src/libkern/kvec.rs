@@ -40,11 +40,7 @@ impl<T> KVec<T> {
     /// Create an empty vector. No allocation happens until the first
     /// element is inserted, so this is usable in `const` context.
     pub const fn new() -> Self {
-        KVec {
-            ptr: NonNull::dangling(),
-            len: 0,
-            cap: 0,
-        }
+        KVec { ptr: NonNull::dangling(), len: 0, cap: 0 }
     }
 
     /// Number of elements currently stored.
@@ -158,11 +154,7 @@ impl<T> KVec<T> {
         // disjoint slice and `T: Copy`, so a bytewise copy fully
         // initialises the appended elements.
         unsafe {
-            ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                self.ptr.as_ptr().add(self.len),
-                src.len(),
-            );
+            ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr().add(self.len), src.len());
         }
         self.len += src.len();
         Ok(())
@@ -170,8 +162,7 @@ impl<T> KVec<T> {
 
     /// Drop every element, keeping the allocated capacity.
     pub fn clear(&mut self) {
-        let initialised: *mut [T] =
-            ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len);
+        let initialised: *mut [T] = ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len);
         // Zero `len` before dropping so a panicking destructor cannot
         // observe — or double-drop — a partially cleared vector.
         self.len = 0;
@@ -189,11 +180,7 @@ impl<T> KVec<T> {
         }
         // Amortise growth by doubling, but jump straight to `required`
         // when a single reservation asks for more than a doubling.
-        let new_cap = if self.cap == 0 {
-            required.max(4)
-        } else {
-            required.max(self.cap.saturating_mul(2))
-        };
+        let new_cap = if self.cap == 0 { required.max(4) } else { required.max(self.cap.saturating_mul(2)) };
         self.realloc_to(new_cap)
     }
 
@@ -209,9 +196,7 @@ impl<T> KVec<T> {
             return Ok(());
         }
 
-        let new_bytes = new_cap
-            .checked_mul(mem::size_of::<T>())
-            .ok_or(AllocError)?;
+        let new_bytes = new_cap.checked_mul(mem::size_of::<T>()).ok_or(AllocError)?;
         let raw = kmalloc(new_bytes, mem::align_of::<T>()) as *mut T;
         let new_ptr = NonNull::new(raw).ok_or(AllocError)?;
 
@@ -222,11 +207,7 @@ impl<T> KVec<T> {
             // the old buffer holds no live elements, so freeing it is
             // sound.
             unsafe {
-                ptr::copy_nonoverlapping(
-                    self.ptr.as_ptr(),
-                    new_ptr.as_ptr(),
-                    self.len,
-                );
+                ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
                 kfree(self.ptr.as_ptr() as *mut u8);
             }
         }

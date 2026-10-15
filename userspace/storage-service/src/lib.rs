@@ -741,11 +741,25 @@ pub mod mounts {
     /// **The mounts devices that arrived after the boot get** (Phase 6 Part D): `new`, by the boot's
     /// rules, among `all` the service knows, with `taken` the labels of the mounts there are. Only
     /// the new are planned: one an administrator unmounted stays so.
-    pub fn arrival(new: &[Device], all: &[Device], already: &[Mounted], taken: &[String], live: bool, init_known: bool) -> Vec<Plan> {
+    pub fn arrival(
+        new: &[Device],
+        all: &[Device],
+        already: &[Mounted],
+        taken: &[String],
+        live: bool,
+        init_known: bool,
+    ) -> Vec<Plan> {
         plan(new, all, already, taken, live, init_known)
     }
 
-    fn plan(candidates: &[Device], all: &[Device], already: &[Mounted], taken: &[String], live: bool, init_known: bool) -> Vec<Plan> {
+    fn plan(
+        candidates: &[Device],
+        all: &[Device],
+        already: &[Mounted],
+        taken: &[String],
+        live: bool,
+        init_known: bool,
+    ) -> Vec<Plan> {
         if !init_known {
             return Vec::new();
         }
@@ -885,7 +899,12 @@ pub mod mounts {
     /// partition beside a mounted sibling is read again, as the `disks` grant gave it (PR #368
     /// review). **And anything on the disk the machine started from**, mounted or not; mounted is
     /// asked first, so a boot disk holding `init`'s root says it is mounted.
-    pub fn reread(devices: &[Device], mounted: &[Mounted], init_known: bool, name: &str) -> Result<Reread, RereadRefusal> {
+    pub fn reread(
+        devices: &[Device],
+        mounted: &[Mounted],
+        init_known: bool,
+        name: &str,
+    ) -> Result<Reread, RereadRefusal> {
         use libkern::device::DeviceKind;
         if !init_known {
             return Err(RereadRefusal::InitUnknown);

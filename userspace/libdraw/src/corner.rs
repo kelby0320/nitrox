@@ -73,11 +73,7 @@ pub fn border_share(radius: u32, dx: u32, dy: u32) -> u8 {
         return 0;
     }
     // The inset shape starts one pixel in, so the outermost row and column are not in it at all.
-    let inner = if dx == 0 || dy == 0 || radius == 0 {
-        0
-    } else {
-        coverage(radius - 1, dx - 1, dy - 1) as u32
-    };
+    let inner = if dx == 0 || dy == 0 || radius == 0 { 0 } else { coverage(radius - 1, dx - 1, dy - 1) as u32 };
     let ring = outer.saturating_sub(inner);
     ((ring * 255 + outer / 2) / outer) as u8
 }

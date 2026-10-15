@@ -175,9 +175,7 @@ impl Superblock {
     /// How many inodes `group` actually has, bounded the same way.
     fn inodes_in_group(&self, group: u32) -> usize {
         let first = group as u64 * self.inodes_per_group as u64;
-        (self.inodes_count as u64)
-            .saturating_sub(first)
-            .min(self.inodes_per_group as u64) as usize
+        (self.inodes_count as u64).saturating_sub(first).min(self.inodes_per_group as u64) as usize
     }
 
     /// Byte offset of `group`'s descriptor. The table is contiguous from
@@ -233,9 +231,9 @@ impl Unservable {
     pub fn fs_error(self) -> FsError {
         match self {
             Unservable::Unreadable | Unservable::RootUnreadable | Unservable::StateUnwritable => FsError::Io,
-            Unservable::NoMagic { .. }
-            | Unservable::ZeroField(_)
-            | Unservable::RootNotDirectory { .. } => FsError::Corrupt,
+            Unservable::NoMagic { .. } | Unservable::ZeroField(_) | Unservable::RootNotDirectory { .. } => {
+                FsError::Corrupt
+            }
             Unservable::Wide64Bit | Unservable::BlockTooLarge { .. } => FsError::Unsupported,
         }
     }
@@ -245,17 +243,14 @@ impl core::fmt::Display for Unservable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
             Unservable::Unreadable => write!(f, "the superblock could not be read off the device"),
-            Unservable::NoMagic { found } => write!(
-                f,
-                "no ext4 filesystem: superblock magic {found:#06x}, not {SUPER_MAGIC:#06x}"
-            ),
+            Unservable::NoMagic { found } => {
+                write!(f, "no ext4 filesystem: superblock magic {found:#06x}, not {SUPER_MAGIC:#06x}")
+            }
             Unservable::Wide64Bit => write!(f, "a 64-bit ext4 filesystem, which this server does not read"),
             // The shift is taken on a u64 and saturated, since `log` is whatever the device held.
-            Unservable::BlockTooLarge { log } => write!(
-                f,
-                "blocks of 2^{} bytes, over the {MAX_BLOCK} this server reads",
-                10u32.saturating_add(log)
-            ),
+            Unservable::BlockTooLarge { log } => {
+                write!(f, "blocks of 2^{} bytes, over the {MAX_BLOCK} this server reads", 10u32.saturating_add(log))
+            }
             Unservable::ZeroField(field) => write!(f, "a malformed superblock: {field} is zero"),
             Unservable::RootUnreadable => write!(
                 f,
@@ -359,8 +354,7 @@ pub(crate) fn read_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Re
     let group = (ino - 1) / sb.inodes_per_group;
     let index = (ino - 1) % sb.inodes_per_group;
     // The group descriptor holds the inode-table block.
-    let gd_off =
-        sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
+    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
     let mut gd = [0u8; 32];
     r.read_meta(gd_off, &mut gd)?;
     let inode_table = rd_u32(&gd, 8) as u64;
@@ -382,11 +376,7 @@ fn stat_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<InodeS
     let inode = read_inode(r, sb, ino)?;
     let mode = rd_u16(&inode, 0);
     let large = sb.inode_size > 128;
-    let size_hi = if large && mode & S_IFMT != S_IFDIR {
-        rd_u32(&inode, 108) as u64
-    } else {
-        0
-    };
+    let size_hi = if large && mode & S_IFMT != S_IFDIR { rd_u32(&inode, 108) as u64 } else { 0 };
     let size = (rd_u32(&inode, 4) as u64) | (size_hi << 32);
     let extra = if large { rd_u32(&inode, I_MTIME_EXTRA) } else { 0 };
     let mtime = decode_time(rd_u32(&inode, I_MTIME), extra);
@@ -394,12 +384,7 @@ fn stat_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<InodeS
 }
 
 /// Find `name` in directory inode `dir`, returning its inode number.
-fn dir_lookup<R: BlockReader>(
-    r: &R,
-    sb: &Superblock,
-    dir: &[u8; 256],
-    name: &[u8],
-) -> Result<u32, FsError> {
+fn dir_lookup<R: BlockReader>(r: &R, sb: &Superblock, dir: &[u8; 256], name: &[u8]) -> Result<u32, FsError> {
     let size = rd_u32(dir, 4) as u64;
     let bs = sb.block_size as usize;
     let nblocks = size.div_ceil(sb.block_size as u64);
@@ -594,11 +579,7 @@ fn read_dir_inner<R: BlockReader>(
             // The entry's inode metadata, if the caller asked for it. A single bad inode
             // degrades to a zeroed stat rather than failing the listing. This reads into
             // its own small buffers, so the cached directory block in `buf` survives.
-            let stat = if want_stat {
-                stat_inode(r, &sb, e_ino).unwrap_or_default()
-            } else {
-                InodeStat::default()
-            };
+            let stat = if want_stat { stat_inode(r, &sb, e_ino).unwrap_or_default() } else { InodeStat::default() };
             if !emit(e_ino, file_type, name, &stat) {
                 // Buffer full: resume *at this same entry* next call.
                 return Ok(pos);
@@ -724,11 +705,7 @@ pub struct MappedFile {
 /// if the file needs more runs than `out` holds (too fragmented to inline in a resolve reply
 /// — the standalone `MapRange` op handles that, deferred). Errors otherwise as
 /// [`resolve_regular_file`].
-pub fn map_file<R: BlockReader>(
-    r: &R,
-    path: &[u8],
-    out: &mut [crate::BlockRun],
-) -> Result<MappedFile, FsError> {
+pub fn map_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [crate::BlockRun]) -> Result<MappedFile, FsError> {
     let sb = read_superblock(r)?;
     let (ino, inode, size) = resolve_regular_file(r, &sb, path)?;
     let bs = sb.block_size;
@@ -842,12 +819,7 @@ fn set_state<RW: BlockReader + BlockWriter>(rw: &RW, f: impl Fn(u16) -> u16) -> 
 ///
 /// `now` comes from the server, never from the caller — a timestamp a client could
 /// choose would be forgeable metadata.
-pub fn touch_at<RW: BlockReader + BlockWriter>(
-    rw: &RW,
-    dir_ino: u32,
-    name: &[u8],
-    now: i64,
-) -> Result<(), FsError> {
+pub fn touch_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8], now: i64) -> Result<(), FsError> {
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
     if !live_dir(&parent) {
@@ -874,11 +846,7 @@ pub fn touch_at<RW: BlockReader + BlockWriter>(
 ///
 /// `now` comes from the server's own clock reading, never from the wire — a writer does not
 /// get to choose what time it wrote.
-pub fn touch_file<RW: BlockReader + BlockWriter>(
-    rw: &RW,
-    ino: u32,
-    now: i64,
-) -> Result<(), FsError> {
+pub fn touch_file<RW: BlockReader + BlockWriter>(rw: &RW, ino: u32, now: i64) -> Result<(), FsError> {
     let sb = read_superblock(rw)?;
     if ino == 0 || ino > sb.inodes_count {
         return Err(FsError::NotFound);
@@ -922,11 +890,7 @@ pub(crate) fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> 
 }
 
 /// Allocate one free filesystem block, preferring `goal` for contiguity: [`alloc_run`] of one.
-pub(crate) fn alloc_block<RW: BlockReader + BlockWriter>(
-    rw: &RW,
-    sb: &Superblock,
-    goal: u64,
-) -> Result<u64, FsError> {
+pub(crate) fn alloc_block<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock, goal: u64) -> Result<u64, FsError> {
     alloc_run(rw, sb, goal, 1).map(|(phys, _)| phys)
 }
 
@@ -1371,8 +1335,7 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     // gives the inode back** (Phase 6 Part H.1): until then it stayed allocated and unattached,
     // for `e2fsck` to find — the 815th file of a full directory left one.
     let linked = resolve_path_ino(rw, &sb, parent_path).and_then(|(parent_ino, mut parent_inode)| {
-        dir_insert(rw, &sb, parent_ino, &mut parent_inode, name, ino, EXT4_FT_REG_FILE, now)
-            .map(|()| parent_ino)
+        dir_insert(rw, &sb, parent_ino, &mut parent_inode, name, ino, EXT4_FT_REG_FILE, now).map(|()| parent_ino)
     });
     let parent_ino = match linked {
         Ok(parent_ino) => parent_ino,
@@ -1495,11 +1458,7 @@ fn free_inode<RW: BlockReader + BlockWriter>(
 }
 
 /// Free filesystem block `block`: [`free_run`] of one.
-pub(crate) fn free_block<RW: BlockReader + BlockWriter>(
-    rw: &RW,
-    sb: &Superblock,
-    block: u64,
-) -> Result<(), FsError> {
+pub(crate) fn free_block<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock, block: u64) -> Result<(), FsError> {
     free_run(rw, sb, block, 1)
 }
 
@@ -1612,7 +1571,9 @@ fn dir_remove<RW: BlockReader + BlockWriter>(
             if rec_len < 8 || off + rec_len > bs {
                 break;
             }
-            if e_ino != 0 && name_len == name.len() && off + 8 + name_len <= bs
+            if e_ino != 0
+                && name_len == name.len()
+                && off + 8 + name_len <= bs
                 && &buf[off + 8..off + 8 + name_len] == name
             {
                 match prev {
@@ -1639,12 +1600,7 @@ fn dir_remove<RW: BlockReader + BlockWriter>(
 /// Adjust directory inode `ino`'s `i_links_count` by `delta` (+1 / -1), reading and writing
 /// it back. Used when a subdirectory's `..` is created/removed (which links/unlinks the
 /// parent).
-fn adjust_links<RW: BlockReader + BlockWriter>(
-    rw: &RW,
-    sb: &Superblock,
-    ino: u32,
-    delta: i32,
-) -> Result<(), FsError> {
+fn adjust_links<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock, ino: u32, delta: i32) -> Result<(), FsError> {
     let off = inode_offset(rw, sb, ino)?;
     let mut inode = [0u8; 256];
     let n = (sb.inode_size as usize).min(256);
@@ -1664,14 +1620,8 @@ fn adjust_links<RW: BlockReader + BlockWriter>(
 /// **A failed `mkdir` gives back what it took** — the inode, its block, and its group's count of
 /// directories (Phase 6 Part H.1). The count is its own group's: until then it was always group
 /// 0's, wherever the inode had come from.
-pub fn mkdir_at<RW: BlockReader + BlockWriter>(
-    rw: &RW,
-    dir_ino: u32,
-    name: &[u8],
-    now: i64,
-) -> Result<(), FsError> {
-    if name.is_empty() || name.len() > 255 || name.contains(&b'/') || name == b"." || name == b".."
-    {
+pub fn mkdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+    if name.is_empty() || name.len() > 255 || name.contains(&b'/') || name == b"." || name == b".." {
         return Err(FsError::Unsupported);
     }
     let sb = read_superblock(rw)?;
@@ -1837,12 +1787,7 @@ pub fn release_inode<RW: BlockReader + BlockWriter>(rw: &RW, ino: u32, now: i64)
 /// only `.`/`..`, unlink it, free its data block + inode, and decrement the parent's link
 /// count (the removed `..`). Name-addressed. `NotFound` if absent; `Unsupported` if `name`
 /// is not a directory (use [`unlink_at`]); `NotEmpty` if it still has entries.
-pub fn rmdir_at<RW: BlockReader + BlockWriter>(
-    rw: &RW,
-    dir_ino: u32,
-    name: &[u8],
-    now: i64,
-) -> Result<(), FsError> {
+pub fn rmdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8], now: i64) -> Result<(), FsError> {
     if name == b"." || name == b".." {
         return Err(FsError::Unsupported);
     }
@@ -2301,8 +2246,8 @@ mod tests {
     // ---- the check before Ready (Phase 5) ----
 
     use super::{Unservable, check_device, read_file, stat_file};
-    use crate::test_support::{ImageReader, fixture};
     use crate::FsError;
+    use crate::test_support::{ImageReader, fixture};
 
     /// Set a little-endian field in a fixture image's superblock (byte 1024 onwards).
     fn poke_sb(img: &mut [u8], off: usize, bytes: &[u8]) {

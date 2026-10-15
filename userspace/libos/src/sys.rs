@@ -125,8 +125,8 @@ pub fn thread_create(args: &libkern::ThreadArgs) -> i64 {
 
 #[cfg(test)]
 pub use mock::{
-    handle_close, handle_restrict, io_submit, memory_create, memory_map, memory_unmap, ns_bind,
-    ns_enumerate, ns_lookup, notif_recv, process_spawn, thread_create, wait,
+    handle_close, handle_restrict, io_submit, memory_create, memory_map, memory_unmap, notif_recv, ns_bind,
+    ns_enumerate, ns_lookup, process_spawn, thread_create, wait,
 };
 
 #[cfg(test)]
@@ -158,10 +158,7 @@ mod mock {
     }
 
     fn fresh() -> Mock {
-        Mock {
-            next_handle: 1000,
-            ..Default::default()
-        }
+        Mock { next_handle: 1000, ..Default::default() }
     }
 
     thread_local! {
@@ -178,14 +175,7 @@ mod mock {
             let (status, result, ready_now) = m.script.pop_front().unwrap_or((0, 0, true));
             let h = m.next_handle;
             m.next_handle += 1;
-            m.pos.insert(
-                h,
-                Po {
-                    ready: ready_now,
-                    status,
-                    result,
-                },
-            );
+            m.pos.insert(h, Po { ready: ready_now, status, result });
             h as i64
         })
     }
@@ -198,12 +188,7 @@ mod mock {
             for &h in handles {
                 if let Some(po) = m.pos.get(&h) {
                     if po.ready {
-                        results[n] = IoResult {
-                            handle: h,
-                            status: po.status,
-                            reserved: 0,
-                            result: po.result,
-                        };
+                        results[n] = IoResult { handle: h, status: po.status, reserved: 0, result: po.result };
                         n += 1;
                     }
                 }
@@ -215,12 +200,7 @@ mod mock {
                 let h = handles[0];
                 if let Some(po) = m.pos.get_mut(&h) {
                     po.ready = true;
-                    results[0] = IoResult {
-                        handle: h,
-                        status: po.status,
-                        reserved: 0,
-                        result: po.result,
-                    };
+                    results[0] = IoResult { handle: h, status: po.status, reserved: 0, result: po.result };
                     n = 1;
                 }
             }
@@ -261,14 +241,7 @@ mod mock {
     pub fn ns_lookup(_ns: u64, _path: u64, _plen: u64, _rights: u64) -> i64 {
         // Resolve through the same PO machinery as `io_submit`: the scripted
         // completion's `result` is the resolved handle.
-        let dummy = IoOp {
-            opcode: 0,
-            flags: 0,
-            buffer: 0,
-            buf_offset: 0,
-            offset: 0,
-            length: 0,
-        };
+        let dummy = IoOp { opcode: 0, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
         io_submit(0, &dummy)
     }
 

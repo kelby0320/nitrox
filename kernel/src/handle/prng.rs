@@ -119,9 +119,6 @@ mod tests {
         for _ in 0..1_000 {
             seen[p.gen_below(16) as usize] = true;
         }
-        assert!(
-            seen.iter().all(|&v| v),
-            "every value in 0..16 should appear at least once in 1000 draws",
-        );
+        assert!(seen.iter().all(|&v| v), "every value in 0..16 should appear at least once in 1000 draws",);
     }
 }

@@ -26,11 +26,10 @@
 #![deny(missing_docs)]
 
 use libkern::abi::{
-    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_REL, EV_SYN, InputEvent, KEY_CAPSLOCK, KEY_DELETE,
-    KEY_DOWN, KEY_END, KEY_ENTER, KEY_HOME, KEY_INSERT, KEY_KPENTER, KEY_LEFT, KEY_LEFTALT,
-    KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_NUMLOCK, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT,
-    KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT, KEY_UP, LIGHT_CAPS, LIGHT_NUM, REL_WHEEL,
-    REL_X, REL_Y, SYN_DROPPED, SYN_REPORT,
+    BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_REL, EV_SYN, InputEvent, KEY_CAPSLOCK, KEY_DELETE, KEY_DOWN, KEY_END,
+    KEY_ENTER, KEY_HOME, KEY_INSERT, KEY_KPENTER, KEY_LEFT, KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT,
+    KEY_NUMLOCK, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT, KEY_RIGHTALT, KEY_RIGHTCTRL, KEY_RIGHTMETA, KEY_RIGHTSHIFT,
+    KEY_UP, LIGHT_CAPS, LIGHT_NUM, REL_WHEEL, REL_X, REL_Y, SYN_DROPPED, SYN_REPORT,
 };
 use librsproto::surface::{LOCK_CAPS, LOCK_NUM, MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT};
 
@@ -415,13 +414,7 @@ impl Interpreter {
                         time_ns: e.time_ns,
                     });
                 } else if let Some(keycode) = self.translate(e.code, pressed) {
-                    self.push(Logical::Key {
-                        keycode,
-                        pressed,
-                        modifiers,
-                        locks: self.locks,
-                        time_ns: e.time_ns,
-                    });
+                    self.push(Logical::Key { keycode, pressed, modifiers, locks: self.locks, time_ns: e.time_ns });
                 }
                 0
             }
@@ -497,12 +490,7 @@ impl Interpreter {
         // hand resting on a mouse moves it while turning the wheel — and a consumer wants the
         // cursor moved before it decides what the wheel turned *over*.
         if self.dz != 0 && n < out.len() {
-            out[n] = Logical::Wheel {
-                dz: self.dz,
-                buttons: self.buttons,
-                modifiers: self.modifiers(),
-                time_ns,
-            };
+            out[n] = Logical::Wheel { dz: self.dz, buttons: self.buttons, modifiers: self.modifiers(), time_ns };
             n += 1;
         }
         self.dx = 0;
@@ -527,12 +515,7 @@ mod tests {
     const T: u64 = 9_000_000_000;
 
     fn key(code: u16, down: bool) -> InputEvent {
-        InputEvent {
-            kind: EV_KEY,
-            code,
-            value: if down { KEY_PRESS } else { KEY_RELEASE },
-            time_ns: T,
-        }
+        InputEvent { kind: EV_KEY, code, value: if down { KEY_PRESS } else { KEY_RELEASE }, time_ns: T }
     }
     fn rel(code: u16, v: i32) -> InputEvent {
         InputEvent { kind: EV_REL, code, value: v, time_ns: T }
@@ -683,13 +666,7 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(
             out[0],
-            Logical::Button {
-                button: BTN_LEFT,
-                pressed: true,
-                buttons: 1,
-                modifiers: MOD_SHIFT,
-                time_ns: T,
-            },
+            Logical::Button { button: BTN_LEFT, pressed: true, buttons: 1, modifiers: MOD_SHIFT, time_ns: T },
             "shift-click is expressible only because both travel together"
         );
     }
@@ -722,8 +699,7 @@ mod tests {
         assert_eq!(i.modifiers(), MOD_SHIFT);
         assert_eq!(i.buttons(), 1);
 
-        let mut out =
-            [Logical::Key { keycode: 0, pressed: false, modifiers: 0, locks: 0, time_ns: T }; MAX_PER_GROUP];
+        let mut out = [Logical::Key { keycode: 0, pressed: false, modifiers: 0, locks: 0, time_ns: T }; MAX_PER_GROUP];
         assert_eq!(i.feed(dropped(), &mut out), 1);
         assert_eq!(out[0], Logical::Dropped { time_ns: T });
         assert_eq!(i.modifiers(), 0, "held keys across a gap are a guess");

@@ -17,10 +17,10 @@
 //! [`KString`] call the slab allocator directly and report exhaustion as
 //! [`AllocError`]. See the decision log entry of 2026-05-20.
 
+pub mod block;
 pub mod chacha;
 pub mod clock;
 pub mod device;
-pub mod block;
 pub mod framebuffer;
 pub mod handle;
 pub mod input;
@@ -28,9 +28,9 @@ pub mod io_op;
 pub mod io_result;
 pub mod ipc;
 pub mod kbox;
-pub mod lockrank;
 pub mod kstring;
 pub mod kvec;
+pub mod lockrank;
 pub mod memory;
 pub mod notification;
 pub mod power;
@@ -44,19 +44,19 @@ pub mod timer_flags;
 pub use chacha::ChaCha20Rng;
 pub use clock::ClockId;
 pub use handle::{KObjectType, RawHandle, Rights};
-pub use syscaps::SysCaps;
 pub use io_op::{IoOp, IoOpcode};
 pub use io_result::IoResult;
 pub use ipc::{IpcMsg, IpcMsgHeader, SendMode};
-pub use notification::{ExitKind, ExitStatus, FaultKind, Notification};
-pub use spawn::{SpawnArgs, SPAWN_MAX_HANDLES};
-pub use thread::ThreadArgs;
 pub use kbox::KBox;
-pub use memory::MemFlags;
-pub use timer_flags::TimerFlags;
 pub use kstring::KString;
 pub use kvec::KVec;
+pub use memory::MemFlags;
+pub use notification::{ExitKind, ExitStatus, FaultKind, Notification};
+pub use spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
 pub use spinlock::{IrqSpinLock, IrqSpinLockGuard, SpinLock, SpinLockGuard};
+pub use syscaps::SysCaps;
+pub use thread::ThreadArgs;
+pub use timer_flags::TimerFlags;
 
 /// Error returned by the fallible `libkern` allocators ([`KBox`],
 /// [`KVec`], [`KString`]) when the kernel heap cannot satisfy a request.

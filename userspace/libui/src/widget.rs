@@ -29,9 +29,8 @@ pub use libdraw::theme::Theme;
 use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::element::{
-    Edge, Element, IconKind, Insets, TextSize, bevel, bold, center, center_v, column, dock,
-    docked, fill, icon, ink, outline, padding, rounded_fill, row, scaled, sized, stack, text, wash,
-    with_spacing,
+    Edge, Element, IconKind, Insets, TextSize, bevel, bold, center, center_v, column, dock, docked, fill, icon, ink,
+    outline, padding, rounded_fill, row, scaled, sized, stack, text, wash, with_spacing,
 };
 // The editing keys. **Imported, not re-declared** — `libkern::abi` publishes these and
 // `libterm::encode` already imports exactly this set from there, so a second copy is a second
@@ -39,10 +38,7 @@ use crate::element::{
 // justified by, applied to the codes as well as the mapping (PR #233 review, finding 3).
 // `libinput::keymap` does not map them because it answers "what text does this produce", and
 // these produce none.
-use libkern::abi::{
-    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_HOME, KEY_LEFT, KEY_RIGHT,
-    KEY_UP,
-};
+use libkern::abi::{KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_HOME, KEY_LEFT, KEY_RIGHT, KEY_UP};
 use librsproto::surface::MOD_SHIFT;
 
 /// How a widget should look, given what the application knows about it.
@@ -68,12 +64,7 @@ const BUTTON_PAD: Insets = Insets { top: 4, right: 8, bottom: 4, left: 8 };
 /// Focusable, because a keyboard user must be able to reach it — and the focus ring is drawn
 /// from `state.active` rather than from focus alone, so a button in an unfocused window does
 /// not claim the keyboard it does not have.
-pub fn button<Msg>(
-    label: impl Into<String>,
-    msg: Msg,
-    state: WidgetState,
-    theme: &Theme,
-) -> Element<Msg> {
+pub fn button<Msg>(label: impl Into<String>, msg: Msg, state: WidgetState, theme: &Theme) -> Element<Msg> {
     let face = if state.pressed {
         theme.face_pressed
     } else if state.hovered {
@@ -94,14 +85,10 @@ pub fn button<Msg>(
     // **Rounded since the desktop refresh's Part H**, to `CONTROL_RADIUS` — the curve a window,
     // a popup, a tab and a field all share. A square button beside a rounded field was the last
     // right angle on these surfaces.
-    let (edge, thickness) =
-        if state.active { (theme.accent, RING) } else { (theme.border, BORDER) };
+    let (edge, thickness) = if state.active { (theme.accent, RING) } else { (theme.border, BORDER) };
     let mut layers = alloc::vec::Vec::with_capacity(3);
     layers.push(rounded_fill(edge, CONTROL_RADIUS));
-    layers.push(padding(
-        Insets::all(thickness),
-        rounded_fill(face, CONTROL_RADIUS.saturating_sub(thickness)),
-    ));
+    layers.push(padding(Insets::all(thickness), rounded_fill(face, CONTROL_RADIUS.saturating_sub(thickness))));
     // **Centred, which is what a button's label is everywhere else in the world.** It was against
     // the top-left corner of the face: `padding` places a child at an inset from the origin, and
     // a face is usually much wider than the word on it, so every button in this toolkit read as
@@ -151,12 +138,7 @@ pub const POPUP_BORDER: u32 = 1;
 /// Takes the title and the rest separately rather than wrapping a finished tree, because those
 /// two are exactly the parts that are treated differently. An application that wants no frame
 /// simply does not call this; the greeter does not, having no title bar to be flush with.
-pub fn window_frame<Msg>(
-    title: Element<Msg>,
-    content: Element<Msg>,
-    focused: bool,
-    theme: &Theme,
-) -> Element<Msg> {
+pub fn window_frame<Msg>(title: Element<Msg>, content: Element<Msg>, focused: bool, theme: &Theme) -> Element<Msg> {
     frame_layers(title, content, None, focused, theme)
 }
 
@@ -176,10 +158,7 @@ fn frame_layers<Msg>(
     // application's own namespace.
     let inner = dock(
         alloc::vec![docked(Edge::Top, padding(Insets::all(0), title))],
-        padding(
-            Insets { top: 0, right: WINDOW_FRAME, bottom: WINDOW_FRAME, left: WINDOW_FRAME },
-            content,
-        ),
+        padding(Insets { top: 0, right: WINDOW_FRAME, bottom: WINDOW_FRAME, left: WINDOW_FRAME }, content),
     );
     // **The border is drawn last, and round** (desktop refresh, Part B). It was a square fill
     // under a face inset by a pixel; the compositor now cuts a window's corners to
@@ -281,8 +260,7 @@ pub const DIALOG_LEFT_CX: i32 = (WINDOW_CONTENT_X + DIALOG_PAD + DIALOG_BUTTON_W
 pub const DIALOG_RIGHT_CX: i32 =
     (WINDOW_CONTENT_X + DIALOG_PAD + DIALOG_BUTTON_W + DIALOG_GAP + DIALOG_BUTTON_W / 2) as i32;
 /// The vertical centre of both, measured up from the dialog's bottom edge.
-pub const DIALOG_BUTTON_CY: i32 =
-    (DIALOG_H - WINDOW_BORDER - WINDOW_FRAME - DIALOG_PAD - DIALOG_BUTTON_H / 2) as i32;
+pub const DIALOG_BUTTON_CY: i32 = (DIALOG_H - WINDOW_BORDER - WINDOW_FRAME - DIALOG_PAD - DIALOG_BUTTON_H / 2) as i32;
 
 /// A confirmation dialog's whole face: a title bar, a question, and two answers.
 ///
@@ -335,10 +313,7 @@ pub fn dialog_frame_sized<Msg>(
 ) -> Element<Msg> {
     let strip = sized(
         Size::new(0, DIALOG_BUTTON_H + DIALOG_PAD),
-        padding(
-            Insets { top: 0, right: DIALOG_PAD, bottom: DIALOG_PAD, left: DIALOG_PAD },
-            buttons,
-        ),
+        padding(Insets { top: 0, right: DIALOG_PAD, bottom: DIALOG_PAD, left: DIALOG_PAD }, buttons),
     );
     // **Both dock children wrapped, and the zero-inset one is not decoration** — the same rule
     // [`window_frame`] states and for the same reason: the diff requires a container's children
@@ -578,16 +553,9 @@ pub fn tab_strip<Msg: Clone>(
             )
             .flex(1)
             .key(t.key),
-            sized(
-                Size::new(TAB_CLOSE_W, TAB_BOX_H),
-                stack(close_layers).on_press(close(t.key)),
-            )
-            .key(close_key),
+            sized(Size::new(TAB_CLOSE_W, TAB_BOX_H), stack(close_layers).on_press(close(t.key)),).key(close_key),
         ]));
-        row_items.push(
-            sized(Size::new(TAB_W, TAB_BOX_H), stack(layers).on_press(select(t.key)))
-                .key(t.key),
-        );
+        row_items.push(sized(Size::new(TAB_W, TAB_BOX_H), stack(layers).on_press(select(t.key))).key(t.key));
     }
     // **The `+` is the last thing in the row**, where the design puts it: after the tabs rather
     // than at the strip's right end, so it stays beside the tab that was opened last.
@@ -603,7 +571,7 @@ pub fn tab_strip<Msg: Clone>(
                     if hovered == Some(NEW_TAB_KEY) { theme.foreground } else { theme.foreground_dim },
                     text("+"),
                 ))])
-                    .on_press(new_tab),
+                .on_press(new_tab),
             )
             .key(NEW_TAB_KEY),
         );
@@ -612,10 +580,7 @@ pub fn tab_strip<Msg: Clone>(
     // The strip's own face, and the rule that separates it from what is below. The current tab
     // is drawn over that rule, which is what "its border is open at the bottom" means here.
     strip.push(fill(theme.face_hover));
-    strip.push(dock(
-        alloc::vec![docked(Edge::Bottom, sized(Size::new(0, TAB_RULE), fill(theme.border)))],
-        text(""),
-    ));
+    strip.push(dock(alloc::vec![docked(Edge::Bottom, sized(Size::new(0, TAB_RULE), fill(theme.border)))], text("")));
     let tabs_row = with_spacing(row(row_items), TAB_GAP);
     strip.push(padding(
         Insets { top: TAB_TOP, right: TAB_SIDE, bottom: 0, left: TAB_SIDE },
@@ -694,12 +659,7 @@ const STATUS_PAD_X: u32 = 11;
 /// editor wraps its own position readout in it — numbers that shuffle the line about as a caret
 /// moves are what a fixed advance is for. A bar set wholly in it would still be wrong; a reading
 /// inside one is the caller's judgement (PR #321 review, worth fixing 5).
-pub fn status_bar<Msg>(
-    left: Element<Msg>,
-    right: Option<Element<Msg>>,
-    rule: Edge,
-    theme: &Theme,
-) -> Element<Msg> {
+pub fn status_bar<Msg>(left: Element<Msg>, right: Option<Element<Msg>>, rule: Edge, theme: &Theme) -> Element<Msg> {
     // **Both slots wrapped, and the zero-inset one is not decoration** — `frame_layers`'s rule,
     // for its reason: the diff wants a container's children all keyed or none, and a caller that
     // keys its readout would otherwise make this dock `MixedKeying` at the first frame. The
@@ -713,14 +673,8 @@ pub fn status_bar<Msg>(
         Size::new(0, STATUS_BAR_H),
         stack(alloc::vec![
             fill(theme.face_hover),
-            dock(
-                alloc::vec![docked(rule, sized(Size::new(0, 1), fill(theme.border)))],
-                text(""),
-            ),
-            padding(
-                Insets { top: 0, right: STATUS_PAD_X, bottom: 0, left: STATUS_PAD_X },
-                center_v(inner),
-            ),
+            dock(alloc::vec![docked(rule, sized(Size::new(0, 1), fill(theme.border)))], text(""),),
+            padding(Insets { top: 0, right: STATUS_PAD_X, bottom: 0, left: STATUS_PAD_X }, center_v(inner),),
         ]),
     )
 }
@@ -751,12 +705,7 @@ pub const STATUS_GAP: u32 = 7;
 ///
 /// Hover and press shade the ground rather than swapping it, because an accent that changed hue
 /// under the pointer would read as a different control.
-pub fn pill<Msg>(
-    label: impl Into<String>,
-    msg: Msg,
-    state: WidgetState,
-    theme: &Theme,
-) -> Element<Msg> {
+pub fn pill<Msg>(label: impl Into<String>, msg: Msg, state: WidgetState, theme: &Theme) -> Element<Msg> {
     let ground = if state.pressed {
         theme.accent.shade(-PILL_SHADE)
     } else if state.hovered {
@@ -776,10 +725,7 @@ pub fn pill<Msg>(
         // **A band of the label's colour, inside the edge** — and it has to be a *band*: this
         // drew the ground inset by the ring over a ground of the same colour, which is the same
         // colour on the same colour and put down not one different pixel (review, optional 4).
-        layers.push(padding(
-            Insets::all(PILL_RING_INSET),
-            rounded_fill(ink_colour, CONTROL_RADIUS - PILL_RING_INSET),
-        ));
+        layers.push(padding(Insets::all(PILL_RING_INSET), rounded_fill(ink_colour, CONTROL_RADIUS - PILL_RING_INSET)));
         layers.push(padding(
             Insets::all(PILL_RING_INSET + RING),
             rounded_fill(ground, CONTROL_RADIUS - PILL_RING_INSET - RING),
@@ -830,12 +776,7 @@ const PILL_SHADE: i16 = 12;
 /// M4 and `WidgetState::hovered` has existed just as long, and until M11 Part E batch 3 no
 /// application ever connected the two — so nothing in this system had ever reacted to the
 /// pointer moving over it.
-pub fn menu_item<Msg: Clone>(
-    label: &str,
-    msg: Msg,
-    hovered: bool,
-    theme: &Theme,
-) -> Element<Msg> {
+pub fn menu_item<Msg: Clone>(label: &str, msg: Msg, hovered: bool, theme: &Theme) -> Element<Msg> {
     // **A wash over the bar, not a ring round a fill** (desktop refresh, Part B) — the design's
     // `--soft`. The bar's own face is painted beneath this by `menu_bar`, first, which is the
     // ground a wash needs.
@@ -1116,7 +1057,6 @@ pub fn menu_bar<Msg>(items: alloc::vec::Vec<Element<Msg>>, height: u32, theme: &
     )
 }
 
-
 /// How tall a title bar is, in pixels — the rule along its bottom included.
 ///
 /// One number rather than a measurement of the font, because a client sizes its window around
@@ -1229,12 +1169,9 @@ pub fn title_bar<Msg: Clone>(
             }
         };
         layers.push(ink(glyph_ink, icon(glyph)));
-        sized(
-            Size::new(TITLE_BUTTON_W, 0),
-            center(sized(Size::new(TITLE_BUTTON_W, TITLE_BUTTON_H), stack(layers))),
-        )
-        .on_press(msg)
-        .key(key)
+        sized(Size::new(TITLE_BUTTON_W, 0), center(sized(Size::new(TITLE_BUTTON_W, TITLE_BUTTON_H), stack(layers))))
+            .on_press(msg)
+            .key(key)
     };
     // **A button a caller has no message for is not drawn.** The alternative is a button that
     // does nothing, and a control that looks live and is not is the defect this milestone's
@@ -1317,14 +1254,8 @@ pub fn resize_grip<Msg: Clone>(msg: Msg, theme: &Theme) -> Element<Msg> {
     layers.push(fill(theme.face));
     for i in 0..3u32 {
         let inset = i * 5;
-        layers.push(padding(
-            Insets { top: inset + 2, right: 2, bottom: 2, left: inset + 2 },
-            fill(theme.track),
-        ));
-        layers.push(padding(
-            Insets { top: inset + 4, right: 4, bottom: 4, left: inset + 4 },
-            fill(theme.face),
-        ));
+        layers.push(padding(Insets { top: inset + 2, right: 2, bottom: 2, left: inset + 2 }, fill(theme.track)));
+        layers.push(padding(Insets { top: inset + 4, right: 4, bottom: 4, left: inset + 4 }, fill(theme.face)));
     }
     sized(Size::new(GRIP_W, GRIP_W), stack(layers).on_press_down(msg))
 }
@@ -1540,7 +1471,6 @@ impl TextFieldState {
     }
 }
 
-
 /// A single-line text field, optionally masked.
 ///
 /// **The caret is a `Row` split at the cursor**, not a measured x-offset: the text before it,
@@ -1555,12 +1485,7 @@ impl TextFieldState {
 ///
 /// The caret is drawn from `state.active`, like the button's focus ring: a field in an
 /// unfocused window must not blink a caret for a keyboard it does not have.
-pub fn text_field<Msg>(
-    field: &TextFieldState,
-    masked: bool,
-    state: WidgetState,
-    theme: &Theme,
-) -> Element<Msg> {
+pub fn text_field<Msg>(field: &TextFieldState, masked: bool, state: WidgetState, theme: &Theme) -> Element<Msg> {
     let render = |s: &str| -> String {
         if masked { core::iter::repeat_n(MASK_CHAR, s.chars().count()).collect() } else { s.into() }
     };
@@ -1583,18 +1508,13 @@ pub fn text_field<Msg>(
     // one-pixel `--line`, which is what makes it read as somewhere to type before it is typed in.
     // The ring keeps its second pixel and its accent, so focus still reads as a state rather than
     // as an edge.
-    let (edge, thickness) =
-        if state.active { (theme.accent, RING) } else { (theme.border, BORDER) };
+    let (edge, thickness) = if state.active { (theme.accent, RING) } else { (theme.border, BORDER) };
     let mut layers = alloc::vec::Vec::with_capacity(3);
     layers.push(rounded_fill(edge, CONTROL_RADIUS));
-    layers.push(padding(
-        Insets::all(thickness),
-        rounded_fill(theme.track, CONTROL_RADIUS.saturating_sub(thickness)),
-    ));
+    layers.push(padding(Insets::all(thickness), rounded_fill(theme.track, CONTROL_RADIUS.saturating_sub(thickness))));
     layers.push(padding(FIELD_PAD, row(content)));
     stack(layers).focusable()
 }
-
 
 /// A multi-line text buffer with a cursor, a selection and a scroll position.
 ///
@@ -1755,8 +1675,7 @@ impl TextAreaState {
         // enforce. An `is_empty` guard stood here until PR #258's review pointed out that it
         // cannot fire, and a guard that cannot fire reads as protecting an invariant it does
         // not (optional 2).
-        let lines: Vec<String> =
-            text.split('\n').map(|l| String::from(l.strip_suffix('\r').unwrap_or(l))).collect();
+        let lines: Vec<String> = text.split('\n').map(|l| String::from(l.strip_suffix('\r').unwrap_or(l))).collect();
         Self { lines, ..Self::default() }
     }
 
@@ -1961,9 +1880,7 @@ impl TextAreaState {
     ///
     /// Coordinates are the ones [`text_area`] hands its pointer handler, so this subtracts the
     /// padding the widget draws with — a caller cannot know that number and should not have to.
-    pub fn at_point(&self, x: i32, y: i32, row_height: u32, width: impl Fn(&str) -> u32)
-        -> (usize, usize)
-    {
+    pub fn at_point(&self, x: i32, y: i32, row_height: u32, width: impl Fn(&str) -> u32) -> (usize, usize) {
         let y = y - FIELD_PAD.top as i32;
         let row = if row_height == 0 { 0 } else { (y.max(0) as u32 / row_height) as usize };
         // **Clamped rather than refused.** A press below the last line means its end, which is
@@ -1979,11 +1896,7 @@ impl TextAreaState {
         // costs: there is no arithmetic that turns a pixel into a column when every glyph is a
         // different width.
         let mut best = (0usize, u32::MAX);
-        for col in text
-            .char_indices()
-            .map(|(i, _)| i)
-            .chain(core::iter::once(text.len()))
-        {
+        for col in text.char_indices().map(|(i, _)| i).chain(core::iter::once(text.len())) {
             let w = width(&text[..col]);
             let d = w.abs_diff(x as u32);
             if d < best.1 {
@@ -1998,11 +1911,7 @@ impl TextAreaState {
     /// The same shape [`ListState::bar`] has, and for the same reason: the widget owns the
     /// arithmetic, so a bar and the text beside it cannot disagree about where a thumb points.
     pub fn bar(&self, visible: usize) -> ScrollState {
-        ScrollState {
-            offset: self.offset as u32,
-            visible: visible as u32,
-            total: self.lines.len() as u32,
-        }
+        ScrollState { offset: self.offset as u32, visible: visible as u32, total: self.lines.len() as u32 }
     }
 
     /// Scroll so `offset` is the first visible line, clamped to what there is.
@@ -2058,8 +1967,7 @@ impl TextAreaState {
     /// the buffer is an undo step that visibly does nothing, which is worse than no step at all.
     fn begin(&mut self, kind: EditKind) {
         if self.group != Some(kind) {
-            let here =
-                Snapshot { lines: self.lines.clone(), line: self.line, col: self.col };
+            let here = Snapshot { lines: self.lines.clone(), line: self.line, col: self.col };
             if self.undo.len() == MAX_UNDO {
                 self.undo.remove(0);
             }
@@ -2600,8 +2508,7 @@ pub fn text_area<Msg>(
 /// launcher derives them from its filtered program list, neither keeping a parallel array of
 /// row widgets to reconcile by hand — which is the hand-rolled diffing `desktop-shell.md` §5
 /// says a list widget exists to avoid.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[derive(Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ListRow<'a> {
     /// Identity across frames.
     ///
@@ -3004,8 +2911,7 @@ pub fn list_view<Msg>(
         if columns.is_empty() && r.swatch.is_none() && r.button.is_none() {
             layers.push(padding(ROW_PAD, text(r.label)));
             let row_el = stack(layers);
-            let mut item =
-                sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
+            let mut item = sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
             if let Some(f) = grab {
                 item = item.on_press_down(f(r.key));
             }
@@ -3066,8 +2972,7 @@ pub fn list_view<Msg>(
             }
         }
         let row_el = stack(layers);
-        let mut item =
-            sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
+        let mut item = sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
         // **A press *down* on a row, for the caller that needs the gesture rather than the
         // click.** Dragging a row somewhere is decided the moment the button lands on it — by
         // the time it comes up the drag is over — and the row a press landed on is a fact this
@@ -3085,11 +2990,7 @@ pub fn list_view<Msg>(
 
     let list = column(items);
     let body = if rows.len() > visible {
-        let bar = ScrollState {
-            offset: state.offset as u32,
-            visible: visible as u32,
-            total: rows.len() as u32,
-        };
+        let bar = ScrollState { offset: state.offset as u32, visible: visible as u32, total: rows.len() as u32 };
         // **The bar takes the pointer when the caller has somewhere to send it** (M11 Part E
         // batch 6). It was built without a handler, so a list's scrollbar showed a position and
         // could not be dragged — a control that looks live and is not, which is the defect this
@@ -3161,18 +3062,15 @@ pub fn list_header<Msg>(
         Size::new(0, LIST_HEADER_H),
         stack(alloc::vec![
             fill(theme.face_hover),
-            dock(
-                alloc::vec![docked(Edge::Bottom, sized(Size::new(0, 1), fill(theme.border)))],
-                text(""),
-            ),
+            dock(alloc::vec![docked(Edge::Bottom, sized(Size::new(0, 1), fill(theme.border)))], text(""),),
             padding(
-            // **The scrollbar's width, when there is one** (PR #320 review, worth fixing 5): a
-            // list that overflows puts its rows beside a scrollbar and they lose that width,
-            // while this spans the whole strip — so every column sat twelve pixels left of its
-            // heading in any directory long enough to scroll, which is most of them.
-            Insets { right: ROW_PAD.right + if scrolling { SCROLLBAR_W } else { 0 }, ..ROW_PAD },
-            row(cells),
-        ),
+                // **The scrollbar's width, when there is one** (PR #320 review, worth fixing 5): a
+                // list that overflows puts its rows beside a scrollbar and they lose that width,
+                // while this spans the whole strip — so every column sat twelve pixels left of its
+                // heading in any directory long enough to scroll, which is most of them.
+                Insets { right: ROW_PAD.right + if scrolling { SCROLLBAR_W } else { 0 }, ..ROW_PAD },
+                row(cells),
+            ),
         ]),
     )
 }
@@ -3192,8 +3090,8 @@ const SCROLLBAR_W: u32 = 12;
 #[cfg(test)]
 mod list_view_tests {
     use super::*;
-    use libdraw::format::Rgb;
     use crate::element::Node;
+    use libdraw::format::Rgb;
 
     fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
         labels.iter().map(|&(key, label)| ListRow { key, label, marked: false, ..Default::default() }).collect()
@@ -3223,8 +3121,7 @@ mod list_view_tests {
             let l = crate::layout::layout(e, all, &m);
             let mut fb = MemFramebuffer::new(Geometry::packed(w, 25, PixelFormat::XRGB8888));
             fb.clear(t.background);
-            let mut custom =
-                |_: u32, _: libdraw::geom::Rect, _: libdraw::geom::Rect, _: &mut MemFramebuffer| {};
+            let mut custom = |_: u32, _: libdraw::geom::Rect, _: libdraw::geom::Rect, _: &mut MemFramebuffer| {};
             crate::paint::paint(&mut fb, &font, &t, e, &l, all, &mut custom);
             // **Text only**: a scrolling list draws its bar at the right edge, and the bar is
             // ink too — what has to line up is the cell's glyphs against the heading's.
@@ -3243,25 +3140,15 @@ mod list_view_tests {
                 .expect("something is drawn")
         };
         let right_edges = |count: usize| {
-            let labels: alloc::vec::Vec<(u64, &str)> =
-                (0..count as u64).map(|i| (i, "entry")).collect();
+            let labels: alloc::vec::Vec<(u64, &str)> = (0..count as u64).map(|i| (i, "entry")).collect();
             let rows: alloc::vec::Vec<ListRow<'_>> = labels
                 .iter()
-                .map(|&(key, label)| ListRow {
-                    key,
-                    label,
-                    marked: false,
-                    cells: &["848"],
-                    swatch: None,
-                    button: None,
-                })
+                .map(|&(key, label)| ListRow { key, label, marked: false, cells: &["848"], swatch: None, button: None })
                 .collect();
             let scrolls = list_scrolls(rows.len(), h, row_h);
             let mut st = ListState::default();
-            let list: Element<u64> =
-                list_view(&rows, &columns, &mut st, h, row_h, |k| k, None, None, None, None, &t);
-            let header: Element<u64> =
-                list_header("Name", &["Size"], &columns, false, scrolls, &t);
+            let list: Element<u64> = list_view(&rows, &columns, &mut st, h, row_h, |k| k, None, None, None, None, &t);
+            let header: Element<u64> = list_header("Name", &["Size"], &columns, false, scrolls, &t);
             (rightmost_ink(&list), rightmost_ink(&header), scrolls)
         };
         // **`848` under `Size`, both right-aligned, so their ink ends at the same x** — within a
@@ -3274,10 +3161,7 @@ mod list_view_tests {
         );
         let (long_row, long_head, long_scrolls) = right_edges(40);
         assert!(long_scrolls, "forty rows overflow");
-        assert!(
-            long_row.abs_diff(long_head) <= 1,
-            "scrolling: row ends at {long_row}, heading at {long_head}"
-        );
+        assert!(long_row.abs_diff(long_head) <= 1, "scrolling: row ends at {long_row}, heading at {long_head}");
         assert!(long_row < short_row, "and a scrolling list gave up the scrollbar's width");
     }
 
@@ -3302,13 +3186,7 @@ mod list_view_tests {
             Grab(u64),
         }
         let build = |button: Option<RowButton<'static>>, hovered: Option<u64>| {
-            let row = ListRow {
-                key: 7,
-                label: "NXFAT",
-                swatch: Some(Swatch::dot(t.ok)),
-                button,
-                ..Default::default()
-            };
+            let row = ListRow { key: 7, label: "NXFAT", swatch: Some(Swatch::dot(t.ok)), button, ..Default::default() };
             let mut st = ListState::default();
             list_view(&[row], &[], &mut st, h, h, M::Open, Some(M::Grab), None, hovered, None, &t)
         };
@@ -3535,16 +3413,14 @@ mod list_view_tests {
     /// other way round (desktop refresh, Part I).
     #[test]
     fn a_rows_cells_land_in_their_columns_and_its_swatch_is_drawn() {
-        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
         use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
         const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
         let font = libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font");
         let t = Theme::default();
         let (w, h) = (400u32, 25u32);
-        let columns = [
-            ListColumn { width: 70, align: ColumnAlign::Right },
-            ListColumn { width: 60, align: ColumnAlign::Left },
-        ];
+        let columns =
+            [ListColumn { width: 70, align: ColumnAlign::Right }, ListColumn { width: 60, align: ColumnAlign::Left }];
         let mark = t.accent;
         let row = ListRow {
             key: 1,
@@ -3555,22 +3431,20 @@ mod list_view_tests {
             button: None,
         };
         let mut st = ListState::default();
-        let e: Element<u64> =
-            list_view(&[row], &columns, &mut st, h, h, |k| k, None, None, None, None, &t);
+        let e: Element<u64> = list_view(&[row], &columns, &mut st, h, h, |k| k, None, None, None, None, &t);
         let all = libdraw::geom::Rect::new(0, 0, w, h);
         let l = crate::layout::layout(&e, all, &crate::paint::FontMetrics::new(&font, t.font_px));
         let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
         fb.clear(t.background);
         crate::paint::paint(&mut fb, &font, &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
         let count = |x0: u32, x1: u32, c: Rgb| {
-            (x0..x1)
-                .flat_map(|x| (0..h).map(move |y| (x, y)))
-                .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(c))
-                .count()
+            (x0..x1).flat_map(|x| (0..h).map(move |y| (x, y))).filter(|(x, y)| fb.get_pixel(*x, *y) == Some(c)).count()
         };
         // The swatch, at the row's left end and in its colour.
-        assert!(count(0, ROW_PAD.left + SWATCH_W + 2, mark) >= (SWATCH_W * SWATCH_H / 2) as usize,
-            "the swatch is drawn where the row starts");
+        assert!(
+            count(0, ROW_PAD.left + SWATCH_W + 2, mark) >= (SWATCH_W * SWATCH_H / 2) as usize,
+            "the swatch is drawn where the row starts"
+        );
         assert_eq!(count(120, w, mark), 0, "and nowhere else");
         // Ink in each column's own band. The columns are the last 130 pixels: 70 then 60.
         let (size_from, kind_from) = (w - ROW_PAD.right - 130, w - ROW_PAD.right - 60);
@@ -3595,10 +3469,7 @@ mod list_view_tests {
             0,
             "a right-aligned cell puts nothing in the left half of its column"
         );
-        assert!(
-            ink_in(kind_from, half(kind_from, w - ROW_PAD.right)) > 0,
-            "…and a left-aligned one does"
-        );
+        assert!(ink_in(kind_from, half(kind_from, w - ROW_PAD.right)) > 0, "…and a left-aligned one does");
         // **The name gives way, not the columns.** A long name is clipped at the column's edge
         // rather than pushing it along — asserted by *which ink* is in the columns' band, since
         // the name is body ink and a cell is the dim step: the darkest pixel there must be no
@@ -3743,8 +3614,19 @@ mod list_view_tests {
     #[test]
     fn every_row_carries_its_key_not_its_index() {
         let data = [(70u64, "a"), (80, "b"), (90, "c")];
-        let e: Element<u64> =
-            list_view(&rows(&data), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
+        let e: Element<u64> = list_view(
+            &rows(&data),
+            &[],
+            &mut ListState::default(),
+            100,
+            20,
+            |k| k,
+            None,
+            None,
+            None,
+            None,
+            &Theme::default(),
+        );
         assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
     }
 
@@ -3753,10 +3635,32 @@ mod list_view_tests {
     fn a_reordered_window_list_keeps_each_rows_identity() {
         let before = [(1u64, "term"), (2, "editor")];
         let after = [(2u64, "editor"), (1, "term")];
-        let a: Element<u64> =
-            list_view(&rows(&before), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
-        let b: Element<u64> =
-            list_view(&rows(&after), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
+        let a: Element<u64> = list_view(
+            &rows(&before),
+            &[],
+            &mut ListState::default(),
+            100,
+            20,
+            |k| k,
+            None,
+            None,
+            None,
+            None,
+            &Theme::default(),
+        );
+        let b: Element<u64> = list_view(
+            &rows(&after),
+            &[],
+            &mut ListState::default(),
+            100,
+            20,
+            |k| k,
+            None,
+            None,
+            None,
+            None,
+            &Theme::default(),
+        );
         assert_eq!(keys(&a), alloc::vec![1, 2]);
         assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
     }
@@ -3783,9 +3687,7 @@ mod list_view_tests {
         // comes back into range on its own.
         assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
         assert!(
-            row_washes(&e)
-                .iter()
-                .any(|w| *w == Some((Theme::default().accent, libdraw::theme::SELECTION_COVERAGE))),
+            row_washes(&e).iter().any(|w| *w == Some((Theme::default().accent, libdraw::theme::SELECTION_COVERAGE))),
             "no row is painted as selected"
         );
         assert!(!state.down(3), "the selection is already on the last row");
@@ -3961,19 +3863,8 @@ mod list_view_tests {
             });
             n
         };
-        let with: Element<u64> = list_view(
-            &rows(&many),
-            &[],
-            &mut ListState::default(),
-            100,
-            20,
-            |k| k,
-            None,
-            Some(|_| 0),
-            None,
-            None,
-            &p,
-        );
+        let with: Element<u64> =
+            list_view(&rows(&many), &[], &mut ListState::default(), 100, 20, |k| k, None, Some(|_| 0), None, None, &p);
         assert_eq!(handlers(&with), 1, "the scrollbar took no pointer handler");
         let without: Element<u64> =
             list_view(&rows(&many), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &p);
@@ -3982,24 +3873,27 @@ mod list_view_tests {
 
     /// A press at `y` on a bar, and the offset it asks for.
     fn press_bar(g: &mut ScrollGrab, st: ScrollState, track: u32, y: i32) -> Option<u32> {
-        g.apply(st, track, PointerEvent {
-            kind: POINTER_BUTTON,
-            button: 0x110,
-            buttons: 1,
-            flags: POINTER_PRESSED,
-            y,
-            ..Default::default()
-        })
+        g.apply(
+            st,
+            track,
+            PointerEvent {
+                kind: POINTER_BUTTON,
+                button: 0x110,
+                buttons: 1,
+                flags: POINTER_PRESSED,
+                y,
+                ..Default::default()
+            },
+        )
     }
 
     /// A motion to `y` with the button still held.
     fn drag_bar(g: &mut ScrollGrab, st: ScrollState, track: u32, y: i32) -> Option<u32> {
-        g.apply(st, track, PointerEvent {
-            kind: librsproto::surface::POINTER_MOTION,
-            buttons: 1,
-            y,
-            ..Default::default()
-        })
+        g.apply(
+            st,
+            track,
+            PointerEvent { kind: librsproto::surface::POINTER_MOTION, buttons: 1, y, ..Default::default() },
+        )
     }
 
     #[test]
@@ -4020,14 +3914,11 @@ mod list_view_tests {
         assert!(bottom <= 15, "the offset ran past the last full screen of rows");
 
         // The release moves nothing and ends the drag.
-        let released = g.apply(bar(&st), 100, PointerEvent {
-            kind: POINTER_BUTTON,
-            button: 0x110,
-            buttons: 0,
-            flags: 0,
-            y: 100,
-            ..Default::default()
-        });
+        let released = g.apply(
+            bar(&st),
+            100,
+            PointerEvent { kind: POINTER_BUTTON, button: 0x110, buttons: 0, flags: 0, y: 100, ..Default::default() },
+        );
         assert_eq!(released, None, "a release is not a position");
         assert!(!g.dragging());
         assert_eq!(drag_bar(&mut g, bar(&st), 100, 90), None, "and the bar stopped following");
@@ -4159,19 +4050,8 @@ mod list_view_tests {
         let data = [(1u64, "a"), (2, "b")];
         // Row 1 selected, row 0 hovered: two different highlights, and they must not be the
         // same weight — two answers to "what happens if I act now" is one too many.
-        let e: Element<u64> = list_view(
-            &rows(&data),
-            &[],
-            &mut ListState::at(Some(1), 0),
-            100,
-            20,
-            |k| k,
-            None,
-            None,
-            Some(1),
-            None,
-            &p,
-        );
+        let e: Element<u64> =
+            list_view(&rows(&data), &[], &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, Some(1), None, &p);
         // Quieter: the hover's coverage against the selection's — 10% against 20% in the light
         // scheme, which is the whole difference in weight.
         let washes = row_washes(&e);
@@ -4180,24 +4060,9 @@ mod list_view_tests {
         assert!(p.scheme.hover_coverage() < libdraw::theme::SELECTION_COVERAGE, "the hover is not quieter");
 
         // And hovering the *selected* row leaves it selected rather than downgrading it.
-        let e: Element<u64> = list_view(
-            &rows(&data),
-            &[],
-            &mut ListState::at(Some(1), 0),
-            100,
-            20,
-            |k| k,
-            None,
-            None,
-            Some(2),
-            None,
-            &p,
-        );
-        assert_eq!(
-            row_washes(&e)[1],
-            Some((p.accent, libdraw::theme::SELECTION_COVERAGE)),
-            "selection lost to hover"
-        );
+        let e: Element<u64> =
+            list_view(&rows(&data), &[], &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, Some(2), None, &p);
+        assert_eq!(row_washes(&e)[1], Some((p.accent, libdraw::theme::SELECTION_COVERAGE)), "selection lost to hover");
     }
 
     /// The selected row paints differently, or selection is invisible.
@@ -4214,7 +4079,11 @@ mod list_view_tests {
         let faces = row_faces(&e);
         assert_eq!(faces, [p.track, p.track], "a row is not on the list's own ground");
         let washes = row_washes(&e);
-        assert_eq!(washes[1], Some((p.accent, libdraw::theme::SELECTION_COVERAGE)), "the selected row looks like the others");
+        assert_eq!(
+            washes[1],
+            Some((p.accent, libdraw::theme::SELECTION_COVERAGE)),
+            "the selected row looks like the others"
+        );
         assert_eq!(washes[0], None, "an unselected row is washed too");
         assert_eq!(row_bevels(&e), [None, None], "a row is drawn with a gradient");
     }
@@ -4237,8 +4106,19 @@ mod list_view_tests {
     #[test]
     fn a_rows_message_carries_its_own_key() {
         let data = [(11u64, "a"), (22, "b")];
-        let e: Element<u64> =
-            list_view(&rows(&data), &[], &mut ListState::default(), 100, 20, |k| k, None, None, None, None, &Theme::default());
+        let e: Element<u64> = list_view(
+            &rows(&data),
+            &[],
+            &mut ListState::default(),
+            100,
+            20,
+            |k| k,
+            None,
+            None,
+            None,
+            None,
+            &Theme::default(),
+        );
         assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
     }
 
@@ -4246,8 +4126,19 @@ mod list_view_tests {
     #[test]
     fn a_degenerate_row_height_is_not_a_division() {
         let data = [(1u64, "a")];
-        let e: Element<u64> =
-            list_view(&rows(&data), &[], &mut ListState::default(), 100, 0, |k| k, None, None, None, None, &Theme::default());
+        let e: Element<u64> = list_view(
+            &rows(&data),
+            &[],
+            &mut ListState::default(),
+            100,
+            0,
+            |k| k,
+            None,
+            None,
+            None,
+            None,
+            &Theme::default(),
+        );
         assert_eq!(keys(&e).len(), 0);
     }
 
@@ -4470,7 +4361,8 @@ mod text_field_tests {
     fn masking_counts_characters_not_bytes() {
         let f = TextFieldState::with_text("aé");
         assert_eq!(f.text().len(), 3, "the fixture is not multi-byte");
-        let e: Element<()> = text_field(&f, true, WidgetState { active: true, ..Default::default() }, &Theme::default());
+        let e: Element<()> =
+            text_field(&f, true, WidgetState { active: true, ..Default::default() }, &Theme::default());
         assert_eq!(rendered(&e), "**", "the mask leaked the byte length");
         // Negative control: unmasked shows the real text.
         let e: Element<()> = text_field(&f, false, WidgetState::default(), &Theme::default());
@@ -4536,11 +4428,11 @@ mod text_field_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libdraw::format::Rgb;
     use crate::layout::{FixedCell, layout};
     use crate::paint::{Theme, paint};
     use alloc::vec;
     use libdraw::format::PixelFormat;
+    use libdraw::format::Rgb;
     use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
     use libdraw::geom::Rect;
 
@@ -4585,10 +4477,9 @@ mod tests {
     fn nothing_to_scroll_fills_the_track() {
         // How a user sees "this is all of it". A full-height thumb that nevertheless moves is
         // the alternative, and it is nonsense.
-        for s in [
-            ScrollState { offset: 0, visible: 100, total: 100 },
-            ScrollState { offset: 0, visible: 200, total: 100 },
-        ] {
+        for s in
+            [ScrollState { offset: 0, visible: 100, total: 100 }, ScrollState { offset: 0, visible: 200, total: 100 }]
+        {
             assert_eq!(s.thumb(200), (0, 200), "{s:?}");
             assert!(!s.scrollable());
         }
@@ -4641,14 +4532,22 @@ mod tests {
                 "the thumb drawn for {offset} grabs as {got}, more than {per_pixel} lines out",
             );
         }
-        assert_eq!(ScrollState { offset: 0, ..s }.offset_at(track, {
-            let (p, l) = ScrollState { offset: 0, ..s }.thumb(track);
-            p as i32 + l as i32 / 2
-        }), 0, "the top is exactly the top");
-        assert_eq!(ScrollState { offset: 1000, ..s }.offset_at(track, {
-            let (p, l) = ScrollState { offset: 1000, ..s }.thumb(track);
-            p as i32 + l as i32 / 2
-        }), 1000, "and the bottom exactly the bottom");
+        assert_eq!(
+            ScrollState { offset: 0, ..s }.offset_at(track, {
+                let (p, l) = ScrollState { offset: 0, ..s }.thumb(track);
+                p as i32 + l as i32 / 2
+            }),
+            0,
+            "the top is exactly the top"
+        );
+        assert_eq!(
+            ScrollState { offset: 1000, ..s }.offset_at(track, {
+                let (p, l) = ScrollState { offset: 1000, ..s }.thumb(track);
+                p as i32 + l as i32 / 2
+            }),
+            1000,
+            "and the bottom exactly the bottom"
+        );
 
         // And where the arithmetic *can* be exact — fewer lines than pixels of span — it is,
         // so the tolerance above is the quantisation and not a bug hiding inside it.
@@ -4727,11 +4626,9 @@ mod tests {
                 .filter_map(|c| match &c.node {
                     // A button's layers are rounded fills since Part H; a square `Fill` is still
                     // matched so this reads whichever shape the widget is built from.
-                    crate::element::Node::Fill(c)
-                    | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
+                    crate::element::Node::Fill(c) | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
                     crate::element::Node::Padding { child, .. } => match &child.node {
-                        crate::element::Node::Fill(c)
-                        | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
+                        crate::element::Node::Fill(c) | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
                         _ => None,
                     },
                     _ => None,
@@ -4754,10 +4651,8 @@ mod tests {
         // over the whole area would hide it and the tree would still look right.
         let p = Theme::default();
         let t = Theme::default();
-        let mut fb =
-            MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
-        let e: Element<Msg> =
-            button("OK", (), WidgetState { active: true, ..Default::default() }, &p);
+        let mut fb = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
+        let e: Element<Msg> = button("OK", (), WidgetState { active: true, ..Default::default() }, &p);
         let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
         // **Down the left edge rather than at the corner**: the button is rounded to
@@ -4813,8 +4708,7 @@ mod tests {
         // Focused, the edge is the accent instead — a state, not a second kind of edge.
         let mut lit = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
         lit.clear(p.background);
-        let f: Element<Msg> =
-            text_field(&state, false, WidgetState { active: true, ..Default::default() }, &p);
+        let f: Element<Msg> = text_field(&state, false, WidgetState { active: true, ..Default::default() }, &p);
         let fl = layout(&f, Rect::new(0, 0, 80, 40), &CELL);
         paint(&mut lit, &font(), &p, &f, &fl, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
         assert_eq!(lit.get_pixel(0, mid), Some(p.accent), "a focused field rings in the accent");
@@ -4843,10 +4737,7 @@ mod tests {
             .collect();
         let (first, last) = (inked[0], inked[inked.len() - 1]);
         let (left, right) = (first, 79 - last);
-        assert!(
-            left.abs_diff(right) <= 2,
-            "the label sits {left} from the left and {right} from the right"
-        );
+        assert!(left.abs_diff(right) <= 2, "the label sits {left} from the left and {right} from the right");
     }
 
     #[test]
@@ -4867,10 +4758,8 @@ mod tests {
         // `button` — a `Stack` over a `Fill` — took the whole row and the second laid out at
         // zero width, off the right edge. The bar looked correct in every assertion above.
         let p = Theme::default();
-        let items: vec::Vec<Element<Msg>> = vec![
-            button("File", (), WidgetState::default(), &p),
-            button("Edit", (), WidgetState::default(), &p),
-        ];
+        let items: vec::Vec<Element<Msg>> =
+            vec![button("File", (), WidgetState::default(), &p), button("Edit", (), WidgetState::default(), &p)];
         let e = menu_bar(items, 24, &p);
         let l = layout(&e, Rect::new(0, 0, 200, 100), &CELL);
         // sized -> dock -> [the rule, stack] ; stack -> [face fill, row] ; row -> the buttons.
@@ -4880,11 +4769,7 @@ mod tests {
         assert!(a.size.w > 0, "the first item measured to nothing");
         assert!(b.size.w > 0, "the second item got no width — the first one ate the row");
         assert_eq!(b.origin.x, a.origin.x + a.size.w as i32, "and they sit side by side");
-        assert!(
-            b.right() <= 200,
-            "the second item runs off the bar: {:?}",
-            b
-        );
+        assert!(b.right() <= 200, "the second item runs off the bar: {:?}", b);
     }
 
     #[test]
@@ -4893,16 +4778,10 @@ mod tests {
         // 400-pixel-tall column is not a 400-pixel-tall button.
         let p = Theme::default();
         let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
-        let big = crate::layout::measure(
-            &e,
-            crate::layout::Constraints::loose(libdraw::geom::Size::new(400, 400)),
-            &CELL,
-        );
-        let small = crate::layout::measure(
-            &e,
-            crate::layout::Constraints::loose(libdraw::geom::Size::new(100, 100)),
-            &CELL,
-        );
+        let big =
+            crate::layout::measure(&e, crate::layout::Constraints::loose(libdraw::geom::Size::new(400, 400)), &CELL);
+        let small =
+            crate::layout::measure(&e, crate::layout::Constraints::loose(libdraw::geom::Size::new(100, 100)), &CELL);
         assert_eq!(big, small, "a button's size must not depend on the room around it");
         assert!(big.h < 100, "a two-line-tall button: {big:?}");
     }
@@ -4926,11 +4805,7 @@ mod tests {
             None,
             true,
             M::Drag,
-            TitleButtons {
-                minimise: Some(M::Min),
-                maximise: Some(M::Max),
-                close: Some(M::Close),
-            },
+            TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
             None,
             &p,
         );
@@ -5234,9 +5109,11 @@ mod tests {
 
     #[test]
     fn find_walks_forward_through_every_match_and_wraps() {
-        let mut a = TextAreaState::with_text("one two
+        let mut a = TextAreaState::with_text(
+            "one two
 three two
-two");
+two",
+        );
         assert!(a.find("two"));
         assert_eq!(a.cursor(), (0, 4), "the first, after the cursor");
         assert!(a.find("two"));
@@ -5661,21 +5538,11 @@ two");
     fn an_ink_run_splits_a_line_and_colours_only_itself() {
         let p = Theme::default();
         let mut a = TextAreaState::with_text("let x = 1");
-        let e: Element<()> = text_area(
-            &mut a,
-            16,
-            16,
-            false,
-            &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }],
-            None,
-            &p,
-        );
+        let e: Element<()> =
+            text_area(&mut a, 16, 16, false, &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }], None, &p);
         assert_eq!(
             inked(&e),
-            alloc::vec![
-                (String::from("let"), Some(KEYWORD)),
-                (String::from(" x = 1"), None),
-            ],
+            alloc::vec![(String::from("let"), Some(KEYWORD)), (String::from(" x = 1"), None),],
             "the line was not split at the run's edge"
         );
     }
@@ -5772,15 +5639,8 @@ two");
         for _ in 0..3 {
             a.apply(KEY_RIGHT, MOD_SHIFT, 0);
         }
-        let e: Element<()> = text_area(
-            &mut a,
-            16,
-            16,
-            true,
-            &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }],
-            None,
-            &p,
-        );
+        let e: Element<()> =
+            text_area(&mut a, 16, 16, true, &[InkRun { line: 0, start: 0, end: 3, colour: KEYWORD }], None, &p);
         assert_eq!(fills(&e, p.selection()), 1, "precondition: the keyword is selected");
         assert!(
             inked(&e).contains(&(String::from("let"), Some(KEYWORD))),
@@ -5799,15 +5659,8 @@ two");
     fn a_stale_or_misaligned_run_neither_panics_nor_colours_past_the_end() {
         let p = Theme::default();
         let mut a = TextAreaState::with_text("ab");
-        let e: Element<()> = text_area(
-            &mut a,
-            16,
-            16,
-            false,
-            &[InkRun { line: 0, start: 1, end: 99, colour: KEYWORD }],
-            None,
-            &p,
-        );
+        let e: Element<()> =
+            text_area(&mut a, 16, 16, false, &[InkRun { line: 0, start: 1, end: 99, colour: KEYWORD }], None, &p);
         assert_eq!(
             inked(&e),
             alloc::vec![(String::from("a"), None), (String::from("b"), Some(KEYWORD))],
@@ -5816,28 +5669,14 @@ two");
 
         // A boundary inside a character is dropped rather than split on.
         let mut a = TextAreaState::with_text("\u{4e2d}\u{6587}");
-        let e: Element<()> = text_area(
-            &mut a,
-            16,
-            16,
-            false,
-            &[InkRun { line: 0, start: 1, end: 2, colour: KEYWORD }],
-            None,
-            &p,
-        );
+        let e: Element<()> =
+            text_area(&mut a, 16, 16, false, &[InkRun { line: 0, start: 1, end: 2, colour: KEYWORD }], None, &p);
         assert_eq!(inked(&e).len(), 1, "the line was split inside a character: {:?}", inked(&e));
 
         // And a run naming a line that is not on screen colours nothing.
         let mut a = TextAreaState::with_text("only");
-        let e: Element<()> = text_area(
-            &mut a,
-            16,
-            16,
-            false,
-            &[InkRun { line: 40, start: 0, end: 2, colour: KEYWORD }],
-            None,
-            &p,
-        );
+        let e: Element<()> =
+            text_area(&mut a, 16, 16, false, &[InkRun { line: 40, start: 0, end: 2, colour: KEYWORD }], None, &p);
         assert!(inked(&e).iter().all(|(_, c)| c.is_none()));
     }
 
@@ -5872,8 +5711,12 @@ two");
         assert_eq!(a.selection(), None, "and the anchor went with the character");
         // This is where it used to panic: the anchor named byte 3 of a line now 2 long.
         let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &Theme::default());
-        assert_eq!(fills(&e, Theme::default().selection()), 0, "nothing is selected, so nothing \
-            is highlighted");
+        assert_eq!(
+            fills(&e, Theme::default().selection()),
+            0,
+            "nothing is selected, so nothing \
+            is highlighted"
+        );
 
         // The quieter symptom of the same defect: typing instead of deleting used to leave a
         // selection over the character just typed, which the next keystroke would replace.
@@ -5956,10 +5799,7 @@ two");
         struct Resize;
         let p = Theme::default();
         let e = resize_grip(Resize, &p);
-        assert_eq!(
-            measure(&e, Constraints::loose(Size::new(400, 400)), &CELL),
-            Size::new(GRIP_W, GRIP_W)
-        );
+        assert_eq!(measure(&e, Constraints::loose(Size::new(400, 400)), &CELL), Size::new(GRIP_W, GRIP_W));
 
         let l = layout(&e, Rect::new(0, 0, 400, 400), &CELL);
         let mut tree = Tree::new();
@@ -6000,11 +5840,7 @@ two");
             None,
             true,
             M::Drag,
-            TitleButtons {
-                minimise: Some(M::Min),
-                maximise: Some(M::Max),
-                close: Some(M::Close),
-            },
+            TitleButtons { minimise: Some(M::Min), maximise: Some(M::Max), close: Some(M::Close) },
             None,
             &p,
         );
@@ -6121,12 +5957,8 @@ two");
             New,
         }
         let theme = Theme::default();
-        let tabs = [
-            Tab { key: 7, label: "one", marked: false },
-            Tab { key: 9, label: "two", marked: true },
-        ];
-        let ui: Element<M> =
-            tab_strip(&tabs, 7, None, M::Select, M::Close, TabExtras::new_tab(M::New), &theme);
+        let tabs = [Tab { key: 7, label: "one", marked: false }, Tab { key: 9, label: "two", marked: true }];
+        let ui: Element<M> = tab_strip(&tabs, 7, None, M::Select, M::Close, TabExtras::new_tab(M::New), &theme);
 
         let cell = crate::layout::FixedCell { w: 8, h: 16 };
         let l = crate::layout::layout(&ui, Rect::new(0, 0, 400, TAB_STRIP_H), &cell);
@@ -6203,16 +6035,11 @@ two");
             let fb = draw(&t, WidgetState::default());
             let ground = brightness(t.accent);
             let (paper, text_ink) = (brightness(t.background), brightness(t.foreground));
-            let wanted =
-                if (paper - ground).abs() >= (text_ink - ground).abs() { paper } else { text_ink };
+            let wanted = if (paper - ground).abs() >= (text_ink - ground).abs() { paper } else { text_ink };
             // The label's extreme pixel on the middle row is the ink it is drawn in.
-            let row: alloc::vec::Vec<i32> =
-                (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(brightness).collect();
-            let reached = if wanted > ground {
-                *row.iter().max().expect("pixels")
-            } else {
-                *row.iter().min().expect("pixels")
-            };
+            let row: alloc::vec::Vec<i32> = (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(brightness).collect();
+            let reached =
+                if wanted > ground { *row.iter().max().expect("pixels") } else { *row.iter().min().expect("pixels") };
             let got = (reached - wanted).abs();
             let other = (reached - if wanted == paper { text_ink } else { paper }).abs();
             assert!(
@@ -6239,10 +6066,7 @@ two");
         }
         let t = Theme::default();
         let (w, h) = (300, TAB_STRIP_H);
-        let tabs = [
-            Tab { key: 1, label: "one", marked: false },
-            Tab { key: 2, label: "two", marked: false },
-        ];
+        let tabs = [Tab { key: 1, label: "one", marked: false }, Tab { key: 2, label: "two", marked: false }];
         let paint_strip = |extras: TabExtras<M>, hovered: Option<u64>| {
             let ui: Element<M> = tab_strip(&tabs, 1, hovered, M::Select, M::Close, extras, &t);
             let all = Rect::new(0, 0, w, h);
@@ -6272,11 +6096,7 @@ two");
             Some(t.face_hover),
             "another tab has no face of its own: the strip's shows through"
         );
-        assert_eq!(
-            fb.get_pixel(second, TAB_STRIP_H - 1),
-            Some(t.border),
-            "…and the rule runs under it"
-        );
+        assert_eq!(fb.get_pixel(second, TAB_STRIP_H - 1), Some(t.border), "…and the rule runs under it");
         // The inactive label is dim, and the current one is not.
         let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
         let darkest = |x0: u32, x1: u32| {
@@ -6302,16 +6122,9 @@ two");
             Some(t.border),
             "a hovered tab still has the rule under it"
         );
-        assert_ne!(
-            hover.get_pixel(second, TAB_TOP + TAB_H / 2),
-            Some(t.face_hover),
-            "…and it does light up"
-        );
+        assert_ne!(hover.get_pixel(second, TAB_TOP + TAB_H / 2), Some(t.face_hover), "…and it does light up");
         // A keyed right-hand slot is drawable: the diff refuses a half-keyed container.
-        let keyed = TabExtras {
-            new_tab: None,
-            right: Some(ink(t.foreground, text("848 bytes")).key(99)),
-        };
+        let keyed = TabExtras { new_tab: None, right: Some(ink(t.foreground, text("848 bytes")).key(99)) };
         let (_, diffable) = paint_strip(keyed, None);
         assert!(diffable, "a caller that keys its right-hand control makes the window undiffable");
     }
@@ -6336,8 +6149,7 @@ two");
             );
             let all = Rect::new(0, 0, DIALOG_W, DIALOG_H);
             let l = layout(&ui, all, &CELL);
-            let mut fb =
-                MemFramebuffer::new(Geometry::packed(DIALOG_W, DIALOG_H, PixelFormat::XRGB8888));
+            let mut fb = MemFramebuffer::new(Geometry::packed(DIALOG_W, DIALOG_H, PixelFormat::XRGB8888));
             fb.clear(t.background);
             paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
             fb.get_pixel(0, DIALOG_H / 2)
@@ -6370,12 +6182,8 @@ two");
         // counts almost none: a glyph at this size is mostly antialiased, which is the same
         // thing the status bar's and the greeter's tests ran into.
         let light = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
-        let row: alloc::vec::Vec<u32> =
-            (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(light).collect();
-        let (lightest, darkest) = (
-            *row.iter().max().expect("pixels"),
-            *row.iter().min().expect("pixels"),
-        );
+        let row: alloc::vec::Vec<u32> = (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(light).collect();
+        let (lightest, darkest) = (*row.iter().max().expect("pixels"), *row.iter().min().expect("pixels"));
         let (ground, paper) = (light(t.accent), light(t.background));
         assert!(
             lightest > ground + (paper - ground) / 2,
@@ -6429,8 +6237,7 @@ two");
         let t = Theme::default();
         let (w, h) = (300, TITLE_BAR_H);
         let draw = |subtitle: Option<&str>| {
-            let e: Element<Msg> =
-                title_bar("Files", subtitle, true, (), TitleButtons::default(), None, &t);
+            let e: Element<Msg> = title_bar("Files", subtitle, true, (), TitleButtons::default(), None, &t);
             let all = Rect::new(0, 0, w, h);
             let l = layout(&e, all, &CELL);
             let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
@@ -6460,16 +6267,12 @@ two");
         // the two halves and passed with the subtitle in *body* ink: antialiasing left it three
         // units lighter than the title, and "darker than" was true of a difference nobody could
         // see. What matters is which ink it is, so the threshold is that ink.
-        let (title_ink, sub_ink) =
-            (darkest(&with, 0, title_half), darkest(&with, title_half, sub_half));
+        let (title_ink, sub_ink) = (darkest(&with, 0, title_half), darkest(&with, title_half, sub_half));
         assert!(
             sub_ink >= darkness(t.foreground_dim),
             "the subtitle is {sub_ink}, darker than `foreground_dim` — it is not a second read"
         );
-        assert!(
-            title_ink <= darkness(t.foreground) + ANTIALIAS_SLACK,
-            "and the title is body ink at {title_ink}"
-        );
+        assert!(title_ink <= darkness(t.foreground) + ANTIALIAS_SLACK, "and the title is body ink at {title_ink}");
     }
 
     /// A status bar is a ground, a rule on the edge that faces the content, and dim readings.
@@ -6482,12 +6285,7 @@ two");
         let t = Theme::default();
         let (w, h) = (200, STATUS_BAR_H);
         let draw = |rule: Edge| {
-            let ui: Element<Msg> = status_bar(
-                status_text("opened", &t),
-                Some(status_text("ln 6", &t)),
-                rule,
-                &t,
-            );
+            let ui: Element<Msg> = status_bar(status_text("opened", &t), Some(status_text("ln 6", &t)), rule, &t);
             let all = Rect::new(0, 0, w, h);
             let l = layout(&ui, all, &CELL);
             let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
@@ -6553,8 +6351,7 @@ two");
         }
         let t = Theme::default();
         let tabs = [Tab { key: 1, label: "one", marked: false }];
-        let ui: Element<M> =
-            tab_strip(&tabs, 1, None, M::Select, M::Close, TabExtras::none(), &t);
+        let ui: Element<M> = tab_strip(&tabs, 1, None, M::Select, M::Close, TabExtras::none(), &t);
         let all = Rect::new(0, 0, 200, TAB_STRIP_H);
         let l = layout(&ui, all, &CELL);
         let mut fb = MemFramebuffer::new(Geometry::packed(200, TAB_STRIP_H, PixelFormat::XRGB8888));
@@ -6588,10 +6385,7 @@ two");
             Close(u64),
         }
         let t = Theme::default();
-        let tabs = [
-            Tab { key: 1, label: "one", marked: false },
-            Tab { key: 2, label: "two", marked: false },
-        ];
+        let tabs = [Tab { key: 1, label: "one", marked: false }, Tab { key: 2, label: "two", marked: false }];
         let ui: Element<M> = tab_strip(&tabs, 1, None, M::Select, M::Close, TabExtras::none(), &t);
         let w = TAB_SIDE * 2 + TAB_W * 2 + TAB_GAP;
         let all = Rect::new(0, 0, w, TAB_STRIP_H);
@@ -6673,13 +6467,10 @@ two");
         }
 
         // Hovered, each lights alone, and in its own colour.
-        for (i, (key, face)) in [
-            (TITLE_MINIMISE_KEY, t.face_pressed),
-            (TITLE_MAXIMISE_KEY, t.face_pressed),
-            (TITLE_CLOSE_KEY, t.deny),
-        ]
-        .iter()
-        .enumerate()
+        for (i, (key, face)) in
+            [(TITLE_MINIMISE_KEY, t.face_pressed), (TITLE_MAXIMISE_KEY, t.face_pressed), (TITLE_CLOSE_KEY, t.deny)]
+                .iter()
+                .enumerate()
         {
             let (fb, rects) = draw(Some(*key));
             assert!(count(&fb, rects[i], *face) > 100, "button {i} did not light in its colour");
@@ -6743,8 +6534,7 @@ two");
         assert_eq!(over(&bar, cx, cy), Some(TITLE_CLOSE_KEY), "the pointer over close does not name it");
 
         let tabs = [Tab { key: 1 << 62, label: "one", marked: false }];
-        let strip: Element<M> =
-            tab_strip(&tabs, 1 << 62, None, M::Select, M::Shut, TabExtras::none(), &t);
+        let strip: Element<M> = tab_strip(&tabs, 1 << 62, None, M::Select, M::Shut, TabExtras::none(), &t);
         let l = layout(&strip, Rect::new(0, 0, 400, 100), &CELL);
         let tab = crate::layout::locate(&strip, &l, 1 << 62).expect("the tab is keyed");
         assert_eq!(tab.size.w, TAB_W, "`locate` found the label rather than the whole tab");
@@ -6764,18 +6554,13 @@ two");
             Close(u64),
         }
         let t = Theme::default();
-        let tabs = [
-            Tab { key: 1, label: "one", marked: false },
-            Tab { key: 2, label: "two", marked: false },
-        ];
+        let tabs = [Tab { key: 1, label: "one", marked: false }, Tab { key: 2, label: "two", marked: false }];
         let w = TAB_SIDE * 2 + TAB_W * 2 + TAB_GAP;
         let draw = |hovered: Option<u64>| {
-            let ui: Element<M> =
-                tab_strip(&tabs, 1, hovered, M::Select, M::Close, TabExtras::none(), &t);
+            let ui: Element<M> = tab_strip(&tabs, 1, hovered, M::Select, M::Close, TabExtras::none(), &t);
             let all = Rect::new(0, 0, w, TAB_STRIP_H);
             let l = layout(&ui, all, &CELL);
-            let mut fb =
-                MemFramebuffer::new(Geometry::packed(w, TAB_STRIP_H, PixelFormat::XRGB8888));
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, TAB_STRIP_H, PixelFormat::XRGB8888));
             fb.clear(t.background);
             paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
             fb
@@ -6924,13 +6709,11 @@ two");
         let tabs = [Tab { key: 1, label: "one", marked: false }];
         let w = TAB_SIDE * 2 + TAB_W + TAB_GAP + NEW_TAB_W;
         let draw = |hovered: Option<u64>| {
-            let ui: Element<M> =
-                tab_strip(&tabs, 1, hovered, M::Select, M::Close, TabExtras::new_tab(M::New), &t);
+            let ui: Element<M> = tab_strip(&tabs, 1, hovered, M::Select, M::Close, TabExtras::new_tab(M::New), &t);
             let all = Rect::new(0, 0, w, TAB_STRIP_H);
             let l = layout(&ui, all, &CELL);
             let plus = crate::layout::locate(&ui, &l, NEW_TAB_KEY).expect("the `+` is keyed");
-            let mut fb =
-                MemFramebuffer::new(Geometry::packed(w, TAB_STRIP_H, PixelFormat::XRGB8888));
+            let mut fb = MemFramebuffer::new(Geometry::packed(w, TAB_STRIP_H, PixelFormat::XRGB8888));
             fb.clear(t.background);
             paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
             // **The darkest pixel, not a count of exact ink.** The `+` is text, antialiased, and
@@ -7003,8 +6786,7 @@ two");
             &theme,
         )
         .key(1);
-        let e: Element<M> =
-            window_frame(bar, sized(Size::new(0, 0), text("")).key(2), true, &theme);
+        let e: Element<M> = window_frame(bar, sized(Size::new(0, 0), text("")).key(2), true, &theme);
         let cell = crate::layout::FixedCell { w: 8, h: 16 };
         let l = crate::layout::layout(&e, Rect::new(0, 0, 400, 200), &cell);
         let mut tree = crate::diff::Tree::new();
@@ -7041,9 +6823,8 @@ two");
         }
         let theme = Theme::default();
         let window = Size::new(200, 120);
-        let content: Element<M> = sized(Size::new(0, 0), crate::element::custom(1, Size::new(0, 0)))
-            .on_press(M::Content)
-            .key(2);
+        let content: Element<M> =
+            sized(Size::new(0, 0), crate::element::custom(1, Size::new(0, 0))).on_press(M::Content).key(2);
         let e = window_frame_with_grip(
             sized(Size::new(0, TITLE_BAR_H), fill(theme.face)).key(1),
             content,
@@ -7110,9 +6891,8 @@ two");
             Drag,
         }
         let theme = Theme::default();
-        let answer = |label: &str, msg: M, key: u64| {
-            button(label, msg, WidgetState::default(), &theme).key(key).flex(1)
-        };
+        let answer =
+            |label: &str, msg: M, key: u64| button(label, msg, WidgetState::default(), &theme).key(key).flex(1);
         let ui: Element<M> = dialog_frame(
             title_bar(
                 "Question",
@@ -7179,8 +6959,7 @@ two");
             );
         }
         assert!(
-            click(&mut router, DIALOG_LEFT_CX, DIALOG_BUTTON_CY - DIALOG_BUTTON_H as i32)
-                .is_empty(),
+            click(&mut router, DIALOG_LEFT_CX, DIALOG_BUTTON_CY - DIALOG_BUTTON_H as i32).is_empty(),
             "a whole button above the aim point is not the button"
         );
     }

@@ -149,12 +149,7 @@ struct Inner {
 
 impl Inner {
     const fn new() -> Self {
-        Inner {
-            class_heads: [core::ptr::null_mut(); 8],
-            arena_cur: 0,
-            arena_end: 0,
-            arena_list: core::ptr::null_mut(),
-        }
+        Inner { class_heads: [core::ptr::null_mut(); 8], arena_cur: 0, arena_end: 0, arena_list: core::ptr::null_mut() }
     }
 }
 
@@ -198,20 +193,12 @@ impl<S: ArenaSource> Guard<'_, S> {
 impl<S: ArenaSource> HeapEngine<S> {
     /// A fresh, empty engine (no arenas mapped; the first allocation maps one).
     pub const fn new() -> Self {
-        HeapEngine {
-            locked: AtomicBool::new(false),
-            inner: UnsafeCell::new(Inner::new()),
-            _src: PhantomData,
-        }
+        HeapEngine { locked: AtomicBool::new(false), inner: UnsafeCell::new(Inner::new()), _src: PhantomData }
     }
 
     /// Acquire the lock (spin), returning a guard that releases it on drop.
     fn lock(&self) -> Guard<'_, S> {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
         Guard { engine: self }
@@ -298,11 +285,7 @@ impl<S: ArenaSource> HeapEngine<S> {
         // SAFETY: `m.ptr` is a fresh writable mapping of `ARENA_SIZE >= size_of
         // ArenaHeader`; nothing else references it yet.
         unsafe {
-            hdr.write(ArenaHeader {
-                next: inner.arena_list,
-                token: m.token,
-                size: ARENA_SIZE,
-            });
+            hdr.write(ArenaHeader { next: inner.arena_list, token: m.token, size: ARENA_SIZE });
         }
         inner.arena_list = hdr;
         inner.arena_cur = base + size_of::<ArenaHeader>();
@@ -352,10 +335,7 @@ impl<S: ArenaSource> HeapEngine<S> {
         // SAFETY: `alloc_large` wrote a `LargeHeader` at `ptr - hdr_size`.
         let hdr = unsafe { &*((ptr as usize - hdr_size) as *const LargeHeader) };
         debug_assert_eq!(hdr.magic, LARGE_MAGIC, "libheap: large free corruption");
-        let m = Mapping {
-            ptr: hdr.base,
-            token: hdr.token,
-        };
+        let m = Mapping { ptr: hdr.base, token: hdr.token };
         // SAFETY: `m`/`map_len` are the exact pair `alloc_large` mapped.
         unsafe { S::unmap(m, hdr.map_len) };
     }
@@ -379,13 +359,7 @@ impl<S: ArenaSource> Drop for HeapEngine<S> {
             let (next, token, size) = (hdr.next, hdr.token, hdr.size);
             // SAFETY: `(base, size)` is the exact pair `grow` mapped for this arena.
             unsafe {
-                S::unmap(
-                    Mapping {
-                        ptr: a as *mut u8,
-                        token,
-                    },
-                    size,
-                );
+                S::unmap(Mapping { ptr: a as *mut u8, token }, size);
             }
             a = next;
         }
@@ -414,18 +388,14 @@ unsafe impl ArenaSource for SyscallSource {
         let rights = libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE;
         // SAFETY: map the just-created object read/write, kernel-chosen address
         // (hint = 0). Returns the mapped address or a negative error.
-        let addr =
-            unsafe { libkern::syscall4(libkern::SYS_MEMORY_MAP, h as u64, 0, size as u64, rights) };
+        let addr = unsafe { libkern::syscall4(libkern::SYS_MEMORY_MAP, h as u64, 0, size as u64, rights) };
         if addr < 0 {
             // Don't leak the object if mapping failed.
             // SAFETY: `h` is the handle we just created.
             unsafe { libkern::syscall1(libkern::SYS_HANDLE_CLOSE, h as u64) };
             return None;
         }
-        Some(Mapping {
-            ptr: addr as usize as *mut u8,
-            token: h as u64,
-        })
+        Some(Mapping { ptr: addr as usize as *mut u8, token: h as u64 })
     }
 
     unsafe fn unmap(m: Mapping, size: usize) {
@@ -482,11 +452,7 @@ mod tests {
             let layout = std::alloc::Layout::from_size_align(size, PAGE_SIZE).ok()?;
             // SAFETY: non-zero `size` (arenas/large maps are always > 0).
             let p = unsafe { std::alloc::alloc(layout) };
-            if p.is_null() {
-                None
-            } else {
-                Some(Mapping { ptr: p, token: 0 })
-            }
+            if p.is_null() { None } else { Some(Mapping { ptr: p, token: 0 }) }
         }
         unsafe fn unmap(m: Mapping, size: usize) {
             let layout = std::alloc::Layout::from_size_align(size, PAGE_SIZE).unwrap();

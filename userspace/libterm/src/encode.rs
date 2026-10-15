@@ -27,8 +27,8 @@
 
 use libinput::keymap;
 use libkern::abi::{
-    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_INSERT, KEY_LEFT,
-    KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT, KEY_UP,
+    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_INSERT, KEY_LEFT, KEY_PAGEDOWN,
+    KEY_PAGEUP, KEY_RIGHT, KEY_UP,
 };
 use librsproto::surface::MOD_ALT;
 
@@ -292,10 +292,9 @@ mod tests {
         // `list /bin` handed the shell `~list /bin` (PR #191 review, finding 1).
         use tty_server::{Discipline, Step};
 
-        for key in [
-            KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_INSERT, KEY_DELETE,
-            KEY_PAGEUP, KEY_PAGEDOWN,
-        ] {
+        for key in
+            [KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_INSERT, KEY_DELETE, KEY_PAGEUP, KEY_PAGEDOWN]
+        {
             let mut d = Discipline::new();
             for b in enc(key, 0) {
                 d.feed(b);

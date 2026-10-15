@@ -38,8 +38,7 @@ use alloc::vec::Vec;
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::Geometry;
 use libdraw::geom::Size;
-use libkern::{SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, syscall2,
-    syscall4};
+use libkern::{SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, syscall2, syscall4};
 
 use crate::{Transport, UiError, WindowRef};
 
@@ -72,11 +71,7 @@ impl BufferPool {
     /// `None` if the memory could not be had or the compositor refused an attach — a caller
     /// with no buffers has no way to draw, so this is a fatal condition rather than one to
     /// carry on past. Whatever was allocated before the failure is unmapped on the way out.
-    pub fn new<T: Transport>(
-        window: &mut WindowRef<'_, T>,
-        size: Size,
-        count: usize,
-    ) -> Option<Self> {
+    pub fn new<T: Transport>(window: &mut WindowRef<'_, T>, size: Size, count: usize) -> Option<Self> {
         Self::in_format(window, size, count, PixelFormat::XRGB8888)
     }
 
@@ -124,11 +119,7 @@ impl BufferPool {
     ///
     /// The buffer the compositor is displaying is never chosen — it is busy — so the refusal
     /// the compositor has for re-attaching a displayed buffer cannot be reached from here.
-    pub fn acquire<T: Transport>(
-        &mut self,
-        window: &mut WindowRef<'_, T>,
-        size: Size,
-    ) -> Result<u32, UiError> {
+    pub fn acquire<T: Transport>(&mut self, window: &mut WindowRef<'_, T>, size: Size) -> Result<u32, UiError> {
         self.size = size;
         let id = window.acquire()?;
         let want = pitch_of(size).and_then(|p| geometry_of(size, p)).ok_or(UiError::Malformed)?;
@@ -159,19 +150,11 @@ impl BufferPool {
     }
 
     /// Allocate memory for `id` at `size`, attach it, and drop whatever was there.
-    fn install<T: Transport>(
-        &mut self,
-        window: &mut WindowRef<'_, T>,
-        id: u32,
-        size: Size,
-    ) -> Option<()> {
+    fn install<T: Transport>(&mut self, window: &mut WindowRef<'_, T>, id: u32, size: Size) -> Option<()> {
         let pitch = pitch_of(size)?;
         let len = pitch.checked_mul(size.h as usize)?;
         let (handle, addr) = shared_buffer(len)?;
-        if window
-            .attach_with_format(id, size.w, size.h, pitch as u32, handle, self.format)
-            .is_err()
-        {
+        if window.attach_with_format(id, size.w, size.h, pitch as u32, handle, self.format).is_err() {
             // **Both halves go back**, which the shape this was copied from did not do: the
             // handle is transferred by a *successful* send, so a failed one leaves it this
             // process's to close. Every caller today either exits or destroys its window, so it
@@ -239,13 +222,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     }
     // SAFETY: mapping an object this process just created, read-write.
     let addr = unsafe {
-        syscall4(
-            SYS_MEMORY_MAP,
-            h as u64,
-            0,
-            len as u64,
-            libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE,
-        )
+        syscall4(SYS_MEMORY_MAP, h as u64, 0, len as u64, libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE)
     };
     if addr <= 0 {
         // SAFETY: the map failed, so nothing references the object; closing our only handle.

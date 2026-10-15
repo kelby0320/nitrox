@@ -148,13 +148,7 @@ pub(crate) fn read_snapshot(entry: &HandleEntry) -> EntrySnapshot {
         fence(Ordering::Acquire);
         let s2 = entry.seq.load(Ordering::Acquire);
         if s1 == s2 {
-            return EntrySnapshot {
-                seq: s1,
-                generation,
-                owner_pid,
-                rights,
-                object_type,
-            };
+            return EntrySnapshot { seq: s1, generation, owner_pid, rights, object_type };
         }
         // A writer landed during the read; retry.
     }
@@ -177,24 +171,15 @@ pub(crate) struct WriteGuard<'a> {
 impl<'a> WriteGuard<'a> {
     pub(crate) fn new(entry: &'a HandleEntry) -> Self {
         let s = entry.seq.load(Ordering::Relaxed);
-        debug_assert_eq!(
-            s & 1,
-            0,
-            "WriteGuard entered on odd seq — concurrent writers",
-        );
+        debug_assert_eq!(s & 1, 0, "WriteGuard entered on odd seq — concurrent writers",);
         entry.seq.store(s.wrapping_add(1), Ordering::Release);
-        Self {
-            entry,
-            seq_at_enter: s,
-        }
+        Self { entry, seq_at_enter: s }
     }
 }
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
-        self.entry
-            .seq
-            .store(self.seq_at_enter.wrapping_add(2), Ordering::Release);
+        self.entry.seq.store(self.seq_at_enter.wrapping_add(2), Ordering::Release);
     }
 }
 
@@ -243,8 +228,7 @@ mod tests {
             e.generation.store(42, Ordering::Relaxed);
             e.owner_pid.store(99, Ordering::Relaxed);
             e.rights.store((Rights::READ | Rights::WRITE).bits(), Ordering::Relaxed);
-            e.object_type
-                .store(KObjectType::IoRing as u32, Ordering::Relaxed);
+            e.object_type.store(KObjectType::IoRing as u32, Ordering::Relaxed);
         }
         let snap = read_snapshot(&e);
         assert_eq!(snap.generation, 42);

@@ -131,10 +131,7 @@ mod tests {
         assert_eq!(5 * NS_PER_SEC + off, 1_784_900_730 * NS_PER_SEC);
         // 90 s of monotonic later, realtime has advanced by exactly 90 s — no
         // drift, no re-reading of the RTC.
-        assert_eq!(
-            (95 * NS_PER_SEC + off) - (5 * NS_PER_SEC + off),
-            90 * NS_PER_SEC
-        );
+        assert_eq!((95 * NS_PER_SEC + off) - (5 * NS_PER_SEC + off), 90 * NS_PER_SEC);
     }
 
     #[test]
