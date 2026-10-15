@@ -583,10 +583,12 @@ struct Mount {
     process: u64,
 }
 
-/// Spawn `path` with `control_end` moved into it. The process handle, or `None`.
+/// Spawn `path` with `control_end` moved into it. The process handle, or `None` with
+/// `control_end` closed, since a failed spawn moves nothing.
 fn spawn(root_ns: u64, path: &[u8], control_end: u64) -> Option<u64> {
     let (st, image) = lookup(root_ns, path, RIGHT_MAP_READ);
     if st != 0 || image == 0 {
+        close(control_end);
         return None;
     }
     let args = SpawnArgs {
@@ -602,7 +604,11 @@ fn spawn(root_ns: u64, path: &[u8], control_end: u64) -> Option<u64> {
     // SAFETY: `args` is a valid `SpawnArgs` naming handles this process holds.
     let h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&args as *const SpawnArgs) as u64) };
     close(image);
-    (h > 0).then_some(h as u64)
+    if h <= 0 {
+        close(control_end);
+        return None;
+    }
+    Some(h as u64)
 }
 
 /// Send a filesystem server its **setup message**: the device in `handles[0]`, and one flags byte.

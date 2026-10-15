@@ -432,10 +432,11 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     };
     if fs_h < 0 {
         kprint(b"init: fs-server spawn FAIL\n");
-        // SAFETY: closing our own handles; neither moved because the spawn failed
+        // SAFETY: closing our own handles; a failed spawn moves none, `ctrl_srv` included.
         unsafe {
             syscall1(SYS_HANDLE_CLOSE, device);
             syscall1(SYS_HANDLE_CLOSE, ctrl_init);
+            syscall1(SYS_HANDLE_CLOSE, ctrl_srv);
         }
         return None;
     }
@@ -619,8 +620,11 @@ fn bind_profile_server(root_ns: u64) -> bool {
     };
     if ps_h < 0 {
         kprint(b"init: profile-server spawn FAIL\n");
-        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        // SAFETY: closing both control ends; a failed spawn moves neither.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, ctrl_init);
+            syscall1(SYS_HANDLE_CLOSE, ctrl_srv);
+        }
         return false;
     }
 
