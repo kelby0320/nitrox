@@ -61,6 +61,13 @@ jobs:
       - name: cargo xtask check-nightly
         run: cargo xtask check-nightly
 
+      # Each workspace formatted by `cargo fmt` with its pinned toolchain and the root rustfmt.toml.
+      - name: cargo fmt --check
+        run: |
+          (cd kernel && cargo fmt --check)
+          (cd tools && cargo fmt --check)
+          (cd userspace && cargo fmt --check)
+
       # New comments at most 0.15 of new code plus 3, and none citing a PR, review, phase or part.
       # A pull request is measured from its base branch, a push to main by the merge it made.
       - name: cargo xtask check-comments

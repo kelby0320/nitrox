@@ -36135,3 +36135,24 @@ second declined.
   `dpc.rs` no longer claims a DPC runs on one CPU — every CPU drains the one queue, and a DPC
   queued again while it runs can run on two at once, which is why a larger slot could not bound
   the race. A test grew `hid.rs` past its size entry, so its tests moved to `hid/tests.rs`.
+
+## 2026-10-15 — Before Phase 7, Part B.1: an exact stable, and `rustfmt`
+
+- **The kernel and tools are pinned to stable 1.99.0**, the version CI's floating stable had
+  reached, in a root `rust-toolchain.toml`; userspace keeps its own nightly file. CI installs both
+  pinned toolchains, each with `rustfmt` and `clippy`. 1.99 deprecates `AtomicU32::fetch_update`,
+  renamed `try_update`; the kernel's two calls follow. The two toolchains carry different
+  `rustfmt`s — 1.10 and the nightly's 1.9 — and each workspace is formatted by its own.
+- **Thirteen items are marked `#[rustfmt::skip]`** in the five files the plan named: the HID
+  report descriptors (three constants and three arrays in tests), the ACPI MADT bytes, SHA-256's
+  `H0` and `K`, ChaCha's expected block, and the three GPT type GUIDs. A reformat of a throwaway
+  copy rewrapped exactly these.
+- **The reformat**, `cargo fmt` with `max_width = 120` and `use_small_heuristics = "Max"`: 293
+  files, 7,655 lines added and 14,739 removed. **`rustfmt` is not idempotent** on one statement in
+  xtask's `main.rs`, which a second pass rewraps and a third leaves alone; the second pass is a
+  commit of its own, and `.git-blame-ignore-revs` names both. The PR merges with a merge commit so
+  the hashes stand.
+- **The size baseline** is a reviewed commit after both passes: nine entries raised by hand, by 13
+  to 146 lines, 54 lowered, and `compositor/src/server.rs` (now 978 lines) removed — 63 entries.
+- **`cargo fmt --check` holds each workspace in CI**, and the rule never to run `cargo fmt` ends:
+  root `CLAUDE.md` says to run it, and the `implementer` is told to.

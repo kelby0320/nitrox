@@ -1,0 +1,6 @@
+# Formatting-only commits, hidden from blame (GitHub honours this file; locally,
+# `git config blame.ignoreRevsFile .git-blame-ignore-revs`).
+
+# cargo fmt, alone, and its second pass (Part B.1)
+13e0e3442e32a7fc3d6087729aabbf1d688f630a
+8bf7a5b2c4f9e956b0b34275c15a62588a57e055

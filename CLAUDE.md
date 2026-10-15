@@ -154,6 +154,7 @@ the relevant one before significant work. `cargo xtask check-docs` holds this li
 ## Cross-cutting conventions
 
 - **Markdown for documentation.** No Sphinx, no MkDocs. Plain `.md` files with Mermaid for diagrams where helpful. Cross-link via relative paths. <!-- check-docs: allow-missing -->
+- **`cargo fmt`** in each workspace you change, with the root `rustfmt.toml`; CI checks it.
 - **TOML for configuration.** `init.toml`, service declarations, profile manifests. No YAML, no JSON5.
 - **All public items have doc comments.** Use `cargo doc` for code-level reference.
 - **`#[repr(C)]` for any type crossing the kernel/userspace boundary.** Layout must be predictable.

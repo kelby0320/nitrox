@@ -16,8 +16,7 @@ particular:
 
 - A comment only where the code cannot say why. Never a reference to a PR, a review, a phase or a
   part, and no narrated history. A `SAFETY` comment says why the precondition holds here.
-- Match the surrounding code. Do not reformat lines you do not change, and do not run
-  `cargo fmt`.
+- Match the surrounding code, and run `cargo fmt` in each workspace you changed.
 - No new dependency, no `#![feature]`, nothing the brief does not ask for.
 
 **Check your work.** Run the tests the brief names, and the host tests of each crate you changed:
