@@ -44,3 +44,9 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-15	376	2df8b96b	13	error-paths	optional	unverified	fixed	b32ca8e6	memory removed with B.1
 2026-10-15	376	2df8b96b	14	tests	optional	unverified	fixed	b32ca8e6	commands recorded; negative controls required
 2026-10-15	376	2df8b96b	15	rules-and-docs	optional	demonstrated	fixed	b32ca8e6	blank line; outline matches the detail
+2026-10-15	377	e1c2ab09	1	logic+tests+architecture	worth-fixing	demonstrated	fixed	c8ad2b55	harness drives each driver read; 6 call-site controls
+2026-10-15	377	e1c2ab09	2	logic+error-paths+tests+architecture	worth-fixing	demonstrated	fixed	c8ad2b55	retire takes unmarked; Gone before Retry pinned
+2026-10-15	377	e1c2ab09	3	logic+error-paths+architecture	optional	unverified	fixed	c8ad2b55	read_or_park returns Submitted, no Retry
+2026-10-15	377	e1c2ab09	4	tests	optional	demonstrated	fixed	c8ad2b55	order logged; reorder fails
+2026-10-15	377	e1c2ab09	5	rules-and-docs	optional	unverified	declined		now stamps only a drop marker; the parameter enables host tests
+2026-10-15	377	e1c2ab09	6	architecture	optional	unverified	fixed	c8ad2b55	dpc.rs: one queue, every CPU; a DPC can run twice at once

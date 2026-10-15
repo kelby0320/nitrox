@@ -36106,3 +36106,32 @@ second declined.
   `main.rs` is split.
 - **CI's runners build or share images by measurement**: the QEMU job's images are 128 MiB disks
   and live images of about 100 MB, not the 512 MiB install target, which CI does not use.
+
+## 2026-10-15 — A read parked during its predecessor's delivery: the input race `check-logout` met
+
+- **What CI saw**: PR #376's QEMU job panicked the kernel in `check-logout`'s second login, "a
+  second completion before a reclaim". The DPC that completes a parked read hands it back for
+  thread context to drop only after delivering it, and delivering wakes the reader. A reader that
+  asked again in that gap found nothing owed, parked, and its own completion then met the first
+  read still unreclaimed. Every image's kernel is the debug profile, so on the laptop it is the same
+  panic; with assertions off the second hand-back would overwrite the first and drop it in the DPC,
+  the allocator deadlock the hand-off exists to avoid.
+- **The class**: the input reader PS/2 and USB HID share, and the console driver's copy of the
+  pattern. Each slot held one read on the claim that a new read reclaims before parking, which the
+  gap made false.
+- **The fix**: a read parks only when no read is in flight and none is owed. Otherwise `read_now`
+  answers `Retry`, and `read_or_park` reclaims and asks again, waiting out the few instructions
+  between a delivery and its hand-back. A larger slot would not have bounded it: a DPC can be
+  queued again while it runs, so two instances can deliver at once.
+- **Shown twice**: a host test replaying the interleaving, which panics with CI's message on the
+  old reader; and a QEMU probe — the PS/2 DPC stalled 50 ms between delivery and hand-back on every
+  other keyboard delivery, idle reclaim of PS/2 reads off — under which `check-terminal` panicked
+  the same way on the old code and passed with the fix, reads waiting out each stall.
+- **PR #377's review**: tests now drive each driver's own read through a delivery in flight — a
+  second read on another thread must not park until the first is handed back, and then must — so
+  a call site that drops its reclaim or parks on `Retry` fails a test; PS/2's and the console's
+  reads take their state as an argument to make that possible. A departure's thread-context take
+  no longer marks a read in flight; `read_or_park` returns `Submitted`, which has no `Retry`; and
+  `dpc.rs` no longer claims a DPC runs on one CPU — every CPU drains the one queue, and a DPC
+  queued again while it runs can run on two at once, which is why a larger slot could not bound
+  the race. A test grew `hid.rs` past its size entry, so its tests moved to `hid/tests.rs`.

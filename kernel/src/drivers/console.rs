@@ -29,6 +29,7 @@
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::dpc::Dpc;
+use crate::drivers::input::{self, ReadNow, Submitted};
 use crate::libkern::KBox;
 use crate::libkern::IrqSpinLock;
 use crate::libkern::handle::KObjectType;
@@ -62,11 +63,13 @@ struct Inner {
     /// The DPC **owns** the entry while it uses its pointers and publishes it here last —
     /// see [`console_intr_dpc`] and [`reclaim_completed`].
     to_drop: Option<ParkedRead>,
+    /// The DPC has taken the parked read and not yet published it to `to_drop`.
+    delivering: bool,
 }
 
 impl Inner {
     const fn new() -> Self {
-        Inner { ring: [0; RING_CAP], head: 0, len: 0, parked: None, to_drop: None }
+        Inner { ring: [0; RING_CAP], head: 0, len: 0, parked: None, to_drop: None, delivering: false }
     }
 
     /// Push one received byte; drops it if the ring is full.
@@ -87,6 +90,37 @@ impl Inner {
         }
         self.len -= n;
         n
+    }
+
+    /// What a read finds: bytes, another reader, the read before not yet reclaimed, or room to park.
+    fn read_now(&mut self, out: &mut [u8]) -> ReadNow {
+        if self.len > 0 {
+            ReadNow::Drained(self.pop_into(out))
+        } else if self.parked.is_some() {
+            ReadNow::Busy
+        } else if self.delivering || self.to_drop.is_some() {
+            ReadNow::Retry
+        } else {
+            ReadNow::Empty
+        }
+    }
+
+    /// The DPC's half: the parked read, if bytes have come for it, and what it drained into `out`.
+    fn take_ready(&mut self, out: &mut [u8]) -> Option<(ParkedRead, usize)> {
+        if self.len == 0 {
+            return None;
+        }
+        let pr = self.parked.take()?;
+        self.delivering = true;
+        let n = self.pop_into(&mut out[..pr.max_len.min(RING_CAP)]);
+        Some((pr, n))
+    }
+
+    /// Hand a delivered read back for thread context to drop.
+    fn owe(&mut self, pr: ParkedRead) {
+        debug_assert!(self.to_drop.is_none(), "a second completion before a reclaim");
+        self.to_drop = Some(pr);
+        self.delivering = false;
     }
 }
 
@@ -127,33 +161,37 @@ fn submit_read(
     max_len: u64,
     _ctx: *mut (),
 ) -> Result<(), KError> {
-    // Thread context: release anything a previous completion left owed before parking.
-    reclaim_completed();
-    let max_len = (max_len as usize).min(RING_CAP);
+    read(&CONSOLE, buffer, po, buf_offset, (max_len as usize).min(RING_CAP))
+}
+
+fn read(
+    console: &IrqSpinLock<Inner>,
+    buffer: &ObjectRef,
+    po: &ObjectRef,
+    buf_offset: u64,
+    max_len: usize,
+) -> Result<(), KError> {
     let mut tmp = [0u8; RING_CAP];
     // Decide under the lock; do the copy + PO completion after releasing it.
-    let drained = {
-        let mut g = CONSOLE.lock();
-        if g.len > 0 {
-            Some(g.pop_into(&mut tmp[..max_len]))
-        } else if g.parked.is_some() {
-            return Err(KError::WouldBlock); // single reader
-        } else {
-            g.parked = Some(ParkedRead {
-                po: po.clone(),
-                buffer: buffer.clone(),
-                buf_offset,
-                max_len,
-            });
-            None
+    let found = input::read_or_park(|| reclaim(console), || {
+        let mut g = console.lock();
+        let found = g.read_now(&mut tmp[..max_len]);
+        if found == ReadNow::Empty {
+            g.parked = Some(ParkedRead { po: po.clone(), buffer: buffer.clone(), buf_offset, max_len });
         }
-    };
-    if let Some(n) = drained {
-        // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
-        unsafe { copy_into_memobj(buffer.as_ptr(), buf_offset, &tmp[..n]) };
-        crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64);
+        found
+    });
+    match found {
+        Submitted::Drained(n) => {
+            // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
+            unsafe { copy_into_memobj(buffer.as_ptr(), buf_offset, &tmp[..n]) };
+            crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64);
+            Ok(())
+        }
+        Submitted::Parked => Ok(()),
+        Submitted::Busy => Err(KError::WouldBlock), // single reader
+        Submitted::Gone => Err(KError::PeerClosed),
     }
-    Ok(())
 }
 
 /// DPC: if a read is parked and the ring has bytes, drain them into the parked
@@ -163,17 +201,7 @@ fn console_intr_dpc(_ctx: *mut ()) {
     // **Take exclusive ownership for the duration** — see `Inner::to_drop`. Leaving the
     // entry visible and merely flagging it reclaimable lets another CPU's `reap_pending`
     // drop the last reference mid-copy (PR #178 review, blocking 1).
-    let completed = {
-        let mut g = CONSOLE.lock();
-        if g.parked.is_some() && g.len > 0 {
-            let pr = g.parked.take().expect("checked is_some");
-            let take = pr.max_len.min(RING_CAP);
-            let n = g.pop_into(&mut tmp[..take]);
-            Some((pr, n))
-        } else {
-            None
-        }
-    };
+    let completed = CONSOLE.lock().take_ready(&mut tmp);
     if let Some((pr, n)) = completed {
         // SAFETY: `pr` owns the `ObjectRef` pinning this `MemoryObject`, and `pr` is a local
         // — unreachable from any other CPU until it is published below.
@@ -187,9 +215,7 @@ fn console_intr_dpc(_ctx: *mut ()) {
         // — the same-CPU allocator deadlock fixed for `io::block` (decision log,
         // 2026-08-06). Publishing the entry for thread context is the hand-off; doing it
         // **last** is what keeps it from being freed while the pointers above are in use.
-        let mut g = CONSOLE.lock();
-        debug_assert!(g.to_drop.is_none(), "a second completion before a reclaim");
-        g.to_drop = Some(pr);
+        CONSOLE.lock().owe(pr);
     }
 }
 
@@ -199,11 +225,12 @@ fn console_intr_dpc(_ctx: *mut ()) {
 /// Called from `sched::reap_pending` (so any CPU going idle reclaims) and from
 /// [`submit_read`] before parking a new read.
 pub fn reclaim_completed() {
+    reclaim(&CONSOLE);
+}
+
+fn reclaim(console: &IrqSpinLock<Inner>) {
     // Take under the lock, drop outside it: a drop reaches the allocator.
-    let owed = {
-        let mut g = CONSOLE.lock();
-        g.to_drop.take()
-    };
+    let owed = console.lock().to_drop.take();
     drop(owed);
 }
 
@@ -286,4 +313,76 @@ pub fn init() {
     // kernel's lifetime and we are ready to receive the IRQ.
     let vector = unsafe { crate::arch::serial::console_arm_rx(console_isr) };
     crate::kprintln!("console: RX armed (vec{:#x})", vector);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::test_support::init_global_heap;
+    use crate::object::PendingOperation;
+
+    fn read() -> ParkedRead {
+        let adopt = |p: *mut (), ty| {
+            // SAFETY: `p` is the single creation reference of a `ty` object.
+            unsafe { ObjectRef::from_raw(p, ty) }
+        };
+        let po = KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut ();
+        let buf = KBox::into_raw(MemoryObject::try_new(PAGE_SIZE).unwrap()).as_ptr() as *mut ();
+        ParkedRead {
+            po: adopt(po, KObjectType::PendingOperation),
+            buffer: adopt(buf, KObjectType::MemoryObject),
+            buf_offset: 0,
+            max_len: 1,
+        }
+    }
+
+    #[test]
+    fn a_console_read_waits_out_the_delivery_before_it() {
+        init_global_heap();
+        let mut g = Inner::new();
+        let mut out = [0u8; RING_CAP];
+        g.delivering = true;
+        assert_eq!(g.read_now(&mut out), ReadNow::Retry, "in flight");
+        g.delivering = false;
+        g.to_drop = Some(read());
+        assert_eq!(g.read_now(&mut out), ReadNow::Retry, "owed");
+        g.to_drop = None;
+        assert_eq!(g.read_now(&mut out), ReadNow::Empty);
+        g.parked = Some(read());
+        assert_eq!(g.read_now(&mut out), ReadNow::Busy);
+        g.push(b'x');
+        assert_eq!(g.read_now(&mut out), ReadNow::Drained(1), "bytes never wait");
+    }
+
+    #[test]
+    fn a_console_read_through_the_driver_waits_out_the_delivery_before_it() {
+        input::test_support::a_read_waits_out_the_delivery_before_it(
+            IrqSpinLock::new(LockRank::Leaf, Inner::new()),
+            |console, buf, po| super::read(console, buf, po, 0, 1),
+            |console| {
+                let mut g = console.lock();
+                g.push(b'x');
+                g.take_ready(&mut [0u8; RING_CAP]).unwrap().0
+            },
+            |console, first| console.lock().owe(first),
+            |console| console.lock().parked.is_some(),
+        );
+    }
+
+    #[test]
+    fn the_dpc_holds_a_read_in_flight_until_it_is_owed() {
+        init_global_heap();
+        let mut g = Inner::new();
+        let mut out = [0u8; RING_CAP];
+        g.parked = Some(read());
+        assert!(g.take_ready(&mut out).is_none(), "no bytes, nothing taken");
+        g.push(b'x');
+        let (pr, n) = g.take_ready(&mut out).expect("bytes and a reader");
+        assert_eq!(n, 1);
+        assert_eq!(g.read_now(&mut out), ReadNow::Retry, "in flight");
+        g.owe(pr);
+        assert!(g.to_drop.take().is_some());
+        assert_eq!(g.read_now(&mut out), ReadNow::Empty, "handed back and reclaimed");
+    }
 }
