@@ -35975,3 +35975,20 @@ settled, beyond the plan:
 - **The workflow's checks are kept beside it**, `.claude/workflows/pr-review-workflow.test.mjs`, run
   with `node`: 19 checks with every agent stubbed, each fix's undoing failing one; nothing in CI
   runs them.
+
+## 2026-10-14 — Before Phase 7: Part D becomes a bug bash
+
+- **Part D becomes a bug bash** (the maintainer's call): the review's two trials on PR #365 found
+  bugs a focused review had missed and `main` still holds, so the review's machinery is aimed at
+  whole subsystems too — A.7, a `/bug-bash` workflow the maintainer starts per subsystem, built in
+  Part A's second PR. Its reviewers are logic, error paths and a new trust-boundary lens on Opus,
+  architecture on Opus for the kernel, tests on Sonnet; no rules-and-docs, a drifted doc not being a
+  bug.
+- **Eight subsystems first**, riskiest first — the kernel's syscall boundary and objects, kernel
+  memory, the filesystems, the drivers, protocol parsing, the security services, the scheduler, and
+  storage and supervision — each run the maintainer's to start, at an estimated 1–2% of a week each;
+  more later as the budget allows.
+- **After Part B**, so the reformat and the splits do not move the lines a finding names and
+  `clippy`'s soundness errors are fixed first; before Part E, which reaches the same code. Findings
+  go in one triage file, `docs/planning/bug-bash.md`, appended by the author from each run's report,
+  and are triaged with the maintainer: fix, schedule, or won't fix.
