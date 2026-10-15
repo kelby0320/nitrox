@@ -215,25 +215,23 @@ impl Nodes {
             return Err(KError::InvalidArgument);
         }
         let max_len = input::read_len(max_len)?;
-        self.reclaim();
         let mut tmp = [0u8; DRAIN_MAX];
-        let found = {
+        let found = input::read_or_park(|| self.reclaim(), || {
             let mut r = self.readers[index].lock();
-            // **Under the node's lock**, against which a reused slot's reset is ordered (Phase 6 Part
-            // C): a node from an earlier epoch reads none of the next device's ring.
+            // **Under the node's lock**, against which a reused slot's reset is ordered: a node from an
+            // earlier epoch reads none of the next device's ring.
             if !self.current(ctx) {
-                ReadNow::Gone
-            } else {
-                let found = r.read_now(&mut tmp[..max_len], now);
-                if found == ReadNow::Empty {
-                    r.park(ParkedRead::new(po, buffer, buf_offset, max_len));
-                }
-                found
+                return ReadNow::Gone;
             }
-        };
+            let found = r.read_now(&mut tmp[..max_len], now);
+            if found == ReadNow::Empty {
+                r.park(ParkedRead::new(po, buffer, buf_offset, max_len));
+            }
+            found
+        });
         match found {
             ReadNow::Drained(n) => input::deliver_now(buffer, po, buf_offset, &tmp[..n]),
-            ReadNow::Empty => {}
+            ReadNow::Empty | ReadNow::Retry => {}
             ReadNow::Busy => return Err(KError::WouldBlock),
             ReadNow::Gone => return Err(KError::PeerClosed),
         }

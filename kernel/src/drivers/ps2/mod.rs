@@ -253,11 +253,9 @@ fn submit_read(
         return Err(KError::InvalidArgument);
     }
     let max_len = input::read_len(max_len)?;
-    // Thread context: release anything a previous completion left owed before parking.
-    reclaim_completed();
-    let now = crate::arch::Timer::read_ns();
     let mut tmp = [0u8; DRAIN_MAX];
-    let found = {
+    let found = input::read_or_park(reclaim_completed, || {
+        let now = crate::arch::Timer::read_ns();
         let mut g = PS2.lock();
         let dev = &mut g.devices[index];
         let found = dev.read_now(&mut tmp[..max_len], now);
@@ -265,10 +263,10 @@ fn submit_read(
             dev.park(ParkedRead::new(po, buffer, buf_offset, max_len));
         }
         found
-    };
+    });
     match found {
         ReadNow::Drained(n) => input::deliver_now(buffer, po, buf_offset, &tmp[..n]),
-        ReadNow::Empty => {}
+        ReadNow::Empty | ReadNow::Retry => {}
         ReadNow::Busy => return Err(KError::WouldBlock),
         // The i8042's devices never depart.
         ReadNow::Gone => return Err(KError::PeerClosed),

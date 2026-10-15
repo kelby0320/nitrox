@@ -15,7 +15,8 @@
 //! back — the two things that must not happen with a leaf lock held, or in a DPC at all.
 //!
 //! 1. **A read** ([`Reader::read_now`]) is satisfied from the ring at once, refused if another is
-//!    parked (one reader per device), or parked ([`Reader::park`]) until events arrive.
+//!    parked (one reader per device), or parked ([`Reader::park`]) until events arrive — never
+//!    while the read before it is still being delivered or not yet reclaimed ([`read_or_park`]).
 //! 2. **The interrupt path** pushes events into the ring, and its DPC takes a parked read that now
 //!    has something to deliver ([`Reader::take_ready`]). **Taken out, it is the DPC's alone**: no
 //!    other CPU can reach it to drop it while its pointers are in use.
@@ -69,6 +70,8 @@ pub enum ReadNow {
     /// submission, `PeerClosed`, with no operation to wait on — so a reader cannot spin on reads that
     /// each complete with an error.
     Gone,
+    /// The read before is still being delivered, or is owed: reclaim and ask again.
+    Retry,
 }
 
 /// **One node's reader side**: its ring, the read parked on it, and a finished read owed to
@@ -79,6 +82,8 @@ pub struct Reader {
     parked: Option<ParkedRead>,
     /// A read the DPC has finished with, awaiting a thread-context drop.
     to_drop: Option<ParkedRead>,
+    /// The DPC has taken the parked read and not yet handed it back.
+    delivering: bool,
     /// The device has gone (Phase 6 Part C): what the ring holds is still read, and then nothing.
     retired: bool,
 }
@@ -86,7 +91,7 @@ pub struct Reader {
 impl Reader {
     /// An empty reader.
     pub const fn new() -> Reader {
-        Reader { ring: EventRing::new(), parked: None, to_drop: None, retired: false }
+        Reader { ring: EventRing::new(), parked: None, to_drop: None, delivering: false, retired: false }
     }
 
     /// **A read arriving**: drain up to `out`'s length of whole records into it if the ring has
@@ -98,6 +103,8 @@ impl Reader {
             ReadNow::Gone
         } else if self.parked.is_some() {
             ReadNow::Busy
+        } else if self.delivering || self.to_drop.is_some() {
+            ReadNow::Retry
         } else {
             ReadNow::Empty
         }
@@ -132,6 +139,7 @@ impl Reader {
             return None;
         }
         let read = self.parked.take()?;
+        self.delivering = true;
         let len = read.max_len.min(scratch.len());
         let n = self.ring.drain_into(&mut scratch[..len], now_ns);
         Some((read, n))
@@ -142,10 +150,10 @@ impl Reader {
     pub fn owe(&mut self, read: ParkedRead) {
         debug_assert!(
             self.to_drop.is_none(),
-            "a second completion before a reclaim: a read drains what is owed first, so a new \
-             read cannot be parked while one is owed"
+            "a second completion before a reclaim: a read parks only when none is owed or in flight"
         );
         self.to_drop = Some(read);
+        self.delivering = false;
     }
 
     /// The read owed to thread context, if any. **Drop it outside the lock**: a drop reaches the
@@ -178,6 +186,20 @@ impl Default for Reader {
 pub fn read_len(max_len: u64) -> Result<usize, KError> {
     let len = ((max_len as usize) / INPUT_EVENT_LEN * INPUT_EVENT_LEN).min(DRAIN_MAX);
     if len == 0 { Err(KError::InvalidArgument) } else { Ok(len) }
+}
+
+/// **A read's submission**: `attempt` until it is not [`ReadNow::Retry`], `reclaim` before each, so
+/// a read waits out the delivery before it — a few instructions on another CPU — rather than
+/// parking beside it. Thread context.
+pub fn read_or_park(mut reclaim: impl FnMut(), mut attempt: impl FnMut() -> ReadNow) -> ReadNow {
+    loop {
+        reclaim();
+        let found = attempt();
+        if found != ReadNow::Retry {
+            return found;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// **Copy `bytes` into a read's buffer and complete its operation.** No lock held: completing takes
@@ -346,6 +368,37 @@ mod tests {
         assert!(!r.has_parked(), "taken out: the DPC's alone");
         assert!(!r.ring.is_empty(), "the second event waits for the next read");
         assert!(r.take_ready(&mut scratch, 0).is_none(), "and no second taker");
+    }
+
+    /// The interleaving CI's `check-logout` hit: the reader woken by a delivery asks again before
+    /// the DPC hands the read back, and must not park until it is reclaimed.
+    #[test]
+    fn a_read_waits_out_the_delivery_before_it() {
+        init_global_heap();
+        let mut r = Reader::new();
+        let mut scratch = [0u8; DRAIN_MAX];
+        let mut out = [0u8; DRAIN_MAX];
+        r.park(read(INPUT_EVENT_LEN));
+        r.ring.push(key(30));
+        let (first, _) = r.take_ready(&mut scratch, 0).unwrap();
+        assert_eq!(r.read_now(&mut out, 0), ReadNow::Retry, "in flight");
+        r.owe(first);
+        assert_eq!(r.read_now(&mut out, 0), ReadNow::Retry, "owed");
+        assert!(r.take_owed().is_some());
+        assert_eq!(r.read_now(&mut out, 0), ReadNow::Empty);
+        r.park(read(INPUT_EVENT_LEN));
+        r.ring.push(key(31));
+        let (second, _) = r.take_ready(&mut scratch, 0).unwrap();
+        r.owe(second);
+        r.ring.push(key(32));
+        assert_eq!(r.read_now(&mut out, 0), ReadNow::Drained(INPUT_EVENT_LEN), "events never wait");
+    }
+
+    #[test]
+    fn read_or_park_reclaims_before_every_attempt() {
+        let (mut reclaims, mut answers) = (0, [ReadNow::Retry, ReadNow::Retry, ReadNow::Empty].into_iter());
+        let found = read_or_park(|| reclaims += 1, || answers.next().unwrap());
+        assert_eq!((found, reclaims), (ReadNow::Empty, 3));
     }
 
     /// **A finished read is dropped only by thread context.** Handing it back destroys nothing;
