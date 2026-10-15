@@ -36183,9 +36183,10 @@ second declined.
   block a comment one statement up already covers says "as above". Four functions in `sched.rs`
   that dispatched on a type with a block an arm are one block each, under the function's contract.
 - **`check-comments` counts a `SAFETY` comment and a `# Safety` section as neither comment nor
-  code** (the maintainer's call in PR #376), and the size baseline is raised by hand for the
-  eighteen files the comments lengthened, by 272 lines — 132 of them `sched.rs`'s, mostly its 24
-  new `# Safety` sections.
+  code** (the maintainer's call in PR #376), to its fifth line — 99% of the tree's are no longer,
+  and past it the lines count, so the exemption pays for no essay — and the size baseline is raised
+  by hand for the eighteen files the comments lengthened, by 272 lines — 132 of them `sched.rs`'s,
+  mostly its 24 new `# Safety` sections.
 - **CI denies `clippy::undocumented_unsafe_blocks` and `clippy::correctness`** in each workspace,
   on the command line rather than only in a manifest, so a crate with no `[lints]` line is held
   too, and with every feature on, so the code only the gates build is held — the kernel also with
