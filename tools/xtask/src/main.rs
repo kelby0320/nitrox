@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod comments;
+mod size;
 
 /// The kernel console's glyphs and layout, compiled here by path so that `check-fbcon` reads a
 /// screendump back into text with the code the kernel drew it with — the same face, palette and
@@ -536,6 +537,7 @@ fn main() -> ExitCode {
         Some("check-deferrals") => cmd_check_deferrals(),
         Some("check-docs") => cmd_check_docs(),
         Some("check-comments") => comments::cmd_check_comments(&qargs),
+        Some("check-size") => size::cmd_check_size(&qargs),
         Some("check-images") => cmd_check_images(),
         // **The first *positional* argument, not the first argument.** `qargs` has the global
         // flags stripped, and anything else beginning with `-` is a flag this command does not

@@ -67,6 +67,11 @@ jobs:
       - name: cargo xtask check-comments
         run: cargo xtask check-comments --base ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'HEAD^1' }}
 
+      # No Rust file over 1,000 lines unless tools/xtask/size-baseline.toml lists it, and a listed
+      # one never grows.
+      - name: cargo xtask check-size
+        run: cargo xtask check-size
+
       # A `TODO(tag)` in shipping source must have an entry in
       # docs/rationale/deferred-decisions.md. Three deferrals that cost real time to
       # rediscover were each recorded outside that list; this makes the code half
