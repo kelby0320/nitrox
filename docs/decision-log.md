@@ -36068,3 +36068,41 @@ second declined.
   died before answering, the verifier's severity, what held up reaching the report, the lenses
   that hunted and the logged stop; the same sweep found three of those unpinned in the review's
   own, now pinned.
+
+## 2026-10-14 — Before Phase 7, Part B detailed: the hygiene, measured
+
+- **Measured on `main` after PR #375**, the commands recorded in the plan: 390 `clippy` findings
+  across 62 lints, among them the error lints — 44 `not_unsafe_ptr_arg_deref` dereferences in 24
+  public safe functions of `sched.rs`, an `uninit_assumed_init`, a `mut_from_ref`, two
+  `while_immutable_condition` — and 233 `unsafe` blocks with no `SAFETY` comment `clippy` can see.
+  Counted with every lint capped at a warning: uncapped, `libfsserver`'s error hides every crate
+  built on it, which is how a first count came to 335. The reformat is 22,458 diff lines in 292
+  files; five byte tables are marked `#[rustfmt::skip]`. Two functions no move can split,
+  `cmd_check_login` at 2,870 lines and `run_interactive_scenarios` at 1,065.
+- **Not every `clippy` error is a defect**: the `uninit_assumed_init` is the zero-sized branch of
+  `copy_from_user`, sound for every inhabited type, and the two loops leave by `break`. Each is
+  judged before it is changed.
+- **The 1,000 lines is a guideline held as a ratchet** (the maintainer's framing): the aim is
+  lengths kept in check, so an entry goes up only by hand, in a reviewed commit that says why. Two
+  raises are planned: the reformat's, which lengthens nine listed files by 13 to 146 lines, in its
+  own reviewed commit after the unreviewed `cargo fmt` one; and B.2's `SAFETY` comments.
+- **`SAFETY` comments and `# Safety` sections are exempt from `check-comments`** (the
+  maintainer's call), since the rules require them: four alone failed it, with a message telling
+  the author to keep exactly that kind of comment.
+- **The kernel's and tools' toolchain is pinned to an exact stable** (the maintainer's call): CI's
+  floating stable was 1.99 against the 1.95 the lints were counted on, and with `-D warnings` a new
+  release could turn `main` red with no code change.
+- **B.4's targets are per crate** (the maintainer's call, as a trial): 0.15, or the floor a
+  one-line doc comment on each public item sets — `libkern`'s 0.29 the only one above. The target
+  is excess comment in the code; doc comments and `SAFETY` comments are required. About 48,400
+  lines come out.
+- **Splits move an allowance and never grow it**: `check-size --split OLD NEW…`, built with B.5,
+  the new files' `mod` and `use` headers not counted. **Moves are checked as moved blocks**, not
+  matched lines, by a new `check-moves`: a `continue` deleted in one place and added in another
+  passed a line match.
+- **What CI runs**: the `clippy` denials on the command line as well as in each workspace's
+  `[workspace.lints]`, since a crate without `[lints] workspace = true` is skipped; test targets
+  linted where they build. `display.yml` and `input.yml` filter on all of xtask's sources once
+  `main.rs` is split.
+- **CI's runners build or share images by measurement**: the QEMU job's images are 128 MiB disks
+  and live images of about 100 MB, not the 512 MiB install target, which CI does not use.
