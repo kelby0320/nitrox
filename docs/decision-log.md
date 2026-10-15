@@ -36188,5 +36188,7 @@ second declined.
   new `# Safety` sections.
 - **CI denies `clippy::undocumented_unsafe_blocks` and `clippy::correctness`** in each workspace,
   on the command line rather than only in a manifest, so a crate with no `[lints]` line is held
-  too. A `SAFETY` comment removed from the kernel or userspace fails the step. Warnings pass until
-  the second PR, which fixes them, lints the test targets, and adds `-D warnings`.
+  too, and with every feature on, so the code only the gates build is held — the kernel also with
+  none, for its two `cfg(not(feature))` blocks. A `SAFETY` comment removed from the kernel or
+  userspace fails the step. Warnings pass until the second PR, which fixes them, lints the test
+  targets, and adds `-D warnings`.
