@@ -6,9 +6,10 @@ only if you cannot.
 For each:
 
 1. Read the code it points at and the evidence it gives.
-2. Run the gate or the boot that settles it, one at a time: `cargo xtask test-qemu` or the
-   `check-*` gate named in the root `CLAUDE.md` whose machine reaches the path. Break the code if
-   the finding says a break goes unseen.
+2. Run the gate or the boot that settles it, one at a time: `cargo xtask test-qemu`, or the
+   `check-*` gate whose machine reaches the path — each is described in
+   `docs/conventions/qemu-integration-tests.md`, *The gates, one by one*. Break the code if the
+   finding says a break goes unseen.
 3. Give one verdict:
    - `demonstrated`: you reproduced the failure, and say what you ran and what happened;
    - `refuted`: you showed it does not happen, and how;
