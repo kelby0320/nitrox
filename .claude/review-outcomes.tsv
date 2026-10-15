@@ -29,3 +29,18 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-14	375	cf5e2c88	13	tests	optional	demonstrated	fixed	54e76271	PR#N, Parts, (#N) bound, cross-file runs pinned
 2026-10-14	375	cf5e2c88	14	tests	optional	demonstrated	fixed	54e76271	JSON numbers and control escapes pinned
 2026-10-14	375	cf5e2c88	15	rules-and-docs	optional	demonstrated	fixed	54e76271	docs/conventions/comments-and-size.md
+2026-10-15	376	2df8b96b	1	logic+error-paths	worth-fixing	demonstrated	fixed	b32ca8e6	SAFETY exempt from check-comments; B.2 raises its entries by hand (maintainer)
+2026-10-15	376	2df8b96b	2	logic	worth-fixing	demonstrated	fixed	b32ca8e6	per-crate targets, libkern 0.29 (maintainer, trial)
+2026-10-15	376	2df8b96b	3	logic	worth-fixing	demonstrated	fixed	b32ca8e6	filters on tools/xtask/src/**; docs follow the move
+2026-10-15	376	2df8b96b	4	error-paths	worth-fixing	demonstrated	fixed	b32ca8e6	reformat and baseline raise in separate commits
+2026-10-15	376	2df8b96b	5	error-paths	worth-fixing	demonstrated	fixed	b32ca8e6	exact stable pinned first in B.1 (maintainer)
+2026-10-15	376	2df8b96b	6	error-paths	worth-fixing	demonstrated	fixed	b32ca8e6	denials on the command line from B.2 PR 1
+2026-10-15	376	2df8b96b	7	error-paths	worth-fixing	demonstrated	fixed	b32ca8e6	check-moves on moved blocks, before formatting
+2026-10-15	376	2df8b96b	8	logic+tests+rules-and-docs	worth-fixing	demonstrated	fixed	b32ca8e6	reworded: sound ZST branch; break loops; 24 functions
+2026-10-15	376	2df8b96b	9	logic+error-paths	optional	demonstrated	fixed	b32ca8e6	figures corrected in plan and log
+2026-10-15	376	2df8b96b	10	logic	optional	unverified	fixed	b32ca8e6	headers not counted; entry removed at 1,000
+2026-10-15	376	2df8b96b	11	logic	optional	demonstrated	fixed	b32ca8e6	test targets linted where they build
+2026-10-15	376	2df8b96b	12	logic	optional	demonstrated	fixed	b32ca8e6	128 MiB images; build or share measured
+2026-10-15	376	2df8b96b	13	error-paths	optional	unverified	fixed	b32ca8e6	memory removed with B.1
+2026-10-15	376	2df8b96b	14	tests	optional	unverified	fixed	b32ca8e6	commands recorded; negative controls required
+2026-10-15	376	2df8b96b	15	rules-and-docs	optional	demonstrated	fixed	b32ca8e6	blank line; outline matches the detail
