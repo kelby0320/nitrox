@@ -36068,3 +36068,30 @@ second declined.
   died before answering, the verifier's severity, what held up reaching the report, the lenses
   that hunted and the logged stop; the same sweep found three of those unpinned in the review's
   own, now pinned.
+## 2026-10-14 — Before Phase 7, Part B detailed: the hygiene, measured
+
+- **Measured on `main` after PR #375**: 390 `clippy` findings across 62 lints, among them 46
+  errors — 42 `not_unsafe_ptr_arg_deref` in the kernel, an `uninit_assumed_init`, a
+  `mut_from_ref`, two loops whose condition cannot change — and 233 `unsafe` blocks with no
+  `SAFETY` comment `clippy` can see. Counted with every lint capped at a warning: uncapped,
+  `libfsserver`'s error hides every crate built on it, which is how a first count came to 335.
+  The reformat is 22,458 diff lines in 292 files, five of them byte tables to mark
+  `#[rustfmt::skip]`; 53,400 comment lines come out to bring all 50 crates to 0.15; and two
+  functions no move can split, `cmd_check_login` at 2,870 lines and `run_interactive_scenarios`
+  at 1,065.
+- **The 1,000 lines is a guideline held as a ratchet** (the maintainer's framing): the aim is
+  lengths kept in check, not a hard limit, so the baseline may record what a reformat or a split
+  honestly produces, and the check's job is that nothing grows unremarked.
+- **The size baseline goes up once, in the reformat**: `rustfmt` shortens 55 of the 64 listed
+  files and lengthens nine past their entries, by 14 to 146 lines, taking none across 1,000. The
+  reformat commit raises those nine, the one raise, and lowers the rest.
+- **Splits move an allowance and never grow it**: `check-size --split OLD NEW…`, built with B.5,
+  lists each piece still over 1,000 lines at its length and lowers `OLD`, refused if the pieces and
+  `OLD` sum past `OLD`'s old entry. `--rename` stays one-to-one.
+- **Order**: B.1 with no other branch open; `clippy` in two PRs, the errors and `unsafe` comments
+  reviewed, the warnings delegated; CI any time; the splits, xtask first; the comments last,
+  delegated a crate at a time and checked to touch only comments, each crate's ratio read by a new
+  `check-comments --ratio`.
+- **CI's runners each build their images** rather than share them: moving a 512 MB install target
+  and the live images between jobs costs about what building them does, and xtask has no mode for
+  images it did not build.

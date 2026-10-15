@@ -2,8 +2,8 @@
 
 **Status: planned 2026-10-13, after Phase 6 closed (the maintainer's call); Part A detailed
 2026-10-14; A.1, A.2 and A.6 built 2026-10-14, and A.3, A.4, A.5 and A.7 the same day — Part A
-built.** Each other part gets its detail pass when it is next. Seven parts, A–G, in the order
-below. Part E is the syscall-surface consolidation, planned separately in
+built; Part B detailed 2026-10-14.** Each other part gets its detail pass when it is next. Seven
+parts, A–G, in the order below. Part E is the syscall-surface consolidation, planned separately in
 [`syscall-surface.md`](syscall-surface.md).
 
 ## Why
@@ -328,6 +328,125 @@ Each touches nearly every crate, which is why all of it comes before the syscall
 Order within: B.1, then B.2, then B.5, then B.4 — the reformat first so nothing else is mixed
 into it, and the moves before the comment cleanup so the cleanup reads each module once. B.3
 needs none of them.
+
+## Part B in detail
+
+*Detailed 2026-10-14, every number measured that day on `main` after PR #375.* Where the outline
+above and this differ, this is the plan. Part A's checks measure it: B.4 by `check-comments`, B.5
+by `check-size`. In order, one PR each unless said: B.1, with no other branch open; B.2 as two; B.3
+at any point, needing none of them; B.5 as two; B.4 last.
+
+### B.1 `rustfmt`
+
+- **`rustfmt.toml` at the root**, stable options only — `max_width = 120`,
+  `use_small_heuristics = "Max"` — since the kernel and tools format with stable `rustfmt` and
+  userspace with its pinned nightly's, both 1.9.0. Measured on a throwaway copy: 22,458 diff lines
+  in 292 files, 7,675 added and 14,783 removed, so the tree is 7,108 lines shorter.
+- **First, one small commit marks the tables whose rows mean something** `#[rustfmt::skip]`. The
+  reformat rewraps five: the HID report descriptors in `kernel/src/drivers/hid/descriptor.rs`'s
+  tests, the ACPI table bytes in `kernel/src/arch/x86_64/acpi.rs`, SHA-256's round constants,
+  ChaCha's test vectors, and the GPT type GUIDs. Each is looked at before it is marked.
+- **Then the reformat, alone**: `cargo fmt` in each workspace and nothing else, its hash in
+  `.git-blame-ignore-revs`, which GitHub's blame honours. Held by the host tests and the full gate
+  set; not reviewed, the maintainer's call.
+- **The size baseline goes up once.** The reformat shortens 55 of the 64 listed files, takes none
+  across 1,000 lines, and lengthens nine past their entries, by 14 lines (`view-broker`'s
+  `main.rs`) to 146 (`bootprobe.rs`). `--update` cannot raise an entry, so the reformat commit
+  raises those nine to their new lengths, the one time an entry goes up, and lowers the 55; the
+  commit says which.
+- **In CI**: `cargo fmt --check` for each workspace in the build job. The working rule never to run
+  `cargo fmt` ends; root `CLAUDE.md` says to run it, and the `implementer`'s line forbidding it is
+  reversed.
+- **With no other branch open**: a reformat conflicts with every open branch on nearly every file.
+
+### B.2 `clippy`
+
+Measured with `cargo clippy --keep-going`, every lint capped at a warning so that a crate failing
+does not hide the crates built after it: **390 findings across 62 lints** — the kernel 129, the
+tools 26, userspace 235 — besides the `unsafe` blocks below. Uncapped, the failures hide every crate
+built on `libfsserver`, which is how an earlier count came to 335.
+
+- **The 46 errors, the author's**, each a correctness question rather than a style one: **42
+  `not_unsafe_ptr_arg_deref` in the kernel** — public safe functions that dereference a raw pointer
+  they are given, each made `unsafe fn` with a `# Safety` section its callers answer, or changed to
+  take what its callers can vouch for; **`uninit_assumed_init`** at
+  `kernel/src/mm/user_access.rs:240`, undefined behaviour as written; **`mut_from_ref`** at
+  `userspace/libfsserver/src/disk.rs:420`, a `&mut` made from a `&`; and two
+  **`while_immutable_condition`** at `userspace/service-mgr/src/main.rs:2132` and `:2148`, loops
+  whose condition cannot change.
+- **`undocumented_unsafe_blocks` becomes an error**: 233 blocks today — 142 in the kernel, 91 in
+  userspace — have no `SAFETY` comment `clippy` recognizes. Some have none, some explain without
+  the `SAFETY:` mark, some have it a statement away. Each needs its justification judged, not just
+  a comment moved: the kernel's are the author's, userspace's the `implementer`'s from a brief,
+  read before commit.
+- **The warnings, the `implementer`'s**, crate by crate: `needless_range_loop` 43,
+  `deref_addrof` 39, `needless_borrow` 39, `collapsible_if` 37, `manual_is_multiple_of` and
+  `new_without_default` 16 each, and the long tail. A lint whose fix would make the code worse is
+  allowed rather than fixed, with its reason — `too_many_arguments` (15) and `type_complexity` are
+  the likely ones — decided case by case and named in the PR.
+- **Configured once a workspace**: `[workspace.lints.clippy]` in each workspace's `Cargo.toml` (the
+  `deny` and any `allow`), `[lints] workspace = true` in each crate; CI runs
+  `cargo clippy --keep-going -- -D warnings` per workspace.
+- **Two PRs**: the errors and the `unsafe` comments, reviewed with `/pr-review`; then the warnings
+  and the CI step.
+
+### B.3 CI in parallel
+
+- **Today** (PR #375's last run): the QEMU job takes 12.9 minutes — `check-images` 2.6, which
+  builds every image, then thirteen gates in series at 20–75 seconds each, 9.6 in all — beside the
+  5.6-minute build job, whose host tests take 2.6.
+- **The QEMU job becomes a matrix** of runners, each running a group of gates, the groups balanced
+  by measured duration. **Each runner builds what its gates need** from the cargo cache rather than
+  sharing built images: the images (a 512 MB install target, 100 MB live images) cost about as much
+  to move between jobs as to build, and xtask would need a mode for using images it did not build.
+  The image build alone on a runner is measured first; it decides three groups or four. The aim
+  stays about six minutes.
+- **Each gate prints its duration**, so the groups are rebalanced from the log rather than guessed.
+- **The audit**: a table in [`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md),
+  beside the gate catalogue A.5 moved there — each gate, what it catches that no other does, and
+  its duration. One whose answer is nothing is merged or retired, the maintainer's call each time.
+  `display.yml` and `input.yml`, path-filtered, stay.
+
+### B.5 The long files
+
+- **`tools/xtask/src/main.rs`**: 20,496 lines, 257 functions; 36 commands make 7,357 of them, and
+  two test modules 1,283. It becomes a module a gate under `src/gates/`, the static checks under
+  `src/checks/` (nightly, arch, deferrals, IRQ scope, ABI, images, beside A's docs, comments and
+  size), and shared modules for QEMU and its devices, QMP, the serial session, reading the screen,
+  building images, and the host's disk checks.
+- **Two functions no move can bring under 1,000**: `cmd_check_login`, 2,870 lines, and
+  `run_interactive_scenarios`, `test-interactive`'s 37 steps in 1,065. Each is split into its steps
+  first — the only changes in B.5 that are not moves — in a commit of its own, held by its gate.
+- **Then the six over 5,000**: `libui/widget.rs` (7,187), `nxfiles/lib.rs` (6,207),
+  `desktop-shell/main.rs` (5,532), `test-harness/bootprobe.rs` (5,354), `nxedit/lib.rs` (5,122),
+  `nxsh/eval.rs` (5,017) — tests into a sibling `tests.rs` first, then by responsibility.
+- **Moves only, shown to be**: each commit's diff is lines moved — the same matching
+  `check-comments` uses, a removed line answering an added one — beside `mod` and `use` lines. The
+  `implementer` moves the code from a module map the author writes, and the author checks the diff
+  is moves before it is committed. Held by the host tests and the gates each crate reaches.
+- **The size baseline follows the splits**: `--update` lowers a file as it shrinks, and a new piece
+  still over 1,000 lines needs an entry nothing adds. **`check-size --split OLD NEW…`**, built with
+  B.5, gives each such piece an entry at its length and lowers `OLD`'s to its own, refused if they
+  sum past `OLD`'s old entry: the allowance moves and never grows.
+- **Two PRs**: xtask; then the six.
+
+### B.4 The comments
+
+- **Measured**: 79,983 comment lines to 177,526 code, 0.45. All 50 crates are over 0.15, from
+  `libsession` at 0.75, `session-mgr` 0.65 and `nxterm` 0.64 down to `fs-server-fat` at 0.18.
+  **Bringing each to 0.15 removes about 53,400 lines**, two thirds of every comment there is.
+- **What stays**: a doc comment on each public item, one line unless a contract needs more (a
+  `# Safety` section B.2 adds, a wire format's layout); `SAFETY` comments; `TODO(tag)`s; an
+  invariant the code cannot state. **What goes**: references to PRs, reviews, phases and parts;
+  narrated history; comments that restate the code; essays.
+- **The `implementer` does it, a crate a brief**, with the crate's target and these rules. **The
+  author checks each crate's diff touches only comments, mechanically** — its code lines before and
+  after, comments stripped, compared — then reads what was cut from `SAFETY` comments and
+  invariants, the one loss that matters. **`check-comments --ratio DIR`**, built with B.4, reports
+  a directory's whole ratio by the check's own classification, so each crate's target is checked
+  by the tool that holds it.
+- **One PR, a commit a crate**, its code unchanged by construction; how it is reviewed is the
+  maintainer's call. The `implementer` on Sonnet reads every Rust line once.
 
 ## Part C — small fixes
 
