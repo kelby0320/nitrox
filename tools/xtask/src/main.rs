@@ -5751,9 +5751,10 @@ fn check_sticks(mbr: &Path, whole: &Path, work: &Path) -> R<()> {
                 return Err(format!("the ejected stick's {label} file is {} bytes and not the pattern", b.len()).into());
             }
             None => {
-                return Err(
-                    format!("the ejected stick's {label} has no pattern file: the eject did not write it back").into()
-                );
+                return Err(format!(
+                    "the ejected stick's {label} has no pattern file: the eject did not write it back"
+                )
+                .into());
             }
         }
     }
