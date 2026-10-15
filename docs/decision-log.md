@@ -36193,3 +36193,23 @@ second declined.
   none, for its two `cfg(not(feature))` blocks. A `SAFETY` comment removed from the kernel or
   userspace fails the step. Warnings pass until the second PR, which fixes them, lints the test
   targets, and adds `-D warnings`.
+
+## 2026-10-15 — Before Phase 7, PR #379's review: three races its comments called sound
+
+- **The review's three worth-fixing kernel findings were races older than the PR**, which its new
+  `SAFETY` comments had certified: `sys_wait` read a `PendingOperation`'s completion after dropping
+  the lookup references that pinned it, the reply path used a registration's address after letting
+  `SCHED` go, and `sys_ns_bind` attached a back-pointer to a registration it had already moved
+  into a binding an unbind could drop. In each the fix passes a reference, so the borrow checker
+  holds the order: the reads go through `refs`, `us_forward_reg_for_send` returns an `ObjectRef`
+  acquired under `SCHED`, and `us_server_attach` takes the registration by reference. **A
+  `SAFETY` comment is an argument someone can check, and writing 231 of them is what surfaced
+  these** — the lesson is to read what pins the pointer, not to restate that something does.
+- **Every public kernel function that dereferences a raw pointer is `unsafe fn`**, not only those
+  `not_unsafe_ptr_arg_deref` sees: it misses a dereference through a cast or a private helper. A
+  scan found eight more and a test helper; three that only store or compare the pointer stay safe.
+- **CI lints with every feature on**, and the kernel also with none: the gates' code was unlinted.
+- **`check-comments`' exemption stops at a `SAFETY` comment's fifth line**, and removed lines carry
+  their line numbers, so a removed `SAFETY` comment no longer swallows the next hunk's.
+- **A failed spawn moves nothing**, so `init` and `storage-service` now close the end they meant
+  to move; `init` had left it open in PID 1, a test-qemu probe showed.

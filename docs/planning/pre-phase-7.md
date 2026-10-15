@@ -426,7 +426,12 @@ besides the `unsafe` blocks below.
   adds userspace's test code (about 90 findings, 18 of them undocumented `unsafe`), and five
   `no_std` binaries — `eshell`, `hello`, `heartbeat`, `clipboard-server`, `profile-server` — do
   not build as tests (E0152), so CI runs `--all-targets` with those five excluded and lints them
-  as they build. In the second PR.
+  as they build. In the second PR. The kernel's test targets hold 106 undocumented `unsafe`
+  blocks (`--lib --tests` on the host target, measured in PR #379's review).
+- **A `SAFETY` comment only on `unsafe` code**: `unnecessary_safety_comment` and
+  `unnecessary_safety_doc` denied, which flag 44 sites (PR #379's review) — several a
+  `// SAFETY:` on an `unsafe fn` that wants a `# Safety` section, some one-line `if … { unsafe
+  {…} }` the lint reads as the statement's. In the second PR, each judged.
 - **Two PRs**: the errors, the `unsafe` comments and the `SAFETY` exemption, reviewed with
   `/pr-review`; then the warnings, the test targets and `-D warnings`.
 
