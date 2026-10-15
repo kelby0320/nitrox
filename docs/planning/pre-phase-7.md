@@ -143,17 +143,19 @@ runtime removes a worktree left unchanged; the report agent removes any other th
      leaves behind, and uses a crate's failure injection where it has one (`fs-server-ext4`'s
      `Failing`).
    - No reviewer boots QEMU. A finding only a boot can show says so.
-3. **Verification**, up to three agents, once every reviewer has returned — the one barrier, so
-   duplicates across lenses merge first. The findings go out in batches, and each verifier is
-   told to refute each one in its batch: demonstrated, refuted, or unverified with what would
-   settle it. Findings that need a boot go to one verifier that runs after the others, so a
+3. **Verification**, *dropped after the second run, 2026-10-14 (A.6)*: across both runs it refuted
+   none of 59 findings, so only a finding that needs a QEMU boot still goes to a verifier, one agent
+   after the reviewers. Planned as: up to three agents, once every reviewer has returned — the one
+   barrier, so duplicates across lenses merge first. The findings go out in batches, and each
+   verifier is told to refute each one in its batch: demonstrated, refuted, or unverified with what
+   would settle it. Findings that need a boot go to one verifier that runs after the others, so a
    single agent boots QEMU and nothing runs beside it.
 4. **Report**, one agent. It ranks what survived, holds the blocking set to defects that must
    not merge, posts one comment (`gh pr comment`), removes leftover worktrees, and returns the
    summary.
 
-One scope agent, five reviewers, three verifiers and a report make ten; with four reviewers there
-is room for a fourth verifier.
+One scope agent, five reviewers, a boot verifier and a report make eight, under the ten the
+maintainer allowed.
 
 **Measured.** Each finding's fate goes in `.claude/review-outcomes.tsv`: the PR, the finding, its
 lens and severity, the verifier's verdict, and what became of it — fixed, refuted or deferred.
@@ -267,7 +269,10 @@ grow it.
 - **The review by model**: the logic, error-path and architecture lenses on the session's model; the
   scope (low effort), the tests and rules-and-docs lenses, the verifiers and the report (medium
   effort) on Sonnet. Reviewers are told to go after what matters most first and stop when digging
-  turns up only optional notes; verifiers, to reproduce a finding's own demonstration first.
+  turns up only optional notes; verifiers, to reproduce a finding's own demonstration first. **The
+  second run** (Sonnet 5.5 where above): 19 minutes against 48, 83 million cache-read tokens against
+  209, the same four of the original seven found; its Sonnet verifiers ran three to six commands
+  each, so verification went too.
 - **Measured against the all-Opus trial**: a second run on PR #365 at `55e6bd18`, against what the
   first found.
 

@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Review a Nitrox PR with the review workflow — a scope agent, reviewers with one lens each, verifiers that try to refute each finding, and one comment posted to the PR. Started by the maintainer as /pr-review <N> [head].
+description: Review a Nitrox PR with the review workflow — a scope agent, reviewers with one lens each, a QEMU boot for findings that need one, and one comment posted to the PR. Started by the maintainer as /pr-review <N> [head].
 disable-model-invocation: true
 ---
 

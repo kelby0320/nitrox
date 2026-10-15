@@ -1,16 +1,17 @@
 export const meta = {
   name: 'pr-review-workflow',
-  description: 'Review a Nitrox PR: a scope, reviewers with one lens each, verifiers that try to refute, one report posted to the PR',
+  description: 'Review a Nitrox PR: a scope, reviewers with one lens each, a boot for findings that need one, one report posted to the PR',
   whenToUse: 'Only through /pr-review, which the maintainer starts; never by the author of the PR on its own',
   phases: [
     { title: 'Scope', detail: 'the head, the base, the files, CI on the head' },
     { title: 'Review', detail: 'one agent a lens, each in its own worktree' },
-    { title: 'Verify', detail: 'each finding handed to an agent told to refute it' },
+    { title: 'Verify', detail: 'only findings that need a QEMU boot to show' },
     { title: 'Report', detail: 'one comment on the PR' },
   ],
 }
 
-const MAX_AGENTS = 10
+// A scope, at most five reviewers, a boot verifier when a finding needs one, and the report.
+const MAX_AGENTS = 8
 const DIR = '.claude/skills/pr-review'
 // The session's model (Opus) where a lens finds subtle defects; Sonnet for mechanical or
 // reproduction-heavy stages.
@@ -65,8 +66,9 @@ const FOUND = {
           evidence: { type: 'string' },
           demonstrated: { type: 'boolean' },
           needs_boot: { type: 'boolean' },
+          severity: { type: 'string', enum: ['blocking', 'worth-fixing', 'optional'] },
         },
-        required: ['file', 'line', 'defect', 'scenario', 'evidence', 'demonstrated', 'needs_boot'],
+        required: ['file', 'line', 'defect', 'scenario', 'evidence', 'demonstrated', 'needs_boot', 'severity'],
       },
     },
   },
@@ -128,10 +130,12 @@ const reviews = await parallel(
     agent(
       `You review Nitrox PR #${pr} through one lens: ${l.title}. ` +
         `${setup(`${DIR}/lenses/${l.key}.md`)}\n\n${context}\n\n` +
-        `Report everything suspicious in your lens, with its evidence: verifiers will try to refute each finding, ` +
-        `so do not hold back a real doubt, and do not pad. Go after what matters most first — a wrong ` +
+        `Report everything suspicious in your lens, with its evidence: do not hold back a real doubt, and do not ` +
+        `pad. Go after what matters most first — a wrong ` +
         `result or a crash before a missing test of a trivial path — and stop when further digging turns up ` +
         `only optional notes. ` +
+        `Demonstrate each finding or mark it undemonstrated, and give it a severity as ${DIR}/verify.md defines ` +
+        `them: no one checks your findings before the author, who reproduces each. ` +
         `Do not boot QEMU; a finding only a boot can show is needs_boot. ` +
         `In held_up, list briefly what you checked that held, such as a mutation a test caught. ` +
         `Restore every probe. Return this worktree's absolute path.`,
@@ -156,77 +160,43 @@ reviews.forEach((r, i) => {
 log(`${findings.length} findings from ${lenses.length} reviewers`)
 
 phase('Verify')
-const byFile = (a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : a.line - b.line)
-const boot = findings.filter(f => f.needs_boot).sort(byFile)
-const plain = findings.filter(f => !f.needs_boot).sort(byFile)
-// What is left of the ten once the scope, the reviewers, the report and a boot verifier are counted.
-const room = MAX_AGENTS - 1 - lenses.length - 1 - (boot.length ? 1 : 0)
-const n = Math.min(room, plain.length)
-// Neighbouring findings in one batch, so one verifier sees the duplicates among them.
-const batches = Array.from({ length: n }, (_, i) =>
-  plain.slice(Math.floor((i * plain.length) / n), Math.floor(((i + 1) * plain.length) / n)),
-)
-
-const verify = (batch, mayBoot) =>
-  `You verify findings from a review of Nitrox PR #${pr}. ${setup(`${DIR}/verify.md`)}\n\n${context}\n\n` +
-  (mayBoot
-    ? 'You alone in this review may boot QEMU, one gate at a time; nothing else runs beside you. '
-    : 'Do not boot QEMU. ') +
-  `Reproduce each finding's own demonstration first; when it holds and nothing undercuts it, move on. ` +
-  `Restore every probe. Return this worktree's absolute path and one verdict for each finding, by id.\n\n` +
-  `Findings:\n${JSON.stringify(batch, null, 1)}`
-
-const verified = await parallel(
-  batches.map((b, i) => () =>
-    agent(verify(b, false), {
-      label: `verify:${i + 1}`,
-      phase: 'Verify',
-      schema: VERIFIED,
-      isolation: 'worktree',
-      model: SONNET,
-    }),
-  ),
-)
-// After the others, so the one agent booting QEMU has the machine to itself.
-if (boot.length) {
-  verified.push(
-    await agent(verify(boot, true), {
-      label: 'verify:boot',
-      phase: 'Verify',
-      schema: VERIFIED,
-      isolation: 'worktree',
-      model: SONNET,
-    }),
-  )
-}
-
+const boot = findings.filter(f => f.needs_boot)
+// After the reviewers, so the one agent booting QEMU has the machine to itself.
+const booted = boot.length
+  ? await agent(
+      `You verify findings from a review of Nitrox PR #${pr} that only a QEMU boot can show. ` +
+        `${setup(`${DIR}/verify.md`)}\n\n${context}\n\n` +
+        `You alone in this review boot QEMU, one gate at a time; nothing else runs beside you. ` +
+        `Restore every probe. Return this worktree's absolute path and one verdict for each finding, by id.\n\n` +
+        `Findings:\n${JSON.stringify(boot, null, 1)}`,
+      { label: 'verify:boot', phase: 'Verify', schema: VERIFIED, isolation: 'worktree', model: SONNET },
+    )
+  : null
 const verdicts = new Map()
-for (const r of verified) {
-  if (!r) continue
-  if (r.worktree) worktrees.push(r.worktree)
-  for (const v of r.verdicts) verdicts.set(v.id, v)
+if (booted) {
+  if (booted.worktree) worktrees.push(booted.worktree)
+  for (const v of booted.verdicts) verdicts.set(v.id, v)
 }
 const judged = findings.map(f => {
-  const v = verdicts.get(f.id) || {
-    verdict: 'unverified',
-    severity: 'worth-fixing',
-    evidence: 'no verifier returned a verdict for it',
-  }
-  return { ...f, verdict: v.verdict, severity: v.severity, verification: v.evidence, duplicate_of: v.duplicate_of }
+  const v = verdicts.get(f.id)
+  if (v) return { ...f, verdict: v.verdict, severity: v.severity, verification: v.evidence }
+  if (f.needs_boot) return { ...f, verdict: 'unverified', verification: 'the boot verifier returned no verdict for it' }
+  return { ...f, verdict: f.demonstrated ? 'demonstrated' : 'unverified' }
 })
-const survived = judged.filter(f => f.verdict !== 'refuted')
-const counts = { found: findings.length, refuted: judged.length - survived.length, reported: survived.length }
-log(`${counts.found} found, ${counts.refuted} refuted, ${counts.reported} to report`)
+const reported = judged.filter(f => f.verdict !== 'refuted')
+const counts = { found: findings.length, refuted: judged.length - reported.length, reported: reported.length }
+log(`${counts.found} found, ${counts.refuted} refuted by a boot, ${counts.reported} to report`)
 
 phase('Report')
 const posted = await agent(
   `You write and post the review of Nitrox PR #${pr}. Read ${DIR}/reviewer.md and ${DIR}/report.md, and follow ` +
     `report.md. Check nothing out and change no file in this checkout: the comment's body is the only file you ` +
     `write, in a temporary directory.\n\n${context}\n\n` +
-    `Counts: ${counts.found} found, ${counts.refuted} refuted, ${counts.reported} to report.\n` +
+    `Counts: ${counts.found} found, ${counts.refuted} refuted by a boot, ${counts.reported} to report.\n` +
     `Worktrees to remove: ${worktrees.join(' ') || 'none'}\n\n` +
     `What the reviewers checked that held:\n${heldUp.join('\n') || 'nothing listed'}\n\n` +
-    `Findings that survived verification:\n${JSON.stringify(survived, null, 1)}`,
+    `Findings, each with its reviewer's evidence and severity:\n${JSON.stringify(reported, null, 1)}\n\n` +
+    `Your final message is the comment's body exactly as posted, with nothing before or after it.`,
   { label: 'report', phase: 'Report', model: SONNET, effort: 'medium' },
 )
 

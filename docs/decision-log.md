@@ -35923,3 +35923,24 @@ settled, beyond the plan:
   the commit, so the outcomes file can say whether delegated work draws more findings. Named by
   alias, so the newest Sonnet is used; the maintainer reports Sonnet 5.5, which this session will
   see once restarted.
+
+## 2026-10-14 — Before Phase 7, Part A.6: the review's second run, and verification dropped
+
+- **The second run, split by model**, Sonnet 5.5 where A.6 put it: 19 minutes against the first's
+  48, 83 million cache-read tokens against 209 — the three Opus reviewers 76 million of them, as
+  many as before — 34,000 out against 97,000, 302 tool calls against 664. **Clean**, read afterwards
+  like the first. Of PR #365's original seven it found four, as the first did, but not the same
+  four: it found in full the read that reports bytes a short chain never held, which the first had
+  in part, and missed the untested write order, which the first found. Both missed the repartitioned
+  stick and the long name over 255 bytes. The new findings largely agree between the runs — the
+  kernel reserving a server's run count unchecked, a rename leaving two names on one chain, FAT16's
+  cluster count unbounded, `allocate` leaking despite "all or nothing", a volume marked clean after
+  a failed write, a directory move checked after it is written — which is what makes them
+  believable.
+- **So the review keeps the split and drops verification.** Across both runs the verifiers refuted
+  none of 59 findings, and on Sonnet each ran three to six commands for nine findings. Precision
+  comes from elsewhere: each reviewer demonstrates a finding or marks it, and `/address-review`
+  reproduces each before fixing it. One verifier remains, for findings only a QEMU boot can show,
+  after the reviewers; reviewers now give each finding its severity. At most eight agents. The
+  report agent, which returned a summary in place of what it posted, is told its last message is the
+  body.

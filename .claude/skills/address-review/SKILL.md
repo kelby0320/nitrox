@@ -18,8 +18,9 @@ Arguments: `$ARGUMENTS` — the PR number, or none for the current branch's PR.
    maintainer's to decide is asked, not guessed.
 5. **Record each finding's outcome** in `.claude/review-outcomes.tsv`, a row a finding, in its
    columns: the date, the PR, the finding's number in the review, its lens (`solo` for a
-   `/pr-review-solo` review), its severity, the verifier's verdict, the outcome — `fixed`,
-   `refuted`, `deferred` or `declined` — the fixing commit, and a short note.
+   `/pr-review-solo` review), its severity, its verdict as the review gives it (`demonstrated` or
+   `unverified`), the outcome — `fixed`, `refuted`, `deferred` or `declined` — the fixing commit,
+   and a short note.
 6. **Run what the fixes reach**: the host tests, and the gates their files touch.
 7. **Commit and push**, then answer on the PR (`gh pr comment`): each finding, what was done, and
    the control that shows it.

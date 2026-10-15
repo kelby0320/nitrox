@@ -390,13 +390,14 @@ Don't run kernel code on the host. Don't run `cargo build` directly in the kerne
 Every PR is reviewed by agents that share none of the author's conversation; they read the
 `CLAUDE.md` files and the memory index, as any session does. **`/pr-review <N>`**, which only the
 maintainer starts, runs the workflow `.claude/workflows/pr-review-workflow.js` from the author's
-session, given the PR number alone: a scope agent, reviewers with one lens each, verifiers told to
-refute each finding, and a report posted to the PR — at most ten agents, each in a worktree of its
-own. The author never starts it and passes it nothing, and while it runs changes nothing on the
-branch and runs no `cargo` or QEMU. **`/pr-review-solo`** is the same review by one agent in a
-second session, and cheaper. The author acts on a review with **`/address-review`**: reproduce each
-finding, fix it with a control, sweep its class, and record the outcome in
-`.claude/review-outcomes.tsv`. The reviewers' rules are in `.claude/skills/pr-review/`.
+session, given the PR number alone: a scope agent, reviewers with one lens each — Opus for logic,
+error paths and architecture, Sonnet for the rest — a QEMU boot for the findings that need one, and
+a report posted to the PR: at most eight agents, each in a worktree of its own. The author never
+starts it and passes it nothing, and while it runs changes nothing on the branch and runs no `cargo`
+or QEMU. **`/pr-review-solo`** is the same review by one agent in a second session, and cheaper. The
+author acts on a review with **`/address-review`**: reproduce each finding, fix it with a control,
+sweep its class, and record the outcome in `.claude/review-outcomes.tsv`. The reviewers' rules are
+in `.claude/skills/pr-review/`.
 
 ## Who does the work
 
