@@ -22,9 +22,10 @@ These shape every decision; deviation requires explicit discussion:
 - **Rust throughout**, built with Cargo and `cargo xtask`, booted by **Limine**.
 - **No nightly language or library features**: no `#![feature(...)]` in `kernel/` or `userspace/`,
   held by `cargo xtask check-nightly`.
-- **Stable, with one narrow exception.** The kernel and tools build on stable for the built-in
-  `x86_64-unknown-none`. Userspace pins an exact nightly only to `-Z build-std` its hard-float
-  custom target, `x86_64-unknown-nitrox`: a target, not a licence (decision log, 2026-07-21).
+- **Stable, with one narrow exception.** The kernel and tools build on an exact stable, pinned
+  in `rust-toolchain.toml`, for the built-in `x86_64-unknown-none`. Userspace pins an exact nightly
+  only to `-Z build-std` its hard-float custom target, `x86_64-unknown-nitrox`: a target, not a
+  licence (decision log, 2026-07-21).
 - **Assembly is emitted from Rust**, not NASM: `core::arch::asm!`, `global_asm!`, and `#[unsafe(naked)]` + `naked_asm!` (all stable since Rust 1.88). The exception entry stubs, the GDT/TSS load, the user-memory copy routines, and the thread context switch are all in-tree Rust asm. There is no assembler in the build — `build.rs` only passes the linker script. (Earlier drafts reserved NASM for the entry stub and context switch; both turned out cleaner as Rust-emitted asm — see `docs/decision-log.md` 2026-05-13 and 2026-05-29 — so NASM is not used. Re-evaluate only if a routine genuinely cannot be expressed via `asm!`/`naked_asm!`.)
 
 ## Build commands

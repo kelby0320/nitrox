@@ -800,8 +800,8 @@ pub fn preempt_enable() {
     // where it is. The RMW costs an uncontended `lock` prefix on a per-CPU line and removes
     // the coupling.
     let depth_before = with_preempt_off(me, |c| {
-        c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1)))
-            // unwrap_or: the closure is infallible, so `fetch_update` cannot return `Err`.
+        c.try_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1)))
+            // unwrap_or: the closure is infallible, so `try_update` cannot return `Err`.
             .unwrap_or(0)
     });
     debug_assert_ne!(

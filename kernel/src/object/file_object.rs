@@ -495,7 +495,7 @@ impl FileObject {
     pub fn writable_unmapped(obj: *mut ()) {
         // SAFETY: the caller's `ObjectRef` (the VMA's) pins a live `FileObject` at `obj`.
         let fo: &FileObject = unsafe { &*(obj as *const FileObject) };
-        let _ = fo.writable_maps.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        let _ = fo.writable_maps.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
     }
 
     /// **Taken before a write-back: whether it can leave the object clean.** `Some` only if no
