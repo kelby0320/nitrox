@@ -36286,12 +36286,12 @@ second declined.
 
 ## 2026-10-16 — Before Phase 7, Part B.5's second PR: the files over 5,000 lines, split
 
-- **Five files, from 28,810 lines to 3,800**, into 51 modules beside them: libui's `widget.rs`
-  (6,970 to 147: frames, tabs, bars, status, scrolling, the text field and area, the list view),
-  nxfiles' `lib.rs` (5,990 to 104: keys, model, messages, text, popups, the app), boot-probe's
+- **Five files, from 28,810 lines to 3,788**, into 51 modules beside them: libui's `widget.rs`
+  (6,970 to 144: frames, tabs, bars, status, scrolling, the text field and area, the list view),
+  nxfiles' `lib.rs` (5,990 to 96: keys, model, messages, text, popups, the app), boot-probe's
   `main.rs` (5,511 to 503: its tests by subsystem), `desktop-shell`'s `main.rs` (5,324 to 2,095:
   windows, placement, the overview, launching, the wallpaper, `/dev/desktop`, menus, power,
-  closing) and `kernel/src/sched.rs` (5,015 to 951: spawning, objects, IPC, exit, placement,
+  closing) and `kernel/src/sched.rs` (5,015 to 950: spawning, objects, IPC, exit, placement,
   timers, preemption, the current thread, waiting, the online CPUs). **`sched.rs` was not in the
   plan's list**: it crossed 5,000 lines with B.2's `SAFETY` comments, after the plan was counted.
   No file in the tree is over 5,000 lines now.
