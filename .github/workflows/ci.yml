@@ -218,8 +218,9 @@ jobs:
             grep -qw "$f" /proc/cpuinfo && echo "  have $f" || echo "  MISSING $f"
           done
 
-      # Restored by every group and saved by `images` alone, which builds every mode, so the cache
-      # holds them all as it did when one job ran every gate.
+      # Restored by every group and saved by `images` alone, whose check-images builds the release,
+      # self-test and test-harness modes: all the cache holds of value, since check-fbcon's mode
+      # differs only in a kernel feature and the kernel has no dependencies.
       - name: Restore cargo registry and build outputs
         id: cache
         uses: actions/cache/restore@v4
