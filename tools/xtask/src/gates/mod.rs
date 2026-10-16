@@ -5,6 +5,7 @@ mod live;
 mod media;
 mod recovery;
 mod report;
+mod resolutions;
 mod shutdown;
 mod storage;
 
@@ -15,5 +16,6 @@ pub(crate) use live::*;
 pub(crate) use media::*;
 pub(crate) use recovery::*;
 pub(crate) use report::*;
+pub(crate) use resolutions::*;
 pub(crate) use shutdown::*;
 pub(crate) use storage::*;
