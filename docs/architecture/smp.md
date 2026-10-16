@@ -109,7 +109,7 @@ thread that *adopts* the `_start` context (`Thread::try_new_boot`, tid 0, no
 4. **AP bring-up** — `bring_up_aps` (`main.rs`) binds the identity map, then
    releases each parked AP by storing `ap_entry` into its Limine `goto_address`.
    Each AP runs `ap_entry` → `adopt_dense_index()` (or **fails the boot**) → `ap_cpu_init`
-   (its GDT/TSS/IDT, x2APIC, its LAPIC timer) → `ap_init` (`sched.rs`: its own
+   (its GDT/TSS/IDT, x2APIC, its LAPIC timer) → `ap_init` (`sched/spawn.rs`: its own
    `current` (a transient AP boot thread) + `idle` thread + `ready`/`reap`
    reserves, sets its `cpu_online` bit and the lock-free `ONLINE_MASK`). `ap_init` is
    called from `ap_entry`, and the AP reports itself online **only once it returns
@@ -199,7 +199,7 @@ machinery was already correct once the hazards below were fixed.
 
 ### 6. Placement and work-stealing
 
-- **Placement** (`place_thread`, `sched.rs`): a newly spawned thread — user or
+- **Placement** (`place_thread`, `sched/placement.rs`): a newly spawned thread — user or
   kernel — goes on the **least-loaded** affinity-permitted core (`pick_target_cpu`),
   so userspace uses the APs from the start. A **woken** thread re-homes to its
   `last_cpu` when permitted (`pick_wake_cpu`), else the least-loaded core —

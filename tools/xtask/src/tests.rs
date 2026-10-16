@@ -163,8 +163,14 @@ fn the_gates_chrome_table_is_the_toolkits() {
 /// quietly comparing nothing.
 #[test]
 fn the_gates_browser_table_is_the_browsers() {
-    let path = repo_root().join("userspace/nxfiles/src/lib.rs");
-    let text = fs::read_to_string(&path).expect("the browser's source is readable");
+    let src = repo_root().join("userspace/nxfiles/src");
+    let mut text = String::new();
+    for entry in fs::read_dir(&src).expect("the browser's source is readable") {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "rs") && !path.ends_with("main.rs") {
+            text += &fs::read_to_string(&path).unwrap();
+        }
+    }
     let mut found: BTreeMap<String, i32> = BTreeMap::new();
     for line in text.lines() {
         let t = line.trim();
@@ -183,7 +189,7 @@ fn the_gates_browser_table_is_the_browsers() {
             panic!(
                 "no `pub const {what}: u32` in {} — this checker's pattern has gone stale, \
                      which silently stops comparing anything",
-                path.display()
+                src.display()
             )
         })
     };

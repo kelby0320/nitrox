@@ -85,6 +85,7 @@ id = "sched"
 what = "threads, scheduling across CPUs, waiting, timers, DPCs and locks"
 paths = [
   "kernel/src/sched.rs",
+  "kernel/src/sched/",
   "kernel/src/dpc.rs",
   "kernel/src/clock.rs",
   "kernel/src/object/pending_op.rs",

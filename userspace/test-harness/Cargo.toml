@@ -59,7 +59,7 @@ path = "src/inputclient.rs"
 
 [[bin]]
 name = "boot-probe"
-path = "src/bootprobe.rs"
+path = "src/bootprobe/main.rs"
 
 # `check-storage`'s writer (administration Part C.8): a pattern written through a mapping and let
 # go without a sync, which no release program does, and read back.

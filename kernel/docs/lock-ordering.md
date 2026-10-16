@@ -199,7 +199,7 @@ makes mutually safe on one CPU:
 The seeded-latch's wake of any `PendingOperation` waiters (the userspace read
 contract) runs on the `PendingOperation` completion path under `SCHED`, **outside**
 this lock — so `ENTROPY` never nests with `SCHED`. Concretely, `on_timer_tick`'s
-`wake_entropy_seed_waiters` (`sched.rs`) *moves* the queued waiter `ObjectRef`s out
+`wake_entropy_seed_waiters` (`sched/timers.rs`) *moves* the queued waiter `ObjectRef`s out
 of `ENTROPY` (the entropy subsystem owns them, the IPC-`Block` pattern), signals
 each, and **parks the refs in `SchedState::deferred_drops`** for `reap_pending` to
 drop later, in thread context with no lock held.

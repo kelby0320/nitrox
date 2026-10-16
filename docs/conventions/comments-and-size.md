@@ -55,13 +55,19 @@ file shorter, at 1,000 lines or fewer, or gone — until it is brought down:
   the pieces hold more than `OLD`'s entry, not counting each new file's leading doc, `mod`, `use`
   and attribute lines, or the `mod` line each needs in its parent.
 
-**A split is moves only, and shown to be.** Each move is a commit of its own, before any
-formatting, and **`cargo xtask check-moves [REV]`** fails a commit (`HEAD` by default) holding any
-changed line that `git diff --color-moved=blocks --color-moved-ws=allow-indentation-change` does not
-find moved — besides blank lines, `mod` lines and the `#[cfg(test)]` before one, `use` statements,
-a visibility widened to `pub(crate)` or `pub(super)` — with the lines running on from it that are
-the same on both sides, a piece of the move too short for git to call moved once the widened line
+**A split is moves only, and shown to be.** Each move is a commit of its own, before any formatting,
+and **`cargo xtask check-moves [REV]`** fails a commit (`HEAD` by default) holding any changed line
+that `git diff --color-moved=blocks --color-moved-ws=allow-indentation-change` does not find moved —
+besides blank lines, `mod` lines and the `#[cfg(test)]` before one, `use` statements, a visibility
+widened to `pub(crate)` or `pub(super)`, an `include_bytes!` or `include_str!` path re-rooted to
+name the same file from the line's new directory — each with the lines running on from it that are
+the same on both sides, a piece of the move too short for git to call moved once the changed line
 splits it — and an inline module made a file: its `mod NAME {` replaced by `mod NAME;`, and its
-closing `}`. A line-by-line match is not enough: a
-`continue` deleted in one place and added in another passes one. Formatting follows in the next
-commit.
+closing `}`. An include moved unchanged to another directory fails, since it names another file. A
+line-by-line match is not enough: a `continue` deleted in one place and added in another passes one.
+Formatting follows in the next commit.
+
+**A split module's pieces glob-import it** (`use super::*;`, or `use crate::*;` in xtask), so a name
+declared in two of them is never an error: an item added beside a piece's same-named one silently
+takes the callers that reach it through the glob. `tools/xtask/tests/splits.rs` fails a name
+declared in two files of one module's pieces.

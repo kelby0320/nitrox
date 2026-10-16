@@ -232,7 +232,7 @@ fn reference_list(theme: &Theme) -> Element<Msg> {
 /// line's end, and a caret at the line's end rather than at the cursor — but it checks one
 /// arrangement, and the caret was missing from every *backward* selection for as long as this
 /// was the only coverage `text_area`'s drawing had (PR #258 review, blocking 2). Both directions
-/// are counted in `widget.rs`'s host tests now; this stays forward so the picture keeps being
+/// are counted in `widget/tests.rs` now; this stays forward so the picture keeps being
 /// one thing rather than a gallery.
 fn reference_area(theme: &Theme) -> Element<Msg> {
     let mut a = TextAreaState::with_text("select me\nand me");

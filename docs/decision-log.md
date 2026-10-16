@@ -36283,3 +36283,33 @@ second declined.
 - **`display.yml` and `input.yml` run on `tools/xtask/src/**`**: on `main.rs` alone, a change to
   a gate's new module would have run neither gate. A test requires every xtask source to match
   each filter.
+
+## 2026-10-16 — Before Phase 7, Part B.5's second PR: the files over 5,000 lines, split
+
+- **Five files, from 28,810 lines to 3,788**, into 51 modules beside them: libui's `widget.rs`
+  (6,970 to 144: frames, tabs, bars, status, scrolling, the text field and area, the list view),
+  nxfiles' `lib.rs` (5,990 to 96: keys, model, messages, text, popups, the app), boot-probe's
+  `main.rs` (5,511 to 503: its tests by subsystem), `desktop-shell`'s `main.rs` (5,324 to 2,095:
+  windows, placement, the overview, launching, the wallpaper, `/dev/desktop`, menus, power,
+  closing) and `kernel/src/sched.rs` (5,015 to 950: spawning, objects, IPC, exit, placement,
+  timers, preemption, the current thread, waiting, the online CPUs). **`sched.rs` was not in the
+  plan's list**: it crossed 5,000 lines with B.2's `SAFETY` comments, after the plan was counted.
+  No file in the tree is over 5,000 lines now.
+- **What no move could divide stays whole**, with a size entry at its length: `desktop-shell`'s
+  `_start` (1,755 lines, one function) in its `main.rs`, nxfiles' `impl App` (1,964 lines, one
+  block) in `app.rs`, and three test modules made files (2,785, 2,525 and 1,139). Splitting a
+  function or a block is not a move, and the plan allowed that only for the two in xtask.
+- **The moves were scripted as in the first PR**, the module map now placing each helper by its
+  users. Children of the split module open with `use super::*;`; the module re-exports each with
+  `pub use` where its items are public (libui's `widget`, nxfiles, `sched`) and `use` where they
+  are not; what a sibling uses is widened to `pub(super)`. Fifty-one move commits, each passing
+  `check-moves`; each crate has as many tests as on `main`.
+- **Three changes that are not moves**, each explained in its commit: boot-probe's source took a
+  directory of its own (its `Cargo.toml` path), since its modules would otherwise sit among eight
+  other binaries' files; `check-moves` learned an `include_bytes!` path re-rooted to name the same
+  file from a test's new directory; and three size entries were raised by hand, 42 lines in all,
+  for the glob imports, blank lines and `rustfmt` wraps their splits added.
+- **What named the files follows them**: `input.yml` runs on `kernel/src/sched/**`, held by a test
+  that a filtered `x.rs` with an `x/` beside it has `x/**` filtered too; an xtask test reads all of
+  nxfiles' library rather than `lib.rs`; the bug bash's `sched` subsystem takes the directory; and
+  the docs placing a moved item name its module.
