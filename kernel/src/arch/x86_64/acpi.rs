@@ -676,7 +676,6 @@ impl ArchPlatform for X86Platform {
 // item consumes; they are parsed and cached now but have no in-tree caller yet.
 /// The I/O APICs discovered from the MADT (arch-internal; the x86 IOAPIC bring-up
 /// consumes this — it does **not** cross the arch boundary).
-#[allow(dead_code)]
 pub(crate) fn ioapics() -> &'static [IoApic] {
     let n = IOAPIC_COUNT.load(Ordering::Acquire);
     // SAFETY: as `pcie_ecam_regions`.
@@ -684,7 +683,6 @@ pub(crate) fn ioapics() -> &'static [IoApic] {
 }
 
 /// The ISA-IRQ → GSI source overrides from the MADT (arch-internal).
-#[allow(dead_code)]
 pub(crate) fn source_overrides() -> &'static [SourceOverride] {
     let n = OVERRIDE_COUNT.load(Ordering::Acquire);
     // SAFETY: as `pcie_ecam_regions`.
@@ -693,7 +691,7 @@ pub(crate) fn source_overrides() -> &'static [SourceOverride] {
 
 /// The enabled CPUs' APIC ids from the MADT, from type-0 and type-9 entries alike
 /// (arch-internal; SMP bring-up).
-#[allow(dead_code)]
+#[allow(dead_code, reason = "parsed with the MADT's other lists; nothing reads it yet")]
 pub(crate) fn cpu_apic_ids() -> &'static [u32] {
     let n = CPU_COUNT.load(Ordering::Acquire);
     // SAFETY: as `pcie_ecam_regions`.

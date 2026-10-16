@@ -98,7 +98,7 @@ impl Timer {
     ///
     /// # Safety
     /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref)]
+    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
     unsafe fn inner<'a>(obj: *mut ()) -> &'a mut TimerInner {
         // SAFETY: `obj` is a live Timer; forming a shared `&Timer` to reach the
         // `UnsafeCell`, then a `&mut TimerInner` through it, is exactly the

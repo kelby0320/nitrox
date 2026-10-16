@@ -1839,7 +1839,7 @@ fn install_for(pid: u32, requested: Rights, obj: ObjectRef, binding_rights: Righ
 /// deliberately: a binding's rights on a userspace-server mount are the rights of the endpoint
 /// handle it was bound with, so they describe the channel, not the files behind it, which is
 /// exactly why the forwarding arm ignores them (`TODO(mount-write-authority)`).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "a resolve's request, its caller and the operation it completes")]
 fn resolve_and_start(
     ns: &Namespace,
     path: &[u8],

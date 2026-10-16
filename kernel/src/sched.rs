@@ -1286,7 +1286,7 @@ pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64, boot_args: [u64;
 /// (`sys_thread_create`); this sets `class`/`rt_priority`/`nice`/`cpu_mask` on the
 /// fresh thread **before** it is enqueued, so it never runs a scheduler tick under the
 /// wrong class. `cpu_mask` `u8::MAX` ⇒ no affinity restriction.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "a thread's process, entry, stack and scheduling")]
 pub fn spawn_user_sched(
     process: ObjectRef,
     entry: u64,

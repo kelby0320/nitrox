@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[repr(C, align(16))]
-    struct Aligned16(#[allow(dead_code)] u128);
+    struct Aligned16(#[allow(dead_code, reason = "there for its size and alignment")] u128);
 
     #[test]
     fn user_ptr_respects_larger_alignment() {

@@ -30,10 +30,10 @@ use files::read_text;
 /// geometry, not a copy of them. The pair names nothing outside itself: `text` reaches `glyphs`
 /// as `super::glyphs`, which is this crate's root here and `crate::fbcon` in the kernel.
 #[path = "../../../kernel/src/fbcon/glyphs.rs"]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "the kernel's module, of which the gates use the screen-reading half")]
 mod glyphs;
 #[path = "../../../kernel/src/fbcon/text.rs"]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "the kernel's module, of which the gates use the screen-reading half")]
 mod text;
 
 /// Limine version we build against. Bump this together with any changes
@@ -96,7 +96,7 @@ mod chrome {
     /// tab in Part I, and the two aims that counted one are the reason that part's CI run
     /// failed. It stays because `the_gates_chrome_table_is_the_toolkits` compares it, so the
     /// next aim that needs a strip's height starts from a number something checks.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "read only by the test that holds it to the toolkit's")]
     pub const TAB_STRIP_H: i32 = 30;
     /// One tab's height inside that strip (`TAB_H`), and [`TAB_TOP`] the strip's padding above it.
     pub const TAB_H: i32 = 24;

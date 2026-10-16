@@ -109,7 +109,7 @@ const UP_H: u32 = FIELD_H;
 /// `entries` is what the application listed and ordered. `on_row` is sent when a row is
 /// activated — the application decides whether that means "descend" or "choose", because only it
 /// knows which rows are directories.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "the chooser's state and the message each control sends")]
 pub fn view<Msg: Clone>(
     mode: Mode,
     path: &str,

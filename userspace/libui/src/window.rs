@@ -605,7 +605,7 @@ fn compose_buffer(size: Size) -> Option<MemFramebuffer> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::element::{Element, Insets, padding, text};
+    use crate::element::Element;
     use crate::layout::FixedCell;
     use crate::route::Router;
     use crate::widget::{Theme, menu_item};
@@ -807,12 +807,6 @@ mod tests {
         assert!(router.grabbed());
         router.pointer(&tree, &ui, &l, at(POINTER_BUTTON, 0, 0, 30));
         assert!(!router.grabbed(), "the release closes it");
-    }
-
-    /// Space for a `padding` import that keeps the element helpers honest in this module.
-    #[allow(dead_code)]
-    fn _unused() -> Element<u32> {
-        padding(Insets::all(0), text("x"))
     }
 
     /// A transport that counts what reaches it and refuses all of it.

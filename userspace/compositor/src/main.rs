@@ -1234,9 +1234,9 @@ fn route_one_batch(
         if m.op != librsproto::OP_INPUT_EVENTS {
             return;
         }
-        // A trailing partial record is dropped rather than guessed at. `chunks_exact`
-        // says so at the type level; `chunks` would hand `read` a short slice and get
-        // `None`, which reads as "malformed" for a batch that is merely truncated.
+        // A trailing partial record is dropped rather than guessed at. `as_chunks` says so
+        // at the type level; `chunks` would hand `read` a short slice and get `None`, which
+        // reads as "malformed" for a batch that is merely truncated.
         for raw in m.body.as_chunks::<INPUT_EVENT_LEN>().0 {
             let Some(ev) = InputEvent::read(raw) else {
                 continue;

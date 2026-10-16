@@ -338,7 +338,7 @@ pub unsafe fn write_cr3(value: u64) {
 // Under `cfg(test)` the body below is a no-op stub and every caller is
 // `#[cfg(not(test))]` (the instruction `#GP`s in ring 3), leaving it callerless —
 // keep the stub for the host-exercisable fault-in path, just don't warn on it.
-#[cfg_attr(test, allow(dead_code))]
+#[cfg_attr(test, allow(dead_code, reason = "a host build elides its only caller, which runs in ring 0"))]
 pub unsafe fn invlpg(virt: u64) {
     // Host unit tests run in ring 3, where `invlpg` would `#GP`. The kernel
     // proper always runs in ring 0; the instruction only evicts a TLB entry,

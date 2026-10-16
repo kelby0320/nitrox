@@ -383,7 +383,7 @@ impl UserspaceServerReg {
     ///
     /// # Safety
     /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref)]
+    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
     unsafe fn inner<'a>(reg: *mut ()) -> &'a mut Inner {
         // The sentinel is cheap and catches a stale back-pointer at the moment it is
         // followed, rather than as garbage read out of the pending table.

@@ -110,7 +110,7 @@ impl PendingOperation {
     ///
     /// # Safety
     /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref)]
+    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
     unsafe fn inner<'a>(obj: *mut ()) -> &'a mut PendingOpInner {
         // SAFETY: `obj` is a live PO; forming a shared `&PendingOperation` to
         // reach the `UnsafeCell`, then a `&mut PendingOpInner` through it, is the

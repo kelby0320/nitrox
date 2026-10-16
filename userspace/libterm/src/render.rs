@@ -160,8 +160,8 @@ pub fn render_rows<F: Framebuffer + ?Sized>(
 /// The scrolled-back render. `rows` are **viewport** rows, not screen rows, and everything the
 /// difference implies is [`Grid::view_cell`]'s and [`Grid::view_cursor`]'s: which half of the
 /// history a row comes from, and whether the cursor is in view at all. That keeps this loop the
-#[allow(clippy::too_many_arguments, reason = "a view's drawing context and extent are separate inputs")]
 /// same loop it was for the live screen, which is what stops the two renders drifting apart.
+#[allow(clippy::too_many_arguments, reason = "a view's drawing context and extent are separate inputs")]
 pub fn render_view<F: Framebuffer + ?Sized>(
     fb: &mut F,
     grid: &Grid,

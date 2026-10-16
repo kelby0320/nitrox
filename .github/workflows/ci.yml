@@ -78,15 +78,16 @@ jobs:
       - name: cargo xtask check-size
         run: cargo xtask check-size
 
-      # Every warning fails, and an unsafe block without a SAFETY comment, or a SAFETY comment on safe
-      # code. Denied on the command line, so no crate escapes by leaving its manifest's [lints] unset.
+      # Every warning fails, and an unsafe block without a SAFETY comment, a SAFETY comment on safe
+      # code, or an allow without its reason. Denied on the command line, so no crate escapes by leaving its manifest's [lints] unset.
       # With every feature on, so the code the gates build is held; the kernel also with none, for its
       # two `cfg(not(feature))` blocks. Test code is linted as the host suite builds it: the kernel's
       # library and every userspace library in test mode (`--profile test`), since userspace's
       # binaries do not build as tests; the tools' every target.
       - name: cargo clippy
         run: |
-          D="-D warnings -D clippy::undocumented_unsafe_blocks -D clippy::unnecessary_safety_comment -D clippy::unnecessary_safety_doc"
+          D="-D warnings -D clippy::undocumented_unsafe_blocks -D clippy::unnecessary_safety_comment \
+            -D clippy::unnecessary_safety_doc -D clippy::allow_attributes_without_reason"
           H=x86_64-unknown-linux-gnu
           (cd kernel && cargo clippy --keep-going -- $D)
           (cd kernel && cargo clippy --keep-going --all-features -- $D)

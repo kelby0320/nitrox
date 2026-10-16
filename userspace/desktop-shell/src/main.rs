@@ -412,7 +412,7 @@ fn task_capacity(
 }
 
 /// The bottom bar's tree as things are now.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "the bar's state, theme and screen, each a separate borrow")]
 fn bottom_view(
     entries: &[WinEntry],
     desktops: &[Desktop],
@@ -3706,7 +3706,7 @@ fn recapture(
 /// creator and is *not* held for the manager — which is what a shell creating a window while
 /// holding its own manager channel needs, as Part C learned the hard way. And a popup takes
 /// keyboard focus, so Escape closes it; a `panel` never could.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "the overview's captures, desktops and windows, and how to draw them")]
 fn open_overview(
     session: &mut Session<ChannelTransport>,
     parent: u32,
@@ -3782,7 +3782,7 @@ fn open_overview(
 }
 
 /// Render the overview into a free buffer and commit it.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "the overview's captures, desktops and windows, and how to draw them")]
 fn present_overview(
     session: &mut Session<ChannelTransport>,
     id: u32,
@@ -4049,8 +4049,8 @@ fn capture_window(
 /// **The one place another process changes the desktop model**, and it goes through exactly the
 /// operations the shell's own chords do — `switch_desktop` and the name field — rather than
 /// touching the lists directly. A second path into the same state is a second place for the
-#[allow(clippy::too_many_arguments, reason = "the session's state lives in separate locals of the caller")]
 /// lifecycle rule to be forgotten.
+#[allow(clippy::too_many_arguments, reason = "the session's state lives in separate locals of the caller")]
 fn serve_desktop_session(
     ch: u64,
     mgr: Option<&mut ChannelTransport>,
@@ -4502,8 +4502,8 @@ type RestoreList = alloc::vec::Vec<(u32, (i32, i32, u32, u32))>;
 /// **Placing is what releases a held window.** With a manager attached the compositor holds a
 /// `normal` window's first `Configure` until the manager acts, so a shell that received
 /// `WindowCreated` and did nothing would leave every launched application invisible — a
-#[allow(clippy::too_many_arguments, reason = "the session's state lives in separate locals of the caller")]
 /// failure that looks like the application never started.
+#[allow(clippy::too_many_arguments, reason = "the session's state lives in separate locals of the caller")]
 fn place_new_windows(
     mgr: &mut ChannelTransport,
     next_origin: &mut i32,
@@ -4810,7 +4810,7 @@ fn place_new_windows(
 }
 
 /// Draw the bottom bar as things are now, if anything it shows has changed.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "the bar's state and how to draw it, each a separate borrow")]
 fn present_bottom(
     session: &mut Session<ChannelTransport>,
     bar: Option<&mut Child>,
@@ -5230,7 +5230,7 @@ fn ask_to_power(l: &Launcher<'_>, ending: Ending) -> Result<u64, Refusal> {
 /// **Say why a Restart or a Shut down did not happen** (administration Part F.3): on the console,
 /// and in a dialog hung where the waiting dialog is, under the power button, replacing any refusal
 /// already up. Its origin is logged, as the waiting dialog's is.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "the refusal, where it goes and how to draw it")]
 fn show_refusal(
     session: &mut Session<ChannelTransport>,
     slot: &mut Option<(Child, Ending, Refusal)>,

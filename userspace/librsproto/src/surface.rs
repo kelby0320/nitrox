@@ -2329,7 +2329,7 @@ impl PointerEvent {
     /// stamped zero that reads as "the beginning of time" to anything comparing two of them.
     /// The wheel is the builder ([`with_wheel`](Self::with_wheel)), because only one kind
     /// carries it.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "a pointer event's fields, in wire order")]
     pub const fn new(
         window: u32,
         kind: u16,

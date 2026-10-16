@@ -78,7 +78,7 @@ fn chosen(table: &[Menu<Msg>], open: Option<usize>, i: usize) -> Option<Msg> {
 /// **A label, not a keystroke.** `check-terminal` needs to know its click reached a row and which
 /// one; the row's label is a constant this program compiled in, so there is nothing here anybody
 /// typed. Silent in a release image like every other harness receipt.
-#[allow(unused_variables)]
+#[allow(unused_variables, reason = "`msg` is read only when the test harness is compiled in")]
 fn chose(msg: Msg) {
     #[cfg(feature = "test-harness")]
     {

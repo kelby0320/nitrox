@@ -809,7 +809,7 @@ impl Host for NitroxHost {
 /// which — a report that is incomplete beats one that is confidently wrong. Filed as
 /// `TODO(pipeline-stage-attribution)`; the fix is a pid on `HandleInfo` for a process
 /// handle, or a handle in the notification, and it is an ABI change.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "a pipeline's channels, stages and what the capture wait already read")]
 fn reap(
     notif: u64,
     tty: u64,

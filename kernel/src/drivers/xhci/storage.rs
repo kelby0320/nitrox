@@ -608,7 +608,7 @@ impl Dev {
     /// data stage, and never answers it — measured in `test-qemu`, where a `READ(10)`, whose data
     /// comes from QEMU's disk asynchronously, hung while `INQUIRY`, answered at once, did not. Linux
     /// asks for each stage after the last, which is why it never meets this.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "a command's owner, unit, CDB, length, direction and buffer")]
     fn issue(&mut self, owner: Owner, lun: u8, cdb: &[u8], len: u32, input: bool, frags: &[PhysFrag], now: u64) {
         self.tag = self.tag.wrapping_add(1);
         let w = cbw(self.tag, len, input, lun, cdb);
@@ -1636,7 +1636,7 @@ impl Disks {
     /// **Put one of the hub thread's commands on device `i`'s rings**, its operation at `po`: `cdb`
     /// for unit `lun`, its data, `len` bytes, into the binding buffer — or, `status_only`, a status
     /// wrapper alone, for the command last sent. Whether the device is still there.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "a command's device, operation, unit, CDB, length and stage")]
     fn issue_hub(&self, i: usize, po: *mut (), lun: u8, cdb: &[u8], len: u32, status_only: bool, now: u64) -> bool {
         let mut d = self.devs[i].lock();
         let Some(dev) = d.as_mut() else { return false };

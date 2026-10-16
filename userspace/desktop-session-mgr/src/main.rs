@@ -134,7 +134,7 @@ static mut RECV_COUNT: usize = 0;
 ///
 /// Returns once the session has ended, so the greeter can draw again. `false` if the
 /// credentials were refused, which is the only outcome the greeter shows differently.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "the session's handles, one for each service it is given")]
 fn run_session(
     root_ns: u64,
     notif: u64,
