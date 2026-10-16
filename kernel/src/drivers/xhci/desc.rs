@@ -391,7 +391,7 @@ pub fn first_language(b: &[u8]) -> Option<u16> {
 /// written, or `None` if `b` is not a string descriptor. Trailing spaces are dropped, since
 /// devices pad.
 pub fn string_into(b: &[u8], out: &mut [u8]) -> Option<usize> {
-    if b.len() < 2 || b[1] != kind::STRING {
+    if b.len() < 2 || (b[0] as usize) < 2 || b[1] != kind::STRING {
         return None;
     }
     let len = (b[0] as usize).min(b.len());
@@ -777,6 +777,20 @@ mod tests {
         assert_eq!(&out[..n], b"QEMU", "the padding a device sends is dropped");
         assert_eq!(first_language(&[4, 3, 0x09, 0x04]), Some(0x0409));
         assert_eq!(first_language(&[2, 3]), None, "no language listed");
+    }
+
+    /// **A string descriptor shorter than its own header is no string**: a length byte of 0 or 1
+    /// names no text, and the bytes after it are the driver's buffer, not the descriptor's.
+    #[test]
+    fn a_string_descriptor_shorter_than_its_header_is_refused() {
+        let mut out = [0u8; 72];
+        for length in [0u8, 1] {
+            let mut b = vec![0u8; 255];
+            b[0] = length;
+            b[1] = kind::STRING;
+            assert_eq!(string_into(&b, &mut out), None, "a length byte of {length}");
+        }
+        assert_eq!(string_into(&[2, kind::STRING], &mut out), Some(0), "an empty string is a string");
     }
 
     /// **A device with no strings is named by its IDs**, four hex digits each, lower case as the
