@@ -66,3 +66,8 @@ splits it — and an inline module made a file: its `mod NAME {` replaced by `mo
 closing `}`. An include moved unchanged to another directory fails, since it names another file. A
 line-by-line match is not enough: a `continue` deleted in one place and added in another passes one.
 Formatting follows in the next commit.
+
+**A split module's pieces glob-import it** (`use super::*;`, or `use crate::*;` in xtask), so a name
+declared in two of them is never an error: an item added beside a piece's same-named one silently
+takes the callers that reach it through the glob. `tools/xtask/tests/splits.rs` fails a name
+declared in two files of one module's pieces.
