@@ -75,3 +75,10 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-16	380	aab8fb89	6	error-paths	optional	unverified	deferred	c0d03f3c	TODO(capture-refused-leak) for Part D; confirmed by reading, Transport::request handle contract unsettled
 2026-10-16	380	aab8fb89	7	architecture	optional	demonstrated	fixed	1b33d020	37 reasons, 2 stale allows removed, CI denies allow_attributes_without_reason; control exit 101
 2026-10-16	380	aab8fb89	8	architecture	optional	demonstrated	fixed	1b33d020	comment names as_chunks
+2026-10-16	382	f8207e73	1	logic	optional	demonstrated	fixed	5d6f0799	with error-paths' report; includes must meet one naming the same file, removed lines in the pre-image's file; both reproduced, 2 controls; 101 move commits still pass
+2026-10-16	382	f8207e73	2	logic	optional	demonstrated	fixed	d21c7b14	new test follows a filtered file's mod lines to pieces opening use super::*; review's control (nxfiles lib.rs filtered) now fails
+2026-10-16	382	f8207e73	3	error-paths	optional	demonstrated	fixed	5d6f0799	open-use state ends at a hunk or side boundary; reproduced, control fails its test; predates the PR
+2026-10-16	382	f8207e73	4	rules-and-docs	optional	demonstrated	declined	-	each bare sched.rs names the file its item is in (all six checked by grep); the line numbers went because they were stale
+2026-10-16	382	f8207e73	5	architecture	optional	demonstrated	fixed	e1a432e4	says sched.rs; swept every this-file/this-module in the 51 new files, three more fixed
+2026-10-16	382	f8207e73	6	architecture	optional	demonstrated	fixed	ec9a2b4c	toy crate reproduced (1, 2, 2); tests/splits.rs fails a name in two files of a family; 3 controls (kernel, crate-root siblings, xtask)
+2026-10-16	382	f8207e73	7	architecture	optional	demonstrated	fixed	d51675da	counts at the head: 950, 144, 96, 3,788 in all; entry edited in place
