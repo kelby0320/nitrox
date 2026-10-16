@@ -1103,6 +1103,30 @@ mod tests {
         }
     }
 
+    /// **A grow whose last append is lost gives that run back**: on a file whose four extents fill
+    /// its inode, the grow's fifth extent goes into a new leaf, and losing a write of that append
+    /// must leave no run in use that nothing maps.
+    #[test]
+    fn a_grow_whose_last_append_fails_gives_its_run_back() {
+        let rw = RwImage(RefCell::new(fixture_blocks(4096, 4096, 0, b"x\n")));
+        for f in [&b"a"[..], b"b"] {
+            ext4::create_file(&rw, b"/", f, TEST_NOW).unwrap();
+        }
+        for i in 1..=4 {
+            for f in [&b"/a"[..], b"/b"] {
+                ext4::grow_file(&rw, f, i * 4096, TEST_NOW).unwrap();
+            }
+        }
+        let img = rw.0.borrow().clone();
+        let before = free_blocks(&rw);
+        for n in [4, 7, 8] {
+            let failing = Failing::once(img.clone(), n);
+            assert_eq!(ext4::grow_file(&failing, b"/a", 5 * 4096, TEST_NOW), Err(FsError::Io), "write {n}");
+            assert_eq!(free_blocks(&failing.image), before, "write {n}: the run went back");
+            assert_e2fsck_clean(&failing.image.0.borrow(), &format!("grow-last-append-{n}"));
+        }
+    }
+
     /// **Blocks past a file's end go before a grow appends**: an extent that runs past `i_size`
     /// — `fallocate` with the size kept leaves one — would otherwise sit under the blocks the grow
     /// appends, and the tree would map one logical block twice.
