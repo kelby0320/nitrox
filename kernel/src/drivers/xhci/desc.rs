@@ -396,7 +396,7 @@ pub fn string_into(b: &[u8], out: &mut [u8]) -> Option<usize> {
     }
     let len = (b[0] as usize).min(b.len());
     let mut n = 0;
-    for pair in b[2..len].chunks_exact(2) {
+    for pair in b[2..len].as_chunks::<2>().0 {
         if n == out.len() {
             break;
         }

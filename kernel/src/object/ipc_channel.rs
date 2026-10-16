@@ -162,8 +162,8 @@ impl MsgRing {
         let idx = (self.head + self.len) % cap;
         let slot = &mut self.slots[idx];
         slot.msg = *src;
-        for i in 0..IPC_HANDLE_MAX {
-            slot.transfers[i] = transfers[i].take();
+        for (dst, src) in slot.transfers.iter_mut().zip(transfers.iter_mut()) {
+            *dst = src.take();
         }
         self.len += 1;
         true
@@ -177,8 +177,8 @@ impl MsgRing {
         }
         let slot = &mut self.slots[self.head];
         *dst = slot.msg;
-        for i in 0..IPC_HANDLE_MAX {
-            out[i] = slot.transfers[i].take();
+        for (dst, src) in out.iter_mut().zip(slot.transfers.iter_mut()) {
+            *dst = src.take();
         }
         self.head = (self.head + 1) % self.cap();
         self.len -= 1;
@@ -628,7 +628,7 @@ impl IpcChannel {
     /// sends — oldest first — collecting their droppable parts into `reclaimed`
     /// for the caller to release **outside** `SCHED`, then promote the oldest
     /// **live** sender into this endpoint's receive ring (FIFO): move its message
-    /// + transfers into `recv` and return its `PendingOperation` reference (the
+    /// and transfers into `recv` and return its `PendingOperation` reference (the
     /// caller completes it status 0 under `SCHED`, drops it outside). Returns
     /// `None` if no live sender was promoted (the ring stays one slot freer).
     ///
@@ -644,9 +644,9 @@ impl IpcChannel {
         loop {
             // Peek the front entry's `cancelled` flag (Copy) so the immutable
             // borrow ends before the mutating `remove` below.
-            let cancelled = match inner.pending_sends.first() {
-                None => return None, // queue drained
-                Some(p) => p.cancelled,
+            let cancelled = {
+                let p = inner.pending_sends.first()?;
+                p.cancelled
             };
             if cancelled {
                 // Reclaim it (move its refs out for outside-SCHED drop); the
@@ -731,14 +731,20 @@ mod tests {
     }
 
     /// `send_push` with no transferred handles (the common test case).
-    /// # Safety: as `IpcChannel::send_push`.
+    ///
+    /// # Safety
+    ///
+    /// As `IpcChannel::send_push`.
     unsafe fn push_no_xfer(obj: *mut (), msg: &StoredMsg) -> SendOutcome {
         let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
         unsafe { IpcChannel::send_push(obj, msg, &mut t) }
     }
 
     /// `recv_pop_into` discarding any (absent) transfers.
-    /// # Safety: as `IpcChannel::recv_pop_into`.
+    ///
+    /// # Safety
+    ///
+    /// As `IpcChannel::recv_pop_into`.
     unsafe fn pop_no_xfer(obj: *mut (), dst: &mut StoredMsg) -> bool {
         let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
         unsafe { IpcChannel::recv_pop_into(obj, dst, &mut t) }

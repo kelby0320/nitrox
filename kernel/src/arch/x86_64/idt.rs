@@ -1104,6 +1104,7 @@ fn scan_stack_candidates(sp: u64, w: &mut impl Write) {
 /// code selector, and `#DF` uses the TSS's IST1). Does not enable
 /// interrupts.
 pub fn init() {
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: boot is single-threaded and no other reference to `IDT`
     // exists. Forming the `&mut` through a raw pointer is the sanctioned
     // way to reach a `static mut`.

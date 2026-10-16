@@ -171,7 +171,9 @@ mod tests {
     use super::*;
     use crate::libkern::input::*;
 
-    fn run(layout: &Layout, buttons: u8, report: &[u8]) -> Option<(Vec<(u16, u16, i32)>, u8)> {
+    type Event = (u16, u16, i32);
+
+    fn run(layout: &Layout, buttons: u8, report: &[u8]) -> Option<(Vec<Event>, u8)> {
         let mut out = [InputEvent::default(); EVENTS_MAX];
         let (n, held) = decode(layout, buttons, report, 9, &mut out)?;
         Some((out[..n].iter().map(|e| (e.kind, e.code, e.value)).collect(), held))

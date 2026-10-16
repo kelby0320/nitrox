@@ -144,11 +144,11 @@ fn fp_isolation_demo() {
 fn fp_fill_pattern(img: &mut arch::VectorRegsImage, seed: u64, live: usize) {
     for r in 0..arch::FPU_SELFTEST_REGS {
         let slot = img.slot_mut(r);
-        for b in 0..live {
+        for (b, byte) in slot.iter_mut().enumerate().take(live) {
             // Mixes the worker seed, the register index, and the byte offset, so a
             // whole-register or whole-file cross-wire is caught as surely as a byte flip.
             let v = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add((r as u64) << 8).wrapping_add(b as u64);
-            slot[b] = (v ^ (v >> 29)) as u8;
+            *byte = (v ^ (v >> 29)) as u8;
         }
     }
 }
@@ -498,8 +498,8 @@ fn smp_affinity_demo() {
     }
     sched::reap_pending();
     let mut all_pinned = true;
-    for i in 0..n {
-        let ran = AFFINITY_RAN_ON[i].load(Ordering::Relaxed);
+    for (i, slot) in AFFINITY_RAN_ON.iter().enumerate().take(n) {
+        let ran = slot.load(Ordering::Relaxed);
         if ran != i as u32 {
             all_pinned = false;
             kprintln!("smp: affinity worker {} (pinned cpu {}) ran on cpu {}", i, i, ran);

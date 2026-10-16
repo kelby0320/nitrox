@@ -65,6 +65,7 @@ impl VAddrRange {
 
     /// Length of the range in bytes; always a non-zero multiple of
     /// [`PAGE_SIZE`].
+    #[allow(clippy::len_without_is_empty, reason = "never empty: `new` refuses `end <= start`")]
     pub const fn len(self) -> u64 {
         self.end.as_u64() - self.start.as_u64()
     }
@@ -307,11 +308,12 @@ impl Drop for Vma {
     /// a VMA drops wherever those do; the object's dirty pin is not touched here — what was
     /// written through this mapping is still unwritten, and a later write-back decides.
     fn drop(&mut self) {
-        if self.mapping == MappingKind::FileBacked && self.prot.contains(Protection::WRITE) {
-            if let Some(obj) = self.object.as_ref() {
-                // SAFETY: `obj` is the VMA's reference to its `FileObject`.
-                unsafe { crate::object::FileObject::writable_unmapped(obj.as_ptr()) };
-            }
+        if self.mapping == MappingKind::FileBacked
+            && self.prot.contains(Protection::WRITE)
+            && let Some(obj) = self.object.as_ref()
+        {
+            // SAFETY: `obj` is the VMA's reference to its `FileObject`.
+            unsafe { crate::object::FileObject::writable_unmapped(obj.as_ptr()) };
         }
     }
 }
@@ -651,6 +653,7 @@ impl VmaTree {
                 // own original colour, captured above).
                 self.transplant(z, Some(y));
                 (*yp).link.left = z_left;
+                #[allow(clippy::unnecessary_unwrap, reason = "a node with two children: the arms above took `None`")]
                 let zl = z_left.unwrap();
                 (*zl.as_ptr()).link.parent = Some(y);
                 (*yp).link.color = (*zp).link.color;
@@ -731,8 +734,7 @@ impl VmaTree {
         // x has a non-`None` sibling, else the parent's black-height
         // would already differ before our removal).
         unsafe {
-            loop {
-                let Some(parent) = x_parent else { break };
+            while let Some(parent) = x_parent {
                 if matches!(x, Some(n) if n.as_ref().link.color == RbColor::Red) {
                     break;
                 }

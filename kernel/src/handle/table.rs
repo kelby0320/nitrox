@@ -954,9 +954,10 @@ mod tests {
     }
 
     /// Read a `Process`'s self-check sentinel through an `ObjectRef` that
-    /// is pinning it. SAFETY: the `ObjectRef` holds a live reference.
+    /// is pinning it.
     fn process_magic_ok(r: &ObjectRef) -> bool {
         debug_assert_eq!(r.object_type(), KObjectType::Process);
+        // SAFETY: `r` pins a live `Process`.
         unsafe { &*(r.as_ptr() as *const Process) }.magic_ok()
     }
 
@@ -1602,8 +1603,8 @@ mod tests {
     fn freelist_invariant_count_matches_chain() {
         let t = fresh_table();
         let mut handles = [RawHandle::NULL; 64];
-        for i in 0..64 {
-            handles[i] = t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap();
+        for (i, h) in handles.iter_mut().enumerate() {
+            *h = t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap();
         }
         for i in (0..64).step_by(2) {
             close_release(&t, handles[i], 1).unwrap();

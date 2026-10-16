@@ -715,8 +715,12 @@ fn log_handoff() -> &'static [u8] {
 
     // SAFETY: as above.
     let hhdm = unsafe { (&raw const HHDM_REQUEST).read().response };
-    // SAFETY: as above — a non-null response Limine wrote.
-    let hhdm = if hhdm.is_null() { 0 } else { unsafe { (*hhdm).offset } };
+    let hhdm = if hhdm.is_null() {
+        0
+    } else {
+        // SAFETY: as above — a non-null response Limine wrote.
+        unsafe { (*hhdm).offset }
+    };
     // SAFETY: as above.
     let date = unsafe { (&raw const DATE_AT_BOOT_REQUEST).read().response };
     // SAFETY: as above.
@@ -952,7 +956,7 @@ fn report_framebuffer_cost(console_virt: u64) {
         unsafe { unmap_plain(v, pages) };
     }
     let Some(f) = measured else { return };
-    let rate = |ns: u64| -> u64 { if ns == 0 { 0 } else { (f.bytes as u64) * 1_000_000_000 / ns / (1024 * 1024) } };
+    let rate = |ns: u64| -> u64 { ((f.bytes as u64) * 1_000_000_000).checked_div(ns).unwrap_or(0) / (1024 * 1024) };
     kprintln!(
         "framebuffer: a full-screen fill of {} KiB took {} us ({} MiB/s) through the console's mapping",
         f.bytes / 1024,

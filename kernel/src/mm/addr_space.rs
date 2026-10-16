@@ -702,10 +702,10 @@ impl AddressSpace {
             // under this same AS lock; `guard.root` is the top-level table they
             // were installed into.
             let r = unsafe { Paging::unmap_page(guard.root, virt) };
-            if let Ok(phys) = r {
-                if matches!(boxed.mapping, MappingKind::Anonymous) {
-                    frames.try_push(phys).expect("within the spare capacity checked above");
-                }
+            if let Ok(phys) = r
+                && matches!(boxed.mapping, MappingKind::Anonymous)
+            {
+                frames.try_push(phys).expect("within the spare capacity checked above");
             }
         }
         Ok(Some(boxed))
@@ -848,13 +848,13 @@ mod tests {
     /// window stops below it.
     #[test]
     fn the_mapping_window_stops_below_the_guard_gap() {
-        assert!(USER_STACK_GUARD_SIZE > 0, "a zero-width gap guards nothing");
+        const { assert!(USER_STACK_GUARD_SIZE > 0, "a zero-width gap guards nothing") };
         assert_eq!(USER_STACK_GUARD_BOTTOM + USER_STACK_GUARD_SIZE, USER_STACK_BOTTOM);
         assert_eq!(MMAP_MAX, USER_STACK_GUARD_BOTTOM);
         // The property the gap exists for: the highest address the anywhere-window can hand
         // out is strictly below the stack, with the whole gap in between.
-        assert!(MMAP_MAX + USER_STACK_GUARD_SIZE <= USER_STACK_BOTTOM);
-        assert!(MMAP_BASE < MMAP_MAX, "the window must not be empty");
+        const { assert!(MMAP_MAX + USER_STACK_GUARD_SIZE <= USER_STACK_BOTTOM) };
+        const { assert!(MMAP_BASE < MMAP_MAX, "the window must not be empty") };
     }
 
     /// `in_stack_guard` catches every way a range can touch the gap, and nothing else.

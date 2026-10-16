@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(core::mem::align_of::<ArchFpuState>(), FPU_AREA_ALIGN);
         assert_eq!(core::mem::size_of::<ArchFpuState>(), FPU_AREA_BYTES);
         // x87+SSE+AVX: 512 B legacy + 64 B header + 256 B YMM_Hi128.
-        assert!(FPU_AREA_BYTES >= 512 + 64 + 256);
+        const { assert!(FPU_AREA_BYTES >= 512 + 64 + 256) };
     }
 
     #[test]

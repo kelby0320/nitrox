@@ -267,6 +267,7 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
 
 /// The `syscall` entry point (the `IA32_LSTAR` target). Builds a
 /// [`SyscallFrame`] and calls [`syscall_dispatch`], then `sysretq`s.
+#[allow(clippy::unnecessary_safety_comment, reason = "the asm's safety argument; `naked_asm!` has no `unsafe` block")]
 #[unsafe(naked)]
 extern "C" fn syscall_entry() -> ! {
     // SAFETY: naked — every register/stack effect is explicit. On entry
@@ -422,6 +423,7 @@ extern "C" fn syscall_entry() -> ! {
 /// `entry`/`user_sp` must be canonical user addresses mapped executable /
 /// writable in the active address space; [`init_syscall_entry`] must have
 /// run; the active CR3 must be the process address space.
+#[allow(clippy::unnecessary_safety_comment, reason = "the asm's safety argument; `naked_asm!` has no `unsafe` block")]
 #[unsafe(naked)]
 pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> ! {
     // SAFETY: naked. SysV: rdi=entry, rsi=user_sp, rdx=a0, rcx=a1, r8=a2, r9=a3.

@@ -88,6 +88,7 @@ impl DmaBuffer {
     }
 
     /// The buffer length in bytes (`2^order × PAGE_SIZE`; ≥ `PAGE_SIZE`).
+    #[allow(clippy::len_without_is_empty, reason = "never empty: at least a page")]
     pub fn len(&self) -> usize {
         PAGE_SIZE << self.order
     }
@@ -158,7 +159,7 @@ mod tests {
         assert_eq!(buf.len(), 4 * PAGE_SIZE);
         assert_eq!(buf.phys().as_u64() % (buf.len() as u64), 0, "block-size aligned");
         // Contiguous + fully addressable: touch the first and last byte.
-        assert!(buf.as_slice().first().is_some());
+        assert!(!buf.as_slice().is_empty());
         assert_eq!(buf.as_slice()[buf.len() - 1], 0);
     }
 

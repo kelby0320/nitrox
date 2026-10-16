@@ -81,8 +81,8 @@ impl KernelStack {
                     allocated_frames += 1;
                 }
                 None => {
-                    for j in 0..allocated_frames {
-                        heap::buddy_free(frames[j], 0);
+                    for &f in &frames[..allocated_frames] {
+                        heap::buddy_free(f, 0);
                     }
                     return Err(AllocError);
                 }

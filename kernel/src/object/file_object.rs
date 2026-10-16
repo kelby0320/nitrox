@@ -604,7 +604,7 @@ impl FileObject {
                 // end of the call, and `resize` takes the other object's lock — two page-cache
                 // locks nested, which the rank checker refuses (a boot caught it; a host test
                 // cannot, since the checker is inert under `cfg(test)`).
-                let runs = core::mem::replace(&mut cand.inner.lock().runs, KVec::new());
+                let runs = core::mem::take(&mut cand.inner.lock().runs);
                 ex.resize(cand.size(), runs).map_err(|_| CacheInError::OutOfMemory)?;
                 drop(candidate);
                 Ok(existing)
@@ -1252,6 +1252,7 @@ impl FileObject {
     /// or — for a hole / block past the map — complete `po` at once (the reserved frame is
     /// already zeroed). `Failed` only on an allocation failure, the pages read ahead let go. The
     /// pages are marked `Ready` by the fault path after the wait.
+    #[allow(clippy::too_many_arguments, reason = "the fill's object, page, frame, operation, device and run")]
     fn model_a_start_fill(
         &self,
         file_obj: &ObjectRef,
@@ -1499,13 +1500,13 @@ impl Drop for FileObject {
         // **Out of the registration's cache**, by address, after the page lock is released:
         // the cache lock ranks above it and is never taken inside it. By address rather than
         // id, since a new object for the same file may already have replaced this one there.
-        if let Producer::FsServerBlocks { reg, file_id, .. } = &self.producer {
-            if *file_id != 0 {
-                // SAFETY: `reg` pins a live `UserspaceServerReg`.
-                let r: &crate::object::UserspaceServerReg =
-                    unsafe { &*(reg.as_ptr() as *const crate::object::UserspaceServerReg) };
-                r.cache_forget_object(self as *mut Self as *mut ());
-            }
+        if let Producer::FsServerBlocks { reg, file_id, .. } = &self.producer
+            && *file_id != 0
+        {
+            // SAFETY: `reg` pins a live `UserspaceServerReg`.
+            let r: &crate::object::UserspaceServerReg =
+                unsafe { &*(reg.as_ptr() as *const crate::object::UserspaceServerReg) };
+            r.cache_forget_object(self as *mut Self as *mut ());
         }
     }
 }

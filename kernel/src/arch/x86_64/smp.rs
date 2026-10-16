@@ -49,8 +49,8 @@ pub fn bind_cpu_identity(dense: u32, apic: u32) {
 /// default/guessed index in that case, as it would collide with another core.
 pub fn adopt_dense_index() -> Option<u32> {
     let apic = hw_apic_id();
-    for i in 0..MAX_CPUS {
-        if DENSE_TO_APIC[i].load(Ordering::Acquire) == apic {
+    for (i, slot) in DENSE_TO_APIC.iter().enumerate() {
+        if slot.load(Ordering::Acquire) == apic {
             // SAFETY: `IA32_TSC_AUX` is architectural; writing this core's dense
             // index only sets what RDTSCP/RDPID return. Ring-0 wrmsr.
             unsafe { regs::wrmsr(MSR_TSC_AUX, i as u64) };

@@ -130,10 +130,10 @@ pub mod spawn_stats {
 fn report_fill_stats() {
     let s = crate::object::file_object::fill_stats::snapshot();
     let boot_ns = Timer::read_ns();
-    let avg = if s.fills > 0 { s.fill_ns / s.fills } else { 0 };
+    let avg = s.fill_ns.checked_div(s.fills).unwrap_or(0);
     // Permille rather than percent: a fill total well under 1% of boot still wants a
     // digit, and the kernel has no float formatting.
-    let permille = if boot_ns > 0 { s.fill_ns * 1000 / boot_ns } else { 0 };
+    let permille = (s.fill_ns * 1000).checked_div(boot_ns).unwrap_or(0);
     crate::kprintln!(
         "page-cache fills: {} io ({} ns avg, {} ns max, {} ns total = {}/1000 of {} ns boot), \
          {} holes, {} hits, {} spins",
@@ -148,15 +148,15 @@ fn report_fill_stats() {
         s.spins,
     );
     let (spawns, spawn_ns, image_ns, image_bytes) = spawn_stats::snapshot();
-    let spawn_avg = if spawns > 0 { spawn_ns / spawns } else { 0 };
-    let image_share = if spawn_ns > 0 { image_ns * 100 / spawn_ns } else { 0 };
+    let spawn_avg = spawn_ns.checked_div(spawns).unwrap_or(0);
+    let image_share = (image_ns * 100).checked_div(spawn_ns).unwrap_or(0);
     crate::kprintln!(
         "spawns: {} ({} ns avg, {} ns total = {}/1000 of boot); image materialise {} ns \
          ({}% of spawn) for {} bytes",
         spawns,
         spawn_avg,
         spawn_ns,
-        if boot_ns > 0 { spawn_ns * 1000 / boot_ns } else { 0 },
+        (spawn_ns * 1000).checked_div(boot_ns).unwrap_or(0),
         image_ns,
         image_share,
         image_bytes,
@@ -512,7 +512,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
         match lookup_typed(args.namespace.bits(), parent_pid, Rights::LOOKUP, KObjectType::Namespace) {
             Ok(ok) => Some(ok.object.clone()),
             Err(e) => {
-                // SAFETY: reclaim the child's notif handle; `proc_box` drops the AS.
+                // Reclaim the child's notif handle; `proc_box` drops the AS.
                 spawn_rollback_child_handles(child_pid, notif_h, RawHandle::NULL, &[]);
                 return Err(e);
             }
@@ -553,8 +553,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
             }
         };
         let child_rights = ok.rights & Rights::from_bits_truncate(args.rights[i]);
-        // SAFETY: `ok.object` pins a live object; clone bumps the refcount for
-        // the child's new handle.
+        // The clone's reference is the child's new handle's.
         let (op, ot) = ok.object.clone().into_raw();
         match global::get().allocate(child_pid, op, ot, child_rights) {
             Ok(h) => installed[i] = h,
@@ -1338,7 +1337,7 @@ fn map_ns_err(e: NsError) -> KError {
 /// returning the populated byte slice. `path_len` must be in `1..=NS_PATH_MAX`
 /// (`InvalidArgument` / `TooLarge` otherwise). Validation of the path *grammar*
 /// is the caller's job (via [`validate_path`] / `Namespace::bind`).
-fn copy_ns_path<'a>(path_ptr: u64, path_len: usize, buf: &'a mut [u8; NS_PATH_MAX]) -> Result<&'a [u8], KError> {
+fn copy_ns_path(path_ptr: u64, path_len: usize, buf: &mut [u8; NS_PATH_MAX]) -> Result<&[u8], KError> {
     if path_len == 0 {
         return Err(KError::InvalidArgument);
     }
@@ -1784,16 +1783,15 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
     // --- resolve + install (failures delivered via the PO) ---
     // SAFETY: live `Namespace` (type verified by `lookup_typed`).
     let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
-    match resolve_and_start(ns, path, dest, op.forward_op(), requested, pid, &po_ref, 0) {
+    // `None` leaves the PO pending: the forwarded request was delivered, and the server's reply
+    // completes it. `po_ref` drops at return (the forwarding path cloned its own reference into
+    // the registration's pending-lookup table).
+    if let Some((status, result)) = resolve_and_start(ns, path, dest, op.forward_op(), requested, pid, &po_ref, 0) {
         // Pre-signal the PO with the outcome (no waiters yet → just records it).
         // `ns_ok` / `po_ref` are still held here (refcounts, no lock), so this —
         // which takes `SCHED` — performs no `ObjectRef` drop under the lock.
         // SAFETY: `po_ref` pins the `PendingOperation` at `po_ptr`.
-        Some((status, result)) => unsafe { crate::sched::complete_pending_op(po_ptr, status, result) },
-        // Left pending: the forwarded request was delivered; the server's reply
-        // completes the PO. `po_ref` drops at return (the forwarding path cloned
-        // its own reference into the registration's pending-lookup table).
-        None => {}
+        unsafe { crate::sched::complete_pending_op(po_ptr, status, result) };
     }
     Ok(po_h.bits() as isize)
 }
@@ -2479,8 +2477,8 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
             // SAFETY: `ok.object` is the live `IpcChannel` its lookup type-checked, held across the call.
             match unsafe { crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) } {
                 SendOutcome::Sent { .. } => {
-                    for i in 0..count {
-                        close_and_release(RawHandle(h_raw[i]), pid);
+                    for &h in &h_raw[..count] {
+                        close_and_release(RawHandle(h), pid);
                     }
                     Ok(0)
                 }
@@ -2507,8 +2505,8 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
             } {
                 BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
                     // Message committed (delivered or held) — commit the transfers.
-                    for i in 0..count {
-                        close_and_release(RawHandle(h_raw[i]), pid);
+                    for &h in &h_raw[..count] {
+                        close_and_release(RawHandle(h), pid);
                     }
                     // Install the PO handle (adopting the creation reference) and
                     // return it for the caller to `sys_wait` on.
@@ -2608,8 +2606,8 @@ fn complete_forwarded_reply(
         }
         // Not a reply we forwarded (or unreadable): consume it.
         _ => {
-            for i in 0..count {
-                close_and_release(RawHandle(h_raw[i]), pid);
+            for &h in &h_raw[..count] {
+                close_and_release(RawHandle(h), pid);
             }
             Ok(0)
         }
@@ -2647,8 +2645,8 @@ fn complete_resolve_reply(
         None => None,
     };
     let Some(pl) = pl else {
-        for i in 0..count {
-            close_and_release(RawHandle(h_raw[i]), pid);
+        for &h in &h_raw[..count] {
+            close_and_release(RawHandle(h), pid);
         }
         return Ok(0);
     };
@@ -2705,7 +2703,7 @@ fn complete_resolve_reply(
                     // Install the resolved object into the original caller's table with
                     // `requested ∩ (the rights the server granted on the transfer)`.
                     let attenuated = pl.requested & tr.rights;
-                    // SAFETY: `tr.obj` owns the in-flight reference; hand it to `allocate`.
+                    // `tr.obj` owns the in-flight reference, which `allocate` takes.
                     let (op, ot) = tr.obj.into_raw();
                     match global::get().allocate(pl.owner_pid, op, ot, attenuated) {
                         Ok(h) => (0, h.bits()),
@@ -2729,8 +2727,8 @@ fn complete_resolve_reply(
         unsafe { crate::sched::complete_pending_op(pl.po.as_ptr(), status, result) };
     }
     drop(pl);
-    for i in 0..count {
-        close_and_release(RawHandle(h_raw[i]), pid);
+    for &h in &h_raw[..count] {
+        close_and_release(RawHandle(h), pid);
     }
     Ok(0)
 }
@@ -3097,7 +3095,7 @@ fn continue_resolve(
                 return Some((KError::TooLarge as i32, 0));
             };
             match continued_dest(suffix, d, consumed as usize, base, dbuf) {
-                Ok(p) => Some(&*p),
+                Ok(p) => Some(p),
                 Err(e) => return Some((e as i32, 0)),
             }
         }
@@ -3260,8 +3258,8 @@ fn complete_read_range_reply(
         None => None,
     };
     let Some(pf) = pf else {
-        for i in 0..count {
-            close_and_release(RawHandle(h_raw[i]), pid);
+        for &h in &h_raw[..count] {
+            close_and_release(RawHandle(h), pid);
         }
         return Ok(0);
     };
@@ -3296,8 +3294,8 @@ fn complete_read_range_reply(
     // SAFETY: `pf` owns the fill's `PendingOperation` reference.
     unsafe { crate::sched::complete_pending_op(pf.po.as_ptr(), status, 0) };
     drop(pf);
-    for i in 0..count {
-        close_and_release(RawHandle(h_raw[i]), pid);
+    for &h in &h_raw[..count] {
+        close_and_release(RawHandle(h), pid);
     }
     Ok(0)
 }
@@ -3388,7 +3386,7 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     let mut installed = [RawHandle::NULL; IPC_HANDLE_MAX];
     for i in 0..n {
         if let Some(tr) = transfers[i].take() {
-            // SAFETY: `tr.obj` owns the in-flight reference; hand it to `allocate`.
+            // `tr.obj` owns the in-flight reference, which `allocate` takes.
             let (op, ot) = tr.obj.into_raw();
             match global::get().allocate(pid, op, ot, tr.rights) {
                 Ok(h) => {

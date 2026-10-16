@@ -448,7 +448,7 @@ pub fn io_bytes(records: &[IoRecord], cache: CacheCounts) -> Result<KVec<u8>, Al
         cache,
     };
     let mut out: KVec<u8> = KVec::new();
-    out.try_reserve(core::mem::size_of::<IoHeader>() + records.len() * core::mem::size_of::<IoRecord>())?;
+    out.try_reserve(core::mem::size_of::<IoHeader>() + core::mem::size_of_val(records))?;
     out.try_extend_from_slice(header.as_bytes())?;
     for r in records.iter() {
         out.try_extend_from_slice(r.as_bytes())?;

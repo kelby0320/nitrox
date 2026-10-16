@@ -551,10 +551,10 @@ fn name_of(
         return Ok((0, 0));
     };
     let mut n = 0;
-    if dev.product_string != 0 {
-        if let Some(b) = string(x, port, slot, mem, dev.product_string, lang)? {
-            n = desc::string_into(b, out).unwrap_or(0);
-        }
+    if dev.product_string != 0
+        && let Some(b) = string(x, port, slot, mem, dev.product_string, lang)?
+    {
+        n = desc::string_into(b, out).unwrap_or(0);
     }
     let mut s = 0;
     if dev.serial != 0 {

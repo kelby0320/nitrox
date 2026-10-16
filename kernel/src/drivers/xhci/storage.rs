@@ -583,7 +583,7 @@ fn irp_command(op: u32, offset: u64, length: u64, lun: Lun) -> Result<(Cdb, u32,
         return Err(KError::InvalidArgument);
     }
     let bl = lun.block_len as u64;
-    if bl == 0 || length == 0 || offset % bl != 0 || length % bl != 0 {
+    if bl == 0 || length == 0 || !offset.is_multiple_of(bl) || !length.is_multiple_of(bl) {
         return Err(KError::InvalidArgument);
     }
     let (lba, count) = (offset / bl, length / bl);

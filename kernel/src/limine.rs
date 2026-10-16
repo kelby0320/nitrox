@@ -16,6 +16,7 @@
 //! are mandatory under base revision 6.
 
 #![allow(dead_code)]
+#![allow(clippy::new_without_default, reason = "each request is built once, as a static, with its protocol ID")]
 
 use core::ptr;
 use core::sync::atomic::AtomicU64;

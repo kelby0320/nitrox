@@ -216,7 +216,7 @@ fn walk(desc: &[u8], mut visit: impl FnMut(Event<'_>)) -> Option<bool> {
                         let slot = id_slot(offsets, n, g.id);
                         let end = slot.and_then(|s| {
                             let end = g.size.checked_mul(g.count).and_then(|bits| offsets[s].1.checked_add(bits))?;
-                            Some((s, end)).filter(|_| end <= REPORT_BITS_LIMIT)
+                            (end <= REPORT_BITS_LIMIT).then_some((s, end))
                         });
                         match (main, end) {
                             (_, Some((s, end))) => {

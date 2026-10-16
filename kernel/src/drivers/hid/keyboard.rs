@@ -217,7 +217,7 @@ fn change(held: &mut Held, target: &Held, time_ns: u64, out: &mut [InputEvent; E
     for (release, modifiers) in [(true, false), (true, true), (false, true), (false, false)] {
         for usage in 0..=0xFFu8 {
             let (was, will) = (held.has(usage), target.has(usage));
-            if was == will || was != release || (usage >= MODIFIER_FIRST && usage <= 0xE7) != modifiers {
+            if was == will || was != release || (MODIFIER_FIRST..=0xE7).contains(&usage) != modifiers {
                 continue;
             }
             let Some(code) = code_of(usage) else {

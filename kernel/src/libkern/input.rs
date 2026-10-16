@@ -311,6 +311,6 @@ mod tests {
         // Deliberate: a button has the same down/up/held state machine as a key, so it
         // shares `EV_KEY` and a consumer needs one code path, not two.
         assert_eq!(InputEvent::key(BTN_LEFT, KEY_PRESS, 1).kind, EV_KEY);
-        assert!(BTN_LEFT > KEY_COMPOSE, "button codes must not collide with keycodes");
+        const { assert!(BTN_LEFT > KEY_COMPOSE, "button codes must not collide with keycodes") };
     }
 }

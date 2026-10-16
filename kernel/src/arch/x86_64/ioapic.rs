@@ -51,6 +51,7 @@ const PIT_CMD: u16 = 0x43;
 const PIT_CH0_DATA: u16 = 0x40;
 const PIT_INPUT_HZ: u32 = 1_193_182;
 /// Channel 0, lobyte/hibyte access, mode 2 (rate generator), binary.
+#[allow(clippy::unusual_byte_groupings, reason = "grouped by the register's fields")]
 const PIT_CH0_MODE2: u8 = 0b00_11_010_0;
 
 /// Kernel-virtual base of the mapped IOAPIC MMIO page (`0` = not initialised).
@@ -84,7 +85,11 @@ unsafe fn read_reg(idx: u32) -> u32 {
     }
 }
 
-/// Write an IOAPIC register by index. # Safety: as [`read_reg`].
+/// Write an IOAPIC register by index.
+///
+/// # Safety
+///
+/// As [`read_reg`].
 unsafe fn write_reg(idx: u32, val: u32) {
     let base = IOAPIC_BASE.load(Ordering::Relaxed);
     debug_assert!(base != 0, "IOAPIC accessed before init");
@@ -140,7 +145,11 @@ fn rte_index(gsi: u32) -> Option<u32> {
     if gsi >= base && gsi < base + max { Some(gsi - base) } else { None }
 }
 
-/// Set or clear an entry's mask bit in place. # Safety: ring-0, post-`init`.
+/// Set or clear an entry's mask bit in place.
+///
+/// # Safety
+///
+/// Ring-0, post-`init`.
 unsafe fn set_rte_mask(gsi: u32, masked: bool) {
     if let Some(idx) = rte_index(gsi) {
         // SAFETY: valid index, MMIO mapped.
@@ -170,7 +179,11 @@ fn pit_dpc_handler(_ctx: *mut ()) {
 }
 
 /// Program PIT channel 0 as a ~`PIT_INPUT_HZ / count` Hz rate generator (mode 2)
-/// so it raises IRQ0 periodically. # Safety: ring-0; owns the PIT ports.
+/// so it raises IRQ0 periodically.
+///
+/// # Safety
+///
+/// Ring-0; owns the PIT ports.
 unsafe fn pit_ch0_periodic(count: u16) {
     // SAFETY: writing the PIT command + channel-0 data ports per the 8254 spec.
     unsafe {

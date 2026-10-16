@@ -413,8 +413,7 @@ mod tests {
             // p_vaddr mod PAGE to satisfy the ELF alignment rule.
             let phdr_count = self.segments.len();
             let phdr_bytes = phdr_count * ELF64_PHDR_SIZE;
-            let mut bytes = Vec::new();
-            bytes.resize(ELF64_EHDR_SIZE + phdr_bytes, 0);
+            let mut bytes = vec![0; ELF64_EHDR_SIZE + phdr_bytes];
 
             // Place segment data; record each offset.
             let mut seg_offsets = Vec::with_capacity(phdr_count);

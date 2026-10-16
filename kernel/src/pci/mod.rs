@@ -285,11 +285,11 @@ fn probe_function(
 /// Probe every function of one device slot (function 0, then 1..8 if the slot
 /// reports multi-function).
 fn scan_device(region: &EcamRegion, win: VirtAddr, bus: u8, dev: u8, out: &mut KVec<ObjectRef>, found: &mut usize) {
-    if let Probe::Present { multifunction } = probe_function(region, win, bus, dev, 0, out, found) {
-        if multifunction {
-            for func in 1u8..8 {
-                probe_function(region, win, bus, dev, func, out, found);
-            }
+    if let Probe::Present { multifunction } = probe_function(region, win, bus, dev, 0, out, found)
+        && multifunction
+    {
+        for func in 1u8..8 {
+            probe_function(region, win, bus, dev, func, out, found);
         }
     }
 }

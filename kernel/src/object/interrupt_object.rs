@@ -191,7 +191,7 @@ impl Drop for InterruptObject {
     fn drop(&mut self) {
         // A live object should never be dropped with waiters still parked on it
         // (each waiter is removed before it unparks). Mirror `PendingOperation`.
-        // SAFETY: `&mut self` is exclusive; no `SCHED` contention at drop.
+        // `&mut self` is exclusive, so no `SCHED` is needed at drop.
         let inner = self.inner.get_mut();
         debug_assert!(inner.waiters.is_empty(), "InterruptObject dropped with waiters still parked");
     }

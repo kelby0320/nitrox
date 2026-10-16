@@ -472,6 +472,8 @@ static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 /// recorded at [`cpu_accepts_work`], when the placement tests read this global. Production
 /// codegen is unchanged — the `cfg(not(test))` arm is the original atomic, verbatim.
 mod online_set {
+    pub(in crate::sched) use backing::*;
+
     #[cfg(not(test))]
     mod backing {
         use core::sync::atomic::{AtomicU64, Ordering};
@@ -509,8 +511,6 @@ mod online_set {
             ONLINE_MASK.with(|m| m.set(mask));
         }
     }
-
-    pub(in crate::sched) use backing::*;
 }
 
 /// The set of online CPUs as a bitmask (dense index → bit), read lock-free.
@@ -1385,7 +1385,6 @@ pub fn on_timer_tick() {
     // it. Gated on `current_is_idle` so a busy thread isn't preempted to steal.
     if !ready_here && current_is_idle(&g) && steal_available(&g, me) {
         switch_to_next(g);
-        return;
     }
     // else: guard drops here — IF was already 0 (IRQ context), stays 0 until iretq.
 }
@@ -1501,7 +1500,7 @@ fn wake_entropy_seed_waiters(g: &mut SchedState) {
 }
 
 /// Drain every deadline at or before `now`, firing each: a timer entry signals
-/// + wakes its waiters (and re-arms if periodic); a `sys_wait` thread-deadline
+/// and wakes its waiters (and re-arms if periodic); a `sys_wait` thread-deadline
 /// entry wakes that thread directly (its wait slots stay un-signaled → the
 /// thread observes a timeout). Caller holds `SCHED`. Performs **no allocation**
 /// and **no blocking** — safe in the timer IRQ.
@@ -1598,14 +1597,20 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
 // has already rejected non-waitables before these run.
 
 /// The kobject type at the head of a type-erased object pointer.
-/// # Safety: `obj` is a live kobject (header at offset 0); `SCHED` held.
+///
+/// # Safety
+///
+/// `obj` is a live kobject (header at offset 0); `SCHED` held.
 unsafe fn obj_type(obj: *mut ()) -> KObjectType {
     // SAFETY: every kobject begins with a `KObjectHeader` (see object::header).
     unsafe { (*(obj as *const crate::object::header::KObjectHeader)).object_type() }
 }
 
 /// Is this waitable currently signaled? (Timer deadline elapsed / channel non-empty.)
-/// # Safety: live waitable, `SCHED` held.
+///
+/// # Safety
+///
+/// Live waitable, `SCHED` held.
 unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
     // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
     // `SCHED` is held.
@@ -1622,7 +1627,10 @@ unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
 }
 
 /// Register the current thread as a waiter. `Err` over the object's reserve.
-/// # Safety: live waitable, `SCHED` held.
+///
+/// # Safety
+///
+/// Live waitable, `SCHED` held.
 unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
     // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
     // `SCHED` is held.
@@ -1639,7 +1647,10 @@ unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
 }
 
 /// Unregister a waiter (idempotent).
-/// # Safety: live waitable, `SCHED` held.
+///
+/// # Safety
+///
+/// Live waitable, `SCHED` held.
 unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
     // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
     // `SCHED` is held.
@@ -2828,6 +2839,7 @@ pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult 
 /// # Safety
 ///
 /// `timer` points at a live `Timer`, pinned for the call by a reference the caller holds.
+#[allow(clippy::result_unit_err, reason = "one failure, the heap's reserve, which every caller reports one way")]
 pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
     let mut g = SCHED.lock();
     // Drop any stale heap entry (re-arm).
