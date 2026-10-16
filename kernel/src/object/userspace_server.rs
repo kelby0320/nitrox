@@ -387,11 +387,13 @@ impl UserspaceServerReg {
     unsafe fn inner<'a>(reg: *mut ()) -> &'a mut Inner {
         // The sentinel is cheap and catches a stale back-pointer at the moment it is
         // followed, rather than as garbage read out of the pending table.
+        // SAFETY: the accessor contract makes `reg` a registration's memory, so readable.
         debug_assert!(unsafe { Self::is_live(reg) }, "UserspaceServerReg accessor on a dead/stale registration");
         // SAFETY: forming a shared `&UserspaceServerReg` to reach the `UnsafeCell`,
         // then a `&mut Inner` through it, is the interior-mutability contract —
         // sound while `SCHED` serialises access.
         let r = unsafe { &*(reg as *const UserspaceServerReg) };
+        // SAFETY: as above.
         unsafe { &mut *r.inner.get() }
     }
 
@@ -401,6 +403,7 @@ impl UserspaceServerReg {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn endpoint_ptr(reg: *mut ()) -> *mut () {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(reg) }.endpoint.as_ptr()
     }
 
@@ -437,6 +440,7 @@ impl UserspaceServerReg {
         suffix: &[u8],
         fwd: Forward<'_>,
     ) -> Option<u64> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         // First free slot, or `None` when the table is full (all in flight).
         let slot = inner.pending.iter().position(Option::is_none)?;
@@ -480,6 +484,7 @@ impl UserspaceServerReg {
         frame: PhysAddr,
         index: usize,
     ) -> Option<u64> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         let slot = inner.pending_fill.iter().position(Option::is_none)?;
         let request_id = inner.next_id;
@@ -497,6 +502,7 @@ impl UserspaceServerReg {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_pending_fill_matching(reg: *mut (), request_id: u64) -> Option<PendingFill> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         let slot = inner.pending_fill.iter().position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
         inner.pending_fill[slot].take()
@@ -510,6 +516,7 @@ impl UserspaceServerReg {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_pending_matching(reg: *mut (), request_id: u64) -> Option<PendingLookup> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         let slot = inner.pending.iter().position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
         inner.pending[slot].take()
@@ -522,6 +529,7 @@ impl UserspaceServerReg {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_pending_next(reg: *mut ()) -> Option<PendingLookup> {
+        // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
         let slot = inner.pending.iter().position(Option::is_some)?;
         inner.pending[slot].take()
@@ -549,7 +557,8 @@ impl Drop for UserspaceServerReg {
     /// that follow then release the endpoint, and if that is its last reference
     /// `ipc_endpoint_closing` runs and correctly finds nothing to drain.
     fn drop(&mut self) {
-        crate::sched::us_reg_detach(self as *mut Self as *mut ());
+        // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
+        unsafe { crate::sched::us_reg_detach(self as *mut Self as *mut ()) };
         // Poison the sentinel last, once nothing here needs the accessors. A dangling
         // pointer that survives this — via a path not yet known — then fails
         // `is_live` and is caught at the dereference, instead of reading a recycled
@@ -635,6 +644,40 @@ mod tests {
              consumer of it is reading freed memory"
         );
         drop(keepalive);
+    }
+
+    /// A reply holds the registration it was routed to: the last binding, dropped on another CPU
+    /// between the lookup and the reply's completion, cannot free it under the reply.
+    #[test]
+    fn a_reply_holds_the_registration_it_found() {
+        init_global_heap();
+        let (k, s) = IpcChannel::try_new_pair(4).unwrap();
+        // SAFETY: `into_raw` yields each endpoint's single creation reference; adopt it.
+        let k_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(k).as_ptr() as *mut (), KObjectType::IpcChannel) };
+        // SAFETY: as above.
+        let s_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(s).as_ptr() as *mut (), KObjectType::IpcChannel) };
+        let k_ptr = k_ref.as_ptr();
+        let r = UserspaceServerReg::try_new(k_ref).unwrap();
+        // SAFETY: adopt the creation reference; it stands for the binding's.
+        let binding =
+            unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
+        // SAFETY: `k_ptr` is the endpoint the registration holds.
+        unsafe { crate::sched::us_server_attach(k_ptr, &binding) };
+
+        // SAFETY: `s_ref` pins the server's end.
+        let reply =
+            unsafe { crate::sched::us_forward_reg_for_send(s_ref.as_ptr()) }.expect("routed to the registration");
+        let destroyed = test_probe::userspace_server_reg_destroys();
+        drop(binding);
+        assert_eq!(test_probe::userspace_server_reg_destroys(), destroyed, "freed under the reply");
+        // SAFETY: `reply` pins the registration.
+        assert!(unsafe { crate::sched::us_forward_take_pending(reply.as_ptr(), 1) }.is_none());
+
+        drop(reply);
+        assert_eq!(test_probe::userspace_server_reg_destroys(), destroyed + 1);
+        // SAFETY: `s_ref` pins the server's end, whose peer closed with the registration.
+        assert!(unsafe { crate::sched::us_forward_reg_for_send(s_ref.as_ptr()) }.is_none());
+        drop(s_ref);
     }
 
     /// Only a pointer that still names *this* registration may be cleared:

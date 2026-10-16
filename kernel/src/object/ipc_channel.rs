@@ -380,6 +380,7 @@ impl IpcChannel {
         // a `&mut Inner` through it, is the interior-mutability contract — sound
         // while `SCHED` serialises access.
         let c = unsafe { &*(obj as *const IpcChannel) };
+        // SAFETY: as above.
         unsafe { &mut *c.inner.get() }
     }
 
@@ -388,6 +389,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn peer_of(obj: *mut ()) -> *mut () {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.peer as *mut ()
     }
 
@@ -396,6 +398,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn clear_peer(obj: *mut ()) {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.peer = core::ptr::null_mut();
     }
 
@@ -407,6 +410,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn set_us_reg(obj: *mut (), reg: *mut ()) {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.us_reg = reg;
     }
 
@@ -417,6 +421,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn us_reg_of(obj: *mut ()) -> *mut () {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.us_reg
     }
 
@@ -432,12 +437,13 @@ impl IpcChannel {
         msg: &StoredMsg,
         transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
     ) -> SendOutcome {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let peer = unsafe { Self::inner(obj) }.peer;
         if peer.is_null() {
             return SendOutcome::PeerClosed;
         }
-        // Distinct object from `obj` (the two endpoints differ), so this second
-        // borrow does not alias the first (which has ended).
+        // SAFETY: the accessor contract, for `peer`: the other endpoint, live while its pointer is
+        // set, which closing clears under `SCHED`; a distinct object from `obj`, whose borrow has ended.
         let peer_inner = unsafe { Self::inner(peer as *mut ()) };
         let was_empty = peer_inner.recv.is_empty();
         if peer_inner.recv.push_from(msg, transfers) {
@@ -452,6 +458,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn recv_peek(obj: *mut ()) -> RecvState {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if !inner.recv.is_empty() {
             RecvState::HasMsg
@@ -472,6 +479,7 @@ impl IpcChannel {
         dst: &mut StoredMsg,
         out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
     ) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.recv.pop_into(dst, out)
     }
 
@@ -481,6 +489,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn already_signaled(obj: *mut ()) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         !inner.recv.is_empty() || inner.peer.is_null()
     }
@@ -491,6 +500,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if inner.recv_waiters.len() < Self::MAX_WAITERS {
             inner
@@ -514,6 +524,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if let Some(i) = inner.recv_waiters.iter().position(|&w| w == thread) {
             inner.recv_waiters.remove(i);
@@ -526,6 +537,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         let n = inner.recv_waiters.len();
         debug_assert!(out.len() >= n);
@@ -552,11 +564,13 @@ impl IpcChannel {
         transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
         po: &ObjectRef,
     ) -> BlockSendOutcome {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let peer = unsafe { Self::inner(obj) }.peer;
         if peer.is_null() {
             return BlockSendOutcome::PeerClosed;
         }
-        // Distinct object from `obj`; the first borrow has ended.
+        // SAFETY: the accessor contract, for `peer`: the other endpoint, live while its pointer is
+        // set, which closing clears under `SCHED`; a distinct object from `obj`, whose borrow has ended.
         let peer_inner = unsafe { Self::inner(peer as *mut ()) };
         let was_empty = peer_inner.recv.is_empty();
         if peer_inner.recv.push_from(msg, transfers) {
@@ -600,6 +614,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn cancel_pending_send(obj: *mut (), po: *mut ()) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if let Some(p) = inner.pending_sends.iter_mut().find(|p| p.po.as_ptr() == po) {
             p.cancelled = true;
@@ -623,6 +638,7 @@ impl IpcChannel {
         obj: *mut (),
         reclaimed: &mut [Option<ReclaimedSend>; Self::MAX_PENDING_SENDS],
     ) -> Option<ObjectRef> {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         let mut r = 0;
         loop {
@@ -660,6 +676,7 @@ impl IpcChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn pending_send_pos(obj: *mut (), out: &mut [*mut ()]) -> usize {
+        // SAFETY: the accessor contract: `obj` is a live `IpcChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         let mut n = 0;
         for p in inner.pending_sends.iter() {
@@ -679,7 +696,8 @@ impl Drop for IpcChannel {
     /// cannot drop while receivers remain). Reaches `SCHED`; sound because
     /// endpoint references are released only outside `SCHED` (see module docs).
     fn drop(&mut self) {
-        crate::sched::ipc_endpoint_closing(self as *mut Self as *mut ());
+        // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
+        unsafe { crate::sched::ipc_endpoint_closing(self as *mut Self as *mut ()) };
         debug_assert!(self.inner.get_mut().recv_waiters.is_empty(), "IpcChannel dropped with live receivers");
     }
 }

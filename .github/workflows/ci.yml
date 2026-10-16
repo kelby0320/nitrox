@@ -78,6 +78,17 @@ jobs:
       - name: cargo xtask check-size
         run: cargo xtask check-size
 
+      # An unsafe block without a SAFETY comment, and clippy's correctness lints, fail every workspace.
+      # Denied on the command line, so no crate escapes by leaving its manifest's [lints] unset. With
+      # every feature on, so the code the gates build is held; the kernel also with none, for its
+      # two `cfg(not(feature))` blocks.
+      - name: cargo clippy (denied lints)
+        run: |
+          (cd kernel && cargo clippy --keep-going -- -D clippy::undocumented_unsafe_blocks -D clippy::correctness)
+          (cd kernel && cargo clippy --keep-going --all-features -- -D clippy::undocumented_unsafe_blocks -D clippy::correctness)
+          (cd tools && cargo clippy --keep-going --all-features -- -D clippy::undocumented_unsafe_blocks -D clippy::correctness)
+          (cd userspace && cargo clippy --keep-going --all-features -- -D clippy::undocumented_unsafe_blocks -D clippy::correctness)
+
       # The review and bug-bash workflows' control flow, every agent stubbed. No workflow runs.
       - name: workflow checks
         run: |

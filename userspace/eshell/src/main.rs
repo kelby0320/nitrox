@@ -36,7 +36,11 @@ fn po_wait(po: u64) -> (i32, u64) {
         WAIT_HANDLES[0] = po;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let status = unsafe { i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]) };
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let result = unsafe {
         u64::from_le_bytes([
             WAIT_RESULTS[16],
@@ -372,8 +376,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _h0: u64, _a0: u64) -> ! {
         }
         let n = (n as usize).min(READ_LEN as usize);
         for i in 0..n {
-            // SAFETY: `buf_addr + i` is within the mapped read buffer (`i < n ≤
-            // READ_LEN ≤ PAGE`).
+            // SAFETY: `buf_addr + i` is within the mapped read buffer (`i < n ≤ READ_LEN ≤ PAGE`).
             let b = unsafe { ((buf_addr + i as u64) as *const u8).read_volatile() };
             handle_byte(b, &mut line, &mut len, root_ns);
         }

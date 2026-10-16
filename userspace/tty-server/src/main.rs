@@ -182,6 +182,8 @@ fn po_wait(po: u64) -> (i32, u64) {
         PO_HANDLES[0] = po;
         syscall4(SYS_WAIT, (&raw const PO_HANDLES) as u64, 1, (&raw mut PO_RESULTS) as u64, u64::MAX)
     };
+    // SAFETY: bytes 8..24 are inside `PO_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let (status, value) = unsafe {
         (
             i32::from_le_bytes([PO_RESULTS[8], PO_RESULTS[9], PO_RESULTS[10], PO_RESULTS[11]]),
@@ -679,8 +681,9 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
             } else if read_po != 0 && h == read_po {
                 let n = console_bytes(off);
                 let mut bytes: Vec<u8> = Vec::with_capacity(n as usize);
-                // SAFETY: the kernel wrote `n` bytes into the mapped read buffer.
                 for k in 0..n {
+                    // SAFETY: the kernel wrote `n` bytes into the mapped read buffer at `buf_addr`,
+                    // which stays mapped for the process's life
                     bytes.push(unsafe { ((buf_addr + k) as *const u8).read_volatile() });
                 }
                 read_po = 0; // consumed; the next iteration submits another
@@ -793,12 +796,14 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     }
 
     // One page, mapped once, for every console read.
+    // SAFETY: a register-only syscall creating an anonymous page object
     let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
     if buf_h < 0 {
         kprint(b"tty-server: read buffer FAIL\n");
         exit(1);
     }
     let buf_h = buf_h as u64;
+    // SAFETY: mapping the page object just created; the mapping is only read through volatile loads below
     let buf_addr = unsafe { syscall4(SYS_MEMORY_MAP, buf_h, 0, 4096, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if buf_addr < 0 {
         kprint(b"tty-server: read buffer map FAIL\n");

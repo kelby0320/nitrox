@@ -102,10 +102,10 @@ pub(crate) fn try_alloc_initialised(seed: u64) -> Result<(NonNull<SegmentEntries
     let perm_align = core::mem::align_of::<u32>();
     let perm_raw = kmalloc(perm_bytes, perm_align) as *mut u32;
     if perm_raw.is_null() {
-        // `entries_raw` came from the matching `kmalloc` above and
+        // SAFETY: `entries_raw` came from the matching `kmalloc` above and
         // has no live references — the writes initialising the
         // entries are not borrowed.
-        kfree(entries_raw as *mut u8);
+        unsafe { kfree(entries_raw as *mut u8) };
         return Err(AllocError);
     }
 
@@ -151,9 +151,9 @@ pub(crate) fn try_alloc_initialised(seed: u64) -> Result<(NonNull<SegmentEntries
         unsafe { ptr::read(perm_raw) }
     };
 
-    // `perm_raw` came from the matching `kmalloc` above; we are done
+    // SAFETY: `perm_raw` came from the matching `kmalloc` above; we are done
     // with it and hold no live references.
-    kfree(perm_raw as *mut u8);
+    unsafe { kfree(perm_raw as *mut u8) };
 
     Ok((entries_ptr, SegmentMeta { free_head, free_count: SEGMENT_LEN as u32 }))
 }
@@ -167,10 +167,10 @@ pub(crate) fn try_alloc_initialised(seed: u64) -> Result<(NonNull<SegmentEntries
 /// block. The handle table guarantees this by only freeing segments
 /// during its own `Drop` after every directory entry has been cleared.
 pub(crate) unsafe fn free_entries(entries: NonNull<SegmentEntries>) {
-    // `kfree` is the matching deallocator for `kmalloc`; safety of
+    // SAFETY: `kfree` is the matching deallocator for `kmalloc`; safety of
     // this call is forwarded from the function contract on
     // `free_entries` itself.
-    kfree(entries.as_ptr() as *mut u8);
+    unsafe { kfree(entries.as_ptr() as *mut u8) };
 }
 
 #[cfg(test)]

@@ -197,7 +197,8 @@ Don't introduce YAML, JSON5, or custom parsers. The TOML crate (project-internal
 
 - Unit tests in `#[cfg(test)]` modules where possible.
 - Integration tests for services run in QEMU.
-- Mock the syscall surface for unit testing layers above `libkern` — `libkern` exposes a test mode that records and replays syscalls.
+- There is no syscall mock yet (`docs/rationale/deferred-decisions.md`): keep logic free of syscalls
+  to test it on the host, and test the paths that make them in a QEMU gate.
 
 ## Forbidden patterns
 

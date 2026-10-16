@@ -222,8 +222,8 @@ fn send_ready(control: u64, name: &[u8], kernel_end: u64) -> bool {
             None => return false,
         }
     };
-    // SAFETY: stamp the IpcMsg header (payload_len @4, handle_count @8) + the
-    // transferred-handle slot.
+    // SAFETY: stamp the IpcMsg header (payload_len @4, handle_count @8) + the transferred-handle
+    // slot.
     unsafe {
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         REPLY_MSG[8] = 1;
@@ -531,8 +531,8 @@ fn forget(serve_end: u64, id: u64) -> bool {
     let Some(n) = forget_request(&mut body, id) else {
         return false;
     };
-    // SAFETY: FORGET_MSG is a valid buffer, written only here; the rsproto message goes at
-    // offset PAYLOAD_OFF.
+    // SAFETY: FORGET_MSG is a valid buffer, written only here; the rsproto message goes at offset
+    // PAYLOAD_OFF.
     let sent = unsafe {
         let Some(rs_len) = librsproto::encode(&mut FORGET_MSG[PAYLOAD_OFF..], OP_FILE_FORGET, 0, 0, &body[..n], 0)
         else {
@@ -1110,10 +1110,10 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
     // The rsproto request occupies the IpcMsg payload (offset 24, `payload_len`
     // bytes). Form non-aliasing slices over the distinct request/content/reply
     // statics via raw pointers.
-    // SAFETY: `payload_len` is bounded to the payload region; the three slices
-    // address disjoint statics, so no aliasing `&`/`&mut` is formed.
     let request_id;
     let served_op;
+    // SAFETY: `received` is bounded to the payload region; the request, content and reply slices address disjoint
+    // statics, so no aliasing `&`/`&mut` is formed
     let served = unsafe {
         let req = received();
         request_id = librsproto::decode(req).map(|m| m.request_id).unwrap_or(0);

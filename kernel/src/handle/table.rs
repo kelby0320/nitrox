@@ -493,14 +493,16 @@ impl HandleTable {
             // i.e. it is being torn down). The reference taken here is
             // adopted into the returned `ObjectRef` at step 12, or
             // released on the retry/error paths below.
-            if !try_acquire_refcount(obj, object_type) {
+            // SAFETY: `obj` was read from a live entry under the grace guard, so it addresses a live object.
+            if !unsafe { try_acquire_refcount(obj, object_type) } {
                 return Err(HandleError::InvalidHandle);
             }
 
             // Step 8: re-read seq; if changed or odd, release and retry.
             let s2 = entry.seq.load(Ordering::Acquire);
             if s2 != snap.seq || (s2 & 1) != 0 {
-                release_refcount(obj, object_type);
+                // SAFETY: releases the reference `try_acquire_refcount` took above.
+                unsafe { release_refcount(obj, object_type) };
                 retries += 1;
                 debug_assert!(retries < 1024, "handle table lookup spinning past 1024 retries — logic bug",);
                 continue;
@@ -508,19 +510,22 @@ impl HandleTable {
 
             // Step 9: generation match.
             if snap.generation != gen_expected {
-                release_refcount(obj, object_type);
+                // SAFETY: releases the reference `try_acquire_refcount` took above.
+                unsafe { release_refcount(obj, object_type) };
                 return Err(HandleError::InvalidHandle);
             }
 
             // Step 10: owner_pid match — security-critical.
             if snap.owner_pid != caller_pid {
-                release_refcount(obj, object_type);
+                // SAFETY: releases the reference `try_acquire_refcount` took above.
+                unsafe { release_refcount(obj, object_type) };
                 return Err(HandleError::NotOwner);
             }
 
             // Step 11: rights subset.
             if !required.is_subset_of(snap.rights) {
-                release_refcount(obj, object_type);
+                // SAFETY: releases the reference `try_acquire_refcount` took above.
+                unsafe { release_refcount(obj, object_type) };
                 return Err(HandleError::NoAccess);
             }
 

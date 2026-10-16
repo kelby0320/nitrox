@@ -116,6 +116,7 @@ impl PendingOperation {
         // reach the `UnsafeCell`, then a `&mut PendingOpInner` through it, is the
         // interior-mutability contract — sound while `SCHED` serialises access.
         let p = unsafe { &*(obj as *const PendingOperation) };
+        // SAFETY: as above.
         unsafe { &mut *p.inner.get() }
     }
 
@@ -129,6 +130,7 @@ impl PendingOperation {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn signal_with_result(obj: *mut (), status: i32, result: u64) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if inner.signaled {
             return false;
@@ -146,6 +148,7 @@ impl PendingOperation {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn status(obj: *mut ()) -> i32 {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.status
     }
 
@@ -156,6 +159,7 @@ impl PendingOperation {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn result(obj: *mut ()) -> u64 {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.result
     }
 
@@ -165,6 +169,7 @@ impl PendingOperation {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn already_signaled(obj: *mut ()) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.signaled
     }
 
@@ -175,6 +180,7 @@ impl PendingOperation {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if inner.waiters.len() < Self::MAX_WAITERS {
             inner
@@ -198,6 +204,7 @@ impl PendingOperation {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if let Some(i) = inner.waiters.iter().position(|&w| w == thread) {
             inner.waiters.remove(i);
@@ -210,6 +217,7 @@ impl PendingOperation {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+        // SAFETY: the accessor contract: `obj` is a live `PendingOperation` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         let n = inner.waiters.len();
         debug_assert!(out.len() >= n);

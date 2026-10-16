@@ -36156,3 +36156,60 @@ second declined.
   to 146 lines, 54 lowered, and `compositor/src/server.rs` (now 978 lines) removed — 63 entries.
 - **`cargo fmt --check` holds each workspace in CI**, and the rule never to run `cargo fmt` ends:
   root `CLAUDE.md` says to run it, and the `implementer` is told to.
+
+## 2026-10-15 — Before Phase 7, Part B.2's first PR: `clippy`'s errors, and `SAFETY` everywhere
+
+- **Measured again on the pinned toolchains**, as B.1 said it would be: 390 findings across 62
+  lints besides the `unsafe` blocks, 46 of them errors in four lints, and **231 `unsafe` blocks**
+  with no `SAFETY` comment `clippy` recognises — 139 in the kernel, 92 in userspace, where 1.95
+  counted 142 and 91.
+- **`not_unsafe_ptr_arg_deref`: 24 public functions of `kernel/src/sched.rs` are `unsafe fn`**,
+  each with a `# Safety` section — the pointer names a live object of its type, pinned for the
+  call by a reference the caller holds, or, for the two `Drop` callers, the object being dropped —
+  and its 48 call sites answer it in a `SAFETY` comment. Each function's prose already said its
+  caller pinned the object; the signature now says it. **The plan's other option**, taking what a
+  caller can vouch for, needs a checked typed accessor on `ObjectRef` the kernel lacks, and the
+  syscall table it would reshape is Part E's: it is left to Part E.
+- **The other three errors**, each judged: `libfsserver`'s `PartitionIo::scratch` made a `&mut`
+  from a `&self`, so two calls could hold two mutable slices of one mapping — it became `copy_out`
+  and `copy_in`, which copy within the call, as `SectorDisk` already did; `service-mgr`'s two loops
+  on a handle that cannot change became an `if` around a `loop` and a `while let`; and
+  `copy_from_user`'s zero-sized branch keeps its `assume_init`, sound for every inhabited `T` with
+  no caller passing another, the lint allowed at that line with its reason.
+- **Every `unsafe` block has a `SAFETY` comment**: the kernel's by the author, userspace's by the
+  `implementer` from a brief, read before commit — two of its comments said a count was written by
+  a receive whose result is checked only after the read, and were corrected. Most of the kernel's
+  were accessors in the object files, whose comment names the contract each file states once; a
+  block a comment one statement up already covers says "as above". Four functions in `sched.rs`
+  that dispatched on a type with a block an arm are one block each, under the function's contract.
+- **`check-comments` counts a `SAFETY` comment and a `# Safety` section as neither comment nor
+  code** (the maintainer's call in PR #376), to its fifth line — 99% of the tree's are no longer,
+  and past it the lines count, so the exemption pays for no essay — and the size baseline is raised
+  by hand for the eighteen files the comments lengthened, by 272 lines — 132 of them `sched.rs`'s,
+  mostly its 24 new `# Safety` sections.
+- **CI denies `clippy::undocumented_unsafe_blocks` and `clippy::correctness`** in each workspace,
+  on the command line rather than only in a manifest, so a crate with no `[lints]` line is held
+  too, and with every feature on, so the code only the gates build is held — the kernel also with
+  none, for its two `cfg(not(feature))` blocks. A `SAFETY` comment removed from the kernel or
+  userspace fails the step. Warnings pass until the second PR, which fixes them, lints the test
+  targets, and adds `-D warnings`.
+
+## 2026-10-15 — Before Phase 7, PR #379's review: three races its comments called sound
+
+- **The review's three worth-fixing kernel findings were races older than the PR**, which its new
+  `SAFETY` comments had certified: `sys_wait` read a `PendingOperation`'s completion after dropping
+  the lookup references that pinned it, the reply path used a registration's address after letting
+  `SCHED` go, and `sys_ns_bind` attached a back-pointer to a registration it had already moved
+  into a binding an unbind could drop. In each the fix passes a reference, so the borrow checker
+  holds the order: the reads go through `refs`, `us_forward_reg_for_send` returns an `ObjectRef`
+  acquired under `SCHED`, and `us_server_attach` takes the registration by reference. **A
+  `SAFETY` comment is an argument someone can check, and writing 231 of them is what surfaced
+  these** — the lesson is to read what pins the pointer, not to restate that something does.
+- **Every public kernel function that dereferences a raw pointer is `unsafe fn`**, not only those
+  `not_unsafe_ptr_arg_deref` sees: it misses a dereference through a cast or a private helper. A
+  scan found eight more and a test helper; three that only store or compare the pointer stay safe.
+- **CI lints with every feature on**, and the kernel also with none: the gates' code was unlinted.
+- **`check-comments`' exemption stops at a `SAFETY` comment's fifth line**, and removed lines carry
+  their line numbers, so a removed `SAFETY` comment no longer swallows the next hunk's.
+- **A failed spawn moves nothing**, so `init` and `storage-service` now close the end they meant
+  to move; `init` had left it open in PID 1, a test-qemu probe showed.

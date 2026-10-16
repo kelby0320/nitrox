@@ -15,9 +15,11 @@ What was done, when, and in which PR, review, phase or part belongs in the commi
   line** is any other line that is not blank.
 - A line is **new** if the branch adds it and does not remove the same trimmed text elsewhere: a
   moved or re-indented line is not new. Untracked Rust files count whole.
-- **New comment lines may be at most 0.15 of new code lines, plus 3**, so that a small fix's
-  `SAFETY` comment passes. A change that adds no more comment lines than it removes passes
-  whatever its ratio.
+- **New comment lines may be at most 0.15 of new code lines, plus 3.** A change that adds no
+  more comment lines than it removes passes whatever its ratio.
+- **A `// SAFETY:` comment and a doc comment's `# Safety` section are neither comment nor code**,
+  to their fifth line: the rules require both. Past it, the lines count as comment. A citation in
+  one still fails.
 - **A new comment citing history fails**: a PR (`PR #12`, `PR#12`, `(#123)`), an issue, a ticket,
   a review finding, a slice, a phase (`Phase 6`), a part (`Part H.4`, `Part K's`, `Parts A–G`), a
   milestone (`Milestone 7`, `M14 Part`), also when the citation is wrapped across two lines.

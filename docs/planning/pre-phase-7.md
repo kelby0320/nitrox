@@ -2,9 +2,9 @@
 
 **Status: planned 2026-10-13, after Phase 6 closed (the maintainer's call); Part A detailed
 2026-10-14; A.1, A.2 and A.6 built 2026-10-14, and A.3, A.4, A.5 and A.7 the same day — Part A
-built; Part B detailed 2026-10-14; B.1 built 2026-10-15.** Each other part gets its detail pass when it is next. Seven
-parts, A–G, in the order below. Part E is the syscall-surface consolidation, planned separately in
-[`syscall-surface.md`](syscall-surface.md).
+built; Part B detailed 2026-10-14; B.1 built 2026-10-15; B.2's first PR built 2026-10-15.** Each
+other part gets its detail pass when it is next. Seven parts, A–G, in the order below. Part E is the
+syscall-surface consolidation, planned separately in [`syscall-surface.md`](syscall-surface.md).
 
 ## Why
 
@@ -426,7 +426,12 @@ besides the `unsafe` blocks below.
   adds userspace's test code (about 90 findings, 18 of them undocumented `unsafe`), and five
   `no_std` binaries — `eshell`, `hello`, `heartbeat`, `clipboard-server`, `profile-server` — do
   not build as tests (E0152), so CI runs `--all-targets` with those five excluded and lints them
-  as they build. In the second PR.
+  as they build. In the second PR. The kernel's test targets hold 106 undocumented `unsafe`
+  blocks (`--lib --tests` on the host target, measured in PR #379's review).
+- **A `SAFETY` comment only on `unsafe` code**: `unnecessary_safety_comment` and
+  `unnecessary_safety_doc` denied, which flag 44 sites (PR #379's review) — several a
+  `// SAFETY:` on an `unsafe fn` that wants a `# Safety` section, some one-line `if … { unsafe
+  {…} }` the lint reads as the statement's. In the second PR, each judged.
 - **Two PRs**: the errors, the `unsafe` comments and the `SAFETY` exemption, reviewed with
   `/pr-review`; then the warnings, the test targets and `-D warnings`.
 

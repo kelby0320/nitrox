@@ -842,6 +842,7 @@ fn preempt_irqs_restore(prev: bool) {
 /// # Safety
 /// `obj` is a live, pinned `Thread`.
 unsafe fn resolve_root(obj: *mut ()) -> PhysAddr {
+    // SAFETY: this function's contract: `obj` is a live, pinned `Thread`.
     match unsafe { Thread::addr_space_root(obj) } {
         Some(root) => root,
         None => PhysAddr::new(BOOT_ROOT.load(Ordering::Relaxed)),
@@ -1187,7 +1188,11 @@ pub fn online_cpus() -> usize {
 /// the thread's next placement / steal / wake; a thread already running on a now-
 /// excluded CPU finishes its slice there and moves on its next reschedule (affinity is
 /// advisory for the in-flight slice). The caller pins `thread` via a held handle ref.
-pub fn set_thread_affinity(thread: *mut (), mask: u8) {
+///
+/// # Safety
+///
+/// `thread` points at a live `Thread`, pinned for the call by a reference the caller holds.
+pub unsafe fn set_thread_affinity(thread: *mut (), mask: u8) {
     let _g = SCHED.lock();
     // SAFETY: `thread` pins a live Thread (caller holds a handle ref); `SCHED` held.
     unsafe { Thread::set_cpu_mask(thread, mask) };
@@ -1602,45 +1607,54 @@ unsafe fn obj_type(obj: *mut ()) -> KObjectType {
 /// Is this waitable currently signaled? (Timer deadline elapsed / channel non-empty.)
 /// # Safety: live waitable, `SCHED` held.
 unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
-    match unsafe { obj_type(obj) } {
-        KObjectType::Timer => unsafe { Timer::already_signaled(obj, now) },
-        KObjectType::NotificationChannel => unsafe { NotificationChannel::already_signaled(obj) },
-        KObjectType::IpcChannel => unsafe { IpcChannel::already_signaled(obj) },
-        KObjectType::PendingOperation => unsafe { PendingOperation::already_signaled(obj) },
-        KObjectType::InterruptObject => unsafe { InterruptObject::already_signaled(obj) },
-        _ => false,
+    // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
+    // `SCHED` is held.
+    unsafe {
+        match obj_type(obj) {
+            KObjectType::Timer => Timer::already_signaled(obj, now),
+            KObjectType::NotificationChannel => NotificationChannel::already_signaled(obj),
+            KObjectType::IpcChannel => IpcChannel::already_signaled(obj),
+            KObjectType::PendingOperation => PendingOperation::already_signaled(obj),
+            KObjectType::InterruptObject => InterruptObject::already_signaled(obj),
+            _ => false,
+        }
     }
 }
 
 /// Register the current thread as a waiter. `Err` over the object's reserve.
 /// # Safety: live waitable, `SCHED` held.
 unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
-    match unsafe { obj_type(obj) } {
-        KObjectType::Timer => unsafe { Timer::add_waiter(obj, th) },
-        KObjectType::NotificationChannel => unsafe { NotificationChannel::add_waiter(obj, th) },
-        KObjectType::IpcChannel => unsafe { IpcChannel::add_waiter(obj, th) },
-        KObjectType::PendingOperation => unsafe { PendingOperation::add_waiter(obj, th) },
-        KObjectType::InterruptObject => unsafe { InterruptObject::add_waiter(obj, th) },
-        _ => Err(()),
+    // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
+    // `SCHED` is held.
+    unsafe {
+        match obj_type(obj) {
+            KObjectType::Timer => Timer::add_waiter(obj, th),
+            KObjectType::NotificationChannel => NotificationChannel::add_waiter(obj, th),
+            KObjectType::IpcChannel => IpcChannel::add_waiter(obj, th),
+            KObjectType::PendingOperation => PendingOperation::add_waiter(obj, th),
+            KObjectType::InterruptObject => InterruptObject::add_waiter(obj, th),
+            _ => Err(()),
+        }
     }
 }
 
 /// Unregister a waiter (idempotent).
 /// # Safety: live waitable, `SCHED` held.
 unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
-    match unsafe { obj_type(obj) } {
-        KObjectType::Timer => unsafe { Timer::remove_waiter(obj, th) },
-        KObjectType::NotificationChannel => unsafe { NotificationChannel::remove_waiter(obj, th) },
-        KObjectType::IpcChannel => unsafe { IpcChannel::remove_waiter(obj, th) },
-        KObjectType::PendingOperation => unsafe { PendingOperation::remove_waiter(obj, th) },
-        KObjectType::InterruptObject => unsafe { InterruptObject::remove_waiter(obj, th) },
-        _ => {}
+    // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
+    // `SCHED` is held.
+    unsafe {
+        match obj_type(obj) {
+            KObjectType::Timer => Timer::remove_waiter(obj, th),
+            KObjectType::NotificationChannel => NotificationChannel::remove_waiter(obj, th),
+            KObjectType::IpcChannel => IpcChannel::remove_waiter(obj, th),
+            KObjectType::PendingOperation => PendingOperation::remove_waiter(obj, th),
+            KObjectType::InterruptObject => InterruptObject::remove_waiter(obj, th),
+            _ => {}
+        }
     }
 }
 
-/// Wake every thread blocked on `channel` (its queue just went non-empty).
-/// Caller holds `SCHED`. No allocation, no blocking — safe from the fault path.
-/// Mirrors [`fire_timer`]'s waiter-drain.
 /// Ask `process` to exit: enqueue [`KIND_TERMINATE_REQUESTED`] on **its own**
 /// notification channel and wake anything blocked there (§11h).
 ///
@@ -1652,7 +1666,11 @@ unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
 ///
 /// `false` when the target has no notification channel attached — it can never be asked,
 /// which the caller reports rather than silently succeeding at.
-pub fn request_terminate(process: *mut ()) -> bool {
+///
+/// # Safety
+///
+/// `process` points at a live `Process`, pinned for the call by a reference the caller holds.
+pub unsafe fn request_terminate(process: *mut ()) -> bool {
     let mut g = SCHED.lock();
     // SAFETY: the caller pins `process` through its Process handle for this call.
     let chan = unsafe { &*(process as *const crate::object::Process) }.notification_channel_ptr();
@@ -1665,6 +1683,9 @@ pub fn request_terminate(process: *mut ()) -> bool {
     true
 }
 
+/// Wake every thread blocked on `channel` (its queue just went non-empty).
+/// Caller holds `SCHED`. No allocation, no blocking — safe from the fault path.
+/// Mirrors [`fire_timer`]'s waiter-drain.
 fn signal_channel(g: &mut SchedState, channel: *mut ()) {
     let mut buf = [core::ptr::null_mut(); NotificationChannel::MAX_WAITERS];
     // SAFETY: live channel, `SCHED` held — drains its waiter list.
@@ -1739,7 +1760,11 @@ fn signal_pending_op_with_result(g: &mut SchedState, po: *mut (), status: i32, r
 /// values are stable after the one-shot completion, but the lock is taken to
 /// honor the accessor contract (and to read both under one hold). The caller's
 /// handle pins `po` for the duration.
-pub fn pending_op_completion(po: *mut ()) -> (i32, u64) {
+///
+/// # Safety
+///
+/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
+pub unsafe fn pending_op_completion(po: *mut ()) -> (i32, u64) {
     let _g = SCHED.lock();
     // SAFETY: `po` is a live `PendingOperation` pinned by the caller's handle;
     // `SCHED` held — both reads see the same one-shot-stable completion.
@@ -1752,7 +1777,11 @@ pub fn pending_op_completion(po: *mut ()) -> (i32, u64) {
 /// resolution finished synchronously, so the PO is completed in place. The PO has
 /// no waiters yet (it was just created), so the wake loop is a no-op; the caller's
 /// later `sys_wait` takes the already-signalled fast path. One-shot.
-pub fn complete_pending_op(po: *mut (), status: i32, result: u64) {
+///
+/// # Safety
+///
+/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
+pub unsafe fn complete_pending_op(po: *mut (), status: i32, result: u64) {
     let mut g = SCHED.lock();
     signal_pending_op_with_result(&mut g, po, status, result);
 }
@@ -1763,7 +1792,11 @@ pub fn complete_pending_op(po: *mut (), status: i32, result: u64) {
 /// so it is callable from a DPC handler (interrupt-dispatch tail) — the path a
 /// device ISR's completion takes. No allocation, no blocking, no `ObjectRef`
 /// drop. The caller's reference (or a registered handler) pins `irq`.
-pub fn signal_interrupt(irq: *mut ()) {
+///
+/// # Safety
+///
+/// `irq` points at a live `InterruptObject`, pinned for the call by a reference the caller holds.
+pub unsafe fn signal_interrupt(irq: *mut ()) {
     let mut g = SCHED.lock();
     // SAFETY: live `InterruptObject`, `SCHED` held — latches a pending interrupt.
     unsafe { InterruptObject::signal(irq) };
@@ -1786,7 +1819,11 @@ pub fn signal_interrupt(irq: *mut ()) {
 /// for an [`InterruptObject`], so a driver's wait→service→wait loop wakes once
 /// per interrupt. Takes `SCHED` (the accessor contract). The caller's handle
 /// pins `irq`.
-pub fn interrupt_consume(irq: *mut ()) {
+///
+/// # Safety
+///
+/// `irq` points at a live `InterruptObject`, pinned for the call by a reference the caller holds.
+pub unsafe fn interrupt_consume(irq: *mut ()) {
     let _g = SCHED.lock();
     // SAFETY: live `InterruptObject` pinned by the caller's handle; `SCHED` held.
     unsafe { InterruptObject::consume(irq) };
@@ -1794,7 +1831,11 @@ pub fn interrupt_consume(irq: *mut ()) {
 
 /// `true` iff `irq` (an [`InterruptObject`]) has an unconsumed pending interrupt.
 /// Takes `SCHED` (the accessor contract). Used by the boot self-test.
-pub fn interrupt_pending(irq: *mut ()) -> bool {
+///
+/// # Safety
+///
+/// `irq` points at a live `InterruptObject`, pinned for the call by a reference the caller holds.
+pub unsafe fn interrupt_pending(irq: *mut ()) -> bool {
     let _g = SCHED.lock();
     // SAFETY: live `InterruptObject` pinned by the caller's reference; `SCHED` held.
     unsafe { InterruptObject::already_signaled(irq) }
@@ -1803,7 +1844,11 @@ pub fn interrupt_pending(irq: *mut ()) -> bool {
 /// `true` iff `po` (a [`PendingOperation`]) has completed. Takes `SCHED` (the
 /// accessor contract); used by a boot self-test to poll for an async completion
 /// without a thread to `sys_wait`.
-pub fn pending_op_is_signaled(po: *mut ()) -> bool {
+///
+/// # Safety
+///
+/// `po` points at a live `PendingOperation`, pinned for the call by a reference the caller holds.
+pub unsafe fn pending_op_is_signaled(po: *mut ()) -> bool {
     let _g = SCHED.lock();
     // SAFETY: live `PendingOperation` pinned by the caller's reference; `SCHED` held.
     unsafe { PendingOperation::already_signaled(po) }
@@ -1815,7 +1860,11 @@ pub fn pending_op_is_signaled(po: *mut ()) -> bool {
 /// already copied the message in from user memory (no copy under the lock). On
 /// `Full`/`PeerClosed` the `transfers` are left with the caller (untaken), to be
 /// dropped **outside** `SCHED`. Returns the [`SendOutcome`].
-pub fn ipc_send_push(
+///
+/// # Safety
+///
+/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
+pub unsafe fn ipc_send_push(
     endpoint: *mut (),
     msg: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
@@ -1851,17 +1900,6 @@ pub enum ForwardOutcome {
     PeerClosed,
 }
 
-/// Originate a forwarded namespace lookup: under one `SCHED` hold, reserve the
-/// registration's (single) pending-lookup slot — assigning a `request_id` and
-/// recording the lookup `po` / `owner_pid` / requested `Rights` — stamp that id
-/// into the already-built `Namespace::Resolve` request `msg`, and push the request
-/// into the server's inbox (the peer of the registration's kernel endpoint),
-/// waking the server's blocked receivers. The lookup PO is left **uncompleted**
-/// (the server's reply completes it later, inline in its send — see
-/// [`us_forward_take_pending`]). On `Busy` nothing was reserved; on `Full` /
-/// `PeerClosed` the reserved slot is rolled back and its `po` clone dropped
-/// outside `SCHED`. `reg` is the [`UserspaceServerReg`] the lookup resolved to;
-/// the caller pins it (and `po`) for the call.
 /// Push a **fire-and-forget** message into a registration's server inbox: no pending slot,
 /// no `request_id`, no reply expected. `true` if it was queued.
 ///
@@ -1870,7 +1908,12 @@ pub enum ForwardOutcome {
 /// reserved, so nothing needs rolling back: a full ring or a dead server just drops the
 /// notification, which degrades to the behaviour that existed before it (a stale `mtime`)
 /// rather than failing the caller's `sys_file_sync`, whose data is already on the device.
-pub fn us_forward_notify(reg: *mut (), msg: &mut StoredMsg) -> bool {
+///
+/// # Safety
+///
+/// `reg` points at a live `UserspaceServerReg`, pinned for the call by a reference the caller
+/// holds.
+pub unsafe fn us_forward_notify(reg: *mut (), msg: &mut StoredMsg) -> bool {
     let mut g = SCHED.lock();
     // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED` held, so
     // the registration's kernel endpoint is pinned with it.
@@ -1892,7 +1935,23 @@ pub fn us_forward_notify(reg: *mut (), msg: &mut StoredMsg) -> bool {
     }
 }
 
-pub fn us_forward_originate(
+/// Originate a forwarded namespace lookup: under one `SCHED` hold, reserve the
+/// registration's (single) pending-lookup slot — assigning a `request_id` and
+/// recording the lookup `po` / `owner_pid` / requested `Rights` — stamp that id
+/// into the already-built `Namespace::Resolve` request `msg`, and push the request
+/// into the server's inbox (the peer of the registration's kernel endpoint),
+/// waking the server's blocked receivers. The lookup PO is left **uncompleted**
+/// (the server's reply completes it later, inline in its send — see
+/// [`us_forward_take_pending`]). On `Busy` nothing was reserved; on `Full` /
+/// `PeerClosed` the reserved slot is rolled back and its `po` clone dropped
+/// outside `SCHED`. `reg` is the [`UserspaceServerReg`] the lookup resolved to;
+/// the caller pins it (and `po`) for the call.
+///
+/// # Safety
+///
+/// `reg` points at a live `UserspaceServerReg`, pinned for the call by a reference the caller
+/// holds.
+pub unsafe fn us_forward_originate(
     reg: *mut (),
     msg: &mut StoredMsg,
     po: &ObjectRef,
@@ -1949,7 +2008,12 @@ pub fn us_forward_originate(
 /// on `Full` / `PeerClosed` the reserved slot is rolled back and its references
 /// dropped outside `SCHED`. `reg` is the [`UserspaceServerReg`] the faulted
 /// `FileObject`'s producer points at; the caller pins it (and `po` / `file_obj`).
-pub fn us_forward_originate_fill(
+///
+/// # Safety
+///
+/// `reg` points at a live `UserspaceServerReg`, pinned for the call by a reference the caller
+/// holds.
+pub unsafe fn us_forward_originate_fill(
     reg: *mut (),
     msg: &mut StoredMsg,
     po: &ObjectRef,
@@ -1997,22 +2061,32 @@ pub fn us_forward_originate_fill(
 /// `File::ReadRange` reply's, for the caller to land (copy the bytes into the
 /// frame, mark the page ready, complete the PO). `None` if it does not correlate
 /// (duplicate / stale). Takes `SCHED`; the returned [`PendingFill`]'s `po` /
-/// `file_obj` are dropped by the caller **outside** `SCHED`. The caller pins `reg`
-/// (via the send's endpoint peer, valid for the call).
-pub fn us_forward_take_pending_fill(reg: *mut (), request_id: u64) -> Option<PendingFill> {
+/// `file_obj` are dropped by the caller **outside** `SCHED`. The caller pins `reg`: the
+/// reference [`us_forward_reg_for_send`] returned.
+///
+/// # Safety
+///
+/// `reg` points at a live `UserspaceServerReg`, pinned for the call by a reference the caller
+/// holds.
+pub unsafe fn us_forward_take_pending_fill(reg: *mut (), request_id: u64) -> Option<PendingFill> {
     let _g = SCHED.lock();
-    // SAFETY: `reg` is a live registration (pinned through the live peer endpoint);
-    // `SCHED` held.
+    // SAFETY: `reg` is a live registration the caller's reference pins; `SCHED` held.
     unsafe { UserspaceServerReg::take_pending_fill_matching(reg, request_id) }
 }
 
 /// If a send on `send_endpoint` targets the kernel's end of a Userspace Server
 /// channel — i.e. its **peer** carries a
 /// [`UserspaceServerReg`](crate::object::UserspaceServerReg) back-pointer — return
-/// that registration (the send is a forwarded-lookup *reply* the kernel completes
-/// inline). `None` for an ordinary channel send or a closed peer. Takes `SCHED`
-/// (the accessor contract). The caller pins `send_endpoint` (its send handle).
-pub fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<*mut ()> {
+/// a new reference to that registration (the send is a forwarded-lookup *reply* the kernel
+/// completes inline). `None` for an ordinary channel send, a closed peer, or a registration
+/// already being destroyed. Acquired under `SCHED`: the back-pointer is uncounted, and once
+/// `SCHED` is released another CPU may drop the registration's last binding.
+///
+/// # Safety
+///
+/// `send_endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller
+/// holds.
+pub unsafe fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<ObjectRef> {
     let _g = SCHED.lock();
     // SAFETY: `send_endpoint` is pinned by the caller; `SCHED` held.
     let peer = unsafe { IpcChannel::peer_of(send_endpoint) };
@@ -2021,7 +2095,12 @@ pub fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<*mut ()> {
     }
     // SAFETY: `peer` is the surviving endpoint (the kernel end); `SCHED` held.
     let reg = unsafe { IpcChannel::us_reg_of(peer) };
-    if reg.is_null() { None } else { Some(reg) }
+    if reg.is_null() {
+        return None;
+    }
+    // SAFETY: a registration clears this back-pointer under `SCHED` before it is freed, so
+    // `reg` is whole while `SCHED` is held; `try_acquire` refuses one already at zero.
+    unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) }
 }
 
 /// Detach a dying [`UserspaceServerReg`] from its endpoint, completing anything
@@ -2039,7 +2118,11 @@ pub fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<*mut ()> {
 ///
 /// Takes `SCHED`, which is sound for the same reason `ipc_endpoint_closing` may:
 /// registration references are released only outside `SCHED`.
-pub fn us_reg_detach(reg: *mut ()) {
+///
+/// # Safety
+///
+/// `reg` is the `UserspaceServerReg` being dropped: its memory whole, its last reference gone.
+pub unsafe fn us_reg_detach(reg: *mut ()) {
     let mut g = SCHED.lock();
     // SAFETY: called from `Drop` with the last reference gone but the object whole;
     // `SCHED` held, satisfying the accessor contract.
@@ -2073,12 +2156,18 @@ pub fn us_reg_detach(reg: *mut ()) {
 /// Record the endpoint → registration back-pointer that makes `endpoint` the
 /// kernel's end of a Userspace Server channel: a reply sent to it (by the server,
 /// on its peer) is then completed inline rather than enqueued. Called by
-/// `sys_ns_bind` once the `UserspaceServer` binding owns the registration. Takes
-/// `SCHED` (the accessor contract). The caller pins `endpoint` (its bound handle).
-pub fn us_server_attach(endpoint: *mut (), reg: *mut ()) {
+/// `sys_ns_bind` once the `UserspaceServer` binding owns the registration, with a reference of
+/// its own still held: an unbind on another thread may drop the binding's. Takes `SCHED` (the
+/// accessor contract). The caller pins `endpoint` (its bound handle).
+///
+/// # Safety
+///
+/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds,
+/// and `reg` is a `UserspaceServerReg`.
+pub unsafe fn us_server_attach(endpoint: *mut (), reg: &ObjectRef) {
     let _g = SCHED.lock();
     // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
-    unsafe { IpcChannel::set_us_reg(endpoint, reg) };
+    unsafe { IpcChannel::set_us_reg(endpoint, reg.as_ptr()) };
 }
 
 /// If `endpoint` already backs a Userspace Server registration, return a **new owned
@@ -2089,7 +2178,11 @@ pub fn us_server_attach(endpoint: *mut (), reg: *mut ()) {
 /// registration is what keeps reply routing correct: the endpoint→reg back-pointer
 /// stays a single, consistent target rather than being clobbered by a rival reg.
 /// Takes `SCHED`; the caller pins `endpoint` (its bound handle).
-pub fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
+///
+/// # Safety
+///
+/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
+pub unsafe fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
     let _g = SCHED.lock();
     // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
     let reg = unsafe { IpcChannel::us_reg_of(endpoint) };
@@ -2117,11 +2210,15 @@ pub fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
 /// reply's, for the caller to complete (cross-context install + signal). `None`
 /// if the reply does not correlate (duplicate / stale). Takes `SCHED`; the
 /// returned [`PendingLookup`]'s `po` is dropped by the caller **outside** `SCHED`.
-/// The caller pins `reg` (via the send's endpoint peer, valid for the call).
-pub fn us_forward_take_pending(reg: *mut (), request_id: u64) -> Option<PendingLookup> {
+/// The caller pins `reg`: the reference [`us_forward_reg_for_send`] returned.
+///
+/// # Safety
+///
+/// `reg` points at a live `UserspaceServerReg`, pinned for the call by a reference the caller
+/// holds.
+pub unsafe fn us_forward_take_pending(reg: *mut (), request_id: u64) -> Option<PendingLookup> {
     let _g = SCHED.lock();
-    // SAFETY: `reg` is a live registration (pinned through the live peer endpoint);
-    // `SCHED` held.
+    // SAFETY: `reg` is a live registration the caller's reference pins; `SCHED` held.
     unsafe { UserspaceServerReg::take_pending_matching(reg, request_id) }
 }
 
@@ -2137,7 +2234,11 @@ pub fn us_forward_take_pending(reg: *mut (), request_id: u64) -> Option<PendingL
 /// `u64::MAX` for plain `Block` (no deadline). On a `Queued` outcome with a finite
 /// deadline, a `PendingSend` deadline-heap entry is registered against the PO (so
 /// the timer tick can time the held message out — see `fire_expired_deadlines`).
-pub fn ipc_send_push_blocking(
+///
+/// # Safety
+///
+/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
+pub unsafe fn ipc_send_push_blocking(
     endpoint: *mut (),
     msg: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
@@ -2184,7 +2285,11 @@ pub fn ipc_send_push_blocking(
 
 /// Inspect `endpoint`'s receive side under `SCHED` without dequeuing — so the
 /// empty-poll `WouldBlock` path allocates no bounce buffer.
-pub fn ipc_recv_peek(endpoint: *mut ()) -> RecvState {
+///
+/// # Safety
+///
+/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
+pub unsafe fn ipc_recv_peek(endpoint: *mut ()) -> RecvState {
     let _g = SCHED.lock();
     // SAFETY: the caller holds an `ObjectRef` pinning `endpoint`; `SCHED` held.
     unsafe { IpcChannel::recv_peek(endpoint) }
@@ -2207,7 +2312,11 @@ pub fn ipc_recv_peek(endpoint: *mut ()) -> RecvState {
 /// (and dropping its pending-send deadline). Returns `(popped, promoted_po)`; the
 /// `promoted_po` and the `reclaimed` entries are released by the caller outside
 /// `SCHED`.
-pub fn ipc_recv_pop_into(
+///
+/// # Safety
+///
+/// `endpoint` points at a live `IpcChannel`, pinned for the call by a reference the caller holds.
+pub unsafe fn ipc_recv_pop_into(
     endpoint: *mut (),
     dst: &mut StoredMsg,
     out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
@@ -2237,7 +2346,11 @@ pub fn ipc_recv_pop_into(
 /// [`IpcChannel::drop`](crate::object::IpcChannel) — see that type's docs for
 /// the no-use-after-free argument and the "refs released only outside `SCHED`"
 /// invariant that makes taking the lock here sound.
-pub fn ipc_endpoint_closing(endpoint: *mut ()) {
+///
+/// # Safety
+///
+/// `endpoint` is the `IpcChannel` being dropped: its memory whole, its last reference gone.
+pub unsafe fn ipc_endpoint_closing(endpoint: *mut ()) {
     let mut g = SCHED.lock();
     // SAFETY: `endpoint` is the object being dropped (still valid memory);
     // `SCHED` held.
@@ -2414,6 +2527,7 @@ unsafe fn switch_into(
     // SAFETY: `next_obj` is pinned (now `current`) and `SCHED` is still held
     // here, satisfying the Thread accessor contract for these reads.
     let next_sp = unsafe { Thread::saved_sp(next_obj) };
+    // SAFETY: as above.
     let next_root = unsafe { resolve_root(next_obj) };
     // Record the CPU this thread is about to run on, so a later wake re-homes it here
     // (cache-warm, minimal migration). SAFETY: `next_obj` pinned (now current); `SCHED`
@@ -2428,6 +2542,7 @@ unsafe fn switch_into(
     // invariant; see `Thread::on_cpu` and `steal_one`).
     // SAFETY: `out_obj` is the pinned outgoing thread; `SCHED` still held.
     unsafe { Thread::set_on_cpu(out_obj, true) };
+    // SAFETY: as above.
     let out_on_cpu = unsafe { Thread::on_cpu_ptr(out_obj) };
     // Drop the lock but keep interrupts masked across the switch. `saved_if`
     // is this thread's prior interrupt state, restored when it next resumes.
@@ -2521,6 +2636,7 @@ fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
         Thread::set_state(prev_obj, ThreadState::Blocked);
         Thread::set_state(next_obj, ThreadState::Running);
     }
+    // SAFETY: as above.
     let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
 
     // Park prev in `blocked` (NOT ready/idle) — its `ObjectRef` keeps it alive.
@@ -2598,7 +2714,13 @@ pub enum WaitResult {
 ///
 /// Registration + block happen under a single `SCHED` hold, so a waker cannot
 /// slip between them (single-CPU, interrupts masked) — no lost wakeup.
-pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
+///
+/// # Safety
+///
+/// Each of `objs` is the address of a live `Timer`, `NotificationChannel`, `IpcChannel`,
+/// `PendingOperation` or `InterruptObject`, pinned by a reference the caller holds until this
+/// returns.
+pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
     debug_assert!(objs.len() <= MAX_WAIT_HANDLES);
     let me_ptr;
     {
@@ -2702,12 +2824,17 @@ pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
 /// Arm (or, with `deadline_ns == 0`, disarm) a timer: set its
 /// deadline/interval and (re)insert its deadline-heap entry. `deadline_ns` is
 /// absolute monotonic ns. Returns `Err(())` if the heap is at reserve.
-pub fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
+///
+/// # Safety
+///
+/// `timer` points at a live `Timer`, pinned for the call by a reference the caller holds.
+pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
     let mut g = SCHED.lock();
     // Drop any stale heap entry (re-arm).
     // SAFETY: live Timer (caller holds its `ObjectRef`), `SCHED` held.
     if unsafe { Timer::in_heap(timer) } {
         deadline::remove(&mut g.deadlines, timer as usize, deadline::DeadlineKind::Timer);
+        // SAFETY: as above.
         unsafe { Timer::set_in_heap(timer, false) };
     }
     // SAFETY: live Timer, `SCHED` held.
@@ -2772,6 +2899,7 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
         Thread::set_state(prev_obj, ThreadState::Ready);
         Thread::set_state(next_obj, ThreadState::Running);
     }
+    // SAFETY: as above.
     let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
 
     // Re-home prev: the idle thread parks in its slot (never in `ready`); every
@@ -2940,6 +3068,7 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     // SAFETY: `me` is the running thread, pinned, lock held. (The idle thread
     // never exits, so `me` is never the idle thread.)
     unsafe { Thread::set_state(me_obj, ThreadState::Exited) };
+    // SAFETY: as above.
     let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
     // Park self for deferred reclamation.
     push_reserved(g.reap_slot(), me, "reap list (self)");
@@ -3145,6 +3274,7 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
             Thread::set_exception_frame(me_obj, frame_ptr);
             Thread::set_state(me_obj, ThreadState::Suspended);
         }
+        // SAFETY: as above.
         let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
         push_reserved(&mut g.suspended, me, "suspended list");
 
@@ -3192,7 +3322,11 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
 /// `false` (no-op) if `thread` is not currently `Suspended` — the backstop
 /// `sys_exception_resume` maps to `InvalidArgument`. Caller need not hold
 /// `SCHED` (taken here).
-pub fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
+///
+/// # Safety
+///
+/// `thread` points at a live `Thread`, pinned for the call by a reference the caller holds.
+pub unsafe fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
     let mut g = SCHED.lock();
     let Some(i) = g.suspended.iter().position(|r| r.as_ptr() == thread) else {
         return false;
@@ -3240,7 +3374,11 @@ pub fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
 /// if it is not currently `Suspended`. Used by `sys_thread_get_registers`; the
 /// thread stays parked while suspended, so the frame is stable to read after
 /// this returns (the caller drops `SCHED` before the user copy-out).
-pub fn thread_exception_frame(thread: *mut ()) -> Option<usize> {
+///
+/// # Safety
+///
+/// `thread` points at a live `Thread`, pinned for the call by a reference the caller holds.
+pub unsafe fn thread_exception_frame(thread: *mut ()) -> Option<usize> {
     let _g = SCHED.lock();
     // SAFETY: the caller pins `thread` via its Thread handle; `SCHED` held.
     if unsafe { Thread::state_now(thread) } != ThreadState::Suspended {
@@ -3384,10 +3522,13 @@ fn vruntime_delta(nice: i8) -> u64 {
 /// # Safety
 /// `obj` is a live, pinned `Thread`; the caller holds `SCHED`.
 unsafe fn sched_key(obj: *mut ()) -> (u8, u8, u64) {
-    match unsafe { Thread::sched_class(obj) } {
-        SchedClass::RealTime => (0, unsafe { Thread::rt_priority(obj) }, 0),
-        SchedClass::TimeShared => (1, 0, unsafe { Thread::vruntime(obj) }),
-        SchedClass::Idle => (2, 0, u64::MAX),
+    // SAFETY: this function's contract: `obj` is a live, pinned `Thread`, and `SCHED` is held.
+    unsafe {
+        match Thread::sched_class(obj) {
+            SchedClass::RealTime => (0, Thread::rt_priority(obj), 0),
+            SchedClass::TimeShared => (1, 0, Thread::vruntime(obj)),
+            SchedClass::Idle => (2, 0, u64::MAX),
+        }
     }
 }
 
@@ -3541,6 +3682,7 @@ fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
 fn pick_wake_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let home = unsafe { Thread::last_cpu(obj) } as usize;
+    // SAFETY: as above.
     let mask = unsafe { Thread::cpu_mask(obj) };
     if home < MAX_CPUS
         && cpu_accepts_work(g, home, online)
@@ -3659,6 +3801,7 @@ unsafe fn stealable_to(obj: *mut (), me: usize) -> bool {
     // stale/garbage frame and double-run it. It stays on the victim's queue and
     // becomes stealable on the next round once the switch completes (the SMP
     // `on_cpu` invariant; see `Thread::on_cpu` / `switch_into`).
+    // SAFETY: this function's contract: `obj` is a live, pinned `Thread`, and `SCHED` is held.
     unsafe { !Thread::is_on_cpu(obj) && Thread::cpu_mask(obj) & (1 << me) != 0 }
 }
 
@@ -3773,7 +3916,12 @@ pub fn current_tid() -> u32 {
 /// Pop one notification from `channel` under `SCHED` (or synthesize a dropped
 /// notice). The lock-guarded core of `sys_notif_recv` and the in-kernel
 /// supervisor; the caller copies the result out **after** this returns.
-pub fn notif_try_recv(channel: *mut ()) -> Option<Notification> {
+///
+/// # Safety
+///
+/// `channel` points at a live `NotificationChannel`, pinned for the call by a reference the caller
+/// holds.
+pub unsafe fn notif_try_recv(channel: *mut ()) -> Option<Notification> {
     let _g = SCHED.lock();
     // SAFETY: the caller holds an `ObjectRef` pinning the channel; SCHED held.
     unsafe { NotificationChannel::try_recv(channel) }
@@ -3881,6 +4029,7 @@ fn park_reaper() {
         Thread::set_state(me_obj, ThreadState::Blocked);
         Thread::set_state(next_obj, ThreadState::Running);
     }
+    // SAFETY: as above.
     let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
     // Park in the reaper slot — not `blocked`, so no generic waker can find it, and not
     // `ready`, so it does not spin. `wake_reaper` is the only way back.
@@ -3942,7 +4091,9 @@ pub(crate) extern "C" fn thread_enter() -> ! {
         // SAFETY: `current` is pinned alive and we hold the lock.
         match unsafe { Thread::user_entry(obj) } {
             Some((entry, user_sp)) => {
+                // SAFETY: as above.
                 let ktop = unsafe { Thread::kstack_top(obj) }.expect("a user thread has a kernel stack");
+                // SAFETY: as above.
                 let boot = unsafe { Thread::user_boot_args(obj) };
                 Some((entry, user_sp, ktop, boot))
             }

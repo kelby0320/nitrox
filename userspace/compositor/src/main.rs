@@ -1049,8 +1049,8 @@ fn connect_input(root_ns: u64) -> Option<u64> {
     use libkern::handle::{RawHandle, Rights};
     use libos::{Handle, Namespace, NsReadOnly, Only, Resource, block_on};
 
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run;
-    // `borrow` never closes it.
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run; `borrow`
+    // never closes it.
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: `/dev/input/new` resolves to a channel endpoint — the input server mints one
     // consumer per resolve, exactly as `/dev/draw/new` mints one session.
@@ -1717,6 +1717,8 @@ enum Served {
 fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
     // SAFETY: reading our own manager slot and valid recv out-params.
     let ch = unsafe { MANAGER_CH };
+    // SAFETY: the recv buffers are this process's statics, only touched from this loop, and the
+    // kernel fills them on return
     let rr = unsafe {
         syscall4(
             SYS_CHANNEL_RECV,
@@ -1782,9 +1784,9 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
         // Handled here rather than in `manager::dispatch`, which is given a `WindowStack` and
         // nothing else: this needs the handle, the pixel source, and syscalls to map with.
         let ok = do_capture(srv, ch, request_id, &body, carried);
-        // SAFETY: the object was installed in this process's table by the recv above; the
-        // capture has finished with it either way.
         if carried != 0 {
+            // SAFETY: the object was installed in this process's table by the recv above; the
+            // capture has finished with it either way
             unsafe { syscall4(SYS_HANDLE_CLOSE, carried, 0, 0, 0) };
         }
         return ok;
@@ -2249,6 +2251,7 @@ fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -
 
 /// Serve one request on session `slot`, if one is queued.
 fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
+    // SAFETY: SESSION_CH is only written by this single-threaded loop, and `slot` indexes it in bounds
     let ch = unsafe { SESSION_CH[slot] };
     // SAFETY: valid recv out-params.
     let rr = unsafe {
@@ -2275,6 +2278,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
     // `SetTitle` fits — this `min` is a bounds check, not a policy, and when it *was* a policy
     // it silently shortened titles to 60 bytes.
     let mut body_buf = [0u8; MAX_BODY];
+    // SAFETY: RECV_MSG and RECV_HANDLES were filled by the recv in the caller; the slice is clamped to the payload
+    // region and is copied out before anything else touches the statics
     let (op, request_id, body_len, handle) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
@@ -2571,10 +2576,10 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
 
     match outcome {
         Outcome::Reply(len) => {
-            // SAFETY: `dispatch` wrote `len` bytes at this offset in REPLY_MSG. Copy them
-            // out before `reply_on_session` re-encodes into the same buffer.
             let mut body = [0u8; MAX_BODY];
             let n = len.min(MAX_BODY);
+            // SAFETY: `dispatch` wrote `len` bytes at this offset in REPLY_MSG, and `n` is clamped to MAX_BODY; copy
+            // them out before `reply_on_session` re-encodes into the same buffer
             unsafe {
                 body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
             }
@@ -2592,10 +2597,10 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
             // The client is blocked in `Window::new` reading the reply for its id, and then
             // waits for the configure before it may commit — so sending them the other way
             // round would park every client at startup.
-            // SAFETY: `dispatch` wrote `reply_len` bytes at this offset in REPLY_MSG. Copy them
-            // out before `reply_on_session` re-encodes into the same buffer.
             let mut body = [0u8; MAX_BODY];
             let n = reply_len.min(MAX_BODY);
+            // SAFETY: `dispatch` wrote `reply_len` bytes at this offset in REPLY_MSG, and `n` is clamped to MAX_BODY;
+            // copy them out before `reply_on_session` re-encodes into the same buffer
             unsafe {
                 body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
             }

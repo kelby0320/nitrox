@@ -101,6 +101,7 @@ impl NotificationChannel {
         // `UnsafeCell`, then a `&mut Inner` through it, is the interior-
         // mutability contract — sound while `SCHED` serialises access.
         let c = unsafe { &*(obj as *const NotificationChannel) };
+        // SAFETY: as above.
         unsafe { &mut *c.inner.get() }
     }
 
@@ -113,6 +114,7 @@ impl NotificationChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn enqueue(obj: *mut (), n: Notification) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         // "Signaled" == queue non-empty OR a drop is pending. Report the edge so
         // waiters aren't double-woken when already wakeable.
@@ -143,6 +145,7 @@ impl NotificationChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn try_recv(obj: *mut ()) -> Option<Notification> {
+        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if inner.dropped > 0 {
             let count = inner.dropped;
@@ -158,6 +161,7 @@ impl NotificationChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn already_signaled(obj: *mut ()) -> bool {
+        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         !inner.queue.is_empty() || inner.dropped > 0
     }
@@ -168,6 +172,7 @@ impl NotificationChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
+        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if inner.waiters.len() < Self::MAX_WAITERS {
             inner
@@ -191,6 +196,7 @@ impl NotificationChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
+        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         if let Some(i) = inner.waiters.iter().position(|&w| w == thread) {
             inner.waiters.remove(i);
@@ -203,6 +209,7 @@ impl NotificationChannel {
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
+        // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
         let n = inner.waiters.len();
         debug_assert!(out.len() >= n);

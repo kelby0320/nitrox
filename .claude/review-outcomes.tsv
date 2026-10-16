@@ -54,3 +54,16 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-15	378	1900ba15	2	error-paths	optional	unverified	fixed	a0862b70	both filters run on the 12 build inputs; tests/workflows.rs
 2026-10-15	378	1900ba15	3	tests	optional	demonstrated	declined		both let-else forms are fixed points; --check holds either
 2026-10-15	378	1900ba15	4	rules-and-docs	optional	unverified	refuted		memory index already held the new entry alone
+2026-10-15	379	2fc6ac08	1	logic+architecture	worth-fixing	demonstrated	fixed	e433202b	sys_wait reads through refs; old order is E0382; replay showed PO freed first
+2026-10-15	379	2fc6ac08	2	logic+architecture	worth-fixing	demonstrated	fixed	e433202b	reg acquired under SCHED; a_reply_holds_the_registration_it_found; fails if adopted unacquired
+2026-10-15	379	2fc6ac08	3	architecture	worth-fixing	demonstrated	fixed	e433202b	clone held across us_server_attach(&ObjectRef); old order is E0382
+2026-10-15	379	2fc6ac08	4	architecture	worth-fixing	demonstrated	fixed	74d77197	8 pub deref-ing fns + complete_for_test unsafe; 72 sites; safe call is E0133
+2026-10-15	379	2fc6ac08	5	error-paths	worth-fixing	demonstrated	fixed	03911be6	--all-features everywhere, kernel also default; boot_selftest and nxterm probes fail only all-features
+2026-10-15	379	2fc6ac08	6	logic+error-paths+architecture	worth-fixing	demonstrated	fixed	dacc45d0	wrapped check on every new comment line; mutation fails its test
+2026-10-15	379	2fc6ac08	7	logic	worth-fixing	demonstrated	fixed	dacc45d0	removed lines carry old line numbers; a_removed_safety_comment_ends_at_its_hunk
+2026-10-15	379	2fc6ac08	8	tests+logic	worth-fixing	demonstrated	fixed	dacc45d0	gap, other-file and removed-side tests; both guard mutations caught
+2026-10-15	379	2fc6ac08	9	logic+error-paths+tests+rules-and-docs+architecture	worth-fixing	demonstrated	fixed	dacc45d0	tally's doc restored; sched siblings (us_forward_originate, signal_channel) in e433202b
+2026-10-15	379	2fc6ac08	10	logic+architecture	optional	demonstrated	fixed	74d77197	values bound before assert_eq!; clippy --tests flags none on PR lines
+2026-10-15	379	2fc6ac08	11	error-paths	optional	demonstrated	fixed	2c0613eb	34 comments: 22 waits read before check, 12 unchecked clock reads; libsession:1157 was true
+2026-10-15	379	2fc6ac08	12	rules-and-docs+architecture	optional	demonstrated	fixed	dacc45d0	capped at 5 lines (the finding's first guard); unnecessary_safety_comment (44 sites) in B.2 PR 2
+2026-10-15	379	2fc6ac08	13	error-paths	optional	unverified	fixed	f34af1a8	init both sites + storage-service spawn; test-qemu probe: open before, closed after

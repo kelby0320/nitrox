@@ -26,6 +26,7 @@ pub struct KBox<T> {
 // Moving the box between threads is sound when `T: Send`; sharing a
 // `&KBox` (which only yields `&T`) is sound when `T: Sync`.
 unsafe impl<T: Send> Send for KBox<T> {}
+// SAFETY: as above.
 unsafe impl<T: Sync> Sync for KBox<T> {}
 
 impl<T> KBox<T> {
@@ -152,7 +153,7 @@ impl<T> Drop for KBox<T> {
             // SAFETY: for a non-ZST the pointer came from `kmalloc`;
             // `kfree` recovers the size class from the slab descriptor,
             // so no layout needs to be threaded through.
-            kfree(self.ptr.as_ptr() as *mut u8);
+            unsafe { kfree(self.ptr.as_ptr() as *mut u8) };
         }
     }
 }

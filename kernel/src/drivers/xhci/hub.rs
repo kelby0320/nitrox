@@ -129,7 +129,8 @@ pub(super) extern "C" fn main(_arg: usize) {
     let mut attached: KVec<Option<Attached>> = KVec::new();
     if attached.try_reserve(x.max_ports as usize + 1).is_err() {
         crate::kprintln!("usb: no memory for the hub thread's ports; nothing is enumerated");
-        crate::sched::complete_pending_op(x.first_round.as_ptr(), 0, 0);
+        // SAFETY: `x.first_round` pins its `PendingOperation` for the controller's life.
+        unsafe { crate::sched::complete_pending_op(x.first_round.as_ptr(), 0, 0) };
         return;
     }
     while attached.push_within_capacity(None).is_ok() {}
@@ -162,7 +163,8 @@ pub(super) extern "C" fn main(_arg: usize) {
         found,
         crate::arch::Timer::read_ns().wrapping_sub(start) / 1_000_000
     );
-    crate::sched::complete_pending_op(x.first_round.as_ptr(), 0, found);
+    // SAFETY: `x.first_round` pins its `PendingOperation` for the controller's life.
+    unsafe { crate::sched::complete_pending_op(x.first_round.as_ptr(), 0, found) };
 
     // **Then every later change**, woken by the DPC. The wake latches, so changes that land while
     // a device is being enumerated are found by the scan after it.
@@ -172,8 +174,10 @@ pub(super) extern "C" fn main(_arg: usize) {
         // answering, including on an idle machine, where nothing else wakes this (PR #363 review).
         let now = crate::arch::Timer::read_ns();
         let until = super::storage::bound(now);
-        match crate::sched::wait_on(&[x.hub_wake.as_ptr() as usize], until.unwrap_or(u64::MAX), now) {
-            crate::sched::WaitResult::Signaled(_) => crate::sched::interrupt_consume(x.hub_wake.as_ptr()),
+        // SAFETY: `x.hub_wake` pins the `InterruptObject` for the controller's life.
+        match unsafe { crate::sched::wait_on(&[x.hub_wake.as_ptr() as usize], until.unwrap_or(u64::MAX), now) } {
+            // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
+            crate::sched::WaitResult::Signaled(_) => unsafe { crate::sched::interrupt_consume(x.hub_wake.as_ptr()) },
             _ if until.is_some() => {}
             _ => sleep(1_000_000),
         }
@@ -796,7 +800,8 @@ fn lights_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
                 }
             }
         };
-        crate::sched::complete_pending_op(po.as_ptr(), status, (status == 0) as u64);
+        // SAFETY: `po` pins the lights write's `PendingOperation`, dropped after this.
+        unsafe { crate::sched::complete_pending_op(po.as_ptr(), status, (status == 0) as u64) };
         drop(po);
     }
 }
@@ -837,7 +842,8 @@ pub(super) fn command(x: &Xhci, trb: Trb) -> Result<u8, Failed> {
 fn wait(x: &Xhci, po: &ObjectRef, bound_ns: u64) -> Option<(u8, u64)> {
     let now = crate::arch::Timer::read_ns();
     let done = matches!(
-        crate::sched::wait_on(&[po.as_ptr() as usize], now + bound_ns, now),
+        // SAFETY: `po` pins the `PendingOperation` waited on.
+        unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], now + bound_ns, now) },
         crate::sched::WaitResult::Signaled(_)
     );
     if !done {
@@ -845,13 +851,15 @@ fn wait(x: &Xhci, po: &ObjectRef, bound_ns: u64) -> Option<(u8, u64)> {
             return None;
         }
         while !matches!(
-            crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0),
+            // SAFETY: `po` pins the `PendingOperation` waited on.
+            unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) },
             crate::sched::WaitResult::Signaled(_)
         ) {
             sleep(1_000_000);
         }
     }
-    let (status, result) = crate::sched::pending_op_completion(po.as_ptr());
+    // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+    let (status, result) = unsafe { crate::sched::pending_op_completion(po.as_ptr()) };
     Some((status as u8, result))
 }
 
@@ -924,7 +932,8 @@ pub(super) fn input_bytes<'a>(input: &'a mut DmaBuffer, x: &Xhci) -> &'a mut [u8
 /// Sleep for `ns`: a wait on nothing with a deadline, so the CPU runs something else meanwhile.
 pub(super) fn sleep(ns: u64) {
     let now = crate::arch::Timer::read_ns();
-    let _ = crate::sched::wait_on(&[], now + ns, now);
+    // SAFETY: no objects: a sleep until the deadline.
+    let _ = unsafe { crate::sched::wait_on(&[], now + ns, now) };
 }
 
 /// Look every millisecond until `done`, or `bound_ns` passes. Whether it was done.

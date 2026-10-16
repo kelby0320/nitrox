@@ -182,6 +182,8 @@ fn recv_handoff(ctrl: u64) -> u64 {
             (&raw mut RECV_COUNT) as u64,
         )
     };
+    // SAFETY: this single-threaded process reads its own static; the count is used only once `rr`
+    // says the recv wrote it.
     let count = unsafe { (&raw const RECV_COUNT).read() };
     if rr != 0 || count < 1 {
         return 0;

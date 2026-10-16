@@ -218,6 +218,7 @@ pub type CharWrite =
 // structure that lives for the kernel's lifetime, touched only on the CPU
 // servicing the device; these impls let a `DeviceNode` holding one be `Send`/`Sync`.
 unsafe impl Send for CharBackend {}
+// SAFETY: as above.
 unsafe impl Sync for CharBackend {}
 
 /// A block device's addressable geometry. Meaningful only for [`DeviceClass::Block`]

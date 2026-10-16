@@ -4224,6 +4224,8 @@ fn serve_desktop_endpoint() {
     use librsproto::{OP_NS_RESOLVE, decode};
     // SAFETY: reading our own serve end into valid out-params.
     let serve = unsafe { DESKTOP_SERVE };
+    // SAFETY: DS_MSG, DS_HANDLES and DS_COUNT are this process's recv buffers, valid for writes and
+    // touched by one thread
     let rr = unsafe {
         syscall4(
             SYS_CHANNEL_RECV,

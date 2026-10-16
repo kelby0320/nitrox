@@ -221,9 +221,12 @@ impl SlabCache {
         obj
     }
 
-    /// Return one object to this cache. Caller asserts `ptr` was
-    /// previously handed out by this same cache's `alloc`.
-    pub fn free(&self, ptr: *mut u8) {
+    /// Return one object to this cache.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` was handed out by this same cache's `alloc` and is not used again.
+    pub unsafe fn free(&self, ptr: *mut u8) {
         let desc = ((ptr as usize) & SLAB_MASK) as *mut SlabDescriptor;
         let mut state = self.state.lock();
         // SAFETY: by the slab invariant the page header is a valid
@@ -430,7 +433,11 @@ pub fn kzalloc(size: usize, align: usize) -> *mut u8 {
 }
 
 /// Return memory to the slab. `kfree(null)` is a no-op.
-pub fn kfree(ptr: *mut u8) {
+///
+/// # Safety
+///
+/// `ptr` is null, or came from `kmalloc`, is not zero-sized, and is not used again.
+pub unsafe fn kfree(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
@@ -453,7 +460,8 @@ pub fn kfree(ptr: *mut u8) {
     // from a `&SlabCache` that lives in `SLAB_CACHES` (or in a test's
     // local array, which lives at least as long as the allocation).
     let cache = unsafe { &*owner };
-    cache.free(ptr);
+    // SAFETY: `ptr` came from this cache's `alloc`, as its descriptor's `owner` says.
+    unsafe { cache.free(ptr) };
 }
 
 /// Allocate a buddy block large enough to satisfy `size`/`align` plus
@@ -656,7 +664,8 @@ mod tests {
         let cache = fresh_cache(64);
         let a = cache.alloc(&pager);
         let b = cache.alloc(&pager);
-        cache.free(b);
+        // SAFETY: `b` came from this cache's `alloc`.
+        unsafe { cache.free(b) };
         let c = cache.alloc(&pager);
         assert_eq!(b, c, "LIFO push/pop should return the just-freed slot");
         // Keep `a` live to suppress unused-warning suspicion.
@@ -685,7 +694,8 @@ mod tests {
             ptrs.push(cache.alloc(&pager));
         }
         assert_eq!(cache.full_len(), 1);
-        cache.free(ptrs[0]);
+        // SAFETY: `ptrs[0]` came from this cache's `alloc`.
+        unsafe { cache.free(ptrs[0]) };
         assert_eq!(cache.full_len(), 0);
         assert_eq!(cache.partial_len(), 1);
     }
@@ -705,7 +715,8 @@ mod tests {
     fn kfree_null_is_noop() {
         // Doesn't touch the global SLAB_CACHES because owner-derefence
         // is short-circuited on null pointer. No panic, no segfault.
-        kfree(ptr::null_mut());
+        // SAFETY: null is a no-op.
+        unsafe { kfree(ptr::null_mut()) };
     }
 
     #[test]
@@ -751,7 +762,8 @@ mod tests {
         unsafe {
             ptr::write_bytes(p, 0xAA, 64);
         }
-        cache.free(p);
+        // SAFETY: `p` came from this cache's `alloc`.
+        unsafe { cache.free(p) };
         let q = cache.alloc(&pager);
         assert_eq!(p, q, "LIFO");
         // SAFETY: q is the same 64-byte slot.

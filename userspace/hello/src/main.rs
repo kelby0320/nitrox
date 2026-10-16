@@ -129,6 +129,7 @@ pub extern "C" fn _start() -> ! {
         // restrict the duplicate to INSPECT only, then close it.
         // SAFETY: valid syscalls operating on our own handle.
         let rr = unsafe { syscall2(SYS_HANDLE_RESTRICT, dup, RIGHT_INSPECT) };
+        // SAFETY: closing the duplicate handle we own
         let cr = unsafe { syscall1(SYS_HANDLE_CLOSE, dup) };
         if rr != 0 || cr != 0 {
             handle_ops_ok = false;
@@ -175,6 +176,8 @@ pub extern "C" fn _start() -> ! {
     // Read t0, arm for t0 + 50 ms (absolute monotonic, one-shot), wait on it.
     // SAFETY: CLOCK_BUF is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     let t0 = unsafe { (&raw const CLOCK_BUF).read() };
     let fire_at = t0 + 50_000_000; // +50 ms
     // SAFETY: arming our own timer handle.
@@ -187,7 +190,10 @@ pub extern "C" fn _start() -> ! {
     };
     // SAFETY: on success (waited == 1) the kernel wrote one IoResult.
     let woke_handle = unsafe { (&raw const WAIT_RESULTS.handle).read() };
+    // SAFETY: CLOCK_BUF is a writable u64 out-param
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     let t_after = unsafe { (&raw const CLOCK_BUF).read() };
     if sr == 0 && waited == 1 && woke_handle == th && t_after >= fire_at {
         kprint(b"timer: waited and woke ok\n");
@@ -196,9 +202,12 @@ pub extern "C" fn _start() -> ! {
     }
 
     // 4d. Poll an unset timer (deadline 0) — nothing ready → WouldBlock.
+    // SAFETY: register-only syscall creating a timer we own
     let th2 = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
     if th2 >= 0 {
         let th2 = th2 as u64;
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid statics owned by this thread; the zero
+        // deadline polls rather than blocks
         let pr = unsafe {
             WAIT_HANDLES[0] = th2;
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, 0)
@@ -210,9 +219,14 @@ pub extern "C" fn _start() -> ! {
         }
 
         // 4e. Pure timeout: arm far in the future, wait with a near deadline.
+        // SAFETY: CLOCK_BUF is a writable u64 out-param
         unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+        // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+        // leaves its last value.
         let now = unsafe { (&raw const CLOCK_BUF).read() };
+        // SAFETY: arming our own timer handle
         unsafe { syscall4(SYS_TIMER_SET, th2, now + 10_000_000_000, 0, 0) }; // +10 s
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid statics owned by this thread; the deadline bounds the wait
         let tr = unsafe {
             WAIT_HANDLES[0] = th2;
             syscall4(
@@ -228,8 +242,10 @@ pub extern "C" fn _start() -> ! {
         } else {
             kprint(b"wait: timeout FAIL\n");
         }
+        // SAFETY: closing our own timer handle
         unsafe { syscall1(SYS_HANDLE_CLOSE, th2) };
     }
+    // SAFETY: closing our own timer handle
     unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
 
     // 5. Unmap.
@@ -343,7 +359,7 @@ pub extern "C" fn _start() -> ! {
     //    (the kernel boot thread, this slice) reports the catch. We write to a
     //    never-mapped low address (page 1) → #PF (not-present, write).
     kprint(b"hello: triggering a deliberate fault\n");
-    // SAFETY-NOT: an intentional fault; control never returns past this store.
+    // SAFETY: a deliberate fault: page 1 is never mapped, so the store faults and the kernel terminates this thread
     unsafe { core::ptr::write_volatile(0x1000 as *mut u64, 0xDEAD) };
     // Unreachable: the store faults and the kernel terminates this thread.
     loop {

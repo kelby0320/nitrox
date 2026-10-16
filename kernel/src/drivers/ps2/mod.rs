@@ -317,7 +317,8 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
         g.lights_say.take()
     };
     for &(_, po, status) in taken.iter().flatten() {
-        crate::sched::complete_pending_op(po, status, (status == 0) as u64);
+        // SAFETY: the slot holds `po`'s reference, `Completing` until thread context reclaims it after this.
+        unsafe { crate::sched::complete_pending_op(po, status, (status == 0) as u64) };
     }
     if taken.iter().any(Option::is_some) {
         let mut g = PS2.lock();
@@ -401,7 +402,8 @@ fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, c
         }
     };
     if let Some((old, _)) = superseded {
-        crate::sched::complete_pending_op(old.as_ptr(), 0, 1);
+        // SAFETY: `old` is the superseded write's `PendingOperation` reference.
+        unsafe { crate::sched::complete_pending_op(old.as_ptr(), 0, 1) };
         drop(old);
     }
     // A start that failed at once has a write for the DPC to complete.

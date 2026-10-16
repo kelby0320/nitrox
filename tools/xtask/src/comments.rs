@@ -12,6 +12,8 @@ const LIMIT_PERCENT: usize = 15;
 const ALLOWANCE: usize = 3;
 const NUDGE_PERCENT: usize = 10;
 const NUDGE_MIN: usize = 3;
+/// The longest `SAFETY` comment the count passes over; lines past it count as comment.
+const SAFETY_MAX: usize = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {
@@ -31,7 +33,7 @@ fn kind(line: &str) -> Kind {
     }
 }
 
-struct Added {
+struct Line {
     file: String,
     line: usize,
     text: String,
@@ -39,44 +41,52 @@ struct Added {
 
 #[derive(Default)]
 struct Change {
-    added: Vec<Added>,
-    removed: Vec<String>,
+    added: Vec<Line>,
+    removed: Vec<Line>,
+}
+
+/// Whether `lines[i]` is the line after `lines[i - 1]` in the same file.
+fn follows(lines: &[Line], i: usize) -> bool {
+    let (a, b) = (&lines[i - 1], &lines[i]);
+    a.file == b.file && a.line + 1 == b.line
 }
 
 impl Change {
     fn from_diff(diff: &str) -> Change {
         let mut change = Change::default();
-        let (mut file, mut at) = (String::new(), 0usize);
+        let (mut file, mut at, mut old_at) = (String::new(), 0usize, 0usize);
         for line in diff.lines() {
             if let Some(path) = line.strip_prefix("+++ ") {
                 file = path.strip_prefix("b/").unwrap_or(path).to_string();
             } else if line.starts_with("--- ") || line.starts_with("diff ") || line.starts_with("index ") {
             } else if let Some(hunk) = line.strip_prefix("@@ ") {
-                at = hunk
-                    .split_whitespace()
-                    .find_map(|w| w.strip_prefix('+'))
-                    .and_then(|w| w.split(',').next())
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0);
+                let start = |sign: char| {
+                    hunk.split_whitespace()
+                        .find_map(|w| w.strip_prefix(sign))
+                        .and_then(|w| w.split(',').next())
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0)
+                };
+                (at, old_at) = (start('+'), start('-'));
             } else if let Some(text) = line.strip_prefix('+') {
-                change.added.push(Added { file: file.clone(), line: at, text: text.to_string() });
+                change.added.push(Line { file: file.clone(), line: at, text: text.to_string() });
                 at += 1;
             } else if let Some(text) = line.strip_prefix('-') {
-                change.removed.push(text.to_string());
+                change.removed.push(Line { file: file.clone(), line: old_at, text: text.to_string() });
+                old_at += 1;
             }
         }
         change
     }
 
     fn from_texts(file: &str, first: usize, old: &str, new: &str) -> Change {
-        Change {
-            added: new
-                .lines()
+        let lines = |text: &str| {
+            text.lines()
                 .enumerate()
-                .map(|(i, t)| Added { file: file.to_string(), line: first + i, text: t.to_string() })
-                .collect(),
-            removed: old.lines().map(str::to_string).collect(),
-        }
+                .map(|(i, t)| Line { file: file.to_string(), line: first + i, text: t.to_string() })
+                .collect()
+        };
+        Change { added: lines(new), removed: lines(old) }
     }
 }
 
@@ -90,21 +100,54 @@ struct Tally {
     runs: Vec<(String, usize, usize)>,
 }
 
+/// Which of `lines` are a `// SAFETY:` comment or a doc comment's `# Safety` section, to its
+/// [`SAFETY_MAX`]th line: the rules require both, so neither is counted.
+fn safety_lines(lines: &[Line]) -> Vec<bool> {
+    let mut out = vec![false; lines.len()];
+    let mut inside = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if kind(&line.text) != Kind::Comment || (i > 0 && !follows(lines, i)) {
+            inside = 0;
+        }
+        if kind(&line.text) == Kind::Comment {
+            let t = line.text.trim();
+            let doc = t.starts_with("///") || t.starts_with("//!");
+            let b = body(t);
+            if inside == 0 && (b.starts_with("SAFETY:") || (doc && b == "# Safety")) {
+                inside = 1;
+            } else if doc && b.starts_with("# ") {
+                inside = 0;
+            } else if inside > 0 {
+                inside += 1;
+            }
+            out[i] = (1..=SAFETY_MAX).contains(&inside);
+        }
+    }
+    out
+}
+
 /// An added line is new unless the same trimmed text was removed elsewhere: a move or a re-indent.
 fn tally(change: &Change) -> Tally {
     let mut removed: HashMap<&str, usize> = HashMap::new();
     for r in &change.removed {
-        *removed.entry(r.trim()).or_default() += 1;
+        *removed.entry(r.text.trim()).or_default() += 1;
     }
+    let removed_safety = safety_lines(&change.removed);
+    let added_safety = safety_lines(&change.added);
     let mut t = Tally {
-        removed_comments: change.removed.iter().filter(|r| kind(r) == Kind::Comment).count(),
+        removed_comments: change
+            .removed
+            .iter()
+            .zip(&removed_safety)
+            .filter(|(r, s)| !**s && kind(&r.text) == Kind::Comment)
+            .count(),
         ..Tally::default()
     };
     let mut run: Option<(String, usize, usize)> = None;
-    let mut prev: Option<&Added> = None;
-    for a in &change.added {
+    let mut prev: Option<&Line> = None;
+    for (a, &safety) in change.added.iter().zip(&added_safety) {
         let k = kind(&a.text);
-        if k == Kind::Comment {
+        if k == Kind::Comment && !safety {
             t.added_comments += 1;
         }
         let trimmed = a.text.trim();
@@ -115,9 +158,7 @@ fn tally(change: &Change) -> Tally {
             }
             _ => false,
         };
-        let new_comment = !moved && k == Kind::Comment;
-        if new_comment {
-            t.new_comments += 1;
+        if !moved && k == Kind::Comment {
             let wrapped = || {
                 let p = prev.filter(|p| p.file == a.file && p.line + 1 == a.line && kind(&p.text) == Kind::Comment)?;
                 let joined = reference(&format!("{} {}", body(&p.text), body(trimmed)));
@@ -126,6 +167,10 @@ fn tally(change: &Change) -> Tally {
             if let Some(why) = reference(trimmed).or_else(wrapped) {
                 t.references.push((a.file.clone(), a.line, why));
             }
+        }
+        let new_comment = !moved && k == Kind::Comment && !safety;
+        if new_comment {
+            t.new_comments += 1;
             run = match run {
                 Some((f, start, n)) if f == a.file && start + n == a.line => Some((f, start, n + 1)),
                 other => {
@@ -514,14 +559,18 @@ mod tests {
     use super::*;
 
     fn change(added: &[&str], removed: &[&str]) -> Change {
-        Change {
-            added: added
+        let lines = |texts: &[&str]| {
+            texts
                 .iter()
                 .enumerate()
-                .map(|(i, t)| Added { file: "a.rs".into(), line: i + 1, text: t.to_string() })
-                .collect(),
-            removed: removed.iter().map(|s| s.to_string()).collect(),
-        }
+                .map(|(i, t)| Line { file: "a.rs".into(), line: i + 1, text: t.to_string() })
+                .collect()
+        };
+        Change { added: lines(added), removed: lines(removed) }
+    }
+
+    fn at(file: &str, line: usize, text: &str) -> Line {
+        Line { file: file.into(), line, text: text.into() }
     }
 
     fn lines(comments: usize, code: usize) -> Vec<String> {
@@ -549,6 +598,91 @@ mod tests {
         let gone: Vec<&str> = gone.iter().map(String::as_str).collect();
         assert!(!over_limit(&tally(&change(&added, &gone))));
         assert!(over_limit(&tally(&change(&added, &gone[1..]))));
+    }
+
+    #[test]
+    fn safety_comments_are_neither_comment_nor_code() {
+        let t =
+            tally(&change(&["// SAFETY: the pointer is live.", "// It came from the caller.", "unsafe { f() };"], &[]));
+        assert_eq!((t.new_comments, t.new_code, t.added_comments), (0, 1, 0));
+        let t = tally(&change(
+            &[
+                "/// Frees it.",
+                "///",
+                "/// # Safety",
+                "///",
+                "/// It must be live.",
+                "/// # Panics",
+                "/// Never.",
+                "pub unsafe fn f() {}",
+            ],
+            &[],
+        ));
+        assert_eq!((t.new_comments, t.new_code), (4, 1), "the doc and its other sections count");
+        let after = tally(&change(&["// SAFETY: live.", "unsafe { f() };", "// an essay"], &[]));
+        assert_eq!(after.new_comments, 1, "a comment after the code is not the SAFETY comment's");
+    }
+
+    #[test]
+    fn a_safety_comment_is_passed_over_to_its_fifth_line() {
+        let long = |n: usize| {
+            let mut l = vec!["// SAFETY: live."];
+            l.extend(vec!["// and more."; n - 1]);
+            l.push("unsafe { f() };");
+            tally(&change(&l, &[])).new_comments
+        };
+        assert_eq!((long(SAFETY_MAX), long(SAFETY_MAX + 1), long(40)), (0, 1, 40 - SAFETY_MAX));
+        let mut stacked = vec!["// SAFETY: one"; 40];
+        stacked.push("unsafe { f() };");
+        assert_eq!(tally(&change(&stacked, &[])).new_comments, 40 - SAFETY_MAX, "a second mark starts no new comment");
+    }
+
+    #[test]
+    fn a_safety_comment_ends_at_a_gap_or_another_file() {
+        let gap = Change {
+            added: vec![at("a.rs", 1, "// SAFETY: live."), at("a.rs", 30, "// an essay"), at("a.rs", 31, "let a = 1;")],
+            removed: vec![],
+        };
+        assert_eq!(tally(&gap).new_comments, 1, "a comment in the next hunk");
+        let other =
+            Change { added: vec![at("a.rs", 1, "// SAFETY: live."), at("b.rs", 2, "// an essay")], removed: vec![] };
+        assert_eq!(tally(&other).new_comments, 1, "a comment opening the next file");
+    }
+
+    #[test]
+    fn a_removed_safety_comment_ends_at_its_hunk() {
+        let mut removed = vec![at("a.rs", 10, "// SAFETY: as it was.")];
+        let mut added = vec![at("a.rs", 10, "// SAFETY: as it is.")];
+        for i in 0..4 {
+            removed.push(at("a.rs", 40 + i, &format!("// old {i}")));
+            added.push(at("a.rs", 40 + i, &format!("// new {i}")));
+        }
+        let t = tally(&Change { added, removed });
+        assert_eq!(t.removed_comments, 4);
+        assert!(!over_limit(&t), "four comment lines for four");
+    }
+
+    #[test]
+    fn a_removed_safety_comment_does_not_pay_for_an_essay() {
+        let t = tally(&change(
+            &["// an essay", "// more of it", "// and more", "// still more", "f();"],
+            &["// SAFETY: a", "// b", "// c", "// d"],
+        ));
+        assert_eq!(t.removed_comments, 0);
+        assert!(over_limit(&t));
+    }
+
+    #[test]
+    fn a_safety_comment_still_may_not_cite_history() {
+        let t = tally(&change(&["// SAFETY: as Part H.4 found, live.", "unsafe { f() };"], &[]));
+        assert_eq!(t.references.len(), 1);
+        let t = tally(&change(&["// SAFETY: as the review of Part", "// H.4 found, live.", "unsafe { f() };"], &[]));
+        assert_eq!(t.references, [("a.rs".to_string(), 2, "Part H.4".to_string())], "wrapped");
+        let t = tally(&change(
+            &["/// # Safety", "///", "/// As Part", "/// H.4 found, live.", "pub unsafe fn f() {}"],
+            &[],
+        ));
+        assert_eq!(t.references, [("a.rs".to_string(), 4, "Part H.4".to_string())], "wrapped, in a doc");
     }
 
     #[test]
@@ -619,8 +753,8 @@ mod tests {
         assert_eq!(t.references, [("a.rs".to_string(), 2, "Part E.5".to_string())]);
         let two_files = Change {
             added: vec![
-                Added { file: "a.rs".into(), line: 1, text: "// see Part".into() },
-                Added { file: "b.rs".into(), line: 2, text: "// E.5 in b".into() },
+                Line { file: "a.rs".into(), line: 1, text: "// see Part".into() },
+                Line { file: "b.rs".into(), line: 2, text: "// E.5 in b".into() },
             ],
             removed: vec![],
         };
@@ -631,8 +765,8 @@ mod tests {
     fn a_run_of_new_comment_does_not_cross_files() {
         let two_files = Change {
             added: vec![
-                Added { file: "a.rs".into(), line: 1, text: "// a".into() },
-                Added { file: "b.rs".into(), line: 2, text: "// b".into() },
+                Line { file: "a.rs".into(), line: 1, text: "// a".into() },
+                Line { file: "b.rs".into(), line: 2, text: "// b".into() },
             ],
             removed: vec![],
         };
@@ -649,7 +783,7 @@ mod tests {
     fn a_unified_diff_is_read_with_its_new_line_numbers() {
         let diff = "diff --git a/k.rs b/k.rs\n--- a/k.rs\n+++ b/k.rs\n@@ -10,2 +12,3 @@ fn f() {\n-// gone\n+// new\n+let x = 1;\n";
         let c = Change::from_diff(diff);
-        assert_eq!(c.removed, ["// gone"]);
+        assert_eq!(c.removed.iter().map(|r| (r.line, r.text.as_str())).collect::<Vec<_>>(), [(10, "// gone")]);
         assert_eq!(c.added.iter().map(|a| (a.file.as_str(), a.line)).collect::<Vec<_>>(), [("k.rs", 12), ("k.rs", 13)]);
     }
 

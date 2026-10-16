@@ -158,7 +158,7 @@ That's it. Init doesn't do supervision (the service manager does that for servic
 Init is hard to test in isolation — it's the integration test for half the system. The strategy is:
 
 - Unit tests for the TOML parser (host-side, easy)
-- Unit tests for individual coordination steps with mocked syscalls (host-side via `libkern`'s test mode)
+- Unit tests for the coordination steps that make no syscall; `libkern` has no syscall mock yet
 - Integration tests via `xtask test-qemu`: boot QEMU with a known initramfs and disk image, verify init reaches "service manager spawned" state
 
 Don't add complex testing scaffolding to init itself. Keep it minimal.

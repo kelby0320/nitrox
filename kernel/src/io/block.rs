@@ -59,6 +59,7 @@ pub struct BlockBackend {
 // true of AHCI either — PR #298 review.) These impls let a `DeviceNode` holding one
 // be `Send`/`Sync` like the rest of the type-erased object graph.
 unsafe impl Send for BlockBackend {}
+// SAFETY: as above.
 unsafe impl Sync for BlockBackend {}
 
 /// The kernel-internal owning wrapper around an in-flight [`Irp`]. `#[repr(C)]`
@@ -364,8 +365,12 @@ pub fn reclaim_completed() {
 
 /// [`irp_complete_dpc`], for another module's host test to complete an IRP its recording device
 /// took, as the device's completion would.
+///
+/// # Safety
+///
+/// `irp` is the in-flight IRP of a box `dispatch_block_irp` armed, completed once.
 #[cfg(test)]
-pub(crate) fn complete_for_test(irp: *mut Irp) {
+pub(crate) unsafe fn complete_for_test(irp: *mut Irp) {
     irp_complete_dpc(irp as *mut ());
 }
 
@@ -381,7 +386,8 @@ fn irp_complete_dpc(ctx: *mut ()) {
         (irp.status, irp.transferred, irp.completion as *mut ())
     };
     // Deliver the outcome through the PO (result payload = bytes transferred).
-    crate::sched::complete_pending_op(po, status, transferred);
+    // SAFETY: the box's `_po` pins the `PendingOperation` until thread context reclaims the box.
+    unsafe { crate::sched::complete_pending_op(po, status, transferred) };
     // **Hand the box to thread context; do not drop it here.** Dropping releases
     // `_po`/`_buffer`/`_device` and the `frags` backing, and every one of those reaches
     // `SlabCache::free`, whose lock is a plain `SpinLock` — preemption off, interrupts on.
@@ -433,6 +439,7 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
     let Ok(po) = crate::object::PendingOperation::try_new() else {
         return false;
     };
+    // SAFETY: `into_raw` yields the box's single creation reference, which this adopts.
     let po_ref = unsafe {
         ObjectRef::from_raw(
             KBox::into_raw(po).as_ptr() as *mut (),
@@ -446,7 +453,8 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
     // Poll the in-flight command to completion + run its DPC (no interrupts).
     (backend.poll)(backend.ctx);
 
-    let (status, _result) = crate::sched::pending_op_completion(po_ref.as_ptr());
+    // SAFETY: `po_ref` is a live `PendingOperation` reference held across the call.
+    let (status, _result) = unsafe { crate::sched::pending_op_completion(po_ref.as_ptr()) };
     if status != 0 {
         return false;
     }
@@ -494,6 +502,7 @@ pub struct Partition {
 // SAFETY: a `Partition` is set up once and accessed only on the CPU servicing the
 // device; it holds no interior-mutable cross-context state.
 unsafe impl Send for Partition {}
+// SAFETY: as above.
 unsafe impl Sync for Partition {}
 
 /// [`BlockBackend::submit`] for a partition: bounds-check the partition-relative
@@ -530,6 +539,7 @@ fn forward(p: &Partition, irp: *mut Irp) {
         (p.disk.submit)(irp, p.disk.ctx);
         return;
     }
+    // SAFETY: as above, `irp` is in flight and uniquely owned during submit.
     let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
     match partition_rebase(offset, length, p.start_lba, p.block_count, p.sector_size) {
         Some(disk_offset) => {

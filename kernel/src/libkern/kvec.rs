@@ -34,6 +34,7 @@ pub struct KVec<T> {
 // the vec is sound when `T: Send`; sharing a `&KVec` yields only `&[T]`,
 // sound when `T: Sync`.
 unsafe impl<T: Send> Send for KVec<T> {}
+// SAFETY: as above.
 unsafe impl<T: Sync> Sync for KVec<T> {}
 
 impl<T> KVec<T> {
@@ -245,7 +246,7 @@ impl<T> Drop for KVec<T> {
         if self.cap != 0 && mem::size_of::<T>() != 0 {
             // SAFETY: in that case `ptr` came from `kmalloc` and `clear`
             // left no live elements behind.
-            kfree(self.ptr.as_ptr() as *mut u8);
+            unsafe { kfree(self.ptr.as_ptr() as *mut u8) };
         }
     }
 }

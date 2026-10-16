@@ -451,6 +451,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // the raw stream. That mattered when a refused send was simply dropped; since M3 Part D3
     // the compositor parks and retries, so the phases are sequenced now for clarity rather
     // than for safety — and phase 3 below exercises the parking deliberately.
+    // SAFETY: `root_ns` is this process's live root namespace handle
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
         Ok(t) => t,
         Err(_) => {
@@ -714,7 +715,8 @@ const IDLE_LIMIT_NS: u64 = 20_000_000_000;
 fn deadline_ns(ns: u64) -> u64 {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: the kernel wrote the ns count.
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns)
 }
 
@@ -760,7 +762,8 @@ fn wait_event_before(
 fn sleep_ns(notif: u64, ns: u64) {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: the kernel wrote the ns count.
+    // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
+    // leaves its last value.
     let deadline = unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns);
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     unsafe {

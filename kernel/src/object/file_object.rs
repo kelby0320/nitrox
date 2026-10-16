@@ -488,7 +488,11 @@ impl FileObject {
     /// A writable mapping of the object at `obj` has gone. Atomic and lock-free, because a
     /// VMA drops wherever its address space is torn down. Saturating, since a VMA that was
     /// never counted must not take another's count with it.
-    pub fn writable_unmapped(obj: *mut ()) {
+    ///
+    /// # Safety
+    ///
+    /// `obj` points at a live `FileObject`, pinned for the call by a reference the caller holds.
+    pub unsafe fn writable_unmapped(obj: *mut ()) {
         // SAFETY: the caller's `ObjectRef` (the VMA's) pins a live `FileObject` at `obj`.
         let fo: &FileObject = unsafe { &*(obj as *const FileObject) };
         let _ = fo.writable_maps.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
@@ -737,7 +741,8 @@ impl FileObject {
     /// [`end_io`](Self::end_io), completing a `Forget` answer it hands back.
     fn finish_io(&self) {
         if let Some(answer) = self.end_io() {
-            crate::sched::complete_pending_op(answer.as_ptr(), 0, 0);
+            // SAFETY: `answer` is the `Forget` answer's `PendingOperation` reference.
+            unsafe { crate::sched::complete_pending_op(answer.as_ptr(), 0, 0) };
         }
     }
 
@@ -977,11 +982,14 @@ impl FileObject {
                         // page back so a retry is clean. Nothing will complete `po`, so
                         // complete it here for anyone already waiting on it.
                         fo.settle(index, &po, false);
-                        crate::sched::complete_pending_op(
-                            po.as_ptr(),
-                            crate::syscall::error::KError::OutOfMemory as i32,
-                            0,
-                        );
+                        // SAFETY: `po` pins the fill's `PendingOperation`.
+                        unsafe {
+                            crate::sched::complete_pending_op(
+                                po.as_ptr(),
+                                crate::syscall::error::KError::OutOfMemory as i32,
+                                0,
+                            )
+                        };
                         return None;
                     }
                     let ok = wait(&po);
@@ -1267,7 +1275,8 @@ impl FileObject {
             ReadStep::Hole => {
                 // Hole or unmapped: the zeroed frame is already correct. Complete the PO
                 // synchronously so the parked faulter wakes at once (no IRP).
-                crate::sched::complete_pending_op(po.as_ptr(), 0, 0);
+                // SAFETY: `po` pins the fill's `PendingOperation`.
+                unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, 0) };
                 FillStart::Hole
             }
             ReadStep::NoMemory => FillStart::Failed,
@@ -1333,7 +1342,8 @@ impl FileObject {
         // Originate: records the pending fill on `reg` and pushes the request. The
         // reply completes `po`; `Busy`/`Full`/`PeerClosed` fail this fault.
         matches!(
-            crate::sched::us_forward_originate_fill(reg.as_ptr(), &mut msg, po, file_obj, frame, index),
+            // SAFETY: `reg` is a live `UserspaceServerReg` reference held across the call.
+            unsafe { crate::sched::us_forward_originate_fill(reg.as_ptr(), &mut msg, po, file_obj, frame, index) },
             crate::sched::ForwardOutcome::Pending
         )
     }
@@ -1345,8 +1355,10 @@ impl FileObject {
 /// is fine: a no-deadline (`u64::MAX`) PO wait uses it only for the already-signalled
 /// check, which a `PendingOperation` answers from its flag.
 fn wait_status(po: &ObjectRef) -> i32 {
-    match crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) {
-        crate::sched::WaitResult::Signaled(_) => crate::sched::pending_op_completion(po.as_ptr()).0,
+    // SAFETY: `po` pins the `PendingOperation` waited on.
+    match unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) } {
+        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+        crate::sched::WaitResult::Signaled(_) => unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0,
         // OutOfMemory (waiter registration failed); TimedOut cannot occur (no deadline).
         _ => crate::syscall::error::KError::OutOfMemory as i32,
     }
@@ -1381,9 +1393,11 @@ impl WriteBack {
 /// is a park, never a spin.
 fn wait_for_fill(po: &ObjectRef) -> bool {
     loop {
-        match crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) {
+        // SAFETY: `po` pins the `PendingOperation` waited on.
+        match unsafe { crate::sched::wait_on(&[po.as_ptr() as usize], u64::MAX, 0) } {
             crate::sched::WaitResult::Signaled(_) => {
-                return crate::sched::pending_op_completion(po.as_ptr()).0 == 0;
+                // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+                return unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0 == 0;
             }
             _ => park_briefly(),
         }
@@ -1396,7 +1410,8 @@ fn wait_for_fill(po: &ObjectRef) -> bool {
 /// yield returns at once and the CPU takes no interrupt at all.
 fn park_briefly() {
     let now = crate::arch::Timer::read_ns();
-    let _ = crate::sched::wait_on(&[], now + 1_000_000, now);
+    // SAFETY: no objects: a sleep until the deadline.
+    let _ = unsafe { crate::sched::wait_on(&[], now + 1_000_000, now) };
 }
 
 /// A self-test fill in flight: the DPC + everything it needs, heap-boxed so its
@@ -1458,7 +1473,8 @@ fn stub_fill_dpc(ctx: *mut ()) {
     // SAFETY: `bx.file_obj` pins a live `FileObject`.
     let fo: &FileObject = unsafe { &*(bx.file_obj.as_ptr() as *const FileObject) };
     fo.mark_ready(bx.index);
-    crate::sched::complete_pending_op(bx.po.as_ptr(), 0, 0);
+    // SAFETY: `bx` owns the reference pinning its `PendingOperation`.
+    unsafe { crate::sched::complete_pending_op(bx.po.as_ptr(), 0, 0) };
     // `bx` drops here: frees the box, releasing the `file_obj` + `po` references.
 }
 
@@ -1757,7 +1773,8 @@ mod tests {
         let a = resolve(&reg, 7, PAGE_SIZE);
         let first = a.as_ptr();
         FileObject::writable_mapped(&a);
-        FileObject::writable_unmapped(a.as_ptr());
+        // SAFETY: `a` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
         let mark = file_of(&a).clean_mark().expect("no writable mapping left");
         FileObject::unpin_if_clean(&a, mark);
         assert!(!file_of(&a).is_dirty());
@@ -1781,7 +1798,8 @@ mod tests {
         let first = a.as_ptr();
         let frame = fill(file_of(&a), 0, 0xC3);
         FileObject::writable_mapped(&a);
-        FileObject::writable_unmapped(a.as_ptr());
+        // SAFETY: `a` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
         assert!(file_of(&a).is_dirty());
         test_probe::reset();
         drop(a);
@@ -1814,13 +1832,15 @@ mod tests {
         // A mapping present at the start: no mark, so nothing cleans — even once it is gone.
         FileObject::writable_mapped(&a);
         assert_eq!(fo.clean_mark(), None);
-        FileObject::writable_unmapped(a.as_ptr());
+        // SAFETY: `a` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
         assert!(fo.is_dirty(), "the sync that began mapped does not clean");
 
         // A mapping made and gone during the write-back moves the mark.
         let mark = fo.clean_mark().unwrap();
         FileObject::writable_mapped(&a);
-        FileObject::writable_unmapped(a.as_ptr());
+        // SAFETY: `a` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
         FileObject::unpin_if_clean(&a, mark);
         assert!(fo.is_dirty(), "a mapping during the write-back keeps it dirty");
 
@@ -1841,10 +1861,12 @@ mod tests {
         FileObject::writable_mapped(&a);
         assert_eq!(file_of(&a).writable_maps(), 1);
         assert!(!file_of(&a).is_dirty());
-        FileObject::writable_unmapped(a.as_ptr());
+        // SAFETY: `a` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
         assert_eq!(reg_of(&reg).cached_files(), 0);
         // And the count saturates: a stray decrement does not wrap it.
-        FileObject::writable_unmapped(a.as_ptr());
+        // SAFETY: `a` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
         assert_eq!(file_of(&a).writable_maps(), 0);
     }
 
@@ -2295,8 +2317,11 @@ mod tests {
         assert_eq!(expected[0], frame.as_u64());
         // SAFETY: as above; the device's side of a completion, a success of the whole length.
         unsafe { ((*irp).status, (*irp).transferred) = (0, length) };
-        crate::io::block::complete_for_test(irp);
-        assert_eq!(crate::sched::pending_op_completion(fill_po.as_ptr()), (0, length), "the fault's PO completed");
+        // SAFETY: `irp` is the recording device's in-flight IRP.
+        unsafe { crate::io::block::complete_for_test(irp) };
+        // SAFETY: `fill_po` is a live `PendingOperation` reference held across the call.
+        let completed = unsafe { crate::sched::pending_op_completion(fill_po.as_ptr()) };
+        assert_eq!(completed, (0, length), "the fault's PO completed");
 
         let (frame, fill_po) = miss(file_of(&f), 8);
         assert_eq!(file_of(&f).start_fill(&f, 8, frame, &fill_po, false), FillStart::DeviceIo(1));
@@ -2307,7 +2332,8 @@ mod tests {
         assert_eq!(file_of(&f).lookup(9), None, "nothing reserved after it");
         // SAFETY: as above.
         unsafe { ((*irp).status, (*irp).transferred) = (0, length) };
-        crate::io::block::complete_for_test(irp);
+        // SAFETY: `irp` is the recording device's in-flight IRP.
+        unsafe { crate::io::block::complete_for_test(irp) };
         crate::io::block::reclaim_completed();
     }
 
@@ -2365,10 +2391,12 @@ mod tests {
                     (0, (*irp).length)
                 };
             }
-            crate::io::block::complete_for_test(irp);
+            // SAFETY: `irp` is the recording device's in-flight IRP.
+            unsafe { crate::io::block::complete_for_test(irp) };
         }
         assert!(reads.borrow().len() < 16, "a fault that never gives up");
-        crate::sched::pending_op_completion(po.as_ptr()).0 == 0
+        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+        unsafe { crate::sched::pending_op_completion(po.as_ptr()) }.0 == 0
     }
 
     /// **A fault waiting on another's read-ahead is not failed by a page it never asked for** (PR
@@ -2471,7 +2499,8 @@ mod tests {
         let a = two_block_file(&reg, 7);
         let first = a.as_ptr();
         FileObject::writable_mapped(&a);
-        FileObject::writable_unmapped(a.as_ptr());
+        // SAFETY: `a` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
         assert!(file_of(&a).is_dirty());
         assert!(matches!(file_of(&a).begin_write(0, 4096, 1, &mut KVec::new()), WriteStep::Go(100, 1)));
         assert!(file_of(&a).end_io().is_none(), "nothing forgotten yet");
@@ -2595,7 +2624,8 @@ mod tests {
         assert_eq!(count(), 2, "a file nothing holds leaves the cache");
 
         FileObject::writable_mapped(&dirty);
-        FileObject::writable_unmapped(dirty.as_ptr());
+        // SAFETY: `dirty` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(dirty.as_ptr()) };
         let mark = file_of(&dirty).clean_mark().expect("no writable mapping remains");
         let dirty_at = dirty.as_ptr();
         drop(dirty);
@@ -2635,7 +2665,8 @@ mod tests {
         let reg = registration();
         let a = two_block_file(&reg, 7);
         FileObject::writable_mapped(&a);
-        FileObject::writable_unmapped(a.as_ptr());
+        // SAFETY: `a` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
         assert!(file_of(&a).is_dirty());
         assert_eq!(FileObject::let_go(&a), 2, "both pages resident, unwritten");
         assert!(!file_of(&a).is_dirty(), "the pin is gone");
@@ -2653,7 +2684,8 @@ mod tests {
         let _ = reg_of(&reg).forget_file(7, &po());
         FileObject::writable_mapped(&a);
         assert!(!file_of(&a).is_dirty());
-        FileObject::writable_unmapped(a.as_ptr());
+        // SAFETY: `a` pins the `FileObject`.
+        unsafe { FileObject::writable_unmapped(a.as_ptr()) };
     }
 
     /// The fault path's reservation, as a test can read it: the frame, and the PO to wait on

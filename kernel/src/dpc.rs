@@ -46,6 +46,7 @@ pub struct Dpc {
 // thread-safety of the raw `ctx` pointer is the handler's own concern. These impls let a `Dpc`
 // be a `static` and be shared by `&Dpc` across the enqueue/run boundary.
 unsafe impl Sync for Dpc {}
+// SAFETY: as above.
 unsafe impl Send for Dpc {}
 
 impl Dpc {

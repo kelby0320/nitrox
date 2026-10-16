@@ -226,6 +226,7 @@ pub struct AhciDisk {
 // "accessed only on the single CPU that services the controller" until 2026-09-14,
 // which a root disk submitting from every CPU makes plainly false — PR #298 review.)
 unsafe impl Send for AhciDisk {}
+// SAFETY: as above.
 unsafe impl Sync for AhciDisk {}
 
 /// The active disk (one in Phase 2). Set at bring-up; read by [`isr`] / [`submit`].
@@ -372,6 +373,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     start_port(port_base);
 
     let intr = match InterruptObject::try_new() {
+        // SAFETY: `into_raw` yields the box's single creation reference, which this adopts.
         Ok(io) => unsafe { ObjectRef::from_raw(KBox::into_raw(io).as_ptr() as *mut (), KObjectType::InterruptObject) },
         Err(_) => return declined(OUT_OF_MEMORY),
     };
@@ -401,8 +403,8 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     AHCI.store(disk, Ordering::Release);
 
     // IDENTIFY the disk (polled — bring-up runs with interrupts masked).
-    // SAFETY: `disk` is the just-published live state.
     let mut name = [0u8; MAX_DEVICE_NAME];
+    // SAFETY: `disk` is the just-published live state.
     let (sectors, name_len, flush) = match unsafe { identify(&mut *disk, &mut name) } {
         Some(s) => s,
         None => {
@@ -975,8 +977,8 @@ fn ahci_poll(_ctx: *mut ()) {
 fn ahci_intr_dpc(_ctx: *mut ()) {
     let disk = AHCI.load(Ordering::Acquire);
     if !disk.is_null() {
-        // SAFETY: live published state; `intr` pins a live InterruptObject.
-        crate::sched::signal_interrupt(unsafe { (*disk).intr });
+        // SAFETY: `disk` is live published state, and its `intr` a live `InterruptObject`.
+        unsafe { crate::sched::signal_interrupt((*disk).intr) };
     }
 }
 

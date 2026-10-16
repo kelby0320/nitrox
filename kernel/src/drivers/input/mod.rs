@@ -229,13 +229,15 @@ pub fn deliver(read: &ParkedRead, bytes: &[u8]) {
     // SAFETY: `read` owns the `ObjectRef` pinning this `MemoryObject`, and the caller keeps `read`
     // for the duration.
     unsafe { copy_into_memobj(read.buffer.as_ptr(), read.buf_offset, bytes) };
-    crate::sched::complete_pending_op(read.po.as_ptr(), 0, bytes.len() as u64);
+    // SAFETY: `read` owns the reference pinning its `PendingOperation`.
+    unsafe { crate::sched::complete_pending_op(read.po.as_ptr(), 0, bytes.len() as u64) };
 }
 
 /// **Complete a parked read with `err`** and no bytes: a read waiting on a device that has gone
 /// (Phase 6 Part C). No lock held.
 pub fn refuse(read: &ParkedRead, err: KError) {
-    crate::sched::complete_pending_op(read.po.as_ptr(), err as i32, 0);
+    // SAFETY: `read` owns the reference pinning its `PendingOperation`.
+    unsafe { crate::sched::complete_pending_op(read.po.as_ptr(), err as i32, 0) };
 }
 
 /// Copy `bytes` into `buffer` at `buf_offset` and complete `po`: a read satisfied at once, from
@@ -243,7 +245,8 @@ pub fn refuse(read: &ParkedRead, err: KError) {
 pub fn deliver_now(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, bytes: &[u8]) {
     // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
     unsafe { copy_into_memobj(buffer.as_ptr(), buf_offset, bytes) };
-    crate::sched::complete_pending_op(po.as_ptr(), 0, bytes.len() as u64);
+    // SAFETY: `po` is the caller's `PendingOperation` reference.
+    unsafe { crate::sched::complete_pending_op(po.as_ptr(), 0, bytes.len() as u64) };
 }
 
 /// Copy `src` into `buffer`'s frames starting at byte `buf_offset`, via the HHDM. The

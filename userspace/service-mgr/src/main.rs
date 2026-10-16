@@ -168,6 +168,8 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     // IoResult: status at bytes 8..12, resolved handle at 16..24.
+    // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
+    // touches; they hold the wait's result only when it returned 1.
     let (status, handle) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
@@ -453,6 +455,8 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) 
             .s(b" (the kernel grants the subset service-mgr holds)")
             .end();
     }
+    // SAFETY: SPAWN_SERVICE is this process's spawn block, owned by this single thread; `image` and `svc_end` are
+    // handles we hold, and the kernel copies the block during the call
     let h = unsafe {
         SPAWN_SERVICE.image = image;
         SPAWN_SERVICE.syscaps = decl.syscaps;
@@ -555,8 +559,8 @@ fn spawn_with_control(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> (i64, 
 /// supervisor hung on a message that is either there or never coming. The same
 /// deadline the `Ready` handshake uses is more than enough.
 fn recv_handoff(ctrl: u64) -> u64 {
-    // SAFETY: `&now` is a valid u64 out-param.
     let mut now: u64 = 0;
+    // SAFETY: `&now` is a valid u64 out-param
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
     let deadline = now.saturating_add(READY_TIMEOUT_NS);
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS valid; one waiter, bounded deadline.
@@ -578,6 +582,8 @@ fn recv_handoff(ctrl: u64) -> u64 {
             (&raw mut RDY_COUNT) as u64,
         )
     };
+    // SAFETY: this single-threaded process reads its own static; the count is used only once `rr`
+    // says the recv wrote it.
     let count = unsafe { (&raw const RDY_COUNT).read() };
     if rr != 0 || count < 1 {
         return 0;
@@ -1025,8 +1031,8 @@ fn reply_table(ch: u64, request_id: u64, bytes: &[u8]) {
         return reply_error(ch, resolve, request_id, KError::OutOfMemory);
     }
     let obj = obj as u64;
-    // SAFETY: mapping an object this process just created, to fill it.
     let rw = RIGHT_MAP_READ | RIGHT_MAP_WRITE;
+    // SAFETY: mapping an object this process just created, to fill it
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, obj, 0, bytes.len() as u64, rw) };
     if addr <= 0 {
         close(obj);
@@ -1038,10 +1044,9 @@ fn reply_table(ch: u64, request_id: u64, bytes: &[u8]) {
     // so left behind it would pin every table ever served.
     // SAFETY: unmapping a range this process mapped moments ago and never reads again.
     unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
-    // SAFETY: narrowing a handle this process holds to what a reader needs — mapping it, and
-    // `INSPECT` for its size, which `libfs::read_file` asks for — and what moving it needs. A
-    // resolve asking for a right the answer lacks is refused, which is how `INSPECT` was found.
     let rights = RIGHT_MAP_READ | RIGHT_INSPECT | RIGHT_TRANSFER;
+    // SAFETY: narrowing a handle this process holds to what a reader needs: mapping it, `INSPECT`
+    // for its size, and moving it
     let ro = unsafe { syscall2(SYS_HANDLE_DUPLICATE, obj, rights) };
     close(obj);
     if ro <= 0 {
@@ -2081,24 +2086,25 @@ impl Mgr {
             }
         }
         let root = self.services.serve;
-        while root != 0 {
-            match recv_request(root) {
-                Ok(Some((op, request_id, body))) => self.answer_resolve(root, op, request_id, &body, false),
-                Ok(None) => break,
-                Err(()) => {
-                    close(root);
-                    self.services.serve = 0;
-                    break;
+        if root != 0 {
+            loop {
+                match recv_request(root) {
+                    Ok(Some((op, request_id, body))) => self.answer_resolve(root, op, request_id, &body, false),
+                    Ok(None) => break,
+                    Err(()) => {
+                        close(root);
+                        self.services.serve = 0;
+                        break;
+                    }
                 }
             }
         }
         // A session endpoint's holders are the logins and what they spawn; this manager holds its
         // other end, so it cannot close.
         let session = self.services.session_serve;
-        while session != 0 {
-            match recv_request(session) {
-                Ok(Some((op, request_id, body))) => self.answer_resolve(session, op, request_id, &body, true),
-                _ => break,
+        if session != 0 {
+            while let Ok(Some((op, request_id, body))) = recv_request(session) {
+                self.answer_resolve(session, op, request_id, &body, true);
             }
         }
     }
@@ -2251,8 +2257,8 @@ impl Mgr {
         let now = now_ns();
         let below = match stage {
             Stage::Sessions { until } => {
-                // SAFETY: single-threaded; the supervisors' slots.
                 let gone = |k: usize| {
+                    // SAFETY: single-threaded; SUPERVISORS has four slots and `k` is 1 or 3
                     let c = unsafe { SUPERVISORS[k] };
                     c == 0 || channel_peer_closed(c)
                 };

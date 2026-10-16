@@ -209,7 +209,8 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     let now = context(index, epoch);
     assert_ne!(now, made[5], "another epoch");
     assert!(nodes.lights.lock()[5].is_none(), "the waiting lights write is let go");
-    assert_eq!(crate::sched::pending_op_completion(lights.as_ptr()), (KError::PeerClosed as i32, 0));
+    // SAFETY: `lights` is a live `PendingOperation` reference held across the call.
+    assert_eq!(unsafe { crate::sched::pending_op_completion(lights.as_ptr()) }, (KError::PeerClosed as i32, 0));
     nodes.readers[5].lock().ring.push(InputEvent::rel(REL_X, 3, 2));
 
     let buf = crate::drivers::adopt(MemoryObject::try_new(PAGE_SIZE).unwrap(), KObjectType::MemoryObject);
@@ -221,7 +222,8 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     assert_eq!(nodes.write(None, &buf, &po, 0, 1, now), Err(KError::Unsupported), "a mouse takes none");
     assert_eq!(nodes.read(&buf, &po, 0, len, now, 3), Ok(()), "the mouse's node reads it");
     assert_eq!(
-        crate::sched::pending_op_completion(po.as_ptr()),
+        // SAFETY: `po` is a live `PendingOperation` reference held across the call.
+        unsafe { crate::sched::pending_op_completion(po.as_ptr()) },
         (0, INPUT_EVENT_LEN as u64),
         "the motion alone: none of the keyboard's release",
     );
