@@ -79,3 +79,42 @@ fn a_filtered_module_is_filtered_with_its_directory() {
         }
     }
 }
+
+/// A filtered file's split-off modules are filtered with it, whether the split made an `x/` beside
+/// `x.rs` or siblings beside a crate root: a module the file declares out of line, not for tests,
+/// whose own file opens with `use super::*;` is code that was the file's.
+#[test]
+fn a_filtered_files_split_off_modules_are_filtered() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for workflow in ["display.yml", "input.yml"] {
+        let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow)).unwrap();
+        let filters: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("      - '")?.strip_suffix('\'')).collect();
+        let covered = |path: &str| {
+            filters.iter().any(|f| f.strip_suffix("/**").map_or(*f == path, |d| path.starts_with(&format!("{d}/"))))
+        };
+        for file in filters.iter().filter(|f| f.ends_with(".rs") && !f.contains('*')) {
+            let source = std::fs::read_to_string(root.join(file)).unwrap();
+            let lines: Vec<&str> = source.lines().collect();
+            let dir = match Path::new(file).file_name().and_then(|n| n.to_str()) {
+                Some("main.rs" | "lib.rs" | "mod.rs") => Path::new(file).parent().unwrap().to_path_buf(),
+                _ => Path::new(file).with_extension(""),
+            };
+            for (i, line) in lines.iter().enumerate() {
+                let Some(name) = line.strip_prefix("mod ").and_then(|l| l.strip_suffix(';')) else { continue };
+                if i > 0 && lines[i - 1] == "#[cfg(test)]" {
+                    continue;
+                }
+                let piece = [dir.join(format!("{name}.rs")), dir.join(name).join("mod.rs")]
+                    .into_iter()
+                    .find(|p| root.join(p).is_file());
+                let Some(piece) = piece else { continue };
+                let opens = std::fs::read_to_string(root.join(&piece)).unwrap();
+                let first = opens.lines().find(|l| !l.is_empty() && !l.starts_with("//!"));
+                let path = piece.to_str().unwrap();
+                if first == Some("use super::*;") {
+                    assert!(covered(path), "{workflow} runs on {file}, not on {path}, split off from it");
+                }
+            }
+        }
+    }
+}
