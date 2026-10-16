@@ -1636,6 +1636,17 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     }
     steps += 1;
 
+    steps += interactive_shell_language(s, &open_at_5)?;
+    steps += interactive_clipboard_and_completion(s)?;
+    steps += interactive_administration(s)?;
+    steps += interactive_services_and_relogin(s)?;
+    Ok(steps)
+}
+
+/// `test-interactive`'s steps 6 to 19: a failing stage, state across lines, history and search,
+/// `break`, `parse`, errors, sequences, `capture` and Ctrl-C. The number of steps it ran.
+fn interactive_shell_language(s: &mut Session, open_at_5: &str) -> R<usize> {
+    let mut steps = 0usize;
     // 6. A *failing* stage reports and returns to the prompt rather than hanging. This is
     //    the shape that hung the shell for an afternoon: a stage that exits without
     //    writing, whose pipe only closes once its process is reclaimed.
@@ -1864,6 +1875,13 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    Ok(steps)
+}
+
+/// `test-interactive`'s steps 19c to 20: the clipboard from a pipeline, tab completion, and
+/// `exit N`. The number of steps it ran.
+fn interactive_clipboard_and_completion(s: &mut Session) -> R<usize> {
+    let mut steps = 0usize;
     // 19c. **The clipboard, from a pipeline** — M12 Part E and decision 4, whose whole point is
     //      that this resource is not graphical-only. Four claims in order: a session's namespace
     //      carries `/dev/clipboard`; a pipeline can push into the ring; a paste comes back out
@@ -1980,6 +1998,13 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    Ok(steps)
+}
+
+/// `test-interactive`'s steps 20b to 20e: `with`, `disk`, the policy changed and put back, and
+/// an account's life. The number of steps it ran.
+fn interactive_administration(s: &mut Session) -> R<usize> {
+    let mut steps = 0usize;
     // 20b. **`with`: a program in a view** (administration Part A). Everything a person does with
     //      it, at the real prompt, in the order that makes each claim depend on the last.
     //
@@ -2396,6 +2421,13 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    Ok(steps)
+}
+
+/// `test-interactive`'s steps 20f to 21: `service`, `date --set`, `log`, and a bare `exit` back
+/// to the login prompt. The number of steps it ran.
+fn interactive_services_and_relogin(s: &mut Session) -> R<usize> {
+    let mut steps = 0usize;
     // 20f. **`service`, and a restart the session survives** (administration Part E.2b).
     //      (a) `--list` is `service-mgr`'s table, from any session: the clipboard running.
     s.send("service --list | filter name == \"clipboard-server\"")?;
@@ -8077,21 +8109,98 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.expect("Super+R names, Super+A opens applications")?;
     session.expect("desktop-shell: Super+H minimizes the focused window")?;
 
+    let mut st = LoginState { qmp_sock, shell_px, wallpaper_id, work, ..LoginState::default() };
+    login_menus_and_buttons(&mut qmp, &mut session, size, &mut st)?;
+    login_window_list_and_overview(&mut qmp, &mut session, size, &mut st)?;
+    login_overview_drags(&mut qmp, &mut session, &mut st)?;
+    login_file_browser(&mut qmp, &mut session, &mut st)?;
+    login_editor(&mut qmp, &mut session, size, &mut st)?;
+    login_buffers_and_clipboard(&mut qmp, &mut session, &mut st)?;
+    login_dialogs_and_places(qmp, session, size, &mut st)
+}
+
+// **A receipt per character, and it is a count rather than an echo.** An editor's echo is
+// its own window, and this gate boots a release image — there are no rendered glyphs to
+// read on serial. Injection is relative and unacknowledged, so without a per-key wait a
+// dropped PS/2 batch would show up as a *wrong file* two steps later.
+const TYPED: &str = "nitrox";
+
+//    The bar spans the screen at y=0 and `Applications` is its first word, 105 pixels wide
+//    at the staged 12 px (111 at the built-in 13), so a press at (60, 12) lands inside it —
+//    which `desktop_shell::panel`'s own test pins against this literal at both sizes
+//    (desktop refresh, Part C).
+const APPS_CLICK: (i32, i32) = (60, 12);
+
+const TITLE_BAR_H: i32 = chrome::TITLE_BAR_H;
+
+// **And the menu bar above the path strip** (M12 Part B), which moved every row down by its
+// height. `nxfiles::list_top` is the browser's own version of this sum; a gate that had
+// missed the change would press one row high and drag the wrong file.
+const MENU_BAR_H: i32 = 24;
+
+// **Where a listing row is.** Hoisted here from the drag step below, which is the other thing
+// that aims at one — two copies of this sum is how a gate comes to press one row high after
+// a strip changes height. `nxfiles::list_top` is the browser's own version of it.
+// **The sidebar takes the left of the content** (M14 Part D), so every aim at a *listing* row
+// starts past it while the strips above still span the full width. `nxfiles::SIDEBAR_W` is
+// the browser's own version of this number.
+const SIDEBAR_W: i32 = browser::SIDEBAR_W;
+
+const ROW_H: i32 = browser::ROW_H;
+
+const PATH_H: i32 = browser::PATH_H;
+
+// Every `Super`-chord this gate presses goes through here, so the four `send_key` calls a
+// chord is have one spelling rather than one per step.
+/// Press `code` with `Super`, and `Shift` too when `shift`, then let them all go.
+fn chord(qmp: &mut Qmp, shift: bool, code: &str) -> R<()> {
+    qmp.send_key("meta_l", true)?;
+    if shift {
+        qmp.send_key("shift", true)?;
+    }
+    qmp.send_key(code, true)?;
+    qmp.send_key(code, false)?;
+    if shift {
+        qmp.send_key("shift", false)?;
+    }
+    qmp.send_key("meta_l", false)?;
+    Ok(())
+}
+
+/// What `check-login`'s steps hand on to the steps after them.
+#[derive(Default)]
+struct LoginState {
+    edit_id: u32,
+    files_win: (u32, i32, i32, u32, u32),
+    first_term_id: u32,
+    fx: i32,
+    fy: i32,
+    list_click: (i32, i32),
+    qmp_sock: PathBuf,
+    shell_px: u32,
+    term_h: u32,
+    term_id: u32,
+    term_w: u32,
+    term_x: i32,
+    term_y: i32,
+    wallpaper_id: u32,
+    work: (i32, i32, u32, u32, u32, u32),
+}
+
+/// `check-login`'s steps 4 to 6: the Applications menu, a terminal launched from it, its title
+/// bar's buttons and the taskbar's.
+fn login_menus_and_buttons(qmp: &mut Qmp, session: &mut Session, size: DisplaySize, st: &mut LoginState) -> R<()> {
+    let work = st.work;
     // 4. **The Applications menu, by both of its triggers** — `desktop-shell.md` §4's word on
     //    the top bar and its chord. The chord is `Super+A` since Phase 5, because the word is on
     //    a `panel` and a panel can only be clicked: on the laptop Phase 5 targets there is no
     //    pointing device until USB (Phase 6), so without a chord a session could be logged into
     //    and never used.
     //
-    //    The bar spans the screen at y=0 and `Applications` is its first word, 105 pixels wide
-    //    at the staged 12 px (111 at the built-in 13), so a press at (60, 12) lands inside it —
-    //    which `desktop_shell::panel`'s own test pins against this literal at both sizes
-    //    (desktop refresh, Part C).
     //    Asserted through the compositor's own `press at` line first, for the reason
     //    `check-terminal` gives: it separates "the pointer was not there" from "the pointer was
     //    there and nothing happened".
-    const APPS_CLICK: (i32, i32) = (60, 12);
-    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    click_at(qmp, session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications menu open")?;
 
     //    **And the chord, closing what the word opened, then opening it again.** Closing first
@@ -8100,24 +8209,9 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //    below driven entirely by the keyboard, which is the path the laptop has. A chord that
     //    only ever opened would pass this gate while leaving a person no way out of the menu but
     //    Escape.
-    // Every `Super`-chord this gate presses goes through here, so the four `send_key` calls a
-    // chord is have one spelling rather than one per step.
-    let chord = |qmp: &mut Qmp, shift: bool, code: &str| -> R<()> {
-        qmp.send_key("meta_l", true)?;
-        if shift {
-            qmp.send_key("shift", true)?;
-        }
-        qmp.send_key(code, true)?;
-        qmp.send_key(code, false)?;
-        if shift {
-            qmp.send_key("shift", false)?;
-        }
-        qmp.send_key("meta_l", false)?;
-        Ok(())
-    };
-    chord(&mut qmp, false, "a")?;
+    chord(qmp, false, "a")?;
     session.expect("desktop-shell: applications menu closed")?;
-    chord(&mut qmp, false, "a")?;
+    chord(qmp, false, "a")?;
     session.expect("desktop-shell: applications menu open")?;
 
     // 5. **Type to filter, then launch.** The menu is a `popup`, so it holds the keyboard —
@@ -8127,8 +8221,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //    **`nxterm`, which is what makes the milestone visible**: a person types into the
     //    Applications menu and a terminal opens. Part E launched a coreutil because the
     //    mechanism was the deliverable; Part F is the thing launched being worth looking at.
-    type_into_menu(&mut qmp, &mut session, "nxterm")?;
-    press(&mut qmp, "ret")?;
+    type_into_menu(qmp, session, "nxterm")?;
+    press(qmp, "ret")?;
     // Each line is a distinct claim: the namespace was built and **checked** before anything
     // ran in it, and only then was the program spawned into it.
     session.expect("desktop-shell: application namespace grants new + /home + /session/user + /dev/devices + /storage, withholds manage")?;
@@ -8192,7 +8286,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // **Maximise here is asserted as far as the shell's answer** — that the ask reached it and
     // that it answered with the *work area* rather than the screen. What the client does with
     // the size is 6g's, which is where the whole round trip is read back.
-    click_at(&mut qmp, &mut session, maximise_at.0, maximise_at.1)?;
+    click_at(qmp, session, maximise_at.0, maximise_at.1)?;
     // **In any order**: `nxterm` logs its request after the compositor answers, and the compositor
     // answers once it has forwarded it, so the shell's line can come first (PR #353's CI).
     let maximised = format!("desktop-shell: maximize window {term_id} to {},{} {}x{}", work.0, work.1, work.2, work.3);
@@ -8213,7 +8307,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // after that is drawn and committed. Clicking on the strength of the first line lands
     // outside the window — `win=none` — which is what the first run of this step did.
     session.expect(&format!("desktop-shell: window {term_id} geometry {},{} {}x{}", work.0, work.1, work.2, work.3))?;
-    click_at(&mut qmp, &mut session, work.0 + work.2 as i32 - chrome::MAXIMISE_X, work.1 + chrome::TITLE_Y)?;
+    click_at(qmp, session, work.0 + work.2 as i32 - chrome::MAXIMISE_X, work.1 + chrome::TITLE_Y)?;
     // **In any order**: `nxterm` logs its request after the compositor answers, and the compositor
     // answers once it has forwarded it, so the shell's line can come first (PR #353's CI).
     session.expect_all(&[
@@ -8228,7 +8322,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
 
     // **And minimise, end to end**, because nothing in it depends on a client honouring
     // anything: the window leaves the screen and the bar marks it with `_`.
-    click_at(&mut qmp, &mut session, minimise_at.0, minimise_at.1)?;
+    click_at(qmp, session, minimise_at.0, minimise_at.1)?;
     // **In any order** (PR #353's CI, the same class one step down): `nxterm` logs its request
     // after the compositor answers it, and the compositor answers once it has forwarded it, so the
     // shell can be first. The list's `_` exists only after the minimise, so no earlier line
@@ -8243,7 +8337,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
 
     // Restore it from the list, which is where a minimized window comes back from, so the steps
     // below have a window to work with.
-    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
+    click_at(qmp, session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: raised window ")?;
 
     // **And minimise it a second time**, which is the step that was missing. The compositor drops
@@ -8252,7 +8346,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // does not go through that path. With the shadow left stale, this second press was dropped as
     // a repeat, the client was told it had succeeded, and the button stayed dead until some other
     // state was asked for first (PR #249 review, blocking 1).
-    click_at(&mut qmp, &mut session, minimise_at.0, minimise_at.1)?;
+    click_at(qmp, session, minimise_at.0, minimise_at.1)?;
     // **In any order**: `nxterm` logs its request after the compositor answers, and the compositor
     // answers once it has forwarded it, so the shell's line can come first (PR #353's CI).
     session.expect_all(&[
@@ -8260,7 +8354,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
         &format!("desktop-shell: client asked to minimize window {term_id}"),
     ])?;
     println!("  ok: the minimise button still works after the taskbar restored the window");
-    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
+    click_at(qmp, session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: raised window ")?;
 
     // 6a3. **The taskbar asks, and the client is what closes** (M9 Part C). Middle-click is the
@@ -8274,7 +8368,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //      away by its own hand. A shell that destroyed it instead would produce neither line —
     //      and the window would be gone all the same, which is why the client's side is the only
     //      place the difference is visible.
-    middle_click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
+    middle_click_at(qmp, session, list_click.0, list_click.1)?;
     // **Only the ordered half is an `expect`.** The compositor logs before it replies, so it
     // leads; the client then wakes and answers. The *shell's* own line comes after its request
     // returns, which is a race against the client it just woke — observed on both sides of the
@@ -8299,11 +8393,11 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // never for the modal's own window: its rows could not be clicked at all, and nothing under
     // the cursor reacted. Everything after this step depends on the terminal, so a click that
     // silently does nothing fails the rest of the gate rather than passing quietly.
-    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    click_at(qmp, session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications menu open")?;
     // Filtered to one row first, so the row being clicked is known without the gate having to
     // work out where `nxterm` sorts in the contents of `/bin`.
-    type_into_menu(&mut qmp, &mut session, "nxterm")?;
+    type_into_menu(qmp, session, "nxterm")?;
     // **The menu hangs 8 pixels in from its word and 2 below the bar**, at (8, 32), with the
     // filter field above its rows (desktop refresh, Part C) — so the one row left sits a field's
     // height below that, at y 69 to 93 in the staged 12 px (71 to 97 at the built-in 13).
@@ -8311,7 +8405,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // `click_at` asserts the press position before anything downstream is checked, which is what
     // separates "the pointer was not over the row" from "it was, and the click did nothing".
     const ROW1: (i32, i32) = (60, 82);
-    click_at(&mut qmp, &mut session, ROW1.0, ROW1.1)?;
+    click_at(qmp, session, ROW1.0, ROW1.1)?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     session.expect("desktop-shell: placed window ")?;
     let replaced = session.rest_of_line()?;
@@ -8334,11 +8428,35 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // again: the line below matches either way, and would be asserting less than it says. Escape
     // closes a menu left open, and with none open it reaches the focused terminal and does
     // nothing.
-    press(&mut qmp, "esc")?;
+    press(qmp, "esc")?;
     session.skip_to_end()?;
-    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    click_at(qmp, session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications menu open")?;
 
+    st.first_term_id = first_term_id;
+    st.list_click = list_click;
+    st.term_h = term_h;
+    st.term_id = term_id;
+    st.term_w = term_w;
+    st.term_x = term_x;
+    st.term_y = term_y;
+    Ok(())
+}
+
+/// `check-login`'s steps 6b to 6e: the window list, show desktop, the lifecycle rule, the
+/// switcher, the overview and `/dev/desktop`.
+fn login_window_list_and_overview(
+    qmp: &mut Qmp,
+    session: &mut Session,
+    size: DisplaySize,
+    st: &mut LoginState,
+) -> R<()> {
+    let list_click = st.list_click;
+    let term_h = st.term_h;
+    let term_w = st.term_w;
+    let term_x = st.term_x;
+    let term_y = st.term_y;
+    let wallpaper_id = st.wallpaper_id;
     // 6b. **The window list, and the two things you can do to a window from it** (M8 Part C).
     //
     //     The launched terminal is a `normal` window, so it is listed — and it holds the
@@ -8370,7 +8488,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // change *whatever else is on screen* — which is what makes it the honest test. Aiming at
     // bare desktop instead would depend on the terminal not being maximised at this point in the
     // gate, and it is.
-    click_at(&mut qmp, &mut session, 600, size.bottom_bar_click_y())?;
+    click_at(qmp, session, 600, size.bottom_bar_click_y())?;
     session.expect("desktop-shell: applications menu closed")?;
     // **That the compositor *said* so is checked against the whole transcript below**, not here.
     // The dismissal is logged while the press is being routed and the `press at` line is logged
@@ -8378,7 +8496,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // position assertion has already scanned past it. Same rule this gate applies to every line
     // whose order is an implementation detail rather than a claim.
 
-    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
+    click_at(qmp, session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: minimized window ")?;
     // **The marker, not just a non-empty list.** The list still holds it — minimizing is not
     // closing, and a taskbar that dropped the entry would leave no way to get the window back —
@@ -8387,7 +8505,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: window list on ")?;
     session.expect(":_ nxterm")?;
 
-    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
+    click_at(qmp, session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: raised window ")?;
     // Restored and focused. Focus arrives one iteration after the raise, so this is the second
     // list line the click produces, not the first.
@@ -8406,11 +8524,11 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //      step has, and is `desktop_shell::ShownDesktop`'s host tests (PR #314 review, optional
     //      5).
     let show = size.show_desktop_click();
-    click_at(&mut qmp, &mut session, show.0, show.1)?;
+    click_at(qmp, session, show.0, show.1)?;
     session.expect("desktop-shell: showing the desktop, minimised 1 window(s)")?;
     session.expect("desktop-shell: window list on ")?;
     session.expect(":_ nxterm")?;
-    click_at(&mut qmp, &mut session, show.0, show.1)?;
+    click_at(qmp, session, show.0, show.1)?;
     session.expect("desktop-shell: restored 1 window(s)")?;
     // Focus arrives one iteration after the raise, so this is the second list line, as above.
     session.expect(":> nxterm")?;
@@ -8418,7 +8536,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
 
     // And the chord, which is the half a taskbar alone does not cover: putting a window away
     // without reaching for its entry. `Super+H`.
-    chord(&mut qmp, false, "h")?;
+    chord(qmp, false, "h")?;
     session.expect("desktop-shell: Super+H minimized window ")?;
 
     // 6c. **The lifecycle rule, which is Part D's whole claim** (M8 Part D).
@@ -8438,21 +8556,21 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // focused — so `Super+Shift+N`, which moves *the focused window*, would correctly find
     // nothing to move and this block would assert against a gesture that did nothing. Clicking
     // its list entry restores and raises it, which is the gesture Part C added for exactly this.
-    click_at(&mut qmp, &mut session, list_click.0, list_click.1)?;
+    click_at(qmp, session, list_click.0, list_click.1)?;
     session.expect("desktop-shell: raised window ")?;
     session.expect(":> nxterm")?;
 
     // Name it. The prompt is the same popup the launcher uses — a `panel` takes no keyboard
     // focus, so the bar itself could never read a typed name.
-    chord(&mut qmp, false, "r")?;
+    chord(qmp, false, "r")?;
     session.expect("desktop-shell: naming this desktop")?;
     // **`Super+A` closes this too, and says which popup it closed.** One window serves both the
     // launcher and the name prompt, so a dismissal that read as the launcher's would send a
     // later gate looking for a line sitting in the transcript under the other name (PR #304
     // review, finding 1). Then reopen it and carry on naming.
-    chord(&mut qmp, false, "a")?;
+    chord(qmp, false, "a")?;
     session.expect("desktop-shell: name prompt closed")?;
-    chord(&mut qmp, false, "r")?;
+    chord(qmp, false, "r")?;
     session.expect("desktop-shell: naming this desktop")?;
     // **One character at a time, waiting for each**, the way `type_at_greeter` does. Injection
     // is relative and unacknowledged: a dropped batch ate the `r` and produced a desktop named
@@ -8461,11 +8579,11 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     for c in "work".chars() {
         let mut qcode = String::new();
         qcode.push(c);
-        press(&mut qmp, &qcode)?;
+        press(qmp, &qcode)?;
         typed.push(c);
         session.expect(&format!("desktop-shell: name so far {typed}"))?;
     }
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
     session.expect("desktop-shell: named this desktop work")?;
     session.expect("desktop-shell: window list on work of 2")?;
 
@@ -8477,10 +8595,10 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     const NEXT_FROM_RIGHT: i32 = 67;
     const FIRST_CELL_FROM_RIGHT: i32 = 148;
     let bar_y = size.bottom_bar_click_y();
-    click_at(&mut qmp, &mut session, size.w as i32 - NEXT_FROM_RIGHT, bar_y)?;
+    click_at(qmp, session, size.w as i32 - NEXT_FROM_RIGHT, bar_y)?;
     session.expect("desktop-shell: switched to Desktop 2")?;
     session.expect("desktop-shell: window list on Desktop 2 of 2 (empty)")?;
-    click_at(&mut qmp, &mut session, size.w as i32 - FIRST_CELL_FROM_RIGHT, bar_y)?;
+    click_at(qmp, session, size.w as i32 - FIRST_CELL_FROM_RIGHT, bar_y)?;
     session.expect("desktop-shell: switched to work")?;
     // **And the terminal has the keyboard again, because it is on the desktop the compositor is
     // showing.** The first runs of this step came back `[N:  nxterm]` — listed, unfocused, and not
@@ -8495,12 +8613,12 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // Move the terminal to the second desktop. `work` is now empty — and **named**, so it
     // stays; the desktop that received the window is no longer the scratch slot, so a new one
     // is appended. Two facts in one line: the bar still says `work`, and there are three.
-    chord(&mut qmp, true, "2")?;
+    chord(qmp, true, "2")?;
     session.expect("desktop-shell: moved window ")?;
     session.expect("desktop-shell: window list on work of 3 (empty)")?;
 
     // Follow it, to prove the list filters by desktop rather than merely being emptied.
-    chord(&mut qmp, false, "2")?;
+    chord(qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
     session.expect(":> nxterm")?;
 
@@ -8512,7 +8630,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // was on, which has just been emptied. That desktop is now the trailing scratch slot, which
     // the rule keeps, so the reading is "desktop 2 of 2, empty": one desktop fewer than before,
     // and the one that went was the unnamed one.
-    chord(&mut qmp, true, "1")?;
+    chord(qmp, true, "1")?;
     session.expect("desktop-shell: moved window ")?;
     session.expect("desktop-shell: window list on Desktop 2 of 2 (empty)")?;
 
@@ -8525,9 +8643,9 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //
     //     Bring the terminal back to this desktop first: `work` is empty after 6c, and an
     //     overview of nothing has no thumbnail to drag.
-    chord(&mut qmp, false, "1")?;
+    chord(qmp, false, "1")?;
     session.expect("desktop-shell: switched to work")?;
-    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
+    click_at(qmp, session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     // **The compositor's own line first, and it comes first in the guest too**: the shell
     // captures every visible window *before* it creates the overview to show them in. Asserted
     // rather than inferred, because an overview that opened with no thumbnails would satisfy
@@ -8568,16 +8686,16 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // that did nothing either. As of 2026-08-26 a click on a thumbnail raises its window and a
     // click on the background dismisses — which is the point of those changes, and leaves a
     // verifying click with no inert place to land.
-    move_pointer_to(&mut qmp, thumb.0, thumb.1)?;
+    move_pointer_to(qmp, thumb.0, thumb.1)?;
     qmp.pointer = Some(thumb);
     qmp.send_button("left", true)?;
     // The press is the last event injected, so QEMU may hold it — see `expect_after_pointer`.
-    expect_after_pointer(&mut qmp, &mut session, "desktop-shell: dragging window ")?;
+    expect_after_pointer(qmp, session, "desktop-shell: dragging window ")?;
     let (dx, dy) = size.card_click(1, cards);
-    move_pointer_to(&mut qmp, dx, dy)?;
+    move_pointer_to(qmp, dx, dy)?;
     qmp.pointer = Some((dx, dy));
     qmp.send_button("left", false)?;
-    expect_after_pointer(&mut qmp, &mut session, "desktop-shell: dropped window ")?;
+    expect_after_pointer(qmp, session, "desktop-shell: dropped window ")?;
     session.expect("desktop-shell: overview closed")?;
 
     // And it really moved: `work` is empty again, and the window is on the desktop it was
@@ -8597,13 +8715,13 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //
     // The switch is asserted *before* the raise because that is the order the shell does it in:
     // a raise on a desktop that is not being composited is the bug, not the fix.
-    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
+    click_at(qmp, session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
     let open_line = session.rest_of_line()?;
     let cards = parse_overview_line(&open_line)
         .ok_or_else(|| format!("could not read the overview's card count from {open_line:?}"))?;
     let away = size.window_in_card(1, cards, (term_x, term_y, term_w, term_h));
-    click_at(&mut qmp, &mut session, away.0, away.1)?;
+    click_at(qmp, session, away.0, away.1)?;
     // **`Desktop 2`, not `cli`**: the second desktop is not named until 6f, so at this point its
     // label is the positional one `desktop_label` gives an unnamed desktop.
     session.expect("desktop-shell: switched to Desktop 2")?;
@@ -8612,9 +8730,9 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     println!("  ok: a window in another desktop's card went to that desktop and raised it");
 
     // Back to `work`, so the rest of this step runs from where it used to.
-    chord(&mut qmp, false, "1")?;
+    chord(qmp, false, "1")?;
     session.expect("desktop-shell: switched to work")?;
-    chord(&mut qmp, false, "2")?;
+    chord(qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
     session.expect(":> nxterm")?;
 
@@ -8640,8 +8758,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // 28 of them — and its router has nowhere to send them, so nothing reaches the shell and
     // the command simply never runs. `check-terminal` has always clicked into the terminal
     // before typing; this gate had not needed to until now.
-    click_at(&mut qmp, &mut session, 200, 200)?;
-    type_at_terminal(&mut qmp, "desktop")?;
+    click_at(qmp, session, 200, 200)?;
+    type_at_terminal(qmp, "desktop")?;
     // **The shell answering, and the command reporting** — both halves, because either alone
     // is satisfiable without the other. A shell that served a list nobody received would print
     // the first; a command that invented an answer would print the second.
@@ -8657,7 +8775,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // **The desktop showing, which is the second one** — the drop moved the terminal there and
     // `Super+2` followed it. Naming the *first* would change a desktop the bar is not showing,
     // and the assertion below reads the bar.
-    type_at_terminal(&mut qmp, "desktop name 2 cli")?;
+    type_at_terminal(qmp, "desktop name 2 cli")?;
     session.expect("desktop-shell: served Name cli")?;
     // The bar is the shell's own readout, so this is the model changing rather than a reply.
     session.expect("desktop-shell: window list on cli of ")?;
@@ -8674,7 +8792,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // **The desktop's name opens the overview**, as the indicator in its place did since M8
     // Part E — what `desktop-shell.md` §7 always specified. Escape closes it again so the serial login below is not typing at a
     // popup that holds the keyboard.
-    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
+    click_at(qmp, session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     // **Before the "overview open" line, because that is where it is** — `open_overview` reports
     // its ground and the caller announces the window afterwards. An expectation placed beside
     // its *topic* rather than beside its position in the stream scans past output that was
@@ -8695,7 +8813,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: overview ground is the wallpaper")?;
     println!("  ok: the overview kept the desktop's picture rather than covering it");
     session.expect("desktop-shell: overview open, window ")?;
-    press(&mut qmp, "esc")?;
+    press(qmp, "esc")?;
     session.expect("desktop-shell: overview closed")?;
 
     // **And so is the wallpaper, which it was not** (M12 Part F; PR #272 review, blocking 1).
@@ -8709,7 +8827,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // gives `win=none` when it is not — the same discriminator the bars use above, and the same
     // reason: the shell's own "is sticky" line says it *asked*, and the compositor's says it
     // took.
-    chord(&mut qmp, false, "3")?;
+    chord(qmp, false, "3")?;
     session.expect("desktop-shell: switched to ")?;
     // **Empty is asserted, not assumed** — the discriminator only works where nothing else is
     // under the cursor, and which desktop holds what has moved several times by this point.
@@ -8719,7 +8837,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // run.) Returned rather than read here, because `click_at` now also waits for the *release*
     // and that wait moves the cursor past the press line — a `rest_of_line` here would read the
     // release's `win=`, which is `none` by construction.
-    let hit = click_at(&mut qmp, &mut session, size.centre().0, size.centre().1)?;
+    let hit = click_at(qmp, session, size.centre().0, size.centre().1)?;
     if !hit.contains(&format!("win={wallpaper_id}")) {
         return Err(format!(
             "a press on an empty desktop reported '{}' — the wallpaper (window {wallpaper_id}) \
@@ -8730,7 +8848,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     }
     println!("  ok: the wallpaper is sticky — still there on an empty desktop");
     // Back to the one the rest of this gate is written against.
-    chord(&mut qmp, false, "2")?;
+    chord(qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
 
     // 6f. **The overview's clicks, which were dead until 2026-08-26.** `desktop-shell.md` §6
@@ -8741,7 +8859,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //     Reported from a real session, which is the part worth keeping: the drag was gated and
     //     the click was not, and a gate that drives only the gesture it was written for cannot
     //     tell the difference between "unimplemented" and "untested".
-    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
+    click_at(qmp, session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
     let open_line = session.rest_of_line()?;
     let cards = parse_overview_line(&open_line)
@@ -8750,7 +8868,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // The chord path first: an overview left showing the desktop you just switched away from is
     // showing a card whose windows are no longer on it. It follows instead of closing,
     // which is what §6 means by "it fetches a different set of images".
-    chord(&mut qmp, false, "1")?;
+    chord(qmp, false, "1")?;
     session.expect("desktop-shell: switched to work")?;
     session.expect("desktop-shell: overview now showing 0 on work")?;
 
@@ -8762,22 +8880,22 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // that window" instead — which is the distinction the cards made possible and the reason
     // this point is not simply the card's middle.
     let (sx, sy) = size.card_click(1, cards);
-    click_at(&mut qmp, &mut session, sx, sy)?;
+    click_at(qmp, session, sx, sy)?;
     session.expect("desktop-shell: switched to cli")?;
     session.expect("desktop-shell: overview now showing 1 on cli")?;
 
     // **Clicking the row you are already on dismisses**, which is the way out of an overview on
     // a desktop with no windows — where clicking a window, the other way out, does not exist.
     // Reported as being stuck there with Escape the only escape, and Escape is not discoverable.
-    click_at(&mut qmp, &mut session, sx, sy)?;
+    click_at(qmp, session, sx, sy)?;
     session.expect("desktop-shell: overview closed")?;
 
     // **And a click on its background dismisses**, the way clicking outside a menu does. That
     // also makes the desktop's name a toggle: the overview covers the bar, so a second click
     // where the name is lands on background.
-    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
+    click_at(qmp, session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
-    click_at(&mut qmp, &mut session, 600, 700)?;
+    click_at(qmp, session, 600, 700)?;
     session.expect("desktop-shell: overview closed")?;
 
     // And a click on a window in a card activates it, which is the third way out and the one
@@ -8786,16 +8904,27 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // **The terminal is on `cli` now**, which the clicks above switched to, so its box is in
     // whichever card that is — found by the same arithmetic as the drag, against the geometry
     // the shell reported when it placed the window.
-    click_at(&mut qmp, &mut session, size.desktop_name_click().0, size.desktop_name_click().1)?;
+    click_at(qmp, session, size.desktop_name_click().0, size.desktop_name_click().1)?;
     session.expect("desktop-shell: overview open, window ")?;
     let open_line = session.rest_of_line()?;
     let cards = parse_overview_line(&open_line)
         .ok_or_else(|| format!("could not read the overview's card count from {open_line:?}"))?;
     let on_term = size.window_in_card(1, cards, (term_x, term_y, term_w, term_h));
-    click_at(&mut qmp, &mut session, on_term.0, on_term.1)?;
+    click_at(qmp, session, on_term.0, on_term.1)?;
     session.expect("desktop-shell: overview raised window ")?;
     session.expect("desktop-shell: overview closed")?;
 
+    Ok(())
+}
+
+/// `check-login`'s steps 6f to 6k and the second session: the overview's clicks, dragging,
+/// resizing and snapping windows.
+fn login_overview_drags(qmp: &mut Qmp, session: &mut Session, st: &mut LoginState) -> R<()> {
+    let term_id = st.term_id;
+    let term_w = st.term_w;
+    let term_x = st.term_x;
+    let term_y = st.term_y;
+    let work = st.work;
     // 6g. **A window is dragged by its own title bar** (M9 Part A). Client-side decorations mean
     //     the bar is pixels `nxterm` committed; what crosses the wire is one `StartMove`, and the
     //     compositor — which is holding the grab the press opened — moves the window from there.
@@ -8824,7 +8953,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     const DRAG_DY: i32 = 5;
     // The title bar is the top of the window; x=100 is clear of the buttons at its right.
     let press_at = (100, term_y + chrome::TITLE_Y);
-    move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
+    move_pointer_to(qmp, press_at.0, press_at.1)?;
     qmp.pointer = Some(press_at);
     qmp.send_button("left", true)?;
     // **Half the motion before the request can possibly arrive**, which is the half a
@@ -8849,8 +8978,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // the destination is its origin plus that — which was the same number only while the cascade
     // placed every window at x=0 (M11 Part E batch 4).
     expect_after_pointer(
-        &mut qmp,
-        &mut session,
+        qmp,
+        session,
         &format!(
             "desktop-shell: window {term_id} geometry {},{} ",
             term_x + DRAG_STEPS * DRAG_DX,
@@ -8875,7 +9004,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // was placed plus what the drag injected.
     let moved_x = term_x + DRAG_STEPS * DRAG_DX;
     let moved_y = term_y + DRAG_STEPS * DRAG_DY;
-    click_at(&mut qmp, &mut session, moved_x + term_w as i32 - chrome::MAXIMISE_X, moved_y + chrome::TITLE_Y)?;
+    click_at(qmp, session, moved_x + term_w as i32 - chrome::MAXIMISE_X, moved_y + chrome::TITLE_Y)?;
     // **Two producers, one cause, so no order between them.** The shell logs the window's new
     // origin when the compositor's geometry event reaches it; the client logs the size it took
     // when the `Configure` reaches it. Both are downstream of the same apply and neither is
@@ -8925,23 +9054,19 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // The grip is a 16-pixel square over the window's bottom-right corner; its middle is eight
     // pixels in from each edge.
     let grip_at = (work.0 + work.2 as i32 - 8, work.1 + work.3 as i32 - 8);
-    move_pointer_to(&mut qmp, grip_at.0, grip_at.1)?;
+    move_pointer_to(qmp, grip_at.0, grip_at.1)?;
     qmp.pointer = Some(grip_at);
     qmp.send_button("left", true)?;
     // `RESIZE_RIGHT | RESIZE_BOTTOM` is `2 | 8`.
-    expect_after_pointer(
-        &mut qmp,
-        &mut session,
-        &format!("compositor: interactive resize of window {term_id} edges 10"),
-    )?;
+    expect_after_pointer(qmp, session, &format!("compositor: interactive resize of window {term_id} edges 10"))?;
     for _ in 0..RESIZE_STEPS {
         qmp.send_motion(RESIZE_DX, RESIZE_DY)?;
     }
     qmp.send_button("left", false)?;
     qmp.pointer = Some((grip_at.0 + RESIZE_STEPS * RESIZE_DX, grip_at.1 + RESIZE_STEPS * RESIZE_DY));
     expect_after_pointer(
-        &mut qmp,
-        &mut session,
+        qmp,
+        session,
         &format!(
             "compositor: interactive resize of window {term_id} ended at {},{} {resized_w}x{resized_h}",
             work.0, work.1
@@ -8979,10 +9104,10 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // here, and this line is what catches it. Asserting the absence of a snap would not: the
     // step after this one produces exactly that line, and an `expect` scans forward.
     let press_at = (100, work.1 + chrome::TITLE_Y);
-    move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
+    move_pointer_to(qmp, press_at.0, press_at.1)?;
     qmp.pointer = Some(press_at);
     qmp.send_button("left", true)?;
-    expect_after_pointer(&mut qmp, &mut session, "compositor: interactive move of window ")?;
+    expect_after_pointer(qmp, session, "compositor: interactive move of window ")?;
     // **The expectation is summed from what is injected**, not written out beside it: the first
     // version divided each leg into three and wrote the leg's total, which is two pixels away
     // from three times a truncated third.
@@ -8996,8 +9121,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     let passed_to = (press_at.0 + walked.0, press_at.1 + walked.1);
     qmp.pointer = Some(passed_to);
     expect_after_pointer(
-        &mut qmp,
-        &mut session,
+        qmp,
+        session,
         &format!(
             "desktop-shell: window {term_id} geometry {},{} {}x{}",
             work.0 + walked.0,
@@ -9015,12 +9140,12 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // the left half, so this press lands on nothing — and the failure says so here, one line
     // after the assertion it belongs to, instead of surfacing as a missing drag further down.
     let press_at = (passed_to.0 + 90, passed_to.1);
-    move_pointer_to(&mut qmp, press_at.0, press_at.1)?;
+    move_pointer_to(qmp, press_at.0, press_at.1)?;
     qmp.pointer = Some(press_at);
     qmp.send_button("left", true)?;
     expect_after_pointer(
-        &mut qmp,
-        &mut session,
+        qmp,
+        session,
         &format!("compositor: press at x={} y={} win={term_id}", press_at.0, press_at.1),
     )?;
     // **On its title bar specifically**, which is the sharpest statement of where the window is:
@@ -9051,8 +9176,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // The compositor asks for the zone's target; the shell answers with the `Configure`; the
     // client commits it. Half the **work area**, at its origin.
     expect_after_pointer(
-        &mut qmp,
-        &mut session,
+        qmp,
+        session,
         &format!("desktop-shell: drop window {term_id} to {},{} {}x{}", work.0, work.1, work.2 / 2, work.3),
     )?;
     session.expect(&format!("nxterm: resized to {}x{}, grid ", work.2 / 2, work.3))?;
@@ -9087,7 +9212,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //     consumer that stops reading and therefore means the same thing at any speed; what
     //     this step still buys is the whole path — a real manager, a real desktop switch, a
     //     real cursor — on the accelerator a person actually runs locally.
-    burst_holds_its_position(&mut qmp, &mut session, &chord)?;
+    burst_holds_its_position(qmp, session, &chord)?;
 
     // 6i. **The close button is the client's own, and sends nothing** (M9 Part C). Everything
     //      else on this bar asks the shell; this one exits. The window **is** the work area
@@ -9106,9 +9231,9 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //
     //      **Measured from the snapped width**: 6j dragged the window smaller by its corner and
     //      6k then dropped it at the left edge, so its right edge is the work area's midpoint.
-    chord(&mut qmp, false, "2")?;
+    chord(qmp, false, "2")?;
     session.expect("desktop-shell: switched to ")?;
-    click_at(&mut qmp, &mut session, work.0 + (work.2 / 2) as i32 - chrome::CLOSE_X, work.1 + chrome::TITLE_Y)?;
+    click_at(qmp, session, work.0 + (work.2 / 2) as i32 - chrome::CLOSE_X, work.1 + chrome::TITLE_Y)?;
     session.expect("nxterm: closing")?;
     session.expect("desktop-shell: window list on ")?;
     println!("  ok: the close button closed the terminal with no request to the shell");
@@ -9128,6 +9253,12 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.send(DEMO_PASSWORD)?;
     session.expect("/home>")?;
 
+    Ok(())
+}
+
+/// `check-login`'s step 7: the file browser, and the two sessions used as one fact.
+fn login_file_browser(qmp: &mut Qmp, session: &mut Session, st: &mut LoginState) -> R<()> {
+    let shell_px = st.shell_px;
     // 7. **The file browser, and the two sessions used as one fact** (M10 Part B). The serial
     //    shell just logged in above, and it sees the *same* `/home` subtree the graphical
     //    session does — `libsession::build_namespace` and `desktop-shell::build_app_namespace`
@@ -9137,10 +9268,10 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.send("mkdir ./papers")?;
     session.expect("/home>")?;
 
-    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    click_at(qmp, session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications menu open")?;
-    type_into_menu(&mut qmp, &mut session, "nxfiles")?;
-    press(&mut qmp, "ret")?;
+    type_into_menu(qmp, session, "nxfiles")?;
+    press(qmp, "ret")?;
     // **The theme reached the application** (M11 Part C): a value that travelled from a file on
     // disk, through one reader in the shell, onto the setup record every launch already carries,
     // and into a window. It is asserted here because it is the first thing the client says — it
@@ -9187,7 +9318,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // asking for it first consumed the listing this step asserts. The gate presses on a row
     // later, and a row's position is the window's origin plus chrome; re-deriving the shell's
     // placement cascade here would be a second copy of a policy that is the shell's to change.
-    let files_win = next_geometry(&mut session)?;
+    let files_win = next_geometry(session)?;
 
     // **Enter descends into the selected row**, which is the keyboard reaching the same message a
     // row press produces.
@@ -9197,14 +9328,14 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // Part D staged three, so it does. Each arrow is acknowledged by the browser's `selected`
     // receipt, which is both a per-keystroke acknowledgement and the assertion that the arrow
     // moved where this thinks it did.
-    select_papers(&mut qmp, &mut session)?;
-    press(&mut qmp, "ret")?;
+    select_papers(qmp, session)?;
+    press(qmp, "ret")?;
     session.expect("nxfiles: listed /home/papers - 0 entries")?;
     println!("  ok: Enter descended, and an empty directory lists nothing");
 
     // And Backspace leaves it again. Two navigations, both from the keyboard, because a
     // listing a person cannot drive without aiming at it is a listing they have to aim at.
-    press(&mut qmp, "backspace")?;
+    press(qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
     println!("  ok: Backspace went back up");
 
@@ -9215,7 +9346,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //
     // **A receipt per character**, the discipline every typed sequence in this gate follows.
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "l")?;
+    press(qmp, "l")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxfiles: location so far 5 chars")?;
     println!("  ok: Ctrl+L opened the bar seeded with /home");
@@ -9224,7 +9355,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // the property the emptying itself proves: a browser whose listing still had the keyboard
     // would navigate rather than edit, and the counts below would never arrive.
     for left in (0..5).rev() {
-        press(&mut qmp, "backspace")?;
+        press(qmp, "backspace")?;
         session.expect(&format!("nxfiles: location so far {left} chars"))?;
     }
     for (i, c) in "/home/papers".chars().enumerate() {
@@ -9232,10 +9363,10 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
             '/' => String::from("slash"),
             other => other.to_string(),
         };
-        press(&mut qmp, &qcode)?;
+        press(qmp, &qcode)?;
         session.expect(&format!("nxfiles: location so far {} chars", i + 1))?;
     }
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
     // **The bar closes before the listing arrives, and the order is not a choice.** The receipt
     // is emitted from the render pass, which runs a full turn of the loop before the pending
     // navigation is taken — so `closed` is on the wire first. `Session::expect` consumes what it
@@ -9246,7 +9377,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     println!("  ok: and what was typed into it became a navigation");
 
     // Back to `/home`, which is where the steps below expect to be.
-    press(&mut qmp, "backspace")?;
+    press(qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
 
     // **Properties** (M14 Part D). `Ctrl+I` on the selected row, then `Esc`.
@@ -9257,7 +9388,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // asserted, and the slice between them is checked for the browser's own complaint.
     let before_props = session.transcript().len();
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "i")?;
+    press(qmp, "i")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxfiles: showing properties")?;
     // **Pressed once the dialog has the keyboard, not once it was asked for.** `showing` is
@@ -9265,7 +9396,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // the browser — an `Esc` there does nothing, and the dialog never closes. A probe that held
     // the shell's placement for half a second failed this step exactly that way.
     session.expect("nxfiles: properties has the keyboard")?;
-    press(&mut qmp, "esc")?;
+    press(qmp, "esc")?;
     session.expect("nxfiles: properties closed")?;
     let props_window = session.transcript()[before_props..].to_string();
     if props_window.contains("could not be drawn") || props_window.contains("could not open") {
@@ -9274,24 +9405,10 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     }
     println!("  ok: Ctrl+I showed the properties dialog, and Esc closed it");
 
-    // **Where a listing row is.** Hoisted here from the drag step below, which is the other thing
-    // that aims at one — two copies of this sum is how a gate comes to press one row high after
-    // a strip changes height. `nxfiles::list_top` is the browser's own version of it.
-    // **The sidebar takes the left of the content** (M14 Part D), so every aim at a *listing* row
-    // starts past it while the strips above still span the full width. `nxfiles::SIDEBAR_W` is
-    // the browser's own version of this number.
-    const SIDEBAR_W: i32 = browser::SIDEBAR_W;
     // **And the margin around it** (M15 Part E), which moved every sidebar row down by its height
     // without moving a listing row at all. The design's sidebar runs to the window's edge, so
     // since the refresh's Part I that margin is nought.
     const SIDEBAR_PAD: i32 = browser::SIDEBAR_PAD;
-    const TITLE_BAR_H: i32 = chrome::TITLE_BAR_H;
-    const PATH_H: i32 = browser::PATH_H;
-    const ROW_H: i32 = browser::ROW_H;
-    // **And the menu bar above the path strip** (M12 Part B), which moved every row down by its
-    // height. `nxfiles::list_top` is the browser's own version of this sum; a gate that had
-    // missed the change would press one row high and drag the wrong file.
-    const MENU_BAR_H: i32 = 24;
     // **No tab strip while there is one tab** (desktop refresh, Part I): the browser leaves it
     // out rather than drawing an empty one, so every row moved up by its height — and **a column
     // header sits above the rows now**, so they moved back down by its. `nxfiles::list_top` is
@@ -9318,10 +9435,10 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // Sidebar rows are Home, the three folders, then Root; they sit `SIDEBAR_PAD` below the
     // listing rows beside them, because the panel is inset from the content it shares an edge
     // with while the strips above span the full width.
-    click_at(&mut qmp, &mut session, files_win.1 + 40, side_y(1))?;
+    click_at(qmp, session, files_win.1 + 40, side_y(1))?;
     session.expect("nxfiles: listed /home/Documents - ")?;
     println!("  ok: one press on a sidebar row went there");
-    press(&mut qmp, "backspace")?;
+    press(qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
 
     // **Cut, copy and paste of files** (M14 Part D), which is the file-clipboard deferral built: a
@@ -9331,19 +9448,19 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // matching count.
     //
     // Row 4 is `theme.toml`, the first file after the three directories.
-    click_at(&mut qmp, &mut session, files_win.1 + SIDEBAR_W + 120, row_y(4))?;
+    click_at(qmp, session, files_win.1 + SIDEBAR_W + 120, row_y(4))?;
     session.expect("nxfiles: selected theme.toml")?;
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "c")?;
+    press(qmp, "c")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxfiles: clipboard now holds 1 path(s) to copy")?;
     println!("  ok: Ctrl+C put a path on the clipboard");
 
     // Into an empty directory, by the sidebar, and paste there.
-    click_at(&mut qmp, &mut session, files_win.1 + 40, side_y(1))?;
+    click_at(qmp, session, files_win.1 + 40, side_y(1))?;
     session.expect("nxfiles: listed /home/Documents - 0 entries")?;
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "v")?;
+    press(qmp, "v")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxfiles: copied /home/Documents/theme.toml")?;
     session.expect("nxfiles: listed /home/Documents - 1 entries")?;
@@ -9356,7 +9473,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.expect("/home>")?;
     println!("  ok: and the shell sees the file the paste made");
 
-    press(&mut qmp, "backspace")?;
+    press(qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
 
     // **A single click selects, a double click opens** (M14 Part D, decision 5).
@@ -9375,7 +9492,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // `wallpaper.png` — directories lead, so row 4 is the first file.
     let before = session.transcript().len();
     let file_row = (files_win.1 + SIDEBAR_W + 120, row_y(4));
-    click_at(&mut qmp, &mut session, file_row.0, file_row.1)?;
+    click_at(qmp, session, file_row.0, file_row.1)?;
     session.expect("nxfiles: selected theme.toml")?;
     println!("  ok: one click on a file selected it");
 
@@ -9395,15 +9512,24 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
 
     // Two clicks on the directory row descend into it.
     let dir_row = (files_win.1 + SIDEBAR_W + 120, row_y(3));
-    click_at(&mut qmp, &mut session, dir_row.0, dir_row.1)?;
+    click_at(qmp, session, dir_row.0, dir_row.1)?;
     session.expect("nxfiles: selected papers")?;
-    click_at(&mut qmp, &mut session, dir_row.0, dir_row.1)?;
+    click_at(qmp, session, dir_row.0, dir_row.1)?;
     session.expect("nxfiles: listed /home/papers - ")?;
     println!("  ok: and a second click on a directory descended");
 
-    press(&mut qmp, "backspace")?;
+    press(qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
 
+    st.files_win = files_win;
+    Ok(())
+}
+
+/// `check-login`'s steps 8 to 9: the editor opened by the browser, undo and find, and a file
+/// dropped onto it.
+fn login_editor(qmp: &mut Qmp, session: &mut Session, size: DisplaySize, st: &mut LoginState) -> R<()> {
+    let files_win = st.files_win;
+    let work = st.work;
     // 8. **The editor, opened by the browser, and read back by the shell** (M10 Part D). The
     //    same two-session fact as step 7, used the other way round: there the serial side made
     //    something the graphical side had to see; here the graphical side writes something the
@@ -9417,14 +9543,14 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
 
     // **The selection is on `Documents` again**, because the `Backspace` above re-listed `/home`
     // and a fresh listing selects row 0.
-    select_papers(&mut qmp, &mut session)?;
-    press(&mut qmp, "ret")?;
+    select_papers(qmp, session)?;
+    press(qmp, "ret")?;
     session.expect("nxfiles: listed /home/papers - 1 entries")?;
 
     // **Enter on a file row asks the shell to open it**, which is Part B's box, moved here
     // because it needed something to launch. The browser holds no authority to spawn anything —
     // it names a path over `/dev/desktop` and the shell decides what opens it.
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
     session.expect("desktop-shell: launched nxedit into its own namespace")?;
     // **Two processes reacting to one launch, so no order between them**: the browser learns
     // its request was taken when the shell's reply arrives, and the editor reads the file when
@@ -9438,18 +9564,13 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.expect_all(&[&asked, &opened])?;
     // After the open, for the reason the browser's is read after its listing: the editor reads
     // its file before it has a window to place.
-    let edit_win = next_geometry(&mut session)?;
+    let edit_win = next_geometry(session)?;
     println!("  ok: a file row launched the editor on the file it names");
 
-    // **A receipt per character, and it is a count rather than an echo.** An editor's echo is
-    // its own window, and this gate boots a release image — there are no rendered glyphs to
-    // read on serial. Injection is relative and unacknowledged, so without a per-key wait a
-    // dropped PS/2 batch would show up as a *wrong file* two steps later.
-    const TYPED: &str = "nitrox";
     for (i, c) in TYPED.chars().enumerate() {
         let mut qcode = String::new();
         qcode.push(c);
-        press(&mut qmp, &qcode)?;
+        press(qmp, &qcode)?;
         session.expect(&format!("nxedit: buffer rev {}", i + 1))?;
     }
     println!("  ok: {} keystrokes reached the editor's buffer", TYPED.len());
@@ -9457,7 +9578,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // Ctrl+S, and the editor says what it wrote. Seven bytes: six typed and the newline the
     // editor adds, because a last line without one reads as one line shorter than it looks.
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "s")?;
+    press(qmp, "s")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxedit: saved /home/papers/notes.txt - 7 bytes")?;
 
@@ -9481,18 +9602,18 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     for c in "ab".chars() {
         let mut qcode = String::new();
         qcode.push(c);
-        press(&mut qmp, &qcode)?;
+        press(qmp, &qcode)?;
         session.expect("nxedit: buffer rev ")?;
     }
 
     // Ctrl+Z. The revision moves on an undo, which is what makes an undone buffer read as
     // modified — the editor has to ask before closing something that is no longer the file.
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "z")?;
+    press(qmp, "z")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxedit: buffer rev ")?;
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "s")?;
+    press(qmp, "s")?;
     qmp.send_key("ctrl", false)?;
     // Seven: `nitrox` and the newline the editor adds. Eight would mean the undo took one
     // character rather than the group; nine would mean it took nothing.
@@ -9504,11 +9625,11 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
 
     // Ctrl+Y brings it back, and the file grows by exactly what the undo removed.
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "y")?;
+    press(qmp, "y")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxedit: buffer rev ")?;
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "s")?;
+    press(qmp, "s")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxedit: saved /home/papers/notes.txt - 9 bytes")?;
     session.send("open ./papers/notes.txt")?;
@@ -9520,15 +9641,15 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // established, which is why it is the same field. What is typed goes to it and not to the
     // buffer, and the receipt is where the match landed rather than what was looked for.
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "f")?;
+    press(qmp, "f")?;
     qmp.send_key("ctrl", false)?;
     for (i, c) in "tro".chars().enumerate() {
         let mut qcode = String::new();
         qcode.push(c);
-        press(&mut qmp, &qcode)?;
+        press(qmp, &qcode)?;
         session.expect(&format!("nxedit: find so far {} chars", i + 1))?;
     }
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
     session.expect("nxedit: find hit at line 0")?;
     // Escape ends the mode. **Not asserted here, and this comment used to say it was** — nothing
     // types into this editor again: step 9 drags its title bar with the pointer, and the click
@@ -9537,7 +9658,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // `nxedit`'s own `ctrl_f_opens_a_find_field_and_enter_walks_the_matches`, which fails when
     // `Esc` stops closing a find field. The press is kept because leaving the editor in a mode
     // the rest of the run does not expect is worse than a keystroke nobody checks.
-    press(&mut qmp, "esc")?;
+    press(qmp, "esc")?;
     println!("  ok: find took the keys, matched, and gave them back");
 
     // 9. **A file dragged from the browser onto the editor** (M10 Part E) — the part every
@@ -9550,7 +9671,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //    drag then uses is the work area's half rather than a number this gate invented.
     let (edit_id, ex, ey, ew, _eh) = edit_win;
     let title_grab = (ex + ew as i32 / 2, ey + chrome::TITLE_Y);
-    move_pointer_to(&mut qmp, title_grab.0, title_grab.1)?;
+    move_pointer_to(qmp, title_grab.0, title_grab.1)?;
     qmp.pointer = Some(title_grab);
     qmp.send_button("left", true)?;
     for _ in 0..6 {
@@ -9569,8 +9690,8 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     qmp.send_button("left", false)?;
     qmp.pointer = None;
     expect_after_pointer(
-        &mut qmp,
-        &mut session,
+        qmp,
+        session,
         &format!(
             "desktop-shell: drop window {edit_id} to {},{} {}x{}",
             work.0 + (work.2 / 2) as i32,
@@ -9614,14 +9735,14 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // places, a press one strip out goes somewhere; over the listing, the worst a slip can do is
     // select a row, because descending takes a second click. An inert click should be inert
     // under a mistake as well as under a correct sum.
-    click_at(&mut qmp, &mut session, fx + SIDEBAR_W + 60, fy + 1 + TITLE_BAR_H + MENU_BAR_H + PATH_H / 2)?;
-    press(&mut qmp, "backspace")?;
+    click_at(qmp, session, fx + SIDEBAR_W + 60, fy + 1 + TITLE_BAR_H + MENU_BAR_H + PATH_H / 2)?;
+    press(qmp, "backspace")?;
     session.expect("nxfiles: listed /home - ")?;
     // **The third step to depend on which row a fresh listing selects**, and the one that never
     // said so: it walks out of `papers` and straight back in, which worked only while `papers`
     // was row 0. The two before it at least named the row.
-    select_papers(&mut qmp, &mut session)?;
-    press(&mut qmp, "ret")?;
+    select_papers(qmp, session)?;
+    press(qmp, "ret")?;
     // **The receipt says both numbers, and that is the assertion.** "2 entries" alone cannot tell
     // a filtered listing from a directory that happens to hold two; "(1 hidden)" is the browser
     // stating that it read three and is showing two.
@@ -9640,14 +9761,14 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // how it would be discovered — several hundred lines away, as a rename that seemed to add a
     // file.
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "h")?;
+    press(qmp, "h")?;
     qmp.send_key("ctrl", false)?;
     // No suffix here: with nothing hidden, what was read and what is shown are the same number,
     // and the receipt says so by not mentioning a difference.
     session.expect("nxfiles: listed /home/papers - 3 entries")?;
     println!("  ok: Ctrl+H showed the hidden one");
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "h")?;
+    press(qmp, "h")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxfiles: listed /home/papers - 2 entries (1 hidden)")?;
     println!("  ok: and hid it again, leaving the directory as the rest of this gate expects");
@@ -9658,7 +9779,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // which the browser leaves out for a single tab (desktop refresh, Part I), and **a header**,
     // which it gained in the same part.
     let row1 = (fx + SIDEBAR_W + 120, fy + TITLE_BAR_H + MENU_BAR_H + PATH_H + browser::HEADER_H + ROW_H + ROW_H / 2);
-    move_pointer_to(&mut qmp, row1.0, row1.1)?;
+    move_pointer_to(qmp, row1.0, row1.1)?;
     qmp.pointer = Some(row1);
     qmp.send_button("left", true)?;
     // **Past the slop, then across.** The browser turns a press into a drag once it has
@@ -9700,11 +9821,23 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // host-tested in `compositor::input`, including the two cases that must show *nothing*.
     qmp.send_button("left", false)?;
     qmp.pointer = Some(onto);
-    expect_after_pointer(&mut qmp, &mut session, &format!("compositor: drop win={edit_id} on=document"))?;
+    expect_after_pointer(qmp, session, &format!("compositor: drop win={edit_id} on=document"))?;
     session.expect("nxedit: drop of other.txt on the document")?;
     session.expect("nxedit: opened /home/papers/other.txt - 0 bytes")?;
     println!("  ok: a file dragged from the browser opened in the editor");
 
+    st.edit_id = edit_id;
+    st.fx = fx;
+    st.fy = fy;
+    Ok(())
+}
+
+/// `check-login`'s steps 9a2 to 9d: two buffers in one window, copy and paste across programs,
+/// `with`, and a rename.
+fn login_buffers_and_clipboard(qmp: &mut Qmp, session: &mut Session, st: &mut LoginState) -> R<()> {
+    let fx = st.fx;
+    let fy = st.fy;
+    let work = st.work;
     // 9c. **Two buffers in one window, switched, and the right one saved** (M12 Part D). The drop
     //     above opened a *tab* rather than replacing the buffer — which is what removed the old
     //     refusal, since there is nothing to lose by taking a file when it arrives beside the one
@@ -9745,7 +9878,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
         )
     };
     let tab0 = tab(0);
-    click_at(&mut qmp, &mut session, tab0.0, tab0.1)?;
+    click_at(qmp, session, tab0.0, tab0.1)?;
     session.expect("nxedit: tab ")?;
     let switched = session.rest_of_line()?;
     if !switched.contains("notes.txt") {
@@ -9766,7 +9899,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     let from = session.transcript().len();
     qmp.send_key("ctrl", true)?;
     qmp.send_key("shift", true)?;
-    press(&mut qmp, "n")?;
+    press(qmp, "n")?;
     qmp.send_key("shift", false)?;
     qmp.send_key("ctrl", false)?;
     let any = |_: &str| true;
@@ -9815,7 +9948,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     let new_id = placed.split_whitespace().next().unwrap_or("").to_string();
     let from = session.transcript().len();
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "w")?;
+    press(qmp, "w")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxedit: closed a window")?;
     // …and the editor is still running, which is the half that would have been lost: **a list
@@ -9834,7 +9967,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // The editor was snapped to the right half earlier and the new window was placed at the
     // top-left, so they do not overlap and a click in the text area is unambiguous.
     let back = (ed.0 + 300, ed.1 + 400);
-    click_at(&mut qmp, &mut session, back.0, back.1)?;
+    click_at(qmp, session, back.0, back.1)?;
     println!("  ok: and clicking the first window took the keyboard back");
 
     // **`End` first, and that is not tidying.** Step 8b's search left its match *selected* —
@@ -9842,14 +9975,14 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // keystroke here would have edited the middle of the file rather than appending to it. It
     // did, on the first run: `tro` became `c` and the save wrote seven bytes. The behaviour is
     // right and the gate's assumption was not.
-    press(&mut qmp, "end")?;
+    press(qmp, "end")?;
     // **And the save goes to the tab that is current, not the one opened last.** That is the
     // whole risk of tabs in an editor, and the assertion is made from outside: the serial shell
     // reads the file back.
-    press(&mut qmp, "c")?;
+    press(qmp, "c")?;
     session.expect("nxedit: buffer rev ")?;
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "s")?;
+    press(qmp, "s")?;
     qmp.send_key("ctrl", false)?;
     session.expect("nxedit: saved /home/papers/notes.txt - 10 bytes")?;
     session.send("open ./papers/notes.txt")?;
@@ -9873,7 +10006,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // the tab, the marker and the next `Ctrl+S` all pointing at the old file.
     qmp.send_key("ctrl", true)?;
     qmp.send_key("shift", true)?;
-    press(&mut qmp, "s")?;
+    press(qmp, "s")?;
     qmp.send_key("shift", false)?;
     qmp.send_key("ctrl", false)?;
     // **The receipt counts the rows**, which is the half a "a dialog opened" expectation cannot
@@ -9893,16 +10026,16 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // for it to happen. The field is seeded with the buffer's own name — `notes.txt`, nine
     // characters — so this empties it rather than appending to it, and the count runs down.
     for left in (0..9).rev() {
-        press(&mut qmp, "backspace")?;
+        press(qmp, "backspace")?;
         session.expect(&format!("nxedit: chooser name so far {left} chars"))?;
     }
     for (i, c) in "asked".chars().enumerate() {
         let mut qcode = String::new();
         qcode.push(c);
-        press(&mut qmp, &qcode)?;
+        press(qmp, &qcode)?;
         session.expect(&format!("nxedit: chooser name so far {} chars", i + 1))?;
     }
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
     session.expect("nxedit: saved /home/papers/asked - ")?;
     println!("  ok: Save As wrote to the name it was given, not to the file it was opened as");
 
@@ -9922,27 +10055,27 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //     The copy is a **find**, which selects its match — so this needs no keystroke that
     //     changes the buffer, and steps 11 and 12 find the editor exactly as step 9c left it.
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "f")?;
+    press(qmp, "f")?;
     qmp.send_key("ctrl", false)?;
     for (i, c) in TYPED.chars().enumerate() {
         let mut qcode = String::new();
         qcode.push(c);
-        press(&mut qmp, &qcode)?;
+        press(qmp, &qcode)?;
         session.expect(&format!("nxedit: find so far {} chars", i + 1))?;
     }
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
     session.expect("nxedit: find hit at line 0")?;
     // **Escape first, and that is the rule Part D's review settled rather than tidying.** A
     // chord that acts on the *buffer* stays the field's while a field is open, and a copy is
     // one — so `Ctrl+C` here would have gone to the find field and done nothing. (It did, on
     // this step's first run.) Escape closes the field and leaves the match selected: the
     // selection is the buffer's, not the field's.
-    press(&mut qmp, "esc")?;
+    press(qmp, "esc")?;
     // Ctrl+C. **A count, never the text** — an editor's buffer is a person's document, and the
     // serial console is a log file. The count is exactly `TYPED`'s length, which is what says
     // the *selection* was copied rather than the line or the buffer.
     qmp.send_key("ctrl", true)?;
-    press(&mut qmp, "c")?;
+    press(qmp, "c")?;
     qmp.send_key("ctrl", false)?;
     session.expect(&format!("nxedit: copied {} bytes", TYPED.len()))?;
     println!("  ok: the editor copied its selection onto the ring");
@@ -9950,12 +10083,12 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // A terminal to paste into. **Launched here rather than reusing step 6's**, which was
     // closed long before the editor existed — and closed again at the end of this step, so the
     // windows steps 11 and 12 drive are the ones they expect to find.
-    click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
+    click_at(qmp, session, APPS_CLICK.0, APPS_CLICK.1)?;
     session.expect("desktop-shell: applications menu open")?;
-    type_into_menu(&mut qmp, &mut session, "nxterm")?;
+    type_into_menu(qmp, session, "nxterm")?;
     // The terminal's lines and the shell's placement of its window come in either order.
     let launched = session.transcript().len();
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
     session.expect("desktop-shell: launched nxterm into its own namespace")?;
     session.expect("desktop-shell: applications menu closed")?;
 
@@ -9989,7 +10122,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // here, which is all a click needs.
     session.line_since(launched, "nxterm: hosting a shell", any, wait)?;
     session.line_since(launched, "nxsh: up", any, wait)?;
-    click_at(&mut qmp, &mut session, tx + 100, ty + TITLE_BAR_H + MENU_BAR_H + 40)?;
+    click_at(qmp, session, tx + 100, ty + TITLE_BAR_H + MENU_BAR_H + 40)?;
 
     // `touch ./` — typed — then the paste, then a suffix. **The suffix is what makes the
     // assertion discriminating**: `nitrox.clip` can only exist if the paste delivered exactly
@@ -10007,19 +10140,19 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     const PER_KEY: std::time::Duration = std::time::Duration::from_millis(40);
     for qcode in ["t", "o", "u", "c", "h", "spc", "dot", "slash"] {
         std::thread::sleep(PER_KEY);
-        press(&mut qmp, qcode)?;
+        press(qmp, qcode)?;
     }
     qmp.send_key("ctrl", true)?;
     qmp.send_key("shift", true)?;
-    press(&mut qmp, "v")?;
+    press(qmp, "v")?;
     qmp.send_key("shift", false)?;
     qmp.send_key("ctrl", false)?;
     session.expect(&format!("nxterm: pasted {} bytes", TYPED.len()))?;
     for qcode in ["dot", "c", "l", "i", "p"] {
         std::thread::sleep(PER_KEY);
-        press(&mut qmp, qcode)?;
+        press(qmp, qcode)?;
     }
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
 
     // **The serial column is what says it happened.** Asking the terminal would be asking the
     // accused: its grid is where the pasted text was drawn, and the thing in doubt is whether
@@ -10059,11 +10192,11 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //      the window's terminal; the password is typed into *this window* and read there. A
     //      release image does not narrate the grid, so what is asserted is the broker's audit on
     //      the console — started, and `nxinstall` exiting 0 because it saw the granted disks.
-    type_at_terminal(&mut qmp, "with admin nxinstall")?;
+    type_at_terminal(qmp, "with admin nxinstall")?;
     session.expect("view: alice admin nxinstall — allowed, asking for a password")?;
     // No leading Enter here, unlike `type_at_terminal`: at a password prompt one would be an empty
     // password.
-    type_answer(&mut qmp, DEMO_PASSWORD)?;
+    type_answer(qmp, DEMO_PASSWORD)?;
     session.expect("view: alice admin nxinstall — started")?;
     session.expect("view: alice admin nxinstall — exited, code 0")?;
     println!("  ok: `with admin nxinstall` in a desktop terminal saw the granted disks");
@@ -10076,7 +10209,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     //      the password above opened a window for this window's terminal and `admin`, so the
     //      broker starts this without a prompt, and nothing is typed. `boot-probe` holds the
     //      window to its terminal and view, and the forgery control, on a test image.
-    type_at_terminal(&mut qmp, "with admin nxinstall /dev/blk/0")?;
+    type_at_terminal(qmp, "with admin nxinstall /dev/blk/0")?;
     // **Refused as the running system** (administration Part G.2), which the installer now knows:
     // the tables say `init` mounted its root partition. Unordered with the audit line: that one
     // reaches the console through the logging service, the refusal straight from `nxinstall`.
@@ -10089,9 +10222,9 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
 
     // Close the terminal from inside, so steps 11 and 12 drive the windows step 9 left.
     for qcode in ["e", "x", "i", "t"] {
-        press(&mut qmp, qcode)?;
+        press(qmp, qcode)?;
     }
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
     session.expect("nxterm: the terminal ended")?;
 
     // 9b. **The browser renames a file, and the shell reads the new name back** (M12 Part B).
@@ -10113,7 +10246,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // delivered click intermittently produced nothing; the cause was `libui` losing the gesture
     // when a repaint between the press and the release re-identified the widget under it, and it
     // is fixed. The retry is gone deliberately: it would hide the regression it was written for.
-    click_at(&mut qmp, &mut session, file_menu.0, file_menu.1)?;
+    click_at(qmp, session, file_menu.0, file_menu.1)?;
     session.expect("nxfiles: menu popup ")?;
     let popup = session.rest_of_line()?;
     let (_, px, py, _pw, ph) =
@@ -10143,7 +10276,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // off the popup. The receipt is what confirms the position; this is only what keeps the
     // steps four pixels apart.
     while ry < py + ph as i32 - MENU_FRAME {
-        move_pointer_to(&mut qmp, rx, ry)?;
+        move_pointer_to(qmp, rx, ry)?;
         qmp.pointer = Some((rx, ry));
         // **The row the pointer settled on, not the first one it crossed** — see
         // `Session::settled_line`. The receipt lands on the frame after the motion; a step that
@@ -10173,7 +10306,7 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     // `move_pointer_to` records nothing itself — injection is relative, and an unacknowledged
     // move leaves the host believing something it cannot check.
     qmp.pointer = Some(rename_at);
-    click_at(&mut qmp, &mut session, rename_at.0, rename_at.1)?;
+    click_at(qmp, session, rename_at.0, rename_at.1)?;
     // **Wait for the menu popup to be gone before typing**, which the desktop-rename step at
     // step 6 already does in its own way and this one did not.
     //
@@ -10199,10 +10332,10 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     for (i, c) in "renamed".chars().enumerate() {
         let mut qcode = String::new();
         qcode.push(c);
-        press(&mut qmp, &qcode)?;
+        press(qmp, &qcode)?;
         session.expect(&format!("nxfiles: name so far {} chars", i + 1))?;
     }
-    press(&mut qmp, "ret")?;
+    press(qmp, "ret")?;
     session.expect("nxfiles: renamed /home/papers/renamed")?;
     // **Three, because Save As made one.** The count is here to say a rename is not a copy, and
     // the number it compares against is the directory's — so the step above that wrote
@@ -10220,6 +10353,17 @@ fn cmd_check_login(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     session.expect("/home>")?;
     println!("  ok: and the shell found the new name, with the old contents");
 
+    Ok(())
+}
+
+/// `check-login`'s steps 10 to 13 and the transcript's last checks: dialogs, insisting on a
+/// close, and the Places menu.
+fn login_dialogs_and_places(mut qmp: Qmp, mut session: Session, size: DisplaySize, st: &mut LoginState) -> R<()> {
+    let edit_id = st.edit_id;
+    let first_term_id = st.first_term_id;
+    let qmp_sock = st.qmp_sock.clone();
+    let term_id = st.term_id;
+    let work = st.work;
     // 10. **An editor launched from the menu, which is a launch with no file** (M11 Part E
     //     batch 7). `nxedit` required `argv[1]` and the Applications menu passes none, so it
     //     printed "no file to edit" and exited — reported as "nxedit doesn't launch from the
