@@ -118,3 +118,38 @@ fn a_filtered_files_split_off_modules_are_filtered() {
         }
     }
 }
+
+/// CI's QEMU job ties each gate to a runner by naming its group, and a name not in the matrix
+/// runs the gate on no runner while every runner still passes. So each `cargo xtask` step of the
+/// job names one of the matrix's groups, every group named anywhere is one of them, and each
+/// group runs a gate.
+#[test]
+fn every_gate_of_the_qemu_job_runs_in_a_group_that_exists() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let mut job_lines = text.lines().skip_while(|l| *l != "  integration:").skip(1);
+    let job: Vec<&str> = job_lines.by_ref().take_while(|l| !(l.starts_with("  ") && !l.starts_with("   "))).collect();
+    let job = job.join("\n");
+    let groups: Vec<&str> = job
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("group: [")?.strip_suffix(']'))
+        .expect("the matrix's groups")
+        .split(", ")
+        .collect();
+    let named: Vec<&str> =
+        job.split("matrix.group == '").skip(1).filter_map(|r| r.split_once('\'')).map(|(g, _)| g).collect();
+    for g in &named {
+        assert!(groups.contains(g), "`{g}` is named in the QEMU job and is not one of {groups:?}");
+    }
+    let lines: Vec<&str> = job.lines().collect();
+    let mut run = Vec::new();
+    for (i, line) in lines.iter().enumerate().filter(|(_, l)| l.trim().starts_with("run: cargo xtask")) {
+        let guard = lines[i - 1].trim().strip_prefix("if: matrix.group == '").and_then(|g| g.split_once('\''));
+        let (group, _) =
+            guard.unwrap_or_else(|| panic!("`{}` names no group, so it runs on every runner", line.trim()));
+        run.push(group);
+    }
+    for g in &groups {
+        assert!(run.contains(g), "group `{g}` runs no gate");
+    }
+}
