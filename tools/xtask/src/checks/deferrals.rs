@@ -1,4 +1,4 @@
-//! `check-deferrals`: every `TODO(tag)` has its entry in `deferred-decisions.md`.
+//! `check-deferrals`: each tagged `TODO` and `deferred-decisions.md` name the same deferrals.
 
 use crate::*;
 
