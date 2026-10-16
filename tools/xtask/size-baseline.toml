@@ -18,7 +18,7 @@
 "kernel/src/pci/mod.rs" = 1206
 "kernel/src/sched.rs" = 5015
 "kernel/src/syscall/table.rs" = 4061
-"tools/xtask/src/main.rs" = 20278
+"tools/xtask/src/main.rs" = 20424
 "userspace/compositor/src/input.rs" = 3382
 "userspace/compositor/src/lib.rs" = 3497
 "userspace/compositor/src/main.rs" = 3046
