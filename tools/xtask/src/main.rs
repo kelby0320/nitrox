@@ -524,6 +524,7 @@ fn main() -> ExitCode {
         .collect();
     let mode = if selftest { BuildMode::Selftest } else { BuildMode::Normal };
 
+    let started = std::time::Instant::now();
     let result = match cmd.as_deref() {
         Some("build") => cmd_build(mode),
         Some("image") if live => cmd_image_live_for(mode),
@@ -578,6 +579,9 @@ fn main() -> ExitCode {
         }
         Some(other) => Err(format!("unknown subcommand: {other}").into()),
     };
+    // On stderr, after the command's own output, so CI's gate groups are balanced from the log.
+    let what: Vec<&str> = cmd.iter().chain(&rest).map(String::as_str).collect();
+    eprintln!("xtask: {} took {} s", what.join(" "), started.elapsed().as_secs());
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
