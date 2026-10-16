@@ -4,6 +4,7 @@ mod interactive;
 mod live;
 mod media;
 mod recovery;
+mod report;
 mod shutdown;
 mod storage;
 
@@ -13,5 +14,6 @@ pub(crate) use interactive::*;
 pub(crate) use live::*;
 pub(crate) use media::*;
 pub(crate) use recovery::*;
+pub(crate) use report::*;
 pub(crate) use shutdown::*;
 pub(crate) use storage::*;
