@@ -802,7 +802,7 @@ mod tests {
 
         // And the nearest *keyed ancestor*, because a widget carries its key on the outside
         // while the cursor is inside one of its layers — which is the shape every widget in
-        // `widget.rs` has.
+        // `widget` has.
         assert!(id != FAR, "the hit was a descendant, which is the case worth covering");
     }
 

@@ -62,3 +62,20 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         }
     }
 }
+
+/// A filtered file whose module was split keeps its modules filtered: an entry naming `x.rs` beside
+/// a directory `x/` must have `x/**` beside it, or a change to the split-off code skips the gate.
+#[test]
+fn a_filtered_module_is_filtered_with_its_directory() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for workflow in ["display.yml", "input.yml"] {
+        let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow)).unwrap();
+        let filters: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("      - '")?.strip_suffix('\'')).collect();
+        for module in filters.iter().filter_map(|f| f.strip_suffix(".rs")) {
+            if root.join(module).is_dir() {
+                let all = format!("{module}/**");
+                assert!(filters.contains(&all.as_str()), "{workflow} runs on {module}.rs, not {all}");
+            }
+        }
+    }
+}

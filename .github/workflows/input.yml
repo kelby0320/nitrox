@@ -41,6 +41,7 @@ on:
       # The DPC hands its parked read to thread context through `reap_pending`; a change to
       # either side can leave a reader blocked forever with the driver still reporting armed.
       - 'kernel/src/sched.rs'
+      - 'kernel/src/sched/**'
       - 'kernel/src/dpc.rs'
       # **The tick, and the sweep's only call site.** `drivers::ps2::poll()` is called from
       # exactly one place in the tree — `timer_dispatch` — so the regression

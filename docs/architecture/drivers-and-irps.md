@@ -216,7 +216,7 @@ have one code path regardless of whether the work was sync or async.
 > **Reconciliation with Phase 1.** The wait mechanism is the one Phase 1
 > actually built — a pre-reserved **waiter list per waitable** plus a fixed
 > 8-slot wait array on each `Thread` (`MAX_WAIT_HANDLES`), dispatched by `match`
-> on `KObjectType` in `kernel/src/sched.rs` (`obj_already_signaled` /
+> on `KObjectType` in `kernel/src/sched/objects.rs` (`obj_already_signaled` /
 > `obj_add_waiter` / `obj_remove_waiter`; the `_ => …` arms are the extension
 > seam). It is **not** the intrusive `WaitNode` list the v5.1 doc sketched.
 > Adding `PendingOperation` and `InterruptObject` as waitables means adding arms

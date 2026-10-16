@@ -25,8 +25,8 @@ all of it: the retained tree and the declarative `view` (`userspace/libui/src/el
 measure/arrange layout (`layout.rs`), the keyed diff that damage falls out of (`diff.rs`),
 per-buffer damage accumulation (`damage.rs`), event routing with implicit capture
 (`route.rs`), painting within a damage rectangle (`paint.rs`), and the widget set —
-`button`, `scrollbar`, `menu_bar`, and the `custom` escape hatch (`widget.rs`) — to which
-`menu.rs` added the drop-down (§8.1). Text is real
+`button`, `scrollbar` and `menu_bar` (`widget.rs` and its modules), and the `custom` escape hatch
+(`element.rs`) — to which `menu.rs` added the drop-down (§8.1). Text is real
 TrueType through `libdraw::text`, rasterised from a font read off the root filesystem at
 runtime — the proportional face the theme names (§11), since M11 Part D. `reference.rs` is
 the fixed picture `cargo xtask check-display` renders on the host and compares against the

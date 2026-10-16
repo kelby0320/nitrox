@@ -25,12 +25,12 @@ the correctness invariants, and a postmortem of every bug the bring-up hit — s
 The scheduler is **single-CPU preemptive** with one global lock and one flat
 runqueue. Concretely:
 
-- `static SCHED: IrqSpinLock<SchedState>` (`sched.rs:299`) guards all scheduling
+- `static SCHED: IrqSpinLock<SchedState>` (`sched.rs`) guards all scheduling
   state — the rank-1 kernel lock.
-- `SchedState.ready: KVec<ObjectRef>` (`sched.rs:258`) is a **single
-  round-robin queue**; `switch_to_next` (`sched.rs:1515`) dequeues the front, runs
+- `SchedState.ready: KVec<ObjectRef>` (`sched.rs`) is a **single
+  round-robin queue**; `switch_to_next` (`sched.rs`) dequeues the front, runs
   it, and re-enqueues the outgoing thread at the tail. **No classes, no priorities.**
-- Preemption *is* wired: the timer IRQ calls `on_timer_tick` (`sched.rs:474`), which
+- Preemption *is* wired: the timer IRQ calls `on_timer_tick` (`sched.rs`), which
   decrements `quantum` and reschedules on expiry (`QUANTUM_TICKS = 1`, every 10 ms
   tick). The tick is the **per-CPU LAPIC timer** in periodic mode, armed at
   `main.rs:355` with `TICK_NS` (`timer.rs:149`); the PIT only *calibrates* it at boot
@@ -38,7 +38,7 @@ runqueue. Concretely:
   `timer.rs:161`) and a TSC monotonic clock (`read_ns`) already exist.
 - `SchedState` already has the seeds of the Idle class: `idle` / `idle_addr` (a
   dedicated idle thread parked off `ready`, run only when nothing else is ready) and
-  a `deadlines` **binary min-heap** (`mod deadline`, `sched.rs:107`) — the ordered
+  a `deadlines` **binary min-heap** (`mod deadline`, `sched/deadline.rs`) — the ordered
   structure we reuse for vruntime.
 - Wakeup is **immediate**, not tick-quantized: `complete_pending_op` /
   `fire_expired_deadlines` move a thread to `ready` under `SCHED`, and the same tick
@@ -101,7 +101,7 @@ weight." The scheduler always runs the **smallest** vruntime.
   rt_priority, vruntime)`) — an O(n) pick that needs no new data structure and leaves
   enqueue and every other `ready` site untouched. Ample at our thread counts.
   **Deferred optimization:** a **binary min-heap keyed on vruntime** (reusing the
-  `mod deadline` heap pattern, `sched.rs:107`) + a RealTime priority array, behind the
+  `mod deadline` heap pattern, `sched/deadline.rs`) + a RealTime priority array, behind the
   same "pick best" interface — a drop-in if profiles ever show the scan dominating.
   (Not a red-black tree: libkern has no ordered tree, and we get efficient arbitrary
   removal via lazy invalidation — a blocked thread is skipped, not eagerly removed.)
@@ -113,7 +113,7 @@ weight." The scheduler always runs the **smallest** vruntime.
   ~6 ms scheduling *latency* divided across runnable threads, floored at a ~0.75 ms
   minimum granularity (newer EEVDF uses a ~0.75 ms base slice); Windows uses much
   coarser quanta (tens of ms). Our enforceable granularity is bounded by the
-  **periodic tick (10 ms / 100 Hz today** — `sched.rs:81`, `ioapic.rs:290`): vruntime
+  **periodic tick (10 ms / 100 Hz today** — `sched.rs`, `ioapic.rs:290`): vruntime
   accrues per tick and the running thread is preempted at a tick boundary once a
   smaller-vruntime thread is runnable, so the *effective* slice is the tick (10 ms).
   A CFS-style `target_latency / nr_running` slice floored at a sub-tick minimum —
@@ -241,7 +241,7 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
   struct has only `state` and no scheduling parameters; `quantum` lives on
   `SchedState` as policy. `vruntime` is per-thread persistent, so it goes on `Thread`;
   the per-runqueue `min_vruntime` floor stays on `SchedState`.
-- **`SchedState`** (`sched.rs:255`) evolves from one `ready: KVec` to per-class
+- **`SchedState`** (`sched.rs`) evolves from one `ready: KVec` to per-class
   structures (RealTime priority buckets + the TimeShared vruntime heap), and becomes
   **per-CPU** in slice 3 (`CPUS[i].sched`). The `idle`/`idle_addr` slots already model
   the Idle class.

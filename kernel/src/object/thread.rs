@@ -151,7 +151,7 @@ pub enum WaitPhase {
 const _: () = assert!(
     crate::arch::MAX_CPUS <= 8,
     "MAX_CPUS > 8 does not fit Thread::cpu_mask (u8) — widen the field, the `1 << c` shifts \
-     in sched.rs, and sys_thread_set_affinity's mask trim together"
+     in sched/placement.rs, and sys_thread_set_affinity's mask trim together"
 );
 
 /// A thread kernel object.

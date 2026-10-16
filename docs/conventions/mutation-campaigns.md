@@ -43,7 +43,7 @@ This is not hygiene, it is correctness, and it is written down because ignoring 
 inverted twelve results (PR #208).
 
 A mutant can **hang** — deleting a loop's exit condition does not fail a test, it fails to
-finish. `handle/table.rs`'s defer-ring backpressure loop and `sched.rs`'s heap sift-down both
+finish. `handle/table.rs`'s defer-ring backpressure loop and `sched/deadline.rs`'s heap sift-down both
 do exactly this. If the runner has no per-mutant timeout it stops there; if it dies without
 restoring, it leaves a **mutated file on disk**. A later run that seeds its baseline from the
 working tree then treats that mutant as pristine, and every subsequent kill/survive verdict is
