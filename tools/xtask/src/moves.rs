@@ -110,9 +110,17 @@ fn starts_use(t: &str) -> bool {
     ["use ", "pub use ", "pub(crate) use ", "pub(super) use "].iter().any(|p| t.starts_with(p))
 }
 
+/// `mod NAME {` (with its visibility) as `mod NAME;`, the line that replaces it when the inline
+/// module becomes a file of its own.
+fn made_a_file(t: &str) -> Option<String> {
+    let line = format!("{};", t.strip_suffix(" {")?);
+    is_mod_line(&line).then_some(line)
+}
+
 /// Every changed line that is not part of a move, as `file: ±text`. Allowed besides moved blocks:
-/// blank lines, `mod` lines with a `#[cfg(test)]` before them, `use` statements, and a line whose
-/// only change is a visibility widened to `pub(crate)` or `pub(super)`.
+/// blank lines, `mod` lines with a `#[cfg(test)]` before them, `use` statements, a line whose
+/// only change is a visibility widened to `pub(crate)` or `pub(super)`, and an inline module made
+/// a file: its `mod NAME {` replaced by `mod NAME;`, and one closing `}` in that file for each.
 fn unmoved(diff: &str) -> Vec<String> {
     let lines = changed_lines(diff);
     let mut ok = vec![false; lines.len()];
@@ -150,6 +158,28 @@ fn unmoved(diff: &str) -> Vec<String> {
         {
             ok[i] = true;
             ok[removed.swap_remove(k)] = true;
+        }
+    }
+    let mut closes: Vec<&str> = Vec::new();
+    for i in 0..lines.len() {
+        let l = &lines[i];
+        if ok[i] || l.added {
+            continue;
+        }
+        if let Some(as_file) = made_a_file(l.text.trim())
+            && lines.iter().any(|n| n.added && n.file == l.file && n.text.trim() == as_file)
+        {
+            ok[i] = true;
+            closes.push(&l.file);
+        }
+    }
+    for i in 0..lines.len() {
+        if ok[i] || lines[i].added || lines[i].text != "}" {
+            continue;
+        }
+        if let Some(k) = closes.iter().position(|f| *f == lines[i].file) {
+            ok[i] = true;
+            closes.swap_remove(k);
         }
     }
     lines
@@ -233,6 +263,25 @@ mod tests {
         let stray = unmoved(&diff_of(&[("a.rs", before)], &[("a.rs", after)]));
         assert!(stray.iter().any(|s| s.contains("-            continue;")), "{stray:?}");
         assert!(stray.iter().any(|s| s.contains("+            continue;")), "{stray:?}");
+    }
+
+    #[test]
+    fn an_inline_module_made_a_file_of_its_own_is_a_move() {
+        let inline = BODY.lines().map(|l| format!("    {l}\n")).collect::<String>();
+        let before = format!("{KEEP}\n#[cfg(test)]\nmod t {{\n    use super::*;\n\n{inline}}}\n");
+        let after = format!("{KEEP}\n#[cfg(test)]\nmod t;\n");
+        let file = format!("use super::*;\n\n{BODY}");
+        let d = diff_of(&[("a.rs", &before)], &[("a.rs", &after), ("t.rs", &file)]);
+        assert_eq!(unmoved(&d), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_inline_module_is_only_made_a_file_by_a_mod_line_of_its_own_name() {
+        let inline = BODY.lines().map(|l| format!("    {l}\n")).collect::<String>();
+        let before = format!("{KEEP}\nmod t {{\n{inline}}}\n");
+        let after = format!("mod u;\n{KEEP}");
+        let stray = unmoved(&diff_of(&[("a.rs", &before)], &[("a.rs", &after), ("t.rs", BODY)]));
+        assert_eq!(stray, ["a.rs: -mod t {", "a.rs: -}"]);
     }
 
     #[test]

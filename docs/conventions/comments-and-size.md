@@ -59,6 +59,7 @@ file shorter, at 1,000 lines or fewer, or gone — until it is brought down:
 formatting, and **`cargo xtask check-moves [REV]`** fails a commit (`HEAD` by default) holding any
 changed line that `git diff --color-moved=blocks --color-moved-ws=allow-indentation-change` does not
 find moved — besides blank lines, `mod` lines and the `#[cfg(test)]` before one, `use` statements,
-and a visibility widened to `pub(crate)` or `pub(super)`. A line-by-line match is not enough: a
+a visibility widened to `pub(crate)` or `pub(super)`, and an inline module made a file: its
+`mod NAME {` replaced by `mod NAME;`, and its closing `}`. A line-by-line match is not enough: a
 `continue` deleted in one place and added in another passes one. Formatting follows in the next
 commit.
