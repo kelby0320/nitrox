@@ -21,6 +21,7 @@ mod comments;
 mod docs;
 mod files;
 mod help;
+mod moves;
 mod size;
 
 use files::read_text;
@@ -501,6 +502,7 @@ fn main() -> ExitCode {
         Some("check-deferrals") => cmd_check_deferrals(),
         Some("check-docs") => docs::cmd_check_docs(),
         Some("check-comments") => comments::cmd_check_comments(&qargs),
+        Some("check-moves") => moves::cmd_check_moves(&qargs),
         Some("check-size") => size::cmd_check_size(&qargs),
         Some("check-images") => cmd_check_images(),
         // **The first *positional* argument, not the first argument.** `qargs` has the global
