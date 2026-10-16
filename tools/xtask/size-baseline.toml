@@ -58,7 +58,7 @@
 "userspace/storage-service/src/lib.rs" = 1148
 "userspace/storage-service/src/main.rs" = 1788
 "userspace/storage-service/src/tests.rs" = 1091
-"userspace/test-harness/src/bootprobe.rs" = 5511
+"userspace/test-harness/src/bootprobe/main.rs" = 5511
 "userspace/test-harness/src/harness.rs" = 4765
 "userspace/test-harness/src/uiclient.rs" = 1639
 "userspace/tty-server/src/lib.rs" = 1523
