@@ -1,5 +1,9 @@
 use crate::*;
 
+mod overview;
+
+pub(crate) use overview::*;
+
 /// **The shell's last whole window list** in `transcript`: what follows `window list on cli of ` on
 /// the last line holding it **that has ended**. The transcript is read as it arrives, so the shell's
 /// next list may be half there — a line cut after its second window, counted, said two, and once
