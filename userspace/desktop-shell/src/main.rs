@@ -4015,6 +4015,7 @@ fn capture_window(
     let ok = mgr.request(OP_MGR_CAPTURE, &body, Some(handle), &mut reply).is_ok();
     if !ok {
         Line::new().s(b"desktop-shell: Capture refused for window ").u(window as u64).end();
+        // TODO(capture-refused-leak): this leaves the mapping, and a failed send the handle too.
         return None;
     }
     // SAFETY: `addr` maps `len` readable bytes the compositor has just written.

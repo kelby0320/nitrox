@@ -89,7 +89,8 @@ replacing `rename_path` return the inode, `release_inode` frees it), and
 another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entries — and
 **extent trees** (Phase 6 Part H.1, 2026-10-08), so a directory no longer stops at about 815
 files with data, a file at four extents, or a removal of a file Linux wrote at its name. A
-grow, create, `mkdir` or rename that fails now gives back what it took.
+grow, create, `mkdir` or rename that fails for want of space or depth now gives back what it took;
+one that loses a write midway does not yet (`TODO(ext4-failed-write-undo)`).
 
 ## This crate's library has a second consumer
 
