@@ -1,5 +1,9 @@
 use crate::*;
 
+mod sticks;
+
+pub(crate) use sticks::*;
+
 /// The file `check-storage` writes, at the root of the SATA disk's `nitrox-root`.
 pub(crate) const STORAGE_PATTERN_FILE: &str = "check-storage.bin";
 
