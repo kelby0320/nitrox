@@ -1,5 +1,9 @@
 use crate::*;
 
+mod admin;
+
+pub(crate) use admin::*;
+
 /// The shell's diagnostics reach a real terminal in the design's colour.
 ///
 /// **On the bytes, because nothing else can see this** (desktop refresh, Part F; PR #324 review,
