@@ -1,3 +1,4 @@
+mod fbcon;
 mod input;
 mod install;
 mod interactive;
@@ -10,6 +11,7 @@ mod resolutions;
 mod shutdown;
 mod storage;
 
+pub(crate) use fbcon::*;
 pub(crate) use input::*;
 pub(crate) use install::*;
 pub(crate) use interactive::*;
