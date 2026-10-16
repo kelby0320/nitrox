@@ -609,7 +609,7 @@ impl Theme {
             .filter_map(|raw| strip_comment(raw).trim().split_once('='))
             .filter(|(k, _)| k.trim() == "scheme")
             .filter_map(|(_, v)| v.trim().strip_prefix('"')?.strip_suffix('"').and_then(Scheme::parse))
-            .last()
+            .next_back()
             .unwrap_or_default();
         let mut t = Self::for_scheme(scheme);
         let mut issues = alloc::vec::Vec::new();

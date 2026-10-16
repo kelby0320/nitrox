@@ -276,6 +276,7 @@ fn serve_loop(serve_end: u64, mut control: u64) -> ! {
                 WAIT_HANDLES[n] = control;
                 n += 1;
             }
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for i in 0..MAX_SESSIONS {
                 if SESSION_CH[i] != 0 {
                     WAIT_HANDLES[n] = SESSION_CH[i];
@@ -502,6 +503,7 @@ fn serve_admin_request(ch: u64) {
     let Some(salt) = salt else {
         return refuse_admin(ch, m.op, m.request_id, name, KError::IoError, b"no entropy for a salt");
     };
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: single-threaded; the three buffers are distinct statics, and `USER_DB` is written
     // only below, after the library has returned.
     let outcome = unsafe {
@@ -509,9 +511,11 @@ fn serve_admin_request(ch: u64) {
         serve_admin(m.op, m.body, db, &salt, &mut *(&raw mut NEW_DB), &mut *(&raw mut ADMIN_REPLY))
     };
     match outcome {
+        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
         // SAFETY: the library wrote `n` bytes of reply.
         Admin::Reply(n) => unsafe { send_reply(ch, m.op, m.request_id, &(&*(&raw const ADMIN_REPLY))[..n], false) },
         Admin::Write(n) => {
+            #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
             // SAFETY: the library wrote `n` bytes of new database.
             let new_db = unsafe { &(&*(&raw const NEW_DB))[..n] };
             if let Err(why) = install(new_db) {
@@ -519,6 +523,7 @@ fn serve_admin_request(ch: u64) {
             }
             // SAFETY: single-threaded; the install held, so memory follows the file.
             unsafe {
+                #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
                 (&mut *(&raw mut USER_DB))[..n].copy_from_slice(new_db);
                 USER_DB_LEN = n;
             }

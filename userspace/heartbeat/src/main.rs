@@ -198,8 +198,13 @@ fn recv_log_handoff(control: u64) -> u64 {
     }
     // SAFETY: the kernel wrote the transferred-handle count + values.
     let count = unsafe { (&raw const RECV_COUNT).read() };
-    // SAFETY: the recv succeeded with `count >= 1`, so the kernel installed a handle at RECV_HANDLES[0]
-    if count >= 1 { unsafe { (&raw const RECV_HANDLES[0]).read() } } else { 0 }
+    if count >= 1 {
+        // SAFETY: the recv succeeded with `count >= 1`, so the kernel installed a handle at
+        // RECV_HANDLES[0].
+        unsafe { (&raw const RECV_HANDLES[0]).read() }
+    } else {
+        0
+    }
 }
 
 /// The daemon loop: beat on a deadline, exit on a control shutdown. Beats emit as log

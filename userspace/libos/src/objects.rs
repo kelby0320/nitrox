@@ -252,8 +252,10 @@ mod tests {
         sys::reset();
         // The lookup PO completes with `result` = the resolved handle (777).
         sys::script_next(0, 777, false);
+        // SAFETY: the mock kernel accepts any raw handle, and no real object stands behind this one.
         let ns = unsafe { Handle::<Namespace, crate::handle::NsReadOnly>::from_raw(RawHandle(1), Rights::LOOKUP) };
         let resolved: Handle<Resource, ReadOnly> =
+            // SAFETY: the mock resolves any path to the scripted handle, so the asserted type and mode are never checked against a real object.
             block_on(unsafe { ns.lookup::<Resource, ReadOnly>("/dev/console", Rights::READ) }).unwrap();
         assert_eq!(resolved.raw(), RawHandle(777));
     }
@@ -262,6 +264,7 @@ mod tests {
     fn read_builds_an_op_and_completes() {
         sys::reset();
         sys::script_next(0, 12, true); // 12 bytes read, ready immediately
+        // SAFETY: the mock kernel accepts any raw handle, and no real object stands behind this one.
         let res = unsafe { Handle::<Resource, ReadOnly>::from_raw(RawHandle(1), Rights::READ) };
         let buf = Handle::<Memory, MapReadWrite>::create(4096).unwrap();
         let n = block_on(res.read(&buf, 0, 0, 64)).unwrap();

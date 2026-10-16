@@ -439,33 +439,33 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     // firmware programs and real UEFI often leaves meaningless. INTx stays as
     // the fallback for a function that advertises no MSI capability.
     let mut signal = None;
-    if let Some(cfg) = &cfg {
-        if let Some(msi) = crate::pci::read_msi(cfg) {
-            // SAFETY: ring-0, post-Irq::init; `isr` stays valid for the kernel's
-            // lifetime, and nothing can be delivered until the message is written.
-            match unsafe { crate::arch::IrqInstall::install_msi(isr) } {
-                // SAFETY: the handler for `msg.vector` was just registered, so
-                // the device may write the message from here on.
-                Some(msg) if unsafe { crate::pci::program_msi(cfg, &msi, msg.address, msg.data) } => {
-                    // MSI does not suppress INTx, and a device able to do both
-                    // would assert a line nothing is listening on.
-                    crate::pci::set_intx_disabled(cfg, true);
-                    crate::kprintln!(
-                        "ahci: irq via MSI (vec {:#04x}, addr {:#x}, data {:#06x}, {}-bit cap at {:#04x})",
-                        msg.vector,
-                        msg.address,
-                        msg.data,
-                        if msi.addr64 { 64 } else { 32 },
-                        msi.off
-                    );
-                    signal = Some(Signal::Msi { vector: msg.vector });
-                }
-                Some(_) => crate::kprintln!(
-                    "ahci: MSI declined — the capability cannot hold the message address; \
-                     falling back"
-                ),
-                None => crate::kprintln!("ahci: MSI declined — this CPU cannot be named in a message; falling back"),
+    if let Some(cfg) = &cfg
+        && let Some(msi) = crate::pci::read_msi(cfg)
+    {
+        // SAFETY: ring-0, post-Irq::init; `isr` stays valid for the kernel's
+        // lifetime, and nothing can be delivered until the message is written.
+        match unsafe { crate::arch::IrqInstall::install_msi(isr) } {
+            // SAFETY: the handler for `msg.vector` was just registered, so
+            // the device may write the message from here on.
+            Some(msg) if unsafe { crate::pci::program_msi(cfg, &msi, msg.address, msg.data) } => {
+                // MSI does not suppress INTx, and a device able to do both
+                // would assert a line nothing is listening on.
+                crate::pci::set_intx_disabled(cfg, true);
+                crate::kprintln!(
+                    "ahci: irq via MSI (vec {:#04x}, addr {:#x}, data {:#06x}, {}-bit cap at {:#04x})",
+                    msg.vector,
+                    msg.address,
+                    msg.data,
+                    if msi.addr64 { 64 } else { 32 },
+                    msi.off
+                );
+                signal = Some(Signal::Msi { vector: msg.vector });
             }
+            Some(_) => crate::kprintln!(
+                "ahci: MSI declined — the capability cannot hold the message address; \
+                     falling back"
+            ),
+            None => crate::kprintln!("ahci: MSI declined — this CPU cannot be named in a message; falling back"),
         }
     }
     let signal = match signal {
@@ -583,7 +583,6 @@ unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Opt
 /// # Safety
 /// `words` must address a complete 512-byte IDENTIFY result.
 unsafe fn format_identity(words: *const u16, out: &mut [u8; MAX_DEVICE_NAME]) -> usize {
-    // SAFETY: forwarded from the caller's contract.
     let field = |first: usize, words_len: usize, dst: &mut [u8]| -> usize {
         let mut n = 0;
         for i in 0..words_len {

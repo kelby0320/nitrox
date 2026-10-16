@@ -158,9 +158,6 @@ fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<C
     }
 }
 
-/// Whether `path` names a directory — it resolves to a directory *session*, which a file
-/// never does.
-
 /// Write the report as a TSM1 table on `stdout`. As in `list`, a closed consumer is a
 /// clean end, not a failure (design §1).
 fn emit(stage: &Stage, stdout: u64, done: &[Copied]) {

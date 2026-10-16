@@ -53,6 +53,7 @@ pub fn wait_until(handles: &[u64], deadline: u64) -> Option<usize> {
 /// Receive one message on `ch`. `Ok(None)` if nothing was queued — a wake with nothing behind
 /// it — and `Err(())` if the peer has gone, which are different answers to a caller waiting on
 /// a program's exit. Handles that came with it are closed: nothing here expects one.
+#[allow(clippy::result_unit_err, reason = "the only error is the peer having gone")]
 pub fn recv(ch: u64) -> Result<Option<Msg>, ()> {
     let mut buf = [0u8; IPC_MSG_SIZE];
     let mut hs = [0u64; 8];

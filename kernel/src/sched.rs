@@ -472,6 +472,8 @@ static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 /// recorded at [`cpu_accepts_work`], when the placement tests read this global. Production
 /// codegen is unchanged — the `cfg(not(test))` arm is the original atomic, verbatim.
 mod online_set {
+    pub(in crate::sched) use backing::*;
+
     #[cfg(not(test))]
     mod backing {
         use core::sync::atomic::{AtomicU64, Ordering};
@@ -509,8 +511,6 @@ mod online_set {
             ONLINE_MASK.with(|m| m.set(mask));
         }
     }
-
-    pub(in crate::sched) use backing::*;
 }
 
 /// The set of online CPUs as a bitmask (dense index → bit), read lock-free.
@@ -1286,7 +1286,7 @@ pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64, boot_args: [u64;
 /// (`sys_thread_create`); this sets `class`/`rt_priority`/`nice`/`cpu_mask` on the
 /// fresh thread **before** it is enqueued, so it never runs a scheduler tick under the
 /// wrong class. `cpu_mask` `u8::MAX` ⇒ no affinity restriction.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "a thread's process, entry, stack and scheduling")]
 pub fn spawn_user_sched(
     process: ObjectRef,
     entry: u64,
@@ -1385,7 +1385,6 @@ pub fn on_timer_tick() {
     // it. Gated on `current_is_idle` so a busy thread isn't preempted to steal.
     if !ready_here && current_is_idle(&g) && steal_available(&g, me) {
         switch_to_next(g);
-        return;
     }
     // else: guard drops here — IF was already 0 (IRQ context), stays 0 until iretq.
 }
@@ -1501,7 +1500,7 @@ fn wake_entropy_seed_waiters(g: &mut SchedState) {
 }
 
 /// Drain every deadline at or before `now`, firing each: a timer entry signals
-/// + wakes its waiters (and re-arms if periodic); a `sys_wait` thread-deadline
+/// and wakes its waiters (and re-arms if periodic); a `sys_wait` thread-deadline
 /// entry wakes that thread directly (its wait slots stay un-signaled → the
 /// thread observes a timeout). Caller holds `SCHED`. Performs **no allocation**
 /// and **no blocking** — safe in the timer IRQ.
@@ -1598,14 +1597,20 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
 // has already rejected non-waitables before these run.
 
 /// The kobject type at the head of a type-erased object pointer.
-/// # Safety: `obj` is a live kobject (header at offset 0); `SCHED` held.
+///
+/// # Safety
+///
+/// `obj` is a live kobject (header at offset 0); `SCHED` held.
 unsafe fn obj_type(obj: *mut ()) -> KObjectType {
     // SAFETY: every kobject begins with a `KObjectHeader` (see object::header).
     unsafe { (*(obj as *const crate::object::header::KObjectHeader)).object_type() }
 }
 
 /// Is this waitable currently signaled? (Timer deadline elapsed / channel non-empty.)
-/// # Safety: live waitable, `SCHED` held.
+///
+/// # Safety
+///
+/// Live waitable, `SCHED` held.
 unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
     // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
     // `SCHED` is held.
@@ -1622,7 +1627,10 @@ unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
 }
 
 /// Register the current thread as a waiter. `Err` over the object's reserve.
-/// # Safety: live waitable, `SCHED` held.
+///
+/// # Safety
+///
+/// Live waitable, `SCHED` held.
 unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
     // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
     // `SCHED` is held.
@@ -1639,7 +1647,10 @@ unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
 }
 
 /// Unregister a waiter (idempotent).
-/// # Safety: live waitable, `SCHED` held.
+///
+/// # Safety
+///
+/// Live waitable, `SCHED` held.
 unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
     // SAFETY: this function's contract: `obj` is a live waitable, of the type its header names, and
     // `SCHED` is held.
@@ -2828,6 +2839,7 @@ pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult 
 /// # Safety
 ///
 /// `timer` points at a live `Timer`, pinned for the call by a reference the caller holds.
+#[allow(clippy::result_unit_err, reason = "one failure, the heap's reserve, which every caller reports one way")]
 pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
     let mut g = SCHED.lock();
     // Drop any stale heap entry (re-arm).
@@ -4323,6 +4335,7 @@ mod tests {
         assert_eq!(a_tid, 1);
         st.ready[0].try_push(a).unwrap();
         let b = dequeue_front(&mut st).unwrap();
+        // SAFETY: `b` pins a live `Thread`.
         let b_tid = unsafe { &*(b.as_ptr() as *const Thread) }.tid();
         assert_eq!(b_tid, 2, "round-robin must pick the next, not repeat");
         st.ready[0].try_push(b).unwrap();
@@ -4413,11 +4426,14 @@ mod tests {
         // A waking thread is boosted to `floor - slice` (latency), not the bare floor.
         let w = inert_ref(2);
         seed_vruntime(&st, w.as_ptr(), 0, true);
+        // SAFETY: `w` pins a live `Thread`, and the test is single-threaded.
         assert_eq!(unsafe { Thread::vruntime(w.as_ptr()) }, base - TICK_NS);
         // A thread already ahead of the floor keeps its (larger) vruntime.
         let ahead = inert_ref(3);
+        // SAFETY: `ahead` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_vruntime(ahead.as_ptr(), 3 * TICK_NS) };
         seed_vruntime(&st, ahead.as_ptr(), 0, false);
+        // SAFETY: `ahead` pins a live `Thread`, and the test is single-threaded.
         assert_eq!(unsafe { Thread::vruntime(ahead.as_ptr()) }, 3 * TICK_NS);
     }
 
@@ -4469,6 +4485,7 @@ mod tests {
         assert_eq!(pick_target_cpu(&st, t.as_ptr(), parked), 3, "placed on a CPU that will never run");
 
         // A waking thread whose home is the parked CPU goes elsewhere too.
+        // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
         assert_ne!(pick_wake_cpu(&st, t.as_ptr(), parked), 2, "woken onto a parked home CPU");
 
@@ -4485,6 +4502,7 @@ mod tests {
         // on `cpu_accepts_work` strands the thread sitting on CPU 2 forever.
         assert!(steal_available(&st, 0), "a parked CPU's queue must stay drainable, or this fix strands what it holds");
         let stolen = steal_one(&mut st).expect("steal_one must reach a parked CPU's queue");
+        // SAFETY: `stolen` pins a live `Thread`.
         assert_eq!(unsafe { &*(stolen.as_ptr() as *const Thread) }.tid(), 12);
         assert!(st.ready[2].is_empty(), "the parked CPU's queue was not drained");
     }
@@ -4507,6 +4525,7 @@ mod tests {
         // Pinned to CPU 3; CPUs 0 and 3 have both parked. Nothing permitted accepts work,
         // and the old fallback answered 0 — which is parked.
         let t = inert_ref(1);
+        // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 3) };
         let parked = all_up(4) & !(1u64 << 0) & !(1u64 << 3);
 
@@ -4537,6 +4556,7 @@ mod tests {
         // the home CPU is covered by `a_parked_cpu_takes_no_new_work_but_can_still_be_drained`
         // — here the affinity mask rejects home 0 before that check is reached, so this
         // asserts the delegation and nothing more.)
+        // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
         let woken = pick_wake_cpu(&st, t.as_ptr(), parked);
         assert!(cpu_accepts_work(&st, woken, parked), "wake fallback picked cpu {woken}, which does not accept work");
@@ -4555,6 +4575,7 @@ mod tests {
         st.ready[1].try_push(inert_ref(11)).unwrap();
         assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 2);
         // Pinned to CPU 3 → must target CPU 3 regardless of load.
+        // SAFETY: `a` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 3) };
         assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 3);
         // Pinned to a CPU that is not online (5) → falls back **outside** the mask, to the
@@ -4563,6 +4584,7 @@ mod tests {
         // once a CPU can park, "CPU 0" is not necessarily a CPU that runs anything. Stated
         // as the two properties rather than an index, so a tie-break change does not read
         // as a contract change.
+        // SAFETY: `a` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 5) };
         let chosen = pick_target_cpu(&st, a.as_ptr(), all_up(4));
         assert!(cpu_accepts_work(&st, chosen, all_up(4)), "fallback chose cpu {chosen}");
@@ -4576,9 +4598,11 @@ mod tests {
         online_n(&mut st, 4);
         let t = inert_ref(1);
         // Home CPU 2 (last ran there) + affinity allows it → wake returns CPU 2.
+        // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
         assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 2);
         // Affinity now excludes the home → falls back to least-loaded (CPU 0).
+        // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 0) };
         assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 0);
     }
@@ -4587,6 +4611,7 @@ mod tests {
     fn stealable_respects_affinity() {
         init_global_heap();
         let t = inert_ref(1); // kernel thread (no user_entry), default mask = all
+        // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
         unsafe {
             assert!(stealable_to(t.as_ptr(), 0));
             assert!(stealable_to(t.as_ptr(), 3));
@@ -4603,6 +4628,7 @@ mod tests {
         let mut st = test_state();
         online_n(&mut st, 2);
         let t = inert_ref(1);
+        // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
         // Fill CPU 0's queue to its reserve: the home pick must divert (F6 — a
         // full home queue used to be a fatal wake).
@@ -4623,6 +4649,7 @@ mod tests {
         // CPU 1 (busiest, 2 threads) — both pinned to CPU 1: not stealable to 0.
         for tid in 10..12 {
             let t = inert_ref(tid);
+            // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
             unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 1) };
             st.ready[1].try_push(t).unwrap();
         }
@@ -4633,6 +4660,7 @@ mod tests {
         // which panics the idle-steal paths on the empty idle slot.
         assert!(steal_available(&st, 0));
         let stolen = steal_one(&mut st).expect("steal_one must succeed when steal_available");
+        // SAFETY: `stolen` pins a live `Thread`.
         let stolen_tid = unsafe { &*(stolen.as_ptr() as *const Thread) }.tid();
         assert_eq!(stolen_tid, 20);
         assert!(st.ready[2].is_empty());
@@ -4649,6 +4677,7 @@ mod tests {
         }
         // Both victims have stealable threads; CPU 2 is busier — steal from it.
         let stolen = steal_one(&mut st).unwrap();
+        // SAFETY: `stolen` pins a live `Thread`.
         let stolen_tid = unsafe { &*(stolen.as_ptr() as *const Thread) }.tid();
         assert_eq!(stolen_tid, 20);
         assert_eq!(st.ready[2].len(), 1);

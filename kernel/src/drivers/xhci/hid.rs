@@ -126,7 +126,7 @@ impl Nodes {
         if states[index] == RETIRED {
             self.epochs[index].fetch_add(1, Ordering::AcqRel);
             self.reclaim();
-            let old = core::mem::replace(&mut *self.readers[index].lock(), Reader::new());
+            let old = core::mem::take(&mut *self.readers[index].lock());
             // Its references dropped here, with the lock let go.
             drop(old);
             let waiting = self.lights.lock()[index].take();

@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(c.next(T0 + STOP_WAIT_NS), Next::End(Asked::Stop));
         // **Inside the leader's bound, with a second to spare**, which is the whole reason for the
         // number: the supervisor's clock starts before the shell hears of the stop.
-        assert!(STOP_WAIT_NS + 1_000_000_000 <= libsession::LEADER_STOP_NS);
+        const { assert!(STOP_WAIT_NS + 1_000_000_000 <= libsession::LEADER_STOP_NS) };
     }
 
     /// **Restart and Shut down ask for `shutdown`, and Log out asks nobody**; Restart's is the

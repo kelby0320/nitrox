@@ -108,7 +108,7 @@ fn gpt(hdr: &[u8], blocks: u64, read_blocks: &mut dyn FnMut(u64, u64, &mut [u8])
     let array_lba = u64_at(hdr, 72);
     let entries = u32_at(hdr, 80);
     let entry_size = u32_at(hdr, 84) as usize;
-    if entry_size < 128 || entry_size > BLOCK || BLOCK % entry_size != 0 {
+    if !(128..=BLOCK).contains(&entry_size) || !BLOCK.is_multiple_of(entry_size) {
         return Err(Unread::Unsupported("its entries are not a size that divides a block"));
     }
     let mut disk_guid = [0u8; 16];

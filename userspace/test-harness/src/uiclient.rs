@@ -231,7 +231,7 @@ fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::Window
     // Unmap once the snapshot is read. `info` mints a fresh object per resolve, so a client
     // that polls it and never unmaps leaks a page each time — the same defect the compositor
     // had on its side of this exchange (PR #175 review, finding 1).
-    let _ = obj.unmap(addr as *mut u8, N);
+    let _ = obj.unmap(addr, N);
     info
 }
 
@@ -1276,8 +1276,6 @@ fn fail(msg: &[u8]) -> ! {
 
 /// Entry point: connect, create a window, share buffers, present, then park.
 ///
-/// # Safety
-///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments — `notif` is this
 /// process's notification handle and `root_ns` its root namespace.
 #[unsafe(no_mangle)]
@@ -1357,6 +1355,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let len = pitch * h as usize;
     let rendered = scene::render_reference();
     let mut maps: [*mut u8; BUFFERS] = [core::ptr::null_mut(); BUFFERS];
+    #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
     for i in 0..BUFFERS {
         let Some((handle, addr)) = shared_buffer(len) else {
             fail(b"ui-testclient: buffer alloc FAILED\n");

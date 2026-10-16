@@ -57,7 +57,7 @@ const _: () = assert!(
 /// console-setup `Lat15` face; asserting it means a different file fails the build rather than
 /// drawing the wrong letters.
 const fn well_formed() -> bool {
-    if PSF.len() < TABLE + 2 || (PSF.len() - TABLE) % 2 != 0 {
+    if PSF.len() < TABLE + 2 || !(PSF.len() - TABLE).is_multiple_of(2) {
         return false;
     }
     if PSF[0] != MAGIC[0] || PSF[1] != MAGIC[1] {

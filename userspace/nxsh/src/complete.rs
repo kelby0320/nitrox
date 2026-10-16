@@ -322,9 +322,7 @@ pub fn listing(candidates: &[String]) -> Vec<u8> {
         if (i + 1) % per_row == 0 || i + 1 == shown {
             out.extend_from_slice(b"\r\n");
         } else {
-            for _ in 0..(widest + GAP - c.chars().count()) {
-                out.push(b' ');
-            }
+            out.resize(out.len() + (widest + GAP - c.chars().count()), b' ');
         }
     }
     if candidates.len() > shown {

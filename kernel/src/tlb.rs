@@ -99,7 +99,7 @@ pub fn shootdown_page(va: VirtAddr) {
 
 /// Invalidate **all** non-global translations on this CPU and every other online
 /// CPU (a CR3 reload per CPU). For edits that touch many pages at once.
-#[allow(dead_code)] // used as broad-invalidation sites land (e.g. address-space teardown)
+#[allow(dead_code, reason = "for broad invalidations to come, such as an address space's teardown")]
 pub fn shootdown_all() {
     shootdown(None);
 }

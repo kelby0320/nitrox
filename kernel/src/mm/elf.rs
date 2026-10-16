@@ -413,8 +413,7 @@ mod tests {
             // p_vaddr mod PAGE to satisfy the ELF alignment rule.
             let phdr_count = self.segments.len();
             let phdr_bytes = phdr_count * ELF64_PHDR_SIZE;
-            let mut bytes = Vec::new();
-            bytes.resize(ELF64_EHDR_SIZE + phdr_bytes, 0);
+            let mut bytes = vec![0; ELF64_EHDR_SIZE + phdr_bytes];
 
             // Place segment data; record each offset.
             let mut seg_offsets = Vec::with_capacity(phdr_count);
@@ -465,7 +464,9 @@ mod tests {
 
     fn read_user_byte(asp: &AddressSpace, virt: VirtAddr) -> u8 {
         let phys =
+            // SAFETY: `asp`'s root is the live page table this test built.
             unsafe { Paging::translate(asp.root(), virt) }.expect("address must be mapped for the test to read it");
+        // SAFETY: a page `translate` found mapped, read through the HHDM.
         unsafe { *((phys.as_u64() + heap::hhdm_offset()) as *const u8) }
     }
 
@@ -646,6 +647,7 @@ mod tests {
         let last_stack_byte = VirtAddr::new(STACK_TOP - 1);
         let first_stack_byte = VirtAddr::new(STACK_TOP - STACK_SIZE);
         assert!(
+            // SAFETY: `asp`'s root is the live page table this test built.
             unsafe { Paging::translate(asp.root(), last_stack_byte) }.is_none(),
             "stack must be demand-paged, not eagerly backed"
         );
@@ -655,6 +657,7 @@ mod tests {
         assert_eq!(asp.fault_in(last_stack_byte, FaultAccess::Write), FaultIn::Mapped);
         assert_eq!(read_user_byte(&asp, last_stack_byte), 0);
         assert!(
+            // SAFETY: `asp`'s root is the live page table this test built.
             unsafe { Paging::translate(asp.root(), first_stack_byte) }.is_none(),
             "an untouched stack page must remain unbacked"
         );

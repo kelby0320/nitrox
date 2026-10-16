@@ -649,7 +649,7 @@ fn drain(x: &Xhci, mut seen: impl FnMut(&Trb)) {
         }
         seen(&trb);
     }
-    write64(x.rt + IR0, ERDP, mem.phys().as_u64() + ring.dequeue() as u64 * 16 | ERDP_EHB);
+    write64(x.rt + IR0, ERDP, (mem.phys().as_u64() + ring.dequeue() as u64 * 16) | ERDP_EHB);
 }
 
 /// The interrupt: acknowledge it, and leave the event ring to the DPC.

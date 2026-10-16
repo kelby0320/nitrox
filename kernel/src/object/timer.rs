@@ -98,7 +98,7 @@ impl Timer {
     ///
     /// # Safety
     /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref)]
+    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
     unsafe fn inner<'a>(obj: *mut ()) -> &'a mut TimerInner {
         // SAFETY: `obj` is a live Timer; forming a shared `&Timer` to reach the
         // `UnsafeCell`, then a `&mut TimerInner` through it, is exactly the
@@ -109,7 +109,10 @@ impl Timer {
     }
 
     /// Arm (or disarm, with `deadline_ns == 0`) the timer.
-    /// # Safety: see the accessor contract.
+    ///
+    /// # Safety
+    ///
+    /// See the accessor contract.
     pub(crate) unsafe fn set_armed(obj: *mut (), deadline_ns: u64, interval_ns: u64) {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
@@ -119,28 +122,41 @@ impl Timer {
 
     /// The armed deadline (`0` = unarmed). Test-only (production reads the
     /// deadline via the heap, not the object).
-    /// # Safety: see the accessor contract.
+    ///
+    /// # Safety
+    ///
+    /// See the accessor contract.
     #[cfg(test)]
     pub(crate) unsafe fn deadline(obj: *mut ()) -> u64 {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.deadline_ns
     }
 
     /// The re-arm interval (`0` = one-shot).
-    /// # Safety: see the accessor contract.
+    ///
+    /// # Safety
+    ///
+    /// See the accessor contract.
     pub(crate) unsafe fn interval(obj: *mut ()) -> u64 {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.interval_ns
     }
 
     /// Set the "present in the deadline heap" flag.
-    /// # Safety: see the accessor contract.
+    ///
+    /// # Safety
+    ///
+    /// See the accessor contract.
     pub(crate) unsafe fn set_in_heap(obj: *mut (), v: bool) {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.in_heap = v;
     }
 
     /// `true` iff this timer has a live deadline-heap entry.
-    /// # Safety: see the accessor contract.
+    ///
+    /// # Safety
+    ///
+    /// See the accessor contract.
     pub(crate) unsafe fn in_heap(obj: *mut ()) -> bool {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.in_heap
@@ -149,7 +165,10 @@ impl Timer {
     /// Register `thread` as a waiter. `Err(())` if already at
     /// [`MAX_WAITERS`](Self::MAX_WAITERS) (caller maps to `OutOfMemory`); never
     /// grows the vector under the lock.
-    /// # Safety: see the accessor contract.
+    ///
+    /// # Safety
+    ///
+    /// See the accessor contract.
     pub(crate) unsafe fn add_waiter(obj: *mut (), thread: *mut ()) -> Result<(), ()> {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
@@ -171,7 +190,10 @@ impl Timer {
     }
 
     /// Remove `thread` from the waiter set if present (idempotent).
-    /// # Safety: see the accessor contract.
+    ///
+    /// # Safety
+    ///
+    /// See the accessor contract.
     pub(crate) unsafe fn remove_waiter(obj: *mut (), thread: *mut ()) {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
@@ -181,7 +203,10 @@ impl Timer {
     }
 
     /// `true` iff the timer is armed and its deadline is at or before `now`.
-    /// # Safety: see the accessor contract.
+    ///
+    /// # Safety
+    ///
+    /// See the accessor contract.
     pub(crate) unsafe fn already_signaled(obj: *mut (), now_ns: u64) -> bool {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
@@ -190,7 +215,10 @@ impl Timer {
 
     /// Drain every waiter into `out` (clearing the set), returning the count.
     /// `out` must be at least [`MAX_WAITERS`](Self::MAX_WAITERS) long.
-    /// # Safety: see the accessor contract.
+    ///
+    /// # Safety
+    ///
+    /// See the accessor contract.
     pub(crate) unsafe fn take_waiters(obj: *mut (), out: &mut [*mut ()]) -> usize {
         // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };

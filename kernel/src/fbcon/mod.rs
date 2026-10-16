@@ -82,10 +82,10 @@ impl Screen {
     /// long as the returned value is used and written by nothing else while the console owns it.
     pub unsafe fn new(base: *mut u8, width: usize, height: usize, pitch: usize, shifts: [u8; 3]) -> Option<Self> {
         let min_pitch = width.checked_mul(4)?;
-        if base.is_null() || (base as usize) % 4 != 0 || width == 0 || height == 0 {
+        if base.is_null() || !(base as usize).is_multiple_of(4) || width == 0 || height == 0 {
             return None;
         }
-        if pitch < min_pitch || pitch % 4 != 0 || shifts.iter().any(|&s| s > 24) {
+        if pitch < min_pitch || !pitch.is_multiple_of(4) || shifts.iter().any(|&s| s > 24) {
             return None;
         }
         let pack = |c: [u8; 3]| (c[0] as u32) << shifts[0] | (c[1] as u32) << shifts[1] | (c[2] as u32) << shifts[2];
@@ -113,7 +113,7 @@ impl Screen {
     /// `base` must address `pitch * height` writable bytes of the *same* framebuffer, for as long
     /// as the returned value is used.
     unsafe fn with_base(&self, base: *mut u8) -> Option<Self> {
-        if base.is_null() || (base as usize) % 4 != 0 {
+        if base.is_null() || !(base as usize).is_multiple_of(4) {
             return None;
         }
         Some(Self { base, ..*self })

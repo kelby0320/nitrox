@@ -975,7 +975,7 @@ mod tests {
         let g = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::ARGB8888).unwrap();
         let word = g.format.encode_alpha(c, alpha).to_le_bytes();
         let mut px = alloc::vec![0u8; g.pitch * h as usize];
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             p.copy_from_slice(&word);
         }
         (g, px, Point::new(x, y))
@@ -1284,7 +1284,7 @@ mod tests {
         let g = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::XRGB8888).unwrap();
         let word = g.format.encode(c).to_le_bytes();
         let mut px = alloc::vec![0u8; g.pitch * h as usize];
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             p.copy_from_slice(&word);
         }
         (g, px, Point::new(x, y))
@@ -1516,7 +1516,7 @@ mod tests {
             ..PixelFormat::XRGB8888
         };
         let mut translucent = spx.clone();
-        for (i, p) in translucent.chunks_exact_mut(4).enumerate() {
+        for (i, p) in translucent.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             p[3] = [255u8, 200, 90, 0][i % 4];
         }
         let cases: [(&str, Geometry, &[u8]); 3] = [

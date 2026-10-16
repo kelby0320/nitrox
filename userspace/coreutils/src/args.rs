@@ -60,7 +60,7 @@ pub struct Args {
 impl Args {
     /// Whether `--long` (or its short form) was given.
     pub fn has(&self, long: &str) -> bool {
-        self.set.iter().any(|f| *f == long)
+        self.set.contains(&long)
     }
 
     /// Whether `--help` was given.

@@ -38,7 +38,7 @@ pub unsafe fn read(root_ns: u64) -> Result<ScreenInfo, UiError> {
     // **Unmapped once read**: the compositor mints an object per resolve, and a mapping left behind
     // holds its frames for the life of this process — the leak `info` had on both sides of the
     // exchange (PR #175 review, finding 1).
-    let _ = obj.unmap(addr as *mut u8, SCREEN_INFO_LEN);
+    let _ = obj.unmap(addr, SCREEN_INFO_LEN);
     match info {
         Some(s) if s.width > 0 && s.height > 0 => Ok(s),
         _ => Err(UiError::Malformed),

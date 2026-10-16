@@ -318,8 +318,11 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
         )
     };
     scrub(&mut body);
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: the crate's buffer; the kernel copied the message during the send.
-    unsafe { scrub(&mut *(&raw mut SEND_MSG)) };
+    unsafe {
+        scrub(&mut *(&raw mut SEND_MSG))
+    };
     if sr != 0 {
         return None;
     }
@@ -968,8 +971,12 @@ fn registry_blocks(ns: u64) -> Option<alloc::vec::Vec<(u32, u32)>> {
     let mut info = abi::HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
     let sr = unsafe { syscall2(SYS_HANDLE_STAT, snap, (&raw mut info) as u64) };
-    // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
-    let addr = if sr == 0 { unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) } } else { -1 };
+    let addr = if sr == 0 {
+        // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
+        unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) }
+    } else {
+        -1
+    };
     // SAFETY: closing our own handle; a mapping outlives it.
     unsafe { syscall1(SYS_HANDLE_CLOSE, snap) };
     if addr < 0 {
@@ -993,7 +1000,7 @@ fn bound_block_indices(ns: u64) -> alloc::vec::Vec<u32> {
     let mut entry = abi::NsEntry::zeroed();
     for index in 0u64.. {
         // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
-        let r = unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut abi::NsEntry as u64) };
+        let r = unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as u64) };
         if r != 0 {
             break; // NotFound ends the walk
         }
@@ -1371,7 +1378,6 @@ pub fn spawn_leader(
         // the caller's copy dead — and the caller reuses it for every later session. The symptom
         // was every graphical login after the first getting no `/dev/draw` at all (PR #237
         // review, finding 2).
-        // SAFETY: duplicating a handle the caller owns, with the rights a re-bind needs.
         let moved = if extra == 0 {
             0
         } else {

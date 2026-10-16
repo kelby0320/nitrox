@@ -81,8 +81,8 @@ impl KernelStack {
                     allocated_frames += 1;
                 }
                 None => {
-                    for j in 0..allocated_frames {
-                        heap::buddy_free(frames[j], 0);
+                    for &f in &frames[..allocated_frames] {
+                        heap::buddy_free(f, 0);
                     }
                     return Err(AllocError);
                 }
@@ -355,6 +355,7 @@ mod tests {
             let stack = KernelStack::new(asp.root()).unwrap();
             // SAFETY: read-only walk.
             assert!(
+                // SAFETY: `asp`'s root is the live page table this test built.
                 unsafe { Paging::translate(asp.root(), stack.base) }.is_some(),
                 "stack base must be mapped before drop"
             );

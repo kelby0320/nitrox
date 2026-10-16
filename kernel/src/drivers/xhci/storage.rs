@@ -583,7 +583,7 @@ fn irp_command(op: u32, offset: u64, length: u64, lun: Lun) -> Result<(Cdb, u32,
         return Err(KError::InvalidArgument);
     }
     let bl = lun.block_len as u64;
-    if bl == 0 || length == 0 || offset % bl != 0 || length % bl != 0 {
+    if bl == 0 || length == 0 || !offset.is_multiple_of(bl) || !length.is_multiple_of(bl) {
         return Err(KError::InvalidArgument);
     }
     let (lba, count) = (offset / bl, length / bl);
@@ -608,7 +608,7 @@ impl Dev {
     /// data stage, and never answers it — measured in `test-qemu`, where a `READ(10)`, whose data
     /// comes from QEMU's disk asynchronously, hung while `INQUIRY`, answered at once, did not. Linux
     /// asks for each stage after the last, which is why it never meets this.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "a command's owner, unit, CDB, length, direction and buffer")]
     fn issue(&mut self, owner: Owner, lun: u8, cdb: &[u8], len: u32, input: bool, frags: &[PhysFrag], now: u64) {
         self.tag = self.tag.wrapping_add(1);
         let w = cbw(self.tag, len, input, lun, cdb);
@@ -1636,7 +1636,7 @@ impl Disks {
     /// **Put one of the hub thread's commands on device `i`'s rings**, its operation at `po`: `cdb`
     /// for unit `lun`, its data, `len` bytes, into the binding buffer — or, `status_only`, a status
     /// wrapper alone, for the command last sent. Whether the device is still there.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "a command's device, operation, unit, CDB, length and stage")]
     fn issue_hub(&self, i: usize, po: *mut (), lun: u8, cdb: &[u8], len: u32, status_only: bool, now: u64) -> bool {
         let mut d = self.devs[i].lock();
         let Some(dev) = d.as_mut() else { return false };

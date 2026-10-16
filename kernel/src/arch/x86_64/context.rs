@@ -127,6 +127,7 @@ const fn fabricated_sp(top: u64) -> u64 {
 /// `prev_on_cpu` must be null or a valid `*mut u8` at the outgoing thread's
 /// `on_cpu` byte. Passing anything else corrupts the stack and is undefined
 /// behaviour.
+#[allow(clippy::unnecessary_safety_comment, reason = "the asm's safety argument; `naked_asm!` has no `unsafe` block")]
 #[unsafe(naked)]
 pub unsafe extern "C" fn context_switch(prev_sp_slot: *mut u64, next_sp: u64, prev_on_cpu: *mut u8) {
     // SAFETY: naked — no prologue/epilogue; every register effect is
@@ -182,6 +183,7 @@ pub unsafe extern "C" fn context_switch(prev_sp_slot: *mut u64, next_sp: u64, pr
 /// returns, so the `ud2` is an unreachable tripwire.
 ///
 /// [`thread_enter`]: crate::sched::thread_enter
+#[allow(clippy::unnecessary_safety_comment, reason = "the asm's safety argument; `naked_asm!` has no `unsafe` block")]
 #[unsafe(naked)]
 pub extern "C" fn thread_trampoline() -> ! {
     // SAFETY: naked — reached only via the fabricated frame's `ret` with an
@@ -263,6 +265,7 @@ mod tests {
         let ctx = unsafe { fabricate_frame(top, tramp) };
 
         assert_eq!(buf[7], tramp, "top-8 must hold the trampoline (ret target)");
+        #[allow(clippy::needless_range_loop, reason = "the index names the entry in each assertion's message")]
         for i in 1..7 {
             assert_eq!(buf[i], 0, "callee-saved slot {i} must be zeroed");
         }

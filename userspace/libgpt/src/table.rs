@@ -305,7 +305,7 @@ pub fn read(front: &[u8]) -> Result<Table, ReadError> {
         return Err(ReadError::NoSignature);
     }
     let header_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
-    if header_size < HEADER_LEN || header_size > BLOCK {
+    if !(HEADER_LEN..=BLOCK).contains(&header_size) {
         return Err(ReadError::Unsupported);
     }
     // The stored sum is over the header with its own field zeroed.

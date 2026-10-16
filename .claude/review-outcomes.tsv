@@ -67,3 +67,11 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-15	379	2fc6ac08	11	error-paths	optional	demonstrated	fixed	2c0613eb	34 comments: 22 waits read before check, 12 unchecked clock reads; libsession:1157 was true
 2026-10-15	379	2fc6ac08	12	rules-and-docs+architecture	optional	demonstrated	fixed	dacc45d0	capped at 5 lines (the finding's first guard); unnecessary_safety_comment (44 sites) in B.2 PR 2
 2026-10-15	379	2fc6ac08	13	error-paths	optional	unverified	fixed	f34af1a8	init both sites + storage-service spawn; test-qemu probe: open before, closed after
+2026-10-16	380	aab8fb89	1	rules-and-docs	worth-fixing	demonstrated	fixed	2ca680f9	convention now says tools only lower an entry, a raise is by hand and reviewed; decision log records the raise
+2026-10-16	380	aab8fb89	2	logic+error-paths+architecture	optional	demonstrated	fixed	1b33d020	3 allows moved below their docs; sweep finds no attribute splitting a doc comment
+2026-10-16	380	aab8fb89	3	logic	optional	demonstrated	fixed	d8efb694	length byte < 2 refused; the new test panicked at desc.rs:399 before
+2026-10-16	380	aab8fb89	4	error-paths	optional	demonstrated	deferred	c0d03f3c	TODO(ext4-failed-write-undo) for Part D; reproduced: grow's write 1 lost leaves bitmap differences
+2026-10-16	380	aab8fb89	5	error-paths	optional	demonstrated	fixed	5fbf9195	test fails at write 4 with give_back(&[run]) removed
+2026-10-16	380	aab8fb89	6	error-paths	optional	unverified	deferred	c0d03f3c	TODO(capture-refused-leak) for Part D; confirmed by reading, Transport::request handle contract unsettled
+2026-10-16	380	aab8fb89	7	architecture	optional	demonstrated	fixed	1b33d020	37 reasons, 2 stale allows removed, CI denies allow_attributes_without_reason; control exit 101
+2026-10-16	380	aab8fb89	8	architecture	optional	demonstrated	fixed	1b33d020	comment names as_chunks

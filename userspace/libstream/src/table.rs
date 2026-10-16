@@ -135,6 +135,10 @@ impl<'a> TableReader<'a> {
 
     /// Read the next record. `None` once the terminator has been returned (or on a
     /// prior error). A decode failure is reported once, then the reader is spent.
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "it returns `Option<Result<Item>>` as the reader's own protocol, not as an iterator"
+    )]
     pub fn next(&mut self) -> Option<Result<Item>> {
         if self.ended {
             return None;

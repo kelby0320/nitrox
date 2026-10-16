@@ -177,7 +177,7 @@ impl<D: BlockReader + BlockWriter, const N: usize> BlockWriter for MetaCache<'_,
         let mut s = self.store.borrow_mut();
         let (first, end) = (offset / BLOCK as u64, (offset + len).div_ceil(BLOCK as u64));
         for t in s.tags.iter_mut() {
-            if *t != EMPTY && *t - 1 >= first && *t - 1 < end {
+            if *t != EMPTY && *t > first && *t - 1 < end {
                 *t = EMPTY;
             }
         }

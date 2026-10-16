@@ -1200,9 +1200,8 @@ mod tests {
     /// happens (PR #222 review, finding 6).
     #[test]
     fn a_create_that_fails_during_the_handshake_leaves_no_window_behind() {
-        let mut t = MockTransport::default();
         // The create request is answered; the wait for the configure is not.
-        t.fail_after_create = true;
+        let t = MockTransport { fail_after_create: true, ..Default::default() };
         let mut s = Session::new(t);
         assert!(s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).is_err(), "the handshake failed");
         assert!(s.window_ids().is_empty(), "and the session kept no half-made window");
@@ -1365,14 +1364,8 @@ mod tests {
         fn events_pending(&self) -> usize {
             self.s.events_pending()
         }
-        fn poll_event(&mut self) -> Result<Option<WindowEvent>, UiError> {
-            Ok(self.s.poll_event()?.map(|(_, e)| e))
-        }
         fn wait_event(&mut self) -> Result<WindowEvent, UiError> {
             Ok(self.s.wait_event()?.1)
-        }
-        fn configured(&mut self) -> Option<ConfigureEvent> {
-            self.w().configured()
         }
         fn buffers(&mut self) -> Vec<ClientBuffer> {
             self.w().buffers().to_vec()
@@ -1591,8 +1584,7 @@ mod tests {
         // compositor has said where it goes. That is what lets a manager place a window before
         // it is ever seen, with the round trip on the client's side rather than the
         // compositor's.
-        let mut t = MockTransport::default();
-        t.next_window = 6;
+        let t = MockTransport { next_window: 6, ..Default::default() };
         let mut s = Session::new(t);
         let id = s.create(&CreateWindowRequest::new(320, 200, Role::Normal), 2).expect("created");
         let cfg = s.window(id).unwrap().configured().expect("configured before create returned");
@@ -1606,8 +1598,7 @@ mod tests {
         // A client acting on the first configure would be acting on a size it has committed
         // nothing at — it is the permission to draw, not an opinion about a drawing. Only a
         // *later* configure is news.
-        let mut t = MockTransport::default();
-        t.next_window = 1;
+        let t = MockTransport { next_window: 1, ..Default::default() };
         let mut s = Session::new(t);
         let id = s.create(&CreateWindowRequest::new(64, 32, Role::Normal), 2).expect("created");
         assert!(s.poll_event().expect("ok").is_none(), "the handshake leaked into the queue");
@@ -1627,8 +1618,7 @@ mod tests {
     fn a_configure_for_another_window_is_not_this_windows_business() {
         // One session can hold several windows and they share a channel, so the id is what
         // makes a configure attributable — the same reason `FocusEvent` carries one.
-        let mut t = MockTransport::default();
-        t.next_window = 3;
+        let t = MockTransport { next_window: 3, ..Default::default() };
         let mut s = Session::new(t);
         let id = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).expect("created");
         let before = s.window(id).unwrap().configured().unwrap();
@@ -1698,8 +1688,7 @@ mod tests {
 
     #[test]
     fn a_transport_failure_surfaces_rather_than_being_swallowed() {
-        let mut t = MockTransport::default();
-        t.fail = true;
+        let t = MockTransport { fail: true, ..Default::default() };
         assert_eq!(
             Session::new(t).create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).err(),
             Some(UiError::Transport)

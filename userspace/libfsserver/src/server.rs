@@ -947,6 +947,7 @@ fn serve_loop<V: Volume>(vol: &V, serve_end: u64, device: u64) -> ! {
                 WAIT_HANDLES[n] = CONTROL;
                 n += 1;
             }
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for i in 0..MAX_SESSIONS {
                 if SESSION_CH[i] != 0 {
                     WAIT_HANDLES[n] = SESSION_CH[i];

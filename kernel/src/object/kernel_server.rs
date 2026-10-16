@@ -499,7 +499,7 @@ fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 
 /// `/proc/sched/stats` — a **leaf** server returning the per-CPU scheduler
 /// statistics as a fresh read-only [`MemoryObject`] text snapshot (`cpus_online=N`
-/// + one `name=value` row per online CPU — see `crate::sched::stats` and
+/// and one `name=value` row per online CPU — see `crate::sched::stats` and
 /// `docs/architecture/scheduler.md` § "The stats surface"). The full
 /// **capture → format → synthesize** discipline in one place: the counters are
 /// copied under a single `SCHED` hold ([`crate::sched::stats_snapshot`]), the

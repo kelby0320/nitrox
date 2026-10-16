@@ -1182,6 +1182,16 @@ The trigger this entry named — "the first client with two windows" — arrived
 predicted, at Part C's menus. Filed at the PR #184 re-review on 2026-08-11 and closed nine days
 later without the intervening milestones having to guess.
 
+**A refused capture leaks its buffer — `TODO(capture-refused-leak)`.** `desktop-shell`'s
+`capture_window` maps a shared buffer, sends its handle with the request, and unmaps it only on
+success: a refusal — a window closed between the overview's list and its capture — leaves up to
+144 KiB mapped for the session. A failed send also leaves the handle, since
+`libsurface::Transport::request` moves a handle only on a successful send and says nothing of who
+closes it otherwise; `Window::attach`, its other caller with a handle, has the same gap. Found by
+reading in PR #380's review (finding 6). **Trigger**: Part D's bug bash — settle `request`'s
+handle contract (consumed on every path is the simplest for callers), then unmap on every path out
+of `capture_window`, held by a boot that destroys a window as the overview opens.
+
 ### Processes and memory
 
 ~~**The default user stack is 32 KiB…**~~ **Decided 2026-08-10: 8 MiB plus a guard gap,
@@ -1794,6 +1804,18 @@ with `metadata_csum`) means either accepting more of what an unclean shutdown ca
 the journal first. A larger cache would remove some of the reads and none of the writes.
 **Trigger**: many small files on a real path — a package unpacked into the store, a large tree
 restored — or the journal itself.
+
+**A grow that loses a write midway is not undone — `TODO(ext4-failed-write-undo)`.** A grow
+gives back what it took when it fails for want of space or depth, not when the device refuses one
+of its writes. `alloc_run` and `alloc_inode` write the bitmap before the group descriptor's and
+superblock's counts, and return the error with the bits still set if a count write is lost; and
+`grow_file_from`'s last write, the inode's size, has no undo, so a leaf can map blocks past an
+unchanged size. `e2fsck` reports either and repairs it, and nothing but free space is lost. Found
+in PR #380's review (finding 4): losing a grow's first or second write leaves `Block bitmap
+differences` and a wrong free count. **Trigger**: Part D's bug bash, or a disk refusing writes in
+the field — the fix is an order that can be undone (counts before bits, or the bits given back on
+a failed count) and a test failing each write of a grow in turn, as `extent.rs`'s already does for
+the extent tree.
 
 **A copy of a file over 8 MiB (`copy-limit`).** `libfs` copies a file through one mapping of the
 whole of it, and refuses one over `MAX_COPY`, 8 MiB: `sys_memory_map` maps a file from offset 0

@@ -78,16 +78,23 @@ jobs:
       - name: cargo xtask check-size
         run: cargo xtask check-size
 
-      # An unsafe block without a SAFETY comment, and clippy's correctness lints, fail every workspace.
-      # Denied on the command line, so no crate escapes by leaving its manifest's [lints] unset. With
-      # every feature on, so the code the gates build is held; the kernel also with none, for its
-      # two `cfg(not(feature))` blocks.
-      - name: cargo clippy (denied lints)
+      # Every warning fails, and an unsafe block without a SAFETY comment, a SAFETY comment on safe
+      # code, or an allow without its reason. Denied on the command line, so no crate escapes by leaving its manifest's [lints] unset.
+      # With every feature on, so the code the gates build is held; the kernel also with none, for its
+      # two `cfg(not(feature))` blocks. Test code is linted as the host suite builds it: the kernel's
+      # library and every userspace library in test mode (`--profile test`), since userspace's
+      # binaries do not build as tests; the tools' every target.
+      - name: cargo clippy
         run: |
-          (cd kernel && cargo clippy --keep-going -- -D clippy::undocumented_unsafe_blocks -D clippy::correctness)
-          (cd kernel && cargo clippy --keep-going --all-features -- -D clippy::undocumented_unsafe_blocks -D clippy::correctness)
-          (cd tools && cargo clippy --keep-going --all-features -- -D clippy::undocumented_unsafe_blocks -D clippy::correctness)
-          (cd userspace && cargo clippy --keep-going --all-features -- -D clippy::undocumented_unsafe_blocks -D clippy::correctness)
+          D="-D warnings -D clippy::undocumented_unsafe_blocks -D clippy::unnecessary_safety_comment \
+            -D clippy::unnecessary_safety_doc -D clippy::allow_attributes_without_reason"
+          H=x86_64-unknown-linux-gnu
+          (cd kernel && cargo clippy --keep-going -- $D)
+          (cd kernel && cargo clippy --keep-going --all-features -- $D)
+          (cd kernel && cargo clippy --keep-going --lib --profile test --target $H -- $D)
+          (cd tools && cargo clippy --keep-going --all-features --all-targets -- $D)
+          (cd userspace && cargo clippy --keep-going --all-features -- $D)
+          (cd userspace && cargo clippy --keep-going --workspace --lib --profile test --all-features --target $H -- $D)
 
       # The review and bug-bash workflows' control flow, every agent stubbed. No workflow runs.
       - name: workflow checks

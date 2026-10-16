@@ -658,7 +658,7 @@ mod tests {
         let mut buf = [0u8; CLIP_ENTRY_HEAD + 4];
         ClipEntry { serial: 1, kind: CLIP_KIND_TEXT, bytes: b"abcd" }.write(&mut buf).unwrap();
         put_u32(&mut buf, 10, 100);
-        assert!(100 < MAX_CLIP_BYTES, "the cap must not be what refuses this");
+        const { assert!(100 < MAX_CLIP_BYTES, "the cap must not be what refuses this") };
         assert_eq!(ClipEntry::read(&buf), None);
     }
 
@@ -672,7 +672,7 @@ mod tests {
         let mut buf = [0u8; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES + 1];
         ClipEntry { serial: 1, kind: CLIP_KIND_TEXT, bytes: b"abcd" }.write(&mut buf).unwrap();
         put_u32(&mut buf, 10, (MAX_CLIP_BYTES + 1) as u32);
-        assert!(buf.len() >= CLIP_ENTRY_HEAD + MAX_CLIP_BYTES + 1, "the arrival bound must not be what refuses this");
+        assert!(buf.len() > CLIP_ENTRY_HEAD + MAX_CLIP_BYTES, "the arrival bound must not be what refuses this");
         assert_eq!(ClipEntry::read(&buf), None);
     }
 

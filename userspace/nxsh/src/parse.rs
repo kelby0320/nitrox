@@ -938,13 +938,14 @@ impl<'a> Parser<'a> {
         // spaces (`a - b`) or parens, which is how it is written anyway.
         if at_head || forced_external {
             let w = self.lx.peek(crate::lex::Mode::Word)?;
-            if let Tok::Word(text) = &w.tok {
-                if text.contains('-') && text.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic()) {
-                    let name = text.clone();
-                    self.lx.bump(crate::lex::Mode::Word)?;
-                    let args = self.word_args()?;
-                    return Ok(Expr::Call(Box::new(Call { name, kind: CallKind::External, args, forced_external })));
-                }
+            if let Tok::Word(text) = &w.tok
+                && text.contains('-')
+                && text.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic())
+            {
+                let name = text.clone();
+                self.lx.bump(crate::lex::Mode::Word)?;
+                let args = self.word_args()?;
+                return Ok(Expr::Call(Box::new(Call { name, kind: CallKind::External, args, forced_external })));
             }
         }
         let name = self.ident("expected a command or a name")?;
@@ -1389,7 +1390,7 @@ fn make_nullable(t: TypeExpr) -> TypeExpr {
 /// bare name there is a field. The explicit closure form exists for that case, and this
 /// is a place worth watching: `filter size > threshold` reads as though it closes over
 /// `threshold` and does not.
-fn desugar_predicate(args: &mut Vec<Arg>) {
+fn desugar_predicate(args: &mut [Arg]) {
     if args.len() != 1 {
         return;
     }

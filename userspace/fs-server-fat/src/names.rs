@@ -118,7 +118,7 @@ pub fn basis(name: &[u8]) -> ([u8; 8], usize, [u8; 3], usize) {
     let mut b = [b' '; 8];
     let mut bn = 0;
     // A multi-byte UTF-8 character is one character a short name cannot hold: one `_`.
-    for &c in stem.iter().filter(|&&c| c != b'.' && (c < 0x80 || c >= 0xC0)) {
+    for &c in stem.iter().filter(|&&c| c != b'.' && !(0x80..0xC0).contains(&c)) {
         if bn == 8 {
             break;
         }
@@ -129,7 +129,7 @@ pub fn basis(name: &[u8]) -> ([u8; 8], usize, [u8; 3], usize) {
     }
     let mut e = [b' '; 3];
     let mut en = 0;
-    for &c in ext.iter().filter(|&&c| c < 0x80 || c >= 0xC0) {
+    for &c in ext.iter().filter(|&&c| !(0x80..0xC0).contains(&c)) {
         if en == 3 {
             break;
         }

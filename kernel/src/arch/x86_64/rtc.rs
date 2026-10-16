@@ -288,7 +288,7 @@ fn encode(secs: i64, status_b: u8, century: bool) -> Option<(Raw, u8)> {
     let binary = status_b & STATUS_B_BINARY != 0;
     let conv = |v: u32| {
         let v = v as u8;
-        if binary { v } else { (v / 10) << 4 | v % 10 }
+        if binary { v } else { ((v / 10) << 4) | (v % 10) }
     };
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400) as u32;
@@ -303,7 +303,7 @@ fn encode(secs: i64, status_b: u8, century: bool) -> Option<(Raw, u8)> {
         conv(hour24)
     } else {
         // 12-hour: midnight is 12 AM and noon 12 PM, with the PM flag in bit 7.
-        let twelve = if hour24 % 12 == 0 { 12 } else { hour24 % 12 };
+        let twelve = if hour24.is_multiple_of(12) { 12 } else { hour24 % 12 };
         conv(twelve) | if hour24 >= 12 { 0x80 } else { 0 }
     };
     let raw = Raw {

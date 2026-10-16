@@ -954,9 +954,10 @@ mod tests {
     }
 
     /// Read a `Process`'s self-check sentinel through an `ObjectRef` that
-    /// is pinning it. SAFETY: the `ObjectRef` holds a live reference.
+    /// is pinning it.
     fn process_magic_ok(r: &ObjectRef) -> bool {
         debug_assert_eq!(r.object_type(), KObjectType::Process);
+        // SAFETY: `r` pins a live `Process`.
         unsafe { &*(r.as_ptr() as *const Process) }.magic_ok()
     }
 
@@ -1211,6 +1212,7 @@ mod tests {
         assert_eq!(prev.0, p);
         assert_eq!(prev.1, KObjectType::Process);
         // Release the handle's reference (destroys the object).
+        // SAFETY: the table's reference, which `close` handed back.
         drop(unsafe { ObjectRef::from_raw(prev.0, prev.1) });
         assert_eq!(t.lookup(h, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle,);
     }
@@ -1545,7 +1547,9 @@ mod tests {
         // The slot is nulled but the object must NOT be destroyed yet.
         assert_eq!(test_probe::process_destroys(), 0);
         // The object memory is still valid (close did not free it).
+        // SAFETY: `co` still holds the table's reference, so `close` freed nothing.
         assert!(unsafe { &*(co.0 as *const Process) }.magic_ok());
+        // SAFETY: the table's reference, which `close` handed back.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
         assert_eq!(test_probe::process_destroys(), 1);
     }
@@ -1602,8 +1606,8 @@ mod tests {
     fn freelist_invariant_count_matches_chain() {
         let t = fresh_table();
         let mut handles = [RawHandle::NULL; 64];
-        for i in 0..64 {
-            handles[i] = t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap();
+        for (i, h) in handles.iter_mut().enumerate() {
+            *h = t.allocate(1, mk_process(i as u32), KObjectType::Process, sig()).unwrap();
         }
         for i in (0..64).step_by(2) {
             close_release(&t, handles[i], 1).unwrap();
@@ -1617,6 +1621,7 @@ mod tests {
         drop(guard);
         let entries_ptr = t.directory[0].load(Ordering::Acquire);
         assert!(!entries_ptr.is_null());
+        // SAFETY: segment 0's entries, which the table keeps for its life.
         let entries = unsafe { &*entries_ptr };
         let mut idx = free_head;
         let mut walked = 0u32;
@@ -1738,6 +1743,7 @@ mod tests {
                         let _ = close_release(&t, h, pid);
                     } else {
                         // allocate failed: reclaim the creation ref.
+                        // SAFETY: adopts the object's creation reference.
                         drop(unsafe { ObjectRef::from_raw(obj, KObjectType::Process) });
                     }
                     pid = pid.wrapping_add(1);
@@ -1767,6 +1773,7 @@ mod tests {
                                 if let Ok(ok) = t.lookup(h, pid, sig()) {
                                     // The pinned object must be a live
                                     // Process whose pid matches the owner.
+                                    // SAFETY: `ok.object` pins the object, and this test stores only `Process`es.
                                     let p = unsafe { &*(ok.object.as_ptr() as *const Process) };
                                     assert!(p.magic_ok(), "torn/UAF read: bad magic");
                                     assert_eq!(p.pid(), pid, "object pid != owner pid");

@@ -558,7 +558,7 @@ fn consumer_lights() -> Option<u8> {
     // SAFETY: a bounded read of the payload the kernel just wrote.
     let payload = unsafe {
         let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        core::slice::from_raw_parts((&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8, len.min(MSG_LEN - PAYLOAD_OFF))
+        core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], len.min(MSG_LEN - PAYLOAD_OFF))
     };
     let m = decode(payload).ok()?;
     if m.op != OP_INPUT_LIGHTS || m.flags & (RS_FLAG_REPLY | RS_FLAG_ERROR) != 0 {
@@ -784,13 +784,11 @@ fn take_notices(srv: &mut Server) -> bool {
         // read is bounded by the buffer.
         let (n, count) = unsafe {
             let count = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
+            #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
             let received: &[u64; libkern::abi::IPC_HANDLE_MAX] = &*(&raw const RECV_HANDLES);
             handles[..count].copy_from_slice(&received[..count]);
             let len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            let payload = core::slice::from_raw_parts(
-                (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
-                len.min(MSG_LEN - PAYLOAD_OFF),
-            );
+            let payload = core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], len.min(MSG_LEN - PAYLOAD_OFF));
             let n = match decode(payload) {
                 Ok(m) => notice(m.op, m.body, count),
                 Err(_) => Notice::Malformed,
@@ -842,10 +840,7 @@ fn serve_forward(serve_end: u64, srv: &mut Server) -> bool {
     // SAFETY: bounded read of the payload, then of the resolve's suffix.
     let (request_id, is_new, ok) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
+        let req = core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], payload_len.min(MSG_LEN - PAYLOAD_OFF));
         match decode(req) {
             Ok(m) if m.op == OP_NS_RESOLVE => {
                 let suffix = librsproto::namespace::parse_resolve_request(m.body).map(|r| r.suffix).unwrap_or(b"");
@@ -1052,8 +1047,6 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
     }
 }
 
-/// # Safety
-///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments; `ctrl` is the
 /// control channel the supervisor spawned this server with.
 #[unsafe(no_mangle)]

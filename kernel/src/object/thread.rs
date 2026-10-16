@@ -537,6 +537,7 @@ impl Thread {
     #[cfg(test)]
     pub(crate) unsafe fn state(obj: *mut ()) -> ThreadState {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).state) }
     }
 
@@ -827,7 +828,7 @@ impl Thread {
         // SAFETY: `obj` is a live Thread. Reading the `Option`'s payload pointer
         // does not move or alias the box; a `None` yields null.
         unsafe {
-            match &*(&raw const (*p).fpu) {
+            match &(*p).fpu {
                 Some(area) => &raw const **area as *mut ArchFpuState,
                 None => core::ptr::null_mut(),
             }
@@ -887,7 +888,7 @@ impl Thread {
         let p = obj as *mut Thread;
         // SAFETY: read the Option<KernelStack> by reference (not by value —
         // KernelStack is not Copy and owns mappings) and project to its top.
-        unsafe { (*(&raw const (*p).stack)).as_ref().map(|s| s.top().as_u64()) }
+        unsafe { (*p).stack.as_ref().map(|s| s.top().as_u64()) }
     }
 
     /// This thread's owning process id, or `0` for a kernel/boot thread. Raw-pointer
@@ -958,8 +959,8 @@ impl Thread {
         unsafe {
             let n = (*p).wait_count as usize;
             debug_assert!(out.len() >= n);
-            for i in 0..n {
-                out[i] = ((*p).wait_objs[i], (*p).wait_signaled[i]);
+            for (i, o) in out.iter_mut().enumerate().take(n) {
+                *o = ((*p).wait_objs[i], (*p).wait_signaled[i]);
             }
             n
         }

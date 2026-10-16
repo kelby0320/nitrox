@@ -423,12 +423,10 @@ impl Interp {
 
     fn bind(&mut self, name: &str, val: Val, mutable: bool, constant: bool) -> Result<()> {
         let scope = self.scopes.last_mut().expect("a scope is always open");
-        if let Some((_, slot)) = scope.iter().find(|(n, _)| n == name) {
-            if slot.constant {
-                return Err(EvalError::new(alloc::format!(
-                    "`{name}` is a const and cannot be rebound in the same scope"
-                )));
-            }
+        if let Some((_, slot)) = scope.iter().find(|(n, _)| n == name)
+            && slot.constant
+        {
+            return Err(EvalError::new(alloc::format!("`{name}` is a const and cannot be rebound in the same scope")));
         }
         scope.push((String::from(name), Slot { val, mutable, constant }));
         Ok(())
@@ -917,10 +915,12 @@ impl Interp {
                 // a call with an empty list, not a mention, and a `Def`-kind call only
                 // ever comes from the parens form (§5b). Conflating the two made `f()`
                 // evaluate to the function itself instead of calling it.
-                if c.args.is_empty() && !c.forced_external && c.kind != CallKind::Def {
-                    if let Some(v) = self.lookup_any(&c.name) {
-                        return Ok(v);
-                    }
+                if c.args.is_empty()
+                    && !c.forced_external
+                    && c.kind != CallKind::Def
+                    && let Some(v) = self.lookup_any(&c.name)
+                {
+                    return Ok(v);
                 }
                 if c.kind == CallKind::External {
                     return self.pipeline(core::slice::from_ref(e));
@@ -1050,27 +1050,27 @@ impl Interp {
                     }
                 },
             };
-            if let (Some(t), Ok(())) = (&p.ty, &result) {
-                if let Err(e) = check_type(&value, t) {
-                    result = Err(EvalError::new(alloc::format!(
-                        "`{}` parameter `{}`: {}",
-                        f.name.as_deref().unwrap_or("this function"),
-                        p.name,
-                        e.message
-                    )));
-                }
+            if let (Some(t), Ok(())) = (&p.ty, &result)
+                && let Err(e) = check_type(&value, t)
+            {
+                result = Err(EvalError::new(alloc::format!(
+                    "`{}` parameter `{}`: {}",
+                    f.name.as_deref().unwrap_or("this function"),
+                    p.name,
+                    e.message
+                )));
             }
             let _ = self.bind(&p.name, value, false, false);
         }
 
         // An unknown named argument is an error, not silently ignored (§5b).
-        if result.is_ok() {
-            if let Some((n, _)) = named.iter().find(|(n, _)| !f.params.iter().any(|p| &p.name == n)) {
-                result = Err(EvalError::new(alloc::format!(
-                    "`{}` has no parameter `{n}`",
-                    f.name.as_deref().unwrap_or("this function")
-                )));
-            }
+        if result.is_ok()
+            && let Some((n, _)) = named.iter().find(|(n, _)| !f.params.iter().any(|p| &p.name == n))
+        {
+            result = Err(EvalError::new(alloc::format!(
+                "`{}` has no parameter `{n}`",
+                f.name.as_deref().unwrap_or("this function")
+            )));
         }
 
         let out = match result {
@@ -1291,7 +1291,7 @@ impl Interp {
         match (names, alias) {
             (Some(wanted), _) => {
                 for n in wanted {
-                    if !public.iter().any(|p| *p == n) {
+                    if !public.contains(&n) {
                         return Err(EvalError::new(alloc::format!(
                             "`{path}` does not export `{n}` — mark it `pub` to let it cross \
                              the file boundary"
@@ -1692,7 +1692,7 @@ impl Interp {
                 let f = self.one_closure(&closures, name)?;
                 let mut kept = Vec::new();
                 for row in ops::rows(&v).map_err(EvalError::new)? {
-                    let keep = self.call_closure(&f, &[row.clone()])?;
+                    let keep = self.call_closure(&f, core::slice::from_ref(&row))?;
                     match keep.as_bool() {
                         Some(true) => kept.push(row),
                         Some(false) => {}
@@ -1863,13 +1863,13 @@ impl Interp {
                 }
             }
             // A bare name bound to a function: §5b's argument-free call form.
-            if let Expr::Ident(n) = &stages[i] {
-                if let Some(Val::Func(f)) = self.lookup_any(n) {
-                    let op = carried.take();
-                    carried = Some(self.call_function(&f, &[], &[], op, false)?);
-                    i += 1;
-                    continue;
-                }
+            if let Expr::Ident(n) = &stages[i]
+                && let Some(Val::Func(f)) = self.lookup_any(n)
+            {
+                let op = carried.take();
+                carried = Some(self.call_function(&f, &[], &[], op, false)?);
+                i += 1;
+                continue;
             }
             // **A keyword stage** — `expect T`, `parse T`, `assert (P)` (§8c).
             //

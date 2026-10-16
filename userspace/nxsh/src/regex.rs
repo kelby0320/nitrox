@@ -150,10 +150,10 @@ impl Regex {
                 *slot = false;
             }
             for pc in &current {
-                if let Inst::Char(class, then) = &self.prog[*pc] {
-                    if class.matches(c) {
-                        self.add_thread(&mut next, &mut on_next, *then, start + 1, &chars);
-                    }
+                if let Inst::Char(class, then) = &self.prog[*pc]
+                    && class.matches(c)
+                {
+                    self.add_thread(&mut next, &mut on_next, *then, start + 1, &chars);
                 }
             }
             core::mem::swap(&mut current, &mut next);
@@ -210,10 +210,8 @@ impl Regex {
                         matched = Some(done);
                         break; // cut the lower-priority threads
                     }
-                    Inst::Char(class, then) => {
-                        if at < chars.len() && class.matches(chars[at]) {
-                            self.add_capturing(&mut next, &mut on_next, *then, at + 1, &chars, slots);
-                        }
+                    Inst::Char(class, then) if at < chars.len() && class.matches(chars[at]) => {
+                        self.add_capturing(&mut next, &mut on_next, *then, at + 1, &chars, slots);
                     }
                     _ => {}
                 }

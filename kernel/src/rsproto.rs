@@ -16,7 +16,7 @@
 //! exist — the kernel is purely the *client* of the forwarded Resolve. All
 //! multi-byte integers are little-endian.
 
-#![allow(dead_code)] // the constants document the wire format; not all are read
+#![allow(dead_code, reason = "the constants document the wire format; not all are read")]
 
 /// Protocol magic: ASCII `"RSMG"`. Every message begins with it.
 const RS_MAGIC: u32 = 0x5253_4D47;

@@ -157,11 +157,11 @@ mod tests {
         out.extend_from_slice(&hdr);
         out.extend_from_slice(name.as_bytes());
         out.push(0);
-        while out.len() % 4 != 0 {
+        while !out.len().is_multiple_of(4) {
             out.push(0);
         }
         out.extend_from_slice(data);
-        while out.len() % 4 != 0 {
+        while !out.len().is_multiple_of(4) {
             out.push(0);
         }
     }

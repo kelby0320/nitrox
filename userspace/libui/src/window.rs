@@ -205,6 +205,10 @@ impl Child {
     /// `Normal` created that way "would ignore every resize a manager asked of it for the rest of
     /// its life — silently, because declining a `Configure` is legal". A window opened here can
     /// answer one: [`resize`](Self::resize) is what `open` had no equivalent of.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a window's role, geometry, content and appearance are separate inputs"
+    )]
     pub fn open_sized<T: Transport, Msg>(
         session: &mut Session<T>,
         role: Role,
@@ -414,6 +418,10 @@ impl Child {
     /// callback and no caller minded; a *main* window need not be — `nxterm`'s grid is a `custom`
     /// node whose damage feeds `libterm`, and a window that painted it with nothing would draw
     /// the chrome around an empty rectangle.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a window's role, geometry, content and appearance are separate inputs"
+    )]
     pub fn present_custom<T: Transport, Msg>(
         &mut self,
         session: &mut Session<T>,
@@ -559,10 +567,45 @@ impl Child {
     }
 }
 
+/// What a caller is told the hover is: the tree's while a gesture runs, the pointer's otherwise.
+///
+/// **A function so that one thing decides it** (PR #270 review, blocking 2). The rule had a test
+/// that re-implemented it with a local closure, so reverting the shipped code left all two hundred
+/// `libui` tests green — a guard for a mechanism rather than for the fix, on the third attempt at
+/// a bug whose first two attempts also looked right. The test calls this now, and breaking it
+/// fails.
+///
+/// **What is still not covered here** is the wiring: that [`Child::present`] records the hover it
+/// drew with and that [`Child::route`] tracks the live one. A `Child` cannot be built on the host
+/// at all — `BufferPool::new` is memory syscalls — so those two lines are the gate's, and this is
+/// the part that can be pinned without one.
+fn reported_hover(grabbed: bool, live: Option<u64>, shown: Option<u64>) -> Option<u64> {
+    if grabbed { shown } else { live }
+}
+
+/// Whether `event` is a window's first keyboard, recording in `had` that it has had one.
+///
+/// A function for [`reported_hover`]'s reason — a `Child` cannot be built on the host. **It
+/// takes the flag rather than returning it**, so the record is part of what the test runs: a
+/// version that returned the new value left the one line storing it untested, and deleting that
+/// line announced every gain (PR #330 review, optional 2).
+fn first_keyboard(had: &mut bool, event: &WindowEvent) -> bool {
+    match event {
+        WindowEvent::Focus(true) => !core::mem::replace(had, true),
+        _ => false,
+    }
+}
+
+/// A private framebuffer of `size` to compose a frame into.
+fn compose_buffer(size: Size) -> Option<MemFramebuffer> {
+    let pitch = (size.w as usize).checked_mul(4)?;
+    Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888).map(MemFramebuffer::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::element::{Element, Insets, padding, text};
+    use crate::element::Element;
     use crate::layout::FixedCell;
     use crate::route::Router;
     use crate::widget::{Theme, menu_item};
@@ -766,12 +809,6 @@ mod tests {
         assert!(!router.grabbed(), "the release closes it");
     }
 
-    /// Space for a `padding` import that keeps the element helpers honest in this module.
-    #[allow(dead_code)]
-    fn _unused() -> Element<u32> {
-        padding(Insets::all(0), text("x"))
-    }
-
     /// A transport that counts what reaches it and refuses all of it.
     #[derive(Default)]
     struct Counting {
@@ -831,39 +868,4 @@ mod tests {
         // A new window starts again.
         assert!(first_keyboard(&mut false, &gain));
     }
-}
-
-/// What a caller is told the hover is: the tree's while a gesture runs, the pointer's otherwise.
-///
-/// **A function so that one thing decides it** (PR #270 review, blocking 2). The rule had a test
-/// that re-implemented it with a local closure, so reverting the shipped code left all two hundred
-/// `libui` tests green — a guard for a mechanism rather than for the fix, on the third attempt at
-/// a bug whose first two attempts also looked right. The test calls this now, and breaking it
-/// fails.
-///
-/// **What is still not covered here** is the wiring: that [`Child::present`] records the hover it
-/// drew with and that [`Child::route`] tracks the live one. A `Child` cannot be built on the host
-/// at all — `BufferPool::new` is memory syscalls — so those two lines are the gate's, and this is
-/// the part that can be pinned without one.
-fn reported_hover(grabbed: bool, live: Option<u64>, shown: Option<u64>) -> Option<u64> {
-    if grabbed { shown } else { live }
-}
-
-/// Whether `event` is a window's first keyboard, recording in `had` that it has had one.
-///
-/// A function for [`reported_hover`]'s reason — a `Child` cannot be built on the host. **It
-/// takes the flag rather than returning it**, so the record is part of what the test runs: a
-/// version that returned the new value left the one line storing it untested, and deleting that
-/// line announced every gain (PR #330 review, optional 2).
-fn first_keyboard(had: &mut bool, event: &WindowEvent) -> bool {
-    match event {
-        WindowEvent::Focus(true) => !core::mem::replace(had, true),
-        _ => false,
-    }
-}
-
-/// A private framebuffer of `size` to compose a frame into.
-fn compose_buffer(size: Size) -> Option<MemFramebuffer> {
-    let pitch = (size.w as usize).checked_mul(4)?;
-    Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888).map(MemFramebuffer::new)
 }

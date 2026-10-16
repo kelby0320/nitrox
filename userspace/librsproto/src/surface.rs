@@ -466,7 +466,7 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
     let role = match get_u16(body, 8) {
         ROLE_NORMAL => Role::Normal,
         ROLE_PANEL => {
-            let Some(dock) = Edge::from_wire(aux16) else { return None };
+            let dock = Edge::from_wire(aux16)?;
             if aux32 > MAX_STRUT_RESERVE {
                 return None;
             }
@@ -2329,7 +2329,7 @@ impl PointerEvent {
     /// stamped zero that reads as "the beginning of time" to anything comparing two of them.
     /// The wheel is the builder ([`with_wheel`](Self::with_wheel)), because only one kind
     /// carries it.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, reason = "a pointer event's fields, in wire order")]
     pub const fn new(
         window: u32,
         kind: u16,
@@ -3093,7 +3093,7 @@ mod title_tests {
         // cap lands *inside* a character and the walk back is the only thing that can work.
         let mut raw = [0u8; 259];
         raw[0] = b'a';
-        for pair in raw[1..].chunks_exact_mut(2) {
+        for pair in raw[1..].as_chunks_mut::<2>().0 {
             pair.copy_from_slice(&[0xC3, 0xA9]);
         }
         let s = core::str::from_utf8(&raw).expect("the fixture is valid UTF-8");

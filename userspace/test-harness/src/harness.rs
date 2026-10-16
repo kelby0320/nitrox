@@ -195,6 +195,7 @@ fn stream_transport_demo() {
     }
     let stack_top = base as u64 + stack_bytes;
 
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // 3. Spawn the producer thread on `e0`.
     // SAFETY: STREAM_E0/STREAM_ARGS are our statics; we initialise them, then hand a
     // shared reference to the wrapper.
@@ -303,6 +304,7 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
         }
     };
 
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // 3. Spawn `child` as a Tier-1 stage: endpoint = `setup_stage` (moved), `arg0` = the
     //    bootstrap descriptor. SAFETY: SPAWN_STAGE is our static, initialised here.
     let _stage = match unsafe {
@@ -427,6 +429,7 @@ fn worker_exception_demo(notif: u64) {
     }
     let stack_top = base as u64 + PAGE; // stacks grow down from the top
 
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // 2. Create the worker thread (entry = worker_fault, sp = stack top).
     // SAFETY: WORKER_ARGS is a valid writable arg block; the pointer is read by
     // the kernel.
@@ -492,8 +495,7 @@ fn worker_exception_demo(notif: u64) {
     }
     // The worker is not this process's last thread (we are still running), so
     // its termination produces no `ChildExited`. Drop our handle to it.
-    // SAFETY: closing our own handle.
-    // (worker Handle<Thread> closes on drop at function end — no explicit close)
+    // The worker's `Handle<Thread>` closes on drop at function end.
     kprint(b"test-harness: worker terminated\n");
 }
 
@@ -1121,6 +1123,7 @@ fn exit_storm_demo(root_ns: u64, notif: u64) {
     for _ in 0..ROUNDS {
         let mut procs = [const { None }; WAVE];
         for slot in procs.iter_mut() {
+            #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
             // SAFETY: STORM_SPAWN is a valid writable arg block, exclusively
             // read here (image set just above; no handle grants).
             let spawned = unsafe {
@@ -1513,12 +1516,11 @@ fn list_pipeline_demo(root_ns: u64, notif: u64) {
     };
     let mut nested = 0usize;
     while let Some(Ok(item)) = tr.next() {
-        if let Item::Row(vals) = item {
-            if let Value::Str(name) = &vals[0] {
-                if name.starts_with("nx-list/e") {
-                    nested += 1;
-                }
-            }
+        if let Item::Row(vals) = item
+            && let Value::Str(name) = &vals[0]
+            && name.starts_with("nx-list/e")
+        {
+            nested += 1;
         }
     }
     if nested != LIST_FIXTURE_ENTRIES {
@@ -1597,6 +1599,7 @@ fn run_coreutil_capture_in(
         Ok(p) => p,
         Err(_) => return_fail(b"test-harness: list setup chan FAIL\n"),
     };
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: SPAWN_LIST is our static, initialised here; spawns are sequential.
     let _proc = match unsafe {
         SPAWN_LIST.image = img;
@@ -1698,7 +1701,7 @@ fn wall_clock_demo() {
     // BCD/epoch conversion.
     const NS_2024: u64 = 1_704_067_200_000_000_000;
     const NS_2100: u64 = 4_102_444_800_000_000_000;
-    if first < NS_2024 || first > NS_2100 {
+    if !(NS_2024..=NS_2100).contains(&first) {
         return_fail(b"test-harness: CLOCK_REALTIME is not a plausible date\n");
     }
 
@@ -1750,6 +1753,7 @@ fn dead_stage_closes_its_pipe_demo(root_ns: u64, notif: u64) {
         Ok(p) => p,
         Err(_) => return_fail(b"test-harness: dead-stage setup chan FAIL\n"),
     };
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: SPAWN_LIST is our static; the coreutil spawns are sequential.
     let _proc = match unsafe {
         SPAWN_LIST.image = img;
@@ -2087,10 +2091,10 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
     let mut method_seen = false;
     if let Ok(mut tr) = TableReader::new(&bytes) {
         while let Some(Ok(item)) = tr.next() {
-            if let Item::Row(vals) = item {
-                if matches!(&vals[2], Value::Str(s) if s == "rename") {
-                    method_seen = true;
-                }
+            if let Item::Row(vals) = item
+                && matches!(&vals[2], Value::Str(s) if s == "rename")
+            {
+                method_seen = true;
             }
         }
     }
@@ -2127,10 +2131,10 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
     let mut copied = false;
     if let Ok(mut tr) = TableReader::new(&bytes) {
         while let Some(Ok(item)) = tr.next() {
-            if let Item::Row(vals) = item {
-                if matches!(&vals[2], Value::Str(s) if s == "copy") {
-                    copied = true;
-                }
+            if let Item::Row(vals) = item
+                && matches!(&vals[2], Value::Str(s) if s == "copy")
+            {
+                copied = true;
             }
         }
     }
@@ -2442,10 +2446,10 @@ fn whoami_demo(root_ns: u64, notif: u64) {
             return_fail(b"test-harness: whoami schema is not a single `user` field\n");
         }
         while let Some(Ok(item)) = tr.next() {
-            if let Item::Row(vals) = item {
-                if matches!(&vals[0], Value::Str(s) if s.as_bytes() == NAME) {
-                    got_name = true;
-                }
+            if let Item::Row(vals) = item
+                && matches!(&vals[0], Value::Str(s) if s.as_bytes() == NAME)
+            {
+                got_name = true;
             }
         }
     }
@@ -2818,6 +2822,7 @@ fn run_coreutil_in(root_ns: u64, notif: u64, image: &[u8], argv: &[&str], child_
         Ok(p) => p,
         Err(_) => return_fail(b"test-harness: copy setup chan FAIL\n"),
     };
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: SPAWN_LIST is our static (shared by the coreutil spawns, which are
     // sequential); initialised here for this spawn.
     let _proc = match unsafe {
@@ -3564,8 +3569,6 @@ fn session_fanout_demo(root_ns: u64) {
         if seen == 0 {
             return_fail(b"test-harness: late session listed nothing (/system is not empty)\n");
         }
-        // `from_endpoint` took ownership; hand it back so the teardown below closes once.
-        core::mem::forget(d);
     }
     if MAX_SESSIONS <= OLD_CAP {
         return_fail(b"test-harness: session cap did not actually move past 7\n");
@@ -4057,6 +4060,7 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
                 exit(1);
             }
         };
+        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
         // SAFETY: SPAWN_STAGE is our static, exclusively written + read here.
         let spawned = unsafe {
             SPAWN_STAGE.image = img;
@@ -4295,8 +4299,12 @@ fn block_demo(root_ns: u64) {
         let mut info = abi::HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
         // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
         let sr = unsafe { syscall2(SYS_HANDLE_STAT, snap, (&raw mut info) as u64) };
-        // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
-        let addr = if sr == 0 { unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) } } else { -1 };
+        let addr = if sr == 0 {
+            // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
+            unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) }
+        } else {
+            -1
+        };
         let found = if addr > 0 {
             // SAFETY: `info.size` bytes are mapped read-only at `addr` until the unmap below.
             let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, info.size as usize) };

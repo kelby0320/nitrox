@@ -140,7 +140,7 @@ impl EntropyState {
     /// Account one jitter sample, crediting a bit every [`JITTER_PER_BIT`] of them.
     fn credit_jitter(&mut self) {
         self.jitter_ctr = self.jitter_ctr.wrapping_add(1);
-        if self.jitter_ctr % JITTER_PER_BIT == 0 {
+        if self.jitter_ctr.is_multiple_of(JITTER_PER_BIT) {
             self.credit(1);
         }
     }

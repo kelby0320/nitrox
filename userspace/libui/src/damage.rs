@@ -124,9 +124,7 @@ impl BufferDamage {
     /// Every rectangle is stale after a resize, and re-deriving that node by node is slower
     /// and no more correct than repainting.
     pub fn reset_all(&mut self, bounds: Rect) {
-        for slot in &mut self.pending {
-            *slot = Some(bounds);
-        }
+        self.pending.fill(Some(bounds));
     }
 
     /// Change the buffer count, damaging everything.

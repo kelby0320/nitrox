@@ -251,8 +251,12 @@ fn cmd_lsblk(root_ns: u64) {
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `&mut info` is a valid 24-byte HandleInfo out-param.
     let sr = unsafe { syscall2(SYS_HANDLE_STAT, h, (&mut info as *mut HandleInfo) as u64) };
-    // SAFETY: `h` is a mappable snapshot with MAP_READ; the syscall rounds up to whole pages.
-    let addr = if sr == 0 { unsafe { syscall4(SYS_MEMORY_MAP, h, 0, info.size, RIGHT_MAP_READ) } } else { -1 };
+    let addr = if sr == 0 {
+        // SAFETY: `h` is a mappable snapshot with MAP_READ; the syscall rounds up to whole pages.
+        unsafe { syscall4(SYS_MEMORY_MAP, h, 0, info.size, RIGHT_MAP_READ) }
+    } else {
+        -1
+    };
     // SAFETY: closing our own handle; a mapping outlives it.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
     if addr < 0 {

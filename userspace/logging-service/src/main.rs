@@ -426,6 +426,7 @@ fn received() -> Option<librsproto::Message<'static>> {
     // SAFETY: RECV_COUNT/RECV_HANDLES were written by the `recv` that filled RECV_MSG; this
     // process is single-threaded, so nothing writes them while the slice below is read.
     unsafe {
+        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
         for i in 0..RECV_COUNT.min(8) {
             close(RECV_HANDLES[i]);
         }
@@ -502,6 +503,7 @@ fn serve_read_session(h: u64, ring: &Ring) -> bool {
 /// more than `max` (`0` for no limit) — [`Ring::fill_reply`]. None left is an empty reply, which is
 /// how a reader knows it has read to the end.
 fn reply_records(to: u64, request_id: u64, ring: &Ring, after: u64, max: u32) {
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: READ_BODY is this single-threaded service's scratch, used by no one else.
     let body = unsafe { &mut *(&raw mut READ_BODY) };
     let Some(len) = ring.fill_reply(after, max, body) else {
@@ -510,6 +512,7 @@ fn reply_records(to: u64, request_id: u64, ring: &Ring, after: u64, max: u32) {
     // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset 24, and READ_BODY is
     // not REPLY_MSG.
     let rs_len = unsafe {
+        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
         let body = &(&*(&raw const READ_BODY))[..len];
         match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_LOG_READ, request_id, RS_FLAG_REPLY, body, 0) {
             Some(n) => n,
@@ -793,8 +796,7 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
         exit(1);
     }
 
-    let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
-    sinks.push(Box::new(SerialSink));
+    let sinks: Vec<Box<dyn Sink>> = alloc::vec![Box::new(SerialSink)];
     let mut log = Log { sinks, ring: Ring::new(), seq: 0 };
     serve_loop(serve_end, control, &mut log);
 }

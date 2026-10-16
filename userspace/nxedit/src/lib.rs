@@ -785,6 +785,7 @@ impl Buffer {
         let from = if unknown { 0 } else { self.dirty_from.min(n.saturating_sub(1)) };
         self.dirty_from = usize::MAX;
         let mut st = if from == 0 { syntax::State::Normal } else { self.starts[from] };
+        #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
         for i in from..n {
             self.starts[i] = st;
             let (_, next) = syntax::scan(&lang, &lines[i], st);
@@ -1107,7 +1108,7 @@ impl App {
     /// person pressing save on a file that could not be read is answered rather than ignored.
     pub fn take_save(&mut self) -> Option<(u64, String, String)> {
         let key = core::mem::take(&mut self.save_requested)?;
-        let Some(b) = self.buffers.iter().find(|b| b.key == key) else { return None };
+        let b = self.buffers.iter().find(|b| b.key == key)?;
         if let Some(why) = b.blocked.clone() {
             self.status = alloc::format!("not saved — {why}");
             return None;
@@ -1739,6 +1740,7 @@ impl App {
         };
         let lines = b.text.lines();
         let mut out = Vec::new();
+        #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
         for i in b.text.offset()..(b.text.offset() + visible).min(lines.len()) {
             let start = b.starts.get(i).copied().unwrap_or_default();
             let (runs, _) = syntax::scan(&lang, &lines[i], start);
@@ -2146,7 +2148,7 @@ impl App {
     /// handed down, rather than being fetched from a default in the middle of a view.
     pub fn view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let title = title_bar(
-            &self.title(),
+            self.title(),
             // The design names the kind of window beside the file it holds.
             Some(EDITOR_KIND),
             self.focused,
@@ -2161,7 +2163,7 @@ impl App {
                 close: Some(Msg::Close),
             },
             hovered,
-            &ui,
+            ui,
         )
         .key(TITLE_KEY);
 
@@ -2174,18 +2176,18 @@ impl App {
             // a person read two things to find out which one is asking for an answer.
             Some((_, f)) => padding(
                 Insets { top: 2, right: 6, bottom: 2, left: 0 },
-                text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+                text_field(f, false, WidgetState { active: true, ..Default::default() }, ui),
             ),
-            None => status_text(self.status.clone(), &ui),
+            None => status_text(self.status.clone(), ui),
         };
         // **`language · ln N, col M`**, in the fixed-advance face so the numbers do not shuffle
         // the line about as the caret moves through a file.
         let position = libui::element::row(alloc::vec![
-            status_text(self.language_name(), &ui),
-            status_separator(&ui),
-            mono(status_text(self.position_text(), &ui)),
+            status_text(self.language_name(), ui),
+            status_separator(ui),
+            mono(status_text(self.position_text(), ui)),
         ]);
-        let strip = status_bar(reading.key(STATUS_KEY), Some(position.key(POSITION_KEY)), Edge::Top, &ui);
+        let strip = status_bar(reading.key(STATUS_KEY), Some(position.key(POSITION_KEY)), Edge::Top, ui);
 
         // **The tab strip, drawn whatever the count.** A strip that appeared with the second
         // tab would move everything below it the moment a file was dropped in — the window's
@@ -2198,11 +2200,11 @@ impl App {
         // **The file's own controls ride on the tab strip** (desktop refresh, Part J), which is
         // where the design puts them: how big the buffer is, and the one action that changes it.
         let controls = libui::element::row(alloc::vec![
-            center_v(mono(status_text(self.size_text(), &ui))).key(BYTES_KEY),
+            center_v(mono(status_text(self.size_text(), ui))).key(BYTES_KEY),
             sized(Size::new(STATUS_GAP, 0), text("")).key(BYTES_GAP_KEY),
             center_v(sized(
                 Size::new(0, PILL_H),
-                pill("Save", Msg::Save, WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() }, &ui,),
+                pill("Save", Msg::Save, WidgetState { hovered: hovered == Some(SAVE_KEY), ..Default::default() }, ui,),
             ))
             .key(SAVE_KEY),
         ]);
@@ -2213,7 +2215,7 @@ impl App {
             Msg::SelectTab,
             Msg::CloseTab,
             TabExtras { new_tab: Some(Msg::NewTab), right: Some(controls) },
-            &ui,
+            ui,
         );
 
         let h = self.area_h();
@@ -2222,7 +2224,7 @@ impl App {
         // offset as it stands now would be for a different set of lines whenever a keystroke
         // moved the view. Calling it here settles the offset first; the widget's own call then
         // finds nothing to do.
-        let ink = self.ink(&ui, (h / ROW_H) as usize);
+        let ink = self.ink(ui, (h / ROW_H) as usize);
         // **The text area takes drops; the chrome does not.** That distinction is the whole of
         // what decision 3 buys — the compositor knows only that this window declared an
         // acceptor, and *where* on the window a drop means something is decided here, by which
@@ -2237,7 +2239,7 @@ impl App {
         // The chrome around it stays proportional — `mono` wraps what is inside it and nothing
         // else, which is how a window comes to be painted in two faces at once.
         let area = mono(
-            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ink, Some(Msg::AreaPointer), &ui)
+            text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ink, Some(Msg::AreaPointer), ui)
                 .on_drop(Msg::Dropped)
                 .on_wheel(Msg::AreaWheel),
         );
@@ -2311,7 +2313,7 @@ impl App {
         let area = dock(
             alloc::vec![docked(
                 Edge::Right,
-                sized(Size::new(SCROLL_W, h), scrollbar(bar, SCROLL_W, h, &ui).on_pointer(Msg::AreaScroll))
+                sized(Size::new(SCROLL_W, h), scrollbar(bar, SCROLL_W, h, ui).on_pointer(Msg::AreaScroll))
                     .key(AREA_BAR_KEY),
             )],
             pane.key(AREA_PANE_KEY),
@@ -2335,7 +2337,7 @@ impl App {
                             MENU_BAR_KEY,
                             hovered,
                             Msg::MenuBar,
-                            &ui,
+                            ui,
                             MENU_BAR_H,
                         )
                         .key(BAR_KEY),
@@ -2350,10 +2352,10 @@ impl App {
                 // rows for one height and be drawn at another.
                 sized(Size::new(0, h), area).key(AREA_KEY),
             ),
-            resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
+            resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), ui).key(GRIP_KEY),
             self.window,
             self.focused,
-            &ui,
+            ui,
         )
     }
 
@@ -2467,7 +2469,7 @@ mod tests {
 
     /// A key press, as the compositor delivers one.
     fn key(a: &mut App, keycode: u16, modifiers: u16) {
-        a.update(Msg::Key(KeyEvent::new(1, keycode, KEY_DOWN as u16, modifiers)));
+        a.update(Msg::Key(KeyEvent::new(1, keycode, KEY_DOWN, modifiers)));
     }
 
     /// Type `text` one keystroke at a time, as a person would.
@@ -2587,7 +2589,6 @@ mod tests {
     /// a smaller step sat three pixels low — worse as `font_px` grows, since the steps diverge.
     #[test]
     fn a_line_number_sits_on_its_line() {
-        use libui::layout::Metrics as _;
         const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
         const MONO: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
         let face = libdraw::text::Font::from_bytes(DEJAVU.to_vec())
@@ -2663,7 +2664,7 @@ mod tests {
             fn scaled_inside<M>(e: &Element<M>) -> bool {
                 matches!(e.node, libui::element::Node::Scale { .. }) || e.children().any(scaled_inside)
             }
-            fn keyed<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
+            fn keyed<M>(e: &Element<M>, key: u64) -> Option<&Element<M>> {
                 if e.key == Some(key) {
                     return Some(e);
                 }
@@ -2731,7 +2732,7 @@ mod tests {
                     walk(c, out);
                 }
             }
-            fn keyed<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
+            fn keyed<M>(e: &Element<M>, key: u64) -> Option<&Element<M>> {
                 if e.key == Some(key) {
                     return Some(e);
                 }
@@ -2783,7 +2784,7 @@ mod tests {
     /// column, further off the further into a line it goes.
     #[test]
     fn the_buffer_is_drawn_in_the_style_the_caret_is_measured_in() {
-        assert!(BUFFER_STYLE.mono, "the buffer is fixed-advance");
+        const { assert!(BUFFER_STYLE.mono, "the buffer is fixed-advance") };
         let mut a = app();
         let e = a.view(&UiTheme::default(), None);
         // **The wrapper is inside the keyed element**, not above it: the key goes on the sized
@@ -3103,7 +3104,7 @@ mod tests {
         let theme = UiTheme::default();
         let size = a.window_size();
         let mut tree = libui::diff::Tree::new();
-        let mut frame = |a: &mut App, tree: &mut libui::diff::Tree| {
+        let frame = |a: &mut App, tree: &mut libui::diff::Tree| {
             let e = a.view(&theme, None);
             let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &CELL);
             tree.update(&e, &l).expect("diffable");
@@ -4030,7 +4031,7 @@ mod tests {
             checked += 1;
             // The table has no two rows on one chord, which is the property the old version of
             // this test pinned and the only one it pinned.
-            let ev = KeyEvent::new(1, acc.key(), KEY_DOWN as u16, acc.mods());
+            let ev = KeyEvent::new(1, acc.key(), KEY_DOWN, acc.mods());
             assert_eq!(
                 libui::menu::accel_match(&table, &ev).as_ref(),
                 Some(msg),
@@ -4620,7 +4621,7 @@ mod tests {
         let theme = UiTheme::default();
         let mut tree = libui::diff::Tree::new();
         let cell = libui::layout::FixedCell { w: 8, h: 16 };
-        let mut check = |a: &mut App, hovered, tree: &mut libui::diff::Tree, what: &str| {
+        let check = |a: &mut App, hovered, tree: &mut libui::diff::Tree, what: &str| {
             let size = a.window_size();
             let e = a.view(&theme, hovered);
             let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
@@ -4861,7 +4862,7 @@ mod tests {
         assert_eq!(a.chooser().unwrap().state.list.selected, Some(1), "and moved nothing");
 
         // A character in Open has nowhere to go, and is swallowed rather than reaching the buffer.
-        let before = String::from(a.text());
+        let before = a.text();
         assert!(a.chooser_key(ev(KEY_X, 1)), "claimed even though it does nothing");
         assert_eq!(a.text(), before, "the buffer behind the dialog is untouched");
 

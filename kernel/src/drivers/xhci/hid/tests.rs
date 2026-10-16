@@ -20,6 +20,7 @@ fn only_a_stall_leaves_the_default_endpoint_to_ask_again() {
 /// QEMU's keyboard reads none of them — it takes any `SET_REPORT` as its lights — so a swapped
 /// `wValue` would pass every gate and reach a real keyboard as an Input report with ID 2.
 #[test]
+#[allow(clippy::unusual_byte_groupings, reason = "grouped by the request type's fields")]
 fn the_lights_request_is_an_output_report_to_its_interface() {
     let r = set_lights_request(3, None);
     assert_eq!(r[0], 0b0_01_00001, "host to device, class, to an interface");
@@ -252,7 +253,7 @@ fn a_report_pushed_after_its_device_departed_is_dropped() {
         let mut out = [0u8; DRAIN_MAX];
         let len = n.readers[index].lock().ring.drain_into(&mut out, 3);
         let events = out[..len].chunks(INPUT_EVENT_LEN).filter_map(InputEvent::read);
-        let last = events.clone().filter(|e| e.kind == EV_KEY).last().map(|e| (e.code, e.value));
+        let last = events.clone().rfind(|e| e.kind == EV_KEY).map(|e| (e.code, e.value));
         (events.count(), last)
     };
     nodes.push(index, epoch, &press, &mut scratch, 2);

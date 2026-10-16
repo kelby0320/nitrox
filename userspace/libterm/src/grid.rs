@@ -486,10 +486,7 @@ impl Grid {
         }
         let mut out = String::new();
         for col in 0..self.cols {
-            match self.view_cell(line, 0, col) {
-                Some(c) => out.push(c.ch),
-                None => return None,
-            }
+            out.push(self.view_cell(line, 0, col)?.ch);
         }
         while out.ends_with(' ') {
             out.pop();

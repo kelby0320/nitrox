@@ -396,7 +396,7 @@ pub fn ns_children(ns: u64, path: &[u8]) -> Vec<(String, u8)> {
     let mut entry = NsEntry::zeroed();
     for index in 0u64.. {
         // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
-        let r = unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut NsEntry as u64) };
+        let r = unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as u64) };
         if r != 0 {
             break; // NotFound ends the walk
         }

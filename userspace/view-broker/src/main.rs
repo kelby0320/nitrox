@@ -286,8 +286,10 @@ fn recv(ch: u64) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
     recv_full(ch).map(|m| m.map(|(op, request_id, _, body)| (op, request_id, body)))
 }
 
+type Incoming = (u16, u64, u32, Vec<u8>);
+
 /// [`recv`], with the message's flags: an answer from a server may be an error reply.
-fn recv_full(ch: u64) -> Result<Option<(u16, u64, u32, Vec<u8>)>, ()> {
+fn recv_full(ch: u64) -> Result<Option<Incoming>, ()> {
     // SAFETY: valid recv out-params.
     let rr = unsafe {
         syscall4(
@@ -712,9 +714,12 @@ impl Broker {
             return Err(String::from("auth-service could not be reached"));
         }
         let asked = send(admin, op, 1, 0, body, &[]);
+        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
         // SAFETY: our send buffer; single-threaded, and the kernel copied the message during the
         // send.
-        unsafe { scrub(&mut *(&raw mut REPLY_MSG)) };
+        unsafe {
+            scrub(&mut *(&raw mut REPLY_MSG))
+        };
         let deadline = now_ns().saturating_add(ACCOUNTS_WAIT_NS);
         let answer = asked
             .then(|| {
@@ -766,9 +771,12 @@ impl Broker {
             }
         };
         if carries_password(op) {
+            #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
             // The password now lives only in `body`, until it has been used.
             // SAFETY: our receive buffer; single-threaded, and the message was copied out.
-            unsafe { scrub(&mut *(&raw mut RECV_MSG)) };
+            unsafe {
+                scrub(&mut *(&raw mut RECV_MSG))
+            };
         }
         received().into_iter().for_each(close);
         let who = self.principal(session).unwrap_or_default();
@@ -823,9 +831,12 @@ impl Broker {
             Err(()) => return self.client_gone(i),
         };
         if carries_password(op) {
+            #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
             // The password now lives only in `body`, until it has been checked.
             // SAFETY: our receive buffer; single-threaded, and the message was copied out.
-            unsafe { scrub(&mut *(&raw mut RECV_MSG)) };
+            unsafe {
+                scrub(&mut *(&raw mut RECV_MSG))
+            };
         }
         // **Only a request carries handles.** Whatever came with anything else is closed here,
         // once, rather than by each arm — an arm that forgot would keep them for good, and any

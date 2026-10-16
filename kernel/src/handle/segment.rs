@@ -191,6 +191,7 @@ mod tests {
         assert_eq!(meta.free_count, SEGMENT_LEN as u32);
         // Walking the freelist must visit exactly SEGMENT_LEN distinct
         // slot indices.
+        // SAFETY: `try_alloc_initialised` returned an initialised segment this test owns.
         let entries_ref = unsafe { entries.as_ref() };
         let mut seen = [false; SEGMENT_LEN];
         let mut idx = meta.free_head;
@@ -214,6 +215,7 @@ mod tests {
     fn freelist_is_actually_shuffled() {
         init_global_heap();
         let (entries, meta) = try_alloc_initialised(0x9E37_79B9_7F4A_7C15).unwrap();
+        // SAFETY: `try_alloc_initialised` returned an initialised segment this test owns.
         let entries_ref = unsafe { entries.as_ref() };
         // Collect the slot order from the freelist.
         let mut order = [0u32; 16];
@@ -239,7 +241,9 @@ mod tests {
         init_global_heap();
         let (e1, m1) = try_alloc_initialised(0x1234_5678).unwrap();
         let (e2, m2) = try_alloc_initialised(0x1234_5678).unwrap();
+        // SAFETY: `try_alloc_initialised` returned an initialised segment this test owns.
         let r1 = unsafe { e1.as_ref() };
+        // SAFETY: as above.
         let r2 = unsafe { e2.as_ref() };
         assert_eq!(m1.free_head, m2.free_head);
         let mut idx1 = m1.free_head;

@@ -139,6 +139,7 @@ unsafe impl Sync for SlabCache {}
 impl SlabCache {
     /// Construct an uninitialised cache. [`SlabCache::init`] must be
     /// called before [`SlabCache::alloc`] or [`SlabCache::free`].
+    #[allow(clippy::new_without_default, reason = "a `Default` would read as a cache ready to use")]
     pub const fn new() -> Self {
         Self {
             state: SpinLock::new(
@@ -471,7 +472,7 @@ fn large_alloc<P: BuddyPager>(size: usize, align: usize, pager: &P) -> *mut u8 {
     // User pointer sits at `obj_offset` from the start of the buddy
     // block; we round up to honour the caller's alignment.
     let obj_offset = align_up(header, align);
-    let total = obj_offset.checked_add(size).unwrap_or(usize::MAX);
+    let total = obj_offset.saturating_add(size);
     let order = BuddyAllocator::order_for_size(total);
     let phys = match pager.alloc(order) {
         Some(p) => p,
@@ -727,6 +728,7 @@ mod tests {
         let desc = ((p as usize) & SLAB_MASK) as *mut SlabDescriptor;
         // SAFETY: test owns the allocation.
         let owner = unsafe { (*desc).owner };
+        // SAFETY: as above.
         let obj_size = unsafe { (*desc).obj_size };
         assert!(owner.is_null(), "large-alloc descriptor must have null owner");
         // The 32-byte header plus 8192 bytes of payload (= 8224 bytes,

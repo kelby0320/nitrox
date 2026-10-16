@@ -133,12 +133,12 @@ impl BuddyAllocator {
         while o < NUM_ORDERS {
             row_offsets[o] = total_words;
             let pairs = (num_frames + (1usize << (o + 1)) - 1) >> (o + 1);
-            let words = (pairs + 63) / 64;
+            let words = pairs.div_ceil(64);
             total_words += words;
             o += 1;
         }
         let bitmap_bytes = total_words * 8;
-        let bitmap_pages = (bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        let bitmap_pages = bitmap_bytes.div_ceil(PAGE_SIZE);
         // We reserve whole pages for the bitmap, so the region we need is
         // the page-rounded size, not `bitmap_bytes`. Searching for only
         // `bitmap_bytes` could pick a region with `bitmap_bytes <= span <
@@ -249,7 +249,7 @@ impl BuddyAllocator {
     /// Smallest order whose block size is `>= size` bytes. `size == 0`
     /// returns 0 (single-page allocation).
     pub const fn order_for_size(size: usize) -> usize {
-        let pages = if size == 0 { 1 } else { (size + PAGE_SIZE - 1) / PAGE_SIZE };
+        let pages = if size == 0 { 1 } else { size.div_ceil(PAGE_SIZE) };
         let mut o = 0usize;
         let mut covered = 1usize;
         while covered < pages {
@@ -469,7 +469,7 @@ mod tests {
         /// addresses sit well above 1 MiB, so the buddy allocator's
         /// low-memory cutoff doesn't reject the region.
         fn new(bytes: usize) -> Self {
-            assert!(bytes % PAGE_SIZE == 0);
+            assert!(bytes.is_multiple_of(PAGE_SIZE));
             // Over-allocate so the page-aligned start lies inside the
             // buffer with room for whatever bitmap pages the allocator
             // carves off the front.

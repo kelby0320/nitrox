@@ -198,6 +198,7 @@ fn draw_icon<F: Framebuffer + ?Sized>(fb: &mut F, kind: IconKind, rect: Rect, cl
 /// [`Node::Ink`]: a text node's colour is a property of where it sits, and a leaf that looked
 /// the colour up itself could not be inside something coloured. The root is called with
 /// `theme.foreground`, so a tree with no ink node draws exactly as it did before this existed.
+#[allow(clippy::too_many_arguments, reason = "a paint pass carries the frame's drawing state as separate values")]
 fn draw<F, Msg, C>(
     fb: &mut F,
     font: &Font,
@@ -659,7 +660,7 @@ mod tests {
         let after = painted(&coloured, &t);
         assert!(any_reddish(&after), "the wrapper's colour never reached the glyphs");
         assert!(
-            !all_theme_ink(&after, &t) && !after.iter().any(|p| *p == t.foreground),
+            !all_theme_ink(&after, &t) && !after.contains(&t.foreground),
             "the theme's ink was drawn as well, so the leaf ignored what it was given"
         );
     }
@@ -681,7 +682,7 @@ mod tests {
         let c = painted(&b, &t);
         assert!(any_reddish(&c), "the outer text lost its ink through the column");
         assert!(any_greenish(&c), "the inner ink did not override the outer");
-        assert!(!c.iter().any(|p| *p == t.foreground), "something was still drawn in the theme's ink");
+        assert!(!c.contains(&t.foreground), "something was still drawn in the theme's ink");
     }
 
     /// An ink node changes no geometry.

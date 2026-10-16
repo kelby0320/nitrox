@@ -528,7 +528,7 @@ mod tests {
     fn the_routes_and_a_starting_server_fit_one_wait() {
         let used = 1 + MAX_ROUTES + crate::services::SLOTS + STARTING_ROOM;
         assert!(used <= libkern::abi::MAX_WAIT_HANDLES);
-        assert!(STARTING_ROOM >= 1);
-        assert!(9 + DERIVED.len() + 1 <= MAX_ROUTES);
+        const { assert!(STARTING_ROOM >= 1) };
+        assert!(9 + DERIVED.len() < MAX_ROUTES);
     }
 }

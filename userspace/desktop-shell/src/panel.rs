@@ -1141,7 +1141,7 @@ mod tests {
                 let size = libui::layout::measure(&view, libui::layout::Constraints::loose(Size::new(4000, 4000)), &m);
                 let msgs = click(&view, Rect::new(0, 0, size.w, size.h), &m, sx - ax, sy - ay);
                 let want = table[which].items.iter().enumerate().find_map(|(i, it)| {
-                    (ROW_KEY_BASE + i as u64 == key).then(|| match it {
+                    (ROW_KEY_BASE + i as u64 == key).then_some(match it {
                         Item::Action { msg, .. } => *msg,
                         Item::Separator => MenuMsg::Nothing,
                     })

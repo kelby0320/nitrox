@@ -271,9 +271,11 @@ fn index(root_ns: u64, packages: &[Package], dir: &str) -> &'static [Entry] {
     // after, and entries are only ever appended — so a `&'static [Entry]` handed out earlier
     // stays valid.
     unsafe {
+        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
         if (*(&raw const INDEX)).is_none() {
             INDEX = Some(Vec::new());
         }
+        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
         let cache = match &mut *(&raw mut INDEX) {
             Some(c) => c,
             None => return &[],
@@ -573,6 +575,7 @@ fn serve_loop(root_ns: u64, serve_end: u64, packages: &[Package]) -> ! {
         let (waited, count) = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1usize;
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for i in 0..MAX_SESSIONS {
                 if SESSION_CH[i] != 0 {
                     WAIT_HANDLES[n] = SESSION_CH[i];

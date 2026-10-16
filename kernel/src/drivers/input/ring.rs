@@ -160,7 +160,7 @@ mod tests {
         let cap = (records * INPUT_EVENT_LEN).min(SCRATCH);
         let n = r.drain_into(&mut buf[..cap], 999);
         let count = n / INPUT_EVENT_LEN;
-        for (i, chunk) in buf[..n].chunks_exact(INPUT_EVENT_LEN).enumerate() {
+        for (i, chunk) in buf[..n].as_chunks::<INPUT_EVENT_LEN>().0.iter().enumerate() {
             out[i] = InputEvent::read(chunk).expect("whole record");
         }
         count

@@ -288,7 +288,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _a: u64, _b: u64) -> ! {
     // A window's worth of pixels, filled once. What is being measured is the compositing, not the
     // client's drawing, so the surface is static across frames — which is also what a drag is.
     let mut win = vec![0u8; win_geom.pitch * WIN_H as usize];
-    for (i, px) in win.chunks_exact_mut(4).enumerate() {
+    for (i, px) in win.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let c = Rgb::new((i % 251) as u8, 0xED, 0xEC);
         px.copy_from_slice(&PixelFormat::XRGB8888.encode(c).to_le_bytes());
     }
@@ -311,7 +311,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _a: u64, _b: u64) -> ! {
         // ratio being reported. Starting at `i % 4` gives every arm each slot equally often.
         let (mut a, mut b, mut c, mut d) = (0u64, 0u64, 0u64, 0u64);
         for slot in 0..4 {
-            match (i as usize + slot) % 4 {
+            match (i + slot) % 4 {
                 0 => a = frame_in_place(&mut fb, &surfaces, &dmg),
                 1 => b = frame_shadow(&mut fb, &mut shadow, &surfaces, &dmg),
                 2 => c = frame_exposed(&mut fb, &surfaces, &dmg),

@@ -233,6 +233,7 @@ impl Trb {
 }
 
 /// The memory a ring's TRBs are in.
+#[allow(clippy::len_without_is_empty, reason = "a ring always holds TRBs")]
 pub trait Slots {
     /// How many TRBs it holds.
     fn len(&self) -> usize;

@@ -371,8 +371,7 @@ mod tests {
     fn a_default_colour_is_not_a_named_one() {
         // The reason `Colour::Default` exists at all: SGR 39 must not resolve to whatever
         // white happens to be, or a re-theme leaves old text stranded in the old default.
-        let mut p = Palette::default();
-        p.foreground = Rgb::new(1, 2, 3);
+        let p = Palette { foreground: Rgb::new(1, 2, 3), ..Palette::default() };
         assert_eq!(p.foreground_of(Colour::Default), Rgb::new(1, 2, 3));
         assert_ne!(
             p.foreground_of(Colour::Default),

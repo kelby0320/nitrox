@@ -315,11 +315,11 @@ mod tests {
         assert_eq!(m.size(), 3 * PAGE_SIZE);
         assert_eq!(m.npages(), 3);
         for &f in m.frames() {
-            // SAFETY: a live MemoryObject's frames are allocated and
-            // HHDM-reachable; read-only check.
             let base = (f.as_u64() + heap::hhdm_offset()) as *const u8;
             for i in 0..PAGE_SIZE {
-                assert_eq!(unsafe { *base.add(i) }, 0, "frame byte {i} not zeroed");
+                // SAFETY: a live MemoryObject's frames are allocated and HHDM-reachable.
+                let byte = unsafe { *base.add(i) };
+                assert_eq!(byte, 0, "frame byte {i} not zeroed");
             }
         }
     }
@@ -404,8 +404,8 @@ mod tests {
         let base1 = (m.frames()[1].as_u64() + heap::hhdm_offset()) as *const u8;
         // SAFETY: live, HHDM-reachable frames; read-only checks.
         unsafe {
-            for i in 0..PAGE_SIZE {
-                assert_eq!(*base0.add(i), data[i], "page0 byte {i}");
+            for (i, &d) in data[..PAGE_SIZE].iter().enumerate() {
+                assert_eq!(*base0.add(i), d, "page0 byte {i}");
             }
             for i in 0..10 {
                 assert_eq!(*base1.add(i), data[PAGE_SIZE + i], "page1 byte {i}");

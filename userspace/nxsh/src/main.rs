@@ -162,6 +162,7 @@ fn drain_diagnostics(err: u64, tty: u64) {
             if rr != 0 {
                 break; // WouldBlock (nothing waiting) or the last stage has closed its end
             }
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             // **Close anything transferred, because `sys_channel_recv` *installs* it.** A
             // diagnostic is text and carries no handles, but this endpoint is not a trusted
             // one: every program the shell spawns holds a `SEND` duplicate of it, so what
@@ -756,10 +757,10 @@ impl Host for NitroxHost {
                     ((&raw const TTY_MSG) as *const u8).add(24),
                     payload_len.min(4096 - 24),
                 );
-                if let Ok(m) = librsproto::decode(rep) {
-                    if m.op == librsproto::OP_TTY_INTERRUPT {
-                        INTERRUPTED = true;
-                    }
+                if let Ok(m) = librsproto::decode(rep)
+                    && m.op == librsproto::OP_TTY_INTERRUPT
+                {
+                    INTERRUPTED = true;
                 }
             }
             // **Consumed, not sticky** — see the trait: a `catch` handling the interrupt
@@ -808,7 +809,7 @@ impl Host for NitroxHost {
 /// which — a report that is incomplete beats one that is confidently wrong. Filed as
 /// `TODO(pipeline-stage-attribution)`; the fix is a pid on `HandleInfo` for a process
 /// handle, or a handle in the notification, and it is an ABI change.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "a pipeline's channels, stages and what the capture wait already read")]
 fn reap(
     notif: u64,
     tty: u64,
@@ -920,11 +921,11 @@ fn drain_tty_interrupt(tty: u64) -> bool {
             let payload_len = u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
             let rep =
                 core::slice::from_raw_parts(((&raw const TTY_MSG) as *const u8).add(24), payload_len.min(4096 - 24));
-            if let Ok(m) = librsproto::decode(rep) {
-                if m.op == librsproto::OP_TTY_INTERRUPT {
-                    INTERRUPTED = true;
-                    hit = true;
-                }
+            if let Ok(m) = librsproto::decode(rep)
+                && m.op == librsproto::OP_TTY_INTERRUPT
+            {
+                INTERRUPTED = true;
+                hit = true;
             }
         }
     }
@@ -1390,7 +1391,7 @@ impl Search {
         let text = if self.query.is_empty() {
             // Nothing searched for yet — "no match" would be a lie about a search that has
             // not happened.
-            alloc::format!("search '' -> ")
+            alloc::string::String::from("search '' -> ")
         } else if self.matched.is_empty() {
             alloc::format!("search '{}' -> (no match)", self.query)
         } else {

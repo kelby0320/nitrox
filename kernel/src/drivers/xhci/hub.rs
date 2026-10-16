@@ -363,7 +363,7 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
 /// endpoints prepared, then one Configure Endpoint adding all of them and one `SET_CONFIGURATION` —
 /// a second would reset the first class's endpoints (USB 2.0 §9.1.1.5) — then each class's own
 /// requests. A failure in the device's steps ends the whole binding.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "the slot the hub found, its memory and what was read of the device")]
 fn bind(
     x: &Xhci,
     port: u8,
@@ -431,7 +431,7 @@ fn device_mem() -> Option<DeviceMem> {
 
 /// Address the device in `slot` and read what it is, in `mem`: what its record carries and how much
 /// of its configuration descriptor is in `config`, or the step that failed and why.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, reason = "a step's whole result, or the step that failed and why")]
 fn address_and_read(
     x: &Xhci,
     port: u8,
@@ -551,10 +551,10 @@ fn name_of(
         return Ok((0, 0));
     };
     let mut n = 0;
-    if dev.product_string != 0 {
-        if let Some(b) = string(x, port, slot, mem, dev.product_string, lang)? {
-            n = desc::string_into(b, out).unwrap_or(0);
-        }
+    if dev.product_string != 0
+        && let Some(b) = string(x, port, slot, mem, dev.product_string, lang)?
+    {
+        n = desc::string_into(b, out).unwrap_or(0);
     }
     let mut s = 0;
     if dev.serial != 0 {

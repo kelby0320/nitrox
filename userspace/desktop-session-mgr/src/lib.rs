@@ -103,6 +103,12 @@ pub const KEY_TAB: u16 = 15;
 /// See [`KEY_TAB`].
 pub const KEY_ENTER: u16 = 28;
 
+impl Default for Greeter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Greeter {
     /// An empty greeter, caret in the username field.
     pub fn new() -> Self {
@@ -314,10 +320,11 @@ mod tests {
                     // is set in, antialiasing leaves only a handful of pixels at `deny` itself
                     // — fifteen, measured — and every other colour on this card is a grey, a
                     // white or the teal accent, none of which lean red.
-                    if let Some(c) = fb.get_pixel(x, y) {
-                        if c.r > c.g.saturating_add(20) && c.r > c.b.saturating_add(20) {
-                            n += 1;
-                        }
+                    if let Some(c) = fb.get_pixel(x, y)
+                        && c.r > c.g.saturating_add(20)
+                        && c.r > c.b.saturating_add(20)
+                    {
+                        n += 1;
                     }
                 }
             }

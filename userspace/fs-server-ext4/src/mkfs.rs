@@ -259,7 +259,7 @@ impl Geometry {
         if group <= 1 {
             return true;
         }
-        if group % 2 == 0 {
+        if group.is_multiple_of(2) {
             return false; // no even group above 0 is a power of 3, 5 or 7
         }
         [3u32, 5, 7].iter().any(|&base| {

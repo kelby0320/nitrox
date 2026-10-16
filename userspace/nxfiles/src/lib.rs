@@ -2560,7 +2560,7 @@ impl App {
                 close: Some(Msg::Close),
             },
             hovered,
-            &ui,
+            ui,
         )
         .key(TITLE_KEY);
 
@@ -2568,7 +2568,7 @@ impl App {
         // since M14 Part A** — the words were `button`s here, which is not what a menu bar's
         // word is, and the popup under them was a second copy of `nxterm`'s.
         let bar =
-            libui::menu::bar(&self.menu_table(), &self.menus, MENU_BAR_KEY, hovered, Msg::MenuBar, &ui, MENU_BAR_H);
+            libui::menu::bar(&self.menu_table(), &self.menus, MENU_BAR_KEY, hovered, Msg::MenuBar, ui, MENU_BAR_H);
 
         // The path strip: where you are, and the one control that leaves it — **or the name
         // being typed**, which replaces the path rather than sitting beside it. The strip is one
@@ -2590,7 +2590,7 @@ impl App {
                 .key(PATH_KEY),
                 padding(
                     Insets { top: 2, right: 6, bottom: 2, left: 0 },
-                    text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+                    text_field(f, false, WidgetState { active: true, ..Default::default() }, ui),
                 )
                 .key(PROMPT_KEY)
                 .flex(1),
@@ -2608,7 +2608,7 @@ impl App {
                 row(alloc::vec![
                     padding(
                         Insets { top: 2, right: 6, bottom: 2, left: 6 },
-                        text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+                        text_field(f, false, WidgetState { active: true, ..Default::default() }, ui),
                     )
                     .key(PATH_KEY)
                     .flex(1),
@@ -2626,7 +2626,7 @@ impl App {
             None => row(alloc::vec![
                 padding(
                     Insets { top: 4, right: 4, bottom: 4, left: 6 },
-                    center_v(row(breadcrumb(self.pane().path.as_str(), &ui))),
+                    center_v(row(breadcrumb(self.pane().path.as_str(), ui))),
                 )
                 .key(PATH_KEY),
                 padding(
@@ -2637,7 +2637,7 @@ impl App {
             ]),
         };
         let mut strip_items = alloc::vec![
-            button("^", Msg::Up, WidgetState { hovered: hovered == Some(UP_KEY), ..Default::default() }, &ui,)
+            button("^", Msg::Up, WidgetState { hovered: hovered == Some(UP_KEY), ..Default::default() }, ui,)
                 .key(UP_KEY),
             middle.key(STRIP_INNER_KEY).flex(1),
         ];
@@ -2651,7 +2651,7 @@ impl App {
                     Size::new(SEARCH_W, 0),
                     padding(Insets { top: 2, right: 6, bottom: 2, left: 0 }, {
                         let state = WidgetState { active: true, ..Default::default() };
-                        text_field(f, false, state, &ui)
+                        text_field(f, false, state, ui)
                     }),
                 )
                 .key(SEARCH_KEY),
@@ -2674,7 +2674,7 @@ impl App {
             Msg::SelectTab,
             Msg::CloseTab,
             TabExtras::new_tab(Msg::NewTab),
-            &ui,
+            ui,
         );
 
         // **The rows the filter leaves**, by index into the whole listing: a row's key carries
@@ -2772,7 +2772,7 @@ impl App {
             // a gap in it, and the report from running it was that the quick-access folders
             // "need a different background color so it's clear it's actually a sidebar".
             Some(ui.sidebar),
-            &ui,
+            ui,
         );
         let mut side = alloc::vec![sized(Size::new(0, places_h), places).key(PLACES_KEY)];
         if !self.drives.is_empty() {
@@ -2804,7 +2804,7 @@ impl App {
                 None,
                 hovered,
                 Some(ui.sidebar),
-                &ui,
+                ui,
             );
             let heading = padding(
                 Insets { left: libui::widget::ROW_PAD.left, ..Insets::all(0) },
@@ -2836,7 +2836,7 @@ impl App {
             Some(Msg::Scroll),
             highlight,
             None,
-            &ui,
+            ui,
         )
         // **On the element the widget returns, rather than through a tenth parameter.** A
         // wheel bubbles to the nearest `on_wheel`, and `list_view`'s outermost node is exactly
@@ -2867,7 +2867,7 @@ impl App {
             // **The foot: what is in this directory, and what is picked** (Part I). Docked to
             // the bottom before the sidebar takes its column, so it spans the whole window as
             // the design draws it rather than stopping at the listing.
-            docked(Edge::Bottom, self.status_bar(&ui).key(STATUS_KEY)),
+            docked(Edge::Bottom, self.status_bar(ui).key(STATUS_KEY)),
             // **Docked after the strips, so it starts below them** — a dock takes its edges in
             // order, and each one divides what the last left. The path strip spans the full
             // width above both panes, which is what makes it read as the window's location
@@ -2903,7 +2903,7 @@ impl App {
                             LIST_COLUMNS,
                             true,
                             libui::widget::list_scrolls(shown.len(), h, ROW_H),
-                            &ui,
+                            ui,
                         )
                         .key(HEADER_KEY),
                     )],
@@ -2911,10 +2911,10 @@ impl App {
                 )
                 .key(LIST_PANE_KEY),
             ),
-            resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
+            resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), ui).key(GRIP_KEY),
             self.window,
             self.focused,
-            &ui,
+            ui,
         )
     }
 }
@@ -3206,7 +3206,7 @@ mod tests {
                 texts(c, out);
             }
         }
-        fn find<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
+        fn find<M>(e: &Element<M>, key: u64) -> Option<&Element<M>> {
             if e.key == Some(key) {
                 return Some(e);
             }
@@ -4715,11 +4715,12 @@ mod tests {
     fn a_place_does_not_light_a_listing_row() {
         // The bases cannot meet however long a directory is: a listing row's key is
         // `LIST_ROW_KEY + i`, and `i` is bounded by what a filesystem can hold.
-        assert!(
-            SIDEBAR_ROW_KEY - LIST_ROW_KEY > (1u64 << 40),
-            "a listing would have to hold {} entries to reach the sidebar",
-            SIDEBAR_ROW_KEY - LIST_ROW_KEY
-        );
+        const {
+            assert!(
+                SIDEBAR_ROW_KEY - LIST_ROW_KEY > (1u64 << 40),
+                "a listing would have to hold over 2^40 entries to reach the sidebar"
+            )
+        };
         let mut a = app();
         a.show("/home", (0..8).map(|i| Entry::file(&alloc::format!("f{i}.txt"))).collect());
         let listing: Vec<u64> = a.list_rows().iter().map(|r| r.key).collect();
@@ -4737,7 +4738,7 @@ mod tests {
             }
         }
         // And a tab's base is above the sidebar's, which is the third range in this namespace.
-        assert!(TAB_KEY_BASE > SIDEBAR_ROW_KEY, "tabs must stay clear of the sidebar too");
+        const { assert!(TAB_KEY_BASE > SIDEBAR_ROW_KEY, "tabs must stay clear of the sidebar too") };
     }
 
     // --- drives (Phase 6 Part F) ----------------------------------------------
@@ -5599,7 +5600,7 @@ mod tests {
         let theme = UiTheme::default();
         let mut tree = libui::diff::Tree::new();
         let cell = libui::layout::FixedCell { w: 8, h: 16 };
-        let mut check = |a: &mut App, hovered, tree: &mut libui::diff::Tree, what: &str| {
+        let check = |a: &mut App, hovered, tree: &mut libui::diff::Tree, what: &str| {
             let size = a.window_size();
             let e = a.view(&theme, hovered);
             let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
@@ -5744,7 +5745,7 @@ mod tests {
         let mut tree = libui::diff::Tree::new();
         let mut r = libui::route::Router::new();
         // A frame, exactly as the binary draws one.
-        let mut frame = |a: &mut App, tree: &mut libui::diff::Tree| {
+        let frame = |a: &mut App, tree: &mut libui::diff::Tree| {
             let e = a.view(&theme, None);
             let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
             tree.update(&e, &l).expect("diffable");

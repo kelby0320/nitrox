@@ -100,7 +100,7 @@ struct Tally {
     runs: Vec<(String, usize, usize)>,
 }
 
-/// Which of `lines` are a `// SAFETY:` comment or a doc comment's `# Safety` section, to its
+/// Which of `lines` are a `SAFETY` comment or a doc comment's `# Safety` section, to its
 /// [`SAFETY_MAX`]th line: the rules require both, so neither is counted.
 fn safety_lines(lines: &[Line]) -> Vec<bool> {
     let mut out = vec![false; lines.len()];
@@ -184,7 +184,7 @@ fn tally(change: &Change) -> Tally {
         prev = Some(a);
     }
     t.runs.extend(run);
-    t.runs.sort_by(|a, b| b.2.cmp(&a.2));
+    t.runs.sort_by_key(|r| std::cmp::Reverse(r.2));
     t
 }
 
@@ -314,10 +314,10 @@ fn change_since(root: &Path, base: &str) -> R<(String, Change)> {
 /// file, it prints the nudge for the author.
 pub(crate) fn hook_main() -> ExitCode {
     let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_ok() {
-        if let Some(out) = hook(&input) {
-            println!("{out}");
-        }
+    if std::io::stdin().read_to_string(&mut input).is_ok()
+        && let Some(out) = hook(&input)
+    {
+        println!("{out}");
     }
     ExitCode::SUCCESS
 }
@@ -555,6 +555,7 @@ fn json_string(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unnecessary_safety_comment, reason = "the fixtures are SAFETY comments, in strings")]
 mod tests {
     use super::*;
 

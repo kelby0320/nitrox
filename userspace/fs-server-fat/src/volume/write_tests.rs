@@ -459,7 +459,6 @@ fn a_read_only_mount_refuses_every_change() {
     assert_eq!(fat.rename_path(b"/file.txt", b"/dir/file.txt", false, NOW), Err(refused));
     assert_eq!(fat.touch_file(id, NOW), Err(refused));
     assert_eq!(fat.release(id, NOW), Err(refused));
-    drop(fat);
     assert!(std::fs::read(&img).unwrap() == before, "the image is unchanged");
 }
 
@@ -692,7 +691,7 @@ fn what_fat_frees_leaves_the_metadata_cache() {
             fat.release(id, NOW).unwrap();
         }
     }
-    let g = fat.geometry().unwrap().clone();
+    let g = *fat.geometry().unwrap();
     let mut clusters = Vec::new();
     fat.cache
         .borrow_mut()

@@ -293,15 +293,15 @@ mod tracker {
     const MAX_HELD: usize = 8;
 
     /// Ranks currently held on each CPU, innermost last.
-    #[allow(clippy::declare_interior_mutable_const)]
+    #[allow(clippy::declare_interior_mutable_const, reason = "an array initializer, copied for each element")]
     const ZERO: AtomicU8 = AtomicU8::new(0);
-    #[allow(clippy::declare_interior_mutable_const)]
+    #[allow(clippy::declare_interior_mutable_const, reason = "an array initializer, copied for each CPU")]
     const EMPTY: [AtomicU8; MAX_HELD] = [ZERO; MAX_HELD];
     static HELD: [[AtomicU8; MAX_HELD]; MAX_CPUS] = [EMPTY; MAX_CPUS];
 
     /// How many entries of `HELD[cpu]` are live. May exceed `MAX_HELD`; the excess is
     /// counted but not recorded (see `MAX_HELD`).
-    #[allow(clippy::declare_interior_mutable_const)]
+    #[allow(clippy::declare_interior_mutable_const, reason = "an array initializer, copied for each CPU")]
     const ZERO_DEPTH: AtomicUsize = AtomicUsize::new(0);
     static DEPTH: [AtomicUsize; MAX_CPUS] = [ZERO_DEPTH; MAX_CPUS];
 

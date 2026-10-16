@@ -86,14 +86,15 @@ pub fn button<Msg>(label: impl Into<String>, msg: Msg, state: WidgetState, theme
     // a popup, a tab and a field all share. A square button beside a rounded field was the last
     // right angle on these surfaces.
     let (edge, thickness) = if state.active { (theme.accent, RING) } else { (theme.border, BORDER) };
-    let mut layers = alloc::vec::Vec::with_capacity(3);
-    layers.push(rounded_fill(edge, CONTROL_RADIUS));
-    layers.push(padding(Insets::all(thickness), rounded_fill(face, CONTROL_RADIUS.saturating_sub(thickness))));
     // **Centred, which is what a button's label is everywhere else in the world.** It was against
     // the top-left corner of the face: `padding` places a child at an inset from the origin, and
     // a face is usually much wider than the word on it, so every button in this toolkit read as
     // a label with a box drawn round it. `center` is the node that was missing.
-    layers.push(center(padding(BUTTON_PAD, text(label))));
+    let layers = alloc::vec![
+        rounded_fill(edge, CONTROL_RADIUS),
+        padding(Insets::all(thickness), rounded_fill(face, CONTROL_RADIUS.saturating_sub(thickness))),
+        center(padding(BUTTON_PAD, text(label))),
+    ];
     stack(layers).on_press(msg).focusable()
 }
 
@@ -1461,7 +1462,7 @@ impl TextFieldState {
                 // Control characters are not text. Ctrl-C folds to 0x03 in the keymap because
                 // a terminal needs it to; a field that inserted it would put an unprintable
                 // byte in a password.
-                Some(b) if b >= 0x20 && b < 0x7F => {
+                Some(b) if (0x20..0x7F).contains(&b) => {
                     self.insert(b as char);
                     true
                 }
@@ -1509,10 +1510,11 @@ pub fn text_field<Msg>(field: &TextFieldState, masked: bool, state: WidgetState,
     // The ring keeps its second pixel and its accent, so focus still reads as a state rather than
     // as an edge.
     let (edge, thickness) = if state.active { (theme.accent, RING) } else { (theme.border, BORDER) };
-    let mut layers = alloc::vec::Vec::with_capacity(3);
-    layers.push(rounded_fill(edge, CONTROL_RADIUS));
-    layers.push(padding(Insets::all(thickness), rounded_fill(theme.track, CONTROL_RADIUS.saturating_sub(thickness))));
-    layers.push(padding(FIELD_PAD, row(content)));
+    let layers = alloc::vec![
+        rounded_fill(edge, CONTROL_RADIUS),
+        padding(Insets::all(thickness), rounded_fill(theme.track, CONTROL_RADIUS.saturating_sub(thickness))),
+        padding(FIELD_PAD, row(content)),
+    ];
     stack(layers).focusable()
 }
 
@@ -1882,7 +1884,7 @@ impl TextAreaState {
     /// padding the widget draws with — a caller cannot know that number and should not have to.
     pub fn at_point(&self, x: i32, y: i32, row_height: u32, width: impl Fn(&str) -> u32) -> (usize, usize) {
         let y = y - FIELD_PAD.top as i32;
-        let row = if row_height == 0 { 0 } else { (y.max(0) as u32 / row_height) as usize };
+        let row = (y.max(0) as u32).checked_div(row_height).unwrap_or(0) as usize;
         // **Clamped rather than refused.** A press below the last line means its end, which is
         // what dragging off the bottom of a selection has to mean.
         let line = (self.offset + row).min(self.lines.len().saturating_sub(1));
@@ -2396,7 +2398,7 @@ pub fn text_area<Msg>(
     pointer: Option<fn(PointerEvent) -> Msg>,
     theme: &Theme,
 ) -> Element<Msg> {
-    let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
+    let visible = height.checked_div(row_height).unwrap_or(0) as usize;
     state.ensure_visible(visible);
     let sel = state.selection();
     let (cur_line, cur_col) = state.cursor();
@@ -2488,9 +2490,7 @@ pub fn text_area<Msg>(
         rows.push(sized(Size::new(0, row_height), row(pieces)));
     }
 
-    let mut layers = alloc::vec::Vec::with_capacity(2);
-    layers.push(fill(theme.track));
-    layers.push(padding(FIELD_PAD, column(rows)));
+    let layers = alloc::vec![fill(theme.track), padding(FIELD_PAD, column(rows))];
     let mut e = stack(layers).focusable();
     if let Some(f) = pointer {
         // **On the whole area, including its padding.** A press in the margin beside a line is a
@@ -2775,7 +2775,7 @@ impl ListState {
     /// converted against a different geometry from the one drawn puts the thumb where the pointer
     /// is not (M11 Part E batch 6).
     pub fn bar(&self, height: u32, row_height: u32, total: usize) -> ScrollState {
-        let visible = if row_height == 0 { 0 } else { height / row_height };
+        let visible = height.checked_div(row_height).unwrap_or(0);
         ScrollState { offset: self.offset as u32, visible, total: total as u32 }
     }
 }
@@ -2823,6 +2823,10 @@ impl ListState {
 /// functions deep to carry state none of them used. In-place update is what Rust uses for this
 /// — `Vec::sort`, `Vec::retain`, `read_line(&mut String)` — and a returned value is for when a
 /// caller may genuinely decline it. There is no correct program that ignores a scroll offset.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the list's rows, handlers and appearance are separate inputs of one constructor"
+)]
 pub fn list_view<Msg>(
     rows: &[ListRow<'_>],
     columns: &[ListColumn],
@@ -2836,7 +2840,7 @@ pub fn list_view<Msg>(
     ground: Option<Rgb>,
     theme: &Theme,
 ) -> Element<Msg> {
-    let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
+    let visible = height.checked_div(row_height).unwrap_or(0) as usize;
     // **The selection is clamped first, because it is an index into a list that may have just
     // been replaced.** A launcher rebuilds its results on every keystroke, so a selection made
     // against twenty of them is not an index into the three that remain — and a stale one is
@@ -2845,10 +2849,10 @@ pub fn list_view<Msg>(
     // what Enter activates gets an out-of-range index. Clamped to the last surviving row
     // rather than cleared, so something is highlighted and the arrows work on the next press
     // (PR #233 review, finding 2).
-    if let Some(i) = state.selected {
-        if i >= rows.len() {
-            state.selected = rows.len().checked_sub(1);
-        }
+    if let Some(i) = state.selected
+        && i >= rows.len()
+    {
+        state.selected = rows.len().checked_sub(1);
     }
     state.ensure_visible(visible);
     // Never scrolled past the end: a list that shrinks under a stale offset would otherwise
@@ -3080,7 +3084,7 @@ pub fn list_header<Msg>(
 /// **The rule `list_view` uses, published**, because a caller drawing a header above one needs
 /// the same answer and computing it twice is how the two come to disagree.
 pub fn list_scrolls(rows: usize, height: u32, row_height: u32) -> bool {
-    let visible = if row_height == 0 { 0 } else { (height / row_height) as usize };
+    let visible = height.checked_div(row_height).unwrap_or(0) as usize;
     rows > visible
 }
 
@@ -3261,8 +3265,7 @@ mod list_view_tests {
                 button: Some(RowButton { key: 8, glyph: "x" }),
                 ..Default::default()
             };
-            let mut st = ListState::default();
-            st.selected = selected;
+            let mut st = ListState { selected, ..Default::default() };
             list_view::<u64>(&[row], &[], &mut st, h, h, |k| k, None, None, hovered, None, &t)
         };
         let at = |pressed: bool| PointerEvent {
@@ -3540,6 +3543,7 @@ mod list_view_tests {
             let mut st = ListState::at(Some(0), 0);
             let e: Element<u64> =
                 list_view(&rows(&data), &[], &mut st, 100, 20, |k| k, None, None, hovered, ground, &p);
+            #[allow(clippy::type_complexity, reason = "a local accumulator in one test")]
             let mut out: Vec<(Option<Rgb>, Option<(Rgb, u8)>)> = Vec::new();
             walk(&e, &mut |n| {
                 if n.key.is_none() {
@@ -4219,10 +4223,10 @@ mod list_view_tests {
             }
             let mut first = None;
             walk(n, &mut |c| {
-                if first.is_none() {
-                    if let Node::Fill(rgb) = &c.node {
-                        first = Some(*rgb);
-                    }
+                if first.is_none()
+                    && let Node::Fill(rgb) = &c.node
+                {
+                    first = Some(*rgb);
                 }
             });
             if let Some(rgb) = first {

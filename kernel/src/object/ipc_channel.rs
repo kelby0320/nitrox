@@ -162,8 +162,8 @@ impl MsgRing {
         let idx = (self.head + self.len) % cap;
         let slot = &mut self.slots[idx];
         slot.msg = *src;
-        for i in 0..IPC_HANDLE_MAX {
-            slot.transfers[i] = transfers[i].take();
+        for (dst, src) in slot.transfers.iter_mut().zip(transfers.iter_mut()) {
+            *dst = src.take();
         }
         self.len += 1;
         true
@@ -177,8 +177,8 @@ impl MsgRing {
         }
         let slot = &mut self.slots[self.head];
         *dst = slot.msg;
-        for i in 0..IPC_HANDLE_MAX {
-            out[i] = slot.transfers[i].take();
+        for (dst, src) in out.iter_mut().zip(slot.transfers.iter_mut()) {
+            *dst = src.take();
         }
         self.head = (self.head + 1) % self.cap();
         self.len -= 1;
@@ -374,7 +374,7 @@ impl IpcChannel {
     ///
     /// # Safety
     /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref)]
+    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
     unsafe fn inner<'a>(obj: *mut ()) -> &'a mut Inner {
         // SAFETY: forming a shared `&IpcChannel` to reach the `UnsafeCell`, then
         // a `&mut Inner` through it, is the interior-mutability contract — sound
@@ -628,7 +628,7 @@ impl IpcChannel {
     /// sends — oldest first — collecting their droppable parts into `reclaimed`
     /// for the caller to release **outside** `SCHED`, then promote the oldest
     /// **live** sender into this endpoint's receive ring (FIFO): move its message
-    /// + transfers into `recv` and return its `PendingOperation` reference (the
+    /// and transfers into `recv` and return its `PendingOperation` reference (the
     /// caller completes it status 0 under `SCHED`, drops it outside). Returns
     /// `None` if no live sender was promoted (the ring stays one slot freer).
     ///
@@ -644,9 +644,9 @@ impl IpcChannel {
         loop {
             // Peek the front entry's `cancelled` flag (Copy) so the immutable
             // borrow ends before the mutating `remove` below.
-            let cancelled = match inner.pending_sends.first() {
-                None => return None, // queue drained
-                Some(p) => p.cancelled,
+            let cancelled = {
+                let p = inner.pending_sends.first()?;
+                p.cancelled
             };
             if cancelled {
                 // Reclaim it (move its refs out for outside-SCHED drop); the
@@ -718,6 +718,7 @@ mod tests {
     /// Adopt the creation reference and drop it (running `IpcChannel::drop`,
     /// which unlinks the peer under `SCHED`).
     fn drop_endpoint(obj: *mut ()) {
+        // SAFETY: adopts the endpoint's creation reference, to drop it.
         drop(unsafe { ObjectRef::from_raw(obj, KObjectType::IpcChannel) });
     }
 
@@ -731,16 +732,24 @@ mod tests {
     }
 
     /// `send_push` with no transferred handles (the common test case).
-    /// # Safety: as `IpcChannel::send_push`.
+    ///
+    /// # Safety
+    ///
+    /// As `IpcChannel::send_push`.
     unsafe fn push_no_xfer(obj: *mut (), msg: &StoredMsg) -> SendOutcome {
         let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        // SAFETY: this function's contract, forwarded.
         unsafe { IpcChannel::send_push(obj, msg, &mut t) }
     }
 
     /// `recv_pop_into` discarding any (absent) transfers.
-    /// # Safety: as `IpcChannel::recv_pop_into`.
+    ///
+    /// # Safety
+    ///
+    /// As `IpcChannel::recv_pop_into`.
     unsafe fn pop_no_xfer(obj: *mut (), dst: &mut StoredMsg) -> bool {
         let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        // SAFETY: this function's contract, forwarded.
         unsafe { IpcChannel::recv_pop_into(obj, dst, &mut t) }
     }
 
@@ -902,6 +911,7 @@ mod tests {
         let (a, b) = new_pair();
         // An object to transfer (a Process; refcount 1 via its creation ref).
         let p = KBox::into_raw(Process::try_new(99).unwrap()).as_ptr() as *mut ();
+        // SAFETY: adopts the process's creation reference.
         let pref = unsafe { ObjectRef::from_raw(p, KObjectType::Process) };
         // SAFETY: live endpoints, single-threaded test.
         unsafe {
@@ -936,6 +946,7 @@ mod tests {
         test_probe::reset();
         let (a, b) = new_pair();
         let p = KBox::into_raw(Process::try_new(7).unwrap()).as_ptr() as *mut ();
+        // SAFETY: adopts the process's creation reference.
         let pref = unsafe { ObjectRef::from_raw(p, KObjectType::Process) };
         // SAFETY: live endpoints, single-threaded test.
         unsafe {

@@ -585,6 +585,7 @@ impl<Msg> Element<Msg> {
         // One iterator type for every shape, so callers do not each re-derive the match.
         // `Dock` yields its edge children before the filler, which is also the order layout
         // consumes them in and the order they are painted.
+        #[allow(clippy::type_complexity, reason = "a local annotation for one match, used nowhere else")]
         let (a, b, c): (&[Element<Msg>], Option<&Element<Msg>>, Option<&Element<Msg>>) = match &self.node {
             Node::Text(_)
             | Node::Fill(_)

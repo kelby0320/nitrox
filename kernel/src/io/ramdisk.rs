@@ -180,7 +180,7 @@ impl RamDisk {
         };
         let dev_off = irp.offset;
         let len = irp.length;
-        if dev_off.checked_add(len).map_or(true, |end| end > self.capacity() as u64) {
+        if dev_off.checked_add(len).is_none_or(|end| end > self.capacity() as u64) {
             return (KError::InvalidArgument as i32, 0);
         }
         let _busy = self.busy.lock();

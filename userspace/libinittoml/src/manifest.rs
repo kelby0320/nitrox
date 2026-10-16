@@ -189,10 +189,9 @@ fn depth(path: &str) -> usize {
 pub fn device_ns_path(device: &str) -> Option<String> {
     let (prefix, value) = if let Some(v) = device.strip_prefix("gpt-partlabel:") {
         ("/dev/disk/by-partlabel/", v)
-    } else if let Some(v) = device.strip_prefix("gpt-partuuid:") {
-        ("/dev/disk/by-partuuid/", v)
     } else {
-        return None;
+        let v = device.strip_prefix("gpt-partuuid:")?;
+        ("/dev/disk/by-partuuid/", v)
     };
     if value.is_empty() {
         return None;

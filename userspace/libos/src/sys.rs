@@ -130,6 +130,9 @@ pub use mock::{
 };
 
 #[cfg(test)]
+pub use mock::{counts, fail_next_bind, fail_next_submit, reset, script_next};
+
+#[cfg(test)]
 mod mock {
     use super::*;
     use std::cell::RefCell;
@@ -186,11 +189,11 @@ mod mock {
             m.waits += 1;
             let mut n = 0usize;
             for &h in handles {
-                if let Some(po) = m.pos.get(&h) {
-                    if po.ready {
-                        results[n] = IoResult { handle: h, status: po.status, reserved: 0, result: po.result };
-                        n += 1;
-                    }
+                if let Some(po) = m.pos.get(&h)
+                    && po.ready
+                {
+                    results[n] = IoResult { handle: h, status: po.status, reserved: 0, result: po.result };
+                    n += 1;
                 }
             }
             // A blocking wait (deadline != 0) with nothing ready simulates the first
@@ -310,6 +313,3 @@ mod mock {
         })
     }
 }
-
-#[cfg(test)]
-pub use mock::{counts, fail_next_bind, fail_next_submit, reset, script_next};

@@ -384,6 +384,10 @@ pub fn lookup<R: BlockReader>(r: &R, g: &Geometry, cache: &mut Cache, dir: Dir, 
 
 /// What a path names.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the variant is the common case, and boxing it needs an allocator this crate does not have"
+)]
 pub enum Node {
     /// The volume's root directory.
     Root,
@@ -621,8 +625,8 @@ pub fn rewrite<RW: BlockReader + BlockWriter>(
         }
         let bytes = &mut buf[..(k * ENTRY) as usize];
         rw.read_meta(at, bytes)?;
-        for (j, e) in bytes.chunks_exact_mut(ENTRY as usize).enumerate() {
-            f(s + j as u32, e.try_into().unwrap());
+        for (j, e) in bytes.as_chunks_mut::<{ ENTRY as usize }>().0.iter_mut().enumerate() {
+            f(s + j as u32, e);
         }
         rw.write_at(at, bytes)?;
         s += k;

@@ -182,7 +182,7 @@ impl<T> UserPtr<T> {
 
     /// The raw u64 address. Crate-internal only — nothing outside
     /// this module should reach for a user address.
-    pub(crate) fn as_u64(self) -> u64 {
+    pub(crate) fn as_u64(&self) -> u64 {
         self.addr
     }
 }
@@ -197,7 +197,7 @@ impl<T> UserMutPtr<T> {
     }
 
     /// The raw u64 address. Crate-internal only.
-    pub(crate) fn as_u64(self) -> u64 {
+    pub(crate) fn as_u64(&self) -> u64 {
         self.addr
     }
 }
@@ -207,7 +207,7 @@ fn validate_user_addr<T>(addr: u64) -> Result<(), UserAccessError> {
         return Err(UserAccessError::BadAddress);
     }
     let align = align_of::<T>() as u64;
-    if align > 1 && addr % align != 0 {
+    if align > 1 && !addr.is_multiple_of(align) {
         return Err(UserAccessError::Misaligned);
     }
     Ok(())
@@ -320,7 +320,7 @@ pub fn copy_slice_to_user(dst: UserMutPtr<u8>, src: &[u8]) -> Result<(), UserAcc
 /// - `Err(NoTerminator)` if `dst` filled without finding a NUL —
 ///   the caller may grow the buffer and retry;
 /// - `Err(Fault)` / `Err(BadAddress)` per the normal rules.
-pub fn copy_cstr_from_user<'a>(dst: &'a mut [u8], src: UserPtr<u8>) -> Result<&'a [u8], UserAccessError> {
+pub fn copy_cstr_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], UserAccessError> {
     let addr = src.as_u64();
     let max = dst.len();
     if max == 0 {
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[repr(C, align(16))]
-    struct Aligned16(#[allow(dead_code)] u128);
+    struct Aligned16(#[allow(dead_code, reason = "there for its size and alignment")] u128);
 
     #[test]
     fn user_ptr_respects_larger_alignment() {
@@ -531,7 +531,7 @@ mod tests {
         // and stack pointers on Linux are typically in the user
         // half (below 0x7FFF_FFFF_FFFF) which is also below our
         // USER_VIRT_END (0x8000_0000_0000).
-        if src.addr < USER_VIRT_END && src.addr.checked_add(dst.len() as u64).map_or(true, |e| e <= USER_VIRT_END) {
+        if src.addr < USER_VIRT_END && src.addr.checked_add(dst.len() as u64).is_none_or(|e| e <= USER_VIRT_END) {
             assert_eq!(copy_slice_from_user(&mut dst, src), Ok(()));
             assert_eq!(dst, src_data);
         }
@@ -542,7 +542,7 @@ mod tests {
         let src_data: [u8; 8] = *b"hello\0XX";
         let src = UserPtr::<u8> { addr: src_data.as_ptr() as u64, _phantom: PhantomData };
         let mut dst = [0u8; 16];
-        if src.addr < USER_VIRT_END && src.addr.checked_add(dst.len() as u64).map_or(true, |e| e <= USER_VIRT_END) {
+        if src.addr < USER_VIRT_END && src.addr.checked_add(dst.len() as u64).is_none_or(|e| e <= USER_VIRT_END) {
             let out = copy_cstr_from_user(&mut dst, src).expect("cstr ok");
             assert_eq!(out, b"hello\0");
             assert_eq!(out.len(), 6);
@@ -558,7 +558,7 @@ mod tests {
         let src_data: [u8; 8] = *b"hello\0XX";
         let src = UserPtr::<u8> { addr: src_data.as_ptr() as u64, _phantom: PhantomData };
         let mut dst = [0u8; 16];
-        if src.addr < USER_VIRT_END && src.addr.checked_add(dst.len() as u64).map_or(true, |e| e <= USER_VIRT_END) {
+        if src.addr < USER_VIRT_END && src.addr.checked_add(dst.len() as u64).is_none_or(|e| e <= USER_VIRT_END) {
             crate::arch::user_access::FAIL_NEXT_CSTR_COPY.with(|f| f.set(true));
             assert_eq!(copy_cstr_from_user(&mut dst, src), Err(UserAccessError::Fault),);
         }
@@ -569,7 +569,7 @@ mod tests {
         let src_data: [u8; 8] = *b"abcdefgh"; // no NUL
         let src = UserPtr::<u8> { addr: src_data.as_ptr() as u64, _phantom: PhantomData };
         let mut dst = [0u8; 4];
-        if src.addr < USER_VIRT_END && src.addr.checked_add(dst.len() as u64).map_or(true, |e| e <= USER_VIRT_END) {
+        if src.addr < USER_VIRT_END && src.addr.checked_add(dst.len() as u64).is_none_or(|e| e <= USER_VIRT_END) {
             assert_eq!(copy_cstr_from_user(&mut dst, src), Err(UserAccessError::NoTerminator),);
         }
     }

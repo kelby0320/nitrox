@@ -710,6 +710,7 @@ fn enqueue(srv: &mut Server, slot: usize, rec: Outbound) {
 /// a [`RETRY_INTERVAL_NS`] deadline instead of forever, and polls *only* while it owes
 /// somebody a message.
 fn flush_outboxes(srv: &mut Server) -> bool {
+    #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
     for slot in 0..MAX_SESSIONS {
         // SAFETY: reading our own slot table.
         let ch = unsafe { SESSION_CH[slot] };
@@ -718,7 +719,7 @@ fn flush_outboxes(srv: &mut Server) -> bool {
             continue;
         }
         while let Some(rec) = srv.outbox[slot].front() {
-            if !send_outbound(ch, &rec) {
+            if !send_outbound(ch, rec) {
                 break;
             }
             srv.outbox[slot].pop();
@@ -1110,6 +1111,7 @@ fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) 
             }
         }
     }
+    #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
     for slot in 0..MAX_SESSIONS {
         for _ in 0..SESSION_QUEUE_DEPTH {
             // SAFETY: reading our own slot table.
@@ -1180,10 +1182,7 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
         // SAFETY: bounded read of the payload the kernel just wrote.
         let payload = unsafe {
             let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            core::slice::from_raw_parts(
-                (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
-                payload_len.min(MSG_LEN - PAYLOAD_OFF),
-            )
+            core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], payload_len.min(MSG_LEN - PAYLOAD_OFF))
         };
         batches.push(payload.to_vec());
     }
@@ -1235,10 +1234,10 @@ fn route_one_batch(
         if m.op != librsproto::OP_INPUT_EVENTS {
             return;
         }
-        // A trailing partial record is dropped rather than guessed at. `chunks_exact`
-        // says so at the type level; `chunks` would hand `read` a short slice and get
-        // `None`, which reads as "malformed" for a batch that is merely truncated.
-        for raw in m.body.chunks_exact(INPUT_EVENT_LEN) {
+        // A trailing partial record is dropped rather than guessed at. `as_chunks` says so
+        // at the type level; `chunks` would hand `read` a short slice and get `None`, which
+        // reads as "malformed" for a batch that is merely truncated.
+        for raw in m.body.as_chunks::<INPUT_EVENT_LEN>().0 {
             let Some(ev) = InputEvent::read(raw) else {
                 continue;
             };
@@ -1763,6 +1762,7 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
         // with it (PR #175 review finding 2, PR #216 review finding 3).
         let takes_handle = matches!(&decoded, Ok(m) if m.op == OP_MGR_CAPTURE);
         let mut carried = 0u64;
+        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
         for i in 0..hcount {
             if i == 0 && takes_handle {
                 carried = RECV_HANDLES[0];
@@ -2282,10 +2282,7 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
     // region and is copied out before anything else touches the statics
     let (op, request_id, body_len, handle) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-        let req = core::slice::from_raw_parts(
-            (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
-            payload_len.min(MSG_LEN - PAYLOAD_OFF),
-        );
+        let req = core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], payload_len.min(MSG_LEN - PAYLOAD_OFF));
         // Take the handles out **before** anything can fail. A message that does not decode
         // can still have carried one, and returning early without closing it pins the
         // client's object for the compositor's life — a leak a client drives by sending one
@@ -2298,6 +2295,7 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
         // same unbounded leak as the three fixed above, differing only in how it arrived
         // (PR #175 review, finding 2).
         let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
+        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
         for i in 1..hcount {
             // SAFETY: closing a handle this process owns and no op can name.
             syscall4(SYS_HANDLE_CLOSE, RECV_HANDLES[i], 0, 0, 0);
@@ -2778,6 +2776,7 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
                 WAIT_HANDLES[n] = MANAGER_CH;
                 n += 1;
             }
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for i in 0..MAX_SESSIONS {
                 if SESSION_CH[i] != 0 {
                     WAIT_HANDLES[n] = SESSION_CH[i];
@@ -2901,10 +2900,8 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
         // SAFETY: bounded read of the payload, then of the resolve's suffix.
         let (request_id, resolved, ok) = unsafe {
             let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            let req = core::slice::from_raw_parts(
-                (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
-                payload_len.min(MSG_LEN - PAYLOAD_OFF),
-            );
+            let req =
+                core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], payload_len.min(MSG_LEN - PAYLOAD_OFF));
             match decode(req) {
                 Ok(m) if m.op == OP_NS_RESOLVE => {
                     let suffix = librsproto::namespace::parse_resolve_request(m.body).map(|r| r.suffix).unwrap_or(b"");
@@ -2937,8 +2934,6 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
     }
 }
 
-/// # Safety
-///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments; `ctrl` is the
 /// control channel the supervisor spawned this server with.
 #[unsafe(no_mangle)]

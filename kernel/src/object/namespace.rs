@@ -819,6 +819,7 @@ mod tests {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
         // SAFETY: adopt the kernel endpoint's creation reference; drop the peer's.
         let endpoint = unsafe { ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel) };
+        // SAFETY: adopts the peer's creation reference, to drop it.
         drop(unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel) });
         let reg = UserspaceServerReg::try_new(endpoint).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.

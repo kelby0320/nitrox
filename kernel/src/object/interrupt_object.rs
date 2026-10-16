@@ -86,7 +86,7 @@ impl InterruptObject {
     ///
     /// # Safety
     /// See the accessor contract above.
-    #[allow(clippy::mut_from_ref)]
+    #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
     unsafe fn inner<'a>(obj: *mut ()) -> &'a mut InterruptInner {
         // SAFETY: `obj` is a live `InterruptObject`; forming a shared reference to
         // reach the `UnsafeCell`, then a `&mut InterruptInner` through it, is the
@@ -191,7 +191,7 @@ impl Drop for InterruptObject {
     fn drop(&mut self) {
         // A live object should never be dropped with waiters still parked on it
         // (each waiter is removed before it unparks). Mirror `PendingOperation`.
-        // SAFETY: `&mut self` is exclusive; no `SCHED` contention at drop.
+        // `&mut self` is exclusive, so no `SCHED` is needed at drop.
         let inner = self.inner.get_mut();
         debug_assert!(inner.waiters.is_empty(), "InterruptObject dropped with waiters still parked");
     }
@@ -217,6 +217,7 @@ mod tests {
         let p = KBox::into_raw(io).as_ptr() as *mut ();
         // SAFETY: live object, single-threaded test stands in for SCHED.
         assert!(!unsafe { InterruptObject::already_signaled(p) });
+        // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
         drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });
     }
 
@@ -237,6 +238,7 @@ mod tests {
             InterruptObject::consume(p);
             assert!(!InterruptObject::already_signaled(p));
         }
+        // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
         drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });
     }
 
@@ -255,6 +257,7 @@ mod tests {
             assert_eq!(n, 1);
             assert_eq!(buf[0], t2);
         }
+        // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
         drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });
     }
 

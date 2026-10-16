@@ -742,8 +742,8 @@ mod tests {
         // SAFETY: PML4 is page-aligned and HHDM-reachable.
         unsafe {
             let pml4 = (frame.as_u64() + heap::hhdm_offset()) as *const u64;
-            for i in 0..PAGE_TABLE_ENTRIES {
-                out[i] = *pml4.add(i);
+            for (i, e) in out.iter_mut().enumerate() {
+                *e = *pml4.add(i);
             }
         }
         out
@@ -759,6 +759,7 @@ mod tests {
         // SAFETY: `source` was just constructed and is HHDM-reachable.
         let captured = unsafe { read_kernel_half_entries(source) };
 
+        #[allow(clippy::needless_range_loop, reason = "the index names the entry in each assertion's message")]
         for i in 0..KERNEL_PML4_COUNT {
             let expected = 0xDEAD_0000_0000_0000u64.wrapping_add((KERNEL_PML4_BASE + i) as u64);
             assert_eq!(
@@ -784,6 +785,7 @@ mod tests {
         unsafe { write_kernel_half_entries(target, &entries) };
 
         let after = read_all_entries(target);
+        #[allow(clippy::needless_range_loop, reason = "the index names the entry in each assertion's message")]
         for i in 0..KERNEL_PML4_BASE {
             // User-half entries untouched: they still match the original
             // `fill_pml4` pattern.
@@ -813,6 +815,7 @@ mod tests {
         }
 
         let after = read_all_entries(target);
+        #[allow(clippy::needless_range_loop, reason = "the index names the entry in each assertion's message")]
         for i in 0..KERNEL_PML4_BASE {
             assert_eq!(after[i], 0, "user half not zero at entry {i}");
         }

@@ -217,6 +217,12 @@ impl Decoder {
     }
 }
 
+impl Default for Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Rows of text: what each cell holds, where the cursor is, and which rows changed.
 ///
 /// Rows are a **ring**: logical row 0 (the top of the screen) is physical row `top`, so a scroll
@@ -342,6 +348,12 @@ impl Grid {
         }
         self.row = rows - jump;
         self.mark(0, rows - 1);
+    }
+}
+
+impl Default for Grid {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

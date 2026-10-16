@@ -15,7 +15,8 @@
 //! markers `RequestsStartMarker`/`RequestsEndMarker` speed up that scan and
 //! are mandatory under base revision 6.
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "the protocol's structures are mirrored whole; the kernel reads some of their fields")]
+#![allow(clippy::new_without_default, reason = "each request is built once, as a static, with its protocol ID")]
 
 use core::ptr;
 use core::sync::atomic::AtomicU64;

@@ -439,7 +439,7 @@ impl Parser {
         // straight into a title bar, so a payload carrying a newline or an escape would let the
         // program on the other end put anything it liked in a window's chrome. A path that does
         // not start at the root is not a place this could name, so it is not accepted either.
-        if !path.starts_with('/') || path.chars().any(|c| is_control(c)) {
+        if !path.starts_with('/') || path.chars().any(is_control) {
             return;
         }
         self.directory = Some(path.into());

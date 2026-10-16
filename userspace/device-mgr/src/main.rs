@@ -180,8 +180,12 @@ fn read_registry(root_ns: u64) -> Option<(Vec<DeviceRecord>, u64)> {
     let mut info = abi::HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
     let sr = unsafe { syscall2(SYS_HANDLE_STAT, snap, (&raw mut info) as u64) };
-    // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
-    let addr = if sr == 0 { unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) } } else { -1 };
+    let addr = if sr == 0 {
+        // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
+        unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) }
+    } else {
+        -1
+    };
     close(snap);
     if addr < 0 {
         return None;
@@ -207,8 +211,12 @@ fn read_io(root_ns: u64) -> Option<(CacheCounts, Vec<IoRecord>)> {
     let mut info = abi::HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
     let sr = unsafe { syscall2(SYS_HANDLE_STAT, snap, (&raw mut info) as u64) };
-    // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
-    let addr = if sr == 0 { unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) } } else { -1 };
+    let addr = if sr == 0 {
+        // SAFETY: register-only syscall; `snap` is a MemoryObject handle with MAP_READ.
+        unsafe { syscall4(SYS_MEMORY_MAP, snap, 0, info.size, RIGHT_MAP_READ) }
+    } else {
+        -1
+    };
     close(snap);
     if addr < 0 {
         return None;

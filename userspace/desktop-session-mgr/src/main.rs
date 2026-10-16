@@ -134,7 +134,7 @@ static mut RECV_COUNT: usize = 0;
 ///
 /// Returns once the session has ended, so the greeter can draw again. `false` if the
 /// credentials were refused, which is the only outcome the greeter shows differently.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, reason = "the session's handles, one for each service it is given")]
 fn run_session(
     root_ns: u64,
     notif: u64,
@@ -579,6 +579,7 @@ fn open_greeter(
     // its own request, honoured when the compositor gives up waiting for a manager.
     let (x, y) = origin;
     let window = session.create(&CreateWindowRequest::at(GREETER_W, GREETER_H, Role::Normal, x, y), BUFFERS).ok()?;
+    #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
     for i in 0..BUFFERS {
         let (handle, addr) = shared_buffer(len)?;
         addrs[i] = addr;

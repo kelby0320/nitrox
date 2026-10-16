@@ -692,16 +692,16 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
                 if !serve_tty(&mut reg, &mut tokens, h) {
                     free_tty(&mut reg, h);
                 }
-            } else if let Some((_, id)) = backend_at.iter().find(|(bh, _)| *bh == h).copied() {
-                if !serve_backend(&mut reg, id, h) {
-                    // **The emulator is gone, so every terminal on its backend ends.** A
-                    // terminal whose window has closed cannot be interacted with, and leaving
-                    // it alive would give its programs a `/dev/tty` that silently discards
-                    // everything written to it — the failure that looks like a hang.
-                    kprint(b"tty-server: a backend went away\n");
-                    for ch in reg.ttys_on(id) {
-                        free_tty(&mut reg, ch);
-                    }
+            } else if let Some((_, id)) = backend_at.iter().find(|(bh, _)| *bh == h).copied()
+                && !serve_backend(&mut reg, id, h)
+            {
+                // **The emulator is gone, so every terminal on its backend ends.** A
+                // terminal whose window has closed cannot be interacted with, and leaving
+                // it alive would give its programs a `/dev/tty` that silently discards
+                // everything written to it — the failure that looks like a hang.
+                kprint(b"tty-server: a backend went away\n");
+                for ch in reg.ttys_on(id) {
+                    free_tty(&mut reg, ch);
                 }
             }
         }
