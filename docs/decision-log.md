@@ -36240,4 +36240,14 @@ second declined.
   sees no `unsafe` block, are allowed there.
 - **Who did what**: the `implementer` fixed userspace's and the tools' warnings, crate by crate;
   the author the kernel's, every `unsafe`-comment lint, and the reading of the delegated diff.
+- **The size baseline is raised by hand** for the 31 listed files the fixes lengthened, by 144
+  lines — `SAFETY` comments on test blocks, `# Safety` sections, allow attributes and their
+  reasons, `if`s opened to hold a comment — in a commit of its own, and nine entries lowered.
+  `comments-and-size.md` said an entry only goes down; it now says what the plan's rule always
+  was: the tools only lower one, and a raise is by hand, reviewed, and says why.
+- **Every allow carries its reason, and CI holds it** (PR #380's review): 37 older allows gained
+  one — two found stale and removed — and `clippy::allow_attributes_without_reason` is denied.
+  Two pre-existing bugs the review found are deferred to Part D's bug bash: a grow that loses a
+  write midway (`TODO(ext4-failed-write-undo)`) and a refused window capture's leaked buffer
+  (`TODO(capture-refused-leak)`).
 

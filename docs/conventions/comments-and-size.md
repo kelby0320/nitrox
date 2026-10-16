@@ -40,7 +40,9 @@ binary.
 with its tests in a sibling `tests.rs`.
 
 The files over it when the rule came in are listed in `tools/xtask/size-baseline.toml` with their
-lengths, and **an entry only goes down**. **`cargo xtask check-size`** fails a file over 1,000
+lengths. **The tools only lower an entry; one goes up only by hand, in a reviewed commit of its own
+that says why** — the 1,000 lines is a guideline held as a ratchet, so that nothing grows
+unremarked. **`cargo xtask check-size`** fails a file over 1,000
 lines that is not listed, a listed file longer than its entry, and an entry that is stale — its
 file shorter, at 1,000 lines or fewer, or gone — until it is brought down:
 
