@@ -64,7 +64,7 @@ has no boot menu to type it at, but the live stick's does.
 
 **MSI only.** The laptop's controller has MSI with eight vectors and no MSI-X, and the driver
 takes that. **Every gate's controller is QEMU's `nec-usb-xhci` with `msi=on,msix=off`**
-(`XHCI_DEVICE` in `tools/xtask/src/main.rs`), so the gates' controller signals the way the laptop's
+(`XHCI_DEVICE` in `tools/xtask/src/usb.rs`), so the gates' controller signals the way the laptop's
 does. It is the same xHCI core as `qemu-xhci`, with the NEC µPD720200's identity (`1033:0194`).
 `qemu-xhci` offers MSI-X alone on q35, and QEMU 8.2 — CI's — hard-codes that, with no `msi`
 property; the NEC model takes `msi` and `msix` in 8.2 and 11 alike.

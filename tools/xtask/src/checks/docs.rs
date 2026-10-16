@@ -399,7 +399,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
     } else {
         let mut msg = String::from(
             "documentation must not point at things that do not exist \
-             (see cmd_check_docs in tools/xtask/src/docs.rs for why each check exists):\n",
+             (see cmd_check_docs in tools/xtask/src/checks/docs.rs for why each check exists):\n",
         );
         for v in &violations {
             msg.push_str("  ");

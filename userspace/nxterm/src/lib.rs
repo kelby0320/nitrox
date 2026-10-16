@@ -2417,7 +2417,7 @@ mod tests {
     /// `Find` instead. This makes it wrong in a second rather than in a boot.
     #[test]
     fn the_gate_clicks_the_row_it_means() {
-        // The constant in `tools/xtask/src/main.rs`, as `MENU_ROW_KEY + n`.
+        // The constant in `tools/xtask/src/gates/terminal.rs`, as `MENU_ROW_KEY + n`.
         const CLEAR_ROW: usize = 6;
         let a = app();
         let edit = a.menu_table().into_iter().find(|m| m.title == "Edit").expect("an Edit menu");

@@ -375,7 +375,7 @@ fn verdict(ok: bool) {
 // `namespace::tests::one_registration_bound_twice_is_shared_not_duplicated`.
 
 /// Size of the Part-5 large-file fixture (`/system/large.bin`). MUST match the
-/// xtask generator (`tools/xtask/src/main.rs`). 32 KiB = 8 pages — past the old
+/// xtask generator (`tools/xtask/src/rootfs.rs`). 32 KiB = 8 pages — past the old
 /// 64 KiB eager read cap, so reading it proves the page cache lifts the cap.
 /// (Was 64 pages; trimmed to 8 because each page demand-faults through the
 /// stateless fs-server fill at ~325 ms/page under QEMU — read-ahead is a Phase-3

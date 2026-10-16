@@ -5975,7 +5975,7 @@ mod tests {
     /// that number wrong in one second instead of in a three-minute boot.
     #[test]
     fn the_gate_clicks_the_row_it_means() {
-        // The constant in `tools/xtask/src/main.rs`, as `MENU_ROW_KEY + n`.
+        // The constant in `tools/xtask/src/gates/login/clipboard.rs`, as `MENU_ROW_KEY + n`.
         const RENAME_ROW: usize = 9;
         let file = &app().menu_table()[0];
         assert!(file.title == "File", "the first menu is File");
