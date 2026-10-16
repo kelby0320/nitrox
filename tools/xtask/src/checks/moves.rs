@@ -122,10 +122,30 @@ fn made_a_file(t: &str) -> Option<String> {
     is_mod_line(&line).then_some(line)
 }
 
+/// `text` with its `include_bytes!` or `include_str!` path taken out, and that path resolved from
+/// `file`'s directory: a line moved to another directory names the same file by another path.
+fn rerooted_include(file: &str, text: &str) -> Option<(String, String)> {
+    let at = ["include_bytes!(\"", "include_str!(\""].iter().find_map(|m| text.find(m).map(|i| i + m.len()))?;
+    let len = text[at..].find('"')?;
+    let mut parts: Vec<&str> = file.split('/').collect();
+    parts.pop();
+    for part in text[at..at + len].split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            p => parts.push(p),
+        }
+    }
+    Some((format!("{}{}", &text[..at], &text[at + len..]), parts.join("/")))
+}
+
 /// Every changed line that is not part of a move, as `file: ±text`. Allowed besides moved blocks:
 /// blank lines, `mod` lines with a `#[cfg(test)]` before them, `use` statements, a line whose
-/// only change is a visibility widened to `pub(crate)` or `pub(super)` with the lines around it
-/// that are the same on both sides, and an inline module made a file: its `mod NAME {` replaced by
+/// only change is a visibility widened to `pub(crate)` or `pub(super)`, or an include's path
+/// re-rooted to name the same file from the line's new directory, with the lines around it that
+/// are the same on both sides, and an inline module made a file: its `mod NAME {` replaced by
 /// `mod NAME;`, and one closing `}` in that file for each.
 fn unmoved(diff: &str) -> Vec<String> {
     let lines = changed_lines(diff);
@@ -153,7 +173,7 @@ fn unmoved(diff: &str) -> Vec<String> {
         }
     }
     let mut removed: Vec<usize> = (0..lines.len()).filter(|&i| !ok[i] && !lines[i].added).collect();
-    let mut widened = Vec::new();
+    let mut pairs = Vec::new();
     for i in 0..lines.len() {
         if ok[i] || !lines[i].added {
             continue;
@@ -164,10 +184,23 @@ fn unmoved(diff: &str) -> Vec<String> {
             && let Some(k) = removed.iter().position(|&j| lines[j].text.trim() == rest)
         {
             ok[i] = true;
-            widened.push((removed.swap_remove(k), i));
+            pairs.push((removed.swap_remove(k), i));
         }
     }
-    // A widened line splits git's moved block, and a piece of it too short for git to call moved is
+    for i in 0..lines.len() {
+        if ok[i] || !lines[i].added {
+            continue;
+        }
+        let added = rerooted_include(&lines[i].file, lines[i].text.trim());
+        if added.is_some()
+            && let Some(k) =
+                removed.iter().position(|&j| rerooted_include(&lines[j].file, lines[j].text.trim()) == added)
+        {
+            ok[i] = true;
+            pairs.push((removed.swap_remove(k), i));
+        }
+    }
+    // A widened line, or a re-rooted include, splits git's moved block, and a piece of it too short for git to call moved is
     // left uncoloured: the same lines on both sides, running on from the pair, are that piece. A run
     // is a hunk's removed lines, or its added ones.
     let mut runs: Vec<Vec<usize>> = Vec::new();
@@ -180,7 +213,7 @@ fn unmoved(diff: &str) -> Vec<String> {
         place[i] = (run, runs[run].len());
         runs[run].push(i);
     }
-    for &(r, a) in &widened {
+    for &(r, a) in &pairs {
         ok[r] = true;
         let ((rr, rp), (ar, ap)) = (place[r], place[a]);
         for step in [1, -1] {
@@ -251,6 +284,7 @@ mod tests {
         };
         git(&["init", "-q"]);
         for (path, text) in before {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
             std::fs::write(root.join(path), text).unwrap();
         }
         git(&["add", "-A"]);
@@ -259,6 +293,7 @@ mod tests {
             let _ = std::fs::remove_file(root.join(path));
         }
         for (path, text) in after {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
             std::fs::write(root.join(path), text).unwrap();
         }
         git(&["add", "-A"]);
@@ -362,6 +397,25 @@ mod tests {
         let moved = format!("pub(crate) {LONG}{MARKER}");
         let stray = unmoved(&diff_of(&[("a.rs", &before)], &[("a.rs", &after), ("b.rs", &moved)]));
         assert_eq!(stray, ["a.rs: +    continue_marker();", "b.rs: +    continue_marker();"]);
+    }
+
+    fn font(path: &str) -> String {
+        format!("fn the_font_the_test_draws_with() -> &'static [u8] {{\n    include_bytes!(\"{path}\")\n}}\n")
+    }
+
+    #[test]
+    fn an_include_rerooted_for_its_new_directory_is_a_move() {
+        let before = format!("{KEEP}\n{}", font("../assets/f.ttf"));
+        let d = diff_of(&[("src/a.rs", &before)], &[("src/a.rs", KEEP), ("src/sub/b.rs", &font("../../assets/f.ttf"))]);
+        assert_eq!(unmoved(&d), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_include_rerooted_to_another_file_is_not_a_move() {
+        let before = format!("{KEEP}\n{}", font("../assets/f.ttf"));
+        let d = diff_of(&[("src/a.rs", &before)], &[("src/a.rs", KEEP), ("src/sub/b.rs", &font("../../assets/g.ttf"))]);
+        let stray = unmoved(&d);
+        assert!(stray.iter().any(|s| s.ends_with("include_bytes!(\"../../assets/g.ttf\")")), "{stray:?}");
     }
 
     #[test]
