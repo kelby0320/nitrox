@@ -22,7 +22,7 @@
 "userspace/compositor/src/input.rs" = 3382
 "userspace/compositor/src/lib.rs" = 3497
 "userspace/compositor/src/main.rs" = 3046
-"userspace/desktop-shell/src/main.rs" = 5324
+"userspace/desktop-shell/src/main.rs" = 5343
 "userspace/desktop-shell/src/panel.rs" = 1379
 "userspace/fs-server-ext4/src/ext4.rs" = 2357
 "userspace/fs-server-ext4/src/extent.rs" = 1451
@@ -44,7 +44,7 @@
 "userspace/libui/src/widget.rs" = 6970
 "userspace/nxedit/src/lib.rs" = 4918
 "userspace/nxedit/src/main.rs" = 1286
-"userspace/nxfiles/src/lib.rs" = 5990
+"userspace/nxfiles/src/lib.rs" = 6010
 "userspace/nxfiles/src/main.rs" = 1384
 "userspace/nxinstall/src/main.rs" = 1138
 "userspace/nxsh/src/eval.rs" = 4738
@@ -58,7 +58,7 @@
 "userspace/storage-service/src/lib.rs" = 1148
 "userspace/storage-service/src/main.rs" = 1788
 "userspace/storage-service/src/tests.rs" = 1091
-"userspace/test-harness/src/bootprobe/main.rs" = 5511
+"userspace/test-harness/src/bootprobe/main.rs" = 5514
 "userspace/test-harness/src/harness.rs" = 4765
 "userspace/test-harness/src/uiclient.rs" = 1639
 "userspace/tty-server/src/lib.rs" = 1523
