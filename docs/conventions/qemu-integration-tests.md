@@ -392,7 +392,8 @@ The gates CI runs, each with what no other gate catches and its duration on a CI
 2026-10-16. **CI's QEMU job is five runners**, a group each, every runner building the images its
 own gates need; a group's first gate pays that build, about 85 s, which the second figure leaves
 out. Each gate prints its time (`xtask: <gate> took N s`), so the groups are rebalanced from the
-log. A gate whose second column is empty is merged or retired — the maintainer's call each time.
+log. A gate with nothing under *What it alone catches* is merged or retired — the maintainer's call
+each time.
 
 | Gate | Runs in | Seconds | What it alone catches |
 |---|---|---|---|
@@ -415,7 +416,7 @@ log. A gate whose second column is empty is merged or retired — the maintainer
 | `check-input --no-ps2-irq` | `input.yml` | 29 | Input with the tick's `ps2::poll` sweep as its only path. |
 | `check-input --usb` | `input.yml` | 33 | USB-only input, and devices that come and go: a keyboard unplugged, another typed on, a held key released. |
 
-**Two pairs are the nearest to overlapping**, and are kept for what the second column says:
+**Two pairs are the nearest to overlapping**, and are kept for what *What it alone catches* says:
 `check-report` and `check-report --usb` read the same pages and differ in the keyboard turning them;
 `check-login --usb` and `check-input --usb` both put USB input on the desktop, one through the
 greeter and a session, the other through hot-plug.
