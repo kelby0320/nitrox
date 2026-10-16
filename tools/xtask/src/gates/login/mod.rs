@@ -1,7 +1,9 @@
 use crate::*;
 
+mod apps;
 mod overview;
 
+pub(crate) use apps::*;
 pub(crate) use overview::*;
 
 /// **The shell's last whole window list** in `transcript`: what follows `window list on cli of ` on
