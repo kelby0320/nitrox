@@ -16,7 +16,7 @@ pub(super) fn centre_dialog(base: (i32, i32, u32, u32), size: (u32, u32), work: 
     let x = base.0.saturating_add((base.2 as i32 - size.0 as i32) / 2);
     let y = base.1.saturating_add((base.3 as i32 - size.1 as i32) / 2);
     // `.max(0)` keeps the clamp's bounds ordered when the dialog is larger than the work area;
-    // `clamp` panics on an inverted range, and this file's whole stance is that a shell must
+    // `clamp` panics on an inverted range, and the shell's whole stance is that a shell must
     // not be the thing that dies.
     let max_x = work.work_x.saturating_add((work.work_w as i32 - size.0 as i32).max(0));
     let max_y = work.work_y.saturating_add((work.work_h as i32 - size.1 as i32).max(0));

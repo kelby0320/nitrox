@@ -30,7 +30,7 @@
 ///
 /// RAII rather than a bare increment-and-reset, because two of these tests panic while it
 /// is alive: cleanup written *after* the assert would simply not run. Test builds unwind
-/// (the `panic = "abort"` assertion in this file is `cfg(not(test))`), so `Drop` runs
+/// (the `panic = "abort"` assertion in `sched.rs` is `cfg(not(test))`), so `Drop` runs
 /// during the unwind and the restore is unconditional.
 ///
 /// **Nothing depends on that today**, and an earlier version of this comment claimed

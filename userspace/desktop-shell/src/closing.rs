@@ -26,7 +26,7 @@ const INSIST_WINDOW_NS: u64 = 5_000_000_000;
 /// expires rather than lasting the window's life.
 ///
 /// **A clock that will not answer means nothing is ever armed**, so the taskbar can ask and
-/// never insist. That is this file's stance on `now_ns` everywhere: the failure that leaves the
+/// never insist. That is the shell's stance on `now_ns` everywhere: the failure that leaves the
 /// machine working is the one where a window stays, and a window that cannot be forced shut from
 /// the bar can still be closed by its own button.
 ///

@@ -99,7 +99,7 @@ pub(super) fn open_wallpaper(
     // Returning `None` from the middle would leave the compositor holding a full-screen,
     // configured, hit-testable `panel` with nothing committed to it, for the life of the
     // process — no manager is attached this early, so its initial `Configure` goes out at once.
-    // `open_overview` in this file says this, and the modal it had before the Applications menu
+    // `open_overview` in `overview.rs` says this, and the modal it had before the Applications menu
     // said it too, each after a review found it (PR #244 blocking 3, PR #237 finding 7); this is
     // the third (PR #272 review, worth fixing 3). `Child::open`, which the menus use, says it in
     // `libui`.
