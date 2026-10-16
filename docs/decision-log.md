@@ -36213,3 +36213,31 @@ second declined.
   their line numbers, so a removed `SAFETY` comment no longer swallows the next hunk's.
 - **A failed spawn moves nothing**, so `init` and `storage-service` now close the end they meant
   to move; `init` had left it open in PID 1, a test-qemu probe showed.
+
+## 2026-10-16 — Before Phase 7, Part B.2's second PR: `clippy` with every warning denied
+
+- **Measured on what CI lints**: 629 findings across 76 lints — the kernel 247, of them 106
+  undocumented `unsafe` blocks in test code and 22 `SAFETY` comments on safe code; userspace and
+  the tools 382. All are fixed or allowed, and CI runs six `clippy`s with `-D warnings` and
+  `undocumented_unsafe_blocks`, `unnecessary_safety_comment` and `unnecessary_safety_doc` denied:
+  the kernel with no features, with every one, and its library in test mode on the host; the tools'
+  every target; userspace with every feature, and each library in test mode.
+- **Test code is linted as the host suite builds it, `--lib --profile test`**, not with
+  `--all-targets`. The plan named five userspace binaries that do not build as tests (E0152);
+  every userspace binary fails that way, so test mode is asked of the libraries alone. The kernel's
+  `--tests` also builds its library outside test mode, where the `panic = "abort"` assertion
+  refuses the host target, so it is linted the same way.
+- **Allows are on the item, each with its `reason`**, rather than in a workspace `[lints]` table
+  as the plan proposed: every one turned out to be a judgement about one site. The large groups are
+  `deref_addrof` on `&mut *(&raw mut STATIC)` (37) — `clippy --fix` rewrites it to `&mut STATIC`,
+  a reference to a `static mut`, which does not compile in edition 2024 — `needless_range_loop`
+  (32), where an iterator would borrow a `static mut` or the index names the entry in a message,
+  and `too_many_arguments` (15), mostly drawing primitives taking geometry as scalars.
+- **A `SAFETY` comment only on `unsafe` code** (57 sites): one-line `# Safety:` docs, which render
+  as a heading, became sections; `# Safety` headings on safe `_start`s went; one-line `if … {
+  unsafe {…} }` expressions opened into blocks to hold their comments; stray comments moved onto
+  their blocks or left; and the four over `naked_asm!`, the asm's safety argument where `clippy`
+  sees no `unsafe` block, are allowed there.
+- **Who did what**: the `implementer` fixed userspace's and the tools' warnings, crate by crate;
+  the author the kernel's, every `unsafe`-comment lint, and the reading of the delegated diff.
+
