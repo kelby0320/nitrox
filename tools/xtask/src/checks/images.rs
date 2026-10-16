@@ -1,3 +1,5 @@
+//! `check-images`: a test image and a release image differ only where allowed.
+
 use crate::*;
 
 /// `check-images`' live half: the live image differs from the image of its mode **only in data** —

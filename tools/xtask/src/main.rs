@@ -620,15 +620,6 @@ fn limine_conf() -> PathBuf {
     repo_root().join("boot").join("limine.conf")
 }
 
-
-
-
-
-
-
-
-
-
 /// Recursively visit every `.rs` file under `dir`, calling `f` on each. Like
 /// [`visit_rs_files`], but pruning any directory whose name is in `skip` (e.g. build
 /// output trees, which can be enormous and are not project source).
@@ -682,8 +673,6 @@ fn parse_host_from_rustc_vv(s: &str) -> Option<String> {
     }
     None
 }
-
-
 
 // --- Helpers ------------------------------------------------------------
 

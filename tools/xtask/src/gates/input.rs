@@ -1,3 +1,5 @@
+//! `check-input`: a key and a click injected, each seen to reach a userspace client.
+
 use crate::*;
 
 /// `cargo xtask check-input` — inject a keystroke and a click, and check they arrive.

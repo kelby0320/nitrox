@@ -1,3 +1,5 @@
+//! The static checks: no guest, each failing with what to fix.
+
 mod abi;
 mod arch;
 pub(crate) mod comments;

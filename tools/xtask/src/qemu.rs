@@ -1,3 +1,5 @@
+//! QEMU's command line: TCG or KVM, the machine every boot shares, OVMF, and `cargo xtask qemu`.
+
 use crate::*;
 
 /// Append the machine / CPU / memory / UEFI-firmware flags shared by every QEMU

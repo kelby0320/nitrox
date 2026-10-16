@@ -1,3 +1,5 @@
+//! `abi-sync-check`: userspace's copy of the kernel ABI has not drifted from it.
+
 use crate::*;
 
 /// The placeholder is spelt `TODO(<tag>)` throughout this file — angle brackets included — and

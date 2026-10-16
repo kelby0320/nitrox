@@ -1,3 +1,5 @@
+//! `check-terminal`: a click into `nxterm`, typing, and the shell's answer seen rendered.
+
 use crate::*;
 
 ///

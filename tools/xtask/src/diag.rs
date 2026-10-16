@@ -1,3 +1,5 @@
+//! A failed guest, diagnosed: its state dumped over QMP and its stack symbolized.
+
 use crate::*;
 
 /// A function symbol from an ELF's symbol table.

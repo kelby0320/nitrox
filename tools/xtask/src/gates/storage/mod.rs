@@ -1,3 +1,5 @@
+//! `check-storage`: the test live stick beside a copy of the release disk, checked by the host.
+
 use crate::*;
 
 mod format;

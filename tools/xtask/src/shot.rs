@@ -1,3 +1,5 @@
+//! `shot`: the release image booted and its desktop photographed.
+
 use crate::*;
 
 /// `cargo xtask shot [all|greeter|desktop|apps|windows|terminal|hover|files|editor|overview]` —

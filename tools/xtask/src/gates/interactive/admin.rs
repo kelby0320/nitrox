@@ -1,3 +1,5 @@
+//! `test-interactive`'s administration: `with`, `disk`, policy, accounts, services, the log.
+
 use crate::*;
 
 /// `test-interactive`'s steps 20b to 20e: `with`, `disk`, the policy changed and put back, and

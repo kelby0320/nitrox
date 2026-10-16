@@ -1,3 +1,5 @@
+//! `check-login`'s file browser and editor.
+
 use crate::*;
 
 /// `check-login`'s step 7: the file browser, and the two sessions used as one fact.

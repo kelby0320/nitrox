@@ -1,3 +1,5 @@
+//! QEMU's USB devices: the controller every gate uses, and `test-qemu`'s hot-plug checks.
+
 use crate::*;
 
 /// The line the hub thread ends its first round with, after which a device is plugged in.

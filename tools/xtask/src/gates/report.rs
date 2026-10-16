@@ -1,3 +1,5 @@
+//! `check-report`: the live menu's hardware report, read off the screen with no serial port.
+
 use crate::*;
 
 /// The facts `check-report`'s boot adds to [`EMULATED_MACHINE_FACTS`]: the laptop's shape — a USB

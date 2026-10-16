@@ -1,3 +1,5 @@
+//! `check-resolutions`: the display gates at five screen sizes.
+
 use crate::*;
 
 /// `cargo xtask check-resolutions` — **resolution independence, checked on demand** (Phase 5

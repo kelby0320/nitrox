@@ -1,6 +1,6 @@
-use crate::*;
+//! `throughput-stick`: the stick copies are timed with, written and read back.
 
-// --- The throughput stick (Phase 6 Part H.2) -------------------------------------------------------
+use crate::*;
 
 /// The label `throughput-stick` gives its FAT.
 const THROUGHPUT_LABEL: &str = "THROUGHPUT";

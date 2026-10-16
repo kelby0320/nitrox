@@ -1,3 +1,5 @@
+//! `check-install`: installed to a blank disk from the live menu, then that disk booted.
+
 use crate::*;
 
 /// The model and serial the gate's target disk reports, and the identity they compose into.

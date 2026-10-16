@@ -1,6 +1,6 @@
-use crate::*;
+//! The disk image assembled: the initramfs and its programs, the store, the ESP, a scratch disk.
 
-// --- Image assembly -----------------------------------------------------
+use crate::*;
 
 pub(crate) fn find_bootx64(limine_root: &Path) -> R<PathBuf> {
     // The tarball layout has varied between versions; search a small set of
@@ -656,7 +656,14 @@ pub(crate) fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice)
     Ok(())
 }
 
-pub(crate) fn assemble_image(bootx64: &Path, kernel: &Path, conf: &Path, initramfs: &Path, out: &Path, mode: BuildMode) -> R<()> {
+pub(crate) fn assemble_image(
+    bootx64: &Path,
+    kernel: &Path,
+    conf: &Path,
+    initramfs: &Path,
+    out: &Path,
+    mode: BuildMode,
+) -> R<()> {
     require_tool("sgdisk")?;
     require_tool("mformat")?;
     require_tool("mcopy")?;

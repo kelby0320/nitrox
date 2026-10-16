@@ -1,3 +1,5 @@
+//! `check-display`: a screendump compared with the host's render of the same screen.
+
 use crate::*;
 
 /// A **smoke gate, not a per-commit one**: it boots a full image and compares an image,
@@ -413,7 +415,6 @@ pub(crate) fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     clippy::too_many_arguments,
     reason = "the screen and scene geometry are separate scalars the caller already holds"
 )]
-
 fn desktop_round_trip(
     qmp: &mut Qmp,
     session: &mut Session,

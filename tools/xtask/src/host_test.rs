@@ -1,3 +1,5 @@
+//! `test`: every workspace's host tests.
+
 use crate::*;
 
 pub(crate) fn cmd_test() -> R<()> {

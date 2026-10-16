@@ -1,6 +1,6 @@
-use crate::*;
+//! `build`, `image`, `fetch-limine` and `clean`, and the userspace builds under them.
 
-// --- Subcommands --------------------------------------------------------
+use crate::*;
 
 /// The coreutils: one crate, a bin per program. Built, packed into the initramfs, and
 /// packaged into the store from this single list — see [`profile_programs`].

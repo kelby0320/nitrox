@@ -1,3 +1,5 @@
+//! `check-irq-scope`: every interrupt entry stub opens the lock-ordering scope.
+
 use crate::*;
 
 /// How `irq_dispatcher!` binds the guard [`enter_interrupt`] returns.

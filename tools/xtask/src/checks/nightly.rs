@@ -1,3 +1,5 @@
+//! `check-nightly`: no crate uses a nightly `#![feature]`.
+
 use crate::*;
 
 /// Enforce the architecture-abstraction boundary: kernel code outside

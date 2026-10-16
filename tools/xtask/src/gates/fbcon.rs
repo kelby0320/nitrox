@@ -1,3 +1,5 @@
+//! `check-fbcon`: a boot and a panic read off the screen, with no serial port.
+
 use crate::*;
 
 /// `cargo xtask check-fbcon` — **the boot is legible with no serial port at all** (Phase 5

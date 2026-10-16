@@ -1,3 +1,5 @@
+//! Keys and clicks sent to the guest, each waited on until it is seen to land.
+
 use crate::*;
 
 /// Position the pointer, click, and **confirm where the press landed** — retrying if it did
@@ -340,7 +342,14 @@ pub(crate) fn wait_ps2_lights(log: &Path, want: &[u8], what: &str) -> R<()> {
 /// followed by `shows` — which `line` then is. The echo is the pacing, as in `check-terminal`'s
 /// first typing. **A row is reported with its trailing blanks trimmed**, so a space is waited for
 /// as the row before it, reported again.
-pub(crate) fn key_echoed(qmp: &mut Qmp, session: &mut Session, line: &mut String, qcode: &str, shift: bool, shows: &str) -> R<()> {
+pub(crate) fn key_echoed(
+    qmp: &mut Qmp,
+    session: &mut Session,
+    line: &mut String,
+    qcode: &str,
+    shift: bool,
+    shows: &str,
+) -> R<()> {
     if shift {
         qmp.send_key("shift", true)?;
     }

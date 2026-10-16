@@ -1,3 +1,5 @@
+//! The screen a gate boots: its size, where things are on it, and a screendump read as text.
+
 use crate::*;
 
 /// The size of the screen QEMU gives the guest (Phase 5 Part E).

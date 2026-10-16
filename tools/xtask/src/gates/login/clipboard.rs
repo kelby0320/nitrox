@@ -1,3 +1,5 @@
+//! `check-login`'s buffers, clipboard, `with` and rename.
+
 use crate::*;
 
 /// `check-login`'s steps 9a2 to 9d: two buffers in one window, copy and paste across programs,

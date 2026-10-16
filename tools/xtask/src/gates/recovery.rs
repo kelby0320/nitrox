@@ -1,3 +1,5 @@
+//! `check-recovery`: a password reset on an installed disk from the live image, then booted.
+
 use crate::*;
 
 /// The password `check-recovery` resets `alice`'s to, on the installed disk — a fixture like

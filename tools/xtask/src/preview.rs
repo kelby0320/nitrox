@@ -1,3 +1,5 @@
+//! `preview` and `tune`: the toolkit and the compositing rendered here, with no guest.
+
 use crate::*;
 
 /// `cargo xtask check-display` — prove the pixels actually reach the screen.

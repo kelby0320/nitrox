@@ -1,3 +1,5 @@
+//! `check-deferrals`: every `TODO(tag)` has its entry in `deferred-decisions.md`.
+
 use crate::*;
 
 pub(crate) fn cmd_check_deferrals() -> R<()> {

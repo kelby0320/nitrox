@@ -1,3 +1,5 @@
+//! The host renders a gate compares the guest's screen with, and the theme and wallpaper staged.
+
 use crate::*;
 
 /// The repository file the image build stages at `guest_path`.

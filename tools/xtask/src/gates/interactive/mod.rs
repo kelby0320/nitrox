@@ -1,3 +1,5 @@
+//! `test-interactive`: the release image booted, and a real login and shell driven.
+
 use crate::*;
 
 mod admin;

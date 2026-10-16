@@ -1,3 +1,5 @@
+//! `image --live`: the live image, its root a RAM-disk module, and its boot menu.
+
 use crate::*;
 
 /// `cargo xtask image --live` — the live image (Phase 5 Part C): the release kernel and initramfs,

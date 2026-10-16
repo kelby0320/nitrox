@@ -1,3 +1,5 @@
+//! `test-qemu`: the headless self-test image, and the facts its transcript must hold.
+
 use crate::*;
 
 /// **The drive past 2 TiB `test-qemu` attaches** (Phase 6 Part G), in the build cache.

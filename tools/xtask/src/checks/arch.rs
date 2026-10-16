@@ -1,3 +1,5 @@
+//! `check-arch`: kernel code outside `arch/` reaches it only through `crate::arch`.
+
 use crate::*;
 
 pub(crate) fn cmd_check_arch() -> R<()> {

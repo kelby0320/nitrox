@@ -1,8 +1,15 @@
+//! `check-login`'s dialogs, a close insisted on, and the Places menu.
+
 use crate::*;
 
 /// `check-login`'s steps 10 to 13 and the transcript's last checks: dialogs, insisting on a
 /// close, and the Places menu.
-pub(crate) fn login_dialogs_and_places(mut qmp: Qmp, mut session: Session, size: DisplaySize, st: &mut LoginState) -> R<()> {
+pub(crate) fn login_dialogs_and_places(
+    mut qmp: Qmp,
+    mut session: Session,
+    size: DisplaySize,
+    st: &mut LoginState,
+) -> R<()> {
     let edit_id = st.edit_id;
     let first_term_id = st.first_term_id;
     let qmp_sock = st.qmp_sock.clone();

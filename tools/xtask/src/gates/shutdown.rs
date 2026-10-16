@@ -1,3 +1,5 @@
+//! `check-shutdown`: `with power shutdown` on a test disk, the disk checked, then a reboot.
+
 use crate::*;
 
 /// The file `check-shutdown` writes, under the serial session's `/home` — `alice`'s home on the

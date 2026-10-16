@@ -1,3 +1,5 @@
+//! `check-login`'s window list, overview, and windows dragged, resized and snapped.
+
 use crate::*;
 
 /// `check-login`'s steps 6b to 6e: the window list, show desktop, the lifecycle rule, the

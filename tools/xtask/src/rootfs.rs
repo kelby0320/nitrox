@@ -1,3 +1,5 @@
+//! The root filesystem's tree staged for `mke2fs`, and a partition spliced into a GPT disk.
+
 use crate::*;
 
 /// Stage the root filesystem's tree for `mode` into `staging` — everything `mke2fs -d` puts on

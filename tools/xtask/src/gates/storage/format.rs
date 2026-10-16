@@ -1,3 +1,5 @@
+//! `check-storage`'s formatting: blank sticks given a filesystem, and read on the host.
+
 use crate::*;
 
 /// **Partitioning and formatting, through `with admin`** (Phase 6 Part G), after the sticks:

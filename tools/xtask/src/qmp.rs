@@ -1,3 +1,5 @@
+//! The QMP connection: keys, buttons, the wheel and pointer motion injected, and screendumps.
+
 use crate::*;
 
 /// How many events [`Qmp::connect`] reads past before it must see QEMU's greeting.

@@ -1,3 +1,5 @@
+//! `check-media`: a stick plugged into the live desktop, shown in Files, saved to and ejected.
+
 use crate::*;
 
 /// The FAT stick `check-media` plugs in: its label, and so the name it is mounted under.

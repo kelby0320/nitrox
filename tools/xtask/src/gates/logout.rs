@@ -1,3 +1,5 @@
+//! `check-logout`: the power menu's log out past an editor's question, restart and shut down.
+
 use crate::*;
 
 /// `cargo xtask check-login` — the **graphical login gate**: a wrong password, then a right

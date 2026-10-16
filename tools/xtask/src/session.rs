@@ -1,3 +1,5 @@
+//! The serial session a gate drives: lines typed at the guest, and its output waited on.
+
 use crate::*;
 
 /// A driven QEMU serial session: write lines, wait for text.

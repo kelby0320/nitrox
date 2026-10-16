@@ -1,3 +1,5 @@
+//! `bench-compose`: what composing a drag costs, and where.
+
 use crate::*;
 
 /// `cargo xtask bench-compose` — what composing a drag costs, and where.

@@ -1,3 +1,5 @@
+//! What the desktop reports on serial, parsed, and the pointer and menu moves that act on it.
+
 use crate::*;
 
 /// Read `<id> at <x>,<y> <w>x<h>` — the tail of `nxfiles`' menu-popup line.

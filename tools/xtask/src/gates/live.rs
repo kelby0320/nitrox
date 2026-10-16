@@ -1,3 +1,5 @@
+//! `check-live`: the live image booted as a USB stick with no disk.
+
 use crate::*;
 
 /// `cargo xtask check-live` — **the live image boots a machine with no storage driver** (Phase 5

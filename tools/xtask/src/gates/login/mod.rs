@@ -1,3 +1,5 @@
+//! `check-login`: the graphical greeter, then the session's desktop driven step by step.
+
 use crate::*;
 
 mod apps;

@@ -1,3 +1,5 @@
+//! `check-storage`'s sticks: mounted, written, renamed and ejected, then read on the host.
+
 use crate::*;
 
 /// **Sticks that come and go** (Phase 6 Part D), after the disk's steps, plugged and pulled over

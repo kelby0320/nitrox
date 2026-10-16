@@ -1,3 +1,5 @@
+//! The QEMU gates, a module each: a guest booted and driven, and what it shows checked.
+
 mod display;
 mod fbcon;
 mod input;
