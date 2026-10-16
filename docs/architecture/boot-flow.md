@@ -131,7 +131,7 @@ it), `fs-server-ext4` (it *is* the root mount), `eshell` (the recovery path *for
 and `profile-server` (`/bin` does not exist until it runs). Everything else — the services, the
 coreutils, the display arm, the test programs — lives in the content-addressed store and is
 projected into `/bin`. The list is the same in every build mode, so the boot path a test exercises
-is the boot path that ships. See `tools/xtask/src/main.rs`'s `INITRAMFS_PROGRAMS`, which pairs each
+is the boot path that ships. See `tools/xtask/src/image.rs`'s `INITRAMFS_PROGRAMS`, which pairs each
 entry with its reason, and the ceiling that fails the build if the list grows.
 
 **The service declarations and the profile manifest are on the root** (administration Part E.1c,

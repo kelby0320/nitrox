@@ -1,5 +1,6 @@
-# Rust files allowed over 1,000 lines, each with its length. An entry only goes down:
-# `cargo xtask check-size --update` lowers or removes entries as files shrink.
+# Rust files allowed over 1,000 lines, each with its length. The tools only lower an entry:
+# `cargo xtask check-size --update` lowers or removes entries as files shrink. A raise is
+# by hand, in a reviewed commit of its own that says why.
 [files]
 "kernel/src/arch/x86_64/acpi.rs" = 1084
 "kernel/src/arch/x86_64/idt.rs" = 1257
@@ -18,7 +19,6 @@
 "kernel/src/pci/mod.rs" = 1206
 "kernel/src/sched.rs" = 5015
 "kernel/src/syscall/table.rs" = 4061
-"tools/xtask/src/main.rs" = 20278
 "userspace/compositor/src/input.rs" = 3382
 "userspace/compositor/src/lib.rs" = 3497
 "userspace/compositor/src/main.rs" = 3046

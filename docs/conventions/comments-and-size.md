@@ -50,3 +50,18 @@ file shorter, at 1,000 lines or fewer, or gone — until it is brought down:
   those at 1,000 lines or fewer or gone. It never raises an entry or adds one.
 - `cargo xtask check-size --rename OLD NEW` moves a renamed file's entry to its new path, at no
   more than its old allowance.
+- `cargo xtask check-size --split OLD NEW...` moves a split file's entry onto its pieces: each still
+  over 1,000 lines gets an entry at its length, and `OLD` keeps one at most its own. Refused if
+  the pieces hold more than `OLD`'s entry, not counting each new file's leading doc, `mod`, `use`
+  and attribute lines, or the `mod` line each needs in its parent.
+
+**A split is moves only, and shown to be.** Each move is a commit of its own, before any
+formatting, and **`cargo xtask check-moves [REV]`** fails a commit (`HEAD` by default) holding any
+changed line that `git diff --color-moved=blocks --color-moved-ws=allow-indentation-change` does not
+find moved — besides blank lines, `mod` lines and the `#[cfg(test)]` before one, `use` statements,
+a visibility widened to `pub(crate)` or `pub(super)` — with the lines running on from it that are
+the same on both sides, a piece of the move too short for git to call moved once the widened line
+splits it — and an inline module made a file: its `mod NAME {` replaced by `mod NAME;`, and its
+closing `}`. A line-by-line match is not enough: a
+`continue` deleted in one place and added in another passes one. Formatting follows in the next
+commit.

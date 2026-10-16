@@ -53,7 +53,7 @@ times because adding a name to a list of names is a one-word change, so it is no
 **To make a new program spawnable**, in order of what to try:
 
 1. Add it to a store package — `SYSTEM_SERVICES` for a service, `COREUTILS` for a user
-   program, `TEST_PROGRAMS` for a gate — in `tools/xtask/src/main.rs`, and have its spawner
+   program, `TEST_PROGRAMS` for a gate — in `tools/xtask/src/build.rs`, and have its spawner
    resolve `/bin/<name>`. This is the answer unless the next point applies.
 2. Only if it must run *before there is a filesystem to read it from*: add it to
    `INITRAMFS_PROGRAMS` **with the reason**, raise `INITRAMFS_MAX_BYTES`, and resolve

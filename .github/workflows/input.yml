@@ -67,7 +67,7 @@ on:
       - 'userspace/librsproto/src/surface.rs'
       - 'userspace/libsurface/**'
       - 'userspace/compositor/**'
-      - 'tools/xtask/src/main.rs'
+      - 'tools/xtask/src/**'
       # What every crate is built with: a change here rebuilds all of it.
       - 'rust-toolchain.toml'
       - 'userspace/rust-toolchain.toml'

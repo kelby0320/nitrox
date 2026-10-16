@@ -36251,3 +36251,35 @@ second declined.
   write midway (`TODO(ext4-failed-write-undo)`) and a refused window capture's leaked buffer
   (`TODO(capture-refused-leak)`).
 
+
+## 2026-10-16 — Before Phase 7, Part B.5's first PR: xtask's `main.rs`, split
+
+- **`tools/xtask/src/main.rs` went from 20,424 lines to 715**, into 51 files: a module a gate under
+  `src/gates/` — `check-login`, `test-interactive` and `check-storage` a directory each — the
+  static checks under `src/checks/` beside `check-docs`, `check-comments`, `check-size` and
+  `check-moves`, moved there whole, and shared modules for the serial session, QMP, QEMU, the
+  screen, a failed guest's diagnosis, the desktop's serial reports, the keys and clicks a gate
+  sends, the host's renders, USB, building, the image, the live image and the root filesystem.
+  The largest piece is 877 lines; `main.rs` keeps `main`, the paths, the fixtures' credentials
+  and the kernel's console modules.
+- **Two functions were split into steps first**, the only change in it that is not a move:
+  `cmd_check_login`'s 2,843 lines into its boot and login and seven steps, which hand on what the
+  later ones read in a `LoginState`; `run_interactive_scenarios`' 1,093 into its first steps and
+  four more. Held by `check-login` with and without `--usb` and `test-interactive`, each with and
+  without `--kvm`. `main.rs`'s size entry was raised by hand for their 146 lines.
+- **The moves were made by a script from the module map, not by the `implementer`** as the plan
+  had it: cutting whole items by line range cannot edit one, the `implementer` does not commit,
+  and the plan asked for a commit a move. Fifty commits, each building and each passing
+  `check-moves`; what another module uses was widened to `pub(crate)` where the compiler asked,
+  308 items, fields and methods.
+- **How the modules see each other**: each opens with `use crate::*;`, and each parent
+  glob-imports its children, so an item is named as it was before the split and the moved code
+  is unchanged. The four older checks keep `pub(crate) mod` lines so `main` still calls them by
+  module.
+- **`check-moves` learned two shapes on the way**, each with tests and controls: an inline
+  module made a file of its own (`mod tests {` becoming `mod tests;`, and its closing brace), and
+  the short tail a widened line splits off a moved block, under git's 20 characters, accepted
+  only where it is the same on both sides within its hunk.
+- **`display.yml` and `input.yml` run on `tools/xtask/src/**`**: on `main.rs` alone, a change to
+  a gate's new module would have run neither gate. A test requires every xtask source to match
+  each filter.

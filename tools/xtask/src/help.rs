@@ -46,7 +46,9 @@ pub(crate) fn print_help() {
            check-comments  fail if new comments exceed 0.15 of new code plus 3, or cite a PR or part;\n  \
            \x20               `--base REF` measures from its merge base (default origin/main)\n  \
            check-size      fail if a Rust file passes 1,000 lines or its baseline entry; `--update`\n  \
-           \x20               lowers stale entries, `--rename OLD NEW` moves one with its file\n  \
+           \x20               lowers stale entries, `--rename OLD NEW` moves one with its file,\n  \
+           \x20               `--split OLD NEW...` moves one onto what the file was split into\n  \
+           check-moves     fail if a commit (default HEAD) changes anything but code it moves\n  \
            check-images    fail if a test image and a release image differ by anything new\n  \
            check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope\n  \
            abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI\n  \

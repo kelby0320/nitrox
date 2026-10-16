@@ -1,0 +1,35 @@
+//! The QEMU gates, a module each: a guest booted and driven, and what it shows checked.
+
+mod display;
+mod fbcon;
+mod input;
+mod install;
+mod interactive;
+mod live;
+mod login;
+mod logout;
+mod media;
+mod recovery;
+mod report;
+mod resolutions;
+mod shutdown;
+mod storage;
+mod terminal;
+mod test_qemu;
+
+pub(crate) use display::*;
+pub(crate) use fbcon::*;
+pub(crate) use input::*;
+pub(crate) use install::*;
+pub(crate) use interactive::*;
+pub(crate) use live::*;
+pub(crate) use login::*;
+pub(crate) use logout::*;
+pub(crate) use media::*;
+pub(crate) use recovery::*;
+pub(crate) use report::*;
+pub(crate) use resolutions::*;
+pub(crate) use shutdown::*;
+pub(crate) use storage::*;
+pub(crate) use terminal::*;
+pub(crate) use test_qemu::*;
