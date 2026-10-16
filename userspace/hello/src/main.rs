@@ -9,10 +9,10 @@
 //!    mapped page (the proof that user PTEs point at the object's frames);
 //! 4. `sys_handle_stat` / `duplicate` / `restrict` / `close` on the memory
 //!    handle — the handle-operation syscalls' first end-to-end ring-3 run;
-//! 4b. `sys_clock_read(Monotonic)` twice — the monotonic clock must advance;
-//! 4c. `sys_timer_create` + `sys_timer_set` (~50 ms) + `sys_wait` — block on a
-//!     timer and wake when it fires; plus a poll (`WouldBlock`) and a pure
-//!     timeout (`TimedOut`) case;
+//!    4b. `sys_clock_read(Monotonic)` twice — the monotonic clock must advance;
+//!    4c. `sys_timer_create` + `sys_timer_set` (~50 ms) + `sys_wait` — block on a
+//!    timer and wake when it fires; plus a poll (`WouldBlock`) and a pure
+//!    timeout (`TimedOut`) case;
 //! 5. `sys_memory_unmap`, then `sys_process_exit`.
 //!
 //! It exists only to demonstrate the kernel can load an ELF, build a process +

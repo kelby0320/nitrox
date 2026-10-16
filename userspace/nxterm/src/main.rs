@@ -416,7 +416,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // A terminal that cannot get one still runs — it draws, it takes input, it just has nobody
     // to talk to. Failing the window instead would turn a tty-server problem into a blank
     // screen, which is the harder thing to diagnose.
-    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     /// A tab's other half: the tty this process is the backend for, and the shell on it.
     ///
     /// **Paired with a `Term` by key**, not by index, for the reason the key exists at all: a tab
@@ -485,8 +484,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         //
         // Destructured rather than dotted through, which is what keeps this loop readable across
         // the conversion: every name below means what it meant when there was one window.
-        for wi in 0..wins.len() {
-            let Win { top, app, backends, bounds, popup, menu_shown, menu_hovered } = &mut wins[wi];
+        for entry in wins.iter_mut() {
+            let Win { top, app, backends, bounds, popup, menu_shown, menu_hovered } = entry;
             let window_id = top.id();
             // ---- render ----
             // **The widget under the pointer, from the router that already knew.** `Router::inside`
@@ -789,9 +788,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         // (`/> whoami`, which never completes until Enter).
                         let now = app.grid().cursor().0;
                         for row in before..now {
-                            report_row(&app, row);
+                            report_row(app, row);
                         }
-                        report_row(&app, now);
+                        report_row(app, now);
                     }
                 }
                 // **Where the shell in this tab says it is**, once per change (desktop refresh,

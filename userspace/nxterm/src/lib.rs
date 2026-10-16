@@ -1339,7 +1339,7 @@ impl App {
         // **The bar is `libui::menu`'s, and so is what hangs off it.** It was one hand-rolled
         // `button` labelled "Terminal"; the word a menu bar carries is not a button, and the
         // popup under it was a second copy of `nxfiles`'s.
-        let bar = libui::menu::bar(&self.menu_table(), &self.menus, MENU_BAR_KEY, hovered, Msg::MenuBar, &ui, BAR_H);
+        let bar = libui::menu::bar(&self.menu_table(), &self.menus, MENU_BAR_KEY, hovered, Msg::MenuBar, ui, BAR_H);
         // **The tab strip, below the menu bar and above the grid** (M14 Part B). Same order as
         // `nxedit` and `nxfiles`, which is the point: a person who learned where the tabs are in
         // one window should not have to look somewhere else in the next.
@@ -1361,7 +1361,7 @@ impl App {
                 Size::new(0, TAB_STRIP_H),
                 libui::element::padding(
                     libui::element::Insets { top: 2, right: 6, bottom: 2, left: 6 },
-                    text_field(f, false, WidgetState { active: true, ..Default::default() }, &ui),
+                    text_field(f, false, WidgetState { active: true, ..Default::default() }, ui),
                 ),
             ),
             None => libui::widget::tab_strip(
@@ -1371,7 +1371,7 @@ impl App {
                 Msg::SelectTab,
                 Msg::CloseTab,
                 libui::widget::TabExtras::new_tab(Msg::NewTab),
-                &ui,
+                ui,
             ),
         };
 
@@ -1403,7 +1403,7 @@ impl App {
                 close: Some(Msg::Close),
             },
             hovered,
-            &ui,
+            ui,
         )
         .key(TITLE_KEY);
         // **The grip sits over the bottom-right corner, not beside it** (M9 Part E). A strip
@@ -1446,7 +1446,7 @@ impl App {
                             // what the pane beside it is filled with: the pane simply looks that
                             // much wider until there is a bar to put there.
                             if self.scroll().scrollable() {
-                                scrollbar(self.scroll(), SCROLL_W, self.track_h(), &ui).on_pointer(Msg::Scroll)
+                                scrollbar(self.scroll(), SCROLL_W, self.track_h(), ui).on_pointer(Msg::Scroll)
                             } else {
                                 libui::element::fill(self.palette.background)
                             },
@@ -1485,10 +1485,10 @@ impl App {
             // scrollbar or the tab strip scrolls the terminal too — which is what a person
             // expects, and what putting it on the grid alone would have made a dead zone of.
             .on_wheel(Msg::Wheel),
-            resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), &ui).key(GRIP_KEY),
+            resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), ui).key(GRIP_KEY),
             self.window,
             self.focused,
-            &ui,
+            ui,
         );
 
         // **The menu is not in this tree.** It used to be a `Stack` layer over the whole
@@ -1570,7 +1570,7 @@ mod tests {
 
     /// A key press, as the compositor delivers one.
     fn press(a: &mut App, keycode: u16, modifiers: u16) {
-        a.update(Msg::Key(KeyEvent::new(1, keycode, KEY_DOWN as u16, modifiers)));
+        a.update(Msg::Key(KeyEvent::new(1, keycode, KEY_DOWN, modifiers)));
     }
 
     #[test]
@@ -2260,7 +2260,7 @@ mod tests {
                 continue;
             };
             checked += 1;
-            let ev = KeyEvent::new(1, acc.key(), KEY_DOWN as u16, acc.mods());
+            let ev = KeyEvent::new(1, acc.key(), KEY_DOWN, acc.mods());
             assert_eq!(
                 libui::menu::accel_match(&table, &ev).as_ref(),
                 Some(msg),
@@ -2297,14 +2297,14 @@ mod tests {
 
         for c in "hello".bytes() {
             let code = (1u16..=90).find(|k| libinput::keymap::to_char(*k, 0) == Some(c)).expect("a keycode");
-            a.update(Msg::Key(KeyEvent::new(1, code, KEY_DOWN as u16, 0)));
+            a.update(Msg::Key(KeyEvent::new(1, code, KEY_DOWN, 0)));
         }
         assert_eq!(a.find.as_ref().map(|f| f.text()), Some("hello"), "the keys went to the field");
 
-        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN as u16, 0)));
+        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN, 0)));
         assert_eq!(a.grid().selected_text().as_deref(), Some("hello"), "Enter selected the match");
 
-        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN as u16, 0)));
+        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN, 0)));
         assert!(a.find.is_none(), "Esc closed it");
     }
 
@@ -2327,9 +2327,9 @@ mod tests {
         a.update(Msg::Find);
         for c in "needle".bytes() {
             let code = (1u16..=90).find(|k| libinput::keymap::to_char(*k, 0) == Some(c)).expect("a keycode");
-            a.update(Msg::Key(KeyEvent::new(1, code, KEY_DOWN as u16, 0)));
+            a.update(Msg::Key(KeyEvent::new(1, code, KEY_DOWN, 0)));
         }
-        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN as u16, 0)));
+        a.update(Msg::Key(KeyEvent::new(1, libkern::abi::KEY_ENTER, KEY_DOWN, 0)));
 
         assert_eq!(a.grid().selected_text().as_deref(), Some("needle"), "it found the match");
         assert_ne!(a.view_line(), a.grid().top_line(), "and scrolled back to show it");
@@ -3043,7 +3043,7 @@ mod tests {
         let theme = UiTheme::default();
         let mut tree = libui::diff::Tree::new();
         let cell = libui::layout::FixedCell { w: 8, h: 16 };
-        let mut check = |a: &mut App, hovered, tree: &mut libui::diff::Tree, what: &str| {
+        let check = |a: &mut App, hovered, tree: &mut libui::diff::Tree, what: &str| {
             let size = a.window_size();
             let e = a.view(&theme, hovered);
             let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &cell);
@@ -3107,7 +3107,7 @@ mod tests {
 
         // The outboxes are separate too: what is typed into one tab must not reach the other's
         // shell. `take_outbox` is drained per tab by the binary, so this checks them by key.
-        a.update(Msg::Key(KeyEvent::new(1, 30, KEY_DOWN as u16, 0))); // `a`
+        a.update(Msg::Key(KeyEvent::new(1, 30, KEY_DOWN, 0))); // `a`
         let outboxes: alloc::vec::Vec<(u64, usize)> =
             a.tabs_mut().iter_mut().map(|t| (t.key(), t.take_outbox().len())).collect();
         assert_eq!(outboxes, alloc::vec![(one, 1), (two, 0)], "only the current tab was typed at");
@@ -3256,7 +3256,7 @@ mod tests {
             a.update(Msg::NewTab);
         }
         assert_eq!(a.tabs().len(), MAX_TABS, "the cap did not hold");
-        assert!(MAX_TABS < libkern::abi::MAX_WAIT_HANDLES, "…and it leaves room for the window");
+        const { assert!(MAX_TABS < libkern::abi::MAX_WAIT_HANDLES, "…and it leaves room for the window") };
         // The refusal is visible: the last one said so in the grid rather than doing nothing.
         assert!((0..a.grid().rows()).any(|r| line(&a, r).contains("no more tabs")), "the refusal was silent");
     }

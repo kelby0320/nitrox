@@ -127,6 +127,7 @@ pub extern "C" fn _start(_notif: u64, _ns: u64, control: u64, _arg0: u64) -> ! {
             }
             // SAFETY: the kernel wrote the count and the handles; none is expected.
             let count = unsafe { (&raw const COUNT).read() }.min(8);
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for k in 0..count {
                 // SAFETY: an installed handle, ours to close.
                 close(unsafe { (&raw const HANDLES[k]).read() });

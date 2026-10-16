@@ -274,7 +274,7 @@ fn held_files(label: &str, ns: u64) -> i64 {
             .s(b"storage-service: ")
             .untrusted(label.as_bytes())
             .s(b" is in use: ")
-            .i(held as i64)
+            .i(held)
             .s(b" file(s) still open or mapped")
             .end();
     }
@@ -459,6 +459,7 @@ impl BlockReader for DeviceIo<'_> {
 
 /// Take `block`: every device the manager queued before the resolve completed, until `Settled`.
 /// `Err` with the reason if the class could not be taken.
+#[allow(clippy::type_complexity, reason = "the pair is returned once and a name for it would only be read here")]
 fn take_block(root_ns: u64) -> Result<(u64, Vec<(DeviceRecord, u64)>), &'static [u8]> {
     let (st, sub) = lookup(root_ns, SUBSCRIPTION, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if st == KError::AlreadyExists.as_i32() as i64 {
@@ -1482,10 +1483,9 @@ impl Service {
         let _ = unsafe { syscall3(SYS_NS_SYNC, x.ns, root.as_ptr() as u64, root.len() as u64) };
         if send(x.control, OP_UNMOUNT, 1, 0, &[], &[])
             && wait_until(x.control, now_ns().saturating_add(READY_TIMEOUT_NS))
+            && let Ok(Some(a)) = recv(x.control)
         {
-            if let Ok(Some(a)) = recv(x.control) {
-                a.handles.iter().for_each(|&h| close(h));
-            }
+            a.handles.iter().for_each(|&h| close(h));
         }
         close(x.ns);
         close(x.control);

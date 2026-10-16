@@ -498,10 +498,12 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
         }
         return None;
     }
-    // SAFETY: single-threaded init; `KEPT` is only ever reached through this raw pointer.
     let kept = Kept { mount_point: m.mount_point.clone(), control: ctrl_init };
-    // SAFETY: as above.
-    unsafe { (*(&raw mut KEPT)).push(kept) };
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
+    // SAFETY: single-threaded init; `KEPT` is only ever reached through this raw pointer.
+    unsafe {
+        (*(&raw mut KEPT)).push(kept)
+    };
 
     Line::new().s(b"init: mounted fs-server-ext4 at ").s(m.mount_point.as_bytes()).end();
     // init keeps `fs_h` (the long-lived server's process handle).
@@ -574,6 +576,7 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
         let len = u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]) as usize;
         (count, len.min(IPC_MSG_LEN - 24))
     };
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: IPC_MSG and IPC_HANDLES are init's own buffers, read after the kernel filled them;
     // single-threaded init writes them again only at its next receive.
     let (msg, handles) = unsafe { (&*(&raw const IPC_MSG), &*(&raw const IPC_HANDLES)) };
@@ -1032,6 +1035,7 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
                     (&raw const IPC_COUNT).read(),
                 )
             };
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for k in 0..handles.min(init::ready::IPC_HANDLE_MAX) {
                 // SAFETY: a handle the kernel installed, which no request carries.
                 unsafe { syscall1(SYS_HANDLE_CLOSE, (&raw const IPC_HANDLES[k]).read()) };
@@ -1079,6 +1083,7 @@ fn finish(root_ns: u64, reboot: bool) {
     } else {
         b"init: finishing the shutdown: its own filesystems, last mounted first\n"
     });
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: single-threaded init; `KEPT` is only ever reached through this raw pointer, and is
     // taken whole so that nothing unmounted is unmounted twice.
     let kept = unsafe { core::mem::take(&mut *(&raw mut KEPT)) };
@@ -1120,6 +1125,7 @@ fn unmount_one(root_ns: u64, m: &Kept) {
     // SAFETY: IPC_MSG is init's own buffer, and nothing else uses it during a shutdown; the
     // request is an envelope and no handles.
     let sent = unsafe {
+        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
         let msg: &mut [u8; IPC_MSG_LEN] = &mut *(&raw mut IPC_MSG);
         let payload = &mut msg[24..];
         match init::unmount::request(payload, 1) {
@@ -1156,6 +1162,7 @@ fn unmount_one(root_ns: u64, m: &Kept) {
         // SAFETY: the kernel wrote the message; its payload is bounded by the header's length.
         let payload = unsafe {
             let len = u32::from_le_bytes([IPC_MSG[4], IPC_MSG[5], IPC_MSG[6], IPC_MSG[7]]) as usize;
+            #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
             let msg: &[u8; IPC_MSG_LEN] = &*(&raw const IPC_MSG);
             &msg[24..24 + len.min(IPC_MSG_LEN - 24)]
         };
@@ -1167,6 +1174,7 @@ fn unmount_one(root_ns: u64, m: &Kept) {
         };
         // SAFETY: handles the kernel installed, which no answer carries.
         unsafe {
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for k in 0..(&raw const IPC_COUNT).read().min(init::ready::IPC_HANDLE_MAX) {
                 syscall1(SYS_HANDLE_CLOSE, (&raw const IPC_HANDLES[k]).read());
             }

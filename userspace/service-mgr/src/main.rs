@@ -418,8 +418,7 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) 
         kprint(b"service-mgr: log endpoint resolve FAIL (spawning without logging)\n");
     }
     Line::new().s(b"service-mgr: starting service '").s(decl.name.as_bytes()).s(b"'").end();
-    // SAFETY: SPAWN_SERVICE is a valid writable arg block. Move the control endpoint into
-    // the child (RECV + WAIT only) at `rdx`. The spawn ABI delivers only one handle to a
+    // The control endpoint moves into the child (RECV + WAIT only) at `rdx`. The spawn ABI delivers only one handle to a
     // register, so the log endpoint is handed over the control channel after spawn (below),
     // mirroring init's device handoff to an fs-server.
     // **Declared authority.** Almost every service declares none; the demo chain declares
@@ -972,6 +971,7 @@ fn recv_request(ch: u64) -> Result<Option<(u16, u64, alloc::vec::Vec<u8>)>, ()> 
         }
         // SAFETY: the kernel wrote the count and the handles it installed.
         let count = unsafe { (&raw const SRV_COUNT).read() }.min(8);
+        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
         for k in 0..count {
             // SAFETY: an installed handle, ours to close.
             close(unsafe { (&raw const SRV_HANDLES[k]).read() });
@@ -1385,9 +1385,9 @@ impl Mgr {
                 d = d.min(until);
             }
         }
-        match self.shutdown.as_ref().map(|s| s.stage) {
-            Some(Stage::Sessions { until } | Stage::Service { until, .. }) => d = d.min(until),
-            _ => {}
+        if let Some(Stage::Sessions { until } | Stage::Service { until, .. }) = self.shutdown.as_ref().map(|s| s.stage)
+        {
+            d = d.min(until)
         }
         for s in &self.svcs {
             if let Phase::Starting { deadline } = s.phase {
@@ -2552,6 +2552,7 @@ fn channel_peer_closed(ch: u64) -> bool {
         }
         // SAFETY: the kernel wrote the count and installed that many handles, ours to close.
         let count = unsafe { (&raw const RDY_COUNT).read() }.min(8);
+        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
         for k in 0..count {
             // SAFETY: a handle the kernel just installed in this process.
             close(unsafe { (&raw const RDY_HANDLES[k]).read() });

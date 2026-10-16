@@ -266,6 +266,7 @@ fn reply_session_handle(serve_end: u64, request_id: u64, client_end: u64) -> boo
 fn free_session(ch: u64) {
     // SAFETY: single-threaded table; closing a handle this process owns.
     unsafe {
+        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
         for i in 0..MAX_SESSIONS {
             if SESSION_CH[i] == ch {
                 SESSION_CH[i] = 0;
@@ -320,6 +321,7 @@ fn serve_copy(ch: u64, request_id: u64, body: &[u8]) {
         refuse(ch, OP_CLIP_COPY, request_id, KError::InvalidArgument.as_i32(), CLIP_ERR_MALFORMED);
         return;
     };
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: single-threaded server; the ring is touched from nowhere else.
     let pushed = unsafe { (*(&raw mut RING)).push(entry.kind, entry.bytes) };
     match pushed {
@@ -348,11 +350,13 @@ fn serve_paste(ch: u64, request_id: u64, body: &[u8]) {
         refuse(ch, OP_CLIP_PASTE, request_id, KError::InvalidArgument.as_i32(), CLIP_ERR_MALFORMED);
         return;
     };
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: single-threaded server; the ring is read here and written only in `serve_copy`.
     let ring = unsafe { &*(&raw const RING) };
     match ring.get(req.index as usize, req.expect) {
         Ok((kind, bytes)) => {
             let entry = ClipEntry { serial: ring.serial(), kind, bytes };
+            #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
             // SAFETY: REPLY_BODY is sized for an entry at the cap, which is the largest this
             // can be, and nothing else is borrowing it.
             let n = unsafe { entry.write(&mut *(&raw mut REPLY_BODY)) };
@@ -360,6 +364,7 @@ fn serve_paste(ch: u64, request_id: u64, body: &[u8]) {
                 refuse(ch, OP_CLIP_PASTE, request_id, KError::KernelError.as_i32(), 0);
                 return;
             };
+            #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
             // SAFETY: `n` bytes were just written; the slice is read-only and not aliased.
             // The reference is spelled out rather than left to autoref — a raw pointer's
             // target has to be valid *and* unaliased for one to exist, and `deny`ing the
@@ -377,6 +382,7 @@ fn serve_paste(ch: u64, request_id: u64, body: &[u8]) {
 /// `Clipboard::List` — the ring's shape, without its contents.
 fn serve_list(ch: u64, request_id: u64) {
     let mut rows = [ClipInfo::default(); CLIP_RING];
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: single-threaded server.
     let ring = unsafe { &*(&raw const RING) };
     let n = ring.list(&mut rows);
@@ -403,6 +409,7 @@ fn serve_loop(serve_end: u64, mut control: u64) -> ! {
                 WAIT_HANDLES[n] = control;
                 n += 1;
             }
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for i in 0..MAX_SESSIONS {
                 if SESSION_CH[i] != 0 {
                     WAIT_HANDLES[n] = SESSION_CH[i];

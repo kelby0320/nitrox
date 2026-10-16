@@ -958,7 +958,7 @@ fn the_watches_keep_the_living_and_free_the_gone() {
     let gone = |e: u64| {
         if e % 10 == 3 {
             Sent::Gone
-        } else if e % 2 == 0 {
+        } else if e.is_multiple_of(2) {
             Sent::Full
         } else {
             Sent::Queued

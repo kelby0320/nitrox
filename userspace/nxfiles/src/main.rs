@@ -460,8 +460,6 @@ fn theme_of(env: &libstream::wire::Record) -> Theme {
 
 /// Entry point.
 ///
-/// # Safety
-///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
@@ -658,7 +656,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         {
             renew_drives(&mut wins, &mut drives, now);
         }
-        for wi in 0..wins.len() {
+        for entry in wins.iter_mut() {
             let Win {
                 top,
                 app,
@@ -673,7 +671,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 reported_prompt,
                 reported_pick,
                 reported_loc,
-            } = &mut wins[wi];
+            } = entry;
             let window_id = top.id();
             // ---- render ----
             // The widget under the pointer, from the router that has always known and that nothing

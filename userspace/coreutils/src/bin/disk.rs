@@ -798,7 +798,9 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
     let scheme = plan.table.map(|(s, ..)| if s == Scheme::Mbr { "mbr" } else { "gpt" });
     let fs_word = fs.map(|f| if f == Fs::Fat { "fat" } else { "ext4" });
     if let Err(why) = wrote {
-        watch.map(close);
+        if let Some(w) = watch {
+            close(w);
+        }
         say(stage, &format!("disk: {name} not {verb}: {why}; what is on it now is unknown\n"));
         return EXIT_FAILURE;
     }
@@ -816,7 +818,9 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
             .map(|n| String::from_utf8_lossy(n).into_owned())
             .collect::<Vec<_>>(),
         Err(f) => {
-            watch.map(close);
+            if let Some(w) = watch {
+                close(w);
+            }
             let why = match f {
                 Failure::NotHere => String::from("this session holds no storage grant: run it as `with admin`"),
                 Failure::Unopened(e) => format!("the storage service opened no admin session ({e:?})"),

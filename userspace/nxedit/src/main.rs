@@ -420,7 +420,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // and the difference is that they are borrowed out of one of several.
         // Set by a window that owes a frame *now* — see the sites that set it.
         let mut redraw_now = false;
-        for wi in 0..wins.len() {
+        for entry in wins.iter_mut() {
             let Win {
                 top,
                 app,
@@ -438,7 +438,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 reported_name,
                 reported_title,
                 reported_tab,
-            } = &mut wins[wi];
+            } = entry;
             let window_id = top.id();
             // **One line per edit, and it carries a count rather than the text.** A gate driving a
             // release image cannot read this window — the pixels are the only echo an editor has —
@@ -933,10 +933,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         // that was confirming and asked the *next* one, which put a dialog on every window at
         // once — the alternative decision 4 explicitly rejected, arrived at by accident (PR #283
         // review, blocking 2).
-        if quit_pending && !wins.iter().any(|w| w.app.confirming()) {
-            if let Some(w) = wins.iter_mut().find(|w| !w.app.closing()) {
-                w.app.update(Msg::Close);
-            }
+        if quit_pending
+            && !wins.iter().any(|w| w.app.confirming())
+            && let Some(w) = wins.iter_mut().find(|w| !w.app.closing())
+        {
+            w.app.update(Msg::Close);
         }
 
         // **A window that has finished closing goes**, and the last one takes the process.

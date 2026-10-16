@@ -1132,6 +1132,7 @@ pub mod watch {
         /// **Take a new watch's end.** With the list full, every watcher is pinged first, freeing
         /// the gone; `Err` if it is full still, and the caller refuses the watch. The ends of the
         /// gone, for the caller to close.
+        #[allow(clippy::result_unit_err, reason = "the only error is a watch list that is still full")]
         pub fn add(&mut self, end: u64, ping: impl FnMut(u64) -> Sent) -> Result<Vec<u64>, ()> {
             let gone = if self.ends.len() >= MAX_WATCHES { self.changed(ping) } else { Vec::new() };
             if self.ends.len() >= MAX_WATCHES {

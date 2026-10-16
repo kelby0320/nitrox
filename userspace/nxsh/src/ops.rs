@@ -293,7 +293,7 @@ pub fn dedupe(v: &Val) -> OpResult<Val> {
     let r = rows(v)?;
     let mut seen: Vec<Val> = Vec::new();
     for row in r {
-        if !seen.iter().any(|s| *s == row) {
+        if !seen.contains(&row) {
             seen.push(row);
         }
     }
@@ -612,7 +612,7 @@ fn key_of(row: &Val, field: Option<&str>, op: &str) -> OpResult<Value> {
                 .schema
                 .fields
                 .iter()
-                .position(|d| &d.name == f)
+                .position(|d| d.name == f)
                 .ok_or_else(|| alloc::format!("no field `{f}` — this row has [{}]", field_names(&rec.schema)))?;
             Ok(rec.values.get(idx).cloned().unwrap_or(Value::Null))
         }

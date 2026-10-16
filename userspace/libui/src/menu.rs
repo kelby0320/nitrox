@@ -671,6 +671,7 @@ mod tests {
     ///
     /// Each text in the popup, with the innermost ink wrapped round it — or `None` for the
     /// theme's foreground — and the popup's washes.
+    #[allow(clippy::type_complexity, reason = "a one-off pair of lists in a test helper")]
     fn inks_and_washes(e: &Element<u8>) -> (Vec<(String, Option<Rgb>)>, Vec<(Rgb, u8)>) {
         fn walk(
             e: &Element<u8>,

@@ -226,6 +226,25 @@ pub fn parse_resolve_reply(body: &[u8]) -> Option<ResolveReply> {
     Some(ResolveReply { object_kind: get_u16(body, 0), content_len: get_u32(body, 4) })
 }
 
+/// The destination suffix + flags a [`RESOLVE_RENAME`] request carries after its primary
+/// suffix: `dest_len: u16`, `flags: u16`, then `dest_len` bytes.
+///
+/// Laid out after the suffix for the same reason the size-changing resolves put `new_size`
+/// there — the fixed prefix stays one shape for every resolve, and only the tail varies.
+pub fn parse_resolve_rename(body: &[u8]) -> Option<(&[u8], u16)> {
+    let r = parse_resolve_request(body)?;
+    let tail = RESOLVE_REQUEST_PREFIX_LEN + r.suffix.len();
+    if body.len() < tail + 4 {
+        return None;
+    }
+    let dest_len = u16::from_le_bytes([body[tail], body[tail + 1]]) as usize;
+    let flags = u16::from_le_bytes([body[tail + 2], body[tail + 3]]);
+    if body.len() < tail + 4 + dest_len {
+        return None;
+    }
+    Some((&body[tail + 4..tail + 4 + dest_len], flags))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,23 +312,4 @@ mod tests {
         assert!(parse_resolve_request(&buf).is_none());
         assert!(parse_resolve_reply(&[0u8; 4]).is_none());
     }
-}
-
-/// The destination suffix + flags a [`RESOLVE_RENAME`] request carries after its primary
-/// suffix: `dest_len: u16`, `flags: u16`, then `dest_len` bytes.
-///
-/// Laid out after the suffix for the same reason the size-changing resolves put `new_size`
-/// there — the fixed prefix stays one shape for every resolve, and only the tail varies.
-pub fn parse_resolve_rename(body: &[u8]) -> Option<(&[u8], u16)> {
-    let r = parse_resolve_request(body)?;
-    let tail = RESOLVE_REQUEST_PREFIX_LEN + r.suffix.len();
-    if body.len() < tail + 4 {
-        return None;
-    }
-    let dest_len = u16::from_le_bytes([body[tail], body[tail + 1]]) as usize;
-    let flags = u16::from_le_bytes([body[tail + 2], body[tail + 3]]);
-    if body.len() < tail + 4 + dest_len {
-        return None;
-    }
-    Some((&body[tail + 4..tail + 4 + dest_len], flags))
 }

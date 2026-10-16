@@ -163,6 +163,7 @@ fn fp_gate() -> bool {
     const LANES: usize = 8;
     let mut v = [0f64; LANES];
     let mut expect_sq: u64 = 0;
+    #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
     for k in 0..LANES {
         let n = 1024 + k as u64;
         v[k] = n as f64;
@@ -2612,10 +2613,8 @@ fn devices_test(root_ns: u64) -> bool {
     let minted = forward(2, b"info-endpoint");
     let listing = forward(3, b"info");
     close(endpoint);
-    for m in [&block, &minted, &listing] {
-        if let Some(m) = m {
-            m.handles.iter().for_each(|&h| close(h));
-        }
+    for m in [&block, &minted, &listing].into_iter().flatten() {
+        m.handles.iter().for_each(|&h| close(h));
     }
     if !refused(&block) {
         return fail(b"the info-only endpoint answered `block` as something other than NotFound");
@@ -3201,7 +3200,7 @@ fn long_listing_test(root_ns: u64) -> bool {
 ///    partition's node, held across it** (PR #369 review): read through before, a `Rescan` sent to it
 ///    refused `Unsupported` by its window, and refused `PeerClosed` after, its window retired.
 /// 10. **Every other disk answers a `Rescan` `Unsupported`**: the SATA disk's node and the scratch
-///    RAM disk's, sent one directly; and the scratch disk, unmounted, refused a `Reread` for it.
+///     RAM disk's, sent one directly; and the scratch disk, unmounted, refused a `Reread` for it.
 fn storage_admin_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_FILE_CREATE, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::storage::{
@@ -3649,8 +3648,12 @@ fn storage_admin_test(root_ns: u64) -> bool {
 /// completion carried, or the submit's own refusal. A page is made for the data of a read or a
 /// write of `length` bytes at `offset`; a `Rescan` or a `Flush` names none.
 fn block_op(dev: u64, opcode: u32, offset: u64, length: u64) -> i64 {
-    // SAFETY: register-only syscall.
-    let page = if length > 0 { unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) } } else { 0 };
+    let page = if length > 0 {
+        // SAFETY: register-only syscall.
+        unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) }
+    } else {
+        0
+    };
     if page < 0 {
         return page;
     }

@@ -220,7 +220,7 @@ pub fn place(image: &[u8], image_geom: Geometry, plan: Fit, ground: Rgb, dst: &m
     let word = dst_geom.format.encode(ground).to_le_bytes();
     for y in 0..dst_geom.height as usize {
         let row = &mut dst[y * dst_geom.pitch..y * dst_geom.pitch + dst_geom.width as usize * 4];
-        for px in row.chunks_exact_mut(4) {
+        for px in row.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&word);
         }
     }
@@ -279,7 +279,7 @@ mod tests {
         let g = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::XRGB8888).unwrap();
         let word = g.format.encode(c).to_le_bytes();
         let mut v = alloc::vec![0u8; g.pitch * h as usize];
-        for px in v.chunks_exact_mut(4) {
+        for px in v.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&word);
         }
         (v, g)

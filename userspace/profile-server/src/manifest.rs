@@ -61,14 +61,14 @@ pub fn parse(text: &str) -> Vec<Package> {
             if let Some(p) = cur.take() {
                 packages.push(p);
             }
-        } else if let Some((key, value)) = key_string(line) {
-            if let Some(p) = cur.as_mut() {
-                match key {
-                    "name" => p.name = String::from(value),
-                    "version" => p.version = String::from(value),
-                    "path" => p.path = String::from(value),
-                    _ => {}
-                }
+        } else if let Some((key, value)) = key_string(line)
+            && let Some(p) = cur.as_mut()
+        {
+            match key {
+                "name" => p.name = String::from(value),
+                "version" => p.version = String::from(value),
+                "path" => p.path = String::from(value),
+                _ => {}
             }
         }
     }

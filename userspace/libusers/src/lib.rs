@@ -374,7 +374,7 @@ fn parse_u32(s: &[u8]) -> Option<u32> {
 
 /// Hex into `out`; the byte count. `None` on an odd length, a non-hex digit, or too little room.
 fn hex_decode(hex: &[u8], out: &mut [u8]) -> Option<usize> {
-    if hex.len() % 2 != 0 || hex.len() / 2 > out.len() {
+    if !hex.len().is_multiple_of(2) || hex.len() / 2 > out.len() {
         return None;
     }
     let nibble = |c: u8| match c {
@@ -383,7 +383,7 @@ fn hex_decode(hex: &[u8], out: &mut [u8]) -> Option<usize> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     };
-    for (i, pair) in hex.chunks_exact(2).enumerate() {
+    for (i, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         out[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Some(hex.len() / 2)

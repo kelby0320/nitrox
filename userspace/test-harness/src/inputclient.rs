@@ -333,7 +333,7 @@ impl Stream {
             let n = m.body.len() / EVENT_LEN;
             let mut done = false;
             for i in 0..n {
-                let Some(ev) = InputEvent::read(&m.body[i * EVENT_LEN..]) else { return None };
+                let ev = InputEvent::read(&m.body[i * EVENT_LEN..])?;
                 if ev.kind == libkern::abi::EV_KEY && ev.code == DONE_CODE && ev.value == 1 {
                     done = true;
                 }
@@ -357,8 +357,6 @@ impl Stream {
     }
 }
 
-/// # Safety
-///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments; `root_ns` is this
 /// process's root namespace.
 #[unsafe(no_mangle)]

@@ -473,8 +473,11 @@ mod tests {
         assert!(!p.is_null());
         assert_eq!(p as usize % 8, 0);
         // Writable through its whole extent.
+        // SAFETY: `p` is a live 24-byte allocation from `alloc` above, referenced by nothing else.
         unsafe { core::ptr::write_bytes(p, 0xAB, 24) };
+        // SAFETY: `p` is live and its first byte was just written.
         assert_eq!(unsafe { *p }, 0xAB);
+        // SAFETY: `p` came from `e.alloc(l)` with this `l` and is freed only here.
         unsafe { e.dealloc(p, l) };
     }
 
@@ -486,6 +489,7 @@ mod tests {
             let l = Layout::from_size_align(sz, 1).unwrap();
             let p = e.alloc(l);
             assert!(!p.is_null());
+            // SAFETY: `p` came from `e.alloc(l)` in this loop, with this `l`, and is freed only here.
             unsafe { e.dealloc(p, l) };
         }
     }
@@ -495,9 +499,11 @@ mod tests {
         let e = engine();
         let l = Layout::from_size_align(40, 8).unwrap(); // 64-byte class
         let a = e.alloc(l);
+        // SAFETY: `a` came from `e.alloc(l)` with this `l` and is freed only here.
         unsafe { e.dealloc(a, l) };
         let b = e.alloc(l);
         assert_eq!(a, b, "LIFO freelist should hand back the just-freed slot");
+        // SAFETY: `b` came from `e.alloc(l)` with this `l` and is freed only here.
         unsafe { e.dealloc(b, l) };
     }
 
@@ -509,6 +515,7 @@ mod tests {
         let p = e.alloc(l);
         assert!(!p.is_null());
         assert_eq!(p as usize % 64, 0);
+        // SAFETY: `p` came from `e.alloc(l)` with this `l` and is freed only here.
         unsafe { e.dealloc(p, l) };
     }
 
@@ -523,13 +530,16 @@ mod tests {
             let p = e.alloc(l);
             assert!(!p.is_null(), "alloc {i} failed");
             // Stamp a unique byte at the slot start; overlap would corrupt a neighbor.
+            // SAFETY: `p` is non-null (asserted above) and points at the start of a live 2048-byte slot.
             unsafe { *p = (i & 0xFF) as u8 };
             ptrs.push(p);
         }
         for (i, &p) in ptrs.iter().enumerate() {
+            // SAFETY: `p` is a slot from the allocations above, live until the free loop below.
             assert_eq!(unsafe { *p }, (i & 0xFF) as u8, "slot {i} overlapped/corrupted");
         }
         for &p in &ptrs {
+            // SAFETY: `p` came from `e.alloc(l)` above, with this `l`, and is freed only here.
             unsafe { e.dealloc(p, l) };
         }
     }
@@ -541,8 +551,11 @@ mod tests {
         let p = e.alloc(l);
         assert!(!p.is_null());
         assert_eq!(p as usize % 8, 0);
+        // SAFETY: `p` is a live 5000-byte allocation, and the write stays within it.
         unsafe { core::ptr::write_bytes(p, 0xCD, 5000) };
+        // SAFETY: byte 4999 is the last byte of the live 5000-byte allocation.
         assert_eq!(unsafe { *p.add(4999) }, 0xCD);
+        // SAFETY: `p` came from `e.alloc(l)` with this `l` and is freed only here.
         unsafe { e.dealloc(p, l) }; // must unmap without crashing
     }
 
@@ -553,6 +566,7 @@ mod tests {
         let p = e.alloc(l);
         assert!(!p.is_null());
         assert_eq!(p as usize % PAGE_SIZE, 0);
+        // SAFETY: `p` came from `e.alloc(l)` with this `l` and is freed only here.
         unsafe { e.dealloc(p, l) };
     }
 
@@ -563,6 +577,7 @@ mod tests {
         let a = e.alloc(l);
         let b = e.alloc(l);
         assert!(!a.is_null() && !b.is_null());
+        // SAFETY: `a` and `b` are distinct live 3000-byte allocations, written and read within their extents, and each is freed once.
         unsafe {
             core::ptr::write_bytes(a, 0x11, 3000);
             core::ptr::write_bytes(b, 0x22, 3000);

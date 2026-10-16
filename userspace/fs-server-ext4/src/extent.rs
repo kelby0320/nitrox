@@ -1365,8 +1365,8 @@ mod tests {
     /// inode, was lost, among them.
     #[test]
     fn a_truncate_or_a_release_stopped_at_any_write_leaves_no_inode_mapping_what_it_freed() {
-        let models: [(&str, fn(Vec<u8>, u64) -> Failing); 2] =
-            [("refused from", Failing::after), ("lost", Failing::once)];
+        type Model = (&'static str, fn(Vec<u8>, u64) -> Failing);
+        let models: [Model; 2] = [("refused from", Failing::after), ("lost", Failing::once)];
         // Four extents in the inode, cut inside it; twelve in a leaf, cut inside the leaf and to
         // three, which fold into the inode.
         for (blocks, keeps) in [(4u64, &[1u64][..]), (12, &[5, 3])] {

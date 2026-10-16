@@ -404,10 +404,8 @@ fn dir_lookup<R: BlockReader>(r: &R, sb: &Superblock, dir: &[u8; 256], name: &[u
             if rec_len < 8 || off + rec_len > bs {
                 break; // malformed / end of block
             }
-            if e_ino != 0 && name_len > 0 && off + 8 + name_len <= bs {
-                if &buf[off + 8..off + 8 + name_len] == name {
-                    return Ok(e_ino);
-                }
+            if e_ino != 0 && name_len > 0 && off + 8 + name_len <= bs && &buf[off + 8..off + 8 + name_len] == name {
+                return Ok(e_ino);
             }
             off += rec_len;
         }
@@ -1121,22 +1119,22 @@ fn grow_blocks<RW: BlockReader + BlockWriter>(
             got = Extent::written(got.lblock + joins, got.phys + joins, got.len - joins);
         }
         if got.len > 0 {
-            if let Some(r) = run {
-                if let Err(e) = extent::append(rw, sb, inode, r) {
-                    give_back(&[run, Some(got)]);
-                    return Err(e);
-                }
+            if let Some(r) = run
+                && let Err(e) = extent::append(rw, sb, inode, r)
+            {
+                give_back(&[run, Some(got)]);
+                return Err(e);
             }
             run = Some(got);
         }
         lb += len;
         goal = phys + len;
     }
-    if let Some(r) = run {
-        if let Err(e) = extent::append(rw, sb, inode, r) {
-            give_back(&[run]);
-            return Err(e);
-        }
+    if let Some(r) = run
+        && let Err(e) = extent::append(rw, sb, inode, r)
+    {
+        give_back(&[run]);
+        return Err(e);
     }
     Ok(())
 }
@@ -1219,6 +1217,10 @@ fn alloc_inode<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock) -> Resul
 /// is allocated *between* the directory's growth blocks, so every directory block is an extent
 /// of its own. Until the extent tree ([`crate::extent`]) the inode's four were all a directory
 /// had — about 815 files with data, or 814 subdirectories, on 4 KiB blocks.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the directory's inode, the new entry's name, inode and type are separate inputs of one insert"
+)]
 fn dir_insert<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,

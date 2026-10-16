@@ -976,16 +976,16 @@ fn preflight_accel(accel: Accel) -> R<()> {
             }
         }
         Accel::Tcg => {
-            if let Some((major, minor)) = qemu_version() {
-                if major < 9 {
-                    return Err(format!(
-                        "QEMU {major}.{minor} is too old: TCG only emulates x2APIC from 9.0, \
+            if let Some((major, minor)) = qemu_version()
+                && major < 9
+            {
+                return Err(format!(
+                    "QEMU {major}.{minor} is too old: TCG only emulates x2APIC from 9.0, \
                          and this kernel is x2APIC-only (decision log 2026-06-26), so the \
                          guest would panic with \"CPU lacks x2APIC\". Use `--kvm` (needs \
                          /dev/kvm) or install QEMU >= 9.0."
-                    )
-                    .into());
-                }
+                )
+                .into());
             }
         }
     }
@@ -3213,7 +3213,7 @@ fn parse_popup_line(rest: &str) -> Option<(u32, i32, i32, u32, u32)> {
 /// stopped drawing where it says, which is what M11 decision 2 is about.
 fn parse_overview_line(rest: &str) -> Option<i32> {
     let (_, tail) = rest.split_once(" of ")?;
-    tail.trim().split_whitespace().next()?.parse().ok()
+    tail.split_whitespace().next()?.parse().ok()
 }
 
 /// Read `desktop-shell: window N geometry X,Y WxH` — the shell's own report of where a window is.
@@ -3450,7 +3450,7 @@ fn push_num(into: &mut Vec<u64>, s: &str) {
 }
 
 /// The median, or 0 for no samples.
-fn median(v: &mut Vec<u64>) -> u64 {
+fn median(v: &mut [u64]) -> u64 {
     percentile(v, 50)
 }
 
@@ -3816,10 +3816,11 @@ fn check_installed_root(disk: &Path, work: &Path) -> R<()> {
         // to leave group 0, which is what this assertion exists for; `Unsupported` is the
         // inline extent header running out of its four entries, which is a different deferral
         // and would be the wrong diagnosis to print here (PR #310 review).
-        fs_server_ext4::FsError::Unsupported => format!(
+        fs_server_ext4::FsError::Unsupported => {
             "growing past group 0 needed a deeper extent tree than the four inline entries \
              hold — that is the extent-splitting deferral, not the allocator"
-        ),
+                .to_string()
+        }
         other => format!(
             "grow past group 0 failed: {other:?} — the allocator did not leave the first \
              group, which is what H.2's first box is"
@@ -4601,7 +4602,7 @@ fn fat32_stick(path: &Path, work: &Path) -> R<()> {
     let fat_sectors = u32::from_le_bytes([boot[36], boot[37], boot[38], boot[39]]) as u64;
     let data = 2048 + reserved + boot[16] as u64 * fat_sectors;
     let clusters = (count as u64 + 2048 - data) / boot[13] as u64;
-    if data % 8 == 0 || boot[13] != 8 || clusters < 65_525 {
+    if data.is_multiple_of(8) || boot[13] != 8 || clusters < 65_525 {
         return Err(format!(
             "the FAT stick's data region is at sector {data} with {} sectors a cluster and {clusters} \
              clusters: the gate needs FAT32 by count, 4 KiB clusters, and data off a 4 KiB boundary",
@@ -7071,10 +7072,10 @@ fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
         if !frame.is_console() && frame.text_cells == 0 {
             break;
         }
-        if let Some((index, of)) = frame.rows.last().and_then(|r| r.as_deref()).and_then(report_prompt) {
-            if index > n {
-                return Err(format!("page {index}/{of} came up after the last page's key").into());
-            }
+        if let Some((index, of)) = frame.rows.last().and_then(|r| r.as_deref()).and_then(report_prompt)
+            && index > n
+        {
+            return Err(format!("page {index}/{of} came up after the last page's key").into());
         }
         if std::time::Instant::now() > deadline {
             return Err(format!(
@@ -7146,7 +7147,7 @@ fn cmd_check_resolutions(accel: Accel) -> R<()> {
                     // has the screen, and on a large one that can be before the chain is done. A
                     // failure is one of these lines followed by nothing, in a boot that ran long
                     // enough — `check-terminal`'s does — so the last line is what to read.
-                    let last = transcript.lines().filter(|l| l.starts_with("test-harness:")).last();
+                    let last = transcript.lines().rfind(|l| l.starts_with("test-harness:"));
                     notes.push(format!(
                         "demo chain unfinished when the boot ended — last: {}",
                         last.unwrap_or("?").trim()
@@ -10917,7 +10918,7 @@ fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<String> {
             // both arrived — the loss was in `libui`, which dropped the gesture when a repaint
             // between the halves re-identified the widget under the pointer. Fixed 2026-09-04;
             // the logging stays, because it is what turned a guess into an answer.
-            return Ok(session.rest_of_line()?);
+            return session.rest_of_line();
         }
         // It did not land where it was aimed, so where it *is* is no longer known.
         qmp.pointer = None;
@@ -13018,7 +13019,8 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     };
     let mut miss = [0usize; 3];
     let mut compared = [0usize; 3];
-    let mut firsts: [Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))>; 3] = [None; 3];
+    type FirstMiss = (u32, u32, (u8, u8, u8), (u8, u8, u8));
+    let mut firsts: [Option<FirstMiss>; 3] = [None; 3];
     if w >= uw && h >= uh {
         for y in 0..uh {
             for x in 0..uw {
@@ -13052,12 +13054,14 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
     // **Only when the static comparison already passed.** A switched screen means nothing if
     // the unswitched one was wrong, and running it anyway would report the second failure while
     // hiding the first.
-    if mismatches == 0 && term_mismatches == 0 && ui_mismatches == 0 {
-        if let Err(e) = desktop_round_trip(&mut qmp, &mut session, &work, w, sw, sh, &composed, radius) {
-            let _ = session.child.kill();
-            let _ = fs::remove_file(&qmp_sock);
-            return Err(e);
-        }
+    if mismatches == 0
+        && term_mismatches == 0
+        && ui_mismatches == 0
+        && let Err(e) = desktop_round_trip(&mut qmp, &mut session, &work, w, sw, sh, &composed, radius)
+    {
+        let _ = session.child.kill();
+        let _ = fs::remove_file(&qmp_sock);
+        return Err(e);
     }
 
     // **And `boot-probe` passed on this machine** (PR #358 review): read now, judged after the
@@ -13131,6 +13135,10 @@ fn cmd_check_display(accel: Accel, size: DisplaySize) -> R<()> {
 /// The round trip is deliberately both ways. A one-way check passes for a compositor that
 /// filtered a window out permanently, or dropped its buffer on the way — the scene coming *back*
 /// with no further commit is what says a desktop switch is a filter changing its mind.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the screen and scene geometry are separate scalars the caller already holds"
+)]
 fn desktop_round_trip(
     qmp: &mut Qmp,
     session: &mut Session,
@@ -13253,7 +13261,7 @@ fn desktop_round_trip(
 /// row 10. The count lets the caller stop at the last complete line and read the rest next time.
 fn last_receipt(fresh: &str, prefix: &str) -> (Option<String>, usize) {
     let whole = fresh.rfind('\n').map_or(0, |i| i + 1);
-    let line = fresh[..whole].lines().filter(|l| l.contains(prefix)).last();
+    let line = fresh[..whole].lines().rfind(|l| l.contains(prefix));
     let rest = line.map(|l| l[l.find(prefix).map_or(0, |i| i + prefix.len())..].trim().to_string());
     (rest, whole)
 }
@@ -15463,12 +15471,11 @@ fn check_login_chain(transcript: &[u8]) -> R<()> {
 fn cmd_fetch_limine() -> R<PathBuf> {
     let dir = limine_dir();
     let marker = dir.join(".version");
-    if marker.exists() {
-        if let Ok(v) = fs::read_to_string(&marker) {
-            if v.trim() == LIMINE_VERSION {
-                return Ok(dir);
-            }
-        }
+    if marker.exists()
+        && let Ok(v) = fs::read_to_string(&marker)
+        && v.trim() == LIMINE_VERSION
+    {
+        return Ok(dir);
     }
 
     if dir.exists() {
@@ -17217,7 +17224,7 @@ fn cmd_check_irq_scope() -> R<()> {
             // for the same reason: a doc comment quoting an operand is prose, not code.
             // Whitespace is normalised first so `dispatch=sym` cannot slip past the
             // convention by omitting the spaces.
-            let normalised = line.replace("=sym", "= sym").replace("= sym", "= sym");
+            let normalised = line.replace("=sym", "= sym");
             if !trimmed.starts_with("//")
                 && !trimmed.starts_with("*")
                 && let Some(before) = normalised.split("= sym").next()
@@ -17425,7 +17432,7 @@ fn visit_rs_files_skipping(dir: &Path, skip: &[&str], f: &mut dyn FnMut(&Path) -
                 continue;
             }
             visit_rs_files_skipping(&path, skip, f)?;
-        } else if path.extension().map_or(false, |e| e == "rs") {
+        } else if path.extension().is_some_and(|e| e == "rs") {
             f(&path)?;
         }
     }
@@ -17437,7 +17444,7 @@ fn visit_rs_files(dir: &Path, f: &mut dyn FnMut(&Path) -> R<()>) -> R<()> {
         let path = entry?.path();
         if path.is_dir() {
             visit_rs_files(&path, f)?;
-        } else if path.extension().map_or(false, |e| e == "rs") {
+        } else if path.extension().is_some_and(|e| e == "rs") {
             f(&path)?;
         }
     }
@@ -17942,11 +17949,11 @@ fn cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
     }
     out.extend_from_slice(name.as_bytes());
     out.push(0);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
     out.extend_from_slice(data);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }
@@ -18099,12 +18106,10 @@ fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
     // the initramfs a release boots, so the boot path under test is the boot path that ships.
     // Until 2026-08-11 a test image's was 680 KB against a release's 323 KB, and both carried
     // programs with no bootstrap role at all.
-    let mut ino = 2u32;
-    for (name, _why) in INITRAMFS_PROGRAMS {
+    for (ino, (name, _why)) in (2u32..).zip(INITRAMFS_PROGRAMS.iter()) {
         let elf = userspace_bin_path(name);
         let bytes = fs::read(&elf).map_err(|e| format!("read {name} ELF {}: {e}", elf.display()))?;
         cpio_entry(&mut buf, ino, &format!("sbin/{name}"), &bytes);
-        ino += 1;
     }
     cpio_entry(&mut buf, 0, "TRAILER!!!", b"");
     // The tripwire. Checked before the write so a build that trips it does not leave an image
@@ -19263,7 +19268,7 @@ mod tests {
             if ty.trim() != "u32" {
                 continue;
             }
-            if let Some(v) = val.trim().trim_end_matches(';').parse::<u32>().ok() {
+            if let Ok(v) = val.trim().trim_end_matches(';').parse::<u32>() {
                 found.push((name.trim().to_string(), v));
             }
         }

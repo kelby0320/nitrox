@@ -398,11 +398,11 @@ fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
             esp = Some(d);
             continue;
         }
-        if let Ok(t) = table::read(&front) {
-            if let Some(p) = t.by_name(SOURCE_LABEL) {
-                root = Some(d);
-                root_extent = (p.first_lba, p.blocks());
-            }
+        if let Ok(t) = table::read(&front)
+            && let Some(p) = t.by_name(SOURCE_LABEL)
+        {
+            root = Some(d);
+            root_extent = (p.first_lba, p.blocks());
         }
     }
     match (esp, root) {
@@ -421,6 +421,10 @@ fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
 }
 
 /// Copy `blocks` blocks from `src` at `src_at` to `dst` at `dst_at`, reporting progress.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the two devices, offsets and the progress hook are separate inputs of one copy"
+)]
 fn copy(
     io: &Io,
     src: &Device,
@@ -515,6 +519,7 @@ fn install(
         human(esp_bytes),
         human(layout.root_blocks() * block)
     ));
+    #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: single-threaded program; these statics have no other reader.
     let (front, back) = unsafe { (&mut *(&raw mut FRONT), &mut *(&raw mut BACK)) };
     table::build(target.info.block_count, disk_guid, &layout.partitions(esp_guid, root_guid), front, back)
@@ -1065,6 +1070,7 @@ static mut PANIC_MSG: [u8; 4096] = [0; 4096];
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // SAFETY: single-threaded, and nothing runs after this.
     unsafe {
+        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
         let buf = &mut *(&raw mut PANIC_MSG);
         let mut n = 0usize;
         let mut put = |bytes: &[u8], n: &mut usize| {
@@ -1108,6 +1114,7 @@ fn raw_send(channel: u64, payload: &[u8]) {
     const OFF_PAYLOAD: usize = 24;
     // SAFETY: single-threaded; this static is used by nothing else.
     unsafe {
+        #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
         let msg = &mut *(&raw mut RAW_MSG);
         let n = payload.len().min(msg.len() - OFF_PAYLOAD);
         msg[..OFF_PAYLOAD].fill(0);

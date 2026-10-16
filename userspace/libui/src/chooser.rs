@@ -301,7 +301,7 @@ mod tests {
     const SEEDED: &str = "a-name-no-row-has.txt";
 
     /// The element carrying `key`, if the tree has one.
-    fn find<'a, M>(e: &'a Element<M>, key: u64) -> Option<&'a Element<M>> {
+    fn find<M>(e: &Element<M>, key: u64) -> Option<&Element<M>> {
         if e.key == Some(key) {
             return Some(e);
         }
@@ -450,10 +450,10 @@ mod tests {
     /// the key is on the `padding` that wraps it, and the padding takes the whole flex cell
     /// whether or not the text inside it moved.
     fn text_rect<M>(e: &Element<M>, l: &Layout, want: &str) -> Option<Rect> {
-        if let crate::element::Node::Text(t) = &e.node {
-            if t == want {
-                return Some(l.rect);
-            }
+        if let crate::element::Node::Text(t) = &e.node
+            && t == want
+        {
+            return Some(l.rect);
         }
         e.children().zip(l.children.iter()).find_map(|(c, cl)| text_rect(c, cl, want))
     }

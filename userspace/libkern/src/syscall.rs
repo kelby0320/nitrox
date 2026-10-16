@@ -174,42 +174,66 @@ pub unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
     ret
 }
 
-/// Zero-argument syscall. # Safety: see [`syscall6`].
+/// Zero-argument syscall.
+///
+/// # Safety
+///
+/// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall0(nr: u64) -> i64 {
     // SAFETY: delegates to `syscall6` with zeroed unused argument registers.
     unsafe { syscall6(nr, 0, 0, 0, 0, 0, 0) }
 }
 
-/// One-argument syscall. # Safety: see [`syscall6`].
+/// One-argument syscall.
+///
+/// # Safety
+///
+/// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
     // SAFETY: delegates to `syscall6` with zeroed unused argument registers.
     unsafe { syscall6(nr, a0, 0, 0, 0, 0, 0) }
 }
 
-/// Two-argument syscall. # Safety: see [`syscall6`].
+/// Two-argument syscall.
+///
+/// # Safety
+///
+/// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
     // SAFETY: delegates to `syscall6` with zeroed unused argument registers.
     unsafe { syscall6(nr, a0, a1, 0, 0, 0, 0) }
 }
 
-/// Three-argument syscall. # Safety: see [`syscall6`].
+/// Three-argument syscall.
+///
+/// # Safety
+///
+/// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     // SAFETY: delegates to `syscall6` with zeroed unused argument registers.
     unsafe { syscall6(nr, a0, a1, a2, 0, 0, 0) }
 }
 
-/// Four-argument syscall. # Safety: see [`syscall6`].
+/// Four-argument syscall.
+///
+/// # Safety
+///
+/// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     // SAFETY: delegates to `syscall6` with zeroed unused argument registers.
     unsafe { syscall6(nr, a0, a1, a2, a3, 0, 0) }
 }
 
-/// Five-argument syscall. # Safety: see [`syscall6`].
+/// Five-argument syscall.
+///
+/// # Safety
+///
+/// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
     // SAFETY: delegates to `syscall6` with zeroed unused argument registers.

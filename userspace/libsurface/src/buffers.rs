@@ -97,9 +97,7 @@ impl BufferPool {
     ) -> Option<Self> {
         let mut pool = BufferPool { maps: Vec::new(), size, format };
         for id in 0..count as u32 {
-            if pool.install(window, id, size).is_none() {
-                return None;
-            }
+            pool.install(window, id, size)?;
         }
         Some(pool)
     }

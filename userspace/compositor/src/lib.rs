@@ -2162,7 +2162,7 @@ mod tests {
         s.create(&CreateWindowRequest::new(32, 4, Role::Panel { dock: Edge::Top, reserve: 4 })).unwrap();
         // The panel is topmost, but must not take focus.
         assert_eq!(s.focus_candidate(), Some(b));
-        s.raise(a).unwrap();
+        assert!(!s.raise(a).unwrap().rect().is_empty());
         assert_eq!(s.focus_candidate(), Some(a));
     }
 
@@ -2251,9 +2251,9 @@ mod tests {
         let ids: Vec<u32> = (0..3).map(|_| s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap()).collect();
         assert_eq!(order(&s), ids, "creation order is bottom-first");
 
-        s.lower(ids[2]).unwrap();
+        assert!(!s.lower(ids[2]).unwrap().rect().is_empty());
         assert_eq!(order(&s), [ids[2], ids[0], ids[1]]);
-        s.raise(ids[2]).unwrap();
+        assert!(!s.raise(ids[2]).unwrap().rect().is_empty());
         assert_eq!(order(&s), [ids[0], ids[1], ids[2]]);
         assert_eq!(s.lower(99), Err(StackError::NoSuchWindow));
     }
@@ -2268,18 +2268,18 @@ mod tests {
 
         // Move the bottom window to just above the second — the case where removing it shifts
         // the target's index, which an index captured before the removal gets wrong by one.
-        s.raise_above(ids[0], ids[1]).unwrap();
+        assert!(!s.raise_above(ids[0], ids[1]).unwrap().rect().is_empty());
         assert_eq!(order(&s), [ids[1], ids[0], ids[2], ids[3]]);
 
         // And downward, where no such shift happens: the two directions are different code
         // paths through the same two lines.
-        s.raise_above(ids[3], ids[1]).unwrap();
+        assert!(!s.raise_above(ids[3], ids[1]).unwrap().rect().is_empty());
         assert_eq!(order(&s), [ids[1], ids[3], ids[0], ids[2]]);
 
         // Already above it: a no-op, not an error — a shell walking a window list should not
         // have to special-case the window it is already above.
         let before = order(&s);
-        s.raise_above(ids[3], ids[3]).unwrap();
+        assert!(s.raise_above(ids[3], ids[3]).unwrap().rect().is_empty());
         assert_eq!(order(&s), before);
         assert_eq!(s.raise_above(ids[0], 99), Err(StackError::NoSuchWindow));
         assert_eq!(s.raise_above(99, ids[0]), Err(StackError::NoSuchWindow));
@@ -2612,7 +2612,7 @@ mod tests {
         let g = Geometry::with_pitch(8, 8, 32, PixelFormat::ARGB8888).unwrap();
         let word = g.format.encode_alpha(ink, 128).to_le_bytes();
         let mut px = vec![0u8; g.pitch * 8];
-        for p in px.chunks_exact_mut(4) {
+        for p in px.as_chunks_mut::<4>().0 {
             p.copy_from_slice(&word);
         }
         src.0.insert((id, 0), px);
@@ -2801,7 +2801,7 @@ mod tests {
         // their shared corner pixel shows neither.
         assert_eq!(fb.get_pixel(4, 4), Some(blue), "window 2 is on top");
 
-        s.raise(1).unwrap();
+        assert!(!s.raise(1).unwrap().rect().is_empty());
         let mut fb = screen();
         s.compose_into(&mut fb, Rgb::BLACK, &src, &[full]);
         assert_eq!(fb.get_pixel(4, 4), Some(red), "window 1 now is");

@@ -50,7 +50,7 @@ impl Reactor {
     /// `MAX_WAIT` — excess is dropped, which only costs an extra poll round).
     fn register(&self, h: u64) {
         let mut r = self.reg.get();
-        if r.handles[..r.count].iter().any(|&x| x == h) {
+        if r.handles[..r.count].contains(&h) {
             return;
         }
         if r.count < MAX_WAIT {

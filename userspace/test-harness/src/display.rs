@@ -134,8 +134,6 @@ fn check_framebuffer_binding(root_ns: u64) -> Result<(), AcquireError> {
     Ok(())
 }
 
-/// # Safety
-///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {

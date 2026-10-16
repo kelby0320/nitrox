@@ -908,7 +908,7 @@ mod tests {
         // then reject the next.
         let mut first = Vec::new();
         let cursor = ext4::read_dir(&r, dir_ino, 0, |_i, _ft, name| {
-            if first.len() >= 1 {
+            if !first.is_empty() {
                 return false; // reject (do not consume) the second entry
             }
             first.push(String::from_utf8_lossy(name).into_owned());
@@ -1640,7 +1640,6 @@ mod tests {
         expected.sort();
         assert_eq!(names, expected);
         assert!(!names_of(&rw, b"/system").iter().any(|n| n == "d2"));
-        drop(c);
         assert_e2fsck_clean(&rw.0.borrow(), "meta-cache");
 
         // **A file's data is never answered from the cache**: read through one large enough to keep

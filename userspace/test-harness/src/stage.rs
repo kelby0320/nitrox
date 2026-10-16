@@ -222,6 +222,7 @@ fn run_fp_worker(seed: u64) -> ! {
     let base = (seed & 0x7) * 1024 + 1;
     let mut v = [0f64; FP_LANES];
     let mut expect_sq: u64 = 0;
+    #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
     for k in 0..FP_LANES {
         let n = base + k as u64;
         v[k] = n as f64;

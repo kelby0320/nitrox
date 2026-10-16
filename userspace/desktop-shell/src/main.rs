@@ -1782,7 +1782,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // **The shell's, not the compositor's.** A `maximized` flag there would be a second source
     // of truth about a rectangle, and the rectangle a window returns to is a decision — this is
     // the process that made it.
-    let mut restore: alloc::vec::Vec<(u32, (i32, i32, u32, u32))> = alloc::vec::Vec::new();
+    let mut restore = RestoreList::new();
     // Windows already asked to close, whose next middle-click destroys them.
     //
     // **Asked first, insisted on afterwards.** A window holds a process's work, and a taskbar
@@ -2067,6 +2067,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 WAIT_HANDLES[n as usize] = DESKTOP_SERVE;
                 n += 1;
             }
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for i in 0..MAX_DESKTOP_SESSIONS {
                 if DESKTOP_SESSIONS[i] != 0 {
                     WAIT_HANDLES[n as usize] = DESKTOP_SESSIONS[i];
@@ -2141,6 +2142,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             if DESKTOP_SERVE != 0 {
                 serve_desktop_endpoint();
             }
+            #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
             for i in 0..MAX_DESKTOP_SESSIONS {
                 let ch = DESKTOP_SESSIONS[i];
                 if ch != 0 {
@@ -2259,11 +2261,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                         );
                     }
                     WINDOW_STATE_NORMAL => {
-                        if e.minimized {
-                            if raise_window(m, e) {
-                                sent_request = true;
-                                list_dirty = true;
-                            }
+                        if e.minimized && raise_window(m, e) {
+                            sent_request = true;
+                            list_dirty = true;
                         }
                         if let Some(i) = restore.iter().position(|(id, _)| *id == s.window) {
                             let (_, (x, y, w, h)) = restore.remove(i);
@@ -3548,7 +3548,7 @@ fn minimize_window(mgr: &mut ChannelTransport, e: &mut WinEntry) -> bool {
 /// compositor for a snapshot. Real windows never move; the compositor gained one operation
 /// instead of a transform pipeline. A window drawn *after* the capture shows its state at the
 /// moment the overview opened, which is accepted deliberately.
-
+#[allow(clippy::too_many_arguments, reason = "the scene's parts are separate borrows the caller already holds")]
 fn render_overview(
     theme: &Theme,
     font: &Font,
@@ -3730,6 +3730,7 @@ fn open_overview(
     // present would write through. Repeat past `MAX_WINDOWS_PER_CONNECTION` and the menus stop
     // opening too, because they share the connection (PR #244 review, blocking 3).
     let mut ok = true;
+    #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
     for i in 0..BUFFERS {
         let Some((handle, addr)) = shared_buffer(len) else {
             ok = false;
@@ -4009,9 +4010,7 @@ fn capture_window(
     let (handle, addr) = shared_buffer(len)?;
     let req = MgrCapture { window, width: w, height: h, pitch: pitch as u32 };
     let mut body = [0u8; core::mem::size_of::<MgrCapture>()];
-    if req.write(&mut body).is_none() {
-        return None;
-    }
+    req.write(&mut body)?;
     let mut reply = [0u8; 64];
     let ok = mgr.request(OP_MGR_CAPTURE, &body, Some(handle), &mut reply).is_ok();
     if !ok {
@@ -4030,7 +4029,7 @@ fn capture_window(
     // to 144 KB each, and nothing else would ever reclaim them.
     let mut addr = addr;
     release_buffer(&mut addr, len);
-    let lit = px.chunks_exact(4).filter(|c| c != &[0, 0, 0, 0]).count();
+    let lit = px.as_chunks::<4>().0.iter().filter(|c| **c != [0, 0, 0, 0]).count();
     if lit == 0 {
         Line::new().s(b"desktop-shell: capture of window ").u(window as u64).s(b" came back blank").end();
         return None;
@@ -4050,6 +4049,7 @@ fn capture_window(
 /// **The one place another process changes the desktop model**, and it goes through exactly the
 /// operations the shell's own chords do — `switch_desktop` and the name field — rather than
 /// touching the lists directly. A second path into the same state is a second place for the
+#[allow(clippy::too_many_arguments, reason = "the session's state lives in separate locals of the caller")]
 /// lifecycle rule to be forgotten.
 fn serve_desktop_session(
     ch: u64,
@@ -4084,6 +4084,7 @@ fn serve_desktop_session(
     // SAFETY: closing handles the kernel just installed for us.
     unsafe {
         let n = ((&raw const DS_COUNT).read()).min(libkern::abi::IPC_HANDLE_MAX);
+        #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
         for i in 0..n {
             syscall1(SYS_HANDLE_CLOSE, DS_HANDLES[i]);
         }
@@ -4092,6 +4093,7 @@ fn serve_desktop_session(
         if rr == KError::PeerClosed.as_i32() as i64 {
             // SAFETY: the peer is gone; free the slot and close our end.
             unsafe {
+                #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
                 for i in 0..MAX_DESKTOP_SESSIONS {
                     if DESKTOP_SESSIONS[i] == ch {
                         DESKTOP_SESSIONS[i] = 0;
@@ -4493,11 +4495,14 @@ fn centre_dialog(base: (i32, i32, u32, u32), size: (u32, u32), work: &MgrLayout)
     (x.clamp(work.work_x, max_x), y.clamp(work.work_y, max_y))
 }
 
+type RestoreList = alloc::vec::Vec<(u32, (i32, i32, u32, u32))>;
+
 /// Drain the manager channel and place every window it announces.
 ///
 /// **Placing is what releases a held window.** With a manager attached the compositor holds a
 /// `normal` window's first `Configure` until the manager acts, so a shell that received
 /// `WindowCreated` and did nothing would leave every launched application invisible — a
+#[allow(clippy::too_many_arguments, reason = "the session's state lives in separate locals of the caller")]
 /// failure that looks like the application never started.
 fn place_new_windows(
     mgr: &mut ChannelTransport,
@@ -4509,7 +4514,7 @@ fn place_new_windows(
     layout: &mut MgrLayout,
     states: &mut alloc::vec::Vec<librsproto::surface::WindowState>,
     dropped: &mut alloc::vec::Vec<librsproto::surface::ConfigureEvent>,
-    restore: &mut alloc::vec::Vec<(u32, (i32, i32, u32, u32))>,
+    restore: &mut RestoreList,
     current: u32,
     screen: Screen,
 ) -> bool {

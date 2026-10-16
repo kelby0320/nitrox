@@ -207,10 +207,10 @@ pub fn decode(bytes: &[u8]) -> Result<Image, PngError> {
         match kind {
             b"IHDR" => header = Some(parse_ihdr(data)?),
             b"PLTE" => {
-                if data.len() % 3 != 0 {
+                if !data.len().is_multiple_of(3) {
                     return Err(PngError::Palette);
                 }
-                palette = data.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+                palette = data.as_chunks::<3>().0.iter().map(|c| [c[0], c[1], c[2]]).collect();
             }
             // **Concatenated, because a PNG's compressed data is one zlib stream split across
             // however many `IDAT`s the encoder felt like.** Inflating each separately is the
@@ -641,9 +641,9 @@ mod tests {
         assert_eq!(decode(&big), Err(PngError::Size));
         // …and the sizes a wallpaper actually is are still admitted. These are *header* checks:
         // what they pin is which images `parse_ihdr` lets through, not a whole decode.
-        assert!(1920 * 1080 < MAX_PIXELS, "a 1080p picture fits");
-        assert!(2560 * 1600 < MAX_PIXELS, "so does a 2560x1600 one");
-        assert!(3840 * 2160 > MAX_PIXELS, "and 4K is refused rather than fatal");
+        const { assert!(1920 * 1080 < MAX_PIXELS, "a 1080p picture fits") };
+        const { assert!(2560 * 1600 < MAX_PIXELS, "so does a 2560x1600 one") };
+        const { assert!(3840 * 2160 > MAX_PIXELS, "and 4K is refused rather than fatal") };
         // The budget is what the bound is made of, so a change to one moves the other.
         assert_eq!(MAX_PIXELS, (MAX_DECODE_BYTES / PEAK_BYTES_PER_PIXEL) as u64);
     }

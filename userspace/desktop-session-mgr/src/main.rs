@@ -579,6 +579,7 @@ fn open_greeter(
     // its own request, honoured when the compositor gives up waiting for a manager.
     let (x, y) = origin;
     let window = session.create(&CreateWindowRequest::at(GREETER_W, GREETER_H, Role::Normal, x, y), BUFFERS).ok()?;
+    #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
     for i in 0..BUFFERS {
         let (handle, addr) = shared_buffer(len)?;
         addrs[i] = addr;

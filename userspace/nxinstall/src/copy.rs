@@ -78,8 +78,7 @@ where
     // runs on a fixed userspace stack with a 64 KiB copy buffer already on it.
     let mut pending: Vec<Vec<u8>> = Vec::new();
     pending.push(Vec::from(&b"/"[..]));
-    let mut buf = Vec::new();
-    buf.resize(COPY_BUF, 0u8);
+    let mut buf = alloc::vec![0u8; COPY_BUF];
 
     while let Some(dir) = pending.pop() {
         let src_ino = ext4::resolve_dir(src, &dir)?;
@@ -190,8 +189,7 @@ where
     }
     ext4::grow_file(dst, &path, bytes.len(), now)?;
     let bs = ext4::block_size(dst)? as usize;
-    let mut buf = Vec::new();
-    buf.resize(bytes.len().div_ceil(bs) * bs, 0u8);
+    let mut buf = alloc::vec![0u8; bytes.len().div_ceil(bs) * bs];
     buf[..bytes.len()].copy_from_slice(bytes);
     let written = write_range(dst, &path, 0, &mut buf, bytes.len());
     // What the installer writes this way includes a password's verifier; the buffer goes back

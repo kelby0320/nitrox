@@ -962,7 +962,7 @@ pub mod slots {
 
         /// Whether another supervisor's channel fits in `max`.
         pub fn admits_supervisor(&self, max: usize) -> bool {
-            self.worst() + 1 <= max
+            self.worst() < max
         }
 
         /// Whether another client fits in `max` — with room for the program it may start.

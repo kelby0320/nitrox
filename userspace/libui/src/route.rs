@@ -567,6 +567,7 @@ impl Router {
 
 impl Router {
     /// Hand a synthesised crossing to `id`'s handler, if it has one.
+    #[allow(clippy::too_many_arguments, reason = "a crossing event needs the tree, element, layout and cause together")]
     fn emit_crossing<Msg>(
         &self,
         tree: &Tree,

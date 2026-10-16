@@ -75,10 +75,10 @@ fn failures(files: &[(String, usize)], baseline: &Baseline) -> Vec<String> {
 fn updated(files: &[(String, usize)], baseline: &Baseline) -> Baseline {
     let mut out = Baseline::new();
     for (path, &entry) in baseline {
-        if let Some((_, lines)) = files.iter().find(|(p, _)| p == path) {
-            if *lines > LIMIT {
-                out.insert(path.clone(), entry.min(*lines));
-            }
+        if let Some((_, lines)) = files.iter().find(|(p, _)| p == path)
+            && *lines > LIMIT
+        {
+            out.insert(path.clone(), entry.min(*lines));
         }
     }
     out

@@ -112,7 +112,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                         && anchor[1..].chars().all(|c| c.is_ascii_digit() || c == '-' || c == 'L'))
                 {
                     let target_file = if file.is_empty() { path.to_path_buf() } else { dir.join(file) };
-                    if target_file.extension().map_or(false, |e| e == "md") {
+                    if target_file.extension().is_some_and(|e| e == "md") {
                         anchor_refs.push((path.to_path_buf(), i + 1, target_file, anchor.to_string()));
                     }
                 }
@@ -214,7 +214,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
         }
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
-            if path.extension().map_or(false, |e| e == "md") {
+            if path.extension().is_some_and(|e| e == "md") {
                 arch_docs += 1;
                 let text = read_text(&path)?;
                 let has_status = text.lines().take(20).any(|l| {
