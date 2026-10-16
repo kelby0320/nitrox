@@ -50,6 +50,7 @@ fn moved_diff(root: &Path, rev: &str) -> R<String> {
 
 struct Changed {
     file: String,
+    hunk: usize,
     added: bool,
     moved: bool,
     text: String,
@@ -80,9 +81,12 @@ fn leading_colour(line: &str) -> &str {
 fn changed_lines(diff: &str) -> Vec<Changed> {
     let mut out = Vec::new();
     let mut file = String::new();
+    let mut hunk = 0;
     for raw in diff.lines() {
         let plain = strip_ansi(raw);
-        if let Some(path) = plain.strip_prefix("+++ ") {
+        if plain.starts_with("@@") {
+            hunk += 1;
+        } else if let Some(path) = plain.strip_prefix("+++ ") {
             file = path.strip_prefix("b/").unwrap_or(path).to_string();
         } else if let Some(path) = plain.strip_prefix("--- ") {
             file = path.strip_prefix("a/").unwrap_or(path).to_string();
@@ -91,6 +95,7 @@ fn changed_lines(diff: &str) -> Vec<Changed> {
         {
             out.push(Changed {
                 file: file.clone(),
+                hunk,
                 added: text.0,
                 moved: MOVED.contains(&leading_colour(raw)),
                 text: text.1.to_string(),
@@ -119,8 +124,9 @@ fn made_a_file(t: &str) -> Option<String> {
 
 /// Every changed line that is not part of a move, as `file: ±text`. Allowed besides moved blocks:
 /// blank lines, `mod` lines with a `#[cfg(test)]` before them, `use` statements, a line whose
-/// only change is a visibility widened to `pub(crate)` or `pub(super)`, and an inline module made
-/// a file: its `mod NAME {` replaced by `mod NAME;`, and one closing `}` in that file for each.
+/// only change is a visibility widened to `pub(crate)` or `pub(super)` with the lines around it
+/// that are the same on both sides, and an inline module made a file: its `mod NAME {` replaced by
+/// `mod NAME;`, and one closing `}` in that file for each.
 fn unmoved(diff: &str) -> Vec<String> {
     let lines = changed_lines(diff);
     let mut ok = vec![false; lines.len()];
@@ -147,6 +153,7 @@ fn unmoved(diff: &str) -> Vec<String> {
         }
     }
     let mut removed: Vec<usize> = (0..lines.len()).filter(|&i| !ok[i] && !lines[i].added).collect();
+    let mut widened = Vec::new();
     for i in 0..lines.len() {
         if ok[i] || !lines[i].added {
             continue;
@@ -157,7 +164,37 @@ fn unmoved(diff: &str) -> Vec<String> {
             && let Some(k) = removed.iter().position(|&j| lines[j].text.trim() == rest)
         {
             ok[i] = true;
-            ok[removed.swap_remove(k)] = true;
+            widened.push((removed.swap_remove(k), i));
+        }
+    }
+    // A widened line splits git's moved block, and a piece of it too short for git to call moved is
+    // left uncoloured: the same lines on both sides, running on from the pair, are that piece. A run
+    // is a hunk's removed lines, or its added ones.
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    let mut place = vec![(0, 0); lines.len()];
+    for (i, l) in lines.iter().enumerate() {
+        if i == 0 || lines[i - 1].hunk != l.hunk || lines[i - 1].added != l.added {
+            runs.push(Vec::new());
+        }
+        let run = runs.len() - 1;
+        place[i] = (run, runs[run].len());
+        runs[run].push(i);
+    }
+    for &(r, a) in &widened {
+        ok[r] = true;
+        let ((rr, rp), (ar, ap)) = (place[r], place[a]);
+        for step in [1, -1] {
+            let mut k = step;
+            while let (Some(&x), Some(&y)) =
+                (runs[rr].get(rp.wrapping_add_signed(k)), runs[ar].get(ap.wrapping_add_signed(k)))
+            {
+                if lines[x].text.trim() != lines[y].text.trim() {
+                    break;
+                }
+                ok[x] = true;
+                ok[y] = true;
+                k += step;
+            }
         }
     }
     let mut closes: Vec<&str> = Vec::new();
@@ -282,6 +319,49 @@ mod tests {
         let after = format!("mod u;\n{KEEP}");
         let stray = unmoved(&diff_of(&[("a.rs", &before)], &[("a.rs", &after), ("t.rs", BODY)]));
         assert_eq!(stray, ["a.rs: -mod t {", "a.rs: -}"]);
+    }
+
+    const FRAME: &str = "struct Frame {\n    sample: String,\n}\n\nimpl Frame {\n    fn cells_sample_of_the_frame(&self) \
+                         -> &str {\n        &self.sample\n    }\n}\n";
+
+    #[test]
+    fn a_tail_too_short_for_git_after_a_widened_line_is_part_of_the_move() {
+        let before = format!("{KEEP}\n{FRAME}");
+        let moved =
+            format!("use crate::*;\n\n{}", FRAME.replace("struct", "pub(crate) struct").replace("fn", "pub(crate) fn"));
+        let d = diff_of(&[("a.rs", &before)], &[("a.rs", KEEP), ("b.rs", &moved)]);
+        assert_eq!(unmoved(&d), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_tail_after_a_widened_line_is_only_a_move_where_it_is_the_same() {
+        let before = format!("{KEEP}\n{FRAME}");
+        let moved = FRAME.replace("fn", "pub(crate) fn").replace("&self.sample", "&self.other");
+        let stray = unmoved(&diff_of(&[("a.rs", &before)], &[("a.rs", KEEP), ("b.rs", &moved)]));
+        assert!(stray.iter().any(|s| s == "a.rs: -        &self.sample"), "{stray:?}");
+        assert!(stray.iter().any(|s| s == "b.rs: +        &self.other"), "{stray:?}");
+    }
+
+    const LONG: &str = "fn widened_function_with_a_long_name() -> u32 {\n    7\n}\n";
+    const MARKER: &str = "    continue_marker();\n";
+
+    #[test]
+    fn a_widened_lines_neighbours_are_in_its_own_hunk() {
+        let other = "fn other() {\n";
+        let before = format!("{LONG}{KEEP}{other}{MARKER}}}\n");
+        let after = format!("{KEEP}{other}}}\n");
+        let moved = format!("pub(crate) {LONG}{MARKER}");
+        let stray = unmoved(&diff_of(&[("a.rs", &before)], &[("a.rs", &after), ("b.rs", &moved)]));
+        assert_eq!(stray, ["a.rs: -    continue_marker();", "b.rs: +    continue_marker();"]);
+    }
+
+    #[test]
+    fn a_widened_lines_neighbours_are_on_its_own_side() {
+        let before = format!("{LONG}{KEEP}");
+        let after = format!("{MARKER}{KEEP}");
+        let moved = format!("pub(crate) {LONG}{MARKER}");
+        let stray = unmoved(&diff_of(&[("a.rs", &before)], &[("a.rs", &after), ("b.rs", &moved)]));
+        assert_eq!(stray, ["a.rs: +    continue_marker();", "b.rs: +    continue_marker();"]);
     }
 
     #[test]
