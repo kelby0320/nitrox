@@ -11,6 +11,7 @@ mod report;
 mod resolutions;
 mod shutdown;
 mod storage;
+mod terminal;
 
 pub(crate) use fbcon::*;
 pub(crate) use input::*;
@@ -25,3 +26,4 @@ pub(crate) use report::*;
 pub(crate) use resolutions::*;
 pub(crate) use shutdown::*;
 pub(crate) use storage::*;
+pub(crate) use terminal::*;
