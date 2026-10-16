@@ -13,6 +13,7 @@ mod resolutions;
 mod shutdown;
 mod storage;
 mod terminal;
+mod test_qemu;
 
 pub(crate) use display::*;
 pub(crate) use fbcon::*;
@@ -29,3 +30,4 @@ pub(crate) use resolutions::*;
 pub(crate) use shutdown::*;
 pub(crate) use storage::*;
 pub(crate) use terminal::*;
+pub(crate) use test_qemu::*;
