@@ -2,8 +2,8 @@
 
 **Status: planned 2026-10-13, after Phase 6 closed (the maintainer's call); Part A detailed
 2026-10-14; A.1, A.2 and A.6 built 2026-10-14, and A.3, A.4, A.5 and A.7 the same day — Part A
-built; Part B detailed 2026-10-14; B.1 built 2026-10-15; B.2 built 2026-10-16; B.5's first PR
-built 2026-10-16.** Each other part
+built; Part B detailed 2026-10-14; B.1 built 2026-10-15; B.2 built 2026-10-16; B.5 built
+2026-10-16.** Each other part
 gets its detail pass when it is next. Seven parts, A–G, in the order below. Part E is the
 syscall-surface consolidation, planned separately in [`syscall-surface.md`](syscall-surface.md).
 
