@@ -82,3 +82,6 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-16	382	f8207e73	5	architecture	optional	demonstrated	fixed	e1a432e4	says sched.rs; swept every this-file/this-module in the 51 new files, three more fixed
 2026-10-16	382	f8207e73	6	architecture	optional	demonstrated	fixed	ec9a2b4c	toy crate reproduced (1, 2, 2); tests/splits.rs fails a name in two files of a family; 3 controls (kernel, crate-root siblings, xtask)
 2026-10-16	382	f8207e73	7	architecture	optional	demonstrated	fixed	d51675da	counts at the head: 950, 144, 96, 3,788 in all; entry edited in place
+2026-10-16	383	740eb6dd	1	solo	worth-fixing	demonstrated	fixed	924d2def	workflows test holds each QEMU gate's if: group to the matrix; reproduced ('harnes' passed), 4 controls
+2026-10-16	383	740eb6dd	2	solo	worth-fixing	demonstrated	fixed	f1f1268c	both sentences name the column by its heading
+2026-10-16	383	740eb6dd	3	solo	optional	demonstrated	fixed	8236dc56	5.7 min, 147 s, nitrox.hdd, images builds all but check-fbcon's mode; each checked; swept with positive controls

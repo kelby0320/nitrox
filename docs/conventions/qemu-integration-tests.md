@@ -386,6 +386,41 @@ lifecycle is a KVM boot loop (0/60 has been the bar) on top of a single
 What each `cargo xtask` gate boots, drives and asserts, and why; the root `CLAUDE.md` lists them a
 line each.
 
+### What each gate alone catches, and what it costs
+
+The gates CI runs, each with what no other gate catches and its duration on a CI runner, measured
+2026-10-16. **CI's QEMU job is five runners**, a group each, every runner building the images its
+own gates need; a group's first gate pays that build, about 85 s, which the second figure leaves
+out. Each gate prints its time (`xtask: <gate> took N s`), so the groups are rebalanced from the
+log. A gate with nothing under *What it alone catches* is merged or retired — the maintainer's call
+each time.
+
+| Gate | Runs in | Seconds | What it alone catches |
+|---|---|---|---|
+| `check-images` | `images` | 147 | A test or live image differing from the release one in anything new: a build-mode feature changing a program's bytes, or the live root not the release root. |
+| `check-shutdown` | `images` | 76 | `with power shutdown`'s sequence, the root left clean on the host, and the clock set and kept across a reboot. |
+| `test-qemu` | `harness` | 125 / 33 | The self-test boot adjudicated whole by `isa-debug-exit`; USB enumeration and hot-plug, a disk written past 2 TiB, the I/O counters, AHCI claimed over MSI. |
+| `check-terminal` | `harness` | 54 | The compositor-to-shell round trip — a click, keys to `nxsh`, the answer rendered — `OSC 7` back to `nxterm`, and the PS/2 locks and lights read from QEMU's trace. |
+| `check-fbcon` | `harness` | 35 | A machine with no serial port: the boot and a panic read off the screen with the kernel's own glyphs. |
+| `test-interactive` | `release` | 120 / 32 | The release image's serial login and shell, its 37 steps through the real `login()` and `tty` layer. |
+| `check-login` | `release` | 61 | The graphical greeter on PS/2, then the desktop driven step by step: menus, windows, the overview, Files, the editor, the clipboard, dialogs. |
+| `check-login --usb` | `release` | 70 | The greeter and that session on a machine with no i8042, every key and click USB's. |
+| `check-logout` | `release-live` | 140 / 56 | Ending a session: log out past the editor's question, restart and shut down, in three boots. |
+| `check-live` | `release-live` | 23 | The live stick: its RAM-disk root, the greeter within 1.5 s of the mount, the boot medium flagged and passed over. |
+| `check-report` | `release-live` | 23 | The live menu's hardware report with no serial port, its pages turned on PS/2: AHCI declined with no disk, no COM1. |
+| `check-report --usb` | `release-live` | 30 | The same pages turned on a USB keyboard, before `init`. |
+| `check-storage` | `live-test` | 137 / 63 | Disks the host reads afterwards: an unmount's writes, sticks plugged and pulled while mounted, FAT, partitioning and formatting. |
+| `check-media` | `live-test` | 46 | Removable media on the desktop: Files' Drives updated with nothing typed, Save As onto a stick, Files' eject. |
+| `check-display` | `display.yml` | 120 | The guest's screen against the host's render — base address, stride, channels — and the overview's round trip. |
+| `check-input` | `input.yml` | 104 | A PS/2 key and click reaching a client window through the compositor's router. |
+| `check-input --no-ps2-irq` | `input.yml` | 29 | Input with the tick's `ps2::poll` sweep as its only path. |
+| `check-input --usb` | `input.yml` | 33 | USB-only input, and devices that come and go: a keyboard unplugged, another typed on, a held key released. |
+
+**Two pairs are the nearest to overlapping**, and are kept for what *What it alone catches* says:
+`check-report` and `check-report --usb` read the same pages and differ in the keyboard turning them;
+`check-login --usb` and `check-input --usb` both put USB input on the desktop, one through the
+greeter and a session, the other through hot-plug.
+
 `cargo xtask test-qemu` boots the self-test build (`test-harness` feature)
 headless and adjudicates the whole boot (kernel → init → mount → userspace demos)
 from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device

@@ -36313,3 +36313,33 @@ second declined.
   that a filtered `x.rs` with an `x/` beside it has `x/**` filtered too; an xtask test reads all of
   nxfiles' library rather than `lib.rs`; the bug bash's `sched` subsystem takes the directory; and
   the docs placing a moved item name its module.
+
+## 2026-10-16 — Before Phase 7, Part B.3: CI in parallel
+
+- **Measured first, on CI's own runners**, with a throwaway workflow on a branch of its own
+  (deleted after): four proposed groups of gates each from a fresh runner with the integration
+  cache, and `check-images` uploading the images it built. A group's first image costs about
+  85 s; the groups took 239 to 346 s each, and `check-images` 147 s on a runner that took 222; the
+  images, 201 MB, moved in 2 s each way.
+- **Each runner builds the images its own gates need.** Sharing them is cheap to move but puts one
+  job building every mode, about three minutes, before any gate boots; built per runner, that
+  cost is paid by every runner at once. It also needs nothing from xtask, where every mode writes
+  the same `tools/build-cache/nitrox.hdd`.
+- **Five runners**: `harness` (test-qemu, check-terminal, check-fbcon), `release`
+  (test-interactive, both check-logins), `release-live` (check-logout, check-live, both
+  check-reports), `live-test` (check-storage, check-media) and `images` (check-images,
+  check-shutdown, moved from the heaviest group to the one whose check-images builds its mode).
+  The cache is restored by all and saved by `images` alone, whose `check-images` builds the
+  release, self-test and test-harness modes: every mode but `check-fbcon`'s, which differs from
+  the release one only in a kernel feature, and the kernel has no dependencies to cache.
+- **Every xtask command prints its duration**, `xtask: <command> took N s`, so the groups are
+  rebalanced from the log.
+- **The audit**, a table in `qemu-integration-tests.md`: each of the eighteen gates CI runs, what
+  no other catches, and its cost. Every gate has an answer, and none is retired; the two pairs
+  nearest to overlapping (`check-report` with and without `--usb`; `check-login --usb` beside
+  `check-input --usb`) are named with why each half stays.
+- **The build job's `cargo xtask build` is dropped** (the maintainer's call): the `release` and
+  `images` groups build the same, no host test reads its output, and it held the build job to
+  6.1 minutes. CI's wall clock goes from 14.1 minutes, the QEMU job's, to 5.7 on the PR's first
+  run: its slowest group, `images`, whose `check-images` took 189 s there against 147 in the
+  measurement — runner to runner, that gate varies most.

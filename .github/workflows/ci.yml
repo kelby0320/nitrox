@@ -134,10 +134,6 @@ jobs:
       - name: cargo xtask abi-sync-check
         run: cargo xtask abi-sync-check
 
-      # Builds the kernel ELF for x86_64-unknown-none.
-      - name: cargo xtask build
-        run: cargo xtask build
-
       # Host-side tests: kernel lib (compiled against the host triple via
       # an internal override in xtask) plus the tools workspace.
       #
@@ -155,9 +151,17 @@ jobs:
       - name: cargo xtask test
         run: cargo xtask test
 
+  # **The gates in five groups, a runner each**, every runner building the images its own gates
+  # need (measured on these runners: a group's first image costs about 85 s, every runner
+  # paying it in parallel, where one job building them all for the rest would put about three
+  # minutes before the first boot). Balanced by the durations each gate prints.
   integration:
-    name: QEMU integration (image + boot self-test)
+    name: QEMU integration (${{ matrix.group }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [harness, release, release-live, live-test, images]
 
     steps:
       - uses: actions/checkout@v4
@@ -214,8 +218,12 @@ jobs:
             grep -qw "$f" /proc/cpuinfo && echo "  have $f" || echo "  MISSING $f"
           done
 
-      - name: Cache cargo registry and build outputs
-        uses: actions/cache@v4
+      # Restored by every group and saved by `images` alone, whose check-images builds the release,
+      # self-test and test-harness modes: all the cache holds of value, since check-fbcon's mode
+      # differs only in a kernel feature and the kernel has no dependencies.
+      - name: Restore cargo registry and build outputs
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -245,6 +253,7 @@ jobs:
       # than a number in a doc. It runs in the QEMU job because it needs both images built,
       # not because it boots anything.
       - name: cargo xtask check-images
+        if: matrix.group == 'images'
         run: cargo xtask check-images
 
       # The whole boot, adjudicated: kernel -> init -> ext4 mount -> userspace demos
@@ -254,6 +263,7 @@ jobs:
       # Milestone 1 was caught here, and none of them would have failed the jobs
       # above. See docs/conventions/qemu-integration-tests.md.
       - name: cargo xtask test-qemu --kvm
+        if: matrix.group == 'harness'
         run: cargo xtask test-qemu --kvm
 
       # The **release image**, which nothing else here boots. It used to be the only place
@@ -270,6 +280,7 @@ jobs:
       # its own cfgs (Part C). Expect-driven, so the guest paces it rather than guessed
       # sleeps.
       - name: cargo xtask test-interactive --kvm
+        if: matrix.group == 'release'
         run: cargo xtask test-interactive --kvm
 
       # The **windowed** path, which neither gate above reaches: a click that raises
@@ -286,6 +297,7 @@ jobs:
       # landed before asserting that `nxterm` received it, so a recurrence in CI reports
       # coordinates instead of a bare timeout. See docs/decision-log.md, 2026-08-18.
       - name: cargo xtask check-terminal --kvm
+        if: matrix.group == 'harness'
         run: cargo xtask check-terminal --kvm
 
       # The **graphical login**, and the only gate that boots a release image with a window
@@ -296,11 +308,13 @@ jobs:
       # login nobody can complete is not a partial failure. Added with M7 Part D, which built
       # it before Parts E and F so those land against a gate that exists.
       - name: cargo xtask check-login --kvm
+        if: matrix.group == 'release'
         run: cargo xtask check-login --kvm
 
       # **The same login with no i8042** (Phase 6 Part B): every key at the greeter and every click
       # after it on a USB keyboard and mouse. The Definition of Done's "types at the greeter".
       - name: cargo xtask check-login --usb --kvm
+        if: matrix.group == 'release'
         run: cargo xtask check-login --usb --kvm
 
       # **Ending a session from the desktop** (administration Part F.2), on the release image as
@@ -311,6 +325,7 @@ jobs:
       # Unconditional, for `check-login`'s reason: a session a person cannot leave is not a
       # partial failure.
       - name: cargo xtask check-logout --kvm
+        if: matrix.group == 'release-live'
         run: cargo xtask check-logout --kvm
 
       # **No serial port**, which is what the laptop Phase 5 targets has: the boot is read back
@@ -320,6 +335,7 @@ jobs:
       # the same feature, pressed over QMP) is checked to take it back. Every other gate here reads COM1,
       # so none of them would notice the console drawing nothing. Added with Phase 5 Part B.
       - name: cargo xtask check-fbcon --kvm
+        if: matrix.group == 'harness'
         run: cargo xtask check-fbcon --kvm
 
       # **The live image boots a machine with no storage driver** (Phase 5 Part C): attached as a
@@ -329,6 +345,7 @@ jobs:
       # laptop's first boot (Part F); a live image that stopped booting in the meantime is the
       # failure this is for.
       - name: cargo xtask check-live --kvm
+        if: matrix.group == 'release-live'
         run: cargo xtask check-live --kvm
 
       # **The hardware report, read the way the laptop will be read** (Phase 5 Part D): the live
@@ -338,12 +355,14 @@ jobs:
       # declined AHCI controller, the module disk, no UART — then that the boot goes on. The only
       # gate that drives the boot menu, and the only one that sees the report at all.
       - name: cargo xtask check-report --kvm
+        if: matrix.group == 'release-live'
         run: cargo xtask check-report --kvm
 
       # **The report on a machine with no i8042** (Phase 6 Part B): its pages turn on USB key
       # presses, which the kernel counts from any keyboard, and it holds them for a USB keyboard
       # — where it once held none without an i8042.
       - name: cargo xtask check-report --usb --kvm
+        if: matrix.group == 'release-live'
         run: cargo xtask check-report --usb --kvm
 
       # **The storage chain, with the host holding the result** (administration Part C.8): the
@@ -354,6 +373,7 @@ jobs:
       # the machine stopped, the host carves the partition out: `e2fsck -fn` clean, the superblock
       # marked clean, and the file holding the pattern. The only gate whose verdict is the disk.
       - name: cargo xtask check-storage --kvm
+        if: matrix.group == 'live-test'
         run: cargo xtask check-storage --kvm
 
       # **Removable media on the desktop a person uses** (Phase 6 Part F): the release live image
@@ -363,6 +383,7 @@ jobs:
       # onto it through Save As; Files' eject button ejects it with no password; and with the
       # machine stopped `fsck.fat -n` finds it clean and `mtype` reads back what was typed.
       - name: cargo xtask check-media --kvm
+        if: matrix.group == 'live-test'
         run: cargo xtask check-media --kvm
 
       # **A shutdown, with the host holding the result** (administration Part E.4d): a copy of the
@@ -373,7 +394,21 @@ jobs:
       # stopped: `e2fsck -fn` clean, the superblock clean, and the file holding the pattern. Then a
       # fresh copy runs `with power shutdown --reboot`, and the second boot mounts its root clean.
       - name: cargo xtask check-shutdown --kvm
+        if: matrix.group == 'images'
         run: cargo xtask check-shutdown --kvm
+
+      - name: Save cargo registry and build outputs
+        if: matrix.group == 'images' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kernel/target
+            tools/target
+            userspace/target
+            tools/build-cache/limine
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.cargo/config.toml', 'kernel/.cargo/config.toml', 'rust-toolchain.toml', 'userspace/rust-toolchain.toml', 'userspace/x86_64-unknown-nitrox.json') }}
 
       # The fault dump prints raw addresses, and a local rebuild of the same commit
       # does **not** reproduce CI's code layout — symbolizing CI addresses against a
@@ -384,7 +419,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: nitrox-kernel
+          name: nitrox-kernel-${{ matrix.group }}
           # The licence goes with the ELF: the kernel embeds Terminus Font (SIL OFL), whose
           # terms require the notice to accompany every copy.
           path: |
