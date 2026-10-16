@@ -1,7 +1,9 @@
 use crate::*;
 
+mod format;
 mod sticks;
 
+pub(crate) use format::*;
 pub(crate) use sticks::*;
 
 /// The file `check-storage` writes, at the root of the SATA disk's `nitrox-root`.
