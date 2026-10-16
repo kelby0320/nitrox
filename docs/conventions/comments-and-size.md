@@ -55,14 +55,14 @@ file shorter, at 1,000 lines or fewer, or gone — until it is brought down:
   the pieces hold more than `OLD`'s entry, not counting each new file's leading doc, `mod`, `use`
   and attribute lines, or the `mod` line each needs in its parent.
 
-**A split is moves only, and shown to be.** Each move is a commit of its own, before any
-formatting, and **`cargo xtask check-moves [REV]`** fails a commit (`HEAD` by default) holding any
-changed line that `git diff --color-moved=blocks --color-moved-ws=allow-indentation-change` does not
-find moved — besides blank lines, `mod` lines and the `#[cfg(test)]` before one, `use` statements,
-a visibility widened to `pub(crate)` or `pub(super)`, an `include_bytes!` or `include_str!` path
-re-rooted to name the same file from the line's new directory — each with the lines running on
-from it that are the same on both sides, a piece of the move too short for git to call moved once
-the changed line splits it — and an inline module made a file: its `mod NAME {` replaced by `mod NAME;`, and its
-closing `}`. A line-by-line match is not enough: a
-`continue` deleted in one place and added in another passes one. Formatting follows in the next
-commit.
+**A split is moves only, and shown to be.** Each move is a commit of its own, before any formatting,
+and **`cargo xtask check-moves [REV]`** fails a commit (`HEAD` by default) holding any changed line
+that `git diff --color-moved=blocks --color-moved-ws=allow-indentation-change` does not find moved —
+besides blank lines, `mod` lines and the `#[cfg(test)]` before one, `use` statements, a visibility
+widened to `pub(crate)` or `pub(super)`, an `include_bytes!` or `include_str!` path re-rooted to
+name the same file from the line's new directory — each with the lines running on from it that are
+the same on both sides, a piece of the move too short for git to call moved once the changed line
+splits it — and an inline module made a file: its `mod NAME {` replaced by `mod NAME;`, and its
+closing `}`. An include moved unchanged to another directory fails, since it names another file. A
+line-by-line match is not enough: a `continue` deleted in one place and added in another passes one.
+Formatting follows in the next commit.

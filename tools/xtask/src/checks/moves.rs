@@ -80,21 +80,23 @@ fn leading_colour(line: &str) -> &str {
 
 fn changed_lines(diff: &str) -> Vec<Changed> {
     let mut out = Vec::new();
-    let mut file = String::new();
+    // A removed line is in the pre-image's file and an added one in the post-image's: they differ
+    // when the file was renamed.
+    let (mut old, mut new) = (String::new(), String::new());
     let mut hunk = 0;
     for raw in diff.lines() {
         let plain = strip_ansi(raw);
         if plain.starts_with("@@") {
             hunk += 1;
         } else if let Some(path) = plain.strip_prefix("+++ ") {
-            file = path.strip_prefix("b/").unwrap_or(path).to_string();
+            new = path.strip_prefix("b/").unwrap_or(path).to_string();
         } else if let Some(path) = plain.strip_prefix("--- ") {
-            file = path.strip_prefix("a/").unwrap_or(path).to_string();
+            old = path.strip_prefix("a/").unwrap_or(path).to_string();
         } else if let Some(text) =
             plain.strip_prefix('+').map(|t| (true, t)).or(plain.strip_prefix('-').map(|t| (false, t)))
         {
             out.push(Changed {
-                file: file.clone(),
+                file: if text.0 { new.clone() } else { old.clone() },
                 hunk,
                 added: text.0,
                 moved: MOVED.contains(&leading_colour(raw)),
@@ -152,6 +154,9 @@ fn unmoved(diff: &str) -> Vec<String> {
     let mut ok = vec![false; lines.len()];
     let mut in_use = false;
     for (i, l) in lines.iter().enumerate() {
+        if i > 0 && (lines[i - 1].hunk != l.hunk || lines[i - 1].added != l.added) {
+            in_use = false;
+        }
         if l.moved {
             in_use = false;
             ok[i] = true;
@@ -251,6 +256,23 @@ fn unmoved(diff: &str) -> Vec<String> {
             ok[i] = true;
             closes.swap_remove(k);
         }
+    }
+    // An include names a file relative to its own, so one moved unchanged to another directory
+    // names another file however git colours it: every changed include must meet one on the other
+    // side naming the same file.
+    let include = |i: usize| rerooted_include(&lines[i].file, lines[i].text.trim());
+    let mut unmet: Vec<usize> = (0..lines.len()).filter(|&i| !lines[i].added && include(i).is_some()).collect();
+    for i in (0..lines.len()).filter(|&i| lines[i].added) {
+        let Some(named) = include(i) else { continue };
+        match unmet.iter().position(|&j| include(j).as_ref() == Some(&named)) {
+            Some(k) => {
+                unmet.swap_remove(k);
+            }
+            None => ok[i] = false,
+        }
+    }
+    for j in unmet {
+        ok[j] = false;
     }
     lines
         .iter()
@@ -416,6 +438,30 @@ mod tests {
         let d = diff_of(&[("src/a.rs", &before)], &[("src/a.rs", KEEP), ("src/sub/b.rs", &font("../../assets/g.ttf"))]);
         let stray = unmoved(&d);
         assert!(stray.iter().any(|s| s.ends_with("include_bytes!(\"../../assets/g.ttf\")")), "{stray:?}");
+    }
+
+    #[test]
+    fn an_include_moved_unchanged_into_another_directory_is_not_a_move() {
+        let before = format!("{KEEP}\n{}", font("../assets/f.ttf"));
+        let d = diff_of(&[("src/a.rs", &before)], &[("src/a.rs", KEEP), ("src/sub/b.rs", &font("../assets/f.ttf"))]);
+        let stray = unmoved(&d);
+        assert!(stray.iter().any(|s| s == "src/sub/b.rs: +    include_bytes!(\"../assets/f.ttf\")"), "{stray:?}");
+    }
+
+    #[test]
+    fn a_rename_that_reroots_its_include_is_a_move() {
+        let file = |path: &str| format!("{KEEP}\n{BODY}\n{}", font(path));
+        let d = diff_of(&[("src/a.rs", &file("../assets/f.ttf"))], &[("src/sub/a.rs", &file("../../assets/f.ttf"))]);
+        assert_eq!(unmoved(&d), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_open_use_does_not_swallow_a_later_hunk() {
+        let f = "fn f() -> u32 {\n    let first_value_of_the_function = 2;\n    return 1\n}\n";
+        let before = format!("use crate::a::{{\n    x,\n}};\n\n{KEEP}\n{f}");
+        let after = format!("use crate::b::{{\n    x,\n}};\n\n{KEEP}\n{}", f.replace("    return 1\n", ""));
+        let stray = unmoved(&diff_of(&[("a.rs", &before)], &[("a.rs", &after)]));
+        assert_eq!(stray, ["a.rs: -    return 1"]);
     }
 
     #[test]
