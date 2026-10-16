@@ -1,3 +1,5 @@
+//! Columns' text, paths and breadcrumbs.
+
 use super::*;
 
 /// A path as breadcrumb segments: the names in the body ink, the separators in the line colour.

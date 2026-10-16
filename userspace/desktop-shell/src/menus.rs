@@ -1,3 +1,5 @@
+//! The bars' menus, and the bottom bar.
+
 use super::*;
 
 /// The bottom bar's tree as things are now.
@@ -188,7 +190,12 @@ impl BarMenus<'_> {
     }
 
     /// Route a pointer event through the popup, returning the row it chose.
-    pub(super) fn route(&mut self, font: &Font, theme: &Theme, event: &libsurface::WindowEvent) -> alloc::vec::Vec<MenuMsg> {
+    pub(super) fn route(
+        &mut self,
+        font: &Font,
+        theme: &Theme,
+        event: &libsurface::WindowEvent,
+    ) -> alloc::vec::Vec<MenuMsg> {
         let table = panel::menus(self.programs, self.query.text(), self.places, self.home, theme);
         let Some((which, c)) = self.win.as_mut() else { return alloc::vec::Vec::new() };
         let view = panel::menu_view(*which, &table, &self.state, c.hovered_key(), &self.query, theme);

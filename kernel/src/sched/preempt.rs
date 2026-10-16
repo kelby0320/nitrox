@@ -1,3 +1,5 @@
+//! Preemption control: the per-CPU disable count and the deferred reschedule.
+
 use super::*;
 
 /// Assert that a thread arriving from ring 3 has preemption enabled.

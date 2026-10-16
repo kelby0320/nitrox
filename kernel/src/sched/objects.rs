@@ -1,3 +1,5 @@
+//! Waitable objects: waiters added and removed, and objects signalled.
+
 use super::*;
 
 // --- Waitable dispatch (Timer | NotificationChannel) -------------------

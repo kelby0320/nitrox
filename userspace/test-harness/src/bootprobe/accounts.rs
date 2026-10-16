@@ -1,3 +1,5 @@
+//! The account and authentication-administration tests.
+
 use super::*;
 
 /// **Accounts, fronted by the broker** (administration Part D.3).

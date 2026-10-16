@@ -58,7 +58,6 @@ pub use text::*;
 /// A listing row's height in pixels: the design's 25, where it was 20.
 pub const ROW_H: u32 = 25;
 
-
 /// How far the pointer must travel with a button down before a press becomes a drag, in pixels.
 ///
 /// **Because a click is a press that moved a little.** Nobody presses a mouse button without
@@ -69,7 +68,6 @@ pub const DRAG_SLOP: i32 = 4;
 
 /// The menu bar's height in pixels — one row of chrome above the path strip.
 pub const MENU_BAR_H: u32 = 24;
-
 
 /// How wide the sidebar of common locations is, in pixels.
 ///
@@ -89,16 +87,10 @@ pub const SIDEBAR_W: u32 = 132;
 /// row read it and a gate writes it down (PR #320 review, worth fixing 8).
 pub const SIDEBAR_PAD: u32 = 0;
 
-
-
 /// The place a sidebar key names, or `None` if it is not a sidebar row's.
 fn place_of(key: u64) -> Option<usize> {
     key.checked_sub(SIDEBAR_ROW_KEY).map(|i| i as usize)
 }
-
-
-
-
 
 #[cfg(test)]
 mod tests;

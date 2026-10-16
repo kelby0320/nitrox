@@ -1,3 +1,5 @@
+//! The multi-line text area, with undo.
+
 use super::*;
 
 /// The same inset, for a caller that must aim inside a text area — the editor's tests, which

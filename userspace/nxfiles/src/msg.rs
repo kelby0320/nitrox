@@ -1,3 +1,5 @@
+//! Gestures, dialogs and the messages `App::update` takes.
+
 use super::*;
 
 /// What a pointer record did to a gesture in progress.

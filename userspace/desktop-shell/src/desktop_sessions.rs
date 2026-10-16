@@ -1,3 +1,5 @@
+//! `/dev/desktop`: its sessions served, and each told which desktop is current.
+
 use super::*;
 
 /// Serve one request on an open `/dev/desktop` session. Returns whether the shell must redraw.

@@ -1,3 +1,5 @@
+//! Exit, fault suspension and resumption, and the reaper.
+
 use super::*;
 
 /// The action a supervisor's `sys_exception_resume` requests for a thread

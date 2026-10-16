@@ -1,3 +1,5 @@
+//! The title bar and its buttons, and the menu bar.
+
 use super::*;
 
 /// One row of a dropdown menu: a label that highlights under the pointer.

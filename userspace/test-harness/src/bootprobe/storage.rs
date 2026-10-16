@@ -1,3 +1,5 @@
+//! The storage service's mount, listing and past-2-TiB tests.
+
 use super::*;
 
 /// **A filesystem the storage service mounted, reached through it** (administration Part C.5b).

@@ -1,3 +1,5 @@
+//! The status bar and pills.
+
 use super::*;
 
 /// How tall a status bar is: the design's 25.

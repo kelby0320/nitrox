@@ -1,3 +1,5 @@
+//! Which CPUs are online, and a CPU leaving them.
+
 use super::*;
 
 /// The set of online CPUs as a bitmask (dense index → bit), read lock-free.

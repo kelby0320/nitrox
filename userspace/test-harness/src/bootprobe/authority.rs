@@ -1,3 +1,5 @@
+//! Binds, derived namespaces, and the calls a missing syscap refuses.
+
 use super::*;
 
 // === the power op, from a process without the object (administration Part E.3) ===================

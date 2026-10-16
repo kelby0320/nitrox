@@ -1,3 +1,5 @@
+//! Launching applications, each in a namespace built and checked for it.
+
 use super::*;
 
 /// Read the desktop entries `/applications` projects, as the Applications menu's entries.

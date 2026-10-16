@@ -1,3 +1,5 @@
+//! The element keys and keycodes the browser's events are routed by.
+
 use super::*;
 
 /// The element key on the column header.

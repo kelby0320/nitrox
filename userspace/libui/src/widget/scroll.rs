@@ -1,3 +1,5 @@
+//! Scroll state, the scrollbar and its grab.
+
 use super::*;
 
 /// Where a scrollbar is and how much of its content is visible.

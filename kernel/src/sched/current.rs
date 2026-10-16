@@ -1,3 +1,5 @@
+//! The current thread, its process and their IDs.
+
 use super::*;
 
 /// `true` if this CPU's current thread is its idle thread (its object address equals

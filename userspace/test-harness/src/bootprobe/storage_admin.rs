@@ -1,3 +1,5 @@
+//! The storage administration tests, with and without the grant.
+
 use super::*;
 
 /// **Unmounting and mounting, through an admin session** (administration Part C.5c), opened as the

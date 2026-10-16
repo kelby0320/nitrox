@@ -1,3 +1,5 @@
+//! The tab strip.
+
 use super::*;
 
 /// How tall a tab strip is: the design's 30 since the refresh's Part H, where it was 24.

@@ -1,3 +1,5 @@
+//! The browser: its state, `update` and `view`.
+
 use super::*;
 
 /// What this window is called, in its own title bar and in the shell's window list.

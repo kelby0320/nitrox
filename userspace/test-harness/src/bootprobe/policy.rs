@@ -1,3 +1,5 @@
+//! The policy and grace-period tests.
+
 use super::*;
 
 /// **A remembered password, and everything that must not use it** (the laptop polish's Part A).

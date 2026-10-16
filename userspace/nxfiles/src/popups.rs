@@ -1,3 +1,5 @@
+//! The popups' faces: the menu, a confirmation, properties.
+
 use super::*;
 
 impl App {

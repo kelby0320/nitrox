@@ -83,11 +83,11 @@ pub use exit::*;
 pub use ipc::*;
 pub use objects::*;
 pub use online::*;
+use placement::*;
 pub use preempt::*;
 pub use spawn::*;
 pub use timers::*;
 pub use wait::*;
-use placement::*;
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
 // monotonic clock is reached via the full path `crate::arch::Timer::read_ns()`
@@ -889,7 +889,6 @@ pub fn ready_is_empty() -> bool {
     // Globally empty: no CPU has a runnable thread queued. Used by the boot drainers.
     SCHED.lock().ready.iter().all(|q| q.is_empty())
 }
-
 
 /// Rust entry reached from
 /// [`thread_trampoline`](crate::arch::thread_trampoline) the first time a

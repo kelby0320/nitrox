@@ -1,3 +1,5 @@
+//! The window list: entries, desktops and their labels.
+
 use super::*;
 
 /// One entry in the bottom bar's window list.

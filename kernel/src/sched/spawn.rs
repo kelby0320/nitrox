@@ -1,3 +1,5 @@
+//! Spawning threads and processes, and bringing up each CPU's scheduler.
+
 use super::*;
 
 /// Pre-reserved capacity for [`SchedState::ended_pids`]. Exit pushes into it under

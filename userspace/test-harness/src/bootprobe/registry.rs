@@ -1,3 +1,5 @@
+//! The registry, device and I/O-counter tests.
+
 use super::*;
 
 /// **Wait `ns`**, on a channel of its own that nothing signals: `sys_wait` takes an absolute deadline

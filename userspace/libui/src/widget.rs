@@ -116,7 +116,6 @@ pub fn button<Msg>(label: impl Into<String>, msg: Msg, state: WidgetState, theme
     stack(layers).on_press(msg).focusable()
 }
 
-
 /// The radius every small control on a surface is rounded to: the design's `--r`, 8 — the same
 /// curve a window and a popup are cut to.
 ///
@@ -134,8 +133,6 @@ const RING: u32 = 2;
 /// a state; an edge is what makes a shape a control at rest, and a second pixel of it would
 /// compete with the ring instead of sitting under it.
 const BORDER: u32 = 1;
-
-
 
 #[cfg(test)]
 mod list_view_tests;

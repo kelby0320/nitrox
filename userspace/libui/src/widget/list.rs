@@ -1,3 +1,5 @@
+//! The list view: rows, columns, row buttons and swatches.
+
 use super::*;
 
 /// One row of a [`list_view`].

@@ -1,3 +1,5 @@
+//! Where a thread runs: weights, vruntime, the CPU chosen and work stolen.
+
 use super::*;
 
 /// `NICE_0_WEIGHT` and the Linux-style nice→weight table (nice `-20..=19`).

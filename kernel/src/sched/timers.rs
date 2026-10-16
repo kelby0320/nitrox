@@ -1,3 +1,5 @@
+//! Timers and deadlines, armed and fired.
+
 use super::*;
 
 /// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the

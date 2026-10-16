@@ -1,3 +1,5 @@
+//! Asking a window to close, and insisting.
+
 use super::*;
 
 /// How long a close request stays armed for the click that insists on it.

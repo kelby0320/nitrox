@@ -1,3 +1,5 @@
+//! The service, restart, power-endpoint and log tests.
+
 use super::*;
 
 /// **A restarted server is reached again at its path** (administration Part E.1).

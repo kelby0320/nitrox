@@ -1,3 +1,5 @@
+//! The overview: cards, miniatures and window captures.
+
 use super::*;
 
 /// `theme`, as the overview wears it: light ink for a card's caption, on no ground of its own.
@@ -490,7 +492,13 @@ const OVERVIEW_GROUND_ALPHA: u8 = 210;
 /// `desktop_card` stacks windows in `entries` order, so the last one drawn is on top and is the
 /// one a press means; walking forwards would hand a press to whichever overlapping window
 /// happened to be first in the list.
-pub(super) fn window_in_card_at(x: i32, y: i32, desktops: &[Desktop], entries: &[WinEntry], screen: Screen) -> Option<u32> {
+pub(super) fn window_in_card_at(
+    x: i32,
+    y: i32,
+    desktops: &[Desktop],
+    entries: &[WinEntry],
+    screen: Screen,
+) -> Option<u32> {
     let i = desktop_shell::card_at(x, y, desktops.len(), screen)?;
     let card = desktop_shell::card_rect(i, desktops.len(), screen);
     let d = desktops[i].id;

@@ -1,3 +1,5 @@
+//! The wallpaper and the theme, read from disk.
+
 use super::*;
 
 /// The wallpaper, once it is on screen.

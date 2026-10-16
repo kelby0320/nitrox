@@ -1,3 +1,5 @@
+//! Logging out, restarting and shutting down: the ending dialog and the broker's answer.
+
 use super::*;
 
 /// Where a dialog of `size` goes over `base`, kept inside the work area.
@@ -254,7 +256,11 @@ pub(super) fn open_prompt(
 }
 
 /// Destroy the name prompt, forgetting what was typed into it.
-pub(super) fn close_prompt(session: &mut Session<ChannelTransport>, prompt: &mut Option<Child>, name: &mut TextFieldState) {
+pub(super) fn close_prompt(
+    session: &mut Session<ChannelTransport>,
+    prompt: &mut Option<Child>,
+    name: &mut TextFieldState,
+) {
     if let Some(c) = prompt.take() {
         let id = c.id();
         c.close(session);

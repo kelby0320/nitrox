@@ -1,3 +1,5 @@
+//! What the browser shows: entries, drives, panes, and the operations on them.
+
 use super::*;
 
 /// A drive the sidebar lists (Phase 6 Part F): a filesystem the storage service mounted under

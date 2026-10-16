@@ -1,3 +1,5 @@
+//! The single-line text field.
+
 use super::*;
 
 /// Space between a text field's content and its edge.

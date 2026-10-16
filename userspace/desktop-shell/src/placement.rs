@@ -1,3 +1,5 @@
+//! Placing, snapping, raising and minimizing windows.
+
 use super::*;
 
 /// How many window-geometry lines have been printed. See [`MAX_LOGGED_GEOMETRY`].

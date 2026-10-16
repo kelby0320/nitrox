@@ -1,3 +1,5 @@
+//! IPC delivery: sends, receives, and forwarding to a userspace server.
+
 use super::*;
 
 /// Send `msg` from `endpoint` (into its peer's receive ring) under `SCHED`,

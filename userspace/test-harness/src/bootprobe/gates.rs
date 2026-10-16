@@ -1,3 +1,5 @@
+//! The scheduler gate and the hard-float gate.
+
 use super::*;
 
 /// Find the first occurrence of `key` in `text` and parse the ASCII decimal

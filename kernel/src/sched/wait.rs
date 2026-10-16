@@ -1,3 +1,5 @@
+//! Blocking on objects, and waking.
+
 use super::*;
 
 /// Park the current thread (set `Blocked`, move into `blocked`) and switch to

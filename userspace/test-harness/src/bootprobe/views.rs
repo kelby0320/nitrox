@@ -1,3 +1,5 @@
+//! The view broker test.
+
 use super::*;
 
 /// **The view broker, through its own protocol** (administration Part A.3), before any shell or

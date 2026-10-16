@@ -1,3 +1,5 @@
+//! The filesystem tests: the page cache, writes, growth, creation and unlinked files.
+
 use super::*;
 
 // === the filesystem tests, moved out of PID 1 ==========================================

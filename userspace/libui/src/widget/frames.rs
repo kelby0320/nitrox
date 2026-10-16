@@ -1,3 +1,5 @@
+//! Window, popup and dialog frames.
+
 use super::*;
 
 /// A popup's backing: a one-pixel border, and the face inside it.
