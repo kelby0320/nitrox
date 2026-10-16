@@ -1,3 +1,4 @@
+mod display;
 mod fbcon;
 mod input;
 mod install;
@@ -13,6 +14,7 @@ mod shutdown;
 mod storage;
 mod terminal;
 
+pub(crate) use display::*;
 pub(crate) use fbcon::*;
 pub(crate) use input::*;
 pub(crate) use install::*;
