@@ -488,6 +488,7 @@ mod tests {
     }
 
     fn header_of(obj: *mut ()) -> &'static KObjectHeader {
+        // SAFETY: each test object is a kernel object, its header at offset 0, freed only after its last read.
         unsafe { &*(obj as *const KObjectHeader) }
     }
 
@@ -498,6 +499,7 @@ mod tests {
         assert_eq!(header_of(obj).refcount(), 1);
         assert_eq!(header_of(obj).object_type(), KObjectType::Process);
         // Reclaim.
+        // SAFETY: adopts the object's creation reference.
         drop(unsafe { ObjectRef::from_raw(obj, KObjectType::Process) });
     }
 
@@ -508,6 +510,7 @@ mod tests {
         assert_eq!(header_of(obj).refcount(), 2);
         // Two outstanding refs now: the implicit creation ref + this one.
         assert!(!header_of(obj).release()); // 2 -> 1
+        // SAFETY: adopts the object's creation reference.
         drop(unsafe { ObjectRef::from_raw(obj, KObjectType::Process) }); // 1 -> 0, destroy
     }
 
@@ -522,6 +525,7 @@ mod tests {
         assert_eq!(header_of(obj).refcount(), 0);
         // Manually free the leaked storage so the test does not leak: the
         // count is zero and nothing else references it.
+        // SAFETY: the count is zero and nothing else holds the storage, which came from a `KBox`.
         drop(unsafe { KBox::<Process>::from_raw(NonNull::new_unchecked(obj as *mut Process)) });
     }
 
@@ -538,6 +542,7 @@ mod tests {
         assert!(!header_of(obj).release());
         // The fourth is the last.
         assert!(header_of(obj).release());
+        // SAFETY: the count is zero and nothing else holds the storage, which came from a `KBox`.
         drop(unsafe { KBox::<Process>::from_raw(NonNull::new_unchecked(obj as *mut Process)) });
     }
 
@@ -546,6 +551,7 @@ mod tests {
         test_probe::reset();
         let obj = fresh_process(1);
         // Adopt the creation ref into an ObjectRef.
+        // SAFETY: adopts the object's creation reference.
         let r = unsafe { ObjectRef::from_raw(obj, KObjectType::Process) };
         let r2 = r.clone(); // count 2
         assert_eq!(header_of(obj).refcount(), 2);
@@ -558,7 +564,9 @@ mod tests {
     #[test]
     fn drop_runs_correct_destructor_per_type() {
         test_probe::reset();
+        // SAFETY: adopts the object's creation reference.
         let p = unsafe { ObjectRef::from_raw(fresh_process(1), KObjectType::Process) };
+        // SAFETY: adopts the object's creation reference.
         let t = unsafe { ObjectRef::from_raw(fresh_thread(1, 1), KObjectType::Thread) };
         drop(p);
         assert_eq!(test_probe::process_destroys(), 1);
@@ -571,10 +579,12 @@ mod tests {
     #[test]
     fn into_raw_then_from_raw_no_double_decrement() {
         test_probe::reset();
+        // SAFETY: adopts the object's creation reference.
         let r = unsafe { ObjectRef::from_raw(fresh_process(1), KObjectType::Process) };
         let (ptr, ty) = r.into_raw(); // forget, no decrement
         assert_eq!(header_of(ptr).refcount(), 1);
         assert_eq!(test_probe::process_destroys(), 0);
+        // SAFETY: re-adopts the reference `into_raw` gave up.
         let r2 = unsafe { ObjectRef::from_raw(ptr, ty) }; // adopt, no increment
         assert_eq!(header_of(ptr).refcount(), 1);
         drop(r2); // count 0, destroy once

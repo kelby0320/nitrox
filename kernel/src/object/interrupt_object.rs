@@ -217,6 +217,7 @@ mod tests {
         let p = KBox::into_raw(io).as_ptr() as *mut ();
         // SAFETY: live object, single-threaded test stands in for SCHED.
         assert!(!unsafe { InterruptObject::already_signaled(p) });
+        // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
         drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });
     }
 
@@ -237,6 +238,7 @@ mod tests {
             InterruptObject::consume(p);
             assert!(!InterruptObject::already_signaled(p));
         }
+        // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
         drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });
     }
 
@@ -255,6 +257,7 @@ mod tests {
             assert_eq!(n, 1);
             assert_eq!(buf[0], t2);
         }
+        // SAFETY: adopts the creation reference `into_raw` gave up, to drop it.
         drop(unsafe { ObjectRef::from_raw(p, KObjectType::InterruptObject) });
     }
 

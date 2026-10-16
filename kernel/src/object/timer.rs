@@ -128,6 +128,7 @@ impl Timer {
     /// See the accessor contract.
     #[cfg(test)]
     pub(crate) unsafe fn deadline(obj: *mut ()) -> u64 {
+        // SAFETY: the accessor contract: `obj` is a live `Timer` its caller pins, and `SCHED` is held.
         unsafe { Self::inner(obj) }.deadline_ns
     }
 

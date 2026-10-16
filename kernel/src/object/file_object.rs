@@ -1671,6 +1671,7 @@ mod tests {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
         // SAFETY: `into_raw` yields each single creation reference; adopt them.
         let ep = unsafe { ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel) };
+        // SAFETY: adopts the peer's creation reference, to drop it.
         drop(unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel) });
         let r = UserspaceServerReg::try_new(ep).unwrap();
         // SAFETY: as above.

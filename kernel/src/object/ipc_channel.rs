@@ -718,6 +718,7 @@ mod tests {
     /// Adopt the creation reference and drop it (running `IpcChannel::drop`,
     /// which unlinks the peer under `SCHED`).
     fn drop_endpoint(obj: *mut ()) {
+        // SAFETY: adopts the endpoint's creation reference, to drop it.
         drop(unsafe { ObjectRef::from_raw(obj, KObjectType::IpcChannel) });
     }
 
@@ -737,6 +738,7 @@ mod tests {
     /// As `IpcChannel::send_push`.
     unsafe fn push_no_xfer(obj: *mut (), msg: &StoredMsg) -> SendOutcome {
         let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        // SAFETY: this function's contract, forwarded.
         unsafe { IpcChannel::send_push(obj, msg, &mut t) }
     }
 
@@ -747,6 +749,7 @@ mod tests {
     /// As `IpcChannel::recv_pop_into`.
     unsafe fn pop_no_xfer(obj: *mut (), dst: &mut StoredMsg) -> bool {
         let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        // SAFETY: this function's contract, forwarded.
         unsafe { IpcChannel::recv_pop_into(obj, dst, &mut t) }
     }
 
@@ -908,6 +911,7 @@ mod tests {
         let (a, b) = new_pair();
         // An object to transfer (a Process; refcount 1 via its creation ref).
         let p = KBox::into_raw(Process::try_new(99).unwrap()).as_ptr() as *mut ();
+        // SAFETY: adopts the process's creation reference.
         let pref = unsafe { ObjectRef::from_raw(p, KObjectType::Process) };
         // SAFETY: live endpoints, single-threaded test.
         unsafe {
@@ -942,6 +946,7 @@ mod tests {
         test_probe::reset();
         let (a, b) = new_pair();
         let p = KBox::into_raw(Process::try_new(7).unwrap()).as_ptr() as *mut ();
+        // SAFETY: adopts the process's creation reference.
         let pref = unsafe { ObjectRef::from_raw(p, KObjectType::Process) };
         // SAFETY: live endpoints, single-threaded test.
         unsafe {

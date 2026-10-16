@@ -537,6 +537,7 @@ impl Thread {
     #[cfg(test)]
     pub(crate) unsafe fn state(obj: *mut ()) -> ThreadState {
         let p = obj as *mut Thread;
+        // SAFETY: the accessor contract: `obj` is a live `Thread` its caller pins, and `SCHED` is held.
         unsafe { core::ptr::read(&raw const (*p).state) }
     }
 

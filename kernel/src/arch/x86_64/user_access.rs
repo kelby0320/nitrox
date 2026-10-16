@@ -214,6 +214,7 @@ pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize)
     // Host stub: byte-by-byte copy until NUL or max_len.
     // SAFETY: forwarded; host tests use ordinary in-process buffers.
     let src_slice = unsafe { core::slice::from_raw_parts(src, max_len) };
+    // SAFETY: as above.
     let dst_slice = unsafe { core::slice::from_raw_parts_mut(dst, max_len) };
     for i in 0..max_len {
         dst_slice[i] = src_slice[i];

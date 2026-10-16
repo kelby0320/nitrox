@@ -3598,6 +3598,7 @@ mod tests {
         let h = t.allocate(1, ptr, KObjectType::Timer, timer_rights()).expect("timer_rights must be valid for a Timer");
         // Clean up: close releases the handle's ref, freeing the object.
         let co = t.close(h, 1).unwrap();
+        // SAFETY: the table's reference, which `close` handed back.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }
 
@@ -3620,6 +3621,7 @@ mod tests {
             .allocate(1, ptr, KObjectType::NotificationChannel, rights)
             .expect("WAIT + generic rights must be valid for a NotificationChannel");
         let co = t.close(h, 1).unwrap();
+        // SAFETY: the table's reference, which `close` handed back.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }
 
@@ -3644,6 +3646,7 @@ mod tests {
             .allocate(1, ptr, KObjectType::Namespace, namespace_rights())
             .expect("namespace_rights must be valid for a Namespace");
         let co = t.close(h, 1).unwrap();
+        // SAFETY: the table's reference, which `close` handed back.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }
 
@@ -3659,6 +3662,7 @@ mod tests {
             .allocate(1, ptr, KObjectType::EntropyObject, entropy_rights())
             .expect("entropy_rights must be valid for an EntropyObject");
         let co = t.close(h, 1).unwrap();
+        // SAFETY: the table's reference, which `close` handed back.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }
 
@@ -3762,6 +3766,7 @@ mod tests {
             .expect("channel_endpoint_rights must be valid for an IpcChannel");
         // Close endpoint a (frees it, nulling b's peer), then drop b's box.
         let co = t.close(h, 1).unwrap();
+        // SAFETY: the table's reference, which `close` handed back.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
         drop(b);
     }
@@ -4050,6 +4055,7 @@ mod tests {
             .expect("full_mem_rights must be valid for a MemoryObject");
         // Clean up: close releases the handle's ref, freeing the object.
         let co = t.close(h, 1).unwrap();
+        // SAFETY: the table's reference, which `close` handed back.
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }
 }

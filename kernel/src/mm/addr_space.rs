@@ -933,6 +933,7 @@ mod tests {
         let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 4)) };
         assert!(phys.is_some());
         // Address just past the page should be unmapped.
+        // SAFETY: `asp`'s root is the live page table this test built.
         let beyond = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) };
         assert!(beyond.is_none());
         assert_eq!(asp.len(), 1);
@@ -948,10 +949,13 @@ mod tests {
         // Each page in the range is mapped; the addresses immediately
         // before and after are not.
         for i in 8..16 {
+            // SAFETY: `asp`'s root is the live page table this test built.
             let p = unsafe { Paging::translate(asp.root(), va(PAGE * i)) };
             assert!(p.is_some(), "page {i} not mapped");
         }
+        // SAFETY: `asp`'s root is the live page table this test built.
         let before = unsafe { Paging::translate(asp.root(), va(PAGE * 7)) };
+        // SAFETY: `asp`'s root is the live page table this test built.
         let after = unsafe { Paging::translate(asp.root(), va(PAGE * 16)) };
         assert!(before.is_none());
         assert!(after.is_none());
@@ -969,6 +973,7 @@ mod tests {
         assert!(asp.is_empty());
 
         for i in 4..8 {
+            // SAFETY: `asp`'s root is the live page table this test built.
             let p = unsafe { Paging::translate(asp.root(), va(PAGE * i)) };
             assert!(p.is_none(), "page {i} still mapped after unmap");
         }
@@ -989,8 +994,10 @@ mod tests {
         assert_eq!(err.0.range, range(PAGE * 6, PAGE * 10));
 
         // The original mapping must be untouched.
+        // SAFETY: `asp`'s root is the live page table this test built.
         assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_some());
         // The rejected range's pages must NOT have been installed.
+        // SAFETY: `asp`'s root is the live page table this test built.
         assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 9)) }.is_none());
         assert_eq!(asp.len(), 1);
     }
@@ -1065,6 +1072,7 @@ mod tests {
         // Each mapped page translates to the object's own frame — not a
         // freshly allocated one (this is what makes the object shareable).
         for i in 0..3u64 {
+            // SAFETY: `asp`'s root is the live page table this test built.
             let phys = unsafe { Paging::translate(asp.root(), va(PAGE * (4 + i))) }.expect("page must be mapped");
             assert_eq!(phys, frames[i as usize], "page {i} not pointing at object frame");
         }
@@ -1083,7 +1091,9 @@ mod tests {
         asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
         asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), obj2).unwrap();
 
+        // SAFETY: `asp`'s root is the live page table this test built.
         let p1 = unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.unwrap();
+        // SAFETY: `asp`'s root is the live page table this test built.
         let p2 = unsafe { Paging::translate(asp.root(), va(PAGE * 8)) }.unwrap();
         assert_eq!(p1, frame0);
         assert_eq!(p2, frame0);
@@ -1104,6 +1114,7 @@ mod tests {
         asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
         let removed = asp.unmap_covering(va(PAGE * 4)).expect("unmap must find the covering vma");
         // PTE is gone.
+        // SAFETY: `asp`'s root is the live page table this test built.
         assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_none());
         // Dropping the removed VMA releases its object reference, but `keep`
         // still holds one — the object (and its frames) must NOT be freed.
@@ -1225,6 +1236,7 @@ mod tests {
 
         // File page 1 lives at VMA page 5 (range starts at page 4). Map it.
         assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
+        // SAFETY: `asp`'s root is the live page table this test built.
         let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) }.expect("page must now be mapped");
         assert_eq!(phys, frame, "PTE points at the cache frame");
         // Idempotent: a racing re-map of the same page still reports present.
@@ -1462,6 +1474,7 @@ mod tests {
         // Entry 5 is write-combining and entry 0 is write-back in the table the kernel programs
         // (`KERNEL_PAT`); the numbers are the architecture's, so they are read here rather than
         // named again.
+        // SAFETY: `asp`'s root is the live page table this test built.
         let index = |v: u64| unsafe { Paging::attribute_index(asp.root(), va(v)) };
         assert_eq!(index(PAGE * 4), Some(5), "the aperture's mapping");
         assert_eq!(index(PAGE * 8), Some(0), "ordinary memory's");

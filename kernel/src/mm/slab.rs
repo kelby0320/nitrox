@@ -728,6 +728,7 @@ mod tests {
         let desc = ((p as usize) & SLAB_MASK) as *mut SlabDescriptor;
         // SAFETY: test owns the allocation.
         let owner = unsafe { (*desc).owner };
+        // SAFETY: as above.
         let obj_size = unsafe { (*desc).obj_size };
         assert!(owner.is_null(), "large-alloc descriptor must have null owner");
         // The 32-byte header plus 8192 bytes of payload (= 8224 bytes,
