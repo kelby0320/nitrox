@@ -1,11 +1,10 @@
-//! **A diagnostic's level** (the laptop polish's Part E): error, warning or notice.
+//! **A diagnostic's level**: error, warning or notice.
 //!
 //! A diagnostic is one message on a pipeline's shared `stderr`, its payload the text
-//! ([`pipeline-stdio.md`](../../../docs/spec/pipeline-stdio.md)). The shell painted every one as an
-//! error, so a program's progress and its usage read as failures. Now a message may say what it is
-//! with **one leading byte**: [`NOTICE`] or [`WARNING`]. **A message whose first byte is neither is
-//! an error, whole** — which is every message a program not yet changed sends, so nothing that
-//! was an error stops being one. No text starts with either control.
+//! ([`pipeline-stdio.md`](../../../docs/spec/pipeline-stdio.md)). A message may say what it
+//! is with **one leading byte**: [`NOTICE`] or [`WARNING`]. **A message whose first byte is
+//! neither is an error, whole**, so a program that sends no level byte is still an error.
+//! No text starts with either control.
 
 use alloc::vec::Vec;
 
@@ -59,8 +58,7 @@ mod tests {
         assert_eq!(frame(Level::Error, b"x"), b"x", "an error carries no byte: it is today's message");
     }
 
-    /// **The reader, with messages no framed writer made**: every program that sends plain text
-    /// is still an error, and so is an empty message; only the two level bytes are taken as one.
+    /// Plain text and an empty message are errors; only the two level bytes are taken as one.
     #[test]
     fn a_message_without_a_level_byte_is_an_error_whole() {
         assert_eq!(parse(b"remove: /x: no such file"), (Level::Error, &b"remove: /x: no such file"[..]));

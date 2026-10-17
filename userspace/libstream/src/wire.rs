@@ -1,25 +1,13 @@
 //! TSM1 wire layer — the byte-level codec for typed streams.
 //!
-//! This module is the **canonical source** for the parts the spec
-//! (`docs/spec/typed-stream-format.md`) leaves "to `libstream`": the [`TypeTag`] byte
-//! values and the exact value/schema/header/terminator encodings. Everything is
-//! little-endian (native on x86_64/aarch64); the `TSM1` magic is the literal bytes
-//! `b"TSM1"`.
+//! The **canonical source** for what the spec (`docs/spec/typed-stream-format.md`) leaves
+//! "to `libstream`": the [`TypeTag`] byte values and the exact value/schema/header/
+//! terminator encodings. Everything is little-endian; the magic is the bytes `b"TSM1"`.
+//! The codec writes through [`ByteSink`] and reads through [`ByteSource`].
 //!
-//! The codec is transport-agnostic: it writes through [`ByteSink`] and reads through
-//! [`ByteSource`], so the same code buffers into a `Vec<u8>` (host tests, or an IPC
-//! message frame) or streams straight to a channel adapter (a later part).
-//!
-//! **Scalars + collections.** [`Value`] and [`read_value`]/[`write_value`] implement
-//! the scalar + `String`/`Bytes`/`Handle` types plus the two nested-cell collections:
-//! `List` ([`Value::List`], an `Arc<[Value]>`) and `Record` ([`Value::Record`], a
-//! sub-schema + values). A whole stream is [`Value::Table`] — the in-memory form of a
-//! header + rows + terminator, serialised via [`Table::encode`]/[`Table::decode`], not
-//! as a nested cell (a table is a stream, not a value tag). The collection variants are
-//! persistent: each is `Arc`-shared, so cloning a [`Value`] is a refcount bump, and the
-//! shell's copy-on-write "mutation" is a cheap rebind (see the shell design doc §9d).
-//! Only the value-level `Error` tag remains reserved (returns [`WireError::Unsupported`]);
-//! `Null`, nullable fields, error records, and the terminator are all implemented.
+//! A whole stream is [`Value::Table`], serialised via [`Table::encode`]/[`Table::decode`],
+//! not as a nested cell. `List` and `Record` are `Arc`-shared, so cloning a [`Value`] is a
+//! refcount bump. Only the value-level `Error` tag is reserved ([`WireError::Unsupported`]).
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -28,18 +16,13 @@ use alloc::vec::Vec;
 /// The 4-byte stream magic — ASCII `"TSM1"` (Typed Stream Magic, version 1).
 pub const MAGIC: [u8; 4] = *b"TSM1";
 
-/// Upper bound used only as a `Vec::with_capacity` *hint* when decoding a schema's
-/// field list, so a malformed huge `field_count` cannot trigger a giant up-front
-/// allocation. The actual count is still honoured (each field read is bounds-checked
-/// against the input, so an over-large count simply errors out on EOF).
+/// Cap on the `Vec::with_capacity` hint for a schema's field list, so a malformed huge
+/// `field_count` cannot force a giant allocation; the count itself is still honoured and
+/// errors out on EOF.
 const SCHEMA_FIELD_HINT_CAP: usize = 64;
 
-// --- Type tags --------------------------------------------------------------
-
 /// Structural type of a schema field / value. The byte values are **pinned here** —
-/// the spec defers them to `libstream`. v1 encodes `Null`..=`Handle`; `List`/`Record`
-/// (and the value-level `Error`) are reserved: recognised on the wire but not yet
-/// encoded/decoded (see the module docs).
+/// the spec defers them to `libstream`. The value-level `Error` tag is reserved.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TypeTag {
@@ -55,9 +38,8 @@ pub enum TypeTag {
     String = 0x04,
     /// `u32` length + that many raw bytes.
     Bytes = 0x05,
-    /// 8 bytes, little-endian `RawHandle` (`u64`). The value here is the numeric
-    /// handle; making it valid in the receiver is the transport's job (IPC handle
-    /// transfer), not this codec's.
+    /// 8 bytes, little-endian `RawHandle` (`u64`); making it valid in the receiver is
+    /// the transport's job, not this codec's.
     Handle = 0x06,
     /// `u32` count, then each element as a `u8` tag + that value's bytes
     /// (self-describing, so a list may be heterogeneous). Decodes to [`Value::List`].
@@ -65,8 +47,7 @@ pub enum TypeTag {
     /// A nested sub-schema (as [`Schema::encode`]) + one row of values. Decodes to
     /// [`Value::Record`].
     Record = 0x08,
-    /// Nested error structure (as a field value, distinct from an error *record*).
-    /// **Reserved in v1.**
+    /// Nested error structure (a field value, not an error *record*). **Reserved.**
     Error = 0x09,
 }
 
@@ -100,8 +81,6 @@ pub const REC_DATA: u8 = 0x01;
 pub const REC_ERROR: u8 = 0x02;
 /// Record tag: the **terminator** (end of stream, carries the producer's exit status).
 pub const REC_TERMINATOR: u8 = 0xFF;
-
-// --- Flag / modifier bitfields (hand-rolled; no `bitflags` crate) -----------
 
 /// Stream-level flags in the header (`StreamFlags` in the spec).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -143,8 +122,6 @@ impl TypeModifiers {
     }
 }
 
-// --- Errors -----------------------------------------------------------------
-
 /// A wire encode/decode failure.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WireError {
@@ -160,24 +137,20 @@ pub enum WireError {
     BadUtf8,
     /// A recognised but not-yet-implemented type (the value-level `Error` tag).
     Unsupported(TypeTag),
-    /// A [`Value::Table`] was used where a nested **cell** value is required (a row
-    /// field, list element, or record field). A table is a *stream*, not a cell: it has
+    /// A [`Value::Table`] was used where a nested cell value is required; a table has
     /// no [`TypeTag`] and serialises via [`Table::encode`], never [`write_value`].
     NestedTable,
     /// The sink refused the write (e.g. a fixed frame is full).
     SinkFull,
     /// A Tier-1 setup message did not fit in one IPC payload.
     ///
-    /// Deliberately distinct from [`SinkFull`](Self::SinkFull): a full channel is a
-    /// transport condition a caller may retry, while this is a *configuration* problem —
-    /// usually an environment that outgrew `IPC_PAYLOAD_SIZE` — and retrying will never
-    /// help. The escape, when it starts to matter, is a memory object carrying the block;
-    /// the setup message already transfers handles.
+    /// Distinct from [`SinkFull`](Self::SinkFull): a full channel may be retried, but this
+    /// is a configuration problem (an environment that outgrew `IPC_PAYLOAD_SIZE`) and
+    /// retrying never helps.
     SetupTooLarge,
     /// The transport's peer closed its end mid-stream (a channel `ByteSink`/reader).
-    /// Per the pipeline model (design §1), a producer treats this as "stop producing,
-    /// exit cleanly" — the early-consumer-cancel case (`yes | head -1`). Never produced
-    /// by the in-memory codec; only by the channel transport ([`crate::channel`]).
+    /// A producer treats this as "stop producing, exit cleanly" (`yes | head -1`). Only
+    /// the channel transport ([`crate::channel`]) produces it.
     PeerClosed,
     /// A record's values don't match the schema: wrong field count, a `Null` in a
     /// non-nullable field, a value whose type differs from its column, or a write in
@@ -189,8 +162,6 @@ pub enum WireError {
 
 /// Codec result.
 pub type Result<T> = core::result::Result<T, WireError>;
-
-// --- Byte sink / source seams ----------------------------------------------
 
 /// A byte destination for the encoder. `Vec<u8>` implements it (buffering / host
 /// tests); a channel adapter implements it over an IPC frame + `sys_channel_send`.
@@ -206,18 +177,15 @@ impl ByteSink for Vec<u8> {
     }
 }
 
-/// Forwarding impl so a `&mut S` can be handed to something that takes a `ByteSink`
-/// by value (e.g. `TableWriter::new(&mut sink)`), keeping ownership with the caller.
+/// Forwarding impl so a `&mut S` can be passed where a `ByteSink` is taken by value.
 impl<S: ByteSink + ?Sized> ByteSink for &mut S {
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
         (**self).put(bytes)
     }
 }
 
-/// A [`ByteSink`] over a caller-owned fixed buffer — the practical transport primitive:
-/// a program encodes a stream straight into an `IpcMsg` body, then `sys_channel_send`s
-/// [`as_bytes`](SliceSink::as_bytes). Overflowing the buffer fails with
-/// [`WireError::SinkFull`] (backpressure) rather than truncating.
+/// A [`ByteSink`] over a caller-owned fixed buffer, such as an `IpcMsg` body. Overflow
+/// fails with [`WireError::SinkFull`] rather than truncating.
 pub struct SliceSink<'a> {
     buf: &'a mut [u8],
     len: usize,
@@ -339,8 +307,6 @@ impl<'a> ByteSource<'a> {
     }
 }
 
-// --- Primitive writers ------------------------------------------------------
-
 /// Write one byte.
 pub fn put_u8(s: &mut impl ByteSink, v: u8) -> Result<()> {
     s.put(&[v])
@@ -364,10 +330,7 @@ pub fn put_lenpfx(s: &mut impl ByteSink, bytes: &[u8]) -> Result<()> {
     s.put(bytes)
 }
 
-// --- Values -----------------------------------------------------------------
-
-/// A single typed value — the payload of one field in a data record. v1 covers the
-/// scalar + `String`/`Bytes`/`Handle` types; `List`/`Record` values are reserved.
+/// A single typed value — the payload of one field in a data record.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Value {
     /// Absent (a `NULLABLE` field with no value, or a `Null`-typed field).
@@ -382,23 +345,19 @@ pub enum Value {
     Str(String),
     /// A raw byte blob.
     Bytes(Vec<u8>),
-    /// A raw handle value (numeric; transport makes it live in the receiver).
+    /// A raw handle value (numeric).
     Handle(u64),
-    /// A list of values ([`TypeTag::List`]). Persistent: `Arc`-shared, so cloning is a
-    /// refcount bump. May be heterogeneous (each element is self-describing on the wire).
+    /// A list of values ([`TypeTag::List`]); may be heterogeneous.
     List(Arc<[Value]>),
-    /// A record — named, typed fields with a value each ([`TypeTag::Record`]). Persistent
-    /// (`Arc`-shared). See [`Record`].
+    /// A record ([`TypeTag::Record`]). See [`Record`].
     Record(Arc<Record>),
-    /// A whole table/stream ([`Table`]). Persistent (`Arc`-shared). Not a nested cell —
-    /// it has no [`TypeTag`] and serialises via [`Table::encode`], so [`type_tag`](Self::type_tag)
-    /// reports `None` for it and [`write_value`] refuses it ([`WireError::NestedTable`]).
+    /// A whole table/stream ([`Table`]); [`type_tag`](Self::type_tag) reports `None` and
+    /// [`write_value`] refuses it ([`WireError::NestedTable`]).
     Table(Arc<Table>),
 }
 
-/// A **record value**: named, typed fields (a sub-schema) with one value each — the
-/// in-memory form of the [`TypeTag::Record`] nested-cell encoding. Persistent: shared
-/// via [`Value::Record`]'s `Arc`, never mutated in place (the shell rebinds copies).
+/// A **record value**: a sub-schema with one value per field — the in-memory form of the
+/// [`TypeTag::Record`] encoding, shared via [`Value::Record`]'s `Arc`.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Record {
     /// The fields' names, types, and modifiers, in wire order.
@@ -409,30 +368,19 @@ pub struct Record {
 
 impl Record {
     /// The string value of the field called `name`, if there is one.
-    ///
-    /// **Because `schema.fields.iter().position(…)` is written in nine places**, in `nxsh`'s
-    /// evaluator, its ops, and every graphical client that reads `HOME` off its setup message.
-    /// Each copy is three lines and each one has to remember that the schema and the values are
-    /// positionally aligned; a caller reaching for a field by name should not have to know that
-    /// (M11 Part C).
     pub fn field_str(&self, name: &str) -> Option<&str> {
         let i = self.schema.fields.iter().position(|f| f.name == name)?;
         self.values.get(i)?.as_str()
     }
 
     /// This record with `name` set to `value` — replacing it if the field is already there.
-    ///
-    /// **Appended rather than inserted**, so a reader that walks fields positionally sees what it
-    /// saw before with one more at the end. Used by `desktop-shell` to hand each application the
-    /// theme on the environment record it already forwards.
+    /// Appended rather than inserted, so a reader that walks fields positionally sees what
+    /// it saw before with one more at the end.
     pub fn with_str_field(mut self, name: &str, value: &str) -> Self {
         let v = Value::Str(String::from(value));
         match self.schema.fields.iter().position(|f| f.name == name) {
             Some(i) => {
-                // **The tag moves with the value.** Overwriting a `List` field with a string and
-                // leaving the schema saying `List` is a record whose own description is wrong —
-                // harmless for `THEME`, which is always a string, and a trap for the first caller
-                // who replaces something else (PR #263 review, optional 4).
+                // The tag moves with the value, or the schema would misdescribe the field.
                 self.schema.fields[i].ty = TypeTag::String;
                 self.schema.fields[i].modifiers = TypeModifiers::NONE;
                 self.values[i] = v;
@@ -446,10 +394,8 @@ impl Record {
     }
 }
 
-/// A **table value**: a schema and its rows — the in-memory form of a whole TSM1 stream
-/// (header + data records + terminator). Persistent: shared via [`Value::Table`]'s `Arc`.
-/// Unlike [`Value::List`]/[`Value::Record`] a table is a *stream*, not a nested cell: it
-/// has no [`TypeTag`] and round-trips through [`Table::encode`]/[`Table::decode`].
+/// A **table value**: a schema and its rows — the in-memory form of a whole TSM1 stream,
+/// shared via [`Value::Table`]'s `Arc`. It round-trips through [`Table::encode`]/[`Table::decode`].
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Table {
     /// Stream-level flags (from the header).
@@ -461,8 +407,7 @@ pub struct Table {
 }
 
 impl Value {
-    /// The [`TypeTag`] this value encodes as, or `None` for [`Value::Table`] (a stream,
-    /// not a cell — it has no tag and cannot appear as a field/element value). `Null`
+    /// The [`TypeTag`] this value encodes as, or `None` for [`Value::Table`]. `Null`
     /// reports [`TypeTag::Null`]; a nullable field carries its declared tag regardless.
     pub fn type_tag(&self) -> Option<TypeTag> {
         Some(match self {
@@ -549,11 +494,9 @@ impl Value {
     }
 }
 
-/// Encode a value's bytes (no tag byte — the tag lives in the schema, and any
-/// `NULLABLE` presence byte is written by the record layer). A [`Value::List`] /
-/// [`Value::Record`] carries its own inner types self-describingly (see [`TypeTag`]);
-/// a [`Value::Table`] is a stream, not a cell, so it is refused with
-/// [`WireError::NestedTable`] — serialise it via [`Table::encode`] instead.
+/// Encode a value's bytes (no tag byte — the tag lives in the schema, and any `NULLABLE`
+/// presence byte is written by the record layer). A [`Value::Table`] is refused with
+/// [`WireError::NestedTable`]; use [`Table::encode`].
 pub fn write_value(sink: &mut impl ByteSink, v: &Value) -> Result<()> {
     match v {
         Value::Null => Ok(()),
@@ -572,9 +515,8 @@ pub fn write_value(sink: &mut impl ByteSink, v: &Value) -> Result<()> {
     }
 }
 
-/// Encode a list body: `u32` count, then each element as a `u8` [`TypeTag`] + that
-/// value's bytes (self-describing, so heterogeneous lists round-trip). A [`Value::Table`]
-/// element is refused ([`WireError::NestedTable`]) — tables are streams, not cells.
+/// Encode a list body: `u32` count, then each element as a `u8` [`TypeTag`] + its bytes.
+/// A [`Value::Table`] element is refused ([`WireError::NestedTable`]).
 fn write_list(sink: &mut impl ByteSink, items: &[Value]) -> Result<()> {
     put_u32(sink, items.len() as u32)?;
     for e in items {
@@ -585,10 +527,8 @@ fn write_list(sink: &mut impl ByteSink, items: &[Value]) -> Result<()> {
     Ok(())
 }
 
-/// Decode a value of the given `tag`. Does not consume a `NULLABLE` presence byte —
-/// that is the record layer's job (it reads presence, then calls this if present).
-/// Handles `List`/`Record` (as [`Value::List`]/[`Value::Record`]); the value-level
-/// `Error` tag is still [`WireError::Unsupported`].
+/// Decode a value of the given `tag`. Does not consume a `NULLABLE` presence byte; the
+/// record layer reads presence, then calls this. The `Error` tag is [`WireError::Unsupported`].
 pub fn read_value(src: &mut ByteSource, tag: TypeTag) -> Result<Value> {
     Ok(match tag {
         TypeTag::Null => Value::Null,
@@ -611,8 +551,7 @@ pub fn read_value(src: &mut ByteSource, tag: TypeTag) -> Result<Value> {
 /// Decode a list body written by [`write_list`].
 fn read_list(src: &mut ByteSource) -> Result<Value> {
     let n = src.u32()? as usize;
-    // Cap the pre-allocation so a bogus huge count can't OOM us; each element read is
-    // still bounds-checked, so an over-large count simply errors out on EOF.
+    // Capped pre-allocation: a bogus huge count errors out on EOF instead.
     let mut items = Vec::with_capacity(n.min(SCHEMA_FIELD_HINT_CAP));
     for _ in 0..n {
         let tb = src.u8()?;
@@ -622,10 +561,8 @@ fn read_list(src: &mut ByteSource) -> Result<Value> {
     Ok(Value::List(Arc::from(items)))
 }
 
-/// Encode a row of `values` against `schema`: for each field, a `NULLABLE` presence byte
-/// where the column declares it, then the value's bytes. Errors on a count / type /
-/// nullness mismatch. Shared by data rows ([`TableWriter`](crate::table::TableWriter)),
-/// [`Value::Record`], and [`Table`] rows so all three frame values identically.
+/// Encode a row of `values` against `schema`: a `NULLABLE` presence byte where the column
+/// declares it, then the value's bytes. Errors on a count / type / nullness mismatch.
 pub fn write_row_values(sink: &mut impl ByteSink, schema: &Schema, values: &[Value]) -> Result<()> {
     if values.len() != schema.fields.len() {
         return Err(WireError::SchemaMismatch);
@@ -641,7 +578,6 @@ pub fn write_row_values(sink: &mut impl ByteSink, schema: &Schema, values: &[Val
         } else if is_null {
             return Err(WireError::SchemaMismatch);
         }
-        // A present value's type must match its column (`Null` columns take `Null`).
         if value.type_tag() != Some(f.ty) {
             return Err(WireError::SchemaMismatch);
         }
@@ -650,9 +586,7 @@ pub fn write_row_values(sink: &mut impl ByteSink, schema: &Schema, values: &[Val
     Ok(())
 }
 
-/// Decode a row of values against `schema` (inverse of [`write_row_values`]): reads a
-/// `NULLABLE` presence byte where declared, then the value. Shared by the same three
-/// call sites as [`write_row_values`].
+/// Decode a row of values against `schema` (inverse of [`write_row_values`]).
 pub fn read_row_values(src: &mut ByteSource, schema: &Schema) -> Result<Vec<Value>> {
     let mut out = Vec::with_capacity(schema.fields.len().min(SCHEMA_FIELD_HINT_CAP));
     for f in &schema.fields {
@@ -665,8 +599,8 @@ pub fn read_row_values(src: &mut ByteSource, schema: &Schema) -> Result<Vec<Valu
 
 impl Table {
     /// Serialise as a complete TSM1 stream: header (`flags` + `schema`), one `REC_DATA`
-    /// record per row, then the terminator (exit status `0` — a table *value* carries no
-    /// pipeline status; that rides separately, see the shell design doc §9f).
+    /// record per row, then the terminator (exit status `0`; a table value carries no
+    /// pipeline status).
     pub fn encode(&self, sink: &mut impl ByteSink) -> Result<()> {
         encode_header(sink, self.flags, &self.schema)?;
         for row in &self.rows {
@@ -697,8 +631,6 @@ impl Table {
     }
 }
 
-// --- Schema -----------------------------------------------------------------
-
 /// One column of a schema: a name, a type, and modifiers.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FieldDef {
@@ -706,12 +638,11 @@ pub struct FieldDef {
     pub name: String,
     /// The column's structural type.
     pub ty: TypeTag,
-    /// Per-field modifiers (e.g. [`TypeModifiers::NULLABLE`]).
+    /// Per-field modifiers.
     pub modifiers: TypeModifiers,
 }
 
-/// A schema: the ordered columns of a stream. A zero-field schema is valid (a
-/// record-free stream — just a terminator).
+/// A schema: the ordered columns of a stream. A zero-field schema is valid.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Schema {
     /// The columns, in declaration (and wire) order.
@@ -758,8 +689,6 @@ impl Schema {
     }
 }
 
-// --- Header -----------------------------------------------------------------
-
 /// Encode the stream header: `TSM1` magic, `flags`, then the `schema`.
 pub fn encode_header(sink: &mut impl ByteSink, flags: StreamFlags, schema: &Schema) -> Result<()> {
     sink.put(&MAGIC)?;
@@ -777,18 +706,14 @@ pub fn decode_header(src: &mut ByteSource) -> Result<(StreamFlags, Schema)> {
     Ok((flags, schema))
 }
 
-// --- Terminator -------------------------------------------------------------
-
 /// Write the terminator record: tag `0xFF` + the producer's `exit_status`.
 pub fn encode_terminator(sink: &mut impl ByteSink, exit_status: i32) -> Result<()> {
     put_u8(sink, REC_TERMINATOR)?;
     put_i32(sink, exit_status)
 }
 
-// --- Error record -----------------------------------------------------------
-
-/// A structured error embedded mid-stream (record tag [`REC_ERROR`]). Generic
-/// operators pass these through unchanged; the consuming end renders them.
+/// A structured error embedded mid-stream (record tag [`REC_ERROR`]): generic operators pass it
+/// through unchanged, and the consuming end renders it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WireErrorRecord {
     /// `KError` discriminant, or `0` if not a kernel error.
@@ -809,8 +734,7 @@ impl WireErrorRecord {
         sink.put(self.field_name.as_bytes())
     }
 
-    /// Decode the record **body**, i.e. after the `0x02` tag has already been read
-    /// (the record loop reads the tag to dispatch, then calls this).
+    /// Decode the record **body**, after the `0x02` tag has been read.
     pub fn decode_body(src: &mut ByteSource) -> Result<WireErrorRecord> {
         let code = src.i32()?;
         let message = src.string()?;
@@ -881,7 +805,6 @@ mod tests {
 
     #[test]
     fn list_values_round_trip() {
-        // Empty, homogeneous, heterogeneous, and nested lists.
         value_round_trip(Value::List(Arc::from(&[][..])));
         value_round_trip(Value::List(Arc::from(&[Value::Int(1), Value::Int(2), Value::Int(3)][..])));
         value_round_trip(Value::List(Arc::from(
@@ -898,17 +821,14 @@ mod tests {
             .field("name", TypeTag::String, TypeModifiers::NONE)
             .field("size", TypeTag::Int, TypeModifiers::NONE)
             .field("note", TypeTag::String, TypeModifiers::NULLABLE);
-        // Present nullable field.
         value_round_trip(Value::Record(Arc::new(Record {
             schema: schema.clone(),
             values: vec![Value::Str(String::from("a")), Value::Int(10), Value::Str(String::from("ok"))],
         })));
-        // Absent nullable field (presence byte = 0).
         value_round_trip(Value::Record(Arc::new(Record {
             schema,
             values: vec![Value::Str(String::from("b")), Value::Int(20), Value::Null],
         })));
-        // A record whose field is itself a list (nested collection cell).
         let nested = Schema::new().field("tags", TypeTag::List, TypeModifiers::NONE);
         value_round_trip(Value::Record(Arc::new(Record {
             schema: nested,
@@ -938,12 +858,10 @@ mod tests {
 
     #[test]
     fn table_is_not_a_cell_value() {
-        // A table has no cell tag and cannot be written as a nested value…
         let table = Value::Table(Arc::new(Table::default()));
         assert_eq!(table.type_tag(), None);
         let mut buf = Vec::new();
         assert_eq!(write_value(&mut buf, &table), Err(WireError::NestedTable));
-        // …including as a list element.
         let list = Value::List(Arc::from(&[table][..]));
         assert_eq!(write_value(&mut Vec::new(), &list), Err(WireError::NestedTable));
     }
@@ -966,7 +884,6 @@ mod tests {
         let mut buf = Vec::new();
         encode_header(&mut buf, flags, &schema).unwrap();
 
-        // Sanity: the stream literally starts with "TSM1".
         assert_eq!(&buf[..4], b"TSM1");
 
         let mut src = ByteSource::new(&buf);
@@ -994,7 +911,6 @@ mod tests {
 
     #[test]
     fn truncated_input_is_eof_not_panic() {
-        // A header claiming one field but cut off mid-name.
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC);
         put_u32(&mut buf, 0).unwrap(); // flags
