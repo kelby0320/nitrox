@@ -9,18 +9,19 @@ type R<T> = Result<T, Box<dyn std::error::Error>>;
 
 const TARGET_PERCENT: usize = 15;
 
-/// A directory's comment lines against what it may hold: 0.15 of its code, or a line for each public
-/// item and field and each `TODO(tag)`, whichever is more.
+/// A directory's comment lines against what it may hold: 0.15 of its code, on top of the docs the
+/// rules require — a line for each public item and field, each `TODO(tag)` and each module.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Budget {
     code: usize,
     comments: usize,
     floor: usize,
+    files: usize,
 }
 
 impl Budget {
     fn allowed(&self) -> usize {
-        (self.code * TARGET_PERCENT / 100).max(self.floor)
+        self.code * TARGET_PERCENT / 100 + self.floor + self.files
     }
 }
 
@@ -53,7 +54,7 @@ fn is_todo(comment: &str) -> bool {
 }
 
 fn budget(files: &[(String, String)]) -> Budget {
-    let mut b = Budget::default();
+    let mut b = Budget { files: files.len(), ..Budget::default() };
     for (file, text) in files {
         let lines: Vec<Line> = text
             .lines()
@@ -107,14 +108,14 @@ pub(crate) fn cmd_ratio(args: &[String]) -> R<()> {
     let b = budget(&files);
     let ratio = |n: usize| n as f64 / b.code as f64;
     let line = format!(
-        "{dir}: {} comment lines to {} of code, {:.3}; it may hold {} ({:.3}: 0.15, or {} public items and \
-         TODOs)",
+        "{dir}: {} comment lines to {} of code, {:.3}; it may hold {} (0.15 of its code, and {} public items \
+         and TODOs and {} modules)",
         b.comments,
         b.code,
         ratio(b.comments),
         b.allowed(),
-        ratio(b.allowed()),
-        b.floor
+        b.floor,
+        b.files
     );
     if b.comments <= b.allowed() {
         println!("check-comments: {line} ✓");
@@ -235,9 +236,9 @@ mod tests {
     #[test]
     fn a_crate_at_its_allowance_passes_and_one_line_over_fails() {
         let code: String = (0..20).map(|i| format!("let x{i} = {i};\n")).collect();
-        let at = format!("{code}// one\n// two\n// three\n");
+        let at = format!("{code}//! The module.\n// one\n// two\n// three\n");
         let b = crate_of(&at);
-        assert_eq!((b.code, b.comments, b.allowed()), (20, 3, 3));
+        assert_eq!((b.code, b.comments, b.allowed()), (20, 4, 4));
         assert!(b.comments <= b.allowed());
         let over = crate_of(&format!("{at}// four\n"));
         assert!(over.comments > over.allowed(), "{over:?}");
@@ -249,6 +250,13 @@ mod tests {
             "// SAFETY: the pointer is live.\nunsafe { f() };\n/// A thing.\npub fn a() {}\npub struct S {\n    pub field: u32,\n    private: u32,\n}\npub const C: u32 = 1;\npub const fn d() {}\n// TODO(tag): later.\n",
         );
         assert_eq!((b.code, b.comments, b.floor), (8, 2, 6));
+    }
+
+    #[test]
+    fn the_required_docs_are_on_top_of_the_share_of_code() {
+        let code: String = (0..20).map(|i| format!("pub fn f{i}() {{}}\n")).collect();
+        let b = budget(&[("a.rs".to_string(), code.clone()), ("b.rs".to_string(), code)]);
+        assert_eq!((b.code, b.floor, b.files, b.allowed()), (40, 40, 2, 6 + 40 + 2));
     }
 
     #[test]

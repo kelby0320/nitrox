@@ -45,8 +45,8 @@ pub(crate) fn print_help() {
            check-docs      fail if a doc links to, or cites, a path that does not exist\n  \
            check-comments  fail if new comments exceed 0.15 of new code plus 3, or cite a PR or part;\n  \
            \x20               `--base REF` measures from its merge base (default origin/main);\n  \
-           \x20               `--ratio DIR`: DIR's comments against 0.15 of its code, or its public\n  \
-           \x20               items' docs; `--only-comments [REV|--worktree]`: fail on code changed\n  \
+           \x20               `--ratio DIR`: DIR's comments against 0.15 of its code, beside the\n  \
+           \x20               docs its public items and modules need; `--only-comments [REV|--worktree]`: fail on code changed\n  \
            check-size      fail if a Rust file passes 1,000 lines or its baseline entry; `--update`\n  \
            \x20               lowers stale entries, `--rename OLD NEW` moves one with its file,\n  \
            \x20               `--split OLD NEW...` moves one onto what the file was split into\n  \
