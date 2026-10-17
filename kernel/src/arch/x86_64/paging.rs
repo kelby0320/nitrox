@@ -1,19 +1,14 @@
-//! x86_64 4-level page-table management: the [`ArchPaging`]
-//! implementation, the page-table-entry format, and the table walk.
+//! x86_64 4-level page-table management: the [`ArchPaging`] implementation, the
+//! page-table-entry format, and the table walk.
 //!
-//! x86_64 long mode translates a 48-bit canonical virtual address through
-//! four levels — PML4 → PDPT → PD → PT — each a 4 KiB frame of 512
-//! 8-byte entries, indexed by a 9-bit slice of the address; the low 12
-//! bits are the page offset. This module implements only 4 KiB leaf
-//! pages: [`map_page`](X86Paging::map_page) never sets the `PS` (huge)
-//! bit. [`translate`] *does* understand huge pages, because it is run
-//! against Limine's live tables, which may map memory with 2 MiB or
-//! 1 GiB pages.
+//! A 48-bit canonical address is translated through PML4 → PDPT → PD → PT, each a 4 KiB frame
+//! of 512 8-byte entries indexed by a 9-bit slice; the low 12 bits are the page offset.
+//! [`map_page`](X86Paging::map_page) maps only 4 KiB leaves and never sets `PS`, but
+//! [`translate`] understands huge pages because it also walks Limine's live tables, which may
+//! use 2 MiB or 1 GiB pages.
 //!
-//! Physical frames are reached through the higher-half direct map (HHDM):
-//! a table at physical address `p` is addressed at `p + hhdm_offset()`.
-//!
-//! 5-level paging (57-bit addresses) is a documented non-goal — see
+//! Physical frames are reached through the higher-half direct map (HHDM): a table at physical
+//! address `p` is at `p + hhdm_offset()`. 5-level paging is a documented non-goal — see
 //! `docs/rationale/deferred-decisions.md`.
 
 use crate::arch::paging::{ArchPaging, MapError, PageFlags, UnmapError};
@@ -22,14 +17,12 @@ use crate::libkern::SpinLock;
 use crate::libkern::lockrank::LockRank;
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
 
-/// Entries per page table at every level. A 4 KiB frame of 8-byte entries.
 const PAGE_TABLE_ENTRIES: usize = 512;
 
-// One page table is exactly one page frame — the invariant the HHDM walk
-// and `alloc_page_table` both rely on.
+// One page table is exactly one page frame, which the HHDM walk and `alloc_page_table` rely on.
 const _: () = assert!(size_of::<[Pte; PAGE_TABLE_ENTRIES]>() == PAGE_SIZE);
 
-// --- Page-table-entry bits ----------------------------------------------
+// --- Page-table-entry bits ---
 
 /// Entry is valid; the CPU may use it for translation.
 const PTE_PRESENT: u64 = 1 << 0;
@@ -41,8 +34,8 @@ const PTE_USER: u64 = 1 << 2;
 const PTE_PWT: u64 = 1 << 3;
 /// Page cache disable.
 const PTE_PCD: u64 = 1 << 4;
-/// Page size — at a non-leaf level this entry maps a huge page directly.
-/// This module never sets it; [`translate`] reads it.
+/// Page size: at a non-leaf level the entry maps a huge page directly. Never set here;
+/// [`translate`] reads it.
 const PTE_HUGE: u64 = 1 << 7;
 /// A 4 KiB leaf's `PAT` bit — the high bit of its attribute-table index.
 const PTE_PAT: u64 = 1 << 7;
@@ -58,53 +51,43 @@ const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 // --- Page-table entry ---------------------------------------------------
 
-/// A single x86_64 page-table entry, used at every level of the 4-level
-/// hierarchy. `#[repr(transparent)]` over `u64` so `[Pte; 512]` is
-/// exactly one 4 KiB page-table frame.
+/// A single x86_64 page-table entry, used at every level. `#[repr(transparent)]` over `u64`
+/// so `[Pte; 512]` is exactly one frame.
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct Pte(u64);
 
 impl Pte {
-    /// The all-zero (not-present) entry.
     const fn empty() -> Pte {
         Pte(0)
     }
 
-    /// `true` if the entry is valid for translation.
     const fn is_present(self) -> bool {
         self.0 & PTE_PRESENT != 0
     }
 
-    /// `true` if a non-leaf entry maps a huge page directly (`PS` set).
     const fn is_huge(self) -> bool {
         self.0 & PTE_HUGE != 0
     }
 
-    /// The physical address held in the entry's address field (bits 51:12).
     const fn phys(self) -> PhysAddr {
         PhysAddr::new(self.0 & PTE_ADDR_MASK)
     }
 
     /// A non-leaf entry pointing at child table `child`.
-    ///
-    /// Intermediate entries are made writable and user-accessible: on
-    /// x86 the *leaf* entry's flags decide a mapping's effective
-    /// permission, so permissive parents are the conventional choice and
-    /// let one sub-tree hold both kernel and (later) user leaves.
+    /// Intermediate entries are writable and user-accessible: the *leaf* entry's flags decide
+    /// a mapping's effective permission, so one sub-tree can hold kernel and user leaves.
     fn new_table(child: PhysAddr) -> Pte {
         Pte((child.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | PTE_WRITABLE | PTE_USER)
     }
 
-    /// A 4 KiB leaf entry mapping physical frame `phys` with `flags`.
     fn new_leaf(phys: PhysAddr, flags: PageFlags) -> Pte {
         Pte((phys.as_u64() & PTE_ADDR_MASK) | PTE_PRESENT | flags_to_pte_bits(flags))
     }
 }
 
-/// Translate architecture-neutral [`PageFlags`] into x86_64 entry bits.
-/// The present bit is added by [`Pte::new_leaf`]; this handles only the
-/// permission and caching attributes.
+/// Translate architecture-neutral [`PageFlags`] into x86_64 entry bits, permission and caching
+/// only; the present bit is added by [`Pte::new_leaf`].
 fn flags_to_pte_bits(flags: PageFlags) -> u64 {
     let mut bits = 0;
     if flags.contains(PageFlags::WRITABLE) {
@@ -125,8 +108,7 @@ fn flags_to_pte_bits(flags: PageFlags) -> u64 {
     if flags.contains(PageFlags::WRITE_THROUGH) {
         bits |= PTE_PWT;
     }
-    // **Entry 5 of the table this kernel programs** (`KERNEL_PAT`): `PAT` and `PWT`, no `PCD`.
-    // The entry is named there, not here — this is the bit pattern that selects it.
+    // Entry 5 of the table this kernel programs (`KERNEL_PAT`): `PAT` and `PWT`, no `PCD`.
     if flags.contains(PageFlags::WRITE_COMBINING) {
         bits |= PTE_PAT | PTE_PWT;
     }
@@ -135,60 +117,50 @@ fn flags_to_pte_bits(flags: PageFlags) -> u64 {
 
 // --- Virtual-address index split (9-9-9-9-12) ---------------------------
 
-/// PML4 index of `v` — virtual-address bits 47:39.
 const fn pml4_index(v: VirtAddr) -> usize {
     ((v.as_u64() >> 39) & 0x1FF) as usize
 }
 
-/// PDPT index of `v` — virtual-address bits 38:30.
 const fn pdpt_index(v: VirtAddr) -> usize {
     ((v.as_u64() >> 30) & 0x1FF) as usize
 }
 
-/// PD index of `v` — virtual-address bits 29:21.
 const fn pd_index(v: VirtAddr) -> usize {
     ((v.as_u64() >> 21) & 0x1FF) as usize
 }
 
-/// PT index of `v` — virtual-address bits 20:12.
 const fn pt_index(v: VirtAddr) -> usize {
     ((v.as_u64() >> 12) & 0x1FF) as usize
 }
 
-/// 4 KiB page offset of `v` — virtual-address bits 11:0.
 const fn page_offset(v: VirtAddr) -> u64 {
     v.as_u64() & 0xFFF
 }
 
-// --- Leaf entries, whose bits move with the page size -------------------
+// --- Leaf entries, whose bits move with the page size ---
 //
-// A leaf's `PAT` bit is bit 7 in a 4 KiB entry and bit 12 in a 2 MiB or 1 GiB one, because bit 7
-// is what *says* the entry is huge. Two things read a leaf — its frame and its attribute — and
-// both have to know which. They are plain functions so the bit arithmetic is host-tested: the one
-// huge mapping this kernel reads today selects the same entry whichever bit is read (PR #305
-// review, optional 4), so no boot can tell a wrong bit from a right one.
+// A leaf's `PAT` bit is bit 7 in a 4 KiB entry and bit 12 in a 2 MiB or 1 GiB one (bit 7 says
+// huge there). The one huge mapping this kernel reads selects the same entry whichever bit is
+// read, so no boot can tell a wrong bit from a right one; the host tests do.
 
 /// The physical frame a leaf entry names.
 ///
 /// **Bit 12 is part of the frame on a 4 KiB entry and the `PAT` bit on a huge one**, so a huge
 /// entry's base must drop it: a write-combining 2 MiB page whose `PAT` bit is set otherwise
-/// translates 4 KiB too high (PR #305 review, optional 7).
+/// translates 4 KiB too high.
 const fn frame_base(raw: u64, huge: bool) -> u64 {
     let mask = if huge { PTE_ADDR_MASK & !PTE_HUGE_PAT } else { PTE_ADDR_MASK };
     raw & mask
 }
 
-/// The attribute-table entry a leaf entry selects — `PAT:PCD:PWT`, three bits choosing one of
-/// eight.
+/// The attribute-table entry a leaf selects: `PAT:PCD:PWT`, one of eight.
 const fn attribute_of(raw: u64, huge: bool) -> u8 {
     let pat = if huge { (raw & PTE_HUGE_PAT) != 0 } else { (raw & PTE_PAT) != 0 };
     (((pat as u64) << 2) | (raw >> 4 & 1) << 1 | (raw >> 3 & 1)) as u8
 }
 
-/// The page-attribute index the mapping of `virt` selects — `PAT:PCD:PWT`, the three bits that
-/// choose one of the eight entries of the attribute table — or `None` if `virt` is not mapped.
-///
-/// The bit arithmetic is [`attribute_of`]'s, which is host-tested.
+/// The page-attribute index the mapping of `virt` selects (`PAT:PCD:PWT`), or `None` if `virt`
+/// is not mapped. The bit arithmetic is [`attribute_of`]'s.
 ///
 /// # Safety
 /// `root` must be a live page-table root reachable through the HHDM.
@@ -227,20 +199,14 @@ pub(crate) unsafe fn attribute_index(root: PhysAddr, virt: VirtAddr) -> Option<u
 
 // --- Table access -------------------------------------------------------
 
-/// Pointer to the 512-entry page table at physical address `table`, via
-/// the higher-half direct map.
-///
-/// Constructing the pointer is safe; dereferencing it is sound only while
-/// `table` genuinely holds a live page-table frame.
+/// Pointer to the 512-entry page table at physical address `table`, via the HHDM. Dereferencing
+/// is sound only while `table` holds a live page-table frame.
 fn table_ptr(table: PhysAddr) -> *mut Pte {
     (table.as_u64() + crate::mm::heap::hhdm_offset()) as *mut Pte
 }
 
-/// Allocate one zeroed 4 KiB physical frame to use as a page table.
-/// Returns `None` if the physical frame allocator is exhausted.
-///
-/// The frame is page-aligned (the buddy allocator guarantees this for
-/// order-0 allocations) and reachable through the HHDM.
+/// Allocate one zeroed, page-aligned 4 KiB frame to use as a page table, or `None` if the
+/// physical frame allocator is exhausted.
 fn alloc_page_table() -> Option<PhysAddr> {
     let frame = crate::mm::heap::buddy_alloc(0)?;
     // SAFETY: `buddy_alloc(0)` returned a fresh, exclusively-owned 4 KiB
@@ -253,8 +219,8 @@ fn alloc_page_table() -> Option<PhysAddr> {
     Some(frame)
 }
 
-/// Return the child table referenced by slot `index` of `table`,
-/// allocating and linking a fresh zeroed table if the slot is empty.
+/// Return the child table referenced by slot `index` of `table`, allocating and linking a
+/// fresh zeroed table if the slot is empty.
 ///
 /// # Safety
 /// `table` must point at a valid 512-entry page table reachable through
@@ -278,9 +244,8 @@ unsafe fn ensure_table(table: *mut Pte, index: usize) -> Result<*mut Pte, MapErr
     }
 }
 
-/// Walk PML4 → PDPT → PD in the tree rooted at `root`, returning a
-/// pointer to the page table that holds the leaf entry for `virt`, or
-/// `None` if any intermediate table is absent.
+/// Walk PML4 → PDPT → PD in the tree rooted at `root`, returning the page table that holds
+/// the leaf entry for `virt`, or `None` if an intermediate table is absent.
 ///
 /// # Safety
 /// `root` must be the physical base of a valid top-level page table
@@ -308,33 +273,19 @@ unsafe fn walk_to_pt(root: PhysAddr, virt: VirtAddr) -> Option<*mut Pte> {
     }
 }
 
-// --- Kernel-half PML4 template ------------------------------------------
+// --- Kernel-half PML4 template ---
 //
-// On 4-level x86_64 paging the kernel half spans PML4 entries 256..512
-// (canonical addresses `0xFFFF_8000_0000_0000` and up). Every process
-// address space must see the same kernel-half mappings as the boot
-// address space — otherwise switching CR3 to it would unmap the
-// currently-executing kernel code, stack, and HHDM. We achieve this by
-// snapshotting the kernel-half PML4 entries at boot and copying them
-// into every new top-level table at construction time. The entries
-// point at intermediate page tables (PDPTs) which are then shared
-// across all address spaces, so modifications at the leaf level
-// (future kernel-vmap allocations, for example) propagate to every AS
-// automatically.
+// The kernel half is PML4 entries 256..512 (`0xFFFF_8000_0000_0000` and up). Every address
+// space must share the boot space's kernel-half mappings or switching CR3 would unmap the
+// running kernel, stack and HHDM, so they are snapshotted at boot and copied into every new
+// top-level table. They point at shared PDPTs, so leaf-level changes propagate everywhere.
 
-/// First PML4 entry that belongs to the kernel half on 4-level paging.
 const KERNEL_PML4_BASE: usize = 256;
-/// Number of PML4 entries in the kernel half.
 const KERNEL_PML4_COUNT: usize = PAGE_TABLE_ENTRIES - KERNEL_PML4_BASE;
 
-/// Captured kernel-half PML4 entries used by
-/// [`X86Paging::inherit_kernel_mappings`]. `None` until
-/// [`init_kernel_template`] runs at boot.
-///
-/// Stored as raw `u64` PML4 entries: the entries themselves are
-/// inert data (they only become live page-table references when
-/// the array is copied into a PML4 frame and that frame is loaded
-/// into `CR3`).
+/// Captured kernel-half PML4 entries for [`X86Paging::inherit_kernel_mappings`]; `None` until
+/// [`init_kernel_template`] runs at boot. Raw `u64`s: inert until copied into a PML4 frame
+/// that is loaded into `CR3`.
 static KERNEL_TEMPLATE: SpinLock<Option<[u64; KERNEL_PML4_COUNT]>> = SpinLock::new(LockRank::KernelPmlTemplate, None);
 
 /// Read entries `256..512` from the PML4 at `root` into a fresh array.
@@ -380,8 +331,7 @@ unsafe fn write_kernel_half_entries(root: PhysAddr, entries: &[u64; KERNEL_PML4_
 
 /// The x86_64 implementation of [`ArchPaging`].
 ///
-/// A zero-sized type: the page-table root is an explicit argument to
-/// every operation, so there is no per-instance state. Re-exported as
+/// A zero-sized type: the root is an explicit argument to every operation. Re-exported as
 /// `crate::arch::Paging`.
 pub struct X86Paging;
 
@@ -441,10 +391,8 @@ impl ArchPaging for X86Paging {
         }
     }
 
-    // Host tests run in ring 3, where `invlpg` `#GP`s; the page-table *memory*
-    // edits are what the tests exercise (via HHDM), and there is no TLB to flush
-    // under `cargo test`. Mirrors the `current_cpu`/`init_this_cpu` cfg(test)
-    // stubs in `smp.rs`.
+    // Host tests run in ring 3, where `invlpg` `#GP`s; they exercise the page-table memory
+    // edits, and there is no TLB to flush under `cargo test`.
     #[cfg(test)]
     unsafe fn flush_tlb_page(_virt: VirtAddr) {}
 
@@ -563,7 +511,6 @@ mod tests {
 
     #[test]
     fn index_split_isolates_each_level() {
-        // A distinct value in each 9-bit window plus a page offset.
         let v = VirtAddr::new((1 << 39) | (2 << 30) | (3 << 21) | (4 << 12) | 0x5);
         assert_eq!(pml4_index(v), 1);
         assert_eq!(pdpt_index(v), 2);
@@ -620,7 +567,6 @@ mod tests {
     fn map_translate_unmap_round_trip() {
         init_global_heap();
         let root = alloc_page_table().expect("root frame");
-        // Any owned, page-aligned frame stands in for the target page.
         let phys = alloc_page_table().expect("target frame");
         let virt = VirtAddr::new(0x4000_0000);
 
@@ -702,8 +648,7 @@ mod tests {
     fn maps_spanning_distinct_top_level_entries() {
         init_global_heap();
         let root = alloc_page_table().unwrap();
-        // Three addresses in distinct PML4 slots, forcing intermediate
-        // table allocation at every level for each.
+        // Three addresses in distinct PML4 slots force intermediate table allocation.
         let cases = [
             VirtAddr::new(0x0000_0000_0000_1000), // PML4 slot 0
             VirtAddr::new(0x0000_0080_0000_1000), // PML4 slot 1 (512 GiB)
@@ -721,8 +666,7 @@ mod tests {
 
     // ----- Kernel-half PML4 template -----
 
-    /// Fill a freshly-allocated PML4 frame with `value` in every entry,
-    /// returning its physical base.
+    /// Fill a PML4 frame with `value` in every entry, returning its physical base.
     fn fill_pml4(value: u64) -> PhysAddr {
         let frame = alloc_page_table().unwrap();
         // SAFETY: just allocated, page-aligned, HHDM-reachable; we write
@@ -736,7 +680,6 @@ mod tests {
         frame
     }
 
-    /// Read all 512 entries from a PML4 frame.
     fn read_all_entries(frame: PhysAddr) -> [u64; PAGE_TABLE_ENTRIES] {
         let mut out = [0u64; PAGE_TABLE_ENTRIES];
         // SAFETY: PML4 is page-aligned and HHDM-reachable.
@@ -752,8 +695,7 @@ mod tests {
     #[test]
     fn read_kernel_half_entries_captures_only_kernel_half() {
         init_global_heap();
-        // Base of 0xDEAD_0000_0000_0000 + index gives a distinct value
-        // per entry across both halves.
+        // 0xDEAD_0000_0000_0000 + index gives a distinct value per entry across both halves.
         let source = fill_pml4(0xDEAD_0000_0000_0000);
 
         // SAFETY: `source` was just constructed and is HHDM-reachable.
@@ -775,8 +717,7 @@ mod tests {
     #[test]
     fn write_kernel_half_entries_preserves_user_half() {
         init_global_heap();
-        // Target PML4 prepopulated with a user-half-marker pattern so we
-        // can verify the write doesn't touch entries 0..256.
+        // Prepopulated with a user-half marker to verify the write leaves entries 0..256 alone.
         let target = fill_pml4(0xC0DE_0000_0000_0000);
         let entries: [u64; KERNEL_PML4_COUNT] =
             core::array::from_fn(|i| 0xBEEF_0000_0000_0000u64.wrapping_add(i as u64));
@@ -805,8 +746,7 @@ mod tests {
         let captured = unsafe { read_kernel_half_entries(source) };
 
         let target = alloc_page_table().unwrap();
-        // Zero the target so any leak through from `alloc_page_table` is
-        // a clear bug.
+        // Zeroed so any leak through from `alloc_page_table` is a clear bug.
         // SAFETY: just allocated, page-aligned, HHDM-reachable.
         unsafe {
             let pml4 = (target.as_u64() + heap::hhdm_offset()) as *mut u8;
@@ -825,10 +765,10 @@ mod tests {
         }
     }
 
-    // ---- what a leaf's bits mean, which moves with the page size ----
+    // ---- what a leaf's bits mean ----
 
-    /// The console's own mapping on the laptop, as a probe printed it (PR #305 review): a 2 MiB
-    /// page at `0x80000000` selecting attribute 5, write-combining.
+    /// The console's own mapping on the laptop: a 2 MiB page at `0x80000000` selecting
+    /// attribute 5, write-combining.
     const HUGE_WC: u64 = 0x8000_10EB;
 
     #[test]
@@ -840,27 +780,23 @@ mod tests {
         assert_eq!(frame_base(0x8000_00EB, true), 0x8000_0000);
     }
 
-    /// **The case no boot can catch**: the one huge mapping this kernel reads selects entry 5
-    /// whichever bit is read, because it has both set. These are the entries that differ.
+    /// The one huge mapping this kernel reads selects entry 5 whichever bit is read, because it
+    /// has both set; these are the entries that differ.
     #[test]
     fn a_huge_leafs_attribute_comes_from_bit_twelve_and_a_small_ones_from_bit_seven() {
         assert_eq!(attribute_of(HUGE_WC, true), 5, "PAT | PWT: write-combining in Limine's table");
         // Bit 7 is "huge" here, so reading it would report 5 for an entry that selects 1.
         assert_eq!(attribute_of(0x8000_008B, true), 1, "PWT alone: entry 1");
         assert_eq!(attribute_of(0x8000_008B, false), 5, "the same bits in a 4 KiB entry");
-        // Write-back, the default every plain mapping lands on, read both ways.
         assert_eq!(attribute_of(0x8000_0083, true), 0, "a huge page with no attribute bits");
         assert_eq!(attribute_of(0x8000_0003, false), 0);
-        // Each bit alone, in a 4 KiB entry: PWT=1, PCD=2, PAT=4.
         assert_eq!(attribute_of(PTE_PWT, false), 1);
         assert_eq!(attribute_of(PTE_PCD, false), 2);
         assert_eq!(attribute_of(PTE_PAT, false), 4);
         assert_eq!(attribute_of(PTE_PCD | PTE_PWT, false), 3);
     }
 
-    /// The mapping `kvmap` makes for device registers selects entry 2, not entry 3 — `UC-` in
-    /// both tables this system has seen. Written down because a comment here once said the kernel
-    /// set no attribute bits at all (PR #305 review, finding 2).
+    /// The mapping `kvmap` makes for device registers selects entry 2 (`UC-` in both tables seen).
     #[test]
     fn a_no_cache_mapping_selects_the_entry_pcd_alone_names() {
         let bits = flags_to_pte_bits(PageFlags::NO_CACHE);

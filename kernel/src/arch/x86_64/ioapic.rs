@@ -1,22 +1,12 @@
-//! x86_64 I/O APIC bring-up + interrupt routing ([`ArchIrqRouter`] impl).
+//! x86_64 I/O APIC bring-up and interrupt routing ([`ArchIrqRouter`] impl).
 //!
-//! The IOAPIC is the **system interrupt router**: it maps an external interrupt
-//! line (a Global System Interrupt) to a redirection-table entry that delivers
-//! a chosen vector to a chosen local APIC. We find it from the MADT (cached by
-//! the ACPI parser, `super::acpi::ioapics()`), map its MMIO page uncached, mask
-//! every entry, and disable the legacy 8259 PICs so external interrupts flow
-//! only through the IOAPIC.
-//!
-//! ## Arch boundary
-//!
-//! Distinct from `super::apic` (the per-CPU local controller, `ArchIrq`). The
-//! ISA-IRQ→GSI resolution (from the MADT source overrides) and the device-vector
-//! handler registry (`super::idt::register_device_handler`) are arch-internal;
-//! the neutral [`ArchIrqRouter`] trait takes an already-resolved line + vector.
-//! IOAPIC / GSI / RTE / 8259 jargon never crosses into a neutral name.
-//!
-//! The byte-level encoders [`encode_rte`] and [`resolve_isa_irq`] are pure and
-//! host-tested; the MMIO/PIT/IDT paths are exercised on-target via [`X86IoApic::self_test`].
+//! The IOAPIC maps an external interrupt line (a Global System Interrupt) to a
+//! redirection-table entry delivering a vector to a local APIC. It is found from the MADT
+//! (`super::acpi::ioapics()`), its MMIO page mapped uncached, every entry masked, and the
+//! legacy 8259 PICs disabled. ISA-IRQ→GSI resolution (MADT source overrides) and the
+//! device-vector registry (`super::idt::register_device_handler`) are arch-internal; the
+//! neutral [`ArchIrqRouter`] takes a resolved line and vector. [`encode_rte`] and
+//! [`resolve_isa_irq`] are host-tested; the rest runs on-target via [`X86IoApic::self_test`].
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -31,46 +21,34 @@ use crate::arch::x86_64::{acpi, idt, regs};
 use crate::libkern::AllocError;
 use crate::mm::kvmap;
 
-// --- IOAPIC MMIO indirect registers ----------------------------------------
-/// I/O register select — write the index of the register to access.
+// --- IOAPIC MMIO indirect registers ---
 const IOREGSEL: u64 = 0x00;
-/// I/O window — read/write the register selected by `IOREGSEL`.
 const IOWIN: u64 = 0x10;
-/// Version register: bits 16:23 hold `max redirection entry` (count − 1).
+/// Version register: bits 23:16 hold the last redirection entry index (count − 1).
 const REG_VER: u32 = 0x01;
-/// First redirection-table register; entry `n` occupies `0x10 + 2n` (low dword)
-/// and `0x11 + 2n` (high dword).
+/// First redirection-table register; entry `n` is `0x10 + 2n` (low) and `0x11 + 2n` (high).
 const REG_REDTBL_BASE: u32 = 0x10;
 
-// --- Legacy 8259 PIC data ports (masked off when using the IOAPIC) ---------
+// --- Legacy 8259 PIC data ports ---
 const PIC1_DATA: u16 = 0x21;
 const PIC2_DATA: u16 = 0xA1;
 
-// --- PIT (for the bring-up self-test) --------------------------------------
+// --- PIT (for the self-test) ---
 const PIT_CMD: u16 = 0x43;
 const PIT_CH0_DATA: u16 = 0x40;
 const PIT_INPUT_HZ: u32 = 1_193_182;
-/// Channel 0, lobyte/hibyte access, mode 2 (rate generator), binary.
 #[allow(clippy::unusual_byte_groupings, reason = "grouped by the register's fields")]
 const PIT_CH0_MODE2: u8 = 0b00_11_010_0;
 
-/// Kernel-virtual base of the mapped IOAPIC MMIO page (`0` = not initialised).
 static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
-/// The IOAPIC's GSI base (the first GSI its entries cover).
 static IOAPIC_GSI_BASE: AtomicU32 = AtomicU32::new(0);
-/// Number of redirection-table entries (GSIs this IOAPIC covers).
 static IOAPIC_MAX_ENTRIES: AtomicU32 = AtomicU32::new(0);
-/// PIT interrupt counter, bumped by the self-test ISR handler.
 static PIT_TICKS: AtomicU32 = AtomicU32::new(0);
-/// PIT deferred-call counter, bumped by the self-test's DPC handler — proves the
-/// ISR → DPC → handler path (the ISR enqueues `PIT_DPC`; the device-IRQ dispatch
-/// tail drains it).
 static PIT_DPC_RUNS: AtomicU32 = AtomicU32::new(0);
-/// The DPC the PIT self-test ISR queues — a `static` so queuing it allocates
-/// nothing, the model real device drivers use (an inline DPC in the IRP).
+/// The self-test's DPC; a `static`, so queuing it allocates nothing.
 static PIT_DPC: crate::dpc::Dpc = crate::dpc::Dpc::new(pit_dpc_handler, core::ptr::null_mut());
 
-/// Read an IOAPIC register by index (IOREGSEL → IOWIN).
+/// Read an IOAPIC register by index (IOREGSEL, then IOWIN).
 ///
 /// # Safety
 /// [`X86IoApic::init`] must have mapped the MMIO page; `idx` a valid register.
@@ -100,12 +78,11 @@ unsafe fn write_reg(idx: u32, val: u32) {
     }
 }
 
-/// Encode a redirection-table entry into its `(low, high)` 32-bit dwords:
-/// fixed delivery, physical destination mode, with the given vector, polarity,
-/// trigger, mask bit, and destination local-APIC id (bits 56:63).
+/// Encode a redirection-table entry into `(low, high)` dwords: fixed delivery, physical
+/// destination mode, destination local-APIC id in bits 56:63.
 fn encode_rte(vector: u8, dest: u8, polarity: Polarity, trigger: TriggerMode, masked: bool) -> (u32, u32) {
-    // low dword: vector[7:0], delivery mode[10:8]=000 (fixed), dest mode[11]=0
-    // (physical), polarity[13], trigger[15], mask[16].
+    // low: vector[7:0], delivery[10:8]=000 (fixed), dest mode[11]=0 (physical), polarity[13],
+    // trigger[15], mask[16].
     let mut low = vector as u32;
     if matches!(polarity, Polarity::ActiveLow) {
         low |= 1 << 13;
@@ -116,20 +93,18 @@ fn encode_rte(vector: u8, dest: u8, polarity: Polarity, trigger: TriggerMode, ma
     if masked {
         low |= 1 << 16;
     }
-    // high dword: destination local-APIC id in bits 56:63 of the 64-bit RTE,
-    // i.e. bits 24:31 of the high dword.
+    // high: destination id in bits 56:63 of the 64-bit entry, i.e. 31:24 of the high dword.
     let high = (dest as u32) << 24;
     (low, high)
 }
 
-/// Resolve a legacy ISA IRQ line to its `(gsi, polarity, trigger)`, applying the
-/// MADT interrupt source overrides. Without an override the mapping is identity
-/// (`IRQ n → GSI n`) with the ISA defaults (edge-triggered, active-high).
+/// Resolve a legacy ISA IRQ to `(gsi, polarity, trigger)` via the MADT interrupt source
+/// overrides; without one it is identity (`IRQ n → GSI n`), edge-triggered, active-high.
 fn resolve_isa_irq(irq: u8, overrides: &[acpi::SourceOverride]) -> (u32, Polarity, TriggerMode) {
     for ov in overrides {
         if ov.source_irq == irq {
-            // MPS INTI flags: polarity in bits 1:0, trigger in bits 3:2;
-            // `00` means "conforms to the bus default" — ISA = high / edge.
+            // MPS INTI flags: polarity in bits 1:0, trigger in 3:2; `00` is the bus default
+            // (ISA: high / edge).
             let polarity = if ov.flags & 0b11 == 0b11 { Polarity::ActiveLow } else { Polarity::ActiveHigh };
             let trigger = if (ov.flags >> 2) & 0b11 == 0b11 { TriggerMode::Level } else { TriggerMode::Edge };
             return (ov.gsi, polarity, trigger);
@@ -138,7 +113,6 @@ fn resolve_isa_irq(irq: u8, overrides: &[acpi::SourceOverride]) -> (u32, Polarit
     (irq as u32, Polarity::ActiveHigh, TriggerMode::Edge)
 }
 
-/// The redirection-entry index for a GSI, if this IOAPIC covers it.
 fn rte_index(gsi: u32) -> Option<u32> {
     let base = IOAPIC_GSI_BASE.load(Ordering::Relaxed);
     let max = IOAPIC_MAX_ENTRIES.load(Ordering::Relaxed);
@@ -164,22 +138,18 @@ unsafe fn set_rte_mask(gsi: u32, masked: bool) {
     }
 }
 
-/// The self-test interrupt handler: count PIT ticks. (EOI is the dispatcher's.)
+/// The self-test interrupt handler: count PIT ticks (EOI is the dispatcher's).
 extern "C" fn pit_tick() {
     PIT_TICKS.fetch_add(1, Ordering::Relaxed);
-    // Defer the "real work" to a DPC — the ISR → DPC pattern device drivers use
-    // (an AHCI completion ISR queues a DPC that runs the IRP completion). Here it
-    // just bumps a counter, drained at the device-IRQ dispatch tail.
+    // Defer to a DPC, as device drivers do (an AHCI ISR queues the IRP completion).
     crate::dpc::enqueue(&PIT_DPC);
 }
 
-/// The PIT self-test's deferred-call handler — runs at the interrupt tail.
 fn pit_dpc_handler(_ctx: *mut ()) {
     PIT_DPC_RUNS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Program PIT channel 0 as a ~`PIT_INPUT_HZ / count` Hz rate generator (mode 2)
-/// so it raises IRQ0 periodically.
+/// Program PIT channel 0 as a ~`PIT_INPUT_HZ / count` Hz rate generator (mode 2) raising IRQ0.
 ///
 /// # Safety
 ///
@@ -193,8 +163,7 @@ unsafe fn pit_ch0_periodic(count: u16) {
     }
 }
 
-/// The x86_64 [`ArchIrqRouter`] implementation (IOAPIC). Zero-sized; re-exported
-/// as `crate::arch::IrqRouter`.
+/// The x86_64 [`ArchIrqRouter`] implementation (IOAPIC); re-exported as `crate::arch::IrqRouter`.
 pub struct X86IoApic;
 
 impl ArchIrqRouter for X86IoApic {
@@ -207,8 +176,7 @@ impl ArchIrqRouter for X86IoApic {
             }
         };
 
-        // Map the IOAPIC register page uncached into the shared kernel vmap
-        // (mirrors the local-APIC mapping in `apic.rs`).
+        // Map the IOAPIC register page uncached into the shared kernel vmap.
         let va = kvmap::vmap_alloc_pages(1)?;
         let flags = PageFlags::WRITABLE | PageFlags::NO_CACHE;
         // SAFETY: `va` is a fresh kernel-vmap page; `io.addr` is the IOAPIC MMIO
@@ -223,7 +191,7 @@ impl ArchIrqRouter for X86IoApic {
         let max_entries = ((ver >> 16) & 0xFF) + 1;
         IOAPIC_MAX_ENTRIES.store(max_entries, Ordering::Relaxed);
 
-        // Mask every redirection entry (bring-up: nothing is routed yet).
+        // Mask every redirection entry.
         let (masked_low, masked_high) = encode_rte(0, 0, Polarity::ActiveHigh, TriggerMode::Edge, true);
         for idx in 0..max_entries {
             // SAFETY: idx < max_entries; MMIO mapped.
@@ -276,15 +244,14 @@ impl ArchIrqRouter for X86IoApic {
         PIT_TICKS.store(0, Ordering::Relaxed);
         PIT_DPC_RUNS.store(0, Ordering::Relaxed);
 
-        // Route the PIT's GSI to our vector on the boot CPU, and start the PIT.
+        // Route the PIT's GSI to our vector on the boot CPU and start the PIT.
         // SAFETY: ring-0, post-init; the handler for `vector` is registered.
         unsafe { Self::route(gsi, vector, bsp, trigger, polarity) };
         // SAFETY: ring-0; we own the PIT.
         unsafe { pit_ch0_periodic((PIT_INPUT_HZ / 100) as u16) };
 
-        // Brief interrupt-enabled window. Only the PIT GSI is unmasked (the LAPIC
-        // timer LVT is still masked, the 8259 is masked) and the scheduler is not
-        // yet running, so nothing else can fire. Wait for a few ticks or ~100 ms.
+        // Brief interrupt-enabled window: only the PIT GSI is unmasked (LAPIC timer LVT and
+        // 8259 masked) and the scheduler is not running. Wait for 3 ticks or ~100 ms.
         let start = crate::arch::Timer::read_ns();
         // SAFETY: ring-0; IF was 0 here, we restore it to 0 below.
         unsafe { Cpu::interrupts_enable() };
@@ -309,22 +276,16 @@ impl ArchIrqRouter for X86IoApic {
     }
 }
 
-/// Install a legacy **ISA** interrupt end-to-end for an in-kernel driver: resolve
-/// the ISA IRQ to its GSI + trigger/polarity (honouring ACPI interrupt source
-/// overrides — ISA defaults are edge/active-high), register `handler` for a fresh
-/// device-interrupt vector, route the GSI to it on the boot CPU, and leave the line
-/// unmasked. Returns the assigned IDT vector. The ISA sibling of
-/// [`X86IrqInstall::install_intx`](super::irq_install::X86IrqInstall) (COM1 IRQ 4, etc.).
+/// Install a legacy **ISA** interrupt end-to-end for an in-kernel driver: resolve the ISA IRQ
+/// to its GSI and trigger/polarity (honouring ACPI source overrides), register `handler` for a
+/// fresh device-interrupt vector, route the GSI to it on the boot CPU, and leave the line
+/// unmasked. Returns the IDT vector.
 ///
-/// **Arch-internal** (`pub(crate)`, not re-exported by `crate::arch`): "ISA" is an
-/// x86-only concept, so neutral kernel code must not name it. A fixed legacy device
-/// wires its interrupt through its own arch module — the serial console via
-/// [`super::serial::console_arm_rx`], which calls this. See
-/// `docs/conventions/arch-boundary.md`.
-///
-/// Its PCI siblings are **not** here: they are the two members of
-/// [`ArchIrqInstall`](crate::arch::irq_install::ArchIrqInstall), in
-/// [`super::irq_install`]. Only the INTx one routes through this controller.
+/// Arch-internal (`pub(crate)`, not re-exported by `crate::arch`): "ISA" is x86-only, so a
+/// fixed legacy device wires its interrupt through its own arch module (the serial console via
+/// [`super::serial::console_arm_rx`]). See `docs/conventions/arch-boundary.md`. The PCI
+/// siblings are [`ArchIrqInstall`](crate::arch::irq_install::ArchIrqInstall)'s, in
+/// [`super::irq_install`].
 ///
 /// # Safety
 /// Ring-0, after [`X86IoApic::init`]. `handler` must stay valid for the kernel's
@@ -346,7 +307,7 @@ mod tests {
 
     #[test]
     fn encode_rte_bit_layout() {
-        // Vector 0x30 to APIC id 0, active-high edge, unmasked.
+        // Vector 0x30, APIC id 0, active-high edge, unmasked.
         let (low, high) = encode_rte(0x30, 0, Polarity::ActiveHigh, TriggerMode::Edge, false);
         assert_eq!(low & 0xFF, 0x30, "vector in bits 7:0");
         assert_eq!(low & (1 << 13), 0, "active-high => polarity bit clear");

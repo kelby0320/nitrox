@@ -1,6 +1,5 @@
-//! x86_64 CPU control and feature detection ([`ArchCpu`] impl): the GDT/IDT
-//! install, the boot-time memory-protection enables (NX, SMEP, SMAP), the
-//! trap kernel-stack setter, halting, and CPUID feature queries.
+//! x86_64 CPU control and feature detection ([`ArchCpu`] impl): GDT/IDT install, the NX, SMEP
+//! and SMAP enables, the trap kernel-stack setter, halting, and CPUID queries.
 
 use core::arch::asm;
 use core::sync::atomic::Ordering;
@@ -8,39 +7,28 @@ use core::sync::atomic::Ordering;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::x86_64::{gdt, idt, regs};
 
-/// CPUID.01H:EDX bit 9 — on-chip local APIC present.
 const CPUID_1_EDX_APIC: u32 = 1 << 9;
 
-/// `RFLAGS` bit 9 — the interrupt-enable flag (`IF`).
 const RFLAGS_IF: u64 = 1 << 9;
 
-/// The Extended Feature Enable Register MSR.
 const MSR_EFER: u32 = 0xC000_0080;
-/// `EFER` bit 11 — no-execute enable.
 const EFER_NXE: u64 = 1 << 11;
 
-/// CR4.SMEP — supervisor mode execution prevention. With this bit set,
-/// instruction fetches from user pages while in ring 0 `#PF`.
+/// CR4.SMEP: ring-0 instruction fetches from user pages `#PF`.
 const CR4_SMEP: u64 = 1 << 20;
-/// CR4.SMAP — supervisor mode access prevention. With this bit set, data
-/// accesses to user pages while in ring 0 `#PF` unless EFLAGS.AC is set
-/// (via `stac`).
+/// CR4.SMAP: ring-0 data accesses to user pages `#PF` unless EFLAGS.AC is set (`stac`).
 const CR4_SMAP: u64 = 1 << 21;
 
-/// CPUID 7.0:EBX bit 7 — SMEP supported.
 const CPUID_7_0_EBX_SMEP: u32 = 1 << 7;
-/// CPUID 7.0:EBX bit 20 — SMAP supported.
 const CPUID_7_0_EBX_SMAP: u32 = 1 << 20;
 
-/// The x86_64 [`ArchCpu`] implementation. Zero-sized; re-exported as
-/// `crate::arch::Cpu`.
+/// The x86_64 [`ArchCpu`] implementation; re-exported as `crate::arch::Cpu`.
 pub struct X86Cpu;
 
 impl ArchCpu for X86Cpu {
     fn init_tables() {
-        // The GDT (with its TSS) must come before the IDT: the IDT's gates
-        // reference the kernel code selector the GDT installs, and the
-        // double-fault gate needs the TSS's IST stack.
+        // The IDT's gates reference the kernel code selector the GDT installs, and the
+        // double-fault gate needs the TSS's IST stack, so the GDT comes first.
         gdt::init();
         idt::init();
     }
@@ -56,26 +44,20 @@ impl ArchCpu for X86Cpu {
 
     fn stop_the_machine() -> ! {
         <Self as ArchCpu>::stop_other_cpus();
-        // **The screen comes back last**, on both of `stop_other_cpus`' branches: after every
-        // other CPU has been told to halt, so a compositor stops drawing over it, and after the
-        // diagnosis was printed — its lines are the grid's last rows. Early in boot the kernel
-        // never gave the screen up and this only finishes a paint; the fallback branch there is
-        // precisely where a panic before `init` lands, which is the case the console exists for.
+        // The screen comes back last, on both of `stop_other_cpus`' branches: after every
+        // other CPU is told to halt, so a compositor stops drawing over it, and after the
+        // diagnosis printed. A panic before `init` lands in the fallback branch.
         crate::fbcon::reclaim_for_stop();
         <Self as ArchCpu>::halt_loop()
     }
 
     fn stop_other_cpus() {
-        // **Mask first, and run to completion on one CPU.** This inherits the caller's IF:
-        // from `dump_and_halt` that is already 0 (the IDT gate clears it), but from `panic!`
-        // it is whatever the panicking context held, and IF=1 in ring 0 is reachable —
-        // `tlb::shootdown` spins for acknowledgements with interrupts *deliberately* enabled,
-        // and the idle and boot threads run with IF=1. A tick landing inside the send loop can
-        // deschedule this thread (`on_timer_tick` calls `switch_to_next` straight out of the
-        // handler), leaving `STOPPING` latched, no NMI sent and the machine running — and if
-        // the thread resumes on a *different* CPU, the `me` captured below names the old one,
-        // so the loop would NMI the core it is now running on and take itself out partway
-        // through the scan. Masking makes the whole sequence uninterruptible.
+        // Mask first, and run to completion on one CPU. This inherits the caller's IF, which
+        // from `panic!` can be 1 in ring 0 (`tlb::shootdown` and the idle and boot threads run
+        // with IF=1). A tick inside the send loop can deschedule this thread
+        // (`on_timer_tick` calls `switch_to_next` from the handler), leaving `STOPPING` latched
+        // with no NMI sent; resuming on another CPU, `me` below would name the old one and
+        // the loop would NMI its own core. Masking makes the sequence uninterruptible.
         //
         // SAFETY: ring 0. The caller goes on to halt or reset, so nothing later depends on IF
         // being restored.
@@ -83,20 +65,16 @@ impl ArchCpu for X86Cpu {
             <Self as ArchCpu>::interrupts_disable();
         }
 
-        // **Only if this CPU can actually send.** An AP that has not run `ap_cpu_init` has not
-        // entered x2APIC mode, and writing the ICR MSR there `#GP`s — inside the panic path,
-        // which would fault while handling a fault. Early boot is precisely where that state
-        // occurs, and precisely where panics are most likely, so this is the common case
-        // rather than a corner: such a core prints, halts, and lets whoever is watching it
-        // (today the BSP's AP-online deadline) take the machine down.
+        // Only if this CPU can send: an AP that has not run `ap_cpu_init` has not entered
+        // x2APIC mode, and the ICR write there `#GP`s inside the panic path. Early boot is
+        // where panics are likeliest, so such a core prints, halts, and lets whoever watches
+        // it (the BSP's AP-online deadline) take the machine down.
         if super::apic::x2apic_enabled_here() {
-            // **Announce inside the branch**, so "STOPPING is set" and "NMIs are coming" are
-            // the same statement. Stored before the sends, because a target that takes the
-            // NMI first would read the flag clear and treat the notice as a hardware NMI —
-            // which on a ring-0 CPU means `dump_and_halt`, the register-dump storm this
-            // exists to avoid. Stored *only* here because the fallback below sends nothing:
-            // latching it there would leave a flag that silently converts any genuine
-            // hardware NMI, on any core, into an undiagnosed halt.
+            // Announce inside the branch, so "STOPPING is set" and "NMIs are coming" mean the
+            // same. Stored before the sends: a target taking the NMI first would read the flag
+            // clear and treat it as a hardware NMI, which on a ring-0 CPU means
+            // `dump_and_halt`. Not stored in the fallback, which sends nothing: a latched flag
+            // there would turn any genuine hardware NMI into an undiagnosed halt.
             super::idt::STOPPING.store(true, Ordering::Release);
             let me = super::smp::hw_apic_id();
             for cpu in 0..crate::arch::MAX_CPUS {
@@ -117,10 +95,8 @@ impl ArchCpu for X86Cpu {
     }
 
     fn halt_loop() -> ! {
-        // **Leave the online set first.** This CPU is about to stop servicing
-        // interrupts for good, and a CPU counted online but unable to acknowledge a
-        // TLB-shootdown IPI deadlocks every later shootdown on the machine — see
-        // `sched::leave_online`, which carries the failure this fixed.
+        // Leave the online set first: a CPU counted online that cannot acknowledge a
+        // TLB-shootdown IPI deadlocks every later shootdown (see `sched::leave_online`).
         crate::sched::leave_online();
         loop {
             // SAFETY: `cli` and `hlt` are always valid in ring 0. Neither
@@ -145,13 +121,10 @@ impl ArchCpu for X86Cpu {
     }
 
     unsafe fn idle_halt() {
-        // SAFETY: ring-0. `sti; hlt` is the canonical idle idiom: `sti` enables
-        // interrupts but its one-instruction interrupt shadow defers delivery
-        // until *after* the `hlt` retires, so the CPU is guaranteed to park with
-        // IF=1 (wakeable by the periodic timer / a reschedule IPI) yet cannot miss
-        // a wake that races the enable. Unlike bare `halt`, it does not trust the
-        // caller's inbound IF — an idle CPU that parked with IF=0 would sleep
-        // forever, since a maskable IRQ cannot resume `hlt` while IF=0.
+        // SAFETY: ring-0. `sti; hlt`: `sti`'s one-instruction interrupt shadow defers delivery
+        // until after the `hlt` retires, so the CPU parks with IF=1 yet cannot miss a wake
+        // racing the enable. Unlike bare `halt` it does not trust the caller's IF: a CPU that
+        // parked with IF=0 would sleep forever.
         unsafe { asm!("sti; hlt", options(nomem, nostack, preserves_flags)) };
     }
 
@@ -172,20 +145,11 @@ impl ArchCpu for X86Cpu {
         unsafe { regs::sti() };
     }
 
-    /// Restore `IF` to `prev` — **set it either way**, rather than assuming the current
-    /// state.
+    /// Restore `IF` to `prev`, setting it either way rather than assuming the current state.
     ///
-    /// The `else` arm used to be a no-op, commented "leave IF clear — it already is". That
-    /// held for every caller that had reached here through `interrupts_disable`, and was
-    /// false for the one that had enabled `IF` *itself*: `tlb::shootdown` unmasks for the
-    /// duration of the IPI round-trip (it must — an `IF`-masked spinner cannot service a
-    /// peer's shootdown IPI), then called this with the `prev = false` it captured on the way
-    /// in. The no-op left interrupts **enabled** for the rest of the syscall, and its return
-    /// through the `sysretq` stub's ring-0-on-user-stack window (PR #231 review, finding 2).
-    ///
-    /// Making it unconditional costs one `cli` on a cold path and removes an unstated
-    /// precondition — the function now does what its name says regardless of how the caller
-    /// got here.
+    /// `tlb::shootdown` enables `IF` itself for the IPI round-trip, so a caller can arrive here
+    /// with `prev = false` and `IF` set; a no-op `else` arm would leave interrupts enabled for
+    /// the rest of the syscall, including the `sysretq` stub's ring-0-on-user-stack window.
     unsafe fn interrupts_restore(prev: bool) {
         if prev {
             // SAFETY: ring-0; restoring a previously-enabled interrupt state.
@@ -203,11 +167,9 @@ impl ArchCpu for X86Cpu {
 
 /// Enable the no-execute (NX) paging extension by setting `EFER.NXE`.
 ///
-/// Until `EFER.NXE` is set, a page-table entry with the NX bit faults as a
-/// reserved-bit violation. Limine enables long mode but does not guarantee
-/// NXE, so the kernel sets it itself before any mapping uses
-/// [`PageFlags::NO_EXECUTE`](crate::arch::paging::PageFlags::NO_EXECUTE).
-/// Idempotent.
+/// Until `EFER.NXE` is set, a page-table entry with the NX bit faults as a reserved-bit
+/// violation. Limine does not guarantee it, so this runs before any mapping uses
+/// [`PageFlags::NO_EXECUTE`](crate::arch::paging::PageFlags::NO_EXECUTE). Idempotent.
 fn ensure_nxe() {
     // SAFETY: `MSR_EFER` is implemented on every x86_64 CPU. Reading it,
     // OR-ing in the NXE bit, and writing it back enables NX support without
@@ -219,16 +181,12 @@ fn ensure_nxe() {
     }
 }
 
-/// Enable SMEP and SMAP — the CPU-level "kernel can't accidentally touch user
-/// memory" protections. Panics if either feature is missing on this CPU.
+/// Enable SMEP and SMAP, panicking if either is missing on this CPU. Idempotent.
 ///
-/// SMEP prevents the kernel fetching instructions from user pages (hardware
-/// only). SMAP prevents the kernel reading/writing user data pages unless
-/// EFLAGS.AC is set; the copy primitives in [`crate::arch::UserAccess`] open
-/// the AC window with `stac` and close it with `clac` (inline-asm-only — no
-/// Rust-visible wrappers, to enforce the "only inside copy routines"
-/// discipline). Phase 1 hard-requires both; the dev loop runs QEMU with
-/// `-cpu qemu64,+smap,+smep`. Idempotent.
+/// SMEP stops the kernel fetching instructions from user pages. SMAP stops it touching user
+/// data pages unless EFLAGS.AC is set; the copy primitives in [`crate::arch::UserAccess`]
+/// open that window with `stac` and close it with `clac`, which have no Rust-visible wrappers
+/// so they stay inside the copy routines. The dev loop runs QEMU with `-cpu qemu64,+smap,+smep`.
 fn ensure_smap_smep() {
     let (_, ebx, _, _) = regs::cpuid(7, 0);
     assert!(
@@ -254,7 +212,7 @@ fn ensure_smap_smep() {
     }
 }
 
-// --- What this processor is (Phase 5 Part D.1) --------------------------------
+// --- What this processor is ---
 
 /// `(family, model, stepping)` from `CPUID.01H:EAX`, with the extended fields folded in as the
 /// SDM specifies: the extended family is added only when the base family is `0xF`, and the
@@ -319,9 +277,8 @@ fn logical_per_package(max_leaf: u32, ebx1: u32, edx1: u32) -> u32 {
     if edx1 & (1 << 28) != 0 { (ebx1 >> 16) & 0xFF } else { 1 }
 }
 
-/// [`ArchCpu::log_identity`] for x86_64: two lines, identity then features. Every leaf is read
-/// only when the maximum-leaf query says it exists, so a part without leaf 7 or the extended
-/// leaves reports those features absent rather than reading garbage as present.
+/// [`ArchCpu::log_identity`] for x86_64: identity then features. A leaf is read only when the
+/// maximum-leaf query says it exists, so an absent leaf reports its features absent.
 fn log_identity() {
     let (max_leaf, vb, vc, vd) = regs::cpuid(0, 0);
     let mut vendor = [0u8; 12];
@@ -377,8 +334,7 @@ mod tests {
 
     #[test]
     fn the_laptops_signature_needs_the_extended_model() {
-        // The laptop's i5-7200U (Kaby Lake-U): CPUID.01H:EAX = 0x000806E9. Base fields alone say
-        // model 0xe.
+        // The laptop's i5-7200U (Kaby Lake-U): CPUID.01H:EAX = 0x000806E9; base fields say 0xe.
         assert_eq!(decode_signature(0x0008_06E9), (6, 0x8E, 9));
     }
 

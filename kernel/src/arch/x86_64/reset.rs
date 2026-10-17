@@ -1,15 +1,12 @@
-//! **Resetting the machine** (administration Part E.3), in the conventional order: the FADT's reset
-//! register when the FADT advertises one, then the 8042's reset line, then a triple fault. None of
-//! it needs AML.
+//! Resetting the machine, in order: the FADT's reset register when it advertises one, then the
+//! 8042's reset line, then a triple fault. None of it needs AML.
 //!
-//! Each step gets [`SETTLE_NS`] to take effect before the next is tried, and says on COM1 which
-//! one it is, so a machine that resets on its second step shows that its first did nothing. Each
-//! resets q35 on its own. The last cannot fail: an exception with no IDT to deliver it through is
-//! a triple fault, which shuts the processor down, and a PC answers a shutdown by resetting.
+//! Each step gets [`SETTLE_NS`] to take effect, and says on COM1 which one it is, so a machine
+//! that resets on its second step shows the first did nothing. The last cannot fail: an
+//! exception with no IDT to deliver it is a triple fault, which a PC answers by resetting.
 //!
 //! [`reset`] runs with every other processor stopped, some possibly holding a lock, so it takes
-//! none and allocates nothing. The one step that would — a reset register in **memory** space,
-//! which needs a mapping — is mapped by [`prepare`] first, while the machine still runs.
+//! none and allocates nothing; a reset register in memory space is mapped by [`prepare`] first.
 
 use core::arch::asm;
 use core::fmt::Write;
@@ -20,36 +17,31 @@ use super::regs::{outb, outl};
 use crate::arch::timer::ArchTimer;
 use crate::mm::{PAGE_SIZE, PhysAddr};
 
-/// How long each step is given to reset the machine before the next is tried.
 const SETTLE_NS: u64 = 500_000_000;
 
-/// The legacy PCI configuration mechanism: the address port, then the data port.
 const PCI_CONFIG_ADDRESS: u16 = 0xcf8;
 const PCI_CONFIG_DATA: u16 = 0xcfc;
 
 /// Where [`prepare`] mapped a reset register in memory space; 0 when it did not.
 static MAPPED: AtomicU64 = AtomicU64::new(0);
 
-/// One way to reset the machine that may not work: each is followed by [`settle`], and then the
-/// next. The triple fault, which cannot fail, is not one — it is what [`reset`] ends in.
+/// One way to reset the machine that may not work; each is followed by [`settle`]. The triple
+/// fault, which cannot fail, is not one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
-    /// Write the byte to the FADT's reset register.
     Register(Gas, u8),
-    /// Pulse the 8042's reset line.
     Kbc,
 }
 
-/// **The steps a reset tries before its triple fault, in order.** The FADT's register comes first
-/// when it has one this kernel can write; the 8042 is tried on every machine.
+/// The steps a reset tries before its triple fault, in order: the FADT's register when this
+/// kernel can write it, then the 8042, which every machine gets.
 pub(crate) fn steps(fadt: Option<Fadt>) -> [Option<Step>; 2] {
     let register = fadt.and_then(|f| f.reset).filter(|(gas, _)| writable(gas));
     [register.map(|(gas, value)| Step::Register(gas, value)), Some(Step::Kbc)]
 }
 
-/// Whether a reset register is one this kernel can write: an I/O port, physical memory, or a
-/// configuration register the legacy PCI mechanism reaches. ACPI allows those three spaces, and
-/// no other, for the reset register.
+/// Whether a reset register is one this kernel can write: ACPI allows I/O, memory and
+/// PCI configuration space, and the legacy mechanism reaches the last.
 fn writable(gas: &Gas) -> bool {
     match gas.space {
         GAS_SYSTEM_IO => gas.address <= u16::MAX as u64,
@@ -60,8 +52,8 @@ fn writable(gas: &Gas) -> bool {
 }
 
 /// A PCI configuration address as a GAS packs it — bus 0, the device in bits 32–47, the function
-/// in 16–31 and the offset in 0–15 (ACPI 6.5 §5.2.3.2) — or `None` for one the legacy mechanism
-/// cannot reach, which addresses 256 bytes of each function.
+/// in 16–31 and the offset in 0–15 (ACPI 6.5 §5.2.3.2) — or `None` if the legacy mechanism
+/// (256 bytes per function) cannot reach it.
 pub(crate) fn pci_config(address: u64) -> Option<(u8, u8, u8)> {
     let device = (address >> 32) & 0xffff;
     let (function, offset) = ((address >> 16) & 0xffff, address & 0xffff);
@@ -151,8 +143,8 @@ unsafe fn write_register(gas: &Gas, value: u8) {
     }
 }
 
-/// Give a step [`SETTLE_NS`] to reset the machine. The clock is read from the processor's
-/// counter, which needs neither interrupts nor a lock.
+/// Give a step [`SETTLE_NS`] to reset the machine, timed by the processor's counter, which
+/// needs neither interrupts nor a lock.
 fn settle() {
     let until = crate::arch::Timer::read_ns().saturating_add(SETTLE_NS);
     while crate::arch::Timer::read_ns() < until {
@@ -161,7 +153,7 @@ fn settle() {
 }
 
 /// Load an empty IDT and raise an exception. Nothing can deliver it, nor the general protection
-/// fault that follows, nor the double fault after that, so the processor shuts down.
+/// fault after it, nor the double fault after that, so the processor shuts down.
 ///
 /// # Safety
 /// Ring 0, with interrupts masked: nothing after this runs.
@@ -187,8 +179,6 @@ mod tests {
         Some(Fadt { reset, ..Fadt::default() })
     }
 
-    /// **The FADT's register first, when it has one this kernel can write**, then the 8042 —
-    /// which every machine gets, whatever its FADT says — before the triple fault.
     #[test]
     fn a_reset_tries_the_register_then_the_8042() {
         let q35 = steps(with_reset(Some((IO, 0x0f))));
@@ -207,8 +197,6 @@ mod tests {
         assert_eq!(steps(with_reset(Some((nowhere, 1)))), rest);
     }
 
-    /// **A PCI configuration address is bus 0's**, with the device, function and offset in their
-    /// own 16-bit fields, and only what the legacy mechanism can reach is written.
     #[test]
     fn a_pci_config_reset_register_decodes_to_device_function_and_offset() {
         // Device 31, function 0, offset 0xac — where an Intel chipset's reset control sits.
