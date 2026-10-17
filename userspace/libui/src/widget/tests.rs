@@ -21,8 +21,6 @@ fn a_thumb_is_proportional_to_what_is_visible() {
 
 #[test]
 fn a_thumb_reaches_the_bottom_exactly_at_the_last_line() {
-    // Off by one here leaves a gap at the bottom that says "there is more" when there is
-    // not, or runs the thumb past the end.
     let s = ScrollState { offset: 75, visible: 25, total: 100 };
     let (pos, len) = s.thumb(200);
     assert_eq!(pos + len, 200, "flush with the end of the track");
@@ -30,9 +28,8 @@ fn a_thumb_reaches_the_bottom_exactly_at_the_last_line() {
 
 #[test]
 fn a_short_thumb_is_clamped_and_still_reaches_both_ends() {
-    // A thumb proportional to a long scrollback shrinks below grabbing size. Clamping it
-    // *after* computing the position runs it past the track's end by whatever the clamp
-    // added — which is why the clamp comes first.
+    // Clamped before the position is computed, or the thumb runs past the track's end by
+    // whatever the clamp added.
     let s = ScrollState { offset: 0, visible: 1, total: 10_000 };
     let (pos, len) = s.thumb(200);
     assert_eq!(len, MIN_THUMB, "clamped to something grabbable");
@@ -46,8 +43,6 @@ fn a_short_thumb_is_clamped_and_still_reaches_both_ends() {
 
 #[test]
 fn nothing_to_scroll_fills_the_track() {
-    // How a user sees "this is all of it". A full-height thumb that nevertheless moves is
-    // the alternative, and it is nonsense.
     for s in [ScrollState { offset: 0, visible: 100, total: 100 }, ScrollState { offset: 0, visible: 200, total: 100 }]
     {
         assert_eq!(s.thumb(200), (0, 200), "{s:?}");
@@ -57,8 +52,6 @@ fn nothing_to_scroll_fills_the_track() {
 
 #[test]
 fn degenerate_scroll_states_do_not_divide_by_zero() {
-    // `total == visible` makes `max_offset` zero and `visible == 0` makes the proportion
-    // zero; a scrollbar for an empty document is an ordinary thing to ask for.
     assert_eq!(ScrollState { offset: 0, visible: 0, total: 0 }.thumb(200), (0, 200));
     assert_eq!(ScrollState { offset: 5, visible: 0, total: 10 }.thumb(200), (0, 200));
     assert_eq!(ScrollState { offset: 0, visible: 10, total: 10 }.thumb(0), (0, 0));
@@ -66,9 +59,6 @@ fn degenerate_scroll_states_do_not_divide_by_zero() {
 
 #[test]
 fn an_offset_past_the_end_is_clamped_rather_than_overflowing() {
-    // An application that scrolled past the end must not produce a thumb outside the
-    // track — and the arithmetic is unsigned, so getting it wrong wraps rather than
-    // going negative.
     let s = ScrollState { offset: 10_000, visible: 25, total: 100 };
     let (pos, len) = s.thumb(200);
     assert_eq!(pos + len, 200);
@@ -76,19 +66,11 @@ fn an_offset_past_the_end_is_clamped_rather_than_overflowing() {
 
 #[test]
 fn a_grab_maps_back_to_the_offset_the_thumb_was_drawn_for() {
-    // `offset_at` is `thumb`'s inverse, and the two are the only pair in the toolkit that
-    // *must* agree: one decides where the thumb is painted, the other what grabbing it
-    // there means. A drift between them is a thumb that jumps away from the cursor.
-    //
-    // Over the whole range rather than one offset, because the arithmetic is two
-    // divisions and a clamp, and the ends are where each of them goes wrong.
-    //
-    // **Within a pixel's worth of lines, not exactly** — and that is a fact about
-    // scrollbars, not a weak assertion. A thousand lines over a ~390-pixel span puts
-    // roughly three lines on every pixel, so a thumb drawn for line 500 is at the same
-    // pixel as one drawn for 501, and no inverse can tell them apart. Demanding equality
-    // here would be demanding the impossible; **the ends are exact**, which is the part
-    // that matters and the part off-by-one errors break.
+    // `offset_at` is `thumb`'s inverse and the two must agree: one decides where the thumb is
+    // painted, the other what grabbing it there means. Over the whole range, since the ends are
+    // where each division and clamp goes wrong. Within a pixel's worth of lines, not exactly:
+    // a thousand lines over ~390 pixels puts three lines on a pixel, so no inverse can tell
+    // them apart; the ends are exact.
     let s = ScrollState { offset: 0, visible: 24, total: 1024 };
     let track = 400;
     let (_, len) = s.thumb(track);
@@ -119,8 +101,6 @@ fn a_grab_maps_back_to_the_offset_the_thumb_was_drawn_for() {
         "and the bottom exactly the bottom"
     );
 
-    // And where the arithmetic *can* be exact — fewer lines than pixels of span — it is,
-    // so the tolerance above is the quantisation and not a bug hiding inside it.
     let s = ScrollState { offset: 0, visible: 10, total: 40 };
     for offset in 0..=30 {
         let s = ScrollState { offset, ..s };
@@ -131,26 +111,21 @@ fn a_grab_maps_back_to_the_offset_the_thumb_was_drawn_for() {
 
 #[test]
 fn dragging_past_either_end_of_the_track_stays_at_that_end() {
-    // The router hands a captured widget coordinates outside itself rather than clamping
-    // them — deliberately, so a drag is not indistinguishable from a drag that stopped at
-    // the edge. Something has to clamp, and this is it.
+    // The router hands a captured widget coordinates outside itself rather than clamping, so
+    // something here has to.
     let s = ScrollState { offset: 300, visible: 24, total: 1024 };
     assert_eq!(s.offset_at(400, -900), 0, "dragged far above the bar");
     assert_eq!(s.offset_at(400, 9000), 1000, "and far below it");
-    // The bottom of the track is the last line, not one short of it: the rounding.
     assert_eq!(s.offset_at(400, 400), 1000, "the very bottom is the end of the document");
 }
 
 #[test]
 fn a_bar_with_nothing_to_scroll_reports_nothing_wherever_it_is_grabbed() {
-    // Otherwise a short document scrolls when its full-height thumb is dragged, which is
-    // the visible form of dividing by a zero span.
     let s = ScrollState { offset: 0, visible: 24, total: 24 };
     assert!(!s.scrollable());
     for y in [-5, 0, 100, 4000] {
         assert_eq!(s.offset_at(400, y), 0, "at y={y}");
     }
-    // And a track so short that `MIN_THUMB` fills it — reachable, not hypothetical.
     let s = ScrollState { offset: 5, visible: 24, total: 1024 };
     assert_eq!(s.thumb(MIN_THUMB).1, MIN_THUMB, "the premise: the thumb fills the track");
     assert_eq!(s.offset_at(MIN_THUMB, 8), 0, "a position it cannot express");
@@ -158,15 +133,12 @@ fn a_bar_with_nothing_to_scroll_reports_nothing_wherever_it_is_grabbed() {
 
 #[test]
 fn a_scrollbar_lays_its_thumb_out_where_the_arithmetic_says() {
-    // The layout half: a `Column` of spacer, thumb and filler places the thumb without
-    // any node needing to offset a child.
     let p = Theme::default();
     let s = ScrollState { offset: 50, visible: 25, total: 100 };
     let e: Element<Msg> = scrollbar(s, 12, 400, &p);
     let l = layout(&e, Rect::new(0, 0, 12, 400), &CELL);
     let (pos, len) = s.thumb(400);
 
-    // stack -> [track fill, column] ; column -> [spacer, thumb, filler]
     let col = &l.children[0].children[1];
     assert_eq!(col.children[0].rect.size.h, pos, "the spacer is the thumb's offset");
     assert_eq!(col.children[1].rect.size.h, len, "and then the thumb");
@@ -184,18 +156,12 @@ fn a_button_carries_its_message_and_takes_focus() {
 
 #[test]
 fn a_buttons_face_follows_the_state_it_is_given() {
-    // Widgets take their state as an argument rather than remembering it, so this is the
-    // whole of a button's appearance logic and it is a pure function.
     let p = Theme::default();
     let face_of = |st: WidgetState| {
         let e: Element<Msg> = button("OK", (), st, &p);
-        // The first layer is the face at rest and the ring when active; either way the
-        // painted face is the last `Fill` before the label.
         let fills: vec::Vec<Rgb> = e
             .children()
             .filter_map(|c| match &c.node {
-                // A button's layers are rounded fills since Part H; a square `Fill` is still
-                // matched so this reads whichever shape the widget is built from.
                 crate::element::Node::Fill(c) | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
                 crate::element::Node::Padding { child, .. } => match &child.node {
                     crate::element::Node::Fill(c) | crate::element::Node::RoundedFill { colour: c, .. } => Some(*c),
@@ -217,28 +183,22 @@ fn a_buttons_face_follows_the_state_it_is_given() {
 
 #[test]
 fn a_focused_button_draws_a_ring_that_the_face_does_not_cover() {
-    // Painted rather than inspected: the ring is the outermost layer, so a face drawn
-    // over the whole area would hide it and the tree would still look right.
+    // Painted rather than inspected: the ring is the outermost layer, and a face drawn over the
+    // whole area would hide it while the tree still looked right.
     let p = Theme::default();
     let t = Theme::default();
     let mut fb = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
     let e: Element<Msg> = button("OK", (), WidgetState { active: true, ..Default::default() }, &p);
     let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
     paint(&mut fb, &font(), &t, &e, &l, Rect::new(0, 0, 80, 40), &mut |_, _, _, _: &mut MemFramebuffer| {});
-    // **Down the left edge rather than at the corner**: the button is rounded to
-    // `CONTROL_RADIUS` since Part H, so `(0, 0)` is the ground the curve was cut out of.
+    // Down the left edge rather than at the corner, which the rounding cuts away.
     assert_eq!(fb.get_pixel(0, 20), Some(p.accent), "the ring is on the edge");
-    // **Inside the ring but away from the label**, which is centred since M15: the middle
-    // of the button is where the word is, so a sample taken there is a glyph.
+    // Inside the ring but away from the centred label.
     assert_eq!(fb.get_pixel(6, 20), Some(p.face), "and the face is inside it");
 }
 
-/// A resting button has an edge, and it is not the focus ring.
-///
-/// **What makes a shape read as a control** (M15). The face is eighteen units per channel
-/// from a white window, which is a difference nobody can see — the report from running it
-/// was that buttons "need different color background … so you know it's a button". An edge
-/// is what every desktop draws and what this toolkit had only around a focused control.
+/// A resting button has an edge, and it is not the focus ring: the face is eighteen units per
+/// channel from a white window, which nobody can see.
 #[test]
 fn a_resting_button_has_a_border_and_a_focused_one_keeps_the_ring() {
     let p = Theme::default();
@@ -252,13 +212,8 @@ fn a_resting_button_has_a_border_and_a_focused_one_keeps_the_ring() {
     assert_eq!(fb.get_pixel(6, 20), Some(p.face), "the face is inside the edge");
 }
 
-/// A resting field has an edge, and on a white card that edge is the only thing that says
-/// there is a field there at all.
-///
-/// **The greeter is what found this** (desktop refresh, Part D): a field was a flat fill of
-/// `track`, `track` is the same white as a window's own ground in the light scheme, and so a
-/// password box at rest was invisible. Painted rather than inspected, because the ground is
-/// drawn over the edge if the layers are the wrong way round and the tree still looks right.
+/// A resting field has an edge, and on a white card that edge is all that says there is a field.
+/// Painted, because the ground is drawn over the edge if the layers are the wrong way round.
 #[test]
 fn a_resting_field_has_an_edge_against_the_ground_it_sits_on() {
     let p = Theme::default();
@@ -269,13 +224,11 @@ fn a_resting_field_has_an_edge_against_the_ground_it_sits_on() {
     let l = layout(&e, Rect::new(0, 0, 80, 40), &CELL);
     let all = Rect::new(0, 0, 80, 40);
     paint(&mut fb, &font(), &p, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
-    // Down the left edge, clear of the rounded corners.
     let mid = l.rect.size.h / 2;
     assert_eq!(fb.get_pixel(0, mid), Some(p.border), "a resting field has an edge");
     assert_ne!(p.border, p.track, "…and it is not the colour of the well inside it");
     assert_ne!(p.border, p.background, "…nor of the surface it sits on");
     assert_eq!(fb.get_pixel(4, mid), Some(p.track), "the well is inside the edge");
-    // Focused, the edge is the accent instead — a state, not a second kind of edge.
     let mut lit = MemFramebuffer::new(Geometry::packed(80, 40, PixelFormat::XRGB8888));
     lit.clear(p.background);
     let f: Element<Msg> = text_field(&state, false, WidgetState { active: true, ..Default::default() }, &p);
@@ -284,12 +237,8 @@ fn a_resting_field_has_an_edge_against_the_ground_it_sits_on() {
     assert_eq!(lit.get_pixel(0, mid), Some(p.accent), "a focused field rings in the accent");
 }
 
-/// The label is in the middle of the button, not against its corner.
-///
-/// **Measured as a distance from each edge**, because the exact pixels a glyph lands on are
-/// the font's business: what this asserts is that the ink is not hard against the left,
-/// which is where `padding` alone put it — a button 80 wide with a word 20 wide had 58
-/// pixels of face to the right of its label (M15).
+/// The label is in the middle of the button, not against its corner: measured as a distance
+/// from each edge, since `padding` alone left 58 pixels of face to the label's right.
 #[test]
 fn a_buttons_label_is_centred_in_its_face() {
     let p = Theme::default();
@@ -321,19 +270,15 @@ fn a_menu_bar_is_as_tall_as_asked_and_no_taller() {
 
 #[test]
 fn a_menu_bars_items_each_get_their_own_width() {
-    // **The test this file was missing.** Every other one here lays *one* widget into a
-    // rectangle of its own, where a widget that measures to "everything available" and one
-    // that measures to its content are indistinguishable. Put two beside each other and
-    // they are not: until 2026-08-11 `Node::Fill` measured to `c.max`, so the first
-    // `button` — a `Stack` over a `Fill` — took the whole row and the second laid out at
-    // zero width, off the right edge. The bar looked correct in every assertion above.
+    // Two widgets beside each other: alone, one that measures to "everything available" and one
+    // that measures to its content are indistinguishable. `Node::Fill` once measured to `c.max`,
+    // so the first `button` took the whole row and the second laid out at zero width.
     let p = Theme::default();
     let items: vec::Vec<Element<Msg>> =
         vec![button("File", (), WidgetState::default(), &p), button("Edit", (), WidgetState::default(), &p)];
     let e = menu_bar(items, 24, &p);
     let l = layout(&e, Rect::new(0, 0, 200, 100), &CELL);
     // sized -> dock -> [the rule, stack] ; stack -> [face fill, row] ; row -> the buttons.
-    // (One level deeper since the desktop refresh's Part B put a rule under the bar.)
     let row = &l.children[0].children[1].children[1];
     let (a, b) = (row.children[0].rect, row.children[1].rect);
     assert!(a.size.w > 0, "the first item measured to nothing");
@@ -344,8 +289,6 @@ fn a_menu_bars_items_each_get_their_own_width() {
 
 #[test]
 fn a_button_measures_to_its_label_not_to_the_room_it_is_given() {
-    // The same defect stated as a property rather than as a composition. A button in a
-    // 400-pixel-tall column is not a 400-pixel-tall button.
     let p = Theme::default();
     let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
     let big = crate::layout::measure(&e, crate::layout::Constraints::loose(libdraw::geom::Size::new(400, 400)), &CELL);
@@ -357,10 +300,8 @@ fn a_button_measures_to_its_label_not_to_the_room_it_is_given() {
 
 #[test]
 fn a_title_bars_buttons_sit_at_its_right_edge_and_the_drag_face_takes_the_rest() {
-    // **The layout property a person notices**, and the one that decides where a press
-    // lands: the buttons are at the right, the title runs from the left, and everything
-    // between them is draggable. A `flex(1)` label that measured to its text instead would
-    // leave the buttons floating next to the title in the middle of the bar.
+    // The layout property that decides where a press lands: buttons at the right, the title
+    // from the left, and everything between draggable.
     #[derive(Clone, PartialEq, Debug)]
     enum M {
         Drag,
@@ -381,10 +322,7 @@ fn a_title_bars_buttons_sit_at_its_right_edge_and_the_drag_face_takes_the_rest()
     let l = layout(&e, Rect::new(0, 0, 400, 100), &CELL);
     let mut tree = crate::diff::Tree::new();
     tree.update(&e, &l).expect("a clean frame");
-    // **Asked of the router, not read off the layout tree**, which this used to walk by child
-    // index and which changed shape when the bar gained a rule and its buttons an ink
-    // (desktop refresh, Part B). Where a press *lands* is the property; the tree's shape was
-    // only ever a way of guessing it.
+    // Asked of the router, not read off the layout tree: where a press lands is the property.
     let click = |x: i32, y: i32| {
         let at = |pressed: bool| librsproto::surface::PointerEvent {
             kind: librsproto::surface::POINTER_BUTTON,
@@ -401,8 +339,6 @@ fn a_title_bars_buttons_sit_at_its_right_edge_and_the_drag_face_takes_the_rest()
         got
     };
     assert_eq!(l.rect.size.h, TITLE_BAR_H, "the bar is its height");
-    // The buttons sit at the right edge, `TITLE_BUTTON_PAD` in, each answering across its
-    // whole column and not a pixel beyond it.
     let right = (400 - TITLE_BUTTON_PAD) as i32;
     let step = (TITLE_BUTTON_W + TITLE_BUTTON_GAP) as i32;
     for (nth, want) in [(0, M::Close), (1, M::Max), (2, M::Min)] {
@@ -412,19 +348,16 @@ fn a_title_bars_buttons_sit_at_its_right_edge_and_the_drag_face_takes_the_rest()
         assert_eq!(click(end - 1, 12), vec![want.clone()], "{want:?}'s last column");
         assert_eq!(click(end, 12), vec![M::Drag], "just past {want:?} is the bar");
     }
-    // And the face takes the rest: the title's end of the bar, the gaps, the padding.
     assert_eq!(click(1, 12), vec![M::Drag], "the title starts at the left and drags");
     assert_eq!(click(399, 12), vec![M::Drag], "the padding after close drags");
 }
 
-// ---- the text area (M10 Part C) ----
+// ---- the text area ----
 
-/// `abc` / `de` / `fghi`, cursor at the start.
 fn area() -> TextAreaState {
     TextAreaState::with_text("abc\nde\nfghi")
 }
 
-/// Type `text` into `a`, one character at a time, the way a person does.
 fn type_text(a: &mut TextAreaState, text: &str) {
     for c in text.chars() {
         if c == '\n' {
@@ -435,7 +368,7 @@ fn type_text(a: &mut TextAreaState, text: &str) {
     }
 }
 
-/// **An area types under the key's locks** (Phase 6 Part B.5; PR #359 review), as a field does.
+/// An area types under the key's locks, as a field does.
 #[test]
 fn an_area_types_under_the_keys_locks() {
     use librsproto::surface::{LOCK_CAPS, LOCK_NUM};
@@ -445,14 +378,11 @@ fn an_area_types_under_the_keys_locks() {
     assert_eq!(a.text(), "A1");
 }
 
-// ---- paste and its range (M12 Part E) ----
+// ---- paste and its range ----
 
 #[test]
 fn insert_text_returns_the_range_it_occupies() {
-    // **The return value is what makes cycling possible at all.** M12 decision 3 says a
-    // cycle *replaces what was just inserted*, so the caller has to be told where that is —
-    // and deriving it at the call site from the cursor and the text's shape would be the
-    // same arithmetic done somewhere with less to check it against.
+    // The return value lets a cycle, which replaces what was just inserted, know where that is.
     let mut a = area();
     a.apply(KEY_RIGHT, 0, 0); // between `a` and `bc`
     let (from, to) = a.insert_text("XY");
@@ -460,7 +390,6 @@ fn insert_text_returns_the_range_it_occupies() {
     assert_eq!(from, (0, 1));
     assert_eq!(to, (0, 3), "one line, so the range is columns 1..3");
 
-    // …and a multi-line paste ends on the line it made, not the one it started on.
     let mut a = area();
     let (from, to) = a.insert_text("one\ntwo");
     assert_eq!(from, (0, 0));
@@ -470,9 +399,7 @@ fn insert_text_returns_the_range_it_occupies() {
 
 #[test]
 fn select_range_then_insert_text_is_the_cycle() {
-    // The two halves together are what `nxedit::App::cycled` does. Doing it here as well
-    // pins the *primitives*: `nxedit`'s own test would pass against a `select_range` that
-    // selected nothing, because `insert_text` inserts at the cursor either way.
+    // The two halves together are what `nxedit::App::cycled` does; this pins the primitives.
     let mut a = area();
     let (from, to) = a.insert_text("FIRST");
     assert_eq!(a.text(), "FIRSTabc\nde\nfghi");
@@ -484,10 +411,8 @@ fn select_range_then_insert_text_is_the_cycle() {
 
 #[test]
 fn select_range_clamps_a_stale_range_rather_than_panicking() {
-    // **The guard is documented and was not covered** (PR #271 review, optional 7). A range
-    // is only valid until the next edit, and a cycle that arrived after one would otherwise
-    // index out of the buffer — in an editor holding somebody's unsaved work. Clamping
-    // makes a stale range select something harmless instead.
+    // A range is only valid until the next edit; clamping makes a stale one select something
+    // harmless instead of indexing out of the buffer.
     let mut a = area();
     a.select_range((99, 99), (99, 99));
     assert_eq!(a.selected_text(), None, "collapsed onto the end of the last line");
@@ -497,22 +422,18 @@ fn select_range_clamps_a_stale_range_rather_than_panicking() {
 
 #[test]
 fn select_range_lands_on_a_character_boundary() {
-    // Columns are byte offsets, and a stale one can point into the middle of a multi-byte
-    // character — where every `String` operation below panics. Clamping walks back to the
-    // boundary rather than trusting the number.
+    // A stale column can point into the middle of a multi-byte character; clamping walks back
+    // to the boundary.
     let mut a = TextAreaState::with_text("aéb");
-    // `é` is two bytes, so 2 is inside it.
     a.select_range((0, 0), (0, 2));
     assert_eq!(a.selected_text().as_deref(), Some("a"));
 }
 
-// ---- undo and redo (M12 Part C) ----
+// ---- undo and redo ----
 
 #[test]
 fn a_word_is_one_undo_step_and_so_is_a_line() {
-    // **The grouping is the decision, not the stack.** Per keystroke is unusable — undoing a
-    // sentence becomes forty presses — and per save is useless. A run of printable characters
-    // is one group, a separator ends it, and `Enter` ends it.
+    // A run of printable characters is one group, a separator ends it, and `Enter` ends it.
     let mut a = TextAreaState::new();
     type_text(&mut a, "hello world");
     assert!(a.undo(), "there is something to undo");
@@ -524,10 +445,8 @@ fn a_word_is_one_undo_step_and_so_is_a_line() {
 
 #[test]
 fn a_line_ends_a_group() {
-    // **`Enter` joins the group it lands in and closes it**, so the line you just typed —
-    // its text *and* its break — comes back in one step, and what you type on the next line
-    // is a step of its own. Splitting the break out would make undoing a line take two
-    // presses that look identical.
+    // `Enter` joins the group it lands in and closes it: the line's text and its break come
+    // back in one step.
     let mut a = TextAreaState::new();
     type_text(&mut a, "one\ntwo");
     assert!(a.undo());
@@ -536,8 +455,6 @@ fn a_line_ends_a_group() {
     assert_eq!(a.text(), "", "then the first line and its break, together");
     assert!(!a.undo());
 
-    // And a break typed after a movement is its own group, because the movement closed the
-    // one before it.
     let mut a = TextAreaState::with_text("ab");
     a.end(false);
     a.newline();
@@ -550,8 +467,8 @@ fn a_line_ends_a_group() {
 
 #[test]
 fn moving_ends_a_group_so_two_edits_undo_separately() {
-    // **Wherever it lands.** Without this, typing at one end of a line, moving to the other
-    // and typing again undoes both at once — two pieces of text a person put in two places.
+    // Wherever it lands: typing at one end of a line, moving to the other and typing again
+    // must not undo both at once.
     let mut a = TextAreaState::with_text("ab");
     a.end(false);
     a.insert('X');
@@ -566,8 +483,6 @@ fn moving_ends_a_group_so_two_edits_undo_separately() {
 
 #[test]
 fn deleting_is_its_own_kind_of_group() {
-    // A run of deletions coalesces, and typing after them starts a new group rather than
-    // extending the one that was removing.
     let mut a = TextAreaState::with_text("abcdef");
     a.end(false);
     a.backspace();
@@ -583,9 +498,8 @@ fn deleting_is_its_own_kind_of_group() {
 
 #[test]
 fn an_edit_that_does_nothing_is_not_a_step() {
-    // A `Backspace` at the start of the buffer and a `Delete` at its end change nothing, and
-    // a snapshot for either is an undo press that visibly does nothing — which reads as a
-    // broken undo rather than an empty history.
+    // A `Backspace` at the start and a `Delete` at the end change nothing, and a snapshot for
+    // either would be an undo press that visibly does nothing.
     let mut a = TextAreaState::with_text("ab");
     assert!(!a.backspace(), "nothing before the cursor");
     assert!(!a.undo(), "and nothing to undo");
@@ -598,11 +512,8 @@ fn an_edit_that_does_nothing_is_not_a_step() {
 
 #[test]
 fn placing_the_cursor_ends_a_group() {
-    // **The fifth boundary, and the one with no test until PR #269's review said so.** A
-    // click is a movement and closes a group for the same reason an arrow key does — and it
-    // is forward-looking here: nothing outside this crate's own tests wires a press to
-    // `place` yet, so the editor cannot reach it. That is a reason for a test rather than
-    // against one: the day `text_area` grows click-to-place, this rule has to already hold.
+    // A click is a movement and closes a group as an arrow key does. Forward-looking:
+    // nothing outside this crate's tests wires a press to `place` yet.
     let mut a = TextAreaState::with_text("ab");
     a.end(false);
     a.insert('X');
@@ -617,8 +528,7 @@ fn placing_the_cursor_ends_a_group() {
 
 #[test]
 fn a_boundary_the_buffer_cannot_see_can_still_be_drawn() {
-    // A save is the boundary this exists for: what a person wants back afterwards is what
-    // they have typed *since*, and without an explicit end the whole session is one group.
+    // A save is the boundary this exists for: without an explicit end the session is one group.
     let mut a = TextAreaState::new();
     type_text(&mut a, "first");
     a.end_group();
@@ -638,7 +548,6 @@ fn redo_comes_forward_and_a_new_edit_abandons_it() {
     assert!(a.redo(), "and forward again");
     assert_eq!(a.text(), "one two");
 
-    // **Typing after an undo is a branch**, so what was undone is not coming back.
     a.undo();
     assert_eq!(a.text(), "one ");
     a.insert('X');
@@ -648,11 +557,9 @@ fn redo_comes_forward_and_a_new_edit_abandons_it() {
 
 #[test]
 fn the_history_is_bounded_and_drops_the_oldest() {
-    // Each step is a copy of the whole buffer, so the depth bound is the memory bound.
     let mut a = TextAreaState::new();
     for i in 0..MAX_UNDO + 10 {
         a.insert(char::from(b'a' + (i % 26) as u8));
-        // A separator between each, so every character is its own group.
         a.insert(' ');
     }
     let mut steps = 0;
@@ -665,8 +572,7 @@ fn the_history_is_bounded_and_drops_the_oldest() {
 
 #[test]
 fn undoing_marks_the_buffer_changed() {
-    // `revision` is what an editor derives "modified" from, and undo has to move it or a
-    // buffer taken back to something else would read as matching the file.
+    // `revision` is what an editor derives "modified" from, and undo has to move it.
     let mut a = TextAreaState::new();
     a.insert('x');
     let after_typing = a.revision();
@@ -674,7 +580,7 @@ fn undoing_marks_the_buffer_changed() {
     assert_ne!(a.revision(), after_typing);
 }
 
-// ---- find (M12 Part C) ----
+// ---- find ----
 
 #[test]
 fn find_walks_forward_through_every_match_and_wraps() {
@@ -695,8 +601,6 @@ two",
 
 #[test]
 fn find_selects_what_it_found() {
-    // A cursor sitting silently at a hit leaves the person to spot it; a highlight says which
-    // of several this one is.
     let mut a = TextAreaState::with_text("alpha beta");
     assert!(a.find("beta"));
     assert_eq!(a.selected_text().as_deref(), Some("beta"));
@@ -707,15 +611,12 @@ fn find_answers_no_for_what_is_not_there_and_for_nothing() {
     let mut a = TextAreaState::with_text("alpha");
     assert!(!a.find("omega"), "absent");
     assert_eq!(a.cursor(), (0, 0), "and the cursor did not move");
-    // An empty needle is what the field holds before anything is typed; matching everything
-    // would move the buffer under the person on the way to their first character.
     assert!(!a.find(""));
     assert_eq!(a.cursor(), (0, 0));
 }
 
 #[test]
 fn find_does_not_split_a_multi_byte_character() {
-    // The search starts one byte past the cursor, and that byte can be inside a character.
     let mut a = TextAreaState::with_text("é and é");
     assert!(a.find("é"), "the second one");
     assert_eq!(a.cursor(), (0, 7));
@@ -723,11 +624,8 @@ fn find_does_not_split_a_multi_byte_character() {
     assert_eq!(a.cursor(), (0, 0));
 }
 
-/// How many `Fill`s of `colour` the tree holds — the caret is one, and a selection's
-/// highlight is one per line it covers.
-///
-/// **What `text_area` draws had no host coverage in either direction** until PR #258's
-/// review; `check-display` renders one arrangement of it and a picture cannot count.
+/// How many `Fill`s of `colour` the tree holds: the caret is one, and a selection's highlight is
+/// one per line it covers. `check-display` renders one arrangement and a picture cannot count.
 fn fills<M>(e: &Element<M>, colour: Rgb) -> usize {
     fn walk<M>(e: &Element<M>, colour: Rgb, n: &mut usize) {
         if matches!(&e.node, crate::element::Node::Fill(rgb) if *rgb == colour) {
@@ -747,14 +645,10 @@ const KEY_X: u16 = 45;
 
 #[test]
 fn a_buffer_round_trips_its_text_and_keeps_a_trailing_empty_line() {
-    // **What was opened is what is saved.** A file that ended with a newline has a final
-    // empty line; one that did not, does not — and an editor that "helpfully" added one
-    // would rewrite every file it touched on the first save.
+    // What was opened is what is saved: no trailing newline added or lost.
     for src in ["abc\nde", "abc\nde\n", "", "\n"] {
         assert_eq!(TextAreaState::with_text(src).text(), src, "round trip of {src:?}");
     }
-    // A carriage return is dropped rather than kept: an invisible character at the end of
-    // every line is one the cursor has to step over and nobody can see.
     assert_eq!(TextAreaState::with_text("a\r\nb").text(), "a\nb");
 }
 
@@ -779,9 +673,7 @@ fn typing_inserts_and_enter_splits_the_line() {
 
 #[test]
 fn backspace_at_the_start_of_a_line_joins_it_to_the_one_above() {
-    // The case a single-line field never has. The cursor lands **where the join happened**,
-    // which is where the text the person was deleting towards now is — not at the start of
-    // the merged line.
+    // The cursor lands where the join happened, not at the start of the merged line.
     let mut a = area();
     a.apply(KEY_DOWN, 0, 0);
     assert_eq!(a.cursor(), (1, 0));
@@ -814,9 +706,8 @@ fn backspace_at_the_very_start_and_delete_at_the_very_end_do_nothing() {
 
 #[test]
 fn vertical_movement_keeps_the_column_it_was_aiming_for() {
-    // **The goal column.** Down from column 3 of `abc` onto `de` (length 2) clamps to 2 —
-    // and coming back up must return to 3, not stay at 2. Without it a person who pressed
-    // only Down and Up has had their column moved for them.
+    // The goal column: Down from column 3 onto a two-character line clamps to 2, and coming
+    // back up must return to 3.
     let mut a = area();
     a.apply(KEY_END, 0, 0);
     assert_eq!(a.cursor(), (0, 3));
@@ -831,8 +722,7 @@ fn vertical_movement_keeps_the_column_it_was_aiming_for() {
 
 #[test]
 fn a_horizontal_move_gives_up_the_goal_column() {
-    // Otherwise the goal outlives the intent that set it: press Down, Left, Down, and the
-    // second Down would jump back out to a column the person just moved away from.
+    // Otherwise the goal outlives the intent that set it.
     let mut a = area();
     a.apply(KEY_END, 0, 0);
     a.apply(KEY_DOWN, 0, 0);
@@ -857,7 +747,6 @@ fn shift_extends_a_selection_and_an_unshifted_move_drops_it() {
 
 #[test]
 fn a_selection_reads_the_same_whichever_way_it_was_made() {
-    // The anchor may be before or after the cursor; every consumer wants document order.
     let mut a = area();
     a.apply(KEY_END, 0, 0);
     for _ in 0..2 {
@@ -878,8 +767,6 @@ fn a_selection_spanning_lines_reads_the_newlines_back() {
 
 #[test]
 fn typing_over_a_selection_replaces_it() {
-    // **The rule that makes a selection worth having.** An editor where typing appends
-    // beside a highlighted run rather than replacing it is one nobody can use.
     let mut a = area();
     a.apply(KEY_DOWN, MOD_SHIFT, 0);
     a.apply(KEY_END, MOD_SHIFT, 0);
@@ -902,9 +789,7 @@ fn backspace_over_a_selection_deletes_the_selection_and_not_a_character() {
 
 #[test]
 fn the_view_scrolls_to_follow_the_cursor_and_the_widget_does_it() {
-    // **`ensure_visible` is the widget's to call, not the application's.** A caller that had
-    // to remember it would have a cursor that walks off the bottom of its own window — and
-    // the widget takes `&mut` precisely so it cannot be forgotten (PR #257 review).
+    // `ensure_visible` is the widget's to call, not the application's.
     let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7");
     let p = Theme::default();
     let _: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &p);
@@ -925,9 +810,8 @@ fn the_view_scrolls_to_follow_the_cursor_and_the_widget_does_it() {
 
 #[test]
 fn the_revision_counts_edits_and_not_movement() {
-    // **What an editor's "modified" marker is made of.** The alternatives it replaces are
-    // both wrong: comparing byte length misses replacing a one-character selection with one
-    // character, and re-deriving which keycodes edit is a second copy of `apply`'s dispatch.
+    // What an editor's "modified" marker is made of: byte length misses replacing a
+    // one-character selection with one character.
     let mut a = area();
     let start = a.revision();
 
@@ -936,9 +820,7 @@ fn the_revision_counts_edits_and_not_movement() {
     }
     assert_eq!(a.revision(), start, "moving is not editing");
 
-    // **Typed with nothing selected, and that is not incidental.** The first version made a
-    // selection first and then typed, so the insert's own bump was covered by the deletion
-    // of the selection — the assertion passed with `insert` not counting at all.
+    // Typed with nothing selected: the insert's own bump must not be covered by a deletion.
     a.apply(KEY_X, 0, 0);
     assert!(a.revision() > start, "typing is");
 
@@ -949,7 +831,6 @@ fn the_revision_counts_edits_and_not_movement() {
     }
     assert_eq!(sel.revision(), quiet, "nor is selecting");
 
-    // The case a length comparison cannot see: one character selected, one typed.
     let mut b = TextAreaState::with_text("abc");
     b.apply(KEY_RIGHT, MOD_SHIFT, 0);
     let before = b.revision();
@@ -958,7 +839,6 @@ fn the_revision_counts_edits_and_not_movement() {
     assert_eq!(b.text().len(), len, "the fixture must keep its length, or it proves nothing");
     assert!(b.revision() > before, "replacing a selection is an edit");
 
-    // And an edit that does nothing is not one.
     let mut c = TextAreaState::with_text("abc");
     let quiet = c.revision();
     assert!(!c.apply(KEY_BACKSPACE, 0, 0), "backspace at the start of the buffer does nothing");
@@ -967,13 +847,9 @@ fn the_revision_counts_edits_and_not_movement() {
 
 #[test]
 fn every_edit_path_counts_its_own_edit() {
-    // **One case per bump, because the bumps are not one line.** `insert` has its own and so
-    // does the `delete_selection` it calls first; `backspace` and `delete` each have two, a
-    // character and a join. A test that only typed left five of the seven uncontrolled, and
-    // the one that matters most is `delete_selection`'s: `backspace` and `delete` both
-    // return the moment it reports it deleted something, so without its bump a person could
-    // select a word, press Delete, and watch the buffer change while the title bar kept
-    // saying the file was saved (PR #259 review, finding 2).
+    // One case per bump, because the bumps are not one line: `delete_selection` has its own, and
+    // without it a person could select a word, press Delete, and watch the buffer change while
+    // the title bar kept saying the file was saved.
     let bumps = |setup: &dyn Fn(&mut TextAreaState)| -> u64 {
         let mut a = area();
         let before = a.revision();
@@ -981,7 +857,6 @@ fn every_edit_path_counts_its_own_edit() {
         a.revision() - before
     };
 
-    // A selection, deleted by each of the two keys that delete one.
     let select_two = |a: &mut TextAreaState| {
         for _ in 0..2 {
             a.apply(KEY_RIGHT, MOD_SHIFT, 0);
@@ -1004,7 +879,6 @@ fn every_edit_path_counts_its_own_edit() {
 
     assert!(bumps(&|a| a.newline()) > 0, "enter splits a line");
 
-    // Backspace's two paths: a character, and the join at the start of a line.
     assert!(
         bumps(&|a| {
             a.apply(KEY_RIGHT, 0, 0);
@@ -1021,7 +895,6 @@ fn every_edit_path_counts_its_own_edit() {
         "backspace joining two lines"
     );
 
-    // Delete's two, the same shape from the other side.
     assert!(bumps(&|a| assert!(a.apply(KEY_DELETE, 0, 0))) > 0, "delete over a character");
     assert!(
         bumps(&|a| {
@@ -1031,7 +904,6 @@ fn every_edit_path_counts_its_own_edit() {
         "delete joining two lines"
     );
 
-    // And the two that change nothing still count nothing, so "an edit" means an edit.
     let mut ends = TextAreaState::with_text("a");
     let quiet = ends.revision();
     assert!(!ends.apply(KEY_BACKSPACE, 0, 0), "backspace at the buffer's start");
@@ -1042,10 +914,8 @@ fn every_edit_path_counts_its_own_edit() {
 
 #[test]
 fn the_caret_is_drawn_at_either_end_of_a_selection() {
-    // **The half a picture cannot check.** `check-display`'s reference builds its selection
-    // with `Shift+Right`, so the gate compares a *forward* one — and the caret was drawn
-    // only after the highlight, which a forward selection satisfies and a backward one
-    // never does. Both directions here, counted in the tree (PR #258 review, blocking 2).
+    // The half a picture cannot check: `check-display` builds its selection with `Shift+Right`,
+    // so the gate compares a forward one. Both directions here, counted in the tree.
     let p = Theme::default();
     let draw = |a: &mut TextAreaState| -> usize {
         let e: Element<()> = text_area(a, 3 * 16, 16, true, &[], None, &p);
@@ -1080,7 +950,7 @@ fn the_caret_is_drawn_at_either_end_of_a_selection() {
     assert_eq!(fills(&e, p.accent), 0, "and none at all when the widget is not active");
 }
 
-/// Every `(text, ink)` pair in a tree, in order — an ink node's text, or `None` for plain.
+/// Every `(text, ink)` pair in a tree, in order.
 fn inked<M>(e: &Element<M>) -> Vec<(String, Option<Rgb>)> {
     fn walk<M>(e: &Element<M>, under: Option<Rgb>, out: &mut Vec<(String, Option<Rgb>)>) {
         match &e.node {
@@ -1102,7 +972,6 @@ fn inked<M>(e: &Element<M>) -> Vec<(String, Option<Rgb>)> {
 
 const KEYWORD: Rgb = Rgb::new(0x11, 0x22, 0x33);
 
-/// A run splits its line and colours exactly its own bytes.
 #[test]
 fn an_ink_run_splits_a_line_and_colours_only_itself() {
     let p = Theme::default();
@@ -1116,14 +985,10 @@ fn an_ink_run_splits_a_line_and_colours_only_itself() {
     );
 }
 
-/// A pixel becomes a line and a column, and the column is the nearest boundary.
-///
-/// **Nearest, not the character under the cursor**: clicking the right half of a letter puts
-/// the caret after it, which is what every editor does and what makes clicking past the end
-/// of a word land after the word rather than inside it.
+/// A pixel becomes a line and a column, and the column is the nearest boundary: clicking the
+/// right half of a letter puts the caret after it.
 #[test]
 fn a_point_becomes_the_nearest_line_and_column() {
-    // Eight pixels a character, which is what the fixed metric these tests use gives.
     let w = |s: &str| (s.chars().count() * 8) as u32;
     let a = TextAreaState::with_text("abcdef\nghi");
     let px = |col: usize| FIELD_PAD.left as i32 + col as i32 * 8;
@@ -1135,19 +1000,15 @@ fn a_point_becomes_the_nearest_line_and_column() {
     assert_eq!(a.at_point(px(3) + 2, py(0), 16, w), (0, 3), "before it is this one");
     assert_eq!(a.at_point(px(0), py(1), 16, w), (1, 0), "the second row is the second line");
 
-    // **Off the ends is clamped, in both directions.** A drag runs off a widget routinely —
-    // the router hands a captured widget negative coordinates rather than clamping them.
+    // Off the ends is clamped in both directions: a drag runs off a widget routinely.
     assert_eq!(a.at_point(-40, py(0), 16, w), (0, 0));
     assert_eq!(a.at_point(px(99), py(0), 16, w), (0, 6), "past the end of the line is its end");
     assert_eq!(a.at_point(px(0), py(9), 16, w), (1, 0), "past the last line is the last line");
     assert_eq!(a.at_point(px(0), -80, 16, w), (0, 0));
 }
 
-/// A scrolled area maps a point to the line that is *on screen* there.
-///
-/// **The offset is the whole of it**, and leaving it out is the bug that makes clicking work
-/// perfectly until the first time somebody scrolls — after which every click lands the same
-/// number of lines too high.
+/// A scrolled area maps a point to the line that is *on screen* there: leaving the offset out
+/// makes clicking work until the first scroll.
 #[test]
 fn a_point_is_read_against_what_is_on_screen() {
     let w = |s: &str| (s.chars().count() * 8) as u32;
@@ -1158,7 +1019,6 @@ fn a_point_is_read_against_what_is_on_screen() {
     assert_eq!(a.at_point(FIELD_PAD.left as i32, y, 16, w).0, 4, "the top row is line 4");
 }
 
-/// The scrollbar's state, and a scroll that leaves the cursor where it was.
 #[test]
 fn a_text_area_reports_a_bar_and_scrolls_without_moving_the_cursor() {
     let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
@@ -1170,19 +1030,14 @@ fn a_text_area_reports_a_bar_and_scrolls_without_moving_the_cursor() {
     a.scroll_to(3, 4);
     assert_eq!(a.offset(), 3);
     assert_eq!(a.cursor(), before, "a scrollbar drag moved the caret");
-    // Clamped to what is left, so a drag past the end shows the last screen rather than
-    // scrolling into blank space.
     a.scroll_to(99, 4);
     assert_eq!(a.offset(), 6, "ten lines, four visible");
 }
 
 /// The caret is drawn where the cursor is in the middle of a line.
 ///
-/// **The commonest caret position there is, and the one the rewrite newly depends on `cuts`
-/// for.** Every other test puts it at column 0, at the line's end, or at an end of a
-/// selection — each of which is already a cut for another reason, so deleting the caret's
-/// own cut left all 240 tests green while a person typing mid-line saw no caret at all
-/// (PR #289 review, 2).
+/// Every other test puts it at column 0, a line's end, or an end of a selection, each already a
+/// cut for another reason, so deleting the caret's own cut left the suite green.
 #[test]
 fn the_caret_is_drawn_in_the_middle_of_a_line() {
     let p = Theme::default();
@@ -1195,12 +1050,8 @@ fn the_caret_is_drawn_in_the_middle_of_a_line() {
     assert_eq!(fills(&e, p.accent), 1, "no caret while typing in the middle of a line");
 }
 
-/// A coloured run under a selection keeps its colour.
-///
-/// **The reason ink is a wrapper rather than a property of the text node.** The selection is
-/// a `fill` beneath the glyphs, so a selected keyword is a stack of a fill and an inked text
-/// — and a version that dropped the ink when the piece was selected would make selecting a
-/// line turn all of it black, which is the moment a person is most likely to be reading it.
+/// A coloured run under a selection keeps its colour: ink is a wrapper, so a selected keyword is
+/// a fill and an inked text, and dropping the ink would turn a selected line black.
 #[test]
 fn a_selected_run_keeps_its_ink() {
     let p = Theme::default();
@@ -1220,10 +1071,8 @@ fn a_selected_run_keeps_its_ink() {
 
 /// A stale run past the end of a line is clamped, not indexed with.
 ///
-/// **Reachable on every keystroke.** The runs are scanned from the buffer as it was a moment
-/// ago, so deleting the end of a line leaves one naming bytes that are gone — and a run whose
-/// bounds landed inside a multi-byte character would panic on the slice. A wrong colour for
-/// one frame is the right failure; a crashed editor is not.
+/// Reachable on every keystroke: runs are scanned from the buffer as it was, and a bound inside
+/// a multi-byte character would panic on the slice.
 #[test]
 fn a_stale_or_misaligned_run_neither_panics_nor_colours_past_the_end() {
     let p = Theme::default();
@@ -1236,13 +1085,11 @@ fn a_stale_or_misaligned_run_neither_panics_nor_colours_past_the_end() {
         "a run past the end was not clamped to it"
     );
 
-    // A boundary inside a character is dropped rather than split on.
     let mut a = TextAreaState::with_text("\u{4e2d}\u{6587}");
     let e: Element<()> =
         text_area(&mut a, 16, 16, false, &[InkRun { line: 0, start: 1, end: 2, colour: KEYWORD }], None, &p);
     assert_eq!(inked(&e).len(), 1, "the line was split inside a character: {:?}", inked(&e));
 
-    // And a run naming a line that is not on screen colours nothing.
     let mut a = TextAreaState::with_text("only");
     let e: Element<()> =
         text_area(&mut a, 16, 16, false, &[InkRun { line: 40, start: 0, end: 2, colour: KEYWORD }], None, &p);
@@ -1251,8 +1098,6 @@ fn a_stale_or_misaligned_run_neither_panics_nor_colours_past_the_end() {
 
 #[test]
 fn a_selection_is_highlighted_on_every_line_it_covers() {
-    // The other half of what `text_area` draws, and the reason the count is per *line*: a
-    // multi-line selection is one highlight per row, not one rectangle.
     let p = Theme::default();
     let mut a = area();
     a.apply(KEY_RIGHT, 0, 0);
@@ -1267,9 +1112,8 @@ fn a_selection_is_highlighted_on_every_line_it_covers() {
 
 #[test]
 fn a_collapsed_selection_leaves_no_anchor_behind_an_edit() {
-    // **Two keystrokes to arm and one to fire**, which is why it survived a review: walking
-    // the cursor back onto its own anchor leaves no *selection* but does leave an anchor,
-    // and the next edit shortens the text it names (PR #258 review, blocking 1).
+    // Two keystrokes arm it and one fires: walking the cursor back onto its anchor leaves no
+    // selection but does leave an anchor, and the next edit shortens the text it names.
     let mut a = area();
     a.apply(KEY_END, 0, 0);
     a.apply(KEY_LEFT, MOD_SHIFT, 0);
@@ -1278,7 +1122,6 @@ fn a_collapsed_selection_leaves_no_anchor_behind_an_edit() {
     assert!(a.apply(KEY_BACKSPACE, 0, 0));
     assert_eq!(a.text(), "ab\nde\nfghi");
     assert_eq!(a.selection(), None, "and the anchor went with the character");
-    // This is where it used to panic: the anchor named byte 3 of a line now 2 long.
     let e: Element<()> = text_area(&mut a, 3 * 16, 16, true, &[], None, &Theme::default());
     assert_eq!(
         fills(&e, Theme::default().selection()),
@@ -1287,8 +1130,6 @@ fn a_collapsed_selection_leaves_no_anchor_behind_an_edit() {
             is highlighted"
     );
 
-    // The quieter symptom of the same defect: typing instead of deleting used to leave a
-    // selection over the character just typed, which the next keystroke would replace.
     let mut a = area();
     a.apply(KEY_RIGHT, MOD_SHIFT, 0);
     a.apply(KEY_LEFT, MOD_SHIFT, 0);
@@ -1296,7 +1137,6 @@ fn a_collapsed_selection_leaves_no_anchor_behind_an_edit() {
     assert_eq!(a.text(), "xabc\nde\nfghi");
     assert_eq!(a.selection(), None, "typing selects nothing");
 
-    // And by pointer, which arms it the same way: a press and a release that never moved.
     let mut a = area();
     a.place(0, 3);
     a.extend_to(0, 3);
@@ -1307,8 +1147,6 @@ fn a_collapsed_selection_leaves_no_anchor_behind_an_edit() {
 
 #[test]
 fn a_press_places_the_cursor_and_a_drag_selects_from_where_it_landed() {
-    // The pointer half, which the state owns because the pixel-to-cell arithmetic is the
-    // application's — it knows its own metrics — and what a press *means* is not.
     let mut a = area();
     a.place(2, 2);
     assert_eq!(a.cursor(), (2, 2));
@@ -1321,8 +1159,7 @@ fn a_press_places_the_cursor_and_a_drag_selects_from_where_it_landed() {
 
 #[test]
 fn a_press_past_the_end_of_a_line_lands_on_its_last_character_boundary() {
-    // The coordinates come from arithmetic on a pixel position, which knows nothing about
-    // encoding or line lengths. Clamping is the widget's job, not the caller's.
+    // Clamping is the widget's job: the coordinates come from pixel arithmetic.
     let mut a = area();
     a.place(1, 99);
     assert_eq!(a.cursor(), (1, 2));
@@ -1332,9 +1169,8 @@ fn a_press_past_the_end_of_a_line_lands_on_its_last_character_boundary() {
 
 #[test]
 fn enter_is_the_text_areas_and_tab_is_not() {
-    // **The one widget for which Enter is text rather than submission** — that is what
-    // multi-line means. Tab stays traversal's: a buffer that swallowed it would trap the
-    // keyboard inside itself with no way out.
+    // Enter is text in a text area, and Tab stays traversal's: a buffer that swallowed it
+    // would trap the keyboard inside itself.
     const KEY_TAB: u16 = 15;
     let mut a = TextAreaState::new();
     assert!(a.apply(KEY_ENTER, 0, 0));
@@ -1345,8 +1181,6 @@ fn enter_is_the_text_areas_and_tab_is_not() {
 
 #[test]
 fn a_control_chord_is_not_text() {
-    // `to_char` folds Ctrl-C to 0x03 because a terminal needs it to; an editor that
-    // inserted that would put an unprintable byte in somebody's file.
     const KEY_C: u16 = 46;
     let mut a = TextAreaState::new();
     assert!(!a.apply(KEY_C, librsproto::surface::MOD_CTRL, 0));
@@ -1355,10 +1189,8 @@ fn a_control_chord_is_not_text() {
 
 #[test]
 fn a_grip_is_a_square_that_reports_its_press_rather_than_its_click() {
-    // **At the press, like the title bar's drag**, because a resize is a gesture that
-    // *begins* there: a grip that waited for the click would hand the compositor a drag
-    // whose button was already up. And it measures its own square, so a caller placing it
-    // in a corner has a number to place it by.
+    // At the press, like the title bar's drag: a grip that waited for the click would hand the
+    // compositor a drag whose button was already up.
     use crate::diff::Tree;
     use crate::layout::{Constraints, measure};
     use crate::route::Router;
@@ -1389,9 +1221,8 @@ fn a_grip_is_a_square_that_reports_its_press_rather_than_its_click() {
 
 #[test]
 fn a_press_on_the_bars_face_is_a_drag_and_a_press_on_a_button_is_not() {
-    // The discrimination the whole widget exists for. The buttons sit *above* the face in
-    // the stack, so a press on one must produce its own message and not also a drag —
-    // otherwise every click on close would move the window a little first.
+    // The buttons sit above the face, so a press on one must produce its own message and not
+    // also a drag.
     use crate::diff::Tree;
     use crate::route::Router;
     use librsproto::surface::{POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
@@ -1426,15 +1257,10 @@ fn a_press_on_the_bars_face_is_a_drag_and_a_press_on_a_button_is_not() {
         y: 8,
         ..Default::default()
     };
-    // The press and the release, kept apart: a drag is decided by the first and a click by
-    // the second, and this widget carries one of each.
     let down = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, true)).0;
     let up = |r: &mut Router, x: i32| r.pointer(&tree, &e, &l, at(x, false)).0;
 
-    // The buttons' centres in a bare 400-wide bar, from the constants — the close button ends
-    // `TITLE_BUTTON_PAD` in from the right, each is `TITLE_BUTTON_W` wide, `TITLE_BUTTON_GAP`
-    // apart. These were 390 and 364 in contiguous 26-pixel slots until the desktop refresh's
-    // Part B, and 364 now falls in a gap, which drags.
+    // The buttons' centres in a bare 400-wide bar, from the constants.
     let step = (TITLE_BUTTON_W + TITLE_BUTTON_GAP) as i32;
     let close_x = (400 - TITLE_BUTTON_PAD - TITLE_BUTTON_W / 2 - 1) as i32;
     let max_x = close_x - step;
@@ -1456,11 +1282,8 @@ fn a_press_on_the_bars_face_is_a_drag_and_a_press_on_a_button_is_not() {
     assert_eq!(down(&mut r, max_x), vec![], "the same for maximise");
     assert_eq!(up(&mut r, max_x), vec![M::Max]);
 
-    // **And a second button pressed mid-drag is not a second drag.** While a capture is held
-    // the router routes to the *captured* widget, so every later press was reaching the bar
-    // — including one over a button, where the shadowing rule cannot help because it walks
-    // the captured node's path rather than the pointer's. A window jumped by the drag's
-    // accumulated distance on each extra click (PR #248 review, blocking 1).
+    // A second button pressed mid-drag is not a second drag: while a capture is held the router
+    // routes to the captured widget, and the shadowing rule walks the captured node's path.
     let mut r = Router::new();
     assert_eq!(down(&mut r, 200), vec![M::Drag], "the left press starts the drag");
     let other = librsproto::surface::PointerEvent {
@@ -1491,8 +1314,7 @@ fn font() -> libdraw::text::Font {
     libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
 }
 
-/// Every `Text` node in a tree, joined — enough to say what a widget shows without pinning
-/// where in its tree it sits.
+/// Every `Text` node in a tree, joined.
 fn all_text<M>(e: &Element<M>) -> String {
     fn walk<M>(e: &Element<M>, out: &mut String) {
         if let crate::element::Node::Text(t) = &e.node {
@@ -1509,12 +1331,9 @@ fn all_text<M>(e: &Element<M>) -> String {
 
 #[test]
 fn a_tab_selects_where_it_is_and_its_close_box_does_not_select_it() {
-    // **The published metrics, and the shadowing rule between them.** `check-login` presses
-    // a tab at `TAB_SIDE + i * TAB_PITCH + something` and its close box at `TAB_CLOSE_CX`
-    // from its own copies, because a gate that aimed from the toolkit could agree with a
-    // toolkit that had stopped drawing where it says (M11 decision 2) — so the numbers are
-    // asserted here against a tree that is actually built, the way the dialog's aim points
-    // are, and `xtask`'s `the_gates_chrome_table_is_the_toolkits` compares the two sets.
+    // The published metrics: `check-login` aims from its own copies, so the numbers are
+    // asserted against a tree actually built, and `xtask`'s
+    // `the_gates_chrome_table_is_the_toolkits` compares the two sets.
     assert_eq!((TAB_W, TAB_STRIP_H, TAB_H, TAB_CLOSE_W), (120, 30, 24, 20));
     assert_eq!((TAB_SIDE, TAB_TOP, TAB_GAP, TAB_PITCH), (6, 5, 1, 121));
     assert_eq!(TAB_CLOSE_CX, 110);
@@ -1548,32 +1367,22 @@ fn a_tab_selects_where_it_is_and_its_close_box_does_not_select_it() {
         r.pointer(&tree, &ui, &l, at(0, 0)).0
     };
 
-    // **Tab `i` begins at `TAB_SIDE + i * TAB_PITCH`** since the refresh's Part H: the strip
-    // has padding at its left end and a pixel between tabs, where it used to start hard
-    // against the content's edge with none.
+    // Tab `i` begins at `TAB_SIDE + i * TAB_PITCH`.
     let tab_x = |i: i32| TAB_SIDE as i32 + i * TAB_PITCH as i32;
-    // The second tab's label area selects it, by **key** and not by position.
     assert_eq!(click(&mut router, tab_x(1) + 20), alloc::vec![M::Select(9)]);
-    // Its close box closes it and does *not* also select it: a nearer `on_press` shadows the
-    // one on the tab, which is the same rule that lets a title bar carry buttons.
+    // Its close box closes it and does not also select it: a nearer `on_press` shadows.
     assert_eq!(click(&mut router, tab_x(1) + TAB_CLOSE_CX), alloc::vec![M::Close(9)]);
-    // And the first tab is still where it was, which is what a fixed width buys.
     assert_eq!(click(&mut router, tab_x(0) + 20), alloc::vec![M::Select(7)]);
-    // The `+` is after the last tab, and opens one rather than selecting anything.
     assert_eq!(click(&mut router, tab_x(2) + (NEW_TAB_W / 2) as i32), alloc::vec![M::New]);
 }
 
-/// How far off an exact ink a glyph's darkest pixel may land. A stem covers a pixel almost
-/// but not quite completely, so even body ink comes out a few units light.
+/// How far off an exact ink a glyph's darkest pixel may land: stems antialias a few units light.
 const ANTIALIAS_SLACK: u32 = 12;
 
 /// A focused pill shows a ring, and its label reads in either scheme.
 ///
-/// **Two failures in one control** (PR #319 review, optionals 4 and 9). The ring was the
-/// ground drawn over the ground — nought pixels of the 2400 differed between an active pill
-/// and a resting one — and the label was the window's paper, which in the dark scheme is
-/// near-black on the accent. Painted, and compared *between states* rather than against a
-/// colour, because "a ring is visible" is exactly the claim a same-colour ring passes.
+/// Painted and compared between states rather than against a colour, since "a ring is visible"
+/// is what a same-colour ring passes.
 #[test]
 fn a_pill_rings_when_focused_and_its_label_reads_in_either_scheme() {
     let (w, h) = (80, 30);
@@ -1594,18 +1403,15 @@ fn a_pill_rings_when_focused_and_its_label_reads_in_either_scheme() {
         .filter(|(x, y)| resting.get_pixel(*x, *y) != active.get_pixel(*x, *y))
         .count();
     assert!(differing > 40, "a focused pill looks no different: {differing} pixels");
-    // **The label is the better-contrasting of the surface's two inks, in each scheme** —
-    // asserted as the *choice* rather than as a distance, because a distance passes for the
-    // wrong ink too: the dark scheme's near-black paper is a long way from the accent by any
-    // arithmetic and still unreadable on it (review, optional 9). In the light scheme that
-    // is the paper, in the dark scheme the text colour.
+    // The label is the better-contrasting of the surface's two inks, asserted as the choice
+    // rather than a distance: the dark scheme's near-black paper is far from the accent by any
+    // arithmetic and still unreadable on it.
     let brightness = |c: Rgb| 299 * c.r as i32 + 587 * c.g as i32 + 114 * c.b as i32;
     for t in [Theme::light(), Theme::dark()] {
         let fb = draw(&t, WidgetState::default());
         let ground = brightness(t.accent);
         let (paper, text_ink) = (brightness(t.background), brightness(t.foreground));
         let wanted = if (paper - ground).abs() >= (text_ink - ground).abs() { paper } else { text_ink };
-        // The label's extreme pixel on the middle row is the ink it is drawn in.
         let row: alloc::vec::Vec<i32> = (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(brightness).collect();
         let reached =
             if wanted > ground { *row.iter().max().expect("pixels") } else { *row.iter().min().expect("pixels") };
@@ -1622,10 +1428,6 @@ fn a_pill_rings_when_focused_and_its_label_reads_in_either_scheme() {
 
 /// What a tab strip *looks* like: the current tab is the window's ground and covers the rule,
 /// the others have no face and their labels are dim, and a keyed right slot is drawable.
-///
-/// **The description's central claim, and nothing tested it** (PR #319 review, worth fixing
-/// 5): every one of these could be broken with all 80 of this module's tests still passing,
-/// which is the same "present and invisible" lesson as the close box, one level up.
 #[test]
 fn a_tab_strip_draws_the_current_tab_as_the_windows_own_ground() {
     #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1648,7 +1450,6 @@ fn a_tab_strip_draws_the_current_tab_as_the_windows_own_ground() {
         (fb, diffable)
     };
     let (fb, _) = paint_strip(TabExtras::none(), None);
-    // Down the middle of each tab, clear of its label and its close box.
     let (first, second) = (TAB_SIDE + 4, TAB_SIDE + TAB_PITCH + 4);
     assert_eq!(
         fb.get_pixel(first, TAB_TOP + TAB_H / 2),
@@ -1666,7 +1467,6 @@ fn a_tab_strip_draws_the_current_tab_as_the_windows_own_ground() {
         "another tab has no face of its own: the strip's shows through"
     );
     assert_eq!(fb.get_pixel(second, TAB_STRIP_H - 1), Some(t.border), "…and the rule runs under it");
-    // The inactive label is dim, and the current one is not.
     let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
     let darkest = |x0: u32, x1: u32| {
         (x0..x1)
@@ -1684,23 +1484,16 @@ fn a_tab_strip_draws_the_current_tab_as_the_windows_own_ground() {
         darkest(second, second + TAB_W - TAB_CLOSE_W - 4) >= darkness(t.foreground_dim),
         "another tab's label is dim"
     );
-    // Hovering one of the others must not open it at the bottom: the rule stays.
     let (hover, _) = paint_strip(TabExtras::none(), Some(2));
     assert_eq!(hover.get_pixel(second, TAB_STRIP_H - 1), Some(t.border), "a hovered tab still has the rule under it");
     assert_ne!(hover.get_pixel(second, TAB_TOP + TAB_H / 2), Some(t.face_hover), "…and it does light up");
-    // A keyed right-hand slot is drawable: the diff refuses a half-keyed container.
     let keyed = TabExtras { new_tab: None, right: Some(ink(t.foreground, text("848 bytes")).key(99)) };
     let (_, diffable) = paint_strip(keyed, None);
     assert!(diffable, "a caller that keys its right-hand control makes the window undiffable");
 }
 
-/// A dialog's edge follows *its* window's focus, not the fact that it is up.
-///
-/// **Two windows edged in the accent is the failure** (PR #319 review, blocking 1): a dialog
-/// that has lost the keyboard to another window is a click away — the compositor raises any
-/// listed window, and a dialog is listed — and every caller already tracks that flag for the
-/// dialog's own title bar. This passed `true` unconditionally, so the edge said "the
-/// keyboard is here" while the title bar beside it said otherwise.
+/// A dialog's edge follows *its* window's focus, not the fact that it is up: two windows edged
+/// in the accent is the failure.
 #[test]
 fn a_dialogs_edge_follows_its_own_focus() {
     let t = Theme::default();
@@ -1725,11 +1518,7 @@ fn a_dialogs_edge_follows_its_own_focus() {
 
 /// A pill is the accent filled in, with its label in the paper colour.
 ///
-/// **The inverse of every other control here**, which is the whole point of it: a button is a
-/// face with an edge and ink on it, and this is the accent with the window's own ground as
-/// ink. Painted, because "filled with the accent" is a statement about pixels, and because a
-/// label drawn in `foreground` on an accent ground is the failure worth catching — it reads
-/// as a smudge rather than as a word (desktop refresh, Part H).
+/// Painted, since "filled with the accent" is a statement about pixels.
 #[test]
 fn a_pill_is_the_accent_with_the_paper_as_its_ink() {
     let t = Theme::default();
@@ -1740,12 +1529,9 @@ fn a_pill_is_the_accent_with_the_paper_as_its_ink() {
     let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
     fb.clear(t.face);
     paint(&mut fb, &font(), &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
-    // The ground, sampled down the left edge and clear of the label in the middle.
     assert_eq!(fb.get_pixel(2, h / 2), Some(t.accent), "a pill is filled with the accent");
-    // **Measured as lightness along the middle row**, where the pill is full width so its
-    // cut corners cannot be mistaken for the label. Counting pixels at exactly `background`
-    // counts almost none: a glyph at this size is mostly antialiased, which is the same
-    // thing the status bar's and the greeter's tests ran into.
+    // Measured as lightness along the middle row: a glyph at this size is mostly antialiased,
+    // so counting pixels at exactly `background` counts almost none.
     let light = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
     let row: alloc::vec::Vec<u32> = (0..w).filter_map(|x| fb.get_pixel(x, h / 2)).map(light).collect();
     let (lightest, darkest) = (*row.iter().max().expect("pixels"), *row.iter().min().expect("pixels"));
@@ -1764,9 +1550,8 @@ fn a_pill_is_the_accent_with_the_paper_as_its_ink() {
 
 /// A focused window's edge is the accent; an unfocused one's is the line colour.
 ///
-/// **The design's own focus cue** (desktop refresh, Part H), and painted rather than read off
-/// the tree: the edge is the last layer over everything else, so a frame that drew it first
-/// would have the right colour in the wrong place and the tree would look the same.
+/// Painted: the edge is the last layer, so a frame that drew it first has the right colour in
+/// the wrong place and the same tree.
 #[test]
 fn a_focused_windows_edge_is_the_accent() {
     let t = Theme::default();
@@ -1783,7 +1568,6 @@ fn a_focused_windows_edge_is_the_accent() {
         let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
         fb.clear(t.background);
         paint(&mut fb, &font(), &t, &e, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
-        // Down the left edge, clear of the rounded corners.
         fb.get_pixel(0, h / 2)
     };
     assert_eq!(edge(true), Some(t.accent), "the focused window is edged in the accent");
@@ -1793,10 +1577,7 @@ fn a_focused_windows_edge_is_the_accent() {
 
 /// A title bar's subtitle is beside the title, dimmer than it, and absent when there is none.
 ///
-/// **Painted, and in that order**: the pair is a bold name and a second word that must read
-/// as secondary, so what this asserts is that the darkest ink in the subtitle's half of the
-/// bar is lighter than the title's — not merely that two strings are in the tree (desktop
-/// refresh, Part H).
+/// Painted: the darkest ink in the subtitle's half must be lighter than the title's.
 #[test]
 fn a_titles_subtitle_is_beside_it_and_dimmer_than_it() {
     let t = Theme::default();
@@ -1819,8 +1600,6 @@ fn a_titles_subtitle_is_beside_it_and_dimmer_than_it() {
             .min()
             .expect("pixels")
     };
-    // Where each word falls: the title starts at `TITLE_PAD`, and "Files" in the bold face
-    // is comfortably inside 60 pixels at the default size.
     let (title_half, sub_half) = (60, 200);
     let with = draw(Some("/home"));
     let without = draw(None);
@@ -1828,10 +1607,8 @@ fn a_titles_subtitle_is_beside_it_and_dimmer_than_it() {
         darkest(&with, title_half, sub_half) < darkest(&without, title_half, sub_half),
         "the subtitle draws where there was nothing"
     );
-    // **Against the dim ink itself, not merely against the title.** A first version compared
-    // the two halves and passed with the subtitle in *body* ink: antialiasing left it three
-    // units lighter than the title, and "darker than" was true of a difference nobody could
-    // see. What matters is which ink it is, so the threshold is that ink.
+    // Against the dim ink itself, not merely the title: antialiasing once left a subtitle in
+    // body ink three units lighter than the title.
     let (title_ink, sub_ink) = (darkest(&with, 0, title_half), darkest(&with, title_half, sub_half));
     assert!(
         sub_ink >= darkness(t.foreground_dim),
@@ -1842,9 +1619,7 @@ fn a_titles_subtitle_is_beside_it_and_dimmer_than_it() {
 
 /// A status bar is a ground, a rule on the edge that faces the content, and dim readings.
 ///
-/// **Painted**, because every part of this is a colour in a place: a bar whose rule is on the
-/// wrong edge reads as a lid rather than a floor, and a reading in body ink is not a second
-/// read (desktop refresh, Part H).
+/// Painted: a rule on the wrong edge reads as a lid, and a body-ink reading is not a second read.
 #[test]
 fn a_status_bar_grounds_itself_and_rules_the_edge_it_is_given() {
     let t = Theme::default();
@@ -1864,11 +1639,8 @@ fn a_status_bar_grounds_itself_and_rules_the_edge_it_is_given() {
     let bottom = draw(Edge::Bottom);
     assert_eq!(bottom.get_pixel(w / 2, h - 1), Some(t.border), "or along the bottom");
     assert_eq!(bottom.get_pixel(w / 2, 0), Some(t.face_hover), "…and then the top is ground");
-    // **Both readings are there, and neither is body ink — measured by darkness, not by the
-    // exact colour.** At the small step a glyph is mostly antialiased, so counting pixels
-    // equal to `foreground_dim` counts almost nothing; what separates the two inks is how
-    // dark the darkest pixel gets. Dim is 91/103/102 and body is 22/32/31, so nothing drawn
-    // in dim reaches the threshold and anything drawn in body sails past it.
+    // Both readings are there and neither is body ink, measured by darkness: at the small step a
+    // glyph is mostly antialiased. Dim is 91/103/102 and body is 22/32/31.
     let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
     let darkest = (0..w)
         .flat_map(|x| (0..h).map(move |y| (x, y)))
@@ -1876,9 +1648,7 @@ fn a_status_bar_grounds_itself_and_rules_the_edge_it_is_given() {
         .map(darkness)
         .min()
         .expect("the bar has pixels");
-    // **Each end counted separately** (PR #319 review, blocking 2). One count over the whole
-    // bar passes on the left reading alone, so dropping the right slot — which is where the
-    // editor's line and column live — failed nothing. Each half must have ink of its own.
+    // Each end counted separately: one count over the bar passes on the left reading alone.
     let ink_between = |x0: u32, x1: u32| {
         (x0..x1)
             .flat_map(|x| (0..h).map(move |y| (x, y)))
@@ -1902,11 +1672,8 @@ fn a_status_bar_grounds_itself_and_rules_the_edge_it_is_given() {
 
 /// A tab's close box is drawn, not merely clickable.
 ///
-/// **`Node::Icon` measures as nothing** and paints into the rect it is handed, so any wrapper
-/// that sizes to its child's measurement — `center`, and it was a `center` — gives the glyph
-/// a zero rect. The tab then still *clicks* like a tab with a close box, which is why the
-/// routing test above passed while the × was missing from a screendump (desktop refresh,
-/// Part H). Painted, because that is the only place the difference exists.
+/// `Node::Icon` measures as nothing, so a `center` around it gave the glyph a zero rect while the
+/// tab still clicked. Painted, because that is the only place the difference exists.
 #[test]
 fn a_tabs_close_box_puts_ink_on_the_screen() {
     #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1922,7 +1689,6 @@ fn a_tabs_close_box_puts_ink_on_the_screen() {
     let mut fb = MemFramebuffer::new(Geometry::packed(200, TAB_STRIP_H, PixelFormat::XRGB8888));
     fb.clear(t.background);
     paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
-    // The close box is the last `TAB_CLOSE_W` of the first tab.
     let (from, to) = (TAB_SIDE + TAB_W - TAB_CLOSE_W, TAB_SIDE + TAB_W);
     let inked = |x0: u32, x1: u32| {
         (x0..x1)
@@ -1931,17 +1697,13 @@ fn a_tabs_close_box_puts_ink_on_the_screen() {
             .count()
     };
     assert!(inked(from, to) > 8, "the close box drew nothing");
-    // And the ink is the box's, not the label's spilling into it.
     assert!(inked(to, to + TAB_GAP + 4) == 0, "and it stays inside the tab");
 }
 
 /// The current tab is outlined in `border` on three sides, and open on the fourth.
 ///
-/// **Painted and read back** (desktop refresh, after Part K). The outline is two faces, and
-/// the tree has them whether or not they come out as a line: an inner face a pixel too wide,
-/// or inset on the bottom as well, leaves the tree identical and the tab unoutlined or closed.
-/// So this looks at the pixels where each edge must be — and at the **resting** state of the
-/// tab beside it, which must stay unoutlined, since an outline on every tab marks none.
+/// Painted and read back: an inner face a pixel too wide leaves the tree identical and the tab
+/// unoutlined. The resting tab beside it must stay unoutlined.
 #[test]
 fn the_current_tab_is_outlined_and_open_into_the_content() {
     #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1960,21 +1722,16 @@ fn the_current_tab_is_outlined_and_open_into_the_content() {
     paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
     let at = |x: u32, y: u32| fb.get_pixel(x, y).expect("inside the strip");
 
-    // The current tab spans `TAB_SIDE..TAB_SIDE + TAB_W`, from `TAB_TOP` to the strip's foot,
-    // whose last row is the strip's rule.
     let (left, right) = (TAB_SIDE, TAB_SIDE + TAB_W - 1);
     let (mid, middle_y, rule_y) = (TAB_SIDE + TAB_W / 2, TAB_TOP + TAB_H / 2, TAB_STRIP_H - 1);
     assert_eq!(at(mid, TAB_TOP), t.border, "no line along the current tab's top");
     assert_eq!(at(left, middle_y), t.border, "no line down its left side");
     assert_eq!(at(right, middle_y), t.border, "no line down its right side");
-    // **A line, not a border-coloured tab**: a pixel in, it is the window's ground again.
     assert_eq!(at(left + 1, middle_y), t.background, "the outline is more than a pixel wide");
     assert_eq!(at(mid, TAB_TOP + 1), t.background, "the outline is more than a pixel deep");
-    // **And open at the bottom**: the strip's rule stops under the current tab, which is what
-    // makes the tab a continuation of the content rather than a box sitting on it.
+    // Open at the bottom: the strip's rule stops under the current tab.
     assert_eq!(at(mid, rule_y), t.background, "the current tab is closed at the bottom");
 
-    // The tab beside it has no outline, and the rule runs under it.
     let next = TAB_SIDE + TAB_W + TAB_GAP;
     assert_ne!(at(next, middle_y), t.border, "an inactive tab was outlined too");
     assert_eq!(at(next + TAB_W / 2, rule_y), t.border, "the rule stopped under an inactive tab");
@@ -1982,10 +1739,8 @@ fn the_current_tab_is_outlined_and_open_into_the_content() {
 
 /// Each title-bar button lights on hover, in its own colour, and only that one.
 ///
-/// **Painted, and the resting state asserted first** — the state no test passed in Part H, when
-/// a widget that drew nothing passed every tree test. Close lights in `deny` and the other two
-/// in `face_pressed`; a hover that lit the wrong button, or all three, or lit close in the
-/// neutral face, fails here.
+/// Painted, with the resting state asserted first. Close lights in `deny`, the other two in
+/// `face_pressed`.
 #[test]
 fn a_title_bar_button_lights_only_when_the_pointer_is_over_it() {
     #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2025,13 +1780,11 @@ fn a_title_bar_button_lights_only_when_the_pointer_is_over_it() {
             .count()
     };
 
-    // At rest, no button has a face of either colour.
     let (fb, rects) = draw(None);
     for r in &rects {
         assert_eq!(count(&fb, *r, t.face_pressed) + count(&fb, *r, t.deny), 0, "a button lit at rest");
     }
 
-    // Hovered, each lights alone, and in its own colour.
     for (i, (key, face)) in
         [(TITLE_MINIMISE_KEY, t.face_pressed), (TITLE_MAXIMISE_KEY, t.face_pressed), (TITLE_CLOSE_KEY, t.deny)]
             .iter()
@@ -2047,21 +1800,14 @@ fn a_title_bar_button_lights_only_when_the_pointer_is_over_it() {
             );
         }
     }
-    // **Close is red, not neutral** — the one button of the three that ends something.
     let (fb, rects) = draw(Some(TITLE_CLOSE_KEY));
     assert_eq!(count(&fb, rects[2], t.face_pressed), 0, "close lit in the neutral face");
 }
 
 /// Hover reaches the keys the buttons carry **through the real router**, not only in a tree.
 ///
-/// **The half the painted tests cannot see.** They hand `hovered` in directly, so they pass
-/// for a key that no pointer could ever produce — a button keyed but laid out under a sibling
-/// that the hit-test finds first, say. This moves a pointer over each target and asks the
-/// router what it names, which is what an application's `view` is actually given.
-///
-/// **And the tab's label keeps its tab's key** — the property the close box's own key rests
-/// on: a label keyed anything else would stop "the pointer is over this tab" from meaning what
-/// it did, and `locate` must still find the *whole* tab under that key rather than the label.
+/// The painted tests hand `hovered` in directly, so they pass for a key no pointer could produce.
+/// The tab's label keeps its tab's key, and `locate` must still find the whole tab under it.
 #[test]
 fn hover_names_the_button_and_the_close_box_through_the_router() {
     use crate::diff::Tree;
@@ -2110,7 +1856,6 @@ fn hover_names_the_button_and_the_close_box_through_the_router() {
     assert_eq!(over(&strip, label_x, y), Some(1 << 62), "the label stopped naming its tab");
 }
 
-/// A tab's `×` lights when the pointer is over it, and the tab stays lit around it.
 #[test]
 fn a_tabs_close_box_lights_on_hover_and_its_tab_stays_lit() {
     #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2136,7 +1881,6 @@ fn a_tabs_close_box_lights_on_hover_and_its_tab_stays_lit() {
             .filter(|(x, y)| fb.get_pixel(*x, *y) == Some(c))
             .count()
     };
-    // The second tab — inactive — and its close box.
     let tab2 = TAB_SIDE + TAB_W + TAB_GAP;
     let (box0, box1) = (tab2 + TAB_W - TAB_CLOSE_W, tab2 + TAB_W);
 
@@ -2145,20 +1889,15 @@ fn a_tabs_close_box_lights_on_hover_and_its_tab_stays_lit() {
 
     let hot = draw(Some(tab_close_key(2)));
     assert!(count(&hot, box0, box1, t.face_pressed) > 50, "the `×` did not light on hover");
-    // **Its tab stays lit.** The pointer over the `×` names the close box rather than the tab,
-    // and a tab that went dark there would flicker at exactly the moment a person is aiming.
+    // Its tab stays lit: the pointer over the `×` names the close box rather than the tab.
     assert!(
         count(&hot, tab2, box0, t.face) > 100,
         "the inactive tab lost its hover face as the pointer reached its `×`"
     );
-    // Nothing lights on the *other* tab's `×`.
     let other = (TAB_SIDE + TAB_W - TAB_CLOSE_W, TAB_SIDE + TAB_W);
     assert_eq!(count(&hot, other.0, other.1, t.face_pressed), 0, "the wrong `×` lit");
 
-    // **And the `×` stays at rest while only its tab is hovered** (PR #325 review, finding 1).
-    // Without this the two states above pass for a `×` that lights whenever its tab does —
-    // a one-word "simplification" to `if over_tab` — which would light every tab's `×` the
-    // moment the pointer crossed into it, the current tab's included.
+    // The `×` stays at rest while only its tab is hovered, or it would light with every tab.
     let tab_only = draw(Some(2));
     assert!(count(&tab_only, tab2, box0, t.face) > 100, "precondition: the tab is lit");
     assert_eq!(
@@ -2170,16 +1909,9 @@ fn a_tabs_close_box_lights_on_hover_and_its_tab_stays_lit() {
 
 /// A lit button's glyph is set in an ink that reads on its face — in both schemes.
 ///
-/// **The faces were counted and the inks were not** (PR #325 review, finding 2): swapping the
-/// close glyph to the scheme's `foreground` passed every test while shipping `#16201F` on
-/// `#A4453C`, about 2.8:1. So this reads the glyph's own pixels.
-///
-/// **Close is pinned by its reason rather than by its colour.** The design writes `#fff`; in
-/// the dark scheme that is 3.36:1 on its `#D46F63`, below what text needs, and the near-black
-/// `furthest_from` picks instead is 5.25:1. So the assertion is that the glyph is whichever of
-/// the scheme's two inks has the higher **WCAG** contrast on `deny`, and that it clears 4.5:1
-/// — a different formula from `furthest_from`'s weighted brightness, so this is not the code
-/// checking itself, and it stays right if either scheme's red is retuned.
+/// Close is pinned by its reason rather than its colour: the glyph is whichever of the scheme's
+/// two inks has the higher WCAG contrast on `deny`, and it clears 4.5:1. That is a different
+/// formula from `furthest_from`'s, so this is not the code checking itself.
 #[test]
 fn a_lit_buttons_glyph_reads_on_its_face_in_both_schemes() {
     #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2230,21 +1962,18 @@ fn a_lit_buttons_glyph_reads_on_its_face_in_both_schemes() {
     };
 
     for (scheme, t) in [("light", Theme::default()), ("dark", Theme::dark())] {
-        // At rest every glyph is dim, and no button holds a pixel of full ink.
         let (fb, rects) = draw(&t, None);
         for (i, r) in rects.iter().enumerate() {
             assert!(count(&fb, *r, t.foreground_dim) > 0, "{scheme}: button {i}'s glyph is not dim at rest");
             assert_eq!(count(&fb, *r, t.foreground), 0, "{scheme}: button {i} in full ink at rest");
         }
 
-        // Minimise and maximise lit: the glyph goes to full ink, the dim one is gone.
         for (i, key) in [(0, TITLE_MINIMISE_KEY), (1, TITLE_MAXIMISE_KEY)] {
             let (fb, rects) = draw(&t, Some(key));
             assert!(count(&fb, rects[i], t.foreground) > 0, "{scheme}: button {i} lit, glyph not in full ink");
             assert_eq!(count(&fb, rects[i], t.foreground_dim), 0, "{scheme}: button {i} lit, glyph still dim");
         }
 
-        // Close lit: the glyph is the more legible of the scheme's two inks on red.
         let (better, worse) = if contrast(t.background, t.deny) >= contrast(t.foreground, t.deny) {
             (t.background, t.foreground)
         } else {
@@ -2261,7 +1990,6 @@ fn a_lit_buttons_glyph_reads_on_its_face_in_both_schemes() {
     }
 }
 
-/// The `+` goes to full ink when the pointer is on it — the design's own hover for it.
 #[test]
 fn the_new_tab_plus_lights_on_hover() {
     #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2281,11 +2009,8 @@ fn the_new_tab_plus_lights_on_hover() {
         let mut fb = MemFramebuffer::new(Geometry::packed(w, TAB_STRIP_H, PixelFormat::XRGB8888));
         fb.clear(t.background);
         paint(&mut fb, &font(), &t, &ui, &l, all, &mut |_, _, _, _: &mut MemFramebuffer| {});
-        // **The darkest pixel, not a count of exact ink.** The `+` is text, antialiased, and
-        // at this size no pixel of its strokes is fully covered — so a count of pixels exactly
-        // `foreground` is zero lit or not, which is how the first version of this test
-        // failed for a `+` that did light. The darkest pixel is the glyph's most-covered one,
-        // and which ink it sits nearer says which ink the glyph was drawn in.
+        // The darkest pixel, not a count of exact ink: the `+` is antialiased, and which ink the
+        // most-covered pixel sits nearer says which ink the glyph was drawn in.
         (plus.origin.x as u32..plus.right() as u32)
             .flat_map(|x| (plus.origin.y as u32..plus.bottom() as u32).map(move |y| (x, y)))
             .filter_map(|(x, y)| fb.get_pixel(x, y))
@@ -2303,9 +2028,7 @@ fn the_new_tab_plus_lights_on_hover() {
 
 #[test]
 fn a_marked_tab_says_so_in_its_label() {
-    // The editor's unsaved mark, which is the only thing distinguishing two tabs on the same
-    // file name — and the reason `Tab` carries a flag rather than the caller pre-marking the
-    // string: two applications would otherwise spell the mark two ways.
+    // The unsaved mark is the only thing distinguishing two tabs on the same file name.
     #[derive(Clone, PartialEq, Eq, Debug)]
     enum M {
         Select(u64),
@@ -2323,12 +2046,9 @@ fn a_marked_tab_says_so_in_its_label() {
 
 #[test]
 fn the_title_buttons_land_where_the_gates_aim() {
-    // **The literals the gates' `chrome` table types**, asserted against a framed window that
-    // is actually built — the same guard `dialog_buttons_land_where_the_constants_say` gives
-    // the dialog, and for its reason: `title_button_centre` moves with the constants, so a
-    // change to the padding moved it and this crate's own tests together and left the gates
-    // aiming four pixels off with nothing saying so (PR #313 review, optional 6). In a window
-    // 400 wide: close 18 in from the right, maximise 50, minimise 82, all 16 down.
+    // The literals the gates' `chrome` table types, asserted against a framed window actually
+    // built: `title_button_centre` moves with the constants. In a window 400 wide: close 18 in
+    // from the right, maximise 50, minimise 82, all 16 down.
     assert_eq!(title_button_centre(400, 0), (382, 16));
     assert_eq!(title_button_centre(400, 1), (350, 16));
     assert_eq!(title_button_centre(400, 2), (318, 16));
@@ -2377,10 +2097,8 @@ fn the_title_buttons_land_where_the_gates_aim() {
 
 #[test]
 fn a_framed_windows_grip_is_inside_its_border_and_under_it() {
-    // **The one corner a person reaches for was the one whose border was missing**: all three
-    // applications stacked the grip over the finished frame (PR #313 review, optional 4). The
-    // frame places it now — inside the border, as a layer before the border — and takes no
-    // presses anywhere but the grip, which a full-size overlay would.
+    // The grip is placed inside the border, as a layer before it, and takes no presses
+    // anywhere but the grip, which a full-size overlay would.
     #[derive(Clone, PartialEq, Eq, Debug)]
     enum M {
         Content,
@@ -2434,18 +2152,9 @@ fn a_framed_windows_grip_is_inside_its_border_and_under_it() {
 
 #[test]
 fn dialog_buttons_land_where_the_constants_say() {
-    // **The four numbers `check-login` types**, asserted against a tree that is actually
-    // built. They were `nxedit`'s until `nxfiles` grew a second confirmation; deriving them
-    // beside the frame and checking them *here* is what stops two applications and one gate
-    // drifting apart in three separate places.
-    //
-    // The literals matter as much as the derivation. Comparing derived constants against a
-    // tree built from the same constants pins nothing — both sides move together, and the
-    // gate's own table is linked to neither (PR #267 review, finding 2).
-    //
-    // **Moved by the desktop refresh's Part B**, from (91, 249, 103): the window's content now
-    // runs flush to its border (`WINDOW_FRAME` 3 → 0), so the strip is three pixels wider on
-    // each side and three pixels lower. `check-login`'s `CONFIRM_*` moved in the same change.
+    // The four numbers `check-login` types, asserted against a tree actually built. The
+    // literals matter as much as the derivation: derived constants compared against a tree
+    // built from the same constants pin nothing, and the gate's table is linked to neither.
     assert_eq!((DIALOG_W, DIALOG_H), (340, 132));
     assert_eq!((DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), (89, 250, 106));
 
@@ -2478,9 +2187,7 @@ fn dialog_buttons_land_where_the_constants_say() {
         &theme,
     );
 
-    // **It measures to exactly what it declares**, which is what lets it be a `Child`:
-    // `Node::Dock` measures as everything it is offered, so without the fixed wrapper this
-    // is a window a thousand screens wide and `Child::open` refuses it.
+    // It measures to exactly what it declares, which lets it be a `Child`.
     let cell = crate::layout::FixedCell { w: 8, h: 16 };
     assert_eq!(
         crate::layout::measure(&ui, crate::layout::Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)), &cell,),
@@ -2507,9 +2214,8 @@ fn dialog_buttons_land_where_the_constants_say() {
     assert_eq!(click(&mut router, DIALOG_LEFT_CX, DIALOG_BUTTON_CY), alloc::vec![M::Left]);
     assert_eq!(click(&mut router, DIALOG_RIGHT_CX, DIALOG_BUTTON_CY), alloc::vec![M::Right]);
 
-    // **And the aim point is the button's *centre*, not merely a point inside it.** Padding
-    // the strip on four sides instead of three halves the buttons, and a centre stays inside
-    // a box that shrank around it — so the row's own height is bracketed here.
+    // The aim point is the button's centre: padding the strip on four sides instead of three
+    // halves the buttons, so the row's own height is bracketed here.
     let half = DIALOG_BUTTON_H as i32 / 2;
     for edge in [DIALOG_BUTTON_CY - half + 1, DIALOG_BUTTON_CY + half - 1] {
         assert_eq!(
