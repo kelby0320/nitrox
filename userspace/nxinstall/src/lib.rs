@@ -1,21 +1,10 @@
-//! What `nxinstall` decides **before** it writes anything: where the two partitions go, and
-//! every reason to refuse.
+//! What `nxinstall` decides before it writes anything: where the two partitions go, and every
+//! reason to refuse.
 //!
-//! Split out from the program so it can be host-tested, for the reason the whole part exists:
-//! the mistakes that matter here are arithmetic, they destroy a disk, and none of them is
-//! visible in a boot that succeeds. A root partition that runs one block into the backup
-//! partition array produces a system that boots perfectly and loses its table the first time
-//! something rewrites it (`libgpt`'s own `last_usable` test, PR #308 review).
-//!
-//! **Numbers, not handles.** This module takes what a device *reported* and returns extents; it
-//! opens nothing, reads nothing and cannot write. That is what lets it run on the host. Since
-//! administration Part G.2 it also says which disks the view does not hold and why ([`withheld`]),
-//! from tables the binary read — still opening nothing.
-//!
-//! **And what goes on the root** ([`copy`], [`account`]), since PR #348's review: the copy of the
-//! pristine root and the account written in the build's place. These do read and write, but
-//! through `fs_server_ext4`'s `BlockReader` and `BlockWriter` rather than a handle — the program
-//! hands them a window onto a partition, and a host test hands them a disk in memory.
+//! Split out so it can be host-tested: the mistakes that matter here are arithmetic, they destroy a
+//! disk, and none is visible in a boot that succeeds. The planning code opens nothing and cannot
+//! write; [`copy`] and [`account`] write through `fs_server_ext4`'s `BlockWriter`, so a host test
+//! hands them a disk in memory.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -26,36 +15,28 @@ pub mod copy;
 
 use libgpt::table::{ARRAY_BLOCKS, FIRST_USABLE, Partition, TYPE_EFI_SYSTEM, TYPE_LINUX_FS};
 
-/// Partition alignment, in 512-byte blocks: 1 MiB, which is what every partitioner has used
-/// since 4 Kn drives arrived. Aligning to the *logical* block size is not enough — a 4 KiB
-/// physical sector under 512-byte logical addressing turns a misaligned write into a
-/// read-modify-write of the neighbouring sector.
+/// Partition alignment, in 512-byte blocks: 1 MiB. Aligning to the logical block size is not
+/// enough: a 4 KiB physical sector under 512-byte logical addressing turns a misaligned write into
+/// a read-modify-write of the neighbouring sector.
 pub const ALIGN: u64 = 2048;
 
 /// Where the ESP starts: 1 MiB in, leaving room for the table and the alignment gap.
 pub const ESP_FIRST: u64 = ALIGN;
 
-/// The GPT name of the boot partition. Nothing resolves this — the firmware finds an ESP by its
-/// *type* GUID — so it exists to be recognised by a person looking at the disk later.
+/// The GPT name of the boot partition. Nothing resolves it (the firmware finds an ESP by its
+/// type GUID); it is for a person looking at the disk.
 pub const ESP_LABEL: &[u8] = b"NITROX_ESP";
 
-/// The GPT name of the root partition, which the **release `init.toml` names** as
-/// `gpt-partlabel:nitrox-root`. An installed system finds its root by this string, so it is the
-/// one label here that is load-bearing.
+/// The GPT name of the root partition. The release `init.toml` names it as
+/// `gpt-partlabel:nitrox-root`, so an installed system finds its root by this string.
 pub const ROOT_LABEL: &[u8] = b"nitrox-root";
 
-/// The only logical block size this installer writes. `libgpt` addresses a disk in 512-byte
-/// blocks throughout, so a 4 Kn disk would need every LBA in every structure reinterpreted —
-/// refused rather than written wrongly.
+/// The only logical block size this installer writes: `libgpt` addresses a disk in 512-byte
+/// blocks throughout, so a 4 Kn disk is refused rather than written wrongly.
 pub const LOGICAL_BLOCK: u32 = 512;
 
 /// The index of a child of `/dev/blk` named `name`, if it names a device: decimal, with no
-/// leading zero but `0` itself, so one device has one spelling (administration Part B.5).
-///
-/// **The installer lists what its namespace holds** rather than probing `/dev/blk/0`, `1`, … for
-/// the first miss. It runs in a view (`with admin nxinstall`), where what it may write is exactly
-/// what the `disks` grant bound — so the listing is the whole answer, and a view granted one disk
-/// has a gap the probe stopped at.
+/// leading zero but `0` itself, so one device has one spelling.
 pub fn block_index(name: &str) -> Option<usize> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) || (bytes.len() > 1 && bytes[0] == b'0') {
@@ -66,21 +47,9 @@ pub fn block_index(name: &str) -> Option<usize> {
 
 /// What a run of the installer did, and therefore what it exits with.
 ///
-/// **The status answers "did what you asked for happen", not "was anything written".** Asking
-/// what an install *would* do — a device with no identity after it — and being told is a
-/// success: it is a query, it answered, and it says in its own words that nothing was written.
-/// Treating it as a failure made the shell print `pipeline failed` directly underneath a calm
-/// explanation of what to type next, which reads as though something had broken (first install
-/// attempt on the laptop, 2026-09-17).
-///
-/// Asking for an install and not getting one is a failure whatever refused it — a wrong kind of
-/// device, a disk too small, an answer the rules refuse, an I/O error part-way. In all of those
-/// the caller asked for something that did not happen, which is exactly what a non-zero status
-/// is for, and a script that stops on it stops correctly.
-///
-/// **Saying no is not a failure** (2026-10-01). A person shown the plan who answers anything but
-/// `yes`, or who cancels a question, has had what they asked for: to be asked. They are told that
-/// nothing was written, and `pipeline failed` under that would read as though something broke.
+/// The status answers "did what you asked for happen", not "was anything written": asking what an
+/// install would do succeeds, and so does saying no to the plan or cancelling a question. Asking
+/// for an install and not getting one is a failure whatever refused it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
     /// The devices this view can reach were listed.
@@ -91,8 +60,7 @@ pub enum Outcome {
     Declined,
     /// The install completed.
     Installed,
-    /// An install was asked for and did not happen. Nothing was written, or the failure says
-    /// how far it got.
+    /// An install was asked for and did not happen; the failure says how far it got.
     NotInstalled,
     /// The command line was not one this program accepts.
     Usage,
@@ -109,15 +77,13 @@ impl Outcome {
     }
 }
 
-/// **Whether `answer` is the go-ahead**: `yes`, in any case, with the line's surrounding blanks
-/// ignored — and nothing else. Not `y`, which is a reflex; and not a prefix or a longer word that
-/// starts with it, since a person who typed `yesterday` was not answering.
+/// Whether `answer` is the go-ahead: `yes`, in any case, surrounding blanks ignored, and nothing
+/// else. Not `y`, which is a reflex, nor a longer word like `yesterday`.
 pub fn confirmed(answer: &[u8]) -> bool {
     answer.trim_ascii().eq_ignore_ascii_case(b"yes")
 }
 
-/// Why a target cannot be installed to. Each is a sentence a person can act on, which is why
-/// the numbers travel with the variant rather than being formatted away here.
+/// Why a target cannot be installed to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PlanError {
     /// The device addresses blocks of some size other than 512.
@@ -155,11 +121,8 @@ impl Layout {
         self.root_last - self.root_first + 1
     }
 
-    /// The two entries, for [`libgpt::table::build`].
-    ///
-    /// The GUIDs are the caller's, because this crate has no entropy and `libgpt` deliberately
-    /// invents none: a disk whose partitions all share one hard-coded GUID is indistinguishable
-    /// from every other machine's, and something will eventually care.
+    /// The two entries, for [`libgpt::table::build`]. The GUIDs are the caller's: this crate has no
+    /// entropy, and a hard-coded GUID would be shared with every other machine's disk.
     pub fn partitions(&self, esp_guid: [u8; 16], root_guid: [u8; 16]) -> [Partition; 2] {
         [
             Partition::new(TYPE_EFI_SYSTEM, esp_guid, self.esp_first, self.esp_last, ESP_LABEL),
@@ -168,21 +131,16 @@ impl Layout {
     }
 }
 
-/// Round `blocks` up to the next [`ALIGN`] boundary.
 fn align_up(blocks: u64) -> u64 {
     blocks.div_ceil(ALIGN) * ALIGN
 }
 
 /// Place both partitions on a disk of `disk_blocks` blocks, given the sizes of the two sources.
 ///
-/// `esp_blocks` is the whole installable-ESP image, which is copied in as raw sectors; the boot
-/// partition is exactly that image, since a FAT32 filesystem records its own size and growing
-/// the partition around it would only produce a partition whose tail no filesystem knows about.
-///
-/// `root_min_blocks` is the filesystem being copied into the root partition. The partition takes
-/// **the rest of the disk** rather than that size: the filesystem inside it stays as big as it
-/// was — growing it is Part H.2's job — and a partition sized to today's filesystem would have
-/// to be moved before it could ever be grown.
+/// The boot partition is exactly `esp_blocks`, the ESP image copied in as raw sectors: a FAT32
+/// filesystem records its own size, so a larger partition would have a tail it does not know.
+/// The root partition takes the rest of the disk, not `root_min_blocks`, so the filesystem can
+/// later be grown without moving the partition.
 pub fn plan(disk_blocks: u64, block_size: u32, esp_blocks: u64, root_min_blocks: u64) -> Result<Layout, PlanError> {
     if block_size != LOGICAL_BLOCK {
         return Err(PlanError::BlockSize(block_size));
@@ -190,11 +148,9 @@ pub fn plan(disk_blocks: u64, block_size: u32, esp_blocks: u64, root_min_blocks:
     let esp_first = ESP_FIRST;
     let esp_last = esp_first + esp_blocks.max(1) - 1;
     let root_first = align_up(esp_last + 1);
-    // **The last block the table may use**, which is where `libgpt::build` puts its own ceiling:
-    // the backup header takes the final block and the backup array the `ARRAY_BLOCKS` before it.
-    // Computed here as well as there so this function can say *why* a disk is too small, with a
-    // number, rather than handing back `libgpt`'s `DiskTooSmall` after the person has already
-    // typed the disk's name back.
+    // The last usable block is where `libgpt::build` puts its ceiling: the backup header takes
+    // the final block and the backup array the `ARRAY_BLOCKS` before it. Computed here too so a
+    // too-small disk is refused with a number before the person types the disk's name back.
     let need = root_first + root_min_blocks + ARRAY_BLOCKS + 1;
     if disk_blocks < need || disk_blocks < FIRST_USABLE {
         return Err(PlanError::TooSmall { have: disk_blocks, need });
@@ -207,19 +163,12 @@ pub fn plan(disk_blocks: u64, block_size: u32, esp_blocks: u64, root_min_blocks:
 }
 
 pub mod withheld {
-    //! **A disk the view does not hold, and why** (administration Part G.2).
+    //! A disk the view does not hold, and why.
     //!
-    //! `nxinstall` runs in a view, whose disks the `disks` grant chose when `with` started it: every
-    //! block device but those in use. So a disk the machine has and the view lacks is one in use,
-    //! and the person is told which, and what frees it, rather than finding it missing. Two
-    //! tables every view can read say so: `/dev/devices`, for the disks and which partitions are
-    //! theirs, and `/dev/storage`, for where each is mounted and by whom.
-    //!
-    //! - **Mounted by the storage service**: the command that unmounts it. `disk --unmount` takes
-    //!   the mount's **label** — the last part of `/storage/<label>` — not the path (PR #347
-    //!   review).
-    //! - **Mounted by `init`**: the running system, and no command. The storage service never
-    //!   unmounts `init`'s mounts.
+    //! The view's `disks` grant is every block device but those in use, so a disk the machine has
+    //! and the view lacks is in use: mounted by the storage service (`disk --unmount` takes the
+    //! mount's label, the last part of `/storage/<label>`, not the path), or by `init`, which is
+    //! the running system and is never unmounted.
 
     use alloc::format;
     use alloc::string::String;
@@ -238,7 +187,7 @@ pub mod withheld {
         pub description: String,
         /// The name of the device it belongs to: a partition's disk.
         pub parent: String,
-        /// **The disk the machine started from** (Phase 6 Part D): on a live boot, the stick.
+        /// The disk the machine started from: on a live boot, the stick.
         pub boot: bool,
     }
 
@@ -278,10 +227,9 @@ pub mod withheld {
         pub why: Why,
     }
 
-    /// **Every disk and RAM disk the machine has and the view does not reach, that something has
-    /// mounted or the machine started from**, in the table's order. `reachable` is the view's own `/dev/blk/<n>` paths. A disk
-    /// missing for no reason the tables give — nothing on it mounted — is left out: there is nothing
-    /// true to say about it.
+    /// Every disk and RAM disk the view does not reach that something has mounted or the machine
+    /// started from, in the table's order. `reachable` is the view's own `/dev/blk/<n>` paths; a
+    /// disk missing for no reason the tables give is left out.
     pub fn withheld(devices: &[Device], mounts: &[Mount], reachable: &[&str]) -> Vec<Withheld> {
         let mut out = Vec::new();
         for d in devices.iter().filter(|d| (d.kind == "disk" || d.kind == "ramdisk") && !d.path.is_empty()) {
@@ -293,8 +241,8 @@ pub mod withheld {
             for p in devices.iter().filter(|p| p.parent == d.name) {
                 found.extend(on(&p.name));
             }
-            // **The disk the machine started from holds the running system** (Phase 6 Part D),
-            // whether or not anything on it is mounted: the live stick, its system in RAM.
+            // The boot disk holds the running system whether or not anything on it is mounted
+            // (the live stick, its system in RAM).
             let why = if d.boot || found.iter().any(|m| m.by == "init") {
                 Why::Running
             } else if let Some(m) = found.iter().find(|m| m.by == "storage") {
@@ -336,8 +284,6 @@ mod tests {
     use super::*;
     use libgpt::table::{self, BACK_BYTES, FRONT_BYTES};
 
-    /// **A child of `/dev/blk` is a device only if its name is an index** — `info` is a device's
-    /// leaf, not a device, and `01` would be a second spelling of one.
     #[test]
     fn a_device_is_a_child_named_by_its_index() {
         assert_eq!(block_index("0"), Some(0));
@@ -348,7 +294,7 @@ mod tests {
         }
     }
 
-    /// A 1 GiB disk, a 33 MiB ESP and a 24 MiB root — the shape `check-install` boots.
+    /// The shape `check-install` boots.
     fn small_disk() -> Layout {
         plan(2 * 1024 * 1024, 512, 33 * 2048, 24 * 2048).expect("a 1 GiB disk is enough")
     }
@@ -365,40 +311,25 @@ mod tests {
         let l = small_disk();
         assert_eq!(l.root_first % ALIGN, 0, "a misaligned partition costs every write twice");
         assert!(l.root_first > l.esp_last, "the two must not overlap");
-        // The rest of the disk, not the size of the filesystem going into it.
         assert!(l.root_blocks() > 900 * 2048, "a 1 GiB disk should yield most of itself");
     }
 
-    /// **An ESP that is not a whole number of MiB**, which is the only input that makes the
-    /// assertion above mean anything. Every other test here passes a 33 MiB source, and
-    /// `ESP_FIRST + 33 * 2048` is already aligned — so `align_up` was the identity on the whole
-    /// suite, and deleting it left all seven tests passing (PR #309 review, blocking 1).
-    ///
-    /// The real input is `byte_capacity() / 512` of whatever RAM disk the module became.
-    /// `assemble_live_image` happens to size that to a whole MiB today, so `check-install`
-    /// cannot see this either; size it to its contents instead, or copy from anywhere else, and
-    /// nothing but this test stands between a misaligned partition and every write to it
-    /// costing a read-modify-write of the neighbouring physical sector.
+    /// Only an ESP that is not a whole number of MiB pins `align_up`.
     #[test]
     fn an_esp_that_is_not_a_whole_number_of_mib_still_aligns_the_root() {
         let odd = plan(2 * 1024 * 1024, 512, 33 * 2048 + 1, 24 * 2048).expect("still fits");
         assert_eq!(odd.esp_last, ESP_FIRST + 33 * 2048, "the ESP is its own size, unrounded");
         assert_eq!(odd.root_first % ALIGN, 0, "and the root still starts on a boundary");
         assert_eq!(odd.root_first, 35 * 2048, "the next boundary after the ESP, not the block after it");
-        // The control, stated here rather than inferred: without rounding, the root would start
-        // on the block straight after the ESP, which this asserts is *not* where it is.
         assert_ne!(odd.root_first, odd.esp_last + 1);
     }
 
-    /// The failure `libgpt`'s own `last_usable` test exists for, from the other side: a root
-    /// partition that runs into the backup array boots fine and loses the table later.
     #[test]
     fn the_root_partition_stops_short_of_the_backup_table() {
         let disk = 2 * 1024 * 1024;
         let l = plan(disk, 512, 33 * 2048, 24 * 2048).unwrap();
         assert_eq!(l.root_last, disk - ARRAY_BLOCKS - 2);
-        // And the proof that the number agrees with the writer: `build` accepts it, and one
-        // block more is refused.
+        // `build` accepts it, and one block more is refused.
         let (mut front, mut back) = ([0u8; FRONT_BYTES], [0u8; BACK_BYTES]);
         let ps = l.partitions([1; 16], [2; 16]);
         assert!(table::build(disk, [3; 16], &ps, &mut front, &mut back).is_ok());
@@ -411,8 +342,6 @@ mod tests {
         );
     }
 
-    /// The table this plan produces reads back as the two partitions it named — the round trip
-    /// that an installed machine's firmware and `init` each do half of.
     #[test]
     fn the_table_reads_back_as_the_plan() {
         let disk = 2 * 1024 * 1024;
@@ -429,7 +358,6 @@ mod tests {
 
     #[test]
     fn a_disk_too_small_for_both_is_refused_with_the_number_it_needed() {
-        // Room for the ESP and the tables, none for the root.
         let err = plan(34 * 2048, 512, 33 * 2048, 24 * 2048).unwrap_err();
         match err {
             PlanError::TooSmall { have, need } => {
@@ -438,32 +366,23 @@ mod tests {
             }
             other => panic!("expected TooSmall, got {other:?}"),
         }
-        // A disk one block short of enough is still short — the boundary, not just the shape.
         let l = small_disk();
         let exact = l.root_first + 24 * 2048 + ARRAY_BLOCKS + 1;
         assert!(plan(exact, 512, 33 * 2048, 24 * 2048).is_ok(), "control: exactly enough");
         assert!(plan(exact - 1, 512, 33 * 2048, 24 * 2048).is_err(), "one block short");
     }
 
-    /// **A question answered is not a failure.** Reading the plan and saying no is an ordinary
-    /// path through this program, as is asking for its usage, so reporting either as a failure
-    /// puts `pipeline failed` under a correct use of the installer.
     #[test]
     fn saying_no_succeeds_and_asking_for_an_install_that_did_not_happen_does_not() {
         assert_eq!(Outcome::Declined.status(), 0, "saying no is an answer, not a failure");
         assert_eq!(Outcome::Help.status(), 0);
         assert_eq!(Outcome::Listed.status(), 0);
         assert_eq!(Outcome::Installed.status(), 0);
-        // And the half that must stay non-zero: a script that asked for an install and did not
-        // get one has to be able to stop.
         assert_ne!(Outcome::NotInstalled.status(), 0);
         assert_ne!(Outcome::Usage.status(), 0);
-        // Usage is distinguishable from a refusal, which is the split every program here uses.
         assert_ne!(Outcome::Usage.status(), Outcome::NotInstalled.status());
     }
 
-    /// **`yes`, and only `yes`.** Each refusal here is an answer a person might give meaning
-    /// something else, or by reflex; the accepted ones are the same word typed loosely.
     #[test]
     fn only_yes_goes_ahead() {
         for yes in [&b"yes"[..], b"YES", b"Yes", b"  yes ", b"yes\r", b"\tyes"] {
@@ -474,8 +393,6 @@ mod tests {
         }
     }
 
-    /// 4 Kn disks exist, `libgpt` addresses 512-byte blocks throughout, and the difference is
-    /// invisible until the firmware reads a table at the wrong offset.
     #[test]
     fn a_disk_that_does_not_address_512_byte_blocks_is_refused() {
         assert_eq!(plan(2 * 1024 * 1024, 4096, 33 * 2048, 24 * 2048), Err(PlanError::BlockSize(4096)));
@@ -498,10 +415,6 @@ mod tests {
         Mount { name: name.into(), at: at.into(), by: by.into() }
     }
 
-    /// **A reinstall's install boot** (administration Part G.2): the SATA disk holding an older
-    /// install, auto-mounted by the storage service; the live root's RAM disk, whose partition
-    /// `init` mounted; the two module sources, which the view holds. The disk is named with the
-    /// command that frees it — by the mount's label — and the live root as the running system.
     #[test]
     fn a_withheld_disk_is_named_with_what_frees_it() {
         let devices = [
@@ -534,7 +447,6 @@ mod tests {
                 },
             ]
         );
-        // The command names the label, which is what `disk --unmount` takes, and not the path.
         assert!(w[0].message().contains("`with admin disk --unmount nitrox-root`"), "{}", w[0].message());
         assert!(!w[0].message().contains("--unmount /storage"));
         assert!(w[1].message().ends_with("holds the running system."));
@@ -542,9 +454,6 @@ mod tests {
         assert_eq!((w[0].refusal(), w[1].refusal()), ("it is in use", "it holds the running system"));
     }
 
-    /// **The live stick is the running system** (Phase 6 Part D): the disk the machine started from,
-    /// withheld with nothing on it mounted, is named so — and the same disk unflagged, with nothing
-    /// mounted, would not be named at all.
     #[test]
     fn the_disk_the_machine_started_from_holds_the_running_system() {
         let mut stick = dev("blk-4", "disk", "/dev/blk/4", "QEMU QEMU HARDDISK (1-0000:00:04.0-1)", "usb-12");
@@ -557,9 +466,6 @@ mod tests {
         assert!(withheld(&[stick], &[], &[]).is_empty(), "nothing gives a reason, so nothing is said");
     }
 
-    /// **A release boot**: the disk under `/` is the running system. A disk the view lacks with
-    /// nothing mounted on it is not named, since the tables give no reason to; one the view holds
-    /// is not named either, mounted or not.
     #[test]
     fn only_a_mounted_disk_the_view_lacks_is_named() {
         let devices = [
@@ -573,7 +479,6 @@ mod tests {
         let w = withheld(&devices, &mounts, &["/dev/blk/1", "/dev/blk/4"]);
         assert_eq!(w.len(), 1, "{w:?}");
         assert_eq!((w[0].path.as_str(), &w[0].why), ("/dev/blk/0", &Why::Running));
-        // A bare filesystem on the disk itself, with no partition table, counts as the disk's.
         let bare = withheld(&devices, &mounts, &["/dev/blk/1"]);
         assert_eq!(bare[1].why, Why::Mounted { label: "data".into(), at: "/storage/data".into() });
     }

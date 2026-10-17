@@ -6,46 +6,22 @@
 //! with admin nxinstall --help
 //! ```
 //!
-//! ## It holds no authority of its own
+//! It holds no authority of its own: it reaches a disk only when the view it runs in has one
+//! bound, by the `disks` grant of `with admin` or `with install`. Absence is the sandbox; no check
+//! in this program is what stops it. A disk the view lacks is one in use, and is named as such on
+//! `stderr`, with the command that frees it when the storage service mounted it.
 //!
-//! There is no privileged installer here, because there is nothing to be privileged *as*: this
-//! system has no root account and no way to become one. `nxinstall` reaches a disk only when the
-//! view it runs in has one bound — the `disks` grant, through `with admin` or `with install`,
-//! which binds every disk not in use ([`administration.md`](../../docs/planning/administration.md)
-//! Part G). Run without a view it resolves nothing and says so. **Absence is the sandbox**: no check
-//! in this program is what stops it, and removing one would not help it.
+//! Naming a disk shows the plan and asks, in one write to the terminal: the disk, what goes on
+//! it, that everything on it is lost, and `type yes to go ahead:`. Anything but `yes` writes
+//! nothing. A whole word rather than `[y/N]`, because a single key is answered before the
+//! question is read. It then asks for the first account with `libprompt`: a name, echo on, and a
+//! password twice, echo off. Nothing is written until all three questions are answered.
 //!
-//! **A disk the view lacks is one in use, and is named as such** (Part G.2): the machine's device
-//! and storage tables say where it is mounted and by whom. One the storage service mounted comes
-//! with the command that frees it; one `init` mounted holds the running system. Those lines go to
-//! `stderr` — the table on `stdout` stays what the view can use.
-//!
-//! ## The confirmation and the account are asked
-//!
-//! **Naming a disk shows the plan and asks**, in one write to the terminal its program was handed:
-//! the disk, what goes on it, that everything on it is lost, and `erase /dev/blk/N and install
-//! Nitrox? type yes to go ahead:`. Anything but `yes` writes nothing (`nxinstall::confirmed`). A
-//! whole word rather than `[y/N]`, because a single key is answered before the question is read;
-//! the plan is on the screen above it, since the two are one write (PR #349 review).
-//!
-//! **Until 2026-10-01 the confirmation was an operand**: a first run printed the plan and a line
-//! carrying the disk's identity, and running that line was the go-ahead. That was the only form
-//! possible when no program could read a terminal — Part A gave every stage one — and on the laptop
-//! it was the hard part of an install: an identity of a model and serial, typed back with its
-//! quotes. The maintainer's call, after that attempt: ask, as installers do.
-//!
-//! **Then it asks for the new machine's first account** (Part G.2, the maintainer's call): a name,
-//! echo on, and a password twice, echo off, with `libprompt`. Nothing is written until all three
-//! questions are answered.
-//!
-//! ## What it writes
-//!
-//! A GPT with two partitions (`nxinstall::plan`); the installable ESP module, whole, onto the boot
-//! partition; and on the root partition a filesystem made for it, holding **the pristine root's
-//! files** — `install-root.img`, which the install entry loads beside the ESP (Part G.1) — but
-//! not the build's accounts. `/home` is made empty, and `/system/users` and `/system/views.toml`
-//! are the new machine's own: its one account, the seeded policy making it the administrator
-//! (`view_broker::policy::seed`), and its home with the three folders a home has.
+//! It writes a GPT with two partitions, the installable ESP module whole onto the boot partition,
+//! and on the root partition a new filesystem holding the pristine root's files
+//! (`install-root.img`) but not the build's accounts. `/home` is made empty, and `/system/users`
+//! and `/system/views.toml` are the new machine's own: its one account, the seeded policy making
+//! it the administrator (`view_broker::policy::seed`), and its home.
 
 #![no_std]
 #![no_main]
@@ -73,31 +49,23 @@ use libstream::diag::Level;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: the report lines and the TSM1 encoder both allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// What a failure before the program is running exits with — a malformed setup message, or a
-/// panic. Every other status comes from [`nxinstall::Outcome`], which is where the policy is
-/// stated and tested.
+/// What a failure before the program is running exits with: a malformed setup message, or a
+/// panic. Every other status comes from [`nxinstall::Outcome`].
 const EXIT_FAILURE: i64 = 1;
 
-/// The transfer buffer, in bytes: 256 KiB, which is 64 pages and so 64 scatter-gather fragments
-/// — comfortably inside what one AHCI command can describe (`MAX_PRDT_ENTRIES` is 248). Copying
-/// 33 MiB one 4 KiB page at a time would be 8,500 round trips through the device and the
-/// scheduler; at this size it is 132.
+/// The transfer buffer, in bytes: 256 KiB, which is 64 pages and so 64 scatter-gather fragments,
+/// inside what one AHCI command can describe (`MAX_PRDT_ENTRIES` is 248).
 const CHUNK: u64 = 256 * 1024;
 
-/// The GPT name of the partition the root is copied from, which is how the root *source* is
-/// recognised among the RAM disks: `install-root.img`'s, the pristine copy of the release root the
-/// install entry loads (administration Part G.1). **Not the live root's `nitrox-live`**, which the
-/// session writes to and `init` has mounted; and not `nitrox-root`, which is what the copy becomes,
-/// named by the table this program writes.
+/// The GPT name of the partition the root is copied from, which is how the root source is
+/// recognised among the RAM disks. Not the live root's `nitrox-live`, which the session writes to
+/// and `init` has mounted.
 const SOURCE_LABEL: &[u8] = libgpt::INSTALL_SOURCE_LABEL.as_bytes();
 
-/// **What `--help` prints**, a line each, on `stdout`. Written for the person at the live stick, who
-/// has the program's name and nothing else: what it does, the two ways to run it, and that the
-/// disks come with the view.
+/// What `--help` prints, a line each, on `stdout`.
 const HELP: &[&str] = &[
     "usage: with admin nxinstall [DEVICE]",
     "",
@@ -116,31 +84,21 @@ const HELP: &[&str] = &[
     "`with admin`: the disks come with the view, and nxinstall alone has none.",
 ];
 
-/// The block size of every filesystem this system makes or reads, and of the one it copies
-/// from. 4 KiB is the reader's scratch and the page size, so a file's blocks map to pages.
+/// The block size of every filesystem this system makes or reads. 4 KiB is the reader's scratch
+/// and the page size, so a file's blocks map to pages.
 const FS_BLOCK: u64 = 4096;
 
-/// Bytes of filesystem per inode — `mke2fs -i`'s default. `mkfs` caps the total, so this
-/// governs small filesystems and the cap governs large ones.
+/// Bytes of filesystem per inode, `mke2fs -i`'s default. `mkfs` caps the total, so this governs
+/// small filesystems and the cap large ones.
 const BYTES_PER_INODE: u32 = 16384;
 
-/// `sys_wait` scratch for a single pending operation.
 static mut WAIT_HANDLES: [u64; 1] = [0; 1];
-/// `sys_wait` results: one `IoResult`, which is 24 bytes (`handle`, `status`, `reserved`,
-/// `result`). The buffer is rounded up; the number is stated correctly because a reader
-/// computing a stride from it would be wrong.
+/// `sys_wait` results: one 24-byte `IoResult`, in a buffer rounded up to 32.
 static mut WAIT_RESULTS: [u8; 32] = [0; 32];
 
-/// The front of a GPT: protective MBR, header, entry array.
 static mut FRONT: [u8; FRONT_BYTES] = [0; FRONT_BYTES];
-/// The back of a GPT: the entry array again, then the backup header.
 static mut BACK: [u8; BACK_BYTES] = [0; BACK_BYTES];
 
-// ---------------------------------------------------------------------------------------------
-// Syscall plumbing
-// ---------------------------------------------------------------------------------------------
-
-/// Wait for one pending operation and return its `(status, value)`.
 fn po_wait(po: u64) -> (i32, u64) {
     // SAFETY: valid single-waiter buffers; the PO handle is ours.
     let waited = unsafe {
@@ -161,7 +119,6 @@ fn po_wait(po: u64) -> (i32, u64) {
     }
 }
 
-/// Resolve `path` in `ns` asking for `rights`, or `None`.
 fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     // SAFETY: valid namespace handle and path slice.
     let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
@@ -172,7 +129,6 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     if status != 0 || handle == 0 { None } else { Some(handle) }
 }
 
-/// A `MemoryObject` of `size` bytes, mapped read-write; `(handle, address)`.
 fn scratch(size: u64) -> Option<(u64, u64)> {
     // SAFETY: register-only syscall.
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, size, 0, 0, 0) };
@@ -192,9 +148,8 @@ fn scratch(size: u64) -> Option<(u64, u64)> {
 
 /// 16 bytes from the kernel CSPRNG, for a partition GUID.
 ///
-/// **Refuses rather than inventing one.** A table whose GUIDs are constant is a table that
-/// collides with every other machine installed by this program, and the failure it produces
-/// arrives much later, somewhere else.
+/// Refuses rather than inventing one: constant GUIDs would collide with every other machine this
+/// program installed.
 fn random_guid() -> Option<[u8; 16]> {
     // SAFETY: register-only syscall.
     let h = unsafe { syscall1(SYS_ENTROPY_CREATE, 0) };
@@ -203,9 +158,8 @@ fn random_guid() -> Option<[u8; 16]> {
     }
     let h = h as u64;
     let mut buf = [0u8; 16];
-    // **Read again after an unseeded pool's PO** (PR #351 review): the PO completing says only that
-    // the pool is now seeded, and writes nothing, so a GUID taken from the buffer then would be
-    // sixteen zeros — the GUID every such install would share. An installer can wait.
+    // Read again after an unseeded pool's PO: it completing says only that the pool is now
+    // seeded and writes nothing, so the buffer would be sixteen zeros.
     let ok = loop {
         // SAFETY: a valid writable 16-byte buffer.
         let r = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut buf) as u64, 16, 0) };
@@ -221,37 +175,24 @@ fn random_guid() -> Option<[u8; 16]> {
     ok.then_some(buf)
 }
 
-// ---------------------------------------------------------------------------------------------
-// Block devices
-// ---------------------------------------------------------------------------------------------
-
 /// One block device this view can reach.
 struct Device {
-    /// Its index under `/dev/blk`.
     index: usize,
-    /// The device handle, with read **and** write.
-    ///
-    /// Not "whatever the binding allowed": [`devices`] asks for both, so a device bound read-only
-    /// is left out of the list rather than appearing in it read-only. The `disks` grant binds both
-    /// (`libsession::rebind_block_devices_except`); a grant that gave less would need a second
-    /// lookup here rather than a different comment (PR #309 review).
+    /// The device handle, with read and write: [`devices`] asks for both, so a device bound
+    /// read-only is left out of the list.
     handle: u64,
-    /// What it says it is.
     info: BlockDeviceInfo,
 }
 
 impl Device {
-    /// Its path, for a report and for the command line that confirms it.
     fn path(&self) -> String {
         format!("/dev/blk/{}", self.index)
     }
 
-    /// Its name, as text.
     fn name(&self) -> String {
         String::from_utf8_lossy(self.info.name()).into_owned()
     }
 
-    /// Read `buf.len()` bytes from byte offset `at` through `io`.
     fn read_at(&self, io: &Io, at: u64, buf: &mut [u8]) -> Result<(), &'static str> {
         let mut done = 0usize;
         while done < buf.len() {
@@ -265,7 +206,6 @@ impl Device {
         Ok(())
     }
 
-    /// Write `buf` at byte offset `at` through `io`.
     fn write_at(&self, io: &Io, at: u64, buf: &[u8]) -> Result<(), &'static str> {
         let mut done = 0usize;
         while done < buf.len() {
@@ -282,9 +222,7 @@ impl Device {
 
 /// The transfer buffer every copy goes through: one `MemoryObject`, mapped once.
 struct Io {
-    /// The object handle, named by each `IoOp`.
     mem: u64,
-    /// Its mapping in this process.
     addr: u64,
 }
 
@@ -308,12 +246,8 @@ impl Io {
     }
 }
 
-/// Every block device in `ns`, in index order.
-///
-/// **What `ns` holds, listed** (administration Part B.5): each device is a binding of its own
-/// under `/dev/blk`, made by whoever built this namespace, so enumerating them is the whole
-/// answer — where probing `/dev/blk/0`, `1`, … stopped at the first gap, and a view granted one
-/// disk has one. An empty result is the ordinary answer in an ordinary session, not an error.
+/// Every block device in `ns`, in index order. Listed, not probed: probing `0`, `1`, … would stop
+/// at the first gap. An empty result is the ordinary answer in an ordinary session.
 fn devices(ns: u64) -> Vec<Device> {
     let mut indices: Vec<usize> =
         libfs::ns_children(ns, b"/dev/blk").iter().filter_map(|(name, _)| nxinstall::block_index(name)).collect();
@@ -325,8 +259,6 @@ fn devices(ns: u64) -> Vec<Device> {
         let Some(handle) = lookup(ns, path.as_bytes(), RIGHT_READ | RIGHT_WRITE) else {
             continue;
         };
-        // The info leaf is mapped, not read: it is a `MemoryObject` snapshot, the same shape
-        // `/dev/framebuffer/info` uses.
         let ipath = format!("/dev/blk/{index}/info");
         let info = lookup(ns, ipath.as_bytes(), RIGHT_MAP_READ)
             .and_then(|h| {
@@ -342,15 +274,14 @@ fn devices(ns: u64) -> Vec<Device> {
                 let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size as usize) };
                 BlockDeviceInfo::read(bytes)
             })
-            // A device whose info would not map is still a device, and it reads as `Unknown` —
-            // which every destructive path here refuses.
+            // A device whose info would not map reads as `Unknown`, which every destructive
+            // path here refuses.
             .unwrap_or_default();
         out.push(Device { index, handle, info });
     }
     out
 }
 
-/// Bytes rendered for a person: `33 MiB`, `931 GiB`.
 fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut n = bytes;
@@ -362,10 +293,6 @@ fn human(bytes: u64) -> String {
     format!("{} {}", n, UNITS[unit])
 }
 
-// ---------------------------------------------------------------------------------------------
-// The install
-// ---------------------------------------------------------------------------------------------
-
 /// The two RAM disks this program copies from.
 struct Sources<'a> {
     /// The installable ESP, copied onto the boot partition whole.
@@ -376,12 +303,8 @@ struct Sources<'a> {
     root_extent: (u64, u64),
 }
 
-/// Find the two sources among the RAM disks.
-///
-/// **By what they contain, not what they are called.** A module's name is `module 2
-/// (/boot/install-esp.img)` — a path in a build script, which is the wrong thing for an
-/// installer to depend on. A FAT volume says so in its boot sector, and the root image carries a
-/// partition table naming [`SOURCE_LABEL`]; both are properties of the bytes being copied.
+/// Find the two sources among the RAM disks by what they contain, not what they are called: a FAT
+/// boot sector, and a partition table naming [`SOURCE_LABEL`].
 fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
     let mut esp = None;
     let mut root = None;
@@ -391,8 +314,8 @@ fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
         if d.read_at(io, 0, &mut front).is_err() {
             continue;
         }
-        // A FAT boot sector: the signature at the end of block 0, and one of the two places the
-        // family name is written (FAT32 at 82, FAT12/16 at 54).
+        // A FAT boot sector: the 0x55AA signature at the end of block 0, and the family name at
+        // 82 (FAT32) or 54 (FAT12/16).
         let fat = front[510] == 0x55 && front[511] == 0xAA && (&front[82..87] == b"FAT32" || &front[54..57] == b"FAT");
         if fat && esp.is_none() {
             esp = Some(d);
@@ -420,7 +343,6 @@ fn sources<'a>(devs: &'a [Device], io: &Io) -> Result<Sources<'a>, String> {
     }
 }
 
-/// Copy `blocks` blocks from `src` at `src_at` to `dst` at `dst_at`, reporting progress.
 #[allow(
     clippy::too_many_arguments,
     reason = "the two devices, offsets and the progress hook are separate inputs of one copy"
@@ -439,8 +361,6 @@ fn copy(
     let mut reported = 0u64;
     while done < bytes {
         let n = core::cmp::min(CHUNK, bytes - done);
-        // Straight through the one buffer: read fills it, write drains it. Nothing is staged in
-        // this process's heap, so the copy costs `CHUNK` of memory whatever the disk's size.
         io.submit(IO_OPCODE_READ, src.handle, src_at + done, n).map_err(|e| format!("reading {what}: {e}"))?;
         io.submit(IO_OPCODE_WRITE, dst.handle, dst_at + done, n).map_err(|e| format!("writing {what}: {e}"))?;
         done += n;
@@ -452,12 +372,8 @@ fn copy(
     Ok(())
 }
 
-/// Where the two partitions would go on `target`, or why they cannot.
-///
-/// **Worked out before the confirmation, not after it.** A disk that cannot take the install is
-/// refused while the person is still reading the plan, rather than after they have typed its
-/// name back — and the plan can then say how big the root partition would actually be, which is
-/// the number they are agreeing to lose (first install attempt, 2026-09-17).
+/// Where the two partitions would go on `target`, or why they cannot. Worked out before the
+/// confirmation, so a disk that cannot take the install is refused while the plan is on screen.
 fn layout_for(target: &Device, srcs: &Sources) -> Result<nxinstall::Layout, String> {
     let block = target.info.logical_block_size.max(1) as u64;
     nxinstall::plan(
@@ -479,7 +395,6 @@ fn layout_for(target: &Device, srcs: &Sources) -> Result<nxinstall::Layout, Stri
     })
 }
 
-/// Everything after the confirmation matched.
 fn install(
     io: &Io,
     target: &Device,
@@ -490,10 +405,7 @@ fn install(
 ) -> Result<(), String> {
     let block = target.info.logical_block_size as u64;
     let esp_bytes = srcs.esp.info.byte_capacity();
-    // **Every timestamp in the new filesystem is the install's own.** These files are created
-    // now; carrying the source's times would date a fresh machine to whenever the image was
-    // built. A clock this system could not read leaves them at the epoch, which is wrong but
-    // not a reason to refuse to install.
+    // Every timestamp is the install's own; an unreadable clock leaves the epoch.
     let now = wall_clock_seconds();
 
     let (esp_guid, root_guid) = match (random_guid(), random_guid()) {
@@ -508,9 +420,8 @@ fn install(
     };
     let disk_guid = random_guid().ok_or_else(|| String::from("no entropy for the disk GUID"))?;
 
-    // **The table first, and the filesystems after.** A disk whose table is written but whose
-    // partitions are empty is one this program can be run against again; the other order leaves
-    // bytes nobody can find.
+    // The table first, and the filesystems after: a disk with a table and empty partitions can
+    // be installed to again; the other order leaves bytes nobody can find.
     say("writing the partition table");
     log(&format!(
         "installing to {} ({}), boot {} + root {}",
@@ -531,10 +442,6 @@ fn install(
     say(&format!("copying the boot partition ({})", human(esp_bytes)));
     copy(io, srcs.esp, 0, target, layout.esp_first * BLOCK as u64, esp_bytes, "boot", say)?;
 
-    // **A filesystem the size of the partition, then its contents** (Phase 5 Part H.2).
-    // H.1 copied the live root's sectors here, which put a 24 MiB filesystem on a partition
-    // the size of the disk: a filesystem records its own size, so it did not know about the
-    // space around it and nothing could grow it.
     let root_bytes_dst = layout.root_blocks() * block;
     say(&format!("making a filesystem of {}", human(root_bytes_dst)));
     let dst = match PartitionIo::new(target.handle, layout.root_first * BLOCK as u64, root_bytes_dst) {
@@ -557,10 +464,8 @@ fn install(
             label: *b"nitrox-root\0\0\0\0\0",
             now,
         },
-        // **A line every so often, because this is the slow part.** Two bitmaps and an inode
-        // table per group is about 300 MiB of scattered writes on a terabyte, one command at a
-        // time — minutes, and a person watching a still screen cannot tell that from a hang.
-        // Every 256th group is roughly every few seconds.
+        // The slow part: about 300 MiB of scattered writes on a terabyte, one command at a time,
+        // which a person watching a still screen cannot tell from a hang.
         &mut |done, total| {
             if done == 1 || done == total || done % 256 == 0 {
                 say(&format!("  group {done} of {total}"));
@@ -575,8 +480,6 @@ fn install(
     })?;
     say(&format!("  {} inodes across {} group(s)", geom.inodes_count, geom.groups));
 
-    // The source is the pristine root's partition *inside* its RAM disk, read as the bytes on the
-    // device, since nothing mounts it — see `nxinstall::copy`'s module doc.
     let src = match PartitionIo::new(
         srcs.root.handle,
         srcs.root_extent.0 * BLOCK as u64,
@@ -586,15 +489,12 @@ fn install(
         None => return Err(String::from("could not allocate a transfer buffer for the source")),
     };
     say("copying the root filesystem");
-    // **Which root, in the system log** (administration Part G.1): the pristine copy, not the live
-    // root the session is running from — the difference `check-install` asserts.
+    // Logged so a gate can assert the pristine copy was the source, not the live root.
     log(&format!("copying the root from {}'s {}", srcs.root.path(), String::from_utf8_lossy(SOURCE_LABEL)));
     let copied = nxinstall::copy::copy_tree(&src, &dst, now, nxinstall::account::PASS_OVER, say)
         .map_err(|e| format!("copying the root filesystem failed: {e:?}"))?;
     say(&format!("  {} director(ies), {} file(s), {}", copied.dirs, copied.files, human(copied.bytes)));
 
-    // **The machine's own account** (administration Part G.2), where the copy passed over the
-    // build's: its record, the policy that makes it the administrator, and its home.
     say(&format!("making {}'s account, its administrator", String::from_utf8_lossy(&account.name)));
     let salt = random_guid().ok_or("the kernel would not give out random bytes for a salt")?;
     nxinstall::account::write(&dst, &account.name, &account.password, &salt, now)
@@ -606,15 +506,14 @@ fn install(
         human(root_bytes_dst),
         copied.files
     ));
-    // **Durable before "done"** (administration Part C.2). A drive may hold the last sectors in
-    // its volatile cache, and the next thing a person does after "done" is take the power away.
+    // Durable before "done": a drive may hold the last sectors in its volatile cache, and the
+    // next thing a person does is take the power away.
     flush(target.handle).map_err(String::from)?;
     log("flushed the disk's write cache");
     Ok(())
 }
 
-/// Have `device` write its volatile cache to its medium, and wait until it has: an
-/// `IO_OPCODE_FLUSH`, which names no buffer and no range.
+/// Have `device` write its volatile cache to its medium and wait: an `IO_OPCODE_FLUSH`.
 fn flush(device: u64) -> Result<(), &'static str> {
     let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
     // SAFETY: `device` is a block device handle with `WRITE`; `&op` is a valid `IoOp`.
@@ -628,7 +527,6 @@ fn flush(device: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Seconds since the epoch, or `0` if the clock cannot be read.
 fn wall_clock_seconds() -> i64 {
     let mut nanos: u64 = 0;
     // SAFETY: a valid writable `u64` out-param.
@@ -636,26 +534,18 @@ fn wall_clock_seconds() -> i64 {
     if r < 0 { 0 } else { (nanos / 1_000_000_000) as i64 }
 }
 
-// ---------------------------------------------------------------------------------------------
-// The first account, and the disks in use
-// ---------------------------------------------------------------------------------------------
-
-/// The new machine's first account, as the person gave it.
 struct Account {
-    /// Its name, which `libusers::valid_name` admits.
     name: Vec<u8>,
     /// Its password, scrubbed by the caller once the install is over.
     password: Vec<u8>,
 }
 
-/// **Ask for the first account on `term`**: a name, echo on, then a password twice, echo off
-/// (administration Part G.2, the maintainer's call). Having said why, before anything is written:
-/// `Declined` if a question was cancelled, and `NotInstalled` if an answer does not keep
-/// `libusers`' rules or the two passwords differ.
+/// Ask for the first account on `term`: a name, echo on, then a password twice, echo off.
+/// `Declined` if a question was cancelled, `NotInstalled` if an answer breaks `libusers`' rules or
+/// the two passwords differ.
 ///
-/// **Each question logs its receipt**, since nothing reads a desktop terminal's grid: the name's
-/// before it is asked, and each password's once echo is off, so what a gate types next is neither
-/// echoed nor early.
+/// Each question logs its receipt, since nothing reads a desktop terminal's grid: the name's
+/// before it is asked, and each password's once echo is off, so a gate's typing is not echoed.
 fn ask_account(term: u64, stderr: Option<u64>) -> Result<Account, nxinstall::Outcome> {
     use nxinstall::Outcome;
     let say = |level: Level, line: &str| say_to(stderr, level, line);
@@ -672,13 +562,13 @@ fn ask_account(term: u64, stderr: Option<u64>) -> Result<Account, nxinstall::Out
         );
         return Err(Outcome::NotInstalled);
     }
-    // Two receipts that do not share a prefix, since a gate matches on a line's start.
+    // Two receipts, neither a prefix of the other, since a gate matches on a line's start.
     let asked = &mut |n: u8| log(if n == 1 { "asking for its password" } else { "asking for the password again" });
     match libprompt::ask_new_password_then(term, b"password: ", asked) {
         Ok(password) => Ok(Account { name, password }),
         Err(why) => {
-            // A cancelled question is the person's no, and said as a notice; two passwords that
-            // differ, or one the rules refuse, is an answer that could not be used.
+            // A cancelled question is the person's no; mismatched or refused passwords are an
+            // answer that could not be used.
             let cancelled = why == libprompt::NewPassword::Cancelled;
             say(if cancelled { Level::Notice } else { Level::Error }, &format!("{}; nothing was written.", why.why()));
             Err(if cancelled { Outcome::Declined } else { Outcome::NotInstalled })
@@ -686,9 +576,8 @@ fn ask_account(term: u64, stderr: Option<u64>) -> Result<Account, nxinstall::Out
     }
 }
 
-/// **The disks this view does not hold, and why**, from `/dev/devices`' and `/dev/storage`'s
-/// tables (administration Part G.2). Empty when either will not read: then there is nothing true
-/// to say, and the listing is what it was.
+/// The disks this view does not hold, and why, from `/dev/devices`' and `/dev/storage`' tables.
+/// Empty when either will not read: there is then nothing true to say.
 fn withheld_disks(ns: u64, reachable: &[String]) -> Vec<nxinstall::withheld::Withheld> {
     use nxinstall::withheld::{Device as Row, Mount, withheld};
     let read = |path: &[u8]| libfs::read_file(ns, path).ok().and_then(|b| libstream::wire::Table::decode(&b).ok());
@@ -729,13 +618,7 @@ fn withheld_disks(ns: u64, reachable: &[String]) -> Vec<nxinstall::withheld::Wit
     withheld(&rows, &mounts, &reachable)
 }
 
-// ---------------------------------------------------------------------------------------------
-// Reports
-// ---------------------------------------------------------------------------------------------
-
-/// The device list, as a TSM1 table on `stdout` — a table because it is *data*: a shell can sort
-/// it, filter it, or count it. Everything else this program says is a message to a person and
-/// goes to `stderr`.
+/// The device list, as a TSM1 table on `stdout`; everything else goes to `stderr`.
 fn emit_devices(stdout: u64, devs: &[Device]) {
     let schema = Schema::new()
         .field("path", TypeTag::String, TypeModifiers::NONE)
@@ -757,7 +640,6 @@ fn emit_devices(stdout: u64, devs: &[Device]) {
     let _ = wrote.and_then(|()| tw.into_sink().finish());
 }
 
-/// A word for a kind, matching the kernel's own.
 fn kind_name(k: BlockKind) -> &'static str {
     match k {
         BlockKind::Unknown => "unknown",
@@ -767,17 +649,10 @@ fn kind_name(k: BlockKind) -> &'static str {
     }
 }
 
-/// Record one milestone of a destructive operation in the **system log**.
-///
-/// Separate from [`say_to`], which talks to the person running the program. This is the record
-/// an install leaves behind: on the machine Phase 5 targets there is no serial port and the
-/// terminal's scrollback goes away with the session, so "what did the installer actually do"
-/// has to survive somewhere. The milestones, and each refusal of a disk a person named: what
-/// stopped an install is part of the record, and the only part of it a gate can see.
-///
-/// **Never what was typed.** A path or an identity logged here is read back out of the tables or
-/// the device's own `info`, not taken from the command line: what a person typed does not belong
-/// on a console, and an operand that names no device is logged as that, without itself.
+/// Record one milestone of a destructive operation in the system log, which outlives the
+/// terminal's scrollback and is what a gate reads. Never what was typed: a path or identity logged
+/// here is read back out of the tables or the device's own `info`, and an operand that names no
+/// device is logged as that, without itself.
 fn log(line: &str) {
     let mut bytes = Vec::from(&b"nxinstall: "[..]);
     bytes.extend_from_slice(line.as_bytes());
@@ -785,11 +660,9 @@ fn log(line: &str) {
     kprint(&bytes);
 }
 
-/// Write one line to `stderr` at `level`, or to the kernel log when there is none.
-///
-/// Each line is its own message: `stderr` is shared between the stages of a pipeline, so a
-/// partial line left in it would interleave with another stage's. **The level** (the laptop
-/// polish's Part E) is how the shell tells a refusal from progress: only an error is drawn as one.
+/// Write one line to `stderr` at `level`, or to the kernel log when there is none. Each line is
+/// its own message, since `stderr` is shared between pipeline stages; only an error-level line is
+/// drawn as a refusal.
 fn say_to(stderr: Option<u64>, level: Level, line: &str) {
     let mut bytes = Vec::from(line.as_bytes());
     bytes.push(b'\n');
@@ -804,8 +677,7 @@ fn say_to(stderr: Option<u64>, level: Level, line: &str) {
     }
 }
 
-/// `--help`'s lines on `stdout`, as text — what was asked for, and so not a diagnostic. `false`
-/// with no `stdout`, or when the write failed.
+/// `--help`'s lines on `stdout`; `false` with no `stdout`, or when the write failed.
 fn help_out(stdout: Option<u64>) -> bool {
     stdout.is_some_and(|h| {
         let mut sink = ChannelSink::new(IpcPort::new(h), IPC_PAYLOAD_SIZE);
@@ -813,11 +685,6 @@ fn help_out(stdout: Option<u64>) -> bool {
     })
 }
 
-// ---------------------------------------------------------------------------------------------
-// Entry
-// ---------------------------------------------------------------------------------------------
-
-/// Run, and return the exit status.
 fn run(
     namespace: u64,
     argv: &[String],
@@ -826,13 +693,13 @@ fn run(
     terminal: Option<u64>,
 ) -> nxinstall::Outcome {
     use nxinstall::Outcome;
-    // An error, a warning or a notice (Part E): what stopped it, what it left out, and progress.
+    // An error, a warning or a notice: what stopped it, what it left out, and progress.
     let say = |line: &str| say_to(stderr, Level::Error, line);
     let warn = |line: &str| say_to(stderr, Level::Warning, line);
     let mut note = |line: &str| say_to(stderr, Level::Notice, line);
 
     let operands: Vec<&String> = argv.iter().skip(1).collect();
-    // **Before anything is looked up**, so `nxinstall --help` answers without a view.
+    // Before anything is looked up, so `nxinstall --help` answers without a view.
     if operands.iter().any(|o| o.as_str() == "--help") {
         if !help_out(stdout) {
             for line in HELP {
@@ -851,9 +718,8 @@ fn run(
     }
 
     let devs = devices(namespace);
-    // **The disks the view does not hold, and why** (administration Part G.2): each is in use.
-    // Messages, on `stderr` — the table on `stdout` stays what the view can use, which is what
-    // `boot-probe`, `test-interactive` and `check-login` read to prove `disks` withholds anything.
+    // Messages on `stderr`: the table on `stdout` stays what the view can use, which gates read
+    // to prove `disks` withholds anything.
     let reachable: Vec<String> = devs.iter().map(|d| d.path()).collect();
     let withheld = withheld_disks(namespace, &reachable);
 
@@ -886,21 +752,13 @@ fn run(
         return Outcome::Listed;
     }
 
-    // **An install that was asked for and refused is an event.** Naming a device is asking to
-    // destroy a disk — the plan and the question that follow are the start of that, not a
-    // separate query — and what stopped it belongs in the system log beside the milestones an
-    // install leaves, not least because it is the only thing a gate can see, the refusal itself
-    // being a conversation on a terminal (PR #309 review, 7).
-    //
-    // **The path is one the tables name**, the target's or a withheld disk's — equal to what was
-    // typed, but never taken from it: an operand that names nothing is logged without itself.
+    // A refusal goes in the system log, the only thing a gate can see of a conversation on a
+    // terminal. The path logged is one the tables name, never taken from what was typed.
     let refuse = |path: &str, what: &str| log(&format!("refused {path}: {what}"));
 
-    // The target, by the path the listing printed.
     let wanted = operands[0].as_str();
     let Some(target) = devs.iter().find(|d| d.path() == wanted) else {
-        // **In use, said as such** (administration Part G.2), rather than "not here": a disk the
-        // machine has and the view lacks was withheld, and the person can act on why.
+        // In use, said as such rather than "not here": the person can act on why.
         if let Some(w) = withheld.iter().find(|w| w.path == wanted) {
             say(&w.message());
             refuse(&w.path, w.refusal());
@@ -911,9 +769,8 @@ fn run(
         return Outcome::NotInstalled;
     };
 
-    // **What it is, before what it is called.** The refusals are per-kind because the mistake
-    // each one catches is a different mistake: a partition is what a person picks off a listing
-    // by mistake, and a RAM disk is the running system itself.
+    // Refusals are per-kind because each catches a different mistake: a partition is picked off
+    // a listing by mistake, and a RAM disk is the running system itself.
     match target.info.kind() {
         BlockKind::Disk => {}
         BlockKind::Partition => {
@@ -969,18 +826,15 @@ fn run(
         }
     };
 
-    // **Asked, on the terminal** (2026-10-01, the maintainer's call): only `yes` goes ahead. Then
-    // the account (administration Part G.2). Nothing has been written, and nothing is until all of
-    // it is answered.
+    // Asked on the terminal: only `yes` goes ahead, then the account. Nothing has been written,
+    // and nothing is until all of it is answered.
     let Some(term) = terminal else {
         say("this installer asks before it writes, on a terminal, and was given none. Nothing was written.");
         refuse(&target.path(), "no terminal to ask on");
         return Outcome::NotInstalled;
     };
-    // **The plan and the question in one write** (PR #349 review). Sent to `stderr`, the plan
-    // reached the screen whenever the shell next drained it, and nothing ordered that against a
-    // question written to the terminal — the shape `with` met with "wrong password" landing under
-    // its next prompt. One channel and one write, so the plan is above the question it explains.
+    // The plan and the question in one write: sent to `stderr`, the plan could reach the screen
+    // after the question, with nothing ordering the two channels.
     let identity = target.name();
     let block = target.info.logical_block_size as u64;
     let question = format!(
@@ -993,8 +847,7 @@ fn run(
         human(layout.root_blocks() * block),
         target.path()
     );
-    // The receipt a gate waits for before it types the answer, since nothing reads a desktop
-    // terminal's grid — as each of the account's questions has one.
+    // The receipt a gate waits for before it types the answer: nothing reads a desktop terminal.
     log("asking to go ahead");
     let answer = libprompt::ask_line(term, question.as_bytes());
     if !answer.as_deref().is_some_and(nxinstall::confirmed) {
@@ -1019,7 +872,6 @@ fn run(
     libkern::scrub(&mut account.password);
     match installed {
         Ok(()) => {
-            // The disk flushed its cache before `install` returned, so this is true when said.
             note("done. Remove the installation medium and restart.");
             Outcome::Installed
         }
@@ -1044,7 +896,6 @@ pub unsafe extern "C" fn _start(notif: u64, namespace: u64, endpoint: u64, arg0:
             kprint(b"nxinstall: malformed setup message\n");
             exit(EXIT_FAILURE);
         }
-        // Spawned without a shell: no `argv`, so the only thing it can do is list.
         None => (Vec::new(), None, None, None),
     };
     // SAFETY: single-threaded, before anything can panic.
@@ -1052,17 +903,9 @@ pub unsafe extern "C" fn _start(notif: u64, namespace: u64, endpoint: u64, arg0:
     exit(run(namespace, &argv, stdout, stderr, terminal).status());
 }
 
-/// The `stderr` sink, kept for the panic handler.
-///
-/// **Because a panic here reached nobody.** The handler printed through `kprint`, which is
-/// `SYS_DEBUG_KPRINT` and so reaches COM1 and nothing else: on the machine this program is for
-/// there is no COM1, so an out-of-bounds index in `mkfs` showed up as `nxsh: pipeline failed:
-/// 'nxinstall' exited 1` under a screen of progress lines and nothing else at all (the second
-/// laptop install, 2026-09-17). A program whose every other word goes to the terminal has to
-/// say *this* there too — it is the one message where the alternative is a person guessing.
+/// The `stderr` sink for the panic handler: `kprint` reaches COM1 only, which the target lacks.
 static mut PANIC_SINK: u64 = 0;
 
-/// A panic message, built without allocating: the heap is the last thing to trust here.
 static mut PANIC_MSG: [u8; 4096] = [0; 4096];
 
 /// Nothing here is recoverable; say where it happened, on the terminal, and stop.
@@ -1083,7 +926,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             put(b" at ", &mut n);
             put(loc.file().as_bytes(), &mut n);
             put(b":", &mut n);
-            // The line number, without `format!`.
             let mut line = loc.line();
             let mut digits = [0u8; 10];
             let mut d = digits.len();
@@ -1107,8 +949,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     exit(EXIT_FAILURE);
 }
 
-/// Send one message on a channel without allocating — what the panic handler needs, where
-/// `IpcPort` would box a 4 KiB buffer.
+/// Send one message on a channel without allocating, for the panic handler.
 fn raw_send(channel: u64, payload: &[u8]) {
     const OFF_PAYLOAD_LEN: usize = 4;
     const OFF_PAYLOAD: usize = 24;
@@ -1134,5 +975,4 @@ fn raw_send(channel: u64, payload: &[u8]) {
     }
 }
 
-/// The panic handler's outgoing message.
 static mut RAW_MSG: [u8; 4096] = [0; 4096];

@@ -1,11 +1,9 @@
-//! **The new machine's own account** (administration Part G.2): what the copy leaves out of the
-//! pristine root, and what the installer writes in its place.
+//! **The new machine's own account**: what the copy leaves out of the pristine root, and what the
+//! installer writes in its place.
 //!
-//! In the lib rather than the program so a host test can hold the two halves to each other (PR
-//! #348 review). They are one contract — every path [`PASS_OVER`] names is one [`write`] fills —
-//! and a mistake in either is invisible to every gate CI runs: a pass-over list that lost `/home`
-//! would ship the build's demo home onto every installed machine, with no account to use it, and
-//! only the on-demand `check-install` would see it.
+//! In the lib so a host test can hold the two halves to each other: every path [`PASS_OVER`]
+//! names is one [`write`] fills. A pass-over list that lost `/home` would ship the build's demo
+//! home onto every installed machine, and only the on-demand `check-install` would see it.
 
 use alloc::format;
 use alloc::string::String;
@@ -15,20 +13,17 @@ use fs_server_ext4::{BlockReader, BlockWriter};
 
 use crate::copy;
 
-/// **What the copy leaves for the installer to write**: the build's accounts' homes — `/home` is
-/// made, empty — and its users and policy, which name the build's demo account. The new machine
-/// gets its own.
+/// What the copy leaves for the installer to write: `/home` (made empty), and the users and policy
+/// files, which name the build's demo account.
 pub const PASS_OVER: &[&[u8]] = &[b"/home", b"/system/users", b"/system/views.toml"];
 
-/// The user database's first lines, as the build writes them.
 const USERS_HEADER: &[u8] = b"# Nitrox user database (auth-service).\n# name:salt_hex:iterations:verifier_hex:home\n";
 
-/// **Write the account onto the new root**: `/system/users` with its one record under `salt`, the
-/// seeded policy naming it administrator, and `/home/<name>` with the three folders a home has
-/// (`libfs::HOME_FOLDERS`, as the view broker makes them for `account --add`).
+/// Write the account onto the new root: `/system/users` with its one record under `salt`, the
+/// seeded policy naming it administrator, and `/home/<name>` with `libfs::HOME_FOLDERS`.
 ///
-/// `name` must be one `libusers::valid_name` admits; the caller asked for it and checked it. The
-/// record's buffers go back to the heap scrubbed, since one holds a password's verifier.
+/// `name` must be one `libusers::valid_name` admits. The record's buffers are scrubbed before
+/// they go back to the heap, since one holds a password's verifier.
 pub fn write<D>(dst: &D, name: &[u8], password: &[u8], salt: &[u8], now: i64) -> Result<(), String>
 where
     D: BlockReader + BlockWriter,
@@ -63,7 +58,6 @@ mod tests {
     use core::cell::RefCell;
     use fs_server_ext4::{FsError, ext4, mkfs};
 
-    /// An in-memory disk, both halves of the traits the copy takes.
     struct Mem(RefCell<Vec<u8>>);
 
     impl BlockReader for Mem {
@@ -102,7 +96,6 @@ mod tests {
         disk
     }
 
-    /// The names in `dir`, sorted.
     fn names(fs: &Mem, dir: &[u8]) -> Vec<String> {
         let ino = ext4::resolve_dir(fs, dir).unwrap();
         let mut out = Vec::new();
@@ -124,7 +117,6 @@ mod tests {
         out
     }
 
-    /// The whole of the file at `path`.
     fn read(fs: &Mem, path: &[u8]) -> Vec<u8> {
         let size = ext4::stat_file(fs, path).unwrap();
         let mut buf = alloc::vec![0u8; size.div_ceil(4096) * 4096];
@@ -138,9 +130,8 @@ mod tests {
         buf
     }
 
-    /// **A pristine root as the build makes one**, in miniature: a program, the demo account's
-    /// home with a file in it, its record, the policy naming it, and a declaration the copy must
-    /// carry.
+    /// A pristine root in miniature: a program, the demo home, its record and policy, and a
+    /// declaration the copy must carry.
     fn pristine() -> Mem {
         let src = formatted(8);
         copy::put_dir(&src, b"/", b"bin", NOW).unwrap();
@@ -161,8 +152,6 @@ mod tests {
         src
     }
 
-    /// **The install's root holds the new account and nothing of the build's** — the copy and
-    /// the write run as the installer runs them, over the pass-over list it passes.
     #[test]
     fn an_installed_root_holds_its_own_account_alone() {
         let src = pristine();
@@ -170,13 +159,11 @@ mod tests {
         copy::copy_tree(&src, &dst, NOW, PASS_OVER, &mut |_| {}).unwrap();
         write(&dst, b"dana", b"a quiet password", &[9; 16], NOW).unwrap();
 
-        // The build's home is gone, and the new one has a home's folders.
         assert_eq!(names(&dst, b"/home"), ["dana"]);
         let mut folders: Vec<String> = libfs::HOME_FOLDERS.iter().map(|f| String::from(*f)).collect();
         folders.sort();
         assert_eq!(names(&dst, b"/home/dana"), folders);
 
-        // One record, the new account's, under the salt it was given.
         let users = read(&dst, b"/system/users");
         let records: Vec<_> = libusers::records(&users).collect();
         assert_eq!(records.len(), 1, "{}", String::from_utf8_lossy(&users));
@@ -184,10 +171,8 @@ mod tests {
         assert_eq!(records[0].home, b"/home/dana");
         assert_eq!(records[0].salt_hex, b"09090909090909090909090909090909");
 
-        // The policy is the seed, naming the new account.
         assert_eq!(read(&dst, b"/system/views.toml"), view_broker::policy::seed("dana").as_bytes());
 
-        // And everything else came across whole.
         assert_eq!(read(&dst, b"/bin/tool"), read(&src, b"/bin/tool"));
         assert_eq!(read(&dst, b"/system/services.toml"), b"# the services\n");
         assert_eq!(names(&dst, b"/system"), ["services.toml", "users", "views.toml"]);
