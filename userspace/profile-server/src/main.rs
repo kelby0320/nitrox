@@ -316,7 +316,8 @@ fn reply_dir_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
     // A directory handle is a live channel to the server; `content_len` is unused.
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
-    // SAFETY: REPLY_MSG is a valid buffer; the transferred handle goes in REPLY_HANDLES[0].
+    // SAFETY: REPLY_MSG is a valid buffer; the reply goes at PAYLOAD_OFF and the transferred handle
+    // in REPLY_HANDLES[0].
     unsafe {
         let rs_len = match encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body, 1) {
             Some(n) => n,

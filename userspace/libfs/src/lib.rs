@@ -53,7 +53,8 @@ pub const MAX_COPY: u64 = 8 * 1024 * 1024;
 pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
     let handle = lookup(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT).ok()?;
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
-    // SAFETY: `info` is a valid, correctly sized `HandleInfo` out-param.
+    // SAFETY: `info` is a valid, correctly sized `HandleInfo` out-param. (Never a
+    // hand-sized byte array — see the 2026-07-24 stack-smash entry in the decision log.)
     let r = unsafe { syscall2(SYS_HANDLE_STAT, handle, (&raw mut info) as u64) };
     // SAFETY: closing the handle we just resolved.
     unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
