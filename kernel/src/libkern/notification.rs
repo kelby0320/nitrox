@@ -1,23 +1,19 @@
-//! [`Notification`] — the structured async event the kernel delivers into a
-//! process's [`NotificationChannel`](crate::object::NotificationChannel).
+//! [`Notification`] — the structured async event the kernel delivers into a process's
+//! [`NotificationChannel`](crate::object::NotificationChannel).
 //!
-//! Nitrox has no Unix signals (`docs/rationale/why-no-signals.md`); instead the
-//! kernel enqueues `Notification`s and the process reads them with
-//! `sys_notif_recv`. The wire format (`docs/spec/notification-format.md`) is a
-//! **fixed 64-byte record**: a `u32` discriminant at offset 0 followed by a
-//! 60-byte little-endian variant body (shorter variants zero-padded).
+//! Nitrox has no Unix signals (`docs/rationale/why-no-signals.md`); the kernel enqueues
+//! `Notification`s and the process reads them with `sys_notif_recv`. The wire format
+//! (`docs/spec/notification-format.md`) is a **fixed 64-byte record**: a `u32` discriminant at
+//! offset 0 followed by a 60-byte little-endian variant body (shorter variants zero-padded).
 //!
-//! The kernel models this as a flat `{ kind, body }` byte record with typed
-//! constructors that write the spec field offsets — not a fieldful
-//! `#[repr(C, u32)]` enum. The flat form *is* the wire bytes (a single
-//! `copy_to_user` of 64 bytes, no per-variant marshalling), and userspace
-//! decodes by discriminant after the copy. This mirrors the `IoResult`
-//! precedent ([`crate::libkern::io_result`]).
+//! The kernel models this as a flat `{ kind, body }` byte record with typed constructors that
+//! write the spec field offsets, not a fieldful `#[repr(C, u32)]` enum: the flat form *is* the
+//! wire bytes (one `copy_to_user` of 64 bytes), and userspace decodes by discriminant after
+//! the copy.
 //!
-//! ABI: the layout is part of the kernel ABI version hash
-//! (`docs/spec/abi-version-hash.md` § "Notification enum layout"). The hash is
-//! not yet computed in code, so nothing is enforced today — but the field
-//! offsets here are a contract; the compile-time asserts pin them.
+//! ABI: the layout is part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`
+//! § "Notification enum layout"). The hash is not yet computed in code, so the compile-time
+//! asserts are what pins the field offsets.
 
 /// Forward-compat fallback: a discriminant the recipient's ABI doesn't know.
 pub const KIND_UNKNOWN: u32 = 0x0000;
@@ -29,28 +25,26 @@ pub const KIND_ILLEGAL_INSN: u32 = 0x0101;
 pub const KIND_DIVIDE_BY_ZERO: u32 = 0x0102;
 /// Hardware exception: stack overflow.
 pub const KIND_STACK_OVERFLOW: u32 = 0x0103;
-/// Process lifecycle: a child process exited. Carries the child's **pid** and its
-/// exit status; the pid is not matchable to a process handle, which is why a
-/// supervisor with several children discriminates on their control channels
-/// instead — see `TODO(child-exit-attribution)`.
+/// Process lifecycle: a child process exited. Carries the child's **pid** and its exit
+/// status; the pid is not matchable to a process handle, which is why a supervisor with
+/// several children discriminates on their control channels instead — see
+/// `TODO(child-exit-attribution)`.
 pub const KIND_CHILD_EXITED: u32 = 0x0200;
 /// Process lifecycle: an IPC peer closed.
 ///
-/// **Declared, specified, and never emitted.** `notification-format.md` gives it a
-/// body (`PeerClosed { handle }`), and nothing in the kernel constructs one: a dead
-/// peer is observed instead by `sys_channel_recv` answering
-/// [`PeerClosed`](crate::syscall::error::KError::PeerClosed), and a waiter is woken
-/// for it by `sched::ipc_endpoint_closing`. Kept because that is the discriminant a
-/// producer would use, and removing it would renumber the ABI for nothing.
+/// **Declared, specified, and never emitted.** `notification-format.md` gives it a body
+/// (`PeerClosed { handle }`), and nothing in the kernel constructs one: a dead peer is
+/// observed instead by `sys_channel_recv` answering
+/// [`PeerClosed`](crate::syscall::error::KError::PeerClosed), and a waiter is woken for it by
+/// `sched::ipc_endpoint_closing`. Kept because it is the discriminant a producer would use,
+/// and removing it would renumber the ABI for nothing.
 pub const KIND_PEER_CLOSED: u32 = 0x0201;
-/// `TerminateRequested {}` — a holder of this process's handle has **asked it to
-/// exit** (§11h).
+/// `TerminateRequested {}` — a holder of this process's handle has **asked it to exit**.
 ///
-/// A request, not an act: the kernel delivers it and does nothing else. There is no
-/// forcible kill in this system, so a process that does not listen keeps running — which
-/// is a stated property rather than a gap. Cooperative shutdown is what the no-signals
-/// design has instead of `SIGTERM`, and the notification queue is where async events
-/// already arrive.
+/// A request, not an act: the kernel delivers it and does nothing else. There is no forcible
+/// kill in this system, so a process that does not listen keeps running — a stated property
+/// rather than a gap. Cooperative shutdown is what the no-signals design has instead of
+/// `SIGTERM`.
 pub const KIND_TERMINATE_REQUESTED: u32 = 0x0202;
 
 /// A handle this process holds was invalidated.
@@ -58,8 +52,8 @@ pub const KIND_HANDLE_INVALIDATED: u32 = 0x0400;
 /// Resource: notifications were dropped due to queue overflow (synthetic).
 pub const KIND_NOTIFICATIONS_DROPPED: u32 = 0x0401;
 
-/// Inclusive-exclusive bounds of the hardware-exception category (`0x0100`
-/// range). Exception notifications get priority on overflow.
+/// Inclusive-exclusive bounds of the hardware-exception category (`0x0100` range).
+/// Exception notifications get priority on overflow.
 const EXCEPTION_LO: u32 = 0x0100;
 const EXCEPTION_HI: u32 = 0x0200;
 
@@ -69,16 +63,19 @@ const EXCEPTION_HI: u32 = 0x0200;
 pub enum FaultKind {
     /// Page not present.
     NotMapped = 0,
+    /// Page present but not readable.
     NotReadable = 1,
+    /// Page present but not writable.
     NotWritable = 2,
     /// Instruction fetch from a no-execute page.
     NotExecutable = 3,
+    /// Misaligned access.
     Misaligned = 4,
+    /// A fault the kernel could not classify.
     UnknownFault = 0xFFFF_FFFF,
 }
 
-/// How a process/thread ended (the `kind` of an [`ExitStatus`]). Producer lands
-/// with process spawn; defined here for the `ChildExited` ABI.
+/// How a process/thread ended (the `kind` of an [`ExitStatus`]); the `ChildExited` ABI.
 #[repr(u32)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ExitKind {
@@ -94,12 +91,14 @@ pub enum ExitKind {
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct ExitStatus {
+    /// An [`ExitKind`] discriminant.
     pub kind: u32,
+    /// The exit code, or the fault kind for a crash.
     pub code: i32,
 }
 
-/// One 64-byte notification record. `#[repr(C, align(8))]` so `u64` body fields
-/// land naturally aligned at their spec offsets.
+/// One 64-byte notification record. `#[repr(C, align(8))]` so `u64` body fields land
+/// naturally aligned at their spec offsets.
 #[repr(C, align(8))]
 #[derive(Copy, Clone)]
 pub struct Notification {
@@ -123,22 +122,21 @@ impl Notification {
         self.kind
     }
 
-    /// `true` iff this is a hardware-exception notification (`0x0100` range) —
-    /// the category that gets priority on queue overflow.
+    /// `true` iff this is a hardware-exception notification (`0x0100` range) — the category
+    /// that gets priority on queue overflow.
     pub fn is_exception(&self) -> bool {
         (EXCEPTION_LO..EXCEPTION_HI).contains(&self.kind)
     }
 
-    /// The fault address — `addr` at body+4 — for an exception notification
-    /// (`seg_fault`/`illegal_insn`/`divide_by_zero` all store it there). For a
-    /// `#PF` this is the faulting linear address (CR2); for `#UD`/`#DE` the faulting
-    /// instruction pointer. Only meaningful when [`is_exception`](Self::is_exception).
+    /// The fault address — `addr` at body+4 — for an exception notification. For a `#PF` this
+    /// is the faulting linear address (CR2); for `#UD`/`#DE` the faulting instruction pointer.
+    /// Only meaningful when [`is_exception`](Self::is_exception).
     pub fn fault_addr(&self) -> u64 {
         u64::from_le_bytes(self.body[4..12].try_into().unwrap())
     }
 
-    /// `SegFault { thread, addr, kind }` — `thread` at body+0, `addr` at body+4,
-    /// `kind` at body+12 (per the spec).
+    /// `SegFault { thread, addr, kind }` — `thread` at body+0, `addr` at body+4, `kind` at
+    /// body+12 (per the spec).
     pub fn seg_fault(thread: u32, addr: u64, fault: FaultKind) -> Self {
         let mut n = Self::zeroed(KIND_SEG_FAULT);
         n.body[0..4].copy_from_slice(&thread.to_le_bytes());
@@ -163,9 +161,8 @@ impl Notification {
         n
     }
 
-    /// `ChildExited { child, status }` — `child` (pid) at body+0, `status.kind`
-    /// at body+4, `status.code` at body+8 (per the spec). Delivered to the
-    /// parent's notification channel when a child process exits.
+    /// `ChildExited { child, status }` — `child` (pid) at body+0, `status.kind` at body+4,
+    /// `status.code` at body+8 (per the spec).
     pub fn child_exited(child: u32, status: ExitStatus) -> Self {
         let mut n = Self::zeroed(KIND_CHILD_EXITED);
         n.body[0..4].copy_from_slice(&child.to_le_bytes());
@@ -174,8 +171,8 @@ impl Notification {
         n
     }
 
-    /// `TerminateRequested {}` — no body: the request carries no argument, and the
-    /// *reason* is the requester's business, not the kernel's.
+    /// `TerminateRequested {}` — no body: the *reason* is the requester's business, not the
+    /// kernel's.
     pub fn terminate_requested() -> Self {
         Self::zeroed(KIND_TERMINATE_REQUESTED)
     }
@@ -212,13 +209,9 @@ mod tests {
     fn seg_fault_writes_spec_offsets() {
         let n = Notification::seg_fault(7, 0xDEAD_BEEF, FaultKind::NotWritable);
         let b = n.as_bytes();
-        // kind @0 (overall) = 0x0100.
         assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), KIND_SEG_FAULT);
-        // thread @ body+0 (overall +4).
         assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 7);
-        // addr @ body+4 (overall +8).
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 0xDEAD_BEEF);
-        // kind (FaultKind) @ body+12 (overall +16).
         assert_eq!(u32::from_le_bytes(b[16..20].try_into().unwrap()), FaultKind::NotWritable as u32);
     }
 
@@ -237,11 +230,8 @@ mod tests {
         let n = Notification::child_exited(42, ExitStatus { kind: ExitKind::Crashed as u32, code: -7 });
         let b = n.as_bytes();
         assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), KIND_CHILD_EXITED);
-        // child pid @ body+0 (overall +4).
         assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 42);
-        // status.kind @ body+4 (overall +8).
         assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), ExitKind::Crashed as u32);
-        // status.code @ body+8 (overall +12).
         assert_eq!(i32::from_le_bytes(b[12..16].try_into().unwrap()), -7);
         assert!(!n.is_exception());
     }
@@ -263,17 +253,13 @@ mod tests {
         assert!(!Notification::zeroed(KIND_NOTIFICATIONS_DROPPED).is_exception());
     }
 
-    /// §11h: a request carries no argument — the *reason* is the requester's business,
-    /// not the kernel's, and there is nothing for a target to interpret beyond "you were
-    /// asked".
+    /// A request carries no argument — the *reason* is the requester's business.
     #[test]
     fn terminate_requested_is_a_bare_kind() {
         let n = Notification::terminate_requested();
         assert_eq!(n.kind(), KIND_TERMINATE_REQUESTED);
         assert!(n.body.iter().all(|b| *b == 0), "the request carries no body");
-        // It is not a fault, so nothing on the exception path should pick it up.
         assert!(!n.is_exception());
-        // And it is distinct from every other kind a process may already be handling.
         for other in
             [KIND_CHILD_EXITED, KIND_PEER_CLOSED, KIND_HANDLE_INVALIDATED, KIND_NOTIFICATIONS_DROPPED, KIND_SEG_FAULT]
         {

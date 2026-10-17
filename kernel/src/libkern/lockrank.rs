@@ -1,119 +1,74 @@
 //! Lock ranks, and the debug-build tracker that enforces them.
 //!
-//! `kernel/docs/lock-ordering.md` defines a total order over every long-lived lock: a
-//! lock may only be taken while holding locks of *strictly higher* rank (smaller number).
-//! Until now that order was "enforced by code review", and three deadlocks (F1, F2, F12 —
-//! decision log 2026-07-21) got through it, each found by hand or by bisecting a boot loop
-//! that hung one time in three. This turns that class of bug into an immediate, located
-//! panic naming both locks.
-//!
-//! ## What is checked
-//!
-//! On acquire, the new lock's rank must be **strictly greater** than every rank held *in
-//! the current interrupt scope*. That single rule catches inversions (taking a high-ranked
-//! lock under a low-ranked one) *and* same-rank nesting, which the ordering document
-//! forbids separately. The document also claims one same-rank exception exists but never
-//! names it; both places it discusses nesting say "never nested". So the rule is enforced
-//! without an exception, and if a legitimate one exists the tracker will find it rather
-//! than the next reader having to.
+//! `kernel/docs/lock-ordering.md` defines a total order over every long-lived lock: a lock may
+//! only be taken while holding locks of *strictly higher* rank (smaller number). On acquire the
+//! new lock's rank must be **strictly greater** than every rank held *in the current interrupt
+//! scope*; that catches inversions and same-rank nesting, with no same-rank exception.
 //!
 //! ### Only an acquisition that waits is ordered
 //!
-//! **A `try_lock` is recorded but not checked** ([`Taken::WithoutWaiting`]). A deadlock is a
-//! cycle of threads each *waiting* for a lock another holds, and a `try_lock` never waits — it
-//! takes a free lock or gives up — so it can never be an edge of that cycle, however it sits
-//! against the order. Every edge is a `lock()`, and every `lock()` is checked against
-//! everything held, `try_lock` holds included: taking `A` without waiting and then waiting for
-//! `B` below it is still reported, at the wait, which is where the deadlock would be. Linux's
-//! lockdep draws the same line and adds no dependency for a trylock.
+//! **A `try_lock` is recorded but not checked** ([`Taken::WithoutWaiting`]): a deadlock is a
+//! cycle of threads each *waiting*, and a `try_lock` never waits. Every `lock()` is checked
+//! against everything held, `try_lock` holds included, so taking `A` without waiting and then
+//! waiting for `B` below it is reported at the wait.
 //!
-//! **The rule keys on the call, so it is only as good as the call's honesty.** A `try_lock`
-//! retried in a loop *is* waiting, and the tracker cannot tell. A bounded retry that gives up —
-//! `fbcon::with_console`, the one there is — can delay but not deadlock, so it may stay a
-//! `try_lock`. An unbounded one must be a `lock()`, or it takes itself out of the ordering check
-//! while doing exactly what the check exists for (PR #296 review).
+//! **The rule keys on the call.** A `try_lock` retried in a loop *is* waiting, and the tracker
+//! cannot tell: a bounded retry that gives up (`fbcon::with_console`) can delay but not
+//! deadlock; an unbounded one must be a `lock()`.
 //!
-//! Checking them anyway was not merely conservative. The panic and fault paths tee into the
-//! log ring and the framebuffer console with `try_lock`, from whatever context faulted, so a
-//! panic raised while holding a `Leaf` lock reported `lock-order violation: acquiring Klog
-//! (rank 72) while holding Leaf (rank 90)` in place of its own message — every driver panic
-//! under its lock lost its diagnosis to a report about the diagnosis being printed (found
-//! 2026-09-14, by the framebuffer console's gate). The shootdown lock's contract still applies
-//! to both kinds of acquisition: its hazard is holding other locks while it spins, not waiting
-//! to take it.
+//! Checking `try_lock` would break the panic path, which tees into the log ring and the
+//! framebuffer console with `try_lock` from whatever context faulted: a panic under a `Leaf`
+//! lock reported `lock-order violation: acquiring Klog (rank 72) while holding Leaf (rank 90)`
+//! in place of its own message. The shootdown lock's contract still binds both kinds of
+//! acquisition: its hazard is holding other locks while it spins.
 //!
 //! ## Interrupt scopes
 //!
-//! **The acquisition order restarts at every interrupt entry**, and modelling that is not
-//! optional — it is what makes the tracker sound at all. A plain [`SpinLock`] is held with
-//! interrupts *enabled*, so a timer tick or an IPI routinely lands on a thread holding, say,
-//! `Buddy` or `HandleTable`, and the handler legitimately takes `SCHED`. Ranked flat that
-//! reads as an inversion, and it is not one: the handler releases everything it takes before
-//! the interrupted section resumes, so the two nestings never actually interleave.
+//! **The acquisition order restarts at every interrupt entry**; the tracker is unsound without
+//! it. A plain [`SpinLock`] is held with interrupts *enabled*, so a timer tick or an IPI
+//! routinely lands on a thread holding, say, `Buddy` or `HandleTable`, and the handler
+//! legitimately takes `SCHED` (the *top* rank). The handler releases everything it takes before
+//! the interrupted section resumes, so the two nestings never interleave.
 //!
 //! [`SpinLock`]: crate::libkern::SpinLock
 //!
-//! So each CPU keeps a **floor** alongside its held-rank stack. [`enter_interrupt`] raises
-//! the floor to the current depth and its guard lowers it again at the handler's return;
-//! the ordering check only looks at entries at or above the floor. A handler therefore
-//! starts from an empty view and is checked in full against *its own* acquisitions, while
-//! the interrupted context's holds stay recorded (and stay enforced once it resumes).
+//! Each CPU keeps a **floor** alongside its held-rank stack. [`enter_interrupt`] raises it to
+//! the current depth and its guard lowers it at the handler's return; the check only looks at
+//! entries at or above the floor. A handler starts from an empty view and is checked in full
+//! against *its own* acquisitions, while the interrupted context's holds stay recorded (and
+//! enforced once it resumes).
 //!
-//! This was the reason the first attempt at this tracker was withdrawn from the Slice D PR
-//! (decision log 2026-07-29): it ranked interrupt-side locks at the bottom of a single flat
-//! order and hoped that covered it. It does not — `SCHED` is the *top* rank and an interrupt
-//! handler is exactly the thing that takes it under anything.
-//!
-//! Every interrupt entry must open a scope. Missing one does not fail loudly, it just
-//! reports phantom inversions from that vector, so the entry points do not rely on anyone
-//! remembering: the `irq_dispatcher!` macro in `arch/x86_64/idt.rs` is the only way to
-//! define an interrupt dispatcher, it opens the scope itself, and `cargo xtask
-//! check-irq-scope` fails the build if a naked entry stub calls anything else.
+//! Every interrupt entry must open a scope; missing one reports phantom inversions from that
+//! vector. The `irq_dispatcher!` macro in `arch/x86_64/idt.rs` is the only way to define an
+//! interrupt dispatcher and opens the scope itself, and `cargo xtask check-irq-scope` fails the
+//! build if a naked entry stub calls anything else.
 //!
 //! ## Per-CPU, not per-thread
 //!
-//! The held-rank stack is per-CPU, which is sound because a lock holder cannot migrate: a
-//! plain `SpinLock` section is a no-preemption region (the F12 fix) and an `IrqSpinLock`
-//! masks interrupts. So whatever this CPU holds, this thread holds.
+//! The held-rank stack is per-CPU, which is sound because a lock holder cannot migrate: a plain
+//! `SpinLock` section is a no-preemption region and an `IrqSpinLock` masks interrupts. A context
+//! switch moves threads between CPUs underneath the per-CPU state, so a thread may only be
+//! switched away with **nothing held and no scope open** (blocking with a lock held is
+//! forbidden). [`assert_switch_safe`] checks it at the one choke point every switch passes
+//! through ([`crate::sched::switch_into`]).
 //!
-//! The place that could break it is a context switch, which moves threads between CPUs
-//! underneath the per-CPU state. It does not break it, because a thread can only be
-//! switched away with **nothing held and no scope open** — a plain-lock holder has
-//! preemption disabled, an `IrqSpinLock` holder has interrupts masked, and blocking with a
-//! lock held is forbidden outright. That is a precondition rather than a hope, so
-//! [`assert_switch_safe`] checks it at the one choke point every switch passes through
-//! ([`crate::sched::switch_into`]). If it ever fires, the per-CPU model has stopped
-//! holding and the tracker says so instead of quietly corrupting.
+//! ## Cost, and not under host `cfg(test)`
 //!
-//! ## Cost and safety
+//! Debug builds only (`cfg(debug_assertions)`). The tracker takes no lock and allocates nothing
+//! (it would deadlock against what it instruments): a fixed per-CPU array of atomics, mirroring
+//! `sched`'s `PREEMPT_OFF`. It is also compiled out for host unit tests, as a correctness
+//! requirement: `cargo test` runs tests on **many OS threads**, all reporting the same
+//! `current_cpu()`, so the per-CPU stack would be shared by unrelated threads and read as
+//! inversions.
 //!
-//! Debug builds only (`cfg(debug_assertions)`) — a release kernel compiles this away
-//! entirely, so there is no production cost to argue about. The tracker itself takes no
-//! lock and allocates nothing (it would deadlock against the very thing it instruments):
-//! it is a fixed per-CPU array of atomics, mirroring `sched`'s `PREEMPT_OFF`.
-//!
-//! ## Not under host `cfg(test)`
-//!
-//! Also compiled out for the host unit tests, and this is a correctness requirement, not a
-//! cost saving. `cargo test` runs test functions on **many OS threads**, all of which
-//! report the same `current_cpu()` — so a per-CPU stack becomes a stack shared by
-//! unrelated threads, and two of them legitimately holding unrelated locks reads as an
-//! inversion. (Found the direct way: wiring this up hung the host suite with two test
-//! binaries spinning at >800 % CPU.) The per-CPU model is sound only where a holder cannot
-//! migrate, which is a property of the real kernel's no-preemption regions and interrupt
-//! masking — neither of which exists in a hosted test process.
-//!
-//! The scope arithmetic itself does not depend on any of that, so it is unit-tested
-//! host-side: the *rule* through [`classify`], which the tracker itself calls, and the
-//! *bookkeeping* against a plain local state struct — see the tests at the bottom.
+//! The *rule* is unit-tested host-side through [`classify`], which the tracker calls; the
+//! *bookkeeping* against a plain local state struct (see the tests at the bottom).
 
 /// Where a lock sits in the acquisition order. **Smaller is acquired first** — a lock may
 /// only be taken while every rank already held is strictly smaller.
 ///
-/// The numbering is sparse on purpose, so a new lock can be slotted between two existing
-/// ranks without renumbering (and without the renumbering silently changing an unrelated
-/// pair's relative order). Mirrors the table in `kernel/docs/lock-ordering.md`; the two
-/// are meant to be read together.
+/// The numbering is sparse so a new lock can be slotted between two existing ranks without
+/// renumbering. Mirrors the table in `kernel/docs/lock-ordering.md`; read them together.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(u8)]
 pub enum LockRank {
@@ -127,8 +82,7 @@ pub enum LockRank {
     /// Rank 5 — subsystem registries that **allocate while held**: the PCI device table
     /// (`DEVICES`), the GPT partition table (`PARTITIONS`). They push or reserve a `KVec`
     /// inside their critical section, so they must rank *above* the allocators; they are
-    /// not leaves, however much they look like one. Taken top-level (nothing else held)
-    /// and never from interrupt context, so ranking them here costs nothing.
+    /// not leaves. Taken top-level and never from interrupt context.
     Registry = 50,
     /// Rank 6a — a slab cache's free list. Above the buddy because a slab refill calls
     /// into it.
@@ -142,30 +96,23 @@ pub enum LockRank {
     /// Rank 7 — the serial port.
     Serial = 70,
     /// Below the serial port: the kernel log ring, teed from inside the serial
-    /// `write_str` **while `SERIAL` is held**, which is what fixes it here rather than
-    /// among the leaves. (It uses `try_lock` for a different reason — re-entry from a
-    /// fault that strikes mid-push.)
+    /// `write_str` **while `SERIAL` is held**, which fixes its rank here rather than among the
+    /// leaves. (Its `try_lock` is for re-entry from a fault that strikes mid-push.)
     Klog = 72,
-    /// Below the log ring, for the same reason it is below the serial port: the framebuffer
-    /// console (`crate::fbcon`) is teed from the serial `write_str` with `SERIAL` held, after
-    /// `KLOG` has been released. Its `try_lock` is for faults that strike mid-paint, as the
-    /// log ring's is for faults mid-push.
+    /// Below the log ring, as it is below the serial port: the framebuffer console
+    /// (`crate::fbcon`) is teed from the serial `write_str` with `SERIAL` held, after `KLOG` has
+    /// been released. Its `try_lock` is for faults that strike mid-paint.
     Fbcon = 74,
-    /// The TLB-shootdown serialiser (`tlb::LOCK`), which is held with **interrupts
-    /// enabled** — the F1 fix (decision log 2026-07-21): an initiator spinning for
-    /// acknowledgements must keep taking incoming shootdown IPIs, or two initiators
-    /// deadlock.
+    /// The TLB-shootdown serialiser (`tlb::LOCK`), held with **interrupts enabled**: an
+    /// initiator spinning for acknowledgements must keep taking incoming shootdown IPIs, or two
+    /// initiators deadlock (`kernel/docs/lock-ordering.md` § F1).
     ///
-    /// That property is why the first tracker had to exempt this lock from ordering
-    /// altogether: interrupt work runs beneath it (a DPC drain at an interrupt tail, a
-    /// timer tick taking `SCHED`) and no single number can express "the order restarts
-    /// here". Interrupt scopes express it directly, so the exemption is gone and this is an
-    /// ordinary rank — the interrupt work beneath it is checked in its own scope, and the
-    /// lock is checked in the initiator's.
+    /// Interrupt work runs beneath it (a DPC drain at an interrupt tail, a timer tick taking
+    /// `SCHED`); interrupt scopes check that work in its own scope and the lock in the
+    /// initiator's.
     ///
     /// It also carries a stricter contract the ranking alone would not catch: the caller
-    /// must hold **no other lock** when taking it (see `kernel/docs/lock-ordering.md` § F1).
-    /// [`acquired`] checks that separately.
+    /// must hold **no other lock** when taking it. [`acquired`] checks that separately.
     TlbShootdown = 85,
     /// Interrupt-side and bottom-of-order locks, taking nothing while held: the DPC queue,
     /// the entropy pool, the console input buffer, the AHCI pending ring, the completed-IRP
@@ -203,11 +150,8 @@ pub enum Acquisition {
 /// The acquisition decision, as a function of its inputs.
 ///
 /// **Split out so the host tests exercise the tracker's own logic rather than a
-/// reimplementation of it.** They used to reproduce the arithmetic over a local struct —
-/// a sound trade, since the real tracker's per-CPU state is invalid on the host, but it
-/// meant any drift between the two was invisible. The drift was not hypothetical: the copy
-/// never had the `ContractBroken` branch at all, so the one rule the rank order cannot
-/// express had no test on either side (found by the kernel audit, 2026-08-14).
+/// reimplementation of it** — a copy had silently lost the `ContractBroken` branch, so the
+/// one rule the rank order cannot express had no test.
 ///
 /// `held` is the scope's slice — entries below the floor belong to an interrupted context
 /// and are not the caller's to violate. `taken` is how the lock was acquired: only a
@@ -227,8 +171,8 @@ pub fn classify(rank: LockRank, held: &[u8], taken: Taken) -> Acquisition {
     Acquisition::Ok
 }
 
-/// Debug-build enforcement. Compiled out in release builds, and in host unit tests (see
-/// the module docs — the per-CPU model does not hold there).
+/// Debug-build enforcement. Compiled out in release builds, and in host unit tests (the
+/// per-CPU model does not hold there).
 #[cfg(all(debug_assertions, not(test)))]
 pub use tracker::{IrqScope, acquired, assert_switch_safe, assert_user_entry_safe, enter_interrupt, releasing};
 
@@ -267,14 +211,10 @@ mod tracker {
     use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
     /// Mask interrupts across a tracker update, returning the prior state.
-    ///
     /// The per-CPU depth is a **read-modify-write**, and a plain `SpinLock` acquire leaves
-    /// interrupts *enabled* (only `preempt_disable` has run, which stops migration, not
-    /// interruption). An IRQ landing between the read and the write does its own
-    /// acquire/release, and the outer write then clobbers the depth with a stale value —
-    /// corrupting the stack and producing phantom violations from then on. `sched`'s
-    /// `preempt_disable` masks around its counter for exactly this reason; this is the
-    /// same hazard on a different counter.
+    /// interrupts *enabled* (`preempt_disable` stops migration, not interruption). An IRQ
+    /// landing between the read and the write does its own acquire/release, and the outer
+    /// write then clobbers the depth with a stale value, corrupting the stack.
     #[inline]
     fn mask() -> bool {
         // SAFETY: ring-0; the window is a handful of instructions, restored below.
@@ -287,9 +227,8 @@ mod tracker {
         unsafe { Cpu::interrupts_restore(prev) };
     }
 
-    /// Deepest lock nesting the tracker records per CPU. Overflow is not a violation —
-    /// the tracker stops recording past this and says so — so a legitimately deep path
-    /// degrades to "unchecked" rather than to a false panic.
+    /// Deepest lock nesting the tracker records per CPU. Past this it stops recording rather
+    /// than panicking, so a legitimately deep path degrades to "unchecked".
     const MAX_HELD: usize = 8;
 
     /// Ranks currently held on each CPU, innermost last.
@@ -318,8 +257,8 @@ mod tracker {
     fn this_cpu() -> usize {
         use crate::arch::smp::ArchSmp;
         let c = crate::arch::Smp::current_cpu() as usize;
-        // Defensive: an out-of-range id (very early boot, before SMP is up) must not
-        // index out of bounds. Fold it onto CPU 0, which is where that code runs.
+        // Out of range (very early boot, before SMP is up) folds onto CPU 0, where that code
+        // runs.
         if c < MAX_CPUS { c } else { 0 }
     }
 
@@ -334,13 +273,10 @@ mod tracker {
         let cpu = this_cpu();
         let floor = FLOOR[cpu].load(Ordering::Relaxed);
         let depth = DEPTH[cpu].load(Ordering::Relaxed);
-        // Check against everything held **in this interrupt scope** — entries below the
-        // floor belong to a context this handler interrupted and will not resume until the
-        // handler has released everything it took. Find the violation under the mask but
-        // report outside it: `report` panics, and the panic path prints.
-        // Snapshot the scope, then decide with `super::classify` — the same function the
-        // host tests call, so the rule cannot drift away from its coverage. Eight bytes
-        // under the mask; the decision itself is pure.
+        // Check against everything held **in this interrupt scope**: entries below the floor
+        // belong to a context this handler interrupted. Decide with `super::classify`, the same
+        // function the host tests call; find the violation under the mask but report outside it,
+        // because `report` panics and the panic path prints.
         let mut scope = [0u8; MAX_HELD];
         let n = depth.min(MAX_HELD).saturating_sub(floor);
         for k in 0..n {
@@ -374,9 +310,8 @@ mod tracker {
         let irq = mask();
         let cpu = this_cpu();
         let depth = DEPTH[cpu].load(Ordering::Relaxed);
-        // Never pop below the floor: those entries belong to the interrupted context, and
-        // an unbalanced release inside a handler must not eat them. `depth == 0` is the
-        // same case at the outermost scope (a lock acquired before the tracker saw this
+        // Never pop below the floor: those entries belong to the interrupted context. `depth == 0`
+        // is the same case at the outermost scope (a lock acquired before the tracker saw this
         // CPU).
         if depth > FLOOR[cpu].load(Ordering::Relaxed) {
             let depth = depth - 1;
@@ -389,15 +324,12 @@ mod tracker {
     }
 
     /// Open a fresh lock-ordering scope for an interrupt handler: ranks held by the
-    /// interrupted context stay recorded but stop being checked against, so a handler is
-    /// ordered against its own acquisitions only. The guard restores the previous scope.
+    /// interrupted context stay recorded but stop being checked against. The guard restores
+    /// the previous scope.
     ///
-    /// Called at every interrupt entry — see the module docs § Interrupt scopes for why
-    /// that is mandatory rather than an optimisation, and `irq_dispatcher!` in
-    /// `arch/x86_64/idt.rs` for how "every" is enforced.
-    ///
-    /// Interrupts are already masked here (the IDT gate clears `IF` and no dispatcher
-    /// re-enables), so the update needs no mask of its own.
+    /// Called at every interrupt entry (module docs § Interrupt scopes; `irq_dispatcher!` in
+    /// `arch/x86_64/idt.rs` enforces "every"). Interrupts are already masked here (the IDT gate
+    /// clears `IF` and no dispatcher re-enables), so the update needs no mask of its own.
     #[must_use = "the scope is restored when the guard drops; dropping it immediately \
                   leaves the handler checked against the interrupted context"]
     pub fn enter_interrupt() -> IrqScope {
@@ -418,10 +350,9 @@ mod tracker {
     impl Drop for IrqScope {
         fn drop(&mut self) {
             // Re-read the CPU rather than caching it at entry: a handler that reschedules
-            // (the timer tail, a device-IRQ completion) can resume on a *different* CPU.
-            // That is only consistent because a switch requires an empty stack and no open
-            // scope on both ends — `assert_switch_safe` enforces exactly that, so both the
-            // saved floor and the entry depth are zero whenever this can happen.
+            // (the timer tail, a device-IRQ completion) can resume on a *different* CPU. That is
+            // consistent because a switch requires an empty stack and no open scope on both ends
+            // (`assert_switch_safe`), so the saved floor and entry depth are then zero.
             let cpu = this_cpu();
             let depth = DEPTH[cpu].load(Ordering::Relaxed);
             if depth != self.entry_depth {
@@ -432,28 +363,26 @@ mod tracker {
     }
 
     /// Assert that this CPU is safe to context-switch on: nothing held, no interrupt scope
-    /// open. Called from [`crate::sched::switch_into`] once `SCHED` has been released, the
-    /// single point every context switch passes through.
+    /// open. Called from [`crate::sched::switch_into`] once `SCHED` has been released.
     ///
     /// This is the per-CPU model's soundness precondition (module docs § Per-CPU, not
-    /// per-thread). Checking it is what lets the rest of the tracker treat "this CPU holds"
-    /// and "this thread holds" as the same statement.
+    /// per-thread): it lets the tracker treat "this CPU holds" and "this thread holds" as the
+    /// same statement.
     pub fn assert_switch_safe() {
         assert_empty(Site::ContextSwitch);
     }
 
     /// Assert that this CPU holds nothing as a thread enters the kernel from ring 3.
     ///
-    /// A `syscall` is **not** an interrupt and gets no scope: the acquisition order does not
-    /// restart here, it *begins* — the calling thread was in user mode, so it can hold no
-    /// kernel lock. That makes the boundary a free, exact statement of ground truth, and
-    /// therefore the best place to notice an unbalanced acquire/release that would otherwise
-    /// accumulate silently and misattribute itself to some later, innocent acquire.
+    /// A `syscall` is **not** an interrupt and gets no scope: the acquisition order *begins*
+    /// here, since the caller was in user mode and can hold no kernel lock. An unbalanced
+    /// acquire/release would otherwise accumulate silently and misattribute itself to a later,
+    /// innocent acquire.
     pub fn assert_user_entry_safe() {
         assert_empty(Site::UserEntry);
     }
 
-    /// Which boundary [`assert_empty`] is checking — only used to word the report.
+    /// Which boundary [`assert_empty`] is checking; only used to word the report.
     #[derive(Copy, Clone)]
     enum Site {
         ContextSwitch,
@@ -469,8 +398,7 @@ mod tracker {
         }
     }
 
-    /// Name a rank for the report. A bare number sends the reader to a table; the name
-    /// usually identifies the lock outright.
+    /// Name a rank for the report; the name usually identifies the lock outright.
     fn rank_name(rank: u8) -> &'static str {
         match rank {
             10 => "Sched",
@@ -490,16 +418,15 @@ mod tracker {
         }
     }
 
-    /// Latch the first report. A violation panic prints, which takes `SERIAL` — and the
-    /// panic path may itself acquire locks. A second caller simply returns: the first panic
-    /// is already tearing the kernel down, and spinning here instead would replace a
-    /// diagnosable panic with a hang.
+    /// Latch the first report. A violation panic prints, which takes `SERIAL`, and the panic
+    /// path may itself acquire locks. A second caller returns: the first panic is already
+    /// tearing the kernel down, and spinning would replace a diagnosable panic with a hang.
     fn latch() -> bool {
         REPORTING.swap(1, Ordering::SeqCst) == 0
     }
 
-    /// Report the shootdown lock taken with something already held — a breach of its caller
-    /// contract rather than of the rank order, hence its own message.
+    /// Report the shootdown lock taken with something already held: a breach of its caller
+    /// contract rather than of the rank order.
     #[cold]
     #[inline(never)]
     fn report_contract(held: u8) {
@@ -570,23 +497,10 @@ mod tracker {
     }
 }
 
-/// Host tests for the scope arithmetic.
-///
-/// The *tracker* is compiled out under `cfg(test)` (module docs § Not under host
-/// `cfg(test)`) because its per-CPU state is invalid there. What that costs, and what it
-/// does not, is worth being exact about — the distinction is the reason for [`classify`]:
-///
-/// - **The rule** — what an acquisition means given what is held — is [`classify`], and the
-///   tests below call **that function**, the same one the tracker calls. It is not
-///   reimplemented here.
-/// - **The bookkeeping** — the stack, the depth, the floor — is the part that genuinely
-///   cannot run on the host, so `State` below models it over a plain local struct with no
-///   atomics, no CPU index and no interrupt masking.
-///
-/// It used to reproduce the rule here too, and the reproduction had silently lost the
-/// shootdown-lock contract branch (2026-08-14). If you are adding a rule, add it to
-/// `classify`; anything added to `State` is bookkeeping by definition, and a rule that lands
-/// there is invisible to the kernel.
+/// Host tests for the scope arithmetic. The *tracker* is compiled out under `cfg(test)`, so the
+/// tests call [`classify`], the function the tracker calls, and model only the bookkeeping (stack,
+/// depth, floor) in `State`. Add a new rule to `classify`; a rule in `State` is invisible to the
+/// kernel.
 #[cfg(test)]
 mod tests {
     use super::LockRank;
@@ -603,17 +517,10 @@ mod tests {
 
     impl State {
         /// `Ok(())`, or `Err(held_rank)` for the entry the acquire broke against.
-        ///
-        /// **The decision comes from [`super::classify`]** — the same function the real
-        /// tracker calls. This struct now models only the *bookkeeping* (the stack, the
-        /// depth, the floor), which is the part that genuinely cannot run on the host. It
-        /// used to reimplement the rule too, and the reimplementation had silently lost the
-        /// `TlbShootdown` contract branch.
         fn acquired(&mut self, rank: LockRank) -> Result<(), u8> {
             self.taken(rank, super::Taken::Waiting)
         }
 
-        /// [`acquired`](Self::acquired), for either kind of acquisition.
         fn taken(&mut self, rank: LockRank, taken: super::Taken) -> Result<(), u8> {
             let hi = self.depth.min(MAX_HELD);
             let scope = if hi > self.floor { &self.held[self.floor..hi] } else { &[][..] };
@@ -637,7 +544,6 @@ mod tests {
             }
         }
 
-        /// Returns the floor to restore at the matching exit.
         fn enter_interrupt(&mut self) -> usize {
             let saved = self.floor;
             self.floor = self.depth;
@@ -653,22 +559,15 @@ mod tests {
         }
     }
 
-    /// `tlb::LOCK`'s contract is stricter than its rank, and only [`classify`] enforces it.
-    ///
-    /// `TlbShootdown` is 85 — above `Sched` (10) and `HandleTable` (30) — so taking it while
-    /// holding either is **not** a rank inversion and the ordinary comparison waves it
-    /// through. The F1 caller contract is that *nothing* may be held. Untested on either
-    /// side until 2026-08-14: the tracker had the branch, the test copy did not, and the
-    /// drift was invisible because the tests exercised the copy.
+    /// `tlb::LOCK`'s contract is stricter than its rank: `TlbShootdown` is 85, so taking it under
+    /// `Sched` (10) is not an inversion, yet *nothing* may be held (F1).
     #[test]
     fn the_shootdown_lock_refuses_any_held_lock_even_one_it_outranks() {
         use super::{Acquisition, LockRank, Taken::Waiting, classify};
 
-        // Nothing held: fine.
         assert_eq!(classify(LockRank::TlbShootdown, &[], Waiting), Acquisition::Ok);
         assert_eq!(classify(LockRank::TlbShootdown, &[0, 0], Waiting), Acquisition::Ok);
 
-        // Holding a *lower* rank would pass the inversion test — and must still be refused.
         let sched = LockRank::Sched as u8;
         assert!(
             (LockRank::TlbShootdown as u8) > sched,
@@ -676,14 +575,11 @@ mod tests {
         );
         assert_eq!(classify(LockRank::TlbShootdown, &[sched], Waiting), Acquisition::ContractBroken { held: sched });
 
-        // A different lock over `Sched` is an ordinary inversion, not a contract break —
-        // so the branch is specific to the shootdown lock rather than to a held stack.
         assert_eq!(classify(LockRank::Sched, &[sched], Waiting), Acquisition::Inverted { held: sched });
     }
 
     /// The panic path's shape: a driver panics holding its `Leaf` lock, and the panic tees
-    /// into the log ring (rank 72) with `try_lock`. Checked, that reported a lock-order
-    /// violation in place of the panic's own message.
+    /// into the log ring (rank 72) with `try_lock`.
     #[test]
     fn an_acquisition_that_does_not_wait_is_not_ordered() {
         use super::{Acquisition, LockRank, Taken, classify};
@@ -704,8 +600,6 @@ mod tests {
             Acquisition::Ok,
             "nor is a same-rank try_lock"
         );
-        // The shootdown lock's contract is about what is held while it spins, not about
-        // waiting to take it, so it binds a try_lock too.
         let sched = LockRank::Sched as u8;
         assert_eq!(
             classify(LockRank::TlbShootdown, &[sched], Taken::WithoutWaiting),
@@ -730,7 +624,6 @@ mod tests {
         s.releasing();
         s.releasing();
         s.releasing();
-        // Held alone, the try-taken lock is what the wait breaks against.
         s.taken(LockRank::Klog, WithoutWaiting).unwrap();
         assert_eq!(s.acquired(LockRank::Serial), Err(LockRank::Klog as u8));
     }
@@ -762,9 +655,8 @@ mod tests {
         assert_eq!(s.acquired(LockRank::KernelObject), Err(LockRank::KernelObject as u8));
     }
 
-    /// The regression the whole change exists for: a timer tick landing on a thread that
-    /// holds an allocator lock, and taking `SCHED`. Flat, that is the exact panic that got
-    /// D4 withdrawn; scoped, it passes.
+    /// A timer tick landing on a thread that holds an allocator lock and taking `SCHED`:
+    /// flat, a false inversion; scoped, it passes.
     #[test]
     fn interrupt_scope_permits_sched_under_a_held_allocator_lock() {
         let mut s = State::default();
@@ -775,8 +667,6 @@ mod tests {
         s.releasing();
         s.exit_interrupt(saved);
 
-        // The interrupted context's hold survived the handler untouched, and is enforced
-        // again now that it has resumed.
         assert_eq!(s.depth, 1);
         assert_eq!(s.acquired(LockRank::Sched), Err(LockRank::Buddy as u8));
     }
@@ -787,7 +677,6 @@ mod tests {
         s.acquired(LockRank::Buddy).unwrap();
         let saved = s.enter_interrupt();
         s.acquired(LockRank::Leaf).unwrap();
-        // Inside the handler the order still applies in full.
         assert_eq!(s.acquired(LockRank::Sched), Err(LockRank::Leaf as u8));
         s.releasing();
         s.releasing();
@@ -828,7 +717,6 @@ mod tests {
     #[test]
     fn overflow_degrades_to_unchecked_rather_than_to_a_false_report() {
         let mut s = State::default();
-        // Descend past MAX_HELD with strictly increasing ranks, then keep going.
         for r in [
             LockRank::Sched,
             LockRank::HandleTable,
@@ -859,9 +747,7 @@ mod tests {
         s.releasing();
         assert!(s.switch_safe());
 
-        // The preemptive path: a tick on an idle CPU opens a scope at depth 0, takes and
-        // drops SCHED, and switches — still safe, which is why the assert can be this
-        // strict.
+        // A tick on an idle CPU opens a scope at depth 0, takes and drops SCHED, and switches.
         let saved = s.enter_interrupt();
         s.acquired(LockRank::Sched).unwrap();
         s.releasing();

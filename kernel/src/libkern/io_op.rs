@@ -1,12 +1,12 @@
 //! `IoOp` — the `sys_io_submit` operation descriptor (kernel mirror).
 //!
-//! Normative layout: `docs/spec/io-operation.md`. This is the kernel's copy of
-//! the `#[repr(C)]` block userspace passes by `UserPtr<IoOp>`; `userspace/libkern`
-//! carries the matching mirror. Both are ABI version-hash inputs
-//! (`docs/spec/abi-version-hash.md` § "IoOp and IoResult layouts").
+//! Normative layout: `docs/spec/io-operation.md`. This is the kernel's copy of the `#[repr(C)]`
+//! block userspace passes by `UserPtr<IoOp>`; `userspace/libkern` carries the matching mirror.
+//! Both are ABI version-hash inputs (`docs/spec/abi-version-hash.md` § "IoOp and IoResult
+//! layouts").
 
-/// One asynchronous I/O operation. `#[repr(C)]`, 40 bytes, 8-byte aligned, no
-/// interior padding (pinned by the asserts below).
+/// One asynchronous I/O operation. `#[repr(C)]`, 40 bytes, 8-byte aligned, no interior
+/// padding (pinned by the asserts below).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct IoOp {
@@ -43,15 +43,14 @@ pub enum IoOpcode {
     /// Buffer → device.
     Write = IO_OPCODE_WRITE,
     /// **Make what has been written durable** — the device's volatile write cache written to
-    /// its medium (administration Part C.2). No buffer and no range: `buffer`, `buf_offset`,
-    /// `offset` and `length` are all `0`. Needs `WRITE` on the device, since only a writer
-    /// has anything to make durable.
+    /// its medium. No buffer and no range: `buffer`, `buf_offset`, `offset` and `length` are all
+    /// `0`. Needs `WRITE` on the device, since only a writer has anything to make durable.
     Flush = IO_OPCODE_FLUSH,
-    /// **Read a disk's partition table again** and publish what it says now (Phase 6 Part G): its
-    /// old partitions' windows retired and their records departed, the new ones published as
-    /// arrivals. No buffer and no range, as for [`Flush`](Self::Flush), and needs `WRITE` on the
-    /// disk. **A partition answers `Unsupported`**, as does a disk whose driver cannot read its
-    /// table again — today every one but a USB disk.
+    /// **Read a disk's partition table again** and publish what it says now: its old
+    /// partitions' windows retired and their records departed, the new ones published as arrivals.
+    /// No buffer and no range, as for [`Flush`](Self::Flush), and needs `WRITE` on the disk.
+    /// **A partition answers `Unsupported`**, as does a disk whose driver cannot read its table
+    /// again — today every one but a USB disk.
     Rescan = IO_OPCODE_RESCAN,
 }
 

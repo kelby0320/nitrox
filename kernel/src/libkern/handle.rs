@@ -1,17 +1,12 @@
 //! ABI-level value types for the kernel handle system.
 //!
-//! [`RawHandle`], [`Rights`], and [`KObjectType`] are the wire-format
-//! primitives the kernel and (eventually) userspace must agree on.
-//! `docs/spec/handle-encoding.md` is the normative source; this module
-//! is its in-kernel embodiment. The handle *table* — the segmented
-//! directory that maps handles to objects — lives in
-//! `kernel/src/handle/`; this file holds only the pure value types so
-//! they have no allocator or arch dependency and can be shared with
-//! userspace later without dragging the table along.
+//! [`RawHandle`], [`Rights`], and [`KObjectType`] are the wire-format primitives the kernel
+//! and userspace must agree on; `docs/spec/handle-encoding.md` is the normative source. The
+//! handle *table* lives in `kernel/src/handle/`; this file holds only the pure value types, so
+//! they carry no allocator or arch dependency.
 //!
-//! All operations on these types are `const`-callable and allocation-
-//! free. Bitflags are hand-rolled in the [`PageFlags`](crate::arch::paging::PageFlags)
-//! style (see `kernel/CLAUDE.md` — no `bitflags` crate).
+//! All operations are `const`-callable and allocation-free. Bitflags are hand-rolled in the
+//! [`PageFlags`](crate::arch::paging::PageFlags) style (see `kernel/CLAUDE.md`).
 
 use core::ops::{BitAnd, BitOr, BitOrAssign};
 
@@ -28,52 +23,40 @@ use core::ops::{BitAnd, BitOr, BitOrAssign};
 ///   └─ reserved zero
 /// ```
 ///
-/// **Bit 63 is reserved zero.** Syscalls return handles in the result
-/// register, which also encodes [`KError`](crate::syscall) values as
-/// *negative* `isize`. Were the generation a full 32 bits, a handle
-/// whose generation reached `0x8000_0000` would set bit 63 and read
-/// back as a negative `isize`, aliasing an error code. Capping the
-/// generation at 31 bits keeps every issued handle a non-negative
-/// `isize`, so the value/error spaces never collide.
+/// **Bit 63 is reserved zero.** Syscalls return handles in the result register, which also
+/// encodes [`KError`](crate::syscall) values as *negative* `isize`. A generation reaching
+/// `0x8000_0000` would set bit 63 and alias an error code; capping the generation at 31 bits
+/// keeps every issued handle a non-negative `isize`.
 ///
-/// [`RawHandle::NULL`] is reserved and never issued by the kernel; it
-/// is the canonical "no handle" sentinel for userspace and the kernel's
-/// own bookkeeping fields (`HandleEntry::next_owned` when the slot is
-/// at the tail of its owner's list).
+/// [`RawHandle::NULL`] is reserved and never issued by the kernel; it is the canonical
+/// "no handle" sentinel for userspace and the kernel's own bookkeeping fields
+/// (`HandleEntry::next_owned` at the tail of its owner's list).
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct RawHandle(pub u64);
 
 impl RawHandle {
-    /// The reserved invalid handle. Never issued by the kernel; safe
-    /// for userspace to use as a "no handle" placeholder.
+    /// The reserved invalid handle. Never issued by the kernel; safe for userspace to use as
+    /// a "no handle" placeholder.
     pub const NULL: RawHandle = RawHandle(0);
 
-    /// Width of the generation field. Bit 63 of a handle is reserved
-    /// zero (see the type-level docs), so the generation occupies bits
-    /// 62:32 — 31 bits, not 32.
+    /// Width of the generation field: bit 63 is reserved zero, so the generation occupies
+    /// bits 62:32 — 31 bits, not 32.
     pub const GENERATION_BITS: u32 = 31;
 
-    /// Largest generation a slot may be issued with. The handle table
-    /// bumps a slot's generation modulo `GENERATION_MAX + 1`, so it
-    /// **wraps** `GENERATION_MAX` → `0` and bit 63 stays clear. Distinct
-    /// generations let a stale `RawHandle` for a recycled slot fail the
-    /// generation check; the wrap admits a narrow, accepted ABA (a stale
-    /// handle re-validating only after `2^31` reuses of the *same* slot,
-    /// and only within the same owning process). See
+    /// Largest generation a slot may be issued with. The handle table bumps a slot's
+    /// generation modulo `GENERATION_MAX + 1`, so it **wraps** `GENERATION_MAX` → `0` and bit
+    /// 63 stays clear. The wrap admits a narrow, accepted ABA (a stale handle re-validating only
+    /// after `2^31` reuses of the *same* slot, and only within the same owning process). See
     /// `docs/spec/handle-encoding.md` § "Generation counter behavior".
     pub const GENERATION_MAX: u32 = (1 << Self::GENERATION_BITS) - 1;
 
     /// Pack a `(segment, slot, generation)` triple into a `RawHandle`.
     ///
-    /// `seg_id` must be `< 4096` (12 bits), `slot_id` must be
-    /// `< 1 << 20` (20 bits), and `generation` must be
-    /// `<= GENERATION_MAX` (31 bits, bit 63 reserved zero); violations
-    /// trip a debug assertion. In release builds out-of-range bits
-    /// silently overlap the next field, which the decode side reads
-    /// back as a structurally valid but logically wrong handle that
-    /// will fail the table's directory / per-segment bounds check or
-    /// the generation check on first lookup.
+    /// `seg_id` must be `< 4096` (12 bits), `slot_id` `< 1 << 20` (20 bits), and `generation`
+    /// `<= GENERATION_MAX` (31 bits); violations trip a debug assertion. In release builds
+    /// out-of-range bits silently overlap the next field, yielding a handle that fails the
+    /// table's bounds or generation check on first lookup.
     pub const fn encode(seg_id: u32, slot_id: u32, generation: u32) -> Self {
         debug_assert!(seg_id < 4096, "segment id overflows 12-bit field");
         debug_assert!(slot_id < (1 << 20), "slot id overflows 20-bit field");
@@ -101,8 +84,7 @@ impl RawHandle {
         self.0 == 0
     }
 
-    /// The raw 64-bit value, for tests, debugging, and the syscall ABI
-    /// crossing.
+    /// The raw 64-bit value, for tests, debugging, and the syscall ABI crossing.
     pub const fn bits(self) -> u64 {
         self.0
     }
@@ -118,11 +100,9 @@ impl RawHandle {
 ///
 /// - **Generic** (bits 0-3): apply to any handle type.
 /// - **Principal** (bits 8-19): per-type "what can this handle *do*".
-/// - **Modifier** (bits 32-37): per-type "and how" (`SEEK`,
-///   `APPEND`, ...).
+/// - **Modifier** (bits 32-37): per-type "and how" (`SEEK`, `APPEND`, ...).
 ///
-/// Subset semantics live on this type: `r1.is_subset_of(r2)` iff
-/// `(r1 & r2) == r1`. The handle table never amplifies rights.
+/// `r1.is_subset_of(r2)` iff `(r1 & r2) == r1`. The handle table never amplifies rights.
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Rights(u64);
@@ -183,16 +163,13 @@ impl Rights {
         Rights(0)
     }
 
-    /// Wrap a raw bit pattern. The caller is responsible for ensuring
-    /// only documented bits are set; unknown bits are accepted but
-    /// never matched by any rights query, so they survive
-    /// transfer/duplicate untouched and have no operational meaning.
+    /// Wrap a raw bit pattern. Unknown bits are accepted but never matched by any rights
+    /// query, so they survive transfer/duplicate untouched and have no operational meaning.
     pub const fn from_bits_truncate(bits: u64) -> Self {
         Rights(bits)
     }
 
-    /// The raw bit pattern, for tests, debugging, and the syscall ABI
-    /// crossing.
+    /// The raw bit pattern, for tests, debugging, and the syscall ABI crossing.
     pub const fn bits(self) -> u64 {
         self.0
     }
@@ -217,9 +194,7 @@ impl Rights {
         Rights(self.0 & !other.0)
     }
 
-    /// `true` iff `self ⊆ other`, i.e. every bit set in `self` is also
-    /// set in `other`. The spec's normative definition of "is a subset
-    /// of".
+    /// `true` iff `self ⊆ other`: the spec's normative definition of "is a subset of".
     pub const fn is_subset_of(self, other: Rights) -> bool {
         (self.0 & other.0) == self.0
     }
@@ -245,52 +220,57 @@ impl BitOrAssign for Rights {
     }
 }
 
-/// Discriminant identifying which kind of kernel object a handle
-/// refers to.
+/// Discriminant identifying which kind of kernel object a handle refers to.
 ///
-/// Per `kernel/CLAUDE.md` § "Kernel object dispatch": kernel objects
-/// are dispatched via `match` on this enum rather than via `dyn Trait`,
-/// which keeps `HandleEntry::object` an 8-byte `AtomicPtr<()>` rather
-/// than a 16-byte fat pointer and keeps the entry cache-line sized.
+/// Per `kernel/CLAUDE.md` § "Kernel object dispatch": kernel objects are dispatched via
+/// `match` on this enum rather than via `dyn Trait`, which keeps `HandleEntry::object` an
+/// 8-byte `AtomicPtr<()>` rather than a 16-byte fat pointer and keeps the entry cache-line
+/// sized.
 ///
-/// Discriminants are fixed by the spec's type-rights compatibility
-/// matrix (`docs/spec/handle-encoding.md`) and contribute to the
-/// kernel ABI version hash (`docs/spec/abi-version-hash.md`); never
-/// renumber or reorder them.
-///
-/// Phase 1 stub: only `Process` and `Thread` will have real kernel
-/// implementations in the next slice; the rest are declared so the
-/// type-rights matrix compiles and discriminants are stable. They land
-/// behind their respective slices in later Phase 1 work.
+/// Discriminants are fixed by the spec's type-rights compatibility matrix
+/// (`docs/spec/handle-encoding.md`) and contribute to the kernel ABI version hash
+/// (`docs/spec/abi-version-hash.md`); never renumber or reorder them.
 #[repr(u32)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum KObjectType {
     /// Reserved; never appears in a live entry.
     Invalid = 0,
+    /// A process.
     Process = 1,
+    /// A thread.
     Thread = 2,
+    /// A namespace.
     Namespace = 3,
+    /// A memory object.
     MemoryObject = 4,
+    /// One end of an IPC channel.
     IpcChannel = 5,
+    /// A process's notification queue.
     NotificationChannel = 6,
+    /// A timer.
     Timer = 7,
+    /// An interrupt source.
     InterruptObject = 8,
+    /// An in-flight asynchronous operation.
     PendingOperation = 9,
+    /// An I/O ring.
     IoRing = 10,
+    /// The entropy source.
     EntropyObject = 11,
+    /// A device node.
     DeviceNode = 12,
+    /// A userspace resource-server registration.
     UserspaceServerReg = 13,
+    /// A file served by a filesystem server.
     FileObject = 14,
-    /// The capability to stop the machine: one, made at boot and handed to `init` (administration
-    /// Part E.3).
+    /// The capability to stop the machine: one, made at boot and handed to `init`.
     SystemControl = 15,
 }
 
 impl KObjectType {
-    /// Decode a u32 discriminant back into a `KObjectType`, or `None`
-    /// if the value is not one of the declared variants. The handle
-    /// table stores the discriminant in an `AtomicU32` for lock-free
-    /// snapshot reads; this helper recovers the enum on the way out.
+    /// Decode a u32 discriminant back into a `KObjectType`, or `None` if it is not a declared
+    /// variant. The handle table stores the discriminant in an `AtomicU32` for lock-free
+    /// snapshot reads; this recovers the enum on the way out.
     pub const fn from_u32(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::Invalid),
@@ -316,19 +296,16 @@ impl KObjectType {
 
 /// User-visible handle metadata, written by `sys_handle_stat`.
 ///
-/// `#[repr(C)]` boundary type (`docs/spec/syscall-abi.md`). The two `u64`s sit at
-/// `0`/`16` and the two `u32`s pack into `8..16` — total 24 bytes, 8-byte aligned,
-/// no interior padding (asserted below). `owner_pid` is intentionally omitted: a
-/// process can only stat handles it owns (the table's lookup enforces
-/// `owner_pid == caller`), so reporting it back is redundant.
+/// `#[repr(C)]` boundary type (`docs/spec/syscall-abi.md`). The two `u64`s sit at `0`/`16`
+/// and the two `u32`s pack into `8..16` — 24 bytes, 8-byte aligned, no interior padding
+/// (asserted below). `owner_pid` is omitted: a process can only stat handles it owns, so
+/// reporting it back is redundant.
 ///
-/// `size` is the referenced object's byte size for sized resources (a
-/// `MemoryObject`'s page-rounded size, a `FileObject`'s exact file size), else `0`
-/// — so a client can map/read a resource of unknown length (e.g. eshell `cat`). It
-/// closes the slice-8 file-size-discovery deferral.
+/// `size` is the referenced object's byte size for sized resources (a `MemoryObject`'s
+/// page-rounded size, a `FileObject`'s exact file size), else `0`, so a client can map/read
+/// a resource of unknown length.
 ///
-/// Not part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`
-/// lists the hashed types; `HandleInfo` is not among them).
+/// Not part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct HandleInfo {
@@ -336,8 +313,7 @@ pub struct HandleInfo {
     pub rights: u64,
     /// The referenced object's [`KObjectType`] discriminant (`as u32`).
     pub object_type: u32,
-    /// The handle's generation counter (bits 62:32 of the [`RawHandle`];
-    /// bit 63 is reserved zero).
+    /// The handle's generation counter (bits 62:32 of the [`RawHandle`]).
     pub generation: u32,
     /// The referenced object's byte size for sized resources, else `0`.
     pub size: u64,
@@ -351,17 +327,15 @@ const _: () = assert!(core::mem::offset_of!(HandleInfo, generation) == 12);
 const _: () = assert!(core::mem::offset_of!(HandleInfo, size) == 16);
 
 impl HandleInfo {
-    /// Build the user-facing info from a handle's metadata snapshot. Takes
-    /// primitives (not the table's `HandleStat`) so this type keeps its
-    /// no-allocator, no-table dependency and can be shared with userspace.
+    /// Build the user-facing info from a handle's metadata snapshot. Takes primitives (not the
+    /// table's `HandleStat`) so this type has no table dependency.
     pub const fn from_stat(object_type: KObjectType, rights: Rights, generation: u32, size: u64) -> Self {
         Self { rights: rights.bits(), object_type: object_type as u32, generation, size }
     }
 }
 
-/// Longest binding path [`NsEntry`] carries inline; a longer path is truncated
-/// (its true length is still reported in `path_len`). Every real mount/resource
-/// path is far shorter.
+/// Longest binding path [`NsEntry`] carries inline; a longer path is truncated (its true
+/// length is still reported in `path_len`).
 pub const NS_ENTRY_PATH_MAX: usize = 256;
 
 /// [`NsEntry::kind`]: a directly-bound resource handle.
@@ -371,11 +345,9 @@ pub const NS_KIND_KERNEL: u32 = 1;
 /// [`NsEntry::kind`]: a userspace resource server — a **mount** (`/` → fs-server).
 pub const NS_KIND_MOUNT: u32 = 2;
 
-/// One namespace binding, written by `sys_ns_enumerate` — the path it owns, what
-/// kind of target it resolves to, and the maximum rights a lookup through it may
-/// obtain. Lets a client list a namespace's mount points + kernel resources (e.g.
-/// eshell `mounts`); it is **not** a filesystem `readdir` (listing files inside a
-/// mount is an fs-server operation).
+/// One namespace binding, written by `sys_ns_enumerate`: the path it owns, what kind of
+/// target it resolves to, and the maximum rights a lookup through it may obtain. It is
+/// **not** a filesystem `readdir` (listing files inside a mount is an fs-server operation).
 ///
 /// `#[repr(C)]` boundary type (`docs/spec/syscall-abi.md`); not in the ABI hash.
 #[repr(C)]
@@ -417,9 +389,6 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip_at_field_corners() {
-        // Generation tops out at `GENERATION_MAX` (31 bits); bit 63 of the
-        // handle is reserved zero, so `u32::MAX`-style generations are no
-        // longer representable (and trip the encode assertion).
         for (seg, slot, generation) in [
             (0u32, 0u32, 0u32),
             (1, 1, 1),
@@ -435,9 +404,6 @@ mod tests {
 
     #[test]
     fn issued_handles_are_non_negative_isize() {
-        // Bit 63 is reserved zero, so even a max-generation handle on the
-        // last segment/slot stays a non-negative `isize` and can never be
-        // mistaken for a `KError` in the syscall result register.
         assert_eq!(RawHandle::GENERATION_MAX, 0x7FFF_FFFF);
         let h = RawHandle::encode(4095, (1 << 20) - 1, RawHandle::GENERATION_MAX);
         assert_eq!(h.bits() >> 63, 0, "bit 63 must be reserved zero");
@@ -447,15 +413,11 @@ mod tests {
     #[test]
     #[should_panic]
     fn encode_rejects_generation_above_max() {
-        // A generation past `GENERATION_MAX` would set the reserved bit 63;
-        // debug builds catch it.
         let _ = RawHandle::encode(0, 0, RawHandle::GENERATION_MAX + 1);
     }
 
     #[test]
     fn encoded_bit_positions_match_spec() {
-        // generation occupies bits 62..32 (bit 63 reserved zero); segment
-        // occupies 31..20; slot occupies 19..0.
         let generation = 0x5EAD_BEEF; // <= GENERATION_MAX, bit 31 clear
         let h = RawHandle::encode(0xABC, 0x12345, generation);
         let raw = h.bits();
@@ -493,13 +455,9 @@ mod tests {
     fn subset_semantics_per_spec() {
         let r = Rights::READ;
         let rw = Rights::READ | Rights::WRITE;
-        // r ⊆ rw
         assert!(r.is_subset_of(rw));
-        // rw ⊄ r — write is set in rw but not in r
         assert!(!rw.is_subset_of(r));
-        // The empty set is a subset of everything.
         assert!(Rights::empty().is_subset_of(rw));
-        // Everything is a subset of itself.
         assert!(rw.is_subset_of(rw));
     }
 
@@ -513,7 +471,6 @@ mod tests {
 
     #[test]
     fn modifier_bits_occupy_high_half() {
-        // SEEK is bit 32; assert it lands above the 32-bit boundary.
         assert_eq!(Rights::SEEK.bits(), 1 << 32);
         assert_eq!(Rights::INSPECT_MEMORY.bits(), 1 << 37);
     }
@@ -536,7 +493,6 @@ mod tests {
         assert_eq!(KObjectType::UserspaceServerReg as u32, 13);
         assert_eq!(KObjectType::FileObject as u32, 14);
         assert_eq!(KObjectType::SystemControl as u32, 15);
-        // Round-trip the newest discriminant; one past it is unknown.
         assert_eq!(KObjectType::from_u32(14), Some(KObjectType::FileObject));
         assert_eq!(KObjectType::from_u32(15), Some(KObjectType::SystemControl));
         assert_eq!(KObjectType::from_u32(16), None);
@@ -562,7 +518,6 @@ mod tests {
 
     #[test]
     fn handle_info_layout_is_stable() {
-        // Mirrors the compile-time asserts; documents the wire layout.
         assert_eq!(core::mem::size_of::<HandleInfo>(), 24);
         assert_eq!(core::mem::align_of::<HandleInfo>(), 8);
         assert_eq!(core::mem::offset_of!(HandleInfo, rights), 0);

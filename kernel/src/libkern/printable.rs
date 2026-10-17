@@ -1,9 +1,9 @@
 //! Bytes someone else wrote, printed without trusting them.
 //!
-//! Firmware and bootloaders hand the kernel fixed-width and NUL-terminated byte strings —
-//! ACPI's space-padded OEM fields, Limine's bootloader name and command line — and the kernel
-//! log is drawn on a terminal and on the framebuffer console. [`Printable`] is the one way
-//! those bytes reach a log line.
+//! Firmware and bootloaders hand the kernel fixed-width and NUL-terminated byte strings
+//! (ACPI's space-padded OEM fields, Limine's bootloader name and command line), and the log
+//! is drawn on a terminal and on the framebuffer console. [`Printable`] is the one way those
+//! bytes reach a log line.
 
 use core::fmt;
 
@@ -68,7 +68,6 @@ mod tests {
     fn an_acpi_oem_field_loses_its_padding_and_nothing_else() {
         assert_eq!(format!("{}", Printable(b"BOCHS ")), "BOCHS");
         assert_eq!(format!("{}", Printable(b"BXPC    ")), "BXPC");
-        // Interior spaces are part of the name.
         assert_eq!(format!("{}", Printable(b"ACER  AB")), "ACER  AB");
     }
 

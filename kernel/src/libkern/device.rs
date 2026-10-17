@@ -1,15 +1,13 @@
-//! What `/dev/registry` serves: the kernel's device table, as records (administration Part B).
+//! What `/dev/registry` serves: the kernel's device table, as records.
 //!
-//! **Why a table and not a directory.** Every userspace enumeration of devices used to be a probe
-//! — look up `/dev/blk/0`, `1`, … until one is missing — because a kernel server answers lookups
-//! and nothing else, and the probe says nothing about *what* each device is. The device manager
-//! needs every node, its kind, and which path serves it, in one read: that is a snapshot of the
-//! table, and a snapshot is what `/dev/log` already is.
+//! A table rather than a directory because a kernel server answers lookups and nothing
+//! else, so enumerating by probing says nothing about *what* each device is. The device manager
+//! needs every node, its kind, and which path serves it in one read: a snapshot of the table,
+//! as `/dev/log` is.
 //!
-//! **The header's count is the length, not the object's size.** A memory object is page-rounded,
-//! so a reader that divided its size by [`DeviceRecord`]'s would read the zero padding as devices
-//! — class `Other`, kind `Unknown` — and a comparison that looked only at block devices would not
-//! notice them.
+//! **The header's count is the length, not the object's size.** A memory object is
+//! page-rounded, so a reader dividing its size by [`DeviceRecord`]'s would read the zero
+//! padding as devices (class `Other`, kind `Unknown`).
 //!
 //! `#[repr(C)]` and mirrored in `userspace/libkern/src/device.rs`: the layout asserts on both
 //! sides keep the structs in step, and `cargo xtask abi-sync-check` the discriminants and
@@ -19,8 +17,8 @@ use core::mem::{align_of, offset_of, size_of};
 
 use super::block::MAX_DEVICE_NAME;
 
-/// What a node is, as the registry reports it — finer than its `DeviceClass`, which calls the
-/// console, the keyboard and the mouse all `Char`.
+/// What a node is, as the registry reports it — finer than its `DeviceClass`, which calls
+/// the console, the keyboard and the mouse all `Char`.
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DeviceKind {
@@ -37,14 +35,13 @@ pub enum DeviceKind {
     RamDisk = 4,
     /// A keyboard.
     Keyboard = 5,
-    /// A mouse, or anything that reports like one — the laptop's trackpad arrives on the i8042's
-    /// aux port.
+    /// A mouse, or anything that reports like one (the i8042's aux port).
     Mouse = 6,
     /// The serial console.
     Console = 7,
-    /// A USB device on a root port of the xHCI controller, its parent (Phase 6 Part A.3). Its
-    /// record's `vendor` and `device` are its USB IDs, its class fields its class triple, and its
-    /// `port` and `speed` say where and how fast it is attached.
+    /// A USB device on a root port of the xHCI controller, its parent. Its record's `vendor`
+    /// and `device` are its USB IDs, its class fields its class triple, and its `port` and
+    /// `speed` say where and how fast it is attached.
     UsbDevice = 8,
 }
 
@@ -73,7 +70,7 @@ impl DeviceKind {
 
 /// The first four bytes of a snapshot, `"DREG"` read as a little-endian `u32`.
 pub const REGISTRY_MAGIC: u32 = 0x4745_5244;
-/// The snapshot layout this kernel writes: 2 since Phase 6 Part C, whose header carries the table's
+/// The snapshot layout this kernel writes: 2, whose header carries the table's
 /// generation.
 pub const REGISTRY_VERSION: u32 = 2;
 /// [`DeviceRecord::served`] for a node no indexed path serves (a PCI function, the console).
@@ -88,12 +85,12 @@ pub const OUTCOME_CLAIMED: u32 = 1;
 pub const OUTCOME_DECLINED: u32 = 2;
 /// Longest driver name served, in bytes.
 pub const MAX_DRIVER_NAME: usize = 16;
-/// [`DeviceRecord::flags`]: **the device has departed** (Phase 6 Part C). Its record keeps its id,
-/// its fields and its served index, which no later device takes; its paths answer `NotFound`. A
-/// departed device's children — a USB device's keyboard, a disk's partitions — are departed too.
+/// [`DeviceRecord::flags`]: **the device has departed**. Its record keeps its id, its
+/// fields and its served index, which no later device takes; its paths answer `NotFound`. A
+/// departed device's children (a USB device's keyboard, a disk's partitions) are departed too.
 pub const DEPARTED: u8 = 0x01;
-/// [`DeviceRecord::flags`]: **the disk the machine started from** (Phase 6 Part D) — its GPT's GUID
-/// is the one Limine loaded the modules from. On a live boot it is the stick; on an installed
+/// [`DeviceRecord::flags`]: **the disk the machine started from** — its GPT's GUID is the
+/// one Limine loaded the modules from. On a live boot it is the stick; on an installed
 /// machine the internal disk, whose root is `init`'s.
 pub const BOOT: u8 = 0x02;
 
@@ -110,9 +107,9 @@ pub struct RegistryHeader {
     /// `size_of::<DeviceRecord>()` as the kernel wrote it, so a reader built against another
     /// layout refuses rather than misreads.
     pub record_size: u32,
-    /// **The table's generation** (Phase 6 Part C): bumped once by every change — a device
-    /// registered, or one departed with its children — so two snapshots with the same generation
-    /// say the same thing. `/dev/registry/changes` answers in the same terms.
+    /// **The table's generation**: bumped once by every change (a device registered, or one
+    /// departed with its children), so two snapshots with the same generation say the same
+    /// thing. `/dev/registry/changes` answers in the same terms.
     pub generation: u64,
 }
 
@@ -134,9 +131,8 @@ pub struct DeviceRecord {
     pub class: u32,
     /// Its [`DeviceKind`] discriminant.
     pub kind: u32,
-    /// **The index its path serves it at** — the `<n>` of `/dev/blk/<n>` or `/dev/input/raw/<n>`
-    /// — or [`NOT_SERVED`]. The same field those servers resolve through, so it cannot disagree
-    /// with them.
+    /// **The index its path serves it at** — the `<n>` of `/dev/blk/<n>` or
+    /// `/dev/input/raw/<n>` — or [`NOT_SERVED`]. The field those servers resolve through.
     pub served: u32,
     /// The `id` of the node it belongs to — a partition's disk, a disk's or a USB device's
     /// controller — or [`NO_PARENT`].
@@ -144,9 +140,9 @@ pub struct DeviceRecord {
     /// For a PCI function, what its driver did with it: [`OUTCOME_NONE`], [`OUTCOME_CLAIMED`]
     /// or [`OUTCOME_DECLINED`].
     pub outcome: u32,
-    /// **Which IDs these are depends on [`kind`](Self::kind)**: a PCI function's vendor id, a USB
-    /// device's `idVendor` (Phase 6 Part A.3), or `0xFFFF` for a node that is neither. A vendor
-    /// other than `0xFFFF` does not mean a PCI function — read the kind.
+    /// **Which IDs these are depends on [`kind`](Self::kind)**: a PCI function's vendor id, a
+    /// USB device's `idVendor`, or `0xFFFF` for a node that is neither. A vendor other than
+    /// `0xFFFF` does not mean a PCI function — read the kind.
     pub vendor: u16,
     /// A PCI function's device id, or a USB device's `idProduct`.
     pub device: u16,
@@ -168,13 +164,13 @@ pub struct DeviceRecord {
     /// PCI function; zero for a node that is not a PCI function.
     pub func: u8,
     /// For a USB device, the root port it is on, numbered from 1; zero for every other kind
-    /// (Phase 6 Part A.3, from bytes that were reserved — the layout and the version are unchanged).
+    /// (from bytes that were reserved — the layout and the version are unchanged).
     pub port: u8,
     /// For a USB device, its speed: 1 full, 2 low, 3 high, 4 SuperSpeed, 5 SuperSpeedPlus (the
     /// xHCI's default speed IDs); zero for every other kind.
     pub speed: u8,
-    /// What has happened to it, and what it is: [`DEPARTED`] (Phase 6 Part C, from the byte that
-    /// was reserved — the layout is unchanged) and [`BOOT`] (Part D).
+    /// What has happened to it, and what it is: [`DEPARTED`] and [`BOOT`] (from the byte that
+    /// was reserved — the layout is unchanged).
     pub flags: u8,
     /// Bytes per logical block, for a block device; zero otherwise.
     pub logical_block_size: u32,
@@ -260,17 +256,17 @@ impl DeviceRecord {
     }
 }
 
-// --- `/dev/registry/io` (Phase 6 Part H.2) -----------------------------------------------------
+// --- `/dev/registry/io` ------------------------------------------------------------------
 //
-// **What the block devices and the page cache have done since boot**: a header carrying the page
-// cache's counters, then a record per disk and RAM disk — partitions have none, since a window's
-// I/O is counted by its disk's driver. The counts are cumulative: a reader takes two snapshots and
-// subtracts, as `nxsh`'s `time` does through the device manager's `io.tsm`.
+// **What the block devices and the page cache have done since boot**: a header carrying the
+// page cache's counters, then a record per disk and RAM disk (partitions have none; a window's
+// I/O is counted by its disk's driver). The counts are cumulative: a reader takes two snapshots
+// and subtracts.
 
 /// The first four bytes of an I/O snapshot, `"DIOS"` read as a little-endian `u32`.
 pub const IO_MAGIC: u32 = 0x534F_4944;
-/// The I/O snapshot layout this kernel writes: 2 since the page cache counts the pages its fills
-/// bring in (Phase 6 Part H.4).
+/// The I/O snapshot layout this kernel writes: 2, since the page cache counts the pages
+/// its fills bring in.
 pub const IO_VERSION: u32 = 2;
 
 /// The page cache's counters, since boot (`file_object::fill_stats`).
@@ -322,9 +318,9 @@ const _: () = assert!(offset_of!(IoHeader, count) == 8);
 const _: () = assert!(offset_of!(IoHeader, record_size) == 12);
 const _: () = assert!(offset_of!(IoHeader, cache) == 16);
 
-/// **One block device's counters, since it was registered**: the commands its driver issued and saw
-/// retire, the bytes they moved, and the time they were on the device. One command at a time on
-/// each driver this kernel has, so the time is the device's busy time.
+/// **One block device's counters, since it was registered**: the commands its driver issued
+/// and saw retire, the bytes they moved, and the time they were on the device (the device's
+/// busy time, as each driver runs one command at a time).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct IoRecord {

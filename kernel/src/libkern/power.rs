@@ -1,6 +1,6 @@
-//! `sys_power`'s operations (administration Part E.3) — the kernel's copy. `userspace/libkern`
-//! carries the matching one, and `cargo xtask abi-sync-check` pairs the two by name. Not a
-//! version-hash input: a syscall argument, like [`ClockId`](super::ClockId).
+//! `sys_power`'s operations — the kernel's copy. `userspace/libkern` carries the matching
+//! one, and `cargo xtask abi-sync-check` pairs the two by name. Not a version-hash input: a
+//! syscall argument, like [`ClockId`](super::ClockId).
 
 /// Flush every disk, stop every processor, and say it is safe to turn the machine off.
 pub const POWER_HALT: u64 = 0;
