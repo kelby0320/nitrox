@@ -30,7 +30,7 @@ Each failure names the file and line and says how to fix it.
 under `DIR` the same way and fails when their comment lines pass 0.15 of their code, or, where it
 is more, a line for each `pub` item and field and each `TODO(tag)` — the doc comments and
 deferrals the rules require. **`cargo xtask check-comments --only-comments [REV]`** fails a commit
-(`HEAD` by default) that changes anything but comments: a file added, removed or not Rust, or a
+(`HEAD` by default), or with `--worktree` the uncommitted changes, that changes anything but comments: a file added, removed or not Rust, or a
 Rust file's code once its `//` comments are taken out, a `//` inside a string literal being code.
 
 **The edit hook.** Every Claude Code session in this repository runs

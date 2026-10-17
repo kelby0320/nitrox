@@ -183,33 +183,45 @@ fn code_change(old: &str, new: &str) -> Option<(String, String)> {
     })
 }
 
-/// `check-comments --only-comments [REV]`: fails when `REV` (`HEAD` by default) changes anything
-/// but comments: a file added, removed or not Rust, or a code line of a Rust file.
+/// `check-comments --only-comments [REV | --worktree]`: fails when `REV` (`HEAD` by default), or
+/// with `--worktree` the uncommitted changes to tracked files, change anything but comments: a
+/// file added, removed or not Rust, or a code line of a Rust file.
 pub(crate) fn cmd_only_comments(args: &[String]) -> R<()> {
-    let rev = args.first().map_or("HEAD", String::as_str);
+    let worktree = args.first().is_some_and(|a| a == "--worktree");
+    let rev = if worktree { "HEAD" } else { args.first().map_or("HEAD", String::as_str) };
+    let (base, what) =
+        if worktree { (rev.to_string(), "the worktree".to_string()) } else { (format!("{rev}^"), rev.to_string()) };
+    let mut range = vec!["diff", "--no-renames", "--name-status", &base];
+    if !worktree {
+        range.push(rev);
+    }
     let mut failures = Vec::new();
     let mut files = 0;
-    for entry in git(&["diff", "--no-renames", "--name-status", &format!("{rev}^"), rev])?.lines() {
+    for entry in git(&range)?.lines() {
         let Some((status, path)) = entry.split_once('\t') else { continue };
         if status != "M" || !path.ends_with(".rs") {
             failures.push(format!("{path}: {status}, which is not a Rust file's comments changing"));
             continue;
         }
         files += 1;
-        let old = git(&["show", &format!("{rev}^:{path}")])?;
-        let new = git(&["show", &format!("{rev}:{path}")])?;
+        let old = git(&["show", &format!("{base}:{path}")])?;
+        let new = if worktree {
+            std::fs::read_to_string(crate::repo_root().join(path))?
+        } else {
+            git(&["show", &format!("{rev}:{path}")])?
+        };
         if let Some((was, is)) = code_change(&old, &new) {
             failures.push(format!("{path}: code changed — `{}` became `{}`", was.trim(), is.trim()));
         }
     }
     if failures.is_empty() {
-        println!("check-comments: {rev} changes comments alone, in {files} Rust file(s) ✓");
+        println!("check-comments: {what} changes comments alone, in {files} Rust file(s) ✓");
         return Ok(());
     }
     for f in &failures {
         eprintln!("  {f}");
     }
-    Err(format!("check-comments: {rev} changes more than comments ({} file(s))", failures.len()).into())
+    Err(format!("check-comments: {what} changes more than comments ({} file(s))", failures.len()).into())
 }
 
 #[cfg(test)]
