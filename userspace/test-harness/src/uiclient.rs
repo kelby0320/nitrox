@@ -1,67 +1,21 @@
-//! `ui-testclient` — the display arm's first real client (plan M2 Part D).
+//! `ui-testclient` — the display arm's first real client: a second process that connects over
+//! `/dev/draw`, shares real memory, and requires the compositor to talk back.
 //!
-//! Everything before this was one half of a conversation. `libsurface` had only met a mock and
-//! the compositor had never answered anybody, which is how the Surface protocol shipped
-//! **one-way** through a PR with three green CI jobs and 1213 passing tests: the code that
-//! produced replies existed, and nothing consumed them.
+//! It proves a session exists, `CreateWindow` is answered, two `MemoryObject`s cross once, and
+//! `Release` comes back: it commits more frames than it has buffers, so from the third it proceeds
+//! only if the compositor released the buffer that left the screen. A one-way protocol stalls.
 //!
-//! So this is the test that could not have passed before: a second process that connects
-//! over `/dev/draw`, shares real memory, and requires the compositor to talk back.
+//! It leaves the reference scene on screen, so `check-display` compares a picture that came through
+//! the whole protocol. **On success it parks rather than exits**: an exiting client's windows are
+//! destroyed, and the gate captured an empty screen that looked like a compositing failure.
+//! Failures go to `sys_test_exit` directly. Beside the scene it presents [`libui::reference`],
+//! drawn with a font read from disk, and the terminal's reference, which the gate compares with the
+//! host's render. **The UI window is created first**, so the scene stacks above it; the other order
+//! fails the comparison.
 //!
-//! ## What it proves, and why each step is load-bearing
-//!
-//! 1. **A session exists.** Resolving `/dev/draw/new` returns a channel — the forwarded
-//!    resolve, the compositor's session slot, and handle transfer of the endpoint.
-//! 2. **The compositor replies.** `CreateWindow` must come back with a window id, or the
-//!    client cannot proceed at all. This is the step that was missing.
-//! 3. **Shared memory crosses once.** Two `MemoryObject`s are created, mapped, drawn into,
-//!    and their handles transferred on `AttachBuffer` — not per frame.
-//! 4. **`Release` comes back.** The client commits more frames than it has buffers, so
-//!    from the third frame it can only proceed if the compositor released the buffer that
-//!    left the screen. A one-way protocol stalls here, and that is the point.
-//!
-//! It leaves the reference scene on screen in its final buffer, so `check-display` compares
-//! a picture that arrived through the whole protocol rather than one written straight to
-//! the aperture.
-//!
-//! ## Why it parks instead of exiting
-//!
-//! It does not exit on success. A client that exits closes its channel, the compositor sees
-//! `PeerClosed` and destroys its windows — correctly — and the screen goes back to
-//! background. The first version exited straight after presenting and the display gate
-//! captured an empty screen, which looked exactly like a compositing failure and was not
-//! one.
-//!
-//! So failures are reported with `sys_test_exit` directly, and success **parks**: the
-//! window stays on screen for as long as the machine runs, which is what every real client
-//! does.
-//!
-//! ## The second window: the toolkit, and a font read from the disk
-//!
-//! Since M4 Part C it also presents [`libui::reference`] in a window of its own, which is the
-//! only thing on the target that has ever loaded a font. Everything about the toolkit was
-//! host-tested against a font compiled into the test binary; this reads a real one through
-//! `fs-server-ext4` and rasterises with it, and `check-display` compares the result against the
-//! same render performed on the host.
-//!
-//! **Two faces since M11 Part D**, and which window gets which is part of what the gate checks:
-//! this window is the desktop's proportional font, the terminal's below is the fixed-advance
-//! one, and both paths come from `Theme::light()` — the same place the host takes them from.
-//!
-//! **A connection per window, though neither thing that forced it is true any more.** Input
-//! records carry a window id (C3 part 1) and `Session` holds several windows on one connection
-//! (C3 part 2), so this client *could* be one session now. It is not, because nothing here
-//! needs it and rewriting a working gate to prove an API is how gates acquire bugs.
-//!
-//! `verify_popup_placement` is the exception, and drives its two windows through the raw
-//! transport for a reason that **is** still live: it is the manager as well as the client, and
-//! `Session::create` blocks for a window's first `Configure` — which, for a `normal` window
-//! with a manager attached, only the manager can release. See `verify_initial_configure`.
-//!
-//! **The UI window is created first**, so the reference scene — created second — stacks above
-//! it. That ordering is load-bearing for the gate: it compares the scene's 64×32 at the
-//! top-left and the toolkit's picture everywhere *else* the UI window covers, so a compositor
-//! that stacked them the other way fails the scene comparison rather than passing quietly.
+//! Windows have one connection each, except in `verify_popup_placement`: it is also the manager,
+//! and `Session::create` blocks for a `normal` window's first `Configure`, which only the manager
+//! can release.
 
 #![no_std]
 #![no_main]
@@ -80,44 +34,28 @@ use librsproto::surface::{
 };
 use libsurface::{Session, Transport, ipc::ChannelTransport};
 
-/// `alloc` backing — rendering the reference scene allocates.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// Frames to commit. **More than the buffer count on purpose**: with two buffers, frame 3
-/// is only reachable if a `Release` arrived for frame 1's buffer.
+/// Frames to commit: more than the buffer count on purpose, so frame 3 needs a `Release`.
 const FRAMES: usize = 6;
-/// Buffers the client allocates. Two is the minimum the protocol permits.
 const BUFFERS: usize = 2;
 
-/// Window-churn cycles, and the buffer size each one shares with the compositor.
-///
-/// Sized so the run **fails on a leak rather than merely leaking**, and sized against the
-/// *sparsest* leak it has to catch. The cycle alternates two disposal paths, so a break in
-/// either one leaks on only half the cycles: 128 cycles is 64 leaking ones at 3 MiB, which
-/// is 192 MiB against a 256 MiB guest. At 80 cycles a break in the alternating half leaked
-/// 120 MiB, the guest absorbed it, and the probe passed — vacuous coverage of exactly the
-/// kind this milestone keeps producing. A smaller buffer or fewer cycles would leak just as
-/// truly and pass just as green.
+/// Window-churn cycles, sized so the run **fails on a leak rather than merely leaking**: a break in
+/// one of the two alternating disposal paths leaks on half the cycles, and 64 at 3 MiB is 192 MiB
+/// against a 256 MiB guest. At 80 cycles such a break leaked 120 MiB, which the guest absorbed.
 const CHURN_CYCLES: usize = 128;
 /// Churn window width — the buffer is `CHURN_W * 4 * CHURN_H` = 3 MiB.
 const CHURN_W: u32 = 1024;
-/// Churn window height.
 const CHURN_H: u32 = 768;
 
-/// A session holding exactly one window — the shape most of this client uses.
-///
-/// `libsurface` became session-oriented in M6 C3, because a client may hold several windows on
-/// one connection and a menu needs exactly that. Most of this file predates it and wants one
-/// window per connection, so this keeps those call sites saying what they always said. The
-/// multi-window API is used directly where it matters — see `verify_popup_placement`.
+/// A session holding exactly one window, the shape most of this client uses.
 struct Win {
     session: Session<alloc::boxed::Box<ChannelTransport>>,
     id: u32,
 }
 
 impl Win {
-    /// Connect, create one window, and wait out its initial configure.
     fn open(
         t: alloc::boxed::Box<ChannelTransport>,
         width: u32,
@@ -158,10 +96,7 @@ impl Win {
     }
 }
 
-/// Create a `MemoryObject` of `len` bytes and map it read-write.
-///
-/// Returns `(handle, address)`. The handle is transferred to the compositor on attach; the
-/// mapping stays, because the client keeps drawing into it.
+/// Create a `MemoryObject` of `len` bytes and map it read-write; returns `(handle, address)`.
 fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     // SAFETY: a plain anonymous object of `len` bytes.
     let h = unsafe { syscall4(SYS_MEMORY_CREATE, len as u64, 0, 0, 0) };
@@ -182,11 +117,7 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     Some((h as u64, addr as *mut u8))
 }
 
-/// Resolve `/dev/draw/<id>/info`, map it, and hand back the snapshot.
-///
-/// Split out of [`check_info`] so a placement can be *read back* rather than assumed: the
-/// manager's `Place` reply says only that the compositor answered, and B1's gate line was
-/// satisfied by that alone until 2026-08-19 (PR #216 review, blocking 1).
+/// Resolve `/dev/draw/<id>/info`, map it, and return the snapshot.
 fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::WindowInfo> {
     use libkern::handle::{RawHandle, Rights};
     use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
@@ -195,7 +126,6 @@ fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::Window
     let prefix = b"/dev/draw/";
     path[..prefix.len()].copy_from_slice(prefix);
     let mut n = prefix.len();
-    // The id, in decimal.
     let mut digits = [0u8; 10];
     let (mut d, mut v) = (0usize, id);
     if v == 0 {
@@ -219,23 +149,17 @@ fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::Window
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: the path resolves to a read-mappable object holding one `WindowInfo`.
     let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ) }).ok()?;
-    // **The constant, not the literal it used to equal.** `WindowInfo` grew from 32 to 40 bytes
-    // in M8 Part A; mapping 32 here would leave `read` refusing the short slice and this
-    // function returning `None` for every window — a *silent* failure, because the image still
-    // builds and the gate would report "no info" rather than a mismatch.
+    // **The constant, not a literal**: a stale length would silently make this return `None`.
     const N: usize = librsproto::surface::WINDOW_INFO_LEN;
     let addr = obj.map(N).ok()?;
     // SAFETY: the compositor serves exactly `N` bytes of `WindowInfo` here.
     let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, N) };
     let info = librsproto::surface::WindowInfo::read(bytes);
-    // Unmap once the snapshot is read. `info` mints a fresh object per resolve, so a client
-    // that polls it and never unmaps leaks a page each time — the same defect the compositor
-    // had on its side of this exchange (PR #175 review, finding 1).
+    // `info` mints a fresh object per resolve; unmap so polling does not leak a page each time.
     let _ = obj.unmap(addr, N);
     info
 }
 
-/// Resolve `/dev/draw/<id>/info` and check it describes the window we created.
 fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
     let Some(info) = read_window_info(root_ns, id) else { return false };
 
@@ -254,21 +178,9 @@ fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
 }
 
 /// Open and close windows in a loop, proving the compositor gives the memory back.
-///
-/// This is the ordinary application lifecycle — a window closes, a client exits — and until
-/// the review of PR #175 nothing exercised it: `ui-testclient` parked with its window open,
-/// so no buffer mapping was ever torn down in the guest. The compositor dropped its
-/// bookkeeping record on destroy and left the mapping behind, which pinned the *client's*
-/// frames, because `map_attached_buffer` closes its handle and relies on the mapping to
-/// hold the object alive.
-///
-/// Runs on its own connection so the presented window is untouched, and commits nothing —
-/// a churn window never reaches the screen.
 #[inline(never)]
 fn churn(root_ns: u64) -> bool {
-    // **Boxed.** A `ChannelTransport` is ~9 KiB against a 32 KiB stack, and moving one in
-    // and out of a `Window` each cycle overflows it — which presents as a process that dies
-    // in its prologue and never prints its own first line.
+    // **Boxed**: a `ChannelTransport` is ~9 KiB against a 32 KiB stack.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let mut t = match unsafe { ChannelTransport::connect(root_ns) } {
         Ok(t) => alloc::boxed::Box::new(t),
@@ -284,7 +196,6 @@ fn churn(root_ns: u64) -> bool {
                 return false;
             }
         };
-        // The allocation that fails first when the compositor is hoarding.
         let Some((handle, addr)) = shared_buffer(len) else {
             Line::new().s(b"churn: real buffer alloc failed at cycle ").u(cycle as u64).end();
             return false;
@@ -296,25 +207,19 @@ fn churn(root_ns: u64) -> bool {
             return false;
         }
         t = w.into_transport();
-        // The client's own half. `attach` transferred the handle away, so this mapping is
-        // all that is left holding the object on this side.
         // SAFETY: unmapping a range this process mapped in `shared_buffer`.
         unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64) };
 
-        // **A rejected attach must also give the memory back.** The handle rides the
-        // message whether or not the compositor accepts it, so an attach naming a window
-        // that does not exist — one malformed message, which any client can send — used to
-        // hand over an object nobody ever closed. Sent through the raw transport because
-        // `libsurface` deliberately cannot express it.
+        // **A rejected attach must also give the memory back**: sent raw, as `libsurface` cannot
+        // express it.
         let Some((bogus_handle, bogus_addr)) = shared_buffer(len) else {
             Line::new().s(b"churn: bogus buffer alloc failed at cycle ").u(cycle as u64).end();
             return false;
         };
-        //
-        // Alternates between two *different* disposal paths, because they are distinguished
-        // by different code. An attach that is rejected exercises the outcome branch; a
-        // handle riding `Commit` exercises the op branch — and only the second one fails if
-        // the close is ever narrowed back to `if op == OP_ATTACH_BUFFER` with an else.
+        // Alternates two disposal paths: a rejected attach exercises the outcome branch, a handle
+        // on
+        // `Commit` the op branch; only the latter fails if the close narrows to `op ==
+        // OP_ATTACH_BUFFER`.
         let mut req = [0u8; 32];
         let built = if cycle % 2 == 0 {
             build_attach_buffer_request(
@@ -346,11 +251,8 @@ fn churn(root_ns: u64) -> bool {
         let Some((rn, bogus_op)) = built else {
             return false;
         };
-        // **Waits for the refusal rather than firing and forgetting.** Two reasons: it
-        // paces the loop against the compositor, and an unconsumed error reply is a message
-        // that parks — eight of those overflow the queue and the *next* request fails for
-        // an unrelated-looking reason. `Err(Server)` is the expected answer here; anything
-        // else means the compositor accepted an attach to a window that does not exist.
+        // **Waits for the refusal**: it paces the loop; anything but `Err(Server)` means a bogus
+        // attach was accepted.
         let mut reply = [0u8; 32];
         match t.request(bogus_op, &req[..rn], Some(bogus_handle), &mut reply) {
             Err(libsurface::UiError::Server) => {}
@@ -365,17 +267,8 @@ fn churn(root_ns: u64) -> bool {
     true
 }
 
-/// Load one of the two faces the image ships, or die saying which and why.
-///
-/// **Both are resolved through the namespace and demand-paged out of ext4** — this is still the
-/// only place on the target that reads a font at all, and since M11 Part D it reads two. Every
-/// failure is fatal to the run: a font that does not load is exactly the regression this exists
-/// to catch, because the files are staged into the ext4 root by the image build, so "it did not
-/// resolve" means the staging broke. Carrying on would leave a green boot with no text on screen.
-///
-/// The theme is the built-in one. Nothing hands this client a setup record — `service-mgr`
-/// starts it — so the paths it loads are `Theme::light()`'s, which is what makes them the same
-/// two files `xtask` renders the host's reference with.
+/// Load one of the two faces the image ships, or die saying which and why: a font that fails to
+/// load must not leave a green boot with no text.
 fn load_face(root_ns: u64, face: Face) -> libdraw::text::Font {
     use libdraw::theme::Theme;
 
@@ -391,10 +284,7 @@ fn load_face(root_ns: u64, face: Face) -> libdraw::text::Font {
         }),
     };
     match loaded {
-        // **The path that was opened, not the one that was asked for.** They are the same here —
-        // this client draws with the built-in theme, so there is nothing to fall back from — and
-        // reporting the request would still be reporting the wrong thing the day that changes,
-        // on a line `check-display` asserts against (PR #264 review, finding 1).
+        // **The path opened, not the one asked for**: `check-display` asserts against this line.
         Ok((f, opened)) => {
             Line::new().s(b"ui-testclient: font loaded ").s(opened.as_str().as_bytes()).end();
             f
@@ -406,29 +296,17 @@ fn load_face(root_ns: u64, face: Face) -> libdraw::text::Font {
     }
 }
 
-/// Which of the two faces a caller wants.
-///
-/// Named `Face` rather than `Role` because a window already has one of those, and the two would
-/// read as the same word for two unrelated things in one file.
 enum Face {
-    /// The desktop's, proportional — what the toolkit's reference is drawn with.
     Ui,
-    /// The terminal's, fixed-advance — what the grid's reference is drawn with.
     Mono,
 }
 
-/// Present [`libui::reference`] in a window of its own, drawn with `font` from the disk.
-///
-/// The window must be kept alive: dropping it closes the channel, the compositor destroys the
-/// window, and the picture leaves the screen.
-///
-/// Every failure here is fatal to the run, for the reason [`load_face`] gives.
+/// Present [`libui::reference`] in a window of its own, drawn with `font`; the caller keeps the
+/// window.
 fn present_reference_ui(root_ns: u64, font: &libdraw::text::Font) -> Win {
     let (w, h) = (libui::reference::WIDTH, libui::reference::HEIGHT);
     let pitch = libui::reference::PITCH;
     let len = pitch * h as usize;
-    // Rendered once. `into_bytes` hands back the buffer at exactly this pitch, so the copy
-    // below is a straight memcpy rather than the row-by-row translation the scene needs.
     let picture = libui::reference::render(font).into_bytes();
     if picture.len() != len {
         fail(b"ui-testclient: reference UI is not the size it declares\n");
@@ -454,9 +332,7 @@ fn present_reference_ui(root_ns: u64, font: &libdraw::text::Font) -> Win {
             fail(b"ui-testclient: reference UI AttachBuffer FAILED\n");
         }
     }
-    // Commit both, then block for a release. One commit and one `acquire` would return the
-    // *other* free buffer immediately and prove nothing: the gate screendumps later, on a
-    // different channel, so without a receipt this window could still be uncomposited then.
+    // Commit both, then block for a release: one commit and one `acquire` proves nothing.
     for i in 0..BUFFERS {
         if win.commit(i as u32, (0, 0, w, h)).is_err() {
             fail(b"ui-testclient: reference UI Commit FAILED\n");
@@ -476,16 +352,10 @@ fn present_reference_ui(root_ns: u64, font: &libdraw::text::Font) -> Win {
     win
 }
 
-/// Present [`libterm::render::reference`] in a window of its own, drawn with `font`.
+/// Present [`libterm::render::reference`] in a window of its own, the gate's third region.
 ///
-/// The gate's third region, and the only place a terminal render is compared against pixels
-/// that actually reached a screen. Same shape as [`present_reference_ui`] and same contract:
-/// the caller keeps the window, and every failure here is fatal.
-///
-/// **The reference rather than `nxterm`'s window**, which is also on screen. A live terminal's
-/// first frame is deterministic but shows a boot banner — one plain line — whereas this stream
-/// is built so each of its lines fails differently. A gate should compare the picture that
-/// discriminates.
+/// **The reference, not `nxterm`'s window**: a live first frame is a banner; this stream makes each
+/// line fail differently.
 fn present_reference_term(root_ns: u64, font: &libdraw::text::Font) -> Win {
     use libterm::render::reference;
 
@@ -518,8 +388,6 @@ fn present_reference_term(root_ns: u64, font: &libdraw::text::Font) -> Win {
             fail(b"ui-testclient: reference terminal AttachBuffer FAILED\n");
         }
     }
-    // Both buffers, then block for a release — see `present_reference_ui` for why one commit
-    // proves nothing.
     for i in 0..BUFFERS {
         if win.commit(i as u32, (0, 0, w, h)).is_err() {
             fail(b"ui-testclient: reference terminal Commit FAILED\n");
@@ -539,17 +407,10 @@ fn present_reference_term(root_ns: u64, font: &libdraw::text::Font) -> Win {
     win
 }
 
-/// Ask the manager channel to put `window` at `(x, y)`. `false` if the request did not succeed.
+/// Ask the manager channel to put `window` at `(x, y)`; `false` on failure.
 ///
-/// **The reply is no longer discarded, and the old reason it could be was wrong.** This said the
-/// display gate checked the result, because "a placement that silently failed shows up there as
-/// a window in the wrong place" — which it cannot, since every placement here is to `(0, 0)` and
-/// that is already the compositor's default. A refused `Place` moved nothing and looked
-/// identical. Demonstrated in review: with every `OP_MGR_PLACE` made to fail, `check-display`
-/// stayed green (PR #216 review, blocking 1).
-///
-/// A successful reply still only says the compositor answered `Ok`, so the caller reads the
-/// origin back through `/dev/draw/<id>/info` — see `verify_placement`.
+/// The reply is not discarded: a refused `Place` moves nothing and looks identical, so the caller
+/// reads the origin back.
 fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32) -> bool {
     use librsproto::surface::{MgrPlace, OP_MGR_PLACE};
     let mut body = [0u8; 12];
@@ -561,8 +422,7 @@ fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32) -> bool
     mgr.request(OP_MGR_PLACE, &body, None, &mut reply).is_ok()
 }
 
-/// Raise `window` to the top of the stack through the manager channel. `false` if the request
-/// did not succeed.
+/// Raise `window` to the top through the manager channel; `false` on failure.
 fn raise_window(mgr: &mut ChannelTransport, window: u32) -> bool {
     use librsproto::surface::{MgrWindowRef, OP_MGR_RAISE};
     let mut body = [0u8; 8];
@@ -573,25 +433,14 @@ fn raise_window(mgr: &mut ChannelTransport, window: u32) -> bool {
     mgr.request(OP_MGR_RAISE, &body, None, &mut reply).is_ok()
 }
 
-/// Drive the three desktop requests over the real manager channel and read each back.
-///
-/// **What this covers that a host unit test cannot.** `compose_into`, `hit` and
-/// `focus_candidate` are exercised directly by `compositor`'s own tests, and those are the
-/// functions the binary calls — so the filtering itself is pinned there. What no host test can
-/// reach is the **wire**: that a real client's request, encoded into a body and sent down
-/// `/dev/draw/manage`, is routed to the right arm of `dispatch` and answered. That is the gap
-/// PR #233 fell into, where a title cap was specified, tested in isolation, and unreachable on
-/// the path a client actually uses.
-///
-/// **The window ends exactly where it started**, so this changes no pixel the display gate
-/// compares — the round trip is the assertion, not a state left behind.
+/// Drive the three desktop requests over the real manager channel and read each back (the **wire**
+/// is what no host test reaches); the window ends where it started.
 fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32) {
     use librsproto::surface::{
         MgrDesktop, MgrWindowValue, OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_MINIMIZED, OP_MGR_SET_WINDOW_DESKTOP,
         STICKY_DESKTOP, WINDOW_FLAG_MINIMIZED,
     };
 
-    /// Send one `window`+`value` request; `false` if the compositor did not answer `Ok`.
     fn send_value(mgr: &mut ChannelTransport, op: u16, window: u32, value: u32) -> bool {
         let mut body = [0u8; 8];
         if (MgrWindowValue { window, value }).write(&mut body).is_none() {
@@ -601,8 +450,7 @@ fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32
         mgr.request(op, &body, None, &mut reply).is_ok()
     }
 
-    // Desktop, there and back. Read back through `info` rather than trusting the reply: an
-    // `Ok` says the compositor answered, which is the distinction PR #216 turned into a rule.
+    // Desktop, there and back, read back through `info` rather than trusting an `Ok`.
     if !send_value(mgr, OP_MGR_SET_WINDOW_DESKTOP, window, 2) {
         fail(b"ui-testclient: SetWindowDesktop was refused\n");
     }
@@ -620,8 +468,7 @@ fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32
         fail(b"ui-testclient: SetWindowDesktop back to 1 was refused\n");
     }
 
-    // Minimized, there and back — the second attribute, and a separate bit in `info` so that a
-    // compositor folding the two into one would fail here rather than look equivalent.
+    // Minimized, there and back: a separate bit in `info`, so folding it into desktop fails here.
     if !send_value(mgr, OP_MGR_SET_MINIMIZED, window, 1) {
         fail(b"ui-testclient: SetMinimized was refused\n");
     }
@@ -638,10 +485,8 @@ fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32
         fail(b"ui-testclient: restoring from minimized was refused\n");
     }
 
-    // The current desktop, and the one value it refuses. `STICKY_DESKTOP` as a *current*
-    // desktop would composite only sticky windows and make everything created afterwards
-    // sticky, so the compositor rejects it — and this is the only place that rejection is
-    // reached the way a real caller reaches it.
+    // The current desktop, and the one value it refuses: `STICKY_DESKTOP` would make new windows
+    // sticky.
     let mut body = [0u8; 4];
     if (MgrDesktop { desktop: STICKY_DESKTOP }).write(&mut body).is_none() {
         fail(b"ui-testclient: could not encode a SetCurrentDesktop body\n");
@@ -650,8 +495,7 @@ fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32
     if mgr.request(OP_MGR_SET_CURRENT_DESKTOP, &body, None, &mut reply).is_ok() {
         fail(b"ui-testclient: the compositor ACCEPTED a current desktop of 0\n");
     }
-    // And a legal switch is accepted — then straight back, so the scene the display gate
-    // compares is the one this client drew.
+    // A legal switch is accepted, then straight back so the display gate's scene is unchanged.
     for d in [2u32, 1] {
         let mut body = [0u8; 4];
         if (MgrDesktop { desktop: d }).write(&mut body).is_none() {
@@ -666,9 +510,6 @@ fn verify_desktop_requests(mgr: &mut ChannelTransport, root_ns: u64, window: u32
 }
 
 /// Place `window` at `(x, y)` and read the origin back through `/dev/draw/<id>/info`.
-///
-/// This is what makes the gate's placement line mean something. The reply to `Place` says the
-/// compositor answered; only the read-back says the window moved.
 fn verify_placement(mgr: &mut ChannelTransport, root_ns: u64, window: u32, x: i32, y: i32) {
     if !place_window(mgr, window, x, y) {
         fail(b"ui-testclient: a manager Place was refused\n");
@@ -694,38 +535,18 @@ fn verify_placement(mgr: &mut ChannelTransport, root_ns: u64, window: u32, x: i3
     }
 }
 
-/// How long one `wait_event_timeout` slice waits for a manager event, and how many slices.
-///
-/// **Up to ~2s, not a 2s budget.** An event of the wrong kind consumes a slice without
-/// waiting, so the wall-clock floor is only reached when nothing arrives at all. That is the
-/// case this bound exists for; with the handful of strays this probe can see, the count is
-/// ample either way. Generous next to a compositor that flushes its manager outbox every loop
-/// iteration, and short enough that a missing event is reported *by name* here rather than by
-/// the gate's wall-clock timeout, which cannot say which event never came.
+/// One `wait_event_timeout` slice and the slice count: ~2s, so a missing event is reported *by
+/// name* here.
 const MGR_EVENT_SLICE_NS: u64 = 100_000_000;
 const MGR_EVENT_TRIES: u32 = 20;
 
-/// How long a popup's first `Configure` may take before it is treated as having been held.
-///
-/// Bimodal, not a tolerance: a popup that is exempt from the initial-configure hold is answered
-/// in the same handler that created it, and one that is held waits out `CONFIGURE_DEADLINE_NS`
-/// — 200 ms. Anything in between does not happen, so 50 ms sits far from both.
-///
-/// **Slices that expired**, not iterations: a record that was already queued returns at once and
-/// must not spend the budget, or the bound is "five other events" rather than 50 ms.
+/// How long a popup's first `Configure` may take before it counts as held: an exempt popup is
+/// answered at once, a held one waits 200 ms (`CONFIGURE_DEADLINE_NS`); only expired slices count.
 const POPUP_CONFIGURE_SLICE_NS: u64 = 10_000_000;
 const POPUP_CONFIGURE_SLICES: u32 = 5;
 
-/// Wait for an event with op `want` that names window `id`. Returns its body length.
-///
-/// **Filtered by window, not just by op**, because several windows are alive here and one
-/// change produces records about more than one of them: focus moving to a new window emits
-/// the *loss* for the old one first, so a wait that took the first `WindowFocus` off the
-/// wire would read the wrong window's event and call the feature broken. `window_of` is
-/// per-op because each body puts the id in a different place.
-///
-/// Events of other kinds are discarded: the four are queued by different paths in the
-/// compositor and this checks that each *arrives*, not how they interleave.
+/// Wait for an event with op `want` that names window `id`, returning its body length; **filtered
+/// by window**, as focus moving to a new window emits the *loss* for the old one first.
 fn await_mgr(
     mgr: &mut ChannelTransport,
     want: u16,
@@ -763,27 +584,16 @@ fn destroyed_window(b: &[u8]) -> Option<u32> {
 }
 
 /// Throw away whatever the run queued before the probe below starts.
-///
-/// `poll_event`, not a zero timeout: this wants what is already here and nothing more.
 fn drain_mgr(mgr: &mut ChannelTransport) {
     let mut buf = [0u8; 64];
     while let Ok(Some(_)) = mgr.poll_event(&mut buf) {}
 }
 
-/// **A window is not shown until it has been configured, and the manager configures it** — M6 B4.
+/// **A window is not shown until it has been configured, and the manager configures it.**
 ///
-/// The interleaving is the whole test, and it is why this cannot use `Window::new`: that call
-/// creates the window *and* blocks for the configure, so a single-threaded client that is also
-/// the manager would be waiting for an answer only it can give. (B3's probe does exactly that
-/// and is released by the deadline instead — which is a fair test of the deadline and no test
-/// at all of the manager path.) Splitting the two with the raw transport is also the pattern a
-/// real manager-and-client process has to follow, so it is worth showing once.
-///
-/// Three things are asserted, in order:
-///   1. the `CreateWindow` **reply** arrives at once — only the configure is held;
-///   2. no configure arrives while the manager has not answered;
-///   3. the configure that does arrive carries the origin **the manager placed**, not the
-///      default — which is the launch-without-a-jump this milestone item exists for.
+/// It cannot use `Window::new`, which blocks for a configure only this client, as the manager, can
+/// release. Asserted: the reply arrives at once, no configure before the manager answers, and the
+/// one that comes carries the origin **the manager placed**.
 fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
     drain_mgr(mgr);
 
@@ -810,21 +620,9 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
         fail(b"ui-testclient: B4 CreateWindow reply did not decode\n");
     };
 
-    // 2. **Nothing yet.** The reply came back, so the compositor has handled the request in
-    //    full; a configure it did not hold would already be queued. Polled rather than waited,
-    //    because the assertion is an absence and waiting for one proves nothing.
-    //
-    //    **Every queued event, not the first.** A single poll only fails if a configure happens
-    //    to be at the head of the ring, and it will not be: creating a window puts it on top of
-    //    the stack, so a `FocusEvent` is queued for it first. A release that moved slightly
-    //    earlier — onto the created-event, say, rather than onto the manager acting — would
-    //    then sit second and the check would report success (PR #218 review, finding 4).
-    //
-    //    **A `FocusEvent` for this window is a failure here too**, and that assertion is not
-    //    decoration: a held window is not on screen, so it must not be the focus candidate, and
-    //    nothing about it can be announced before the configure that makes it one. Draining is
-    //    what makes the configure check thorough and is also what would hide this one — the
-    //    stray record would simply be discarded — so the drain has to judge what it discards.
+    // 2. **Nothing yet**, polled since the assertion is an absence: **every queued event, not the
+    // first** (a `FocusEvent` is queued ahead of any configure), and **a `FocusEvent` for this
+    // window fails too**: a held window is not on screen.
     let mut buf = [0u8; 64];
     while let Ok(Some((op, n))) = t.poll_event(&mut buf) {
         if op == OP_CONFIGURE {
@@ -849,13 +647,8 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
         fail(b"ui-testclient: B4 Place was refused\n");
     }
 
-    // 4. And the held configure arrives, carrying where the manager put it — **as the very
-    //    next record on this channel**, which is what the spec promises about `CreateWindow`
-    //    producing the reply and then a `Configure`. Asserted strictly rather than searched
-    //    for, because the ordering is the interesting part: a held window is not a focus
-    //    candidate (it is not on screen), so nothing about it can be announced before the
-    //    configure that makes it one. Searching past other records would pass on a compositor
-    //    that announced focus for an invisible window first.
+    // 4. The held configure arrives with the manager's placement **as the very next record**:
+    // asserted, not searched for, or focus announced for an invisible window first would pass.
     let mut waited = 0;
     let cfg = loop {
         match t.wait_event_timeout(&mut buf, MGR_EVENT_SLICE_NS) {
@@ -893,30 +686,14 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
 
     kprint(b"ui-testclient: the first configure carried the manager's placement\n");
 
-    // **Closed, not leaked.** These probes used to `core::mem::forget` their transport, because
-    // closing a session makes the compositor tear it down and repaint the whole screen, which
-    // raced `check-display`'s capture. That race is gone — the gate now captures only once two
-    // consecutive screendumps match (B4) — and leaking was never free: an unread session's
-    // outbox never empties, so the compositor stays `parked` and wakes every
-    // `RETRY_INTERVAL_NS` to retry sends that can never land, for the rest of the boot. That is
-    // steady pressure on exactly the path `input-testclient`'s stall phase measures.
+    // **Closed, not leaked**: an unread session's outbox never empties, so the compositor would
+    // retry for the rest of the boot.
     drop(t);
 }
 
-/// **A popup is placed by its creator, relative to its parent** — M6 C1, on the wire.
-///
-/// Two things only a booted guest can show. That the offset is resolved against the parent's
-/// **current** origin, so a popup created after the manager moved its parent lands beside the
-/// parent rather than beside where it started. And that a popup is **not** held for the
-/// manager: its position is its creator's business, so there is nobody to wait for, and holding
-/// it would spend the initial-configure deadline on every menu open.
-///
-/// **Raw transport, and not because `libsurface` cannot do this any more.** `Session` holds
-/// both windows on one connection since C3 part 2, which is what a popup needs — a popup may
-/// only name a parent its own connection owns. The live reason is different: this client is
-/// *also* the manager, and `Session::create` blocks for a window's first `Configure`, which for
-/// a `normal` window with a manager attached only the manager can release. Splitting create
-/// from wait is the pattern such a process has to follow either way.
+/// **A popup is placed by its creator, relative to its parent**: the offset resolves against the
+/// parent's **current** origin, and a popup is **not** held for the manager; raw transport, as in
+/// the module doc.
 fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     drain_mgr(mgr);
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
@@ -925,31 +702,20 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
         Err(_) => fail(b"ui-testclient: C1 connect to /dev/draw FAILED\n"),
     };
 
-    // 1. A parent, moved somewhere the default placement would never put it — so an offset
-    //    resolved against `(0, 0)` instead of against the parent is a different answer.
+    // 1. A parent moved off the default, so an offset resolved against `(0, 0)` differs.
     let parent = raw_create(&mut t, &CreateWindowRequest::new(120, 90, Role::Normal), b"C1 parent");
     let (px, py) = (211i32, 143i32);
     if !place_window(mgr, parent, px, py) {
         fail(b"ui-testclient: C1 parent Place was refused\n");
     }
 
-    // 2. The popup. Negative in x, so it hangs off the parent's left edge: a menu that could not
-    //    do that would not be a menu. That it is *drawn* there is C2's host test, which reads
-    //    pixels; this checks the geometry the compositor recorded.
+    // 2. The popup, negative in x so it hangs off the parent's left edge.
     let (ox, oy) = (-14i32, 90i32);
     let popup = raw_create(&mut t, &CreateWindowRequest::at(40, 30, Role::Popup { parent }, ox, oy), b"C1 popup");
 
-    // 3. **Not held.** Nothing here answered as the manager, so a popup that was held would
-    //    still be waiting. Bounded by *elapsed time*, not by iterations — see
-    //    `POPUP_CONFIGURE_SLICES`.
-    //
-    //    **Only an empty slice counts.** `wait_event_timeout` returns a queued record without
-    //    waiting, so counting every iteration would spend the budget on other people's events
-    //    rather than on time: two of the five were already gone before this ever ran, on the
-    //    parent's own configure and the focus change that followed it. One more record ahead of
-    //    the popup — a pointer crossing the parent, a third window in this probe — and the gate
-    //    would report "a popup waited for the manager" about a compositor that is perfectly
-    //    fine (PR #219 review, finding 1).
+    // 3. **Not held**: nothing answered as the manager. **Only an empty slice counts** against
+    // `POPUP_CONFIGURE_SLICES`: a queued record returns without waiting, so counting iterations
+    // would spend the budget on other windows' events.
     let mut buf = [0u8; 64];
     let mut empty_slices = 0;
     loop {
@@ -958,7 +724,6 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
                 Some(c) if c.window == popup => break,
                 _ => {}
             },
-            // Somebody else's record. It cost no time, so it costs no budget.
             Ok(Some(_)) => {}
             Ok(None) => {
                 empty_slices += 1;
@@ -990,18 +755,12 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
 
     kprint(b"ui-testclient: a popup was placed by its creator, without the manager\n");
 
-    // 5. **And a `dialog` is the other way round on both counts.** It names a parent, but the
-    //    parent carries its desktop membership and its lifetime — not its position — so a
-    //    manager places it and it is held like a `normal`. The offset below is deliberately
-    //    large and deliberately ignored.
-    //
-    //    Neither half of that is reachable from a host test: `placed_by_creator` lives in the
-    //    `#![no_main]` bin, which `cargo test -p compositor --lib` does not build. Without this
-    //    the two roles could be merged back into one arm and every gate would stay green
-    //    (PR #220 review, finding 2).
+    // 5. **A `dialog` is the other way round on both counts**: its parent carries desktop
+    // membership and lifetime, not position, so a manager places it and it is held like a `normal`;
+    // the offset is ignored. `placed_by_creator` is in the bin no host test builds, so the two
+    // roles could merge unnoticed.
     let dialog = raw_create(&mut t, &CreateWindowRequest::at(24, 18, Role::Dialog { parent }, 500, 400), b"C1 dialog");
 
-    // Held: nothing answers as the manager yet, so no configure may arrive for it.
     let mut slices = 0;
     while slices < POPUP_CONFIGURE_SLICES {
         match t.wait_event_timeout(&mut buf, POPUP_CONFIGURE_SLICE_NS) {
@@ -1010,15 +769,14 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
                     fail(b"ui-testclient: a dialog was configured with no manager answer\n");
                 }
             }
-            // Somebody else's record; it cost no time, so it costs no budget.
             Ok(Some(_)) => {}
             Ok(None) => slices += 1,
             Err(_) => fail(b"ui-testclient: C1 dialog channel error\n"),
         }
     }
 
-    // The manager places it, which releases the hold — and what the client is told is the
-    // manager's placement, not the offset it asked for.
+    // The manager places it, which releases the hold; the client gets the placement, not its
+    // offset.
     let (dx, dy) = (301i32, 217i32);
     if !place_window(mgr, dialog, dx, dy) {
         fail(b"ui-testclient: C1 dialog Place was refused\n");
@@ -1056,14 +814,10 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
 
     kprint(b"ui-testclient: a dialog was held for the manager and placed by it\n");
 
-    // Destroying the parent takes the popup with it — transitively, which is the stack's rule.
     let mut body = [0u8; 8];
     body[..4].copy_from_slice(&parent.to_le_bytes());
-    // **An empty reply buffer is how the transport is told an op is silent** — `DestroyWindow`
-    // answers only on failure. Passing a real buffer parks this thread waiting for a reply that
-    // is never coming, which is a hang rather than an error.
+    // **An empty reply buffer tells the transport the op is silent**; a real one would hang.
     let _ = t.request(librsproto::surface::OP_DESTROY_WINDOW, &body[..4], None, &mut []);
-    // Closed rather than leaked, for the reasons given in `verify_initial_configure`.
     drop(t);
 }
 
@@ -1091,22 +845,13 @@ fn raw_create(t: &mut ChannelTransport, req: &CreateWindowRequest, what: &[u8]) 
     }
 }
 
-/// **One window's whole life, watched from the manager channel** — M6 B3.
-///
-/// The manager is told about windows it did not create, which is the half of the seam B1
-/// left unproven: B1 showed a manager can *act* (`Place`), not that it is *told* anything.
-/// Each of the four events is queued by a different path in the compositor, so each is
-/// checked separately and named separately when it does not come.
-///
-/// The *transitive* removed set — a popup going with its parent — is covered by the host
-/// test `take_removed_reports_the_whole_subtree_parent_first_then_drains`. What only a
-/// booted guest can show is that these records are framed, queued and delivered at all.
+/// **One window's whole life, watched from the manager channel**; each event is checked and named
+/// separately.
 fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::boxed::Box<ChannelTransport> {
-    // Everything the reference placements above queued is not this probe's business.
     drain_mgr(mgr);
 
-    // A window created *after* the manager attached, so it is announced. Small and never
-    // committed, so it paints nothing the display gate could capture.
+    // Created *after* the manager attached, so it is announced; never committed, so it paints
+    // nothing.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let t = match unsafe { ChannelTransport::connect(root_ns) } {
         Ok(t) => alloc::boxed::Box::new(t),
@@ -1141,7 +886,6 @@ fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::box
         fail(b"ui-testclient: WindowCreated carried the wrong role\n");
     }
 
-    // 2. Focus — a new window takes the keyboard, and the manager is told.
     let n = await_mgr(
         mgr,
         OP_MGR_WINDOW_FOCUS,
@@ -1157,13 +901,8 @@ fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::box
         fail(b"ui-testclient: WindowFocus did not say the new window gained focus\n");
     }
 
-    // 3. Geometry — **after a move to somewhere that is not the default, on a window whose
-    //    committed size is not the size it asked for.** `(0, 0)` is where the compositor
-    //    already puts windows, so a geometry event reporting the origin cannot be told from one
-    //    that echoed the request without the window having moved. And the two sizes must
-    //    differ, or an event reporting the *requested* size looks identical to one reporting
-    //    what is actually on screen — which is exactly how that defect survived this gate the
-    //    first time (PR #217 review, finding 1).
+    // 3. Geometry, **after a move off the default, on a window committed at a size other than
+    // requested**: otherwise an event echoing the request looks like one reporting the screen.
     let (cw, ch) = (32u32, 16u32);
     let cpitch = cw as usize * 4;
     let Some((chandle, caddr)) = shared_buffer(cpitch * ch as usize) else {
@@ -1175,8 +914,7 @@ fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::box
     if w.commit(0, (0, 0, cw, ch)).is_err() {
         fail(b"ui-testclient: probe commit FAILED\n");
     }
-    // A commit that resizes is itself a geometry change, and it is announced. Take that one
-    // off the wire before placing, so step 3 below reads the event for the *move*.
+    // A commit that resizes is itself announced; take that off the wire so step 3 reads the *move*.
     await_mgr(
         mgr,
         OP_MGR_WINDOW_GEOMETRY,
@@ -1230,7 +968,6 @@ fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::box
         fail(b"ui-testclient: WindowGeometry reported a size that is not what is on screen\n");
     }
 
-    // 4. Destroyed.
     if w.destroy().is_err() {
         fail(b"ui-testclient: probe destroy FAILED\n");
     }
@@ -1242,60 +979,36 @@ fn verify_manager_events(mgr: &mut ChannelTransport, root_ns: u64) -> alloc::box
         &mut buf,
         b"ui-testclient: no WindowDestroyed for the probe window\n",
     );
-    // The client's own half of the buffer; `attach` transferred the handle away.
     // SAFETY: unmapping a range this process mapped in `shared_buffer`.
     unsafe { syscall2(SYS_MEMORY_UNMAP, caddr as u64, (cpitch * ch as usize) as u64) };
 
     kprint(b"ui-testclient: manager saw created, focus, geometry and destroyed\n");
 
-    // **Handed back rather than dropped.** Closing this session would make the compositor
-    // tear it down and *full-screen repaint* — the path that redraws the cursor after a
-    // client dies under it (PR #185 review, finding 1). Recompositing 1280x800 takes long
-    // enough that the display gate, which captures as soon as this client says the scene is
-    // up, caught a torn frame about half the time: reference windows half-drawn, no cursor.
-    // The window is destroyed either way, which is what this probe is checking; keeping the
-    // channel open just means the probe's *cleanup* is not the last thing to touch the screen.
+    // **Handed back rather than dropped**: closing the session repaints the screen, which tore the
+    // gate's capture.
     w.into_transport()
 }
 
-/// Report failure and end the run.
-///
-/// Called instead of exiting with a code, because init cannot wait for this program: on
-/// success it never exits.
+/// Report failure and end the run; init cannot wait on this program, which on success never exits.
 fn fail(msg: &[u8]) -> ! {
     kprint(msg);
-    // The same verdict path init uses. Unconditional rather than `cfg`-gated: this binary
-    // is embedded only in selftest/test-harness images, and on a kernel without the exit
-    // device the syscall is `Unsupported` and falls through to `exit` below.
-    //
+    // The verdict path init uses; unconditional because this binary is embedded only in test
+    // images, and without the exit device the syscall is `Unsupported` and falls through to `exit`.
     // SAFETY: SYS_TEST_EXIT takes the verdict in a0; under the test-harness kernel it
     // terminates QEMU, so this does not return in practice.
     unsafe { libkern::syscall1(libkern::SYS_TEST_EXIT, libkern::TEST_EXIT_FAILURE as u64) };
     exit(1);
 }
 
-/// Entry point: connect, create a window, share buffers, present, then park.
-///
-/// Called by the kernel's ELF entry with the standard bootstrap arguments — `notif` is this
-/// process's notification handle and `root_ns` its root namespace.
+/// Entry point: connect, create a window, share buffers, present, then serve chords or park.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"ui-testclient: up\n");
 
-    // 0. The reference pictures, each in its own window, **before** the scene's and in
-    //    decreasing size — windows stack in creation order, so each must be smaller than the one
-    //    below or it would hide it entirely and the gate would compare a region that is not on
-    //    screen. Held for the process's life; dropping either closes its channel and takes the
-    //    window off the screen.
-    //
-    //    The toolkit's is 320x160, the terminal's 180x96 and the scene's 64x32.
-    //
-    //    **Two fonts since M11 Part D, and which picture gets which is the point.** The toolkit's
-    //    window is the desktop's proportional face and the terminal's is the fixed-advance one;
-    //    they used to share a single load, and the comment then said the two windows were
-    //    "provably drawn with the same bytes". Now the claim worth making is the opposite, and
-    //    `check-display` makes it: the host renders each reference with the same file the guest
-    //    read, so a client that loaded the wrong one fails against real pixels.
+    // 0. The reference pictures first, in decreasing size (320x160, 180x96, then the scene's
+    // 64x32), as windows stack in creation order and a larger later one would hide a region the
+    // gate compares. **Which font each gets is the point**: the host renders each with the file the
+    // guest read, so the wrong one fails against real pixels.
     let ui_font = load_face(root_ns, Face::Ui);
     let mono_font = load_face(root_ns, Face::Mono);
     let _ui_window = present_reference_ui(root_ns, &ui_font);
@@ -1304,15 +1017,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 1. A session. The compositor mints a channel per resolve of `/dev/draw/new`.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
-        // Boxed for the same reason `churn` boxes its own: ~9 KiB of message buffers has no
-        // business sitting in a 32 KiB stack frame alongside everything else here.
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => {
             fail(b"ui-testclient: connect to /dev/draw FAILED\n");
         }
     };
 
-    // 2. A window. This blocks on the compositor's reply — the step that did not exist.
     let (w, h) = (scene::SCREEN_WIDTH, scene::SCREEN_HEIGHT);
     let mut win = match Win::open(transport, w, h, Role::Normal) {
         Ok(win) => win,
@@ -1322,35 +1032,23 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     };
     Line::new().s(b"ui-testclient: window ").u(win.id() as u64).end();
 
-    // 2b. Read the window's own metadata back through the *numbered* path. This is the
-    //     other half of Part B: `/dev/draw/new` mints a session, `/dev/draw/<N>/info`
-    //     answers with a mapped snapshot. Checking it here rather than in a host test is
-    //     what proves the resolve suffix, the id parsing and the object hand-off agree.
+    // 2b. Read the window back through the *numbered* path: resolve suffix, id parsing, object
+    // hand-off.
     if !check_info(root_ns, win.id(), w, h) {
         fail(b"ui-testclient: /dev/draw/<N>/info FAILED\n");
     }
 
-    // 2c. Open and close windows until the guest would run out of memory if the compositor
-    //     kept a single one of their buffers mapped. Before the presented window exists in
-    //     its final form, so a churn window can never be what `check-display` captures.
+    // 2c. Churn before the presented window exists in final form, so no churn window is captured.
     if !churn(root_ns) {
-        // Deliberately names **no** suspect. This line used to blame the compositor for
-        // leaking, and during review it misattributed two client-side failures in a row —
-        // the parked-queue overflow and a missing `RS_FLAG_ERROR` check. This PR's own
-        // lesson applies to its own diagnostics: when the picture is wrong, the compositor
-        // is not the only suspect. The `churn:` line above says which step failed.
+        // Names **no** suspect: the compositor is not the only one; the `churn:` line says which
+        // step failed.
         fail(b"ui-testclient: window churn FAILED (see the churn: line above)\n");
     }
     Line::new().s(b"ui-testclient: churned ").u(CHURN_CYCLES as u64).s(b" windows").end();
 
-    // 3. Shared memory. Rendered once; both buffers get the same picture, so whichever is
-    //    on screen at the end is the one `check-display` expects.
-    // **Attached at `SCREEN_PITCH` (268), not `w * 4` (256).** The extra 12 bytes are three
-    // pixels of row padding that exist for exactly one reason: any code computing a row
-    // offset from the width rather than the pitch skews every row after the first, and a
-    // 256-byte buffer hides that bug because the two numbers agree. `display-selftest` used
-    // to carry this coverage in the guest; when the client took over producing the picture
-    // it briefly did not (PR #175 review, finding 7).
+    // 3. Shared memory, rendered once: both buffers get the same picture.
+    // **Attached at `SCREEN_PITCH` (268), not `w * 4` (256)**: the row padding catches code that
+    // computes a row offset from the width, which a 256-byte buffer hides.
     let pitch = scene::SCREEN_PITCH;
     let len = pitch * h as usize;
     let rendered = scene::render_reference();
@@ -1360,7 +1058,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         let Some((handle, addr)) = shared_buffer(len) else {
             fail(b"ui-testclient: buffer alloc FAILED\n");
         };
-        // Copy the scene in, row by row: the client's pitch and the render's may differ.
         for y in 0..h {
             for x in 0..w {
                 let c = Framebuffer::get_pixel(&rendered, x, y).unwrap_or_default();
@@ -1376,17 +1073,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     }
     let _ = maps;
 
-    // 4. More frames than buffers. From frame 3 this only proceeds if the compositor
-    //    released the buffer that left the screen — a one-way protocol stalls here.
+    // 4. More frames than buffers: from frame 3 this proceeds only if the compositor released one.
     for frame in 0..FRAMES {
-        // `acquire` blocks if the compositor holds every buffer. Polling once and giving up
-        // is how this stalled at frame 2 the first time: a release that has not arrived
-        // *yet* is not one that will never arrive.
+        // `acquire` blocks if the compositor holds every buffer; polling once stalled at frame 2.
         let b = match win.acquire() {
             Ok(b) => b,
             Err(_) => {
-                // Built here rather than split across `fail`, which prints its argument as
-                // given: the frame number and the reason are one line.
                 Line::new().s(b"ui-testclient: STALLED at frame ").u(frame as u64).s(b" -- no buffer released").end();
                 fail(b"");
             }
@@ -1396,12 +1088,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
     }
 
-    // **Confirm the last commit was actually processed.** Printing straight after the
-    // final `commit` would race the compositor: the send returns as soon as the message is
-    // queued, so the gate could screendump a frame that has not been composited yet. One
-    // more `acquire` blocks until a `Release` arrives, and the compositor only sends that
-    // after handling the commit that displaced the buffer — so it is a receipt, not a
-    // sleep.
+    // **Confirm the last commit was processed**: one more `acquire` returns only after a `Release`,
+    // so the gate cannot screendump an uncomposited frame — a receipt, not a sleep.
     if win.acquire().is_err() {
         fail(b"ui-testclient: final frame never acknowledged\n");
     }
@@ -1413,68 +1101,34 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         .u(BUFFERS as u64)
         .s(b" buffers")
         .end();
-    // **Place the reference windows explicitly, through the manager channel.**
-    //
-    // They land at the origin anyway — that is the compositor's default and M6 kept it — so this
-    // changes no pixel. What it changes is what the display gate *means*: its nesting assertion
-    // was an accident it relied on (windows cannot move, so they must overlap at the origin) and
-    // is now a placement this client performs. A gate that asserts a behaviour beats one that
-    // asserts the absence of a feature, and the seam gets its first consumer a milestone before
-    // the shell exists.
-    //
-    // Best-effort: a compositor with a manager already attached refuses, and this client is a
-    // test fixture rather than the manager of a real session.
-    //
-    // Outlives the block below deliberately; see where it is assigned.
+    // **Place the reference windows explicitly through the manager channel**: they land at the
+    // origin anyway, but the gate's nesting assertion is now a placement this client performs.
+    // Best-effort. Outlives the block below.
     let mut probe_session: Option<alloc::boxed::Box<ChannelTransport>> = None;
-    // **The manager channel outlives the block below too**, since M8 Part B: the client keeps
-    // serving registered chords for the rest of its life, which is what lets a gate ask the
-    // guest to change what is on screen. Dropping it at the end of the block would close the
-    // channel and take the chord table with it.
+    // **Outlives the block below too**: the client serves chords for the rest of its life.
     let mut manager: Option<ChannelTransport> = None;
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     if let Ok(mut mgr) = unsafe { ChannelTransport::manage(root_ns) } {
-        // **Before the placements below, not after.** This probe creates and destroys a
-        // window, so it is the noisiest thing this client does to the screen; running it
-        // first leaves the reference placements as the last screen-affecting work, which is
-        // the sequence the display gate was stable under before this probe existed.
-        //
-        // **Bound outside this block**, so it lives as long as the process rather than as
-        // long as the manager channel. Dropping it here would close the probe's session, and
-        // the compositor answers a closed session with a full-screen repaint — the thing this
-        // whole arrangement exists to keep away from the moment a gate starts looking at, or
-        // clicking on, the screen.
+        // **Before the placements**: this probe creates and destroys a window, so it goes first and
+        // leaves the placements last. **Bound outside this block**: dropping it closes the probe's
+        // session and repaints the screen.
         probe_session = Some(verify_manager_events(&mut mgr, root_ns));
         verify_initial_configure(&mut mgr, root_ns);
         verify_popup_placement(&mut mgr, root_ns);
 
-        // **Move one window somewhere that is not the default, and read it back**, before
-        // putting everything at the origin. Placing only at `(0, 0)` proves nothing: that is
-        // where the compositor already puts windows, so a `Place` that did nothing is
-        // indistinguishable from one that worked. The offset is restored below, so the scene
-        // the display gate compares is unchanged.
+        // **Move one window off the default and read it back** before placing at the origin: a
+        // `Place` that did nothing looks the same at `(0, 0)`. Restored below.
         verify_placement(&mut mgr, root_ns, win.id(), 11, 7);
 
         for id in [_ui_window.id(), _term_window.id(), win.id()] {
             verify_placement(&mut mgr, root_ns, id, 0, 0);
         }
-        // **After the placements, before the scene is declared presented.** It restores every
-        // attribute it touches, so it leaves the screen exactly as the placements left it.
         verify_desktop_requests(&mut mgr, root_ns, win.id());
 
-        // **Then stack them, bottom to top, in the order the gate composes them** — the last
-        // thing this client does to the stack, so nothing above can reorder it afterwards.
-        //
-        // Creation order used to be the stacking, and it was a race: `nxterm`, started just
-        // before this client and larger than all three, had to open its window before this
-        // client opened its first. Both load the same two fonts first, and administration C.1
-        // made the race a coin flip — once a file is one shared cache object, whichever process
-        // is behind rides the other's fills instead of doing its own reads, so neither keeps a
-        // head start. `nxterm` landed above the toolkit reference in 4 KVM boots of 6.
-        //
-        // What is still assumed is that `nxterm`'s window *exists* by now, after three windows'
-        // frames and a configure this client lets time out. A window opened later would sit on
-        // top and cover the region the gate compares, so that failure is loud, not hidden.
+        // **Then stack them, bottom to top, in the order the gate composes them**, last so nothing
+        // reorders it. Creation order was a race with `nxterm` (it landed above the toolkit
+        // reference in 4 of 6 KVM boots). Still assumed: `nxterm`'s window *exists* by now, else it
+        // covers the region the gate compares.
         for id in [_ui_window.id(), _term_window.id(), win.id()] {
             if !raise_window(&mut mgr, id) {
                 fail(b"ui-testclient: a manager Raise was refused\n");
@@ -1482,16 +1136,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
         kprint(b"ui-testclient: reference windows placed and stacked via /dev/draw/manage\n");
 
-        // **Exercise the one-manager rule, which is the whole of B1's contract.** The
-        // compositor refuses a second resolve rather than deposing the first, because two
-        // managers placing windows is a race with no arbiter and the failure would look like
-        // windows moving on their own. That refusal was implemented and never executed: with
-        // one client asking once, the branch was unreachable, so the rule was pinned by
-        // nothing. Asking twice from the client that already holds the channel is the
-        // cheapest honest exercise of it.
-        //
-        // A *success* here is the failure: it means the channel was handed out twice, and the
-        // second holder would silently depose the first.
+        // **Exercise the one-manager rule**: a second resolve is refused, not allowed to depose the
+        // first (two managers placing windows is a race). A *success* here is the failure.
         // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
         match unsafe { ChannelTransport::manage(root_ns) } {
             Ok(_) => fail(b"ui-testclient: a second /dev/draw/manage was SERVED\n"),
@@ -1499,35 +1145,27 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
         manager = Some(mgr);
     } else {
-        // Kept as a distinguishable line rather than a `fail`: the gate asserts the success
-        // line above, so this path already fails the run — and it says *which* way it failed,
-        // which a panic here would not.
+        // A distinguishable line, not a `fail`: the gate asserts the success line above, and this
+        // says which way it failed.
         kprint(b"ui-testclient: no manager channel; windows keep the default placement\n");
     }
 
     kprint(b"ui-testclient: scene presented via /dev/draw\n");
     kprint(b"ui-testclient: PASSED\n");
 
-    // Named so it is obvious this is deliberate rather than a forgotten binding: the probe's
-    // session stays open for the life of the process.
+    // Named so it is plainly deliberate: the probe's session stays open for the process's life.
     let _held_open = probe_session;
 
-    // **The client stops parking here, and that is M8 Part B's point.** Until now it waited on
-    // a notification nothing signals, so the screen it left behind was the only thing a gate
-    // could look at — which is why Part A could not take a screendump of a *switched* desktop:
-    // nothing host-side could tell the guest to switch. A registered chord is exactly that
-    // channel. The host injects it over QMP, this loop acts on it, and the screen the gate
-    // captures is one the host asked for.
+    // **The client serves chords rather than parking**: a chord is how the host asks the guest to
+    // change the screen.
     match manager.as_mut() {
         Some(mgr) => serve_hotkeys(mgr, notif),
-        // No manager channel: there is nothing to register a chord on, and the line above
-        // already says so. Park as this client did before Part B, so the scene stays up.
+        // No manager channel, nothing to register a chord on: park so the scene stays up.
         None => park(notif),
     }
 }
 
-/// Wait forever on a notification nothing signals — what this client did before it served
-/// chords, kept for the path where there is no manager channel to serve them on.
+/// Wait forever on a notification nothing signals, for the path with no manager channel.
 fn park(notif: u64) -> ! {
     loop {
         let handles = [notif];
@@ -1538,20 +1176,14 @@ fn park(notif: u64) -> ! {
     }
 }
 
-/// Register a chord and act on it until the process is killed.
-///
-/// **Toggling, not one-way**, so a gate can capture the switched screen *and* prove the scene
-/// comes back — a compositor that filtered a window out permanently, or lost its buffer on the
-/// way, would pass a one-way check and fail this one.
+/// Register a chord and act on it until killed; **toggling, not one-way**, so a gate sees the scene
+/// come back.
 fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
     use libkern::abi::{KEY_F1, KEY_SPACE};
     use librsproto::surface::{MOD_META, MgrHotkey, OP_MGR_HOTKEY, OP_MGR_REGISTER_HOTKEY};
     let _ = notif;
 
-    // `Super+F1`: `Super` alone is what a real shell binds for its launcher, so a chord with a
-    // second key stays out of the way of anything Part D will want. `F1` because it is the
-    // highest function key `libkern::abi` names, and this client must not need a keycode the
-    // ABI does not publish.
+    // `Super+F1`: a second key keeps it out of the way of a shell's `Super` launcher.
     const HOTKEY_ID: u32 = 0x8001;
     let hk = MgrHotkey { id: HOTKEY_ID, mods: MOD_META, code: KEY_F1 };
     let mut body = [0u8; 8];
@@ -1562,20 +1194,14 @@ fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
     if mgr.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_err() {
         fail(b"ui-testclient: RegisterHotkey was refused\n");
     }
-    // **A second registration under the same id must be refused**, not silently replace the
-    // first — a manager holding two chords under one id would be told nothing and then wonder
-    // why one of them never fires. Checked here because this is the only caller there is.
+    // **A second registration under the same id must be refused**, not silently replace the first.
     let mut reply = [0u8; 8];
     if mgr.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_ok() {
         fail(b"ui-testclient: a duplicate hotkey id was ACCEPTED\n");
     }
-    // **A second chord whose action moves nothing**, and it exists for one reason: key repeat.
-    // A consumed chord must not arm a repeat, and the only gate that can see that is one where
-    // the chord is *held* — but `Super+F1` empties the current desktop, so `focus_candidate`
-    // becomes `None` and `fire_repeat` cancels itself. The gate was immune by coincidence of
-    // what this client did with the chord, which is why the control passed against a compositor
-    // that did arm one (PR #241 review, blocking 1). This chord only prints, so focus is
-    // untouched and a wrongly-armed repeat reaches the focused window and is logged there.
+    // **A second chord whose action moves nothing**, for key repeat: `Super+F1` empties the
+    // desktop, so `fire_repeat` cancels itself and the gate could not see a wrongly armed repeat.
+    // This one only prints, so one reaches the focused window and is logged.
     const QUIET_ID: u32 = 0x8002;
     let quiet = MgrHotkey { id: QUIET_ID, mods: MOD_META, code: KEY_SPACE };
     let mut body = [0u8; 8];
@@ -1604,8 +1230,8 @@ fn serve_hotkeys(mgr: &mut ChannelTransport, notif: u64) -> ! {
                 if got.id != HOTKEY_ID {
                     fail(b"ui-testclient: a Hotkey event named a chord we never registered\n");
                 }
-                // The event echoes the chord, so a compositor that matched the wrong one is
-                // caught here rather than looking like a missing event.
+                // The event echoes the chord, so a compositor that matched the wrong one is caught
+                // here.
                 if got.mods != MOD_META || got.code != KEY_F1 {
                     fail(b"ui-testclient: a Hotkey event carried the wrong chord\n");
                 }

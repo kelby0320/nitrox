@@ -1,30 +1,10 @@
-//! The REPL's language-side logic — everything about an interactive session that is not
-//! reading bytes from a device.
+//! The REPL's language-side logic: **when a typed line is finished** (§11b); the console loop lives
+//! in the binary.
 //!
-//! Milestone 3 Part F. The console loop lives in the binary; what lives here is the part
-//! worth testing: **when is a typed line finished?**
-//!
-//! ## §11b, and why this is exact rather than heuristic
-//!
-//! Multi-line continuation is genuinely REPL-specific. A whole script file parses
-//! unambiguously — leading-`|` style included — because the parser sees all of it at once
-//! (that is D2's lookahead, in `lex`). The ambiguity exists only in the line-by-line,
-//! decide-after-each-Enter model.
-//!
-//! So continuation covers **only states the parser can prove incomplete**:
-//!
-//! - an unclosed `(`, `[` or `{`;
-//! - a trailing `|` — real precedent, since bash's own `PS2` triggers on a trailing
-//!   `|`/`&&`/`\` for exactly this reason: the parser is demonstrably mid-production.
-//!
-//! Everything else executes. In particular a line that is a complete, valid statement, and
-//! whose *next* line would begin with `|`, is **not** continued — that case has a real
-//! one-bit ambiguity no grammar refinement can resolve, and §11b's answer is Shift-Enter,
-//! which needs a key-event channel and belongs to the deferred rich REPL. Leading-pipe
-//! style stays fully valid in a file.
-//!
-//! Guessing there would be worse than not offering it: a shell that sometimes swallowed a
-//! finished command waiting for more would be unusable in the way that matters.
+//! Continuation covers only states the parser can prove incomplete: an unclosed `(`, `[` or `{`,
+//! and a trailing `|`. A complete statement whose next line would begin with `|` is not continued:
+//! that one-bit ambiguity cannot be resolved, and guessing would sometimes swallow a finished
+//! command.
 
 use alloc::string::String;
 
@@ -42,11 +22,8 @@ pub enum Continue {
     TrailingPipe,
 }
 
-/// Decide whether more input is needed (§11b).
-///
-/// Lexes rather than counts characters, so a brace inside a string literal or a comment
-/// does not open anything — the naive character scan gets `"{"` wrong, and getting it
-/// wrong means hanging the prompt on a finished command.
+/// Decide whether more input is needed (§11b). Lexes, so a brace inside a string or a comment opens
+/// nothing.
 pub fn needs_continuation(src: &str) -> Continue {
     let mut lx = Lexer::new(src);
     let mut depth = 0i32;
@@ -54,9 +31,8 @@ pub fn needs_continuation(src: &str) -> Continue {
     loop {
         let t = match lx.bump(Mode::Expr) {
             Ok(t) => t.tok,
-            // A lexical error is not an incomplete line — except an unterminated string,
-            // which is the one case where more input genuinely helps. Treated as complete
-            // so the error is reported rather than swallowed into a hanging prompt.
+            // A lexical error is reported rather than swallowed into a hanging prompt, even an
+            // unterminated string.
             Err(_) => return Continue::No,
         };
         match t {
@@ -80,38 +56,23 @@ pub fn needs_continuation(src: &str) -> Continue {
 
 /// Whether a statement's value should be printed in the REPL (§11e).
 ///
-/// **The two modes differ on purpose.** A REPL appends `| display` to an unassigned
-/// top-level pipeline, which is what Python, nushell and PowerShell all do in some form. A
-/// *script* discards it, because a script full of `remove`/`move` calls run for their
-/// effects would otherwise flood its output.
-///
-/// A statement that already ends in a terminal operator is left alone — `… | display`
-/// should print once, not twice — and an assignment prints nothing, since `let x = 5` is a
-/// binding rather than a question.
+/// The two modes differ on purpose: a REPL appends `| display` to an unassigned top-level pipeline,
+/// a script discards it. A chain already ending in a terminal operator is left alone, and an
+/// assignment prints nothing.
 pub fn should_display(stmt: &Stmt) -> bool {
-    // **The same predicate the language uses for a block's value.** `is_expression_shaped`
-    // counts `if` as value-producing (§9a), so a block ending in one evaluates to it — but
-    // this asked only for `Stmt::Expr`, and the REPL threw the rest away. Typing
-    // `if n > 3 { "big" } else { "small" }` at a prompt computed "big" and printed nothing.
-    //
-    // `try` is no longer named in either place: it became an *expression* in v1.2, so it
-    // arrives here as `Stmt::Expr` and is covered by the first arm. The two predicates
-    // still have to agree — that is the whole point of asking through
-    // `is_expression_shaped` rather than matching a second list.
+    // Asks the language's own predicate for a block's value, so an `if` is echoed at the prompt;
+    // the two must agree.
     if !stmt.is_expression_shaped() {
         return false;
     }
     match stmt {
         Stmt::Expr(e) => !ends_in_terminal_operator(e),
-        // An `if` cannot itself *be* a terminal operator; its branches are blocks, and a
-        // branch ending in `save` yields null, which the caller already suppresses.
+        // A branch ending in `save` yields null, which the caller already suppresses.
         _ => true,
     }
 }
 
-/// The longest line the REPL will accept from the terminal, matching the tty server's own
-/// limit. Sized here so the read buffer and the discipline cannot silently disagree about
-/// where a line stops.
+/// The longest line the REPL will accept, matching the tty server's own limit.
 pub const LINE_MAX: usize = 1024;
 
 /// Operators that consume a value and end the chain, so the REPL must not add another.
@@ -128,23 +89,14 @@ fn ends_in_terminal_operator(e: &Expr) -> bool {
 
 /// The prompt for a fresh statement, showing the session's namespace position (§11a).
 ///
-/// **It announces that position to the terminal as well** (desktop refresh, Part K), as
-/// `OSC 7` — `ESC ] 7 ; <path> BEL`, the sequence a terminal reads to learn where the shell
-/// running in it is. `nxterm` puts it in the window's title bar, which is what the design
-/// draws beside a window's name; a terminal that ignores the sequence swallows it whole.
-///
-/// **Here rather than at the six places the REPL writes a prompt**, because the announcement
-/// and the prompt are the same fact and two of the six would eventually disagree. It costs a
-/// few bytes per prompt and repeats a value that has usually not changed, which is what every
-/// shell that puts this in `PS1` does: `cd` then needs no separate announcement, and a prompt
-/// is the moment the shell is certainly idle and certainly somewhere.
+/// It announces that position to the terminal too, as `OSC 7`, which `nxterm` puts in the window's
+/// title bar; a terminal that ignores it swallows it whole.
 pub fn prompt(position: &str, styled: bool) -> String {
     let mut s = String::from("\x1b]7;");
     s.push_str(position);
     s.push('\x07');
-    // **The prompt in the design's bright cyan** (desktop refresh, Part F), bracketing the
-    // trailing space too — see [`style::paint`](crate::style::paint) for why the reset goes
-    // after it rather than before.
+    // The prompt, trailing space included, in bright cyan; see
+    // [`style::paint`](crate::style::paint).
     let mut text = String::from(position);
     text.push_str("> ");
     s.push_str(&crate::style::paint(styled, crate::style::PROMPT, &text));
@@ -154,17 +106,8 @@ pub fn prompt(position: &str, styled: bool) -> String {
 /// The shell's own diagnostic, as it goes to a terminal: `nxsh: <message>`, in the diagnostic
 /// colour when there is one.
 ///
-/// **No trailing newline, and that is the contract** (desktop refresh, Part F). Every caller
-/// hands this to something that ends the line itself — `tty_write_crlf` emits a `\r\n` after
-/// each chunk it splits on `\n`, so a reset that landed *after* a newline would be a chunk of
-/// its own: a blank line with `\x1b[0m` at the head of the next one. Returning the message
-/// without a line terminator is what makes that mistake impossible to make here rather than a
-/// rule each caller has to remember.
-///
-/// **Here rather than in the binary**, because the binary is not host-tested: the first version
-/// of this painted `NitroxHost::diag`, which no interactive path calls at all — script mode
-/// builds its host with no terminal, so the branch was dead and the claim that the shell
-/// coloured its diagnostics was false (PR #324 review, blocking 1).
+/// No trailing newline, by contract: `tty_write_crlf` ends every chunk it splits on `\n`, so a
+/// reset after a newline would be a blank line with `\x1b[0m` at the head of the next.
 pub fn diagnostic(message: &str, styled: bool) -> String {
     let mut body = String::from("nxsh: ");
     body.push_str(message);
@@ -193,7 +136,6 @@ mod tests {
         assert_eq!(needs_continuation("if (a > 1"), Continue::Unclosed);
         assert_eq!(needs_continuation("let x = ["), Continue::Unclosed);
         assert_eq!(needs_continuation("def f() {"), Continue::Unclosed);
-        // …and closing it on a later line finishes the statement.
         assert_eq!(needs_continuation("def f() {\n1\n}"), Continue::No);
     }
 
@@ -203,30 +145,22 @@ mod tests {
         assert_eq!(needs_continuation("ls | sort size"), Continue::No);
     }
 
-    /// The naive character-counting version gets this wrong, and getting it wrong means
-    /// hanging the prompt on a finished command.
     #[test]
     fn a_delimiter_inside_a_string_or_comment_opens_nothing() {
         assert_eq!(needs_continuation("let x = \"{\""), Continue::No);
         assert_eq!(needs_continuation("let x = 1 # {"), Continue::No);
     }
 
-    /// §11b's genuinely ambiguous case is deliberately **not** continued: a complete
-    /// statement stands, even though the next line might have begun with `|`. Only the
-    /// person typing knows, and guessing would sometimes swallow a finished command.
     #[test]
     fn a_complete_statement_is_not_held_waiting_for_a_leading_pipe() {
         assert_eq!(needs_continuation("ls --long"), Continue::No);
         assert_eq!(needs_continuation("ls"), Continue::No);
     }
 
-    /// An unterminated string is reported, not turned into a hanging prompt.
     #[test]
     fn a_lexical_error_is_not_treated_as_incomplete() {
         assert_eq!(needs_continuation("let x = \"abc"), Continue::No);
     }
-
-    // --- auto-display (§11e) ------------------------------------------------
 
     fn first(src: &str) -> Stmt {
         parse_script(src).expect("parses").stmts.into_iter().next().expect("one statement")
@@ -240,7 +174,6 @@ mod tests {
         assert!(!should_display(&first("mut x = 1")));
     }
 
-    /// A chain that already ends in a terminal operator prints once, not twice.
     #[test]
     fn a_chain_ending_in_display_or_save_is_left_alone() {
         assert!(!should_display(&first("ls | display")));
@@ -254,31 +187,20 @@ mod tests {
 
         let d = diagnostic("boom", true);
         assert!(d.contains("nxsh: boom"), "{d:?}");
-        // **The rule this function exists to keep.** A newline inside the paint puts the reset
-        // on the far side of it, and `tty_write_crlf` then makes `\x1b[0m` a chunk — a blank
-        // line with the reset at the head of the next. Asserted on the bytes, because stripping
-        // the escapes back out gives the same text either way and cannot tell the two apart
-        // (PR #324 review, finding 2).
+        // Asserted on the bytes: stripping the escapes gives the same text either way.
         assert!(!d.contains('\n'), "{d:?} carries a newline the caller must add");
         assert!(d.ends_with(crate::style::RESET), "{d:?}");
     }
 
     #[test]
     fn the_prompt_shows_the_namespace_position() {
-        // **What a person sees is unchanged**, which is the half the escape must not disturb:
-        // the prompt is still the position and `> `, with everything before it invisible.
         let p = prompt("/home/alice", false);
         assert!(p.ends_with("/home/alice> "), "{p:?}");
-        // **And the terminal is told the same position**, byte for byte. `nxterm` reads this
-        // as `OSC 7` — `libterm::parse`'s `directory` — and a terminal that does not simply
-        // swallows it. Spelled out here rather than built from a constant, because the other
-        // end of this agreement is in another crate and a shared constant would only move the
-        // place the two could drift apart; what actually holds them together is
-        // `cargo xtask check-terminal`, which boots both.
+        // The terminal is told the same position, byte for byte. Spelled out rather than built from
+        // a constant, because the other end of the agreement is `libterm::parse`;
+        // `cargo xtask check-terminal` is what boots both.
         assert_eq!(p, "\x1b]7;/home/alice\x07/home/alice> ");
 
-        // **And coloured, with the text still in one piece.** A terminal gets the prompt in the
-        // design's bright cyan; the OSC comes first because it is not part of what is drawn.
         let c = prompt("/home/alice", true);
         assert!(c.starts_with("\x1b]7;/home/alice\x07"), "{c:?}");
         assert!(c.contains("/home/alice> "), "{c:?} split the prompt");

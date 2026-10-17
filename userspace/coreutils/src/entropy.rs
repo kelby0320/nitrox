@@ -1,6 +1,5 @@
-//! **Random bytes from the kernel's entropy source**: `account`'s salts, and since Phase 6 Part G.4
-//! `disk`'s volume IDs, UUIDs and partition GUIDs. It was `account`'s own until `disk` needed it
-//! too.
+//! **Random bytes from the kernel's entropy source**: `account`'s salts, and `disk`'s volume IDs,
+//! UUIDs and partition GUIDs.
 
 use libkern::syscall::{
     SYS_ENTROPY_CREATE, SYS_ENTROPY_READ, SYS_HANDLE_CLOSE, SYS_WAIT, syscall0, syscall1, syscall3, syscall4,
@@ -26,7 +25,6 @@ pub fn fill(buf: &mut [u8]) -> bool {
         if r < 0 {
             break false;
         }
-        // Not yet seeded: wait for the pending operation, then read again.
         let handles = [r as u64];
         let mut results = [0u8; 24];
         // SAFETY: a valid one-entry handle array and result buffer on this frame.

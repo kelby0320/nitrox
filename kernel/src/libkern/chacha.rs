@@ -3,17 +3,17 @@
 //! A hand-rolled ChaCha20 (RFC 8439) — no external crates (per `kernel/CLAUDE.md`).
 //! Two layers:
 //!
-//! - [`chacha20_block`]: the RFC 8439 §2.3 block function — `(key, counter,
-//!   nonce) -> 64` keystream bytes. Pure, deterministic, integer-only (no FPU /
-//!   AES-NI; see `docs/architecture/entropy.md` § "Why ChaCha20").
+//! - [`chacha20_block`]: the RFC 8439 §2.3 block function — `(key, counter, nonce) -> 64`
+//!   keystream bytes. Pure, deterministic, integer-only (no FPU / AES-NI; see
+//!   `docs/architecture/entropy.md` § "Why ChaCha20").
 //! - [`ChaCha20Rng`]: the kernel CSPRNG built on it, with **fast key erasure** for
 //!   forward secrecy (DJB's design): every [`fill`](ChaCha20Rng::fill) derives the
 //!   next key from fresh keystream and overwrites the old key before returning, so
 //!   capturing the current key cannot reconstruct earlier output.
 //!
-//! The pool that *seeds* this (hardware RNG + interrupt jitter) and the *policy*
-//! for when to [`reseed`](ChaCha20Rng::reseed) live in the entropy subsystem
-//! (Phase 2 slice 2, Part C); this module is the deterministic primitive.
+//! The pool that *seeds* this (hardware RNG + interrupt jitter) and the *policy* for when to
+//! [`reseed`](ChaCha20Rng::reseed) live in the entropy subsystem; this module is the
+//! deterministic primitive.
 
 /// The four ChaCha state constants — the ASCII of `"expand 32-byte k"` as
 /// little-endian `u32`s (RFC 8439 §2.3).
@@ -38,10 +38,8 @@ fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
     s[b] = (s[b] ^ s[c]).rotate_left(7);
 }
 
-/// The ChaCha20 block function (RFC 8439 §2.3): produce the 64-byte keystream
-/// block for `key`, the 32-bit block `counter`, and the 96-bit `nonce`.
-///
-/// Little-endian throughout, per the RFC. Pure and deterministic.
+/// The ChaCha20 block function (RFC 8439 §2.3): the 64-byte keystream block for `key`, the
+/// 32-bit block `counter`, and the 96-bit `nonce`. Little-endian throughout, per the RFC.
 pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; BLOCK_LEN] {
     // Build the initial state: constants | key (8 words) | counter | nonce (3 words).
     let mut state = [0u32; 16];
@@ -57,12 +55,10 @@ pub fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; BL
     // 20 rounds = 10 double-rounds (column rounds then diagonal rounds).
     let mut work = state;
     for _ in 0..DOUBLE_ROUNDS {
-        // Column rounds.
         quarter_round(&mut work, 0, 4, 8, 12);
         quarter_round(&mut work, 1, 5, 9, 13);
         quarter_round(&mut work, 2, 6, 10, 14);
         quarter_round(&mut work, 3, 7, 11, 15);
-        // Diagonal rounds.
         quarter_round(&mut work, 0, 5, 10, 15);
         quarter_round(&mut work, 1, 6, 11, 12);
         quarter_round(&mut work, 2, 7, 8, 13);
@@ -94,16 +90,14 @@ pub struct ChaCha20Rng {
 }
 
 impl ChaCha20Rng {
-    /// Construct a generator from a 32-byte seed (the seed becomes the initial
-    /// key). Deterministic: the same seed yields the same output sequence. `const`
-    /// so it can initialize a `static` (the entropy subsystem keys it at boot).
+    /// Construct a generator from a 32-byte seed (the seed becomes the initial key).
+    /// Deterministic; `const` so it can initialize a `static`.
     pub const fn from_seed(seed: [u8; 32]) -> Self {
         Self { key: seed }
     }
 
-    /// Fold fresh entropy into the key by XOR. The next [`fill`](Self::fill) draws
-    /// from the mixed key. Used by the entropy subsystem (Part C) to reseed from
-    /// the pool; XOR so a reseed can only add uncertainty, never reduce it.
+    /// Fold fresh entropy into the key by XOR. The next [`fill`](Self::fill) draws from the
+    /// mixed key. XOR so a reseed can only add uncertainty, never reduce it.
     pub fn reseed(&mut self, seed: &[u8; 32]) {
         for (k, s) in self.key.iter_mut().zip(seed.iter()) {
             *k ^= *s;
@@ -112,11 +106,10 @@ impl ChaCha20Rng {
 
     /// Fill `out` with CSPRNG output, then erase the key (fast key erasure).
     ///
-    /// The logical keystream from the current key is `[0..32)` = the next key and
-    /// `[32..)` = output. We walk it block by block so an arbitrarily large `out`
-    /// needs no large scratch buffer. The key is rotated to the freshly-derived
-    /// value before returning — this overwrite is the load-bearing forward-secrecy
-    /// step (output above came from the *old* key, unrecoverable from the new one).
+    /// The logical keystream from the current key is `[0..32)` = the next key and `[32..)` =
+    /// output, walked block by block so an arbitrarily large `out` needs no large scratch
+    /// buffer. Rotating the key before returning is the load-bearing forward-secrecy step:
+    /// the output came from the *old* key, unrecoverable from the new one.
     pub fn fill(&mut self, out: &mut [u8]) {
         const NONCE: [u8; 12] = [0; 12];
         let mut new_key = [0u8; 32];
@@ -220,8 +213,6 @@ mod tests {
 
     #[test]
     fn fast_key_erasure_advances_the_key() {
-        // Two RNGs from the same seed; advance one by an extra fill. Their next
-        // outputs must differ — proof the first fill rotated the key.
         let mut a = ChaCha20Rng::from_seed([0x99; 32]);
         let mut b = ChaCha20Rng::from_seed([0x99; 32]);
         a.fill(&mut [0u8; 16]); // a rekeys once; b does not

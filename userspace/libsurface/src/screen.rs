@@ -1,10 +1,8 @@
 //! The screen's size, read from `/dev/draw/screen` (`rsproto-surface-ops.md`, "Reading the
 //! screen's size").
 //!
-//! A client that places or sizes something against the screen — a greeter centring itself, a
-//! shell spanning it with bars — asks here rather than writing a size down. Until Phase 5 Part E
-//! both did write it down, as 1280×800, and on the laptop's 768-row screen the shell's window list
-//! was placed below the last row.
+//! A client that places or sizes something against the screen asks here rather than writing a
+//! size down: a hard-coded 1280×800 put a window list below the last row of a 768-row screen.
 
 use librsproto::surface::{SCREEN_INFO_LEN, ScreenInfo};
 
@@ -15,9 +13,8 @@ pub const SCREEN_PATH: &str = "/dev/draw/screen";
 
 /// Resolve [`SCREEN_PATH`], map the object, and return the size it holds.
 ///
-/// [`UiError::Transport`] when the resolve or the mapping fails — no compositor, or a namespace
-/// without the leaf — and [`UiError::Malformed`] for an object that does not parse. A size of zero
-/// in either dimension is refused as malformed too: nothing can be placed on it.
+/// [`UiError::Transport`] when the resolve or the mapping fails, and [`UiError::Malformed`] for
+/// an object that does not parse or holds a zero dimension.
 ///
 /// # Safety
 ///
@@ -35,9 +32,8 @@ pub unsafe fn read(root_ns: u64) -> Result<ScreenInfo, UiError> {
     // SAFETY: the compositor serves exactly `SCREEN_INFO_LEN` bytes here, mapped just above.
     let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, SCREEN_INFO_LEN) };
     let info = ScreenInfo::read(bytes);
-    // **Unmapped once read**: the compositor mints an object per resolve, and a mapping left behind
-    // holds its frames for the life of this process — the leak `info` had on both sides of the
-    // exchange (PR #175 review, finding 1).
+    // The compositor mints an object per resolve; a mapping left behind holds its frames for the
+    // life of this process.
     let _ = obj.unmap(addr, SCREEN_INFO_LEN);
     match info {
         Some(s) if s.width > 0 && s.height > 0 => Ok(s),

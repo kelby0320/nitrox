@@ -1,14 +1,14 @@
-//! The kernel device table — every [`DeviceNode`] the kernel has.
+//! The kernel device table: every [`DeviceNode`] the kernel has.
 //!
-//! Architecture-independent: the table is seeded by PCI(e) enumeration ([`crate::pci`]) — on
-//! aarch64 it would be a Device Tree Blob — and drivers append what they publish after it: disks,
-//! the partitions found on them, the RAM disk, the console, the i8042's keyboard and mouse, and
-//! the USB devices the hub thread enumerates. Each entry is an owning reference, so a registered
-//! node lives for the kernel's lifetime — a USB device that leaves included.
+//! Architecture-independent: the table is seeded by PCI(e) enumeration ([`crate::pci`]; on aarch64
+//! it would be a Device Tree Blob) and drivers append what they publish after it: disks, their
+//! partitions, the RAM disk, the console, the i8042's keyboard and mouse, and the USB devices the
+//! hub thread enumerates. Each entry is an owning reference, so a registered node lives for the
+//! kernel's lifetime, a USB device that leaves included.
 //!
-//! **A device that leaves is departed, not removed** (Phase 6 Part C): an id is a record's place,
-//! and `/dev/registry/<id>`, `device-mgr`'s `usb-<id>` and an owner's `Departed` all name a device
-//! by it. A departed entry keeps its fields and its served index, which no later device takes; its
+//! **A device that leaves is departed, not removed**: an id is a record's place, and
+//! `/dev/registry/<id>`, `device-mgr`'s `usb-<id>` and an owner's `Departed` all name a device by
+//! it. A departed entry keeps its fields and its served index, which no later device takes; its
 //! paths stop resolving; and its children depart with it. **Every change bumps the table's
 //! generation**, which the snapshot carries and `/dev/registry/changes` answers a waiting read
 //! with, so a reader that waits past the generation of the snapshot it holds misses nothing.
@@ -16,9 +16,9 @@
 //! **What the table knows that a node does not** is kept beside it: the node's kind, which its
 //! `DeviceClass` is too coarse to say (the console and both i8042 nodes are all `Char`), **the
 //! index its path serves it at**, and the node it belongs to. `/dev/blk` and `/dev/input/raw`
-//! resolve through that served index, and `/dev/registry` reports it, so the two cannot disagree
-//! (administration Part B). A USB device's IDs, class, port, speed and name are kept there too,
-//! since its node is a bare `Other` (Phase 6 Part A.3).
+//! resolve through that served index, and `/dev/registry` reports it, so the two cannot disagree. A
+//! USB device's IDs, class, port, speed and name are kept there too, since its node is a bare
+//! `Other`.
 //!
 //! [`DeviceNode`]: crate::object::DeviceNode
 
@@ -48,16 +48,16 @@ struct Entry {
     parent: u32,
     /// The driver that published it; empty for a PCI function, whose driver is its outcome's.
     driver: &'static str,
-    /// For a USB device, what its record carries that its node cannot say (Phase 6 Part A.3).
+    /// For a USB device, what its record carries that its node cannot say.
     usb: Option<UsbFacts>,
-    /// The device has left (Phase 6 Part C): its record says so, and its paths answer `NotFound`.
+    /// The device has left: its record says so, and its paths answer `NotFound`.
     departed: bool,
-    /// **The disk the machine started from** (Phase 6 Part D): its GPT's GUID is the one Limine
+    /// **The disk the machine started from**: its GPT's GUID is the one Limine
     /// loaded the modules from.
     boot: bool,
 }
 
-/// **What a USB device's record carries** that its node does not (Phase 6 Part A.3). The node is a
+/// **What a USB device's record carries** that its node does not. The node is a
 /// plain `Other` with the zero descriptor — vendor `0xFFFF`, which the table reads as "not a PCI
 /// function", where a USB device's zero address would find the host bridge — and these fill its
 /// record instead.
@@ -82,8 +82,7 @@ pub struct UsbFacts {
 /// The table as a value, so a host test can build one without the kernel's.
 pub struct Registry {
     entries: KVec<Entry>,
-    /// Bumped once by every change: a registration, or a departure with its children (Phase 6
-    /// Part C).
+    /// Bumped once by every change: a registration, or a departure with its children.
     generation: u64,
 }
 
@@ -105,12 +104,12 @@ impl Registry {
         Self { entries: KVec::new(), generation: 0 }
     }
 
-    /// The table's generation: how many changes it has seen (Phase 6 Part C).
+    /// The table's generation: how many changes it has seen.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// **Depart node `id` and every node whose parent chain reaches it** (Phase 6 Part C): a USB
+    /// **Depart node `id` and every node whose parent chain reaches it**: a USB
     /// device's keyboard and mouse with it, a disk's partitions with the disk. One change, so one
     /// generation. Whether anything departed that had not: an id the table does not hold, or one
     /// already departed with all of its children, changes nothing.
@@ -137,8 +136,8 @@ impl Registry {
         changed
     }
 
-    /// **The records under `id` still present**, in table order: a disk's partitions (Phase 6 Part
-    /// G), which a rescan departs one by one and publishes again. `None` if memory ran out.
+    /// **The records under `id` still present**, in table order: a disk's partitions, which a
+    /// rescan departs one by one and publishes again. `None` if memory ran out.
     pub fn children(&self, id: u32) -> Option<KVec<u32>> {
         let mut out = KVec::new();
         for (i, e) in self.entries.iter().enumerate() {
@@ -149,7 +148,7 @@ impl Registry {
         Some(out)
     }
 
-    /// **Flag `disk` as the disk the machine started from** (Phase 6 Part D). One change, so one
+    /// **Flag `disk` as the disk the machine started from**. One change, so one
     /// generation. Whether it changed anything: a node the table does not hold, or one flagged
     /// already, does not.
     pub fn mark_boot(&mut self, disk: &ObjectRef) -> bool {
@@ -216,7 +215,7 @@ impl Registry {
     }
 
     /// **Append a block node under the entry `parent`**, by id: a USB disk under its `UsbDevice`
-    /// record (Phase 6 Part D), whose address names no PCI function.
+    /// record, whose address names no PCI function.
     pub fn add_block_under(&mut self, node: ObjectRef, parent: u32, driver: &'static str) -> bool {
         let served = self.entries.iter().filter(|e| node_of(e).class() == DeviceClass::Block).count() as u32;
         let kind = match BlockKind::from_u32(node_of_ref(&node).block_info().kind) {
@@ -233,7 +232,7 @@ impl Registry {
         self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None, departed: false, boot: false })
     }
 
-    /// Append a keyboard or mouse a USB device provides (Phase 6 Part B.2), under `parent`, the
+    /// Append a keyboard or mouse a USB device provides, under `parent`, the
     /// device's record. **Its served index is the next after every input node's**: the i8042 keeps
     /// 0 and 1, and a machine without one starts at 0. A count of input nodes would collide where
     /// the i8042 has a mouse and no keyboard. The index, or `None` when the table could not take it.
@@ -290,7 +289,7 @@ impl Registry {
             .map_or(NO_PARENT, |i| i as u32)
     }
 
-    /// The block node `/dev/blk/<index>` serves. **None for a departed one** (Phase 6 Part C).
+    /// The block node `/dev/blk/<index>` serves. **None for a departed one**.
     pub fn block(&self, index: u32) -> Option<ObjectRef> {
         self.entries
             .iter()
@@ -298,7 +297,7 @@ impl Registry {
             .map(|e| e.node.clone())
     }
 
-    /// The input node `/dev/input/raw/<index>` serves. **None for a departed one** (Phase 6 Part C).
+    /// The input node `/dev/input/raw/<index>` serves. **None for a departed one**.
     pub fn input(&self, index: u32) -> Option<ObjectRef> {
         self.entries
             .iter()
@@ -306,7 +305,7 @@ impl Registry {
             .map(|e| e.node.clone())
     }
 
-    /// Node `id` — its place in the table. **None for a departed one** (Phase 6 Part C).
+    /// Node `id` — its place in the table. **None for a departed one**.
     pub fn node(&self, id: u32) -> Option<ObjectRef> {
         self.entries.get(id as usize).filter(|e| !e.departed).map(|e| e.node.clone())
     }
@@ -422,7 +421,7 @@ impl Registry {
 }
 
 impl Registry {
-    /// **Every disk's and RAM disk's counters** (Phase 6 Part H.2), a record each in table order,
+    /// **Every disk's and RAM disk's counters**, a record each in table order,
     /// departed ones flagged — a partition has none, its I/O being its disk's.
     pub fn io_records(&self) -> Result<KVec<IoRecord>, AllocError> {
         let mut out: KVec<IoRecord> = KVec::new();
@@ -492,10 +491,9 @@ pub fn count() -> usize {
     DEVICES.lock().len()
 }
 
-/// A snapshot of the device table: a cloned owning reference per device. Taken
-/// under the lock and returned, so a caller (driver matching) can iterate and
-/// allocate **without** holding the device lock across a lock-ordering boundary.
-/// The table keeps its own references; the caller drops the snapshot when done.
+/// A snapshot of the device table: a cloned owning reference per device, taken under the lock and
+/// returned, so a caller (driver matching) can iterate and allocate **without** holding the device
+/// lock across a lock-ordering boundary.
 pub fn snapshot() -> KVec<ObjectRef> {
     let table = DEVICES.lock();
     let mut out: KVec<ObjectRef> = KVec::new();
@@ -535,9 +533,9 @@ pub fn register_char(node: ObjectRef, kind: DeviceKind, served: u32, driver: &'s
 }
 
 /// Append a USB device under the PCI function at `controller`'s address, carrying `facts`. The
-/// table takes ownership of `node`. Its id — the `<id>` of `/dev/registry/<id>` and of
-/// `device-mgr`'s `usb-<id>` — or `None` when the table could not take it. From the hub thread
-/// (Phase 6 Part A.3), never a DPC: the table allocates while locked.
+/// table takes ownership of `node`. Its id (the `<id>` of `/dev/registry/<id>` and of
+/// `device-mgr`'s `usb-<id>`), or `None` when the table could not take it. From the hub thread,
+/// never a DPC: the table allocates while locked.
 pub fn register_usb(
     node: ObjectRef,
     controller: &ResourceDescriptor,
@@ -552,7 +550,7 @@ pub fn register_usb(
     id
 }
 
-/// **Append a disk a USB device provides**, under its device's record `parent` (Phase 6 Part D). Its
+/// **Append a disk a USB device provides**, under its device's record `parent`. Its
 /// id, the place its partitions are registered under, or `None` if the table could not take it.
 pub fn register_block_under(node: ObjectRef, parent: u32, driver: &'static str) -> Option<u32> {
     let id = {
@@ -569,7 +567,7 @@ pub fn register_block_under(node: ObjectRef, parent: u32, driver: &'static str) 
 
 /// Append a keyboard or mouse a USB device provides, under its device's record `parent`, at the next
 /// `/dev/input/raw/<n>`. The table takes ownership of `node`. The `<n>`, or `None` when the table
-/// could not take it. From the hub thread (Phase 6 Part B.2).
+/// could not take it. From the hub thread.
 pub fn register_input(node: ObjectRef, kind: DeviceKind, parent: Option<u32>, driver: &'static str) -> Option<u32> {
     let served = DEVICES.lock().add_input(node, kind, parent, driver);
     if served.is_none() {
@@ -579,7 +577,7 @@ pub fn register_input(node: ObjectRef, kind: DeviceKind, parent: Option<u32>, dr
     served
 }
 
-/// **Depart node `id` and every node whose parent chain reaches it** (Phase 6 Part C) — a USB
+/// **Depart node `id` and every node whose parent chain reaches it** — a USB
 /// device and its keyboards and mice — as one change, and answer the reads waiting on
 /// `/dev/registry/changes`. From the hub thread, never a DPC: the answers complete operations.
 pub fn depart(id: u32) {
@@ -588,13 +586,13 @@ pub fn depart(id: u32) {
     }
 }
 
-/// **The records under `id` still present** — a disk's partitions — for a rescan (Phase 6 Part G).
+/// **The records under `id` still present** — a disk's partitions — for a rescan.
 /// Empty if memory ran out, which a rescan then says.
 pub fn children(id: u32) -> KVec<u32> {
     DEVICES.lock().children(id).unwrap_or_default()
 }
 
-/// **Flag `disk` as the disk the machine started from** (Phase 6 Part D), as one change. Whether
+/// **Flag `disk` as the disk the machine started from**, as one change. Whether
 /// it was not flagged before.
 pub fn mark_boot(disk: &ObjectRef) -> bool {
     let marked = DEVICES.lock().mark_boot(disk);
@@ -625,7 +623,7 @@ pub fn has(kind: DeviceKind) -> bool {
     DEVICES.lock().has(kind)
 }
 
-/// The node `/dev/registry/changes` serves (Phase 6 Part C), or `None` if it could not be made.
+/// The node `/dev/registry/changes` serves, or `None` if it could not be made.
 pub fn changes_node() -> Option<ObjectRef> {
     CHANGES.lock().clone()
 }
@@ -645,7 +643,7 @@ pub fn registry_snapshot() -> Result<KVec<u8>, AllocError> {
     DEVICES.lock().snapshot_bytes(|d| outcomes.iter().find(|(a, _)| *a == address(d)).map(|&(_, o)| o))
 }
 
-/// What `/dev/registry/io` serves (Phase 6 Part H.2): the page cache's counters and every disk's.
+/// What `/dev/registry/io` serves: the page cache's counters and every disk's.
 pub fn io_snapshot() -> Result<KVec<u8>, AllocError> {
     let records = DEVICES.lock().io_records()?;
     let s = crate::object::file_object::fill_stats::snapshot();
@@ -662,14 +660,14 @@ pub fn io_snapshot() -> Result<KVec<u8>, AllocError> {
     io_bytes(&records, cache)
 }
 
-// --- `/dev/registry/changes` (Phase 6 Part C) -----------------------------------
+// --- `/dev/registry/changes` -----------------------------------
 //
 // **How a reader learns that the table changed**: a char node whose `Read` waits until the table's
 // generation is past the read's `offset`, then answers with the generation, eight bytes. A reader
 // that is behind is answered at once. The device manager reads a snapshot, then waits past its
-// generation, so a change between the two answers the wait at once and none is missed. It is the
-// async model as it is — `sys_io_submit`, a `PendingOperation`, `sys_wait` — and needs no way for
-// the kernel to name the manager, which a notification would have (the plan's detail pass).
+// generation, so a change between the two answers the wait at once and none is missed. This is the
+// async model as it is (`sys_io_submit`, a `PendingOperation`, `sys_wait`) and needs no way for the
+// kernel to name the manager, which a notification would have.
 
 /// Reads that may wait on `/dev/registry/changes` at once: the device manager's one, with room to
 /// spare. A fifth is refused, `WouldBlock`.
@@ -769,9 +767,8 @@ fn changes_read(
     read_changes(&WAITING, &GENERATION, buffer, po, buf_offset, offset, max_len)
 }
 
-/// [`changes_read`] against `waiting` and `generation`: the statics in a boot, and a host test's own
-/// (PR #361 review), so the read's two refusals are held through the read rather than through
-/// [`Waiters`] alone.
+/// [`changes_read`] against `waiting` and `generation`: the statics in a boot, and a host test's
+/// own, so the read's two refusals are held through the read rather than through [`Waiters`] alone.
 fn read_changes(
     waiting: &SpinLock<Waiters<WaitingRead>>,
     generation: &AtomicU64,
@@ -815,13 +812,11 @@ fn read_changes(
     }
 }
 
-// --- What the drivers did with each function (Phase 5 Part D.1) ---------------
+// --- What the drivers did with each function -----------------
 //
-// On a machine with no debugger the question after "what is there" is "what took it", and it
-// has three answers, not two. A driver that matched a controller and gave it up is a different
-// finding from no driver matching at all — on the laptop, "ahci declined: no SATA disk" points
-// at port detection and "no driver" at the match table — so drivers report both, and the table
-// keeps them beside the functions they describe.
+// A driver that matched a controller and gave it up is a different finding from no driver matching
+// at all ("ahci declined: no SATA disk" points at port detection, "no driver" at the match
+// table), so drivers report both, and the table keeps them beside the functions they describe.
 
 /// The functions [`init`] enumerated: the first this-many entries of [`DEVICES`]. Everything
 /// after them was registered by a driver (a disk, a partition), and has no outcome of its own.
@@ -954,11 +949,10 @@ mod tests {
         adopt(DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).unwrap())
     }
 
-    /// The boot's order, which `drivers::probe` sets: PCI functions — the host bridge at 00:00.0
-    /// first, as on every PC — then a disk on the AHCI controller, then a RAM disk (published
-    /// before the GPT pass, so it can be scanned like a disk), then the disk's partition from that
-    /// pass, then the console and the i8042's keyboard and mouse. It was disk, partition, RAM disk
-    /// until the PR #333 review found no boot does that.
+    /// The boot's order, which `drivers::probe` sets: PCI functions (the host bridge at 00:00.0
+    /// first, as on every PC), a disk on the AHCI controller, a RAM disk (published before the GPT
+    /// pass, so it can be scanned like a disk), the disk's partition from that pass, then the
+    /// console and the i8042's keyboard and mouse.
     fn booted() -> (Registry, ObjectRef, ObjectRef) {
         let mut r = Registry::new();
         assert!(
@@ -992,10 +986,10 @@ mod tests {
     }
 
     /// **Every node, in table order, with what the table knows about it.** A disk's parent is its
-    /// controller by address, a partition's is its disk, and the RAM disk — whose descriptor's
-    /// all-zero address is the host bridge's — has none. **The keyboard is served at 0 and the
-    /// mouse at 1** although the console, also `Char`, registered before them: a served index
-    /// counted within `DeviceClass` would call the keyboard `input-1` (PR #332 review, finding 4).
+    /// controller by address, a partition's is its disk, and the RAM disk, whose descriptor's
+    /// all-zero address is the host bridge's, has none. **The keyboard is served at 0 and the mouse
+    /// at 1** although the console, also `Char`, registered before them: an index counted within
+    /// `DeviceClass` would call the keyboard `input-1`.
     #[test]
     fn a_record_per_node_with_its_kind_served_index_and_parent() {
         init_global_heap();
@@ -1029,9 +1023,9 @@ mod tests {
         assert_eq!(recs[4].vendor, 0xFFFF, "the RAM disk is no PCI device");
     }
 
-    /// **A USB keyboard or mouse takes the next index after every input node's** (Phase 6 Part
-    /// B.2): 2 and 3 beside the i8042's two, 0 and 1 on a machine without one, and 2 where the
-    /// i8042 has a mouse and no keyboard — where counting input nodes would give the mouse's 1.
+    /// **A USB keyboard or mouse takes the next index after every input node's**: 2 and 3 beside
+    /// the i8042's two, 0 and 1 on a machine without one, and 2 where the i8042 has a mouse and no
+    /// keyboard, where counting input nodes would give the mouse's 1.
     #[test]
     fn a_usb_input_node_takes_the_next_index_after_every_input_nodes() {
         init_global_heap();
@@ -1053,7 +1047,6 @@ mod tests {
         assert_eq!(mouse_only.add_input(char_node(), DeviceKind::Keyboard, None, "usb-hid"), Some(2));
     }
 
-    /// **The paths resolve through the same served index the records report.**
     #[test]
     fn the_paths_serve_what_the_records_say() {
         init_global_heap();
@@ -1066,10 +1059,6 @@ mod tests {
         assert!(r.node(9).is_none());
     }
 
-    /// **A PCI function carries what its driver did** — claimed, declined, or nothing — and a
-    /// function with no outcome says so. Declined is what `/dev/devices` renders as
-    /// `ahci (declined)`, and until the PR #333 review nothing between the kernel's mapping and
-    /// that text was tested.
     #[test]
     fn a_pci_record_carries_its_drivers_outcome() {
         init_global_heap();
@@ -1092,10 +1081,9 @@ mod tests {
     }
 
     /// **A USB device's record is filled from its entry**, its node being a bare `Other` with the
-    /// zero descriptor (Phase 6 Part A.3): the USB IDs where a PCI function's go, its class triple,
-    /// its port and speed, its name and its driver — and **its parent is the controller's function,
-    /// found by the controller's address**, not the host bridge its own zero address would match.
-    /// A controller the table does not hold gives no parent.
+    /// zero descriptor: the USB IDs, class triple, port, speed, name and driver, and **its parent
+    /// is the controller's function, found by the controller's address**, not the host bridge its
+    /// own zero address would match. A controller the table does not hold gives no parent.
     #[test]
     fn a_usb_record_carries_its_ids_port_speed_and_name_under_its_controller() {
         init_global_heap();
@@ -1129,8 +1117,7 @@ mod tests {
         assert_eq!((recs[8].port, recs[8].speed), (0, 0), "zero for every other kind");
     }
 
-    /// **The header's count is the number of records**, and the bytes are exactly the header and
-    /// those records — the padding is the memory object's, added after.
+    /// The bytes are exactly the header and the records: the padding is the memory object's.
     #[test]
     fn the_snapshot_is_a_header_counting_its_records() {
         init_global_heap();
@@ -1145,9 +1132,8 @@ mod tests {
         assert_eq!(generation, 9, "one change per node registered (Phase 6 Part C)");
     }
 
-    /// A booted table with two USB devices under an xHCI at 00:03.0: a keyboard on port 9 with its
-    /// keyboard node, then a mouse on port 10 with its mouse node. The USB devices' ids, and the
-    /// input nodes'.
+    /// A booted table with two USB devices under an xHCI at 00:03.0: a keyboard on port 9, then a
+    /// mouse on port 10, each with its input node. The devices' ids, and the nodes'.
     fn with_usb(r: &mut Registry) -> (u32, u32, u32, u32) {
         let at3 = pci_at(0, 3, 0);
         let xhci = ResourceDescriptor {
@@ -1166,10 +1152,9 @@ mod tests {
         (kbd, kbd + 1, mouse, mouse + 1)
     }
 
-    /// **A departure takes its children, and nothing else** (Phase 6 Part C): the USB keyboard's
-    /// keyboard node with it, the mouse beside it and every boot device untouched. The records stay,
-    /// marked rather than omitted, so ids still name places. One change, so one generation; a second
-    /// departure of the same device changes nothing.
+    /// **A departure takes its children, and nothing else**: the USB keyboard's node with it, the
+    /// mouse beside it and every boot device untouched. The records stay, marked, so ids still name
+    /// places. One change, one generation; a second departure changes nothing.
     #[test]
     fn a_departure_takes_its_children_and_nothing_else() {
         init_global_heap();
@@ -1195,8 +1180,6 @@ mod tests {
         assert!(!r.depart(99), "an id the table does not hold");
     }
 
-    /// **A disk's children are its partitions still present** (Phase 6 Part G): what a rescan
-    /// departs one by one, leaving the disk; and a partition published after it is a child too.
     #[test]
     fn a_disks_children_are_its_present_partitions() {
         init_global_heap();
@@ -1213,10 +1196,10 @@ mod tests {
         assert!(after[0] > 8, "published afresh, at a new id: {}", after[0]);
     }
 
-    /// **A departed device's paths refuse it, and its served index is never reissued** (Phase 6 Part
-    /// C): `/dev/input/raw/2` and `/dev/registry/<id>` answer nothing once the keyboard has gone.
-    /// With the mouse gone too — the highest index, which is the case a reissue would show in —
-    /// the next keyboard takes 4, not 3 and not 2.
+    /// **A departed device's paths refuse it, and its served index is never reissued**:
+    /// `/dev/input/raw/2` and `/dev/registry/<id>` answer nothing once the keyboard has gone. With
+    /// the mouse gone too (the highest index, the case a reissue would show in) the next keyboard
+    /// takes 4, not 3 and not 2.
     #[test]
     fn a_departed_device_is_found_by_no_path_and_its_index_stays_taken() {
         init_global_heap();
@@ -1232,21 +1215,19 @@ mod tests {
         assert!(!r.has(DeviceKind::UsbDevice), "what the hardware report and the i8042 ask");
         assert!(r.has(DeviceKind::Keyboard), "the i8042's keyboard is still here");
         assert_eq!(r.add_input(char_node(), DeviceKind::Keyboard, None, "usb-hid"), Some(4), "not 3, nor 2");
-        // A block device the same way, for Part D: the partition departs with its disk.
+        // A block device the same way: the partition departs with its disk.
         let (mut b, _, _) = booted();
         b.depart(3);
         assert!(b.block(0).is_none() && b.block(2).is_none(), "the disk and its partition");
         assert!(b.block(1).is_some(), "the RAM disk is no child of the disk");
-        // **And two levels down** (PR #361 review): Part D's USB disk is a device, its disk and its
-        // partition. The controller stands in for the device here, the partition its grandchild.
+        // **And two levels down**: a USB disk is a device, its disk and its partition. The
+        // controller stands in for the device here, the partition its grandchild.
         let (mut c, _, _) = booted();
         c.depart(1);
         assert!(c.block(0).is_none() && c.block(2).is_none(), "the controller's disk, and that disk's partition");
         assert!(c.block(1).is_some() && c.node(0).is_some() && c.node(2).is_some(), "and nothing else");
     }
 
-    /// **A disk under a USB device names the device as its parent** (Phase 6 Part D), and its
-    /// partition the disk: a departure of the device takes both.
     #[test]
     fn a_disk_under_a_usb_device_departs_with_it() {
         init_global_heap();
@@ -1263,9 +1244,9 @@ mod tests {
         assert!(r.node(at).is_none() && r.node(at + 1).is_none(), "the disk and its partition depart with it");
     }
 
-    /// **`/dev/registry/io`: a record per disk and RAM disk, with what its node counted** (Phase 6
-    /// Part H.2) — none for a partition, whose I/O its disk's driver counts, and a departed disk's
-    /// kept and flagged. The header counts the records and carries the page cache's counters.
+    /// **`/dev/registry/io`: a record per disk and RAM disk, with what its node counted**, none for
+    /// a partition (its disk's driver counts its I/O), a departed disk's kept and flagged. The
+    /// header counts the records and carries the page cache's counters.
     #[test]
     fn the_io_records_are_every_disks_counters_and_no_partitions() {
         init_global_heap();
@@ -1294,9 +1275,6 @@ mod tests {
         assert_eq!(&bytes[80..144], recs[0].as_bytes());
     }
 
-    /// **The boot disk is flagged, once, and nothing else is** (Phase 6 Part D): the disk's record
-    /// carries `BOOT` and its partition's does not, the flag is one change, and flagging it again,
-    /// or a node the table does not hold, changes nothing.
     #[test]
     fn the_boot_disk_is_flagged_once_and_nothing_else() {
         init_global_heap();
@@ -1318,7 +1296,6 @@ mod tests {
         assert_eq!(r.generation(), before + 1);
     }
 
-    /// **Every change counts once**: each registration, and a departure with its children.
     #[test]
     fn the_generation_counts_every_change() {
         init_global_heap();
@@ -1331,8 +1308,6 @@ mod tests {
         assert_eq!(r.generation(), 3);
     }
 
-    /// **A waiting read is answered by the change past its generation, and not before** (Phase 6
-    /// Part C), and the slots run out at four: a fifth is handed back to be refused.
     #[test]
     fn a_waiting_read_is_answered_past_its_generation_and_not_before() {
         let mut w: Waiters<char> = Waiters::new();
@@ -1349,8 +1324,8 @@ mod tests {
     }
 
     /// **A change read shorter than its answer is refused, one that is behind is answered at once,
-    /// and a fifth waiting is refused** (PR #361 review): `io-operation.md`'s two refusals, through
-    /// the read itself. Seven bytes and eight, either side of the bound.
+    /// and a fifth waiting is refused** (`io-operation.md`'s two refusals), through the read
+    /// itself. Seven bytes and eight, either side of the bound.
     #[test]
     fn a_change_read_is_refused_short_answered_behind_and_refused_a_fifth_place() {
         init_global_heap();

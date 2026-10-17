@@ -1,24 +1,14 @@
-//! The console's glyphs: an 8×16 bitmap face, embedded as the file it is distributed as.
-//!
-//! **Terminus Font**, normal weight, in the PSF1 form Debian's `console-setup` ships
-//! (`assets/fonts/Lat15-Terminus16.psf`; SIL OFL 1.1, with the licence and where the file came
-//! from in `assets/fonts/LICENSE-Terminus.txt`). The file is embedded whole and read in place
-//! rather than converted into a Rust table, so there is no generator to rerun and no second copy
-//! of the glyphs to drift from the first. Its shape is checked when the kernel compiles.
-//!
-//! A bitmap, in a project whose userspace draws only TrueType (`libdraw::text`), because the
-//! console this serves has to draw before there is an allocator or a filesystem, and after
-//! everything else has failed.
-//!
-//! **Also compiled into `xtask`**, by path, whose `-serial none` gate reads a screendump back
-//! into text with these same glyphs. So this file names nothing outside itself.
-//!
-//! ## The format
+//! The console's glyphs: an 8×16 bitmap face, **Terminus Font** (normal weight) in the PSF1
+//! form Debian's `console-setup` ships (`assets/fonts/Lat15-Terminus16.psf`; SIL OFL 1.1,
+//! licence in `assets/fonts/LICENSE-Terminus.txt`), embedded whole and read in place; its shape
+//! is checked when the kernel compiles. A bitmap, because the console draws before there is an
+//! allocator or a filesystem. **Also compiled into `xtask`**, by path, whose `-serial none`
+//! gate reads a screendump back with these glyphs, so this file names nothing outside itself.
 //!
 //! PSF1 is four header bytes (`0x36 0x04`, a mode, the glyph height), 256 glyphs of
-//! [`GLYPH_H`] bytes each — one byte per pixel row, bit 7 leftmost — and then, when the mode says
-//! so, a Unicode table: for each glyph in order, the UCS-2 codepoints it draws, each list ended
-//! by `0xFFFF`. `0xFFFE` starts a list of combining sequences, which the console never draws.
+//! [`GLYPH_H`] bytes each — one byte per pixel row, bit 7 leftmost — and then, when the mode
+//! says so, a Unicode table: per glyph, the UCS-2 codepoints it draws, each list ended by
+//! `0xFFFF`. `0xFFFE` starts a list of combining sequences, which the console never draws.
 
 /// Glyph width in pixels. PSF1 fixes it at eight.
 pub const GLYPH_W: usize = 8;
@@ -39,7 +29,6 @@ const MODE_512: u8 = 0x01;
 const MODE_HAS_TABLE: u8 = 0x02;
 const HEADER: usize = 4;
 const COUNT: usize = 256;
-/// Where the Unicode table starts.
 const TABLE: usize = HEADER + COUNT * GLYPH_H;
 const END_OF_GLYPH: u16 = 0xFFFF;
 const SEQUENCE: u16 = 0xFFFE;
@@ -50,12 +39,8 @@ const _: () = assert!(
      table and printable ASCII at its own index that the console reads"
 );
 
-/// Whether the embedded file is the face everything below assumes.
-///
-/// **Printable ASCII at its own index** is part of it because [`index_of`] takes that shortcut
-/// instead of searching the table for every character of every line. It is true of every
-/// console-setup `Lat15` face; asserting it means a different file fails the build rather than
-/// drawing the wrong letters.
+/// Whether the embedded file is the face everything below assumes, including **printable ASCII
+/// at its own index**, which [`index_of`] takes as a shortcut instead of searching the table.
 const fn well_formed() -> bool {
     if PSF.len() < TABLE + 2 || !(PSF.len() - TABLE).is_multiple_of(2) {
         return false;
@@ -114,8 +99,8 @@ pub fn index_or_replacement(ch: char) -> u8 {
 /// The pixel rows of glyph `index`, top first; bit 7 of each is the leftmost pixel.
 pub fn rows(index: u8) -> &'static [u8; GLYPH_H] {
     let at = HEADER + index as usize * GLYPH_H;
-    // `at + GLYPH_H <= TABLE <= PSF.len()` for every `u8`, which `well_formed` established;
-    // the fallback is unreachable and exists so this cannot panic.
+    // `at + GLYPH_H <= TABLE <= PSF.len()` for every `u8` (`well_formed`); the fallback is
+    // unreachable and exists so this cannot panic.
     match PSF[at..].first_chunk::<GLYPH_H>() {
         Some(r) => r,
         None => &[0; GLYPH_H],
@@ -144,9 +129,8 @@ pub fn char_of(index: u8) -> Option<char> {
 
 /// Which glyph a bitmap is, trying printable ASCII first.
 ///
-/// For reading a screen back: several glyphs can be pixel-identical (a blank and a no-break
-/// space, a hyphen and a minus), and the first match in plain index order would name a
-/// codepoint nobody printed.
+/// For reading a screen back, where several glyphs can be pixel-identical (a blank and a
+/// no-break space) and plain index order would name a codepoint nobody printed.
 pub fn identify(bitmap: &[u8; GLYPH_H]) -> Option<u8> {
     let ascii = 0x20u8..0x7F;
     let rest = (0u8..0x20).chain(0x7F..=0xFF);
@@ -163,7 +147,6 @@ mod tests {
             assert_eq!(index_of(c as char), Some(c));
             assert_eq!(char_of(c), Some(c as char));
         }
-        // A face whose glyphs were all blank would pass the lines above; letters must differ.
         assert_ne!(rows(b'a'), rows(b'b'));
         assert_ne!(rows(b'0'), rows(b'O'));
         assert_eq!(rows(BLANK), &[0; GLYPH_H], "a cleared cell is blank");
@@ -171,7 +154,6 @@ mod tests {
 
     #[test]
     fn the_table_is_searched_for_what_ascii_does_not_cover() {
-        // Characters the kernel's own messages use, by count in the tree.
         let dash = index_of('—').expect("the face draws an em dash");
         assert!(dash >= 0x80, "an em dash is not an ASCII glyph");
         assert_eq!(char_of(dash), Some('—'));

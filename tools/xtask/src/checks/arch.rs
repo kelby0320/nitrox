@@ -2,6 +2,10 @@
 
 use crate::*;
 
+/// Kernel code outside `kernel/src/arch/` must reach the arch layer only through `crate::arch`,
+/// never `arch::x86_64::…`: the private `mod x86_64` makes such a path a compile error, and this
+/// is the regression net for comments, doc-links and re-export slips. See
+/// `docs/conventions/arch-boundary.md`.
 pub(crate) fn cmd_check_arch() -> R<()> {
     let kernel_src = repo_root().join("kernel").join("src");
     let arch_dir = kernel_src.join("arch");

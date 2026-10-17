@@ -3,9 +3,7 @@
 //! [`ArchEntropy`] exposes the CPU's hardware random-number source as a single
 //! fallible draw, used by the entropy subsystem to *seed* the software CSPRNG
 //! (`docs/architecture/entropy.md` § Sources). On x86_64 this is `RDSEED`
-//! (preferred) with an `RDRAND` fallback, both CPUID-detected (see
-//! `arch/x86_64/entropy.rs`); a future aarch64 port would back it with `RNDR` /
-//! the SMCCC TRNG.
+//! (preferred) with an `RDRAND` fallback; aarch64 would use `RNDR` / the SMCCC TRNG.
 //!
 //! The draw is **fallible by design**: a hardware source can legitimately have no
 //! value ready, and a CPU may have no source at all (older parts, some
@@ -15,9 +13,6 @@
 //! **Trust model.** Output here is raw hardware-RNG material. It is *absorbed into
 //! the entropy pool, never used as CSPRNG output directly* (mix-don't-trust); see
 //! the design doc. This module only exposes the raw draw.
-//!
-//! The active architecture's implementation is re-exported from `crate::arch` as
-//! `Entropy` (see `kernel/src/arch/mod.rs`).
 
 /// The best hardware random source the current CPU offers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

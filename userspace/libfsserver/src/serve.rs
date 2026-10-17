@@ -1,16 +1,7 @@
-//! The request→reply logic for the forwarded ops the kernel sends — the pure core
-//! of the server loop, kept apart from [`crate::server`] so it is **host-testable**: it is
-//! generic over [`Volume`], and each server's crate tests it through its own volume, against
-//! an image its filesystem's tools built.
-//!
-//! [`serve`] dispatches by op: a `Namespace::Resolve` ([`serve_resolve`]) resolves a
-//! path — lazily (reply `OBJECT_KIND_FILE_BLOCKS` + the file's map; the kernel builds the
-//! page-cache object) or eagerly (reply a `MemoryObject` of the whole content) — and
-//! a `File::ReadRange` ([`serve_read_range`]) reads one byte range of a file (the
-//! page-cache fill; reply a `MemoryObject` of the range). The syscall plumbing
-//! (materialising/transferring the `MemoryObject`, recv/send) lives in [`crate::server`];
-//! this module touches no syscalls. An error reply carries the op of its request so
-//! the kernel routes it to the right pending operation (lookup vs fill).
+//! The request→reply logic for the forwarded ops the kernel sends — the pure core of the server
+//! loop, **host-testable** because it touches no syscalls: generic over [`Volume`], each server's
+//! crate tests it through its own volume. An error reply carries the op of its request so the
+//! kernel routes it to the right pending operation (lookup vs fill).
 
 use crate::{BlockRun, FsError, Mapped, RUN_UNWRITTEN, Refusal, Volume};
 use libkern::KError;
@@ -22,37 +13,30 @@ use librsproto::namespace::{
 };
 use librsproto::{OP_FILE_READ_RANGE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
-/// Largest suffix the server resolves (bounds the on-stack path buffer). A path
-/// longer than this resolves to `TooLarge` — far beyond any real filesystem path.
+/// Largest suffix the server resolves (bounds the on-stack path buffer). A longer path
+/// resolves to `TooLarge`.
 pub const MAX_SUFFIX: usize = 1024;
 
-/// **Largest file an eager resolve reads whole**, the slice-7 path's cap: what the server's
-/// content buffer holds.
+/// **Largest file an eager resolve reads whole**: the server's content buffer.
 pub const MAX_FILE: usize = 64 * 1024;
 
 /// What the caller ([`crate::server`]) should do with the reply a serve fn built.
 pub enum Served {
-    /// Success: `reply[..reply_len]` is the rsproto reply; the caller transfers a
-    /// read-only `MemoryObject` of `content[..content_len]` in `IpcMsg.handles[0]`.
-    /// Both an eager resolve and a `ReadRange` fill produce this.
+    /// The caller transfers a read-only `MemoryObject` of `content[..content_len]` in
+    /// `IpcMsg.handles[0]`: an eager resolve or a `ReadRange` fill.
     File { reply_len: usize, content_len: usize },
-    /// A **Model A** lazy resolve: `reply[..reply_len]` carries the file size + block map;
-    /// the caller transfers a `READ | TRANSFER` **duplicate of the block-device handle** in
-    /// `IpcMsg.handles[0]` (the kernel does the file-data I/O). Keep the original device
-    /// handle for metadata reads.
+    /// A **Model A** lazy resolve: the caller transfers a `READ | TRANSFER` **duplicate of the
+    /// block-device handle** in `IpcMsg.handles[0]`; the original stays for metadata reads.
     LazyBlocks { reply_len: usize },
     /// An error reply (no handle transferred): `reply[..reply_len]`.
     Error { reply_len: usize },
 }
 
-/// Largest `BlockRun` map inlined in a Model A resolve reply. A file needing more runs is
-/// too fragmented to inline (→ `TooLarge`); the standalone `MapRange` op covers it
-/// (`TODO(map-range)`, for both servers). 64 runs = 1536 body bytes, comfortably inside the 4 KiB
-/// IPC payload.
+/// Largest `BlockRun` map inlined in a Model A resolve reply (1536 body bytes, inside the 4 KiB
+/// IPC payload). A more fragmented file is `TooLarge` until `TODO(map-range)` lands.
 pub const MAX_RUNS: usize = 64;
 
-/// Serve one forwarded request: dispatch by op to [`serve_resolve`] (a
-/// `Namespace::Resolve`) or [`serve_read_range`] (a `File::ReadRange`). An
+/// Serve one forwarded request: dispatch by op to [`serve_resolve`] or [`serve_read_range`]. An
 /// undecodable request or an unknown op yields an error reply.
 pub fn serve<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], reply: &mut [u8]) -> Served {
     match decode(request) {
@@ -65,23 +49,19 @@ pub fn serve<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], reply: &mut
     }
 }
 
-/// Serve one forwarded `Namespace::Resolve`: parse `request`, resolve `"/" + suffix`
-/// (the mount is the filesystem root) to a regular file, and build the reply. With
-/// `RESOLVE_FILE_LAZY` the reply is **lazy** — `OBJECT_KIND_FILE_BLOCKS`, the file size and its
-/// map, no content read (the kernel builds the page-cache object; the caller transfers the
-/// device). Otherwise it is **eager** — the whole content read into `content` and
-/// named by a transferred `MemoryObject` (`OBJECT_KIND_MEMOBJ`, the slice-7 path,
-/// capped at [`MAX_FILE`]). The `request_id` is echoed; a malformed/oversized
-/// request or any [`FsError`] yields an error reply.
+/// Serve one forwarded `Namespace::Resolve` of `"/" + suffix` (the mount is the filesystem root).
+/// With `RESOLVE_FILE_LAZY` the reply is **lazy**: `OBJECT_KIND_FILE_BLOCKS`, the size and the
+/// map, no content read. Otherwise it is **eager**: the whole content (capped at [`MAX_FILE`])
+/// named by a transferred `MemoryObject`. A malformed or oversized request or any [`FsError`]
+/// yields an error reply.
 pub fn serve_resolve<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], reply: &mut [u8]) -> Served {
     resolve(vol, request, content, reply, None)
 }
 
-/// [`serve_resolve`] for a resolve whose grow took the file from `grown_from` bytes: **what the grow
-/// added is marked [`RUN_UNWRITTEN`]** in the reply's map ([`mark_grown`]), so the kernel fills it as
-/// zero without reading it (Phase 6 Part H.4). [`Volume::grow_file`] promises that it reads as zero.
-/// Only this reply marks it: a later resolve maps the same blocks unmarked, and the device then holds
-/// the zeroes or what was written over them.
+/// [`serve_resolve`] for a resolve whose grow took the file from `grown_from` bytes: **what the
+/// grow added is marked [`RUN_UNWRITTEN`]** ([`mark_grown`]), so the kernel fills it as zero
+/// without reading it, as [`Volume::grow_file`] promises. Only this reply marks it; a later
+/// resolve maps the same blocks unmarked.
 pub fn serve_grown<V: Volume>(
     vol: &V,
     request: &[u8],
@@ -100,11 +80,9 @@ fn resolve<V: Volume>(
     reply: &mut [u8],
     grown_from: Option<u64>,
 ) -> Served {
-    // Decode the envelope first — recover the `request_id` even if the rest is
-    // unusable, so the error reply still correlates to the right lookup.
+    // Decode the envelope first, so even an unusable request's error reply correlates.
     let msg = match decode(request) {
         Ok(m) => m,
-        // A request that doesn't even decode has no recoverable id; reply id 0.
         Err(_) => return error_reply(reply, 0, KError::InvalidArgument, OP_NS_RESOLVE),
     };
     let request_id = msg.request_id;
@@ -119,23 +97,19 @@ fn resolve<V: Volume>(
         return error_reply(reply, request_id, KError::TooLarge, OP_NS_RESOLVE);
     }
 
-    // Build the absolute path "/" + suffix (the binding is the filesystem root, so
-    // the lookup suffix is the path under it; the kernel strips the leading '/').
+    // The binding is the filesystem root and the kernel strips the leading '/'.
     let mut path_buf = [0u8; MAX_SUFFIX + 1];
     path_buf[0] = b'/';
     path_buf[1..1 + req.suffix.len()].copy_from_slice(req.suffix);
     let path = &path_buf[..1 + req.suffix.len()];
 
     if req.flags & RESOLVE_FILE_LAZY != 0 {
-        // Model A lazy resolve: map the file's blocks to device runs, reply the size +
-        // block size + map (the kernel then does file-data I/O; the caller transfers the
-        // device handle).
         let mut runs = [BlockRun::default(); MAX_RUNS];
         return match vol.map_file(path, &mut runs) {
             Ok(m) if m.size > u32::MAX as usize => error_reply(reply, request_id, KError::TooLarge, OP_NS_RESOLVE),
             Ok(m) => {
                 // A read-only mount's files are marked so: the kernel installs them without
-                // `MAP_WRITE` (administration Part C.3).
+                // `MAP_WRITE`.
                 let flags = if vol.read_only() { FILE_BLOCKS_READ_ONLY } else { 0 };
                 let n = match grown_from {
                     Some(was) if m.block_size > 0 => mark_grown(&mut runs, m.runs, was.div_ceil(m.block_size as u64)),
@@ -150,24 +124,19 @@ fn resolve<V: Volume>(
         };
     }
 
-    // Eager (slice-7): read the whole file and name a MemoryObject of it.
     match vol.read_file(path, content) {
         Ok(size) => match success_reply(reply, request_id, size) {
             Some(reply_len) => Served::File { reply_len, content_len: size },
-            // The caller's reply buffer is the 4 KiB IPC payload — far larger than a
-            // RESOLVE_REPLY — so this is unreachable; degrade to an error reply.
+            // The reply buffer is the 4 KiB IPC payload, far larger than a RESOLVE_REPLY.
             None => error_reply(reply, request_id, KError::KernelError, OP_NS_RESOLVE),
         },
         Err(e) => error_reply(reply, request_id, kerror(e), OP_NS_RESOLVE),
     }
 }
 
-/// Serve one forwarded `File::ReadRange` (the page-cache fill): parse `request`,
-/// read the requested byte range of `"/" + suffix` into `content`, and reply naming
-/// a `MemoryObject` of the bytes read (the caller transfers it). The fill is
-/// **stateless** — the file is re-identified by the suffix each call. `content_len`
-/// in the reply is the bytes actually read (≤ requested; a short tail at EOF leaves
-/// the kernel's zeroed frame as padding). An error reply carries the `ReadRange` op.
+/// Serve one forwarded `File::ReadRange` (the page-cache fill) of `"/" + suffix`. It is
+/// **stateless**: the file is re-identified by the suffix each call. `content_len` is the bytes
+/// actually read; a short tail at EOF leaves the kernel's zeroed frame as padding.
 pub fn serve_read_range<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], reply: &mut [u8]) -> Served {
     let msg = match decode(request) {
         Ok(m) => m,
@@ -201,19 +170,16 @@ pub fn serve_read_range<V: Volume>(vol: &V, request: &[u8], content: &mut [u8], 
     }
 }
 
-/// Build a success `ResolveReply` (object_kind `MEMOBJ`, the exact `content_len`)
-/// into `reply`; `None` only if `reply` is too small.
+/// Build a success `ResolveReply` (object_kind `MEMOBJ`).
 fn success_reply(reply: &mut [u8], request_id: u64, content_len: usize) -> Option<usize> {
     let mut body = [0u8; RESOLVE_REPLY_LEN];
     let body_len = resolve_reply(&mut body, OBJECT_KIND_MEMOBJ, content_len as u32)?;
     encode(reply, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body[..body_len], 1)
 }
 
-/// Build a **Model A** lazy `ResolveReply` into `reply`: `OBJECT_KIND_FILE_BLOCKS` +
-/// `content_len` = file size, then the block size, the file's id, and the
-/// `BlockRun` map, with `handle_count = 1` (the caller transfers the device handle). Body
-/// layout matches `rsproto-namespace-ops.md` § *The `FILE_BLOCKS` body* and the kernel's
-/// `file_blocks_reply_header`/`file_blocks_run`. `None` only if `reply` is too small.
+/// Build a **Model A** lazy `ResolveReply`: `OBJECT_KIND_FILE_BLOCKS`, `content_len` = file size,
+/// then the block size, the file's id and the `BlockRun` map, `handle_count = 1`. Body layout:
+/// `rsproto-namespace-ops.md` § *The `FILE_BLOCKS` body*.
 fn model_a_reply(reply: &mut [u8], request_id: u64, m: &Mapped, runs: &[BlockRun], flags: u32) -> Option<usize> {
     let mut body = [0u8; FILE_BLOCKS_PREFIX_LEN + MAX_RUNS * BLOCK_RUN_WIRE_LEN];
     let mut off = file_blocks_prefix(&mut body, m.size as u32, m.block_size, runs.len() as u32, m.id, flags)?;
@@ -227,7 +193,7 @@ fn model_a_reply(reply: &mut [u8], request_id: u64, m: &Mapped, runs: &[BlockRun
     encode(reply, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body[..off], 1)
 }
 
-/// **Mark what a grow added** (Phase 6 Part H.4): of the first `n` runs, every one from file block
+/// **Mark what a grow added**: of the first `n` runs, every one from file block
 /// `fresh` on — the first block wholly past the file's old end — is flagged [`RUN_UNWRITTEN`], and
 /// one across `fresh` is split in two, so the blocks before it go on reading from the device. A
 /// hole stays a hole. With no room left to split, the run across is left as it is, and reads from
@@ -261,26 +227,20 @@ pub(crate) fn mark_grown(runs: &mut [BlockRun], n: usize, fresh: u64) -> usize {
     n
 }
 
-/// Build a success `ReadRangeReply` (the `content_len` bytes ride in `handles[0]`)
-/// into `reply`; `None` only if `reply` is too small.
+/// Build a success `ReadRangeReply`; the bytes ride in `handles[0]`.
 fn range_reply(reply: &mut [u8], request_id: u64, content_len: usize) -> Option<usize> {
     let mut body = [0u8; READ_RANGE_REPLY_LEN];
     let body_len = read_range_reply(&mut body, content_len as u32)?;
     encode(reply, OP_FILE_READ_RANGE, request_id, RS_FLAG_REPLY, &body[..body_len], 1)
 }
 
-/// Build an error reply (`REPLY | ERROR`, an `ErrorBody` carrying `err`) for `op`
-/// into `reply`. The body has no message (replies stay minimal).
 fn error_reply(reply: &mut [u8], request_id: u64, err: KError, op: u16) -> Served {
     Served::Error { reply_len: encode_error(reply, request_id, err.as_i32(), op, b"") }
 }
 
-/// Encode a standalone error reply (`REPLY | ERROR`) for `request_id` / `op`
-/// carrying the `kerror` discriminant — and `reason`, up to 64 bytes, for a person reading the
-/// error — into `reply`, returning its length. The `op`
-/// must match the request's so the kernel routes the error to the right pending
-/// operation (a lookup vs a fill). Exposed for the server loop's fallback (e.g. if
-/// it cannot materialise an object it already resolved).
+/// Encode an error reply (`REPLY | ERROR`) carrying the `kerror` discriminant and `reason`, up to
+/// 64 bytes, into `reply`, returning its length. The `op` must match the request's so the kernel
+/// routes the error to the right pending operation.
 pub fn encode_error(reply: &mut [u8], request_id: u64, kerror: i32, op: u16, reason: &[u8]) -> usize {
     let mut body = [0u8; ERROR_BODY_LEN + 64];
     let reason = &reason[..reason.len().min(64)];
@@ -288,17 +248,13 @@ pub fn encode_error(reply: &mut [u8], request_id: u64, kerror: i32, op: u16, rea
     encode(reply, op, request_id, RS_FLAG_REPLY | RS_FLAG_ERROR, &body[..body_len], 0).unwrap_or(0)
 }
 
-/// Longest reason a refusal carries. Every reason a server's library gives fits with room to
-/// spare; a longer one is cut here rather than failing the refusal.
+/// Longest refusal reason; a longer one is cut rather than failing the refusal.
 pub const MAX_REASON: usize = 192;
 
-/// Encode the message a server that cannot serve its device sends **in place of** `Meta::Ready`:
-/// the `Ready` op with `RS_FLAG_ERROR`, an `ErrorBody` whose message says why, and no handle
-/// (`docs/spec/rsproto-wire-format.md` § Meta::Ready). Returns its length, or `None` if `out`
-/// cannot hold it.
-///
-/// The supervisor prints the reason with what only it knows — the device and the mount point —
-/// so the server does not print it too.
+/// Encode what a server that cannot serve its device sends **in place of** `Meta::Ready`: the
+/// `Ready` op with `RS_FLAG_ERROR`, an `ErrorBody` saying why, and no handle
+/// (`docs/spec/rsproto-wire-format.md` § Meta::Ready). The supervisor prints the reason with the
+/// device and mount point, so the server does not.
 pub fn encode_refusal(out: &mut [u8], why: &impl Refusal) -> Option<usize> {
     let mut reason = Truncating { buf: [0; MAX_REASON], len: 0 };
     // `Truncating` never fails a write, so neither does this.
@@ -323,27 +279,11 @@ impl core::fmt::Write for Truncating {
     }
 }
 
-/// **The [`KError`] a reply carries for an [`FsError`].**
-///
-/// Four of these arms were wrong or lossy until the 2026-07-30 ABI pass, and the
-/// pattern in all four was the same: a `KError` that said what happened existed,
-/// and the mapping reached for a vaguer one anyway. `Exists`/`NotEmpty` collapsed
-/// into `InvalidArgument` (the documented `fs-error-granularity` deferral), but also
-/// `TooLarge` reported `OutOfMemory` — the kernel is not out of memory, the file
-/// exceeded the caller's buffer, and `KError::TooLarge` has meant exactly that
-/// since the beginning — and `Io` reported `KernelError`, so a failing disk was
-/// indistinguishable from a bug in the server.
-///
-/// `Corrupt` still shares `IoError` with `Io`: from a client's side both mean "the
-/// medium did not yield what it should have", and neither changes what the client
-/// can do. The distinction is real but it is *server-specific*, which is what the
-/// wire's `server_code` field is for (`docs/spec/rsproto-wire-format.md`); it is
-/// left unpopulated until something consumes it, rather than spending a kernel
-/// discriminant on a difference only this server can observe.
-///
-/// **One mapping since Phase 6 Part E.1.** `fs-server-ext4` had two: this one in its loop, and one
-/// in its resolve core still collapsing `Exists` and `NotEmpty` into `InvalidArgument`. No resolve
-/// or range read produces either, so taking this one for both changed no reply.
+/// **The [`KError`] a reply carries for an [`FsError`]**, the one mapping for both servers. A
+/// failing disk (`Io`) must not read as a bug in the server, nor `TooLarge` as the kernel out of
+/// memory. `Corrupt` shares `IoError` with `Io`: the distinction is *server-specific*, which the
+/// wire's `server_code` field is for (`docs/spec/rsproto-wire-format.md`), unpopulated until
+/// something consumes it.
 pub fn kerror(e: FsError) -> KError {
     match e {
         FsError::NotFound => KError::NotFound,
@@ -366,10 +306,6 @@ pub fn reason(e: FsError) -> &'static [u8] {
 mod tests {
     use super::*;
 
-    /// **What a grow added is marked, and nothing before it** (Phase 6 Part H.4): runs wholly past
-    /// the old end flagged `UNWRITTEN`, a run across it split so its first blocks keep reading from
-    /// the device, a hole left a hole, and — with no room to split — the run across left whole and
-    /// unflagged, which reads the zeroes on the device: slower, never a block of data read as zero.
     #[test]
     fn a_grows_reply_marks_what_it_added_and_nothing_before_it() {
         let run = |file_block, device_lba, length| BlockRun { file_block, device_lba, length, flags: 0 };
@@ -384,17 +320,14 @@ mod tests {
             "split at block 5; the hole left alone"
         );
 
-        // On a boundary: nothing split, nothing before it marked.
         let mut runs = [run(0, 100, 3), run(3, 200, 4), BlockRun::default()];
         assert_eq!(mark_grown(&mut runs, 2, 3), 2);
         assert_eq!(runs[..2], [run(0, 100, 3), fresh(3, 200, 4)]);
 
-        // No room to split: the run across stays whole and unmarked; what follows is marked.
         let mut runs = [run(0, 100, 3), run(3, 200, 4)];
         assert_eq!(mark_grown(&mut runs, 2, 1), 2);
         assert_eq!(runs, [run(0, 100, 3), fresh(3, 200, 4)]);
 
-        // A grow from nothing marks everything, and one that added nothing past the map marks none.
         let mut runs = [run(0, 100, 3)];
         assert_eq!((mark_grown(&mut runs, 1, 0), runs[0]), (1, fresh(0, 100, 3)));
         let mut runs = [run(0, 100, 3)];

@@ -1,26 +1,13 @@
-//! PCI(e) enumeration over ECAM.
+//! PCI(e) enumeration over ECAM: walks the firmware-discovered ECAM windows
+//! ([`crate::arch::platform::ArchPlatform::pcie_ecam_regions`]) and builds an
+//! architecture-independent [`DeviceNode`] per present function. Only *where the ECAM window
+//! lives* is arch-specific ([`EcamRegion`]s). Bridge traversal beyond the ECAM bus range is
+//! not done. See `docs/spec/device-node.md` and `docs/architecture/drivers-and-irps.md`.
 //!
-//! Walks the PCIe configuration space exposed by the firmware-discovered ECAM
-//! windows ([`crate::arch::platform::ArchPlatform::pcie_ecam_regions`]) and
-//! builds an architecture-independent [`DeviceNode`] per present function. PCI(e)
-//! config space is a PCI-SIG standard identical across architectures, so this
-//! module is neutral kernel code; only *where the ECAM window lives* is
-//! arch-specific (ACPI MCFG vs. a DTB), and that already crossed the arch
-//! boundary as [`EcamRegion`]s.
-//!
-//! This is Phase 2 slice 5, Part 1: enumeration + `DeviceNode` only. Driver
-//! matching (claiming a node, marking it `Block`, routing its interrupt) is the
-//! AHCI part; bridge/secondary-bus traversal beyond the ECAM bus range is
-//! deferred (QEMU q35's devices sit on the buses the MCFG already covers). See
-//! `docs/spec/device-node.md` and `docs/architecture/drivers-and-irps.md`.
-//!
-//! ## Config-space access
-//!
-//! Each function's 4 KiB config space is 4 KiB-aligned MMIO at
-//! `region.base + ((bus - bus_start) << 20 | dev << 15 | func << 12)`. The vmap
-//! allocator never reclaims VA, so rather than mapping every function (or the
-//! whole multi-hundred-MiB ECAM window), enumeration reserves **one** vmap page
-//! and repoints it per function with [`kvmap::remap_mmio_page`].
+//! Each function's 4 KiB config space is at
+//! `region.base + ((bus - bus_start) << 20 | dev << 15 | func << 12)`. The vmap allocator never
+//! reclaims VA, so enumeration reserves **one** vmap page and repoints it per function with
+//! [`kvmap::remap_mmio_page`].
 
 use crate::arch::Platform;
 use crate::arch::platform::{ArchPlatform, EcamRegion};
@@ -33,7 +20,6 @@ use crate::object::device_node::{
     DeviceNode, InterruptSpec, ResourceDescriptor,
 };
 
-// PCI configuration-space register offsets (dword-aligned).
 const REG_ID: u16 = 0x00; // vendor_id | device_id << 16
 const REG_COMMAND: u16 = 0x04; // command | status << 16
 const REG_CLASS_REV: u16 = 0x08; // revision | prog_if << 8 | subclass << 16 | class << 24
@@ -48,17 +34,13 @@ const VENDOR_ABSENT: u16 = 0xFFFF;
 /// Header-type bit 7: the device is multi-function.
 const HEADER_MULTIFUNCTION: u8 = 0x80;
 
-/// Read/write access to one function's configuration space. Abstracted so the
-/// decoding/sizing logic is host-testable against a synthetic config space.
-///
-/// `pub(crate)` because a driver programming its own capabilities needs one —
-/// see [`Config`], the window that outlives [`enumerate`].
+/// Read/write access to one function's configuration space, abstract so decoding/sizing is
+/// host-testable. `pub(crate)` because a driver programming its own capabilities needs one.
 pub(crate) trait Cfg {
     fn read32(&self, off: u16) -> u32;
     fn write32(&self, off: u16, val: u32);
 }
 
-/// Config access through a mapped, uncached MMIO window.
 struct MmioCfg {
     base: *mut u8,
 }
@@ -80,18 +62,15 @@ impl Cfg for MmioCfg {
     }
 }
 
-/// Physical base of `(bus, dev, func)`'s 4 KiB config space within `region`.
 fn func_phys(region: &EcamRegion, bus: u8, dev: u8, func: u8) -> PhysAddr {
     let off = (((bus - region.bus_start) as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12);
     PhysAddr(region.base.as_u64() + off)
 }
 
-/// Header-type byte, including the multi-function bit (bit 7).
 fn header_type_raw<C: Cfg>(cfg: &C) -> u8 {
     ((cfg.read32(REG_HEADER) >> 16) & 0xFF) as u8
 }
 
-/// Decode the device's identity from its class/id registers.
 fn decode_identity<C: Cfg>(cfg: &C) -> DeviceIdentity {
     let id = cfg.read32(REG_ID);
     let class = cfg.read32(REG_CLASS_REV);
@@ -105,8 +84,8 @@ fn decode_identity<C: Cfg>(cfg: &C) -> DeviceIdentity {
     }
 }
 
-/// Decode the legacy interrupt line/pin. `gsi`/`trigger`/`polarity` stay
-/// unresolved until a driver routes the pin (the AHCI part).
+/// Decode the legacy interrupt line/pin. `gsi`/`trigger`/`polarity` stay unresolved until a
+/// driver routes the pin.
 fn read_interrupt<C: Cfg>(cfg: &C) -> InterruptSpec {
     let d = cfg.read32(REG_INTERRUPT);
     let line = (d & 0xFF) as u8;
@@ -114,10 +93,8 @@ fn read_interrupt<C: Cfg>(cfg: &C) -> InterruptSpec {
     InterruptSpec { gsi: 0, trigger: 0, polarity: 0, line, pin, present: (pin != 0) as u8, _pad: 0 }
 }
 
-/// Size every BAR of a header-type-0 function. Standard protocol: disable the
-/// function's decode, write all-ones to a BAR and read back the size mask,
-/// restore the original value, re-enable decode. A 64-bit memory BAR consumes
-/// its slot plus the next.
+/// Size every BAR of a header-type-0 function: disable decode, write all-ones and read back the
+/// size mask, restore, re-enable decode. A 64-bit memory BAR consumes its slot plus the next.
 fn size_bars<C: Cfg>(cfg: &C) -> [BarWindow; 6] {
     let mut bars = [BarWindow::ZERO; 6];
     let cmd = cfg.read32(REG_COMMAND);
@@ -128,7 +105,6 @@ fn size_bars<C: Cfg>(cfg: &C) -> [BarWindow; 6] {
         let off = REG_BAR0 + (i as u16) * 4;
         let orig = cfg.read32(off);
         if orig & 0x1 != 0 {
-            // I/O-space BAR (always 32-bit; low two bits are flags).
             cfg.write32(off, 0xFFFF_FFFF);
             let mask = cfg.read32(off) & 0xFFFF_FFFC;
             cfg.write32(off, orig);
@@ -142,7 +118,6 @@ fn size_bars<C: Cfg>(cfg: &C) -> [BarWindow; 6] {
             }
             i += 1;
         } else if (orig >> 1) & 0x3 == 0x2 {
-            // 64-bit memory BAR (this slot + the next).
             let orig_hi = cfg.read32(off + 4);
             cfg.write32(off, 0xFFFF_FFFF);
             cfg.write32(off + 4, 0xFFFF_FFFF);
@@ -165,7 +140,6 @@ fn size_bars<C: Cfg>(cfg: &C) -> [BarWindow; 6] {
             }
             i += 2;
         } else {
-            // 32-bit memory BAR.
             cfg.write32(off, 0xFFFF_FFFF);
             let mask = cfg.read32(off) & 0xFFFF_FFF0;
             cfg.write32(off, orig);
@@ -189,13 +163,11 @@ fn size_bars<C: Cfg>(cfg: &C) -> [BarWindow; 6] {
     bars
 }
 
-/// Build the full resource descriptor for one present function.
 fn decode_function<C: Cfg>(cfg: &C, seg: u16, bus: u8, dev: u8, func: u8) -> ResourceDescriptor {
     let bars = if header_type_raw(cfg) & 0x7F == 0 {
         size_bars(cfg)
     } else {
-        // Bridges (header type 1) have a different BAR layout; their traversal
-        // is deferred, so leave the windows empty.
+        // Bridges (header type 1) have a different BAR layout; leave the windows empty.
         [BarWindow::ZERO; 6]
     };
     ResourceDescriptor {
@@ -210,8 +182,6 @@ fn decode_function<C: Cfg>(cfg: &C, seg: u16, bus: u8, dev: u8, func: u8) -> Res
     }
 }
 
-/// Log a discovered function: one line for the function and its capabilities, then one per
-/// BAR.
 fn log_function(desc: &ResourceDescriptor, caps: &Capabilities) {
     let id = &desc.identity;
     crate::kprintln!(
@@ -238,14 +208,13 @@ fn log_function(desc: &ResourceDescriptor, caps: &Capabilities) {
     }
 }
 
-/// Outcome of probing one function slot.
 enum Probe {
     Absent,
     Present { multifunction: bool },
 }
 
-/// Probe `(bus, dev, func)`: repoint the window, and if a device is present
-/// build its `DeviceNode`, log it, and push an owning reference into `out`.
+/// Probe `(bus, dev, func)`: repoint the window and, if a device is present, build, log and push
+/// its `DeviceNode`.
 fn probe_function(
     region: &EcamRegion,
     win: VirtAddr,
@@ -282,8 +251,6 @@ fn probe_function(
     Probe::Present { multifunction }
 }
 
-/// Probe every function of one device slot (function 0, then 1..8 if the slot
-/// reports multi-function).
 fn scan_device(region: &EcamRegion, win: VirtAddr, bus: u8, dev: u8, out: &mut KVec<ObjectRef>, found: &mut usize) {
     if let Probe::Present { multifunction } = probe_function(region, win, bus, dev, 0, out, found)
         && multifunction
@@ -294,13 +261,11 @@ fn scan_device(region: &EcamRegion, win: VirtAddr, bus: u8, dev: u8, out: &mut K
     }
 }
 
-/// Enumerate every PCI(e) function reachable through the firmware ECAM windows,
-/// returning one owning [`DeviceNode`] reference per present function. Logs each
-/// function as it is discovered.
+/// Enumerate every PCI(e) function reachable through the firmware ECAM windows, returning one
+/// owning [`DeviceNode`] reference per present function.
 ///
-/// Must run after the allocators, the HHDM, the kvmap, and
-/// [`ArchPlatform::init`] (so the ECAM regions are populated). Performs no I/O
-/// beyond config-space reads (and the BAR-sizing read/restore writes).
+/// Must run after the allocators, HHDM, kvmap and [`ArchPlatform::init`]. Performs no I/O
+/// beyond config reads and BAR sizing.
 pub fn enumerate() -> KVec<ObjectRef> {
     let mut out: KVec<ObjectRef> = KVec::new();
     let regions = Platform::pcie_ecam_regions();
@@ -327,42 +292,26 @@ pub fn enumerate() -> KVec<ObjectRef> {
     out
 }
 
-// --- Config space that outlives enumeration ---------------------------------
-//
-// `enumerate` reserves one scan window and repoints it per function, so it is
-// gone by the time a driver is bound. A driver that must program its own
-// capabilities (MSI) needs a window of its own, and `ResourceDescriptor` carries
-// the `seg`/`bus`/`dev`/`func` the address is derived from.
-
 /// Why a function's configuration space could not be reached.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigError {
-    /// No firmware ECAM window covers this function's segment and bus. Either
-    /// the descriptor did not come from [`enumerate`], or the firmware described
-    /// a bus it does not map.
+    /// No firmware ECAM window covers this function's segment and bus.
     NoEcamWindow,
     /// The window is covered but could not be mapped (out of VA or page tables).
     Unmappable(AllocError),
 }
 
-/// A function's 4 KiB configuration space, mapped uncached for as long as the
-/// holder keeps it — the driver-side counterpart to [`enumerate`]'s shared scan
-/// window.
+/// A function's 4 KiB configuration space, mapped uncached for as long as the holder keeps it.
 ///
-/// **The mapping is permanent.** The vmap allocator never reclaims VA, so
-/// dropping a `Config` returns nothing; one page per claimed device is the price,
-/// and Tier 1 drivers are few and bound once at boot. A shared window behind a
-/// lock would save that page and cost a lock on a path that runs after the
-/// scheduler exists — the wrong trade at this count.
+/// **The mapping is permanent**: the vmap allocator never reclaims VA, so dropping a `Config`
+/// returns nothing. A page per claimed device is cheap (Tier 1 drivers are few, bound once at
+/// boot); a shared window behind a lock would cost a lock on a post-scheduler path.
 pub(crate) struct Config {
     inner: MmioCfg,
 }
 
 impl Config {
-    /// Map the configuration space of the function `desc` describes.
-    ///
-    /// Boot-time; must run after [`ArchPlatform::init`] (the ECAM windows) and
-    /// the kvmap.
+    /// Map the configuration space of the function `desc` describes. Boot-time.
     pub(crate) fn map(desc: &ResourceDescriptor) -> Result<Config, ConfigError> {
         let region = Platform::pcie_ecam_regions()
             .iter()
@@ -385,8 +334,6 @@ impl Cfg for Config {
     }
 }
 
-// --- The capability list ----------------------------------------------------
-
 /// `status` bit 4: the function implements a capability list.
 const STATUS_CAP_LIST: u32 = 1 << 4;
 /// Config offset of the capability-list pointer (header types 0 and 1 alike).
@@ -398,22 +345,16 @@ const CAP_LAST: u16 = 0xFC;
 /// Capability ID: MSI (PCI 3.0 §6.8.1).
 pub(crate) const CAP_ID_MSI: u8 = 0x05;
 
-/// Config offset of the first capability with `id`, or `None` if the function
-/// has no capability list or does not implement one with that id.
+/// Config offset of the first capability with `id`, or `None`.
 ///
-/// The walk is **bounded by the number of dword-aligned slots the list can
-/// occupy**, so a device that reports a circular or malformed chain terminates
-/// the search instead of hanging the boot.
+/// The walk is **bounded by the number of dword-aligned slots the list can occupy**, so a
+/// circular or malformed chain terminates instead of hanging the boot.
 pub(crate) fn find_capability<C: Cfg>(cfg: &C, id: u8) -> Option<u16> {
     capability_list(cfg).find(|&(cap, _)| cap == id).map(|(_, off)| off)
 }
 
-/// Every capability in the function's list as `(id, offset)`, in chain order — the one walk
-/// [`find_capability`] and the enumeration report share.
-///
-/// Ends where the chain does (a next pointer of zero), at a pointer outside the capability
-/// region, or after as many entries as the region has dword-aligned slots, so a circular chain
-/// terminates.
+/// Every capability in the function's list as `(id, offset)`, in chain order; ends at a zero
+/// next pointer, one outside the capability region, or after as many entries as it has slots.
 fn capability_list<C: Cfg>(cfg: &C) -> impl Iterator<Item = (u8, u16)> + '_ {
     let mut off = if cfg.read32(REG_COMMAND) & (STATUS_CAP_LIST << 16) == 0 {
         0 // no list: an offset outside the region ends the walk before it reads anything
@@ -438,9 +379,8 @@ const CAP_ID_PCIE: u8 = 0x10;
 /// Capability ID: MSI-X (PCI 3.0 §6.8.2).
 const CAP_ID_MSIX: u8 = 0x11;
 
-/// What a function's capability list holds, as far as a hardware report names it (Phase 5
-/// Part D.1): its MSI capability's form, whether it has MSI-X and a PCI Express capability,
-/// and how many entries of any other kind.
+/// What a function's capability list holds, as a hardware report names it: its MSI form, MSI-X,
+/// PCI Express, and how many entries of any other kind.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Capabilities {
     /// `None` without an MSI capability, `Some(None)` with one [`read_msi`] refuses.
@@ -503,15 +443,9 @@ impl core::fmt::Display for Capabilities {
     }
 }
 
-// --- MSI --------------------------------------------------------------------
-//
-// The capability's *layout* is selected by Message Control bit 7, and it is not
-// a widening: Message Data sits at `+0x0C` when the address is 64-bit and at
-// `+0x08` when it is 32-bit. Both target machines' AHCI controllers matter here
-// and they disagree — QEMU's ICH9 is 64-bit, the laptop's Sunrise Point-LP is
-// 32-bit — and no QEMU boot can exercise the second. That is what the host tests
-// below are for. See `docs/planning/phase-5-bare-metal.md` § "The divergence
-// QEMU structurally cannot catch".
+// --- MSI: the layout is selected by Message Control bit 7 (Message Data at `+0x0C` when the
+// address is 64-bit, `+0x08` when 32-bit). QEMU's ICH9 AHCI is 64-bit, the laptop's Sunrise
+// Point-LP 32-bit, which no QEMU boot exercises (`docs/planning/phase-5-bare-metal.md`). ---
 
 /// Message Control bit 0: MSI enable.
 const MSI_CTL_ENABLE: u16 = 1 << 0;
@@ -529,23 +463,18 @@ const MSI_CTL_PVM: u16 = 1 << 8;
 pub(crate) struct MsiCap {
     /// Config offset of the capability header.
     pub off: u16,
-    /// Message Control bit 7 — **which selects the structure**, not merely the
-    /// address width. See [`msi_data_offset`].
+    /// Message Control bit 7 — **which selects the structure**, not merely the address width.
+    /// See [`msi_data_offset`].
     pub addr64: bool,
-    /// Message Control bit 8. When clear the capability has no Mask or Pending
-    /// Bits registers at all and simply ends after Message Data; neither
-    /// controller on either target machine sets it.
+    /// Message Control bit 8. When clear the capability has no Mask or Pending Bits registers
+    /// and ends after Message Data.
     pub per_vector_mask: bool,
-    /// Message Control bits 3:1: log2 of the vectors the function can accept.
-    /// We request one regardless, so this is recorded rather than acted on.
+    /// Message Control bits 3:1: log2 of the vectors the function can accept; we request one.
     pub multi_message_capable: u8,
 }
 
-/// Config offset of this capability's **Message Data** register.
-///
-/// `+0x0C` in the 64-bit form, where `+0x08` holds the upper address; `+0x08` in
-/// the 32-bit form, where the capability then ends. Writing Data at the wrong one
-/// leaves Data zero and the device signalling vector 0.
+/// Config offset of this capability's **Message Data** register: `+0x0C` in the 64-bit form,
+/// `+0x08` in the 32-bit form. Writing it at the wrong one leaves Data zero (vector 0).
 pub(crate) fn msi_data_offset(cap: &MsiCap) -> u16 {
     if cap.addr64 { cap.off + 0x0C } else { cap.off + 0x08 }
 }
@@ -560,26 +489,19 @@ pub(crate) fn read_msi<C: Cfg>(cfg: &C) -> Option<MsiCap> {
         per_vector_mask: ctl & MSI_CTL_PVM != 0,
         multi_message_capable: ((ctl >> MSI_CTL_MMC_SHIFT) & 0b111) as u8,
     };
-    // **The structure has to fit inside the 256-byte header.** `CAP_LAST` bounds
-    // where a capability may *start*, not where it may end, so a function
-    // advertising MSI at `0xF4` or above — malformed; the 64-bit form needs 14
-    // bytes and the 32-bit form 10 — would have `program_msi` writing into
-    // extended configuration space and over whatever capability begins at
-    // `0x100`. Refuse it, and the caller falls back to INTx.
+    // **The structure has to fit inside the 256-byte header.** `CAP_LAST` bounds where a
+    // capability may *start*: MSI at `0xF4` or above would have `program_msi` writing into
+    // extended configuration space. Refuse it, and the caller falls back to INTx.
     if msi_data_offset(&cap) as u32 + 4 > 0x100 {
         return None;
     }
     Some(cap)
 }
 
-/// Point the function's MSI capability at `addr`/`data` and enable it with
-/// **one** vector (Multiple Message Enable = 0).
-///
-/// `addr` and `data` are the architecture's business — see
-/// [`crate::arch::msi_message`] — and the layout is this module's.
-///
-/// Returns `false` without writing anything if `addr` does not fit the
-/// capability's form, leaving the caller to fall back to INTx.
+/// Point the function's MSI capability at `addr`/`data` and enable it with **one** vector
+/// (Multiple Message Enable = 0); `addr` and `data` are the architecture's business
+/// ([`crate::arch::msi_message`]). Returns `false` without writing anything if `addr` does not
+/// fit the capability's form, leaving the caller to fall back to INTx.
 ///
 /// # Safety
 /// Ring-0, boot-time. On a `true` return the device may write `data` to `addr` at
@@ -587,11 +509,7 @@ pub(crate) fn read_msi<C: Cfg>(cfg: &C) -> Option<MsiCap> {
 /// ready to receive it. The caller is also responsible for disabling the
 /// function's INTx (see [`set_intx_disabled`]), which MSI does not do by itself.
 pub(crate) unsafe fn program_msi<C: Cfg>(cfg: &C, cap: &MsiCap, addr: u64, data: u16) -> bool {
-    // **Refuse rather than truncate.** A 32-bit capability has nowhere to put the
-    // upper half, and writing only the low one would point the device at a
-    // different address than the caller was told it had. `install_msi` makes the
-    // same choice about a destination that will not fit, and a silent truncation
-    // is the exact shape of the bug this part exists to prevent.
+    // **Refuse rather than truncate**: a 32-bit capability has nowhere to put the upper half.
     if !cap.addr64 && addr > u32::MAX as u64 {
         return false;
     }
@@ -600,44 +518,31 @@ pub(crate) unsafe fn program_msi<C: Cfg>(cfg: &C, cap: &MsiCap, addr: u64, data:
     if cap.addr64 {
         cfg.write32(cap.off + 0x08, (addr >> 32) as u32);
     }
-    // Message Data is 16 bits and shares its dword with reserved space, so
-    // read-modify-write rather than zeroing the other half.
+    // Message Data is 16 bits and shares its dword with reserved space: read-modify-write.
     let data_off = msi_data_offset(cap);
     let keep = cfg.read32(data_off) & 0xFFFF_0000;
     cfg.write32(data_off, keep | data as u32);
-    // Enable, one vector. The header's low half (id, next) is read-only, so
-    // writing it back unchanged is a no-op on hardware.
+    // Enable, one vector. The header's low half (id, next) is read-only.
     let hdr = cfg.read32(cap.off);
     let ctl = ((hdr >> 16) as u16 & !MSI_CTL_MME_MASK) | MSI_CTL_ENABLE;
     cfg.write32(cap.off, (hdr & 0xFFFF) | ((ctl as u32) << 16));
     true
 }
 
-// --- The command register ---------------------------------------------------
-
 /// `command` bit 2: the function may act as a DMA bus master.
 const CMD_BUS_MASTER: u32 = 1 << 2;
 /// `command` bit 10: the function's INTx assertion is suppressed.
 const CMD_INTX_DISABLE: u32 = 1 << 10;
 
-/// Write the 16-bit `command` register **without disturbing `status`**, which
-/// shares its dword.
-///
-/// `status`'s error bits (Master Abort, Target Abort, Parity Error, Signalled
-/// System Error) are **write-1-to-clear**, so reading the dword and writing it
-/// back silently clears whatever the function had latched — exactly the
-/// diagnostics that matter on a machine we have not met. Writing zeros there
-/// clears nothing, so the whole dword is written with the status half zeroed.
+/// Write the 16-bit `command` register **without disturbing `status`**, whose error bits
+/// (Master Abort, Target Abort, Parity Error, Signalled System Error) are **write-1-to-clear**:
+/// the whole dword is written with the status half zeroed.
 fn write_command<C: Cfg>(cfg: &C, command: u16) {
     cfg.write32(REG_COMMAND, command as u32);
 }
 
-/// Let the function act as a DMA bus master, returning whether it already could.
-///
-/// **Nothing in Nitrox used to do this**, and DMA worked anyway because the
-/// firmware hands every function over with the bit already set. That is a
-/// property of the firmware we boot under, not of the machine, so a driver that
-/// DMAs sets it for itself.
+/// Let the function act as a DMA bus master, returning whether it already could (the firmware
+/// hands every function over with the bit set, which is not a property of the machine).
 pub(crate) fn enable_bus_master<C: Cfg>(cfg: &C) -> bool {
     let cs = cfg.read32(REG_COMMAND);
     let was = cs & CMD_BUS_MASTER != 0;
@@ -647,10 +552,7 @@ pub(crate) fn enable_bus_master<C: Cfg>(cfg: &C) -> bool {
     was
 }
 
-/// Suppress or allow the function's legacy INTx assertion.
-///
-/// Enabling MSI does not do this, so a device left with INTx enabled can deliver
-/// both — and the IOAPIC entry the INTx path routed is still live.
+/// Suppress or allow the function's legacy INTx; enabling MSI does not do this.
 pub(crate) fn set_intx_disabled<C: Cfg>(cfg: &C, disabled: bool) {
     let cs = cfg.read32(REG_COMMAND);
     let next = if disabled { cs | CMD_INTX_DISABLE } else { cs & !CMD_INTX_DISABLE };
@@ -659,17 +561,14 @@ pub(crate) fn set_intx_disabled<C: Cfg>(cfg: &C, disabled: bool) {
     }
 }
 
-// --- Power management -------------------------------------------------------
-//
-// A function a driver finds in D3 answers configuration cycles but not memory ones: its registers
-// read as all ones. The laptop's xHCI was in D3 when Linux's view of it was taken, because Linux
-// suspends an idle controller (Phase 6 Part A); what the firmware leaves it in is not known.
+// --- Power management: a function in D3 answers configuration cycles but not memory ones (its
+// registers read as all ones); the laptop's xHCI was found in D3. ---
 
 /// Capability ID: PCI Power Management (PCI PM 1.2 §3.2).
 const CAP_ID_PM: u8 = 0x01;
 /// PMCSR, at the capability's `+4`: bits 1:0 are the power state.
 const PMCSR_STATE: u32 = 0b11;
-/// PMCSR bit 3, `No_Soft_Reset`: a transition from D3hot to D0 keeps the function's configuration.
+/// PMCSR bit 3, `No_Soft_Reset`: a D3hot to D0 transition keeps the function's configuration.
 const PMCSR_NO_SOFT_RESET: u32 = 1 << 3;
 /// PMCSR bit 15, `PME_Status`: write one to clear, so a write that changes the state carries zero.
 const PMCSR_PME_STATUS: u32 = 1 << 15;
@@ -681,9 +580,8 @@ pub(crate) enum Power {
     NoCapability,
     /// It was in D0 already.
     AlreadyD0,
-    /// It was in D`from` and is asked for D0. **The caller waits 10 ms before touching it** (PCI PM
-    /// 1.2 §5.4.1), and when `kept` is false — no `No_Soft_Reset` — restores what the transition
-    /// reset with [`Saved::restore`].
+    /// It was in D`from` and is asked for D0. **The caller waits 10 ms before touching it** (PCI
+    /// PM 1.2 §5.4.1), and restores with [`Saved::restore`] when `kept` is false.
     Raised { from: u8, kept: bool },
 }
 
@@ -694,7 +592,7 @@ pub(crate) struct Saved {
 }
 
 impl Saved {
-    /// Write the BARs back, then the command register, which is what enables decoding them.
+    /// Write the BARs back, then the command register, which enables decoding them.
     pub(crate) fn restore<C: Cfg>(&self, cfg: &C) {
         for (i, &bar) in self.bars.iter().enumerate() {
             cfg.write32(REG_BAR0 + 4 * i as u16, bar);
@@ -703,8 +601,8 @@ impl Saved {
     }
 }
 
-/// Put the function in D0, having saved what a resetting transition would lose. Configuration
-/// cycles reach a function in D3hot, so the save is of the live values.
+/// Put the function in D0, having saved what a resetting transition would lose (configuration
+/// cycles reach a function in D3hot, so the saved values are live).
 pub(crate) fn power_up<C: Cfg>(cfg: &C) -> (Power, Saved) {
     let mut saved = Saved { command: cfg.read32(REG_COMMAND), bars: [0; 6] };
     for (i, bar) in saved.bars.iter_mut().enumerate() {
@@ -727,9 +625,6 @@ mod tests {
     use super::*;
     use core::cell::RefCell;
 
-    /// A synthetic 256-byte config space that faithfully models BAR sizing:
-    /// writing `0xFFFF_FFFF` to a dword "arms" it, and the next read returns the
-    /// preset `sizing` mask instead of the stored value.
     struct FakeCfg {
         normal: RefCell<[u32; 64]>,
         sizing: [u32; 64],
@@ -764,11 +659,6 @@ mod tests {
         }
     }
 
-    // --- Capability list + MSI ----------------------------------------------
-
-    /// A config space with a capability list: `status` bit 4 set, the pointer at
-    /// `0x34`, and one MSI capability at `off` carrying `ctl` as its Message
-    /// Control. `next` chains onward (0 terminates).
     fn with_msi(off: u16, ctl: u16, next: u8) -> FakeCfg {
         let mut c = FakeCfg::new();
         c.set(REG_COMMAND, (STATUS_CAP_LIST << 16) | 0x0006);
@@ -777,21 +667,18 @@ mod tests {
         c
     }
 
-    /// QEMU's ICH9 AHCI, read off a live boot: MSI at `0x80`, control `0x0080`.
+    /// QEMU's ICH9 AHCI, read off a live boot: MSI at `0x80`, 64-bit (control `0x0080`).
     fn qemu_ahci_msi() -> FakeCfg {
         with_msi(0x80, 0x0080, 0xA8)
     }
 
-    /// The laptop's Sunrise Point-LP AHCI, read from `lspci -vv`: MSI at `0x80`,
-    /// `Count=1/1 Maskable- 64bit-` — so Message Control is `0x0000`.
+    /// The laptop's Sunrise Point-LP AHCI, from `lspci -vv`: MSI at `0x80`, 32-bit (control `0`).
     fn laptop_ahci_msi() -> FakeCfg {
         with_msi(0x80, 0x0000, 0xA8)
     }
 
     #[test]
     fn the_report_names_each_ahci_controllers_msi_form() {
-        // The laptop's chain as `lspci -vv` lists it: power management at 0x70, MSI at 0x80,
-        // SATA at 0xA8.
         let mut laptop = laptop_ahci_msi();
         laptop.set(REG_CAP_PTR, 0x70);
         laptop.set(0x70, 0x01 | (0x80 << 8));
@@ -821,8 +708,6 @@ mod tests {
         none.set(REG_COMMAND, 0x0006);
         assert_eq!(format!("{}", Capabilities::read(&none)), "caps none");
 
-        // 64-bit MSI at 0xF4 would end past the header; `read_msi` refuses it, and the report
-        // must not print it as a usable form.
         let malformed = with_msi(0xF4, 0x0080, 0);
         assert_eq!(read_msi(&malformed), None);
         assert_eq!(format!("{}", Capabilities::read(&malformed)), "caps msi-malformed");
@@ -844,15 +729,12 @@ mod tests {
     #[test]
     fn the_capability_walk_declines_when_the_status_bit_is_clear() {
         let mut c = qemu_ahci_msi();
-        // Everything is still in place except the claim that a list exists. A
-        // function without the bit may have anything at 0x34.
         c.set(REG_COMMAND, 0x0006);
         assert_eq!(find_capability(&c, CAP_ID_MSI), None);
     }
 
     #[test]
     fn the_capability_walk_terminates_on_a_circular_chain() {
-        // Positive control first: the same two entries, chain terminated.
         let mut ok = FakeCfg::new();
         ok.set(REG_COMMAND, STATUS_CAP_LIST << 16);
         ok.set(REG_CAP_PTR, 0x40);
@@ -860,8 +742,6 @@ mod tests {
         ok.set(0x50, 0x10);
         assert_eq!(find_capability(&ok, 0x10), Some(0x50), "control: a sane chain resolves");
 
-        // Now point the second entry back at the first. Searching for something
-        // absent must return rather than walk forever.
         let mut loopy = ok;
         loopy.set(0x50, 0x10 | (0x40 << 8));
         assert_eq!(find_capability(&loopy, CAP_ID_MSI), None);
@@ -872,33 +752,20 @@ mod tests {
         let mut c = FakeCfg::new();
         c.set(REG_COMMAND, STATUS_CAP_LIST << 16);
         c.set(REG_CAP_PTR, 0x10); // inside the header — that is BAR0, not a capability
-        // **Decodable on purpose, so the range check is the only thing that can
-        // refuse it.** Written first without this line, where the walk stopped on
-        // the zero `next` pointer instead and the test passed with the bound
-        // deleted (PR #295 review, 2). A BAR whose low byte is `0x05` is not
-        // far-fetched, and without the bound `read_msi` returns a capability at
-        // `0x10` — after which `program_msi` writes the message address over BAR1
-        // and the data over BAR2.
+        // Decodable on purpose, so only the range check refuses it.
         c.set(0x10, CAP_ID_MSI as u32);
         assert_eq!(find_capability(&c, CAP_ID_MSI), None);
     }
 
     #[test]
     fn an_msi_capability_that_would_run_past_the_header_is_refused() {
-        // Malformed: a 64-bit structure needs 14 bytes, so it cannot legally
-        // start above 0xF0. `CAP_LAST` bounds where a capability may *start*, not
-        // where it may end, so the walk finds this one and `read_msi` is what has
-        // to decline it — otherwise Message Data lands at 0x100, in extended
-        // configuration space, over whatever capability begins there.
         let c = with_msi(0xF4, 0x0080, 0);
         assert_eq!(find_capability(&c, CAP_ID_MSI), Some(0xF4), "the walk finds it");
         assert_eq!(read_msi(&c), None, "and read_msi refuses it");
 
-        // The last offset that does fit, so the bound is not simply off-by-wide.
         let ok = with_msi(0xF0, 0x0080, 0);
         assert!(read_msi(&ok).is_some(), "0xF0 leaves exactly enough room");
 
-        // The 32-bit form needs ten bytes and so fits four higher.
         let narrow = with_msi(0xF4, 0x0000, 0);
         assert!(read_msi(&narrow).is_some(), "0xF4 fits a 32-bit structure");
     }
@@ -918,10 +785,8 @@ mod tests {
         assert_eq!(laptop.multi_message_capable, 0);
     }
 
-    /// **The test this whole part exists to make possible.** No QEMU boot can
-    /// reach the 32-bit branch, because QEMU's AHCI is 64-bit; a driver shaped by
-    /// the emulator writes Data at `+0x0C` and leaves the real Message Data —
-    /// `+0x08` — holding whatever the upper-address write put there.
+    /// No QEMU boot reaches the 32-bit branch (QEMU's AHCI is 64-bit); a driver shaped by the
+    /// emulator would write Data at `+0x0C` instead of `+0x08`.
     #[test]
     fn a_32_bit_capability_takes_its_data_at_plus_8_and_nothing_beyond() {
         let c = laptop_ahci_msi();
@@ -966,11 +831,7 @@ mod tests {
 
     #[test]
     fn programming_msi_enables_exactly_one_vector() {
-        // **Message Control arrives with MME already 3**, so clearing it is work
-        // the write has to do rather than a property the fixture came with. The
-        // first version of this test used 0x0086, whose MME is already zero, and
-        // passed with `& !MSI_CTL_MME_MASK` deleted (PR #295 review, 3).
-        // 0x00B6 = bit 7 (64-bit), bits 6:4 = 3 (enabled for eight), bits 3:1 = 3.
+        // MME arrives already 3, so clearing it is work the write must do (0x00B6).
         let c = with_msi(0x80, 0x00B6, 0);
         let cap = read_msi(&c).unwrap();
         assert_eq!(cap.multi_message_capable, 3, "capable of 8");
@@ -1000,7 +861,6 @@ mod tests {
         assert_eq!(c.read32(0x88), 0, "message data untouched");
         assert_eq!((c.read32(0x80) >> 16) as u16 & MSI_CTL_ENABLE, 0, "and not enabled");
 
-        // The same address is fine on a capability that has room for it.
         let wide = qemu_ahci_msi();
         let wide_cap = read_msi(&wide).unwrap();
         // SAFETY: a synthetic config space.
@@ -1008,17 +868,9 @@ mod tests {
         assert_eq!(wide.read32(0x88), 1, "upper half of the address");
     }
 
-    // --- The command register ------------------------------------------------
-
     #[test]
     fn writing_the_command_register_never_writes_ones_into_the_status_half() {
-        // `status` shares the dword and its error bits are write-1-to-clear, so
-        // a read-modify-write of the whole dword clears whatever the function had
-        // latched. Every write goes through `write_command`, which puts zeros
-        // there — and zeros clear nothing on hardware.
-        //
-        // `FakeCfg` has no write-1-to-clear semantics, so what this asserts is the
-        // property that matters: the *value we write* carries no ones above bit 15.
+        // `FakeCfg` has no write-1-to-clear semantics: what is checked is the value written.
         const LATCHED: u32 = (1 << 13) | (1 << 15); // target abort, parity error
         for (what, run) in [
             (
@@ -1049,14 +901,11 @@ mod tests {
 
     #[test]
     fn enabling_bus_master_reports_whether_the_firmware_had_already_done_it() {
-        // What both target machines' firmware actually hands over.
         let mut already = FakeCfg::new();
         already.set(REG_COMMAND, 0x0007);
         assert!(enable_bus_master(&already), "firmware had set it");
         assert_eq!(already.read32(REG_COMMAND) & 0xFFFF, 0x0007, "unchanged");
 
-        // And a function handed over without it, which is what we must not assume
-        // away: decode bits on, bus mastering off.
         let mut not_yet = FakeCfg::new();
         not_yet.set(REG_COMMAND, 0x0003);
         assert!(!enable_bus_master(&not_yet), "firmware had not");
@@ -1073,14 +922,12 @@ mod tests {
         assert_eq!(c.read32(REG_COMMAND) & 0xFFFF, 0x0007, "and it is reversible");
     }
 
-    /// A QEMU-ICH9-like AHCI controller header (header type 0, BAR5 = ABAR).
     fn ahci_fake() -> FakeCfg {
         let mut c = FakeCfg::new();
         c.set(REG_ID, 0x2922_8086); // vendor 8086, device 2922
         c.set(REG_COMMAND, 0x0000_0007); // I/O + mem + bus-master enabled
         c.set(REG_CLASS_REV, 0x0106_0102); // class 01, subclass 06, prog_if 01, rev 02
         c.set(REG_HEADER, 0x0000_0000); // header type 0, single-function
-        // BAR5 (offset 0x24): 32-bit non-prefetchable MMIO, base 0xFEBF1000, 8 KiB.
         c.set(REG_BAR0 + 5 * 4, 0xFEBF_1000);
         c.set_sizing(REG_BAR0 + 5 * 4, 0xFFFF_E000);
         c.set(REG_INTERRUPT, 0x0000_0105); // line 5, pin 1 (INTA)
@@ -1106,7 +953,6 @@ mod tests {
         assert_eq!(abar.base, 0xFEBF_1000);
         assert_eq!(abar.size, 0x2000);
         assert_eq!(abar.flags, 0); // 32-bit, non-prefetchable
-        // The unimplemented BARs stay absent.
         assert_eq!(bars[0].kind, BAR_NONE);
     }
 
@@ -1122,7 +968,6 @@ mod tests {
     fn sizes_64bit_prefetchable_mmio() {
         let mut c = FakeCfg::new();
         c.set(REG_HEADER, 0); // header type 0
-        // BAR0: 64-bit prefetchable memory at 0x8000_0000, 1 MiB.
         c.set(REG_BAR0, 0x8000_000C); // bits: mem(0)=0, type(2:1)=10, prefetch(3)=1
         c.set(REG_BAR0 + 4, 0x0000_0000);
         c.set_sizing(REG_BAR0, 0xFFF0_0000);
@@ -1132,7 +977,6 @@ mod tests {
         assert_eq!(bars[0].base, 0x8000_0000);
         assert_eq!(bars[0].size, 0x10_0000);
         assert_eq!(bars[0].flags, BAR_FLAG_64 | BAR_FLAG_PREFETCH);
-        // The high slot was consumed, not reported as its own window.
         assert_eq!(bars[1].kind, BAR_NONE);
     }
 
@@ -1153,8 +997,6 @@ mod tests {
         assert_eq!(int.present, 0);
     }
 
-    /// A function with one capability, power management at `0x70`, whose PMCSR is `pmcsr`, and a
-    /// 64-bit BAR0 and a command register worth restoring.
     fn pm_fake(pmcsr: u32) -> FakeCfg {
         let mut c = FakeCfg::new();
         c.set(REG_COMMAND, (STATUS_CAP_LIST << 16) | 0x0406);
@@ -1176,8 +1018,7 @@ mod tests {
         assert_eq!(power_up(&none).0, Power::NoCapability);
     }
 
-    /// **The laptop's xHCI as Linux left it**: `Status: D3 NoSoftRst+ PME-Enable+`. Raised to D0,
-    /// with `PME_Enable` kept and a pending `PME_Status` not cleared by the write.
+    /// **The laptop's xHCI as Linux left it** (`D3 NoSoftRst+ PME-Enable+`): raised to D0.
     #[test]
     fn d3_is_raised_to_d0_without_clearing_pme_status() {
         let c = pm_fake(PMCSR_PME_STATUS | 1 << 8 | PMCSR_NO_SOFT_RESET | 0b11);
@@ -1188,8 +1029,6 @@ mod tests {
         assert_ne!(after & (1 << 8), 0, "PME_Enable kept");
     }
 
-    /// Without `No_Soft_Reset` the transition resets the function; what was saved before it puts
-    /// the BARs and the command register back.
     #[test]
     fn a_resetting_transition_is_undone_by_the_save() {
         let mut c = pm_fake(0b11);

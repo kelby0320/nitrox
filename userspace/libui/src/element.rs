@@ -1,40 +1,9 @@
 //! `Element` — what an application's `view` returns.
 //!
-//! An `Element` is a **description**, not a widget. It is built fresh every time `view` runs
-//! and dropped once the diff has consumed it; the retained widget that survives between
-//! frames is the diff's business, not this module's.
-//!
-//! That split decides where state may live, which is the part worth being firm about:
-//! **anything the application owns belongs in its state and arrives through `view`.** What
-//! a retained widget keeps is strictly *interaction* state — a scrollbar's drag origin, a
-//! menu's open item — which the application has no opinion about and would be tedious to
-//! thread through messages.
-//!
-//! ## Handlers are `fn` pointers, not boxed closures
-//!
-//! `Msg` arrived in Part B, with the routing that can fire it. A handler taking event data
-//! is `Option<fn(KeyEvent) -> Msg>` rather than `Option<Box<dyn Fn(..) -> Msg>>`, and the
-//! reason is that **a Rust tuple-variant constructor is already a `fn` pointer**: an
-//! application writes `.on_key(Msg::Key)` and gets exactly what Iced spells with a closure.
-//!
-//! **The reason is `Clone` and `Debug`, not allocation.** `Box<dyn Fn>` is neither, so
-//! `#[derive(Clone, Debug)]` on `Element` stops compiling and the diff's tests lose the
-//! `assert_eq!` they are written with; `Rc<dyn Fn>` restores `Clone` but still needs a
-//! hand-written `Debug`. A `fn` pointer is `Copy`, `Clone` and `Debug` for free, and reads
-//! identically at every call site we have.
-//!
-//! An earlier version of this comment also claimed a box would cost an allocation per
-//! handler on a hand-rolled heap. That argument does not survive contact with the rest of
-//! the type: `view` already allocates a `Vec` per container, a `Box` per `padding`/`sized`
-//! child and a `String` per `text`, so a handler box is a small fraction of a number that
-//! is already fine — and `view` runs on *events*, not at frame rate. The claim is struck
-//! rather than quietly deleted, because a justification nobody believes is worse than none.
-//!
-//! **The real limit is that a `fn` cannot capture**, and it is narrower than it sounds.
-//! `on_press` takes a *value*, so `Msg::Select(i)` captures `i` perfectly well. It bites
-//! only the handlers that take event data: a list row wanting both the event and its own
-//! index — `Msg::RowKey(i, event)` — cannot be spelled. Expect that in Part C or Milestone
-//! 5; the fix then is an `Rc<dyn Fn>` variant *alongside* this one, which is additive.
+//! An `Element` is a **description**, not a widget: built fresh every time `view` runs and dropped
+//! once the diff has consumed it. **Anything the application owns belongs in its state and arrives
+//! through `view`**; a retained widget keeps only *interaction* state (a scrollbar's drag origin, a
+//! menu's open item).
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -106,19 +75,11 @@ pub enum IconKind {
     Maximise,
     /// Two crossed strokes.
     Close,
-    /// **The power symbol**: a ring open at the top, with a bar down through the gap to the
-    /// centre — the top bar's power menu (administration Part F.2).
+    /// **The power symbol**: a ring open at the top, with a bar down through the gap to the centre.
     Power,
 }
 
-/// A step on the text-size scale, relative to the theme's one `font_px` (desktop refresh,
-/// Part G).
-///
-/// **One number in the theme, three sizes on the screen.** The design sets its top bar at 12.5 px,
-/// its rows at 11.5 and its status bars and hints at 10.5 — a hierarchy carried by size, since it
-/// has no other way to say "read this second". A theme still sets one value; the steps between
-/// the sizes are the toolkit's, so a person who makes the body bigger makes everything bigger in
-/// proportion.
+/// A step on the text-size scale, relative to the theme's one `font_px`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TextSize {
     /// Metadata read second: a status bar, a column header, a chord or a path beside a menu row.
@@ -131,22 +92,14 @@ pub enum TextSize {
 }
 
 impl TextSize {
-    /// How much smaller [`Small`](Self::Small) is than the body: 10.5 at the staged 12, the
-    /// design's own step from its 11.5.
+    /// How much smaller [`Small`](Self::Small) is than the body: 10.5 at the staged 12.
     pub const SMALL: f32 = 0.875;
-    /// How much larger [`Large`](Self::Large) is: 13 at the staged 12, the design's step from
-    /// 11.5 to its top bar's 12.5.
+    /// How much larger [`Large`](Self::Large) is: 13 at the staged 12.
     pub const LARGE: f32 = 13.0 / 12.0;
 
     /// This step's size in pixels, for a body size of `body`.
     ///
-    /// **Never below [`MIN_FONT_PX`]**, which is the floor a theme's `font_px` is already held
-    /// to — "below this the glyph rasteriser produces shapes nobody can read". A step below the
-    /// body would otherwise walk under it: `font_px = 6` is a legal file, and ⅞ of it is 5.25,
-    /// so a menu's chord column and the editor's status line would be set below the size the
-    /// floor exists to forbid (PR #316 review, finding 3). At the ceiling there is nothing to
-    /// clamp: `Large` is 17⅓ at `font_px = 16`, and the only thing set at that step is the top
-    /// bar's two words, in a bar 30 pixels tall.
+    /// **Never below [`MIN_FONT_PX`]**, the floor a theme's `font_px` is held to.
     pub fn px(self, body: f32) -> f32 {
         let px = match self {
             TextSize::Small => body * Self::SMALL,
@@ -157,25 +110,18 @@ impl TextSize {
     }
 }
 
-/// How a run of text is set: its step on the size scale, and whether it is bold — what
-/// [`Node::Scale`] and [`Node::Bold`] set for everything inside them.
+/// How a run of text is set: its size step, and whether it is bold or mono.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TextStyle {
     /// The step on the size scale.
     pub size: TextSize,
     /// Drawn in the face's bold companion, if it has one — `libdraw::text::Font::bold`.
     pub bold: bool,
-    /// Whether it is set in the face's fixed-advance companion — an editor's buffer, a byte
-    /// count, a line-and-column readout (desktop refresh, Part J).
+    /// Whether it is set in the face's fixed-advance companion.
     pub mono: bool,
 }
 
 /// What an element *is*.
-///
-/// Deliberately short. `docs/architecture/widget-toolkit.md` §1's rule is that anything Milestone
-/// 5's terminal does not use is not in Milestone 4, and these are the structural nodes the
-/// diff and layout need in order to be tested at all. The interactive widgets — button,
-/// menu, scrollbar — arrive in Part C, pulled into existence by the terminal.
 #[derive(Clone, Debug)]
 pub enum Node<Msg> {
     /// A run of text, measured by the caller's [`Metrics`](crate::layout::Metrics).
@@ -195,20 +141,13 @@ pub enum Node<Msg> {
         children: Vec<Element<Msg>>,
     },
     /// Children pinned to edges, with one child filling what remains.
-    ///
-    /// The filler is a **named field rather than "the last child"**. A positional rule reads
-    /// fine and then silently changes meaning the first time somebody appends a docked child
-    /// to the end of the list.
     Dock {
         /// Edge-pinned children, applied in order — each takes its slice of what is left.
         edges: Vec<Docked<Msg>>,
         /// The child that takes everything remaining.
         fill: Box<Element<Msg>>,
     },
-    /// Children overlaid in paint order, each filling the whole area.
-    ///
-    /// The overlay node menus are drawn into. Painted first to last, so the last child is on
-    /// top — and hit-tested in the reverse of that, once Part B hit-tests anything.
+    /// Children overlaid in paint order, each filling the whole area; hit-tested in reverse.
     Stack(Vec<Element<Msg>>),
     /// A child with space around it.
     Padding {
@@ -219,15 +158,11 @@ pub enum Node<Msg> {
     },
     /// A child constrained on one or both axes.
     ///
-    /// **A zero component means "whatever the parent gives"**, so `sized(12 × 0)` is a
-    /// full-height 12-wide strip — a scrollbar — and `sized(0 × 16)` is a full-width bar.
-    /// Without that convention every fixed-size child would have to name a cross-axis extent
-    /// it does not care about, and would then be wrong the moment the window resized.
+    /// **A zero component means "whatever the parent gives"**: `sized(12 × 0)` is a full-height
+    /// strip, `sized(0 × 16)` a full-width bar.
     ///
-    /// The constraint binds the node's **own** rectangle, not merely its measured extent. An
-    /// earlier version passed the parent's rectangle straight through, so a `sized` inside a
-    /// `Stack` took the whole overlay and the doc claiming "an exact size" was false
-    /// (PR #183 review, finding 5).
+    /// The constraint binds the node's **own** rectangle, not merely its measured extent, so a
+    /// `sized` inside a `Stack` does not take the whole overlay.
     Sized {
         /// The constraint; zero on an axis means unconstrained.
         size: Size,
@@ -236,140 +171,72 @@ pub enum Node<Msg> {
     },
     /// A child placed in the middle of what its parent gives it.
     ///
-    /// **The one thing `padding` cannot express.** A label centred with padding is a label
-    /// whose insets have to be recomputed for every string and every window width — so before
-    /// this, every button in this toolkit had its text against the top-left corner of a face
-    /// that was usually much wider than the word on it.
-    ///
-    /// It measures as its child, so a `center` that is *given* only what it asked for changes
-    /// nothing; centring happens in the space a parent hands it beyond that.
-    ///
-    /// **Down is always; across is a choice.** A label on a button wants both. A label *beside*
-    /// a control — the chooser's path next to its up button — wants the vertical half only:
-    /// centred across as well, a short path floats in the middle of the dialog and its left edge
-    /// moves with the length of the string.
+    /// **Down is always; across is a choice**: a label *beside* a control (the chooser's path)
+    /// wants the vertical half only, or a short path floats in the middle of the dialog and its
+    /// left edge moves with the string.
     Center {
         /// Whether the child is centred across its rectangle as well as down it.
-        ///
-        /// `false` leaves it at the rectangle's left edge, where a run of text belongs when
-        /// something else in the row is what the eye follows.
         across: bool,
         /// The child.
         child: Box<Element<Msg>>,
     },
     /// A child drawn in a different ink.
     ///
-    /// **A wrapper rather than a colour on [`Text`](Self::Text)**, because ink is inherited: a
-    /// run of coloured text is usually several nodes — a highlighted keyword under a selection
-    /// is a `Stack` of a fill and a text — and the alternative is every leaf carrying a colour
-    /// its parent has to remember to set. `paint` threads the current ink down the subtree, so
-    /// this colours everything inside it that draws ink: text and icons.
-    ///
-    /// **It changes no geometry**: it measures and arranges exactly as its child, like a
-    /// [`Padding`](Self::Padding) of nothing. Nesting is innermost-wins, which is what makes a
-    /// run inside a coloured block able to differ from it.
+    /// **A wrapper rather than a colour on [`Text`](Self::Text)**, because ink is inherited:
+    /// `paint` threads it down the subtree; nesting is innermost-wins, and it changes no geometry.
     Ink {
         /// The colour text and icons inside are drawn in.
         colour: Rgb,
         /// The child.
         child: Box<Element<Msg>>,
     },
-    /// A child whose text is drawn at another step of the size scale — see [`TextSize`].
-    ///
-    /// **A wrapper rather than a size on [`Text`](Self::Text)**, for [`Ink`](Self::Ink)'s reason: a
-    /// status bar or a column of hints is several nodes that share a size, and the alternative is
-    /// every leaf carrying one its parent has to remember to set. Layout and paint thread the step
-    /// down the subtree; nesting is innermost-wins. Unlike `Ink` it *does* change geometry — text
-    /// inside measures at its own size — but nothing else.
+    /// A child whose text is drawn at another step of the size scale — see [`TextSize`]; unlike
+    /// `Ink` it *does* change geometry.
     Scale {
         /// The step everything inside is set at.
         size: TextSize,
         /// The child.
         child: Box<Element<Msg>>,
     },
-    /// A child whose text is set in the fixed-advance face (desktop refresh, Part J).
-    ///
-    /// **Threaded exactly as [`Bold`](Self::Bold) is**, and for its reason: the face changes what
-    /// the text inside measures, so this changes geometry. A face with no fixed-advance
-    /// companion draws it in the proportional one.
+    /// A child whose text is set in the fixed-advance face.
     Mono {
         /// What is set in it.
         child: Box<Element<Msg>>,
     },
-    /// A child whose text is bold — a window's title (desktop refresh, Part G).
-    ///
-    /// A wrapper for [`Scale`](Self::Scale)'s reason, and threaded the same way. Text inside
-    /// measures in the bold face, which is wider, so this changes geometry exactly as a size
-    /// does. A face with no bold companion draws it in its regular weight.
+    /// A child whose text is bold — a window's title.
     Bold {
         /// The child.
         child: Box<Element<Msg>>,
     },
-    /// A rectangle of flat colour.
-    ///
-    /// The one painting primitive the composites need: a button's face, a scrollbar's track
-    /// and thumb, a menu's backing. Without it every widget that is not text would have to be
-    /// a `Custom`, and the application would end up painting the toolkit's own chrome.
-    ///
-    /// It measures to nothing and takes what it is given — a colour has no natural size, and
-    /// a caller that wants one wraps it in [`sized`].
+    /// A rectangle of flat colour; it measures to nothing and takes what it is given (wrap it in
+    /// [`sized`] for a size).
     Fill(Rgb),
-    /// A face with the theme's bevel: the colour lightened at the top and darkened at the
-    /// bottom of the node's own box.
-    ///
-    /// **A second fill rather than a flag on the first**, because the two differ in what they
-    /// need to know: a flat fill is correct from the clip alone, and a gradient is only correct
-    /// from the node's rect — the ramp is fixed by the shape, not by how much of it a frame
-    /// repaints. Keeping them separate is what stops that distinction being a parameter somebody
-    /// passes wrongly.
+    /// A face with the theme's bevel: lightened at the top, darkened at the bottom of the node's
+    /// own box; **a gradient is only correct from the node's rect, not the clip**.
     Bevel(Rgb),
-    /// The one-pixel border of a window or a popup, with its corners rounded to `radius`
-    /// (desktop refresh, Part B).
+    /// The one-pixel border of a window or a popup, with its corners rounded to `radius`.
     ///
-    /// **Drawn last, over the surface's content**, because the corner curves inward over whatever
-    /// is in the window's corners — a title bar, a menu's first row — and a border painted first
-    /// would be painted over. It measures to nothing, like [`Fill`](Self::Fill), and draws along
-    /// its own rectangle's edge.
-    ///
-    /// **Only for a surface the compositor cuts to the same curve**: it blends the border at
-    /// `libdraw::corner::border_share`, which leaves the curve's own fade to the compositor. See
-    /// `Framebuffer::outline_rounded_rect`.
+    /// **Drawn last, over the surface's content**, because its corner curves inward over whatever
+    /// is in the window's corners; **only for a surface the compositor cuts to the same curve**.
     Outline {
         /// The border's colour.
         colour: Rgb,
-        /// The corner radius — `libdraw::corner::WINDOW_RADIUS` for everything that uses it
-        /// today, since it must be the radius the compositor cuts with.
+        /// The corner radius — `libdraw::corner::WINDOW_RADIUS`, which the compositor cuts with.
         radius: u32,
     },
-    /// A rectangle of flat colour with its corners rounded to `radius`, antialiased against what
-    /// is painted beneath it (desktop refresh, Part C).
-    ///
-    /// **For a shape *inside* a surface** — a task button, a desktop cell, a swatch — which nothing
-    /// cuts afterwards. That is the difference from [`Outline`](Self::Outline), whose corners leave
-    /// the curve's fade to the compositor because a window's corners *are* cut: a rounded shape in
-    /// the middle of a bar has to fade itself. A bordered shape is two of these, the border colour
-    /// and then the ground inset by a pixel; see `Framebuffer::fill_rounded_rect`.
-    ///
-    /// **Its ground must be painted before it**, like a [`Wash`](Self::Wash)'s, since the corner
-    /// pixels are blended over whatever is there. It measures to nothing, like [`Fill`](Self::Fill).
+    /// A rectangle of flat colour with rounded corners, antialiased against what is beneath it;
+    /// **its ground must be painted before it**, like a [`Wash`](Self::Wash)'s.
     RoundedFill {
         /// The colour.
         colour: Rgb,
         /// The corner radius, clamped to half the shorter side.
         radius: u32,
     },
-    /// A translucent wash of `colour` at `coverage` over whatever is painted beneath it — a
-    /// selected row, a hovered menu item (desktop refresh, Part B).
+    /// A translucent wash of `colour` at `coverage` over whatever is beneath it: selection is the
+    /// accent at 20%, hover at 10% (18% dark).
     ///
-    /// **The design's model of emphasis**: its selection is the accent at 20% and its hover the
-    /// accent at 10% (18% dark), laid over the ground a row sits on — the list's paper, a
-    /// sidebar, a menu — so one colour is right on all of them, where a precomputed opaque colour
-    /// is right on one. It measures to nothing, like [`Fill`](Self::Fill).
-    ///
-    /// **Its ground must be painted before it in the same repaint**, because half its colour is
-    /// what is under it: a wash repainted over itself darkens a step per frame. Every caller puts
-    /// it in a `Stack` after that ground, and `paint` clears the damage and draws the tree in
-    /// order, which is what keeps that true.
+    /// **Its ground must be painted before it in the same repaint**: a wash repainted over itself
+    /// darkens a step per frame.
     Wash {
         /// The colour washed over.
         colour: Rgb,
@@ -377,24 +244,11 @@ pub enum Node<Msg> {
         coverage: u8,
     },
     /// One of the three window-control glyphs, drawn rather than typed.
-    ///
-    /// **Drawn, so there is no icon format yet** (M11 Part E, batch 2). A minimise is a bar, a
-    /// maximise is a square and a close is two strokes; expressing them as shapes costs a paint
-    /// arm, where expressing them as images costs a decoder, an asset path in the image build and
-    /// a size convention. That trade is worth revisiting the day something needs an icon that is
-    /// not three strokes — see the polish list's filed image-support item.
     Icon(IconKind),
     /// A child shifted within its parent, taking its own measured size.
     ///
-    /// **The one place absolute positioning exists, and it exists for overlays.** §5 rules it
-    /// out for ordinary widgets — "a terminal is resized constantly and every widget would need
-    /// to recompute, which is a layout engine written in application code" — and that argument
-    /// does not reach a menu popup, whose whole definition is "here, under the item that opened
-    /// it". Without this a popup can only be placed by computing `Padding` insets in the
-    /// application, which *is* the layout engine §5 refused.
-    ///
-    /// The offset is relative to the parent's origin, so a popup inside a window-level `Stack`
-    /// is placed in window coordinates and moves with the window rather than with the screen.
+    /// **The one place absolute positioning exists, and it exists for overlays** such as a menu
+    /// popup placed under the item that opened it.
     Offset {
         /// Rightward shift from the parent's origin.
         dx: i32,
@@ -403,13 +257,8 @@ pub enum Node<Msg> {
         /// The child, which takes the size it measures rather than the space it is offered.
         child: Box<Element<Msg>>,
     },
-    /// An application-drawn node: the escape hatch.
-    ///
-    /// Opaque to the toolkit — it measures to `size` and the application paints it. This is
-    /// what Milestone 5's terminal grid is, and it is deliberately a first-class node rather
-    /// than an afterthought: the flagship application is an escape-hatch client, so the
-    /// toolkit supplies chrome, layout and input plumbing and gets out of the way where the
-    /// application knows better.
+    /// An application-drawn node, the escape hatch: it measures to `size` and the application
+    /// paints it.
     Custom {
         /// Application-chosen discriminator, so a diff can tell two custom nodes apart.
         kind: u32,
@@ -423,78 +272,38 @@ pub enum Node<Msg> {
 pub struct Element<Msg> {
     /// Identity within the parent, for the diff.
     ///
-    /// `None` means "pair me by position", which is right for the fixed structural nesting
-    /// that makes up most of a UI. Dynamic lists — anything reordered, inserted into, or
-    /// removed from — must set it, or the diff pairs row 2's widget with row 3's element.
+    /// `None` means "pair me by position". Dynamic lists must set it, or the diff pairs row 2's
+    /// widget with row 3's element.
     pub key: Option<u64>,
     /// Share of a `Row`/`Column`'s leftover space; `0` means "just my measured size".
     pub flex: u16,
     /// What this element is.
     pub node: Node<Msg>,
     /// The message a click on this element produces.
-    ///
-    /// A *click* — a press and its release, both inside — rather than a bare press, because
-    /// pressing a button and sliding off it is how a user cancels, and a toolkit that fired
-    /// on the press removes that.
     pub on_press: Option<Msg>,
     /// A press going **down** on this element, before it is known whether it becomes a click.
     ///
-    /// **For gestures that begin at the press**, which a click cannot express: dragging a
-    /// window by its title bar is decided the moment the button goes down, and a handler that
-    /// waited for the release would start the move after the user had finished making it.
-    ///
-    /// **A nearer [`on_press`](Self::on_press) shadows this**, which is the rule that lets a
-    /// title bar carry a drag and still hold buttons: a widget that handles clicks handles the
-    /// press that begins them, so pressing close does not also start a move. Dispatch is in
-    /// [`Router::pointer`](crate::route::Router::pointer).
+    /// **For gestures that begin at the press** (dragging a window by its title bar); **a nearer
+    /// [`on_press`](Self::on_press) shadows it**, so pressing the close button does not also start
+    /// a move.
     pub on_press_down: Option<Msg>,
     /// A drag-and-drop payload released over this element — `Surface::Dropped`.
     ///
-    /// **Routed by position, exactly like a press** (M10 decision 3), which is what makes a drop
-    /// *region* a client-side matter: the compositor knows only that this window declared an
-    /// acceptor, and where on the window a drop is allowed is decided here, by which element is
-    /// under the point. A window can take a file in its document area and refuse one on its
-    /// title bar without the protocol growing a rectangle.
-    ///
-    /// **The message carries no payload**, and that is deliberate: an `Option<Msg>` cannot be
-    /// parameterised by a value the toolkit does not have, and the payload is already in the
-    /// event the application is holding when it calls the router. What this answers is *which
-    /// widget* the drop landed on; what was dropped is the caller's, and pairing them at the one
-    /// call site is clearer than a closure that has to be built into every frame's tree.
+    /// **Routed by position, exactly like a press**, so where on a window a drop is allowed is
+    /// decided here; **the message carries no payload**.
     pub on_drop: Option<Msg>,
     /// Raw key events, while this element holds widget focus.
     ///
-    /// The path the terminal grid uses: a `custom` widget that wants keycodes rather than a
-    /// toolkit's interpretation of them.
-    ///
-    /// **Returns `Option`, so a handler can decline** and let the key keep bubbling. Without
-    /// that, having a handler *means* handling: a focused text field would swallow Ctrl-O,
-    /// and the menu accelerator this design uses as its motivating example could never fire.
-    /// A non-capturing closure coerces to a `fn` pointer, so `.on_key(|k| Some(Msg::Key(k)))`
-    /// costs nothing.
+    /// **Returns `Option`, so a handler can decline** and let the key bubble.
     pub on_key: Option<fn(KeyEvent) -> Option<Msg>>,
-    /// Raw pointer events routed to this element.
-    ///
-    /// **Never a wheel** — those go to [`on_wheel`](Self::on_wheel) instead, so a widget that
-    /// tracks the cursor does not have to filter out an event it has no opinion about.
+    /// Raw pointer events routed to this element, **never a wheel**.
     pub on_pointer: Option<fn(PointerEvent) -> Msg>,
     /// The wheel turned over this element — a `POINTER_WHEEL` record.
     ///
-    /// **Its own handler rather than a kind arriving at [`on_pointer`](Self::on_pointer)**, and
-    /// the reason is what happens to the widgets that do not want it. A wheel bubbles: the
-    /// thing that scrolls is rarely the thing under the cursor — a row in a list, a cell in a
-    /// grid — so it has to walk up until something takes it. Sent through `on_pointer` it would
-    /// stop at the first widget tracking the cursor for *any* reason, hover included, and be
-    /// silently dropped there. A separate handler makes "I scroll" a claim a widget states
-    /// rather than one it is assumed into.
-    ///
-    /// The record still carries `x`/`y` (widget-local, like every other), `modifiers` for
-    /// Ctrl-scroll, and `buttons` for a wheel turned mid-drag.
+    /// **Its own handler rather than an `on_pointer` kind**: the thing that scrolls is rarely the
+    /// thing under the cursor, so a wheel must bubble past widgets that merely track the cursor.
     pub on_wheel: Option<fn(PointerEvent) -> Msg>,
-    /// Whether this element accepts keyboard focus.
-    ///
-    /// Opt-in, not derived from having an `on_key`: a scrollbar has neither and must still
-    /// be skipped by Tab, while a container may want focus without handling a key itself.
+    /// Whether this element accepts keyboard focus; opt-in, not derived from having an `on_key`.
     pub focusable: bool,
 }
 
@@ -527,15 +336,13 @@ impl<Msg> Element<Msg> {
         self
     }
 
-    /// Send `msg` when a drag is released over this element — see
-    /// [`on_drop`](Self::on_drop).
+    /// Send `msg` when a drag is released over this element.
     pub fn on_drop(mut self, msg: Msg) -> Self {
         self.on_drop = Some(msg);
         self
     }
 
-    /// Send `msg` when a press goes **down** on this element, before it is known whether it
-    /// becomes a click — see [`Node::on_press_down`](crate::element::Element).
+    /// Send `msg` when a press goes **down** on this element.
     pub fn on_press_down(mut self, msg: Msg) -> Self {
         self.on_press_down = Some(msg);
         self
@@ -548,10 +355,6 @@ impl<Msg> Element<Msg> {
     }
 
     /// Take raw key events while focused. Implies [`focusable`](Self::focusable).
-    ///
-    /// Implied, because a handler for keys that can never be focused is dead code the
-    /// application would have to notice it wrote. Something that wants focus *without*
-    /// handling keys still says so explicitly.
     pub fn on_key(mut self, f: fn(KeyEvent) -> Option<Msg>) -> Self {
         self.on_key = Some(f);
         self.focusable = true;
@@ -564,11 +367,7 @@ impl<Msg> Element<Msg> {
         self
     }
 
-    /// Take the wheel when it turns over this element or anything inside it.
-    ///
-    /// **Claiming it stops it**: the nearest ancestor with a handler is the one that gets it,
-    /// so a scrolling pane inside another scrolling pane takes its own wheel — see
-    /// [`on_wheel`](Self::on_wheel) for why this is not `on_pointer` with a `kind` check.
+    /// Take the wheel; **claiming it stops it**: the nearest ancestor with a handler gets it.
     pub fn on_wheel(mut self, f: fn(PointerEvent) -> Msg) -> Self {
         self.on_wheel = Some(f);
         self
@@ -582,9 +381,8 @@ impl<Msg> Element<Msg> {
 
     /// This element's children, if it has any, in paint order.
     pub fn children(&self) -> impl Iterator<Item = &Element<Msg>> {
-        // One iterator type for every shape, so callers do not each re-derive the match.
-        // `Dock` yields its edge children before the filler, which is also the order layout
-        // consumes them in and the order they are painted.
+        // `Dock` yields its edge children before the filler: the order layout consumes them in and
+        // paints.
         #[allow(clippy::type_complexity, reason = "a local annotation for one match, used nowhere else")]
         let (a, b, c): (&[Element<Msg>], Option<&Element<Msg>>, Option<&Element<Msg>>) = match &self.node {
             Node::Text(_)
@@ -682,9 +480,6 @@ pub fn bevel<Msg>(colour: Rgb) -> Element<Msg> {
 }
 
 /// A glyph — a window control, or the power symbol — see [`Node::Icon`].
-///
-/// It measures to nothing, like a fill: the button around it decides its size, and the glyph is
-/// drawn centred in whatever box it lands in.
 pub fn icon<Msg>(kind: IconKind) -> Element<Msg> {
     Element::new(Node::Icon(kind))
 }
@@ -709,18 +504,12 @@ pub fn center<Msg>(child: Element<Msg>) -> Element<Msg> {
     Element::new(Node::Center { across: true, child: Box::new(child) })
 }
 
-/// A child centred *down* its parent's rectangle and left where it starts across it — see
-/// [`Node::Center`].
-///
-/// What a label beside a control wants: it sits on the control's middle whatever the theme's
-/// text size is, without its left edge drifting with the length of the string.
+/// A child centred *down* its parent's rectangle only — see [`Node::Center`].
 pub fn center_v<Msg>(child: Element<Msg>) -> Element<Msg> {
     Element::new(Node::Center { across: false, child: Box::new(child) })
 }
 
 /// A child drawn in `colour` — see [`Node::Ink`].
-///
-/// Changes no geometry, so it can be wrapped around anything without moving it.
 pub fn ink<Msg>(colour: Rgb, child: Element<Msg>) -> Element<Msg> {
     Element::new(Node::Ink { colour, child: Box::new(child) })
 }
@@ -735,10 +524,7 @@ pub fn custom<Msg>(kind: u32, size: Size) -> Element<Msg> {
     Element::new(Node::Custom { kind, size })
 }
 
-/// Set the gap between a `Row`'s or `Column`'s children.
-///
-/// A no-op on anything else rather than an error: `spacing` is a layout hint, and refusing
-/// it on a `Text` would make every builder chain conditional on the node kind.
+/// Set the gap between a `Row`'s or `Column`'s children; a no-op on anything else.
 pub fn with_spacing<Msg>(mut e: Element<Msg>, gap: u32) -> Element<Msg> {
     match &mut e.node {
         Node::Column { spacing, .. } | Node::Row { spacing, .. } => *spacing = gap,
@@ -751,22 +537,16 @@ pub fn with_spacing<Msg>(mut e: Element<Msg>, gap: u32) -> Element<Msg> {
 mod tests {
     use super::*;
 
-    /// Part A's tests carry no messages, and `()` is the simplest inhabited `Msg`. Part B's
-    /// routing tests use a real enum; these are about shape, not about what a click means.
     type Msg = ();
     use alloc::vec;
 
-    /// The steps hold the theme's own floor: no step sets text smaller than `MIN_FONT_PX`,
-    /// at any size a theme file can ask for (PR #316 review, finding 3).
+    /// The steps hold the theme's own floor at any size a theme file can ask for.
     #[test]
     fn no_step_goes_under_the_font_floor() {
         use libdraw::theme::{MAX_FONT_PX, MIN_FONT_PX};
-        // The smallest legal body size is where a step below it would break the floor: 7/8 of
-        // 6 is 5.25, and the clamp is the whole of the difference.
         assert_eq!(TextSize::Small.px(MIN_FONT_PX), MIN_FONT_PX);
         assert_eq!(TextSize::Body.px(MIN_FONT_PX), MIN_FONT_PX);
         assert!(TextSize::Large.px(MIN_FONT_PX) > MIN_FONT_PX);
-        // Across the whole legal range, in hundredths as `font_px` is read.
         let mut px = MIN_FONT_PX;
         while px <= MAX_FONT_PX {
             for step in [TextSize::Small, TextSize::Body, TextSize::Large] {
@@ -775,7 +555,6 @@ mod tests {
             }
             px += 0.01;
         }
-        // Above the floor the steps are themselves, and ordered — the clamp is not a flattening.
         let small = TextSize::Small.px(12.0);
         let (body, large) = (TextSize::Body.px(12.0), TextSize::Large.px(12.0));
         assert!(small < body && body < large, "{small} {body} {large}");
@@ -792,8 +571,6 @@ mod tests {
 
     #[test]
     fn children_yields_every_shape_and_nothing_extra() {
-        // Counted through a pinned binding rather than a turbofish per line: every one of
-        // these is a `text("a")` whose `Msg` nothing else constrains.
         let n = |e: Element<Msg>| e.children().count();
         assert_eq!(n(text("a")), 0);
         assert_eq!(n(custom(1, Size::new(4, 4))), 0);
@@ -806,9 +583,7 @@ mod tests {
 
     #[test]
     fn a_docks_children_come_before_its_filler() {
-        // The order layout consumes them in and the order they are painted. The diff walks
-        // this too, so a different order here would silently re-pair every docked child
-        // with the filler.
+        // The order layout consumes them in and the order they are painted; the diff walks it too.
         let d: Element<Msg> =
             dock(vec![docked(Edge::Top, text("bar")), docked(Edge::Right, text("scroll"))], text("fill"));
         let kinds: Vec<&str> = d
@@ -827,7 +602,6 @@ mod tests {
         assert!(matches!(c.node, Node::Column { spacing: 4, .. }));
         let r: Element<Msg> = with_spacing(row(vec![text("a")]), 3);
         assert!(matches!(r.node, Node::Row { spacing: 3, .. }));
-        // Ignored rather than refused: a builder chain must not become conditional on kind.
         let t: Element<Msg> = with_spacing(text("a"), 9);
         assert!(matches!(t.node, Node::Text(_)));
     }

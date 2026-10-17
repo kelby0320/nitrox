@@ -1,11 +1,8 @@
 //! The [`EntropyObject`] kernel object — a capability token onto the kernel CSPRNG.
 //!
-//! The random source is a singleton (the one global generator in
-//! [`crate::entropy`]); an `EntropyObject` is a handle-bearing **token** that
-//! authorizes reading from it, exactly the way many handles can refer to one
-//! object. It therefore carries no per-handle state — every `EntropyObject` draws
-//! from the same pool. `sys_entropy_read` looks one up (requiring `READ`) and
-//! draws via [`crate::entropy::fill`]. See `docs/architecture/entropy.md`.
+//! The generator is a singleton ([`crate::entropy`]); an `EntropyObject` is a handle-bearing
+//! token that authorizes reading it, so it carries no state. `sys_entropy_read` looks one up
+//! (requiring `READ`) and draws via [`crate::entropy::fill`]. See `docs/architecture/entropy.md`.
 
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
@@ -57,8 +54,6 @@ mod tests {
     fn dropping_last_objectref_routes_through_dispatch_destroy() {
         init_global_heap();
         test_probe::reset();
-        // Adopt the object into an `ObjectRef` — the path a real handle release
-        // takes — and drop it; the last reference runs `dispatch_destroy`'s arm.
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let r = unsafe {
             ObjectRef::from_raw(

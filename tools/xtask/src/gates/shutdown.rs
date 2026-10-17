@@ -2,11 +2,9 @@
 
 use crate::*;
 
-/// The file `check-shutdown` writes, under the serial session's `/home` — `alice`'s home on the
-/// root filesystem.
+/// The file `check-shutdown` writes under the serial session's `/home`.
 const SHUTDOWN_PATTERN_FILE: &str = "check-shutdown.bin";
 
-/// Where it lands on the root filesystem: the session's `/home` is `alice`'s home.
 fn shutdown_pattern_path() -> String {
     format!("/home/{DEMO_USER}/{SHUTDOWN_PATTERN_FILE}")
 }
@@ -15,32 +13,20 @@ fn shutdown_pattern_path() -> String {
 /// bound: its graphical clients and `restart-probe`. Any other name "still running" is a failure.
 const SHUTDOWN_UNHONOURED: &[&str] = &["nxterm", "ui-testclient", "input-testclient", "restart-probe"];
 
-/// `cargo xtask check-shutdown` — **a shutdown, with the host holding the result** (administration
-/// Part E.4d).
+/// `cargo xtask check-shutdown` — a shutdown, with the host holding the result.
 ///
-/// A copy of a `--selftest` disk image, the release root with the test packages, booted twice and
-/// driven on serial as a person at the prompt would drive it.
+/// A copy of a `--selftest` disk image, booted twice and driven on serial. The halt: `test-pattern`
+/// writes under `/home` through a mapping and exits without a sync, so the host reads the disk
+/// while the guest runs and finds the file without the pattern and the superblock mounted; then
+/// `with power shutdown` (no password: the seeded policy gives it to everyone). COM1 must show the
+/// sequence and the screen the message (`check-fbcon`'s decoder; the laptop has no serial port);
+/// with the machine stopped the host carves the root out: `e2fsck -fn` clean, a clean unmount, the
+/// file holding the pattern.
 ///
-/// **The halt.** Logged in as `alice`, `test-pattern` writes a pattern under `/home` through a
-/// mapping and **exits without a sync**; the host reads the disk while the guest runs and finds the
-/// file without the pattern, and the superblock saying mounted. Then `with power shutdown`, with no
-/// password, as the seeded policy gives it to everyone. The gate asserts the sequence on COM1 — the
-/// sessions ended when asked rather than after their bound, every service but the test image's
-/// known clients stopped, `init` unmounted `/` clean — and **reads the message off the screen**
-/// with `check-fbcon`'s decoder as well as off COM1, since the laptop has no serial port. With the
-/// machine stopped, the host carves the root partition out: `e2fsck -fn` clean, the superblock
-/// recording a clean unmount, and the file holding the pattern, read with `debugfs`.
-///
-/// **The reboot.** A fresh copy of the disk, since `boot-probe` is not one to run twice on the same
-/// filesystem; `with admin date --set` to 2031, then `with power shutdown --reboot`, a reset
-/// through the FADT's register, and QEMU is watched through a second boot — which must **anchor its
-/// clock to the time set**, read back from the RTC the set wrote (administration Part E.5), and
-/// whose `init` must mount the root **without** finding it not cleanly unmounted, which is the
-/// reboot's own shutdown leaving it clean.
-///
-/// **Only after `boot-probe`'s verdict.** The power endpoint is one, and `boot-probe` takes and
-/// lets go of it to test its refusals; a shutdown asked in the meantime would find the broker
-/// unable to grant it.
+/// The reboot, on a fresh disk copy: `with admin date --set` to 2031, `with power shutdown
+/// --reboot`, and a second boot that must anchor its clock to the time set and mount the root
+/// clean. Only after `boot-probe`'s verdict, which takes and lets go of the one power endpoint to
+/// test its refusals.
 pub(crate) fn cmd_check_shutdown(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     require_tool("e2fsck")?;
@@ -131,11 +117,10 @@ pub(crate) fn cmd_check_shutdown(accel: Accel, size: DisplaySize) -> R<()> {
     Ok(())
 }
 
-/// Wait for `boot-probe`'s verdict, then log in on serial as `DEMO_USER`.
 fn shutdown_login(s: &mut Session) -> R<()> {
     s.expect("boot-probe: test-harness verdict")?;
-    // **The whole line, waited for** (PR #356's CI): the prefix can arrive before the word after
-    // it, and on KVM this read `… verdict P` from the transcript and refused a passing image.
+    // The whole line, waited for: the prefix can arrive before the word after it, and on KVM this
+    // read `… verdict P` and refused a passing image.
     if !s.matched_line()?.contains("boot-probe: test-harness verdict PASS") {
         return Err("boot-probe's verdict was not PASS, so the image is not one to shut down".into());
     }
@@ -153,16 +138,14 @@ fn shutdown_login(s: &mut Session) -> R<()> {
     Ok(())
 }
 
-/// The halt: a write through a mapping with no sync, seen on the host without its pattern, then
-/// `with power shutdown`, and the message on COM1 and on the screen.
 fn run_shutdown_halt(s: &mut Session, disk: &Path, work: &Path, qmp_sock: &Path, dump: &Path) -> R<()> {
     shutdown_login(s)?;
     let at = format!("/home/{SHUTDOWN_PATTERN_FILE}");
     s.send(&format!("test-pattern --write {at}"))?;
     s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
     s.expect("/home>")?;
-    // **On the host, the file is on the disk and the pattern is not**, as in `check-storage`: so
-    // what the host finds after the shutdown, the shutdown put there.
+    // On the host the file is there and the pattern is not, so what is found after the shutdown,
+    // the shutdown put there.
     let fs_img = work.join("nitrox-root-midrun.ext4");
     carve_partition(disk, 2, &fs_img)?;
     let path = shutdown_pattern_path();
@@ -194,23 +177,20 @@ fn run_shutdown_halt(s: &mut Session, disk: &Path, work: &Path, qmp_sock: &Path,
     }
     println!("  ok: on the host meanwhile: the file is there without the pattern, and the root mounted");
 
-    // **The shutdown, as anyone may ask it**: the seeded policy's `power` view, with no password.
+    // The shutdown, as anyone may ask it: the seeded policy's `power` view, with no password.
     s.send("with power shutdown")?;
     s.expect("shutdown: shutting down")?;
     s.expect("It is now safe to turn off your computer.")?;
     println!("  ok: `with power shutdown` was taken, and COM1 says it is safe to turn off");
 
-    // **And the screen says so**, read with the kernel console's own glyphs: the laptop has no
-    // COM1. The machine is halted, so the frame is still.
+    // And the screen says so, read with the kernel console's glyphs: the laptop has no COM1.
     let mut qmp = Qmp::connect(qmp_sock)?;
     expect_safe_on_screen(&mut qmp, dump)?;
     println!("  ok: the screen, read back as text, ends in the message");
     Ok(())
 }
 
-/// **A halted machine's screen ends in "It is now safe to turn off your computer."**, read back
-/// as text with the kernel console's own glyphs and layout (`check-fbcon`'s decoder) — what a
-/// person sees on a machine with no serial port. `check-shutdown` and `check-logout` read it.
+/// A halted machine's screen ends in "It is now safe to turn off your computer."
 pub(crate) fn expect_safe_on_screen(qmp: &mut Qmp, dump: &Path) -> R<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
@@ -233,8 +213,6 @@ pub(crate) fn expect_safe_on_screen(qmp: &mut Qmp, dump: &Path) -> R<()> {
     }
 }
 
-/// **What a shutdown's COM1 must show**: the sessions ended when asked, every service stopped but
-/// the test image's known clients, and `init` left `/` clean before `sys_power` flushed the disk.
 fn check_shutdown_sequence(transcript: &str) -> R<()> {
     for line in [
         "service-mgr: shutting down, as asked",
@@ -269,15 +247,10 @@ fn check_shutdown_sequence(transcript: &str) -> R<()> {
 /// clock, so a second boot that anchored to the host's time rather than the one written is plain.
 const SHUTDOWN_SET_CLOCK: (&str, i64) = ("2031-01-02T00:00:00Z", 1_925_078_400);
 
-/// How far past [`SHUTDOWN_SET_CLOCK`] the second boot may anchor: the seconds the reboot took,
-/// since QEMU's RTC goes on counting, with room for a slow TCG host. A clock that did not survive
-/// is five years out.
+/// How far past [`SHUTDOWN_SET_CLOCK`] the second boot may anchor: the seconds the reboot took
+/// (QEMU's RTC goes on counting), with room for a slow TCG host. A lost clock is five years out.
 const SHUTDOWN_CLOCK_SLACK_SECS: i64 = 600;
 
-/// The reboot: the clock set with `with admin date --set`, then `with power shutdown --reboot`
-/// resets through the FADT's register. The second boot anchors its clock to the time that was set
-/// — the RTC's write-back, across a reset (administration Part E.5) — and its `init` mounts the
-/// root without finding it not cleanly unmounted.
 fn run_shutdown_reboot(s: &mut Session) -> R<()> {
     s.expect("init: up (pid 1)")?;
     shutdown_login(s)?;
@@ -322,17 +295,12 @@ fn run_shutdown_reboot(s: &mut Session) -> R<()> {
     Ok(())
 }
 
-/// **What an unmount through the storage service must leave**, read on the host from the carved
-/// filesystem `fs_img`: `e2fsck -fn` clean, and the superblock's `s_state` recording a clean
-/// unmount with no error — `check-storage`'s and `check-recovery`'s.
 pub(crate) fn check_left_clean(fs_img: &Path) -> R<()> {
     check_ext4_clean(fs_img, &format!("the disk's {ROOT_PARTLABEL}"))
 }
 
-/// `e2fsck -fn` clean and `s_state` recorded clean, for the ext4 image `fs_img`, which is `what`.
 pub(crate) fn check_ext4_clean(fs_img: &Path, what: &str) -> R<()> {
-    // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read — as
-    // `check_installed_root` reads it.
+    // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read.
     let out = Command::new("e2fsck")
         .args(["-fn", &fs_img.display().to_string()])
         .output()

@@ -3,23 +3,15 @@
 //! [`ArchTimer`] is the kernel's source of monotonic time and the per-CPU
 //! countdown timer that drives preemption (periodic) and deadline wakeups
 //! (one-shot). On x86_64 this is the TSC (monotonic nanoseconds) plus the
-//! local-APIC timer, both calibrated against the legacy PIT at boot (see
-//! `arch/x86_64/timer.rs`); a future aarch64 port would back it with the
-//! generic timer.
+//! local-APIC timer, both calibrated against the legacy PIT at boot; aarch64
+//! would back it with the generic timer.
 //!
 //! [`read_ns`](ArchTimer::read_ns) is the monotonic clock;
 //! [`start_periodic`](ArchTimer::start_periodic) drives the preemptive
-//! scheduler tick (its consumer landed with preemptive scheduling, which raised
-//! `IF=1`). [`arm_oneshot_in`](ArchTimer::arm_oneshot_in) remains dormant until
-//! its consumer — wait-queue deadlines — lands.
+//! scheduler tick. [`arm_oneshot_in`](ArchTimer::arm_oneshot_in) has no consumer yet.
 //!
-//! NOTE: `crate::arch::Timer` — the *hardware* timer re-exported from this
-//! trait — is a distinct namespace from the future `crate::object::Timer`, the
-//! waitable `Timer` kernel object (deferred to the wait-queues slice). They
-//! never collide in the same scope.
-//!
-//! The active architecture's implementation is re-exported from `crate::arch`
-//! as `Timer` (see `kernel/src/arch/mod.rs`).
+//! `crate::arch::Timer` — the *hardware* timer — is a distinct namespace from
+//! `crate::object::Timer`, the waitable kernel object.
 
 /// Monotonic time source + per-CPU countdown timer.
 pub trait ArchTimer {
@@ -42,7 +34,7 @@ pub trait ArchTimer {
     fn read_ns() -> u64;
 
     /// Arm the per-CPU timer to fire repeatedly every `period_ns` at the
-    /// kernel's timer vector. Consumer: the preemptive-scheduling tick.
+    /// kernel's timer vector.
     ///
     /// # Safety
     /// Ring-0 only; valid after [`init`](ArchTimer::init). Reconfigures
@@ -53,10 +45,9 @@ pub trait ArchTimer {
     /// vector. Relative by design — the timer is inherently a counting-down
     /// initial count.
     ///
-    /// **Still dormant.** The wait-queues slice checks deadlines on the periodic
-    /// preemption tick (the one LAPIC timer is already in periodic mode for
-    /// preemption, so a concurrent one-shot isn't available), so this has no
-    /// consumer yet. It awaits a tickless or second-timer design.
+    /// **Dormant.** Wait-queue deadlines are checked on the periodic preemption tick (the
+    /// one LAPIC timer is already in periodic mode for preemption, so a concurrent one-shot
+    /// isn't available), so this has no consumer. It awaits a tickless or second-timer design.
     ///
     /// # Safety
     /// As [`start_periodic`](ArchTimer::start_periodic).

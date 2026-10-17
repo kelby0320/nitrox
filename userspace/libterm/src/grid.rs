@@ -1,18 +1,8 @@
 //! The cell grid: what [`Op`]s do to a screen, and where lines go when they leave it.
 //!
-//! The other half of A3's split. The parser decides what a byte *means*; this decides what it
-//! *does*, and the two are tested apart so an escape-sequence bug and a wrapping bug cannot
-//! present identically.
-//!
-//! ## Where terminals are subtly wrong, and what this does instead
-//!
-//! - **Wrapping is deferred.** Writing to the last column leaves the cursor *on* it with a
-//!   pending flag; the next character wraps. See [`Grid::print`].
-//! - **Cursor addressing clamps, it does not wrap or scroll.** `CUP` past the last row is the
-//!   last row.
-//! - **Erasing fills with the current background**, not with the default one.
-//! - **Scrolling moves a line into scrollback** rather than discarding it, and the scrollback
-//!   is a ring with a bound.
+//! Where terminals are subtly wrong: wrapping is deferred ([`Grid::print`]); cursor addressing
+//! clamps and never wraps or scrolls; erasing fills with the current background; scrolling
+//! moves a line into a bounded scrollback ring.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -23,92 +13,53 @@ use crate::cell::{Attributes, Cell, Colour, Flags};
 use crate::parse::{Erase, Op, Sgr};
 
 /// Columns a terminal starts at.
-///
-/// **A starting size since M9 Part D, not a fixed one.** This said "fixed because M6 owns move
-/// and resize", then "fixed, and Part D is where it stops being": [`Grid::resize`] is that, and
-/// what made it possible was the thing the old note named as the obstacle — the scrollback now
-/// records which of its rows were soft wraps ([`Line::wrapped`]), so it can be re-wrapped rather
-/// than merely re-cut.
+/// A starting size, not a fixed one: [`Grid::resize`] changes it.
 pub const COLS: usize = 80;
 /// Rows a terminal starts at. See [`COLS`].
 pub const ROWS: usize = 24;
 
 /// Lines retained above the screen.
-///
-/// A ring, so a program that prints forever costs a bounded amount rather than growing until
-/// something dies. A thousand lines is ~640 KiB of `Cell` at 80 columns, which is the same
-/// order as one of the client's frame buffers.
+/// A ring, so a program that prints forever costs a bounded amount.
 pub const SCROLLBACK: usize = 1000;
 
 /// Columns between tab stops.
-///
-/// Fixed rather than a settable stop list: nothing in this system emits `HTS`, and a stop list
-/// that only ever holds multiples of eight is a table pretending to be a decision.
+/// Fixed: nothing here emits `HTS`.
 pub const TAB_WIDTH: usize = 8;
 
 /// A line of cells, and whether the line below it continues the same text.
-///
-/// **The flag is what makes a reflow possible at all.** A scrollback of already-wrapped rows
-/// with no record of *which* wraps were soft is a scrollback that cannot be re-wrapped: joining
-/// every adjacent pair would merge paragraphs that were never one line, and joining none would
-/// leave the old width's breaks frozen into the history at the new width. M9 Part D is where
-/// the flag arrives; before it, `resize` had nothing to be correct with.
+/// The flag records which wraps were soft, so the scrollback can be re-wrapped.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Line {
     /// The cells, as wide as the grid was when the line was produced.
     pub cells: Vec<Cell>,
-    /// **A soft wrap**: text ran past the right margin and continues on the next line. False
-    /// for a line that ended because the program said so.
+    /// A soft wrap: text ran past the right margin and continues on the next line.
     pub wrapped: bool,
 }
 
 /// How a [`resize`](Grid::resize) moved the lines, so an anchor into them can follow.
-///
-/// **A view is anchored to an absolute line number** and a reflow changes how many lines exist,
-/// so every anchor held outside the grid — the scrolled-back viewport, and nothing else today —
-/// is stale the moment the width changes. This maps the old numbering onto the new, which is
-/// what lets the visible region go on showing the same *text* across a resize rather than the
-/// same arithmetic.
+/// An anchor into the old line numbering follows the text across the new one.
 pub struct Reflow {
     /// The absolute number of the oldest line this maps.
     base: u64,
-    /// Where each old line's text begins in the new layout: which **logical** line, and how
-    /// far into it. Empty for a resize that moved nothing, where the mapping is the identity.
-    ///
-    /// **A logical line's text is invariant across a rewrap** — that is the whole reason
-    /// [`Line::wrapped`] exists — so an offset into one is the coordinate that survives, and
-    /// every mapping below is that offset re-divided by the new width.
+    /// Where each old line's text begins in the new layout: which logical line, and how far
+    /// into it. Empty when the resize moved nothing.
     at: Vec<(usize, usize)>,
     /// Where each logical line starts in the new row numbering, and how many rows it takes.
     lines: Vec<(usize, usize)>,
     /// The new width, which is what turns an offset back into a row and a column.
     cols: usize,
-    /// Logical lines the bounded scrollback dropped during this resize. See
-    /// [`evicted_lines`](Reflow::evicted_lines).
+    /// Logical lines the scrollback dropped during this resize.
     evicted: usize,
 }
 
 impl Reflow {
     /// Where the line that was numbered `old` is now.
-    ///
-    /// **Total, and clamping at both ends**, because an anchor is not guaranteed to name a line
-    /// that still exists — the scrollback evicts, and a caller holding a number from before an
-    /// eviction is the ordinary case [`clamp_view`](Grid::clamp_view) already exists for.
+    /// Total, clamping at both ends: the scrollback may have evicted the line.
     pub fn map_line(&self, old: u64) -> u64 {
         self.map_position(old, 0).0
     }
 
-    /// Where the *cell* at old `(line, col)` is now.
-    ///
-    /// **The generalisation of [`map_line`](Self::map_line), and the reason a selection can
-    /// survive a resize at all** (M12 Part E). A view is anchored to a line and does not care
-    /// which column, so the line map was enough for it; a selection is a pair of *positions*,
-    /// and re-breaking a paragraph at a new width moves a character across rows as well as
-    /// down them.
-    ///
-    /// The arithmetic is exactly what [`Grid::resize`] already did for the cursor — an offset
-    /// into the logical line, re-divided by the new width — which is why the cursor's own
-    /// remap is now this function rather than a second copy of it.
+    /// Where the *cell* at old `(line, col)` is now; a selection needs the column too.
     pub fn map_position(&self, line: u64, col: usize) -> (u64, usize) {
         if self.at.is_empty() {
             return (line, col);
@@ -117,53 +68,23 @@ impl Reflow {
         let (li, into) = self.at[i];
         let (start, height) = self.lines[li];
         let off = into + col;
-        // The segment the character landed in, clamped to the line's last row: a column past
-        // the trimmed text belongs at the end of the text rather than off the bottom of it.
+        // Clamped to the line's last row: a column past the trimmed text belongs at its end.
         let seg = (off / self.cols).min(height.saturating_sub(1));
         (self.base + (start + seg) as u64, (off - seg * self.cols).min(self.cols - 1))
     }
 
-    /// How many logical lines the bounded scrollback dropped during this resize.
-    ///
-    /// **Narrowing makes more rows out of the same text**, so a terminal whose history is near
-    /// [`SCROLLBACK`] loses its oldest lines to the ring rather than to the rewrap. That is the
-    /// one thing that can make [`logical_lines`](Grid::logical_lines) differ either side of a
-    /// resize, and it is counted here so the difference can be attributed rather than blamed on
-    /// the rewrap — which is exactly what a gate asserting the invariant would otherwise do
-    /// (PR #252 review, finding 2).
+    /// Narrowing makes more rows from the same text, so a full history loses its oldest lines
+    /// to the ring; this attributes that to eviction, not the rewrap.
     pub fn evicted_lines(&self) -> usize {
         self.evicted
     }
 }
 
 /// A range of text a person has swept out with the pointer.
-///
-/// **A pair of absolute `(line, column)` positions**, which is the same coordinate the
-/// scrolled-back viewport is anchored to and is chosen for the same reason: a selection made in
-/// the history must go on naming the same *text* while output arrives below it. Screen-relative
-/// coordinates would slide up a row per line printed, so a selection would drift under the
-/// person who made it.
-///
-/// **An anchor and a head rather than a start and an end**, matching
-/// `libui::widget::TextAreaState`: a selection is *directional* while it is being made, so
-/// dragging back past where the button went down selects the other way. Normalising is
-/// [`ordered`](Selection::ordered)'s job, once, rather than every reader's.
-///
-/// ## What a selection is across a reflow — the question inside this part
-///
-/// M5 deferred selection "in the same breath as the clipboard", and
-/// `display-arm-plan.md` M12 Part E names the reflow as the open question in it. The answer is
-/// that a **logical line's text is invariant** across a rewrap — that is exactly what
-/// [`Line::wrapped`] was added for in M9 Part D — so a position expressed as an offset into a
-/// logical line survives, and re-dividing that offset by the new width is the whole mapping.
-/// [`Reflow::map_position`] does it, and the cursor now goes through the same function, so the
-/// two cannot disagree about where a character went.
-///
-/// The alternative was to **clear the selection on resize**, which is what several real
-/// terminals do. It was not taken because the mechanism already existed: the viewport's anchor
-/// had to survive a rewrap for the same reason a milestone earlier, and a selection that
-/// vanished when a window was nudged would be the visible half of a decision made to save
-/// twenty lines.
+/// A pair of absolute `(line, column)` positions, so a selection in the history does not slide
+/// as output arrives. An anchor and a head rather than a start and an end: dragging back past
+/// the press selects the other way; [`ordered`](Selection::ordered) normalises. A position
+/// survives a resize as an offset into its logical line ([`Reflow::map_position`]).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Selection {
     /// Where the gesture started: absolute line, and column.
@@ -183,19 +104,13 @@ impl Selection {
     }
 
     /// Whether the range covers no cells at all.
-    ///
-    /// A press with no drag is this: the two ends are one position, and there is nothing
-    /// between them. It is not *nothing* — a gesture is in progress — which is why this is a
-    /// question about the range rather than the selection being `None`.
+    /// A press with no drag is empty yet in progress, so the selection is not `None`.
     pub fn is_empty(&self) -> bool {
         self.anchor == self.head
     }
 
     /// Whether the cell at absolute `(line, col)` falls inside the range.
-    ///
-    /// **Half-open at the end**, like every other range here: the head is where the pointer is,
-    /// and the cell *under* the pointer is not yet swept. Inclusive would make a press with no
-    /// drag select one character, which is not what a click means anywhere.
+    /// Half-open at the end: the cell under the pointer is not yet swept.
     pub fn contains(&self, line: u64, col: usize) -> bool {
         let (first, last) = self.ordered();
         (line, col) >= first && (line, col) < last
@@ -211,55 +126,30 @@ pub struct Grid {
     /// Lines that have scrolled off the top, oldest first.
     scrollback: VecDeque<Line>,
     /// Per screen row: its text continues on the row below. See [`Line::wrapped`].
-    ///
-    /// Parallel to the rows rather than stored with the cells, for the same reason `dirty` is:
-    /// `cells` is one flat buffer that `copy_within` shifts on a scroll, and a per-row field
-    /// inside it would have to be threaded through every index calculation in this file.
     wrapped: Vec<bool>,
     /// Cursor row, always `< rows`.
     row: usize,
     /// Cursor column, always `< cols`.
     col: usize,
-    /// **Deferred wrap.** Set when a character lands in the last column; the *next* character
-    /// wraps. See [`Grid::print`] for why this exists rather than wrapping on write.
+    /// Deferred wrap: set when a character lands in the last column; the next one wraps.
     pending_wrap: bool,
     /// Attributes the next printed character takes.
     attrs: Attributes,
     /// Rows changed since [`Grid::take_damage`].
     dirty: Vec<bool>,
-    /// Where the cursor was when damage was last taken.
-    ///
-    /// The render paints the cursor **into its cell**, so moving it changes two cells' pixels
-    /// while changing no cell's *contents*. Remembering the reported position is what lets
-    /// [`take_damage`](Grid::take_damage) name the row that has to un-invert.
+    /// Where the cursor was when damage was last taken: the render paints it into its cell, so
+    /// moving it must damage the row it left.
     cursor_drawn: (usize, usize),
-    /// How many lines have ever scrolled off the top — **the absolute line number of the
-    /// screen's first row**.
-    ///
-    /// This is what a scrolled-back view is anchored to, and the reason it is anchored to an
-    /// absolute number rather than to "n lines above the bottom": output arriving while the
-    /// user is reading history pushes lines into the scrollback, so a bottom-relative offset
-    /// would make the text creep upward under them at exactly the moment they are trying to
-    /// read it. Anchored here, a view showing lines 40..64 goes on showing lines 40..64
-    /// however much arrives below.
-    ///
-    /// It counts *lines produced*, not lines retained, so it does not move when the bounded
-    /// scrollback evicts its oldest line. [`oldest_line`](Grid::oldest_line) is the other end.
+    /// Lines ever scrolled off the top: the absolute line number of the screen's first row.
+    /// It counts lines produced, so eviction does not move it; a view anchored here does not
+    /// creep as output arrives.
     scrolled: u64,
-    /// The range a person has swept out, if any. See [`Selection`].
-    ///
-    /// **The grid's rather than the client's**, because two of the three things that can
-    /// invalidate it are the grid's own: a reflow moves the text under it, and the bounded
-    /// scrollback evicts the lines it names. A client holding it would have to be told about
-    /// both, which is a protocol between a client and its own data structure.
+    /// The range a person has swept out, if any. The grid's, since reflow and eviction both
+    /// invalidate it.
     selection: Option<Selection>,
 }
 
-/// Drop the run of untouched cells at the end of a logical line.
-///
-/// **Only exactly-blank cells**, never a space a program wrote with a background colour: a
-/// coloured region reaching the right margin is content, and trimming it would repaint a bar the
-/// program drew. `Cell::BLANK` is the one value that means "never written".
+/// Only exactly-blank cells: a space written with a background colour is content.
 fn trim_trailing_blanks(cells: &mut Vec<Cell>) {
     while cells.last() == Some(&Cell::BLANK) {
         cells.pop();
@@ -274,10 +164,7 @@ impl Default for Grid {
 }
 
 impl Grid {
-    /// An empty grid of `cols` × `rows`, cursor at the origin.
-    ///
-    /// Both are clamped to at least 1: a zero-column grid has no valid cursor position, and
-    /// every operation below would need a special case for a screen that cannot hold anything.
+    /// An empty grid of `cols` × `rows`, each clamped to at least 1.
     pub fn new(cols: usize, rows: usize) -> Grid {
         let (cols, rows) = (cols.max(1), rows.max(1));
         Grid {
@@ -328,25 +215,16 @@ impl Grid {
     }
 
     /// Whether screen row `row`'s text continues on the row below.
-    ///
-    /// The screen's half of [`Line::wrapped`], which is what a reflow reads before the rows
-    /// ever reach the scrollback.
     pub fn row_wrapped(&self, row: usize) -> bool {
         self.wrapped.get(row).copied().unwrap_or(false)
     }
 
     /// The absolute line number of the screen's first row.
-    ///
-    /// A view anchored here is at the bottom — following the output, which is what a terminal
-    /// does unless the user has scrolled away from it.
     pub fn top_line(&self) -> u64 {
         self.scrolled
     }
 
-    /// The absolute line number of the oldest line still retained.
-    ///
-    /// It moves as the bounded scrollback evicts, which is why a view holds a line number and
-    /// asks [`clamp_view`](Grid::clamp_view) rather than assuming its anchor survives.
+    /// The absolute line number of the oldest line still retained; eviction moves it.
     pub fn oldest_line(&self) -> u64 {
         self.scrolled - self.scrollback.len() as u64
     }
@@ -356,12 +234,8 @@ impl Grid {
         top.clamp(self.oldest_line(), self.top_line())
     }
 
-    /// The cell at viewport `(row, col)` when the viewport's first line is absolute line `top`.
-    ///
-    /// The one place the two halves of the history meet: a viewport row is served from the
-    /// scrollback or from the live screen depending only on where its line number falls.
-    /// `None` outside the grid's width, or for a line that no longer exists — total, like
-    /// [`cell`](Grid::cell), so a caller with a stale anchor draws blanks rather than panicking.
+    /// The cell at viewport `(row, col)` when its first line is absolute line `top`; `None`
+    /// outside the grid or for an evicted line, so a stale anchor draws blanks.
     pub fn view_cell(&self, top: u64, row: usize, col: usize) -> Option<Cell> {
         if row >= self.rows || col >= self.cols {
             return None;
@@ -375,11 +249,8 @@ impl Grid {
         }
     }
 
-    /// Where the cursor falls in a viewport whose first line is `top`, if it is in view at all.
-    ///
-    /// **`None` when it is not**, and that is the point: scrolling back does not move the
-    /// cursor, so a render that drew it at its screen row regardless would invert a cell of
-    /// somebody's history, several screens above where the cursor actually is.
+    /// Where the cursor falls in a viewport whose first line is `top`, or `None` if out of
+    /// view: scrolling back does not move it.
     pub fn view_cursor(&self, top: u64) -> Option<(usize, usize)> {
         let row = (self.scrolled + self.row as u64).checked_sub(top)?;
         (row < self.rows as u64).then_some((row as usize, self.col))
@@ -390,33 +261,19 @@ impl Grid {
         self.selection
     }
 
-    /// Whether anything is actually selected — a range that exists **and** covers cells.
-    ///
-    /// **The cheap half of [`selected_text`](Self::selected_text)**, which allocates the whole
-    /// selection as a `String` and is what callers used to ask this question with (PR #280 review,
-    /// worth fixing 6). A menu asks it once per message and a drag asks it once per motion, so
-    /// the allocating version made a long selection quadratic over the gesture.
-    ///
-    /// **Not `selection().is_some()`**, which is true after a bare press: a gesture in progress
-    /// with both ends at one position is `Some` and empty, and offering *Copy* for it would offer
-    /// something `selected_text` then declines.
+    /// Whether anything is selected: a range that exists and covers cells. Not
+    /// `selection().is_some()`, which is true after a bare press.
     pub fn has_selection(&self) -> bool {
         self.selection.is_some_and(|s| !s.is_empty())
     }
 
-    /// Begin a selection at absolute `(line, col)` — a press.
-    ///
-    /// Both ends start here, so a press with no drag selects nothing. [`extend`](Self::extend)
-    /// is what moves the head.
+    /// Begin a selection at absolute `(line, col)` — a press; both ends start here.
     pub fn select_from(&mut self, line: u64, col: usize) {
         self.selection = Some(Selection { anchor: (line, col), head: (line, col) });
         self.damage_all();
     }
 
-    /// Move the head of an in-progress selection — a drag.
-    ///
-    /// **Does nothing without an anchor**, which is what keeps a motion with no button held
-    /// from selecting: the caller decides when a gesture starts, and this cannot start one.
+    /// Move the head of an in-progress selection — a drag; without an anchor it does nothing.
     pub fn extend(&mut self, line: u64, col: usize) {
         if let Some(sel) = self.selection.as_mut() {
             if sel.head == (line, col) {
@@ -428,10 +285,6 @@ impl Grid {
     }
 
     /// Drop the selection, if there is one. Returns whether anything changed.
-    ///
-    /// **The return value is the repaint**, and it is why this reports rather than being a
-    /// plain setter: clearing nothing must not damage the whole grid, or every keystroke in a
-    /// terminal with no selection would repaint every row.
     pub fn clear_selection(&mut self) -> bool {
         if self.selection.take().is_some() {
             self.damage_all();
@@ -441,22 +294,11 @@ impl Grid {
         }
     }
 
-    /// Select every line the grid holds, scrollback included.
-    ///
-    /// **From the oldest line to the end of the newest**, which is what "all" means in a terminal:
-    /// the screen is a window onto the scrollback, and a Select All that took only the visible
-    /// rows would copy a different thing depending on where you had scrolled to.
-    ///
-    /// Returns whether anything was selected — an empty grid has nothing to select, and saying so
-    /// is what lets a caller decline to redraw.
+    /// Select every line the grid holds, scrollback included; returns whether anything was.
     pub fn select_all(&mut self) -> bool {
         let oldest = self.oldest_line();
         let last = self.top_line() + self.rows() as u64 - 1;
-        // **"Nothing to select" means every line is blank**, not a line-number comparison. The
-        // guard here was `last < oldest`, which cannot happen — `last` is at least `scrolled`,
-        // which is at least `oldest_line()` — so this never returned `false`, and Select All then
-        // Copy in a fresh terminal put a run of empty lines on the clipboard (PR #287 review,
-        // worth fixing 10).
+        // "Nothing to select" means every line is blank, not a line-number comparison.
         let mut end = None;
         let mut at = oldest;
         while at <= last {
@@ -469,17 +311,12 @@ impl Grid {
         }
         let Some((last_line, last_col)) = end else { return false };
         self.select_from(oldest, 0);
-        // **To the end of the last line that has text, not the grid's width.** `extend` does no
-        // clamping — it assigns — so a column past the text highlights empty cells out to the
-        // window's edge, which is the thing `select_line_at` one screen away exists to avoid.
+        // To the end of the last line with text: `extend` does not clamp.
         self.extend(last_line, last_col);
         true
     }
 
-    /// The text of one absolute line, trailing blanks trimmed.
-    ///
-    /// `None` past either end of the history — the ring evicts, so a line number that was valid
-    /// a moment ago may name nothing now.
+    /// The text of one absolute line, trailing blanks trimmed; `None` outside the history.
     pub fn line_text(&self, line: u64) -> Option<String> {
         if line < self.oldest_line() || line > self.top_line() + self.rows as u64 - 1 {
             return None;
@@ -494,15 +331,8 @@ impl Grid {
         Some(out)
     }
 
-    /// The first `needle` at or after `(line, col)`, searching towards the newest line.
-    ///
-    /// **Never spans a line break**, the same limit `TextAreaState::search_from` states and for
-    /// the same reason: lines are separate here, and a needle containing one would have to be
-    /// matched piecewise. Nothing can type a newline into a find field.
-    ///
-    /// **Columns are character offsets into the line's text**, which is what a caller wanting to
-    /// select the match needs — the grid's own columns are cells, and the two agree for every
-    /// character this terminal can print.
+    /// The first `needle` at or after `(line, col)`, searching towards the newest line. Never
+    /// spans a line break; columns are character offsets into the line's text.
     pub fn find_from(&self, needle: &str, line: u64, col: usize) -> Option<(u64, usize)> {
         if needle.is_empty() {
             return None;
@@ -511,11 +341,7 @@ impl Grid {
         let mut at = line.max(self.oldest_line());
         while at <= last {
             if let Some(text) = self.line_text(at) {
-                // **Cells in, cells out.** `str::find` works in bytes and a grid column is a
-                // character — `é` is one cell and two bytes — so a byte offset handed to
-                // `select_from` names the wrong span, and a start offset landing inside a
-                // multi-byte character makes `str::get` yield `None`, silently skipping the rest
-                // of the line (PR #287 review, blocking 5).
+                // Cells in, cells out: a column is a character, `str::find` works in bytes.
                 let skip = if at == line { col } else { 0 };
                 let from: usize = text.char_indices().nth(skip).map_or(text.len(), |(b, _)| b);
                 if let Some(hit) = text.get(from..).and_then(|tail| tail.find(needle)) {
@@ -527,14 +353,8 @@ impl Grid {
         None
     }
 
-    /// Drop the lines that have scrolled off, keeping the screen.
-    ///
-    /// **The absolute numbering does not rewind.** `scrolled` counts lines *produced*, and a
-    /// view or a selection anchored to line 900 must keep meaning line 900 — so this shortens the
-    /// history rather than renumbering it, exactly as eviction does. `oldest_line` moves up to
-    /// meet the screen; nothing above it exists any more.
-    ///
-    /// Returns whether anything was dropped, so a caller can decline to redraw.
+    /// Drop the lines that have scrolled off, keeping the screen and the absolute numbering.
+    /// Returns whether anything was dropped.
     pub fn clear_scrollback(&mut self) -> bool {
         if self.scrollback.is_empty() {
             return false;
@@ -549,13 +369,8 @@ impl Grid {
         true
     }
 
-    /// Select the word under `(line, col)`; `false` if there is no word there.
-    ///
-    /// **A word is a run of anything that is not a space**, which is the rule a terminal wants
-    /// rather than a language's: what is under the pointer is usually a path, a flag or an
-    /// identifier, and splitting `--colour=auto` into three selections would make double click
-    /// useless for the thing it is mostly used for. Selecting on a blank does nothing rather than
-    /// selecting the run of blanks.
+    /// Select the word under `(line, col)`; `false` if there is none. A word is a run of
+    /// non-spaces, so `--colour=auto` stays one.
     pub fn select_word_at(&mut self, line: u64, col: usize) -> bool {
         let Some(text) = self.line_text(line) else { return false };
         let chars: Vec<char> = text.chars().collect();
@@ -579,24 +394,13 @@ impl Grid {
     pub fn select_line_at(&mut self, line: u64) -> bool {
         let Some(text) = self.line_text(line) else { return false };
         self.select_from(line, 0);
-        // **To the end of the text, not the end of the row.** A line's trailing cells are blanks
-        // the terminal never wrote, and taking them would put a run of spaces on the clipboard.
+        // To the end of the text, not the row: trailing blanks were never written.
         self.extend(line, text.chars().count());
         true
     }
 
-    /// The selected text, or `None` when nothing is selected.
-    ///
-    /// **Trailing blanks are dropped per line**, exactly as [`resize`](Self::resize) drops them
-    /// when it joins: a grid is a rectangle and the cells past the end of a line were never
-    /// written, so keeping them would paste a screen's width of spaces after every line. What
-    /// they are *not* is a coloured region a program drew — `Cell::BLANK` is the one value that
-    /// means "never written", and this compares against it for that reason.
-    ///
-    /// **A soft wrap does not become a newline.** A line that ran past the right margin is one
-    /// line of text that the terminal happened to break; pasting it with a newline in the
-    /// middle would insert a break the program never wrote. [`Line::wrapped`] is what says
-    /// which is which — the same flag the rewrap rests on.
+    /// The selected text, or `None` when nothing is selected. Trailing blanks are dropped per
+    /// line and a soft wrap does not become a newline ([`Line::wrapped`]).
     pub fn selected_text(&self) -> Option<String> {
         let sel = self.selection?;
         if sel.is_empty() {
@@ -629,11 +433,7 @@ impl Grid {
         Some(out)
     }
 
-    /// Whether absolute `line`'s text continues on the line below — history or screen.
-    ///
-    /// [`row_wrapped`](Self::row_wrapped) answers this for a *screen* row;
-    /// [`Line::wrapped`] holds it for a scrollback line. This is the one accessor that spans
-    /// both, which is what a selection reaching from the history onto the screen needs.
+    /// Whether absolute `line`'s text continues on the line below, in history or on screen.
     pub fn line_wrapped(&self, line: u64) -> bool {
         if line >= self.scrolled {
             self.row_wrapped((line - self.scrolled) as usize)
@@ -645,26 +445,9 @@ impl Grid {
         }
     }
 
-    /// Which rows changed since this was last called, and clear the record.
-    ///
-    /// **Per row, not one rectangle.** A keystroke dirties one row, and the render unions what
-    /// it is given — so a grid that reported a bounding box would make a status line at the
-    /// bottom and a prompt at the top repaint everything between them.
-    ///
-    /// **A moved cursor damages two rows**: the one it left and the one it arrived in. The
-    /// render paints the cursor by inverting the cell it sits on, so moving it changes pixels
-    /// in a cell whose *contents* did not change — and the row it left must repaint or the
-    /// inversion stays behind as a phantom block. That is the same rule the compositor follows
-    /// for the pointer, and for the same reason: something drawn *over* a surface rather than
-    /// composited into it owns both of its positions.
-    ///
-    /// An earlier version reported nothing for cursor movement, with a rationale that would
-    /// have held if the cursor were a separate overlay pass. A5 made it per-cell and the
-    /// rationale stopped being true — each half defensible, the pair wrong (PR #190 review).
-    ///
-    /// **Calling this means "I am about to draw these rows."** The cursor bookkeeping updates
-    /// here, so a caller that takes damage and does not render leaves the record ahead of the
-    /// screen — the same contract the dirty flags themselves have always had.
+    /// Which rows changed since this was last called, and clear the record. A moved cursor
+    /// damages two rows: the render inverts the cell under it, so the row it left must repaint.
+    /// Calling this means "I am about to draw these rows".
     pub fn take_damage(&mut self) -> Vec<usize> {
         if self.cursor_drawn != (self.row, self.col) {
             let (was_row, _) = self.cursor_drawn;
@@ -679,32 +462,11 @@ impl Grid {
 
     /// Re-lay the whole terminal at `cols` × `rows`, rewrapping the history.
     ///
-    /// **The constant this file opens with stops being one here** (M9 Part D). It is the largest
-    /// operation in this crate and the reason the part is the milestone's largest, so what it
-    /// does is worth stating in order:
-    ///
-    /// 1. **Everything becomes logical lines again.** The scrollback and the screen are one
-    ///    sequence of rows; consecutive rows joined by [`Line::wrapped`] were one line before the
-    ///    old width broke them, and are one line again. Trailing blanks go with the break they
-    ///    padded — a line that ends is trimmed, so narrowing does not push a run of spaces onto
-    ///    a row of its own.
-    /// 2. **Each logical line is re-broken at the new width**, every piece but the last marked
-    ///    wrapped. This is the step that a `resize` without the flag could not do correctly in
-    ///    either direction: joining every pair merges paragraphs, joining none freezes the old
-    ///    width's breaks into the history for ever.
-    /// 3. **The last `rows` of the result are the screen**, the rest is scrollback, and the
-    ///    cursor follows the character it was on — clamped into the screen if the rewrap pushed
-    ///    its line above the top, which only a shrink with content below the cursor can do.
-    ///
-    /// **The screen's empty tail is not history.** Rows below the last one carrying anything —
-    /// and below the cursor — are dropped rather than rewrapped, or every resize of an idle
-    /// terminal would push a screenful of blank lines into the scrollback.
-    ///
-    /// The returned [`Reflow`] maps old absolute line numbers onto new ones. A caller holding a
-    /// scrolled-back anchor **must** put it through that, or its viewport shows a different part
-    /// of the history after a resize than before it.
-    ///
-    /// Both dimensions are clamped to at least 1, as [`Grid::new`] clamps them.
+    /// Rows joined by [`Line::wrapped`] become logical lines again, each is re-broken at the
+    /// new width, and the last `rows` become the screen with the cursor following its
+    /// character. The screen's empty tail is dropped, not rewrapped, or an idle terminal would
+    /// fill the scrollback with blanks. A scrolled-back anchor must go through the returned
+    /// [`Reflow`]. Both dimensions are clamped to at least 1.
     pub fn resize(&mut self, cols: usize, rows: usize) -> Reflow {
         let (cols, rows) = (cols.max(1), rows.max(1));
         if cols == self.cols && rows == self.rows {
@@ -712,8 +474,7 @@ impl Grid {
         }
         let base = self.oldest_line();
 
-        // 1. Every line there is, oldest first. Old absolute number `base + i` for index `i`,
-        //    which is what makes the map below a plain vector.
+        // 1. Every line there is, oldest first: old absolute number `base + i` for index `i`.
         let mut old: Vec<Line> = Vec::with_capacity(self.scrollback.len() + self.rows);
         let sb_len = self.scrollback.len();
         old.extend(self.scrollback.drain(..));
@@ -740,8 +501,7 @@ impl Grid {
             }
         }
         if open {
-            // The last row wrapped and there is nothing after it — a line the cursor is still
-            // in the middle of writing. It is a logical line like any other.
+            // The last row wrapped with nothing after it: a line still being written.
             trim_trailing_blanks(&mut cur);
             logical.push(cur);
         }
@@ -767,10 +527,7 @@ impl Grid {
             height.push(lines.len() - start[start.len() - 1]);
         }
 
-        // **The map is kept as offsets rather than resolved to rows here.** Resolving loses the
-        // column, and a selection is a pair of *positions* — see [`Reflow::map_position`], which
-        // is where the division by the new width now lives, once, for the cursor and for a
-        // selection alike.
+        // Kept as offsets: resolving loses the column. [`Reflow::map_position`] divides.
         let screen_start = lines.len().saturating_sub(rows);
         let at = pos.clone();
         let line_spans: Vec<(usize, usize)> = start.iter().zip(height.iter()).map(|(&s, &h)| (s, h)).collect();
@@ -782,18 +539,12 @@ impl Grid {
             self.cells[r * cols..(r + 1) * cols].copy_from_slice(&l.cells);
             self.wrapped[r] = l.wrapped;
         }
-        // **No fixing-up of the last row is needed.** The final element of `lines` is always the
-        // last segment of a logical line, whose `wrapped` is false by construction, and the rows
-        // padded below it start false. An earlier version wrote `false` there explicitly; it was
-        // a dead store describing a state that cannot arise (PR #252 review, optional 8).
+        // No fix-up of the last row: the final `lines` element ends a logical line.
         lines.truncate(screen_start);
         self.scrollback = lines.into_iter().collect();
         self.scrolled = base + screen_start as u64;
-        // **Narrowing makes more rows than it started with**, so this is where a terminal near
-        // the cap loses its oldest lines — to the ring, not to the rewrap. Counted, because the
-        // count is the difference between "the reflow lost lines" and "the history was full",
-        // and only one of those is a bug. `scrolled` counts lines produced and the eviction
-        // moves the *other* end, exactly as in `scroll_up`.
+        // A terminal near the cap loses its oldest lines to the ring, not the rewrap; counted so
+        // the two can be told apart. `scrolled` is unchanged: eviction moves the other end.
         let mut evicted = 0;
         while self.scrollback.len() > SCROLLBACK {
             if self.scrollback.pop_front().is_some_and(|l| !l.wrapped) {
@@ -801,23 +552,14 @@ impl Grid {
             }
         }
 
-        // 5. The cursor follows the character it was on — **through the same map a selection
-        //    uses**, rather than a second copy of the arithmetic beside it.
+        // 5. The cursor follows its character through the same map a selection uses.
         let reflow = Reflow { base, at, lines: line_spans, cols, evicted: 0 };
         let (cursor_line, cursor_col) = reflow.map_position(base + cursor_row as u64, self.col);
         let line_index = (cursor_line - base) as usize;
         self.row = line_index.saturating_sub(screen_start).min(rows - 1);
         self.col = cursor_col;
 
-        // 5b. **The selection follows too** — a pair of absolute positions, exactly like the
-        //     viewport's anchor and for the same reason (see [`Selection`]).
-        //
-        //     **It is not dropped when it names evicted text**, and this comment said it was
-        //     (PR #271 review, optional 5). `map_position` clamps an out-of-range old line to
-        //     the nearest one it maps, so such a selection survives pointing somewhere
-        //     `selected_text` finds nothing for — which is harmless, because `view_cell`
-        //     answers `None` there and the read stops. Saying it was dropped described a branch
-        //     that does not exist, which is what the next reader would have gone looking for.
+        // 5b. The selection follows too; `map_position` clamps an evicted line, harmlessly.
         self.selection = self.selection.map(|sel| Selection {
             anchor: reflow.map_position(sel.anchor.0, sel.anchor.1),
             head: reflow.map_position(sel.head.0, sel.head.1),
@@ -833,18 +575,8 @@ impl Grid {
         Reflow { evicted, ..reflow }
     }
 
-    /// How many *logical* lines the terminal holds — history and screen, wraps not counted.
-    ///
-    /// **The invariant a rewrap must not break, and the one a caller can check without reading
-    /// anybody's text.** Re-breaking lines at a new width moves where the breaks are; it does
-    /// not create or destroy *lines*. So this number is the same before and after a
-    /// [`resize`](Grid::resize) — **less whatever the bounded scrollback evicted**, which
-    /// [`Reflow::evicted_lines`] counts, because narrowing makes more rows out of the same text
-    /// and a history near [`SCROLLBACK`] loses its oldest to the ring. An implementation that
-    /// ignored [`Line::wrapped`] and joined every adjacent row would collapse the whole history
-    /// to one — visibly, in a single number, with nothing about the content in it. That is what
-    /// lets a gate on a release image assert the reflow at all: a terminal's rows are somebody's
-    /// session and the serial log is not the place for them.
+    /// How many *logical* lines the terminal holds. A rewrap moves breaks but creates no lines,
+    /// so this is unchanged by a [`resize`](Grid::resize), less [`Reflow::evicted_lines`].
     pub fn logical_lines(&self) -> usize {
         let sb = self.scrollback.iter().filter(|l| !l.wrapped).count();
         let screen = (0..self.content_rows()).filter(|r| !self.wrapped[*r]).count();
@@ -879,16 +611,13 @@ impl Grid {
             }
             Op::LineFeed => self.line_feed(),
             Op::Backspace => {
-                // Stops at the left margin rather than wrapping to the previous line. A
-                // backspace that wrapped would let a program erase text it never wrote.
+                // Stops at the left margin, or a program could erase text it never wrote.
                 self.col = self.col.saturating_sub(1);
                 self.pending_wrap = false;
             }
             Op::Tab => {
                 let next = (self.col / TAB_WIDTH + 1) * TAB_WIDTH;
-                // A tab in the last cell moves *to* the last column and stops there. It does
-                // not wrap, and it does not set the pending flag: a tab is movement, and the
-                // deferred-wrap flag belongs to a character having been written.
+                // Movement to the last column does not set the pending-wrap flag.
                 self.col = next.min(self.cols - 1);
                 self.pending_wrap = false;
             }
@@ -905,18 +634,8 @@ impl Grid {
         }
     }
 
-    /// What an erase writes: a space in the **current background**, with nothing else set.
-    ///
-    /// **Not [`Cell::BLANK`].** `ED` after `SGR 44` fills blue, which is how a program paints a
-    /// coloured region, and a fill with the default background would make that impossible. The
-    /// other attributes go: an erased cell has no character, so bold and underline have nothing
-    /// to apply to, and carrying them would make a later `reverse` repaint a region that looks
-    /// erased.
-    ///
-    /// The foreground goes too, for the same reason — with one consequence worth knowing:
-    /// under `SGR 7`, [`Attributes::resolve`] swaps, so an erase while reversed fills with the
-    /// *foreground*. That is what xterm does and it is what makes "reverse, erase line" paint a
-    /// solid bar.
+    /// Not [`Cell::BLANK`]: `ED` after `SGR 44` fills blue. Bold and underline go; the
+    /// foreground goes too, so under `SGR 7` an erase fills with the foreground, as xterm does.
     fn blank(&self) -> Cell {
         Cell {
             ch: ' ',
@@ -934,32 +653,18 @@ impl Grid {
         }
     }
 
-    /// Write one character at the cursor and advance it.
-    ///
-    /// **Deferred wrap, not wrap-on-write.** A character landing in the last column leaves the
-    /// cursor *on* that column with [`Grid::pending_wrap`] set, and only the next character
-    /// moves to the next line. Wrapping immediately is the naive implementation and it is
-    /// wrong in a way people notice: printing exactly `cols` characters and then a newline
-    /// produces a blank line, because the wrap already happened and the newline moves again.
-    /// Every real terminal defers, and every program that draws a full-width line depends on
-    /// it.
+    /// **Deferred wrap, not wrap-on-write.** A character in the last column leaves the cursor on
+    /// it with [`Grid::pending_wrap`] set; only the next one wraps. Wrapping at once makes
+    /// `cols` characters then a newline print a blank line.
     fn print(&mut self, c: char) {
         if self.pending_wrap {
             self.col = 0;
-            // **The row being left is a soft wrap**, and this is the only moment that is known:
-            // afterwards it is just two adjacent full rows, indistinguishable from a program
-            // that printed exactly `cols` characters and a newline. `scroll_up` carries the
-            // flag into the scrollback with the line, and `resize` reads it back.
+            // The row being left is a soft wrap, known only now.
             let leaving = self.row;
             self.set_wrapped(leaving, true);
             self.line_feed_scrolling();
         }
-        // **Cleared unconditionally**, before the trailing branch decides whether to set it
-        // again. Clearing it only inside the wrap arm leaves it set after a wrap on any grid
-        // wider than one column — so the *second* character of the wrapped line wraps too, and
-        // a paragraph reaching the right margin then descends one line per character. Nothing
-        // caught that until a break-test removed the assignment and every test stayed green:
-        // the wrap test wrote exactly one character past the margin and stopped.
+        // Cleared unconditionally, or a wrapped paragraph descends one line per character.
         self.pending_wrap = false;
         let (row, col) = (self.row, self.col);
         let cell = Cell::new(c, self.attrs);
@@ -972,31 +677,15 @@ impl Grid {
         }
     }
 
-    /// Move down one line, scrolling if that leaves the screen.
-    ///
-    /// **The column does not change.** `LF` is *index* — down only — and returning to column 0
-    /// is `CR`'s job, which is why a program that wants a new line emits `\r\n`. A terminal
-    /// that folded the two would make `\r\n` return to column 0 twice, harmlessly, and make
-    /// the sequence `abc\ndef` (which should stairstep) look like two aligned lines — hiding a
-    /// producer's bug rather than showing it.
-    ///
-    /// **Translating a bare `\n` into `\r\n` is the line discipline's job**, not the
-    /// terminal's: it is Unix's `ONLCR`, and this system already has a tty server that owns
-    /// the discipline. `tty-server` writes `\r\n` explicitly where it echoes and does **not**
-    /// translate on the `Tty::Write` path — so a program emitting bare `\n` will stairstep in
-    /// the GUI terminal, which is a Part C item and is recorded as one in the plan.
+    /// The column does not change: `LF` is index, `CR` returns to column 0. Translating a bare
+    /// `\n` is the line discipline's `ONLCR`.
     fn line_feed(&mut self) {
         self.pending_wrap = false;
-        // **An explicit line feed ends the line it happens on**, whatever a previous paragraph
-        // left behind there. Without this a row that once wrapped stays marked after the text
-        // that wrapped it has been overwritten, and a reflow would join it to the row below —
-        // which is exactly what makes two deliberately short adjacent lines become one, the
-        // failure the reflow gate is built around.
+        // An explicit line feed ends the line, or a reflow joins a stale wrap to the row below.
         self.set_wrapped(self.row, false);
         self.line_feed_scrolling();
     }
 
-    /// Record whether `row`'s text continues below, if `row` is on the screen.
     fn set_wrapped(&mut self, row: usize, to: bool) {
         if let Some(w) = self.wrapped.get_mut(row) {
             *w = to;
@@ -1015,14 +704,12 @@ impl Grid {
     fn scroll_up(&mut self) {
         let cells = self.cells[0..self.cols].to_vec();
         self.scrollback.push_back(Line { cells, wrapped: self.wrapped[0] });
-        // The flags move with the rows they describe, and the row opened at the bottom is a
-        // fresh line that continues nothing.
+        // The flags move with their rows.
         self.wrapped.rotate_left(1);
         if let Some(last) = self.wrapped.last_mut() {
             *last = false;
         }
-        // Counts lines *produced*, so it is incremented here and not adjusted by the eviction
-        // below: it is the top of the history, and the eviction moves the bottom.
+        // Counts lines produced; eviction below does not adjust it.
         self.scrolled += 1;
         while self.scrollback.len() > SCROLLBACK {
             self.scrollback.pop_front();
@@ -1031,14 +718,10 @@ impl Grid {
         let blank = self.blank();
         let start = (self.rows - 1) * self.cols;
         self.cells[start..].fill(blank);
-        // Everything moved, so everything repaints. A scroll is the one operation that dirties
-        // the whole screen, and pretending otherwise would be the bug a damage system exists
-        // to avoid on the *other* side.
         self.damage_all();
     }
 
-    /// `CUP`: clamp into the screen. Never scrolls — addressing a row past the bottom means
-    /// the bottom row, not a screen that moves under the program.
+    /// `CUP`: clamp into the screen; never scrolls.
     fn move_to(&mut self, row: usize, col: usize) {
         self.row = row.min(self.rows - 1);
         self.col = col.min(self.cols - 1);
@@ -1058,21 +741,16 @@ impl Grid {
         let (row, col) = (self.row, self.col);
         let (from, to) = match e {
             Erase::ToEnd => (col, self.cols),
-            // Inclusive of the cursor, which is what `EL 1` means — an exclusive range leaves
-            // the character under the cursor behind.
             Erase::ToStart => (0, col + 1),
             Erase::All => (0, self.cols),
         };
         let blank = self.blank();
         self.cells[row * self.cols + from..row * self.cols + to].fill(blank);
         if to == self.cols {
-            // Its tail is gone, so it does not continue below any more — the same reasoning as
-            // `erase_in_display`, for the one row this touches.
             self.set_wrapped(row, false);
         }
         self.touch(row);
-        // Erasing does not move the cursor, but it does end a pending wrap: the character that
-        // set it is gone.
+        // Erasing ends a pending wrap: the character that set it is gone.
         self.pending_wrap = false;
     }
 
@@ -1083,21 +761,15 @@ impl Grid {
             Erase::ToEnd => {
                 self.cells[row * self.cols + col..(row + 1) * self.cols].fill(blank);
                 self.cells[(row + 1) * self.cols..].fill(blank);
-                // **Erased text cannot still be continued below.** A row whose tail is gone
-                // ends there, and so does every row under it — leaving the flags set would let
-                // a later reflow join rows whose joining text no longer exists.
+                // Erased text cannot be continued below, or a reflow would join rows.
                 self.wrapped[row..].fill(false);
             }
             Erase::ToStart => {
                 self.cells[..row * self.cols].fill(blank);
                 self.cells[row * self.cols..row * self.cols + col + 1].fill(blank);
-                // The rows above are empty now, so nothing continues into anything; this row
-                // keeps its own flag, because its tail — past the cursor — is untouched.
                 self.wrapped[..row].fill(false);
             }
-            // **`ED 2` does not scroll.** `Ctrl-L` in a shell clears the screen and leaves the
-            // scrollback alone; a version that scrolled the screen into history would fill
-            // someone's scrollback with blank lines every time they cleared.
+            // `ED 2` does not scroll: `Ctrl-L` must not fill the scrollback with blank lines.
             Erase::All => {
                 self.cells.fill(blank);
                 self.wrapped.fill(false);
@@ -1128,11 +800,7 @@ mod tests {
     use crate::cell::Ansi;
     use crate::parse::{MAX_PER_BYTE, Parser};
 
-    /// Drive a grid from real bytes, through the real parser.
-    ///
-    /// The two halves are tested apart *and* joined here, because "the parser emits the right
-    /// ops" and "the grid does the right thing with them" together still permit a mismatch in
-    /// what the ops mean.
+    /// Drive a grid from real bytes through the real parser.
     fn feed(g: &mut Grid, s: &str) {
         let mut p = Parser::new();
         let mut out = [Op::Print('\0'); MAX_PER_BYTE];
@@ -1143,16 +811,10 @@ mod tests {
     }
 
     /// `select_all` takes every line the grid holds, scrollback included.
-    ///
-    /// **The scrollback is the point.** The screen is a window onto it, so a Select All that took
-    /// only the visible rows would copy a different thing depending on where the view was
-    /// scrolled to — and `nxterm`'s chord test cannot see the difference, because it only asks
-    /// whether the row changed *something* (M14 Part E).
     #[test]
     fn select_all_takes_the_scrollback_too() {
         let mut g = Grid::new(20, 3);
         feed(&mut g, "one\r\ntwo\r\nthree\r\nfour\r\nfive");
-        // Three rows on screen and two scrolled off, so a visible-only selection would miss them.
         assert!(g.oldest_line() < g.top_line(), "there is scrollback to miss");
 
         assert!(g.select_all(), "something was selected");
@@ -1162,12 +824,7 @@ mod tests {
         }
     }
 
-    /// `find_from` reports **cell** columns, which is what a caller selects with.
-    ///
-    /// **`str::find` works in bytes and a grid column is a character.** `é` is one cell and two
-    /// bytes, so a byte offset handed to `select_from` selects the wrong span — and a start
-    /// offset landing inside a multi-byte character makes `str::get` yield `None`, silently
-    /// skipping the rest of the line (PR #287 review, blocking 5).
+    /// `find_from` reports cell columns, not bytes (`é` is one cell and two bytes).
     #[test]
     fn find_from_reports_cells_not_bytes() {
         let mut g = Grid::new(30, 2);
@@ -1178,20 +835,13 @@ mod tests {
             Some((line, 3)),
             "two accents and an x are three cells, not five bytes"
         );
-        // And selecting with that column takes the word it named.
         g.select_from(line, 3);
         g.extend(line, 3 + "target".chars().count());
         assert_eq!(g.selected_text().as_deref(), Some("target"));
 
-        // A search starting mid-line, from a column inside the accented run.
         assert_eq!(g.find_from("x", line, 1), Some((line, 2)), "the rest of the line is searched");
     }
 
-    /// Select All on a grid with nothing on it selects nothing.
-    ///
-    /// **The old guard could not fire**: `last` is at least `scrolled`, which is at least
-    /// `oldest_line()`, so `select_all` always returned `true` — and a fresh terminal's Select
-    /// All then Copy put a run of blank lines on the clipboard.
     #[test]
     fn select_all_on_a_blank_grid_selects_nothing() {
         let mut g = Grid::new(20, 3);
@@ -1200,7 +850,6 @@ mod tests {
         assert_eq!(g.selected_text(), None, "and nothing to copy");
     }
 
-    /// Select All stops at the end of the last line with text, not at the grid's width.
     #[test]
     fn select_all_stops_at_the_text() {
         let mut g = Grid::new(30, 3);
@@ -1211,22 +860,16 @@ mod tests {
         assert_eq!(g.selected_text().as_deref(), Some("one\ntwo\nshort"));
     }
 
-    /// A find walks forward through the history and reports character columns.
     #[test]
     fn find_from_walks_the_history() {
         let mut g = Grid::new(20, 3);
         feed(&mut g, "alpha\r\nbeta\r\ngamma\r\nbeta again");
         let first = g.find_from("beta", g.oldest_line(), 0).expect("the first beta");
-        // Searching on from just after it finds the second, not the same one again.
         let next = g.find_from("beta", first.0, first.1 + 1).expect("the second beta");
         assert!(next.0 > first.0, "the second is on a later line: {first:?} then {next:?}");
         assert_eq!(g.find_from("zeta", g.oldest_line(), 0), None, "and what is absent is absent");
     }
 
-    /// Clearing the scrollback keeps the screen and does **not** rewind the numbering.
-    ///
-    /// **`scrolled` counts lines produced**, so a view or a selection anchored to line 900 must
-    /// go on meaning line 900 — this shortens the history exactly as eviction does.
     #[test]
     fn clearing_the_scrollback_keeps_the_screen_and_the_numbering() {
         let mut g = Grid::new(20, 3);
@@ -1241,11 +884,6 @@ mod tests {
         assert!(!g.clear_scrollback(), "and a second clear has nothing to do");
     }
 
-    /// Double click takes a word, and a word is a run of non-blanks.
-    ///
-    /// **Not a language's idea of a word.** What is under the pointer in a terminal is usually a
-    /// path or a flag, and splitting `--colour=auto` into three would make the gesture useless
-    /// for what it is mostly used for.
     #[test]
     fn a_word_is_a_run_of_non_blanks() {
         let mut g = Grid::new(30, 2);
@@ -1258,16 +896,9 @@ mod tests {
         assert!(g.select_word_at(line, 0), "the first word");
         assert_eq!(g.selected_text().as_deref(), Some("ls"));
 
-        // A blank is not a word, and selecting on one does nothing.
         assert!(!g.select_word_at(line, 2), "the space between them");
     }
 
-    /// Triple click takes the line, and stops at the text rather than the row's width.
-    ///
-    /// **Asserted on the range, not on the text.** `selected_text` trims trailing blanks itself,
-    /// so a selection running to the row's full width copies the same string — the difference is
-    /// what is *highlighted*, which is a run of empty cells to the right of the text. The first
-    /// version of this test asserted the text and passed with the wrong implementation.
     #[test]
     fn a_line_selection_stops_at_the_text() {
         let mut g = Grid::new(30, 2);
@@ -1280,13 +911,11 @@ mod tests {
         assert_eq!(g.selected_text().as_deref(), Some("short"));
     }
 
-    /// A row's characters, trailing blanks trimmed.
     fn line(g: &Grid, row: usize) -> alloc::string::String {
         let s: alloc::string::String = (0..g.cols()).map(|c| g.cell(row, c).unwrap().ch).collect();
         s.trim_end().into()
     }
 
-    /// The text of a viewport row, from wherever it is served, trailing blanks trimmed.
     fn view(g: &Grid, top: u64, row: usize) -> alloc::string::String {
         let s: alloc::string::String =
             (0..g.cols()).map(|c| g.view_cell(top, row, c).map(|x| x.ch).unwrap_or(' ')).collect();
@@ -1295,10 +924,8 @@ mod tests {
 
     #[test]
     fn a_wrapped_line_rejoins_on_a_widen_and_two_short_lines_do_not() {
-        // **The assertion the whole flag exists for**, and the shape M9 Part D's gate uses. A
-        // rewrap that ignored `wrapped` and simply joined adjacent rows would put the long line
-        // back together too — so "the long line is now one row" holds for the broken version as
-        // well, and it is the *short pair staying two rows* that separates them.
+        // The assertion the flag exists for: a rewrap that joined adjacent rows would also
+        // rejoin the long line, so the short pair staying two rows separates them.
         let mut g = Grid::new(6, 6);
         feed(&mut g, "abcdefghij\r\n"); // 10 characters at width 6: one soft wrap
         feed(&mut g, "xx\r\n");
@@ -1315,10 +942,6 @@ mod tests {
 
     #[test]
     fn a_rewrap_moves_the_breaks_and_never_the_count_of_lines() {
-        // **The invariant a gate can check without reading anyone's text**, which is what makes
-        // the reflow assertable on a release image at all. An implementation that joined every
-        // adjacent row — the failure `Line::wrapped` exists to prevent — collapses the whole
-        // history into one logical line, and says so in this one number.
         let mut g = Grid::new(20, 4);
         for i in 0..10 {
             feed(&mut g, &alloc::format!("line{i} with a tail on it\r\n"));
@@ -1336,11 +959,6 @@ mod tests {
 
     #[test]
     fn what_the_ring_drops_on_a_narrow_is_counted_rather_than_lost() {
-        // **The one thing that can break the line-count invariant, and it is not the rewrap.**
-        // Narrowing makes more rows out of the same text, so a history near the cap loses its
-        // oldest to the ring. A gate that asserted the invariant unconditionally would blame
-        // `Line::wrapped` for `SCROLLBACK` — sending the first person to hit it to the wrong
-        // file (PR #252 review, finding 2).
         let mut g = Grid::new(20, 3);
         for _ in 0..900 {
             feed(&mut g, "0123456789012345678\r\n"); // 19 characters: one row at width 20
@@ -1360,10 +978,7 @@ mod tests {
 
     #[test]
     fn a_line_feed_clears_a_stale_wrap() {
-        // **The clearing half of the flag, which nothing covered.** A row that once wrapped and
-        // has since been overwritten must stop being marked, or the next widen joins it to the
-        // row below — the two-short-lines failure, arriving by way of history rather than by way
-        // of the rewrap (PR #252 review, finding 3).
+        // A row that once wrapped and was overwritten must stop being marked, or a widen joins it.
         let mut g = Grid::new(6, 4);
         feed(&mut g, "abcdefghij"); // row 0 "abcdef" wrapped -> row 1 "ghij"
         assert!(g.row_wrapped(0));
@@ -1378,7 +993,6 @@ mod tests {
 
     #[test]
     fn erasing_to_the_margin_ends_a_wrapped_row() {
-        // `EL` to the end of the line takes the text that continued below with it.
         let mut g = Grid::new(6, 4);
         feed(&mut g, "abcdefghij");
         feed(&mut g, "\x1b[1;3H\x1b[K"); // row 0, column 2, erase to the margin
@@ -1391,15 +1005,12 @@ mod tests {
 
     #[test]
     fn erasing_the_display_ends_the_wrapped_rows_it_blanks() {
-        // The three `ED` arms, each clearing the flags of the rows it actually blanked — and
-        // `ToStart` deliberately leaving this row's own flag alone, because its tail survives.
+        // Each `ED` arm clears the flags of the rows it blanked; `ToStart` leaves this row's own.
         let mut g = Grid::new(6, 4);
         feed(&mut g, "abcdefghij\r\n"); // rows 0-1, row 0 wrapped
         feed(&mut g, "klmnopqrst"); // rows 2-3, row 2 wrapped
         assert!(g.row_wrapped(0) && g.row_wrapped(2));
 
-        // `ED 0` from row 1: rows 1 onward are blanked, so 2 stops continuing. Row 0 keeps its
-        // flag — nothing touched its text.
         feed(&mut g, "\x1b[2;1H\x1b[J");
         assert!(g.row_wrapped(0), "the row above the erase is untouched");
         assert!(!g.row_wrapped(2), "the erased row continues nothing");
@@ -1407,8 +1018,6 @@ mod tests {
         let mut g = Grid::new(6, 4);
         feed(&mut g, "abcdefghij\r\n");
         feed(&mut g, "klmnopqrst");
-        // `ED 1` to row 2 inclusive: rows above are gone, so row 0 stops continuing; row 2's own
-        // tail survives past the cursor, so its flag stays.
         feed(&mut g, "\x1b[3;1H\x1b[1J");
         assert!(!g.row_wrapped(0), "an erased row continues nothing");
         assert!(g.row_wrapped(2), "this row's tail was not erased, so it still continues");
@@ -1432,12 +1041,6 @@ mod tests {
 
     #[test]
     fn a_reflow_maps_a_scrolled_back_anchor_onto_the_same_text() {
-        // **The property a person notices**: after a resize the viewport shows the same words,
-        // not the same line arithmetic. `scrolled` counts lines and a rewrap changes how many
-        // there are, so an anchor carried across unmapped is off by the number of joins above
-        // it — which is why the history here is *wrapped*. A first version of this test used
-        // lines that fitted at both widths, where nothing moves and carrying the number across
-        // unmapped passes too (found by running that control).
         let mut g = Grid::new(5, 3);
         for i in 0..8 {
             feed(&mut g, &alloc::format!("aaaa{i}bbbb\r\n")); // 9 chars at width 5: two rows
@@ -1447,10 +1050,6 @@ mod tests {
         assert_eq!(want, "aaaa2", "the first half of a line the old width broke in two");
 
         let r = g.resize(10, 3);
-        // **Starts with**, not equals: the row at the new number holds the *rejoined* line, so
-        // the text that began at the anchor now has the rest of its own line after it. What
-        // must not happen is landing on a different line, which is what carrying the number
-        // across unmapped does.
         let now = view(&g, r.map_line(anchor), 0);
         assert!(now.starts_with(&want), "anchor landed on {now:?}, wanted {want:?} first");
         assert_ne!(r.map_line(anchor), anchor, "the numbering really did move");
@@ -1472,12 +1071,6 @@ mod tests {
 
     #[test]
     fn resizing_an_idle_screen_pushes_nothing_into_the_scrollback() {
-        // A terminal showing a prompt is mostly empty screen. Rewrapping the blank tail would
-        // put a screenful of nothing into the history on every resize — and a person who
-        // maximises and restores would find their scrollback full of blank lines.
-        // **Shrinking, because that is where it shows.** Growing has room for the blank tail
-        // and nothing spills whether or not it is trimmed — the first version of this test grew
-        // the screen and passed with the trim removed (found by running that control).
         let mut g = Grid::new(20, 10);
         feed(&mut g, "/home> ");
         g.resize(40, 5);
@@ -1498,15 +1091,11 @@ mod tests {
 
     #[test]
     fn a_coloured_run_to_the_right_margin_is_not_trimmed_away() {
-        // `trim_trailing_blanks` drops only never-written cells. A program that painted a bar
-        // to the margin — reverse video, or an erase under a background colour — wrote those
-        // spaces on purpose, and a rewrap that trimmed them would erase the bar.
+        // `trim_trailing_blanks` drops only never-written cells: a bar painted to the margin
+        // was written on purpose.
         let mut g = Grid::new(6, 3);
         feed(&mut g, "\x1b[44m\x1b[K"); // erase the line under blue: six blue spaces
-        // **A real resize.** The first version of this asked for the shape the grid already
-        // had, which takes `resize`'s early return — so `trim_trailing_blanks` never ran and
-        // the test passed against a trim that deleted every logical line outright (PR #252
-        // review, blocking 1).
+        // A real resize: an unchanged shape takes `resize`'s early return and skips the trim.
         g.resize(8, 3);
         let blue = (0..6).filter(|c| g.cell(0, *c).unwrap().attrs.bg == Colour::Ansi(Ansi::Blue));
         assert_eq!(blue.count(), 6, "the painted run survived the rewrap");
@@ -1522,10 +1111,8 @@ mod tests {
 
     #[test]
     fn a_full_line_then_a_newline_does_not_leave_a_blank_one() {
-        // **The whole reason wrapping is deferred.** Wrap-on-write moves to row 1 as the last
-        // character lands, and the newline then moves to row 2 — so a program printing exactly
-        // `cols` characters per line double-spaces. Every real terminal defers; the naive
-        // implementation is wrong in a way people see immediately.
+        // The reason wrapping is deferred: wrap-on-write double-spaces a program printing exactly
+        // `cols` characters per line.
         let mut g = Grid::new(4, 4);
         feed(&mut g, "abcd\r\nxy");
         assert_eq!(line(&g, 0), "abcd");
@@ -1535,10 +1122,6 @@ mod tests {
 
     #[test]
     fn a_line_feed_moves_down_and_leaves_the_column_alone() {
-        // **`LF` is index, not newline.** Returning to column 0 is `CR`'s job, which is why a
-        // program emits `\r\n`. Folding the two here would hide a producer's stairstepping
-        // bug rather than showing it — and translation is the *line discipline's* job
-        // (Unix `ONLCR`), which this system has a tty server for.
         let mut g = Grid::new(10, 3);
         feed(&mut g, "abc\ndef");
         assert_eq!(line(&g, 0), "abc");
@@ -1547,7 +1130,6 @@ mod tests {
 
     #[test]
     fn the_character_after_a_full_line_wraps() {
-        // The other half: deferring must not mean *not* wrapping.
         let mut g = Grid::new(4, 4);
         feed(&mut g, "abcde");
         assert_eq!(line(&g, 0), "abcd");
@@ -1557,9 +1139,6 @@ mod tests {
 
     #[test]
     fn a_wrapped_line_keeps_filling_rather_than_wrapping_every_character() {
-        // The test the wrap coverage was missing: it wrote one character past the margin and
-        // stopped, so a stale pending flag — which makes every subsequent character wrap —
-        // looked identical. A paragraph would have descended one line per character.
         let mut g = Grid::new(4, 4);
         feed(&mut g, "abcdefg");
         assert_eq!(line(&g, 0), "abcd");
@@ -1577,9 +1156,6 @@ mod tests {
 
     #[test]
     fn movement_cancels_a_pending_wrap() {
-        // A pending wrap belongs to the character that set it. Any explicit movement replaces
-        // that position, so the flag must not survive — or a `\r` after a full line would
-        // still wrap the next character to row 1.
         let mut g = Grid::new(4, 4);
         feed(&mut g, "abcd\rZ");
         assert_eq!(line(&g, 0), "Zbcd");
@@ -1592,9 +1168,6 @@ mod tests {
 
     #[test]
     fn a_newline_at_the_bottom_scrolls_and_the_line_goes_to_scrollback() {
-        // Three characters into four columns, deliberately: "three" would have wrapped and
-        // scrolled a second time, which is a different thing from what this test is about and
-        // is what the first version of it accidentally measured.
         let mut g = Grid::new(4, 2);
         feed(&mut g, "one\r\ntwo\r\nsix");
         assert_eq!(line(&g, 0), "two");
@@ -1606,9 +1179,6 @@ mod tests {
 
     #[test]
     fn scrollback_is_bounded() {
-        // A program that prints forever must cost a bounded amount. Sized small here and
-        // driven past it, because a ring that never evicts passes every test that only fills
-        // it partway.
         let mut g = Grid::new(4, 1);
         for i in 0..(SCROLLBACK + 50) {
             feed(&mut g, &alloc::format!("{}\r\n", i % 10));
@@ -1618,13 +1188,12 @@ mod tests {
 
     #[test]
     fn a_scrolled_back_view_reads_from_the_scrollback_and_the_screen_at_once() {
-        // The seam. A viewport straddling the boundary must serve its top rows from history
-        // and its bottom rows from the live screen, and the two halves are stored differently.
+        // The seam: a viewport straddling the boundary serves top rows from history, bottom
+        // rows from the screen, which are stored differently.
         let mut g = Grid::new(4, 2);
         for i in 0..6 {
             feed(&mut g, &alloc::format!("{i}\r\n"));
         }
-        // Six lines produced on a two-row screen: lines 0..4 are history, 4..6 on screen.
         assert_eq!(g.top_line(), 5, "five lines scrolled off");
         assert_eq!(g.oldest_line(), 0, "and none evicted");
 
@@ -1636,9 +1205,6 @@ mod tests {
 
     #[test]
     fn the_view_is_anchored_to_a_line_so_output_does_not_drag_it() {
-        // **Why the anchor is an absolute line number.** A view expressed as "n lines above
-        // the bottom" shows different text every time a line arrives — the reader's page
-        // creeping upward exactly while they are trying to read it.
         let mut g = Grid::new(4, 2);
         for i in 0..6 {
             feed(&mut g, &alloc::format!("{i}\r\n"));
@@ -1655,8 +1221,6 @@ mod tests {
 
     #[test]
     fn an_anchor_the_scrollback_has_evicted_clamps_to_the_oldest_line_kept() {
-        // The bounded ring drops the oldest line, so an anchor that was valid stops being so.
-        // Clamping is what a real terminal does; the alternative is a viewport of blanks.
         let mut g = Grid::new(4, 1);
         for i in 0..(SCROLLBACK + 50) {
             feed(&mut g, &alloc::format!("{}\r\n", i % 10));
@@ -1669,17 +1233,14 @@ mod tests {
 
     #[test]
     fn the_cursor_is_not_in_a_view_scrolled_away_from_it() {
-        // Scrolling back does not move the cursor. A render that drew it at its *screen* row
-        // regardless would invert a cell of somebody's history, several screens above where
-        // the cursor really is.
+        // Scrolling back does not move the cursor; drawing it at its screen row would invert
+        // a cell of history.
         let mut g = Grid::new(4, 2);
         for i in 0..6 {
             feed(&mut g, &alloc::format!("{i}\r\n"));
         }
         assert_eq!(g.cursor(), (1, 0));
         assert_eq!(g.view_cursor(g.top_line()), Some((1, 0)), "following: where it always was");
-        // One line back: the cursor's line is 6, the viewport covers 4 and 5 — just below it,
-        // which is the boundary case a `<=` here would get wrong.
         assert_eq!(g.view_cursor(4), None, "one row past the bottom is still out of view");
         assert_eq!(g.view_cursor(5), Some((1, 0)), "and the row before it is the last in view");
         assert_eq!(g.view_cursor(0), None, "scrolled to the top: nowhere near it");
@@ -1687,17 +1248,13 @@ mod tests {
 
     #[test]
     fn cursor_addressing_clamps_and_never_scrolls() {
-        // A program that addresses row 999 gets the last row. Scrolling instead would move the
-        // screen under a program that was only trying to position a cursor.
         let mut g = Grid::new(10, 3);
         feed(&mut g, "\x1b[99;99H");
         assert_eq!(g.cursor(), (2, 9));
         assert_eq!(g.scrollback().len(), 0, "addressing the cursor scrolled the screen");
 
-        // **One past the end, not far past it.** `99` on a 3-row grid clamps to 2 *and*
-        // wraps to 2 (`98 % 3`), so it cannot tell clamping from a modulo — which a break-test
-        // proved by leaving this assertion green. Row 4 (zero-based 3) separates them: clamp
-        // gives 2, modulo gives 0.
+        // One past the end, not far past: `99` clamps to 2 and `98 % 3` is also 2, so only row 4
+        // separates clamping from a modulo.
         let mut g = Grid::new(10, 3);
         feed(&mut g, "\x1b[4;11H");
         assert_eq!(g.cursor(), (2, 9), "the cursor wrapped instead of clamping");
@@ -1715,7 +1272,6 @@ mod tests {
 
     #[test]
     fn backspace_stops_at_the_left_margin() {
-        // Wrapping to the previous line would let a program erase text it never wrote.
         let mut g = Grid::new(4, 2);
         feed(&mut g, "ab\r\n\x08\x08\x08");
         assert_eq!(g.cursor(), (1, 0));
@@ -1728,7 +1284,6 @@ mod tests {
         assert_eq!(g.cursor(), (0, TAB_WIDTH));
         feed(&mut g, "\t");
         assert_eq!(g.cursor(), (0, TAB_WIDTH * 2));
-        // Against the right edge it stops rather than wrapping.
         let mut g = Grid::new(10, 2);
         feed(&mut g, "\t\t\t\t");
         assert_eq!(g.cursor(), (0, 9));
@@ -1736,10 +1291,6 @@ mod tests {
 
     #[test]
     fn erasing_fills_with_the_current_background_not_the_default() {
-        // **The A2 gap this part was expected to force.** `ED`/`EL` after `SGR 44` fill blue —
-        // it is how a program paints a coloured region — and `Cell::BLANK` cannot express that.
-        // A2's `BLANK` is still right for a *never-written* cell; what was missing is that an
-        // erased one is a different thing.
         let mut g = Grid::new(4, 2);
         feed(&mut g, "\x1b[44m\x1b[2K");
         for c in 0..4 {
@@ -1751,8 +1302,6 @@ mod tests {
 
     #[test]
     fn an_erased_cell_carries_no_ink_attributes() {
-        // A space has nothing to embolden or underline, and carrying those would make a later
-        // reverse repaint a region that looks erased.
         let mut g = Grid::new(4, 2);
         feed(&mut g, "\x1b[1;4;44m\x1b[2K");
         let cell = g.cell(0, 0).unwrap();
@@ -1763,14 +1312,8 @@ mod tests {
 
     #[test]
     fn erasing_while_reversed_fills_with_the_foreground() {
-        // **`blank()` keeps `REVERSE` while dropping `BOLD` and `UNDERLINE`**, and that
-        // retention is the whole of "reverse, erase line paints a solid bar". It was documented
-        // in three places and asserted in none: adding `.without(Flags::REVERSE)` — deleting the
-        // behaviour outright — left every test green (PR #190 review, finding 4).
-        //
-        // Worse than an ordinary gap, because `blank()`'s own summary reads "a space in the
-        // current background, with nothing else set" — so a reader tidying the flags to match
-        // the summary would break a documented behaviour and see a passing suite.
+        // `blank()` keeps `REVERSE` and drops `BOLD`/`UNDERLINE`: that retention is what makes
+        // "reverse, erase line" paint a bar, and removing it would otherwise leave tests green.
         let p = crate::cell::Palette::default();
         let mut g = Grid::new(4, 1);
         feed(&mut g, "\x1b[7m\x1b[2K");
@@ -1778,8 +1321,6 @@ mod tests {
         assert_eq!(bg, p.foreground, "an erase under reverse did not paint a bar");
         assert_eq!(fg, p.background);
 
-        // And without reverse it is the ordinary background, or the assertion above would hold
-        // for any erase at all.
         let mut g = Grid::new(4, 1);
         feed(&mut g, "\x1b[2K");
         assert_eq!(g.cell(0, 0).unwrap().attrs.resolve(&p).1, p.background);
@@ -1817,8 +1358,6 @@ mod tests {
 
     #[test]
     fn clearing_the_screen_does_not_push_it_into_scrollback() {
-        // `Ctrl-L` clears and leaves history alone. A version that scrolled would fill
-        // someone's scrollback with blank lines every time they cleared.
         let mut g = Grid::new(4, 3);
         feed(&mut g, "aaaa\r\nbbbb\x1b[2J");
         assert_eq!(g.scrollback().len(), 0);
@@ -1839,8 +1378,6 @@ mod tests {
 
     #[test]
     fn a_character_carries_the_attributes_in_force_when_it_was_written() {
-        // Attributes are per-cell, not per-screen: changing them later must not recolour text
-        // already on the grid.
         let mut g = Grid::new(4, 2);
         feed(&mut g, "\x1b[31ma\x1b[32mb");
         assert_eq!(g.cell(0, 0).unwrap().attrs.fg, Colour::Ansi(Ansi::Red));
@@ -1856,16 +1393,12 @@ mod tests {
         assert_eq!(g.take_damage(), alloc::vec![2], "only the written row should be dirty");
         assert_eq!(g.take_damage(), alloc::vec![], "damage was not cleared");
 
-        // Writing where the cursor already is stays one row; it is *moving* that costs two, and
-        // that is what the two tests below are about.
         feed(&mut g, "y");
         assert_eq!(g.take_damage(), alloc::vec![2]);
     }
 
     #[test]
     fn a_scroll_damages_every_row() {
-        // Everything moved. A grid that reported only the bottom row here would leave the
-        // screen showing the pre-scroll contents everywhere else.
         let mut g = Grid::new(4, 3);
         feed(&mut g, "a\r\nb\r\nc");
         g.take_damage();
@@ -1875,16 +1408,12 @@ mod tests {
 
     #[test]
     fn erasing_the_display_damages_every_row_it_touched() {
-        // `ED` writes to rows the cursor is not on, so reporting the cursor's row alone would
-        // leave the rest of the screen showing what was erased. Caught by a break-test: the
-        // extent test above asserts *contents* and says nothing about damage.
         let mut g = Grid::new(4, 3);
         feed(&mut g, "aaaa\r\nbbbb\r\ncccc");
         g.take_damage();
         feed(&mut g, "\x1b[2J");
         assert_eq!(g.take_damage(), alloc::vec![0, 1, 2]);
 
-        // And the partial forms too — `ED 0` from the middle of row 1 touches rows 1 and 2.
         let mut g = Grid::new(4, 3);
         feed(&mut g, "aaaa\r\nbbbb\r\ncccc\x1b[2;3H");
         g.take_damage();
@@ -1895,30 +1424,23 @@ mod tests {
 
     #[test]
     fn moving_the_cursor_damages_the_row_it_left_and_the_one_it_reached() {
-        // **This test used to assert the opposite**, on the rationale that the render draws the
-        // cursor over whatever cell it sits on — which would hold if it were a separate overlay
-        // pass. A5 paints it *into* the cell, so the row the cursor left keeps an inverted
-        // block until something repaints it (PR #190 review, finding 1).
+        // The render paints the cursor into its cell, so the row it left keeps an inverted block
+        // until repainted.
         let mut g = Grid::new(10, 4);
         g.take_damage();
         feed(&mut g, "\x1b[2;5H");
         assert_eq!(g.take_damage(), alloc::vec![0, 1], "left row 0, arrived in row 1");
 
-        // Within one row, one row.
         feed(&mut g, "\x1b[C");
         assert_eq!(g.take_damage(), alloc::vec![1]);
 
-        // And a cursor that did not move damages nothing, which is what keeps a still screen
-        // free.
         assert_eq!(g.take_damage(), alloc::vec![]);
     }
 
     #[test]
     fn a_wrap_damages_the_row_the_cursor_left() {
-        // The ordinary print path, no cursor keys involved: `abcd` rests the cursor on the last
-        // column of row 0 (inverted), and `e` wraps it to row 1. Reporting only row 1 leaves a
-        // phantom block at the end of row 0 — one per line of any paragraph reaching the
-        // margin.
+        // `abcd` rests the cursor on the last column and `e` wraps it; reporting only row 1 would
+        // leave a phantom block at the end of row 0.
         let mut g = Grid::new(4, 3);
         feed(&mut g, "abcd");
         g.take_damage();
@@ -1928,8 +1450,6 @@ mod tests {
 
     #[test]
     fn a_degenerate_size_is_clamped_rather_than_panicking() {
-        // `Grid::new(0, 0)` has no valid cursor position, and every operation would need a
-        // special case for a screen that cannot hold anything.
         let mut g = Grid::new(0, 0);
         feed(&mut g, "abc\r\n\x1b[9;9H\x1b[2J");
         assert_eq!(g.cols(), 1);
@@ -1937,16 +1457,12 @@ mod tests {
         assert_eq!(g.cursor(), (0, 0));
     }
 
-    // --- selection (M12 Part E) ---------------------------------------------
-
     #[test]
     fn a_press_selects_nothing_until_it_is_dragged() {
         let mut g = Grid::new(20, 4);
         feed(&mut g, "hello world");
         g.select_from(0, 0);
         assert!(g.selection().is_some(), "the gesture is in progress");
-        // **A click is not a one-character selection.** The range is half-open at the head, so
-        // a press with no motion covers no cells at all.
         assert_eq!(g.selected_text(), None);
         g.extend(0, 5);
         assert_eq!(g.selected_text().as_deref(), Some("hello"));
@@ -1954,8 +1470,6 @@ mod tests {
 
     #[test]
     fn dragging_backwards_selects_the_same_text() {
-        // The anchor is where the button went down, and it may be *after* the head. A stored
-        // (start, end) range would need normalising at every write instead of every read.
         let mut g = Grid::new(20, 4);
         feed(&mut g, "hello world");
         g.select_from(0, 5);
@@ -1974,9 +1488,8 @@ mod tests {
 
     #[test]
     fn a_soft_wrap_does_not_become_a_newline() {
-        // **The distinction the whole rewrap rests on, seen from the other side.** A line that
-        // ran past the right margin is one line of text the terminal broke; pasting it with a
-        // newline in the middle inserts a break the program never wrote.
+        // A soft wrap is one line of text, and pasting it with a newline inserts a break the
+        // program never wrote.
         let mut g = Grid::new(4, 4);
         feed(&mut g, "abcdefgh");
         assert!(g.row_wrapped(0), "precondition: the first row is a soft wrap");
@@ -1987,8 +1500,8 @@ mod tests {
 
     #[test]
     fn trailing_blanks_are_not_selected() {
-        // A grid is a rectangle; the cells past the end of a line were never written. Keeping
-        // them would paste a screen's width of spaces after every line.
+        // Cells past the end of a line were never written; keeping them pastes a screen's width
+        // of spaces.
         let mut g = Grid::new(20, 4);
         feed(&mut g, "hi\r\nthere");
         g.select_from(0, 0);
@@ -1998,9 +1511,7 @@ mod tests {
 
     #[test]
     fn a_selection_in_the_history_names_the_same_text_as_output_arrives() {
-        // **Absolute positions, for the viewport anchor's reason.** Screen-relative ones would
-        // slide up a row per line printed, so a selection made in the history would drift under
-        // the person who made it while a program was still writing.
+        // Absolute positions, so a selection in the history does not drift while output arrives.
         let mut g = Grid::new(20, 2);
         feed(&mut g, "first\r\nsecond\r\nthird\r\n");
         let top = g.top_line();
@@ -2017,14 +1528,9 @@ mod tests {
 
     #[test]
     fn a_selection_survives_a_rewrap() {
-        // **The question M12 Part E names, tested where the two answers differ.** A logical
-        // line's *text* is invariant across a rewrap, so a selection expressed as an offset
-        // into one survives; a selection expressed as a row and a column does not, because
-        // re-breaking a paragraph moves a character across rows as well as down them.
-        //
-        // "abcdefgh" at width 4 is two rows; at width 3 it is three. The word "defg" begins in
-        // row 1 at width 4 and in row 1 at width 3 — at a *different column* — which is exactly
-        // what `map_position` exists to follow and what `map_line` alone cannot.
+        // A logical line's text is invariant across a rewrap, so an offset into it survives. At
+        // width 3 "defg" sits in row 1 at a different column than at width 4, which
+        // `map_position` follows and `map_line` alone cannot.
         let mut g = Grid::new(4, 4);
         feed(&mut g, "abcdefgh");
         g.select_from(0, 3);
@@ -2040,8 +1546,6 @@ mod tests {
 
     #[test]
     fn clearing_a_selection_that_is_not_there_damages_nothing() {
-        // The return value *is* the repaint. A `clear` that damaged unconditionally would
-        // repaint every row of the grid on every keystroke.
         let mut g = Grid::new(20, 4);
         feed(&mut g, "hello");
         let _ = g.take_damage();
@@ -2056,8 +1560,6 @@ mod tests {
 
     #[test]
     fn extending_without_an_anchor_selects_nothing() {
-        // A terminal is delivered motion whether or not a button is held. This is what keeps
-        // the pointer merely crossing the grid from selecting.
         let mut g = Grid::new(20, 4);
         feed(&mut g, "hello");
         g.extend(0, 3);
@@ -2067,8 +1569,6 @@ mod tests {
 
     #[test]
     fn a_selection_reaching_past_the_history_stops_at_what_exists() {
-        // The scrollback is a ring, so an anchor can name a line that has been evicted. Total
-        // rather than panicking, for `view_cell`'s reason.
         let mut g = Grid::new(10, 2);
         for i in 0..(SCROLLBACK + 10) {
             feed(&mut g, "x\r\n");
@@ -2076,31 +1576,23 @@ mod tests {
         }
         g.select_from(0, 0);
         g.extend(2, 1);
-        // Whatever comes back, it came back — the point is that asking did not panic.
         let _ = g.selected_text();
     }
-    /// `has_selection` agrees with `selected_text().is_some()` in every state, including the one
-    /// they could disagree in.
-    ///
-    /// **The empty range is the whole point.** A press with no drag leaves `selection()` as
-    /// `Some` covering nothing, so the obvious cheap spelling — `selection().is_some()` — would
-    /// say a menu row is available for a gesture that yields no text.
+    /// `has_selection` agrees with `selected_text().is_some()` in every state. An empty range
+    /// is the case they could disagree in.
     #[test]
     fn has_selection_is_the_cheap_half_of_selected_text() {
         let mut g = Grid::new(20, 4);
         feed(&mut g, "hello world");
         assert!(!g.has_selection(), "nothing swept out");
         assert_eq!(g.selected_text(), None);
-        // A press and no drag: a gesture is in progress and covers nothing.
         g.select_from(0, 3);
         assert_eq!(g.selected_text(), None, "a press selects no text");
         assert!(!g.has_selection(), "…and this must agree, which selection().is_some() would not");
         assert!(g.selection().is_some(), "the range does exist — that is the trap");
-        // A drag: both say yes.
         g.extend(0, 8);
         assert!(g.selected_text().is_some());
         assert!(g.has_selection());
-        // Cleared: both say no again.
         g.clear_selection();
         assert_eq!(g.selected_text(), None);
         assert!(!g.has_selection());

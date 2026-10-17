@@ -1,28 +1,23 @@
 //! The [`ThreadArgs`] thread-creation ABI block.
 //!
-//! `ThreadArgs` crosses the kernel/userspace boundary: `sys_thread_create` reads
-//! one. It is **syscall-ABI** — passed by `UserPtr` to a syscall, self-pinned by the
-//! compile-time `size_of`/`offset_of` asserts below and `docs/spec/thread-args.md` —
-//! not a Tier-2 module-boundary layout, so it is *not* in the module ABI-version hash
-//! (`docs/spec/abi-version-hash.md`). Growing it (as the SysCaps slice did, filling
-//! the reserved block with the scheduling fields) is a pre-v1 syscall-ABI change.
+//! `ThreadArgs` crosses the kernel/userspace boundary: `sys_thread_create` reads one. It is
+//! **syscall-ABI** — passed by `UserPtr` to a syscall, self-pinned by the compile-time
+//! `size_of`/`offset_of` asserts below and `docs/spec/thread-args.md` — not a Tier-2
+//! module-boundary layout, so it is *not* in the module ABI-version hash
+//! (`docs/spec/abi-version-hash.md`). Growing it is a pre-v1 syscall-ABI change.
 //!
-//! `ThreadArgs` is arch-**neutral** (its `entry`/`user_sp` are just user VAs and
-//! `arg0` is opaque), so it lives here. The faulted-register snapshot a
-//! supervisor reads back — `RegisterValues` — *is* arch-specific (the register
-//! set differs per architecture), so it lives behind the arch boundary as
-//! `crate::arch::RegisterValues` (see `crate::arch::registers::ArchRegisters`),
-//! not here.
+//! `ThreadArgs` is arch-**neutral** (`entry`/`user_sp` are just user VAs, `arg0` is opaque).
+//! The faulted-register snapshot a supervisor reads back, `RegisterValues`, is arch-specific
+//! and lives behind the arch boundary as `crate::arch::RegisterValues` (see
+//! `crate::arch::registers::ArchRegisters`).
 
-/// The argument block `sys_thread_create` reads from userspace to start a new
-/// thread in the calling process.
+/// The argument block `sys_thread_create` reads from userspace to start a new thread in the
+/// calling process.
 ///
-/// The new thread begins executing at `entry` (ring 3) with `rsp = user_sp` and
-/// `rdx = arg0` (the Phase-1 register bootstrap). The caller owns the user stack:
-/// it allocates + maps a region (e.g. via `sys_memory_create` + `sys_memory_map`)
-/// and passes the **top** (stacks grow down) as `user_sp`. Both `entry` and
-/// `user_sp` must be canonical user addresses already mapped (X / W) in the
-/// calling process's address space.
+/// The new thread begins executing at `entry` (ring 3) with `rsp = user_sp` and `rcx = arg0`.
+/// The caller owns the user stack: it allocates + maps a region and passes the **top** (stacks
+/// grow down) as `user_sp`. Both `entry` and `user_sp` must be canonical user addresses already
+/// mapped (X / W) in the calling process's address space.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct ThreadArgs {

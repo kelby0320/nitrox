@@ -1,10 +1,6 @@
-//! `Meta::Unmount`, from `init`'s side (administration Part E.4): the request `init` sends each of
-//! its filesystem servers at shutdown, and the answer it reads back
-//! (`docs/spec/rsproto-wire-format.md` § Meta::Unmount).
-//!
-//! **Hand-built and hand-parsed**, as [`ready`](crate::ready) is: `userspace/init/CLAUDE.md` keeps
-//! `librsproto` out of init's build. The tests check the request with `librsproto`'s own decoder,
-//! and hand the parser what `fs-server-ext4` sends as well as what no correct server would.
+//! `Meta::Unmount`, from `init`'s side: the request sent each filesystem server at shutdown, and
+//! the answer read back (`docs/spec/rsproto-wire-format.md` § Meta::Unmount). **Hand-built and
+//! hand-parsed**, as [`ready`](crate::ready) is, to keep `librsproto` out of init's build.
 
 use crate::ready::{ERROR_BODY_LEN, FLAG_ERROR, HEADER_LEN, RS_MAGIC};
 
@@ -15,8 +11,7 @@ pub const RS_VERSION: u16 = 1;
 /// `RS_FLAG_REPLY`: set on an answer.
 pub const FLAG_REPLY: u32 = 1 << 0;
 
-/// Write a `Meta::Unmount` request, numbered `request_id`, at the front of `out`: an envelope and
-/// no body. Its length, or `None` if `out` is too short to hold it.
+/// Write a `Meta::Unmount` request (an envelope, no body) into `out`: its length, or `None`.
 pub fn request(out: &mut [u8], request_id: u64) -> Option<usize> {
     let out = out.get_mut(..HEADER_LEN)?;
     out.fill(0);
@@ -38,8 +33,7 @@ pub enum Answer<'a> {
     Unexpected,
 }
 
-/// Parse the rsproto message in an `IpcMsg`'s payload, already cut to the header's
-/// `payload_len`.
+/// Parse the rsproto message in an `IpcMsg`'s payload, already cut to the header's `payload_len`.
 pub fn answer(payload: &[u8]) -> Answer<'_> {
     let envelope = payload.len() >= HEADER_LEN && u32_at(payload, 0) == RS_MAGIC;
     if !envelope || u16_at(payload, 6) != OP_UNMOUNT {
@@ -77,8 +71,6 @@ mod tests {
     use librsproto::error::error_body;
     use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
-    /// **The request is what `fs-server-ext4` looks for**: `librsproto`'s own decoder reads an
-    /// `OP_UNMOUNT` that is not a reply, with the id `init` gave it.
     #[test]
     fn the_request_decodes_as_an_unmount() {
         let mut buf = [0xAAu8; 64];
@@ -91,8 +83,6 @@ mod tests {
         assert_eq!(request(&mut [0u8; HEADER_LEN - 1], 7), None, "too short to hold it");
     }
 
-    /// **The answers `fs-server-ext4` sends**, encoded as it encodes them: an empty reply, and an
-    /// error reply with its reason.
     #[test]
     fn a_servers_answers_parse() {
         let mut buf = [0u8; 256];
@@ -107,8 +97,6 @@ mod tests {
         assert_eq!(answer(&buf[..n]), Answer::Failed(why));
     }
 
-    /// **What no correct server sends is not taken for an answer**: a request echoed back, the
-    /// wrong op, a truncated envelope, and a failure whose body is cut short.
     #[test]
     fn anything_else_is_unexpected() {
         let mut buf = [0u8; 256];

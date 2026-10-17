@@ -4,10 +4,9 @@ use crate::*;
 
 /// How `irq_dispatcher!` binds the guard [`enter_interrupt`] returns.
 ///
-/// The distinction is the whole of rule 2. `enter_interrupt` opens the scope and its guard
-/// closes it on drop, so *when the guard drops* decides whether the handler body runs inside
-/// the scope or after it — and the three forms below are indistinguishable to a check that
-/// only asks whether the text `enter_interrupt` appears.
+/// *When the guard drops* decides whether the handler body runs inside the scope or after it,
+/// and the three forms below are indistinguishable to a check that only asks whether the text
+/// `enter_interrupt` appears.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ScopeBinding {
     /// `let name = …enter_interrupt();` — lives to the end of the block. Correct.
@@ -19,7 +18,6 @@ pub(crate) enum ScopeBinding {
     Temporary,
 }
 
-/// Classify the line in `irq_dispatcher!` that calls `enter_interrupt`.
 pub(crate) fn scope_binding(line: &str) -> ScopeBinding {
     let t = line.trim();
     let Some(rest) = t.strip_prefix("let ") else {
@@ -36,11 +34,10 @@ pub(crate) fn scope_binding(line: &str) -> ScopeBinding {
 
 /// How many naked entry stubs `check-irq-scope` expects to find.
 ///
-/// A count, because the check keys on a textual convention and a stub can leave its view
-/// without leaving the kernel — by being renamed, or moved out of `kernel/src/arch`. The
-/// emptiness guard below only fires at *zero*; this is what notices one going missing.
-/// Today: 6 in `idt.rs` (exception, page-fault, timer, TLB shootdown, reschedule IPI,
-/// device IRQ) + `syscall_entry`.
+/// A count, because a stub can leave the scan's view without leaving the kernel — by being
+/// renamed, or moved out of `kernel/src/arch`. The emptiness guard below only fires at *zero*.
+/// Today: 6 in `idt.rs` (exception, page-fault, timer, TLB shootdown, reschedule IPI, device
+/// IRQ) + `syscall_entry`.
 const EXPECTED_ENTRY_STUBS: usize = 7;
 
 /// `<name> = sym TARGET` operands that are deliberately **not** interrupt dispatchers.
@@ -55,61 +52,47 @@ const SYM_OPERAND_ALLOWLIST: &[&str] = &[
 
 /// `cargo xtask check-irq-scope` — every interrupt entry opens a lock-ordering scope.
 ///
-/// The kernel's lock-rank tracker (`kernel/src/libkern/lockrank.rs`) models interrupt
-/// context by having each handler start from an empty view of the held-rank stack, because
-/// the acquisition order genuinely restarts at an interrupt boundary — a tick that lands on
-/// a thread holding an allocator lock and takes `SCHED` is correct, and reads as an
-/// inversion otherwise. That is not a refinement: it is what makes the tracker sound, and
-/// getting it wrong is what got the first attempt withdrawn (decision log 2026-07-29).
+/// The kernel's lock-rank tracker (`kernel/src/libkern/lockrank.rs`) has each interrupt handler
+/// start from an empty view of the held-rank stack, because the acquisition order genuinely
+/// restarts at an interrupt boundary — a tick that lands on a thread holding an allocator lock
+/// and takes `SCHED` is correct, and reads as an inversion otherwise.
 ///
-/// A dispatcher that forgets the scope does not fail loudly. It just starts reporting
-/// phantom inversions from its own vector, days later, in whoever's boot log. So the scope
-/// is not left to the author of the next dispatcher:
+/// A dispatcher that forgets the scope does not fail loudly: it reports phantom inversions from
+/// its own vector, days later. So the scope is not left to the author of the next dispatcher:
 ///
 /// 1. every `dispatch = sym NAME` in a naked entry stub must name a function defined by the
 ///    `irq_dispatcher!` macro, which opens the scope itself; and
 /// 2. that macro must in fact still call `enter_interrupt` — otherwise rule 1 checks that
 ///    everyone went through a door that no longer leads anywhere.
 ///
-/// Arch-generic: it walks `kernel/src/arch`, so an aarch64 entry path is covered the day it
-/// exists rather than the day someone remembers this check.
+/// Arch-generic: it walks `kernel/src/arch`, so an aarch64 entry path is covered the day it exists.
 ///
 /// ## What it cannot see (the ESCAPES boundary)
 ///
-/// This is a textual scan, so its coverage is a convention rather than a proof. Three
-/// escapes are closed by construction — a guard bound to `_` or left as a temporary
-/// ([`ScopeBinding`]), a stub whose operand is renamed ([`SYM_OPERAND_ALLOWLIST`]), and a
-/// stub that leaves the scan's view entirely ([`EXPECTED_ENTRY_STUBS`]). Two are known and
-/// **not** closed, verified during the PR #202 review:
+/// This is a textual scan, so its coverage is a convention rather than a proof. Three escapes
+/// are closed by construction — a guard bound to `_` or left as a temporary ([`ScopeBinding`]),
+/// a stub whose operand is renamed ([`SYM_OPERAND_ALLOWLIST`]), and a stub that leaves the
+/// scan's view entirely ([`EXPECTED_ENTRY_STUBS`]). Two are **not** closed, and need an entry
+/// stub in a deliberately unusual shape:
 ///
 /// - A macro that puts the handler body *above* the `let` binding classifies as held and
 ///   passes. The classifier reads the binding form, not the ordering.
 /// - The count notices a stub going missing, not a new one arriving in a form the scan does
-///   not parse — a positional `sym` operand, say. Adding one is invisible to all three
-///   guards.
-///
-/// Both need someone writing an entry stub in a deliberately unusual shape, which is a
-/// different threat from the accident this gate exists to catch. Stated so the next reader
-/// knows where the line is rather than assuming there isn't one.
+///   not parse — a positional `sym` operand, say.
 pub(crate) fn cmd_check_irq_scope() -> R<()> {
     let arch_dir = repo_root().join("kernel").join("src").join("arch");
     // Dispatchers named by a naked stub, as (file:line, file, name).
     let mut called: Vec<(String, String, String)> = Vec::new();
     // Dispatchers the macro generated, as (file, name).
-    //
-    // **Per file, for the same reason as `user_entry` below.** Matched by name alone, a
-    // second architecture reusing an obvious name — `timer_dispatch`, `exception_dispatch` —
-    // would have its *unscoped* dispatcher exempted because x86_64 happens to generate one
-    // with that name. Demonstrated in the PR #202 review with a probe file, which passed
-    // green. The check advertises itself as arch-generic, so that is the live half of the
-    // escape rather than a hypothetical.
+    // **Per file, for the same reason as `user_entry` below.** Matched by name alone, a second
+    // architecture reusing an obvious name — `timer_dispatch`, `exception_dispatch` — would have
+    // its *unscoped* dispatcher exempted because x86_64 happens to generate one with that name.
     let mut generated: Vec<(String, String)> = Vec::new();
     // Dispatchers that are not interrupts and take the ring-3 entry discipline instead
     // (see `assert_user_entry_safe`): the order begins there rather than restarting.
     let mut user_entry: Vec<(String, String)> = Vec::new();
-    // `<name> = sym …` operands that are not the `dispatch` this check keys on. The operand
-    // name is a local choice in `naked_asm!`, so without this a stub leaves the check's view
-    // by being renamed — see § What it cannot see on `cmd_check_irq_scope`.
+    // `<name> = sym …` operands that are not the `dispatch` this check keys on; without this a
+    // stub leaves the check's view by being renamed.
     let mut stray_sym: Vec<(String, String)> = Vec::new();
     // Files that define the macro, and whether the definition still opens a scope.
     let mut macro_defs: Vec<(String, Option<ScopeBinding>)> = Vec::new();
@@ -129,12 +112,10 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
                 }
             }
 
-            // Any *other* `<ident> = sym` operand. Allowlisted by target, not by operand
-            // name, so renaming an operand cannot buy an exemption.
-            // Comment lines are skipped, as in the `assert_user_entry_safe` scan below and
-            // for the same reason: a doc comment quoting an operand is prose, not code.
-            // Whitespace is normalised first so `dispatch=sym` cannot slip past the
-            // convention by omitting the spaces.
+            // Any *other* `<ident> = sym` operand. Allowlisted by target, not by operand name, so
+            // renaming an operand cannot buy an exemption. Comment lines are skipped, as in
+            // `assert_user_entry_safe` below: a doc comment quoting an operand is prose.
+            // Whitespace is normalised first so `dispatch=sym` cannot slip past the convention.
             let normalised = line.replace("=sym", "= sym");
             if !trimmed.starts_with("//")
                 && !trimmed.starts_with("*")
@@ -193,7 +174,6 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
             }
 
             if trimmed.starts_with("macro_rules! irq_dispatcher") {
-                // The expansion is short; the scope call is within a few lines.
                 let end = (i + 12).min(lines.len());
                 let scope_line = lines[i..end].iter().find(|l| l.contains("enter_interrupt"));
                 macro_defs.push((format!("{}:{}", path.display(), i + 1), scope_line.map(|l| scope_binding(l))));
@@ -204,8 +184,7 @@ pub(crate) fn cmd_check_irq_scope() -> R<()> {
 
     let mut violations: Vec<String> = Vec::new();
 
-    // A check that silently finds nothing to check is worse than no check — it reads as a
-    // pass. (The `abi-sync-check` guard, for the same reason.)
+    // A check that silently finds nothing to check reads as a pass.
     if called.is_empty() {
         violations.push(
             "found no `dispatch = sym …` entry stubs under kernel/src/arch — either the \

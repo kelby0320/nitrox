@@ -1,10 +1,8 @@
 //! [`TypedRecord`] — mapping a Rust struct to a typed stream's schema + rows, so
 //! application code writes/reads structs directly instead of assembling `Value`s.
 //!
-//! In v1 the trait is **implemented by hand** (see the tests for the shape); the
-//! `#[derive(TypedRecord)]` procedural macro that generates these impls is a deferred
-//! follow-on. Either way it lowers to the dynamic [`Value`]/[`TableWriter`] API — the
-//! wire framing lives in one place.
+//! The trait is implemented by hand (see the tests for the shape); it lowers to the
+//! dynamic [`Value`]/[`TableWriter`] API.
 
 use alloc::vec::Vec;
 
@@ -12,13 +10,8 @@ use crate::table::{Item, TableReader, TableWriter};
 use crate::wire::{ByteSink, Result, Schema, StreamFlags, Value, WireError};
 
 /// A Rust type that maps to a typed stream: it declares a [`Schema`] and converts
-/// to/from a row of [`Value`]s (in schema order).
-///
-/// Manual impls (and the eventual derive) provide three things:
-/// - [`schema`](TypedRecord::schema) — the columns (names, types, modifiers);
-/// - [`to_values`](TypedRecord::to_values) — this record's field values, in order;
-/// - [`from_values`](TypedRecord::from_values) — rebuild from decoded values, erroring
-///   on a count/type mismatch (a stream whose schema differs from `Self`'s).
+/// to/from a row of [`Value`]s (in schema order). `from_values` errors on a count/type
+/// mismatch, i.e. a stream whose schema differs from `Self`'s.
 pub trait TypedRecord: Sized {
     /// The schema for this record type.
     fn schema() -> Schema;
@@ -44,10 +37,9 @@ impl<W: ByteSink> TableWriter<W> {
 }
 
 impl<'a> TableReader<'a> {
-    /// Read the next **data** record decoded as `T`. `None` at the terminator (end of
-    /// rows). An in-stream error record surfaces as [`WireError::StreamError`]; a decode
-    /// failure surfaces as its wire error. For streams that interleave error/data records
-    /// and need to distinguish them, iterate [`next`](TableReader::next) directly.
+    /// Read the next **data** record decoded as `T`. `None` at the terminator. An
+    /// in-stream error record surfaces as [`WireError::StreamError`]; to tell error and
+    /// data records apart, iterate [`next`](TableReader::next) directly.
     pub fn read_record<T: TypedRecord>(&mut self) -> Option<Result<T>> {
         Some(match self.next()? {
             Ok(Item::Row(values)) => T::from_values(&values),
@@ -65,8 +57,8 @@ mod tests {
     use alloc::string::String;
     use alloc::vec;
 
-    /// A hand-written `TypedRecord` — the pattern the derive macro will generate. Has a
-    /// nullable column (`note: Option<String>`) to exercise the presence-byte path.
+    /// A hand-written `TypedRecord` with a nullable column (`note`) to exercise the
+    /// presence-byte path.
     #[derive(Clone, PartialEq, Debug)]
     struct Beat {
         seq: u64,
@@ -139,10 +131,8 @@ mod tests {
 
     #[test]
     fn from_values_rejects_mismatch() {
-        // A `Str` where `seq` (Int) is expected.
         let bad = [Value::Str(String::from("x")), Value::Str(String::from("s")), Value::Bool(true), Value::Null];
         assert_eq!(Beat::from_values(&bad), Err(WireError::SchemaMismatch));
-        // Wrong field count.
         assert_eq!(Beat::from_values(&[Value::Int(1)]), Err(WireError::SchemaMismatch));
     }
 }

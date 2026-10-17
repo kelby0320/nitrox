@@ -1,28 +1,18 @@
 //! The [`Namespace`] kernel object — a per-process map from paths to resources.
 //!
-//! A namespace is an ordered set of **bindings** `{ path, target, rights }`;
-//! resolving a path is a **longest-prefix match** that yields the covering
-//! binding and the remaining *suffix*. It is the per-process name-resolution
-//! substrate that replaces a global VFS — see
-//! `docs/architecture/namespace-and-resource-servers.md` for the full model.
-//!
-//! This module is the slice-1 substrate: the object, the binding store, path
-//! validation, and the resolver. The `sys_ns_*` syscalls (Part C) and
-//! resource-server IPC-forwarding (slice 3) build on it. Slice-1 binding targets
-//! are **direct handles** (a bound `ObjectRef`); the `KernelServer`/`UserspaceServer`/`SubNamespace`
-//! target kinds — and a `BindingTarget` enum — arrive with slice 3.
+//! A namespace is an ordered set of **bindings** `{ path, target, rights }`; resolving a path
+//! is a **longest-prefix match** yielding the covering binding and the remaining *suffix*. See
+//! `docs/architecture/namespace-and-resource-servers.md`.
 //!
 //! ## Mutation discipline
 //!
-//! Unlike `Timer`/`IpcChannel` (touched by the scheduler, hence `UnsafeCell`
-//! under `SCHED`), a `Namespace` is touched only by the owning thread's syscalls.
-//! Its state lives behind a plain [`SpinLock`] at lock-rank 4 — the `AddressSpace`
-//! model (`kernel/docs/lock-ordering.md`). `bind` may allocate under that lock
-//! (rank 4 → the rank-6 allocator is a legal acquire order; the no-allocation rule
-//! is rank-1 `SCHED` only). **No `ObjectRef` is ever dropped while the lock is
-//! held** (a target's `Drop` could take a higher-rank lock — e.g. an `IpcChannel`
-//! endpoint closing takes `SCHED`): bind/unbind hand refs back to the caller to
-//! drop outside the lock; resolve clones (an atomic bump, never a drop).
+//! A `Namespace` is touched only by the owning thread's syscalls (unlike `Timer`/`IpcChannel`),
+//! so its state lives behind a plain [`SpinLock`] at lock-rank 4 — the `AddressSpace` model
+//! (`kernel/docs/lock-ordering.md`). `bind` may allocate under it (rank 4 → the rank-6
+//! allocator is legal). **No `ObjectRef` is ever dropped while the lock is held** (a target's
+//! `Drop` could take a higher-rank lock: an `IpcChannel` endpoint closing takes `SCHED`):
+//! bind/unbind hand refs back to the caller to drop outside the lock; resolve clones (an atomic
+//! bump, never a drop).
 
 use crate::libkern::handle::{
     KObjectType, NS_ENTRY_PATH_MAX, NS_KIND_DIRECT, NS_KIND_KERNEL, NS_KIND_MOUNT, NsEntry, Rights,
@@ -36,8 +26,6 @@ use crate::object::kernel_server::KernelServerId;
 /// Maximum namespace path length in bytes (see the design doc § Path grammar).
 pub const NS_PATH_MAX: usize = 1024;
 
-/// Capacity of each namespace's resolution cache (design doc § The lookup cache).
-/// Small and pre-reserved; resolution is a hot path, mutations are rare.
 const NS_CACHE_MAX: usize = 8;
 
 /// Why a namespace operation failed.
@@ -53,26 +41,16 @@ pub enum NsError {
     OutOfMemory,
 }
 
-/// Maximum length of a subtree base path (a userspace-server binding's scoping
-/// prefix), in bytes. Home-directory bases are short; this bound keeps
-/// [`SubtreeBase`] a small, `Copy`, allocation-free inline value that resolution can
-/// carry out without a heap copy or a drop hazard.
+/// Maximum length of a subtree base path, in bytes. Bases are short; the bound keeps
+/// [`SubtreeBase`] a small, `Copy`, allocation-free inline value.
 pub const NS_SUBTREE_BASE_MAX: usize = 128;
 
-/// A **subtree base path** attached to a userspace-server binding: the
-/// server-root-relative prefix the kernel prepends to every forwarded lookup's
-/// suffix, so the binding exposes only a *sub-tree* of the server (e.g. a session's
-/// `/home` bound to the fs-server with base `/home/alice` — a lookup of
-/// `/home/notes` reaches the server as `home/alice/notes`, and nothing above
-/// `/home/alice` is nameable). See
-/// `docs/architecture/namespace-and-resource-servers.md` § Subtree scoping.
-///
-/// Empty = no scoping (the whole server tree is exposed — the original behaviour).
-/// A small, `Copy`, allocation-free inline buffer: it owns no `ObjectRef`, so
-/// [`Namespace::resolve`] can copy it out from under the lock without an allocation
-/// or a drop hazard. The stored path is a validated absolute namespace path (leading
-/// `/`, no `.`/`..` — see [`validate_path`]); the leading `/` is stripped where the
-/// kernel prepends it to a server-relative suffix.
+/// A **subtree base path** attached to a userspace-server binding: the server-root-relative
+/// prefix the kernel prepends to every forwarded lookup's suffix, so the binding exposes only a
+/// *sub-tree* of the server (see `docs/architecture/namespace-and-resource-servers.md` §
+/// Subtree scoping). Empty = no scoping. A small, `Copy`, allocation-free buffer owning no
+/// `ObjectRef`, so [`Namespace::resolve`] can copy it out from under the lock; the stored path
+/// is a validated absolute path, its leading `/` stripped where the kernel prepends it.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct SubtreeBase {
     buf: [u8; NS_SUBTREE_BASE_MAX],
@@ -85,11 +63,8 @@ impl SubtreeBase {
         SubtreeBase { buf: [0u8; NS_SUBTREE_BASE_MAX], len: 0 }
     }
 
-    /// Build a base from an absolute namespace `path`. Validated like any binding
-    /// path (leading `/`, no `.`/`..`, no empty components — so a base can never
-    /// escape a subtree); root `/` is rejected (it scopes to nothing), and a path
-    /// longer than [`NS_SUBTREE_BASE_MAX`] is rejected. Returns [`NsError::InvalidPath`]
-    /// otherwise.
+    /// Build a base from an absolute namespace `path`, validated like any binding path (so it can
+    /// never escape a subtree); root `/` and a path over [`NS_SUBTREE_BASE_MAX`] are rejected.
     pub fn from_path(path: &[u8]) -> Result<Self, NsError> {
         validate_path(path)?;
         if path == b"/" || path.len() > NS_SUBTREE_BASE_MAX {
@@ -112,76 +87,56 @@ impl SubtreeBase {
     }
 }
 
-/// What a binding resolves to. One of three kinds: a **direct handle** (a bound
-/// `ObjectRef`, returned by a lookup directly), a **Kernel Server** (an in-kernel
-/// resource server the lookup calls to *produce* a handle — see
-/// [`crate::object::kernel_server`]), or a **Userspace Server** (a process reached
-/// over IPC; the lookup is forwarded to it — see
-/// [`crate::object::UserspaceServerReg`]). A userspace-server binding also carries a
-/// [`SubtreeBase`] (empty for a whole-tree mount).
-///
-/// Drop discipline (see "Mutation discipline"): `DirectHandle` and
-/// `UserspaceServer` each own an `ObjectRef` and must be dropped **outside** the
-/// namespace lock; `KernelServer` holds a `Copy` id and is drop-free. The
-/// `SubtreeBase` is `Copy` bytes — drop-free.
+/// What a binding resolves to: a **direct handle** (a bound `ObjectRef`), a **Kernel Server**
+/// (an in-kernel server the lookup calls to *produce* a handle) or a **Userspace Server** (a
+/// process reached over IPC; the lookup is forwarded) with a [`SubtreeBase`]. `DirectHandle`
+/// and `UserspaceServer` own an `ObjectRef` and must be dropped **outside** the namespace lock;
+/// `KernelServer` and `SubtreeBase` are `Copy` and drop-free.
 pub enum BindingTarget {
     /// A directly-bound resource. A lookup returns a clone of this handle.
     DirectHandle(ObjectRef),
     /// An in-kernel resource server, identified by its dispatch id.
     KernelServer(KernelServerId),
-    /// A userspace resource server, via its kernel registration record (the
-    /// kernel forwards the lookup to it over IPC), with an optional subtree base.
+    /// A userspace resource server via its kernel registration record, with a subtree base.
     UserspaceServer(ObjectRef, SubtreeBase),
 }
 
-/// The result of [`Namespace::resolve`] for the matched binding: the same three
-/// kinds as [`BindingTarget`], but the handle-owning cases carry a **cloned**
-/// `ObjectRef` (an atomic bump done under the lock) for the caller to own. The
-/// caller drops a `DirectHandle` / `UserspaceServer` **outside** the lock;
-/// `KernelServer` is drop-free.
+/// The result of [`Namespace::resolve`]: the kinds of [`BindingTarget`], the handle-owning cases
+/// carrying a **cloned** `ObjectRef` (an atomic bump) for the caller to drop **outside** the lock.
 pub enum ResolvedTarget {
     /// A cloned direct-handle resource, owned by the caller.
     DirectHandle(ObjectRef),
     /// An in-kernel resource server to dispatch to (id copied out).
     KernelServer(KernelServerId),
-    /// A cloned reference to a userspace server's registration, owned by the
-    /// caller (which forwards the lookup to it), plus the binding's [`SubtreeBase`]
-    /// (empty for a whole-tree mount) the caller prepends to the forwarded suffix.
+    /// A cloned reference to a userspace server's registration, plus the binding's [`SubtreeBase`]
+    /// the caller prepends to the forwarded suffix.
     UserspaceServer(ObjectRef, SubtreeBase),
 }
 
-/// One binding: the absolute path it owns, the target it resolves to, and the
-/// maximum rights a lookup through it may obtain.
 struct Binding {
     path: KVec<u8>,
     target: BindingTarget,
     rights: Rights,
 }
 
-/// A cached positive resolution: a fully looked-up `path` and the index of the
-/// `bindings` entry it resolved to. Holds **no** `ObjectRef` (so a cache flush is
-/// a byte-only `KVec` drop — never an `ObjectRef` drop under the lock). The index
-/// is valid because every binding mutation flushes the whole cache.
+/// A cached positive resolution: a `path` and the `bindings` index it resolved to. Holds **no**
+/// `ObjectRef`, so a flush never drops one under the lock; the index stays valid because every
+/// binding mutation flushes the whole cache.
 struct CacheEntry {
     path: KVec<u8>,
     binding_index: usize,
 }
 
 /// A per-process namespace kernel object.
-///
-/// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
 #[repr(C)]
 pub struct Namespace {
     header: KObjectHeader,
-    /// Self-check sentinel; a live object always reads [`Namespace::MAGIC`].
     magic: u64,
     inner: SpinLock<Inner>,
 }
 
 struct Inner {
     bindings: KVec<Binding>,
-    /// Bounded resolution cache (pre-reserved to [`NS_CACHE_MAX`]); flushed whole
-    /// on any binding mutation. A pure optimization — no semantic effect.
     cache: KVec<CacheEntry>,
 }
 
@@ -189,8 +144,7 @@ impl Namespace {
     /// Sentinel written into [`Namespace::magic`] at construction.
     pub const MAGIC: u64 = 0x4e_61_6d_65_73_70_63_21; // "Namespc!"
 
-    /// Allocate an empty namespace with a refcount of one. The resolution cache
-    /// is pre-reserved to [`NS_CACHE_MAX`] so cache inserts never need to grow it.
+    /// Allocate an empty namespace, refcount one, with the resolution cache pre-reserved.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
         let mut cache: KVec<CacheEntry> = KVec::new();
         cache.try_reserve(NS_CACHE_MAX)?;
@@ -206,11 +160,9 @@ impl Namespace {
         self.magic == Self::MAGIC
     }
 
-    /// Bind `target` (a direct handle) at `path` with `rights` (the maximum a
-    /// lookup through it may obtain). Rejects an invalid path or a duplicate exact
-    /// path; on any error the `target` is **handed back** in the tuple so the
-    /// caller drops it outside the lock (never dropped here — see "Mutation
-    /// discipline").
+    /// Bind `target` (a direct handle) at `path` with `rights` (the maximum a lookup through it
+    /// may obtain). On an invalid path or duplicate exact path, `target` is **handed back** so the
+    /// caller drops it outside the lock.
     pub fn bind(&self, path: &[u8], target: ObjectRef, rights: Rights) -> Result<(), (ObjectRef, NsError)> {
         if let Err(e) = validate_path(path) {
             return Err((target, e));
@@ -219,9 +171,8 @@ impl Namespace {
         if guard.bindings.iter().any(|b| &b.path[..] == path) {
             return Err((target, NsError::AlreadyBound));
         }
-        // Reserve the slot and copy the path BEFORE moving `target` into a
-        // `Binding`, so the committing `try_push` cannot fail (and therefore
-        // cannot drop the `Binding` — and its `ObjectRef` — under the lock).
+        // Reserve the slot and copy the path BEFORE moving `target` into a `Binding`, so the commit
+        // cannot fail and so cannot drop the `Binding` (and its `ObjectRef`) under the lock.
         if guard.bindings.try_reserve(1).is_err() {
             return Err((target, NsError::OutOfMemory));
         }
@@ -234,28 +185,19 @@ impl Namespace {
             .bindings
             .try_push(Binding { path: p, target: BindingTarget::DirectHandle(target), rights })
             .expect("slot reserved above");
-        // A mutation may change what any cached path resolves to; flush the whole
-        // cache (cheap: byte-only `KVec`s, no `ObjectRef` drops). Mutations are rare.
         guard.cache.clear();
         Ok(())
     }
 
-    /// Bind an in-kernel resource server (a [`KernelServerId`]) at `path` with
-    /// `rights` (the maximum a lookup through it may obtain). Like [`bind`], but
-    /// the target is a `Copy` dispatch id rather than a handle, so there is
-    /// nothing to hand back on error. Rejects an invalid path or a duplicate
-    /// exact path.
-    ///
-    /// [`bind`]: Namespace::bind
+    /// Bind an in-kernel resource server (a [`KernelServerId`]) at `path` with `rights`; like
+    /// [`bind`](Namespace::bind) but the target is a `Copy` id, so nothing is handed back.
     pub fn bind_kernel_server(&self, path: &[u8], id: KernelServerId, rights: Rights) -> Result<(), NsError> {
         validate_path(path)?;
         let mut guard = self.inner.lock();
         if guard.bindings.iter().any(|b| &b.path[..] == path) {
             return Err(NsError::AlreadyBound);
         }
-        // Reserve + copy the path before committing, so the `try_push` cannot fail
-        // (and so nothing is dropped under the lock — though a `KernelServer`
-        // binding holds no `ObjectRef` anyway).
+        // Reserve + copy the path before committing, so the `try_push` cannot fail.
         if guard.bindings.try_reserve(1).is_err() {
             return Err(NsError::OutOfMemory);
         }
@@ -271,17 +213,10 @@ impl Namespace {
         Ok(())
     }
 
-    /// Bind a userspace resource server (its kernel registration record `reg`, an
-    /// `ObjectRef` to a [`UserspaceServerReg`](crate::object::UserspaceServerReg))
-    /// at `path` with `rights`. Like [`bind`], but the target is a
-    /// `UserspaceServer`; on any error `reg` is **handed back** in the tuple for
-    /// the caller to drop outside the lock (never dropped here — see "Mutation
-    /// discipline"). Rejects an invalid path or a duplicate exact path.
-    ///
-    /// [`bind`]: Namespace::bind
-    /// `base` is the subtree scoping prefix ([`SubtreeBase::empty`] for a whole-tree
-    /// mount); a lookup's suffix is prepended with it before being forwarded to the
-    /// server (see [`SubtreeBase`]).
+    /// Bind a userspace resource server (its registration `reg`) at `path` with `rights`; like
+    /// [`bind`](Namespace::bind) but `reg` is **handed back** on error. `base` is the subtree
+    /// scoping prefix ([`SubtreeBase::empty`] for a whole-tree mount) prepended to a lookup's
+    /// suffix before it is forwarded.
     pub fn bind_userspace_server(
         &self,
         path: &[u8],
@@ -296,8 +231,7 @@ impl Namespace {
         if guard.bindings.iter().any(|b| &b.path[..] == path) {
             return Err((reg, NsError::AlreadyBound));
         }
-        // Reserve + copy the path before committing, so the `try_push` cannot fail
-        // (and so the `reg` `ObjectRef` is never dropped under the lock).
+        // Reserve + copy the path before committing, so `reg` is never dropped under the lock.
         if guard.bindings.try_reserve(1).is_err() {
             return Err((reg, NsError::OutOfMemory));
         }
@@ -313,42 +247,28 @@ impl Namespace {
         Ok(())
     }
 
-    /// Remove the binding at the exact `path`, returning its `target` for the
-    /// caller to drop **outside** the lock. `None` if nothing is bound there.
-    /// (A returned `DirectHandle` / `UserspaceServer` carries an `ObjectRef` to
-    /// drop; `KernelServer` is drop-free, but is still returned out for uniformity.)
+    /// Remove the binding at the exact `path`, returning its `target` for the caller to drop
+    /// **outside** the lock (it may carry an `ObjectRef`). `None` if nothing is bound there.
     pub fn unbind(&self, path: &[u8]) -> Option<BindingTarget> {
         let mut guard = self.inner.lock();
         let idx = guard.bindings.iter().position(|b| &b.path[..] == path)?;
-        // `remove` moves the `Binding` out by value (no drop). We move its
-        // `target` into the return; the rest (`path` bytes, `rights`) drops here —
-        // no `ObjectRef` among them, so the lock-held drop is harmless.
+        // `remove` moves the `Binding` out; `target` is returned, the rest holds no `ObjectRef`.
         let b = guard.bindings.remove(idx);
-        // Removing a binding shifts indices and changes resolutions; flush the
-        // whole cache (byte-only `KVec` drops, no `ObjectRef` drops).
         guard.cache.clear();
         Some(b.target)
     }
 
-    /// Resolve `path` by **longest-prefix match**. Returns the matched
-    /// [`ResolvedTarget`] (a **cloned** `ObjectRef` for a direct handle — an
-    /// atomic refcount bump under the lock — or the copied [`KernelServerId`] for
-    /// a kernel server), the binding's `rights`, and the `suffix` of `path` past
-    /// the matched prefix (leading `/` stripped; empty on an exact match). `None`
-    /// if no binding covers `path`.
+    /// Resolve `path` by **longest-prefix match**: the matched [`ResolvedTarget`] (a **cloned**
+    /// `ObjectRef` — an atomic bump under the lock — or the copied [`KernelServerId`]), the
+    /// binding's `rights`, and the `suffix` past the matched prefix (leading `/` stripped; empty on
+    /// an exact match). `None` if no binding covers `path`.
     ///
-    /// Pure resolution: the direct-handle leaf policy (a non-empty suffix on a
-    /// direct handle is *not found*), kernel-server dispatch, and rights
-    /// attenuation are the lookup syscall's job.
-    ///
-    /// Positive resolutions are cached (path → binding index); a repeat lookup of
-    /// the same path skips the longest-prefix scan. The cache is flushed on every
-    /// binding mutation, so a cached index always refers to the same binding.
+    /// Pure resolution: the direct-handle leaf policy, kernel-server dispatch and rights
+    /// attenuation are the lookup syscall's job. Positive resolutions are cached (path → binding
+    /// index); every binding mutation flushes the cache, so a cached index stays correct.
     pub fn resolve<'p>(&self, path: &'p [u8]) -> Option<(ResolvedTarget, Rights, &'p [u8])> {
         let mut guard = self.inner.lock();
 
-        // Cache fast path: an exact prior lookup of this path. The cached index is
-        // valid (mutations flush the cache), so recompute the suffix and return.
         if let Some(idx) = guard.cache.iter().find(|e| &e.path[..] == path).map(|e| e.binding_index) {
             let b = &guard.bindings[idx];
             let off =
@@ -356,14 +276,12 @@ impl Namespace {
             return Some((resolve_target(&b.target), b.rights, &path[off..]));
         }
 
-        // Cold path: longest-prefix scan over the bindings.
         let mut best: Option<(usize, usize)> = None; // (binding index, suffix offset)
         for (i, b) in guard.bindings.iter().enumerate() {
             let Some(off) = match_suffix_offset(&b.path, path) else {
                 continue;
             };
             match best {
-                // Keep the longer binding path (the more specific match).
                 Some((bi, _)) if guard.bindings[bi].path.len() >= b.path.len() => {}
                 _ => best = Some((i, off)),
             }
@@ -373,10 +291,8 @@ impl Namespace {
             let b = &guard.bindings[i];
             (resolve_target(&b.target), b.rights, &path[off..])
         };
-        // Insert into the cache (best-effort): copy the path, round-robin evict
-        // when full. A failed path copy just skips caching — no correctness effect.
-        // No `ObjectRef` is stored, so neither insert nor the evicting `remove(0)`
-        // drops one under the lock.
+        // Insert into the cache (best-effort): round-robin evict when full; a failed path copy just
+        // skips caching. No `ObjectRef` is stored, so nothing is dropped under the lock.
         let mut entry_path: KVec<u8> = KVec::new();
         if entry_path.try_extend_from_slice(path).is_ok() {
             if guard.cache.len() == NS_CACHE_MAX {
@@ -390,20 +306,14 @@ impl Namespace {
         Some(result)
     }
 
-    /// The number of live resolution-cache entries. Test-only observability.
     #[cfg(test)]
     pub(crate) fn cache_len(&self) -> usize {
         self.inner.lock().cache.len()
     }
 
-    /// Fill `out` with the `index`-th binding (insertion order): its path (truncated
-    /// to [`NS_ENTRY_PATH_MAX`], true length in `path_len`), target `kind`, and
-    /// `rights`. Returns `false` if `index` is past the binding count. Used by
-    /// `sys_ns_enumerate` to **list** a namespace's bindings (mount points + kernel
-    /// resources) — not a filesystem `readdir`. Snapshot-per-call: the result
-    /// reflects the bindings at the moment of the lock (stable post-boot). No
-    /// allocation under the lock (a fixed-buffer copy); the copy-out to user memory
-    /// happens in the caller, outside the lock.
+    /// Fill `out` with the `index`-th binding (insertion order): path (truncated to
+    /// [`NS_ENTRY_PATH_MAX`], true length in `path_len`), target `kind` and `rights`; `false` past
+    /// the count. For `sys_ns_enumerate`, not a filesystem `readdir`. No allocation under the lock.
     pub fn enumerate(&self, index: usize, out: &mut NsEntry) -> bool {
         let g = self.inner.lock();
         let Some(b) = g.bindings.get(index) else {
@@ -424,22 +334,18 @@ impl Namespace {
 
     /// A new namespace holding **a copy of every binding** in this one — `sys_ns_derive`.
     ///
-    /// **A snapshot, not a view.** The copy owns its own binding list, so a later bind or unbind
-    /// in either namespace does not reach the other. The *targets* are shared rather than
-    /// duplicated: a direct handle's object and a userspace server's registration each gain a
-    /// reference, and a kernel server's id is copied. So both namespaces resolve the same paths to
-    /// the same resources, and a registration stays alive while either one binds it. A binding's
-    /// subtree base and its rights are copied with it. The resolution cache is not: it is a pure
-    /// optimisation, and the copy starts with an empty one.
+    /// **A snapshot, not a view**: the copy owns its binding list, so a later bind or unbind in
+    /// either namespace does not reach the other. *Targets* are shared, not duplicated: a direct
+    /// handle's object and a userspace server's registration each gain a reference, and a kernel
+    /// server's id is copied. Subtree bases and rights are copied; the resolution cache is not.
     ///
     /// **The module's lock discipline, twice over.** Targets are cloned under this namespace's
-    /// lock, which is an atomic bump and never a drop. The copy is built in a list that outlives
-    /// the guard, so a failed allocation partway through drops the targets cloned so far only
-    /// *after* the lock is released. And the new namespace's lock is taken only to install the
-    /// finished list, never while this one's is held: both are rank 4.
+    /// lock (an atomic bump, never a drop); the copy is built in a list that outlives the guard, so
+    /// a failed allocation partway drops the targets cloned so far only *after* the lock is
+    /// released. The new namespace's lock is taken only to install the finished list, never while
+    /// this one's is held: both are rank 4.
     ///
-    /// Why it exists: a view is its caller's namespace plus a profile's grants, and a broker that
-    /// rebuilt a session from its ingredients would have to hold them all
+    /// A view is its caller's namespace plus a profile's grants
     /// (`docs/planning/administration.md` § *A view is your namespace plus a profile*).
     pub fn try_derive(&self) -> Result<KBox<Namespace>, AllocError> {
         let derived = Namespace::try_new()?;
@@ -449,24 +355,17 @@ impl Namespace {
             copy_bindings(&guard.bindings, &mut copied)
         };
         copy?;
-        // Swap rather than assign, so the empty list it replaces is dropped here, outside the
-        // new namespace's lock — it holds nothing, but the rule is simpler kept than argued.
+        // Swap rather than assign, so the empty list it replaces is dropped outside the new lock.
         core::mem::swap(&mut derived.inner.lock().bindings, &mut copied);
         Ok(derived)
     }
 }
 
-// No `Drop` impl: the `KBox` drop (run by `dispatch_destroy`, outside any lock)
-// drops `inner` → the `bindings` `KVec` → each `Binding`'s `target`
-// `BindingTarget`, releasing every bound resource (a `DirectHandle`'s `ObjectRef`;
-// a `KernelServer` id is drop-free). (`Namespace` auto-derives `Send`/`Sync`: all
-// fields are — `ObjectRef`/`KernelServerId` are `Send`/`Sync`, `SpinLock<T>: Sync`
-// for `T: Send`.)
+// No `Drop` impl: the `KBox` drop (run by `dispatch_destroy`, outside any lock) drops `inner`
+// and so each `Binding`'s target, releasing every bound resource.
 
-/// Validate a namespace path: non-empty, absolute (`/`-prefixed), ≤
-/// [`NS_PATH_MAX`], and — except for root `/` — every `/`-separated component
-/// non-empty and not `.`/`..`, with no trailing `/`. (Callers normalize; the
-/// kernel never interprets `.`/`..`, so path traversal cannot occur.)
+/// Validate a namespace path: non-empty, absolute, ≤ [`NS_PATH_MAX`], and — except for root —
+/// every component non-empty and not `.`/`..` (the kernel never interprets them), no trailing `/`.
 pub fn validate_path(path: &[u8]) -> Result<(), NsError> {
     if path.is_empty() || path.len() > NS_PATH_MAX || path[0] != b'/' {
         return Err(NsError::InvalidPath);
@@ -485,10 +384,8 @@ pub fn validate_path(path: &[u8]) -> Result<(), NsError> {
     Ok(())
 }
 
-/// Project a stored [`BindingTarget`] into a [`ResolvedTarget`] for return from
-/// [`Namespace::resolve`], **under the namespace lock**: a direct handle is
-/// `clone`d (an atomic refcount bump — never a drop), a kernel server's id is
-/// copied. Neither operation drops an `ObjectRef`, so it is safe to hold the lock.
+/// Project a stored [`BindingTarget`] into a [`ResolvedTarget`] **under the namespace lock**: a
+/// handle is `clone`d (an atomic bump), a kernel server's id copied; neither drops an `ObjectRef`.
 fn resolve_target(t: &BindingTarget) -> ResolvedTarget {
     match t {
         BindingTarget::DirectHandle(obj) => ResolvedTarget::DirectHandle(obj.clone()),
@@ -497,13 +394,12 @@ fn resolve_target(t: &BindingTarget) -> ResolvedTarget {
     }
 }
 
-/// Copy every binding in `from` onto the end of `into`, for [`Namespace::try_derive`]: each path's
-/// bytes, each target shared (a direct handle or a registration cloned, a kernel server's id
-/// copied), each subtree base and rights value as they are.
+/// Copy every binding in `from` onto the end of `into`, for [`Namespace::try_derive`]: targets
+/// shared (handle or registration cloned, kernel-server id copied), bases and rights as they are.
 ///
-/// **Called under the source's lock**, so it allocates (rank 4 → the rank-6 allocator is legal)
-/// and clones, and never drops a target. An `Err` leaves `into` holding the bindings copied so far,
-/// for the caller to drop once the lock is released.
+/// **Called under the source's lock**: it allocates and clones, and never drops a target. An
+/// `Err` leaves `into` holding the bindings copied so far, for the caller to drop once the lock
+/// is released.
 fn copy_bindings(from: &KVec<Binding>, into: &mut KVec<Binding>) -> Result<(), AllocError> {
     into.try_reserve(from.len())?;
     for b in from.iter() {
@@ -519,12 +415,10 @@ fn copy_bindings(from: &KVec<Binding>, into: &mut KVec<Binding>) -> Result<(), A
     Ok(())
 }
 
-/// If `binding` is a component-boundary prefix of the absolute `query`, return
-/// the byte offset in `query` where the suffix begins (past any boundary `/`);
-/// `None` otherwise. Root (`/`) matches every absolute query.
+/// If `binding` is a component-boundary prefix of the absolute `query`, the byte offset where
+/// the suffix begins (past any boundary `/`); `None` otherwise. Root matches every absolute query.
 fn match_suffix_offset(binding: &[u8], query: &[u8]) -> Option<usize> {
     if binding == b"/" {
-        // Suffix is everything after the leading '/'.
         return Some(1.min(query.len()));
     }
     if query.len() < binding.len() || &query[..binding.len()] != binding {
@@ -533,7 +427,6 @@ fn match_suffix_offset(binding: &[u8], query: &[u8]) -> Option<usize> {
     if query.len() == binding.len() {
         return Some(query.len()); // exact match → empty suffix
     }
-    // The prefix must end on a component boundary.
     if query[binding.len()] == b'/' {
         Some(binding.len() + 1) // skip the boundary '/'
     } else {
@@ -548,7 +441,6 @@ mod tests {
     use crate::object::Timer;
     use crate::object::header::test_probe;
 
-    /// A live `Timer`, adopted into an `ObjectRef`, to use as a bind target.
     fn target() -> ObjectRef {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         unsafe {
@@ -565,7 +457,6 @@ mod tests {
     fn enumerate_lists_bindings_in_order_with_kind() {
         use crate::object::kernel_server::KernelServerId;
         let n = ns();
-        // A DirectHandle binding, then a KernelServer binding (insertion order).
         n.bind(b"/store", target(), Rights::LOOKUP | Rights::INSPECT).unwrap();
         n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ).unwrap();
 
@@ -579,7 +470,6 @@ mod tests {
         assert_eq!(&e.path[..e.path_len as usize], b"/dev/entropy");
         assert_eq!(e.kind, NS_KIND_KERNEL);
 
-        // Past the last binding → false (the iteration terminator).
         assert!(!n.enumerate(2, &mut e));
     }
 
@@ -607,11 +497,9 @@ mod tests {
     fn bind_rejects_invalid_and_duplicate() {
         let n = ns();
         assert!(n.bind(b"/dev", target(), Rights::LOOKUP).is_ok());
-        // Invalid path: target handed back.
         let (t, e) = n.bind(b"bad", target(), Rights::LOOKUP).unwrap_err();
         assert_eq!(e, NsError::InvalidPath);
         drop(t);
-        // Duplicate exact path: target handed back.
         let (t, e) = n.bind(b"/dev", target(), Rights::LOOKUP).unwrap_err();
         assert_eq!(e, NsError::AlreadyBound);
         drop(t);
@@ -624,7 +512,6 @@ mod tests {
         let t = n.unbind(b"/dev").expect("was bound");
         drop(t); // released outside the lock
         assert!(n.unbind(b"/dev").is_none(), "already removed");
-        // Re-bind now succeeds.
         assert!(n.bind(b"/dev", target(), Rights::LOOKUP).is_ok());
     }
 
@@ -635,13 +522,10 @@ mod tests {
         n.bind(b"/dev/log", target(), Rights::LOOKUP | Rights::INSPECT).unwrap();
         n.bind(b"/store", target(), Rights::LOOKUP).unwrap();
 
-        // Exact match → empty suffix.
         let (_, _, suf) = n.resolve(b"/store").unwrap();
         assert_eq!(suf, b"");
-        // Prefix match → suffix past the boundary.
         let (_, _, suf) = n.resolve(b"/dev/tty0").unwrap();
         assert_eq!(suf, b"tty0");
-        // Longest of several: /dev/log wins for /dev/log (and carries its rights).
         let (_, rights, suf) = n.resolve(b"/dev/log").unwrap();
         assert_eq!(suf, b"");
         assert_eq!(rights, Rights::LOOKUP | Rights::INSPECT);
@@ -654,19 +538,16 @@ mod tests {
         n.bind(b"/dev/log", target(), Rights::LOOKUP | Rights::INSPECT).unwrap();
         assert_eq!(n.cache_len(), 0, "bind leaves the cache empty");
 
-        // A cold resolve caches the path; a repeat is a cache hit (same result).
         let (_, r0, s0) = n.resolve(b"/dev/log").unwrap();
         assert_eq!(n.cache_len(), 1);
         let (_, r1, s1) = n.resolve(b"/dev/log").unwrap();
         assert_eq!(n.cache_len(), 1, "repeat lookup reuses the entry");
         assert_eq!((r0, s0), (r1, s1), "cache hit matches the cold resolve");
 
-        // A prefix lookup caches a distinct entry.
         let (_, _, suf) = n.resolve(b"/dev/tty0").unwrap();
         assert_eq!(suf, b"tty0");
         assert_eq!(n.cache_len(), 2);
 
-        // Any mutation flushes the whole cache.
         n.bind(b"/store", target(), Rights::LOOKUP).unwrap();
         assert_eq!(n.cache_len(), 0, "bind flushes the cache");
         n.resolve(b"/store").unwrap();
@@ -680,7 +561,6 @@ mod tests {
     fn cache_evicts_at_capacity() {
         let n = ns();
         n.bind(b"/dev", target(), Rights::LOOKUP).unwrap();
-        // Resolve more distinct paths than the cache holds; it caps at NS_CACHE_MAX.
         for i in 0..(NS_CACHE_MAX as u8 + 4) {
             let path = [b'/', b'd', b'e', b'v', b'/', b'a' + i];
             let (_, _, suf) = n.resolve(&path).unwrap();
@@ -693,9 +573,7 @@ mod tests {
     fn resolve_respects_component_boundary_and_misses() {
         let n = ns();
         n.bind(b"/dev", target(), Rights::LOOKUP).unwrap();
-        // `/dev` must NOT match `/devices` (not a component boundary).
         assert!(n.resolve(b"/devices").is_none());
-        // Nothing covers `/net`.
         assert!(n.resolve(b"/net/x").is_none());
     }
 
@@ -719,8 +597,6 @@ mod tests {
             n.bind(b"/dev", target(), Rights::LOOKUP).unwrap();
             let (t, _, _) = n.resolve(b"/dev").unwrap();
             resolved = t; // a cloned ref — keeps the Timer alive
-            // Drop the namespace (KBox): its binding's target ref is released,
-            // but `resolved` still holds one, so the Timer is NOT destroyed yet.
             drop(n);
         }
         assert_eq!(test_probe::timer_destroys(), 0, "still pinned by the clone");
@@ -732,7 +608,6 @@ mod tests {
     fn dropping_namespace_frees_all_targets() {
         init_global_heap();
         test_probe::reset();
-        // 8 build/drop cycles, 3 bindings each — a leak would show in the count.
         for _ in 0..8 {
             let n = Namespace::try_new().unwrap();
             n.bind(b"/a", target(), Rights::LOOKUP).unwrap();
@@ -747,10 +622,6 @@ mod tests {
     fn dropping_last_objectref_routes_through_dispatch_destroy() {
         init_global_heap();
         test_probe::reset();
-        // Adopt the namespace into an `ObjectRef` — the path a real handle
-        // release takes — and drop it. The last reference runs
-        // `dispatch_destroy`'s `Namespace` arm, which frees the `KBox` and
-        // cascades to the two bound targets.
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let r = unsafe {
             ObjectRef::from_raw(
@@ -758,7 +629,6 @@ mod tests {
                 KObjectType::Namespace,
             )
         };
-        // Reach the object through the ref to populate it.
         {
             // SAFETY: `r` holds a live reference to a `Namespace`.
             let ns: &Namespace = unsafe { &*(r.as_ptr() as *const Namespace) };
@@ -775,7 +645,6 @@ mod tests {
     fn bind_kernel_server_resolves_to_the_id() {
         let n = ns();
         n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ).unwrap();
-        // Exact match → empty suffix, the kernel-server target, its rights.
         let (target, rights, suf) = n.resolve(b"/dev/entropy").unwrap();
         assert_eq!(suf, b"");
         assert_eq!(rights, Rights::READ);
@@ -785,8 +654,6 @@ mod tests {
                 panic!("expected a kernel-server target")
             }
         }
-        // A deeper path resolves to the same server with a non-empty suffix (the
-        // leaf-vs-subtree decision is the lookup syscall's, not resolve's).
         let (target, _, suf) = n.resolve(b"/dev/entropy/x").unwrap();
         assert_eq!(suf, b"x");
         assert!(matches!(target, ResolvedTarget::KernelServer(_)));
@@ -812,8 +679,6 @@ mod tests {
         assert!(matches!(n.resolve(b"/dev/entropy").unwrap().0, ResolvedTarget::KernelServer(_)));
     }
 
-    /// A live `UserspaceServerReg` (owning a fresh IPC endpoint), adopted into an
-    /// `ObjectRef` — the form a `UserspaceServer` binding holds.
     fn us_reg_target() -> ObjectRef {
         use crate::object::{IpcChannel, UserspaceServerReg};
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
@@ -831,7 +696,6 @@ mod tests {
         let n = ns();
         n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP | Rights::MAP_READ, SubtreeBase::empty())
             .unwrap();
-        // Exact match → empty suffix, the userspace-server target, its rights.
         let (target, rights, suf) = n.resolve(b"/fs").unwrap();
         assert_eq!(suf, b"");
         assert_eq!(rights, Rights::LOOKUP | Rights::MAP_READ);
@@ -842,8 +706,6 @@ mod tests {
             }
             _ => panic!("expected a userspace-server target"),
         }
-        // A deeper path resolves to the same server, carrying the suffix the kernel
-        // forwards (leaf-vs-subtree is the lookup syscall's concern, not resolve's).
         let (target, _, suf) = n.resolve(b"/fs/system/current-generation").unwrap();
         assert_eq!(suf, b"system/current-generation");
         assert!(matches!(target, ResolvedTarget::UserspaceServer(..)));
@@ -851,12 +713,10 @@ mod tests {
 
     #[test]
     fn subtree_base_from_path_validates() {
-        // A valid absolute path is accepted and stored verbatim.
         let b = SubtreeBase::from_path(b"/home/alice").unwrap();
         assert_eq!(b.as_path(), b"/home/alice");
         assert!(!b.is_empty());
         assert!(SubtreeBase::empty().is_empty());
-        // Rejected: relative, dot/dotdot (subtree escape), root, and over-long.
         for bad in [&b"home"[..], b"/a/../b", b"/./x", b"/", b"//x"] {
             assert_eq!(SubtreeBase::from_path(bad), Err(NsError::InvalidPath), "{bad:?}");
         }
@@ -873,9 +733,6 @@ mod tests {
         let n = ns();
         let base = SubtreeBase::from_path(b"/home/alice").unwrap();
         n.bind_userspace_server(b"/home", us_reg_target(), Rights::LOOKUP | Rights::WRITE, base).unwrap();
-        // Resolving through the binding carries the base out to the caller (which
-        // prepends it to the suffix before forwarding). The suffix itself is
-        // unchanged — the join is the syscall layer's job.
         let (target, _, suf) = n.resolve(b"/home/notes.txt").unwrap();
         assert_eq!(suf, b"notes.txt");
         match target {
@@ -884,27 +741,10 @@ mod tests {
         }
     }
 
-    /// **One registration can be bound at two paths, and the two coexist** — one unscoped,
-    /// one subtree-scoped, each resolving with its own suffix and base.
-    ///
-    /// That is the shape `init` and `session-mgr` rely on: the fs endpoint is bound at `/`,
-    /// and `session-mgr` binds *the same* endpoint again at `/home` with a base. Nothing else
-    /// here covers it — [`bind_rejects_invalid_and_duplicate`] rejects a repeated *path*, not
-    /// a repeated target.
-    ///
-    /// **What this test does NOT establish, despite an earlier name that said it did.** It was
-    /// called `one_registration_bound_twice_is_shared_not_duplicated`, and its headline
-    /// assertion — that both bindings resolve to the same registration pointer — **cannot
-    /// fail**: the test hands the same `ObjectRef` to both binds, `bind_userspace_server`
-    /// stores it verbatim, and `resolve` clones it back out. There is no code path in
-    /// `Namespace` that could substitute a different registration, so the assertion is a
-    /// property of the test's own setup (PR #228 review, finding 4). It is kept below because
-    /// it states the intent cheaply, not because it is a check.
-    ///
-    /// **Sharing is the caller's property**, enforced by `init` and `session-mgr` passing the
-    /// same endpoint rather than minting a second, and pinned end to end by `boot-probe`'s
-    /// `subtree_bind_test` — which compares a file read through both names — and by
-    /// `test-interactive` steps 5a–5c, where a session writes through the scoped binding.
+    /// **One registration can be bound at two paths, and the two coexist**, one unscoped and one
+    /// subtree-scoped, each with its own suffix and base: the shape `init` and `session-mgr` rely
+    /// on. The same-pointer assertion holds by construction; each binding's own base is the real
+    /// check. Sharing is pinned end to end by `boot-probe`'s `subtree_bind_test`.
     #[test]
     fn one_registration_can_be_bound_at_two_paths() {
         let n = ns();
@@ -915,21 +755,15 @@ mod tests {
         let base = SubtreeBase::from_path(b"/system").unwrap();
         n.bind_userspace_server(b"/subtreetest", same, Rights::LOOKUP, base).unwrap();
 
-        // The root mount forwards the whole path and carries no base.
         let (direct, _, dsuf) = n.resolve(b"/system/current-generation").unwrap();
         assert_eq!(dsuf, b"system/current-generation");
-        // The scoped binding forwards only the tail, and hands back the base to prepend —
-        // so the syscall layer joins them to the *same* server-relative path as above.
         let (scoped, _, ssuf) = n.resolve(b"/subtreetest/current-generation").unwrap();
         assert_eq!(ssuf, b"current-generation");
 
         match (direct, scoped) {
             (ResolvedTarget::UserspaceServer(a, abase), ResolvedTarget::UserspaceServer(b, bbase)) => {
-                // True by construction (see the doc comment) — stated, not checked.
                 assert_eq!(a.as_ptr() as usize, addr);
                 assert_eq!(b.as_ptr() as usize, addr);
-                // These two *are* checks: each binding carries its own base, and the second
-                // bind did not overwrite or inherit the first's.
                 assert!(abase.is_empty(), "the unscoped binding must carry no base");
                 assert_eq!(bbase.as_path(), b"/system");
             }
@@ -940,13 +774,11 @@ mod tests {
     #[test]
     fn bind_userspace_server_hands_back_target_on_error() {
         let n = ns();
-        // Invalid path: the registration ref is handed back to drop outside the lock.
         let (t, e) =
             n.bind_userspace_server(b"bad", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap_err();
         assert_eq!(e, NsError::InvalidPath);
         assert_eq!(t.object_type(), KObjectType::UserspaceServerReg);
         drop(t);
-        // Duplicate exact path.
         n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap();
         let (t, e) =
             n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty()).unwrap_err();
@@ -981,12 +813,9 @@ mod tests {
         assert!(n.unbind(b"/dev/entropy").is_none(), "already removed");
     }
 
-    /// **A copy resolves every kind of binding the way its source does.** A direct handle
-    /// resolves to the same object, a kernel server to the same id, and a userspace server to
-    /// the same registration **with the same subtree base**. Each binding keeps its rights. A
-    /// view is its caller's namespace plus a profile's grants, so a copy that lost a base would
-    /// widen a session's `/home` to the whole filesystem, and one that lost rights would change
-    /// what the program may do (`docs/planning/administration.md` § Part A).
+    /// **A copy resolves every kind of binding the way its source does**, with the same subtree
+    /// base and rights: a copy that lost a base would widen a session's `/home` to the whole
+    /// filesystem.
     #[test]
     fn derive_copies_every_binding_kind_with_its_rights_and_base() {
         let n = ns();
@@ -1020,10 +849,7 @@ mod tests {
         }
     }
 
-    /// **A snapshot, not a view, in both directions.** After the copy, a bind or an unbind in
-    /// either namespace leaves the other as it was. A long-running program in a view does not
-    /// see its session change underneath it, and pruning a copy cannot reach the namespace it
-    /// was copied from.
+    /// **A snapshot, not a view, in both directions.**
     #[test]
     fn derive_is_a_snapshot_in_both_directions() {
         let n = ns();
@@ -1042,11 +868,8 @@ mod tests {
         assert!(n.resolve(b"/b").is_some(), "an unbind in the copy reached the source");
     }
 
-    /// **Targets are shared, not moved or duplicated.** Dropping either namespace leaves the
-    /// other's targets alive, and dropping both destroys each exactly once. That holds for a
-    /// direct handle and for a registration alike. A registration outliving every binding of
-    /// it is how a server's kernel end is released, so a copy that took a reference too few
-    /// would free it under a live binding, and one too many would leak it.
+    /// **Targets are shared, not moved or duplicated**: a reference too few would free a
+    /// registration under a live binding, one too many would leak it.
     #[test]
     fn derive_shares_targets_and_each_is_freed_once() {
         init_global_heap();
@@ -1066,13 +889,9 @@ mod tests {
         assert_eq!(test_probe::userspace_server_reg_destroys(), 1, "the registration freed once");
     }
 
-    /// **Unbinding can widen.** Resolution is longest-prefix, so removing a narrower binding
-    /// hands its paths to the broader one beneath it. Here `/` reaches a whole filesystem and
-    /// `/home` only alice's subtree of it: the source confines `/home/bob/x` to alice's, and a
-    /// copy with `/home` unbound reaches bob's. Any holder of a namespace can derive a copy and
-    /// unbind in it, so **a narrower binding must never be what hides part of a broader one** —
-    /// the rule `docs/architecture/namespace-and-resource-servers.md` states (PR #329 review,
-    /// finding 3, which corrected docs that said unbinding could only narrow).
+    /// **Unbinding can widen.** Removing a narrower binding hands its paths to the broader one
+    /// beneath it: the source confines `/home/bob/x` to alice's subtree, and a copy with `/home`
+    /// unbound reaches bob's. **A narrower binding must never hide part of a broader one.**
     #[test]
     fn unbinding_a_narrower_binding_in_a_copy_exposes_the_broader_one() {
         let n = ns();
@@ -1099,8 +918,7 @@ mod tests {
         }
     }
 
-    /// **The copy's cache starts empty.** The source's entries are indices into *its* binding
-    /// list, so an inherited entry would be right only while the two lists happened to agree.
+    /// **The copy's cache starts empty**: inherited entries index *the source's* binding list.
     #[test]
     fn derive_starts_with_an_empty_cache() {
         let n = ns();

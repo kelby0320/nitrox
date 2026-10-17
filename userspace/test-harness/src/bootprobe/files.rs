@@ -2,36 +2,20 @@
 
 use super::*;
 
-// === the filesystem tests, moved out of PID 1 ==========================================
+// **These gate the verdict.** Each returns `bool` and the verdict is their conjunction; a bare
+// `return` after a `FAIL` print would let a broken filesystem pass.
 //
-// Five of these lived in `init` — 32 % of the file — because `init` was where the boot
-// self-test ran. They exercise `fs-server-ext4` through the namespace, which any program
-// with the right bindings can do, and better: one that fails may do so without taking the
-// boot with it. Retrofit Part C.
-//
-// **They now gate the verdict, which they never did before.** Every failure path in `init`
-// was a bare `return` after a `FAIL` print — 19 of them — so a broken filesystem printed
-// `init: create MISMATCH` and the run passed. That is decoration wearing the word "test",
-// and exactly the class this plan is about, so each returns `bool` here and the verdict is
-// their conjunction.
-//
-// **`subtree_bind_test` moved too, but its `/subtreetest` binding could not.** A test-only
-// namespace bind is the one thing "data, not code" cannot express — `[handles].namespace` is
-// unparsed and a declared service gets `namespace: 0`, an inherited root — so `init` still
-// makes it under `selftest`, and that is the single cfg Part C could not remove. Removing it
-// anyway broke the demo harness's case 8, which needs a binding that is *also* an openable
-// directory to prove `move` refuses to recurse through a mount.
-//
-// What it smoke-tests — bind-mount sharing, one registration behind two names — is now
-// *also* a deterministic kernel host test,
+// **`subtree_bind_test`'s `/subtreetest` binding is made by `init` under `selftest`.** A
+// test-only namespace bind is the one thing "data, not code" cannot express (a declared service
+// gets `namespace: 0`, an inherited root), and the demo harness needs a binding that is *also*
+// an openable directory to prove `move` refuses to recurse through a mount. The sharing it
+// smoke-tests is also a kernel host test,
 // `namespace::tests::one_registration_bound_twice_is_shared_not_duplicated`.
 
-/// Size of the Part-5 large-file fixture (`/system/large.bin`). MUST match the
-/// xtask generator (`tools/xtask/src/rootfs.rs`). 32 KiB = 8 pages — past the old
-/// 64 KiB eager read cap, so reading it proves the page cache lifts the cap.
-/// (Was 64 pages; trimmed to 8 because each page demand-faults through the
-/// stateless fs-server fill at ~325 ms/page under QEMU — read-ahead is a Phase-3
-/// item, see docs/rationale/deferred-decisions.md.)
+/// Size of the large-file fixture (`/system/large.bin`). MUST match the xtask generator
+/// (`tools/xtask/src/rootfs.rs`). 32 KiB = 8 pages — past the old 64 KiB eager read cap, so
+/// reading it proves the page cache lifts the cap. Kept small because each page demand-faults
+/// through the stateless fs-server fill at ~325 ms/page under QEMU.
 const LARGE_FILE_BYTES: usize = 32 * 1024;
 
 /// The expected byte at file offset `i` of `/system/large.bin` — position-sensitive
@@ -41,15 +25,12 @@ fn fill_byte(i: usize) -> u8 {
     (((i >> 12) ^ i) & 0xFF) as u8
 }
 
-// === what the device holds ==============================================================
-
 /// What the **device** holds, as opposed to what the page cache does — the root partition
 /// opened raw, read through the ext4 library `fs-server-ext4` is built on.
 ///
-/// **Why the filesystem checks need it** (administration Part C.1). Every resolve of a file
-/// now shares the one page-cache object any other resolve of it holds, so re-resolving a file
-/// reads the cache, not the disk. The checks that used to prove a write "persisted" by
-/// re-resolving would pass with no write-back at all.
+/// **Why the filesystem checks need it.** Every resolve of a file shares one page-cache object,
+/// so re-resolving reads the cache, not the disk: a check that proved a write "persisted" that
+/// way would pass with no write-back at all.
 pub(super) struct RootDevice {
     device: u64,
     /// A page of scratch every read passes through, and its mapping.
@@ -66,7 +47,7 @@ impl RootDevice {
     }
 
     /// Any device, by its path in `ns`: a disk the storage service mounted, read as the device
-    /// holds it (administration Part C.5b).
+    /// holds it.
     pub(super) fn on(ns: u64, path: &[u8]) -> Option<RootDevice> {
         let device = match ns_lookup(ns, path, RIGHT_READ) {
             (0, h) if h != 0 => h,
@@ -141,18 +122,17 @@ fn c1_byte(p: u64, i: u64) -> u8 {
     (0xC1 + p as u8) ^ (i as u8)
 }
 
-/// **Administration Part C.1, end to end: one object per file, and a dirty one kept until a
-/// sync.**
+/// **One object per file, and a dirty one kept until a sync.**
 ///
-/// 1. **A write through one mapping is read through another without a sync** — two resolves of
-///    the file share its object. The device does not have the write yet, which is what makes
-///    the second read a reading of the cache.
-/// 2. **Unmapped and closed without a sync, the write is kept, and `sys_ns_sync` writes it** —
-///    a writer that forgot loses nothing. Checked on the device on both sides of the sync.
-/// 3. **A truncate and a grow of a file held open read zero over the regrown range** — a whole
-///    page and a partial tail — through a new mapping and on the device. The mapping reads the
-///    kernel's half (pages retired, the tail zeroed); the device reads the server's (what the
-///    grow allocated, and the tail it kept, zeroed).
+/// 1. **A write through one mapping is read through another without a sync**: two resolves
+///    share the file's object, and the device does not have the write yet, so the second read
+///    is a reading of the cache.
+/// 2. **Unmapped and closed without a sync, the write is kept, and `sys_ns_sync` writes it**,
+///    checked on the device on both sides of the sync.
+/// 3. **A truncate and a grow of a file held open read zero over the regrown range** (a whole
+///    page and a partial tail) through a new mapping and on the device. The mapping reads the
+///    kernel's half (pages retired, the tail zeroed); the device the server's (what the grow
+///    allocated, and the tail it kept, zeroed).
 pub(super) fn file_cache_test(root_ns: u64) -> bool {
     let path = b"/system/c1-cache";
     let size = 2 * PAGE;
@@ -164,7 +144,6 @@ pub(super) fn file_cache_test(root_ns: u64) -> bool {
     let pattern = |p: u64, n: u64| (0..n).map(|i| c1_byte(p, i)).collect::<alloc::vec::Vec<u8>>();
     let zeroes = |n: usize| alloc::vec![0u8; n];
 
-    // 1. Two resolves, two mappings, one object.
     let Some(w) = file_resize(SYS_FILE_CREATE, root_ns, path, size) else {
         kprint(b"boot-probe: c1 create FAIL\n");
         return false;
@@ -217,7 +196,6 @@ pub(super) fn file_cache_test(root_ns: u64) -> bool {
         kprint(b"boot-probe: c1 ns-sync MISMATCH\n");
     }
 
-    // 3. Held open, with both pages resident: truncate into page 0, then grow back.
     let (st, h) = ns_lookup(root_ns, path, RIGHT_MAP_READ | RIGHT_MAP_WRITE);
     let Some(ha) = (if st == 0 { map_file(h, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) } else { None }) else {
         kprint(b"boot-probe: c1 reopen FAIL\n");
@@ -264,7 +242,7 @@ pub(super) fn file_cache_test(root_ns: u64) -> bool {
     shared && unwritten && kept && synced && regrown && regrown_on_device
 }
 
-/// **Administration Part C.1b: an unlinked file's pages are not written back.** A file
+/// **An unlinked file's pages are not written back.** A file
 /// written through a mapping and let go without a sync stays dirty in the kernel's cache.
 /// When it is unlinked, the server's `File::Forget` takes it out of that cache before the
 /// server frees its block. So a `sys_ns_sync` after the unlink finds nothing of it to write,
@@ -298,7 +276,6 @@ pub(super) fn unlinked_file_test(root_ns: u64) -> bool {
     unsafe { syscall2(SYS_MEMORY_UNMAP, wa, 0) };
     close(w);
 
-    // Where the file's one block is, and that it does not hold the bytes yet.
     let mut runs = [fs_server_ext4::BlockRun::default(); 4];
     let block_at = fs_server_ext4::ext4::map_file(&dev, path, &mut runs)
         .ok()
@@ -314,7 +291,6 @@ pub(super) fn unlinked_file_test(root_ns: u64) -> bool {
     };
     let unwritten = raw(block_at).is_some_and(|b| b[..] != pattern[..]);
 
-    // Unlink it through a session on its directory, then sync the mount.
     let mut buf = [0u8; 4096];
     let unlinked = match librsproto::session::Dir::open(root_ns, b"/system", &mut buf) {
         Ok(mut dir) => {
@@ -337,14 +313,10 @@ pub(super) fn unlinked_file_test(root_ns: u64) -> bool {
     }
 }
 
-/// **Administration Part C.2: a flush of the root disk completes.** `IoOpcode::Flush` on the
-/// root partition goes down to its disk — AHCI's `FLUSH CACHE EXT` in `test-qemu`, a RAM disk's
-/// answer at once in a live image — and its `PendingOperation` completes with status `0`.
-///
-/// Two refusals alongside, which a flush path that ignored its descriptor would fail: one that
-/// names a range is `InvalidArgument`, since a flush covers the whole device and must not look
-/// as if it covered less; and one on a read-only handle is `NoAccess`, since only a writer has
-/// anything to make durable.
+/// **A flush of the root disk completes.** `IoOpcode::Flush` on the root partition goes down to
+/// its disk (AHCI's `FLUSH CACHE EXT` in `test-qemu`) and its `PendingOperation` completes with
+/// status `0`. Two refusals alongside, which a flush path that ignored its descriptor would
+/// fail: one that names a range is `InvalidArgument`, and one on a read-only handle `NoAccess`.
 pub(super) fn flush_test(root_ns: u64) -> bool {
     use libkern::{IO_OPCODE_FLUSH, KError, RIGHT_WRITE};
     let fail = |why: &[u8]| {
@@ -414,7 +386,7 @@ fn po_poll(po: u64) -> Option<(i32, u64)> {
     })
 }
 
-/// **Administration Part C.4, end to end: a resolve continues in a namespace a server hands back.**
+/// **A resolve continues in a namespace a server hands back.**
 ///
 /// This probe is the server. It binds a channel of its own at `/cont` in a namespace it made, and
 /// answers each lookup that reaches it with `OBJECT_KIND_SUBNAMESPACE`, pointing into a copy of the
@@ -425,9 +397,8 @@ fn po_poll(po: u64) -> Option<(i32, u64)> {
 /// 4. a rename whose destination **leaves the prefix** is `Unsupported`, and nothing moves;
 /// 5. a server that keeps answering into itself is stopped at **depth four**, `TooLarge`, after
 ///    exactly five replies;
-/// 6. a continuation onto **`/proc/self`** is `Unsupported`. It runs in the replying server's
-///    syscall, and `/proc/self` answers for whoever is calling, so without the refusal it would
-///    have handed the caller the server's own `Process`.
+/// 6. a continuation onto **`/proc/self`** is `Unsupported`: it runs in the replying server's
+///    syscall, where `/proc/self` would hand the caller the server's own `Process`.
 pub(super) fn continuation_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_FILE_RENAME, SYS_NS_BIND, SYS_NS_CREATE};
     let fail = |why: &[u8]| {
@@ -489,7 +460,6 @@ pub(super) fn continuation_test(root_ns: u64) -> bool {
     };
     let rw = RIGHT_MAP_READ | RIGHT_MAP_WRITE;
 
-    // 1. A lookup, continued into the root filesystem.
     let p = b"/cont/fs/l1/system/current-generation";
     // SAFETY: valid path + namespace handle.
     let po = unsafe { syscall4(SYS_NS_LOOKUP, a, p.as_ptr() as u64, p.len() as u64, RIGHT_MAP_READ) };
@@ -511,7 +481,6 @@ pub(super) fn continuation_test(root_ns: u64) -> bool {
         return fail(b"a lookup did not continue to the root filesystem's file");
     }
 
-    // 2. A create, its size change carried on.
     let c = b"/cont/fs/l1/system/c4-created";
     // SAFETY: valid path + namespace handle.
     let po = unsafe { syscall5(SYS_FILE_CREATE, a, c.as_ptr() as u64, c.len() as u64, rw, 100) };
@@ -525,7 +494,6 @@ pub(super) fn continuation_test(root_ns: u64) -> bool {
         return fail(b"a create did not carry its size on");
     }
 
-    // 3. A rename, both paths continued.
     let d = b"/cont/fs/l1/system/c4-renamed";
     // SAFETY: valid paths + namespace handle.
     let po = unsafe {
@@ -557,7 +525,6 @@ pub(super) fn continuation_test(root_ns: u64) -> bool {
         return fail(b"a rename leaving the prefix was not refused, or moved the file");
     }
 
-    // 5. A server answering into itself: four continuations, and the fifth reply refused.
     let l = b"/cont/loop/x";
     // SAFETY: valid path + namespace handle.
     let po = unsafe { syscall4(SYS_NS_LOOKUP, a, l.as_ptr() as u64, l.len() as u64, RIGHT_MAP_READ) };
@@ -566,7 +533,6 @@ pub(super) fn continuation_test(root_ns: u64) -> bool {
         return fail(b"a resolve answering into itself was not stopped at depth four");
     }
 
-    // 6. Not onto /proc/self, which would answer for this server.
     let s = b"/cont/proc/self/process";
     // SAFETY: valid path + namespace handle.
     let po = unsafe { syscall4(SYS_NS_LOOKUP, a, s.as_ptr() as u64, s.len() as u64, libkern::RIGHT_INSPECT) };
@@ -588,16 +554,13 @@ pub(super) fn continuation_test(root_ns: u64) -> bool {
     true
 }
 
-/// fs-server-rw Part C milestone (selftest): **overwrite** an existing file in place through
-/// a `MAP_WRITE` mapping, `sys_file_sync`, then read the block **off the device** and verify
-/// the change persisted — proving the Model A write data path (dirty pages → write IRPs →
-/// device) with no fs-server metadata write. (A re-resolve read the disk until administration
-/// Part C.1; it now shares this object, so the device is read directly — [`RootDevice`].)
+/// **Overwrite** an existing file in place through a `MAP_WRITE` mapping, `sys_file_sync`, then
+/// read the block **off the device** ([`RootDevice`]) and verify the change persisted: the write
+/// data path (dirty pages, write IRPs, device) with no fs-server metadata write.
 pub(super) fn overwrite_test(root_ns: u64) -> bool {
     let path = b"/system/rwtest";
     let marker = [0xDEu8, 0xAD, 0xBE, 0xEF];
 
-    // 1. Map MAP_READ | MAP_WRITE; note an untouched byte, then overwrite bytes 0..4.
     let (st, fh) = ns_lookup(root_ns, path, RIGHT_MAP_READ | RIGHT_MAP_WRITE);
     if st != 0 || fh == 0 {
         kprint(b"boot-probe: rwtest lookup FAIL\n");
@@ -638,7 +601,7 @@ pub(super) fn overwrite_test(root_ns: u64) -> bool {
     }
 }
 
-/// fs-server-rw Part D milestone (selftest): **grow** a file past EOF via `sys_file_grow`
+/// **Grow** a file past EOF via `sys_file_grow`
 /// (the fs-server allocates a block + extends its extent tree + updates the inode), write
 /// into the newly-allocated region, `sys_file_sync`, then read the device and confirm the
 /// appended data persisted — proving the write path's metadata mutation end to end.
@@ -647,8 +610,6 @@ pub(super) fn grow_test(root_ns: u64) -> bool {
     let marker = [0xC0u8, 0xFF, 0xEEu8, 0x11];
     let new_size: u64 = 8000; // 4096 (1 block) → 8000 (2 blocks)
 
-    // 1. Grow-resolve: the fs-server grows the file, then replies its (2-block) map. The
-    //    lookup returns a PO; wait for the handle.
     // SAFETY: `path` outlives the call and `root_ns` is a namespace handle we hold
     let po = unsafe {
         syscall5(
@@ -718,7 +679,7 @@ pub(super) fn grow_test(root_ns: u64) -> bool {
     }
 }
 
-/// fs-server-rw Part E milestone (selftest): **create** a brand-new file via
+/// **Create** a brand-new file via
 /// `sys_file_create` (the fs-server allocates an inode + inserts a directory entry in the
 /// parent, then grows it to the target size), write into it, `sys_file_sync`, then read the
 /// path off the device and confirm both that it resolves there and that its data persisted —
@@ -798,11 +759,10 @@ pub(super) fn create_test(root_ns: u64) -> bool {
     }
 }
 
-/// The slice-8 Part-5 milestone: map the **large** file `/system/large.bin`
-/// (lazily, a `FileObject`) and read **every** byte — each first touch of a page is
-/// a demand fault the kernel services by a `File::ReadRange` to the fs-server. Verify
-/// the position-sensitive content (so a mis-filled / mis-ordered page is caught) and
-/// log the result. Proves **multi-page demand faulting** past the old 64 KiB cap.
+/// Map the **large** file `/system/large.bin` lazily and read **every** byte: each first touch
+/// of a page is a demand fault serviced by a `File::ReadRange` to the fs-server. The
+/// position-sensitive content catches a mis-filled or mis-ordered page. Proves **multi-page
+/// demand faulting** past the old 64 KiB cap.
 pub(super) fn read_large_file(root_ns: u64) -> bool {
     let (st, fh) = ns_lookup(root_ns, b"/system/large.bin", RIGHT_MAP_READ);
     if st != 0 || fh == 0 {
@@ -822,8 +782,7 @@ pub(super) fn read_large_file(root_ns: u64) -> bool {
     let mut mismatches = 0u64;
     let mut i = 0usize;
     while i < LARGE_FILE_BYTES {
-        // First touch of each page faults; the kernel demand-fills it from the
-        // fs-server. Subsequent bytes in the page are plain (already-resident) reads.
+        // The first touch of each page faults; later bytes in it are plain reads.
         // SAFETY: `base + i` is within the mapped [0, LARGE_FILE_BYTES) file range.
         let got = unsafe { ((base + i as u64) as *const u8).read_volatile() };
         if got != fill_byte(i) {

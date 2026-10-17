@@ -1,4 +1,4 @@
-//! `Fat` on **bytes a correct writer never produces** (PR #365 review, finding 1): a FAT is anyone's
+//! `Fat` on **bytes a correct writer never produces**: a FAT is anyone's
 //! bytes, so a malformed one must be an `FsError`, never a panic — which, in the server, would leave
 //! it spinning in its panic handler with a resolve waiting on it for ever.
 
@@ -6,9 +6,7 @@ use super::*;
 use crate::test_support::{FileImage, Overlay, mformat, mkfs, mmd, put};
 use std::rc::Rc;
 
-/// **A long-name entry of ordinal 0 after a complete long name** is stale, and the short name
-/// stands alone. Its ordinal once passed as the next one expected — `0`, once a name is whole — and
-/// its slot in the name was computed as `0 - 1`.
+/// **A long-name entry of ordinal 0 after a complete long name** is stale: the short name stands.
 #[test]
 fn a_long_name_entry_of_ordinal_zero_is_stale() {
     let img = mformat(64, &["-F", "-c", "8"]);
@@ -56,7 +54,6 @@ impl Rng {
 /// **Everything a request can do**, on whatever the image holds: each result is ignored, since
 /// only a panic is wrong here.
 fn exercise(fat: &Fat<Overlay>) {
-    // What the server serves: nothing its check refuses.
     if fat.check().is_err() {
         return;
     }
@@ -119,8 +116,7 @@ const NOW: i64 = 1_791_244_800;
 /// - a random byte over the boot sector's fields, the FAT, the fixed root and the first clusters;
 /// - **a field of a real entry** — its first byte, attributes, cluster or size — made random;
 /// - **an entry turned into a long-name part** carrying its neighbour's checksum and a random
-///   ordinal, the shape that found the ordinal-0 underflow: random bytes alone almost never match a
-///   long name's checksum.
+///   ordinal: random bytes alone almost never match a long name's checksum.
 #[test]
 fn garbage_in_any_structure_is_an_error_never_a_panic() {
     for (what, img) in [
@@ -138,7 +134,6 @@ fn garbage_in_any_structure_is_an_error_never_a_panic() {
         let pristine = Overlay::new(base.clone());
         let fat = Fat::new(&pristine);
         let g = *fat.geometry().unwrap();
-        // Every slot in use, in the root and in `dir`, by its byte.
         let mut slots: Vec<u64> = Vec::new();
         let sub = dir::resolve_dir(&pristine, &g, &mut fat.cache.borrow_mut(), b"/dir").unwrap();
         for d in [Dir::root(&g), sub] {
@@ -198,8 +193,8 @@ fn garbage_in_any_structure_is_an_error_never_a_panic() {
     }
 }
 
-/// **A file whose chain is shorter than its size is `Corrupt` to read, as to map** (PR #365 review,
-/// finding 7): the read stopped where the chain did and answered the whole length, the rest of the
+/// **A file whose chain is shorter than its size is `Corrupt` to read, as to map**: the read
+/// stopped where the chain did and answered the whole length, the rest of the
 /// buffer whatever it held — in the server, the last request's bytes.
 #[test]
 fn a_chain_shorter_than_its_file_is_corrupt_to_read() {
@@ -225,11 +220,10 @@ fn a_chain_shorter_than_its_file_is_corrupt_to_read() {
 }
 
 /// **A long name over 255 bytes of UTF-8 is listed by its short name, and reached by either**
-/// (PR #365 review, finding 6): a listing entry carries 255 bytes, and the lookup compared against
+/// a listing entry carries 255 bytes, and the lookup compared against
 /// that same form, so such a file could be neither listed nor reached, and its directory never
-/// removed. `名` is three bytes, so 85 of them and `.txt` are 259 — and stored whole: mtools cuts a
-/// longer name at about 255 bytes, mid-character, so the 274-byte name this test first used was
-/// never on the disk, which `mdir` confirms here for the one it does use.
+/// removed. `名` is three bytes, so 85 of them and `.txt` are 259, which mtools stores whole
+/// (`mdir` confirms it); a longer name it cuts at about 255 bytes, mid-character.
 #[test]
 fn a_long_name_too_long_for_a_listing_is_listed_short_and_reached_by_either() {
     let img = mformat(16, &["-c", "4"]);
@@ -261,10 +255,9 @@ fn a_long_name_too_long_for_a_listing_is_listed_short_and_reached_by_either() {
     assert_eq!(fat.rmdir_at(root, b"d", NOW), Ok(()), "empty once the file is gone");
 }
 
-/// **A directory removed is no directory to a session still holding its id** (PR #365 review,
-/// finding 5): a FAT directory's id is its first cluster, which a removal frees and a grow may take.
-/// Every operation by id refuses it `NotFound` — freed, or taken by a file — and the filesystem
-/// stays clean. Made again at the same cluster, it is a directory again.
+/// **A directory removed is no directory to a session still holding its id**: a FAT
+/// directory's id is its first cluster, which a removal frees and a grow may take.
+/// Every operation by id refuses it `NotFound`, freed or taken by a file; the volume stays clean.
 #[test]
 fn a_removed_directory_is_refused_to_a_session_still_holding_it() {
     let img = mformat(16, &["-c", "8"]);

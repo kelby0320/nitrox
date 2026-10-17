@@ -1,112 +1,59 @@
 //! The **i8042** controller's platform wiring: port I/O and interrupt arming.
 //!
-//! The x86-only half of `drivers/ps2`. Ports `0x60`/`0x64` and ISA IRQs 1 and 12 are as
-//! arch-specific as COM1's registers, so they live here for the same reason and behind the
-//! same shape of interface: `arch/mod.rs` refuses to re-export `install_isa_irq` neutrally
-//! because "ISA" is x86 jargon, and *"a fixed legacy platform device wires its own interrupt
-//! inside the arch layer"*. The neutral verb is "arm the keyboard's interrupt", not "install
-//! ISA IRQ 1".
+//! The x86-only half of `drivers/ps2`: ports `0x60`/`0x64` and ISA IRQs 1 and 12.
 //!
-//! ## Bring-up order, and why it is polled
+//! [`init`] runs with interrupts masked and talks to the controller **synchronously**, and only
+//! then does [`arm`] route the interrupts. `0xAA`, a device's passed-self-test byte, is also
+//! `0x2A | 0x80`, a Left Shift **release**, indistinguishable in the stream; so every controller
+//! response must be consumed before any byte can reach the scancode decoder.
 //!
-//! [`init`] runs with interrupts masked and talks to the controller **synchronously**:
-//! disable both ports, flush, program the config byte once, enable the ports, reset each
-//! device and consume its response. Only then does [`arm`] route the interrupts.
-//!
-//! That ordering is not stylistic. `0xAA` — the byte a device sends to report a passed
-//! self-test — is also `0x2A | 0x80`, an ordinary Left Shift **release**. The two are
-//! indistinguishable in the stream, so the *only* way to tell them apart is time: consume
-//! every controller response before any byte can reach the scancode decoder. Arming first
-//! would deliver a phantom Shift release on every boot, and worse, `drivers/ps2` would have
-//! to special-case `0xAA` forever and swallow every real one.
-//!
-//! ## One config byte, written once
-//!
-//! Enabling the mouse is a read-modify-write of the same byte that carries the keyboard's
-//! IRQ-1 enable. Two drivers doing that independently race and lose one of the bits — a
-//! machine that intermittently boots with a dead keyboard. There is one driver and one
-//! write.
+//! The config byte is written once: the mouse enable is a read-modify-write of the byte that
+//! carries the keyboard's IRQ-1 enable, and two writers would race and lose a bit.
 
 use super::ioapic;
 use super::regs::{inb, outb};
 
-/// Data port: scancodes and mouse packets in, device commands out.
 const DATA: u16 = 0x60;
-/// Status (read) / command (write) port.
 const CMD: u16 = 0x64;
 
-/// Status bit: output buffer full — a byte is waiting in [`DATA`].
 const STATUS_OUTPUT_FULL: u8 = 0x01;
-/// Status bit: input buffer full — the controller has not consumed our last write.
 const STATUS_INPUT_FULL: u8 = 0x02;
-/// Status bit: the waiting byte came from the **aux** (mouse) port, not the keyboard.
 const STATUS_FROM_AUX: u8 = 0x20;
 
-/// Controller command: read the configuration byte.
 const CMD_READ_CONFIG: u8 = 0x20;
-/// Controller command: write the configuration byte.
 const CMD_WRITE_CONFIG: u8 = 0x60;
-/// Controller command: disable the keyboard port.
 const CMD_DISABLE_KBD: u8 = 0xAD;
-/// Controller command: enable the keyboard port.
 const CMD_ENABLE_KBD: u8 = 0xAE;
-/// Controller command: disable the aux port.
 const CMD_DISABLE_AUX: u8 = 0xA7;
-/// Controller command: enable the aux port.
 const CMD_ENABLE_AUX: u8 = 0xA8;
-/// Controller command: the **next** data-port write goes to the aux device.
 const CMD_WRITE_AUX: u8 = 0xD4;
-/// Controller command: pulse the output port's reset line — the processor's reset, on a PC.
 const CMD_PULSE_RESET: u8 = 0xFE;
 
-/// Config bit: raise IRQ 1 when the keyboard has a byte.
 const CONFIG_KBD_IRQ: u8 = 0x01;
-/// Config bit: raise IRQ 12 when the aux device has a byte.
 const CONFIG_AUX_IRQ: u8 = 0x02;
-/// Config bit: the controller translates set 2 to set 1 for us. **Kept on** — `scancode.rs`
-/// decodes set 1, which is what every PC BIOS leaves enabled.
+/// Config bit: the controller translates set 2 to set 1. **Kept on**: `scancode.rs` decodes set 1.
 const CONFIG_TRANSLATE: u8 = 0x40;
-/// Config bit: the keyboard clock is *disabled* when set.
 const CONFIG_KBD_CLOCK_OFF: u8 = 0x10;
-/// Config bit: the aux clock is *disabled* when set.
 const CONFIG_AUX_CLOCK_OFF: u8 = 0x20;
 
-/// Device command: reset and run the built-in self-test.
 const DEV_RESET: u8 = 0xFF;
-/// Device command: enable reporting (the mouse needs it; it boots silent).
 const DEV_ENABLE_REPORTING: u8 = 0xF4;
-/// Device command: set the sample rate; the rate follows as a second data byte.
 const DEV_SET_SAMPLE_RATE: u8 = 0xF3;
-/// Device command: report the device id — `0x00` a plain mouse, `0x03` one with a wheel.
 const DEV_GET_DEVICE_ID: u8 = 0xF2;
 
-/// The sample rates that ask a mouse to become an IntelliMouse, in order.
-///
-/// **A knock, not a command.** There is no "do you have a wheel" query: Microsoft's
-/// IntelliMouse looks for this exact sequence of sample-rate settings, and a device that
-/// recognises it changes its id from `0x00` to `0x03` and starts sending **four**-byte
-/// packets. A device that does not simply ends up sampling at 80 Hz, which is why the rate
-/// is set again afterwards. Every PS/2 stack does this — Linux's `psmouse` calls it
-/// `intellimouse_sequence` — and QEMU's emulated mouse implements it.
+/// The sample-rate sequence that asks a mouse to become an IntelliMouse: a device that
+/// recognises it changes its id from `0x00` to `0x03` and sends **four**-byte packets.
 const WHEEL_KNOCK: [u8; 3] = [200, 100, 80];
 
-/// The device id an IntelliMouse answers with once the knock has been recognised.
 const ID_WHEEL: u8 = 0x03;
 
-/// The rate to leave the mouse reporting at, in Hz.
-///
-/// **Restored after the knock**, whose last step leaves a wheel-capable mouse at 80 Hz — a
-/// visibly coarser cursor than the 100 Hz default, bought by a probe rather than chosen.
+/// The rate to leave the mouse at, restored after the knock leaves it at 80 Hz.
 const SAMPLE_RATE: u8 = 100;
 
-/// ISA IRQ the keyboard port raises.
 const KBD_IRQ: u8 = 1;
-/// ISA IRQ the aux port raises.
 const AUX_IRQ: u8 = 12;
 
-/// Spin bound for a controller handshake. The i8042 is a microcontroller on a slow bus; a
-/// dead or absent one must not hang the boot, so every wait is bounded and failure is
-/// reported rather than retried forever.
+/// Spin bound for a controller handshake: a dead or absent i8042 must not hang the boot.
 const SPIN_LIMIT: u32 = 100_000;
 
 /// Which port a byte came from.
@@ -118,7 +65,6 @@ pub enum Port {
     Aux,
 }
 
-/// Wait until the controller has consumed our previous write. Returns `false` on timeout.
 fn wait_writable() -> bool {
     for _ in 0..SPIN_LIMIT {
         // SAFETY: ring-0 read of the i8042 status port.
@@ -130,7 +76,6 @@ fn wait_writable() -> bool {
     false
 }
 
-/// Wait until a byte is waiting to be read. Returns `false` on timeout.
 fn wait_readable() -> bool {
     for _ in 0..SPIN_LIMIT {
         // SAFETY: ring-0 read of the i8042 status port.
@@ -142,7 +87,6 @@ fn wait_readable() -> bool {
     false
 }
 
-/// Write a controller command to [`CMD`].
 fn command(byte: u8) -> bool {
     if !wait_writable() {
         return false;
@@ -152,7 +96,6 @@ fn command(byte: u8) -> bool {
     true
 }
 
-/// Write a byte to [`DATA`] (a device command, or the operand of a controller command).
 fn write_data(byte: u8) -> bool {
     if !wait_writable() {
         return false;
@@ -162,14 +105,12 @@ fn write_data(byte: u8) -> bool {
     true
 }
 
-/// **Send `byte` to the keyboard** (Phase 6 Part B.5): a device command or its operand, whose answer
-/// arrives through [`read_byte`] as a [`Port::Keyboard`] byte. `false` if the controller did not take
-/// it within the bound. From the driver's lock, in thread context or its interrupt.
+/// **Send `byte` to the keyboard**: a device command or its operand, answered through
+/// [`read_byte`] as a [`Port::Keyboard`] byte. `false` if the controller did not take it in time.
 pub fn send_keyboard(byte: u8) -> bool {
     write_data(byte)
 }
 
-/// Read [`DATA`], waiting for a byte. `None` on timeout.
 fn read_data() -> Option<u8> {
     if !wait_readable() {
         return None;
@@ -178,8 +119,7 @@ fn read_data() -> Option<u8> {
     Some(unsafe { inb(DATA) })
 }
 
-/// Discard every byte the controller currently holds. Bounded, so a device that streams
-/// continuously cannot wedge the boot here.
+/// Discard every byte the controller holds, bounded so a streaming device cannot wedge the boot.
 fn flush() {
     for _ in 0..16 {
         // SAFETY: ring-0 read of the i8042 status port.
@@ -191,7 +131,6 @@ fn flush() {
     }
 }
 
-/// Send a command to the aux device (prefixed with [`CMD_WRITE_AUX`]) and read its ack.
 fn aux_command(byte: u8) -> Option<u8> {
     if !command(CMD_WRITE_AUX) || !write_data(byte) {
         return None;
@@ -201,9 +140,8 @@ fn aux_command(byte: u8) -> Option<u8> {
 
 /// Read one byte and say which device produced it.
 ///
-/// Called from the ISRs, where the status bit is the only way to tell a scancode from a
-/// mouse packet byte: **both ports deliver through the same data port**, and reading it
-/// clears the interrupt condition for whichever one it was.
+/// **Both ports deliver through the same data port**, so the status bit is the only way to tell
+/// a scancode from a mouse byte; reading clears the interrupt condition.
 pub fn read_byte() -> Option<(Port, u8)> {
     // SAFETY: ring-0 read of the i8042 status port.
     let status = unsafe { inb(CMD) };
@@ -215,13 +153,11 @@ pub fn read_byte() -> Option<(Port, u8)> {
     Some((port, unsafe { inb(DATA) }))
 }
 
-/// **Pulse the reset line** (administration Part E.3): the second way a reboot tries, after the
-/// FADT's reset register.
+/// **Pulse the reset line**: the second way a reboot tries, after the FADT's reset register.
 ///
-/// Waits a bounded time for the controller to take a command, then writes it. A machine with no
-/// 8042 reads `0xFF` from the status port, input-full set for ever, so the wait gives up and the
-/// write goes nowhere — which is why this runs whatever `IAPC_BOOT_ARCH` says: firmware gets that
-/// bit wrong both ways, and a pulse sent to nothing costs nothing.
+/// A machine with no 8042 reads `0xFF` from the status port (input-full for ever), so the
+/// bounded wait gives up and the write goes nowhere; this therefore runs whatever
+/// `IAPC_BOOT_ARCH` says, as firmware gets that bit wrong both ways.
 ///
 /// # Safety
 /// Ring 0, with every other processor stopped: when it works, it resets the machine.
@@ -237,10 +173,7 @@ pub unsafe fn pulse_reset() {
     unsafe { outb(CMD, CMD_PULSE_RESET) };
 }
 
-/// Whether the controller has a byte nobody has collected.
-///
-/// A status read with no side effects — it neither consumes the byte nor acknowledges
-/// anything, so it is safe to call from any context that can afford one `inb`.
+/// Whether the controller has a byte nobody has collected (a side-effect-free status read).
 pub fn output_pending() -> bool {
     // SAFETY: ring-0 read of the i8042 status port; reading it has no side effects.
     unsafe { inb(CMD) & STATUS_OUTPUT_FULL != 0 }
@@ -253,19 +186,14 @@ pub struct Present {
     pub keyboard: bool,
     /// An aux port that answered its reset — a mouse.
     pub mouse: bool,
-    /// That mouse answered the IntelliMouse knock and is sending **four**-byte packets.
-    ///
-    /// **The packet length is the reason this has to be reported rather than inferred.** A
-    /// three-byte decoder fed four-byte packets is not merely missing a wheel: it reads every
-    /// packet one byte out of phase for ever, which is the framing failure `mouse.rs` exists
-    /// to avoid. Whoever asked for the wheel has to tell the decoder it worked.
+    /// That mouse answered the IntelliMouse knock and sends **four**-byte packets; the decoder
+    /// must be told, as a three-byte one reads every packet out of phase.
     pub wheel: bool,
 }
 
 /// Bring the controller up, synchronously and with interrupts still masked.
 ///
-/// Returns which devices answered. Never panics: a machine with no i8042 at all (or a
-/// virtualised one that ignores the port) reports both absent and the boot continues.
+/// Returns which devices answered. Never panics: a machine with no i8042 reports both absent.
 ///
 /// # Safety
 ///
@@ -273,14 +201,13 @@ pub struct Present {
 pub unsafe fn init() -> Present {
     let mut found = Present::default();
 
-    // 1. Silence both ports before touching anything else, so no device can deposit a byte
-    //    into the middle of the configuration handshake below.
+    // Silence both ports so no device deposits a byte mid-handshake.
     command(CMD_DISABLE_KBD);
     command(CMD_DISABLE_AUX);
     flush();
 
-    // 2. Program the config byte **once**. Interrupts stay off until `arm`; the clocks go
-    //    on now because a device cannot answer its reset with its clock disabled.
+    // Interrupts stay off until `arm`; the clocks go on now, as a device cannot answer its
+    // reset with its clock disabled.
     if !command(CMD_READ_CONFIG) {
         return found;
     }
@@ -292,14 +219,11 @@ pub unsafe fn init() -> Present {
         return found;
     }
 
-    // 3. Enable the ports and reset each device, consuming its response **here** — the
-    //    whole reason bring-up is polled. `0xAA` (self-test passed) is byte-identical to a
-    //    Left Shift release, so it must never reach the scancode decoder.
     command(CMD_ENABLE_KBD);
     command(CMD_ENABLE_AUX);
 
     if write_data(DEV_RESET) {
-        // Ack (0xFA) then self-test result (0xAA), in either order on some controllers.
+        // Ack (0xFA) and self-test (0xAA), in either order on some controllers.
         let a = read_data();
         let b = read_data();
         found.keyboard = matches!(a, Some(0xFA) | Some(0xAA)) || matches!(b, Some(0xAA));
@@ -308,14 +232,11 @@ pub unsafe fn init() -> Present {
     if let Some(ack) = aux_command(DEV_RESET) {
         let a = read_data();
         let b = read_data();
-        // 0xFA ack, then 0xAA self-test, then the device id (0x00 for a plain mouse).
         found.mouse = ack == 0xFA && (matches!(a, Some(0xAA)) || matches!(b, Some(0xAA)));
         if found.mouse {
-            // 4. Ask for the wheel, **before reporting is enabled**: the knock and the id
-            //    query are a conversation, and a mouse already reporting would be
-            //    interleaving movement packets into it.
+            // Ask for the wheel **before reporting is enabled**, or movement packets would
+            // interleave with the knock and id query.
             found.wheel = knock_for_wheel();
-            // A PS/2 mouse boots with reporting **off** and says nothing until told.
             let _ = aux_command(DEV_ENABLE_REPORTING);
         }
     }
@@ -324,56 +245,33 @@ pub unsafe fn init() -> Present {
     found
 }
 
-/// Ask the mouse for a wheel, and say whether it has one.
+/// Send the [`WHEEL_KNOCK`] rates, read the device id back, and say whether the mouse has a wheel.
 ///
-/// Sends the [`WHEEL_KNOCK`] sample rates, then reads the device id back. `true` means the
-/// device answered [`ID_WHEEL`] and will now send four-byte packets — a promise the caller
-/// **must** pass on to the packet decoder, since nothing in the stream distinguishes a
-/// four-byte packet from a three-byte one.
-///
-/// ## `false` is only safe until the knock lands
-///
-/// **Returning `false` is not free after the third rate has been acknowledged.** A device that
-/// recognises the sequence switches to four-byte packets *there*, not when its id is read — so a
-/// failure at the id query would leave a four-byte mouse behind a three-byte decoder, which
-/// frames every packet at an offset for ever and is exactly the "wanders the screen pressing
-/// buttons" failure a cautious `false` is supposed to avoid. Before the loop finishes, `false`
-/// really is free: the sequence is recognised only when all three land.
-///
-/// So **anything but a confirmed [`ID_WHEEL`] resets the device**, which unambiguously puts it
-/// back to three-byte packets whatever it had decided — a failed ack, a timed-out read, or an id
-/// this code does not know. A reset also restores the default sample rate, which is why only the
-/// `true` path has to put the rate back.
-///
-/// Reasoned from the control flow rather than demonstrated: it needs an i8042 that acknowledges
-/// three commands and then times out, which nothing here can inject (PR #288 review, 2).
+/// A device that recognises the sequence switches to four-byte packets when the third rate is
+/// acknowledged, not when its id is read, so a later failure would leave a four-byte mouse
+/// behind a three-byte decoder. Hence **anything but a confirmed [`ID_WHEEL`] after that point
+/// resets the device**, restoring three-byte packets and the default rate.
 fn knock_for_wheel() -> bool {
     for rate in WHEEL_KNOCK {
         if aux_command(DEV_SET_SAMPLE_RATE) != Some(0xFA) || aux_command(rate) != Some(0xFA) {
-            // Nothing has changed shape yet, so there is nothing to put back.
             return false;
         }
     }
     if aux_command(DEV_GET_DEVICE_ID) != Some(0xFA) || read_data() != Some(ID_WHEEL) {
         return reset_to_three_bytes();
     }
-    // Undo the knock's parting gift of 80 Hz — the wheel path is the only one that has to,
-    // since the reset above restores the default rate for every other outcome.
+    // Undo the knock's 80 Hz; every other outcome was reset to the default rate.
     if aux_command(DEV_SET_SAMPLE_RATE) == Some(0xFA) {
         let _ = aux_command(SAMPLE_RATE);
     }
     true
 }
 
-/// Reset the mouse and consume its replies. Always answers `false` — "no wheel".
-///
-/// **The only way to be sure of the packet length after the knock has landed.** `0xFF` returns
-/// the device to its power-on state: three-byte packets, default sample rate, reporting off —
-/// and [`init`] enables reporting immediately afterwards, which it does for every mouse anyway.
+/// Reset the mouse (three-byte packets, default rate, reporting off) and consume its replies.
+/// Always `false`: "no wheel".
 fn reset_to_three_bytes() -> bool {
     if aux_command(DEV_RESET) == Some(0xFA) {
-        // The self-test byte and the device id, in that order. Consumed here for the reason the
-        // whole bring-up is polled: a `0xAA` that reached the scancode decoder would be a
+        // The self-test byte and the device id; a `0xAA` reaching the decoder would be a
         // phantom Left Shift release.
         let _ = read_data();
         let _ = read_data();
@@ -381,11 +279,8 @@ fn reset_to_three_bytes() -> bool {
     false
 }
 
-/// Route the keyboard and aux interrupts to `kbd`/`aux` and enable them in the controller.
-///
-/// Returns the assigned IDT vectors. The neutral operation is "arm the input controller's
-/// interrupts" — the platform wiring (which ISA IRQ, how routed) stays here, exactly as
-/// `console_arm_rx` hides COM1's IRQ 4.
+/// Route the keyboard and aux interrupts to `kbd`/`aux` and enable them in the controller,
+/// returning the assigned IDT vectors.
 ///
 /// # Safety
 ///
@@ -399,16 +294,12 @@ pub unsafe fn arm(kbd: extern "C" fn(), aux: extern "C" fn()) -> (u8, u8) {
     // SAFETY: as above, for the aux line.
     let aux_vec = unsafe { ioapic::install_isa_irq(AUX_IRQ, aux) };
 
-    // Enable the controller's interrupt generation last, so neither line can fire before
-    // both handlers are routed.
+    // Enable the controller's interrupt generation last, so neither line fires before both
+    // handlers are routed.
     //
-    // **Skipped under `no-ps2-irq`**, which is the whole of that feature: the vectors above are
-    // still routed and both devices are still enabled, but the controller never asserts either
-    // line, so every byte has to be recovered by the tick-driven `ps2::poll` sweep. That sweep
-    // exists because the i8042's one-byte output buffer loses edges (2026-08-13), and nothing
-    // else in the tree can fail when it is deleted — on healthy hardware the interrupt path
-    // carries every byte and the sweep is pure redundancy. `cargo xtask check-input
-    // --no-ps2-irq` makes the redundancy load-bearing so its absence is observable.
+    // **Skipped under `no-ps2-irq`**: the controller then never asserts either line, so every
+    // byte is recovered by the tick-driven `ps2::poll` sweep, which exists because the i8042's
+    // one-byte output buffer loses edges. `cargo xtask check-input --no-ps2-irq` uses it.
     #[cfg(not(feature = "no-ps2-irq"))]
     if command(CMD_READ_CONFIG)
         && let Some(config) = read_data()

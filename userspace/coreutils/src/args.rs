@@ -80,11 +80,8 @@ pub const UNIVERSAL_FLAGS: [Flag; 2] = [
     Flag::long_only("version", "show version information and exit"),
 ];
 
-/// Parse `argv[1..]` against `flags`, which need not include [`UNIVERSAL_FLAGS`] — those
-/// are always accepted.
-///
-/// `argv[0]` is the program name by convention (the setup message's `argv`), and is
-/// skipped. Everything after a bare `--` is an operand, even if it looks like a flag.
+/// Parse `argv[1..]` against `flags`, plus the always-accepted [`UNIVERSAL_FLAGS`]. `argv[0]`
+/// is skipped; everything after a bare `--` is an operand, even if it looks like a flag.
 pub fn parse(argv: &[String], flags: &[Flag]) -> Result<Args, ArgError> {
     let mut out = Args::default();
     let mut operands_only = false;
@@ -112,7 +109,6 @@ pub fn parse(argv: &[String], flags: &[Flag]) -> Result<Args, ArgError> {
         }
         // A lone `-` is an operand, not a flag: see the module note on GNU's `cat -`.
         if bytes.len() > 1 && bytes[0] == b'-' {
-            // Clustered shorts: `-rf` is `-r -f`.
             for c in arg[1..].chars() {
                 match lookup_short(c, flags) {
                     Some(f) => set(&mut out, f.long),
@@ -190,7 +186,6 @@ mod tests {
             Err(ArgError::UnknownLong(String::from("recusive")))
         );
         assert_eq!(parse(&argv(&["list", "-z"]), &[RECURSIVE]), Err(ArgError::UnknownShort('z')));
-        // A cluster fails on the offending letter even if the others are valid.
         assert_eq!(parse(&argv(&["remove", "-rz"]), &[RECURSIVE]), Err(ArgError::UnknownShort('z')));
     }
 
@@ -211,7 +206,6 @@ mod tests {
 
     #[test]
     fn argv0_is_never_an_operand() {
-        // argv[0] is the program name (setup-message convention), not an argument.
         let a = parse(&argv(&["list"]), &[]).unwrap();
         assert!(a.operands.is_empty());
     }

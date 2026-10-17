@@ -1,19 +1,16 @@
 //! The [`NotificationChannel`] kernel object — a process's bounded, waitable
 //! queue of [`Notification`]s.
 //!
-//! Each process owns one channel; the kernel enqueues structured events (this
-//! slice: CPU-exception faults) and the process drains them with
-//! `sys_notif_recv`. The channel is `sys_wait`-able — it signals when its queue
-//! transitions empty→non-empty — so it composes with other waitables, exactly
-//! like a [`Timer`](crate::object::Timer).
+//! Each process owns one channel; the kernel enqueues structured events (CPU-exception faults,
+//! `ChildExited`) and the process drains them with `sys_notif_recv`. The channel is
+//! `sys_wait`-able, signalling when its queue goes empty→non-empty, like a
+//! [`Timer`](crate::object::Timer).
 //!
 //! ## Mutation discipline
 //!
-//! Like [`Timer`], all interior state lives in an [`UnsafeCell`] touched
-//! **only while the rank-1 `SCHED` lock is held** (single-CPU serialisation;
-//! see `kernel/docs/lock-ordering.md`). The `pub(crate) unsafe fn` accessors
-//! take a type-erased `*mut ()` and reach the interior through that cell — no
-//! aliasing `&mut NotificationChannel` is ever formed.
+//! As for [`Timer`], all interior state lives in an [`UnsafeCell`] touched **only under the
+//! rank-1 `SCHED` lock** (`kernel/docs/lock-ordering.md`), reached through a type-erased
+//! `*mut ()` so no aliasing `&mut NotificationChannel` is formed.
 
 use core::cell::UnsafeCell;
 
@@ -21,13 +18,10 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec, Notification};
 use crate::object::header::KObjectHeader;
 
-/// A per-process notification queue.
-///
-/// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
+/// A per-process notification queue (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct NotificationChannel {
     header: KObjectHeader,
-    /// Self-check sentinel; a live object always reads [`NotificationChannel::MAGIC`].
     magic: u64,
     /// All mutable state, reached only under `SCHED`.
     inner: UnsafeCell<Inner>,
@@ -36,11 +30,11 @@ pub struct NotificationChannel {
 struct Inner {
     /// FIFO of pending notifications; pre-reserved to [`NotificationChannel::QUEUE_CAP`].
     queue: KVec<Notification>,
-    /// Count of notifications dropped on overflow; surfaced as a synthetic
-    /// `NotificationsDropped` on the next recv.
+    /// Notifications dropped on overflow; surfaced as a synthetic `NotificationsDropped` on the
+    /// next recv.
     dropped: u32,
-    /// Threads blocked on this channel (type-erased `Thread` pointers; non-owning,
-    /// removed before a waiter unparks). Pre-reserved to [`NotificationChannel::MAX_WAITERS`].
+    /// Blocked threads (type-erased, non-owning, removed before a waiter unparks); reserved to
+    /// [`NotificationChannel::MAX_WAITERS`].
     waiters: KVec<*mut ()>,
 }
 
@@ -58,16 +52,11 @@ impl NotificationChannel {
     /// Bounded queue depth (default per `docs/spec/notification-format.md`).
     pub const QUEUE_CAP: usize = 64;
 
-    /// Maximum simultaneous waiters; bounds the pre-reserved waiter vector so
-    /// `add_waiter` never allocates under `SCHED`. Matches [`Timer::MAX_WAITERS`].
-    ///
-    /// [`Timer::MAX_WAITERS`]: crate::object::Timer::MAX_WAITERS
+    /// Maximum simultaneous waiters; the reserve keeps `add_waiter` from allocating under
+    /// `SCHED`.
     pub const MAX_WAITERS: usize = 4;
 
-    /// Allocate an empty channel with a refcount of one. The queue and waiter
-    /// vectors are reserved up front (the only fallible growth), so later
-    /// `enqueue`/`add_waiter` stay within capacity and never allocate under the
-    /// scheduler lock.
+    /// Allocate an empty channel (refcount one), reserving queue and waiters up front.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
         let mut queue: KVec<Notification> = KVec::new();
         queue.try_reserve(Self::QUEUE_CAP)?;
@@ -85,11 +74,8 @@ impl NotificationChannel {
         self.magic == Self::MAGIC
     }
 
-    // --- Scheduler-only accessors --------------------------------------
-    //
-    // SAFETY (shared by all): `obj` addresses a live `NotificationChannel`
-    // (pinned by an `ObjectRef` the caller holds), and the caller holds `SCHED`,
-    // which — single-CPU — serialises all access to `inner`.
+    // SAFETY (shared by all): `obj` is a live `NotificationChannel` pinned by the caller's
+    // `ObjectRef`, and the caller holds `SCHED`, which serialises all access to `inner`.
 
     /// Borrow the interior mutably (no aliasing; `SCHED` held).
     ///
@@ -105,31 +91,29 @@ impl NotificationChannel {
         unsafe { &mut *c.inner.get() }
     }
 
-    /// Enqueue `n`. Returns `true` iff the channel went empty→signaled (the
-    /// caller must then wake its waiters). Overflow policy
-    /// (`docs/spec/notification-format.md`): if the queue is full, an exception
-    /// notification evicts the oldest non-exception entry; otherwise (and if the
-    /// queue is all-exceptions) the drop counter is incremented.
+    /// Enqueue `n`; `true` iff the channel went empty→signaled (the caller then wakes its
+    /// waiters). Overflow (`docs/spec/notification-format.md`): on a full queue an exception
+    /// notification evicts the oldest non-exception entry; otherwise (or if the queue is all
+    /// exceptions) the drop counter is incremented.
     ///
     /// # Safety
     /// See the accessor contract above.
     pub(crate) unsafe fn enqueue(obj: *mut (), n: Notification) -> bool {
         // SAFETY: the accessor contract: `obj` is a live `NotificationChannel` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(obj) };
-        // "Signaled" == queue non-empty OR a drop is pending. Report the edge so
-        // waiters aren't double-woken when already wakeable.
+        // "Signaled" is queue non-empty or a drop pending; report the edge to avoid a double wake.
         let was_signaled = !inner.queue.is_empty() || inner.dropped > 0;
         if inner.queue.len() < Self::QUEUE_CAP {
-            // Non-growing: enqueue runs under `SCHED` and `try_push` would `kmalloc` there
-            // (F11). `QUEUE_CAP` is reserved at construction, so this cannot refuse.
+            // Non-growing: under `SCHED`, `try_push` would `kmalloc`. `QUEUE_CAP` is reserved at
+            // construction, so this cannot refuse.
             let _ = inner.queue.push_within_capacity(n);
         } else if n.is_exception() {
-            // Evict the oldest non-exception entry to preserve fault info.
+            // Evict the oldest non-exception entry to keep fault info.
             if let Some(i) = inner.queue.iter().position(|e| !e.is_exception()) {
                 inner.queue.remove(i);
                 let _ = inner.queue.push_within_capacity(n);
             } else {
-                // All-exceptions and full: drop-count rather than grow/lose silently.
+                // All exceptions and full: count the drop rather than grow or lose it silently.
                 inner.dropped = inner.dropped.saturating_add(1);
             }
         } else {
@@ -138,9 +122,8 @@ impl NotificationChannel {
         !was_signaled
     }
 
-    /// Pop the oldest notification, or — if drops are pending — a synthetic
-    /// `NotificationsDropped { count }` first (resetting the counter). `None`
-    /// when truly empty.
+    /// Pop the oldest notification, or first a synthetic `NotificationsDropped { count }` if drops
+    /// are pending (resetting the counter).
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -155,8 +138,7 @@ impl NotificationChannel {
         if inner.queue.is_empty() { None } else { Some(inner.queue.remove(0)) }
     }
 
-    /// `true` iff a recv would return something (queue non-empty or a drop is
-    /// pending) — the waitable "signaled" predicate.
+    /// `true` iff a recv would return something — the waitable "signaled" predicate.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -166,8 +148,7 @@ impl NotificationChannel {
         !inner.queue.is_empty() || inner.dropped > 0
     }
 
-    /// Register `thread` as a waiter. `Err(())` if already at
-    /// [`MAX_WAITERS`](Self::MAX_WAITERS); never grows under the lock.
+    /// Register `thread` as a waiter; `Err(())` at [`MAX_WAITERS`](Self::MAX_WAITERS).
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -177,12 +158,9 @@ impl NotificationChannel {
         if inner.waiters.len() < Self::MAX_WAITERS {
             inner
                 .waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED`
-                // (`wait_on` → `obj_add_waiter` with the guard held), and `try_push` grows,
-                // which is `kmalloc` under the rank-1 lock (F11). Safe either way today —
-                // construction reserves `MAX_WAITERS` with `?`, so `len < MAX ⟹ len < cap` —
-                // but the type is what should say so, since this is the shape a new waiter
-                // list gets copied from (PR #205 review, optional 5).
+                // `push_within_capacity`, not `try_push`: this runs under `SCHED`, and
+                // `try_push` grows, which is `kmalloc` under the rank-1 lock. Construction
+                // reserves `MAX_WAITERS`, so `len < MAX ⟹ len < cap`; the type should say so.
                 .push_within_capacity(thread)
                 .expect("within reserved waiter capacity");
             Ok(())
@@ -203,8 +181,7 @@ impl NotificationChannel {
         }
     }
 
-    /// Drain every waiter into `out` (clearing the set), returning the count.
-    /// `out` must be at least [`MAX_WAITERS`](Self::MAX_WAITERS) long.
+    /// Drain every waiter into `out` (at least [`MAX_WAITERS`](Self::MAX_WAITERS) long).
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -222,8 +199,8 @@ impl NotificationChannel {
 }
 
 impl Drop for NotificationChannel {
-    /// A live waiter pins this channel (each holds an `ObjectRef` on it across
-    /// `sys_wait`), so the last reference cannot drop while waiters remain.
+    /// A live waiter pins this channel (it holds an `ObjectRef` across `sys_wait`), so the last
+    /// reference cannot drop while waiters remain.
     fn drop(&mut self) {
         debug_assert!(self.inner.get_mut().waiters.is_empty(), "NotificationChannel dropped with live waiters");
     }
@@ -256,11 +233,9 @@ mod tests {
         unsafe {
             assert!(!NotificationChannel::already_signaled(obj));
             assert!(NotificationChannel::try_recv(obj).is_none());
-            // First enqueue reports the empty→signaled edge; second does not.
             assert!(NotificationChannel::enqueue(obj, Notification::divide_by_zero(1, 0x10)));
             assert!(!NotificationChannel::enqueue(obj, Notification::illegal_insn(2, 0x20)));
             assert!(NotificationChannel::already_signaled(obj));
-            // FIFO order.
             assert_eq!(
                 NotificationChannel::try_recv(obj).unwrap().kind(),
                 crate::libkern::notification::KIND_DIVIDE_BY_ZERO
@@ -280,20 +255,15 @@ mod tests {
         let obj = new_chan();
         // SAFETY: live channel, single-threaded test.
         unsafe {
-            // Fill with non-exception notifications (use NotificationsDropped kind,
-            // which is not in the 0x0100 range).
             for _ in 0..NotificationChannel::QUEUE_CAP {
                 NotificationChannel::enqueue(obj, Notification::notifications_dropped(0));
             }
-            // Five more overflow → dropped += 5.
             for _ in 0..5 {
                 NotificationChannel::enqueue(obj, Notification::notifications_dropped(0));
             }
-            // Drain the 64 queued first... actually dropped is surfaced FIRST.
             let first = NotificationChannel::try_recv(obj).unwrap();
             assert_eq!(first.kind(), KIND_NOTIFICATIONS_DROPPED);
             assert_eq!(u32::from_le_bytes(first.as_bytes()[4..8].try_into().unwrap()), 5);
-            // Then the 64 queued entries remain.
             let mut n = 0;
             while NotificationChannel::try_recv(obj).is_some() {
                 n += 1;
@@ -312,10 +282,7 @@ mod tests {
             for _ in 0..NotificationChannel::QUEUE_CAP {
                 NotificationChannel::enqueue(obj, Notification::notifications_dropped(0));
             }
-            // A full queue + an exception → evicts oldest non-exception, no drop.
             NotificationChannel::enqueue(obj, Notification::seg_fault(7, 0x1000, FaultKind::NotMapped));
-            // No drop recorded.
-            // Drain: the seg_fault is now in the queue (last), 63 non-exceptions before it.
             let mut saw_seg = false;
             let mut count = 0;
             while let Some(n) = NotificationChannel::try_recv(obj) {
@@ -339,7 +306,6 @@ mod tests {
             for _ in 0..NotificationChannel::QUEUE_CAP {
                 NotificationChannel::enqueue(obj, Notification::seg_fault(1, 0, FaultKind::NotMapped));
             }
-            // Full of exceptions → the next exception drop-counts (no eviction).
             NotificationChannel::enqueue(obj, Notification::seg_fault(2, 0, FaultKind::NotMapped));
             let first = NotificationChannel::try_recv(obj).unwrap();
             assert_eq!(first.kind(), KIND_NOTIFICATIONS_DROPPED);

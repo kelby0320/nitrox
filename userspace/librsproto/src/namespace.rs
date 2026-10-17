@@ -1,18 +1,14 @@
-//! `Namespace` category (`op = 0x01xx`) bodies. Slice 7 defines `Resolve` — the
-//! kernel-forwarded path resolution. See `docs/spec/rsproto-namespace-ops.md`.
+//! `Namespace` category (`op = 0x01xx`) bodies: `Resolve`, the kernel-forwarded path
+//! resolution. See `docs/spec/rsproto-namespace-ops.md`.
 
 use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
 
-// --- Resolve flags ----------------------------------------------------------
-
-/// `RESOLVE_FILE_AS_MEMOBJ` — resolve a regular file to a read-only `MemoryObject`
-/// of its content, eagerly (slice 7; the whole file is read up front).
+/// `RESOLVE_FILE_AS_MEMOBJ` — resolve a regular file to a read-only `MemoryObject`, eagerly.
 pub const RESOLVE_FILE_AS_MEMOBJ: u32 = 1 << 0;
 /// `RESOLVE_FILE_LAZY` — resolve a regular file to a `File` resource
 /// ([`OBJECT_KIND_FILE`]) whose pages are filled on demand via
-/// [`File::ReadRange`](crate::file) (slice 8). The reply carries the file size,
-/// not its bytes; no handle rides in `handles[0]` — the kernel builds the
-/// page-cache object itself, pointed back at this server.
+/// [`File::ReadRange`](crate::file). The reply carries the size, not the bytes; no handle
+/// rides in `handles[0]`.
 pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
 /// `RESOLVE_GROW` — grow the file to the `new_size` appended after the suffix (a `u32`)
 /// before replying its map. Combined with `RESOLVE_FILE_LAZY`. See
@@ -25,38 +21,25 @@ pub const RESOLVE_GROW: u32 = 1 << 2;
 pub const RESOLVE_CREATE: u32 = 1 << 3;
 /// `RESOLVE_TRUNCATE` — **shrink** the file to the `new_size` appended after the suffix
 /// (free the blocks past the new end) before replying its map. Combined with
-/// [`RESOLVE_FILE_LAZY`]. For `sys_file_truncate`. The inverse of [`RESOLVE_GROW`], and a
-/// separate flag rather than "grow to a smaller size" because the two do opposite things
-/// to the block allocator and a caller must not get one when it asked for the other.
+/// [`RESOLVE_FILE_LAZY`]; for `sys_file_truncate`. Mutually exclusive with [`RESOLVE_GROW`].
 pub const RESOLVE_TRUNCATE: u32 = 1 << 4;
 /// `RESOLVE_RENAME` — **rename** the resolved path to a second path carried in the same
 /// request, and reply status-only ([`OBJECT_KIND_NONE`]) rather than an object.
 ///
-/// A rename inherently names *two* directories, which a directory session — bound to one
-/// inode, addressing entries by name — structurally cannot express; so it rides the
-/// path-addressed resolve surface alongside `RESOLVE_CREATE`/`GROW`/`TRUNCATE`, with the
-/// **namespace** as the confinement boundary (a process can only name what its supervisor
-/// bound into it). The kernel additionally guarantees both paths resolve through the *same*
-/// binding, so a server never sees a cross-filesystem rename. See the decision log
-/// (2026-07-29).
+/// A rename names *two* directories, so it rides the path-addressed resolve surface; a server
+/// never sees a cross-filesystem rename (`rsproto-namespace-ops.md`).
 pub const RESOLVE_RENAME: u32 = 1 << 5;
 
 /// `RENAME_REPLACE` — the rename flag permitting an existing destination to be replaced.
 /// Absent, a taken destination fails; the primitive does not guess.
 pub const RENAME_REPLACE: u16 = 1 << 0;
 
-// --- object_kind values (reply) ---------------------------------------------
-
-/// The reply's `handles[0]` is a read-only `MemoryObject` of file content.
-/// The request completed and produced **no object** — a status-only success, used by the
-/// mutating resolves (`RESOLVE_RENAME`) that change the filesystem rather than resolve to
-/// something. The reply carries no handle and the lookup completes with result `0`.
+/// Completed with **no object**: a status-only success for the mutating resolves
+/// (`RESOLVE_RENAME`); no handle, result `0`.
 pub const OBJECT_KIND_NONE: u16 = 0;
+/// The reply's `handles[0]` is a read-only `MemoryObject` of file content.
 pub const OBJECT_KIND_MEMOBJ: u16 = 1;
-/// A directory resource. The fs-server does not use this kind on the wire — the kernel has
-/// no "directory" reply kind, so an **open directory handle** is returned as an
-/// [`OBJECT_KIND_CHANNEL`] (a session [`IpcChannel`] scoped to the resolved directory). This
-/// value is reserved.
+/// A directory resource: reserved. An open directory is answered as [`OBJECT_KIND_CHANNEL`].
 pub const OBJECT_KIND_DIRECTORY: u16 = 2;
 /// A nested namespace (deferred).
 pub const OBJECT_KIND_SUBNAMESPACE: u16 = 3;
@@ -74,15 +57,15 @@ pub const OBJECT_KIND_CHANNEL: u16 = 5;
 /// zero-copy from the device.
 pub const OBJECT_KIND_FILE_BLOCKS: u16 = 6;
 
-// --- Resolve request --------------------------------------------------------
-
 /// Fixed prefix of a `ResolveRequest` (before the suffix bytes).
 pub const RESOLVE_REQUEST_PREFIX_LEN: usize = 16;
 
 /// A parsed `ResolveRequest`.
 #[derive(Copy, Clone, Debug)]
 pub struct ResolveRequest<'a> {
+    /// Rights requested on the resolved resource.
     pub requested_rights: u64,
+    /// `RESOLVE_*` flags.
     pub flags: u32,
     /// The path suffix (UTF-8, no leading `/`).
     pub suffix: &'a [u8],
@@ -122,8 +105,7 @@ pub fn parse_resolve_request(body: &[u8]) -> Option<ResolveRequest<'_>> {
     })
 }
 
-/// For a `RESOLVE_GROW` request, the target `new_size` (a `u32` appended after the suffix),
-/// or `None` if the body is too short. See [`RESOLVE_GROW`].
+/// For a `RESOLVE_GROW` request, the `new_size` appended after the suffix; `None` if too short.
 pub fn parse_resolve_grow_size(body: &[u8]) -> Option<u32> {
     if body.len() < RESOLVE_REQUEST_PREFIX_LEN {
         return None;
@@ -136,14 +118,13 @@ pub fn parse_resolve_grow_size(body: &[u8]) -> Option<u32> {
     Some(get_u32(body, off))
 }
 
-// --- Resolve reply (success) ------------------------------------------------
-
 /// `ResolveReply` wire length (the resource handle rides in `IpcMsg.handles[0]`).
 pub const RESOLVE_REPLY_LEN: usize = 8;
 
 /// A parsed success `ResolveReply`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ResolveReply {
+    /// An `OBJECT_KIND_*` value.
     pub object_kind: u16,
     /// Exact resource length in bytes (a MemoryObject may zero-pad its tail).
     pub content_len: u32,
@@ -161,14 +142,12 @@ pub fn resolve_reply(out: &mut [u8], object_kind: u16, content_len: u32) -> Opti
 }
 
 /// Bytes of a `FILE_BLOCKS` reply body before its runs: the `ResolveReply`, then `block_size`,
-/// `run_count`, `file_id`, `flags` and four reserved bytes. The file id and flags arrived with
-/// administration Part C.1, when the kernel began keeping one page-cache object per file.
+/// `run_count`, `file_id`, `flags` and four reserved bytes.
 pub const FILE_BLOCKS_PREFIX_LEN: usize = 32;
 /// Bytes of one `BlockRun` in a `FILE_BLOCKS` reply: `file_block: u64`, `device_lba: u64`,
 /// `length: u32`, `flags: u32`.
 pub const BLOCK_RUN_WIRE_LEN: usize = 24;
-/// `FILE_BLOCKS` flag: the file may not be written — a read-only mount's. The kernel installs
-/// it without `MAP_WRITE`, whatever the lookup asked for (administration Part C.3).
+/// `FILE_BLOCKS` flag: a read-only mount's file; the kernel installs it without `MAP_WRITE`.
 pub const FILE_BLOCKS_READ_ONLY: u32 = 1 << 0;
 
 /// Build a `FILE_BLOCKS` reply body's prefix into `out`, returning [`FILE_BLOCKS_PREFIX_LEN`];
@@ -200,12 +179,11 @@ pub fn file_blocks_prefix(
 /// `base_len`.
 pub const SUBNAMESPACE_PREFIX_LEN: usize = 12;
 
-/// Build an **`OBJECT_KIND_SUBNAMESPACE`** reply body into `out` (administration Part C.4): the
-/// resolve continues in the namespace the server transfers in `handles[0]`, which it must hold
-/// `LOOKUP` on. The first `consumed` bytes of the suffix the server was sent stand for `base`,
-/// an absolute path in that namespace, and the kernel resolves `base` plus the rest there with
-/// the same operation — a rename's destination too, which must share those bytes. `consumed`
-/// ends a component of the suffix. `None` if `out` is short.
+/// Build an **`OBJECT_KIND_SUBNAMESPACE`** reply body into `out`: the
+/// resolve continues in the namespace the server transfers in `handles[0]` (which it must hold
+/// `LOOKUP` on): the first `consumed` bytes of the suffix stand for `base`, and the kernel
+/// resolves `base` plus the rest there, a rename's destination too
+/// (`rsproto-namespace-ops.md` § `SUBNAMESPACE`). `None` if `out` is short.
 pub fn subnamespace_reply(out: &mut [u8], consumed: u16, base: &[u8]) -> Option<usize> {
     let total = SUBNAMESPACE_PREFIX_LEN.checked_add(base.len())?;
     if out.len() < total || base.len() > u16::MAX as usize {
@@ -228,9 +206,7 @@ pub fn parse_resolve_reply(body: &[u8]) -> Option<ResolveReply> {
 
 /// The destination suffix + flags a [`RESOLVE_RENAME`] request carries after its primary
 /// suffix: `dest_len: u16`, `flags: u16`, then `dest_len` bytes.
-///
-/// Laid out after the suffix for the same reason the size-changing resolves put `new_size`
-/// there — the fixed prefix stays one shape for every resolve, and only the tail varies.
+/// Laid out after the suffix, like `new_size`, so the fixed prefix keeps one shape.
 pub fn parse_resolve_rename(body: &[u8]) -> Option<(&[u8], u16)> {
     let r = parse_resolve_request(body)?;
     let tail = RESOLVE_REQUEST_PREFIX_LEN + r.suffix.len();
@@ -260,7 +236,7 @@ mod tests {
         assert_eq!(r.suffix, b"system/current-generation");
     }
 
-    /// **A `SUBNAMESPACE` body is laid out as the kernel reads it** — `consumed` at 8, the base's
+    /// A `SUBNAMESPACE` body is laid out as the kernel reads it — `consumed` at 8, the base's
     /// length at 10, the base from 12 — checked byte by byte.
     #[test]
     fn a_subnamespace_reply_is_laid_out_as_the_spec_draws_it() {
@@ -275,8 +251,7 @@ mod tests {
         assert_eq!(subnamespace_reply(&mut out[..16], 0, b"/home"), None);
     }
 
-    /// **The prefix lands where the kernel reads it** — checked byte by byte against the
-    /// spec's offsets, not through a reader in this crate: the reader is the kernel's.
+    /// The prefix lands where the kernel reads it, checked byte by byte against the spec.
     #[test]
     fn a_file_blocks_prefix_is_laid_out_as_the_spec_draws_it() {
         let mut buf = [0xAAu8; 40];
@@ -306,7 +281,6 @@ mod tests {
     #[test]
     fn parse_rejects_truncated() {
         assert!(parse_resolve_request(&[0u8; 8]).is_none());
-        // suffix_len claims 100 bytes but body is short
         let mut buf = [0u8; 32];
         super::put_u16(&mut buf, 12, 100);
         assert!(parse_resolve_request(&buf).is_none());

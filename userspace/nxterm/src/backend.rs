@@ -1,19 +1,9 @@
-//! The tty side of the terminal: obtaining a terminal, becoming its backend, and hosting a
-//! shell on it.
+//! The tty side of the terminal: attaching as its backend, and hosting a shell on it.
 //!
-//! **This is a pty, assembled from the pieces this system has.** `nxterm` resolves `/dev/tty`
-//! like any program, hands the tty server the far end of a channel it made — `AttachBackend` —
-//! and then gives the terminal itself away to the shell it spawns. What it keeps is the
-//! backend: the server writes the shell's output down it and reads the user's keystrokes back.
-//! Unix would call the kept half the master and the given half the slave; here the line
-//! discipline is the tty server rather than the kernel, so those are the only two pieces.
-//!
-//! **Why the terminal is handed down rather than resolved.** `/dev/tty` is a namespace binding,
-//! one per session, so a program cannot resolve its way to a *particular* window — the shell
-//! would find the session's console. The handle travels in the setup message, which is where
-//! `docs/spec/process-spawn-args.md` says everything beyond the four bootstrap registers
-//! belongs, and it is the same thing Unix does by inheriting fd 0/1/2 instead of looking them
-//! up. `docs/architecture/graphical-session.md` §6.1 owns making the resolved path work here too.
+//! `nxterm` resolves `/dev/tty`, hands the tty server the far end of a channel (`AttachBackend`),
+//! and gives the terminal itself to the shell it spawns; the backend it keeps carries output in and
+//! keystrokes out. The terminal is handed down, not resolved, as `/dev/tty` is one binding per
+//! session and would reach the session's console (`docs/spec/process-spawn-args.md`).
 
 use libkern::abi::SpawnArgs;
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_TRANSFER, RIGHT_WAIT};
@@ -23,11 +13,10 @@ use libkern::{
 };
 use librsproto::{OP_TTY_ATTACH_BACKEND, OP_TTY_INPUT, OP_TTY_OUTPUT, RS_FLAG_REPLY, decode, encode};
 
-/// IPC payload starts after the 24-byte header.
+/// Offset of the IPC payload, after the 24-byte header.
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
-/// The most terminal input one message carries ([`librsproto::RS_MAX_BODY`]). Keystrokes are small;
-/// this bounds the copy — a paste is what reaches it.
+/// The most terminal input one message carries ([`librsproto::RS_MAX_BODY`]); a paste reaches it.
 const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 
 static mut MSG: [u8; MSG_LEN] = [0; MSG_LEN];
@@ -42,28 +31,14 @@ static mut CH1: u64 = 0;
 pub struct Backend {
     /// The channel the tty server writes output to and reads input from.
     pub channel: u64,
-    /// The server has closed its end — learned from the receive that found it, never from a
-    /// receive of its own. See [`output`](Backend::output).
+    /// The server has closed its end; learned only from [`output`](Backend::output)'s receive.
     gone: bool,
 }
 
 impl Drop for Backend {
-    /// **Closing the channel is how the terminal ends**, and it had to become a `Drop` when tabs
-    /// arrived (PR #282 review, blocking 3).
-    ///
-    /// While there was one backend for the life of the process, nothing ever dropped one and the
-    /// handle went with the exit. A closed *tab* drops one, and a raw `u64` dropped silently is a
-    /// handle this process still holds: the tty server never sees `PeerClosed`, the terminal is
-    /// never finished, and the `nxsh` on it blocks on a read forever. Ten opened and closed tabs
-    /// would leave ten shells and ten terminals with nothing attached to them.
-    ///
-    /// **The same shape the server already records from the other side** — `tty-server`'s
-    /// `attach_backend` returns the orphaned channel to its caller precisely because "closing it
-    /// is not bookkeeping, it is how the *previous* emulator learns its terminal has ended".
-    ///
-    /// On `Drop` rather than at the one call site that closes tabs, because a handle whose
-    /// release depends on somebody remembering is one that leaks the first time a second caller
-    /// arrives.
+    /// Closing the channel is how the terminal ends: the tty server sees `PeerClosed`, finishes
+    /// the terminal, and the `nxsh` on it stops. A closed tab drops a `Backend`, so the close
+    /// lives here rather than at the one call site that closes tabs.
     fn drop(&mut self) {
         // SAFETY: `channel` is a handle this process owns for the life of this `Backend`, and
         // nothing else holds a copy — `attach` moves the far end to the server and keeps this.
@@ -169,8 +144,8 @@ pub unsafe fn attach(root_ns: u64) -> Option<(u64, Backend)> {
         return None;
     }
     let (near, far) = make_channel()?;
-    // **`far` is moved.** After the send it belongs to the tty server, which is what makes the
-    // server able to close it — and that close is how this process learns its terminal ended.
+    // `far` is moved: once the server owns it, its close is how this process learns the terminal
+    // ended.
     if !send(tty, OP_TTY_ATTACH_BACKEND, 1, 0, &[], Some(far)) {
         kprint(b"nxterm: AttachBackend did not send\n");
         // SAFETY: the send failed, so both ends are still ours.
@@ -181,8 +156,8 @@ pub unsafe fn attach(root_ns: u64) -> Option<(u64, Backend)> {
         }
         return None;
     }
-    // The reply is awaited rather than assumed: a refusal means the shell would be talking to a
-    // terminal whose output goes to the serial console, which is silent and confusing.
+    // The reply is awaited: a refusal would leave the shell on a terminal whose output goes to
+    // the serial console.
     // SAFETY: valid wait buffers; one waiter on the terminal channel.
     let waited = unsafe {
         WAIT_HANDLES[0] = tty;
@@ -221,31 +196,17 @@ fn recv_is_ok(ch: u64) -> bool {
 }
 
 impl Backend {
-    /// Tell the server the user typed `bytes`.
-    ///
-    /// The one call that replaced the loopback. What goes down here is exactly what a serial
-    /// keyboard would have produced, which is why the discipline above it needs no idea a
-    /// window is involved.
+    /// Tell the server the user typed `bytes`, exactly what a serial keyboard would produce.
     pub fn typed(&self, bytes: &[u8]) -> bool {
         bytes.chunks(MAX_BODY).all(|part| send(self.channel, OP_TTY_INPUT, 0, 0, part, None))
     }
 
     /// Take one queued message of program output, if there is one.
     ///
-    /// Returns `None` when the ring is empty, and `Some(&[])` never — an empty body would be
-    /// indistinguishable from "nothing to do".
-    ///
-    /// **This is the only receive on the backend**, and that is a correctness requirement
-    /// rather than tidiness. `sys_channel_recv` has no peek: it dequeues. A first version had
-    /// [`is_gone`](Self::is_gone) call it separately "to probe the ring", which meant every
-    /// turn of the event loop ate a message — and back-to-back messages are the norm, since
-    /// `sink_write` emits one per chunk and one per `Act::Write`. The bytes vanished, and
-    /// because the message *was* dequeued the channel stopped being signalled, so nothing woke
-    /// to retry: silent output loss with a hole in the line, the same failure this part fixed
-    /// one file over by making the server's send block (PR #194 review, finding 1).
-    ///
-    /// `PeerClosed` is recorded here for `is_gone` to report, because the receive that
-    /// discovers it is this one.
+    /// `None` when empty; never `Some(&[])`. This is the only receive on the backend:
+    /// `sys_channel_recv` has no peek, so a separate probe would dequeue a message and the channel,
+    /// no longer signalled, would never wake to retry. `PeerClosed` is recorded here for
+    /// [`is_gone`](Self::is_gone).
     pub fn output(&mut self) -> Option<&'static [u8]> {
         // SAFETY: valid recv out-params.
         let rr = unsafe {
@@ -261,9 +222,8 @@ impl Backend {
             self.gone = rr == libkern::error::KError::PeerClosed.as_i32() as i64;
             return None;
         }
-        // SAFETY: bounded read-only slice over the just-received message. `'static` is honest
-        // here: `MSG` is a module static and the caller consumes the bytes before the next
-        // receive, which is the same contract every server in this tree uses for its buffer.
+        // SAFETY: bounded read-only slice over the just-received message. `'static` holds because
+        // `MSG` is a module static and the caller consumes the bytes before the next receive.
         unsafe {
             let payload_len = u32::from_le_bytes([MSG[4], MSG[5], MSG[6], MSG[7]]) as usize;
             let req = core::slice::from_raw_parts(
@@ -277,10 +237,7 @@ impl Backend {
         }
     }
 
-    /// Whether the server has closed its end — the terminal is over.
-    ///
-    /// A plain read of what [`output`](Self::output) last saw. It performs no receive of its
-    /// own: there is no way to ask a channel a question without consuming from it.
+    /// Whether the server has closed its end; reads what [`output`](Self::output) last saw.
     pub fn is_gone(&self) -> bool {
         self.gone
     }
@@ -288,19 +245,14 @@ impl Backend {
 
 /// Spawn `/bin/nxsh` on `terminal`, handing the terminal down in its setup message.
 ///
-/// The terminal handle is **moved**: this process has no further use for it, and keeping a
-/// second reference would stop the server seeing `PeerClosed` when the shell exits.
+/// The terminal handle is **moved**: keeping a second reference would stop the server seeing
+/// `PeerClosed` when the shell exits.
 ///
 /// # Safety
 ///
 /// `root_ns` must be this process's live root namespace and `terminal` a channel it owns.
-/// `env` is forwarded from this terminal's **own** setup message, not invented here.
-///
-/// It was `Record::default()` until M7 Part F, which was invisible while `nxterm` was only
-/// ever spawned by `init` with no environment of its own — the shell it hosts simply had none
-/// either. Launched from `desktop-shell` into a constructed namespace, that becomes a terminal
-/// whose shell has no `$env.HOME` while every serial login's does, and the asymmetry is the
-/// bug: a graphical terminal should be the same shell in a window.
+/// `env` is forwarded from this terminal's own setup message so the shell has the same
+/// `$env.HOME` a serial login's does.
 pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Record) -> i64 {
     let image = ns_lookup(root_ns, b"/bin/nxsh", libkern::RIGHT_MAP_READ);
     if image == 0 {
@@ -338,12 +290,8 @@ pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Re
     let streams = libstream::setup::Streams::default();
     let sent = libstream::setup::send_setup_full(setup_ours, &streams, Some(terminal), &["nxsh"], env).is_ok();
     if sent {
-        // **Reported here, beside the send, rather than where the environment arrived.** This
-        // number is what a launched terminal hands its shell, and it is the only part of the
-        // chain a *release* image shows: the shell's own banner goes to the tty, which for a
-        // windowed terminal means the grid, which renders only under `test-harness`. Reading
-        // it at the far end of the function from `_start` would let the two drift — a send
-        // changed back to `Record::default()` would still log a healthy count.
+        // Logged beside the send: this count is what the shell is handed, and the only link in
+        // the chain a release image shows. `check-login`'s clipboard gate waits on this line.
         libkern::debug::Line::new()
             .s(b"nxterm: hosting a shell (env: ")
             .u(env.values.len() as u64)
@@ -353,13 +301,7 @@ pub unsafe fn spawn_shell(root_ns: u64, terminal: u64, env: &libstream::wire::Re
     // SAFETY: closing our end of the setup channel.
     unsafe { syscall1(SYS_HANDLE_CLOSE, setup_ours) };
     if !sent {
-        // **The failure branch is the one that has to close it.** A successful send commits the
-        // move by closing the sender's handles itself, so closing here would be a no-op that
-        // errors; on failure the handle is still ours and nothing else will take it. The first
-        // version had these the wrong way round, which left the tty-server holding a terminal —
-        // and one of its fifteen wait slots — for the life of the boot, while the orphaned
-        // shell fell back to resolving `/dev/tty` and landed a second REPL on the serial
-        // console (PR #194 review, finding 5).
+        // On failure the handle is still ours and must be closed here; a successful send closes it.
         // SAFETY: the send failed, so the terminal handle is still ours.
         unsafe { syscall1(SYS_HANDLE_CLOSE, terminal) };
         kprint(b"nxterm: the shell's setup message did not send\n");

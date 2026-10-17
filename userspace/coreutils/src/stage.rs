@@ -2,21 +2,14 @@
 //!
 //! A coreutil is a *pipeline stage*: it is spawned by a shell, receives its streams and
 //! `argv` in the setup message (`docs/spec/pipeline-stdio.md`), does its job, and exits
-//! with a status. That shape is identical across programs, so it lives here once.
+//! with a status.
 //!
 //! ## Both tiers, deliberately
 //!
 //! Tier 1 (a setup message is pending) is the shell-spawned case and supplies `argv`.
-//! Tier 0 — no descriptor, no message — is what a program gets when something spawns it
-//! *without* a shell, which today is init and the test harness. A Tier-0 stage has no
-//! `argv` and no streams, so it can only run its argument-free default. Handling both
-//! means a coreutil is directly spawnable before the shell exists, which is exactly the
-//! position Milestone 1 is in.
-//!
-//! ## Exit statuses
-//!
-//! [`EXIT_OK`] / [`EXIT_FAILURE`] / [`EXIT_USAGE`], the conventional split. The shell
-//! surfaces these as a stage's `exit_status` in `PipelineStatus` (design §1).
+//! Tier 0 — no descriptor, no message — is what a program gets when init or the test harness
+//! spawns it *without* a shell. A Tier-0 stage has no `argv` and no streams, so it can only
+//! run its argument-free default.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -25,7 +18,6 @@ use libkern::syscall::{SYS_NOTIF_RECV, syscall4};
 use libkern::{exit, kprint};
 use libstream::setup::Streams;
 
-/// Out-param for [`Stage::terminate_requested`]'s drain.
 static mut NOTIF_BUF: Notification = Notification { kind: 0, body: [0; 60] };
 
 /// The program did its job. (`i64` — the width `sys_process_exit` takes.)
@@ -45,24 +37,15 @@ pub struct Stage {
     pub streams: Streams,
     /// `argv`, with `argv[0]` the program name. Empty in Tier 0.
     pub argv: Vec<String>,
-    /// The working directory from the environment's `PWD`, if it has one.
-    ///
-    /// `None` in Tier 0, and in Tier 1 when the spawner passed no `PWD`. A relative path
-    /// then fails rather than resolving against `/` — see [`Stage::path`].
+    /// The working directory from the environment's `PWD`; `None` in Tier 0 or with no `PWD`, and a
+    /// relative path then fails rather than resolving against `/` — see [`Stage::path`].
     pub cwd: Option<String>,
-    /// The terminal the shell handed this stage, if it handed one — a sibling of its own, on the
-    /// same window or console (administration Part A.2).
-    ///
-    /// What a stage that has to *ask* something prompts on: `with` for a password, an elevated
-    /// shell for its commands. `None` in Tier 0, under a spawner that passes none, and when the
-    /// tty server had no terminal to spare, so a stage that needs one must say so rather than
-    /// assume it.
+    /// The terminal the shell handed this stage, if any: what a stage that has to *ask* something
+    /// prompts on. `None` in Tier 0, under a spawner that passes none, and when the tty server
+    /// had none to spare, so a stage that needs one must say so rather than assume it.
     pub terminal: Option<u64>,
-    /// The whole environment the spawner passed, as it passed it — empty in Tier 0.
-    ///
-    /// `cwd` above is the one entry most stages need; a stage that hands its environment on
-    /// unchanged — `with`, forwarding it to the program it asks the view broker to run — needs
-    /// the rest, and rebuilding it from pieces would drop whatever it did not know about.
+    /// The whole environment the spawner passed — empty in Tier 0. A stage that hands it on
+    /// unchanged (`with`) needs the record, not `cwd`.
     pub env: libstream::wire::Record,
     /// Whether a setup message was received (Tier 1).
     pub from_shell: bool,
@@ -70,28 +53,22 @@ pub struct Stage {
 
 /// Pull `PWD` out of an environment record.
 ///
-/// `PWD` is a *conventional* entry (Milestone 3.5), not a distinct field: there is no
-/// second source of truth for it to disagree with, unlike Unix's `$PWD` versus `getcwd()`.
+/// `PWD` is a *conventional* entry, not a distinct field: there is no second source of truth
+/// for it to disagree with, unlike Unix's `$PWD` versus `getcwd()`.
 fn cwd_of(env: &libstream::wire::Record) -> Option<String> {
     let i = env.schema.fields.iter().position(|f| f.name == "PWD")?;
     env.values.get(i)?.as_str().map(String::from)
 }
 
 impl Stage {
-    /// Receive the bootstrap: the four registers, plus the setup message when `arg0`
-    /// marks one pending. A malformed setup message is fatal — a stage that cannot
-    /// establish what it was asked to do must not guess.
-    /// Has someone asked this stage to exit? (§11h)
+    /// Has someone asked this stage to exit?
     ///
     /// A **non-blocking** drain of this process's notification channel, looking for
-    /// `TerminateRequested`. Nothing forces a stage to call it and nothing happens if it
-    /// does not — there is no forcible kill in this system, so "well-behaved" is a
-    /// property a program has by asking, and this is the asking.
+    /// `TerminateRequested`. Nothing forces a stage to call it: there is no forcible kill
+    /// in this system.
     ///
-    /// The place it belongs is a wait: a stage that blocks should put `notif` in its
-    /// `sys_wait` set and call this when the wait returns, which is what makes the request
-    /// take effect promptly rather than at the end of a job that was going to finish
-    /// anyway.
+    /// A stage that blocks should put `notif` in its `sys_wait` set and call this when the
+    /// wait returns, so the request takes effect promptly.
     pub fn terminate_requested(&self) -> bool {
         let mut hit = false;
         // SAFETY: `NOTIF_BUF` is a valid 64-byte out-param; single-threaded stage.
@@ -109,6 +86,9 @@ impl Stage {
         hit
     }
 
+    /// Receive the bootstrap: the four registers, plus the setup message when `arg0`
+    /// marks one pending. A malformed setup message is fatal — a stage that cannot
+    /// establish what it was asked to do must not guess.
     pub fn enter(notif: u64, namespace: u64, endpoint: u64, arg0: u64) -> Stage {
         let boot = libstream::setup::bootstrap(notif, namespace, endpoint, arg0);
         match boot.setup() {
@@ -126,9 +106,7 @@ impl Stage {
                 kprint(b"coreutil: malformed setup message\n");
                 exit(EXIT_FAILURE);
             }
-            // Tier 0: no setup message, so no `argv` and — for the same reason — no
-            // environment and no working directory. A relative path then fails, which is
-            // the honest outcome: this process was handed nothing to resolve against.
+            // Tier 0: no setup message, so no `argv`, environment or working directory.
             None => Stage {
                 notif,
                 namespace,
@@ -144,13 +122,8 @@ impl Stage {
 
     /// Resolve a user-supplied path against this stage's working directory.
     ///
-    /// Called **once, where a path enters from `argv`** — the boundary — rather than
-    /// threaded through every filesystem helper. That keeps one place per program where a
-    /// relative path becomes absolute, and it is the same place a bad path should be
-    /// reported.
-    ///
-    /// Diverges with a message on failure, since a path the caller typed that cannot be
-    /// resolved is a usage error, not something to carry on past.
+    /// Called **once, where a path enters from `argv`**, rather than threaded through every
+    /// filesystem helper. Diverges with a message and `EXIT_USAGE` on failure.
     pub fn path(&self, operand: &[u8]) -> Vec<u8> {
         let mut buf = [0u8; 1024];
         match librsproto::path::resolve(self.cwd.as_deref().map(str::as_bytes), operand, &mut buf) {
@@ -169,27 +142,22 @@ impl Stage {
         self.argv.first().map(|s| s.as_str()).unwrap_or(fallback)
     }
 
-    /// Write `msg` to `stderr`.
+    /// Write `msg` to `stderr` as an **error**; [`Stage::warn`] and [`Stage::note`] say otherwise.
     ///
-    /// `stderr` is a **shared diagnostic sink**, separate from the pipe (design §1), so a
-    /// diagnostic never corrupts the typed stream on `stdout`. Until a stage actually has
-    /// one wired — Tier 0, or a shell that passed none — this falls back to the kernel
-    /// log, which is where such output would otherwise vanish.
-    ///
-    /// **An error**, as every diagnostic was until the laptop polish's Part E: [`Stage::warn`] and
-    /// [`Stage::note`] say otherwise.
+    /// `stderr` is a **shared diagnostic sink**, separate from the pipe, so a diagnostic never
+    /// corrupts the typed stream on `stdout`. With none wired — Tier 0, or a shell that passed
+    /// none — this falls back to the kernel log.
     pub fn diag(&self, msg: &[u8]) {
         self.diag_at(libstream::diag::Level::Error, msg);
     }
 
     /// Write `msg` to `stderr` as a **warning**: something the person may have wanted, and is not
-    /// getting. The shell draws it in its own colour, not as an error.
+    /// getting. The shell draws it in its own colour.
     pub fn warn(&self, msg: &[u8]) {
         self.diag_at(libstream::diag::Level::Warning, msg);
     }
 
-    /// Write `msg` to `stderr` as a **notice**: progress, or a result said in words. The shell
-    /// draws it plain — it is not a failure, and colouring it as one is what this exists to stop.
+    /// Write `msg` to `stderr` as a **notice**: progress, or a result said in words, drawn plain.
     pub fn note(&self, msg: &[u8]) {
         self.diag_at(libstream::diag::Level::Notice, msg);
     }
@@ -211,9 +179,8 @@ impl Stage {
     /// Write `text` to `stdout` as text — a `TEXT_FALLBACK` stream, which the shell prints as lines,
     /// and `ChannelSink` splits however long it is. `false` if there is no `stdout`, or it failed.
     ///
-    /// **Bytes that are not UTF-8 are shown replaced, not dropped**: a row is a `String`, and an
-    /// empty one in place of a body that did not decode would print a blank line and call it the
-    /// answer (PR #352 review).
+    /// **Bytes that are not UTF-8 are shown replaced, not dropped**: an empty row in place of a
+    /// body that did not decode would print a blank line and call it the answer.
     pub fn text_out(&self, text: &[u8]) -> bool {
         let text = String::from_utf8_lossy(text);
         let text: &str = &text;
@@ -225,9 +192,9 @@ impl Stage {
         })
     }
 
-    /// **`--help` and `--version`: the text, as what was asked for**, and exit 0 (the laptop
-    /// polish's Part E). It goes to `stdout` ([`Stage::text_out`]), so it is output, can be piped,
-    /// and is not drawn as an error. With no `stdout`, it is a notice.
+    /// **`--help` and `--version`: the text, as what was asked for**, and exit 0. It goes to
+    /// `stdout` ([`Stage::text_out`]), so it can be piped and is not drawn as an error. With no
+    /// `stdout`, it is a notice.
     pub fn answer(&self, text: &[u8]) -> ! {
         if !self.text_out(text) {
             self.note(text);
@@ -235,19 +202,16 @@ impl Stage {
         exit(0)
     }
 
-    /// Report a fatal error on `stderr` and exit with `code`. `-> !`, so a caller can use
-    /// it in any position without contorting its control flow.
+    /// Report a fatal error on `stderr` and exit with `code`.
     pub fn die(&self, msg: &[u8], code: i64) -> ! {
         self.diag(msg);
         exit(code)
     }
 }
 
-/// Send one diagnostic line as a framed message on the shared `stderr` sink.
 fn send_diag(port: &mut libstream::channel::IpcPort, msg: &[u8]) -> libstream::wire::Result<()> {
     use libstream::channel::MsgPort;
-    // Each diagnostic is one self-contained message: `stderr` is shared between every
-    // stage of a pipeline, so a stage must never leave a partial line interleaved with
-    // another's. `last` stays false — the sink outlives any one stage.
+    // One self-contained message: `stderr` is shared by every stage of a pipeline, so a partial
+    // line must never be interleaved with another's. `last` stays false: the sink outlives a stage.
     port.send(msg, false)
 }

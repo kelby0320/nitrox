@@ -5,9 +5,6 @@
 //! control registers on x86_64; the ID/feature/system registers on aarch64):
 //! installing the CPU control tables, enabling memory-protection features,
 //! setting the trap kernel stack, halting, and feature detection.
-//!
-//! The active architecture's implementation is re-exported from
-//! `crate::arch` as `Cpu` (see `kernel/src/arch/mod.rs`).
 
 /// Per-CPU feature queries and control operations.
 pub trait ArchCpu {
@@ -32,21 +29,19 @@ pub trait ArchCpu {
     /// is a contract, not an x86 implementation detail: `sched::online_mask` is the target
     /// set for TLB-shootdown IPIs and the initiator waits for an acknowledgement from every
     /// CPU in it, so a CPU that halts while still counted online wedges the machine's next
-    /// shootdown — i.e. the next large `free` in any process — permanently. That is how a
-    /// terminal ended up freezing mid-repaint for two milestones (2026-08-13; see the
-    /// decision log).
+    /// shootdown — i.e. the next large `free` in any process — permanently (see the
+    /// decision log, 2026-08-13).
     ///
     /// `leave_online` guards itself against being called by a CPU that has no identity yet,
-    /// so an implementation does not need to reason about bring-up order — it needs only to
-    /// call it. Note there is no test or gate covering this for a *new* architecture: the
-    /// host test exercises the decision inside `leave_online`, not the call site.
+    /// so an implementation needs only to call it. No test or gate covers the call site for
+    /// a *new* architecture.
     fn halt_loop() -> !;
 
     /// Stop every **online** CPU, then halt this one. Diverges.
     ///
-    /// The mechanism behind the 2026-08-19 promise that a ring-0 fault stops the machine
-    /// (`docs/decision-log.md`). Distinct from [`halt_loop`](Self::halt_loop), which stops
-    /// only the caller and remains correct for a core that never joined — see
+    /// The mechanism behind the promise that a ring-0 fault stops the machine
+    /// (`docs/decision-log.md`, 2026-08-19). Distinct from [`halt_loop`](Self::halt_loop),
+    /// which stops only the caller and remains correct for a core that never joined — see
     /// `bring_up_aps`.
     ///
     /// Must be usable from the panic and exception paths, including before this CPU's
@@ -62,8 +57,8 @@ pub trait ArchCpu {
     /// checking that a stop began before it makes itself schedulable; see `ap_entry`.
     fn stop_the_machine() -> !;
     /// Stop every **online** CPU but this one, and mask interrupts on this one; then return, so
-    /// that it can finish the machine's last work alone — a power operation's message or reset
-    /// (administration Part E.3). [`stop_the_machine`](Self::stop_the_machine) is this, then
+    /// that it can finish the machine's last work alone — a power operation's message or reset.
+    /// [`stop_the_machine`](Self::stop_the_machine) is this, then
     /// the screen, then [`halt_loop`](Self::halt_loop).
     ///
     /// **After it, the caller must not take a lock another CPU could hold, nor allocate**: a CPU
@@ -129,10 +124,10 @@ pub trait ArchCpu {
     /// Ring-0 only.
     unsafe fn interrupts_restore(prev: bool);
 
-    /// Log what this processor is and which of the features the kernel depends on it has
-    /// (Phase 5 Part D.1): the vendor, model and brand, and the features in three groups —
-    /// those the kernel **requires**, those it **uses when present**, and those whose absence
-    /// it **warns about** — each marked present (`+`) or absent (`-`).
+    /// Log what this processor is and which of the features the kernel depends on it has:
+    /// the vendor, model and brand, and the features in three groups — those the kernel
+    /// **requires**, those it **uses when present**, and those whose absence it **warns about**
+    /// — each marked present (`+`) or absent (`-`).
     ///
     /// Read-only and allocation-free, so the boot calls it before anything that could fail on
     /// an unfamiliar machine — in particular before [`init_protections`](Self::init_protections),

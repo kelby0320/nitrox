@@ -1,28 +1,24 @@
-//! `auth-service` — the userspace **authentication service** (Phase 3).
+//! `auth-service` — the userspace **authentication service**.
 //!
-//! A request/reply resource server that validates credentials: it answers the `Auth`
-//! rsproto category (`Authenticate { username, password } → { AUTHENTICATED,
-//! principal, home } | DENIED`, `docs/spec/rsproto-auth-ops.md`) on a plain IPC
-//! channel. Like the fs / profile servers it **is** a namespace forwarder as of M7 Part C:
+//! A request/reply resource server that answers the `Auth` rsproto category (`Authenticate {
+//! username, password } → { AUTHENTICATED, principal, home } | DENIED`,
+//! `docs/spec/rsproto-auth-ops.md`). Like the fs / profile servers it is a namespace forwarder:
 //! `service-mgr` binds `/svc/auth` to reach it and it mints a session channel per caller that
-//! resolves there, which is what lets `session-mgr` and `desktop-session-mgr` each hold one.
-//! Before that it minted a single pair at startup and was a one-client oracle by
-//! construction. The credential logic (user-DB parse + PBKDF2 verify) is the
-//! host-tested `auth_service` library; this binary is the bare-target syscall
-//! plumbing: read `/system/users`, hand the supervisor a client endpoint via
+//! resolves there, which is what lets `session-mgr` and `desktop-session-mgr` each hold one. The
+//! credential logic is the host-tested `auth_service` library; this binary is the bare-target
+//! syscall plumbing: read `/system/users`, hand the supervisor a client endpoint via
 //! `Meta::Ready`, then serve.
 //!
-//! **And the database's only writer** (administration Part D.1). A resolve of `/svc/auth/admin`
-//! opens an *admin* session, which answers `List`, `Add`, `Remove` and `SetPassword`. The view
+//! **And the database's only writer.** A resolve of `/svc/auth/admin` opens an *admin* session,
+//! which answers `List`, `Add`, `Remove` and `SetPassword`. The view
 //! broker is the one client meant to hold one, since it fronts every account operation and applies
 //! the guards; anything holding the root namespace can resolve it, the same boundary `/svc/auth`
 //! has always had (`TODO(svc-auth-ungated)`). A write replaces the file atomically — written to
 //! `/system/users.new`, synced, then renamed over — and the copy in memory changes only once the
 //! rename has held.
 //!
-//! `#![no_std]` + `#![no_main]`, **no `alloc`** — fixed `.bss` buffers, no
-//! `#[global_allocator]` (the DB + messages are bounded). `libkern` + `libcrypto`
-//! (via the lib) + `librsproto`. See `userspace/auth-service/CLAUDE.md`.
+//! `#![no_std]` + `#![no_main]`, **no `alloc`** — fixed `.bss` buffers, no `#[global_allocator]`
+//! (the DB + messages are bounded). See `userspace/auth-service/CLAUDE.md`.
 
 #![no_std]
 #![no_main]
@@ -58,18 +54,15 @@ static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 /// How many clients may hold an auth session at once.
 ///
-/// Two slots go to the forwarding endpoint and, since administration Part E.4, the control
-/// channel; the rest are sessions. Two supervisors is what M7 needs — `session-mgr` and
-/// `desktop-session-mgr` — and the limit is the wait set's rather than a guess, so it costs
-/// nothing to be generous.
+/// Two slots go to the forwarding endpoint and the control channel; the rest are sessions. The
+/// limit is the wait set's, so it costs nothing to be generous.
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 2;
 const _: () = assert!(2 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
 
 /// Open auth sessions, one per client that resolved `/svc/auth`. `0` marks a free slot.
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
-/// Whether each session is an **admin** one — resolved at `/svc/auth/admin` — rather than an
-/// oracle one. An admin session answers only the administrative ops, and an oracle session only
-/// `Authenticate`.
+/// Whether each session is an **admin** one (resolved at `/svc/auth/admin`) or an oracle one. An
+/// admin session answers only the administrative ops, an oracle session only `Authenticate`.
 static mut SESSION_ADMIN: [bool; MAX_SESSIONS] = [false; MAX_SESSIONS];
 /// The namespace the file is read and written through: the inherited root.
 static mut ROOT_NS: u64 = 0;
@@ -90,13 +83,11 @@ static mut CH_OUT1: u64 = 0;
 static mut USER_DB: [u8; DB_MAX] = [0; DB_MAX];
 static mut USER_DB_LEN: usize = 0;
 
-/// Emit `msg` to the serial console.
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
-/// Exit the process (does not return).
 fn exit(code: i64) -> ! {
     // SAFETY: SYS_PROCESS_EXIT terminates this process.
     unsafe { syscall1(SYS_PROCESS_EXIT, code as u64) };
@@ -105,8 +96,7 @@ fn exit(code: i64) -> ! {
     }
 }
 
-/// Resolve `path` in `ns` requesting `rights`; return the resolved handle, or `0`.
-/// Waits + closes the `PendingOperation`.
+/// Resolve `path` in `ns` requesting `rights`; the resolved handle, or `0`. Closes the PO.
 fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     // SAFETY: valid path pointer + namespace handle.
     let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
@@ -141,15 +131,13 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     if waited != 1 || status != 0 { 0 } else { handle }
 }
 
-/// Read `/system/users` into `USER_DB`, recording its length in `USER_DB_LEN`.
-/// Returns `false` on any failure (the server then denies every credential — a
-/// missing DB must never authenticate).
+/// Read `/system/users` into `USER_DB`, recording its length in `USER_DB_LEN`. `false` on any
+/// failure: a missing DB must never authenticate.
 fn load_db(root_ns: u64) -> bool {
     let fh = ns_lookup(root_ns, b"/system/users", RIGHT_MAP_READ | RIGHT_INSPECT);
     if fh == 0 {
         return false;
     }
-    // Stat for the exact byte size (the file is a small text DB).
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `&mut info` is a valid 24-byte HandleInfo out-param.
     let sr = unsafe { syscall2(SYS_HANDLE_STAT, fh, (&mut info as *mut HandleInfo) as u64) };
@@ -179,9 +167,7 @@ fn load_db(root_ns: u64) -> bool {
     true
 }
 
-/// Create a connected channel pair (depth 4). Returns `(client_end, serve_end)`: the
-/// supervisor routes `client_end` to session-mgr (which sends `Authenticate` on it);
-/// the server serves on `serve_end`. `None` on failure.
+/// Create a connected channel pair (depth 4), `(client_end, serve_end)`. `None` on failure.
 fn make_channel() -> Option<(u64, u64)> {
     // SAFETY: CH_OUT0/CH_OUT1 are valid writable out-params.
     let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CH_OUT0) as u64, (&raw mut CH_OUT1) as u64, 4, 0) };
@@ -192,8 +178,7 @@ fn make_channel() -> Option<(u64, u64)> {
     Some(unsafe { ((&raw const CH_OUT0).read(), (&raw const CH_OUT1).read()) })
 }
 
-/// Send `Meta::Ready` on the control channel, transferring `client_end` (the endpoint
-/// a client sends `Authenticate` on). `false` on any failure.
+/// Send `Meta::Ready` on the control channel, transferring `client_end`. `false` on any failure.
 fn send_ready(control: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let body_len = match librsproto::meta::ready(&mut body, b"auth-service") {
@@ -228,8 +213,7 @@ fn send_ready(control: u64, client_end: u64) -> bool {
     sr == 0
 }
 
-/// Send a reply body for `op` on `serve_end`, echoing `request_id`, with `error` set iff this is
-/// an error reply. No handles are transferred.
+/// Send a reply body for `op` on `serve_end`, echoing `request_id`; no handles are transferred.
 fn send_reply(serve_end: u64, op: u16, request_id: u64, body: &[u8], error: bool) {
     let flags = if error { RS_FLAG_REPLY | RS_FLAG_ERROR } else { RS_FLAG_REPLY };
     // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset 24.
@@ -254,19 +238,14 @@ fn send_reply(serve_end: u64, op: u16, request_id: u64, body: &[u8], error: bool
     }
 }
 
-/// The serve loop: block for an `Authenticate` request, validate it against the DB,
-/// and reply. Never returns.
+/// The serve loop. Never returns.
 ///
-/// **It exits on `CTRL_OP_SHUTDOWN`** (administration Part E.4), which a shutdown sends every
-/// service. `service --stop` never does: `auth-service` is `essential`. Nothing needs saving on
-/// the way out, since every write to the users file is made whole — a new file, synced, then
-/// renamed over the old — before its answer is sent.
+/// **It exits on `CTRL_OP_SHUTDOWN`**, which a shutdown sends every service (`service --stop`
+/// never does: `auth-service` is `essential`). Nothing needs saving: every write to the users
+/// file is made whole — a new file, synced, then renamed over — before its answer is sent.
 fn serve_loop(serve_end: u64, mut control: u64) -> ! {
     kprint(b"auth-service: serving Auth::Authenticate over /svc/auth, and administration at /svc/auth/admin\n");
     loop {
-        // Wait on the forwarding endpoint plus every open auth session — the same shape
-        // `profile-server` and the compositor use, and the reason this server can now answer
-        // more than one supervisor.
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots and `n` is bounded by
         // `2 + MAX_SESSIONS`, which is that limit by construction (asserted above).
         let waited = unsafe {
@@ -321,12 +300,8 @@ fn serve_loop(serve_end: u64, mut control: u64) -> ! {
     }
 }
 
-/// Answer a resolve of `/svc/auth` by minting a session channel for the caller.
-///
-/// **This is what makes one oracle serve two supervisors.** Until M7 Part C `auth-service`
-/// created exactly one channel pair at startup and handed the client end to `session-mgr`
-/// through `service-mgr`, so a second supervisor could not reach it at all — one server, one
-/// client, by construction (`docs/architecture/session-and-auth.md`).
+/// Answer a resolve of `/svc/auth` by minting a session channel for the caller, so one oracle
+/// serves several supervisors (`docs/architecture/session-and-auth.md`).
 fn serve_resolve(serve_end: u64) {
     // SAFETY: valid recv out-params.
     let rr = unsafe {
@@ -349,9 +324,7 @@ fn serve_resolve(serve_end: u64) {
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
         );
         match decode(req) {
-            // **Two suffixes, and nothing else.** An empty one is the oracle itself; `admin` is
-            // the administrative session (administration Part D.1). Anything else names
-            // something that does not exist.
+            // **Two suffixes, nothing else**: empty is the oracle, `admin` the administrative one.
             Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
                 Some(r) if r.suffix.is_empty() => (m.op, m.request_id, Some(false)),
                 Some(r) if r.suffix == b"admin" => (m.op, m.request_id, Some(true)),
@@ -368,8 +341,7 @@ fn serve_resolve(serve_end: u64) {
     open_auth_session(serve_end, request_id, admin);
 }
 
-/// Mint a session channel — an oracle one, or an `admin` one — and hand its client end back in the
-/// resolve reply.
+/// Mint an oracle or `admin` session channel and hand its client end back in the resolve reply.
 fn open_auth_session(serve_end: u64, request_id: u64, admin: bool) {
     // SAFETY: single-threaded scan of the session table.
     let slot = unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == 0) };
@@ -399,7 +371,6 @@ fn open_auth_session(serve_end: u64, request_id: u64, admin: bool) {
     }
 }
 
-/// Serve one request on an open auth session. Frees the slot when the peer closes.
 fn serve_session(ch: u64) {
     // SAFETY: valid recv out-params (an Authenticate carries no transferred handles).
     let rr = unsafe {
@@ -426,8 +397,6 @@ fn serve_session(ch: u64) {
         return;
     }
 
-    // Decode the rsproto request from the IpcMsg payload (offset 24, `payload_len`),
-    // then build the reply into a local body buffer over non-aliasing statics.
     let mut reply_body = [0u8; 512];
     // SAFETY: read the header length + form a bounded read-only slice over RECV_MSG;
     // `USER_DB`/`USER_DB_LEN` are read-only here (written once at startup).
@@ -442,7 +411,6 @@ fn serve_session(ch: u64) {
                 let db = core::slice::from_raw_parts((&raw const USER_DB) as *const u8, USER_DB_LEN);
                 match serve_authenticate(m.body, db, &mut reply_body) {
                     Some(n) => (m.request_id, n, false),
-                    // Malformed request → an error reply.
                     None => {
                         let n = build_denied_reply(&mut reply_body).unwrap_or(0);
                         (m.request_id, n, true)
@@ -476,9 +444,8 @@ fn scrub_request() {
     }
 }
 
-/// **Serve one administrator's request** on an admin session, decided by the library
-/// (`auth_service::serve_admin`). A write is installed before it is answered, and the copy in
-/// memory changes only once the install holds.
+/// **Serve one administrator's request** on an admin session. A write is installed before it is
+/// answered, and the copy in memory changes only once the install holds.
 fn serve_admin_request(ch: u64) {
     // SAFETY: bounded read-only slice over the payload the kernel just wrote.
     let req = unsafe {
@@ -559,8 +526,7 @@ fn refuse_admin(ch: u64, op: u16, request_id: u64, name: &[u8], err: KError, why
     send_reply(ch, op, request_id, &body[..n], true);
 }
 
-/// A new password's salt, from the kernel's entropy source. `None` if the source is not open or
-/// will not answer.
+/// A new password's salt, from the kernel's entropy source; `None` if it is not open or fails.
 fn fresh_salt() -> Option<[u8; libusers::SALT_LEN]> {
     // SAFETY: single-threaded read of a handle set once at startup.
     let ent = unsafe { ENTROPY };
@@ -585,7 +551,6 @@ fn fresh_salt() -> Option<[u8; libusers::SALT_LEN]> {
     }
 }
 
-/// Wait for a `PendingOperation`, returning `(status, result)` and closing it.
 fn po_wait(po: u64) -> (i32, u64) {
     let handles = [po];
     let mut r = [0u8; 24];
@@ -610,7 +575,7 @@ fn install(bytes: &[u8]) -> Result<(), &'static [u8]> {
     let ns = unsafe { ROOT_NS };
     let path = |p: &[u8]| (p.as_ptr() as u64, p.len() as u64);
     let (np, nl) = path(USERS_NEW);
-    // 1. A leftover, cut to nothing. Absent is the usual case, and not an error.
+    // A leftover, cut to nothing. Absent is the usual case, and not an error.
     // SAFETY: a valid path and namespace handle.
     let po = unsafe { syscall5(SYS_FILE_TRUNCATE, ns, np, nl, RIGHT_MAP_READ | RIGHT_MAP_WRITE, 0) };
     if po > 0 {
@@ -620,7 +585,6 @@ fn install(bytes: &[u8]) -> Result<(), &'static [u8]> {
             unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
         }
     }
-    // 2. The new copy, at its size.
     // SAFETY: a valid path and namespace handle.
     let po = unsafe { syscall5(SYS_FILE_CREATE, ns, np, nl, RIGHT_MAP_READ | RIGHT_MAP_WRITE, bytes.len() as u64) };
     if po < 0 {
@@ -654,7 +618,6 @@ fn install(bytes: &[u8]) -> Result<(), &'static [u8]> {
     if synced != 0 {
         return Err(b"users.new could not be written back");
     }
-    // 3. Over the file, in one operation.
     let (up, ul) = path(USERS);
     // SAFETY: two valid paths and a namespace handle.
     let po = unsafe { syscall6(SYS_FILE_RENAME, ns, np, nl, up, ul, RENAME_REPLACE as u64) };
@@ -668,7 +631,6 @@ fn install(bytes: &[u8]) -> Result<(), &'static [u8]> {
     Ok(())
 }
 
-/// Close a session channel and free its slot.
 fn free_session(ch: u64) {
     // SAFETY: single-threaded table; closing a handle this process owns.
     unsafe {
@@ -682,10 +644,8 @@ fn free_session(ch: u64) {
     }
 }
 
-/// Reply to a resolve with the minted session channel in `handles[0]`.
-///
-/// There is no distinct "auth session" reply kind: an auth handle *is* a live channel to
-/// this server, exactly as a directory handle is to `profile-server`.
+/// Reply to a resolve with the minted session channel in `handles[0]`: an auth handle *is* a live
+/// channel to this server, as a directory handle is to `profile-server`.
 fn reply_session_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     let mut body = [0u8; RESOLVE_REPLY_LEN];
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
@@ -712,9 +672,8 @@ fn reply_session_handle(serve_end: u64, request_id: u64, client_end: u64) -> boo
 }
 
 /// Reply to a resolve with an error: **the whole twelve-byte `ErrorBody`**, as every server sends
-/// one. This sent four bytes until administration Part D.1, and the kernel reads a shorter body on
-/// a forwarded resolve as malformed, so a caller refused `NotFound` or `WouldBlock` here was
-/// handed `KernelError` instead — the view broker's own reply once did the same (PR #329 review).
+/// one. The kernel reads a shorter body on a forwarded resolve as malformed, so a caller refused
+/// `NotFound` or `WouldBlock` would be handed `KernelError` instead.
 fn reply_resolve_error(serve_end: u64, request_id: u64, op: u16, code: i32) {
     let mut body = [0u8; librsproto::error::ERROR_BODY_LEN];
     let _ = librsproto::error::error_body(&mut body, code, 0, b"");

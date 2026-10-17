@@ -1,20 +1,12 @@
 //! `sleep` — wait for a duration.
 //!
-//! Milestone 2 Part D. The waiting is three syscalls; the *parsing* is where this can be
-//! wrong, so it lives in [`coreutils::time::parse_duration`] and is tested on the host.
-//!
-//! ```text
-//! sleep 5        # seconds, by default
-//! sleep 1.5s
-//! sleep 200ms
-//! ```
+//! The waiting is three syscalls; the *parsing* is where this can be wrong, so it lives in
+//! [`coreutils::time::parse_duration`] and is tested on the host.
 //!
 //! ## Deliberate behaviours
 //!
 //! - **It blocks on a timer, it does not spin.** A one-shot timer armed at an absolute
-//!   monotonic deadline, then `sys_wait`. Nitrox has no sleeping syscall by design —
-//!   nothing blocks *inside* a syscall — so the shape here is arm-then-wait, which is
-//!   also why a `sleep` costs one runnable thread and no CPU.
+//!   monotonic deadline, then `sys_wait`: nothing blocks *inside* a syscall.
 //! - **The deadline is absolute, not a delay.** It is computed once from the monotonic
 //!   clock, so time spent between the read and the arm does not extend the wait.
 //! - **It emits nothing.** A stage that published a row would put a table into a
@@ -36,15 +28,12 @@ use libkern::syscall::{
 };
 use libkern::{exit, kprint};
 
-/// `alloc` backing: argument parsing allocates.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// Out-param for `sys_clock_read`.
 static mut CLOCK_BUF: u64 = 0;
-/// `sys_wait` in/out buffers — **two** handles now: the timer, and this process's
-/// notification channel, so a request to stop is noticed while the sleep is in progress
-/// rather than after it (§11h).
+/// `sys_wait` in/out buffers: the timer, and this process's notification channel, so a request
+/// to stop is noticed while the sleep is in progress.
 static mut WAIT_HANDLES: [u64; 2] = [0; 2];
 static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 
@@ -106,16 +95,9 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.die(b"sleep: cannot arm the timer\n", EXIT_FAILURE);
     }
 
-    // **Wait on the notification channel as well as the timer** (§11h).
-    //
-    // `sleep` is the coreutil where "stop early" actually means something, so it is the
-    // first stage to listen: a `Ctrl-C` during `sleep 30` should return the prompt now
-    // rather than in thirty seconds. Waiting on the timer alone is what would make the
-    // request arrive and do nothing — the notification would sit in the queue, unread,
-    // until the sleep it was meant to cut short had finished anyway.
-    //
-    // A stage that ignores this is not broken, it is merely not interruptible. That is the
-    // contract `sys_process_terminate` states, and this is what honouring it looks like.
+    // **Wait on the notification channel as well as the timer**, so a `Ctrl-C` during `sleep 30`
+    // returns the prompt now rather than in thirty seconds. A stage that ignores this is not
+    // broken, merely not interruptible.
     loop {
         // SAFETY: valid wait buffers; two handles.
         let waited = unsafe {

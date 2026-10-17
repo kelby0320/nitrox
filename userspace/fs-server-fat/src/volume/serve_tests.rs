@@ -1,4 +1,4 @@
-//! `Fat` through `libfsserver`'s request core (Phase 6 Part E.4): what the kernel is replied for a
+//! `Fat` through `libfsserver`'s request core: what the kernel is replied for a
 //! FAT, as `fs-server-ext4`'s volume tests check it for ext4.
 
 use super::*;
@@ -13,7 +13,6 @@ use librsproto::namespace::{
 };
 use librsproto::{OP_FILE_READ_RANGE, OP_NS_RESOLVE, OP_READY, RS_FLAG_ERROR, decode, encode};
 
-/// A `RESOLVE_FILE_LAZY` resolve for `suffix`: the kernel's form for a Model A file.
 fn lazy_request(request_id: u64, suffix: &[u8]) -> Vec<u8> {
     let mut body = [0u8; 256];
     let n = resolve_request(&mut body, 0x8000, RESOLVE_FILE_LAZY, suffix).unwrap();
@@ -22,8 +21,6 @@ fn lazy_request(request_id: u64, suffix: &[u8]) -> Vec<u8> {
     buf[..len].to_vec()
 }
 
-/// What a block-file reply says: its size, block size, runs as `(file block, device block,
-/// length)`, file id and flags.
 struct Blocks {
     size: u32,
     block_size: u32,
@@ -94,7 +91,7 @@ fn a_file_is_replied_in_sectors_with_its_first_cluster_as_its_id() {
 }
 
 /// **A grow's reply marks the sectors it added `UNWRITTEN`, which read zero on the device, and a
-/// plain resolve marks none** (Phase 6 Part H.4). A FAT file is replied in sectors, so a file grown
+/// plain resolve marks none**. A FAT file is replied in sectors, so a file grown
 /// from 1,000 bytes is marked from sector 2 — the first wholly past its old end — through the end of
 /// the clusters it took, its first two sectors read from the device as ever.
 #[test]
@@ -142,8 +139,6 @@ fn a_grows_reply_marks_the_sectors_it_added_and_they_read_zero() {
     assert!(later.iter().all(|r| r.3 == 0), "{later:?}");
 }
 
-/// **A file in more fragments than a reply holds is refused `TooLarge`**, as ext4's is: mtools
-/// fills the 70 holes left by deleting every other one-cluster file.
 #[test]
 fn a_file_in_more_than_64_fragments_is_refused_too_large() {
     let img = mformat(64, &["-c", "8"]);
@@ -167,7 +162,6 @@ fn a_file_in_more_than_64_fragments_is_refused_too_large() {
     assert_eq!(resolve(&Fat::new(&disk), b"huge.bin").err(), Some(KError::TooLarge.as_i32()));
 }
 
-/// **A range read** — the page-cache fill's other path — serves the window asked for.
 #[test]
 fn a_range_read_serves_the_window() {
     let img = mformat(16, &["-c", "4"]);

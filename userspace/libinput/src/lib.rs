@@ -1,26 +1,10 @@
-//! `libinput` — interpreting input, at both ends of the protocol.
+//! Interpreting input (`docs/architecture/input-subsystem.md` §4a): device [`InputEvent`]
+//! triples → logical events on the compositor side, and keycode + modifiers → text
+//! ([`keymap`]) on the client side.
 //!
-//! Two jobs that look unrelated and are the same one, which is why they share a crate
-//! (`docs/architecture/input-subsystem.md` §4a):
-//!
-//! - **Compositor side:** device [`InputEvent`] triples → logical events. The device layer
-//!   has no notion of "shift is held" — shift is an ordinary key there — so somebody must
-//!   accumulate that state, and it should be one somebody rather than one per consumer.
-//! - **Client side:** a keycode and modifiers → text. A layout is policy and data, which is
-//!   why it is not in the kernel; putting it in each application instead would be the same
-//!   mistake one layer up.
-//!
-//! **A client never reads the device stream.** Input reaches a window over its Surface
-//! session, routed by the compositor — so this crate is not "the client's input library". It
-//! owns *interpreting* input; `libsurface` owns *transporting* it to a window.
-//!
-//! ## What it deliberately does not do
-//!
-//! **It does not track where the pointer is.** The device layer reports motion as deltas, and
-//! turning deltas into a position needs a screen to clamp against — which the compositor owns
-//! and this crate does not. That is now **decided rather than deferred**
-//! (`deferred-decisions.md`, 2026-08-10): the compositor's `InputRouter` accumulates and
-//! clamps, and [`Logical::Motion`] carries the delta plus the state held during it.
+//! The device layer has no notion of "shift is held", so this crate accumulates it once. It
+//! does not track the pointer's position, which needs a screen to clamp against: the
+//! compositor's `InputRouter` does, and [`Logical::Motion`] carries the delta.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -35,40 +19,18 @@ use librsproto::surface::{LOCK_CAPS, LOCK_NUM, MOD_ALT, MOD_CTRL, MOD_META, MOD_
 
 pub mod keymap;
 
-/// Transitions one group may hold before further ones are dropped.
-///
-/// Three buttons, a motion and a loss marker is the largest plausible group; a device
-/// sending more than this in one `SYN` is malfunctioning, and dropping the surplus beats
-/// growing a buffer on its say-so.
+/// Transitions one group may hold before further ones are dropped: three buttons, a motion and a
+/// loss marker is the largest plausible group, and a device sending more is malfunctioning.
 pub const MAX_LOGICAL: usize = 5;
 
-/// How large an `out` slice [`Interpreter::feed`] needs to lose nothing: **two more than
-/// [`MAX_LOGICAL`]**.
-///
-/// The accumulated motion and the accumulated wheel are appended at flush time rather than
-/// queued, so a full group of transitions plus both is `MAX_LOGICAL + 2` events. A caller
-/// sizing its buffer to `MAX_LOGICAL` — as this crate's own tests did — silently loses them in
-/// exactly that case, which reads as a cursor that stops while keys are held.
-///
-/// **It was `+ 1` until the wheel existed**, and that is the shape of mistake this constant is
-/// for: a mouse reports movement, buttons and the wheel in *one* packet, so the worst case grew
-/// the moment a fourth packet byte started producing events.
+/// How large an `out` slice [`Interpreter::feed`] needs to lose nothing: [`MAX_LOGICAL`] plus
+/// the accumulated motion and wheel, which are appended at flush time rather than queued.
 pub const MAX_PER_GROUP: usize = MAX_LOGICAL + 2;
 
 /// One interpreted event — what happened, when, and the state that was true then.
 ///
-/// ## Every variant carries `time_ns`, and it is the *interrupt's* time
-///
-/// The kernel stamps every [`InputEvent`] at the interrupt and this crate used to drop it, so
-/// the moment a button went down was unavailable anywhere above the compositor's input thread —
-/// and a client wanting one (a double click is two presses close in time) had to read its own
-/// clock when the press was *delivered*. That is a different number whenever anything queued in
-/// between, which the `press-time` deferral recorded until M14 Part I paid it off.
-///
-/// **On the event rather than beside it.** The obvious alternative — `feed` tells the caller
-/// nothing and the caller passes the record's time alongside each `Logical` it routes — costs
-/// no field and reintroduces the whole bug on the first edit that reaches for the `now` already
-/// in scope. A number that can be swapped for the wrong number silently will be.
+/// Every variant carries `time_ns`, the kernel's stamp at the interrupt, not the time the event
+/// was delivered; a double click is two presses close in time.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Logical {
     /// A key or button transition, with the modifiers held at that moment.
@@ -80,7 +42,7 @@ pub enum Logical {
         /// Modifiers held **at this transition**.
         modifiers: u16,
         /// The locks on **at this transition**, a lock key's own press included: `LOCK_CAPS`,
-        /// `LOCK_NUM` (Phase 6 Part B.5).
+        /// `LOCK_NUM`.
         locks: u16,
         /// Kernel monotonic time at the interrupt. See the type's own docs.
         time_ns: u64,
@@ -91,21 +53,12 @@ pub enum Logical {
         dx: i32,
         /// Vertical delta, positive down.
         dy: i32,
-        /// Every button held during this motion.
-        ///
-        /// Carried rather than left to the consumer because **a drag is motion plus a held
-        /// button**, and the alternative is every consumer re-accumulating button state
-        /// from the transitions — the per-application duplication this layer exists to
-        /// prevent. A first version omitted it, and the resulting `PointerEvent` reported
-        /// `buttons == 0` for every motion of every drag (PR #180 review, finding 2).
+        /// Every button held during this motion: a drag is motion plus a held button.
         buttons: u16,
         /// Modifiers held during this motion — what makes a shift-drag expressible.
         modifiers: u16,
-        /// When the group this motion accumulated over was closed — its `SYN_REPORT`'s stamp.
-        ///
-        /// **The group's, because the motion is the group's**: a diagonal move is two records
-        /// summed into one event, and neither record's own time is more the answer than the
-        /// other's. They are microseconds apart in any case — one packet, one interrupt.
+        /// The closing `SYN_REPORT`'s stamp: the motion sums several records, so none's own
+        /// time is the answer.
         time_ns: u64,
     },
     /// A pointer button transition.
@@ -123,34 +76,25 @@ pub enum Logical {
     },
     /// The wheel turned, as a **delta in detents**.
     ///
-    /// **Its own variant rather than a third axis on [`Motion`](Self::Motion)**: a consumer
-    /// acts on the two completely differently — motion moves a cursor, a wheel scrolls
-    /// whatever is under it — and folding them together would make every motion handler test
-    /// a field it does not care about, with the failure being a window that scrolls whenever
-    /// the mouse is moved.
+    /// Not an axis of [`Motion`](Self::Motion): motion moves a cursor, the wheel scrolls what
+    /// is under it.
     Wheel {
-        /// Detents, positive **down**. See `REL_WHEEL` for why that is the screen's sign
-        /// rather than Linux's.
+        /// Detents, positive **down** (the screen's sign, not Linux's; see `REL_WHEEL`).
         dz: i32,
-        /// Buttons held while it turned, carried for [`Motion`](Self::Motion)'s reason.
+        /// Buttons held while it turned.
         buttons: u16,
-        /// Modifiers held while it turned — what makes Ctrl-scroll expressible.
+        /// Modifiers held while it turned.
         modifiers: u16,
-        /// When the group this accumulated over was closed, as for [`Motion`](Self::Motion).
+        /// The closing `SYN_REPORT`'s stamp, as for [`Motion`](Self::Motion).
         time_ns: u64,
     },
     /// Events were lost upstream; **accumulated state has been reset**.
     ///
-    /// The consumer must discard whatever it believed about held keys and buttons. A
-    /// consumer that ignores this carries a phantom held modifier for the rest of a session,
-    /// which is exactly the failure `SYN_DROPPED` exists to prevent.
+    /// The consumer must discard what it believed about held keys and buttons, or it carries
+    /// a phantom held modifier.
     Dropped {
-        /// When the loss was reported.
-        ///
-        /// **A loss is a moment too**, and this one is load-bearing rather than decorative: a
-        /// consumer that synthesises anything on a drop — the compositor synthesises the
-        /// crossings a broken grab implies — has to stamp it with something, and the only
-        /// alternative is the clock it happens to read next.
+        /// When the loss was reported; a consumer synthesising events on a drop stamps them
+        /// with it.
         time_ns: u64,
     },
 }
@@ -175,23 +119,15 @@ fn modifier_slot(keycode: u16) -> Option<usize> {
 
 /// Whether `keycode` is a modifier key — shift, control, alt or meta, either side.
 ///
-/// Modifiers arrive as ordinary [`Logical::Key`] events, because they *are* key transitions
-/// and a consumer may legitimately care about them. What a consumer must not do is treat them
-/// as ordinary text keys, and this is what lets it tell the difference without knowing the
-/// keycode table.
-///
-/// The compositor's key repeat is the case that named it: it armed a repeat from any key
-/// press, so holding Ctrl before a shortcut sent the focused window 25 `KEY_REPEAT`s a second,
-/// and pressing a modifier while another key was held replaced that key's repeat outright
-/// (PR #185 review, finding 2).
+/// Modifiers arrive as ordinary [`Logical::Key`] events; a consumer such as key repeat must
+/// not treat them as text keys.
 pub fn is_modifier(keycode: u16) -> bool {
     modifier_slot(keycode).is_some()
 }
 
-/// **The keypad's navigation keys** (Phase 6 Part B.5), as `(keypad keycode, the key it stands for
-/// with Num Lock off)`: 7 Home, 8 Up, 9 Page Up, 4 Left, 6 Right, 1 End, 2 Down, 3 Page Down,
-/// 0 Insert, `.` Delete. Delivered as those keys, every client that acts on them takes the keypad
-/// unchanged.
+/// The keypad's navigation keys, as `(keypad keycode, the key it stands for with Num Lock
+/// off)`: 7 Home, 8 Up, 9 Page Up, 4 Left, 6 Right, 1 End, 2 Down, 3 Page Down, 0 Insert,
+/// `.` Delete.
 const KEYPAD_NAV: [(u16, u16); 10] = [
     (71, KEY_HOME),
     (72, KEY_UP),
@@ -211,15 +147,14 @@ const KEY_KP5: u16 = 76;
 /// The lock keys, and the bit each toggles.
 const LOCK_KEYS: [(u16, u16); 2] = [(KEY_CAPSLOCK, LOCK_CAPS), (KEY_NUMLOCK, LOCK_NUM)];
 
-/// **Whether `keycode` is a lock key** — Caps Lock or Num Lock (Phase 6 Part B.5). Like a
-/// modifier, it changes how other keys read rather than being one to repeat.
+/// Whether `keycode` is a lock key — Caps Lock or Num Lock. Like a modifier, it is not one to
+/// repeat.
 pub fn is_lock_key(keycode: u16) -> bool {
     LOCK_KEYS.iter().any(|&(k, _)| k == keycode)
 }
 
-/// **The keyboard lights `locks` call for** (Phase 6 Part B.5): the byte a keyboard's node takes,
-/// `LIGHT_NUM` for Num Lock and `LIGHT_CAPS` for Caps Lock. Scroll Lock is not a lock here, so
-/// its light stays off.
+/// The keyboard lights `locks` call for: the byte a keyboard's node takes. Scroll Lock is not
+/// a lock here, so its light stays off.
 pub fn lights(locks: u16) -> u8 {
     let mut l = 0;
     if locks & LOCK_NUM != 0 {
@@ -243,18 +178,14 @@ fn button_bit(code: u16) -> Option<u16> {
 
 /// The device-stream interpreter: triples in, logical events out.
 ///
-/// Feed it every record; it emits when a group's `SYN_REPORT` arrives, because that is when a
-/// logical event is complete. A diagonal move is `REL_X`, `REL_Y`, `SYN` and must become
-/// **one** motion, not two.
+/// It emits when a group's `SYN_REPORT` arrives; a diagonal move (`REL_X`, `REL_Y`, `SYN`) is
+/// one motion.
 #[derive(Clone, Copy, Debug)]
 pub struct Interpreter {
     /// Which modifier **keys** are down, one bit per entry of [`MOD_KEYS`].
     ///
-    /// The mask handed to consumers is *derived* from this rather than edited in place. The
-    /// first version tracked the mask directly and cleared `MOD_SHIFT` when either shift
-    /// came up — so holding both and releasing one reported no shift while a key was still
-    /// down. Tracking the keys and deriving the mask is how X11 and Wayland avoid the same
-    /// bug with a single `ShiftMask` bit: **the shared bit was never the defect**.
+    /// The mask handed to consumers is derived from this: editing a shared mask bit would
+    /// clear `MOD_SHIFT` when one of two held shifts came up.
     held_mods: u8,
     buttons: u16,
     /// Motion accumulated within the current group.
@@ -265,12 +196,10 @@ pub struct Interpreter {
     /// Key/button transitions seen in the current group, awaiting its `SYN`.
     pending: [Option<Logical>; MAX_LOGICAL],
     pending_n: usize,
-    /// **The locks on** (Phase 6 Part B.5): `LOCK_CAPS`, `LOCK_NUM`. Num Lock is on from the start.
+    /// The locks on: `LOCK_CAPS`, `LOCK_NUM`. Num Lock is on from the start.
     locks: u16,
-    /// Which lock keys are down, one bit per entry of [`LOCK_KEYS`]: **a held lock key toggles
-    /// once**. A PS/2 keyboard's typematic repeat arrives as further presses with no release
-    /// between, so a lock that toggled on every press would flip at the repeat rate while held
-    /// (PR #357 review).
+    /// Which lock keys are down, one bit per entry of [`LOCK_KEYS`]: a held lock key toggles
+    /// once, though a PS/2 keyboard's typematic repeat sends further presses with no release.
     lock_keys_down: u8,
     /// Which keypad keys are down, one bit per entry of [`KEYPAD_NAV`] and bit 10 for keypad 5,
     /// and which of them went down as navigation keys: **a release is its press's keycode**, so a
@@ -288,8 +217,7 @@ impl Default for Interpreter {
 }
 
 impl Interpreter {
-    /// An interpreter with nothing held, and **Num Lock on**, so the keypad types digits from the
-    /// start (Phase 6 Part B.5).
+    /// An interpreter with nothing held, and **Num Lock on**, so the keypad types digits.
     pub const fn new() -> Self {
         Self {
             held_mods: 0,
@@ -306,13 +234,12 @@ impl Interpreter {
         }
     }
 
-    /// **The locks on**: `LOCK_CAPS`, `LOCK_NUM` (Phase 6 Part B.5). What a key carries to a client,
-    /// and what the keyboards' lights show.
+    /// The locks on: `LOCK_CAPS`, `LOCK_NUM`.
     pub fn locks(&self) -> u16 {
         self.locks
     }
 
-    /// **A lock key's transition**: a first press toggles its lock, a release lets it toggle again.
+    /// A first press toggles the lock; a release lets it toggle again.
     fn lock_key(&mut self, code: u16, pressed: bool) {
         let Some(i) = LOCK_KEYS.iter().position(|&(k, _)| k == code) else {
             return;
@@ -327,9 +254,9 @@ impl Interpreter {
         }
     }
 
-    /// **The keycode a key is delivered as**, or `None` for none (Phase 6 Part B.5): keypad Enter
-    /// as Enter always, and with Num Lock off — as it was when the key first went down — the
-    /// keypad's navigation keys as the keys they stand for, and keypad 5 as nothing.
+    /// The keycode a key is delivered as, or `None`: keypad Enter as Enter always, and with Num
+    /// Lock off (as when the key first went down) the keypad's navigation keys as the keys they
+    /// stand for and keypad 5 as nothing.
     fn translate(&mut self, code: u16, pressed: bool) -> Option<u16> {
         if code == KEY_KPENTER {
             return Some(KEY_ENTER);
@@ -362,10 +289,7 @@ impl Interpreter {
 
     /// Modifiers currently held, derived from which modifier keys are down.
     ///
-    /// Left and right share a bit deliberately — a client asking "was shift held" should not
-    /// have to ask twice, which is what X11's `ShiftMask` and Wayland's xkb mask also do.
-    /// The *keycodes* stay distinct, so a consumer that genuinely needs the side reads them;
-    /// adding `MOD_*_R` bits later is additive.
+    /// Left and right share a bit; the keycodes stay distinct for a consumer that needs the side.
     pub fn modifiers(&self) -> u16 {
         let mut m = 0;
         for (i, &(_, bit)) in MOD_KEYS.iter().enumerate() {
@@ -388,10 +312,8 @@ impl Interpreter {
             EV_KEY => {
                 let pressed = e.value != 0;
                 if let Some(slot) = modifier_slot(e.code) {
-                    // **State updates before the event is built**, so pressing shift reports
-                    // `MOD_SHIFT` set. "Modifiers held at this transition" includes the
-                    // transition itself; the alternative reports shift-down with no shift,
-                    // which no consumer expects.
+                    // Updated before the event is built: the modifiers held at a transition
+                    // include the transition itself.
                     if pressed {
                         self.held_mods |= 1 << slot;
                     } else {
@@ -428,12 +350,10 @@ impl Interpreter {
                 0
             }
             EV_SYN if e.code == SYN_DROPPED => {
-                // Everything accumulated is now a guess. Reset and say so — a consumer that
-                // keeps its held-key set across a gap is the phantom-modifier bug.
+                // A guess now: reset, and report the loss at once rather than at the next `SYN`.
                 self.held_mods = 0;
                 self.buttons = 0;
-                // **But not the locks**: a lock is not a held key, and its light goes on showing it
-                // (PR #357 review). Which lock and keypad keys are down is a guess like the rest.
+                // Not the locks: a lock is not a held key, and its light goes on showing it.
                 self.lock_keys_down = 0;
                 self.keypad_down = 0;
                 self.keypad_as_nav = 0;
@@ -452,8 +372,7 @@ impl Interpreter {
         }
     }
 
-    /// Queue a transition for the current group, dropping it if the group is implausibly
-    /// large rather than growing without bound.
+    /// Queue a transition for the current group, dropping it if the group is full.
     fn push(&mut self, l: Logical) {
         if self.pending_n < self.pending.len() {
             self.pending[self.pending_n] = Some(l);
@@ -461,10 +380,8 @@ impl Interpreter {
         }
     }
 
-    /// Emit the current group and reset it, stamping what it accumulated with `time_ns`.
-    ///
-    /// The transitions were stamped when they arrived; only the accumulated motion is stamped
-    /// here, because only it was assembled from several records.
+    /// Emit the current group and reset it; transitions keep their own stamps, the accumulated
+    /// motion and wheel take `time_ns`.
     fn flush(&mut self, time_ns: u64, out: &mut [Logical]) -> usize {
         let mut n = 0;
         for slot in self.pending.iter_mut().take(self.pending_n) {
@@ -486,9 +403,7 @@ impl Interpreter {
             };
             n += 1;
         }
-        // **After the motion, and a separate event from it.** One packet can carry both — a
-        // hand resting on a mouse moves it while turning the wheel — and a consumer wants the
-        // cursor moved before it decides what the wheel turned *over*.
+        // After the motion: the cursor moves before the wheel's target is decided.
         if self.dz != 0 && n < out.len() {
             out[n] = Logical::Wheel { dz: self.dz, buttons: self.buttons, modifiers: self.modifiers(), time_ns };
             n += 1;
@@ -505,13 +420,7 @@ mod tests {
     use super::*;
     use libkern::abi::{KEY_ESC, KEY_PRESS, KEY_RELEASE};
 
-    /// The time every helper below stamps.
-    ///
-    /// **Nonzero deliberately.** With the helpers stamping zero, every assertion in this
-    /// module would read `time_ns: 0` and hold just as well for an interpreter that dropped
-    /// the field and defaulted it — the assertion would be decoration. One shared constant
-    /// makes each of them a check; `the_interrupts_own_time_reaches_each_event` is the one
-    /// that pins *which* record's time each event gets.
+    /// The time every helper stamps; nonzero so an interpreter that dropped `time_ns` fails.
     const T: u64 = 9_000_000_000;
 
     fn key(code: u16, down: bool) -> InputEvent {
@@ -539,8 +448,6 @@ mod tests {
 
     #[test]
     fn nothing_is_emitted_until_the_group_ends() {
-        // The property the whole accumulator exists for: a `SYN` is what completes a logical
-        // event, so acting on each record would double-report a diagonal move.
         let mut i = Interpreter::new();
         let mut out = [Logical::Dropped { time_ns: T }; MAX_PER_GROUP];
         assert_eq!(i.feed(key(KEY_ESC, true), &mut out), 0, "the key alone completes nothing");
@@ -549,9 +456,6 @@ mod tests {
 
     #[test]
     fn a_motion_carries_the_buttons_held_during_it() {
-        // A drag is motion plus a held button. Without this a consumer implementing the
-        // standard "on motion, if a button is down, move the object" gets `buttons == 0`
-        // for every motion of every drag, and nothing ever drags (PR #180 review).
         let mut i = Interpreter::new();
         group(&mut i, &[key(BTN_LEFT, true), syn()]);
         let (out, n) = group(&mut i, &[rel(REL_X, 4), syn()]);
@@ -577,8 +481,6 @@ mod tests {
 
     #[test]
     fn a_key_carries_the_modifiers_held_at_its_transition() {
-        // Shift-A: the `a` must report MOD_SHIFT, which is the entire reason this layer
-        // exists — the device stream has no such field.
         let mut i = Interpreter::new();
         group(&mut i, &[key(KEY_LEFTSHIFT, true), syn()]);
         let (out, n) = group(&mut i, &[key(30, true), syn()]);
@@ -591,8 +493,6 @@ mod tests {
 
     #[test]
     fn pressing_a_modifier_reports_it_as_held() {
-        // State updates before the event is built: shift-down with no shift set would be a
-        // surprise to every consumer.
         let mut i = Interpreter::new();
         let (out, _) = group(&mut i, &[key(KEY_LEFTSHIFT, true), syn()]);
         assert_eq!(
@@ -616,10 +516,7 @@ mod tests {
 
     #[test]
     fn releasing_one_shift_while_the_other_is_held_keeps_shift_set() {
-        // The bug a naive `mask &= !bit` has, and the reason the mask is *derived* from held
-        // keys rather than edited: with both shifts down, releasing one must not report that
-        // no shift is held while a key is still physically down. X11 and Wayland avoid this
-        // with a single `ShiftMask` too — the shared bit was never the defect.
+        // A naive `mask &= !bit` would report no shift while one is still down.
         let mut i = Interpreter::new();
         group(&mut i, &[key(KEY_LEFTSHIFT, true), syn()]);
         group(&mut i, &[key(KEY_RIGHTSHIFT, true), syn()]);
@@ -641,8 +538,6 @@ mod tests {
 
     #[test]
     fn the_sides_are_tracked_separately_across_every_modifier() {
-        // The same asymmetry for ctrl/alt/meta, since one shared slot per pair would pass
-        // the shift test above by luck.
         for (l, r, bit) in [
             (KEY_LEFTCTRL, KEY_RIGHTCTRL, MOD_CTRL),
             (KEY_LEFTALT, KEY_RIGHTALT, MOD_ALT),
@@ -682,9 +577,7 @@ mod tests {
 
     #[test]
     fn a_button_is_not_reported_as_a_key() {
-        // Buttons share `EV_KEY` with keys on the wire; a consumer routing by window needs
-        // them apart, since a key goes to the focused window and a click to the one under
-        // the pointer.
+        // Buttons share `EV_KEY` with keys on the wire.
         let mut i = Interpreter::new();
         let (out, _) = group(&mut i, &[key(BTN_MIDDLE, true), syn()]);
         assert!(matches!(out[0], Logical::Button { .. }));
@@ -692,8 +585,6 @@ mod tests {
 
     #[test]
     fn a_dropped_marker_resets_state_and_is_reported_immediately() {
-        // Immediately, not at the next SYN: the marker *is* the news, and a consumer holding
-        // stale state until the next group would act on it in between.
         let mut i = Interpreter::new();
         group(&mut i, &[key(KEY_LEFTSHIFT, true), key(BTN_LEFT, true), syn()]);
         assert_eq!(i.modifiers(), MOD_SHIFT);
@@ -706,12 +597,7 @@ mod tests {
         assert_eq!(i.buttons(), 0);
     }
 
-    /// Everything one packet can carry at once — five transitions, a motion and a wheel.
-    ///
-    /// The two accumulated events are appended at flush rather than queued, so they do not
-    /// compete with the transitions for `MAX_LOGICAL` slots and need the two extra ones.
-    /// Sized short, they are what falls off the end — and a cursor that freezes while three
-    /// buttons are held is a maddening bug to find from the symptom.
+    /// Five transitions, a motion and a wheel: sized short, the accumulated events fall off.
     #[test]
     fn a_full_group_plus_motion_and_a_wheel_needs_the_whole_max_per_group() {
         const GROUP: [fn() -> InputEvent; 7] = [
@@ -750,11 +636,7 @@ mod tests {
         assert!(!small.iter().any(|l| matches!(l, Logical::Motion { .. } | Logical::Wheel { .. })));
     }
 
-    /// A wheel is its own event, not a third axis on the motion.
-    ///
-    /// **Both in one group, which is what a real packet looks like**: a hand resting on a
-    /// mouse moves it while turning the wheel, and an implementation that folded the two
-    /// together would make every motion handler scroll.
+    /// A wheel is its own event, not a third axis on the motion, even in one group.
     #[test]
     fn a_wheel_is_a_separate_event_from_the_motion_in_the_same_group() {
         let mut i = Interpreter::new();
@@ -764,7 +646,6 @@ mod tests {
         assert_eq!(out[1], Logical::Wheel { dz: 1, buttons: 0, modifiers: 0, time_ns: T });
     }
 
-    /// Detents within one group are summed, and a group with none emits nothing.
     #[test]
     fn wheel_detents_accumulate_within_a_group_and_a_still_wheel_is_not_an_event() {
         let mut i = Interpreter::new();
@@ -775,12 +656,10 @@ mod tests {
         let (_, n) = group(&mut i, &[rel(REL_WHEEL, 0), syn()]);
         assert_eq!(n, 0, "a zero delta is not an event, as for motion");
 
-        // And the accumulator was reset by the flush, or the next group would re-report it.
         let (_, n) = group(&mut i, &[key(30, true), syn()]);
         assert_eq!(n, 1, "the key alone");
     }
 
-    /// A loss discards accumulated detents rather than re-emitting them afterwards.
     #[test]
     fn a_drop_discards_a_wheel_the_group_had_accumulated() {
         let mut i = Interpreter::new();
@@ -809,13 +688,8 @@ mod tests {
         assert_eq!(n, 0, "a zero delta is not an event");
     }
 
-    /// Each event carries the time of the record that produced it, not the group's last.
-    ///
-    /// **The times are made different on purpose**, which the helpers above cannot do: they
-    /// stamp one constant, so every assertion in this module holds equally for an interpreter
-    /// that took the `SYN`'s time for everything. This is the one that tells those apart — a
-    /// transition keeps the stamp of *its own* interrupt, and only the accumulated motion,
-    /// which is several records added together, takes the group's closing time.
+    /// The times differ on purpose: the helpers' one constant cannot tell an interpreter that
+    /// stamps everything with the `SYN`'s time from a correct one.
     #[test]
     fn the_interrupts_own_time_reaches_each_event() {
         let at = |mut e: InputEvent, t: u64| {
@@ -839,15 +713,11 @@ mod tests {
             "the motion is the group's, so it takes the group's time"
         );
 
-        // And a loss is a moment as well — the compositor stamps what it synthesises with it.
         assert_eq!(i.feed(at(dropped(), 400), &mut out), 1);
         assert_eq!(out[0], Logical::Dropped { time_ns: 400 });
     }
 
-    /// **A lock key's first press toggles its lock, and a held one toggles once** (Phase 6 Part
-    /// B.5; PR #357 review): a PS/2 keyboard's typematic repeat is press, press, release, with no
-    /// release between. Num Lock is on from the start, and a key carries the locks on at its
-    /// transition, the lock key's own press included.
+    /// A PS/2 typematic repeat is press, press, release, with no release between.
     #[test]
     fn a_held_lock_key_toggles_its_lock_once() {
         let mut i = Interpreter::new();
@@ -855,8 +725,7 @@ mod tests {
         let (out, n) = group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
         assert_eq!(n, 1);
         assert!(matches!(out[0], Logical::Key { keycode: KEY_CAPSLOCK, locks, .. } if locks == LOCK_NUM | LOCK_CAPS));
-        // **Checked after each repeat**, since two toggles cancel: asserted only after the second,
-        // an interpreter that toggled on every press passed this (PR #359 review).
+        // Checked after each repeat, since two toggles cancel.
         group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
         assert_eq!(i.locks(), LOCK_NUM | LOCK_CAPS, "a repeat toggled nothing");
         group(&mut i, &[key(KEY_CAPSLOCK, true), syn()]);
@@ -868,8 +737,7 @@ mod tests {
         assert_eq!(i.locks(), 0);
     }
 
-    /// **`SYN_DROPPED` clears no lock**: a lock is not a held key. A lock key held across the gap
-    /// can toggle again on its next press.
+    /// A lock key held across the gap can toggle again on its next press.
     #[test]
     fn a_drop_keeps_the_locks() {
         let mut i = Interpreter::new();
@@ -881,7 +749,7 @@ mod tests {
         assert_eq!(i.locks(), LOCK_NUM, "a press after the gap toggles");
     }
 
-    /// **Each lock lights its own light, in HID's order** — the order the kernel's drivers read.
+    /// The bits follow HID's LED order, which the kernel's drivers read.
     #[test]
     fn the_locks_light_their_own_lights() {
         assert_eq!(lights(0), 0);
@@ -902,8 +770,6 @@ mod tests {
             .collect()
     }
 
-    /// **The keypad**: its digits as themselves with Num Lock on, as the keys they stand for with
-    /// it off, keypad 5 as nothing, and keypad Enter as Enter either way.
     #[test]
     fn the_keypad_is_navigation_with_num_lock_off() {
         let mut i = Interpreter::new();
@@ -923,8 +789,7 @@ mod tests {
         assert_eq!(keycodes(&mut i, &[key(KEY_KPENTER, false), syn()]), vec![(KEY_ENTER, false)], "either way");
     }
 
-    /// **A release is its press's keycode**: keypad 4 pressed as Left releases as Left after Num
-    /// Lock came on in between, and its repeats stay Left.
+    /// Keypad 4 pressed as Left releases as Left after Num Lock came on in between.
     #[test]
     fn a_keypad_key_keeps_its_first_press_meaning() {
         let mut i = Interpreter::new();

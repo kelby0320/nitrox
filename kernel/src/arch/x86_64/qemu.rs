@@ -1,39 +1,20 @@
-//! QEMU integration-test support: the `isa-debug-exit` shutdown primitive.
+//! The `isa-debug-exit` shutdown primitive, compiled only under `test-harness`.
 //!
-//! Compiled **only** under the kernel's `test-harness` feature (`cargo xtask
-//! test-qemu`); it does not exist in production builds, so there is no
-//! emulator-exit backdoor in a shipping kernel. See
-//! `docs/conventions/qemu-integration-tests.md`.
-//!
-//! QEMU's `isa-debug-exit` device (`-device isa-debug-exit,iobase=0xf4,
-//! iosize=0x04`) turns a guest write to its I/O port into a host process exit:
-//! QEMU terminates with status `(value << 1) | 1`. The value is arbitrary — the
-//! xtask runner owns the pass/fail mapping (`0x10` → exit 33 = pass, `0x11` →
-//! exit 35 = fail). Because the low bit is always set, exit `0` is unreachable,
-//! so "pass" is a chosen odd code, not zero.
+//! A write to the device's port makes QEMU exit with `(value << 1) | 1`, so exit `0` is
+//! unreachable; the xtask runner maps `0x10` (exit 33) to pass and `0x11` (exit 35) to fail.
+//! See `docs/conventions/qemu-integration-tests.md`.
 
 use super::regs;
 
-/// The `isa-debug-exit` I/O port. Must match the `iobase=` the runner passes to
-/// QEMU (`tools/xtask`).
+/// The `isa-debug-exit` I/O port; must match the runner's `iobase=` (`tools/xtask`).
 const DEBUG_EXIT_PORT: u16 = 0xf4;
 
-/// Report the harness verdict `code` to QEMU's `isa-debug-exit` device (the low byte
-/// is what QEMU reads; it exits with `(code << 1) | 1`).
+/// Report the harness verdict `code` to QEMU's `isa-debug-exit` device.
 ///
-/// **Returns if — and only if — the device is absent**, which is not the exotic case the
-/// original version of this assumed. Only `xtask test-qemu` attaches
-/// `-device isa-debug-exit`; `check-input`, `check-display`, `check-terminal` and
-/// `test-interactive` boot this same `test-harness` image *without* it, because they need
-/// the guest alive after the boot self-test reports its verdict. For them the write is
-/// ignored and this returns.
-///
-/// It used to park the CPU in a bespoke `hlt` loop instead, "so we don't execute past a
-/// 'we're done' point". That cost two things and bought nothing: the CPU halted with
-/// interrupts disabled while still counted in `sched::online_mask`, deadlocking the
-/// machine's next TLB shootdown (see [`crate::sched::leave_online`]), and it stranded the
-/// calling thread forever on a CPU that would never run again. Returning lets the caller
-/// decide; the one caller that must not continue — the kernel panic path — halts itself.
+/// Returns if the device is absent: only `xtask test-qemu` attaches it, while the gates that
+/// boot this image to keep the guest alive after the verdict do not. It does not park the CPU,
+/// which would leave it in `sched::online_mask` with interrupts off and deadlock the next TLB
+/// shootdown (see [`crate::sched::leave_online`]); the panic path halts itself.
 pub fn debug_exit(code: u32) {
     // SAFETY: writing the harness verdict to the `isa-debug-exit` port. Under
     // the `test-harness` feature the runner always attaches the device at this

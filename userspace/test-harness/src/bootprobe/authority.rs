@@ -2,8 +2,6 @@
 
 use super::*;
 
-// === the power op, from a process without the object (administration Part E.3) ===================
-
 /// **`sys_power` from anything but `init` is refused**, and the machine goes on: with no handle,
 /// with a namespace this process may only look up in, and with a disk it may write — a `WRITE`
 /// handle, so it is the object's type that refuses it, not a missing right.
@@ -46,8 +44,6 @@ pub(super) fn power_refused_test(root_ns: u64) -> bool {
     true
 }
 
-// === setting the clock, without SYSTEM_CLOCK (administration Part E.5) ===========================
-
 /// **`sys_clock_set` is refused without `SYSTEM_CLOCK`**, which this process does not hold, and
 /// the clock does not move: a set to 2031 refused `NoAccess`, and the clock read either side of it
 /// within a minute of itself. Before the authority, the arguments: `Monotonic` never steps, and
@@ -89,13 +85,12 @@ pub(super) fn clock_set_refused_test() -> bool {
     true
 }
 
-/// **A direct-handle bind needs `TRANSFER`** (PR #342 review), since every resolve of the binding
-/// mints a handle to the object for whoever asked. Without it, `init` could publish its
-/// system-control object, whose handle carries no `TRANSFER` so that it cannot leave `init`.
+/// **A direct-handle bind needs `TRANSFER`**, since every resolve of the binding mints a handle
+/// to the object for whoever asked: without it, `init` could publish its system-control object,
+/// whose handle carries no `TRANSFER` so that it cannot leave `init`.
 ///
-/// This process holds no such object, so it makes one of its own shape: a memory object's handle,
-/// duplicated without `TRANSFER`, is refused `NoAccess`, and the original, with it, is taken — in
-/// the same namespace, so the refusal is the right's and not the bind's.
+/// A memory object's handle, duplicated without `TRANSFER`, is refused `NoAccess`, and the
+/// original, with it, is taken — in the same namespace, so the refusal is the right's.
 pub(super) fn bind_needs_transfer_test() -> bool {
     use libkern::{KError, RIGHT_INSPECT, RIGHT_MAP_READ, SYS_NS_BIND, SYS_NS_CREATE};
     let fail = |why: &[u8]| {
@@ -130,8 +125,6 @@ pub(super) fn bind_needs_transfer_test() -> bool {
     kprint(b"boot-probe: a direct bind needs TRANSFER: refused without it, taken with it ok\n");
     true
 }
-
-// === a resolve continued in another namespace (administration Part C.4) ===========================
 
 /// Reply `SUBNAMESPACE` to `request_id` on `ch`: the first `consumed` bytes of the suffix stand for
 /// `base` in `ns`, a duplicate of which is transferred (with `LOOKUP`, which the kernel requires).
@@ -174,15 +167,12 @@ pub(super) fn reply_subnamespace(ch: u64, request_id: u64, consumed: u16, base: 
     sr == 0
 }
 
-/// auth+session Part B milestone (selftest): prove **subtree-scoped namespace
-/// binding** end to end. `mount_one` bound the fs endpoint a second time at
-/// `/subtreetest` scoped to base `/system` (sharing the server's registration), so a
-/// lookup of `/subtreetest/current-generation` must forward `system/current-generation`
-/// to the server and resolve to the *same* file as `/system/current-generation`. Read
-/// the leading bytes of both and confirm they match — the kernel prepended the base to
-/// the forwarded suffix, and the shared registration routed both replies correctly.
+/// Prove **subtree-scoped namespace binding** end to end. `mount_one` bound the fs endpoint a
+/// second time at `/subtreetest` scoped to base `/system`, so a lookup of
+/// `/subtreetest/current-generation` must forward `system/current-generation` to the server and
+/// resolve to the *same* file as `/system/current-generation`; the leading bytes of both must
+/// match.
 pub(super) fn subtree_bind_test(root_ns: u64) -> bool {
-    // Resolve + map the first page of `path` read-only; returns its address or 0.
     fn map_first_page(root_ns: u64, path: &[u8]) -> u64 {
         let (st, fh) = ns_lookup(root_ns, path, RIGHT_MAP_READ);
         if st != 0 || fh == 0 {
@@ -190,7 +180,6 @@ pub(super) fn subtree_bind_test(root_ns: u64) -> bool {
         }
         // SAFETY: mapping a file handle we hold, read-only; the result is checked below
         let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, PAGE, RIGHT_MAP_READ) };
-        // The mapping pins its own reference to the object; close the handle.
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
         if addr < 0 { 0 } else { addr as u64 }
@@ -215,11 +204,7 @@ pub(super) fn subtree_bind_test(root_ns: u64) -> bool {
             break;
         }
     }
-    // SAFETY: unmap our two mappings. `init` ran this and never exits, so this said
-    // "init runs forever — don't leak"; `boot-probe` exits a few lines below and the address
-    // space goes with it either way. Still right to tidy before the checks that follow — and
-    // a file mapping released inside `AddressSpace::drop` is exactly what exposed the
-    // lock-order violation this move found.
+    // SAFETY: unmapping our two mappings, tidied before the checks that follow.
     unsafe {
         syscall2(SYS_MEMORY_UNMAP, direct, PAGE);
         syscall2(SYS_MEMORY_UNMAP, via_sub, PAGE);
@@ -233,25 +218,18 @@ pub(super) fn subtree_bind_test(root_ns: u64) -> bool {
     }
 }
 
-/// Prove `auth-service` serves **more than one client** — which is what M7 Part C claims and
-/// what nothing else here would check.
+/// Prove `auth-service` serves **more than one client**.
 ///
 /// `session-mgr` resolves `/svc/auth` at startup and holds its session for the machine's life,
-/// so by the time this runs there is already one client. Resolving a second is the whole
-/// assertion: before Part C `auth-service` minted one channel pair at startup and handed the
-/// only client end to `session-mgr`, so this could not have succeeded however it was asked.
-///
-/// **Without this the claim rides on `desktop-session-mgr`, which does not exist until Part
-/// D.** A capability specified, reasoned about, and reachable by nobody is exactly what the
-/// title cap in PR #233 turned out to be, and the fix there was to test the path rather than
-/// the component. This is that, one part earlier.
+/// so there is already one client when this runs; resolving a second is the whole assertion.
+/// It is tested here because the second consumer, `desktop-session-mgr`, comes later: a
+/// capability reachable by nobody is untested by its component alone.
 pub(super) fn auth_multi_client_test(root_ns: u64) -> bool {
     let (st, ch) = ns_lookup(root_ns, b"/svc/auth", libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT);
     if st != 0 || ch == 0 {
         kprint(b"boot-probe: /svc/auth second session FAIL\n");
         return false;
     }
-    // A second resolve, so the answer is not "one spare slot" but "it mints per caller".
     let (st2, ch2) = ns_lookup(root_ns, b"/svc/auth", libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT);
     // SAFETY: closing handles this process owns.
     unsafe {
@@ -263,8 +241,7 @@ pub(super) fn auth_multi_client_test(root_ns: u64) -> bool {
     // **The count is the assertion, not the handle values.** Two *successful* resolves while
     // `session-mgr` already holds one means three concurrent sessions, which one spare slot
     // cannot supply. Comparing `ch2 == ch` would be decoration: the probe holds `ch` open
-    // across the second resolve and `HandleTable::allocate` never re-issues a live slot, so
-    // the numbers differ whatever the server did (PR #235 review, finding 4).
+    // across the second resolve, so the numbers differ whatever the server did.
     if st2 != 0 || ch2 == 0 {
         kprint(b"boot-probe: /svc/auth third session FAIL (not minted per caller)\n");
         return false;
@@ -274,18 +251,16 @@ pub(super) fn auth_multi_client_test(root_ns: u64) -> bool {
 }
 
 /// Prove `sys_ns_derive` through the syscall, not only through `Namespace::try_derive`, whose host
-/// tests cannot see the rights check, the handle the syscall allocates, or the rights it carries
-/// (administration Part A.1).
+/// tests cannot see the rights check, the handle the syscall allocates, or the rights it carries.
 ///
 /// Four claims, each one a view depends on:
 /// 1. the copy resolves what its source resolves;
 /// 2. it can be sent — `TRANSFER` — which the `LOOKUP`-only root this process was spawned with
 ///    cannot, and it can be pruned, `UNBIND`;
-/// 3. pruning the copy leaves the source alone, the snapshot rule seen from the side that matters;
+/// 3. pruning the copy leaves the source alone;
 /// 4. a namespace handle without `LOOKUP` cannot be copied.
 ///
-/// `/subtreetest` is the test image's own `[[bind]]`, which `subtree_bind_test` above already
-/// resolves, so this borrows a binding that is known to be there rather than adding one.
+/// `/subtreetest` is the test image's own `[[bind]]`, already resolved by `subtree_bind_test`.
 pub(super) fn ns_derive_test(root_ns: u64) -> bool {
     const PATH: &[u8] = b"/subtreetest/current-generation";
     // SAFETY: a namespace handle this process holds.

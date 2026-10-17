@@ -1,19 +1,17 @@
-//! Kernel-side mirror of the `librsproto` wire codec — just enough of it for the
-//! **kernel↔userspace-server** ABI the forwarded namespace lookup needs (slice 7).
+//! Kernel-side mirror of the `librsproto` wire codec: just enough of it for the
+//! **kernel<->userspace-server** ABI the forwarded namespace lookup needs.
 //!
-//! When a client `sys_ns_lookup`s a path bound to a **Userspace Server**, the
-//! kernel speaks the resource-server protocol *on the client's behalf*: it builds
-//! a [`Namespace::Resolve`](build_resolve_request) request, sends it to the
-//! server's kernel-held endpoint, and later parses the server's
-//! [reply](parse_reply). `librsproto` (`userspace/librsproto/`) is the userspace
-//! mirror of the same format; this is a small hand-coded kernel copy because the
-//! kernel may not depend on a userspace crate (and `librsproto` pulls in `alloc`).
-//! Both sides are pinned by `docs/spec/rsproto-namespace-ops.md` +
-//! `rsproto-wire-format.md`; the host tests here round-trip against the documented
-//! offsets so the two codecs cannot drift.
+//! When a client `sys_ns_lookup`s a path bound to a **Userspace Server**, the kernel speaks the
+//! resource-server protocol *on the client's behalf*: it builds a
+//! [`Namespace::Resolve`](build_resolve_request) request, sends it to the server's kernel-held
+//! endpoint, and later parses the [reply](parse_reply). `librsproto` (`userspace/librsproto/`) is
+//! the userspace mirror of the same format; this is a small hand-coded kernel copy because the
+//! kernel may not depend on a userspace crate (and `librsproto` pulls in `alloc`). Both sides are
+//! pinned by `docs/spec/rsproto-namespace-ops.md` + `rsproto-wire-format.md`; the host tests here
+//! round-trip against the documented offsets so the two codecs cannot drift.
 //!
-//! Only the **server-bound request** (encode) and the **reply** (decode) paths
-//! exist — the kernel is purely the *client* of the forwarded Resolve. All
+//! Only the **server-bound request** (encode) and the **reply** (decode) exist: the kernel is
+//! purely the *client* of the forwarded Resolve. All multi-byte integers are little-endian.
 //! multi-byte integers are little-endian.
 
 #![allow(dead_code, reason = "the constants document the wire format; not all are read")]
@@ -36,12 +34,11 @@ const OP_NS_RESOLVE: u16 = 0x0100;
 /// Model-B page-cache fill (`docs/spec/rsproto-file-ops.md`).
 const OP_FILE_READ_RANGE: u16 = 0x0600;
 
-/// `RESOLVE_FILE_AS_MEMOBJ` — resolve a regular file to a read-only `MemoryObject`
-/// of its content, eagerly (slice 7).
+/// `RESOLVE_FILE_AS_MEMOBJ`: resolve a regular file to a read-only `MemoryObject` of its content.
 const RESOLVE_FILE_AS_MEMOBJ: u32 = 1 << 0;
-/// `RESOLVE_FILE_LAZY` — resolve a regular file to a lazily page-cache-filled
-/// `File` resource ([`OBJECT_KIND_FILE`]); the reply carries the file size and
-/// the kernel builds the page-cache object (slice 8). See `build_resolve_request`.
+/// `RESOLVE_FILE_LAZY`: resolve a regular file to a lazily page-cache-filled `File` resource
+/// ([`OBJECT_KIND_FILE`]); the reply carries the file size and the kernel builds the page-cache
+/// object. See `build_resolve_request`.
 pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
 
 /// Status-only success: the request mutated the filesystem and produced no object (the
@@ -49,20 +46,20 @@ pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
 pub const OBJECT_KIND_NONE: u16 = 0;
 /// Reply `object_kind`: `handles[0]` is a read-only `MemoryObject` of file content.
 pub const OBJECT_KIND_MEMOBJ: u16 = 1;
-/// Reply `object_kind`: **continue the resolve in another namespace** (administration Part
-/// C.4). `handles[0]` is a `Namespace` the server holds `LOOKUP` on, and the body says what the
-/// server answered for — [`subnamespace_reply`]: the first `consumed` bytes of the request's
-/// suffix stand for `base` in that namespace. The kernel resolves `base` plus the rest of the
-/// suffix there and carries the same operation on. `content_len` is unused.
+/// Reply `object_kind`: **continue the resolve in another namespace**. `handles[0]` is a
+/// `Namespace` the server holds `LOOKUP` on, and the body says what the server answered for
+/// ([`subnamespace_reply`]): the first `consumed` bytes of the request's suffix stand for `base` in
+/// that namespace. The kernel resolves `base` plus the rest of the suffix there and carries the
+/// same operation on. `content_len` is unused.
 pub const OBJECT_KIND_SUBNAMESPACE: u16 = 3;
 /// Reply `object_kind`: a lazily-filled file — `content_len` is the total file
 /// size and `handles[0]` is empty; the kernel builds the page-cache object,
 /// pointed back at the server, and fills it on demand via `build_read_range_request`.
 pub const OBJECT_KIND_FILE: u16 = 4;
-/// Reply `object_kind`: `handles[0]` is a live `IpcChannel` endpoint — a connection to
-/// the resolving server, not a file. The general "resolve a service path → get a channel
-/// to it" case (the logging service's first use); the kernel installs the transferred
-/// endpoint like any other resolved handle. `content_len` is unused.
+/// Reply `object_kind`: `handles[0]` is a live `IpcChannel` endpoint, a connection to the resolving
+/// server rather than a file: the general "resolve a service path, get a channel to it" case. The
+/// kernel installs the transferred endpoint like any other resolved handle. `content_len` is
+/// unused.
 pub const OBJECT_KIND_CHANNEL: u16 = 5;
 /// Reply `object_kind`: a **Model A** (block-filesystem) lazy file. `content_len` is the
 /// file size; `handles[0]` transfers the block **`DeviceNode`**; the reply body carries the
@@ -71,10 +68,9 @@ pub const OBJECT_KIND_CHANNEL: u16 = 5;
 /// `docs/architecture/filesystem-data-path.md`, `docs/spec/rsproto-block-ops.md`.
 pub const OBJECT_KIND_FILE_BLOCKS: u16 = 6;
 
-/// Model A resolve-reply body prefix: `ResolveReply` (8) + `block_size` (4) + `run_count`
-/// (4) + `file_id` (8) + `flags` (4) + reserved (4). The `run_count` `BlockRun`s follow, 24
-/// bytes each. The file id and flags arrived with administration Part C.1, when the page
-/// cache began keeping one object per file and needed to know which file a reply names.
+/// Model A resolve-reply body prefix: `ResolveReply` (8) + `block_size` (4) + `run_count` (4) +
+/// `file_id` (8) + `flags` (4) + reserved (4). The `run_count` `BlockRun`s follow, 24 bytes each.
+/// The file id and flags let the page cache keep one object per file.
 const FILE_BLOCKS_PREFIX_LEN: usize = 32;
 /// Wire length of one `BlockRun` in a Model A resolve reply.
 const BLOCK_RUN_WIRE_LEN: usize = 24;
@@ -107,8 +103,8 @@ pub struct FileBlocksHeader {
     pub flags: u32,
 }
 
-/// [`FileBlocksHeader::flags`]: the file may not be written — a read-only mount's. The kernel
-/// installs such a file without `MAP_WRITE` (administration Part C.3).
+/// [`FileBlocksHeader::flags`]: the file may not be written (a read-only mount's). The kernel
+/// installs such a file without `MAP_WRITE`.
 pub const FILE_BLOCKS_READ_ONLY: u32 = 1 << 0;
 
 /// Parse a Model A resolve reply body's header, or `None` if short. `body` is the rsproto
@@ -159,13 +155,10 @@ const RESOLVE_REPLY_LEN: usize = 8;
 /// Fixed prefix of an `ErrorBody` (before the optional message).
 const ERROR_BODY_LEN: usize = 12;
 
-/// Byte offset of the envelope's `request_id` field (a `u64`) within a message —
-/// the kernel stamps it *after* building the request, once the
-/// [`UserspaceServerReg`](crate::object::UserspaceServerReg) has assigned one
-/// under `SCHED`.
+/// Byte offset of the envelope's `request_id` field (a `u64`) within a message: the kernel stamps
+/// it *after* building the request, once the
+/// [`UserspaceServerReg`](crate::object::UserspaceServerReg) has assigned one under `SCHED`.
 pub const REQUEST_ID_OFFSET: usize = 8;
-
-// --- little-endian byte helpers --------------------------------------------
 
 fn put_u16(b: &mut [u8], off: usize, v: u16) {
     b[off..off + 2].copy_from_slice(&v.to_le_bytes());
@@ -188,15 +181,6 @@ fn get_u64(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(v)
 }
 
-/// Build a `Namespace::Resolve` request (envelope + body) into `out`, returning
-/// the total byte length, or `None` if `out` is too small or `suffix` is longer
-/// than `u16::MAX`. The `request_id` is written as `0`; the caller stamps the real
-/// id with [`stamp_request_id`] once it has been assigned. `requested_rights` is
-/// the lookup's requested `Rights` bits; `RESOLVE_FILE_LAZY` is always set (slice 8
-/// — files resolve to a demand-filled page-cache object). A server that does not
-/// honour the flag replies the eager `OBJECT_KIND_MEMOBJ` instead, which the kernel
-/// still installs (the slice-7 path); a server that does honour it replies
-/// `OBJECT_KIND_FILE`. `handle_count = 0` (the request carries no handles).
 /// `RESOLVE_GROW` — grow the resolved file to the `new_size` appended after the suffix
 /// (allocate blocks + extend its extent tree) **before** replying its Model A map. Combined
 /// with `RESOLVE_FILE_LAZY`. For `sys_file_grow`. See `docs/architecture/ext4-fs-server-rw.md`.
@@ -204,16 +188,16 @@ pub const RESOLVE_GROW: u32 = 1 << 2;
 /// `RESOLVE_CREATE` — create the file (in its parent directory) if it does not exist, before
 /// growing/mapping. Combined with `RESOLVE_GROW`. For `sys_file_create`.
 pub const RESOLVE_CREATE: u32 = 1 << 3;
-/// `RESOLVE_TRUNCATE` — **shrink** the resolved file to the `new_size` appended after the
-/// suffix (free the blocks past the new end) before replying its Model A map. Combined with
-/// `RESOLVE_FILE_LAZY`. For `sys_file_truncate`. The inverse of [`RESOLVE_GROW`], and a
-/// separate flag rather than "grow to a smaller size" because the two do opposite things to
-/// the block allocator and a caller must not get one when it asked for the other.
+/// `RESOLVE_TRUNCATE`: **shrink** the resolved file to the `new_size` appended after the suffix
+/// (free the blocks past the new end) before replying its Model A map. Combined with
+/// `RESOLVE_FILE_LAZY`. For `sys_file_truncate`. A separate flag from [`RESOLVE_GROW`]: the two do
+/// opposite things to the block allocator and a caller must not get one when it asked for the
+/// other.
 pub const RESOLVE_TRUNCATE: u32 = 1 << 4;
-/// `RESOLVE_RENAME` — rename the resolved path to a second path carried after the suffix,
-/// replying status-only (`OBJECT_KIND_NONE`). A rename names two directories, which a
-/// directory session cannot express; the namespace is the confinement boundary, and the
-/// kernel guarantees both paths share a binding. See the decision log (2026-07-29).
+/// `RESOLVE_RENAME`: rename the resolved path to a second path carried after the suffix, replying
+/// status-only (`OBJECT_KIND_NONE`). A rename names two directories, which a directory session
+/// cannot express; the namespace is the confinement boundary, and the kernel guarantees both paths
+/// share a binding. See the decision log (2026-07-29).
 pub const RESOLVE_RENAME: u32 = 1 << 5;
 
 /// Which size change a resolve carries. The size itself rides after the suffix.
@@ -316,6 +300,12 @@ pub fn build_resolve_request_rename(
     Some(total)
 }
 
+/// Build a `Namespace::Resolve` request (envelope + body) into `out`, returning the total byte
+/// length, or `None` if `out` is too small or `suffix` is longer than `u16::MAX`. The `request_id`
+/// is written as `0`; the caller stamps the real id with [`stamp_request_id`]. `requested_rights`
+/// is the lookup's requested `Rights` bits; `RESOLVE_FILE_LAZY` is always set. A server that does
+/// not honour it replies the eager `OBJECT_KIND_MEMOBJ`, which the kernel still installs; one that
+/// does replies `OBJECT_KIND_FILE`. `handle_count = 0` (the request carries no handles).
 pub fn build_resolve_request(out: &mut [u8], requested_rights: u64, suffix: &[u8]) -> Option<usize> {
     if suffix.len() > u16::MAX as usize {
         return None;
@@ -325,7 +315,6 @@ pub fn build_resolve_request(out: &mut [u8], requested_rights: u64, suffix: &[u8
     if out.len() < total {
         return None;
     }
-    // Envelope.
     put_u32(out, 0, RS_MAGIC);
     put_u16(out, 4, RS_VERSION);
     put_u16(out, 6, OP_NS_RESOLVE);
@@ -334,7 +323,6 @@ pub fn build_resolve_request(out: &mut [u8], requested_rights: u64, suffix: &[u8
     put_u32(out, 20, body_len as u32);
     put_u16(out, 24, 0); // handle_count
     put_u16(out, 26, 0); // _reserved
-    // Body: ResolveRequest.
     let b = RS_HEADER_LEN;
     put_u64(out, b, requested_rights);
     put_u32(out, b + 8, RESOLVE_FILE_LAZY);
@@ -421,11 +409,10 @@ const OP_FILE_FORGET: u16 = 0x0607;
 /// Bytes of a `File::Forget` body: the file id.
 const FORGET_LEN: usize = 8;
 
-/// The file id a **`File::Forget`** request names, if `buf` is one — the one message a server
-/// sends the kernel that is not a reply (administration Part C.1b). A server sends it on its
-/// forwarding endpoint before it frees a file's blocks, and frees them only once the kernel
-/// has answered: by then nothing of the file is in flight, and nothing more will be written.
-/// `None` for anything else, a reply included, so the caller routes it as before.
+/// The file id a **`File::Forget`** request names, if `buf` is one: the one message a server sends
+/// the kernel that is not a reply. A server sends it on its forwarding endpoint before it frees a
+/// file's blocks, and frees them only once the kernel has answered: by then nothing of the file is
+/// in flight. `None` for anything else, a reply included, so the caller routes it as before.
 pub fn forget_request(buf: &[u8]) -> Option<u64> {
     if buf.len() < RS_HEADER_LEN + FORGET_LEN || get_u32(buf, 0) != RS_MAGIC {
         return None;
@@ -441,25 +428,21 @@ pub fn forget_request(buf: &[u8]) -> Option<u64> {
 /// Bytes of a kernel-sent `File::Touch` body: the file id.
 const TOUCH_BY_ID_LEN: usize = 8;
 
-/// Build a `File::Touch` request into `out`: the envelope plus the file's **id** — the one
-/// its `FILE_BLOCKS` reply gave. By id, not by name, since administration Part C.1: a cached
-/// object is written back at a sync or an unmount, long after the resolve that named it, and a
-/// rename may have given that name to another file by then.
+/// Build a `File::Touch` request into `out`: the envelope plus the file's **id**, the one its
+/// `FILE_BLOCKS` reply gave. By id, not by name: a cached object is written back at a sync or an
+/// unmount, long after the resolve that named it, and a rename may have given that name to another
+/// file by then.
 ///
-/// Sent by the kernel after flushing a Model A file's pages, because that write is
-/// otherwise **invisible** to the server: an in-place, same-length overwrite goes
-/// straight from the page cache to the device with no resolve and no IPC, so nothing
-/// would ever move the inode's `mtime`.
+/// Sent by the kernel after flushing a Model A file's pages, because that write is otherwise
+/// **invisible** to the server: an in-place, same-length overwrite goes from the page cache to the
+/// device with no resolve and no IPC, so nothing would move the inode's `mtime`.
 ///
-/// Deliberately carries **no timestamp** — the server reads its own clock. A time supplied
-/// by whoever wrote the file would be a time the writer could choose, and timestamps are
-/// not the writer's to choose (the same reasoning that put the wall clock behind a syscall
-/// rather than a caller argument; decision log 2026-07-22).
+/// Deliberately carries **no timestamp**: the server reads its own clock, since a time supplied by
+/// the writer is one the writer could choose (decision log 2026-07-22).
 ///
-/// It also expects **no reply**: `request_id` stays `0` and nothing is registered as
-/// pending. That keeps `sys_file_sync` off a second blocking round trip, and ordering
-/// still holds where it matters — the request goes into the same endpoint ring as
-/// forwarded resolves, so a subsequent lookup of that file is processed after it.
+/// Expects **no reply**: `request_id` stays `0` and nothing is registered as pending, which keeps
+/// `sys_file_sync` off a second blocking round trip. Ordering holds where it matters: the request
+/// goes into the same endpoint ring as forwarded resolves.
 pub fn build_touch_request(out: &mut [u8], file_id: u64) -> Option<usize> {
     let body_len = TOUCH_BY_ID_LEN;
     let total = RS_HEADER_LEN + body_len;
@@ -478,13 +461,12 @@ pub fn build_touch_request(out: &mut [u8], file_id: u64) -> Option<usize> {
     Some(total)
 }
 
-/// Build a `File::ReadRange` request (envelope + body) into `out`, returning the
-/// total byte length, or `None` if `out` is too small or `suffix` exceeds
-/// `u16::MAX`. The kernel sends this to fill one page of a lazily-resolved file:
-/// `offset` is the (page-aligned) file offset, `len` the byte count (at most one
-/// page), `suffix` the path naming the file (the fill is stateless). The
-/// `request_id` is written `0`; the caller stamps it with [`stamp_request_id`].
-/// The filled bytes come back in the reply's `handles[0]` (a `MemoryObject`).
+/// Build a `File::ReadRange` request (envelope + body) into `out`, returning the total byte length,
+/// or `None` if `out` is too small or `suffix` exceeds `u16::MAX`. The kernel sends this to fill
+/// one page of a lazily-resolved file: `offset` is the (page-aligned) file offset, `len` the byte
+/// count (at most one page), `suffix` the path naming the file (the fill is stateless). The
+/// `request_id` is written `0`; the caller stamps it. The filled bytes come back in the reply's
+/// `handles[0]` (a `MemoryObject`).
 pub fn build_read_range_request(out: &mut [u8], offset: u64, len: u32, suffix: &[u8]) -> Option<usize> {
     if suffix.len() > u16::MAX as usize {
         return None;
@@ -494,7 +476,6 @@ pub fn build_read_range_request(out: &mut [u8], offset: u64, len: u32, suffix: &
     if out.len() < total {
         return None;
     }
-    // Envelope.
     put_u32(out, 0, RS_MAGIC);
     put_u16(out, 4, RS_VERSION);
     put_u16(out, 6, OP_FILE_READ_RANGE);
@@ -503,7 +484,6 @@ pub fn build_read_range_request(out: &mut [u8], offset: u64, len: u32, suffix: &
     put_u32(out, 20, body_len as u32);
     put_u16(out, 24, 0); // handle_count
     put_u16(out, 26, 0); // _reserved
-    // Body: ReadRangeRequest.
     let b = RS_HEADER_LEN;
     put_u64(out, b, offset);
     put_u32(out, b + 8, len);
@@ -587,16 +567,14 @@ pub const RESOLVE_OP: u16 = OP_NS_RESOLVE;
 mod tests {
     use super::*;
 
-    // The kernel encoder must agree byte-for-byte with `librsproto`'s decoder
-    // (and vice-versa). These tests pin the documented offsets; the userspace
-    // crate's own round-trip tests pin the same layout from the other side.
+    // The kernel encoder must agree byte-for-byte with `librsproto`'s decoder; these tests pin the
+    // documented offsets, and the userspace crate's round-trip tests pin the same layout.
 
     #[test]
     fn resolve_request_has_documented_layout() {
         let mut buf = [0u8; 128];
         let n = build_resolve_request(&mut buf, 0x8000, b"system/current-generation").unwrap();
         assert_eq!(n, RS_HEADER_LEN + RESOLVE_REQUEST_PREFIX_LEN + 25);
-        // Envelope.
         assert_eq!(get_u32(&buf, 0), RS_MAGIC);
         assert_eq!(get_u16(&buf, 4), RS_VERSION);
         assert_eq!(get_u16(&buf, 6), OP_NS_RESOLVE);
@@ -604,7 +582,6 @@ mod tests {
         assert_eq!(get_u32(&buf, 16), 0); // a request, no flags
         assert_eq!(get_u32(&buf, 20) as usize, RESOLVE_REQUEST_PREFIX_LEN + 25);
         assert_eq!(get_u16(&buf, 24), 0); // handle_count
-        // Body.
         let b = RS_HEADER_LEN;
         assert_eq!(get_u64(&buf, b), 0x8000); // requested_rights
         assert_eq!(get_u32(&buf, b + 8), RESOLVE_FILE_LAZY);
@@ -662,11 +639,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_non_reply_and_bad_magic() {
-        // A request (no REPLY flag) is not a reply.
         let mut req = [0u8; 64];
         build_resolve_request(&mut req, 0, b"x").unwrap();
         assert!(parse_reply(&req).is_none());
-        // Bad magic.
         let buf = [0u8; 32];
         assert!(parse_reply(&buf).is_none());
     }
@@ -685,13 +660,11 @@ mod tests {
         let mut buf = [0u8; 128];
         let n = build_read_range_request(&mut buf, 0x2000, 4096, b"system/big-file").unwrap();
         assert_eq!(n, RS_HEADER_LEN + READ_RANGE_REQUEST_PREFIX_LEN + 15);
-        // Envelope.
         assert_eq!(get_u32(&buf, 0), RS_MAGIC);
         assert_eq!(get_u16(&buf, 6), OP_FILE_READ_RANGE);
         assert_eq!(get_u64(&buf, REQUEST_ID_OFFSET), 0);
         assert_eq!(get_u32(&buf, 16), 0); // a request
         assert_eq!(get_u32(&buf, 20) as usize, READ_RANGE_REQUEST_PREFIX_LEN + 15);
-        // Body.
         let b = RS_HEADER_LEN;
         assert_eq!(get_u64(&buf, b), 0x2000); // offset
         assert_eq!(get_u32(&buf, b + 8), 4096); // len
@@ -720,9 +693,9 @@ mod tests {
         assert_eq!(e.kind, RangeReplyKind::Error { kerror: -10 });
     }
 
-    /// **The block reply's header is read at its documented offsets** — the id at 16, the flags
-    /// at 24, the first run at 32 — from bytes laid out by hand as the spec draws them, not by a
-    /// writer in this crate, so a reader and writer that moved together cannot agree by accident.
+    /// **The block reply's header is read at its documented offsets** (the id at 16, the flags at
+    /// 24, the first run at 32) from bytes laid out by hand, so a reader and writer that moved
+    /// together cannot agree by accident.
     #[test]
     fn a_file_blocks_header_carries_the_file_id_and_flags() {
         let mut body = [0u8; 32 + 24];
@@ -750,8 +723,8 @@ mod tests {
         assert_eq!(file_blocks_reply_header(&body[..31]), None, "a prefix a byte short");
     }
 
-    /// **A forget is read at the offsets a server writes** — laid out by hand here, since the
-    /// writer is `librsproto`'s — and only a request: a reply with the same op is not one.
+    /// **A forget is read at the offsets a server writes**, laid out by hand since the writer is
+    /// `librsproto`'s, and only a request: a reply with the same op is not one.
     #[test]
     fn a_forget_is_a_request_carrying_the_file_id() {
         let mut buf = [0u8; RS_HEADER_LEN + 8];
@@ -772,9 +745,8 @@ mod tests {
         assert_eq!(forget_request(&buf[..RS_HEADER_LEN + 7]), None);
     }
 
-    /// **A `SUBNAMESPACE` body is read at its documented offsets** — `consumed` at 8, the base's
-    /// length at 10, the base from 12 — from bytes laid out by hand, since the writer is
-    /// `librsproto`'s.
+    /// **A `SUBNAMESPACE` body is read at its documented offsets** (`consumed` at 8, the base's
+    /// length at 10, the base from 12) from bytes laid out by hand.
     #[test]
     fn a_subnamespace_reply_carries_what_was_consumed_and_the_base() {
         let mut body = [0u8; 12 + 5];
@@ -787,7 +759,6 @@ mod tests {
         assert_eq!(subnamespace_reply(&body[..11]), None, "a prefix a byte short");
     }
 
-    /// **The kernel's touch names the file by id**, eight bytes at the start of the body.
     #[test]
     fn a_touch_carries_the_file_id() {
         let mut out = [0u8; 64];

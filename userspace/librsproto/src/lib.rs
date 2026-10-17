@@ -1,21 +1,12 @@
 //! `librsproto` — the resource-server protocol wire codec.
 //!
-//! A pure byte codec for the protocol every userspace resource server speaks over
-//! IPC (`docs/spec/rsproto-wire-format.md` + `rsproto-namespace-ops.md`). It is
-//! `#![no_std]`, **no `alloc`**, `core` only, and has **no dependencies**: it
-//! serialises and parses messages in a **caller-provided buffer** (the
-//! `IpcMsg.payload`); transferred handles ride out-of-band in `IpcMsg.handles[]`,
-//! managed by the caller, so the codec only tracks `handle_count`. Multi-byte
-//! integers are little-endian; bodies are byte-serialised explicitly (no
-//! `#[repr(packed)]` field references) so the codec is robust regardless of
-//! alignment.
-//!
-//! Slice 7 builds the wire codec + the **server-side** path (parse a request,
-//! build a reply) that `fs-server-ext4` uses. A synchronous client (`RsClient`)
-//! is deferred to its first consumer (eshell).
-//!
-//! Under `cargo test` the crate compiles as host `std` so the round-trip logic is
-//! unit-tested.
+//! A pure byte codec for the protocol every userspace resource server speaks over IPC
+//! (`docs/spec/rsproto-wire-format.md` + `rsproto-namespace-ops.md`). It is `#![no_std]`, **no
+//! `alloc`**, with **no dependencies**: it serialises and parses messages in a
+//! **caller-provided buffer** (the `IpcMsg.payload`); transferred handles ride out-of-band in
+//! `IpcMsg.handles[]`, so the codec only tracks `handle_count`. Multi-byte integers are
+//! little-endian, byte-serialised explicitly (no `#[repr(packed)]` field references). Under
+//! `cargo test` the crate compiles as host `std`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -36,8 +27,6 @@ pub mod storage;
 pub mod surface;
 pub mod views;
 
-// --- Envelope (RsMsgHeader) -------------------------------------------------
-
 /// The protocol magic: ASCII `"RSMG"`. Every message begins with it.
 pub const RS_MAGIC: u32 = 0x5253_4D47;
 /// Wire size of [`RsMsgHeader`].
@@ -47,26 +36,18 @@ pub const RS_VERSION: u16 = 1;
 
 /// The largest rsproto message this codec will build, in bytes — envelope and body together.
 ///
-/// **A mirror of [`IPC_PAYLOAD_SIZE`], pinned rather than trusted.** The codec core is
-/// `core`-only by design (see this module's header), so it cannot *read* `libkern`'s constant;
-/// but two constants that agree by coincidence are exactly the seam this crate exists to close
-/// (PR #259 review, optional 5). The assertion below runs whenever `io` is on — which is every
-/// build that actually sends one of these — so a change to the IPC payload breaks the build
-/// here rather than truncating somebody's message in the guest.
+/// Mirrors `IPC_PAYLOAD_SIZE`, which the `core`-only codec cannot read; an assertion pins the
+/// two together whenever `io` is on.
 pub const RS_MAX_PAYLOAD: usize = 4008;
 
 #[cfg(feature = "io")]
 const _: () = assert!(RS_MAX_PAYLOAD == libkern::abi::IPC_PAYLOAD_SIZE);
 
-/// **The largest body one message can carry**: [`RS_MAX_PAYLOAD`] less the envelope. What every
-/// buffer a body is built in is sized by.
+/// The largest body one message can carry: [`RS_MAX_PAYLOAD`] less the envelope. Size every
+/// buffer a body is built in by this.
 ///
-/// **Not the page less its headers.** A message is a page, but its payload is the page less the
-/// IPC header *and the room for eight handles*, whether any are sent or not, and the kernel refuses
-/// a longer one. Five buffers missed one or the other — a directory reply's in `libfsserver`, which
-/// forgot the handles, and four others', which subtracted them and forgot the envelope — and a full
-/// one made a message no send could carry: the server's reply went nowhere and its client waited
-/// for good. A FAT directory of 126 files did it (Phase 6 Part H's dry run, 2026-10-08).
+/// Not the page less its headers: the payload is the page less the IPC header and room for
+/// eight handles, sent or not.
 pub const RS_MAX_BODY: usize = RS_MAX_PAYLOAD - RS_HEADER_LEN;
 
 /// `RsFlags` — message-envelope flags.
@@ -88,19 +69,15 @@ pub const OP_PING: u16 = 0x0003;
 /// `Meta::Ready` — startup signal on the control channel.
 pub const OP_READY: u16 = 0x0004;
 /// `Meta::Unmount` — a supervisor telling a filesystem server, on its control channel, to
-/// record the filesystem cleanly unmounted and exit (administration Part C.3). Empty body; the
-/// server answers with a reply — empty on success, an error body if the state could not be
-/// written — then exits.
+/// record the filesystem cleanly unmounted and exit. Empty body; the server answers with a
+/// reply — empty on success, an error body if the state could not be written — then exits.
 pub const OP_UNMOUNT: u16 = 0x0005;
 /// `Namespace::Resolve` — resolve a path suffix to a resource handle.
 pub const OP_NS_RESOLVE: u16 = 0x0100;
-/// `File::ReadRange` — read a byte range of a lazily-resolved file (the Model-B
-/// page-cache fill). See [`file`].
+/// `File::ReadRange` — read a byte range of a lazily-resolved file (Model-B page-cache fill).
 pub const OP_FILE_READ_RANGE: u16 = 0x0600;
 /// `File::ReadDir` — read a batch of entries from an open **directory handle** (a session
-/// channel the fs-server mints when a directory path resolves, scoped to that directory;
-/// see [`file`] and `docs/spec/rsproto-file-ops.md`). Client-initiated, sent on the
-/// directory channel; the reply rides back on the same channel.
+/// channel scoped to one directory); the reply rides back on it (`rsproto-file-ops.md`).
 pub const OP_FILE_READ_DIR: u16 = 0x0601;
 /// `File::Mkdir` — create a subdirectory `name` in the open directory handle. See [`file`].
 pub const OP_FILE_MKDIR: u16 = 0x0602;
@@ -112,38 +89,28 @@ pub const OP_FILE_RMDIR: u16 = 0x0604;
 pub const OP_FILE_RENAME: u16 = 0x0605;
 /// `File::Touch` — stamp the named file's modification time as "now".
 ///
-/// The odd one out among the `File::*` ops: from the kernel it is addressed by **file id on
-/// the server's forwarding endpoint**, not by name on a directory session, and it carries **no
-/// reply**. Both follow from who sends it — the *kernel*, after flushing a Model A file's
-/// dirty pages, to tell the server about a write it structurally could not have seen. See
-/// [`file::parse_touch_request`] and `docs/architecture/filesystem-data-path.md`.
+/// Addressed by **file id on the server's forwarding endpoint**, sent by the *kernel* after a
+/// Model A flush, with **no reply** (`rsproto-file-ops.md` § Touch). See
+/// [`file::parse_touch_request`].
 pub const OP_FILE_TOUCH: u16 = 0x0606;
-/// `File::Forget` — a **server telling the kernel** that a file is about to be freed, and the
-/// one request that travels that way on a forwarding endpoint (administration Part C.1b).
-/// Sent `SENDMODE_BLOCK`, it is answered by the send's `PendingOperation`, which completes
-/// once no I/O of the file is in flight; the server frees the file's blocks only then. See
-/// [`file::forget_request`] and `docs/spec/rsproto-file-ops.md`.
+/// `File::Forget` — a **server telling the kernel** that a file is about to be freed, sent
+/// `SENDMODE_BLOCK` on a forwarding endpoint and answered by the send's `PendingOperation`
+/// once no I/O of the file is in flight (`rsproto-file-ops.md` § Forget). See
+/// [`file::forget_request`].
 pub const OP_FILE_FORGET: u16 = 0x0607;
 /// `Input::Events` — a batch of `InputEvent` records from the `input-server` to a consumer.
 ///
-/// Server→consumer, no reply. The body is a whole number of 16-byte records, and a batch
-/// never splits a `SYN` group. See `docs/spec/rsproto-input-ops.md`.
+/// Server→consumer, no reply. The body is a whole number of 16-byte records; a batch never
+/// splits a `SYN` group (`rsproto-input-ops.md`).
 pub const OP_INPUT_EVENTS: u16 = 0x0A00;
-/// `Input::Lights` — the keyboard lights a consumer wants on, from it to the `input-server`
-/// (Phase 6 Part B.5).
+/// `Input::Lights` — the keyboard lights a consumer wants on, from it to the `input-server`.
 ///
-/// Consumer→server, no reply. The body is one byte, `LIGHT_NUM`, `LIGHT_CAPS` and
-/// `LIGHT_SCROLL` from `libkern::abi`; the server writes it to every keyboard it reads, and to
-/// each that arrives later. See `docs/spec/rsproto-input-ops.md`.
+/// Consumer→server, no reply. The body is one byte of `LIGHT_*` bits from `libkern::abi`
+/// (`rsproto-input-ops.md` § Lights).
 pub const OP_INPUT_LIGHTS: u16 = 0x0A01;
 
-// The `Tty` category is `0x0Bxx`. It occupied `0x09xx` from 2026-08-03 without registering
-// itself in `rsproto-wire-format.md`, and `Surface` was assigned that range on 2026-08-05 —
-// so five ops collided exactly (`OP_TTY_READ_LINE` and `OP_CREATE_WINDOW` were both
-// `0x0900`). Harmless on the wire, because a channel only ever carries one category's ops
-// and therefore disambiguates them, which is why it went unnoticed for three days. Moved on
-// 2026-08-06 when allocating `Input`; `Tty` moved rather than `Surface` because it was the
-// one with neither a registry row nor a spec, and it now has both.
+// The `Tty` category is `0x0Bxx`; `0x09xx` is `Surface`'s. A channel carries one category, so a
+// clash would not show on the wire, but the registry in `rsproto-wire-format.md` keeps them apart.
 
 /// `Tty::ReadLine` — ask the tty for one edited line. The reply body is the line's bytes
 /// (no terminator). Completes only when the user finishes a line, so a client may have at
@@ -151,96 +118,62 @@ pub const OP_INPUT_LIGHTS: u16 = 0x0A01;
 pub const OP_TTY_READ_LINE: u16 = 0x0B00;
 /// `Tty::Read` — take whatever input is available, **unedited**.
 ///
-/// The raw counterpart to [`OP_TTY_READ_LINE`]: it completes as soon as any byte arrives
-/// rather than waiting for a finished line, and the server's line discipline is not
-/// consulted at all. An interactive shell reads this way and does its own editing, which is
-/// exactly what `bash` does when it clears `ICANON` — the difference being that here the
-/// choice is per read rather than a mode the terminal is left in.
-///
-/// **There is deliberately no `TTY_MODE_RAW`.** Two read ops say the same thing with less
-/// state: a client asks for what it wants, when it wants it, and cannot leave a terminal in
-/// a mode some later reader did not expect.
+/// The raw counterpart to [`OP_TTY_READ_LINE`]: completes on any byte, with no line
+/// discipline. There is deliberately no `TTY_MODE_RAW` (`rsproto-tty-ops.md` § Read).
 pub const OP_TTY_READ: u16 = 0x0B04;
-/// `Tty::Write` — write the body's bytes to the terminal. This is what makes terminal
-/// output a **capability**: a process writes because it holds a tty channel, not because
-/// it can reach an ambient debug syscall.
+/// `Tty::Write` — write the body's bytes to the terminal; output is a **capability**.
 pub const OP_TTY_WRITE: u16 = 0x0B01;
 /// `Tty::SetMode` — one body byte of flags; bit 0 is echo.
 ///
-/// Echo belongs to the server, not the caller. It was a `bool` each client passed to its
-/// own `read_line`, so reading a password safely depended on every caller remembering to
-/// pass `false`.
+/// Echo belongs to the server, so reading a password does not depend on callers passing `false`.
 pub const OP_TTY_SET_MODE: u16 = 0x0B02;
 /// `Tty::Close` — the supervisor declaring this tty finished.
 ///
-/// **Revocation, not release.** Handles are refcounted and this kernel has none, so
-/// closing a handle cannot take a capability back from a process that outlived its
-/// session. The server declining to serve the channel is what makes teardown a guarantee.
+/// **Revocation, not release**: the server declining to serve the channel is what makes
+/// teardown a guarantee (`rsproto-tty-ops.md` § Close).
 pub const OP_TTY_CLOSE: u16 = 0x0B03;
 
-/// **Interrupt** — the one message a terminal sends *unsolicited* (§11h).
+/// **Interrupt** — the one message a terminal sends *unsolicited*.
 ///
-/// Every other op is a request the client made. This one is an event: the terminal saw
-/// `Ctrl-C` and is telling whoever holds it. It is not a signal — it is data on a channel
-/// the client already holds, and what it *means* is entirely the client's decision (a
-/// shell clears the line at a prompt and unwinds an evaluation in progress).
-///
-/// A client that never looks for it is unaffected: it queues like any other message, and
-/// the shell drains it with a non-blocking receive at its own checkpoints.
+/// An event, not a request: the terminal saw `Ctrl-C`; what it means is the client's decision
+/// (`rsproto-tty-ops.md` § Interrupt).
 pub const OP_TTY_INTERRUPT: u16 = 0x0B05;
 
 /// `Tty::AttachBackend` — hand the server the other end of this terminal.
 ///
-/// Sent by a terminal emulator on a terminal it resolved, moving **one handle**: a channel the
-/// emulator keeps the far end of. From then on that terminal's output arrives on the channel as
-/// [`OP_TTY_OUTPUT`] and its input is whatever the emulator sends back as [`OP_TTY_INPUT`],
-/// instead of the serial console.
-///
-/// **This is a pty, with the pieces named differently.** Unix puts the line discipline in the
-/// kernel between a master and a slave; here the tty server *is* the discipline, so the emulator
-/// holds what a master would be and the terminal itself is what it hands to the program it hosts.
-/// The emulator resolves `/dev/tty`, attaches its backend, and then gives the terminal away —
-/// it has no use for the client end.
-///
-/// Empty body. The reply is empty on success.
+/// Sent by a terminal emulator, moving **one handle**: a channel whose far end it keeps. That
+/// terminal's output then arrives on it as [`OP_TTY_OUTPUT`] and its input is whatever the
+/// emulator sends back as [`OP_TTY_INPUT`]. Empty body; empty reply on success
+/// (`rsproto-tty-ops.md` § AttachBackend).
 pub const OP_TTY_ATTACH_BACKEND: u16 = 0x0B06;
 
 /// Server → emulator on a backend channel: **render these bytes.**
 ///
-/// Unsolicited, `request_id` 0, no reply — the same shape as [`OP_TTY_INTERRUPT`]. Body is the
-/// bytes, already through the line discipline: this is what a serial console would have been
-/// sent, so an emulator is a terminal for the same byte stream rather than for a special one.
+/// Unsolicited, `request_id` 0, no reply, like [`OP_TTY_INTERRUPT`]; the bytes are already
+/// through the line discipline.
 pub const OP_TTY_OUTPUT: u16 = 0x0B07;
 
 /// Emulator → server on a backend channel: **the user typed these bytes.**
 ///
-/// Unsolicited, `request_id` 0, no reply. Body is what a keyboard would have produced on a
-/// serial line, encoder output included — the server runs the discipline over it exactly as it
-/// does over console input, which is what keeps one implementation of `Ctrl-C`, erase, and echo.
+/// Unsolicited, `request_id` 0, no reply; the server runs the line discipline over it as over
+/// console input.
 pub const OP_TTY_INPUT: u16 = 0x0B08;
 /// `Tty::OpenSibling` — mint **another terminal on this terminal's backend**, and hand back its
-/// channel (one moved handle in the reply). Empty request body.
 ///
-/// A shell gives each stage it spawns a terminal this way (administration Part A.2): the stage's
-/// terminal shares the shell's backend — the same window, or the serial console — so its prompt
-/// appears where the person is typing, while the shell keeps its own terminal and still sees
-/// `Ctrl-C`. Resolving `/dev/tty` cannot do this, because a resolve mints a terminal on the
-/// *default* backend rather than on a particular window's.
+/// A shell gives each stage a terminal on its own backend this way; resolving `/dev/tty` mints
+/// one on the *default* backend (`rsproto-tty-ops.md` § OpenSibling).
 pub const OP_TTY_OPEN_SIBLING: u16 = 0x0B09;
-/// `Tty::Token` — a **one-time token naming this terminal's backend** (laptop polish Part A).
-/// Empty request body; the reply is 16 bytes, good once, for thirty seconds.
+/// `Tty::Token` — a **one-time token naming this terminal's backend**.
 ///
-/// `with` asks for one and sends it with its request, so the view broker can remember a password
-/// per terminal without taking the caller's word for which terminal it is: the broker redeems the
-/// token itself ([`OP_TTY_REDEEM`]), over a channel it opened. Only a process holding a terminal
-/// on a backend can get a token for it.
+/// The view broker redeems it itself ([`OP_TTY_REDEEM`]), so it need not take the caller's
+/// word for which terminal it is; only a holder of a terminal on a backend can get one
+/// (`rsproto-tty-ops.md` § Token).
 pub const OP_TTY_TOKEN: u16 = 0x0B0A;
 /// `Tty::Redeem` — **which backend a token was minted for**, once. Request body: the 16 bytes.
 /// Reply: the backend's id, a little-endian `u32`; or `NotFound` for a token never minted, already
 /// redeemed, or expired. Answered on any terminal: knowing the token is the proof.
 pub const OP_TTY_REDEEM: u16 = 0x0B0B;
-/// Bytes in a `Tty::Token` — 128 bits. One length for the server that mints them and the request
-/// that carries one to the view broker.
+/// Bytes in a `Tty::Token` — 128 bits; one length for the minting server and the view broker.
 pub const TTY_TOKEN_LEN: usize = 16;
 
 /// Bit 0 of `Tty::SetMode`'s flags byte: echo typed characters back.
@@ -260,14 +193,18 @@ pub enum RsError {
     BadLength,
 }
 
-/// A decoded message envelope: the parsed header fields plus a borrow of the
-/// `body_len` body bytes that follow the header.
+/// A decoded message envelope: the parsed header fields plus a borrow of the body bytes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Message<'a> {
+    /// Protocol version (`RS_VERSION`).
     pub version: u16,
+    /// Operation discriminant (`category << 8 | specific`).
     pub op: u16,
+    /// Correlates a reply with its request; 0 for unsolicited messages.
     pub request_id: u64,
+    /// `RS_FLAG_*` bits.
     pub flags: u32,
+    /// Number of handles transferred out-of-band with the message.
     pub handle_count: u16,
     /// The operation body (exactly `body_len` bytes).
     pub body: &'a [u8],
@@ -306,8 +243,7 @@ pub fn encode(out: &mut [u8], op: u16, request_id: u64, flags: u32, body: &[u8],
     Some(total)
 }
 
-/// Parse a received `IpcMsg` payload (`buf`) into its envelope + body. Validates
-/// the magic and that the declared `body_len` fits within `buf`.
+/// Parse a received `IpcMsg` payload into its envelope + body, checking magic and `body_len`.
 pub fn decode(buf: &[u8]) -> Result<Message<'_>, RsError> {
     if buf.len() < RS_HEADER_LEN {
         return Err(RsError::Truncated);
@@ -329,8 +265,6 @@ pub fn decode(buf: &[u8]) -> Result<Message<'_>, RsError> {
         body: &buf[RS_HEADER_LEN..end],
     })
 }
-
-// --- little-endian byte helpers (shared by the body codecs) -----------------
 
 pub(crate) fn put_u16(b: &mut [u8], off: usize, v: u16) {
     b[off..off + 2].copy_from_slice(&v.to_le_bytes());
@@ -377,9 +311,7 @@ mod tests {
     fn decode_rejects_bad_magic_and_truncation() {
         assert_eq!(decode(&[0u8; 10]), Err(RsError::Truncated));
         let mut buf = [0u8; 28];
-        // Valid length but zero magic.
         assert_eq!(decode(&buf), Err(RsError::BadMagic));
-        // Good magic but body_len overruns the buffer.
         put_u32(&mut buf, 0, RS_MAGIC);
         put_u32(&mut buf, 20, 100);
         assert_eq!(decode(&buf), Err(RsError::BadLength));
@@ -391,10 +323,7 @@ mod tests {
         assert!(encode(&mut buf, OP_PING, 0, 0, &[], 0).is_none());
     }
 
-    /// **A body one byte over what a message carries is refused, in a buffer with room for it**:
-    /// the page less its IPC header has room for 4,044 bytes of body, and the kernel takes 3,980.
-    /// Until Phase 6 Part H the codec built such a message and the kernel refused the send, with
-    /// nothing to tell the receiver.
+    /// A body one byte over what a message carries is refused, in a buffer with room for it.
     #[test]
     fn encode_refuses_a_body_longer_than_a_message_carries() {
         let mut page = [0u8; 4096 - 24];

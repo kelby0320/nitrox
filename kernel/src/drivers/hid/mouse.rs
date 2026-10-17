@@ -1,10 +1,10 @@
-//! **A HID mouse's report as events** (Phase 6 Parts B.2 and B.3), by a [`Layout`]: where in the
-//! report its buttons, X, Y and wheel are.
+//! **A HID mouse's report as events**, by a [`Layout`]: where in the report its buttons, X, Y and
+//! wheel are.
 //!
 //! A boot-protocol mouse has one layout, [`Layout::BOOT`] (HID 1.11 Appendix B.2): buttons in the
 //! first byte, X and Y as signed bytes after it, and nothing defined beyond. A mouse in report
 //! protocol has the layout its report descriptor gives, which is how a wheel and axes wider than a
-//! byte are read (B.3).
+//! byte are read.
 //!
 //! The events are the PS/2 driver's shape: button changes, then `REL_X`, `REL_Y` and `REL_WHEEL`
 //! when non-zero, then `SYN_REPORT`; a report that changes nothing gives none.
@@ -147,8 +147,8 @@ pub fn decode(
     Some((n, held))
 }
 
-/// **What a mouse held, let go** (Phase 6 Part C): a release for each button `buttons` holds —
-/// left, right, middle — then `SYN_REPORT`. What its driver delivers when it departs, ending a drag.
+/// **What a mouse held, let go**: a release for each button `buttons` holds — left, right,
+/// middle — then `SYN_REPORT`. What its driver delivers when it departs, ending a drag.
 /// **From the decoder's held state, not by decoding an empty report**, which for a layout with a
 /// report ID would carry no ID and decode to nothing. Nothing when no button was held.
 pub fn release_all(buttons: u8, time_ns: u64, out: &mut [InputEvent; EVENTS_MAX]) -> usize {
@@ -181,7 +181,7 @@ mod tests {
 
     const SYN: (u16, u16, i32) = (EV_SYN, SYN_REPORT, 0);
 
-    /// **Each button, on change**, left right middle as bits 0, 1, 2; held ones stay quiet.
+    /// **Each button, on change**; held ones stay quiet.
     #[test]
     fn boot_buttons_press_and_release_on_change() {
         let b = &Layout::BOOT;
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(run(b, 0b110, &[0b110, 0, 0]), Some((vec![], 0b110)), "nothing changed");
     }
 
-    /// **Both axes signed**, and positive Y is down on HID as on `REL_Y`.
+    /// **Both axes signed**; positive Y is down on HID as on `REL_Y`.
     #[test]
     fn boot_axes_are_signed_bytes() {
         let b = &Layout::BOOT;
@@ -209,17 +209,15 @@ mod tests {
         assert_eq!(run(b, 0, &[0, 0x81, 0x7F]), Some((vec![(EV_REL, REL_X, -127), (EV_REL, REL_Y, 127), SYN], 0)));
     }
 
-    /// **A boot mouse's fourth byte is not read**: it is the device's own, and QEMU's `usb-mouse`
-    /// puts its wheel there.
+    /// **A boot mouse's fourth byte is not read**: QEMU's `usb-mouse` puts its wheel there.
     #[test]
     fn a_boot_report_reads_three_bytes() {
         assert_eq!(run(&Layout::BOOT, 0, &[0, 0, 0, 0xFF]), Some((vec![], 0)));
         assert_eq!(run(&Layout::BOOT, 0, &[0, 0]), None, "too short for Y");
     }
 
-    /// **A wheel, negated**: HID's wheel is positive away from the user, `REL_WHEEL` here toward —
-    /// so one notch toward the user, `-1` in the report, is `+1`, as on the PS/2 wire (PR #357
-    /// review).
+    /// **A wheel, negated**: one notch toward the user, `-1` in the report, is `+1`, as on the PS/2
+    /// wire.
     #[test]
     fn the_wheel_is_negated_to_this_systems_sign() {
         let wheel = Layout { wheel: Some(Field::byte(3, true)), ..Layout::BOOT };
@@ -227,7 +225,7 @@ mod tests {
         assert_eq!(run(&wheel, 0, &[0, 0, 0, 1]), Some((vec![(EV_REL, REL_WHEEL, -1), SYN], 0)));
     }
 
-    /// **A report ID** must match, and the fields count from the byte after it.
+    /// **A report ID** must match; fields count from the byte after it.
     #[test]
     fn a_report_id_selects_and_prefixes() {
         let numbered = Layout { report_id: Some(2), ..Layout::BOOT };
@@ -238,8 +236,7 @@ mod tests {
         assert_eq!(run(&numbered, 0, &[1, 1, 3, 0]), None, "another report");
     }
 
-    /// **Fields that are not bytes**: 12-bit axes packed into three bytes, and 16-bit ones, signed at
-    /// their own width.
+    /// **Fields that are not bytes**: 12-bit axes packed into three bytes, and 16-bit ones.
     #[test]
     fn wide_and_packed_fields_read_at_their_width() {
         let x12 = Field { offset: 8, size: 12, signed: true };
@@ -254,9 +251,8 @@ mod tests {
         assert_eq!(x16.read(&[0, 0x00]), None, "past the report");
     }
 
-    /// **A departing mouse lets go of its buttons** (Phase 6 Part C), from the held state, so it
-    /// works for a layout whose reports carry an ID — where an empty report, having no ID, decodes
-    /// to nothing at all. Nothing when no button was held.
+    /// **A departing mouse lets go of its buttons** from the held state, so it works for a layout
+    /// whose reports carry an ID.
     #[test]
     fn a_departing_mouse_releases_its_held_buttons_whatever_its_layout() {
         let numbered = Layout { report_id: Some(2), ..Layout::BOOT };

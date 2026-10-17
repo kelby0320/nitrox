@@ -2,16 +2,16 @@
 
 use super::*;
 
-/// **A remembered password, and everything that must not use it** (the laptop polish's Part A).
+/// **A remembered password, and everything that must not use it**.
 ///
 /// A session opened as a supervisor does, a real terminal from `/dev/tty`, and the build's fixture
 /// password open a window for that terminal and `admin`. Then, in order:
 /// - a second real token from the same terminal starts without asking;
-/// - **each of these is asked**: a made-up token (the forgery control — a caller that serves its
-///   own "terminal" and claims another's), a token already redeemed, no token, another view, and a
-///   token from a terminal on a backend of its own, attached as `nxterm` attaches a window's;
-/// - **a real token still starts without asking** — so the window was open while each of those was
-///   asked, and none of them was asked because it had closed;
+/// - **each of these is asked**: a made-up token (the forgery control), a token already
+///   redeemed, no token, another view, and a token from a terminal on a backend of its own,
+///   attached as `nxterm` attaches a window's;
+/// - **a real token still starts without asking**, so none of those was asked because the
+///   window had closed;
 /// - after `Forget`, a real token is asked.
 ///
 /// None of the requests that are asked is answered: a refused password would forget the window,
@@ -42,7 +42,6 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
         close(sup);
         return fail(b"no terminal at /dev/tty");
     }
-    // A token from terminal `t`, as `with` asks for one.
     let token = |t: u64| -> Option<[u8; TTY_TOKEN_LEN]> {
         if !rs_send(t, OP_TTY_TOKEN, 0x7470, &[], &[]) {
             return None;
@@ -95,7 +94,6 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
         ok
     };
     let sleep: &[&[u8]] = &[b"0"];
-    // A request that starts: wait for the program to exit, so nothing is left running.
     let started = |o: Option<(Outcome, u64)>, exited: &mut alloc::vec::Vec<alloc::vec::Vec<u8>>| -> bool {
         match o {
             Some((Outcome::Started, cli)) => {
@@ -112,7 +110,6 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
             None => false,
         }
     };
-    // A request that is asked for a password, and left unanswered.
     let asked = |o: Option<(Outcome, u64)>| -> bool {
         match o {
             Some((Outcome::NeedPassword, cli)) => {
@@ -127,7 +124,6 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
         }
     };
 
-    // 1. The window: a real token, asked, and the password.
     let Some(first) = token(tty) else {
         return finish(fail(b"the terminal gave no token"), &[]);
     };
@@ -147,7 +143,6 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
     if !opened {
         return finish(fail(b"a first request with a token was not asked and then started"), &[]);
     }
-    // 2. A second real token from the same terminal is not asked.
     let Some(second) = token(tty) else {
         return finish(fail(b"no second token"), &[]);
     };
@@ -159,11 +154,9 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
     if !asked(ask(b"admin", b"sleep", sleep, Some(forged), &mut exited)) {
         return finish(fail(b"a made-up token was not asked"), &[]);
     }
-    // 4. A token already redeemed.
     if !asked(ask(b"admin", b"sleep", sleep, Some(second), &mut exited)) {
         return finish(fail(b"a token used twice was not asked"), &[]);
     }
-    // 5. No token at all.
     if !asked(ask(b"admin", b"sleep", sleep, None, &mut exited)) {
         return finish(fail(b"a request with no token was not asked"), &[]);
     }
@@ -215,9 +208,9 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
             &[window, ours],
         );
     }
-    // 8b. **A refused password forgets every window of the session** (PR #351 review): a request
-    //     from the other terminal, which has no window and so is asked, is answered wrong — and
-    //     the first terminal's window is gone with it, so a real token from there is asked too.
+    // 8b. **A refused password forgets every window of the session** : a request from
+    //     the other terminal, which has no window and so is asked, is answered wrong, and the
+    //     first terminal's window is gone with it, so a real token from there is asked too.
     let Some(other) = token(window) else {
         return finish(fail(b"no token from the second terminal for the wrong password"), &[window, ours]);
     };
@@ -270,7 +263,6 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
     if !reopened || !started(ask(b"admin", b"sleep", sleep, Some(open), &mut exited), &mut exited) {
         return finish(fail(b"the window would not open again after the wrong password"), &[window, ours]);
     }
-    // 9. `Forget`, and a real token is asked again.
     let (fst, fcli) = ns_lookup(root_ns, alloc::format!("/svc/views/s/{session}").as_bytes(), chan);
     let forgot = fst == 0 && matches!(views_call(fcli, OP_VIEWS_FORGET, 4, &[], &[], &mut exited), Some((false, _)));
     close(fcli);
@@ -314,16 +306,15 @@ pub(super) fn grace_test(root_ns: u64) -> bool {
     finish(true, &[window, ours])
 }
 
-/// **The policy endpoint: `Show` and `Install`, and what an administrator is** (administration
-/// Part D.2).
+/// **The policy endpoint: `Show` and `Install`, and what an administrator is**.
 ///
 /// Asked on the channel the `views` grant's `/dev/policy` resolves to — reached here as
 /// `/svc/views/policy/<id>`, the root namespace's boundary (`TODO(svc-auth-ungated)`), for a
 /// session the probe opens as a supervisor does.
 /// - `Show` is the file as the device holds it.
 /// - **Two policies no existing account could administer are refused**, by `Check` and by
-///   `Install` alike, and the file stays as it was: one whose `admin` profile has lost `views`, the
-///   review's case, and one naming only an account that does not exist.
+///   `Install` alike, and the file stays as it was: one whose `admin` profile has lost `views`,
+///   and one naming only an account that does not exist.
 /// - A policy with one more view is installed, `Show` and the device hold it, and `List` names the
 ///   new view. The original is then installed again.
 /// - A closed session's policy channel is closed with it, and a session that is not open has no
@@ -432,7 +423,6 @@ pub(super) fn policy_test(root_ns: u64) -> bool {
         return finish(fail(b"Check refused the seeded policy"));
     }
 
-    // One more view: installed, shown, on the device, and listed.
     let mut more = original.clone();
     more.extend_from_slice(b"\n[profile.d2probe]\ngrants = []\n\n[[rule]]\nwho = [\"alice\"]\nuse = [\"d2probe\"]\nrun = [\"nxsh\"]\nauth = \"none\"\n");
     if outcome_of(ask(pol, OP_VIEWS_INSTALL, &more)).map(|o| o.0) != Some(true) {
@@ -453,7 +443,6 @@ pub(super) fn policy_test(root_ns: u64) -> bool {
         return finish(fail(b"List does not name the installed view"));
     }
 
-    // Put back.
     if outcome_of(ask(pol, OP_VIEWS_INSTALL, &original)).map(|o| o.0) != Some(true)
         || on_device().as_deref() != Some(&original[..])
     {
@@ -463,7 +452,6 @@ pub(super) fn policy_test(root_ns: u64) -> bool {
         return finish(fail(b"List still names the view after the original went back"));
     }
 
-    // A closed session's policy channel closes with it.
     close_session(sup);
     let answered = ask(pol, OP_VIEWS_SHOW, &[]).is_some();
     close(pol);

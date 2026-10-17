@@ -1,31 +1,19 @@
 //! x86_64 ACPI static-table parser ([`ArchPlatform`] impl).
 //!
-//! Pure-Rust, **no AML**: walk the RSDP → RSDT/XSDT → the tables the kernel
-//! reads — the **MADT** (interrupt routing: IOAPIC bases, GSI bases, ISA-IRQ
-//! source overrides), the **MCFG** (PCIe ECAM windows) and, since
-//! administration Part E.3, the **FADT** (its flags, the reset register a
-//! reboot writes, the RTC's century register, and whether an 8042 is present).
-//! ACPICA/AML is a separate, deferred concern (see
-//! `docs/rationale/why-phased-acpi.md`).
+//! Pure-Rust, **no AML**: walk the RSDP → RSDT/XSDT → the **MADT** (IOAPIC bases, GSI bases,
+//! ISA-IRQ source overrides), the **MCFG** (PCIe ECAM windows) and the **FADT** (its flags,
+//! the reset register, the RTC's century register, whether an 8042 is present). ACPICA/AML is
+//! deferred (see `docs/rationale/why-phased-acpi.md`).
 //!
-//! ## Arch boundary
-//!
-//! Only the **PCIe ECAM regions** cross into neutral code, through
-//! [`ArchPlatform::pcie_ecam_regions`] — PCIe config space is a PCI-SIG
-//! standard, identical across architectures. The MADT-derived interrupt-routing
-//! facts are **arch-internal**: cached here and read directly by the x86 IOAPIC
-//! code (`pub(crate)` [`ioapics`] / [`source_overrides`]). IOAPIC / GSI / MADT
-//! never appear in neutral names. See `docs/architecture/drivers-and-irps.md`
+//! Only the PCIe ECAM regions cross into neutral code, through
+//! [`ArchPlatform::pcie_ecam_regions`] (PCIe config space is a PCI-SIG standard). The
+//! MADT-derived routing facts are arch-internal, read by the x86 IOAPIC code through
+//! `pub(crate)` [`ioapics`] / [`source_overrides`]. See `docs/architecture/drivers-and-irps.md`
 //! and the decision log (2026-06-11).
 //!
-//! ## Structure
-//!
-//! The byte-level parsers ([`parse_rsdp`], [`parse_madt`], [`parse_mcfg`],
-//! [`parse_fadt`], [`sdt_pointers`]) are pure functions over `&[u8]`,
-//! host-tested against synthetic table blobs. The only non-pure part is the
-//! boot glue in [`X86Platform::init`]: read the RSDP from Limine, translate
-//! physical table addresses through the HHDM, and feed the bytes to the
-//! parsers.
+//! The byte-level parsers ([`parse_rsdp`], [`parse_madt`], [`parse_mcfg`], [`parse_fadt`],
+//! [`sdt_pointers`]) are pure over `&[u8]` and host-tested against synthetic blobs; only
+//! [`X86Platform::init`] is boot glue (RSDP from Limine, table addresses through the HHDM).
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -34,26 +22,24 @@ use crate::libkern::AllocError;
 use crate::libkern::printable::Printable;
 use crate::mm::{PhysAddr, heap};
 
-// --- Limine RSDP request (x86 firmware detail; owned here so `init` is arg-free) ---
+// --- Limine RSDP request (owned here so `init` is arg-free) ---
 //
-// Lives in `.limine_requests` like the requests in `main.rs`; the linker
-// collects this section from every object between the start/end markers, so a
-// request declared in a submodule is discovered by the bootloader all the same.
+// In `.limine_requests` like the requests in `main.rs`: the linker collects the section from
+// every object, so the bootloader finds a request declared in a submodule.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static mut RSDP_REQUEST: crate::limine::RsdpRequest = crate::limine::RsdpRequest::new();
 
-// --- Caps on the fixed static caches (no dynamic allocation) ---------------
+// --- Caps on the fixed static caches (no dynamic allocation) ---
 const MAX_ECAM: usize = 8;
 const MAX_IOAPIC: usize = 8;
 const MAX_OVERRIDE: usize = 24; // ISA exposes 16 IRQ lines; overrides ≤ that
 const MAX_CPU: usize = 64;
-/// Defensive cap on a single table's byte length (real ACPI tables are tiny);
-/// stops a corrupt length field from forming a slice past mapped memory.
+/// Defensive cap on one table's byte length; stops a corrupt length field forming a slice past
+/// mapped memory.
 const MAX_TABLE_BYTES: usize = 0x1_0000;
 
-/// One I/O APIC discovered from the MADT (arch-internal — consumed by the x86
-/// IOAPIC bring-up, never crosses the arch boundary).
+/// One I/O APIC discovered from the MADT (arch-internal).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IoApic {
     pub id: u8,
@@ -88,7 +74,6 @@ static mut IOAPICS: [IoApic; MAX_IOAPIC] = [IoApic::ZERO; MAX_IOAPIC];
 static OVERRIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static mut OVERRIDES: [SourceOverride; MAX_OVERRIDE] = [SourceOverride::ZERO; MAX_OVERRIDE];
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// The FADT's parse, and whether there was one (administration Part E.3).
 static FADT_READ: AtomicBool = AtomicBool::new(false);
 static mut FADT: Fadt = Fadt { flags: None, reset: None, century: None, boot_arch: None };
 static mut CPU_APIC_IDS: [u32; MAX_CPU] = [0; MAX_CPU];
@@ -107,22 +92,18 @@ fn rd_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7]])
 }
 
-/// ACPI checksum: the bytes sum to zero (mod 256).
 fn checksum_ok(b: &[u8]) -> bool {
     b.iter().fold(0u8, |a, &x| a.wrapping_add(x)) == 0
 }
 
-/// The common 36-byte System Description Table header is present.
 fn sdt_signature(b: &[u8]) -> Option<[u8; 4]> {
     if b.len() < 36 { None } else { Some([b[0], b[1], b[2], b[3]]) }
 }
 
-/// Total length of an SDT (header field at offset 4). Caller must have ≥ 36 bytes.
 fn sdt_length(b: &[u8]) -> usize {
     rd_u32(b, 4) as usize
 }
 
-/// What [`parse_rsdp`] extracts: which root table to walk, and at what address.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct RsdpInfo {
     revision: u8,
@@ -130,9 +111,8 @@ struct RsdpInfo {
     use_xsdt: bool,
 }
 
-/// Validate an RSDP (Root System Description Pointer) and extract the root SDT
-/// address. Prefers the 64-bit XSDT (ACPI 2.0+) when present and valid, else the
-/// 32-bit RSDT. Returns `None` on a bad signature or checksum.
+/// Validate an RSDP and extract the root SDT address: the 64-bit XSDT (ACPI 2.0+) when present
+/// and valid, else the 32-bit RSDT. `None` on a bad signature or checksum.
 fn parse_rsdp(rsdp: &[u8]) -> Option<RsdpInfo> {
     if rsdp.len() < 20 || &rsdp[0..8] != b"RSD PTR " || !checksum_ok(&rsdp[0..20]) {
         return None;
@@ -150,7 +130,6 @@ fn parse_rsdp(rsdp: &[u8]) -> Option<RsdpInfo> {
     Some(RsdpInfo { revision, sdt_phys: PhysAddr(rd_u32(rsdp, 16) as u64), use_xsdt: false })
 }
 
-/// Iterate the physical addresses of the tables an RSDT/XSDT points at.
 fn sdt_pointers(sdt: &[u8], use_xsdt: bool) -> impl Iterator<Item = PhysAddr> + '_ {
     let stride = if use_xsdt { 8 } else { 4 };
     let len = if sdt.len() >= 36 { sdt_length(sdt).min(sdt.len()) } else { 0 };
@@ -196,10 +175,8 @@ impl CpuState {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum MadtEntry {
     /// Type 0 (Processor Local APIC, 8-bit ids) or type 9 (Processor Local x2APIC, 32-bit).
-    /// Both are CPUs: type 9 is required for an APIC id of 255 or above, and a machine whose ids
-    /// are all lower may still list its CPUs that way. **But some firmware lists a CPU both
-    /// ways**, and ACPI 6.5 §5.2.12.12 says that where both kinds of entry are present an x2APIC
-    /// entry's id is 255 or above — see [`not_counted`].
+    /// Type 9 is required for an id of 255 or above, but some firmware lists a CPU both ways;
+    /// ACPI 6.5 §5.2.12.12 says an x2APIC entry's id is then 255 or above — see [`not_counted`].
     Cpu { x2apic: bool, uid: u32, apic_id: u32, state: CpuState },
     /// Type 1.
     IoApic(IoApic),
@@ -272,16 +249,16 @@ fn has_lapic_cpus(madt: &[u8]) -> bool {
     })
 }
 
-/// Why a CPU entry is not a CPU of its own, or `None` when it is (or `entry` is not a CPU entry).
-/// `has_lapic_cpus` is [`has_lapic_cpus`] for the same table. Two reasons, both the ones Linux
-/// applies (`acpi_check_lapic`, `acpi_parse_x2apic`):
+/// Why a CPU entry is not a CPU of its own, or `None` when it is (or `entry` is not a CPU).
+/// `has_lapic_cpus` is [`has_lapic_cpus`] for the same table. Two reasons, as Linux applies
+/// (`acpi_check_lapic`, `acpi_parse_x2apic`):
 ///
 /// - **An id that names no CPU**: `0xFF` in a type-0 entry, `0xFFFF_FFFF` in a type-9 one.
-/// - **A low x2APIC id where type-0 entries list the CPUs.** ACPI 6.5 §5.2.12.12: where both kinds
-///   are present, an x2APIC entry's id is 255 or above. Some firmware lists each CPU both ways
-///   regardless, and counting both reads eight CPUs on a four-thread machine.
+/// - **A low x2APIC id where type-0 entries list the CPUs.** ACPI 6.5 §5.2.12.12: an x2APIC
+///   entry's id is then 255 or above, but some firmware lists each CPU both ways, and
+///   counting both reads eight CPUs on a four-thread machine.
 ///
-/// Such an entry is still logged, with the reason, so a report shows what the firmware listed.
+/// Such an entry is still logged, with the reason.
 fn not_counted(entry: &MadtEntry, has_lapic_cpus: bool) -> Option<&'static str> {
     match *entry {
         MadtEntry::Cpu { x2apic: false, apic_id: 0xFF, .. }
@@ -294,9 +271,8 @@ fn not_counted(entry: &MadtEntry, has_lapic_cpus: bool) -> Option<&'static str> 
 }
 
 /// Parse a MADT ("APIC" table) into the caller's buffers, truncating at each buffer's
-/// capacity. Returns `(n_ioapic, n_override, n_cpu)`, where a CPU is an **enabled** entry of
-/// either processor type — online-capable ones are not present at boot — that [`not_counted`]
-/// has no reason to leave out.
+/// capacity. Returns `(n_ioapic, n_override, n_cpu)`; a CPU is an **enabled** entry of either
+/// processor type (online-capable ones are not present at boot) that [`not_counted`] keeps.
 fn parse_madt(
     madt: &[u8],
     ioapics: &mut [IoApic],
@@ -328,8 +304,6 @@ fn parse_madt(
     (ni, no, nc)
 }
 
-/// Log one MADT entry on one line, a CPU entry the count leaves out marked with why
-/// ([`not_counted`]; `has_lapic_cpus` is [`has_lapic_cpus`] for the same table).
 fn log_madt_entry(entry: &MadtEntry, has_lapic_cpus: bool) {
     match *entry {
         MadtEntry::Cpu { x2apic, uid, apic_id, state } => crate::kprintln!(
@@ -400,7 +374,6 @@ impl Gas {
         Gas { space, bit_width, bit_offset, access_size, address: rd_u64(b, 4) }
     }
 
-    /// The address space's name, for the report.
     fn space_name(&self) -> &'static str {
         match self.space {
             GAS_SYSTEM_MEMORY => "memory",
@@ -411,10 +384,10 @@ impl Gas {
     }
 }
 
-/// **What this kernel reads of the FADT** (administration Part E.3): its flags, the reset register
-/// and the value that resets, the RTC's century register, and whether there is an 8042. Each is
-/// `None` when the table is too short to hold it — a revision-1 FADT ends at byte 116, before the
-/// reset register — or does not name it.
+/// What this kernel reads of the FADT: its flags, the reset register and the value that
+/// resets, the RTC's century register, and whether there is an 8042. Each is `None` when the
+/// table is too short to hold it (a revision-1 FADT ends at byte 116, before the reset
+/// register) or does not name it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) struct Fadt {
     pub flags: Option<u32>,
@@ -457,8 +430,7 @@ fn parse_fadt(t: &[u8]) -> Fadt {
     }
 }
 
-/// Log what the FADT says, a line the hardware report carries: the facts a reset and the clock
-/// depend on, so a machine's report says whether it can reset by register.
+/// Log what the FADT says: the facts a reset and the clock depend on.
 fn log_fadt(f: &Fadt) {
     match f.flags {
         Some(flags) => crate::kprintln!("fadt: flags {:#x}", flags),
@@ -528,9 +500,8 @@ impl ArchPlatform for X86Platform {
         // SAFETY: non-null response written by Limine.
         let address = unsafe { (*resp).address };
 
-        // Translate to a kernel-virtual pointer via the HHDM. Recent Limine
-        // hands back a physical address; tolerate an already-virtual pointer
-        // from older bootloaders (a physical RSDP is far below the HHDM base).
+        // Translate to a kernel-virtual pointer via the HHDM; Limine returns a physical address,
+        // but an already-virtual one (far above a physical RSDP) is tolerated.
         let hhdm = heap::hhdm_offset();
         let va = if address >= hhdm { address } else { address + hhdm };
         // SAFETY: the RSDP lives in firmware memory mapped by the HHDM; reading
@@ -545,8 +516,7 @@ impl ArchPlatform for X86Platform {
             }
         };
 
-        // 2. Map the root table (XSDT/RSDT): read its header for the length,
-        // then re-map the whole (capped) table.
+        // 2. Map the root table (XSDT/RSDT): its header for the length, then the capped table.
         // SAFETY: `sdt_phys` came from the validated RSDP; 36 header bytes.
         let sdt_hdr = unsafe { phys_slice(info.sdt_phys, 36) };
         let sdt_len = sdt_length(sdt_hdr).min(MAX_TABLE_BYTES);
@@ -560,9 +530,8 @@ impl ArchPlatform for X86Platform {
             info.sdt_phys.as_u64(),
         );
 
-        // 3. Walk the SDT pointers: one line per table, then parse the first MADT and first
-        // MCFG into local buffers. The MADT's entries are logged after the table list, so the
-        // list reads as one block on the screen.
+        // 3. Walk the SDT pointers: one line per table, then parse the first MADT and MCFG. The
+        // MADT's entries are logged after the table list so the list reads as one block.
         let mut ioapics = [IoApic::ZERO; MAX_IOAPIC];
         let mut overrides = [SourceOverride::ZERO; MAX_OVERRIDE];
         let mut cpus = [0u32; MAX_CPU];
@@ -672,10 +641,7 @@ impl ArchPlatform for X86Platform {
     }
 }
 
-// The arch-internal MADT accessors below are the seam the `phase-2/ioapic`
-// item consumes; they are parsed and cached now but have no in-tree caller yet.
-/// The I/O APICs discovered from the MADT (arch-internal; the x86 IOAPIC bring-up
-/// consumes this — it does **not** cross the arch boundary).
+/// The I/O APICs discovered from the MADT (arch-internal).
 pub(crate) fn ioapics() -> &'static [IoApic] {
     let n = IOAPIC_COUNT.load(Ordering::Acquire);
     // SAFETY: as `pcie_ecam_regions`.
@@ -702,14 +668,12 @@ pub(crate) fn cpu_apic_ids() -> &'static [u32] {
 mod tests {
     use super::*;
 
-    /// Set the checksum byte (at `csum_off`) so the table's bytes sum to zero.
     fn fix_checksum(table: &mut [u8], csum_off: usize) {
         table[csum_off] = 0;
         let sum = table.iter().fold(0u8, |a, &x| a.wrapping_add(x));
         table[csum_off] = 0u8.wrapping_sub(sum);
     }
 
-    /// Build a minimal valid SDT header with the given signature and length.
     fn sdt_header(sig: &[u8; 4], length: usize) -> Vec<u8> {
         let mut h = vec![0u8; 36];
         h[0..4].copy_from_slice(sig);
@@ -726,7 +690,6 @@ mod tests {
         r[20..24].copy_from_slice(&36u32.to_le_bytes()); // length
         r[24..32].copy_from_slice(&xsdt_addr.to_le_bytes());
         fix_checksum(&mut r[0..20], 8); // v1 checksum over first 20 bytes
-        // extended checksum over the full 36 bytes (byte 32)
         r[32] = 0;
         let sum = r.iter().fold(0u8, |a, &x| a.wrapping_add(x));
         r[32] = 0u8.wrapping_sub(sum);
@@ -767,14 +730,12 @@ mod tests {
 
     #[test]
     fn sdt_pointers_walks_xsdt_and_rsdt() {
-        // XSDT with two 64-bit pointers.
         let mut xsdt = sdt_header(b"XSDT", 36 + 16);
         xsdt.extend_from_slice(&0x1111u64.to_le_bytes());
         xsdt.extend_from_slice(&0x2222u64.to_le_bytes());
         let got: Vec<PhysAddr> = sdt_pointers(&xsdt, true).collect();
         assert_eq!(got, vec![PhysAddr(0x1111), PhysAddr(0x2222)]);
 
-        // RSDT with two 32-bit pointers.
         let mut rsdt = sdt_header(b"RSDT", 36 + 8);
         rsdt.extend_from_slice(&0x3333u32.to_le_bytes());
         rsdt.extend_from_slice(&0x4444u32.to_le_bytes());
@@ -812,9 +773,7 @@ mod tests {
         assert_eq!(cpus[0], 5); // only the enabled CPU
     }
 
-    /// QEMU q35's MADT at `-smp 4`, as the kernel read it (captured 2026-09-14 by a
-    /// temporary hex dump in `X86Platform::init` under `cargo xtask test-qemu`, then removed).
-    /// Checksum-valid as captured.
+    /// QEMU q35's MADT at `-smp 4`, as the kernel read it. Checksum-valid as captured.
     #[rustfmt::skip]
     const QEMU_MADT: [u8; 144] = [
         0x41, 0x50, 0x49, 0x43, 0x90, 0x00, 0x00, 0x00, 0x03, 0x49, 0x42, 0x4f,
@@ -863,8 +822,7 @@ mod tests {
 
     #[test]
     fn x2apic_cpus_count_and_online_capable_ones_are_listed_but_not_counted() {
-        // Firmware that describes its CPUs only as type-9 entries: the parser before Part D
-        // matched type 0 alone and would have counted none of these.
+        // Firmware that describes its CPUs only as type-9 entries.
         let mut madt = sdt_header(b"APIC", 0);
         madt.extend_from_slice(&0xFEE0_0000u32.to_le_bytes());
         madt.extend_from_slice(&0u32.to_le_bytes());
@@ -998,7 +956,6 @@ mod tests {
     fn parse_mcfg_extracts_ecam_region() {
         let mut mcfg = sdt_header(b"MCFG", 0);
         mcfg.extend_from_slice(&0u64.to_le_bytes()); // reserved
-        // one allocation: base 0xB000_0000, seg 0, bus 0..=255
         mcfg.extend_from_slice(&0xB000_0000u64.to_le_bytes());
         mcfg.extend_from_slice(&0u16.to_le_bytes());
         mcfg.push(0); // bus_start
@@ -1044,8 +1001,8 @@ mod tests {
         t
     }
 
-    /// **Each field is read only when the table holds it** — a revision-1 FADT ends at 116, before
-    /// the reset register — and a reset register counts only when the flags advertise it and it
+    /// Each field is read only when the table holds it (a revision-1 FADT ends at 116, before
+    /// the reset register), and a reset register counts only when the flags advertise it and it
     /// names an address.
     #[test]
     fn a_fadt_is_read_as_far_as_its_length_goes() {
@@ -1064,7 +1021,6 @@ mod tests {
         // Revision 1's length: flags, century and boot arch, no reset register.
         let v1 = parse_fadt(&fadt(116));
         assert_eq!((v1.flags.is_some(), v1.reset, v1.century), (true, None, Some(0x32)));
-        // Too short for any of it.
         assert_eq!(parse_fadt(&fadt(100)), Fadt::default());
         assert_eq!(parse_fadt(&[0u8; 10]), Fadt::default());
     }

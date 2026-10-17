@@ -21,9 +21,8 @@ pub struct ErrorView<'a> {
 /// `out`, returning its length, or `None` only if `out` cannot hold the fixed prefix.
 ///
 /// **A message longer than `out` holds is cut to fit**, back to a UTF-8 character boundary where
-/// it is UTF-8 (PR #369 review's gate run). It used to be refused: every caller sends what this
-/// returns or nothing, so a reply went out flagged an error with an empty body, its code lost
-/// with its reason — which a 108-byte reason in the storage service's 96-byte buffer did.
+/// it is UTF-8: every caller sends what this returns or nothing, so refusing it would send an
+/// error reply with an empty body, its code lost with its reason.
 pub fn error_body(out: &mut [u8], kerror: i32, server_code: u32, msg: &[u8]) -> Option<usize> {
     let room = out.len().checked_sub(ERROR_BODY_LEN)?.min(u16::MAX as usize);
     let mut len = msg.len().min(room);
@@ -70,9 +69,9 @@ mod tests {
         assert_eq!(e.msg, b"not found");
     }
 
-    /// **A message longer than the buffer is cut, and the code kept** (PR #369 review's gate run):
-    /// to the buffer, and back to a character boundary when the cut would split one. Only a buffer
-    /// that cannot hold the prefix is refused.
+    /// A message longer than the buffer is cut, and the code kept: to the buffer, and back to a
+    /// character boundary when the cut would split one. Only a buffer that cannot hold the
+    /// prefix is refused.
     #[test]
     fn a_message_longer_than_the_buffer_is_cut_and_the_code_kept() {
         let mut buf = [0u8; ERROR_BODY_LEN + 5];

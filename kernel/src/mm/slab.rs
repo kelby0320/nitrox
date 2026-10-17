@@ -1,51 +1,35 @@
 //! SLUB-inspired slab allocator on top of the buddy.
 //!
-//! Layer 2 of the three-layer memory management design (per
-//! `docs/architecture/memory-management.md`). Sits between the buddy
-//! allocator (which hands out page frames) and `libkern`'s heap
-//! containers (`KBox`, `KVec`, `KString`), which call [`kmalloc`] /
-//! [`kfree`] directly. The kernel registers no `#[global_allocator]`
-//! and does not use the `alloc` crate — see the decision log entry of
-//! 2026-05-20.
+//! Sits between the buddy allocator and `libkern`'s heap containers (`KBox`, `KVec`, `KString`),
+//! which call [`kmalloc`] / [`kfree`] directly; the kernel registers no `#[global_allocator]`
+//! (decision log 2026-05-20). Design: `docs/architecture/memory-management.md`.
 //!
 //! ## Geometry
 //!
-//! - Every slab is exactly one 4 KiB page (`SLAB_SIZE`).
-//! - The [`SlabDescriptor`] header sits at byte 0 of the page; objects
-//!   live in the remaining bytes, starting at `obj_offset` (rounded up
-//!   from the header size to the cache's alignment).
-//! - Each cache holds two intrusive linked lists of descriptors: a
-//!   `partial` list (slabs with at least one free slot) and a `full`
-//!   list (slabs with no free slots).
-//! - Free slots store the next-free pointer in their own first 8 bytes
-//!   (embedded freelist, no separate book-keeping array).
+//! - Every slab is one 4 KiB page (`SLAB_SIZE`).
+//! - The [`SlabDescriptor`] sits at byte 0; objects start at `obj_offset` (the header size
+//!   rounded up to the cache's alignment).
+//! - Each cache has a `partial` list (slabs with a free slot) and a `full` list.
+//! - A free slot stores the next-free pointer in its first 8 bytes (embedded freelist).
 //!
-//! ## Why this layout enables O(1) free
+//! ## Why free is O(1)
 //!
-//! Given any object pointer `p`, the descriptor for its slab is at
-//! `(p as usize) & SLAB_MASK`. This works because the buddy hands out
-//! `SLAB_SIZE`-aligned pages and we keep the descriptor at the start of
-//! each. `kfree` reads `desc.owner` to find the cache (or detect a
-//! large-allocation sentinel) without any external table.
+//! The descriptor of any object `p` is at `(p as usize) & SLAB_MASK`, because the buddy hands out
+//! `SLAB_SIZE`-aligned pages and the descriptor starts each. `kfree` reads `desc.owner` to find
+//! the cache, or the large-allocation sentinel, with no external table.
 //!
-//! ## Phase 1 scope
+//! ## Scope
 //!
-//! - Single global spinlock per cache (no per-CPU fast path yet).
-//! - Seven size buckets feeding [`kmalloc`]: 32, 64, 128, 256, 512, 1024,
-//!   2048 bytes. Larger requests bypass to the buddy via the large-alloc
-//!   path (see [`large_alloc`]) using an `owner = null` sentinel in the
-//!   descriptor.
-//! - No empty-slab reclaim; once grown, a cache holds onto its pages.
-//! - No alignment > `SLAB_SIZE`; requests are rejected. The real answer for the
-//!   one client that needs it — DMA buffers, which also need a physical address
-//!   and contiguity the slab can't express — is the separate
-//!   [`DmaBuffer`](crate::mm::DmaBuffer) path over the buddy allocator, not a
-//!   `kmalloc` extension.
+//! - One spinlock per cache; no per-CPU fast path.
+//! - Seven buckets feed [`kmalloc`]: 32 to 2048 bytes. Larger requests go to the buddy via
+//!   [`large_alloc`], with an `owner = null` sentinel in the descriptor.
+//! - No empty-slab reclaim: a grown cache keeps its pages.
+//! - No alignment above `SLAB_SIZE`; such requests are rejected. Its one client, DMA, also needs
+//!   a physical address and contiguity, so it uses [`DmaBuffer`](crate::mm::DmaBuffer) over the
+//!   buddy.
 //!
-//! See `kernel/docs/lock-ordering.md` for how the slab cache lock (rank
-//! 6a) relates to the buddy lock (rank 6b) — slab `grow` holds the cache
-//! lock across a `buddy.alloc()` call, and that is the only allocator-
-//! to-allocator nesting permitted.
+//! `kernel/docs/lock-ordering.md`: the slab cache lock (rank 6a) is held across the `buddy.alloc()`
+//! in `grow` (rank 6b), the only allocator-to-allocator nesting permitted.
 
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -56,8 +40,7 @@ use crate::mm::buddy::BuddyAllocator;
 use crate::mm::heap::{BuddyPager, HeapBuddy};
 use crate::mm::{PAGE_SIZE, PhysAddr};
 
-/// Bytes per slab. Matches `PAGE_SIZE` — every slab is exactly one buddy
-/// order-0 block.
+/// Bytes per slab: one buddy order-0 block.
 pub const SLAB_SIZE: usize = 4096;
 
 /// Mask that, applied to any pointer inside a slab page, yields the
@@ -66,64 +49,44 @@ pub const SLAB_MASK: usize = !(SLAB_SIZE - 1);
 
 const SIZE_CLASSES: [usize; 7] = [32, 64, 128, 256, 512, 1024, 2048];
 
-/// Requests larger than this bypass the slab and route directly through
-/// the buddy allocator (see [`large_alloc`]).
+/// Requests larger than this bypass the slab and go to the buddy (see [`large_alloc`]).
 const MAX_SLAB_OBJ: usize = 2048;
 
-/// The strongest alignment any size bucket provides. Requests needing more
-/// go to [`large_alloc`], which honours `align` directly — see the routing
-/// condition in [`kmalloc`] and the cap applied in [`slab_init`].
+/// The strongest alignment any bucket provides. Requests needing more go to [`large_alloc`]
+/// (see the routing in [`kmalloc`] and the cap in [`slab_init`]).
 const MAX_BUCKET_ALIGN: usize = core::mem::align_of::<u64>();
 
-// Compile-time check that the two constants don't drift apart. The
-// pointer-masking trick falls over silently if pages are not
-// `SLAB_SIZE`-aligned.
+// The pointer-masking trick falls over silently if pages are not `SLAB_SIZE`-aligned.
 const _: () = assert!(SLAB_SIZE == PAGE_SIZE);
 
-/// Header at byte 0 of every slab page. Found in O(1) from any object
-/// pointer by masking with [`SLAB_MASK`].
-///
-/// `#[repr(C)]` so layout is predictable: a future debugger or out-of-
-/// tree tool can read these without parsing DWARF.
+/// Header at byte 0 of every slab page, found from any object pointer by masking with
+/// [`SLAB_MASK`]. `#[repr(C)]` so its layout is predictable.
 #[repr(C)]
 pub struct SlabDescriptor {
-    /// First free slot's HHDM-virtual address, or null when the slab is
-    /// full. Each free slot's first 8 bytes hold the next-free pointer.
     freelist: *mut u8,
 
-    /// Pointer back to the owning cache. A null value is the sentinel
-    /// for a large allocation that bypassed the slab and is owned
-    /// directly by the buddy.
+    /// The owning cache; null is the sentinel for a large allocation owned directly by the buddy.
     owner: *const SlabCache,
 
-    /// Intrusive singly-linked-list pointer; threads this descriptor onto
-    /// either the cache's `partial` or `full` list. Null at the tail.
     next: *mut SlabDescriptor,
 
-    /// Bytes per object as the allocator sees it. For large allocations
-    /// this stores the total buddy block size in bytes so `large_free`
-    /// can recover the buddy order.
+    /// Bytes per object; for a large allocation, the buddy block size, so `large_free` can
+    /// recover the order.
     obj_size: u32,
 
-    /// Slots currently allocated out of this slab.
     in_use: u16,
 
-    /// Total slots in this slab (= `objs_per_slab` from cache init).
     capacity: u16,
 }
 
-/// One slab cache: a single object-size bucket, all state behind one
-/// spin lock. Designed to be const-constructible so `static` arrays of
-/// caches can live in `.bss` and be patched in by [`slab_init`].
+/// One slab cache: a single object-size bucket behind one spin lock. Const-constructible so
+/// `static` arrays of caches live in `.bss` and are patched by [`slab_init`].
 pub struct SlabCache {
     state: SpinLock<SlabCacheState>,
 }
 
 struct SlabCacheState {
-    /// Slabs with at least one free slot. LIFO; allocations always pop
-    /// from the head.
     partial: *mut SlabDescriptor,
-    /// Slabs with no free slots.
     full: *mut SlabDescriptor,
 
     obj_size: usize,
@@ -137,8 +100,7 @@ struct SlabCacheState {
 unsafe impl Sync for SlabCache {}
 
 impl SlabCache {
-    /// Construct an uninitialised cache. [`SlabCache::init`] must be
-    /// called before [`SlabCache::alloc`] or [`SlabCache::free`].
+    /// Construct an uninitialised cache; [`SlabCache::init`] must run first.
     #[allow(clippy::new_without_default, reason = "a `Default` would read as a cache ready to use")]
     pub const fn new() -> Self {
         Self {
@@ -156,9 +118,8 @@ impl SlabCache {
         }
     }
 
-    /// Finalise the cache's geometry from a requested size/alignment.
-    /// Asserts at init time so a misconfigured cache fails loudly rather
-    /// than silently mis-laying objects.
+    /// Finalise the geometry from a requested size/alignment, asserting so a misconfigured cache
+    /// fails loudly.
     pub fn init(&self, requested_size: usize, requested_align: usize) {
         let ptr_size = core::mem::size_of::<*mut u8>();
         let ptr_align = core::mem::align_of::<*mut u8>();
@@ -180,10 +141,8 @@ impl SlabCache {
         state.objs_per_slab = objs_per_slab;
     }
 
-    /// Allocate one object from this cache. Returns null on OOM.
-    ///
-    /// `pager` is the [`BuddyPager`] used if the cache needs to grow.
-    /// Production callers pass [`HeapBuddy`]; tests inject a local one.
+    /// Allocate one object; null on OOM. `pager` is used if the cache must grow ([`HeapBuddy`] in
+    /// production, a local one in tests).
     pub fn alloc<P: BuddyPager>(&self, pager: &P) -> *mut u8 {
         let mut state = self.state.lock();
         if state.partial.is_null() {
@@ -210,8 +169,6 @@ impl SlabCache {
             (*desc).in_use += 1;
         }
         if next.is_null() {
-            // The slab is now full: pop it off `partial` and prepend to
-            // `full`.
             // SAFETY: lock held; desc is the partial-list head.
             unsafe {
                 state.partial = (*desc).next;
@@ -236,8 +193,6 @@ impl SlabCache {
             debug_assert!((*desc).in_use > 0, "slab: free underflow");
             (*desc).freelist.is_null()
         };
-        // Embedded-freelist push: write current head into `ptr`'s first
-        // 8 bytes, then make `ptr` the new head.
         // SAFETY: `ptr` is a slot we previously handed out; lock held.
         unsafe {
             *(ptr as *mut *mut u8) = (*desc).freelist;
@@ -250,8 +205,8 @@ impl SlabCache {
         }
     }
 
-    /// Allocate a fresh page from `pager` and initialise its descriptor
-    /// and embedded freelist. Returns the new descriptor or null on OOM.
+    /// Allocate a fresh page from `pager` and initialise its descriptor and embedded freelist;
+    /// null on OOM.
     ///
     /// # Safety
     /// Caller must hold the cache lock and pass its locked state via
@@ -283,9 +238,6 @@ impl SlabCache {
                     capacity: state.objs_per_slab as u16,
                 },
             );
-            // Build the embedded freelist by walking the slots in order
-            // and writing each slot's "next" pointer into its first 8
-            // bytes.
             let first = virt.add(state.obj_offset);
             let stride = state.obj_size;
             let n = state.objs_per_slab;
@@ -301,9 +253,8 @@ impl SlabCache {
         desc
     }
 
-    /// Walk the full list, remove `desc`, and prepend it to the partial
-    /// list. O(n) scan over the full list; acceptable in Phase 1 because
-    /// the full list is short and we don't optimise for high churn.
+    /// Remove `desc` from the full list and prepend it to `partial`. An O(n) scan, acceptable as
+    /// the full list is short.
     ///
     /// # Safety
     /// Caller holds the cache lock; `desc` is on `state.full`.
@@ -332,10 +283,7 @@ impl SlabCache {
     }
 }
 
-// --- Module-level state --------------------------------------------------
-
-/// Seven size-bucket caches feeding [`kmalloc`]. Const-constructed so the
-/// array sits in `.bss`; [`slab_init`] writes their geometry once.
+/// Seven size-bucket caches feeding [`kmalloc`], in `.bss`; [`slab_init`] writes their geometry.
 static SLAB_CACHES: [SlabCache; 7] = [
     SlabCache::new(),
     SlabCache::new(),
@@ -346,23 +294,16 @@ static SLAB_CACHES: [SlabCache; 7] = [
     SlabCache::new(),
 ];
 
-/// Flag inspected by [`kmalloc`] so a too-early allocation (before
-/// [`slab_init`]) panics loudly rather than silently corrupting the
-/// heap.
+/// Set by [`slab_init`]; [`kmalloc`] panics before it rather than corrupt the heap.
 static SLAB_INITIALISED: AtomicBool = AtomicBool::new(false);
 
-/// Initialise the seven size-bucket caches. Call exactly once during
-/// boot, after [`crate::mm::heap::init_buddy`].
+/// Initialise the seven caches. Call once at boot, after [`crate::mm::heap::init_buddy`].
 pub fn slab_init() {
     assert!(!SLAB_INITIALISED.swap(true, Ordering::AcqRel), "slab_init called twice");
     let mut i = 0;
     while i < SIZE_CLASSES.len() {
-        // Bucket alignment is capped at `MAX_BUCKET_ALIGN`: bumping align
-        // beyond the natural alignment of the bucket's size doesn't serve
-        // any allocation we route into this bucket. Callers that need
-        // stronger alignment than the bucket provides go through the
-        // large-alloc path (where `align` is honoured directly) — see the
-        // routing condition in [`kmalloc`], which enforces exactly that.
+        // Capped at `MAX_BUCKET_ALIGN`: more alignment serves nothing routed here, and callers
+        // needing more go to the large-alloc path (see the routing in [`kmalloc`]).
         let align = SIZE_CLASSES[i].min(MAX_BUCKET_ALIGN);
         SLAB_CACHES[i].init(SIZE_CLASSES[i], align);
         i += 1;
@@ -380,41 +321,32 @@ fn size_class_index(min_size: usize) -> Option<usize> {
     None
 }
 
-/// Allocate `size` bytes with alignment `align`. Returns null on OOM or
-/// when the request cannot be served (e.g. `align > SLAB_SIZE`).
+/// Allocate `size` bytes aligned to `align`; null on OOM or an unservable request (e.g.
+/// `align > SLAB_SIZE`).
 ///
-/// `kmalloc(0, ...)` returns a non-null aligned sentinel pointer that
-/// must never be dereferenced; passing it to [`kfree`] is harmless.
+/// `kmalloc(0, ...)` returns a non-null aligned sentinel that must never be dereferenced;
+/// passing it to [`kfree`] is harmless.
 pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
     if size == 0 {
-        // ZST convention: a non-null aligned sentinel. Caller must never
-        // deref it; kfree treats it as a no-op because its page is
-        // never one of our slab pages.
+        // ZST convention: a non-null aligned sentinel; `kfree` treats it as a no-op.
         return align.max(1) as *mut u8;
     }
     if align > SLAB_SIZE {
-        // Above-`SLAB_SIZE` alignment is intentionally not served here: its one
-        // client, DMA, uses `mm::dma::DmaBuffer` (buddy-backed, exposes a phys
-        // address). See this module's docs.
+        // Not served here: its one client, DMA, uses `mm::dma::DmaBuffer` (see the module docs).
         return ptr::null_mut();
     }
     if !SLAB_INITIALISED.load(Ordering::Acquire) {
         panic!("kmalloc called before slab_init");
     }
     let bucket_size = size.max(align);
-    // Route to the buddy-backed large path when the request is too big for any
-    // bucket, **or** when it needs stronger alignment than a bucket provides.
-    // `slab_init` caps every bucket's alignment at `align_of::<u64>()`, so a
-    // bucket cannot satisfy `align > 8` — and `bucket_size` alone does not catch
-    // that (a 64-byte-aligned 832-byte request has `bucket_size == 832` and would
-    // otherwise land in the 1024 bucket at 8-byte alignment). `large_alloc`
-    // honours `align` directly by rounding the object offset up from a
-    // page-aligned buddy block. Its first client is the per-thread FPU save area,
-    // whose `XSAVE` image `#GP`s unless 64-byte aligned.
+    // Large path when the request exceeds every bucket **or** needs more alignment than a bucket
+    // gives: `slab_init` caps buckets at `align_of::<u64>()`, and `bucket_size` alone misses this
+    // (a 64-aligned 832-byte request would land in the 1024 bucket at 8-byte alignment).
+    // `large_alloc` honours `align` by rounding the object offset up inside a page-aligned block;
+    // its first client is the per-thread FPU save area (`XSAVE` `#GP`s unless 64-aligned).
     if bucket_size > MAX_SLAB_OBJ || align > MAX_BUCKET_ALIGN {
         return large_alloc(size, align, &HeapBuddy);
     }
-    // bucket_size <= MAX_SLAB_OBJ, so SIZE_CLASSES has a suitable entry.
     let idx = size_class_index(bucket_size).expect("bucket_size in range");
     SLAB_CACHES[idx].alloc(&HeapBuddy)
 }
@@ -443,15 +375,10 @@ pub unsafe fn kfree(ptr: *mut u8) {
         return;
     }
     let desc = ((ptr as usize) & SLAB_MASK) as *mut SlabDescriptor;
-    // SAFETY: every non-null pointer kmalloc returns lives in a
-    // buddy-owned page whose first bytes are a valid SlabDescriptor —
-    // either a slab descriptor with non-null `owner`, or a large-alloc
-    // descriptor with null `owner`. The ZST sentinel is not a valid
-    // pointer into our pages and would mask to some garbage page; for
-    // safety the caller must not free a ZST allocation. The `libkern`
-    // containers uphold this: `KBox` / `KVec` represent zero-sized types
-    // with a dangling pointer and never route them through `kmalloc` /
-    // `kfree`.
+    // SAFETY: every non-null pointer `kmalloc` returns lies in a buddy-owned page starting with
+    // a valid SlabDescriptor (non-null `owner` for a slab, null for a large allocation). The ZST
+    // sentinel is not such a pointer, so the caller must not free one; `KBox` / `KVec` give
+    // zero-sized types a dangling pointer and never route them here.
     let owner = unsafe { (*desc).owner };
     if owner.is_null() {
         large_free(ptr, &HeapBuddy);
@@ -465,12 +392,11 @@ pub unsafe fn kfree(ptr: *mut u8) {
     unsafe { cache.free(ptr) };
 }
 
-/// Allocate a buddy block large enough to satisfy `size`/`align` plus
-/// the descriptor header. Returns the user pointer past the header.
+/// Allocate a buddy block holding `size`/`align` plus the descriptor header; returns the pointer
+/// past the header.
 fn large_alloc<P: BuddyPager>(size: usize, align: usize, pager: &P) -> *mut u8 {
     let header = core::mem::size_of::<SlabDescriptor>();
-    // User pointer sits at `obj_offset` from the start of the buddy
-    // block; we round up to honour the caller's alignment.
+    // The user pointer sits at `obj_offset`, rounded up for the caller's alignment.
     let obj_offset = align_up(header, align);
     let total = obj_offset.saturating_add(size);
     let order = BuddyAllocator::order_for_size(total);
@@ -488,7 +414,6 @@ fn large_alloc<P: BuddyPager>(size: usize, align: usize, pager: &P) -> *mut u8 {
             desc,
             SlabDescriptor {
                 freelist: ptr::null_mut(),
-                // Null owner is the large-alloc sentinel.
                 owner: ptr::null(),
                 next: ptr::null_mut(),
                 obj_size: (PAGE_SIZE << order) as u32,
@@ -500,7 +425,7 @@ fn large_alloc<P: BuddyPager>(size: usize, align: usize, pager: &P) -> *mut u8 {
     }
 }
 
-/// Free a large allocation previously obtained from [`large_alloc`].
+/// Free a large allocation from [`large_alloc`].
 fn large_free<P: BuddyPager>(ptr: *mut u8, pager: &P) {
     let page0 = (ptr as usize) & SLAB_MASK;
     let desc = page0 as *mut SlabDescriptor;
@@ -518,24 +443,16 @@ fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
-// --- Tests ---------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
-    //! Slab tests run host-side via `cargo test --lib`. They build a
-    //! [`LocalBuddy`] wrapping a per-test [`BuddyAllocator`] backed by
-    //! the [`FakeMem`] helper, then exercise local caches directly. The
-    //! production `SLAB_CACHES` / `HeapBuddy` statics are not touched,
-    //! so tests stay hermetic and parallel-safe.
+    //! Slab tests build a [`LocalBuddy`] over a per-test [`BuddyAllocator`] on [`FakeMem`] and
+    //! exercise local caches, leaving the production statics untouched (hermetic, parallel-safe).
 
     use super::*;
     use crate::limine::{MEMMAP_USABLE, MemoryMapEntry, MemoryMapResponse};
     use core::cell::RefCell;
 
-    /// Heap-backed substitute for physical memory, modelled on
-    /// `buddy::tests::FakeMem`. Duplicated here because the upstream
-    /// helper is `#[cfg(test)]`-private to the buddy module; future
-    /// refactor can lift it into a shared `mm::test_support` module.
+    /// Heap-backed stand-in for physical memory (see `buddy::tests::FakeMem`).
     struct FakeMem {
         _backing: Vec<u8>,
         _entries: Vec<MemoryMapEntry>,
@@ -549,9 +466,6 @@ mod tests {
             let mut backing = vec![0u8; bytes + 2 * PAGE_SIZE];
             let raw = backing.as_mut_ptr() as u64;
             let aligned = align_up(raw as usize, PAGE_SIZE) as u64;
-            // Host buffers sit at addresses well above 1 MiB, so the
-            // buddy allocator's low-memory cutoff does not reject the
-            // region.
             assert!(aligned >= 0x10_0000);
             let mut entries = vec![MemoryMapEntry { base: aligned, length: bytes as u64, kind: MEMMAP_USABLE }];
             let entries_ptr: *mut MemoryMapEntry = entries.as_mut_ptr();
@@ -566,10 +480,7 @@ mod tests {
         }
     }
 
-    /// Test-only [`BuddyPager`] wrapping a local [`BuddyAllocator`]
-    /// behind a `RefCell` so the trait's `&self` methods can mutate it.
-    /// On the kernel target the global `BUDDY` static is wrapped in a
-    /// `SpinLock` for the same reason.
+    /// Test-only [`BuddyPager`] over a local [`BuddyAllocator`] behind a `RefCell`.
     struct LocalBuddy {
         inner: RefCell<BuddyAllocator>,
         hhdm: u64,
@@ -603,7 +514,6 @@ mod tests {
         cache
     }
 
-    // Test-only accessors that inspect cache internals.
     impl SlabCache {
         fn partial_len(&self) -> usize {
             let state = self.state.lock();
@@ -648,12 +558,10 @@ mod tests {
         let cap = cache.objs_per_slab();
         let first = cache.alloc(&pager);
         let first_page = (first as usize) & SLAB_MASK;
-        // Fill out the rest of the first slab.
         for _ in 1..cap {
             let p = cache.alloc(&pager);
             assert_eq!((p as usize) & SLAB_MASK, first_page);
         }
-        // Next allocation must come from a new slab.
         let q = cache.alloc(&pager);
         assert!(!q.is_null());
         assert_ne!((q as usize) & SLAB_MASK, first_page);
@@ -669,7 +577,6 @@ mod tests {
         unsafe { cache.free(b) };
         let c = cache.alloc(&pager);
         assert_eq!(b, c, "LIFO push/pop should return the just-freed slot");
-        // Keep `a` live to suppress unused-warning suspicion.
         let _ = a;
     }
 
@@ -714,8 +621,6 @@ mod tests {
 
     #[test]
     fn kfree_null_is_noop() {
-        // Doesn't touch the global SLAB_CACHES because owner-derefence
-        // is short-circuited on null pointer. No panic, no segfault.
         // SAFETY: null is a no-op.
         unsafe { kfree(ptr::null_mut()) };
     }
@@ -731,18 +636,12 @@ mod tests {
         // SAFETY: as above.
         let obj_size = unsafe { (*desc).obj_size };
         assert!(owner.is_null(), "large-alloc descriptor must have null owner");
-        // The 32-byte header plus 8192 bytes of payload (= 8224 bytes,
-        // which is 3 pages once rounded up) rounds to order 2 — the
-        // smallest order whose 2^order pages cover three pages.
         assert_eq!(obj_size as usize, PAGE_SIZE << 2);
         large_free(p, &pager);
     }
 
     #[test]
     fn large_alloc_round_trip_via_kfree_routing() {
-        // Exercises the routing in `kfree`'s analogue: a manual walk
-        // through the descriptor that mirrors what the public `kfree`
-        // does, using the local pager.
         let (_mem, pager) = make_world(PAGE_SIZE * 64);
         let p = large_alloc(3000, 8, &pager);
         let desc = ((p as usize) & SLAB_MASK) as *mut SlabDescriptor;
@@ -753,10 +652,6 @@ mod tests {
 
     #[test]
     fn kzalloc_via_cache_returns_zeroed_memory() {
-        // We don't exercise `kzalloc` directly here because that path
-        // uses the global SLAB_CACHES. Instead allocate via the cache,
-        // poison the bytes, free, reallocate, and zero by hand to mirror
-        // what `kzalloc` does once routing chose a bucket.
         let (_mem, pager) = make_world(PAGE_SIZE * 64);
         let cache = fresh_cache(64);
         let p = cache.alloc(&pager);
@@ -787,7 +682,6 @@ mod tests {
     #[should_panic(expected = "obj_size too large")]
     fn init_panics_when_obj_too_large() {
         let cache = SlabCache::new();
-        // SLAB_SIZE-sized objects leave no room for a descriptor.
         cache.init(SLAB_SIZE, 8);
     }
 

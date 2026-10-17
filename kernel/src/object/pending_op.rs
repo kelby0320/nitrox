@@ -1,28 +1,18 @@
 //! The [`PendingOperation`] kernel object — a one-shot completion waitable.
 //!
-//! A `PendingOperation` (PO) represents a single in-flight asynchronous
-//! operation. Per the async-first rule (`docs/rationale/why-async-syscalls.md`),
-//! a potentially-blocking syscall returns a PO handle immediately rather than
-//! parking inside the syscall; the caller blocks on it via `sys_wait`. When the
-//! operation completes — a DPC signalling an I/O completion, or (this slice) a
-//! blocking IPC send whose message is finally delivered — the PO is **signalled**
-//! with a completion `status`, waking every thread blocked on it. The status is
-//! reported back through the `IoResult` that `sys_wait` writes.
+//! A PO is one in-flight asynchronous operation: per the async-first rule
+//! (`docs/rationale/why-async-syscalls.md`), a potentially-blocking syscall returns a PO handle
+//! and the caller blocks on it via `sys_wait`. Completion (a DPC for an I/O, or the delivery of
+//! a blocking IPC send) **signals** it with a `status`, waking every thread blocked on it.
 //!
-//! A PO is **one-shot**: it transitions `pending → signalled` exactly once and
-//! stays signalled (a second [`signal`](PendingOperation::signal) is a no-op).
-//! Once signalled, a `sys_wait` returns immediately via the fast-path check.
+//! **One-shot**: `pending → signalled` exactly once; a second signal is a no-op, so the first
+//! completion wins.
 //!
 //! ## Mutation discipline
 //!
-//! Identical to [`Timer`](crate::object::Timer): the PO is shared through an
-//! [`ObjectRef`](crate::object::ObjectRef) yet its `signaled`/`status`/waiter set
-//! are mutated by the scheduler. That is sound only because **all** interior
-//! state lives in an [`UnsafeCell`] touched **exclusively while the rank-1
-//! `SCHED` lock is held** (single-CPU serialisation; see
-//! `kernel/docs/lock-ordering.md`). The `pub(crate) unsafe fn` accessors take a
-//! type-erased `*mut ()` and reach the interior through that cell, forming no
-//! aliasing `&mut PendingOperation`.
+//! As for [`Timer`](crate::object::Timer): all interior state lives in an [`UnsafeCell`]
+//! touched **exclusively under the rank-1 `SCHED` lock** (`kernel/docs/lock-ordering.md`),
+//! reached through a type-erased `*mut ()` so no aliasing `&mut PendingOperation` is formed.
 
 use core::cell::UnsafeCell;
 
@@ -30,39 +20,27 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec};
 use crate::object::header::KObjectHeader;
 
-/// A pending-operation kernel object.
-///
-/// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
+/// A pending-operation kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct PendingOperation {
     header: KObjectHeader,
-    /// Self-check sentinel; a live object always reads [`PendingOperation::MAGIC`].
     magic: u64,
-    /// All mutable state, reached only under `SCHED` (see "Mutation discipline").
     inner: UnsafeCell<PendingOpInner>,
 }
 
-/// A `PendingOperation`'s scheduler-owned interior.
 struct PendingOpInner {
     /// `true` once the operation has completed; one-shot (never cleared).
     signaled: bool,
-    /// The completion status, valid once `signaled`. `0` = success; a negative
-    /// value is a [`KError`](crate::libkern::KError) discriminant (e.g. the
-    /// `TimedOut` / `PeerClosed` outcomes of a blocking IPC send). Surfaced to
-    /// userspace as the `status` of the `IoResult` `sys_wait` writes.
+    /// The completion status, valid once `signaled`: `0` = success, else a negative
+    /// [`KError`](crate::libkern::KError) discriminant (e.g. `TimedOut`, `PeerClosed`). Surfaced
+    /// as the `status` of the `IoResult` `sys_wait` writes.
     status: i32,
-    /// The completion **result payload**, valid once `signaled` and meaningful
-    /// when `status == 0` for operations that return a value rather than just a
-    /// status — a namespace lookup delivers its **resolved handle** here.
-    /// Surfaced as the `result` of the `IoResult` `sys_wait` writes; `0` for
-    /// status-only completions (a blocking IPC send) and edge-style waitables.
+    /// The completion **result payload**, meaningful when `status == 0` for operations that
+    /// return a value (a namespace lookup's **resolved handle**); the `result` of the `IoResult`,
+    /// `0` for status-only completions.
     result: u64,
-    /// Threads blocked on this PO, as type-erased `Thread` object pointers
-    /// (non-owning — each waiter is kept alive by its own parked `ObjectRef` in
-    /// the scheduler `blocked` list, and is removed from here before it unparks).
-    /// Pre-reserved at [`PendingOperation::try_new`] to
-    /// [`MAX_WAITERS`](PendingOperation::MAX_WAITERS); `add_waiter` never grows
-    /// it under the lock.
+    /// Blocked threads, non-owning (each is kept alive by its own parked `ObjectRef` and removed
+    /// from here before it unparks); pre-reserved to [`PendingOperation::MAX_WAITERS`].
     waiters: KVec<*mut ()>,
 }
 
@@ -77,14 +55,11 @@ impl PendingOperation {
     /// Sentinel written into [`PendingOperation::magic`] at construction.
     pub const MAGIC: u64 = 0x50_65_6e_64_4f_70_21_21; // "PendOp!!"
 
-    /// Maximum simultaneous waiters on one PO. Bounds the pre-reserved waiter
-    /// vector so `add_waiter` never allocates under `SCHED`; a PO almost always
-    /// has exactly one waiter (the thread that submitted the operation).
+    /// Maximum simultaneous waiters; the reserve keeps `add_waiter` from allocating under
+    /// `SCHED`. A PO almost always has one (the submitter).
     pub const MAX_WAITERS: usize = 4;
 
-    /// Allocate an unsignalled `PendingOperation` with a refcount of one. The
-    /// waiter vector is reserved up front (the only fallible growth) so later
-    /// `add_waiter`s stay within capacity and never allocate under `SCHED`.
+    /// Allocate an unsignalled `PendingOperation` (refcount one), reserving waiters up front.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
         let mut waiters: KVec<*mut ()> = KVec::new();
         waiters.try_reserve(Self::MAX_WAITERS)?;
@@ -100,11 +75,8 @@ impl PendingOperation {
         self.magic == Self::MAGIC
     }
 
-    // --- Scheduler-only accessors --------------------------------------
-    //
-    // SAFETY (shared by all): `obj` addresses a live `PendingOperation` (pinned
-    // by an `ObjectRef` the caller holds), and the caller holds the `SCHED`
-    // lock, which — single-CPU — serialises all access to `inner`.
+    // SAFETY (shared by all): `obj` is a live `PendingOperation` pinned by the caller's
+    // `ObjectRef`, and the caller holds `SCHED`, which serialises all access to `inner`.
 
     /// Borrow the interior mutably. Must not outlive the `SCHED` hold nor alias.
     ///
@@ -120,12 +92,9 @@ impl PendingOperation {
         unsafe { &mut *p.inner.get() }
     }
 
-    /// Mark the operation complete with `status` **and** a `result` payload,
-    /// **one-shot**: a PO already signalled is left untouched (the first
-    /// completion wins). Returns `true` iff this call performed the transition
-    /// (so the caller knows to wake waiters). Pairs with the scheduler's
-    /// `signal_pending_op_with_result`. A namespace lookup uses this to deliver
-    /// its resolved handle in `result`.
+    /// Mark the operation complete with `status` **and** a `result` payload. **One-shot**: a PO
+    /// already signalled is untouched (the first completion wins). Returns `true` iff this call
+    /// made the transition, so the caller knows to wake waiters.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -141,9 +110,7 @@ impl PendingOperation {
         true
     }
 
-    /// The completion status (meaningful once signalled; `0` before). Stable
-    /// after the one-shot transition, so it may be read at `sys_wait`
-    /// result-build time.
+    /// The completion status (`0` before signalled); stable after the one-shot transition.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -152,9 +119,7 @@ impl PendingOperation {
         unsafe { Self::inner(obj) }.status
     }
 
-    /// The completion result payload (meaningful once signalled with `status ==
-    /// 0`; `0` before). Stable after the one-shot transition, so it may be read
-    /// at `sys_wait` result-build time alongside [`status`](Self::status).
+    /// The completion result payload (`0` before signalled); stable after the transition.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -163,8 +128,7 @@ impl PendingOperation {
         unsafe { Self::inner(obj) }.result
     }
 
-    /// `true` iff the operation has completed — the waitable "signaled"
-    /// predicate (the `sys_wait` fast-path check).
+    /// `true` iff the operation has completed — the `sys_wait` fast-path check.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -173,9 +137,7 @@ impl PendingOperation {
         unsafe { Self::inner(obj) }.signaled
     }
 
-    /// Register `thread` as a waiter. `Err(())` if already at
-    /// [`MAX_WAITERS`](Self::MAX_WAITERS) (caller maps to `OutOfMemory`); never
-    /// grows the vector under the lock.
+    /// Register `thread` as a waiter; `Err(())` at the cap, which callers map to `OutOfMemory`.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -185,12 +147,9 @@ impl PendingOperation {
         if inner.waiters.len() < Self::MAX_WAITERS {
             inner
                 .waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED`
-                // (`wait_on` → `obj_add_waiter` with the guard held), and `try_push` grows,
-                // which is `kmalloc` under the rank-1 lock (F11). Safe either way today —
-                // construction reserves `MAX_WAITERS` with `?`, so `len < MAX ⟹ len < cap` —
-                // but the type is what should say so, since this is the shape a new waiter
-                // list gets copied from (PR #205 review, optional 5).
+                // `push_within_capacity`, not `try_push`: this runs under `SCHED`, and `try_push`
+                // grows, which is `kmalloc` under the rank-1 lock. Construction reserves
+                // `MAX_WAITERS`, so `len < MAX ⟹ len < cap`; the type should say so.
                 .push_within_capacity(thread)
                 .expect("within reserved waiter capacity");
             Ok(())
@@ -211,8 +170,7 @@ impl PendingOperation {
         }
     }
 
-    /// Drain every waiter into `out` (clearing the set), returning the count.
-    /// `out` must be at least [`MAX_WAITERS`](Self::MAX_WAITERS) long.
+    /// Drain every waiter into `out` (at least [`MAX_WAITERS`](Self::MAX_WAITERS) long).
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -230,9 +188,8 @@ impl PendingOperation {
 }
 
 impl Drop for PendingOperation {
-    /// A live waiter pins this PO (each holds an `ObjectRef` on it across
-    /// `sys_wait`), so the last reference cannot drop while waiters remain — the
-    /// assert documents that invariant. The `KVec` storage frees with the `KBox`.
+    /// A live waiter pins this PO (it holds an `ObjectRef` across `sys_wait`), so the last
+    /// reference cannot drop while waiters remain; the assert documents that.
     fn drop(&mut self) {
         debug_assert!(self.inner.get_mut().waiters.is_empty(), "PendingOperation dropped with live waiters");
     }
@@ -279,7 +236,6 @@ mod tests {
             assert!(PendingOperation::signal_with_result(obj, 0, 0));
             assert!(PendingOperation::already_signaled(obj));
             assert_eq!(PendingOperation::status(obj), 0);
-            // A second signal is a no-op: the first completion wins.
             assert!(!PendingOperation::signal_with_result(obj, -12, 0));
             assert_eq!(PendingOperation::status(obj), 0, "status must not change");
         }
@@ -294,7 +250,6 @@ mod tests {
             assert!(PendingOperation::signal_with_result(obj, -12, 0)); // e.g. TimedOut
             assert!(PendingOperation::already_signaled(obj));
             assert_eq!(PendingOperation::status(obj), -12);
-            // A status-only completion leaves the payload zero.
             assert_eq!(PendingOperation::result(obj), 0);
         }
         free(obj);
@@ -306,12 +261,10 @@ mod tests {
         // SAFETY: live PO, single-threaded test.
         unsafe {
             assert_eq!(PendingOperation::result(obj), 0, "zero before signal");
-            // A successful lookup-style completion: status 0, resolved handle.
             assert!(PendingOperation::signal_with_result(obj, 0, 0xCAFE));
             assert!(PendingOperation::already_signaled(obj));
             assert_eq!(PendingOperation::status(obj), 0);
             assert_eq!(PendingOperation::result(obj), 0xCAFE);
-            // One-shot: a second completion (even with a payload) is a no-op.
             assert!(!PendingOperation::signal_with_result(obj, -10, 0xDEAD));
             assert_eq!(PendingOperation::status(obj), 0, "status unchanged");
             assert_eq!(PendingOperation::result(obj), 0xCAFE, "result unchanged");
@@ -333,7 +286,6 @@ mod tests {
             assert!(PendingOperation::add_waiter(obj, 0xBEEF as *mut ()).is_ok());
             let mut buf = [core::ptr::null_mut(); PendingOperation::MAX_WAITERS];
             assert_eq!(PendingOperation::take_waiters(obj, &mut buf), PendingOperation::MAX_WAITERS);
-            // Empty after drain (so Drop's assert holds).
             let mut buf2 = [core::ptr::null_mut(); PendingOperation::MAX_WAITERS];
             assert_eq!(PendingOperation::take_waiters(obj, &mut buf2), 0);
         }

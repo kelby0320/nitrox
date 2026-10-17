@@ -1,27 +1,16 @@
-//! Allocation-time check that a [`Rights`] set is compatible with a
-//! given [`KObjectType`].
+//! Allocation-time check that a [`Rights`] set is compatible with a given
+//! [`KObjectType`], per the matrix in `docs/spec/handle-encoding.md`: nonsensical
+//! combinations (e.g. `MAP_WRITE` on a `Process`) are rejected at allocation, so
+//! the lookup hot path never second-guesses it.
 //!
-//! Implements the type-rights compatibility matrix from
-//! `docs/spec/handle-encoding.md`. The kernel rejects nonsensical
-//! right combinations (e.g. `MAP_WRITE` on a `Process` handle) at
-//! allocation time so the lookup hot path never has to second-guess
-//! the matrix.
-//!
-//! ## What is checked
-//!
-//! - **Principal rights** (bits 8-19): must be a subset of the
-//!   per-type mask below.
-//! - **Generic rights** (bits 0-3) and **modifier rights** (bits
-//!   32-37): not checked here. The spec calls generic rights "valid
-//!   on any handle type" and is silent on modifier-rights validity
-//!   per type; modifier-rights enforcement, where required, lands
-//!   with the slice that introduces each affected type.
+//! Only **principal rights** (bits 8-19) are checked, as a subset of the
+//! per-type mask. **Generic** (0-3) and **modifier** (32-37) rights are not: the
+//! spec calls generic rights valid on any type and is silent on modifier rights
+//! per type.
 
 use crate::libkern::handle::{KObjectType, Rights};
 
-/// Mask covering every principal-rights bit (8-19) defined by the
-/// spec. Used to isolate the principal-rights portion of a requested
-/// `Rights` set before comparing against a type-specific mask.
+/// Every principal-rights bit (8-19), to isolate that portion of a request.
 const PRINCIPAL_MASK: Rights = Rights::from_bits_truncate(
     Rights::READ.bits()
         | Rights::WRITE.bits()
@@ -37,59 +26,46 @@ const PRINCIPAL_MASK: Rights = Rights::from_bits_truncate(
         | Rights::RECV.bits(),
 );
 
-/// Principal rights valid on [`KObjectType::Process`] handles.
+/// Principal rights valid per object type.
 const PROCESS_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::SIGNAL.bits() | Rights::TERMINATE.bits());
 
-/// Principal rights valid on [`KObjectType::Thread`] handles.
 const THREAD_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::SIGNAL.bits() | Rights::TERMINATE.bits());
 
-/// Principal rights valid on [`KObjectType::Namespace`] handles.
 const NAMESPACE_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::LOOKUP.bits() | Rights::BIND.bits());
 
-/// Principal rights valid on [`KObjectType::MemoryObject`] handles.
 const MEMORY_OBJECT_PRINCIPALS: Rights =
     Rights::from_bits_truncate(Rights::MAP_READ.bits() | Rights::MAP_WRITE.bits() | Rights::MAP_EXEC.bits());
 
-/// Principal rights valid on [`KObjectType::FileObject`] handles. A mapped file is
-/// mappable like a `MemoryObject` (the `MAP_*` band); the actual grant is attenuated
-/// at resolve time (read-only content in Phase 2). `MAP_WRITE` is in the *type* mask
-/// for the Phase-3 read-write path, not because a Phase-2 file grants it.
+/// Principal rights valid on [`KObjectType::FileObject`] handles: mappable like
+/// a `MemoryObject` (the `MAP_*` band). The actual grant is attenuated at
+/// resolve time; `MAP_WRITE` is in the type mask for read-write mappings.
 const FILE_OBJECT_PRINCIPALS: Rights = MEMORY_OBJECT_PRINCIPALS;
 
-/// Principal rights valid on [`KObjectType::IpcChannel`] handles.
 const IPC_CHANNEL_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::SEND.bits() | Rights::RECV.bits());
 
-/// Principal rights valid on [`KObjectType::IoRing`] handles. The
-/// SQE/CQE memory regions need read and write for the producer and
-/// consumer halves of the ring.
+/// Principal rights valid on [`KObjectType::IoRing`] handles: read and write,
+/// for the producer and consumer halves of the SQE/CQE regions.
 const IO_RING_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::READ.bits() | Rights::WRITE.bits());
 
-/// Principal rights valid on [`KObjectType::EntropyObject`] handles.
 const ENTROPY_PRINCIPALS: Rights = Rights::READ;
 
-/// Principal rights valid on [`KObjectType::DeviceNode`] handles — `READ` + `WRITE`
-/// (a block device is written via `sys_io_submit` writes: the RW fs-server's metadata,
-/// and the writeback data path). `INSPECT` is a generic right; not on the principal mask.
+/// Principal rights valid on [`KObjectType::DeviceNode`] handles: `READ` and
+/// `WRITE` (a block device is written via `sys_io_submit`). `INSPECT` is a
+/// generic right, not on the principal mask.
 const DEVICE_NODE_PRINCIPALS: Rights = Rights::READ.union(Rights::WRITE);
 
-/// Principal rights valid on [`KObjectType::SystemControl`] handles — `WRITE`, which `sys_power`
-/// requires: stopping the machine changes its state (administration Part E.3).
+/// Principal rights valid on [`KObjectType::SystemControl`] handles: `WRITE`,
+/// which `sys_power` requires.
 const SYSTEM_CONTROL_PRINCIPALS: Rights = Rights::WRITE;
 
-/// Wait-only types — [`KObjectType::NotificationChannel`],
-/// [`KObjectType::Timer`], [`KObjectType::InterruptObject`],
-/// [`KObjectType::PendingOperation`]. `WAIT` is a generic right
-/// (bit 3), not a principal one, so the principal mask is empty —
-/// allocations may carry `WAIT` via the generic-rights band.
+/// Wait-only types ([`KObjectType::NotificationChannel`], `Timer`,
+/// `InterruptObject`, `PendingOperation`). `WAIT` is a generic right, so the
+/// principal mask is empty.
 const WAIT_ONLY_PRINCIPALS: Rights = Rights::empty();
 
-/// `true` iff `rights` is a valid set for a handle of type `ty`.
-///
-/// Generic and modifier rights are accepted without check; only
-/// principal rights (bits 8-19) are matched against the spec's
-/// per-type allowlist. `KObjectType::Invalid` and
-/// `KObjectType::UserspaceServerReg` are rejected outright — neither
-/// is a user-accessible type.
+/// `true` iff `rights` is valid for a handle of type `ty`: only principal
+/// rights are matched against the per-type allowlist. `Invalid` and
+/// `UserspaceServerReg` are rejected outright, being no user-accessible type.
 pub(crate) fn is_rights_compatible(ty: KObjectType, rights: Rights) -> bool {
     let allowed_principal = match ty {
         KObjectType::Process => PROCESS_PRINCIPALS,
@@ -145,10 +121,7 @@ mod tests {
         assert!(is_rights_compatible(KObjectType::Process, Rights::SIGNAL));
         assert!(is_rights_compatible(KObjectType::Process, Rights::TERMINATE));
         assert!(is_rights_compatible(KObjectType::Process, Rights::SIGNAL | Rights::TERMINATE,));
-        // READ is a principal right not in Process's mask.
         assert!(!is_rights_compatible(KObjectType::Process, Rights::READ));
-        // MAP_WRITE is principal — the spec's own example of a
-        // nonsensical combination.
         assert!(!is_rights_compatible(KObjectType::Process, Rights::MAP_WRITE));
     }
 
@@ -156,7 +129,6 @@ mod tests {
     fn memory_object_accepts_map_band() {
         let map_all = Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC;
         assert!(is_rights_compatible(KObjectType::MemoryObject, map_all));
-        // But not plain READ/WRITE — those are for streams/rings.
         assert!(!is_rights_compatible(KObjectType::MemoryObject, Rights::READ));
     }
 
@@ -189,9 +161,7 @@ mod tests {
             KObjectType::InterruptObject,
             KObjectType::PendingOperation,
         ] {
-            // WAIT is generic (bit 3), not principal — accepted.
             assert!(is_rights_compatible(ty, Rights::WAIT), "{:?}", ty);
-            // READ is principal — rejected.
             assert!(!is_rights_compatible(ty, Rights::READ), "{:?}", ty);
         }
     }
@@ -204,9 +174,7 @@ mod tests {
 
     #[test]
     fn modifier_rights_are_not_checked() {
-        // SEEK / APPEND / TRUNCATE / INSPECT_MEMORY are modifier bits.
-        // The current matrix doesn't restrict them per type; document
-        // that behaviour with a positive test.
+        // Modifier bits are not restricted per type.
         let with_modifier = Rights::SIGNAL | Rights::SEEK | Rights::INSPECT_MEMORY;
         assert!(is_rights_compatible(KObjectType::Process, with_modifier));
     }

@@ -1,10 +1,7 @@
 //! Points, sizes and rectangles, and the clipping arithmetic over them.
 //!
-//! Coordinates are **signed**: a surface may sit partly off the left or top edge of
-//! the screen, and clipping that correctly is one of the three properties the
-//! reference scene exists to exercise (`docs/design/display-substrate.md` §8e).
-//! Sizes are unsigned — a negative width has no meaning and should not be
-//! representable.
+//! Coordinates are signed: a surface may sit partly off the left or top edge of the screen
+//! (`docs/design/display-substrate.md` §8e). Sizes are unsigned.
 
 /// A point in screen space. Signed, so off-screen origins are representable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -45,8 +42,7 @@ impl Size {
 
 /// An axis-aligned rectangle: an origin plus a size.
 ///
-/// The rectangle covers `x .. x + w` and `y .. y + h`, so the right and bottom
-/// edges are exclusive.
+/// The rectangle covers `x .. x + w` and `y .. y + h`: right and bottom edges are exclusive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Rect {
     /// Top-left corner.
@@ -78,9 +74,8 @@ impl Rect {
 
     /// Right edge (**exclusive**).
     ///
-    /// Widened to `i64` before the add: a rectangle placed near `i32::MAX` would
-    /// otherwise overflow, and an overflow here silently produces a *smaller*
-    /// rectangle, which reads as correct clipping rather than as a bug.
+    /// Widened to `i64` before the add: an overflow near `i32::MAX` would silently produce a
+    /// smaller rectangle, which reads as correct clipping.
     pub const fn right(&self) -> i64 {
         self.origin.x as i64 + self.size.w as i64
     }
@@ -97,8 +92,8 @@ impl Rect {
 
     /// The overlap of two rectangles, or `None` when they do not overlap.
     ///
-    /// This is the whole of clipping: a surface is drawn through the intersection of
-    /// its own bounds, the damage rectangle, and the screen.
+    /// This is the whole of clipping: a surface is drawn through the intersection of its bounds,
+    /// the damage rectangle and the screen.
     pub fn intersect(&self, other: &Rect) -> Option<Rect> {
         if self.is_empty() || other.is_empty() {
             return None;
@@ -131,7 +126,6 @@ mod tests {
         let a = Rect::new(0, 0, 10, 10);
         let b = Rect::new(5, 5, 10, 10);
         assert_eq!(a.intersect(&b), Some(Rect::new(5, 5, 5, 5)));
-        // Intersection is symmetric.
         assert_eq!(b.intersect(&a), Some(Rect::new(5, 5, 5, 5)));
     }
 
@@ -139,14 +133,12 @@ mod tests {
     fn disjoint_and_edge_touching_rects_do_not_intersect() {
         let a = Rect::new(0, 0, 10, 10);
         assert_eq!(a.intersect(&Rect::new(20, 20, 5, 5)), None);
-        // Edges are exclusive: touching at x = 10 shares no pixel.
         assert_eq!(a.intersect(&Rect::new(10, 0, 5, 10)), None);
         assert_eq!(a.intersect(&Rect::new(0, 10, 10, 5)), None);
     }
 
     #[test]
     fn a_rect_off_the_left_edge_clips_to_the_visible_part() {
-        // The case the reference scene exists to exercise: negative origin.
         let screen = Rect::new(0, 0, 64, 32);
         let surface = Rect::new(-6, 4, 16, 10);
         assert_eq!(surface.intersect(&screen), Some(Rect::new(0, 4, 10, 10)));
@@ -168,8 +160,7 @@ mod tests {
 
     #[test]
     fn edges_near_i32_max_do_not_overflow_into_a_smaller_rect() {
-        // `right()`/`bottom()` widen to i64 precisely so this stays a huge rectangle
-        // rather than wrapping to a tiny one that would clip everything away.
+        // `right()`/`bottom()` widen to i64 so this stays a huge rectangle, not a wrapped tiny one.
         let r = Rect::new(i32::MAX - 1, 0, 16, 4);
         assert_eq!(r.right(), i32::MAX as i64 + 15);
         let screen = Rect::new(0, 0, 64, 32);

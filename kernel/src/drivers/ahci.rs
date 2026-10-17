@@ -1,20 +1,11 @@
-//! AHCI (SATA) Tier 1 block driver.
+//! AHCI (SATA) block driver: a single controller and SATA disk, one command at a time (slot 0).
 //!
-//! Brings up the HBA found by PCI enumeration (a class-`01.06.01` function),
-//! maps its ABAR uncached, enumerates ports, runs `IDENTIFY DEVICE` on the first
-//! SATA disk, and publishes it as a block [`DeviceNode`] backed by a
-//! [`BlockBackend`]. Reads flow through the Part 2 I/O spine: `dispatch_block_irp`
-//! → [`submit`] issues a `READ DMA EXT` against the IRP's buffer fragments
-//! (the controller DMAs straight into the client's `MemoryObject` frames) →
-//! the completion IRQ → [`isr`] → the IRP's completion DPC → its
-//! `PendingOperation`.
-//!
-//! Scope: a **single controller, single SATA disk**, one outstanding command
-//! (slot 0). The interrupt is **MSI** where the controller advertises the
-//! capability, with IOAPIC-routed INTx as the fallback for one that does not
-//! (Phase 5 Part A). Multi-port/multi-controller, NCQ, port multipliers and
-//! MSI-X are deferred (`docs/rationale/deferred-decisions.md`).
-//! See `docs/architecture/drivers-and-irps.md`.
+//! Brings up the class-`01.06.01` HBA that PCI enumeration found, maps its ABAR uncached, runs
+//! `IDENTIFY DEVICE` on the first SATA disk and publishes it as a block [`DeviceNode`] backed by a
+//! [`BlockBackend`]: [`submit`] → controller DMA into the IRP's fragments → [`isr`] → the IRP's
+//! completion DPC. MSI where the controller has it, IOAPIC-routed INTx otherwise. NCQ, multi-port
+//! and MSI-X are deferred (`docs/rationale/deferred-decisions.md`); see
+//! `docs/architecture/drivers-and-irps.md`.
 
 use crate::libkern::block::{BlockKind, MAX_DEVICE_NAME};
 use crate::libkern::printable::Printable;
@@ -36,8 +27,6 @@ use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
 use crate::object::{InterruptObject, ObjectRef};
-
-// --- HBA / port register offsets (AHCI 1.3) ---------------------------------
 
 const HBA_CAP: u64 = 0x00;
 const HBA_GHC: u64 = 0x04;
@@ -78,20 +67,14 @@ const SSTS_DET_PRESENT: u32 = 0x3; // device present + PHY communication
 const PXIE_DHRE: u32 = 1 << 0; // D2H register FIS interrupt
 const PXIE_TFEE: u32 = 1 << 30; // task file error
 
-// ATA commands.
 const ATA_IDENTIFY: u8 = 0xEC;
 const ATA_READ_DMA_EXT: u8 = 0x25;
 const ATA_WRITE_DMA_EXT: u8 = 0x35;
-/// `FLUSH CACHE` — write the drive's volatile cache to its medium. Non-data.
 const ATA_FLUSH_CACHE: u8 = 0xE7;
-/// `FLUSH CACHE EXT` — the same for a drive with the 48-bit feature set, and able to report
-/// an LBA48 failure address. Non-data.
 const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
 
-/// **The ATA command for an IRP op, and whether it writes** — `None` for an op this driver has no
-/// command for. By name for every op: this read "a write, else a read" until administration Part
-/// C.2, which would have sent a flush out as a `READ DMA EXT` of count 0 — 65,536 sectors
-/// under LBA48 — with no PRDT to receive them.
+/// **The ATA command for an IRP op, and whether it writes**; `None` for an op with no command.
+/// A flush must never fall through to a `READ DMA EXT` of count 0 (65,536 sectors under LBA48).
 fn ata_command(op: u32, flush: u8) -> Option<(u8, bool)> {
     use crate::io::irp::IrpOp;
     match op {
@@ -102,60 +85,33 @@ fn ata_command(op: u32, flush: u8) -> Option<(u8, bool)> {
     }
 }
 
-/// **Which flush the drive takes**, from IDENTIFY word 83 (command sets supported): bit 13
-/// is `FLUSH CACHE EXT`. A drive without it gets `FLUSH CACHE`, which every ATA-6 drive has —
-/// mandatory since, and older than the 48-bit feature set this driver needs anyway.
+/// **Which flush the drive takes**, from IDENTIFY word 83 bit 13 (`FLUSH CACHE EXT`); without it,
+/// `FLUSH CACHE`, which every ATA-6 drive has.
 fn flush_command(word83: u16) -> u8 {
     if word83 & (1 << 13) != 0 { ATA_FLUSH_CACHE_EXT } else { ATA_FLUSH_CACHE }
 }
 
 const SECTOR_SIZE: u32 = 512;
 
-// --- Command-table geometry -------------------------------------------------
-//
-// A command table is a 64-byte command FIS, a 16-byte ATAPI command and 48 bytes
-// reserved, then the PRDT: 16 bytes per entry, one entry per physical fragment.
-// **The three constants below are one fact stated once**, because the capacity
-// derived from them (`MAX_PRDT_ENTRIES`) has to be the same number
-// `build_command` writes within — an overflow here is the HBA reading PRDT
-// entries out of memory the table does not own, and DMAing to whatever addresses
-// it finds there.
+// A command table is a 64-byte command FIS, a 16-byte ATAPI command and 48 reserved bytes, then
+// the PRDT: 16 bytes per entry, one per physical fragment. `MAX_PRDT_ENTRIES` must equal what
+// `build_command` writes: an overflow has the HBA read PRDT entries from memory the table does
+// not own and DMA to whatever addresses it finds.
 
-/// Byte offset of the PRDT within a command table (past the CFIS + ATAPI +
-/// reserved area).
 const PRDT_OFFSET: usize = 128;
-/// Size of one PRDT entry: base low, base high, reserved, and the byte count.
 const PRDT_ENTRY: usize = 16;
-/// How much memory one command table gets. **This is the allocation**, used by `probe`
-/// and by the capacity below — the point is that they cannot be separately edited.
-///
-/// An earlier version wrote `PAGE_SIZE` at the allocation and derived the capacity from
-/// `PAGE_SIZE` too, and called that "derived, not chosen". It was not: shrinking the
-/// allocation left the capacity untouched and the test still passed, which a reviewer
-/// demonstrated (PR #293 review, 4). Two expressions of one size are two things to keep
-/// equal; this is one.
+/// How much memory one command table gets: the allocation `init` makes and the one the capacity
+/// below derives from, so the two cannot be edited apart.
 const CMD_TABLE_BYTES: usize = crate::mm::PAGE_SIZE;
-/// How many fragments one command can describe: whatever fits in a command table after
-/// the FIS area. Derived from [`CMD_TABLE_BYTES`] — shrink the allocation and this
-/// follows, which is now a property rather than a claim.
 const MAX_PRDT_ENTRIES: u32 = ((CMD_TABLE_BYTES - PRDT_OFFSET) / PRDT_ENTRY) as u32;
 /// Bounded poll for command completion / port readiness (~1 s of monotonic time).
 const POLL_TIMEOUT_NS: u64 = 1_000_000_000;
 
-// --- Driver state -----------------------------------------------------------
-
-/// Depth of the software pending-IRP queue in front of slot 0. The driver issues one
-/// command at a time (slot 0); concurrent block submits beyond that are queued here
-/// and drained FIFO as slot 0 retires, so concurrent clients serialise correctly
-/// instead of clobbering each other's in-flight request. Full 32-slot NCQ (letting the
-/// controller run many commands at once) is a future item — see
-/// `docs/rationale/deferred-decisions.md`. A full queue fails the excess submit with
-/// `IoError` (backpressure); 32 is far beyond realistic concurrency here.
+/// Depth of the software queue in front of slot 0, drained FIFO as it retires; a full queue fails
+/// the excess submit with `IoError` (backpressure).
 const PENDING_DEPTH: usize = 32;
 
-/// A FIFO ring of block IRPs waiting for slot 0. Guarded by [`AhciDisk::pending`]; the
-/// ring holds only *pointers* (the `Irp` boxes are owned by the submitter until
-/// completion), so it needs no `Irp` layout change.
+/// A FIFO ring of block IRP pointers waiting for slot 0; the submitter owns the boxes.
 struct PendingRing {
     ring: [*mut Irp; PENDING_DEPTH],
     head: usize,
@@ -166,7 +122,6 @@ impl PendingRing {
     const fn new() -> Self {
         PendingRing { ring: [core::ptr::null_mut(); PENDING_DEPTH], head: 0, len: 0 }
     }
-    /// Enqueue `irp`; `false` if the ring is full.
     fn push(&mut self, irp: *mut Irp) -> bool {
         if self.len == PENDING_DEPTH {
             return false;
@@ -176,7 +131,6 @@ impl PendingRing {
         self.len += 1;
         true
     }
-    /// Dequeue the oldest waiter, or `null` if empty.
     fn pop(&mut self) -> *mut Irp {
         if self.len == 0 {
             return core::ptr::null_mut();
@@ -188,8 +142,7 @@ impl PendingRing {
     }
 }
 
-/// State for the single supported AHCI disk. Leaked to `'static` at bring-up (the
-/// hardware lives for the kernel's lifetime); the ISR reaches it through
+/// State for the single supported AHCI disk, leaked to `'static`; the ISR reaches it through
 /// [`AHCI`].
 pub struct AhciDisk {
     abar: u64,      // mapped ABAR kernel-virtual base
@@ -199,47 +152,33 @@ pub struct AhciDisk {
     _fis: DmaBuffer,      // 256 B received-FIS area
     cmd_table: DmaBuffer, // CFIS + PRDT for slot 0
     sectors: u64,
-    /// The flush command the drive takes ([`flush_command`]), from IDENTIFY.
     flush_command: u8,
-    /// The IRP currently issued on slot 0 (`null` when idle), for the ISR to
-    /// complete. One command runs at a time; further submits queue in [`pending`].
-    /// Accessed under [`pending`]'s lock (the atomic type is retained for the
-    /// boot-path lock-free peek in [`poll_complete_inflight`]).
+    /// The IRP issued on slot 0 (`null` when idle). Accessed under [`pending`]'s lock; atomic for
+    /// the lock-free peek in [`poll_complete_inflight`].
     inflight: AtomicPtr<Irp>,
-    /// FIFO queue of block IRPs waiting for slot 0 (drained as it retires). An
-    /// interrupt-safe lock: submit runs in thread context, completion in the ISR.
+    /// IRPs waiting for slot 0; IRQ-safe since submit is thread context and completion the ISR.
     pending: IrqSpinLock<PendingRing>,
-    /// The controller's IRQ object, signalled by the ISR (exercises the
-    /// signal-from-real-ISR path; no waiter in Phase 2).
     intr: *mut (),
-    /// When slot 0's command was issued, for its time on the device (Phase 6 Part H.2). Written
-    /// under [`pending`] as the command issues; read once it retires, before the next issues.
+    /// When slot 0's command issued, for its time on the device; written under [`pending`], read
+    /// once it retires.
     issued_at: AtomicU64,
-    /// The disk node's counters, attached once it is registered ([`crate::io::stats`]).
     counted: Counted,
 }
 
-// SAFETY: the disk state is set up once at boot and is immutable thereafter except
-// for `pending` and `inflight`. `submit` runs on whichever CPU submits and the ISR on
-// whichever CPU takes the interrupt; both take `pending` — the port lock, an
-// `IrqSpinLock` — before touching slot 0, and `inflight` is atomic. (This said
-// "accessed only on the single CPU that services the controller" until 2026-09-14,
-// which a root disk submitting from every CPU makes plainly false — PR #298 review.)
+// SAFETY: the disk state is set up once at boot and is immutable thereafter except for
+// `pending` and `inflight`. `submit` runs on whichever CPU submits and the ISR on whichever CPU
+// takes the interrupt; both take `pending` — the port lock, an `IrqSpinLock` — before touching
+// slot 0, and `inflight` is atomic.
 unsafe impl Send for AhciDisk {}
 // SAFETY: as above.
 unsafe impl Sync for AhciDisk {}
 
-/// The active disk (one in Phase 2). Set at bring-up; read by [`isr`] / [`submit`].
 static AHCI: AtomicPtr<AhciDisk> = AtomicPtr::new(core::ptr::null_mut());
 
-/// DPC that signals the controller's `InterruptObject` (queued by the ISR).
 static AHCI_INTR_DPC: Dpc = Dpc::new(ahci_intr_dpc, core::ptr::null_mut());
 
-/// DPC that issues the next queued command after a completion (queued by the ISR).
-/// Draining from a DPC — not the ISR — keeps command-issue off the interrupt path.
+/// DPC that issues the next queued command after a completion, off the interrupt path.
 static AHCI_DRAIN_DPC: Dpc = Dpc::new(ahci_drain_dpc, core::ptr::null_mut());
-
-// --- MMIO helpers -----------------------------------------------------------
 
 #[inline]
 fn read32(base: u64, off: u64) -> u32 {
@@ -253,14 +192,8 @@ fn write32(base: u64, off: u64, val: u32) {
     unsafe { core::ptr::write_volatile((base + off) as *mut u32, val) };
 }
 
-// --- Bring-up ---------------------------------------------------------------
-
-/// Probe and initialise an AHCI controller `DeviceNode`. On success, publishes
-/// the first SATA disk found as a block `DeviceNode` (registered in the device
-/// table) and installs the completion ISR. Logs progress, and returns what became of the
-/// controller — claimed, with how its interrupts arrive, or declined, with why — for the
-/// caller to record in the device table (Phase 5 Part D.1). Every return is one or the
-/// other, so a controller that matched can never be reported as having no driver.
+/// Probe and initialise an AHCI controller `DeviceNode`, publishing its first SATA disk; returns
+/// its fate (claimed, or declined with why).
 pub fn init(controller: &ObjectRef) -> Outcome {
     // SAFETY: `controller` pins a live `DeviceNode`.
     let dn: &DeviceNode = unsafe { &*(controller.as_ptr() as *const DeviceNode) };
@@ -282,17 +215,13 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         }
     };
 
-    // Enable AHCI mode, then find an implemented port with a SATA disk.
     write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_AE);
     let pi = read32(abar, HBA_PI);
     let cap = read32(abar, HBA_CAP);
     crate::kprintln!("ahci: HBA up (CAP {:#010x}, PI {:#010x})", cap, pi);
 
-    // The driver writes 64-bit addresses into the command list, the FIS base and
-    // every PRDT entry, and the frames it is handed can sit anywhere in physical
-    // memory. An HBA without `S64A` would take the low half and silently DMA to
-    // the wrong place, so decline it instead: no disk is a diagnosable failure
-    // and a corrupted one is not. Both target controllers set it.
+    // The driver writes 64-bit addresses into the command list, the FIS base and every PRDT entry.
+    // An HBA without `S64A` would take the low half and DMA to the wrong place, so decline it.
     if cap & CAP_S64A == 0 {
         crate::kprintln!("ahci: HBA lacks 64-bit addressing (CAP.S64A clear) — declining");
         return declined("no 64-bit addressing (CAP.S64A clear)");
@@ -315,8 +244,6 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     }
     let port_base = abar + PORT_BASE + port as u64 * PORT_STRIDE;
 
-    // Configuration space, for the command register and the MSI capability.
-    // Enumeration's scan window is long gone by now (see `pci::Config`).
     let cfg = match crate::pci::Config::map(desc) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -329,16 +256,10 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         }
     };
 
-    // **Bus mastering, and it has to be here — before anything DMAs.** `start_port`
-    // below sets FRE, after which the HBA writes received FISes into memory, and
-    // `identify` has it fetch a command list and a PRDT and write 512 bytes back.
-    // All three are bus-master transactions. This call sat after `identify` until
-    // the PR #295 review: on a machine whose firmware left the bit clear — the one
-    // case it exists for — `identify` would have timed out, `init` returned at
-    // "IDENTIFY failed", and the enable never been reached at all.
-    //
-    // Every firmware we have booted under leaves it on, which is a property of
-    // those firmwares rather than of the machine, so say which happened.
+    // **Bus mastering must be enabled before anything DMAs**: `start_port` sets FRE (the HBA then
+    // writes received FISes to memory) and `identify` has it fetch a command list and a PRDT and
+    // write 512 bytes back. Firmware that left the bit clear would otherwise time `identify` out.
+    // Say which happened: leaving it on is a property of the firmware.
     if let Some(cfg) = &cfg {
         if crate::pci::enable_bus_master(cfg) {
             crate::kprintln!("ahci: bus master already enabled by firmware");
@@ -347,7 +268,6 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         }
     }
 
-    // Allocate the per-port DMA structures (zeroed, contiguous, page-aligned).
     let cmd_list = match DmaBuffer::alloc(1024) {
         Ok(b) => b,
         Err(_) => return declined(OUT_OF_MEMORY),
@@ -361,7 +281,6 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         Err(_) => return declined(OUT_OF_MEMORY),
     };
 
-    // Stop the port, point it at our structures, clear errors, restart.
     stop_port(port_base);
     write32(port_base, PX_CLB, cmd_list.phys().as_u64() as u32);
     write32(port_base, PX_CLBU, (cmd_list.phys().as_u64() >> 32) as u32);
@@ -378,7 +297,6 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         Err(_) => return declined(OUT_OF_MEMORY),
     };
     let intr_ptr = intr.as_ptr();
-    // Leak the IRQ object: the controller holds it for the kernel's lifetime.
     core::mem::forget(intr);
 
     let disk = AhciDisk {
@@ -402,7 +320,6 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     };
     AHCI.store(disk, Ordering::Release);
 
-    // IDENTIFY the disk (polled — bring-up runs with interrupts masked).
     let mut name = [0u8; MAX_DEVICE_NAME];
     // SAFETY: `disk` is the just-published live state.
     let (sectors, name_len, flush) = match unsafe { identify(&mut *disk, &mut name) } {
@@ -422,22 +339,17 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         port,
         sectors,
         sectors * SECTOR_SIZE as u64 / (1024 * 1024),
-        // The model is a fact about the machine, so it belongs in the report every boot logs
-        // (Part D) as much as in the info a program reads.
         Printable(&name[..name_len])
     );
-    // Its own line: the one above is matched by a gate, and this is a fact about the drive the
-    // hardware report should carry (administration Part C.2).
+    // Its own line: the one above is matched by a gate.
     crate::kprintln!(
         "ahci: port {} flushes with {}",
         port,
         if flush == ATA_FLUSH_CACHE_EXT { "FLUSH CACHE EXT" } else { "FLUSH CACHE" }
     );
 
-    // Prefer MSI: the device is told a vector and raises the interrupt itself,
-    // so nothing depends on the PCI interrupt-line register — which QEMU's
-    // firmware programs and real UEFI often leaves meaningless. INTx stays as
-    // the fallback for a function that advertises no MSI capability.
+    // Prefer MSI: it does not depend on the PCI interrupt-line register, which QEMU's firmware
+    // programs and real UEFI often leaves meaningless. INTx is the fallback.
     let mut signal = None;
     if let Some(cfg) = &cfg
         && let Some(msi) = crate::pci::read_msi(cfg)
@@ -485,7 +397,6 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         }
     };
 
-    // Enable HBA-level interrupt delivery.
     write32(abar, HBA_GHC, read32(abar, HBA_GHC) | GHC_IE);
     write32(abar, HBA_IS, read32(abar, HBA_IS)); // clear stale
 
@@ -496,17 +407,12 @@ pub fn init(controller: &ObjectRef) -> Outcome {
     }
 }
 
-/// This driver's name in the device table's outcome lines.
 const DRIVER: &str = "ahci";
 
-/// The reason a controller with no disk attached is declined: the live image's case, booted
-/// from a USB stick with the AHCI controller empty, and the one to stop at on a new machine.
 const NO_SATA_DISK: &str = "no SATA disk on any implemented port";
 
-/// The reason for any allocation this bring-up could not make.
 const OUT_OF_MEMORY: &str = "out of memory";
 
-/// `init`'s outcome when it gives the controller up.
 fn declined(why: &'static str) -> Outcome {
     Outcome::Declined { driver: DRIVER, why }
 }
@@ -533,7 +439,6 @@ fn start_port(pb: u64) {
     write32(pb, PX_CMD, cmd);
 }
 
-/// Spin until `mask` bits at `pb+off` are clear, or the poll timeout elapses.
 fn wait_clear(pb: u64, off: u64, mask: u32) {
     let start = crate::arch::Timer::read_ns();
     while read32(pb, off) & mask != 0 {
@@ -566,15 +471,13 @@ unsafe fn identify(disk: &mut AhciDisk, name: &mut [u8; MAX_DEVICE_NAME]) -> Opt
             | (words.add(102).read() as u64) << 32
             | (words.add(103).read() as u64) << 48
     };
-    // **The model and serial, which this read already has** (Phase 5 Part H.1). Words 10..=19 are
-    // the serial and 27..=46 the model, ASCII in **byte-swapped pairs** — the wire order of the
-    // old 16-bit register interface, kept for compatibility ever since. A person about to lose a
-    // disk's contents confirms it by this string, so it is worth the twenty lines.
+    // The model and serial: words 10..=19 are the serial and 27..=46 the model, ASCII in
+    // **byte-swapped pairs** (the wire order of the old 16-bit register interface); a person about
+    // to lose a disk confirms it by this string.
     // SAFETY: as above; words 10..=46 are inside the 512-byte result.
     let len = unsafe { format_identity(words, name) };
     // SAFETY: as above; word 83 is inside the 512-byte result.
     let flush = flush_command(unsafe { words.add(83).read() });
-    // `data` drops here (IDENTIFY is one-shot); the command is complete.
     if n == 0 { None } else { Some((n, len, flush)) }
 }
 
@@ -595,13 +498,9 @@ unsafe fn format_identity(words: *const u16, out: &mut [u8; MAX_DEVICE_NAME]) ->
                 }
             }
         }
-        // **ATA pads with spaces, and not always on the right.** The standard says the
-        // field is space-padded and says nothing about which end, so drives differ: the
-        // laptop's Seagate right-justifies its serial in the 20-byte field, and trimming
-        // only the tail left `ST1000LM035-1RK172 (            WDELGVZ3)` — a name the
-        // installer then asked a person to type back exactly, spaces and all (first
-        // install attempt, 2026-09-17). Its *model* is left-justified, which is why QEMU
-        // and the model field never showed this.
+        // **ATA pads with spaces, and not always on the right**: the laptop's Seagate
+        // right-justifies its serial, and trimming only the tail left interior spaces in a name the
+        // installer asks a person to type back. QEMU never showed this.
         let mut start = 0;
         while start < n && dst[start] == b' ' {
             start += 1;
@@ -634,20 +533,13 @@ unsafe fn format_identity(words: *const u16, out: &mut [u8; MAX_DEVICE_NAME]) ->
     n
 }
 
-/// Fill slot 0's command header + table for an ATA command transferring the
-/// `frags` region. `write` selects the transfer direction.
 fn build_command(disk: &AhciDisk, command: u8, lba: u64, count: u16, frags: &[PhysFrag], write: bool) {
     let ct = disk.cmd_table.virt();
-    // Zero the command FIS + PRDT region we touch.
-    //
     // SAFETY: `ct` is our owned page-sized command-table buffer, and `frags.len()` is
-    // `<= MAX_PRDT_ENTRIES` — refused by [`submit`] below before the port lock is taken,
-    // and again by `dispatch_block_irp` against the `max_frags` this driver publishes.
-    // **The check is in `submit` rather than here** because here is under the port lock,
-    // where there is no way to report: a `debug_assert!` in this spot panics on a
-    // *lock-order violation* while formatting its own message, which says nothing about
-    // PRDTs, and compiles out in release besides. (Found by deleting the dispatch guard
-    // and reading what the boot self-test actually printed.)
+    // `<= MAX_PRDT_ENTRIES` — refused by [`submit`] before the port lock is taken, and again by
+    // `dispatch_block_irp` against the `max_frags` this driver publishes. The check is not here
+    // because here is under the port lock, where a failure cannot be reported (a `debug_assert!`
+    // there panics on a lock-order violation while formatting, and vanishes in release).
     unsafe { core::ptr::write_bytes(ct, 0, PRDT_OFFSET + frags.len() * PRDT_ENTRY) };
 
     // Command FIS — H2D Register FIS (type 0x27), command set.
@@ -667,7 +559,6 @@ fn build_command(disk: &AhciDisk, command: u8, lba: u64, count: u16, frags: &[Ph
         ct.add(13).write((count >> 8) as u8);
     }
 
-    // PRDT entries at `PRDT_OFFSET`.
     for (i, f) in frags.iter().enumerate() {
         let e = (ct as u64 + PRDT_OFFSET as u64 + (i as u64) * PRDT_ENTRY as u64) as *mut u32;
         // SAFETY: `e` is within the owned command-table page (frags bounded).
@@ -680,7 +571,6 @@ fn build_command(disk: &AhciDisk, command: u8, lba: u64, count: u16, frags: &[Ph
         }
     }
 
-    // Command header (slot 0) at the start of the command list.
     let cl = disk._cmd_list.virt() as *mut u32;
     // DW0: CFL = 5 dwords (H2D FIS), W bit, PRDTL = frag count.
     let dw0 = 5u32 | ((write as u32) << 6) | ((frags.len() as u32) << 16);
@@ -693,7 +583,6 @@ fn build_command(disk: &AhciDisk, command: u8, lba: u64, count: u16, frags: &[Ph
     }
 }
 
-/// Issue slot 0 (set PxCI bit 0).
 fn issue(disk: &AhciDisk) {
     write32(disk.port_base, PX_CI, 1);
 }
@@ -717,7 +606,6 @@ fn wait_command_polled(disk: &AhciDisk) -> bool {
     read32(disk.port_base, PX_TFD) & (TFD_ERR | TFD_BSY | TFD_DRQ) == 0
 }
 
-/// Publish the disk as a block `DeviceNode` in the device table.
 fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut AhciDisk) -> bool {
     // SAFETY: `controller` pins a live `DeviceNode`.
     let cdesc = unsafe { &*(controller.as_ptr() as *const DeviceNode) }.descriptor();
@@ -760,18 +648,15 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut Ah
     }
 }
 
-// --- The block backend: issue a read/write IRP ------------------------------
-
-/// [`BlockBackend::submit`] for an AHCI disk. Builds a `READ DMA EXT` (or write)
-/// against the IRP's buffer fragments and issues it; completion arrives via the
-/// IRQ (or the boot self-test's polled fallback). `ctx` is the `*mut AhciDisk`.
+/// [`BlockBackend::submit`] for an AHCI disk: builds a `READ DMA EXT` (or write or flush) against
+/// the IRP's fragments and issues it. Completion arrives via the IRQ or the boot polled fallback.
 fn submit(irp: *mut Irp, ctx: *mut ()) {
     let disk = ctx as *mut AhciDisk;
     // SAFETY: `disk` is the live published disk.
     let d = unsafe { &*disk };
 
-    // **A rescan is refused**: a SATA disk's table is read at boot, by polling, and nothing reads it
-    // again (Phase 6 Part G) — partitioning an internal disk is `nxinstall`'s, and a reboot follows.
+    // **A rescan is refused**: a SATA disk's table is read once at boot, by polling; partitioning
+    // an internal disk is `nxinstall`'s, and a reboot follows.
     // SAFETY: `irp` is a live block IRP during submit.
     if unsafe { (*irp).op } == crate::io::irp::IrpOp::Rescan as u32 {
         // SAFETY: `irp` is uniquely owned during submit; completing it releases its waiter.
@@ -783,11 +668,9 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
     }
 
     // **More fragments than one command table can describe: refuse, before the lock.**
-    // `dispatch_block_irp` already rejects this against the `max_frags` we publish, so
-    // nothing in the tree reaches here — this is the backstop that makes the overflow
-    // unreachable rather than merely unreached, for a future caller that submits an IRP
-    // by some other route. It sits *before* the port lock deliberately: failing an IRP
-    // means completing it, and completion from under the lock is not available.
+    // `dispatch_block_irp` already rejects this against the published `max_frags`; this is the
+    // backstop for another route. It precedes the port lock because failing an IRP means completing
+    // it, unavailable under the lock.
     // SAFETY: `irp` is a live block IRP during submit.
     if unsafe { (*irp).buffer.count } as usize > MAX_PRDT_ENTRIES as usize {
         // SAFETY: `irp` is uniquely owned during submit; complete it with an error so
@@ -803,7 +686,6 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
     // this CPU while we decide whether slot 0 is free — `inflight` is stable here.
     let mut q = d.pending.lock();
     if d.inflight.load(Ordering::Acquire).is_null() {
-        // Slot 0 is idle — issue immediately.
         d.inflight.store(irp, Ordering::Release);
         // SAFETY: slot 0 is free; `irp` is a live block IRP.
         if !unsafe { issue_locked(d, irp) } {
@@ -812,9 +694,6 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
             fail_irp(irp);
         }
     } else if !q.push(irp) {
-        // Slot busy and the queue is full — refuse this submit with backpressure
-        // rather than clobber an in-flight request. Complete it with an error so its
-        // waiter is released (a demand-fault fill then fails cleanly, not silently).
         drop(q);
         // SAFETY: `irp` is uniquely owned during submit; complete it with an error.
         unsafe {
@@ -822,13 +701,11 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
             crate::dpc::enqueue(&(*irp).dpc);
         }
     }
-    // Otherwise `irp` is queued; it issues when slot 0 next retires (`advance_slot`).
 }
 
-/// Build slot 0's command for `irp` and issue it. The caller holds [`AhciDisk::pending`]
-/// and has established that slot 0 is idle. `false`, issuing nothing, for an op with no ATA
-/// command ([`ata_command`]): the caller takes the IRP back out of flight and fails it once it
-/// has let go of the lock, since completion cannot happen under it.
+/// Build slot 0's command for `irp` and issue it; the caller holds [`AhciDisk::pending`] and has
+/// established that slot 0 is idle. `false`, issuing nothing, for an op with no ATA command
+/// ([`ata_command`]): the caller fails the IRP once it has let go of the lock.
 ///
 /// # Safety
 /// `irp` is a live block IRP whose `buffer.frags` is a valid `[PhysFrag; count]`, or has a
@@ -837,8 +714,8 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
 unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) -> bool {
     // SAFETY: `irp` is live.
     let (op, offset, length, buffer) = unsafe { ((*irp).op, (*irp).offset, (*irp).length, (*irp).buffer) };
-    // **No buffer is an empty slice**, not one built from a null pointer, which
-    // `from_raw_parts` forbids at any length (a flush's first boot tripped it).
+    // **No buffer is an empty slice**, not one built from a null pointer, which `from_raw_parts`
+    // forbids.
     let frags: &[PhysFrag] = if buffer.count == 0 {
         &[]
     } else {
@@ -850,9 +727,8 @@ unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) -> bool {
     let Some((command, write)) = ata_command(op, d.flush_command) else {
         return false;
     };
-    // Slot 0 is idle (caller established): build its command table + issue. A flush is
-    // non-data — no LBA, no count, no PRDT — and completes with a D2H register FIS, which
-    // `PXIE_DHRE` already interrupts on.
+    // A flush is non-data — no LBA, no count, no PRDT — and completes with a D2H register FIS,
+    // which `PXIE_DHRE` already interrupts on.
     if op == crate::io::irp::IrpOp::Flush as u32 {
         build_command(d, command, 0, 0, &[], false);
     } else {
@@ -863,9 +739,8 @@ unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) -> bool {
     true
 }
 
-/// **Complete the IRP slot 0 retired, and count it** (Phase 6 Part H.2): its status, the bytes it
-/// moved, and its time on the device since [`issue_locked`] stamped it — read before the next
-/// command can issue, which only the drain after this does.
+/// **Complete the IRP slot 0 retired, and count it**: its status, the bytes it moved, and its time
+/// on the device since [`issue_locked`] stamped it — read before the next command can issue.
 ///
 /// # Safety
 /// `irp` is the IRP [`take_retired`] just took out of flight: live, and uniquely this driver's
@@ -882,12 +757,11 @@ unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool) {
     }
 }
 
-/// Slot 0 has retired: under the port lock, take the completed IRP out of flight
-/// (capturing its error status) and mark the slot idle. Returns the retired IRP
-/// (`null` if the slot was already idle) and whether it errored. Does **not** issue
-/// the next command — that is deferred to [`drain_queue`] (run from a DPC, not the
-/// ISR, so a fast pipelined completion cannot race the interrupt ack). The caller
-/// completes the retired IRP **outside** any driver lock.
+/// Slot 0 has retired: under the port lock, take the completed IRP out of flight (capturing its
+/// error status) and mark the slot idle. Returns the IRP (`null` if already idle) and whether it
+/// errored. Does **not** issue the next command: [`drain_queue`] does, from a DPC, so a fast
+/// pipelined completion cannot race the interrupt ack. The caller completes the IRP outside any
+/// lock.
 fn take_retired(d: &AhciDisk) -> (*mut Irp, bool) {
     let _q = d.pending.lock();
     let retired = d.inflight.swap(core::ptr::null_mut(), Ordering::AcqRel);
@@ -895,9 +769,8 @@ fn take_retired(d: &AhciDisk) -> (*mut Irp, bool) {
     (retired, err)
 }
 
-/// If slot 0 is idle and the queue is non-empty, issue the next waiting IRP. Called
-/// from the completion DPC (and the boot poll path) — not the ISR — so issuing a new
-/// command is decoupled from the interrupt acknowledge.
+/// If slot 0 is idle, issue the next queued IRP. Called from the completion DPC and the boot poll
+/// path, not the ISR.
 fn drain_queue(d: &AhciDisk) {
     loop {
         let refused = {
@@ -917,13 +790,11 @@ fn drain_queue(d: &AhciDisk) {
             d.inflight.store(core::ptr::null_mut(), Ordering::Release);
             next
         };
-        // Refused, and the slot still idle: fail it outside the lock and try the next.
         fail_irp(refused);
     }
 }
 
-/// Complete `irp` with `InvalidArgument` — an op this driver has no command for. Outside the
-/// port lock, like every completion here.
+/// Complete `irp` with `InvalidArgument` (an op with no command), outside the port lock.
 fn fail_irp(irp: *mut Irp) {
     // SAFETY: `irp` is a live IRP no longer in flight or queued, so uniquely ours.
     unsafe {
@@ -932,47 +803,38 @@ fn fail_irp(irp: *mut Irp) {
     }
 }
 
-// --- Interrupt + completion -------------------------------------------------
-
-/// The AHCI completion ISR (device-IRQ context). Acknowledges the controller,
-/// completes the in-flight IRP via its DPC, and queues the InterruptObject
-/// signal. The dispatcher EOIs after this returns.
+/// The AHCI completion ISR (device-IRQ context): acknowledges the controller, completes the
+/// in-flight IRP via its DPC and queues the `InterruptObject` signal.
 extern "C" fn isr() {
     let disk = AHCI.load(Ordering::Acquire);
     if disk.is_null() {
         return;
     }
-    // SAFETY: `disk` is the live published state; ISR runs single-CPU, IF=0.
+    // SAFETY: `disk` was leaked to `'static` before its `Release` store, which this `Acquire`
+    // load pairs with; `AhciDisk` is `Sync`, so a shared borrow on any CPU is sound.
     let d = unsafe { &*disk };
 
-    // Acknowledge: clear the port's interrupt status, then the HBA's.
     let pxis = read32(d.port_base, PX_IS);
     write32(d.port_base, PX_IS, pxis);
     write32(d.abar, HBA_IS, 1 << d.port);
 
-    // If slot 0's command has retired, take it out of flight + complete it, then queue
-    // the drain DPC to issue the next waiting command (off the interrupt path).
+    // If slot 0 has retired, complete the IRP and queue the drain DPC for the next waiting command.
     if read32(d.port_base, PX_CI) & 1 == 0 {
         let (irp, err) = take_retired(d);
         if !irp.is_null() {
             // SAFETY: `irp` is the retired request; set status + queue its DPC.
             unsafe { retire(d, irp, err) };
-            // Issue the next queued command from a DPC (not here in the ISR).
             crate::dpc::enqueue(&AHCI_DRAIN_DPC);
         }
     }
-    // Exercise the signal-from-real-ISR path (no waiter in Phase 2).
     crate::dpc::enqueue(&AHCI_INTR_DPC);
 }
 
-/// [`BlockBackend::poll`] for the AHCI disk: drive the single in-flight command
-/// to completion by polling and run its DPC (the `read_blocking` boot path; `ctx`
-/// is unused — Phase 2 has one disk, tracked in [`AHCI`]).
+/// [`BlockBackend::poll`] for the AHCI disk: complete the in-flight command by polling (boot path).
 fn ahci_poll(_ctx: *mut ()) {
     poll_complete_inflight();
 }
 
-/// DPC queued by [`isr`]: signal the controller's `InterruptObject`.
 fn ahci_intr_dpc(_ctx: *mut ()) {
     let disk = AHCI.load(Ordering::Acquire);
     if !disk.is_null() {
@@ -981,7 +843,6 @@ fn ahci_intr_dpc(_ctx: *mut ()) {
     }
 }
 
-/// DPC queued by [`isr`] after a completion: issue the next queued command.
 fn ahci_drain_dpc(_ctx: *mut ()) {
     let disk = AHCI.load(Ordering::Acquire);
     if !disk.is_null() {
@@ -990,9 +851,8 @@ fn ahci_drain_dpc(_ctx: *mut ()) {
     }
 }
 
-/// Poll the in-flight command to completion and complete its IRP — the boot
-/// self-test's fallback when the IRQ does not fire (e.g. an unrouted GSI).
-/// Returns `true` if a command was completed this way.
+/// Poll the in-flight command to completion and complete its IRP — the boot self-test's fallback
+/// when the IRQ does not fire. Returns `true` if a command was completed this way.
 pub fn poll_complete_inflight() -> bool {
     let disk = AHCI.load(Ordering::Acquire);
     if disk.is_null() {
@@ -1000,14 +860,12 @@ pub fn poll_complete_inflight() -> bool {
     }
     // SAFETY: live published state.
     let d = unsafe { &*disk };
-    // Lock-free peek (this is the boot-time synchronous path — single-threaded).
     if d.inflight.load(Ordering::Acquire).is_null() {
         return false;
     }
-    // Spin until slot 0 retires (or times out); then take it out of flight and complete
-    // it. On timeout `take_retired` still completes it with its (error) status so its
-    // waiter is not left stuck. The boot poll path is synchronous, so issue the next
-    // queued IRP directly (no interrupt-race concern here).
+    // Spin until slot 0 retires or times out; `take_retired` completes it even on timeout, with its
+    // error status, so its waiter is not left stuck. Boot polling is synchronous: issue the next
+    // directly.
     let _ = wait_command_polled(d);
     let (irp, err) = take_retired(d);
     if irp.is_null() {
@@ -1042,24 +900,14 @@ mod tests {
         assert_eq!(flush_command(0), ATA_FLUSH_CACHE);
     }
 
-    /// The PRDT capacity is exactly what fits in a command table after the FIS area.
-    ///
-    /// **Against `CMD_TABLE_BYTES`, which is the allocation** — `probe` passes that same
-    /// constant to `DmaBuffer::alloc`, so shrinking the table shrinks the capacity and this
-    /// test moves with both. The earlier version compared against `PAGE_SIZE` while the
-    /// allocation separately said `PAGE_SIZE`, and a reviewer showed it passed with the
-    /// allocation cut to 512 bytes (PR #293 review, 4).
     #[test]
     fn the_prdt_capacity_is_what_fits_in_a_command_table() {
         assert_eq!(MAX_PRDT_ENTRIES, 248);
-        // Every entry fits…
         assert!(PRDT_OFFSET + MAX_PRDT_ENTRIES as usize * PRDT_ENTRY <= CMD_TABLE_BYTES);
-        // …and one more would not, which is the property that matters.
         assert!(PRDT_OFFSET + (MAX_PRDT_ENTRIES as usize + 1) * PRDT_ENTRY > CMD_TABLE_BYTES);
     }
 
-    /// What that capacity is worth as a transfer, stated so the number in
-    /// `deferred-decisions.md` has something that fails when it goes stale.
+    /// What that capacity is worth as a transfer, pinning the figure in `deferred-decisions.md`.
     #[test]
     fn one_command_covers_just_under_a_megabyte() {
         let bytes = MAX_PRDT_ENTRIES as usize * crate::mm::PAGE_SIZE;
@@ -1067,9 +915,8 @@ mod tests {
         assert_eq!(bytes / 1024, 992);
     }
 
-    /// Lay `text` into an IDENTIFY field the way a drive does: byte-swapped within each
-    /// 16-bit word, space-padded to the field width. `text` is taken verbatim, so a caller
-    /// can write the padding itself and choose which end it sits on.
+    /// Lay `text` into an IDENTIFY field as a drive does: byte-swapped within each word,
+    /// space-padded.
     fn put_field(words: &mut [u16; 256], first: usize, width_words: usize, text: &[u8]) {
         let mut bytes = [b' '; 40];
         bytes[..text.len()].copy_from_slice(text);
@@ -1078,8 +925,6 @@ mod tests {
         }
     }
 
-    /// The name a drive reporting `model` and `serial` would be given. No `alloc` — the
-    /// kernel's host tests run against the same no-alloc code the boot path uses.
     fn identity_of(model: &[u8], serial: &[u8]) -> ([u8; MAX_DEVICE_NAME], usize) {
         let mut words = [0u16; 256];
         put_field(&mut words, 27, 20, model);
@@ -1090,7 +935,6 @@ mod tests {
         (out, n)
     }
 
-    /// `identity_of`, asserted against `want`.
     fn assert_identity(model: &[u8], serial: &[u8], want: &[u8]) {
         let (out, n) = identity_of(model, serial);
         assert_eq!(
@@ -1103,24 +947,18 @@ mod tests {
         );
     }
 
-    /// **Padding is trimmed at both ends**, because the standard does not say which end a
-    /// drive pads and they disagree. The laptop's Seagate right-justifies its serial, so
-    /// trimming only the tail produced a name with a dozen spaces inside it — which the
-    /// installer then asked a person to type back character for character (2026-09-17).
+    /// **Padding is trimmed at both ends**, because the standard does not say which end a drive
+    /// pads.
     #[test]
     fn a_right_justified_field_loses_its_padding_too() {
-        // The laptop's drive, as it actually reports itself.
         assert_identity(b"ST1000LM035-1RK172", b"            WDELGVZ3", b"ST1000LM035-1RK172 (WDELGVZ3)");
-        // The control: a left-justified serial, which is what QEMU reports and is the only
-        // shape that ever worked.
         assert_identity(b"QEMU HARDDISK", b"QM00001", b"QEMU HARDDISK (QM00001)");
-        // Padding on both ends of both fields, and interior spaces kept — a model is
-        // allowed to contain one, and `QEMU HARDDISK` is the proof.
+        // Padding on both ends of both fields, interior spaces kept: `QEMU HARDDISK` has one.
         assert_identity(b"  A B  ", b"   C D  ", b"A B (C D)");
     }
 
-    /// A field that is nothing but padding is empty, not a run of spaces — and a disk with
-    /// no serial is named by its model alone rather than by an empty bracket.
+    /// A field that is nothing but padding is empty, and a disk with no serial is named by its
+    /// model alone.
     #[test]
     fn an_all_padding_field_comes_back_empty() {
         assert_identity(b"ST1000LM035", b"                    ", b"ST1000LM035");

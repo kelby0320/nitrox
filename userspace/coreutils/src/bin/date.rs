@@ -1,27 +1,15 @@
 //! `date` — report the wall-clock time, or set it.
 //!
-//! Milestone 2 Part D, and `--set` administration Part E.5. Almost all of this utility is
-//! calendar arithmetic, which lives in [`coreutils::time`] and is tested on the host; what
-//! remains here is a syscall or two and the choice of what to publish.
-//!
-//! ```text
-//! date                                       # the current time
-//! date --unix                                # …as a bare epoch value, for arithmetic
-//! with admin date --set 2026-09-28T14:30:00Z # set it, and the machine's hardware clock
-//! ```
+//! Almost all of this utility is calendar arithmetic, which lives in [`coreutils::time`] and is
+//! tested on the host; what remains here is a syscall or two and the choice of what to publish.
 //!
 //! ## Deliberate behaviours
 //!
 //! - **It emits fields, not a formatted string.** `Table<{unix, year, month, day, hour,
-//!   minute, second}>`, one row. A string would force every consumer to parse it back
-//!   apart, which is exactly the Unix habit the typed-stream model exists to avoid — the
-//!   shell can format it, and a pipeline that wants the year can select the year.
-//! - **UTC only, and no `--format`.** There is no timezone database and no locale, so an
-//!   offset would be a fiction and a format string would imply a flexibility that has no
-//!   backing. Both are additions to make when there is something real behind them.
-//! - **An unset clock is an error, not a zero.** `CLOCK_REALTIME` reports `Unsupported`
-//!   on a machine whose RTC could not be read rather than inventing an epoch, and this
-//!   passes that through instead of printing 1970 as though it were true.
+//!   minute, second}>`, one row, so a consumer need not parse a string back apart.
+//! - **UTC only, and no `--format`.** There is no timezone database and no locale.
+//! - **An unset clock is an error, not a zero.** `CLOCK_REALTIME` reports `Unsupported` on a
+//!   machine whose RTC could not be read, and this passes that through instead of printing 1970.
 //! - **`--set` takes one form, in UTC**: `YYYY-MM-DDTHH:MM:SSZ` ([`coreutils::time::parse_utc`]),
 //!   from 2000 to 2099, which is what the hardware clock holds. It needs the `clock` grant — the
 //!   kernel's `SYSTEM_CLOCK`, given at spawn — and then reports the time as `date` does, so what
@@ -44,11 +32,9 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: the TSM1 encoder allocates.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// Out-param for `sys_clock_read`.
 static mut CLOCK_BUF: u64 = 0;
 
 const UNIX: Flag = Flag::new("unix", 'u', "report the bare epoch value only");
@@ -100,8 +86,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     // single-threaded.
     let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_REALTIME, (&raw mut CLOCK_BUF) as u64) };
     if r != 0 {
-        // The clock is unset (no readable RTC), which is a different thing from "the time
-        // is zero" — say so rather than reporting 1970 as fact.
+        // The clock is unset (no readable RTC), which is not "the time is zero".
         stage.die(b"date: the wall clock is not set on this machine\n", EXIT_FAILURE);
     }
     // SAFETY: written by the syscall above.
@@ -126,7 +111,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(EXIT_OK)
 }
 
-/// **Set the clock to `time`** (administration Part E.5), or die saying why not. Returns once the
+/// **Set the clock to `time`**, or die saying why not. Returns once the
 /// clock is set, whether or not the hardware clock took it — which is said when it did not.
 fn set(stage: &Stage, time: &str) {
     let Some(secs) = parse_utc(time) else {
@@ -157,11 +142,8 @@ fn set(stage: &Stage, time: &str) {
     }
 }
 
-/// Write the single row as a TSM1 table on the `stdout` stream.
-///
-/// `--unix` narrows the schema to the one field rather than emitting all of them and
-/// letting the consumer pick: a stage that asked for the epoch value should not have to
-/// know the calendar fields exist.
+/// Write the single row as a TSM1 table on the `stdout` stream; `--unix` narrows the schema to the
+/// one field.
 fn emit(stage: &Stage, stdout: u64, unix_secs: i64, c: &coreutils::time::Civil, unix_only: bool) {
     let schema = if unix_only {
         Schema::new().field("unix", TypeTag::Int, TypeModifiers::NONE)

@@ -1,11 +1,9 @@
 //! The process **setup message** — how a shell hands a pipeline stage its standard
 //! streams and `argv`. See `docs/spec/pipeline-stdio.md`.
 //!
-//! This is the pure, transport-agnostic half of the C3 stdio convention: the `arg0`
-//! bootstrap descriptor, the TSM1 payload codec, and the mapping between a stream
-//! **presence bitmap** and the ordered transferred handles. Both the sender (the shell)
-//! and the receiver (`libos::bootstrap().setup()`, the stage) share these; the actual
-//! IPC send/recv is thin syscall glue layered on top.
+//! The pure, transport-agnostic half: the `arg0` bootstrap descriptor, the TSM1 payload
+//! codec, and the mapping between a stream **presence bitmap** and the ordered
+//! transferred handles. The sender (the shell) and the receiver (the stage) share these.
 //!
 //! ## Tiers
 //!
@@ -18,9 +16,9 @@
 //!
 //! The stream endpoints ride as transferred handles in the IPC message, packed in the
 //! canonical order **stdin, stdout, stderr** (only those present — see [`Streams`]). The
-//! payload is a TSM1 `Record { streams: Int, argv: List<String> }` ([`SetupPayload`]);
-//! `env` may be appended as a later field without a version bump (readers ignore fields
-//! they don't know).
+//! payload is a TSM1 `Record { streams: Int, argv: List<String>, env: Record, terminal: Int }`
+//! ([`SetupPayload`]); fields are appended without a version bump, as readers ignore
+//! fields they don't know.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -28,13 +26,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// The largest setup payload that fits one IPC message: `IPC_MSG_SIZE` (4096) less the
-/// header (24) and the handle slots (8 × 8).
-///
-/// Defined here rather than imported because the wire core deliberately has **no
-/// dependencies** — that is what lets it host-test cleanly, and reaching for `libkern` to
-/// get one number would spend that property. The `const` assertion below keeps the two
-/// from drifting: under the `io` feature, where a real message is actually sent, a
-/// mismatch is a compile error.
+/// header (24) and the handle slots (8 × 8). Stated, not imported, so the wire core keeps no
+/// dependencies; under `io` an assertion ties it to `IPC_PAYLOAD_SIZE`.
 pub const SETUP_PAYLOAD_MAX: usize = 4096 - 24 - 8 * 8;
 
 #[cfg(feature = "io")]
@@ -44,17 +37,14 @@ use crate::wire::{
     ByteSource, Record, Result, Schema, TypeModifiers, TypeTag, Value, WireError, read_value, write_value,
 };
 
-// --- The `arg0` bootstrap descriptor ---------------------------------------
-
 /// The bootstrap-descriptor version this build speaks (the low byte of a Tier-1 `arg0`).
 pub const BOOTSTRAP_VERSION: u8 = 1;
 
 /// `arg0` bit 8 — a setup message is queued on the child's bootstrap endpoint.
 const SETUP_PENDING: u64 = 1 << 8;
 
-/// The `arg0` a parent passes to `sys_process_spawn` to launch a Tier-1 stage: the
-/// descriptor version, plus [`SETUP_PENDING`](self) when a setup message will follow on
-/// the bootstrap endpoint. (A Tier-0 child takes `arg0 == 0`.)
+/// The `arg0` a parent passes to `sys_process_spawn`: the descriptor version, plus
+/// [`SETUP_PENDING`](self) when a setup message will follow. (A Tier-0 child takes `0`.)
 pub fn bootstrap_arg0(setup_pending: bool) -> u64 {
     let mut a = BOOTSTRAP_VERSION as u64;
     if setup_pending {
@@ -63,14 +53,11 @@ pub fn bootstrap_arg0(setup_pending: bool) -> u64 {
     a
 }
 
-/// Whether `arg0` is a recognised bootstrap descriptor asking the runtime to receive a
-/// setup message. `arg0 == 0` (Tier 0) and any descriptor with a different version are
-/// `false` — a stage that isn't expecting a setup message never blocks on one.
+/// Whether `arg0` is a recognised descriptor asking the runtime to receive a setup message.
+/// `arg0 == 0` and any other version are `false`, so a Tier-0 stage never blocks on one.
 pub fn setup_is_pending(arg0: u64) -> bool {
     (arg0 & 0xFF) as u8 == BOOTSTRAP_VERSION && arg0 & SETUP_PENDING != 0
 }
-
-// --- Stream presence + handle mapping --------------------------------------
 
 /// Presence bit for `stdin` in a [`Streams`] bitmap.
 pub const STREAM_STDIN: u32 = 1 << 0;
@@ -82,10 +69,8 @@ pub const STREAM_STDERR: u32 = 1 << 2;
 /// The three defined stream bits.
 const STREAM_MASK: u32 = STREAM_STDIN | STREAM_STDOUT | STREAM_STDERR;
 
-/// A stage's standard-stream handles. Each is optional — a *source* stage has no
-/// `stdin`, a *sink* no `stdout`, and `stderr` is a shared diagnostic sink. The handles
-/// travel as transferred IPC handles; this type pairs them with the presence
-/// [`bitmap`](Self::bitmap) so each ends up in the right slot.
+/// A stage's standard-stream handles, each optional (a *source* has no `stdin`, a *sink*
+/// no `stdout`).
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Streams {
     /// The read end of the upstream pipe, if any.
@@ -112,9 +97,8 @@ impl Streams {
         b
     }
 
-    /// The present handles in canonical order (`stdin`, `stdout`, `stderr`) — the order
-    /// the sender packs them into the message and [`from_bitmap`](Self::from_bitmap)
-    /// reads them back.
+    /// The present handles in canonical order (`stdin`, `stdout`, `stderr`), as packed
+    /// into the message.
     pub fn ordered(&self) -> Vec<u64> {
         [self.stdin, self.stdout, self.stderr].into_iter().flatten().collect()
     }
@@ -137,11 +121,8 @@ impl Streams {
     }
 }
 
-// --- The setup-message payload ---------------------------------------------
-
-/// The decoded setup-message payload: the stream presence [`bitmap`](Streams::bitmap),
-/// `argv`, and the environment. The stream *handles* are carried out-of-band as
-/// transferred IPC handles and reunited with the bitmap via [`Streams::from_bitmap`].
+/// The decoded setup-message payload. The stream *handles* travel out-of-band as
+/// transferred IPC handles, reunited via [`Streams::from_bitmap`].
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct SetupPayload {
     /// The stream presence bitmap (matches the packed transferred handles).
@@ -150,40 +131,23 @@ pub struct SetupPayload {
     pub argv: Vec<String>,
     /// The environment, as a TSM1 `Record` — **not** `key=value` strings.
     ///
-    /// Typed, which removes a bug class rather than merely being tidier: `PATH` is a
-    /// `List<String>` instead of a colon-joined string, so a path *containing* a colon is
-    /// representable and no two readers can disagree about how to split it. A reader that
-    /// expects the wrong type gets a schema mismatch rather than a silent misparse.
-    ///
-    /// `cwd` is a conventional entry, as `PWD` is in Unix — and safer here, because there
-    /// is no second source of truth (no `getcwd`) for it to disagree with.
-    ///
-    /// Empty for a sender that has none, so "no environment" is not a special case.
-    /// See `docs/planning/shell-coreutils-plan.md` § Milestone 3.5 and the decision log,
-    /// 2026-07-30.
+    /// Typed so that `PATH` is a `List<String>`: a path containing a colon is representable
+    /// and a reader expecting the wrong type gets a schema mismatch, not a silent misparse.
+    /// `cwd` is a conventional entry; there is no `getcwd` for it to disagree with. Empty
+    /// for a sender that has none.
     pub env: Record,
     /// A **terminal** handle follows the stream handles.
     ///
-    /// Not one of [`Streams`], deliberately: a terminal is not a stream. It answers
-    /// `SetMode` and delivers `Interrupt`, and a program holds it *as well as* its
-    /// stdin/stdout rather than instead of them — `ls | less` inside a terminal has both.
-    ///
-    /// It exists because `/dev/tty` is a **namespace binding**, one per session, so a
-    /// program cannot resolve its way to a *particular* terminal. A terminal emulator hands
-    /// the shell it hosts the terminal it attached its backend to, the way Unix inherits
-    /// fd 0/1/2 rather than looking them up. See `docs/architecture/graphical-session.md` §6.1
-    /// for what closes this properly.
+    /// Not one of [`Streams`]: a program holds it *as well as* its stdin/stdout. It exists
+    /// because `/dev/tty` cannot name a *particular* terminal; an emulator hands its shell
+    /// its own.
     pub terminal: bool,
 }
 
 /// Split a setup message's transferred handles into its streams and its terminal.
 ///
-/// **Pure, and here rather than in the `io` module, so it can be tested.** It was inline in the
-/// receive path, which needs a kernel — and the bound it gets wrong is exactly the sort a host
-/// test catches for free: `handles` arrives as a fixed zero-initialised array, so an index
-/// inside *it* says nothing about whether a handle was actually transferred. A payload claiming
-/// a terminal with none attached read back as `Some(0)`, and a shell would then run its whole
-/// REPL against handle 0 (PR #194 review, finding 6).
+/// The receiver's `handles` is a fixed zero-initialised array, so a terminal claimed with
+/// none transferred is refused rather than read back as `Some(0)`.
 pub fn split_handles(payload: &SetupPayload, handles: &[u64]) -> Result<(Streams, Option<u64>)> {
     let n = (payload.streams & STREAM_MASK).count_ones() as usize;
     if n + usize::from(payload.terminal) > handles.len() {
@@ -197,9 +161,8 @@ pub fn split_handles(payload: &SetupPayload, handles: &[u64]) -> Result<(Streams
 impl SetupPayload {
     /// Encode as a TSM1 `Record { streams: Int, argv: List<String>, env: Record }`.
     ///
-    /// `env` is **appended**, never inserted: [`decode`](Self::decode) reads by position,
-    /// so an existing stage keeps reading fields 0 and 1 and ignores the rest. Reordering
-    /// these fields would break every stage in the image at once.
+    /// Fields are **appended**, never inserted: [`decode`](Self::decode) reads by position,
+    /// so reordering them would break every existing stage.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let schema = Schema::new()
             .field("streams", TypeTag::Int, TypeModifiers::NONE)
@@ -218,9 +181,7 @@ impl SetupPayload {
         };
         let mut buf = Vec::new();
         write_value(&mut buf, &Value::Record(Arc::new(record)))?;
-        // The size limit is a property of the *message*, so it is checked here rather
-        // than at the send site: that keeps it testable without a kernel, and means every
-        // sender gets the same refusal.
+        // Checked here, not at the send site, so every sender gets the same refusal.
         if buf.len() > SETUP_PAYLOAD_MAX {
             return Err(WireError::SetupTooLarge);
         }
@@ -229,10 +190,9 @@ impl SetupPayload {
 
     /// Decode a payload written by [`encode`](Self::encode).
     ///
-    /// Reads by **position**, and treats every field past `argv` as optional. That is what
-    /// makes the format extensible in one direction: a newer sender may append fields an
-    /// older reader ignores, and an older sender's message still decodes here — `env`
-    /// simply comes back empty. Both directions are tested.
+    /// Reads by **position**, and treats every field past `argv` as optional: a newer
+    /// sender's extra fields are ignored, and an older sender's message still decodes with
+    /// `env` empty and no terminal.
     pub fn decode(bytes: &[u8]) -> Result<SetupPayload> {
         let mut src = ByteSource::new(bytes);
         let value = read_value(&mut src, TypeTag::Record)?;
@@ -246,24 +206,18 @@ impl SetupPayload {
         for item in list {
             argv.push(String::from(item.as_str().ok_or(WireError::SchemaMismatch)?));
         }
-        // Absent `env` ⇒ empty, so an older sender is not an error case.
         let env = record.values.get(2).and_then(|v| v.as_record()).cloned().unwrap_or_default();
-        // Absent `terminal` ⇒ none, so a sender that predates it is not an error case —
-        // the same rule as `env`, one field along.
         let terminal = record.values.get(3).and_then(|v| v.as_int()).unwrap_or(0) != 0;
         Ok(SetupPayload { streams, argv, env, terminal })
     }
 }
 
-// --- Syscall-backed stage runtime (Tier-1 spawn + bootstrap) ----------------
-
 #[cfg(feature = "io")]
 pub use self::io_stage::{Bootstrap, Setup, bootstrap, pipe, send_setup, send_setup_env, send_setup_full};
 
 /// The sender (a shell spawning a stage) and receiver (`bootstrap().setup()`) sides of
-/// the setup message, over real IPC. Gated behind `io` so the pure protocol above stays
-/// host-testable with no dependency. Mirrors the send/recv shape of
-/// [`channel::IpcPort`](crate::channel) but carries transferred handles.
+/// the setup message, over real IPC, behind `io`. Like [`channel::IpcPort`](crate::channel)
+/// but carries transferred handles.
 #[cfg(feature = "io")]
 mod io_stage {
     use super::{SetupPayload, Streams, setup_is_pending};
@@ -287,8 +241,7 @@ mod io_stage {
         if r == E_PEERCLOSED { WireError::PeerClosed } else { WireError::SinkFull }
     }
 
-    /// Create a pipe (an IPC channel pair) of queue depth `depth`, returning both
-    /// endpoint handles `(a, b)`.
+    /// Create a pipe (an IPC channel pair) of queue depth `depth`: endpoints `(a, b)`.
     pub fn pipe(depth: u32) -> Result<(u64, u64)> {
         let mut a = 0u64;
         let mut b = 0u64;
@@ -301,16 +254,12 @@ mod io_stage {
     }
 
     /// Send the **setup message** on `channel` (the shell's end of the stage's bootstrap
-    /// endpoint): transfer the present stream handles (canonical order) and carry `argv`.
-    /// The stream handles are **moved** to the stage.
+    /// endpoint): the present stream handles (canonical order) are **moved** to the stage.
     pub fn send_setup(channel: u64, streams: &Streams, argv: &[&str]) -> Result<()> {
         send_setup_env(channel, streams, argv, &Record::default())
     }
 
-    /// As [`send_setup`], with an environment (Milestone 3.5 Part A).
-    ///
-    /// Kept as a separate entry point so every existing caller stays correct without
-    /// edits — a spawn that has no environment to pass is not obliged to say so.
+    /// As [`send_setup`], with an environment.
     pub fn send_setup_env(channel: u64, streams: &Streams, argv: &[&str], env: &Record) -> Result<()> {
         send_setup_full(channel, streams, None, argv, env)
     }
@@ -318,9 +267,7 @@ mod io_stage {
     /// The full form: streams, an optional **terminal**, `argv` and the environment.
     ///
     /// The terminal handle is **moved** like the streams, and rides *after* them in the
-    /// handle array — see [`SetupPayload::terminal`] for why it is not one of them. A
-    /// terminal emulator uses this to hand the shell it hosts the terminal it attached its
-    /// backend to; every other caller passes `None` and gets what it always got.
+    /// handle array; see [`SetupPayload::terminal`]. Other callers pass `None`.
     pub fn send_setup_full(
         channel: u64,
         streams: &Streams,
@@ -331,9 +278,8 @@ mod io_stage {
         let owned: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
         let payload =
             SetupPayload { streams: streams.bitmap(), argv: owned, env: env.clone(), terminal: terminal.is_some() }
-                // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge` — deliberately
-                // not `SinkFull`, since a full channel is a transport condition a caller may retry
-                // and this never will be.
+                // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge`, not the
+                // retryable `SinkFull`.
                 .encode()?;
         let mut handles = streams.ordered();
         if let Some(t) = terminal {
@@ -391,18 +337,11 @@ mod io_stage {
         pub streams: Streams,
         /// The command-line arguments (`argv[0]` is the program name).
         pub argv: Vec<String>,
-        /// The environment this stage was given (empty if none).
-        ///
-        /// **Tier 0 has no environment, for the same reason it has no `argv`**: there is
-        /// no setup message. That is not a gap — a process spawned without one was given
-        /// nothing to start from, which is the whole meaning of the tier.
+        /// The environment this stage was given (empty if none); Tier 0 has none, as it
+        /// has no setup message.
         pub env: Record,
-        /// The terminal this stage was handed, if its parent gave it one.
-        ///
-        /// `None` is the ordinary case: a program finds its terminal by resolving
-        /// `/dev/tty`. A program launched *by a terminal emulator* is handed one instead,
-        /// because a namespace binding cannot name a particular window — see
-        /// [`SetupPayload::terminal`].
+        /// The terminal this stage was handed, if its parent gave it one; otherwise it
+        /// resolves `/dev/tty`. See [`SetupPayload::terminal`].
         pub terminal: Option<u64>,
     }
 
@@ -479,9 +418,8 @@ mod io_stage {
                 return Err(WireError::UnexpectedEof);
             }
             let payload = SetupPayload::decode(&buf[OFF_PAYLOAD..OFF_PAYLOAD + n])?;
-            // The streams come first and the terminal, if any, after them — so the split
-            // is by the bitmap's population count rather than by the handle count, which
-            // includes both.
+            // Streams first, the terminal after: split by the bitmap's population count,
+            // not the handle count, which includes both.
             let (streams, terminal) = super::split_handles(&payload, &handles[..count])?;
             Ok(Setup { streams, argv: payload.argv, env: payload.env, terminal })
         }
@@ -491,15 +429,9 @@ mod io_stage {
 #[cfg(test)]
 mod tests {
 
-    /// The refusal is its own error, and it is asserted — an earlier pass added the
-    /// variant with a justification and nothing that checked it, which a control caught by
-    /// passing.
     #[test]
     fn a_claimed_terminal_with_no_handle_transferred_is_refused() {
-        // **Not `Some(0)`.** The handle array a receiver holds is fixed and zero-initialised,
-        // so being inside it proves nothing; only the transferred `count` does. A shell handed
-        // `Some(0)` would run its entire REPL against handle 0 and every read would fail in a
-        // way that looks like a dead terminal rather than a bad message.
+        // Not `Some(0)`: only the transferred `count` proves a handle, not the array bound.
         let claims =
             SetupPayload { streams: STREAM_STDOUT, argv: alloc::vec![], env: Record::default(), terminal: true };
         assert!(split_handles(&claims, &[7]).is_err(), "one handle is the stream's");
@@ -510,7 +442,6 @@ mod tests {
 
     #[test]
     fn a_payload_with_no_terminal_ignores_a_handle_beyond_its_streams() {
-        // The other direction: extra handles are not silently adopted as a terminal.
         let none = SetupPayload { streams: STREAM_STDIN, argv: alloc::vec![], env: Record::default(), terminal: false };
         let (streams, terminal) = split_handles(&none, &[3, 4]).expect("ok");
         assert_eq!(streams.stdin, Some(3));
@@ -519,9 +450,6 @@ mod tests {
 
     #[test]
     fn a_terminal_survives_the_round_trip_and_its_absence_is_the_default() {
-        // The flag and the handle are carried separately — the flag in the payload, the
-        // handle in the message's transferred array — so a payload that claims a terminal
-        // and one that does not have to be distinguishable here.
         let with = SetupPayload {
             streams: STREAM_STDOUT,
             argv: alloc::vec![String::from("nxsh")],
@@ -540,10 +468,7 @@ mod tests {
 
     #[test]
     fn a_sender_that_predates_the_terminal_field_still_decodes() {
-        // **The extensibility the format claims, exercised in the direction that matters.**
-        // `decode` reads by position and treats everything past `argv` as optional, so a
-        // three-field message from before this field existed must still arrive — otherwise
-        // adding a field is a flag day across every stage in the image.
+        // A three-field message from before `terminal` existed must still decode.
         let schema = Schema::new()
             .field("streams", TypeTag::Int, TypeModifiers::NONE)
             .field("argv", TypeTag::List, TypeModifiers::NONE)
@@ -587,8 +512,6 @@ mod tests {
         }
     }
 
-    // --- env on the wire (Milestone 3.5 Part A) -----------------------------
-
     fn env_record() -> Record {
         let schema = Schema::new().field("PWD", TypeTag::String, TypeModifiers::NONE).field(
             "PATH",
@@ -612,13 +535,11 @@ mod tests {
         assert_eq!(back.streams, p.streams);
         assert_eq!(back.argv, p.argv);
         assert_eq!(back.env, p.env);
-        // The point of typing it: `PATH` comes back as a list, not a string to split.
         let path = back.env.values[1].as_list().expect("PATH is a List");
         assert_eq!(path.len(), 2);
         assert_eq!(path[0].as_str(), Some("/bin"));
     }
 
-    /// A sender with nothing to pass produces an empty env, not a special case.
     #[test]
     fn an_absent_environment_is_empty_not_an_error() {
         let p =
@@ -627,12 +548,7 @@ mod tests {
         assert!(back.env.values.is_empty());
     }
 
-    /// **The compatibility claim, asserted rather than reasoned about.**
-    ///
-    /// The format extends in one direction only: appending is safe because `decode` reads
-    /// by position and treats anything past `argv` as optional. This builds a payload in
-    /// the *old* two-field shape by hand and decodes it with the current reader — which is
-    /// what every stage in the image is doing until it is rebuilt.
+    /// A payload in the old two-field shape, built by hand, decodes with the current reader.
     #[test]
     fn an_old_two_field_payload_still_decodes() {
         let schema = Schema::new().field("streams", TypeTag::Int, TypeModifiers::NONE).field(
@@ -651,8 +567,7 @@ mod tests {
         assert!(back.env.values.is_empty(), "no env is empty, not garbage");
     }
 
-    /// …and the converse: a *truncated* payload is still refused, so the tolerance above
-    /// is "later fields are optional", not "any record will do".
+    /// A truncated payload is still refused: later fields are optional, not any record.
     #[test]
     fn a_payload_missing_argv_is_still_rejected() {
         let schema = Schema::new().field("streams", TypeTag::Int, TypeModifiers::NONE);
@@ -665,12 +580,9 @@ mod tests {
 
     #[test]
     fn arg0_descriptor_round_trips() {
-        // Tier 0: the value every current spawner passes.
         assert!(!setup_is_pending(0));
-        // Tier 1 with / without a pending setup message.
         assert!(setup_is_pending(bootstrap_arg0(true)));
         assert!(!setup_is_pending(bootstrap_arg0(false)));
-        // A descriptor with a different version is not honoured (forward-safety).
         let other_version = (bootstrap_arg0(true) & !0xFF) | 0x02;
         assert!(!setup_is_pending(other_version));
     }
@@ -692,9 +604,7 @@ mod tests {
 
     #[test]
     fn from_bitmap_rejects_bad_input() {
-        // Handle count disagrees with the bitmap.
         assert_eq!(Streams::from_bitmap(STREAM_STDIN | STREAM_STDOUT, &[0x1]), Err(WireError::SchemaMismatch));
-        // An unknown presence bit.
         assert_eq!(Streams::from_bitmap(1 << 5, &[0x1]), Err(WireError::SchemaMismatch));
     }
 
@@ -715,8 +625,7 @@ mod tests {
 
     #[test]
     fn decode_tolerates_a_trailing_field() {
-        // A future sender appends `env` as a third field; an older decoder still reads
-        // `streams`/`argv` and ignores it.
+        // A trailing field of a type the reader does not know is ignored.
         let schema = Schema::new()
             .field("streams", TypeTag::Int, TypeModifiers::NONE)
             .field("argv", TypeTag::List, TypeModifiers::NONE)

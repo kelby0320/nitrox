@@ -1,19 +1,10 @@
-//! `fs-server-ext4` — a read-only ext4 filesystem reader.
+//! `fs-server-ext4` — an ext4 reader and writer behind the [`BlockReader`] and [`BlockWriter`]
+//! traits, so it is host-testable against a fixture image built by `mke2fs`.
 //!
-//! Slice 7 Part 2: the parsing core, behind a [`BlockReader`] trait so it is
-//! 100% host-testable against a fixture image. The real fs-server (Part 4)
-//! implements `BlockReader` over `sys_io_submit`; the host tests implement it
-//! over an in-memory image built by `mke2fs`.
-//!
-//! **Read-only, minimal** (`docs/planning/implementation-plan.md` slice 7): the
-//! superblock, block-group descriptors, inodes, the **extent tree**, and a linear
-//! directory walk — enough to resolve a path to a regular file and read its bytes.
-//! Skips the journal, bigalloc, inline-data, htree-specific layout (a linear walk
-//! still works), 64-bit block numbers, RW, xattrs, symlinks, and checksums.
-//!
-//! No `alloc`: [`read_file`] reads into a caller-provided buffer (the fs-server
-//! passes a bounded scratch ≤ 64 KiB; see [`ext4::MAX_FILE`]). Parsing uses
-//! bounded stack scratch: a filesystem block, and one per level of an extent tree.
+//! The superblock, block-group descriptors, inodes, the **extent tree**, and directories as a
+//! linear walk (which works on htree directories too). It skips the journal, bigalloc,
+//! inline-data, 64-bit block numbers, xattrs, symlinks, and checksums. No `alloc`: [`read_file`]
+//! reads into a caller buffer, and parsing uses one block of stack scratch per tree level.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -25,12 +16,10 @@ pub mod volume;
 pub use ext4::read_file;
 pub use volume::Ext4;
 
-/// **The block-device traits and their types live in `libfsserver`** (Phase 6 Part E.1), which
-/// serves ext4 and FAT alike; they are re-exported here so this library's users — the
-/// installer, the storage service and `boot-probe` — name them as they always have.
+/// **The block-device traits and their types live in `libfsserver`**, which serves ext4 and FAT
+/// alike; re-exported so this library's users (the installer, the storage service, `boot-probe`)
+/// name them as they always have.
 pub use libfsserver::{BlockReader, BlockRun, BlockWriter, FsError, ReadOnly};
-
-// --- little-endian byte helpers (shared by the ext4 parser) -----------------
 
 pub(crate) fn rd_u16(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
@@ -39,8 +28,8 @@ pub(crate) fn rd_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
-/// Host-test fixtures shared by the parser tests ([`ext4`]) and the server-loop
-/// tests ([`serve`]): an in-memory [`BlockReader`] over an `mke2fs`-built image.
+/// Host-test fixtures shared by the parser and server-loop tests: an in-memory [`BlockReader`]
+/// over an `mke2fs`-built image.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{BlockReader, BlockWriter, FsError};
@@ -48,8 +37,7 @@ pub(crate) mod test_support {
     use std::io::Write;
     use std::process::Command;
 
-    /// A read-write in-memory image (`BlockReader` + `BlockWriter`) for the write-path
-    /// tests. Interior mutability (`RefCell`) so `write_at(&self, …)` matches the traits.
+    /// A read-write in-memory image for the write-path tests.
     pub(crate) struct RwImage(pub RefCell<Vec<u8>>);
     impl BlockReader for RwImage {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
@@ -76,10 +64,9 @@ pub(crate) mod test_support {
         }
     }
 
-    /// **Commands as `libfsserver::disk::Disk` sends them** (Phase 6 Part H.4), over an
-    /// [`RwImage`]: a read is one command a 4 KiB block it touches, and a write one a block — and
-    /// a read first for each block it writes only part of, which the `Disk` reads to keep the
-    /// rest. What Part H.4's fixes are held by: a count of commands, never a time.
+    /// **Commands as `libfsserver::disk::Disk` sends them**, over an [`RwImage`]: a command a 4 KiB
+    /// block touched, and a read first for each block written only in part. A count of commands,
+    /// never a time, holds the run-at-a-time fixes.
     pub(crate) struct Counting {
         pub image: RwImage,
         pub reads: std::cell::Cell<u64>,
@@ -90,11 +77,11 @@ pub(crate) mod test_support {
         pub(crate) fn new(image: Vec<u8>) -> Counting {
             Counting { image: RwImage(RefCell::new(image)), reads: 0.into(), writes: 0.into() }
         }
-        /// `(reads, writes)` so far, and back to nothing.
         pub(crate) fn take(&self) -> (u64, u64) {
             (self.reads.take(), self.writes.take())
         }
-        /// The 4 KiB blocks `[offset, offset + len)` touches, each with whether it is touched whole.
+        /// The 4 KiB blocks `[offset, offset + len)` touches, each with whether it is touched
+        /// whole.
         fn blocks(offset: u64, len: usize) -> impl Iterator<Item = bool> {
             let end = offset + len as u64;
             let first = offset / Self::IO_BLOCK;
@@ -118,6 +105,7 @@ pub(crate) mod test_support {
         }
         /// As `Disk` writes them: a block's part at each end by `write_at`, whole blocks a
         /// [`libfsserver::disk::SPAN`] a command.
+        /// [`libfsserver::disk::SPAN`] a command.
         fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
             let (head, whole, tail) = libfsserver::disk::split_zeroes(offset, len);
             self.write_at(head.start, &vec![0; (head.end - head.start) as usize])?;
@@ -128,24 +116,18 @@ pub(crate) mod test_support {
         }
     }
 
-    /// **An [`RwImage`] whose writes fail** (PR #371 review): from the `n`th on, a device gone bad
-    /// partway through an operation, or the `n`th alone, one command lost. A refused write is `Io`
-    /// and changes nothing.
+    /// **An [`RwImage`] whose writes fail**: from the `n`th on, or the `n`th alone. A refused write
+    /// is `Io` and changes nothing.
     pub(crate) struct Failing {
         pub image: RwImage,
-        /// Writes asked of it so far, refused ones among them.
         pub writes: std::cell::Cell<u64>,
-        /// The first write refused, counted from 0.
         fail_at: u64,
-        /// Whether only that one is.
         once: bool,
     }
     impl Failing {
-        /// Every write from the `n`th on refused.
         pub(crate) fn after(image: Vec<u8>, n: u64) -> Failing {
             Failing { image: RwImage(RefCell::new(image)), writes: 0.into(), fail_at: n, once: false }
         }
-        /// The `n`th write alone refused.
         pub(crate) fn once(image: Vec<u8>, n: u64) -> Failing {
             Failing { once: true, ..Failing::after(image, n) }
         }
@@ -166,7 +148,7 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A `BlockReader` over an in-memory image. Its writes are refused, so a test reading through
+    /// A `BlockReader` over an in-memory image whose writes are refused, so a test reading through
     /// a server's [`crate::Ext4`] volume, which takes a writer, cannot change it.
     pub(crate) struct ImageReader(pub Vec<u8>);
     impl BlockWriter for ImageReader {
@@ -186,36 +168,24 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Build a minimal ext4 image with `mke2fs -d` (no root, no mount) whose
-    /// content tree holds `/system/current-generation`. The feature flags mirror
-    /// the slice-5/Part-5 disk so the reader's supported feature set is exercised
-    /// against a real e2fsprogs image. Panics with a clear message if `mke2fs` is
-    /// unavailable (e2fsprogs is a project dependency — see Part 5).
-    /// A fixed wall-clock instant the mutation tests stamp with: 2026-07-24
-    /// 13:45:30 UTC. Fixed rather than "now" so a test can assert the exact
-    /// value that reached the inode — the fs-server is handed the time, it does
-    /// not read a clock itself.
+    /// A fixed wall-clock instant the mutation tests stamp with, so a test can assert the exact
+    /// value that reached the inode.
     pub(crate) const TEST_NOW: i64 = 1_784_900_730;
 
+    /// A minimal ext4 image from `mke2fs -d` holding `/system/current-generation`.
     pub(crate) fn fixture(block_size: u32, content: &[u8]) -> Vec<u8> {
         fixture_blocks(block_size, 4096, 0, content)
     }
 
     /// [`fixture`], with the filesystem's size in blocks chosen by the caller.
     ///
-    /// **For crossing a block group.** `mke2fs` puts `8 * block_size` blocks in a group, so
-    /// the 4096-block default is a single group and no test built on it can reach a second
-    /// one — which is how "creation is group 0 only" went unnoticed until a real disk was
-    /// partitioned (Phase 5 Part H.2). At 1 KiB blocks a group is 8,192 blocks, so 24,576
-    /// gives three, the last of them deliberately short: 24,575 addressable blocks do not
-    /// divide by 8,192, and the bitmap's spare bits address nothing.
+    /// **For crossing a block group.** `mke2fs` puts `8 * block_size` blocks in a group, so the
+    /// 4096-block default is one group. At 1 KiB blocks 24,576 gives three, the last deliberately
+    /// short: its bitmap's spare bits address nothing.
     ///
-    /// `bytes_per_inode` is `mke2fs -i`, or `0` to let it choose. A large ratio gives *few*
-    /// inodes per group, which is how a test can exhaust group 0's inodes by creating a
-    /// couple of hundred files instead of eight thousand.
+    /// `bytes_per_inode` is `mke2fs -i`, or `0` to let it choose; a large ratio gives few inodes
+    /// per group, so a test can exhaust group 0's inodes cheaply.
     pub(crate) fn fixture_blocks(block_size: u32, blocks: u32, bytes_per_inode: u32, content: &[u8]) -> Vec<u8> {
-        // A unique dir per call (cargo runs tests in parallel threads) so they
-        // never share / remove each other's staging tree.
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -254,25 +224,15 @@ pub(crate) mod test_support {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// [`assert_e2fsck_clean`] for a filesystem already on disk — a sparse file too large to
-    /// want in memory, or one a gate carved out of an image.
-    ///
-    /// **Split rather than copied.** Two tests had their own hand-rolled invocation, which is
-    /// how the status-only check below survived being noticed; a third copy would be the same
-    /// mistake with the ink still wet (PR #310 review).
+    /// [`assert_e2fsck_clean`] for a filesystem already on disk (a sparse file too large for
+    /// memory).
     pub(crate) fn assert_e2fsck_clean_path(p: &std::path::Path, tag: &str) {
         let out = std::process::Command::new("e2fsck").args(["-fn", p.to_str().unwrap()]).output().unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        // **The exit status is not the oracle; the output is.** Measured against e2fsck
-        // 1.47.0: a filesystem whose superblock free-block count is wrong by 7 prints
-        // "Free blocks count wrong (7669, counted=7662). Fix? no" and **exits 0**. This
-        // helper trusted the status from the day it was written (2026-07-24), so every test
-        // using it was blind to the whole class of summary-information corruption — which is
-        // exactly what a filesystem writer gets wrong (Phase 5 Part H.2).
-        //
-        // Every problem e2fsck finds prints a prompt, and `-n` answers each one "no", so the
-        // prompt is what to look for. The summary line is the other half: without it e2fsck
-        // stopped early and found nothing because it checked nothing.
+        // **The exit status is not the oracle; the output is.** A wrong superblock free-block count
+        // prints "Free blocks count wrong (7669, counted=7662). Fix? no" and **exits 0** (e2fsck
+        // 1.47.0). Every problem prints a prompt, which `-n` answers "no"; the summary line proves
+        // it checked anything.
         assert!(out.status.success(), "e2fsck exited {:?}:\n{text}", out.status.code());
         assert!(!text.contains("? no"), "e2fsck found a problem in `{tag}`:\n{text}");
         assert!(text.contains(" files ("), "e2fsck never reached its summary:\n{text}");
@@ -318,8 +278,7 @@ mod tests {
         assert_eq!(read_file(&r, b"/system", &mut out), Err(FsError::NotFound));
     }
 
-    /// Collect every entry name of a directory (draining the cursor across calls, as the
-    /// server does when a listing spans messages).
+    /// Collect every entry name of a directory, draining the cursor across calls.
     fn list_dir(r: &ImageReader, path: &[u8]) -> Vec<(String, u8)> {
         let dir_ino = ext4::resolve_dir(r, path).unwrap();
         let mut names = Vec::new();
@@ -342,7 +301,6 @@ mod tests {
     fn read_dir_lists_system_directory() {
         let r = ImageReader(fixture(1024, b"gen\n"));
         let names = list_dir(&r, b"/system");
-        // ext4 `file_type` 1 = regular file.
         assert!(
             names.iter().any(|(n, ft)| n == "current-generation" && *ft == 1),
             "expected current-generation as a regular file, got {names:?}"
@@ -361,7 +319,6 @@ mod tests {
         );
     }
 
-    /// `(mtime, size)` of `name` inside the directory `dir`, via the stat-bearing walk.
     fn entry_stat(r: &RwImage, dir: &[u8], name: &[u8]) -> (i64, u64) {
         let dir_ino = ext4::resolve_dir(r, dir).unwrap();
         let mut found = None;
@@ -389,12 +346,9 @@ mod tests {
         let ino = ext4::create_file(&rw, b"/system", b"edited", TEST_NOW).unwrap();
         ext4::grow_file(&rw, b"/system/edited", 1500, TEST_NOW).unwrap();
         assert_eq!(entry_stat(&rw, b"/system", b"edited"), (TEST_NOW, 1500));
-        // The id the kernel will touch by is the one the block-file reply gave it.
         let mut runs = [BlockRun::default(); 8];
         assert_eq!(ext4::map_file(&rw, b"/system/edited", &mut runs).unwrap().ino, ino);
 
-        // The Model A case: the kernel wrote the bytes itself and is telling us so. No
-        // size change, no structural change — only the timestamp moves.
         const LATER: i64 = TEST_NOW + 100;
         ext4::touch_file(&rw, ino, LATER).unwrap();
 
@@ -403,27 +357,23 @@ mod tests {
             (LATER, 1500),
             "touch must move mtime and leave the size alone"
         );
-        // **Only a live regular file is stamped** — the id comes off the wire. Not a
-        // directory, not a number past the table, not `0`.
+        // **Only a live regular file is stamped**: not a directory, a number past the table, or
+        // `0`.
         let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
         assert_eq!(ext4::touch_file(&rw, sys, LATER + 1), Err(FsError::NotFound));
         assert_eq!(ext4::touch_file(&rw, 0, LATER + 1), Err(FsError::NotFound));
         assert_eq!(ext4::touch_file(&rw, u32::MAX, LATER + 1), Err(FsError::NotFound));
         assert_e2fsck_clean(&rw.0.borrow(), "touch");
 
-        // And not a file unlinked since — a touch can trail the unlink of what it names, and
-        // stamping a freed inode would give e2fsck something to find.
+        // Nor a file unlinked since: stamping a freed inode would give e2fsck something to find.
         let orphan = ext4::unlink_at(&rw, sys, b"edited", LATER).unwrap().unwrap();
         ext4::release_inode(&rw, orphan, LATER).unwrap();
         assert_eq!(ext4::touch_file(&rw, ino, LATER + 2), Err(FsError::NotFound));
         assert_e2fsck_clean(&rw.0.into_inner(), "touch-after-unlink");
     }
 
-    /// **A read-only mount refuses every mutation the server can reach, and writes nothing**
-    /// (administration Part C.3). Each operation is run twice: through [`ReadOnly`], where it
-    /// must fail with `ReadOnly`, and on a writable copy of the same image, where it must
-    /// succeed — so read-only is the only thing that stopped it, not a missing name or a full
-    /// directory. The image is byte-for-byte what it was afterwards.
+    /// **A read-only mount refuses every mutation the server can reach, and writes nothing.** Each
+    /// operation also succeeds on a writable copy, so read-only is the only thing that stopped it.
     #[test]
     fn a_read_only_mount_refuses_every_mutation_and_writes_nothing() {
         use std::cell::RefCell;
@@ -461,15 +411,13 @@ mod tests {
             assert_eq!(op(&copy), Ok(()), "{name} on a writable copy — else read-only is not what stopped it");
         }
         assert!(*rw.0.borrow() == before, "a read-only mount wrote nothing");
-        // Reading through it still works.
         let ro = crate::ReadOnly(&rw);
         let mut out = [0u8; 4];
         assert_eq!(ext4::read_file_range(&ro, b"/system/current-generation", 0, 4, &mut out), Ok(4));
         assert!(ro.read_only() && !rw.read_only());
     }
 
-    /// Every mutating operation, callable through one object-safe face so the test above can
-    /// list them. Each discards what its operation returns on success.
+    /// Every mutating operation behind one object-safe face, so the test above can list them.
     trait Mutate {
         fn mark_mounted(&self) -> Result<(), FsError>;
         fn mark_clean(&self) -> Result<(), FsError>;
@@ -528,8 +476,8 @@ mod tests {
         }
     }
 
-    /// **How the filesystem was left round-trips** through the writer, and preserves the rest of
-    /// `s_state` — a filesystem with its error bit set keeps it across a mount and an unmount.
+    /// **How the filesystem was left round-trips** through the writer, preserving the rest of
+    /// `s_state`.
     #[test]
     fn the_state_round_trips_through_a_mount_and_an_unmount() {
         use std::cell::RefCell;
@@ -540,7 +488,6 @@ mod tests {
         ext4::mark_clean(&rw).unwrap();
         assert_eq!(ext4::was_left_clean(&rw), Ok(true));
         assert_e2fsck_clean(&rw.0.borrow(), "state-round-trip");
-        // The error bit (`EXT4_ERROR_FS`, 0x2) survives both, set by hand.
         rw.0.borrow_mut()[1024 + 58] |= 0x2;
         ext4::mark_mounted(&rw).unwrap();
         assert_eq!(rw.0.borrow()[1024 + 58], 0x2, "the clean bit cleared, the error bit kept");
@@ -548,10 +495,8 @@ mod tests {
         assert_eq!(rw.0.borrow()[1024 + 58], 0x3);
     }
 
-    /// **The state is read from bytes this writer never produced**: a superblock left mounted
-    /// by someone else — `s_state` written by hand — reads as not clean, and one with only the
-    /// clean bit reads as clean. A reader tested only on its own writer's output could share
-    /// that writer's mistake.
+    /// **The state is read from bytes this writer never produced**, which a reader tested only on
+    /// its own writer's output could misread alike.
     #[test]
     fn a_superblock_left_mounted_reads_as_not_clean() {
         use std::cell::RefCell;
@@ -564,9 +509,8 @@ mod tests {
         assert!(ext4::was_left_clean(&rw).is_err());
     }
 
-    /// **The label is `s_volume_name` up to its first NUL**: what `mkfs` wrote, nothing for an
-    /// image `mke2fs` made without `-L`, all sixteen bytes when there is no terminator, and an
-    /// error on a device holding no ext4 filesystem.
+    /// **The label is `s_volume_name` up to its first NUL**: nothing for an image made without
+    /// `-L`, all sixteen bytes when there is no terminator, an error if not ext4.
     #[test]
     fn the_volume_label_reads_up_to_its_first_nul() {
         use std::cell::RefCell;
@@ -586,9 +530,8 @@ mod tests {
         assert!(ext4::volume_label(&bare, &mut out).is_err());
     }
 
-    /// **A touch follows the file, not its old name** — the reason it is by id. The kernel
-    /// flushes a cached file long after the resolve that named it; by then a rename has moved
-    /// it, and a new file has taken the name.
+    /// **A touch follows the file, not its old name**: by the flush a rename may have moved the
+    /// file and a new file taken the name.
     #[test]
     fn a_touch_by_id_after_a_rename_stamps_the_renamed_file() {
         use std::cell::RefCell;
@@ -616,8 +559,6 @@ mod tests {
 
         ext4::rename_path(&rw, b"/system/mover", b"/system/dst/moved", false, TEST_NOW).unwrap();
 
-        // Gone from the source, present at the destination, and still the same file —
-        // the size proves the inode moved rather than a fresh empty one being created.
         assert_eq!(ext4::stat_file(&rw, b"/system/mover"), Err(FsError::NotFound));
         assert_eq!(ext4::stat_file(&rw, b"/system/dst/moved"), Ok(1500));
         assert_e2fsck_clean(&rw.0.into_inner(), "rename-cross");
@@ -632,13 +573,10 @@ mod tests {
         ext4::create_file(&rw, b"/system", b"victim", TEST_NOW).unwrap();
         ext4::grow_file(&rw, b"/system/victim", 3000, TEST_NOW).unwrap();
 
-        // Without `replace` the destination is untouched — fail loud, as everywhere else.
         assert_eq!(ext4::rename_path(&rw, b"/system/src", b"/system/victim", false, TEST_NOW), Err(FsError::Exists));
         assert_eq!(ext4::stat_file(&rw, b"/system/victim"), Ok(3000));
         assert_eq!(ext4::stat_file(&rw, b"/system/src"), Ok(1200));
 
-        // With it, the destination becomes the source, and the replaced inode is handed back —
-        // unfreed until the kernel has forgotten it — then freed by `release_inode`.
         let free_before = free_inodes(&rw);
         let mut runs = [crate::BlockRun::default(); 4];
         let victim = ext4::map_file(&rw, b"/system/victim", &mut runs).unwrap().ino;
@@ -665,12 +603,10 @@ mod tests {
 
         ext4::rename_path(&rw, b"/system/outer", b"/system/target/inner", false, TEST_NOW).unwrap();
 
-        // The directory and its contents moved wholesale…
         assert!(ext4::resolve_dir(&rw, b"/system/target/inner").is_ok());
         assert_eq!(ext4::stat_file(&rw, b"/system/target/inner/payload"), Ok(0));
         assert!(ext4::resolve_dir(&rw, b"/system/outer").is_err());
-        // …and `..` now names the new parent, which is what `e2fsck` checks link counts
-        // against — a stale `..` shows up as a link-count mismatch on both directories.
+        // `..` now names the new parent: a stale one is a link-count mismatch on both.
         assert_e2fsck_clean(&rw.0.into_inner(), "rename-dir");
     }
 
@@ -683,20 +619,15 @@ mod tests {
         ext4::mkdir_at(&rw, sys, b"e", TEST_NOW).unwrap();
         ext4::create_file(&rw, b"/system", b"f", TEST_NOW).unwrap();
 
-        // Moving a directory inside itself would detach the subtree from the root.
         assert_eq!(ext4::rename_path(&rw, b"/system/d", b"/system/d/self", false, TEST_NOW), Err(FsError::Unsupported));
-        // Replacing a directory needs rmdir's emptiness + link bookkeeping; deferred.
         assert_eq!(ext4::rename_path(&rw, b"/system/f", b"/system/e", true, TEST_NOW), Err(FsError::Unsupported));
-        // A missing source is NotFound, not a silent success.
         assert_eq!(ext4::rename_path(&rw, b"/system/ghost", b"/system/g", false, TEST_NOW), Err(FsError::NotFound));
-        // Renaming onto itself is a no-op, and must not unlink the file.
         ext4::rename_path(&rw, b"/system/f", b"/system/f", false, TEST_NOW).unwrap();
         assert_eq!(ext4::stat_file(&rw, b"/system/f"), Ok(0));
         assert_e2fsck_clean(&rw.0.into_inner(), "rename-refuse");
     }
 
-    /// The superblock's free-inode count — proves a replaced inode was actually freed
-    /// rather than merely unlinked.
+    /// The superblock's free-inode count: proves a replaced inode was freed, not merely unlinked.
     fn free_inodes(rw: &RwImage) -> u32 {
         let img = rw.0.borrow();
         u32::from_le_bytes(img[1024 + 16..1024 + 20].try_into().unwrap())
@@ -705,9 +636,6 @@ mod tests {
     #[test]
     fn a_directory_grows_past_its_first_block_and_stays_e2fsck_clean() {
         use std::cell::RefCell;
-        // 1 KiB blocks and 200-byte names, so each record costs ~208 bytes and four fill
-        // a block: 40 entries force the directory to grow several times. Before growth
-        // existed this returned `TooLarge` on the fifth entry.
         let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
         let name_of = |i: usize| {
             let mut n = std::format!("f{i:03}");
@@ -722,15 +650,12 @@ mod tests {
                 .unwrap_or_else(|e| panic!("create {i} failed: {e:?}"));
         }
 
-        // Every name present exactly once, through the paginated walk the server's
-        // `ReadDir` uses — so the added blocks are reachable, not merely written.
         let listed = list_dir(&ImageReader(rw.0.borrow().clone()), b"/system");
         for i in 0..40 {
             let want = name_of(i);
             let seen = listed.iter().filter(|(n, _)| *n == want).count();
             assert_eq!(seen, 1, "entry {i} appears {seen} times, want 1");
         }
-        // And `dir_lookup`'s multi-block walk finds them, which enumeration does not prove.
         for i in [0usize, 17, 39] {
             let path = std::format!("/system/{}", name_of(i));
             assert_eq!(
@@ -746,8 +671,6 @@ mod tests {
     #[test]
     fn a_grown_directory_still_removes_cleanly() {
         use std::cell::RefCell;
-        // Growing is half of it: `rmdir`'s emptiness scan and `unlink` must walk the added
-        // blocks too, and the directory has to survive being emptied again.
         let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
         let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
         let name_of = |i: usize| {
@@ -757,16 +680,10 @@ mod tests {
             }
             n
         };
-        // 12 subdirectories at ~208 bytes each spans three 1 KiB blocks, and stays inside
-        // the inline extent header's four entries (see `dir_insert` on that ceiling —
-        // each `mkdir` allocates the child's own block between the parent's, so a parent
-        // block costs an extent).
         for i in 0..12 {
             ext4::mkdir_at(&rw, sys, name_of(i).as_bytes(), TEST_NOW)
                 .unwrap_or_else(|e| panic!("mkdir {i} failed: {e:?}"));
         }
-        // A non-empty subdirectory living in a *later* block must still be refused, which
-        // only works if the emptiness scan reaches past block 0.
         let outer = ext4::resolve_dir(&rw, name_path(&name_of(11)).as_bytes()).unwrap();
         ext4::mkdir_at(&rw, outer, b"inner", TEST_NOW).unwrap();
         assert_eq!(ext4::rmdir_at(&rw, sys, name_of(11).as_bytes(), TEST_NOW), Err(FsError::NotEmpty));
@@ -781,7 +698,6 @@ mod tests {
         assert_e2fsck_clean(&rw.0.into_inner(), "dirgrow-rm");
     }
 
-    /// `/system/<name>` — the absolute path of an entry in the fixture's directory.
     fn name_path(name: &str) -> String {
         std::format!("/system/{name}")
     }
@@ -789,9 +705,6 @@ mod tests {
     #[test]
     fn creating_a_file_stamps_it_and_its_parent_directory() {
         use std::cell::RefCell;
-        // The whole point of threading a clock into the mutation ops: a new inode
-        // carries the time it was made, and the directory that now contains it
-        // records that its contents changed.
         let r = RwImage(RefCell::new(fixture(1024, b"gen\n")));
         let sys = ext4::resolve_dir(&r, b"/system").unwrap();
         let before = dir_entry_mtime(&r, sys, b".").unwrap();
@@ -818,8 +731,6 @@ mod tests {
         assert_eq!(dir_entry_mtime(&r, sys, b"kid"), Some(TEST_NOW));
         assert_eq!(dir_entry_mtime(&r, sys, b"."), Some(TEST_NOW));
 
-        // Removing an entry changes the directory's contents too — stamp it with a
-        // later time and require the parent to move forward.
         let later = TEST_NOW + 600;
         ext4::rmdir_at(&r, sys, b"kid", later).unwrap();
         assert_eq!(dir_entry_mtime(&r, sys, b"."), Some(later));
@@ -828,8 +739,6 @@ mod tests {
     #[test]
     fn a_rename_stamps_the_directory_but_not_the_file() {
         use std::cell::RefCell;
-        // A file's name lives in the directory entry, not in its inode, so renaming
-        // it changes the directory and leaves the file's own mtime alone.
         let r = RwImage(RefCell::new(fixture(1024, b"gen\n")));
         let sys = ext4::resolve_dir(&r, b"/system").unwrap();
         ext4::create_file(&r, b"/system", b"before", TEST_NOW).unwrap();
@@ -853,7 +762,6 @@ mod tests {
         assert_eq!(dir_entry_mtime(&r, sys, b"grows"), Some(later));
     }
 
-    /// The `mtime` a directory listing reports for `name` in directory `dir_ino`.
     fn dir_entry_mtime<R: crate::BlockReader>(r: &R, dir_ino: u32, name: &[u8]) -> Option<i64> {
         let mut found = None;
         ext4::read_dir_stat(r, dir_ino, 0, |_i, _ft, ename, st| {
@@ -869,8 +777,6 @@ mod tests {
 
     #[test]
     fn read_dir_stat_reports_size_mode_and_mtime() {
-        // The listing form must resolve each entry's inode: `list` reports
-        // `Table<{name, size, kind, modified}>` straight off these fields.
         let content = b"generation-42\n";
         let r = ImageReader(fixture(1024, content));
         let dir_ino = ext4::resolve_dir(&r, b"/system").unwrap();
@@ -887,8 +793,6 @@ mod tests {
         assert_eq!(file.size, content.len() as u64, "exact file size, not a block count");
         assert_eq!(file.mode & 0xF000, 0x8000, "S_IFREG");
         assert_ne!(file.mode & 0o777, 0, "permission bits must survive");
-        // The fixture is built moments ago: a plausible, non-zero, non-future timestamp
-        // catches a mis-decoded field (a zeroed or byte-swapped mtime fails this).
         assert!(file.mtime > now - 3600 && file.mtime <= now + 60, "mtime {} is not near now ({now})", file.mtime);
 
         let (_, dot) = entries.iter().find(|(n, _)| n == ".").unwrap();
@@ -898,14 +802,11 @@ mod tests {
 
     #[test]
     fn read_dir_cursor_resumes_when_emit_stops_early() {
-        // Stop after the first entry, then resume from the returned cursor and confirm the
-        // union covers every entry exactly once (no drop, no dup at the boundary).
+        // Stop after the first entry, then resume from the returned cursor: no drop, no dup.
         let r = ImageReader(fixture(1024, b"gen\n"));
         let dir_ino = ext4::resolve_dir(&r, b"/system").unwrap();
 
-        // Mirror the server's `DirReplyWriter::push` contract: returning `false` means
-        // "this entry was NOT accepted (buffer full) — resume at it", so accept one entry
-        // then reject the next.
+        // `false` means the entry was NOT accepted (buffer full), as in `DirReplyWriter::push`.
         let mut first = Vec::new();
         let cursor = ext4::read_dir(&r, dir_ino, 0, |_i, _ft, name| {
             if !first.is_empty() {
@@ -969,30 +870,23 @@ mod tests {
         let content = b"0123456789ABCDEF\n"; // 17 bytes
         let r = ImageReader(fixture(1024, content));
         let mut out = [0u8; 32];
-        // A mid-file window.
         let n = ext4::read_file_range(&r, b"/system/current-generation", 4, 6, &mut out).unwrap();
         assert_eq!(&out[..n], b"456789");
-        // A tail clamped to the file size (ask 100 from offset 10 → 7 bytes).
         let n = ext4::read_file_range(&r, b"/system/current-generation", 10, 100, &mut out).unwrap();
         assert_eq!(&out[..n], b"ABCDEF\n");
-        // The whole file from 0.
         let n = ext4::read_file_range(&r, b"/system/current-generation", 0, 17, &mut out).unwrap();
         assert_eq!(&out[..n], content);
-        // Past end-of-file → zero bytes.
         assert_eq!(ext4::read_file_range(&r, b"/system/current-generation", 17, 8, &mut out), Ok(0));
     }
 
     #[test]
     fn read_range_spans_block_boundaries() {
-        // A multi-block file (5000 bytes > one 1 KiB block) so a range crosses
-        // block boundaries and exercises per-block extent lookup.
         let mut content = std::vec::Vec::new();
         for i in 0..5000u32 {
             content.push((i & 0xFF) as u8);
         }
         let r = ImageReader(fixture(1024, &content));
         let mut out = [0u8; 2048];
-        // A 2000-byte window starting at 1500 spans blocks 1..4 (1 KiB blocks).
         let n = ext4::read_file_range(&r, b"/system/current-generation", 1500, 2000, &mut out).unwrap();
         assert_eq!(n, 2000);
         assert_eq!(&out[..n], &content[1500..3500]);
@@ -1001,7 +895,6 @@ mod tests {
     #[test]
     fn map_range_maps_blocks_to_correct_device_data() {
         use crate::BlockRun;
-        // A ~3.02-block file (4 KiB blocks) so runs span multiple blocks + a tail.
         let mut content = std::vec::Vec::new();
         for i in 0..(4096 * 3 + 100) {
             content.push((i * 7 % 251) as u8);
@@ -1015,7 +908,6 @@ mod tests {
         let n = ext4::map_range(&r, path, 0, file_blocks, &mut runs).unwrap();
         assert!(n >= 1);
 
-        // Runs cover [0, file_blocks) contiguously in file-block space, none sparse.
         let mut next_fb = 0u64;
         for run in &runs[..n] {
             assert_eq!(run.file_block, next_fb);
@@ -1024,7 +916,6 @@ mod tests {
         }
         assert_eq!(next_fb, file_blocks);
 
-        // Cross-check: each mapped device block holds the file's bytes for that block.
         for run in &runs[..n] {
             for k in 0..run.length as u64 {
                 let fb = run.file_block + k;
@@ -1038,30 +929,18 @@ mod tests {
         }
     }
 
-    /// Run `e2fsck -fn` over an image and assert it is clean (no changes needed, no errors).
-    /// **A file bigger than block group 0**, which is the whole of Part H.2's first box.
-    ///
-    /// Before cross-group allocation this failed with `TooLarge` while `dumpe2fs` showed most
-    /// of the filesystem free — and the number that matters is not this fixture's but the
-    /// laptop's: a 931 GiB root confined to group 0 held about 112 MiB. **No existing test
-    /// could have caught it**, because every fixture was 4,096 blocks and a group is 8,192, so
-    /// the second group did not exist to fail to reach.
-    ///
-    /// The physical block numbers are the assertion. A size assertion passes with the
-    /// allocator confined to group 0 — it would simply have failed earlier — and `e2fsck`
-    /// alone would pass on a filesystem that allocated nothing.
+    /// **A file bigger than block group 0.** The physical block numbers are the assertion: a size
+    /// assertion passes with the allocator confined to group 0 (it would have failed earlier), and
+    /// `e2fsck` alone would pass on a filesystem that allocated nothing.
     #[test]
     fn a_file_grows_past_block_group_0_and_stays_e2fsck_clean() {
         use std::cell::RefCell;
-        // Three groups of 8,192 1 KiB blocks. `flex_bg` packs all three groups' metadata into
-        // group 0, so group 0 has roughly 6,600 free data blocks and groups 1 and 2 are empty.
         let rw = RwImage(RefCell::new(fixture_blocks(1024, 24576, 0, b"x\n")));
         ext4::create_file(&rw, b"/", b"big", TEST_NOW).unwrap();
         let size = 9 * 1024 * 1024; // 9,216 blocks — past what group 0 can hold
         assert_eq!(ext4::grow_file(&rw, b"/big", size, TEST_NOW).unwrap(), size);
         assert_eq!(ext4::stat_file(&rw, b"/big").unwrap(), size);
 
-        // Every block the file got, and the highest of them.
         let mut runs = [BlockRun::default(); 8];
         let n = ext4::map_range(&rw, b"/big", 0, 16384, &mut runs).unwrap();
         let highest = runs[..n]
@@ -1075,18 +954,12 @@ mod tests {
             "every block landed inside group 0 (highest {highest}), so the file cannot be \
              {size} bytes — group 0 holds 8,192 blocks including all three groups' metadata"
         );
-        // And nothing was placed past the end of the filesystem, which is the other half of
-        // the last group's short tail.
         assert!(highest < 24576, "block {highest} is past the end of the device");
         assert_e2fsck_clean(&rw.0.into_inner(), "grow-cross-group");
     }
 
-    /// **More files than one group has inodes**, the other half of the same box.
-    ///
-    /// `-i 65536` gives this fixture 128 inodes per group, so the 129th file is the first that
-    /// cannot come from group 0. The assertion is that every create succeeds *and* that an
-    /// inode number exceeds what a group holds — read out of the superblock rather than
-    /// written down here, since `mke2fs` chooses it.
+    /// **More files than one group has inodes.** `-i 65536` gives 128 inodes per group, so the
+    /// 129th file cannot come from group 0.
     #[test]
     fn more_files_than_group_0_holds_inodes_for_and_stays_e2fsck_clean() {
         use std::cell::RefCell;
@@ -1111,9 +984,7 @@ mod tests {
         assert_e2fsck_clean(&rw.0.into_inner(), "inodes-cross-group");
     }
 
-    /// **A directory made past group 0's inodes is counted in its own group** (Phase 6 Part H.1):
-    /// `mkdir` bumped group 0's count of directories wherever the inode came from, which `e2fsck`
-    /// reports once group 0's inodes are gone. Made and removed, clean after each.
+    /// **A directory made past group 0's inodes is counted in its own group**, not group 0's.
     #[test]
     fn a_directory_made_past_group_0s_inodes_is_counted_in_its_own_group() {
         use std::cell::RefCell;
@@ -1133,10 +1004,8 @@ mod tests {
     }
 
     /// **A create, a rename and a `mkdir` that need a directory block the filesystem cannot give
-    /// take nothing with them** (Phase 6 Part H.1). The create once left its inode allocated and
-    /// unattached; the rename removed the old name before the new one failed, and the file had
-    /// none; the `mkdir`, given the last block for its own, kept it and its inode. A full block of
-    /// 200-byte names on a full filesystem, `e2fsck` clean after each.
+    /// take nothing with them**: the create's inode, the rename's old name, and the `mkdir`'s block
+    /// and inode all go back. `e2fsck` clean after each.
     #[test]
     fn what_a_full_directory_refuses_takes_nothing_with_it() {
         use std::cell::RefCell;
@@ -1152,14 +1021,12 @@ mod tests {
             }
             n
         };
-        // Records of 208 bytes: nineteen beside `.` and `..` leave 120 of the block.
         for i in 0..19 {
             ext4::create_file(&rw, b"/d", long(i).as_bytes(), TEST_NOW).unwrap();
         }
         let sb = ext4::read_superblock(&rw).unwrap();
         let (_, dir) = ext4::resolve_path_ino(&rw, &sb, b"/d").unwrap();
         assert_eq!(rd_u32(&dir, 4), 4096, "one block of entries");
-        // Every block taken, a block at a time, by a file of one extent.
         ext4::create_file(&rw, b"/", b"filler", TEST_NOW).unwrap();
         let mut size = 0;
         while ext4::grow_file(&rw, b"/filler", size + 4096, TEST_NOW).is_ok() {
@@ -1170,7 +1037,6 @@ mod tests {
 
         assert_eq!(ext4::create_file(&rw, b"/d", long(19).as_bytes(), TEST_NOW), Err(FsError::TooLarge));
         assert_eq!(free(&rw), full, "the create gave its inode back");
-        // 220 bytes: no record has the room, and the removed one's is 208.
         let longer = std::format!("{}{}", long(0), "y".repeat(20));
         assert_eq!(ext4::rename_at(&rw, d, long(0).as_bytes(), longer.as_bytes(), TEST_NOW), Err(FsError::TooLarge));
         assert_eq!(ext4::stat_file(&rw, std::format!("/d/{}", long(0)).as_bytes()), Ok(0), "the old name");
@@ -1186,9 +1052,8 @@ mod tests {
         assert_e2fsck_clean(&rw.0.borrow(), "full-mkdir");
     }
 
-    /// **`e2fsck -fn` on a filesystem we laid out ourselves**, which is the whole point of
-    /// `mkfs`: the oracle is somebody else's implementation of the format, and agreeing only
-    /// with our own reader would prove nothing.
+    /// **`e2fsck -fn` on a filesystem we laid out ourselves**: the oracle is somebody else's
+    /// implementation of the format.
     fn format_image(blocks: u64, block_size: u32) -> (Vec<u8>, crate::mkfs::Geometry) {
         use std::cell::RefCell;
         let img = RwImage(RefCell::new(std::vec![0u8; (blocks * block_size as u64) as usize]));
@@ -1215,15 +1080,13 @@ mod tests {
             let (img, geom) = format_image(blocks, bs);
             assert_e2fsck_clean(&img.clone(), &std::format!("mkfs-{bs}"));
 
-            // And our own reader agrees it is an empty root directory. `e2fsck` accepting a
-            // filesystem this parser cannot walk would be half an answer.
+            // Our own reader agrees it is an empty root: `e2fsck` alone would accept a filesystem
+            // this parser cannot walk.
             let rw = RwImage(RefCell::new(img));
             assert_eq!(ext4::resolve_dir(&rw, b"/").unwrap(), 2, "the root is inode 2");
             assert_eq!(names_of(&rw, b"/"), [".", ".."], "a new root holds itself and nothing");
             assert!(geom.groups >= 1);
 
-            // And it takes a file, which is the other half of "empty": the structures are
-            // not merely self-consistent, they are the ones the writer allocates into.
             ext4::create_file(&rw, b"/", b"hello", TEST_NOW).unwrap();
             ext4::grow_file(&rw, b"/hello", 40, TEST_NOW).unwrap();
             assert_eq!(names_of(&rw, b"/"), [".", "..", "hello"]);
@@ -1232,11 +1095,6 @@ mod tests {
     }
 
     /// **What the module's doc says it declares, read back off the image by `dumpe2fs`.**
-    ///
-    /// The feature list is a promise about layout: `sparse_super` says where the backups are,
-    /// `extent` says how an inode addresses blocks, and a bit set for something not done
-    /// describes a filesystem that is not there. A comment claiming the set is an unrun
-    /// claim; this runs it.
     #[test]
     fn the_feature_set_is_exactly_what_the_module_says_it_makes() {
         let (img, _) = format_image(16384, 4096);
@@ -1256,34 +1114,19 @@ mod tests {
             ["dir_nlink", "extent", "extra_isize", "filetype", "huge_file", "large_file", "sparse_super"],
             "the declared set drifted from the module doc: {line}"
         );
-        // And the two that are deliberately absent, named so their absence is deliberate
-        // rather than forgotten: packed metadata, and checksums the writer does not maintain.
         assert!(!line.contains("flex_bg"), "flex_bg is declared but not implemented: {line}");
         assert!(!line.contains("metadata_csum"), "checksums are not maintained: {line}");
         assert!(!line.contains("has_journal"), "there is no journal: {line}");
     }
 
-    /// **More groups than one block of descriptors holds**, which is the case the installer
-    /// died on and no test could reach.
-    ///
-    /// A group-descriptor table is 32 bytes per group: one 1 KiB block describes 32 groups,
-    /// one 4 KiB block describes 128. The laptop's 931 GiB root has **7,452 groups — 59 blocks
-    /// of table** — and the first version of `format` built the whole thing in a single
-    /// one-block buffer, so it indexed past the end at group 128 and panicked. Every fixture
-    /// here was four groups or fewer, 128 bytes of descriptors, so nothing failed until a real
-    /// disk (2026-09-17). This is the same shape as the single-group fixture that hid
-    /// group-0-only allocation, and the lesson is the same: **a fixture smaller than the
-    /// structure it is testing proves the structure works at that size and nothing more.**
-    ///
-    /// **Written to a sparse file, not to memory.** 70 groups of 8 MiB is a 560 MiB filesystem;
-    /// `mkfs` touches a few hundred blocks of it, and the holes read as zeros, so this costs
-    /// about a megabyte of disk and no RAM at all. That is what makes testing a *large*
-    /// filesystem affordable, and the absence of it is why this bug shipped.
+    /// **More groups than one block of descriptors holds**: a 931 GiB root has 7,452, 59 blocks of
+    /// table, and `format` once indexed past a one-block buffer at group 128. **A fixture smaller
+    /// than the structure it tests proves it works at that size and nothing more.** Written to a
+    /// sparse file, not memory: `mkfs` touches a few hundred blocks of 560 MiB.
     #[test]
     fn a_descriptor_table_spanning_several_blocks_is_written_whole() {
         use std::io::{Read, Seek, SeekFrom, Write};
 
-        /// A [`BlockWriter`] straight onto a file, so unwritten regions stay holes.
         struct SparseFile(std::cell::RefCell<std::fs::File>);
         impl BlockReader for SparseFile {
             fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
@@ -1303,8 +1146,6 @@ mod tests {
         let dir = std::env::temp_dir().join(std::format!("nitrox-mkfs-wide-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("wide.ext4");
-        // 70 groups at 1 KiB blocks: 3 blocks of descriptors, and backups in 0, 1, 3, 5, 7,
-        // 9, 25, 27, 49 — nine copies of a table that is not one block.
         let blocks = 70u64 * 8192;
         let f = std::fs::File::options().create(true).truncate(true).read(true).write(true).open(&path).unwrap();
         f.set_len(blocks * 1024).unwrap();
@@ -1325,15 +1166,9 @@ mod tests {
         assert_eq!(geom.groups, 70);
         assert!(geom.gdt_blocks > 1, "this test means nothing with a one-block table ({} blocks)", geom.gdt_blocks);
 
-        // **The last group's descriptor, read back, before the oracle is asked.** A table
-        // truncated at its first block leaves this one zeroed — and `e2fsck` on a filesystem
-        // that broken does not report it, it *spins*: measured at ten minutes of CPU before
-        // being killed. A test whose failure mode is a hang is not a test, so the cheap,
-        // deterministic claim goes first and the oracle confirms the rest.
-        //
-        // The expected value is re-derived from the documented layout rather than read from
-        // the private helper that wrote it: a group's metadata starts after its superblock
-        // copy and descriptor table, if it has one.
+        // **The last group's descriptor, read back, before the oracle is asked**: a table truncated
+        // at its first block leaves it zeroed, and `e2fsck` then spins rather than reporting. The
+        // expected value is re-derived from the layout, not from the helper that wrote it.
         let last = geom.groups - 1;
         let expect = geom.group_start(last) + if geom.has_super(last) { 1 + geom.gdt_blocks as u64 } else { 0 };
         let mut d = [0u8; 32];
@@ -1347,19 +1182,14 @@ mod tests {
         );
         drop(img);
 
-        // The oracle reads every copy of the table it can find, so a truncated or misplaced
-        // one is its business, not ours to re-derive.
         assert_e2fsck_clean_path(&path, "mkfs-wide");
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A filesystem large enough to need **backup superblocks past group 1**, which is where
-    /// `sparse_super` stops being a rule about small numbers. `e2fsck -b` reads one of the
-    /// backups rather than the primary, so it fails if the copy is wrong or in the wrong place
-    /// — which a check of the primary alone would never notice.
+    /// A filesystem large enough to need **backup superblocks past group 1**. `e2fsck -b` reads a
+    /// backup rather than the primary, so it fails if the copy is wrong or misplaced.
     #[test]
     fn the_backup_superblocks_are_where_sparse_super_says_and_are_usable() {
-        // Nine groups at 1 KiB blocks, so backups land in 0, 1, 3, 5 and 7.
         let blocks = 9 * 8192;
         let (img, geom) = format_image(blocks, 1024);
         assert_eq!(geom.groups, 9);
@@ -1371,7 +1201,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("img.ext4");
         std::fs::write(&p, &img).unwrap();
-        // Group 3's copy starts at its first block: 1 + 3 * 8192.
         let out = std::process::Command::new("e2fsck")
             .args(["-fn", "-b", "24577", "-B", "1024", p.to_str().unwrap()])
             .output()
@@ -1384,12 +1213,10 @@ mod tests {
         );
     }
 
-    /// The inode number of a directory path (for the name-addressed mutation ops).
     fn dir_ino(rw: &RwImage, path: &[u8]) -> u32 {
         ext4::resolve_dir(rw, path).unwrap()
     }
 
-    /// The entry names of a directory, as owned strings.
     fn names_of(rw: &RwImage, path: &[u8]) -> Vec<String> {
         let ino = dir_ino(rw, path);
         let mut names = Vec::new();
@@ -1413,11 +1240,9 @@ mod tests {
         use std::cell::RefCell;
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
         let sys = dir_ino(&rw, b"/system");
-        // The exact demo sequence on one directory.
         ext4::mkdir_at(&rw, sys, b"a", TEST_NOW).unwrap();
         ext4::rename_at(&rw, sys, b"a", b"b", TEST_NOW).unwrap();
         ext4::rmdir_at(&rw, sys, b"b", TEST_NOW).unwrap();
-        // The directory must still enumerate cleanly (terminating), with a/b gone.
         let names = names_of(&rw, b"/system");
         assert!(!names.iter().any(|n| n == "a" || n == "b"), "a/b linger: {names:?}");
         assert!(names.iter().any(|n| n == "current-generation"));
@@ -1431,7 +1256,6 @@ mod tests {
         let sys = dir_ino(&rw, b"/system");
 
         ext4::mkdir_at(&rw, sys, b"sub", TEST_NOW).unwrap();
-        // It appears in /system, is itself a directory, and lists exactly `.`/`..`.
         assert!(names_of(&rw, b"/system").iter().any(|n| n == "sub"));
         let sub = ext4::resolve_dir(&rw, b"/system/sub").unwrap();
         assert!(sub > 10);
@@ -1439,20 +1263,15 @@ mod tests {
         inner.sort();
         assert_eq!(inner, vec![".".to_string(), "..".to_string()]);
 
-        // Duplicate is rejected; `.`/`..` are rejected.
         assert_eq!(ext4::mkdir_at(&rw, sys, b"sub", TEST_NOW), Err(FsError::Exists));
         assert_eq!(ext4::mkdir_at(&rw, sys, b".", TEST_NOW), Err(FsError::Unsupported));
 
         assert_e2fsck_clean(&rw.0.into_inner(), "mkdir");
     }
 
-    /// **An 8 MiB grow and its removal cost commands a run, not a block** (Phase 6 Part H.4), on
-    /// the device as `libfsserver::disk::Disk` drives it. The laptop's copies spent eight of every
-    /// twelve commands a block allocating — the bitmap, the descriptor and the superblock read and
-    /// written for each — and removing a file the same, eight a block. Measured one block at a
-    /// time, this grow was 10,251 reads and 8,193 writes and the removal 10,271 and 6,150; in runs
-    /// 26 and 2,058, and 61 commands. **And its zeroes 64 KiB a command** (H.4's fourth fix): 2,048
-    /// writes of them were 128 and a write for each run's last part.
+    /// **An 8 MiB grow and its removal cost commands a run, not a block**, on the device as `Disk`
+    /// drives it. A block at a time this grow was 10,251 reads and 8,193 writes and the removal
+    /// 10,271 and 6,150; in runs, 26 and 2,058, and 61. Zeroes go 64 KiB a command.
     #[test]
     fn an_eight_mebibyte_grow_and_its_removal_cost_commands_a_run_not_a_block() {
         const BLOCKS: u64 = 2048;
@@ -1464,9 +1283,7 @@ mod tests {
         ext4::grow_file(&rw, b"/system/big", (BLOCKS * 4096) as usize, TEST_NOW).unwrap();
         let (reads, writes) = rw.take();
         assert!(reads <= 32, "{reads} reads to grow {BLOCKS} blocks");
-        // A sixteenth of the blocks' zeroes, a command for each run's ragged end, and the metadata.
         assert!((BLOCKS / 16..=BLOCKS / 16 + 3 + 16).contains(&writes), "{writes} writes to grow {BLOCKS} blocks");
-        // In the fixture's free stretches — three of them, as one block at a time placed it.
         let mut runs = [BlockRun::default(); 4];
         let mapped = ext4::map_file(&rw, b"/system/big", &mut runs).unwrap();
         let mapped_blocks: u64 = runs[..mapped.runs].iter().map(|r| r.length as u64).sum();
@@ -1479,17 +1296,13 @@ mod tests {
         assert_e2fsck_clean(&rw.image.0.borrow(), "grow-run-remove");
     }
 
-    /// **A run lands where a block at a time put each of its blocks** (Phase 6 Part H.4):
-    /// [`ext4::alloc_run`] called until it has as many blocks as [`ext4::alloc_block`] called once a
-    /// block, each from the last one's end, takes the same blocks in the same order and leaves the
-    /// image byte for byte the same — across a bitmap with holes of one, two and five, through a
-    /// run cut short by `want`, and over a group's end into the next. And [`ext4::free_run`] of
-    /// runs crossing that end leaves the image as `free_block` of each block does.
+    /// **A run lands where a block at a time put each of its blocks**: [`ext4::alloc_run`] called
+    /// until it has as many blocks as [`ext4::alloc_block`] called once a block takes the same
+    /// blocks in the same order and leaves the image byte for byte the same — across holes, a run
+    /// cut short by `want`, and a group's end. [`ext4::free_run`] likewise matches `free_block`.
     #[test]
     fn a_run_lands_where_a_block_at_a_time_put_each_of_its_blocks() {
         use std::cell::RefCell;
-        // Three groups of 8,192 one-KiB blocks, group 0 given holes: 900 blocks taken, then some
-        // given back — every seventh and the one after it, and every thirteenth's fifth.
         let base = RwImage(RefCell::new(fixture_blocks(1024, 24576, 0, b"seed\n")));
         let sb = ext4::read_superblock(&base).unwrap();
         let first = sb.first_data_block as u64;
@@ -1502,7 +1315,6 @@ mod tests {
         let image = base.0.borrow().clone();
         let free_0 = {
             let mut gd = [0u8; 32];
-            // At one KiB a block the descriptor table starts at block 2.
             base.read_at(2 * 1024, &mut gd).unwrap();
             rd_u16(&gd, 12) as u64
         };
@@ -1526,7 +1338,6 @@ mod tests {
         assert!(by_run.iter().any(|&p| p >= first + 8192), "the runs reached group 1");
         assert!(*a.0.borrow() == *b.0.borrow(), "the same bitmaps and counts");
 
-        // Freed again in runs that cross group 0's end, and a block at a time.
         let end_0 = first + 8192;
         let runs = [(end_0 - 300, 900), (first + 120, 40)];
         for (phys, len) in runs {
@@ -1535,22 +1346,18 @@ mod tests {
                 ext4::free_block(&b, &sb, blk).unwrap();
             }
         }
-        // Byte for byte is the oracle: `e2fsck` is not, on blocks taken for no file and freed
-        // from the filesystem's own.
+        // Byte for byte is the oracle: `e2fsck` is not, on blocks taken for no file.
         assert!(*a.0.borrow() == *b.0.borrow(), "freed alike");
-        // Not on the filesystem: refused before anything is written.
         let before = a.0.borrow().clone();
         assert_eq!(ext4::free_run(&a, &sb, sb.blocks_count - 2, 5), Err(FsError::Corrupt));
         assert_eq!(ext4::free_run(&a, &sb, 0, 1).is_err(), first > 0);
         assert!(*a.0.borrow() == before);
     }
 
-    /// **Nothing the metadata cache holds goes stale** (Phase 6 Part H.4). Through a cache of eight
-    /// blocks, so it evicts all the time: files made, grown and given data the way the kernel writes
-    /// it — to the device, behind the server — then renamed, removed and released, a directory
-    /// filled, emptied and removed so its blocks become new files' data, and files cut and grown back
-    /// over the bytes the kernel wrote. Every file then reads what it should, the directories list
-    /// what they should, and `e2fsck` finds the filesystem clean.
+    /// **Nothing the metadata cache holds goes stale.** Through a cache of eight blocks, so it
+    /// evicts all the time: files made, grown and given data the way the kernel writes it (behind
+    /// the server), renamed, removed and released, a directory filled, emptied and removed so its
+    /// blocks become file data, files cut and grown back. Every file then reads what it should.
     #[test]
     fn every_change_through_the_metadata_cache_leaves_it_and_the_disk_agreeing() {
         use libfsserver::cache::{MetaCache, Store};
@@ -1559,7 +1366,6 @@ mod tests {
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
         let mut store = Box::new(Store::<8>::new());
         let c = MetaCache::new(&rw, &mut store);
-        // The kernel's write-back: straight to the image, over the blocks the file's map names.
         let kernel_writes = |path: &[u8], byte: u8| {
             let mut runs = [BlockRun::default(); 8];
             let m = ext4::map_file(&rw, path, &mut runs).unwrap();
@@ -1592,7 +1398,6 @@ mod tests {
             let ino = ext4::unlink_at(&c, d1, format!("f{i:03}").as_bytes(), TEST_NOW).unwrap().unwrap();
             ext4::release_inode(&c, ino, TEST_NOW).unwrap();
         }
-        // A directory of a hundred names, emptied and removed: its blocks are free for data.
         ext4::mkdir_at(&c, sys, b"d2", TEST_NOW).unwrap();
         let d2 = ext4::resolve_dir(&c, b"/system/d2").unwrap();
         for i in 0..100 {
@@ -1611,7 +1416,7 @@ mod tests {
             ext4::grow_file(&c, &path("d1", &name), SIZE, TEST_NOW).unwrap();
             kernel_writes(&path("d1", &name), 0xEE);
         }
-        // Cut and grown back: what the kernel wrote before the cut stays, and the rest reads zero.
+        // Cut and grown back: what the kernel wrote before the cut stays, the rest reads zero.
         for i in 150..160 {
             ext4::truncate_file(&c, &path("d1", &format!("f{i:03}")), 1000, TEST_NOW).unwrap();
             ext4::grow_file(&c, &path("d1", &format!("f{i:03}")), SIZE, TEST_NOW).unwrap();
@@ -1642,8 +1447,8 @@ mod tests {
         assert!(!names_of(&rw, b"/system").iter().any(|n| n == "d2"));
         assert_e2fsck_clean(&rw.0.borrow(), "meta-cache");
 
-        // **A file's data is never answered from the cache**: read through one large enough to keep
-        // it, written again by the kernel, and read at once — the new bytes, not the ones read.
+        // **A file's data is never answered from the cache**: read, written again by the kernel,
+        // and read at once — the new bytes.
         let mut store = Box::new(Store::<64>::new());
         let c = MetaCache::new(&rw, &mut store);
         for i in 0..5u8 {
@@ -1655,10 +1460,9 @@ mod tests {
         }
     }
 
-    /// **A directory is read from the device once** (Phase 6 Part H.4). Through a server's cache, a
-    /// lookup that misses in a directory of 4,096 names reads the directory, twenty blocks; one that
-    /// finds a file then reads at most that file's inode-table block; and every lookup again reads
-    /// nothing. Uncached, each of them scanned the directory from the device.
+    /// **A directory is read from the device once.** Through a server's cache, a miss in a
+    /// directory of 4,096 names reads its twenty blocks, a hit at most its inode-table block, and
+    /// every lookup again nothing.
     #[test]
     fn a_directory_is_read_from_the_device_once_through_the_cache() {
         use libfsserver::cache::{MetaCache, SERVER_BLOCKS, Store};
@@ -1705,14 +1509,12 @@ mod tests {
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
         let sys = dir_ino(&rw, b"/system");
 
-        // Create a file with content (so it owns a data block to free), then unlink it.
         let ino = ext4::create_file(&rw, b"/system", b"scratch", TEST_NOW).unwrap();
         ext4::grow_file(&rw, b"/system/scratch", 4096, TEST_NOW).unwrap();
         assert!(names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
 
-        // **Two halves** (administration Part C.1b): the name goes at once, but the inode and
-        // its block stay allocated until `release_inode` — which a server calls only once the
-        // kernel has answered `File::Forget`, since it may still be writing that block.
+        // **Two halves**: the name goes at once, but the inode and its block stay allocated until
+        // `release_inode`, after `File::Forget`.
         let (blocks, inodes) = (free_blocks(&rw), free_inodes(&rw));
         assert_eq!(ext4::unlink_at(&rw, sys, b"scratch", TEST_NOW), Ok(Some(ino)));
         assert!(!names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
@@ -1720,12 +1522,10 @@ mod tests {
         assert_eq!((free_blocks(&rw), free_inodes(&rw)), (blocks, inodes), "nothing freed yet");
         ext4::release_inode(&rw, ino, TEST_NOW).unwrap();
         assert_eq!((free_blocks(&rw), free_inodes(&rw)), (blocks + 1, inodes + 1), "freed on release");
-        // A second release, or one of a live file, is refused rather than freeing twice.
         assert_eq!(ext4::release_inode(&rw, ino, TEST_NOW), Err(FsError::NotFound));
         let sys_ino = ext4::resolve_dir(&rw, b"/system").unwrap();
         assert_eq!(ext4::release_inode(&rw, sys_ino, TEST_NOW), Err(FsError::NotFound));
 
-        // Unlink of a directory is rejected (use rmdir); missing name is NotFound.
         ext4::mkdir_at(&rw, sys, b"adir", TEST_NOW).unwrap();
         assert_eq!(ext4::unlink_at(&rw, sys, b"adir", TEST_NOW), Err(FsError::Unsupported));
         assert_eq!(ext4::unlink_at(&rw, sys, b"nope", TEST_NOW), Err(FsError::NotFound));
@@ -1741,10 +1541,8 @@ mod tests {
 
         ext4::mkdir_at(&rw, sys, b"empty", TEST_NOW).unwrap();
         ext4::mkdir_at(&rw, sys, b"full", TEST_NOW).unwrap();
-        // Put a file inside `full` so it is non-empty.
         ext4::create_file(&rw, b"/system/full", b"f", TEST_NOW).unwrap();
 
-        // Non-empty rmdir is refused; a regular file is refused (use unlink).
         let full = dir_ino(&rw, b"/system/full");
         let _ = full;
         assert_eq!(ext4::rmdir_at(&rw, sys, b"full", TEST_NOW), Err(FsError::NotEmpty));
@@ -1757,10 +1555,9 @@ mod tests {
         assert_e2fsck_clean(&rw.0.into_inner(), "rmdir");
     }
 
-    /// **A directory removed is no directory to a session still holding its inode** (PR #365
-    /// review, finding 5): every operation that takes a directory by inode refuses it `NotFound`.
-    /// A removed directory keeps its mode and extent, so the mode check alone let `mkdir_at` write
-    /// an entry into a block the removal had freed.
+    /// **A directory removed is no directory to a session still holding its inode**: every
+    /// operation taking a directory by inode refuses it `NotFound`; the mode check alone let
+    /// `mkdir_at` write into a freed block.
     #[test]
     fn a_removed_directory_is_refused_to_a_session_still_holding_it() {
         use std::cell::RefCell;
@@ -1790,7 +1587,6 @@ mod tests {
         assert!(names.iter().any(|n| n == "after"));
         assert!(!names.iter().any(|n| n == "before"));
 
-        // Renaming onto an existing name is refused; a missing source is NotFound.
         ext4::create_file(&rw, b"/system", b"other", TEST_NOW).unwrap();
         assert_eq!(ext4::rename_at(&rw, sys, b"after", b"other", TEST_NOW), Err(FsError::Exists));
         assert_eq!(ext4::rename_at(&rw, sys, b"ghost", b"x", TEST_NOW), Err(FsError::NotFound));
@@ -1805,16 +1601,14 @@ mod tests {
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
         let path = b"/system/current-generation";
 
-        // Grow to 5 blocks, then cut back to 1.5 — so the shrink must drop whole
-        // extents *and* shorten the one straddling the new end, which is where a
-        // naive "free everything past the last kept extent" gets it wrong.
+        // Grow to 5 blocks, then cut back to 1.5: the shrink must drop whole extents *and* shorten
+        // the one straddling the new end.
         ext4::grow_file(&rw, path, 5 * 4096, TEST_NOW).unwrap();
         let before_free = free_blocks(&rw);
 
         assert_eq!(ext4::truncate_file(&rw, path, 6000, TEST_NOW), Ok(6000));
         assert_eq!(ext4::stat_file(&rw, path), Ok(6000));
 
-        // 6000 bytes needs 2 blocks; the other 3 must have come back.
         let mut runs = [BlockRun::default(); 8];
         let ext4::MappedFile { size, runs: n, .. } = ext4::map_file(&rw, path, &mut runs).unwrap();
         assert_eq!(size, 6000);
@@ -1836,13 +1630,10 @@ mod tests {
         let path = b"/system/current-generation";
         ext4::grow_file(&rw, path, 3 * 4096, TEST_NOW).unwrap();
 
-        // A size inside the first block keeps exactly that block: the bytes past the
-        // new end are slack, as they are after any short write.
         assert_eq!(ext4::truncate_file(&rw, path, 1, TEST_NOW), Ok(1));
         assert_eq!(ext4::stat_file(&rw, path), Ok(1));
         assert_e2fsck_clean(&rw.0.borrow(), "truncate-partial");
 
-        // Zero keeps nothing at all.
         assert_eq!(ext4::truncate_file(&rw, path, 0, TEST_NOW), Ok(0));
         assert_eq!(ext4::stat_file(&rw, path), Ok(0));
         let mut runs = [crate::BlockRun::default(); 8];
@@ -1859,9 +1650,8 @@ mod tests {
         let path = b"/system/current-generation";
         ext4::grow_file(&rw, path, 4096, TEST_NOW).unwrap();
 
-        // At or above the current size is a no-op reporting the current size —
-        // growing allocates, which is `grow_file`'s job. Silently *extending* here
-        // would hand back a file whose tail was never written.
+        // At or above the current size is a no-op reporting the current size; growing is
+        // `grow_file`'s job.
         assert_eq!(ext4::truncate_file(&rw, path, 4096, TEST_NOW), Ok(4096));
         assert_eq!(ext4::truncate_file(&rw, path, 999_999, TEST_NOW), Ok(4096));
         assert_eq!(ext4::stat_file(&rw, path), Ok(4096));
@@ -1878,31 +1668,24 @@ mod tests {
         ext4::truncate_file(&rw, b"/system/current-generation", 10, later).unwrap();
         assert_eq!(dir_entry_mtime(&rw, sys, b"current-generation"), Some(later));
 
-        // A directory is not truncatable — its size is its data, not a byte count a
-        // caller may set.
         assert_eq!(ext4::truncate_file(&rw, b"/system", 0, TEST_NOW), Err(FsError::NotFound));
     }
 
-    /// The superblock's free-block count — what proves a freed block reached the
-    /// allocator rather than merely leaving the inode's extent tree.
+    /// The superblock's free-block count.
     fn free_blocks(rw: &RwImage) -> u32 {
         let img = rw.0.borrow();
         u32::from_le_bytes(img[1024 + 12..1024 + 16].try_into().unwrap())
     }
 
-    /// **A truncate and then a grow read zero over the regrown range, on the device** — a whole
-    /// block and a partial tail. The kernel fills a page it does not hold from the blocks the
-    /// map names, so what the device holds there is what a reader sees. Both halves reuse what
-    /// the truncate left: the tail stays in the kept block, and the freed block is where the
-    /// allocator's goal points — asserted, since a test that grew into a fresh block would pass
-    /// with no zeroing at all.
+    /// **A truncate and then a grow read zero over the regrown range, on the device**, a whole
+    /// block and a partial tail. Both halves reuse what the truncate left (asserted: a grow into a
+    /// fresh block would pass with no zeroing at all).
     #[test]
     fn a_truncate_then_a_grow_reads_zero_over_the_regrown_range() {
         use crate::BlockRun;
         use std::cell::RefCell;
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
         let path = b"/system/current-generation";
-        // Two blocks of a pattern, written to the device as the kernel's write-back would.
         ext4::grow_file(&rw, path, 8192, TEST_NOW).unwrap();
         let mut runs = [BlockRun::default(); 8];
         let m = ext4::map_file(&rw, path, &mut runs).unwrap();
@@ -1935,11 +1718,9 @@ mod tests {
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n"))); // 5-byte file → 1 block
         let path = b"/system/current-generation";
 
-        // Grow 5 → 5000 bytes (1 → 2 blocks): allocate + extend the extent tree + inode.
         assert_eq!(ext4::grow_file(&rw, path, 5000, TEST_NOW), Ok(5000));
         assert_eq!(ext4::stat_file(&rw, path), Ok(5000));
 
-        // The block map now covers 2 blocks, none sparse.
         let mut runs = [BlockRun::default(); 8];
         let ext4::MappedFile { size, runs: n, .. } = ext4::map_file(&rw, path, &mut runs).unwrap();
         assert_eq!(size, 5000);
@@ -1949,10 +1730,6 @@ mod tests {
             assert_ne!(r.device_lba, 0);
         }
 
-        // e2fsck the mutated image: the metadata (extent tree, bitmap, free counts, inode)
-        // must be fully consistent. **Through the shared helper** — this test and the one
-        // below each had their own copy of the invocation, which is how they went on
-        // trusting an exit status the helper had to stop trusting (Phase 5 Part H.2).
         assert_e2fsck_clean(&rw.0.into_inner(), "grow");
     }
 
@@ -1961,19 +1738,13 @@ mod tests {
         use std::cell::RefCell;
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
 
-        // Create a new regular file in /system.
         let ino = ext4::create_file(&rw, b"/system", b"newfile", TEST_NOW).unwrap();
         assert!(ino > 10, "should not reuse a reserved inode");
-        // It resolves and is empty.
         assert_eq!(ext4::stat_file(&rw, b"/system/newfile"), Ok(0));
-        // Idempotent: creating again returns the same inode.
         assert_eq!(ext4::create_file(&rw, b"/system", b"newfile", TEST_NOW), Ok(ino));
-        // Grow + write path works on the freshly-created file.
         assert_eq!(ext4::grow_file(&rw, b"/system/newfile", 100, TEST_NOW), Ok(100));
         assert_eq!(ext4::stat_file(&rw, b"/system/newfile"), Ok(100));
 
-        // e2fsck the mutated image: the new inode, its dir entry, the bitmaps + counts, and
-        // the extent must all be consistent.
         assert_e2fsck_clean(&rw.0.into_inner(), "create");
     }
 }

@@ -1,14 +1,11 @@
 //! `tty-server` — the line discipline, separated from the syscalls.
 //!
-//! Everything with behaviour lives here and host-tests in milliseconds: what a byte does to
-//! a line buffer, when a line is complete, what gets echoed. The binary half owns the
-//! console device, the IPC channels, and the wait loop.
+//! What a byte does to a line buffer, when a line is complete and what gets echoed live here
+//! and host-test; the binary half owns the console device, the IPC channels and the wait loop.
 //!
-//! **The seam is the reason this crate is split.** Line editing existed three times before
-//! this server — in `eshell`, in `session-mgr`'s login, and in `nxsh`'s REPL — and the three
-//! copies disagreed: two of them differed over whether to echo the CR/LF that ends a line,
-//! which is why a password prompt rendered as `alicepassword:` for weeks. One implementation
-//! behind a testable seam is the whole point of the exercise, so the syscalls stay out.
+//! One implementation behind a testable seam replaces three copies (`eshell`, `session-mgr`'s
+//! login, `nxsh`'s REPL) that disagreed over whether to echo the CR/LF ending a line, which
+//! rendered a password prompt as `alicepassword:`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -16,10 +13,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-/// What the caller should do after feeding one byte.
-///
-/// The discipline never writes anything itself — it *says* what to write. That is what keeps
-/// it free of syscalls, and it is also what lets a test assert on the echo.
+/// What the caller should do after feeding one byte; the discipline *says* what to write and
+/// never writes, which keeps it free of syscalls.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Step {
     /// Nothing to do.
@@ -29,31 +24,25 @@ pub enum Step {
     /// A line is complete. Its bytes (no terminator) are the payload; `echo` is what to
     /// write to move the cursor on, which is empty in no-echo mode.
     Line { bytes: Vec<u8>, echo: Vec<u8> },
-    /// A key this discipline deliberately does not act on, reported for the caller to
-    /// decide. Arrow keys are the case that matters: recalling history means replacing the
-    /// line, and *what* to replace it with is the shell's business, not the terminal's.
+    /// A key this discipline does not act on, reported for the caller to decide: what to
+    /// replace the line with on recall is the shell's business, not the terminal's.
     Key(Key),
-    /// End of input — Ctrl-D at an empty line. Distinct from an empty *line*, which is
-    /// what Enter on its own produces: one means "nothing this time", the other means
-    /// "nothing ever again", and a reader that conflates them either exits on a stray
-    /// Enter or cannot be exited at all.
+    /// End of input — Ctrl-D at an empty line. Distinct from an empty *line* (a bare Enter):
+    /// a reader that conflates them either exits on a stray Enter or cannot be exited.
     Eof,
 }
 
 /// A key with no meaning to the line discipline itself.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Key {
+    /// Cursor up (`ESC [ A`).
     Up,
+    /// Cursor down (`ESC [ B`).
     Down,
 }
 
-/// Where the escape-sequence parser is.
-///
-/// Arrow keys arrive as three bytes (`ESC [ A`), so recognising them needs state. Kept
-/// deliberately small: this parses *cursor keys and nothing else*, and unknown sequences are
-/// discarded rather than accumulated. It is the first step toward terminal input parsing,
-/// and the stopping point is chosen rather than discovered — anything richer belongs with a
-/// real keyboard driver, which can report modifiers a serial byte stream cannot express.
+/// Where the escape-sequence parser is: cursor keys and nothing else, with unknown sequences
+/// discarded, not accumulated.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum EscState {
     Ground,
@@ -69,10 +58,8 @@ pub struct Discipline {
     esc: EscState,
 }
 
-/// The longest line accepted before further printable input is refused.
-///
-/// Refusing beats truncating: a silently shortened password or path is a wrong value that
-/// looks like a right one.
+/// The longest line accepted before further printable input is refused, not truncated: a
+/// shortened password or path is a wrong value that looks like a right one.
 pub const LINE_MAX: usize = 1024;
 
 impl Default for Discipline {
@@ -82,23 +69,23 @@ impl Default for Discipline {
 }
 
 impl Discipline {
+    /// An empty line with echo on.
     pub fn new() -> Self {
         Discipline { line: Vec::new(), echo: true, max: LINE_MAX, esc: EscState::Ground }
     }
 
-    /// Whether typed characters are echoed. Off is how a password is read — and because it
-    /// is *the server's* state, a client cannot forget to ask for it the way every caller of
-    /// the old `read_line(..., echo: false)` had to remember.
+    /// Whether typed characters are echoed. Off is how a password is read; it is the server's
+    /// state, so a client cannot forget to ask for it.
     pub fn set_echo(&mut self, on: bool) {
         self.echo = on;
     }
 
+    /// Whether typed characters are echoed.
     pub fn echo_on(&self) -> bool {
         self.echo
     }
 
-    /// Discard a partially typed line — what a tty being handed to a new reader needs, so no
-    /// one inherits half of somebody else's input.
+    /// Discard a partially typed line, so a new reader inherits none of someone else's input.
     pub fn reset(&mut self) {
         self.line.clear();
         self.esc = EscState::Ground;
@@ -109,14 +96,9 @@ impl Discipline {
         &self.line
     }
 
-    /// Replace the whole line, returning what to write so the display matches.
-    ///
-    /// This is the redraw primitive history recall needs, and the reason the line buffer
-    /// stays here rather than being reimplemented by every caller that wants a history: the
-    /// discipline knows what is on screen, so only it can say how to erase it.
-    ///
-    /// Erase-then-write, not a cursor-addressing sequence: a dumb terminal is the baseline,
-    /// and `\x08 \x08` per character is what works everywhere.
+    /// Replace the whole line, returning what to write so the display matches: only the
+    /// discipline knows what is on screen. Erase-then-write (`\x08 \x08` per character), as a
+    /// dumb terminal needs.
     pub fn replace_line(&mut self, new: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         if self.echo {
@@ -135,35 +117,19 @@ impl Discipline {
         // Mid-escape bytes are never text: a `[` after ESC is not a bracket the user typed.
         match self.esc {
             EscState::Ground => {}
-            // **`ESC` is the meta prefix, so the byte after a bare one is consumed.** That is
-            // what readline does — `ESC d` is M-d, and an `ESC` pair with no binding is
-            // discarded rather than inserted — and it is why the test below is named for what
-            // it asserts rather than for what a reader might hope. M8 Part F briefly took this
-            // for a bug, on the evidence that typing `desktop` at a terminal an Escape had
-            // reached gave the shell `esktop`. It does; that is the meta prefix working, and
-            // the Escape came from a *gate* dismissing a popup while the terminal held the
-            // keyboard, not from the discipline losing input.
+            // `ESC` is the meta prefix, so the byte after a bare one is consumed, as readline
+            // does: `ESC d` is M-d, and an unbound pair is discarded rather than inserted.
             EscState::Esc => {
                 self.esc = if b == b'[' { EscState::Csi } else { EscState::Ground };
                 return Step::None;
             }
             EscState::Csi => {
-                // **A CSI ends at its *final* byte, not at its first.** This consumed exactly
-                // one byte after `ESC [` and called the sequence over, which is right for
-                // `ESC [ A` and wrong for every sequence with a parameter: `ESC [ 3 ~` — the
-                // Delete key on any real terminal — ended at the `3`, and the `~` landed in the
-                // ground state as printable ASCII, so it was pushed onto the line **and
-                // echoed**. Typing Delete then `list /bin` handed the shell `~list /bin`.
-                //
-                // Live over the serial console since this discipline was written; found while
-                // reviewing `libterm`'s encoder, which produces the same four sequences
-                // (PR #191 review, finding 1). The old comment claimed "the sequence cannot
-                // leak into the line", which was the claim to check.
+                // A CSI ends at its *final* byte, not its first: ending `ESC [ 3 ~` (Delete) at
+                // the `3` would let the `~` land on the line as printable text and be echoed.
                 return match b {
                     // Parameter and intermediate bytes belong to the sequence.
                     0x20..=0x3F => Step::None,
-                    // `ESC` cancels and restarts, so an interrupted sequence cannot make the
-                    // next one disappear.
+                    // `ESC` restarts, so an interrupted sequence cannot swallow the next one.
                     0x1B => {
                         self.esc = EscState::Esc;
                         Step::None
@@ -174,13 +140,11 @@ impl Discipline {
                         match b {
                             b'A' => Step::Key(Key::Up),
                             b'B' => Step::Key(Key::Down),
-                            // Left/right and everything else: recognised as *ended*, so the
-                            // sequence cannot leak into the line, but not acted on.
+                            // Ended but not acted on, so it cannot leak into the line.
                             _ => Step::None,
                         }
                     }
-                    // Malformed. End the sequence rather than swallowing the rest of the
-                    // stream, which is what a terminal going silent looks like.
+                    // Malformed: end it rather than swallow the rest of the stream.
                     _ => {
                         self.esc = EscState::Ground;
                         Step::None
@@ -189,26 +153,21 @@ impl Discipline {
             }
         }
         match b {
-            // ESC begins a sequence. Alone it does nothing, which is the right answer for a
-            // key with no meaning here.
             0x1b => {
                 self.esc = EscState::Esc;
                 Step::None
             }
-            // CR and LF both end a line. A serial line may send either, and which one is
-            // an accident of the terminal rather than a distinction worth carrying.
+            // CR and LF both end a line; which one a serial line sends is an accident.
             b'\r' | b'\n' => {
                 let bytes = core::mem::take(&mut self.line);
-                // The newline is echoed *because the user typed it*. Omitting it leaves the
-                // cursor on the line they typed on, so the next prompt lands against their
-                // input — exactly the `alicepassword:` bug. In no-echo mode nothing was
-                // shown, so the caller supplies its own newline when it is ready.
+                // Echoed because the user typed it: omitting it leaves the next prompt against
+                // their input (`alicepassword:`). In no-echo mode nothing was shown, so the
+                // caller supplies its own newline.
                 let echo = if self.echo { b"\r\n".to_vec() } else { Vec::new() };
                 Step::Line { bytes, echo }
             }
-            // Ctrl-D. At an empty line it is end-of-input, the universal convention. With
-            // a partial line it does nothing: bash uses it to list completions there, and
-            // silently discarding what someone typed would be worse than ignoring a key.
+            // Ctrl-D is end-of-input at an empty line; mid-line it does nothing, since discarding
+            // what someone typed would be worse than ignoring a key.
             0x04 => {
                 if self.line.is_empty() {
                     Step::Eof
@@ -219,17 +178,14 @@ impl Discipline {
             // Backspace and DEL both erase: terminals disagree about which they send.
             0x08 | 0x7f => {
                 if self.line.pop().is_some() && self.echo {
-                    // Back up, overwrite with a space, back up again — the only way to
-                    // erase on a dumb terminal.
+                    // Back up, overwrite with a space, back up again.
                     Step::Echo(b"\x08 \x08".to_vec())
                 } else {
-                    // Nothing to erase, or nothing to show. Not an error: backspace at an
-                    // empty prompt is something people do constantly.
+                    // Nothing to erase, or nothing to show.
                     Step::None
                 }
             }
-            // Ctrl-U: kill the line. Erase exactly what is on screen, no more — in no-echo
-            // mode that is nothing.
+            // Ctrl-U kills the line, erasing exactly what is on screen: nothing in no-echo mode.
             0x15 => {
                 let n = self.line.len();
                 self.line.clear();
@@ -243,8 +199,8 @@ impl Discipline {
                     Step::None
                 }
             }
-            // Ctrl-W: erase the word before the cursor, plus the run of spaces before it,
-            // which is what makes repeated presses walk back through a command line.
+            // Ctrl-W erases the word before the cursor and the spaces before it, so repeated
+            // presses walk back through a command line.
             0x17 => {
                 let before = self.line.len();
                 while self.line.last() == Some(&b' ') {
@@ -275,46 +231,29 @@ impl Discipline {
                 self.line.push(b);
                 if self.echo { Step::Echo(alloc::vec![b]) } else { Step::None }
             }
-            // Everything else — control codes this discipline does not define — is dropped
-            // rather than accumulated, so a stray byte cannot corrupt a command.
+            // Undefined control codes are dropped so a stray byte cannot corrupt a command.
             _ => Step::None,
         }
     }
 }
 
-/// Which terminals exist, where each one's bytes come from and go to, and who is waiting.
-///
-/// **The routing half, split out for the reason the discipline was.** Until Milestone 5 Part C
-/// this lived in the binary as three globals and a flat `Vec<Tty>`, where none of it could be
-/// tested: the rule "input goes to the first terminal that is waiting" and the rule "`Ctrl-C`
-/// goes to *every* terminal" were both single lines with no way to state them except in prose.
-/// Both change in this part — from "first waiter anywhere" to "first waiter **on this
-/// backend**" — and a change to an untestable rule is a change nobody can check.
-///
-/// Nothing here performs a syscall. Handles are opaque `u64`s and every effect comes back as an
-/// [`Act`] for the caller to perform, which is the same shape as the compositor's
-/// `server::dispatch` and for the same reason.
+/// Which terminals exist, where each one's bytes go, and who is waiting. No syscalls: every
+/// effect comes back as an [`Act`]. Input goes to the first waiter **on its backend**, `Ctrl-C`
+/// to every terminal on it.
 pub mod routing {
     use super::{Discipline, Key, Step};
     use alloc::collections::VecDeque;
     use alloc::vec::Vec;
 
-    // **The real definitions, not copies.** A first draft duplicated these with a comment
-    // saying the host tests must not need the wire format, and got `PeerClosed` wrong by 19 —
-    // which no test could have caught, because the copy was the only thing the tests saw. Both
-    // crates are `no_std` and both host-test; the compositor's library half already depends on
-    // `librsproto` for exactly this reason.
+    // The real definitions, not copies: a copy of `PeerClosed` was wrong and no test could see it.
     use libkern::error::KError;
     use librsproto::{
         OP_TTY_INTERRUPT as OP_INTERRUPT, OP_TTY_READ as OP_READ, OP_TTY_READ_LINE as OP_READ_LINE,
         OP_TTY_SET_MODE as OP_SET_MODE, OP_TTY_WRITE as OP_WRITE,
     };
 
-    /// Where a terminal's bytes come from and go to.
-    ///
-    /// **The seam `console-and-tty.md` built the backend for.** One line discipline, two
-    /// sources: a serial port, or a terminal emulator holding what Unix would call the master
-    /// half of a pty. The discipline cannot tell the difference and must not be able to.
+    /// Where a terminal's bytes come from and go to: a serial port, or a terminal emulator
+    /// holding the master half of a pty. The discipline cannot tell which.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum Sink {
         /// The serial console — the kernel's debug write out, the console device in.
@@ -336,28 +275,21 @@ pub mod routing {
     pub struct Tty {
         /// The server-side endpoint, opaque here.
         pub ch: u64,
-        /// This terminal's line-editing state — echo mode, the partial line, the escape
-        /// machine. One per terminal, because the mode is per terminal.
+        /// This terminal's line-editing state; the mode is per terminal.
         pub disc: Discipline,
         /// The outstanding read, if the client is waiting for input.
         pub waiting: Option<(u64, ReadKind)>,
         /// An interrupt arrived while **nobody was reading**, so the next read completes empty
-        /// immediately. Without this, `Ctrl-C` between prompts would only take effect once the
-        /// user pressed something else — the interrupt has to be able to end a read that has
-        /// not started yet.
+        /// at once; otherwise `Ctrl-C` between prompts would wait for another keystroke.
         pub interrupt_pending: bool,
         /// Which backend this terminal belongs to.
         pub backend: u32,
     }
 
-    /// A backend, and the input from it that no terminal has taken yet.
-    ///
-    /// **The queue is per backend, not global.** Bytes typed at the serial console must not be
-    /// deliverable to a terminal inside a window, and a queue shared between them makes that a
-    /// matter of which terminal happened to ask first.
+    /// A backend, and its input no terminal has taken yet. The queue is per backend: console
+    /// bytes must not be deliverable to a terminal inside a window.
     pub struct Backend {
-        /// Stable within a run; terminals name their backend by it rather than by index, so
-        /// retiring one does not renumber the others.
+        /// Stable within a run, so retiring a backend renumbers no other.
         pub id: u32,
         /// Where this backend's bytes come from and go to.
         pub sink: Sink,
@@ -369,17 +301,13 @@ pub mod routing {
     pub enum Act {
         /// Write bytes to a sink — program output, or an echo.
         Write(Sink, Vec<u8>),
-        /// Send a message on a terminal's channel. `request_id` 0 means unsolicited, which is
-        /// what an interrupt is.
+        /// Send on a terminal's channel; `request_id` 0 is unsolicited, as an interrupt is.
         Reply { ch: u64, op: u16, request_id: u64, body: Vec<u8> },
         /// Send an error reply.
         Fail { ch: u64, op: u16, request_id: u64, err: i32 },
     }
 
-    /// The id the console backend always has.
-    ///
-    /// Fixed rather than allocated, because the console exists before anything can ask for it
-    /// and a terminal opened with no backend named has to land somewhere.
+    /// The console backend's fixed id: a terminal opened with no backend named lands there.
     pub const CONSOLE: u32 = 0;
 
     /// Every terminal and every backend.
@@ -457,10 +385,7 @@ pub mod routing {
 
         /// Add terminal `ch` on the same backend as terminal `of` — `Tty::OpenSibling`.
         ///
-        /// **The shared case, reached for real.** A shell hands each stage it spawns a sibling of
-        /// its own terminal (administration Part A.2), so one backend holds several terminals.
-        /// Input goes to whichever of them is waiting, `Ctrl-C` goes to all of them, and each
-        /// keeps its own discipline, so a password prompt that turns echo off on one leaves the
+        /// Each keeps its own discipline, so a password prompt turning echo off leaves the
         /// shell's echo alone. Returns `false`, adding nothing, if `of` does not exist.
         pub fn open_sibling(&mut self, ch: u64, of: u64) -> bool {
             let Some(backend) = self.ttys.iter().find(|t| t.ch == of).map(|t| t.backend) else {
@@ -483,9 +408,7 @@ pub mod routing {
 
         /// Drop terminal `ch` and return any backend channel that became unused.
         ///
-        /// The caller closes the returned handles. **Returned rather than closed here** for the
-        /// reason nothing in this module does I/O — and closing a backend channel is not
-        /// bookkeeping: it is what tells a terminal emulator its terminal is gone.
+        /// The caller closes it: that is what tells an emulator its terminal is gone.
         pub fn close_and_retire(&mut self, ch: u64) -> Vec<u64> {
             let Some(i) = self.ttys.iter().position(|t| t.ch == ch) else { return Vec::new() };
             let backend = self.ttys[i].backend;
@@ -496,13 +419,7 @@ pub mod routing {
             }
         }
 
-        /// Put terminal `ch` on the existing backend `id`.
-        ///
-        /// Nothing calls this outside tests: a terminal joins a backend by *attaching* one, or by
-        /// being opened as a sibling of a terminal already on it ([`open_sibling`]). It predates
-        /// the second, as the only way to reach the shared case in a test.
-        ///
-        /// [`open_sibling`]: Registry::open_sibling
+        /// Put terminal `ch` on the existing backend `id`; only tests call it.
         pub fn move_to(&mut self, ch: u64, id: u32) -> bool {
             if !self.backends.iter().any(|b| b.id == id) {
                 return false;
@@ -516,10 +433,7 @@ pub mod routing {
             }
         }
 
-        /// Every terminal on backend `id`, by channel.
-        ///
-        /// Collected rather than iterated, because the caller is about to close each one and
-        /// cannot hold a borrow of the registry while doing it.
+        /// Every terminal on backend `id`, collected so the caller can close each.
         pub fn ttys_on(&self, id: u32) -> Vec<u64> {
             self.ttys.iter().filter(|t| t.backend == id).map(|t| t.ch).collect()
         }
@@ -532,11 +446,8 @@ pub mod routing {
             self.drive(id)
         }
 
-        /// Deliver whatever backend `id` has queued to whichever of *its* terminals is waiting.
-        ///
-        /// Input that arrives with nobody waiting stays queued rather than being dropped —
-        /// typing ahead of a prompt is ordinary, and losing it would be a bug the user cannot
-        /// see.
+        /// Deliver backend `id`'s queue to whichever of *its* terminals is waiting; input with
+        /// nobody waiting stays queued, as typing ahead of a prompt must.
         pub fn drive(&mut self, id: u32) -> Vec<Act> {
             let mut acts = Vec::new();
             let Some(bi) = self.backends.iter().position(|b| b.id == id) else {
@@ -547,10 +458,8 @@ pub mod routing {
                 if self.backends[bi].pending.is_empty() {
                     return acts;
                 }
-                // **`Ctrl-C` is taken before anything else, and never queues.** It is an event
-                // about the terminal rather than input to it, so it is answered whether or not
-                // anybody is reading — which is the whole point, since during an evaluation
-                // nobody is.
+                // `Ctrl-C` is an event about the terminal, not input to it: it is taken first and
+                // never queues, so it is answered while nobody is reading.
                 if self.backends[bi].pending.front() == Some(&0x03) {
                     self.backends[bi].pending.pop_front();
                     self.interrupt(id, &mut acts);
@@ -560,11 +469,8 @@ pub mod routing {
                     return acts; // nobody on this backend is reading; hold the bytes
                 };
                 if let Some((rid, ReadKind::Raw)) = self.ttys[i].waiting {
-                    // **Stop at an interrupt.** A raw read takes everything available in one
-                    // go, which handed `Ctrl-C` to the client as an ordinary byte whenever it
-                    // arrived in the same chunk as the keystrokes before it — the front-of-queue
-                    // check above never saw it. Bytes typed *before* the interrupt are still
-                    // input; the interrupt itself is picked up on the next turn of this loop.
+                    // Stop at an interrupt, or one in the same chunk as earlier keystrokes would
+                    // reach the client as an ordinary byte. Bytes before it are still input.
                     let q = &mut self.backends[bi].pending;
                     let stop = q.iter().position(|&b| b == 0x03).unwrap_or(q.len());
                     let n = stop.min(RAW_CHUNK);
@@ -588,15 +494,14 @@ pub mod routing {
                         let (rid, _) = self.ttys[i].waiting.take().expect("waiting");
                         acts.push(Act::Reply { ch: self.ttys[i].ch, op: OP_READ_LINE, request_id: rid, body: bytes });
                     }
-                    // Canonical mode has no history to recall, so a cursor key is nothing here.
-                    // A client that wants them reads raw and runs the discipline itself.
+                    // Canonical mode has no history to recall; a client that wants cursor keys
+                    // reads raw.
                     Step::Key(k) => {
                         let _: Key = k;
                     }
                     Step::Eof => {
-                        // Ctrl-D at an empty prompt. Answered as an *error* rather than an empty
-                        // line, because those are different answers and a reader that conflated
-                        // them would either exit on a stray Enter or never exit at all.
+                        // Ctrl-D at an empty prompt is an *error*, not an empty line: a reader
+                        // must tell "nothing this time" from "nothing ever again".
                         acts.push(Act::Write(sink, alloc::vec![b'\r', b'\n']));
                         let (rid, _) = self.ttys[i].waiting.take().expect("waiting");
                         acts.push(Act::Fail {
@@ -610,22 +515,13 @@ pub mod routing {
             }
         }
 
-        /// Deliver an interrupt to every terminal on backend `id`.
-        ///
-        /// **On that backend and no other**, which is the correction Part C makes. The flat
-        /// version sent it to every terminal in the system and said so in a comment — "a session
-        /// has one, and a server that guessed which was *foreground* would be inventing a
-        /// concept this system does not have yet". Both halves of that were wrong: a session has
-        /// as many terminals as its programs resolve, and this is not a guess about which is
-        /// foreground — a backend is a *physical* grouping. Typing `Ctrl-C` in one window has no
-        /// business interrupting a program in another.
+        /// Deliver an interrupt to every terminal on backend `id` and no other: `Ctrl-C` in one
+        /// window must not interrupt a program in another.
         fn interrupt(&mut self, id: u32, acts: &mut Vec<Act>) {
             for t in self.ttys.iter_mut().filter(|t| t.backend == id) {
                 acts.push(Act::Reply { ch: t.ch, op: OP_INTERRUPT, request_id: 0, body: Vec::new() });
-                // **An outstanding read is completed, empty.** Otherwise a client sitting at a
-                // prompt stays blocked on a read whose byte just became an event, and could not
-                // redraw until the user typed something else. A raw read otherwise only ever
-                // completes with at least one byte, so an empty completion is unambiguous.
+                // An outstanding read completes empty (a raw read otherwise has at least one
+                // byte), or a client at a prompt could not redraw until another key.
                 match t.waiting.take() {
                     Some((rid, kind)) => {
                         let op = match kind {
@@ -643,27 +539,14 @@ pub mod routing {
 
         /// Point terminal `ch` at a new backend whose sink is the channel `handle`.
         ///
-        /// **The pty's shape.** A terminal emulator resolves `/dev/tty` like any program, gets a
-        /// terminal, and then says "this one's bytes come from and go to me" — handing the
-        /// server the master half. It then passes the terminal itself to the shell it hosts and
-        /// keeps only the backend, which is exactly the split Unix draws between the two ends of
-        /// a pty. One line discipline serves both, which is what
-        /// `console-and-tty.md` built the backend seam for.
+        /// The pty's shape: an emulator hands the server the master half and keeps only the
+        /// backend. Returns `(new backend id, any channel the caller must close)`, or `None`
+        /// if `ch` is not a terminal.
         ///
-        /// Returns `(new backend id, any channel the caller must close)`, or `None` if `ch` is
-        /// not a terminal.
-        ///
-        /// **A terminal may be re-pointed**, and the old backend is dropped if nothing else uses
-        /// it. Re-pointing while a read is outstanding keeps the read: it is the same terminal
-        /// and the same client, and failing the read would make attaching a backend a visible
-        /// hiccup for a program that never asked about backends.
-        ///
-        /// **The orphaned channel comes back to the caller**, for the same reason
-        /// [`close_and_retire`](Self::close_and_retire)'s does: closing it is not bookkeeping,
-        /// it is how the *previous* emulator learns its terminal has ended. A first version
-        /// dropped the `Backend` and returned nothing, so a second `AttachBackend` on one
-        /// terminal leaked a handle per re-point and left the old emulator waiting forever for
-        /// a `PeerClosed` that could not arrive (PR #194 review, finding 4).
+        /// A terminal may be re-pointed: the old backend is dropped if nothing else uses it and
+        /// an outstanding read is kept. Its channel comes back to the caller, because closing
+        /// it is how the previous emulator learns its terminal has ended; dropping it would
+        /// leak a handle and leave that emulator waiting for a `PeerClosed`.
         pub fn attach_backend(&mut self, ch: u64, handle: u64) -> Option<(u32, Option<u64>)> {
             let i = self.ttys.iter().position(|t| t.ch == ch)?;
             let old = self.ttys[i].backend;
@@ -674,11 +557,8 @@ pub mod routing {
             Some((id, self.retire(old)))
         }
 
-        /// Drop backend `id` if it is not the console and no terminal is left on it, returning
-        /// its channel for the caller to close.
-        ///
-        /// The console is never retired: it exists before anything can ask for it, and a
-        /// terminal opened with no backend named has to land somewhere.
+        /// Drop backend `id` unless it is the console or has a terminal left, returning its
+        /// channel for the caller to close.
         fn retire(&mut self, id: u32) -> Option<u64> {
             if id == CONSOLE || self.ttys.iter().any(|t| t.backend == id) {
                 return None;
@@ -713,16 +593,14 @@ pub mod routing {
             };
             let Some(i) = self.ttys.iter().position(|t| t.ch == ch) else { return Vec::new() };
             if self.ttys[i].waiting.is_some() {
-                // One outstanding read per terminal: two would race for the same input and there
-                // is no rule that says which should win.
+                // One outstanding read per terminal: two would race for the same input.
                 return alloc::vec![Act::Fail { ch, op, request_id, err: KError::WouldBlock.as_i32() }];
             }
             if self.ttys[i].interrupt_pending {
                 self.ttys[i].interrupt_pending = false;
                 return alloc::vec![Act::Reply { ch, op, request_id, body: Vec::new() }];
             }
-            // A partial line from a previous canonical read must not leak into a raw one, or the
-            // shell's first keystroke arrives with somebody else's prefix.
+            // A partial line from a canonical read must not leak into a raw one.
             if kind == ReadKind::Raw {
                 self.ttys[i].disc.reset();
             }
@@ -736,22 +614,18 @@ pub mod routing {
     const RAW_CHUNK: usize = 64;
 }
 
-/// **One-time tokens naming a terminal's backend** — `Tty::Token` and `Tty::Redeem` (laptop polish
-/// Part A).
+/// One-time tokens naming a terminal's backend — `Tty::Token` and `Tty::Redeem`.
 ///
-/// The view broker remembers a password per session, terminal and view, and has to learn the
-/// terminal from this server rather than from its caller: a channel the caller hands it could be
-/// one the caller serves itself, answering as any terminal it likes. So the caller asks its own
-/// terminal for a token, sends the token, and the broker redeems it here over a channel it opened
-/// itself. A token is 128 random bits, names one backend, and is good **once and briefly**.
+/// The view broker must learn a caller's terminal from this server, not the caller: a channel
+/// the caller hands it could be one the caller serves itself, answering as any terminal it
+/// likes. A token is 128 random bits, names one backend, and is good **once and briefly**.
 pub mod tokens {
     use alloc::vec::Vec;
 
     /// Bytes in a token: the wire's length, not a second one.
     pub const LEN: usize = librsproto::TTY_TOKEN_LEN;
 
-    /// How long a token lasts. `with` sends it at once and the broker redeems it on receipt, so
-    /// this only has to outlast a slow machine between the two — a TCG boot under load included.
+    /// How long a token lasts: enough for a slow machine (TCG under load) to redeem it.
     pub const TTL_NS: u64 = 30_000_000_000;
 
     /// Tokens kept at once. Each is redeemed or expires within [`TTL_NS`], so this bounds only a
@@ -770,19 +644,15 @@ pub mod tokens {
         live: Vec<Entry>,
     }
 
-    /// **A token from what `sys_entropy_read` answered** — `r`, and the buffer it was asked to fill
-    /// — or none.
-    ///
-    /// **Only `0` filled the buffer.** A positive answer is a `PendingOperation`: the pool is not
-    /// seeded, and the PO completing says only that it now is, writing nothing — the caller would
-    /// have to read again (PR #351 review). This server does not wait for that: its one serve
-    /// loop would hold every terminal still while it did, and a token that is not there costs its
-    /// requester a password prompt, which is safe. So a PO is no token, as an error is.
+    /// A token from what `sys_entropy_read` answered (`r`, and the buffer), or none. Only `0`
+    /// filled the buffer: a positive answer is a `PendingOperation` for an unseeded pool, which
+    /// completes without writing. The serve loop does not wait for it, and a missing token only
+    /// costs a password prompt.
     pub fn from_read(r: i64, buf: [u8; LEN]) -> Option<[u8; LEN]> {
         (r == 0).then_some(buf)
     }
 
-    /// Equal bytes, compared without stopping at the first difference.
+    /// Equal bytes, compared without stopping at the first difference (constant time).
     fn same(a: &[u8; LEN], b: &[u8]) -> bool {
         b.len() == LEN && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
     }
@@ -832,8 +702,7 @@ pub mod tokens {
             [n; LEN]
         }
 
-        /// **The buffer is a token only when the read filled it** — never after a
-        /// `PendingOperation`, which leaves it as it was: all zeros, a token anyone can name.
+        /// After a `PendingOperation` the buffer is all zeros, a token anyone can name.
         #[test]
         fn only_a_completed_read_is_a_token() {
             assert_eq!(from_read(0, token(9)), Some(token(9)));
@@ -865,7 +734,6 @@ pub mod tokens {
             assert_eq!(t.redeem(&token(1), T0), Some(7), "and the real one is still there");
         }
 
-        /// **Its expiry, and the nanosecond either side of it.**
         #[test]
         fn a_token_expires_at_its_ttl() {
             let mut t = Tokens::new();
@@ -959,7 +827,6 @@ mod routing_tests {
 
     #[test]
     fn input_typed_before_anyone_reads_is_kept_not_dropped() {
-        // Typing ahead of a prompt is ordinary, and losing it is a bug the user cannot see.
         let mut r = console_ttys(1);
         assert!(r.feed(CONSOLE, b"ahead\r").is_empty(), "nobody is reading yet");
         let acts = r.read(1, 5, ReadKind::Line);
@@ -968,9 +835,6 @@ mod routing_tests {
 
     #[test]
     fn input_from_one_backend_never_reaches_a_terminal_on_another() {
-        // **The Part C rule.** Two windows, or a window and the serial console: bytes typed at
-        // one must not be deliverable to a program in the other. Before this, one flat queue
-        // and one flat `Vec` meant the recipient was whichever terminal happened to be waiting.
         let mut r = console_ttys(2);
         let (other, _) = r.attach_backend(2, 0xBEEF).expect("terminal 2 exists");
         assert_ne!(other, CONSOLE);
@@ -988,9 +852,6 @@ mod routing_tests {
 
     #[test]
     fn an_interrupt_reaches_every_terminal_on_its_backend_and_no_others() {
-        // The other Part C rule. `Ctrl-C` in one window must not interrupt a program in
-        // another — the flat version broadcast to every terminal in the system and justified it
-        // with "a session has one", which was never true.
         let mut r = console_ttys(2);
         let (win, _) = r.attach_backend(2, 0xBEEF).expect("terminal 2 exists");
 
@@ -1005,9 +866,6 @@ mod routing_tests {
 
     #[test]
     fn an_interrupt_ends_an_outstanding_read_and_one_that_has_not_started() {
-        // Both halves, because they are different mechanisms: a waiting read completes empty,
-        // and a `Ctrl-C` between prompts has to end the *next* read rather than wait for a
-        // keystroke that may never come.
         let mut r = console_ttys(1);
         r.read(1, 3, ReadKind::Line);
         let acts = r.feed(CONSOLE, &[0x03]);
@@ -1030,8 +888,6 @@ mod routing_tests {
 
     #[test]
     fn a_terminals_output_goes_to_its_own_backend() {
-        // The write half of the same rule: a program in a window must not print on the serial
-        // console, which is what a single global `backend_write` did by construction.
         let mut r = console_ttys(2);
         r.attach_backend(2, 0xBEEF);
         assert_eq!(r.sink_of(1), Some(Sink::Console));
@@ -1044,8 +900,8 @@ mod routing_tests {
 
     #[test]
     fn an_echo_goes_to_the_backend_the_byte_came_from() {
-        // Echo is the subtle one: it is generated by the *discipline*, not by the client, so a
-        // version that echoed to a fixed sink would type a window's password on the console.
+        // The discipline generates echo, not the client; a fixed sink would show a window's
+        // password on the console.
         let mut r = console_ttys(1);
         let (win, _) = r.attach_backend(1, 0xF00D).expect("terminal 1 exists");
         r.read(1, 1, ReadKind::Line);
@@ -1056,8 +912,6 @@ mod routing_tests {
 
     #[test]
     fn a_second_read_on_one_terminal_is_refused_rather_than_queued() {
-        // Two outstanding reads would race for the same input and there is no rule saying
-        // which should win.
         let mut r = console_ttys(1);
         r.read(1, 1, ReadKind::Line);
         let acts = r.read(1, 2, ReadKind::Line);
@@ -1066,8 +920,6 @@ mod routing_tests {
 
     #[test]
     fn a_raw_read_stops_at_an_interrupt_in_the_same_chunk() {
-        // A raw read takes everything available in one go, which handed `Ctrl-C` to the client
-        // as an ordinary byte whenever it arrived in the same chunk as the keys before it.
         let mut r = console_ttys(1);
         r.read(1, 1, ReadKind::Raw);
         let acts = r.feed(CONSOLE, b"ab\x03cd");
@@ -1078,10 +930,8 @@ mod routing_tests {
 
     #[test]
     fn re_pointing_a_terminal_hands_back_the_backend_it_left() {
-        // Closing that channel is how the *previous* emulator learns its terminal has ended —
-        // `rsproto-tty-ops.md` § Lifetime — so a version that merely dropped the `Backend`
-        // leaked a handle per re-point and left that emulator waiting for a `PeerClosed` that
-        // could not arrive (PR #194 review, finding 4).
+        // Closing that channel is how the previous emulator learns its terminal has ended
+        // (`rsproto-tty-ops.md` § Lifetime).
         let mut r = console_ttys(1);
         let (_first, orphan) = r.attach_backend(1, 0xAAA).expect("terminal 1 exists");
         assert_eq!(orphan, None, "there was no channel backend before this one");
@@ -1098,8 +948,6 @@ mod routing_tests {
 
     #[test]
     fn a_backend_with_another_terminal_left_on_it_is_not_handed_back() {
-        // The other half of `retire`: two terminals on one backend, and closing the first must
-        // not close the channel the second is still using.
         let mut r = console_ttys(2);
         let (id, _) = r.attach_backend(1, 0xC0DE).expect("terminal 1 exists");
         r.move_to(2, id);
@@ -1119,8 +967,7 @@ mod routing_tests {
         assert_eq!(r.sink_of(3), Some(Sink::Console));
     }
 
-    /// A shell in a window (terminal 1 on backend `0xAB`) and a stage's sibling terminal (2), the
-    /// shape `Tty::OpenSibling` makes — administration Part A.2.
+    /// A shell in a window (terminal 1 on backend `0xAB`) and a stage's sibling terminal (2).
     fn shell_and_stage_in_a_window() -> (Registry, u32) {
         let mut r = console_ttys(1);
         let (win, _) = r.attach_backend(1, 0xAB).expect("terminal 1 exists");
@@ -1130,8 +977,6 @@ mod routing_tests {
 
     #[test]
     fn a_sibling_joins_its_terminals_window_not_the_console() {
-        // The point of the op: a stage's prompt has to appear in the window it was typed into.
-        // A terminal resolved from `/dev/tty` would land on the console instead.
         let (mut r, win) = shell_and_stage_in_a_window();
         assert_eq!(r.sink_of(2), Some(Sink::Channel(0xAB)));
         r.read(2, 7, ReadKind::Line);
@@ -1141,8 +986,6 @@ mod routing_tests {
 
     #[test]
     fn the_stage_that_is_reading_gets_the_input_while_the_shell_waits() {
-        // During a pipeline the shell reads nothing — it waits on its terminal only for an
-        // interrupt — so the stage's read is the one the bytes are for.
         let (mut r, win) = shell_and_stage_in_a_window();
         r.read(2, 3, ReadKind::Line);
         let acts = r.feed(win, b"yes\r");
@@ -1152,8 +995,6 @@ mod routing_tests {
 
     #[test]
     fn ctrl_c_reaches_the_shell_and_the_stage_alike() {
-        // The shell has to see it to stop the pipeline, and the stage has to see it so a prompt
-        // it is holding ends: one keystroke, both terminals.
         let (mut r, win) = shell_and_stage_in_a_window();
         let acts = r.feed(win, &[0x03]);
         assert_eq!(replies_to(&acts, 1), [(OP_TTY_INTERRUPT, Vec::new())], "the shell");
@@ -1162,8 +1003,6 @@ mod routing_tests {
 
     #[test]
     fn a_stages_echo_setting_is_its_own() {
-        // A password prompt turns echo off on the stage's terminal. The shell's must keep
-        // echoing afterwards, or the next command line is typed blind.
         let (mut r, win) = shell_and_stage_in_a_window();
         r.set_mode(2, 1, false);
         r.read(2, 2, ReadKind::Line);
@@ -1176,7 +1015,6 @@ mod routing_tests {
 
     #[test]
     fn closing_a_stages_terminal_leaves_the_shell_its_window() {
-        // A stage exits after every command; the window's backend has to outlive it.
         let (mut r, _) = shell_and_stage_in_a_window();
         // Without this the test passes vacuously for a sibling that never joined the window.
         assert_eq!(r.sink_of(2), Some(Sink::Channel(0xAB)), "precondition: the stage is on it");
@@ -1225,9 +1063,7 @@ mod tests {
         assert_eq!(echoed, "hello\r\n");
     }
 
-    /// The bug this server exists to make impossible: the newline is echoed **because the
-    /// user typed it**. Without it the cursor never leaves the line they typed on, so the
-    /// next prompt lands against their input — `alicepassword:`.
+    /// Without the echoed newline the next prompt lands against the input: `alicepassword:`.
     #[test]
     fn the_terminating_newline_is_echoed() {
         let mut d = Discipline::new();
@@ -1235,7 +1071,6 @@ mod tests {
         assert!(echoed.ends_with("\r\n"), "echo was {echoed:?}");
     }
 
-    /// CR and LF are the same key. Which one arrives is an accident of the terminal.
     #[test]
     fn cr_and_lf_both_end_a_line() {
         let mut d = Discipline::new();
@@ -1243,8 +1078,6 @@ mod tests {
         assert_eq!(drive(&mut d, "b\n").0, ["b"]);
     }
 
-    /// No-echo is the server's state, so a password cannot leak through a caller that forgot
-    /// to ask for it — which is what `read_line(..., echo: false)` depended on.
     #[test]
     fn no_echo_shows_nothing_at_all() {
         let mut d = Discipline::new();
@@ -1262,15 +1095,12 @@ mod tests {
         assert!(echoed.contains("\x08 \x08"));
     }
 
-    /// DEL and backspace are the same key by another name.
     #[test]
     fn del_erases_like_backspace() {
         let mut d = Discipline::new();
         assert_eq!(drive(&mut d, "abc\x7f\n").0, ["ab"]);
     }
 
-    /// Backspace at an empty prompt is something people do constantly; it must not erase
-    /// the prompt itself.
     #[test]
     fn backspace_at_an_empty_line_writes_nothing() {
         let mut d = Discipline::new();
@@ -1285,7 +1115,6 @@ mod tests {
         assert_eq!(lines, ["kept"]);
     }
 
-    /// Erasing must not show more than was displayed: in no-echo mode, nothing.
     #[test]
     fn killing_a_hidden_line_erases_nothing_on_screen() {
         let mut d = Discipline::new();
@@ -1301,8 +1130,6 @@ mod tests {
         assert_eq!(drive(&mut d, "one two   \x17\n").0, ["one "]);
     }
 
-    /// Refusing beats truncating: a silently shortened password is a wrong value that looks
-    /// like a right one.
     #[test]
     fn an_over_long_line_is_refused_not_truncated() {
         let mut d = Discipline::new();
@@ -1319,17 +1146,12 @@ mod tests {
         }
     }
 
-    /// A stray control byte must not become part of a command.
-    /// Ctrl-D at an empty prompt is end-of-input — the convention the shell's own banner
-    /// promises ("Ctrl-D or `exit` to leave").
     #[test]
     fn ctrl_d_at_an_empty_line_is_end_of_input() {
         let mut d = Discipline::new();
         assert_eq!(d.feed(0x04), Step::Eof);
     }
 
-    /// ...but not mid-line, where discarding what someone typed would be worse than
-    /// ignoring a key.
     #[test]
     fn ctrl_d_mid_line_does_nothing() {
         let mut d = Discipline::new();
@@ -1341,8 +1163,6 @@ mod tests {
         }
     }
 
-    /// End of input and an empty line are different answers: one means "nothing this
-    /// time", the other "nothing ever again".
     #[test]
     fn an_empty_line_is_not_end_of_input() {
         let mut d = Discipline::new();
@@ -1352,7 +1172,6 @@ mod tests {
         }
     }
 
-    /// Arrow keys are three bytes and must not appear in the line.
     #[test]
     fn cursor_keys_are_reported_not_typed() {
         let mut d = Discipline::new();
@@ -1368,8 +1187,6 @@ mod tests {
         }
     }
 
-    /// An unrecognised sequence is consumed to its end rather than leaking its bytes into
-    /// the line — the failure that would make a stray arrow key corrupt a command.
     #[test]
     fn an_unknown_escape_sequence_leaks_nothing() {
         let mut d = Discipline::new();
@@ -1382,13 +1199,9 @@ mod tests {
         panic!("no line produced");
     }
 
-    /// A bare ESC is a key with no meaning here, and must not swallow what follows.
+    /// `ESC x` is how a terminal sends Alt-x; the discipline does not act on it.
     #[test]
     fn a_bare_escape_consumes_exactly_two_bytes() {
-        // Renamed 2026-08-12: it was `a_bare_escape_does_not_eat_the_next_character`, which
-        // promises the opposite of what it asserts — the `x` *is* consumed. That is correct
-        // (`ESC x` is how a terminal sends Alt-x, and this discipline does not act on it), but
-        // a name that contradicts its assertion is worse than no name (PR #191 review).
         let mut d = Discipline::new();
         d.feed(0x1b);
         match d.feed(b'x') {
@@ -1404,8 +1217,7 @@ mod tests {
 
     #[test]
     fn a_parameterised_sequence_leaves_nothing_behind() {
-        // **The bug this state machine shipped with.** `ESC [ 3 ~` is Delete on every real
-        // terminal; ending the sequence at the `3` left the `~` to be typed and echoed.
+        // Ending `ESC [ 3 ~` at the `3` would leave the `~` to be typed and echoed.
         for seq in [
             &b"\x1b[3~"[..],   // Delete
             &b"\x1b[2~"[..],   // Insert
@@ -1428,8 +1240,6 @@ mod tests {
 
     #[test]
     fn the_arrows_still_arrive_after_the_widening() {
-        // The sequences this discipline *does* act on must survive a change made for the ones
-        // it does not.
         for (seq, key) in [(&b"\x1b[A"[..], Key::Up), (&b"\x1b[B"[..], Key::Down)] {
             let mut d = Discipline::new();
             let mut got = None;
@@ -1444,10 +1254,7 @@ mod tests {
 
     #[test]
     fn an_escape_inside_a_sequence_starts_a_new_one() {
-        // A program interrupted mid-sequence emits a fresh one, and the new `ESC` must not be
-        // read as the old sequence's payload. Added with the widening above — and it had no
-        // test until a break-test said so, which is the same gap `libterm::parse` had at the
-        // same place.
+        // A program interrupted mid-sequence emits a fresh one; its `ESC` is not payload.
         let mut d = Discipline::new();
         let mut got = None;
         for b in b"\x1b[1\x1b[Ahi" {
@@ -1461,20 +1268,15 @@ mod tests {
 
     #[test]
     fn a_malformed_csi_does_not_swallow_the_stream() {
-        // Staying in the CSI state on a byte that can appear in no sequence would make the
-        // terminal go silent from one corrupt byte onward.
         let mut d = Discipline::new();
         for b in b"\x1b[1\x7fZhi" {
             d.feed(*b);
         }
-        // `0x7f` can appear in no CSI, so the sequence is abandoned there — and `Z` is then
-        // ordinary text rather than the tail of something. That is the same answer
-        // `libterm::parse` gives, and the alternative is a terminal that goes silent from one
-        // corrupt byte onward.
+        // `0x7f` can appear in no CSI, so the sequence is abandoned there and `Z` is text,
+        // as in `libterm::parse`.
         assert_eq!(d.line(), b"Zhi");
     }
 
-    /// The redraw primitive: erase exactly what is displayed, then draw the new line.
     #[test]
     fn replacing_a_line_erases_what_was_shown() {
         let mut d = Discipline::new();
@@ -1484,7 +1286,6 @@ mod tests {
         assert_eq!(d.line(), b"xy");
     }
 
-    /// With nothing echoed there is nothing to erase, and nothing to draw.
     #[test]
     fn replacing_a_hidden_line_writes_nothing() {
         let mut d = Discipline::new();
@@ -1494,7 +1295,6 @@ mod tests {
         assert_eq!(d.line(), b"x", "the buffer still changed");
     }
 
-    /// A recalled line then behaves as if typed.
     #[test]
     fn a_replaced_line_can_be_edited_and_submitted() {
         let mut d = Discipline::new();
@@ -1512,7 +1312,6 @@ mod tests {
         assert_eq!(drive(&mut d, "a\x01\x02b\n").0, ["ab"]);
     }
 
-    /// A tty handed to a new reader must not carry half of somebody else's input.
     #[test]
     fn reset_discards_a_partial_line() {
         let mut d = Discipline::new();

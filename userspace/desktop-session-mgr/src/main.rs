@@ -1,20 +1,7 @@
-//! `desktop-session-mgr` — the graphical login supervisor.
+//! `desktop-session-mgr` — the graphical login supervisor, `session-mgr`'s twin.
 //!
-//! `session-mgr`'s twin. It runs the same sequence through the same `libsession` —
-//! authenticate, construct the namespace, spawn the leader, reap, tear down — and differs in
-//! exactly one place: its **greeter is a window**, not a terminal prompt. That is the split
-//! `graphical-session.md` §4 draws, and the reason `libsession` exists.
-//!
-//! **The greeter is a compositor client that exists before anyone has logged in**, which makes
-//! this the first process to hold a `/dev/draw` connection in a *release* image. Everything
-//! graphical before it was `selftest`-gated. It is closer to `gdm`'s `class=greeter` than to
-//! anything `session-mgr` does: it draws first and outlives every session it starts.
-//!
-//! **No `/dev/console` in a graphical session.** `libsession::NamespaceSpec::bind_console` is
-//! false here, and this is that flag's first caller — governing decision 3.
-//!
-//! `#![no_std]` + `#![no_main]`, with `alloc`: the same reasoning as `session-mgr`'s, plus a
-//! toolkit that builds an `Element` tree per frame.
+//! The same sequence through the same `libsession`, except that its greeter is a window. It
+//! draws first and outlives every session it starts. No `/dev/console` in a graphical session.
 
 #![no_std]
 #![no_main]
@@ -30,32 +17,22 @@ use libsession::{NamespaceSpec, authenticate, build_namespace, ns_lookup, spawn_
 use libsurface::Session;
 use libsurface::ipc::ChannelTransport;
 
-/// `alloc` backing: the toolkit builds an element tree per frame and `libsession` builds the
-/// session's environment record.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// How many buffers the greeter attaches.
 const BUFFERS: usize = 2;
 
-/// How many redraws to report before going quiet.
-///
-/// Generous: two login attempts at this demo's credential lengths is about seventy.
 const MAX_REDRAWS_LOGGED: u32 = 512;
 
-/// Redraws so far — see [`present`].
 static mut REDRAWS: u32 = 0;
 
-/// Write one line to the debug console.
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
-/// **A shutdown asked this supervisor to stop** (administration Part E.4c), and it has no session
-/// running: say so and exit, which `service-mgr` sees as its control channel closing. The greeter's
-/// window goes with the process. A session running when the request came is ended first, by
-/// `libsession::spawn_leader` passing it on.
+/// A shutdown asked this supervisor to stop with no session running: exit, which `service-mgr`
+/// sees as its control channel closing. A running session is ended first by `spawn_leader`.
 fn stop() -> ! {
     kprint(b"desktop-session-mgr: asked to stop, exiting\n");
     // SAFETY: terminating this process.
@@ -65,7 +42,6 @@ fn stop() -> ! {
     }
 }
 
-/// Report and exit. A greeter that cannot draw is not a degraded greeter.
 fn fail(msg: &[u8]) -> ! {
     kprint(msg);
     // SAFETY: terminating this process.
@@ -75,7 +51,6 @@ fn fail(msg: &[u8]) -> ! {
     }
 }
 
-/// Allocate a shared memory object of `len` bytes and map it writable.
 fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     // SAFETY: a plain anonymous object of `len` bytes.
     let h = unsafe { syscall4(SYS_MEMORY_CREATE, len as u64, 0, 0, 0) };
@@ -92,11 +67,8 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     Some((h as u64, base as usize as *mut u8))
 }
 
-/// Receive the next control message on `ctrl` and return its transferred `handles[0]`.
-///
-/// A handoff carries exactly one moved handle and no payload; `0` on failure. The same shape
-/// `session-mgr` uses, and positional for the same reason — `service-mgr` sends an empty
-/// message for an endpoint it does not have, so a missing one shortens no one's count.
+/// Receive the next control message's one moved handle; `0` on failure. Positional: `service-mgr`
+/// sends an empty message for an endpoint it does not have.
 fn recv_handoff(ctrl: u64) -> u64 {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
     let waited = unsafe {
@@ -123,17 +95,11 @@ fn recv_handoff(ctrl: u64) -> u64 {
     unsafe { if RECV_COUNT == 0 { 0 } else { RECV_HANDLES[0] } }
 }
 
-/// Buffers for the endpoint handoff.
 static mut RECV_MSG: [u8; 256] = [0; 256];
-/// See [`RECV_MSG`].
 static mut RECV_HANDLES: [u64; 8] = [0; 8];
-/// See [`RECV_MSG`].
 static mut RECV_COUNT: usize = 0;
 
-/// One attempt at a login: authenticate, build the session, run the leader, tear down.
-///
-/// Returns once the session has ended, so the greeter can draw again. `false` if the
-/// credentials were refused, which is the only outcome the greeter shows differently.
+/// One login attempt, run to the session's end. `false` if the credentials were refused.
 #[allow(clippy::too_many_arguments, reason = "the session's handles, one for each service it is given")]
 fn run_session(
     root_ns: u64,
@@ -158,17 +124,12 @@ fn run_session(
         return false;
     };
     Line::new().s(b"desktop-session-mgr: login ok -> home=").s(&home[..hl]).end();
-    // **A session with the view broker, before the namespace** — its base is part of what the
-    // namespace binds, here and in every application the shell launches. `None` builds the session
-    // without `/dev/views`.
+    // Before the namespace: the broker's base is part of what it binds.
     let mut views_base = [0u8; 24];
     let opened = if views_sup != 0 { libsession::views_open_session(views_sup, user, &mut views_base) } else { None };
     let base_len = opened.map_or(0, |v| v.1);
 
-    // **No `/dev/console` in a graphical session** — governing decision 3, and this is that
-    // flag's first caller since `libsession` gained it in Part B. Not "bound and unused": a
-    // binding a session holds is authority it has, and the console is shared with the serial
-    // column, which is the recovery path.
+    // No `/dev/console`: a binding is authority, and the console is the serial column's recovery path.
     let session_ns = build_namespace(&NamespaceSpec {
         root_ns,
         fs_endpoint: fs,
@@ -177,7 +138,6 @@ fn run_session(
         clipboard_endpoint: clipboard,
         home: &home[..hl],
         user,
-        // Its clients render text, and a constructed namespace has no font without this.
         bind_fonts: true,
         bind_console: false,
         views_endpoint: if opened.is_some() { views } else { 0 },
@@ -185,8 +145,7 @@ fn run_session(
         devices_endpoint: devices,
         storage_endpoint: storage,
         services_endpoint: services,
-        // A session lists its desktop entries. `/dev/draw` is bound whole below, for
-        // `desktop-shell` itself; `new` alone is an application's.
+        // `/dev/draw` is bound whole below, for `desktop-shell`; `new` alone is an application's.
         bind_applications: true,
         draw_endpoint: 0,
         desktop_endpoint: 0,
@@ -198,80 +157,49 @@ fn run_session(
         }
         return true;
     }
-    // **`/dev/draw`, bound as a subtree and unscoped**, so the shell resolves both `new` (a
-    // window of its own) and `manage` (the manager channel). That breadth is deliberate and is
-    // exactly what an *application's* namespace will not get: Part E binds `/dev/draw/new`
-    // alone into those, which is what closed the `manage-ungated` deferral — a narrow bind
-    // expresses
-    // "new and not manage" without any protocol change.
+    // Unscoped, so the shell resolves `manage` as well as `new`; applications get `new` alone.
     if draw != 0 {
         let path = b"/dev/draw";
         // SAFETY: valid namespace handle, path pointer and endpoint handle.
         let dr = unsafe { syscall4(SYS_NS_BIND, session_ns, path.as_ptr() as u64, path.len() as u64, draw) };
         if dr != 0 {
-            // Non-fatal: the session exists, the shell just cannot draw in it. Say so rather
-            // than failing a login the user completed.
             kprint(b"desktop-session-mgr: /dev/draw bind FAIL (the shell cannot draw)\n");
         } else {
             kprint(b"desktop-session-mgr: /dev/draw bound into the session\n");
         }
     }
-    // **Reported from what was bound, not from what was asked for.** This was a hardcoded
-    // "(no /dev/console)" and the gate's assertion on it passed with `bind_console: true` —
-    // decoration, found by running the control rather than by reading it.
+    // Reported from what was bound, not from what was asked for, so the gate's assertion can fail.
     if libsession::session_has_console() {
         kprint(b"desktop-session-mgr: session namespace built (WITH /dev/console)\n");
     } else {
         kprint(b"desktop-session-mgr: session namespace built (no /dev/console)\n");
     }
-    // Reported the same way and for the same reason — see `session_has_clipboard`.
     if libsession::session_has_clipboard() {
         kprint(b"desktop-session-mgr: session has /dev/clipboard\n");
     } else {
         kprint(b"desktop-session-mgr: session has NO /dev/clipboard\n");
     }
-    // And the view broker, the same way (administration Part A.4).
     if libsession::session_has_views() {
         kprint(b"desktop-session-mgr: session has /dev/views\n");
     } else {
         kprint(b"desktop-session-mgr: session has NO /dev/views\n");
     }
-    // And the device manager's tables (administration Part B.4).
     if libsession::session_has_devices() {
         kprint(b"desktop-session-mgr: session has /dev/devices\n");
     } else {
         kprint(b"desktop-session-mgr: session has NO /dev/devices\n");
     }
-    // And the storage service's filesystems and table (administration Part C.6).
     if libsession::session_has_storage() {
         kprint(b"desktop-session-mgr: session has /storage\n");
     } else {
         kprint(b"desktop-session-mgr: session has NO /storage\n");
     }
 
-    // `desktop-shell` is the leader here where `nxsh` is the serial column's. Part E makes it
-    // a real shell; what it has to be now is a process that proves the session runs.
-    // **`BIND_NAMESPACE`, and only the graphical leader gets it.** The shell constructs a
-    // namespace per application it launches; `nxsh` is handed one and constructs nothing.
-    // The compositor endpoint travels with it: the shell binds `/dev/draw/new` into every
-    // application namespace it builds, and a binding cannot be re-bound.
-    // **The endpoints, in the order the shell reads them.** It binds each into the namespaces it
-    // constructs per application — the compositor's so a window can be made, the fs-server's so
-    // text can be rendered, the tty server's so a terminal emulator can obtain a terminal, the
-    // profile server's so an application can spawn programs, the clipboard server's so copy and
-    // paste reach something, the view broker's so `with` works, and the device manager's so
-    // `/dev/devices` lists. Each is an *endpoint* rather than the session's binding of it,
-    // because a binding resolves to a kernel registration and never back to one.
-    // **The real home, as an argument.** The shell binds `/home` into every application
-    // namespace it constructs, and that bind needs the subtree base — which its own namespace
-    // cannot tell it, because there `/home` *is* the home and a binding does not resolve back
-    // to its base. Not authority: the fs endpoint above is the authority, and this only says
-    // which subtree of it an application should see (PR #238 review, finding 3).
+    // Endpoints are passed as endpoints, since a binding never resolves back to one. The home is
+    // an argument because the shell's own `/home` cannot tell it the base an application's bind
+    // needs; not authority, the fs endpoint is.
     let home_str = core::str::from_utf8(&home[..hl]).unwrap_or("");
-    // **The session's view base, as the second argument**, for the home's reason: the shell binds
-    // `/dev/views` into every application namespace, and that bind needs the base, which its own
-    // `/dev/views` cannot tell it. Not authority — the endpoint below is — only which session's.
-    // Empty when the broker gave no session, and the shell then binds nothing.
+    // The view base, for the home's reason; empty when the broker gave no session.
     let base_str = core::str::from_utf8(&views_base[..base_len]).unwrap_or("");
     let views_for_shell = if opened.is_some() { views } else { 0 };
     let code = spawn_leader(
@@ -280,76 +208,51 @@ fn run_session(
         notif,
         "desktop-shell",
         &[home_str, base_str],
+        // The graphical leader alone: it builds each application's namespace, and `nxsh` none.
         SYSCAP_BIND_NAMESPACE,
-        // **Nine now.** The fifth is the clipboard (M12 Part E), the sixth the view broker
-        // (administration Part A.4), the seventh the device manager (Part B.4), the eighth the
-        // storage service's session endpoint (Part C.6) and the ninth `service-mgr`'s services
-        // endpoint (Part E.2b); the shell binds each into every application namespace it
-        // constructs, for the same reason as the rest — a binding resolves to a kernel
-        // registration and never back to an endpoint.
+        // In the order the shell reads them: compositor, fs, tty, profile, clipboard, view broker,
+        // device manager, storage, services.
         &[draw, fs, tty, profile, clipboard, views_for_shell, devices, storage, services],
     );
-    // **Tell the broker the session ended**, as the serial column does.
     if let Some((id, _)) = opened {
         libsession::views_close_session(views_sup, id);
     }
-    // The leader has been reaped, so this drops the last reference to the namespace and with
-    // it every binding in it.
+    // The leader is reaped, so this drops the last reference to the namespace.
     // SAFETY: closing the namespace we created for this session.
     unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
     Line::new().s(b"desktop-session-mgr: session ended (leader exit ").i(code as i64).s(b")").end();
     true
 }
 
-/// Bootstrap registers, as `service-mgr`'s spawn fills them: `rdi` = the notification channel
-/// this supervisor reaps its session leader on, `rsi` = the inherited LOOKUP-only root
-/// namespace, `rdx` = the control channel the endpoints arrive over, `rcx` = `arg0` (unused).
+/// Bootstrap registers: `rdi` the notification channel the leader is reaped on, `rsi` the
+/// LOOKUP-only root namespace, `rdx` the control channel the endpoints arrive over, `rcx` unused.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"desktop-session-mgr: up\n");
 
-    // The endpoints, in `service-mgr`'s send order. Positional, like the serial column's. **All but
-    // the first two are `service-mgr`'s routes** (administration Part E.1b), not the servers' own
-    // endpoints, so a session bound before a server restarts still reaches it after.
+    // Endpoints in `service-mgr`'s send order; all but the first two are its routes.
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
     let tty_endpoint = recv_handoff(control);
-    // The compositor's forwarding endpoint — the one handoff the serial column does not get.
-    // `desktop-shell` needs `/dev/draw` **bound in the namespace it runs in**, not a
-    // connection handed to it: it resolves `manage` as well as `new`, and Part E gates
-    // applications by binding those two paths differently.
+    // The compositor's endpoint, which the serial column does not get: the shell needs `/dev/draw`
+    // bound in its namespace, since it resolves `manage` as well as `new`.
     let draw_endpoint = recv_handoff(control);
-    // The clipboard server's forwarding endpoint (M12 Part E) — the fifth, and the second
-    // that both columns take.
     let clipboard_endpoint = recv_handoff(control);
-    // The view broker's (administration Part A.4) — the sixth, and the third both columns take.
     let views_endpoint = recv_handoff(control);
-    // An info-only endpoint of the device manager's (administration Part B.4) — the seventh, and
-    // the fourth both take: bound at `/dev/devices` with the base `/info`, in the session and in
-    // every application. Info-only because the shell holds it with `BIND_NAMESPACE`.
+    // Info-only, because the shell holds it with `BIND_NAMESPACE`.
     let devices_endpoint = recv_handoff(control);
-    // **The storage service's session endpoint** (administration Part C.6) — the eighth, and the
-    // fifth both take. Bound at `/storage` and `/dev/storage` in every session and, through the
-    // shell, every application. `0` on a boot without the service. **Couriered since Part E.1b**:
-    // it was resolved here, which minted one that died with the service; `service-mgr` asks for it
-    // each time the service comes up, and this is the route to whichever is current.
+    // `0` on a boot without the storage service. Couriered rather than resolved here, because a
+    // resolved endpoint dies with the service.
     let storage_endpoint = recv_handoff(control);
-    // **`service-mgr`'s services endpoint** (administration Part E.2b) — the ninth, and the sixth
-    // both take: `/dev/services`, the table of services, in every session and application.
     let services_endpoint = recv_handoff(control);
-    // A supervisor channel to it, resolved once, as the serial column does: this process opens a
-    // session for each login and closes it when the shell exits.
     let views_sup = if views_endpoint != 0 {
         ns_lookup(root_ns, b"/svc/views/session", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT).1
     } else {
         0
     };
-    // The oracle, resolved rather than couriered — Part C. Once at startup: its lifetime is
-    // the machine's, and re-resolving per attempt would mint a session per keystroke.
+    // Resolved once at startup: re-resolving per attempt would mint a session per keystroke.
     let (auth_status, auth_ch) = ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if fs_endpoint == 0 || auth_status != 0 || auth_ch == 0 {
-        // A greeter that cannot authenticate is a window that wastes a screen. Say which half
-        // is missing — the two have completely different causes.
         if fs_endpoint == 0 {
             kprint(b"desktop-session-mgr: no fs endpoint; cannot build a session\n");
         } else {
@@ -358,8 +261,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         fail(b"desktop-session-mgr: no graphical login\n");
     }
 
-    // The font, before the window: a greeter that cannot draw text has nothing to show, and
-    // failing here reports the real cause rather than an empty window.
+    // The font before the window, so a missing one is reported as itself, not an empty window.
     let theme = greeter_theme();
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run
     let (font, _) = match unsafe { libdraw::text::load_ui(root_ns, &theme, b"desktop-session-mgr") } {
@@ -376,11 +278,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         Err(_) => fail(b"desktop-session-mgr: connect to /dev/draw FAILED\n"),
     };
     let mut session = Session::new(transport);
-    // **Where the greeter goes, from the screen it is on** (Phase 5 Part E). It centred on a
-    // written-down 1280×800 until then, which on the laptop's 1366×768 put it 43 px left of centre
-    // and 16 px low. **No size to fall back on**: a screen that cannot be read leaves the greeter
-    // asking for the origin and saying so, a visible wrong in a login that still works, rather
-    // than a number that is right on one machine.
+    // An unreadable screen leaves the greeter at the origin and says so, rather than guess a size.
     // SAFETY: `root_ns` is live for this process's whole run.
     let origin = match unsafe { libsurface::screen::read(root_ns) } {
         Ok(screen) => {
@@ -406,18 +304,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             (0, 0)
         }
     };
-    // **This window is created before every other client's**, wherever on the screen it lands.
-    // `service-mgr` brings the login chain up before it starts declared services, so the
-    // greeter is bottom-most and the reference windows `check-display` and `check-terminal`
-    // depend on stack above it. That is load-bearing rather than incidental: a greeter
-    // created *after* them would cover the regions those gates compare, and the failure would
-    // read as a compositing regression. The plan's Milestone 6 Part D says the same thing
-    // about `init`'s spawn order — "a stale comment asserting a retired invariant is what the
-    // last two milestones each shipped once".
+    // Created before every other client's window: the gates' reference windows stack above it.
     let mut greeter = Greeter::new();
     let len = GREETER_PITCH * GREETER_H as usize;
-    // **The mapped addresses are kept**, not dropped after attach: every keystroke redraws,
-    // so the greeter writes new pixels into whichever buffer the compositor has released.
     let mut addrs = [core::ptr::null_mut::<u8>(); BUFFERS];
     let mut window = match open_greeter(&mut session, &font, &greeter, &mut addrs, len, origin) {
         Some(id) => id,
@@ -432,16 +321,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         .u(GREETER_H as u64)
         .end();
 
-    // **The greeter loop.** Blocks on the event channel, never spins: a supervisor that spins
-    // keeps a run queue non-empty, the idle thread never runs, and deferred handle
-    // reclamation lives there — so every exited process on the system stops being reaped.
-    // That is the 2026-07-31 `logging-service` bug, and `session-mgr`'s park comment records
-    // the same thing.
+    // Blocks on the event channel, never spins: a spinning supervisor keeps the idle thread from
+    // running, and deferred handle reclamation lives there.
     let ev = session.wait_handle();
     loop {
-        // **The notification channel beside the compositor's** (administration Part E.4c): a
-        // shutdown's terminate request, at the greeter, ends this supervisor. It has no child
-        // between sessions, so nothing it needs is among the notifications read here.
+        // The notification channel is waited on too, so a shutdown ends the supervisor.
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers for two waiters.
         unsafe {
             WAIT_HANDLES[0] = ev;
@@ -461,9 +345,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 continue;
             }
             if let libsurface::WindowEvent::Key(k) = event {
-                // Presses only. A greeter that acted on releases would type every character
-                // twice, and the repeat the compositor sends is a press too — which is what
-                // makes holding backspace work without any code here.
+                // Presses only, or each character types twice; a held key's repeats are presses too.
                 if k.pressed == 0 {
                     continue;
                 }
@@ -484,19 +366,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             user[..ul].copy_from_slice(&greeter.user.text().as_bytes()[..ul]);
             pass[..pl].copy_from_slice(&greeter.password.text().as_bytes()[..pl]);
             greeter.reset();
-            // **The greeter's window goes away for the duration of the session.**
-            //
-            // `graphical-session.md` says the greeter *outlives* each session, and that is
-            // about the **process**, not the window: a login window left mapped sits at the
-            // origin underneath whatever the session draws, and the moment anything raises it
-            // it covers the shell's top bar — which is exactly what happened when a dropped
-            // PS/2 packet sent a click to (160, 112) instead of the bar, and every later click
-            // then landed on the greeter instead. Found by a negative control, not by
-            // reasoning (M7 Part E).
-            //
-            // Destroyed rather than hidden because the protocol has no "hide": a window is
-            // mapped or it does not exist, and recreating one is what M6 Part A's
-            // initial-configure handshake is already built for.
+            // The window is destroyed for the session, not hidden (the protocol has no "hide"):
+            // left mapped, it sits under the session and covers the shell's top bar once raised.
             if let Some(w) = session.window(window) {
                 let _ = w.destroy();
             }
@@ -520,26 +391,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // SAFETY: a local buffer this function owns; zeroed so a refused password does
             // not sit in this process's stack for the machine's lifetime.
             unsafe { core::ptr::write_volatile(&mut pass, [0u8; 128]) };
-            // **A shutdown ended this session** (administration Part E.4c): no greeter after it.
             if libsession::stop_asked() {
                 stop();
             }
-            // **Set before the window is drawn, not after.** `open_greeter` presents, and
-            // `view()` reads `denied` — so setting it afterwards drew a blank greeter and the
-            // refusal never appeared. The next keystroke clears `denied` before its own
-            // redraw, so the message was reachable only by pressing Tab, and the gate asserts
-            // the *kprint* rather than the rendering, so nothing caught it (PR #237 review,
-            // finding 4). `Greeter::view`'s own comment describes what that state is: a
-            // refusal a user cannot see is a login that appears to have done nothing.
+            // Before the window is drawn: `open_greeter` presents, and `view()` reads `denied`.
             greeter.denied = !ok;
-            // Back to a login window. A fresh one rather than a retained one, for the reason
-            // above — and its buffers with it, since the old window's are gone.
             match open_greeter(&mut session, &font, &greeter, &mut addrs, len, origin) {
                 Some(id) => {
                     window = id;
-                    // **Said, as the first one is** (administration Part F.2): a logout from the
-                    // desktop's power menu is the first thing to end a graphical session and
-                    // leave the machine running, and `check-logout` waits for this.
+                    // `check-logout` waits for this line after each logout.
                     Line::new().s(b"desktop-session-mgr: greeter presented again, window ").u(id as u64).end();
                 }
                 None => fail(b"desktop-session-mgr: could not draw the greeter again\n"),
@@ -552,11 +412,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     }
 }
 
-/// Create the greeter window at `origin`, attach fresh buffers, and present it. `None` if any
-/// step failed.
-///
-/// Called for the first login and again after every session, because the window is destroyed
-/// for the duration of one — see the call site for why.
+/// Create the greeter window at `origin`, attach fresh buffers and present it; `None` on failure.
 fn open_greeter(
     session: &mut Session<ChannelTransport>,
     font: &Font,
@@ -565,18 +421,8 @@ fn open_greeter(
     len: usize,
     origin: (i32, i32),
 ) -> Option<u32> {
-    // **Centred, and created before every other client's window.** `service-mgr` brings the login
-    // chain up before it starts declared services, so the greeter is bottom-most and the
-    // reference windows `check-display` and `check-terminal` depend on stack above it. That is
-    // load-bearing rather than incidental: a greeter created *after* them would cover the regions
-    // those gates compare, and the failure would read as a compositing regression.
-    //
-    // **The origin is the screen's centre**, read from `/dev/draw/screen` by the caller (Phase 5
-    // Part E); it was computed from a written-down 1280×800 from M11 Part E batch 8 until then.
-    //
-    // **It asks rather than being placed.** Nothing is managing windows yet — the shell that
-    // would is what this window exists to let somebody start — so a `normal` window's origin is
-    // its own request, honoured when the compositor gives up waiting for a manager.
+    // The window asks for its origin rather than being placed: nothing manages windows yet, so a
+    // `normal` window's request is honoured when the compositor stops waiting for a manager.
     let (x, y) = origin;
     let window = session.create(&CreateWindowRequest::at(GREETER_W, GREETER_H, Role::Normal, x, y), BUFFERS).ok()?;
     #[allow(clippy::needless_range_loop, reason = "the index also feeds arithmetic or a second array")]
@@ -610,8 +456,8 @@ fn present(
     let Some(mut w) = session.window(window) else {
         return false;
     };
-    // `acquire` blocks for a buffer the compositor is not displaying, which is what makes a
-    // redraw safe: writing into the committed one would tear the picture on screen.
+    // `acquire` blocks for a buffer the compositor is not displaying; writing the committed one
+    // would tear the picture.
     let Ok(slot) = w.acquire() else {
         return false;
     };
@@ -620,18 +466,9 @@ fn present(
     // distinct allocations, so they cannot overlap.
     unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
     let ok = w.commit(slot, (0, 0, GREETER_W, GREETER_H)).is_ok();
-    // **A redraw counter, and it is not decoration.** A greeter has no echo: what a person
-    // typed is on screen and nowhere else, so a harness driving it has nothing to pace
-    // against — and this window repaints 420×200 per keystroke, which is exactly the cost
-    // `check-terminal` types one character at a time to stay behind. This line is what the
-    // graphical login gate waits on between keystrokes.
-    //
-    // **A count, deliberately, and never the fields.** Reporting what was typed would put a
-    // password on the console; reporting its *length* would leak it more slowly. A monotonic
-    // count paces a harness, says "the greeter is still redrawing" to anyone debugging one
-    // that is not, and tells an observer nothing about the credential.
-    //
-    // Unconditional, like the compositor's press diagnostics, and capped for the same reason.
+    // A redraw counter paces the gate between keystrokes. It is a count, never the fields:
+    // reporting what was typed would put a password on the console, and its length would leak it
+    // more slowly. Capped like the compositor's press diagnostics.
     // SAFETY: single-threaded supervisor; one redraw at a time.
     unsafe {
         if REDRAWS < MAX_REDRAWS_LOGGED {
@@ -642,7 +479,6 @@ fn present(
     ok
 }
 
-/// Wait set for the greeter's event channel and, beside it, the notification channel.
 static mut WAIT_HANDLES: [u64; 2] = [0; 2];
 /// A 24-byte `IoResult` per waiter.
 static mut WAIT_RESULTS: [u8; 48] = [0; 48];

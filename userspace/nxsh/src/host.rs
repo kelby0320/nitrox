@@ -1,39 +1,11 @@
-//! The `Host` seam — everything the language does that touches the operating system.
+//! The `Host` seam: everything the language does that touches the operating system, so pipeline
+//! ordering, per-stage status and a crashed stage become ordinary tests against [`MockHost`].
 //!
-//! Milestone 3 Part C, and the structural bet the plan named: spawning a stage, wiring
-//! pipes, reading a script, writing diagnostics all sit behind this trait, exactly as the
-//! ext4 parser sits behind `BlockReader`.
-//!
-//! It is worth more here than there. An interpreter is mostly pure logic, and the parts
-//! that are *not* — pipeline ordering, per-stage status, what happens when a stage
-//! crashes — are precisely the parts hardest to provoke on real hardware and easiest to
-//! get subtly wrong. [`MockHost`] makes all of them ordinary host tests.
-//!
-//! ## Where the boundary is drawn
-//!
-//! [`Host::run`] takes a **run of consecutive external stages**, not one stage. That is
-//! deliberate: §1 says each stage is a concurrently-running process streaming to the next
-//! through a bounded IPC channel, so the pipes between them are the kernel's business and
-//! must not be serialised through the shell. The shell hands over a chain and gets back
-//! per-stage status plus whatever the last stage produced.
-//!
-//! Only the *final* output is captured into memory. Backpressure between stages is real —
-//! bounded channels, a slow consumer blocking its producer — and this interface preserves
-//! that by not touching the middle.
-//!
-//! ## A finding about the standard coreutils
-//!
-//! No coreutil reads `stdin`. That is not an oversight: §10a dissolved every classic
-//! *filter* — `grep`, `head`, `uniq`, `cat`, `find` — into generic operators, which run
-//! in-process (§5c). What remains external is sources (`list`, `date`, `whoami`) and
-//! mutations (`copy`, `move`, …).
-//!
-//! So with the standard set, a pipeline has **at most one external stage, always at the
-//! head**. §5c's "most of a typical pipeline costs exactly one process boundary" is
-//! stronger than it sounds: for the shipped programs it is *exactly* one. The N-stage
-//! machinery below is still right — a user's own programs chain freely — but the standard
-//! set cannot exercise it, which is why the in-guest demo borrows a pass-through role from
-//! `test-stage` and the ordering semantics are tested here against a mock.
+//! [`Host::run`] takes a run of consecutive external stages, not one: the stages are concurrent
+//! processes streaming through bounded IPC channels, which are the kernel's business and not
+//! serialised through the shell. Only the final output is captured. A standard pipeline has at most
+//! one external stage (§10a made every filter a generic operator); the N-stage machinery is for a
+//! user's own programs and is exercised against the mock.
 
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -50,7 +22,7 @@ pub struct StageSpec {
     pub argv: Vec<String>,
 }
 
-/// What one stage did — §1's `StageStatus`, verbatim.
+/// What one stage did (§1's `StageStatus`).
 #[derive(Clone, PartialEq, Debug)]
 pub struct StageStatus {
     pub command: String,
@@ -86,23 +58,15 @@ pub trait Host {
     /// Run `stages` as one connected pipeline, feeding `input` to the first stage's
     /// `stdin` and capturing the last stage's `stdout`.
     ///
-    /// `strict` selects §1's eager-abort behaviour: on the first stage failure the shell
-    /// terminates the remaining stages rather than letting them drain. It needs no new
-    /// mechanism — the shell holds a process handle for everything it spawned, so
-    /// "abort the rest" is an ordinary capability-mediated call on handles it already
-    /// owns, not signal delivery.
+    /// `strict` selects §1's eager-abort: on the first stage failure the shell terminates the
+    /// remaining stages through the process handles it already holds.
     ///
-    /// An `Err` is a failure to *run* the pipeline at all (a program that does not
-    /// resolve, a pipe that cannot be created). A stage that ran and failed is a
-    /// successful `Ok` with a non-zero [`StageStatus`] — the distinction matters, because
-    /// only the first is the shell's own fault.
-    /// `env` is handed to **every** stage in the chain, unchanged.
+    /// An `Err` is a failure to run the pipeline at all (a program that does not resolve, a
+    /// pipe that cannot be created). A stage that ran and failed is an `Ok` with a non-zero
+    /// [`StageStatus`]: only the first is the shell's own fault.
     ///
-    /// The shell does *not* pre-resolve a stage's paths: it passes the arguments as
-    /// written and passes the same `PWD`, so both sides resolve identically. Rewriting
-    /// them here would put the shell's reading of a relative path into a program that
-    /// might read it differently — which is the split-brain this whole slice exists to
-    /// prevent.
+    /// `env` goes to every stage unchanged. The shell does not pre-resolve a stage's paths: it
+    /// passes the arguments as written and the same `PWD`, so both sides resolve identically.
     fn run(
         &mut self,
         stages: &[StageSpec],
@@ -120,53 +84,28 @@ pub trait Host {
     /// Whether `path` resolves. Used by `cd` before it commits to a new `PWD`.
     fn exists(&mut self, path: &str) -> bool;
 
-    /// Diagnostics — §1's second error category. Bypasses the pipe entirely and goes to
-    /// the shell's own `stderr`, which is why it is a separate method and not something
-    /// threaded through a pipeline's value.
+    /// Diagnostics (§1's second error category): bypass the pipe and go to the shell's own
+    /// `stderr`.
     fn diag(&mut self, text: &str);
 
     /// Ordinary output: what `display` and the REPL's auto-display write to.
     fn out(&mut self, text: &str);
 
-    /// Whether what this host writes is going to a terminal that reads SGR.
-    ///
-    /// **The whole of "only when it has a terminal"** (desktop refresh, Part F). A shell with no
-    /// terminal is a script or a Tier-0 stage, and its output is bytes somebody will read as
-    /// text or feed to something else — an escape in it is corruption, not colour.
-    ///
-    /// **A default of `false`**, so a host that has not thought about it emits nothing: the same
-    /// shape as [`interrupted`](Self::interrupted), where "no terminal" means the question is
-    /// never asked of anyone.
+    /// Whether what this host writes goes to a terminal that reads SGR. A script or a Tier-0 stage
+    /// has none, and an escape in its output is corruption. Defaults to `false`.
     fn styled(&mut self) -> bool {
         false
     }
 
-    /// The external programs this shell could run by name, for completion (§11c).
-    ///
-    /// **On the trait rather than in the library**, because *where* programs come from is
-    /// the host's knowledge — `PROGRAM_DIRS` lives in the binary, beside the resolution
-    /// [`run`](Self::run) already does — and a library that listed `/bin` itself would be a
-    /// second answer to a question this trait already answers, free to disagree with the
-    /// first.
-    ///
-    /// A best-effort list: a host with nothing to say returns nothing, and completion then
-    /// offers the three categories it can always name. Never an error — a failed listing at
-    /// a prompt is a Tab that does less, not a shell that reports a problem.
+    /// The external programs this shell could run by name, for completion (§11c). Best-effort and
+    /// never an error: a failed listing is a Tab that does less.
     fn commands(&mut self) -> Vec<String> {
         Vec::new()
     }
 
-    /// What is directly under `dir`, each name with whether it is itself a directory.
-    ///
-    /// `dir` is absolute — the caller resolves against `PWD`, the way every other path the
-    /// shell uses for itself is resolved. Best-effort like [`commands`](Self::commands),
-    /// and for the same reason.
-    ///
-    /// **The union of the filesystem and the namespace**, which is what `list` shows and
-    /// therefore what completion must show: a mount point and a kernel-served directory are
-    /// both places you can `cd` into, and a Tab that could not see them would disagree with
-    /// the listing on screen. `libfs::list_dir` is that union and is what the real host
-    /// calls.
+    /// What is directly under `dir` (absolute), each name with whether it is a directory.
+    /// Best-effort like [`commands`](Self::commands); the real host calls `libfs::list_dir`, the
+    /// filesystem-and-namespace union `list` shows.
     fn list_dir(&mut self, dir: &str) -> Vec<(String, bool)> {
         let _ = dir;
         Vec::new()
@@ -174,36 +113,24 @@ pub trait Host {
 
     /// Has the terminal asked this evaluation to stop? (§11h)
     ///
-    /// Called at statement boundaries and between loop iterations, so it must be cheap —
-    /// the real implementation is a **non-blocking** receive on the tty channel, not a
-    /// syscall that can park. A default of `false` keeps every host that has no terminal
-    /// (a script, a test, a Tier-0 stage) out of the question entirely.
+    /// Called at statement boundaries and between loop iterations, so it must be cheap: the real
+    /// implementation is a non-blocking receive on the tty channel.
     ///
-    /// This is the whole of the interrupt mechanism inside the language: there is no
-    /// signal, no ambient flag, and nothing the evaluator polls for on its own. An
-    /// interrupt is data the *host* saw, asked for at points where stopping is safe.
-    ///
-    /// **Edge-triggered: an interrupt is reported once and consumed.** A level-triggered
-    /// answer would make cleanup impossible — the `catch` block handling the interrupt
-    /// runs statements, so it reaches this checkpoint too, and a host that kept saying
-    /// "yes" would interrupt the recovery as fast as it started. Consuming the event is
-    /// what makes `try { … } catch { … }` a usable response to `Ctrl-C` rather than a
-    /// second thing to be interrupted.
+    /// Edge-triggered: reported once and consumed. A level-triggered answer would interrupt a
+    /// `catch` block's recovery as fast as it started, so `try { … } catch { … }` would not answer
+    /// `Ctrl-C`.
     fn interrupted(&mut self) -> bool {
         false
     }
 
-    /// **Nanoseconds on a clock that only goes forward**, for `time` (Phase 6 Part H.2): the
-    /// kernel's monotonic clock. `None` from a host with no clock, and `time` then says so.
+    /// Nanoseconds on the kernel's monotonic clock, for `time`. `None` from a host with no clock.
     fn now_ns(&mut self) -> Option<u64> {
         None
     }
 }
 
-/// A host that cannot do anything, for evaluating pure expressions.
-///
-/// Used by [`crate::Interp::new`] so Part B's arithmetic still evaluates without an OS
-/// underneath it. Every method fails or discards rather than pretending.
+/// A host that cannot do anything, for evaluating pure expressions: every method fails or
+/// discards rather than pretending.
 #[derive(Default)]
 pub struct NullHost;
 
@@ -236,10 +163,6 @@ impl Host for NullHost {
 }
 
 /// A scripted host for tests: canned stage results, and a record of what was asked for.
-///
-/// This is what makes pipeline *semantics* testable without a kernel — stage ordering,
-/// status collection, the strict-abort rule, a crashed stage, an empty output. Every one
-/// of those is awkward to provoke on real hardware and trivial here.
 pub struct MockHost {
     /// Programs the mock knows: name → (exit status, stdout bytes).
     pub programs: Vec<(String, i32, Option<Vec<u8>>)>,
@@ -251,20 +174,14 @@ pub struct MockHost {
     pub dirs: Vec<String>,
     /// What each directory contains: absolute directory → (name, is a directory).
     ///
-    /// Separate from [`dirs`](Self::dirs), which answers "does this exist" and says nothing
-    /// about contents — a directory can exist and be empty, and a test of completion needs
-    /// to be able to say so.
+    /// Separate from [`dirs`](Self::dirs): a directory can exist and be empty.
     pub entries: Vec<(String, Vec<(String, bool)>)>,
     /// External program names, for completion.
     pub commands: Vec<String>,
-    /// What the host was asked to do, shared so a test can still read it after the
-    /// interpreter has taken ownership of the host.
+    /// What the host was asked to do, shared so a test can read it after the interpreter owns the
+    /// host.
     log: Rc<RefCell<MockLog>>,
     /// Report an interrupt once this many checkpoints have gone by (§11h).
-    ///
-    /// A counter rather than a flag because the property under test is *when* the
-    /// evaluator asks: an interrupt that only ever arrives before the first statement
-    /// would prove nothing about a loop.
     interrupt_after: Option<u32>,
     /// A clock for `time`: what it reads now, and how far each read moves it. `None`, no clock.
     clock_ns: Option<(u64, u64)>,
@@ -367,8 +284,6 @@ impl Host for MockHost {
 
     fn interrupted(&mut self) -> bool {
         match &mut self.interrupt_after {
-            // Consumed, not sticky — the contract the trait documents, and the behaviour
-            // the real host has for free because it *receives* a message.
             Some(0) => {
                 self.interrupt_after = None;
                 true
@@ -406,8 +321,8 @@ impl Host for MockHost {
         let mut aborted = false;
         for (i, s) in stages.iter().enumerate() {
             if aborted {
-                // §1: `strict` terminates the *remaining* stages. They ran no code, so
-                // they are `cancelled`, not failed — a distinction a report should keep.
+                // §1: `strict` terminates the remaining stages; they ran no code, so they are
+                // `cancelled`, not failed.
                 statuses.push(StageStatus {
                     command: s.program.clone(),
                     exit_status: 0,

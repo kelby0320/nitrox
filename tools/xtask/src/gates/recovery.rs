@@ -2,39 +2,27 @@
 
 use crate::*;
 
-/// The password `check-recovery` resets `alice`'s to, on the installed disk — a fixture like
-/// `DEMO_PASSWORD`, for a disk the gate made and throws away.
+/// The password `check-recovery` resets `alice`'s to: a fixture, like `DEMO_PASSWORD`, on a disk
+/// the gate makes and throws away.
 const RECOVERED_PASSWORD: &str = "alice after recovery";
 
-/// `cargo xtask check-recovery` — **a forgotten password, reset from the live image**
-/// (administration Part D.5), on demand like `check-install`: two boots and a disk image.
+/// `cargo xtask check-recovery` — a forgotten password, reset from the live image, on demand like
+/// `check-install`: two boots and a disk image.
 ///
-/// Recovery is the one account path nobody exercises until they need it, and then there is no
-/// administrator to ask: the person has forgotten the password `with admin` wants. So the gate is
-/// the path a person takes on the laptop, with no view and no service writing the file.
-///
-/// **The first boot** is the live image as a USB stick beside **a copy of the release disk**,
-/// its root marked not cleanly unmounted as an installed machine's is. On the serial console,
-/// logged in as the live image's own `alice`:
-/// - the disk's `nitrox-root` is auto-mounted read-only; `with admin disk` unmounts it and mounts
-///   it writable — the live image's `alice` is its administrator, not the installed one's;
-/// - `account --password alice --users /storage/nitrox-root/system/users` sets a new password in
-///   **that disk's** file, typed twice;
-/// - `with admin disk --unmount` leaves it clean;
-/// - and the live system's own `alice` still logs in with the old password: the file edited was
-///   the disk's, not the running system's, which no session can reach.
-///
-/// **Between the boots, on the host**: the filesystem carved out of the disk is clean, and its
-/// `/system/users` differs from what the release disk shipped **in `alice`'s line alone**.
-///
-/// **The second boot** is that disk alone, with no stick: the old password is refused at the
-/// login, and the new one taken. And neither boot printed either password.
+/// The path a person takes on the laptop, with no view and no service writing the file. The first
+/// boot is the live image as a USB stick beside a copy of the release disk, its root marked not
+/// cleanly unmounted. On serial, as the live `alice` (administrator of the live system, not the
+/// installed one): `with admin disk` mounts the disk's `nitrox-root` writable; `account --password
+/// alice --users /storage/nitrox-root/system/users` sets a new password in that disk's file; `with
+/// admin disk --unmount` leaves it clean; and the live `alice` still logs in with the old password.
+/// Between the boots the host checks the filesystem is clean and that `/system/users` differs from
+/// the shipped one in `alice`'s line alone. The second boot is that disk alone: the old password is
+/// refused, the new one taken. Neither boot printed either.
 pub(crate) fn cmd_check_recovery(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     require_tool("e2fsck")?;
     require_tool("debugfs")?;
-    // **A copy of the release disk, made fresh**, so a run cannot pass on what an earlier one
-    // wrote.
+    // A copy of the release disk, made fresh, so a run cannot pass on what an earlier one wrote.
     cmd_image(BuildMode::Normal)?;
     let work = build_cache().join("check-recovery");
     fs::create_dir_all(&work)?;
@@ -135,12 +123,9 @@ fn await_serial_login(s: &mut Session) -> R<()> {
     Ok(())
 }
 
-/// The live boot: the disk's root made writable, `alice`'s password set in its file, and unmounted.
 fn run_recovery_steps(s: &mut Session) -> R<()> {
     let users = format!("/storage/{ROOT_PARTLABEL}/system/users");
 
-    // 1. **The disk's root, auto-mounted read-only**, the boot being a live one; its name is read
-    //    off the line the storage service reports it on.
     let reported = format!("(partition {ROOT_PARTLABEL}): ext4");
     s.expect(&reported)?;
     let line = s.matched_line()?;
@@ -155,14 +140,12 @@ fn run_recovery_steps(s: &mut Session) -> R<()> {
     }
     println!("  ok: {name}, the disk's {ROOT_PARTLABEL}, auto-mounted read-only on a live boot");
 
-    // 2. The live image's `alice`, on the serial column.
     await_serial_login(s)?;
     s.send(DEMO_USER)?;
     s.expect("password:")?;
     s.send(DEMO_PASSWORD)?;
     s.expect("/home>")?;
 
-    // 3. **Writable**, through the live image's own administrator.
     let admin = |s: &mut Session, command: &str| -> R<()> { with_admin_asked(s, command) };
     admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
     s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
@@ -173,7 +156,6 @@ fn run_recovery_steps(s: &mut Session) -> R<()> {
     s.expect("/home>")?;
     println!("  ok: `with admin disk` unmounted it and mounted it writable");
 
-    // 4. **The reset**: no view and no service — `libusers` on the disk's file.
     s.send(&format!("account --password alice --users {users}"))?;
     s.expect("new password for alice: ")?;
     s.send(RECOVERED_PASSWORD)?;
@@ -183,7 +165,6 @@ fn run_recovery_steps(s: &mut Session) -> R<()> {
     s.expect("/home>")?;
     println!("  ok: account --password alice --users set it in the disk's file");
 
-    // 5. Unmounted, and left clean.
     admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
     s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, left clean"))?;
     s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
@@ -226,7 +207,7 @@ fn check_recovered_users(shipped: &[u8], now: &[u8]) -> R<()> {
     if !alice.verifies(RECOVERED_PASSWORD.as_bytes()) || alice.verifies(DEMO_PASSWORD.as_bytes()) {
         return Err("alice's new record does not take the recovered password, or still takes the old one".into());
     }
-    // **Under a fresh salt**: a whole one, from the entropy source, and not the build's.
+    // Under a fresh salt, a whole one from the entropy source, not the build's.
     let salt_of = |file: &[u8]| {
         let mut out = [0u8; libusers::SALT_MAX];
         let n = libusers::find(file, DEMO_USER.as_bytes()).and_then(|r| r.salt(&mut out)).unwrap_or(0);
@@ -246,7 +227,6 @@ fn check_recovered_users(shipped: &[u8], now: &[u8]) -> R<()> {
     Ok(())
 }
 
-/// The disk alone: the old password refused at the login, and the new one taken.
 fn run_recovered_boot_steps(s: &mut Session) -> R<()> {
     s.expect(&format!("init:   /: fs-server-ext4 on gpt-partlabel:{ROOT_PARTLABEL} (rw)"))?;
     await_serial_login(s)?;

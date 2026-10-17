@@ -1,17 +1,6 @@
 #![no_std]
 
 //! Calendar arithmetic, and parsing a time or a duration — the pure half of `date` and `sleep`.
-//!
-//! Both utilities are mostly *not* about syscalls: `date` reads one clock and then does
-//! calendar arithmetic, and `sleep` arms one timer and then does string parsing. Those
-//! two pieces are where the bugs live, and they are the parts that need no kernel at all
-//! — so they live here, in the library, and are tested on the host.
-//!
-//! There is no `std`, so the civil-from-days conversion is hand-rolled. It is Howard
-//! Hinnant's algorithm (the one behind `<chrono>`), chosen because it is branch-free over
-//! the leap rules rather than a chain of special cases — the century rules that make 1900
-//! and 2100 common years while 2000 is a leap year fall out of the era arithmetic instead
-//! of being written down and then got wrong.
 
 extern crate alloc;
 
@@ -20,6 +9,7 @@ use alloc::string::String;
 /// A civil date and time, UTC. What [`civil_from_unix`] decomposes an instant into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Civil {
+    /// Astronomical year number; may be zero or negative.
     pub year: i64,
     /// 1-12.
     pub month: u32,
@@ -29,27 +19,25 @@ pub struct Civil {
     pub hour: u32,
     /// 0-59.
     pub minute: u32,
-    /// 0-59. Leap seconds do not exist here: the clock is a count of SI seconds since
-    /// the epoch, so this never reads 60.
+    /// 0-59; never 60, as the clock counts SI seconds.
     pub second: u32,
 }
 
-/// Days since 1970-01-01 → the civil date, proleptic Gregorian.
-///
-/// Hinnant's `civil_from_days`, shifted to an era beginning 0000-03-01 so that the leap
-/// day lands at the *end* of a year and the month-length pattern becomes regular. `days`
-/// may be negative (dates before the epoch).
+/// Days since 1970-01-01 → the civil date `(year, month, day)`, proleptic Gregorian; `days` may
+/// be negative.
+/// Howard Hinnant's `civil_from_days`, shifted to an era starting 0000-03-01 so the leap day
+/// ends a year.
 pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     // Shift the epoch from 1970-01-01 to 0000-03-01.
     let z = days + 719_468;
     // An era is 400 years = 146_097 days, the Gregorian repeat period.
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // day of era, [0, 146_096]
-    // Year of era, [0, 399]. The three correction terms are the 4/100/400 leap rules.
+    // Year of era, [0, 399]; the three correction terms are the 4/100/400 leap rules.
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year, [0, 365]
-    // Month of the shifted year, [0, 11], from the regular 153-day 5-month pattern.
+    // Month of the shifted year, [0, 11], from the regular 153-day, 5-month pattern.
     let mp = (5 * doy + 2) / 153;
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
     let m = (mp + if mp < 10 { 3 } else { -9 }) as u32; // [1, 12]
@@ -57,11 +45,9 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y + i64::from(m <= 2), m, d)
 }
 
-/// The civil date → days since 1970-01-01, proleptic Gregorian: [`civil_from_days`]'s inverse
-/// (administration Part E.5, for `date --set`).
-///
-/// Hinnant's `days_from_civil`, over the same March-based era. `month` must be 1-12 and `day` a
-/// day of it; [`parse_utc`] checks that by converting back.
+/// The civil date → days since 1970-01-01, proleptic Gregorian: [`civil_from_days`]'s inverse.
+/// Hinnant's `days_from_civil`. `month` must be 1-12 and `day` a day of it; [`parse_utc`]
+/// checks that by converting back.
 pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     // January and February belong to the previous March-based year.
     let y = if month <= 2 { year - 1 } else { year };
@@ -73,14 +59,10 @@ pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// **A time in UTC, as `date --set` takes it**: `YYYY-MM-DDTHH:MM:SSZ` exactly, as
-/// `2026-09-28T14:30:00Z` — seconds since the Unix epoch, or `None` (administration Part E.5).
-///
-/// **Only that form**, because it is the one a person can read without asking which field is
-/// which, and because anything looser invites a guess: no offset but `Z`, since there is no
-/// timezone database to apply one with; no fraction; no leap second. A date that does not exist —
-/// the 30th of February, the 29th in a common year — is refused rather than rolled into the next
-/// month, by converting the date back and comparing.
+/// Parse `YYYY-MM-DDTHH:MM:SSZ` exactly (`2026-09-28T14:30:00Z`) into seconds since the Unix epoch.
+/// No offset but `Z` (no timezone database), no fraction, no leap second. A date that does not
+/// exist, such as 30 February, is refused rather than rolled over, by converting back and
+/// comparing.
 pub fn parse_utc(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     let punctuation = [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':'), (19, b'Z')];
@@ -107,9 +89,7 @@ pub fn parse_utc(s: &str) -> Option<i64> {
 /// Decompose nanoseconds since the Unix epoch into a UTC civil date and time.
 pub fn civil_from_unix(unix_nanos: u64) -> Civil {
     let secs = (unix_nanos / 1_000_000_000) as i64;
-    // Floor-divide, so a pre-epoch instant lands on the right day rather than truncating
-    // toward zero. (`secs` is non-negative for any clock this kernel can produce, but the
-    // arithmetic should not quietly depend on that.)
+    // Floor-divide, so a pre-epoch instant lands on its own day rather than truncating toward zero.
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400); // second of day, [0, 86_399]
     let (year, month, day) = civil_from_days(days);
@@ -154,20 +134,13 @@ fn push_pad(out: &mut String, v: u64, width: usize) {
     }
 }
 
-/// Parse a duration into **nanoseconds**.
-///
-/// Accepts a decimal number with an optional unit suffix: bare (seconds), `ns`, `us`,
-/// `ms`, `s`, `m`, `h`. A fractional part is exact — the digits are scaled as integers
-/// rather than going through a float, so `0.1s` is exactly 100 ms and not a value that
-/// depends on binary rounding.
-///
-/// Returns `None` for anything malformed, including an empty string, a lone `.`, an
-/// unknown suffix, or a value that would overflow.
+/// Parse a duration into **nanoseconds**: a decimal number with an optional unit suffix (bare is
+/// seconds; `ns`, `us`, `ms`, `s`, `m`, `h`). Fractions are scaled as integers, so `0.1s` is exact.
+/// Returns `None` for anything malformed or that overflows.
 pub fn parse_duration(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     let mut i = 0;
 
-    // Integer part.
     let start = i;
     let mut int_part: u64 = 0;
     while i < b.len() && b[i].is_ascii_digit() {
@@ -176,8 +149,7 @@ pub fn parse_duration(s: &str) -> Option<u64> {
     }
     let had_int = i > start;
 
-    // Fractional part: keep 9 digits (nanosecond resolution), ignore the rest rather than
-    // rejecting — trailing precision a nanosecond clock cannot express is not an error.
+    // Keep 9 digits; a nanosecond clock cannot express more, and that is not an error.
     let mut frac: u64 = 0;
     let mut frac_digits = 0u32;
     let mut had_frac = false;
@@ -210,7 +182,6 @@ pub fn parse_duration(s: &str) -> Option<u64> {
     if frac_digits == 0 {
         return Some(whole);
     }
-    // frac / 10^frac_digits of a unit, computed as integers.
     let mut scale = 1u64;
     for _ in 0..frac_digits {
         scale = scale.checked_mul(10)?;
@@ -223,25 +194,18 @@ pub fn parse_duration(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// The dates worth pinning are the ones the leap rules disagree about.
     #[test]
     fn civil_from_days_handles_the_century_rules() {
-        // The epoch itself.
         assert_eq!(civil_from_days(0), (1970, 1, 1));
-        // 2000 is a leap year (divisible by 400), so 2000-02-29 exists.
         assert_eq!(civil_from_days(11016), (2000, 2, 29));
-        // 2100 is **not** (divisible by 100, not by 400) — the case a hand-written
-        // leap rule usually gets wrong. 2100-02-28 is followed by 2100-03-01.
+        // 2100 is not a leap year (divisible by 100, not 400): the case hand-written rules get wrong.
         assert_eq!(civil_from_days(47540), (2100, 2, 28));
         assert_eq!(civil_from_days(47541), (2100, 3, 1));
-        // An ordinary leap year.
         assert_eq!(civil_from_days(19782), (2024, 2, 29));
         // Before the epoch: the era arithmetic must floor, not truncate.
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
     }
 
-    /// `days_from_civil` inverts `civil_from_days`, day by day across four centuries around the
-    /// epoch.
     #[test]
     fn days_from_civil_inverts_civil_from_days() {
         for days in -200 * 365..300 * 365 {
@@ -253,8 +217,6 @@ mod tests {
         assert_eq!(days_from_civil(2100, 3, 1), 47541);
     }
 
-    /// **The one form `date --set` takes**, and the instants it names — cross-checked with
-    /// `date -u -d '…' +%s`.
     #[test]
     fn parse_utc_reads_the_documented_form() {
         assert_eq!(parse_utc("2026-09-28T14:30:00Z"), Some(1_790_605_800));
@@ -262,13 +224,11 @@ mod tests {
         assert_eq!(parse_utc("2000-02-29T23:59:59Z"), Some(951_868_799));
         assert_eq!(parse_utc("2031-01-02T00:00:00Z"), Some(1_925_078_400));
         assert_eq!(parse_utc("2099-12-31T23:59:59Z"), Some(4_102_444_799));
-        // And what it reads, `civil_from_unix` writes back.
         let c = civil_from_unix(1_790_605_800 * 1_000_000_000);
         assert_eq!(format_civil(&c), "2026-09-28 14:30:00");
     }
 
-    /// **Anything else is refused**, including a date that does not exist — each field at the
-    /// value past its last.
+    /// Anything else is refused, including dates that do not exist.
     #[test]
     fn parse_utc_refuses_everything_else() {
         for bad in [
@@ -293,7 +253,6 @@ mod tests {
         ] {
             assert_eq!(parse_utc(bad), None, "{bad:?}");
         }
-        // Their neighbours are taken.
         assert!(parse_utc("2026-09-30T23:59:59Z").is_some());
         assert!(parse_utc("2024-02-29T00:00:00Z").is_some());
         assert!(parse_utc("2000-02-29T00:00:00Z").is_some());
@@ -305,12 +264,10 @@ mod tests {
         assert_eq!((c.year, c.month, c.day), (1970, 1, 1));
         assert_eq!((c.hour, c.minute, c.second), (0, 0, 0));
 
-        // 2024-02-29T13:45:07Z
         let c = civil_from_unix(1_709_214_307 * 1_000_000_000);
         assert_eq!((c.year, c.month, c.day), (2024, 2, 29));
         assert_eq!((c.hour, c.minute, c.second), (13, 45, 7));
 
-        // Sub-second input must not disturb the second.
         let c = civil_from_unix(1_709_214_307 * 1_000_000_000 + 999_999_999);
         assert_eq!(c.second, 7);
     }
@@ -319,7 +276,6 @@ mod tests {
     fn format_civil_zero_pads_every_field() {
         let c = civil_from_unix(1_709_214_307 * 1_000_000_000);
         assert_eq!(format_civil(&c), "2024-02-29 13:45:07");
-        // Single-digit month/day/time must pad, which is the whole point of the helper.
         let c = civil_from_unix(1_000_000_000); // 1970-01-01T00:00:01Z
         assert_eq!(format_civil(&c), "1970-01-01 00:00:01");
     }
@@ -335,14 +291,12 @@ mod tests {
         assert_eq!(parse_duration("1h"), Some(3_600_000_000_000));
     }
 
-    /// Fractions are scaled as integers, so these are exact rather than nearly-right.
     #[test]
     fn parse_duration_fractions_are_exact() {
         assert_eq!(parse_duration("1.5s"), Some(1_500_000_000));
         assert_eq!(parse_duration("0.1s"), Some(100_000_000));
         assert_eq!(parse_duration("0.5m"), Some(30_000_000_000));
         assert_eq!(parse_duration(".25s"), Some(250_000_000));
-        // More precision than a nanosecond clock can hold is truncated, not rejected.
         assert_eq!(parse_duration("0.1234567891s"), Some(123_456_789));
     }
 
@@ -355,7 +309,6 @@ mod tests {
         assert_eq!(parse_duration("5 s"), None);
         assert_eq!(parse_duration("-5"), None);
         assert_eq!(parse_duration("99999999999999999999"), None);
-        // A unit that would overflow the multiply.
         assert_eq!(parse_duration("99999999999h"), None);
     }
 }

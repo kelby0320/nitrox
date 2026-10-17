@@ -1,25 +1,14 @@
 //! Generic value operators — §3's third command category, §10b's additions.
 //!
-//! Milestone 3 Part D. These are the operators that "do generic dispatch over `Value`'s
-//! structural shape" (§5c): `filter` works on whatever fields showed up, `sort` orders by
-//! a column it has never heard of, `save` serialises a schema it did not know at build
-//! time.
+//! These "do generic dispatch over `Value`'s structural shape" (§5c): `filter` works on whatever
+//! fields showed up, `sort` orders by a column it has never heard of. That is why they cannot be
+//! external programs: they walk a schema that arrives at runtime, and a closure argument cannot
+//! cross a process boundary. They run in-process on the `Value` tree.
 //!
-//! That genericity is exactly why they **cannot** be external programs. An external
-//! program defines its own fixed schema; these have to walk one that arrives at runtime,
-//! and a closure argument could not cross a process boundary at all (§5c). So they run
-//! in-process on the `Value` tree — which is also why the dense middle of a pipeline costs
-//! no spawns.
-//!
-//! ## Rows, generically
-//!
-//! Everything here goes through [`rows`] and [`rebuild`]. A `Table` yields one `Record`
-//! per row and rebuilds as a `Table` with its schema preserved; a `List` yields its
-//! elements and rebuilds as a `List`; a `String` yields its characters and rebuilds as a
-//! `String`; a `Range` yields its values. Operators therefore never mention which they
-//! were handed, which is the whole point — and a scalar is an error rather than a
-//! one-element sequence, because silently treating `5` as `[5]` is the kind of coercion
-//! §6 spends its fail-loud rule on.
+//! Everything goes through [`rows`] and [`rebuild`]: a `Table` yields one `Record` per row and
+//! rebuilds as a `Table`, a `List` its elements, a `String` its characters, a `Range` its values.
+//! A scalar is an error, not a one-element sequence: that is the coercion §6's fail-loud rule
+//! refuses.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -32,17 +21,12 @@ use crate::value::{Val, render_i64};
 /// An operator failure. Plain strings: the evaluator wraps them.
 pub type OpResult<T> = Result<T, String>;
 
-/// How many values a `Range` will materialise into before an operator refuses it.
-///
-/// The same backstop `for` applies to a range it walks: a range is a *language* value with
-/// no storage behind it, so turning one into rows is where an absurd one has to be caught.
+/// How many values a `Range` will materialise into before an operator refuses it: the same
+/// backstop `for` applies, since a range has no storage behind it.
 pub const MAX_RANGE_ROWS: i64 = 10_000_000;
 
-/// Decompose a value into rows, generically.
-///
-/// A `Table` gives one `Record` per row — which is what makes `filter name == "x"` work on
-/// a stream without the operator knowing the schema. A `List` gives its elements, a
-/// `String` its characters, and a `Range` its values (§10b).
+/// Decompose a value into rows, generically: a `Table` gives one `Record` per row, a `List` its
+/// elements, a `String` its characters, and a `Range` its values (§10b).
 pub fn rows(v: &Val) -> OpResult<Vec<Val>> {
     match v {
         Val::Data(Value::Table(t)) => Ok(t
@@ -51,14 +35,11 @@ pub fn rows(v: &Val) -> OpResult<Vec<Val>> {
             .map(|r| Val::Data(Value::Record(Arc::new(Record { schema: t.schema.clone(), values: r.clone() }))))
             .collect()),
         Val::Data(Value::List(items)) => Ok(items.iter().map(|i| Val::Data(i.clone())).collect()),
-        // **A String is a sequence of its characters** (§10b). This is where length,
-        // substring and slicing come from — `count`, `take`, `skip`, `last` over text —
-        // rather than from a second vocabulary of string-only verbs. Characters, not
-        // bytes: `"abc"[0]` already indexes characters, and two answers to "what is an
-        // element of a String" is one too many.
+        // A String is a sequence of its characters (§10b), which is where `count`, `take`, `skip`
+        // and `last` over text come from. Characters, not bytes, as `"abc"[0]` indexes.
         Val::Data(Value::Str(text)) => Ok(text.chars().map(|c| Val::str(alloc::string::String::from(c))).collect()),
-        // A Range's elements are its values. It stays language-only (§8c) — materialising
-        // one here is exactly what it means to put it in front of an operator.
+        // A Range stays language-only (§8c); materialising it is what putting it in front of an
+        // operator means.
         Val::Range { start, end, inclusive } => {
             let last = if *inclusive { *end } else { *end - 1 };
             let n = last.saturating_sub(*start).saturating_add(1);
@@ -81,15 +62,11 @@ pub fn rows(v: &Val) -> OpResult<Vec<Val>> {
     }
 }
 
-/// Reassemble rows into the shape they came from.
-///
-/// A `Table` keeps its schema, so a filtered stream is still the same stream minus rows.
-/// A row whose record no longer matches the schema forces a `List`, since a table with
-/// ragged rows is not a table.
+/// Reassemble rows into the shape they came from. A row whose record no longer matches the
+/// table's schema forces a `List`, since a table with ragged rows is not a table.
 pub fn rebuild(original: &Val, out: Vec<Val>) -> OpResult<Val> {
-    // **The result comes back in the shape it went in.** Filtering a String yields a
-    // String; mapping one to something that is not text falls back to a List, which is the
-    // same rule a ragged Table already takes.
+    // The result comes back in the shape it went in; a String mapped to non-text falls back to
+    // a List, as a ragged Table does.
     if let Val::Data(Value::Str(_)) = original {
         let mut joined = String::new();
         for r in &out {
@@ -159,8 +136,7 @@ pub fn skip(v: &Val, n: i64) -> OpResult<Val> {
     rebuild(v, r.into_iter().skip(n).collect())
 }
 
-/// `last N` — the tail. §10a's replacement for `tail`, and the reason `head -n -N` needed
-/// no separate program either.
+/// `last N` — the tail.
 pub fn last(v: &Val, n: i64) -> OpResult<Val> {
     let r = rows(v)?;
     let n = clamp_count(n, r.len())?;
@@ -175,21 +151,16 @@ fn clamp_count(n: i64, len: usize) -> OpResult<usize> {
     Ok((n as usize).min(len))
 }
 
-/// `count` — the number of rows. A scalar count of a stream, which is why it is the one
-/// operator that does not return the shape it was given.
+/// `count` — the number of rows; the one operator that does not return the shape it was given.
 pub fn count(v: &Val) -> OpResult<Val> {
     Ok(Val::int(rows(v)?.len() as i64))
 }
 
-/// `sum` / `min` / `max` / `avg` (§10b) — the reductions `count` was alone in.
+/// `sum` / `min` / `max` / `avg` (§10b). A bareword names a column, as `sort size` does; with no
+/// column the rows are the values.
 ///
-/// Without them "the total size of these files" needs a `mut` and a `for` loop, which is
-/// the shape a pipeline language exists to remove. A bareword names a *column*, the same
-/// reading `sort size` has; with no column the rows are the values.
-///
-/// **Empty input is where these differ, and each answer is forced.** The sum of nothing is
-/// zero; there is no minimum of an empty set and no average without a divisor, so those are
-/// errors — the same refusal to fabricate a value §8a makes for division by zero.
+/// Empty input: the sum of nothing is zero; there is no minimum of an empty set and no average
+/// without a divisor, so those are errors, as division by zero is (§8a).
 pub fn sum(v: &Val, field: Option<&str>) -> OpResult<Val> {
     let mut int_total: i64 = 0;
     let mut float_total: f64 = 0.0;
@@ -250,9 +221,7 @@ pub fn max(v: &Val, field: Option<&str>) -> OpResult<Val> {
     extreme(v, field, "max", 1)
 }
 
-/// `min`/`max` share everything but which direction wins, and both order with the same
-/// `compare` as `sort` — so mixed types are an error rather than an ordering invented at
-/// the point of comparison.
+/// `min`/`max` order with the same `compare` as `sort`, so mixed types are an error.
 fn extreme(v: &Val, field: Option<&str>, op: &str, want: i32) -> OpResult<Val> {
     let values = column(v, field, op)?;
     let mut best: Option<Value> = None;
@@ -286,9 +255,7 @@ fn column(v: &Val, field: Option<&str>, op: &str) -> OpResult<Vec<Value>> {
     Ok(out)
 }
 
-/// `dedupe` (§10b) — row-equality deduplication, the same generic-row shape as
-/// `sort`/`filter`. Order-preserving: the first occurrence wins, because a shell that
-/// reordered while deduplicating would be doing two things under one name.
+/// `dedupe` (§10b) — row-equality deduplication; the first occurrence wins, so order is kept.
 pub fn dedupe(v: &Val) -> OpResult<Val> {
     let r = rows(v)?;
     let mut seen: Vec<Val> = Vec::new();
@@ -300,18 +267,10 @@ pub fn dedupe(v: &Val) -> OpResult<Val> {
     rebuild(v, seen)
 }
 
-// --- strings (§10b) -------------------------------------------------------
-//
-// These are *scalar* operators: they take a String and give something back, rather than
-// walking rows. v1.1 could **test** text with `~=` and never take it apart, and with `parse`
-// also missing, text that arrived as text stayed that way forever.
-
 /// `split SEP` — String → `List<String>`. The inverse of [`join`].
 pub fn split(v: &Val, sep: &str) -> OpResult<Val> {
     let s = as_str(v, "split")?;
-    // An empty separator would give one element per character with no way to put them back,
-    // which is what `rows` already does properly (§10b) — so it is refused rather than
-    // quietly meaning something else.
+    // An empty separator is refused rather than quietly meaning something else.
     if sep.is_empty() {
         return Err(String::from(
             "`split` needs a separator — to split into characters, the String is already a \
@@ -322,10 +281,7 @@ pub fn split(v: &Val, sep: &str) -> OpResult<Val> {
     Ok(Val::Data(Value::List(Arc::from(parts))))
 }
 
-/// `join SEP` — a sequence → String.
-///
-/// Elements are rendered the way `++` renders them (§8a), so `[1, 2] | join ","` is
-/// `"1,2"`: one definition of "this value as text" rather than a second that disagrees.
+/// `join SEP` — a sequence → String, rendering elements as `++` does (§8a).
 pub fn join(v: &Val, sep: &str) -> OpResult<Val> {
     let mut out = String::new();
     for (i, row) in rows(v)?.iter().enumerate() {
@@ -337,10 +293,7 @@ pub fn join(v: &Val, sep: &str) -> OpResult<Val> {
     Ok(Val::str(out))
 }
 
-/// `trim` — leading and trailing whitespace.
-///
-/// This is what makes `parse`'s strictness workable (§6): the two exist as a pair, so text
-/// with stray spaces is trimmed deliberately rather than silently accepted.
+/// `trim` — leading and trailing whitespace; the pair to `parse`'s strictness (§6).
 pub fn trim(v: &Val) -> OpResult<Val> {
     Ok(Val::str(as_str(v, "trim")?.trim()))
 }
@@ -355,15 +308,14 @@ pub fn replace(v: &Val, from: &str, to: &str) -> OpResult<Val> {
     Ok(Val::str(as_str(v, "replace")?.replace(from, to)))
 }
 
-/// `upper` / `lower` — **ASCII only**, said where a user meets it rather than only in the
-/// design doc. Full case folding needs Unicode tables this system does not carry, and a
-/// `lower` that quietly mangles non-ASCII is worse than one that documents its range.
+/// `upper` / `lower` — ASCII only: full case folding needs Unicode tables this system does not
+/// carry.
 /// TODO(unicode-case): `docs/rationale/deferred-decisions.md`.
 pub fn upper(v: &Val) -> OpResult<Val> {
     Ok(Val::str(as_str(v, "upper")?.to_ascii_uppercase()))
 }
 
-/// `lower` — the other half of `upper`'s contract, and ASCII-only for the same reason.
+/// `lower` — ASCII-only, like [`upper`].
 pub fn lower(v: &Val) -> OpResult<Val> {
     Ok(Val::str(as_str(v, "lower")?.to_ascii_lowercase()))
 }
@@ -375,13 +327,7 @@ fn as_str<'a>(v: &'a Val, op: &str) -> OpResult<&'a str> {
     }
 }
 
-// --- records (§10b) -------------------------------------------------------
-
-/// `keys` / `values` — in schema order, because the schema *is* the order.
-///
-/// A Record was constructible and readable by known field name only, so no script could
-/// walk one it did not itself write — which also blocked any generic handling of a schema
-/// that arrived at runtime.
+/// `keys` / `values` — in schema order, so a script can walk a record it did not write.
 pub fn keys(v: &Val) -> OpResult<Val> {
     let r = as_record(v, "keys")?;
     let out: Vec<Value> = r.schema.fields.iter().map(|f| Value::Str(f.name.clone())).collect();
@@ -400,8 +346,8 @@ pub fn merge(a: &Val, b: &Val) -> OpResult<Val> {
     let mut schema = Schema::new();
     let mut values: Vec<Value> = Vec::new();
     for (i, f) in left.schema.fields.iter().enumerate() {
-        // A field the right operand also carries takes its value from there, and keeps the
-        // left's position — a merge should not reorder what it did not change.
+        // A field the right operand also carries takes its value from there and keeps the left's
+        // position.
         let from_right = right.schema.fields.iter().position(|g| g.name == f.name).and_then(|j| right.values.get(j));
         let (tag, value) = match from_right {
             Some(v) => (v.type_tag().unwrap_or(TypeTag::Null), v.clone()),
@@ -428,18 +374,12 @@ fn as_record<'a>(v: &'a Val, op: &str) -> OpResult<&'a Record> {
     }
 }
 
-// --- numbers (§10b) -------------------------------------------------------
-
-/// `round` / `floor` / `ceil` / `trunc` — `Float` → `Int`, **named by which way they lose
-/// information** (§6). A cast that silently truncates is the fabricated value §8a refuses.
-///
-/// Hand-rolled because `f64::round` and friends live in `std`: this crate is `no_std`, so
-/// the arithmetic is done here rather than pulling in a libm.
+/// `round` / `floor` / `ceil` / `trunc` — `Float` → `Int`, named by which way they lose
+/// information (§6). Hand-rolled: `f64::round` lives in `std`.
 pub fn round(v: &Val) -> OpResult<Val> {
     let x = as_f64(v, "round")?;
     let t = trunc_f64(x, "round")?;
-    // Half **away from zero** — stated out loud because half-to-even is the other
-    // defensible answer, and silence would make it a coin flip settled by whoever wrote it.
+    // Half away from zero.
     let frac = x - (t as f64);
     let away = if frac >= 0.5 {
         1
@@ -471,8 +411,7 @@ pub fn trunc(v: &Val) -> OpResult<Val> {
 /// `abs` — the one that keeps its type, since it does not lose information.
 pub fn abs(v: &Val) -> OpResult<Val> {
     match v.as_data() {
-        // `-i64::MIN` has no positive counterpart, so it is an error rather than itself
-        // (§8a: no wrapping, because a wrapped result is a fabricated number).
+        // `-i64::MIN` has no positive counterpart: an error, not a wrapped result (§8a).
         Some(Value::Int(i)) => i.checked_abs().map(Val::int).ok_or_else(|| String::from("`abs` overflows an Int")),
         Some(Value::Float(f)) => Ok(Val::float(if *f < 0.0 { -f } else { *f })),
         _ => Err(alloc::format!("`abs` needs a number, got {}", v.type_name())),
@@ -495,10 +434,8 @@ fn trunc_f64(x: f64, op: &str) -> OpResult<i64> {
     Ok(x as i64)
 }
 
-/// `select FIELD...` — projection. Missing fields are an error rather than silently
-/// absent columns: asking for a field that is not there is a mistake worth hearing about,
-/// and §6's subset-match rule is about *accepting extra* fields, not inventing missing
-/// ones.
+/// `select FIELD...` — projection. A missing field is an error: §6's subset match accepts extra
+/// fields, not missing ones.
 pub fn select(v: &Val, fields: &[String]) -> OpResult<Val> {
     if fields.is_empty() {
         return Err(String::from("`select` needs at least one field name"));
@@ -527,17 +464,11 @@ pub fn select(v: &Val, fields: &[String]) -> OpResult<Val> {
     table_from_records(out)
 }
 
-/// `sort FIELD... [--reverse]`, or `sort` over bare values.
-///
-/// **Every key given is used**, in order: `sort dept name` sorts by department and then by
-/// name within it. Taking the first and silently discarding the rest is neither of the two
-/// acceptable behaviours (§10b).
+/// `sort FIELD... [--reverse]`, or `sort` over bare values. Every key given is used, in order.
 pub fn sort(v: &Val, fields: &[String], reverse: bool) -> OpResult<Val> {
     let mut r = rows(v)?;
-    // A stable insertion sort: `Vec::sort_by` needs a total order, and comparing two
-    // arbitrary `Value`s does not have one (a String and an Int are simply not ordered).
-    // Doing it by hand keeps the "these two cannot be compared" case an error rather than
-    // an arbitrary answer.
+    // A stable insertion sort: two arbitrary `Value`s have no total order, and doing it by hand
+    // keeps "cannot be compared" an error rather than an arbitrary answer.
     let mut err: Option<String> = None;
     let mut sorted: Vec<Val> = Vec::with_capacity(r.len());
     for item in r.drain(..) {
@@ -568,8 +499,7 @@ pub fn sort(v: &Val, fields: &[String], reverse: bool) -> OpResult<Val> {
     rebuild(v, sorted)
 }
 
-/// The ordering keys for one row, one per named field — or the row itself when no field
-/// was named.
+/// The ordering keys for one row, one per named field, or the row itself with none.
 fn sort_keys(row: &Val, fields: &[String]) -> OpResult<Vec<Value>> {
     if fields.is_empty() {
         return Ok(alloc::vec![sort_key(row, None)?]);
@@ -581,8 +511,7 @@ fn sort_keys(row: &Val, fields: &[String]) -> OpResult<Vec<Value>> {
     Ok(keys)
 }
 
-/// Compare rows key by key: the first that differs decides, which is what makes the
-/// second key a tie-break rather than a second sort.
+/// Compare rows key by key: the first that differs decides.
 fn compare_keys(a: &[Value], b: &[Value]) -> OpResult<i32> {
     for (x, y) in a.iter().zip(b) {
         let ord = compare(x, y)?;
@@ -597,10 +526,8 @@ fn sort_key(row: &Val, field: Option<&str>) -> OpResult<Value> {
     key_of(row, field, "sort")
 }
 
-/// One value out of a row: a named field, or the row itself.
-///
-/// Shared by `sort` and the reductions so that "which column?" is answered once — and so
-/// `sum size` and `sort size` fail the same way on a row that has no such field.
+/// One value out of a row: a named field, or the row itself. Shared with the reductions, so
+/// `sum size` and `sort size` fail the same way on a row without the field.
 fn key_of(row: &Val, field: Option<&str>, op: &str) -> OpResult<Value> {
     match field {
         None => row.as_data().cloned().ok_or_else(|| alloc::format!("cannot `{op}` a value TSM1 cannot represent")),
@@ -673,14 +600,9 @@ fn field_names(s: &Schema) -> String {
     out
 }
 
-/// `format(template, args…)` — §8d, positional and indexed only.
-///
-/// Deliberately not named capture. §8d's reasoning: Rust gets away with `format!("{name}")`
-/// because it is a *macro* rewriting a literal at compile time, never looking up a string
-/// against a live scope. Without a macro system the same syntax would mean resolving a
-/// *string* against the caller's bindings at run time — categorically different from every
-/// other name resolution in the language, and a refactoring trap where renaming a variable
-/// breaks a string with no error pointing anywhere useful.
+/// `format(template, args…)` — §8d, positional and indexed only. Not named capture: that would
+/// resolve a string against the caller's scope at run time, unlike every other name in the
+/// language.
 pub fn format(template: &str, args: &[Val]) -> OpResult<String> {
     let mut out = String::new();
     let bytes = template.as_bytes();
@@ -727,9 +649,7 @@ pub fn format(template: &str, args: &[Val]) -> OpResult<String> {
             }
         }
     }
-    // §8d: arity mismatch is an error, same fail-loud default used throughout. An unused
-    // argument is as much a mistake as a missing one — it means the template and the call
-    // disagree.
+    // §8d: arity mismatch is an error; an unused argument is as much a mistake as a missing one.
     if next_positional < args.len() && !template.contains('{') {
         return Err(alloc::format!(
             "format was given {} argument(s) the template does not use",
@@ -739,18 +659,11 @@ pub fn format(template: &str, args: &[Val]) -> OpResult<String> {
     Ok(out)
 }
 
-/// Render a value for `display`: a table as aligned columns, anything else as itself.
+/// Render a value for `display`: a table as aligned columns, anything else as itself. A
+/// text-fallback stream prints as text, with no header; see [`text_fallback_lines`].
 ///
-/// This is where a `Table` finally gets a real rendering — `Val::render` deliberately
-/// gives only a summary, because laying out columns is a *display* decision and belongs
-/// with the operator that ends a chain rather than with the value.
-///
-/// **A text-fallback stream prints as text**, with no header — see [`text_fallback_lines`].
-///
-/// **`styled` colours the header row and nothing else** (desktop refresh, Part F). The shell
-/// knows which row is a header because it built the table, which is the whole argument for
-/// colouring here rather than in each program; the *values* are left alone, because a value is
-/// data and tinting data means guessing what it means.
+/// `styled` colours the header row and nothing else: the shell knows which row is a header, and a
+/// value is data.
 pub fn display(v: &Val, styled: bool) -> String {
     let Val::Data(Value::Table(t)) = v else {
         let mut s = v.render();
@@ -767,10 +680,7 @@ pub fn display(v: &Val, styled: bool) -> String {
         .iter()
         .map(|row| {
             row.iter()
-                // **A null cell is drawn blank** (the laptop polish's Part B): the column's header
-                // already says what is missing, and a column of `null` under it reads as data.
-                // Only the cell itself — a null inside a list in a cell is still that list's
-                // `[null]`, and a bare `null` is still the answer `null`.
+                // A null cell is drawn blank; a null inside a list is still `[null]`.
                 .map(|c| if *c == Value::Null { String::new() } else { Val::Data(c.clone()).render() })
                 .collect::<Vec<String>>()
         })
@@ -786,16 +696,13 @@ pub fn display(v: &Val, styled: bool) -> String {
     for (i, h) in headers.iter().enumerate() {
         pad_into(&mut head, h, widths[i], i + 1 == headers.len());
     }
-    // **The row, and its newline after the reset.** `display`'s caller may hand the text to
-    // `tty_write_crlf`, which makes a chunk of anything following a `\n` — so a reset placed
-    // after it becomes a line of its own. The row's own trailing spaces are inside the paint,
-    // which is what `style::paint` is about.
+    // The row's newline comes after the reset: `tty_write_crlf` makes a chunk of anything
+    // following a `\n`, so a reset after it would become a line of its own.
     let mut out = crate::style::paint(styled, crate::style::HEADER, &head);
     out.push('\n');
     for row in &cells {
-        // **A row ends at its last cell with something in it**, so blank cells at the end leave
-        // no run of padding behind them: a line that long would wrap a narrow terminal for nothing.
-        // Blank cells before it are padded as any other, which keeps the columns aligned.
+        // A row ends at its last non-empty cell, so trailing blanks leave no padding to wrap a
+        // narrow terminal; earlier blanks are padded to keep the columns aligned.
         let end = row.iter().rposition(|c| !c.is_empty()).map_or(0, |i| i + 1);
         for (i, c) in row.iter().enumerate().take(end) {
             if i < widths.len() {
@@ -807,18 +714,11 @@ pub fn display(v: &Val, styled: bool) -> String {
     out
 }
 
-/// A text-fallback stream rendered as the text it is: one row per line, no column header.
+/// A text-fallback stream rendered as the text it is: one row per line, no column header, so
+/// plain text wrapped as `Table<{line: String}>` still looks like text at the end of a pipeline.
 ///
-/// **`StreamFlags::TEXT_FALLBACK` is what the "Unix floor" means**, and until M12 Part E
-/// nothing in the tree produced one — so the flag had been defined, documented and written by
-/// `libstream::write_text_fallback` for four milestones with **no reader anywhere**. `clip` is
-/// the first producer, and printing `line` above somebody's pasted text is what made that
-/// visible: the whole point of wrapping plain text as `Table<{line: String}>` is that it flows
-/// through a typed pipeline *and still looks like text at the end of one*.
-///
-/// `None` for anything else, including a stream that claims the flag but does not have the
-/// shape — one `String` column. A producer that sets the bit on a three-column table is wrong,
-/// and rendering its first column as "the text" would hide two of them.
+/// `None` for anything else, including a stream that claims the flag but is not one `String`
+/// column: rendering the first column of a wider table as "the text" would hide the rest.
 fn text_fallback_lines(t: &Table) -> Option<String> {
     if !t.flags.contains(libstream::StreamFlags::TEXT_FALLBACK) {
         return None;
@@ -847,9 +747,8 @@ fn pad_into(out: &mut String, text: &str, width: usize, last: bool) {
     out.push_str("  ");
 }
 
-/// Serialise for `save` (B5). `.tsm` is the native stream; `.txt` is one rendered row per
-/// line. `.csv`/`.json` are deliberately not here — each is a real serialiser, and §4
-/// scoped them as separate work rather than free.
+/// Serialise for `save`. `.tsm` is the native stream; `.txt` is one rendered row per line.
+/// `.csv`/`.json` are separate work (§4).
 pub fn encode_for(path: &str, v: &Val) -> OpResult<Vec<u8>> {
     if path.ends_with(".tsm") {
         let Val::Data(Value::Table(t)) = v else {
@@ -876,15 +775,10 @@ pub fn encode_for(path: &str, v: &Val) -> OpResult<Vec<u8>> {
     ))
 }
 
-/// Parse for `open` (B5).
+/// Parse for `open` (§4): text is wrapped into a single-column `Table<String>`.
 ///
-/// §4: text is wrapped into a single-column `Table<String>`, because there is no such
-/// thing as a raw untyped byte stream in this pipeline model — which is also what let
-/// `open`'s multi-path form absorb `cat` entirely (§10a).
-///
-/// **Text ends at its last character that is not a NUL** ([`libfs::unpadded`]): a snapshot such
-/// as the kernel's `/dev/log` is read whole, its last page padded with NULs, which would be a
-/// last line of them (PR #371 review, finding 1).
+/// Text ends at its last character that is not a NUL ([`libfs::unpadded`]): a snapshot such as
+/// `/dev/log` is read whole, its last page padded with NULs, which would be a last line of them.
 pub fn decode_from(path: &str, bytes: &[u8]) -> OpResult<Val> {
     if path.ends_with(".tsm") {
         let t = Table::decode(bytes).map_err(|_| alloc::format!("`{path}` is not a TSM1 stream"))?;
@@ -928,19 +822,15 @@ mod tests {
 
     #[test]
     fn a_text_fallback_stream_displays_as_text_and_a_plain_table_keeps_its_header() {
-        // **The flag had no reader for four milestones** — `clip` is the first producer in the
-        // tree (M12 Part E), and what it produced printed `line` above somebody's pasted text.
+        // `clip` is the first producer of the flag.
         assert_eq!(display(&text_stream(StreamFlags::TEXT_FALLBACK, &["one", "two"]), false), "one\ntwo\n");
-        // The control: the identical rows *without* the flag are a table, and a table has
-        // columns. Without this the test above would pass for a `display` that dropped every
-        // header.
+        // The control: without the flag the same rows are a table, and have columns.
         assert_eq!(display(&text_stream(StreamFlags::NONE, &["one", "two"]), false), "line\none\ntwo\n");
     }
 
     #[test]
     fn a_flag_on_the_wrong_shape_is_not_believed() {
-        // A producer that sets the bit on a table that is not one `String` column is wrong, and
-        // rendering its first column as "the text" would hide the rest. Two columns here: the
+        // A producer setting the bit on a table that is not one `String` column is wrong: the
         // header comes back.
         let schema = Schema::new().field("line", TypeTag::String, TypeModifiers::NONE).field(
             "n",
@@ -957,8 +847,7 @@ mod tests {
 
     #[test]
     fn an_empty_text_fallback_stream_displays_as_nothing() {
-        // `clip` on an empty ring emits exactly this, and a shell that printed a bare `line`
-        // for it would be reporting a column name as the clipboard's contents.
+        // An empty `clip` ring must not print a bare `line`, a column name.
         assert_eq!(display(&text_stream(StreamFlags::TEXT_FALLBACK, &[]), false), "");
     }
     use alloc::vec;
@@ -1043,8 +932,6 @@ mod tests {
         assert!(e.contains("scalar is not one"), "{e}");
     }
 
-    // --- format (§8d) -------------------------------------------------------
-
     #[test]
     fn format_is_positional_and_indexed_only() {
         assert_eq!(format("hello {}", &[Val::str("world")]).unwrap(), "hello world");
@@ -1061,8 +948,6 @@ mod tests {
         assert!(format("{", &[]).is_err());
     }
 
-    // --- save / open (B5) ---------------------------------------------------
-
     #[test]
     fn tsm_round_trips_through_save_and_open() {
         let t = table(&["a", "b"], &[1, 2]);
@@ -1072,8 +957,7 @@ mod tests {
         assert_eq!(rows(&back).unwrap()[1].render(), "{ name: \"b\", size: 2 }");
     }
 
-    /// §4: text becomes a single-column `Table<String>`, because there is no untyped byte
-    /// stream in this model — which is what let `open a b` absorb `cat`.
+    /// §4: text becomes a single-column `Table<String>`.
     #[test]
     fn text_is_wrapped_into_a_single_column_table() {
         let v = decode_from("notes.txt", b"one\ntwo\n").unwrap();
@@ -1081,8 +965,7 @@ mod tests {
         assert_eq!(rows(&v).unwrap()[0].render(), "{ line: \"one\" }");
     }
 
-    /// **A snapshot's padding is no line** (PR #371 review, finding 1): `/dev/log` is read whole,
-    /// its last page padded with NULs. One inside the text is still the text's.
+    /// A snapshot's NUL padding is no line; one inside the text is still the text's.
     #[test]
     fn text_ends_before_the_nuls_that_pad_it() {
         let v = decode_from("/dev/log", b"one\ntwo\n\0\0\0").unwrap();
@@ -1107,8 +990,6 @@ mod tests {
         assert!(concat(a, other).is_err());
     }
 
-    // --- display ------------------------------------------------------------
-
     #[test]
     fn display_lays_a_table_out_in_columns() {
         let t = table(&["short", "a-longer-name"], &[1, 200]);
@@ -1124,9 +1005,8 @@ mod tests {
         assert_eq!(display(&Val::int(5), false), "5\n");
     }
 
-    /// **A null cell is blank, and nothing else changes** (the laptop polish's Part B): its column
-    /// keeps its width and alignment, a bare `null` still says so, and a null nested in a cell's
-    /// list is still part of that list.
+    /// A null cell is blank and keeps its column's width; a bare `null` still says so, and a null
+    /// nested in a cell's list is still part of that list.
     #[test]
     fn a_null_cell_is_drawn_blank_and_a_bare_null_is_not() {
         let schema = Schema::new()
@@ -1152,34 +1032,27 @@ mod tests {
         assert!(display(&nested, false).contains("[null]"), "a null inside a cell's list stays");
     }
 
-    /// A table's header row is coloured and its values are not.
-    ///
-    /// **The values half is the claim worth making** (desktop refresh, Part F). Painting a whole
-    /// table is easy and wrong: a value is data, and tinting data means guessing what it means.
-    /// A version that wrapped the whole string would pass an assertion about the header alone.
+    /// A table's header row is coloured and its values are not: a version wrapping the whole
+    /// string would pass an assertion about the header alone.
     #[test]
     fn a_terminal_gets_a_coloured_header_and_plain_values() {
         let t = table(&["short"], &[1]);
         let plain = display(&t, false);
         let styled = display(&t, true);
 
-        // Nothing at all when there is no terminal — a script's output is text.
+        // Nothing at all when there is no terminal.
         assert!(!plain.contains('\x1b'), "{plain:?} carries an escape with no terminal");
 
-        // The header row, and only it: the escape opens before the first header and the reset
-        // closes before the first row of values.
+        // The escape opens before the first header and the reset closes before the first value row.
         assert!(styled.starts_with(crate::style::HEADER), "{styled:?}");
         let (head, body) = styled.split_once(crate::style::RESET).expect("the header is reset");
         assert!(head.contains("name") && head.contains("size"), "{head:?}");
         assert!(body.contains("short") && body.contains('1'), "{body:?}");
         assert!(!body.contains('\x1b'), "{body:?}: a value was coloured");
 
-        // **The reset closes the row before its newline, not after it.** Asserted on the bytes,
-        // because the strip-and-compare below cannot tell the two orders apart — it was claimed
-        // to, and did not (PR #324 review, finding 2). The order matters wherever the caller
-        // strips a trailing newline before handing the text to `tty_write_crlf`, which is what
-        // `drain_diagnostics` does: a reset on the far side of a `\n` becomes a chunk of its
-        // own, printing a blank line with `\x1b[0m` at the head of the next.
+        // The reset closes the row before its newline, asserted on the bytes: a strip-and-compare
+        // cannot tell the two orders apart, and a reset after a `\n` that `drain_diagnostics`
+        // strips would print a blank line led by `\x1b[0m`.
         assert!(
             styled.contains(&alloc::format!("{}\n", crate::style::RESET)),
             "{styled:?}: the header's reset does not close before its newline"
@@ -1189,9 +1062,7 @@ mod tests {
             "{styled:?}: the reset is on the far side of a newline"
         );
 
-        // And the text is the same text: colour adds bytes, it does not move columns. **This
-        // half does not see the order above** — stripping the escapes gives identical text
-        // either way — so the two assertions are about different things.
+        // The text is the same text; this half does not see the order above.
         let stripped: String = {
             let mut out = String::new();
             let mut rest = styled.as_str();

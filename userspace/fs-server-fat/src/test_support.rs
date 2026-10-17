@@ -99,7 +99,6 @@ pub(crate) fn scratch(what: &str) -> PathBuf {
     std::env::temp_dir().join(format!("nitrox-fat-{}-{}-{what}", std::process::id(), n))
 }
 
-/// **A blank, sparse image** of `mib` MiB.
 pub(crate) fn blank(mib: u64) -> PathBuf {
     let p = scratch("img");
     std::fs::File::create(&p).unwrap().set_len(mib << 20).unwrap();
@@ -129,7 +128,6 @@ pub(crate) fn mformat(mib: u64, args: &[&str]) -> PathBuf {
     p
 }
 
-/// **`mkfs.fat` an image** of `mib` MiB with `args`.
 pub(crate) fn mkfs(mib: u64, args: &[&str]) -> PathBuf {
     let p = blank(mib);
     let out = Command::new("mkfs.fat")
@@ -141,7 +139,6 @@ pub(crate) fn mkfs(mib: u64, args: &[&str]) -> PathBuf {
     p
 }
 
-/// Make the directory `dir` on `img`.
 pub(crate) fn mmd(img: &Path, dir: &str) {
     mtools("mmd", img, &[&format!("::{dir}")]);
 }
@@ -154,12 +151,10 @@ pub(crate) fn put(img: &Path, dest: &str, bytes: &[u8]) {
     let _ = std::fs::remove_file(&src);
 }
 
-/// Remove the file `path` from `img` with `mdel`.
 pub(crate) fn mdel(img: &Path, path: &str) {
     mtools("mdel", img, &[&format!("::{path}")]);
 }
 
-/// **A file's bytes as `mtype` reads them** off `img`.
 pub(crate) fn mtype(img: &Path, path: &str) -> Vec<u8> {
     mtools("mtype", img, &[&format!("::{path}")]).stdout
 }

@@ -1387,7 +1387,7 @@ drag it says it takes, silently and much later. An empty or over-long name, a no
 
 **The grab is the authority**, as it is for `StartMove` and `StartResize`, and it matters more
 here: a drag is an *offer to another application*, so a client that could start one at will could
-push a path into somebody else's window with nobody touching anything. `NoSuchWindow` when the
+push a path into somebody else's window with nobody touching anything. `NotFound` when the
 caller does not hold the grab, or a move or resize is already running — **one grab carries one
 gesture**, in every direction.
 

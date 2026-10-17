@@ -1,29 +1,19 @@
 //! `nxfiles` — the file browser: the window, the buffers, and the event pump.
 //!
-//! Everything with behaviour is in the library half and host-tested there. What is here is the
-//! part that needs an OS: connecting to `/dev/draw`, sharing buffers with the compositor,
-//! reading a directory, draining input.
+//! Everything with behaviour is in the library half and host-tested there; this is the part that
+//! needs an OS.
 //!
-//! ## The one thing this file decides
+//! The first window starts at `argv[1]` (the shell's Places menu passes one), else `HOME` from
+//! the Tier-1 environment record — the user's own subtree — else `/`. Home is `HOME` either way:
+//! the sidebar's places and every later window keep the session's home.
 //!
-//! **Where the browser starts.** `argv[1]` when it is given one — the shell's Places menu does —
-//! and otherwise `HOME` from the Tier-1 environment record, which
-//! `desktop-shell::build_app_namespace` binds to the user's subtree — so `/home` here is the
-//! user's own directory and not the `/home` above it. An application launched with no setup
-//! message at all falls back to `/`, which is the honest answer for a process that was told
-//! nothing: it can still list what its namespace contains.
+//! The sidebar's Drives are the storage service's table, `/dev/storage/all.tsm`, read at start
+//! and again whenever the watch at `/dev/storage/watch` pings. A browser refused a watch reads
+//! the table when a window opens or takes focus, and follows nothing between. An eject opens a
+//! media session for the one request, and closes it.
 //!
-//! **Home is `HOME` either way.** The argument chooses the first window's directory; the
-//! sidebar's places and every later window are still the session's home's.
-//!
-//! ## The drives (Phase 6 Part F)
-//!
-//! **The sidebar's Drives are the storage service's table**, `/dev/storage/all.tsm`, read once at
-//! start and again whenever the **watch** at `/dev/storage/watch` pings: a channel the service
-//! only sends a bare `Changed` on, waited on here beside the compositor's. A browser the service
-//! refused a watch — every one of them held — reads the table when a window opens and when one
-//! takes focus, and follows nothing between. An eject opens a **media session** for the one
-//! request, and closes it.
+//! The gates (`check-login`, `check-media`) match most `nxfiles:` lines this prints: grep
+//! `tools/xtask/src` before changing one.
 
 #![no_std]
 #![no_main]
@@ -48,29 +38,22 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// `alloc` backing — the element tree and the listing both allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Buffers shared with the compositor. Two is the minimum the protocol permits.
 const BUFFERS: usize = 2;
 
-/// The storage service's table, through the session endpoint every application is bound.
 const STORAGE_TABLE: &[u8] = b"/dev/storage/all.tsm";
-/// Its watch: a ping whenever the mounts change.
 const STORAGE_WATCH: &[u8] = b"/dev/storage/watch";
-/// A media session, for an eject.
 const STORAGE_MEDIA: &[u8] = b"/dev/storage/media";
 
-/// **The drives, as the storage service's table lists them now**, or `None` if it would not
-/// read — a namespace with no `/dev/storage`, or a service gone.
 fn read_drives(ns: u64) -> Option<Vec<Drive>> {
     let bytes = libfs::read_file(ns, STORAGE_TABLE).ok()?;
     let table = libstream::wire::Table::decode(&bytes).ok()?;
     Some(nxfiles::drives(&table))
 }
 
-/// Say what the drives are, on a change: the names, escaped, since a stick's label is anyone's.
 fn say_drives(drives: &[Drive]) {
     let mut l = libkern::debug::Line::new();
     l.s(b"nxfiles: drives:");
@@ -86,7 +69,6 @@ fn say_drives(drives: &[Drive]) {
     l.end();
 }
 
-/// **Open a watch**, or `None` if the service refused one, with the reason said.
 fn open_watch(ns: u64) -> Option<u64> {
     let (st, watch) = libfs::lookup_wait(ns, STORAGE_WATCH, librsproto::session::DIR_SESSION_RIGHTS);
     if st != 0 || watch == 0 {
@@ -101,10 +83,8 @@ fn open_watch(ns: u64) -> Option<u64> {
     Some(watch)
 }
 
-/// **Take every ping queued on the watch**, into `buf` — one message's room, held for the browser's
-/// run: `Ok(true)` if there was one, `Err` once the service's end has gone. A ping carries
-/// nothing, so how many there were does not matter. Called only when a wait said the watch was
-/// ready, not on every turn of the loop (PR #367 review).
+/// Take every ping queued on the watch, into `buf`: `Ok(true)` if there was one, `Err` once the
+/// service's end has gone. Called only when a wait said the watch was ready.
 fn drain_pings(watch: u64, buf: &mut [u8]) -> Result<bool, ()> {
     let mut pinged = false;
     loop {
@@ -138,11 +118,10 @@ fn drain_pings(watch: u64, buf: &mut [u8]) -> Result<bool, ()> {
     }
 }
 
-/// **Eject the drive mounted as `name`**: a media session opened for the one `Eject`, and closed.
-/// It waits for the service, on the browser's one thread — `TODO(files-storage-wait)`.
-/// `Ok` once the service says it can be pulled, with the names of every mount it unmounted on that
-/// stick — the drive goes whole — or the reason it gave, or this end's, put for the person reading
-/// the strip.
+/// Eject the drive mounted as `name`: a media session opened for the one `Eject`, and closed.
+/// It waits for the service on the browser's one thread — `TODO(files-storage-wait)`. `Ok`
+/// carries every mount unmounted on that stick, the drive going whole; `Err` the reason, put for
+/// the person reading the strip.
 fn eject(ns: u64, name: &str) -> Result<Vec<String>, String> {
     use librsproto::storage::OP_STORAGE_EJECT;
     let (st, session) = libfs::lookup_wait(ns, STORAGE_MEDIA, librsproto::session::DIR_SESSION_RIGHTS);
@@ -174,31 +153,13 @@ fn eject(ns: u64, name: &str) -> Result<Vec<String>, String> {
 
 /// Carry out a filesystem operation, and say in one line what happened.
 ///
-/// **The browser performs these itself.** It holds `/home` — the session bound it there — and
-/// that binding *is* the authority these need; routing them through `desktop-shell` would be
-/// asking a supervisor to do what the application is already entitled to do, which is the
-/// opposite of the argument that keeps `Desktop::Open` on the shell's side. Opening a *program*
-/// needs `/bin` and a namespace, and this has neither; renaming a file in a directory it can
-/// already list needs nothing it does not hold.
-///
-/// The returned string is what the strip shows, so it is written for the person looking at the
-/// window rather than for a log.
+/// The browser performs these itself: its `/home` binding is the authority they need. The
+/// returned string is what the strip shows, so it is written for the person looking at it.
 fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
-    // **The destination is tested first, and that is what makes "nothing overwrites" true.**
-    // Three of the four refusals this used to claim were unreachable, and one of them was worse
-    // than unreachable (PR #268 review, worth fixing 1):
-    //
-    // - `libfs::create_file` is documented *idempotent* — `fs-server-ext4` resolves with
-    //   `RESOLVE_CREATE`, discards "already exists" and grows the file to zero, which is a
-    //   no-op. So *new file* onto an existing name **succeeded**, destroyed nothing, and told
-    //   the person a new empty file was there while the old one and its contents still were.
-    // - `libfs::rename`'s `map_rename_error` deliberately does not distinguish an occupied
-    //   destination — its own doc says a caller that cares should test with `file_size` first,
-    //   which is what the `copy` coreutil does. So a refused rename or move was correct and
-    //   reported "could not rename it", which reads like a fault rather than an answer.
-    //
-    // Testing here gives all of them the sentence written for them, and puts the promise in this
-    // program rather than in what a server happens to return.
+    // The destination is tested first, which is what makes "nothing overwrites" true:
+    // `libfs::create_file` is idempotent, so *new file* onto an existing name would succeed and
+    // report a new empty file, and `libfs::rename` does not distinguish an occupied destination,
+    // so a refused rename would read like a fault. Testing here puts the promise in this program.
     let taken = |path: &String| libfs::file_size(ns, path.as_bytes()).is_some() || libfs::is_dir(ns, path.as_bytes());
     match op {
         FileOp::Create { path, dir } => {
@@ -212,9 +173,7 @@ fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
             };
             if made { (true, "created") } else { (false, "could not create it") }
         }
-        // **Never `replace`**, for rename, copy and move alike: overwriting is a second
-        // question, and a browser that answered it silently would be one whose most ordinary
-        // mistake — typing a name that is already there — destroys a file.
+        // Never `replace`, for rename, copy and move alike: overwriting is a second question.
         FileOp::Rename { from, to } => {
             if taken(to) {
                 return (false, "that name is taken");
@@ -233,10 +192,8 @@ fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
                 Err(_) => (false, "could not move it"),
             }
         }
-        // **`copy_file`, which maps both sides and copies between the mappings** with no heap at
-        // all, bounded by `libfs::MAX_COPY`. `read_file` is the one function here that allocates
-        // a whole file, and the wrong one for a copy to call. A *folder* takes `copy_tree`, which
-        // was always there — `copy_file` on one merely fails.
+        // `copy_file` maps both sides and copies with no heap, bounded by `libfs::MAX_COPY`; a
+        // *folder* takes `copy_tree`.
         FileOp::Copy { from, to, dir } => {
             if taken(to) {
                 return (false, "that name is taken");
@@ -264,7 +221,6 @@ fn perform(ns: u64, op: &FileOp) -> (bool, &'static str) {
     }
 }
 
-/// The path an operation acts on, for the line that reports it.
 fn subject(op: &FileOp) -> &str {
     match op {
         FileOp::Create { path, .. } | FileOp::Delete { path, .. } => path,
@@ -272,7 +228,6 @@ fn subject(op: &FileOp) -> &str {
     }
 }
 
-/// Report and end the run.
 fn fail(msg: &[u8]) -> ! {
     kprint(msg);
     // SAFETY: under the test-harness kernel this terminates QEMU; elsewhere it is
@@ -281,12 +236,8 @@ fn fail(msg: &[u8]) -> ! {
     exit(1);
 }
 
-/// The wall clock in nanoseconds since the epoch, or `0` when the machine has none.
-///
-/// **Zero rather than a fabricated epoch**: the kernel answers `Unsupported` on a machine whose
-/// RTC could not be read, and a listing whose dates were all 1970 would be stating something
-/// false rather than admitting it knows nothing. `column_modified` shows a date rather than a
-/// time when it has no today to compare against.
+/// The wall clock in nanoseconds since the epoch, or `0` when the machine has none: a listing
+/// dated 1970 would state something false. `column_modified` then shows dates, not times.
 fn clock_now() -> u64 {
     let mut nanos = 0u64;
     // SAFETY: `&mut nanos` is a valid writable u64 out-param for the clock read.
@@ -297,33 +248,18 @@ fn clock_now() -> u64 {
 
 /// Read `path` and hand the listing to `app`.
 ///
-/// **A failed listing leaves the browser where it was**, saying so on the debug console rather
-/// than clearing the window: a directory that cannot be read is a thing that happens — a
-/// permission a namespace does not carry, a path that went away between the press and the read
-/// — and a browser that emptied itself in response would lose the one thing the user could
-/// still act on, which is the listing they came from.
+/// A failed listing leaves the browser where it was: a directory that cannot be read (a path
+/// that went away since the press) must not cost the listing the user came from.
 fn navigate(app: &mut App, ns: u64, path: &str) {
     match libfs::list_dir(ns, path.as_bytes()) {
         Ok(entries) => {
             let rows: Vec<Entry> = entries.iter().filter_map(App::entry_of).collect();
             let read = rows.len();
-            // **What the clock says, read here and handed to a view that is a function of it**
-            // (desktop refresh, Part I): the `Modified` column shows `HH:MM` for today and a
-            // date before that, and "today" is a fact about the world that the pure half cannot
-            // fetch for itself. Read per listing rather than per frame — a browser repaints on
-            // every keystroke, and the date does not change between them.
             app.now_nanos = clock_now();
             app.show(path, rows);
-            // **Counted after `show`, because `show` is what decides which of them the tab
-            // holds.** The count used to be `rows.len()` — what the directory *read* returned —
-            // which was the same number until M14 Part D gave the browser something to hide. A
-            // receipt naming a number nobody can see is worse than none: it is what a gate
-            // counting entries would believe, and it would have gone on agreeing with a hidden
-            // file the browser was quietly still listing.
-            //
-            // Both numbers when they differ, because "two of the three are shown" is the fact,
-            // and a reader who sees only the two has no way to tell a filtered listing from a
-            // small directory.
+            // Counted after `show`, which decides what the tab holds, and both numbers when they
+            // differ, so a filtered listing is not mistaken for a small directory. Gates match
+            // this line.
             let shown = app.entries().len();
             let mut l = libkern::debug::Line::new();
             l.s(b"nxfiles: listed ").untrusted(path.as_bytes()).s(b" - ").u(shown as u64);
@@ -334,9 +270,6 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
             l.end();
         }
         Err(_) => {
-            // **And the window says so too.** The console line has always been here; what was
-            // missing is anything on screen, so a typed path with a typo did nothing visible and
-            // read as a keystroke that had not registered (M14 Part D).
             app.list_failed(path);
             libkern::debug::Line::new().s(b"nxfiles: cannot list ").untrusted(path.as_bytes()).end();
         }
@@ -345,15 +278,9 @@ fn navigate(app: &mut App, ns: u64, path: &str) {
 
 /// Ask `desktop-shell` to open `path`, and say whether it took the request.
 ///
-/// **A session per request, rather than one held for the browser's run.** The shell allows a
-/// bounded number of `/dev/desktop` sessions and this one is used once per file opened — where a
-/// held session would be a slot occupied for the whole run of every browser window, to save a
-/// resolve that happens at human speed. It is also the shape that cannot leak one: the session
-/// is closed on every path out of this function.
-///
-/// The answer is about the *request*: the shell replies once it has launched something, which is
-/// before that program has read anything. What the file turned out to be is the opener's to
-/// report, in its own window.
+/// A session per request: the shell bounds `/dev/desktop` sessions, and this is used once per
+/// file at human speed. The answer is about the request; what the file turned out to be is the
+/// opener's to report.
 fn ask_shell_to_open(root_ns: u64, path: &str) -> bool {
     use librsproto::desktop::Desktop;
     let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
@@ -371,7 +298,6 @@ fn ask_shell_to_open(root_ns: u64, path: &str) -> bool {
     ok
 }
 
-/// `HOME` from the setup record, or `/` for a process that was told nothing.
 fn home_of(env: &libstream::wire::Record) -> String {
     env.schema
         .fields
@@ -383,11 +309,8 @@ fn home_of(env: &libstream::wire::Record) -> String {
         .unwrap_or_else(|| String::from("/"))
 }
 
-/// Put `bytes` on the clipboard as a list of paths.
-///
-/// **Connects per operation rather than holding a session open**, as `nxedit` and `nxterm` do: a
-/// person copies a handful of times a minute at most, and a held session costs the server a
-/// wait-set slot in a set every application in the window system is in.
+/// Put `bytes` on the clipboard as a list of paths, connecting per operation as `nxedit` and
+/// `nxterm` do: a held session costs a wait-set slot.
 fn clip_put(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
     let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
     let mut clip = librsproto::clipboard::Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
@@ -396,10 +319,8 @@ fn clip_put(ns: u64, bytes: &[u8]) -> Result<(), &'static str> {
     r.map_err(|_| "the clipboard refused it")
 }
 
-/// Read the newest clipboard entry: its kind, and how many bytes landed in `out`.
-///
-/// `Ok(None)` is an empty ring, which is not a failure — it is what a paste before any copy
-/// finds.
+/// Read the newest clipboard entry: its kind, and how many bytes landed in `out`; `Ok(None)` is
+/// an empty ring, which is what a paste before any copy finds.
 fn clip_get(ns: u64, out: &mut [u8]) -> Result<Option<(u16, usize)>, &'static str> {
     let mut buf = [0u8; libkern::abi::IPC_MSG_SIZE];
     let mut clip = librsproto::clipboard::Clipboard::connect(ns, &mut buf).map_err(|_| "no /dev/clipboard")?;
@@ -413,13 +334,9 @@ fn clip_get(ns: u64, out: &mut [u8]) -> Result<Option<(u16, usize)>, &'static st
     }
 }
 
-/// Block until the compositor has something to say, **or the watch does** (Phase 6 Part F).
-///
-/// One handle until the drives: a browser read a directory when it was told to and otherwise
-/// waited on the session channel alone. A watch is the second source of work — a stick plugged
-/// in is drawn with no key pressed and no pointer moved — and a browser the service refused one
-/// waits as before. **Whether the watch was among what woke it**: a record names each handle ready,
-/// first word.
+/// Block until the compositor has something to say, or the watch does; with no watch it waits
+/// on the session channel alone. Returns whether the watch was among what woke it: a record
+/// names each handle ready, first word.
 fn wait_for(h: u64, watch: Option<u64>) -> bool {
     let handles = [h, watch.unwrap_or(0)];
     let n = if watch.is_some() { 2 } else { 1 };
@@ -436,11 +353,6 @@ fn wait_for(h: u64, watch: Option<u64>) -> bool {
     })
 }
 
-/// Tell the compositor what a newly created window of this browser is.
-///
-/// **Extracted so a second window gets the same treatment** (M14 Part B): it was inline before
-/// the loop, which was fine while a window was created once and would have been the first thing
-/// New Window quietly failed to do.
 fn dress<T: libsurface::Transport>(win: &mut Session<T>, id: u32) {
     if let Some(mut w) = win.window(id)
         && w.set_title(TITLE).is_err()
@@ -449,18 +361,13 @@ fn dress<T: libsurface::Transport>(win: &mut Session<T>, id: u32) {
     }
 }
 
-/// The theme the shell handed this application, or the built-in one.
-///
-/// **Absent is normal rather than an error**: a client started outside a graphical session — by
-/// `init`, or by a test harness — gets no setup record at all, and a desktop that refused to draw
-/// without one would be a client that cannot be run on its own.
+/// The theme the shell handed this application, or the built-in one: a client started outside a
+/// graphical session gets no setup record, which is normal.
 fn theme_of(env: &libstream::wire::Record) -> Theme {
     env.field_str("THEME").map(|s| Theme::from_config(s).0).unwrap_or_default()
 }
 
 /// Entry point.
-///
-/// Called by the kernel's ELF entry with the standard bootstrap arguments.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
     kprint(b"nxfiles: up\n");
@@ -470,22 +377,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         _ => (Vec::new(), libstream::wire::Record::default()),
     };
     let home = home_of(&env);
-    // **`argv[1]` is where to start, and home is where a window belongs** (desktop refresh,
-    // Part C): the shell's Places menu launches this at `Documents` or `/`, and that is where the
-    // first window opens — but the sidebar's places, and every window opened after it, are still
-    // this session's home's. A browser that took the argument *as* its home would offer
-    // `Documents/Documents`.
+    // `argv[1]` is where the first window starts; home, which the sidebar's places and every later
+    // window keep, is not the argument (it would offer `Documents/Documents`).
     let start = argv.get(1).cloned().unwrap_or_else(|| home.clone());
     libkern::debug::Line::new().s(b"nxfiles: starting at ").untrusted(start.as_bytes()).end();
-    // **From the environment, not from a default** (M11 Part C), and read *here* — beside the
-    // other thing the session tells this program — rather than at the point it is first drawn
-    // with. A value logged where it is learned appears in the order a reader expects it, which
-    // is what an assertion about it can be placed against.
+    // Read here, beside the other thing the session tells this program, so the log shows it in
+    // the order a reader expects.
     let theme = theme_of(&env);
-    // **Said out loud because a theme that arrives is otherwise invisible to a gate.** Colours
-    // are pixels and `check-login` boots a release image with no rendered grid to read; the size
-    // is one number that came from a file, and printing it is what makes the whole path — disk,
-    // shell, setup record, client — assertable from a console.
+    // Said out loud: a gate on a release image has no rendered grid to read, and this makes the
+    // whole path — disk, shell, setup record, client — assertable from a console.
     libkern::debug::Line::new().s(b"nxfiles: theme font_px ").u(theme.font_px as u64).end();
 
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
@@ -503,16 +403,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     let size = app.window_size();
     // SAFETY: `root_ns` is this process's live root namespace.
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
-        // Boxed for the reason every client here boxes it: ~9 KiB of message buffers has no
-        // business in a stack frame beside everything else.
+        // Boxed: ~9 KiB of message buffers has no business in a stack frame.
         Ok(t) => Box::new(t),
         Err(_) => fail(b"nxfiles: connect to /dev/draw FAILED\n"),
     };
     let mut win = Session::new(transport);
-    // **The window is a `libui::window::Child`** (M14 Part B), top-level role and all — the same
-    // value the menu and the dialog have always been. Everything a window needs to be drawn and
-    // routed lives in there, so a second window is a second value rather than a second copy of
-    // this loop.
+    // The window is a `libui::window::Child`, so a second window is a second value rather than a
+    // second copy of this loop.
     let top = {
         let ui = app.view(&theme, None);
         match Child::open_sized(&mut win, Role::Normal, (0, 0), size, &ui, &font, &theme, BUFFERS) {
@@ -523,27 +420,21 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     dress(&mut win, top.id());
 
     let bounds = Rect::new(0, 0, size.w, size.h);
-    // The open menu's window, and which menu it is showing — two things because the *same*
-    // popup cannot serve both: choosing `Edit` while `File` is open has to replace the window,
-    // not redraw it at the other anchor.
+    // The open menu's window and which menu it shows: choosing `Edit` while `File` is open
+    // replaces the window rather than redrawing it at the other anchor.
     let menu: Option<Child> = None;
     let menu_shown: Option<usize> = None;
     let menu_hovered: Option<u64> = None;
-    // The delete question's window, alive only while one is being asked (M12 Part A's shape).
+    // The delete question's window, alive only while one is being asked.
     let dialog: Option<(Dialog, Child)> = None;
     let dialog_hovered: Option<u64> = None;
     let ev = win.wait_handle();
-    // The name prompt's receipt, reported on change the way `nxedit` reports its buffer's.
     let reported_prompt = app.prompt_len();
     let reported_pick: Option<String> = app.picked_name();
     let reported_loc: Option<usize> = app.location_text().map(|t| t.chars().count());
 
-    /// Everything one window of this browser is.
-    ///
-    /// **A window, not the application** (M14 Part B). Its own panes and tabs, its own surface
-    /// and retained tree, its own menu and its own question, and its own receipt. The `Session`,
-    /// the font and the theme are not here: one connection, one face and one palette serve every
-    /// window this process owns.
+    /// Everything one window of this browser is: its own panes, surface, tree, menu, dialog and
+    /// receipt. One connection, face and palette serve every window the process owns.
     struct Win {
         top: Child,
         app: App,
@@ -552,26 +443,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         menu: Option<Child>,
         menu_shown: Option<usize>,
         menu_hovered: Option<u64>,
-        /// The one dialog window this browser window may have open, and which dialog it is.
-        ///
-        /// **One slot rather than one field per dialog.** The plumbing below — open, close,
-        /// present, route, and deciding which window an event belongs to — was written for the
-        /// delete question and is the same for every dialog after it. The kind rides with the
-        /// window so that a *different* dialog opening replaces it rather than being drawn into
-        /// a frame sized for the last one.
+        /// The one dialog window this browser window may have open, and which dialog it is; the
+        /// kind rides with it so a different dialog opening replaces it.
         dialog: Option<(Dialog, Child)>,
         dialog_hovered: Option<u64>,
         reported_prompt: Option<usize>,
-        /// The selected row's name, reported on change — see the receipt below.
         reported_pick: Option<String>,
-        /// How many characters the location bar holds, reported the same way.
         reported_loc: Option<usize>,
     }
 
-    /// Open a window of this browser, dressed and ready to be serviced.
-    ///
-    /// **The same path for the first window and every later one**, so a New Window cannot end up
-    /// subtly different from the original — an untitled bar being the obvious way.
+    /// Open a window of this browser, dressed and ready: the path for the first window and every
+    /// later one, so a New Window cannot differ.
     fn open_window<T: libsurface::Transport>(
         win: &mut Session<T>,
         mut app: App,
@@ -601,9 +483,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         })
     }
 
-    /// **The drives as read now, given to every window** when they changed — never to one alone,
-    /// or the others go on showing what was (PR #367 review: a New Window with no watch updated
-    /// itself and the cache, so the windows already open never saw the change).
+    /// The drives as read now, given to every window when they changed, never to one alone, or
+    /// the others go on showing what was.
     fn renew_drives(wins: &mut [Win], drives: &mut Vec<Drive>, now: Vec<Drive>) {
         if now != *drives {
             say_drives(&now);
@@ -615,7 +496,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     }
 
     let mut quit_pending = false;
-    // **The drives are to be read again**: a ping, an eject, or — with no watch — a focus.
+    // The drives are to be read again: a ping, an eject, or — with no watch — a focus.
     let mut refresh_drives = false;
     let mut wins = alloc::vec![Win {
         top,
@@ -632,24 +513,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         reported_loc,
     }];
 
-    // **The drives, once the window is up** (PR #367 review): opening the watch and reading the
-    // table each wait for the storage service, which is one thread and may be in an unmount chain
-    // for seconds, and a browser that asked first would show no window until it answered. The
-    // first frame has no Drives; the loop's first turn draws them.
+    // The drives, once the window is up: opening the watch and reading the table wait for the
+    // storage service, which may be in an unmount chain for seconds. The first frame has no
+    // Drives; the loop's first turn draws them.
     let mut watch = open_watch(root_ns);
     let mut drives = Vec::new();
     if let Some(now) = read_drives(root_ns) {
         renew_drives(&mut wins, &mut drives, now);
     }
-    // One message's room for the watch's pings, held for the browser's run.
     let mut ping_buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
 
     loop {
-        // **Every window this process owns, each serviced exactly as one used to be.**
-        //
-        // Destructured rather than dotted through, which is what keeps this loop readable across
-        // the conversion: every name below means what it meant when there was one window.
-        // Set by a window that owes a frame *now* — see the sites that set it.
         let mut redraw_now = false;
         if core::mem::take(&mut refresh_drives)
             && let Some(now) = read_drives(root_ns)
@@ -660,7 +534,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let Win {
                 top,
                 app,
-                // The resize acts on the window whose `Configure` it was, in the dispatch below.
                 size: _,
                 bounds,
                 menu,
@@ -673,22 +546,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 reported_loc,
             } = entry;
             let window_id = top.id();
-            // ---- render ----
-            // The widget under the pointer, from the router that has always known and that nothing
-            // had ever asked (M11 Part E batch 3).
             let ui = app.view(&theme, top.hovered_key());
             let l = layout(&ui, *bounds, &FontMetrics::new(&font, theme.font_px));
-            // Where each menu drops from, read every frame rather than when one opens: a bar item's
-            // position is a fact about the layout, and before the first one there is nowhere to put
-            // a popup at all.
+            // Where each menu drops from, read every frame: a bar item's position is a fact about
+            // the layout.
             app.place_menus(&ui, &l);
-            // The layout is computed here rather than inside `present` because the menu bar's
-            // anchors are read from it — see `present_laid_out`.
+            // Laid out here, not inside `present`, because the menu bar's anchors read it.
             if !top.present_laid_out(&mut win, &ui, &l, &font, &theme) {
                 fail(b"nxfiles: the window could not be drawn\n");
             }
 
-            // ---- the requests this frame owes the compositor ----
             if app.take_move_request()
                 && let Some(mut w) = win.window(window_id)
                 && w.start_move().is_err()
@@ -707,8 +574,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             {
                 kprint(b"nxfiles: the state request was refused\n");
             }
-            // **The dialog's own title bar, on the dialog's own window.** A `StartMove` names a
-            // window id, so this cannot share the branch above.
             if app.take_confirm_move()
                 && let Some((_, c)) = dialog.as_ref()
                 && let Some(mut w) = win.window(c.id())
@@ -717,11 +582,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 kprint(b"nxfiles: the compositor refused the dialog's move\n");
             }
 
-            // ---- the menu's window ----
-            //
-            // Opened and destroyed with the menu, because `popup` is a transient role: the
-            // compositor takes it with its parent, it holds the keyboard while it is up, and a
-            // hidden one would still be a window in the stack.
+            // Opened and destroyed with the menu: a `popup` is a transient role that holds the
+            // keyboard while up, and a hidden one would still be a window in the stack.
             if *menu_shown != app.menus.open() {
                 if let Some(m) = menu.take() {
                     m.close(&mut win);
@@ -745,11 +607,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         None => *menu = None,
                     }
                     match menu.as_ref() {
-                        // **Where it is and how big, unconditionally.** `check-login` boots the
-                        // release image, so a `test-harness` line would not exist in the binary it
-                        // runs — and this is the only thing that says the menu became a window. The
-                        // gate divides the height by the number of rows rather than deriving one
-                        // from the theme's text size, which is the metric that is *not* fixed.
+                        // Where it is and how big, unconditionally (`check-login` matches this
+                        // line, and a release image has no `test-harness` line): the gate divides
+                        // the height by the row count rather than read the theme's text size.
                         Some(m) => {
                             let o = win.window(m.id()).and_then(|w| w.configured()).map_or((0, 0), |c| (c.x, c.y));
                             libkern::debug::Line::new()
@@ -765,8 +625,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                                 .u(m.size().h as u64)
                                 .end();
                         }
-                        // Not fatal: the browser is usable without its menu, and saying so beats a
-                        // window that silently never appears.
+                        // Not fatal: the browser is usable without its menu.
                         None => {
                             kprint(b"nxfiles: could not open the menu\n");
                             app.menus.close();
@@ -779,12 +638,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let now = m.hovered_key();
                 if now != *menu_hovered {
                     *menu_hovered = now;
-                    // **Which row the pointer is over, unconditionally** (M14 Part A). `check-login`
-                    // boots the release image, so a `test-harness` line would not exist in the binary
-                    // it runs — and since the File menu grew a separator, dividing the popup's height
-                    // by a row count names the wrong row. The gate walks down and stops when this
-                    // says it is over the one it means to click. A key is a number this program
-                    // chose: not a label, not a position, and nothing anybody typed.
+                    // Which row the pointer is over, unconditionally: `check-login` matches this
+                    // line, walks down and stops at the row it means to click. A key is a number
+                    // this program chose, not a label or a position.
                     let mut l = libkern::debug::Line::new();
                     l.s(b"nxfiles: menu hover ");
                     match now {
@@ -805,32 +661,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
 
-            // **One line per character typed into the name prompt.** Injection is relative and
-            // unacknowledged, so without a receipt a gate types at whatever speed it likes and finds
-            // out about a dropped keystroke as a wrong filename several steps later. A count, not
-            // the text — what somebody is naming a file is theirs, and the listing shows it anyway.
-            //
-            // **Emitted here rather than in `render`, which is where it was**, so the *first* one —
-            // `0 chars`, the one a gate waits on before it starts typing — comes out after the menu
-            // popup has been told to close rather than before. A `popup` holds the keyboard while it
-            // is up, and the prompt is a keyboard *mode* inside this window rather than a window of
-            // its own, so a key injected between the receipt and the close was routed to the menu and
-            // dropped. `check-login` timed out on that (PR #278 review, blocking 1).
-            //
-            // **What it proves.** The destroy has been *sent* when this prints, and since 2026-09-22
-            // that is enough: the compositor serves every queued request before it routes input, so
-            // a key that arrives after this line is routed after the menu is gone. Until then it was
-            // not — a busy compositor served the key first, and `check-login` still timed out here
-            // now and then under KVM (`serve_queued_requests`, in the compositor).
+            // One line per character typed into the name prompt, a count and not the text: a
+            // gate types at its own speed and otherwise finds a dropped keystroke as a wrong
+            // filename later. The first (`0 chars`, which `check-login` waits on) is emitted after
+            // the menu popup is told to close, as a popup holds the keyboard and a key injected
+            // before the destroy was routed to the menu and dropped. The compositor serves every
+            // queued request before it routes input, so a key after this line is routed after.
             let typed = app.prompt_len();
-            // **What is selected, reported on change** (M14 Part D, decision 5). Since a single click
-            // selects rather than opens, "the click landed and selected the right row" is a fact with
-            // no other outward sign — the window redraws and nothing is logged. On change rather than
-            // per event, like the prompt's receipt below it, so pointing down a listing costs one
-            // line per row rather than one per motion.
-            // **The location bar's length, on change** — the same receipt the name prompt has, and
-            // for the same reason: a gate typing a path needs a per-character acknowledgement, or an
-            // unacknowledged burst becomes a dropped keystroke found later as a wrong path.
+            // The selected row's name and the location bar's length, reported on change: a click
+            // that selects has no other outward sign, and a gate typing a path needs a
+            // per-character acknowledgement. Gates match `selected` and `location so far`.
             let loc = app.location_text().map(|t| t.chars().count());
             if loc != *reported_loc {
                 *reported_loc = loc;
@@ -856,11 +696,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
 
-            // ---- the dialog's window ----
-            //
-            // **Reconciled against the *kind*, not against "is one open".** A dialog replacing another
-            // is a different tree in a differently sized frame, so the window is closed and reopened
-            // rather than redrawn — which is what a `bool` here would silently get wrong.
+            // Reconciled against the kind, not "is one open": a dialog replacing another is a
+            // differently sized frame, so the window is closed and reopened.
             let want = app.dialog();
             if want != dialog.as_ref().map(|(k, _)| *k) {
                 if let Some((kind, c)) = dialog.take() {
@@ -869,16 +706,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 *dialog_hovered = None;
                 if let Some(kind) = want {
-                    // **Said before the window is asked for.** A dialog's first `Configure` is held
-                    // for the manager, so a line printed after `Child::open` returned would be
-                    // downstream of the shell and racing it to the console (M12 Part A, PR #267).
+                    // Said before the window is asked for, so it cannot race the shell to the
+                    // console: the dialog's first `Configure` is held for the manager.
                     kprint(kind.opening());
                     let view = app.dialog_view(&theme, None);
                     let opened = Child::open(
                         &mut win,
                         Role::Dialog { parent: window_id },
-                        // (0, 0): this client does not know where it is on screen, and a dialog's
-                        // offset is a preference the manager overrides anyway.
+                        // (0, 0): the manager overrides a dialog's offset anyway.
                         (0, 0),
                         &view,
                         &font,
@@ -903,10 +738,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
 
-            // **The filesystem work, here because it is syscalls.** `update` produced a value saying
-            // what should happen; this is where it happens, and the listing is read again afterwards
-            // so that what the person sees is what is on disk rather than what was asked for.
-            // ---- the clipboard, which is syscalls ----
             if let Some((verb, paths)) = app.take_clip_push() {
                 let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
                 let mut payload = [0u8; librsproto::clipboard::MAX_CLIP_BYTES];
@@ -923,9 +754,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                             .end(),
                         Err(e) => app.operated(e),
                     },
-                    // **Refused rather than truncated**, and said out loud: half a path is a path to
-                    // somewhere else, and this is the one failure here that could act on the wrong
-                    // file.
+                    // Refused rather than truncated, and said: half a path names another file.
                     None => app.operated("too many paths for one clipboard entry"),
                 }
             }
@@ -935,16 +764,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     Ok(Some((kind, len))) if kind == librsproto::clipboard::CLIP_KIND_PATH => {
                         match librsproto::clipboard::Paths::read(&payload[..len]) {
                             Some(p) => {
-                                // **The filesystem is asked what each path is**, because the wire
-                                // carries paths and a copy of a folder is a different operation from
-                                // a copy of a file. `libfs::is_dir` is one resolve per pasted entry,
-                                // at human speed.
+                                // The filesystem is asked what each path is: the wire carries
+                                // paths, and a folder copy differs from a file copy.
                                 let list: Vec<(&str, bool)> =
                                     p.iter().map(|path| (path, libfs::is_dir(root_ns, path.as_bytes()))).collect();
                                 app.pasted(p.verb, &list);
                             }
-                            // The kind said paths and the bytes are not: a server or a client is
-                            // wrong, and neither is this browser's to fix.
+                            // The kind said paths and the bytes are not: not this browser's to fix.
                             None => app.operated("the clipboard entry is not readable"),
                         }
                     }
@@ -955,15 +781,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
 
             if app.has_ops() {
-                // **The whole queue, then one listing.** A paste is several operations and each gets
-                // its own line; re-listing between them would read the directory once per file and
-                // show it half-done in between.
-                // **Every outcome, not the last one** (PR #285 review, worth fixing 6). The queue
-                // fixed the *op* slot and left the notice with the identical defect: copy four files
-                // into a directory holding three of them and three say "that name is taken" while the
-                // fourth says "copied" — and the strip, which is the person's channel, said *copied*.
-                // The console keeps its line per operation; the strip gets a sentence about all of
-                // them.
+                // The whole queue, then one listing, so the directory is not shown half-done. Every
+                // outcome reaches the strip, not the last: three refusals then a success must not
+                // say *copied*. The console keeps a line per operation.
                 let mut said = "";
                 let mut done = 0usize;
                 let mut refused: Option<&'static str> = None;
@@ -985,8 +805,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         .end();
                 }
                 match (done, refusals, refused) {
-                    // One operation keeps the sentence written for it, which is what every other
-                    // caller of `operated` produces.
                     (_, 0, _) if done <= 1 => app.operated(said),
                     (_, 0, _) => app.operated_many(done, 0, said),
                     (0, _, Some(why)) if refusals == 1 => app.operated(why),
@@ -995,32 +813,21 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 let here = String::from(app.path());
                 navigate(app, root_ns, &here);
-                // The notice `navigate` cleared is the answer to what just happened, so it is put
-                // back after the listing rather than before it.
                 app.operated(said);
-                // **Round again without waiting**, which is what this `continue` meant
-                // when the body serviced one window. Inside the per-window loop it means
-                // "next window", and the wait below would then block with a frame owed —
-                // the stale-listing bug PR #257 removed, reintroduced by the conversion
-                // (PR #283 review, worth fixing 4). The flag is what carries the old
-                // meaning across the new shape.
+                // Round again without waiting: inside the per-window loop `continue` means "next
+                // window", and the wait below would block with a frame owed. The flag carries it.
                 redraw_now = true;
                 continue;
             }
-            // **The listing is read here, not in `update`.** `update` is a function of values; a
-            // directory read is a syscall, and the application says where it wants to be rather
-            // than going there itself.
-            // **Asking the shell to open a file, which is where a browser's authority stops.** It
-            // has no `/bin`, no way to build a namespace and no business spawning anything; what it
-            // has is `/dev/desktop`, bound into every application namespace by the shell that built
-            // it. So the browser names a path and the shell decides what opens it (M10 Part D).
+            // Asking the shell to open a file is where a browser's authority stops: it has no
+            // `/bin` and no namespace-building, only `/dev/desktop`. It names a path; the shell
+            // decides what opens it.
             if let Some(path) = app.take_open() {
                 let ok = ask_shell_to_open(root_ns, &path);
                 app.opened(&path, ok);
             }
-            // **An eject, for the one request** (Phase 6 Part F), answered in the strip — and the
-            // table read again at once rather than at the watch's ping, which a browser with no
-            // watch would never get.
+            // An eject for the one request, answered in the strip; the table is read again at once,
+            // which a browser with no watch would otherwise never get.
             if let Some(name) = app.take_eject() {
                 let answer = eject(root_ns, &name);
                 let mut l = libkern::debug::Line::new();
@@ -1038,27 +845,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             if let Some(to) = app.take_goto() {
                 navigate(app, root_ns, &to);
-                // **Round again rather than waiting**, or the listing just installed is not drawn
-                // until the *next* event happens to arrive. In practice that is the key's own
-                // release a moment later, which is why hand testing and the gate both pass — and
-                // why it is worth removing rather than reasoning about (PR #257 review, finding 4).
-                // **Round again without waiting**, which is what this `continue` meant
-                // when the body serviced one window. Inside the per-window loop it means
-                // "next window", and the wait below would then block with a frame owed —
-                // the stale-listing bug PR #257 removed, reintroduced by the conversion
-                // (PR #283 review, worth fixing 4). The flag is what carries the old
-                // meaning across the new shape.
+                // Round again rather than waiting, or the listing is not drawn until the next
+                // event arrives.
                 redraw_now = true;
                 continue;
             }
-
-            // **Asked to close, by its own button or by the shell.**
         }
 
-        // ---- what the windows asked for ----
-        //
-        // **After every window has been serviced**, never inside that loop: creating or
-        // destroying a window while iterating over them is the one thing that shape cannot do.
         let mut opened = 0usize;
         for w in wins.iter_mut() {
             if w.app.take_new_window() {
@@ -1070,10 +863,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
         for _ in 0..opened {
-            // **A new window starts at home**, not at this window's directory: New Window is a
-            // second browser, and one that opened where the first happens to be looking would be
-            // a copy rather than a window.
-            // **With the drives as last read** — read again first when no watch keeps them.
+            // A new window starts at home, not here, with the drives as last read (read again
+            // first when no watch keeps them).
             if watch.is_none()
                 && let Some(now) = read_drives(root_ns)
             {
@@ -1089,9 +880,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 None => kprint(b"nxfiles: could not open another window\n"),
             }
         }
-        // **Quit closes every window.** This browser has nothing unsaved to ask about, so there
-        // is no dialog to cancel and no window that can refuse — the editor is where decision 4's
-        // interesting half lives, and this is the same rule with nothing in its way.
+        // Quit closes every window: nothing here has unsaved work, so none can refuse.
         if quit_pending {
             for w in wins.iter_mut() {
                 w.app.update(Msg::Close);
@@ -1118,19 +907,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             exit(0);
         }
 
-        // **A frame is owed, so do not block for an event.** Without this the window that
-        // asked would not repaint until the next event happened to arrive — in practice the
-        // key's own release, which is why this reads as a lag rather than a hang.
         if redraw_now {
             continue;
         }
 
-        // ---- events ----
         let watch_ready = win.events_pending() == 0 && wait_for(ev, watch);
-        // **A ping, or several**: the drives are read again once, before the next frame. A watch
-        // whose service end has gone is let go, and the browser reads the table as one refused a
-        // watch does. A ping left queued while events were pending keeps the watch ready, so the
-        // next wait returns at once and says so.
+        // A ping, or several: the drives are read once, before the next frame. A watch whose
+        // service end has gone is let go and the table is read at focus. A ping left queued while
+        // events were pending keeps the watch ready, so the next wait returns at once.
         if watch_ready && let Some(w) = watch {
             match drain_pings(w, &mut ping_buf) {
                 Ok(pinged) => refresh_drives |= pinged,
@@ -1154,8 +938,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
         }
         for (from, event) in events {
-            // **Which window is this for?** A record naming none of them is dropped rather than
-            // routed into whichever window happened to be first.
             let Some(wi) = wins.iter().position(|w| {
                 w.top.id() == from
                     || w.menu.as_ref().is_some_and(|m| m.id() == from)
@@ -1166,34 +948,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let Win { top, app, size, bounds, menu, menu_shown, menu_hovered, dialog, dialog_hovered, .. } =
                 &mut wins[wi];
             let window_id = top.id();
-            // Rebuilt for *this* window: routing is against this window's tree, and another
-            // window's would report a widget that is not the one under the pointer. **No layout
-            // here** — `Child::route` lays the content out itself, and this browser has no
-            // `drop_at` to hand one to.
+            // Rebuilt for *this* window: routing is against this window's tree. `Child::route`
+            // lays the content out itself.
             let ui = app.view(&theme, top.hovered_key());
             let mut resized = false;
-            // **The menu's window routes through the menu's tree.** Same `App`, so a row's `Msg`
-            // updates the same state a click in the list does; a different tree and router,
-            // because they describe a different window.
+            // The menu's window routes through the menu's tree, though the `Msg` updates the same
+            // `App` a click in the list does.
             if menu.as_ref().is_some_and(|m| m.id() == from) {
-                // A press landed outside the menu, so it goes away — the one thing a popup's
-                // owner cannot work out for itself, because it never sees a press aimed
-                // elsewhere (M11 Part E batch 5).
                 if matches!(event, WindowEvent::Dismissed) {
                     app.menus.close();
                     continue;
                 }
-                // **Arrows, Esc and Enter drive the open menu**, which is possible only here: a
-                // popup holds the keyboard while it is up, so these arrive naming *its* window
-                // and never reach the browser's router below. `Chose` carries the row, and the
-                // message comes from the same table the popup drew — so Enter and a click on the
-                // same row cannot do different things.
+                // Arrows, Esc and Enter drive the open menu: a popup holds the keyboard, so these
+                // never reach the browser's router. The message comes from the table the popup
+                // drew, so Enter and a click on a row cannot differ.
                 if let WindowEvent::Key(k) = event {
                     let table = app.menu_table();
                     match app.menus.key(&k, &table) {
                         KeyOutcome::Chose { menu, item: i } => {
-                            // **From the outcome rather than from `menu_shown`**, which happened
-                            // to be right here and is a second copy of the same fact.
                             if let Some(msg) = table.get(menu).and_then(|m| m.items.get(i)).and_then(|it| match it {
                                 Item::Action { msg, enabled: true, .. } => Some(msg.clone()),
                                 _ => None,
@@ -1223,9 +995,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 let mut msgs = dialog
                     .as_mut()
                     .map(|(kind, c)| {
-                        // **The receipt a key may be pressed after** — `opening` is said before
-                        // the window is asked for, and a key that beats the manager's placement
-                        // reaches the browser instead (see `Child::took_keyboard`).
+                        // The receipt a key may be pressed after (`opening` precedes the window,
+                        // and an earlier key can reach the browser): see `Child::took_keyboard`.
                         if c.took_keyboard(&event) {
                             kprint(kind.has_keyboard());
                         }
@@ -1233,22 +1004,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     })
                     .unwrap_or_default();
                 match event {
-                    // What a key means is the dialog's own — for the question, `Esc` keeps the
-                    // entry and nothing else answers, because no key may delete.
                     WindowEvent::Key(k) => msgs.extend(app.dialog_key(k)),
                     WindowEvent::Focus(f) => app.dialog_focused = f,
-                    // A dialog is not dismissed by a press elsewhere — that is a popup's event,
-                    // and a question stays until it is answered.
                     WindowEvent::Dismissed => {}
-                    // A manager asking the *dialog* to close means the same as its own close
-                    // button, and which answer that is belongs to the dialog: for the question it
-                    // is the one that changes nothing.
                     WindowEvent::CloseRequested => msgs.extend(app.dialog_dismissed()),
                     _ => {}
                 }
                 for msg in msgs {
-                    // Unconditional, because `check-login` boots the release image: these two
-                    // lines are the only outside sign of which answer was given.
+                    // Unconditional: `check-login` matches these two lines, the only outside sign
+                    // of which answer was given.
                     match msg {
                         Msg::ConfirmDelete => kprint(b"nxfiles: confirmed the delete\n"),
                         Msg::KeepIt => kprint(b"nxfiles: delete cancelled\n"),
@@ -1266,20 +1030,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     if let Some(msg) = top.route_key(&ui, k) {
                         app.update(msg);
                     } else {
-                        // Arrow keys and Enter are the browser's own, not any widget's: nothing
-                        // in this tree is focusable that would want them, and a listing a person
-                        // cannot drive from the keyboard is one they have to aim at.
+                        // Arrow keys and Enter are the browser's own: nothing in this tree is
+                        // focusable that would want them.
                         app.update(Msg::Key(k));
                     }
                 }
                 WindowEvent::Pointer(p) => {
-                    // **Counted before the event is routed** (M14 decision 5), so the message the
-                    // press produces can ask what number the click was.
-                    //
-                    // **The record's own time, since Part I.** `libui` and this crate's library
-                    // half make no syscalls, so the clock used to be read *here* — at delivery,
-                    // which is when this loop got round to the press rather than when the press
-                    // happened. `press-time` was the deferral that recorded the difference.
+                    // Counted before the event is routed, so the message the press produces can
+                    // ask what number the click was; the record's own time is used.
                     if p.kind == librsproto::surface::POINTER_BUTTON
                         && p.flags & librsproto::surface::POINTER_PRESSED != 0
                         && p.button == libkern::abi::BTN_LEFT
@@ -1290,15 +1048,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     for m in msgs {
                         app.update(m);
                     }
-                    // **The distance the toolkit does not measure.** `libui` routes messages,
-                    // and what makes a press a *drag* is how far it has travelled since — so the
-                    // application reads the record it already has. `buttons` is on every pointer
-                    // record for exactly this reason (M10 Part E).
-                    // **A drag is this window's until it leaves it** (M12 Part B). Past the
-                    // slop the browser tracks the row under the pointer itself and the payload
-                    // never reaches the compositor; only a pointer that goes outside hands the
-                    // gesture over. The compositor could not have delivered an internal drop
-                    // anyway — it skips the source window when it looks for a target.
+                    // What makes a press a drag is how far it has travelled, which `libui` does
+                    // not measure. A drag is this window's until the pointer leaves it, and only
+                    // then is it handed to the compositor.
                     match app.pointer_moved(p.x, p.y, p.buttons) {
                         Gesture::HandOff => {
                             if let Some((entry, path)) = app.take_drag() {
@@ -1313,15 +1065,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                                             .s(b"nxfiles: dragging ")
                                             .untrusted(entry.name.as_bytes())
                                             .end(),
-                                        // Refused means the pointer is not holding this window
-                                        // — the press ended between the motion and this
-                                        // request, which is ordinary rather than an error.
+                                        // Refused means the press ended between the motion and
+                                        // this request: ordinary, not an error.
                                         Err(_) => kprint(b"nxfiles: the compositor refused the drag\n"),
                                     }
                                 }
                             }
                         }
-                        // The op is taken below, with every other one.
                         Gesture::Dropped | Gesture::Moved | Gesture::None => {}
                     }
                 }
@@ -1341,23 +1091,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                             .end();
                     }
                 }
-                // A dismissal is a popup's event; this window is not one.
                 WindowEvent::Dismissed => {}
-                // **The shell asking, answered the way the close button is.** Exiting is the
-                // whole of it: the kernel closes this process's handles and the compositor
-                // tears its windows down with its session.
+                // The shell asking, answered as the close button is: the kernel closes this
+                // process's handles and the compositor tears its windows down.
                 WindowEvent::CloseRequested => {
                     kprint(b"nxfiles: asked to close, exiting\n");
                     app.update(Msg::Close);
                 }
-                // **Everything accumulated about held keys is a guess now.** This client keeps
-                // none, so there is nothing to discard — and saying so is the point: a client
-                // that silently ignored this would be wrong the moment it started tracking
-                // anything.
-                // **This browser offers drags and takes none** (M10 Part E). Moving a file by
-                // dropping it into another folder is a file *operation*, which is M12's along
-                // with rename, delete and copy — and a window that declared an acceptor without
-                // implementing one would be highlighted for drops it then swallowed.
+                // This browser offers drags and takes none: a drop is ignored, not swallowed
+                // under a highlight.
                 WindowEvent::Drop { ref name, .. } => {
                     libkern::debug::Line::new().s(b"nxfiles: ignoring a drop of ").untrusted(name.as_bytes()).end();
                 }
@@ -1365,9 +1107,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             if resized {
                 *size = app.window_size();
-                // `Child::resize` reallocates and throws the retained tree away: a tree diffed
-                // against a layout from the old bounds reports damage in the old coordinates, and
-                // starting again reports the whole window, which is what a resize is.
+                // `Child::resize` throws the retained tree away, so the next diff reports the
+                // whole window rather than damage in the old coordinates.
                 if top.resize(*size) == Some(false) {
                     fail(b"nxfiles: impossible window geometry\n");
                 }

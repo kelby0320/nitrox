@@ -7,18 +7,16 @@ use crate::*;
 /// `--selftest` image.
 ///
 /// Three claims, each checked against what the builds produced rather than against the functions
-/// that produced them — a live build that called `stage_rootfs` and then wrote one file more would
-/// pass a check on the function (PR #297 review):
+/// that produced them:
 ///
 /// 1. the live initramfs carries the ordinary initramfs's files, byte-identical except
 ///    `etc/init.toml`, which must differ — it names `nitrox-live`;
-/// 2. the ext4 filesystem inside the built stick's `root.img` holds the same entries as the
-///    ordinary image's root partition — names, kinds, sizes and contents — read back out of both
-///    with `debugfs`;
-/// 3. for the release stick, the FAT filesystem inside its `install-esp.img` module — the ESP the
-///    installer writes to a disk — holds the same entries as the release image's own ESP. The
-///    first two are about the stick booting; this one is about the machine booting once the stick
-///    is gone. Nobody installs from a test stick, so it is not asked of that one.
+/// 2. the ext4 inside the built stick's `root.img` holds the same entries as the ordinary
+///    image's root partition — names, kinds, sizes and contents — read back with `debugfs`;
+/// 3. for the release stick, the FAT inside its `install-esp.img` — the ESP the installer writes
+///    to a disk — holds the same entries as the release image's own ESP. The first two are about
+///    the stick booting; this one is about the machine booting once the stick is gone. Nobody
+///    installs from a test stick, so it is not asked of that one.
 fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
     let tag = if mode.stages_test_data() { "live-test" } else { "live" };
     let what = if mode.stages_test_data() { "the test live" } else { "the live" };
@@ -69,7 +67,7 @@ fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
     }
     println!("check-images: {what} root.img holds {base} root's {} entries, byte for byte ✓", release_tree.len());
 
-    // **The pristine root is the root too** (administration Part G.1). `install-root.img` is what
+    // **The pristine root is the root too.** `install-root.img` is what
     // the installer copies onto a disk, so it is held to the same tree as `root.img` — and its one
     // partition is found, as `nxinstall` finds it, by `libgpt`'s reader and the shared name.
     let install_root = dir.join(format!("{tag}-install-root.img"));
@@ -110,14 +108,12 @@ fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
         return Ok(());
     }
 
-    // **The installable ESP is the release ESP** (Phase 5 Part H.1, PR #307 review finding 6).
-    // The two claims above compare the parts of the live image that boot the *stick*; this module
-    // is the part that boots the machine **afterwards**, and nothing above would notice it being
-    // built from the live `limine.conf` and the live initramfs. That mistake is silent in every
-    // gate and on the desk: the installed machine boots while the stick is still plugged in, and
-    // fails the first time it is not, looking for `gpt-partlabel:nitrox-live`. So it is compared
-    // file for file against what a release image actually ships — which is also what makes
-    // `build_esp`'s own arguments the thing under test rather than a second copy of them.
+    // **The installable ESP is the release ESP.** The claims above compare the parts of the live
+    // image that boot the *stick*; this module boots the machine **afterwards**, and nothing
+    // above would notice it built from the live `limine.conf`: the installed machine boots
+    // while the stick is plugged in and fails the first time it is not, looking for
+    // `gpt-partlabel:nitrox-live`. It is compared file for file against what a release image
+    // ships, which also makes `build_esp`'s own arguments the thing under test.
     let install_esp = dir.join("install-esp.img");
     let _ = fs::remove_file(&install_esp);
     run(Command::new("mcopy").arg("-i").arg(&esp).arg("::/boot/install-esp.img").arg(&install_esp))?;
@@ -140,7 +136,6 @@ fn check_live_image(dir: &Path, release_cpio: &Path, mode: BuildMode) -> R<()> {
     Ok(())
 }
 
-/// Copy partition `n` of the GPT disk image `disk` into a file of its own.
 pub(crate) fn carve_partition(disk: &Path, n: u32, out: &Path) -> R<()> {
     use std::io::{Read, Seek, SeekFrom};
     let (lba, sectors) = partition_extent(disk, n)?;
@@ -152,15 +147,12 @@ pub(crate) fn carve_partition(disk: &Path, n: u32, out: &Path) -> R<()> {
     Ok(())
 }
 
-/// One entry of a filesystem tree: a directory, or a file's size and a hash of its bytes.
 #[derive(PartialEq, Debug, Clone)]
 pub(crate) enum TreeEntry {
     Dir,
     File { size: u64, hash: u64 },
 }
 
-/// Extract the ext4 filesystem image `fs_img` into `out` with `debugfs`, and describe every entry
-/// under it by path relative to the root.
 fn ext4_tree(fs_img: &Path, out: &Path) -> R<BTreeMap<String, TreeEntry>> {
     if out.exists() {
         fs::remove_dir_all(out)?;
@@ -187,9 +179,8 @@ fn ext4_tree(fs_img: &Path, out: &Path) -> R<BTreeMap<String, TreeEntry>> {
 }
 
 /// Extract the FAT filesystem image `fat_img` into `out` with `mcopy`, and describe every entry
-/// under it by path relative to the root — [`ext4_tree`] for the other filesystem in these images.
-///
-/// `mcopy` globs on the FAT side, so `::/*` is passed through literally rather than by a shell.
+/// under it by path, as [`ext4_tree`] does. `mcopy` globs on the FAT side, so `::/*` is passed
+/// through literally rather than by a shell.
 fn fat_tree(fat_img: &Path, out: &Path) -> R<BTreeMap<String, TreeEntry>> {
     if out.exists() {
         fs::remove_dir_all(out)?;
@@ -203,7 +194,6 @@ fn fat_tree(fat_img: &Path, out: &Path) -> R<BTreeMap<String, TreeEntry>> {
     Ok(tree)
 }
 
-/// Describe every entry under `root` by path relative to it: a directory, or a size and a hash.
 fn host_tree(root: &Path) -> R<BTreeMap<String, TreeEntry>> {
     fn walk(root: &Path, dir: &Path, tree: &mut BTreeMap<String, TreeEntry>) -> R<()> {
         use std::hash::{Hash, Hasher};
@@ -228,8 +218,6 @@ fn host_tree(root: &Path) -> R<BTreeMap<String, TreeEntry>> {
     Ok(tree)
 }
 
-/// Every way `actual` departs from `expected`, named by path — empty when the two hold the same
-/// entries with the same bytes.
 fn tree_problems(
     expected: &BTreeMap<String, TreeEntry>,
     actual: &BTreeMap<String, TreeEntry>,
@@ -251,40 +239,29 @@ fn tree_problems(
 
 /// The initramfs files a **test** image is allowed to differ from a **release** image in.
 ///
-/// **All three are data**: the extra service declarations, the profile manifest that lists the
-/// test-harness store package, and the mount manifest's two extra binds. The last code
-/// difference — `sbin/init`, for the `#[cfg(feature = "selftest")]` that made those binds —
-/// went with Phase 5 Part C.1, which made them `[[bind]]` entries and stopped passing `init`
-/// a feature at all.
-///
-/// **Everything else must be byte-identical**, and that is the whole claim of the retrofit:
-/// the software under test is the software that ships. Every program is, today.
-///
-/// **One since administration Part E.1c**, which moved the declarations and the profile manifest
-/// onto the root: `init.toml`, whose test copy adds two binds. The other two are on the root's
-/// list, [`ROOT_DIVERGENCE_ALLOWED`].
+/// `init.toml` alone, whose test copy adds two binds; the rest are on the root's list,
+/// [`ROOT_DIVERGENCE_ALLOWED`]. **Everything else must be byte-identical**: the software under
+/// test is the software that ships.
 const IMAGE_DIVERGENCE_ALLOWED: &[&str] = &["etc/init.toml"];
 
 /// The root-filesystem files a **test** root is allowed to differ from a **release** root in,
-/// beside the test package's store directory, which only a test root has (administration Part
-/// E.1c). Store paths are compared with their hash taken out ([`unhashed`]):
+/// beside the test package's store directory, which only a test root has. Store paths are
+/// compared with their hash taken out ([`unhashed`]):
 /// - **the declarations**, with the test services in them;
 /// - **the profile manifest**, which lists the test package — and the coreutils package by a
 ///   different hash, for the next reason;
 /// - **`nxterm`**, the one program built differently: a test-harness image's reports each
 ///   completed grid row on the debug console for `check-terminal`, and a release one must not
-///   narrate itself to the kernel log (PR #194 review, finding 3). The initramfs comparison
-///   never saw it, since it is not in the initramfs; this one found it the first time it ran.
+///   narrate itself to the kernel log. The initramfs comparison never saw it, since it is not in
+///   the initramfs.
 ///
-/// **Every other file on the two roots must be byte-identical**, and on a root that means the
-/// system and coreutils packages too — every program a release image runs, where the initramfs
-/// comparison reaches only the four it carries.
+/// **Every other file on the two roots must be byte-identical**, including the system and
+/// coreutils packages: every program a release image runs.
 const ROOT_DIVERGENCE_ALLOWED: &[&str] =
     &["system/services.toml", "system/profiles/system.toml", "store/coreutils-0.1.0/bin/nxterm"];
 
 /// A root path with a store package's hash taken out: `store/<hash>-<name>-<version>/…` becomes
-/// `store/<name>-<version>/…`. A package with one differing file then compares file by file,
-/// rather than as two unrelated directories whose every entry is "only on one root".
+/// `store/<name>-<version>/…`. A package with one differing file then compares file by file.
 pub(crate) fn unhashed(path: &str) -> String {
     match path.strip_prefix("store/").and_then(|rest| rest.split_once('-')) {
         Some((hash, tail)) if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
@@ -330,32 +307,19 @@ pub(crate) fn root_divergence(
 
 /// `cargo xtask check-images` — a test image may differ from a release image only in **data**.
 ///
-/// Builds both initramfs archives and compares them file by file, and since administration Part
-/// E.1c both root filesystems too, where the declarations and the profile manifest now are and
-/// every program but four ([`root_divergence`]). A new divergence fails, which is what makes the
-/// retrofit's result a wall rather than a measurement.
+/// Builds both initramfs archives and compares them file by file, and both root filesystems too
+/// ([`root_divergence`]). A new divergence fails, which is what makes the result a wall rather
+/// than a measurement.
 ///
-/// **What it actually catches**, stated precisely because the first version of this comment
-/// overstated it (PR #230 review, finding 1): wiring `mode.features()` into a build that does
-/// not take one — the shape Part B removed from `session-mgr` — makes that program's ELF differ
-/// here. A bare `#[cfg(feature = "test-harness")]` does **not**, because `eshell`,
-/// `fs-server-ext4` and `profile-server` declare no features, so the cfg is inert in both modes.
-/// The invariant is therefore "no build-mode-varying input reaches these programs", which is the
-/// useful one — a cfg that nothing can turn on is not a divergence.
+/// **What it actually catches**: wiring `mode.features()` into a build that does not take one
+/// makes that program's ELF differ here. A bare `#[cfg(feature = "test-harness")]` does **not**,
+/// because `eshell`, `fs-server-ext4` and `profile-server` declare no features, so the cfg is
+/// inert in both modes: the invariant is "no build-mode-varying input reaches these programs".
 ///
-/// A consequence worth knowing: most of the byte-identity is cargo not rebuilding a crate whose
-/// feature set did not change. That is the invariant holding, not an independent measurement of
-/// it.
-///
-/// It is deliberately a check on the **set** of differing files rather than on a byte count:
-/// the allowed three change size whenever a declaration is added, and pinning sizes would make
-/// this fail for the right reason at the wrong time.
-///
-/// **It is one-directional.** A file that *stops* differing — as `sbin/init` did when the
-/// `/subtreetest` binding became manifest data — leaves the allow-list stale with nothing to
-/// say so. That is the harmless direction, and tightening it would mean failing a
-/// build for getting *better*; the cost is that the list needs pruning by hand when a box in
-/// `test-path-retrofit.md` closes.
+/// It checks the **set** of differing files, not a byte count, which changes whenever a
+/// declaration is added. **It is one-directional**: a file that *stops* differing leaves the
+/// allow-list stale with nothing to say so — the harmless direction, since tightening it would
+/// fail a build for getting *better*; prune it by hand.
 pub(crate) fn cmd_check_images() -> R<()> {
     let dir = build_cache().join("check-images");
     fs::create_dir_all(&dir)?;
@@ -366,14 +330,12 @@ pub(crate) fn cmd_check_images() -> R<()> {
     cmd_build(BuildMode::Normal)?;
     build_initramfs(&release, BuildMode::Normal)?;
 
-    // **The third mode, the live image** (Phase 5 Part C), while the release programs are the
-    // ones built: its initramfs may differ from the release one in the root's label and nothing
-    // else, and the filesystem inside its `root.img` must be the release root's.
+    // **The third mode, the live image**: its initramfs may differ from the release one in the
+    // root's label and nothing else, and its `root.img` filesystem must be the release root's.
     check_live_image(&dir, &release, BuildMode::Normal)?;
 
-    // **And the test live image** (administration Part C.8), held to a `--selftest` image as the
-    // release stick is held to the release image: `check-storage` boots it, and what it proves
-    // about the storage chain holds for the release stick only while the two differ in data.
+    // **And the test live image**, held to a `--selftest` image: `check-storage` boots it, and
+    // what it proves holds for the release stick only while the two differ in data.
     let selftest = dir.join("selftest.cpio");
     cmd_build(BuildMode::Selftest)?;
     build_initramfs(&selftest, BuildMode::Selftest)?;
@@ -418,10 +380,8 @@ pub(crate) fn cmd_check_images() -> R<()> {
         differ
     );
 
-    // **And the roots** (administration Part E.1c). The declarations and the profile manifest
-    // live there now, so a test image's data differs on its root rather than in its initramfs —
-    // and the root is where every program but four is, so this is also the comparison that holds
-    // the system and coreutils packages byte for byte.
+    // **And the roots**, where the declarations and the profile manifest live, and where every
+    // program but four is — so this also holds the system and coreutils packages byte for byte.
     require_tool("debugfs")?;
     let mut trees = Vec::new();
     for (mode, name) in [(BuildMode::Normal, "release"), (BuildMode::TestHarness, "test")] {
@@ -456,7 +416,7 @@ pub(crate) fn cmd_check_images() -> R<()> {
 ///
 /// **`TRAILER!!!` is skipped.** It is the zero-byte end-of-archive sentinel, not a file, and
 /// counting it inflated every number this gate prints by one — "8 entries, 5 byte-identical"
-/// for what is 7 files and 4 (PR #230 review, finding 6).
+/// for what is 7 files and 4.
 fn cpio_entries(blob: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let mut out = BTreeMap::new();
     let mut i = 0usize;

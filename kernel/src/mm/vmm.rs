@@ -1,19 +1,12 @@
-//! Virtual memory manager — per-process address-space layer.
+//! Virtual memory manager: the per-process address-space layer.
 //!
-//! The third layer of the kernel's memory design (see the table at the
-//! top of `docs/architecture/memory-management.md`). The VMM owns the
-//! address-space view of memory: virtual address ranges, their
-//! protection, what backs them, and the red-black tree that stores them
-//! per process. It does not touch hardware page tables directly; that
-//! goes through [`arch::Paging`](crate::arch::Paging).
+//! The third layer of the memory design (`docs/architecture/memory-management.md`). The VMM owns
+//! the address-space view of memory: virtual ranges, their protection, what backs them, and the
+//! red-black tree storing them per process. It reaches hardware page tables only through
+//! [`arch::Paging`](crate::arch::Paging).
 //!
-//! This file lands the address-spaces-and-paging slice incrementally.
-//! Today it holds the leaf data types ([`VAddrRange`], [`Protection`],
-//! [`MappingKind`], [`Vma`]) and the [`VmaTree`] — an intrusive
-//! interval-augmented red-black tree of `Vma`s with overlap-detecting
-//! insert, point lookup, and iterative teardown. Range-overlap
-//! iteration, removal, and the `AddressSpace` owner land in the
-//! following sub-items.
+//! This file holds the leaf data types ([`VAddrRange`], [`Protection`], [`MappingKind`], [`Vma`])
+//! and the [`VmaTree`], an intrusive interval-augmented red-black tree of `Vma`s.
 
 use core::ptr::NonNull;
 
@@ -23,16 +16,9 @@ use crate::object::ObjectRef;
 
 /// A half-open range of virtual addresses, `[start, end)`.
 ///
-/// Both endpoints are 4 KiB aligned and `end > start`. The range is the
-/// unit a [`Vma`] covers, but the type is dumber than a `Vma`: it carries
-/// no protection or backing information, so the VMM can pass a
-/// `VAddrRange` to the tree's overlap queries without manufacturing a
-/// fake `Vma`.
-///
-/// Half-open intervals were chosen for the same reason most Unix VMM
-/// code uses them: `len()` is `end - start` with no off-by-one, and two
-/// "adjacent" ranges (one ends where the next begins) compose by
-/// endpoint equality rather than `+ 1`.
+/// Both endpoints are 4 KiB aligned and `end > start`. It carries no protection or backing, so the
+/// tree's overlap queries can take one without a fake `Vma`. Half-open so `len()` is `end - start`
+/// and adjacent ranges compose by endpoint equality.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct VAddrRange {
     start: VirtAddr,
@@ -40,11 +26,8 @@ pub struct VAddrRange {
 }
 
 impl VAddrRange {
-    /// Construct a range covering `[start, end)`.
-    ///
-    /// Returns `None` if either endpoint is not 4 KiB aligned, or if
-    /// `end <= start`. An empty range has no meaning at the VMA layer:
-    /// every `Vma` covers at least one page.
+    /// Construct a range covering `[start, end)`; `None` if either endpoint is not 4 KiB aligned
+    /// or `end <= start` (every `Vma` covers at least one page).
     pub const fn new(start: VirtAddr, end: VirtAddr) -> Option<Self> {
         if !start.is_page_aligned() || !end.is_page_aligned() {
             return None;
@@ -63,8 +46,7 @@ impl VAddrRange {
         self.end
     }
 
-    /// Length of the range in bytes; always a non-zero multiple of
-    /// [`PAGE_SIZE`].
+    /// Length in bytes; always a non-zero multiple of [`PAGE_SIZE`].
     #[allow(clippy::len_without_is_empty, reason = "never empty: `new` refuses `end <= start`")]
     pub const fn len(self) -> u64 {
         self.end.as_u64() - self.start.as_u64()
@@ -80,15 +62,12 @@ impl VAddrRange {
         addr.as_u64() >= self.start.as_u64() && addr.as_u64() < self.end.as_u64()
     }
 
-    /// `true` if `self` and `other` share at least one byte. Adjacent
-    /// (touching) ranges do **not** overlap under the half-open
-    /// convention.
+    /// `true` if `self` and `other` share a byte; adjacent ranges do **not** overlap.
     pub const fn overlaps(self, other: VAddrRange) -> bool {
         self.start.as_u64() < other.end.as_u64() && other.start.as_u64() < self.end.as_u64()
     }
 
-    /// The intersection of `self` and `other`, or `None` if they are
-    /// disjoint — including the merely adjacent case.
+    /// The intersection, or `None` if disjoint (including merely adjacent).
     pub fn intersect(self, other: VAddrRange) -> Option<VAddrRange> {
         let start = core::cmp::max(self.start, other.start);
         let end = core::cmp::min(self.end, other.end);
@@ -96,27 +75,16 @@ impl VAddrRange {
     }
 }
 
-/// VMA-level access policy: who may reach the mapping and what may they
-/// do with it.
+/// VMA-level access policy: who may reach the mapping and what they may do with it.
 ///
-/// `Protection` is a narrower abstraction than
-/// [`PageFlags`](crate::arch::paging::PageFlags). Not every PTE flag is
-/// meaningful at the VMA layer: a VMA never carries `GLOBAL` (a user
-/// mapping cannot be global; a kernel-image mapping is global by
-/// construction at install time, not via a per-VMA decision), and
-/// cache-attribute bits are per-mapping policy decided by the code that
-/// installs the PTE (driver MMIO, framebuffer), not a property of the
-/// address range. The VMM translates `Protection` to `PageFlags` when
-/// populating a leaf.
+/// Narrower than [`PageFlags`](crate::arch::paging::PageFlags): a VMA never carries `GLOBAL`, and
+/// cache attributes are decided by the code that installs the PTE, not by the range. The VMM
+/// translates `Protection` to `PageFlags` when populating a leaf.
 ///
-/// "Readable" is not a separate flag: a `Vma` existing in the tree
-/// implies the range is readable. x86_64 has no separate read bit
-/// (present implies readable); we surface that uniformly. The
-/// `mprotect`-style distinction between "no access" and "read-only" is
-/// expressed by removing the VMA entirely, not by clearing a flag.
+/// "Readable" is not a flag: a `Vma` in the tree implies readable (x86_64 has no read bit).
+/// "No access" versus "read-only" is expressed by removing the VMA, not by clearing a flag.
 ///
-/// Hand-rolled bitflags: the kernel uses no `bitflags` crate (see
-/// `kernel/CLAUDE.md`).
+/// Hand-rolled bitflags: the kernel uses no `bitflags` crate (`kernel/CLAUDE.md`).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Protection(u8);
 
@@ -128,12 +96,9 @@ impl Protection {
     /// The mapping is reachable from ring 3. Without it, kernel-only.
     pub const USER: Protection = Protection(1 << 2);
 
-    /// No flags: kernel-only, read-only, non-executable — the safe
-    /// default. Contrast
-    /// [`PageFlags::empty`](crate::arch::paging::PageFlags::empty), which
-    /// is *executable* by default because `NO_EXECUTE` is opt-in at the
-    /// hardware level. The VMM presents the safer logical default and
-    /// translates to the inverted PTE encoding at install time.
+    /// No flags: kernel-only, read-only, non-executable. Contrast
+    /// [`PageFlags::empty`](crate::arch::paging::PageFlags::empty), which is *executable* because
+    /// `NO_EXECUTE` is opt-in in hardware; the VMM translates to the inverted PTE encoding.
     pub const fn empty() -> Self {
         Self(0)
     }
@@ -164,40 +129,29 @@ impl core::ops::BitOr for Protection {
 
 /// What backs a [`Vma`]'s pages.
 ///
-/// `Device(PhysAddr)` lands with the driver MMIO mapper. The enum is a `Copy`
-/// marker — the per-mapping owning reference for [`Object`] lives in
-/// [`Vma::object`], not here, so the enum stays `Copy`/`Eq`. Adding a variant
-/// only touches the call sites that need to act on the new backing kind
-/// (notably the `match`es in `AddressSpace::free_vma_pages` and
-/// `AddressSpace::fault_in`).
+/// A `Copy` marker: the owning reference for [`Object`] lives in [`Vma::object`], so the enum
+/// stays `Copy`/`Eq`. A new variant touches only the `match`es in `AddressSpace::free_vma_pages`
+/// and `AddressSpace::fault_in`.
 ///
 /// [`Object`]: MappingKind::Object
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MappingKind {
-    /// Zero-initialised; backed by anonymous physical frames owned by the
-    /// VMA itself. Frames are faulted in lazily on first touch (see
-    /// `AddressSpace::fault_in`) when reserved via `map_vma_lazy`, or
-    /// allocated up front by `map_vma`; either way freed on unmap.
+    /// Zero-initialised, backed by anonymous frames owned by the VMA. Faulted in on first touch
+    /// when reserved via `map_vma_lazy`, or allocated up front by `map_vma`; freed on unmap.
     Anonymous,
-    /// Backed by a [`MemoryObject`](crate::object::MemoryObject)'s own,
-    /// pre-allocated frames. The owning [`ObjectRef`] is held in
-    /// [`Vma::object`]; the frames are freed by the object on its last-ref
-    /// drop, **not** by unmap.
+    /// Backed by a [`MemoryObject`](crate::object::MemoryObject)'s own pre-allocated frames. The
+    /// owning [`ObjectRef`] is in [`Vma::object`]; the object frees the frames on its last-ref
+    /// drop, **not** unmap.
     Object,
-    /// Backed by a file's pages served through the page cache. The variant and
-    /// its fault-in / teardown dispatch arms exist as of the demand-paging
-    /// slice, but **no producer constructs a `FileBacked` VMA yet** — the
-    /// page-cache and fs-server integration that fills them in is a later
-    /// Phase 2 slice. Until then a fault on such a mapping is a fatal fault.
+    /// Backed by a file's pages served through the page cache; the owning [`ObjectRef`] is in
+    /// [`Vma::object`]. A not-present fault is serviced outside the AS lock
+    /// (`AddressSpace::file_backing`, `map_file_page`).
     FileBacked,
 }
 
-/// The kind of access that triggered a page fault, decoded from the
-/// architecture's fault information into an arch-neutral form. Drives the
-/// protection check in [`AddressSpace::fault_in`].
-///
-/// "Readable" subsumes any access that is not a write or an instruction fetch;
-/// a present VMA is always readable (see [`Protection`]).
+/// The kind of access that triggered a page fault, decoded from the arch's fault information.
+/// Drives the protection check in [`AddressSpace::fault_in`]. "Readable" covers any access that is
+/// not a write or fetch; a present VMA is always readable (see [`Protection`]).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum FaultAccess {
     /// A data read.
@@ -215,9 +169,7 @@ enum RbColor {
     Black,
 }
 
-/// `true` if `node` is a real, red node. The delete fixup needs to
-/// treat `None` (a missing leaf) as black per the RB-tree convention;
-/// this helper makes that the natural single-expression check.
+/// `true` if `node` is a real, red node; the delete fixup treats `None` as black.
 fn is_red(node: Option<NonNull<Vma>>) -> bool {
     // SAFETY: when `Some`, the link pointer references a live tree
     // node by the invariants documented on `VmaTree`.
@@ -226,87 +178,64 @@ fn is_red(node: Option<NonNull<Vma>>) -> bool {
 
 /// Intrusive red-black-tree link embedded in every [`Vma`].
 ///
-/// Raw pointers because the tree forms cycles — every non-root node's
-/// parent slot points back through the parent's child slot at the same
-/// node — which Rust's borrow checker correctly refuses to express with
-/// references. The pointers are non-aliasing in the safe sense: every
-/// `Vma` is reached through exactly one tree node. Expressing that as
-/// `&mut Vma` is still impossible because a tree walk needs the parent
-/// reference live while it visits a child, and the parent's child slot
-/// aliases the child reference.
+/// Raw pointers because the tree forms cycles (a child's parent slot points back through the
+/// parent's child slot), which references cannot express: a walk needs the parent live while it
+/// visits a child. Every `Vma` is reached through exactly one tree node. `NonNull` gives a
+/// one-word `Option` with a niche and a never-dangling-by-construction link.
 ///
-/// `NonNull` rather than `*mut Vma` for the nullable-but-aligned shape
-/// (`Option<NonNull<Vma>>` is one machine word with a niche-optimised
-/// `None`) and the soundness invariant that a non-`None` link is never
-/// dangling-by-construction.
-///
-/// The link is private to `mm::vmm`; callers outside this module neither
-/// see nor construct one. It carries no methods today — accessors and
-/// the structural mutators arrive with the tree operations.
+/// Private to `mm::vmm`.
 #[derive(Debug)]
 struct RbLink {
     parent: Option<NonNull<Vma>>,
     left: Option<NonNull<Vma>>,
     right: Option<NonNull<Vma>>,
     color: RbColor,
-    /// The largest `range.end` in the subtree rooted at this node — the
-    /// interval-tree augmentation. Maintained on every structural
-    /// mutation by the tree operations.
+    /// The largest `range.end` in the subtree rooted here (the interval augmentation); kept
+    /// current by every structural mutation.
     subtree_max_end: VirtAddr,
 }
 
 impl RbLink {
-    /// Construct a link for a freshly-allocated `Vma` whose own range
-    /// ends at `end`. New nodes are red — the standard RB-tree insertion
-    /// convention; the insert fixup recolours as needed.
+    /// A link for a fresh `Vma` whose range ends at `end`. New nodes are red (the insert fixup
+    /// recolours).
     const fn new(end: VirtAddr) -> Self {
         Self { parent: None, left: None, right: None, color: RbColor::Red, subtree_max_end: end }
     }
 }
 
-/// A virtual memory area: a contiguous virtual address range with
-/// uniform protection and a single backing kind.
+/// A virtual memory area: a contiguous virtual range with uniform protection and one backing
+/// kind.
 ///
-/// The smallest unit the VMM tracks. An address space is a tree of
-/// non-overlapping `Vma`s. `mprotect`-style operations that change
-/// protection on only a sub-range, and merges of adjacent compatible
-/// VMAs, are tree operations rather than field mutations: a `Vma` is
-/// conceptually immutable once installed.
+/// An address space is a tree of non-overlapping `Vma`s. Changing protection on a sub-range, or
+/// merging adjacent VMAs, are tree operations: a `Vma` is conceptually immutable once installed.
 ///
-/// Once a `Vma` has been wired into a tree, its address must not change
-/// — the intrusive links of its parent and children hold raw pointers
-/// at it. Storing `Vma`s in `KBox` (and never moving the box) satisfies
-/// this. The non-`Send` / non-`Sync` status that follows from the link
-/// field is intentional: synchronisation is provided by the owning
-/// `AddressSpace`'s lock, not by `Vma` itself.
+/// Once wired into a tree its address must not change (its neighbours' links point at it), which
+/// storing `Vma`s in a never-moved `KBox` satisfies. It is non-`Send` / non-`Sync` because of the
+/// link field: synchronisation is the owning `AddressSpace`'s lock.
 #[derive(Debug)]
 pub struct Vma {
     pub range: VAddrRange,
     pub prot: Protection,
     pub mapping: MappingKind,
-    /// How this mapping's pages are cached — the backing object's answer, taken when the VMA is
+    /// How this mapping's pages are cached: the backing object's answer, taken when the VMA is
     /// made.
     ///
-    /// **Read wherever page flags are computed**, which is four sites, of which only `map_object`
-    /// can see anything but [`Caching::Normal`](crate::mm::Caching) today: an object mapping
-    /// installs every page up front, and the kinds that fault in — anonymous and file-backed — are
-    /// ordinary memory. The field is here so the answer travels with the mapping rather than being
-    /// recomputed per site, not because a fault-in path depends on it (PR #306 review).
+    /// Read wherever page flags are computed. Only `map_object` can see anything but
+    /// [`Caching::Normal`](crate::mm::Caching): an object mapping installs every page up front,
+    /// and the kinds that fault in are ordinary memory. The field lets the answer travel with the
+    /// mapping rather than being recomputed per site.
     pub caching: crate::mm::Caching,
-    /// `Some(_)` iff `mapping == MappingKind::Object`: the owning reference to
-    /// the backing [`MemoryObject`](crate::object::MemoryObject), held so its
-    /// frames outlive this mapping. Dropped when the VMA is freed (unmap or
-    /// address-space teardown), releasing one object reference. `None` for
-    /// anonymous mappings.
+    /// `Some(_)` iff `mapping` is `Object` or `FileBacked`: the owning reference to the backing
+    /// object, held so its frames outlive this mapping and dropped when the VMA is freed.
     pub object: Option<ObjectRef>,
     link: RbLink,
 }
 
 impl Drop for Vma {
-    /// **A writable file mapping lowers its file's count as it goes** (administration Part
-    /// C.1), whichever path frees it — an unmap or an address space's teardown. Lock-free, since
-    /// a VMA drops wherever those do; the object's dirty pin is not touched here — what was
-    /// written through this mapping is still unwritten, and a later write-back decides.
+    /// A writable file mapping lowers its file's writable-mapping count as it goes, whichever
+    /// path frees it (unmap or address-space teardown). Lock-free, since a VMA drops wherever
+    /// those do. The object's dirty pin is untouched: what was written through this mapping is
+    /// still unwritten, and a later write-back decides.
     fn drop(&mut self) {
         if self.mapping == MappingKind::FileBacked
             && self.prot.contains(Protection::WRITE)
@@ -323,8 +252,7 @@ impl Vma {
         Self { range, prot, mapping, caching: crate::mm::Caching::Normal, object: None, link: RbLink::new(range.end()) }
     }
 
-    /// Construct an object-backed VMA holding `object` alive for its lifetime.
-    /// Not `const` because it stores a (non-`const`) [`ObjectRef`].
+    /// Construct an object-backed VMA holding `object`; not `const` (stores an [`ObjectRef`]).
     pub fn new_object(range: VAddrRange, prot: Protection, object: ObjectRef, caching: crate::mm::Caching) -> Self {
         Self {
             range,
@@ -337,32 +265,23 @@ impl Vma {
     }
 }
 
-/// An interval-augmented red-black tree of [`Vma`]s, keyed on
-/// `range.start`.
+/// An interval-augmented red-black tree of [`Vma`]s, keyed on `range.start`.
 ///
-/// The tree owns the boxed `Vma`s it stores. Insertion takes a
-/// [`KBox<Vma>`] and consumes it on success; on overlap it returns the
-/// box back so the caller decides what to do. Removal (next sub-item)
-/// returns the box. On drop the tree iteratively frees every node
-/// without allocating.
+/// The tree owns the boxed `Vma`s it stores: `insert` consumes the box (returning it on overlap),
+/// removal returns it, and drop frees every node iteratively without allocating.
 ///
 /// ## Invariants
 ///
-/// 1. **BST ordering by `range.start`.** Sub-trees are uniquely ordered
-///    because no two stored `Vma`s overlap, so no two share a start.
-/// 2. **Red-black properties.** Root is black; no red node has a red
-///    parent; every root-to-leaf path crosses the same number of black
-///    nodes.
-/// 3. **Interval augmentation.** Each node's `subtree_max_end` equals
-///    the maximum `range.end` over all `Vma`s in its subtree.
-/// 4. **Non-overlap.** Inserts that would create an overlap with an
-///    existing VMA are rejected.
+/// 1. **BST ordering by `range.start`.** Unique, because no two stored `Vma`s overlap.
+/// 2. **Red-black properties.** Root black; no red node has a red parent; every root-to-leaf path
+///    crosses the same number of black nodes.
+/// 3. **Interval augmentation.** A node's `subtree_max_end` is the maximum `range.end` in its
+///    subtree.
+/// 4. **Non-overlap.** An insert that would overlap an existing VMA is rejected.
 ///
-/// All link pointers (`parent`, `left`, `right`) refer to live `Vma`s
-/// owned by this tree, or are `None`. The `Vma` at the address held in
-/// any link is live until either the tree drops or the node is removed
-/// — both events run through the tree, so external code cannot
-/// invalidate them.
+/// Link pointers (`parent`, `left`, `right`) refer to live `Vma`s owned by this tree, or are
+/// `None`; a node dies only when the tree drops or removes it, so external code cannot invalidate
+/// them.
 pub struct VmaTree {
     root: Option<NonNull<Vma>>,
     len: usize,
@@ -381,19 +300,12 @@ impl VmaTree {
         self.len
     }
 
-    /// Insert `boxed` into the tree.
-    ///
-    /// On success the tree takes ownership of the box. On overlap with
-    /// an existing VMA the box is returned untouched so the caller can
-    /// drop it, modify it, or retry with a different range. The
-    /// rejection is decided by walking the BST: if the new range
-    /// overlaps any VMA in the tree it necessarily overlaps one on the
-    /// insertion path, so a single walk catches every conflict (proof
-    /// in the architecture doc).
+    /// Insert `boxed`. On success the tree owns the box; on overlap it is returned untouched. If
+    /// the new range overlaps any VMA it necessarily overlaps one on the insertion path, so a
+    /// single walk catches every conflict (proof in the architecture doc).
     pub fn insert(&mut self, boxed: KBox<Vma>) -> Result<(), KBox<Vma>> {
-        // Find the parent slot via a BST walk, checking for overlap at
-        // every visited node. `parent` ends up at the future leaf's
-        // parent; `parent_left` records which side to hook into.
+        // BST walk to the parent slot, checking overlap at every node; `parent_left` records the
+        // side to hook into.
         let new_range = boxed.range;
         let mut parent: Option<NonNull<Vma>> = None;
         let mut parent_left = false;
@@ -415,9 +327,7 @@ impl VmaTree {
             }
         }
 
-        // Hook the new node in. KBox::into_raw consumes the box and
-        // hands ownership to the tree; from here on the tree is
-        // responsible for freeing it.
+        // `into_raw` hands ownership to the tree, which must free it from here on.
         let new_node = KBox::into_raw(boxed);
         // SAFETY: `new_node` is the just-allocated node, no other reference
         // exists; we initialise its link to point at its parent.
@@ -443,21 +353,17 @@ impl VmaTree {
         }
         self.len += 1;
 
-        // Update interval augmentation up the path. This is independent
-        // of RB fixup: the set of nodes in each ancestor's subtree
-        // changed, so each ancestor's subtree_max_end may have grown.
+        // Independent of the RB fixup: each ancestor's subtree gained a node, so its
+        // `subtree_max_end` may have grown.
         self.update_max_end_up_from(parent);
 
-        // RB fixup: restore the no-red-red property. Rotations inside
-        // the fixup separately maintain augmentation on the rotated
-        // nodes (see `rotate_left` / `rotate_right`).
+        // RB fixup restores no-red-red; its rotations maintain augmentation themselves.
         self.insert_fixup(new_node);
         Ok(())
     }
 
-    /// Find the `Vma` whose range contains `addr`, if any. The interval
-    /// augmentation isn't needed for a point query — a plain BST walk
-    /// is O(log n).
+    /// Find the `Vma` whose range contains `addr`. A plain O(log n) BST walk; the augmentation is
+    /// not needed.
     pub fn find_covering(&self, addr: VirtAddr) -> Option<&Vma> {
         let mut current = self.root;
         while let Some(node) = current {
@@ -474,23 +380,12 @@ impl VmaTree {
         None
     }
 
-    /// Find the lowest-start `Vma` that overlaps `query`, if any.
+    /// Find the lowest-start `Vma` that overlaps `query`.
     ///
-    /// O(log n) plain BST walk, no backtracking, no augmentation
-    /// consumed. At each node:
-    /// - If `node.start >= query.end`, the node and its right subtree
-    ///   lie entirely after the query — descend left.
-    /// - Otherwise, if `node.range` overlaps `query`, record it as the
-    ///   best candidate so far and descend left to look for an earlier
-    ///   one (`best` is overwritten only by smaller `start`s).
-    /// - Otherwise (`node.end <= query.start`, node entirely before
-    ///   query), descend right.
-    ///
-    /// The `subtree_max_end` augmentation is maintained by the tree
-    /// but not consulted here: the leftmost-overlap query is already
-    /// O(log n) without it. Augmentation pays off for disjoint-range
-    /// stabbing queries (a later sub-item) where subtree pruning
-    /// avoids visiting entire branches.
+    /// An O(log n) plain BST walk with no backtracking. At each node: if `node.start >=
+    /// query.end` the node and its right subtree lie after the query, so descend left; else if
+    /// the node overlaps, record it as `best` and descend left for an earlier one; else (entirely
+    /// before the query) descend right. The `subtree_max_end` augmentation is not consulted.
     pub fn find_first_overlapping(&self, query: VAddrRange) -> Option<&Vma> {
         let mut current = self.root;
         let mut best: Option<NonNull<Vma>> = None;
@@ -510,14 +405,11 @@ impl VmaTree {
         best.map(|n| unsafe { n.as_ref() })
     }
 
-    /// Find the lowest page-aligned gap of `size` bytes within `[min, max)`
-    /// not covered by any existing VMA, for `sys_memory_map(hint = 0)`.
+    /// Find the lowest page-aligned gap of `size` bytes within `[min, max)` not covered by any
+    /// VMA, for `sys_memory_map(hint = 0)`; `None` if none fits.
     ///
-    /// O(n) scan of the VMAs in ascending order (the common Phase 1 case has
-    /// a handful of mappings). Returns `None` if no gap fits. The produced
-    /// range is page-aligned: the cursor starts at `min` (a page-aligned
-    /// base) and only ever advances to a VMA's `range.end()`, which the
-    /// [`VAddrRange`] invariant keeps page-aligned.
+    /// An O(n) scan of the VMAs in ascending order. The result is page-aligned: the cursor starts
+    /// at the page-aligned `min` and only advances to a VMA's `range.end()`.
     pub fn find_free_range(&self, min: VirtAddr, max: VirtAddr, size: u64) -> Option<VAddrRange> {
         let max = max.as_u64();
         let mut cursor = min.as_u64();
@@ -525,14 +417,11 @@ impl VmaTree {
             let s = v.range.start().as_u64();
             let e = v.range.end().as_u64();
             if e <= cursor {
-                // Entirely behind the cursor; skip.
                 continue;
             }
-            // The gap [cursor, s) precedes this VMA. Does `size` fit in it?
             if s >= cursor.saturating_add(size) {
                 break;
             }
-            // Overlaps the cursor — jump past it and keep looking.
             cursor = e;
             if cursor.saturating_add(size) > max {
                 return None;
@@ -545,21 +434,17 @@ impl VmaTree {
         }
     }
 
-    /// In-order iterator over every `Vma` in the tree, by ascending
-    /// `range.start`.
+    /// In-order iterator over every `Vma`, by ascending `range.start`.
     pub fn iter(&self) -> Iter<'_> {
         Iter { cur: leftmost_of(self.root), _tree: core::marker::PhantomData }
     }
 
-    /// In-order iterator over every `Vma` whose range overlaps `query`,
-    /// yielded by ascending `range.start`.
+    /// In-order iterator over every `Vma` overlapping `query`, by ascending `range.start`.
     ///
-    /// Overlapping VMAs are necessarily contiguous in the in-order
-    /// sequence: if `A` and `B` both overlap `query` and `A` precedes
-    /// `B`, any `C` strictly between them has `C.start >= A.end >
-    /// query.start`, so `C.start < query.end` would also overlap. The
-    /// iterator therefore terminates at the first node with `start >=
-    /// query.end` — no further candidates can exist.
+    /// Overlapping VMAs are contiguous in the in-order sequence: if `A` precedes `B` and both
+    /// overlap `query`, any `C` between them has `C.start >= A.end > query.start`, so it overlaps
+    /// too unless `C.start >= query.end`. The iterator therefore stops at the first node with
+    /// `start >= query.end`.
     pub fn iter_overlapping(&self, query: VAddrRange) -> OverlapIter<'_> {
         OverlapIter {
             cur: self.find_first_overlapping(query).map(NonNull::from),
@@ -568,20 +453,15 @@ impl VmaTree {
         }
     }
 
-    /// Find and remove the `Vma` whose range contains `addr`, returning
-    /// the owning [`KBox`] so the caller may inspect, drop, or reinsert
-    /// a modified version. Returns `None` if no VMA covers `addr`; the
-    /// tree is unchanged in that case.
+    /// Find and remove the `Vma` whose range contains `addr`, returning the owning [`KBox`];
+    /// `None` (tree unchanged) if nothing covers `addr`.
     ///
-    /// The deletion is BST-delete with successor swap when the target
-    /// has two children, followed by an RB delete-fixup when a black
-    /// node was structurally removed (restores the equal-black-height
-    /// property). Interval augmentation is refreshed along the affected
-    /// path before the fixup runs.
+    /// BST-delete with a successor swap when the target has two children, then an RB delete-fixup
+    /// if a black node was structurally removed. Augmentation is refreshed along the affected
+    /// path before the fixup.
     pub fn remove_covering(&mut self, addr: VirtAddr) -> Option<KBox<Vma>> {
-        // Locate the target node (z) via the same BST walk as
-        // find_covering. Working with a raw pointer (rather than a
-        // borrow) lets us mutate the tree afterwards.
+        // Locate the target `z` as `find_covering` does, holding a raw pointer so the tree can be
+        // mutated afterwards.
         let mut current = self.root;
         let z = loop {
             let n = current?;
@@ -596,34 +476,29 @@ impl VmaTree {
             }
         };
 
-        // SAFETY: every link pointer touched below addresses a live
-        // tree node (root, ancestor, child, or successor reached via
-        // the standard CLRS traversal). The successor `y` is leftmost
-        // in `z`'s right subtree so its `.left` is necessarily `None`.
-        // Each structural mutation maintains the tree invariants
-        // declared at the type level.
+        // SAFETY: every link pointer touched below addresses a live tree node (root, ancestor,
+        // child, or successor reached by the CLRS traversal). The successor `y` is leftmost in
+        // `z`'s right subtree, so its `.left` is `None`. Each structural mutation maintains the
+        // type-level invariants.
         let (x, x_parent, x_is_left, y_original_color) = unsafe {
             let zp = z.as_ptr();
             let z_left = (*zp).link.left;
             let z_right = (*zp).link.right;
 
             if z_left.is_none() {
-                // 0 or 1 (right) child: x = z.right takes z's spot.
                 let x = z_right;
                 let x_parent = (*zp).link.parent;
                 let x_is_left = matches!(x_parent.map(|p| (*p.as_ptr()).link.left == Some(z)), Some(true),);
                 self.transplant(z, x);
                 (x, x_parent, x_is_left, (*zp).link.color)
             } else if z_right.is_none() {
-                // 1 (left) child: x = z.left takes z's spot.
                 let x = z_left;
                 let x_parent = (*zp).link.parent;
                 let x_is_left = matches!(x_parent.map(|p| (*p.as_ptr()).link.left == Some(z)), Some(true),);
                 self.transplant(z, x);
                 (x, x_parent, x_is_left, (*zp).link.color)
             } else {
-                // Two children: in-order successor y = leftmost of
-                // z.right. y has no left child by construction.
+                // Two children: the successor `y` is leftmost of `z.right`, so it has no left child.
                 let mut y = z_right.unwrap();
                 while let Some(yl) = (*y.as_ptr()).link.left {
                     y = yl;
@@ -633,13 +508,12 @@ impl VmaTree {
                 let x = (*yp).link.right;
                 let (x_parent, x_is_left);
                 if (*yp).link.parent == Some(z) {
-                    // y is z's direct right child. x stays as y.right;
-                    // y rises to z's spot. After fixup, x_parent is y.
+                    // `y` is z's direct right child: `x` stays as `y.right`, `y` rises to z's spot.
                     x_parent = Some(y);
                     x_is_left = false;
                 } else {
-                    // y is deeper. Transplant x for y first, then move
-                    // y up to z's spot inheriting z's right subtree.
+                    // `y` is deeper: transplant `x` for `y`, then move `y` up inheriting z's right
+                    // subtree.
                     let yp_parent = (*yp).link.parent.unwrap();
                     x_parent = Some(yp_parent);
                     x_is_left = true; // y was leftmost, so y was its parent's left child.
@@ -648,9 +522,8 @@ impl VmaTree {
                     let zr = z_right.unwrap();
                     (*zr.as_ptr()).link.parent = Some(y);
                 }
-                // Move y to z's slot. y inherits z's left subtree and
-                // z's color (so the only colour that "vanished" is y's
-                // own original colour, captured above).
+                // `y` takes z's slot, left subtree and colour, so the only colour that vanished
+                // is y's original one (captured above).
                 self.transplant(z, Some(y));
                 (*yp).link.left = z_left;
                 #[allow(clippy::unnecessary_unwrap, reason = "a node with two children: the arms above took `None`")]
@@ -661,19 +534,13 @@ impl VmaTree {
             }
         };
 
-        // Augmentation: the structural change altered subtree contents
-        // on the path from x_parent up to root. One walk fixes them all.
         self.update_max_end_up_from(x_parent);
 
-        // RB-fixup only when we removed a black node (paths through the
-        // removed position now have one fewer black, which the fixup
-        // either absorbs or rotates away).
         if y_original_color == RbColor::Black {
             self.delete_fixup(x, x_parent, x_is_left);
         }
 
-        // Detach z's link state so the returned box looks fresh. Then
-        // reconstitute the owning KBox and return it.
+        // Detach z's link state so the returned box looks fresh, then rebuild the owning KBox.
         // SAFETY: z came from KBox::into_raw in `insert`, has been
         // structurally removed from the tree, and is no longer reached
         // by any link pointer.
@@ -685,10 +552,8 @@ impl VmaTree {
         }
     }
 
-    /// Replace `u`'s slot in its parent (or the root) with `v`, and
-    /// update `v`'s parent pointer. `u`'s own parent pointer is not
-    /// cleared — the caller either reuses `u` (the successor-swap
-    /// path) or discards `u` afterwards.
+    /// Replace `u`'s slot in its parent (or the root) with `v` and update `v`'s parent pointer.
+    /// `u`'s own parent pointer is not cleared: the caller reuses or discards `u`.
     ///
     /// # Safety
     /// `u` is a live tree node; `v` is `None` or a live tree node.
@@ -713,26 +578,19 @@ impl VmaTree {
         }
     }
 
-    /// Restore the equal-black-height property after structurally
-    /// removing a black node. `x` (possibly `None`) replaced the
-    /// removed node at the spot that lost a black; `x_parent` is its
-    /// parent (or `None` if `x` is the root); `x_is_left` says which
-    /// side of `x_parent` `x` sits on, only consulted on the first
-    /// iteration since `x` may be `None`.
+    /// Restore the equal-black-height property after structurally removing a black node. `x`
+    /// (possibly `None`) replaced it at the spot that lost a black; `x_parent` is its parent
+    /// (`None` if `x` is the root); `x_is_left` says which side `x` is on, consulted only on the
+    /// first iteration since `x` may be `None`.
     ///
-    /// Four CLRS-textbook cases, mirrored for left vs. right. The
-    /// loop terminates because every iteration either rotates +
-    /// recolours to a configuration that locally absorbs the missing
-    /// black (cases 1/3/4 → break), or moves the "doubly-black" mark
-    /// one level up (case 2). When the mark reaches a red node or the
-    /// root, it is absorbed.
+    /// The four CLRS cases, mirrored. Every iteration either rotates and recolours to absorb the
+    /// missing black (cases 1/3/4, break) or moves the doubly-black mark up (case 2); it is
+    /// absorbed at a red node or the root.
     fn delete_fixup(&mut self, mut x: Option<NonNull<Vma>>, mut x_parent: Option<NonNull<Vma>>, mut x_is_left: bool) {
-        // SAFETY: in the loop body, every link pointer dereferenced is
-        // either `x_parent`, `x_parent`'s sibling, or those siblings'
-        // children — all of which are live tree nodes. The fixup
-        // invariant guarantees the sibling `w` exists (a black `None`
-        // x has a non-`None` sibling, else the parent's black-height
-        // would already differ before our removal).
+        // SAFETY: every link pointer dereferenced in the loop is `x_parent`, its sibling, or
+        // their children, all live tree nodes. The fixup invariant guarantees the sibling `w`
+        // exists (a black `None` `x` has a non-`None` sibling, or the black-height already
+        // differed before the removal).
         unsafe {
             while let Some(parent) = x_parent {
                 if matches!(x, Some(n) if n.as_ref().link.color == RbColor::Red) {
@@ -744,9 +602,8 @@ impl VmaTree {
                     let mut w = (*pp).link.right.expect("delete fixup: sibling must exist");
                     let wp = w.as_ptr();
                     if (*wp).link.color == RbColor::Red {
-                        // Case 1: red sibling. Rotate parent left and
-                        // swap colours; new sibling is one of w's
-                        // children, which is black.
+                        // Case 1: red sibling. Rotate the parent left and swap colours; the new
+                        // sibling is black.
                         (*wp).link.color = RbColor::Black;
                         (*pp).link.color = RbColor::Red;
                         self.rotate_left(parent);
@@ -756,9 +613,8 @@ impl VmaTree {
                     let w_left_black = !is_red((*wpp).link.left);
                     let w_right_black = !is_red((*wpp).link.right);
                     if w_left_black && w_right_black {
-                        // Case 2: black sibling with two black
-                        // children — recolour sibling red and push the
-                        // missing-black mark up to the parent.
+                        // Case 2: black sibling with two black children: recolour it red and push
+                        // the missing black up.
                         (*wpp).link.color = RbColor::Red;
                         x = x_parent;
                         x_parent = (*pp).link.parent;
@@ -767,9 +623,8 @@ impl VmaTree {
                         }
                     } else {
                         if w_right_black {
-                            // Case 3: outer (right) nephew black, inner
-                            // (left) red — rotate sibling right so the
-                            // outer nephew becomes red.
+                            // Case 3: outer (right) nephew black, inner red: rotate the sibling
+                            // right so the outer nephew becomes red.
                             if let Some(wl) = (*wpp).link.left {
                                 (*wl.as_ptr()).link.color = RbColor::Black;
                             }
@@ -777,8 +632,7 @@ impl VmaTree {
                             self.rotate_right(w);
                             w = (*pp).link.right.expect("rotation leaves sibling");
                         }
-                        // Case 4: outer nephew red — rotate parent and
-                        // recolour to absorb the missing black.
+                        // Case 4: outer nephew red: rotate the parent and recolour.
                         let wpp = w.as_ptr();
                         (*wpp).link.color = (*pp).link.color;
                         (*pp).link.color = RbColor::Black;
@@ -789,7 +643,6 @@ impl VmaTree {
                         break;
                     }
                 } else {
-                    // Mirror: x is its parent's right child.
                     let mut w = (*pp).link.left.expect("delete fixup: sibling must exist");
                     let wp = w.as_ptr();
                     if (*wp).link.color == RbColor::Red {
@@ -828,19 +681,15 @@ impl VmaTree {
                     }
                 }
             }
-            // Absorb any remaining missing-black into x by colouring it
-            // black. If `x` is `None`, the missing-black is at the root
-            // and disappears with nothing to absorb.
+            // Absorb any remaining missing black by colouring `x` black; if `x` is `None` it
+            // vanishes at the root.
             if let Some(n) = x {
                 (*n.as_ptr()).link.color = RbColor::Black;
             }
         }
     }
 
-    // ----- Internals -----
-
-    /// Recompute the `subtree_max_end` for the single node `n` from its
-    /// own range end and its children's `subtree_max_end`.
+    /// Recompute `subtree_max_end` of `n` from its own range end and its children's.
     ///
     /// # Safety
     /// `n` is a live tree node; its child links (which we read) are
@@ -866,8 +715,7 @@ impl VmaTree {
         }
     }
 
-    /// Walk from `start` up to the root, recomputing each ancestor's
-    /// `subtree_max_end`.
+    /// Walk from `start` up to the root, recomputing each ancestor's `subtree_max_end`.
     fn update_max_end_up_from(&mut self, start: Option<NonNull<Vma>>) {
         let mut cur = start;
         while let Some(n) = cur {
@@ -879,10 +727,9 @@ impl VmaTree {
         }
     }
 
-    /// Rotate left at `x`: x's right child y becomes the parent, x
-    /// becomes y's left child. The set of nodes in the subtree is
-    /// unchanged, so y inherits x's old `subtree_max_end`; x's gets
-    /// recomputed because its children changed.
+    /// Rotate left at `x`: its right child `y` becomes the parent and `x` y's left child. The
+    /// subtree's node set is unchanged, so `y` inherits x's old `subtree_max_end` and x's is
+    /// recomputed.
     ///
     /// # Safety
     /// `x` is a live tree node with a non-`None` right child. Every
@@ -895,13 +742,11 @@ impl VmaTree {
             let y = (*xp).link.right.expect("rotate_left precondition: right child");
             let yp = y.as_ptr();
 
-            // y's left subtree becomes x's right subtree.
             (*xp).link.right = (*yp).link.left;
             if let Some(yl) = (*yp).link.left {
                 (*yl.as_ptr()).link.parent = Some(x);
             }
 
-            // y takes x's slot in the parent.
             (*yp).link.parent = (*xp).link.parent;
             match (*xp).link.parent {
                 None => self.root = Some(y),
@@ -915,11 +760,9 @@ impl VmaTree {
                 }
             }
 
-            // x becomes y's left child.
             (*yp).link.left = Some(x);
             (*xp).link.parent = Some(y);
 
-            // Augmentation: x first (its children changed), then y.
             Self::recompute_max_end(x);
             Self::recompute_max_end(y);
         }
@@ -962,19 +805,13 @@ impl VmaTree {
         }
     }
 
-    /// Restore the no-red-red property after inserting `z` as a red
-    /// leaf. CLRS-textbook fixup: while `z`'s parent is red, look at
-    /// `z`'s uncle and either recolour (red uncle) or rotate (black
-    /// uncle), mirrored for left vs. right parent.
+    /// Restore the no-red-red property after inserting `z` as a red leaf (CLRS): while `z`'s
+    /// parent is red, recolour (red uncle) or rotate (black uncle), mirrored per side.
     fn insert_fixup(&mut self, z: NonNull<Vma>) {
         let mut z = z;
-        // SAFETY: in the loop body, every pointer dereferenced is either
-        // `z` itself or reached through `z`'s `parent` / grandparent /
-        // uncle chain. Each is a live tree node — `z` because we just
-        // inserted it, the rest because they exist as ancestors. The
-        // loop condition guarantees `z.parent` is `Some(_)` and red;
-        // since the root is always black on entry (invariant), a red
-        // parent implies a grandparent exists.
+        // SAFETY: every pointer dereferenced in the loop is `z` or reached through its parent /
+        // grandparent / uncle chain, all live tree nodes. The loop condition makes `z.parent`
+        // `Some` and red; the root is always black on entry, so a red parent has a grandparent.
         unsafe {
             while let Some(zparent) = z.as_ref().link.parent {
                 if zparent.as_ref().link.color != RbColor::Red {
@@ -985,18 +822,15 @@ impl VmaTree {
                 if (*gpp).link.left == Some(zparent) {
                     let uncle = (*gpp).link.right;
                     if matches!(uncle.map(|u| u.as_ref().link.color), Some(RbColor::Red)) {
-                        // Case 1 (left): red uncle — recolour, push up.
                         (*zparent.as_ptr()).link.color = RbColor::Black;
                         (*uncle.unwrap().as_ptr()).link.color = RbColor::Black;
                         (*gpp).link.color = RbColor::Red;
                         z = zgp;
                     } else {
                         if (*zparent.as_ptr()).link.right == Some(z) {
-                            // Case 2 (left): rotate parent left, then fall through.
                             z = zparent;
                             self.rotate_left(z);
                         }
-                        // Case 3 (left): recolour and rotate grandparent right.
                         let zp_after = z.as_ref().link.parent.unwrap();
                         (*zp_after.as_ptr()).link.color = RbColor::Black;
                         (*gpp).link.color = RbColor::Red;
@@ -1005,7 +839,6 @@ impl VmaTree {
                 } else {
                     let uncle = (*gpp).link.left;
                     if matches!(uncle.map(|u| u.as_ref().link.color), Some(RbColor::Red)) {
-                        // Case 1 (right, mirror).
                         (*zparent.as_ptr()).link.color = RbColor::Black;
                         (*uncle.unwrap().as_ptr()).link.color = RbColor::Black;
                         (*gpp).link.color = RbColor::Red;
@@ -1022,8 +855,6 @@ impl VmaTree {
                     }
                 }
             }
-            // Recolour the root black. The fixup may have left a red
-            // root in the case-1 recursion path.
             if let Some(root) = self.root {
                 (*root.as_ptr()).link.color = RbColor::Black;
             }
@@ -1037,9 +868,8 @@ impl Default for VmaTree {
     }
 }
 
-/// Walk left from `start` to the leftmost descendant in its subtree.
-/// Returns `start` itself if it has no left child, or `None` if `start`
-/// is itself `None`.
+/// Walk left from `start` to the leftmost descendant (`start` itself if it has no left child,
+/// `None` if `start` is `None`).
 fn leftmost_of(start: Option<NonNull<Vma>>) -> Option<NonNull<Vma>> {
     let mut cur = start?;
     // SAFETY: link pointers refer to live tree nodes by invariants.
@@ -1051,11 +881,8 @@ fn leftmost_of(start: Option<NonNull<Vma>>) -> Option<NonNull<Vma>> {
     Some(cur)
 }
 
-/// In-order successor of `node` in the tree it sits in: the next-larger
-/// node by `range.start`. Walks the right subtree's leftmost path if
-/// `node` has a right child; otherwise climbs via parent pointers until
-/// arriving from a left child. Returns `None` if `node` is the
-/// rightmost in the tree.
+/// In-order successor of `node`: the leftmost of its right subtree if it has one, else the first
+/// ancestor reached from a left child. `None` for the rightmost node.
 fn successor(node: NonNull<Vma>) -> Option<NonNull<Vma>> {
     // SAFETY: link pointers refer to live tree nodes by invariants.
     unsafe {
@@ -1075,8 +902,7 @@ fn successor(node: NonNull<Vma>) -> Option<NonNull<Vma>> {
     }
 }
 
-/// In-order iterator over every `Vma` in a [`VmaTree`], yielded by
-/// ascending `range.start`.
+/// In-order iterator over every `Vma` in a [`VmaTree`], by ascending `range.start`.
 pub struct Iter<'a> {
     cur: Option<NonNull<Vma>>,
     _tree: core::marker::PhantomData<&'a VmaTree>,
@@ -1093,10 +919,9 @@ impl<'a> Iterator for Iter<'a> {
     }
 }
 
-/// In-order iterator over every `Vma` in a [`VmaTree`] that overlaps a
-/// query range, yielded by ascending `range.start`. Terminates at the
-/// first node whose `range.start >= query.end` — past that point no
-/// further overlap is possible (proof on [`VmaTree::iter_overlapping`]).
+/// In-order iterator over the `Vma`s of a [`VmaTree`] overlapping a query range, by ascending
+/// `range.start`; stops at the first node with `range.start >= query.end` (proof on
+/// [`VmaTree::iter_overlapping`]).
 pub struct OverlapIter<'a> {
     cur: Option<NonNull<Vma>>,
     end: VirtAddr,
@@ -1120,9 +945,8 @@ impl<'a> Iterator for OverlapIter<'a> {
 }
 
 impl Drop for VmaTree {
-    /// Iterative post-order teardown using parent pointers. Each leaf
-    /// is freed and its parent's pointing slot cleared, so the next
-    /// iteration finds a new leaf one level up. O(n), no allocation.
+    /// Iterative post-order teardown via parent pointers: each leaf is freed and its parent's
+    /// slot cleared. O(n), no allocation.
     fn drop(&mut self) {
         let mut current = self.root;
         while let Some(n) = current {
@@ -1134,7 +958,6 @@ impl Drop for VmaTree {
                 } else if let Some(r) = (*np).link.right {
                     Some(r)
                 } else {
-                    // Leaf: clear the parent's slot and free.
                     let parent = (*np).link.parent;
                     if let Some(p) = parent {
                         let pp = p.as_ptr();
@@ -1182,16 +1005,9 @@ mod tests {
         tree.insert(anon_box(r)).expect("test insert must succeed");
     }
 
-    // ----- Invariant checkers -----
-
-    /// Walk the subtree rooted at `node` and verify:
-    /// - BST ordering by `range.start` (and consequently no overlaps,
-    ///   since we also reject overlapping inserts up front).
-    /// - Interval-augmentation invariant: `subtree_max_end` at every
-    ///   node equals the true maximum `range.end` over the subtree.
-    ///
-    /// Returns the actual maximum `range.end` of the subtree, panics
-    /// with a descriptive message on any violation.
+    /// Verify the subtree at `node`: BST ordering by `range.start` (so no overlaps, as inserts
+    /// reject them) and the augmentation invariant. Returns the true maximum `range.end`; panics
+    /// with a descriptive message on a violation.
     fn check_bst_and_augmentation(node: Option<NonNull<Vma>>) -> VirtAddr {
         let Some(n) = node else {
             return VirtAddr::new(0);
@@ -1231,11 +1047,8 @@ mod tests {
         max_end
     }
 
-    /// Walk the subtree rooted at `node` and verify the red-black
-    /// properties: no red node has a red parent, every root-to-leaf
-    /// path crosses the same number of black nodes. Returns the
-    /// black-height (counting black nodes on any path from `node` down
-    /// to a `None` leaf, exclusive of `node`).
+    /// Verify the red-black properties of the subtree at `node`: no red node has a red parent,
+    /// every root-to-leaf path has the same number of black nodes. Returns the black-height.
     fn check_rb(node: Option<NonNull<Vma>>, parent_color: RbColor) -> usize {
         let Some(n) = node else {
             return 0;
@@ -1308,7 +1121,6 @@ mod tests {
         assert!(!a.overlaps(b));
         assert!(!b.overlaps(a));
 
-        // Adjacent (touching at PAGE) — half-open, so no overlap.
         let c = range(0, PAGE);
         let d = range(PAGE, PAGE * 2);
         assert!(!c.overlaps(d));
@@ -1334,7 +1146,6 @@ mod tests {
         let b = range(PAGE * 2, PAGE * 3);
         assert_eq!(a.intersect(b), None);
 
-        // Adjacent counts as disjoint under half-open semantics.
         let c = range(0, PAGE);
         let d = range(PAGE, PAGE * 2);
         assert_eq!(c.intersect(d), None);
@@ -1378,13 +1189,9 @@ mod tests {
         assert!(rw_user.contains(Protection::WRITE));
         assert!(rw_user.contains(Protection::USER));
         assert!(!rw_user.contains(Protection::EXEC));
-        // Self-containment.
         assert!(rw_user.contains(rw_user));
-        // Empty is contained in everything.
         assert!(rw_user.contains(Protection::empty()));
     }
-
-    // ----- VmaTree -----
 
     #[test]
     fn empty_tree_is_valid() {
@@ -1416,18 +1223,12 @@ mod tests {
         let mut tree = VmaTree::new();
         insert_or_panic(&mut tree, range(PAGE * 4, PAGE * 8));
 
-        // Identical range.
         assert!(tree.insert(anon_box(range(PAGE * 4, PAGE * 8))).is_err());
-        // Starts inside.
         assert!(tree.insert(anon_box(range(PAGE * 6, PAGE * 10))).is_err());
-        // Ends inside.
         assert!(tree.insert(anon_box(range(PAGE * 2, PAGE * 6))).is_err());
-        // Strictly nested inside existing.
         assert!(tree.insert(anon_box(range(PAGE * 5, PAGE * 7))).is_err());
-        // Existing nested inside new.
         assert!(tree.insert(anon_box(range(PAGE * 2, PAGE * 10))).is_err());
 
-        // Tree unchanged after every rejection.
         assert_eq!(tree.len(), 1);
         verify(&tree);
     }
@@ -1436,7 +1237,6 @@ mod tests {
     fn adjacent_ranges_do_not_overlap() {
         init_global_heap();
         let mut tree = VmaTree::new();
-        // Touching at PAGE*8 — half-open semantics: no overlap.
         insert_or_panic(&mut tree, range(PAGE * 4, PAGE * 8));
         insert_or_panic(&mut tree, range(PAGE * 8, PAGE * 12));
         insert_or_panic(&mut tree, range(0, PAGE * 4));
@@ -1446,9 +1246,6 @@ mod tests {
 
     #[test]
     fn ascending_inserts_balance_and_keep_invariants() {
-        // Pure ascending order is the degenerate input for an unbalanced
-        // BST: it builds a right-leaning list. RB fixup must rebalance
-        // it. Verify the invariants after every insert.
         init_global_heap();
         let mut tree = VmaTree::new();
         let n: u64 = 64;
@@ -1463,8 +1260,6 @@ mod tests {
 
     #[test]
     fn descending_inserts_balance_and_keep_invariants() {
-        // Mirror of ascending: pure descending builds a left-leaning
-        // list without rebalancing.
         init_global_heap();
         let mut tree = VmaTree::new();
         let n: u64 = 64;
@@ -1478,14 +1273,11 @@ mod tests {
 
     #[test]
     fn shuffled_inserts_maintain_invariants_throughout() {
-        // Generate a sequence of non-overlapping ranges, shuffle the
-        // insertion order with a fixed-seed LCG (deterministic for
-        // reproducibility), and verify after each insert.
+        // Shuffle the insertion order with a fixed-seed LCG and verify after each insert.
         init_global_heap();
         let n: usize = 200;
         let mut order: [usize; 200] = core::array::from_fn(|i| i);
 
-        // Fisher-Yates with the LCG.
         let mut lcg: u64 = 0xDEAD_BEEF_CAFE_F00D;
         for i in (1..n).rev() {
             lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -1501,7 +1293,6 @@ mod tests {
             assert_eq!(tree.len(), count + 1);
         }
 
-        // Lookups across the resulting tree.
         for &idx in order.iter() {
             let start = (idx as u64 * 4) * PAGE;
             assert!(tree.find_covering(va(start)).is_some());
@@ -1523,7 +1314,6 @@ mod tests {
         init_global_heap();
         let mut tree = VmaTree::new();
         insert_or_panic(&mut tree, range(PAGE * 4, PAGE * 8));
-        // Address before, after, and exactly at the exclusive end.
         assert!(tree.remove_covering(va(PAGE)).is_none());
         assert!(tree.remove_covering(va(PAGE * 16)).is_none());
         assert!(tree.remove_covering(va(PAGE * 8)).is_none()); // half-open
@@ -1545,9 +1335,6 @@ mod tests {
 
     #[test]
     fn removing_all_in_insertion_order_maintains_invariants() {
-        // Insert ascending, then remove ascending. Each remove pulls a
-        // leaf-or-near-leaf (after early rebalancing); collectively
-        // they exercise root removal once the rest of the tree is gone.
         init_global_heap();
         let mut tree = VmaTree::new();
         let n: u64 = 64;
@@ -1585,10 +1372,8 @@ mod tests {
 
     #[test]
     fn shuffled_insert_then_shuffled_remove_maintains_invariants() {
-        // The torture test: 200 ranges inserted in shuffled order and
-        // then removed in a *different* shuffled order, with full
-        // invariant verification after every single operation. This is
-        // the most-exercised path for the delete fixup's case mix.
+        // The torture test: 200 ranges inserted and removed in different shuffled orders with
+        // full invariant checks after every operation, the delete fixup's most-exercised path.
         init_global_heap();
         let n: usize = 200;
         let mut insert_order: [usize; 200] = core::array::from_fn(|i| i);
@@ -1634,8 +1419,6 @@ mod tests {
         assert!(tree.find_covering(va(PAGE * 14)).is_some()); // other range still present
     }
 
-    // ----- Iteration -----
-
     #[test]
     fn iter_on_empty_tree_yields_nothing() {
         let tree = VmaTree::new();
@@ -1647,7 +1430,6 @@ mod tests {
     fn iter_yields_every_vma_in_ascending_order() {
         init_global_heap();
         let mut tree = VmaTree::new();
-        // Insert in a non-sorted order so the tree isn't trivially linear.
         let starts: [u64; 5] = [40, 10, 30, 0, 20];
         for s in starts.iter() {
             insert_or_panic(&mut tree, range(s * PAGE, (s + 4) * PAGE));
@@ -1666,10 +1448,6 @@ mod tests {
     fn find_first_overlapping_returns_leftmost_when_multiple_overlap() {
         init_global_heap();
         let mut tree = VmaTree::new();
-        // Three non-overlapping VMAs at offsets 10, 20, 30 (each
-        // PAGE*2 wide: ends at 12, 22, 32). A query covering 11..21
-        // overlaps the 10 VMA (at 11..12) and the 20 VMA (at 20..21);
-        // the leftmost must be at 10.
         for s in [10u64, 20, 30] {
             insert_or_panic(&mut tree, range(s * PAGE, (s + 2) * PAGE));
         }
@@ -1684,13 +1462,9 @@ mod tests {
         let mut tree = VmaTree::new();
         insert_or_panic(&mut tree, range(10 * PAGE, 12 * PAGE));
         insert_or_panic(&mut tree, range(20 * PAGE, 22 * PAGE));
-        // Before all VMAs.
         assert!(tree.find_first_overlapping(range(0, 8 * PAGE)).is_none());
-        // In a gap.
         assert!(tree.find_first_overlapping(range(14 * PAGE, 18 * PAGE)).is_none());
-        // After all VMAs.
         assert!(tree.find_first_overlapping(range(30 * PAGE, 40 * PAGE)).is_none());
-        // Exactly adjacent (half-open): no overlap.
         assert!(tree.find_first_overlapping(range(12 * PAGE, 14 * PAGE)).is_none());
     }
 
@@ -1698,10 +1472,6 @@ mod tests {
     fn iter_overlapping_yields_contiguous_run_in_order() {
         init_global_heap();
         let mut tree = VmaTree::new();
-        // Five VMAs at starts 0, 10, 20, 30, 40 (PAGE*4 each: ends at
-        // 4, 14, 24, 34, 44). A query covering 12..32 overlaps the 10
-        // VMA (12..14), all of 20 (20..24), and 30 (30..32) — but not
-        // the 0 or 40 VMA.
         for s in [0u64, 10, 20, 30, 40] {
             insert_or_panic(&mut tree, range(s * PAGE, (s + 4) * PAGE));
         }
@@ -1721,7 +1491,6 @@ mod tests {
         init_global_heap();
         let mut tree = VmaTree::new();
         insert_or_panic(&mut tree, range(0, PAGE * 16));
-        // A query entirely inside the lone VMA yields just that VMA.
         let mut hits = 0;
         for v in tree.iter_overlapping(range(PAGE * 4, PAGE * 8)) {
             assert_eq!(v.range, range(0, PAGE * 16));
@@ -1737,8 +1506,6 @@ mod tests {
         for s in [5u64, 50, 25, 75, 100, 10, 60] {
             insert_or_panic(&mut tree, range(s * PAGE, (s + 2) * PAGE));
         }
-        // A query covering the full extent of every VMA should yield
-        // the same sequence as `iter()`.
         let big = range(0, 200 * PAGE);
         let from_iter: [VirtAddr; 7] = {
             let mut arr = [va(0); 7];
@@ -1764,11 +1531,8 @@ mod tests {
         for s in [10u64, 20, 30, 40, 50] {
             insert_or_panic(&mut tree, range(s * PAGE, (s + 2) * PAGE));
         }
-        // Remove the middle one.
         let _ = tree.remove_covering(va(30 * PAGE)).expect("present");
         verify(&tree);
-        // A query spanning what was 25..45 should now yield only 40
-        // (the 30 VMA is gone; 20 ends at 22; 50 starts at 50).
         let q = range(25 * PAGE, 45 * PAGE);
         let mut hits = [va(0); 4];
         let mut n = 0;
@@ -1782,12 +1546,8 @@ mod tests {
 
     #[test]
     fn drop_releases_every_owned_box() {
-        // Indirect verification: drop a large tree, then allocate the
-        // same number of fresh Vmas. With a leak, this would gradually
-        // exhaust the 16 MiB host heap across the test run. The hard
-        // verification of "every box drops exactly once" lives in
-        // KBox's own tests; this confirms the tree threads boxes
-        // through KBox::from_raw on teardown.
+        // Drop a large tree, then allocate as many fresh Vmas: a leak would exhaust the 16 MiB
+        // host heap. KBox's own tests cover each box dropping exactly once.
         init_global_heap();
         for _ in 0..4 {
             let mut tree = VmaTree::new();
@@ -1795,7 +1555,6 @@ mod tests {
                 insert_or_panic(&mut tree, range(i * 2 * PAGE, (i * 2 + 1) * PAGE));
             }
             verify(&tree);
-            // Tree drops here.
         }
     }
 }

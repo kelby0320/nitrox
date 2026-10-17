@@ -1,17 +1,14 @@
 //! The boot **initramfs**: a Limine-loaded CPIO-newc blob, parsed in-kernel.
 //!
-//! Limine loads one module (the initramfs, see `boot/limine.conf` +
-//! `kernel/src/limine.rs` [`ModuleRequest`](crate::limine::ModuleRequest)) into
-//! HHDM-mapped memory; the kernel records it here at boot with [`set_blob`]. The
-//! in-kernel `/initramfs` resource server ([`crate::object::kernel_server`])
-//! resolves a path to a file's bytes with [`lookup`] and hands userspace a
-//! read-only `MemoryObject` copy. Init reads `etc/init.toml` and (later) spawn
-//! images from it.
+//! Limine loads one module (see `boot/limine.conf` and `kernel/src/limine.rs`
+//! [`ModuleRequest`](crate::limine::ModuleRequest)) into HHDM-mapped memory; the kernel records it
+//! with [`set_blob`]. The in-kernel `/initramfs` resource server ([`crate::object::kernel_server`])
+//! resolves a path to a file's bytes with [`lookup`] and hands userspace a read-only `MemoryObject`
+//! copy.
 //!
-//! Only the **CPIO `newc`** format (magic `070701`) is parsed — the format
-//! `cpio -H newc` / the xtask packer emits. Parsing is pure over a byte slice
-//! and host-testable; reclaiming the blob's pages is deferred to the
-//! resource-server lifecycle work (`docs/rationale/deferred-decisions.md`).
+//! Only the **CPIO `newc`** format (magic `070701`) is parsed, as `cpio -H newc` and the xtask
+//! packer emit it. Parsing is pure over a byte slice and host-testable; reclaiming the blob's pages
+//! is deferred (`docs/rationale/deferred-decisions.md`).
 
 use core::ptr;
 use core::slice;
@@ -25,7 +22,7 @@ static BLOB_LEN: AtomicUsize = AtomicUsize::new(0);
 ///
 /// # Safety
 /// `ptr`/`len` must describe a live, `'static` byte region — the Limine-mapped
-/// module (in `MEMMAP_KERNEL_AND_MODULES` memory, never reclaimed this slice).
+/// module (in `MEMMAP_KERNEL_AND_MODULES` memory, which nothing reclaims).
 pub unsafe fn set_blob(ptr: *mut u8, len: usize) {
     BLOB_LEN.store(len, Ordering::Relaxed);
     // Release so a later `blob()` Acquire observes the length too.

@@ -1,46 +1,28 @@
 //! Channel transport — carry a TSM1 byte stream across an IPC channel.
 //!
-//! The [`wire`](crate::wire) codec is transport-agnostic (it writes a [`ByteSink`] and
-//! reads a [`ByteSource`]). This module is the adapter that moves those bytes over a
-//! **message-oriented** IPC channel: a producer's [`ChannelSink`] frames the stream into
-//! fixed-size messages (so an unbounded producer streams rather than buffering the whole
-//! thing), and a consumer's [`ChannelReceiver`] reassembles them back into one buffer for
-//! [`TableReader`](crate::table::TableReader).
-//!
-//! ## The [`MsgPort`] seam
-//!
-//! The framing logic here is **pure** — it depends only on `core + alloc` and a
-//! [`MsgPort`] (send/recv one framed message). The concrete port over
-//! `sys_channel_send`/`sys_channel_recv` (the only syscall-touching part) is a thin
-//! `libkern` impl that lands with the pipe-wiring helpers (its first consumer); the
-//! framing here host-tests against a mock port. This keeps `libstream`'s wire core
-//! dependency-free (see the crate `Cargo.toml`).
+//! A producer's [`ChannelSink`] frames the stream into messages over a [`MsgPort`]; a
+//! consumer's [`ChannelReceiver`] reassembles them. Only [`IpcPort`] touches a syscall.
 //!
 //! ## Framing
 //!
-//! The stream is split into chunks of at most `max_chunk` bytes, each sent as one
-//! message; the **final** message carries a `last` marker (in the real port, an
-//! `IpcMsgHeader.flags` bit). A stream always ends with exactly one `last` message —
-//! even an empty tail — so the receiver has an unambiguous end-of-stream. Chunk
-//! boundaries are byte-arbitrary: a record may straddle two messages; the receiver
-//! rejoins the bytes before any parsing (v1 reassembles the whole stream first —
-//! incremental parsing is a later refinement, as with [`TableReader`]).
+//! The stream is split into chunks of at most `max_chunk` bytes, each one message; the
+//! **final** message carries a `last` marker (an `IpcMsgHeader.flags` bit). A stream always
+//! ends with exactly one `last` message, even an empty one. Chunk boundaries are
+//! byte-arbitrary: a record may straddle two messages.
 //!
 //! ## Backpressure & early close
 //!
-//! A [`MsgPort::send`] blocks while the channel's bounded queue is full (the kernel's
-//! backpressure), so a fast producer paces itself to a slow consumer with no
-//! shell-level flow control. If the consumer closes its read end, the next `send`
-//! returns [`WireError::PeerClosed`]; a producer treats that as "stop producing, exit
-//! cleanly" (design §1 — the `yes | head -1` case). No signals.
+//! A [`MsgPort::send`] blocks while the channel's bounded queue is full, so a fast
+//! producer paces itself to a slow consumer. If the consumer closes its read end, the
+//! next `send` returns [`WireError::PeerClosed`]; a producer treats that as "stop
+//! producing, exit cleanly" (`yes | head -1`).
 
 use alloc::vec::Vec;
 
 use crate::wire::{ByteSink, Result};
 
 /// A message-oriented transport for one TSM1 stream: send/receive one framed message
-/// at a time. The framing ([`ChannelSink`]/[`ChannelReceiver`]) is generic over this so
-/// the byte-level logic is testable against a mock, independent of the real IPC syscalls.
+/// at a time.
 pub trait MsgPort {
     /// Send one message carrying `payload` (`≤ max_chunk` bytes); `last` marks the final
     /// message of the stream. Blocks while the channel queue is full (backpressure).
@@ -54,11 +36,10 @@ pub trait MsgPort {
 }
 
 /// A [`ByteSink`] that frames its bytes into `≤ max_chunk` messages on a [`MsgPort`],
-/// eager-flushing full chunks as they accumulate (so an unbounded stream never buffers
-/// more than one chunk). Call [`finish`](Self::finish) once the stream is complete to
-/// emit the terminating `last` message.
+/// flushing full chunks eagerly. Call [`finish`](Self::finish) once the stream is complete
+/// to emit the terminating `last` message.
 ///
-/// Typical use wraps it in a [`TableWriter`](crate::table::TableWriter):
+/// Typically wrapped in a [`TableWriter`](crate::table::TableWriter):
 /// ```ignore
 /// let mut tw = TableWriter::new(ChannelSink::new(port, IPC_PAYLOAD_SIZE));
 /// tw.write_schema(StreamFlags::NONE, &schema)?;
@@ -81,8 +62,6 @@ impl<P: MsgPort> ChannelSink<P> {
         ChannelSink { port, buf: Vec::new(), max_chunk, finished: false }
     }
 
-    /// Emit every buffered full chunk as a (non-`last`) message, leaving `< max_chunk`
-    /// bytes buffered for the next write or [`finish`](Self::finish).
     fn flush_full_chunks(&mut self) -> Result<()> {
         while self.buf.len() >= self.max_chunk {
             self.port.send(&self.buf[..self.max_chunk], false)?;
@@ -93,14 +72,11 @@ impl<P: MsgPort> ChannelSink<P> {
 
     /// Send the buffered tail as the terminating `last` message, closing the stream.
     /// Emits exactly one `last` message (an empty one if the stream ended on a chunk
-    /// boundary), so the receiver always sees an unambiguous end. Idempotent-safe: a
-    /// second call is a no-op.
+    /// boundary); a second call is a no-op.
     pub fn finish(&mut self) -> Result<()> {
         if self.finished {
             return Ok(());
         }
-        // Drain any remaining full chunks first (in case bytes were buffered without a
-        // put crossing the threshold), then the final short tail as the `last` message.
         self.flush_full_chunks()?;
         self.port.send(&self.buf, true)?;
         self.buf.clear();
@@ -121,9 +97,8 @@ impl<P: MsgPort> ByteSink for ChannelSink<P> {
     }
 }
 
-/// Reassembles a framed stream from a [`MsgPort`] back into one contiguous buffer, ready
-/// for [`TableReader`](crate::table::TableReader). v1 collects the whole stream before
-/// parsing (incremental parsing is a later refinement).
+/// Reassembles a framed stream from a [`MsgPort`] into one contiguous buffer, ready for
+/// [`TableReader`](crate::table::TableReader).
 pub struct ChannelReceiver<P: MsgPort> {
     port: P,
 }
@@ -154,9 +129,8 @@ impl<P: MsgPort> ChannelReceiver<P> {
 #[cfg(feature = "io")]
 pub use self::io_port::IpcPort;
 
-/// The concrete [`MsgPort`] over a real IPC channel endpoint — the syscall-touching
-/// half of the transport. Gated behind the `io` feature so the framing above stays
-/// host-testable with no dependency.
+/// The concrete [`MsgPort`] over a real IPC channel endpoint, behind the `io` feature so
+/// the framing above stays dependency-free.
 #[cfg(feature = "io")]
 mod io_port {
     use super::MsgPort;
@@ -168,24 +142,22 @@ mod io_port {
         SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4, syscall6,
     };
 
-    // `KError` discriminants we distinguish (see `libkern::error::KError`).
     const E_WOULDBLOCK: i64 = -11;
     const E_PEERCLOSED: i64 = -13;
 
-    // `IpcMsgHeader` field byte offsets (see `libkern::abi::IpcMsgHeader`) — accessed by
-    // offset so the buffer can be a plain byte array (no `align(4096)` allocation).
+    // `IpcMsgHeader` field byte offsets (see `libkern::abi::IpcMsgHeader`), so the buffer
+    // can be a plain byte array.
     const OFF_PAYLOAD_LEN: usize = 4;
     const OFF_HANDLE_COUNT: usize = 8;
     const OFF_FLAGS: usize = 10;
     const OFF_PAYLOAD: usize = 24;
 
-    /// Transport flag, carried in the IPC header's `flags`: the final message of a
-    /// stream. The kernel passes `flags` through untouched, so the receiver reads it.
+    /// Transport flag in the IPC header's `flags`: the final message of a stream. The
+    /// kernel passes `flags` through untouched.
     const MSG_FLAG_LAST: u16 = 1 << 0;
 
-    /// A [`MsgPort`] over one IPC channel endpoint (`sys_channel_send`/`recv`), owning a
-    /// reusable one-page message buffer. Backpressure and `PeerClosed` are the channel's
-    /// own behaviour (a full ring blocks the send; a closed peer fails it).
+    /// A [`MsgPort`] over one IPC channel endpoint, owning a reusable one-page message
+    /// buffer. A full ring blocks the send; a closed peer fails it.
     pub struct IpcPort {
         endpoint: u64,
         buf: Box<[u8; IPC_MSG_SIZE]>,
@@ -221,9 +193,9 @@ mod io_port {
             self.buf[OFF_PAYLOAD..OFF_PAYLOAD + payload.len()].copy_from_slice(payload);
 
             let no_handles = [0u64; 1];
-            // Block-mode send returns a PendingOperation handle to wait on (delivery,
-            // i.e. backpressure), or a negative `KError`. The message is committed once
-            // it returns a handle. SAFETY: `buf` is a valid IPC_MSG_SIZE buffer;
+            // Block-mode send returns a PendingOperation handle (delivery; a full ring
+            // blocks here) or a negative `KError`; a handle means the message is committed.
+            // SAFETY: `buf` is a valid IPC_MSG_SIZE buffer;
             // `no_handles` is a valid (empty) handle array with count 0.
             let r = unsafe {
                 syscall6(
@@ -239,8 +211,7 @@ mod io_port {
             if r < 0 {
                 return Err(map_err(r));
             }
-            // Wait for the delivery PO to complete (this is where a full ring blocks),
-            // then release it.
+            // Wait for the delivery PO, then release it.
             let po = r as u64;
             let wait_handles = [po];
             let mut result = [0u8; 24]; // one IoResult
@@ -369,10 +340,8 @@ mod tests {
 
     #[test]
     fn long_stream_chunks_eagerly_then_final_last() {
-        // 20 bytes, max_chunk 8 → chunks of 8, 8, then a 4-byte `last`.
         let mut sink = ChannelSink::new(Loopback::default(), 8);
         sink.put(&[0u8; 20]).unwrap();
-        // Two full chunks flushed eagerly; none is `last` yet.
         assert_eq!(sink.port.msgs.len(), 2);
         assert!(sink.port.msgs.iter().all(|(p, last)| p.len() == 8 && !*last));
         sink.finish().unwrap();
@@ -384,8 +353,6 @@ mod tests {
 
     #[test]
     fn boundary_aligned_stream_ends_with_empty_last() {
-        // Exactly 2 chunks of data → the terminator is an empty `last` message, so the
-        // receiver still gets an unambiguous end.
         let mut sink = ChannelSink::new(Loopback::default(), 8);
         sink.put(&[7u8; 16]).unwrap();
         sink.finish().unwrap();
@@ -396,7 +363,6 @@ mod tests {
 
     #[test]
     fn receiver_reassembles_across_chunks() {
-        // Producer frames a byte pattern across several small chunks; receiver rejoins.
         let mut sink = ChannelSink::new(Loopback::default(), 4);
         let payload: Vec<u8> = (0..=250u8).collect();
         sink.put(&payload).unwrap();
@@ -412,7 +378,6 @@ mod tests {
             TypeTag::String,
             TypeModifiers::NONE,
         );
-        // Small max_chunk forces multi-message framing of a real TSM1 stream.
         let mut tw = TableWriter::new(ChannelSink::new(Loopback::default(), 7));
         tw.write_schema(StreamFlags::NONE, &schema).unwrap();
         tw.write_row(&[Value::Int(1), Value::Str(String::from("init"))]).unwrap();
@@ -431,18 +396,13 @@ mod tests {
 
     #[test]
     fn peer_closed_surfaces_to_the_producer() {
-        // The consumer closes after accepting one message; the next flush fails loud so
-        // the producer can stop cleanly.
         let mut sink = ChannelSink::new(CloseAfter { ok: 1 }, 4);
         assert_eq!(sink.put(&[0u8; 4]).unwrap(), ()); // first chunk sent OK
-        // Second full chunk → peer already closed → PeerClosed.
         assert_eq!(sink.put(&[0u8; 4]), Err(WireError::PeerClosed));
     }
 
     #[test]
     fn receiver_reports_peer_closed_if_producer_never_finishes() {
-        // A Loopback with a non-`last` message and nothing more models a producer that
-        // died mid-stream; the receiver surfaces PeerClosed rather than hanging.
         let mut port = Loopback::default();
         port.send(b"partial", false).unwrap();
         assert_eq!(ChannelReceiver::new(port).receive(), Err(WireError::PeerClosed));

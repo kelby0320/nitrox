@@ -7,17 +7,13 @@ use core::ptr::{self, NonNull};
 use crate::libkern::AllocError;
 use crate::mm::slab::{kfree, kmalloc};
 
-/// A fallible, owned heap allocation — the kernel's analogue of
-/// `alloc::boxed::Box`.
+/// A fallible, owned heap allocation — the kernel's analogue of `alloc::boxed::Box`.
 ///
-/// The kernel does not use the `alloc` crate (see the decision log entry
-/// of 2026-05-20): `alloc`'s `Box::new` aborts on allocation failure,
-/// which a kernel cannot tolerate. [`KBox::try_new`] instead reports
-/// exhaustion as [`AllocError`].
+/// The kernel does not use the `alloc` crate: `Box::new` aborts on allocation failure, which
+/// a kernel cannot tolerate. [`KBox::try_new`] instead reports exhaustion as [`AllocError`].
 ///
-/// `KBox<T>` owns exactly one heap-allocated `T`, dereferences to it, and
-/// on drop runs its destructor and releases the backing storage. A
-/// zero-sized `T` is handled without ever touching the allocator.
+/// `KBox<T>` owns exactly one heap-allocated `T`; on drop it runs the destructor and releases
+/// the storage. A zero-sized `T` never touches the allocator.
 pub struct KBox<T> {
     ptr: NonNull<T>,
 }
@@ -30,22 +26,16 @@ unsafe impl<T: Send> Send for KBox<T> {}
 unsafe impl<T: Sync> Sync for KBox<T> {}
 
 impl<T> KBox<T> {
-    /// Allocate space for a `T` on the kernel heap, move `val` into it,
-    /// and return the owning box.
-    ///
-    /// Returns [`AllocError`] if the heap cannot satisfy the request.
+    /// Allocate space for a `T` on the kernel heap and move `val` into it. Returns
+    /// [`AllocError`] if the heap cannot satisfy the request.
     ///
     /// # Panics
     ///
-    /// Aborts the kernel if called before `mm::slab::slab_init` has run.
-    /// That is a use-before-init bug rather than an out-of-memory
-    /// condition, and the abort is a deliberate tripwire — see
-    /// [`kmalloc`](crate::mm::slab::kmalloc).
+    /// Aborts the kernel if called before `mm::slab::slab_init` has run: a use-before-init
+    /// bug, not an out-of-memory condition — see [`kmalloc`](crate::mm::slab::kmalloc).
     pub fn try_new(val: T) -> Result<Self, AllocError> {
         let ptr = if mem::size_of::<T>() == 0 {
-            // A zero-sized `T` needs no storage; a dangling-but-aligned
-            // pointer is a valid place to "hold" it and the allocator is
-            // never involved.
+            // A zero-sized `T` needs no storage; a dangling-but-aligned pointer will do.
             NonNull::<T>::dangling()
         } else {
             let raw = kmalloc(mem::size_of::<T>(), mem::align_of::<T>()) as *mut T;
@@ -63,15 +53,10 @@ impl<T> KBox<T> {
     /// on the stack.
     ///
     /// [`try_new`](Self::try_new) takes `val` **by value**, so `KBox::try_new(Big::zeroed())`
-    /// builds the whole `Big` in the caller's frame and then copies it into the heap. For a
-    /// 4 KiB `StoredMsg` that is 4 KiB of kernel stack, silently, on whatever path happens
-    /// to be building a message — measured (2026-07-29) as the difference between a 58 %
-    /// and an 83 % high-water mark on a 16 KiB stack. The optimiser *may* elide the
-    /// temporary; it demonstrably did not here, and a stack budget should not rest on
-    /// whether it does.
-    ///
-    /// This zeroes the allocation in place instead, so the cost is zero stack regardless of
-    /// `T`'s size.
+    /// builds the whole `Big` in the caller's frame first. For a 4 KiB `StoredMsg` that was
+    /// the difference between a 58 % and an 83 % high-water mark on a 16 KiB stack, and a stack
+    /// budget should not rest on the optimiser eliding the temporary. This zeroes the allocation
+    /// in place instead.
     ///
     /// # Safety
     ///
@@ -94,22 +79,16 @@ impl<T> KBox<T> {
         Ok(KBox { ptr })
     }
 
-    /// Consume the box and yield its raw pointer, suppressing the
-    /// destructor. The caller takes ownership of the allocation and is
-    /// responsible for reconstituting it via [`KBox::from_raw`] (or
-    /// freeing the storage directly).
-    ///
-    /// Used by intrusive containers that thread the allocation through
-    /// raw pointers in their links and reconstruct the box on removal.
+    /// Consume the box and yield its raw pointer, suppressing the destructor. The caller owns
+    /// the allocation and must reconstitute it via [`KBox::from_raw`] (or free it directly).
+    /// Used by intrusive containers that thread the allocation through raw pointers.
     pub fn into_raw(boxed: Self) -> NonNull<T> {
         let ptr = boxed.ptr;
         mem::forget(boxed);
         ptr
     }
 
-    /// Reconstruct a box from a raw pointer previously yielded by
-    /// [`KBox::into_raw`]. The reconstructed box owns the allocation as
-    /// if it had been returned by `try_new`.
+    /// Reconstruct a box from a raw pointer previously yielded by [`KBox::into_raw`].
     ///
     /// # Safety
     /// `ptr` must have come from a prior [`KBox::into_raw`] for a `T`
@@ -164,8 +143,7 @@ mod tests {
     use crate::mm::test_support::init_global_heap;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Bumps a caller-owned counter when dropped, so tests can observe
-    /// that `KBox` runs destructors exactly once.
+    /// Bumps a caller-owned counter when dropped.
     struct DropFlag<'a>(&'a AtomicUsize);
 
     impl Drop for DropFlag<'_> {
@@ -203,10 +181,8 @@ mod tests {
     #[test]
     fn zero_sized_type_constructs_and_drops() {
         init_global_heap();
-        // A plain ZST must construct and drop without touching the slab.
         let _unit = KBox::try_new(()).unwrap();
 
-        // A ZST carrying a destructor must still have its drop run.
         struct ZstDrop<'a>(&'a AtomicUsize);
         impl Drop for ZstDrop<'_> {
             fn drop(&mut self) {
@@ -225,7 +201,6 @@ mod tests {
         init_global_heap();
         let count = AtomicUsize::new(0);
         let raw = KBox::into_raw(KBox::try_new(DropFlag(&count)).unwrap());
-        // `into_raw` must suppress the destructor — no drop yet.
         assert_eq!(count.load(Ordering::SeqCst), 0);
         // SAFETY: `raw` came from the matching `into_raw` above and
         // has not been reconstructed yet.

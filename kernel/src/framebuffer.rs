@@ -1,10 +1,7 @@
-//! The system framebuffer as a userspace resource: Limine's aperture, captured at boot and
-//! handed out as `/dev/framebuffer`.
-//!
-//! The kernel's own drawing — the console, from the first line of boot until a client takes the
-//! screen, and again when the machine stops — is `crate::fbcon`, which reads Limine's descriptor
-//! directly. This module is only what userspace needs: where the pixels are, physically, and how
-//! they are laid out.
+//! The system framebuffer as a userspace resource: Limine's aperture, captured at boot and handed
+//! out as `/dev/framebuffer`. The kernel's own drawing is `crate::fbcon`, which reads Limine's
+//! descriptor directly; this module is what userspace needs: where the pixels are, physically, and
+//! how they are laid out.
 
 use crate::libkern::framebuffer::FramebufferInfo;
 use crate::libkern::lockrank::LockRank;
@@ -14,40 +11,33 @@ use crate::mm::{Caching, PhysAddr};
 
 /// The system framebuffer's physical extent and pixel layout, captured once at boot.
 ///
-/// The console (`crate::fbcon`) draws through a *virtual* base (Limine reports an HHDM
-/// address) and the three channel shifts. Handing the aperture to userspace needs strictly
-/// more — the **physical** base, so a `MemoryObject` can describe the frames, and the channel
-/// *sizes*, so a compositor can pack pixels for a layout that is not `0x00RRGGBB`.
-///
-/// Captured at boot rather than read on demand because Limine's descriptor lives in
-/// bootloader-reclaimable memory: the facts must be copied out before anything reclaims
-/// it.
+/// Handing the aperture to userspace needs more than the console's virtual base and channel shifts:
+/// the **physical** base, so a `MemoryObject` can describe the frames, and the channel *sizes*, so
+/// a compositor can pack pixels for a layout that is not `0x00RRGGBB`. Captured because Limine's
+/// descriptor lives in bootloader-reclaimable memory.
 pub struct FramebufferAperture {
     /// Physical base address of the linear aperture.
     pub phys_base: PhysAddr,
     /// Geometry and channel layout, in the shape userspace receives.
     pub info: FramebufferInfo,
-    /// How every mapping of it is cached (Phase 5 Part G.3).
+    /// How every mapping of it is cached.
     ///
     /// **Recorded here because two things need the same answer**: the `MemoryObject` minted when
-    /// something resolves `/dev/framebuffer`, and the boot's own measurement, which maps the
-    /// aperture the way userspace's mapping is made and times a fill through it. A measurement
-    /// that named its flags itself would go on saying "as userspace's is" after userspace's
-    /// stopped being that — which is exactly what it did until a control caught it.
+    /// something resolves `/dev/framebuffer`, and the boot's measurement, which maps the aperture
+    /// the way userspace's mapping is made. A measurement that named its own flags would go on
+    /// saying "as userspace's is" after userspace's stopped being that.
     pub caching: Caching,
 }
 
-/// The captured aperture, or `None` if no usable framebuffer was reported.
-/// `Leaf` rank: taken while holding nothing, and nothing is taken while it is held —
-/// the read path copies the facts out and releases immediately.
+/// The captured aperture, or `None` if no usable framebuffer was reported. `Leaf` rank: taken
+/// holding nothing, and nothing is taken under it; the read path copies the facts out at once.
 static APERTURE: IrqSpinLock<Option<FramebufferAperture>> = IrqSpinLock::new(LockRank::Leaf, None);
 
 /// Record Limine's framebuffer as a userspace-mappable aperture.
 ///
-/// Returns `false` when there is nothing usable to record — no framebuffer at all, or
-/// a depth other than 32 bits. Refusing an unsupported depth is deliberate: it is a
-/// boot-time diagnosis, where letting a client render into a 16- or 24-bit buffer is a
-/// visual artefact to puzzle over later.
+/// Returns `false` when there is nothing usable: no framebuffer, or a depth other than 32 bits.
+/// Refusing an unsupported depth is a boot-time diagnosis, where a client rendering into a 16- or
+/// 24-bit buffer is an artefact to puzzle over later.
 ///
 /// # Safety
 ///

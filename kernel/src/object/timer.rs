@@ -1,23 +1,17 @@
 //! The [`Timer`] kernel object — a waitable monotonic-deadline source.
 //!
-//! A `Timer` holds an armed `deadline_ns` (absolute monotonic nanoseconds, the
-//! same clock as [`arch::Timer::read_ns`](crate::arch::Timer)) and an
-//! `interval_ns` (`0` = one-shot, else the re-arm period after each fire), plus
-//! the set of threads currently blocked in `sys_wait` on it. `sys_timer_set`
-//! arms it; the periodic scheduler tick fires it when the deadline elapses,
-//! waking its waiters (see [`crate::sched`]).
+//! Holds an armed `deadline_ns` (absolute monotonic ns, the clock of
+//! [`arch::Timer::read_ns`](crate::arch::Timer)), an `interval_ns` (`0` = one-shot) and the
+//! threads blocked in `sys_wait` on it. The scheduler tick fires it when the deadline elapses,
+//! waking them (see [`crate::sched`]).
 //!
 //! ## Mutation discipline
 //!
-//! Like [`Thread`](crate::object::Thread), a `Timer` is shared through an
-//! [`ObjectRef`](crate::object::ObjectRef) yet its deadline/interval/waiter set
-//! are mutated by the scheduler. That is sound only because **all** of a
-//! Timer's interior state lives in an [`UnsafeCell`] touched **exclusively
-//! while the rank-1 `SCHED` lock is held** (single-CPU serialisation; see
-//! `kernel/docs/lock-ordering.md`). The `pub(crate) unsafe fn` accessors below
-//! take a type-erased `*mut ()` and reach the interior through that cell — the
-//! same raw-pointer discipline the `Thread` scheduler accessors use — so no
-//! aliasing `&mut Timer` is ever formed.
+//! A `Timer` is shared through an [`ObjectRef`](crate::object::ObjectRef) yet mutated by the
+//! scheduler, which is sound only because **all** its interior state lives in an
+//! [`UnsafeCell`] touched **exclusively under the rank-1 `SCHED` lock**
+//! (`kernel/docs/lock-ordering.md`). The `pub(crate) unsafe fn` accessors reach the cell
+//! through a type-erased `*mut ()`, so no aliasing `&mut Timer` is ever formed.
 
 use core::cell::UnsafeCell;
 
@@ -25,19 +19,14 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec};
 use crate::object::header::KObjectHeader;
 
-/// A timer kernel object.
-///
-/// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
+/// A timer kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct Timer {
     header: KObjectHeader,
-    /// Self-check sentinel; a live object always reads [`Timer::MAGIC`].
     magic: u64,
-    /// All mutable state, reached only under `SCHED` (see "Mutation discipline").
     inner: UnsafeCell<TimerInner>,
 }
 
-/// A `Timer`'s scheduler-owned interior.
 struct TimerInner {
     /// Absolute monotonic-ns deadline; `0` = not armed.
     deadline_ns: u64,
@@ -45,11 +34,8 @@ struct TimerInner {
     interval_ns: u64,
     /// `true` while this timer has a live entry in the scheduler deadline heap.
     in_heap: bool,
-    /// Threads blocked on this timer, as type-erased `Thread` object pointers
-    /// (non-owning — each waiter is kept alive by its own parked `ObjectRef`
-    /// in the scheduler `blocked` list, and is removed from here before it
-    /// unparks). Pre-reserved at [`Timer::try_new`] to [`Timer::MAX_WAITERS`];
-    /// `add_waiter` never grows it under the lock.
+    /// Blocked threads, non-owning (each is kept alive by its own parked `ObjectRef` and removed
+    /// from here before it unparks); pre-reserved to [`Timer::MAX_WAITERS`].
     waiters: KVec<*mut ()>,
 }
 
@@ -64,14 +50,10 @@ impl Timer {
     /// Sentinel written into [`Timer::magic`] at construction.
     pub const MAGIC: u64 = 0x54_69_6d_65_72_21_21_21; // "Timer!!!"
 
-    /// Maximum simultaneous waiters on one timer. Bounds the pre-reserved
-    /// waiter vector so `add_waiter` never allocates under `SCHED`; a timer
-    /// almost always has exactly one waiter.
+    /// Maximum simultaneous waiters; the reserve keeps `add_waiter` from allocating under `SCHED`.
     pub const MAX_WAITERS: usize = 4;
 
-    /// Allocate an unarmed `Timer` with a refcount of one. The waiter vector is
-    /// reserved up front (the only fallible growth) so later `add_waiter`s stay
-    /// within capacity and never allocate under the scheduler lock.
+    /// Allocate an unarmed `Timer` (refcount one), reserving the waiter vector up front.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
         let mut waiters: KVec<*mut ()> = KVec::new();
         waiters.try_reserve(Self::MAX_WAITERS)?;
@@ -87,14 +69,10 @@ impl Timer {
         self.magic == Self::MAGIC
     }
 
-    // --- Scheduler-only accessors --------------------------------------
-    //
-    // SAFETY (shared by all): `obj` addresses a live `Timer` (pinned by an
-    // `ObjectRef` the caller holds), and the caller holds the `SCHED` lock,
-    // which — single-CPU — serialises all access to `inner`.
+    // SAFETY (shared by all): `obj` is a live `Timer` pinned by the caller's `ObjectRef`, and
+    // the caller holds `SCHED`, which serialises all access to `inner`.
 
-    /// Borrow the interior mutably. The returned reference must not outlive the
-    /// `SCHED` hold and must not be aliased.
+    /// Borrow the interior mutably; must not outlive the `SCHED` hold nor alias.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -120,8 +98,7 @@ impl Timer {
         inner.interval_ns = interval_ns;
     }
 
-    /// The armed deadline (`0` = unarmed). Test-only (production reads the
-    /// deadline via the heap, not the object).
+    /// The armed deadline (`0` = unarmed). Test-only; production reads it from the heap.
     ///
     /// # Safety
     ///
@@ -162,9 +139,7 @@ impl Timer {
         unsafe { Self::inner(obj) }.in_heap
     }
 
-    /// Register `thread` as a waiter. `Err(())` if already at
-    /// [`MAX_WAITERS`](Self::MAX_WAITERS) (caller maps to `OutOfMemory`); never
-    /// grows the vector under the lock.
+    /// Register `thread` as a waiter; `Err(())` at the cap, which callers map to `OutOfMemory`.
     ///
     /// # Safety
     ///
@@ -175,12 +150,9 @@ impl Timer {
         if inner.waiters.len() < Self::MAX_WAITERS {
             inner
                 .waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED`
-                // (`wait_on` → `obj_add_waiter` with the guard held), and `try_push` grows,
-                // which is `kmalloc` under the rank-1 lock (F11). Safe either way today —
-                // construction reserves `MAX_WAITERS` with `?`, so `len < MAX ⟹ len < cap` —
-                // but the type is what should say so, since this is the shape a new waiter
-                // list gets copied from (PR #205 review, optional 5).
+                // `push_within_capacity`, not `try_push`: this runs under `SCHED`, and `try_push`
+                // grows, which is `kmalloc` under the rank-1 lock. Construction reserves
+                // `MAX_WAITERS`, so `len < MAX ⟹ len < cap`; the type should say so.
                 .push_within_capacity(thread)
                 .expect("within reserved waiter capacity");
             Ok(())
@@ -213,8 +185,7 @@ impl Timer {
         inner.deadline_ns != 0 && inner.deadline_ns <= now_ns
     }
 
-    /// Drain every waiter into `out` (clearing the set), returning the count.
-    /// `out` must be at least [`MAX_WAITERS`](Self::MAX_WAITERS) long.
+    /// Drain every waiter into `out` (at least [`MAX_WAITERS`](Self::MAX_WAITERS) long).
     ///
     /// # Safety
     ///
@@ -233,10 +204,8 @@ impl Timer {
 }
 
 impl Drop for Timer {
-    /// A live waiter pins this timer (each holds an `ObjectRef` on it across
-    /// `sys_wait`), so the last reference cannot drop while waiters remain —
-    /// the assert documents that invariant. The `KVec` storage frees with the
-    /// `KBox`.
+    /// A live waiter pins this timer (it holds an `ObjectRef` across `sys_wait`), so the last
+    /// reference cannot drop while waiters remain; the assert documents that.
     fn drop(&mut self) {
         debug_assert!(self.inner.get_mut().waiters.is_empty(), "Timer dropped with live waiters");
     }
@@ -292,16 +261,12 @@ mod tests {
             for &t in &ths {
                 assert!(Timer::add_waiter(obj, t).is_ok());
             }
-            // Over capacity -> Err, no growth.
             assert!(Timer::add_waiter(obj, 0xDEAD as *mut ()).is_err());
-            // Remove one, re-add succeeds.
             Timer::remove_waiter(obj, ths[1]);
             assert!(Timer::add_waiter(obj, 0xBEEF as *mut ()).is_ok());
-            // Drain.
             let mut buf = [core::ptr::null_mut(); Timer::MAX_WAITERS];
             let n = Timer::take_waiters(obj, &mut buf);
             assert_eq!(n, Timer::MAX_WAITERS);
-            // Empty after drain (so Drop's assert holds).
             let mut buf2 = [core::ptr::null_mut(); Timer::MAX_WAITERS];
             assert_eq!(Timer::take_waiters(obj, &mut buf2), 0);
             drop(KBox::<Timer>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Timer)));

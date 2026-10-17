@@ -14,7 +14,7 @@ and a richer thread-attributes form are deferred past Phase 1.
 pub struct ThreadArgs {
     pub entry:     u64,      // offset 0  — ring-3 entry point VA
     pub user_sp:   u64,      // offset 8  — initial user stack pointer (stack top)
-    pub arg0:        u64,    // offset 16 — opaque bootstrap word, delivered in rdx
+    pub arg0:        u64,    // offset 16 — opaque bootstrap word, delivered in rcx
     pub class:       u8,     // offset 24 — 0 = TimeShared (default), 1 = RealTime
     pub rt_priority: u8,     // offset 25 — RealTime fixed priority 0..=99
     pub nice:        i8,     // offset 26 — TimeShared nice -20..=19
@@ -37,8 +37,8 @@ cross-boundary layout, like [`SpawnArgs`](process-spawn-args.md) / `IpcMsg`).
   allocates + maps a region (e.g. via `sys_memory_create` + `sys_memory_map` with
   `MAP_READ | MAP_WRITE`) and passes the **top** (stacks grow down). Must be a
   non-null user-half address.
-- **`arg0`** — an opaque word delivered to the new thread at entry (in `rdx`),
-  mirroring the spawn register-bootstrap ABI. `rdi`/`rsi` are zero for a
+- **`arg0`** — an opaque word delivered to the new thread at entry (in `rcx`),
+  mirroring the spawn register-bootstrap ABI. `rdi`/`rsi`/`rdx` are zero for a
   `sys_thread_create` thread (unlike a spawned process's main thread, which
   receives its bootstrap handles there).
 - **`class`/`rt_priority`/`nice`/`cpu_affinity`** — the scheduling parameters, filled

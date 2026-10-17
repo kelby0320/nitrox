@@ -1,14 +1,4 @@
 //! `liblog` — the client side of the logging service.
-//!
-//! A tiny, `alloc`-free helper so any process can emit structured log records to a log
-//! endpoint (a `SEND`-righted channel to the logging service, handed to it at spawn or
-//! obtained via [`open_source`]). Emitting a record is a one-liner — `logger.info("…")` —
-//! that encodes a `LogRecord` body (via `librsproto::log`) and `sys_channel_send`s it,
-//! fire-and-forget. The trusted provenance (`principal`/`tier`/`timestamp`/`sequence`) is
-//! stamped by the logging service from *which* channel the record arrives on, never here.
-//!
-//! See `docs/architecture/logging.md`. `#![no_std]`, no `alloc` — usable by leaf
-//! services (the init family's rules).
 
 #![no_std]
 
@@ -17,63 +7,63 @@ use librsproto::log::encode_append;
 
 pub use librsproto::log::{LEVEL_CRITICAL, LEVEL_DEBUG, LEVEL_ERROR, LEVEL_INFO, LEVEL_TRACE, LEVEL_WARN};
 
-/// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
-/// The send buffer is a **full `IpcMsg`** (4096 bytes): `sys_channel_send` copies a fixed
-/// 4096-byte message in from the pointer, so the buffer must be that large even though a
-/// log record fills only its first bytes. A record that would not fit the payload is
-/// dropped rather than truncated.
+/// `sys_channel_send` copies a fixed 4096-byte `IpcMsg`, so the buffer must be that size;
+/// a record that does not fit is dropped rather than truncated.
 const BUF: usize = 4096;
 
-/// A handle to a log endpoint. Emitting is fire-and-forget; a zero (absent) handle makes
-/// every call a no-op, so callers need not special-case a missing logging service.
+/// A log endpoint; a zero (absent) handle makes every emit a no-op.
 #[derive(Copy, Clone)]
 pub struct Logger {
     handle: u64,
 }
 
 impl Logger {
-    /// Wrap a log-endpoint handle (`0` = absent → all emits are no-ops).
+    /// Wrap a log-endpoint handle.
     pub const fn new(handle: u64) -> Self {
         Self { handle }
     }
 
-    /// Whether this logger has a live endpoint.
+    /// Whether the endpoint is present.
     pub const fn is_valid(&self) -> bool {
         self.handle != 0
     }
 
-    /// Emit `message` at `level` with no source sub-label.
+    /// Emit `message` at `level`.
     pub fn log(&self, level: u8, message: &str) {
         self.emit(level, message, None);
     }
 
-    /// Emit `message` at `level` with a self-declared `source` sub-label.
+    /// Emit `message` at `level` with a self-declared `source`.
     pub fn log_source(&self, level: u8, message: &str, source: &str) {
         self.emit(level, message, Some(source));
     }
 
+    /// Emit `message` at trace level.
     pub fn trace(&self, message: &str) {
         self.log(LEVEL_TRACE, message);
     }
+    /// Emit `message` at debug level.
     pub fn debug(&self, message: &str) {
         self.log(LEVEL_DEBUG, message);
     }
+    /// Emit `message` at info level.
     pub fn info(&self, message: &str) {
         self.log(LEVEL_INFO, message);
     }
+    /// Emit `message` at warn level.
     pub fn warn(&self, message: &str) {
         self.log(LEVEL_WARN, message);
     }
+    /// Emit `message` at error level.
     pub fn error(&self, message: &str) {
         self.log(LEVEL_ERROR, message);
     }
+    /// Emit `message` at critical level.
     pub fn critical(&self, message: &str) {
         self.log(LEVEL_CRITICAL, message);
     }
 
-    /// Encode a record into a stack `IpcMsg` and send it on the log channel, fire-and-
-    /// forget (`NoBlock`). A missing handle or an over-long record is a silent no-op.
     fn emit(&self, level: u8, message: &str, source: Option<&str>) {
         if self.handle == 0 {
             return;
@@ -109,13 +99,8 @@ impl Logger {
     }
 }
 
-/// Resolve a log path (e.g. `/log/system/<principal>/<label>`) in namespace `ns` to a
-/// [`Logger`] — the app-facing "register a source, then log" path. Records on the
-/// returned endpoint carry the path's `<label>` as their `source` (stamped by the logging
-/// service). Returns an invalid `Logger` (a no-op) if the path can't be resolved.
+/// Resolve a log path in `ns` to a [`Logger`]; an unresolvable path yields an invalid one.
 pub fn open_source(ns: u64, path: &[u8]) -> Logger {
-    // Resolve with SEND | TRANSFER (the logging service replies a channel endpoint; the
-    // client only sends). Stack buffers — reentrant, no statics.
     // SAFETY: valid path pointer + namespace handle.
     let po =
         unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_SEND | RIGHT_TRANSFER) };

@@ -1,32 +1,18 @@
 //! `mkdir` — create directories.
 //!
-//! The third Nitrox coreutil (shell design §10c/§10d), and the first of Milestone 2.
 //! Where [`copy`](../copy) builds trees as a side effect of duplicating them, `mkdir`
 //! is the direct form: one directory-protocol operation per name.
 //!
-//! ```text
-//! mkdir PATH...              # create each, parent must already exist
-//! mkdir --parents PATH...    # create missing intermediates; an existing leaf is fine
-//! ```
-//!
 //! ## Deliberate behaviours
 //!
-//! - **`--parents` makes an existing leaf a success, not an error.** That is the whole
-//!   point of the flag — "ensure this path exists" — and it is why the flag also relaxes
-//!   the exists check rather than only creating intermediates.
+//! - **`--parents` makes an existing leaf a success, not an error**: "ensure this path exists".
 //! - **Existence is learned from the attempt, and only its *kind* is asked about.** The
-//!   server answers a colliding create with `KError::AlreadyExists` (since the 2026-07-30
-//!   ABI pass; it was indistinguishable from a malformed request before), so the common
-//!   path — the component is missing — is one round trip rather than a probe and a
-//!   create. What the code *cannot* infer is whether the occupant is a directory, and
-//!   `--parents` accepts only a directory, so [`libfs::is_dir`] is asked exactly there: on
-//!   the collision, not ahead of every component.
-//! - **A failure stops the run**, as in `copy`. The rows already emitted say what was
-//!   created before the failure; the exit status says the run did not succeed. Fail
-//!   loud, don't fail silent (§1).
+//!   server answers a colliding create with `KError::AlreadyExists`, so the common path is
+//!   one round trip. `--parents` accepts only a directory, so [`libfs::is_dir`] is asked
+//!   on the collision, not ahead of every component.
+//! - **A failure stops the run**, as in `copy`; the rows already emitted say what was created.
 //! - **It emits a table.** `Table<{path: String, created: Bool}>`, one row per operand.
-//!   `created` is `false` when `--parents` found the leaf already there — a pipeline can
-//!   then tell "I made this" from "this was already so", which a bare exit status cannot.
+//!   `created` is `false` when `--parents` found the leaf already there.
 
 #![no_std]
 #![no_main]
@@ -47,7 +33,6 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: path building and the TSM1 encoder both allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
@@ -65,7 +50,6 @@ const HELP: &[u8] = b"usage: mkdir [--parents] PATH...\n\
 
 const VERSION: &[u8] = b"mkdir (nitrox coreutils) 0.1.0\n";
 
-/// One directory named on the command line, and whether this run created it.
 struct Made {
     path: String,
     created: bool,
@@ -112,21 +96,15 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(EXIT_OK)
 }
 
-/// Create `path`, whose parent must already exist. Diverges on failure.
 fn make_one(stage: &Stage, path: &[u8]) -> bool {
-    // **Checked here as well as in `libfs::mkdir`**, because the two answers differ: this
-    // program exits with a *usage* status and a sentence about the root, where the library has
-    // only an error to return and no idea what the caller was trying to do.
+    // Checked here as well as in `libfs::mkdir`: this exits with a *usage* status and a
+    // sentence about the root, where the library has only an error to return.
     if libfs::basename(path).is_empty() {
         stage.die(b"mkdir: cannot create the root directory\n", EXIT_USAGE);
     }
-    // **Through `libfs::mkdir` since M12 Part B**, when `nxfiles` grew a *new folder* command
-    // and became the second consumer of these three lines. What stays here is this program's:
-    // the `--parents` walk below, and turning a failure into an exit status and a message.
     match libfs::mkdir(stage.namespace, path) {
         Ok(()) => true,
-        // The server says the name is taken, so the message can say so without a
-        // confirming round trip — which is the whole point of the error carrying it.
+        // The server says the name is taken, so no confirming round trip is needed.
         Err(TreeError::MakeDir(k)) if k == KError::AlreadyExists.as_i32() => {
             stage.die(b"mkdir: path already exists (use --parents to allow it)\n", EXIT_FAILURE)
         }
@@ -135,19 +113,15 @@ fn make_one(stage: &Stage, path: &[u8]) -> bool {
     }
 }
 
-/// Whether a directory-op failure is the server reporting an occupied name.
 fn is_already_exists(e: &DirError) -> bool {
     matches!(e, DirError::Server(k) if *k == KError::AlreadyExists.as_i32())
 }
 
-/// Create `path` and any missing components above it. Returns whether the **leaf** was
-/// created by this run (`false` when it already existed). Diverges on failure.
+/// Create `path` and any missing components above it; whether the **leaf** was created by this
+/// run. Diverges on failure.
 fn make_parents(stage: &Stage, path: &[u8]) -> bool {
-    // Walk the prefixes shortest-first and just try to create each one. A component that
-    // is already there answers `AlreadyExists`, which is the ordinary case for the upper
-    // prefixes and costs nothing extra; the probe is spent only on that answer, to check
-    // the occupant is a directory. (Before the error existed this had to probe *every*
-    // component first, because a collision could not be told from a real failure.)
+    // Walk the prefixes shortest-first and try to create each one; `AlreadyExists` is the
+    // ordinary answer for the upper prefixes, and only then is the occupant's kind probed.
     let mut created_leaf = false;
     for end in component_ends(path) {
         let prefix = &path[..end];
@@ -166,9 +140,7 @@ fn make_parents(stage: &Stage, path: &[u8]) -> bool {
         created_leaf = match r {
             Ok(()) => true,
             Err(e) if is_already_exists(&e) => {
-                // `--parents` means "ensure this path exists as a directory". A file
-                // wearing the name does not satisfy that, and silently continuing would
-                // report success for a tree that was never built.
+                // A file wearing the name does not satisfy "exists as a directory".
                 if !libfs::is_dir(stage.namespace, prefix) {
                     stage.die(b"mkdir: path exists and is not a directory\n", EXIT_FAILURE);
                 }
@@ -180,10 +152,8 @@ fn make_parents(stage: &Stage, path: &[u8]) -> bool {
     created_leaf
 }
 
-/// Byte offsets just past each path component, shortest prefix first.
-///
-/// `/a/b/c` yields the ends of `/a`, `/a/b`, `/a/b/c`. A leading slash is not itself a
-/// component (the root always exists), and repeated slashes collapse.
+/// Byte offsets just past each path component, shortest prefix first: `/a/b/c` yields the ends
+/// of `/a`, `/a/b`, `/a/b/c`. The root is not a component, and repeated slashes collapse.
 fn component_ends(path: &[u8]) -> Vec<usize> {
     let mut ends = Vec::new();
     let mut i = 0;
@@ -192,7 +162,6 @@ fn component_ends(path: &[u8]) -> Vec<usize> {
             if i > 0 {
                 ends.push(i);
             }
-            // Skip a run of slashes.
             while i < path.len() && path[i] == b'/' {
                 i += 1;
             }
@@ -216,7 +185,6 @@ fn trim_trailing_slashes(path: &[u8]) -> &[u8] {
     &path[..end]
 }
 
-/// Write the rows as a TSM1 table on the `stdout` stream.
 fn emit(stage: &Stage, stdout: u64, made: &[Made]) {
     let schema = Schema::new().field("path", TypeTag::String, TypeModifiers::NONE).field(
         "created",

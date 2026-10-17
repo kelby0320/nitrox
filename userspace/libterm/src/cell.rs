@@ -1,16 +1,10 @@
 //! What a grid position holds: a character, and how it is drawn.
-//!
-//! This is the vocabulary the parser writes and the render reads, so it lands before either.
 
 use libdraw::format::Rgb;
 
 /// One of the sixteen ANSI colours.
 ///
-/// **Named exhaustively rather than held as an index.** A `u8` would admit 240 values the
-/// system does not have, and every consumer would then need a rule for them; sixteen variants
-/// make the supported set the type. 256-colour and truecolour become *variants* of [`Colour`]
-/// when something emits them — which is what the plan means by "a match arm rather than a
-/// reshape" — and neither is in Milestone 5, because nothing does.
+/// Named exhaustively rather than held as an index, so the supported set is the type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ansi {
     /// SGR 30 / 40.
@@ -88,9 +82,7 @@ impl Ansi {
 pub enum Colour {
     /// The theme's default — SGR 39 for a foreground, SGR 49 for a background.
     ///
-    /// **Not a synonym for white-on-black.** A default is whatever the theme says, so it must
-    /// survive into the cell rather than being resolved at parse time: a stored colour would
-    /// freeze the theme into the scrollback, and re-theming would recolour new text only.
+    /// Not white-on-black: it stays unresolved in the cell so a re-theme recolours scrollback too.
     #[default]
     Default,
     /// One of the sixteen.
@@ -112,42 +104,11 @@ pub struct Palette {
 }
 
 impl Default for Palette {
-    /// The design's terminal, as sixteen colours and a pair of defaults.
+    /// The terminal's own sixteen colours and default pair.
     ///
-    /// **Retuned once, for the whole set** (desktop refresh, Part F). The design names five of
-    /// these outright — the banner's cyan, the prompt's bright cyan, the dim its table headers
-    /// and notes are set in, its success green and its error red — plus `--term` and `--termFg`.
-    /// The other eleven are built in the same key rather than left at the previous set's, because
-    /// a palette half in one key and half in another is what makes a terminal look like two
-    /// programs. `ok`, `warn` and `deny` from the theme are the anchors for green, yellow and red.
-    ///
-    /// **One set, not one per palette.** The design keeps its terminal colours outside both of
-    /// its themes, which is the same conclusion the paragraph below reaches from the other
-    /// direction: these are tuned for a dark ground and a light desktop does not retune them.
-    ///
-    /// **All eighteen are the terminal's.** `ansi` is what a program addresses with `ESC[31m` — a
-    /// vocabulary defined by what programs expect, which is why retheming a desktop must not
-    /// retheme `ls` output. `foreground` and `background` are what `Colour::Default` means.
-    ///
-    /// **Those two were read from the shared theme from M11 Part B until Part E**, on the
-    /// argument that a terminal whose ground differed from the chrome around it would flash
-    /// against it. The desktop turning light is the event that showed what the tie really was:
-    /// these two belong with *the sixteen*, which are tuned for a dark ground. Bright white is
-    /// `#ECF0F4`; on a white ground it is invisible, and bright yellow is unreadable. Following
-    /// the theme would therefore mean retuning the sixteen, which is the one thing the paragraph
-    /// above says not to do — so the grid keeps its own ground and a dark terminal sits on a
-    /// light desktop, which is what most people's screens look like anyway.
-    ///
-    /// The desktop's own values are still one source: they are `Theme`'s, and nothing here is a
-    /// second opinion about them — these are a *different* pair, for a different surface.
-    ///
-    /// **That replaces an assertion with a fact.** From A5 until Part B this equality was a pair
-    /// of literals in two crates, enforced by a host test in `xtask` — the one place that links
-    /// `libterm` and `libui`, chosen because they are siblings and "putting a theme colour in
-    /// `libdraw` would make the pixel layer own a theme". Part B did precisely that, on purpose:
-    /// the compositor paints chrome too and links no toolkit, so `libdraw` is where a value all
-    /// three need belongs. One source, so the test that compared two of them has nothing left
-    /// to compare (PR #189 review, finding 6; PR #190 review, finding 2).
+    /// Tuned for a dark ground and independent of the desktop theme: bright white vanishes and
+    /// bright yellow is unreadable on a light ground, and retheming the desktop must not
+    /// retheme `ls` output.
     fn default() -> Self {
         Self {
             ansi: [
@@ -168,13 +129,8 @@ impl Default for Palette {
                 Rgb::new(0x79, 0xC6, 0xD6), // bright cyan — the design's prompt
                 Rgb::new(0xEA, 0xF6, 0xF6), // bright white
             ],
-            // **The design's `--term` and `--termFg`** (desktop refresh, Part F). They were the
-            // dark theme's own two, carried here when the desktop turned light rather than
-            // re-chosen; the design names a pair for its terminal specifically, and keeps them
-            // *outside* both of its palettes for the same reason this whole set sits outside the
-            // theme. **Not `ansi[0]`**, which is a different colour for a reason — a ground equal
-            // to a cell colour is text nobody can read, and the first attempt at this line used
-            // it (caught by `xtask`'s own cross-crate test).
+            // The terminal's own ground, not `ansi[0]`: a ground equal to a cell colour is
+            // unreadable.
             foreground: Rgb::new(0xCF, 0xDE, 0xDC),
             background: Rgb::new(0x0C, 0x12, 0x13),
         }
@@ -201,9 +157,7 @@ impl Palette {
 
 /// The on/off attributes a cell carries, as a bit set.
 ///
-/// A newtype over `u8` rather than four `bool`s: a cell is stored per grid position and there
-/// are 80 × 24 of them before scrollback, so the packing is the difference between an
-/// attribute set that costs one byte and one that costs four.
+/// A `u8` bit set rather than four `bool`s, so a cell's attributes cost one byte.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Flags(u8);
 
@@ -247,17 +201,10 @@ pub struct Attributes {
 impl Attributes {
     /// The pixel colours this cell is drawn in: `(foreground, background)`.
     ///
-    /// Two rules, in this order, and the order is the whole of the function:
-    ///
-    /// 1. **Bold brightens the foreground**, and only an [`Ansi`] one — `Colour::Default`
-    ///    stays the theme's default. This is what xterm and VTE do *when no bold face is
-    ///    available*, which is our situation: `libdraw` has one weight, so a bold that changed
-    ///    nothing would make `SGR 1` invisible, and shells emit it constantly. A real bold face
-    ///    supersedes this rather than joining it.
-    /// 2. **Reverse swaps what results**, not what was named. Reversing
-    ///    default-on-default must give the theme's background drawn on its foreground — a swap
-    ///    applied before resolution would produce `Default` on `Default` and change nothing at
-    ///    all, which is the bug this ordering exists to prevent.
+    /// **Bold brightens the foreground** first, and only an [`Ansi`] one: with one font weight
+    /// (as in xterm and VTE without a bold face) `SGR 1` would otherwise be invisible.
+    /// **Reverse then swaps the resolved colours**, not the named ones: swapping first would turn
+    /// default-on-default into itself and change nothing.
     pub fn resolve(&self, palette: &Palette) -> (Rgb, Rgb) {
         let fg = match (self.flags.contains(Flags::BOLD), self.fg) {
             (true, Colour::Ansi(a)) => Colour::Ansi(a.brightened()),
@@ -271,8 +218,7 @@ impl Attributes {
 /// One grid position.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cell {
-    /// What is printed. A blank cell holds a space rather than `\0`, so a cell is always
-    /// drawable and nothing needs a "is this empty" rule.
+    /// What is printed; a blank cell holds a space, never `\0`, so every cell is drawable.
     pub ch: char,
     /// How it is drawn.
     pub attrs: Attributes,
@@ -302,9 +248,7 @@ mod tests {
 
     #[test]
     fn every_colour_has_a_distinct_palette_entry() {
-        // `Ansi::index` is `self as usize`, which silently depends on declaration order
-        // matching `ALL`. If the two ever disagree, two colours share an entry and text
-        // renders in the wrong one — visible, but only to someone who knows what it should be.
+        // `Ansi::index` is `self as usize`, which depends on declaration order matching `ALL`.
         for (i, c) in Ansi::ALL.iter().enumerate() {
             assert_eq!(c.index(), i, "{c:?} indexes {} but sits at {i}", c.index());
         }
@@ -312,18 +256,10 @@ mod tests {
 
     /// Every colour a program prints in is readable on the ground it is printed on.
     ///
-    /// **The one property of a palette that is not a matter of taste** (desktop refresh, Part F).
-    /// `xtask` already asserts no colour *equals* the ground — the sharp edge — but a colour a
-    /// shade off the ground is text nobody can read either, and a whole set was retuned here by
-    /// hand. 4.5:1 is WCAG's threshold for body text; the tightest of the fifteen is plain red at
-    /// 4.88, so this has room without being slack.
-    ///
-    /// **ANSI black is exempt, and that is the convention rather than a hole.** Slot 0 is what a
-    /// program means by "the darkest thing"; it is dim on a dark ground in every terminal ever
-    /// shipped, and a palette that made it readable would have stopped being black.
+    /// 4.5:1 is WCAG's threshold for body text. ANSI black is exempt: slot 0 is dim on a dark
+    /// ground in every terminal, and a readable one would stop being black.
     #[test]
     fn every_colour_but_black_is_readable_on_the_terminals_ground() {
-        // sRGB relative luminance, as WCAG defines it.
         fn lum(c: Rgb) -> f32 {
             fn chan(v: u8) -> f32 {
                 let v = v as f32 / 255.0;
@@ -345,8 +281,6 @@ mod tests {
         }
         assert!(ratio(p.foreground, p.background) >= 4.5, "the default foreground is unreadable");
 
-        // **And the sixteen are sixteen.** A duplicate loses a colour with no other symptom:
-        // `ESC[32m` and `ESC[36m` would print the same pixels and nothing would say so.
         for (i, a) in p.ansi.iter().enumerate() {
             for (j, b) in p.ansi.iter().enumerate().skip(i + 1) {
                 assert_ne!(a, b, "ANSI colours {i} and {j} are the same colour");
@@ -369,8 +303,7 @@ mod tests {
 
     #[test]
     fn a_default_colour_is_not_a_named_one() {
-        // The reason `Colour::Default` exists at all: SGR 39 must not resolve to whatever
-        // white happens to be, or a re-theme leaves old text stranded in the old default.
+        // SGR 39 must not resolve to a palette entry, or a re-theme strands old text.
         let p = Palette { foreground: Rgb::new(1, 2, 3), ..Palette::default() };
         assert_eq!(p.foreground_of(Colour::Default), Rgb::new(1, 2, 3));
         assert_ne!(
@@ -382,9 +315,7 @@ mod tests {
 
     #[test]
     fn the_same_colour_differs_by_where_it_is_used() {
-        // Only for `Default`: a named colour is the same pixel either side, and the default is
-        // two different pixels. A single `resolve(c)` would have to pick one and be wrong half
-        // the time.
+        // Only `Default` differs by use; a named colour is one pixel either side.
         let p = Palette::default();
         assert_eq!(p.foreground_of(Colour::Ansi(Ansi::Red)), p.background_of(Colour::Ansi(Ansi::Red)));
         assert_ne!(p.foreground_of(Colour::Default), p.background_of(Colour::Default));
@@ -398,8 +329,7 @@ mod tests {
         assert_eq!(bold.resolve(&p).0, p.ansi[Ansi::BrightRed.index()]);
         assert_ne!(bold.resolve(&p).0, plain.resolve(&p).0, "bold changed nothing visible");
 
-        // The default has no bright counterpart to move to, and inventing one would make
-        // `SGR 1` on default text a theme change.
+        // The default has no bright counterpart; inventing one would make `SGR 1` a theme change.
         let bold_default = Attributes { flags: Flags::BOLD, ..Default::default() };
         assert_eq!(bold_default.resolve(&p).0, p.foreground);
     }
@@ -413,9 +343,7 @@ mod tests {
 
     #[test]
     fn reverse_swaps_the_resolved_colours_not_the_named_ones() {
-        // **The ordering bug this exists to prevent.** Swapping `fg`/`bg` before resolution
-        // turns `Default`/`Default` into `Default`/`Default` — reverse video on default text
-        // would do nothing, which is exactly where a shell uses it (a selected menu line).
+        // Swapping before resolution would make reverse a no-op on default text.
         let p = Palette::default();
         let rev = Attributes { flags: Flags::REVERSE, ..Default::default() };
         assert_eq!(rev.resolve(&p), (p.background, p.foreground));
@@ -426,8 +354,7 @@ mod tests {
 
     #[test]
     fn reverse_and_bold_compose_in_the_stated_order() {
-        // Bold brightens the foreground, *then* reverse moves it to the background. A reverse
-        // applied first would brighten what is now the background instead.
+        // Bold brightens first, then reverse moves the result to the background.
         let p = Palette::default();
         let a = Attributes {
             fg: Colour::Ansi(Ansi::Green),
@@ -452,8 +379,7 @@ mod tests {
 
     #[test]
     fn a_blank_cell_is_a_space_in_default_attributes() {
-        // Erasing writes this, so it has to be what a never-written cell already is — or a
-        // cleared region would differ from an untouched one and the diff would repaint it.
+        // Erasing writes this, so it must equal a never-written cell or the diff would repaint.
         assert_eq!(Cell::default(), Cell::BLANK);
         assert_eq!(Cell::BLANK.ch, ' ');
         assert_eq!(Cell::BLANK.attrs, Attributes::default());
@@ -461,9 +387,6 @@ mod tests {
 
     #[test]
     fn a_cell_is_no_bigger_than_it_needs_to_be() {
-        // 80x24 is 1,920 cells before any scrollback, and the scrollback ring multiplies that
-        // by the number of retained lines. Not a hard requirement — an assertion so that a
-        // field added without thinking shows up as a decision rather than as memory.
         assert!(core::mem::size_of::<Cell>() <= 8, "a cell is {} bytes", core::mem::size_of::<Cell>());
     }
 }

@@ -1,6 +1,5 @@
-//! Pass the absolute path to `user.ld` as a `-T` link arg. Cargo runs the
-//! linker from the target directory, so a relative path in `.cargo/config.toml`
-//! would not resolve — this mirrors `kernel/build.rs`.
+//! Pass the absolute path to `user.ld` as a `-T` link arg: cargo runs the linker from the
+//! target directory, so a relative path in `.cargo/config.toml` would not resolve.
 
 use std::env;
 use std::path::PathBuf;

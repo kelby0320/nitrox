@@ -1,16 +1,10 @@
-//! What a block device is, for a program that has to choose one (Phase 5 Part H.1).
+//! What a block device is, for a program that has to choose one.
 //!
-//! `/dev/blk/<n>` hands out the *n*-th block device, and until now nothing said what that device
-//! **was**: partitions and module RAM disks are registered in the same table as disks, so an
-//! installer given an index could write a partition table over the running root — which the Part H
-//! detail pass's own example command would have done (PR #307 review). Nor was there a capacity or
-//! a name, so "refuse anything that is not a whole disk" and "type the target's identity back"
-//! were both unimplementable.
-//!
-//! The facts live here rather than in the installer because every tool
-//! `docs/planning/administration.md` describes needs the same three: a partitioner, a mount tool
-//! and a disk list all have to tell a disk from a slice of one, say how big it is, and name it to a
-//! person.
+//! `/dev/blk/<n>` hands out the *n*-th block device, and partitions and module RAM disks are
+//! registered in the same table as disks, so an installer given an index could write a
+//! partition table over the running root. The facts live here because a partitioner, a mount
+//! tool and a disk list all have to tell a disk from a slice of one, say how big it is, and
+//! name it to a person.
 //!
 //! Served as one `BlockDeviceInfo` at `/dev/blk/<n>/info`, the shape `/dev/framebuffer/info`
 //! already uses. `#[repr(C)]` and mirrored byte-for-byte in `userspace/libkern/src/abi.rs`; the
@@ -18,9 +12,8 @@
 
 use core::mem::{align_of, offset_of, size_of};
 
-/// Longest device name served, in bytes. ATA's model field is 40 and its serial 20, so a disk's
-/// `model (serial)` fits with room for the space and brackets; a partition's is its GPT label,
-/// capped at the same length by the same field.
+/// Longest device name served, in bytes. ATA's model field is 40 and its serial 20, so a
+/// disk's `model (serial)` fits; a partition's is its GPT label, capped at the same length.
 pub const MAX_DEVICE_NAME: usize = 72;
 
 /// What kind of block device a node is. **Not a hint**: the installer refuses to partition
@@ -200,8 +193,8 @@ mod tests {
         assert!(info.name[11..].iter().all(|&b| b == 0), "no stale bytes past the name");
     }
 
-    /// The product is the capacity every caller wants, and a driver that filled the geometry in
-    /// wrongly must not produce a *small* number — which is what a wrap would do.
+    /// A driver that filled the geometry in wrongly must not produce a *small* number, which
+    /// is what a wrap would do.
     #[test]
     fn capacity_is_the_product_and_saturates_rather_than_wrapping() {
         let disk = BlockDeviceInfo::new(BlockKind::Disk, 512, 1_953_525_168, b"");
@@ -235,7 +228,6 @@ mod tests {
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 1024);
         assert_eq!(u32::from_le_bytes(b[16..20].try_into().unwrap()), 11);
         assert_eq!(&b[24..24 + 11], b"nitrox-root");
-        // Every byte is accounted for by a field, so a zeroed record serialises as zeros.
         assert!(BlockDeviceInfo::default().as_bytes().iter().all(|&b| b == 0));
     }
 }

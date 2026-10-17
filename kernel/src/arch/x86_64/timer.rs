@@ -1,18 +1,12 @@
-//! x86_64 [`ArchTimer`] implementation: TSC monotonic time + local-APIC timer,
-//! both calibrated against the legacy PIT (channel 2) at boot.
+//! x86_64 [`ArchTimer`] implementation: TSC monotonic time + local-APIC timer, both calibrated
+//! against the legacy PIT (channel 2) at boot.
 //!
-//! The LAPIC timer runs in classic **count-down** mode (one-shot / periodic) —
-//! **not** TSC-deadline mode — because the project's QEMU dev loop runs under
-//! TCG, which does not emulate the TSC-deadline timer (the same reason
-//! `apic.rs` uses xAPIC, not x2APIC; see the decision log). There is no HPET or
-//! ACPI dependency: the PIT is found at fixed legacy ports and the LAPIC at the
-//! MSR-reported MMIO base (see `docs/rationale/why-phased-acpi.md`).
+//! The LAPIC timer runs in **count-down** mode (one-shot / periodic), **not** TSC-deadline mode,
+//! because TCG does not emulate the latter. There is no HPET or ACPI dependency
+//! (`docs/rationale/why-phased-acpi.md`).
 //!
-//! Calibration uses **PIT channel 2**, which is software-gated (port `0x61`
-//! bit 0) and whose output is pollable (port `0x61` bit 5) — so it needs no
-//! interrupt, which matters because it runs at boot before interrupts are
-//! enabled (IF is still 0). We run the channel for a fixed ~10 ms window and
-//! count how far the TSC and the LAPIC timer advance, yielding both frequencies.
+//! Calibration runs **PIT channel 2** (software-gated by port `0x61` bit 0, pollable at bit 5, so
+//! no interrupt with IF still 0) for a fixed ~10 ms window while the TSC and LAPIC timer count.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,83 +15,56 @@ use crate::arch::timer::ArchTimer;
 use crate::arch::x86_64::apic;
 use crate::arch::x86_64::regs;
 
-// --- PIT (Intel 8254) channel 2 -------------------------------------------
-/// Channel-2 data port (count read/write).
 const PIT_CH2_DATA: u16 = 0x42;
-/// Mode/command port.
 const PIT_CMD: u16 = 0x43;
-/// Channel-2 gate + speaker control / output-status port. Bit 0 = gate enable,
-/// bit 1 = speaker enable, bit 5 = channel-2 OUT (read-only status).
+/// Channel-2 gate/speaker control port: bit 0 gate, bit 1 speaker, bit 5 channel-2 OUT (read).
 const PIT_CH2_GATE: u16 = 0x61;
-/// PIT input clock — 1.193182 MHz on every PC.
 const PIT_INPUT_HZ: u64 = 1_193_182;
-/// Command byte: channel 2 (bits 7:6 = 10), access lobyte/hibyte (bits 5:4 =
-/// 11), mode 0 / interrupt-on-terminal-count (bits 3:1 = 000), binary (bit 0 =
-/// 0) → `0b1011_0000`. In mode 0, OUT is low while counting and goes high at
-/// terminal count.
+/// Command byte: channel 2, lobyte/hibyte access, mode 0 (OUT low while counting, high at
+/// terminal count), binary.
 const PIT_CH2_MODE0_LOHI: u8 = 0b1011_0000;
-/// Calibration window, milliseconds.
 const CAL_MS: u64 = 10;
-/// Channel-2 reload count for a `CAL_MS` window (≈ 11932 for 10 ms).
 const CAL_PIT_COUNT: u16 = ((PIT_INPUT_HZ * CAL_MS) / 1000) as u16;
 
-// --- LAPIC timer ----------------------------------------------------------
-/// Divide-by-16 (DCR encoding `0b0011`).
 const LAPIC_TIMER_DIV16_DCR: u32 = 0b0011;
-/// LVT Timer bit 16 — delivery mask.
 const LVT_TIMER_MASKED: u32 = 1 << 16;
-/// LVT Timer bits 18:17 = `01` — periodic mode.
 const LVT_TIMER_PERIODIC: u32 = 1 << 17;
 
-// --- Invariant-TSC feature bit --------------------------------------------
-/// Extended CPUID leaf carrying the invariant-TSC bit.
 const CPUID_INVARIANT_TSC_LEAF: u32 = 0x8000_0007;
-/// `CPUID.80000007H:EDX.8` — TSC ticks at a constant rate across P-/C-states.
+/// `CPUID.80000007H:EDX.8`: the TSC ticks at a constant rate across P-/C-states.
 const CPUID_INVARIANT_TSC_BIT: u32 = 1 << 8;
 
-// --- Calibration results (set once by `init`) -----------------------------
-/// Calibrated TSC frequency in Hz. `0` until [`X86Timer::init`] runs.
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
-/// Calibrated LAPIC-timer input frequency in Hz (at the chosen divisor).
 static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
-/// TSC value captured at the end of `init`, the monotonic zero-point.
 static TSC_BASE: AtomicU64 = AtomicU64::new(0);
-/// Multiply-shift pair for the TSC→ns conversion: `ns = (delta * MULT) >> SHIFT`.
-/// Precomputed in `init` so [`X86Timer::read_ns`] needs no per-call division.
+/// Multiply-shift pair for the TSC→ns conversion, `ns = (delta * MULT) >> SHIFT`.
 static NS_MULT: AtomicU64 = AtomicU64::new(0);
 static NS_SHIFT: AtomicU64 = AtomicU64::new(0);
 
-/// The x86_64 [`ArchTimer`] implementation. Zero-sized; re-exported as
-/// `crate::arch::Timer`.
+/// The x86_64 [`ArchTimer`] implementation, re-exported as `crate::arch::Timer`.
 pub struct X86Timer;
 
 impl ArchTimer for X86Timer {
     unsafe fn init() {
         debug_assert!(apic::is_initialised(), "ArchTimer::init before Irq::init — LAPIC MMIO not mapped");
 
-        // Warn (do not fail) if the CPU does not advertise an invariant TSC: on
-        // such hardware the monotonic clock could drift with P-states. QEMU/TCG
-        // does provide a stable TSC, so this is informational in the dev loop.
+        // Warn only: without an invariant TSC the monotonic clock could drift with P-states.
         let (_, _, _, edx) = regs::cpuid(CPUID_INVARIANT_TSC_LEAF, 0);
         if edx & CPUID_INVARIANT_TSC_BIT == 0 {
             crate::kprintln!("timer: WARNING — CPU reports no invariant TSC; monotonic clock may drift");
         }
 
-        // Free-run the LAPIC timer from max so its current-count decrements
-        // measurably during the PIT window. Masked LVT: it raises nothing.
-        // SAFETY: `apic::is_initialised()` (asserted above) means the LAPIC MMIO
-        // page is mapped; writing the timer registers is the defined way to
-        // configure the count-down timer, and a masked LVT delivers nothing.
+        // Free-run the LAPIC timer from max so its count decrements during the PIT window.
+        // SAFETY: `apic::is_initialised()` (asserted above) means this CPU's local APIC is in
+        // x2APIC mode, its registers reachable as MSRs; writing the timer registers is the
+        // defined way to configure the count-down timer, and a masked LVT delivers nothing.
         unsafe {
             apic::write_reg_shared(apic::REG_TIMER_DIV_CONFIG, LAPIC_TIMER_DIV16_DCR);
             apic::write_reg_shared(apic::REG_LVT_TIMER, LVT_TIMER_MASKED | TIMER_VECTOR as u32);
             apic::write_reg_shared(apic::REG_TIMER_INIT_COUNT, u32::MAX);
         }
 
-        // Run PIT channel 2 for the window and bracket it with TSC + LAPIC
-        // snapshots. The snapshots are taken right after the gate is raised and
-        // right after terminal count, so the tiny setup/teardown windows add
-        // only a constant sub-microsecond error over the 10 ms span.
+        // Snapshots right after the gate rises and at terminal count keep the error constant.
         // SAFETY: single CPU during boot with IF=0; nothing else touches the PIT
         // or port 0x61, and the LAPIC page is mapped.
         let (tsc_start, lapic_start, tsc_end, lapic_end) = unsafe {
@@ -110,9 +77,7 @@ impl ArchTimer for X86Timer {
             (tsc_start, lapic_start, tsc_end, lapic_end)
         };
 
-        // Elapsed real time is `CAL_PIT_COUNT / PIT_INPUT_HZ` seconds, so
-        // `hz = ticks * PIT_INPUT_HZ / CAL_PIT_COUNT`. The LAPIC current-count
-        // counts *down*, so its elapsed ticks are `start - end`.
+        // Elapsed time is `CAL_PIT_COUNT / PIT_INPUT_HZ` seconds. The LAPIC count goes *down*.
         let count = CAL_PIT_COUNT as u64;
         let tsc_hz = tsc_end.wrapping_sub(tsc_start) * PIT_INPUT_HZ / count;
         let lapic_ticks = (lapic_start - lapic_end) as u64;
@@ -124,7 +89,7 @@ impl ArchTimer for X86Timer {
         NS_MULT.store(mult, Ordering::Relaxed);
         NS_SHIFT.store(shift, Ordering::Relaxed);
 
-        // Disarm the calibration countdown and capture the monotonic zero-point.
+        // Disarm the countdown and capture the monotonic zero-point.
         // SAFETY: writing 0 to the initial count halts the timer; LAPIC mapped.
         unsafe { apic::write_reg_shared(apic::REG_TIMER_INIT_COUNT, 0) };
         TSC_BASE.store(regs::rdtsc(), Ordering::Relaxed);
@@ -141,7 +106,7 @@ impl ArchTimer for X86Timer {
 
     unsafe fn start_periodic(period_ns: u64) {
         let count = ns_to_timer_ticks(period_ns);
-        // SAFETY: LAPIC MMIO mapped (post-init). Unmasked periodic LVT at the
+        // SAFETY: the local APIC is in x2APIC mode (post-init). Unmasked periodic LVT at the
         // timer vector — once IF=1 (preemptive scheduling) this fires the timer
         // IRQ every `period_ns`.
         unsafe {
@@ -181,9 +146,7 @@ impl ArchTimer for X86Timer {
 
 /// Program PIT channel 2 to count down from `count` in mode 0 and start it.
 ///
-/// Channel 2 is software-gated via port `0x61` bit 0; its OUT (bit 5) reads low
-/// while counting and high at terminal count. The speaker bit (bit 1) is forced
-/// low so nothing is audible.
+/// The speaker bit (bit 1) is forced low so nothing is audible.
 ///
 /// # Safety
 /// Ring-0 port I/O; the caller must own the PIT and port `0x61` (single CPU,
@@ -191,18 +154,18 @@ impl ArchTimer for X86Timer {
 unsafe fn pit_ch2_start(count: u16) {
     // SAFETY: legacy PIT/port-0x61 I/O, owned by the kernel during boot.
     unsafe {
-        // Gate low + speaker off first, so reprogramming starts cleanly.
+        // Gate low + speaker off first.
         let p61 = regs::inb(PIT_CH2_GATE) & 0xFC;
         regs::outb(PIT_CH2_GATE, p61);
         regs::outb(PIT_CMD, PIT_CH2_MODE0_LOHI);
         regs::outb(PIT_CH2_DATA, (count & 0xFF) as u8);
         regs::outb(PIT_CH2_DATA, (count >> 8) as u8);
-        // Raise the gate (bit 0) to begin counting; speaker (bit 1) stays clear.
+        // Raise the gate to begin counting.
         regs::outb(PIT_CH2_GATE, p61 | 0x01);
     }
 }
 
-/// Busy-poll channel-2 OUT (port `0x61` bit 5) until terminal count.
+/// Busy-poll channel-2 OUT until terminal count.
 ///
 /// # Safety
 /// As [`pit_ch2_start`].
@@ -219,71 +182,51 @@ unsafe fn pit_ch2_wait_until_done() {
 
 /// Convert a raw TSC reading into nanoseconds since [`TSC_BASE`].
 ///
-/// **Saturating, not wrapping, and that is the whole of it.** `TSC_BASE` is captured once, on
-/// the BSP, at the end of calibration; every CPU then reports `(its own TSC − that base) ×
-/// scale`, so an AP whose TSC sits *behind* the BSP's produces a negative delta. Wrapping
-/// turned that into ~9.2×10¹⁸ ns — 292 years — which is not a late clock but a poisoned one:
-/// `fire_expired_deadlines` finds every armed entry expired and drains the heap in one pass,
-/// and the periodic re-arm writes `now + interval` back ~292 years out, where `saturating_add`
-/// does not clamp because the value is nowhere near `u64::MAX`. Healthy CPUs then compare
-/// their own sane `now` against those entries and never fire them again: **one cold AP
-/// permanently ends periodic timers machine-wide.**
+/// **Saturating, not wrapping.** `TSC_BASE` is captured once, on the BSP; every CPU reports
+/// `(its own TSC − that base) × scale`, so an AP whose TSC is *behind* gets a negative delta.
+/// Wrapping turns that into ~292 years, a poisoned clock: `fire_expired_deadlines` drains the
+/// heap in one pass and the periodic re-arm writes `now + interval` ~292 years out, which
+/// `saturating_add` does not clamp. Healthy CPUs then never fire those entries again: **one
+/// cold AP permanently ends periodic timers machine-wide.**
 ///
-/// Saturating reads 0 instead — that CPU's clock appears not to advance until its TSC passes
-/// the base, which is wrong but bounded and self-correcting. The tolerance for a negative
-/// skew is `now − base`, the time since calibration, which is *smallest exactly when the APs
-/// come up*.
+/// Saturating reads 0 instead: that CPU's clock appears not to advance until its TSC passes the
+/// base, which is wrong but bounded and self-correcting.
 ///
-/// **It does not make early firing impossible, and an earlier version of this comment said it
-/// did** (PR #204 review, finding 4). A skewed AP is exactly the "CPU running behind" case
-/// `smp.md` § Deferred describes: a `sys_wait(10 ms)` *stamped* there reads `now` as 0 and
-/// arms `0 + 10 ms`, which a healthy CPU 30 ms into boot finds expired on its next sweep and
-/// returns to userspace as an immediate `TimedOut`. Firings *adjudicated on* the skewed CPU
-/// are late, never early; deadlines *stamped by* it can fire early elsewhere. The improvement
-/// is real and large — the same wait was previously armed ~292 years out and never fired at
-/// all — but it is a bound on the damage, not an end to it.
-///
-/// This bounds the damage; it does not detect the skew. Verifying cross-CPU TSC
-/// synchronisation at bring-up is still deferred (F10, `smp.md` § Deferred). Split out of
-/// [`X86Timer::read_ns`] so the skew case is reachable by a host test — `rdtsc` is not
-/// (kernel audit C.5(b), 2026-08-14).
+/// **It does not make early firing impossible.** A deadline *stamped* on a skewed CPU reads
+/// `now` as 0, so a `sys_wait(10 ms)` there can be found expired early by a healthy CPU
+/// (`smp.md` § Deferred); firings *adjudicated on* it are late, never early. Verifying
+/// cross-CPU TSC synchronisation at bring-up is still deferred (F10, `smp.md` § Deferred). Split
+/// out of [`X86Timer::read_ns`] so a host test can reach the skew case.
 fn elapsed_ns(now: u64, base: u64, mult: u64, shift: u64) -> u64 {
     let delta = now.saturating_sub(base);
-    // u128 intermediate: `delta` and `mult` are each ≤ u64::MAX, and
-    // (2^64-1)^2 < 2^128-1, so the product never overflows.
+    // (2^64-1)^2 < 2^128-1, so the u128 product never overflows.
     (((delta as u128) * (mult as u128)) >> shift) as u64
 }
 
-/// Convert a nanosecond interval to a LAPIC initial-count using the calibrated
-/// timer frequency, saturating into the 32-bit count register.
 fn ns_to_timer_ticks(ns: u64) -> u32 {
     ns_to_ticks_with_hz(ns, TIMER_HZ.load(Ordering::Relaxed))
 }
 
-/// Pure core of [`ns_to_timer_ticks`]: `ns * timer_hz / 1e9`, clamped to
-/// `1..=u32::MAX` (a never-zero count so an arm always programs a real
-/// countdown). Host-tested.
+/// Pure core of [`ns_to_timer_ticks`]: `ns * timer_hz / 1e9`, clamped to `1..=u32::MAX` so an arm
+/// always programs a real countdown.
 fn ns_to_ticks_with_hz(ns: u64, timer_hz: u64) -> u32 {
     let hz = timer_hz.max(1) as u128;
     let ticks = (ns as u128 * hz) / 1_000_000_000u128;
     ticks.clamp(1, u32::MAX as u128) as u32
 }
 
-/// Choose `(mult, shift)` so that `(delta * mult) >> shift ≈ delta * 1e9 /
-/// tsc_hz`, with `mult ≤ u64::MAX` and `shift` as large as possible for
-/// precision. Pure; host-tested against a u128 reference.
+/// Choose `(mult, shift)` so `(delta * mult) >> shift ≈ delta * 1e9 / tsc_hz`, with
+/// `mult ≤ u64::MAX` and `shift` as large as possible for precision.
 fn compute_ns_mul_shift(tsc_hz: u64) -> (u64, u64) {
     let hz = tsc_hz.max(1) as u128;
     let mut shift: u32 = 63;
     loop {
-        // mult = round(1e9 * 2^shift / hz)
         let numer = 1_000_000_000u128 << shift;
         let mult = (numer + hz / 2) / hz;
         if mult <= u64::MAX as u128 {
             return (mult as u64, shift as u64);
         }
         if shift == 0 {
-            // Unreachable for any real frequency (hz ≥ 1 ⇒ mult ≤ 1e9 here).
             return (1, 0);
         }
         shift -= 1;
@@ -295,28 +238,17 @@ mod tests {
     use super::*;
 
     /// A TSC reading *behind* the calibration base must read as no time elapsed, not as 292
-    /// years.
-    ///
-    /// The failure this pins is not a late clock, it is a poisoned one: `wrapping_sub` put
-    /// `read_ns` at ~9.2×10¹⁸ ns, which makes `fire_expired_deadlines` drain the whole heap
-    /// in one pass and re-arm every periodic timer ~292 years out — a value `saturating_add`
-    /// does not clamp, because it is nowhere near `u64::MAX`. Healthy CPUs then never fire
-    /// those entries again, so **one cold AP ends periodic timers machine-wide, permanently**
-    /// (kernel audit C.5(b)).
-    ///
-    /// Numbers mirror the audit's replay: a 2 GHz TSC, base 25 ms into boot.
+    /// years (see [`elapsed_ns`]).
     #[test]
     fn a_tsc_behind_the_calibration_base_reads_zero_rather_than_wrapping() {
-        // 2 GHz: 1 tick = 0.5 ns. mult/shift as `Timer::init` computes them.
+        // 2 GHz: 1 tick = 0.5 ns.
         let (mult, shift) = (1u64 << 62, 63u64);
         let base = 50_000_000; // 25 ms in
         let one_ms = 2_000_000; // ticks
 
-        // Forwards: ordinary scaling still works.
         assert_eq!(elapsed_ns(base, base, mult, shift), 0);
         assert_eq!(elapsed_ns(base + one_ms, base, mult, shift), 1_000_000);
 
-        // Behind the base by any amount: zero, and specifically *not* astronomical.
         for behind in [1u64, one_ms, 10 * one_ms, base] {
             let ns = elapsed_ns(base - behind, base, mult, shift);
             assert_eq!(ns, 0, "a TSC {behind} ticks behind the base must read 0");
@@ -328,12 +260,10 @@ mod tests {
         }
     }
 
-    /// Reference conversion using a full u128 division.
     fn ref_ns(delta: u64, tsc_hz: u64) -> u64 {
         ((delta as u128 * 1_000_000_000u128) / tsc_hz as u128) as u64
     }
 
-    /// Apply the precomputed mul-shift the way `read_ns` does.
     fn apply(delta: u64, mult: u64, shift: u64) -> u64 {
         (((delta as u128) * (mult as u128)) >> shift) as u64
     }
@@ -346,7 +276,7 @@ mod tests {
             for &delta in &[0u64, 1, 1_000, 3_000_000_000, 90_000_000_000_000_000] {
                 let got = apply(delta, mult, shift);
                 let want = ref_ns(delta, tsc_hz);
-                // Allow ≤ 1 ns of rounding slack per second of elapsed time.
+                // ≤ 1 ns of rounding slack per second elapsed.
                 let secs = want / 1_000_000_000 + 1;
                 let tol = secs + 1; // ≤ 1 ns/s, plus a floor-boundary unit
                 let diff = got.abs_diff(want);
@@ -357,8 +287,6 @@ mod tests {
 
     #[test]
     fn mul_shift_no_overflow_at_max_delta() {
-        // mult ≤ u64::MAX and delta ≤ u64::MAX must not overflow the u128 in
-        // `read_ns`: (2^64-1)^2 < 2^128-1.
         let (mult, shift) = compute_ns_mul_shift(1_000_000_000);
         let _ = apply(u64::MAX, mult, shift); // must not panic
         assert!(mult as u128 <= u64::MAX as u128);
@@ -367,28 +295,20 @@ mod tests {
 
     #[test]
     fn ns_to_ticks_scales_and_clamps() {
-        // 100 MHz timer: 1 ms → 100_000 ticks.
         assert_eq!(ns_to_ticks_with_hz(1_000_000, 100_000_000), 100_000);
-        // Zero interval still programs a real (non-zero) countdown.
         assert_eq!(ns_to_ticks_with_hz(0, 100_000_000), 1);
-        // A huge interval saturates to the 32-bit register width.
         assert_eq!(ns_to_ticks_with_hz(u64::MAX, 1_000_000_000), u32::MAX);
-        // A zero/uncalibrated frequency does not divide-by-zero.
         assert_eq!(ns_to_ticks_with_hz(1_000_000, 0), 1);
     }
 
     #[test]
     fn cal_pit_count_is_about_10ms() {
-        // 1_193_182 Hz * 10 ms ≈ 11932 counts.
         assert_eq!(CAL_PIT_COUNT, 11931);
     }
 }
 
-/// Raw CPU cycle counter, for self-test micro-measurements only.
-///
-/// Distinct from [`X86Timer::read_ns`]: no scaling, no monotonicity guarantee across
-/// CPUs — just the bare `RDTSC`, so a self-test can price a code path in cycles. Only
-/// meaningful under KVM or on real hardware; TCG's `RDTSC` counts emulator progress.
+/// Raw `RDTSC` for self-test micro-measurements: unscaled, and not monotonic across CPUs.
+/// Meaningful only under KVM or on real hardware; TCG's `RDTSC` counts emulator progress.
 #[cfg(feature = "selftest")]
 pub fn read_cycles() -> u64 {
     regs::rdtsc()

@@ -1,4 +1,4 @@
-//! **FAT's dates and times** (Phase 6 Part E.2), which carry no zone: read and written as UTC, as
+//! **FAT's dates and times**, which carry no zone: read and written as UTC, as
 //! the system keeps its clock. A date is days from 1980 to 2107; a time has two-second steps.
 
 /// 1980-01-01 00:00:00 UTC, the first moment a FAT date can hold.

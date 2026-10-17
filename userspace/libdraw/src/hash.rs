@@ -1,27 +1,16 @@
 //! A stable hash of a framebuffer's *visible* pixels.
 //!
-//! This is the value `docs/design/display-substrate.md` §8b asserts in two places:
-//! the guest composites the reference scene and reports its hash, and the host test
-//! asserts the same constant against its in-memory composite. "If the host and the
-//! guest disagree, one of them is wrong and the commit that broke it is the one that
-//! fails."
+//! The value `docs/design/display-substrate.md` §8b asserts in two places: the guest composites
+//! the reference scene and reports its hash, and the host test asserts the same constant.
 //!
-//! **Row padding is excluded, and that is the whole design.** Hashing whole rows
-//! would fold `pitch - width × bpp` bytes of never-written memory into the result, so
-//! the same picture would hash differently depending on what happened to be in the
-//! allocation. §7 forbids exactly that. It also means a host buffer and a guest
-//! framebuffer with *different* strides hash identically for the same image, which is
-//! what lets the two sides be compared at all.
+//! Row padding is excluded: hashing whole rows would fold never-written memory into the result
+//! (§7 forbids that), and a host buffer and a guest framebuffer with different strides must hash
+//! identically for the same image.
 //!
-//! **The *pixel's* padding is not excluded, which is a different thing.** A row contributes
-//! `width × bpp` bytes, and in `XRGB8888` that includes the X byte — so the hash is sensitive to
-//! bits the display ignores. Nothing in tree writes them: every producer goes through
-//! [`PixelFormat::encode`](crate::format::PixelFormat::encode), which leaves X zero, and
-//! `compose`'s row-copy blit preserves what it finds. A future client that `memcpy`s ARGB data
-//! straight into an XRGB surface would draw a correct picture and move `REFERENCE_HASH` anyway,
-//! which is a confusing way to fail (PR #274 review). Masking X here would cost a pass over every
-//! pixel to defend against a client that does not exist; the note is the cheaper half, and the
-//! trigger for doing more is the first client that trips it.
+//! The pixel's own padding is not excluded: in `XRGB8888` the X byte is hashed. Every producer
+//! goes through [`PixelFormat::encode`](crate::format::PixelFormat::encode), which leaves it zero,
+//! but a client that `memcpy`s ARGB data into an XRGB surface would move `REFERENCE_HASH` with a
+//! correct picture. Masking X would cost a pass over every pixel; do it when a client trips this.
 
 use crate::framebuffer::Framebuffer;
 
@@ -32,13 +21,10 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Hash the visible pixels of a framebuffer.
 ///
-/// FNV-1a, chosen because it is a dozen lines with no dependencies — the kernel and
-/// userspace both forbid pulling in a crate for this — and because the gate needs a
-/// *stable* fingerprint, not a cryptographic one. Nothing here defends against an
-/// adversary; it detects accidental change.
+/// FNV-1a: a dozen lines with no dependency, and the gate needs a stable fingerprint, not a
+/// cryptographic one.
 ///
-/// The geometry is folded in first, so two images that differ only in size cannot
-/// collide by having the same pixel bytes.
+/// The geometry is folded in first, so two images differing only in size cannot collide.
 pub fn hash_visible<F: Framebuffer + ?Sized>(fb: &F) -> u64 {
     let g = fb.geometry();
     let bytes = fb.bytes();
@@ -86,15 +72,13 @@ mod tests {
 
     #[test]
     fn stride_does_not_change_the_hash() {
-        // The property that lets the host's buffer and the guest's framebuffer be
-        // compared at all: same picture, different row padding, same hash.
+        // Same picture, different row padding, same hash: what lets host and guest be compared.
         assert_eq!(hash_visible(&painted(32)), hash_visible(&painted(96)));
     }
 
     #[test]
     fn padding_contents_do_not_change_the_hash() {
         let mut a = painted(96);
-        // Scribble in the row padding, which no correct writer ever touches.
         let g = a.geometry();
         let row_bytes = g.width as usize * 4;
         let bytes = a.bytes_mut();
@@ -116,8 +100,7 @@ mod tests {
 
     #[test]
     fn transposed_content_changes_the_hash() {
-        // The reason the reference scene must vary in both axes: if swapping two rows
-        // did not change the hash, the gate could not catch a stride bug.
+        // The reference scene must vary in both axes, or the gate could not catch a stride bug.
         let mut a = painted(32);
         let g = a.geometry();
         let row = g.width as usize * 4;
@@ -133,7 +116,6 @@ mod tests {
     fn geometry_is_folded_in_so_different_sizes_cannot_collide() {
         let wide = MemFramebuffer::new(Geometry::packed(8, 2, PixelFormat::XRGB8888));
         let tall = MemFramebuffer::new(Geometry::packed(4, 4, PixelFormat::XRGB8888));
-        // Identical pixel bytes (all zero), different shape.
         assert_eq!(wide.bytes(), tall.bytes());
         assert_ne!(hash_visible(&wide), hash_visible(&tall));
     }

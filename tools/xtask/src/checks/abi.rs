@@ -2,40 +2,6 @@
 
 use crate::*;
 
-/// The placeholder is spelt `TODO(<tag>)` throughout this file — angle brackets included — and
-/// that is load-bearing: this gate scans `tools/xtask/src`, so the bare form in its own prose
-/// was being counted as a real marker named `tag`, inflating the tally and, worse, making the
-/// gate depend on `deferred-decisions.md` continuing to contain the same placeholder. The
-/// angle brackets fail the plain-word check, so [`markers_in_line`] skips them.
-///
-/// This sentence used to spell the bare form out to explain itself, which was invisible only
-/// because the code scan stopped at the first marker on a line and that one was the bracketed
-/// version. Sharing [`markers_in_line`] between both directions surfaced it immediately — the
-/// third self-reference in this file, and the one the previous bug was hiding.
-///
-/// Every `TODO(<tag>)` in the shipping source must have a matching entry in
-/// `docs/rationale/deferred-decisions.md`.
-///
-/// This exists because of a specific, repeated failure: the three deferrals that cost the
-/// most to rediscover (exit-time handle reclamation, the wall clock, file truncate) were
-/// each recorded *somewhere other than* the canonical list — one in an architecture doc,
-/// one as a `TODO` tag in the kernel's syscall table, one in a crate `CLAUDE.md` — so none was
-/// ever reviewed, and each surfaced only when a consumer tripped over it (audit,
-/// 2026-07-24). A `TODO` is a deferral; this makes the code half of that mechanical.
-///
-/// The document must name the tag **literally** — the whole `TODO(<tag>)` form, not just the
-/// bare word inside it — because a short tag on its own (`mm`) matches half the prose in any
-/// technical document, which would make the check pass without recording anything. Naming it
-/// also makes the entry searchable from the code and vice versa.
-///
-/// **The illustration above is a placeholder on purpose.** This file is one of the three roots
-/// the reverse check scans, so spelling a real tag here makes this comment count as that
-/// deferral's code marker. Until 2026-09-11 the line read the MSI tag literally, and it had
-/// been the *only* marker backing that entry since the real one was written — so the entry
-/// stayed green when its marker was deleted, which is the exact failure the reverse check was
-/// added to catch. Sibling comments in this file name real tags deliberately, as
-/// cross-references from code that relates to them; an example of the *syntax* relates to
-/// nothing and must not name one.
 /// One family of ABI constants mirrored between the kernel and `userspace/libkern`.
 ///
 /// `pattern` is matched per line on both sides; capture group semantics are handled by
@@ -70,9 +36,8 @@ enum AbiShape {
 }
 
 /// The ABI surfaces `userspace/libkern` mirrors by hand, and therefore the ones that can
-/// silently drift. Layout of `#[repr(C)]` types is deliberately **not** here: both sides
-/// already carry `offset_of!`/`size_of` compile-time asserts, which is a stronger check than
-/// text comparison and fails at build time.
+/// silently drift. `#[repr(C)]` layout is deliberately **not** here: both sides carry
+/// `offset_of!`/`size_of` compile-time asserts, a stronger check than text comparison.
 const ABI_FAMILIES: &[AbiFamily] = &[
     AbiFamily {
         what: "syscall numbers",
@@ -109,7 +74,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::EnumVariant,
         one_sided: &[],
     },
-    // The device registry (administration Part B): its own file on each side, so the
+    // The device registry: its own file on each side, so the
     // enum-variant sweep sees `DeviceKind` and nothing else.
     AbiFamily {
         what: "device registry kinds",
@@ -125,7 +90,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U32Const,
         one_sided: &[],
     },
-    // The `sys_io_submit` opcodes (administration Part C.2, which added `Flush`). The kernel
+    // The `sys_io_submit` opcodes. The kernel
     // states each value once as an `IO_OPCODE_*` const and builds `IoOpcode` from them, so the
     // names pair with `libkern`'s; the other `u32` consts in `abi.rs` are never looked up.
     AbiFamily {
@@ -135,7 +100,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U32Const,
         one_sided: &[],
     },
-    // `sys_power`'s operations (administration Part E.3). The kernel states them in a file of their
+    // `sys_power`'s operations. The kernel states them in a file of their
     // own, so the sweep there finds nothing else; `libkern` keeps them beside `SYS_POWER`.
     AbiFamily {
         what: "power operations",
@@ -144,7 +109,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U64Const,
         one_sided: &[],
     },
-    // What `sys_clock_set` says (administration Part E.5): the clock set and kept by the RTC, or
+    // What `sys_clock_set` says: the clock set and kept by the RTC, or
     // set for this boot only. The kernel's `u64` consts in `clock.rs` are these alone; `libkern`
     // keeps them beside `CLOCK_REALTIME`.
     AbiFamily {
@@ -158,17 +123,14 @@ const ABI_FAMILIES: &[AbiFamily] = &[
 
 /// Individually-named constants that mirror across the boundary under *different* names or
 /// in unrelated files, so a family sweep cannot pair them. Each is `(kernel file, kernel
-/// name, userspace file, userspace name)`.
-///
-/// These are the ones that bit in practice: `MAX_WAIT_HANDLES` and the IPC limits are
-/// hand-copied values with no compile-time tie between the two sides at all.
+/// name, userspace file, userspace name)`. These bit in practice: `MAX_WAIT_HANDLES` and the
+/// IPC limits are hand-copied with no compile-time tie between the two sides.
 const ABI_PAIRS: &[(&str, &str, &str, &str)] = &[
     ("kernel/src/object/thread.rs", "MAX_WAIT_HANDLES", "userspace/libkern/src/abi.rs", "MAX_WAIT_HANDLES"),
     ("kernel/src/libkern/ipc.rs", "IPC_HANDLE_MAX", "userspace/libkern/src/abi.rs", "IPC_HANDLE_MAX"),
     ("kernel/src/libkern/ipc.rs", "IPC_MAX_QUEUE_DEPTH", "userspace/libkern/src/abi.rs", "IPC_MAX_QUEUE_DEPTH"),
 ];
 
-/// Pull `name -> value` pairs of one `shape` out of a source file.
 fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
@@ -178,7 +140,6 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
         }
         match shape {
             AbiShape::U64Const => {
-                // pub const NAME: u64 = <int>;
                 let Some(rest) = t.strip_prefix("pub const ") else { continue };
                 let Some((name, tail)) = rest.split_once(':') else { continue };
                 let Some((ty, val)) = tail.split_once('=') else { continue };
@@ -190,7 +151,6 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 }
             }
             AbiShape::U32Const => {
-                // pub const NAME: u32 = <int>;
                 let Some(rest) = t.strip_prefix("pub const ") else { continue };
                 let Some((name, tail)) = rest.split_once(':') else { continue };
                 let Some((ty, val)) = tail.split_once('=') else { continue };
@@ -214,7 +174,6 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 }
             }
             AbiShape::EnumVariant => {
-                // Name = <int>,
                 let Some(body) = t.strip_suffix(',') else { continue };
                 let Some((name, val)) = body.split_once('=') else { continue };
                 let name = name.trim();
@@ -229,7 +188,6 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 }
             }
             AbiShape::RightsBit => {
-                // pub const NAME: Rights = Rights(1 << k);
                 let Some(rest) = t.strip_prefix("pub const ") else { continue };
                 let Some((name, tail)) = rest.split_once(':') else { continue };
                 if !tail.contains("Rights(") {
@@ -246,7 +204,6 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
     out
 }
 
-/// Parse a trailing integer literal (decimal or `0x`), tolerating `_` and a `;`/`,` tail.
 fn parse_int(s: &str) -> Option<i128> {
     let t = s.trim().trim_end_matches([';', ',']).trim().replace('_', "");
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
@@ -255,7 +212,6 @@ fn parse_int(s: &str) -> Option<i128> {
     t.parse::<i128>().ok()
 }
 
-/// Find `pub const NAME: <ty> = <int>;` for one specific name, whatever the type.
 fn extract_named(text: &str, want: &str) -> Option<i128> {
     for line in text.lines() {
         let t = line.trim();
@@ -273,14 +229,9 @@ fn extract_named(text: &str, want: &str) -> Option<i128> {
 /// `cargo xtask abi-sync-check` — verify `userspace/libkern` still mirrors the kernel ABI.
 ///
 /// `libkern` is a **hand-maintained** copy of the kernel's syscall numbers, error and object
-/// discriminants, rights bits, and shared limits. Nothing in the build ties the two together,
-/// so an edit to one side is invisible until something misbehaves at runtime. This compares
-/// them and fails on a mismatch, a name the kernel has and userspace lacks, or a one-sided
-/// name that is not documented as such.
-///
-/// Deliberately **not** checked here: `#[repr(C)]` layouts. Both sides already assert their
-/// own field offsets and sizes at compile time, which is stronger than text comparison and
-/// fails earlier.
+/// discriminants, rights bits, and shared limits, and nothing in the build ties the two. This
+/// fails on a mismatch, a name the kernel has and userspace lacks, or an undocumented one-sided
+/// name.
 pub(crate) fn cmd_abi_sync_check() -> R<()> {
     let root = repo_root();
     let mut problems: Vec<String> = Vec::new();
@@ -356,17 +307,12 @@ pub(crate) fn cmd_abi_sync_check() -> R<()> {
 
 /// Verify `libkern::KError::from_i32` decodes **every** kernel `KError` variant.
 ///
-/// Mirroring the enum is not enough. `from_i32` is a second, hand-written copy of the
-/// same table, and its `_ => KernelError` catch-all — deliberate forward-compat, so a
-/// newer kernel's error does not panic an older `libkern` — means a *missing* arm is
-/// indistinguishable from an unknown code at runtime. `IoError` sat in both enums with
-/// matching discriminants and no arm here from 2026-06 to 2026-07-30: every device error
-/// silently decoded as `KernelError`, `abi-sync-check` passed, and the round-trip test in
-/// `error.rs` missed it because that test enumerates variants by hand too.
-///
-/// So this derives the expected set from the **kernel's** enum. A variant added to the
-/// kernel and mirrored into the userspace enum but forgotten here is now a guard failure,
-/// which is the only place in the chain that does not depend on someone remembering.
+/// Mirroring the enum is not enough: `from_i32` is a second, hand-written copy of the same
+/// table, and its `_ => KernelError` catch-all — deliberate forward-compat — makes a *missing*
+/// arm indistinguishable from an unknown code at runtime. A variant with matching
+/// discriminants and no arm once decoded silently as `KernelError`, and the round-trip test in
+/// `error.rs` missed it because that test enumerates variants by hand too. So this derives the
+/// expected set from the **kernel's** enum.
 fn check_kerror_decode_table(root: &Path) -> Result<usize, Vec<String>> {
     const KERNEL: &str = "kernel/src/syscall/error.rs";
     const USER: &str = "userspace/libkern/src/error.rs";

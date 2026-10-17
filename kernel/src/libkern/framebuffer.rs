@@ -1,20 +1,16 @@
 //! The framebuffer geometry ABI — what a compositor must be told and cannot infer.
 //!
-//! `docs/design/display-substrate.md` §3: "What the compositor needs to be told is the
-//! geometry it cannot infer: width, height, pitch (bytes per row, which is not width ×
-//! bpp), and the channel layout. Limine reports all four to the kernel; they cross to
-//! userspace as an attribute of the resource rather than a second protocol."
+//! `docs/design/display-substrate.md` §3: width, height, pitch (bytes per row, which is not
+//! width × bpp), and the channel layout. Limine reports all four to the kernel; they cross to
+//! userspace as an attribute of the resource rather than a second protocol.
 //!
-//! Concretely, `/dev/framebuffer/info` resolves to a small read-only `MemoryObject`
-//! holding one of these. That reuses the namespace lookup every other kernel server
-//! uses — no new syscall, and no change to [`HandleInfo`], which is a frozen 24-byte
-//! struct shared by every object type and the wrong place for per-type fields. (A
-//! 16-versus-24-byte mismatch in that struct smashed a userspace stack once already.)
+//! `/dev/framebuffer/info` resolves to a small read-only `MemoryObject` holding one of these.
+//! That reuses the namespace lookup every other kernel server uses, and leaves [`HandleInfo`],
+//! a frozen 24-byte struct shared by every object type, alone.
 //!
-//! **Channel layout is reported, not assumed.** Firmware does not always choose
-//! `0x00RRGGBB`, and a compositor that hardcodes it renders channel-swapped output on
-//! hardware that reports BGR — a bug a self-hash structurally cannot detect, because
-//! the guest stays perfectly consistent with itself (§8c).
+//! **Channel layout is reported, not assumed.** Firmware does not always choose `0x00RRGGBB`,
+//! and a compositor that hardcodes it renders channel-swapped output on hardware that reports
+//! BGR — a bug a self-hash cannot detect, because the guest stays consistent with itself.
 //!
 //! [`HandleInfo`]: crate::libkern::handle::HandleInfo
 
@@ -101,7 +97,6 @@ mod tests {
         };
         let b = info.as_bytes();
         assert_eq!(b.len(), 32);
-        // Read the fields back at their documented offsets, the way userspace will.
         assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 1280);
         assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 800);
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 5120);
@@ -114,8 +109,6 @@ mod tests {
 
     #[test]
     fn the_struct_has_no_padding_holes_to_leak() {
-        // Every byte is accounted for by a field, so `as_bytes` never copies
-        // uninitialised padding out to userspace.
         let zeroed = FramebufferInfo::default();
         assert!(zeroed.as_bytes().iter().all(|&b| b == 0));
         assert_eq!(size_of::<u32>() * 2 + size_of::<u64>() * 2 + size_of::<u16>() + 6, size_of::<FramebufferInfo>());

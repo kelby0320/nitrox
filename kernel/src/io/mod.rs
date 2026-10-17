@@ -4,12 +4,11 @@
 //! - [`block`] — building/dispatching a block IRP through a device's
 //!   [`BlockBackend`](block::BlockBackend).
 //! - [`ramdisk`] — a RAM-backed block device for bring-up.
-//! - [`stats`] — what each block device has done, kept by its driver (Phase 6 Part H.2).
+//! - [`stats`] — what each block device has done, kept by its driver.
 //!
 //! The async model — `sys_io_submit` → `Irp` → device → completion IRQ → DPC →
 //! `PendingOperation` → `sys_wait` — is `docs/architecture/drivers-and-irps.md`.
-//! Part 2 builds the spine and proves it on the ramdisk via [`self_test`]; the
-//! AHCI driver (Part 3) and the `/dev/blk` resource server (Part 4) follow.
+//! [`self_test`] proves the spine on the ramdisk.
 
 pub mod block;
 pub mod irp;
@@ -30,27 +29,23 @@ fn intr_test_dpc(ctx: *mut ()) {
     unsafe { crate::sched::signal_interrupt(ctx) };
 }
 
-/// Boot self-test for the I/O spine (Phase 2 slice 5, Part 2). Proves, without
-/// real hardware:
+/// Boot self-test for the I/O spine. Proves, without real hardware:
 ///
-/// 1. **The block IRP path** — submit a read against the ramdisk, drain the DPC
-///    queue, and confirm the request's `PendingOperation` completed (status 0,
-///    `result` = bytes transferred) and the destination `MemoryObject` holds the
-///    ramdisk's data.
-/// 2. **`InterruptObject` signalling from a DPC** — queue a DPC that signals an
-///    `InterruptObject`, drain it, and confirm the object latched the interrupt
-///    (and that consuming it clears the latch).
+/// 1. **The block IRP path**: a read against the ramdisk, after draining the DPC
+///    queue, completes the request's `PendingOperation` (status 0, `result` =
+///    bytes transferred) and fills the destination `MemoryObject`.
+/// 2. **`InterruptObject` signalling from a DPC**: the object latches the
+///    interrupt, and consuming it clears the latch.
 ///
 /// Logs a one-line pass/fail per check. Call once at boot, after the allocators,
-/// the HHDM, the DPC queue, and the scheduler waitable machinery are up. Not a
-/// `panic!` path — it reports and returns (critical-path discipline).
+/// the HHDM, the DPC queue and the scheduler waitable machinery are up. It
+/// reports and returns rather than panicking (critical-path discipline).
 pub fn self_test() {
     block_irp_self_test();
     interrupt_object_self_test();
 }
 
 fn block_irp_self_test() {
-    // A leaked 'static ramdisk (a device persists for the kernel's lifetime).
     let rd = match ramdisk::RamDisk::try_new() {
         Ok(rd) => {
             // SAFETY: leak the box to obtain a 'static reference for the device.
@@ -69,7 +64,6 @@ fn block_irp_self_test() {
         }
     };
 
-    // An 8 KiB destination buffer.
     const LEN: usize = 2 * crate::mm::PAGE_SIZE;
     let buffer = match MemoryObject::try_new(LEN) {
         Ok(mo) => adopt(mo, KObjectType::MemoryObject),
@@ -87,14 +81,13 @@ fn block_irp_self_test() {
     };
     let po_check = po.clone();
 
-    // Submit a read of the first `LEN` bytes into the buffer.
     if let Err(e) = block::dispatch_block_irp(&device, &buffer, &po, IoOpcode::Read, 0, 0, LEN as u64) {
         crate::kprintln!("io: self-test FAIL (dispatch err {:?})", e);
         return;
     }
 
-    // The ramdisk queued the completion DPC; drain it (stands in for the
-    // interrupt-dispatch tail).
+    // The ramdisk queued the completion DPC; drain it in place of the
+    // interrupt-dispatch tail.
     crate::dpc::run_pending();
 
     // SAFETY: `po_check` is a live `PendingOperation` reference held across the call.
@@ -104,7 +97,6 @@ fn block_irp_self_test() {
         return;
     }
 
-    // Verify the buffer received the ramdisk's pattern.
     if buffer_matches_pattern(&buffer, LEN) {
         crate::kprintln!("io: block-read self-test OK ({} bytes via IRP+DPC+PO)", LEN);
     } else {
@@ -145,7 +137,6 @@ fn interrupt_object_self_test() {
             return;
         }
     };
-    // A DPC that signals the object, as a device ISR's completion DPC would.
     let dpc = Dpc::new(intr_test_dpc, irq.as_ptr());
     crate::dpc::enqueue(&dpc);
     crate::dpc::run_pending();

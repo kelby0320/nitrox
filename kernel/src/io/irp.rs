@@ -1,20 +1,17 @@
 //! The `Irp` (I/O Request Packet) — the kernel-internal unit of I/O.
 //!
-//! Normative layout: `docs/spec/irp-layout.md`; model and rationale:
-//! `docs/architecture/drivers-and-irps.md`. An `Irp` is **not** a
-//! handle-accessible object (userspace never sees one), but a Tier 2 loadable
-//! driver module walks `&mut Irp`, so the layout is a kernel-ABI version-hash
-//! input — the field offsets below are pinned by the compile-time asserts at the
-//! end of this module.
-//!
-//! The owning references that keep an in-flight IRP's raw pointers valid (its
-//! `PendingOperation`, data buffer, and `DeviceNode`) live in a kernel-internal
-//! [`IrpBox`](crate::io::block::IrpBox) wrapper, not in the hashed `Irp` itself.
+//! Normative layout: `docs/spec/irp-layout.md`; model:
+//! `docs/architecture/drivers-and-irps.md`. An `Irp` is not handle-accessible,
+//! but a Tier 2 loadable driver walks `&mut Irp`, so the layout is a kernel-ABI
+//! version-hash input, pinned by compile-time asserts at the end of this module.
+//! The owning references that keep an in-flight IRP's raw pointers valid live in
+//! the kernel-internal [`IrpBox`](crate::io::block::IrpBox), not in the hashed
+//! `Irp`.
 
 use crate::dpc::Dpc;
 
-/// `IRP_MAX_STACK` — the deepest driver stack Phase 2/3 builds (GPT-over-AHCI =
-/// 2); the headroom avoids a reallocation seam (`docs/spec/irp-layout.md`).
+/// `IRP_MAX_STACK` — the deepest driver stack built (GPT-over-AHCI = 2); the
+/// headroom avoids a reallocation seam (`docs/spec/irp-layout.md`).
 pub const IRP_MAX_STACK: usize = 4;
 
 /// One physically-contiguous fragment of an IRP's data buffer — the form an AHCI
@@ -75,11 +72,13 @@ impl IrpStackFrame {
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IrpOp {
+    /// Move data from the device into the buffer.
     Read = 0,
+    /// Move data from the buffer onto the device.
     Write = 1,
     /// Write the device's volatile cache to its medium. Carries no buffer and no range.
     Flush = 2,
-    /// Read a disk's partition table again (Phase 6 Part G). Carries no buffer and no range.
+    /// Read a disk's partition table again. Carries no buffer and no range.
     Rescan = 3,
 }
 
@@ -89,7 +88,9 @@ pub enum IrpOp {
 #[repr(i32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IrpStatus {
+    /// Completed successfully.
     Success = 0,
+    /// Still in flight.
     Pending = 1,
 }
 
@@ -107,6 +108,7 @@ pub struct Irp {
     pub stack_count: u32,
     /// The frame the IRP is currently at (descends high→low).
     pub stack_index: u32,
+    /// Reserved padding.
     pub _pad: u32,
     /// `ProcessId` that submitted the IRP (0 for an internal/self-test IRP).
     pub initiator: u64,
@@ -127,11 +129,11 @@ pub struct Irp {
 }
 
 impl Irp {
-    /// Build a single-layer IRP targeting `device`, transferring `length` bytes
-    /// at device `offset` against `buffer`, completing `completion` (a
-    /// `*mut PendingOperation`). The inline DPC is left unarmed
-    /// ([`arm_completion`](Self::arm_completion) sets it once the IRP's final
-    /// address is known); `status` starts `Pending`.
+    /// Build a single-layer IRP targeting `device` for `length` bytes at
+    /// `offset` against `buffer`, completing `completion` (a
+    /// `*mut PendingOperation`). The inline DPC is left unarmed until
+    /// [`arm_completion`](Self::arm_completion) sets it at the IRP's final
+    /// address; `status` starts `Pending`.
     pub fn new_block(
         op: IrpOp,
         device: *const (),
@@ -171,7 +173,6 @@ impl Irp {
     }
 }
 
-/// The unarmed-DPC placeholder; never actually queued/run.
 fn noop_dpc(_ctx: *mut ()) {}
 
 // --- Layout pinning (docs/spec/irp-layout.md) ---------------------------------
@@ -189,9 +190,8 @@ const _: () = {
     assert!(offset_of!(Irp, transferred) == 48);
     assert!(offset_of!(Irp, buffer) == 56);
     assert!(offset_of!(Irp, completion) == 72);
-    // `dpc` follows at 80; `stack` after the inline DPC. The exact tail offset
-    // depends on `Dpc`'s size, which is kernel-internal — assert the leading
-    // hashed fields (through `completion`) and the sub-type sizes.
+    // `dpc` follows at 80, then `stack`; the tail offset depends on `Dpc`'s
+    // kernel-internal size, so only the hashed fields and sub-type sizes are asserted.
     assert!(size_of::<PhysFrag>() == 16);
     assert!(size_of::<IrpBuffer>() == 16);
     assert!(size_of::<IrpStackFrame>() == 24);
@@ -207,7 +207,6 @@ mod tests {
         assert_eq!(IrpOp::Read as u32, 0);
         assert_eq!(IrpOp::Write as u32, 1);
         assert_eq!(IrpOp::Flush as u32, 2);
-        // Kept numerically aligned with the userspace-facing opcode.
         use crate::libkern::io_op::IoOpcode;
         assert_eq!(IrpOp::Flush as u32, IoOpcode::Flush as u32);
         assert_eq!(IrpOp::Rescan as u32, IoOpcode::Rescan as u32);

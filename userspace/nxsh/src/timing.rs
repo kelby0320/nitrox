@@ -1,17 +1,14 @@
-//! **`time PIPELINE`'s line** (Phase 6 Part H.2, §3): how long a pipeline took, and what each disk
-//! and the page cache did while it ran — the device manager's `io.tsm`, read before and after, and
-//! the difference. Pure: the evaluator reads the clock and the table, and this turns two readings
-//! into the line.
+//! `time PIPELINE`'s line: how long a pipeline took and what each disk and the page cache did,
+//! as the difference of the device manager's `io.tsm` read before and after. Pure: the evaluator
+//! reads the clock and the table.
 //!
-//! **One line, ASCII only**, since it is read off a laptop's screen during a measurement and off a
-//! serial console by a gate, which drops everything else:
+//! One line, ASCII only: a serial console drops everything else, and `test-interactive` matches it.
 //!
 //! ```text
-//! time: 12.34 s; blk-0: 1,200 reads 4.7 MiB, 300 writes 1.2 MiB, busy 3.21 s; page-cache: 1,200 fills 4.7 MiB, 300 write-backs 1.2 MiB
+//! time: 12.34 s; blk-0: 1,200 reads 4.7 MiB, 300 writes 1.2 MiB, busy 3.21 s; page-cache: ...
 //! ```
 //!
-//! A device whose counts did not move is left out, and so is a count that did not; a device's busy
-//! time is always said. With no table to read, the line is the time alone.
+//! A device or count that did not move is left out; a device's busy time is always said.
 
 use alloc::format;
 use alloc::string::String;
@@ -22,7 +19,6 @@ use libstream::wire::{Table, Value};
 /// Where the counts are: the device manager's table, bound in every session at `/dev/devices`.
 pub const IO_TABLE: &str = "/dev/devices/io.tsm";
 
-/// The row the page cache's counts are in.
 const PAGE_CACHE: &str = "page-cache";
 
 /// One row of `io.tsm`.
@@ -173,10 +169,6 @@ mod tests {
         IoRow { name: name.into(), reads, read_bytes, writes, written_bytes, busy_ns, ..Default::default() }
     }
 
-    /// **The line names what moved and nothing else**: the time, a disk that read and wrote with
-    /// its busy time, the page cache's fills and write-backs — and not the disk that did nothing, nor
-    /// the counts of the one that did that stayed still. A stick that arrived meanwhile counts from
-    /// nothing.
     #[test]
     fn the_line_names_what_moved() {
         let before = [
@@ -197,7 +189,6 @@ mod tests {
         );
     }
 
-    /// With no table, the time alone; with nothing moved, the time and that; with no clock, so.
     #[test]
     fn what_the_line_says_with_less_to_say() {
         let still = [row("blk-0", 1, 512, 0, 0, 9)];
@@ -206,8 +197,6 @@ mod tests {
         assert_eq!(line(None, Some(&still), None), "time: unknown");
     }
 
-    /// The table as the device manager encodes it — `Null` where a row has no count — reads into
-    /// rows, and bytes that are not a table do not.
     #[test]
     fn rows_read_from_the_table_and_its_nulls_as_zero() {
         let int = |s: Schema, n: &str| s.field(n, TypeTag::Int, TypeModifiers::NULLABLE);

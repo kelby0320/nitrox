@@ -1,48 +1,20 @@
 // --- leave_online's decision half ------------------------------------------
 //
-// **Three tests, not one.** They were a single `#[test]` because `ONLINE_MASK` was a
-// process-global and separate tests run concurrently, so splitting them would have made
-// them race — the old comment said exactly that. The set is now per-thread under
-// `cfg(test)` (see `online_set`), so each case establishes its own starting set and fails
-// on its own name.
-//
-// Measured rather than assumed, because the interesting part is how *weak* the natural
-// signal is: split against the shared global these three passed **40 runs out of 40**.
-// They would have been isolated by being fast, which is not isolation. Forcing the
-// interleaving with sleeps — one test asserting 300 ms after its own write, another
-// writing 100 ms in — fails `a_park_clears_its_own_bit_and_only_its_own` deterministically
-// on the shared backing and passes on this one. Same shape, same result, as the mock `IF`
-// flag in `libkern::spinlock`.
+// Separate tests, because the online set is per-thread under `cfg(test)` (see `online_set`):
+// each case sets its own starting set. Against a shared global they passed only by being
+// fast; forcing the interleaving fails `a_park_clears_its_own_bit_and_only_its_own`.
 
 // --- the two preemption guards ------------------------------------------------
 //
-// Both are `debug_assert`s added by PR #203 (audit B.5c, B.5e), and the 2026-08-14 entry
-// recorded that **neither had a host test**, giving the reason: `PREEMPT_OFF` was a
-// process-global that concurrent host tests already touched through `SpinLock::lock`, so
-// raising the counter to test a guard would have raised it under every other test running
-// at that moment. That is fixed above — the counter is per-thread under `cfg(test)` — and
-// these are the tests it was blocking.
-//
-// Each pair is positive-and-negative on purpose: the `should_panic` half alone would pass
-// against a guard that fires unconditionally.
+// Both are `debug_assert`s, testable on the host because the preempt counter is per-thread
+// under `cfg(test)`. Each pair is positive-and-negative on purpose: the `should_panic` half
+// alone would pass against a guard that fires unconditionally.
 
 /// Raise the depth on *this thread's* counter and put it back, whatever the test does.
 ///
-/// RAII rather than a bare increment-and-reset, because two of these tests panic while it
-/// is alive: cleanup written *after* the assert would simply not run. Test builds unwind
-/// (the `panic = "abort"` assertion in `sched.rs` is `cfg(not(test))`), so `Drop` runs
-/// during the unwind and the restore is unconditional.
-///
-/// **Nothing depends on that today**, and an earlier version of this comment claimed
-/// otherwise — that it is what keeps `--test-threads=1` correct, "where the whole suite
-/// shares one thread". It does not: libtest spawns a **fresh OS thread per test at every
-/// concurrency level**, so a `thread_local!` cannot carry from one test to the next and the
-/// leak this is said to prevent cannot happen. Measured on rustc 1.95.0 — at
-/// `--test-threads=1` two tests report `ThreadId(2)` and `ThreadId(3)` — and confirmed the
-/// other way: delete this `Drop` body and the suite is still 640 green at
-/// `--test-threads=1`. The fixture is defensive against a future harness or `catch_unwind`
-/// wrapper that *does* share a thread, which is a fine reason to keep it and not a reason
-/// to claim it is load-bearing.
+/// RAII because two tests panic while it is alive and cleanup after the assert would not
+/// run. Nothing depends on that today (libtest gives every test a fresh OS thread), so it
+/// is defensive against a harness that shares a thread.
 struct PreemptRaised;
 impl PreemptRaised {
     fn new() -> Self {
@@ -68,8 +40,8 @@ fn a_syscall_from_ring_3_with_preemption_enabled_is_accepted() {
     super::assert_user_entry_preempt_safe();
 }
 
-/// B.5(c)'s ring-3 half: a kernel path that leaked a `preempt_disable` is caught at the
-/// next syscall entry rather than silently stopping this CPU preempting.
+/// The ring-3 half: a kernel path that leaked a `preempt_disable` is caught at the next
+/// syscall entry rather than silently stopping this CPU preempting.
 #[test]
 #[should_panic(expected = "entered a syscall from ring 3 with preemption disabled")]
 fn a_syscall_from_ring_3_with_preemption_disabled_is_refused() {
@@ -82,8 +54,8 @@ fn a_voluntary_switch_with_preemption_enabled_is_accepted() {
     super::assert_switch_preempt_safe();
 }
 
-/// B.5(c) proper: the involuntary paths latch into `RESCHED_PENDING`; nothing checked the
-/// voluntary ones until PR #203, and nothing tested that check until this one.
+/// The voluntary half: the involuntary paths latch into `RESCHED_PENDING`, so only the
+/// voluntary ones need this check.
 #[test]
 #[should_panic(expected = "context switch with preemption disabled")]
 fn a_voluntary_switch_inside_a_preempt_critical_window_is_refused() {
@@ -101,12 +73,10 @@ fn a_park_clears_its_own_bit_and_only_its_own() {
 
 /// …and must clear **nobody's** when it has no identity of its own.
 ///
-/// This is the case that matters. `current_cpu()` reports `0` for a CPU that never
-/// established an identity (x86's `IA32_TSC_AUX` reset default), so an unguarded park
-/// clears the *running BSP's* bit — dropping it from the TLB-shootdown set, where the
-/// slow path's self-IPI is the only thing that invalidates its own TLB. A freed frame
-/// stays reachable through a stale translation. Note the range check does not catch it:
-/// `0` is perfectly in range (PR #198 review, blocking 1).
+/// `current_cpu()` reports `0` for a CPU that never established an identity, so an
+/// unguarded park clears the *running BSP's* bit — dropping it from the TLB-shootdown set,
+/// leaving a freed frame reachable through a stale translation. The range check does not
+/// catch it: `0` is in range.
 #[test]
 fn a_park_with_no_identity_clears_nobodys_bit() {
     super::online_set::force(0b1011);
@@ -114,13 +84,12 @@ fn a_park_with_no_identity_clears_nobodys_bit() {
     assert_eq!(super::online_mask(), 0b1011, "an unbound CPU cleared someone else's bit");
 }
 
-/// An out-of-range index is ignored — and this is asserted at **64**, not `MAX_CPUS`.
+/// An out-of-range index is ignored — asserted at **64**, not `MAX_CPUS`.
 ///
-/// `MAX_CPUS` is 8, so deleting the range check leaves `0b1011 & !(1 << 8)` = `0b1011`
-/// and an assertion at `MAX_CPUS` passes for the broken implementation too. A shift only
-/// misbehaves at the width of the type: `1u64 << 64` panics in debug and wraps to
-/// `1 << 0` in release — clearing **CPU 0's** bit, the same silent corruption the
-/// identity guard exists to prevent. Caught by a reviewer's negative control.
+/// With `MAX_CPUS` = 8, deleting the range check leaves `0b1011 & !(1 << 8)` = `0b1011`, so
+/// an assertion at `MAX_CPUS` passes for the broken implementation too. A shift only
+/// misbehaves at the type's width: `1u64 << 64` panics in debug and wraps to `1 << 0` in
+/// release, clearing **CPU 0's** bit.
 #[test]
 fn a_park_with_an_out_of_range_index_clears_nobodys_bit() {
     super::online_set::force(0b1011);
@@ -132,22 +101,17 @@ use super::*;
 use crate::mm::test_support::init_global_heap;
 use crate::object::header::test_probe;
 
-// These tests exercise the run-queue bookkeeping and refcount handling
-// at the data-structure level. They do NOT call `context_switch`,
-// `thread_trampoline`, or run a thread body — those manipulate real
-// registers/stacks and are validated only under QEMU (the `xtask qemu`
-// serial trace) until `xtask test-qemu` exists.
+// These tests exercise run-queue bookkeeping and refcounts at the data-structure level; they
+// do NOT call `context_switch` or run a thread body (validated only under QEMU).
 
 extern "C" fn noop(_arg: usize) {}
 
-/// Build an inert Thread ObjectRef without a kernel stack (so no real
-/// paging is needed on the host).
+/// Build an inert Thread ObjectRef without a kernel stack (no host paging needed).
 fn inert_ref(tid: u32) -> ObjectRef {
     into_objref(Thread::try_new(tid, 0).unwrap())
 }
 
-/// A fresh `SchedState` for data-structure tests (no idle thread; no real
-/// paging needed since the refs are inert).
+/// A fresh `SchedState` for data-structure tests (no idle thread; the refs are inert).
 fn test_state() -> SchedState {
     SchedState {
         ready: [const { KVec::new() }; MAX_CPUS],
@@ -182,7 +146,6 @@ fn dequeue_front_is_round_robin() {
     for tid in 1..=3 {
         st.ready[0].try_push(inert_ref(tid)).unwrap();
     }
-    // Dequeue front, re-enqueue at back: classic round-robin rotation.
     let a = dequeue_front(&mut st).unwrap();
     // SAFETY: pinned, single-threaded test.
     let a_tid = unsafe { &*(a.as_ptr() as *const Thread) }.tid();
@@ -212,10 +175,8 @@ fn nice_weight_and_delta_are_sane() {
     assert_eq!(nice_weight(0), NICE_0_WEIGHT);
     assert!(nice_weight(-20) > nice_weight(0));
     assert!(nice_weight(19) < nice_weight(0));
-    // Out-of-range nice clamps to the table ends.
     assert_eq!(nice_weight(-128), nice_weight(-20));
     assert_eq!(nice_weight(127), nice_weight(19));
-    // nice 0 accrues exactly one slice per tick; lower nice accrues slower.
     assert_eq!(vruntime_delta(0), TICK_NS);
     assert!(vruntime_delta(-20) < vruntime_delta(0));
     assert!(vruntime_delta(19) > vruntime_delta(0));
@@ -237,7 +198,6 @@ fn dequeue_prefers_realtime_by_priority_then_timeshared() {
     st.ready[0].try_push(ts).unwrap();
     st.ready[0].try_push(rt_lo).unwrap();
     st.ready[0].try_push(rt_hi).unwrap();
-    // RealTime beats TimeShared; lower rt_priority value wins within RealTime.
     assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 3, "RealTime prio 5 first");
     assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 2, "RealTime prio 20 next");
     assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 1, "TimeShared last");
@@ -272,17 +232,14 @@ fn seed_vruntime_floors_new_and_boosts_woken() {
     let mut st = test_state();
     let base = 2 * TICK_NS;
     st.min_vruntime[0] = base;
-    // A new TimeShared thread (vruntime 0) jumps up to the floor.
     let n = inert_ref(1);
     seed_vruntime(&st, n.as_ptr(), 0, false);
     // SAFETY: pinned, single-threaded test.
     assert_eq!(unsafe { Thread::vruntime(n.as_ptr()) }, base);
-    // A waking thread is boosted to `floor - slice` (latency), not the bare floor.
     let w = inert_ref(2);
     seed_vruntime(&st, w.as_ptr(), 0, true);
     // SAFETY: `w` pins a live `Thread`, and the test is single-threaded.
     assert_eq!(unsafe { Thread::vruntime(w.as_ptr()) }, base - TICK_NS);
-    // A thread already ahead of the floor keeps its (larger) vruntime.
     let ahead = inert_ref(3);
     // SAFETY: `ahead` pins a live `Thread`, and the test is single-threaded.
     unsafe { Thread::set_vruntime(ahead.as_ptr(), 3 * TICK_NS) };
@@ -299,10 +256,8 @@ fn online_n(st: &mut SchedState, n: usize) {
     }
 }
 
-/// The online set a placement test passes in: `n` CPUs up, none parked.
-///
-/// A value rather than the `ONLINE_MASK` global, deliberately — see
-/// [`cpu_accepts_work`]. Writing the global here made these tests race each other.
+/// The online set a placement test passes in: `n` CPUs up, none parked. A value rather than
+/// the `ONLINE_MASK` global — see [`cpu_accepts_work`].
 fn all_up(n: usize) -> u64 {
     (1u64 << n) - 1
 }
@@ -310,17 +265,12 @@ fn all_up(n: usize) -> u64 {
 /// A CPU that has parked forever must not be given work — and its queue must still be
 /// drainable, which is how the threads it already holds get rescued.
 ///
-/// The two halves are the whole point. `leave_online` cannot clear `cpu_online[]` (that
-/// needs `SCHED`, which the parking CPU may hold), so after a ring-0 fault parks an AP
-/// the two disagree: placing on it hangs the thread forever, while draining its queue is
-/// the rescue.
-///
-/// **The steal half asserts against an emptied peer set on purpose.** The first version
-/// of this test left a thread on CPU 1, so `steal_available` was satisfied by *that*
-/// queue and the assertion passed even with the victim side wrongly gated — the exact
-/// "consistency cleanup" the doc comments warn against would have gone green
-/// (PR #199 review, blocking 2). CPU 2 must be the only stealable queue for this to mean
-/// anything, and `steal_one` is checked too rather than inferred from `steal_available`.
+/// `leave_online` cannot clear `cpu_online[]`, so after a ring-0 fault parks an AP the two
+/// disagree: placing on it hangs the thread, while draining its queue is the rescue.
+/// **The steal half asserts against an emptied peer set on purpose**: were a thread left on
+/// CPU 1, `steal_available` would be satisfied by *that* queue and the assertion would pass
+/// even with the victim side wrongly gated. `steal_one` is checked too rather than inferred
+/// from `steal_available`.
 #[test]
 fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
     init_global_heap();
@@ -328,7 +278,6 @@ fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
     online_n(&mut st, 4);
     let t = inert_ref(1);
 
-    // Load 0 and 1 so the least-loaded pick would otherwise land on CPU 2.
     st.ready[0].try_push(inert_ref(10)).unwrap();
     st.ready[1].try_push(inert_ref(11)).unwrap();
     assert_eq!(pick_target_cpu(&st, t.as_ptr(), all_up(4)), 2);
@@ -343,8 +292,7 @@ fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
     unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
     assert_ne!(pick_wake_cpu(&st, t.as_ptr(), parked), 2, "woken onto a parked home CPU");
 
-    // Now the rescue half. Empty every other queue so the parked CPU is the *only*
-    // source a steal could come from — otherwise this passes without testing anything.
+    // Rescue half: empty every other queue so the parked CPU is the *only* steal source.
     drop(st.ready[0].pop().unwrap());
     drop(st.ready[1].pop().unwrap());
     for c in 0..MAX_CPUS {
@@ -352,8 +300,7 @@ fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
     }
     st.ready[2].try_push(inert_ref(12)).unwrap();
 
-    // Host `this_cpu()` is 0. Both paths must reach a parked CPU's queue: gating either
-    // on `cpu_accepts_work` strands the thread sitting on CPU 2 forever.
+    // Gating either path on `cpu_accepts_work` would strand the thread on CPU 2 forever.
     assert!(steal_available(&st, 0), "a parked CPU's queue must stay drainable, or this fix strands what it holds");
     let stolen = steal_one(&mut st).expect("steal_one must reach a parked CPU's queue");
     // SAFETY: `stolen` pins a live `Thread`.
@@ -361,23 +308,17 @@ fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
     assert!(st.ready[2].is_empty(), "the parked CPU's queue was not drained");
 }
 
-/// When affinity permits no CPU that accepts work, placement must still land somewhere
-/// that will run the thread — **not** on CPU 0 because it happened to be the fallback.
-///
-/// This is the hang `cpu_accepts_work` exists to prevent, reintroduced one line below it
-/// by `if best == usize::MAX { 0 }` (kernel audit; decision log 2026-08-14). Reachable
-/// when a ring-0 fault parks
-/// the BSP while APs keep running and a pinned thread wakes.
-///
-/// Asserted as "the chosen CPU accepts work" rather than "the chosen CPU is 1 or 2", so
-/// the test states the invariant instead of the current tie-break.
+/// When affinity permits no CPU that accepts work, placement must still land somewhere that
+/// will run the thread — **not** on CPU 0 because it happened to be the fallback (the hang
+/// `cpu_accepts_work` exists to prevent, reachable when a ring-0 fault parks the BSP).
+/// Asserted as "the chosen CPU accepts work" rather than an index, so the test states the
+/// invariant instead of the current tie-break.
 #[test]
 fn placement_falls_back_to_a_cpu_that_accepts_work_not_to_cpu_zero() {
     init_global_heap();
     let mut st = test_state();
     online_n(&mut st, 4);
-    // Pinned to CPU 3; CPUs 0 and 3 have both parked. Nothing permitted accepts work,
-    // and the old fallback answered 0 — which is parked.
+    // Pinned to CPU 3; CPUs 0 and 3 have parked, so nothing permitted accepts work.
     let t = inert_ref(1);
     // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
     unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 3) };
@@ -390,11 +331,9 @@ fn placement_falls_back_to_a_cpu_that_accepts_work_not_to_cpu_zero() {
              never be scheduled"
     );
 
-    // **And the fallback is least-loaded, not first-found.** A CPU that accepts work but
-    // whose queue is at `READY_RESERVE` is not runnable either: `place_thread` returns
-    // `Err` and both wake callers turn that into a `panic!`. Filling CPU 1 must push the
-    // choice to CPU 2 rather than onto the full queue beside it (PR #201 review,
-    // finding 2).
+    // **The fallback is least-loaded, not first-found**: a CPU at `READY_RESERVE` is not
+    // runnable either (`place_thread` returns `Err`, the wake callers `panic!`), so filling
+    // CPU 1 must push the choice to CPU 2.
     for i in 0..READY_RESERVE {
         st.ready[1].try_push(inert_ref(100 + i as u32)).unwrap();
     }
@@ -406,10 +345,8 @@ fn placement_falls_back_to_a_cpu_that_accepts_work_not_to_cpu_zero() {
              return Err and the wake callers panic"
     );
 
-    // The wake path delegates to the same fallback. (Its own `cpu_accepts_work` check on
-    // the home CPU is covered by `a_parked_cpu_takes_no_new_work_but_can_still_be_drained`
-    // — here the affinity mask rejects home 0 before that check is reached, so this
-    // asserts the delegation and nothing more.)
+    // The wake path delegates to the same fallback. (The affinity mask rejects home 0 before
+    // `cpu_accepts_work` is reached, so this asserts the delegation and nothing more.)
     // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
     unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
     let woken = pick_wake_cpu(&st, t.as_ptr(), parked);
@@ -421,23 +358,16 @@ fn placement_least_loaded_and_respects_affinity() {
     init_global_heap();
     let mut st = test_state();
     online_n(&mut st, 4);
-    // No affinity → least-loaded. With all queues empty, CPU 0 (first min) wins.
     let a = inert_ref(1);
     assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 0);
-    // Load CPU 0 and 1; the least-loaded becomes CPU 2.
     st.ready[0].try_push(inert_ref(10)).unwrap();
     st.ready[1].try_push(inert_ref(11)).unwrap();
     assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 2);
-    // Pinned to CPU 3 → must target CPU 3 regardless of load.
     // SAFETY: `a` pins a live `Thread`, and the test is single-threaded.
     unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 3) };
     assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 3);
-    // Pinned to a CPU that is not online (5) → falls back **outside** the mask, to the
-    // least-loaded CPU that accepts work. This asserted CPU 0 unconditionally until
-    // 2026-08-14, when that turned out to be a hang rather than a defensive default:
-    // once a CPU can park, "CPU 0" is not necessarily a CPU that runs anything. Stated
-    // as the two properties rather than an index, so a tie-break change does not read
-    // as a contract change.
+    // Pinned to an offline CPU (5) → falls **outside** the mask, to the least-loaded CPU that
+    // accepts work; stated as properties, not an index.
     // SAFETY: `a` pins a live `Thread`, and the test is single-threaded.
     unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 5) };
     let chosen = pick_target_cpu(&st, a.as_ptr(), all_up(4));
@@ -451,11 +381,9 @@ fn wake_placement_prefers_home_cpu() {
     let mut st = test_state();
     online_n(&mut st, 4);
     let t = inert_ref(1);
-    // Home CPU 2 (last ran there) + affinity allows it → wake returns CPU 2.
     // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
     unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
     assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 2);
-    // Affinity now excludes the home → falls back to least-loaded (CPU 0).
     // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
     unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 0) };
     assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 0);
@@ -469,7 +397,6 @@ fn stealable_respects_affinity() {
     unsafe {
         assert!(stealable_to(t.as_ptr(), 0));
         assert!(stealable_to(t.as_ptr(), 3));
-        // Pin to CPU 0 only: stealable to 0, not to 1.
         Thread::set_cpu_mask(t.as_ptr(), 1 << 0);
         assert!(stealable_to(t.as_ptr(), 0));
         assert!(!stealable_to(t.as_ptr(), 1));
@@ -484,13 +411,11 @@ fn wake_placement_falls_back_when_home_queue_is_full() {
     let t = inert_ref(1);
     // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
     unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
-    // Fill CPU 0's queue to its reserve: the home pick must divert (F6 — a
-    // full home queue used to be a fatal wake).
+    // Fill CPU 0's queue to its reserve: the home pick must divert (not a fatal wake).
     for tid in 100..(100 + READY_RESERVE as u32) {
         st.ready[0].try_push(inert_ref(tid)).unwrap();
     }
     assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 1);
-    // With room at home again, the cache-warm home pick returns.
     drop(st.ready[0].pop().unwrap());
     assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 0);
 }
@@ -500,18 +425,15 @@ fn steal_one_skips_busiest_victim_with_no_stealable_thread() {
     init_global_heap();
     let mut st = test_state();
     online_n(&mut st, 3);
-    // CPU 1 (busiest, 2 threads) — both pinned to CPU 1: not stealable to 0.
     for tid in 10..12 {
         let t = inert_ref(tid);
         // SAFETY: `t` pins a live `Thread`, and the test is single-threaded.
         unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 1) };
         st.ready[1].try_push(t).unwrap();
     }
-    // CPU 2 (smaller, 1 thread) — default all-CPU mask: stealable.
     st.ready[2].try_push(inert_ref(20)).unwrap();
-    // Host `this_cpu()` is 0. `steal_available` says true; the F4 bug was
-    // `steal_one` returning None here (it searched only the busiest victim),
-    // which panics the idle-steal paths on the empty idle slot.
+    // Host `this_cpu()` is 0. `steal_one` must not return None when `steal_available` holds
+    // (searching only the busiest victim would), which panics the idle-steal paths.
     assert!(steal_available(&st, 0));
     let stolen = steal_one(&mut st).expect("steal_one must succeed when steal_available");
     // SAFETY: `stolen` pins a live `Thread`.
@@ -529,7 +451,6 @@ fn steal_one_prefers_the_busiest_stealable_victim() {
     for tid in 20..22 {
         st.ready[2].try_push(inert_ref(tid)).unwrap();
     }
-    // Both victims have stealable threads; CPU 2 is busier — steal from it.
     let stolen = steal_one(&mut st).unwrap();
     // SAFETY: `stolen` pins a live `Thread`.
     let stolen_tid = unsafe { &*(stolen.as_ptr() as *const Thread) }.tid();
@@ -558,17 +479,15 @@ fn drain_pending_drops_moves_all_and_preserves_capacity() {
     assert_eq!(n, 5);
     assert!(st.reap[0].is_empty());
     assert!(st.deferred_drops.is_empty());
-    // The reserves survive the drain — the F11 hazard was `mem::take` zeroing
-    // them, making the next exit-path push allocate under `SCHED`.
+    // The reserves survive the drain: `mem::take` would zero them and the next exit-path
+    // push would allocate under `SCHED`.
     assert_eq!(st.reap[0].capacity(), reap_cap);
     assert_eq!(st.deferred_drops.capacity(), dd_cap);
     drop(buf); // the moved refs release their threads here (outside any lock)
 }
 
-// --- stats: the pure format step of capture → format → synthesize. The
-// increment sites and `stats_snapshot` need a running scheduler (they read
-// `this_cpu()`) and are validated under QEMU (Part D's selftest gates the
-// verdict on two-CPU activity).
+// --- stats: the pure format step. The increment sites and `stats_snapshot` need a running
+// scheduler (they read `this_cpu()`) and are validated under QEMU.
 
 /// A snapshot with the given rows online (all other CPUs offline).
 fn snap_with(rows: &[(usize, stats::CpuSnapshot)]) -> stats::Snapshot {
@@ -618,7 +537,6 @@ fn stats_format_renders_header_and_one_row_per_online_cpu() {
 fn stats_format_omits_offline_cpus_preserving_indices() {
     init_global_heap();
     let row = stats::CpuSnapshot { online: true, idle: true, ready: 0, counters: stats::Counters::ZERO };
-    // CPUs 0 and 2 online, 1 offline: rows keep their dense indices.
     let snap = snap_with(&[(0, row), (2, row)]);
     let text = stats::format(&snap).unwrap();
     assert_eq!(
@@ -663,7 +581,6 @@ fn heap_peek_is_min_and_remove_targets() {
     deadline::push(&mut h, entry(10, 0xA)).unwrap();
     deadline::push(&mut h, entry(20, 0xB)).unwrap();
     assert_eq!(deadline::peek(&h).unwrap().target, 0xA);
-    // Remove the middle target; ordering of the rest is preserved.
     assert!(deadline::remove(&mut h, 0xB, deadline::DeadlineKind::Timer));
     assert!(!deadline::remove(&mut h, 0xB, deadline::DeadlineKind::Timer)); // gone
     assert!(!deadline::remove(&mut h, 0xA, deadline::DeadlineKind::Thread)); // wrong kind
@@ -677,8 +594,7 @@ fn heap_remove_distinguishes_kind_for_same_target() {
     init_global_heap();
     let mut h: KVec<deadline::Entry> = KVec::new();
     h.try_reserve(deadline::HEAP_RESERVE).unwrap();
-    // The same `target` can hold entries of different kinds — each removable
-    // independently by `(target, kind)`.
+    // The same `target` can hold entries of different kinds, each removable by `(target, kind)`.
     deadline::push(
         &mut h,
         deadline::Entry { deadline_ns: 10, target: 0xA, kind: deadline::DeadlineKind::Thread, channel: 0 },
@@ -689,9 +605,7 @@ fn heap_remove_distinguishes_kind_for_same_target() {
         deadline::Entry { deadline_ns: 20, target: 0xA, kind: deadline::DeadlineKind::PendingSend, channel: 0xBEEF },
     )
     .unwrap();
-    // Neither is a Timer.
     assert!(!deadline::remove(&mut h, 0xA, deadline::DeadlineKind::Timer));
-    // Remove the Thread entry; the PendingSend one survives, channel intact.
     assert!(deadline::remove(&mut h, 0xA, deadline::DeadlineKind::Thread));
     let e = deadline::peek(&h).unwrap();
     assert_eq!(e.kind, deadline::DeadlineKind::PendingSend);
@@ -717,19 +631,15 @@ fn heap_push_refuses_over_reserve() {
 
 #[test]
 fn tick_quantum_decrements_then_reschedules_on_expiry() {
-    // A multi-tick quantum counts down and only reschedules at 0.
     assert_eq!(tick_quantum(3, true), (2, false));
     assert_eq!(tick_quantum(2, true), (1, false));
-    // Expiry with a ready thread → reset + reschedule.
     assert_eq!(tick_quantum(1, true), (QUANTUM_TICKS, true));
-    // Expiry with nothing ready → reset but do NOT reschedule (keep running
-    // the current thread; switching to idle would be pointless churn).
+    // Expiry with nothing ready → reset but do NOT reschedule (switching to idle is churn).
     assert_eq!(tick_quantum(1, false), (QUANTUM_TICKS, false));
 }
 
 #[test]
 fn tick_quantum_one_tick_quantum_reschedules_every_tick_when_ready() {
-    // With QUANTUM_TICKS == 1 the live config reschedules each tick.
     assert_eq!(tick_quantum(QUANTUM_TICKS, true).1, QUANTUM_TICKS == 1);
 }
 
@@ -747,15 +657,13 @@ fn queue_drop_releases_every_thread_exactly_once() {
         st.reap[0].try_reserve(REAP_RESERVE).unwrap();
         st.reap[0].try_push(inert_ref(6)).unwrap();
         st.reap[0].try_push(inert_ref(7)).unwrap();
-        // No destroys while the refs are held.
         assert_eq!(test_probe::thread_destroys(), 0);
     } // st dropped here — every ObjectRef drops its one reference.
     assert_eq!(test_probe::thread_destroys(), 7, "each queued/current/reaped thread destroyed exactly once",);
 }
 
-/// Build an inert Thread tagged with `owner_pid = pid` (and no owning
-/// Process / kernel stack, so no host paging is needed). The teardown tests
-/// only read `owner_pid`, so this is enough to exercise the `pid` scans.
+/// Build an inert Thread tagged with `owner_pid = pid`, enough for the teardown tests'
+/// `pid` scans (no process, no kernel stack).
 fn inert_user_ref(tid: u32, pid: u32) -> ObjectRef {
     into_objref(Thread::try_new(tid, pid).unwrap())
 }
@@ -775,8 +683,7 @@ fn resume_suspended_moves_to_ready_and_sets_disposition() {
     }
     st.suspended.try_push(th).unwrap();
 
-    // resume_suspended works against the global SCHED, so drive the list ops
-    // directly here (mirroring its body) to keep the test lock-free.
+    // `resume_suspended` takes the global SCHED, so mirror its list ops to stay lock-free.
     let i = st.suspended.iter().position(|r| r.as_ptr() == obj).unwrap();
     let r = st.suspended.remove(i);
     // SAFETY: pinned, single-threaded.
@@ -803,7 +710,6 @@ fn has_live_siblings_scans_all_parked_lists() {
     st.blocked.try_reserve(BLOCKED_RESERVE).unwrap();
     st.suspended.try_reserve(BLOCKED_RESERVE).unwrap();
 
-    // pid 1 has a sibling parked in `suspended`; pid 2 has none anywhere.
     st.ready[0].try_push(inert_user_ref(1, 1)).unwrap();
     st.suspended.try_push(inert_user_ref(2, 1)).unwrap();
     st.blocked.try_push(inert_user_ref(3, 3)).unwrap();
@@ -831,7 +737,6 @@ fn reap_matching_moves_only_same_pid_threads() {
         // SAFETY: pinned, single-threaded.
         let left = unsafe { &*(st.ready[0].iter().next().unwrap().as_ptr() as *const Thread) };
         assert_eq!(left.owner_pid(), 2);
-        // No destroys yet — the refs are alive in `reap`.
         assert_eq!(test_probe::thread_destroys(), 0);
     } // st dropped — reap + ready release their refs.
     assert_eq!(test_probe::thread_destroys(), 3);
@@ -851,9 +756,7 @@ fn reaped_thread_destroyed_when_dropped() {
 fn into_objref_preserves_single_reference() {
     init_global_heap();
     test_probe::reset();
-    // Spawn-style: create runnable would need paging, so use inert.
     let r = into_objref(Thread::try_new(9, 0).unwrap());
-    // entry/arg accessor reads back the inert defaults.
     // SAFETY: pinned, single-threaded.
     let (_entry, arg) = unsafe { Thread::entry_and_arg(r.as_ptr()) };
     assert_eq!(arg, 0);

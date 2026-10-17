@@ -1,5 +1,5 @@
-//! **Directories** (Phase 6 Part E.2): their 32-byte entries, long names assembled from the entries
-//! before a short one, and paths resolved; and (E.3) entries written, a name's short form made
+//! **Directories**: their 32-byte entries, long names assembled from the entries
+//! before a short one, and paths resolved; and entries written, a name's short form made
 //! unique, and free slots found.
 //!
 //! **A directory is FAT12 and FAT16's fixed root**, a run of sectors after the FATs, **or a chain
@@ -15,10 +15,13 @@ use crate::{BlockReader, BlockWriter, FsError};
 pub const ENTRY: u32 = 32;
 /// The first byte of an entry deleted.
 pub const DELETED: u8 = 0xE5;
-/// An entry's attributes.
+/// A read-only file.
 pub const ATTR_READ_ONLY: u8 = 0x01;
+/// The volume label's entry.
 pub const ATTR_VOLUME: u8 = 0x08;
+/// A directory.
 pub const ATTR_DIR: u8 = 0x10;
+/// The archive bit, set on a new file.
 pub const ATTR_ARCHIVE: u8 = 0x20;
 /// A long-name entry's attributes: read-only, hidden, system and volume together.
 pub const ATTR_LONG: u8 = 0x0F;
@@ -26,14 +29,17 @@ pub const ATTR_LONG: u8 = 0x0F;
 pub const MAX_NAME_SLOTS: usize = 21;
 /// The most slots a directory may have, by the specification: 2 MiB of entries.
 pub const MAX_SLOTS: u32 = 65_536;
-/// A directory's first two entries' names.
+/// A directory's first entry's name.
 pub const DOT: &[u8; 11] = b".          ";
+/// A directory's second entry's name.
 pub const DOTDOT: &[u8; 11] = b"..         ";
 
 /// **A directory**: FAT12 and FAT16's fixed root, or the chain from a cluster.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Dir {
+    /// FAT12 and FAT16's fixed root.
     Root,
+    /// A chain of clusters from this one.
     Chain(u32),
 }
 
@@ -107,7 +113,6 @@ fn walk<R: BlockReader>(
 ) -> Result<(), FsError> {
     let mut sector = [0u8; SECTOR as usize];
     let per_sector = SECTOR / ENTRY;
-    // Every sector of the directory from the one holding `from`, as (its byte, its first slot).
     let mut visit = |at: u64, first: u32, sector: &mut [u8; SECTOR as usize]| -> Result<bool, FsError> {
         r.read_meta(at, sector)?;
         for k in 0..per_sector {
@@ -179,7 +184,7 @@ impl Lfn {
     /// what was assembled: such a name is stale, and the short entry stands alone. **An ordinal
     /// outside `1..=20` is never a part**, with the last-part flag or without: once a name is
     /// whole the part expected next is `0`, and an entry of ordinal `0` matched it and was
-    /// placed at part `0 - 1` (PR #365 review, finding 1).
+    /// placed at part `0 - 1`.
     fn feed(&mut self, slot: u32, e: &[u8; 32]) {
         let ord = e[0] & 0x1F;
         if ord == 0 || ord > 20 {
@@ -233,12 +238,15 @@ pub struct Found {
     pub first_slot: u32,
     /// Its short entry.
     pub slot: u32,
+    /// Its short name, eleven bytes.
     pub short: [u8; 11],
     /// Windows' case bits for the short name.
     pub case: u8,
+    /// Its attribute byte.
     pub attr: u8,
     /// Its first cluster; `0` for an empty file.
     pub cluster: u32,
+    /// Its size in bytes.
     pub size: u32,
     /// When it was last written, seconds since the epoch; `0` if unknown.
     pub mtime: i64,
@@ -248,7 +256,7 @@ pub struct Found {
     /// Whether it has a long name at all, fitting or not.
     has_long: bool,
     /// **Its long name as stored**, in UTF-16 units, which a lookup compares against: a name too
-    /// long for 255 bytes of UTF-8 has no [`Found::long`] to compare (PR #365 review, finding 6).
+    /// long for 255 bytes of UTF-8 has no [`Found::long`] to compare.
     units: [u16; names::MAX_UNITS],
     units_len: usize,
 }
@@ -262,8 +270,8 @@ impl Found {
     /// **Its name as the system shows it**: its long name, or its short one shown, into `out`. Its
     /// length. **A long name too long for 255 bytes of UTF-8 is shown by its short name**, which
     /// every entry has and [`Found::is_named`] answers to — so the file is listed, reached and
-    /// removable, where it used to be left out of the listing altogether (PR #365 review, finding
-    /// 6). `None` is not answered today; it stays in the signature for a name that cannot be shown.
+    /// removable. `None` is not answered today; it stays in the signature for a name that
+    /// cannot be shown.
     pub fn name(&self, out: &mut [u8; 255]) -> Option<usize> {
         if let (true, Some(n)) = (self.has_long, self.long_len) {
             out[..n].copy_from_slice(&self.long[..n]);
@@ -324,7 +332,6 @@ fn found(kind: Kind, dir: Dir, slot: u32, e: &[u8; 32], long: Option<(&[u16], u3
     f
 }
 
-/// Whether a short entry is `.` or `..`.
 fn is_dot(e: &[u8; 32]) -> bool {
     &e[..11] == DOT || &e[..11] == DOTDOT
 }

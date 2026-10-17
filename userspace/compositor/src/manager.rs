@@ -1,21 +1,12 @@
 //! The manager channel's request handling: pure, host-tested, no syscalls.
 //!
-//! The counterpart of [`server::dispatch`](crate::server::dispatch) for the *other* channel role.
-//! A client holds a session and speaks about windows it created; a manager holds one channel for
-//! the whole compositor and speaks about any window at all.
+//! The counterpart of [`server::dispatch`](crate::server::dispatch) for the manager role: a
+//! client speaks about windows it created, a manager about any window at all.
 //!
-//! ## The capability is the binding, not a check
-//!
-//! **Nothing here verifies ownership, and that is the point.** A manager manages windows it did
-//! not create — that is what makes it a manager — so the boundary is *who may hold this channel*,
-//! not *what may be asked over it*. `/dev/draw/manage` is where that boundary lives.
-//!
-//! **In Milestone 6 that binding gates nothing**, and pretending otherwise would be worse than
-//! the gap: `/dev/draw` is bound unscoped into init's root namespace, every graphical client
-//! inherits it, and resolves are classified by suffix with no caller identity. Namespace-based
-//! gating needs *per-client namespaces*, and the process that constructs them is `desktop-shell`
-//! — closed in M7 Part E, where `desktop-shell` binds `/dev/draw/new` alone into each
-//! application namespace. See `docs/architecture/graphical-session.md` §3.
+//! Nothing here checks ownership: the capability is who may hold the channel
+//! (`/dev/draw/manage`), not what may be asked over it. That binding gates nothing while
+//! `/dev/draw` is bound unscoped for every client; `desktop-shell` binds only `/dev/draw/new`
+//! into application namespaces. See `docs/architecture/graphical-session.md` §3.
 
 use libdraw::geom::{Point, Rect};
 use libdraw::theme::Scheme;
@@ -34,58 +25,28 @@ use crate::{StackError, WindowStack};
 pub enum MgrOutcome {
     /// Applied. `dirty` is the region to repaint, in screen coordinates.
     ///
-    /// **`None` means "everything"** — the same convention `server::Outcome` uses, and the answer
-    /// anything that cannot name its region must give. Two requests give it, and for both it is
-    /// the literal truth: `SetCurrentDesktop` (since 2026-08-26), where every window on screen is
-    /// replaced by a different set, and `SetScheme` (since 2026-09-18), where every shadow on
-    /// screen is replaced by a different one. This said `SetCurrentDesktop` was the only one
-    /// until the PR #312 review found `SetScheme` had joined it.
-    ///
-    /// **A restack is no longer one of them**, and this doc said it was: "which pixels change
-    /// depends on every overlap in the stack" is true of *which* of them change and irrelevant to
-    /// *where* they are — reordering one window leaves every other pair in the same relative
-    /// order, so the change is confined to that window's own rectangle. The argument, and the
-    /// test that pins it by comparing against a full recompose, are on
-    /// [`WindowStack::raise`](crate::WindowStack::raise). A full recompose is ~100 ms under
-    /// emulation with no input read during it, which is what that cost bought.
+    /// `None` means "everything", as in `server::Outcome`; only `SetCurrentDesktop` and `SetScheme`
+    /// give it, as both replace what is on screen wholesale. A restack is confined to the moved
+    /// window's rectangle; see [`WindowStack::raise`](crate::WindowStack::raise).
     Applied {
         /// The window the request named, or `None` for a request that names none.
         ///
-        /// Carried rather than left for the caller to re-decode: acting on a window is what
-        /// releases its held initial `Configure` (M6 B4), and reading the id back out of the
-        /// request body would depend on every manager op happening to put it at offset 0 —
-        /// true today, and exactly the kind of coincidence that stops being true quietly.
-        ///
-        /// **`Option`, not a zero sentinel.** `SetCurrentDesktop` is the first manager request
-        /// that names no window, and it first shipped as `window: 0` on the argument that zero
-        /// is never a window id, so the caller's lookup finds nothing. True — and it makes a
-        /// runtime invariant of `WindowStack::next_id` load-bearing for a *release-the-held-
-        /// configure* decision two modules away, with nothing enforcing the connection. The
-        /// type says it instead (PR #240 review, answer 4).
+        /// Carried so the caller need not re-decode it: acting on a window releases its held
+        /// initial `Configure`. An `Option`, not a zero sentinel, so no `next_id` invariant is
+        /// load-bearing.
         window: Option<u32>,
         /// The region this request changed, or `None` for "repaint everything".
         dirty: Option<Rect>,
     },
     /// Refused, with the reason.
     Failed(SurfaceError),
-    /// A chord the caller must give to the input router.
-    ///
-    /// Separate from `Applied` because it changes nothing on screen and names no window, and
-    /// separate from a direct call because the table is the router's — this module is given a
-    /// `WindowStack` and nothing else, which is what keeps it host-testable.
+    /// A chord the caller must give to the input router, which owns the table.
     RegisterHotkey(MgrHotkey),
-    /// A snap zone the caller must give to the input router.
-    ///
-    /// Separate from `RegisterHotkey` because the two tables answer different questions and are
-    /// kept apart on purpose — one matches keystrokes, the other matches a pointer during a
-    /// drag — and because registering a zone id that already exists *replaces* it, where a
-    /// duplicate chord id is refused. See `RegisterSnapZone` (M9 Part F).
+    /// A snap zone for the input router; a duplicate zone id replaces, a duplicate chord id is
+    /// refused.
     RegisterZone(librsproto::surface::MgrSnapZone),
-    /// A `Configure` the caller must forward to the window's client.
-    ///
-    /// Not performed here because it is a message to a *third* party — the manager asked, the
-    /// client is told — and this module holds no channels. It is separate from `Applied` because
-    /// a configure changes nothing on screen by itself: the client's next commit does.
+    /// A `Configure` for the caller to forward to the window's client; this module holds no
+    /// channels, and nothing changes on screen until the client commits.
     Configure {
         /// Which window's client to tell.
         window: u32,
@@ -98,21 +59,16 @@ pub enum MgrOutcome {
     },
 }
 
-/// Map a stack error to the wire error a manager sees.
 fn refused(e: StackError) -> MgrOutcome {
     MgrOutcome::Failed(match e {
         StackError::NoSuchWindow => SurfaceError::NotFound,
-        // The spec publishes `Malformed` for this: a current desktop of `STICKY_DESKTOP` is a
-        // request that cannot mean anything, not a request the compositor declined to serve.
+        // The spec publishes `Malformed`: a sticky current desktop cannot mean anything.
         StackError::StickyIsNotADesktop => SurfaceError::Malformed,
         other => SurfaceError::Rejected(other),
     })
 }
 
-/// Handle one manager request.
-///
-/// `body` is the decoded rsproto payload. A malformed body is refused rather than guessed at, the
-/// same rule the client dispatch follows.
+/// Handle one manager request; a malformed `body` is refused rather than guessed at.
 pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
     match op {
         OP_MGR_PLACE => {
@@ -132,23 +88,13 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 OP_MGR_RAISE => stack.raise(req.window),
                 OP_MGR_LOWER => stack.lower(req.window),
                 OP_MGR_RAISE_ABOVE => stack.raise_above(req.window, req.other),
-                // **Focus is a consequence of stacking, not a field.** `focus_candidate` is
-                // topmost-focusable, so "give this window the keyboard" *is* "raise it" — and
-                // keeping a separate focus field would be a second source of truth that could
-                // disagree with the stack about who has it. Click-to-focus already relies on
-                // this: `input.rs` raises and calls that the focus change.
+                // Focus is a consequence of stacking: `focus_candidate` is the topmost focusable
+                // window, so a separate focus field would be a second source of truth.
                 _ => stack.raise(req.window),
             };
             match r {
-                // **A restack repaints the window that moved, and nothing else.** Reordering one
-                // window leaves every other pair in the same relative order, so only the pixels
-                // it covers can differ — the argument is in [`WindowStack::raise`]. This said
-                // `dirty: None` (repaint everything) until 2026-08-26, and a full recompose is
-                // ~100 ms under emulation with no input read in it, which is how a window-list
-                // click cost the mouse movement around it.
-                //
-                // Empty damage means the stack did not change — raising what was already on top
-                // — and the caller repaints nothing at all.
+                // A restack repaints only the moved window's rectangle; empty damage means
+                // nothing changed.
                 Ok(d) => MgrOutcome::Applied { window: Some(req.window), dirty: Some(d.rect()) },
                 Err(e) => refused(e),
             }
@@ -160,30 +106,12 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
             if stack.window(req.window).is_none() {
                 return MgrOutcome::Failed(SurfaceError::NotFound);
             }
-            // Every rectangle before any of them go, because those are what have to be
-            // repainted — and afterwards there is nothing to read them from.
-            //
-            // **Painted bounds, so a shadow goes when its window does** (M13 Part C, PR #276
-            // review). `server.rs`'s `DestroyWindow` arm moved with the rest of the damage sites
-            // and this one did not, because the sweep that found them grepped `.bounds()` in the
-            // files it already had open and this module was not among them. The symptom would
-            // have been a dark halo left where a manager-closed window used to be, sitting there
-            // until something unrelated repainted that region.
+            // Painted bounds of everything, read before it goes, so a shadow is repainted too.
             let before: alloc::vec::Vec<(u32, Rect)> =
                 stack.windows().iter().map(|w| (w.id, w.painted_bounds())).collect();
             match stack.destroy(req.window) {
-                // **Exactly what a client's own `DestroyWindow` does**, descendants included:
-                // this is the same removal reached by a different caller, not a second kind of
-                // destruction with its own rules. `WindowDestroyed` follows from `removed_log`
-                // like any other.
-                //
-                // Which is why the damage is **the union of everything that vanished**, not the
-                // named window's rectangle: destroy is transitive, a popup is placed at its
-                // parent's origin *plus an offset* with its own size, and a dialog is placed
-                // independently — so a child is not bounded by its parent and its pixels would
-                // stay on screen until something unrelated repainted them. `server.rs` computes
-                // the same union for the same reason; this arm reported one rectangle until the
-                // Part C review found it.
+                // Same removal as a client's `DestroyWindow`, descendants included, so the damage
+                // is the union of everything that vanished: a child is not bounded by its parent.
                 Ok(()) => {
                     let mut dirty: Option<Rect> = None;
                     for (id, bounds) in before {
@@ -226,13 +154,8 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 stack.set_minimized(req.window, req.value != 0)
             };
             match r {
-                // **`dirty` is `None` when it changed, and `Some(empty)` when it did not.** A
-                // window appearing or disappearing changes pixels wherever it overlapped
-                // anything, which is the same "cannot name the region" case a restack is. But
-                // moving a window between two desktops that are both not the current one — or
-                // minimizing one that is already hidden — changes nothing on screen, and a full
-                // repaint per such request would make a shell that tidies windows in the
-                // background repaint the screen for each one.
+                // `None` when the screen changed, `Some(empty)` when not (e.g. between two hidden
+                // desktops), so background tidying does not repaint the screen.
                 Ok(true) => MgrOutcome::Applied { window: Some(req.window), dirty: None },
                 Ok(false) => MgrOutcome::Applied { window: Some(req.window), dirty: Some(Rect::new(0, 0, 0, 0)) },
                 Err(e) => refused(e),
@@ -243,9 +166,7 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 return MgrOutcome::Failed(SurfaceError::Malformed);
             };
             match stack.set_current_desktop(req.desktop) {
-                // **`None`, because this request names no window.** The window requests name
-                // one, and `Applied.window` exists so the caller can release that window's held
-                // initial `Configure`; this one releases none, and neither does `SetScheme`.
+                // No window is named, so there is no held `Configure` to release.
                 Ok(true) => MgrOutcome::Applied { window: None, dirty: None },
                 Ok(false) => MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) },
                 Err(e) => refused(e),
@@ -255,14 +176,11 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
             let scheme = match MgrScheme::read(body).map(|r| r.scheme) {
                 Some(SCHEME_LIGHT) => Scheme::Light,
                 Some(SCHEME_DARK) => Scheme::Dark,
-                // A scheme this compositor does not know, or no body at all. Not the nearest
-                // scheme: a shell and a compositor disagreeing about a number would each look
-                // right on its own.
+                // An unknown scheme is refused, not rounded to the nearest.
                 _ => return MgrOutcome::Failed(SurfaceError::Malformed),
             };
             if stack.set_scheme(scheme) {
-                // **Everything**, and literally: every shadow on screen changed, and a darker one
-                // reaches further than the one it replaces. See `WindowStack::set_scheme`.
+                // Everything: every shadow on screen changed.
                 MgrOutcome::Applied { window: None, dirty: None }
             } else {
                 MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) }
@@ -272,17 +190,13 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
             let Some(hk) = MgrHotkey::read(body) else {
                 return MgrOutcome::Failed(SurfaceError::Malformed);
             };
-            // **Handed back rather than applied here.** The chord table lives in the input
-            // router, which this module holds no reference to — the same reason `Configure` is
-            // handed back: it is not the stack's to change.
+            // Handed back: the chord table is the input router's.
             MgrOutcome::RegisterHotkey(hk)
         }
         OP_MGR_REGISTER_SNAP_ZONE => {
             let Some(z) = librsproto::surface::MgrSnapZone::read(body) else {
                 return MgrOutcome::Failed(SurfaceError::Malformed);
             };
-            // Handed back for the reason a chord is: the table lives in the input router, and
-            // this module is given a `WindowStack` and nothing else.
             MgrOutcome::RegisterZone(z)
         }
         _ => MgrOutcome::Failed(SurfaceError::Malformed),
@@ -294,14 +208,12 @@ mod tests {
     use super::*;
     use librsproto::surface::{ConfigureEvent, CreateWindowRequest, Role};
 
-    /// A stack with `n` normal 8×8 windows, ids returned bottom-first.
     fn stack_with(n: usize) -> (WindowStack, alloc::vec::Vec<u32>) {
         let mut s = WindowStack::new();
         let ids = (0..n)
             .map(|_| {
                 let id = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
-                // Configured: a manager acts on windows that are on screen, and since B4
-                // `focus_candidate` does not consider one that is not.
+                // Configured: `focus_candidate` ignores unconfigured windows.
                 s.mark_configured(id);
                 id
             })
@@ -327,9 +239,7 @@ mod tests {
 
     #[test]
     fn a_manager_places_a_window_it_did_not_create() {
-        // **The whole point of the channel.** Every op here names a window by id and none checks
-        // ownership; the capability is holding the channel, not owning the window. A manager
-        // that could only move its own windows would be an application.
+        // No op checks ownership: holding the channel is the capability.
         let (mut s, ids) = stack_with(1);
         let out = dispatch(&mut s, OP_MGR_PLACE, &place_body(ids[0], 40, 25));
         assert!(matches!(out, MgrOutcome::Applied { .. }));
@@ -338,9 +248,7 @@ mod tests {
 
     #[test]
     fn placing_an_uncommitted_window_reports_nothing_to_repaint() {
-        // The manager's ordinary case: it places a window between the client's `CreateWindow`
-        // and its first `Commit`, when the window is not on screen at all. Reporting a region
-        // there would repaint on every window launch.
+        // Placed between `CreateWindow` and the first `Commit`: not on screen, nothing to repaint.
         let (mut s, ids) = stack_with(1);
         let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, OP_MGR_PLACE, &place_body(ids[0], 5, 5)) else {
             panic!("expected Applied")
@@ -351,19 +259,13 @@ mod tests {
 
     #[test]
     fn a_restack_repaints_the_window_that_moved_and_nothing_else() {
-        // **This asserted the opposite until 2026-08-26**, on the reasoning that which pixels a
-        // restack changes "depends on every overlap in the stack". It does — and every one of
-        // them is inside the moved window's own rectangle, because reordering one window leaves
-        // every other pair in the same relative order. `None` here means "repaint the screen",
-        // which under emulation is ~100 ms with no input read in it: the cost landed on the
-        // mouse movement around every window-list click.
+        // Only the moved window's own rectangle can change, not the whole screen.
         let (mut s, ids) = stack_with(3);
         for (op, body, id) in [
             (OP_MGR_RAISE, ref_body(ids[0], 0), ids[0]),
             (OP_MGR_LOWER, ref_body(ids[0], 0), ids[0]),
             (OP_MGR_SET_FOCUS, ref_body(ids[1], 0), ids[1]),
         ] {
-            // Painted bounds: a restacked window repaints its shadow too (M13 Part C).
             let want = s.window(id).expect("in the stack").painted_bounds();
             assert!(want.size.w > 8, "the premise: the damage includes the shadow");
             let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, op, &body) else { panic!("expected Applied") };
@@ -373,10 +275,7 @@ mod tests {
 
     #[test]
     fn a_restack_that_moves_nothing_reports_nothing_to_repaint() {
-        // Raising what is already topmost is the common case, not a corner: click-to-focus
-        // raises on every press, and a shell that raises from a window list does the same. An
-        // empty region is this crate's "nothing changed" — distinct from `None`, which is
-        // "repaint everything" — so the caller paints neither.
+        // Raising the topmost is the common case; empty damage (not `None`) repaints nothing.
         let (mut s, ids) = stack_with(3);
         let top = *ids.last().expect("three windows");
         let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, OP_MGR_RAISE, &ref_body(top, 0)) else {
@@ -389,12 +288,8 @@ mod tests {
 
     #[test]
     fn close_destroys_a_window_the_caller_does_not_own_and_names_what_to_repaint() {
-        // **The only answer available to a desktop whose applications draw their own chrome.** A
-        // close button the client paints cannot close a client that has stopped answering, so
-        // the manager needs a way to remove a window it does not own — which is the whole point
-        // of the manager channel, and is what `DestroyWindow` deliberately is not.
+        // A manager can remove a window whose client has stopped answering.
         let (mut s, ids) = stack_with(2);
-        // Painted bounds: closing a window repaints its shadow too (M13 Part C).
         let want = s.window(ids[0]).expect("in the stack").painted_bounds();
         assert!(want.origin.x < 0, "the premise: the region reaches outside the window");
         let MgrOutcome::Applied { window, dirty } = dispatch(&mut s, OP_MGR_CLOSE, &ref_body(ids[0], 0)) else {
@@ -405,8 +300,6 @@ mod tests {
         assert_eq!(order(&s), [ids[1]], "and it is out of the stack");
         assert_eq!(s.take_removed(), vec![ids[0]], "recorded, so `WindowDestroyed` follows");
 
-        // A second close of the same window is `NotFound`, like any other op naming a window
-        // that is not there.
         assert!(matches!(
             dispatch(&mut s, OP_MGR_CLOSE, &ref_body(ids[0], 0)),
             MgrOutcome::Failed(SurfaceError::NotFound)
@@ -415,11 +308,7 @@ mod tests {
 
     #[test]
     fn close_repaints_the_descendants_it_takes_with_it() {
-        // **Destroy is transitive and so is the damage.** A popup is placed at its parent's
-        // origin *plus an offset*, with its own size, so it is not bounded by the window that
-        // owns it: reporting the parent's rectangle leaves the menu's pixels on screen until
-        // something unrelated repaints them. The arm reported one rectangle until the Part C
-        // review demonstrated exactly this.
+        // Destroy is transitive and a popup is not bounded by its parent, so the damage is a union.
         let (mut s, ids) = stack_with(1);
         let parent = ids[0];
         let popup = s.create(&CreateWindowRequest::at(8, 8, Role::Popup { parent }, 100, 100)).unwrap();
@@ -450,9 +339,6 @@ mod tests {
 
     #[test]
     fn set_focus_is_a_raise_because_focus_is_a_consequence_of_stacking() {
-        // Not a separate field: `focus_candidate` is topmost-focusable, so a focus field would
-        // be a second source of truth that could disagree with the stack. Click-to-focus already
-        // works this way.
         let (mut s, ids) = stack_with(3);
         assert_eq!(s.focus_candidate(), Some(ids[2]));
         dispatch(&mut s, OP_MGR_SET_FOCUS, &ref_body(ids[0], 0));
@@ -462,8 +348,6 @@ mod tests {
 
     #[test]
     fn a_configure_is_handed_back_rather_than_applied() {
-        // It is a message to a *third* party — the manager asked, the client is told — and it
-        // changes nothing on screen by itself: the client's next commit does.
         let (mut s, ids) = stack_with(1);
         let mut body = [0u8; 20];
         ConfigureEvent { window: ids[0], width: 300, height: 200, x: 10, y: 20 }.write(&mut body).unwrap();
@@ -478,9 +362,6 @@ mod tests {
 
     #[test]
     fn every_op_refuses_a_window_that_does_not_exist() {
-        // Stated over the set rather than for one op: a rule about all of them wants a test
-        // over all of them, and the `Configure` arm reaches the stack by a different path from
-        // the others.
         let (mut s, _) = stack_with(1);
         let mut cfg = [0u8; 20];
         ConfigureEvent { window: 99, width: 1, height: 1, x: 0, y: 0 }.write(&mut cfg).unwrap();
@@ -526,22 +407,17 @@ mod tests {
         let (mut s, ids) = stack_with(1);
         let w = ids[0];
 
-        // Off the current desktop: the screen changed, so the whole of it must be repainted —
-        // which pixels changed depends on every overlap, the same case a restack is.
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_WINDOW_DESKTOP, &value_body(w, 2)),
             MgrOutcome::Applied { window: Some(w), dirty: None },
         );
         assert_eq!(s.window(w).unwrap().desktop, 2);
 
-        // Between two desktops that are both hidden: nothing on screen changed, and an empty
-        // rectangle is how this codebase already says "repaint nothing".
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_WINDOW_DESKTOP, &value_body(w, 3)),
             MgrOutcome::Applied { window: Some(w), dirty: Some(Rect::new(0, 0, 0, 0)) },
         );
 
-        // Minimize takes any non-zero value as true, as the spec publishes.
         dispatch(&mut s, OP_MGR_SET_WINDOW_DESKTOP, &value_body(w, 1));
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_MINIMIZED, &value_body(w, 7)),
@@ -552,17 +428,13 @@ mod tests {
 
     #[test]
     fn switching_the_current_desktop_names_no_window() {
-        // **`window: 0` is the point.** `Applied.window` exists so the caller can release that
-        // window's held initial `Configure`; this request names none, so it must release none.
-        // Zero is never a window id — `next_id` starts at 1 — so the caller looks for nothing
-        // and finds nothing.
+        // `Applied.window` is `None`: there is no held `Configure` to release.
         let (mut s, _) = stack_with(1);
         let mut b = [0u8; 4];
         MgrDesktop { desktop: 5 }.write(&mut b).unwrap();
         assert_eq!(dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b), MgrOutcome::Applied { window: None, dirty: None },);
         assert_eq!(s.current_desktop(), 5);
 
-        // Switching to the desktop already current changes nothing on screen.
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &b),
             MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) },
@@ -571,10 +443,7 @@ mod tests {
 
     #[test]
     fn a_current_desktop_of_zero_is_malformed_on_the_wire() {
-        // The spec publishes `Malformed` rather than a refusal: a current desktop of
-        // `STICKY_DESKTOP` is a request that cannot mean anything, not one the compositor
-        // declined to serve. Checked here because `refused()` maps every other `StackError`
-        // to `Rejected`, so this one relies on an explicit arm.
+        // The spec publishes `Malformed`; `refused()` needs an explicit arm for it.
         let (mut s, _) = stack_with(1);
         let mut b = [0u8; 4];
         MgrDesktop { desktop: librsproto::surface::STICKY_DESKTOP }.write(&mut b).unwrap();
@@ -618,9 +487,6 @@ mod tests {
 
     #[test]
     fn registering_a_chord_is_handed_back_rather_than_applied() {
-        // Like `Configure`, and for a comparable reason: the chord table belongs to the input
-        // router, which this module is not given. Being handed back is what keeps `dispatch`
-        // testable against a bare `WindowStack`.
         let (mut s, _) = stack_with(1);
         let hk = MgrHotkey { id: 3, mods: 8, code: 59 };
         let mut b = [0u8; 8];

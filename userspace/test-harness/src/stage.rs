@@ -1,23 +1,8 @@
-//! `child` — the Phase-1 IPC handle-transfer demo worker.
-//!
-//! Spawned by `parent` with three bootstrap arguments (seeded by the kernel into
-//! `rdi`/`rsi`/`rdx`, i.e. the three `extern "C"` parameters):
-//!
-//! - `notif`    — a handle to this process's own notification channel (unused);
-//! - `endpoint` — one end of an IPC channel shared with the sibling child;
-//! - `arg0`     — low 8 bits select the **role**, the rest is a role-specific payload:
-//!   `0` = sender, `1` = receiver, `2` = exit immediately (the exit-storm stress
-//!   child; no endpoint needed), `3` = hard-float worker (payload = per-worker seed).
-//!
-//! Role 0 creates a `MemoryObject`, writes a marker into it, and **transfers the
-//! handle** to the sibling over `endpoint` (capability propagation). Role 1
-//! receives the handle, maps the same object, and reads the marker back —
-//! proving the capability crossed the process boundary and aliases shared frames.
-//!
-//! Role 3 is the Phase-4 hardware-floating-point proof: ordinary Rust `f64` arithmetic
-//! (plus an `#[target_feature(enable = "avx2")]` SIMD path) checked bit-exactly against
-//! integer math, across syscalls and preemption, with a per-worker seed so concurrent
-//! workers hold different live FP state. See [`run_fp_worker`].
+//! `test-stage` — a worker `parent` spawns. With a setup message pending (`arg0` marks it) it
+//! dispatches on `argv[0]`: `"stage <rows>"` verifies a TSM1 stream on stdin, `"fp <seed>"` runs
+//! the hard-float worker ([`run_fp_worker`]). With `arg0 == 0` it exits at once: the exit-storm
+//! child, whose payload is the process teardown (kernel-stack free, TLB shootdown, reap) racing
+//! across CPUs.
 
 #![no_std]
 #![no_main]
@@ -30,35 +15,23 @@ use libkern::{
     syscall1, syscall2, syscall4,
 };
 
-/// `alloc` backing for the C3 setup-message stage path (`run_stream_stage`).
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-// === role 3: the hard-float worker =======================================================
-//
-// The first Nitrox userspace code that computes with **real hardware floating point** —
-// ordinary Rust `f64` arithmetic compiled for `x86_64-unknown-nitrox`, lowered to `mulsd`
-// / `addsd` rather than the `__muldf3` libcalls the old soft-float target emitted. See
-// the decision log, 2026-07-21 (FP enablement Parts C and D).
+// The hard-float worker: real `mulsd`/`addsd`, not soft-float libcalls.
 
 /// Exit codes, so `parent` can tell *which* invariant broke rather than just "nonzero".
 const FP_EXIT_SCALAR_MISMATCH: i64 = 20;
-/// The round-trip transform did not return the values bit-exactly.
 const FP_EXIT_ROUNDTRIP: i64 = 21;
-/// The AVX2 path disagreed with the scalar path.
 const FP_EXIT_SIMD_MISMATCH: i64 = 22;
 /// The kernel enabled AVX in `XCR0` but the `YMM` state bit was not visible from ring 3.
 const FP_EXIT_XCR0: i64 = 23;
 
-/// Values per worker. Eight `f64` — two `ymm` registers' worth, so the AVX2 path below
-/// does two vector iterations.
+/// Values per worker: eight `f64`, two `ymm` registers' worth.
 const FP_LANES: usize = 8;
-/// Rounds of transform → syscall → inverse-transform → verify.
 const FP_ROUNDS: u32 = 12;
 
 /// `CPUID` leaf/subleaf, returning `(eax, ebx, ecx, edx)`.
-///
-/// Unprivileged: `CPUID` is legal at CPL 3.
 fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let (a, b, c, d);
     // SAFETY: `cpuid` has no memory effects and is valid in ring 3. `rbx` is
@@ -93,14 +66,10 @@ unsafe fn xgetbv0() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-/// Whether AVX2 is usable *from this process* — which is a question about the OS, not
-/// just the CPU.
+/// Whether AVX2 is usable *from this process*.
 ///
-/// The full three-part check the ecosystem uses: the CPU implements AVX2
-/// (`CPUID.07H:EBX[5]`), the OS turned on `XSAVE` (`CPUID.01H:ECX[27]`, mirroring
-/// `CR4.OSXSAVE`), **and** the OS actually enabled the SSE + AVX state components in
-/// `XCR0`. That last clause is the interesting one here: it is userspace independently
-/// confirming, from ring 3, the `XCR0` write the kernel performed in `fpu_init_cpu`.
+/// Needs the CPU feature, `XSAVE` on, **and** the SSE + AVX state enabled in `XCR0` — userspace
+/// confirming from ring 3 the write the kernel made in `fpu_init_cpu`.
 fn avx2_usable() -> Result<bool, i64> {
     let (_, _, ecx1, _) = cpuid(1, 0);
     let osxsave = ecx1 & (1 << 27) != 0;
@@ -135,10 +104,7 @@ unsafe fn sum_squares_avx2(v: &[f64; FP_LANES]) -> f64 {
         let a = _mm256_loadu_pd(v.as_ptr());
         let b = _mm256_loadu_pd(v.as_ptr().add(4));
         let acc = _mm256_add_pd(_mm256_mul_pd(a, a), _mm256_mul_pd(b, b));
-        // Horizontal sum of the four lanes. The lane values are exact integers well
-        // under 2^53, so addition is exact and this reassociation is bit-identical to
-        // the scalar left-to-right sum — which is precisely why the workload is built
-        // from exact integers.
+        // Exact integers under 2^53, so this reassociated sum equals the scalar one bit for bit.
         let hi = _mm256_extractf128_pd(acc, 1);
         let lo = _mm256_castpd256_pd128(acc);
         let s = _mm_add_pd(lo, hi);
@@ -147,7 +113,6 @@ unsafe fn sum_squares_avx2(v: &[f64; FP_LANES]) -> f64 {
     }
 }
 
-/// Σ v[k]², in plain scalar Rust.
 fn sum_squares_scalar(v: &[f64; FP_LANES]) -> f64 {
     let mut acc = 0.0f64;
     for x in v.iter() {
@@ -156,8 +121,7 @@ fn sum_squares_scalar(v: &[f64; FP_LANES]) -> f64 {
     acc
 }
 
-/// Sleep roughly `ms` milliseconds by arming a one-shot timer and blocking on it —
-/// a genuine deschedule, so the scheduler switches this thread out and back in.
+/// Sleep about `ms` milliseconds on a one-shot timer: a real deschedule and wake.
 fn timer_nap_ms(ms: u64) {
     // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
     let th = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
@@ -189,36 +153,21 @@ fn timer_nap_ms(ms: u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
 }
 
-/// Out-params for [`timer_nap_ms`]. Single-threaded process; touched only there.
 static mut FP_CLOCK: u64 = 0;
 static mut FP_WAIT_HANDLES: [u64; 1] = [0];
 static mut FP_WAIT_RESULTS: [u8; 24] = [0; 24];
 
-/// Role 3 — prove hardware floating point works in ring 3, and that a process's FP state
-/// survives syscalls, preemption, and other processes doing the same thing.
+/// Role 3 — prove hardware floating point works in ring 3 and that a process's FP state survives
+/// syscalls, preemption and other processes doing the same.
 ///
-/// Every value is a small exact integer held in an `f64`, which makes all of the checks
-/// **bit-exact** rather than epsilon-fuzzy:
-///
-/// - **Cross-check against integer math.** Σ v[k]² is computed in `f64` and again in
-///   `u64`, and the two must agree exactly. A self-consistent-but-wrong FPU (a bad
-///   multiply, a stuck rounding mode, an `MXCSR` we failed to initialise) fails here,
-///   where a float-only check would not.
-/// - **Round-trip invariant across a syscall.** `x → 2x+1 → (x-1)/2` is exactly
-///   invertible in binary floating point for these magnitudes. The forward half runs,
-///   then the worker crosses into the kernel and burns enough cycles to be preempted
-///   several times, then the inverse half must reproduce the original bit patterns.
-/// - **Scalar vs. AVX2.** When the OS has enabled `YMM` state, the same sum computed
-///   through `#[target_feature(enable = "avx2")]` intrinsics must match the scalar
-///   result exactly — the per-function opt-in pattern the GUI toolkit's font and image
-///   crates will use.
-///
-/// `seed` differs per worker, so concurrent workers hold *different* live FP state; if
-/// the context switch cross-wired two processes' register files, the round-trip check
-/// would see another worker's values.
+/// Every value is a small exact integer in an `f64`, so each check is **bit-exact**: the sum of
+/// squares must match `u64` math (catching a self-consistent-but-wrong FPU, a stuck rounding
+/// mode, an uninitialised `MXCSR`); `x → 2x+1 → (x-1)/2` must round-trip across a timer nap; and
+/// the AVX2 sum, when `YMM` state is enabled, must match the scalar one. `seed` differs per
+/// worker, so a context switch that cross-wired two register files would show another worker's
+/// values.
 fn run_fp_worker(seed: u64) -> ! {
-    // Small exact integers: base ≤ 8·1024, so v[k]² and their sum stay far below 2^53
-    // and every operation below is exact in `f64`.
+    // base ≤ 8·1024, so v[k]² and the sum stay far below 2^53 and every operation is exact.
     let base = (seed & 0x7) * 1024 + 1;
     let mut v = [0f64; FP_LANES];
     let mut expect_sq: u64 = 0;
@@ -230,7 +179,6 @@ fn run_fp_worker(seed: u64) -> ! {
     }
     let original = v;
 
-    // The FPU must agree with integer arithmetic.
     if sum_squares_scalar(&v) != expect_sq as f64 {
         exit(FP_EXIT_SCALAR_MISMATCH);
     }
@@ -251,16 +199,12 @@ fn run_fp_worker(seed: u64) -> ! {
         for x in v.iter_mut() {
             *x = *x * 2.0 + 1.0;
         }
-        // Block on a short timer while the transformed values are live. A real
-        // deschedule + wake beats burning cycles: it *guarantees* a context switch (and
-        // very likely a CPU migration) at the same cost under TCG and KVM, whereas a
-        // spin long enough to span a tick under emulation finishes in microseconds under
-        // KVM and might never be preempted at all.
+        // A real deschedule + wake guarantees a context switch (likely a CPU migration) under
+        // TCG and KVM alike; a spin spanning a tick under TCG ends in microseconds under KVM.
         timer_nap_ms(2);
         for x in v.iter_mut() {
             *x = (*x - 1.0) / 2.0;
         }
-        // Bit-exact: these are integers, so the round trip is lossless.
         if v != original {
             exit(FP_EXIT_ROUNDTRIP);
         }
@@ -298,14 +242,10 @@ fn parse_u64(s: &str) -> Option<u64> {
     Some(v)
 }
 
-/// The C3 **Tier-1 stage** path: receive the setup message on the bootstrap endpoint
-/// (streams + `argv`), then read a TSM1 stream from `stdin` and verify it against the
-/// row count passed in `argv[1]`. Exits `0` on success, `1` on any mismatch — the
-/// setup-message spawn proved end to end. `argv` is `["stage-demo", "<rows>"]`.
-/// A **Tier-1 stage**: receive the setup message (streams + `argv`), then dispatch on
-/// `argv[0]` — `"stage <rows>"` verifies a TSM1 stream on stdin, `"fp <seed>"` runs a
-/// hard-float worker. Both exit `0`/`1`. This is the one spawn convention: role + params
-/// come from `argv`, streams from the setup message — never from `arg0`.
+/// A **Tier-1 stage**: receive the setup message, then dispatch on `argv[0]`.
+///
+/// `"stage <rows>"` verifies a TSM1 stream on stdin, `"fp <seed>"` runs a hard-float worker. Role
+/// and params come from `argv`, streams from the setup message, never from `arg0`. Exits `0`/`1`.
 fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let boot = libstream::setup::bootstrap(notif, ns, endpoint, arg0);
     let setup = match boot.setup() {
@@ -387,14 +327,10 @@ fn run_stage_consumer(setup: &libstream::setup::Setup) -> ! {
     exit(0);
 }
 
-/// Bootstrap registers: `rdi` = notif, `rsi` = namespace, `rdx` = endpoint (the setup
-/// channel for a Tier-1 stage), `rcx` = `arg0` (the one-convention bootstrap descriptor).
+/// Bootstrap registers: `rdi` notif, `rsi` namespace, `rdx` endpoint (the setup channel for a
+/// Tier-1 stage), `rcx` `arg0`.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    // The one spawn convention: `arg0` marks a Tier-1 stage (a setup message is pending)
-    // or Tier 0 (`arg0 == 0`). A Tier-0 `test-stage` is an **exit-storm** child — the
-    // payload IS the process teardown (kernel-stack free, TLB shootdown, reap) racing
-    // across CPUs (substrate-hardening Part F; decision log 2026-07-21).
     if libstream::setup::setup_is_pending(arg0) {
         run_stage(notif, ns, endpoint, arg0);
     }

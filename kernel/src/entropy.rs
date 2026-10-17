@@ -1,27 +1,18 @@
-//! The kernel entropy subsystem: a global CSPRNG seeded from hardware
-//! (`RDSEED`/`RDRAND`) and software (interrupt-timing jitter) sources.
+//! The kernel entropy subsystem: a global CSPRNG seeded from hardware (`RDSEED`/`RDRAND`) and
+//! software (interrupt-timing jitter) sources.
 //!
-//! Design: `docs/architecture/entropy.md`. A fixed-size **pool** accumulates raw
-//! samples; a conservative **entropy estimate** gates a one-shot **seeded** latch
-//! at 256 bits; the [`ChaCha20Rng`] CSPRNG is keyed from the pool and reseeded as
-//! fresh entropy arrives. Every source — hardware RNG included — is *absorbed into
-//! the pool, never used as output directly* (mix-don't-trust).
+//! Design: `docs/architecture/entropy.md`. A fixed-size **pool** accumulates raw samples; a
+//! conservative **entropy estimate** gates a one-shot **seeded** latch at 256 bits; the
+//! [`ChaCha20Rng`] CSPRNG is keyed from the pool and reseeded as fresh entropy arrives. Every
+//! source, the hardware RNG included, is *absorbed into the pool, never used as output directly*.
 //!
-//! ## Lifecycle
+//! [`init`] runs once at boot (after the timer/APIC, before the handle table): it draws a hardware
+//! burst, mixes early jitter, **always keys the CSPRNG** from what it gathered (so kernel draws
+//! work with no hardware RNG), and latches `seeded` if it crossed the gate. Then [`on_irq_sample`]
+//! folds in jitter from IRQ context, and [`fill`] / [`seed_u64`] draw output.
 //!
-//! [`init`] runs once at boot (after the timer/APIC are up, before the handle
-//! table) — it draws a hardware burst, mixes early jitter, **always keys the
-//! CSPRNG** from whatever entropy it gathered (so kernel draws work even with no
-//! hardware RNG), and latches `seeded` if it crossed the gate. Thereafter
-//! [`on_irq_sample`] folds interrupt-timing jitter in from IRQ context, and
-//! [`fill`] / [`seed_u64`] draw CSPRNG output.
-//!
-//! ## Locking
-//!
-//! All state is behind one [`IrqSpinLock`] — a **leaf** (held alone, briefly, with
-//! interrupts masked; no nested locks, no allocation). The IF-masking makes the
-//! IRQ-context sampler ([`on_irq_sample`]) and the syscall/boot-context draw
-//! ([`fill`]) mutually safe on one CPU. See `kernel/docs/lock-ordering.md`.
+//! All state is behind one [`IrqSpinLock`], a **leaf**: held alone, briefly, with interrupts
+//! masked, no nested locks, no allocation. See `kernel/docs/lock-ordering.md`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,37 +20,30 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{ChaCha20Rng, IrqSpinLock, KVec};
 use crate::object::ObjectRef;
 
-/// Pool size in bytes. Sized to one ChaCha key — the pool *is* the CSPRNG key
-/// material once conditioned by the key schedule.
+/// Pool size in bytes: one ChaCha key.
 const POOL_LEN: usize = 32;
 
 /// Estimated entropy bits required before the pool latches **seeded**.
 const SEED_BITS: u32 = 256;
 
-/// Entropy credited per successful hardware `u64` draw. Conservative: a full
-/// 64-bit hardware sample is credited its width; the real guarantee is "drew from
-/// a hardware RNG", not this estimate.
+/// Entropy credited per hardware `u64` draw: its full width. The real guarantee is "drew from a
+/// hardware RNG", not this estimate.
 const EST_PER_HW: u32 = 64;
 
-/// Jitter samples required to credit one estimated bit. Interrupt timing carries
-/// only a fraction of a bit each, so credit sparsely.
+/// Jitter samples per estimated bit: interrupt timing carries a fraction of a bit each.
 const JITTER_PER_BIT: u32 = 8;
 
-/// Hardware `u64` draws attempted at boot. Eight × 64 bits = 512 estimated bits —
-/// well past the gate when a hardware RNG is present.
+/// Hardware `u64` draws attempted at boot: 8 x 64 bits, well past the gate.
 const HW_DRAWS: usize = 8;
 
-/// Bytes of CSPRNG output between automatic reseeds (fold fresh pool entropy into
-/// the key). Bounds how much output rides a single key on a busy system.
+/// Bytes of CSPRNG output between automatic reseeds; bounds how much output rides one key.
 const RESEED_BYTES: u32 = 1 << 20; // 1 MiB
 
-/// Diffusion multiplier for the pool absorb (the SplitMix64 / fibonacci-hash
-/// constant). Mixing only — cryptographic conditioning is ChaCha's key schedule.
+/// Diffusion multiplier for the pool absorb (the SplitMix64 constant); mixing only.
 const ABSORB_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Maximum `sys_entropy_read` callers that can simultaneously block on the pool
-/// becoming seeded. Only reachable on a CPU with no hardware RNG (otherwise the
-/// pool seeds at boot, before userspace), so a small cap suffices; an overflowing
+/// Maximum `sys_entropy_read` callers blocked at once on the pool seeding. Only reachable on a CPU
+/// with no hardware RNG (otherwise it seeds at boot), so a small cap suffices; an overflowing
 /// reader is told to retry rather than queued.
 pub const SEED_WAITERS_MAX: usize = 4;
 
@@ -75,32 +59,24 @@ pub enum SeedWaitReg {
     Full(ObjectRef),
 }
 
-/// Set whenever the seed-waiter list is non-empty, so the timer tick can skip the
-/// lock entirely in the common (already-seeded, no-waiters) case.
+/// Set while the seed-waiter list is non-empty, so the timer tick can skip the lock otherwise.
 static SEED_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// The entropy subsystem's interior state (see the module docs).
 struct EntropyState {
     /// Entropy accumulator. Conditioned into the CSPRNG key by the key schedule.
     pool: [u8; POOL_LEN],
-    /// Rotating 8-byte absorb offset selector.
     absorb_ctr: u32,
-    /// Jitter samples seen, for fractional crediting (`JITTER_PER_BIT` → 1 bit).
     jitter_ctr: u32,
-    /// Conservative estimated entropy bits absorbed.
     est_bits: u32,
     /// `true` once [`init`] has keyed the CSPRNG (kernel draws are valid).
     keyed: bool,
     /// One-shot: set when `est_bits` first reaches [`SEED_BITS`]. Never cleared.
     seeded: bool,
-    /// The CSPRNG, keyed from the pool.
     csprng: ChaCha20Rng,
-    /// CSPRNG output since the last reseed (drives [`RESEED_BYTES`]).
     bytes_since_reseed: u32,
-    /// `PendingOperation`s parked on the pool becoming seeded (the unseeded-read
-    /// path). Pre-reserved to [`SEED_WAITERS_MAX`] in [`init`]. The subsystem owns
-    /// these refs (mirroring the IPC `Block` pattern) until the timer-tick drain
-    /// moves them out to be signalled + dropped.
+    /// `PendingOperation`s parked on the pool seeding. Pre-reserved in [`init`]; the subsystem owns
+    /// these refs until the timer-tick drain moves them out to be signalled and dropped.
     seed_waiters: KVec<ObjectRef>,
 }
 
@@ -120,9 +96,8 @@ impl EntropyState {
         }
     }
 
-    /// Fold `x` into 8 bytes of the pool at a rotating offset, with a SplitMix-style
-    /// diffusion so successive samples accumulate rather than overwrite. Mixing
-    /// only — does not, by itself, credit any entropy.
+    /// Fold `x` into 8 bytes of the pool at a rotating offset, with SplitMix-style diffusion so
+    /// samples accumulate rather than overwrite. Mixing only: credits no entropy.
     fn absorb(&mut self, x: u64) {
         let off = (self.absorb_ctr as usize % (POOL_LEN / 8)) * 8;
         let cur = u64::from_le_bytes(self.pool[off..off + 8].try_into().unwrap());
@@ -131,13 +106,10 @@ impl EntropyState {
         self.absorb_ctr = self.absorb_ctr.wrapping_add(1);
     }
 
-    /// Credit `bits` of estimated entropy (saturating at [`SEED_BITS`] so the
-    /// counter never wraps on a long-running system).
     fn credit(&mut self, bits: u32) {
         self.est_bits = self.est_bits.saturating_add(bits).min(SEED_BITS);
     }
 
-    /// Account one jitter sample, crediting a bit every [`JITTER_PER_BIT`] of them.
     fn credit_jitter(&mut self) {
         self.jitter_ctr = self.jitter_ctr.wrapping_add(1);
         if self.jitter_ctr.is_multiple_of(JITTER_PER_BIT) {
@@ -145,14 +117,12 @@ impl EntropyState {
         }
     }
 
-    /// (Re)key the CSPRNG from the current pool and mark the state keyed.
     fn key_from_pool(&mut self) {
         self.csprng.reseed(&self.pool);
         self.keyed = true;
     }
 
-    /// If enough entropy has accumulated and we have not latched yet, key the
-    /// CSPRNG from the pool at the crossing point and latch `seeded` (one-shot).
+    /// Key the CSPRNG from the pool at the crossing point and latch `seeded` (one-shot).
     fn maybe_latch(&mut self) {
         if !self.seeded && self.est_bits >= SEED_BITS {
             self.csprng.reseed(&self.pool);
@@ -160,8 +130,8 @@ impl EntropyState {
         }
     }
 
-    /// Draw `out.len()` CSPRNG bytes, folding fresh pool entropy into the key once
-    /// output since the last reseed crosses [`RESEED_BYTES`].
+    /// Draw `out.len()` CSPRNG bytes, folding fresh pool entropy into the key past
+    /// [`RESEED_BYTES`].
     fn draw(&mut self, out: &mut [u8]) {
         debug_assert!(self.keyed, "entropy::draw before init keyed the CSPRNG");
         self.csprng.fill(out);
@@ -172,17 +142,13 @@ impl EntropyState {
         }
     }
 
-    /// Queue `po` to be woken on seeding, or hand it back (see [`SeedWaitReg`]).
-    /// Refs are *moved*, never dropped, here.
+    /// Queue `po` to be woken on seeding, or hand it back (see [`SeedWaitReg`]); refs are moved,
+    /// never dropped, here.
     ///
-    /// **The push refuses rather than growing**, and the length check above is not what makes
-    /// that true. [`init`]'s reserve is best-effort: if it fails, `len() >= SEED_WAITERS_MAX`
-    /// is `0 >= 4` — false — so control reaches the push on an *unreserved* list, and
-    /// `try_push` would then `kmalloc` while this leaf-ranked lock is held. That is the
-    /// inversion `init`'s own comment says it is avoiding, reached by the path it did not
-    /// consider (kernel audit C.1(e), 2026-08-14). `push_within_capacity` cannot allocate, so
-    /// an unreserved list simply reports itself full — which is exactly what the caller
-    /// already handles.
+    /// **The push refuses rather than growing.** [`init`]'s reserve is best-effort: if it fails,
+    /// `len() >= SEED_WAITERS_MAX` is `0 >= 4`, false, so control reaches the push on an unreserved
+    /// list, and `try_push` would `kmalloc` under this leaf-ranked lock. `push_within_capacity`
+    /// cannot allocate, so an unreserved list reports itself full, which the caller handles.
     fn register_waiter(&mut self, po: ObjectRef) -> SeedWaitReg {
         if self.seeded {
             return SeedWaitReg::AlreadySeeded(po);
@@ -198,8 +164,8 @@ impl EntropyState {
         }
     }
 
-    /// If seeded, move up to `out.len()` queued waiter refs into `out` and return
-    /// the count; 0 (touching nothing) if not yet seeded. No `ObjectRef` drop here.
+    /// If seeded, move up to `out.len()` waiter refs into `out`; 0 if not. No `ObjectRef` drop
+    /// here.
     fn drain_waiters(&mut self, out: &mut [Option<ObjectRef>]) -> usize {
         if !self.seeded {
             return 0;
@@ -213,37 +179,30 @@ impl EntropyState {
     }
 }
 
-/// The single global entropy state (a leaf `IrqSpinLock`; see the module docs).
+/// The global entropy state, a leaf `IrqSpinLock`.
 static ENTROPY: IrqSpinLock<EntropyState> = IrqSpinLock::new(LockRank::Leaf, EntropyState::new());
 
-/// Initialize the entropy subsystem once at boot: draw a hardware burst, mix in
-/// early jitter, key the CSPRNG, and latch `seeded` if the gate was crossed.
+/// Initialize the entropy subsystem once at boot: draw a hardware burst, mix in early jitter, key
+/// the CSPRNG, and latch `seeded` if the gate was crossed.
 ///
-/// Must run after the timer/APIC are up (so the monotonic clock is live) and
-/// before the handle table is initialized (so it can seed from the CSPRNG). Keys
-/// the CSPRNG **unconditionally** from whatever entropy was gathered, so kernel
-/// draws work even on a CPU without a hardware RNG (where `seeded` stays false
-/// until interrupt jitter accumulates).
+/// After the timer/APIC are up (the monotonic clock is live) and before the handle table (it seeds
+/// from the CSPRNG). Keys the CSPRNG **unconditionally**, so kernel draws work without a hardware
+/// RNG, where `seeded` stays false until interrupt jitter accumulates.
 pub fn init() {
     use crate::arch::entropy::{ArchEntropy, HwRngSource};
     use crate::arch::timer::ArchTimer;
 
     let source = crate::arch::Entropy::source();
     let mut hw = 0usize;
-    // Pre-reserve the seed-waiter list so `register_seed_waiter` never allocates under the
-    // lock — and do the reserving **outside** it, because allocating (slab, rank 6a) while
-    // holding this leaf-ranked lock is itself the inversion we are trying to avoid. The
-    // debug lock-order tracker rejects it (Slice D4 found this and the identical pattern in
-    // `dpc::init`). Best-effort, and the failure mode is the one
-    // `register_waiter` handles: an unreserved list reports itself full, so callers are told
-    // to retry. That is only true because the push there refuses instead of growing — an
-    // earlier version of this comment claimed the outcome without the mechanism, and the
-    // mechanism was missing (kernel audit C.1(e)).
+    // Pre-reserve the seed-waiter list so `register_seed_waiter` never allocates under the lock,
+    // and reserve **outside** it: allocating (slab, rank 6a) under this leaf-ranked lock is an
+    // inversion the debug lock-order tracker rejects (as in `dpc::init`). Best-effort: an
+    // unreserved list reports itself full, so callers are told to retry, because the push in
+    // `register_waiter` refuses instead of growing.
     let mut waiters = KVec::new();
     let _ = waiters.try_reserve(SEED_WAITERS_MAX);
     let mut g = ENTROPY.lock();
     g.seed_waiters = waiters;
-    // Hardware burst: each successful draw is absorbed and credited its full width.
     for _ in 0..HW_DRAWS {
         if let Some(v) = crate::arch::Entropy::try_seed_u64() {
             g.absorb(v);
@@ -251,8 +210,8 @@ pub fn init() {
             hw += 1;
         }
     }
-    // Mix in early jitter (no entropy credit — boot-time clock reads are highly
-    // correlated; this is defence-in-depth mixing, the hardware burst is the seed).
+    // Early jitter is mixed without credit: boot-time clock reads are highly correlated, so this is
+    // defence in depth and the hardware burst is the seed.
     for _ in 0..16 {
         g.absorb(crate::arch::Timer::read_ns());
     }
@@ -269,9 +228,8 @@ pub fn init() {
     crate::kprintln!("entropy: source {src}, {hw} hw draws, seeded={seeded}",);
 }
 
-/// Absorb one interrupt-timing jitter sample (a raw cycle count) from IRQ context.
-/// Cheap and lock-bounded; credits a fraction of a bit and may latch `seeded` once
-/// enough jitter has accumulated (the no-hardware-RNG seeding path).
+/// Absorb one interrupt-timing jitter sample (a raw cycle count) from IRQ context. Credits a
+/// fraction of a bit and may latch `seeded` (the no-hardware-RNG seeding path).
 pub fn on_irq_sample(cycles: u64) {
     let mut g = ENTROPY.lock();
     g.absorb(cycles);
@@ -279,31 +237,28 @@ pub fn on_irq_sample(cycles: u64) {
     g.maybe_latch();
 }
 
-/// Fill `out` with CSPRNG output. Valid after [`init`]. Reseeds from the pool
-/// automatically past [`RESEED_BYTES`] of output.
+/// Fill `out` with CSPRNG output; valid after [`init`]. Reseeds past [`RESEED_BYTES`] of output.
 pub fn fill(out: &mut [u8]) {
     ENTROPY.lock().draw(out);
 }
 
-/// Draw a 64-bit CSPRNG value (e.g. to seed the handle-table free-list shuffle).
+/// Draw a 64-bit CSPRNG value.
 pub fn seed_u64() -> u64 {
     let mut buf = [0u8; 8];
     fill(&mut buf);
     u64::from_le_bytes(buf)
 }
 
-/// `true` once the pool has latched **seeded** (crossed the 256-bit estimate).
-/// Gates the userspace read contract (Part D); kernel draws work once [`init`] has
-/// keyed the CSPRNG, seeded or not.
+/// `true` once the pool has latched **seeded** (crossed the 256-bit estimate). Gates the userspace
+/// read contract; kernel draws work once [`init`] has keyed the CSPRNG, seeded or not.
 pub fn is_seeded() -> bool {
     ENTROPY.lock().seeded
 }
 
-/// Register `po` to be completed when the pool seeds (the unseeded `sys_entropy_read`
-/// path). On [`SeedWaitReg::Queued`] the subsystem takes ownership of `po` until the
-/// timer-tick drain ([`drain_seed_waiters`]) signals it; otherwise `po` is handed
-/// back for the caller to complete now (see [`SeedWaitReg`]). The TOCTOU re-check
-/// under the lock closes the seed-between-check-and-register race.
+/// Register `po` to be completed when the pool seeds (the unseeded `sys_entropy_read` path). On
+/// [`SeedWaitReg::Queued`] the subsystem owns `po` until [`drain_seed_waiters`] signals it;
+/// otherwise `po` is handed back to complete now. The re-check under the lock closes the race
+/// between the caller's `is_seeded` check and registering.
 pub fn register_seed_waiter(po: ObjectRef) -> SeedWaitReg {
     let reg = ENTROPY.lock().register_waiter(po);
     if matches!(reg, SeedWaitReg::Queued) {
@@ -312,17 +267,14 @@ pub fn register_seed_waiter(po: ObjectRef) -> SeedWaitReg {
     reg
 }
 
-/// `true` iff seed-waiters are queued — the cheap (lock-free) gate the timer tick
-/// checks before taking the lock in [`drain_seed_waiters`].
+/// `true` iff seed-waiters are queued: the lock-free gate the timer tick checks.
 pub fn seed_wake_pending() -> bool {
     SEED_WAKE_PENDING.load(Ordering::Acquire)
 }
 
-/// If the pool is seeded, move up to `out.len()` queued waiter `PendingOperation`
-/// refs into `out` (returning the count) for the caller to signal + drop; clears
-/// [`seed_wake_pending`] once the list empties. Returns 0 (touching nothing) when
-/// the pool is not yet seeded. The refs are *moved* out — no `ObjectRef` drop
-/// happens under the entropy lock.
+/// If the pool is seeded, move up to `out.len()` queued waiter refs into `out` (returning the
+/// count) for the caller to signal and drop, and clear [`seed_wake_pending`] once the list empties;
+/// 0, touching nothing, when unseeded. No `ObjectRef` drop happens under the lock.
 pub fn drain_seed_waiters(out: &mut [Option<ObjectRef>]) -> usize {
     let mut g = ENTROPY.lock();
     let n = g.drain_waiters(out);
@@ -351,7 +303,6 @@ mod tests {
     #[test]
     fn hardware_credit_crosses_gate_and_latches_once() {
         let mut s = EntropyState::new();
-        // Four 64-bit hardware draws = 256 estimated bits → exactly the gate.
         for i in 0..4 {
             s.absorb(0x1111_1111 * (i + 1));
             s.credit(EST_PER_HW);
@@ -360,7 +311,6 @@ mod tests {
         assert!(!s.seeded);
         s.maybe_latch();
         assert!(s.seeded, "latched once the estimate reached the gate");
-        // Idempotent: a second latch attempt is a no-op (one-shot).
         s.maybe_latch();
         assert!(s.seeded);
     }
@@ -368,7 +318,6 @@ mod tests {
     #[test]
     fn jitter_alone_can_seed() {
         let mut s = EntropyState::new();
-        // Each jitter sample credits 1 bit per JITTER_PER_BIT; need 256 bits.
         for i in 0..(SEED_BITS * JITTER_PER_BIT) {
             s.absorb(i as u64);
             s.credit_jitter();
@@ -412,7 +361,6 @@ mod tests {
         let mut s = EntropyState::new();
         s.absorb(0x9999);
         s.key_from_pool();
-        // Draw just over RESEED_BYTES so the threshold trips and the counter resets.
         let mut chunk = [0u8; 4096];
         let mut total = 0u32;
         while total < RESEED_BYTES + 4096 {
@@ -442,14 +390,9 @@ mod tests {
         s
     }
 
-    /// An **unreserved** waiter list reports itself full rather than allocating.
-    ///
-    /// This is the case `init`'s best-effort `try_reserve` leaves behind on failure, and the
-    /// one the length check cannot catch: `len() >= SEED_WAITERS_MAX` is `0 >= 4`, false, so
-    /// control reaches the push. Before 2026-08-14 that push *grew* — `kmalloc` under this
-    /// leaf-ranked lock, the very inversion `init`'s comment says the reserve exists to
-    /// avoid — and returned `Queued`. Every other test here builds through `reserved_state`,
-    /// so nothing exercised it (kernel audit C.1(e); PR #205 review, finding 4).
+    /// An **unreserved** waiter list reports itself full rather than allocating: the case `init`'s
+    /// best-effort `try_reserve` leaves on failure, which the length check cannot catch (`0 >= 4`
+    /// is false), and where the push once grew under the lock.
     #[test]
     fn register_reports_full_when_the_reserve_never_happened() {
         crate::mm::test_support::init_global_heap();
@@ -476,7 +419,6 @@ mod tests {
             assert!(matches!(s.register_waiter(po()), SeedWaitReg::Queued));
         }
         assert_eq!(s.seed_waiters.len(), SEED_WAITERS_MAX);
-        // One past capacity is handed back.
         assert!(matches!(s.register_waiter(po()), SeedWaitReg::Full(_)));
     }
 

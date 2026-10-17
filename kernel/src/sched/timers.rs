@@ -2,18 +2,17 @@
 
 use super::*;
 
-/// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the
-/// unseeded `sys_entropy_read` path). Gated by a cheap lock-free check so the common
-/// already-seeded / no-waiters case costs one atomic load. Caller holds `SCHED`.
+/// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the unseeded
+/// `sys_entropy_read` path), gated by a lock-free check so the common case costs one atomic
+/// load. Caller holds `SCHED`.
 ///
-/// The entropy subsystem owns the waiter refs (the IPC-`Block` pattern); we move
-/// them out, signal each, and **park the refs in [`SchedState::deferred_drops`]**
-/// for [`reap_pending`] to drop in thread context. They must not drop here: an
-/// `ObjectRef` drop can reach the plain-spinlock allocator, which may neither run
-/// under the IRQ-acquired `SCHED` lock (a cross-CPU deadlock against an allocator
-/// holder whose own tick spins on `SCHED`) nor anywhere in this tick's IRQ context
-/// (a same-CPU self-deadlock against an allocator holder this tick interrupted).
-/// See the decision log (2026-07-21, F2) and `kernel/docs/lock-ordering.md`.
+/// The entropy subsystem owns the waiter refs; we move them out, signal each, and **park
+/// them in [`SchedState::deferred_drops`]** for [`reap_pending`] to drop in thread context.
+/// They must not drop here: an `ObjectRef` drop can reach the plain-spinlock allocator,
+/// which may neither run under the IRQ-acquired `SCHED` lock (a cross-CPU deadlock against
+/// an allocator holder whose own tick spins on `SCHED`) nor in this tick's IRQ context (a
+/// same-CPU self-deadlock against an allocator holder it interrupted). See
+/// `kernel/docs/lock-ordering.md`.
 pub(super) fn wake_entropy_seed_waiters(g: &mut SchedState) {
     if !crate::entropy::seed_wake_pending() {
         return;
@@ -24,19 +23,18 @@ pub(super) fn wake_entropy_seed_waiters(g: &mut SchedState) {
     for slot in buf[..n].iter_mut() {
         if let Some(po) = slot.take() {
             signal_pending_op_with_result(g, po.as_ptr(), 0, 0);
-            // A move within the reserve — no drop, no allocation under the lock.
-            // Bounded: waiters queue only pre-seed and the drain fires post-seed,
-            // so the lifetime total is ≤ SEED_WAITERS_MAX (< the reserve).
+            // A move within the reserve — no drop, no allocation under the lock. Bounded:
+            // waiters queue only pre-seed and the drain fires post-seed, so the lifetime
+            // total is ≤ SEED_WAITERS_MAX (< the reserve).
             push_reserved(&mut g.deferred_drops, po, "deferred-drop list");
         }
     }
 }
 
-/// Drain every deadline at or before `now`, firing each: a timer entry signals
-/// and wakes its waiters (and re-arms if periodic); a `sys_wait` thread-deadline
-/// entry wakes that thread directly (its wait slots stay un-signaled → the
-/// thread observes a timeout). Caller holds `SCHED`. Performs **no allocation**
-/// and **no blocking** — safe in the timer IRQ.
+/// Drain every deadline at or before `now`, firing each: a timer signals and wakes its
+/// waiters (and re-arms if periodic); a `sys_wait` thread-deadline wakes that thread
+/// directly with its wait slots un-signaled, so it observes a timeout. Caller holds `SCHED`.
+/// **No allocation, no blocking** — safe in the timer IRQ.
 pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
     while let Some(top) = deadline::peek(&g.deadlines) {
         if top.deadline_ns > now {
@@ -61,11 +59,10 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
                 fire_timer(g, timer, now);
             }
             deadline::DeadlineKind::PendingSend => {
-                // A `BlockBounded` send's delivery deadline elapsed: cancel the
-                // held send and complete its `PendingOperation` with `TimedOut`.
-                // No `ObjectRef` drop here (rank-1 `SCHED` held — a transferred
-                // object's `Drop` could take the buddy lock); the message + refs
-                // are reclaimed on the next recv / at close (see `ipc_channel`).
+                // A `BlockBounded` send's delivery deadline elapsed: cancel the held send
+                // and complete its `PendingOperation` with `TimedOut`. No `ObjectRef` drop
+                // here (`SCHED` held — a transferred object's `Drop` could take the buddy
+                // lock); the message + refs are reclaimed on the next recv / at close.
                 let channel = top.channel as *mut ();
                 let po = top.target as *mut ();
                 // SAFETY: `channel` is still open — `ipc_endpoint_closing`
@@ -79,8 +76,8 @@ pub(super) fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
     }
 }
 
-/// Fire one timer: signal + wake all its waiters, then re-arm if periodic.
-/// Caller holds `SCHED`.
+/// Fire one timer: signal + wake all its waiters, then re-arm if periodic. Caller holds
+/// `SCHED`.
 fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
     let mut buf = [core::ptr::null_mut(); Timer::MAX_WAITERS];
     // SAFETY: live Timer, `SCHED` held — drains its waiter list.
@@ -105,8 +102,8 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
             Timer::set_armed(timer, next, interval);
             Timer::set_in_heap(timer, true);
         }
-        // Re-push: a periodic timer that just had ≥1 waiter keeps a heap slot
-        // free (its entry was just popped), so this stays within reserve.
+        // Re-push: a periodic timer that just had ≥1 waiter keeps a heap slot free (its
+        // entry was just popped), so this stays within reserve.
         let _ = deadline::push(
             &mut g.deadlines,
             deadline::Entry {
@@ -122,9 +119,8 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
     }
 }
 
-/// Arm (or, with `deadline_ns == 0`, disarm) a timer: set its
-/// deadline/interval and (re)insert its deadline-heap entry. `deadline_ns` is
-/// absolute monotonic ns. Returns `Err(())` if the heap is at reserve.
+/// Arm (or, with `deadline_ns == 0`, disarm) a timer: set its deadline/interval and
+/// (re)insert its absolute-monotonic-ns heap entry. `Err(())` if the heap is at reserve.
 ///
 /// # Safety
 ///

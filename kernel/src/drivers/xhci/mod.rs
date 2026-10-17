@@ -1,6 +1,5 @@
-//! **The xHCI USB host controller** (Phase 6 Part A): one Tier 1 driver for QEMU's xHCI — the gates
-//! attach `nec-usb-xhci` — and the laptop's Sunrise Point-LP controller, matched by PCI class
-//! `0C/03/30`.
+//! **The xHCI USB host controller**: one Tier 1 driver for QEMU's xHCI (the gates attach
+//! `nec-usb-xhci`) and the laptop's Sunrise Point-LP controller, matched by PCI class `0C/03/30`.
 //!
 //! Bring-up is in [`init`], from `drivers::probe`, polled, before the scheduler runs:
 //! 1. the function into D0, and bus mastering on;
@@ -14,14 +13,12 @@
 //!    the doorbell and the event ring are proved before anything depends on them;
 //! 6. the interrupter on.
 //!
-//! **Every wait is bounded, and a failed one declines the function with its reason**: no USB is
-//! a diagnosable failure, and a hang on a machine with no serial port is not. A decline after the
-//! controller started stops it first, since it would otherwise go on writing to memory this
-//! driver frees.
+//! **Every wait is bounded, and a failed one declines the function with its reason**: no USB is a
+//! diagnosable failure, a hang on a machine with no serial port is not. A decline after the
+//! controller started stops it first, or it would go on writing to memory this driver frees.
 //!
 //! The interrupt's DPC drains the event ring: a port change wakes [`hub`]'s thread, and a command's
-//! or a transfer's completion ends the wait the thread is in. See `docs/planning/phase-6-usb.md`
-//! § *Part A in detail*.
+//! or a transfer's completion ends the wait the thread is in. See `docs/planning/phase-6-usb.md`.
 
 pub mod caps;
 pub mod context;
@@ -114,24 +111,20 @@ const LEGCTL_CLEAR_EVENTS: u32 = 0x7 << 29;
 /// TRBs per ring: one page.
 const RING_TRBS: usize = 256;
 
-// --- Bounds -----------------------------------------------------------------
-
 /// The firmware's release of the controller. Linux waits a second, then takes it.
 const HANDOFF_NS: u64 = 1_000_000_000;
 /// A halt takes at most 16 ms (xHCI 1.2 §5.4.2); a reset and readiness, longer.
 const HALT_NS: u64 = 100_000_000;
 const RESET_NS: u64 = 1_000_000_000;
-/// The No Op's answer.
 const NO_OP_NS: u64 = 100_000_000;
 
 /// The one controller this driver brought up, for the interrupt and its DPC.
 static XHCI: AtomicPtr<Xhci> = AtomicPtr::new(core::ptr::null_mut());
 
-/// The interrupt's deferred half: drain the event ring.
 static XHCI_DPC: Dpc = Dpc::new(xhci_dpc, core::ptr::null_mut());
 
 /// **The controller, once brought up**: for a storage submit to wake the hub thread through, with a
-/// rescan for it (Phase 6 Part G). `None` before then, when no USB disk exists to submit to.
+/// rescan for it. `None` before then, when no USB disk exists to submit to.
 pub(super) fn controller() -> Option<&'static Xhci> {
     let x = XHCI.load(Ordering::Acquire);
     // SAFETY: a published controller is leaked to `'static` and never freed.
@@ -147,9 +140,7 @@ pub struct Xhci {
     db: u64,
     /// How many ports it has, numbered from 1.
     max_ports: u8,
-    /// Where an input context's entries are, for its context size.
     layout: context::Layout,
-    /// The ports' USB versions.
     caps: caps::ExtCaps,
     /// The device context base array, whose slot entries the hub thread writes, and the
     /// scratchpad buffers and their array, which are the controller's from here on.
@@ -160,7 +151,6 @@ pub struct Xhci {
     /// The event ring and its segment table, which only the DPC reads after bring-up.
     events: IrqSpinLock<EventRing>,
     _erst: DmaBuffer,
-    /// Port Status Change Events seen.
     port_changes: AtomicU32,
     /// **What wakes the hub thread**: the DPC signals it on every port change. Latching, so a
     /// change that lands while the thread is busy is counted, not lost.
@@ -174,15 +164,12 @@ pub struct Xhci {
     /// The controller's own descriptor, whose address finds its function in the device table: the
     /// parent of every device it enumerates.
     pci: ResourceDescriptor,
-    /// **The HID endpoints the DPC polls** (Phase 6 Part B.2), and whether one halted for the hub
-    /// thread to reset.
+    /// **The HID endpoints the DPC polls**, and whether one halted for the hub thread to reset.
     hid: IrqSpinLock<hid::Table>,
     hid_halted: AtomicBool,
-    /// A keyboard's lights are waiting for the hub thread (Phase 6 Part B.5).
     hid_lights: AtomicBool,
 }
 
-/// What the hub thread is waiting for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Awaited {
     /// The completion of the command at this address.
@@ -192,17 +179,15 @@ enum Awaited {
     Transfer { slot: u8, status: u64 },
 }
 
-/// A wait, and the operation that ends it.
 struct Waiting {
     awaited: Awaited,
     po: PoPtr,
-    /// **The bytes a short Data stage did not move**, from its own event (Phase 6 Part B.7), which
-    /// comes before its Status stage's; the transfer completes with it. `0` for a whole one.
+    /// **The bytes a short Data stage did not move**, from its own event, which comes before its
+    /// Status stage's; the transfer completes with it. `0` for a whole one.
     short: u32,
 }
 
 impl Waiting {
-    /// A wait for `awaited`, ended by `po`.
     fn new(awaited: Awaited, po: PoPtr) -> Waiting {
         Waiting { awaited, po, short: 0 }
     }
@@ -216,13 +201,11 @@ struct PoPtr(*mut ());
 // completed through `sched::complete_pending_op`, which serialises on `SCHED`.
 unsafe impl Send for PoPtr {}
 
-/// The command ring's memory and its producer.
 struct CommandRing {
     mem: DmaBuffer,
     ring: Producer,
 }
 
-/// The event ring's memory and its consumer.
 struct EventRing {
     mem: DmaBuffer,
     ring: Consumer,
@@ -235,7 +218,6 @@ struct Scratchpads {
     _pages: KVec<DmaBuffer>,
 }
 
-/// A ring's TRBs in DMA memory, written and read volatile.
 struct DmaSlots<'a>(&'a DmaBuffer);
 
 impl Slots for DmaSlots<'_> {
@@ -284,7 +266,6 @@ fn write64(base: u64, off: u64, val: u64) {
     write32(base, off + 4, (val >> 32) as u32);
 }
 
-/// Spin until `done`, or `bound_ns` passes. Whether it was done.
 fn wait_for(bound_ns: u64, mut done: impl FnMut() -> bool) -> bool {
     let start = crate::arch::Timer::read_ns();
     loop {
@@ -298,7 +279,6 @@ fn wait_for(bound_ns: u64, mut done: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// Spin for `ns`.
 fn pause(ns: u64) {
     let start = crate::arch::Timer::read_ns();
     while crate::arch::Timer::read_ns().wrapping_sub(start) < ns {
@@ -408,9 +388,8 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     }
 
     // **Not before it is ready** (xHCI 1.2 §4.2): no operational register may be written while
-    // Controller Not Ready is set, which a function just raised from D3 by a resetting transition
-    // can be — a reset written then would land on nothing, and the poll after it pass at once.
-    // Linux waits the same way before its handoff's halt (PR #354 review).
+    // Controller Not Ready is set, which a function just raised from D3 can be — a reset written
+    // then would land on nothing, and the poll after it pass at once.
     if !wait_for(RESET_NS, || read32(op, USBSTS) & STS_CNR == 0) {
         return declined("it stayed not ready after power-up");
     }
@@ -507,9 +486,8 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
         hid_lights: AtomicBool::new(false),
     };
     // **Boxed before the controller runs**, so no failure after it starts can free what it writes
-    // to while it writes: a box that cannot be had is declined here, with nothing running. The first
-    // version boxed after the No Op, and a failed allocation dropped the rings inside `try_new`
-    // with the controller still running (PR #354 review).
+    // to while it writes: a box that cannot be had is declined here, with nothing running. Boxing
+    // after the No Op let a failed allocation drop the rings with the controller still running.
     let Ok(boxed) = KBox::try_new(x) else {
         return declined(OUT_OF_MEMORY);
     };
@@ -539,12 +517,11 @@ pub fn init(controller: &ObjectRef, usb_off: bool) -> Outcome {
     let x = unsafe { &*x };
 
     // **The interrupter on, without touching Interrupt Pending**, then the controller's interrupts,
-    // then **one more drain**. An event posted after the No Op's drain set IP and Event Handler Busy
-    // with the interrupter off, and raised nothing. Writing IP as one here — it is write-one-to-clear
-    // — threw that interrupt away, and with EHB still set the interrupter raised nothing again for
-    // the rest of the boot, since only a DPC clears EHB and only an interrupt runs the DPC (PR #354
-    // review, demonstrated with a port reset in the window). Now the pending interrupt is kept, and
-    // the drain consumes whatever landed and clears EHB, so the next event interrupts either way.
+    // then **one more drain**. An event posted after the No Op's drain set IP and Event Handler
+    // Busy with the interrupter off, and raised nothing. Writing IP (write-one-to-clear) here would
+    // throw that interrupt away, and with EHB still set nothing would raise another for the rest of
+    // the boot, since only a DPC clears EHB and only an interrupt runs the DPC. So the pending
+    // interrupt is kept, and the drain consumes what landed and clears EHB.
     write32(ir, IMAN, IMAN_IE);
     write32(op, USBCMD, read32(op, USBCMD) | CMD_INTE);
     drain_counting(x);
@@ -607,9 +584,8 @@ fn stop(op: u64) {
     let _ = wait_for(RESET_NS, || read32(op, USBCMD) & CMD_HCRST == 0);
 }
 
-/// Send a No Op through the command ring and poll the event ring for its completion. Its
-/// completion code, or `None` if no answer came within the bound. Port changes that arrive first
-/// are counted.
+/// Send a No Op through the command ring and poll the event ring for its completion code, or
+/// `None` if no answer came within the bound. Port changes that arrive first are counted.
 fn no_op(x: &Xhci) -> Option<u8> {
     let sent = {
         let mut c = x.cmd.lock();
@@ -632,8 +608,7 @@ fn no_op(x: &Xhci) -> Option<u8> {
 }
 
 /// **Drain the event ring at bring-up**, counting port changes and passing everything else, then
-/// tell the controller where it stopped, clearing Event Handler Busy. Polled, before the scheduler
-/// runs: nothing here may wake a thread.
+/// clear Event Handler Busy. Polled, before the scheduler runs: nothing here may wake a thread.
 fn drain_counting(x: &Xhci) {
     drain(x, |_| {});
 }
@@ -715,8 +690,7 @@ fn on_event(x: &Xhci, trb: &Trb) {
             trb.slot_id() as u64,
         ),
         // **A bound endpoint's transfer**: the default endpoint's transfers are the hub thread's
-        // waits; every other endpoint's is a storage device's (Phase 6 Part D.2) or a HID one's
-        // (Part B.2).
+        // waits; every other endpoint's is a storage device's or a HID one's.
         kind::TRANSFER_EVENT if trb.endpoint_id() != context::DCI_EP0 => {
             if !storage::on_transfer(x, trb) {
                 hid::on_transfer(x, trb);
@@ -734,13 +708,12 @@ fn on_event(x: &Xhci, trb: &Trb) {
     }
 }
 
-/// **An event on a default endpoint, against the waiting record** (Phase 6 Part B.7): the record
-/// taken, with the code and result to complete it with, when the event ends its transfer. **A
-/// short Data stage's own event** keeps the bytes it did not move on the record and ends nothing:
-/// its Status stage follows, and completes the transfer with them — so a transfer's result is what
-/// its Data stage fell short by. The Status stage's event, or an error on any stage, ends it; an
-/// error's result is its own TRB's residual. An event for another slot, or with no transfer
-/// waiting, changes nothing.
+/// **An event on a default endpoint, against the waiting record**: the record taken, with the
+/// code and result to complete it with, when the event ends its transfer. **A short Data stage's
+/// own event** keeps the bytes it did not move on the record and ends nothing: its Status stage
+/// follows, and completes the transfer with them. The Status stage's event, or an error on any
+/// stage, ends it; an error's result is its own TRB's residual. An event for another slot, or
+/// with no transfer waiting, changes nothing.
 fn ep0_event(
     waiting: &mut Option<Waiting>,
     slot: u8,
@@ -792,8 +765,8 @@ pub fn start() {
 }
 
 /// **Wait for the hub thread's first round**, up to `bound_ns`, so the hardware report lists what
-/// is attached and the registry holds it before userspace reads it (Part A.3). A bound that passes
-/// is said; whatever is still enumerating arrives later.
+/// is attached and the registry holds it before userspace reads it. A bound that passes is said;
+/// whatever is still enumerating arrives later.
 pub fn settle(bound_ns: u64) {
     let x = XHCI.load(Ordering::Acquire);
     if x.is_null() {
@@ -854,10 +827,8 @@ mod tests {
         Some(Waiting::new(Awaited::Transfer { slot, status }, PoPtr(core::ptr::null_mut())))
     }
 
-    /// **A short Data stage's residual is its transfer's result** (Phase 6 Part B.7): its own event
-    /// ends nothing and the Status stage's carries it, so a reader learns how many bytes came. A
-    /// whole one ends with nothing short; an error on the Data stage ends there with its own
-    /// residual; another slot's event, a command's wait, or none leave things as they are.
+    /// **A short Data stage's residual is its transfer's result**: its own event ends nothing and
+    /// the Status stage's carries it; an error on the Data stage ends there with its own residual.
     #[test]
     fn a_short_data_stage_ends_its_transfer_with_what_it_did_not_move() {
         let (data, status) = (0x1010, 0x1020);

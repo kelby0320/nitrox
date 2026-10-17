@@ -1,22 +1,10 @@
 //! The kill ring itself — the half of `clipboard-server` that is a function of values.
 //!
-//! The binary is syscall plumbing: a resolve, a session per caller, and three ops decoded off
-//! the wire. Everything that can be *wrong* about a clipboard is here — which entry index 0
-//! means, what happens when the ring wraps, and when a cycle is refused — so it can be tested
-//! on the host in a second rather than in a guest in three minutes.
+//! Fixed storage, no allocator: [`CLIP_RING`] slots of [`MAX_CLIP_BYTES`] each, in `.bss`, about
+//! 63 KiB. A clipboard that could grow is one a program can push into until something dies.
 //!
-//! ## Fixed storage, no allocator
-//!
-//! [`CLIP_RING`] slots of [`MAX_CLIP_BYTES`] each, in `.bss`: about 63 KiB, bounded by
-//! construction. `auth-service` is the precedent — a server whose whole state is bounded has no
-//! business carrying a heap, and a clipboard that could grow is a clipboard a program can push
-//! into until something dies.
-//!
-//! ## What this must never log
-//!
-//! Counts, serials, lengths, kinds. **Never bytes.** A clipboard holds what a person copied,
-//! which on any real machine eventually includes a password, and the serial console is a log
-//! file that a gate reads and a maintainer pastes into a bug report.
+//! **Never log bytes** — counts, serials, lengths and kinds only. A clipboard eventually holds a
+//! password, and the serial console is a log file.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -33,10 +21,7 @@ pub enum RingError {
     TooLarge,
 }
 
-/// One slot.
-///
-/// The bytes are inline rather than boxed, which is what makes the whole ring one `.bss`
-/// object and its worst case a number rather than a hope.
+/// One slot; its bytes are inline so the whole ring is one `.bss` object.
 struct Slot {
     kind: u16,
     len: usize,
@@ -57,9 +42,8 @@ pub struct Ring {
     head: usize,
     /// How many slots hold an entry — climbs to [`CLIP_RING`] and stays.
     len: usize,
-    /// Pushes since boot. **Never reset, and never decremented**: it is an answer to "has
-    /// anything been copied since I looked", so a value that could repeat would make a stale
-    /// cycle look fresh exactly once, which is worse than not having it.
+    /// Pushes since boot. **Never reset or decremented**: a value that could repeat would make
+    /// a stale cycle look fresh.
     serial: u64,
 }
 
@@ -70,18 +54,13 @@ impl Default for Ring {
 }
 
 impl Ring {
-    /// An empty ring.
-    ///
-    /// `const` because the server holds this in `.bss` and a runtime initialiser for 63 KiB
-    /// would be 63 KiB of code doing what the loader already does.
+    /// An empty ring; `const` so the server holds it in `.bss` with no runtime initialiser.
     pub const fn new() -> Ring {
         // `[Slot::new(); CLIP_RING]` needs `Copy`, which a 4 KiB slot should not have.
         Ring { slots: [const { Slot::new() }; CLIP_RING], head: 0, len: 0, serial: 0 }
     }
 
-    /// The ring's serial — [`CLIP_ANY_SERIAL`] exactly while nothing has ever been copied.
-    ///
-    /// [`CLIP_ANY_SERIAL`]: librsproto::clipboard::CLIP_ANY_SERIAL
+    /// The ring's serial; `CLIP_ANY_SERIAL` exactly while nothing has ever been copied.
     pub fn serial(&self) -> u64 {
         self.serial
     }
@@ -98,17 +77,13 @@ impl Ring {
 
     /// Push an entry; returns the new serial, or [`RingError::TooLarge`].
     ///
-    /// **Duplicates are kept.** Emacs keeps them by default and the alternative is a rule about
-    /// what counts as the same thing — bytes, or bytes and kind, or bytes ignoring trailing
-    /// whitespace — which is a decision with no obviously right answer and no consumer asking
-    /// for it.
+    /// **Duplicates are kept**: what counts as the same entry has no obviously right answer.
     pub fn push(&mut self, kind: u16, bytes: &[u8]) -> Result<u64, RingError> {
         if bytes.len() > MAX_CLIP_BYTES {
             return Err(RingError::TooLarge);
         }
-        // The newest goes *before* the old head, so index 0 is always the newest and the ring
-        // walks backwards through its storage. Writing forwards and reversing on read would put
-        // the arithmetic in the hot path instead of here.
+        // The newest goes before the old head, so index 0 is the newest and reads need no
+        // reversal.
         self.head = if self.len == 0 { 0 } else { (self.head + CLIP_RING - 1) % CLIP_RING };
         let s = &mut self.slots[self.head];
         s.kind = kind;
@@ -124,11 +99,9 @@ impl Ring {
     /// Read entry `index` (0 is the newest), refusing if `expect` is a serial the ring has left
     /// behind.
     ///
-    /// **The staleness check comes first, and that ordering is the whole guarantee.** Checked
-    /// after the bound, a cycle whose index has *also* gone out of range would be told
-    /// `NoEntry` — "you have reached the end of the ring" — when what actually happened is that
-    /// the ring moved and the index means something else now. The client's two answers to those
-    /// are opposite: stop cycling, versus start again from the newest.
+    /// **The staleness check comes first.** Checked after the bound, a cycle that also ran off
+    /// the end would be told `NoEntry` (stop cycling) when the ring moved (start again from the
+    /// newest).
     pub fn get(&self, index: usize, expect: u64) -> Result<(u16, &[u8]), RingError> {
         if expect != librsproto::clipboard::CLIP_ANY_SERIAL && expect != self.serial {
             return Err(RingError::Stale);
@@ -157,8 +130,7 @@ mod tests {
     use librsproto::clipboard::{CLIP_ANY_SERIAL, CLIP_KIND_TEXT};
 
     fn ring() -> alloc::boxed::Box<Ring> {
-        // Boxed: 63 KiB is more than a test thread's stack wants, and the server holds it in
-        // `.bss` for the same reason.
+        // Boxed: 63 KiB is more than a test thread's stack wants.
         alloc::boxed::Box::new(Ring::new())
     }
 
@@ -188,11 +160,9 @@ mod tests {
             r.push(CLIP_KIND_TEXT, &[b'a' + i as u8]).unwrap();
         }
         assert_eq!(r.len(), CLIP_RING);
-        // The newest is the last pushed, and reaching back `CLIP_RING - 1` finds the fourth.
         assert_eq!(r.get(0, CLIP_ANY_SERIAL).unwrap().1, &[b'a' + (CLIP_RING + 2) as u8]);
         assert_eq!(r.get(CLIP_RING - 1, CLIP_ANY_SERIAL).unwrap().1, &[b'a' + 3]);
         assert_eq!(r.get(CLIP_RING, CLIP_ANY_SERIAL), Err(RingError::NoEntry));
-        // And the serial counts *pushes*, not entries — it is past the ring's depth.
         assert_eq!(r.serial(), (CLIP_RING + 3) as u64);
     }
 
@@ -201,21 +171,15 @@ mod tests {
         let mut r = ring();
         r.push(CLIP_KIND_TEXT, b"one").unwrap();
         let serial = r.push(CLIP_KIND_TEXT, b"two").unwrap();
-        // Continuing from the serial the last paste returned is fine.
         assert_eq!(r.get(1, serial).unwrap().1, b"one");
-        // A pipeline pushes underneath, and the same cycle is now refused.
         r.push(CLIP_KIND_TEXT, b"three").unwrap();
         assert_eq!(r.get(1, serial), Err(RingError::Stale));
-        // An *ordinary* paste is unaffected: it asks about nothing.
         assert_eq!(r.get(0, CLIP_ANY_SERIAL).unwrap().1, b"three");
     }
 
     #[test]
     fn a_stale_cycle_past_the_end_says_stale_rather_than_no_entry() {
-        // **The order of the two checks, tested where it differs.** Both conditions hold at
-        // once here; the client's answers to them are opposite — start again from the newest,
-        // versus stop cycling — so a `get` that reported the bound would send a client that
-        // *could* have continued away empty-handed.
+        // Both conditions hold at once; the order of the two checks is what is tested.
         let mut r = ring();
         r.push(CLIP_KIND_TEXT, b"one").unwrap();
         let serial = r.serial();
@@ -231,8 +195,8 @@ mod tests {
         let before = r.serial();
         let big = [b'x'; MAX_CLIP_BYTES + 1];
         assert_eq!(r.push(CLIP_KIND_TEXT, &big), Err(RingError::TooLarge));
-        // **The refusal is not a push.** A serial that moved would tell every cycling client
-        // the ring had changed, for an entry that was never stored.
+        // A serial that moved would tell cycling clients the ring changed for an entry never
+        // stored.
         assert_eq!(r.serial(), before);
         assert_eq!(r.get(0, CLIP_ANY_SERIAL).unwrap().1, b"kept");
     }
@@ -247,9 +211,8 @@ mod tests {
 
     #[test]
     fn a_shorter_entry_does_not_show_the_last_one_through() {
-        // The slots are reused and never cleared, so the length is what bounds a read. A `get`
-        // that returned the whole slot would leak the tail of whatever was copied before — the
-        // one way this server could hand somebody bytes they never asked for.
+        // Slots are never cleared, so the length bounds a read; the whole slot would leak the
+        // tail of an earlier copy.
         let mut r = ring();
         r.push(CLIP_KIND_TEXT, b"a long secret value").unwrap();
         for _ in 0..CLIP_RING {
@@ -277,7 +240,6 @@ mod tests {
         assert_eq!(r.list(&mut rows), 2);
         assert_eq!(rows[0], ClipInfo { kind: CLIP_KIND_TEXT, len: 6 });
         assert_eq!(rows[1], ClipInfo { kind: CLIP_KIND_TEXT, len: 3 });
-        // A caller with room for one gets one, rather than an overrun.
         let mut one = [ClipInfo::default(); 1];
         assert_eq!(r.list(&mut one), 1);
         assert_eq!(one[0].len, 6);
@@ -285,8 +247,6 @@ mod tests {
 
     #[test]
     fn the_kind_travels_with_the_entry() {
-        // The tag is why a second kind is not a second clipboard, so the ring has to keep it
-        // per entry rather than per ring.
         let mut r = ring();
         r.push(CLIP_KIND_TEXT, b"text").unwrap();
         r.push(7, b"something else").unwrap();

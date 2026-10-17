@@ -1,4 +1,4 @@
-//! `Fat`'s host tests for writing (Phase 6 Part E.3): each change made by the library, then the
+//! `Fat`'s host tests for writing: each change made by the library, then the
 //! image settled as an unmount leaves it and handed to `fsck.fat -n`, which must find it clean, and
 //! to mtools, which must read back what was written.
 
@@ -41,7 +41,6 @@ fn write_through_map<R: BlockReader + BlockWriter>(fat: &Fat<R>, path: &[u8], da
     }
 }
 
-/// **A file's bytes read through its map**, as the kernel fills a page.
 fn read_through_map(fat: &Fat<FileImage>, path: &[u8]) -> Vec<u8> {
     let mut runs = [BlockRun::default(); 64];
     let m = fat.map_file(path, &mut runs).unwrap();
@@ -56,7 +55,6 @@ fn read_through_map(fat: &Fat<FileImage>, path: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// Create the file `name` in `parent` holding `data`: created, grown, written through its map.
 fn make<R: BlockReader + BlockWriter>(fat: &Fat<R>, parent: &str, name: &str, data: &[u8]) {
     fat.create_file(parent.as_bytes(), name.as_bytes(), NOW).unwrap();
     let path = if parent == "/" { format!("/{name}") } else { format!("{parent}/{name}") };
@@ -77,9 +75,7 @@ fn short_names(img: &Path, dir: &str) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-/// **Every change, on each kind, leaves a filesystem `fsck.fat` finds clean and mtools reads**:
-/// a short name, a long one and a Unicode one created, grown and written; a directory and a file
-/// in it; a file shrunk, one emptied, one removed and an empty directory removed.
+/// **Every change, on each kind, leaves a filesystem `fsck.fat` finds clean and mtools reads**.
 #[test]
 fn every_change_leaves_a_clean_filesystem_that_mtools_reads_back() {
     for (what, img) in images() {
@@ -135,7 +131,6 @@ fn every_change_leaves_a_clean_filesystem_that_mtools_reads_back() {
     }
 }
 
-/// **A name a FAT cannot hold is refused**, `InvalidName`, before anything is written.
 #[test]
 fn a_name_a_fat_cannot_hold_is_refused() {
     let img = mformat(16, &["-c", "4"]);
@@ -154,9 +149,8 @@ fn a_name_a_fat_cannot_hold_is_refused() {
     assert_eq!(mdir_all(&img), BTreeSet::from(["fine.txt".to_string()]));
 }
 
-/// **Short names are unique**: a generated one takes the lowest tail no entry has — past one
-/// mtools wrote, and back to `~1` once that is removed — and a name in another case is the same
-/// name, so creating it again is nothing.
+/// **Short names are unique**: past one mtools wrote, and back to `~1` once that is removed; a
+/// name in another case is the same name, so creating it again is nothing.
 #[test]
 fn a_generated_short_name_takes_the_lowest_tail_free() {
     let img = mformat(16, &["-c", "4"]);
@@ -214,8 +208,6 @@ fn what_a_grow_adds_reads_as_zeroes() {
     }
 }
 
-/// **A full volume is `TooLarge`**, and takes nothing; so is a full fixed root. A directory that
-/// is a chain grows instead.
 #[test]
 fn a_full_volume_and_a_full_fixed_root_are_too_large_and_a_directory_grows() {
     let img = mkfs(2, &["-F", "12", "-s", "1", "-r", "32"]);
@@ -301,8 +293,6 @@ fn a_directory_moved_has_its_dotdot_repointed() {
     }
 }
 
-/// **Renames**: in another case, to a long name, refused onto a name taken, and replacing a file
-/// when asked — whose id comes back to be released.
 #[test]
 fn a_rename_keeps_the_file_and_a_replace_returns_the_replaced_id() {
     let img = mformat(64, &["-F", "-c", "8"]);
@@ -327,7 +317,6 @@ fn a_rename_keeps_the_file_and_a_replace_returns_the_replaced_id() {
     assert_eq!(fat.release(replaced, NOW), Err(FsError::NotFound), "released once");
 }
 
-/// **`File::Touch` finds a file by its id** — through a rename — and misses one removed.
 #[test]
 fn a_touch_by_id_finds_the_file_through_a_rename() {
     let img = mformat(16, &["-c", "4"]);
@@ -353,8 +342,7 @@ fn a_touch_by_id_finds_the_file_through_a_rename() {
     settle(&fat, "touched");
 }
 
-/// **A filesystem found dirty is left dirty by its unmount**, and a clean one left clean; FAT32's
-/// free count is unknown while mounted and counted at the unmount.
+/// FAT32's free count is unknown while a filesystem is mounted and counted at the unmount.
 #[test]
 fn a_dirty_filesystem_stays_dirty_and_a_clean_one_clean() {
     for (what, img) in images() {
@@ -390,7 +378,6 @@ fn a_dirty_filesystem_stays_dirty_and_a_clean_one_clean() {
     }
 }
 
-/// A writer that counts its writes.
 struct Counting<'a> {
     inner: &'a FileImage,
     writes: Cell<usize>,
@@ -410,8 +397,7 @@ impl BlockWriter for Counting<'_> {
 }
 
 /// **The write path batches**: a 1 MiB grow — 256 clusters, 2,048 sectors — costs sixteen 64 KiB
-/// zeroing writes, the FAT's sectors once per copy, and the entry: about twenty, where a write per
-/// cluster would be hundreds.
+/// zeroing writes, the FAT's sectors once per copy, and the entry: about twenty, not hundreds.
 #[test]
 fn a_one_mebibyte_grow_costs_a_handful_of_writes() {
     let img = mformat(64, &["-F", "-c", "8"]);
@@ -429,7 +415,6 @@ fn a_one_mebibyte_grow_costs_a_handful_of_writes() {
     assert_eq!(fsck(&img).0, 0, "{}", fsck(&img).1);
 }
 
-/// **A read-only mount refuses every change**, `ReadOnly`, and the image is as it was.
 #[test]
 fn a_read_only_mount_refuses_every_change() {
     let img = mformat(16, &["-c", "4"]);
@@ -463,7 +448,7 @@ fn a_read_only_mount_refuses_every_change() {
 }
 
 /// **`File::Touch` stamps only the file the table says**: the entry at the place it holds must
-/// still be a live file with that cluster (PR #365 review, optional). Here another system removed
+/// still be a live file with that cluster. Here another system removed
 /// the file and put an empty one in its slot; the table cannot know, and the touch must not stamp
 /// the newcomer. The table's own `forget` never runs, so this is the guard alone.
 #[test]
@@ -490,10 +475,9 @@ fn a_touch_by_id_stamps_nothing_where_another_file_took_the_place() {
     assert_eq!(stamp(&Fat::new(&disk)), before, "the newcomer unstamped");
 }
 
-/// **A change bigger than the FAT cache** (PR #365 review, optional): a 100 MiB grow on a 300 MiB
-/// FAT32 dirties 200 FAT sectors where the cache holds 64, so sectors are evicted dirty and
-/// written as they go. Then a shrink, a regrow and a removal; `fsck.fat -n` clean after each, and the
-/// free count back where it started.
+/// **A change bigger than the FAT cache**: a 100 MiB grow on a 300 MiB FAT32 dirties 200 FAT
+/// sectors where the cache holds 64, so sectors are evicted dirty. Then a shrink, a regrow and a
+/// removal; `fsck.fat -n` clean after each, and the free count back where it started.
 #[test]
 fn a_change_bigger_than_the_fat_cache_evicts_and_stays_clean() {
     let img = mformat(300, &["-F", "-c", "8"]);
@@ -523,8 +507,7 @@ fn a_change_bigger_than_the_fat_cache_evicts_and_stays_clean() {
 }
 
 /// **A read never loads over a dirty sector**: with every slot of the cache dirty, a read of a
-/// sector it does not hold is refused, and the dirty sectors are still there to be written. Only a
-/// write path may evict one, writing it out first.
+/// sector it does not hold is refused, and the dirty sectors are still there to be written.
 #[test]
 fn a_read_with_every_slot_dirty_is_refused_and_loses_nothing() {
     let img = mformat(300, &["-F", "-c", "8"]);
@@ -541,12 +524,10 @@ fn a_read_with_every_slot_dirty_is_refused_and_loses_nothing() {
     assert_eq!(cache.flush(&disk, &g).unwrap(), 2, "all 64 still dirty: one run, to each copy");
 }
 
-/// **Nothing the metadata cache holds goes stale** (Phase 6 Part H.4), as `fs-server-ext4`'s test
-/// holds it for ext4. Through a cache of eight blocks, so it evicts all the time: files made, grown
-/// and given data the way the kernel writes it — to the device, behind the server — then renamed,
-/// removed and released, a directory filled, emptied and removed so its clusters become new files'
-/// data, and files cut and grown back. Every file then reads what it should, its directory lists
-/// what it should, and `fsck.fat -n` finds the volume clean.
+/// **Nothing the metadata cache holds goes stale**, as `fs-server-ext4`'s test holds it for ext4:
+/// through a cache of eight blocks, so it evicts all the time, files are made, written behind the
+/// server, renamed, removed, cut and grown back, and a directory's clusters become file data. Every
+/// file and listing then reads right and `fsck.fat -n` finds the volume clean.
 #[test]
 fn every_change_through_the_metadata_cache_leaves_it_and_the_disk_agreeing() {
     use libfsserver::cache::{MetaCache, Store};
@@ -666,7 +647,7 @@ fn every_change_through_the_metadata_cache_leaves_it_and_the_disk_agreeing() {
     }
 }
 
-/// **What FAT frees leaves the metadata cache** (PR #371 review, finding 4), as ext4's test holds
+/// **What FAT frees leaves the metadata cache**, as ext4's test holds
 /// it: a directory's clusters, read through the cache and so held, are not held once the directory
 /// is removed — clusters that may next be a file's data, which the kernel writes behind the server.
 /// Nothing reads such a cluster back today, since a cluster that becomes a directory's is written
@@ -712,16 +693,13 @@ fn what_fat_frees_leaves_the_metadata_cache() {
     }
 }
 
-/// **A directory is read from the device once** (Phase 6 Part H.4), as ext4's test holds it. FAT
-/// read a directory a sector a command, and every lookup read it again: in a directory of 4,096
-/// names, 127 commands to find a file half way, measured. Through a server's cache, a lookup that
-/// misses reads the directory in 4 KiB blocks, and every lookup after it reads nothing — here in a
-/// directory of 1,024, which a debug build makes in seconds rather than minutes.
+/// **A directory is read from the device once**, as ext4's test holds it. Through a server's
+/// cache, a lookup that misses reads the directory in 4 KiB blocks, and every lookup after it
+/// reads nothing — here in a directory of 1,024, which a debug build makes in seconds.
 #[test]
 fn a_directory_is_read_from_the_device_once_through_the_cache() {
     use libfsserver::cache::{MetaCache, SERVER_BLOCKS, Store};
     use std::cell::Cell;
-    /// The image, counting the commands that reach it.
     struct Counted<'a>(&'a FileImage, Cell<u32>);
     impl BlockReader for Counted<'_> {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {

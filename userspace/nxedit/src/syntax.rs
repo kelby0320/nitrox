@@ -1,39 +1,18 @@
 //! A tolerant, table-driven scanner: what a line of text *looks like*.
 //!
-//! **A lexer answers "what does this program mean". This answers "what does this text look
-//! like", over text that is not a program yet** — which is a different job, and the reason
-//! `nxsh`'s own lexer is not reused here (M14 Part G). That lexer is fallible: `peek` and `bump`
-//! return `Result`, and while a person is typing an unterminated string is the *normal* state of
-//! the buffer, so a highlighter built on it would stop colouring at the first quote and start
-//! again when the pair closed. It is also parser-mode-driven — `Mode::Word` for a command's
-//! arguments, expression mode elsewhere — and a standalone highlighter has no parser to pick the
-//! mode with, so barewords, flags and regex literals would all be read as the wrong thing.
+//! Total by construction: no input is refused, and an unterminated string runs to the end of
+//! its line (or past it, if the language says so). `nxsh`'s lexer is not reused: it is
+//! fallible and parser-mode-driven, and an unterminated string is the normal state of a
+//! buffer being typed in.
 //!
-//! **This is total by construction.** Every byte of every line lands in exactly one run, an
-//! unterminated string simply runs to the end of the line (or past it, if the language says so),
-//! and there is no input it can refuse. That is what every small editor does and what a person
-//! typing a quote expects to see.
-//!
-//! ## A language is a table
-//!
-//! [`Language`] is data: line-comment markers, a block-comment pair, string rules, a keyword
-//! list, whether numbers are lexed, a variable sigil, line prefixes and a fence. One scanner
-//! drives all of them, so **the scanner is the work and a language after it is a table**.
-//!
-//! ## Where it lives
-//!
-//! In `nxedit`, because `nxedit` is its only consumer. `userspace/CLAUDE.md`'s rule is that a
-//! helper with one consumer belongs to that consumer and one with two belongs below both — so
-//! the trigger for moving this into a crate of its own is the second thing that wants to colour
-//! text, which would today mean a preview pane in `nxfiles` or a pager.
+//! [`Language`] is data, so one scanner drives them all and a new language is a table.
 
 use alloc::vec::Vec;
 
-/// What a run of text is, for colouring. The application maps these onto `Theme`'s six
-/// `syntax_*` colours; [`Kind::Plain`] takes the ordinary foreground.
+/// What a run of text is, for colouring. [`Kind::Plain`] takes the ordinary foreground.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
-    /// Ordinary text — drawn in the theme's foreground, and never emitted as a run.
+    /// Ordinary text; never emitted as a run.
     Plain,
     /// A reserved word.
     Keyword,
@@ -47,19 +26,13 @@ pub enum Kind {
     Heading,
     /// A shell variable.
     Variable,
-    /// The name on the left of an assignment: a TOML key (desktop refresh, Part J).
-    ///
-    /// **A kind this scanner did not have**, which Part A recorded when it compared the editor
-    /// with the design: the page colours a TOML key distinctly and everything here drew it as
-    /// plain text, so the eye had nothing to catch on down a column of settings.
+    /// The name on the left of an assignment: a TOML key.
     Key,
 }
 
 /// A coloured stretch of one line, in byte offsets within that line.
 ///
-/// **Only the non-plain stretches are emitted.** Plain text is the theme's foreground, which is
-/// what the widget draws without being told anything, so a line of ordinary prose produces no
-/// runs at all and costs nothing to render.
+/// Only non-plain stretches are emitted, so a line of prose produces no runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Run {
     /// First byte, inclusive. Always a character boundary.
@@ -72,9 +45,8 @@ pub struct Run {
 
 /// What was open at the end of a line, and therefore at the start of the next.
 ///
-/// **The whole of the multi-line problem.** A block comment or a fenced code block makes line
-/// *N*'s colours depend on where line *N−1* ended, so a line cannot be scanned alone. Kept small
-/// and `Copy` so an editor can cache one per line cheaply and compare them.
+/// A block comment or fence makes line *N*'s colours depend on line *N-1*, so a line cannot be
+/// scanned alone. `Copy`, so an editor can cache one per line and compare them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum State {
     /// Nothing is open.
@@ -86,8 +58,7 @@ pub enum State {
     Fence,
     /// A string is open, and this is its delimiter.
     ///
-    /// Only reachable for a rule whose `multiline` is set; every other string is closed at the
-    /// end of its line whether or not its quote arrived.
+    /// Only reachable for a rule whose `multiline` is set.
     Str(char),
 }
 
@@ -105,11 +76,8 @@ pub struct StringRule {
 /// A language, as data. See the module docs.
 #[derive(Clone, Copy)]
 pub struct Language {
-    /// What to call it — for a receipt, and for a test that wants to say which table it got.
-    ///
-    /// **A field rather than an identity derived from the table.** Comparing two `Language`
-    /// values by the addresses of their slices is the clever alternative, and it rests on the
-    /// compiler not merging two identical empty ones — a thing it is free to do.
+    /// What to call it, for a receipt. A field because comparing slices by address rests on
+    /// the compiler not merging two identical empty ones.
     pub name: &'static str,
     /// Sequences that start a comment running to the end of the line.
     pub line_comments: &'static [&'static str],
@@ -125,10 +93,8 @@ pub struct Language {
     pub variable: Option<char>,
     /// Prefixes that colour a **whole line**, tested against the line with leading blanks kept.
     ///
-    /// **The whole line, deliberately.** A Markdown heading is its line, and a TOML table header
-    /// is its line; making the rule stop at a comment would need each of them to say where it
-    /// ends, which is a grammar. The cost is that `[server] # note` colours the note as part of
-    /// the header, which nobody has ever been confused by.
+    /// The whole line because stopping at a comment would need a grammar: `[server] # note`
+    /// colours the note as part of the header.
     pub line_prefixes: &'static [(&'static str, Kind)],
     /// A fence that toggles a verbatim block, tested at the start of a line.
     pub fence: Option<&'static str>,
@@ -137,9 +103,7 @@ pub struct Language {
     /// The character that separates a name from its value, when a language has one line-shaped
     /// assignment — TOML's `=`. The name before it is a [`Kind::Key`].
     ///
-    /// **`None` for every language with a grammar**: in Rust or a shell an `=` is an operator and
-    /// what precedes it is an expression, so colouring it as a name would be wrong more often
-    /// than right (desktop refresh, Part J).
+    /// `None` for every language with a grammar: there an `=` is an operator.
     pub assignment: Option<char>,
 }
 
@@ -194,16 +158,13 @@ pub const TOML: Language = Language {
     line_prefixes: &[("[", Kind::Heading)],
     fence: None,
     code_span: None,
-    // **The name before the `=`**, which is what a TOML file is mostly made of.
     assignment: Some('='),
 };
 
 /// Rust.
 ///
-/// **No character literals**, and that is a table limitation stated rather than an oversight: the
-/// same quote opens a lifetime, so `&'static str` would open a string that ran to the end of the
-/// line. Telling the two apart needs a grammar, and a highlighter that coloured half of every
-/// generic function is worse than one that leaves `'x'` plain.
+/// No character literals: the same quote opens a lifetime, and telling them apart needs a
+/// grammar. Leaving `'x'` plain beats colouring half of every generic function.
 pub const RUST: Language = Language {
     name: "rust",
     line_comments: &["//"],
@@ -224,12 +185,8 @@ pub const RUST: Language = Language {
 
 /// Markdown — every document under `docs/`.
 ///
-/// **The language that stretches the table**, and it was named in the plan as the drop candidate
-/// rather than discovered as a distortion. Its structure is line-prefixed and fenced rather than
-/// keyword-and-string, so it uses the two rules built for exactly that and nothing else: a
-/// heading and a quote are line prefixes, a fenced block is the multi-line state block comments
-/// already needed, and an inline code span is a delimiter. Emphasis is **not** coloured — `*`
-/// pairs across a line are a grammar, and this is where the table would have started bending.
+/// Headings and quotes are line prefixes, a fenced block is the multi-line state, an inline
+/// code span is a delimiter. Emphasis is not coloured: pairing `*` across a line is a grammar.
 pub const MARKDOWN: Language = Language {
     name: "markdown",
     line_comments: &[],
@@ -244,10 +201,8 @@ pub const MARKDOWN: Language = Language {
     assignment: None,
 };
 
-/// The language a file's name implies.
-///
-/// **From the extension, and `None` is a supported answer** rather than a gap: a file with no
-/// extension, or one this system does not contain, is plain text and is drawn in one colour.
+/// The language a file's name implies, from its extension. `None` (plain text) is a supported
+/// answer.
 pub fn for_name(name: &str) -> Option<Language> {
     let ext = name.rsplit_once('.')?.1;
     match ext {
@@ -259,24 +214,21 @@ pub fn for_name(name: &str) -> Option<Language> {
     }
 }
 
-/// What to call a language in a receipt. `None` — a file with no known extension — is `"plain"`.
+/// What to call a language in a receipt; `None` is `"plain"`.
 pub fn name_of(lang: Option<Language>) -> &'static str {
     lang.map_or(PLAIN.name, |l| l.name)
 }
 
 /// Scan one line, given what was open at its start. Returns its runs and what is open after it.
 ///
-/// `line` is one line **without** its terminator. Offsets in the returned runs are bytes within
-/// it, and always character boundaries.
+/// `line` is without its terminator; run offsets are bytes within it.
 pub fn scan(lang: &Language, line: &str, start: State) -> (Vec<Run>, State) {
     let mut out = Vec::new();
     let mut state = start;
 
-    // ---- states that own the whole line, or the start of it ----
     match state {
         State::Fence => {
-            // A fence closes on a line that is itself a fence; the closing line is part of the
-            // block, which is what makes an empty fenced block still look like one.
+            // The closing fence line is part of the block.
             let closes = lang.fence.is_some_and(|f| line.trim_start().starts_with(f));
             push(&mut out, 0, line.len(), Kind::Str);
             return (out, if closes { State::Normal } else { State::Fence });
@@ -313,7 +265,6 @@ pub fn scan(lang: &Language, line: &str, start: State) -> (Vec<Run>, State) {
         State::Normal => {}
     }
 
-    // ---- a fence opening, and the line rules that own a whole line ----
     let trimmed = line.trim_start();
     if let Some(f) = lang.fence
         && trimmed.starts_with(f)
@@ -328,19 +279,11 @@ pub fn scan(lang: &Language, line: &str, start: State) -> (Vec<Run>, State) {
         }
     }
 
-    // ---- the name on the left of an assignment ----
+    // Only the head of the line, up to the first separator: an `=` in a value is not a second
+    // key.
     //
-    // **The head of the line only**, and only up to the first separator: an `=` inside a string
-    // or after one is somebody's value, not a second key. That is the whole of the rule, which
-    // is why it is a character in the table rather than a grammar (desktop refresh, Part J).
-    //
-    // **The comment check is deliberately redundant**, and a test cannot tell it apart from the
-    // name's spelling today: comments are found inside `scan_from`, which runs after this, and
-    // what keeps `# font_px = 12` a comment right now is that `#` is not a character a name may
-    // contain. Two guards for one invariant usually drift; this pair is kept because the
-    // spelling rule is about *names* and would reasonably be widened one day, at which point the
-    // comment would stop being protected by an accident. Remove both and the comment becomes a
-    // key and a number, which is the control this pair was written against.
+    // The comment check is redundant today (`#` is not a name character) but kept: the name
+    // rule may be widened, and without this `# font_px = 12` would become a key and a number.
     let commented = lang.line_comments.iter().any(|c| trimmed.starts_with(c));
     if let Some(sep) = lang.assignment
         && !commented
@@ -365,12 +308,10 @@ fn scan_from(lang: &Language, line: &str, at: usize, mut state: State, mut out: 
     let b = line.as_bytes();
     let mut i = at;
     while i < line.len() {
-        // A line comment takes everything after it.
         if lang.line_comments.iter().any(|c| line[i..].starts_with(c)) {
             push(&mut out, i, line.len(), Kind::Comment);
             return (out, state);
         }
-        // A block comment may close on this line or run past it.
         if let Some((open, close)) = lang.block_comment
             && line[i..].starts_with(open)
         {
@@ -388,7 +329,6 @@ fn scan_from(lang: &Language, line: &str, at: usize, mut state: State, mut out: 
             }
         }
         let c = line[i..].chars().next().unwrap_or(' ');
-        // A code span, which is a string that cannot escape and cannot cross a line.
         if lang.code_span == Some(c) {
             match close_string(line, i + c.len_utf8(), c, false) {
                 Some(end) => {
@@ -402,7 +342,6 @@ fn scan_from(lang: &Language, line: &str, at: usize, mut state: State, mut out: 
             }
             continue;
         }
-        // A string literal.
         if let Some(rule) = lang.strings.iter().find(|r| r.delim == c) {
             match close_string(line, i + c.len_utf8(), c, rule.escape) {
                 Some(end) => {
@@ -411,16 +350,14 @@ fn scan_from(lang: &Language, line: &str, at: usize, mut state: State, mut out: 
                 }
                 None => {
                     push(&mut out, i, line.len(), Kind::Str);
-                    // **Only a multiline rule leaves the string open.** Everything else is
-                    // closed at the newline, which is what makes a typed quote colour one line
-                    // rather than the whole file below it.
+                    // Only a multiline rule leaves the string open, so a typed quote colours one
+                    // line rather than the file below it.
                     state = if rule.multiline { State::Str(c) } else { State::Normal };
                     return (out, state);
                 }
             }
             continue;
         }
-        // A variable: the sigil plus a word, or a braced name.
         if lang.variable == Some(c) {
             let mut j = i + c.len_utf8();
             if line[j..].starts_with('{') {
@@ -433,25 +370,20 @@ fn scan_from(lang: &Language, line: &str, at: usize, mut state: State, mut out: 
                     j += 1;
                 }
             }
-            // A bare sigil with nothing after it is not a variable; leaving it plain is what
-            // stops a person typing `$` from seeing a colour appear and vanish.
+            // A bare sigil is left plain so a typed `$` does not flicker a colour.
             if j > i + c.len_utf8() {
                 push(&mut out, i, j, Kind::Variable);
             }
             i = j.max(i + c.len_utf8());
             continue;
         }
-        // A word: a keyword if the table lists it, a number if it starts with a digit.
         if is_word(b[i]) {
             let mut j = i;
             while j < line.len() && is_word(b[j]) {
                 j += 1;
             }
-            // **A number may carry a decimal point and an identifier may not**, which is why
-            // this is here rather than in `is_word`: `.` as a general joiner would swallow the
-            // `self` in `self.foo` and stop colouring the commonest keyword in the language it
-            // was added for. A point counts only when a digit follows it, so `1.5` is one
-            // number and Rust's `1..2` is two (PR #289 review, 3).
+            // A point joins a number only when a digit follows it, so `1.5` is one number and
+            // `1..2` is two. Not in `is_word`: that would swallow the `self` in `self.foo`.
             if b[i].is_ascii_digit() {
                 while j + 1 < line.len() && b[j] == b'.' && b[j + 1].is_ascii_digit() {
                     j += 1;
@@ -476,7 +408,7 @@ fn scan_from(lang: &Language, line: &str, at: usize, mut state: State, mut out: 
     (out, state)
 }
 
-/// Where the string opened before `from` ends, as a byte offset **past** its closing delimiter.
+/// Where the string opened before `from` ends, as a byte offset past its closing delimiter.
 fn close_string(line: &str, from: usize, delim: char, escape: bool) -> Option<usize> {
     let mut skip = false;
     for (i, c) in line[from..].char_indices() {
@@ -497,13 +429,8 @@ fn close_string(line: &str, from: usize, delim: char, escape: bool) -> Option<us
 
 /// Whether `b` is part of a word: a letter, a digit or an underscore.
 ///
-/// **`.` and `-` are not**, deliberately. A point joins the parts of a *number* and that is
-/// handled where numbers are scanned, because as a general rule it would make `self.foo` one
-/// word and stop `self` being a keyword. A hyphen would join a TOML key, which is not coloured
-/// at all — so it would buy nothing and break `a-b` in every other language.
-///
-/// The doc here claimed both of them until PR #289's review pointed at the body, which had
-/// never accepted either.
+/// `.` joins only the parts of a number, handled where numbers are scanned; as a general rule
+/// it would make `self.foo` one word. `-` would break `a-b` in every other language.
 fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -520,13 +447,11 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    /// Scan one line from nothing, returning its runs as `(text, kind)` pairs.
     fn runs<'a>(lang: &Language, line: &'a str) -> Vec<(&'a str, Kind)> {
         let (rs, _) = scan(lang, line, State::Normal);
         rs.iter().map(|r| (&line[r.start..r.end], r.kind)).collect()
     }
 
-    /// Scan a whole buffer, carrying the state from line to line.
     fn buffer<'a>(lang: &Language, lines: &[&'a str]) -> Vec<Vec<(&'a str, Kind)>> {
         let mut st = State::Normal;
         let mut out = Vec::new();
@@ -540,8 +465,6 @@ mod tests {
 
     #[test]
     fn plain_text_produces_no_runs_at_all() {
-        // The cheap case, and the one every line of prose takes: nothing to colour is nothing
-        // to allocate, draw or diff.
         assert!(runs(&PLAIN, "just some words").is_empty());
         assert!(runs(&RUST, "        ").is_empty());
     }
@@ -556,19 +479,12 @@ mod tests {
     }
 
     /// A bare sigil is not a variable.
-    ///
-    /// **What a person typing sees**: `$` on its own would otherwise colour, and then uncolour
-    /// as soon as a letter arrived, which is a flicker with no meaning behind it.
     #[test]
     fn a_sigil_with_no_name_after_it_is_not_a_variable() {
         assert!(runs(&NXSH, "echo $ x").is_empty());
     }
 
-    /// An unterminated string runs to the end of its line and **stops there**.
-    ///
-    /// **The defining property of a tolerant scanner.** While a person is typing, an unterminated
-    /// string is the normal state of the buffer — a scanner that carried it downward would
-    /// recolour the whole file below the cursor on every opening quote.
+    /// An unterminated string ends at its line: carrying it down would recolour the file.
     #[test]
     fn an_unterminated_string_ends_at_its_line() {
         assert_eq!(runs(&NXSH, "echo \"unfinished"), vec![("\"unfinished", Kind::Str)]);
@@ -576,7 +492,7 @@ mod tests {
         assert_eq!(st, State::Normal, "a shell string does not span lines");
     }
 
-    /// …unless the language says its strings span lines, which Rust's do.
+    /// A language whose strings span lines (Rust) carries the open string.
     #[test]
     fn a_rust_string_spans_lines_until_it_closes() {
         let out = buffer(&RUST, &["let s = \"one", "two", "three\"; let n = 1;"]);
@@ -592,8 +508,6 @@ mod tests {
     #[test]
     fn an_escaped_quote_does_not_close_a_string() {
         assert_eq!(runs(&RUST, r#"let s = "a\"b";"#), vec![("let", Kind::Keyword), (r#""a\"b""#, Kind::Str),]);
-        // …and a language without escapes takes the backslash literally, which is what a
-        // single-quoted shell string does.
         assert_eq!(runs(&NXSH, r"echo 'a\'"), vec![(r"'a\'", Kind::Str)]);
     }
 
@@ -617,14 +531,8 @@ mod tests {
     }
 
     /// Rust's `'` is a lifetime as often as a character, so it opens nothing.
-    ///
-    /// **A stated limitation of the table rather than an oversight.** Treating it as a string
-    /// delimiter colours the remainder of every line holding `&'static str`, which is most of
-    /// this repository's signatures.
     #[test]
     fn a_rust_lifetime_does_not_open_a_string() {
-        // `static` is a keyword wherever it appears, `'static` included — which is what every
-        // editor does. What matters is that nothing *after* a quote turns into a string.
         assert_eq!(
             runs(&RUST, "fn f<'a>(s: &'a str) -> &'static str { s }"),
             vec![("fn", Kind::Keyword), ("static", Kind::Keyword)],
@@ -635,31 +543,18 @@ mod tests {
     }
 
     /// A float is one number, and a range is two.
-    ///
-    /// **The visible half is the float**: `1.5` scanned as two numbers renders as a coloured
-    /// digit, a foreground-coloured dot and a coloured digit — in the two languages most likely
-    /// to be open on this system (PR #289 review, 3).
     #[test]
     fn a_decimal_point_joins_a_number_and_nothing_else() {
-        // **The name is a `Key` since the refresh's Part J**, which is why it leads each of
-        // these: the value's colouring is what this test is about and is unchanged.
         assert_eq!(runs(&TOML, "timeout = 1.5"), vec![("timeout", Kind::Key), ("1.5", Kind::Number)]);
         assert_eq!(runs(&RUST, "let x = 1.0;"), vec![("let", Kind::Keyword), ("1.0", Kind::Number),]);
-        // A point with no digit after it ends the number, so Rust's range is two of them.
         assert_eq!(
             runs(&RUST, "for i in 1..2 {"),
             vec![("for", Kind::Keyword), ("in", Kind::Keyword), ("1", Kind::Number), ("2", Kind::Number),]
         );
-        // …and a point after an *identifier* is not part of anything: the keyword still ends at
-        // it, which is what makes `self.foo` work.
         assert_eq!(runs(&RUST, "self.field"), vec![("self", Kind::Keyword)]);
     }
 
     /// A key is the plain name at the head of a line, and nothing else is.
-    ///
-    /// **The rule is a character in the table, not a grammar** (desktop refresh, Part J), so what
-    /// matters is where it declines: an `=` inside a value, a comment that contains one, and any
-    /// language whose `=` is an operator rather than an assignment of this shape.
     #[test]
     fn a_key_is_the_name_at_the_head_of_a_line() {
         assert_eq!(
@@ -672,16 +567,12 @@ mod tests {
             vec![("indented", Kind::Key), ("1", Kind::Number)],
             "leading space is not part of the name"
         );
-        // **A comment is a comment**, even one with an `=` in it: the line rules run first.
         assert_eq!(
             runs(&TOML, "# font_px = 12"),
             vec![("# font_px = 12", Kind::Comment)],
             "a commented-out setting is not a key"
         );
-        // **A table header is a header**, for the same reason.
         assert_eq!(runs(&TOML, "[a.b]"), vec![("[a.b]", Kind::Heading)]);
-        // **Nothing before the `=` that is not a name**: an `=` inside a string on the value's
-        // side must not make the string into a key.
         assert_eq!(
             runs(&TOML, "greeting = \"a = b\""),
             vec![("greeting", Kind::Key), ("\"a = b\"", Kind::Str)],
@@ -692,7 +583,6 @@ mod tests {
             vec![("\"quoted = key\"", Kind::Str), ("1", Kind::Number)],
             "a quoted name is a string, which this rule leaves alone"
         );
-        // **And a language whose `=` is an operator says so by having no rule at all.**
         assert_eq!(
             runs(&RUST, "let x = 1;"),
             vec![("let", Kind::Keyword), ("1", Kind::Number)],
@@ -723,10 +613,7 @@ mod tests {
         assert!(out[3].is_empty(), "the text after the fence is prose again");
     }
 
-    /// The scanner is total: every input produces runs inside the line and no panic.
-    ///
-    /// **Including the inputs that are not a program.** A highlighter runs over a buffer
-    /// mid-keystroke, so "half of something" is its ordinary input rather than an edge case.
+    /// Every input yields runs inside the line and no panic; a buffer is scanned mid-keystroke.
     #[test]
     fn every_language_survives_garbage_and_stays_inside_the_line() {
         let langs = [PLAIN, NXSH, TOML, RUST, MARKDOWN];
@@ -768,15 +655,10 @@ mod tests {
 
     #[test]
     fn a_language_comes_from_the_extension_and_nothing_else_is_an_error() {
-        // **Which language, not merely that there is one.** A `.toml` read as Markdown colours
-        // nothing and looks exactly like a scanner that never ran, so the mapping is what the
-        // assertion is about.
         for (file, want) in [("build.nx", "nxsh"), ("init.toml", "toml"), ("lib.rs", "rust"), ("README.md", "markdown")]
         {
             assert_eq!(name_of(for_name(file)), want, "{file}");
         }
-        // **`None` is a supported answer**, not a gap: a file this system does not know is
-        // plain text, drawn in one colour.
         assert!(for_name("notes").is_none(), "no extension is plain text");
         assert!(for_name("photo.png").is_none());
         assert!(for_name(".hidden").is_some_and(|_| true) || for_name(".hidden").is_none());

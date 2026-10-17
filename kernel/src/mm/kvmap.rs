@@ -1,32 +1,15 @@
 //! Kernel-half virtual address allocator (the "kernel vmap").
 //!
-//! Hands out virtual address ranges in the kernel-vmap region for
-//! kernel-half mappings the boot path didn't pre-establish: kernel
-//! stacks, future per-CPU data, future driver MMIO. The allocator
-//! itself is just a bump pointer — Phase 1 has 16 TiB to spend and no
-//! workload that approaches it, so a freelist isn't worth the
-//! complexity. The vmap region is laid out by
-//! `docs/architecture/overview.md`.
+//! A bump pointer, never reclaimed, over the vmap region (16 TiB; layout in
+//! `docs/architecture/overview.md`), for kernel-half mappings the boot path did not pre-establish.
 //!
-//! ## Sharing across address spaces
-//!
-//! Vmap mappings must be visible to every address space — a kernel
-//! stack pre-allocated by one AS has to be reachable when the CPU is
-//! running under another. The mechanism is the
-//! [Kernel-half PML4 sharing](../../docs/architecture/memory-management.md#kernel-half-pml4-sharing)
-//! captured in the previous slice item:
-//!
-//! 1. [`init`] runs at boot **before** `init_kernel_template` and
-//!    pre-allocates the top-level intermediate page tables for the
-//!    vmap region via `ArchPaging::ensure_kernel_intermediate`. The
-//!    live PML4 now points at real PDPTs covering the vmap.
-//! 2. `init_kernel_template` snapshots the (now-populated) kernel-half
-//!    PML4 entries into the boot template.
-//! 3. Every `AddressSpace::new` inherits the same PML4 entries, which
-//!    point at the same shared PDPTs. Future `map_page` calls in the
-//!    vmap modify a PD/PT chain that hangs off those shared PDPTs and
-//!    is visible to every AS — no shootdown step, no per-AS
-//!    coordination.
+//! A vmap mapping must be visible under every address space (a stack allocated under one AS is
+//! used while another is loaded), via
+//! [Kernel-half PML4 sharing](../../docs/architecture/memory-management.md#kernel-half-pml4-sharing):
+//! [`init`] runs at boot **before** `init_kernel_template` and pre-allocates the vmap's top-level
+//! intermediate page tables, the template snapshots those PML4 entries, and every
+//! `AddressSpace::new` inherits them. Later `map_page` calls modify a PD/PT chain under the shared
+//! PDPTs, visible to every AS with no shootdown.
 
 use crate::arch::Paging;
 use crate::arch::paging::{ArchPaging, PageFlags};
@@ -34,29 +17,17 @@ use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
 
-/// Inclusive lower bound of the kernel vmap region per
-/// `docs/architecture/overview.md`.
+/// Inclusive lower bound of the kernel vmap region (`docs/architecture/overview.md`).
 pub const KERNEL_VMAP_START: u64 = 0xFFFF_C000_0000_0000;
 /// Exclusive upper bound of the kernel vmap region (16 TiB).
 pub const KERNEL_VMAP_END: u64 = 0xFFFF_D000_0000_0000;
 
-/// Bump-pointer cursor. Grows upward through the vmap region. Holds
-/// the next virtual byte to hand out. Acquired briefly per allocation
-/// and never nested with other locks — sits at lock rank 6d alongside
-/// the allocator leaves.
+/// Bump-pointer cursor: the next virtual byte to hand out. Never nested; lock rank 6d.
 static VMAP_NEXT: SpinLock<u64> = SpinLock::new(LockRank::KernelVmap, KERNEL_VMAP_START);
 
-/// Boot-time setup: pre-allocate kernel-vmap intermediate page tables
-/// in the live PML4 so the kernel template captures their pointers.
-/// After the template snapshot, the same PDPTs are reached from every
-/// AS's PML4 — post-boot leaf installs into vmap propagate without
-/// further coordination.
-///
-/// For Phase 1 this pre-allocates a single PDPT covering the first
-/// 512 GiB of vmap. That's more than the slice needs (a handful of
-/// 16 KiB kernel stacks); if a future allocation crosses the 512 GiB
-/// boundary it must add its PDPT to the live PML4 here, before any AS
-/// exists, to keep the immutable-post-boot rule intact.
+/// Boot-time setup: pre-allocate the vmap's intermediate page tables in the live PML4 so the
+/// kernel template captures them. One PDPT covers the first 512 GiB; crossing that boundary needs
+/// another added here, before any AS exists.
 ///
 /// # Safety
 /// Must be called after `init_memory` (HHDM required to reach the
@@ -76,15 +47,9 @@ pub unsafe fn init() {
     }
 }
 
-/// Reserve `n_pages` consecutive virtual pages in the kernel vmap
-/// region. Returns the starting virtual address (page-aligned).
-///
-/// The returned range is reserved but **not mapped** — the caller is
-/// responsible for installing PTEs into it (or deliberately leaving
-/// pages absent, e.g. for guard pages). Returns [`AllocError`] if the
-/// vmap region cannot satisfy the request (Phase 1: only if the bump
-/// pointer would overflow `KERNEL_VMAP_END`, which won't happen at
-/// realistic workloads).
+/// Reserve `n_pages` consecutive vmap pages; returns the page-aligned start. The range is
+/// **not mapped**: the caller installs PTEs or leaves guard pages absent. [`AllocError`] only if
+/// the bump pointer would overflow `KERNEL_VMAP_END`.
 pub fn vmap_alloc_pages(n_pages: u64) -> Result<VirtAddr, AllocError> {
     let bytes = n_pages.checked_mul(PAGE_SIZE as u64).ok_or(AllocError)?;
     let mut next = VMAP_NEXT.lock();
@@ -97,12 +62,8 @@ pub fn vmap_alloc_pages(n_pages: u64) -> Result<VirtAddr, AllocError> {
     Ok(VirtAddr::new(start))
 }
 
-/// Map `n_pages` of physical MMIO starting at `phys` into a fresh kernel-vmap
-/// range, **uncached** and writable, and return the virtual base. The mapping is
-/// **permanent** (the vmap bump allocator never reclaims VA) — for a device
-/// register window held for the kernel's lifetime (an AHCI ABAR, an xHCI cap
-/// region, …). `phys` should be page-aligned; sub-page offsets are added back by
-/// the caller.
+/// Map `n_pages` of physical MMIO from `phys` into a fresh vmap range, **uncached** and writable.
+/// **Permanent** (VA is never reclaimed). `phys` should be page-aligned.
 ///
 /// # Safety
 /// - `phys .. phys + n_pages*PAGE` must be a real device MMIO range safe to map
@@ -127,14 +88,9 @@ pub unsafe fn map_mmio(phys: PhysAddr, n_pages: u64) -> Result<VirtAddr, AllocEr
     Ok(base)
 }
 
-/// Point a single, already-reserved vmap page at the physical MMIO frame
-/// `phys`, mapped **uncached** and writable, flushing the stale TLB entry.
-///
-/// This is the repointing primitive behind a *reusable* MMIO scan window:
-/// the caller reserves one page once with [`vmap_alloc_pages`] and calls this
-/// per target frame, instead of leaking a fresh vmap reservation per access
-/// (the bump allocator never reclaims VA). `phys` must be page-aligned. The
-/// previous mapping of `virt`, if any, is dropped first.
+/// Point one already-reserved vmap page at the MMIO frame `phys`, **uncached** and writable,
+/// flushing the stale TLB entry: for a reusable scan window reserved once with
+/// [`vmap_alloc_pages`]. `phys` must be page-aligned; the previous mapping of `virt` is dropped.
 ///
 /// # Safety
 /// - `virt` must be a page handed out by [`vmap_alloc_pages`] that the caller
@@ -145,7 +101,6 @@ pub unsafe fn map_mmio(phys: PhysAddr, n_pages: u64) -> Result<VirtAddr, AllocEr
 ///   address space.
 pub unsafe fn remap_mmio_page(virt: VirtAddr, phys: PhysAddr) -> Result<(), AllocError> {
     let root = Paging::active_root();
-    // Drop any prior leaf at `virt` (the first call finds none — ignore that).
     // SAFETY: `virt` is a caller-owned vmap page in the shared kernel half.
     let _ = unsafe { Paging::unmap_page(root, virt) };
     let flags = PageFlags::WRITABLE | PageFlags::NO_CACHE;
@@ -172,9 +127,6 @@ mod tests {
 
     #[test]
     fn back_to_back_allocations_advance_by_at_least_request_size() {
-        // The global cursor is shared across tests, so `b` could be
-        // further along than `a + n*PAGE` if a parallel test slipped
-        // in between — but never closer.
         let pages = 4u64;
         let a = vmap_alloc_pages(pages).unwrap();
         let b = vmap_alloc_pages(1).unwrap();

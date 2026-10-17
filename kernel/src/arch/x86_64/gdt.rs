@@ -1,155 +1,103 @@
-//! The kernel's own Global Descriptor Table, Task State Segment, and the
-//! IST stack the double-fault handler runs on.
+//! The kernel's own GDT, TSS and the IST stacks for `#DF` and NMI.
 //!
-//! Limine hands the kernel a working GDT, but the kernel needs its own:
-//! the IDT's gates must reference a code selector the kernel controls,
-//! and a reliable `#DF` handler needs an Interrupt Stack Table entry —
-//! which lives in a TSS, which needs a TSS descriptor in a GDT the kernel
-//! owns. So the GDT, the TSS, and the IST double-fault stack are brought
-//! up together by [`init`].
+//! **Per-CPU.** Each CPU has its own GDT, TSS and IST stacks ([`GDTS`], [`TSSES`],
+//! [`DF_STACKS`], indexed by [`this_cpu`]), because a TSS holds per-CPU stacks (IST1, IST2 and
+//! RSP0). [`init`] runs once per CPU, the BSP at boot and each AP during bring-up.
 //!
-//! **Per-CPU.** Each CPU has its own GDT, TSS, and `#DF` stack (the [`GDTS`],
-//! [`TSSES`], [`DF_STACKS`] arrays, indexed by [`this_cpu`]), because a TSS holds
-//! per-CPU stacks (IST1 and RSP0). [`init`] runs once per CPU — the BSP at boot,
-//! each AP during its own bring-up — and loads that CPU's tables.
-//!
-//! Layout of each GDT: null, 64-bit kernel code (`0x08`), kernel data (`0x10`),
-//! ring-3 data (`0x18`), ring-3 code (`0x20`), then a 16-byte TSS descriptor
-//! occupying two slots (`0x28`). The user-selector order is fixed by
-//! `syscall`/`sysret` (see [`STAR_VALUE`]).
+//! Layout of each GDT: null, 64-bit kernel code (`0x08`), kernel data (`0x10`), ring-3 data
+//! (`0x18`), ring-3 code (`0x20`), then a 16-byte TSS descriptor in two slots (`0x28`). The
+//! user-selector order is fixed by `syscall`/`sysret` (see [`STAR_VALUE`]).
 
 use core::arch::asm;
 
 use crate::arch::smp::MAX_CPUS;
 use crate::arch::x86_64::regs;
 
-/// Dense index of the running CPU (its per-CPU GDT/TSS slot), read via `RDTSCP`
-/// — the same source as `X86Smp::current_cpu`. Valid from the first instruction
-/// (`IA32_TSC_AUX` resets to 0, so the BSP reads 0 even before `init_this_cpu`);
-/// an AP sets its index (via `init_this_cpu`) *before* calling [`init`].
+/// Dense index of the running CPU (its GDT/TSS slot), read via `RDTSCP`; an AP sets it
+/// *before* calling [`init`].
 fn this_cpu() -> usize {
     let cpu = regs::rdtscp_aux() as usize;
     debug_assert!(cpu < MAX_CPUS, "cpu index out of range");
     cpu
 }
 
-/// Selector for the 64-bit kernel code segment (GDT index 1). The IDT's
-/// gates reference this; see `idt.rs`.
+/// Selector for the 64-bit kernel code segment (GDT index 1), referenced by the IDT's gates.
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
-/// Selector for the kernel data segment (GDT index 2).
 const KERNEL_DATA_SELECTOR: u16 = 0x10;
-/// Selector for the ring-3 data segment (GDT index 3), with RPL 3. Loaded
-/// into SS by `sysretq` (and pushed as SS in the ring-3 `iretq` frame).
+/// Selector for the ring-3 data segment (GDT index 3), with RPL 3; `sysretq` loads it into SS.
 pub const USER_DATA_SELECTOR: u16 = 0x18 | 3;
-/// Selector for the ring-3 64-bit code segment (GDT index 4), with RPL 3.
-/// Loaded into CS by `sysretq` (and pushed as CS in the `iretq` frame).
+/// Selector for the ring-3 64-bit code segment (GDT index 4), with RPL 3; `sysretq` loads it
+/// into CS.
 pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
-/// Selector for the TSS descriptor (GDT index 5, spanning indices 5-6).
 const TSS_SELECTOR: u16 = 0x28;
 
-/// 64-bit kernel code descriptor: present, DPL 0, executable, long-mode.
 const KERNEL_CODE: u64 = 0x00AF_9A00_0000_FFFF;
-/// Kernel data descriptor: present, DPL 0, writable.
 const KERNEL_DATA: u64 = 0x00CF_9200_0000_FFFF;
-/// Ring-3 data descriptor: kernel data with DPL 3 (access `0x92 | 0x60 =
-/// 0xF2`).
+// The ring-3 descriptors are the kernel ones with DPL 3 (access byte `| 0x60`).
 const USER_DATA: u64 = 0x00CF_F200_0000_FFFF;
-/// Ring-3 64-bit code descriptor: kernel code with DPL 3 (access `0x9A |
-/// 0x60 = 0xFA`).
 const USER_CODE: u64 = 0x00AF_FA00_0000_FFFF;
 
 /// The `IA32_STAR` value for `syscall`/`sysretq`.
 ///
-/// - `STAR[47:32]` (the `syscall` base) = `0x08`: `syscall` loads
-///   `CS = 0x08` (kernel code) and `SS = 0x08 + 8 = 0x10` (kernel data).
-/// - `STAR[63:48]` (the `sysret` base) = `0x13` — the user-data selector **minus 8**,
-///   *including its RPL-3 bits*. `sysretq` computes `SS = base + 8 = 0x1B` and
-///   `CS = base + 16 = 0x23`, which is why the GDT places user data at index 3 and
-///   user code at index 4, in that order.
+/// - `STAR[47:32]` (the `syscall` base) = `0x08`: `syscall` loads `CS = 0x08` (kernel code) and
+///   `SS = 0x10` (kernel data).
+/// - `STAR[63:48]` (the `sysret` base) = `0x13`: the user-data selector **minus 8**, *including
+///   its RPL-3 bits*. `sysretq` computes `SS = base + 8 = 0x1B` and `CS = base + 16 = 0x23`,
+///   which is why the GDT places user data at index 3 and user code at index 4, in that order.
 ///
-///   **The RPL bits in the base are load-bearing, and this is vendor-specific.** The
-///   obvious encoding is a base of `0x10` (the bare selectors, `0x18` / `0x20`),
-///   relying on the CPU to force RPL 3 into both. Intel does. **AMD forces RPL 3 into
-///   `CS` only and leaves `SS` as the raw `base + 8`** — so with a `0x10` base,
-///   userspace resumes from every `sysretq` with `SS = 0x18`, i.e. RPL 0. Nothing
-///   notices until the next ring-3 interrupt: the CPU pushes that `SS`, and the entry
-///   stub's `iretq` back to ring 3 raises `#GP(0x18)`, because returning to CPL 3
-///   requires `SS.RPL == CS.RPL == 3`.
-///
-///   Carrying the RPL in the base makes the result correct on both vendors — it is
-///   what Linux does (`MSR_STAR` gets `__USER32_CS`, itself RPL-3-tagged). Diagnosed
-///   from CI: green on Intel runners, `#GP(0x18)` on AMD ones, with the offending
-///   `ss = 0x18` read straight out of the faulting `iretq` frame. See the decision
-///   log, 2026-07-30.
+///   **The RPL bits in the base are load-bearing, and vendor-specific.** With a bare base of
+///   `0x10`, Intel forces RPL 3 into both selectors, but **AMD forces it into `CS` only** and
+///   leaves `SS = 0x18` (RPL 0). The next ring-3 interrupt then pushes that `SS`, and the
+///   `iretq` back to ring 3 raises `#GP(0x18)`, as it requires `SS.RPL == CS.RPL == 3`.
+///   Carrying the RPL in the base is correct on both vendors, as in Linux. See the decision log,
+///   2026-07-30.
 pub const STAR_VALUE: u64 = (0x0013u64 << 48) | (0x0008u64 << 32);
 
-/// GDT slot count: null + kernel code + kernel data + user data + user
-/// code + TSS descriptor (two slots).
 const GDT_LEN: usize = 7;
 
-/// Size of the per-CPU double-fault IST stack.
 const DF_STACK_SIZE: usize = 16 * 1024;
 
-/// One Global Descriptor Table **per CPU**, indexed by [`this_cpu`]; each CPU
-/// loads its own (the TSS descriptor's base is the runtime address of that CPU's
-/// [`TSSES`] slot). Populated by [`init`]. Only slot 0 is live until APs start.
+/// One Global Descriptor Table **per CPU**, indexed by [`this_cpu`]; the TSS descriptor's base is
+/// the address of that CPU's [`TSSES`] slot.
 static mut GDTS: [[u64; GDT_LEN]; MAX_CPUS] = [[0; GDT_LEN]; MAX_CPUS];
 
-/// One 64-bit Task State Segment **per CPU**. Each CPU's `ist[0]` (IST1) points
-/// at its own `#DF` stack, `ist[1]` (IST2) at its own NMI stack, and `rsp[0]` at
-/// its current thread's kernel stack.
+/// One 64-bit Task State Segment **per CPU**: `ist[0]` (IST1) is its `#DF` stack, `ist[1]` (IST2)
+/// its NMI stack, and `rsp[0]` its current thread's kernel stack.
 static mut TSSES: [Tss; MAX_CPUS] = [const { Tss::new(0, 0) }; MAX_CPUS];
 
 /// Backing storage for the per-CPU **NMI** IST stacks.
 ///
-/// NMI needs its own stack for the same reason `#DF` does, and for one more: it can arrive at
-/// a moment when RSP is not a kernel stack at all. `syscall_entry` has a two-instruction
-/// window after `swapgs` where RSP still points at the **user** stack, and an IST=0 gate does
-/// not switch stacks — the CPU would push the interrupt frame there, `#PF` under SMAP, take
-/// that fault on the same bad stack, and `#DF`. The machine would still stop, but it would
-/// print a full and entirely misleading double-fault dump over the real diagnosis, which is
-/// the outcome the `STOPPING` check exists to prevent, through a door that check cannot
-/// cover.
-///
-/// Live since 2026-08-19, when `stop_the_machine` made vector 2 a delivered vector; before
-/// that nothing in the tree sent an NMI.
+/// An NMI can arrive when RSP is the **user** stack (`syscall_entry`'s two-instruction window
+/// after `swapgs`), and an IST=0 gate does not switch stacks: the push would `#PF` under SMAP,
+/// then `#DF` with a misleading dump over the real diagnosis.
 static mut NMI_STACKS: [DfStack; MAX_CPUS] = [const { DfStack([0; DF_STACK_SIZE]) }; MAX_CPUS];
 
-/// Backing storage for the per-CPU double-fault IST stacks. The CPU loads RSP
-/// directly from IST1 on a `#DF`, so 16-byte alignment is baked in.
+/// Backing storage for the per-CPU double-fault IST stacks; the CPU loads RSP directly from IST1.
 static mut DF_STACKS: [DfStack; MAX_CPUS] = [const { DfStack([0; DF_STACK_SIZE]) }; MAX_CPUS];
 
-/// A 16-byte-aligned block of bytes used as an exception stack.
 #[repr(C, align(16))]
 struct DfStack([u8; DF_STACK_SIZE]);
 
 /// The 64-bit Task State Segment, exact hardware layout.
 ///
-/// `#[repr(C, packed)]` is mandatory: the architectural TSS places 64-bit
-/// fields at 4-byte-aligned offsets (a `u32` sits at offset 0), which a
-/// naturally-aligned `#[repr(C)]` would pad and corrupt.
+/// `#[repr(C, packed)]` is mandatory: the TSS places 64-bit fields at 4-byte-aligned offsets.
 #[repr(C, packed)]
 struct Tss {
     reserved0: u32,
-    /// RSP0-2 — privilege-level stacks. Unused until userspace exists.
+    /// RSP0-2: privilege-level stacks; only RSP0 is used.
     rsp: [u64; 3],
     reserved1: u64,
-    /// IST1-7 — interrupt-stack-table entries. Only IST1 is used.
+    /// IST1-7: interrupt-stack-table entries; IST1 (`#DF`) and IST2 (NMI) are used.
     ist: [u64; 7],
     reserved2: u64,
     reserved3: u16,
-    /// Offset of the I/O permission bitmap. Set to the TSS size so the
-    /// CPU treats every port as not-permitted (the kernel never traps on
-    /// it because it runs in ring 0).
+    /// Offset of the I/O permission bitmap: the TSS size, so every port is not-permitted.
     iomap_base: u16,
 }
 
 const _: () = assert!(size_of::<Tss>() == 104);
 
 impl Tss {
-    /// Construct a zeroed TSS whose IST1/IST2 entries are `ist1`/`ist2`. `const` so it
-    /// can initialise the [`TSS`] static; [`init`] rewrites it with the
-    /// real stack address.
     const fn new(ist1: u64, ist2: u64) -> Self {
         Tss {
             reserved0: 0,
@@ -163,17 +111,14 @@ impl Tss {
     }
 }
 
-/// The operand of `lgdt`: table byte-length minus one, then base address.
 #[repr(C, packed)]
 struct GdtPointer {
     limit: u16,
     base: u64,
 }
 
-/// Encode a 64-bit TSS descriptor (a 16-byte system descriptor occupying
-/// two GDT slots) for a TSS at `base` with byte-limit `limit`.
-///
-/// Pure arithmetic, so it is exercised by host tests below.
+/// Encode a 64-bit TSS descriptor (16 bytes, two GDT slots) for a TSS at `base` with byte-limit
+/// `limit`.
 fn tss_descriptor(base: u64, limit: u32) -> [u64; 2] {
     let mut low: u64 = 0;
     low |= (limit as u64) & 0xFFFF; // limit 15:0
@@ -185,12 +130,12 @@ fn tss_descriptor(base: u64, limit: u32) -> [u64; 2] {
     [low, high]
 }
 
-/// Install the kernel's GDT, load the TSS, and switch to kernel
-/// selectors. Call once, early in boot, before [`crate::arch::x86_64::idt::init`].
+/// Install this CPU's GDT, load the TSS, and switch to kernel selectors.
+///
+/// Call once per CPU, before [`crate::arch::x86_64::idt::init`].
 pub fn init() {
     let cpu = this_cpu();
-    // Raw element pointers into this CPU's per-CPU statics — no bounds-check
-    // panic in the boot path, and each CPU touches only its own slots.
+    // Raw element pointers: no bounds-check panic in the boot path.
     // SAFETY: `cpu < MAX_CPUS` (a dense id from `this_cpu`); `add(cpu)` stays in
     // bounds. No references into the `static mut`s are formed.
     let (df_ptr, nmi_ptr, tss_ptr, gdt_ptr) = unsafe {
@@ -202,8 +147,7 @@ pub fn init() {
         )
     };
 
-    // 1. Point IST1 at the top of this CPU's double-fault stack and IST2 at the top of its
-    //    NMI stack (stacks grow down), then write the completed TSS.
+    // IST1 and IST2 at the tops of the `#DF` and NMI stacks (they grow down).
     let df_top = (df_ptr as usize as u64) + DF_STACK_SIZE as u64;
     let nmi_top = (nmi_ptr as usize as u64) + DF_STACK_SIZE as u64;
     let tss = Tss::new(df_top, nmi_top);
@@ -213,11 +157,9 @@ pub fn init() {
         tss_ptr.write(tss);
     }
 
-    // 2. Build this CPU's GDT with a TSS descriptor for the TSS just written.
     let tss_addr = tss_ptr as usize as u64;
     let tss_desc = tss_descriptor(tss_addr, (size_of::<Tss>() - 1) as u32);
-    // Order is fixed by `sysretq`: user data (0x18) then user code (0x20),
-    // with the TSS pushed to 0x28. See `STAR_VALUE`.
+    // Order is fixed by `sysretq`: user data (0x18) then user code (0x20). See `STAR_VALUE`.
     let gdt: [u64; GDT_LEN] = [
         0,
         KERNEL_CODE, // 0x08
@@ -233,7 +175,6 @@ pub fn init() {
         gdt_ptr.write(gdt);
     }
 
-    // 3. Load this CPU's GDT, reload the segment registers, load its TSS.
     let ptr = GdtPointer { limit: (size_of::<[u64; GDT_LEN]>() - 1) as u16, base: gdt_ptr as usize as u64 };
     // SAFETY: `ptr` describes the GDT just populated; the selector constants
     // match the table indices; `TSS_SELECTOR` indexes the TSS descriptor written
@@ -258,8 +199,8 @@ unsafe fn load_gdt(ptr: &GdtPointer) {
     }
 }
 
-/// Reload `CS` (via a far return — `mov cs, ...` is illegal in long mode)
-/// and the data-segment registers to the kernel selectors.
+/// Reload `CS` (via a far return; `mov cs, ...` is illegal in long mode) and the data-segment
+/// registers to the kernel selectors.
 ///
 /// # Safety
 /// A GDT with kernel code at `0x08` and kernel data at `0x10` must be
@@ -300,12 +241,10 @@ unsafe fn load_tss() {
     }
 }
 
-/// Set `TSS.RSP0` — the stack the CPU loads when an interrupt or exception
-/// is taken while running in ring 3. Must be set before any ring-3 entry.
+/// Set `TSS.RSP0`, the stack the CPU loads for an interrupt or exception taken in ring 3.
 ///
-/// Note: the `syscall` instruction does *not* consult RSP0 (it doesn't
-/// switch stacks at all — the syscall entry stub loads the kernel stack
-/// itself via the per-CPU block); RSP0 covers a fault/IRQ taken in ring 3.
+/// Must be set before any ring-3 entry. `syscall` does *not* consult RSP0; the entry stub loads
+/// the kernel stack itself.
 pub fn set_kernel_stack(top: u64) {
     let cpu = this_cpu();
     // SAFETY: writes only the running CPU's TSS slot (`cpu < MAX_CPUS`), which it
@@ -325,7 +264,6 @@ mod tests {
 
     #[test]
     fn tss_descriptor_encodes_base_and_limit() {
-        // Base spread across all four base fields; limit across both.
         let [low, high] = tss_descriptor(0x1234_5678_9ABC_DEF0, 0x6_7104);
 
         assert_eq!(low & 0xFFFF, 0x7104, "limit 15:0");
@@ -345,8 +283,6 @@ mod tests {
 
     #[test]
     fn user_descriptors_are_kernel_descriptors_with_dpl3() {
-        // Same base/limit/flags as the kernel descriptors, access byte
-        // raised to DPL 3 (the `0x60` DPL bits).
         assert_eq!(USER_CODE, KERNEL_CODE | (0x60 << 40), "user code = kcode|DPL3");
         assert_eq!(USER_DATA, KERNEL_DATA | (0x60 << 40), "user data = kdata|DPL3");
         assert_eq!((USER_CODE >> 40) & 0xFF, 0xFA, "user code access byte");
@@ -357,15 +293,10 @@ mod tests {
     fn star_value_yields_the_sysret_and_syscall_selectors() {
         let sysret_base = STAR_VALUE >> 48;
         let syscall_base = (STAR_VALUE >> 32) & 0xFFFF;
-        // syscall: CS = base, SS = base + 8 → kernel code / kernel data.
         assert_eq!(syscall_base, KERNEL_CODE_SELECTOR as u64);
         assert_eq!(syscall_base + 8, KERNEL_DATA_SELECTOR as u64);
-        // sysretq: SS = base + 8, CS = base + 16 → user data / user code
-        // (RPL stripped; the hardware forces RPL 3 on load).
-        // Compared against the **full** selectors, RPL included: the base carries the
-        // RPL-3 bits precisely so `sysretq` yields `0x1B` / `0x23` on AMD as well as
-        // Intel. Masking the RPL off here is what let the original encoding look
-        // correct while `SS` came back RPL 0 on AMD.
+        // Compared against the **full** selectors, RPL included: masking the RPL off would hide
+        // an `SS` that comes back RPL 0 on AMD.
         assert_eq!(sysret_base + 8, USER_DATA_SELECTOR as u64);
         assert_eq!(sysret_base + 16, USER_CODE_SELECTOR as u64);
     }

@@ -88,7 +88,7 @@ impl<M: CanWrite> Handle<Resource, M> {
 
 impl<M: CanLookup> Handle<Namespace, M> {
     /// Resolve `path` to a handle, granting it `rights`. The resolved object's type
-    /// is asserted by the caller via the `T2`/`M2` type arguments.
+    /// is asserted by the caller via `T2`/`M2`.
     ///
     /// # Safety
     /// The caller asserts the resolved object is of type `T2` with mode `M2` (the same
@@ -98,8 +98,7 @@ impl<M: CanLookup> Handle<Namespace, M> {
         if po < 0 {
             return Err(Error::from_status(po as i32));
         }
-        // The lookup completes through the PO; its `result` is the resolved handle
-        // (or the completion carries a `NotFound`-style status).
+        // The PO's `result` is the resolved handle.
         let done = Op::from_po(po as u64).await?;
         // SAFETY: forwarded from the caller's type assertion; `result` is the handle
         // the kernel resolved and installed into our table.
@@ -122,8 +121,8 @@ impl<M: CanLookup> Handle<Namespace, M> {
 
 impl Handle<Notify, Only> {
     /// Dequeue one notification into `out`. `Ok(true)` if one was written, `Ok(false)`
-    /// if the queue is empty. Block first by `sys_wait`-ing on this handle (the queue
-    /// is waitable) — a libos async `next()` is a later addition.
+    /// if the queue is empty. To block, `sys_wait` on this handle first (the queue is
+    /// waitable).
     pub fn recv(&self, out: &mut Notification) -> Result<bool> {
         let r = sys::notif_recv(self.raw().0, out as *mut Notification as u64);
         if r < 0 {
@@ -250,7 +249,6 @@ mod tests {
     #[test]
     fn lookup_resolves_to_a_typed_handle() {
         sys::reset();
-        // The lookup PO completes with `result` = the resolved handle (777).
         sys::script_next(0, 777, false);
         // SAFETY: the mock kernel accepts any raw handle, and no real object stands behind this one.
         let ns = unsafe { Handle::<Namespace, crate::handle::NsReadOnly>::from_raw(RawHandle(1), Rights::LOOKUP) };

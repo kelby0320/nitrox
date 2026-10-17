@@ -6,25 +6,19 @@ use core::ops::Deref;
 use crate::libkern::AllocError;
 use crate::libkern::KVec;
 
-/// A fallible, growable, heap-backed UTF-8 string — the kernel's
-/// analogue of `alloc::string::String`.
+/// A fallible, growable, heap-backed UTF-8 string — the kernel's analogue of
+/// `alloc::string::String`.
 ///
-/// `KString` is a thin wrapper over [`KVec<u8>`] whose contents are
-/// guaranteed to be valid UTF-8 at all times: every mutator accepts only
-/// `&str` input. Growth is fallible, so the kernel uses `KString` in
-/// place of `alloc`'s `String` — see the decision log entry of
-/// 2026-05-20.
-///
-/// Pair it with [`kformat!`] for `format!`-style construction that
-/// reports allocation failure instead of aborting.
+/// A thin wrapper over [`KVec<u8>`] whose contents are valid UTF-8 at all times: every
+/// mutator accepts only `&str`. Pair it with [`kformat!`] for `format!`-style construction
+/// that reports allocation failure instead of aborting.
 pub struct KString {
     /// Backing bytes. Always well-formed UTF-8.
     buf: KVec<u8>,
 }
 
 impl KString {
-    /// Create an empty string. No allocation happens until the first
-    /// push, so this is usable in `const` context.
+    /// Create an empty string; usable in `const` context.
     pub const fn new() -> Self {
         KString { buf: KVec::new() }
     }
@@ -84,9 +78,8 @@ impl Default for KString {
     }
 }
 
-/// Appends formatted output. `write_str` fails with [`fmt::Error`] when
-/// the backing [`KVec`] cannot grow; [`kformat!`] turns that back into an
-/// [`AllocError`].
+/// Appends formatted output. `write_str` fails with [`fmt::Error`] when the backing
+/// [`KVec`] cannot grow; [`kformat!`] turns that back into an [`AllocError`].
 impl fmt::Write for KString {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.try_push_str(s).map_err(|_| fmt::Error)
@@ -105,9 +98,8 @@ impl fmt::Debug for KString {
     }
 }
 
-/// `format!` for the kernel: build a [`KString`] from format arguments,
-/// reporting heap exhaustion as `Err(`[`AllocError`]`)` instead of
-/// aborting.
+/// `format!` for the kernel: build a [`KString`] from format arguments, reporting heap
+/// exhaustion as `Err(`[`AllocError`]`)` instead of aborting.
 ///
 /// ```ignore
 /// let msg = kformat!("fault at {:#x}, thread {}", addr, tid)?;

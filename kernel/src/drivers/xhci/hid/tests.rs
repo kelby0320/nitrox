@@ -4,10 +4,9 @@ use crate::mm::PAGE_SIZE;
 use crate::mm::test_support::init_global_heap;
 use crate::object::{MemoryObject, PendingOperation};
 
-/// **Only a stall leaves the default endpoint to be asked again** (PR #358 review): a stall is
-/// the request's answer, and every other failure may have left the request on the ring — a
-/// transaction error (4) and babble (3) halt the endpoint mid-transfer, and a timeout says
-/// nothing at all.
+/// **Only a stall leaves the default endpoint to be asked again**: a stall is the request's
+/// answer, and every other failure may have left the request on the ring — a transaction error (4)
+/// and babble (3) halt the endpoint mid-transfer, and a timeout says nothing at all.
 #[test]
 fn only_a_stall_leaves_the_default_endpoint_to_ask_again() {
     assert!(!in_doubt(&Failed::Code(code::STALL)));
@@ -32,8 +31,8 @@ fn the_lights_request_is_an_output_report_to_its_interface() {
     assert_eq!(u16::from_le_bytes([r[6], r[7]]), 1, "one byte");
     assert_eq!(lights_data(None, 0b101), ([0b101, 0], 1), "the lights alone");
 
-    // A keyboard whose lights are report 1, as a Corsair K70's are in report protocol (Part
-    // B.7): the ID in `wValue`'s low byte, and first in a two-byte data stage.
+    // A keyboard whose lights are report 1, as a Corsair K70's are in report protocol: the ID in
+    // `wValue`'s low byte, and first in a two-byte data stage.
     let r = set_lights_request(0, Some(1));
     let w_value = u16::from_le_bytes([r[2], r[3]]);
     assert_eq!((w_value >> 8, w_value & 0xFF), (2, 1), "an Output report, ID 1");
@@ -41,10 +40,10 @@ fn the_lights_request_is_an_output_report_to_its_interface() {
     assert_eq!(lights_data(Some(1), 0b010), ([1, 0b010], 2));
 }
 
-/// **Every batch of a change is delivered** (Part B.7): a bitmap keyboard pressing fifty keys
-/// and every modifier in one report gives three batches, each ending in its `SYN` — every key
-/// pressed, once — and the keys it holds after are the report's; a departure lets them all go
-/// the same way. A step that finds its device gone ends it, having delivered what came before.
+/// **Every batch of a change is delivered**: a bitmap keyboard pressing fifty keys and every
+/// modifier in one report gives three batches, each ending in its `SYN`, and a departure lets
+/// them all go the same way. A step that finds its device gone ends it, having delivered what
+/// came before.
 #[test]
 fn every_batch_of_a_change_is_delivered() {
     use crate::drivers::hid::keyboard::{Bits, Held, Layout};
@@ -96,10 +95,9 @@ fn every_batch_of_a_change_is_delivered() {
     assert_eq!((steps, delivered), (2, 21), "the first batch, and then the device was gone");
 }
 
-/// **A bind's line says how its descriptor went** (Part B.7): its protocol, the try a descriptor
-/// read on when it took more than one, and in boot protocol why — none, every try stalled, or
-/// one not read, with its length and first bytes. What the laptop's kernel log is read for when a
-/// keyboard types the wrong keys.
+/// **A bind's line says how its descriptor went**: its protocol, the try a descriptor read on when
+/// it took more than one, and in boot protocol why. What the laptop's kernel log is read for when
+/// a keyboard types the wrong keys.
 #[test]
 fn a_bind_line_says_how_its_descriptor_went() {
     let said = |d: Described| std::format!("{}", Said(&d));
@@ -142,8 +140,8 @@ fn a_bind_line_says_how_its_descriptor_went() {
     );
 }
 
-/// **A new node takes a slot no node has had, then one whose device has departed** (Phase 6 Part
-/// C), and none while every slot is bound: sixteen bound devices, not sixteen ever attached.
+/// **A new node takes a slot no node has had, then one whose device has departed**, and none while
+/// every slot is bound: sixteen bound devices, not sixteen ever attached.
 #[test]
 fn a_new_node_takes_a_free_slot_then_a_retired_one() {
     let mut states = [BOUND; MAX_NODES];
@@ -155,8 +153,8 @@ fn a_new_node_takes_a_free_slot_then_a_retired_one() {
     assert_eq!(choose(&[FREE; MAX_NODES]), Some(0));
 }
 
-/// **A context names its slot and the epoch it was made in** (Phase 6 Part C), so a node made
-/// before its slot was reused is told apart from the one after: same slot, another epoch.
+/// **A context names its slot and the epoch it was made in**, so a node made before its slot was
+/// reused is told apart from the one after.
 #[test]
 fn a_node_read_waits_out_the_delivery_before_it() {
     init_global_heap();
@@ -185,9 +183,9 @@ fn a_context_carries_its_slot_and_epoch() {
 }
 
 /// **A slot taken, retired and taken by another device serves the node it had before nothing of
-/// the new one** (PR #361 review): `take` bumps the epoch, replaces the reader and completes a
-/// lights write left waiting, and `read` and `write` refuse a node from an earlier epoch. No boot
-/// reaches it — a slot is reused only once all sixteen are bound — so this is its guard.
+/// the new one**: `take` bumps the epoch, replaces the reader and completes a lights write left
+/// waiting, and `read` and `write` refuse a node from an earlier epoch. No boot reaches it — a slot
+/// is reused only once all sixteen are bound — so this is its guard.
 #[test]
 fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     init_global_heap();
@@ -232,9 +230,9 @@ fn a_reused_slot_serves_its_old_node_nothing_of_the_new_device() {
     assert!(!nodes.current(context(MAX_NODES + 1, 0)), "no such slot");
 }
 
-/// **A report the DPC pushes after its device departed is dropped** (PR #361 review), under the
-/// node's lock: once the node has retired, so its releases stay the last thing its ring holds, and
-/// once the slot is another device's, whose ring it is not.
+/// **A report the DPC pushes after its device departed is dropped**, under the node's lock: once
+/// the node has retired, so its releases stay the last thing its ring holds, and once the slot is
+/// another device's, whose ring it is not.
 #[test]
 fn a_report_pushed_after_its_device_departed_is_dropped() {
     init_global_heap();

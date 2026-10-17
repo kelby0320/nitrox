@@ -1,5 +1,5 @@
 //! `restart-probe` — a server that can be made to exit, for proving that a restarted server is
-//! reached again at its path (administration Part E.1).
+//! reached again at its path.
 //!
 //! **A test image only.** Declared with `endpoint = "/svc/restart-probe"` and `policy = "always"`,
 //! so `service-mgr` binds it through its registry and brings it back after it exits. A resolve of:

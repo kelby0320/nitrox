@@ -1,23 +1,21 @@
-//! **Partitioning and formatting, decided** (Phase 6 Part G.4): everything `disk --partition` and
+//! **Partitioning and formatting, decided**: everything `disk --partition` and
 //! `disk --format` decide before they write a byte — whether the target may be written at all,
 //! which table, where its one partition goes, what is wiped, and the filesystem's label — from the
 //! device's row in `/dev/devices` and the person's words. The binary writes; this decides, so each
 //! refusal comes **before anything is written** and is a host test.
 //!
 //! - **The disk the machine started from is refused**, the target or its disk, by its `boot` flag:
-//!   the `disks` grant withholds that disk and not its partitions (PR #368 review).
-//! - **A disk must be removable** to be partitioned, or formatted whole: an internal disk is
-//!   partitioned by `nxinstall`, which reboots after, since only a USB disk's table is read again.
-//!   A partition of an internal disk may be formatted. **Nothing on a RAM disk is**: it is a
-//!   module the bootloader loaded — the live root, or the installer's pristine copy (PR #369
-//!   review).
+//!   the `disks` grant withholds that disk and not its partitions.
+//! - **A disk must be removable** to be partitioned, or formatted whole: `nxinstall` partitions an
+//!   internal disk and reboots, since only a USB disk's table is read again. A partition of an
+//!   internal disk may be formatted. **Nothing on a RAM disk is**: it is a module the bootloader
+//!   loaded — the live root, or the installer's pristine copy.
 //! - **The table follows the filesystem**: an MBR for FAT, which every camera and television
-//!   reads, and a GPT for ext4; **a GPT for either from 2 TiB**, where an MBR cannot count, and
-//!   `--mbr` there is refused, naming `--gpt` (PR #368 review). `--partition` alone types its
-//!   partition for FAT, the default filesystem.
+//!   reads, and a GPT for ext4; **a GPT for either from 2 TiB**, where `--mbr` is refused, naming
+//!   `--gpt`. `--partition` alone types its partition for FAT.
 //! - **One partition, from 1 MiB** to the end of the disk — a GPT's to before its backup.
-//! - **The first two mebibytes and the last are wiped** before a table is written: the old table's,
-//!   an old filesystem at 1 MiB, and an old GPT's backup (PR #368 review).
+//! - **The first two mebibytes and the last are wiped** before a table is written: the old
+//!   table, an old filesystem at 1 MiB, and an old GPT's backup.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -85,6 +83,7 @@ pub enum Kind {
 pub struct Target {
     /// `blk-<n>`.
     pub name: String,
+    /// Whole disk, partition or RAM disk.
     pub kind: Kind,
     /// Its length in sectors.
     pub sectors: u64,
@@ -230,7 +229,7 @@ pub fn wipes(sectors: u64) -> [(u64, u64); 2] {
     [(0, front), (bytes - back, back)]
 }
 
-/// **What the storage service can name a mount by** (PR #369 review): a label beginning with `.` or
+/// **What the storage service can name a mount by**: a label beginning with `.` or
 /// a space, or ending with a space, would be passed over for a fallback name, so it is refused here,
 /// before anything is written, rather than met as a surprise in `/storage`. Its rule is
 /// `storage_service::labels::valid`; an empty label is none, and named by the partition.

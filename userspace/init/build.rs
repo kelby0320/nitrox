@@ -1,12 +1,6 @@
-//! Pass the absolute path to `user.ld` as a `-T` link arg. Cargo runs the linker
-//! from the target directory, so a relative path in `.cargo/config.toml` would not
-//! resolve — this mirrors `kernel/build.rs`.
-//!
-//! Unlike the other userspace bins, init is also a **library** with host unit
-//! tests (`cargo test -p init --lib`). The fixed-address bare-target script must
-//! NOT reach that host link (it corrupts it — the linker segfaults), so we use
-//! `rustc-link-arg-bins`, which applies only to the `[[bin]]`, never to the lib
-//! test binary.
+//! Pass the absolute path to `user.ld` as a `-T` link arg, as cargo runs the linker from the target
+//! directory; `rustc-link-arg-bins` keeps the fixed-address script off init's host-test link, which
+//! it corrupts.
 
 use std::env;
 use std::path::PathBuf;

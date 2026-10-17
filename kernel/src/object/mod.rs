@@ -15,10 +15,6 @@
 //! refcount holder that `HandleTable::lookup` hands back; dropping it
 //! releases the reference and, on the last one, runs the concrete
 //! destructor.
-//!
-//! This slice implements the substrate plus the first two concrete
-//! objects, [`Process`] and [`Thread`]. The remaining object types land
-//! behind their respective Phase 1 slices.
 
 pub mod device_node;
 pub mod entropy_object;

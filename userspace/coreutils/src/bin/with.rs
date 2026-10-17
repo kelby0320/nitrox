@@ -1,32 +1,23 @@
 //! `with` — run a program in a **view**: this session's namespace plus what the view grants, when
-//! `/system/views.toml` says the person asking may (`docs/planning/administration.md` § Part A).
+//! `/system/views.toml` says the person asking may.
 //!
-//! ```text
-//! with admin disk --mount /dev/blk/1     # mount a disk, through the view's storage grant
-//! with --list                            # the views you may use
-//! with --check policy.toml               # whether a file is a valid policy
-//! with admin with --show ./views.toml    # a copy of the policy to edit (the `views` grant)
-//! with admin with --install ./views.toml # install an edited copy (the `views` grant)
-//! ```
-//!
-//! **The policy is changed by `--show` and `--install`** (administration Part D.2), not edited in
-//! place: `--show FILE` writes a copy, any editor changes it, and `--install FILE` has the broker
-//! check it — it must read, and an account that exists must still be able to administer — and
-//! replace the policy atomically. Both reach the broker through `/dev/policy`, which only a view
+//! **The policy is changed by `--show` and `--install`**, not edited in place: `--show FILE`
+//! writes a copy, any editor changes it, and `--install FILE` has the broker check it — it must
+//! read, and an account that exists must still be able to administer — and replace the policy
+//! atomically. Both reach the broker through `/dev/policy`, which only a view
 //! with the `views` grant binds, so outside one they say which view to use.
 //!
 //! **What `with` never gets is the authority.** It sends the view broker a *copy* of its own
-//! namespace (`sys_ns_derive`), the broker copies that again and builds the view there, and the
-//! program runs in a namespace `with` holds no handle to. `with` relays: the program's streams are
-//! its own, moved to the program, and what comes back is an exit status.
+//! namespace (`sys_ns_derive`); the broker builds the view there, and the program runs in a
+//! namespace `with` holds no handle to. `with` relays: its streams move to the program, and what
+//! comes back is an exit status.
 //!
 //! **It reads the password, not the broker** — on the terminal its shell handed it, echo off, with
-//! `libprompt`, which `account` shares. The broker holds each check for the session's delay
-//! after a wrong one, and ends a request after three.
+//! `libprompt`. The broker holds each check for the session's delay after a wrong one, and ends
+//! a request after three.
 //!
-//! **The request itself is `libviews`'** (administration Part F.3): the desktop's Restart and Shut
-//! down make the same one, for `shutdown` in the `power` view. What is `with`'s is the prompt, the
-//! relay, and the policy's `--show` and `--install`.
+//! **The request itself is `libviews`'**: the desktop's Restart and Shut down make the same one,
+//! for `shutdown` in the `power` view. `with`'s own are the prompt, the relay and the policy.
 
 #![no_std]
 #![no_main]
@@ -85,8 +76,7 @@ const TRIES: u8 = 3;
 
 static mut NOTIF: Notification = Notification::zeroed();
 
-/// When a token from this terminal stops being worth waiting for: two seconds from now. The terminal
-/// server answers from a table; this only bounds a terminal handle that is not one.
+/// When a token from this terminal stops being worth waiting for: two seconds from now.
 fn token_deadline() -> u64 {
     let mut ns: u64 = 0;
     // SAFETY: a valid writable `u64` out-param.
@@ -100,7 +90,6 @@ fn dup(h: u64) -> u64 {
     if d > 0 { d as u64 } else { 0 }
 }
 
-/// The view broker, through this session's `/dev/views`.
 fn broker(stage: &Stage) -> u64 {
     let ch = libviews::broker(stage.namespace);
     if ch == 0 {
@@ -109,12 +98,10 @@ fn broker(stage: &Stage) -> u64 {
     ch
 }
 
-/// Say `what` on `stderr` as an error, behind `with: `.
 fn say(stage: &Stage, what: &str) {
     say_at(stage, Level::Error, what);
 }
 
-/// Say `what` on `stderr` at `level`, behind `with: `.
 fn say_at(stage: &Stage, level: Level, what: &str) {
     let mut line = String::from("with: ");
     line.push_str(what);
@@ -155,7 +142,6 @@ fn forget(stage: &Stage) -> ! {
     }
 }
 
-/// `with --list`: the views this session's person may use, as `Table<{view, run, password}>`.
 fn list(stage: &Stage) -> ! {
     let ch = broker(stage);
     let rows = match libviews::list(ch, u64::MAX) {
@@ -199,7 +185,6 @@ fn list(stage: &Stage) -> ! {
     exit(EXIT_OK)
 }
 
-/// `with --check FILE`: whether FILE is a policy the broker would accept.
 fn check(stage: &Stage, file: &str) -> ! {
     let path = stage.path(file.as_bytes());
     let Ok(text) = libfs::read_file(stage.namespace, &path) else {
@@ -262,7 +247,6 @@ fn show(stage: &Stage, file: Option<&str>) -> ! {
     exit(EXIT_OK)
 }
 
-/// `with --install FILE`: check FILE and install it as the policy, through the broker.
 fn install(stage: &Stage, file: &str) -> ! {
     let path = stage.path(file.as_bytes());
     let Ok(text) = libfs::read_file(stage.namespace, &path) else {
@@ -285,7 +269,6 @@ fn install(stage: &Stage, file: &str) -> ! {
     exit(if o == Outcome::Started { EXIT_OK } else { EXIT_FAILURE })
 }
 
-/// `with VIEW PROGRAM ARGS…`: ask, prove, relay.
 fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
     let ch = broker(stage);
     // **A copy of this namespace, not this namespace** — the one a process is spawned with cannot
@@ -304,9 +287,7 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
     let stderr = stage.streams.stderr.map(dup).filter(|&d| d != 0);
     if stage.streams.stderr.is_some() && stderr.is_none() {
         // **Said, not degraded quietly**, as `nxsh` says it of a stage: a program with no `stderr`
-        // writes to the kernel log, which on a machine with no serial port reaches nobody. Until
-        // the shell gave its stages `DUPLICATE` this was every program `with` ran, and the first
-        // install from a view printed nothing after the password (2026-09-30).
+        // writes to the kernel log, which on a machine with no serial port reaches nobody.
         let why = alloc::format!("`{program}` gets no diagnostic channel; its messages go to the kernel log");
         say_at(stage, Level::Warning, &why);
     }
@@ -336,10 +317,8 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
         }
         tries += 1;
         // **Why the last one was refused goes on the terminal, in the same write as the next
-        // prompt.** Sent to `stderr` it reached the screen whenever the shell next drained that
-        // sink — which could be after the prompt, so a person saw the second prompt and then
-        // "wrong password" under it, and `test-interactive` scanned past the prompt it was about
-        // to wait for. One channel, one write: the order is the order it was written in.
+        // prompt.** On `stderr` it could reach the screen after the prompt, and `test-interactive`
+        // scanned past the prompt it was about to wait for.
         let mut prompt = String::new();
         if o == (Outcome::Denied { retry: true }) {
             prompt.push_str("with: ");
@@ -363,12 +342,10 @@ fn run(stage: &Stage, view: &str, program: &str, args: &[&str]) -> ! {
         say(stage, &why);
         exit(EXIT_FAILURE);
     }
-    // The program has the terminal now; `with` asks nothing more.
     close(term);
     wait_for_exit(stage, ch)
 }
 
-/// Relay the program's exit status, and pass a request to stop on to it.
 fn wait_for_exit(stage: &Stage, ch: u64) -> ! {
     let mut asked = false;
     loop {

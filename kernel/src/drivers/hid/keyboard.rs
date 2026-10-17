@@ -1,14 +1,14 @@
-//! **A HID keyboard's report as key presses and releases** (Phase 6 Parts B.2 and B.7), by a
-//! [`Layout`]: where its report keeps its modifiers and its keys.
+//! **A HID keyboard's report as key presses and releases**, by a [`Layout`]: where its report keeps
+//! its modifiers and its keys.
 //!
 //! A boot-protocol keyboard has one layout, [`Layout::BOOT`] (HID 1.11 Appendix B.1): a modifier
 //! bitmap, a reserved byte, and up to six key usages from the Keyboard/Keypad page (0x07), in no
-//! order. **A keyboard in report protocol has the layout its report descriptor gives** (B.7): the
-//! same array, or **a bitmap** with a bit for each key, which is how a keyboard that reports every
-//! key held at once says it — a Corsair K70's, whose boot interface sends its bitmap whatever
-//! protocol it is asked for. Either way a report is the keyboard's **whole state**: it is read into
-//! the set of usages held, and decoded against the set before — what left was released, what joined
-//! was pressed.
+//! order. **A keyboard in report protocol has the layout its report descriptor gives**: the same
+//! array, or **a bitmap** with a bit for each key, which is how a keyboard that reports every key
+//! held at once says it — a Corsair K70's, whose boot interface sends its bitmap whatever protocol
+//! it is asked for. Either way a report is the keyboard's **whole state**: it is read into the set
+//! of usages held, and decoded against the set before — what left was released, what joined was
+//! pressed.
 
 use super::mouse::Field;
 use crate::libkern::input::{InputEvent, KEY_PRESS, KEY_RELEASE};
@@ -201,10 +201,9 @@ pub fn decode(
     Some(change(held, &now, time_ns, out))
 }
 
-/// **What a keyboard held, let go** (Phase 6 Part C): its keys released, then its modifiers, then
-/// `SYN_REPORT` — `held` decoded against a report holding nothing, in batches as [`decode`]'s are.
-/// What its driver delivers when it departs, so that no key stays down and no repeat runs on.
-/// Nothing when nothing was held.
+/// **What a keyboard held, let go**: its keys released, then its modifiers, then `SYN_REPORT` —
+/// `held` decoded against a report holding nothing, in batches as [`decode`]'s are. What its
+/// driver delivers when it departs, so that no key stays down and no repeat runs on.
 pub fn release_all(held: &mut Held, time_ns: u64, out: &mut [InputEvent; EVENTS_MAX]) -> (usize, bool) {
     change(held, &Held::NONE, time_ns, out)
 }
@@ -279,8 +278,7 @@ mod tests {
         (EV_KEY, code, KEY_RELEASE)
     }
 
-    /// **The usages the system's own keys name map to its keycodes**: the letters, the digits, the
-    /// keys around them, the arrows, the lock keys and the keypad.
+    /// **The usages the system's own keys name map to its keycodes.**
     #[test]
     fn usages_are_evdev_keycodes() {
         assert_eq!(keycode(0x04), Some(30), "a is KEY_A");
@@ -315,8 +313,7 @@ mod tests {
         assert_eq!(MODIFIERS[4..], right);
     }
 
-    /// **No usage is a key it should not be**: 0x00–0x03 are none of them, past the table is
-    /// nothing, and every keycode the table gives is inside evdev's key range, below the buttons.
+    /// **No usage is a key it should not be**; every keycode the table gives is below the buttons.
     #[test]
     fn non_keys_and_unknown_usages_have_no_keycode() {
         for u in 0..=3 {
@@ -338,8 +335,7 @@ mod tests {
         assert_eq!(run(a, NONE), Some(vec![release(30), SYN]));
     }
 
-    /// **Releases before presses**, so a key that left and one that came in the same report do not
-    /// overlap; and a key that only moved slots is neither.
+    /// **Releases before presses**; a key that only moved slots is neither.
     #[test]
     fn releases_come_before_presses_and_a_moved_key_is_still_down() {
         let ab = [0, 0, 0x04, 0x05, 0, 0, 0, 0];
@@ -349,8 +345,7 @@ mod tests {
         assert_eq!(run(ab, ba), Some(vec![]), "the same keys in another order");
     }
 
-    /// **A modifier is a bit**, pressed before a key in the same report so the key is shifted, and
-    /// released after the keys that leave with it.
+    /// **A modifier is a bit**, pressed before a key in the same report and released after it.
     #[test]
     fn modifiers_press_first_and_release_last() {
         let shift_a = [0x02, 0, 0x04, 0, 0, 0, 0, 0];
@@ -383,8 +378,7 @@ mod tests {
         assert_eq!(decode(&Layout::BOOT, &mut Held::NONE.clone(), &[0, 0, 0x04], 0, &mut out), None);
     }
 
-    /// **The worst case fits**: every modifier and six keys released, the rest pressed, in one
-    /// report.
+    /// **The worst case fits**: every modifier and six keys released, the rest pressed.
     #[test]
     fn the_worst_report_fits_its_buffer() {
         let before = [0xFF, 0, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
@@ -398,9 +392,7 @@ mod tests {
         assert_eq!(run(after, mods_on).unwrap().len(), 6 + 8 + 1);
     }
 
-    /// **A departing keyboard lets go of everything** (Phase 6 Part C): its keys, then its
-    /// modifiers, then `SYN_REPORT`, so a key held when it is unplugged is released, Shift last, and
-    /// nothing at all when nothing was held.
+    /// **A departing keyboard lets go of everything**, Shift last; nothing when nothing was held.
     #[test]
     fn a_departing_keyboard_releases_its_keys_then_its_modifiers() {
         let mut held = Layout::BOOT.read(&[0x02, 0, 0x04, 0x05, 0, 0, 0, 0]).unwrap(); // Left Shift, `a` and `b`
@@ -442,8 +434,7 @@ mod tests {
         r
     }
 
-    /// **A bitmap reads as the keys its bits name**, Shift before the key pressed with it and after
-    /// the key released before it, as a boot report's array does.
+    /// **A bitmap reads as the keys its bits name**, ordered as a boot report's array is.
     #[test]
     fn a_bitmap_report_reads_as_its_keys() {
         let mut held = Held::NONE;
@@ -460,7 +451,7 @@ mod tests {
     }
 
     /// **Another report's ID is not this one**: the K70 sends its media keys and a mouse on the same
-    /// endpoint, as reports 2 and 5. Not kept, and the keys held stay held.
+    /// endpoint, as reports 2 and 5.
     #[test]
     fn a_report_with_another_id_is_not_kept() {
         let mut held = Held::NONE;
@@ -475,9 +466,8 @@ mod tests {
         assert_eq!(run_all(&BITMAP, &mut held, &rollover), None, "ErrorRollOver's bit");
     }
 
-    /// **A change larger than one batch is given in batches**, each within `EVENTS_MAX` and ending in
-    /// its `SYN`, every key pressed once and in order, and the keys held after as the report says —
-    /// and a departure lets them all go, in batches too.
+    /// **A change larger than one batch is given in batches**, each ending in its `SYN`, every key
+    /// pressed once and in order; a departure lets them all go, in batches too.
     #[test]
     fn a_large_change_is_given_in_batches() {
         let usages: Vec<u8> = (0x04..0x04 + 50).collect();
@@ -506,8 +496,7 @@ mod tests {
         assert_eq!((released, held), (58, Held::NONE));
     }
 
-    /// **An array's slots hold usages counted from its logical minimum**, and a value below it is no
-    /// key: an array of 16-bit slots from usage 0x04, its values from 1.
+    /// **An array's slots hold usages counted from its logical minimum**; below it is no key.
     #[test]
     fn an_array_counts_its_usages_from_its_logical_minimum() {
         let layout = Layout {

@@ -1,38 +1,19 @@
-//! The [`IpcChannel`] kernel object — one **endpoint** of a bidirectional IPC
-//! channel.
+//! The [`IpcChannel`] kernel object — one **endpoint** of a bidirectional IPC channel.
 //!
-//! A channel is a **pair** of `IpcChannel` endpoint objects (both
-//! [`KObjectType::IpcChannel`]), each owning its own receive ring and
-//! recv-waiter list, linked by a mutual raw `peer` pointer. A send on one
-//! endpoint pushes into the *peer*'s receive ring; a recv drains the endpoint's
-//! *own* ring. (`docs/spec/ipc-message-format.md` describes "two endpoint
-//! handles, separate queues per direction" — this is that, with one kobject per
-//! endpoint. A single shared object can't be used because a handle→object
-//! pointer carries no per-handle tag to tell the two ends apart for the
-//! asymmetric routing.)
+//! A channel is a **pair** of endpoint objects, each with its own receive ring and recv-waiter
+//! list, linked by a mutual raw `peer` pointer: a send pushes into the *peer's* ring, a recv
+//! drains the endpoint's *own*. See `docs/spec/ipc-message-format.md`.
 //!
-//! ## Mutation discipline
+//! All interior state lives in an [`UnsafeCell`] touched **only while the rank-1 `SCHED` lock
+//! is held** (see `kernel/docs/lock-ordering.md`); the `pub(crate) unsafe fn` accessors take a
+//! type-erased `*mut ()`, so no aliasing `&mut IpcChannel` is formed.
 //!
-//! Exactly like [`Timer`](crate::object::Timer) /
-//! [`NotificationChannel`](crate::object::NotificationChannel): all interior
-//! state lives in an [`UnsafeCell`] touched **only while the rank-1 `SCHED`
-//! lock is held** (single-CPU serialisation; see `kernel/docs/lock-ordering.md`).
-//! The `pub(crate) unsafe fn` accessors take a type-erased `*mut ()` and reach
-//! the interior through that cell — no aliasing `&mut IpcChannel` is formed.
-//!
-//! ## Dead-peer / close
-//!
-//! When an endpoint's last handle closes, its refcount hits zero and
-//! [`IpcChannel::drop`] runs [`crate::sched::ipc_endpoint_closing`]: under
-//! `SCHED` it nulls the *surviving* peer's `peer` pointer and wakes the peer's
-//! blocked receivers (so they observe `PeerClosed`). The survivor is alive
-//! (pinned by its own handle / a waiter's `ObjectRef`); the second endpoint to
-//! drop reads its own `peer` as already-null and skips — no use-after-free, safe
-//! under single-CPU `SCHED` serialisation.
-//!
-//! **Invariant:** `IpcChannel` endpoint references are released only in
-//! syscall/boot context (handle close, the `sys_wait`/lookup `ObjectRef`s),
-//! **never under `SCHED`** — so `drop` may itself take `SCHED`.
+//! When an endpoint's last handle closes, [`IpcChannel::drop`] runs
+//! [`crate::sched::ipc_endpoint_closing`]: under `SCHED` it nulls the *surviving* peer's `peer`
+//! pointer and wakes its blocked receivers (they observe `PeerClosed`). The survivor is alive
+//! (pinned by its handle or a waiter); the second endpoint to drop reads its own `peer` as
+//! already-null and skips. **Invariant:** endpoint references are released only in
+//! syscall/boot context, **never under `SCHED`**, so `drop` may itself take `SCHED`.
 
 use core::cell::UnsafeCell;
 
@@ -42,10 +23,8 @@ use crate::libkern::{AllocError, KBox, KVec};
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
 
-/// A queued message in kernel storage: the byte-identical, natural-alignment
-/// twin of [`IpcMsg`](crate::libkern::IpcMsg) (no page alignment — avoids
-/// over-aligned heap allocations for the queue slots). Field offsets match the
-/// wire `IpcMsg` exactly, so a byte view round-trips through `copy_*_user`.
+/// A queued message in kernel storage: the natural-alignment twin of
+/// [`IpcMsg`](crate::libkern::IpcMsg), so a byte view round-trips through `copy_*_user`.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct StoredMsg {
@@ -53,18 +32,16 @@ pub struct StoredMsg {
     pub header: IpcMsgHeader,
     /// Inline payload bytes.
     pub payload: [u8; IPC_PAYLOAD_SIZE],
-    /// Transferable-handle slots (unused until handle transfer lands; zeroed).
+    /// Transferable-handle slots.
     pub handles: [u64; crate::libkern::ipc::IPC_HANDLE_MAX],
 }
 
 const _: () = assert!(core::mem::size_of::<StoredMsg>() == IPC_MSG_SIZE);
-// `IpcMsg` and `StoredMsg` share field offsets (the only difference is `IpcMsg`'s
-// page alignment, which adds no interior padding); the byte view below is sound.
+// `IpcMsg` and `StoredMsg` share field offsets (`IpcMsg`'s page alignment adds no padding).
 const _: () = assert!(core::mem::offset_of!(StoredMsg, payload) == 24);
 
 impl StoredMsg {
-    /// An all-zero message (a valid bit pattern: every field is an integer or
-    /// integer array).
+    /// An all-zero message (a valid bit pattern).
     pub fn zeroed() -> Self {
         // SAFETY: `StoredMsg` is `#[repr(C)]` over `u32`/`u8`/`u16`/`u64`
         // (arrays included); the all-zero bit pattern is a valid value.
@@ -86,11 +63,9 @@ impl StoredMsg {
     }
 }
 
-/// One handle moved through IPC, held by the kernel while the message is queued
-/// ("in flight"): the object reference (pinning it) plus the rights to install it
-/// with in the receiver's table (captured from the sender's handle at send). The
-/// receiver consumes this at `sys_channel_recv`; an undelivered transfer's ref is
-/// released when the queue (the endpoint) is destroyed.
+/// One handle moved through IPC, held by the kernel while the message is queued: the object
+/// reference (pinning it) plus the rights to install it with. An undelivered transfer's ref is
+/// released when the endpoint is destroyed.
 pub struct TransferRef {
     /// The pinned transferred object.
     pub obj: ObjectRef,
@@ -98,9 +73,7 @@ pub struct TransferRef {
     pub rights: Rights,
 }
 
-/// A queued message slot: the wire bytes plus the in-flight transferred-handle
-/// references (`None` per slot for a no-handle message). Not `Copy` — the
-/// `TransferRef`s are **moved** in/out, never bytewise-copied.
+/// A queued message slot: the wire bytes plus in-flight transfer references, **moved** in/out.
 struct RingSlot {
     msg: StoredMsg,
     transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
@@ -112,28 +85,19 @@ impl RingSlot {
     }
 }
 
-/// A fixed-capacity ring of message slots. The backing [`KVec`] is pre-filled
-/// with `cap` empty slots at construction (the only fallible growth);
-/// `push_from`/`pop_into` then move messages (bytes copied, transfer references
-/// moved) in place — no element shifting, no reallocation, no large stack
-/// temporaries — so they are safe to run under `SCHED`. (No `ObjectRef` *Drop*
-/// ever runs here; only moves, which never touch a refcount.)
+/// A fixed-capacity ring of message slots, pre-filled at construction (the only fallible
+/// growth); `push_from`/`pop_into` move messages in place, so they are safe under `SCHED`.
 struct MsgRing {
-    /// Exactly `cap` storage slots; `slots.len()` is the capacity.
     slots: KVec<RingSlot>,
-    /// Index of the oldest queued message.
     head: usize,
-    /// Number of queued messages, `0..=cap`.
     len: usize,
 }
 
 impl MsgRing {
-    /// A ring holding `cap` (`≥ 1`) pre-allocated, initially empty slots.
     fn with_capacity(cap: usize) -> Result<Self, AllocError> {
         let mut slots: KVec<RingSlot> = KVec::new();
         slots.try_reserve(cap)?;
         for _ in 0..cap {
-            // Within the reserved capacity — never reallocates.
             slots.try_push(RingSlot::empty())?;
         }
         Ok(MsgRing { slots, head: 0, len: 0 })
@@ -151,9 +115,6 @@ impl MsgRing {
         self.len == self.cap()
     }
 
-    /// Copy `src` into the tail slot and **move** any `transfers` into it
-    /// (`take`-ing them from the caller's array). Returns `false` if full (and
-    /// leaves `transfers` untouched for the caller to reclaim).
     fn push_from(&mut self, src: &StoredMsg, transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX]) -> bool {
         if self.is_full() {
             return false;
@@ -169,8 +130,6 @@ impl MsgRing {
         true
     }
 
-    /// Copy the head slot's bytes into `dst`, **move** its transfers into `out`,
-    /// and advance. Returns `false` if empty.
     fn pop_into(&mut self, dst: &mut StoredMsg, out: &mut [Option<TransferRef>; IPC_HANDLE_MAX]) -> bool {
         if self.is_empty() {
             return false;
@@ -189,8 +148,7 @@ impl MsgRing {
 /// Outcome of a [`send_push`](IpcChannel::send_push).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum SendOutcome {
-    /// Queued. `woke_edge` is `true` iff the peer's receive ring went
-    /// empty→non-empty (so the peer's blocked receivers must be woken).
+    /// Queued. `woke_edge` is `true` iff the peer's ring went empty→non-empty (wake its receivers).
     Sent { woke_edge: bool },
     /// The peer's receive ring is full (NoBlock → `WouldBlock`).
     Full,
@@ -198,52 +156,37 @@ pub enum SendOutcome {
     PeerClosed,
 }
 
-/// Outcome of a blocking send ([`send_or_queue`](IpcChannel::send_or_queue)) —
-/// the `Block` / `BlockBounded` path. Unlike [`SendOutcome`] there is no plain
-/// "full": a full receive ring means the message is **held** (`Queued`) until a
-/// recv frees space; the only hard failure is the bounded pending-send queue
-/// itself overflowing.
+/// Outcome of a blocking send ([`send_or_queue`](IpcChannel::send_or_queue)): a full ring means
+/// the message is **held**; the only hard failure is the pending-send queue overflowing.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum BlockSendOutcome {
-    /// Delivered straight into the peer's receive ring. `woke_edge` is `true`
-    /// iff the ring went empty→non-empty (wake the peer's receivers). The
-    /// caller's [`PendingOperation`] is completed immediately (pre-signalled).
+    /// Delivered into the peer's ring; the caller's [`PendingOperation`] completes immediately.
     Sent { woke_edge: bool },
-    /// The peer's ring was full; the message (and its transfers + a reference to
-    /// the caller's `PendingOperation`) is held in the peer's pending-send queue
-    /// and will be delivered — completing the PO — when the peer next receives.
+    /// The peer's ring was full: the message (with its transfers and a reference to the caller's
+    /// PO) is held in the peer's pending-send queue and delivered when the peer next receives.
     Queued,
-    /// The peer's pending-send queue is at capacity — back-pressure. The
-    /// transfers are left untaken for the caller to reclaim (→ `WouldBlock`).
+    /// Pending-send queue full — back-pressure; transfers are left for the caller (`WouldBlock`).
     PendingFull,
     /// The peer endpoint has closed.
     PeerClosed,
 }
 
-/// A blocking send held in a receiving endpoint's pending-send queue: the copied
-/// message, the in-flight transferred-handle references it carries, and an owning
-/// reference to the sender's [`PendingOperation`] (kept alive even if the sender
-/// closes its handle early). Delivered — moving `msg`/`transfers` into the ring
-/// and completing `po` (status 0) — when the endpoint next receives, or completed
-/// with `PeerClosed` (and its `transfers` reclaimed) when the endpoint closes.
+/// A blocking send held in a receiving endpoint's pending-send queue: the message, its
+/// in-flight transfers, and an owning reference to the sender's [`PendingOperation`] (alive even
+/// if the sender closes early). Delivered, completing `po` with status 0, when the endpoint
+/// next receives; completed `PeerClosed` (transfers reclaimed) when it closes.
 struct PendingSend {
     msg: StoredMsg,
     transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
     po: ObjectRef,
-    /// Set when a `BlockBounded` delivery deadline elapsed before delivery: the
-    /// `po` was already completed `TimedOut`, so this entry is **not** delivered
-    /// — it is swept out and reclaimed at the next `promote_pending_send` (or at
-    /// close). Always `false` for `Block`. See [`cancel_pending_send`].
-    ///
-    /// [`cancel_pending_send`]: IpcChannel::cancel_pending_send
+    /// Set when a `BlockBounded` deadline elapsed: `po` was already completed `TimedOut`, so the
+    /// entry is swept out at the next `promote_pending_send` (or at close), not delivered.
     cancelled: bool,
 }
 
-/// The droppable parts of a cancelled (timed-out) [`PendingSend`], handed back by
-/// [`promote_pending_send`](IpcChannel::promote_pending_send) for the caller to
-/// release **outside** `SCHED` (the `Drop`s of `po` / a transferred object may
-/// take lower-rank locks — e.g. the buddy allocator — which must not nest under
-/// the rank-1 scheduler lock). The message bytes are `Copy` and need no reclaim.
+/// The droppable parts of a cancelled [`PendingSend`], handed back by
+/// [`promote_pending_send`](IpcChannel::promote_pending_send) for release **outside** `SCHED`:
+/// their `Drop`s may take lower-rank locks (the buddy allocator) that must not nest under it.
 pub struct ReclaimedSend {
     pub po: ObjectRef,
     pub transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
@@ -261,38 +204,26 @@ pub enum RecvState {
 }
 
 /// One endpoint of an IPC channel.
-///
-/// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
 #[repr(C)]
 pub struct IpcChannel {
     header: KObjectHeader,
-    /// Self-check sentinel; a live object always reads [`IpcChannel::MAGIC`].
     magic: u64,
-    /// All mutable state, reached only under `SCHED`.
     inner: UnsafeCell<Inner>,
 }
 
 struct Inner {
-    /// This endpoint's inbox: messages the peer sent here, awaiting recv.
     recv: MsgRing,
-    /// Threads blocked recv-ing on this endpoint (type-erased `Thread` pointers,
-    /// non-owning; removed before a waiter unparks). Pre-reserved to
-    /// [`IpcChannel::MAX_WAITERS`] so `add_waiter` never allocates under `SCHED`.
+    /// Threads blocked recv-ing (type-erased, non-owning; removed before a waiter unparks).
+    /// Pre-reserved to [`IpcChannel::MAX_WAITERS`] so `add_waiter` never allocates under `SCHED`.
     recv_waiters: KVec<*mut ()>,
-    /// Blocking senders whose message is waiting for space in **this** endpoint's
-    /// receive ring (`Block` / `BlockBounded`). FIFO; promoted into `recv` when a
-    /// recv frees a slot. Pre-reserved to [`IpcChannel::MAX_PENDING_SENDS`] so
-    /// `send_or_queue` never allocates under `SCHED`.
+    /// Blocking senders awaiting space in **this** ring, FIFO, promoted into `recv` when a recv
+    /// frees a slot. Pre-reserved to [`IpcChannel::MAX_PENDING_SENDS`]: no `SCHED` allocation.
     pending_sends: KVec<PendingSend>,
-    /// The other endpoint, or null once it has closed.
     peer: *mut IpcChannel,
-    /// Non-null iff this endpoint is the **kernel's** end of a Userspace Server
-    /// channel: a back-pointer (type-erased, non-owning) to the owning
-    /// [`UserspaceServerReg`](crate::object::UserspaceServerReg). A reply sent to
-    /// this endpoint (by the server, on its peer) is a forwarded-lookup reply the
-    /// kernel completes inline rather than enqueues. Null on every ordinary
-    /// channel. The registration *owns* this endpoint (the only reference), so the
-    /// back-pointer is valid for as long as the endpoint is alive.
+    /// Non-null iff this is the **kernel's** end of a Userspace Server channel: a non-owning
+    /// back-pointer to the owning [`UserspaceServerReg`](crate::object::UserspaceServerReg), which
+    /// *owns* this endpoint. A reply sent here (by the server, on its peer) is a forwarded-lookup
+    /// reply the kernel completes inline rather than enqueues.
     us_reg: *mut (),
 }
 
@@ -307,29 +238,20 @@ impl IpcChannel {
     /// Sentinel written into [`IpcChannel::magic`] at construction.
     pub const MAGIC: u64 = 0x49_70_63_43_68_21_21_21; // "IpcCh!!!"
 
-    /// Maximum simultaneous receivers blocked on one endpoint. Bounds the
-    /// pre-reserved waiter vector. Matches [`Timer::MAX_WAITERS`].
-    ///
-    /// [`Timer::MAX_WAITERS`]: crate::object::Timer::MAX_WAITERS
+    /// Maximum simultaneous receivers blocked on one endpoint; bounds the pre-reserved vector.
     pub const MAX_WAITERS: usize = 4;
 
-    /// Maximum messages held in one endpoint's pending-send queue (blocking
-    /// senders whose message awaits space in this endpoint's receive ring).
-    /// Bounds the pre-reserved `pending_sends` vector so `send_or_queue` never
-    /// allocates under `SCHED`; beyond it, a blocking send gets `WouldBlock`
-    /// back-pressure.
+    /// Maximum messages in one endpoint's pending-send queue; bounds the pre-reserved vector,
+    /// beyond which a blocking send gets `WouldBlock` back-pressure.
     pub const MAX_PENDING_SENDS: usize = 4;
 
-    /// Create a connected endpoint **pair**, each with a `depth`-slot receive
-    /// ring (clamped to `1..=IPC_MAX_QUEUE_DEPTH`). The two returned `KBox`es
-    /// each hold one creation reference; the caller installs them into handles.
+    /// Create a connected endpoint **pair**, each with a `depth`-slot receive ring (clamped to
+    /// `1..=IPC_MAX_QUEUE_DEPTH`). Each returned `KBox` holds one creation reference.
     pub fn try_new_pair(depth: u32) -> Result<(KBox<Self>, KBox<Self>), AllocError> {
         let cap = depth.clamp(1, IPC_MAX_QUEUE_DEPTH) as usize;
         let mut a = Self::try_new_endpoint(cap)?;
         let mut b = Self::try_new_endpoint(cap)?;
-        // Link the peers. Both boxes are still private to this function (their
-        // handles are not yet allocated), so no other context can observe them;
-        // plain writes through the cell are sound, no `SCHED` needed yet.
+        // Both boxes are still private here: plain writes are sound; no `SCHED` needed.
         let a_ptr = (&*a as *const Self) as *mut Self;
         let b_ptr = (&*b as *const Self) as *mut Self;
         a.inner.get_mut().peer = b_ptr;
@@ -337,9 +259,8 @@ impl IpcChannel {
         Ok((a, b))
     }
 
-    /// Allocate one unconnected endpoint (`peer == null`), refcount one. The
-    /// receive ring + waiter vector are reserved up front — the only fallible
-    /// growth — so later `push`/`add_waiter` never allocate under `SCHED`.
+    /// Allocate one unconnected endpoint, refcount one. Ring and waiter vector are reserved up
+    /// front (the only fallible growth), so later pushes never allocate under `SCHED`.
     fn try_new_endpoint(cap: usize) -> Result<KBox<Self>, AllocError> {
         let recv = MsgRing::with_capacity(cap)?;
         let mut recv_waiters: KVec<*mut ()> = KVec::new();
@@ -402,10 +323,8 @@ impl IpcChannel {
         unsafe { Self::inner(obj) }.peer = core::ptr::null_mut();
     }
 
-    /// Mark this endpoint as the kernel's end of a Userspace Server channel,
-    /// recording `reg` (the owning
-    /// [`UserspaceServerReg`](crate::object::UserspaceServerReg)). Set once, when a
-    /// supervisor binds the endpoint as a `UserspaceServer`.
+    /// Mark this endpoint as the kernel's end of a Userspace Server channel, recording `reg`.
+    /// Set once, when a supervisor binds the endpoint as a `UserspaceServer`.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -425,10 +344,8 @@ impl IpcChannel {
         unsafe { Self::inner(obj) }.us_reg
     }
 
-    /// Push `msg` (and **move** any `transfers` it carries) into the **peer**'s
-    /// receive ring. The `woke_edge` flag on `Sent` reports whether the peer went
-    /// empty→non-empty. On `Full`/`PeerClosed` the `transfers` are left untouched
-    /// (the caller reclaims them).
+    /// Push `msg` (and **move** any `transfers`) into the **peer**'s ring; `Sent`'s `woke_edge`
+    /// reports an empty→non-empty edge. On `Full`/`PeerClosed` the `transfers` are left untouched.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -483,8 +400,7 @@ impl IpcChannel {
         unsafe { Self::inner(obj) }.recv.pop_into(dst, out)
     }
 
-    /// `true` iff a recv would return something (a queued message) or report a
-    /// closed peer — the waitable "signaled" predicate.
+    /// `true` iff a recv would return something or report a closed peer — the "signaled" predicate.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -494,8 +410,7 @@ impl IpcChannel {
         !inner.recv.is_empty() || inner.peer.is_null()
     }
 
-    /// Register `thread` as a receiver. `Err(())` if already at
-    /// [`MAX_WAITERS`](Self::MAX_WAITERS); never grows under the lock.
+    /// Register `thread` as a receiver. `Err(())` at [`MAX_WAITERS`](Self::MAX_WAITERS).
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -505,12 +420,10 @@ impl IpcChannel {
         if inner.recv_waiters.len() < Self::MAX_WAITERS {
             inner
                 .recv_waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED`
-                // (`wait_on` → `obj_add_waiter` with the guard held), and `try_push` grows,
-                // which is `kmalloc` under the rank-1 lock (F11). Safe either way today —
-                // construction reserves `MAX_WAITERS` with `?`, so `len < MAX ⟹ len < cap` —
-                // but the type is what should say so, since this is the shape a new waiter
-                // list gets copied from (PR #205 review, optional 5).
+                // `push_within_capacity`, not `try_push`: this runs under `SCHED` and `try_push`
+                // grows (`kmalloc` under the rank-1 lock). Construction reserves `MAX_WAITERS`, so
+                // it cannot fail; the type should say so, since a new waiter list copies this
+                // shape.
                 .push_within_capacity(thread)
                 .expect("within reserved waiter capacity");
             Ok(())
@@ -531,8 +444,7 @@ impl IpcChannel {
         }
     }
 
-    /// Drain every receiver into `out` (clearing the set), returning the count.
-    /// `out` must be at least [`MAX_WAITERS`](Self::MAX_WAITERS) long.
+    /// Drain every receiver into `out`, returning the count; `out` is at least `MAX_WAITERS` long.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -548,13 +460,9 @@ impl IpcChannel {
         n
     }
 
-    // --- Blocking-send (pending-sender) accessors ----------------------
-
-    /// Blocking-send entry: try to deliver `msg` straight into the **peer**'s
-    /// receive ring; if the ring is full, **hold** it in the peer's pending-send
-    /// queue together with a cloned reference to the caller's `PendingOperation`
-    /// `po`. On `Sent`/`Queued` the `transfers` are moved out (taken); on
-    /// `PendingFull`/`PeerClosed` they are left for the caller to reclaim.
+    /// Blocking-send entry: deliver `msg` straight into the **peer**'s ring, or if full **hold**
+    /// it in the peer's pending-send queue with a cloned reference to the caller's
+    /// `PendingOperation` `po`. `Sent`/`Queued` take the `transfers`; the rest leave them.
     ///
     /// # Safety
     /// See the accessor contract above; `po` references a live `PendingOperation`.
@@ -576,7 +484,6 @@ impl IpcChannel {
         if peer_inner.recv.push_from(msg, transfers) {
             return BlockSendOutcome::Sent { woke_edge: was_empty };
         }
-        // Ring full — hold the message if the pending-send queue has room.
         if peer_inner.pending_sends.len() >= Self::MAX_PENDING_SENDS {
             return BlockSendOutcome::PendingFull; // transfers left for the caller
         }
@@ -584,12 +491,9 @@ impl IpcChannel {
         for i in 0..IPC_HANDLE_MAX {
             held[i] = transfers[i].take();
         }
-        // `po.clone()` bumps the refcount (atomic; no alloc/drop) — sound under SCHED.
-        // Non-growing, and here the value carries an `ObjectRef` (`po`): `try_push` drops
-        // its argument when a growth fails, which under `SCHED` would reach
-        // `SlabCache::free` (F2). Reserved to `MAX_PENDING_SENDS` at construction and
-        // length-checked above, so it cannot refuse — a seventh site of the shape audit
-        // C.1(c) describes, found while sweeping the six the review named.
+        // `po.clone()` bumps an atomic refcount: sound under `SCHED`. Non-growing: `try_push` drops
+        // its argument when growth fails, and its `ObjectRef` would drop under `SCHED`. Reserved to
+        // `MAX_PENDING_SENDS` and length-checked above, so it cannot refuse.
         peer_inner
             .pending_sends
             .push_within_capacity(PendingSend { msg: *msg, transfers: held, po: po.clone(), cancelled: false })
@@ -602,14 +506,9 @@ impl IpcChannel {
         BlockSendOutcome::Queued
     }
 
-    /// Mark the held sender whose `PendingOperation` is `po` as **cancelled** (a
-    /// `BlockBounded` delivery deadline elapsed). The entry is not removed here —
-    /// its `po` was already completed `TimedOut` by the caller, and its message +
-    /// refs are reclaimed at the next [`promote_pending_send`] / at close (a drop
-    /// must not run under `SCHED`). Returns `true` if a matching held send was
-    /// found (idempotent; a no-op if it was already delivered/removed).
-    ///
-    /// [`promote_pending_send`]: IpcChannel::promote_pending_send
+    /// Mark the held sender whose `PendingOperation` is `po` **cancelled** (a `BlockBounded`
+    /// deadline elapsed). It stays queued — `po` was already completed `TimedOut`, and a drop must
+    /// not run under `SCHED` — until `promote_pending_send` or close reclaims it.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -624,13 +523,10 @@ impl IpcChannel {
         }
     }
 
-    /// After a recv frees a slot, sweep out any **cancelled** (timed-out) held
-    /// sends — oldest first — collecting their droppable parts into `reclaimed`
-    /// for the caller to release **outside** `SCHED`, then promote the oldest
-    /// **live** sender into this endpoint's receive ring (FIFO): move its message
-    /// and transfers into `recv` and return its `PendingOperation` reference (the
-    /// caller completes it status 0 under `SCHED`, drops it outside). Returns
-    /// `None` if no live sender was promoted (the ring stays one slot freer).
+    /// After a recv frees a slot, sweep out **cancelled** held sends (their droppable parts into
+    /// `reclaimed`, for release **outside** `SCHED`), then promote the oldest **live** sender into
+    /// the ring (FIFO) and return its `PendingOperation` ref: the caller completes it status 0
+    /// under `SCHED` and drops it outside. `None` if no live sender was promoted.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -642,22 +538,17 @@ impl IpcChannel {
         let inner = unsafe { Self::inner(obj) };
         let mut r = 0;
         loop {
-            // Peek the front entry's `cancelled` flag (Copy) so the immutable
-            // borrow ends before the mutating `remove` below.
             let cancelled = {
                 let p = inner.pending_sends.first()?;
                 p.cancelled
             };
             if cancelled {
-                // Reclaim it (move its refs out for outside-SCHED drop); the
-                // message bytes are Copy and discarded.
                 let ps = inner.pending_sends.remove(0);
                 debug_assert!(r < reclaimed.len());
                 reclaimed[r] = Some(ReclaimedSend { po: ps.po, transfers: ps.transfers });
                 r += 1;
                 continue;
             }
-            // The oldest live entry: deliver it into the freed ring slot.
             if inner.recv.is_full() {
                 return None; // no freed slot to promote into
             }
@@ -668,10 +559,8 @@ impl IpcChannel {
         }
     }
 
-    /// Copy the `PendingOperation` pointers of every held sender into `out` (for
-    /// the closing path to complete them `PeerClosed`), returning the count. Does
-    /// **not** remove them — their references are released when this endpoint's
-    /// `Inner` drops, outside `SCHED`.
+    /// Copy every held sender's `PendingOperation` pointer into `out` (for the closing path to
+    /// complete them `PeerClosed`), returning the count. They stay queued, released with `Inner`.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -690,11 +579,8 @@ impl IpcChannel {
 }
 
 impl Drop for IpcChannel {
-    /// Unlink from the peer and wake its blocked receivers (so they observe
-    /// `PeerClosed`), then assert this endpoint has no receivers of its own (a
-    /// live waiter pins it via its parked `ObjectRef`, so the last reference
-    /// cannot drop while receivers remain). Reaches `SCHED`; sound because
-    /// endpoint references are released only outside `SCHED` (see module docs).
+    /// Unlink from the peer and wake its blocked receivers (they observe `PeerClosed`), then assert
+    /// this endpoint has no receivers of its own (a live waiter pins it via its `ObjectRef`).
     fn drop(&mut self) {
         // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
         unsafe { crate::sched::ipc_endpoint_closing(self as *mut Self as *mut ()) };
@@ -715,8 +601,6 @@ mod tests {
         (KBox::into_raw(a).as_ptr() as *mut (), KBox::into_raw(b).as_ptr() as *mut ())
     }
 
-    /// Adopt the creation reference and drop it (running `IpcChannel::drop`,
-    /// which unlinks the peer under `SCHED`).
     fn drop_endpoint(obj: *mut ()) {
         // SAFETY: adopts the endpoint's creation reference, to drop it.
         drop(unsafe { ObjectRef::from_raw(obj, KObjectType::IpcChannel) });
@@ -772,17 +656,14 @@ mod tests {
         let (a, b) = new_pair();
         // SAFETY: live endpoints, single-threaded test.
         unsafe {
-            // a is empty; sending on a targets b's inbox, so a stays empty.
             assert!(!IpcChannel::already_signaled(a));
             let edge = push_no_xfer(a, &a_msg(0x11, 3));
             assert_eq!(edge, SendOutcome::Sent { woke_edge: true });
             let edge2 = push_no_xfer(a, &a_msg(0x22, 5));
             assert_eq!(edge2, SendOutcome::Sent { woke_edge: false });
-            // a's own inbox is still empty; b's has two messages.
             assert!(!IpcChannel::already_signaled(a));
             assert!(IpcChannel::already_signaled(b));
             assert_eq!(IpcChannel::recv_peek(b), RecvState::HasMsg);
-            // FIFO drain on b.
             let mut got = StoredMsg::zeroed();
             assert!(pop_no_xfer(b, &mut got));
             assert_eq!(got.header.payload_len, 3);
@@ -806,7 +687,6 @@ mod tests {
             for _ in 0..4 {
                 assert!(matches!(push_no_xfer(a, &a_msg(0xAB, 1)), SendOutcome::Sent { .. }));
             }
-            // Fifth send: b's inbox (depth 4) is full.
             assert_eq!(push_no_xfer(a, &a_msg(0xAB, 1)), SendOutcome::Full);
         }
         drop_endpoint(a);
@@ -820,7 +700,6 @@ mod tests {
         // SAFETY: live endpoints, single-threaded test.
         unsafe {
             let mut got = StoredMsg::zeroed();
-            // Push 3, pop 2, push 3 more → wraps past the end; drain in order.
             for i in 0..3u8 {
                 push_no_xfer(a, &a_msg(i, 1));
             }
@@ -831,7 +710,6 @@ mod tests {
             for i in 3..6u8 {
                 assert!(matches!(push_no_xfer(a, &a_msg(i, 1)), SendOutcome::Sent { .. }));
             }
-            // Remaining: 2,3,4,5 in FIFO order (1 left from first batch + 3 new).
             for i in 2..6u8 {
                 assert!(pop_no_xfer(b, &mut got));
                 assert_eq!(got.payload[0], i);
@@ -848,24 +726,18 @@ mod tests {
         let (a, b) = new_pair();
         // SAFETY: live endpoints, single-threaded test.
         unsafe {
-            // Queue one message into b before closing a.
             push_no_xfer(a, &a_msg(0x7E, 2));
         }
-        // Close a (drops its only reference → `drop` nulls b's peer pointer).
         drop_endpoint(a);
         // SAFETY: b is still live.
         unsafe {
             assert!(IpcChannel::peer_of(b).is_null());
-            // b still drains its queued message first ...
             assert_eq!(IpcChannel::recv_peek(b), RecvState::HasMsg);
             let mut got = StoredMsg::zeroed();
             assert!(pop_no_xfer(b, &mut got));
             assert_eq!(got.payload[0], 0x7E);
-            // ... then reports the closed peer (and a closed peer is "signaled"
-            // so a blocked recv wakes to see it).
             assert_eq!(IpcChannel::recv_peek(b), RecvState::PeerClosed);
             assert!(IpcChannel::already_signaled(b));
-            // Sending from b now fails: the peer is gone.
             assert_eq!(push_no_xfer(b, &a_msg(0, 1)), SendOutcome::PeerClosed);
         }
         drop_endpoint(b);
@@ -884,7 +756,6 @@ mod tests {
             assert!(IpcChannel::add_waiter(a, 0xDEAD as *mut ()).is_err());
             IpcChannel::remove_waiter(a, ths[0]);
             assert!(IpcChannel::add_waiter(a, 0xBEEF as *mut ()).is_ok());
-            // Drain before dropping (a dropped-with-waiters debug-asserts).
             let mut buf = [core::ptr::null_mut(); IpcChannel::MAX_WAITERS];
             assert_eq!(IpcChannel::take_waiters(a, &mut buf), IpcChannel::MAX_WAITERS);
         }
@@ -909,7 +780,6 @@ mod tests {
         init_global_heap();
         test_probe::reset();
         let (a, b) = new_pair();
-        // An object to transfer (a Process; refcount 1 via its creation ref).
         let p = KBox::into_raw(Process::try_new(99).unwrap()).as_ptr() as *mut ();
         // SAFETY: adopts the process's creation reference.
         let pref = unsafe { ObjectRef::from_raw(p, KObjectType::Process) };
@@ -919,18 +789,14 @@ mod tests {
             send_t[0] = Some(TransferRef { obj: pref, rights: Rights::empty() });
             let mut msg = a_msg(0, 0);
             msg.header.handle_count = 1;
-            // Send on a → b's inbox; the transfer moves into the queued slot.
             assert!(matches!(IpcChannel::send_push(a, &msg, &mut send_t), SendOutcome::Sent { .. }));
             assert!(send_t[0].is_none(), "transfer moved into the queue");
-            // Pop on b → the transfer moves back out.
             let mut got = StoredMsg::zeroed();
             let mut recv_t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
             assert!(IpcChannel::recv_pop_into(b, &mut got, &mut recv_t));
             assert_eq!(got.header.handle_count, 1);
             let tr = recv_t[0].take().unwrap();
             assert_eq!(tr.obj.as_ptr(), p);
-            // The reference is still held (not destroyed); dropping it destroys
-            // the object (refcount 1 → 0).
             assert_eq!(test_probe::process_destroys(), 0);
             drop(tr);
             assert_eq!(test_probe::process_destroys(), 1);
@@ -954,12 +820,9 @@ mod tests {
             t[0] = Some(TransferRef { obj: pref, rights: Rights::empty() });
             let mut msg = a_msg(0, 0);
             msg.header.handle_count = 1;
-            // Queue the transfer into b's inbox but never receive it.
             IpcChannel::send_push(a, &msg, &mut t);
         }
         assert_eq!(test_probe::process_destroys(), 0);
-        // Destroying the endpoints (b holds the queued message) drops the
-        // undelivered transfer's reference → the object is released.
         drop_endpoint(a);
         drop_endpoint(b);
         assert_eq!(test_probe::process_destroys(), 1);
@@ -967,14 +830,10 @@ mod tests {
 
     #[test]
     fn payload_size_is_one_page_worth() {
-        // Guard the reconciled constant from drifting.
         assert_eq!(IPC_PAYLOAD_SIZE, 4008);
         assert_eq!(core::mem::size_of::<StoredMsg>(), 4096);
     }
 
-    // --- Blocking send (pending-sender queue) --------------------------
-
-    /// A fresh `PendingOperation`, adopting its creation reference.
     fn make_po() -> ObjectRef {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         unsafe {
@@ -1005,7 +864,6 @@ mod tests {
                 IpcChannel::send_or_queue(a, &a_msg(7, 1), &mut t, &po),
                 BlockSendOutcome::Sent { woke_edge: true }
             );
-            // Delivered straight into b's ring; nothing held.
             let mut d = a_msg(0, 0);
             assert!(pop_no_xfer(b, &mut d));
             assert_eq!(d.payload[0], 7);
@@ -1027,17 +885,13 @@ mod tests {
             for i in 0..4u8 {
                 assert!(matches!(push_no_xfer(a, &a_msg(i, 1)), SendOutcome::Sent { .. }));
             }
-            // 5th send: ring full → held in b's pending-send queue.
             let mut t = empty_xfer();
             assert_eq!(IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po), BlockSendOutcome::Queued);
-            // Receive one (frees a slot): FIFO byte 0.
             let mut d = a_msg(0, 0);
             assert!(pop_no_xfer(b, &mut d));
             assert_eq!(d.payload[0], 0);
-            // Promote the held sender into b's ring; returns its PO reference.
             let promoted = IpcChannel::promote_pending_send(b, &mut empty_reclaim());
             assert!(promoted.is_some());
-            // Drain the rest: 1, 2, 3, then the promoted 99 (FIFO preserved).
             for expect in [1u8, 2, 3, 99] {
                 let mut dd = a_msg(0, 0);
                 assert!(pop_no_xfer(b, &mut dd));
@@ -1065,13 +919,10 @@ mod tests {
             }
             let mut t = empty_xfer();
             assert_eq!(IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po), BlockSendOutcome::Queued);
-            // The held sender is visible to the closing path.
             let mut pos = [core::ptr::null_mut(); IpcChannel::MAX_PENDING_SENDS];
             assert_eq!(IpcChannel::pending_send_pos(b, &mut pos), 1);
             assert_eq!(pos[0], po.as_ptr());
         }
-        // Dropping b (the receiver holding the pending send) releases the queued
-        // PO reference (and the held transfers) via its `Inner` drop.
         drop_endpoint(b);
         assert_eq!(test_probe::pending_op_destroys(), 0, "creation ref still held");
         drop(po); // last ref → PO destroyed
@@ -1091,11 +942,9 @@ mod tests {
             }
             let mut t = empty_xfer();
             assert_eq!(IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po), BlockSendOutcome::Queued);
-            // Cancel finds the held send by its PO; an unknown PO is a no-op.
             assert!(!IpcChannel::cancel_pending_send(b, 0xDEAD as *mut ()));
             assert!(IpcChannel::cancel_pending_send(b, po.as_ptr()));
         }
-        // The cancelled (un-promoted) send is reclaimed via b's Inner drop.
         drop(po);
         drop_endpoint(a);
         drop_endpoint(b);
@@ -1117,10 +966,7 @@ mod tests {
             assert_eq!(IpcChannel::send_or_queue(a, &a_msg(50, 1), &mut t1, &po1), BlockSendOutcome::Queued);
             let mut t2 = empty_xfer();
             assert_eq!(IpcChannel::send_or_queue(a, &a_msg(51, 1), &mut t2, &po2), BlockSendOutcome::Queued);
-            // po1 times out.
             assert!(IpcChannel::cancel_pending_send(b, po1.as_ptr()));
-            // A recv frees a slot: promote sweeps the cancelled po1 (reclaimed)
-            // and delivers the live po2.
             let mut d = a_msg(0, 0);
             assert!(pop_no_xfer(b, &mut d));
             let mut rc = empty_reclaim();
@@ -1131,7 +977,6 @@ mod tests {
             drop(promoted); // release po2's queue ref
             drop(rc); // release po1's queue ref (the reclaimed entry)
         }
-        // Both creation refs now the last → both POs destroyed.
         drop(po1);
         drop(po2);
         assert_eq!(test_probe::pending_op_destroys(), 2);

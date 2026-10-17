@@ -1,4 +1,4 @@
-//! **Names on a FAT** (Phase 6 Part E.2): long names in UTF-16, short names in 8.3, and the rules
+//! **Names on a FAT**: long names in UTF-16, short names in 8.3, and the rules
 //! for both.
 //!
 //! - **Long names** are up to 255 UTF-16 units, held in long-name entries before a file's short
@@ -177,8 +177,9 @@ pub fn checksum(short: &[u8; 11]) -> u8 {
     short.iter().fold(0u8, |sum, &c| (sum >> 1).wrapping_add(sum << 7).wrapping_add(c))
 }
 
-/// Windows' case bits in a short entry: its base, and its extension, are lower case.
+/// Windows' case bit in a short entry: its base is lower case.
 pub const LOWER_BASE: u8 = 0x08;
+/// Windows' case bit in a short entry: its extension is lower case.
 pub const LOWER_EXT: u8 = 0x10;
 
 /// **A short name as it is shown**: `NAME.EXT`, padding trimmed, with Windows' case bits applied —
@@ -281,7 +282,6 @@ mod tests {
         assert_eq!((&b[..bn], en), (&b"__"[..], 0));
     }
 
-    /// The specification's checksum, and the case bits shown.
     #[test]
     fn the_checksum_and_a_short_name_shown() {
         assert_eq!(checksum(b"README  TXT"), 0x73);

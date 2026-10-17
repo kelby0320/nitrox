@@ -1,19 +1,15 @@
-//! **A FAT filesystem on a device** (Phase 6 Part E.2), and what can be done with it.
+//! **A FAT filesystem on a device**, and what can be done with it.
 //!
 //! [`Fat`] holds the device, the geometry its boot sector gave, and the cache of FAT sectors; its
 //! methods are what `fs-server-fat`'s binary hands `libfsserver`'s loop. **The map it replies is in
 //! 512-byte sectors** — `block_size` 512, every run's start and length in sectors from the volume's
-//! start — because a FAT's data region need not begin on a 4 KiB boundary. The kernel fills and
-//! writes a page as one device range, so no page may span two runs: a cluster of at least a page,
-//! the server's rule ([`crate::bpb::servable`]). **A file's id is its first cluster**, the same
-//! through a rename or a move; an empty file has none, and its id is `0`.
+//! start — because a FAT's data region need not begin on a 4 KiB boundary. **A file's id is its
+//! first cluster**, the same through a rename or a move; an empty file has none, and its id is `0`.
 //!
-//! **Writing** (Phase 6 Part E.3) orders what it writes so a crash between writes loses clusters
+//! **Writing** orders what it writes so a crash between writes loses clusters
 //! and never gives one to two files: **data, then the chain, then the directory entry**. A grow
 //! zeroes the clusters it takes, writes the FAT, and only then the entry that makes them the
-//! file's; a removal writes the entry first and frees the chain after. The FAT's dirty sectors
-//! are written at those points and at the end of each change — adjacent ones together, to every
-//! copy — so a request costs a few writes rather than one per cluster.
+//! file's; a removal writes the entry first and frees the chain after.
 
 use core::cell::{Cell, RefCell};
 
@@ -31,7 +27,6 @@ const MODE_DIR: u16 = 0o040755;
 const MODE_FILE: u16 = 0o100644;
 const MODE_READ_ONLY: u16 = 0o100444;
 
-/// Zeroes, written over what a grow adds.
 static ZEROES: [u8; SPAN] = [0; SPAN];
 
 /// **How many files [`Fat::touch_file`] can find by id.** FAT has no table from a first cluster
@@ -42,7 +37,6 @@ pub const ID_TABLE: usize = 256;
 /// each straight after the kernel forgets it, so one is the most ever waiting.
 const ORPHANS: usize = 8;
 
-/// **Where the short entry of the file with id `id` is.**
 #[derive(Copy, Clone)]
 struct Place {
     id: u32,
@@ -61,7 +55,6 @@ impl Ids {
         Ids { places: [Place { id: 0, dir: Dir::Root, slot: 0 }; ID_TABLE], next: 0 }
     }
 
-    /// Record where file `id` is: where it was if it is held, else in place of the oldest.
     fn put(&mut self, id: u32, dir: Dir, slot: u32) {
         if id == 0 {
             return;
@@ -74,19 +67,16 @@ impl Ids {
         self.next = (self.next + 1) % ID_TABLE;
     }
 
-    /// Where file `id` is, if it is held.
     fn get(&self, id: u32) -> Option<(Dir, u32)> {
         self.places.iter().find(|p| id != 0 && p.id == id).map(|p| (p.dir, p.slot))
     }
 
-    /// A file moved: where it is now, if it is held.
     fn moved(&mut self, id: u32, dir: Dir, slot: u32) {
         if let Some(p) = self.places.iter_mut().find(|p| id != 0 && p.id == id) {
             (p.dir, p.slot) = (dir, slot);
         }
     }
 
-    /// Let file `id` go: it has no entry any more.
     fn forget(&mut self, id: u32) {
         for p in self.places.iter_mut().filter(|p| p.id == id) {
             p.id = 0;
@@ -162,11 +152,10 @@ impl<'a, R: BlockReader> Fat<'a, R> {
         Ok(b[0] & 1 == 0)
     }
 
-    /// **The directory with id `id`, if it still is one** (PR #365 review, finding 5). A session
+    /// **The directory with id `id`, if it still is one**. A session
     /// names its directory by id — its first cluster — and a removal frees that cluster, which a
     /// grow may then take, so a number that is a cluster is not enough: it must still be allocated,
-    /// and its first entry still a `.` naming it. A directory made again at the same cluster is one
-    /// again. A fixed root, or FAT32's, is always.
+    /// and its first entry still a `.` naming it. A fixed root, or FAT32's, is always.
     fn live_dir(&self, g: &Geometry, cache: &mut Cache, id: u64) -> Result<Dir, FsError> {
         let d = Dir::from_id(g, id)?;
         let Dir::Chain(c) = d else {
@@ -201,7 +190,6 @@ impl<'a, R: BlockReader> Fat<'a, R> {
         Ok((n, last))
     }
 
-    /// The short entry at `slot` of `dir`, as its bytes.
     fn raw_entry(&self, g: &Geometry, cache: &mut Cache, dir: Dir, slot: u32) -> Result<[u8; 32], FsError> {
         let at = dir::slot_byte(self.r, g, cache, dir, slot)?.ok_or(FsError::Corrupt)?;
         let mut e = [0u8; 32];
@@ -209,7 +197,6 @@ impl<'a, R: BlockReader> Fat<'a, R> {
         Ok(e)
     }
 
-    /// The regular file `path` names, or `NotFound`.
     fn file(&self, g: &Geometry, cache: &mut Cache, path: &[u8]) -> Result<dir::Found, FsError> {
         match dir::resolve(self.r, g, cache, path)? {
             Node::Entry(f) if !f.is_dir() => Ok(f),
@@ -260,8 +247,7 @@ impl<'a, R: BlockReader> Fat<'a, R> {
     }
 
     /// **Read `len` bytes of the file at `path` from `offset`** into `out`: how many, fewer at the
-    /// file's end. A chain that ends before the bytes asked for is `Corrupt`, as `map_file` says it
-    /// is: answering the length would hand back whatever `out` held (PR #365 review, finding 7).
+    /// file's end. A chain that ends before the bytes asked for is `Corrupt`, as in `map_file`.
     pub fn read_file_range(&self, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Result<usize, FsError> {
         let g = self.geometry()?;
         let mut cache = self.cache.borrow_mut();
@@ -359,7 +345,6 @@ impl<'f, W: BlockWriter> Zeroer<'f, W> {
         Zeroer { w, at: 0, len: 0 }
     }
 
-    /// Zero device bytes `[at, at + len)`, now or with what follows.
     fn add(&mut self, at: u64, len: u64) -> Result<(), FsError> {
         if self.len > 0 && self.at + self.len == at {
             self.len += len;
@@ -375,7 +360,6 @@ impl<'f, W: BlockWriter> Zeroer<'f, W> {
         Ok(())
     }
 
-    /// Write what is held.
     fn finish(&mut self) -> Result<(), FsError> {
         if self.len > 0 {
             self.w.write_at(self.at, &ZEROES[..self.len as usize])?;
@@ -399,8 +383,8 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// **Run a change to the filesystem**: refused on a read-only mount before anything is read,
     /// and the FAT's dirty sectors written at its end. **A failure is written too**: one that is
     /// not the device's leaves the cache as it found it, or with what it took given back; one that
-    /// is the device's leaves nothing certain. A write that fails has the cache forgotten, so it
-    /// never holds what the device does not.
+    /// is the device's leaves nothing certain; a failed write forgets the cache, so it never holds
+    /// what the device does not.
     fn change<T>(&self, op: impl FnOnce(&Geometry, &mut Cache) -> Result<T, FsError>) -> Result<T, FsError> {
         if self.r.read_only() {
             return Err(FsError::ReadOnly);
@@ -415,7 +399,6 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         out
     }
 
-    /// **FAT32's FSInfo sector**, if it has one whose signatures are right.
     fn fsinfo(&self, g: &Geometry) -> Result<Option<[u8; SECTOR as usize]>, FsError> {
         if g.fsinfo == 0 {
             return Ok(None);
@@ -522,8 +505,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// **Write the entries naming `name` into `d`**, its short entry made by `short` from its
     /// short name: the directory grown first if it must be, and **every FAT change made so far
     /// written before the entries** — a grown directory's link, and a `mkdir`'s cluster, which the
-    /// entry names. This one flush is the rule for both (PR #365 review, finding 2). Where its short
-    /// entry is.
+    /// entry names. This one flush is the rule for both. Where its short entry is.
     fn insert(
         &self,
         g: &Geometry,
@@ -540,7 +522,6 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
         Ok(first + n - 1)
     }
 
-    /// `name` in `d`, if anything has it.
     fn find(&self, g: &Geometry, cache: &mut Cache, d: Dir, name: &[u8]) -> Result<Option<Found>, FsError> {
         match dir::lookup(self.r, g, cache, d, name) {
             Ok(f) => Ok(Some(f)),
@@ -565,7 +546,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     /// what its own clusters held past its end, and every cluster taken — as near its last one as
     /// the free space allows, so it stays in few runs. A size at or below the file's is nothing to
     /// do; one past FAT's 4 GiB less a byte, or more than the volume has free, is `TooLarge`. **The
-    /// size the file had**, from which it reads as zero (Phase 6 Part H.4).
+    /// size the file had**, from which it reads as zero.
     pub fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError> {
         self.change(|g, cache| {
             let f = self.file(g, cache, path)?;
@@ -868,9 +849,7 @@ impl<'a, R: BlockReader + BlockWriter> Fat<'a, R> {
     }
 }
 
-/// **FAT as the protocol sees it** (Phase 6 Part E.4): what `libfsserver`'s loop calls, each the
-/// library's own method. A file's id is its first cluster, and a truncate to zero ends one, so the
-/// loop forgets and releases it as it does an unlinked file's.
+/// **FAT as the protocol sees it**: what `libfsserver`'s loop calls, each the library's own method.
 impl<R: BlockReader + BlockWriter> Volume for Fat<'_, R> {
     const NAME: &'static [u8] = b"fs-server-fat";
     const KIND: &'static [u8] = b"fat";

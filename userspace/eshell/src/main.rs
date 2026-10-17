@@ -1,13 +1,12 @@
-//! `eshell` — the emergency shell (Phase 2 slice 9).
+//! `eshell` — the emergency shell.
 //!
 //! The first interactive userspace program: a minimal command shell on the serial console. init
-//! spawns it on a critical-path failure, its own or one `service-mgr` reports (administration Part
-//! E.1a). Keyboard input comes from `/dev/console` (a char `DeviceNode`) through the universal
-//! `sys_io_submit(Read)` + `sys_wait` path; eshell does its own echo + line editing and runs a few
-//! inspection commands. Output is `sys_kprint`.
+//! spawns it on a critical-path failure, its own or one `service-mgr` reports. Keyboard input
+//! comes from `/dev/console` (a char `DeviceNode`) through `sys_io_submit(Read)` + `sys_wait`;
+//! eshell does its own echo and line editing. Output is `sys_kprint`.
 //!
-//! `#![no_std]` + `#![no_main]`, **no `alloc`**, `libkern` only (no rsproto/libos) —
-//! the init family's rules. See `userspace/eshell/CLAUDE.md`.
+//! `#![no_std]` + `#![no_main]`, **no `alloc`**, `libkern` only (no rsproto/libos): see
+//! `userspace/eshell/CLAUDE.md`.
 
 #![no_std]
 #![no_main]
@@ -25,8 +24,6 @@ const READ_LEN: u64 = 256;
 
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
-
-// --- syscall helpers (eshell speaks the raw surface, like init) --------------
 
 /// Wait on a single `PendingOperation` handle; returns `(status, result)` and
 /// closes the PO. `(-1, 0)` if the wait did not signal exactly one handle.
@@ -70,19 +67,14 @@ fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     (status, resolved)
 }
 
-// --- output ------------------------------------------------------------------
-
 /// Echo one byte to the console.
 fn putb(b: u8) {
     kprint(&[b]);
 }
 
-/// The interactive prompt.
 fn prompt() {
     kprint(b"eshell> ");
 }
-
-// --- the line editor ---------------------------------------------------------
 
 /// ASCII control codes the line editor recognises.
 const CR: u8 = 0x0D;
@@ -91,9 +83,8 @@ const BS: u8 = 0x08;
 const DEL: u8 = 0x7F;
 const BEL: u8 = 0x07;
 
-/// Process one received byte against the current line buffer. On end-of-line
-/// (CR/LF) it echoes a newline, dispatches the line, clears it, and reprints the
-/// prompt. Returns nothing — the buffer/len are updated in place.
+/// Process one received byte against the current line buffer. On end-of-line (CR/LF) it echoes a
+/// newline, dispatches the line, clears it, and reprints the prompt.
 fn handle_byte(b: u8, line: &mut [u8; LINE_MAX], len: &mut usize, root_ns: u64) {
     match b {
         CR | LF => {
@@ -121,8 +112,6 @@ fn handle_byte(b: u8, line: &mut [u8; LINE_MAX], len: &mut usize, root_ns: u64) 
         _ => {} // ignore other control bytes
     }
 }
-
-// --- command dispatch --------------------------------------------------------
 
 /// Parse and run one command line (no trailing newline). Empty lines are ignored.
 fn dispatch(line: &[u8], root_ns: u64) {
@@ -153,9 +142,8 @@ fn cmd_help() {
     );
 }
 
-/// List the bindings of the (inherited) root namespace — mount points + kernel
-/// resources — via `sys_ns_enumerate`. This lists the namespace's bindings, not the
-/// files inside a mounted filesystem (that would be an fs-server `readdir`).
+/// List the bindings of the inherited root namespace (mount points and kernel resources) via
+/// `sys_ns_enumerate`, not the files inside a mounted filesystem.
 fn cmd_mounts(root_ns: u64) {
     let mut i: u64 = 0;
     loop {
@@ -177,21 +165,18 @@ fn cmd_mounts(root_ns: u64) {
     }
 }
 
-/// Print a file (or any mappable, sized resource): resolve the path, `stat` it for
-/// its size, map it read-only, and write its bytes. A `FileObject` faults its pages
-/// in from the fs-server as they're read (the slice-8 lazy page cache).
+/// Print a file (or any mappable, sized resource): resolve the path, `stat` it for its size, map it
+/// read-only, and write its bytes. A `FileObject` faults its pages in from the fs-server as read.
 fn cmd_cat(root_ns: u64, path: &[u8]) {
     if path.is_empty() {
         kprint(b"cat: usage: cat <path>\r\n");
         return;
     }
-    // Need MAP_READ (map+read) and INSPECT (stat for the size).
     let (st, h) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ | RIGHT_INSPECT);
     if st != 0 || h == 0 {
         Line::new().s(b"cat: cannot open: ").s(path).s(b"\r").end();
         return;
     }
-    // Stat for the byte size (the slice-9 `HandleInfo.size`).
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `&mut info` is a valid 24-byte HandleInfo out-param.
     let sr = unsafe { syscall2(SYS_HANDLE_STAT, h, (&mut info as *mut HandleInfo) as u64) };
@@ -207,7 +192,6 @@ fn cmd_cat(root_ns: u64, path: &[u8]) {
         unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
         return;
     }
-    // Map read-only (the syscall rounds the length up to whole pages).
     // SAFETY: `h` is a mappable resource handle with MAP_READ.
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, size, RIGHT_MAP_READ) };
     if addr < 0 {
@@ -216,9 +200,8 @@ fn cmd_cat(root_ns: u64, path: &[u8]) {
         unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
         return;
     }
-    // Write the bytes (a FileObject demand-faults its pages here). Trim a
-    // zero-padded tail: a `MemoryObject`'s `size` is page-rounded, so a snapshot
-    // resource (e.g. an initramfs file) has trailing NULs past its content.
+    // Trim a zero-padded tail: a `MemoryObject`'s `size` is page-rounded, so a snapshot resource
+    // (e.g. an initramfs file) has trailing NULs past its content.
     // SAFETY: `addr..addr+size` maps `size` valid bytes of the resource.
     let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size as usize) };
     let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
@@ -236,12 +219,11 @@ fn cmd_cat(root_ns: u64, path: &[u8]) {
 }
 
 /// List the block devices from `/dev/registry` — every one the kernel serves under `/dev/blk`, by
-/// its index, with its kind, size and name (administration Part B.5).
+/// its index, with its kind, size and name.
 ///
-/// **The registry, not a probe.** This probed `/dev/blk/0..` until one was not found, which could
-/// say that a device exists and nothing about it, and stopped at a gap. The registry is bound in
-/// the root namespace — this shell's — and says what exists: the recovery surface, on a boot whose
-/// mount failed, should show the disk and its partitions by name.
+/// **The registry, not a probe.** Probing `/dev/blk/0..` stops at a gap and says nothing about a
+/// device; on a boot whose mount failed, the recovery surface should show the disk and its
+/// partitions by name.
 fn cmd_lsblk(root_ns: u64) {
     let (st, h) = ns_lookup_wait(root_ns, b"/dev/registry", RIGHT_MAP_READ | RIGHT_INSPECT);
     if st != 0 || h == 0 {
@@ -304,8 +286,6 @@ fn cmd_lsblk(root_ns: u64) {
     unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, 0) };
 }
 
-// --- small string helpers (no alloc) -----------------------------------------
-
 /// Trim leading/trailing ASCII spaces.
 fn trim(s: &[u8]) -> &[u8] {
     let mut a = 0;
@@ -328,24 +308,19 @@ fn split_first_word(s: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-// --- entry -------------------------------------------------------------------
-
-/// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the
-/// inherited root namespace, `rdx`/`rcx` unused. eshell resolves `/dev/console`
-/// (and `/dev/blk/*`) through the inherited namespace.
+/// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the inherited root
+/// namespace, `rdx`/`rcx` unused.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, _h0: u64, _a0: u64) -> ! {
     kprint(b"\r\neshell: interactive console (type 'help')\r\n");
 
-    // Resolve the console (read-only input).
     let (st, console) = ns_lookup_wait(root_ns, b"/dev/console", RIGHT_READ);
     if st != 0 || console == 0 {
         kprint(b"eshell: /dev/console not found\r\n");
         halt();
     }
 
-    // A one-page read buffer: the kernel writes input into it (MAP_WRITE), we read
-    // it back (MAP_READ).
+    // One-page read buffer: the kernel writes input into it (MAP_WRITE), we read it (MAP_READ).
     // SAFETY: register-only syscall.
     let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
     if buf_h < 0 {
@@ -365,8 +340,6 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _h0: u64, _a0: u64) -> ! {
     let mut len = 0usize;
     prompt();
 
-    // The read/edit loop. Each console read returns ≥1 raw byte; eshell echoes and
-    // line-edits, running a command on each CR/LF.
     loop {
         let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: buf_h, buf_offset: 0, offset: 0, length: READ_LEN };
         // SAFETY: `console` is a char DeviceNode with READ; `&op` is a valid IoOp.

@@ -2,7 +2,6 @@
 
 use super::*;
 
-/// The bottom bar's tree as things are now.
 #[allow(clippy::too_many_arguments, reason = "the bar's state, theme and screen, each a separate borrow")]
 pub(super) fn bottom_view(
     entries: &[WinEntry],
@@ -16,8 +15,7 @@ pub(super) fn bottom_view(
 ) -> Element<BottomMsg> {
     let cap = task_capacity(desktops, entries, current, theme, font, screen);
     let visible = visible_entries(entries, current, cap);
-    // **The title, or the id when there is none** — a window that has not named itself still
-    // needs a button to click. The serial log's markers are not drawn: the dot says it.
+    // The title, or the id when there is none; the log's markers are not drawn: the dot says it.
     let titles: alloc::vec::Vec<alloc::string::String> = visible.iter().map(|e| entry_title(e)).collect();
     let tasks: alloc::vec::Vec<panel::Task<'_>> = visible
         .iter()
@@ -54,21 +52,15 @@ pub(super) fn present_bottom(
 /// The program a place opens in — the folder's counterpart of [`OPENER`].
 pub(super) const FOLDER_OPENER: &str = "nxfiles";
 
-/// The top bar's two menus: which one is open, the popup showing it, and what the Applications
-/// menu is filtered by (desktop refresh, Part C).
-///
-/// **One popup at a time, whichever menu it is.** `MenuState` moves between the two with Left and
-/// Right; [`sync`](Self::sync) is what makes the popup follow, closing one menu's window and
-/// opening the other's. The popup is a `Child`, like every application's menus, so it keeps its
-/// own retained tree and router — the two things this shell used to keep beside the modal by hand.
+/// The top bar's two menus: which is open, the popup showing it, and what the Applications menu
+/// is filtered by. One popup at a time: [`sync`](Self::sync) makes it follow `MenuState`.
 pub(super) struct BarMenus<'a> {
     /// Which menu is open and which row the keyboard is on.
     pub(super) state: MenuState,
     /// The popup, and which menu it is showing.
     pub(super) win: Option<(usize, Child)>,
-    /// What the Applications menu is filtered by. Cleared when it closes: a launcher that reopened
-    /// still filtered by the last thing launched would be showing a stale answer to a question
-    /// nobody asked.
+    /// What the Applications menu is filtered by. Cleared when it closes, so a reopened launcher
+    /// shows no stale answer.
     pub(super) query: TextFieldState,
     /// The desktop entries, in the order the rows' messages index.
     pub(super) programs: &'a [Application],
@@ -81,7 +73,6 @@ pub(super) struct BarMenus<'a> {
 }
 
 impl BarMenus<'_> {
-    /// The two menus as they are now.
     pub(super) fn table(&self, theme: &Theme) -> alloc::vec::Vec<libui::menu::Menu<MenuMsg>> {
         panel::menus(self.programs, self.query.text(), self.places, self.home, theme)
     }
@@ -115,10 +106,7 @@ impl BarMenus<'_> {
             if which == panel::APPS {
                 self.query.clear();
             }
-            // **Named, because two menus share this path.** These gates read the serial log as
-            // the shell's only externally visible output, and a Places dismissal reading as the
-            // Applications menu's is the line a later gate would assert the wrong thing about
-            // (PR #243 review, optional 8).
+            // Named, because two menus share this path and gates read the serial log.
             Line::new().s(b"desktop-shell: ").s(what.as_bytes()).s(b" closed, window ").u(id as u64).end();
         }
     }
@@ -148,9 +136,7 @@ impl BarMenus<'_> {
             self.state.close();
             return None;
         };
-        // **Drawn before it is announced**, so a line saying it is open is a line about a window
-        // that has committed a frame — an uncommitted popup is invisible and still takes the
-        // keyboard, which is the worst of both.
+        // Drawn before it is announced: an uncommitted popup is invisible yet takes the keyboard.
         if !c.present(session, &view, font, theme) {
             kprint(b"desktop-shell: a menu could not draw its first frame\n");
             c.close(session);
@@ -163,8 +149,6 @@ impl BarMenus<'_> {
         if which == panel::APPS {
             l.s(b"applications menu open, window ").u(id as u64).s(b" listing ").u(self.programs.len() as u64);
         } else {
-            // **Named by `what`**, which knows all three: a two-way branch here called the power
-            // menu the places menu (administration Part F.2).
             l.s(self.what().as_bytes()).s(b" open, window ").u(id as u64);
         }
         l.end();
@@ -172,8 +156,8 @@ impl BarMenus<'_> {
         Some(id)
     }
 
-    /// Redraw the popup with the lit row and the filter as they are now — **at a new size** when
-    /// the filter has changed how many rows there are, since a menu is as tall as what is in it.
+    /// Redraw the popup with the lit row and the filter as they are now, at a new size when the
+    /// filter changed the row count.
     pub(super) fn redraw(&mut self, session: &mut Session<ChannelTransport>, theme: &Theme, font: &Font) {
         let table = panel::menus(self.programs, self.query.text(), self.places, self.home, theme);
         let Some((which, c)) = self.win.as_mut() else { return };
@@ -203,12 +187,8 @@ impl BarMenus<'_> {
     }
 }
 
-/// Where each menu hangs: under its word on the top bar, by [`panel::APPS`], [`panel::PLACES`]
-/// and [`panel::POWER`] — the last **right-aligned** under the power button, so it stays on the
-/// screen (administration Part F.2).
-///
-/// **Read off a layout of the bar**, not written down: a word's position is a fact about the bar,
-/// and the menu hanging from it is the one thing that has to agree.
+/// Where each menu hangs: under its word on the top bar, the power menu right-aligned so it stays
+/// on screen. Read off a layout of the bar, not written down.
 pub(super) fn menu_anchors(clock: &str, theme: &Theme, font: &Font, screen: Screen) -> [(i32, i32); 3] {
     let view = panel::top_bar(clock, None, None, theme);
     let metrics = FontMetrics::new(font, theme.font_px);

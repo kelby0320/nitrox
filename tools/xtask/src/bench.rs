@@ -4,23 +4,9 @@ use crate::*;
 
 /// `cargo xtask bench-compose` — what composing a drag costs, and where.
 ///
-/// **Milestone 13 Part A opens with a measurement, and this runs it.** The plan's claim is that
-/// composing into RAM and copying the finished damage rectangle to the aperture is *also faster*
-/// than composing straight into the aperture, and records it as plausible and unproven. It is
-/// probably wrong as stated: this system maps the aperture **write-back cached**
-/// (`protection_to_page_flags` never sets `NO_CACHE`), so "the per-pixel work moving off MMIO
-/// into cached RAM" describes nothing here. E1 checks that by measurement rather than by reading
-/// page tables.
-///
-/// **A tool, not a gate**, like `shot` and `preview`. Timing under CI is noise and this tree has
-/// no precedent for a performance gate; what this produces is a *before* number to compare a
-/// later change against, and a distribution rather than a mean, because flicker is a tail
-/// phenomenon.
-///
-/// **Run it under both accelerators.** TCG models neither caches nor QEMU's dirty-tracking, so it
-/// measures instruction count — the shadow arm should be strictly slower there by about one copy,
-/// which is the *control*. KVM is where the real answer is, and if the two agree this is not
-/// measuring what it claims to.
+/// A tool, not a gate: CI timing is noise. It records a *before* distribution (flicker is a tail
+/// phenomenon). Run it under both accelerators: TCG measures instruction count, so the shadow
+/// arm should be slower by about one copy (the control); KVM holds the real answer.
 pub(crate) fn cmd_bench_compose(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::Bench)?;
@@ -48,9 +34,7 @@ pub(crate) fn cmd_bench_compose(accel: Accel, size: DisplaySize) -> R<()> {
     let how = if matches!(accel, Accel::Kvm) { "KVM" } else { "TCG" };
     println!("xtask: benchmarking compose under QEMU ({how})…\n");
     let mut session = Session::spawn(cmd, "bench-compose")?;
-    // **A generous deadline, because this is deliberately slow work.** Four hundred composed
-    // frames under TCG is tens of seconds, and a run that timed out mid-distribution would report
-    // a percentile over a truncated tail — which reads as a result rather than as a failure.
+    // Slow on purpose: a timeout mid-distribution would report percentiles of a truncated tail.
     let done = session.expect_within("compose-bench: done", std::time::Duration::from_secs(300))?;
     let transcript = session.finish();
     let path = build_cache().join("guest-transcript-bench-compose.log");
@@ -99,9 +83,7 @@ fn report_bench(transcript: &str) -> R<()> {
         _ => {
             let pct = (ap as f64 / an as f64) * 100.0;
             println!("  aperture is {pct:.0}% of anonymous");
-            // **The interpretation is printed, because a bare ratio invites the reading the
-            // person already expected.** The plan's rationale needs the aperture to be *slower*;
-            // parity means it is ordinary cached memory and that rationale describes nothing.
+            // Print the reading: a bare ratio invites the one already expected.
             if pct < 150.0 {
                 println!(
                     "  → the aperture is behaving as cached RAM. \"off MMIO into cached RAM\"\n\
@@ -157,10 +139,7 @@ fn median(v: &mut [u64]) -> u64 {
     percentile(v, 50)
 }
 
-/// The `p`th percentile by nearest rank, or 0 for no samples.
-///
-/// **Nearest rank rather than interpolation**, because these are timings and an interpolated
-/// value is a number no frame took.
+/// The `p`th percentile by nearest rank (an interpolation is a number no frame took), or 0.
 fn percentile(v: &mut [u64], p: usize) -> u64 {
     if v.is_empty() {
         return 0;

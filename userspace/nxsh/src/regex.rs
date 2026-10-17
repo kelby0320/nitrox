@@ -1,39 +1,22 @@
-//! A regex matcher for `~=` (§10b).
+//! A regex matcher for `~=` (§10b): pattern → program → **Pike VM** (a Thompson NFA
+//! simulation), linear in the input, no backtracking.
 //!
-//! Milestone 3 Part G. Pattern → program → **Pike VM** (a Thompson NFA simulation):
-//! linear time in the input, no backtracking, no catastrophic blowup.
+//! §10b asks `~=` for a boolean and `capture` for the matched text; replace, named groups
+//! and lookaround are out.
 //!
-//! ## Why this is small
+//! Submatch extraction is confined to [`Regex::captures`], a second, slot-carrying pass.
+//! [`Regex::is_match`] allocates no slots: `~=` runs once per row inside `filter`.
 //!
-//! §10b asks `~=` for a boolean — `ls | filter name ~= /\.rs$/` — and `capture` for the
-//! text a pattern matched. Everything else a regex library usually carries (replace, named
-//! groups, lookaround) is still out.
+//! ## Excluded, each a **loud compile error**, never a silently different match
 //!
-//! **Submatch extraction is the single largest source of complexity in a regex engine**,
-//! and it is confined here to one function: [`Regex::captures`] runs a second, slot-
-//! carrying pass. [`Regex::is_match`] is untouched and allocates no slots — `~=` runs once
-//! per row inside `filter`, so it must not pay for a feature it never uses.
+//! - **Backreferences (`\1`).** They force backtracking and exponential blowup; excluding
+//!   them is what permits the linear-time VM (Go's `regexp` and RE2 make the same call).
+//! - **Counted repetition (`{n,m}`).** Pure sugar for concatenation.
+//! - **Lazy quantifiers (`*?`).** Only meaningful when extracting submatches.
+//! - **Lookaround.** Needs a different engine.
 //!
-//! That is also why the minimal version is the *architecturally correct* one rather than a
-//! stepping stone: adding counted repetition or character classes later extends the
-//! compiler, and the VM does not change.
-//!
-//! ## What is excluded, and why each is principled
-//!
-//! - **Backreferences (`\1`).** These are precisely what force backtracking and
-//!   exponential blowup. Excluding them is what *permits* the linear-time VM — the same
-//!   call Go's `regexp` and RE2 make, for the same reason.
-//! - **Counted repetition (`{n,m}`).** Pure sugar; it expands to concatenation. Adding it
-//!   later changes no existing pattern's meaning.
-//! - **Lazy quantifiers (`*?`).** Only meaningful when extracting submatches, which a
-//!   predicate never does.
-//! - **Lookaround.** Needs a different engine, and no shell filter has badly needed it.
-//!
-//! Every one of those is a **loud compile error**, not a silently different match. That is
-//! the property that made this the right starting point and literal-substring-matching the
-//! wrong one: substring-first would silently change what `.` means the day a real engine
-//! arrived, and every pattern written in the meantime would quietly mean something else.
-//! Here, a pattern that compiles today means the same thing forever.
+//! So a pattern that compiles today means the same thing forever; matching substrings
+//! first would have silently changed what `.` means once a real engine arrived.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -41,14 +24,9 @@ use alloc::vec::Vec;
 /// A compiled pattern.
 pub struct Regex {
     prog: Vec<Inst>,
-    /// Where the program begins.
-    ///
-    /// **Not instruction zero.** Fragments are emitted as they are parsed and a combinator
-    /// emits its own instruction *after* its operands, so an alternation's `Split` lands
-    /// past both branches — `a|b` compiles to `Char(a); Char(b); Split(0, 1)`. Starting the
-    /// VM at zero therefore ran the *first branch only*, and `"b" ~= /a|b/` was false. It
-    /// went unnoticed because a concatenation does start at zero, and no test used a
-    /// top-level alternation whose second branch had to win.
+    /// Where the program begins. **Not instruction zero**: a combinator emits its own
+    /// instruction after its operands, so `a|b` compiles to `Char(a); Char(b); Split(0, 1)`
+    /// and starting at zero would run the first branch only.
     start: usize,
     /// `2 × (groups + 1)`: a start and an end for the whole match and for each group.
     slots: usize,
@@ -56,12 +34,10 @@ pub struct Regex {
 
 /// One VM instruction.
 ///
-/// Every instruction with a single successor carries it **explicitly**. The tempting
-/// shortcut — let a `Char` fall through to `pc + 1` and patch a fragment's exit by
-/// overwriting that slot with a `Jump` — is wrong, and wrong in a way that passes simple
-/// tests: overwriting the slot destroys the instruction that was there, so `^bc` became
-/// `Jump; Char(b); Char(c)` and matched anywhere. Explicit successors make a fragment's
-/// exit a *field* to fill rather than an instruction to clobber.
+/// Every instruction with a single successor carries it **explicitly**. Letting a `Char`
+/// fall through to `pc + 1` and patching a fragment's exit by overwriting that slot
+/// destroys the instruction there (`^bc` became `Jump; Char(b); Char(c)` and matched
+/// anywhere); an explicit successor is a field to fill.
 #[derive(Clone, Debug)]
 enum Inst {
     /// Consume one character if it satisfies the class, then go to `.1`.
@@ -69,9 +45,6 @@ enum Inst {
     /// Fork: try both, in the same step.
     Split(usize, usize),
     /// Record the current position in slot `.0`, consuming nothing, then go to `.1`.
-    ///
-    /// Slots are the *only* thing capture adds to the program: what matches is decided by
-    /// the same instructions as before, and these record where.
     Save(usize, usize),
     /// Assert start-of-input, consuming nothing, then go to `.0`.
     AssertStart(usize),
@@ -123,20 +96,17 @@ impl Regex {
 
     /// Whether `text` contains a match (§10b's predicate).
     ///
-    /// Unanchored by default, like `grep`: `name ~= /rs/` is true of `parse.rs`. `^` and
-    /// `$` anchor explicitly, which is what `/\.rs$/` relies on.
+    /// Unanchored, like `grep`; `^` and `$` anchor.
     pub fn is_match(&self, text: &str) -> bool {
         let chars: Vec<char> = text.chars().collect();
-        // The Pike VM: one pass over the input carrying a *set* of active threads, so the
-        // cost is O(len(text) × len(prog)) regardless of how the pattern nests. No thread
-        // ever backs up, which is what removes the blowup.
+        // The Pike VM: a *set* of active threads per step, O(len(text) × len(prog)); no
+        // thread backs up.
         let mut current: Vec<usize> = Vec::new();
         let mut next: Vec<usize> = Vec::new();
         let mut on_current = alloc::vec![false; self.prog.len()];
         let mut on_next = alloc::vec![false; self.prog.len()];
 
         for start in 0..=chars.len() {
-            // Unanchored: a new thread may begin at every position.
             self.add_thread(&mut current, &mut on_current, self.start, start, &chars);
             if current.iter().any(|pc| matches!(self.prog[*pc], Inst::Match)) {
                 return true;
@@ -165,20 +135,12 @@ impl Regex {
     /// The leftmost match and its groups, as `(start, end)` character offsets.
     ///
     /// `None` when the pattern does not match; an element is `None` for a group that did
-    /// not participate (`(a)|(b)` leaves one of them unset by construction). Element 0 is
-    /// always the whole match.
+    /// not participate (`(a)|(b)`). Element 0 is the whole match.
     ///
-    /// This is the Pike VM again, with two additions that give **leftmost-first**
-    /// semantics — the same rule Perl and RE2's default use:
-    ///
-    /// - Threads are processed in priority order, and a thread that reaches `Match`
-    ///   **cuts off every lower-priority thread in the same step**. That is what makes
-    ///   `(a|ab)` prefer `a`.
-    /// - Once a match exists, no new thread is seeded at a later start, so an earlier
-    ///   start always wins over a later one.
-    ///
-    /// Slots are cloned per thread. That is the cost of submatches and the reason `~=`
-    /// keeps its own slot-free pass.
+    /// **Leftmost-first** (Perl, RE2's default): threads run in priority order and one
+    /// reaching `Match` cuts off every lower-priority thread in that step (`(a|ab)` prefers
+    /// `a`); once a match exists no new thread is seeded, so an earlier start wins. Slots are
+    /// cloned per thread, which is why `~=` keeps its own slot-free pass.
     pub fn captures(&self, text: &str) -> Option<Vec<Option<(usize, usize)>>> {
         let chars: Vec<char> = text.chars().collect();
         let mut current: Vec<(usize, Vec<Option<usize>>)> = Vec::new();
@@ -189,9 +151,8 @@ impl Regex {
 
         for at in 0..=chars.len() {
             if matched.is_none() {
-                // Slot 0 is the match start, recorded when the thread is seeded rather
-                // than by an instruction — which is why the compiler emits `Save` only for
-                // groups, and why the program's entry point did not have to move.
+                // Slot 0 is recorded at seeding, not by an instruction: the compiler emits
+                // `Save` only for groups.
                 let mut slots = alloc::vec![None; self.slots];
                 slots[0] = Some(at);
                 self.add_capturing(&mut current, &mut on_current, self.start, at, &chars, slots);
@@ -249,8 +210,7 @@ impl Regex {
         match &self.prog[pc] {
             Inst::Split(a, b) => {
                 let (a, b) = (*a, *b);
-                // Priority order: `a` first. This is what makes the match leftmost-*first*
-                // rather than longest.
+                // Priority order: `a` first, which makes the match leftmost-*first*.
                 self.add_capturing(list, seen, a, at, chars, slots.clone());
                 self.add_capturing(list, seen, b, at, chars, slots);
             }
@@ -278,8 +238,7 @@ impl Regex {
 
     /// Follow `Split`/`Jump`/assertions without consuming, adding reachable states.
     ///
-    /// `seen` is what keeps this linear: a state already in the set this step is not added
-    /// twice, so a pattern like `(a*)*` cannot spin.
+    /// `seen` keeps this linear: `(a*)*` cannot spin.
     fn add_thread(&self, list: &mut Vec<usize>, seen: &mut [bool], pc: usize, at: usize, chars: &[char]) {
         if pc >= self.prog.len() || seen[pc] {
             return;
@@ -291,8 +250,7 @@ impl Regex {
                 self.add_thread(list, seen, a, at, chars);
                 self.add_thread(list, seen, b, at, chars);
             }
-            // `is_match` does not care *where* anything matched, so a `Save` is a plain
-            // pass-through here — the slot-carrying twin in `captures` is where it records.
+            // `is_match` ignores where anything matched, so `Save` passes through.
             Inst::Save(_, then) => {
                 let then = *then;
                 self.add_thread(list, seen, then, at, chars);
@@ -331,7 +289,6 @@ enum Hole {
 fn patch(prog: &mut [Inst], holes: &[Hole], target: usize) {
     for h in holes {
         match *h {
-            // Fill the instruction's successor *field*; never replace the instruction.
             Hole::Next(i) => match &mut prog[i] {
                 Inst::Char(_, then) | Inst::AssertStart(then) | Inst::AssertEnd(then) | Inst::Save(_, then) => {
                     *then = target;
@@ -370,7 +327,6 @@ impl Parser {
         self.prog.len() - 1
     }
 
-    /// `a|b|c`
     fn alternation(&mut self) -> Result<Frag, String> {
         let mut left = self.concat()?;
         while self.peek() == Some('|') {
@@ -401,7 +357,6 @@ impl Parser {
         }
         Ok(match frag {
             Some(f) => f,
-            // An empty branch (`a|`) matches the empty string.
             None => {
                 // An empty branch (`a|`) matches the empty string: a `Split` whose two
                 // arms are the same exit, so it consumes nothing and always proceeds.
@@ -462,8 +417,6 @@ impl Parser {
                          lookaround needs a different engine",
                     ));
                 }
-                // Groups are numbered in the order their `(` appears, which is the order
-                // a reader counts them in.
                 self.groups += 1;
                 let g = self.groups;
                 let open = self.emit(Inst::Save(2 * g, usize::MAX));
@@ -522,7 +475,6 @@ impl Parser {
         }
     }
 
-    /// `[abc]`, `[a-z]`, `[^…]`.
     fn char_class(&mut self) -> Result<Class, String> {
         let negated = if self.peek() == Some('^') {
             self.pos += 1;
@@ -553,7 +505,6 @@ impl Parser {
                 self.pos += 1;
                 match escape_class(e)? {
                     Class::Literal(l) => l,
-                    // `\d` inside a class contributes its ranges.
                     Class::Set { ranges: r, .. } => {
                         ranges.extend(r);
                         continue;
@@ -594,16 +545,13 @@ fn escape_class(e: char) -> Result<Class, String> {
         'n' => Class::Literal('\n'),
         't' => Class::Literal('\t'),
         'r' => Class::Literal('\r'),
-        // A digit after a backslash is a backreference — the one exclusion that is
-        // load-bearing rather than merely scoped, since backreferences are what would
-        // force backtracking and lose the linear-time guarantee.
+        // A digit after a backslash is a backreference, refused so matching stays linear.
         '1'..='9' => {
             return Err(String::from(
                 "backreferences (`\\1`) are not supported — they are what would force \
                  backtracking, and excluding them is what keeps matching linear-time",
             ));
         }
-        // Everything else escapes to itself: `\.`, `\*`, `\/`, `\\`.
         other => Class::Literal(other),
     })
 }
@@ -619,8 +567,6 @@ mod tests {
     #[test]
     fn literals_match_unanchored() {
         assert!(m("rs", "parse.rs"));
-        // Not `parse.py` — that contains "rs" in "pa*rs*e", which is exactly the sort of
-        // accidental substring an unanchored predicate is supposed to find.
         assert!(!m("rs", "notes.py"));
         assert!(m("", "anything"));
     }
@@ -632,7 +578,6 @@ mod tests {
         assert!(re.is_match("parse.rs"));
         assert!(!re.is_match("parse.rss"));
         assert!(!re.is_match("rs"));
-        // `\.` is a literal dot, so it does not match an arbitrary character.
         assert!(!re.is_match("parsexrs"));
     }
 
@@ -686,9 +631,7 @@ mod tests {
         assert!(m(r"^\D$", "x"));
     }
 
-    /// The property that makes this the right starting point: an unsupported construct is
-    /// a **loud error**, never a silently different match. A pattern that compiles today
-    /// means the same thing forever.
+    /// An unsupported construct is a **loud error**, never a silently different match.
     #[test]
     fn unsupported_constructs_are_named_errors() {
         let cases =
@@ -711,14 +654,12 @@ mod tests {
         }
     }
 
-    /// The whole reason for a Pike VM. A backtracking engine takes exponential time on
-    /// this; here it is linear, and the test finishing *is* the assertion.
+    /// A backtracking engine takes exponential time on this; the test finishing is the assertion.
     #[test]
     fn a_pathological_pattern_does_not_blow_up() {
         let re = Regex::new("^(a*)*b$").expect("compiles");
         assert!(!re.is_match("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(re.is_match("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"));
-        // Nested alternation over a long input, the other classic blowup shape.
         let re = Regex::new("^(a|aa)+$").expect("compiles");
         assert!(re.is_match("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(!re.is_match("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"));
@@ -729,8 +670,6 @@ mod tests {
         assert!(m("^.$", "é"));
         assert!(m("^é$", "é"));
     }
-
-    // --- submatches (§10b, Part F) ------------------------------------------
 
     fn caps(pattern: &str, text: &str) -> Option<Vec<Option<alloc::string::String>>> {
         let re = Regex::new(pattern).expect("compiles");
@@ -755,12 +694,10 @@ mod tests {
     #[test]
     fn groups_come_back_in_the_order_they_open() {
         assert_eq!(text(r"(\d+)-(\d+)", "call 12-345 now"), ["12-345", "12", "345"]);
-        // Nested groups are numbered by their `(`, which is how a reader counts them.
         assert_eq!(text("((a)b)", "xaby"), ["ab", "ab", "a"]);
     }
 
-    /// A group that did not participate is `None`, not an empty string — `(a)|(b)` leaves
-    /// one unset **by construction**, and "did not match" is not "matched nothing".
+    /// A group that did not participate is `None`, not an empty string.
     #[test]
     fn a_group_that_did_not_participate_is_absent() {
         let g = caps("(a)|(b)", "b").expect("a match");
@@ -769,13 +706,11 @@ mod tests {
         assert_eq!(g[2].as_deref(), Some("b"));
     }
 
-    /// **Leftmost-first**, the rule Perl and RE2's default use: an earlier start wins, and
-    /// within a start the higher-priority alternative wins.
+    /// **Leftmost-first**: an earlier start wins, then the higher-priority alternative.
     #[test]
     fn the_match_is_leftmost_then_first() {
         assert_eq!(text("(a|ab)", "ab"), ["a", "a"]);
         assert_eq!(text("a+", "baaa"), ["aaa"]);
-        // An earlier start beats a longer later one.
         assert_eq!(text("(x|xy)", "zxy"), ["x", "x"]);
     }
 
@@ -786,38 +721,28 @@ mod tests {
         assert_eq!(text("^(a)bc$", "abc"), ["abc", "a"]);
     }
 
-    /// A repeated group keeps its **last** iteration, which is what every engine does and
-    /// the reason `(a)*` is a poor way to collect things.
+    /// A repeated group keeps its **last** iteration.
     #[test]
     fn a_repeated_group_holds_its_last_iteration() {
         assert_eq!(text("(ab)+", "ababab"), ["ababab", "ab"]);
     }
 
-    /// The pathological case the engine exists to survive still terminates — now with
-    /// slots being cloned at every fork.
+    /// The pathological case still terminates now that slots are cloned at every fork.
     #[test]
     fn the_pathological_pattern_still_terminates_with_slots() {
         let g = caps("(a*)*b", "aaaaaaaaaaaaaaaaaaaaaaaaac");
         assert!(g.is_none());
     }
 
-    /// **A top-level alternation must try every branch**, which it did not.
-    ///
-    /// Instructions are emitted as fragments are parsed, and a combinator emits its own
-    /// after its operands — so `a|b` is `Char(a); Char(b); Split(0, 1)` and the `Split` is
-    /// the *last* instruction. Both VMs started at instruction zero, which is the first
-    /// branch, so `"b" ~= /a|b/` was false. A concatenation happens to start at zero, and
-    /// no test used an alternation whose second branch had to win — found by writing
-    /// `capture`'s tests, not by writing `capture`.
+    /// A top-level alternation must try every branch: both VMs once started at instruction
+    /// zero, so `"b" ~= /a|b/` was false and no test had a second branch that had to win.
     #[test]
     fn an_alternation_tries_both_branches() {
         let re = Regex::new("a|b").expect("compiles");
         assert!(re.is_match("a"));
         assert!(re.is_match("b"), "the second branch was unreachable");
         assert!(!re.is_match("c"));
-        // …and the same for `capture`, which shares the entry point.
         assert_eq!(text("(a)|(b)", "b")[0], "b");
-        // Nested inside a larger pattern, where the Split is not last either.
         let re = Regex::new("x(a|b)y").expect("compiles");
         assert!(re.is_match("xby"));
     }

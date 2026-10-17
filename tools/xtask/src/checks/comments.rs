@@ -16,13 +16,13 @@ const NUDGE_MIN: usize = 3;
 const SAFETY_MAX: usize = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub(super) enum Kind {
     Blank,
     Comment,
     Code,
 }
 
-fn kind(line: &str) -> Kind {
+pub(super) fn kind(line: &str) -> Kind {
     let t = line.trim();
     if t.is_empty() {
         Kind::Blank
@@ -33,10 +33,10 @@ fn kind(line: &str) -> Kind {
     }
 }
 
-struct Line {
-    file: String,
-    line: usize,
-    text: String,
+pub(super) struct Line {
+    pub(super) file: String,
+    pub(super) line: usize,
+    pub(super) text: String,
 }
 
 #[derive(Default)]
@@ -102,7 +102,7 @@ struct Tally {
 
 /// Which of `lines` are a `SAFETY` comment or a doc comment's `# Safety` section, to its
 /// [`SAFETY_MAX`]th line: the rules require both, so neither is counted.
-fn safety_lines(lines: &[Line]) -> Vec<bool> {
+pub(super) fn safety_lines(lines: &[Line]) -> Vec<bool> {
     let mut out = vec![false; lines.len()];
     let mut inside = 0usize;
     for (i, line) in lines.iter().enumerate() {
@@ -204,7 +204,7 @@ fn body(comment: &str) -> &str {
 
 /// The reference a comment makes to a PR, an issue, a review finding, a phase, a part, a milestone
 /// or a slice, if it makes one.
-fn reference(comment: &str) -> Option<String> {
+pub(super) fn reference(comment: &str) -> Option<String> {
     fn clean(w: &str) -> &str {
         let w = w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '#'));
         w.strip_suffix("'s").or_else(|| w.strip_suffix("’s")).unwrap_or(w)
@@ -250,6 +250,11 @@ fn reference(comment: &str) -> Option<String> {
 }
 
 pub(crate) fn cmd_check_comments(args: &[String]) -> R<()> {
+    match args.first().map(String::as_str) {
+        Some("--ratio") => return super::comment_budget::cmd_ratio(&args[1..]),
+        Some("--only-comments") => return super::comment_budget::cmd_only_comments(&args[1..]),
+        _ => {}
+    }
     let base = args
         .iter()
         .position(|a| a == "--base")

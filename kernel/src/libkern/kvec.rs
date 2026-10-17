@@ -7,19 +7,15 @@ use core::ptr::{self, NonNull};
 use crate::libkern::AllocError;
 use crate::mm::slab::{kfree, kmalloc};
 
-/// A fallible, growable, heap-backed array — the kernel's analogue of
-/// `alloc::vec::Vec`.
+/// A fallible, growable, heap-backed array — the kernel's analogue of `alloc::vec::Vec`.
 ///
 /// Every operation that can allocate ([`try_push`](KVec::try_push),
 /// [`try_reserve`](KVec::try_reserve),
 /// [`try_extend_from_slice`](KVec::try_extend_from_slice)) returns
-/// `Result<_, `[`AllocError`]`>` rather than aborting on exhaustion. That
-/// is why the kernel uses `KVec` in place of `alloc`'s `Vec` — see the
-/// decision log entry of 2026-05-20.
+/// `Result<_, `[`AllocError`]`>` rather than aborting on exhaustion.
 ///
-/// An empty `KVec` holds no allocation; the backing buffer is acquired
-/// lazily on first growth and released on drop. A zero-sized element type
-/// never allocates.
+/// An empty `KVec` holds no allocation; the buffer is acquired lazily on first growth and
+/// released on drop. A zero-sized element type never allocates.
 pub struct KVec<T> {
     /// Backing buffer. Dangling when `cap == 0` or `T` is zero-sized.
     ptr: NonNull<T>,
@@ -78,20 +74,15 @@ impl<T> KVec<T> {
 
     /// Append `val` **without ever growing**, returning it back when the vector is full.
     ///
-    /// **For anything pushing under a lock.** [`try_push`](Self::try_push) grows, and growth
-    /// is `kmalloc` + `kfree` — so at the reserve boundary a push under the rank-1 `SCHED`
-    /// lock reaches the allocator's plain spinlock, which `kernel/docs/lock-ordering.md`
-    /// forbids without qualification (F2/F11). A `debug_assert!(len < capacity)` beside such
-    /// a push does not prevent it: the growth happens first and succeeds, so the assertion
-    /// never fires and the inversion is silent (kernel audit C.1(c), 2026-08-14).
+    /// **For anything pushing under a lock.** [`try_push`](Self::try_push) grows, and growth is
+    /// `kmalloc` + `kfree` — so at the reserve boundary a push under the rank-1 `SCHED` lock
+    /// reaches the allocator's plain spinlock, which `kernel/docs/lock-ordering.md` forbids. A
+    /// `debug_assert!(len < capacity)` beside such a push does not prevent it: the growth happens
+    /// first and succeeds, so the inversion is silent.
     ///
-    /// Returning `Err(val)` rather than dropping it matters for the same reason: an
-    /// `ObjectRef` dropped here would reach `SlabCache::free` under the same lock. The caller
-    /// gets its value back and decides — carry it out of the locked block, park it, or
-    /// `forget` it.
-    ///
-    /// This is deliberately not `try_push`'s behaviour. A reserve-then-push caller wants the
-    /// refusal; a general caller wants the growth.
+    /// Returning `Err(val)` rather than dropping it matters for the same reason: an `ObjectRef`
+    /// dropped here would reach `SlabCache::free` under the same lock. The caller carries the
+    /// value out of the locked block, parks it, or `forget`s it.
     pub fn push_within_capacity(&mut self, val: T) -> Result<(), T> {
         if self.len == self.cap {
             return Err(val);
@@ -179,8 +170,6 @@ impl<T> KVec<T> {
         if required <= self.cap {
             return Ok(());
         }
-        // Amortise growth by doubling, but jump straight to `required`
-        // when a single reservation asks for more than a doubling.
         let new_cap = if self.cap == 0 { required.max(4) } else { required.max(self.cap.saturating_mul(2)) };
         self.realloc_to(new_cap)
     }
@@ -262,8 +251,7 @@ mod tests {
 
     use super::*;
 
-    /// The whole point: at capacity it refuses and hands the value back, rather than
-    /// allocating — which under `SCHED` would reach the allocator's plain spinlock (F2).
+    /// At capacity it refuses and hands the value back rather than allocating.
     #[test]
     fn push_within_capacity_refuses_instead_of_growing() {
         init_global_heap();
@@ -277,20 +265,16 @@ mod tests {
         }
         assert_eq!(v.len(), cap);
 
-        // Full: the value comes back and the allocation is untouched.
         assert_eq!(v.push_within_capacity(99), Err(99));
         assert_eq!(v.capacity(), cap, "a refusal must not grow the buffer");
         assert_eq!(v.len(), cap);
 
-        // Room again after a pop.
         v.pop();
         assert_eq!(v.push_within_capacity(99), Ok(()));
         assert_eq!(v.capacity(), cap);
     }
 
-    /// An empty, never-reserved vector has no room, so it refuses rather than allocating —
-    /// the case a `debug_assert!(len < capacity)` reads as fine (`0 < 0` is false, but the
-    /// assert sits *beside* a `try_push` that has already grown by then).
+    /// An empty, never-reserved vector has no room, so it refuses rather than allocating.
     #[test]
     fn push_within_capacity_on_an_unreserved_vector_allocates_nothing() {
         init_global_heap();
@@ -347,8 +331,8 @@ mod tests {
     #[test]
     fn growth_crosses_slab_to_buddy_boundary() {
         init_global_heap();
-        // 800 * 8 bytes = 6400 bytes — well past the 2048-byte largest
-        // slab bucket, so the backing buffer routes through `large_alloc`.
+        // 800 * 8 bytes is past the 2048-byte largest slab bucket: the buffer routes through
+        // `large_alloc`.
         let mut v = KVec::new();
         for i in 0..800u64 {
             v.try_push(i).unwrap();
@@ -386,9 +370,6 @@ mod tests {
         for _ in 0..4 {
             v.try_push(DropFlag(&count)).unwrap();
         }
-        // Removing returns ownership of exactly one element; dropping the
-        // returned value runs exactly one destructor, and the three shifted
-        // survivors are not dropped by the shift.
         let taken = v.remove(0);
         drop(taken);
         assert_eq!(count.load(Ordering::SeqCst), 1);

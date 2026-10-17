@@ -11,28 +11,14 @@ const HOT_KEYBOARD: &[&str] = &["usb: port ", ": 0627:0001 class 03/01/01, high-
 /// The mouse swapped in for it on the same port: a high-speed boot mouse.
 const HOT_MOUSE: &[&str] = &["usb: port ", ": 0627:0001 class 03/01/02, high-speed, \"QEMU USB Mouse"];
 
-/// **USB devices plugged in after boot, swapped, and pulled out** (Phase 6 Part A.2): coldplug is
-/// the first round of hot-plug, and these are the rounds after it.
-/// 1. Once the guest logs its first round, a keyboard is added over QMP.
-/// 2. Once it logs the keyboard's arrival **and its binding**, **the machine is paused**, the
-///    keyboard removed and a
-///    mouse added on the same QEMU port, and the machine resumed. The guest then finds a connect
-///    change on a port that still has a device — both changes landed before it looked — which is
-///    a replug it must take as a departure and an arrival. Paused, so the two always land together:
-///    a hub thread that keeps the old device fails it every time (PR #355 review).
-/// 3. Once it logs the mouse's arrival and its binding, the mouse is removed, and the QMP
-///    connection closed — QEMU serves one QMP client at a time, and the deadline's dump of the
-///    guest needs it.
-///
-/// **Bound, not only enumerated, before each is taken away** (PR #358's gate run). Binding asks the
-/// device for its protocol and idle rate after the arrival line, and a device taken away meanwhile
-/// leaves that request unanswered: the default endpoint is in doubt, and the device is rightly not
-/// bound. Acting on the arrival line made that a race with the guest's speed, which a binding that
-/// ignored a failed `SET_PROTOCOL` used to hide.
-///
-/// The lines are asserted after the run by [`check_hot_plug`]. It lands on a root port only because
-/// `test-qemu`'s controller has eight connectors: with QEMU's four, the boot's devices fill them and
-/// the keyboard goes behind the hub, where the driver does not look (PR #353 review).
+/// **USB devices plugged in after boot, swapped, and pulled out**: once the guest logs its first
+/// round a keyboard is added over QMP; once it logs the keyboard **bound**, **the machine is
+/// paused**, the keyboard removed and a mouse added on the same port, so the guest finds a connect
+/// change on a port that still has a device and must take it as a departure and an arrival; once it
+/// logs the mouse bound, the mouse is removed and the QMP connection closed (QEMU serves one
+/// client, and the deadline's dump needs it). Bound, not only enumerated: a device removed during
+/// binding is rightly not bound. Asserted by [`check_hot_plug`]; the device lands on a root port
+/// only because `test-qemu`'s controller has eight connectors.
 #[derive(Default)]
 pub(crate) struct HotPlug {
     stage: u8,
@@ -58,7 +44,6 @@ impl HotPlug {
 
     fn advance(&mut self, transcript: &[u8], qmp_sock: &Path) -> R<()> {
         let text = String::from_utf8_lossy(transcript);
-        // Whether the device `fragments` names has arrived after `from`, and been bound as `what`.
         let bound = |from: usize, fragments: &[&str], what: &str| {
             let rest = &text[from..];
             let Some(line) = rest.lines().find(|l| fragments.iter().all(|f| l.contains(f))) else {
@@ -110,9 +95,9 @@ impl HotPlug {
 }
 
 /// **The hot-plug's lines**, in order after the first round, all on one port: the keyboard's
-/// arrival; its departure when the mouse is swapped in; the mouse's arrival; the mouse's departure.
-/// Each departure with its slot disabled. And **the first round before userspace**: the boot waits
-/// for it, which the facts alone cannot show, since its lines would be there either way, later.
+/// arrival and binding, its departure when the mouse is swapped in, the mouse's arrival and
+/// binding, its departure; each departure with its slot disabled. **And the first round before
+/// userspace**, which the facts alone cannot show.
 pub(crate) fn check_hot_plug(transcript: &[u8], hot: &HotPlug) -> R<()> {
     if let Some(why) = &hot.failed {
         return Err(format!("the hot-plug could not be driven over QMP: {why}").into());
@@ -141,8 +126,6 @@ pub(crate) fn check_hot_plug(transcript: &[u8], hot: &HotPlug) -> R<()> {
         .ok_or_else(|| format!("no port in {line:?}"))?;
     let gone = format!("usb: port {port}: disconnected; slot ");
     let mouse = format!("usb: port {port}: 0627:0001 class 03/01/02, high-speed, \"QEMU USB Mouse");
-    // **Each bound as it arrives** (Part B.2), and unbound when it leaves, which the departure's
-    // slot being disabled follows.
     let kbd_bound = format!("usb: port {port}: keyboard at /dev/input/raw/");
     let mouse_bound = format!("usb: port {port}: mouse at /dev/input/raw/");
     let mut rest = &after[after.find(line).unwrap_or(0) + line.len()..];
@@ -176,15 +159,12 @@ pub(crate) fn check_hot_plug(transcript: &[u8], hot: &HotPlug) -> R<()> {
     Ok(())
 }
 
-/// The devices line's count of USB devices `device-mgr` lists, the part before it.
 const DEVICES_USB_LISTED: &str = " of them usb-<id>, and ";
 
-/// **`device-mgr` lists every device the first round found** (Phase 6 Part A.3; PR #356 review).
-/// `boot-probe` can hold the manager only to the registry's first records, since the hot-plug may
-/// land on either side of the manager's one read — and a manager that dropped every USB record
-/// looks, to it, like one that read before any registered. The host knows better: the first round
-/// ended before `init` ([`check_hot_plug`] asserts it), so the manager read at least that round's
-/// devices, and its count of `usb-<id>.tsm` files must be at least the round's.
+/// **`device-mgr` lists every device the first round found.** `boot-probe` can hold the manager
+/// only to the registry's first records, as the hot-plug may land on either side of its read; the
+/// first round ended before `init`, so the count of `usb-<id>.tsm` files must be at least the
+/// round's.
 pub(crate) fn check_usb_listed(transcript: &[u8]) -> R<()> {
     let text = String::from_utf8_lossy(transcript);
     let round = text
@@ -204,9 +184,8 @@ pub(crate) fn check_usb_listed(transcript: &[u8]) -> R<()> {
         .into());
     }
     println!("xtask: device-mgr lists {listed} USB device(s) as usb-<id>.tsm, the first round's {round} among them ✓");
-    // **And `input-server` was handed the keyboards and mice the first round bound** (Part B.2),
-    // beside the i8042's two, which `test-qemu`'s machine has. At least: a hot-plugged keyboard bound
-    // before the manager's read is handed over too.
+    // `input-server` is handed the i8042's two and every input device the first round bound, or
+    // more: a keyboard hot-plugged and bound before the manager's read is handed over too.
     let at_round = text.find(USB_FIRST_ROUND).unwrap_or(0);
     let bound =
         text[..at_round].lines().filter(|l| l.starts_with("usb: port ") && l.contains(" at /dev/input/raw/")).count();
@@ -230,40 +209,26 @@ pub(crate) fn check_usb_listed(transcript: &[u8]) -> R<()> {
     Ok(())
 }
 
-/// **QEMU's xHCI, configured as the laptop's is: MSI, and no MSI-X** (Phase 6 Part A). The laptop's
-/// Sunrise Point-LP controller has plain MSI with eight vectors and no MSI-X, and the driver takes
-/// the one interrupt mechanism that machine has, so every gate's controller is given it.
-///
-/// **`nec-usb-xhci`, not `qemu-xhci`**: the same xHCI core with the NEC µPD720200's identity
-/// (`1033:0194`). `qemu-xhci` offers MSI-X alone on q35, and only QEMU 11 lets that be changed —
-/// QEMU 8.2, which CI runs, hard-codes it, with no `msi` property, so the first version of this
-/// constant failed every CI boot that attached it (PR #354). The NEC model takes `msi` and `msix`
-/// in both, and numbers its SuperSpeed ports first, as `qemu-xhci` does.
+/// **QEMU's xHCI, configured as the laptop's is: MSI, and no MSI-X**, the one mechanism its Sunrise
+/// Point-LP controller has, and so the driver's. **`nec-usb-xhci`, not `qemu-xhci`**: `qemu-xhci`
+/// offers MSI-X alone on q35, and only QEMU 11 lets that be changed; CI's QEMU 8.2 has no `msi`
+/// property. The NEC model takes `msi` and `msix` in both, and numbers its SuperSpeed ports first.
 pub(crate) const XHCI_DEVICE: &str = "nec-usb-xhci,id=xhci,msi=on,msix=off";
 
-/// **A machine whose only keyboard and mouse are USB** (Phase 6 Part B): q35 with its i8042 off —
-/// the FADT then says the 8042 is absent, and the PS/2 driver publishes nothing — and a `usb-kbd`
-/// and a `usb-mouse` on the gates' controller, which is added here unless the gate has one
-/// already (`check-report`'s stick is on it). QMP's input reaches them because nothing else takes
-/// it. A second `-machine` merges with `qemu_base_args`'s, as QEMU 8.2 and 11 both do.
+/// **A machine whose only keyboard and mouse are USB**: q35 with its i8042 off (the FADT then says
+/// the 8042 is absent) and a `usb-kbd` and `usb-mouse` on the gates' controller, added here unless
+/// the gate has one. A second `-machine` merges with `qemu_base_args`'s in QEMU 8.2 and 11.
 pub(crate) fn usb_input_args(cmd: &mut Command, add_controller: bool) {
     cmd.arg("-machine").arg("i8042=off");
     if add_controller {
         cmd.arg("-device").arg(XHCI_DEVICE);
     }
-    // `id=usbkbd`, so `check-input --usb` can unplug it (Phase 6 Part C).
     cmd.arg("-device").arg("usb-kbd,bus=xhci.0,id=usbkbd").arg("-device").arg("usb-mouse,bus=xhci.0");
 }
 
 /// **`boot-probe`'s registry test has reported**, waited for before `check-input --usb`'s keyboards
-/// come and go (PR #363's gate run). The test reads the device table once and looks up every present
-/// record's paths, and an unplug in the middle of it fails it: a kept `--kvm` transcript had it
-/// reading the table between the gate's unplug of one keyboard and its plug of the next, and finding
-/// none. It landed among the swaps in every run kept, either side of the last plug.
-///
-/// **Not `boot-probe`'s whole verdict**: the test client gives up after twenty seconds without an
-/// event (`IDLE_LIMIT_NS` in `inputclient.rs`), and the verdict comes long after the registry test.
-/// Read from the transcript, not with `expect`, which would consume what the gate waits for next.
+/// come and go, as an unplug in the middle of it fails it. Not the whole verdict, which comes long
+/// after the test client gives up. Read from the transcript, not with `expect`.
 pub(crate) fn await_registry_probe(s: &Session) -> R<()> {
     let start = std::time::Instant::now();
     let reported = |l: &str| {
@@ -280,19 +245,12 @@ pub(crate) fn await_registry_probe(s: &Session) -> R<()> {
     Ok(())
 }
 
-/// **`check-input --usb`'s keyboards coming and going** (Phase 6 Part C), while the test client's
-/// window holds the keyboard and logs every key it receives:
-/// 1. **the boot keyboard unplugged**: the input server sees it leave, the manager says it departed,
-///    and its slot is retired;
-/// 2. **a keyboard plugged in**, then the only one, so every key after is its: the manager hands it
-///    over, the input server reads it and writes its lights, and a key typed on it reaches the window;
-/// 3. **a key held down on it, then the keyboard unplugged: the window sees the release.** QEMU
-///    sends nothing for a key held when its device goes (`hw/input/hid.c`, `hid_free`), so the
-///    release is the guest's — the driver letting go of what its last report held;
-/// 4. a keyboard plugged in for the rest of the gate.
-///
-/// Each line is matched from the action that causes it on, whichever process prints first: the
-/// input server's "left", the manager's departure and the kernel's lines answer one unplug.
+/// **`check-input --usb`'s keyboards coming and going** while the test client's window holds the
+/// keyboard: the boot keyboard unplugged; one plugged in, then the only one; **a key held down on
+/// it, then it is unplugged, and the window sees the release** (QEMU sends nothing for a key held
+/// when its device goes, `hw/input/hid.c`, so the release is the guest's); one plugged in for the
+/// rest of the gate. Each line is matched from the action that causes it on, whichever process
+/// prints first: the input server's, the manager's and the kernel's lines answer one unplug.
 pub(crate) fn usb_keyboards_come_and_go(qmp: &mut Qmp, session: &mut Session) -> R<()> {
     let secs = std::time::Duration::from_secs;
     let any = |_: &str| true;
@@ -323,7 +281,6 @@ pub(crate) fn usb_keyboards_come_and_go(qmp: &mut Qmp, session: &mut Session) ->
     session.expect("input-testclient: win key code=48 down=0")?;
     println!("  ok: a keyboard plugged in was handed over, read, given its lights, and typed on");
 
-    // `x` is keycode 45.
     qmp.send_key("x", true)?;
     session.expect("input-testclient: win key code=45 down=1")?;
     let from = session.transcript().len();
@@ -339,11 +296,9 @@ pub(crate) fn usb_keyboards_come_and_go(qmp: &mut Qmp, session: &mut Session) ->
     Ok(())
 }
 
-/// **What `check-input --usb`'s departures leave in the transcript** (Phase 6 Part C): one `left`
-/// line for each of its two unplugged keyboards, and neither line an input server prints for a node
-/// it goes on reading after its device has gone — `read completed with an error` for a read that
-/// completes `PeerClosed`, and `read submit FAILED` at each pass for one refused. Asserting on the
-/// failed submit alone could not see the first (PR #360 review).
+/// **What `check-input --usb`'s departures leave in the transcript**: one `left` line per unplugged
+/// keyboard, and no read of a node after its device has gone: neither `read completed with an
+/// error` (a read completing `PeerClosed`) nor `read submit FAILED` (one refused).
 pub(crate) fn check_departures_quiet(transcript: &str) -> R<()> {
     let left = transcript.lines().filter(|l| l.starts_with("input-server: keyboard ") && l.ends_with(" left")).count();
     if left != 2 {
@@ -362,11 +317,9 @@ pub(crate) fn check_departures_quiet(transcript: &str) -> R<()> {
     Ok(())
 }
 
-/// What `check-report --usb`'s report says beside [`EMULATED_MACHINE_FACTS`] and [`REPORT_FACTS`]
-/// (Phase 6 Part B): the FADT's 8042 absent, where the first has it present; the keyboard and mouse
-/// bound at `/dev/input/raw/0` and `/1`, since no i8042 took them, on the USB 2 ports after the
-/// stick's (read off the first run); and a first round of three devices, where the second has the
-/// stick's one.
+/// What `check-report --usb`'s report says beside [`EMULATED_MACHINE_FACTS`] and [`REPORT_FACTS`]:
+/// the FADT's 8042 absent; the keyboard and mouse bound at `/dev/input/raw/0` and `/1`; a first
+/// round of three devices.
 pub(crate) const USB_INPUT_FACTS: &[&[&str]] = &[
     &["fadt: boot arch 0x0; 8042 absent"],
     &["ps2: no i8042 devices answered"],
@@ -375,26 +328,15 @@ pub(crate) const USB_INPUT_FACTS: &[&[&str]] = &[
     &["usb: first round: 3 device(s) in "],
 ];
 
-/// **The USB devices `test-qemu` boots with** (Phase 6 Part A): an xHCI controller with a device
-/// at each of three speeds, a hub, and one nothing matches.
-/// - `usb-kbd` attaches at high speed, `usb-mouse` with `usb_version=1` at full speed, and
-///   `usb-storage` at SuperSpeed (QEMU 11.0.2's `info usb`). No QEMU USB device takes a low-speed
-///   setting.
-/// - `usb-hub` matches as a hub, which is listed and left alone: external hubs are outside Phase 6.
-/// - **`usb-ccid`** is the device nothing matches, a smart-card reader, and **the one whose default
-///   endpoint is not its speed's default**: full speed with 64-byte packets, so its enumeration
-///   takes Evaluate Context. The other four keep the default, and QEMU's controller ignores the
-///   packet size anyway, so without it nothing would run that path (Part A.2, read off a boot).
-/// - **`p2=8,p3=8` gives eight connectors.** The defaults give four, which these four fill, and a
-///   device plugged in later would land behind the hub, where the driver does not look (PR #353
-///   review).
-/// - **The stick is a stick from a shop** (Phase 6 Part D): an MBR naming one FAT partition, which
-///   the first round reads and the storage service reports and leaves unmounted, until Part E.
-/// - **And a drive past 2 TiB** (Phase 6 Part G): [`PAST_TWO_TIB_IMAGE`], 3 TiB, blank and sparse,
-///   last, so every other device keeps its port. The kernel reads it with the sixteen-byte
-///   commands, `boot-probe` writes a sector past 2 TiB through its node, and
-///   [`check_past_two_tib`] finds that sector in the image, where a block number cut to 32 bits
-///   would have put it 2 TiB lower.
+/// **The USB devices `test-qemu` boots with**: an xHCI controller with a device at each of three
+/// speeds (`usb-kbd` high, `usb-mouse` with `usb_version=1` full, `usb-storage` SuperSpeed; no QEMU
+/// device takes low speed), a hub, and **`usb-ccid`**, which nothing matches and whose default
+/// endpoint is not its speed's default (full speed, 64-byte packets), so its enumeration takes
+/// Evaluate Context. **`p2=8,p3=8` gives eight connectors**; the default four fill, and a later
+/// device would land behind the hub. The stick is an MBR naming one FAT partition. **A drive past 2
+/// TiB** ([`PAST_TWO_TIB_IMAGE`], sparse, last so every other device keeps its port): `boot-probe`
+/// writes a sector past 2 TiB and [`check_past_two_tib`] finds it, where a block number cut to 32
+/// bits would be 2 TiB lower.
 pub(crate) fn test_qemu_usb_args(cmd: &mut Command) -> R<()> {
     let stick = build_cache().join("test-qemu-usb-stick.img");
     mbr_fat_stick(&stick, 16, "NXSTICK")?;

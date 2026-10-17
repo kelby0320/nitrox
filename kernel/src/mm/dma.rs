@@ -1,33 +1,19 @@
-//! [`DmaBuffer`] — a physically-contiguous, zeroed DMA buffer for bus-mastering
-//! devices.
+//! [`DmaBuffer`]: a physically contiguous, zeroed DMA buffer for bus-mastering devices.
 //!
-//! A device DMAs to a **physical** address and needs its buffer **physically
-//! contiguous** and suitably aligned — neither of which the `KBox`/`kmalloc`
-//! path exposes (it hands back a virtual pointer, and `slab` rejects alignments
-//! above `SLAB_SIZE`). `DmaBuffer` fills that gap: it allocates a power-of-two
-//! block of contiguous frames straight from the buddy allocator (whose order-`k`
-//! blocks are aligned to `2^k × PAGE_SIZE`), zeroes it, and exposes **both** the
-//! CPU-side virtual pointer (via the HHDM, for filling/reading the buffer) and
-//! the physical address (to program into device registers / PRDTs). It is the
-//! allocation path the AHCI command lists, received-FIS areas, and PRDTs in the
-//! storage slice are built on (`docs/architecture/drivers-and-irps.md` § DMA).
+//! A device DMAs to a **physical** address and needs its buffer **physically contiguous** and
+//! aligned, which `KBox`/`kmalloc` cannot give. `DmaBuffer` takes a power-of-two block of frames
+//! from the buddy, zeroes it, and exposes the HHDM pointer and the physical address
+//! (`docs/architecture/drivers-and-irps.md` § DMA).
 //!
 //! ## Alignment
 //!
-//! The base is page-aligned; a multi-page (`order > 0`) buffer is aligned to its
-//! whole block size (`2^order × PAGE_SIZE`) by the buddy invariant. AHCI's
-//! sub-structures (1 KiB command list, 256 B received-FIS, 128 B command tables)
-//! all fit within a single page-aligned buffer, laid out at their required
-//! offsets by the driver — so no explicit alignment parameter is needed; a larger
-//! alignment is obtained by allocating a larger block.
+//! The base is page-aligned; an `order > 0` buffer is aligned to its whole block size by the
+//! buddy invariant, so a larger alignment comes from a larger block.
 //!
 //! ## Coherency
 //!
-//! On x86_64 DMA to/from write-back HHDM memory is hardware-coherent (the CPU
-//! snoops), so no cache maintenance is needed. A non-coherent architecture
-//! (aarch64) will need clean/invalidate around device access; that is a future
-//! `ArchDma` hook, not built here — `DmaBuffer` itself is arch-neutral (buddy +
-//! HHDM only).
+//! x86_64 DMA to write-back HHDM memory is hardware-coherent. A non-coherent architecture will
+//! need clean/invalidate around device access (a future `ArchDma` hook).
 
 use core::ptr::{self, NonNull};
 
@@ -35,14 +21,10 @@ use crate::libkern::AllocError;
 use crate::mm::buddy::MAX_ORDER;
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
 
-/// An owned, physically-contiguous, zeroed block of DMA-able memory. Frees its
-/// frames back to the buddy allocator on drop.
+/// An owned, physically contiguous, zeroed block of DMA-able memory; freed to the buddy on drop.
 pub struct DmaBuffer {
-    /// HHDM-mapped virtual base (for CPU reads/writes). Non-null by construction.
     virt: NonNull<u8>,
-    /// Physical base (for the device). Aligned to the block size.
     phys: PhysAddr,
-    /// Block size as a buddy order: the buffer spans `2^order × PAGE_SIZE` bytes.
     order: usize,
 }
 
@@ -54,16 +36,13 @@ pub struct DmaBuffer {
 unsafe impl Send for DmaBuffer {}
 
 impl DmaBuffer {
-    /// Allocate a zeroed, physically-contiguous buffer of **at least** `size`
-    /// bytes (rounded up to the buddy's power-of-two page granularity). Returns
-    /// [`AllocError`] if `size` exceeds the largest buddy block
+    /// Allocate a zeroed, physically contiguous buffer of **at least** `size` bytes, rounded up to a
+    /// power-of-two number of pages. [`AllocError`] if `size` exceeds the largest buddy block
     /// (`2^MAX_ORDER × PAGE_SIZE`) or physical memory is exhausted.
     pub fn alloc(size: usize) -> Result<Self, AllocError> {
         let order = order_for(size).ok_or(AllocError)?;
         let phys = heap::buddy_alloc(order).ok_or(AllocError)?;
         let len = PAGE_SIZE << order;
-        // The buddy returns an HHDM-reachable physical block; form its virtual
-        // base and zero it before any device or CPU reads it.
         let virt = (phys.as_u64() + heap::hhdm_offset()) as *mut u8;
         // SAFETY: `phys` was just allocated (so not aliased), is HHDM-reachable,
         // and the block is exactly `len` bytes; zeroing it is sound.
@@ -76,32 +55,30 @@ impl DmaBuffer {
         })
     }
 
-    /// The physical base address — what a device DMAs to (program it into the
-    /// HBA's command-list / FIS-base registers, a PRDT entry, etc.).
+    /// The physical base address: what a device DMAs to.
     pub fn phys(&self) -> PhysAddr {
         self.phys
     }
 
-    /// The CPU-side virtual base (HHDM), for filling/reading the buffer.
+    /// The CPU-side virtual base (HHDM).
     pub fn virt(&self) -> *mut u8 {
         self.virt.as_ptr()
     }
 
-    /// The buffer length in bytes (`2^order × PAGE_SIZE`; ≥ `PAGE_SIZE`).
+    /// The buffer length in bytes (`2^order × PAGE_SIZE`).
     #[allow(clippy::len_without_is_empty, reason = "never empty: at least a page")]
     pub fn len(&self) -> usize {
         PAGE_SIZE << self.order
     }
 
-    /// The buffer as a byte slice (read-only CPU view).
+    /// The buffer as a byte slice.
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: `virt` addresses `len()` valid, initialised (zeroed) bytes the
         // buffer owns for its lifetime; the shared borrow ties the slice to it.
         unsafe { core::slice::from_raw_parts(self.virt.as_ptr(), self.len()) }
     }
 
-    /// The buffer as a mutable byte slice (CPU fills it before handing the
-    /// `phys()` address to a device).
+    /// The buffer as a mutable byte slice.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as `as_slice`; `&mut self` proves exclusive access.
         unsafe { core::slice::from_raw_parts_mut(self.virt.as_ptr(), self.len()) }
@@ -109,16 +86,14 @@ impl DmaBuffer {
 }
 
 impl Drop for DmaBuffer {
-    /// Return the block to the buddy allocator. The bytes are raw (no element
-    /// destructors), so the free is the only cleanup.
+    /// Return the block to the buddy allocator. The bytes are raw, so the free is the only cleanup.
     fn drop(&mut self) {
         heap::buddy_free(self.phys, self.order);
     }
 }
 
-/// The smallest buddy `order` whose block (`2^order × PAGE_SIZE`) holds `size`
-/// bytes, or `None` if that exceeds [`MAX_ORDER`]. A zero/`size ≤ PAGE_SIZE`
-/// request is one page (order 0).
+/// The smallest buddy `order` whose block holds `size` bytes, or `None` if that exceeds
+/// [`MAX_ORDER`]. A request of at most one page is order 0.
 fn order_for(size: usize) -> Option<usize> {
     let pages = size.div_ceil(PAGE_SIZE).max(1);
     let order = pages.next_power_of_two().trailing_zeros() as usize;
@@ -154,11 +129,9 @@ mod tests {
     #[test]
     fn multi_page_alloc_is_contiguous_and_block_aligned() {
         init_global_heap();
-        // 3 pages → order 2 (4-page block), aligned to its 16 KiB block size.
         let buf = DmaBuffer::alloc(3 * PAGE_SIZE).unwrap();
         assert_eq!(buf.len(), 4 * PAGE_SIZE);
         assert_eq!(buf.phys().as_u64() % (buf.len() as u64), 0, "block-size aligned");
-        // Contiguous + fully addressable: touch the first and last byte.
         assert!(!buf.as_slice().is_empty());
         assert_eq!(buf.as_slice()[buf.len() - 1], 0);
     }
@@ -169,8 +142,6 @@ mod tests {
         let mut buf = DmaBuffer::alloc(PAGE_SIZE).unwrap();
         buf.as_mut_slice()[0] = 0xAB;
         buf.as_mut_slice()[PAGE_SIZE - 1] = 0xCD;
-        // Read back through the raw HHDM mapping of `phys()` — the same bytes a
-        // device would see.
         let p = (buf.phys().as_u64() + heap::hhdm_offset()) as *const u8;
         // SAFETY: `p` is the live HHDM mapping of this buffer's frame.
         unsafe {
@@ -187,13 +158,10 @@ mod tests {
 
     #[test]
     fn repeated_alloc_drop_does_not_leak() {
-        // 64 alloc/drop cycles of a 4-page block would exhaust a leaking heap;
-        // each `DmaBuffer` must return its frames on drop.
         init_global_heap();
         for _ in 0..64 {
             let buf = DmaBuffer::alloc(4 * PAGE_SIZE).unwrap();
             assert_eq!(buf.len(), 4 * PAGE_SIZE);
-            // drops here, freeing the block
         }
     }
 }
