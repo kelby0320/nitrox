@@ -1,32 +1,19 @@
-//! `libheap` — the freeing userspace heap allocator.
+//! `libheap` — the freeing userspace heap, the `#[global_allocator]` backing `extern crate alloc`
+//! for `no_std` userspace. Design contract: `docs/architecture/libheap.md`.
 //!
-//! The `#[global_allocator]` backing `extern crate alloc` for `no_std` userspace.
-//! Replaces the fixed bump arena services carried before (init's `BumpAlloc`),
-//! which never frees. Design contract: `docs/architecture/libheap.md`.
+//! Small allocations (≤ [`SMALL_MAX`]) round up to a size class and are carved from **arenas**
+//! (each a mapped `MemoryObject`); freed slots return to a per-class LIFO freelist, with no
+//! coalescing. Large allocations get a dedicated mapping, unmapped on free.
 //!
-//! ## Shape
-//!
-//! A segregated size-class allocator over multiple discontiguous **arenas** (each a
-//! mapped `MemoryObject`) — the SLUB-over-buddy split re-expressed for userspace.
-//! Small allocations (≤ [`SMALL_MAX`]) round up to a size class and are carved from
-//! arenas; freed slots return to a per-class LIFO freelist (no coalescing — a freed
-//! 32-byte slot is only reused as a 32-byte slot). Large allocations get a dedicated
-//! mapping that is unmapped (and its `MemoryObject` closed) on free.
-//!
-//! ## The engine / registration split (std-port seam)
-//!
-//! [`HeapEngine`] is the reusable allocator; [`Heap`] is the thin `GlobalAlloc`
-//! newtype that forwards to a process-global engine. A future `std` port's
-//! `std::sys::alloc` can forward to the same [`HeapEngine`] instead of fighting for
-//! the single `#[global_allocator]` slot. The engine is generic over an
-//! [`ArenaSource`] so its logic is host-testable with a `std`-backed source and no
-//! kernel (see the tests).
+//! [`HeapEngine`] is the reusable allocator, generic over an [`ArenaSource`] so it is
+//! host-testable with no kernel; [`Heap`] is the thin `GlobalAlloc` newtype forwarding to a
+//! process-global engine. A future `std` port forwards to the same engine instead of taking
+//! the single `#[global_allocator]` slot.
 //!
 //! ## Invariants
 //!
-//! - **No self-reentrancy.** Growing the heap (mapping an arena) uses only stack
-//!   locals + syscalls; [`ArenaSource`] impls must not allocate through libheap.
-//! - **Abort-only.** Written for `panic = "abort"`; no unwind-safety obligations.
+//! - **No self-reentrancy.** Growing the heap (mapping an arena) uses only stack locals and
+//!   syscalls; [`ArenaSource`] impls must not allocate through libheap.
 //! - OOM surfaces as a null return (→ `alloc`'s `handle_alloc_error`), never a panic.
 
 #![cfg_attr(not(test), no_std)]
@@ -39,35 +26,28 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Page size (bytes). Arenas and large mappings are page multiples.
 pub const PAGE_SIZE: usize = 4096;
 
-/// Small-allocation size classes (bytes), ascending powers of two. A request
-/// (rounded up by alignment) at or below [`SMALL_MAX`] is served from the smallest
-/// class that fits; larger requests take the dedicated-mapping path.
+/// Small-allocation size classes (bytes), ascending powers of two: a request (rounded up
+/// by alignment) at or below [`SMALL_MAX`] takes the smallest class that fits.
 const SIZE_CLASSES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
-/// Largest small size class; the small/large boundary.
+/// The small/large boundary.
 pub const SMALL_MAX: usize = 2048;
 
-/// Bytes mapped per arena. Modest because `MemoryObject` frames are **eager**
-/// (allocated + zeroed up front, `kernel/src/object/memory_object.rs`), so an arena
-/// consumes its full size immediately; big arenas would waste memory for small
-/// consumers. Tunable — the one open sizing question from the slice-4 plan.
+/// Bytes per arena: modest, as `MemoryObject` frames are **eager**, all allocated at create.
 const ARENA_SIZE: usize = 64 * 1024;
 
-/// Mirror of the kernel's `MemoryObject::MAX_SIZE` (16 MiB). A single large
-/// allocation cannot exceed this (the backing object would be rejected at create).
+/// Mirror of the kernel's `MemoryObject::MAX_SIZE`: a larger object is rejected at create.
 const MEMOBJ_MAX_SIZE: usize = 16 * 1024 * 1024;
 
-/// Sanity marker written into a large allocation's header, checked on free.
+/// Marker in a large header, checked on free.
 const LARGE_MAGIC: u32 = 0x4C48_4248; // "LHBH"
 
-/// Round `x` up to a multiple of `align` (a power of two). Callers guarantee no
-/// overflow (addresses are far below `usize::MAX`; size inputs are pre-checked).
+/// Round `x` up to a multiple of the power of two `align`; callers rule out overflow.
 #[inline]
 fn round_up(x: usize, align: usize) -> usize {
     (x + (align - 1)) & !(align - 1)
 }
 
-/// The smallest size-class index whose slot is `>= needed`. The caller guarantees
-/// `needed <= SMALL_MAX`, so a class always matches.
+/// The smallest size-class index whose slot is `>= needed` (`needed <= SMALL_MAX`).
 #[inline]
 fn class_index(needed: usize) -> usize {
     let mut i = 0;
@@ -80,9 +60,7 @@ fn class_index(needed: usize) -> usize {
     SIZE_CLASSES.len() - 1
 }
 
-/// A backing mapping handed out by an [`ArenaSource`]: a base pointer plus an opaque
-/// `token` the source needs to release it later (on the target, the `MemoryObject`
-/// handle).
+/// A backing mapping from an [`ArenaSource`], with the token needed to release it.
 #[derive(Clone, Copy)]
 pub struct Mapping {
     /// Base of the mapped region (page-aligned).
@@ -91,9 +69,7 @@ pub struct Mapping {
     pub token: u64,
 }
 
-/// The heap's backing-memory provider: maps and unmaps page-aligned regions. The
-/// target impl ([`SyscallSource`]) creates + maps a `MemoryObject`; a host-test impl
-/// uses `std::alloc`, so [`HeapEngine`] logic runs under `cargo test` with no kernel.
+/// The heap's backing-memory provider: maps and unmaps page-aligned regions.
 ///
 /// # Safety
 /// `map` must return a region that is readable/writable for `size` bytes and stays
@@ -110,22 +86,15 @@ pub unsafe trait ArenaSource {
     unsafe fn unmap(m: Mapping, size: usize);
 }
 
-/// Intrusive per-arena header, stored at the base of each mapped arena. Threads all
-/// arenas onto a list so the engine can release them (host-test `Drop`; future
-/// empty-arena reclamation).
+/// Intrusive per-arena header at the base of each arena, listing them for release.
 #[repr(C)]
 struct ArenaHeader {
-    /// Previous arena in the list (or null).
     next: *mut ArenaHeader,
-    /// The arena mapping's release token.
     token: u64,
-    /// Total mapped bytes of this arena.
     size: usize,
 }
 
-/// Header for a large (dedicated-mapping) allocation, stored just below the returned
-/// pointer so `dealloc` can recover the mapping. `base`/`map_len`/`token` reconstruct
-/// the exact [`ArenaSource::unmap`] arguments.
+/// Large-allocation header, just below the returned pointer; holds the `unmap` arguments.
 #[repr(C)]
 struct LargeHeader {
     base: *mut u8,
@@ -134,16 +103,14 @@ struct LargeHeader {
     magic: u32,
 }
 
-/// The mutable allocator state, guarded by [`HeapEngine`]'s lock.
+/// The allocator state; reached only through [`HeapEngine`]'s lock.
 struct Inner {
     /// Per-size-class freelist heads (a free slot stores the next pointer in its
     /// first 8 bytes; every class is `>= 16` bytes, so there is room).
     class_heads: [*mut u8; 8],
     /// Next carve address in the current arena (`0` before the first arena maps).
     arena_cur: usize,
-    /// End of the current arena.
     arena_end: usize,
-    /// Head of the intrusive all-arenas list.
     arena_list: *mut ArenaHeader,
 }
 
@@ -153,12 +120,10 @@ impl Inner {
     }
 }
 
-/// The reusable freeing allocator. Generic over its [`ArenaSource`]; the source is a
-/// zero-sized marker (its methods are associated functions), so the engine stores no
-/// source instance and is `const`-constructible for use as a `static`.
+/// The reusable freeing allocator; its [`ArenaSource`] is a zero-sized marker, so it is
+/// `const`-constructible as a `static`.
 pub struct HeapEngine<S: ArenaSource> {
-    /// Spinlock over [`Inner`] (uncontended today — userspace is single-threaded and
-    /// Nitrox has no signals — but a real lock so future std OS-threads are correct).
+    /// Spinlock over [`Inner`]; uncontended while userspace is single-threaded.
     locked: AtomicBool,
     inner: UnsafeCell<Inner>,
     _src: PhantomData<S>,
@@ -169,8 +134,7 @@ pub struct HeapEngine<S: ArenaSource> {
 // dereferenced while the lock is held, all within one address space.
 unsafe impl<S: ArenaSource> Sync for HeapEngine<S> {}
 
-/// RAII lock guard: releases the engine lock on drop, so the many early-return paths
-/// in `alloc`/`dealloc` can never leave it held.
+/// RAII lock guard: early returns can never leave the engine lock held.
 struct Guard<'a, S: ArenaSource> {
     engine: &'a HeapEngine<S>,
 }
@@ -191,12 +155,11 @@ impl<S: ArenaSource> Guard<'_, S> {
 }
 
 impl<S: ArenaSource> HeapEngine<S> {
-    /// A fresh, empty engine (no arenas mapped; the first allocation maps one).
+    /// A fresh engine; the first allocation maps an arena.
     pub const fn new() -> Self {
         HeapEngine { locked: AtomicBool::new(false), inner: UnsafeCell::new(Inner::new()), _src: PhantomData }
     }
 
-    /// Acquire the lock (spin), returning a guard that releases it on drop.
     fn lock(&self) -> Guard<'_, S> {
         while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
@@ -206,9 +169,8 @@ impl<S: ArenaSource> HeapEngine<S> {
 
     /// Allocate for `layout`. Returns null on OOM (→ `handle_alloc_error`).
     pub fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        // `align` folds into the size request: a slot aligned to a power-of-two
-        // class `>= align` is `align`-aligned, so `max(size, align)` picks a class
-        // (or the large path) that satisfies both. `dealloc` recomputes identically.
+        // A slot of a power-of-two class `>= align` is `align`-aligned, so `max(size, align)`
+        // picks a class (or the large path) satisfying both; `dealloc` recomputes it.
         let needed = layout.size().max(layout.align()).max(1);
         if needed > SMALL_MAX {
             return self.alloc_large(layout.size(), layout.align());
@@ -218,7 +180,6 @@ impl<S: ArenaSource> HeapEngine<S> {
         let inner = g.inner();
         let head = inner.class_heads[class];
         if !head.is_null() {
-            // Pop the freelist: the slot's first 8 bytes hold the next pointer.
             // SAFETY: `head` is a live free slot of `>= 16` bytes we handed to the
             // freelist; its first word is the next link.
             let next = unsafe { *(head as *const *mut u8) };
@@ -242,26 +203,21 @@ impl<S: ArenaSource> HeapEngine<S> {
         let class = class_index(needed);
         let mut g = self.lock();
         let inner = g.inner();
-        // Push onto the class freelist: stash the old head in the slot's first word.
         // SAFETY: `ptr` is a live slot of this class (`>= 16` bytes); writing its
         // first word is in-bounds.
         unsafe { *(ptr as *mut *mut u8) = inner.class_heads[class] };
         inner.class_heads[class] = ptr;
     }
 
-    /// Carve a `class_size` slot from the current arena, growing (mapping a new
-    /// arena) if it can't fit. Caller holds the lock. Null on OOM.
+    /// Carve a `class_size` slot, mapping a new arena if it won't fit. Lock held. Null on OOM.
     fn carve(&self, inner: &mut Inner, class_size: usize) -> *mut u8 {
         let aligned = round_up(inner.arena_cur, class_size);
-        // Refill if the aligned slot would run past the arena end (also true when no
-        // arena exists yet: cur == end == 0).
+        // Past the arena's end, or no arena yet (cur == end == 0).
         if aligned.checked_add(class_size).is_none_or(|e| e > inner.arena_end) {
             if !self.grow(inner) {
                 return core::ptr::null_mut();
             }
             let aligned = round_up(inner.arena_cur, class_size);
-            // A fresh arena always fits one slot (`class_size <= SMALL_MAX` and the
-            // usable arena far exceeds it), but re-check defensively.
             if aligned + class_size > inner.arena_end {
                 return core::ptr::null_mut();
             }
@@ -272,15 +228,13 @@ impl<S: ArenaSource> HeapEngine<S> {
         aligned as *mut u8
     }
 
-    /// Map a new arena and make it current, linking it into the arena list. Caller
-    /// holds the lock. `false` on map failure.
+    /// Map a new arena, make it current and link it into the list. Lock held.
     fn grow(&self, inner: &mut Inner) -> bool {
         let m = match S::map(ARENA_SIZE) {
             Some(m) => m,
             None => return false,
         };
         let base = m.ptr as usize;
-        // The arena header lives at the base of the arena's own memory.
         let hdr = m.ptr as *mut ArenaHeader;
         // SAFETY: `m.ptr` is a fresh writable mapping of `ARENA_SIZE >= size_of
         // ArenaHeader`; nothing else references it yet.
@@ -293,11 +247,9 @@ impl<S: ArenaSource> HeapEngine<S> {
         true
     }
 
-    /// Serve a large allocation from its own dedicated mapping. Lock-free: it touches
-    /// no shared state (each large allocation is independent). Null on OOM / too large.
+    /// Serve a large allocation from its own mapping. Lock-free: no shared state is touched.
     fn alloc_large(&self, size: usize, align: usize) -> *mut u8 {
         let hdr = size_of::<LargeHeader>();
-        // Room for the header, worst-case alignment slack, and the payload.
         let raw = match hdr.checked_add(align).and_then(|v| v.checked_add(size)) {
             Some(v) => v,
             None => return core::ptr::null_mut(),
@@ -326,7 +278,7 @@ impl<S: ArenaSource> HeapEngine<S> {
         p as *mut u8
     }
 
-    /// Free a large allocation: recover its header, unmap, and release the object.
+    /// Free a large allocation: recover its header and unmap.
     ///
     /// # Safety
     /// `ptr` must be a live pointer from [`alloc_large`](Self::alloc_large).
@@ -348,9 +300,7 @@ impl<S: ArenaSource> Default for HeapEngine<S> {
 }
 
 impl<S: ArenaSource> Drop for HeapEngine<S> {
-    /// Release every arena. A `static` engine never drops (target); this keeps a
-    /// short-lived engine (host tests) leak-clean. Large allocations are released by
-    /// their owner's `dealloc`, not here.
+    /// Release every arena. Large allocations are released by `dealloc`, not here.
     fn drop(&mut self) {
         let mut a = self.inner.get_mut().arena_list;
         while !a.is_null() {
@@ -366,9 +316,7 @@ impl<S: ArenaSource> Drop for HeapEngine<S> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Target backing + the `#[global_allocator]` registration (bare build only).
-// ---------------------------------------------------------------------------
+// Target backing and the `#[global_allocator]` registration (bare build only).
 
 /// The target [`ArenaSource`]: backs arenas with `MemoryObject`s via `libkern`.
 #[cfg(not(test))]
@@ -390,7 +338,6 @@ unsafe impl ArenaSource for SyscallSource {
         // (hint = 0). Returns the mapped address or a negative error.
         let addr = unsafe { libkern::syscall4(libkern::SYS_MEMORY_MAP, h as u64, 0, size as u64, rights) };
         if addr < 0 {
-            // Don't leak the object if mapping failed.
             // SAFETY: `h` is the handle we just created.
             unsafe { libkern::syscall1(libkern::SYS_HANDLE_CLOSE, h as u64) };
             return None;
@@ -408,7 +355,6 @@ unsafe impl ArenaSource for SyscallSource {
     }
 }
 
-/// The process-global heap engine (bare build).
 #[cfg(not(test))]
 static ENGINE: HeapEngine<SyscallSource> = HeapEngine::new();
 
@@ -429,21 +375,14 @@ unsafe impl core::alloc::GlobalAlloc for Heap {
         // SAFETY: forwarded matching (ptr, layout) pair from a prior `alloc`.
         unsafe { ENGINE.dealloc(ptr, layout) }
     }
-    // `realloc` uses the `GlobalAlloc` default (alloc + copy + dealloc), which is
-    // correct here; a same-class fast path is a later optimisation.
 }
-
-// ---------------------------------------------------------------------------
-// Host tests: exercise the engine with a `std`-backed source, no kernel.
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::alloc::Layout;
 
-    /// Host [`ArenaSource`]: page-aligned `std::alloc` regions (mirrors the target's
-    /// page-aligned mappings).
+    /// Host [`ArenaSource`]: page-aligned `std::alloc` regions.
     struct TestSource;
     // SAFETY: `std::alloc` returns a valid region for `size` bytes, page-aligned,
     // valid until `dealloc` with the same layout.
@@ -472,7 +411,6 @@ mod tests {
         let p = e.alloc(l);
         assert!(!p.is_null());
         assert_eq!(p as usize % 8, 0);
-        // Writable through its whole extent.
         // SAFETY: `p` is a live 24-byte allocation from `alloc` above, referenced by nothing else.
         unsafe { core::ptr::write_bytes(p, 0xAB, 24) };
         // SAFETY: `p` is live and its first byte was just written.
@@ -484,7 +422,6 @@ mod tests {
     #[test]
     fn small_requests_round_to_size_classes() {
         let e = engine();
-        // 1 and 16 both land in the 16-byte class; 17 in the 32-byte class.
         for &sz in &[1usize, 8, 16] {
             let l = Layout::from_size_align(sz, 1).unwrap();
             let p = e.alloc(l);
@@ -510,7 +447,6 @@ mod tests {
     #[test]
     fn honors_large_alignment_via_class_promotion() {
         let e = engine();
-        // size 16 but align 64 -> needed 64 -> 64-byte class, 64-aligned.
         let l = Layout::from_size_align(16, 64).unwrap();
         let p = e.alloc(l);
         assert!(!p.is_null());
@@ -522,14 +458,13 @@ mod tests {
     #[test]
     fn many_allocations_grow_arenas_without_overlap() {
         let e = engine();
-        // 2048-byte slots: ~31 per 64 KiB arena, so 200 forces several arenas.
         let l = Layout::from_size_align(2048, 8).unwrap();
+        // About 31 such slots fit a 64 KiB arena, so 200 forces several.
         let n = 200usize;
         let mut ptrs = std::vec::Vec::with_capacity(n);
         for i in 0..n {
             let p = e.alloc(l);
             assert!(!p.is_null(), "alloc {i} failed");
-            // Stamp a unique byte at the slot start; overlap would corrupt a neighbor.
             // SAFETY: `p` is non-null (asserted above) and points at the start of a live 2048-byte slot.
             unsafe { *p = (i & 0xFF) as u8 };
             ptrs.push(p);
