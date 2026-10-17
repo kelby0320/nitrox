@@ -15,7 +15,6 @@ fn params(sectors: u64) -> Params {
     Params { sectors, label: label(b"nitrox").unwrap(), volume_id: 0x1234_ABCD, hidden: 2048, now: NOW }
 }
 
-/// **A sparse image of `sectors`**, in a file removed when dropped.
 fn image(sectors: u64) -> FileImage {
     let p = scratch("mkfs");
     std::fs::File::create(&p).unwrap().set_len(sectors * 512).unwrap();
@@ -74,8 +73,7 @@ impl BlockWriter for Sparse {
     }
 }
 
-/// **The type and the cluster at each neighbour of every boundary**: the floor, both edges of the
-/// FAT16/FAT32 band, FAT32's steps at 8, 16 and 32 GiB, and FAT32's last sector count.
+/// The floor, the FAT16/FAT32 band's edges, FAT32's steps at 8, 16 and 32 GiB, and its last count.
 #[test]
 fn the_type_and_cluster_change_at_each_neighbour() {
     let at = |sectors: u64| {
@@ -113,9 +111,8 @@ fn the_band_is_where_neither_type_is_valid_at_four_kib() {
     assert_eq!(layout(Kind::Fat16, MIN_SECTORS as u32, 8).map(|g| g.clusters), Some(4087));
 }
 
-/// **Every size from the floor makes a FAT the server takes**, its boot sector parsing back to the
-/// geometry planned: every sector across the band, a step through the small sizes, and sizes up to
-/// FAT32's last sector count from a fixed sequence.
+/// **Its boot sector parses back to the geometry planned** at every sector across the band, a step
+/// through the small sizes, and a fixed sequence up to FAT32's last sector count.
 #[test]
 fn every_size_from_the_floor_makes_a_fat_the_server_takes() {
     let mut sizes: Vec<u64> = (FAT16_BAND - 2000..FAT32_FROM + 2000).collect();
@@ -139,7 +136,6 @@ fn every_size_from_the_floor_makes_a_fat_the_server_takes() {
     }
 }
 
-/// Write `data` to the new file `/name` through its map, as the kernel writes a page.
 fn make(fat: &Fat<FileImage>, name: &str, data: &[u8]) {
     fat.create_file(b"/", name.as_bytes(), NOW).unwrap();
     let path = format!("/{name}");
@@ -155,10 +151,8 @@ fn make(fat: &Fat<FileImage>, name: &str, data: &[u8]) {
     }
 }
 
-/// **What it makes at each neighbour, `fsck.fat -n` finds clean, mtools reads, and the library
-/// serves**: the label in the boot sector and the root directory, then a file written through the
-/// library and the volume settled as an unmount leaves it, clean again and read back by `mtype`.
-/// Sparse images, the largest 32 GiB.
+/// The label in the boot sector and the root directory, then a file written through the library
+/// and the volume settled as an unmount leaves it, clean again and read back by `mtype`.
 #[test]
 fn what_it_makes_fsck_finds_clean_mtools_reads_and_the_library_serves() {
     let sizes = [
@@ -197,8 +191,6 @@ fn what_it_makes_fsck_finds_clean_mtools_reads_and_the_library_serves() {
     }
 }
 
-/// **No label is no label**: [`NO_NAME`] in the boot sector, no entry in the root, and mtools and
-/// the library both say there is none.
 #[test]
 fn an_empty_label_writes_no_name_and_no_root_entry() {
     let img = image(MIN_SECTORS);
@@ -212,8 +204,7 @@ fn an_empty_label_writes_no_name_and_no_root_entry() {
 /// **Nothing an older filesystem left in the first mebibyte, or in the FATs past it, survives** —
 /// an ext4's superblock is at 1024 — and **data clusters past them are left as they were**. The
 /// volume is filled with a pattern first; what the format leaves must equal a format of a blank
-/// one up to where the metadata ends, and the pattern after it. A FAT16 at the floor, whose
-/// metadata ends inside the first mebibyte, and a FAT32 whose FATs run past it.
+/// one up to where the metadata ends, and the pattern after it.
 #[test]
 fn a_format_leaves_nothing_old_in_the_first_mebibyte_or_the_fats() {
     for s in [MIN_SECTORS, 8 * GIB + 1] {
@@ -237,8 +228,6 @@ fn a_format_leaves_nothing_old_in_the_first_mebibyte_or_the_fats() {
     }
 }
 
-/// **A format cut short leaves no FAT**: stopped at every write in turn, the boot sector is still
-/// zero, so nothing reads half-written tables as a filesystem. A FAT16 and a FAT32.
 #[test]
 fn a_format_cut_short_at_any_write_leaves_no_boot_sector() {
     for s in [MIN_SECTORS, FAT32_FROM] {
@@ -254,7 +243,6 @@ fn a_format_cut_short_at_any_write_leaves_no_boot_sector() {
     }
 }
 
-/// **A label as FAT keeps it**, and the bytes refused.
 #[test]
 fn a_label_is_uppercased_padded_and_refused_past_eleven_or_for_a_forbidden_byte() {
     assert_eq!(label(b"nitrox"), Ok(*b"NITROX     "));

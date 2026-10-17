@@ -1,16 +1,15 @@
-//! **The boot sector** (Phase 6 Part E.2): a FAT's type and geometry, read from its BIOS parameter
+//! **The boot sector**: a FAT's type and geometry, read from its BIOS parameter
 //! block, and the reasons a server will not serve one.
 //!
 //! **The type is read as Linux, `fsck.fat` and mtools read it**: FAT32 when the boot sector's
 //! 16-bit FAT size is zero, else FAT12 or FAT16 by cluster count. The specification decides by
 //! count alone. The two agree on every volume it allows, and differ on a FAT32 with too few
 //! clusters — which `mkfs.fat -F 32` writes, with a warning, on anything under 257 MiB of 4 KiB
-//! clusters — so deciding by count would read such a volume's 32-bit entries as 16-bit ones (PR
-//! #364 review).
+//! clusters — so deciding by count would read such a volume's 32-bit entries as 16-bit ones.
 
 use crate::FsError;
 
-/// The one sector size served: what every stick this phase meets uses, and the kernel's block.
+/// The one sector size served: what every stick uses, and the kernel's block.
 pub const SECTOR: u32 = 512;
 /// The smallest cluster a server takes: a page, so no page of a file spans two runs of its map
 /// (the kernel fills and writes a page as one device range).
@@ -22,30 +21,39 @@ pub const FAT12_CLUSTERS: u32 = 4085;
 /// Which FAT.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// FAT12.
     Fat12,
+    /// FAT16.
     Fat16,
+    /// FAT32.
     Fat32,
 }
 
 /// **A FAT's geometry**, in sectors from the start of the volume unless it says otherwise.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Geometry {
+    /// Its type.
     pub kind: Kind,
+    /// Sectors in a cluster.
     pub sectors_per_cluster: u32,
     /// The reserved region: the boot sector, and FAT32's FSInfo and backup boot sector.
     pub reserved: u32,
-    /// How many copies of the FAT, and each one's length.
+    /// How many copies of the FAT.
     pub fats: u32,
+    /// Each copy's length.
     pub fat_sectors: u32,
-    /// FAT12 and FAT16's **fixed root directory**: its entries, first sector and length. Zero on
+    /// FAT12 and FAT16's **fixed root directory**: how many entries. Zero on
     /// FAT32, whose root is a cluster chain.
     pub root_entries: u32,
+    /// The fixed root's first sector.
     pub root_start: u32,
+    /// The fixed root's length in sectors.
     pub root_sectors: u32,
     /// FAT32's root directory's first cluster; `0` on FAT12 and FAT16.
     pub root_cluster: u32,
     /// Where cluster 2 begins.
     pub data_start: u32,
+    /// Sectors in the volume.
     pub total_sectors: u32,
     /// **How many data clusters**: valid cluster numbers are `2..clusters + 2`.
     pub clusters: u32,
@@ -284,7 +292,7 @@ mod tests {
         b
     }
 
-    /// **The FAT12 bound, at its neighbours** (PR #364's review asked for the type both ways):
+    /// **The FAT12 bound, at its neighbours**, the type both ways:
     /// 4,084 clusters is FAT12 and 4,085 is FAT16. One reserved sector, two FATs of 16 sectors —
     /// enough for either — and a root of 32 sectors put cluster 2 at sector 65; a cluster a sector.
     #[test]
@@ -308,8 +316,6 @@ mod tests {
         assert_eq!(g.kind, Kind::Fat32);
     }
 
-    /// **What a server refuses, and why**: another sector size, clusters under a page, and a
-    /// sector that is no FAT's; and a page-sized cluster taken.
     #[test]
     fn a_server_refuses_other_sectors_small_clusters_and_what_is_not_fat() {
         let mut b = boot(32_768, 4, 32);
@@ -325,7 +331,6 @@ mod tests {
         assert_eq!(parse(&b), Err(Unservable::NotFat));
     }
 
-    /// **A boot sector's fields are anyone's bytes**: none of these may panic, and each is refused.
     #[test]
     fn a_malformed_boot_sector_is_refused_not_trusted() {
         let mut b = boot(32_768, 3, 32);

@@ -1,4 +1,4 @@
-//! **Making an empty FAT** (Phase 6 Part G.2): what `disk --format DEVICE fat` writes.
+//! **Making an empty FAT**: what `disk --format DEVICE fat` writes.
 //!
 //! ## What it makes, by size
 //!
@@ -6,36 +6,25 @@
 //! makes, the server serves:
 //!
 //! - **FAT32** wherever 4 KiB clusters reach FAT32's 65,525, from [`FAT32_FROM`] sectors (about
-//!   256.5 MiB), with Microsoft's steps: 4 KiB clusters up to 8 GiB, 8 KiB up to 16, 16 KiB up to 32
-//!   and 32 KiB above.
+//!   256.5 MiB), with Microsoft's cluster steps above 8 GiB.
 //! - **FAT16** below that, at 4 KiB clusters while they keep its count under 65,525 — **and at 8 KiB
 //!   in the quarter-mebibyte below FAT32's line**, from [`FAT16_BAND`] sectors, where at 4 KiB
 //!   neither type is valid: FAT16 passes 65,524 clusters there and FAT32 has not reached 65,525.
 //! - **Refused under [`MIN_SECTORS`]**, 16 MiB, a round floor 8 KiB above where 4 KiB clusters stop
 //!   making a FAT16 at all; and **over 2 TiB**, FAT32's sector count being 32 bits.
 //!
-//! Each type is what Linux, `fsck.fat` and mtools read it as too ([`crate::bpb`]): a FAT32's 16-bit
-//! FAT size is zero, and a FAT16's cluster count is in FAT16's range.
-//!
 //! ## The layout
 //!
 //! Two FATs, as every system expects. **The data region begins on a cluster**, so a cluster begins
 //! on a cluster's multiple from the volume's start — and a volume at 1 MiB, where `disk` puts
 //! every partition, has its clusters aligned on the disk too. The padding goes into the reserved
-//! region, which a reader skips by its count. Each FAT is sized for every cluster the volume could
-//! hold before the FATs are taken from it, a few sectors more than it strictly needs, so it is
-//! never short.
+//! region, which a reader skips by its count.
 //!
 //! **The first mebibyte is zeroed first**, so no old boot sector or superblock outlives the format
 //! for a reader to find — an ext4's is at 1024 — and so are the FATs and the root directory, which
 //! a reader trusts entirely. **The boot sector is written last**: until it is, the volume reads as
 //! nothing, rather than as a FAT whose tables are half written. Data clusters are left as they
 //! were; the FAT says they are free.
-//!
-//! ## The oracle
-//!
-//! `fsck.fat -n` finds what this writes clean, mtools reads what the library then writes to it,
-//! and [`crate::Fat`] serves it — none alone being enough, as for `fs-server-ext4`'s formatter.
 
 use crate::bpb::{self, Geometry, Kind, MIN_CLUSTER, SECTOR};
 use crate::{BlockWriter, FsError};
@@ -62,7 +51,6 @@ const FAT16_CLUSTERS: core::ops::RangeInclusive<u32> = bpb::FAT12_CLUSTERS..=65_
 const FAT32_CLUSTERS: core::ops::RangeInclusive<u32> = 65_525..=0x0FFF_FFF5;
 /// The fixed-disk media byte, which entry 0 of each FAT repeats.
 const MEDIA: u8 = 0xF8;
-/// How much of the volume is zeroed at a time.
 const ZERO_SPAN: usize = 64 * 1024;
 /// The volume label every system reads as none.
 pub const NO_NAME: [u8; 11] = *b"NO NAME    ";
@@ -283,7 +271,6 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u
     let g = plan(p).map_err(MkfsError::fs_error)?;
     let s = SECTOR as u64;
 
-    // The first mebibyte, the FATs and the root directory — FAT32's, its first cluster — zeroed.
     let meta_end = g.data_start as u64 + if g.kind == Kind::Fat32 { g.sectors_per_cluster as u64 } else { 0 };
     let zero_end = (meta_end * s).max(1 << 20).min(g.total_sectors as u64 * s);
     let zeros = [0u8; ZERO_SPAN];
@@ -312,7 +299,6 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u
         w.write_at(g.fat_byte(n), &fat)?;
     }
 
-    // The label, as the root directory's first entry.
     if g.label != NO_NAME {
         let root = match g.kind {
             Kind::Fat32 => g.cluster_sector(g.root_cluster),
@@ -330,7 +316,6 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u
         w.write_at(root * s, &e)?;
     }
 
-    // The boot sector, last: FAT32's FSInfo and backup first.
     let boot = boot_sector(&g, p);
     if g.kind == Kind::Fat32 {
         let info = fsinfo(&g);

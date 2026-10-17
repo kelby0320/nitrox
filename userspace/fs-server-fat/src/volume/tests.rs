@@ -29,7 +29,6 @@ fn listing(fat: &Fat<FileImage>, path: &[u8], per_call: usize) -> BTreeSet<(Stri
     }
 }
 
-/// A file's bytes read **through its map**, as the kernel would: each run's sectors off the device.
 fn through_map(fat: &Fat<FileImage>, path: &[u8]) -> (Vec<u8>, usize) {
     let mut runs = [BlockRun::default(); 64];
     let m = fat.map_file(path, &mut runs).unwrap();
@@ -45,9 +44,7 @@ fn through_map(fat: &Fat<FileImage>, path: &[u8]) -> (Vec<u8>, usize) {
     (bytes, m.runs)
 }
 
-/// **What mtools wrote, read back** on FAT12, FAT16 and FAT32 — the names, kinds and sizes a
-/// listing gives, a short name with Windows' case bits, a long name, a Unicode one, a file in a
-/// subdirectory — and each file's bytes, read whole, read in part, and read through its map.
+/// **What mtools wrote, read back**: a listing, a whole read, a range read and the file's map.
 #[test]
 fn reads_names_kinds_sizes_and_contents_on_fat12_fat16_and_fat32() {
     for (what, img) in [
@@ -98,8 +95,6 @@ fn reads_names_kinds_sizes_and_contents_on_fat12_fat16_and_fat32() {
     }
 }
 
-/// **Names are case-insensitive** for ASCII letters — a short name, a long name and a path — and
-/// exact beyond ASCII. A file is found by its short name too.
 #[test]
 fn a_name_is_found_in_another_case() {
     let img = mformat(16, &["-c", "4"]);
@@ -147,8 +142,7 @@ fn a_long_name_with_another_short_names_checksum_is_ignored() {
     assert_eq!(fat.read_file(b"/ALONGF~2.TXT", &mut buf), Ok(5));
 }
 
-/// **A file in many fragments is mapped run by run**, and one in more than a reply holds is
-/// `TooLarge`. mtools fills the holes left by deleting every other one-cluster file.
+/// mtools fills the holes left by deleting every other one-cluster file.
 #[test]
 fn a_fragmented_file_is_mapped_run_by_run_and_too_many_runs_are_refused() {
     let img = mformat(64, &["-c", "8"]);
@@ -186,9 +180,7 @@ fn a_fragmented_file_is_mapped_run_by_run_and_too_many_runs_are_refused() {
     assert_eq!(fat.map_file(b"/huge.bin", &mut runs), Err(FsError::TooLarge));
 }
 
-/// **The type, both ways a FAT32 can be one**: 300 MiB of 4 KiB clusters is FAT32 by count, and
-/// 64 MiB of them is FAT32 by its boot sector alone — what `mformat -F` and `mkfs.fat -F 32`
-/// write. Either reads back.
+/// 300 MiB of 4 KiB clusters is FAT32 by count, and 64 MiB of them by its boot sector alone.
 #[test]
 fn a_fat32_by_count_and_one_by_its_boot_sector_alone_both_read() {
     for (mib, by_count) in [(300, true), (64, false)] {
@@ -204,8 +196,6 @@ fn a_fat32_by_count_and_one_by_its_boot_sector_alone_both_read() {
     }
 }
 
-/// **What the server's check refuses**: clusters under a page, what is not FAT, and a volume larger
-/// than its device; and a page-sized cluster taken.
 #[test]
 fn the_check_refuses_small_clusters_no_fat_and_a_volume_past_its_device() {
     let small = mformat(16, &["-c", "4"]);
@@ -224,7 +214,6 @@ fn the_check_refuses_small_clusters_no_fat_and_a_volume_past_its_device() {
     assert_eq!(Fat::new(&disk).check(), Err(Unservable::Truncated));
 }
 
-/// **A clean filesystem reads clean**, and one whose state byte says mounted does not.
 #[test]
 fn the_state_byte_says_how_it_was_left() {
     let img = mformat(64, &["-F", "-c", "8"]);
@@ -252,16 +241,12 @@ fn fat16_takes_no_cluster_from_the_high_word() {
     assert_eq!(&buf[..9], b"extended\n");
 }
 
-/// Write `value` into FAT16 entry `c` of every copy, as a corrupting system might.
 fn poke16(disk: &FileImage, g: &crate::bpb::Geometry, c: u32, value: u16) {
     for n in 0..g.fats {
         disk.write_at(g.fat_byte(n) + c as u64 * 2, &value.to_le_bytes()).unwrap();
     }
 }
 
-/// **A chain is anyone's bytes**: a directory whose chain loops back on itself is `Corrupt` rather
-/// than a listing that never ends — the walk is bounded by the volume's clusters — and a file whose
-/// chain names a cluster outside the volume is `Corrupt` too.
 #[test]
 fn a_chain_that_loops_or_leaves_the_volume_is_corrupt() {
     let img = mformat(16, &["-c", "4"]);
