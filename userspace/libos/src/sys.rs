@@ -1,17 +1,15 @@
 //! The syscall seam.
 //!
-//! The three raw kernel calls the async core makes — `io_submit`, `wait`,
-//! `handle_close` — behind a thin module so the executor is host-testable with no
-//! kernel. `cfg(not(test))` forwards to `libkern`'s `syscallN`; `cfg(test)` swaps in
-//! a scriptable mock (mirrors `libheap`'s `ArenaSource` seam). All returns are the
-//! kernel's `i64` (`isize`): negative = a `KError` discriminant.
+//! The raw kernel calls libos makes, behind a thin module so the executor is
+//! host-testable with no kernel. `cfg(not(test))` forwards to `libkern`'s `syscallN`;
+//! `cfg(test)` swaps in a scriptable mock. All returns are the kernel's `i64`:
+//! negative = a `KError` discriminant.
 
 use libkern::{IoOp, IoResult};
 
 // --- target: real syscalls ------------------------------------------------
 
-/// `sys_io_submit(resource, &op)` — never blocks; returns a `PendingOperation`
-/// handle (>= 0) or a negative error.
+/// `sys_io_submit` — never blocks; returns a `PendingOperation` handle or an error.
 #[cfg(not(test))]
 pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
     // SAFETY: `resource` is a caller-supplied handle; `op` is a live `IoOp`. The
@@ -19,8 +17,7 @@ pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
     unsafe { libkern::syscall2(libkern::SYS_IO_SUBMIT, resource, op as *const IoOp as u64) }
 }
 
-/// `sys_wait(handles, count, results, deadline)` — returns the count of signaled
-/// handles (writing one `IoResult` per signaled handle), or a negative error.
+/// `sys_wait` — returns the count of signaled handles (one `IoResult` each), or an error.
 /// `deadline`: `0` = poll (non-blocking), `u64::MAX` = forever.
 #[cfg(not(test))]
 pub fn wait(handles: &[u64], results: &mut [IoResult], deadline: u64) -> i64 {
@@ -60,8 +57,7 @@ pub fn memory_create(size: u64) -> i64 {
     unsafe { libkern::syscall2(libkern::SYS_MEMORY_CREATE, size, 0) }
 }
 
-/// `sys_memory_map(h, hint, size, rights)` — map into the address space; returns the
-/// base address (`hint = 0` lets the kernel choose).
+/// `sys_memory_map` — returns the base address (`hint = 0` lets the kernel choose).
 #[cfg(not(test))]
 pub fn memory_map(h: u64, hint: u64, size: u64, rights: u64) -> i64 {
     // SAFETY: `h` is a mappable handle carrying `rights`; the kernel validates.
@@ -75,32 +71,28 @@ pub fn memory_unmap(addr: u64, size: u64) -> i64 {
     unsafe { libkern::syscall2(libkern::SYS_MEMORY_UNMAP, addr, size) }
 }
 
-/// `sys_ns_lookup(ns, path, path_len, rights)` — resolve a path; returns a
-/// `PendingOperation` handle whose completion carries the resolved handle.
+/// `sys_ns_lookup` — returns a `PendingOperation` whose completion carries the handle.
 #[cfg(not(test))]
 pub fn ns_lookup(ns: u64, path: u64, path_len: u64, rights: u64) -> i64 {
     // SAFETY: `path`/`path_len` name a live UTF-8 buffer; `ns` is a namespace handle.
     unsafe { libkern::syscall4(libkern::SYS_NS_LOOKUP, ns, path, path_len, rights) }
 }
 
-/// `sys_ns_enumerate(ns, index, out)` — write the `index`-th binding into `out` (an
-/// `NsEntry`); returns `0`, or `NotFound` past the end.
+/// `sys_ns_enumerate` — writes an `NsEntry` to `out`; `NotFound` past the end.
 #[cfg(not(test))]
 pub fn ns_enumerate(ns: u64, index: u64, out: u64) -> i64 {
     // SAFETY: `out` points at a live `NsEntry`; `ns` is a namespace handle.
     unsafe { libkern::syscall3(libkern::SYS_NS_ENUMERATE, ns, index, out) }
 }
 
-/// `sys_notif_recv(queue, out)` — dequeue one notification into `out` (a
-/// `Notification`); returns `0`, or `WouldBlock` if empty.
+/// `sys_notif_recv` — writes a `Notification` to `out`; `WouldBlock` if empty.
 #[cfg(not(test))]
 pub fn notif_recv(queue: u64, out: u64) -> i64 {
     // SAFETY: `out` points at a live `Notification`; `queue` is a notif-channel handle.
     unsafe { libkern::syscall2(libkern::SYS_NOTIF_RECV, queue, out) }
 }
 
-/// `sys_ns_bind(ns, path, path_len, resource)` — bind `resource` at `path` in `ns`.
-/// Gated kernel-side by the `BIND` handle right *and* the `BIND_NAMESPACE` syscap.
+/// `sys_ns_bind` — gated by the `BIND` handle right *and* the `BIND_NAMESPACE` syscap.
 #[cfg(not(test))]
 pub fn ns_bind(ns: u64, path: u64, path_len: u64, resource: u64) -> i64 {
     // SAFETY: `path`/`path_len` name a live buffer; `ns`/`resource` are live handles.
@@ -196,9 +188,8 @@ mod mock {
                     n += 1;
                 }
             }
-            // A blocking wait (deadline != 0) with nothing ready simulates the first
-            // pending handle completing during the wait — so block_on always makes
-            // progress. A poll (deadline == 0) never fabricates a completion.
+            // A blocking wait with nothing ready completes the first handle, so block_on
+            // makes progress; a poll (deadline == 0) never fabricates a completion.
             if n == 0 && deadline != 0 && !handles.is_empty() {
                 let h = handles[0];
                 if let Some(po) = m.pos.get_mut(&h) {
@@ -233,7 +224,6 @@ mod mock {
     }
 
     pub fn memory_map(_h: u64, _hint: u64, _size: u64, _rights: u64) -> i64 {
-        // A fake non-null, page-aligned address (never dereferenced by tests).
         0x1_0000_0000i64
     }
 
@@ -242,8 +232,7 @@ mod mock {
     }
 
     pub fn ns_lookup(_ns: u64, _path: u64, _plen: u64, _rights: u64) -> i64 {
-        // Resolve through the same PO machinery as `io_submit`: the scripted
-        // completion's `result` is the resolved handle.
+        // The scripted completion's `result` is the resolved handle.
         let dummy = IoOp { opcode: 0, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
         io_submit(0, &dummy)
     }
@@ -274,7 +263,7 @@ mod mock {
         mint_handle()
     }
 
-    /// A fresh fake handle (for spawn/thread mocks), tracked so `handle_close` counts.
+    /// A fresh fake handle for the spawn and thread mocks.
     fn mint_handle() -> i64 {
         MOCK.with(|m| {
             let mut m = m.borrow_mut();

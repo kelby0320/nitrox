@@ -1,11 +1,10 @@
 //! `Handle<T, M>` — the typed capability handle.
 //!
-//! Implements the typestate design from `docs/archive/os-design-v5.1.md`: `T` is the
-//! object-type marker, `M` the mode marker encoding **principal** rights as a type
-//! (so the wrong operation is a compile error), and `extra` carries the generic +
-//! modifier rights checked at runtime. A `Handle` **owns** its capability and closes
-//! it on drop (RAII); [`into_raw`](Handle::into_raw) extracts it without closing (for
-//! transfer). Object methods live in [`crate::objects`].
+//! `T` is the object-type marker, `M` the mode marker encoding **principal** rights as
+//! a type (so the wrong operation is a compile error), and `extra` carries the generic
+//! and modifier rights checked at runtime. A `Handle` **owns** its capability and closes
+//! it on drop; [`into_raw`](Handle::into_raw) extracts it without closing. Object
+//! methods live in [`crate::objects`].
 
 use core::marker::PhantomData;
 
@@ -118,8 +117,7 @@ impl MemMode for MapExec {
 
 /// A typed capability handle. An **owning** handle (from [`from_raw`](Handle::from_raw))
 /// closes its capability on drop; a **borrowed** one (from [`borrow`](Handle::borrow))
-/// does not — a non-owning view of a handle owned elsewhere (e.g. the bootstrap
-/// `root_ns`, which the process holds for its whole life).
+/// does not.
 pub struct Handle<T, M> {
     raw: RawHandle,
     extra: Rights,
@@ -130,20 +128,18 @@ pub struct Handle<T, M> {
 
 impl<T, M> Handle<T, M> {
     /// Wrap a raw handle as a typed **owning** `Handle` (closed on drop). `extra` is
-    /// the generic + modifier rights band.
+    /// the generic and modifier rights band.
     ///
     /// # Safety
     /// The caller asserts that `raw` names a live object of type `T` carrying at
     /// least mode `M`'s principal rights, and transfers ownership of it. libos cannot
-    /// check `M` statically; where cheap, callers should confirm the object type via
-    /// `sys_handle_stat` first.
+    /// check `M` statically.
     pub unsafe fn from_raw(raw: RawHandle, extra: Rights) -> Self {
         Handle { raw, extra, owned: true, _t: PhantomData, _m: PhantomData }
     }
 
     /// Wrap a raw handle as a typed **borrowed** `Handle` — a non-owning view that is
-    /// **not** closed on drop. For handles owned elsewhere (the bootstrap `root_ns`,
-    /// a handle whose lifetime the caller manages).
+    /// **not** closed on drop. For handles owned elsewhere.
     ///
     /// # Safety
     /// As [`from_raw`](Handle::from_raw), except ownership is **not** transferred: the
@@ -153,14 +149,13 @@ impl<T, M> Handle<T, M> {
         Handle { raw, extra, owned: false, _t: PhantomData, _m: PhantomData }
     }
 
-    /// The raw handle (for the raw paths that still need it — spawn ABIs, IPC handle
-    /// transfer). Does **not** relinquish ownership; the `Handle` still closes on drop.
+    /// The raw handle. Does **not** relinquish ownership; the `Handle` still closes on drop.
     pub fn raw(&self) -> RawHandle {
         self.raw
     }
 
-    /// Extract the raw handle, relinquishing ownership (the `Handle` will **not** close
-    /// it). Use before transferring the handle to a child or over IPC.
+    /// Extract the raw handle, relinquishing ownership: the `Handle` will **not** close
+    /// it. Use before transferring it to a child or over IPC.
     pub fn into_raw(self) -> RawHandle {
         let raw = self.raw;
         core::mem::forget(self); // suppress Drop's close
@@ -172,8 +167,8 @@ impl<T, M> Handle<T, M> {
         self.extra
     }
 
-    /// Restrict rights by intersecting with `mask` (via `sys_handle_restrict`) and
-    /// retype the mode to `M2`. Consumes `self`; on error `self` is dropped (closed).
+    /// Intersect rights with `mask` (`sys_handle_restrict`) and retype the mode to `M2`.
+    /// Consumes `self`; on error `self` is dropped (closed).
     fn retype<M2>(self, mask: u64) -> Result<Handle<T, M2>> {
         let r = sys::handle_restrict(self.raw.0, mask);
         if r < 0 {
@@ -225,7 +220,7 @@ mod tests {
         {
             // SAFETY: test handle; the mock ignores the value.
             let _h = unsafe { Handle::<Memory, MapReadWrite>::from_raw(RawHandle(5), Rights::empty()) };
-        } // dropped here
+        }
         let (_s, _w, closes) = sys::counts();
         assert_eq!(closes, 1, "Handle::drop must close the raw handle");
     }
@@ -236,7 +231,7 @@ mod tests {
         {
             // SAFETY: test handle; borrow does not take ownership.
             let _h = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(3), Rights::LOOKUP) };
-        } // dropped here — must NOT close
+        }
         let (_s, _w, closes) = sys::counts();
         assert_eq!(closes, 0, "a borrowed Handle must not close on drop");
     }
@@ -262,7 +257,6 @@ mod tests {
         assert!(h.extra_rights().contains(Rights::DUPLICATE));
         let (_s, _w, closes) = sys::counts();
         assert_eq!(closes, 0, "a successful restrict must not close the handle");
-        // and the retyped handle still closes on drop
         drop(h);
         let (_s, _w, closes) = sys::counts();
         assert_eq!(closes, 1);
@@ -274,6 +268,5 @@ mod tests {
         // SAFETY: test handle.
         let h = unsafe { Handle::<Memory, MapReadWrite>::from_raw(RawHandle(9), Rights::MAP_READ | Rights::MAP_WRITE) };
         let _ro: Handle<Memory, MapRead> = h.into_read_only().unwrap();
-        // Type is now Handle<Memory, MapRead> — a `write` op would not compile.
     }
 }

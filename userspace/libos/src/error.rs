@@ -1,9 +1,7 @@
 //! `libos::Error` — an `std::io::Error`-shaped wrapper over [`KError`].
 //!
-//! Shaped like `std::io::Error` (a [`kind`](Error::kind) mapping to an
-//! `io::ErrorKind`-analog, `From<KError>`, `Display`) so a future `std` port's
-//! `std::io::Error` can re-export rather than adapt — the "std-shaped where free"
-//! rule (`docs/architecture/overview.md`).
+//! Shaped like `std::io::Error` so a future `std` port can re-export rather than adapt
+//! (`docs/architecture/overview.md`).
 
 use core::fmt;
 use libkern::KError;
@@ -20,8 +18,7 @@ pub struct Error {
 
 impl Error {
     /// Build an `Error` from a raw negative syscall status (an `IoResult.status`
-    /// or a syscall return). A non-negative `status` is not an error and should not
-    /// reach here.
+    /// or a syscall return); a non-negative `status` is not an error.
     pub fn from_status(status: i32) -> Error {
         Error { code: KError::from_i32(status) }
     }
@@ -49,8 +46,7 @@ impl fmt::Display for Error {
     }
 }
 
-/// A coarse error classification mirroring `std::io::ErrorKind`, so a future `std`
-/// facade maps onto it directly. `#[non_exhaustive]` — variants may be added.
+/// A coarse error classification mirroring `std::io::ErrorKind`. `#[non_exhaustive]`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -64,12 +60,9 @@ pub enum ErrorKind {
     TimedOut,
     /// An IPC peer closed ([`KError::PeerClosed`]).
     BrokenPipe,
-    /// The name the operation would create is already taken
-    /// ([`KError::AlreadyExists`]). Same name as `std::io::ErrorKind::AlreadyExists`.
+    /// The name the operation would create is already taken ([`KError::AlreadyExists`]).
     AlreadyExists,
-    /// A container the operation requires to be empty is not
-    /// ([`KError::NotEmpty`]). Named for `std::io::ErrorKind::DirectoryNotEmpty`,
-    /// which is what a `std` facade would map this onto.
+    /// A container the operation requires to be empty is not ([`KError::NotEmpty`]).
     DirectoryNotEmpty,
     /// A malformed handle / argument / buffer.
     InvalidInput,
