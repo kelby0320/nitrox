@@ -2,13 +2,11 @@
 
 use super::*;
 
-/// Park the current thread (set `Blocked`, move into `blocked`) and switch to
-/// the next runnable thread. Mirrors [`switch_to_next`]'s IF-bracket exactly,
-/// but does **not** re-enqueue the outgoing thread — the caller ([`wait_on`])
-/// has already registered it on its objects' wait queues / the deadline heap
-/// under this same `SCHED` hold, so there is no lost-wakeup window. Resumes
-/// here (lock-free) when a waker calls [`make_runnable`] and the scheduler
-/// later picks this thread. Consumes the guard.
+/// Park the current thread (`Blocked`, into `blocked`) and switch to the next runnable one,
+/// mirroring [`switch_to_next`]'s IF-bracket but **not** re-enqueuing it. The caller
+/// ([`wait_on`]) has already registered it on its objects and the deadline heap under this
+/// same `SCHED` hold, so there is no lost-wakeup window. Resumes lock-free when a waker
+/// calls [`make_runnable`] and the scheduler picks it. Consumes the guard.
 fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
     let next = match pick_next(&mut g) {
         Some(n) => n,
@@ -39,10 +37,10 @@ fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
     unsafe { switch_into(g, prev_slot, prev_obj, next_obj) };
 }
 
-/// Move a `Blocked` thread from `blocked` to `ready` (state `Ready`). Caller
-/// holds `SCHED`. Returns `false` (no-op) if `thread` is not in `blocked` —
-/// the backstop for a second waker after the wake-CAS already claimed it. The
-/// `ObjectRef` moves `blocked`→`ready` with no refcount change.
+/// Move a `Blocked` thread from `blocked` to `ready` (state `Ready`). Caller holds
+/// `SCHED`. Returns `false` (no-op) if `thread` is not in `blocked` — the backstop for a
+/// second waker after the wake-CAS already claimed it. The `ObjectRef` moves
+/// `blocked`→`ready` with no refcount change.
 pub(super) fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     let Some(i) = g.blocked.iter().position(|r| r.as_ptr() == thread) else {
         return false;
@@ -50,30 +48,25 @@ pub(super) fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     let r = g.blocked.remove(i);
     // SAFETY: `r` pins `thread`; `SCHED` held.
     unsafe { Thread::set_state(thread, ThreadState::Ready) };
-    // Re-home onto its CPU (cache-warm; a full home falls back to the
-    // least-loaded permitted queue with room — F6). This fails only when
-    // *every* permitted queue is at reserve — e.g. a thread pinned to a single
-    // CPU whose queue is full — which is genuine reserve exhaustion, still fatal.
+    // Re-home onto its CPU (a full home falls back to the least-loaded permitted queue with
+    // room). Failing means *every* permitted queue is at reserve — genuine exhaustion, fatal.
     if let Err(returned) = place_thread(g, r, true) {
         // **Do not let `returned` drop here.** `SCHED` is held, and an `ObjectRef` drop can
         // reach `dispatch_destroy` → `SlabCache::free` — a plain spinlock under the rank-1
-        // lock, which is F2 (`kernel/docs/lock-ordering.md`). The two spawn callers avoid it
-        // by carrying the ref out of the locked block with a `match`; here there is nowhere
-        // to carry it *to*, because the next statement ends the machine.
+        // lock (`kernel/docs/lock-ordering.md`). The spawn callers avoid it by carrying the
+        // ref out of the locked block with a `match`; here there is nowhere to carry it
+        // *to*, because the next statement ends the machine.
         //
-        // `if place_thread(..).is_err()` used to do exactly the forbidden thing: an `if`
+        // `if place_thread(..).is_err()` would do exactly the forbidden thing: an `if`
         // condition is its own temporary scope, so the `Result` — and the `ObjectRef` inside
-        // it — dropped at the end of the condition, *before* the panic, with `SCHED` still
-        // held. An earlier version of this comment asserted the opposite and credited
-        // `panic = "abort"` with saving it; both were wrong (PR #204 review, blocking 1).
-        // The consequence was not theoretical: reserve exhaustion is the state this panic
-        // exists for, and the drop would spin on the allocator lock while another CPU's tick
-        // spins on `SCHED` with IRQs masked — a hang instead of the diagnostic.
+        // it — would drop at the end of the condition, *before* the panic, with `SCHED`
+        // still held. Reserve exhaustion is the state this panic exists for, and the drop
+        // would spin on the allocator lock while another CPU's tick spins on `SCHED` with
+        // IRQs masked — a hang instead of the diagnostic.
         //
-        // Leaked deliberately: `panic = "abort"` means nothing outlives this call, so a
-        // `forget` costs nothing and is honest about it. `deferred_drops` would be the
-        // documented alternative but is worse here — pushing to it can itself grow under
-        // `SCHED` (audit C.1(c)) and nothing will ever drain it.
+        // Leaked deliberately: `panic = "abort"` means nothing outlives this call.
+        // `deferred_drops` is worse here: pushing to it can itself grow under `SCHED`, and
+        // nothing will ever drain it.
         core::mem::forget(returned);
         panic!(
             "wake placement: no ready queue would take the thread — every affinity-permitted \
@@ -86,8 +79,8 @@ pub(super) fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
 
 /// Outcome of [`wait_on`].
 pub enum WaitResult {
-    /// At least one object signaled. `signaled[i]` corresponds to `objs[i]`
-    /// (the input order); set bits mark the handles to report.
+    /// At least one object signaled. `signaled[i]` corresponds to `objs[i]`; set bits mark
+    /// the handles to report.
     Signaled([bool; MAX_WAIT_HANDLES]),
     /// Nothing signaled before the deadline (or a poll found nothing ready).
     TimedOut,
@@ -95,13 +88,11 @@ pub enum WaitResult {
     OutOfMemory,
 }
 
-/// Register the current thread as a waiter on every object in `objs` (their
-/// type-erased addresses) with an optional `deadline_ns` (absolute monotonic;
-/// `0` = poll, `u64::MAX` = no timeout), block until one fires, then
-/// unregister and report which signaled. `now` is the current monotonic time.
-///
-/// Registration + block happen under a single `SCHED` hold, so a waker cannot
-/// slip between them (single-CPU, interrupts masked) — no lost wakeup.
+/// Register the current thread as a waiter on every object in `objs` (type-erased
+/// addresses) with an optional `deadline_ns` (absolute monotonic; `0` = poll, `u64::MAX` =
+/// no timeout), block until one fires, then unregister and report which signaled. `now` is
+/// the current monotonic time. Registration and block happen under a single `SCHED` hold, so
+/// a waker cannot slip between them — no lost wakeup.
 ///
 /// # Safety
 ///
@@ -134,8 +125,8 @@ pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult 
             return WaitResult::TimedOut;
         }
 
-        // Register the wait set on the thread, then on each object. All under
-        // this one hold → atomic w.r.t. any waker.
+        // Register the wait set on the thread, then on each object, all under this one hold
+        // so it is atomic w.r.t. any waker.
         let has_deadline = deadline_ns != u64::MAX;
         // SAFETY: live Thread (current), `SCHED` held.
         unsafe { Thread::wait_register(me_ptr, objs, has_deadline) };
@@ -176,8 +167,8 @@ pub unsafe fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult 
         block_current_and_switch(g); // consumes g; resumes here when woken
     }
 
-    // Resumed (woken by a signal or the deadline). Unregister everything under
-    // a fresh hold, snapshot which slots fired, then build the result.
+    // Resumed (woken by a signal or the deadline). Unregister everything under a fresh
+    // hold, snapshot which slots fired, then build the result.
     let mut snap = [(0usize, false); MAX_WAIT_HANDLES];
     let signaled;
     {
