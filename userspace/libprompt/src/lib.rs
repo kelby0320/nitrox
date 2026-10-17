@@ -1,25 +1,11 @@
-//! `libprompt` — **asking a person**, on the terminal their shell handed the program: a line with
-//! echo on, or a password with echo off, once or twice — and the channel plumbing a password
-//! crosses on its way to whoever checks it ([`ipc`]).
+//! `libprompt` — asking a person for a line (echo on) or a password (echo off) on the terminal the
+//! shell handed the program, and the channel plumbing ([`ipc`]) a password crosses afterwards.
 //!
-//! **Three consumers, so a crate of its own** (administration Part G.2). `with` asks for the
-//! password a rule wants, `account` for a new one and the current one (Part D.4), and `nxinstall`
-//! for the new machine's first account. It was `with`'s, then `coreutils::prompt`; the installer
-//! is not a coreutil and never talks to the view broker, so neither crate was the place (PR #347
-//! review). The plumbing came with it from `libviews`, which takes it from here.
+//! Which prompt to ask, and when, stays with each caller: this crate is how a question is put to a
+//! terminal and how the answer is kept out of the stack. A stage with no terminal must say so
+//! rather than read a password from a stream.
 //!
-//! **Which prompt, and when, stays with each caller.** This is how a question is put to a terminal
-//! and how the answer is kept out of the stack afterwards; what to ask, and what to do when there
-//! is no terminal to ask on, is the program's.
-//!
-//! A stage that has no terminal has nobody to ask, and must say so rather than read one from a
-//! stream.
-//!
-//! **An older reader on the same backend gets the line first**: input goes to the oldest terminal
-//! with a read pending, so a program still reading one — an earlier stage of this pipeline, or one
-//! a previous command left behind — receives what is typed at the prompt. `sudo` has the same
-//! limit; `docs/planning/administration.md` records it, and `docs/design/graphical-prompt.md` is
-//! its remedy.
+//! Input goes to the oldest terminal with a read pending, so an earlier reader gets the line.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -33,8 +19,8 @@ use librsproto::{OP_TTY_INTERRUPT, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRI
 
 use ipc::{recv, send, wait};
 
-/// One exchange with the terminal, stepping over an `Interrupt` — which it records in
-/// `interrupted`, since `Ctrl-C` at a password prompt means "never mind".
+/// One exchange with the terminal, stepping over an `Interrupt` and recording it in `interrupted`:
+/// `Ctrl-C` at a password prompt means "never mind".
 fn tty(term: u64, op: u16, body: &[u8], interrupted: &mut bool) -> Option<(bool, Vec<u8>)> {
     if !send(term, op, 1, body, &[]) {
         return None;
@@ -50,8 +36,7 @@ fn tty(term: u64, op: u16, body: &[u8], interrupted: &mut bool) -> Option<(bool,
     }
 }
 
-/// Ask for a line on `term`, **echo on**: something a person may see as they type it, such as a
-/// name. `None` if they pressed `Ctrl-C` or `Ctrl-D`, or the terminal failed.
+/// Ask for a line on `term`, echo on. `None` on `Ctrl-C`, `Ctrl-D` or a terminal failure.
 pub fn ask_line(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
     let mut interrupted = false;
     let _ = tty(term, OP_TTY_SET_MODE, &[TTY_MODE_ECHO], &mut interrupted);
@@ -62,27 +47,20 @@ pub fn ask_line(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Ask for a password on `term`, echo off. `None` if the person pressed `Ctrl-C` or `Ctrl-D`, or
-/// the terminal failed.
+/// Ask for a password on `term`, echo off. `None` on `Ctrl-C`, `Ctrl-D` or a terminal failure.
 pub fn ask_password(term: u64, prompt: &[u8]) -> Option<Vec<u8>> {
     ask_password_then(term, prompt, &mut || {})
 }
 
-/// [`ask_password`], calling `asked` **once echo is off and before the read** (administration Part
-/// G.2).
-///
-/// **The receipt a gate may type after.** Nothing reads a desktop terminal's grid, so a gate waits
-/// for a line the program logs. Logged before the prompt, it could let the password be typed while
-/// echo was still on, into the grid. Logged here, after `tty-server` has answered the change of
-/// mode, what is typed next is not echoed, and it waits at the server for the read.
+/// [`ask_password`], calling `asked` once echo is off and before the read: a gate waiting on a
+/// line the program logs there cannot type the password while echo is still on.
 pub fn ask_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut()) -> Option<Vec<u8>> {
     let mut interrupted = false;
     let _ = tty(term, OP_TTY_SET_MODE, &[0], &mut interrupted);
     let _ = tty(term, OP_TTY_WRITE, prompt, &mut interrupted);
     asked();
     let line = tty(term, OP_TTY_READ_LINE, &[], &mut interrupted);
-    // **Echo back on before anything else**: this terminal goes to a program next, and an
-    // elevated shell that inherited echo off would type blind.
+    // Echo back on first: a shell that inherited echo off would type blind.
     let _ = tty(term, OP_TTY_SET_MODE, &[TTY_MODE_ECHO], &mut interrupted);
     let _ = tty(term, OP_TTY_WRITE, b"\r\n", &mut interrupted);
     match line {
@@ -117,15 +95,14 @@ impl NewPassword {
     }
 }
 
-/// **A new password, typed twice** on `term`: `prompt` for the first, `again:` for the second, then
-/// [`confirm`]ed.
+/// A new password typed twice on `term`, then [`confirm`]ed.
 pub fn ask_new_password(term: u64, prompt: &[u8]) -> Result<Vec<u8>, NewPassword> {
     ask_new_password_then(term, prompt, &mut |_| {})
 }
 
-/// [`ask_new_password`], calling `asked` with `1` and then `2` as each read is ready, echo off —
-/// the receipts [`ask_password_then`] gives, once per copy. Echo goes back on between the two
-/// reads, so one receipt for both would let the second copy be typed while it was on.
+/// [`ask_new_password`], calling `asked` with `1` and then `2` as each read is ready, echo off.
+/// Echo goes back on between the two reads, so one receipt for both would let the second copy be
+/// typed while it was on.
 pub fn ask_new_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut(u8)) -> Result<Vec<u8>, NewPassword> {
     let mut first = ask_password_then(term, prompt, &mut || asked(1)).ok_or(NewPassword::Cancelled)?;
     let Some(second) = ask_password_then(term, b"again: ", &mut || asked(2)) else {
@@ -135,9 +112,9 @@ pub fn ask_new_password_then(term: u64, prompt: &[u8], asked: &mut dyn FnMut(u8)
     confirm(first, second)
 }
 
-/// **The password typed twice, if the two agree and it keeps the rules.** The second copy is
-/// always zeroed; the first is kept only when it is the answer. Nothing is sent before this, so a
-/// typing mistake changes nothing.
+/// The password typed twice, if the two agree and it keeps the rules. The second copy is always
+/// zeroed; the first is kept only when it is the answer. Nothing is sent before this, so a typing
+/// mistake changes nothing.
 pub fn confirm(mut first: Vec<u8>, mut second: Vec<u8>) -> Result<Vec<u8>, NewPassword> {
     let same = first == second;
     scrub(&mut second);
