@@ -224,6 +224,7 @@ pub mod services {
         }
     }
 
+    /// The table's schema: `name`, `state`, `restarts`.
     pub fn schema() -> Schema {
         Schema::new()
             .field("name", TypeTag::String, TypeModifiers::NONE)
@@ -263,6 +264,7 @@ pub mod services {
         Unknown,
     }
 
+    /// Classify `suffix`, as asked on a `session` endpoint or on `/svc/services` itself.
     pub fn asked(suffix: &[u8], session: bool) -> Asked {
         match suffix {
             b"all.tsm" => Asked::Table,
@@ -272,6 +274,7 @@ pub mod services {
         }
     }
 
+    /// What `service-mgr` does for an admin request.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Action {
         /// Start it; answer once it is up.

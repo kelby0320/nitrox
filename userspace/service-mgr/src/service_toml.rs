@@ -73,12 +73,10 @@ pub struct ServiceDecl {
     /// System capabilities to grant at spawn, as a `SysCaps` bitmask.
     ///
     /// Names are the schema's (`"BIND_NAMESPACE"`, `"LOAD_MODULE"`, …); an unrecognised one
-    /// contributes nothing and is **reported** by the caller rather than dropped silently,
-    /// because a service that starts with less authority than it declared fails somewhere
-    /// else entirely.
-    ///
-    /// The kernel refuses amplification, so this can only ever be a subset of what
-    /// `service-mgr` itself holds.
+    /// contributes nothing and is **reported** by the caller rather than dropped silently, because
+    /// a service that starts with less authority than it declared fails somewhere else entirely.
+    /// The kernel refuses amplification, so this can only ever be a subset of what `service-mgr`
+    /// itself holds.
     pub syscaps: u64,
     /// `syscaps` entries not recognised, kept so the caller can report them.
     pub unknown_syscaps: Vec<String>,
@@ -151,14 +149,11 @@ pub fn parse_syscaps(list: &[String]) -> (u64, Vec<String>) {
     (bits, unknown)
 }
 
-/// Which `[restart]` keys this declaration has already set.
-///
-/// **First value wins, for every key**, which is what makes the schema's "a declarations
-/// file cannot be steered by appending to it" true. That includes appending a whole second
-/// `[service.<name>.restart]` table, since a repeated header re-enters the section.
-///
-/// Flags rather than "differs from the default", because a key deliberately set *to* the
-/// default would otherwise stay overwritable.
+/// Which `[restart]` keys this declaration has already set. **First value wins, for every key**,
+/// which is what makes the schema's "a declarations file cannot be steered by appending to it"
+/// true. That includes appending a whole second `[service.<name>.restart]` table, since a repeated
+/// header re-enters the section. Flags rather than "differs from the default", because a key
+/// deliberately set *to* the default would otherwise stay overwritable.
 #[derive(Default)]
 struct RestartSeen {
     /// `after = []` followed by `after = ["x"]` must keep the empty list, which `is_empty()`
