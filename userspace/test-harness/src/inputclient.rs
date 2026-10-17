@@ -1,29 +1,10 @@
-//! `input-testclient` — proves the i8042 driver actually delivers events (plan M3 Part A).
+//! `input-testclient` — proves the i8042 driver and the input path deliver events, which bring-up
+//! alone does not show. It prints what arrives on `/dev/input/new` (the **merged** stream from
+//! `input-server`), then drives a window and the toolkit; `cargo xtask check-input` injects
+//! keystrokes and clicks over QMP and checks the decoded events.
 //!
-//! Bring-up is not the same as working. Before this, Part A could report
-//! `ps2: keyboard mouse armed` on every boot with the ISR, the event ring and the parked
-//! read having never run against a real keystroke — which is precisely the shape that let a
-//! **one-way** Surface protocol ship in PR #174 behind three green CI jobs and 1213 passing
-//! tests. A bound server that never answers, and an armed driver that never delivers, read
-//! identically from the outside.
-//!
-//! So this consumes `/dev/input/new` — the **merged** stream from the `input-server` — and
-//! prints what arrives. The host side (`cargo xtask check-input`) injects the keystrokes and
-//! clicks over QMP and checks the decoded events against what it sent, which exercises the
-//! whole path: i8042 → driver ring → raw node → server → merge → channel → here.
-//!
-//! It read the raw nodes directly until M3 Part B. It cannot any more, and that is the
-//! design working: the driver is single-reader per device and the server now holds both, so
-//! a second reader gets `WouldBlock`. Reading a raw node unfiltered is a keylogger, and the
-//! binding is the whole of that boundary (`input-subsystem.md` §5).
-//!
-//! ## Why it announces itself first
-//!
-//! Injection is a host action against a guest that must already be waiting. The client
-//! prints `listening` once its reads are parked, the harness waits for that line, and only
-//! then injects — otherwise the event lands in the ring before anyone is reading, or worse,
-//! before the device node has been resolved, and the test becomes a race it loses
-//! intermittently.
+//! **It prints `listening` once its reads are parked**, and the gate waits for that line before
+//! injecting: an earlier event would land before anyone reads.
 
 #![no_std]
 #![no_main]
@@ -43,79 +24,35 @@ use libui::element::{Element, custom};
 use libui::layout::{FixedCell, layout};
 use libui::route::Router;
 
-/// `alloc` backing — `libsurface` holds its buffers and event queue on the heap.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The invisible window's size.
-///
-/// **Nothing is ever committed to it**, so the compositor skips it when compositing — a
-/// window that has created buffers but not drawn shows background, which is a real state and
-/// not a trick. That is what lets this client hold a focusable, hit-testable window through
-/// a boot without disturbing `cargo xtask check-display`, which compares the screen against
-/// `ui-testclient`'s scene pixel for pixel.
-///
-/// **Larger than any screen, deliberately.** New windows land at `(0, 0)`, so a window this
-/// size contains the cursor wherever the compositor parked it — which means the gate can
-/// click without first driving the cursor somewhere known. That matters more than it sounds:
-/// steering the cursor takes a dozen PS/2 motion events, each of which becomes a
-/// `PointerEvent` on this client's session ring, and the first attempt at this gate lost the
-/// keystroke behind exactly that flood. The compositor clips, so an oversized window is
-/// ordinary — a maximised one is the same shape.
+/// The invisible window's size: nothing is ever committed, so the compositor skips it; **larger
+/// than any screen**, as new windows land at `(0, 0)`, so it contains the cursor and the gate can
+/// click without steering it first.
 const WIN_W: u32 = 2048;
 const WIN_H: u32 = 2048;
 
-/// How long phase 3 refuses to drain, in nanoseconds.
-///
-/// Long enough for the harness to see `stalling`, inject a flood over QMP, and for the
-/// compositor to fill the ring and start parking — sub-second would race the host round trip.
+/// How long the stall stage refuses to drain, in ns, while the harness floods motion over QMP.
 const STALL_NS: u64 = 1_500_000_000;
 
-/// The key the harness injects *after* the flood, and the one whose arrival proves nothing
-/// was dropped while the ring was full.
+/// The key injected *after* the flood; its arrival proves nothing was dropped.
 const LATE_CODE: u16 = 46;
 
-/// How long the motion phase refuses to drain the **device** stream, in nanoseconds.
-///
-/// Long enough for the harness to see `input stalled` and inject its paced burst over QMP.
+/// How long the motion phase refuses to drain the **device** stream, in ns.
 const INPUT_STALL_NS: u64 = 3_000_000_000;
 
-/// The key the harness presses to ask for the motion phase.
-///
-/// **The phase begins on a record rather than at boot, and is noticed by the phase-1 pump
-/// rather than by a wait of its own.** Two things forced that. It cannot start on its own clock:
-/// the harness has other clients to attend to first — `ui-testclient`'s window churn — and a
-/// client that stalled at boot was racing whatever `check-input` was waiting for, which cost the
-/// `PASSED` line the next step needed. And it cannot have its own wait either: this client is in
-/// the image *every* display gate boots, and most of them want the phases below instead, so a
-/// wait long enough for one gate is a delay every other gate pays. The pump is already running,
-/// already bounded, and already sees every record.
-///
-/// `F2` is unbound everywhere — `ui-testclient` registers `Super+F1`.
+/// The key the harness presses to ask for the motion phase, noticed by the raw-stream pump: a
+/// clock or wait of its own would delay every display gate; `F2` is unbound.
 const START_CODE: u16 = 60;
 
-/// How long a drain waits with nothing arriving before calling the stream quiet.
-///
-/// **Sized against the slowest way input can reach this guest, not against the flush.**
-/// `input-server` retries a deferred send after 5 ms, which 500 ms covers with room to spare —
-/// and 500 ms, then 1.5 s, were both too short. With the i8042's interrupts off
-/// (`check-input --no-ps2-irq`) nothing reads the controller until the 10 ms recovery sweep, so
-/// a burst injected in a few milliseconds is delivered to the guest over *seconds*, and a drain
-/// that gives up mid-trickle reports a sum that is short by whatever was still on its way.
-///
-/// Four seconds is not a measurement of that rate; it is far enough above it that the difference
-/// stops mattering. A drain only ever waits this long once, at the end.
+/// How long a drain waits with nothing arriving before calling the stream quiet: with the i8042's
+/// interrupts off (`check-input --no-ps2-irq`) a burst arrives over *seconds*.
 const QUIET_NS: u64 = 4_000_000_000;
 
-/// The one widget this client builds: a `custom` node filling the window, which is the shape
-/// Milestone 5's terminal grid takes.
 const GRID: u32 = 1;
 
 /// What the toolkit hands back when an event reaches the widget.
-///
-/// Part B's whole claim is that an injected keystroke reaches a *widget* — not merely a
-/// window — so the gate needs something the router produced rather than something the
-/// window received. These are that something.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Msg {
     Key(KeyEvent),
@@ -124,28 +61,15 @@ enum Msg {
     Wheel(PointerEvent),
 }
 
-/// Bytes per record, from the shared ABI rather than a local literal — an earlier version
-/// hardcoded `16` and read fields at literal offsets, so a kernel-side layout change would
-/// have gone unnoticed until this gate happened to run (PR #178 review).
 const EVENT_LEN: usize = INPUT_EVENT_LEN;
-/// The last thing the harness injects, and therefore what "done" means here.
-///
-/// **A sentinel rather than a record count.** Counting was the first attempt and it was both
-/// wrong (nine records, not ten — the motion is `REL_X`, `REL_Y`, `SYN`) and brittle for a
-/// worse reason: how many records an injection produces is the driver's business, so a count
-/// would need updating whenever the mouse packet framing changed. Waiting for the event that
-/// *means* the sequence finished does not.
+/// The last thing the harness injects, so what "done" means: a sentinel, not a record count.
 const DONE_CODE: u16 = libkern::abi::BTN_LEFT;
-/// Offset of the rsproto payload inside an `IpcMsg`.
 const PAYLOAD_OFF: usize = 24;
 
 static mut CLOCK_BUF: u64 = 0;
-/// Two slots: the window channel and this process's notification handle, which the bounded
-/// window-phase wait needs together.
 static mut WAIT_HANDLES: [u64; 2] = [0; 2];
 static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 
-/// Wait for a `PendingOperation` and return `(status, result)`.
 fn po_wait(po: u64) -> (i32, u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     let waited = unsafe {
@@ -172,7 +96,6 @@ fn po_wait(po: u64) -> (i32, u64) {
     }
 }
 
-/// Resolve `path`, blocking on the lookup's `PendingOperation`.
 fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     // SAFETY: valid path pointer + namespace handle.
     let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
@@ -191,49 +114,21 @@ struct Stream {
     count: u64,
     /// The harness pressed [`START_CODE`], asking for the motion phase.
     start_requested: bool,
-    /// The idle deadline passed rather than the channel failing. The two are
-    /// indistinguishable from `sys_wait`'s return, and they mean opposite things: one is
-    /// "nobody is driving this run", the other is a real fault the gate must not pass.
+    /// The idle deadline passed rather than the channel failing: nobody is driving this run.
     timed_out: bool,
 }
 
 impl Stream {
-    /// Resolve `/dev/input/new`, which mints a per-consumer channel.
     fn open(root_ns: u64) -> Option<Self> {
         let channel = lookup(root_ns, b"/dev/input/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT)?;
         Some(Self { channel, msg: [0; 4096], handles: [0; 8], count: 0, start_requested: false, timed_out: false })
     }
 
-    /// Sum the relative motion **between a button press and its release**.
+    /// Sum relative motion until the stream is quiet: `(dx, dy, announced, widest)`.
     ///
-    /// Returns `(dx, dy, announced, widest)` — the sums of `REL_X` and `REL_Y`, the record
-    /// count carried by any `SYN_DROPPED` seen, and the largest single `REL_X` value.
-    ///
-    /// **Correct only because nothing else has been injected yet**, which is why the phase that
-    /// uses it runs first. Summing a device stream cannot be delimited from inside the guest:
-    /// with the i8042's interrupts off — `check-input --no-ps2-irq`, which CI runs — input
-    /// arrives on a 10 ms recovery sweep, so another phase's flood is still trickling in long
-    /// after it was injected, and any window drawn around this one either includes it or gives
-    /// up before this burst's own tail. Both were observed on one commit: six stray records too
-    /// many in CI, two of the burst's own missing locally.
-    ///
-    /// Delimiting it with a button press and release was the first repair, and it fails for a
-    /// reason worth keeping: **a button is exactly what deferral cannot recover**. A press that
-    /// lands in an overflowing ring is announced as a gap and is gone — which is the property
-    /// this phase exists to demonstrate, applied to its own delimiter.
-    ///
-    /// **`widest` is how a consumer can tell that a deferral happened**, and it is the only way
-    /// available to it: recovery is deliberately invisible — the point of carrying motion
-    /// forward is that the stream still adds up — so nothing else distinguishes "the ring
-    /// overran and the server folded the motion" from "the ring never filled". A folded group
-    /// carries the *sum* of the batches it stands for, so it is wider than any delta the harness
-    /// injects. A gate that did not check this would pass on a run that never overran, which is
-    /// exactly how the first version of this guard passed under KVM (PR #246 review, blocking 1).
-    ///
-    /// **Summing rather than listing.** A burst is tens of records and a per-record line would
-    /// bury the transcript; more to the point, the property under test *is* the sum. Relative
-    /// deltas are additive, so what a consumer must end up with is the total the harness
-    /// injected, whatever the batching, coalescing and deferral in between did with it.
+    /// It runs first, as a device stream cannot be delimited from inside the guest. **`widest`
+    /// tells a consumer a deferral happened**: recovery is invisible, but a folded group carries
+    /// the *sum* of its batches, so it is wider than any injected delta.
     fn sum_motion(&mut self) -> (i64, i64, u64, i64) {
         let (mut dx, mut dy, mut announced, mut widest) = (0i64, 0i64, 0u64, 0i64);
         loop {
@@ -287,16 +182,10 @@ impl Stream {
         }
     }
 
-    /// Block for one `Input::Events` message and print every record it carries.
-    ///
-    /// Returns whether the batch contained [`DONE_CODE`]'s press, or `None` if the channel
-    /// failed.
+    /// Block for one `Input::Events` message and print its records; whether it held [`DONE_CODE`]'s
+    /// press.
     fn pump(&mut self) -> Option<bool> {
-        // **Bounded, like the window phase.** An undriven boot must not leave this client
-        // waiting here forever, because the *next* thing it does is create a 2048×2048
-        // window and take every click in the system. `check-terminal` found this the hard
-        // way: its one click on the terminal was also this phase's sentinel, so the client
-        // woke, created that window, and swallowed every keystroke after the first.
+        // **Bounded**: the next step creates a window that takes every click.
         let deadline = deadline_ns(IDLE_LIMIT_NS);
         loop {
             // SAFETY: waiting on this process's own channel handle.
@@ -337,8 +226,6 @@ impl Stream {
                 if ev.kind == libkern::abi::EV_KEY && ev.code == DONE_CODE && ev.value == 1 {
                     done = true;
                 }
-                // The harness asking for the motion phase. Recorded rather than acted on here:
-                // this is inside a loop over one batch, and the phase stops draining.
                 if ev.kind == libkern::abi::EV_KEY && ev.code == START_CODE && ev.value == 1 {
                     self.start_requested = true;
                 }
@@ -357,8 +244,7 @@ impl Stream {
     }
 }
 
-/// Called by the kernel's ELF entry with the standard bootstrap arguments; `root_ns` is this
-/// process's root namespace.
+/// Entry point; `root_ns` is the process's root namespace.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"input-testclient: up\n");
@@ -368,41 +254,19 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         exit(1);
     };
 
-    // The harness waits for this before injecting: an event delivered before the consumer
-    // channel exists is one the server has nowhere to send.
+    // The harness waits for this before injecting.
     kprint(b"input-testclient: listening\n");
 
-    // Pump until the button press arrives — the last injection. Message boundaries are
-    // timing, not protocol: the server batches whatever is ready, so how the nine records
-    // split across messages varies run to run and neither the client nor the harness should
-    // depend on it.
+    // Pump until the button press arrives, the last injection; message boundaries are timing only.
     loop {
         match stream.pump() {
             Some(true) => break,
             Some(false) => {
                 // ---- The motion phase, asked for by a keystroke ----
-                //
-                // This covers server→consumer, where a relative delta can be *destroyed* rather
-                // than delayed: `input-server` cannot send to a consumer whose ring is full, and
-                // a discarded batch of `REL_*` is movement no consumer can ever re-derive —
-                // unlike a key or a button, whose state `SYN_DROPPED` asks it to resynchronise.
-                // That is the drift the whole of PR #246 is about. (Phase 3 below covers the
-                // compositor→client direction, which is a different queue with a different
-                // answer.)
-                //
-                // **The stall is this client refusing to read**, which is what makes the gate
-                // mean the same thing under every accelerator: the first version lived in
-                // `check-login` and overran the ring by injecting faster than the compositor
-                // could repaint — true under TCG, false under KVM, and `--kvm` is the only
-                // configuration CI runs (PR #246 review, blocking 1).
-                //
-                // **Run from inside the pump, on a key.** It cannot start on its own clock: the
-                // harness has `ui-testclient`'s churn to wait out first, and a client that
-                // stalled at boot raced it — consuming the `PASSED` line the next step needed.
-                // It cannot have a wait of its own either: every display gate boots this client
-                // and most want the phases below, so a wait long enough for `check-input` is a
-                // delay all of them pay. The pump is already running and already sees every
-                // record.
+                // Covers server→consumer, where a relative delta can be *destroyed*, not delayed.
+                // **The stall is this client refusing to read**, so the overrun means the same
+                // under TCG and KVM. It runs inside the pump, on a key, not on its own clock or
+                // wait.
                 if core::mem::take(&mut stream.start_requested) {
                     kprint(b"input-testclient: input stalled\n");
                     sleep_ns(notif, INPUT_STALL_NS);
@@ -420,17 +284,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 }
             }
             None if stream.timed_out => {
-                // Nothing is driving this run. Exiting *before* the window phase is what
-                // keeps this client out of every other gate's way — see `IDLE_LIMIT_NS`.
-                //
-                // **A distinct message from the phase-2 one below, and that matters to a
-                // gate.** Both used to print "idle, releasing the window", which is only
-                // true of one of them: here no window has been created yet, so a gate that
-                // waits for this may act immediately. There it announces an *intention* —
-                // the 2048×2048 window is still up and stays up through `exit`, the kernel's
-                // teardown, and the compositor noticing the peer closed. A gate cannot tell
-                // those apart from one string, and the difference decides whether its next
-                // click lands on the terminal or on a window the size of the screen.
+                // Nothing is driving this run; exiting keeps this client out of other gates' way.
+                // **A distinct message from the window-stage one**: here no window exists yet, so a
+                // gate may act at once.
                 kprint(b"input-testclient: idle before the window phase\n");
                 exit(0);
             }
@@ -441,14 +297,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
     }
 
-    // ---- Phase 2: the same events, but through a *window* ----
-    //
-    // The window is created **after** phase 1 rather than up front. With no window, the
-    // compositor has nothing to route phase 1's events to and sends nothing; created early,
-    // its records would queue on this client's session channel while it was blocked reading
-    // the raw stream. That mattered when a refused send was simply dropped; since M3 Part D3
-    // the compositor parks and retries, so the phases are sequenced now for clarity rather
-    // than for safety — and phase 3 below exercises the parking deliberately.
+    // ---- The window stage: the same events through a *window*, created after the raw stage ----
     // SAFETY: `root_ns` is this process's live root namespace handle
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
         Ok(t) => t,
@@ -457,26 +306,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             exit(1);
         }
     };
-    // One session, one window: this client never opens a menu. `Session` is what `libsurface`
-    // hands out since M6 C3 — a window no longer owns its connection.
     let mut win = Session::new(alloc::boxed::Box::new(transport));
     let Ok(window_id) = win.create(&CreateWindowRequest::new(WIN_W, WIN_H, Role::Normal), 2) else {
         kprint(b"input-testclient: Session::create FAILED\n");
         exit(1);
     };
 
-    // ---- The toolkit, driven by real events ----
-    //
-    // `element -> layout -> diff -> route -> handler`, the whole of Part B, with events that
-    // came from a QMP injection through the i8042 driver, the input server, the compositor's
-    // own router and `libsurface`. Everything below this line is unit-tested in `libui`; what
-    // the gate adds is that the pieces are wired to each other.
+    // ---- The toolkit, driven by real events from a QMP injection ----
     let view: Element<Msg> = custom(GRID, libdraw::geom::Size::new(WIN_W, WIN_H))
         .on_key(|k| Some(Msg::Key(k)))
         .on_pointer(Msg::Ptr)
-        // **A separate handler, which is the thing worth proving here.** `on_pointer` never
-        // receives a wheel, so a widget reporting one through this handler is evidence that
-        // `libui` routed it as a wheel rather than as an ordinary pointer record.
+        // **A separate handler, the thing worth proving**: `on_pointer` never receives a wheel.
         .on_wheel(Msg::Wheel)
         .focusable();
     let bounds = libdraw::geom::Rect::new(0, 0, WIN_W, WIN_H);
@@ -488,7 +328,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         exit(1);
     }
     let mut router = Router::new();
-    // Focus the grid, as a real client would on creation: it is the only focusable widget.
     match tree.root().map(|w| w.id) {
         Some(id) if router.focus(&tree, &view, id) => {}
         _ => {
@@ -497,49 +336,27 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
     }
 
-    // The second synchronisation point. The window has to exist before the harness injects
-    // at it, for the same reason `listening` exists: a keystroke routed before there is a
-    // focusable window is one the compositor correctly drops.
+    // The second synchronisation point, like `listening`.
     Line::new().s(b"input-testclient: window ready id=").u(window_id as u64).end();
 
-    // **A button *press* is the sentinel**, for the same reason `DONE_CODE` is one for the
-    // raw stream: it is the last thing the harness injects. Accepting any button record
-    // ended the phase on the release left over from phase 1 — which arrives before anything
-    // aimed at this window — so the client printed `PASSED` and exited while the harness was
-    // still asserting, and the compositor correctly routed the remaining keys to whatever
-    // window was left. Diagnosed from `compositor: key win=1` after `window ready id=130`.
-    // **The first event this window receives must be its focus change**, and asserting the
-    // *order* is what catches a compositor that announces focus late. Announced on the create
-    // itself, it precedes any input the window could be routed. Announced from somewhere that
-    // only runs later — an `Applied` on some other session, or the next input event — a
-    // pointer record arrives first, and the window spends that interval owning the keyboard
-    // without knowing it. The gate could not tell the two apart until this line existed
-    // (PR #184 review, finding 2).
+    // **A button *press* ends this phase**: the raw stream's leftover release arrives first. **The
+    // first event must be the focus change**: asserting the *order* catches a compositor announcing
+    // focus late.
     let mut first_event_reported = false;
 
     let (mut saw_key, mut saw_press) = (false, false);
     while !(saw_key && saw_press) {
-        // The window id is discarded: this client has exactly one window, so every record is
-        // for it — `Session` filters anything else out before it gets here.
         let ev = match wait_event_before(&mut win, deadline_ns(IDLE_LIMIT_NS)) {
             Some(Ok((_, e))) => e,
             Some(Err(_)) => {
                 kprint(b"input-testclient: window stream FAILED\n");
                 exit(1);
             }
-            // **Nothing is driving this run.** Exiting releases the window, and releasing it
-            // matters: it is 2048×2048 — larger than the screen — and created last, so while
-            // it exists it is the topmost window everywhere and takes every click and every
-            // keystroke. `check-input` drives this phase within a second of `window ready`;
-            // any other gate has no reason to, and before this the client sat here for the
-            // life of the boot with the whole screen under it. `cargo xtask check-terminal`
-            // is the gate that found it: its click on the terminal landed here instead.
+            // **Nothing is driving this run.** Exiting releases the 2048×2048 window, which takes
+            // every click and keystroke; `check-terminal` found its click landing here.
             None => {
-                // **This is an announcement, not a completion.** The window outlives the
-                // line: `exit` has not run, the kernel has not torn the process down, and
-                // the compositor has not yet noticed the peer closed. A gate that clicks on
-                // seeing this can still land on a 2048×2048 window. Named distinctly from
-                // the phase-1 message above so the two states are not one signal.
+                // **An announcement, not a completion**: the window outlives this line, so a gate
+                // clicking on seeing it can still land on it.
                 kprint(b"input-testclient: releasing the window (still up)\n");
                 exit(0);
             }
@@ -551,12 +368,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 WindowEvent::Key(_) => b"key",
                 WindowEvent::Pointer(_) => b"pointer",
                 WindowEvent::InputLost => b"dropped",
-                // This client declares no acceptor, so nothing can be dropped on it.
                 WindowEvent::Drop { .. } => b"drop",
                 WindowEvent::CloseRequested => b"close",
-                // This client creates no popup, so it can never be dismissed.
                 WindowEvent::Dismissed => b"dismissed",
-                // Not this client's business: its window is fixed-size and it never moves.
                 WindowEvent::Configure { .. } => b"configure",
             };
             Line::new().s(b"input-testclient: first win event=").s(what).end();
@@ -572,12 +386,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                     .u(k.modifiers as u64)
                     .end();
                 if k.pressed == librsproto::surface::KEY_REPEAT {
-                    // A held key repeating. Reported separately from a press so the gate can
-                    // tell them apart — a client counting presses must not count a held key
-                    // forever, which is the whole reason the value is distinct.
+                    // A held key repeating, reported apart from a press.
                     Line::new().s(b"input-testclient: win repeat code=").u(k.keycode as u64).end();
                 }
-                // ...and through the toolkit, which is the part Part B is about.
                 if let Some(Msg::Key(rk)) = router.key(&tree, &view, k) {
                     Line::new()
                         .s(b"input-testclient: widget key code=")
@@ -629,40 +440,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             }
             WindowEvent::Focus(f) => {
                 router.set_window_focused(f);
-                // The *other* half of the two-focus rule: widget focus is the toolkit's,
-                // window focus is the compositor's, and a client needs both to know whether
-                // a caret should blink. Announced on the change, so it arrives once when
-                // this window becomes the topmost focusable one.
+                // Widget focus is the toolkit's, window focus the compositor's.
                 Line::new().s(b"input-testclient: win focus has=").u(u64::from(f)).end();
             }
             WindowEvent::InputLost => kprint(b"input-testclient: win events DROPPED\n"),
             WindowEvent::Drop { .. } => kprint(b"input-testclient: a drop arrived\n"),
-            // **Reported and ignored, deliberately.** This client exists to be driven by a gate,
-            // and a window that vanished because something asked politely would take the rest of
-            // the run with it. A client is free to ignore a close request — that is the whole
-            // reason it is a request — and this one is the case a shell has to insist on.
+            // **Reported and ignored, deliberately**: a window that vanished when asked politely
+            // would end the run.
             WindowEvent::CloseRequested => kprint(b"input-testclient: asked to close, staying\n"),
-            // A dismissal is a popup's event, and this client has no popup.
             WindowEvent::Dismissed => {}
-            // Ignored deliberately: a fixed-size window declining a resize is legal, and this
-            // one is 2048×2048 on purpose.
+            // A fixed-size window may decline a resize; this one is 2048×2048 on purpose.
             WindowEvent::Configure { .. } => {}
         }
     }
 
-    // ---- Phase 3: stop draining, and prove nothing is lost ----
-    //
-    // The phases above never exercise the compositor's park-and-retry: this client drains in
-    // `wait_event` between injections, so a send is never refused and the outbox never holds
-    // anything (PR #181 review, finding 3 — demonstrated by replacing retry with the old
-    // drop-on-refusal and watching the gate pass anyway).
-    //
-    // So stall deliberately. While this sleeps, the harness floods motion until the 16-slot
-    // ring is full and then injects a key. Every motion after the ring fills parks in the
-    // compositor's outbox and coalesces to one; the key queues behind it. On waking, the
-    // key must still arrive — under drop-on-refusal it would not, and under park-with-no-
-    // wakeup (the same review's finding 1) it would never be re-sent, because a client
-    // draining its own ring signals nothing to the compositor.
+    // ---- The stall stage: stop draining, and prove nothing is lost ----
+    // The phases above drain between injections, so park-and-retry never runs. So stall: the
+    // harness floods motion until the 16-slot ring is full, then injects a key. On waking it must
+    // still arrive; drop-on-refusal would lose it, and park-with-no-wakeup would never re-send it.
     kprint(b"input-testclient: stalling\n");
     sleep_ns(notif, STALL_NS);
 
@@ -685,15 +480,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             WindowEvent::Pointer(_) | WindowEvent::Focus(_) => {}
             WindowEvent::InputLost => kprint(b"input-testclient: win events DROPPED\n"),
             WindowEvent::Drop { .. } => kprint(b"input-testclient: a drop arrived\n"),
-            // **Reported and ignored, deliberately.** This client exists to be driven by a gate,
-            // and a window that vanished because something asked politely would take the rest of
-            // the run with it. A client is free to ignore a close request — that is the whole
-            // reason it is a request — and this one is the case a shell has to insist on.
+            // **Reported and ignored, deliberately**, as in the window stage.
             WindowEvent::CloseRequested => kprint(b"input-testclient: asked to close, staying\n"),
-            // A dismissal is a popup's event, and this client has no popup.
             WindowEvent::Dismissed => {}
-            // Ignored deliberately: a fixed-size window declining a resize is legal, and this
-            // one is 2048×2048 on purpose.
             WindowEvent::Configure { .. } => {}
         }
     }
@@ -703,13 +492,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 }
 
 /// How long the window phase waits for the harness to start injecting before giving up.
-///
-/// Generous: `check-input` injects within a second of `window ready`, so this never fires
-/// there, and a slow CI machine has room. Its only job is to stop an undriven run from
-/// leaving a screen-covering window in place forever.
 const IDLE_LIMIT_NS: u64 = 20_000_000_000;
 
-/// An absolute monotonic deadline `ns` from now.
 fn deadline_ns(ns: u64) -> u64 {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
@@ -718,11 +502,7 @@ fn deadline_ns(ns: u64) -> u64 {
     unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns)
 }
 
-/// Wait for a window event until `deadline`, or `None` if it passes first.
-///
-/// `Session::wait_event` blocks forever, which is right for a real client and wrong for a test
-/// one that may never be driven. Built from the pieces `libsurface` grew in M5 Part C for
-/// `nxterm`: the waitable handle, and a non-blocking drain.
+/// Wait for a window event until `deadline`, or `None`: `Session::wait_event` blocks forever.
 fn wait_event_before(
     win: &mut Session<alloc::boxed::Box<ChannelTransport>>,
     deadline: u64,
@@ -737,11 +517,8 @@ fn wait_event_before(
         if h == 0 {
             return Some(win.wait_event());
         }
-        // **The window handle alone.** An earlier version also waited on this process's
-        // notification handle, which nothing here enqueues on and nothing here drains — so if
-        // one ever *were* pending it would return immediately every turn and this would spin
-        // until the deadline. The deadline is what bounds this loop; the notification handle
-        // added nothing but that risk (PR #194 review, optional 2).
+        // **The window handle alone**: the notification handle is never drained, so waiting on it
+        // spins.
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
         let waited = unsafe {
             WAIT_HANDLES[0] = h;
@@ -754,9 +531,6 @@ fn wait_event_before(
 }
 
 /// Sleep for `ns` by waiting on a handle that never signals.
-///
-/// No timer handle needed: `sys_wait` takes an absolute monotonic deadline and returns
-/// `TimedOut`, and this process's notification handle is signalled by nothing it does.
 fn sleep_ns(notif: u64, ns: u64) {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };

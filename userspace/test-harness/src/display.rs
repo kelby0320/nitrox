@@ -1,45 +1,17 @@
-//! `display-selftest` — the display arm's guest-side gate (plan M1 Part C).
+//! `display-selftest` — the display arm's guest-side gate: two checks that fail for different
+//! reasons.
 //!
-//! Two independent checks, deliberately separated because they fail for different
-//! reasons and one of them needs no display at all:
+//! 1. **The self-hash.** Composite `libdraw`'s reference scene into its own 64×32 buffer and
+//!    compare its hash to [`libdraw::scene::REFERENCE_HASH`], which the host test asserts against
+//!    its own composite: compositing must behave the same compiled for `x86_64-unknown-nitrox`.
+//! 2. **The framebuffer is reachable.** Acquire it and report its geometry. It does not draw:
+//!    `ui-testclient` presents the scene, and a second writer would race the compositor.
 //!
-//! 1. **The self-hash.** Composite `libdraw`'s reference scene and compare its hash to
-//!    [`libdraw::scene::REFERENCE_HASH`], the constant the host test asserts against its
-//!    own composite of the same scene. The scene renders into its *own* 64×32 buffer, so
-//!    this needs no framebuffer — what it proves is that compositing behaves identically
-//!    compiled for `x86_64-unknown-nitrox` as it does on the host: integer width,
-//!    endianness, optimisation. "The same hash asserted in two places is what makes this
-//!    worth running" (`docs/design/display-substrate.md` §8b).
-//! 2. **The framebuffer is reachable.** Acquire it and report its geometry, proving the
-//!    binding and the geometry hand-off still work.
-//!
-//! It no longer *presents* the scene: since M2 Part D that is `ui-testclient`'s job, and
-//! the picture `check-display` compares now arrives through the whole Surface protocol
-//! rather than being written straight to the aperture. Writing it here as well would race
-//! the compositor for the same pixels.
-//!
-//! Splitting them means a framebuffer problem cannot break the hash check and a
-//! compositing bug cannot hide behind a display problem.
-//!
-//! **On failure the scene is dumped as a PPM to the serial log** (base64-free, just the
-//! byte count and hash), because a mismatch otherwise reports two 64-bit numbers and
-//! nothing about *what* differs — stride skew, swapped channels and wrong stacking order
-//! all present identically.
-//!
-//! **Exit codes distinguish the two ways this can end badly**, because the program cannot
-//! decide which of them matters — its environment can:
-//!
-//! - `0` — everything checked out.
-//! - `1` — a real failure: the hash disagreed, or the aperture resolved and then
-//!   misbehaved.
-//! - `2` — **no `/dev/framebuffer` binding at all.** On a machine with no display that is
-//!   expected; under `test-harness` the emulator always reports a framebuffer, so it means
-//!   the binding is broken. Folding this into `0` is exactly the regression this program
-//!   shipped with at first: the whole display arm could be gone and `test-qemu` stayed
-//!   green.
-//!
-//! This binary is disposable. The part worth keeping — `libdraw::acquire` — is in the
-//! library, so when the real compositor arrives at Milestone 2 this can simply go.
+//! On a mismatch the scene is dumped as a hex PPM to serial; two hashes cannot tell a stride
+//! skew from swapped channels. Exit `0` all checked out, `1` a real failure, `2` no
+//! `/dev/framebuffer` binding: under `test-harness` the emulator always reports a framebuffer, so
+//! `2` means the binding is broken, and folding it into `0` once left `test-qemu` green with the
+//! display arm gone.
 
 #![no_std]
 #![no_main]
@@ -52,11 +24,9 @@ use libdraw::scene::{self, REFERENCE_HASH};
 use libkern::debug::Line;
 use libkern::{exit, kprint};
 
-/// `alloc` backing — `libdraw`'s scene rendering allocates its surface buffers.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// Check 1: the reference scene's hash matches the constant the host asserts.
 fn check_reference_hash() -> bool {
     let fb = scene::render_reference();
     let got = hash_visible(&fb);
@@ -65,12 +35,10 @@ fn check_reference_hash() -> bool {
         return true;
     }
 
-    // Two lines, two calls — each complete on its own. The pair can still interleave with
-    // another process's output, but neither is *torn*, which is the property that matters.
+    // Two lines, two calls: each complete on its own, never torn.
     Line::new().s(b"display-selftest: reference hash MISMATCH").end();
     Line::new().s(b"  guest ").x(got).s(b"  host ").x(REFERENCE_HASH).end();
-    // The picture, not just the number. A viewer can open this; the two hashes cannot
-    // distinguish a stride skew from a swapped channel.
+    // The picture, not just the number.
     let ppm = libdraw::ppm::to_ppm(&fb);
     Line::new()
         .s(b"display-selftest: scene follows as hex-encoded P6 PPM (")
@@ -81,9 +49,7 @@ fn check_reference_hash() -> bool {
         .u(scene::SCREEN_HEIGHT as u64)
         .s(b")")
         .end();
-    // Emitted over serial so the picture actually leaves the guest. Without this the
-    // encoder would exist and a failure would still report only two hex numbers, which
-    // is the situation the dump is meant to end. Extract with:
+    // Emitted over serial so the picture leaves the guest. Extract with:
     //   sed -n '/PPM-BEGIN/,/PPM-END/p' log | grep -v PPM- | tr -d '\n' | xxd -r -p > s.ppm
     kprint(b"---PPM-BEGIN---\n");
     let mut line = [0u8; 65];
@@ -107,16 +73,10 @@ fn check_reference_hash() -> bool {
     false
 }
 
-/// Check 2: the real framebuffer can still be acquired and describes itself sanely.
+/// Check 2: the real framebuffer can still be acquired.
 ///
-/// It **acquires and does not draw.** Since M2 Part D the scene reaches the screen through
-/// the compositor, and a second writer to the same aperture would race it — so what is left
-/// to check here is the binding itself, which is still worth checking: `NoBinding` is how a
-/// removed or misordered `/dev/framebuffer` registration shows up.
-///
-/// Returns `Err` only for failures that indicate a *broken binding*. A machine with no
-/// display at all reports `NoBinding` and is not a failure here — the caller decides,
-/// because only it knows whether a display was expected.
+/// `Err` only for a *broken binding*; a machine with no display reports `NoBinding`, which the
+/// caller judges.
 fn check_framebuffer_binding(root_ns: u64) -> Result<(), AcquireError> {
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let (_fb, info) = unsafe { acquire::acquire(root_ns) }?;
@@ -134,7 +94,7 @@ fn check_framebuffer_binding(root_ns: u64) -> Result<(), AcquireError> {
     Ok(())
 }
 
-/// Called by the kernel's ELF entry with the standard bootstrap arguments.
+/// Entry point: run the hash check, then the framebuffer check, and exit with the verdict.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"display-selftest: up\n");
@@ -145,8 +105,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let present_ok = match check_framebuffer_binding(root_ns) {
         Ok(()) => true,
         Err(AcquireError::NoBinding) => {
-            // No display bound into this namespace. Reported distinctly (exit 2) rather
-            // than as success: only the caller knows whether a display was expected here.
+            // Exit 2 rather than success: only the caller knows whether a display was expected.
             kprint(b"display-selftest: no /dev/framebuffer binding (headless)\n");
             headless = true;
             true

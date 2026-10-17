@@ -1,5 +1,5 @@
 //! `test-pattern` — write a known pattern into a file **through a mapping, without a sync**, or
-//! check that a file holds it (administration Part C.8).
+//! check that a file holds it.
 //!
 //! ```text
 //! test-pattern --write PATH   # create PATH, map it writable, fill it, unmap, exit: no sync
@@ -7,19 +7,17 @@
 //! test-pattern --eject-held PATH NAME   # hold PATH open, and ask for NAME's eject meanwhile
 //! ```
 //!
-//! **Why a test program.** No release program writes through a mapping and lets go without a
-//! sync: `libfs`, `nxsh` and `nxedit` all sync. So the case an unmount's write-back exists for has
-//! no writer outside a test image. `cargo xtask check-storage` runs this at a serial prompt on a
-//! live test image, against a SATA disk it then reads on the host.
+//! **Why a test program.** No release program lets go of a mapping without a sync (`libfs`,
+//! `nxsh` and `nxedit` all sync), so the case an unmount's write-back exists for has no writer
+//! outside a test image. `cargo xtask check-storage` runs this at a serial prompt on a live test
+//! image, against a SATA disk it then reads on the host.
 //!
-//! **`--eject-held` is a second process a shell cannot be** (Phase 6 Part F): `nxsh` has no
-//! background jobs yet, so nothing at a prompt can hold a file while `disk --eject` runs. This holds
-//! `PATH` and sends the `Eject` itself, on a media session as `disk` and Files open one, and says
-//! what the service answered — which, a file on it being held, must be a refusal.
+//! **`--eject-held` is a second process a shell cannot be**: `nxsh` has no background jobs, so
+//! nothing at a prompt can hold a file while `disk --eject` runs. This holds `PATH`, sends the
+//! `Eject` itself on a media session, and says the answer — a refusal, a file on it being held.
 //!
-//! **A refusal is named**, with the kernel's status: on a read-only mount the create is refused
-//! `NoAccess`, and the gate matches that rather than a generic "cannot create".
-//!
+//! **A refusal is named** with the kernel's status; the gate matches `NoAccess` on a read-only
+//! mount rather than a generic "cannot create".
 //! **The pattern is written down twice**: here, and in `xtask`'s `check-storage`, which reads the
 //! file back on the host. A gate does not take its aim from the program under test.
 
@@ -39,18 +37,18 @@ use libkern::{
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The file's length: three whole pages and part of a fourth, so a lost page, a page written
-/// to the wrong place and a lost tail each show.
+/// The file's length: three whole pages and part of a fourth, so a lost page, a misplaced page
+/// and a lost tail each show.
 const LEN: usize = 3 * 4096 + 1234;
 
-/// Byte `i` of the pattern. Each page is its own sequence — the page index, times an odd
-/// constant, into the low byte of the offset — so no two pages hold the same bytes, and a page
-/// of zeroes matches nowhere. `xtask`'s `STORAGE_PATTERN_LEN` and `storage_pattern_byte` must
-/// match these.
+/// Byte `i` of the pattern: each page is its own sequence, so no two pages hold the same bytes
+/// and a page of zeroes matches nowhere. `xtask`'s `STORAGE_PATTERN_LEN` and
+/// `storage_pattern_byte` must match.
 fn byte(i: usize) -> u8 {
     ((i >> 12) as u8).wrapping_mul(0x5B) ^ (i as u8) ^ 0xA5
 }
 
+/// Entry point: dispatch `--write`, `--check` or `--eject-held` from the setup message's `argv`.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let argv: Vec<String> = match libstream::setup::bootstrap(notif, ns, endpoint, arg0).setup() {
@@ -70,13 +68,11 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(code)
 }
 
-/// A kernel status by its name.
 fn status_name(status: i32) -> String {
     alloc::format!("{:?}", KError::from_i32(status))
 }
 
-/// `--write`: create `path` at the pattern's length, write the pattern through a writable
-/// mapping, and let go **without a sync**.
+/// `--write`: create `path`, write the pattern through a writable mapping, **do not sync**.
 fn write(ns: u64, path: &[u8]) -> i64 {
     // SAFETY: a valid path slice and the namespace this process was given.
     let po = unsafe {
@@ -120,8 +116,7 @@ fn write(ns: u64, path: &[u8]) -> i64 {
         // SAFETY: `LEN` bytes are mapped writable at `addr`.
         unsafe { ((addr as usize + i) as *mut u8).write(byte(i)) };
     }
-    // **Let go without a sync**: unmapped and closed, and nothing else. The kernel keeps the
-    // file's pages dirty in its cache until something writes them back.
+    // **Let go without a sync**: the kernel keeps the pages dirty until something writes them back.
     // SAFETY: unmapping this call's own mapping, then closing its own handle.
     unsafe {
         syscall2(SYS_MEMORY_UNMAP, addr as u64, LEN as u64);
@@ -137,7 +132,6 @@ fn write(ns: u64, path: &[u8]) -> i64 {
     0
 }
 
-/// `--check`: read `path` and compare it with the pattern.
 fn check(ns: u64, path: &[u8]) -> i64 {
     let bytes = match libfs::read_file(ns, path) {
         Ok(b) => b,
@@ -231,7 +225,6 @@ fn eject_held(ns: u64, path: &[u8], name: &[u8]) -> i64 {
     }
 }
 
-/// Wait for a `PendingOperation`, returning `(status, result)` and closing it.
 fn po_wait(po: u64) -> (i32, u64) {
     let handles = [po];
     let mut r = [0u8; 24];
