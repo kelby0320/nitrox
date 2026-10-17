@@ -2,14 +2,9 @@
 //! carrying the endpoint to bind, or a refusal saying why there is none
 //! (`docs/spec/rsproto-wire-format.md` § Meta::Ready).
 //!
-//! **Hand-parsed**, as init has always read the Ready — `userspace/init/CLAUDE.md` keeps
-//! `librsproto` out of init's build — and host-tested here, where the tests build messages with
-//! `librsproto`'s own encoder and then hand the parser what a correct encoder never would.
-//!
-//! The refusal is Phase 5's: `fs-server-ext4` used to say Ready over a device holding no
-//! filesystem, and the first sign was a program that would not load off the mount. It now
-//! refuses, and init prints the reason beside the device and mount point only it knows — through
-//! `Line::untrusted`, since it crossed the wire, and uncut: `Line` marks a line too long to hold.
+//! **Hand-parsed**: `userspace/init/CLAUDE.md` keeps `librsproto` out of init's build. The tests
+//! build messages with its encoder, then hand the parser what a correct encoder never would. A
+//! refusal's reason crossed the wire, so init prints it through `Line::untrusted`, uncut.
 
 /// `"RSMG"`, the envelope's first four bytes.
 pub const RS_MAGIC: u32 = 0x5253_4D47;
@@ -30,8 +25,7 @@ pub const IPC_HANDLE_MAX: usize = 8;
 pub enum First<'a> {
     /// A `Meta::Ready` that transferred a handle: the endpoint to bind.
     Ready,
-    /// A `Meta::Ready` with the error flag: the server cannot serve, and here is its reason —
-    /// empty if it gave none, or gave one that does not parse.
+    /// A `Meta::Ready` with the error flag: the server cannot serve; its reason, if one parses.
     Refused(&'a [u8]),
     /// Anything else: too short, the wrong magic or op, or a Ready with no handle to bind.
     Unexpected,
@@ -57,9 +51,8 @@ fn reason(payload: &[u8]) -> Option<&[u8]> {
     body.get(ERROR_BODY_LEN..ERROR_BODY_LEN + msg_len)
 }
 
-/// Which of the `count` handles that arrived with `first` init must close: every one, unless
-/// it is a Ready, whose `handles[0]` is the endpoint to bind. A message with more handles than it
-/// should carry would otherwise leave the rest in PID 1's table for the life of the machine.
+/// Which of the `count` handles that arrived with `first` init must close: all but a Ready's
+/// `handles[0]`, the endpoint to bind; a surplus would stay in PID 1's table for good.
 pub fn handles_to_close(first: &First<'_>, count: usize) -> core::ops::Range<usize> {
     let count = count.min(IPC_HANDLE_MAX);
     match first {
@@ -81,7 +74,6 @@ mod tests {
     use super::*;
     use librsproto::error::error_body;
 
-    /// A message built by the encoder every server uses.
     fn encoded(flags: u32, body: &[u8], handles: u16) -> Vec<u8> {
         let mut out = vec![0u8; 512];
         let n = librsproto::encode(&mut out, librsproto::OP_READY, 0, flags, body, handles).unwrap();
@@ -117,27 +109,22 @@ mod tests {
     fn a_refusal_carries_its_reason_and_needs_no_handle() {
         let msg = refusal(b"no ext4 filesystem: superblock magic 0x0000, not 0xef53");
         assert_eq!(parse(&msg, 0), First::Refused(b"no ext4 filesystem: superblock magic 0x0000, not 0xef53"));
-        // A refusal is a refusal even if a handle came with it: init closes it and binds nothing.
         assert_eq!(parse(&msg, 1), First::Refused(b"no ext4 filesystem: superblock magic 0x0000, not 0xef53"));
     }
 
-    /// **Bytes no correct encoder writes.** A reader tested only against its encoder's output
-    /// learns nothing about the lengths it trusts.
+    /// **Bytes no correct encoder writes**: a reader tested on its encoder alone learns nothing.
     #[test]
     fn a_refusal_whose_lengths_lie_is_still_a_refusal_with_no_reason() {
         let good = refusal(b"why");
 
-        // The body length says more than arrived.
         let mut long_body = good.clone();
         long_body[20..24].copy_from_slice(&1000u32.to_le_bytes());
         assert_eq!(parse(&long_body, 0), First::Refused(b""));
 
-        // The message length says more than the body holds.
         let mut long_msg = good.clone();
         long_msg[HEADER_LEN + 8..HEADER_LEN + 10].copy_from_slice(&200u16.to_le_bytes());
         assert_eq!(parse(&long_msg, 0), First::Refused(b""));
 
-        // A body too short to be an ErrorBody at all.
         let mut short = good.clone();
         short[20..24].copy_from_slice(&4u32.to_le_bytes());
         assert_eq!(parse(&short, 0), First::Refused(b""));
