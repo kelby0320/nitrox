@@ -1,15 +1,9 @@
-//! A GUID partition table, built whole or read whole.
+//! A GUID partition table (UEFI specification, GPT header and entries), built whole or read whole.
 //!
-//! Layout, in logical blocks: block 0 is the **protective MBR** (one partition of type `0xEE`
-//! spanning the disk, so a tool that understands only MBRs sees the disk as full rather than
-//! empty); block 1 is the **header**; the **entry array** follows it; and the last block of the
-//! disk holds a **backup header** with its own copy of the array below it. Every multi-byte field
-//! is little-endian.
-//!
-//! **Both checksums are the point.** The header carries a CRC32 of itself (with the field zeroed)
-//! and one of the entry array; firmware that finds either wrong falls back to the backup, and
-//! firmware that finds both wrong boots nothing. They are the reason this crate exists rather than
-//! a `write_all` of some bytes.
+//! Block 0 is the protective MBR (one `0xEE` partition spanning the disk, so an MBR-only tool sees
+//! it full, not empty), block 1 the header, then the entry array; the last block holds a backup
+//! header with its own copy of the array below it. Fields are little-endian. The header and the
+//! array each carry a CRC32.
 
 use crate::crc32::crc32;
 
@@ -21,15 +15,13 @@ pub const REVISION: u32 = 0x0001_0000;
 pub const HEADER_LEN: usize = 92;
 /// One entry's size. 128 is the minimum the standard allows and what every tool writes.
 pub const ENTRY_LEN: usize = 128;
-/// Entries in the array. 128 is the conventional count, and the 16 KiB it occupies is why the
-/// first usable block is 34: one MBR, one header, 32 blocks of array.
+/// Entries in the array; the 16 KiB they occupy put the first usable block at 34.
 pub const ENTRY_COUNT: u32 = 128;
 /// Logical blocks the entry array occupies at 512 bytes a block.
 pub const ARRAY_BLOCKS: u64 = (ENTRY_COUNT as u64 * ENTRY_LEN as u64) / 512;
 /// The block the entry array starts at, and so the first block a partition may use.
 pub const FIRST_USABLE: u64 = 2 + ARRAY_BLOCKS;
-/// Bytes per logical block. **512 throughout**: the disks this writes to report 512, and a
-/// 4096-byte-block disk would need every constant above recomputed rather than a flag.
+/// Bytes per logical block; 512 throughout, so a 4096-byte-block disk is not supported.
 pub const BLOCK: usize = 512;
 
 /// The EFI system partition's type GUID, `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`.
@@ -37,14 +29,12 @@ pub const BLOCK: usize = 512;
 pub const TYPE_EFI_SYSTEM: [u8; 16] = [
     0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
 ];
-/// The Linux filesystem type GUID, `0FC63DAF-8483-4772-8E79-3D69D8477DE4` — what `mke2fs` images
-/// and every Linux root carry, and what this system's own images already use.
+/// The Linux filesystem type GUID, `0FC63DAF-8483-4772-8E79-3D69D8477DE4`.
 #[rustfmt::skip]
 pub const TYPE_LINUX_FS: [u8; 16] = [
     0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4,
 ];
-/// Microsoft basic data, `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7` — what a FAT on a GPT is typed, by
-/// Windows, macOS and Linux alike (Phase 6 Part G.2).
+/// Microsoft basic data, `EBD0A0A2-B9E5-4433-87C0-68B6B72699C7`: what a FAT on a GPT is typed.
 #[rustfmt::skip]
 pub const TYPE_BASIC_DATA: [u8; 16] = [
     0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
@@ -61,11 +51,9 @@ pub enum ReadError {
     HeaderChecksum,
     /// The entry array's checksum does not match the entries.
     ArrayChecksum,
-    /// A field describes a table this code does not read: an entry size that is not 128, a header
-    /// shorter than the fields it must carry, or an array that does not fit the buffer.
+    /// A field describes a table this code does not read: an entry size not 128, say.
     Unsupported,
-    /// More partitions in use than [`MAX_PARTITIONS`]. Refused rather than truncated: a caller
-    /// searching for one of the rest would be told it is not there.
+    /// More partitions in use than [`MAX_PARTITIONS`]; refused, as a truncated table misleads.
     TooManyPartitions,
 }
 
@@ -74,11 +62,9 @@ pub enum ReadError {
 pub enum BuildError {
     /// More partitions than the array holds.
     TooManyPartitions,
-    /// A partition starts before the first usable block, ends after the last, or ends before it
-    /// starts.
+    /// A partition outside the usable blocks, or ending before it starts.
     OutOfRange,
-    /// Two partitions overlap. **Refused rather than written**: a table that overlaps is one where
-    /// formatting the second destroys the first, and nothing downstream would notice.
+    /// Two partitions overlap: formatting the second would destroy the first.
     Overlap,
     /// The disk is too small to hold a table at all.
     DiskTooSmall,
@@ -91,13 +77,11 @@ pub enum BuildError {
 pub struct Partition {
     /// The type GUID: [`TYPE_EFI_SYSTEM`], [`TYPE_LINUX_FS`], or another the caller knows.
     pub type_guid: [u8; 16],
-    /// This partition's own GUID. Callers that have no entropy may repeat one; firmware does not
-    /// care, and the system selects partitions by label.
+    /// This partition's own GUID; callers with no entropy may repeat one.
     pub unique_guid: [u8; 16],
     /// First logical block, inclusive.
     pub first_lba: u64,
-    /// Last logical block, **inclusive** — the standard's convention, and the one every
-    /// off-by-one in partitioning comes from.
+    /// Last logical block, **inclusive**.
     pub last_lba: u64,
     /// The label, UTF-16LE on disk and ASCII here: 36 code units, so 36 characters.
     pub name: [u8; 36],
@@ -141,8 +125,7 @@ pub struct Table {
     pub count: usize,
 }
 
-/// Partitions this crate reads or writes. The array holds 128; nothing this system builds needs
-/// more than a handful, and a fixed buffer is what keeps the crate `alloc`-free.
+/// Partitions this crate reads or writes; a fixed buffer keeps the crate `alloc`-free.
 pub const MAX_PARTITIONS: usize = 8;
 
 impl Table {
@@ -157,20 +140,13 @@ impl Table {
     }
 }
 
-/// Bytes a table occupies at the **front** of a disk: the protective MBR, the header and the
-/// array.
+/// Bytes a table occupies at the front of a disk: protective MBR, header and array.
 pub const FRONT_BYTES: usize = (2 + ARRAY_BLOCKS as usize) * BLOCK;
-/// Bytes a table occupies at the **back**: the array again, then the backup header.
+/// Bytes a table occupies at the back: the array again, then the backup header.
 pub const BACK_BYTES: usize = (ARRAY_BLOCKS as usize + 1) * BLOCK;
 
-/// Build a table for a disk of `disk_blocks` blocks holding `partitions`.
-///
-/// Writes the front of the disk into `front` and the back into `back`; the caller writes `front`
-/// at block 0 and `back` at `disk_blocks - ARRAY_BLOCKS - 1`. Two buffers rather than one disk
-/// image, because the caller is writing to a device rather than building a file.
-///
-/// `disk_guid` identifies the disk; this crate does not invent GUIDs, since it has no entropy of
-/// its own and a caller that has some should decide.
+/// Build a table for a disk of `disk_blocks` blocks holding `partitions`: the caller writes
+/// `front` at block 0 and `back` at `disk_blocks - ARRAY_BLOCKS - 1`.
 pub fn build(
     disk_blocks: u64,
     disk_guid: [u8; 16],
@@ -193,8 +169,6 @@ pub fn build(
         if p.first_lba < FIRST_USABLE || p.last_lba > last_usable || p.last_lba < p.first_lba {
             return Err(BuildError::OutOfRange);
         }
-        // **Overlap is refused, not rounded.** Two partitions sharing a block means formatting one
-        // corrupts the other, and no later step could tell.
         for q in &partitions[..i] {
             if p.first_lba <= q.last_lba && q.first_lba <= p.last_lba {
                 return Err(BuildError::Overlap);
@@ -205,8 +179,7 @@ pub fn build(
     front[..FRONT_BYTES].fill(0);
     back[..BACK_BYTES].fill(0);
 
-    // Block 0: the protective MBR. One entry of type 0xEE covering the disk (capped at the 32-bit
-    // field's maximum, which is what every implementation does for a disk over 2 TiB).
+    // The protective MBR: one 0xEE entry covering the disk, capped at the 32-bit field's maximum.
     let mbr = &mut front[..BLOCK];
     mbr[446] = 0x00; // not bootable
     mbr[447..450].copy_from_slice(&[0x00, 0x02, 0x00]); // CHS start, legacy and ignored
@@ -218,7 +191,6 @@ pub fn build(
     mbr[510] = 0x55;
     mbr[511] = 0xAA;
 
-    // The entry array, written once into each buffer.
     let array_len = ENTRY_COUNT as usize * ENTRY_LEN;
     let entries_crc = {
         let array = &mut front[2 * BLOCK..2 * BLOCK + array_len];
@@ -230,8 +202,6 @@ pub fn build(
         crc
     };
 
-    // The two headers differ in three fields: which block each lives at, where the other is, and
-    // where its own array starts.
     write_header(&mut front[BLOCK..2 * BLOCK], 1, disk_blocks - 1, 2, disk_guid, last_usable, entries_crc);
     write_header(
         &mut back[array_len..array_len + BLOCK],
@@ -245,22 +215,19 @@ pub fn build(
     Ok(())
 }
 
-/// Write one 128-byte entry.
 fn write_entry(e: &mut [u8], p: &Partition) {
     e[0..16].copy_from_slice(&p.type_guid);
     e[16..32].copy_from_slice(&p.unique_guid);
     e[32..40].copy_from_slice(&p.first_lba.to_le_bytes());
     e[40..48].copy_from_slice(&p.last_lba.to_le_bytes());
-    // Attributes: none. Nothing here marks a partition required or read-only.
     e[48..56].copy_from_slice(&0u64.to_le_bytes());
-    // The label is UTF-16LE. ASCII in, so each byte becomes a code unit with a zero above it.
+    // UTF-16LE label, ASCII in: each byte is a code unit with a zero above it.
     for (i, &b) in p.name().iter().enumerate() {
         e[56 + i * 2] = b;
         e[56 + i * 2 + 1] = 0;
     }
 }
 
-/// Write one header block, then its own checksum over the defined bytes.
 fn write_header(
     block: &mut [u8],
     my_lba: u64,
@@ -284,18 +251,13 @@ fn write_header(
     block[80..84].copy_from_slice(&ENTRY_COUNT.to_le_bytes());
     block[84..88].copy_from_slice(&(ENTRY_LEN as u32).to_le_bytes());
     block[88..92].copy_from_slice(&entries_crc.to_le_bytes());
-    // **The header's checksum covers exactly `header_size` bytes**, with the field itself zero —
-    // not the whole block. A sum over 512 bytes validates against itself and fails everywhere else.
+    // The checksum covers exactly `header_size` bytes, not the whole block, with its own field zero.
     let crc = crc32(&block[..HEADER_LEN]);
     block[16..20].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// Read a table from the front of a disk: `front` must hold block 0 onwards, far enough to cover
-/// the header's array.
-///
-/// **Both checksums are verified**, which is what makes this a reader rather than a parser: an
-/// installer that copied a filesystem out of a table it had not checked would copy whatever the
-/// bytes happened to say.
+/// the header's array. Both checksums are verified.
 pub fn read(front: &[u8]) -> Result<Table, ReadError> {
     if front.len() < 2 * BLOCK {
         return Err(ReadError::Truncated);
@@ -308,7 +270,6 @@ pub fn read(front: &[u8]) -> Result<Table, ReadError> {
     if !(HEADER_LEN..=BLOCK).contains(&header_size) {
         return Err(ReadError::Unsupported);
     }
-    // The stored sum is over the header with its own field zeroed.
     let stored = u32::from_le_bytes(header[16..20].try_into().unwrap());
     let mut scratch = [0u8; BLOCK];
     scratch[..header_size].copy_from_slice(&header[..header_size]);
@@ -342,14 +303,11 @@ pub fn read(front: &[u8]) -> Result<Table, ReadError> {
     };
     for i in 0..count {
         let e = &front[start + i * entry_len..start + (i + 1) * entry_len];
-        // An all-zero type GUID is an unused slot.
         if e[0..16].iter().all(|&b| b == 0) {
             continue;
         }
         if table.count == MAX_PARTITIONS {
-            // **Refused rather than cut.** A caller asking `by_name` for a partition in the part
-            // that was dropped would be told "no such partition" about a table that has one
-            // (PR #308 review, optional 9). Nothing this system builds comes near eight.
+            // Refused rather than cut: `by_name` would deny a partition the table has.
             return Err(ReadError::TooManyPartitions);
         }
         let mut name = [0u8; 36];
@@ -359,11 +317,7 @@ pub fn read(front: &[u8]) -> Result<Table, ReadError> {
             if lo == 0 && hi == 0 {
                 break;
             }
-            // Non-ASCII becomes `?`: this name is shown to a person and matched against labels
-            // this system writes, both of which are ASCII. **A space is a label character** —
-            // `EFI System` and `Basic data partition` are what other tools write, and
-            // `is_ascii_graphic` alone excludes the space, so this crate could not read back a
-            // label it had itself written (PR #308 review, finding 3).
+            // Non-ASCII becomes `?`; a space is a label character, which `is_ascii_graphic` excludes.
             name[k] = if hi == 0 && (lo.is_ascii_graphic() || lo == b' ') { lo } else { b'?' };
             name_len = k + 1;
         }
@@ -423,9 +377,6 @@ mod tests {
         assert!(t.by_name(b"nitrox-live").is_none());
     }
 
-    /// **The backup is a table too**, and firmware falls back to it. A backup that did not parse
-    /// would be found only by a disk whose front had been damaged — which is the one moment it
-    /// matters.
     #[test]
     fn the_backup_header_is_valid_and_points_the_other_way() {
         let disk = build_disk(&two_partitions());
@@ -435,7 +386,6 @@ mod tests {
         assert_eq!(u64::from_le_bytes(backup[24..32].try_into().unwrap()), DISK - 1, "its own block");
         assert_eq!(u64::from_le_bytes(backup[32..40].try_into().unwrap()), 1, "the primary's");
         assert_eq!(u64::from_le_bytes(backup[72..80].try_into().unwrap()), DISK - 1 - ARRAY_BLOCKS, "its own array");
-        // Its self-checksum verifies the same way the primary's does.
         let mut scratch = [0u8; BLOCK];
         scratch[..HEADER_LEN].copy_from_slice(&backup[..HEADER_LEN]);
         scratch[16..20].copy_from_slice(&0u32.to_le_bytes());
@@ -451,8 +401,6 @@ mod tests {
         assert_eq!((disk[510], disk[511]), (0x55, 0xAA));
     }
 
-    /// **Corruption is refused, not parsed.** An installer that copied a filesystem out of a table
-    /// it had not checked would copy whatever the bytes happened to say.
     #[test]
     fn a_damaged_table_is_refused_and_says_which_half() {
         let good = build_disk(&two_partitions());
@@ -461,13 +409,10 @@ mod tests {
         no_sig[BLOCK] ^= 0xFF;
         assert_eq!(read(&no_sig), Err(ReadError::NoSignature));
 
-        // A header field changed without its checksum: the disk GUID.
         let mut bad_header = good.clone();
         bad_header[BLOCK + 56] ^= 0xFF;
         assert_eq!(read(&bad_header), Err(ReadError::HeaderChecksum));
 
-        // An entry changed without the array's checksum — the case that matters most, because the
-        // header still verifies and the partition now points somewhere else.
         let mut bad_entry = good.clone();
         bad_entry[2 * BLOCK + 32] ^= 0xFF;
         assert_eq!(read(&bad_entry), Err(ReadError::ArrayChecksum));
@@ -504,18 +449,6 @@ mod tests {
         assert_eq!(build(DISK, GUID, &parts, &mut front[..10], &mut back), Err(BuildError::BufferTooSmall));
     }
 
-    // ---- `sgdisk` as the oracle ----
-    //
-    // **The kernel's parser is a weak second opinion**: it checks neither CRC and reads no backup
-    // header, so agreeing with it would prove little. `sgdisk` is what wrote every partition table
-    // this system has ever booted, and what a person would reach for to inspect a disk this
-    // installer wrote. Both directions are checked, because the installer does both: it writes a
-    // table firmware must accept, and reads one the image builder made with `sgdisk`.
-    //
-    // Skipped with a clear panic if `sgdisk` is missing, as `fs-server-ext4`'s fixtures do with
-    // `mke2fs` — both are project dependencies.
-
-    /// A scratch file path unique to this test process.
     fn scratch(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -541,8 +474,6 @@ mod tests {
         assert!(verify.status.success(), "sgdisk --verify failed: {out}");
         assert!(out.contains("No problems found"), "sgdisk found problems: {out}");
 
-        // And it reads back the same partitions — type codes included, since firmware finds the
-        // ESP by its type GUID and nothing else.
         let print = sgdisk(&["--print"], &path);
         let out = String::from_utf8_lossy(&print.stdout);
         assert!(out.contains("EF00  NITROX_ESP"), "the ESP's type or label: {out}");
@@ -550,7 +481,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **The basic data type is the one `sgdisk` calls Microsoft basic data**, code `0700`.
     #[test]
     fn sgdisk_names_the_basic_data_type() {
         let path = scratch("basic");
@@ -601,8 +531,6 @@ mod tests {
 
     #[test]
     fn a_label_with_a_space_survives_the_round_trip() {
-        // `EFI System` and `Basic data partition` are what other tools write, and this crate
-        // wrote spaces and refused to read them back (PR #308 review, finding 3).
         let p = Partition::new(TYPE_EFI_SYSTEM, [0x22; 16], 2048, 4096, b"EFI System");
         let disk = build_disk(&[p]);
         let t = read(&disk).unwrap();
@@ -610,14 +538,10 @@ mod tests {
         assert!(t.by_name(b"EFI System").is_some(), "and is findable by that name");
     }
 
-    /// **The boundary the backup array sits on**, which `sgdisk --verify` does not police: a
-    /// header one block too generous lets a partition overwrite the backup, and firmware then
-    /// finds a corrupt backup exactly when the primary is damaged (PR #308 review, finding 4).
     #[test]
     fn the_last_usable_block_stops_short_of_the_backup_array() {
         let disk = build_disk(&two_partitions());
         let t = read(&disk).unwrap();
-        // The disk's last block holds the backup header and the 32 before it the backup array.
         assert_eq!(t.last_usable, DISK - ARRAY_BLOCKS - 2);
         assert_eq!(t.last_usable, 262_110, "and that is what sgdisk reports for this size");
 
@@ -647,7 +571,6 @@ mod tests {
         assert_eq!(read(&disk), Err(ReadError::TooManyPartitions));
     }
 
-    /// A label longer than the field is cut on a character, and read back as what was written.
     #[test]
     fn a_long_label_is_cut_to_the_field() {
         let long = [b'x'; 64];

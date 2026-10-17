@@ -1,17 +1,9 @@
-//! **A master boot record**, built whole (Phase 6 Part G.2): what `disk --partition` writes for a
-//! stick, which cameras, televisions and every other system read.
+//! A master boot record, built whole: what `disk --partition` writes for a stick.
 //!
-//! **Only building.** The kernel reads tables at a disk's arrival (`kernel/src/drivers/partitions.rs`);
-//! nothing in userspace reads an MBR. Entries are **LBA-only** in every sense that matters: a reader
-//! goes by the first sector and the count, and the CHS fields are written as `fdisk` writes them —
-//! the usual 255 heads and 63 sectors, clamped at cylinder 1023 — for the BIOSes that still look.
-//!
-//! **No MBR on a disk of 2 TiB or more**: an entry counts sectors in 32 bits, so a partition past
-//! that would be cast to a smaller one, or clamped and the rest of the drive left unused, saying
-//! nothing. [`build`] refuses such a disk, and a caller writes a GPT there.
+//! No MBR on a disk of 2 TiB or more: an entry counts sectors in 32 bits, so [`build`] refuses
+//! and a caller writes a GPT there.
 
-/// FAT32 with LBA addressing: what a FAT on a stick is typed, and what `disk --partition` types its
-/// partition for the default filesystem.
+/// FAT32 with LBA addressing.
 pub const TYPE_FAT32_LBA: u8 = 0x0C;
 /// FAT16 with LBA addressing.
 pub const TYPE_FAT16_LBA: u8 = 0x0E;
@@ -43,15 +35,13 @@ pub enum BuildError {
     DiskTooLarge,
     /// More than four partitions; there are no extended partitions here.
     TooManyPartitions,
-    /// A partition starting at sector 0, the record's own, holding nothing, or running past the
-    /// disk's end; or a type of `0`, which marks an unused entry.
+    /// A partition at sector 0, empty, past the disk's end, or of type `0` (an unused entry).
     OutOfRange,
     /// Two partitions sharing a sector.
     Overlap,
 }
 
-/// The CHS triple an entry carries for `lba`, as `fdisk` writes it: 255 heads and 63 sectors a
-/// track, and cylinder 1023's last sector for anything past it.
+/// The CHS triple for `lba`: 255 heads, 63 sectors a track, and `FE FF FF` past cylinder 1023.
 fn chs(lba: u64) -> [u8; 3] {
     let (heads, sectors) = (255u64, 63u64);
     let cylinder = lba / (heads * sectors);
@@ -63,12 +53,8 @@ fn chs(lba: u64) -> [u8; 3] {
     [head as u8, (sector as u8) | ((cylinder >> 2) as u8 & 0xC0), cylinder as u8]
 }
 
-/// **Build the record** for a disk of `disk_blocks` sectors holding `partitions`, into `out`.
-///
-/// `disk_id` is the 32-bit disk signature systems tell disks apart by — the caller's, from its
-/// entropy, as [`crate::table::build`] takes its GUID. No partition is marked active, and the boot
-/// code is two instructions: `int 0x18`, telling a BIOS that tried to boot this to try the next
-/// device, then a spin.
+/// Build the record for a disk of `disk_blocks` sectors holding `partitions`, into `out`;
+/// `disk_id` is the disk signature. Nothing is active; the boot code is `int 0x18`, then a spin.
 pub fn build(disk_blocks: u64, disk_id: u32, partitions: &[Partition], out: &mut [u8; LEN]) -> Result<(), BuildError> {
     if disk_blocks > MAX_BLOCKS {
         return Err(BuildError::DiskTooLarge);
@@ -106,7 +92,6 @@ pub fn build(disk_blocks: u64, disk_id: u32, partitions: &[Partition], out: &mut
 mod tests {
     use super::*;
 
-    /// A 64 MiB disk.
     const DISK: u64 = 131_072;
 
     fn one(kind: u8, first_lba: u64, blocks: u64) -> Partition {
@@ -119,9 +104,6 @@ mod tests {
         out
     }
 
-    /// **The bytes, laid out by hand**: a FAT32 partition from 1 MiB to the end of a 64 MiB disk,
-    /// as the specification places each field — so the builder is held to the format, not to its
-    /// own idea of it. The entry is byte for byte the one `sfdisk` writes for that layout.
     #[test]
     fn a_record_is_laid_out_as_the_format_says() {
         let mut want = [0u8; LEN];
@@ -140,8 +122,6 @@ mod tests {
         assert_eq!(built(DISK, &[one(TYPE_FAT32_LBA, 2048, DISK - 2048)]), want);
     }
 
-    /// **A record built here is what `sfdisk` reads**: its id, and each partition's start, size and
-    /// type.
     #[test]
     fn sfdisk_reads_a_record_built_here_as_written() {
         let path = std::env::temp_dir().join(format!("nitrox-mbr-{}.img", std::process::id()));
@@ -164,8 +144,6 @@ mod tests {
         assert_eq!(said.matches(r#""start""#).count(), 2, "{said}");
     }
 
-    /// **No record for a disk of 2 TiB or more** — at its neighbours: 2 TiB less a sector is
-    /// described whole, and 2 TiB is refused rather than wrapped or clamped.
     #[test]
     fn a_disk_of_two_tib_or_more_is_refused() {
         let all = MAX_BLOCKS - 2048;
@@ -178,7 +156,6 @@ mod tests {
         assert_eq!(build(MAX_BLOCKS + 1, 1, &[], &mut out), Err(BuildError::DiskTooLarge));
     }
 
-    /// **What would describe a broken disk is refused**, and four partitions are taken.
     #[test]
     fn a_record_that_would_lose_data_is_not_built() {
         let mut out = [0u8; LEN];
@@ -198,7 +175,6 @@ mod tests {
         assert!(build(DISK, 1, &touching, &mut out).is_ok(), "adjacent, not overlapping");
     }
 
-    /// The CHS triple at the edges of its range.
     #[test]
     fn chs_is_fdisks_and_clamps_past_cylinder_1023() {
         assert_eq!(chs(0), [0, 1, 0]);
