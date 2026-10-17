@@ -1,25 +1,10 @@
 //! Turning a laid-out tree into pixels, within a damage rectangle.
 //!
-//! This is where the diff's output is finally spent. [`paint`] takes the rectangle
-//! [`Tree::update`](crate::diff::Tree::update) returned and draws **only** what intersects
-//! it: a one-character edit repaints one row, not a window. Everything before this point —
-//! keyed identity, per-buffer accumulation, the union that keeps `Commit` to one rectangle —
-//! exists so that this function can be handed a small rectangle.
+//! [`paint`] takes the rectangle [`Tree::update`](crate::diff::Tree::update) returned and draws
+//! **only** what intersects it.
 //!
-//! ## The damaged region is cleared first
-//!
-//! Painting draws ink; it does not erase. A label that got shorter would leave the tail of
-//! its previous text on screen, and a widget that moved would leave a copy behind. So the
-//! damage rectangle is filled with the background before anything draws into it — which is
-//! also why damage must cover where a node *was* as well as where it is, and why the diff
-//! reports both.
-//!
-//! ## Custom widgets paint themselves
-//!
-//! A [`Node::Custom`](crate::element::Node::Custom) is opaque here: the toolkit hands the
-//! application its rectangle and the clip, and gets out of the way. That is not a
-//! concession — Milestone 5's terminal grid is an escape-hatch client, so the escape hatch
-//! is a first-class path rather than an afterthought.
+//! Painting draws ink; it does not erase, so the damage rectangle is filled with the background
+//! first — which is also why damage must cover where a node *was*.
 
 use libdraw::format::Rgb;
 use libdraw::framebuffer::Framebuffer;
@@ -29,23 +14,11 @@ use libdraw::text::Font;
 use crate::element::{Element, IconKind, Node, TextStyle};
 use crate::layout::{Layout, Metrics};
 
-/// The theme everything is drawn from — **`libdraw`'s, since M11 Part B**.
-///
-/// Re-exported rather than moved silently, because `libui::paint::Theme` is what every client in
-/// the tree names. It lives one crate down now for a reason `libui` cannot serve: the compositor
-/// paints chrome too — a cursor, a drag outline, the ground between windows — and it does not
-/// link a widget toolkit, deliberately. `libdraw` is what both link.
-///
-/// It absorbed `Palette` in the same part. The two were split by which *function* needed which,
-/// which is not a distinction between kinds of value — and the wrong seam for a milestone whose
-/// point is that these arrive together from one place.
+/// The theme everything is drawn from — `libdraw`'s, re-exported.
 pub use libdraw::theme::Theme;
 
-/// A font at a size, as something layout can measure with.
-///
-/// The bridge between `libdraw`'s glyphs and [`Metrics`]. Layout must measure with the *same*
-/// font that paints, or a label is laid out to one width and drawn at another — text that
-/// overflows its box by a few pixels and looks like a layout bug.
+/// A font at a size, as something layout can measure with: layout must use the *same* font that
+/// paints, or text overflows its box.
 pub struct FontMetrics<'a> {
     font: &'a Font,
     px: f32,
@@ -64,9 +37,8 @@ impl Metrics for FontMetrics<'_> {
     }
 
     fn text_size_as(&self, s: &str, style: TextStyle) -> libdraw::geom::Size {
-        // **Fixed-advance first, then weight within it** (desktop refresh, Part J): a buffer set
-        // in the mono face and a bold word inside it want the mono face's bold, and a mono face
-        // with no bold companion answers with itself.
+        // **Fixed-advance first, then weight within it**: a bold word in a mono buffer wants the
+        // mono face's bold, and a mono face with no bold companion answers with itself.
         let base = if style.mono { self.font.mono() } else { self.font };
         let face = if style.bold { base.bold() } else { base };
         face.measure(s, style.size.px(self.px))
@@ -89,27 +61,14 @@ pub fn paint<F, Msg, C>(
     F: Framebuffer + ?Sized,
     C: FnMut(u32, Rect, Rect, &mut F),
 {
-    // `Framebuffer::fill_rect`, not a loop over `put_pixel`. There was a private copy of
-    // this here until 2026-08-11; the trait's own doc explains why that is the wrong shape —
-    // an earlier open-coded `y * pitch + x * bpp` left one of two copies silently correct
-    // when `offset_of` was broken to check the tests were not vacuous. It is also the faster
-    // one: `fill_rect` computes a row's start once and writes across it, where `put_pixel`
-    // recomputes the geometry and the offset per pixel, and `paint` clears the whole damage
-    // rectangle on every frame (PR #185 review, finding 6).
+    // `Framebuffer::fill_rect`, not a loop over `put_pixel`: it computes a row's start once, and
+    // `paint` clears the whole damage every frame.
     fb.fill_rect(damage, theme.background);
     draw(fb, font, theme, element, layout, damage, theme.foreground, TextStyle::default(), custom);
 }
 
-/// [`paint`], **without clearing to the theme's ground first**.
-///
-/// For a caller that has already put something there and means to keep it. The overview's sidebar
-/// is the one that asked for it (M13 Part C): its ground is filled at a partial opacity so the
-/// desktop shows through, and the rows are then drawn opaque over it. Clearing would replace that
-/// translucent ground with a solid one and the panel would stop being see-through.
-///
-/// **Not the default, and not a flag on [`paint`].** Every ordinary window wants the clear — it is
-/// what makes a damage rectangle a repaint rather than an accumulation — so the caller that does
-/// not want it should have to say so by name.
+/// [`paint`], **without clearing to the theme's ground first**, for a caller that has put something
+/// there to keep (the overview's sidebar, translucent so the desktop shows through).
 pub fn paint_over<F, Msg, C>(
     fb: &mut F,
     font: &Font,
@@ -127,13 +86,10 @@ pub fn paint_over<F, Msg, C>(
 
 /// Draw a glyph — a window control, or the power symbol — inside `rect`, clipped to `clip`.
 ///
-/// **Centred in a square derived from the box** rather than sized in pixels, so the glyphs stay
-/// proportionate if the title bar's height ever changes — which it will, the day chrome metrics
-/// follow the type scale. The strokes are two pixels so they read at the sizes this chrome
-/// actually uses; one pixel disappears against a bevelled face.
+/// **Centred in a square derived from the box** so the glyphs stay proportionate; two-pixel
+/// strokes, as one disappears against a bevelled face.
 fn draw_icon<F: Framebuffer + ?Sized>(fb: &mut F, kind: IconKind, rect: Rect, clip: Rect, ink: libdraw::format::Rgb) {
     const STROKE: u32 = 2;
-    // A square glyph box, a little under half the smaller dimension, centred.
     let side = (rect.size.w.min(rect.size.h) * 4 / 10).max(STROKE * 2);
     let x = rect.origin.x + (rect.size.w.saturating_sub(side) / 2) as i32;
     let y = rect.origin.y + (rect.size.h.saturating_sub(side) / 2) as i32;
@@ -143,20 +99,15 @@ fn draw_icon<F: Framebuffer + ?Sized>(fb: &mut F, kind: IconKind, rect: Rect, cl
         }
     };
     match kind {
-        // A bar along the bottom — the window going down.
         IconKind::Minimise => {
             bar(Rect::new(x, y + (side - STROKE) as i32, side, STROKE));
         }
-        // An empty square: the outline of a window at full size.
         IconKind::Maximise => {
             bar(Rect::new(x, y, side, STROKE));
             bar(Rect::new(x, y + (side - STROKE) as i32, side, STROKE));
             bar(Rect::new(x, y, STROKE, side));
             bar(Rect::new(x + (side - STROKE) as i32, y, STROKE, side));
         }
-        // Two strokes. Drawn as a run of short horizontal bars stepping across, which is a
-        // line-drawing routine written the once rather than a primitive this crate does not
-        // otherwise need — the glyph is a dozen pixels on a side.
         IconKind::Close => {
             for i in 0..side {
                 let step = i as i32;
@@ -164,24 +115,18 @@ fn draw_icon<F: Framebuffer + ?Sized>(fb: &mut F, kind: IconKind, rect: Rect, cl
                 bar(Rect::new(x + step, y + (side - 1) as i32 - step, STROKE, 1));
             }
         }
-        // **The power symbol** (administration Part F.2): a ring `STROKE` thick, open over the
-        // top where the bar comes down through it to the centre. Worked a pixel at a time in
-        // doubled coordinates, so the centre of an even box is an integer and the ring is
-        // symmetric about it — a dozen pixels on a side, where a routine for arcs would be more
-        // code than the glyph.
+        // **The power symbol**: a ring `STROKE` thick, open over the top where the bar comes down
+        // to the centre, worked in doubled coordinates so the ring is symmetric.
         IconKind::Power => {
-            // **Even**, so the two-pixel bar has a centre to straddle: an odd box would put it a
-            // pixel off. Only this glyph rounds; the window controls keep the box they had.
+            // **Even**, so the two-pixel bar has a centre to straddle; only this glyph rounds.
             let s = (side & !1) as i32;
             let (outer, inner) = (s * s, (s - 2 * STROKE as i32) * (s - 2 * STROKE as i32));
             for py in 0..s {
                 for px in 0..s {
                     let (dx, dy) = (2 * px + 1 - s, 2 * py + 1 - s);
                     let d = dx * dx + dy * dy;
-                    // The gap: the ring's top, within about 35° either side of straight up.
                     let in_gap = dy < 0 && dx.abs() * 7 < s * 4;
                     let ring = d <= outer && d > inner && !in_gap;
-                    // The bar: `STROKE` columns about the centre, from the top down to it.
                     let stem = dx.abs() < STROKE as i32 && dy < 0;
                     if ring || stem {
                         bar(Rect::new(x + px, y + py, 1, 1));
@@ -193,11 +138,6 @@ fn draw_icon<F: Framebuffer + ?Sized>(fb: &mut F, kind: IconKind, rect: Rect, cl
 }
 
 /// Draw one node and its subtree, in `ink`.
-///
-/// **`ink` is threaded rather than read from the theme at each leaf**, which is the whole of
-/// [`Node::Ink`]: a text node's colour is a property of where it sits, and a leaf that looked
-/// the colour up itself could not be inside something coloured. The root is called with
-/// `theme.foreground`, so a tree with no ink node draws exactly as it did before this existed.
 #[allow(clippy::too_many_arguments, reason = "a paint pass carries the frame's drawing state as separate values")]
 fn draw<F, Msg, C>(
     fb: &mut F,
@@ -213,21 +153,17 @@ fn draw<F, Msg, C>(
     F: Framebuffer + ?Sized,
     C: FnMut(u32, Rect, Rect, &mut F),
 {
-    // **Skipped whole, subtree and all.** A node's children are arranged inside it — the
-    // invariant `every_child_is_contained_by_its_parent` holds — so a node that misses the
-    // damage has nothing beneath it that could hit. This is where a small damage rectangle
-    // turns into a small amount of work rather than merely a small `Commit`.
+    // **Skipped whole, subtree and all**: children are arranged inside their parent
+    // (`every_child_is_contained_by_its_parent`), so a node that misses the damage has nothing
+    // beneath it that could hit.
     let Some(clip) = l.rect.intersect(&damage) else {
         return;
     };
 
     match &e.node {
         Node::Text(s) => {
-            // Positioned by the baseline, which is `ascent` below the box's top: a font's
-            // metrics are expressed against the baseline and two runs of different heights
-            // line up on it, not on their tops.
-            // At the step the enclosing `Scale` set — the size layout measured this run at, which
-            // is what keeps the glyphs inside the box they were given.
+            // Positioned by the baseline, `ascent` below the box's top, at the step the enclosing
+            // `Scale` set (the size layout measured this run at).
             let px = at.size.px(theme.font_px);
             let base = if at.mono { font.mono() } else { font };
             let face = if at.bold { base.bold() } else { base };
@@ -245,16 +181,12 @@ fn draw<F, Msg, C>(
         Node::RoundedFill { colour, radius } => fb.fill_rounded_rect(l.rect, clip, *colour, *radius),
         Node::Wash { colour, coverage } => fb.blend_rect(clip, *colour, *coverage),
         Node::Icon(kind) => draw_icon(fb, *kind, l.rect, clip, ink),
-        // **Not a container arm**, which is what would happen by default and is the whole bug
-        // this node exists to avoid: it would paint its child correctly and ignore the colour.
-        // `Center` needs no arm of its own: its child is a child like any other, and the
-        // container arm below paints it at the rectangle `arrange` gave it.
+        // **Not a container arm**, which would paint its child correctly and ignore the colour.
         Node::Ink { colour, child } => {
             if let Some(cl) = l.children.first() {
                 draw(fb, font, theme, child, cl, damage, *colour, at, custom);
             }
         }
-        // The same shape as `Ink`: the step is threaded to the text inside, not drawn.
         Node::Scale { size, child } => {
             if let Some(cl) = l.children.first() {
                 let at = TextStyle { size: *size, ..at };
@@ -274,10 +206,8 @@ fn draw<F, Msg, C>(
             }
         }
         Node::Custom { kind, .. } => custom(*kind, l.rect, clip, fb),
-        // Containers draw nothing of their own; their children are the picture. Painted in
-        // `children()` order, so a `Stack`'s last layer lands on top — the reverse of the
-        // order `hit_test` walks, which is what makes the thing you can see the thing you
-        // can click.
+        // Containers draw nothing of their own; painted in `children()` order, a `Stack`'s last
+        // layer lands on top, the reverse of `hit_test`'s walk.
         _ => {
             for (ce, cl) in e.children().zip(l.children.iter()) {
                 draw(fb, font, theme, ce, cl, damage, ink, at, custom);
@@ -313,7 +243,6 @@ mod tests {
         MemFramebuffer::new(Geometry::packed(W, H, PixelFormat::XRGB8888))
     }
 
-    /// Pixels not equal to the theme background.
     fn ink(fb: &MemFramebuffer, theme: &Theme) -> usize {
         let mut n = 0;
         for y in 0..H {
@@ -326,7 +255,6 @@ mod tests {
         n
     }
 
-    /// Paint with no custom widgets.
     fn go(b: &mut MemFramebuffer, f: &Font, t: &Theme, e: &Element<Msg>, damage: Rect) -> Layout {
         let l = layout(e, Rect::new(0, 0, W, H), &FontMetrics::new(f, t.font_px));
         paint(b, f, t, e, &l, damage, &mut |_, _, _, _: &mut MemFramebuffer| {});
@@ -355,17 +283,11 @@ mod tests {
         b.get_pixel(x, y) != Some(t.background)
     }
 
-    /// Text inside a `Scale` measures and draws at its step, and nesting is innermost-wins
-    /// (desktop refresh, Part G). The ink is measured, not assumed: what `draw_str` put down must
-    /// fit in the box layout gave the run, which is what breaks if paint and layout disagree about
-    /// the size.
     #[test]
     fn scaled_text_measures_and_draws_at_its_step() {
         use crate::element::{TextSize, scaled};
         let (f, t) = (font(), Theme::default());
         let m = FontMetrics::new(&f, t.font_px);
-        // What the element asks for: a column arranges its children across its whole width, so
-        // a laid-out rectangle would compare the column's width rather than the text's.
         let at = |e: &Element<Msg>| crate::layout::measure(e, crate::layout::Constraints::loose(Size::new(W, H)), &m);
         let body = at(&column(vec![text("Hello")]));
         let small = at(&column(vec![scaled(TextSize::Small, text("Hello"))]));
@@ -373,15 +295,12 @@ mod tests {
         assert!(small.w < body.w && small.h < body.h, "small {small:?} against body {body:?}");
         assert!(large.w > body.w && large.h > body.h, "large {large:?} against body {body:?}");
         assert_eq!(small, f.measure("Hello", TextSize::Small.px(t.font_px)));
-        // Innermost wins: a Small inside a Large is small.
         let inner = scaled(TextSize::Small, text("Hello"));
         let nested = at(&column(vec![scaled(TextSize::Large, inner)]));
         assert_eq!(nested, small);
 
-        // **What is drawn is drawn at the step**, read off the ink. In a box far wider than the
-        // text, so the paint's clip cannot be what limits it: the first version of this checked
-        // that the ink stayed inside its box, which a clip guarantees whatever size the glyphs are
-        // drawn at, and a paint that ignored the step passed it.
+        // **What is drawn is drawn at the step**, read off the ink in a box far wider than the
+        // text, so the clip cannot be what limits it.
         let mut widths = Vec::new();
         for step in [TextSize::Small, TextSize::Body, TextSize::Large] {
             let e: Element<Msg> = sized(Size::new(W, 40), scaled(step, text("Hello")));
@@ -399,8 +318,6 @@ mod tests {
             }
             widths.push(right + 1 - left);
         }
-        // Ordered, and in proportion. Ink excludes a run's side bearings, so it is compared with
-        // ink rather than with a measured advance, which it undershoots by a few pixels.
         let ordered = widths[0] < widths[1] && widths[1] < widths[2];
         assert!(ordered, "the steps draw at one size: {widths:?}");
         let ratio = widths[0] as f32 / widths[1] as f32;
@@ -408,12 +325,6 @@ mod tests {
         assert!((ratio - want).abs() < 0.08, "small is {ratio} of body, not {want}");
     }
 
-    /// Fixed-advance text is set in the face's mono companion — every glyph the same width —
-    /// and in the proportional face when there is none.
-    ///
-    /// **Measured as advance rather than as ink** (desktop refresh, Part J): what makes a face
-    /// fixed is that `i` and `m` take the same room, which a width comparison of two strings of
-    /// the same length says exactly.
     #[test]
     fn mono_text_uses_the_companion_face_and_falls_back_without_one() {
         use crate::element::mono;
@@ -425,8 +336,6 @@ mod tests {
             let loose = crate::layout::Constraints::loose(Size::new(W * 4, H));
             crate::layout::measure(e, loose, &FontMetrics::new(f, t.font_px)).w
         };
-        // `iiii` and `mmmm` are the same width in a fixed-advance face and nothing like it in a
-        // proportional one.
         let narrow = || -> Element<Msg> { mono(text("iiii")) };
         let wide = || -> Element<Msg> { mono(text("mmmm")) };
         assert_eq!(
@@ -434,27 +343,21 @@ mod tests {
             measured(&paired, &wide()),
             "every glyph takes the same room in the companion"
         );
-        // Without a companion, the proportional face draws it and the two differ.
         assert!(
             measured(&plain, &narrow()) < measured(&plain, &wide()),
             "with no companion it is the proportional face"
         );
-        // And the wrapper is what does it: the same strings unwrapped differ even when paired.
         let bare = |s: &'static str| -> Element<Msg> { text(s) };
         assert!(measured(&paired, &bare("iiii")) < measured(&paired, &bare("mmmm")));
 
-        // **And the glyphs are *painted* in it, which measuring cannot say** (PR #321 review,
-        // worth fixing 1): the bold test this one is modelled on counts ink as well, and without
-        // that half, dropping the face selection in `draw` leaves text laid out at mono advances
-        // and drawn with proportional glyphs — every column crooked — with libui green.
+        // **And the glyphs are *painted* in it, which measuring cannot say**: dropping the face
+        // selection in `draw` would leave every column crooked.
         let inked = |f: &Font, e: Element<Msg>| {
             let mut b = fb();
             b.clear(t.background);
             go(&mut b, f, &t, &sized(Size::new(W, 40), e), Rect::new(0, 0, W, H));
             ink(&b, &t)
         };
-        // Eight narrow glyphs: the fixed-advance face spaces them out, so it puts down more ink
-        // across the row than the proportional one, which packs them.
         let narrow_run = || -> Element<Msg> { mono(text("iiiiiiii")) };
         assert!(
             inked(&paired, narrow_run()) > inked(&plain, narrow_run()),
@@ -462,8 +365,6 @@ mod tests {
         );
     }
 
-    /// Bold text is set in the face's bold companion — wider, and heavier on the page — and in the
-    /// regular face when there is none (desktop refresh, Part G).
     #[test]
     fn bold_text_uses_the_companion_face_and_falls_back_without_one() {
         use crate::element::bold;
@@ -471,7 +372,6 @@ mod tests {
         let t = Theme::default();
         let plain = font();
         let paired = font().with_bold(Font::from_bytes(BOLD.to_vec()).expect("the bold face"));
-        // Measured bare, so the width is the text's; drawn in a box wide enough not to clip it.
         let words = || -> Element<Msg> { text("Files") };
         let measured = |f: &Font, e: &Element<Msg>| {
             let loose = crate::layout::Constraints::loose(Size::new(W, H));
@@ -483,17 +383,13 @@ mod tests {
             go(&mut b, f, &t, &sized(Size::new(W, 40), e), Rect::new(0, 0, W, H));
             ink(&b, &t)
         };
-        // With a companion: wider, and more ink.
         let (heavy, regular) = (measured(&paired, &bold(words())), measured(&paired, &words()));
         assert!(heavy > regular, "bold measures wider");
         assert!(inked(&paired, bold(words())) > inked(&paired, words()), "bold puts down more ink");
-        // Without one: exactly the regular weight, measured and drawn.
         assert_eq!(measured(&plain, &bold(words())), measured(&plain, &words()));
         assert_eq!(inked(&plain, bold(words())), inked(&plain, words()));
     }
 
-    /// A change of step or weight alone repaints: the text is the same and, inside a fixed box, so
-    /// is every rectangle — only the fingerprint can say the picture changed.
     #[test]
     fn a_change_of_step_or_weight_alone_repaints() {
         use crate::diff::Tree;
@@ -507,8 +403,6 @@ mod tests {
         let b = view(TextSize::Small);
         let damage = tree.update(&b, &layout(&b, Rect::new(0, 0, W, H), &m)).expect("diffs");
         assert!(damage.is_some(), "a smaller status line must be redrawn");
-        // And a change of weight alone: the same shape of tree, one node setting the body step and
-        // then the bold weight, so nothing but the fingerprint of that node differs.
         let c = view(TextSize::Body);
         let _ = tree.update(&c, &layout(&c, Rect::new(0, 0, W, H), &m));
         let d: Element<Msg> = sized(Size::new(120, 30), crate::element::bold(text("status")));
@@ -516,10 +410,6 @@ mod tests {
         assert!(damage.is_some(), "a bold status line must be redrawn");
     }
 
-    /// **The power symbol is a ring open at the top with a bar down to its centre**
-    /// (administration Part F.2) — painted and read back, and read in terms the other glyphs fail:
-    /// a close cross is inked at its centre, a maximise square along its whole top edge, and a
-    /// minimise bar has no top at all.
     #[test]
     fn the_power_glyph_is_an_open_ring_with_a_bar() {
         use crate::element::{IconKind, icon};
@@ -528,7 +418,6 @@ mod tests {
             let mut b = fb();
             let e: Element<Msg> = sized(Size::new(40, 40), icon(kind));
             go(&mut b, &f, &t, &e, Rect::new(0, 0, W, H));
-            // The ink's bounding box, and a reader of it.
             let inked: Vec<(u32, u32)> =
                 (0..H).flat_map(|y| (0..W).map(move |x| (x, y))).filter(|&(x, y)| fb_has_ink(&b, &t, x, y)).collect();
             (b, inked)
@@ -538,24 +427,18 @@ mod tests {
         let (x0, x1) = (inked.iter().map(|p| p.0).min().unwrap(), inked.iter().map(|p| p.0).max().unwrap());
         let (y0, y1) = (inked.iter().map(|p| p.1).min().unwrap(), inked.iter().map(|p| p.1).max().unwrap());
         let on = |x: u32, y: u32| fb_has_ink(&b, &t, x, y);
-        // Square, and symmetric left to right.
         assert_eq!(x1 - x0, y1 - y0, "not square: {x0}..{x1} by {y0}..{y1}");
         for &(x, y) in &inked {
             assert!(on(x0 + x1 - x, y), "not symmetric at ({x},{y})");
         }
         let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
-        // The bar at the top centre — `cx` is its left column, the box being even — and **the
-        // gap beside it, a row down**: a closed ring's top reaches that row two pixels either
-        // side of the bar, which the top row alone cannot show, since there a closed ring is
-        // inked only where the bar is anyway.
+        // The bar at the top centre — `cx` is its left column, the box being even — and **the gap
+        // beside it, a row down**, which the top row alone cannot show.
         assert!(on(cx, y0) && on(cx + 1, y0), "no bar at the top centre");
         assert!(!on(cx - 2, y0 + 1) && !on(cx + 3, y0 + 1), "the ring is closed at the top");
-        // The ring's sides at the middle, and its bottom — and hollow below the centre.
         assert!(on(x0, cy) && on(x1, cy), "no ring at the sides");
         assert!(on(cx, y1), "the ring is open at the bottom");
         assert!(!on(cx, cy + (y1 - cy) / 2), "filled below the centre");
-        // **And the other glyphs fail what it passes**, so this reads the shape and not merely
-        // some ink: the cross is inked at its centre, the square along its top.
         let (bc, _) = glyph(IconKind::Close);
         assert!(fb_has_ink(&bc, &t, 20, 20), "the close cross should be inked at its centre");
         let (bm, maxi) = glyph(IconKind::Maximise);
@@ -564,11 +447,6 @@ mod tests {
         assert!(fb_has_ink(&bm, &t, left + 1, top), "the square's top edge runs its whole width");
     }
 
-    /// A rounded fill is rounded at its **own** corners — not at a partial repaint's.
-    ///
-    /// The second half is the one a shape taken from the clip would fail: repainting a band
-    /// through the middle of the shape must leave that band's ends square, since the shape has no
-    /// corner there.
     #[test]
     fn a_rounded_fill_is_rounded_at_its_own_corners_and_nowhere_else() {
         use crate::element::rounded_fill;
@@ -583,11 +461,9 @@ mod tests {
         assert_eq!(b.get_pixel(20, 0), Some(red), "the straight top edge is solid");
         assert_eq!(b.get_pixel(0, 15), Some(red), "the straight left edge is solid");
         assert_eq!(b.get_pixel(20, 15), Some(red), "the middle is the colour");
-        // An edge pixel of the curve is a blend: neither the ground nor the colour.
         let curve = (0..8).map(|i| b.get_pixel(i, 8 - 1 - i)).find(|p| *p != Some(red) && *p != Some(t.background));
         assert!(curve.is_some(), "the curve is antialiased, not stepped");
 
-        // A band through the middle, repainted on its own over a clean ground.
         let mut b = fb();
         b.clear(t.background);
         go(&mut b, &f, &t, &e, Rect::new(0, 10, W, 10));
@@ -596,15 +472,8 @@ mod tests {
         assert_eq!(b.get_pixel(0, 0), Some(t.background), "and nothing outside the band was drawn");
     }
 
-    /// Every pixel drawn, as a set of colours.
-    ///
-    /// **A set rather than one coordinate, and never an exact match against the ink.** Glyphs
-    /// are antialiased: `draw_str` blends coverage between the ink and what is under it, and at
-    /// 16 px a stem is a pixel and a half wide, so a letter may contain *no* fully-covered
-    /// pixel at all — an assertion that the ink appears exactly can fail on a correct
-    /// implementation. What survives blending against a white ground is the **hue**: grey ink
-    /// blends to grey, red ink blends to pinks whose red channel leads. That is what the
-    /// helpers below ask about.
+    /// Every pixel drawn, as a set of colours: **a set, never an exact match against the ink**, as
+    /// antialiasing leaves what survives blending as the **hue**.
     fn painted(b: &MemFramebuffer, t: &Theme) -> Vec<Rgb> {
         let mut out = Vec::new();
         for y in 0..H {
@@ -620,23 +489,14 @@ mod tests {
         out
     }
 
-    /// Whether every colour in `c` is the theme's foreground over its background at some coverage
-    /// — text drawn in the theme's ink and in nothing else.
-    ///
-    /// **Not "grey"**, which is what this checked until the desktop refresh: the old ink was
-    /// `#2F2F2F`, so a neutral pixel meant the theme's ink, and the design's `#16201F` is not
-    /// neutral. The property was always "the theme's ink"; greyness was a proxy that held for one
-    /// palette.
     fn all_theme_ink(c: &[Rgb], t: &Theme) -> bool {
         c.iter().all(|p| (0..=255u8).any(|a| t.foreground.blend(t.background, a) == *p))
     }
 
-    /// Whether anything was drawn whose red channel leads, i.e. in [`RED`].
     fn any_reddish(c: &[Rgb]) -> bool {
         c.iter().any(|p| p.r > p.g && p.g == p.b)
     }
 
-    /// Whether anything was drawn whose green channel leads, i.e. in [`GREEN`].
     fn any_greenish(c: &[Rgb]) -> bool {
         c.iter().any(|p| p.g > p.r && p.r == p.b)
     }
@@ -665,11 +525,6 @@ mod tests {
         );
     }
 
-    /// Ink is inherited, and the innermost wins.
-    ///
-    /// **Both halves in one tree**, because they are the two ways the threading can be wrong: a
-    /// version that only coloured its *immediate* child leaves the nested text at the theme's
-    /// ink, and one that took the outermost leaves it red.
     #[test]
     fn ink_is_inherited_and_the_innermost_wins() {
         let (f, t) = (font(), Theme::default());
@@ -685,11 +540,6 @@ mod tests {
         assert!(!c.contains(&t.foreground), "something was still drawn in the theme's ink");
     }
 
-    /// An ink node changes no geometry.
-    ///
-    /// **The property that lets it be wrapped around anything.** A version that measured as zero
-    /// — the obvious mistake, since `Fill` and `Icon` do — would collapse every coloured run in a
-    /// text area to nothing, and the line would draw on top of itself.
     #[test]
     fn an_ink_node_lays_out_exactly_as_its_child() {
         let (f, t) = (font(), Theme::default());
@@ -703,8 +553,6 @@ mod tests {
 
     #[test]
     fn nothing_outside_the_damage_rectangle_is_touched() {
-        // The whole point of the diff. A one-character edit must repaint one row, and the
-        // proof is that every pixel elsewhere keeps whatever it held.
         let (f, t) = (font(), Theme::default());
         let mut b = fb();
         let marker = Rgb::new(0xFF, 0x00, 0xFF);
@@ -727,15 +575,8 @@ mod tests {
 
     #[test]
     fn a_fill_straddling_the_damage_edge_stops_at_it() {
-        // **The gap the test above leaves.** It proves containment using only `text`, whose
-        // glyphs cover a fraction of their box — so a node that overdrew its clip by a few
-        // pixels might well not reach the assertions. `Fill` is the primitive that covers
-        // large areas, and the one a partial repaint would visibly overdraw with.
-        //
-        // Changing `fb.fill_rect(clip, ..)` to `fb.fill_rect(l.rect, ..)` in `draw` left the
-        // whole suite green (PR #185 review, finding 4): a `Fill` whose rect extends past the
-        // damage would repaint pixels the diff had just reported clean, which for a partial
-        // repaint means painting over a neighbour that did not change.
+        // **The gap the test above leaves**: `text` covers only a fraction of its box, so an
+        // overdrawn clip might not reach the assertions; `Fill` would.
         let (f, t) = (font(), Theme::default());
         let mut b = fb();
         let marker = Rgb::new(0xFF, 0x00, 0xFF);
@@ -745,7 +586,6 @@ mod tests {
             }
         }
 
-        // One `Fill` taking the whole buffer, damaged over only its top half.
         let colour = Rgb::new(0x20, 0x90, 0x40);
         let e: Element<Msg> = fill_node(colour);
         let half = H / 2;
@@ -762,8 +602,6 @@ mod tests {
 
     #[test]
     fn the_damaged_region_is_cleared_before_anything_draws_into_it() {
-        // Painting draws ink; it does not erase. A label that got shorter would otherwise
-        // leave the tail of its previous text on screen.
         let (f, t) = (font(), Theme::default());
         let mut b = fb();
         let e: Element<Msg> = column(vec![text("MMMMMMMMMMMM")]);
@@ -800,8 +638,6 @@ mod tests {
 
     #[test]
     fn a_node_outside_the_damage_is_skipped_entirely() {
-        // Not merely clipped: the subtree is never walked. Children are contained by their
-        // parents, so a parent that misses the damage has nothing beneath it that could hit.
         let (f, t) = (font(), Theme::default());
         let mut b = fb();
         let e: Element<Msg> = column(vec![
@@ -819,8 +655,6 @@ mod tests {
 
     #[test]
     fn a_stacks_last_layer_paints_on_top() {
-        // The reverse of the order `hit_test` walks, which is what makes the thing you can
-        // see the thing you can click.
         let (f, t) = (font(), Theme::default());
         let mut b = fb();
         let e: Element<Msg> = stack(vec![custom_node(1, Size::new(0, 0)), custom_node(2, Size::new(0, 0))]);
@@ -834,12 +668,8 @@ mod tests {
 
     #[test]
     fn an_empty_damage_rectangle_paints_nothing_at_all() {
-        // What a caller does with the `None` the diff returns is its own business, but a
-        // zero-extent rectangle reaching here must still be inert. It is, without a guard:
-        // `fill`'s loops run zero times and `intersect` gives `None` at the root. An earlier
-        // version had an early return justified as stopping a corner pixel from being
-        // cleared — removing it changed nothing, which is how the justification was found to
-        // be false.
+        // A zero-extent rectangle reaching here must be inert without a guard: `fill`'s loops run
+        // zero times and `intersect` gives `None` at the root.
         let (f, t) = (font(), Theme::default());
         let mut b = fb();
         let marker = Rgb::new(0xFF, 0x00, 0xFF);
@@ -851,8 +681,6 @@ mod tests {
 
     #[test]
     fn layout_measures_with_the_font_that_paints() {
-        // Measuring with one font and drawing with another gives text that overflows its box
-        // by a few pixels and reads as a layout bug. `FontMetrics` is the seam that stops it.
         let (f, t) = (font(), Theme::default());
         let e: Element<Msg> = column(vec![text("Hello")]);
         let l = layout(&e, Rect::new(0, 0, W, H), &FontMetrics::new(&f, t.font_px));
@@ -861,8 +689,6 @@ mod tests {
 
     #[test]
     fn painting_after_a_diff_repaints_exactly_what_the_diff_reported() {
-        // The two halves meeting: the rectangle `Tree::update` returns is the rectangle
-        // `paint` is handed, and nothing outside it changes.
         let (f, t) = (font(), Theme::default());
         let m = FontMetrics::new(&f, t.font_px);
         let mut b = fb();

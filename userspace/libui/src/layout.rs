@@ -1,19 +1,13 @@
 //! Measure and arrange: constraints down, sizes up, then rectangles.
 //!
-//! Two passes, the model Flutter uses and the one that survives contact with a scrollbar:
+//! Two passes: **measure** (the parent passes a min/max box down; each child returns the size it
+//! wants) then **arrange** (the parent assigns each child a rectangle).
 //!
-//! 1. **Measure.** The parent passes a min/max box down; each child returns the size it wants
-//!    within it.
-//! 2. **Arrange.** The parent assigns each child a rectangle.
+//! Rectangles come out **absolute**, in the window's coordinates rather than the parent's: every
+//! consumer of a layout (painting, damage, hit-testing) wants them, and re-accumulating offsets in
+//! each is three chances to get it wrong.
 //!
-//! Rectangles come out **absolute** — in the window's coordinates, not the parent's. The
-//! design document describes arrange as assigning "a rectangle in its own coordinates", and
-//! this is the same thing with the origin already folded in: every consumer of a layout
-//! (painting, damage, and later hit-testing) wants window coordinates, and having each of
-//! them re-accumulate offsets down the tree is three chances to get it wrong instead of one.
-//!
-//! **There is no font here.** Text is measured through [`Metrics`], which the caller
-//! supplies, because glyph rendering is Milestone 5 and layout must not wait for it.
+//! **There is no font here.** Text is measured through [`Metrics`], which the caller supplies.
 
 use alloc::vec::Vec;
 
@@ -21,19 +15,13 @@ use libdraw::geom::{Point, Rect, Size};
 
 use crate::element::{Edge, Element, Node, TextStyle};
 
-/// How big a run of text is.
-///
-/// A trait rather than a font because `libdraw` has no glyphs until Milestone 5 Part A, and
-/// because a terminal, a menu and a status line may not measure the same way forever.
+/// How big a run of text, a trait rather than a font so surfaces may measure differently.
 pub trait Metrics {
     /// The size `s` occupies when drawn at the body size.
     fn text_size(&self, s: &str) -> Size;
 
-    /// The size `s` occupies when set in `style` — a step on the scale ([`TextSize`]) and a
-    /// weight.
-    ///
-    /// **Defaulted to the body size**, which is right for a metric with one cell and no scale —
-    /// [`FixedCell`], the structural tests' — and wrong for a real face, which overrides it.
+    /// The size `s` occupies when set in `style`; **defaulted to the body size**, right for a
+    /// one-cell metric ([`FixedCell`]), wrong for a real face.
     fn text_size_as(&self, s: &str, style: TextStyle) -> Size {
         let _ = style;
         self.text_size(s)
@@ -41,8 +29,6 @@ pub trait Metrics {
 }
 
 /// A fixed-cell metric: every character the same box.
-///
-/// What a bitmap font gives, and enough for every text this milestone lays out.
 #[derive(Clone, Copy, Debug)]
 pub struct FixedCell {
     /// Width of one character cell.
@@ -53,9 +39,7 @@ pub struct FixedCell {
 
 impl Metrics for FixedCell {
     fn text_size(&self, s: &str) -> Size {
-        // `chars()`, not `len()`: a byte count is a character count only for ASCII, and
-        // getting that wrong makes every non-ASCII label mis-sized rather than mis-drawn,
-        // which is much harder to spot.
+        // `chars()`, not `len()`: a byte count is a character count only for ASCII.
         Size::new(self.w.saturating_mul(s.chars().count() as u32), self.h)
     }
 }
@@ -85,10 +69,8 @@ impl Constraints {
         Size::new(size.w.clamp(self.min.w, self.max.w), size.h.clamp(self.min.h, self.max.h))
     }
 
-    /// The same box with `w`/`h` removed from `max`, saturating at zero.
-    ///
-    /// Saturating matters: a `Padding` wider than the space it was given would otherwise
-    /// wrap to an enormous `max`, and the child would measure as if it had the whole screen.
+    /// The same box with `w`/`h` removed from `max`, saturating at zero, or a `Padding` wider than
+    /// its space would wrap to an enormous `max`.
     pub fn shrink(&self, w: u32, h: u32) -> Self {
         Self {
             min: Size::new(
@@ -101,9 +83,6 @@ impl Constraints {
 }
 
 /// Where an element ended up, and where its children did.
-///
-/// Parallel in shape to the [`Element`] it came from: `children` is in the same order as
-/// [`Element::children`], so the two walk together.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Layout {
     /// The element's rectangle, in window coordinates.
@@ -128,24 +107,13 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
 fn measure_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M, at: TextStyle) -> Size {
     let size = match &e.node {
         Node::Text(s) => m.text_size_as(s, at),
-        // Scale and bold change no geometry of their own: their child measures in the new style.
         Node::Scale { size, child } => measure_in(child, c, m, TextStyle { size: *size, ..at }),
         Node::Bold { child } => measure_in(child, c, m, TextStyle { bold: true, ..at }),
         Node::Mono { child } => measure_in(child, c, m, TextStyle { mono: true, ..at }),
-        // A colour has no natural size, and a caller wanting a particular one wraps it in
-        // `sized` or gives it `flex`.
-        //
-        // **Zero, not `c.max`.** It was `c.max` until 2026-08-11, on the stated grounds that
-        // zero "would make a button's face collapse inside a `Column`" — which is not what
-        // happens, because `arrange` gives every `Stack` layer the whole rect regardless of
-        // what it measured. What `c.max` *did* do was make every `Stack`-based widget greedy:
-        // `button` and `menu_bar` are stacks over a `Fill`, so the first one in a `Row` or
-        // `Column` measured to the entire remaining extent and its siblings got nothing. A
-        // two-item menu bar laid its second item out at zero width, off the right edge.
-        //
-        // Nothing caught it because every widget test lays *one* widget into a fixed
-        // rectangle, where a greedy measure and a correct one give the same answer. Composing
-        // the widget set into one UI (`reference::view`) is what surfaced it.
+        // A colour has no natural size; a caller wanting one wraps it in `sized` or gives it
+        // `flex`. **Zero, not `c.max`**: `Stack` layers all get the whole rect, and `button` and
+        // `menu_bar` are stacks over a `Fill`, so a greedy measure made the first take the entire
+        // remaining extent of a `Row` or `Column`.
         Node::Fill(_)
         | Node::Bevel(_)
         | Node::Outline { .. }
@@ -153,8 +121,7 @@ fn measure_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M,
         | Node::Wash { .. }
         | Node::Icon(_) => Size::new(0, 0),
         Node::Custom { size, .. } => *size,
-        // An offset child measures as itself: the shift moves it, it does not resize it. What
-        // the *parent* sees is the child's size plus the shift, so a `Stack` that sized itself
+        // What the *parent* sees is the child's size plus the shift, so a `Stack` that sized itself
         // to its layers would still contain the popup.
         Node::Offset { dx, dy, child } => {
             let inner = measure_in(child, c, m, at);
@@ -165,10 +132,7 @@ fn measure_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M,
             let inner = measure_in(child, c, m, at);
             Size::new(if size.w == 0 { inner.w } else { size.w }, if size.h == 0 { inner.h } else { size.h })
         }
-        // Ink changes no geometry, so it measures as its child does.
         Node::Ink { child, .. } => measure_in(child, c, m, at),
-        // **A centred child asks for what it needs**, which is what makes `center` composable:
-        // a button's face is sized by the caller, and the label inside it takes its own width.
         Node::Center { child, .. } => measure_in(child, c, m, at),
         Node::Padding { insets, child } => {
             let inner = measure_in(child, c.shrink(insets.horizontal(), insets.vertical()), m, at);
@@ -197,7 +161,6 @@ fn measure_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M,
             Size::new(w, h)
         }
         Node::Stack(children) => {
-            // The union: an overlay is as big as its largest layer.
             let mut size = Size::new(0, 0);
             for ch in children {
                 let s = measure_in(ch, c, m, at);
@@ -219,12 +182,10 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
 
 /// [`arrange`], in the text style the enclosing [`Node::Scale`] and [`Node::Bold`] set.
 fn arrange_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M, at: TextStyle) -> Layout {
-    // `Sized` and `Offset` are the two nodes that change their *own* rectangle rather than
-    // only their children's. They have to: hit-testing and damage both read a node's rect, so
-    // constraining only the child would leave a 12-pixel scrollbar claiming the whole overlay
-    // it sits in — and an offset node whose rect stayed its parent's would break the
-    // containment invariant `paint` relies on to skip a subtree, since its child would sit
-    // outside it.
+    // `Sized` and `Offset` change their *own* rectangle, not only their children's: hit-testing and
+    // damage read a node's rect, so constraining only the child would leave a 12-pixel scrollbar
+    // claiming the whole overlay, and an offset node whose rect stayed its parent's would break the
+    // containment invariant `paint` relies on to skip a subtree.
     let rect = match &e.node {
         Node::Sized { size, .. } => Rect::new(
             rect.origin.x,
@@ -233,23 +194,14 @@ fn arrange_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M, at:
             if size.h == 0 { rect.size.h } else { size.h.min(rect.size.h) },
         ),
         Node::Offset { dx, dy, child } => {
-            // The child takes the size it *measures*, not the space it is offered — that is
-            // what distinguishes this from `Padding`, which shrinks a child into the
-            // remainder. A popup is as big as its contents wherever it lands.
             let want = measure_in(child, Constraints::loose(rect.size), m, at);
             let placed =
                 Rect::new(rect.origin.x.saturating_add(*dx), rect.origin.y.saturating_add(*dy), want.w, want.h);
-            // **Clipped to the parent**, which is what keeps the containment invariant true for
-            // this node too. Shifting a child's own rect was enough for the child; the offset
-            // node itself could still overhang, and `paint` skips a whole subtree whose rect
-            // misses the damage — so an overhanging popup with damage in the overhang would
-            // simply not be drawn. `every_child_is_contained_by_its_parent` did not catch it
-            // because its tree had no `Offset` in it (PR #192 review, finding 6).
-            //
-            // The consequence is that a popup larger than its container is cut off rather than
-            // escaping it. That is the right answer inside a window — `widget-toolkit.md` §5's
-            // own line is "a menu clipped to its window is not a menu", which is why a menu that
-            // must escape is a `Role::Popup` *window* and not a node.
+            // **Clipped to the parent**, which keeps the containment invariant true for this node
+            // too: `paint` skips a whole subtree whose rect misses the damage, so an overhanging
+            // popup with damage in the overhang would not be drawn. A popup larger than its
+            // container is cut off rather than escaping it; a menu that must escape is a
+            // `Role::Popup` *window*, not a node.
             placed.intersect(&rect).unwrap_or(Rect::new(placed.origin.x, placed.origin.y, 0, 0))
         }
         _ => rect,
@@ -274,11 +226,8 @@ fn arrange_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M, at:
             alloc::vec![arrange_in(child, inner, m, at)]
         }
 
-        // `rect` is already the constrained one, computed above.
         Node::Sized { child, .. } => alloc::vec![arrange_in(child, rect, m, at)],
-        // The child takes the whole rect: an ink wrapper is transparent to layout.
         Node::Ink { child, .. } => alloc::vec![arrange_in(child, rect, m, at)],
-        // So is a scale, except that everything inside it is text of a different size.
         Node::Scale { size, child } => {
             alloc::vec![arrange_in(child, rect, m, TextStyle { size: *size, ..at })]
         }
@@ -288,10 +237,8 @@ fn arrange_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M, at:
         Node::Mono { child } => {
             alloc::vec![arrange_in(child, rect, m, TextStyle { mono: true, ..at })]
         }
-        // **The child at its measured size, placed in the middle** — the one wrapper that moves
-        // its child rather than merely passing the rectangle through. Rounding leaves the extra
-        // pixel on the right and the bottom, which is what every layout engine does and what
-        // keeps a one-pixel-narrow label from drifting left of centre.
+        // **The child at its measured size, placed in the middle** — the one wrapper that moves its
+        // child. Rounding leaves the extra pixel on the right and the bottom.
         Node::Center { across, child } => {
             let want = measure_in(child, Constraints::loose(rect.size), m, at);
             let x = match across {
@@ -303,12 +250,10 @@ fn arrange_in<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M, at:
             alloc::vec![arrange_in(child, placed, m, at)]
         }
 
-        // `rect` is already the offset one, computed above.
         Node::Offset { child, .. } => alloc::vec![arrange_in(child, rect, m, at)],
 
         Node::Stack(children) => {
-            // Every layer gets the whole area. Overlays that want to be smaller wrap
-            // themselves in a `Sized` or a `Padding`, which keeps this node one rule.
+            // Every layer gets the whole area; a smaller overlay wraps itself in a `Sized`.
             children.iter().map(|ch| arrange_in(ch, rect, m, at)).collect()
         }
 
@@ -378,9 +323,8 @@ fn arrange_linear<M: Metrics + ?Sized, Msg>(
 
     let weight: u32 = children.iter().map(|c| c.flex as u32).sum();
     if weight > 0 {
-        // Integer division leaves a remainder; give it to the last flexed child rather than
-        // dropping it, or a two-way split of an odd number leaves a one-pixel seam that
-        // nothing paints.
+        // The remainder of the integer division goes to the last flexed child, or a two-way split
+        // of an odd number leaves a one-pixel seam that nothing paints.
         let free = total.saturating_sub(used);
         let mut handed_out = 0;
         let mut last_flex = None;
@@ -451,20 +395,11 @@ fn split(rect: Rect, edge: Edge, want: Size) -> (Rect, Rect) {
 
 /// Where the element with `key` was laid out, if it is in this tree.
 ///
-/// **The other half of [`offset`](crate::element::offset).** A popup is placed *under the item
-/// that opened it*, so the application needs that item's rectangle — and the only thing that
-/// knows it is the layout. The alternatives are both worse: re-deriving the item's width from
-/// the font is the layout engine §5 refused, written in application code and wrong the moment a
-/// label changes; and walking the tree by index is a path that silently means something else
-/// the first time a container gains a child.
+/// **The other half of [`offset`](crate::element::offset).** A popup is placed under the item that
+/// opened it, whose rectangle only the layout knows.
 ///
-/// A key rather than a [`Widget::id`](crate::diff::Widget::id): ids are assigned by the diff
-/// and an application does not choose them, whereas a key is what an application already uses
-/// to say "this element, across frames".
-///
-/// Returns the **first** match in tree order. Duplicate keys within one parent are a
-/// [`DiffError`](crate::diff::DiffError); duplicates across different parents are legal and
-/// this does not disambiguate them.
+/// Returns the **first** match in tree order; duplicates within one parent are a
+/// [`DiffError`](crate::diff::DiffError), across parents legal.
 pub fn locate<Msg>(e: &Element<Msg>, l: &Layout, key: u64) -> Option<Rect> {
     if e.key == Some(key) {
         return Some(l.rect);
@@ -481,18 +416,12 @@ pub fn to_local(rect: Rect, p: Point) -> Point {
 mod tests {
     use super::*;
 
-    /// Part A's tests carry no messages, and `()` is the simplest inhabited `Msg`. Part B's
-    /// routing tests use a real enum; these are about shape, not about what a click means.
     type Msg = ();
 
-    /// `layout` with `Msg` and the metrics pinned, so a construction like
-    /// `column(vec![text("a")])` infers from the parameter instead of needing a turbofish
-    /// at every call.
     fn lay(e: &Element<Msg>, bounds: Rect) -> Layout {
         layout(e, bounds, &CELL)
     }
 
-    /// `measure`, likewise.
     fn meas(e: &Element<Msg>, c: Constraints) -> Size {
         measure(e, c, &CELL)
     }
@@ -503,14 +432,11 @@ mod tests {
     use alloc::vec;
     use libdraw::format::Rgb;
 
-    /// 8×16 cells, which is what a bitmap console font gives.
     const CELL: FixedCell = FixedCell { w: 8, h: 16 };
     const SCREEN: Rect = Rect::new(0, 0, 640, 480);
 
     #[test]
     fn text_measures_by_characters_not_bytes() {
-        // A byte count is a character count only for ASCII. Getting this wrong mis-sizes
-        // every non-ASCII label, which reads as a layout bug rather than a metrics one.
         assert_eq!(CELL.text_size("abc"), Size::new(24, 16));
         assert_eq!("é".len(), 2, "two bytes");
         assert_eq!(CELL.text_size("é"), Size::new(8, 16), "one cell");
@@ -529,10 +455,6 @@ mod tests {
 
     #[test]
     fn spacing_goes_between_children_and_not_at_the_ends() {
-        // `n` children have `n-1` gaps. Two assertions, because they cover different code:
-        // the cursor walk places each child, and the gap *total* is subtracted from what
-        // flex divides. A first version tested only the placements and passed against `n`
-        // gaps, because the cursor never reads the total.
         let c = with_spacing(column(vec![text("a"), text("b"), text("c")]), 4);
         let l = lay(&c, SCREEN);
         assert_eq!(l.children[0].rect.origin.y, 0);
@@ -548,7 +470,6 @@ mod tests {
 
     #[test]
     fn flex_divides_only_what_the_fixed_children_leave() {
-        // The terminal's shape: a fixed menu bar, a grid taking the rest.
         let c = column(vec![text("menu"), custom(1, Size::new(0, 0)).flex(1)]);
         let l = lay(&c, Rect::new(0, 0, 640, 480));
         assert_eq!(l.children[0].rect, Rect::new(0, 0, 640, 16), "fixed keeps its measure");
@@ -557,8 +478,6 @@ mod tests {
 
     #[test]
     fn flex_weights_split_in_proportion_and_lose_no_pixel() {
-        // Integer division leaves a remainder. Dropping it leaves a one-pixel seam that
-        // nothing paints — visible as a stripe of stale content, and maddening to trace.
         let c = row(vec![
             custom(1, Size::new(0, 0)).flex(1),
             custom(2, Size::new(0, 0)).flex(1),
@@ -572,7 +491,6 @@ mod tests {
 
     #[test]
     fn a_dock_gives_each_edge_a_slice_and_the_filler_the_rest() {
-        // The terminal: a menu bar on top, a scrollbar on the right, the grid filling.
         let d = dock(
             vec![
                 docked(Edge::Top, sized(Size::new(0, 16), text(""))),
@@ -616,8 +534,6 @@ mod tests {
 
     #[test]
     fn a_dock_takes_what_it_is_offered_rather_than_what_its_children_measure() {
-        // Measuring a dock as the sum of its children would leave the filler nothing to
-        // fill, which defeats the only reason the node exists.
         let d = dock(vec![docked(Edge::Top, text("x"))], text("y"));
         assert_eq!(meas(&d, Constraints::loose(Size::new(200, 100))), Size::new(200, 100));
     }
@@ -632,15 +548,12 @@ mod tests {
 
     #[test]
     fn shrinking_past_zero_saturates_rather_than_wrapping() {
-        // Tested on `shrink` directly, not through `measure`: the outer `constrain` clamps
-        // the final answer either way, so an underflow that hands the *child* a `max` near
-        // `u32::MAX` is invisible from outside — a first version of this test asserted the
-        // outer size and passed against `wrapping_sub`.
+        // Tested on `shrink` directly: the outer `constrain` clamps the answer either way, so an
+        // underflow handing the *child* a `max` near `u32::MAX` is invisible from outside.
         let c = Constraints::loose(Size::new(20, 20)).shrink(100, 100);
         assert_eq!(c.max, Size::new(0, 0), "saturated, not wrapped");
         assert!(c.min.w <= c.max.w && c.min.h <= c.max.h, "min must never exceed max");
 
-        // And a tight box shrunk past its own minimum stays coherent.
         let c = Constraints::tight(Size::new(10, 10)).shrink(30, 4);
         assert!(c.min.w <= c.max.w && c.min.h <= c.max.h, "{c:?}");
         assert_eq!(c.max, Size::new(0, 6));
@@ -655,8 +568,6 @@ mod tests {
 
     #[test]
     fn sized_constrains_the_axes_it_names_and_yields_the_ones_it_does_not() {
-        // A zero component means "whatever the parent gives". Without it every fixed-size
-        // child would have to name a cross-axis extent it does not care about.
         let l = lay(&sized(Size::new(12, 0), text("")), Rect::new(0, 0, 100, 80));
         assert_eq!(l.rect, Rect::new(0, 0, 12, 80), "a scrollbar strip");
         assert_eq!(l.children[0].rect, l.rect, "and the child gets exactly that");
@@ -666,9 +577,6 @@ mod tests {
 
     #[test]
     fn sized_binds_inside_a_stack_where_the_slot_is_the_whole_area() {
-        // The case that exposed the doc overselling: `Stack` hands every layer the whole
-        // area, so passing the parent rect straight through made `sized` a no-op there —
-        // and Part C reaches for exactly this to place a scrollbar over a grid.
         let s = stack(vec![custom(1, Size::new(0, 0)), sized(Size::new(12, 20), text(""))]);
         let l = lay(&s, Rect::new(0, 0, 200, 100));
         assert_eq!(l.children[0].rect, Rect::new(0, 0, 200, 100), "the base layer fills");
@@ -687,14 +595,11 @@ mod tests {
         let l = lay(&s, Rect::new(5, 5, 40, 30));
         assert_eq!(l.children[0].rect, Rect::new(5, 5, 40, 30));
         assert_eq!(l.children[1].rect, Rect::new(5, 5, 40, 30));
-        // And it measures as the union, so a menu popup does not shrink its host.
         assert_eq!(meas(&s, Constraints::loose(Size::new(640, 480))), Size::new(20, 20));
     }
 
     #[test]
     fn layouts_children_are_in_the_same_order_as_elements_children() {
-        // The diff and the painter both walk the two together; a different order silently
-        // pairs each node with the wrong rectangle.
         let e = dock(
             vec![docked(Edge::Top, text("bar")), docked(Edge::Left, text("side"))],
             column(vec![text("a"), text("b")]),
@@ -712,16 +617,13 @@ mod tests {
         let l = lay(&e, Rect::new(0, 0, 200, 100));
         let popup = &l.children[1];
         assert_eq!(popup.rect, Rect::new(30, 12, 40, 8));
-        // And it takes its *measured* size rather than the space it was offered — the
-        // distinction from `Padding`, which shrinks a child into the remainder.
         assert_ne!(popup.rect.size, Size::new(170, 88));
     }
 
     #[test]
     fn an_offset_node_owns_the_rectangle_its_child_sits_in() {
-        // The containment invariant `paint` relies on to skip a subtree whole: a node whose
-        // rect stayed its parent's would have a child outside it, and the skip could drop a
-        // popup that overlapped the damage.
+        // The containment invariant `paint` relies on to skip a subtree whole: a node whose rect
+        // stayed its parent's would have a child outside it.
         let e: Element<Msg> = offset(20, 10, sized(Size::new(30, 6), fill(Rgb::BLACK)));
         let l = lay(&e, Rect::new(0, 0, 100, 50));
         assert_eq!(l.rect, Rect::new(20, 10, 30, 6));
@@ -730,18 +632,13 @@ mod tests {
 
     #[test]
     fn an_offset_is_relative_to_the_parent_not_the_screen() {
-        // A popup in a window-level stack must move with the window. Nested inside a padding
-        // so the parent's origin is not the screen's.
         let e: Element<Msg> = padding(Insets::all(5), offset(10, 4, sized(Size::new(8, 8), fill(Rgb::BLACK))));
         let l = lay(&e, Rect::new(100, 200, 80, 60));
         assert_eq!(l.children[0].rect.origin, Point::new(115, 209));
     }
 
-    /// `center` moves its child on both axes; `center_v` moves it down and not across.
-    ///
-    /// **The contract the vocabulary rests on.** The chooser's path wants the vertical half
-    /// alone, and getting both is not a smaller version of the same thing — it is a label that
-    /// detaches from the control it labels and slides as its string grows (PR #290 review, 3).
+    /// `center` moves its child on both axes; `center_v` moves it down and not across: both axes
+    /// detaches a label from its control and slides it as its string grows.
     #[test]
     fn center_moves_on_both_axes_and_center_v_only_down() {
         let child = || -> Element<Msg> { sized(Size::new(20, 10), fill(Rgb::BLACK)).key(1) };
@@ -779,8 +676,6 @@ mod tests {
 
     #[test]
     fn locate_and_offset_place_a_popup_under_its_item() {
-        // The two additions doing the job they exist for, end to end: find the item, put the
-        // popup beneath it. This is the whole of what `nxterm`'s menu needs from the toolkit.
         let bar = || -> Element<Msg> {
             sized(
                 Size::new(0, 20),
@@ -804,8 +699,6 @@ mod tests {
 
     #[test]
     fn an_empty_container_lays_out_rather_than_panicking() {
-        // `children.len() - 1` for the gap count underflows on an empty list, and an empty
-        // container is what a `view` returns while a list is still loading.
         let l = lay(&with_spacing(column(vec![]), 4), SCREEN);
         assert!(l.children.is_empty());
         assert_eq!(meas(&column(vec![]), Constraints::loose(SCREEN.size)).h, 0);
@@ -813,8 +706,6 @@ mod tests {
 
     #[test]
     fn a_child_larger_than_its_slot_is_clipped_by_the_slot_not_by_overflow() {
-        // Arithmetic on a rect narrower than its content must not wrap. The child keeps its
-        // requested size here — clipping is the painter's job — but nothing may go negative.
         let l = lay(&row(vec![text("a very long line indeed")]), Rect::new(0, 0, 16, 16));
         assert!(l.children[0].rect.size.w <= 16, "constrained, not wrapped");
     }
