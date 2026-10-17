@@ -1,28 +1,25 @@
 //! Classifying a resolved log path into `(tier, principal, source)`.
 //!
-//! A client obtains a log endpoint by resolving a path under the logging service's
-//! mount — the path *is* the identity (see `docs/architecture/logging.md`). The
-//! forwarded resolve delivers the suffix below the mount, e.g. `system/heartbeat` or
-//! `system/heartbeat/worker`. This parses it:
+//! A client obtains a log endpoint by resolving a path under the logging service's mount; the
+//! path *is* the identity (see `docs/architecture/logging.md`). The suffix below the mount,
+//! e.g. `system/heartbeat/worker`, parses as:
 //!
-//! - component 0 = **tier** (`system` / `app`; `kernel` is not resolvable — the kernel
-//!   rings are not opened this way)
+//! - component 0 = **tier** (`system` / `app`; `kernel` rings are not opened this way)
 //! - component 1 = **principal** (required, non-empty)
 //! - the remainder = an optional **source** sub-label
 //!
-//! Authority is *not* checked here — a caller can only resolve paths its namespace
-//! binding permits, so reaching `system/*` at all already implies the right to. This is
-//! pure syntax.
+//! Authority is *not* checked here: a caller can only resolve paths its namespace binding
+//! permits. This is pure syntax.
 
-/// The tiers, and their names: `librsproto`'s since administration Part E.6, when `log` came to
-/// read records back and show them. `TIER_KERNEL` is never produced by [`classify`] — kernel
-/// rings are not resolved.
+/// The tiers and their names, from `librsproto`. `TIER_KERNEL` is never produced by [`classify`].
 pub use librsproto::log::{TIER_APP, TIER_KERNEL, TIER_SYSTEM, tier_name};
 
 /// A classified log path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Classified<'a> {
+    /// `TIER_SYSTEM` or `TIER_APP`.
     pub tier: u8,
+    /// The required, non-empty second path component.
     pub principal: &'a str,
     /// Optional self-declared sub-label under `principal`.
     pub source: Option<&'a str>,
@@ -36,7 +33,7 @@ pub fn classify(suffix: &str) -> Option<Classified<'_>> {
     let tier = match it.next()? {
         "system" => TIER_SYSTEM,
         "app" => TIER_APP,
-        _ => return None, // unknown tier, or `kernel` (not resolvable)
+        _ => return None,
     };
     let principal = it.next().filter(|p| !p.is_empty())?;
     let source = it.next().filter(|s| !s.is_empty());
@@ -85,7 +82,7 @@ mod tests {
     #[test]
     fn rejects_unknown_and_kernel_tier() {
         assert!(classify("bogus/x").is_none());
-        assert!(classify("kernel/x").is_none()); // kernel rings aren't resolved
+        assert!(classify("kernel/x").is_none());
         assert!(classify("").is_none());
     }
 }

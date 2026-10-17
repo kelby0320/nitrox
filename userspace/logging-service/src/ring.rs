@@ -1,27 +1,22 @@
-//! **The ring `Log::Read` answers from** (administration Part E.6): the records the logging
-//! service keeps, bounded by bytes, cut to what a `Read` reply holds whole, and the replies built
-//! from them. Here rather than in the binary so that it is host-tested — the reply's loop included,
-//! since a record it cannot write is one no reader gets past (PR #344 review).
+//! **The ring `Log::Read` answers from**: the records kept, bounded by bytes and cut to what a
+//! `Read` reply holds whole, and the replies built from them. Here so that it is host-tested.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
 
 use librsproto::log::{ReadRecord, ReadReplyWriter};
 
-/// **What the ring may hold, in bytes** (administration Part E.6), counting what each record's
-/// strings have allocated and [`RECORD_OVERHEAD`]: a megabyte, several thousand records. It was
-/// 256 records until E.6; a boot writes 50 to 100, so what outgrew it was a machine running for
-/// days, whose audit is here too. Bytes rather than a count, because a record's message may be a
-/// kilobyte. **Allocated, not used** (PR #344 review): a message cut from 4 KB kept its 4 KB until
-/// [`cut`] gave it back, and the count said a quarter of that. The heap's size classes still round
-/// a string of under 2 KiB up to the next power of two, which this does not count, so what the
-/// ring occupies can reach twice this.
+/// **What the ring may hold, in bytes**, counting what each record's strings have allocated and
+/// [`RECORD_OVERHEAD`]. Bytes rather than a count, because a message may be a kilobyte.
+/// **Allocated, not used**: a message cut from 4 KB keeps its 4 KB until [`cut`] gives it back.
+/// The heap's size classes round a string of under 2 KiB up to a power of two, which this does
+/// not count, so what the ring occupies can reach twice this.
 pub const RING_BUDGET: usize = 1024 * 1024;
 /// What a record costs the ring beyond its strings: its fixed fields and the queue's slot.
 pub const RECORD_OVERHEAD: usize = 96;
 /// **The longest message the ring keeps**, in bytes; a longer one is cut there on a character
-/// boundary and ends in `…`. The serial sink prints it whole. So every record fits a `Read`
-/// reply with room to spare: `RECORD_HEADER_LEN` + two [`NAME_MAX`] strings + this.
+/// boundary and ends in `…`. The serial sink prints it whole. Every record fits a `Read` reply:
+/// `RECORD_HEADER_LEN` + two [`NAME_MAX`] strings + this.
 pub const MESSAGE_KEPT: usize = 1024;
 /// The longest principal or source a resolve may name, refused past it; and the longest source a
 /// record's own claim is kept to.
@@ -30,21 +25,27 @@ pub const NAME_MAX: usize = 64;
 /// A stamped log record. The trusted fields (`principal`/`tier`/`timestamp`/`time`/`sequence`)
 /// are supplied by the server; the rest are the emitter's claims.
 pub struct Record {
+    /// The channel's principal.
     pub principal: String,
+    /// The channel's tier.
     pub tier: u8,
     /// The monotonic clock at ingest.
     pub timestamp: u64,
-    /// The wall clock at ingest (administration Part E.6), or `None` while it is not set. It can
-    /// step (Part E.5), so `sequence` is what orders records.
+    /// The wall clock at ingest, or `None` while it is not set. It can step, so `sequence` is
+    /// what orders records.
     pub time: Option<u64>,
+    /// Rises by one per record: an `oldest()` past a reader's last plus one says it missed some.
     pub sequence: u64,
+    /// The emitter's severity.
     pub level: u8,
+    /// The emitter's text, cut to [`MESSAGE_KEPT`].
     pub message: String,
+    /// The emitter's claim, or the channel's label; never present and empty once pushed.
     pub source: Option<String>,
 }
 
-/// **The most recent records, for `Read`** (administration Part E.6), oldest first and bounded by
-/// [`RING_BUDGET`]. Sequences rise, so the records after one are found by a binary search.
+/// **The most recent records, for `Read`**, oldest first and bounded by [`RING_BUDGET`].
+/// Sequences rise, so the records after one are found by a binary search.
 pub struct Ring {
     buf: VecDeque<Record>,
     /// What the records hold, by [`Ring::cost`].
@@ -65,11 +66,11 @@ impl Ring {
 
     /// Keep `rec` as a reply can carry it, and drop the oldest until the ring is in budget.
     ///
-    /// **Everything kept is servable** (PR #344 review): a message and a source are cut to what a
-    /// reply holds, and a source that is present and empty — which an emitter may send, and which a
-    /// reply cannot carry, since an empty source means none — is kept as none. A record the reply
-    /// writer refused stopped every `Read` at it, and `log` took that for the end of the ring. The
-    /// principal is the service's, from a resolve path that names one of 1 to [`NAME_MAX`] bytes.
+    /// **Everything kept is servable**: a message and a source are cut to what a reply holds, and
+    /// a present, empty source (an empty source means none in a reply) is kept as none. A record
+    /// the reply writer refused would stop every `Read` at it, which `log` takes for the end of
+    /// the ring. The principal is the service's, from a resolve path naming 1 to [`NAME_MAX`]
+    /// bytes.
     pub fn push(&mut self, mut rec: Record) {
         cut(&mut rec.message, MESSAGE_KEPT);
         if rec.source.as_ref().is_some_and(String::is_empty) {
@@ -103,10 +104,9 @@ impl Ring {
     /// no more than `max` (`0` for no limit). Returns the reply's length, or `None` if `out` cannot
     /// hold even its header.
     ///
-    /// A record the writer refuses ends the reply — it is full — **unless the reply is empty**:
+    /// A record the writer refuses ends the reply (it is full) **unless the reply is empty**:
     /// then that record could never be written, and stopping at it would stop every reader there.
-    /// [`Ring::push`] keeps nothing a reply cannot carry, so that is never reached; it is passed
-    /// over rather than trusted to be.
+    /// [`Ring::push`] keeps nothing a reply cannot carry, but this passes over one anyway.
     pub fn fill_reply(&self, after: u64, max: u32, out: &mut [u8]) -> Option<usize> {
         let mut w = ReadReplyWriter::new(out, self.oldest())?;
         for r in self.after(after) {
@@ -122,8 +122,8 @@ impl Ring {
 }
 
 /// **The source a record is kept under**: its own claim when it makes one, and otherwise the
-/// channel's named-source label. **An empty claim is no claim** (PR #344 review), so it falls back
-/// to the label as none does; a claim that is not UTF-8 is `?`.
+/// channel's named-source label. **An empty claim is no claim**, so it falls back to the label
+/// as none does; a claim that is not UTF-8 is `?`.
 pub fn claimed_source(claim: Option<&[u8]>, channel: &Option<String>) -> Option<String> {
     match claim.filter(|c| !c.is_empty()) {
         Some(c) => Some(String::from(core::str::from_utf8(c).unwrap_or("?"))),
@@ -162,8 +162,7 @@ pub fn cut(s: &mut String, max: usize) {
     }
     s.truncate(end);
     s.push('…');
-    // **And give back what was cut** (PR #344 review): `truncate` keeps the allocation, so a
-    // message cut from 4 KB held 4 KB while the budget counted one.
+    // `truncate` keeps the allocation, which the ring's budget counts.
     s.shrink_to_fit();
 }
 
@@ -185,9 +184,7 @@ mod tests {
         }
     }
 
-    /// **Over budget, the oldest go, and the count stays exact**: after thousands of kilobyte
-    /// records the ring holds what fits, newest last, and `bytes` is the sum of what it holds —
-    /// not a counter that drifted.
+    /// `bytes` stays the sum of what the ring holds, not a counter that drifted.
     #[test]
     fn the_oldest_go_when_the_budget_is_spent() {
         let mut r = Ring::new();
@@ -198,14 +195,12 @@ mod tests {
         let held: usize = r.after(0).map(Ring::cost).sum();
         assert_eq!(r.bytes, held);
         assert!(r.bytes <= RING_BUDGET);
-        // One more would not have fitted: it is full, not merely under.
         assert!(r.bytes + Ring::cost(&rec(0, &long)) > RING_BUDGET);
         assert_eq!(r.after(0).last().map(|r| r.sequence), Some(3000));
         let kept = r.after(0).count() as u64;
         assert_eq!(r.oldest(), 3000 - kept + 1);
     }
 
-    /// Read the whole ring as `log` does: from the start, a reply at a time, until one is empty.
     fn read_all(r: &Ring) -> alloc::vec::Vec<u64> {
         let (mut after, mut seen) = (0, alloc::vec::Vec::new());
         let mut out = alloc::vec![0u8; 3980];
@@ -222,10 +217,7 @@ mod tests {
         }
     }
 
-    /// **A record with an empty source does not stop a reader** (PR #344 review). It came through
-    /// `parse_append` as a present, empty source; kept that way, the reply writer refused it, every
-    /// `Read` stopped there, and `log` read 1 record of 50 and called it the end. Built here the way
-    /// the service builds it: an append encoded, parsed, its source claimed, and kept.
+    /// Built the way the service builds it: an append encoded, parsed, its source claimed, kept.
     #[test]
     fn an_empty_source_does_not_stop_a_reader() {
         use librsproto::log::{LEVEL_INFO, encode_append, parse_append};
@@ -247,14 +239,12 @@ mod tests {
         assert_eq!(read_all(&r), (1..=50).collect::<alloc::vec::Vec<u64>>());
         let sources: alloc::vec::Vec<_> = r.after(0).take(3).map(|x| x.source.clone()).collect();
         assert_eq!(sources, [label.clone(), label.clone(), Some(String::from("own"))]);
-        // And kept straight into the ring, with no claim to fall back from, it is none.
         let mut empty = rec(51, "m");
         empty.source = Some(String::new());
         r.push(empty);
         assert_eq!(r.after(50).next().map(|x| x.source.clone()), Some(None));
         assert_eq!(read_all(&r).last(), Some(&51));
-        // **And were one kept all the same**, around `push`, a reply that cannot write it passes it
-        // over rather than stopping there: the records after it are still read.
+        // Kept around `push`, a reply that cannot write it passes it over.
         let mut unservable = rec(52, "m");
         unservable.source = Some(String::new());
         r.buf.push_back(unservable);
@@ -263,8 +253,6 @@ mod tests {
         assert!(!seen.contains(&52) && seen.last() == Some(&53), "{seen:?}");
     }
 
-    /// **A cut message gives back what was cut** (PR #344 review): the budget counts what a record
-    /// has allocated, and a message cut from 3.9 KB held all of it while the count said 1 KB.
     #[test]
     fn a_cut_message_gives_back_what_was_cut() {
         let mut s = String::with_capacity(3900);
@@ -278,8 +266,6 @@ mod tests {
         assert!(r.bytes <= RECORD_OVERHEAD + "view-broker".len() + MESSAGE_KEPT, "{}", r.bytes);
     }
 
-    /// **`after` is the records past a sequence**, at each edge: before the oldest, at it, inside,
-    /// at the newest, and past it.
     #[test]
     fn after_finds_the_records_past_a_sequence() {
         let mut r = Ring::new();
@@ -296,14 +282,12 @@ mod tests {
         assert_eq!(r.oldest(), 3);
     }
 
-    /// **A long message is cut on a character boundary and says so**; one at the limit is not.
-    /// The source is cut the same way, at [`NAME_MAX`].
     #[test]
     fn what_is_kept_is_cut_on_a_character_boundary() {
         let mut r = Ring::new();
         let exact = "y".repeat(MESSAGE_KEPT);
         r.push(rec(1, &exact));
-        // A two-byte character straddling the cut: the cut steps back rather than splitting it.
+        // A two-byte character straddles the cut.
         let straddling = format!("{}é{}", "z".repeat(MESSAGE_KEPT - 4), "z".repeat(10));
         let mut long_source = rec(2, &straddling);
         long_source.source = Some("s".repeat(NAME_MAX + 1));
