@@ -3,8 +3,6 @@
 
 use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
 
-// --- Hello (version negotiation) --------------------------------------------
-
 /// `HelloRequest` wire length.
 pub const HELLO_REQUEST_LEN: usize = 8;
 /// `HelloReply` wire length.
@@ -13,8 +11,11 @@ pub const HELLO_REPLY_LEN: usize = 10;
 /// A parsed `HelloRequest` (the client's acceptable version range).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HelloRequest {
+    /// Lowest protocol version the client accepts.
     pub client_min_version: u16,
+    /// Highest protocol version the client accepts.
     pub client_max_version: u16,
+    /// Reserved flags.
     pub flags: u32,
 }
 
@@ -44,8 +45,11 @@ pub fn parse_hello_request(body: &[u8]) -> Option<HelloRequest> {
 /// A parsed `HelloReply` (the agreed version + the server's capabilities).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HelloReply {
+    /// The version the server chose.
     pub agreed_version: u16,
+    /// The server's capability bits.
     pub server_caps: u32,
+    /// Reserved flags.
     pub server_flags: u32,
 }
 
@@ -68,8 +72,6 @@ pub fn parse_hello_reply(body: &[u8]) -> Option<HelloReply> {
     Some(HelloReply { agreed_version: get_u16(body, 0), server_caps: get_u32(body, 2), server_flags: get_u32(body, 6) })
 }
 
-// --- Ping (liveness) --------------------------------------------------------
-
 /// Ping request/reply body length (an opaque nonce).
 pub const PING_LEN: usize = 8;
 
@@ -90,35 +92,27 @@ pub fn parse_ping(body: &[u8]) -> Option<u64> {
     Some(get_u64(body, 0))
 }
 
-// --- A filesystem server's setup message ---------------------------------------
-
 /// [`fs_setup`] flag: serve the filesystem **read-only** — refuse every mutation with
-/// `NoAccess`, mark every file resolved read-only, and never write the superblock
-/// (administration Part C.3).
+/// `NoAccess`, mark every file resolved read-only, and never write the superblock.
 pub const FS_SETUP_READ_ONLY: u8 = 1 << 0;
 
 /// The payload of the **setup message** a supervisor sends a filesystem server on its control
 /// channel, transferring the block device in `handles[0]`: one flags byte ([`FS_SETUP_READ_ONLY`]).
-/// Not rsproto-framed — it precedes everything else on the channel, and carries only this.
-/// Returns its length.
+/// Not rsproto-framed: it precedes everything else on the channel. Returns its length.
 pub fn fs_setup(out: &mut [u8], flags: u8) -> Option<usize> {
     *out.first_mut()? = flags;
     Some(1)
 }
 
-/// The flags of a setup message's payload. **An empty payload is `0` — writable**, which is
-/// what every setup message said before the flags existed.
+/// The flags of a setup message's payload; **an empty payload is `0`, writable**.
 pub fn parse_fs_setup(payload: &[u8]) -> u8 {
     payload.first().copied().unwrap_or(0)
 }
 
-// --- Ready (startup signal on the control channel) --------------------------
-
 /// Fixed prefix of a `ReadyMessage` (before the server name).
 pub const READY_PREFIX_LEN: usize = 4;
 
-/// Write a `ReadyMessage` body (`server_name` is informational; the endpoint
-/// handle rides in `IpcMsg.handles[0]`); returns its length.
+/// Write a `ReadyMessage` body (`server_name` is informational; the endpoint is `handles[0]`).
 pub fn ready(out: &mut [u8], server_name: &[u8]) -> Option<usize> {
     if server_name.len() > u16::MAX as usize {
         return None;
@@ -187,7 +181,6 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = ready(&mut buf, b"fs-server-ext4").unwrap();
         assert_eq!(parse_ready(&buf[..n]), Some(&b"fs-server-ext4"[..]));
-        // Empty name is valid.
         let n = ready(&mut buf, b"").unwrap();
         assert_eq!(parse_ready(&buf[..n]), Some(&b""[..]));
     }

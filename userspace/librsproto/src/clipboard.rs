@@ -1,57 +1,38 @@
 //! `Clipboard` — the kill ring, served at `/dev/clipboard`.
 //!
-//! **A store, not a broker.** Wayland's model is that the copier keeps the data and the
-//! compositor arranges a transfer when somebody pastes, so nothing is ever held by a third
-//! party. It was considered and rejected for one reason: the clipboard then dies with the
-//! application you copied from, which is the behaviour people install clipboard managers to
-//! escape. Here, copy from the editor, close it, paste. See `display-arm-plan.md` M12
-//! decision 1.
+//! **A store, not a broker.** The clipboard outlives the application you copied from: copy
+//! from the editor, close it, paste.
 //!
-//! **The binding is the authority.** A read succeeds for anyone holding this endpoint, whenever
-//! they like — consistent with every other resource in this system, and a real capability story
-//! rather than an ambient one: a namespace without `/dev/clipboard` has no clipboard, and a
-//! `SYS_HANDLE_RESTRICT` to `RIGHT_SEND` alone is a profile that can copy and not read. Focus
-//! gating is what modern desktops do and is deferred; its trigger is written down in
-//! `docs/rationale/deferred-decisions.md`.
+//! **The binding is the authority.** A read succeeds for anyone holding this endpoint: a
+//! namespace without `/dev/clipboard` has no clipboard, and a `SYS_HANDLE_RESTRICT` to
+//! `RIGHT_SEND` alone is a profile that can copy and not read. Focus gating is deferred
+//! (`docs/rationale/deferred-decisions.md`).
 //!
-//! ## The ring, and the two halves of it
+//! ## The ring
 //!
-//! The server keeps the last [`CLIP_RING`] entries, most recent first, and a [`Copy`](OP_CLIP_COPY)
-//! pushes. What makes this a *kill ring* rather than a stack of slots is the division:
+//! The server keeps the last [`CLIP_RING`] entries, most recent first, and a
+//! [`Copy`](OP_CLIP_COPY) pushes. **The ring is shared** by every holder of the endpoint;
+//! **the position in it is not**: the server answers by *index* and holds no per-client
+//! state, so applications cycling at once cannot fight over one cursor. An ordinary paste asks
+//! for index 0; cycling is a *continuation* of a paste (Emacs's `M-y` rule).
 //!
-//! - **The ring is shared.** Every holder of the endpoint sees the same entries in the same
-//!   order.
-//! - **The position in it is not.** "Paste the one before that" is a property of the editing
-//!   somebody is doing right now, so the server answers by *index* and holds no per-client
-//!   state. Two applications cycling at once cannot fight over one cursor, because there is no
-//!   cursor to fight over.
+//! ## Staleness
 //!
-//! An ordinary paste asks for index 0 and gets whatever was last copied, by anyone. Cycling is
-//! a *continuation* of a paste — valid only immediately after one, replacing what was just
-//! inserted, and ended by any other action — which is Emacs's `M-y` rule and is what makes a
-//! stale position unreachable: the position exists only inside one uninterrupted gesture.
-//!
-//! ## Where it can still go stale, and the `u64` that says so
-//!
-//! A pipeline can push while somebody is mid-cycle ([`clip`](../../coreutils/src/bin/clip.rs) is
-//! exactly that), so "uninterrupted gesture" is not enough on its own. Every entry comes back
-//! with the ring's [`serial`](ClipEntry::serial), and a cycle carries the serial it last saw in
-//! [`ClipPaste::expect`]. If the ring has moved the server refuses — [`CLIP_ERR_STALE`] — and
-//! the client starts again from the newest. One `u64`, and it turns a silent wrong paste into a
-//! visible restart.
+//! A pipeline can push mid-cycle, so every entry comes back with the ring's
+//! [`serial`](ClipEntry::serial), and a cycle carries the serial it last saw in
+//! [`ClipPaste::expect`]. If the ring has moved the server refuses with [`CLIP_ERR_STALE`] and
+//! the client restarts from the newest.
 //!
 //! ## What the server must never log
 //!
-//! Counts, serials, lengths and kinds — never bytes. A clipboard holds what a person copied,
-//! which on any real machine eventually includes a password, and the serial console is a log
-//! file. This is the same rule the compositor follows for keystrokes.
+//! Counts, serials, lengths and kinds — never bytes: a clipboard eventually holds a password,
+//! and the serial console is a log file.
 
 use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
 
 /// `Clipboard::Copy` — push an entry onto the ring. Body: [`ClipEntry`] without its serial.
 ///
-/// The reply is the ring's new [`serial`](ClipEntry::serial) as eight little-endian bytes, so a
-/// client that copies and then cycles has a serial without a second round trip.
+/// The reply is the ring's new [`serial`](ClipEntry::serial) as eight little-endian bytes.
 pub const OP_CLIP_COPY: u16 = 0x0D00;
 
 /// `Clipboard::Paste` — read one entry by index. Body: [`ClipPaste`].
@@ -62,20 +43,14 @@ pub const OP_CLIP_PASTE: u16 = 0x0D01;
 
 /// `Clipboard::List` — describe the ring without reading it. Reply: [`write_list`]'s body.
 ///
-/// **Metadata only, and that is a size decision rather than a privacy one**: anybody who can
-/// send this can send [`Paste`](OP_CLIP_PASTE) for every index, so withholding the bytes
-/// protects nothing. What it buys is a reply that fits one message — [`CLIP_RING`] entries of
-/// [`MAX_CLIP_BYTES`] each do not.
+/// **Metadata only, as a size decision rather than a privacy one** (anyone who can send this
+/// can `Paste` every index): [`CLIP_RING`] entries of [`MAX_CLIP_BYTES`] do not fit one message.
 pub const OP_CLIP_LIST: u16 = 0x0D02;
 
 /// `server_code`: the ring moved under a cycle — [`ClipPaste::expect`] is not its serial.
 ///
-/// **A `server_code`, not a new `KError`**, and that is this system's documented rule rather
-/// than a shortcut: *"a `KError` is for a condition more than one component can produce and any
-/// client can act on"* (`docs/reference/error-codes.md`). One server produces this. The `kerror`
-/// beside it is `InvalidArgument` — the `expect` argument is out of date — and the server code
-/// is what keeps that from collapsing into "your request was malformed", which is the
-/// diagnosis-of-the-operand mistake the same page exists to prevent.
+/// **A `server_code`, not a new `KError`** (`docs/reference/error-codes.md`): one server
+/// produces it. The `kerror` beside it is `InvalidArgument`.
 pub const CLIP_ERR_STALE: u32 = 1;
 
 /// `server_code`: the request body did not decode. Paired with `InvalidArgument`.
@@ -83,35 +58,21 @@ pub const CLIP_ERR_MALFORMED: u32 = 2;
 
 /// How many entries the ring keeps.
 ///
-/// Emacs's default kill ring is 60 and holds lines; this holds up to [`MAX_CLIP_BYTES`] per
-/// entry, so the bound that matters is the product: 16 × ~4 KiB is 64 KiB of server memory at
-/// worst, which is the same order as one small window's buffer. Deep enough that "the one before
-/// that" reaches back through a working session, bounded enough that a program pushing in a loop
-/// costs a fixed amount.
+/// 16 × ~4 KiB is 64 KiB of server memory at worst.
 pub const CLIP_RING: usize = 16;
 
 /// `text/plain`, UTF-8. The only kind that exists today.
 ///
-/// **The tag exists so a second kind is not a second clipboard.** A file path (the browser's cut
-/// and paste) or an image is a value in this space, sharing one ring and one authority; a
-/// private buffer inside an application would be a clipboard nobody could inspect or attenuate.
-/// No other value is defined here, because a constant nothing sends is scaffolding.
+/// The tag exists so a second kind is not a second clipboard.
 pub const CLIP_KIND_TEXT: u16 = 0;
 
 /// A list of absolute paths, and what was meant to happen to them.
 ///
-/// **A second kind rather than a second clipboard**, which is what the tag above exists for: the
-/// browser's cut and paste share one ring and one authority with text. The file-clipboard
-/// deferral named the three things this needed — the kind, the menu, and a paste that reads one —
-/// and M14 Part D built all three, which is what closed it.
-///
 /// The bytes are UTF-8 and newline-separated: a **verb** line, then one absolute path per line.
 /// The verb is `cut` or `copy`. See [`encode_paths`] and [`Paths`].
 ///
-/// **The verb is on the wire and not in the browser**, because a cut in one window and a paste in
-/// another is the same gesture as within one — a browser remembering its own pending cut would
-/// move files for itself and copy them for anybody else, which is the kind of difference nobody
-/// can see until it has happened.
+/// **The verb is on the wire, not in the browser**, so a cut in one window and a paste in
+/// another is the same gesture.
 pub const CLIP_KIND_PATH: u16 = 1;
 
 /// What a [`CLIP_KIND_PATH`] entry says should happen to its paths.
@@ -134,14 +95,9 @@ impl PathVerb {
 }
 
 /// Write `paths` into `out` as a [`CLIP_KIND_PATH`] payload; returns how many bytes were used.
-///
-/// **Into a caller's buffer, because this crate has no allocator** — the same shape every other
-/// codec here takes. `None` if the payload would not fit, rather than a truncated list: half a
-/// path is a path to somewhere else.
-///
-/// **Absolute paths are a caller's rule, not this codec's** — a relative one would be read against
-/// whatever directory the *reader* is in, which is a different file. The browser resolves before
-/// pushing; this does not validate, for the reason the text codec does not validate UTF-8.
+/// `None` if the payload would not fit, rather than a truncated list: half a path is a path to
+/// somewhere else. **Absolute paths are the caller's rule**: a relative one would be read
+/// against the *reader's* directory.
 pub fn encode_paths(verb: PathVerb, paths: &[&str], out: &mut [u8]) -> Option<usize> {
     let word = verb.word().as_bytes();
     let mut n = word.len() + paths.iter().map(|p| 1 + p.len()).sum::<usize>();
@@ -171,8 +127,7 @@ pub struct Paths<'a> {
 impl<'a> Paths<'a> {
     /// Read a payload, or `None` if the verb is not one of the two.
     ///
-    /// **An unknown verb is not a copy.** Guessing would make a future third verb — a link, say —
-    /// silently duplicate files on every browser that predates it.
+    /// An unknown verb is not a copy: a future third verb would silently duplicate files.
     pub fn read(bytes: &'a [u8]) -> Option<Paths<'a>> {
         let text = core::str::from_utf8(bytes).ok()?;
         let (head, rest) = match text.split_once('\n') {
@@ -193,8 +148,7 @@ impl<'a> Paths<'a> {
     }
 }
 
-/// Wire size of an entry's fixed head: `serial` (8), `kind` (2), `len` (4), and two bytes of
-/// padding so the bytes start 8-aligned.
+/// Wire size of an entry's fixed head: `serial` (8), `kind` (2), `len` (4), 2 bytes padding.
 pub const CLIP_ENTRY_HEAD: usize = 16;
 
 /// Wire size of [`ClipPaste`].
@@ -202,48 +156,32 @@ pub const CLIP_PASTE_LEN: usize = 16;
 
 /// The largest entry the ring will take, in bytes.
 ///
-/// **Derived, not chosen**, and spelled the same way at both ends the way [`MAX_EVENT_BODY`]
-/// is: one IPC payload, less the rsproto envelope, less the entry's own head. About two screens
-/// of terminal text.
+/// **Derived, not chosen**: one IPC payload less the rsproto envelope and the entry head.
 ///
-/// **Chunking is expected rather than hypothetical** — M12 decision 5. The maintainer's own
-/// judgement was "we can start with 1, but we may need to end up at 2", so the trigger is
-/// written as one: `TODO(clipboard-chunking)`, fired by the first thing somebody cannot copy. A
-/// shared memory object was the third option and is not taken, because M10 rejected handle
-/// transfer for drops — a refused handle has no clean owner — and this would inherit that
-/// question.
+/// **Chunking is expected**: `TODO(clipboard-chunking)`, fired by the first thing somebody
+/// cannot copy.
 ///
 /// [`MAX_EVENT_BODY`]: crate::surface::MAX_EVENT_BODY
 pub const MAX_CLIP_BYTES: usize = crate::RS_MAX_PAYLOAD - crate::RS_HEADER_LEN - CLIP_ENTRY_HEAD;
 
 /// "Whatever the ring holds now" — the [`expect`](ClipPaste::expect) of an ordinary paste.
 ///
-/// Zero is never a real serial: the ring starts at 1 and every push increments, so a client that
-/// has not seen one cannot accidentally spell a serial it might match.
+/// Zero is never a real serial: the ring starts at 1 and every push increments.
 pub const CLIP_ANY_SERIAL: u64 = 0;
 
 /// One entry, on the wire.
-///
-/// Borrowed rather than owned so the server can answer out of its ring and a client can send
-/// out of its buffer, neither allocating.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ClipEntry<'a> {
     /// The ring's serial **at the time this entry was read**, not the entry's own age.
-    ///
-    /// It answers "has anything been copied since I looked", which is the only question a
-    /// cycling client has. An identity per entry would answer a different one, and the client
-    /// would then have to track both.
     pub serial: u64,
     /// What kind of thing the bytes are — [`CLIP_KIND_TEXT`] today.
     pub kind: u16,
-    /// The bytes. UTF-8 for [`CLIP_KIND_TEXT`], **not validated here**: this codec's job is the
-    /// wire, and a server that rejected invalid UTF-8 would be diagnosing the operand.
+    /// The bytes. UTF-8 for [`CLIP_KIND_TEXT`], **not validated here**.
     pub bytes: &'a [u8],
 }
 
 impl<'a> ClipEntry<'a> {
-    /// Serialise into `out`; returns the length written, or `None` if it does not fit or the
-    /// payload is over [`MAX_CLIP_BYTES`].
+    /// Serialise into `out`; `None` if it does not fit or the payload is over [`MAX_CLIP_BYTES`].
     pub fn write(&self, out: &mut [u8]) -> Option<usize> {
         if self.bytes.len() > MAX_CLIP_BYTES {
             return None;
@@ -262,9 +200,7 @@ impl<'a> ClipEntry<'a> {
 
     /// Parse from `b`, borrowing its bytes.
     ///
-    /// **The declared length is checked against what arrived**, not trusted: a truncated
-    /// message would otherwise slice past the end, and the length is the one field a peer
-    /// controls entirely.
+    /// **The declared length is checked against what arrived**, not trusted.
     pub fn read(b: &'a [u8]) -> Option<ClipEntry<'a>> {
         if b.len() < CLIP_ENTRY_HEAD {
             return None;
@@ -289,9 +225,8 @@ pub struct ClipPaste {
     pub index: u32,
     /// The serial the caller is continuing from, or [`CLIP_ANY_SERIAL`] for an ordinary paste.
     ///
-    /// A cycling client passes the serial its previous paste returned. If the ring has moved
-    /// the server refuses rather than answering an index that now means something else — the
-    /// whole point being that a wrong paste is silent and a refusal is not.
+    /// A cycling client passes the serial its previous paste returned; if the ring has moved
+    /// the server refuses rather than answering an index that now means something else.
     pub expect: u64,
 }
 
@@ -361,9 +296,8 @@ pub struct ClipList<'a> {
 impl<'a> ClipList<'a> {
     /// Parse from `b`.
     ///
-    /// **The declared count is checked against the bytes that arrived**, for [`ClipEntry::read`]'s
-    /// reason: it is a peer-controlled length, and an iterator built on the claim rather than the
-    /// arrival would read past the end.
+    /// **The declared count is checked against the bytes that arrived** (a peer-controlled
+    /// length).
     pub fn read(b: &'a [u8]) -> Option<ClipList<'a>> {
         if b.len() < CLIP_LIST_HEAD {
             return None;
@@ -389,13 +323,10 @@ impl<'a> ClipList<'a> {
     }
 }
 
-// --- The client half --------------------------------------------------------
-
 /// A connection to the clipboard server — the `/dev/clipboard` session.
 ///
-/// Shaped like [`Desktop`](crate::desktop::Desktop) deliberately: same `connect`, same
-/// `from_endpoint`, same explicit `close`, and the same borrowed message buffer, so a reader who
-/// knows one knows this.
+/// Shaped like [`Desktop`](crate::desktop::Desktop): `connect`, `from_endpoint`, explicit
+/// `close`, borrowed buffer.
 #[cfg(feature = "io")]
 pub struct Clipboard<'a> {
     endpoint: u64,
@@ -405,40 +336,30 @@ pub struct Clipboard<'a> {
 
 /// What a `/dev/clipboard` request can fail with.
 ///
-/// Three cases and not one, for [`DesktopError`](crate::desktop::DesktopError)'s reason: a dead
-/// channel and a refusal have nothing in common except that neither produced an answer, and
-/// collapsing them makes a client diagnose the operand for a fault that was never about it.
+/// Three cases and not one, for [`DesktopError`](crate::desktop::DesktopError)'s reason.
 #[cfg(feature = "io")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClipError {
-    /// A syscall failed, or the reply did not decode. The payload is the syscall's negative
-    /// return where there was one.
+    /// A syscall failed or the reply did not decode; the payload is the negative return, if any.
     Transport(i32),
     /// The request did not fit the message buffer, or the payload is over [`MAX_CLIP_BYTES`].
     Protocol,
     /// The server refused: its `KError` (or `None` if the error reply carried no body) and its
     /// `server_code`.
     ///
-    /// **Both halves, because one of them cannot be read alone.** Two refusals here share
-    /// `InvalidArgument` and mean opposite things to a client — a stale cycle is *retry from the
-    /// newest*, a malformed body is *a bug in this program*. Carrying only the `kerror` would
-    /// make them one case at exactly the point a client has to tell them apart.
+    /// Two refusals share `InvalidArgument` and mean opposite things: a stale cycle is *retry*,
+    /// a malformed body *a bug*.
     Refused { kerror: Option<i32>, server_code: u32 },
 }
 
 #[cfg(feature = "io")]
 impl ClipError {
     /// Whether this is the ring having moved under a cycle — see [`ClipPaste::expect`].
-    ///
-    /// A named question rather than a comparison at each call site: every client that cycles has
-    /// to ask it, and each would otherwise spell the `kerror`-plus-`server_code` pair for itself
-    /// — which is how one of them ends up testing only the half that does not discriminate.
     pub fn is_stale(&self) -> bool {
         matches!(self, ClipError::Refused { server_code, .. } if *server_code == CLIP_ERR_STALE)
     }
 
-    /// Whether this is "there is no entry at that index" — an empty ring, or a cycle that has
-    /// walked off the end of it.
+    /// Whether this is "no entry at that index": an empty ring, or a cycle that walked off it.
     pub fn is_empty(&self) -> bool {
         matches!(
             self,
@@ -503,9 +424,7 @@ impl<'a> Clipboard<'a> {
         let payload = &self.buf[off..off + len];
         let msg = crate::decode(payload).map_err(|_| ClipError::Transport(0))?;
         if msg.flags & crate::RS_FLAG_ERROR != 0 {
-            // **Parsed as an `ErrorBody`, not read as four bytes.** `Desktop` takes the shortcut
-            // because it has nothing to do with the finer code; here the finer code *is* the
-            // answer, so the body goes through the codec that knows its layout.
+            // Parsed as an `ErrorBody`: here the finer code is the answer.
             let e = crate::error::parse_error(msg.body);
             return Err(ClipError::Refused {
                 kerror: e.map(|e| e.kerror),
@@ -535,10 +454,8 @@ impl<'a> Clipboard<'a> {
 
     /// Read entry `index`, copying its bytes into `out`.
     ///
-    /// Returns `(serial, kind, len)`. `len` is the entry's **whole** length even when `out` was
-    /// too small to hold it — a caller that silently pasted a truncated entry would be the
-    /// quietest possible way to corrupt somebody's text, so the number to compare against `out`
-    /// comes back rather than being inferred.
+    /// `len` is the entry's **whole** length even when `out` was too small to hold it, so a
+    /// caller cannot silently paste a truncated entry.
     pub fn paste(&mut self, index: u32, expect: u64, out: &mut [u8]) -> Result<(u64, u16, usize), ClipError> {
         let mut body = [0u8; CLIP_PASTE_LEN];
         let n = ClipPaste { index, expect }.write(&mut body).ok_or(ClipError::Protocol)?;
@@ -573,9 +490,6 @@ impl<'a> Clipboard<'a> {
 #[cfg(test)]
 mod tests {
 
-    // --- the path kind (M14 Part D) ------------------------------------------
-
-    /// A list of paths survives the round trip, verb and all.
     #[test]
     fn paths_round_trip() {
         let mut buf = [0u8; 256];
@@ -588,30 +502,19 @@ mod tests {
         assert_eq!(seen.next(), None, "and nothing after them");
     }
 
-    /// **Bytes a correct writer would never produce**, which is the half a round trip cannot
-    /// reach: it only ever tests the encoder's own output.
+    /// Bytes a correct writer would never produce: the half a round trip cannot reach.
     #[test]
     fn a_reader_refuses_what_it_should() {
-        // An unknown verb is not a copy. Guessing would make a future third verb — a link, say —
-        // silently duplicate files on every browser that predates it.
         assert!(Paths::read(b"link\n/home/a").is_none());
         assert!(Paths::read(b"\n/home/a").is_none(), "an empty verb is not one either");
         assert!(Paths::read(b"copied\n/home/a").is_none(), "nor a prefix of one");
-        // A verb with no paths is legal and empty — pushing nothing is not a malformed entry.
         let only = Paths::read(b"copy").expect("a bare verb reads");
         assert_eq!(only.iter().count(), 0);
-        // Blank lines are skipped rather than yielded as an empty path, which would name the
-        // reader's own directory.
         let padded = Paths::read(b"copy\n/home/a\n\n/home/b\n").expect("reads");
         assert_eq!(padded.iter().count(), 2);
-        // Not UTF-8 at all.
         assert!(Paths::read(&[b'c', b'o', b'p', b'y', b'\n', 0xff, 0xfe]).is_none());
     }
 
-    /// A payload that will not fit is refused rather than truncated.
-    ///
-    /// **Half a path is a path to somewhere else**, which is the one failure here that could
-    /// delete the wrong file.
     #[test]
     fn a_payload_that_does_not_fit_is_refused() {
         let mut small = [0u8; 8];
@@ -635,8 +538,6 @@ mod tests {
 
     #[test]
     fn an_empty_entry_is_a_legal_entry() {
-        // Copying an empty selection is a thing a person can do, and a codec that refused it
-        // would make the application decide what to do about a case the ring can hold fine.
         let mut buf = [0u8; 32];
         let n = ClipEntry { serial: 1, kind: CLIP_KIND_TEXT, bytes: b"" }.write(&mut buf).unwrap();
         assert_eq!(n, CLIP_ENTRY_HEAD);
@@ -645,16 +546,7 @@ mod tests {
 
     #[test]
     fn a_declared_length_past_the_message_is_refused() {
-        // **The peer controls this field.** A reader that trusted it would slice past the end
-        // of what arrived — the whole class the `read` bound exists for. Handing the reader
-        // bytes a correct writer would never produce is the only way to test it: a round-trip
-        // test cannot, because the writer and the reader would agree about the lie.
-        //
-        // **The length has to be *inside* the cap**, or this tests the wrong half. `read`
-        // refuses on two conditions — over `MAX_CLIP_BYTES`, and past what arrived — and a
-        // stamped 4000 trips the first, so the arrival bound this test is named for was never
-        // reached and could be deleted with the suite still green (PR #271 review, blocking 2).
-        // 100 is a legal entry length and twenty bytes is not a hundred.
+        // The length stays inside the cap (100), so the arrival bound is the one tested.
         let mut buf = [0u8; CLIP_ENTRY_HEAD + 4];
         ClipEntry { serial: 1, kind: CLIP_KIND_TEXT, bytes: b"abcd" }.write(&mut buf).unwrap();
         put_u32(&mut buf, 10, 100);
@@ -664,11 +556,6 @@ mod tests {
 
     #[test]
     fn a_declared_length_over_the_cap_is_refused_too() {
-        // The other half, kept separate so neither can stand in for the other — **and the
-        // buffer really has to be long enough to hold what it claims**, or the arrival bound
-        // refuses it first and this tests nothing. The first version of this test used a
-        // twenty-byte buffer and passed with the cap check deleted; the control caught it,
-        // which is the same lesson the review had just delivered one test along.
         let mut buf = [0u8; CLIP_ENTRY_HEAD + MAX_CLIP_BYTES + 1];
         ClipEntry { serial: 1, kind: CLIP_KIND_TEXT, bytes: b"abcd" }.write(&mut buf).unwrap();
         put_u32(&mut buf, 10, (MAX_CLIP_BYTES + 1) as u32);
@@ -685,8 +572,6 @@ mod tests {
 
     #[test]
     fn the_cap_leaves_an_entry_inside_one_payload() {
-        // The derivation is the promise: an entry at the cap, wrapped in an envelope, fits the
-        // IPC payload with nothing left over to be wrong about.
         assert_eq!(CLIP_ENTRY_HEAD + MAX_CLIP_BYTES + crate::RS_HEADER_LEN, crate::RS_MAX_PAYLOAD);
     }
 
@@ -713,15 +598,12 @@ mod tests {
         }
         assert_eq!(got, rows);
 
-        // The same peer-controlled-length class as the entry's.
         put_u32(&mut buf, 8, 9);
         assert_eq!(ClipList::read(&buf[..n]), None);
     }
 
     #[test]
     fn the_any_serial_sentinel_is_not_a_serial_the_ring_can_reach() {
-        // The ring starts at 1 and only increments, so this is a fact about the server rather
-        // than a coincidence — asserted here because the *protocol* is what promises it.
         assert_eq!(CLIP_ANY_SERIAL, 0);
     }
 }

@@ -1,6 +1,5 @@
 //! `Views` (`op = 0x0Exx`) — the view broker, served at `/svc/views` and, per session, at
-//! `/dev/views`. See `docs/spec/rsproto-views-ops.md` and `docs/planning/administration.md`
-//! § Part A.
+//! `/dev/views`. See `docs/spec/rsproto-views-ops.md`.
 //!
 //! **Two kinds of channel, told apart by the path they were resolved through.** A login
 //! supervisor resolves `/svc/views/session` and gets a *supervisor* channel, on which it opens a
@@ -15,13 +14,10 @@
 //! or `Denied` back. The client reads the password itself, on the terminal its shell handed it;
 //! the broker never touches a terminal. When the program exits the broker sends `Exited`,
 //! unsolicited.
-//!
-//! Bodies are little-endian and byte-serialised into a caller buffer, like every category here.
 
 use crate::{TTY_TOKEN_LEN, get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
 
-/// Supervisor → broker: open a session for the principal in the body (its bytes). The reply
-/// body is the new session's id, a `u64`. Ids increase and are never reused within a boot.
+/// Supervisor → broker: open a session for the principal in the body. Reply: the id (`u64`).
 pub const OP_VIEWS_OPEN_SESSION: u16 = 0x0E00;
 /// Supervisor → broker: the session whose id is the body (a `u64`) has ended. Empty reply.
 pub const OP_VIEWS_CLOSE_SESSION: u16 = 0x0E01;
@@ -32,8 +28,7 @@ pub const OP_VIEWS_REQUEST: u16 = 0x0E02;
 pub const OP_VIEWS_PASSWORD: u16 = 0x0E03;
 /// Broker → client, unsolicited, `request_id` 0: the program exited. Body [`build_exited`].
 pub const OP_VIEWS_EXITED: u16 = 0x0E04;
-/// Client → broker: ask the program to stop — the shell asked the client to. Empty body and
-/// reply. A request, like every stop in this system: the program decides.
+/// Client → broker: ask the program to stop (a request: the program decides). Empty body and reply.
 pub const OP_VIEWS_STOP: u16 = 0x0E05;
 /// Client → broker: which views may this session's principal use? Reply: rows, [`push_row`].
 pub const OP_VIEWS_LIST: u16 = 0x0E06;
@@ -42,24 +37,22 @@ pub const OP_VIEWS_LIST: u16 = 0x0E06;
 /// file installs nothing.
 pub const OP_VIEWS_CHECK: u16 = 0x0E07;
 /// Policy endpoint → broker: the policy's text. Body: empty. Reply: the text, at most
-/// [`POLICY_MAX`] bytes (administration Part D.2). Asked on a channel resolved through the `views`
-/// grant's `/dev/policy`, never on a client channel: the policy is not every session's to read.
+/// [`POLICY_MAX`] bytes. Asked only on a channel resolved through the `views` grant's
+/// `/dev/policy`.
 pub const OP_VIEWS_SHOW: u16 = 0x0E08;
 /// Policy endpoint → broker: install this text as the policy. Body: the text. Reply: an
 /// [`Outcome`] — `Started` meaning installed, `Denied` with the reason otherwise: it does not read,
 /// or no account that exists could administer under it.
 pub const OP_VIEWS_INSTALL: u16 = 0x0E09;
-/// Client → broker: every account (administration Part D.3). Body: empty. Reply: rows,
-/// [`push_account`] — name, home, open sessions, and whether it could administer. Anyone may ask,
-/// as a Unix `passwd` file is anyone's to read.
+/// Client → broker: every account. Body: empty. Reply: rows,
+/// [`push_account`] — name, home, open sessions, and whether it could administer. Anyone may ask.
 pub const OP_VIEWS_ACCOUNTS: u16 = 0x0E0A;
 /// Client → broker: change this session's principal's own password. Body
-/// [`build_password_change`]: the current password, then the new one. Reply: an [`Outcome`]. The
-/// current password is checked under the session's delay, as `Password` is.
+/// [`build_password_change`]: the current password, then the new one. Reply: an [`Outcome`].
 pub const OP_VIEWS_CHANGE_PASSWORD: u16 = 0x0E0B;
 /// Accounts endpoint → broker: add an account. Body: a name and a password, laid out as
-/// `Auth::Add`'s ([`crate::auth::build_account_request`]). Reply: an [`Outcome`]. Asked on a
-/// channel resolved through the `accounts` grant's `/dev/accounts`, never on a client channel.
+/// `Auth::Add`'s. Reply: an [`Outcome`]. Asked only on a channel resolved through the
+/// `accounts` grant's `/dev/accounts`.
 pub const OP_VIEWS_ADD_ACCOUNT: u16 = 0x0E0C;
 /// Accounts endpoint → broker: remove an account. Body [`build_remove_account`]. Reply: an
 /// [`Outcome`].
@@ -69,18 +62,15 @@ pub const OP_VIEWS_REMOVE_ACCOUNT: u16 = 0x0E0D;
 pub const OP_VIEWS_SET_PASSWORD: u16 = 0x0E0E;
 /// Client → broker: **what would a `Request` for this program in this view be answered?** Body
 /// [`build_decide`]. Reply: an [`Outcome`] — `Started` meaning it would start with no password,
-/// `NeedPassword`, or `Denied` with the policy's reason. It runs nothing and takes no handle: it
-/// tells a session what its `List` already does, from the broker's own rule rather than a
-/// client's reading of the rows (administration Part F.3, PR #346 review). The desktop asks it
-/// before closing a window for a Restart or a Shut down.
+/// `NeedPassword`, or `Denied` with the reason. It runs nothing and takes no handle
+/// (`rsproto-views-ops.md` § `Decide`).
 pub const OP_VIEWS_DECIDE: u16 = 0x0E0F;
-/// Client → broker: **forget every password this session has remembered** (`with --forget`, the
-/// laptop polish's Part A). Empty body, empty reply. Every terminal's window goes, so the next
-/// request whose rule asks for a password asks.
+/// Client → broker: **forget every password this session has remembered** (`with --forget`).
+/// Empty body, empty reply: every terminal's remembered password goes (`rsproto-views-ops.md`
+/// § `Forget`).
 pub const OP_VIEWS_FORGET: u16 = 0x0E10;
 
-/// The longest policy `Show` answers with and `Install` takes: one message's body, with room for
-/// its header.
+/// The longest policy `Show` answers with and `Install` takes: one message's body less its header.
 pub const POLICY_MAX: usize = 3584;
 
 /// The broker's answer to a `Request`, a `Password` or a `Check`.
@@ -120,8 +110,7 @@ pub fn build_outcome(out: &mut [u8], outcome: Outcome, reason: &[u8]) -> Option<
     Some(OUTCOME_PREFIX_LEN + reason.len())
 }
 
-/// Parse an outcome body into the outcome and its reason. `None` for an unknown kind, a retry
-/// byte that is neither 0 nor 1, or a reason length that runs past the body.
+/// Parse an outcome body; `None` for an unknown kind, a retry byte not 0 or 1, or a bad length.
 pub fn parse_outcome(body: &[u8]) -> Option<(Outcome, &[u8])> {
     if body.len() < OUTCOME_PREFIX_LEN || body[1] > 1 {
         return None;
@@ -136,8 +125,6 @@ pub fn parse_outcome(body: &[u8]) -> Option<(Outcome, &[u8])> {
     };
     Some((outcome, reason))
 }
-
-// --- Request -----------------------------------------------------------------
 
 /// `handles` bit: a `stdin` follows the namespace.
 pub const REQ_STDIN: u8 = 1 << 0;
@@ -163,10 +150,8 @@ pub struct ViewRequest<'a> {
     args: &'a [u8],
     /// The caller's environment, a TSM1 record, opaque here. The broker passes it on.
     pub env: &'a [u8],
-    /// **A `Tty::Token` from the caller's terminal**, if it sent one (the laptop polish's Part
-    /// A). The broker redeems it with the terminal server to learn which terminal the request came
-    /// from — never from the caller — and a password remembered for that terminal can skip the
-    /// prompt.
+    /// **A `Tty::Token` from the caller's terminal**, if it sent one (`rsproto-views-ops.md` §
+    /// `Request`).
     pub token: Option<[u8; TTY_TOKEN_LEN]>,
 }
 
@@ -251,8 +236,8 @@ pub fn build_request(
     put_u32(out, at, env.len() as u32);
     out[at + 4..at + 4 + env.len()].copy_from_slice(env);
     at += 4 + env.len();
-    // **The token is the last field, and absent means absent**: a request with none is the bytes
-    // it was before tokens existed, so a caller that sends none is unchanged.
+    // The token is the last field, and absent means absent: a request with none is the bytes
+    // it was before tokens existed.
     if let Some(t) = token {
         let end = at + 1 + TTY_TOKEN_LEN;
         if out.len() < end {
@@ -306,10 +291,7 @@ pub fn parse_request(body: &[u8]) -> Option<ViewRequest<'_>> {
     Some(ViewRequest { handles, view, program, argc, args, env, token })
 }
 
-// --- Sessions ----------------------------------------------------------------
-
-/// Write a session id — `OpenSession`'s reply, `CloseSession`'s request. Returns 8, or `None`
-/// if `out` is too small.
+/// Write a session id (`OpenSession`'s reply, `CloseSession`'s request); returns 8, or `None`.
 pub fn build_session_id(out: &mut [u8], id: u64) -> Option<usize> {
     if out.len() < 8 {
         return None;
@@ -322,8 +304,6 @@ pub fn build_session_id(out: &mut [u8], id: u64) -> Option<usize> {
 pub fn parse_session_id(body: &[u8]) -> Option<u64> {
     (body.len() == 8).then(|| get_u64(body, 0))
 }
-
-// --- Exited ------------------------------------------------------------------
 
 /// Length of an `Exited` body: the code, and whether the program crashed rather than exiting.
 pub const EXITED_LEN: usize = 5;
@@ -338,16 +318,13 @@ pub fn build_exited(out: &mut [u8], code: i32, crashed: bool) -> Option<usize> {
     Some(EXITED_LEN)
 }
 
-/// Parse an `Exited` body into `(code, crashed)`. `None` unless it is exactly [`EXITED_LEN`]
-/// bytes with a crashed byte of 0 or 1.
+/// Parse an `Exited` body into `(code, crashed)`; `None` unless [`EXITED_LEN`] bytes, flag 0 or 1.
 pub fn parse_exited(body: &[u8]) -> Option<(i32, bool)> {
     if body.len() != EXITED_LEN || body[4] > 1 {
         return None;
     }
     Some((get_u32(body, 0) as i32, body[4] == 1))
 }
-
-// --- List --------------------------------------------------------------------
 
 /// One row of `List`'s reply: a view this principal may use, the programs it may run there,
 /// and whether a password is asked for.
@@ -384,8 +361,7 @@ pub fn push_row(out: &mut [u8], at: &mut usize, row: &Row<'_>) -> Option<()> {
     Some(())
 }
 
-/// Parse a `List` reply into its rows. `None` if a row runs past the body, a password byte is
-/// neither 0 nor 1, or bytes are left over.
+/// Parse a `List` reply; `None` if a row runs past the body, a bool byte is bad or bytes remain.
 pub fn parse_rows(body: &[u8], mut each: impl FnMut(Row<'_>)) -> Option<usize> {
     let n = get_u16(body.get(..2)?, 0) as usize;
     let mut at = 2usize;
@@ -404,8 +380,6 @@ pub fn parse_rows(body: &[u8], mut each: impl FnMut(Row<'_>)) -> Option<usize> {
     }
     (at == body.len()).then_some(n)
 }
-
-// --- Accounts (administration Part D.3) ---------------------------------------
 
 /// One row of `Accounts`' reply.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -448,8 +422,7 @@ pub fn push_account(out: &mut [u8], at: &mut usize, row: &AccountRow<'_>) -> Opt
     Some(())
 }
 
-/// Parse an `Accounts` reply into its rows. `None` if a row runs past the body, an `administers`
-/// byte is neither 0 nor 1, or bytes are left over.
+/// Parse an `Accounts` reply; `None` if a row overruns the body, a bool is bad, or bytes remain.
 pub fn parse_accounts(body: &[u8], mut each: impl FnMut(AccountRow<'_>)) -> Option<usize> {
     let n = get_u16(body.get(..2)?, 0) as usize;
     let mut at = 2usize;
@@ -471,8 +444,7 @@ pub fn parse_accounts(body: &[u8], mut each: impl FnMut(AccountRow<'_>)) -> Opti
     (at == body.len()).then_some(n)
 }
 
-/// Write a `ChangePassword` body: the current password, then the new one, laid out as
-/// `Auth::Add`'s name and password are.
+/// Write a `ChangePassword` body: the current password, then the new one, as `Auth::Add` lays out.
 pub fn build_password_change(out: &mut [u8], current: &[u8], new: &[u8]) -> Option<usize> {
     crate::auth::build_account_request(out, current, new)
 }
@@ -496,8 +468,7 @@ pub fn build_decide(out: &mut [u8], view: &[u8], program: &[u8]) -> Option<usize
     Some(n)
 }
 
-/// Parse a `Decide` body into `(view, program)`, **accounted for exactly**: a length past the
-/// body, or a byte left after the program, is `None`.
+/// Parse a `Decide` body into `(view, program)`, **accounted for exactly** (else `None`).
 pub fn parse_decide(body: &[u8]) -> Option<(&[u8], &[u8])> {
     let vl = get_u16(body.get(..2)?, 0) as usize;
     let view = body.get(2..2 + vl)?;
@@ -521,8 +492,7 @@ pub fn build_remove_account(out: &mut [u8], name: &[u8], home: bool) -> Option<u
     Some(n)
 }
 
-/// Parse a `RemoveAccount` body into `(name, remove the home)`. `None` for an empty name or a flag
-/// this codec does not know.
+/// Parse a `RemoveAccount` body into `(name, remove the home)`; `None` for an empty name or flag.
 pub fn parse_remove_account(body: &[u8]) -> Option<(&[u8], bool)> {
     let (&flags, name) = body.split_first()?;
     if flags & !REMOVE_HOME != 0 || name.is_empty() {
@@ -549,8 +519,6 @@ mod tests {
         assert_eq!(got, [&b"--list"[..], &b""[..]], "an empty argument is still an argument");
     }
 
-    /// **The reader, tested with bytes a correct writer never produces** — the round trip above
-    /// only proves the two agree with each other.
     #[test]
     fn a_request_the_writer_could_not_have_made_is_refused() {
         let mut buf = [0u8; 64];
@@ -567,13 +535,11 @@ mod tests {
         long.push(0);
         assert!(parse_request(&long).is_none(), "trailing bytes");
 
-        // An argument count larger than the arguments there are.
         let argc_at = 1 + 2 + 5 + 2 + 4;
         let mut more = good.to_vec();
         more[argc_at] = 2;
         assert!(parse_request(&more).is_none(), "argc past the body");
 
-        // An empty view or program names nothing.
         let n = build_request(&mut buf, 0, b"", b"disk", &[], b"", None).unwrap();
         assert!(parse_request(&buf[..n]).is_none(), "empty view");
         let n = build_request(&mut buf, 0, b"admin", b"", &[], b"", None).unwrap();
@@ -581,8 +547,6 @@ mod tests {
         assert!(parse_request(&[]).is_none());
     }
 
-    /// **A token rides last, and a request without one is the bytes it always was** (the laptop
-    /// polish's Part A).
     #[test]
     fn a_request_carries_a_token_or_none() {
         let token = [7u8; TTY_TOKEN_LEN];
@@ -598,13 +562,10 @@ mod tests {
         assert_eq!(n, m + 1 + TTY_TOKEN_LEN, "the token is the only difference");
         assert_eq!(with[..m], without[..m], "and it comes after everything else");
 
-        // Too small a buffer for the token is refused rather than cut short.
         let short = &mut with[..m + TTY_TOKEN_LEN];
         assert!(build_request(short, REQ_TERMINAL, b"admin", b"disk", &[b"--list"], b"E", Some(&token)).is_none());
     }
 
-    /// **The token field, as a correct writer never writes it**: every length but sixteen, a short
-    /// token, and a byte after one.
     #[test]
     fn a_token_field_the_writer_could_not_have_made_is_refused() {
         let token = [9u8; TTY_TOKEN_LEN];
@@ -732,7 +693,6 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = build_decide(&mut buf, b"power", b"shutdown").unwrap();
         assert_eq!(parse_decide(&buf[..n]), Some((&b"power"[..], &b"shutdown"[..])));
-        // Bytes no writer here makes, each refused rather than read.
         assert!(parse_decide(&buf[..n - 1]).is_none(), "short a byte of the program");
         let mut long = buf[..n].to_vec();
         long.push(0);

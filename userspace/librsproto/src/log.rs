@@ -1,32 +1,32 @@
-//! `LogRecord` append body — the payload of a log append — and, since administration Part E.6,
-//! **`Read`**, the op that reads the logging service's ring back.
+//! `LogRecord` append body — the payload of a log append — and **`Read`**, the op that reads
+//! the logging service's ring back.
 //!
-//! A log append is deliberately **not** an rsproto operation: it carries no envelope
-//! and no `op`. The logging service hands each emitter a dedicated log channel
-//! (obtained by resolving a path under the logging service), and appending a record is
-//! a raw `sys_channel_send` of the body defined here. The channel's identity is the
-//! "op" — every message on it is a log record. See
-//! `docs/architecture/logging.md` and `docs/spec/rsproto-wire-format.md` § Log records.
+//! A log append is deliberately **not** an rsproto operation: it carries no envelope and no
+//! `op`. The logging service hands each emitter a dedicated log channel (obtained by resolving
+//! a path under it), and appending is a raw `sys_channel_send` of the body defined here; the
+//! channel's identity is the "op". See `docs/architecture/logging.md` and
+//! `docs/spec/rsproto-wire-format.md` § Log records.
 //!
-//! The body carries only the emitter's **claimed** fields (`level`, `message`, optional
-//! `source` sub-label, `span_id`, `trace_id`, and — deferred — structured `fields`). The
-//! **trusted** fields (`principal`, `tier`, `timestamp`, `sequence`) are supplied by the
-//! logging service from the channel the record arrived on; they never appear on the wire.
+//! The body carries only the emitter's **claimed** fields; the **trusted** ones (`principal`,
+//! `tier`, `timestamp`, `sequence`) are supplied by the logging service from the channel the
+//! record arrived on and never appear on the wire.
 
 use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
 
-// --- Levels -----------------------------------------------------------------
-
 /// Severity levels, matching `LogLevel` in the architecture doc.
 pub const LEVEL_TRACE: u8 = 0;
+/// Debug severity.
 pub const LEVEL_DEBUG: u8 = 1;
+/// Informational severity.
 pub const LEVEL_INFO: u8 = 2;
+/// Warning severity.
 pub const LEVEL_WARN: u8 = 3;
+/// Error severity.
 pub const LEVEL_ERROR: u8 = 4;
+/// Critical severity.
 pub const LEVEL_CRITICAL: u8 = 5;
 
-/// A level's name, as the serial sink prints it and `log` shows it; `?` for one this does not
-/// know.
+/// A level's name as the serial sink prints it and `log` shows it; `?` for an unknown one.
 pub fn level_name(level: u8) -> &'static str {
     match level {
         LEVEL_TRACE => "TRACE",
@@ -38,11 +38,6 @@ pub fn level_name(level: u8) -> &'static str {
         _ => "?",
     }
 }
-
-// --- Tiers ------------------------------------------------------------------
-//
-// Here rather than in `logging-service` since administration Part E.6, when `log` came to read
-// them back too.
 
 /// Kernel tier — the kernel `klog`/audit rings. Never resolved; defined for the record's `tier`.
 pub const TIER_KERNEL: u8 = 0;
@@ -61,8 +56,6 @@ pub fn tier_name(tier: u8) -> &'static str {
     }
 }
 
-// --- Flags ------------------------------------------------------------------
-
 /// `span_id` is present (else the wire's 0 means "absent").
 pub const LOG_FLAG_HAS_SPAN: u8 = 1 << 0;
 /// `trace_id` is present.
@@ -70,29 +63,27 @@ pub const LOG_FLAG_HAS_TRACE: u8 = 1 << 1;
 /// A `source` sub-label follows the message.
 pub const LOG_FLAG_HAS_SOURCE: u8 = 1 << 2;
 
-// --- Body layout ------------------------------------------------------------
-
 /// Fixed header length (before the variable message/source/fields).
 pub const LOG_HEADER_LEN: usize = 24;
 
 /// A parsed log-append body.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LogAppend<'a> {
+    /// Severity: one of the `LEVEL_*` constants.
     pub level: u8,
     /// The log message (UTF-8; not validated here).
     pub message: &'a [u8],
     /// Optional self-declared sub-label under the channel's `principal`.
     pub source: Option<&'a [u8]>,
+    /// The span this record belongs to, if the flag is set.
     pub span_id: Option<u64>,
+    /// The trace this record belongs to, if the flag is set.
     pub trace_id: Option<u64>,
-    /// Count of structured k/v `fields`. Always 0 in slice 1 (typed-I/O deferred); the
-    /// field bytes themselves are not yet decoded — reserved for forward-compat.
+    /// Count of structured k/v `fields`; always 0, as structured fields are deferred.
     pub field_count: u16,
 }
 
-/// Encode a log-append body into `out`; returns its length, or `None` if `out` is too
-/// small or a length exceeds its wire width. `field_count` is 0 (structured fields are
-/// deferred).
+/// Encode a log-append body into `out`; `None` if `out` is short or a length exceeds its width.
 pub fn encode_append(
     out: &mut [u8],
     level: u8,
@@ -143,9 +134,7 @@ pub fn encode_append(
     Some(total)
 }
 
-/// Parse a log-append body. Rejects a truncated header, message, or source. The
-/// structured `fields` region (when `field_count > 0`, a future addition) is not
-/// decoded; only its count is surfaced.
+/// Parse a log-append body; rejects a truncated header, message or source. `fields` is not decoded.
 pub fn parse_append(body: &[u8]) -> Option<LogAppend<'_>> {
     if body.len() < LOG_HEADER_LEN {
         return None;
@@ -188,16 +177,12 @@ pub fn parse_append(body: &[u8]) -> Option<LogAppend<'_>> {
     })
 }
 
-// --- Reading the ring back (administration Part E.6) --------------------------
-
 /// **`Log::Read`** — the records kept after a sequence number, on a **read session**: a channel
 /// opened by resolving anything on a read endpoint, which the `logs` grant binds at `/dev/logs`
-/// (`docs/spec/rsproto-log-ops.md`). The first reply-bearing op in the `Log` category, which was
-/// reserved for it.
+/// (`docs/spec/rsproto-log-ops.md`).
 pub const OP_LOG_READ: u16 = 0x0700;
 
-/// A `Read` request body: `after: u64` — only records whose sequence is greater — then
-/// `max: u32` — at most this many, `0` for as many as one reply holds.
+/// A `Read` request body: `after: u64` (only later sequences), `max: u32` (`0` = as many as fit).
 pub const READ_REQUEST_LEN: usize = 12;
 
 /// Encode a `Read` request.
@@ -208,8 +193,7 @@ pub fn read_request(after: u64, max: u32) -> [u8; READ_REQUEST_LEN] {
     b
 }
 
-/// Parse a `Read` request: `(after, max)`, or `None` for any body not exactly
-/// [`READ_REQUEST_LEN`] bytes.
+/// Parse a `Read` request: `(after, max)`, or `None` unless the body is [`READ_REQUEST_LEN`] bytes.
 pub fn parse_read_request(body: &[u8]) -> Option<(u64, u32)> {
     (body.len() == READ_REQUEST_LEN).then(|| (get_u64(body, 0), get_u32(body, 8)))
 }
@@ -225,19 +209,24 @@ pub const READ_REPLY_HEADER_LEN: usize = 16;
 /// each a `u16` — followed by those three strings, in that order. `source_len` `0` is no source.
 pub const RECORD_HEADER_LEN: usize = 32;
 
-/// One record of a `Read` reply, as the logging service kept it: the trusted fields it stamped,
-/// then the emitter's claims.
+/// One record of a `Read` reply: the trusted fields the service stamped, then the emitter's claims.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ReadRecord<'a> {
+    /// The ring's sequence number for this record.
     pub sequence: u64,
     /// The wall clock at ingest, or `None` when it was not set.
     pub time: Option<u64>,
     /// The monotonic clock at ingest.
     pub timestamp: u64,
+    /// The `TIER_*` the emitter's channel was minted for.
     pub tier: u8,
+    /// Severity: one of the `LEVEL_*` constants.
     pub level: u8,
+    /// The emitter's principal, never empty.
     pub principal: &'a [u8],
+    /// The emitter's self-declared sub-label, if any.
     pub source: Option<&'a [u8]>,
+    /// The log message (UTF-8; not validated here).
     pub message: &'a [u8],
 }
 
@@ -256,8 +245,7 @@ pub struct ReadReplyWriter<'a> {
 }
 
 impl<'a> ReadReplyWriter<'a> {
-    /// Start a reply saying the ring's oldest record is `oldest`; `None` if `out` cannot hold even
-    /// the header.
+    /// Start a reply saying the ring's oldest record is `oldest`; `None` if `out` is too short.
     pub fn new(out: &'a mut [u8], oldest: u64) -> Option<Self> {
         if out.len() < READ_REPLY_HEADER_LEN {
             return None;
@@ -328,9 +316,8 @@ pub struct ReadReply<'a> {
 }
 
 /// Parse a `Read` reply, or `None` for one that is not exactly what [`ReadReplyWriter`] makes.
-/// **A reader is fed bytes no writer makes** — a count past the records, a length past the body,
-/// bytes after the last record, a sequence that does not rise — and must refuse each rather than
-/// read past a string or return half a reply.
+/// **A reader is fed bytes no writer makes** — a count past the records, a length past the
+/// body, bytes after the last record, a sequence that does not rise — and must refuse each.
 pub fn parse_read_reply(body: &[u8]) -> Option<ReadReply<'_>> {
     if body.len() < READ_REPLY_HEADER_LEN || get_u32(body, 4) != 0 {
         return None;
@@ -352,11 +339,8 @@ pub fn parse_read_reply(body: &[u8]) -> Option<ReadReply<'_>> {
 }
 
 /// **How many records a reader lost** between the last sequence it read, `after`, and a reply
-/// whose ring now starts at `oldest` — `0` when none were (PR #344 review). A ring drops only its
-/// oldest and numbers every record, so what lies between is exactly what was dropped: from the
-/// start of a read (`after` `0`) the records before the oldest, and in the middle of one those the
-/// ring dropped while it was being read. An empty ring (`oldest` `0`) has lost nothing a reader
-/// could have been given.
+/// whose ring now starts at `oldest` — `0` when none were. A ring drops only its oldest and
+/// numbers every record, so the gap is exactly what was dropped.
 pub fn dropped(after: u64, oldest: u64) -> u64 {
     oldest.saturating_sub(after.saturating_add(1))
 }
@@ -390,8 +374,7 @@ impl<'a> Iterator for ReadRecords<'a> {
     }
 }
 
-/// The record at `off` in `records`, or `None` if its fixed part or its strings run past the end,
-/// or its principal is empty.
+/// The record at `off`, or `None` if it or its strings run past the end or its principal is empty.
 fn record_at(records: &[u8], off: usize) -> Option<ReadRecord<'_>> {
     let fixed = records.get(off..off.checked_add(RECORD_HEADER_LEN)?)?;
     let (plen, slen, mlen) = (get_u16(fixed, 26) as usize, get_u16(fixed, 28) as usize, get_u16(fixed, 30) as usize);
@@ -417,8 +400,7 @@ fn record_at(records: &[u8], off: usize) -> Option<ReadRecord<'_>> {
 mod tests {
     use super::*;
 
-    /// Two records, as the service keeps them: one with a source and the clock set, one without
-    /// either.
+    /// Two records, as the service keeps them: one with a source and the clock set, one without.
     fn two() -> [ReadRecord<'static>; 2] {
         [
             ReadRecord {
@@ -444,7 +426,6 @@ mod tests {
         ]
     }
 
-    /// Write `records` into a reply, checking each was taken.
     fn reply(oldest: u64, records: &[ReadRecord<'_>]) -> Vec<u8> {
         let mut out = vec![0u8; 512];
         let mut w = ReadReplyWriter::new(&mut out, oldest).unwrap();
@@ -456,8 +437,6 @@ mod tests {
         out
     }
 
-    /// **`Read` round-trips**, the request exactly and the reply record for record, including no
-    /// source and no wall clock.
     #[test]
     fn read_request_and_reply_round_trip() {
         assert_eq!(parse_read_request(&read_request(41, 100)), Some((41, 100)));
@@ -466,14 +445,11 @@ mod tests {
         assert_eq!((r.oldest, r.count), (3, 2));
         let got: Vec<_> = r.records().collect();
         assert_eq!(got, two());
-        // An empty reply is the end of the ring, and says so the same way.
         let empty = reply(0, &[]);
         let r = parse_read_reply(&empty).unwrap();
         assert_eq!((r.oldest, r.count, r.records().count()), (0, 0, 0));
     }
 
-    /// **A record that does not fit is not written**, and the reply stays whole: the writer never
-    /// leaves half a record for a reader to trip on.
     #[test]
     fn a_record_that_does_not_fit_is_left_out() {
         let [a, b] = two();
@@ -485,8 +461,6 @@ mod tests {
         let n = w.finish();
         let r = parse_read_reply(&out[..n]).unwrap();
         assert_eq!(r.records().collect::<Vec<_>>(), [a]);
-        // An empty principal, or a source present and empty, is refused rather than written as
-        // something a reader would read differently.
         let mut out = [0u8; 256];
         let mut w = ReadReplyWriter::new(&mut out, 0).unwrap();
         assert!(!w.push(&ReadRecord { principal: b"", ..a }));
@@ -494,8 +468,6 @@ mod tests {
         assert_eq!(w.count(), 0);
     }
 
-    /// **What a reader lost**, at the start of a read and in the middle of one, and at the edges:
-    /// the next record exactly, and an empty ring.
     #[test]
     fn dropped_is_the_gap_before_the_oldest() {
         assert_eq!(dropped(0, 1), 0); // from the start, nothing dropped yet
@@ -507,7 +479,6 @@ mod tests {
         assert_eq!(dropped(u64::MAX, u64::MAX), 0);
     }
 
-    /// **The request is exactly twelve bytes.**
     #[test]
     fn a_read_request_of_any_other_length_is_refused() {
         let good = read_request(1, 2);
@@ -518,8 +489,6 @@ mod tests {
         assert_eq!(parse_read_request(&[]), None);
     }
 
-    /// **Bytes no writer makes**, each refused whole: the reader is what stands between a
-    /// misbehaving server and `log` reading past a string.
     #[test]
     fn a_read_reply_no_writer_makes_is_refused() {
         let good = reply(3, &two());
@@ -538,10 +507,8 @@ mod tests {
         refused(&|b| super::put_u32(b, 4, 1), "a reserved flag set");
         refused(&|b| super::put_u16(b, first + 26, 0xFFFF), "a principal length past the body");
         refused(&|b| super::put_u16(b, first + 30, 0xFFFF), "a message length past the body");
-        // **An empty principal, in a record otherwise well formed** (PR #344 review): the
-        // principal's bytes are handed to the message, so every length still adds up and only the
-        // principal guard can refuse it. Zeroing the length alone moved every boundary after it,
-        // and the whole-body check refused that before the guard was asked.
+        // **An empty principal, in a record otherwise well formed**: only the principal guard
+        // can refuse it.
         refused(
             &|b| {
                 let plen = super::get_u16(b, first + 26);
@@ -553,8 +520,7 @@ mod tests {
         );
         refused(&|b| super::put_u64(b, first, 9), "a sequence that does not rise");
         refused(&|b| super::put_u64(b, first, 0), "a sequence of 0");
-        // A count of u32::MAX over a short body must stop at the body, not loop four billion
-        // times — it fails on the first record past the end.
+        // A count of u32::MAX over a short body must stop at the body.
         refused(&|b| super::put_u32(b, 0, u32::MAX), "a count of u32::MAX");
     }
 
@@ -593,8 +559,6 @@ mod tests {
 
     #[test]
     fn absent_optionals_stay_none_even_if_wire_bytes_nonzero() {
-        // Encode with no span/trace; the wire span/trace fields are 0 and the flags
-        // clear, so parse must report None regardless.
         let mut buf = [0u8; 64];
         let n = encode_append(&mut buf, LEVEL_DEBUG, b"x", None, None, None).unwrap();
         let r = parse_append(&buf[..n]).unwrap();
@@ -604,14 +568,11 @@ mod tests {
 
     #[test]
     fn parse_rejects_truncation() {
-        // Short header.
         assert!(parse_append(&[0u8; 8]).is_none());
-        // message_len overruns the body.
         let mut buf = [0u8; 32];
         buf[1] = 0; // no flags
         super::put_u32(&mut buf, 4, 100); // claims 100 message bytes
         assert!(parse_append(&buf).is_none());
-        // has_source set but no room for the source_len.
         let mut buf2 = [0u8; 64];
         let n = encode_append(&mut buf2, LEVEL_INFO, b"hi", None, None, None).unwrap();
         buf2[1] |= LOG_FLAG_HAS_SOURCE; // lie: claim a source that isn't there
