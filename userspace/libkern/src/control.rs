@@ -1,14 +1,9 @@
 //! **The control channel a supervisor spawned a service with**, read from the service's side: one
 //! op byte per message ([`CTRL_OP_SHUTDOWN`](crate::abi::CTRL_OP_SHUTDOWN)).
 //!
-//! A thin wrapper over `sys_channel_recv`, here rather than copied into each service because five
-//! read it: `heartbeat`, and since administration Part E.2 every server `service --stop` can stop
-//! — the terminal server, the clipboard, the input server and the compositor.
-//!
 //! **A closed channel is an answer, not an empty one.** Its supervisor has gone, and the channel
 //! stays signalled for good, so a service that went on waiting on it would spin. [`Control::Closed`]
-//! says to take it out of the wait set; `heartbeat`'s own copy of this read did not, which is how
-//! that was found.
+//! says to take it out of the wait set.
 
 use crate::abi::{IPC_HEADER_SIZE, IPC_MSG_SIZE};
 use crate::error::KError;

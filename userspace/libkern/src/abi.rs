@@ -2,16 +2,12 @@
 //!
 //! Mirrors `kernel/src/libkern/{spawn,thread,notification,ipc,io_result}.rs` and
 //! the `HandleInfo` in `kernel/src/libkern/handle.rs`. Each layout carries the
-//! same compile-time `offset_of!`/`size_of` asserts the kernel uses, so the two
-//! sides self-pin to identical layouts until `cargo xtask abi-sync-check` lands.
+//! same compile-time `offset_of!`/`size_of` asserts the kernel uses.
 //!
-//! Inline handle arrays use `u64` (the raw handle bits) rather than `RawHandle`
-//! for ergonomics at raw-syscall call sites; `RawHandle` is `repr(transparent)`
-//! over `u64`, so the layout is identical.
+//! Inline handle arrays use `u64` rather than `RawHandle`, which is `repr(transparent)` over
+//! `u64`, so the layout is identical.
 
 use core::mem::{align_of, offset_of, size_of};
-
-// --- sys_process_spawn -----------------------------------------------------
 
 /// Maximum initial handles a parent can install in a child at spawn.
 pub const SPAWN_MAX_HANDLES: usize = 4;
@@ -20,9 +16,7 @@ pub const SPAWN_MAX_HANDLES: usize = 4;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct SpawnArgs {
-    /// A `MemoryObject` handle holding the program's ELF image (offset 0). The spawner
-    /// resolves the executable path (`sys_ns_lookup` → a readable object) and passes the
-    /// handle, which `sys_process_spawn` reads (requires `MAP_READ`) and loads.
+    /// A `MemoryObject` handle holding the program's ELF image (offset 0); needs `MAP_READ`.
     pub image: u64,
     /// Valid entries in `handles`/`rights`; `≤ SPAWN_MAX_HANDLES` (offset 8).
     pub handle_count: u32,
@@ -53,8 +47,6 @@ const _: () = assert!(offset_of!(SpawnArgs, handles) == 24);
 const _: () = assert!(offset_of!(SpawnArgs, rights) == 56);
 const _: () = assert!(offset_of!(SpawnArgs, namespace) == 88);
 const _: () = assert!(offset_of!(SpawnArgs, syscaps) == 96);
-
-// --- sys_thread_create / sys_thread_get_registers --------------------------
 
 /// The argument block `sys_thread_create` reads to start a new thread.
 #[repr(C)]
@@ -102,8 +94,6 @@ pub struct RegisterValues {
 
 /// Index of `rip` within [`RegisterValues::regs`].
 pub const REG_RIP: usize = 16;
-
-// --- Notifications (sys_notif_recv) ----------------------------------------
 
 /// Forward-compat fallback: a discriminant the recipient's ABI doesn't know.
 pub const KIND_UNKNOWN: u32 = 0x0000;
@@ -159,8 +149,6 @@ impl Notification {
     }
 }
 
-// --- IPC (sys_channel_send / sys_channel_recv) -----------------------------
-
 /// Total size of an [`IpcMsg`], in bytes — one page on x86_64.
 pub const IPC_MSG_SIZE: usize = 4096;
 /// Size of the [`IpcMsgHeader`] prefix, in bytes.
@@ -173,24 +161,12 @@ pub const IPC_PAYLOAD_SIZE: usize = IPC_MSG_SIZE - IPC_HEADER_SIZE - IPC_HANDLE_
 /// `InvalidArgument`.
 pub const IPC_MAX_QUEUE_DEPTH: u32 = 1024;
 
-// --- sys_wait --------------------------------------------------------------
-
-/// Maximum handles one `sys_wait` call may block on — the kernel's
-/// `MAX_WAIT_HANDLES`. A larger `count` is rejected with `InvalidArgument`.
-///
-/// This is the **fan-out limit of every resource server**: a server that keeps a channel
-/// per client waits on its serving endpoint plus one slot per client, so it serves at most
-/// `MAX_WAIT_HANDLES - 1` of them at once. Both servers that do this (`fs-server-ext4`'s
-/// directory sessions, `logging-service`'s per-principal sources) derive their cap from
-/// this constant rather than restating the number, so raising it is one edit.
-///
-/// The kernel side is a **fixed per-thread array**, sized rather than allocated so that
-/// registering a wait never allocates under the rank-1 scheduler lock. That is what makes
-/// this a constant instead of a parameter, and what bounds how far it can sensibly be
-/// raised — the cost is paid by every thread, waiting or not.
-///
-/// Escaping the limit entirely (a readiness mechanism, so one wait slot covers any number
-/// of clients) is `TODO(server-fanout)` in `docs/rationale/deferred-decisions.md`.
+/// Maximum handles one `sys_wait` call may block on — the kernel's `MAX_WAIT_HANDLES`; a larger
+/// `count` is `InvalidArgument`. It is the **fan-out limit of every resource server**, which
+/// waits on its endpoint plus one slot per client and derives its cap from this constant.
+/// The kernel side is a fixed per-thread array, so a wait never allocates under the rank-1
+/// scheduler lock.
+/// Escaping the limit is `TODO(server-fanout)` in `docs/rationale/deferred-decisions.md`.
 pub const MAX_WAIT_HANDLES: usize = 32;
 
 /// Bytes one `sys_wait` writes per signaled handle (an `IoResult`).
@@ -206,24 +182,21 @@ pub const SENDMODE_BLOCKBOUNDED: u64 = 2;
 // --- Service control-channel protocol --------------------------------------
 //
 // The opcode a supervisor (service-mgr) sends to a service over its per-service
-// **control channel** (`[service.<name>.handles].control` in the service schema). A
-// slice-A seed of a userspace convention (not a kernel ABI): the opcode is the first
-// payload byte of an `IpcMsg`. It will grow (health-check, config reload) and may move
-// to a dedicated control-protocol module. See `docs/architecture/service-manager.md`.
+// **control channel**: a userspace convention (not a kernel ABI), the first payload byte of
+// an `IpcMsg`. See `docs/architecture/service-manager.md`.
 
 /// Control opcode: shut down gracefully and exit. The service should stop its work
 /// and call `sys_process_exit(0)`.
 pub const CTRL_OP_SHUTDOWN: u8 = 1;
 
-/// `service-mgr` → `init`, on the **terminal channel** (administration Part E.1): a critical server
-/// did not come up at boot — or the declarations lost their critical servers, and nothing was
-/// started — so start the emergency shell. The console is still free then: the critical servers
-/// start before the terminal server. One byte of payload, as the control ops.
+/// `service-mgr` → `init`, on the **terminal channel**: a critical server did not come up at
+/// boot (or none was started), so start the emergency shell. The console is still free then,
+/// the critical servers starting before the terminal server. One byte of payload.
 pub const TERMINAL_OP_EMERGENCY: u8 = 1;
 
-/// `service-mgr` → `init`, on the terminal channel (administration Part E.4): every session and
-/// service has been asked to stop, so finish the shutdown — `init`'s own mounts, last first, then
-/// `sys_power`. Two bytes of payload: this op, then `1` to reboot or `0` to halt.
+/// `service-mgr` → `init`, on the terminal channel: every session and service has been asked to
+/// stop, so finish the shutdown — `init`'s own mounts, last first, then `sys_power`. Two bytes
+/// of payload: this op, then `1` to reboot or `0` to halt.
 pub const TERMINAL_OP_FINISH: u8 = 2;
 
 /// The fixed 24-byte IPC message header. `sender_pid`/`timestamp` are stamped by
@@ -291,18 +264,14 @@ const _: () = assert!(align_of::<IpcMsg>() == 4096);
 const _: () = assert!(offset_of!(IpcMsg, payload) == 24);
 const _: () = assert!(offset_of!(IpcMsg, handles) == 4032);
 
-// --- sys_clock_read and sys_clock_set ---------------------------------------
-
 /// `ClockId::Monotonic` — nanoseconds since boot, never decreasing, and never set.
 pub const CLOCK_MONOTONIC: u64 = 0;
 
 /// `ClockId::Realtime` — nanoseconds since the Unix epoch (UTC).
 ///
-/// Derived as monotonic + an offset anchored from the hardware RTC at boot, so it advances
-/// smoothly — **until someone sets it**: `sys_clock_set` steps it, backwards as readily as
-/// forwards (administration Part E.5), so an interval is measured on [`CLOCK_MONOTONIC`]. Returns
-/// `Unsupported` on a machine whose RTC could not be read, until it is set, rather than reporting
-/// a fabricated epoch.
+/// Monotonic plus an offset anchored from the hardware RTC at boot. **`sys_clock_set` steps it**,
+/// backwards as readily as forwards, so an interval is measured on [`CLOCK_MONOTONIC`]. Returns
+/// `Unsupported` on a machine whose RTC could not be read, until it is set.
 pub const CLOCK_REALTIME: u64 = 1;
 
 /// `sys_clock_set` set the clock, and the machine's hardware clock holds it: the next boot anchors
@@ -311,8 +280,6 @@ pub const CLOCK_SET_KEPT: u64 = 0;
 /// `sys_clock_set` set the clock, but the hardware clock did not take the time — there is none,
 /// or it did not read back — so it lasts until the next boot.
 pub const CLOCK_SET_THIS_BOOT: u64 = 1;
-
-// --- sys_wait completion record --------------------------------------------
 
 /// One completion record `sys_wait` writes per signaled handle; 24 bytes.
 #[repr(C)]
@@ -346,10 +313,9 @@ pub const IO_OPCODE_WRITE: u32 = 1;
 /// written to its medium. No buffer and no range (`buffer`, `buf_offset`, `offset`, `length`
 /// all `0`), and needs `WRITE` on the device.
 pub const IO_OPCODE_FLUSH: u32 = 2;
-/// `IoOpcode::Rescan` — read a disk's partition table again and publish what it says now (Phase 6
-/// Part G): the old partitions departed, the new ones arriving. No buffer and no range, as for a
-/// flush, and needs `WRITE` on the disk. A partition, and every disk but a USB one, answers
-/// `Unsupported`.
+/// `IoOpcode::Rescan` — read a disk's partition table again and publish what it says now: the
+/// old partitions departed, the new ones arriving. No buffer and no range, as for a flush, and
+/// needs `WRITE` on the disk. A partition, and every disk but a USB one, answers `Unsupported`.
 pub const IO_OPCODE_RESCAN: u32 = 3;
 
 /// The `sys_io_submit` operation descriptor — the userspace mirror of the
@@ -381,8 +347,6 @@ const _: () = assert!(offset_of!(IoOp, buf_offset) == 16);
 const _: () = assert!(offset_of!(IoOp, offset) == 24);
 const _: () = assert!(offset_of!(IoOp, length) == 32);
 
-// --- sys_handle_stat metadata ----------------------------------------------
-
 /// Handle metadata written by `sys_handle_stat`; 24 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -401,8 +365,6 @@ pub struct HandleInfo {
 const _: () = assert!(size_of::<HandleInfo>() == 24);
 const _: () = assert!(align_of::<HandleInfo>() == 8);
 
-// --- sys_ns_enumerate ------------------------------------------------------
-
 /// Longest binding path an [`NsEntry`] carries inline; a longer path is truncated
 /// (its true length is still reported in `path_len`).
 pub const NS_ENTRY_PATH_MAX: usize = 256;
@@ -414,10 +376,8 @@ pub const NS_KIND_KERNEL: u32 = 1;
 /// [`NsEntry::kind`]: a userspace resource server — a **mount** (`/` → fs-server).
 pub const NS_KIND_MOUNT: u32 = 2;
 
-/// One namespace binding, written by `sys_ns_enumerate`: its path, target kind
-/// (`NS_KIND_*`), and max rights. Lists a namespace's mount points + kernel
-/// resources (eshell `mounts`) — not a filesystem `readdir`. `16 + NS_ENTRY_PATH_MAX`
-/// bytes.
+/// One namespace binding, written by `sys_ns_enumerate`: its path, target kind (`NS_KIND_*`)
+/// and max rights — not a filesystem `readdir`. `16 + NS_ENTRY_PATH_MAX` bytes.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct NsEntry {
@@ -444,14 +404,8 @@ const _: () = assert!(offset_of!(HandleInfo, rights) == 0);
 const _: () = assert!(offset_of!(HandleInfo, object_type) == 8);
 const _: () = assert!(offset_of!(HandleInfo, generation) == 12);
 
-// --- Framebuffer geometry -----------------------------------------------
-
-/// What a block device is, mirroring `kernel/src/libkern/block.rs` byte for byte.
-///
-/// Read from `/dev/blk/<n>/info`, the shape `/dev/framebuffer/info` already uses. A program that
-/// is about to write a partition table needs all three facts: **what** the device is (this
-/// registry holds whole disks, their partitions and memory published as a disk), how big it is,
-/// and what to call it so a person can confirm the one they mean.
+/// What a block device is, mirroring `kernel/src/libkern/block.rs` byte for byte; read from
+/// `/dev/blk/<n>/info`.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlockDeviceInfo {
@@ -496,8 +450,7 @@ impl Default for BlockDeviceInfo {
 
 impl BlockDeviceInfo {
     /// What kind of device this is. **An unrecognised discriminant reads as
-    /// [`BlockKind::Unknown`]**, which is what a caller that refuses what it does not understand
-    /// wants: a newer kernel naming a fourth kind must not have it mistaken for a disk.
+    /// [`BlockKind::Unknown`]**: a newer kernel's new kind must not be mistaken for a disk.
     pub fn kind(&self) -> BlockKind {
         match self.kind {
             1 => BlockKind::Disk,
@@ -562,17 +515,12 @@ impl BlockKind {
 
 /// Geometry and pixel layout of the system framebuffer.
 ///
-/// The userspace mirror of `kernel/src/libkern/framebuffer.rs`. Obtained by mapping
-/// `/dev/framebuffer/info`, which resolves to a read-only `MemoryObject` holding exactly
-/// one of these; the aperture itself is `/dev/framebuffer`.
-///
-/// Both sides carry the layout asserts below. `cargo xtask abi-sync-check` deliberately
-/// does not compare `#[repr(C)]` layouts — the asserts are the stronger check, and they
-/// fail at build time rather than in a separate pass.
+/// Mirrors `kernel/src/libkern/framebuffer.rs`. Obtained by mapping `/dev/framebuffer/info`,
+/// a read-only `MemoryObject` holding exactly one of these; the aperture is `/dev/framebuffer`.
+/// `cargo xtask abi-sync-check` does not compare `#[repr(C)]` layouts; the asserts below do.
 ///
 /// **Channel layout is reported, not assumed.** Firmware does not always choose
-/// `0x00RRGGBB`; a client that hardcodes it renders channel-swapped output on hardware
-/// that reports BGR.
+/// `0x00RRGGBB`; a client that hardcodes it swaps channels on hardware that reports BGR.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct FramebufferInfo {
@@ -616,10 +564,7 @@ const _: () = assert!(offset_of!(FramebufferInfo, blue_size) == 31);
 
 impl FramebufferInfo {
     /// Read one from the first 32 bytes of a mapped `/dev/framebuffer/info` object.
-    ///
-    /// Returns `None` if the slice is short — a truncated read would otherwise produce
-    /// a plausible-looking geometry with zeroed tail fields, and a client would map an
-    /// aperture of the wrong size.
+    /// `None` if the slice is short, which would otherwise read as a plausible geometry.
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
         if b.len() < core::mem::size_of::<Self>() {
             return None;
@@ -643,14 +588,9 @@ impl FramebufferInfo {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Input events — the userspace mirror of `kernel/src/libkern/input.rs`.
-//
-// Records read from a raw input node (`/dev/input/raw/<n>`). The kernel side carries the
-// same layout asserts; `cargo xtask abi-sync-check` compares the `EV_*`/`KEY_*`/`REL_*`/
-// `BTN_*` constants across the boundary. Before this existed the kernel doc *claimed* a
-// mirror that did not, and the only consumer hardcoded the offsets (PR #178 review).
-// ---------------------------------------------------------------------------
+// Input events, read from a raw input node (`/dev/input/raw/<n>`): the mirror of
+// `kernel/src/libkern/input.rs`. `cargo xtask abi-sync-check` compares the `EV_*`/`KEY_*`/
+// `REL_*`/`BTN_*` constants across the boundary.
 
 /// One input event: what happened, on what, when. See the kernel module for the semantics.
 #[repr(C)]
@@ -704,12 +644,8 @@ pub const REL_Y: u16 = 0x01;
 /// Wheel detents; positive is **down**, toward the user.
 ///
 /// **The same direction [`REL_Y`] is positive in**, and deliberately *not* Linux's, which is
-/// positive-up. This table takes Linux's codes; the sign convention here is the screen's, so
-/// that everything above the driver — `libinput`, the compositor, a client adding a delta to a
-/// scroll offset — needs no sign of its own. The PS/2 wire already reports positive as toward
-/// the user, so unlike `REL_Y` nothing negates it. Stated in
-/// `docs/spec/rsproto-input-ops.md` beside `REL_Y`'s note, because a wheel that scrolls the
-/// wrong way is a one-character mistake and an unmistakable symptom.
+/// positive-up: the sign convention here is the screen's, so nothing above the driver needs a
+/// sign of its own. See `docs/spec/rsproto-input-ops.md`.
 pub const REL_WHEEL: u16 = 0x08;
 
 /// Keycodes — `EV_KEY` codes for keyboard keys. Identical to the kernel's table, which
@@ -784,9 +720,8 @@ pub const BTN_RIGHT: u16 = 0x111;
 /// Wheel click.
 pub const BTN_MIDDLE: u16 = 0x112;
 
-/// **A keyboard's lights**, the one byte a write to its raw node carries (Phase 6 Part B.5), in HID's
-/// order: Num Lock in bit 0. Typed `u16` with the codes above so the two copies are held together;
-/// the byte is their low eight bits.
+/// **A keyboard's lights**, the one byte a write to its raw node carries, in HID's order: Num
+/// Lock in bit 0. Typed `u16` with the codes above; the byte is their low eight bits.
 pub const LIGHT_NUM: u16 = 0x01;
 /// Caps Lock's light.
 pub const LIGHT_CAPS: u16 = 0x02;

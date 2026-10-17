@@ -1,8 +1,8 @@
 //! [`KError`] — the kernel error space, mirrored from `kernel/src/syscall/error.rs`.
 //!
-//! Every syscall returns a single `isize`: a **negative** value is a `KError`
-//! discriminant; a non-negative value is operation-specific (a byte count, a
-//! handle, or `0`). The numeric values are the contract and must match the kernel.
+//! Every syscall returns a single `isize`: a **negative** value is a `KError` discriminant; a
+//! non-negative one is operation-specific (a count, a handle, or `0`). The numbers must match
+//! the kernel.
 
 /// A kernel error, as returned (negated) across the syscall boundary.
 /// `#[repr(i32)]` so the discriminant is exactly the wire value.
@@ -24,7 +24,7 @@ pub enum KError {
     /// A blocking operation's deadline elapsed before it completed.
     TimedOut = -12,
     /// The other end has gone: an IPC channel's peer endpoint has closed, or a
-    /// device has departed (Phase 6 Part C).
+    /// device has departed.
     PeerClosed = -13,
     /// The name the operation would create is already taken. Well-formed
     /// request, occupied name — which is why `mkdir --parents` can treat it as
@@ -51,11 +51,8 @@ impl KError {
     /// value maps to [`KError::KernelError`] (forward-compat: a kernel newer than
     /// this `libkern` may return an error this build doesn't name).
     ///
-    /// **Every variant above must have an arm here.** The forward-compat fallback
-    /// means an omission is silent — `IoError` was missing from 2026-06 until
-    /// 2026-07-30, so every device error decoded as `KernelError` while the enum
-    /// itself matched the kernel perfectly. `cargo xtask abi-sync-check` now
-    /// checks this table against the kernel's variants for exactly that reason.
+    /// **Every variant above must have an arm here.** The forward-compat fallback makes an
+    /// omission silent; `cargo xtask abi-sync-check` checks this table against the kernel's.
     pub const fn from_i32(v: i32) -> KError {
         match v {
             -1 => KError::InvalidHandle,
@@ -107,14 +104,8 @@ mod tests {
         assert_eq!(KError::from_i32(-9999), KError::KernelError);
     }
 
-    /// Every variant must survive `as_i32` → `from_i32`.
-    ///
-    /// This list is only as good as its completeness, which is how `IoError` sat
-    /// undecodable for a month: it was in the enum, absent from `from_i32`, and
-    /// absent from here too, so nothing failed. The enumeration is duplicated in
-    /// `xtask abi-sync-check`, which derives it from the *kernel's* enum rather
-    /// than from this file — a list that cannot be kept in step by the same
-    /// oversight that made it wrong.
+    /// Every variant must survive `as_i32` → `from_i32`. Keep this list complete; `abi-sync-check`
+    /// derives its own from the kernel's enum, so one oversight cannot hide in both.
     #[test]
     fn discriminants_round_trip() {
         for e in [
@@ -139,15 +130,12 @@ mod tests {
         }
     }
 
-    /// The regression proper: a device error must not read as an internal one.
     #[test]
     fn io_error_decodes_as_itself() {
         assert_eq!(KError::from_i32(-40), KError::IoError);
         assert_ne!(KError::from_i32(-40), KError::KernelError);
     }
 
-    /// The two errors this pass exists to make visible are distinguishable from
-    /// each other and from the `InvalidArgument` they used to share.
     #[test]
     fn create_and_empty_errors_are_distinct() {
         assert_eq!(from_raw(-14), Err(KError::AlreadyExists));

@@ -1,5 +1,5 @@
 //! The device registry's records, mirroring `kernel/src/libkern/device.rs` — what
-//! `/dev/registry` serves (administration Part B) — and a reader for them.
+//! `/dev/registry` serves — and a reader for them.
 //!
 //! The layout asserts on both sides keep the structs in step; `cargo xtask abi-sync-check`
 //! compares the discriminants and constants. Specified in `docs/spec/device-node.md`
@@ -9,9 +9,8 @@
 //! object is page-rounded, so the bytes a lookup maps run on past the last record in zeros, and a
 //! reader that divided the size by a record's would find phantom devices of kind `Unknown`.
 //!
-//! **The reader is here rather than in `libos`**, where this crate's rules would put a parser,
-//! because its consumers sit below `libos`: `eshell` and `libsession` link `libkern` alone. It
-//! allocates nothing — an iterator over the caller's bytes.
+//! **The reader is here rather than in `libos`** because its consumers (`eshell`, `libsession`)
+//! link `libkern` alone. It allocates nothing.
 
 use core::mem::{align_of, offset_of, size_of};
 
@@ -38,9 +37,8 @@ pub enum DeviceKind {
     Mouse = 6,
     /// The serial console.
     Console = 7,
-    /// A USB device on a root port of the xHCI controller, its parent (Phase 6 Part A.3). Its
-    /// record's `vendor` and `device` are its USB IDs, its class fields its class triple, and its
-    /// `port` and `speed` say where and how fast it is attached.
+    /// A USB device on a root port of the xHCI controller, its parent. `vendor` and `device`
+    /// are its USB IDs, the class fields its class triple; `port` and `speed` say where it is.
     UsbDevice = 8,
 }
 
@@ -73,8 +71,7 @@ impl DeviceKind {
 
 /// The first four bytes of a snapshot, `"DREG"` read as a little-endian `u32`.
 pub const REGISTRY_MAGIC: u32 = 0x4745_5244;
-/// The snapshot layout this build reads: 2 since Phase 6 Part C, whose header carries the table's
-/// generation.
+/// The snapshot layout this build reads; version 2's header carries the table's generation.
 pub const REGISTRY_VERSION: u32 = 2;
 /// [`DeviceRecord::served`] for a node no indexed path serves.
 pub const NOT_SERVED: u32 = 0xFFFF_FFFF;
@@ -88,10 +85,9 @@ pub const OUTCOME_CLAIMED: u32 = 1;
 pub const OUTCOME_DECLINED: u32 = 2;
 /// Longest driver name served, in bytes.
 pub const MAX_DRIVER_NAME: usize = 16;
-/// [`DeviceRecord::flags`]: the device has departed (Phase 6 Part C). See the kernel's mirror.
+/// [`DeviceRecord::flags`]: the device has departed. See the kernel's mirror.
 pub const DEPARTED: u8 = 0x01;
-/// [`DeviceRecord::flags`]: the disk the machine started from (Phase 6 Part D). See the kernel's
-/// mirror.
+/// [`DeviceRecord::flags`]: the disk the machine started from. See the kernel's mirror.
 pub const BOOT: u8 = 0x02;
 
 /// The start of a snapshot.
@@ -106,7 +102,7 @@ pub struct RegistryHeader {
     pub count: u32,
     /// `size_of::<DeviceRecord>()` as the kernel wrote it.
     pub record_size: u32,
-    /// The table's generation, bumped once by every change (Phase 6 Part C).
+    /// The table's generation, bumped once by every change.
     pub generation: u64,
 }
 
@@ -128,19 +124,18 @@ pub struct DeviceRecord {
     pub kind: u32,
     /// The `<n>` of `/dev/blk/<n>` or `/dev/input/raw/<n>`, or [`NOT_SERVED`].
     pub served: u32,
-    /// The `id` of the node it belongs to — a partition's disk, a disk's or a USB device's
-    /// controller — or [`NO_PARENT`].
+    /// The `id` of the node it belongs to (a partition's disk, a USB device's controller), or
+    /// [`NO_PARENT`].
     pub parent: u32,
     /// For a PCI function, what its driver did with it.
     pub outcome: u32,
     /// **Which IDs these are depends on [`kind`](Self::kind)**: a PCI function's vendor id, a USB
-    /// device's `idVendor` (Phase 6 Part A.3), or `0xFFFF` for a node that is neither. A vendor
-    /// other than `0xFFFF` does not mean a PCI function — read the kind.
+    /// device's `idVendor`, or `0xFFFF` for neither; a vendor other than `0xFFFF` does not mean
+    /// a PCI function.
     pub vendor: u16,
     /// A PCI function's device id, or a USB device's `idProduct`.
     pub device: u16,
-    /// A PCI function's base class, or a USB device's class (its first interface's when its own
-    /// is zero).
+    /// A PCI function's base class, or a USB device's (its first interface's if its own is 0).
     pub pci_class: u8,
     /// The subclass, as for [`pci_class`](Self::pci_class).
     pub subclass: u8,
@@ -156,13 +151,12 @@ pub struct DeviceRecord {
     pub dev: u8,
     /// PCI function; zero for a node that is not a PCI function.
     pub func: u8,
-    /// For a USB device, the root port it is on, numbered from 1; zero for every other kind
-    /// (Phase 6 Part A.3, from bytes that were reserved — the layout and the version are unchanged).
+    /// For a USB device, the root port it is on, numbered from 1; zero for every other kind.
     pub port: u8,
     /// For a USB device, its speed: 1 full, 2 low, 3 high, 4 SuperSpeed, 5 SuperSpeedPlus (the
     /// xHCI's default speed IDs); zero for every other kind.
     pub speed: u8,
-    /// What has happened to it, and what it is: [`DEPARTED`] (Phase 6 Part C) and [`BOOT`] (Part D).
+    /// What has happened to it, and what it is: [`DEPARTED`] and [`BOOT`].
     pub flags: u8,
     /// Bytes per logical block, for a block device.
     pub logical_block_size: u32,
@@ -173,7 +167,7 @@ pub struct DeviceRecord {
     /// The driver that published the node or took the function, NUL-padded.
     pub driver: [u8; MAX_DRIVER_NAME],
     /// What to call it: a disk's model and serial, a partition's label, a module's path, a USB
-    /// device's product and serial (or `vvvv:pppp` when it has no strings).
+    /// device's product and serial (or `vvvv:pppp`).
     pub name: [u8; MAX_DEVICE_NAME],
 }
 
@@ -198,8 +192,8 @@ impl DeviceRecord {
             return None;
         }
         // SAFETY: `bytes` is exactly `size_of::<DeviceRecord>()` long, and every bit pattern is a
-        // valid `DeviceRecord` (integers and byte arrays only). `read_unaligned` because neither a
-        // mapped snapshot nor a message body promises the struct's alignment.
+        // valid `DeviceRecord` (integers and byte arrays only); `read_unaligned` since neither a
+        // snapshot nor a message body promises alignment.
         Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<DeviceRecord>()) })
     }
 
@@ -215,20 +209,18 @@ impl DeviceRecord {
         DeviceKind::from_u32(self.kind)
     }
 
-    /// Whether the device has departed (Phase 6 Part C): [`DEPARTED`].
+    /// Whether the device has departed: [`DEPARTED`].
     pub fn is_departed(&self) -> bool {
         self.flags & DEPARTED != 0
     }
 
-    /// **Whether it is the disk the machine started from** (Phase 6 Part D): [`BOOT`].
+    /// **Whether it is the disk the machine started from**: [`BOOT`].
     pub fn is_boot_medium(&self) -> bool {
         self.flags & BOOT != 0
     }
 
-    /// The `<n>` of the `/dev/blk/<n>` that serves it, if it is a block device and served — what
-    /// a reader of the registry needs instead of probing `/dev/blk/0`, `1`, … for the first miss.
-    /// **`None` for a departed device**, whose path no longer resolves: a reader asking this is
-    /// right without knowing departures exist (Phase 6 Part C).
+    /// The `<n>` of the `/dev/blk/<n>` that serves it, if it is a block device and served.
+    /// **`None` for a departed device**, whose path no longer resolves.
     pub fn block_index(&self) -> Option<u32> {
         (self.kind().is_block() && self.served != NOT_SERVED && !self.is_departed()).then_some(self.served)
     }
@@ -295,8 +287,7 @@ impl Records<'_> {
         self.count
     }
 
-    /// The table's generation when the snapshot was taken (Phase 6 Part C): what to wait past on
-    /// `/dev/registry/changes`.
+    /// The table's generation when the snapshot was taken: what to wait past on `/dev/registry/changes`.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -334,12 +325,11 @@ pub fn records(bytes: &[u8]) -> Result<Records<'_>, SnapshotError> {
     Ok(Records { bytes, count, next: 0, generation })
 }
 
-// --- `/dev/registry/io` (Phase 6 Part H.2) -----------------------------------------------------
+// --- `/dev/registry/io` -------------------------------------------------------------------
 
 /// The first four bytes of an I/O snapshot, `"DIOS"` read as a little-endian `u32`.
 pub const IO_MAGIC: u32 = 0x534F_4944;
-/// The I/O snapshot layout this build reads: 2 since the page cache counts the pages its fills
-/// bring in (Phase 6 Part H.4).
+/// The I/O snapshot layout this build reads; version 2 adds the pages the fills brought in.
 pub const IO_VERSION: u32 = 2;
 
 /// The page cache's counters, since boot.
@@ -513,7 +503,6 @@ pub fn io(bytes: &[u8]) -> Result<IoSnapshot<'_>, SnapshotError> {
 mod tests {
     use super::*;
 
-    /// A header, version 2: generation 7.
     fn header(count: u32) -> [u8; 24] {
         let mut h = [0u8; 24];
         h[0..4].copy_from_slice(&REGISTRY_MAGIC.to_le_bytes());
@@ -531,9 +520,6 @@ mod tests {
         r
     }
 
-    /// **The header's count, not the page.** A page as the kernel hands it over — a header, two
-    /// records, and zeros to the end — reads as exactly two. A reader that divided the size would
-    /// find twenty-six, the rest of them all-zero `Unknown` devices (PR #332 review, finding 5).
     #[test]
     fn a_padded_snapshot_reads_exactly_its_count() {
         let mut page = [0u8; 4096];
@@ -551,8 +537,6 @@ mod tests {
         assert_eq!(records(&page).unwrap().count(), 2, "and no more after them");
     }
 
-    /// **What a correct kernel never writes is refused, not guessed at**: a count the bytes cannot
-    /// hold, another magic, another version, another record size, and fewer bytes than a header.
     #[test]
     fn a_snapshot_that_does_not_add_up_is_refused() {
         let mut short = [0u8; 24 + 144];
@@ -574,9 +558,6 @@ mod tests {
         assert_eq!(records(&header(0)).unwrap().len(), 0, "an empty table reads");
     }
 
-    /// **A block index is a block record's served index, and nothing else's**: the keyboard is
-    /// served at 0 too, by `/dev/input/raw`, and a disk the kernel registered but serves nowhere
-    /// has none.
     #[test]
     fn only_a_served_block_device_has_a_block_index() {
         let rec = |kind: DeviceKind, served: u32| {
@@ -592,9 +573,6 @@ mod tests {
         assert_eq!(rec(DeviceKind::Disk, NOT_SERVED).block_index(), None, "registered, served nowhere");
     }
 
-    /// **A departed device has no index on either path** (Phase 6 Part C), so a reader that asks
-    /// for one is right without knowing departures exist. Its id and its served index stay in the
-    /// record, which is what a reader comparing two snapshots needs.
     #[test]
     fn a_departed_device_has_no_index() {
         let rec = |kind: DeviceKind, flags: u8| {
@@ -613,8 +591,6 @@ mod tests {
         assert_eq!((gone.id, gone.served), (4, 3), "its id and served index stay");
     }
 
-    /// **One record from exactly its bytes**, at an odd address — a message body promises no
-    /// alignment — and nothing from a body a byte short or a byte long.
     #[test]
     fn a_record_reads_from_exactly_its_bytes() {
         let mut buf = [0u8; 1 + 145];
@@ -625,9 +601,7 @@ mod tests {
         assert!(DeviceRecord::read(&buf[1..146]).is_none());
     }
 
-    /// **An I/O snapshot reads by its header's count**, each field at its offset — bytes laid out
-    /// by hand as the kernel's `repr(C)` writes them, not by this crate's own structs — and a
-    /// wrong magic, version, record size or count is refused.
+    /// Bytes are laid out by hand as the kernel's `repr(C)` writes them, not by this crate's structs.
     #[test]
     fn an_io_snapshot_reads_its_counted_records_and_refuses_the_rest() {
         let mut page = [0u8; 4096];
