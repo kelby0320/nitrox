@@ -29,7 +29,8 @@ Each failure names the file and line and says how to fix it.
 **A crate's whole budget**: `cargo xtask check-comments --ratio DIR` counts the tracked Rust files
 under `DIR` the same way and fails when their comment lines pass 0.15 of their code **on top of**
 a line for each `pub` item and field, each `TODO(tag)` and each module: the docs and deferrals the
-rules require are not what the share is for, as a `SAFETY` comment is not. **`cargo xtask check-comments --only-comments [REV]`** fails a commit
+rules require are not what the share is for, as a `SAFETY` comment is not. It also fails on any
+comment there that cites history, by the same reading as the branch check. **`cargo xtask check-comments --only-comments [REV]`** fails a commit
 (`HEAD` by default), or with `--worktree` the uncommitted changes, that changes anything but comments: a file added, removed or not Rust, or a
 Rust file's code once its `//` comments are taken out, a `//` inside a string literal being code.
 

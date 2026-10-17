@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::comments::{Kind, Line, kind, safety_lines};
+use super::comments::{Kind, Line, kind, reference, safety_lines};
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -17,6 +17,8 @@ struct Budget {
     comments: usize,
     floor: usize,
     files: usize,
+    /// Each comment citing a PR, a review, a phase or a part, as `file:line: cited`.
+    citations: Vec<String>,
 }
 
 impl Budget {
@@ -63,6 +65,11 @@ fn budget(files: &[(String, String)]) -> Budget {
             .collect();
         let safety = safety_lines(&lines);
         for (line, is_safety) in lines.iter().zip(safety) {
+            if kind(&line.text) == Kind::Comment
+                && let Some(cited) = reference(&line.text)
+            {
+                b.citations.push(format!("{file}:{}: {cited}", line.line));
+            }
             match kind(&line.text) {
                 Kind::Comment if !is_safety => {
                     b.comments += 1;
@@ -117,11 +124,18 @@ pub(crate) fn cmd_ratio(args: &[String]) -> R<()> {
         b.floor,
         b.files
     );
-    if b.comments <= b.allowed() {
-        println!("check-comments: {line} ✓");
-        Ok(())
-    } else {
-        Err(format!("check-comments: {line}; {} over", b.comments - b.allowed()).into())
+    for c in &b.citations {
+        eprintln!("  {c}: cites history; say why the code is as it is instead");
+    }
+    match (b.comments <= b.allowed(), b.citations.is_empty()) {
+        (true, true) => {
+            println!("check-comments: {line} ✓");
+            Ok(())
+        }
+        (within, _) => {
+            let over = if within { String::new() } else { format!("; {} over", b.comments - b.allowed()) };
+            Err(format!("check-comments: {line}{over}; {} citation(s)", b.citations.len()).into())
+        }
     }
 }
 
@@ -257,6 +271,15 @@ mod tests {
         let code: String = (0..20).map(|i| format!("pub fn f{i}() {{}}\n")).collect();
         let b = budget(&[("a.rs".to_string(), code.clone()), ("b.rs".to_string(), code)]);
         assert_eq!((b.code, b.floor, b.files, b.allowed()), (40, 40, 2, 6 + 40 + 2));
+    }
+
+    #[test]
+    fn a_comment_citing_history_is_found_and_one_saying_why_is_not() {
+        let b = crate_of(
+            "// Kept since PR #123's review.\nlet a = 1;\n// The cache is per file.\n/// Phase 6 Part H.4 made it.\n",
+        );
+        assert_eq!(b.citations.len(), 2, "{:?}", b.citations);
+        assert!(b.citations[0].starts_with("a.rs:1: "), "{:?}", b.citations);
     }
 
     #[test]

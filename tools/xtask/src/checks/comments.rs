@@ -204,7 +204,7 @@ fn body(comment: &str) -> &str {
 
 /// The reference a comment makes to a PR, an issue, a review finding, a phase, a part, a milestone
 /// or a slice, if it makes one.
-fn reference(comment: &str) -> Option<String> {
+pub(super) fn reference(comment: &str) -> Option<String> {
     fn clean(w: &str) -> &str {
         let w = w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '#'));
         w.strip_suffix("'s").or_else(|| w.strip_suffix("’s")).unwrap_or(w)
