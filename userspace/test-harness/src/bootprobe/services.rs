@@ -2,22 +2,19 @@
 
 use super::*;
 
-/// **A restarted server is reached again at its path** (administration Part E.1).
+/// **A restarted server is reached again at its path.**
 ///
-/// `restart-probe` is a test image's server, declared with `endpoint = "/svc/restart-probe"` and
-/// `policy = "always"`. It answers `id` with a token unique to the instance, and exits when asked
-/// for `exit`. So: take its token, have it exit, and resolve the same path until a different token
-/// comes back — from the instance `service-mgr` started in its place.
+/// `restart-probe` is a test image's server (`policy = "always"`). It answers `id` with a token
+/// unique to the instance, and exits when asked for `exit`. So: take its token, have it exit,
+/// and resolve the same path until a different token comes back.
 ///
 /// **What this proves is the registry.** The root's `/svc/restart-probe` is bound once, to
-/// `service-mgr`'s route for the server, and never again: only the registry binding changes on a
-/// restart. A root binding to the server's own endpoint would reach the dead one, which answers
-/// `PeerClosed`, however long this waited.
+/// `service-mgr`'s route for the server; only the registry binding changes on a restart. A root
+/// binding to the server's own endpoint would reach the dead one, which answers `PeerClosed`.
 ///
-/// **And that a binding made before the restart reaches the new instance** (Part E.1b), in a copy
-/// of the root made before it. That is a session's case: its bindings are made at login, of the
-/// same route the root binds, and nothing rebinds them. A restart that rebound the root's path
-/// alone passes the first half and fails this one.
+/// **And that a binding made before the restart reaches the new instance**, in a copy of the
+/// root made before it: a session's case, whose bindings nothing rebinds. A restart that rebound
+/// the root's path alone passes the first half and fails this one.
 pub(super) fn restart_test(root_ns: u64) -> bool {
     let fail = |what: &[u8]| {
         Line::new().s(b"boot-probe: restart: ").s(what).s(b" FAIL").end();
@@ -38,10 +35,8 @@ pub(super) fn restart_test(root_ns: u64) -> bool {
     let Some(first) = token(root_ns) else {
         return fail(b"/svc/restart-probe answered no token");
     };
-    // **A namespace bound before the restart, and never touched again** — a session's, as a
-    // supervisor builds one (administration Part E.1b). A copy of the root holds the same binding
-    // objects the root does, and later changes to the root do not reach it: a restart that
-    // rebound the root's path alone would leave this one at the server that exited.
+    // **A namespace bound before the restart, and never touched again** — a session's. A copy
+    // of the root holds the same binding objects, and later changes to the root do not reach it.
     // SAFETY: a namespace handle this process holds; the copy is its own to close.
     let copy = unsafe { syscall1(SYS_NS_DERIVE, root_ns) };
     if copy <= 0 {
@@ -100,18 +95,18 @@ pub(super) fn restart_test(root_ns: u64) -> bool {
     true
 }
 
-/// **Starting, stopping and restarting services** (administration Part E.2), on an admin session
-/// opened as the view broker's `services` grant will open one: the endpoint
-/// `/svc/services/admin-endpoint` mints, bound in a namespace the probe builds, and resolved there.
+/// **Starting, stopping and restarting services**, on an admin session opened as the view
+/// broker's `services` grant opens one: the endpoint `/svc/services/admin-endpoint` mints, bound
+/// in a namespace the probe builds, and resolved there.
 /// 1. `/svc/services/all.tsm` lists the declarations, `clipboard-server` running.
 /// 2. **A stop is answered once it has happened**: the table then says `stopped`, and
 ///    `/dev/clipboard` answers `NotFound` — its registry entry went with the server.
-/// 3. A start is answered once the server is up, and `/dev/clipboard` opens again.
-/// 4. A restart is answered once the new instance is up, and the table counts it.
-/// 5. The refusals: an essential service's stop and restart, a name nothing declares, a start of a
+/// 3. A start and a restart are answered once the server is up, `/dev/clipboard` opens again,
+///    and the table counts the restart.
+/// 4. The refusals: an essential service's stop and restart, a name nothing declares, a start of a
 ///    running service.
-/// 6. **A restart whose session closes at once still starts the service again** (PR #341 review,
-///    finding 1): only the answer is lost with the session.
+/// 5. **A restart whose session closes at once still starts the service again**: only the
+///    answer is lost with it.
 pub(super) fn services_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::services::{OP_SERVICES_RESTART, OP_SERVICES_START, OP_SERVICES_STOP};
@@ -121,7 +116,6 @@ pub(super) fn services_test(root_ns: u64) -> bool {
         false
     };
     let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT | libkern::RIGHT_DUPLICATE;
-    // A service's row: its state and its restarts.
     let row = |name: &str| -> Option<(alloc::string::String, i64)> {
         let (st, h) = ns_lookup(root_ns, b"/svc/services/all.tsm", RIGHT_MAP_READ | libkern::RIGHT_INSPECT);
         let bytes = if st == 0 { read_all(h) } else { None };
@@ -142,12 +136,10 @@ pub(super) fn services_test(root_ns: u64) -> bool {
         st
     };
 
-    // 1. The list.
     if state("clipboard-server").as_deref() != Some("running") || state("auth-service").is_none() {
         return fail(b"all.tsm does not list clipboard-server running, and auth-service");
     }
 
-    // The admin session, as the view broker will reach it.
     let (st, endpoint) = ns_lookup(root_ns, b"/svc/services/admin-endpoint", chan);
     if st != 0 || endpoint == 0 {
         return fail(b"no admin endpoint at /svc/services/admin-endpoint");
@@ -195,7 +187,6 @@ pub(super) fn services_test(root_ns: u64) -> bool {
         ok
     };
 
-    // 2. Stopped.
     if !answered(&ask(OP_SERVICES_STOP, b"clipboard-server")) {
         return finish(fail(b"a stop of clipboard-server was not answered"));
     }
@@ -205,14 +196,12 @@ pub(super) fn services_test(root_ns: u64) -> bool {
     if clipboard_opens() != KError::NotFound.as_i32() {
         return finish(fail(b"/dev/clipboard did not answer NotFound with its server stopped"));
     }
-    // 3. Started.
     if !answered(&ask(OP_SERVICES_START, b"clipboard-server")) {
         return finish(fail(b"a start of clipboard-server was not answered"));
     }
     if state("clipboard-server").as_deref() != Some("running") || clipboard_opens() != 0 {
         return finish(fail(b"clipboard-server started, and is not running at /dev/clipboard"));
     }
-    // 4. Restarted.
     let before = row("clipboard-server").map_or(-1, |r| r.1);
     if !answered(&ask(OP_SERVICES_RESTART, b"clipboard-server")) {
         return finish(fail(b"a restart of clipboard-server was not answered"));
@@ -221,7 +210,6 @@ pub(super) fn services_test(root_ns: u64) -> bool {
     if after.as_ref().map(|r| (r.0.as_str(), r.1)) != Some(("running", before + 1)) || clipboard_opens() != 0 {
         return finish(fail(b"clipboard-server restarted, and is not running, counted once, at /dev/clipboard"));
     }
-    // 5. Refused.
     if !refused(&ask(OP_SERVICES_STOP, b"auth-service"), KError::NoAccess)
         || !refused(&ask(OP_SERVICES_RESTART, b"auth-service"), KError::NoAccess)
     {
@@ -284,18 +272,17 @@ pub(super) fn services_test(root_ns: u64) -> bool {
     finish(true)
 }
 
-/// **The power endpoint answers nothing but a well-formed shutdown** (administration Part E.4b),
-/// on a session opened as the view broker's `power` grant will open one — and an admin session
-/// answers no shutdown at all. A well-formed one on a power session would stop this machine, so
-/// sending it is `check-shutdown`'s:
+/// **The power endpoint answers nothing but a well-formed shutdown**, on a session opened as the
+/// view broker's `power` grant opens one, and an admin session answers no shutdown at all. A
+/// well-formed one on a power session would stop this machine, so sending it is
+/// `check-shutdown`'s:
 /// - `Start` on a power session, refused `NoAccess`;
 /// - `Shutdown` with no body, two bytes, or a byte that names neither halt nor reboot, refused
 ///   `InvalidArgument`;
 /// - `Shutdown` on an admin session, refused `NoAccess`;
 /// - a third power endpoint while two are held, refused `WouldBlock`, and another taken at once
-///   once one is let go — which is `serve_services` answering closes before resolves. **The view
-///   broker holds the first** by then: `view_broker_test` has had it build `admin` views, whose
-///   `power` grant takes one for the boot (administration Part E.4d).
+///   once one is let go. **The view broker holds the first** by then: `view_broker_test` has had
+///   it build `admin` views, whose `power` grant takes one for the boot.
 pub(super) fn power_endpoint_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::services::{OP_SERVICES_SHUTDOWN, OP_SERVICES_START, SHUTDOWN_HALT, SHUTDOWN_REBOOT};
@@ -329,7 +316,6 @@ pub(super) fn power_endpoint_test(root_ns: u64) -> bool {
         }
         Some((ns, session))
     };
-    // Ask `op` on `session` and say how it was answered: `0`, or the refusal's `KError`.
     let ask = |session: u64, id: u64, op: u16, body: &[u8]| -> Option<i32> {
         if !rs_send(session, op, id, body, &[]) {
             return None;
@@ -387,7 +373,7 @@ pub(super) fn power_endpoint_test(root_ns: u64) -> bool {
     true
 }
 
-/// **Reading the log back** (administration Part E.6), through a read endpoint bound as the
+/// **Reading the log back**, through a read endpoint bound as the
 /// `logs` grant binds it:
 /// - a record this probe writes on a log source of its own is read back, principal, source, level
 ///   and message as written, and stamped with the wall clock;
@@ -395,8 +381,8 @@ pub(super) fn power_endpoint_test(root_ns: u64) -> bool {
 ///   `Read` `Unsupported`;
 /// - **two sessions at once, and a third refused** `WouldBlock`; one let go, and another opened
 ///   at once — so a closed session is retired, not waited on;
-/// - **two endpoints at once**, the broker's and this probe's: a third refused, and one minted at
-///   once when this probe's is let go.
+/// - **two endpoints at once**, the broker's and this probe's: a third refused, and one minted
+///   at once when this probe's is let go.
 ///
 /// **After `power_endpoint_test`, and so after `storage_grant_test`**, whose admin views make the
 /// broker resolve its read endpoint for the `logs` grant and keep it for the boot.
@@ -411,7 +397,6 @@ pub(super) fn logs_test(root_ns: u64) -> bool {
     const MESSAGE: &str = "boot-probe: a record to read back";
     liblog::open_source(root_ns, b"/log/system/boot-probe/logs-test").info(MESSAGE);
 
-    // A read endpoint, bound in a namespace of this probe's own at `/logs`, as the grant binds one.
     let (st, endpoint) = ns_lookup(root_ns, b"/log/read-endpoint", chan);
     if st != 0 || endpoint == 0 {
         return fail(b"no read endpoint through /log/read-endpoint");
@@ -483,7 +468,6 @@ pub(super) fn logs_test(root_ns: u64) -> bool {
     };
     let (short_refused, op_refused) =
         (refused_as(invalid, KError::InvalidArgument), refused_as(unsupported, KError::Unsupported));
-    // Two sessions, and a third refused; the second let go, and another taken at once.
     let (st2, second) = ns_lookup(ns, at, chan);
     let (st3, third) = ns_lookup(ns, at, chan);
     close(third);
@@ -508,10 +492,8 @@ pub(super) fn logs_test(root_ns: u64) -> bool {
         return fail(b"two read sessions, a third refused, and one at once after one was let go");
     }
     if e3 != KError::WouldBlock.as_i32() || e4 != 0 || again == 0 {
-        // **Which half, by number** (2026-10-01): one failure in five runs since the laptop
-        // polish's Part A, with two mints in the log rather than three, said only that one of the
-        // two did not hold. The statuses say whether the third was granted or the one after the let
-        // go was refused, which is the first thing the next occurrence has to tell us.
+        // The statuses say whether the third was granted or the one after the let go was
+        // refused, which the failure alone does not.
         Line::new()
             .s(b"boot-probe: logs: third endpoint status ")
             .i(e3 as i64)

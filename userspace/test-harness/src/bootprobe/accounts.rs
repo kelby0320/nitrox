@@ -2,18 +2,18 @@
 
 use super::*;
 
-/// **Accounts, fronted by the broker** (administration Part D.3).
+/// **Accounts, fronted by the broker.**
 ///
 /// **First the grant, as a view builds it**: `list /dev`, run in the admin view, names `accounts`
 /// there, and `policy` beside it. Then the ops, asked at the protocol on `/svc/views/accounts/<id>`
-/// — the suffix the grant's binding forwards to — for a session the probe opens as a supervisor
-/// does, under a principal no account has, so no guard sees the probe itself as logged in:
+/// for a session the probe opens as a supervisor does, under a principal no account has, so no
+/// guard sees the probe itself as logged in:
 /// - a client channel refuses `AddAccount`, and a name that is not one is refused without a home;
-/// - `d3probe` added, its home made with the three folders, and it authenticates;
-/// - `Accounts` names it with no session, then with the one the probe opens for it;
-/// - its removal refused while that session is open;
-/// - `ChangePassword` on its session: a wrong current password refused, and the right one answered
-///   only once the session's delay has passed; the new one authenticates and the old does not;
+/// - `d3probe` added with its home and folders, and it authenticates; `Accounts` names it with
+///   no session, then with the one the probe opens for it, and its removal is refused while
+///   that session is open;
+/// - `ChangePassword`: a wrong current password refused, the right one answered only once the
+///   session's delay has passed; the new password authenticates and the old does not;
 /// - `SetPassword` from the accounts channel;
 /// - removing `alice`, the only administrator, refused for that reason, with her logged out;
 /// - `d3probe` removed keeping its home, added again adopting it, and removed with it;
@@ -42,7 +42,6 @@ pub(super) fn accounts_test(root_ns: u64) -> bool {
         let _ = views_call(sup, OP_VIEWS_CLOSE_SESSION, 9, &b[..n], &[], &mut alloc::vec::Vec::new());
     };
 
-    // The grant, as a view builds it.
     let Some(as_alice) = open(DEMO_USER) else {
         close(sup);
         return fail(b"OpenSession for alice");
@@ -58,7 +57,6 @@ pub(super) fn accounts_test(root_ns: u64) -> bool {
         return fail(b"list /dev in the admin view does not name accounts and policy");
     }
 
-    // A session of the probe's own, and its channels.
     let Some(probe) = open(b"boot-probe") else {
         close(sup);
         return fail(b"OpenSession for the probe");
@@ -146,7 +144,6 @@ pub(super) fn accounts_test(root_ns: u64) -> bool {
         return finish(fail(b"a name that is not one was not refused, or made a directory"));
     }
 
-    // Added, with a home and its folders.
     match outcome(ask(acc, OP_VIEWS_ADD_ACCOUNT, &pair(NAME, b"first secret"))) {
         Some((true, why)) if says(&why, b"with a new home at /home/d3probe") => {}
         _ => return finish(fail(b"AddAccount did not add d3probe with a new home")),
@@ -161,7 +158,6 @@ pub(super) fn accounts_test(root_ns: u64) -> bool {
         return finish(fail(b"Accounts does not show d3probe with no session, and alice administering"));
     }
 
-    // Logged in: shown with its session, and not removed.
     let Some(as_d3) = open(NAME) else {
         return finish(fail(b"OpenSession for d3probe"));
     };
@@ -216,14 +212,12 @@ pub(super) fn accounts_test(root_ns: u64) -> bool {
         return finish(fail(b"Accounts still shows d3probe's closed session"));
     }
 
-    // An administrator's `SetPassword`, with no current password to prove.
     if !outcome(ask(acc, OP_VIEWS_SET_PASSWORD, &pair(NAME, b"third secret"))).is_some_and(|(s, _)| s)
         || !authenticates(NAME, b"third secret")
     {
         return finish(fail(b"SetPassword did not set d3probe's password"));
     }
 
-    // The only administrator, logged out, is not removed.
     let why: &[u8] = b"removing alice would leave no account that could use `views` for every program";
     if !refused_for(ask(acc, OP_VIEWS_REMOVE_ACCOUNT, &removal(DEMO_USER, false)), why)
         || !authenticates(DEMO_USER, DEMO_PASSWORD)
@@ -231,7 +225,6 @@ pub(super) fn accounts_test(root_ns: u64) -> bool {
         return finish(fail(b"removing alice, the only administrator, was not refused for that reason"));
     }
 
-    // Removed keeping the home, added again adopting it, and removed with it.
     match outcome(ask(acc, OP_VIEWS_REMOVE_ACCOUNT, &removal(NAME, false))) {
         Some((true, why)) if says(&why, b"keeping /home/d3probe") => {}
         _ => return finish(fail(b"RemoveAccount without the home did not remove d3probe")),
@@ -254,7 +247,6 @@ pub(super) fn accounts_test(root_ns: u64) -> bool {
         return finish(fail(b"a second removal of d3probe was not refused"));
     }
 
-    // A closed session's accounts channel closes with it.
     close_session(probe);
     let answered = ask(acc, OP_VIEWS_SET_PASSWORD, &pair(NAME, b"fifth secret")).is_some();
     close(acc);
@@ -268,17 +260,16 @@ pub(super) fn accounts_test(root_ns: u64) -> bool {
     true
 }
 
-/// **`auth-service`'s admin session, and the file it writes** (administration Part D.1).
+/// **`auth-service`'s admin session, and the file it writes.**
 ///
 /// Asked directly, as the view broker will ask it, on a session resolved at `/svc/auth/admin`:
-/// - an account added, then authenticated against on an ordinary oracle session;
-/// - its password set, after which the old one is refused and the new one accepted;
-/// - the account removed, after which it is refused altogether.
+/// an account added and authenticated against on an ordinary oracle session, its password set
+/// (the old one refused, the new accepted), and removed (refused altogether).
 ///
 /// **After each write, the file is read from the device**, raw, through the ext4 library: a
 /// re-resolve would read the page cache, and what is at stake is that the rename landed. `alice`'s
 /// line is the same bytes throughout. Each refusal is its own, and a suffix the service does not
-/// serve is `NotFound` — the whole error body, where a short one once arrived as `KernelError`.
+/// serve is `NotFound`.
 pub(super) fn auth_admin_test(root_ns: u64) -> bool {
     use libkern::KError;
     use librsproto::auth::{
@@ -331,7 +322,6 @@ pub(super) fn auth_admin_test(root_ns: u64) -> bool {
     let refused_with = |m: Option<Received>| {
         m.filter(|m| m.error).and_then(|m| librsproto::error::parse_error(&m.body).map(|e| e.kerror))
     };
-    // `Some(home)` if the oracle authenticates `name` with `pw`, `None` if it refuses.
     let authenticates = |name: &[u8], pw: &[u8]| -> Option<alloc::vec::Vec<u8>> {
         let mut b = [0u8; 256];
         let n = build_authenticate_request(&mut b, name, pw)?;
@@ -339,7 +329,6 @@ pub(super) fn auth_admin_test(root_ns: u64) -> bool {
         let r = parse_authenticate_reply(&m.body)?;
         r.is_authenticated().then(|| r.home.to_vec())
     };
-    // The file as the device holds it, and the line in it naming `name`.
     let on_device = || -> Option<alloc::vec::Vec<u8>> {
         let size = fs_server_ext4::ext4::stat_file(&dev, b"/system/users").ok()?;
         dev.read_file(b"/system/users", 0, size)
@@ -357,7 +346,6 @@ pub(super) fn auth_admin_test(root_ns: u64) -> bool {
     };
     let alice_unchanged = |file: &[u8]| line_of(file, b"alice").as_deref() == Some(&alice[..]);
 
-    // `List`: alice, and her home.
     let listed = |m: Option<Received>, name: &[u8]| {
         m.filter(|m| !m.error)
             .is_some_and(|m| parse_account_list(&m.body).is_some_and(|l| l.iter().any(|(n, _)| n == name)))
@@ -366,7 +354,6 @@ pub(super) fn auth_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"List does not name alice"));
     }
 
-    // An account added: the oracle knows it, and so does the device.
     const NAME: &[u8] = b"d1probe";
     let added = ask(admin, OP_AUTH_ADD, &account(NAME, b"first secret"));
     if !added.as_ref().is_some_and(|m| !m.error) {
@@ -385,7 +372,6 @@ pub(super) fn auth_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"alice's line changed when another account was added"));
     }
 
-    // Each refusal, its own.
     if refused_with(ask(admin, OP_AUTH_ADD, &account(NAME, b"x"))) != Some(KError::AlreadyExists.as_i32()) {
         return finish(fail(b"a second Add of one name was not AlreadyExists"));
     }

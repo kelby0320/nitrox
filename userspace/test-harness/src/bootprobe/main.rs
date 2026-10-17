@@ -1,30 +1,19 @@
 //! `boot-probe` — the in-guest substrate checks, and the boot verdict.
 //!
-//! **Why this is a program and not a phase of a supervisor.** The SMP and floating-point
-//! gates below lived in `session-mgr`, and the filesystem tests still live in `init`. They
-//! were there because *the verdict* was, not because they belong to a supervisor:
-//! `sched_gate` called itself "the Phase 3 clause 3 verdict gate, checked synchronously at
-//! the single PASS point", which is a statement about where the verdict is, and nothing
-//! about sessions. Move the verdict to a program whose job is adjudication and the probes
-//! follow it out. See [`docs/planning/test-path-retrofit.md`](../../../docs/planning/test-path-retrofit.md).
-//!
-//! **What it now owns**, as of Part B: the clause-3 scheduler gate, the hard-float gate,
-//! and `SYS_TEST_EXIT`. `init` still writes a FAIL verdict for a critical-path boot failure
-//! or a crashed demo chain — that is a different question ("did the boot get this far") and
-//! it is answered before this program starts. Part C moves `init`'s filesystem tests here.
+//! **Why a program and not a phase of a supervisor.** The verdict lives here, so the probes
+//! that gate it live here too: the scheduler and hard-float gates, the filesystem tests and
+//! the rest. `init` still writes a FAIL verdict for a critical-path boot failure or a crashed
+//! demo chain; that is answered before this program starts.
 //!
 //! **The ordering that makes the gates meaningful is `init`'s, and it is serial.**
 //! `init::supervise` runs the demo chain synchronously and fails the run on a non-zero
 //! exit, and only then hands off to the login chain that reaches `service-mgr` and this
 //! program. So everything the run adjudicates has already happened when the gates run, and
-//! they are the last thing before the only `SYS_TEST_EXIT(PASS)` call. That placement is
-//! the whole reason `fp_gate` was moved out of the demo `parent` in the first place — see
-//! its own doc comment.
+//! they are the last thing before the only `SYS_TEST_EXIT(PASS)` call.
 //!
-//! **Started by `service-mgr`** from `/system/services.toml` on the root, which carries a
-//! `[service.boot-probe]` table only in selftest / test-harness images. It is an ordinary
-//! declared service: a control channel at `rdx`, a LOOKUP-only view of the root namespace
-//! at `rsi`, no syscaps, and `policy = "never"` — start once, do not restart.
+//! **Started by `service-mgr`** from `/system/services.toml`, which carries a
+//! `[service.boot-probe]` table only in selftest / test-harness images: a LOOKUP-only root
+//! namespace, no syscaps, and `policy = "never"`.
 
 #![no_std]
 #![no_main]
@@ -124,11 +113,7 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
 /// Fire the boot verdict — terminate QEMU via `SYS_TEST_EXIT` with pass or fail.
 ///
 /// **The single PASS point.** `test-qemu` adjudicates the whole boot from this one call, so
-/// every check that must gate the run has to happen before it and in this process. That is
-/// why the SMP and floating-point gates above are here rather than wherever they are
-/// conceptually at home: they were in `session-mgr` for the same reason, because the verdict
-/// was, and they followed it here when it moved
-/// (`docs/planning/test-path-retrofit.md` Part B).
+/// every check that must gate the run has to happen before it and in this process.
 ///
 /// Outside `test-qemu` the `isa-debug-exit` device is not attached, so the port write is
 /// ignored and the syscall returns `Unsupported` — the caller carries on. It must not park
@@ -191,23 +176,15 @@ fn map_file(h: u64, len: u64, rights: u64) -> Option<u64> {
 /// process's notification channel, `rsi` = the inherited LOOKUP-only root namespace,
 /// `rdx` = the control-channel endpoint (`RECV | WAIT`), `rcx` = `arg0` (unused).
 ///
-/// **The control endpoint is held until exit, and closing it early is a bug.** An earlier
-/// version of this file closed it as its second instruction, reasoning that a probe with no
-/// lifecycle protocol to serve has no use for it. It does have one use, and it is not the
-/// probe's: `service-mgr` reads *this handle's* closure as "the child is gone"
-/// (`supervise`), because a pid on `KIND_CHILD_EXITED` cannot be matched to a process
-/// handle. Closing it early therefore reports a death that has not happened — observed as
-/// `'boot-probe' exited code=unknown` printed before this function's own next line, and
-/// under `policy = "always"` as a *second copy of a live service*, which is the exact
-/// failure this program was added to prove is gone (PR #226 review, finding 1).
+/// **The control endpoint is held until exit, and closing it early is a bug.** `service-mgr`
+/// reads *this handle's* closure as "the child is gone" (`supervise`), because a pid on
+/// `KIND_CHILD_EXITED` cannot be matched to a process handle. Closing it early reports a death
+/// that has not happened, and under `policy = "always"` starts a *second copy of a live
+/// service*. So hold it and let process teardown close it; this is a contract on every declared
+/// service (`docs/spec/service-toml-schema.md`).
 ///
-/// So: hold it, and let process teardown close it. That is what makes "peer closed" mean
-/// "child exited", and it is a contract on every declared service rather than a quirk of
-/// this one — see `docs/spec/service-toml-schema.md`.
-///
-/// **The verdict is fired, then the process exits.** `verdict` does not return under
-/// `test-qemu` (QEMU terminates), but it does everywhere else — every other gate boots this
-/// image without the `isa-debug-exit` device — so there is a real path past it.
+/// **The verdict is fired, then the process exits.** `verdict` returns everywhere but
+/// `test-qemu`, the only gate with the `isa-debug-exit` device.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"boot-probe: up\n");
@@ -250,15 +227,12 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         & logs_test(root_ns);
     verdict(ok);
     // **Reached only where the verdict device is absent** — every gate except `test-qemu`
-    // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
-    // execution continues here. Naming `test-qemu` on this line would name the one gate that
-    // is not running when it is reached.
+    // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported`.
     //
     // The exit code tracks the gates, and `service-mgr` reports it. `check-terminal`'s
     // `check_service_attribution` requires `code=0`, so a `sched_gate` or `fp_gate` regression
-    // fails **that** gate — with a message about attribution, since that is what it asserts.
-    // The `boot-probe: … FAIL` line naming the real cause is directly above it in the same
-    // transcript.
+    // fails **that** gate with a message about attribution; the `boot-probe: … FAIL` line naming
+    // the real cause is directly above it in the same transcript.
     exit(if ok { 0 } else { 1 });
 }
 

@@ -2,21 +2,20 @@
 
 use super::*;
 
-/// **A filesystem the storage service mounted, reached through it** (administration Part C.5b).
+/// **A filesystem the storage service mounted, reached through it.**
 ///
 /// The scratch disk is a RAM disk, and the service auto-mounted it at boot. Every step below goes
 /// through `/svc/storage`, so the service answers `fs/nitrox-scratch/…` with `SUBNAMESPACE`, and
 /// the kernel continues the resolve in the mount's own namespace, to the server the service spawned.
-/// 1. `fs` lists the label, as a directory.
-/// 2. The `README` the image builder wrote reads through the service.
-/// 3. **A file created and written through the service reaches the device**, read back from the
+/// 1. `fs` lists the label, as a directory, and the image builder's `README` reads through it.
+/// 2. **A file created and written through the service reaches the device**, read back from the
 ///    RAM disk itself, since a re-resolve would only read the page cache. A create is a resolve
-///    with a size, so this also carries C.4's continued operation through a real server.
-/// 4. **A session endpoint, bound as a login supervisor will bind it** (C.6): at `/storage` with
+///    with a size, so this also carries a continued operation through a real server.
+/// 3. **A session endpoint, bound as a login supervisor will bind it**: at `/storage` with
 ///    the base `/fs`, and at `/dev/storage` with the base `/info`, in a namespace the probe builds.
 ///    The same file and the same table come back. Bound with no base, it will not mint another
 ///    endpoint.
-/// 5. A label nothing is mounted under is `NotFound`.
+/// 4. A label nothing is mounted under is `NotFound`.
 pub(super) fn storage_mount_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_FILE_CREATE, SYS_NS_BIND, SYS_NS_CREATE};
     let fail = |what: &[u8]| {
@@ -30,7 +29,6 @@ pub(super) fn storage_mount_test(root_ns: u64) -> bool {
         bytes
     };
 
-    // 1. The directory of mounts.
     let mut dirbuf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
     let Ok(mut dir) = librsproto::session::Dir::open(root_ns, b"/svc/storage/fs", &mut dirbuf) else {
         return fail(b"/svc/storage/fs is not a directory");
@@ -50,12 +48,10 @@ pub(super) fn storage_mount_test(root_ns: u64) -> bool {
         return fail(b"/svc/storage/fs is not the one directory nitrox-scratch");
     }
 
-    // 2. A file the image builder wrote, through the service.
     if read(root_ns, b"/svc/storage/fs/nitrox-scratch/README").as_deref() != Some(SCRATCH_README) {
         return fail(b"the scratch disk's README did not read through /svc/storage");
     }
 
-    // 3. A file made through the service reaches the device.
     const LEN: u64 = 3 * PAGE + 100;
     let path = b"/svc/storage/fs/nitrox-scratch/probe-write";
     let Some(fh) = file_resize(SYS_FILE_CREATE, root_ns, path, LEN) else {
@@ -152,7 +148,6 @@ pub(super) fn storage_mount_test(root_ns: u64) -> bool {
         return fail(b"a session endpoint minted another");
     }
 
-    // 5. A label nothing is mounted under.
     let (st, h) = ns_lookup(root_ns, b"/svc/storage/fs/no-such-label/README", RIGHT_MAP_READ);
     close(h);
     if st != KError::NotFound.as_i32() {
@@ -162,12 +157,11 @@ pub(super) fn storage_mount_test(root_ns: u64) -> bool {
     true
 }
 
-/// **A directory whose listing fills its pages to the brim lists whole** (Phase 6 Part H): 200 files
+/// **A directory whose listing fills its pages to the brim lists whole**: 200 files
 /// with names long enough that a page of entries reaches the most one message carries, made on the
-/// scratch disk and listed through a session, as `list` and `copy` list one. A directory reply was
-/// sized by the page rather than by what a message carries, so a full page made a reply the kernel
-/// refused, the server never knew, and the client waited for good — here, `test-qemu` timing out
-/// at this step. Found by Part H's dry run on a FAT stick; the server loop is both filesystems'.
+/// scratch disk and listed through a session, as `list` and `copy` list one. A reply sized by the
+/// page rather than by what a message carries is one the kernel refuses, the server never knows,
+/// and the client waits for good — here, `test-qemu` timing out at this step.
 pub(super) fn long_listing_test(root_ns: u64) -> bool {
     use libkern::SYS_FILE_CREATE;
     let fail = |what: &[u8]| {
@@ -222,14 +216,14 @@ pub(super) fn long_listing_test(root_ns: u64) -> bool {
     true
 }
 
-/// **What `test-qemu` writes past 2 TiB** (Phase 6 Part G): a marker, then bytes no two of which a
+/// **What `test-qemu` writes past 2 TiB**: a marker, then bytes no two of which a
 /// sector at another place would share. The host reads it back out of the image.
 const PAST_TWO_TIB: &[u8; 32] = b"nitrox: past two tebibytes, G.5\n";
 
 /// **The block it goes at**: seven past the last a ten-byte command can name.
 const PAST_TWO_TIB_BLOCK: u64 = (1 << 32) + 7;
 
-/// **A USB disk of more than 2^32 blocks** (Phase 6 Part G.1's sixteen-byte commands): a sector
+/// **A USB disk of more than 2^32 blocks** (sixteen-byte commands): a sector
 /// written through its node past 2 TiB — where a ten-byte command's block number would wrap — and
 /// read back, the page cleared between. **On a machine with no such disk it says so and passes**:
 /// every `--selftest` gate runs this, and only `test-qemu` attaches one, which holds this line.
@@ -310,15 +304,14 @@ pub(super) fn past_two_tib_test(root_ns: u64) -> bool {
     true
 }
 
-/// **The storage service owns the disks and says what is on them** (administration Part C.5a),
+/// **The storage service owns the disks and says what is on them**,
 /// read through the root endpoint, since the probe runs in the root namespace.
 /// - `all.tsm` has a row per block record, in registry order: the device manager's replay reached
 ///   its owner whole.
 /// - `nitrox-root` is `init`'s, at `/`, and the only row mounted there, so nothing mounts the root
 ///   twice. The service mounts nothing on a boot with nothing to mount: the ESP is FAT, which it
 ///   recognises and does not serve, and the disk holds only its table.
-/// - What each device holds is what the image builder put there, read off the disks on a boot:
-///   the FAT recogniser's host tests use a sector `mformat` wrote, and this is the ESP itself.
+/// - What each device holds is what the image builder put there, read off the disks on a boot.
 pub(super) fn storage_test(root_ns: u64) -> bool {
     use alloc::string::String;
     use libkern::device::{DeviceKind, DeviceRecord};
@@ -381,7 +374,7 @@ pub(super) fn storage_test(root_ns: u64) -> bool {
     if t.rows[root][clean_c] != Value::Null {
         return fail(b"a root mounted writable reported how it was left");
     }
-    // **What the service mounted is the test image's scratch disk, and only it** (C.5b): the
+    // **What the service mounted is the test image's scratch disk, and only it**: the
     // one filesystem on this boot that is neither `init`'s nor FAT.
     let by_storage: alloc::vec::Vec<usize> = (0..t.rows.len()).filter(|&i| text(i, by_c) == Some("storage")).collect();
     let Some(scratch) = find(DeviceKind::RamDisk, b"") else {

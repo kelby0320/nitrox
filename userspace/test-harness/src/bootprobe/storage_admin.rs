@@ -2,32 +2,30 @@
 
 use super::*;
 
-/// **Unmounting and mounting, through an admin session** (administration Part C.5c), opened as the
+/// **Unmounting and mounting, through an admin session**, opened as the
 /// view broker will open one: the endpoint `/svc/storage/admin-endpoint` mints, bound at
 /// `/dev/storage/admin` in a namespace the probe builds, and resolved there.
 /// 1. `InUse` names the scratch disk, `init`'s root and the disk holding it, and not the ESP.
 /// 2. **An unmount is refused while a file is held**, and the mount is left as it was.
 /// 3. **A file written through a mapping and never synced survives an unmount**: the unmount's
-///    write-back is what puts it on the device, which then also says it was left clean.
-/// 4. The label is gone once unmounted, and a `Mount` by name brings the filesystem back, with the
-///    file, writable.
-/// 5. Each refusal is its own: a hidden label, `init`'s root, a device already mounted, a FAT device,
-///    an unknown label.
-/// 6. A session endpoint reaches no admin endpoint.
-/// 7. **A watch and a media session, opened through a session endpoint** (Phase 6 Part F): the
-///    watch is pinged by the unmount and by the remount, and not by the unmount refused; the media
-///    session's `Eject` of the scratch disk — a RAM disk, not removable — is refused `NoAccess`,
-///    and of a name nothing is mounted under `NotFound`, both leaving the mount as it was.
-/// 8. **`Reread`'s refusals** (Phase 6 Part G): the mounted scratch disk, and the disk holding
-///    `init`'s root, `WouldBlock`; a partition of the disk the machine started from that nothing has
-///    mounted, `NoAccess`; a name nothing has, `NotFound`. None pings the watch.
-/// 9. **And one taken**, where a USB disk holding a partition and nothing mounted is attached —
-///    `test-qemu`'s stick: rescanned, its partition departed and published again, and **the watch
-///    pinged though no mount changed**, which is what `disk --partition` waits on. **Its old
-///    partition's node, held across it** (PR #369 review): read through before, a `Rescan` sent to it
-///    refused `Unsupported` by its window, and refused `PeerClosed` after, its window retired.
-/// 10. **Every other disk answers a `Rescan` `Unsupported`**: the SATA disk's node and the scratch
-///     RAM disk's, sent one directly; and the scratch disk, unmounted, refused a `Reread` for it.
+///    write-back puts it on the device, which also says it was left clean. The label is gone
+///    once unmounted, and a `Mount` by name brings the filesystem back, with the file, writable.
+/// 4. Each refusal is its own: a hidden label, `init`'s root, a device already mounted, a FAT
+///    device, an unknown label. A session endpoint reaches no admin endpoint.
+/// 5. **A watch and a media session, opened through a session endpoint**: the watch is pinged by
+///    the unmount and the remount, not by the refused unmount; the media session's `Eject` of the
+///    scratch disk (a RAM disk, not removable) is `NoAccess`, of an unmounted name `NotFound`,
+///    both leaving the mount as it was.
+/// 6. **`Reread`'s refusals**: the mounted scratch disk and the disk holding `init`'s root,
+///    `WouldBlock`; an unmounted partition of the disk the machine started from, `NoAccess`; an
+///    unknown name, `NotFound`. None pings the watch.
+/// 7. **And one taken**, where a USB disk holding an unmounted partition is attached (`test-qemu`'s
+///    stick): rescanned, its partition departed and published again, and **the watch pinged
+///    though no mount changed**, which is what `disk --partition` waits on. **Its old partition's
+///    node, held across it**, refuses a `Rescan` `Unsupported` before and `PeerClosed` after,
+///    its window retired.
+/// 8. **Every other disk answers a `Rescan` `Unsupported`**: the SATA disk's node and the scratch
+///    RAM disk's, sent one directly; and the scratch disk, unmounted, refused a `Reread` for it.
 pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_FILE_CREATE, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::storage::{
@@ -47,7 +45,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     };
     let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT | libkern::RIGHT_DUPLICATE;
 
-    // The devices, by what the table says of them.
     let table = || read(root_ns, b"/svc/storage/info/all.tsm").and_then(|b| Table::decode(&b).ok());
     let Some(t) = table() else {
         return fail(b"all.tsm would not read");
@@ -76,7 +73,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         return fail(b"a table name matches no registry record");
     };
 
-    // The admin session, as the view broker will reach it.
     let (st, endpoint) = ns_lookup(root_ns, b"/svc/storage/admin-endpoint", chan);
     if st != 0 || endpoint == 0 {
         return fail(b"no admin endpoint at /svc/storage/admin-endpoint");
@@ -123,7 +119,7 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         ok
     };
 
-    // 0. **A watch and a media session, as a session opens them** (Phase 6 Part F): a resolve of
+    // 0. **A watch and a media session, as a session opens them**: a resolve of
     //    `info/watch` and of `info/media` on a session endpoint, each answered with a channel.
     let (st, endpoint) = ns_lookup(root_ns, b"/svc/storage/session-endpoint", chan);
     let open = |suffix: &[u8]| -> Option<u64> {
@@ -161,10 +157,8 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         }
         any
     };
-    // Whatever earlier tests' mounts and unmounts queued.
     pinged(0);
 
-    // 1. What is in use.
     let mut ids = alloc::vec::Vec::new();
     let in_use = ask(OP_STORAGE_IN_USE, &[]);
     if !in_use.as_ref().is_some_and(|m| !m.error && parse_in_use(&m.body, |id| ids.push(id))) {
@@ -177,7 +171,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"InUse is not the scratch disk, the root and its disk, without the ESP"));
     }
 
-    // 2. Refused while a file is held.
     let (st, held) = ns_lookup(root_ns, b"/svc/storage/fs/nitrox-scratch/README", RIGHT_MAP_READ);
     if st != 0 || held == 0 {
         return finish(fail(b"the README would not open to hold"));
@@ -197,7 +190,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"a refused unmount did not leave the mount as it was"));
     }
 
-    // 3. A write through a mapping, never synced.
     const LEN: u64 = 2 * PAGE + 17;
     let Some(fh) = file_resize(SYS_FILE_CREATE, root_ns, b"/svc/storage/fs/nitrox-scratch/unsynced", LEN) else {
         return finish(fail(b"a file would not create to write unsynced"));
@@ -233,7 +225,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"the table still shows the scratch disk mounted"));
     }
 
-    // 5. On the device: the unsynced file, and a filesystem left clean.
     let Some(raw) = RootDevice::on(root_ns, alloc::format!("/dev/blk/{}", scratch_rec.served).as_bytes()) else {
         return finish(fail(b"the scratch disk's device would not open raw"));
     };
@@ -249,10 +240,9 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     }
 
     // 5b. **A `Reread` of the scratch disk, unmounted**: a RAM disk, which the kernel cannot rescan,
-    //     so `Unsupported` (Phase 6 Part G) — the one disk this boot can ask that of.
+    //     so `Unsupported` — the one disk this boot can ask that of.
     let reread = ask(OP_STORAGE_REREAD, names[0].as_bytes());
     if !refused(&reread, KError::Unsupported) {
-        // What it was answered, for whoever reads the failure.
         let said = reread.as_ref().and_then(|m| librsproto::error::parse_error(&m.body));
         Line::new()
             .s(b"boot-probe: storage admin: the scratch disk's Reread answered ")
@@ -287,7 +277,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"the remount is not writable"));
     }
 
-    // 7. Each refusal.
     let mount = |ask: &mut dyn FnMut(u16, &[u8]) -> Option<Received>, device: &str, label: &[u8]| {
         let mut body = [0u8; 96];
         let n = build_mount(&mut body, device.as_bytes(), label).unwrap_or(0);
@@ -306,7 +295,6 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         }
     }
 
-    // 8. A session endpoint reaches no admin endpoint.
     let (st, session) = ns_lookup(root_ns, b"/svc/storage/session-endpoint", chan);
     if st != 0 || session == 0 {
         return finish(fail(b"no session endpoint"));
@@ -348,10 +336,9 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
         return finish(fail(b"a refused eject unmounted the scratch disk"));
     }
 
-    // 10. **`Reread`'s refusals** (Phase 6 Part G). The disk the machine started from is found by its
-    //     flag, and its partition by its parent: on `test-qemu` the SATA disk's ESP, on a live boot
-    //     the stick's — never "the first FAT", which on some machines is an internal disk's, that a
-    //     `Reread` would take.
+    // 10. **`Reread`'s refusals**. The disk the machine started from is found by its flag, and
+    //     its partition by its parent — never "the first FAT", which on some machines is an
+    //     internal disk's, that a `Reread` would take.
     let blk = |r: &libkern::device::DeviceRecord| alloc::format!("blk-{}", r.served);
     let root_disk = registry.iter().find(|r| r.id == root_rec.parent);
     let mounted_ids: alloc::vec::Vec<u32> = ids.clone();
@@ -383,7 +370,7 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     }
 
     // 11. **A disk read again**: its old partition record departs and a new one arrives, with no
-    //     mount on either — the change a watch is pinged for since Part G, the devices'.
+    //     mount on either — the change a watch is pinged for.
     let stick = registry.iter().find(|r| {
         r.kind() == libkern::device::DeviceKind::Disk
             && r.driver() == b"usb-storage"
@@ -416,7 +403,7 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     }
     match stick {
         Some(stick) => {
-            // **Its old partition's node, held across the rescan** (PR #369 review): the window's own
+            // **Its old partition's node, held across the rescan**: the window's own
             // refusal of a `Rescan`, and its retirement, through the node a holder keeps.
             let Some(old) = registry.iter().find(|p| {
                 p.parent == stick.id && p.kind() == libkern::device::DeviceKind::Partition && !p.is_departed()
@@ -471,7 +458,7 @@ pub(super) fn storage_admin_test(root_ns: u64) -> bool {
     finish(true)
 }
 
-/// **One block operation on `dev`, waited for** (Phase 6 Part G): its status — `0`, the error its
+/// **One block operation on `dev`, waited for**: its status — `0`, the error its
 /// completion carried, or the submit's own refusal. A page is made for the data of a read or a
 /// write of `length` bytes at `offset`; a `Rescan` or a `Flush` names none.
 fn block_op(dev: u64, opcode: u32, offset: u64, length: u64) -> i64 {
@@ -494,16 +481,14 @@ fn block_op(dev: u64, opcode: u32, offset: u64, length: u64) -> i64 {
     status
 }
 
-/// **`disk`, through the `storage` grant** (administration Part C.7): the success path a person
-/// takes with `with admin disk`, from a view the broker built. `disk --unmount nitrox-scratch`
-/// and then `disk --mount /dev/blk/<n>` each run in the admin view with a stdout pipe. The table
-/// each writes is read back, its exit code checked, and the service's own table checked after it.
-/// This is the one boot that reaches `/dev/storage/admin` through a view — the grant's binding,
-/// which C.6 bound and nothing used until `disk`.
+/// **`disk`, through the `storage` grant**: the success path of `with admin disk`.
+/// `disk --unmount nitrox-scratch` and then `disk --mount /dev/blk/<n>` each run in the admin
+/// view with a stdout pipe; the table each writes and its exit code are checked, and then the
+/// service's own table.
 ///
 /// **Then a busy service, which is not a missing grant.** With every admin session taken,
-/// `disk --unmount` in the same view is refused, and what it writes on `stderr` names the service's
-/// `WouldBlock` rather than telling a person who holds the grant to go and get it.
+/// `disk --unmount` in the same view is refused, and what it writes on `stderr` names the
+/// service's `WouldBlock` rather than telling a person who holds the grant to go and get it.
 pub(super) fn storage_grant_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::views::*;

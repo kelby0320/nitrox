@@ -21,26 +21,23 @@ fn nap(ns: u64) {
     close(theirs);
 }
 
-/// **The device registry, through its binding** (administration Part B.1). The kernel's host tests
-/// see its table as a value; this sees `/dev/registry` as a process does, and holds it to the
-/// paths it has to agree with:
+/// **The device registry, through its binding.** The kernel's host tests see its table as a
+/// value; this sees `/dev/registry` as a process does, and holds it to the paths it has to agree
+/// with:
 /// - the snapshot decodes, through the reader everything else will use;
 /// - **its block records are exactly what probing `/dev/blk` finds** — the same number, and each
 ///   record's served index resolving to a device of the record's size, whose `info` gives the
 ///   record's name;
 /// - **the i8042's keyboard is served at 0 and its mouse at 1**, each resolving under
-///   `/dev/input/raw`; a USB keyboard or mouse (Phase 6 Part B.2) resolves there too, at an index
-///   after every i8042 record's — from 0 on a machine with no i8042 — under its `UsbDevice` record,
-///   driven by `usb-hid`; and there is a keyboard and a mouse, from either;
+///   `/dev/input/raw`; a USB keyboard or mouse (driven by `usb-hid`, under its `UsbDevice`
+///   record) resolves there too, at an index after every i8042 record's; and there is a keyboard
+///   and a mouse, from either;
 /// - every record's `/dev/registry/<id>` is a device node, **and its id is its place** — which a
 ///   phantom record read past the count, all zeros, cannot be;
-/// - **a USB device is under the controller that enumerated it** (Phase 6 Part A.3): its parent a
+/// - **a USB device is under the controller that enumerated it**: its parent a
 ///   PCI function of class `0c/03/30` claimed by `xhci`, with a port, a speed and a name, which no
 ///   other kind carries. Each is printed, for `test-qemu` to hold to what QEMU attached: the
 ///   kernel's own line says a device was enumerated, and only this says the table got it.
-///
-/// The paths and the records read one field in the kernel, so a disagreement here would be a new
-/// path that stopped reading it.
 pub(super) fn registry_test(root_ns: u64) -> bool {
     use libkern::device::DeviceKind;
     use libkern::{RIGHT_INSPECT, RIGHT_READ};
@@ -56,7 +53,7 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
     let mut blocks = 0u32;
     let (mut keyboard, mut mouse) = (false, false);
     // **Where a USB input record may be served from: after every i8042 record**, which on a machine
-    // with no i8042 is 0. A fixed 2 failed every USB record on that machine (PR #358 review).
+    // with no i8042 is 0, not a fixed 2.
     let usb_from = all
         .iter()
         .filter(|r| matches!(r.kind(), DeviceKind::Keyboard | DeviceKind::Mouse) && r.driver() != b"usb-hid")
@@ -69,7 +66,7 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
             return fail(b"the records are not the table in order");
         }
         let path = alloc::format!("/dev/registry/{}", r.id);
-        // **A departed device's paths answer `NotFound`** (Phase 6 Part C) — its id, and its served
+        // **A departed device's paths answer `NotFound`** — its id, and its served
         // index on its own path — and nothing else about it is checked: the record is a history, not
         // a device. `test-qemu`'s hot-plug leaves one or two in most boots.
         if r.is_departed() {
@@ -125,8 +122,8 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
                 if !named {
                     return fail(b"a block record's name is not its device's");
                 }
-                // **A USB disk is under its USB device, and its partitions under it** (Phase 6
-                // Part D): said, for `test-qemu` to hold to the stick it attached.
+                // **A USB disk is under its USB device, and its partitions under it**: said, for
+                // `test-qemu` to hold to the stick it attached.
                 if r.driver() == b"usb-storage" {
                     if !all.get(r.parent as usize).is_some_and(|p| p.kind() == DeviceKind::UsbDevice) {
                         return fail(b"a USB disk is not under its USB device");
@@ -222,7 +219,6 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
             _ => {}
         }
     }
-    // What the probes find, the old way.
     let mut probed = 0u32;
     loop {
         let dev = alloc::format!("/dev/blk/{probed}");
@@ -246,7 +242,7 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
     if !keyboard || !mouse {
         return fail(b"no keyboard and mouse records");
     }
-    // **The disk the machine started from, flagged, and nothing else** (Phase 6 Part D): every boot
+    // **The disk the machine started from, flagged, and nothing else**: every boot
     // that runs this one came off a GPT disk, so exactly one record says so, and it is a disk.
     let mut boot = all.iter().filter(|r| r.is_boot_medium());
     match (boot.next(), boot.next()) {
@@ -260,10 +256,10 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
         (None, _) => return fail(b"no record is flagged as the disk the machine started from"),
         _ => return fail(b"the boot flag is on more than one record, or on one that is not a present disk"),
     }
-    // **`/dev/registry/changes` refuses a read too short for its answer**, at submission (PR #361
-    // review): `io-operation.md`'s rule, which the manager's eight-byte reads never test. Asked past
-    // generation 0, which the table is long past, so a node that took it would answer at once rather
-    // than keep one of the four places a waiting read has.
+    // **`/dev/registry/changes` refuses a read too short for its answer**, at submission
+    // (`io-operation.md`'s rule, which the manager's eight-byte reads never test). Asked past
+    // generation 0, so a node that took it would answer at once rather than keep one of the
+    // four places a waiting read has.
     let (st, changes) = ns_lookup(root_ns, b"/dev/registry/changes", RIGHT_READ);
     if st != 0 || changes == 0 {
         return fail(b"/dev/registry/changes does not open");
@@ -294,25 +290,17 @@ pub(super) fn registry_test(root_ns: u64) -> bool {
     true
 }
 
-/// **The device manager, through its own paths** (administration Part B.2), before any owner but
-/// `input-server` exists. `block` has no owner until Part C's storage service, so the probe takes
-/// it:
-/// - **the subscription replays every block device as `Arrived`, each with its node, then
-///   `Settled`** with the count — the same devices `/dev/registry` lists as block;
-/// - **a second subscription is refused while the first is held**, and taken once it is closed —
-///   one owner per class, the kernel's one reader per device kept at the manager;
+/// **The device manager, through its own paths.**
+/// - **`block` and `input` are refused, because the storage service and `input-server` hold
+///   them**, which is how a probe sees the owners took their devices from the manager;
 /// - **`info` lists `all.tsm` and a file per present device, and `all.tsm` is a table** with a row
-///   each, **agreeing with the registry's present records** once the manager has caught up (Phase 6
-///   Part C): it follows the table, so `test-qemu`'s hot-plug — landing while this runs — is in
-///   both, or departed from both. Each present USB device is listed as `usb-<id>.tsm`. Until Part
-///   C the manager read the table once, and this held it to a prefix of the registry. **It cannot
+///   each, **agreeing with the registry's present records** once the manager has caught up: it
+///   follows the table, so `test-qemu`'s hot-plug — landing while this runs — is in both, or
+///   departed from both. Each present USB device is listed as `usb-<id>.tsm`. **It cannot
 ///   see a manager that never follows** when the hot-plug has come and gone before that manager's
 ///   one read — a run with following removed passed it — so `check-input --usb`, which orders its
 ///   own plugs, is the gate that holds following, and this holds agreement wherever the plug lands;
-/// - **`input` is refused, because `input-server` holds it** (Part B.3) — which is how a probe
-///   sees that the input server took its devices from the manager rather than from the raw paths.
-///   Were it not held, this resolve would take the class for a moment and give it back;
-/// - **the info-only endpoint answers the tables and nothing else** (Part B.4): `block` and
+/// - **the info-only endpoint answers the tables and nothing else**: `block` and
 ///   another `info-endpoint` are `NotFound` on it, where the root endpoint subscribes and mints,
 ///   and `info` opens the directory.
 pub(super) fn devices_test(root_ns: u64) -> bool {
@@ -322,13 +310,10 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
     };
     let chan = libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT;
 
-    // **`block` has its owner from boot on** (administration Part C.5): `service-mgr` spawns the
-    // storage service straight after the manager and waits for its `Ready`, which comes only after
-    // it has subscribed and settled. So `block` is refused here, as `input` is below. Until C.5 the
-    // probe took the class itself, to see the replay settle before its resolve completed, a second
-    // owner refused, and the class taken again once closed. Those stay the manager's host tests and
-    // B.2's recorded controls, since taking the class now would take the disks from their owner.
-    // That the replay reaches its owner is `storage_test`'s: a row per block record.
+    // **`block` has its owner from boot on**: `service-mgr` spawns the storage service straight
+    // after the manager and waits for its `Ready`, which comes only after it has subscribed and
+    // settled. Taking the class here would take the disks from their owner; that the replay
+    // reaches it is `storage_test`'s: a row per block record.
     let (st, block) = ns_lookup(root_ns, b"/svc/devices/block", chan);
     close(block);
     if st != libkern::KError::AlreadyExists.as_i32() {
@@ -345,12 +330,11 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
         return fail(b"input is not held, so input-server did not take its devices from the manager");
     }
 
-    // **The endpoint a session is given answers the tables and nothing else** (Part B.4). `init`
-    // couriers one of these for every session's `/dev/devices`, and `desktop-shell` holds it with
-    // `BIND_NAMESPACE`, so it could bind it with no base — where the root endpoint would take
-    // `block` as a subscription to every disk. The probe cannot bind (it holds no syscaps), but a
-    // forwarding endpoint is a channel and the manager answers whatever resolve arrives on it, so
-    // the probe sends the resolves a namespace would forward, as the kernel would.
+    // **The endpoint a session is given answers the tables and nothing else.** `desktop-shell`
+    // holds one with `BIND_NAMESPACE`, so it could bind it with no base, where the root endpoint
+    // would take `block` as a subscription to every disk. The probe cannot bind (no syscaps), but
+    // the manager answers whatever resolve arrives on the channel, so the probe sends the
+    // resolves a namespace would forward.
     let (st, endpoint) = ns_lookup(root_ns, b"/svc/devices/info-endpoint", chan);
     if st != 0 || endpoint == 0 {
         return fail(b"no info-only endpoint at /svc/devices/info-endpoint");
@@ -395,12 +379,11 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
         return fail(b"the info-only endpoint would not open its directory");
     }
 
-    // **The information side: the manager agrees with the registry's present records** (Phase 6
-    // Part C). It follows the table, so once it has caught up its directory names every present
-    // device and no departed one, `all.tsm` has a row each, and every present USB device is
-    // `usb-<id>.tsm`. `test-qemu`'s hot-plug may still be landing as this runs, so both are read
-    // again until they agree, for five seconds at most. Until Part C the manager read the table
-    // once, and this held it to a prefix of the registry.
+    // **The information side: the manager agrees with the registry's present records.** It
+    // follows the table, so once it has caught up its directory names every present device and
+    // no departed one, `all.tsm` has a row each, and every present USB device is `usb-<id>.tsm`.
+    // `test-qemu`'s hot-plug may still be landing as this runs, so both are read again until
+    // they agree, for five seconds at most.
     let usb = |r: &libkern::device::DeviceRecord| r.kind() == libkern::device::DeviceKind::UsbDevice;
     let mut attempts = 0u32;
     let (rows, usb_named, departed) = loop {
@@ -442,7 +425,7 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
         // The object is page-sized; the decoder stops at the table's terminator.
         let rows = tbytes.and_then(|b| libstream::wire::Table::decode(&b).ok()).map(|t| t.rows.len());
         let present_usb = present.iter().filter(|r| usb(r)).count();
-        // `all.tsm` and `io.tsm` (Phase 6 Part H.2), then a file per device.
+        // `all.tsm` and `io.tsm`, then a file per device.
         let agree = has_all
             && has_io
             && names == present.len() + 2
@@ -472,7 +455,7 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
         }
         nap(100_000_000);
     };
-    // **And a listed USB device's file is its table** (PR #356 review): one row, named `usb-<id>`,
+    // **And a listed USB device's file is its table**: one row, named `usb-<id>`,
     // of kind `usb`, driven by `xhci`. The listing alone says only that a name was made.
     let now = registry_records(root_ns).unwrap_or_default();
     if let Some(r) = now.iter().find(|r| usb(r) && !r.is_departed()) {
@@ -505,28 +488,25 @@ pub(super) fn devices_test(root_ns: u64) -> bool {
     true
 }
 
-/// **What the disks and the page cache did, as `io.tsm` says** (Phase 6 Part H.2), read before and
+/// **What the disks and the page cache did, as `io.tsm` says**, read before and
 /// after a file of 64 pages is made on the scratch disk through the storage service and synced:
 /// 1. **the scratch disk's writes moved, its written bytes by at least the file's, and its busy
 ///    time** — the RAM disk's driver counted them where it served them — **and by no more than
-///    a few dozen commands** (Part H.4): 40 writes, the file's data in a write-back IRP a run of
-///    pages, its zeroes in 64 KiB writes, and the metadata — measured, 25. A page a command, the
-///    data and the zeroes took two writes a page and the file 145; a block at a time the allocator
-///    read and wrote the bitmap, descriptor and superblock for each block, and it took 328 — **and
-///    no read a page**, 32 in all: a page a grow just allocated fills as zero without reading it
-///    (`UNWRITTEN`, the second fix), and the server reads its directories, inodes and bitmaps
-///    once, through its metadata cache (the third). Measured, 12; uncached, 58; filling each page
+///    a few dozen commands** (40 writes; measured, 25): data goes in a write-back IRP a run of
+///    pages, zeroes in 64 KiB writes. A page a command took 145, a block at a time through the
+///    allocator 328 — **and no read a page**, 32 in all: a page a grow just allocated fills as
+///    zero without reading it (`UNWRITTEN`), and the server reads its directories, inodes and
+///    bitmaps once, through its metadata cache. Measured, 12; uncached, 58; filling each page
 ///    as well, 115 to 122;
 /// 2. **the page cache's write-backs moved, by at least the file's bytes** — bounded below only,
 ///    since every file's write-backs count there;
 /// 3. every present disk and RAM disk has a row, and the page cache one;
-/// 4. **the disk `init`'s root is on has read something** — at boot, through whichever driver it
-///    has: AHCI on an installed disk, a RAM disk on the live stick;
-/// 5. **a file of 64 pages the build wrote reads back as written, in at most eight reads** (Part
-///    H.4): nothing has opened it, so its pages fill from the device, each fill reading up to 31
-///    pages ahead of its own in the same IRP, to where its blocks jump on the device — measured,
-///    4, for the three extents `mke2fs` laid it in — where a page a fill took 64; and the page
-///    cache filled at least its bytes.
+/// 4. **the disk `init`'s root is on has read something**, through whichever driver it has;
+/// 5. **a file of 64 pages the build wrote reads back as written, in at most eight reads**:
+///    nothing has opened it, so each fill reads up to 31 pages ahead of its own in the same
+///    IRP, to where its blocks jump on the device — measured, 4, for the three extents
+///    `mke2fs` laid it in — where a page a fill took 64; and the page cache filled at least
+///    its bytes.
 ///
 /// Each holds on every machine this runs on, which is every `--selftest` gate's, so none names a
 /// device by position: the scratch disk by its label, the root's by what is mounted at `/`.
