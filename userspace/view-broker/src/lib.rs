@@ -1,19 +1,10 @@
 //! `view-broker` — the part of the view broker that can be wrong about who may do what.
 //!
 //! The broker runs a program in a **view**: its caller's namespace plus a profile's grants, when
-//! `/system/views.toml` says the caller may (`docs/planning/administration.md` § Part A). This
-//! library is everything it decides with, kept apart from the syscall plumbing so it can be
-//! tested on the host:
-//!
-//! - [`policy`] — reading `views.toml`, deciding a request, listing what a principal may use,
-//!   and the last-administrator guard;
-//! - [`pacing`] — the delay after a wrong password, held per *session*, so a program that opens
-//!   several requests at once still guesses at one per delay;
-//! - [`sessions`] — which sessions are open, for whom, under ids that are never reused;
-//! - [`accounts`] — the guards on removing an account, and what `Accounts` shows of each;
-//! - [`slots`] — room in the one wait set, counted so a client let in can always start;
-//! - [`suffix`] — what a forwarded resolve asked for, which is where a client's identity comes
-//!   from.
+//! `/system/views.toml` says the caller may. This library is everything it decides with, kept
+//! apart from the syscall plumbing so it can be tested on the host: the policy, the pacing of
+//! wrong passwords, the sessions, the account guards, the wait-set slots, and the suffix of a
+//! forwarded resolve, which is where a client's identity comes from.
 //!
 //! The spec for the file is `docs/spec/views-toml-schema.md`; the protocol is
 //! `docs/spec/rsproto-views-ops.md` and `librsproto::views`.
@@ -25,61 +16,57 @@ extern crate alloc;
 pub mod policy {
     //! `/system/views.toml` — profiles, and the rules that say who may use them for what.
     //!
-    //! **A focused reader, not a TOML parser**, in the house style (`init`'s `toml_lite`,
-    //! `service-mgr`'s `service_toml`): it reads exactly the shape the schema allows — `#`
-    //! comments, `[profile.<name>]` tables, `[[rule]]` entries, and values that are a string or a
-    //! one-line array of strings — and refuses the rest with the line it stopped at. A policy
-    //! that does not read denies everything, so a message that says where is the difference
-    //! between a mistake and an outage.
+    //! **A focused reader, not a TOML parser**: it reads exactly the shape the schema allows and
+    //! refuses the rest with the line it stopped at. A policy that does not read denies
+    //! everything, so a message that says where is the difference between a mistake and an
+    //! outage.
 
     use alloc::format;
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
 
-    /// Something a profile grants. **Part A knew one**; each later part adds its own, and a
-    /// policy naming a grant this broker does not know is refused rather than ignored — a grant
-    /// silently dropped is an administrator who believes they can do something they cannot.
+    /// Something a profile grants. A policy naming a grant this broker does not know is refused
+    /// rather than ignored — a grant silently dropped is an administrator who believes they can
+    /// do something they cannot.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Grant {
         /// Every block device **not in use**, raw: `/dev/blk/<n>` and its `info`, bound one by
-        /// one. Since administration Part C.6 the storage service's `InUse` is asked first, and a
-        /// mounted filesystem's device and the disk under it are left out.
+        /// one. The storage service's `InUse` is asked first, and a mounted filesystem's device
+        /// and the disk under it are left out.
         Disks,
         /// Mounting and unmounting: the storage service's admin endpoint, bound at
-        /// `/dev/storage/admin` (administration Part C.6).
+        /// `/dev/storage/admin`.
         Storage,
         /// **Changing the policy**: the broker's own policy endpoint, bound at `/dev/policy` with
-        /// the base `/policy/<session>`, which answers `Show` and `Install` (administration Part
-        /// D.2). Nothing else changes `/system/views.toml` on a running system, so **an
-        /// administrator is an account that may use this for every program**
-        /// ([`Policy::administrators`]).
+        /// the base `/policy/<session>`, which answers `Show` and `Install`. Nothing else changes
+        /// `/system/views.toml` on a running system, so **an administrator is an account that may
+        /// use this for every program** ([`Policy::administrators`]).
         Views,
         /// **Administering accounts**: the broker's own accounts endpoint, bound at `/dev/accounts`
         /// with the base `/accounts/<session>`, which answers `AddAccount`, `RemoveAccount` and
-        /// `SetPassword` (administration Part D.3). The broker checks the guards and asks
-        /// `auth-service`, the accounts' only writer.
+        /// `SetPassword`. The broker checks the guards and asks `auth-service`, the accounts' only
+        /// writer.
         Accounts,
         /// **Starting, stopping and restarting services**: `service-mgr`'s admin endpoint, bound at
-        /// `/dev/services/admin` (administration Part E.2b). `service-mgr` refuses an essential
-        /// service's stop itself, whoever holds this.
+        /// `/dev/services/admin`. `service-mgr` refuses an essential service's stop itself,
+        /// whoever holds this.
         Services,
         /// **Shutting the machine down, or restarting it**: `service-mgr`'s power endpoint, bound
-        /// at `/dev/power` (administration Part E.4d). A session opened there takes `Shutdown` and
-        /// nothing else. The seeded policy gives it to everyone, for `shutdown` only, as a
-        /// desktop's power button would.
+        /// at `/dev/power`. A session opened there takes `Shutdown` and nothing else. The seeded
+        /// policy gives it to everyone, for `shutdown` only, as a desktop's power button would.
         Power,
         /// **Setting the clock**: `SYSTEM_CLOCK` in the program's spawn, which `sys_clock_set`
-        /// asks for (administration Part E.5). The one grant that binds nothing — the kernel
-        /// checks a process-wide capability here, not a handle — so the program's children get it
-        /// only if it passes it on.
+        /// asks for. The one grant that binds nothing — the kernel checks a process-wide
+        /// capability here, not a handle — so the program's children get it only if it passes it
+        /// on.
         Clock,
-        /// **Reading the log back**: the logging service's read endpoint, bound at `/dev/logs`
-        /// (administration Part E.6), where a resolve opens a session that answers `Log::Read` —
-        /// every service's records, and this broker's audit among them.
+        /// **Reading the log back**: the logging service's read endpoint, bound at `/dev/logs`,
+        /// where a resolve opens a session that answers `Log::Read` — every service's records,
+        /// and this broker's audit among them.
         Logs,
-        /// **Reading the kernel's log** (Phase 6 Part B.7): a snapshot of the kernel's `/dev/log`,
-        /// taken as the view is made, bound at `/dev/log` — what `log --kernel` reads. A view is
-        /// made for each request, so a program run in one reads the log as it stood then.
+        /// **Reading the kernel's log**: a snapshot of the kernel's `/dev/log`, taken as the view
+        /// is made, bound at `/dev/log`. A view is made for each request, so a program run in one
+        /// reads the log as it stood then.
         KernelLog,
     }
 
@@ -448,19 +435,17 @@ pub mod policy {
         Ok(policy)
     }
 
-    /// **The policy a machine starts with, naming `name` its administrator** (administration Part
-    /// G.2): the build seeds it naming the demo account, and `nxinstall` writes it onto an installed
-    /// machine naming the first account it made. One text for both, so the policy an installed
-    /// machine starts with is the one every gate has run under.
+    /// **The policy a machine starts with, naming `name` its administrator**: written by the
+    /// build for the demo account and by `nxinstall` for the first account it makes, one text
+    /// for both, so an installed machine starts with the policy every gate runs under.
     ///
-    /// - **`admin`** grants everything, for every program, behind `name`'s password: what makes
-    ///   `name` an administrator ([`Policy::administrators`]).
-    /// - **`install`** grants `disks` alone, for `nxinstall` alone: a narrower view for the one
-    ///   program that needs disks, and the rule a gate is refused by when it asks for another.
+    /// - **`admin`** grants everything, for every program, behind `name`'s password.
+    /// - **`install`** grants `disks` alone, for `nxinstall` alone: the rule a gate is refused by
+    ///   when it asks for another program.
     /// - **`power`** lets the person at the machine turn it off, as a desktop's power button does.
     ///
-    /// `name` is not checked here: the build's is a constant, and the installer checks the name it
-    /// asks for with `libusers`' rule, which admits no character a TOML string would need escaped.
+    /// `name` is not checked here: the installer checks it with `libusers`' rule, which admits no
+    /// character a TOML string would need escaped.
     pub fn seed(name: &str) -> String {
         format!(
             "# The view broker's policy: who may run what in which view (docs/spec/views-toml-schema.md).\n\
@@ -523,9 +508,9 @@ pub mod policy {
         }
 
         /// **What a `Request` for `program` in `view` would be answered**, as the outcome and its
-        /// reason — `Decide`'s answer (administration Part F.3, PR #346 review). A `Request`
-        /// refuses a program that is not a bare name before it reads the policy, so this does
-        /// too; after that it is [`decide`](Self::decide), with the rule's `auth` as the outcome.
+        /// reason — `Decide`'s answer. A `Request` refuses a program that is not a bare name before
+        /// it reads the policy, so this does too; after that it is [`decide`](Self::decide), with
+        /// the rule's `auth` as the outcome.
         pub fn would(&self, principal: &str, view: &str, program: &str) -> (librsproto::views::Outcome, String) {
             use librsproto::views::Outcome;
             if !is_bare_name(program) {
@@ -556,17 +541,16 @@ pub mod policy {
         /// **Who, of `accounts`, could administer the system under this policy**: the accounts a
         /// rule lets use, **for every program**, a view whose profile grants [`Grant::Views`].
         ///
-        /// **To administer is to be able to change the policy again** (administration Part D.2,
-        /// PR #337 review). After Part D nothing but the `views` grant changes it, so a policy
-        /// under which no account could use that grant for everything could be replaced only from
-        /// the live image. Until D.2 this asked only for a view *named* `admin`, and a policy whose
-        /// `admin` profile had lost `views` passed.
+        /// **To administer is to be able to change the policy again.** Nothing but the `views`
+        /// grant changes it, so a policy under which no account could use that grant for
+        /// everything could be replaced only from the live image. A view merely *named* `admin`
+        /// is not enough: its profile must grant `views`.
         ///
-        /// Narrow on purpose (`administration.md` § Policy): a rule granting one program does not
-        /// make an administrator, and a broad `who = ["*"]` rule letting everyone power off must
-        /// not count, or removing the last real administrator would look safe. **Only accounts
-        /// that exist count**: `who = ["kelby"]` names nobody if `kelby` has no account, and
-        /// `who = ["*"]` names every account there is. In the order `accounts` gives them.
+        /// Narrow on purpose: a rule granting one program does not make an administrator, and a
+        /// broad `who = ["*"]` rule letting everyone power off must not count, or removing the
+        /// last real administrator would look safe. **Only accounts that exist count**:
+        /// `who = ["kelby"]` names nobody if `kelby` has no account, and `who = ["*"]` names
+        /// every account there is. In the order `accounts` gives them.
         pub fn administrators<'a>(&self, accounts: &[&'a str]) -> Vec<&'a str> {
             let grants_views =
                 |view: &String| self.profiles.iter().any(|p| &p.name == view && p.grants.contains(&Grant::Views));
@@ -610,9 +594,8 @@ pub mod pacing {
     //! arrives. The cap — three failures — is per request, as a login's is: a cap per session
     //! would let one program's wrong guesses lock its person out of `with` until they logged out.
     //!
-    //! **A deadline, never a sleep.** The broker is one thread serving every session and the
-    //! supervisors' logins; it keeps a check in [`Held`] until its session's
-    //! [`Pacing::check_at`] and waits on its other channels meanwhile.
+    //! **A deadline, never a sleep**: the broker is one thread serving every session, so a check
+    //! waits in [`Held`] until its session's [`Pacing::check_at`].
 
     use crate::sessions::Sessions;
     use alloc::vec::Vec;
@@ -647,10 +630,9 @@ pub mod pacing {
     /// key the broker chooses (its client's channel) and the session it arrived in.
     ///
     /// **A held check has no deadline of its own.** When one may run is asked of its session
-    /// each time, so a failure on any request holds every check still waiting in that session —
-    /// including those that arrived before it, whose delay had seemed to end sooner. A deadline
-    /// fixed when a password arrived would let a program queue a password on each of several
-    /// requests during one delay and have them all checked the moment it ended.
+    /// each time, so a failure holds every check still waiting in that session, including those
+    /// that arrived before it. A deadline fixed on arrival would let a program queue a password
+    /// on each of several requests during one delay and have them all checked when it ended.
     #[derive(Debug, Default)]
     pub struct Held {
         waiting: Vec<(u64, u64)>,
@@ -696,7 +678,7 @@ pub mod pacing {
 }
 
 pub mod grace {
-    //! **Passwords remembered per terminal** (the laptop polish's Part A).
+    //! **Passwords remembered per terminal.**
     //!
     //! A session remembers a password that succeeded **for the terminal it was typed at and the
     //! view it was typed for**, for [`WINDOW_NS`]: a later request matching both skips the prompt.
@@ -827,9 +809,9 @@ pub mod sessions {
 }
 
 pub mod accounts {
-    //! **Accounts, as the broker fronts them** (administration Part D.3). `auth-service` holds
-    //! them and is their only writer; the broker checks what only it knows — the policy, and who
-    //! is logged in — before it asks.
+    //! **Accounts, as the broker fronts them.** `auth-service` holds them and is their only
+    //! writer; the broker checks what only it knows — the policy, and who is logged in — before
+    //! it asks.
 
     use crate::policy::Policy;
     use crate::sessions::Sessions;
@@ -866,11 +848,11 @@ pub mod accounts {
             .collect()
     }
 
-    /// **What a write that did not say it succeeded came to** (PR #338 review). An answer that
-    /// never came is not a refusal: `auth-service` has the request, serves one at a time, and may
-    /// well carry it out after the broker stopped waiting. So an add or a removal whose answer was
-    /// anything but success is settled by **the account list, asked again**: `listed`, or `None` if
-    /// that went unanswered too.
+    /// **What a write that did not say it succeeded came to.** An answer that never came is not a
+    /// refusal: `auth-service` has the request, serves one at a time, and may carry it out after
+    /// the broker stopped waiting. So an add or a removal whose answer was anything but success is
+    /// settled by **the account list, asked again**: `listed`, or `None` if that went unanswered
+    /// too.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Settled {
         /// The list shows it done — `name` there after an add, gone after a removal.
@@ -893,8 +875,8 @@ pub mod accounts {
     /// **Why removing `name` is refused**, if it is. The guards, in the order a person should
     /// hear them:
     /// - no account of `accounts` has that name;
-    /// - **it is logged in**: removal waits until every session of the account has ended (the
-    ///   maintainer's call in Part D's detail pass, over ending the sessions);
+    /// - **it is logged in**: removal waits until every session of the account has ended, rather
+    ///   than the broker ending them;
     /// - the policy does not read (`Err`, with its reason), so whether an administrator would
     ///   remain cannot be said — refused rather than guessed;
     /// - **no account left could administer** ([`Policy::administrators`]).
@@ -938,8 +920,7 @@ pub mod slots {
     //! broker does not wait on is an exit it never sees, whose code is then paired with some other
     //! program's.
 
-    /// The forwarding endpoint, the notification channel and, since administration Part E.4, the
-    /// control channel.
+    /// The forwarding endpoint, the notification channel and the control channel.
     pub const FIXED: usize = 3;
 
     /// What the wait set holds, by how many slots each may come to need.
@@ -977,15 +958,12 @@ pub mod exits {
     //! `ChildExited`.
     //!
     //! **Either can come first.** `sys_process_exit` closes the program's handle table, its life
-    //! channel's end included, before it queues `ChildExited`, so that a peer's `PeerClosed` is
-    //! prompt. On another CPU the broker can see the close while the code is still to come. A
-    //! closed channel stays ready, so the broker must also stop waiting on it
-    //! ([`Exits::is_closed`]); otherwise every wake until the code arrives reports it again.
+    //! channel's end included, before it queues `ChildExited`. A closed channel stays ready, so
+    //! the broker must also stop waiting on it ([`Exits::is_closed`]); otherwise every wake until
+    //! the code arrives reports it again.
     //!
-    //! **A first version pushed the life on every report** (administration C.7, found by
-    //! `boot-probe` under KVM). A life reported twice left a copy behind. That copy then took the
-    //! next program's code and matched no program, and the code was lost. That program's life
-    //! then never paired: it was queued again on every wake until the broker ran out of memory.
+    //! A life is therefore queued once: a copy left by a second report would take the next
+    //! program's code, match no program, and lose it, and that program's life would never pair.
     //!
     //! Codes are still paired first with first. **Two exits in one wake can swap codes**, which is
     //! the residual of `TODO(child-exit-attribution)`.
@@ -1052,10 +1030,10 @@ pub mod suffix {
         /// `s/<id>`: a client in session `id`.
         Client(u64),
         /// `policy/<id>`: the policy endpoint, as the `views` grant binds it into a view of session
-        /// `id` (administration Part D.2).
+        /// `id`.
         Policy(u64),
         /// `accounts/<id>`: the accounts endpoint, as the `accounts` grant binds it into a view of
-        /// session `id` (administration Part D.3).
+        /// session `id`.
         Accounts(u64),
         /// Anything else — answered `NotFound`.
         Unknown,
@@ -1100,7 +1078,6 @@ mod grace_tests {
 
     const T0: u64 = 10_000_000_000;
 
-    /// **The window's edge, and the nanosecond either side of it.**
     #[test]
     fn a_password_is_remembered_for_five_minutes() {
         let mut w = Windows::default();
@@ -1111,8 +1088,6 @@ mod grace_tests {
         assert!(!w.covers(3, "admin", T0 + WINDOW_NS + 1), "past it");
     }
 
-    /// **Per terminal and per view** — the maintainer's calls: another window, another view, or
-    /// both, still asks.
     #[test]
     fn a_window_covers_its_terminal_and_view_only() {
         let mut w = Windows::default();
@@ -1136,7 +1111,6 @@ mod grace_tests {
         assert_eq!(w.len(), 1, "the expired one went");
     }
 
-    /// `with --forget` and a refused password both forget every window of the session.
     #[test]
     fn forgetting_forgets_every_window() {
         let mut w = Windows::default();
@@ -1147,8 +1121,8 @@ mod grace_tests {
         assert!(!w.covers(3, "admin", T0) && !w.covers(4, "install", T0));
     }
 
-    /// **The windows are the session's**: they end with it, and another session's are its own —
-    /// which is what keeps a password typed at the desktop out of a serial login.
+    /// The windows end with their session, and another session's are its own — which keeps a
+    /// password typed at the desktop out of a serial login.
     #[test]
     fn windows_belong_to_their_session() {
         let mut sessions = Sessions::new();
@@ -1204,9 +1178,8 @@ auth = "password"
         assert_eq!(p.rules[1].line, 15, "a rule remembers its header's line");
     }
 
-    /// **Two rules that both match, with different `auth`, in both orders** — the only fixture
-    /// that tells the first match from the last. Were the last to decide, the broad passwordless
-    /// rule below would let alice skip her password for `nxinstall` (PR #329 review, finding 2).
+    /// **Two matching rules with different `auth`, in both orders** tell the first match from the
+    /// last: were the last to decide, the passwordless rule would let alice skip her password.
     #[test]
     fn a_request_is_decided_by_the_first_rule_that_matches_all_three() {
         let p = parse(SEED).unwrap();
@@ -1240,8 +1213,8 @@ auth = "password"
         assert_eq!(p.decide("alice", "nope", "x"), deny("there is no view called `nope`"));
     }
 
-    /// **`storage` is a grant** (administration Part C.6), named beside `disks` and kept in the
-    /// order the policy gives, and the refusal of an unknown grant names it among the ones there are.
+    /// Grants are kept in the order the policy gives, and the refusal of an unknown grant names
+    /// it among the ones there are.
     #[test]
     fn storage_is_a_grant_a_policy_can_name() {
         let p = parse("[profile.admin]\ngrants = [\"disks\", \"storage\"]\n").unwrap();
@@ -1264,11 +1237,9 @@ auth = "password"
         assert!(KNOWN_GRANTS.contains(&Grant::Logs));
         let e = parse("[profile.admin]\ngrants = [\"teleport\"]\n").unwrap_err();
         assert!(e.message.contains("disks") && e.message.contains("storage"), "{e}");
-        // And `views` (administration Part D.2).
         assert_eq!(Grant::from_name("views"), Some(Grant::Views));
         assert_eq!(Grant::Views.name(), "views");
         assert!(e.message.contains("views"), "{e}");
-        // And `accounts` (administration Part D.3).
         assert_eq!(Grant::from_name("accounts"), Some(Grant::Accounts));
         assert_eq!(Grant::Accounts.name(), "accounts");
         assert!(e.message.contains("accounts"), "{e}");
@@ -1319,11 +1290,10 @@ auth = "password"
         assert_eq!(p.rows_for("carol"), []);
     }
 
-    /// **`Decide` answers as a `Request` would** (administration Part F.3, PR #346 review): the
-    /// three outcomes, each reason, and the first matching rule's `auth` — the overlapping rules
-    /// below list `power` twice, the first not running `shutdown` and asking a password, the
-    /// second running it without one. `Decide` replaced a client's reading of `List`, which the
-    /// broker cuts at 2 KiB, so a `power` row past the cut read as "no rule".
+    /// **`Decide` answers as a `Request` would**: the three outcomes, each reason, and the first
+    /// matching rule's `auth` — the overlapping rules below list `power` twice, the first not
+    /// running `shutdown` and asking a password, the second running it without one. A client's
+    /// reading of `List` cannot stand in, as the broker cuts it at 2 KiB.
     #[test]
     fn decide_answers_as_a_request_would() {
         use librsproto::views::Outcome;
@@ -1343,8 +1313,6 @@ auth = "password"
         assert_eq!(p.would("alice", "power", "/bin/shutdown"), denied("a program is a bare name, resolved under /bin"));
     }
 
-    /// **The seed makes its one account the one administrator** (administration Part G.2), and
-    /// nobody else anything but the power button: what an installed machine starts with.
     #[test]
     fn the_seed_makes_its_account_the_one_administrator() {
         let p = parse(&seed("bob")).expect("the seed reads");
@@ -1354,17 +1322,14 @@ auth = "password"
         assert!(matches!(p.decide("alice", "admin", "disk"), Decision::Deny(_)), "the demo account is not in it");
         assert!(matches!(p.decide("carol", "power", "shutdown"), Decision::Allow { auth: Auth::None, .. }));
         assert!(matches!(p.decide("carol", "power", "date"), Decision::Deny(_)));
-        // **`admin` grants everything this broker knows** (Phase 6 Part B.7), as its doc says: a
-        // grant added to the broker and forgotten here is one no installed machine could use.
+        // A grant forgotten in the seed is one no installed machine could use.
         let admin = p.profiles.iter().find(|pr| pr.name == "admin").expect("the admin profile");
         for g in KNOWN_GRANTS {
             assert!(admin.grants.contains(g), "the seed's admin lacks {}", g.name());
         }
     }
 
-    /// **The guard at its neighbours.** Only a profile granting `views`, with `run = ["*"]`, for
-    /// someone makes an administrator; one step away on each axis does not. Every case parses, so
-    /// an empty answer is the guard's and not the reader's.
+    /// Every case parses, so an empty answer is the guard's and not the reader's.
     #[test]
     fn only_views_for_every_program_makes_an_administrator() {
         let with = |who: &str, view: &str, run: &str| {
@@ -1384,9 +1349,8 @@ auth = "password"
         assert!(parse("").unwrap().administrators(&accounts).is_empty(), "an empty policy");
     }
 
-    /// **An administrator is whoever can use `views` for everything, whatever the view is
-    /// called** — the review's case, an `admin` profile that lost `views`, is not one, and a
-    /// profile under another name that has it is.
+    /// An `admin` profile that lost `views` is not an administrator's, and a profile under
+    /// another name that has it is.
     #[test]
     fn what_makes_an_administrator_is_the_views_grant_not_the_name() {
         let policy = |grants: &str, view: &str| {
@@ -1401,7 +1365,6 @@ auth = "password"
         assert_eq!(policy("\"views\"", "keeper").administrators(&accounts), ["alice"], "another name, with views");
     }
 
-    /// **Only accounts that exist count**, for each shape of `who`.
     #[test]
     fn an_administrator_is_an_account_that_exists() {
         let policy = |who: &str| {
@@ -1417,8 +1380,6 @@ auth = "password"
         assert!(policy("[\"*\"]").administrators(&[]).is_empty(), "`*` of nobody is nobody");
     }
 
-    /// **`check` is the reader, then the guard**: a policy that reads and leaves an administrator
-    /// passes, and one that reads and leaves none is refused for that reason, not another.
     #[test]
     fn check_refuses_a_policy_that_reads_but_leaves_no_administrator() {
         let text = |who: &str| {
@@ -1435,30 +1396,23 @@ auth = "password"
         assert!(check("[rule]\n", &["alice"]).unwrap_err().line == 1, "one that does not read says where");
     }
 
-    /// **Pacing is the session's.** Two requests in one session share the delay a failure on
-    /// either starts; a request in another session does not wait.
     #[test]
     fn a_failure_delays_the_sessions_next_check_on_any_request_but_not_another_sessions() {
         let mut s = Sessions::new();
         let a = s.open("alice");
         let b = s.open("bob");
         let t0 = 1_000;
-        // Request 1 in session `a` fails at t0.
         s.get_mut(a).unwrap().pacing.failed(t0);
-        // Request 2 in session `a`, half a second later, waits for the whole delay.
         let half = t0 + FAIL_DELAY_NS / 2;
         assert_eq!(s.get(a).unwrap().pacing.check_at(half), t0 + FAIL_DELAY_NS);
-        // Session `b` is not held.
         assert_eq!(s.get(b).unwrap().pacing.check_at(half), half);
-        // And after the delay, `a` is free again.
         let after = t0 + FAIL_DELAY_NS + 1;
         assert_eq!(s.get(a).unwrap().pacing.check_at(after), after);
         assert_eq!(Pacing::default().check_at(0), 0);
     }
 
     /// **One guess per delay, however many requests.** Passwords queued on several requests
-    /// during one delay are checked one per delay, not all at its end — a failure holds the checks that arrived before
-    /// it as well as after.
+    /// during one delay are checked one per delay, not all at its end.
     #[test]
     fn held_checks_in_a_session_run_one_per_delay_however_many_are_queued() {
         let mut s = Sessions::new();
@@ -1520,9 +1474,6 @@ auth = "password"
         assert!(a != 0 && b != 0, "zero never names a session");
     }
 
-    /// **At the neighbour.** With two slots free a client is let in and with one it is not;
-    /// either way, every client admitted can start its program without the wait set outgrowing
-    /// `max`.
     #[test]
     fn a_client_is_admitted_only_with_room_for_its_program_too() {
         const MAX: usize = 32;
@@ -1531,27 +1482,22 @@ auth = "password"
             load.clients += 1;
         }
         assert_eq!(load.clients, 14, "(32 - 3) / 2");
-        // Every one of them starts a program: channel and life channel each.
         let running = FIXED + 2 * load.clients;
         assert!(running <= MAX, "{running} handles in a {MAX}-slot wait set");
-        // Exactly two slots free: one more client fits.
         let two = Load { clients: 13, singles: 1, ..Load::default() };
         assert_eq!(two.worst(), MAX - 2);
         assert!(two.admits_client(MAX));
-        // One free: a supervisor fits, and half a client does not.
         let one = Load { singles: 2, ..two };
         assert_eq!(one.worst(), MAX - 1);
         assert!(!one.admits_client(MAX), "its program's life channel would have no slot");
         assert!(one.admits_supervisor(MAX));
-        // None free: nothing fits.
         let none = Load { supervisors: 1, ..one };
         assert!(!none.admits_supervisor(MAX));
         assert!(!none.admits_client(MAX));
     }
 
-    /// **A life reported closed twice before its code is queued once**: the case `boot-probe` hit
-    /// under KVM. The copy the first version left took the next program's code, matched nothing,
-    /// and lost it.
+    /// **A life reported closed twice before its code is queued once**, or the copy would take
+    /// the next program's code.
     #[test]
     fn a_life_reported_closed_twice_takes_one_code_and_leaves_the_next_one_alone() {
         let mut e = Exits::default();
@@ -1570,7 +1516,6 @@ auth = "password"
         assert_eq!(e.next(|_| true), None);
     }
 
-    /// **A closed life whose program is gone takes no code**: the code goes to the next one.
     #[test]
     fn a_life_no_longer_running_takes_no_code() {
         let mut e = Exits::default();
@@ -1581,7 +1526,6 @@ auth = "password"
         assert!(!e.is_closed(5), "dropped on the way");
     }
 
-    /// **A code can come first**, and waits for its close.
     #[test]
     fn a_code_before_its_close_waits_for_it() {
         let mut e = Exits::default();
@@ -1601,21 +1545,19 @@ auth = "password"
         for bad in bads {
             assert_eq!(suffix::parse(bad), Suffix::Unknown, "{:?}", core::str::from_utf8(bad));
         }
-        // The policy endpoint's base, with the same rule for the id (administration Part D.2).
         assert_eq!(suffix::parse(b"policy/3"), Suffix::Policy(3));
         for bad in [&b"policy/"[..], b"policy/0", b"policy/03", b"policy/x", b"policy", b"policies/3"] {
             assert_eq!(suffix::parse(bad), Suffix::Unknown, "{:?}", core::str::from_utf8(bad));
         }
-        // And the accounts endpoint's (administration Part D.3).
         assert_eq!(suffix::parse(b"accounts/12"), Suffix::Accounts(12));
         for bad in [&b"accounts/"[..], b"accounts/0", b"accounts/012", b"accounts/1/x", b"accounts", b"account/1"] {
             assert_eq!(suffix::parse(bad), Suffix::Unknown, "{:?}", core::str::from_utf8(bad));
         }
     }
 
-    /// **The guards on a removal, each at its neighbour** (administration Part D.3): an account
-    /// that exists, logged out, whose going leaves someone able to administer, is removed; one step
-    /// away on each axis is refused, for its own reason.
+    /// **The guards on a removal, each at its neighbour**: an account that exists, logged out,
+    /// whose going leaves someone able to administer, is removed; one step away on each axis is
+    /// refused, for its own reason.
     #[test]
     fn a_removal_waits_for_logout_and_leaves_an_administrator() {
         let policy = |who: &str| {
@@ -1655,9 +1597,7 @@ auth = "password"
         assert!(last.is_some(), "`*` of nobody is nobody: the last account is never removed");
     }
 
-    /// **A write that did not say it succeeded is settled by the list asked again**: done if the
-    /// list shows it, not done if it shows otherwise, and unknown if the list went unanswered too —
-    /// for an add and for a removal, which read the same list the opposite way.
+    /// An add and a removal read the same list the opposite way.
     #[test]
     fn an_unanswered_write_is_settled_by_the_list() {
         use accounts::{Settled, settled};
@@ -1670,8 +1610,6 @@ auth = "password"
         assert_eq!(settled(None, "bob", false), Settled::Unknown);
     }
 
-    /// **`Accounts` shows each account's sessions and whether it administers** — and, when the
-    /// policy does not read, that nobody does.
     #[test]
     fn accounts_are_shown_with_their_sessions_and_who_administers() {
         let policy = parse(

@@ -1,30 +1,25 @@
 //! `view-broker` — run a program in a **view**: its caller's namespace plus a profile's grants,
-//! when `/system/views.toml` says the caller may (`docs/planning/administration.md` § Part A).
+//! when `/system/views.toml` says the caller may.
 //!
 //! **What it holds, and so what a bug here reaches.** It is spawned by `service-mgr` with
 //! `BIND_NAMESPACE`, which it needs to bind grants into the views it builds, and `SYSTEM_CLOCK`,
-//! which it never uses and passes to a program only for the `clock` grant (administration Part
-//! E.5) — a capability can be given at spawn only by a parent that holds it. It inherits the
-//! root namespace, which is where the grants come from: every block device, for `disks`. **And the
-//! root filesystem**, through which it reads `/system/views.toml`, replaces it since Part D.2, and
-//! makes and removes `/home/<name>` for the accounts it fronts since Part D.3. It never holds a
-//! session's ingredients — the caller hands it a copy of its own namespace (`sys_ns_derive`), and
-//! it copies that again before binding anything, so the caller cannot keep a handle to what it
-//! builds. It never touches a terminal: `with` reads the password.
+//! which it never uses and passes to a program only for the `clock` grant — a capability can be
+//! given at spawn only by a parent that holds it. It inherits the root namespace, which is where
+//! the grants come from: every block device, for `disks`. **And the root filesystem**, through
+//! which it reads and replaces `/system/views.toml` and makes and removes `/home/<name>` for the
+//! accounts it fronts. It never holds a session's ingredients — the caller hands it a copy of its
+//! own namespace (`sys_ns_derive`), and it copies that again before binding anything, so the
+//! caller cannot keep a handle to what it builds. It never touches a terminal: `with` reads the
+//! password.
 //!
-//! **Two kinds of channel off one forwarding endpoint**, which `service-mgr` binds at `/svc/views`:
-//! a login supervisor resolves `/svc/views/session` for a channel to open and close sessions on,
-//! and binds the same endpoint into each session at `/dev/views` with the base `/s/<session>`, so a
-//! process there resolves a channel the broker already knows the session of. See
-//! `librsproto::views` for the ops.
+//! **One forwarding endpoint**, which `service-mgr` binds at `/svc/views`: a login supervisor
+//! resolves `/svc/views/session` for a channel to open and close sessions on, and binds the same
+//! endpoint into each session at `/dev/views` with the base `/s/<session>`, so a process there
+//! resolves a channel the broker already knows the session of. The `views` and `accounts` grants
+//! bind it at `/dev/policy` and `/dev/accounts` the same way, each channel answering that
+//! grant's ops alone. See `librsproto::views` for the ops.
 //!
-//! **And a channel per grant that needs one**: the `views` grant binds the same endpoint at
-//! `/dev/policy` and `accounts` at `/dev/accounts`, each with a base naming the session, so a
-//! resolve there is a channel for that grant's ops alone (administration Parts D.2 and D.3).
-//!
-//! **A resource server holding `BIND_NAMESPACE`** — the second after `desktop-shell`, and for the
-//! same reason: it binds only into namespaces it creates, and never registers itself
-//! (`graphical-session.md` §3, `userspace/CLAUDE.md`).
+//! It binds only into namespaces it creates, and never registers itself (`userspace/CLAUDE.md`).
 
 #![no_std]
 #![no_main]
@@ -130,7 +125,7 @@ struct Pending {
     queued: Option<(u64, Vec<u8>)>,
     /// **The terminal the request came from**, as `tty-server` named it when the broker redeemed
     /// the request's token — never as the caller did. A password that succeeds is remembered for
-    /// it (the laptop polish's Part A); `None`, and nothing is remembered.
+    /// it; `None`, and nothing is remembered.
     backend: Option<u32>,
 }
 
@@ -138,7 +133,7 @@ enum State {
     Idle,
     Password(Pending),
     /// A `ChangePassword` held until the session's delay from its last failure has passed: the
-    /// request to answer, the current password and the new one (administration Part D.3).
+    /// request to answer, the current password and the new one.
     Changing {
         request_id: u64,
         current: Vec<u8>,
@@ -160,23 +155,19 @@ struct Client {
     state: State,
 }
 
-/// Where the storage service mints an admin endpoint (administration Part C.6).
+/// Where the storage service mints an admin endpoint.
 const STORAGE_ADMIN: &[u8] = b"/svc/storage/admin-endpoint";
-/// How long the storage service may take to answer `InUse`: it answers from what it holds, so this
-/// bounds a service that is wedged, not an ordinary wait.
+/// How long the storage service may take to answer `InUse`; it bounds a wedged service.
 const IN_USE_WAIT_NS: u64 = 5_000_000_000;
 
-/// How long a token's redeem may take before the request is asked for a password instead. The
-/// terminal server answers from a table it holds; this only bounds a server that has stopped.
+/// How long a token's redeem may take before the request is asked for a password instead.
 const REDEEM_WAIT_NS: u64 = 2_000_000_000;
 
-/// **The storage service, as this broker reaches it** (administration Part C.6): an admin endpoint,
-/// which the `storage` grant binds into a view, and an admin session of the broker's own, on which
-/// it asks `InUse` before the `disks` grant.
+/// The storage service as this broker reaches it: an admin endpoint, which the `storage` grant
+/// binds into a view, and an admin session of its own, on which it asks `InUse` before `disks`.
 ///
-/// **Resolved when first needed, not at startup**: `service-mgr` spawns the broker before the
-/// device manager and the storage service, so at startup there is nothing to resolve. A failure is
-/// not remembered, so a service that came up later is found the next time.
+/// **Resolved when first needed**: `service-mgr` spawns the broker before the storage service. A
+/// failure is not remembered, so a service that came up later is found the next time.
 #[derive(Default)]
 struct Storage {
     endpoint: u64,
@@ -186,53 +177,42 @@ struct Storage {
 /// Which grant's endpoint a channel was resolved through.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Endpoint {
-    /// `/dev/policy`, the `views` grant's: `Show` and `Install` (administration Part D.2).
     Policy,
-    /// `/dev/accounts`, the `accounts` grant's: `AddAccount`, `RemoveAccount` and `SetPassword`
-    /// (administration Part D.3).
     Accounts,
 }
 
 struct Broker {
     storage: Storage,
-    /// `service-mgr`'s admin endpoint, which the `services` grant binds into a view (administration
-    /// Part E.2b). **Resolved when first needed**, as the storage service's is; `0` until then.
+    /// Endpoints for the `services`, `power` and `logs` grants, each held for the boot and
+    /// **resolved when first needed**, as the storage service's is; `0` until then.
     services_admin: u64,
-    /// `service-mgr`'s power endpoint, resolved on first need and bound into every view with the
-    /// `power` grant. There is one; the broker holds it for the boot.
     power: u64,
-    /// The logging service's read endpoint (administration Part E.6), resolved on first need and
-    /// bound into every view with the `logs` grant. The broker holds it for the boot, as `power`.
     logs: u64,
     root_ns: u64,
     notif: u64,
     serve_end: u64,
     /// **A duplicate of this broker's own forwarding endpoint** — the one `service-mgr` binds at
     /// `/svc/views` — kept to bind into a view with a base of the broker's choosing: the `views`
-    /// grant's `/dev/policy` (administration Part D.2). `0` if it would not duplicate, and then
-    /// that grant is refused rather than given without its binding.
+    /// grant's `/dev/policy`. `0` if it would not duplicate, and then that grant is refused rather
+    /// than given without its binding.
     forwarding: u64,
     auth_ch: u64,
     /// An admin session on `auth-service` (`/svc/auth/admin`), opened on first need: the account
     /// list the policy and a removal are judged against, and every account write the accounts
     /// endpoint asks for. `0` until then, or after it failed.
     auth_admin: u64,
-    /// Channels resolved through a grant's endpoint in a view — `/dev/policy` or `/dev/accounts` —
-    /// each with its session.
+    /// Channels resolved through `/dev/policy` or `/dev/accounts`, each with its session.
     endpoints: Vec<(u64, u64, Endpoint)>,
     supervisors: Vec<u64>,
     clients: Vec<Client>,
     sessions: Sessions,
-    /// Passwords waiting to be checked, by client channel — see [`Held`] for why none of them
-    /// carries a deadline of its own.
+    /// Passwords waiting to be checked, by client channel.
     held: Held,
-    /// Programs whose life channel closed, and exit codes from `ChildExited`, each waiting for
-    /// the other — see [`Exits`] for why either can come first.
+    /// Closed life channels and `ChildExited` codes, each waiting for the other.
     exits: Exits,
     log: liblog::Logger,
 }
 
-/// Send `body` on `ch` as `op`, echoing `request_id`, with `flags`, moving `handles`.
 fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
     unsafe {
@@ -256,8 +236,7 @@ fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u
 
 /// An error reply: an `ErrorBody`, as every server sends one. **Its whole twelve bytes** — the
 /// kernel reads a shorter one on a forwarded resolve as malformed and hands the caller
-/// `KernelError`, which is how a full broker's `WouldBlock` and a closed session's `NotFound`
-/// once arrived (found by `boot-probe`'s full-broker step).
+/// `KernelError` in place of the `WouldBlock` or `NotFound` sent.
 fn reply_error(ch: u64, op: u16, request_id: u64, err: KError) {
     let mut body = [0u8; librsproto::error::ERROR_BODY_LEN];
     let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, b"").unwrap_or(0);
@@ -272,7 +251,6 @@ fn reply_outcome(ch: u64, op: u16, request_id: u64, outcome: Outcome, reason: &s
     let _ = send(ch, op, request_id, RS_FLAG_REPLY, &body[..n], &[]);
 }
 
-/// Make a channel pair of `depth`. `(a, b)`.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
     let (mut a, mut b) = (0u64, 0u64);
     // SAFETY: valid writable out-params.
@@ -326,7 +304,6 @@ fn recv_full(ch: u64) -> Result<Option<Incoming>, ()> {
     }
 }
 
-/// The handles the last message moved to us.
 fn received() -> Vec<u64> {
     // SAFETY: the kernel wrote RECV_COUNT handles into RECV_HANDLES.
     unsafe { RECV_HANDLES[..RECV_COUNT.min(8)].to_vec() }
@@ -337,35 +314,26 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     if st == 0 { h } else { 0 }
 }
 
-/// Where the `storage` grant is bound in a view.
+// Each `*_GRANT` is where its grant is bound in a view; `SERVICES_ADMIN`, `POWER_ENDPOINT` and
+// `LOG_READ_ENDPOINT` are where the service behind one mints its endpoint.
 const STORAGE_GRANT: &[u8] = b"/dev/storage/admin";
-/// Where `service-mgr` mints an admin endpoint (administration Part E.2b).
 const SERVICES_ADMIN: &[u8] = b"/svc/services/admin-endpoint";
-/// Where the `services` grant is bound in a view.
 const SERVICES_GRANT: &[u8] = b"/dev/services/admin";
-/// Where `service-mgr` mints a power endpoint (administration Part E.4d).
 const POWER_ENDPOINT: &[u8] = b"/svc/services/power-endpoint";
-/// Where the `power` grant is bound in a view.
 const POWER_GRANT: &[u8] = b"/dev/power";
-/// Where the logging service mints a read endpoint (administration Part E.6).
 const LOG_READ_ENDPOINT: &[u8] = b"/log/read-endpoint";
-/// Where the `logs` grant is bound in a view.
 const LOGS_GRANT: &[u8] = b"/dev/logs";
 /// **The kernel's log**, where the root namespace binds it and where the `kernel-log` grant binds a
-/// snapshot of it in a view (Phase 6 Part B.7): one path, so `log --kernel` reads where a program in
-/// the root namespace would.
+/// snapshot of it in a view: one path, so `log --kernel` reads where a program in the root
+/// namespace would.
 const KERNEL_LOG: &[u8] = b"/dev/log";
-/// Where the `views` grant binds the broker's policy endpoint in a view (administration Part D.2).
 const POLICY_GRANT: &[u8] = b"/dev/policy";
-/// Where the `accounts` grant binds the broker's accounts endpoint in a view (administration Part
-/// D.3).
 const ACCOUNTS_GRANT: &[u8] = b"/dev/accounts";
 /// Where a new policy is written before it is renamed over the old one.
 const POLICY_NEW: &[u8] = b"/system/views.toml.new";
 /// How long the broker waits for `auth-service`'s account list.
 const ACCOUNTS_WAIT_NS: u64 = 5_000_000_000;
 
-/// Wait on `h` until `deadline`. `true` if it became ready.
 fn wait_until(h: u64, deadline: u64) -> bool {
     let handles = [h];
     let mut results = [0u8; 24];
@@ -393,7 +361,6 @@ const NAME_RULE: &str =
     "a name is 1 to 32 bytes: a lowercase letter or `_`, then lowercase letters, digits, `_` or `-`";
 
 impl Broker {
-    /// `service-mgr`'s admin endpoint, resolved on first need. `0` if it could not be.
     fn services_endpoint(&mut self) -> u64 {
         if self.services_admin == 0 {
             self.services_admin = ns_lookup(
@@ -405,7 +372,6 @@ impl Broker {
         self.services_admin
     }
 
-    /// `service-mgr`'s power endpoint, resolved on first need. `0` if it could not be.
     fn power_endpoint(&mut self) -> u64 {
         if self.power == 0 {
             self.power = ns_lookup(
@@ -417,7 +383,6 @@ impl Broker {
         self.power
     }
 
-    /// The logging service's read endpoint, resolved on first need. `0` if it could not be.
     fn logs_endpoint(&mut self) -> u64 {
         if self.logs == 0 {
             self.logs = ns_lookup(
@@ -429,8 +394,6 @@ impl Broker {
         self.logs
     }
 
-    /// The storage service's admin endpoint, resolved on first need. `0` if the service is not
-    /// there.
     fn storage_endpoint(&mut self) -> u64 {
         if self.storage.endpoint == 0 {
             self.storage.endpoint = ns_lookup(
@@ -496,7 +459,7 @@ impl Broker {
 
     /// **Which terminal a token was minted for**, asked of `tty-server` over a terminal this
     /// broker resolves itself — never over one a caller sent, which could be a channel the caller
-    /// serves (PR #350 review). Resolved for the one question and closed after, since every
+    /// serves. Resolved for the one question and closed after, since every
     /// terminal is a slot in the server's wait set. `None` if the token names nothing or the server
     /// does not answer in time: then the request is asked for a password, which is safe.
     fn redeem(&mut self, token: &[u8; TTY_TOKEN_LEN]) -> Option<u32> {
@@ -509,11 +472,9 @@ impl Broker {
             .then(|| {
                 loop {
                     match recv_full(tty) {
-                        // **An error reply is not an answer, by its flag.** Today its body is twelve
-                        // bytes and would not read as a backend id anyway, but that is the error
-                        // format's length rather than this check: were a refusal ever read as an id,
-                        // every token the server refused would name the same made-up terminal, and a
-                        // window opened under it would cover them all.
+                        // An error reply is not an answer, by its flag: a refusal read as an id
+                        // would make every refused token name one terminal, and a window opened
+                        // under it would cover them all.
                         Ok(Some((op, 1, flags, body))) if op == OP_TTY_REDEEM => {
                             break (flags & RS_FLAG_ERROR == 0)
                                 .then(|| <[u8; 4]>::try_from(body.as_slice()).ok().map(u32::from_le_bytes))
@@ -531,7 +492,7 @@ impl Broker {
         backend
     }
 
-    /// A record in the log — every request, failure and exit, and never a password.
+    /// Log a record: every request, failure and exit, and never a password.
     fn audit(&self, what: &str) {
         self.log.info(what);
     }
@@ -540,7 +501,6 @@ impl Broker {
         self.sessions.get(session).map(|s| s.principal.clone())
     }
 
-    /// The forwarding endpoint: a supervisor wanting a channel, or a client in a session.
     fn serve_resolve(&mut self) {
         let Ok(Some((op, request_id, body))) = recv(self.serve_end) else {
             return;
@@ -555,10 +515,10 @@ impl Broker {
         let (session, endpoint) = match asked {
             Suffix::Supervisor => (None, None),
             Suffix::Client(id) if self.sessions.get(id).is_some() => (Some(id), None),
-            // **The policy endpoint, as the `views` grant binds it** (administration Part D.2): a
-            // channel of its own, on which only `Show` and `Install` are answered.
+            // The policy endpoint, as the `views` grant binds it: a channel of its own, on which
+            // only `Show` and `Install` are answered.
             Suffix::Policy(id) if self.sessions.get(id).is_some() => (Some(id), Some(Endpoint::Policy)),
-            // **The accounts endpoint, as the `accounts` grant binds it** (Part D.3).
+            // The accounts endpoint, as the `accounts` grant binds it.
             Suffix::Accounts(id) if self.sessions.get(id).is_some() => (Some(id), Some(Endpoint::Accounts)),
             _ => {
                 reply_error(self.serve_end, OP_NS_RESOLVE, request_id, KError::NotFound);
@@ -596,7 +556,6 @@ impl Broker {
         }
     }
 
-    /// A supervisor's channel: sessions opening and closing.
     fn serve_supervisor(&mut self, i: usize) {
         let ch = self.supervisors[i];
         let (op, request_id, body) = match recv(ch) {
@@ -620,10 +579,8 @@ impl Broker {
                 let id = self.sessions.open(principal);
                 let mut out = [0u8; 8];
                 let n = build_session_id(&mut out, id).unwrap_or(0);
-                // **Logged before the reply, not after it.** The supervisor builds the session's
-                // namespace on the reply and says so, and a line logged after the send could land
-                // after that one — which is what `test-interactive` step 4 met, waiting for a line
-                // its own `expect` had scanned past (2026-10-01). Before the send, it cannot.
+                // Logged before the reply: the supervisor builds the session's namespace on the
+                // reply and says so, and a gate waiting for this line must not see it after that.
                 Line::new().s(b"view-broker: session ").u(id).s(b" opened").end();
                 let _ = send(ch, op, request_id, RS_FLAG_REPLY, &out[..n], &[]);
             }
@@ -654,8 +611,7 @@ impl Broker {
                     // SAFETY: a Process handle this broker owns, with SIGNAL from spawn.
                     unsafe { syscall1(SYS_PROCESS_TERMINATE, *process) };
                     libsession::unbind_block_devices(*view_ns);
-                    // The `storage`, `views` and `accounts` grants too; `NotFound` for a view not
-                    // given one.
+                    // The `storage`, `views` and `accounts` grants too.
                     for at in [STORAGE_GRANT, POLICY_GRANT, ACCOUNTS_GRANT] {
                         // SAFETY: valid namespace handle and path.
                         unsafe { syscall3(SYS_NS_UNBIND, *view_ns, at.as_ptr() as u64, at.len() as u64) };
@@ -689,10 +645,8 @@ impl Broker {
         Line::new().s(b"view-broker: session ").u(id).s(b" ended").end();
     }
 
-    /// **The accounts that exist**, from `auth-service`'s `List` on an admin session of the
-    /// broker's own, opened on first need. `None` if it cannot be asked or does not answer — and
-    /// then the session is dropped, so the next ask opens a new one. Judging a policy fails closed
-    /// without it: a policy cannot be said to leave an administrator when nobody knows who exists.
+    /// **The accounts that exist**, from `auth-service`'s `List`. `None` if it cannot be asked (the
+    /// session dropped, for the next ask to reopen); judging a policy then fails closed.
     fn accounts(&mut self) -> Option<Vec<(String, String)>> {
         let body = self.ask_auth(OP_AUTH_LIST, &[]).ok()?;
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
@@ -744,9 +698,7 @@ impl Broker {
         }
     }
 
-    /// **Judge a policy's text** as `Check` and `Install` do: it must be text, it must read, and an
-    /// account that exists must be able to administer under it (`policy::check`). The reason, if
-    /// not.
+    /// Judge a policy's text as `Check` and `Install` do (`policy::check`): the reason, if not.
     fn judge(&mut self, text: &[u8]) -> Result<policy::Policy, String> {
         let text = core::str::from_utf8(text).map_err(|_| String::from("the file is not text"))?;
         let accounts = self
@@ -756,9 +708,8 @@ impl Broker {
         policy::check(text, &names).map_err(|e| alloc::format!("{e}"))
     }
 
-    /// A channel resolved through a grant's endpoint in a view: the policy's or the accounts'.
-    /// From a session each is reached only through its grant's binding, so holding it is the
-    /// authority.
+    /// A policy or accounts channel. Each is reached only through its grant's binding, so
+    /// holding it is the authority.
     fn serve_endpoint(&mut self, i: usize) {
         let (ch, session, endpoint) = self.endpoints[i];
         let (op, request_id, mut body) = match recv(ch) {
@@ -787,7 +738,6 @@ impl Broker {
         scrub(&mut body);
     }
 
-    /// **A policy channel**: `Show` and `Install`, and nothing else (administration Part D.2).
     fn serve_policy(&mut self, ch: u64, op: u16, request_id: u64, body: &[u8], who: &str) {
         match op {
             OP_VIEWS_SHOW => match libfs::read_file(self.root_ns, POLICY_PATH) {
@@ -822,7 +772,6 @@ impl Broker {
         }
     }
 
-    /// A client's channel: requests, passwords, stops, listings and checks.
     fn serve_client(&mut self, i: usize) {
         let ch = self.clients[i].ch;
         let (op, request_id, mut body) = match recv(ch) {
@@ -838,9 +787,8 @@ impl Broker {
                 scrub(&mut *(&raw mut RECV_MSG))
             };
         }
-        // **Only a request carries handles.** Whatever came with anything else is closed here,
-        // once, rather than by each arm — an arm that forgot would keep them for good, and any
-        // program in any session can send them.
+        // Only a request carries handles. Whatever came with anything else is closed here, not
+        // by each arm: an arm that forgot would keep them, and any program can send them.
         let mut handles = received();
         if op != OP_VIEWS_REQUEST {
             for h in handles.drain(..) {
@@ -868,8 +816,8 @@ impl Broker {
                 let _ = send(ch, op, request_id, RS_FLAG_REPLY, &[], &[]);
             }
             OP_VIEWS_LIST => self.list(ch, request_id, &principal),
-            // **`with --forget`** (the laptop polish's Part A): every remembered password of the
-            // session, every terminal's. Forgetting more than asked is the safe direction.
+            // `with --forget`: every remembered password of the session, every terminal's.
+            // Forgetting more than asked is the safe direction.
             OP_VIEWS_FORGET => {
                 if let Some(s) = self.sessions.get_mut(session) {
                     s.grace.forget();
@@ -877,9 +825,9 @@ impl Broker {
                 self.audit(&alloc::format!("view: {principal} — remembered passwords forgotten"));
                 let _ = send(ch, op, request_id, RS_FLAG_REPLY, &[], &[]);
             }
-            // **What a `Request` would be answered, running nothing** (administration Part F.3,
-            // PR #346 review): the desktop asks before it closes a window for a Restart or a Shut
-            // down. Not audited, as `List` is not: it tells the session only what `List` does.
+            // What a `Request` would be answered, running nothing: the desktop asks before it
+            // closes a window for a Restart or a Shut down. Not audited, as `List` is not: it
+            // tells the session only what `List` does.
             OP_VIEWS_DECIDE => {
                 let question = parse_decide(&body)
                     .and_then(|(v, p)| Some((core::str::from_utf8(v).ok()?, core::str::from_utf8(p).ok()?)));
@@ -1004,8 +952,7 @@ impl Broker {
     }
 
     /// A password for a request waiting on one: held, and checked by [`Broker::run_due`] once
-    /// the session's delay from its last failure has passed — on whichever request that failure
-    /// was, and whenever it came.
+    /// the session's delay from its last failure has passed.
     fn password(&mut self, i: usize, request_id: u64, mut pw: Vec<u8>) {
         let ch = self.clients[i].ch;
         let session = self.clients[i].session;
@@ -1058,7 +1005,7 @@ impl Broker {
             let State::Password(p) = core::mem::replace(&mut self.clients[i].state, State::Idle) else {
                 return;
             };
-            // **Remembered for the terminal it was typed at**, and for this view, for five minutes.
+            // Remembered for the terminal it was typed at, and for this view.
             if let (Some(b), Some(s)) = (p.backend, self.sessions.get_mut(session)) {
                 s.grace.remember(b, &p.view, now_ns());
             }
@@ -1086,10 +1033,10 @@ impl Broker {
         }
     }
 
-    /// **`ChangePassword`** (administration Part D.3): the new password checked against the rules
-    /// here, and the request **held**, as a `Password` is, until the session's delay from its last
-    /// failure has passed — so a wrong current password here and a wrong one for `with` share one
-    /// pace. [`Broker::check_change`] answers it.
+    /// **`ChangePassword`**: the new password checked against the rules here, and the request
+    /// **held**, as a `Password` is, until the session's delay from its last failure has passed —
+    /// so a wrong current password here and a wrong one for `with` share one pace.
+    /// [`Broker::check_change`] answers it.
     fn change_password(&mut self, i: usize, request_id: u64, body: &[u8]) {
         let ch = self.clients[i].ch;
         let session = self.clients[i].session;
@@ -1154,8 +1101,7 @@ impl Broker {
         }
     }
 
-    /// **`Accounts`** (administration Part D.3): every account, its home, its open sessions and
-    /// whether it could administer — anyone's to read, as a Unix `passwd` file is.
+    /// **`Accounts`**: anyone's to read, as a Unix `passwd` file is.
     fn list_accounts(&mut self, ch: u64, request_id: u64) {
         let Some(listed) = self.accounts() else {
             return reply_error(ch, OP_VIEWS_ACCOUNTS, request_id, KError::IoError);
@@ -1177,9 +1123,9 @@ impl Broker {
         let _ = send(ch, OP_VIEWS_ACCOUNTS, request_id, RS_FLAG_REPLY, &out[..at], &[]);
     }
 
-    /// **An accounts channel** (administration Part D.3): `AddAccount`, `RemoveAccount` and
-    /// `SetPassword`, and nothing else. Every answer is audited as the session's principal, and a
-    /// refusal with the guard that refused it.
+    /// **An accounts channel**: `AddAccount`, `RemoveAccount` and `SetPassword`, and nothing else.
+    /// Every answer is audited as the session's principal, and a refusal with the guard that
+    /// refused it.
     fn serve_accounts(&mut self, ch: u64, op: u16, request_id: u64, body: &[u8], who: &str) {
         let (asked, answer) = match op {
             OP_VIEWS_ADD_ACCOUNT => ("add", self.add_account(body)),
@@ -1201,10 +1147,8 @@ impl Broker {
 
     /// **`AddAccount`**: the name and password checked, the home and its folders made — or an
     /// existing home adopted — and then the record, by `auth-service`. A home this made is taken
-    /// away again **only when the record is known not to be there**: an answer other than success
-    /// is settled by the account list asked again ([`accounts::settled`]), since one that never
-    /// came may be an add still carried out. So a refusal leaves nothing behind, and a slow add
-    /// never leaves an account without its home.
+    /// away again **only when the record is known not to be there** ([`accounts::settled`]), so a
+    /// refusal leaves nothing behind and a slow add never leaves an account without its home.
     fn add_account(&mut self, body: &[u8]) -> Result<String, String> {
         let r = parse_account_request(body).ok_or_else(|| String::from("the request does not read"))?;
         if !libusers::valid_name(r.username) {
@@ -1231,8 +1175,7 @@ impl Broker {
                 let _ = libfs::remove_tree(root_ns, home.as_bytes(), &mut |_, _| {});
             }
         };
-        // **The folders a person's files go in**, for every home an administrator adds: the same
-        // three `nxfiles`' sidebar offers. The installer makes them for the first account.
+        // The folders `nxfiles`' sidebar offers; the installer makes them for the first account.
         for folder in libfs::HOME_FOLDERS {
             let dir = libfs::join(home.as_bytes(), folder.as_bytes());
             if libfs::mkdir(root_ns, dir.as_bytes()).is_err() && !libfs::is_dir(root_ns, dir.as_bytes()) {
@@ -1246,8 +1189,6 @@ impl Broker {
             None => Err(String::from("the request does not fit")),
         };
         scrub(&mut req);
-        // **A home is taken away only when the record is known not to be there** — an answer that
-        // never came may be an add `auth-service` still carries out (PR #338 review).
         let (settled, why) = match asked {
             Ok(()) => (accounts::Settled::Done, String::new()),
             Err(why) => (accounts::settled(self.accounts().as_deref(), &name, true), why),
@@ -1265,8 +1206,7 @@ impl Broker {
         }
     }
 
-    /// **`RemoveAccount`**: refused while the account is logged in, and when no account left
-    /// could administer (`view_broker::accounts::refuse_removal`); then the record, by
+    /// **`RemoveAccount`**: guarded by `accounts::refuse_removal`; then the record, by
     /// `auth-service`, and the home only if asked.
     fn remove_account(&mut self, body: &[u8]) -> Result<String, String> {
         let (name, home_too) = parse_remove_account(body).ok_or_else(|| String::from("the request does not read"))?;
@@ -1324,9 +1264,8 @@ impl Broker {
         asked.map(|()| alloc::format!("set a new password for {name}"))
     }
 
-    /// Bind this broker's own forwarding endpoint at `at` in `view_ns`, with `base` — how a grant
-    /// gives a view an endpoint that knows which session it serves. `false` if it would not bind,
-    /// or there is no endpoint to bind.
+    /// Bind this broker's forwarding endpoint at `at` in `view_ns`, with `base` naming the session
+    /// it serves. `false` if it would not bind, or there is none.
     fn bind_endpoint(&self, view_ns: u64, at: &[u8], base: &str) -> bool {
         // SAFETY: a namespace this broker made, a valid path and base, and an endpoint it holds.
         self.forwarding != 0
@@ -1343,7 +1282,6 @@ impl Broker {
             } == 0
     }
 
-    /// Build the view and spawn the program in it.
     fn start(&mut self, i: usize, op: u16, request_id: u64, mut p: Pending, principal: &str) {
         let ch = self.clients[i].ch;
         let what = alloc::format!("{principal} {} {}", p.view, p.program);
@@ -1365,10 +1303,10 @@ impl Broker {
         let mut syscaps = 0;
         for g in &p.grants {
             match g {
-                // **Every disk not in use** (administration Part C.6): a mounted filesystem's
-                // device, `init`'s root included, and the disk under it are left out, since a raw
-                // write there lands underneath a live server. **Refused, not granted blind**, when
-                // the storage service cannot say what is in use.
+                // Every disk not in use: a mounted filesystem's device, `init`'s root included,
+                // and the disk under it are left out, since a raw write there lands underneath a
+                // live server. Refused, not granted blind, when the storage service cannot say
+                // what is in use.
                 Grant::Disks => {
                     let Some(in_use) = self.in_use() else {
                         close(view_ns);
@@ -1376,9 +1314,8 @@ impl Broker {
                     };
                     libsession::rebind_block_devices_except(self.root_ns, view_ns, &in_use);
                 }
-                // **Mounting and unmounting**: the storage service's admin endpoint, at
-                // `/dev/storage/admin`. The service answers every request on a session opened
-                // there, so holding this binding is the authority.
+                // The service answers every request on a session opened at the binding, so
+                // holding it is the authority.
                 Grant::Storage => {
                     let endpoint = self.storage_endpoint();
                     // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
@@ -1397,9 +1334,7 @@ impl Broker {
                         return fail(self, &mut p, "the storage service is not there to grant");
                     }
                 }
-                // **Starting and stopping services** (administration Part E.2b): `service-mgr`'s admin
-                // endpoint at `/dev/services/admin`. It answers every request on a session opened
-                // there, bar an essential service's stop, so holding this binding is the authority.
+                // As for storage, bar an essential service's stop, which `service-mgr` refuses.
                 Grant::Services => {
                     let endpoint = self.services_endpoint();
                     // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
@@ -1413,8 +1348,7 @@ impl Broker {
                         return fail(self, &mut p, "service-mgr's admin endpoint is not there to grant");
                     }
                 }
-                // **Shutting down** (administration Part E.4d): `service-mgr`'s power endpoint at
-                // `/dev/power`. A session opened there takes `Shutdown` and nothing else.
+                // A session opened here takes `Shutdown` and nothing else.
                 Grant::Power => {
                     let endpoint = self.power_endpoint();
                     // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
@@ -1428,8 +1362,7 @@ impl Broker {
                         return fail(self, &mut p, "service-mgr's power endpoint is not there to grant");
                     }
                 }
-                // **Reading the log back** (administration Part E.6): the logging service's read
-                // endpoint at `/dev/logs`. Any resolve there opens a read session.
+                // Any resolve here opens a read session.
                 Grant::Logs => {
                     let endpoint = self.logs_endpoint();
                     // SAFETY: a namespace this broker made, a valid path, and an endpoint it holds.
@@ -1443,10 +1376,9 @@ impl Broker {
                         return fail(self, &mut p, "the logging service's read endpoint is not there to grant");
                     }
                 }
-                // **Reading the kernel's log** (Phase 6 Part B.7): the kernel answers a resolve of
-                // `/dev/log` with a fresh snapshot, so the one taken here is the log as this view
-                // is made, bound at the same path as a direct handle — readable and sizeable, and
-                // nothing more.
+                // The kernel answers a resolve of `/dev/log` with a fresh snapshot, so the one
+                // taken here is the log as this view is made, bound at the same path as a direct
+                // handle — readable and sizeable, and nothing more.
                 Grant::KernelLog => {
                     let snapshot = ns_lookup(self.root_ns, KERNEL_LOG, RIGHT_MAP_READ | RIGHT_INSPECT | RIGHT_TRANSFER);
                     let result = match snapshot {
@@ -1458,9 +1390,7 @@ impl Broker {
                             syscall6(SYS_NS_BIND, view_ns, p, l, snapshot, 0, 0)
                         },
                     };
-                    // **A caller whose namespace binds `/dev/log` already keeps its own**: it reads
-                    // the kernel's log without the grant, as `boot-probe`'s does, and a bind over a
-                    // bound path is refused.
+                    // A caller that already binds `/dev/log` keeps its own.
                     let bound = result == 0 || result == KError::AlreadyExists.as_i32() as i64;
                     if snapshot != 0 {
                         // The bind took its own reference.
@@ -1471,11 +1401,10 @@ impl Broker {
                         return fail(self, &mut p, "the kernel's log is not there to grant");
                     }
                 }
-                // **Setting the clock** (administration Part E.5): `SYSTEM_CLOCK` in the spawn
-                // below, which the kernel intersects with the broker's own. Binds nothing.
+                // `SYSTEM_CLOCK` in the spawn below, which the kernel intersects with the broker's
+                // own. Binds nothing.
                 Grant::Clock => syscaps |= SYSCAP_SYSTEM_CLOCK,
-                // **Changing the policy** (administration Part D.2): the broker's own forwarding
-                // endpoint at `/dev/policy`, with the base `/policy/<session>`, so a resolve there
+                // The broker's own endpoint with the base `/policy/<session>`, so a resolve there
                 // reaches the broker as this session's policy channel.
                 Grant::Views => {
                     let base = alloc::format!("/policy/{}", self.clients[i].session);
@@ -1484,8 +1413,6 @@ impl Broker {
                         return fail(self, &mut p, "the policy endpoint could not be granted");
                     }
                 }
-                // **Administering accounts** (administration Part D.3): the same endpoint at
-                // `/dev/accounts`, with the base `/accounts/<session>`.
                 Grant::Accounts => {
                     let base = alloc::format!("/accounts/{}", self.clients[i].session);
                     if !self.bind_endpoint(view_ns, ACCOUNTS_GRANT, &base) {
@@ -1518,8 +1445,7 @@ impl Broker {
             // (`TODO(child-exit-attribution)`, as `service-mgr` does it).
             SPAWN.handles[1] = life_child;
             SPAWN.namespace = view_ns;
-            // **No ambient authority but what a grant says**: `SYSTEM_CLOCK` for `clock`, and
-            // nothing otherwise.
+            // No ambient authority but what a grant says.
             SPAWN.syscaps = syscaps;
             SPAWN.arg0 = bootstrap_arg0(true);
             syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN) as u64)
@@ -1569,8 +1495,7 @@ impl Broker {
         for (i, (view, run, password)) in rows.iter().enumerate() {
             let row = Row { view: view.as_bytes(), run: run.as_bytes(), password: *password };
             if push_row(&mut out, &mut at, &row).is_none() {
-                // **Said, since the reply cannot say it** (PR #346 review): a listing cut here
-                // reads as whole, and `rsproto-views-ops.md` tells clients not to decide from it.
+                // Said, since the reply cannot: a cut listing reads as whole.
                 Line::new()
                     .s(b"view-broker: a listing cut at ")
                     .u(i as u64)
@@ -1584,15 +1509,13 @@ impl Broker {
         let _ = send(ch, OP_VIEWS_LIST, request_id, RS_FLAG_REPLY, &out[..at], &[]);
     }
 
-    /// A client's channel closed: `with` is gone. If it left a program running, ask it to stop —
-    /// nobody is left to see its output or stop it.
+    /// A client's channel closed. A program it left running is asked to stop.
     fn client_gone(&mut self, i: usize) {
         let c = self.clients.remove(i);
         match c.state {
             State::Running { process, life, view_ns, .. } => {
                 // SAFETY: a Process handle this broker owns.
                 unsafe { syscall1(SYS_PROCESS_TERMINATE, process) };
-                // Still reaped when it exits: its life channel stays in the wait set.
                 self.clients.push(Client {
                     ch: 0,
                     session: c.session,
@@ -1615,7 +1538,6 @@ impl Broker {
         close(c.ch);
     }
 
-    /// Take every `ChildExited` queued on the notification channel.
     fn drain_notifications(&mut self) {
         loop {
             // SAFETY: NOTIF is a valid 64-byte out-param.
@@ -1634,7 +1556,6 @@ impl Broker {
         self.pair_exits();
     }
 
-    /// A program's life channel closed: it exited. Its code may not be queued yet.
     fn life_closed(&mut self, life: u64) {
         self.exits.closed(life);
         self.drain_notifications();
@@ -1677,7 +1598,6 @@ impl Broker {
         }
     }
 
-    /// What the wait set holds, by the most each may come to need.
     fn load(&self) -> Load {
         let (mut clients, mut singles) = (0, 0);
         for c in &self.clients {
@@ -1692,7 +1612,6 @@ impl Broker {
         Load { supervisors: self.supervisors.len(), clients, singles: singles + self.endpoints.len() }
     }
 
-    /// The soonest a held password may be checked.
     fn next_deadline(&self) -> u64 {
         self.held.next_due(&self.sessions, now_ns()).unwrap_or(u64::MAX)
     }
@@ -1708,8 +1627,7 @@ impl Broker {
     }
 }
 
-/// The caller's environment with `view` set to the view the program runs in, so a program — an
-/// elevated shell's prompt, say — can know. A caller that sent none gets one with just that.
+/// The caller's environment with `view` set to the view the program runs in.
 fn view_env(bytes: &[u8], view: &str) -> Record {
     let record = if bytes.is_empty() {
         Record::default()
@@ -1722,8 +1640,7 @@ fn view_env(bytes: &[u8], view: &str) -> Record {
     record.with_str_field("view", view)
 }
 
-/// Send `Meta::Ready` to `service-mgr`, naming this server and carrying the forwarding endpoint's
-/// client end — the handshake every server here speaks to the supervisor that binds it.
+/// Send `Meta::Ready` to `service-mgr`, carrying the forwarding endpoint's client end.
 fn send_ready(control: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let Some(n) = librsproto::meta::ready(&mut body, b"view-broker") else {
@@ -1749,8 +1666,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         kprint(b"view-broker: Ready send FAIL\n");
         exit(1);
     }
-    // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN` (administration Part E.4).
-    // `service --stop` never sends it: the broker is `essential`. `0` once `service-mgr` is gone.
+    // The control channel, for a shutdown's `CTRL_OP_SHUTDOWN`. `service --stop` never sends it:
+    // the broker is `essential`. `0` once `service-mgr` is gone.
     let mut control = control;
     let mut b = Broker {
         storage: Storage::default(),
@@ -1818,11 +1735,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         };
         let _ = n;
         if waited > 0 {
-            // **Resolves last**: a new client is admitted by what the wait set holds, so every
-            // closed channel this wake reports is let go first. Answered in the wait set's order,
-            // the forwarding endpoint — its first slot — came before them, and a client arriving in
-            // the same wake as others' closes was refused `WouldBlock` with the slots it needed
-            // about to be freed (found by `boot-probe`'s paced pair, administration Part E.4a).
+            // Resolves last: a new client is admitted by what the wait set holds, so every closed
+            // channel this wake reports is let go first. In the wait set's order the forwarding
+            // endpoint, its first slot, would come before them, and a client arriving in the same
+            // wake as others' closes would be refused `WouldBlock` with its slots about to free.
             let mut resolves = false;
             for j in 0..waited as usize {
                 // SAFETY: `waited` records were written; the handle is the first word of each.
