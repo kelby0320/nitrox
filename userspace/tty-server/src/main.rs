@@ -1,25 +1,16 @@
 //! `tty-server` — the userspace terminal server.
 //!
-//! Bound at `/dev/tty` by `service-mgr` (by `init` until administration Part E.1a). A client
-//! resolving it gets a **fresh per-caller channel** (an `OBJECT_KIND_CHANNEL` resolve reply, the
-//! same shape the logging service uses), and then speaks `Tty::ReadLine` / `Write` / `SetMode` /
-//! `Close` on it.
+//! Bound at `/dev/tty` by `service-mgr`. A client resolving it gets a **fresh per-caller
+//! channel** (an `OBJECT_KIND_CHANNEL` resolve reply), and then speaks `Tty::ReadLine` /
+//! `Write` / `SetMode` / `Close` on it.
 //!
-//! ## Why it exists
-//!
-//! Console *input* was already a capability — `/dev/console` is a char `DeviceNode` you must
-//! hold a handle to. Console *output* was not: `CharBackend` has no write path, so every
-//! program printed through `SYS_DEBUG_KPRINT`, an ambient syscall taking no handle. A
-//! process with an empty namespace could still write to the console, and nothing could
-//! redirect or capture a shell's output because there was no object to redirect.
-//!
-//! This server closes that: it holds the raw device **exclusively**, and a session gets a
-//! channel. `SYS_DEBUG_KPRINT` reverts to being what it is — a kernel debug facility, used
-//! here as the write backend and by `eshell`, which runs when this server does not exist.
+//! Console output used to go through `SYS_DEBUG_KPRINT`, an ambient syscall taking no handle, so
+//! a process with an empty namespace could still write to the console and nothing could redirect
+//! a shell's output. This server holds the raw device **exclusively** and a session gets a
+//! channel; `SYS_DEBUG_KPRINT` is left as a kernel debug facility, used here as the write backend
+//! and by `eshell`, which runs when this server does not exist.
 //!
 //! See `docs/architecture/console-and-tty.md`.
-//!
-//! `#![no_std]` + `#![no_main]`; `libkern` + `libheap` + `librsproto`.
 
 #![no_std]
 #![no_main]
@@ -46,10 +37,9 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
-/// One `sys_wait` slot goes to the serving endpoint, one to the outstanding console read, and one
-/// to the control channel — `service --stop`'s, since administration Part E.2, which made this 14
-/// from 15. **The rest is halved**, because since Part C a terminal can also own a backend channel
-/// that has to be waited on — worst case one per terminal, when every terminal is a window's.
+/// One `sys_wait` slot goes to the serving endpoint, one to the outstanding console read and one
+/// to the control channel. **The rest is halved**, because a terminal can also own a backend
+/// channel that has to be waited on: worst case one per terminal, when every one is a window's.
 const MAX_TTYS: usize = (libkern::abi::MAX_WAIT_HANDLES - 3) / 2;
 const _: () = assert!(3 + 2 * MAX_TTYS <= libkern::abi::MAX_WAIT_HANDLES);
 /// Bytes per console read submission.
@@ -62,33 +52,22 @@ static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
-/// A separate pair for [`po_wait`], which waits *inside* the dispatch of a record the serve
-/// loop is still iterating.
-///
-/// Sharing the buffers above was correct only by accident of ordering: record 0 is read before
-/// anything in its handling can reach a `po_wait`. Any future wait earlier in a record's path
-/// would silently corrupt the dispatch of records 1..n — a class of bug with no symptom at the
-/// site that causes it (PR #194 review, optional 1).
+/// A separate pair for [`po_wait`], which waits *inside* the dispatch of a record the serve loop
+/// is still iterating; sharing the buffers above would corrupt records 1..n.
 static mut PO_HANDLES: [u64; 1] = [0];
 static mut PO_RESULTS: [u8; 24] = [0; 24];
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 
-/// **Write to a sink.** The seam `console-and-tty.md` built the backend for, now with two
-/// implementations rather than one and a comment: serial via the kernel's debug write, or an
-/// `OP_TTY_OUTPUT` message to whoever holds the terminal's backend channel.
-///
-/// That the console case is `SYS_DEBUG_KPRINT` is an implementation detail of *one* server
-/// rather than the way every program prints.
+/// Write to a sink: serial via the kernel's debug write, or an `OP_TTY_OUTPUT` message to whoever
+/// holds the terminal's backend channel.
 fn sink_write(sink: Sink, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
     match sink {
         Sink::Console => kprint(bytes),
-        // Chunked, because a single write may exceed one message and the emulator has no way to
-        // ask for the rest — a terminal that dropped the tail of a long line would be a bug
-        // visible only on long lines.
+        // Chunked: a write may exceed one message and the emulator cannot ask for the rest.
         Sink::Channel(h) => {
             for part in bytes.chunks(MAX_BODY) {
                 send_output(h, part);
@@ -97,26 +76,20 @@ fn sink_write(sink: Sink, bytes: &[u8]) {
     }
 }
 
-/// The most body one message can carry ([`librsproto::RS_MAX_BODY`]). It was the page less the IPC
-/// header and the handles, which left no room for the envelope: a full chunk would make a message
-/// the kernel refuses, and `send_output` drops a send that fails (Phase 6 Part H).
+/// The most body one message can carry ([`librsproto::RS_MAX_BODY`]), envelope included: a
+/// larger chunk makes a message the kernel refuses, and `send_output` drops a failed send.
 const MAX_BODY: usize = librsproto::RS_MAX_BODY;
 
 /// Send one `Tty::Output` message, **blocking if the emulator's ring is full**.
 ///
-/// Every other send in this server is `NOBLOCK`, and correctly so: a reply goes to a client
-/// that is waiting for exactly it, so the ring is empty by construction. Output is different —
-/// the emulator is off drawing, and a `NOBLOCK` send onto a full ring **silently discards a
-/// program's output**. That is invisible: no error reaches anyone, the shell believes it
-/// printed, and the user sees a line with a hole in it. `check-terminal` found it as an
-/// intermittently-missing character, which is exactly how it would present in use.
+/// Every other send here is `NOBLOCK`: a reply goes to a client waiting for exactly it, so the
+/// ring is empty. Output differs — a `NOBLOCK` send onto a full ring (the emulator is off
+/// drawing) **silently discards a program's output**.
 ///
-/// Blocking here means a wedged emulator stalls **this whole server** — one blocked send holds
-/// the single serve loop, so the login terminal and the serial console shell stall with it, not
-/// just that emulator's own terminals. It is a stall and not a deadlock: the compositor depends
-/// on nothing in the tty path, and the emulator's send back is `NOBLOCK`. Trading a *visible*
-/// stall for an *invisible* loss is the better half of a bad choice; the answer that costs
-/// neither is a per-backend output queue the serve loop drains, which is
+/// Blocking means a wedged emulator stalls **this whole server**, login terminal and serial
+/// console shell included. It is a stall and not a deadlock: the compositor depends on nothing in
+/// the tty path, and the emulator's send back is `NOBLOCK`. A *visible* stall beats an *invisible*
+/// loss; a per-backend output queue the serve loop drains would cost neither, which is
 /// `TODO(tty-output-queue)`.
 fn send_output(ch: u64, body: &[u8]) {
     // SAFETY: REPLY_MSG is a valid buffer owned by this module.
@@ -137,9 +110,8 @@ fn send_output(ch: u64, body: &[u8]) {
         )
     };
     if po >= 0 {
-        // The delivery is a `PendingOperation`; waiting it is what makes this blocking. Its
-        // status is ignored — a failed delivery means the emulator is gone, which the serve
-        // loop learns from `PeerClosed` on the same channel.
+        // Waiting the delivery's `PendingOperation` is what blocks. Its status is ignored: a
+        // failure means the emulator is gone, which the serve loop learns from `PeerClosed`.
         po_wait(po as u64);
     }
 }
@@ -213,9 +185,8 @@ fn now_ns() -> u64 {
 }
 
 /// A token's 128 bits, from the kernel CSPRNG — **or none**: a token made up when the pool will
-/// not answer is a token someone else could make up too, and without one the caller is asked for
-/// its password, which is safe. **An unseeded pool is none too**, without waiting for it
-/// (`tty_server::tokens::from_read`): the PO it answers with fills nothing.
+/// not answer is one someone else could make up too, and without one the caller is asked for its
+/// password, which is safe. An unseeded pool is none too (`tty_server::tokens::from_read`).
 fn random_token() -> Option<[u8; tty_server::tokens::LEN]> {
     // SAFETY: register-only syscall.
     let h = unsafe { syscall1(SYS_ENTROPY_CREATE, 0) };
@@ -362,10 +333,9 @@ fn open_tty(serve_end: u64, request_id: u64, reg: &mut Registry) {
 /// `Tty::OpenSibling` on terminal `of`: mint another terminal on its backend and hand the
 /// caller the new channel, moved in the reply.
 ///
-/// **A shell's stages get their terminals here** (administration Part A.2): a stage's prompt has
-/// to appear where the shell's does, and resolving `/dev/tty` would land it on the console. The
-/// same cap as a resolve applies — every terminal is a slot in this server's wait set — and a
-/// refusal is `WouldBlock`, which the shell answers by running the stage with no terminal.
+/// A shell's stages get their terminals here: a stage's prompt must appear where the shell's does,
+/// and resolving `/dev/tty` would land it on the console. The cap is a resolve's, and a refusal
+/// is `WouldBlock`, which the shell answers by running the stage with no terminal.
 fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
     if reg.len() >= MAX_TTYS {
         reply_error(of, OP_TTY_OPEN_SIBLING, request_id, KError::WouldBlock.as_i32());
@@ -375,8 +345,7 @@ fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
         reply_error(of, OP_TTY_OPEN_SIBLING, request_id, KError::KernelError.as_i32());
         return;
     };
-    // Registered before the reply, so the new terminal exists by the time its holder can use it;
-    // undone below if the reply cannot go.
+    // Registered before the reply so the terminal exists when first used; undone if it cannot go.
     if !reg.open_sibling(server_end, of) {
         // SAFETY: closing our own handles; neither has been sent.
         unsafe {
@@ -406,10 +375,8 @@ fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
         }
     };
     if sent {
-        // **With the count, so a leak is visible.** A stage's terminal is freed when the stage
-        // exits; one that was not would hold one of `MAX_TTYS` slots for good, and after a dozen
-        // commands every stage would quietly run without a terminal. `test-interactive` compares
-        // this number across two identical commands.
+        // With the count, so a leak is visible: a stage's terminal not freed would hold one of
+        // `MAX_TTYS` slots for good. `test-interactive` compares it across identical commands.
         libkern::debug::Line::new()
             .s(b"tty-server: terminal opened beside another, ")
             .u(reg.len() as u64)
@@ -428,13 +395,12 @@ fn open_sibling(reg: &mut Registry, of: u64, request_id: u64) {
 
 /// Free terminal `i`: close its endpoint and drop it.
 ///
-/// **This is the revocation point.** Handles are refcounted and this kernel has none, so a
-/// process that outlived its session while holding a `/dev/tty` handle cannot have it taken
-/// away. The server declining to serve the channel is what makes teardown a guarantee
-/// rather than a convention — see `docs/architecture/console-and-tty.md`.
+/// **This is the revocation point.** This kernel has no revocation, so a process that outlived
+/// its session while holding a `/dev/tty` handle cannot have it taken away; the server ceasing to
+/// serve the channel makes teardown a guarantee — see `docs/architecture/console-and-tty.md`.
 fn free_tty(reg: &mut Registry, ch: u64) {
-    // The backend goes with it if this was the last terminal on it — and if that backend was a
-    // channel, closing our end is what tells the emulator the terminal is gone.
+    // The backend goes with the last terminal on it; closing a channel backend tells the
+    // emulator the terminal is gone.
     for h in reg.close_and_retire(ch) {
         // SAFETY: closing our own backend endpoint.
         unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
@@ -457,8 +423,7 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
         )
     };
     if rr != 0 {
-        // `PeerClosed` means the last holder is gone: the terminal is finished. Anything
-        // else is an empty ring.
+        // `PeerClosed` means the terminal is finished; anything else is an empty ring.
         return rr != KError::PeerClosed.as_i32() as i64;
     }
     // SAFETY: bounded read-only slice over the just-received message.
@@ -487,8 +452,8 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
             // SAFETY: the kernel wrote `RECV_COUNT` handles into `RECV_HANDLES`.
             let handle = unsafe { if RECV_COUNT >= 1 { RECV_HANDLES[0] } else { 0 } };
             if handle == 0 {
-                // No handle moved: there is nothing to attach, and silently succeeding would
-                // leave the emulator waiting for output that goes to the console.
+                // Succeeding silently would leave the emulator waiting for output that goes to
+                // the console.
                 reply_error(ch, op, request_id, KError::InvalidArgument.as_i32());
             } else {
                 match reg.attach_backend(ch, handle) {
@@ -505,8 +470,8 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
             }
         }
         OP_TTY_OPEN_SIBLING => open_sibling(reg, ch, request_id),
-        // **A token for this terminal's backend** (laptop polish Part A): what lets the view
-        // broker learn which terminal a request came from without asking the requester.
+        // A token for this terminal's backend: how the view broker learns which terminal a
+        // request came from without asking the requester.
         OP_TTY_TOKEN => match (reg.backend_of_terminal(ch), random_token()) {
             (Some(backend), Some(token)) => {
                 tokens.mint(token, backend, now_ns());
@@ -529,10 +494,8 @@ fn serve_tty(reg: &mut Registry, tokens: &mut Tokens, ch: u64) -> bool {
     true
 }
 
-/// Read whatever a terminal emulator sent on backend `id`'s channel and feed it in.
-///
-/// Returns `false` if the emulator is gone, which ends every terminal on that backend — see
-/// `serve_loop`.
+/// Feed in what a terminal emulator sent on backend `id`'s channel. Returns `false` if the
+/// emulator is gone, which ends every terminal on that backend.
 fn serve_backend(reg: &mut Registry, id: u32, ch: u64) -> bool {
     // SAFETY: valid recv out-params.
     let rr = unsafe {
@@ -559,8 +522,8 @@ fn serve_backend(reg: &mut Registry, id: u32, ch: u64) -> bool {
             Err(_) => return true,
         }
     };
-    // Only input is expected here. Anything else is ignored rather than answered: this channel
-    // carries unsolicited messages in both directions, so there is no request to fail.
+    // Anything but input is ignored: this channel carries unsolicited messages, so there is no
+    // request to fail.
     if op == OP_TTY_INPUT {
         perform(&reg.feed(id, body));
     }
@@ -578,20 +541,10 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
     let mut backend_at: Vec<(u64, u32)> = Vec::new();
 
     loop {
-        // **A console read is always outstanding.**
-        //
-        // It used to be submitted only while a terminal waited, because the console driver
-        // is single-reader and `session-mgr`'s login and `nxsh`'s REPL still read the
-        // device directly — a permanent read here swallowed their keystrokes, and the
-        // interactive login test timed out on a password prompt that never saw its input.
-        // That comment said the migration could then happen one client at a time, and it
-        // has: session-mgr reads through `tty_read_line` and the shell opens `/dev/tty`,
-        // so this server is the only reader of `/dev/console` in a live session.
-        //
-        // Reading continuously is now required rather than merely allowed. `Ctrl-C` has to
-        // be seen **while the shell is busy** (§11h) — that is the entire point of an
-        // interrupt — and nobody is waiting for input at that moment. Bytes that arrive
-        // with no reader still queue, exactly as typing ahead of a prompt always did.
+        // A console read is always outstanding: `Ctrl-C` has to be seen **while the shell is
+        // busy**, when nobody is waiting for input. This server is the only reader of
+        // `/dev/console` in a live session, so the single-reader driver is not contended.
+        // Bytes that arrive with no reader still queue.
         if read_po == 0 {
             let op = libkern::abi::IoOp {
                 opcode: libkern::abi::IO_OPCODE_READ,
@@ -621,8 +574,8 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
             unsafe {
                 WAIT_HANDLES[0] = serve_end;
                 let mut n = 1usize;
-                // The control channel, for `service --stop` — until its supervisor has gone, when
-                // it would stay signalled for good.
+                // The control channel (`service --stop`), until its supervisor has gone and it
+                // would stay signalled for good.
                 if control != 0 {
                     WAIT_HANDLES[n] = control;
                     n += 1;
@@ -669,8 +622,8 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
                 drain_resolves(serve_end, &mut reg);
             } else if control != 0 && h == control {
                 match libkern::control::recv(control) {
-                    // Every terminal ends with this process: its programs' next read or write
-                    // finds the channel closed, as when a window's emulator goes.
+                    // Every terminal ends with this process; its programs' next read or write
+                    // finds the channel closed.
                     Control::Op(CTRL_OP_SHUTDOWN) => {
                         kprint(b"tty-server: asked to stop, exiting\n");
                         exit(0);
@@ -695,10 +648,9 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64, mut contr
             } else if let Some((_, id)) = backend_at.iter().find(|(bh, _)| *bh == h).copied()
                 && !serve_backend(&mut reg, id, h)
             {
-                // **The emulator is gone, so every terminal on its backend ends.** A
-                // terminal whose window has closed cannot be interacted with, and leaving
-                // it alive would give its programs a `/dev/tty` that silently discards
-                // everything written to it — the failure that looks like a hang.
+                // The emulator is gone, so every terminal on its backend ends: leaving one alive
+                // would give its programs a `/dev/tty` that silently discards everything
+                // written to it, which looks like a hang.
                 kprint(b"tty-server: a backend went away\n");
                 for ch in reg.ttys_on(id) {
                     free_tty(&mut reg, ch);
@@ -759,8 +711,7 @@ fn drain_resolves(serve_end: u64, reg: &mut Registry) {
                 payload_len.min(MSG_LEN - PAYLOAD_OFF),
             );
             match decode(req) {
-                // Only the terminal itself is addressable: `/dev/tty/anything` is not a
-                // name this server has.
+                // Only the terminal itself is addressable, not `/dev/tty/anything`.
                 Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
                     Some(r) => (m.op, m.request_id, r.suffix.is_empty()),
                     None => (m.op, m.request_id, false),
@@ -785,10 +736,8 @@ fn drain_resolves(serve_end: u64, reg: &mut Registry) {
 pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"tty-server: up\n");
 
-    // The raw device, held **exclusively** from here on. A session gets `/dev/tty` and not
-    // `/dev/console`, so it cannot reach the device at all — which also retires the
-    // driver's single-reader assumption, previously kept only by session-mgr and nxsh
-    // happening not to read at the same time.
+    // The raw device is held **exclusively** from here on: a session gets `/dev/tty` and not
+    // `/dev/console`, so it cannot reach the device at all.
     let console = ns_lookup(root_ns, b"/dev/console", RIGHT_READ);
     if console == 0 {
         kprint(b"tty-server: /dev/console not found\n");
