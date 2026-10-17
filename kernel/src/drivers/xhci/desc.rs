@@ -189,7 +189,7 @@ impl Endpoint {
     }
 }
 
-/// **A HID interface** (Phase 6 Part B.2): its number and class triple, its first interrupt-IN
+/// **A HID interface**: its number and class triple, its first interrupt-IN
 /// endpoint if it has one, and the length of the report descriptor its HID descriptor names.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HidInterface {
@@ -261,7 +261,7 @@ pub fn hid_interfaces(b: &[u8]) -> impl Iterator<Item = HidInterface> {
     found.into_iter().flatten()
 }
 
-/// **A bulk-only mass-storage interface** (Phase 6 Part D.2): its number, and its bulk IN and bulk
+/// **A bulk-only mass-storage interface**: its number, and its bulk IN and bulk
 /// OUT endpoints, each with a SuperSpeed companion's burst.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct StorageInterface {
@@ -323,13 +323,13 @@ pub fn storage_interface(b: &[u8]) -> Option<StorageInterface> {
 /// What this kernel has, or will have, a driver for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Match {
-    /// HID, boot interface, keyboard: `03/01/01` (Part B).
+    /// HID, boot interface, keyboard: `03/01/01`.
     BootKeyboard,
-    /// HID, boot interface, mouse: `03/01/02` (Part B).
+    /// HID, boot interface, mouse: `03/01/02`.
     BootMouse,
-    /// Mass storage, SCSI transparent, bulk-only: `08/06/50` (Part D).
+    /// Mass storage, SCSI transparent, bulk-only: `08/06/50`.
     BulkOnlyStorage,
-    /// A hub, class `09`: external hubs are outside Phase 6.
+    /// A hub, class `09`: external hubs are not driven.
     Hub,
     /// Nothing this kernel drives.
     Nothing,
@@ -361,7 +361,7 @@ fn match_triple(t: (u8, u8, u8)) -> Match {
 
 /// **The device's match**: the first interface that matches anything, or the device's own class
 /// when it is not zero and no interface does. A composite device — a keyboard and a mouse in one —
-/// matches its first; Part B binds each interface.
+/// matches its first; each interface is bound on its own.
 pub fn class_match(dev: &Device, config: &[u8]) -> Match {
     if let Some(m) = interfaces(config).map(|i| match_triple(i.class)).find(|m| *m != Match::Nothing) {
         return m;
@@ -410,7 +410,7 @@ pub fn string_into(b: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
-/// **`vvvv:pppp`**, a device's name when it gives no string (Phase 6 Part A.3), into `out`, which
+/// **`vvvv:pppp`**, a device's name when it gives no string, into `out`, which
 /// holds at least nine bytes. The length written.
 pub fn ids_into(vendor: u16, product: u16, out: &mut [u8]) -> usize {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(device_prefix(&KEYBOARD[..7]), None);
     }
 
-    /// **At SuperSpeed `bMaxPacketSize0` is an exponent** (PR #353 review): 9 is 512 there, and
+    /// **At SuperSpeed `bMaxPacketSize0` is an exponent**: 9 is 512 there, and
     /// below SuperSpeed only the four byte counts USB 2.0 allows are taken.
     #[test]
     fn the_default_endpoints_packet_is_an_exponent_at_super_speed() {
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(first_language(&hex("04030904")), Some(0x0409), "US English");
     }
 
-    /// **The checks a reviewer could delete without a test failing** (PR #355 review): a string
+    /// **The checks a reviewer could delete without a test failing**: a string
     /// descriptor 0 too short to name a language, *as the driver hands it over* — 255 bytes with
     /// zeros after it, where the zeros would read as language 0 — and a device prefix of the wrong
     /// type or too short a length.
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(record_class(&iad, &keyboard_config()), (0xEF, 0x02, 0x01), "the record keeps the device's");
     }
 
-    /// **QEMU's keyboard and mouse, as HID interfaces** (Phase 6 Part B.2), from the bytes they sent:
+    /// **QEMU's keyboard and mouse, as HID interfaces**, from the bytes they sent:
     /// each one interface with its interrupt-IN endpoint 1 and its report descriptor's length, and
     /// the reader none. Endpoint 1 IN is Device Context Index 3.
     #[test]
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(found[1].report_len, 0, "no HID descriptor");
     }
 
-    /// **A companion is its own endpoint's** (PR #358 review): one after an endpoint that is not the
+    /// **A companion is its own endpoint's**: one after an endpoint that is not the
     /// chosen one — here an OUT endpoint after the chosen IN — leaves the chosen one's burst alone.
     #[test]
     fn a_companion_after_another_endpoint_is_not_the_chosen_ones() {
@@ -729,7 +729,7 @@ mod tests {
         assert!(storage_interface(&c).is_some());
     }
 
-    /// **An interface's endpoints are its own** (PR #363 review): a bulk-only interface with a bulk IN
+    /// **An interface's endpoints are its own**: a bulk-only interface with a bulk IN
     /// alone does not take the next interface's bulk OUT to make up the pair.
     #[test]
     fn a_storage_interface_takes_no_endpoint_of_the_next_interface() {

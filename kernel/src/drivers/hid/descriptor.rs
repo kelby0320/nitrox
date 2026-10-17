@@ -1,6 +1,5 @@
-//! **A HID report descriptor, read for a mouse's or a keyboard's layout** (Phase 6 Parts B.3 and
-//! B.7): where its report keeps a mouse's buttons, X, Y and wheel, or a keyboard's modifiers and
-//! keys, so a device in report protocol is read by what it says.
+//! **A HID report descriptor, read for a mouse's or a keyboard's layout**: where its report keeps
+//! a mouse's buttons, X, Y and wheel, or a keyboard's modifiers and keys.
 //!
 //! HID 1.11 §6.2.2: a descriptor is a sequence of items, each a prefix byte — its size, type and
 //! tag — and up to four bytes of data. *Global* items (usage page, logical extents, report size,
@@ -10,9 +9,8 @@
 //! Output items count their own reports the same way.
 //!
 //! **One walk reads the items** ([`walk`]) and hands each collection and each Input and Output item
-//! to a reader of the device's kind, so every length a device states is checked in one place, as
-//! every other descriptor reader in this driver checks: a descriptor that runs past its bytes is
-//! read no further.
+//! to a reader of the device's kind, so every length a device states is checked in one place: a
+//! descriptor that runs past its bytes is read no further.
 //!
 //! **Only what this driver needs is read**, and anything else gives `None`, which runs the device in
 //! boot protocol instead:
@@ -28,13 +26,11 @@
 use super::keyboard::{self, Array, Bits, Lights};
 use super::mouse::{Field, Layout};
 
-/// Usage pages.
 const PAGE_GENERIC_DESKTOP: u16 = 0x01;
 const PAGE_KEYBOARD: u16 = 0x07;
 const PAGE_LEDS: u16 = 0x08;
 const PAGE_BUTTON: u16 = 0x09;
 
-/// Generic Desktop usages.
 const USAGE_POINTER: u16 = 0x01;
 const USAGE_MOUSE: u16 = 0x02;
 const USAGE_KEYBOARD: u16 = 0x06;
@@ -76,7 +72,6 @@ const INPUT_RELATIVE: u32 = 1 << 2;
 const USAGES_MAX: usize = 16;
 /// Report IDs whose bit offsets are tracked, of each kind.
 const IDS_MAX: usize = 16;
-/// Push depth.
 const STACK_MAX: usize = 4;
 /// The longest report a layout may describe, in bits: what a TRB asks for, 64 bytes.
 const REPORT_BITS_MAX: u32 = 64 * 8;
@@ -95,7 +90,6 @@ struct Globals {
     id: u8,
 }
 
-/// Which report an item adds to: an input report, or an output one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Main {
     Input,
@@ -119,8 +113,7 @@ struct Item<'a> {
 }
 
 impl Item<'_> {
-    /// **Field `f`'s usage**: counted from the usage minimum, or the list's — its last standing for
-    /// every field past it — or `None` for no usage, or one past the usage maximum.
+    /// **Field `f`'s usage**: from the usage minimum, or the list's (its last stands for the rest).
     fn usage(&self, f: u32) -> Option<u32> {
         let usage = match (self.usage_min, self.usages.last()) {
             (Some(min), _) => min.saturating_add(f),
@@ -130,20 +123,15 @@ impl Item<'_> {
         if self.usage_max.is_some_and(|m| usage > m) { None } else { Some(usage) }
     }
 
-    /// Whether its fields are data and variables: a value each, rather than constant padding or an
-    /// array of usages.
+    /// Whether its fields are data variables: a value each, not padding or an array of usages.
     fn variable(&self) -> bool {
         self.flags & INPUT_CONSTANT == 0 && self.flags & INPUT_VARIABLE != 0
     }
 }
 
-/// What [`walk`] meets, in order.
 enum Event<'a> {
-    /// A collection opens: its type, and the first usage before it.
     Open { kind: u32, usage: Option<u32> },
-    /// The innermost open collection closes.
     Close,
-    /// An Input or Output item with fields of a bit or more.
     Item(Item<'a>),
 }
 
@@ -154,17 +142,15 @@ enum Event<'a> {
 /// report whose size overflows or runs past [`REPORT_BITS_LIMIT`].
 ///
 /// **A device's sizes are taken as untrusted**: a count and size whose product overflows, or a
-/// report past any a TRB could carry, ends the walk rather than overflow or loop for ever. **A field
-/// of no bits reads nothing**, so an item of them is passed over whatever its count says: its
-/// product is zero, so no count is too large for either guard, and walking its fields was a loop as
-/// long as the count — 19 s for one item (PR #358 review). An output report that runs long, or a
-/// seventeenth output ID, is not an error: its items are passed over, since only a keyboard's lights
-/// are read from one.
+/// report past any a TRB could carry, ends the walk rather than overflow or loop for ever. **A
+/// field of no bits reads nothing**, so an item of them is passed over whatever its count says: its
+/// product is zero, so no count is too large for either guard, and walking its fields would loop
+/// as long as the count. An output report that runs long, or a seventeenth output ID, is not an
+/// error: its items are passed over, since only a keyboard's lights are read from one.
 fn walk(desc: &[u8], mut visit: impl FnMut(Event<'_>)) -> Option<bool> {
     let mut g = Globals::default();
     let mut stack = [Globals::default(); STACK_MAX];
     let mut depth = 0usize;
-    // Local items.
     let mut usages = [0u32; USAGES_MAX];
     let mut n_usages = 0usize;
     let mut usage_min: Option<u32> = None;
@@ -348,7 +334,7 @@ pub fn mouse_layout(desc: &[u8]) -> Option<Layout> {
     found.layout(uses_ids)
 }
 
-/// **The keyboard layout `desc` describes** (Phase 6 Part B.7), or `None` for one this driver does
+/// **The keyboard layout `desc` describes**, or `None` for one this driver does
 /// not read — no keyboard collection, keys in no field it knows, more runs of bits than a layout
 /// holds, a report past any a TRB could carry — or one that does not parse.
 pub fn keyboard_layout(desc: &[u8]) -> Option<keyboard::Layout> {
@@ -368,7 +354,6 @@ pub fn keyboard_layout(desc: &[u8]) -> Option<keyboard::Layout> {
     keys.layout(uses_ids)
 }
 
-/// A usage as page and ID together, as a four-byte usage item gives it.
 const fn usage_of(page: u16, id: u16) -> u32 {
     (page as u32) << 16 | id as u32
 }
@@ -386,7 +371,7 @@ fn id_slot(offsets: &mut [(u8, u32); IDS_MAX], n: &mut usize, id: u8) -> Option<
     Some(*n - 1)
 }
 
-/// **What the keyboard walk found** (Phase 6 Part B.7): the key report's ID and fields, and its
+/// **What the keyboard walk found**: the key report's ID and fields, and its
 /// lights.
 #[derive(Default)]
 struct Keys {
@@ -404,7 +389,6 @@ struct Keys {
 }
 
 impl Keys {
-    /// Take `item`, inside the keyboard's collection.
     fn take(&mut self, item: &Item<'_>) {
         match item.main {
             Main::Input => self.take_input(item),
@@ -470,7 +454,6 @@ impl Keys {
         }
     }
 
-    /// An output item: the lights it carries, a bit each.
     fn take_output(&mut self, item: &Item<'_>) {
         if !item.variable() || item.size != 1 {
             return;
@@ -533,7 +516,6 @@ struct Found {
 }
 
 impl Found {
-    /// Take `field`, whose usage is `usage`, from report `id`.
     fn take(&mut self, usage: u32, field: Field, relative: bool, id: u8) {
         let page = (usage >> 16) as u16;
         let what = usage as u16;
@@ -594,8 +576,7 @@ impl Found {
 mod tests {
     use super::*;
 
-    /// **QEMU's `usb-mouse`** (`qemu_mouse_hid_report_descriptor`, `hw/usb/dev-hid.c`): five
-    /// buttons, three bits of padding, then X, Y and the wheel as signed bytes, with no report ID.
+    /// **QEMU's `usb-mouse`**: five buttons, padding, then X, Y and the wheel as signed bytes.
     #[rustfmt::skip]
     const QEMU_MOUSE: [u8; 52] = [
         0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x05,
@@ -604,7 +585,6 @@ mod tests {
         0x81, 0x06, 0xC0, 0xC0,
     ];
 
-    /// QEMU's `usb-kbd`: a keyboard, not a mouse.
     #[rustfmt::skip]
     const QEMU_KEYBOARD: [u8; 63] = [
         0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x75, 0x01, 0x95, 0x08, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,
@@ -613,11 +593,9 @@ mod tests {
         0x75, 0x08, 0x15, 0x00, 0x25, 0xFF, 0x05, 0x07, 0x19, 0x00, 0x29, 0xFF, 0x81, 0x00, 0xC0,
     ];
 
-    /// **A Corsair K70 RGB MK.2's boot interface** (`1b1c:1b49`), read from a real one by Linux
-    /// (`report_descriptor` in sysfs, 2026-10-13): report 1 a keyboard — the modifiers, then a bit
-    /// for each usage 0x00–0x97, and Num, Caps and Scroll Lock as an output — then consumer keys as
-    /// report 2, two vendor reports, and a mouse as report 5. It answers boot protocol and sends
-    /// report 1 regardless, which is what Part B.7 reads it by.
+    /// **A Corsair K70 RGB MK.2's boot interface** (`1b1c:1b49`): report 1 a keyboard — the
+    /// modifiers, a bit for each usage 0x00–0x97, and the three lights as an output — then consumer
+    /// keys, two vendor reports, and a mouse as report 5. It sends report 1 in any protocol.
     #[rustfmt::skip]
     const K70: [u8; 192] = [
         0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00,
@@ -652,9 +630,8 @@ mod tests {
         assert_eq!(mouse_layout(&QEMU_KEYBOARD), None);
     }
 
-    /// **The shape many real mice have in report protocol**: report ID 2, sixteen buttons, X and Y
-    /// as 12-bit fields packed into three bytes, a wheel, and a horizontal wheel on the Consumer page
-    /// — which is walked past.
+    /// **The shape many real mice have in report protocol**: ID 2, sixteen buttons, 12-bit X and Y
+    /// packed into three bytes, a wheel, and a horizontal wheel on the Consumer page (walked past).
     #[test]
     fn a_numbered_report_with_twelve_bit_axes() {
         #[rustfmt::skip]
@@ -678,7 +655,6 @@ mod tests {
         assert_eq!(l.wheel, Some(signed(40, 8)));
     }
 
-    /// **16-bit axes and no wheel**: still a mouse, without one.
     #[test]
     fn sixteen_bit_axes_and_no_wheel() {
         #[rustfmt::skip]
@@ -693,29 +669,24 @@ mod tests {
         assert_eq!((l.x, l.y, l.wheel), (signed(8, 16), signed(24, 16), None));
     }
 
-    /// **Not a plain mouse**: no X, absolute axes (a tablet), or no button — each runs in boot
-    /// protocol instead.
+    /// **Not a plain mouse**: no X, absolute axes, or no button each run in boot protocol.
     #[test]
     fn what_is_not_a_plain_mouse_gives_no_layout() {
         // QEMU's mouse with X's usage changed to Z (0x32): no X.
         let mut no_x = QEMU_MOUSE;
         no_x[35] = 0x32;
         assert_eq!(mouse_layout(&no_x), None);
-        // Its axes absolute: Input (Data, Variable, Absolute).
         let mut absolute = QEMU_MOUSE;
         absolute[49] = 0x02;
         assert_eq!(mouse_layout(&absolute), None);
-        // Its buttons constant: no button.
         let mut no_buttons = QEMU_MOUSE;
         no_buttons[25] = 0x03;
         assert_eq!(mouse_layout(&no_buttons), None);
     }
 
-    /// **A device's sizes are untrusted** (Phase 6 Part B.3): a count and size whose product
-    /// overflows ends the walk with no layout rather than overflowing, which panics in a debug
-    /// kernel; a report longer than a page ends it at once, where the field loop would otherwise
-    /// run two billion times at boot, held here to a second; and so does an item whose fields have
-    /// no bits, however many it says it has.
+    /// **A device's sizes are untrusted**: a count and size whose product overflows ends the walk
+    /// with no layout rather than panicking a debug kernel; a report longer than a page ends it at
+    /// once; and so does an item whose fields have no bits, however many it says it has.
     #[test]
     fn sizes_that_overflow_or_run_long_give_no_layout() {
         // The axes' Report Size and Count as four-byte items: their product overflows.
@@ -729,7 +700,7 @@ mod tests {
         assert_eq!(mouse_layout(&d), None, "a report longer than a page");
         assert!(start.elapsed() < std::time::Duration::from_secs(1), "the walk ended at once");
         // Fields of no bits, as many as a count can say: their product is zero, so neither guard
-        // sees them (PR #358 review). Walked, it took 19 s.
+        // sees them. Walked, it took 19 s.
         let mut d = QEMU_MOUSE[..44].to_vec();
         d.extend_from_slice(&[0x75, 0x00, 0x97, 0xFF, 0xFF, 0xFF, 0xFF, 0x81, 0x06, 0xC0, 0xC0]);
         let start = std::time::Instant::now();
@@ -737,10 +708,9 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(1), "the item was passed over at once");
     }
 
-    /// **Only the mouse's collection is read** (PR #358 review). A report may hold another
-    /// collection's fields first — here a joystick's, with relative X and Y of its own — and they push
-    /// the mouse's fields along, since one report is every input item with its ID; but they are not
-    /// the mouse's axes.
+    /// **Only the mouse's collection is read**. A joystick's fields before it, with relative X and
+    /// Y of their own, push the mouse's fields along (one report is every input item with its ID)
+    /// but are not the mouse's axes.
     #[test]
     fn axes_outside_the_mouse_collection_are_not_its() {
         let mut d = vec![
@@ -754,8 +724,7 @@ mod tests {
         assert_eq!((l.x, l.y, l.wheel), (signed(24, 8), signed(32, 8), Some(signed(40, 8))));
     }
 
-    /// **A descriptor that runs past its bytes is read no further**, and a Pop with nothing pushed
-    /// ends it.
+    /// **A descriptor that runs past its bytes is read no further**; so is a Pop with no push.
     #[test]
     fn a_descriptor_that_runs_past_its_bytes_gives_none() {
         assert_eq!(mouse_layout(&QEMU_MOUSE[..49]), None, "cut inside the axes' Input item");
@@ -764,18 +733,16 @@ mod tests {
         assert_eq!(mouse_layout(&[]), None);
     }
 
-    /// **QEMU's keyboard reads as a boot keyboard** (Part B.7): its descriptor is the boot report's
-    /// — modifiers, a reserved byte, six slots, and five lights of which the first three are Num,
-    /// Caps and Scroll Lock — so report protocol reads it exactly as boot protocol did.
+    /// **QEMU's keyboard reads as a boot keyboard**: its descriptor is the boot report's, so report
+    /// protocol reads it exactly as boot protocol did.
     #[test]
     fn qemus_keyboard_reads_as_the_boot_layout() {
         assert_eq!(keyboard_layout(&QEMU_KEYBOARD), Some(keyboard::Layout::BOOT));
         assert_eq!(keyboard_layout(&QEMU_MOUSE), None, "a mouse is not a keyboard");
     }
 
-    /// **The K70's layout**: report 1, the modifiers and a 152-bit bitmap after its ID, and its
-    /// lights in output report 1 — and nothing taken from the consumer, vendor or mouse reports
-    /// after the keyboard's collection.
+    /// **The K70's layout**: report 1, the modifiers and a 152-bit bitmap, its lights in output
+    /// report 1, and nothing from the reports after the keyboard's collection.
     #[test]
     fn the_k70_reads_as_its_modifiers_and_a_bitmap() {
         let l = keyboard_layout(&K70).expect("a keyboard this driver reads");
@@ -794,9 +761,8 @@ mod tests {
         assert_eq!(l.report_bytes(), 21, "the 21 bytes a K70 sends");
     }
 
-    /// **The K70's own reports, as it sent them** with boot protocol asked for (2026-10-13): `a`
-    /// pressed and released, `b`, then Left Shift held over `a`. Read by the boot layout these gave
-    /// `m`, `3` and a Control held throughout; read by its own, what was typed.
+    /// **The K70's own reports, as it sent them**: the boot layout read these as `m`, `3` and a
+    /// Control held throughout; read by its own, what was typed.
     #[test]
     fn the_k70s_reports_type_what_was_pressed() {
         use crate::libkern::input::*;
@@ -837,7 +803,6 @@ mod tests {
             assert_eq!(keys, want, "report {r:02x?}");
         }
         assert_eq!(held, keyboard::Held::NONE, "nothing held at the end");
-        // What boot protocol made of the first: Control and `m`.
         let mut out = [InputEvent::default(); keyboard::EVENTS_MAX];
         let mut nothing = keyboard::Held::NONE;
         let (n, _) = keyboard::decode(&keyboard::Layout::BOOT, &mut nothing, &sent[0], 7, &mut out).unwrap();
@@ -845,19 +810,15 @@ mod tests {
         assert_eq!(keys, [KEY_LEFTCTRL, 50], "the fault as the laptop showed it");
     }
 
-    /// **What is not a keyboard this driver reads gives no layout**: no field over the letters, a
-    /// variable key field wider than a bit, more runs of bits than a layout holds, and keys past a
-    /// report a TRB carries. Lights anywhere but the first three bits are not taken, and the keys
-    /// still are.
+    /// **What is not a keyboard this driver reads gives no layout**; lights anywhere but the first
+    /// three bits are not taken, and the keys still are.
     #[test]
     fn what_is_not_a_readable_keyboard_gives_no_layout() {
-        // The keyboard's collection with only the modifiers: no letters.
         let mods_only = [
             0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
             0x95, 0x08, 0x81, 0x02, 0xC0,
         ];
         assert_eq!(keyboard_layout(&mods_only), None, "no letters");
-        // The K70's bitmap as two-bit fields.
         let mut wide = K70;
         let at = K70.windows(4).position(|w| w == [0x75, 0x01, 0x95, 0x98]).expect("the bitmap's size and count");
         wide[at + 1] = 0x02;
@@ -896,9 +857,7 @@ mod tests {
         assert_eq!((l.array.is_some(), l.lights), (true, None), "lights not in the first three bits");
     }
 
-    /// **The keys are one report's** (Part B.7): the first with a Keyboard-page field. A second
-    /// report's keys in the same collection are not taken, here a bitmap as report 2 after report
-    /// 1's modifiers and slots.
+    /// **The keys are one report's**: a second report's keys in the same collection are not taken.
     #[test]
     fn the_keys_are_the_first_reports() {
         #[rustfmt::skip]
@@ -906,7 +865,6 @@ mod tests {
             0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01, // keyboard, report 1
             0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, // modifiers
             0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x19, 0x00, 0x2A, 0xFF, 0x00, 0x81, 0x00, // six slots
-            // Report 2: a..z, a bit each.
             0x85, 0x02, 0x19, 0x04, 0x29, 0x1D, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x1A, 0x81, 0x02,
             0xC0,
         ];
@@ -916,8 +874,7 @@ mod tests {
         assert_eq!(l.array, Some(Array { offset: 8, count: 6, size: 8, first: 0, logical_min: 0 }));
     }
 
-    /// **Only the keyboard's collection is read**: a collection before it with Keyboard-page fields
-    /// of its own — here a Consumer Control's, as report 3 — is not the keyboard's.
+    /// **Only the keyboard's collection is read**: a Consumer Control's fields before it are not.
     #[test]
     fn keys_outside_the_keyboard_collection_are_not_its() {
         let mut d = vec![

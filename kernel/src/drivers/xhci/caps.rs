@@ -117,8 +117,7 @@ mod tests {
         w.insert(at + 8, (count as u32) << 8 | first as u32);
     }
 
-    /// **A controller the shape of the laptop's**: Legacy Support first, then USB 2 and USB 3, then
-    /// a vendor-defined entry, as Intel's lay them out.
+    /// **A controller the shape of the laptop's**: Legacy Support, USB 2, USB 3, a vendor entry.
     #[test]
     fn legacy_and_two_protocols_are_found_and_the_rest_counted() {
         let mut w = HashMap::new();
@@ -158,7 +157,6 @@ mod tests {
         assert_eq!(walk(|_| 0x0000_000A, 0x10, 0x1000).other, 1, "next = 0 ends after one");
     }
 
-    /// An entry past the end of the window is not read, and neither is a chain that runs off it.
     #[test]
     fn the_window_bounds_the_walk() {
         let mut w = HashMap::new();
@@ -170,7 +168,6 @@ mod tests {
         assert_eq!(walk(|_| 0, 0, 0x1000), ExtCaps::default(), "no chain at all");
     }
 
-    /// A Supported Protocol entry with some other name is not a USB one.
     #[test]
     fn a_protocol_entry_not_named_usb_is_not_taken() {
         let mut w = HashMap::new();
