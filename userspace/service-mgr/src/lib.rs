@@ -1,13 +1,8 @@
 //! service-mgr's host-testable internals.
 //!
-//! `service-mgr` is a library + binary crate (mirroring init): this library holds the
-//! logic that can be unit-tested on the host (the service-declaration parser), while
-//! `src/main.rs` is the bare-target supervisor entry point that uses it.
-//! `#![no_std]` for the bare build; `std` under `cargo test` so the host harness works
-//! (`cargo xtask test` runs `cargo test -p service-mgr --lib`).
-//!
-//! The bare-target binary provides the `#[global_allocator]` (`libheap`); this library
-//! only needs `alloc`. See `docs/architecture/service-manager.md`.
+//! This library holds the logic that can be unit-tested on the host; `src/main.rs` is the
+//! bare-target supervisor that uses it, and provides the `#[global_allocator]`. `std` under
+//! `cargo test`. See `docs/architecture/service-manager.md`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -16,13 +11,10 @@ extern crate alloc;
 pub mod service_toml;
 
 pub mod bringup {
-    //! **The order the boot starts things in** (administration Part E.1).
-    //!
-    //! Declarations start in file order, a server's `Meta::Ready` awaited before the next starts
-    //! — which keeps the orders `init`'s comments called load-bearing. The login chain is not a
-    //! declaration, so where it goes is decided here: **after the last server and before
-    //! anything else**. Its supervisors need the servers, and a test image's clients must start
-    //! after the greeter, which is what keeps `check-display`'s reference windows on top.
+    //! **The order the boot starts things in**: file order, a server's `Meta::Ready` awaited
+    //! before the next starts. The login chain goes **after the last server and before anything
+    //! else**: its supervisors need the servers, and a test image's clients must start after the
+    //! greeter, which is what keeps `check-display`'s reference windows on top.
 
     /// What a declaration contributes to the order.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -33,8 +25,7 @@ pub mod bringup {
         pub critical: bool,
     }
 
-    /// The index the login chain starts before: just after the last server, or first if there
-    /// is none.
+    /// The index the login chain starts before: just after the last server, or first.
     pub fn chain_at(entries: &[Entry]) -> usize {
         entries.iter().rposition(|e| e.server).map_or(0, |i| i + 1)
     }
@@ -50,8 +41,7 @@ pub mod bringup {
         Done,
     }
 
-    /// The next step, with `started` declarations started and the login chain started or not.
-    /// The caller asks only when nothing is being waited for.
+    /// The next step; the caller asks only when nothing is being waited for.
     pub fn next(entries: &[Entry], started: usize, chain_started: bool) -> Step {
         if !chain_started && started >= chain_at(entries) {
             return Step::LoginChain;
@@ -62,28 +52,22 @@ pub mod bringup {
     /// What a server that did not come up at boot means.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Failed {
-        /// Start nothing more, and ask `init` for the emergency shell. The console is still free:
-        /// the critical servers start before the terminal server.
+        /// Ask `init` for the emergency shell; the console is still free, since the critical
+        /// servers start before the terminal server.
         Emergency,
         /// Report it, and go on.
         Continue,
     }
 
-    /// The consequence of `entry` failing to come up at boot.
+    /// What `entry` failing to come up at boot means.
     pub fn failed_at_boot(entry: Entry) -> Failed {
         if entry.critical { Failed::Emergency } else { Failed::Continue }
     }
 
-    /// **Why a set of declarations is not one to boot with**, or `None` (PR #340 review, finding
-    /// 2). `service-mgr` then starts nothing and asks `init` for the emergency shell, as for a
-    /// critical server that did not come up — which each of these is, before it is started:
-    /// - a declaration that said `critical = true` and could not be read (`skipped_critical`);
-    /// - no declarations at all: a missing, unreadable or unparseable file;
-    /// - none that is critical. The two critical servers are what a boot cannot go on without,
-    ///   and a file declaring neither has lost them rather than meant it.
-    ///
-    /// Before administration Part E.1, `init` started those two unconditionally and took the
-    /// emergency path if either failed, so no edit to a file could lose them.
+    /// **Why a set of declarations is not one to boot with**, or `None`: `service-mgr` then
+    /// starts nothing and asks `init` for the emergency shell. Because a critical declaration
+    /// could not be read (`skipped_critical`), there are none at all, or none is critical — a
+    /// file declaring none has lost them rather than meant it.
     pub fn unfit(entries: &[Entry], skipped_critical: bool) -> Option<&'static str> {
         if skipped_critical {
             Some("a critical declaration could not be read")
@@ -99,40 +83,32 @@ pub mod bringup {
 
 pub mod registry {
     //! **The registry**: where `service-mgr` binds each server's endpoint, under the server's
-    //! name, in a namespace of its own (administration Part E.1). Every other binding of a
-    //! server's path is one of `service-mgr`'s own endpoints — a **route** — which answers every
-    //! resolve with `SUBNAMESPACE` into the registry at one place, and the resolve continues into
-    //! whichever server is bound there now. A restart rebinds there and nowhere else.
+    //! name, in a namespace of its own. Every other binding of a server's path is a **route**: an
+    //! endpoint of `service-mgr`'s own that answers every resolve with `SUBNAMESPACE` into the
+    //! registry at one place. A restart rebinds there and nowhere else.
     //!
-    //! **A route reaches one server, never more** (Part E.1b). A single endpoint for every server,
-    //! routing on the suffix, is what Part E.1a's root used, and it could not be handed to a
-    //! session: `desktop-shell` holds what it is handed with `BIND_NAMESPACE`, and could have bound
-    //! it with any base — `/auth-service/admin`, or `/device-mgr/input`. A route is attenuation by
-    //! construction, as the device manager's info-only endpoint is.
+    //! **A route reaches one server, never more.** One endpoint routing on the suffix could not
+    //! be handed to a session: `desktop-shell` could bind it at any base, such as
+    //! `/auth-service/admin`.
 
     use alloc::string::String;
 
-    /// Routes `service-mgr` serves at once: one per server, and one per [`DERIVED`] endpoint.
-    /// Bounded by its wait set, which holds the notification channel, every route, the handles
-    /// that serve `/svc/services` ([`crate::services::SLOTS`]) and the control channel of each
-    /// server still starting (see [`STARTING_ROOM`]). Sixteen until administration Part E.2 made
-    /// room for the services.
+    /// Routes served at once: one per server, and one per [`DERIVED`] endpoint. Bounded by the
+    /// wait set, which also holds the notification channel, [`crate::services::SLOTS`] and
+    /// [`STARTING_ROOM`].
     pub const MAX_ROUTES: usize = 14;
 
-    /// The control channels of starting servers the wait set has room for, beside the
-    /// notification channel, [`MAX_ROUTES`] routes and the services' handles, within the kernel's
-    /// 32. One more starting at once is still seen, on the next pass: the wait is level-triggered
-    /// and looks at everything.
+    /// The control channels of starting servers the wait set has room for, within the kernel's
+    /// 32. One more starting at once is still seen on the next pass: the wait is level-triggered.
     pub const STARTING_ROOM: usize = libkern::abi::MAX_WAIT_HANDLES - 1 - MAX_ROUTES - crate::services::SLOTS;
 
-    /// **Endpoints a server mints for sessions**, each reached through a route of its own
-    /// (Part E.1b): `(server, suffix)` — resolving `suffix` on the server answers a forwarding
-    /// endpoint of its own, narrower than its root one. `service-mgr` resolves it each time the
-    /// server comes up, binds it at [`derived`], and hands the login supervisors the route to it,
-    /// so a restart re-derives it and every session reaches the new one.
-    /// - `device-mgr`'s `info-endpoint` answers its tables and never a class (Part B.4);
-    /// - `storage-service`'s `session-endpoint` answers the filesystems and the tables and never an
-    ///   admin endpoint (Part C.6).
+    /// **Endpoints a server mints for sessions**, `(server, suffix)`: resolving `suffix` on the
+    /// server answers a forwarding endpoint narrower than its root one. `service-mgr` resolves it
+    /// each time the server comes up, binds it at [`derived`], and hands the login supervisors
+    /// the route to it.
+    /// - `device-mgr`'s `info-endpoint` answers its tables and never a class;
+    /// - `storage-service`'s `session-endpoint` answers the filesystems and the tables and never
+    ///   an admin endpoint.
     pub const DERIVED: &[(&str, &str)] = &[("device-mgr", "info-endpoint"), ("storage-service", "session-endpoint")];
 
     /// The suffixes `name` derives endpoints from, in [`DERIVED`]'s order.
@@ -140,8 +116,8 @@ pub mod registry {
         DERIVED.iter().filter(move |(n, _)| *n == name).map(|&(_, s)| s)
     }
 
-    /// Where a derived endpoint is bound in the registry: `/<name>.<suffix>`. **The `.` is what
-    /// keeps it apart from every server**: no name the registry binds has one ([`valid_name`]).
+    /// Where a derived endpoint is bound: `/<name>.<suffix>`. **The `.` keeps it apart from every
+    /// server**: no name the registry binds has one ([`valid_name`]).
     pub fn derived(name: &str, suffix: &str) -> String {
         let mut b = base(name);
         b.push('.');
@@ -149,14 +125,13 @@ pub mod registry {
         b
     }
 
-    /// A name the registry binds a server under: 1 to 32 bytes of lowercase letters, digits and
-    /// `-`, as the declarations' names are.
+    /// A name the registry binds a server under: 1 to 32 bytes of lowercase letters, digits, `-`.
     pub fn valid_name(name: &str) -> bool {
         (1..=32).contains(&name.len())
             && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     }
 
-    /// Where `name` is bound in the registry: its route continues every resolve there.
+    /// Where `name` is bound in the registry.
     pub fn base(name: &str) -> String {
         let mut b = String::from("/");
         b.push_str(name);
@@ -165,68 +140,56 @@ pub mod registry {
 }
 
 pub mod shutdown {
-    //! **A shutdown's order** (administration Part E.4b): the sessions first, then the services
-    //! **last declared first** — the reverse of the order bring-up starts them in, so each server
-    //! outlives the ones started after it, which may use it: the compositor stops before the input
-    //! server, and the storage service unmounts while the log it reports to is still there — and
-    //! then `init`, which unmounts its own filesystems and stops the machine.
+    //! **A shutdown's order**: the sessions first, then the services **last declared first** —
+    //! the reverse of bring-up, so each server outlives the ones started after it, which may use
+    //! it: the compositor stops before the input server, and the storage service unmounts while
+    //! the log it reports to is still there — and then `init`, which stops the machine.
 
-    /// The next service to ask, below `below` in declaration order: the last one there that is
-    /// `running`, or `None` once none is.
+    /// The last `running` service below `below` in declaration order, if any.
     pub fn next_to_stop(running: &[bool], below: usize) -> Option<usize> {
         running[..below.min(running.len())].iter().rposition(|&r| r)
     }
 }
 
 pub mod services {
-    //! **`/svc/services`** (administration Part E.2): the list of services, for anyone, and
-    //! starting, stopping and restarting them, on an admin session.
+    //! **`/svc/services`**: the list of services, for anyone, and starting, stopping and
+    //! restarting them, on an admin session.
     //!
-    //! - The list is a table, `all.tsm`, resolved from `/svc/services` or a session endpoint's
-    //!   `/dev/services`, as the device manager's and the storage service's are: `name`, `state`
-    //!   and `restarts`.
-    //! - `admin-endpoint`, resolved from `/svc/services` only, mints a forwarding endpoint on which
-    //!   any resolve opens an admin session. The view broker's `services` grant binds one at
+    //! - The list is a table, `all.tsm`: `name`, `state` and `restarts`.
+    //! - `admin-endpoint`, resolved from `/svc/services` only, mints an endpoint on which any
+    //!   resolve opens an admin session, which takes `Start`, `Stop` and `Restart`, each answered
+    //!   once it has happened. The view broker's `services` grant binds one at
     //!   `/dev/services/admin`.
-    //! - On an admin session, `Start`, `Stop` and `Restart` (`librsproto::services`), each answered
-    //!   once it has happened.
-    //! - `power-endpoint`, resolved from `/svc/services` only, mints one on which any resolve
-    //!   opens a **power session**, which takes `Shutdown` and nothing else (administration Part
-    //!   E.4b). The view broker's `power` grant binds one at `/dev/power`.
+    //! - `power-endpoint`, likewise, opens a **power session**, which takes `Shutdown` and
+    //!   nothing else. The view broker's `power` grant binds one at `/dev/power`.
 
     use alloc::string::String;
     use alloc::vec::Vec;
     use libkern::error::KError;
     use libstream::wire::{Schema, StreamFlags, Table, TypeModifiers, TypeTag, Value};
 
-    /// Admin endpoints at once. The view broker asks for one the first time a view needs it; the
-    /// second is headroom.
+    /// Admin endpoints at once: the view broker's, and headroom.
     pub const MAX_ADMIN_ENDPOINTS: usize = 2;
-    /// Admin sessions open at once: a `service --stop` or `--restart` is one, briefly.
+    /// Admin sessions open at once.
     pub const MAX_ADMIN_SESSIONS: usize = 4;
-    /// Power endpoints at once: **one the view broker holds for the boot**, asked for the first
-    /// time a view needs it — and every `admin` view does, since `admin` grants `power` — and bound
-    /// into every view with the grant; and a second for a client that resolves one directly, as
-    /// `boot-probe` does to test the refusals (administration Part E.4d, when one was found to be
-    /// the broker's before the probe ever asked).
+    /// Power endpoints at once: **the view broker's, held for the boot**, and a second for a
+    /// client that resolves one directly, as `boot-probe` does to test the refusals.
     pub const MAX_POWER_ENDPOINTS: usize = 2;
-    /// Power sessions open at once: a `shutdown` is one, and a second can only be refused, since
-    /// one shutdown is already enough.
+    /// Power sessions open at once; a second shutdown can only be refused.
     pub const MAX_POWER_SESSIONS: usize = 2;
-    /// Wait-set slots the services take: `/svc/services`' own endpoint, the session endpoint, and
-    /// the admin and power endpoints and sessions.
+    /// Wait-set slots the services take.
     pub const SLOTS: usize = 2 + MAX_ADMIN_ENDPOINTS + MAX_ADMIN_SESSIONS + MAX_POWER_ENDPOINTS + MAX_POWER_SESSIONS;
 
     /// Where a service is, as the table says it.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum State {
-        /// Spawned, and a server whose `Meta::Ready` has not come.
+        /// A server whose `Meta::Ready` has not come.
         Starting,
         /// Running.
         Running,
-        /// Not running, and not for a failure: asked to stop, finished cleanly, or never started.
+        /// Not running, and not failed: asked to stop, finished cleanly, or never started.
         Stopped,
-        /// Not running, because it failed: an exit other than `0`, or one whose code never came.
+        /// An exit other than `0`, or one whose code never came.
         Failed,
     }
 
@@ -242,12 +205,12 @@ pub mod services {
         }
     }
 
-    /// A service's state: whether it is `running` and still `starting`, or `usable` — a server
-    /// bound, or any other service — whether its stop was `requested`, and how it last `exited`:
-    /// `None` if it never has, `Some(None)` if its code never came.
+    /// A service's state from whether it is `running` and `starting`, or `usable` (a server
+    /// bound, or any other service), whether its stop was `requested`, and how it last `exited`
+    /// (`Some(None)` if its code never came).
     ///
-    /// **Running and not usable is `failed`** (PR #341 review, finding 7): a server that refused,
-    /// or sent no `Meta::Ready` in time, is still a process, and its path answers `NotFound`.
+    /// **Running and not usable is `failed`**: a server that refused or sent no `Meta::Ready`
+    /// in time is still a process, and its path answers `NotFound`.
     pub fn state(running: bool, starting: bool, usable: bool, requested: bool, exited: Option<Option<i32>>) -> State {
         match (running, starting, usable) {
             (true, true, _) => State::Starting,
@@ -261,7 +224,6 @@ pub mod services {
         }
     }
 
-    /// The table's schema: `name`, `state`, `restarts`.
     pub fn schema() -> Schema {
         Schema::new()
             .field("name", TypeTag::String, TypeModifiers::NONE)
@@ -269,7 +231,7 @@ pub mod services {
             .field("restarts", TypeTag::Int, TypeModifiers::NONE)
     }
 
-    /// `all.tsm`: a row per service, in the declarations' order.
+    /// `all.tsm`: a row per service, in declaration order.
     pub fn table(rows: &[(&str, State, u32)]) -> Vec<u8> {
         let rows = rows
             .iter()
@@ -282,7 +244,7 @@ pub mod services {
             })
             .collect();
         let mut out = Vec::new();
-        // A `Vec` sink cannot fail, and every row has the schema's shape by construction.
+        // A `Vec` sink cannot fail, and every row has the schema's shape.
         let _ = Table { flags: StreamFlags::NONE, schema: schema(), rows }.encode(&mut out);
         out
     }
@@ -292,17 +254,15 @@ pub mod services {
     pub enum Asked {
         /// `all.tsm`: the table.
         Table,
-        /// `admin-endpoint`: an admin endpoint. **Only on `/svc/services`**: a session endpoint
-        /// answers it `NotFound`, so a session cannot reach starting and stopping at all.
+        /// `admin-endpoint`. **Only on `/svc/services`**: a session cannot reach starting and
+        /// stopping at all.
         AdminEndpoint,
-        /// `power-endpoint`: a power endpoint, and **only on `/svc/services`** for the same reason:
-        /// a session reaches a shutdown through the `power` grant or not at all.
+        /// `power-endpoint`, **only on `/svc/services`** for the same reason.
         PowerEndpoint,
         /// Anything else.
         Unknown,
     }
 
-    /// Classify `suffix`, as asked on a `session` endpoint or on `/svc/services` itself.
     pub fn asked(suffix: &[u8], session: bool) -> Asked {
         match suffix {
             b"all.tsm" => Asked::Table,
@@ -312,7 +272,6 @@ pub mod services {
         }
     }
 
-    /// What `service-mgr` does for an admin request.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Action {
         /// Start it; answer once it is up.
@@ -321,9 +280,8 @@ pub mod services {
         Stop,
         /// Ask it to stop, then start it; answer once the new one is up.
         StopThenStart,
-        /// **Cancel the restart its policy has scheduled**, and answer at once: a service in its
-        /// backoff is not running, and a stop is what keeps it from running again (PR #341 review,
-        /// finding 6). Without this a crash-looping service could not be stopped.
+        /// **Cancel the restart its policy has scheduled**, and answer at once; without this a
+        /// crash-looping service could not be stopped.
         CancelRestart,
     }
 
@@ -336,8 +294,7 @@ pub mod services {
         pub restart_due: bool,
     }
 
-    /// The request `op` (`librsproto::services`) for the service `found`, or none: what to do, or
-    /// why not.
+    /// What to do for request `op` on the service `found`, or why not.
     pub fn decide(op: u16, found: Option<Found>) -> Result<Action, (KError, &'static str)> {
         use librsproto::services::{OP_SERVICES_RESTART, OP_SERVICES_START, OP_SERVICES_STOP};
         let Some(Found { essential, running, restart_due }) = found else {
@@ -369,7 +326,6 @@ mod tests {
     const C: Entry = Entry { server: true, critical: true };
     const N: Entry = Entry { server: false, critical: false };
 
-    /// Walk the steps as the event loop takes them, starting each thing as it is named.
     fn order(entries: &[Entry]) -> std::vec::Vec<Step> {
         let (mut started, mut chain, mut out) = (0, false, std::vec::Vec::new());
         loop {
@@ -383,22 +339,18 @@ mod tests {
         }
     }
 
-    /// **The login chain goes after the last server and before everything else**: its
-    /// supervisors need the servers, and a test image's clients start after the greeter.
     #[test]
     fn the_login_chain_starts_after_the_last_server_and_before_the_rest() {
         use Step::*;
         assert_eq!(order(&[C, S, S, N, N]), [Start(0), Start(1), Start(2), LoginChain, Start(3), Start(4), Done]);
         assert_eq!(chain_at(&[C, S, S, N, N]), 3);
-        // A server declared after a non-server still counts: the chain waits for it.
         assert_eq!(order(&[S, N, S, N]), [Start(0), Start(1), Start(2), LoginChain, Start(3), Done]);
-        // No servers at all, as before Part E: the chain first.
+        // No servers at all: the chain first.
         assert_eq!(order(&[N, N]), [LoginChain, Start(0), Start(1), Done]);
         assert_eq!(order(&[]), [LoginChain, Done]);
         assert_eq!(order(&[S]), [Start(0), LoginChain, Done]);
     }
 
-    /// **What each admin request does, and what refuses it** (administration Part E.2).
     #[test]
     fn an_admin_request_is_decided_by_the_service_it_names() {
         use super::services::{Action, Found, decide};
@@ -415,13 +367,13 @@ mod tests {
         assert_eq!(decide(STOP, plain_down).map_err(|e| e.0), Err(KError::InvalidArgument));
         assert_eq!(decide(RESTART, plain_up), Ok(Action::StopThenStart));
         assert_eq!(decide(RESTART, plain_down), Ok(Action::Start), "a stopped one's restart starts it");
-        // An essential service is refused a stop and a restart, running or not, and not a start.
+        // An essential service is refused a stop and a restart, not a start.
         for op in [STOP, RESTART] {
             assert_eq!(decide(op, essential_up).map_err(|e| e.0), Err(KError::NoAccess));
             assert_eq!(decide(op, found(true, false, false)).map_err(|e| e.0), Err(KError::NoAccess));
         }
         assert_eq!(decide(START, found(true, false, false)), Ok(Action::Start));
-        // **A stop during a backoff cancels the restart**, where "not running" would let it run.
+        // A stop during a backoff cancels the restart, where "not running" would let it run.
         let backing_off = found(false, false, true);
         assert_eq!(decide(STOP, backing_off), Ok(Action::CancelRestart));
         assert_eq!(decide(START, backing_off), Ok(Action::Start));
@@ -431,7 +383,6 @@ mod tests {
         assert_eq!(decide(0x1103, plain_up).map_err(|e| e.0), Err(KError::Unsupported));
     }
 
-    /// **A service's state**, as the table says it.
     #[test]
     fn a_state_is_told_from_how_a_service_last_ended() {
         use super::services::{State, state};
@@ -446,8 +397,6 @@ mod tests {
         assert_eq!(never_came, State::Failed, "a code that never came");
     }
 
-    /// **The table is a TSM1 table** a reader decodes, a row per service, and a session endpoint
-    /// cannot mint an admin endpoint.
     #[test]
     fn the_list_is_a_table_and_a_session_cannot_reach_the_admin_endpoint() {
         use super::services::{Asked, State, asked, table};
@@ -465,8 +414,6 @@ mod tests {
         assert_eq!(asked(b"", false), Asked::Unknown);
     }
 
-    /// **A shutdown asks the services last first**, passing over what is not running, and ends
-    /// once none is left below where it has got to.
     #[test]
     fn a_shutdown_stops_the_services_last_first() {
         use super::shutdown::next_to_stop;
@@ -483,7 +430,6 @@ mod tests {
         assert_eq!(next_to_stop(&[true], 0), None, "none below the first");
     }
 
-    /// **A file that has lost its critical servers is an emergency**, however it lost them.
     #[test]
     fn declarations_without_a_critical_server_are_unfit_to_boot_with() {
         use super::bringup::unfit;
@@ -501,8 +447,6 @@ mod tests {
         assert_eq!(failed_at_boot(S), Failed::Continue);
     }
 
-    /// **Each server has one place in the registry, and each derived endpoint another** that no
-    /// server's name can take.
     #[test]
     fn a_derived_endpoint_is_bound_where_no_server_can_be() {
         assert_eq!(base("auth-service"), "/auth-service");
@@ -522,8 +466,6 @@ mod tests {
         assert_eq!(derives("tty-server").count(), 0);
     }
 
-    /// **The wait set fits the kernel's**, with room for a server starting — and the nine servers,
-    /// their derived endpoints and a test image's server fit the routes.
     #[test]
     fn the_routes_and_a_starting_server_fit_one_wait() {
         let used = 1 + MAX_ROUTES + crate::services::SLOTS + STARTING_ROOM;
