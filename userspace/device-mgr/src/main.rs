@@ -2,14 +2,11 @@
 //! ([`device_mgr`]); this file is what cannot be tested on the host: reading `/dev/registry`,
 //! holding each device's node, serving forwarded resolves, and sending on channels.
 //!
-//! ## Shape
-//!
 //! 1. Read `/dev/registry`: every node's record, then each class device's node by id. Every node
-//!    present at boot registers before userspace starts — the boot waits for the USB hub thread's
-//!    first round, for two seconds at most — so the first read is complete coldplug.
-//!    **Then follow the table** (Phase 6 Part C): a read waits on `/dev/registry/changes` past the
-//!    generation of the last snapshot; each time it is answered the manager reads the table again,
-//!    diffs it ([`device_mgr::follow`]), and sends each class's owner its `Arrived` and `Departed`.
+//!    present at boot registers before userspace starts, so the first read is complete coldplug.
+//!    **Then follow the table**: a read waits on `/dev/registry/changes` past the generation of
+//!    the last snapshot; each time it is answered the manager reads the table again, diffs it
+//!    ([`device_mgr::follow`]), and sends each class's owner its `Arrived` and `Departed`.
 //! 2. Mint a forwarding endpoint and answer `Meta::Ready`; `service-mgr` binds it at
 //!    `/svc/devices`.
 //! 3. Serve. `<class>` makes the resolver that class's owner and replays its devices; `info` is a
@@ -47,12 +44,11 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
-/// Room a subscription channel keeps past its replay and `Settled`, for Phase 6's arrivals while
-/// the owner is busy. The replay itself is always room made: sends do not block, so a channel
-/// shallower than the replay would cut it short, and `Settled` would count what fit.
+/// Room a subscription channel keeps past its replay and `Settled`, for arrivals while the owner
+/// is busy. The replay itself is always room made: sends do not block, so a channel shallower than
+/// the replay would cut it short, and `Settled` would count what fit.
 const SUBSCRIPTION_HEADROOM: usize = 32;
-/// Info-only endpoints at once. `service-mgr` asks for one at boot and couriers it for every
-/// session; the second is headroom, not a use.
+/// Info-only endpoints at once; `service-mgr` asks for one, the second is headroom.
 const MAX_INFO_ENDPOINTS: usize = 2;
 /// Directory sessions open at once: the wait set, less the endpoint, the control channel, the read
 /// waiting on `/dev/registry/changes`, the info-only endpoints and an owner per class.
@@ -78,7 +74,7 @@ fn close(h: u64) {
     }
 }
 
-/// Send `body` on `ch` as `op`, echoing `request_id`, with `flags`, moving `handles`.
+/// Send `body` on `ch`, moving `handles`.
 fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
     unsafe {
@@ -100,8 +96,7 @@ fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u
     }
 }
 
-/// An error reply: a whole twelve-byte `ErrorBody`, which is what the kernel reads a forwarded
-/// resolve's refusal from.
+/// An error reply: a whole twelve-byte `ErrorBody`, which the kernel reads a refusal from.
 fn reply_error(ch: u64, op: u16, request_id: u64, err: KError) {
     let mut body = [0u8; librsproto::error::ERROR_BODY_LEN];
     let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, b"").unwrap_or(0);
@@ -164,7 +159,6 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
         WAIT_HANDLES[0] = po as u64;
         let w = syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
         let word = |off: usize| u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]));
-        // The status is an `i32`, beside a zero reserved word.
         (w == 1, word(8) as u32 as i32 as i64, word(16))
     };
     close(po as u64);
@@ -201,8 +195,8 @@ fn read_registry(root_ns: u64) -> Option<(Vec<DeviceRecord>, u64)> {
     out
 }
 
-/// **What the disks and the page cache have done**, from one read of `/dev/registry/io` (Phase 6
-/// Part H.2): read afresh for each `io.tsm`, since the counts move with every command.
+/// **What the disks and the page cache have done**, from one read of `/dev/registry/io`: read
+/// afresh for each `io.tsm`, since the counts move with every command.
 fn read_io(root_ns: u64) -> Option<(CacheCounts, Vec<IoRecord>)> {
     let snap = lookup(root_ns, b"/dev/registry/io", RIGHT_MAP_READ | RIGHT_INSPECT);
     if snap == 0 {
@@ -244,8 +238,8 @@ fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) {
     }
     // SAFETY: `addr` maps at least `bytes.len()` writable bytes.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
-    // **Unmap before replying**, as the compositor learned (PR #175 review, finding 1): the
-    // mapping holds its own reference, so left behind it would pin every table ever served.
+    // **Unmap before replying**: the mapping holds its own reference, so left behind it would
+    // pin every table ever served.
     // SAFETY: unmapping a range this process mapped moments ago and never reads again.
     unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
     let mut body = [0u8; RESOLVE_REPLY_LEN];
@@ -268,15 +262,15 @@ struct Manager {
     /// The last snapshot's records.
     records: Vec<DeviceRecord>,
     /// **The generation the change read waits past**: the last snapshot's — or, when the table did
-    /// not read after a change, the generation that change brought (PR #361 review).
+    /// not read after a change, the generation that change brought.
     past: u64,
     /// `/dev/registry/changes`, the page its answer lands in and where that is mapped, and the read
-    /// waiting on it — `0` for none (Phase 6 Part C).
+    /// waiting on it — `0` for none.
     changes: u64,
     change_buf: u64,
     change_at: u64,
     change_po: u64,
-    /// Each class device's node, by registry id — what an owner is handed a duplicate of.
+    /// Each class device's node, by registry id; an owner is handed a duplicate.
     nodes: Vec<(u32, u64)>,
     owners: Owners,
     dirs: Vec<u64>,
@@ -286,9 +280,8 @@ struct Manager {
 }
 
 impl Manager {
-    /// Answer one forwarded resolve from `from` — the endpoint bound at `/svc/devices`, or, when
-    /// `info_only`, one of the info-only endpoints — replying on the endpoint it came from.
-    /// `false` if that endpoint has gone.
+    /// Answer one forwarded resolve from `from`: the endpoint bound at `/svc/devices`, or, when
+    /// `info_only`, an info-only one. `false` if that endpoint has gone.
     fn serve_resolve(&mut self, from: u64, info_only: bool) -> bool {
         let (op, request_id, body) = match recv(from) {
             Ok(Some(m)) => m,
@@ -336,8 +329,8 @@ impl Manager {
         let Some((client_end, ours)) = make_channel(4) else {
             return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
-        // **Said before the reply, not after**, so the line is ordered against what the asker
-        // does next rather than racing it: a gate reads it as `service-mgr` having asked for the
+        // Said before the reply, not after, so the line is ordered against what the asker does
+        // next rather than racing it: a gate reads it as `service-mgr` having asked for the
         // endpoint it couriers, before any login exists.
         kprint(b"device-mgr: an info-only endpoint minted\n");
         if reply_channel(reply_to, request_id, client_end) {
@@ -352,7 +345,6 @@ impl Manager {
     /// Make the resolver `class`'s owner, and replay the class's devices to it.
     fn subscribe(&mut self, reply_to: u64, request_id: u64, class: Class) {
         if self.owners.owner(class).is_some() {
-            // One owner at a time — the kernel gives a raw device one reader.
             Line::new().s(b"device-mgr: ").s(class.name().as_bytes()).s(b" is owned; refused a second").end();
             return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::AlreadyExists);
         }
@@ -361,9 +353,8 @@ impl Manager {
         let Some((client_end, ours)) = make_channel(depth as u64) else {
             return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
         };
-        // **The replay is queued before the owner has the channel**, so a completed resolve is a
-        // whole subscription: `Settled` is already waiting, and what it counts cannot depend on
-        // how soon the owner reads, or whether it closes first.
+        // The replay is queued before the owner has the channel, so a completed resolve is a whole
+        // subscription: what `Settled` counts cannot depend on how soon the owner reads.
         let mut sent = Vec::new();
         for r in devices {
             let Some(&(_, node)) = self.nodes.iter().find(|(id, _)| *id == r.id) else {
@@ -377,8 +368,7 @@ impl Manager {
         let n = build_settled(&mut body, sent.len() as u32).unwrap_or(0);
         let _ = send(ours, OP_DEVICES_SETTLED, 0, 0, &body[..n], &[]);
         if !reply_channel(reply_to, request_id, client_end) {
-            // The queued nodes go with the channel: the kernel releases an undelivered transfer
-            // when its endpoint is destroyed.
+            // The kernel releases an undelivered transfer when its endpoint is destroyed.
             close(client_end);
             close(ours);
             return;
@@ -412,8 +402,8 @@ impl Manager {
     }
 
     /// **Submit the read that waits on `/dev/registry/changes`** past [`Manager::past`], if none is
-    /// waiting (Phase 6 Part C). A refusal is said, and the manager stops following: it keeps what
-    /// it has, and serves it.
+    /// waiting. A refusal is said, and the manager stops following: it keeps what it has, and
+    /// serves it.
     fn arm_changes(&mut self) {
         if self.changes == 0 || self.change_po != 0 {
             return;
@@ -441,15 +431,12 @@ impl Manager {
         }
     }
 
-    /// **The table changed** (Phase 6 Part C): read it again, diff it against the records held, and
-    /// tell each class's owner what arrived and what departed. Then wait again, past the new
-    /// generation.
-    ///
-    /// **A table that does not read waits for the next change** (PR #361 review), past the
-    /// generation the node answered with: past the one held, the node answers at once, so a read
-    /// that kept failing — the snapshot's allocation or its mapping, under memory pressure — would
-    /// spin a CPU, a line a pass. The next change's read diffs against the records held, so what
-    /// this one missed is told then.
+    /// **The table changed**: read it again, diff it against the records held, and tell each
+    /// class's owner what arrived and what departed. Then wait again, past the new generation.
+    /// **A table that does not read waits for the next change**, past the generation the node
+    /// answered with: past the one held, the node answers at once, so a read that kept failing
+    /// would spin a CPU, a line a pass. The next change's read diffs against the records held, so
+    /// what this one missed is told then.
     fn follow(&mut self, status: i64) {
         close(self.change_po);
         self.change_po = 0;
@@ -486,15 +473,13 @@ impl Manager {
         self.arm_changes();
     }
 
-    /// A class device that arrived: take its node, and send its owner an `Arrived` if it has one —
-    /// else the replay will.
+    /// A class device that arrived: take its node, and send its owner an `Arrived` if it has one.
     fn arrived(&mut self, r: &DeviceRecord) {
         let Some(class) = Class::of(r.kind()) else { return };
         let path = format!("/dev/registry/{}", r.id);
         let node = lookup(self.root_ns, path.as_bytes(), NODE_RIGHTS);
         if node == 0 {
-            // Departed meanwhile: handed to no one, so its departure, which the next read finds, is
-            // owed to no one.
+            // Departed meanwhile: handed to no one, so its departure is owed to no one.
             return;
         }
         self.nodes.push((r.id, node));
@@ -511,9 +496,8 @@ impl Manager {
         }
     }
 
-    /// A class device that departed: let its node go, and send its owner a `Departed` if it was
-    /// handed the device — `rsproto-devices-ops.md`'s rule, which an `Arrived` that did not send
-    /// would otherwise break.
+    /// A class device that departed: let its node go, and send its owner a `Departed` only if it
+    /// was handed the device (`rsproto-devices-ops.md`).
     fn departed(&mut self, r: &DeviceRecord) {
         let Some(class) = Class::of(r.kind()) else { return };
         if let Some(i) = self.nodes.iter().position(|(id, _)| *id == r.id) {
@@ -536,8 +520,7 @@ impl Manager {
         }
     }
 
-    /// An owner's channel: nothing is asked on it, so a message is answered `Unsupported`, and
-    /// its closing frees the class.
+    /// An owner's channel: a message is answered `Unsupported`, and its closing frees the class.
     fn serve_owner(&mut self, ch: u64) {
         match recv(ch) {
             Err(()) => {
@@ -607,8 +590,7 @@ fn send_arrived(ch: u64, r: &DeviceRecord, node: u64) -> bool {
     sent
 }
 
-/// Send `Meta::Ready` to `service-mgr`, naming this server and carrying the forwarding endpoint's
-/// client end.
+/// Send `Meta::Ready` to `service-mgr`, carrying the forwarding endpoint's client end.
 fn send_ready(control: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let Some(n) = librsproto::meta::ready(&mut body, b"device-mgr") else {
@@ -617,8 +599,7 @@ fn send_ready(control: u64, client_end: u64) -> bool {
     send(control, librsproto::OP_READY, 0, 0, &body[..n], &[client_end])
 }
 
-/// Say, in place of `Meta::Ready`, that there is nothing to serve — no handle, and `service-mgr`
-/// prints `why` (`rsproto-wire-format.md` § Meta::Ready) — then exit.
+/// Say, in place of `Meta::Ready`, that there is nothing to serve: `service-mgr` prints `why`.
 fn refuse(control: u64, err: KError, why: &[u8]) -> ! {
     let mut body = [0u8; librsproto::error::ERROR_BODY_LEN + 64];
     let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
@@ -636,7 +617,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     };
     let mut nodes = Vec::new();
     for r in &records {
-        // A device that departed before this read has no node to take (PR #361 review).
+        // A device that departed before this read has no node to take.
         if Class::of(r.kind()).is_none() || r.is_departed() {
             continue;
         }
@@ -666,11 +647,11 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         .u(count(Class::Block))
         .s(b" block")
         .end();
-    // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN` (administration Part E.4).
-    // `service --stop` never sends it: the manager is `essential`. `0` once `service-mgr` is gone.
+    // The control channel, for a shutdown's `CTRL_OP_SHUTDOWN`. `service --stop` never sends it:
+    // the manager is `essential`. `0` once `service-mgr` is gone.
     let mut control = control;
-    // **The table, followed** (Phase 6 Part C): the change node, and a page for its answers, mapped
-    // for the life of the manager so an answer can be read when the table cannot.
+    // The change node, and a page for its answers, mapped for the life of the manager so an
+    // answer can be read when the table cannot.
     let changes = lookup(root_ns, b"/dev/registry/changes", RIGHT_READ | RIGHT_INSPECT);
     // SAFETY: register-only syscall.
     let change_buf = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) }.max(0) as u64;
@@ -740,12 +721,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             if m.change_po != 0 && h == m.change_po {
                 m.follow(status);
             } else if h == m.serve_end {
-                // **A root endpoint with no peer is the end of this manager**, not a message to
-                // skip: the kernel keeps a peer-closed channel signalled, so going round again
-                // would spin a CPU for the life of the boot (PR #333 review, finding 1). It happens
-                // when `service-mgr`'s bind in its registry fails — it has closed the only other
-                // handle — and then nothing can reach this manager to subscribe anyway. Exiting is
-                // what `input-server` does in the same place.
+                // A root endpoint with no peer is the end of this manager: the kernel keeps a
+                // peer-closed channel signalled, so going round again would spin a CPU. It happens
+                // when `service-mgr`'s bind fails, and then nothing can reach this manager anyway.
                 if !m.serve_resolve(h, false) {
                     kprint(b"device-mgr: forwarding endpoint closed\n");
                     exit(1);
@@ -760,7 +738,6 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
                     _ => {}
                 }
             } else if let Some(i) = m.info_ends.iter().position(|&e| e == h) {
-                // Every holder of this endpoint has let it go — its bindings included.
                 if !m.serve_resolve(h, true) {
                     close(h);
                     m.info_ends.remove(i);
