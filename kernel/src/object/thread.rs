@@ -1,24 +1,18 @@
 //! The [`Thread`] kernel object.
 //!
-//! A thread is a register state, a kernel stack, scheduling state, an entry
-//! point, the owning process, and — for a thread blocked in `sys_wait` — its
-//! wait bookkeeping (the objects it waits on + the wake handshake; see the
-//! `wait_*` fields), and — for every schedulable thread — its floating-point /
-//! SIMD register file (`fpu`), which the scheduler swaps eagerly on each
-//! context switch. The TLS `fs_base` still arrives with a later slice (see the
-//! deferred note on the fields below and
-//! `docs/planning/implementation-plan.md`).
+//! A thread is a register state, kernel stack, scheduling state, entry point, owning process,
+//! wait bookkeeping and — when schedulable — its FP/SIMD register file, swapped eagerly by the
+//! scheduler on each context switch.
+//! TLS (`fs_base`) is not yet a field: `sys_thread_set_tls` is deferred with the `std` port
+//! (`docs/rationale/deferred-decisions.md`).
 //!
 //! ## Mutation discipline
 //!
-//! [`Thread`] is shared through an [`ObjectRef`](crate::object::ObjectRef),
-//! yet the scheduler mutates `arch`, `state`, `entry`, and `arg`. That is
-//! sound only because Phase 1 is single-CPU and the scheduler touches
-//! those fields exclusively while holding its run-queue lock, which
-//! serialises every access. The scheduler-only accessors below take a
-//! type-erased `*mut ()` (an `ObjectRef::as_ptr()`) and reach individual
-//! fields through raw pointers — never forming a `&mut Thread` that would
-//! alias the atomically-accessed [`KObjectHeader`].
+//! [`Thread`] is shared through an [`ObjectRef`](crate::object::ObjectRef), yet the scheduler
+//! mutates `arch`, `state`, `entry` and `arg`, sound only because it does so exclusively while
+//! holding its run-queue lock. The scheduler-only accessors take a type-erased `*mut ()` and
+//! reach fields through raw pointers, never forming a `&mut Thread` that would alias the
+//! atomically-accessed [`KObjectHeader`].
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -32,43 +26,26 @@ use crate::object::ObjectRef;
 use crate::object::Process;
 use crate::object::header::KObjectHeader;
 
-/// Maximum number of handles one `sys_wait` call may block on. Bounds the
-/// per-thread wait arrays (so registration never allocates under the scheduler
-/// lock) and the `count` a caller may pass.
+/// Maximum number of handles one `sys_wait` call may block on. Bounds the per-thread wait
+/// arrays (so registration never allocates under the scheduler lock) and a caller's `count`.
 ///
-/// **This is the fan-out limit of every resource server.** A server holding a channel per
-/// client waits on its serving endpoint plus one slot per client, so it serves at most
-/// `MAX_WAIT_HANDLES - 1` at once — which is why raising it from 8 to 32 was a Slice C3
-/// change rather than a tuning knob (decision log, 2026-07-29). Userspace mirrors the value
-/// as `libkern::abi::MAX_WAIT_HANDLES`, and both fan-out servers derive their caps from it.
-///
-/// The arrays are fixed rather than allocated precisely so registration cannot allocate
-/// under rank-1 `SCHED`, so the cost is per-thread and paid whether waiting or not: at 32
-/// the two arrays are 288 B, against the 1 KiB `ArchFpuState` every thread already carries.
-/// That ratio is what makes 32 cheap and what would make, say, 256 not. Escaping the limit
+/// **This is the fan-out limit of every resource server**: a server waiting on its serving
+/// endpoint plus one slot per client serves at most `MAX_WAIT_HANDLES - 1` clients at once.
+/// Userspace mirrors it as `libkern::abi::MAX_WAIT_HANDLES`, and both fan-out servers derive
+/// their caps from it (decision log, 2026-07-29). The arrays are fixed, paid per thread: at 32
+/// they are 288 B, against the 1 KiB `ArchFpuState` every thread carries. Escaping the limit
 /// rather than raising it is `TODO(server-fanout)` in `docs/rationale/deferred-decisions.md`.
 pub const MAX_WAIT_HANDLES: usize = 32;
 
-/// The second cost of raising [`MAX_WAIT_HANDLES`], and the one that bites rather than
-/// merely adds up: `sys_wait` and the scheduler below it hold **several** arrays of this
-/// width on the **kernel stack** — the copied handles, the resolved `ObjectRef`s, the
-/// object addresses, the types, the `IoResult` output, and the scheduler's signaled
-/// snapshots. At 32 that is roughly 3 KiB against a `KERNEL_STACK_PAGES` (4-page, 16 KiB)
-/// stack; the growth is linear, so a careless bump to 256 would put ~24 KiB of frame on a
-/// 16 KiB stack and simply run off it.
-///
-/// A guard page below each stack means that would fault rather than corrupt, but a fault
-/// is a poor way to learn it. This budget check fails the **build** instead. Raising the
-/// limit past it is a real decision: either grow `KERNEL_STACK_PAGES` to match, or move the
-/// wait arrays off the stack.
+/// The second cost of raising [`MAX_WAIT_HANDLES`]: `sys_wait` and the scheduler hold
+/// **several** arrays of this width on the **kernel stack** (~3 KiB at 32 against 16 KiB,
+/// growing linearly). This check fails the **build** rather than faulting on the guard page;
+/// raising past it means growing `KERNEL_STACK_PAGES` or moving the arrays off the stack.
 const _: () = {
-    // Bytes of kernel stack the wait path may spend on `MAX_WAIT_HANDLES`-wide arrays.
-    // A quarter of the stack, leaving the rest for the syscall frame and everything the
-    // wait path calls into.
+    // Bytes of kernel stack the wait path may spend on these arrays: a quarter.
     const WAIT_STACK_BUDGET: usize = (crate::mm::kstack::KERNEL_STACK_BYTES as usize) / 4;
-    // Per element, summed over the arrays that are simultaneously live across the call:
-    // handles (8) + copied bytes (8) + refs (16) + objs (8) + types (1) + IoResult out (24)
-    // + the scheduler's `(usize, bool)` snapshot (16) + signaled bits (1).
+    // Per element across the live arrays: handles (8) + copied bytes (8) + refs (16) + objs (8) +
+    // types (1) + IoResult out (24) + `(usize, bool)` snapshot (16) + signaled bits (1).
     const PER_HANDLE: usize = 8 + 8 + 16 + 8 + 1 + 24 + 16 + 1;
     assert!(
         MAX_WAIT_HANDLES * PER_HANDLE <= WAIT_STACK_BUDGET,
@@ -77,9 +54,7 @@ const _: () = {
     );
 };
 
-/// A kernel thread's entry point. `extern "C"` so the
-/// [`thread_trampoline`](crate::arch::thread_trampoline) → `thread_enter`
-/// path can call it with a stable ABI; the `usize` argument is opaque.
+/// A kernel thread's entry point (`extern "C"` for the trampoline); the argument is opaque.
 pub type ThreadEntry = extern "C" fn(arg: usize);
 
 /// Lifecycle state of a thread, tracked by the scheduler.
@@ -90,27 +65,20 @@ pub enum ThreadState {
     Ready,
     /// The currently executing thread.
     Running,
-    /// Off the run queue, blocked in `sys_wait` on ≥1 object and/or a deadline;
-    /// parked in the scheduler's `blocked` list until a waker makes it runnable.
+    /// Off the run queue, blocked in `sys_wait`; parked in the scheduler's `blocked` list.
     Blocked,
-    /// Off the run queue after a ring-3 fault, parked in the scheduler's
-    /// `suspended` list with its `ExceptionFrame` preserved on its kernel stack,
-    /// awaiting a supervisor's `sys_exception_resume` (resume or terminate).
+    /// Off the run queue after a ring-3 fault, `ExceptionFrame` preserved, awaiting a resume.
     Suspended,
-    /// Body returned or `exit` called; awaiting reclamation by the next
-    /// scheduler entry.
+    /// Body returned or `exit` called; awaiting reclamation by the next scheduler entry.
     Exited,
 }
 
-/// A thread's **scheduling class**, in strict dispatch precedence: a runnable
-/// `RealTime` thread always preempts `TimeShared`, which preempts `Idle` (the
-/// per-CPU fallback). See `docs/architecture/scheduler.md` §Scheduling classes.
+/// A thread's **scheduling class**, in strict dispatch precedence: `RealTime` preempts
+/// `TimeShared`, which preempts `Idle`. See `docs/architecture/scheduler.md` §Scheduling classes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum SchedClass {
-    /// Fixed-priority FIFO (priority `0..=99`, `0` highest). Not fair-scheduled;
-    /// does not accrue vruntime. Creating one is `REAL_TIME`-gated (deferred
-    /// until the syscap system lands; kernel threads set it directly for now).
+    /// Fixed-priority FIFO (`0..=99`, `0` highest), `REAL_TIME`-gated (deferred); no vruntime.
     RealTime = 0,
     /// CFS-like vruntime-fair scheduling — the default for every thread.
     TimeShared = 1,
@@ -118,15 +86,11 @@ pub enum SchedClass {
     Idle = 2,
 }
 
-/// The wait wake-handshake state, stored as an [`AtomicU8`] on each [`Thread`]
-/// so a waker (the timer-tick fire path, under `SCHED`) and the blocking thread
-/// agree on a single source of truth for "was I claimed for wakeup?".
-///
-/// `Running` → not waiting. `Waiting` → registered and (about to be) blocked.
-/// `Woken` → a waker (a signal or the deadline) has claimed this thread. The
-/// CAS `Waiting → Woken` ([`Thread::wait_try_wake`]) deduplicates multiple
-/// signals for one multi-handle wait: the first waker wins and makes the thread
-/// runnable; later wakers still mark their slot but skip the re-enqueue.
+/// The wait wake-handshake state, an [`AtomicU8`] per [`Thread`], so a waker (under `SCHED`)
+/// and the blocking thread agree on whether it was claimed for wakeup: `Running` (not waiting),
+/// `Waiting` (registered, about to block), `Woken` (claimed by a signal or the deadline). The
+/// CAS `Waiting → Woken` ([`Thread::wait_try_wake`]) lets only the first of several signals
+/// for one multi-handle wait make the thread runnable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum WaitPhase {
@@ -135,156 +99,83 @@ pub enum WaitPhase {
     Woken = 2,
 }
 
-/// A dense CPU index must fit in [`Thread`]'s `cpu_mask`, which is a `u8`.
-///
-/// **Stated in that field's comment since it was written, and asserted nowhere until
-/// 2026-08-14.** The audit raised `MAX_CPUS` to 9: the kernel built clean, all 622 host
-/// tests passed, and nothing objected — while `mask & (1 << c)` in `pick_target_cpu` and
-/// `stealable_to` became `1u8 << 8`, which panics in debug and in release wraps to bit 0, so
-/// CPU 8's affinity silently reads as CPU 0's. `sys_thread_set_affinity` separately truncates
-/// bit 8 away and rejects a pin to CPU 8 as invalid. The first build error anywhere appears
-/// at 16, incidentally, from an unrelated lint on a `u16` shift.
-///
-/// Raising `MAX_CPUS` past 8 therefore means widening this field, the shifts that read it,
-/// and the syscall's truncation **together**. `tlb.rs`'s `MAX_CPUS <= 64` assertion does not
-/// cover this: it is stated for a `u64` bitmask and would leave with it.
+/// A dense CPU index must fit in [`Thread`]'s `cpu_mask` (a `u8`): raising `MAX_CPUS` past 8
+/// means widening that field, the shifts that read it (`1u8 << 8` panics in debug and wraps to
+/// bit 0 in release) and `sys_thread_set_affinity`'s truncation **together**.
 const _: () = assert!(
     crate::arch::MAX_CPUS <= 8,
     "MAX_CPUS > 8 does not fit Thread::cpu_mask (u8) — widen the field, the `1 << c` shifts \
      in sched/placement.rs, and sys_thread_set_affinity's mask trim together"
 );
 
-/// A thread kernel object.
-///
-/// `#[repr(C)]` with [`KObjectHeader`] first — see
-/// [`crate::object::header`]. The fields after the identity pair are
-/// scheduler-owned (see the module's "Mutation discipline").
+/// A thread kernel object, `#[repr(C)]` with [`KObjectHeader`] first. The fields after the
+/// identity pair are scheduler-owned (see "Mutation discipline").
 #[repr(C)]
 pub struct Thread {
     header: KObjectHeader,
     tid: u32,
     owner_pid: u32,
-    /// Saved kernel register state (just the resume RSP this slice).
     arch: ArchThreadContext,
-    /// Scheduler lifecycle state.
     state: ThreadState,
-    /// Entry point run by `thread_enter` on first schedule.
     entry: ThreadEntry,
-    /// Opaque argument passed to `entry`.
     arg: usize,
-    /// Owned kernel stack. `None` for the boot thread (it runs on the
-    /// bootloader-provided stack) and for non-schedulable threads created
-    /// purely as handle-table kernel objects in tests.
+    /// Owned kernel stack; `None` for the boot thread (bootloader stack) and inert threads.
     stack: Option<KernelStack>,
-    /// Page-table root to load when this thread runs, if it differs from
-    /// the kernel/boot root. `None` for kernel/boot threads (the scheduler
-    /// resolves it to its cached boot root); `Some(root)` for a user thread
-    /// (the owning process's address-space root). `None` also avoids a
-    /// privileged `active_root()` read in constructors that run host-side.
+    /// Page-table root to load when this thread runs: `None` for kernel/boot threads (the
+    /// scheduler uses its cached boot root), `Some(root)` for a user thread.
     addr_space_root: Option<PhysAddr>,
-    /// First-run ring-3 descent target: `Some((entry_va, user_sp))` marks a
-    /// **user** thread (run `entry` in ring 3 via the trampoline); `None`
-    /// is a kernel thread (run `entry(arg)` in ring 0).
     user_entry: Option<(u64, u64)>,
-    /// Bootstrap argument registers (`rdi`, `rsi`, `rdx`, `rcx`) seeded at the
-    /// user thread's first ring-3 entry — the Phase-1/2 hand-off by which a spawned
-    /// process learns its initial handle *values* (notification channel, root
-    /// namespace, installed endpoint) and a user data word (`arg0`). `[0; 4]` for
-    /// kernel threads and the boot/`hello` path. (A later phase replaces this with
-    /// a stack-resident bootstrap block / the real init handoff.)
+    /// Bootstrap registers (`rdi`, `rsi`, `rdx`, `rcx`) seeded at a user thread's ring-3 entry.
     user_boot_args: [u64; 4],
-    /// Set when this thread is the one whose exit **ends its process** — the
-    /// whole-process exit, or the last thread of a multi-threaded one. The reaper
-    /// reads it to run the process's handle sweep
-    /// ([`handle::global::close_all_owned_by`](crate::handle::global::close_all_owned_by)),
-    /// which cannot run at exit time itself: the exiting thread holds rank-1 `SCHED`
-    /// and never returns from `finish_exit`. Scheduler-owned, like the fields above.
+    /// Set on the thread whose exit **ends its process**; the reaper reads it to run the handle
+    /// sweep ([`handle::global::close_all_owned_by`](crate::handle::global::close_all_owned_by)),
+    /// which cannot run at exit time: the exiting thread holds rank-1 `SCHED` and never returns
+    /// from `finish_exit`.
     process_ended: bool,
-    /// Owning process, for a user thread. Holding this [`ObjectRef`] keeps
-    /// the `Process` — and thus its `AddressSpace` — alive for as long as
-    /// the thread exists; it is released when the thread is reaped, freeing
-    /// the address space. No refcount cycle: the `Process` does not hold
-    /// the thread. `None` for kernel/boot threads.
+    /// Owning process, for a user thread. This [`ObjectRef`] keeps the `Process` and its
+    /// `AddressSpace` alive until the thread is reaped. No cycle: the `Process` does not hold the
+    /// thread. `None` for kernel/boot threads.
     process: Option<ObjectRef>,
-    /// Wait bookkeeping (meaningful only while `state == Blocked`), touched only
-    /// under `SCHED` except `wait_phase`. `wait_objs[0..wait_count]` are the
-    /// type-erased object *addresses* (`as usize`, so `Thread` carries no raw
-    /// pointer — mirrors the scheduler's `idle_addr`) this thread is registered
-    /// as a waiter on; `wait_signaled[i]` is set by the waker when that object
-    /// fires.
+    /// Wait bookkeeping (meaningful only while `Blocked`), touched only under `SCHED` except
+    /// `wait_phase`: the type-erased addresses this thread waits on, and per-slot fired flags set
+    /// by the waker.
     wait_objs: [usize; MAX_WAIT_HANDLES],
-    /// Per-slot fired flag, parallel to `wait_objs`.
     wait_signaled: [bool; MAX_WAIT_HANDLES],
-    /// Number of live entries in `wait_objs`/`wait_signaled`; `0` when not waiting.
     wait_count: u8,
-    /// `true` if this wait registered a finite deadline (so on resume the thread
-    /// removes its deadline-heap entry).
     wait_has_deadline: bool,
-    /// The wake handshake; a [`WaitPhase`] discriminant in an [`AtomicU8`].
     wait_phase: AtomicU8,
-    /// Kernel-stack address of the `ExceptionFrame` captured when this thread
-    /// faulted in ring 3 (meaningful only while `state == Suspended`); `0` when
-    /// not suspended. The supervisor reads the frame via `sys_thread_get_registers`;
-    /// the thread itself unwinds it on resume.
+    /// Kernel-stack address of the `ExceptionFrame` captured when this thread faulted in ring 3
+    /// (meaningful only while `Suspended`); the supervisor reads it, the thread unwinds it.
     exception_frame: usize,
-    /// Resume disposition set by `sys_exception_resume` and read when the
-    /// suspended thread resumes: `0` = Resume (retry), `2` = Terminate. `disp_code`
-    /// carries the terminate exit code.
+    /// Resume disposition set by `sys_exception_resume`: `0` = Resume, `2` = Terminate.
     disp_tag: u8,
     disp_code: i32,
-    /// Scheduling class (RealTime / TimeShared / Idle). The scheduler reads it
-    /// (and the fields below) under `SCHED`. Default `TimeShared`.
     class: SchedClass,
-    /// RealTime fixed priority `0..=99` (`0` = highest); meaningful only when
-    /// `class == RealTime`. `0` otherwise.
     rt_priority: u8,
-    /// TimeShared niceness `-20..=19` (lower = more CPU); `0` = default. Scales
-    /// the per-tick `vruntime` increment via the nice-weight table.
     nice: i8,
-    /// TimeShared virtual runtime (ns-scaled): runtime accrued, inversely
-    /// weighted by `nice`. The scheduler runs the smallest-`vruntime` thread.
     vruntime: u64,
-    /// The dense index of the CPU this thread **last ran on** (recorded on every
-    /// switch-in). Per-CPU runqueues use it to re-place a waking thread on its
-    /// home CPU (cache-warm, and minimizes cross-CPU migration). `0` until first run.
+    /// The dense index of the CPU this thread **last ran on**: a waking thread returns there.
     last_cpu: u8,
-    /// CPU **affinity** bitmask (bit `c` set ⇒ may run on CPU `c`); `MAX_CPUS ≤ 8`,
-    /// so a `u8` suffices — **enforced** by the `const _: () = assert!(…)` above this
-    /// struct, which also names what must be widened alongside this field. Default all-ones (no restriction). Placement and work
-    /// stealing honour it; `sys_thread_set_affinity` writes it.
+    /// CPU **affinity** bitmask (bit `c` ⇒ may run on CPU `c`); a `u8` because `MAX_CPUS ≤ 8`,
+    /// **enforced** by the assertion above this struct. Default all-ones.
     cpu_mask: u8,
-    /// **Mid-switch-out guard** (the SMP `on_cpu` invariant, after Linux's
-    /// `task_struct::on_cpu`). Set `true` under `SCHED` just before a switch
-    /// releases the run-queue lock, and cleared by
-    /// [`context_switch`](crate::arch::context_switch) **after** it commits this
-    /// thread's `saved_sp`. While it is `true`, the thread's parked context is
-    /// **not yet valid to resume**: another CPU must not steal and run it (it
-    /// would load a stale `saved_sp` and double-run the thread). Work-stealing
-    /// skips threads with this set. Cleared by the arch switch, so an
-    /// [`AtomicBool`] whose storage the asm pokes as a raw `u8`.
+    /// **Mid-switch-out guard** (the SMP `on_cpu` invariant). Set `true` under `SCHED` just before
+    /// a switch releases the run-queue lock, and cleared by
+    /// [`context_switch`](crate::arch::context_switch) **after** it commits this thread's
+    /// `saved_sp`. While `true`, the parked context is **not yet valid to resume**: another CPU
+    /// must not steal and run it (it would load a stale `saved_sp` and double-run the thread), so
+    /// work-stealing skips it. An [`AtomicBool`] whose storage the asm pokes as a raw `u8`.
     on_cpu: AtomicBool,
-    /// This thread's floating-point / SIMD register file while it is not
-    /// running, swapped eagerly by `sched::switch_into` (see
-    /// [`crate::arch::fpu_save`]). `None` only for **inert** threads — objects
-    /// that exist purely as handle-table entries and are never scheduled — so
-    /// the switch path treats a null area as "nothing to swap" rather than
-    /// asserting.
-    ///
-    /// Boxed rather than inline: the area is 1 KiB and needs 64-byte alignment,
-    /// which would force that alignment (and padding) onto every `Thread`.
-    /// Written under the same discipline as `arch`: only by the CPU running the
-    /// thread, and only while the thread's `on_cpu` guard is raised, so a
-    /// stealer that observes the guard clear also observes the finished image.
+    /// This thread's FP/SIMD register file while it is not running, swapped eagerly by
+    /// `sched::switch_into`. `None` only for **inert** threads, never scheduled, so the switch path
+    /// treats a null area as "nothing to swap". Boxed because the area is 1 KiB and needs 64-byte
+    /// alignment. Written only by the CPU running the thread, and only while its `on_cpu` guard is
+    /// raised, so a stealer that observes the guard clear also observes the finished image.
     fpu: Option<KBox<ArchFpuState>>,
-    // Deferred to later slices:
-    //   fs_base/TLS  — no userspace, no `sys_thread_set_tls` yet.
 }
 
-/// Allocate and initialise a schedulable thread's FP/SIMD save area.
-///
-/// The area must hold a *valid* image before the thread's first switch-in —
-/// which restores it — so it is initialised to the architectural power-on state
-/// here rather than merely zeroed (see [`crate::arch::fpu_init_area`]).
+/// Allocate and initialise a thread's FP/SIMD save area to the architectural power-on state (it
+/// is restored on the first switch-in, so merely zeroed would not do).
 fn new_fpu_area() -> Result<KBox<ArchFpuState>, AllocError> {
     let mut area = KBox::try_new(ArchFpuState::zeroed())?;
     // SAFETY: `area` is a live, uniquely owned, correctly aligned `ArchFpuState`
@@ -293,15 +184,10 @@ fn new_fpu_area() -> Result<KBox<ArchFpuState>, AllocError> {
     Ok(area)
 }
 
-/// A non-scheduling default entry, used for threads that exist only as
-/// refcounted kernel objects (e.g. handle-table tests) and are never run.
 extern "C" fn inert_entry(_arg: usize) {}
 
 impl Thread {
-    /// Allocate an **inert** thread object (no kernel stack, never
-    /// scheduled) with a refcount of one. Used where a `Thread` is needed
-    /// purely as a handle-table kernel object; the caller transfers the
-    /// reference to a handle via `KBox::into_raw` + `HandleTable::allocate`.
+    /// Allocate an **inert** thread (no kernel stack, never scheduled), refcount one.
     pub fn try_new(tid: u32, owner_pid: u32) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Thread),
@@ -332,18 +218,12 @@ impl Thread {
             last_cpu: 0,
             cpu_mask: u8::MAX,
             on_cpu: AtomicBool::new(false),
-            // Inert threads are never scheduled, so they never reach the switch
-            // path and need no FP/SIMD save area.
             fpu: None,
         })
     }
 
-    /// Allocate the **boot** thread: the already-running boot context,
-    /// adopted so the first [`context_switch`](crate::arch::context_switch)
-    /// has a valid slot to save into. It owns no fabricated frame and no
-    /// kernel stack (it runs on the bootloader stack); its `arch.rsp` is
-    /// written by that first switch-out before it is ever read. State is
-    /// [`Running`](ThreadState::Running).
+    /// Allocate the **boot** thread: the already-running boot context, adopted so the first
+    /// [`context_switch`](crate::arch::context_switch) has a slot to save into. It owns no stack.
     pub fn try_new_boot(tid: u32, owner_pid: u32) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Thread),
@@ -378,17 +258,14 @@ impl Thread {
         })
     }
 
-    /// Allocate a **runnable** thread: a fresh kernel stack with a
-    /// fabricated initial frame so the first switch-in runs `entry(arg)`
-    /// via the trampoline. State is [`Ready`](ThreadState::Ready).
+    /// Allocate a **runnable** thread: a fresh kernel stack and fabricated frame that runs
+    /// `entry(arg)` via the trampoline.
     pub fn try_new_runnable(
         tid: u32,
         owner_pid: u32,
         entry: ThreadEntry,
         arg: usize,
     ) -> Result<KBox<Self>, AllocError> {
-        // Kernel threads share the active (boot) PML4; the stack maps into
-        // the shared kernel vmap, visible from every address space.
         let stack = KernelStack::new(crate::arch::Paging::active_root())?;
         let top = stack.top().as_u64();
         // SAFETY: a freshly allocated `KernelStack` has its top
@@ -430,15 +307,9 @@ impl Thread {
         })
     }
 
-    /// Allocate a **user** thread: a fresh kernel stack with a fabricated
-    /// initial frame (so the first switch-in lands in
-    /// [`thread_enter`](crate::sched), which descends to ring 3 rather than
-    /// running a kernel `entry`), the owning `process` (kept alive by the
-    /// held [`ObjectRef`] so its address space outlives the thread), and the
-    /// ring-3 descent target `(entry, user_sp)`. State is `Ready`.
-    ///
-    /// `process` must be a live `Process` `ObjectRef` whose address space
-    /// has a root (built by the ELF loader).
+    /// Allocate a **user** thread: a fresh kernel stack and fabricated frame that lands in
+    /// [`thread_enter`](crate::sched), which descends to ring 3 at `(entry, user_sp)`. `process`
+    /// must be a live `Process` with an address space root; the held [`ObjectRef`] keeps it alive.
     pub fn try_new_user(
         tid: u32,
         process: ObjectRef,
@@ -454,8 +325,6 @@ impl Thread {
             let root = unsafe { (*p).address_space_root() }.expect("user process must have an address space");
             (pid, root)
         };
-        // The kernel stack maps into the shared kernel vmap (visible from
-        // every address space); install it into the process root.
         let stack = KernelStack::new(root)?;
         let top = stack.top().as_u64();
         // SAFETY: as `try_new_runnable` — a fresh KernelStack top has the
@@ -504,33 +373,24 @@ impl Thread {
         self.owner_pid
     }
 
-    /// Clone the owning [`Process`](crate::object::Process) reference, if this
-    /// is a user thread. Bumps the process refcount; `None` for kernel/boot
-    /// threads. Used by [`sched::current_process`](crate::sched::current_process)
-    /// to reach the calling process's address space from a syscall.
+    /// Clone the owning [`Process`](crate::object::Process) reference of a user thread; `None`
+    /// for kernel/boot threads.
     pub fn process_ref(&self) -> Option<ObjectRef> {
         self.process.clone()
     }
 
-    /// `true` if this is a user thread (it has an owning
-    /// [`Process`](crate::object::Process)). Unlike [`process_ref`](Self::process_ref)
-    /// this touches no refcount, so it is safe to call with the rank-1 `SCHED`
-    /// lock held (an `ObjectRef` clone/drop must not run under it).
+    /// `true` if this is a user thread. Unlike [`process_ref`](Self::process_ref) it touches no
+    /// refcount, so it is safe with the rank-1 `SCHED` lock held.
     pub fn has_process(&self) -> bool {
         self.process.is_some()
     }
 
-    // --- Scheduler-only field accessors --------------------------------
-    //
-    // Each takes the type-erased object pointer (`ObjectRef::as_ptr()`) and
-    // reaches one field through a raw pointer, never forming `&mut Thread`.
     // SAFETY (shared by all): `obj` addresses a live `Thread` (pinned by an
     // `ObjectRef` the caller holds), and the scheduler invokes these only
     // while holding its run-queue lock, which — single-CPU — serialises all
     // access to these fields.
 
-    /// Read the scheduler lifecycle state. Test-only: production code sets
-    /// state but never reads it back this slice.
+    /// Read the scheduler lifecycle state. Test-only: production code sets it but never reads it.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -677,8 +537,7 @@ impl Thread {
         unsafe { core::ptr::write(&raw mut (*p).cpu_mask, mask) }
     }
 
-    /// Read the scheduler lifecycle state (production-reachable for the
-    /// process-teardown sibling scan and the suspend/resume checks).
+    /// Read the lifecycle state (for the teardown sibling scan and suspend/resume checks).
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -811,18 +670,14 @@ impl Thread {
     /// A raw pointer to this thread's FP/SIMD save area, or **null** for an
     /// inert thread that has none.
     ///
-    /// The scheduler's switch path passes the result straight to
-    /// [`fpu_save`](crate::arch::fpu_save) / [`fpu_restore`](crate::arch::fpu_restore),
-    /// skipping the swap on null. The pointee outlives the switch: the `Thread`
-    /// is refcount-pinned by the caller, and the `KBox` is dropped only when the
-    /// thread object is destroyed.
+    /// The switch path passes it straight to [`fpu_save`](crate::arch::fpu_save) /
+    /// [`fpu_restore`](crate::arch::fpu_restore), skipping the swap on null. The pointee outlives
+    /// the switch: the caller refcount-pins the `Thread`, and the `KBox` drops only with it.
     ///
     /// # Safety
-    /// See the accessor contract above. The returned pointer may be used only
-    /// for the switch's save/restore on the CPU running this thread, under the
-    /// `on_cpu` guard discipline that already protects `saved_sp` — the FP image
-    /// is part of the same parked context and inherits the same publication
-    /// rules.
+    /// See the accessor contract above. The returned pointer may be used only for the switch's
+    /// save/restore on the CPU running this thread, under the `on_cpu` guard discipline that
+    /// already protects `saved_sp` — the FP image is part of the same parked context.
     pub(crate) unsafe fn fpu_area_ptr(obj: *mut ()) -> *mut ArchFpuState {
         let p = obj as *mut Thread;
         // SAFETY: `obj` is a live Thread. Reading the `Option`'s payload pointer
@@ -867,8 +722,8 @@ impl Thread {
         unsafe { core::ptr::read(&raw const (*p).user_entry) }
     }
 
-    /// The bootstrap argument registers (`[rdi, rsi, rdx]`) to seed at this user
-    /// thread's first ring-3 entry. `[0; 3]` for kernel threads.
+    /// The bootstrap argument registers (`[rdi, rsi, rdx, rcx]`) to seed at this user
+    /// thread's first ring-3 entry. `[0; 4]` for kernel threads.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -904,12 +759,8 @@ impl Thread {
         unsafe { (*p).owner_pid() }
     }
 
-    // --- Wait bookkeeping (scheduler-only; same accessor contract) ------
-
-    /// Register `objs` (type-erased object addresses, `len <= MAX_WAIT_HANDLES`)
-    /// as this thread's wait set, all slots un-signaled, recording whether a
-    /// finite deadline accompanies the wait, and set the wake phase to
-    /// `Waiting`.
+    /// Register `objs` (type-erased addresses, `len <= MAX_WAIT_HANDLES`) as this thread's wait
+    /// set, all un-signaled, and set the wake phase to `Waiting`.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -992,10 +843,7 @@ impl Thread {
         }
     }
 
-    /// CAS the wake phase `Waiting → Woken`. Returns `true` if this caller won
-    /// (the thread was still `Waiting` and is now claimed for wakeup), so the
-    /// waker should make it runnable; `false` if already `Woken` (another waker
-    /// won this multi-handle wait).
+    /// `true` if this caller won the CAS and should make the thread runnable.
     ///
     /// # Safety
     /// See the accessor contract above (the `AtomicU8` is valid for the live
@@ -1044,9 +892,6 @@ mod tests {
         let t = Thread::try_new_boot(0, 0).unwrap();
         assert_eq!(t.state, ThreadState::Running);
         assert!(t.stack.is_none());
-        // The zeroed initial context is covered by `ArchThreadContext`'s
-        // own tests; the boot thread's saved sp is written by the first
-        // switch-out before it is ever read.
     }
 
     #[test]
@@ -1062,7 +907,6 @@ mod tests {
             assert_eq!(Thread::state(obj), ThreadState::Running);
             Thread::set_state(obj, ThreadState::Exited);
             assert_eq!(Thread::state(obj), ThreadState::Exited);
-            // Reclaim the leaked allocation.
             drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(obj as *mut Thread)));
         }
     }
@@ -1081,8 +925,6 @@ mod tests {
         }
     }
 
-    /// Build a `Process` (with an address space) and adopt it into an
-    /// `ObjectRef`, for the user-thread tests.
     fn user_process_ref(pid: u32) -> (ObjectRef, crate::mm::PhysAddr) {
         use crate::mm::addr_space::AddressSpace;
         let asp = AddressSpace::new().unwrap();
@@ -1093,13 +935,8 @@ mod tests {
         (unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }, root)
     }
 
-    /// A user thread for host tests, built **without** a kernel stack so it
-    /// avoids the QEMU-only `fabricate_frame` (which writes to a kernel-vmap
-    /// virtual address that isn't real host memory). It carries the same
-    /// process reference + user-launch bookkeeping as `try_new_user`, which
-    /// is what these tests exercise. (The real `try_new_user` + its kernel
-    /// stack are validated under QEMU.) The test module can name the private
-    /// fields directly.
+    /// A user thread built **without** a kernel stack, avoiding the QEMU-only `fabricate_frame`,
+    /// which writes a kernel-vmap address that is not host memory.
     fn user_thread_no_stack(tid: u32, process: ObjectRef, entry: u64, user_sp: u64) -> KBox<Thread> {
         let root = {
             let p = process.as_ptr() as *const Process;
@@ -1160,9 +997,6 @@ mod tests {
         init_global_heap();
         test_probe::reset();
         let (proc_ref, _root) = user_process_ref(1);
-        // The Thread takes the only Process reference. Adopt it into an
-        // ObjectRef (as the scheduler does) so dropping runs the kernel-object
-        // destructor path (`dispatch_destroy`) the probe counts.
         let t = user_thread_no_stack(1, proc_ref, 0x40_0000, 0x7fff_f000);
         let tref = {
             let ptr = KBox::into_raw(t).as_ptr() as *mut ();
@@ -1172,9 +1006,6 @@ mod tests {
         assert_eq!(test_probe::process_destroys(), 0);
         assert_eq!(test_probe::thread_destroys(), 0);
         drop(tref);
-        // Dropping the Thread destroys it AND releases its last Process
-        // reference (freeing the address space) — proving the Thread→Process
-        // link carries ownership with no back-reference cycle.
         assert_eq!(test_probe::thread_destroys(), 1);
         assert_eq!(test_probe::process_destroys(), 1);
     }
@@ -1186,31 +1017,25 @@ mod tests {
         let obj = KBox::into_raw(t).as_ptr() as *mut ();
         // SAFETY: live Thread, single-threaded test (stands in for SCHED).
         unsafe {
-            // Initially Running phase, no wait.
             assert_eq!(Thread::wait_phase(obj), WaitPhase::Running as u8);
 
-            // Register two objects with a finite deadline.
             Thread::wait_register(obj, &[0xAA, 0xBB], true);
             assert_eq!(Thread::wait_phase(obj), WaitPhase::Waiting as u8);
             assert!(Thread::wait_has_deadline(obj));
 
-            // Mark one signaled; the other stays false; unknown target no-ops.
             assert!(Thread::wait_mark_signaled(obj, 0xBB));
             assert!(!Thread::wait_mark_signaled(obj, 0xCC));
 
-            // Snapshot reflects the registration + the one signal.
             let mut out = [(0usize, false); MAX_WAIT_HANDLES];
             let n = Thread::wait_snapshot(obj, &mut out);
             assert_eq!(n, 2);
             assert_eq!(out[0], (0xAA, false));
             assert_eq!(out[1], (0xBB, true));
 
-            // First wake wins the CAS; a second loses (dedup).
             assert!(Thread::wait_try_wake(obj));
             assert!(!Thread::wait_try_wake(obj));
             assert_eq!(Thread::wait_phase(obj), WaitPhase::Woken as u8);
 
-            // Clear resets count + phase.
             Thread::wait_clear(obj);
             assert_eq!(Thread::wait_phase(obj), WaitPhase::Running as u8);
             assert!(!Thread::wait_has_deadline(obj));
