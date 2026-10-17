@@ -63,6 +63,13 @@ be read as the list of what is actually owed.
 
 See `docs/architecture/drivers-and-irps.md` for the framework these defer from.
 
+**The kernel's GPT reader checks no CRC — `TODO(gpt-crc)`.** `drivers/gpt.rs` validates a
+table's signature, entry size and bounds, but neither the header's CRC32 nor the entry array's, and
+never reads the backup header, so a damaged primary table is trusted as long as its partitions fit
+the disk. `libgpt`, which writes tables, computes both. Recorded when the reader's comments were cut
+(2026-10-17): its doc had called the check "deferred" with no entry here. Trigger: a disk whose
+primary table is damaged, or the kernel publishing a partition from a table it did not write.
+
 **Tier 2 (runtime-loadable) drivers.** Phase 2 ships only Tier 1 drivers
 (compiled into the kernel ELF via Cargo features: `pci`, `ahci`, `gpt`). The
 userspace driver manager — matching `DeviceNode`s to loadable modules and

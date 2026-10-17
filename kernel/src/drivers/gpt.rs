@@ -1,20 +1,17 @@
-//! **A disk's partitions, published** — GPT's, and since Phase 6 Part D.1 MBR's.
+//! **A disk's partitions, published** — GPT's and MBR's.
 //!
 //! [`partitions`](super::partitions) parses the table; this publishes each partition as a block
 //! [`DeviceNode`] over a [`Partition`](crate::io::block::Partition) window — the first
-//! **two-layer** block IRP stack (partition rebases the offset and forwards to the disk). The
-//! partition nodes are registered in the device table (so they appear at `/dev/blk/<n>`), and **a
-//! boot disk's GPT partitions** are recorded for the stable `/dev/disk/by-partuuid/<uuid>` and
-//! `/dev/disk/by-partlabel/<label>` namespace bindings (created at boot by
-//! [`bind_partition_names`]). **A USB disk's are not** ([`Names`]): those names are how `init`
-//! finds its critical path, among what the boot's probe found.
+//! **two-layer** block IRP stack (partition rebases the offset and forwards to the disk),
+//! registered in the device table (`/dev/blk/<n>`). **A boot disk's GPT partitions** are also
+//! recorded for the `/dev/disk/by-partuuid/<uuid>` and `by-partlabel/<label>` bindings made by
+//! [`bind_partition_names`]; **a USB disk's are not** ([`Names`]), since those names are how `init`
+//! finds its critical path among what the boot's probe found. The disk whose GPT GUID is the one
+//! Limine loaded the modules from is flagged `BOOT` ([`partitions::is_boot`]).
 //!
-//! **The disk the machine started from is flagged** in its record (`BOOT`), when its GPT's GUID is
-//! the one Limine loaded the modules from ([`partitions::is_boot`]).
-//!
-//! At boot [`init`] reads with interrupts masked, so it uses the synchronous polled
-//! [`read_blocking`](crate::io::block::read_blocking). GPT header/array CRC validation is deferred
-//! (the signature + sane bounds are checked).
+//! [`init`] reads with interrupts masked, so it uses the polled
+//! [`read_blocking`](crate::io::block::read_blocking). The signature, entry size and bounds are
+//! validated; the header and array CRCs are not (`TODO(gpt-crc)`).
 
 use super::partitions::{self, PartKind, Scheme, Table, Unread};
 use crate::io::block::{Partition, partition_backend, read_blocking};
@@ -29,27 +26,22 @@ use crate::object::{Namespace, ObjectRef};
 
 const SECTOR: u64 = partitions::BLOCK as u64;
 
-/// One published partition, retained for the deferred namespace bindings.
 struct PartEntry {
     node: ObjectRef,
-    /// `/dev/disk/by-partuuid/<uuid>` path.
     by_partuuid: KVec<u8>,
-    /// `/dev/disk/by-partlabel/<label>` path (absent if the label is empty or
-    /// not a usable path component).
+    /// `/dev/disk/by-partlabel/<label>` path (absent if the label is not a usable path component).
     by_partlabel: Option<KVec<u8>>,
 }
 
-/// Partitions discovered across all disks, for [`bind_partition_names`]. Written
-/// at boot by [`init`]; read once when init's namespace is built.
+/// Partitions discovered across all disks, for [`bind_partition_names`]; written by [`init`].
 static PARTITIONS: SpinLock<KVec<PartEntry>> = SpinLock::new(LockRank::Registry, KVec::new());
 
 /// Whether a disk's partitions are recorded for `/dev/disk`.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Names {
-    /// A disk the boot's probe found: its GPT partitions are recorded for
-    /// [`bind_partition_names`].
+    /// A disk the boot's probe found: its GPT partitions are recorded for [`bind_partition_names`].
     Bind,
-    /// A disk that arrived later, a USB one (Phase 6 Part D): none are.
+    /// A disk that arrived later, a USB one: none are.
     None,
 }
 
@@ -109,8 +101,8 @@ pub fn publish(disk: &ObjectRef, table: Result<Table, Unread>, names: Names) -> 
     found
 }
 
-/// Create a partition window + block `DeviceNode`, register it, and — for a boot disk's GPT
-/// partition — record its `by-partuuid`/`by-partlabel` paths.
+/// Create a partition window and block `DeviceNode`, register it, and record a boot disk's GPT
+/// names.
 fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bool {
     let Some(part) = Partition::new(disk, p.first_lba, p.count, SECTOR) else {
         return false;
@@ -141,14 +133,12 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bo
         PartKind::Mbr { kind } => (None, *kind),
     };
     let by_partlabel = gpt.and_then(|(_, name)| decode_partlabel(&name[..]));
-    // **A partition's name is its label** — what `init.toml` selects it by, and what a person
-    // reading a disk list recognises. An unlabelled one says which slice of which disk it is,
-    // because "partition" alone is not something you can confirm before destroying it.
+    // **A partition's name is its label** — what `init.toml` selects it by. An unlabelled one says
+    // which slice of which disk it is: "partition" alone cannot be confirmed before destroying it.
     let mut name = [0u8; MAX_DEVICE_NAME];
     let name_len = match by_partlabel.as_ref() {
-        // `decode_partlabel` returns the whole `/dev/disk/by-partlabel/<label>` path, because that
-        // is what it is for. A device's name is the label itself: a person confirming a partition
-        // reads `nitrox-root`, not a path they cannot type anywhere.
+        // `decode_partlabel` returns the whole `/dev/disk/by-partlabel/<label>` path; a device's
+        // name is the label itself, which a person can read and type.
         Some(path) => {
             let label = path.strip_prefix(PARTLABEL_PREFIX).unwrap_or(&path[..]);
             let n = label.len().min(MAX_DEVICE_NAME);
@@ -157,12 +147,9 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bo
         }
         None => {
             let mut w = NameBuf::new(&mut name);
-            // **Numbered from one, as every other tool numbers partitions.** A position in an
-            // array counts from zero; a partition *number* is
-            // 1-based everywhere a person will have met one — `/dev/sda1`, `sgdisk`'s
-            // listing, the firmware's `HD(1,GPT,…)`. The disk list on the laptop showed
-            // `partition 0`, `partition 1`, `partition 2` against a Debian install whose
-            // own tools call the same three 1, 2 and 3 (2026-09-17).
+            // **Numbered from one, as every other tool numbers partitions** (`/dev/sda1`,
+            // `sgdisk`'s listing, the firmware's `HD(1,GPT,…)`); an array position counts from
+            // zero.
             let _ = core::fmt::Write::write_fmt(&mut w, format_args!("partition {} (unlabelled)", p.number));
             w.len()
         }
@@ -175,8 +162,6 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bo
     let node_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
 
     let (first, last) = (p.first_lba, p.first_lba + p.count - 1);
-    // 1-based, to agree with the name above and with every other tool. The boot log and a disk
-    // list disagreeing about which partition is which is worse than either convention on its own.
     let Some((guid, _)) = gpt else {
         crate::kprintln!(
             "mbr:  partition {} lba {}..{} ({} sectors) type {:#04x} -> block node",
@@ -189,10 +174,8 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bo
         crate::device::register_partition(node_ref, disk, "mbr");
         return true;
     };
-    // **The label, by name.** A partition is found by its label (`init.toml`'s
-    // `gpt-partlabel:`), and until Phase 5 Part C no line said which labels a disk carried — so a
-    // live boot could not show it had found `nitrox-live`, and the laptop's hardware report could
-    // not list what is on its own disk.
+    // **The label, by name**: a partition is found by its label (`init.toml`'s `gpt-partlabel:`),
+    // so the boot log and the hardware report must say which labels a disk carries.
     let label =
         by_partlabel.as_ref().and_then(|p| core::str::from_utf8(&p[PARTLABEL_PREFIX.len()..]).ok()).unwrap_or("");
     crate::kprintln!(
@@ -203,35 +186,28 @@ fn publish_partition(disk: &ObjectRef, p: &partitions::Part, names: Names) -> bo
         p.count,
         label
     );
-    // A boot disk's names, for `init`; a USB disk's partitions get none (Phase 6 Part D).
     if names == Names::Bind
         && let Some(uuid) = format_partuuid(&guid[..])
     {
         record(PartEntry { node: node_ref.clone(), by_partuuid: uuid, by_partlabel });
     }
-    // The device table owns the node (it now also resolves at /dev/blk/<n>), and records that it
-    // belongs to `disk`.
+    // The device table owns the node (it also resolves at /dev/blk/<n>) and records its disk.
     crate::device::register_partition(node_ref, disk, "gpt");
     true
 }
 
-/// Append a discovered partition to the registry.
 fn record(entry: PartEntry) {
     if PARTITIONS.lock().try_push(entry).is_err() {
         crate::kprintln!("gpt: partition registry full");
     }
 }
 
-/// Bind every discovered partition's `/dev/disk/by-partuuid/<uuid>` and
-/// `/dev/disk/by-partlabel/<label>` into `ns` as direct handles. Called once when
-/// init's root namespace is built (the supervisor). Read-only (`READ` + generic
-/// band) — uniform with `/dev/blk`.
+/// Bind every discovered partition's `/dev/disk/by-partuuid/<uuid>` and `by-partlabel/<label>` name
+/// into `ns` as direct handles. Called once when init's root namespace is built.
 pub fn bind_partition_names(ns: &Namespace) {
     // READ + WRITE (the RW fs-server writes filesystem metadata to its partition) + the
     // generic band (DUPLICATE lets it hand a device copy to the kernel for the data path).
     let rights = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    // Snapshot under the lock (clone refs + copy path bytes), then bind without
-    // holding the registry lock across the namespace lock.
     let mut snapshot: KVec<(ObjectRef, KVec<u8>, Option<KVec<u8>>)> = KVec::new();
     {
         let parts = PARTITIONS.lock();
@@ -263,9 +239,6 @@ fn bind_one(ns: &Namespace, path: &KVec<u8>, node: &ObjectRef, rights: Rights) {
     }
 }
 
-// --- byte helpers -----------------------------------------------------------
-
-/// Copy a `KVec<u8>`'s bytes into a fresh one (`None` on OOM).
 fn copy_bytes(src: &KVec<u8>) -> Option<KVec<u8>> {
     let mut out = KVec::new();
     out.try_extend_from_slice(&src[..]).ok()?;
@@ -281,7 +254,6 @@ fn copy_bytes_opt(src: &KVec<u8>) -> Option<KVec<u8>> {
 fn format_partuuid(guid: &[u8]) -> Option<KVec<u8>> {
     let mut p = KVec::new();
     p.try_extend_from_slice(b"/dev/disk/by-partuuid/").ok()?;
-    // Field byte order for the canonical string form.
     const ORDER: [usize; 16] = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
     const DASH_AFTER: [usize; 4] = [3, 5, 7, 9]; // positions in ORDER to follow with '-'
     for (i, &o) in ORDER.iter().enumerate() {
@@ -299,12 +271,10 @@ fn hex_lo(n: u8) -> u8 {
     if n < 10 { b'0' + n } else { b'a' + (n - 10) }
 }
 
-/// The namespace directory a partition's label is bound under.
 const PARTLABEL_PREFIX: &[u8] = b"/dev/disk/by-partlabel/";
 
-/// Decode a GPT partition name (72 bytes UTF-16LE) into
-/// `/dev/disk/by-partlabel/<label>`. ASCII-only; `None` if empty, non-ASCII, or
-/// containing a path separator (not a usable component).
+/// Decode a GPT partition name (72 bytes UTF-16LE) into `/dev/disk/by-partlabel/<label>`; `None` if
+/// empty, non-ASCII, or containing a path separator.
 fn decode_partlabel(name: &[u8]) -> Option<KVec<u8>> {
     let mut p = KVec::new();
     p.try_extend_from_slice(PARTLABEL_PREFIX).ok()?;
@@ -334,7 +304,6 @@ mod tests {
     #[test]
     fn format_partuuid_mixed_endian() {
         init_global_heap();
-        // bytes 0..16 of a GUID; canonical string swaps the first three fields.
         let guid = [
             0x78, 0x56, 0x34, 0x12, // time_low (LE) -> 12345678
             0xbc, 0x9a, // time_mid (LE) -> 9abc
@@ -349,7 +318,6 @@ mod tests {
     #[test]
     fn decode_partlabel_ascii() {
         init_global_heap();
-        // "ESP" in UTF-16LE, NUL-padded.
         let mut name = [0u8; 72];
         name[0] = b'E';
         name[2] = b'S';

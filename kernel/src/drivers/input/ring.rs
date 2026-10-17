@@ -1,39 +1,20 @@
 //! The per-device event ring: **whole records in, whole records out, losses announced**.
 //!
-//! `docs/architecture/input-subsystem.md` §3a. This is the design's one deliberate departure from
-//! reusing the console's mechanism unchanged, and it exists because the two obvious choices
-//! do not compose:
-//!
-//! - [`InputEvent`](crate::libkern::input::InputEvent) is **fixed-size**.
-//! - The console's ring is **byte**-granular and drops a single byte when full.
-//!
-//! One byte lost at a non-record boundary misaligns the stream *permanently*: `kind` starts
-//! reading the high half of the previous `time_ns`, and nothing recovers, because the record
-//! has no sync word and `EV_SYN` is a value *inside* a record rather than a framing marker
-//! anyone can scan for. Splitting a read across a record boundary is harmless — the reader
-//! buffers the remainder — but dropping part of one is not.
-//!
-//! So: the ring stores `InputEvent`s, not bytes; overflow discards the **oldest whole
-//! record**; and the next drain is preceded by
-//! [`SYN_DROPPED`](crate::libkern::input::SYN_DROPPED) so the consumer discards accumulated
-//! state rather than carrying a phantom held key for the rest of the session.
-//!
-//! **The oldest is discarded, not the newest.** Input is a stream whose value decays: the
-//! most recent events are the ones a user is waiting to see happen. Dropping the newest
-//! would also make the eventual `SYN_DROPPED` describe a gap that had already been
-//! interpreted.
+//! `docs/architecture/input-subsystem.md` §3a. [`InputEvent`](crate::libkern::input::InputEvent) is
+//! **fixed-size** with no sync word, so one byte lost at a non-record boundary (what the console's
+//! byte ring does when full) misaligns the stream *permanently*. So overflow discards the **oldest
+//! whole record** — the newest are what a user is waiting to see — and the next drain is preceded
+//! by [`SYN_DROPPED`](crate::libkern::input::SYN_DROPPED) so the consumer discards accumulated
+//! state rather than carrying a phantom held key.
 
 use crate::libkern::input::{INPUT_EVENT_LEN, InputEvent};
 
 /// Events held per device.
 ///
-/// Sized against a burst, not a backlog: 128 events is roughly a second of a PS/2 mouse — 100
-/// reports a second, up to three events each — or far more typing than anyone produces between
-/// two scheduler quanta. **A USB mouse polled every millisecond fills it in about 32 ms**, at up to
-/// four events a report (Phase 6 Part B.2; QEMU's polls every 10 ms). Its reader is woken by every
-/// report, so that is still many wakeups' worth. A consumer that falls further behind than this
-/// is not slow, it is broken, and `SYN_DROPPED` is how it finds out — though for relative motion
-/// what it learns of is a loss: this ring does not carry motion forward as `input-server` does.
+/// Sized against a burst: 128 is roughly a second of a PS/2 mouse (100 reports a second, up to
+/// three events each); **a USB mouse polled every millisecond fills it in about 32 ms**. A consumer
+/// that falls further behind learns of it by `SYN_DROPPED` — for relative motion, a loss: this ring
+/// does not carry motion forward as `input-server` does.
 pub const RING_EVENTS: usize = 128;
 
 /// A fixed-capacity ring of whole [`InputEvent`]s with loss announcement.
@@ -58,18 +39,10 @@ impl EventRing {
 
     /// True when the ring holds nothing to deliver.
     ///
-    /// **Deliberately just `len == 0`.** An earlier version also tested `lost == 0`, on the
-    /// reasoning that a ring owing a `SYN_DROPPED` still has something to tell the consumer.
-    /// That state cannot arise: `lost` is only incremented by [`push`](Self::push) when the
-    /// ring is *full*, and that same push immediately refills the slot it freed, so
-    /// `lost > 0` implies `len == RING_EVENTS`. `len` falls only through
-    /// [`drain_into`](Self::drain_into), which emits the announcement and clears `lost`
-    /// before it removes anything. So `len == 0` already implies nothing is owed.
-    ///
-    /// It is gone rather than kept as defence because it could not be tested: the PR #178
-    /// review showed the original assertion held for the broken implementation too, and two
-    /// further attempts to construct the state were equally vacuous — which is the argument
-    /// for deleting dead code rather than for writing a third contrivance around it.
+    /// **Deliberately just `len == 0`**: `lost` is only incremented when the ring is *full* and
+    /// that same push refills the slot, so `lost > 0` implies `len == RING_EVENTS`; and
+    /// [`drain_into`](Self::drain_into) clears `lost` before it removes anything. So `len == 0`
+    /// already implies nothing is owed.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -84,18 +57,12 @@ impl EventRing {
         let tail = (self.head + self.len) % RING_EVENTS;
         self.buf[tail] = e;
         self.len += 1;
-        // Why `is_empty` need not consider `lost`: a loss is only recorded by dropping from
-        // a full ring, and this push refills the slot, so an owed announcement always has
-        // records travelling with it.
         debug_assert!(self.lost == 0 || self.len == RING_EVENTS, "a loss implies a full ring");
     }
 
-    /// Push a group, all-or-nothing.
-    ///
-    /// A `SYN`-terminated group is one logical event, and delivering half of it is worse
-    /// than delivering none: a consumer would act on a click with no coordinates, or motion
-    /// with no terminator. If the group does not fit, the ring makes room by discarding
-    /// oldest records — which is a loss it announces — rather than by truncating the group.
+    /// Push a group, all-or-nothing: half a `SYN`-terminated group (a click with no coordinates) is
+    /// worse than none, so a group that does not fit makes room by discarding oldest records — a
+    /// loss announced — rather than truncating.
     pub fn push_group(&mut self, group: &[InputEvent]) {
         debug_assert!(group.len() <= RING_EVENTS, "a group larger than the ring cannot be atomic");
         for &e in group {
@@ -105,9 +72,8 @@ impl EventRing {
 
     /// Drain whole records into `dst`, which is truncated to a whole number of records.
     ///
-    /// Returns bytes written. When a loss is owed, the **first** record written is
-    /// `SYN_DROPPED` — before any surviving event, so the consumer resynchronises before
-    /// interpreting anything on the far side of the gap.
+    /// Returns bytes written. When a loss is owed, the **first** record written is `SYN_DROPPED`,
+    /// so the consumer resynchronises before interpreting anything past the gap.
     pub fn drain_into(&mut self, dst: &mut [u8], now_ns: u64) -> usize {
         let capacity = dst.len() / INPUT_EVENT_LEN;
         if capacity == 0 {
@@ -147,14 +113,12 @@ mod tests {
     use super::*;
     use crate::libkern::input::*;
 
-    /// Scratch large enough for a full ring plus the loss marker.
     const SCRATCH: usize = (RING_EVENTS + 4) * INPUT_EVENT_LEN;
 
     fn ev(n: u16) -> InputEvent {
         InputEvent::key(n, KEY_PRESS, n as u64)
     }
 
-    /// Drain at most `records` records, returning them in `out` and how many there were.
     fn drain(r: &mut EventRing, records: usize, out: &mut [InputEvent]) -> usize {
         let mut buf = [0u8; SCRATCH];
         let cap = (records * INPUT_EVENT_LEN).min(SCRATCH);
@@ -180,8 +144,7 @@ mod tests {
 
     #[test]
     fn a_drain_never_writes_a_partial_record() {
-        // The property the whole module exists for. A destination of 1.5 records must yield
-        // exactly one, not one and a half.
+        // A destination of 1.5 records must yield exactly one, not one and a half.
         let mut r = EventRing::new();
         r.push(ev(1));
         r.push(ev(2));
@@ -215,9 +178,7 @@ mod tests {
 
     #[test]
     fn syn_dropped_precedes_the_survivors_not_follows_them() {
-        // Ordering is the point: a consumer must resynchronise *before* interpreting
-        // anything from the far side of the gap, or it applies post-gap events to pre-gap
-        // state.
+        // A consumer must resynchronise *before* interpreting anything past the gap.
         let mut r = EventRing::new();
         for i in 0..RING_EVENTS as u16 + 1 {
             r.push(ev(i));
@@ -247,11 +208,9 @@ mod tests {
 
     #[test]
     fn a_loss_is_only_ever_recorded_by_a_full_ring() {
-        // The invariant that makes `is_empty` safe as `len == 0`: overflow is the only
-        // source of `lost`, and the overflowing push refills the ring, so a loss never
-        // outlives the records it arrived with. Asserted on the *strong* form
-        // (`len == RING_EVENTS`), not the weak `len > 0` — a first attempt used the weak
-        // form and still passed against a `push` that dropped without refilling.
+        // The invariant that makes `is_empty` safe as `len == 0`: overflow is the only source of
+        // `lost`, and the overflowing push refills the ring. Asserted on the *strong* form (`len ==
+        // RING_EVENTS`): the weak `len > 0` passes against a `push` that drops without refilling.
         let mut r = EventRing::new();
         for i in 0..RING_EVENTS as u16 * 3 {
             r.push(ev(i));
@@ -262,8 +221,6 @@ mod tests {
 
     #[test]
     fn a_drained_ring_is_empty_and_owes_nothing() {
-        // The consumer-visible half: once everything has been taken, including any
-        // announcement, the ring reports empty and a reader parks rather than spinning.
         let mut r = EventRing::new();
         for i in 0..RING_EVENTS as u16 + 5 {
             r.push(ev(i));
