@@ -1,82 +1,51 @@
 //! x86_64 raw user-memory copy primitives.
 //!
-//! The arch-specific half of the user-memory-access subsystem: two
-//! `unsafe` functions that copy bytes between kernel and user memory
-//! under the SMAP `stac`/`clac` window, with `#PF`-during-copy
-//! converted to a fault flag via the kernel-wide exception table
-//! (`.user_access_table` section, walked by
-//! [`crate::mm::user_access::lookup_recovery`]).
+//! Two `unsafe` functions copy bytes between kernel and user memory under the SMAP `stac`/`clac`
+//! window, turning a `#PF` during the copy into a fault flag via the exception table
+//! (`.user_access_table`, walked by [`crate::mm::user_access::lookup_recovery`]).
 //!
-//! The arch-neutral half — [`UserPtr<T>`](crate::mm::user_access::UserPtr),
-//! [`UserMutPtr<T>`](crate::mm::user_access::UserMutPtr), validation,
-//! and the public `copy_*_user` API — lives in
-//! [`crate::mm::user_access`]. That module calls into the functions
-//! here for the actual asm.
-//!
-//! When aarch64 is implemented its raw primitives live in
-//! `kernel/src/arch/aarch64/user_access.rs` and use PAN (Privileged
-//! Access Never) in place of SMAP, with the same return shape so the
-//! mm-layer wrapper does not need to change.
+//! Validation and the public `copy_*_user` API live in [`crate::mm::user_access`]. See
+//! `docs/spec/user-memory-access.md`.
 
 /// Copy `len` bytes from `src` to `dst` under SMAP discipline.
-/// Returns `true` if a `#PF` occurred inside the copy window
-/// (the kernel-side bytes are partially copied; the caller treats
-/// the operation as failed), `false` on success.
 ///
-/// `src` and `dst` must not overlap. One of them is a user pointer;
-/// the other is a kernel pointer. SMAP must be enabled
+/// Returns `true` if a `#PF` occurred inside the copy window (the kernel-side bytes are
+/// partially copied), `false` on success. `src` and `dst` must not overlap; one is a user
+/// pointer and the other a kernel pointer. SMAP must be enabled
 /// ([`crate::arch::ensure_smap_smep`] has run).
 ///
 /// # Safety
-/// - At least one of `src` / `dst` points into user memory; the
-///   other must be a valid kernel pointer for the corresponding
-///   direction.
-/// - `len` bytes from `src` and to `dst` must be reachable for the
-///   direction in question — the user side may fault, in which
-///   case the recovery path converts the fault into the `true`
-///   return.
+/// One of `src` / `dst` points into user memory, the other must be a valid kernel pointer. `len`
+/// bytes must be reachable on both sides; the user side may fault, which the recovery path turns
+/// into the `true` return.
 #[cfg(not(test))]
 pub(crate) unsafe fn copy_bytes_raw(dst: *mut u8, src: *const u8, len: usize) -> bool {
     if len == 0 {
         return false;
     }
     let faulted: u64;
-    // SAFETY: forwarded from this function's contract. The asm opens
-    // the SMAP window with `stac`, runs `rep movsb` once (advancing
-    // rsi/rdi/rcx and possibly faulting on a user-side access),
-    // then closes the window with `clac` on either path. The
-    // exception-table entry (`.user_access_table`) registers the
-    // `rep movsb` PC as the fault site and the recovery label as
-    // the resume PC; the #PF handler patches `frame.rip` to that
-    // label on match.
+    // SAFETY: forwarded from this function's contract. `stac` opens the SMAP window and `clac`
+    // closes it on either path. The exception-table entry registers the `rep movsb` PC as the
+    // fault site and the recovery label as the resume PC; the #PF handler patches `frame.rip`
+    // to that label on match.
     unsafe {
         core::arch::asm!(
             "stac",
-            // `rep movsb` advances forward only with DF=0. The syscall
-            // entry path clears DF via SFMASK, but these primitives are
-            // also reachable from contexts that don't (a future #PF
-            // handler or DPC copying user memory), where DF is whatever
-            // the interrupted code left. Clear it explicitly so the copy
-            // can never run backwards and corrupt memory.
+            // `rep movsb` runs forward only with DF=0. SFMASK clears DF on syscall entry, but
+            // other contexts reaching this primitive may not, and a backwards copy corrupts memory.
             "cld",
-            // Fault PC: the `rep movsb` instruction itself. On a
-            // user-side #PF the CPU leaves RIP pointing here so the
-            // exception-table match below can find it.
+            // Fault PC: the CPU leaves RIP here on a user-side #PF.
             "2:",
             "rep movsb",
-            // Success: close SMAP, return 0.
             "clac",
             "xor eax, eax",
             "jmp 3f",
-            // Recovery PC: the #PF handler jumped here. The saved
-            // RFLAGS still has AC=1 (we faulted inside the stac
-            // window), so the first instruction is `clac` to put
-            // SMAP enforcement back. Then signal failure with rax=1.
+            // Recovery PC: the saved RFLAGS still has AC=1 (the fault was inside the `stac`
+            // window), so `clac` first, then signal failure with rax=1.
             "4:",
             "clac",
             "mov eax, 1",
             "3:",
-            // Register the recovery pair in the exception table.
             ".pushsection .user_access_table, \"a\"",
             ".balign 8",
             ".quad 2b",
@@ -92,12 +61,9 @@ pub(crate) unsafe fn copy_bytes_raw(dst: *mut u8, src: *const u8, len: usize) ->
     faulted != 0
 }
 
+/// Host-test stand-in for the asm [`copy_bytes_raw`] (same contract, never faults).
 #[cfg(test)]
 pub(crate) unsafe fn copy_bytes_raw(dst: *mut u8, src: *const u8, len: usize) -> bool {
-    // Host stub. No SMAP, no exception table; the asm body is what
-    // the integration test will eventually exercise. The mm-layer
-    // wrapper tests use this to verify validation plumbing without
-    // privileged instructions.
     // SAFETY: forwarded from this function's contract; the host
     // never has user memory, so this only runs against ordinary
     // in-process buffers.
@@ -108,19 +74,17 @@ pub(crate) unsafe fn copy_bytes_raw(dst: *mut u8, src: *const u8, len: usize) ->
 /// Outcome of a byte-by-byte NUL-terminated user copy.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CstrCopyOutcome {
-    /// NUL terminator was found within `max_len` bytes. The `usize`
-    /// is the number of bytes written to `dst`, including the NUL.
+    /// NUL terminator found within `max_len` bytes; the `usize` is the bytes written to `dst`,
+    /// including the NUL.
     Ok(usize),
-    /// A `#PF` occurred on a user-side load. The kernel-side `dst`
-    /// may hold a partial copy; the caller treats it as failed.
+    /// A `#PF` occurred on a user-side load; `dst` may hold a partial copy.
     Fault,
-    /// `dst` filled to `max_len` without encountering a NUL byte.
-    /// The caller can grow the buffer and retry.
+    /// `dst` filled to `max_len` without a NUL byte.
     NoTerminator,
 }
 
-/// Byte-by-byte copy of a NUL-terminated user string. Stops at the
-/// first NUL byte or when `max_len` bytes have been read.
+/// Byte-by-byte copy of a NUL-terminated user string, stopping at the first NUL or after
+/// `max_len` bytes.
 ///
 /// # Safety
 /// Same contract as [`copy_bytes_raw`]: `src` points into user
@@ -137,17 +101,11 @@ pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize)
     unsafe {
         core::arch::asm!(
             "stac",
-            // `lodsb`/`stosb` advance forward only with DF=0; clear it
-            // explicitly so the copy is correct regardless of the DF
-            // state of whatever context reached this primitive (see the
-            // note in `copy_bytes_raw`).
+            // `lodsb`/`stosb` run forward only with DF=0 (see `copy_bytes_raw`).
             "cld",
             "xor rdx, rdx",
-            // Fault PC. Only `lodsb` reads from user memory; the
-            // subsequent `stosb`, `inc`, `test`, `cmp`, `jb` touch
-            // only kernel memory (`stosb` into `dst`) or no memory
-            // at all, so a #PF inside this block can only originate
-            // from `lodsb`.
+            // Fault PC: only `lodsb` reads user memory, so a #PF in this block can only come
+            // from it.
             "20:",
             "lodsb",
             "stosb",
@@ -156,16 +114,13 @@ pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize)
             "jz 22f",                  // found NUL
             "cmp rdx, rcx",
             "jb 20b",                  // continue (rdx < max_len)
-            // Filled without finding NUL.
             "clac",
             "mov eax, 2",
             "jmp 23f",
-            // Found NUL.
             "22:",
             "clac",
             "xor eax, eax",
             "jmp 23f",
-            // Recovery PC.
             "24:",
             "clac",
             "mov eax, 1",
@@ -195,23 +150,19 @@ pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize)
 
 #[cfg(test)]
 std::thread_local! {
-    /// One-shot **per-thread** flag the suite can set to force the next
-    /// [`copy_cstr_raw`] host-stub call on the same thread to report a
-    /// [`CstrCopyOutcome::Fault`], exercising the `#PF` mapping path that
-    /// the real asm body produces only on a genuine user-side fault.
-    ///
-    /// Per-thread (rather than process-global) so concurrent tests do
-    /// not consume each other's flag — cargo runs unit tests in parallel.
+    /// One-shot **per-thread** flag forcing the next [`copy_cstr_raw`] host-stub call on the same
+    /// thread to report [`CstrCopyOutcome::Fault`]. Per-thread so parallel tests do not consume
+    /// each other's flag.
     pub(crate) static FAIL_NEXT_CSTR_COPY: core::cell::Cell<bool> =
         const { core::cell::Cell::new(false) };
 }
 
+/// Host-test stand-in for the asm [`copy_cstr_raw`], with a forced-fault hook.
 #[cfg(test)]
 pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize) -> CstrCopyOutcome {
     if FAIL_NEXT_CSTR_COPY.with(|f| f.replace(false)) {
         return CstrCopyOutcome::Fault;
     }
-    // Host stub: byte-by-byte copy until NUL or max_len.
     // SAFETY: forwarded; host tests use ordinary in-process buffers.
     let src_slice = unsafe { core::slice::from_raw_parts(src, max_len) };
     // SAFETY: as above.
@@ -225,11 +176,8 @@ pub(crate) unsafe fn copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize)
     CstrCopyOutcome::NoTerminator
 }
 
-/// The x86_64 [`ArchUserAccess`](crate::arch::user_access::ArchUserAccess)
-/// implementation. Zero-sized; re-exported as `crate::arch::UserAccess`. The
-/// methods forward to the SMAP-windowed copy primitives above — the asm and
-/// exception-table mechanism are unchanged; the trait only formalises the
-/// neutral call surface.
+/// The x86_64 [`ArchUserAccess`](crate::arch::user_access::ArchUserAccess) implementation,
+/// forwarding to the copy primitives above.
 pub struct X86UserAccess;
 
 impl crate::arch::user_access::ArchUserAccess for X86UserAccess {
