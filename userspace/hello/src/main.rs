@@ -1,27 +1,8 @@
-//! `hello` — the first Nitrox userspace program (a throwaway Phase-1 proof).
+//! `hello` — a freestanding ring-3 program that exercises the syscall surface and reports each
+//! step over `sys_kprint`; the boot gate counts on the lines it prints.
 //!
-//! A freestanding ring-3 program that exercises the syscall surface available
-//! so far and reports each step over the debug `sys_kprint` log:
-//!
-//! 1. prints a greeting;
-//! 2. `sys_memory_create` → a one-page anonymous `MemoryObject`;
-//! 3. `sys_memory_map` → maps it read/write and round-trips a byte through the
-//!    mapped page (the proof that user PTEs point at the object's frames);
-//! 4. `sys_handle_stat` / `duplicate` / `restrict` / `close` on the memory
-//!    handle — the handle-operation syscalls' first end-to-end ring-3 run;
-//!    4b. `sys_clock_read(Monotonic)` twice — the monotonic clock must advance;
-//!    4c. `sys_timer_create` + `sys_timer_set` (~50 ms) + `sys_wait` — block on a
-//!    timer and wake when it fires; plus a poll (`WouldBlock`) and a pure
-//!    timeout (`TimedOut`) case;
-//! 5. `sys_memory_unmap`, then `sys_process_exit`.
-//!
-//! It exists only to demonstrate the kernel can load an ELF, build a process +
-//! address space, schedule a thread into ring 3, service syscalls, and tear
-//! the process down. It is replaced by the real `init` (PID 1) once an
-//! initramfs exists.
-//!
-//! Built as a **static, non-PIE `ET_EXEC`** at a low user virtual address —
-//! see `user.ld` and `.cargo/config.toml`.
+//! Built as a static, non-PIE `ET_EXEC` at a low user address; see `user.ld` and
+//! `.cargo/config.toml`.
 
 #![no_std]
 #![no_main]
@@ -37,13 +18,10 @@ use libkern::{
 
 const PAGE: u64 = 4096;
 
-/// Errors (`KError`), as returned (negated) in rax — derived from `libkern`.
 const E_WOULD_BLOCK: i64 = KError::WouldBlock.as_i32() as i64;
 const E_TIMED_OUT: i64 = KError::TimedOut.as_i32() as i64;
 const E_PEER_CLOSED: i64 = KError::PeerClosed.as_i32() as i64;
 
-/// Out-buffer for one `sys_wait` result + a one-entry handles array, both in
-/// writable `.bss`.
 static mut WAIT_RESULTS: IoResult = IoResult { handle: 0, status: 0, reserved: 0, result: 0 };
 static mut WAIT_HANDLES: [u64; 1] = [0];
 
@@ -66,11 +44,11 @@ static mut STAT_BUF: HandleInfo = HandleInfo { rights: 0, object_type: 0, genera
 /// Out-parameter for `sys_clock_read`. Writable `.bss`, naturally 8-aligned.
 static mut CLOCK_BUF: u64 = 0;
 
+/// Entry point: runs each demo step, then faults on purpose.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     kprint(MSG);
 
-    // 1. Create a one-page memory object.
     // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
     let h = unsafe { syscall2(SYS_MEMORY_CREATE, PAGE, 0) };
     if h < 0 {
@@ -79,7 +57,6 @@ pub extern "C" fn _start() -> ! {
     }
     let h = h as u64;
 
-    // 2. Map it read/write (anywhere).
     // SAFETY: valid syscall; returns the mapped address or a negative KError.
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if addr < 0 {
@@ -107,7 +84,6 @@ pub extern "C" fn _start() -> ! {
     //    step prints its own failure so a regression is easy to localise.
     let mut handle_ops_ok = true;
 
-    // stat → expect type MemoryObject and the MAP_READ right present.
     // SAFETY: STAT_BUF is a valid writable out-param of the right layout.
     let stat_ret = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut STAT_BUF) as u64) };
     // SAFETY: on success the kernel wrote a HandleInfo into STAT_BUF.
@@ -119,14 +95,12 @@ pub extern "C" fn _start() -> ! {
         handle_ops_ok = false;
     }
 
-    // duplicate → a second handle with only INSPECT|DUPLICATE.
     // SAFETY: valid syscall; returns a new handle or a negative KError.
     let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, h, RIGHT_INSPECT | RIGHT_DUPLICATE) };
     if dup < 0 {
         handle_ops_ok = false;
     } else {
         let dup = dup as u64;
-        // restrict the duplicate to INSPECT only, then close it.
         // SAFETY: valid syscalls operating on our own handle.
         let rr = unsafe { syscall2(SYS_HANDLE_RESTRICT, dup, RIGHT_INSPECT) };
         // SAFETY: closing the duplicate handle we own
@@ -147,7 +121,6 @@ pub extern "C" fn _start() -> ! {
     let r1 = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
     // SAFETY: on success the kernel wrote the nanosecond count into CLOCK_BUF.
     let t1 = unsafe { (&raw const CLOCK_BUF).read() };
-    // A little observable work so the counter advances measurably between reads.
     let mut spin = 0u64;
     for _ in 0..200_000 {
         // SAFETY-free: a volatile-style accumulate the optimiser can't drop.
@@ -164,7 +137,6 @@ pub extern "C" fn _start() -> ! {
         kprint(b"clock: monotonic FAIL\n");
     }
 
-    // 4c. Timer + sys_wait: create a timer, arm it ~50 ms out, and block on it.
     // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
     let th = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
     if th < 0 {
@@ -173,7 +145,6 @@ pub extern "C" fn _start() -> ! {
     }
     let th = th as u64;
 
-    // Read t0, arm for t0 + 50 ms (absolute monotonic, one-shot), wait on it.
     // SAFETY: CLOCK_BUF is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
     // SAFETY: `CLOCK_BUF` is a plain `u64` static only this thread touches; a failed clock read
@@ -248,7 +219,6 @@ pub extern "C" fn _start() -> ! {
     // SAFETY: closing our own timer handle
     unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
 
-    // 5. Unmap.
     // SAFETY: valid syscall on a region we mapped above.
     let ur = unsafe { syscall2(SYS_MEMORY_UNMAP, addr, PAGE) };
     if ur == 0 {
@@ -296,7 +266,6 @@ pub extern "C" fn _start() -> ! {
         ipc_ok = false;
     }
 
-    // Block on end1 (immediately signaled), then receive and verify the message.
     // SAFETY: WAIT_HANDLES / WAIT_RESULTS are valid writable buffers.
     let waited = unsafe {
         WAIT_HANDLES[0] = e1;
@@ -325,7 +294,6 @@ pub extern "C" fn _start() -> ! {
         ipc_ok = false;
     }
 
-    // A second recv on the now-drained end1 would block.
     // SAFETY: valid out-params.
     let dr = unsafe { syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64) };
     if dr == E_WOULD_BLOCK {
@@ -334,7 +302,6 @@ pub extern "C" fn _start() -> ! {
         ipc_ok = false;
     }
 
-    // Close end0; receiving on end1 now reports the closed peer.
     // SAFETY: closing our own endpoint handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, e0) };
     // SAFETY: valid out-params.
@@ -361,7 +328,6 @@ pub extern "C" fn _start() -> ! {
     kprint(b"hello: triggering a deliberate fault\n");
     // SAFETY: a deliberate fault: page 1 is never mapped, so the store faults and the kernel terminates this thread
     unsafe { core::ptr::write_volatile(0x1000 as *mut u64, 0xDEAD) };
-    // Unreachable: the store faults and the kernel terminates this thread.
     loop {
         // SAFETY: `pause` is always valid in ring 3 and has no effects.
         unsafe { asm!("pause", options(nomem, nostack)) };
