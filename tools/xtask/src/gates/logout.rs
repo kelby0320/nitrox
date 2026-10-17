@@ -2,65 +2,22 @@
 
 use crate::*;
 
-/// `cargo xtask check-login` — the **graphical login gate**: a wrong password, then a right
-/// one, then a session.
-///
-/// The sequence `test-interactive` runs on serial, driven the way `check-input` and
-/// `check-terminal` drive input, and adjudicated on the host. Built in Part D rather than at
-/// the end of the milestone so Parts E and F land against a gate that already exists.
-///
-/// **The release image, not the test one, and that is not a preference.** In the test image
-/// the greeter is bottom-most — `service-mgr` brings the login chain up before declared
-/// services, which is what keeps `check-display`'s reference windows undisturbed — so it does
-/// not hold the keyboard and nothing typed would reach it. In a release image it is the only
-/// window. That also makes this the gate that proves the graphical arm exists for a person:
-/// every other display gate boots `--selftest`.
-///
-/// How many desktop entries the image stages — the number `check-login` asserts the shell read.
-///
-/// **Duplicated from `GRAPHICAL_APPLICATIONS`'s length on purpose.** Deriving it would make the
-/// gate agree with the build by construction and assert nothing; a literal is a second statement
-/// of the same fact, which is what an assertion is for.
+/// How many desktop entries the image stages, which `check-login` asserts the shell read: a
+/// literal, as deriving it from `GRAPHICAL_APPLICATIONS` would agree with the build by
+/// construction.
 pub(crate) const STAGED_APPLICATIONS: usize = 3;
 
-/// `cargo xtask check-logout` — **ending a session from the desktop** (administration Part F.2),
-/// in CI's QEMU job.
+/// `cargo xtask check-logout` — ending a session from the desktop, in CI's QEMU job.
 ///
-/// On the **release image**, as `check-login` is: only there does the greeter hold the keyboard,
-/// and only after a real login does `desktop-shell` build a session a person can end. In one QEMU
-/// run:
-/// 1. log in at the greeter;
-/// 2. open the editor from the Applications menu, and type a key, so it has something to lose;
-/// 3. the power menu's **Log out**: the shell asks the editor's window to close, the editor asks
-///    whether to discard, and half a second later **the shell's waiting dialog names it** —
-///    **without taking the keyboard from the editor's question** (PR #346 review, finding 2):
-///    Escape answers the question, *keep editing*, and the logout goes on waiting;
-/// 4. **Cancel**, and the session goes on — the Applications menu still opens;
-/// 5. Log out again, and **discard** in the editor's question, asked again: the editor
-///    closes, the shell exits, and **the greeter comes back**;
-/// 6. log in again, open a terminal, and Log out: **nothing to ask**, so no waiting dialog, and the
-///    greeter comes back;
-/// 7. log in again, open the editor with a key typed into it and a terminal, and type
-///    `with power shutdown --reboot` there: **a shutdown started elsewhere asks the windows too** —
-///    the editor asks, no dialog comes, and the shell goes after its own 3 s, **inside its
-///    supervisor's 5 s**, so no leader is left "still running after it was asked to stop"; then the
-///    machine resets, and **a second boot's greeter** comes up. No other gate reaches this path:
-///    `check-shutdown` has no graphical session;
-/// 8. log in, open the editor with a key typed into it, and choose **Restart** (administration Part
-///    F.3): the editor asks, the waiting dialog names it, and **End anyway** destroys its window;
-///    then the shell asks the view broker for `shutdown --reboot` in the `power` view, `service-mgr`'s
-///    sequence asks the shell to stop, it goes at once with nothing left open, and **a third boot's
-///    greeter** comes up;
-/// 9. log in, and choose **Shut down**: nothing to ask, the broker starts `shutdown`, and the
-///    machine halts — "It is now safe to turn off your computer." **read off the screen** with
-///    `check-fbcon`'s decoder, as on the laptop, which has no serial port.
-///
-/// **Two resets and a halt in one QEMU run**, so it boots with a reset allowed to reboot — three
-/// boots, and the order is forced: the halt must be last.
-///
-/// **Aimed, not measured**: the power button at `chrome::POWER_FROM_RIGHT` in from the right edge,
-/// the menu's rows by the keyboard, and the dialogs' buttons at `chrome`'s published centres from
-/// the origins the shell logs — the rule every screen gate here keeps (M11 decision 2).
+/// On the release image, as `check-login` is (only there does the greeter hold the keyboard). One
+/// run, three boots with the halt last: Log out past an editor's question (the waiting dialog names
+/// it without taking the keyboard from the question), Cancel, discard; a terminal with nothing to
+/// ask; `with power shutdown --reboot` typed at a terminal, which asks the windows too and ends the
+/// shell after its own 3 s, inside its supervisor's 5 s (no other gate reaches this:
+/// `check-shutdown` has no graphical session); Restart with End anyway; Shut down, read off the
+/// screen with `check-fbcon`'s decoder. Aimed, not measured: the power button at
+/// `chrome::POWER_FROM_RIGHT`, the menu's rows by keyboard, the dialogs' buttons at `chrome`'s
+/// published centres from the origins the shell logs.
 pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::Normal)?;
@@ -72,18 +29,15 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     const APPS_CLICK: (i32, i32) = (60, 12);
     let power_click = (size.w as i32 - chrome::POWER_FROM_RIGHT, 12);
 
-    // 1. Log in.
     session.expect("desktop-session-mgr: greeter presented")?;
     logout_gate_login(&mut qmp, &mut session, size)?;
     println!("  ok: logged in at the greeter");
 
-    // 2. The editor, with a key typed into it.
     let editor = logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxedit")?;
     press(&mut qmp, "z")?;
     session.expect("nxedit: buffer rev 1")?;
     println!("  ok: the editor is open (window {editor}) with something to lose");
 
-    // 3. Log out: the editor asks, and the shell names it.
     logout_gate_choose(&mut qmp, &mut session, power_click, LOG_OUT)?;
     session.expect("nxedit: unsaved buffer - asking before closing")?;
     session.expect("desktop-shell: placed dialog ")?;
@@ -95,10 +49,9 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     }
     let (wx, wy) = logout_gate_waiting(&mut session, "Waiting for 1 window to close:")?;
     println!("  ok: Log out asked the editor, which asked about its buffer, and the shell named it");
-    // **The keyboard is still the question's**: the dialog gave it back, so Escape reaches the
-    // editor — *keep editing* — and not the dialog, where it would be Cancel. No receipt from the
-    // editor to wait for: it announces only its first gain. None is needed: the shell logs after
-    // the compositor has answered the raise, and a key is routed to whatever the stack says then.
+    // The keyboard is still the question's: the dialog gave it back, so Escape reaches the editor
+    // (keep editing), not the dialog, where it would be Cancel. No receipt to wait for; the shell
+    // logs after the compositor answered the raise.
     session.expect(&format!("desktop-shell: the keyboard back to window {placed_id}"))?;
     let from = session.transcript().len();
     press(&mut qmp, "esc")?;
@@ -108,7 +61,6 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     }
     println!("  ok: the waiting dialog left the keyboard with the editor's question");
 
-    // 4. Cancel, and the session goes on.
     click_at(&mut qmp, &mut session, wx + chrome::DIALOG_RIGHT_CX, wy + chrome::DIALOG_BUTTON_CY)?;
     session.expect("desktop-shell: ending the session cancelled; it goes on")?;
     click_at(&mut qmp, &mut session, APPS_CLICK.0, APPS_CLICK.1)?;
@@ -117,7 +69,6 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-shell: applications menu closed")?;
     println!("  ok: Cancel kept the session");
 
-    // 5. Log out again, and discard in the question the editor asks again: the greeter comes back.
     logout_gate_choose(&mut qmp, &mut session, power_click, LOG_OUT)?;
     session.expect("nxedit: unsaved buffer - asking before closing")?;
     session.expect("desktop-shell: placed dialog ")?;
@@ -132,7 +83,6 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-session-mgr: greeter presented again")?;
     println!("  ok: once the editor closed, the session ended and the greeter came back");
 
-    // 6. Log in again; a terminal; Log out — nothing to ask.
     logout_gate_login(&mut qmp, &mut session, size)?;
     logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxterm")?;
     logout_gate_choose(&mut qmp, &mut session, power_click, LOG_OUT)?;
@@ -144,7 +94,6 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("desktop-session-mgr: greeter presented again")?;
     println!("  ok: with nothing to ask, the session ended at once and the greeter came back");
 
-    // 7. A restart typed at a terminal, with the editor holding something to lose.
     logout_gate_login(&mut qmp, &mut session, size)?;
     logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxedit")?;
     press(&mut qmp, "z")?;
@@ -153,9 +102,8 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     type_at_terminal(&mut qmp, "with power shutdown --reboot")?;
     session.expect("desktop-shell: asked to stop; asking every window to close first")?;
     session.expect("nxedit: unsaved buffer - asking before closing")?;
-    // **To the reset, then read back**: a shell that outlived its supervisor's bound never says it
-    // is exiting before the machine goes, so waiting for that line would time out rather than say
-    // why.
+    // To the reset, then read back: a shell that outlived its supervisor's bound never says it is
+    // exiting before the machine goes, so waiting for that line would time out without saying why.
     let from = session.transcript().len();
     session.expect(RESET)?;
     let after = session.transcript()[from..].to_string();
@@ -166,7 +114,6 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect(BOOT_GREETER)?;
     println!("  ok: a restart from a terminal asked the windows, waited without a dialog, and a second boot came up");
 
-    // 8. Restart from the desktop, with the editor holding something to lose: End anyway.
     logout_gate_login(&mut qmp, &mut session, size)?;
     logout_gate_launch(&mut qmp, &mut session, APPS_CLICK, "nxedit")?;
     press(&mut qmp, "z")?;
@@ -174,8 +121,8 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     logout_gate_choose(&mut qmp, &mut session, power_click, RESTART)?;
     session.expect("nxedit: unsaved buffer - asking before closing")?;
     let (wx, wy) = logout_gate_waiting(&mut session, "Waiting for 1 window to close:")?;
-    // **Read back from the click**, not from the shell's line: `shutdown` runs as soon as the broker
-    // has spawned it, and can say it is restarting before the shell has heard it was started.
+    // Read back from the click, not the shell's line: `shutdown` runs once the broker has spawned
+    // it and can say it is restarting before the shell has heard it was started.
     let from = session.transcript().len();
     click_at(&mut qmp, &mut session, wx + chrome::DIALOG_LEFT_CX, wy + chrome::DIALOG_BUTTON_CY)?;
     session.expect("desktop-shell: ending anyway, closing 1 window(s)")?;
@@ -191,7 +138,6 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect(BOOT_GREETER)?;
     println!("  ok: Restart waited for the editor, ended it anyway, asked the broker, and a third boot came up");
 
-    // 9. Shut down from the desktop: the message, on the screen.
     logout_gate_login(&mut qmp, &mut session, size)?;
     let from = session.transcript().len();
     logout_gate_choose(&mut qmp, &mut session, power_click, SHUT_DOWN)?;
@@ -214,25 +160,20 @@ pub(crate) fn cmd_check_logout(accel: Accel, size: DisplaySize) -> R<()> {
     Ok(())
 }
 
-/// The power menu's rows, as `check-logout` chooses them: each by pressing Down that many times, so
-/// their order is `desktop-shell`'s `panel` test's, which pins it (M11 decision 2).
+/// The power menu's rows, each chosen by pressing Down that many times, in the order
+/// `desktop-shell`'s `panel` test pins.
 const LOG_OUT: (&str, usize) = ("Log out", 1);
 
-/// See [`LOG_OUT`].
 const RESTART: (&str, usize) = ("Restart", 2);
 
-/// See [`LOG_OUT`].
 const SHUT_DOWN: (&str, usize) = ("Shut down", 3);
 
-/// What a reset says last on COM1, before the next boot's first line.
 const RESET: &str = "power: resetting through the FADT's reset register";
 
-/// **The greeter of a boot**, and not the one presented again after a logout, whose line begins the
-/// same way.
+/// The greeter of a boot, not the one presented again after a logout, whose line begins the same
+/// way.
 const BOOT_GREETER: &str = "desktop-session-mgr: greeter presented,";
 
-/// **The shell went when asked, inside its supervisor's bound**, in the stretch of `transcript` a
-/// shutdown or a restart covered.
 fn logout_gate_stopped_in_time(transcript: &str) -> R<()> {
     if transcript.contains("desktop-shell is still running after it was asked to stop")
         || !transcript.contains("desktop-shell: asked to stop, exiting")
@@ -242,7 +183,6 @@ fn logout_gate_stopped_in_time(transcript: &str) -> R<()> {
     Ok(())
 }
 
-/// Log in at the greeter as the demo account, and wait for the shell's bars.
 pub(crate) fn logout_gate_login(qmp: &mut Qmp, session: &mut Session, size: DisplaySize) -> R<()> {
     type_at_greeter(qmp, session, DEMO_USER)?;
     press(qmp, "tab")?;
@@ -254,8 +194,6 @@ pub(crate) fn logout_gate_login(qmp: &mut Qmp, session: &mut Session, size: Disp
     Ok(())
 }
 
-/// Launch `program` from the Applications menu, and return its window's id once the shell has
-/// placed it and the screen has settled — so what is typed next reaches it.
 fn logout_gate_launch(qmp: &mut Qmp, session: &mut Session, apps: (i32, i32), program: &str) -> R<u32> {
     click_at(qmp, session, apps.0, apps.1)?;
     session.expect("desktop-shell: applications menu open")?;
@@ -270,8 +208,6 @@ fn logout_gate_launch(qmp: &mut Qmp, session: &mut Session, apps: (i32, i32), pr
     Ok(id)
 }
 
-/// Open the power menu at `power` and choose `row` — one of [`LOG_OUT`], [`RESTART`] and
-/// [`SHUT_DOWN`] — by the keyboard.
 fn logout_gate_choose(qmp: &mut Qmp, session: &mut Session, power: (i32, i32), row: (&str, usize)) -> R<()> {
     click_at(qmp, session, power.0, power.1)?;
     session.expect("desktop-shell: power menu open")?;
@@ -283,7 +219,6 @@ fn logout_gate_choose(qmp: &mut Qmp, session: &mut Session, power: (i32, i32), r
     Ok(())
 }
 
-/// Wait for the shell's waiting dialog, check what it says, and return its origin.
 fn logout_gate_waiting(session: &mut Session, says: &str) -> R<(i32, i32)> {
     session.expect("desktop-shell: waiting dialog open, window ")?;
     let line = session.rest_of_line()?;

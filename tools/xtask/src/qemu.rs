@@ -2,15 +2,10 @@
 
 use crate::*;
 
-/// Append the machine / CPU / memory / UEFI-firmware flags shared by every QEMU
-/// launch (`qemu`, `qemu-debug`, `test-qemu`) to `qemu`.
 /// How the guest CPU is executed.
 ///
-/// The kernel is **x2APIC-only** (decision log, 2026-06-26), which sets a hard floor on
-/// the host side: QEMU's TCG only emulates x2APIC from **9.0**, so an older QEMU boots to
-/// a kernel panic ("CPU lacks x2APIC"). KVM has no such limit — the in-kernel APIC has
-/// supported x2APIC for years — so `--kvm` is both the fast path and the way to run on a
-/// host whose QEMU is too old to emulate it.
+/// The kernel is **x2APIC-only**, and QEMU's TCG emulates x2APIC only from **9.0**; KVM has no such
+/// limit, so `--kvm` is the fast path and the way to run on an older QEMU (CI's is 8.2).
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Accel {
     /// Pure emulation. Requires QEMU ≥ 9.0 for x2APIC.
@@ -19,11 +14,9 @@ pub(crate) enum Accel {
     Kvm,
 }
 
-/// The host QEMU's `(major, minor)` version, or `None` if it could not be parsed.
 fn qemu_version() -> Option<(u32, u32)> {
     let out = Command::new("qemu-system-x86_64").arg("--version").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    // "QEMU emulator version 9.2.0 (…)" — take the first dotted number.
     let ver = text.split_whitespace().find(|w| w.contains('.') && w.starts_with(|c: char| c.is_ascii_digit()))?;
     let mut parts = ver.split('.');
     let major = parts.next()?.parse().ok()?;
@@ -31,12 +24,8 @@ fn qemu_version() -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// Fail *before* launching if the host cannot give the guest what the kernel requires, so
-/// the operator sees an actionable message instead of a kernel panic from inside QEMU.
-///
-/// This check exists because the failure it replaces was genuinely confusing: a CI runner
-/// with QEMU 8.2 booted to `*** KERNEL PANIC *** CPU lacks x2APIC`, which reads like a
-/// kernel bug and is actually a host-tooling floor.
+/// Fail *before* launching if the host cannot give the guest what the kernel requires: QEMU 8.2
+/// otherwise boots to `CPU lacks x2APIC`, which reads like a kernel bug.
 pub(crate) fn preflight_accel(accel: Accel) -> R<()> {
     match accel {
         Accel::Kvm => {
@@ -64,36 +53,19 @@ pub(crate) fn preflight_accel(accel: Accel) -> R<()> {
     Ok(())
 }
 
-/// QEMU's machine, CPU, memory and firmware — and the screen, which every caller states:
-/// `Some(size)` for a mode of that size, `None` for QEMU's own default (`test-qemu` and
-/// `test-interactive`, so every CI run boots two sizes).
+/// QEMU's machine, CPU, memory and firmware, and the screen: `Some(size)` for a mode of that size,
+/// `None` for QEMU's default (`test-qemu` and `test-interactive`, so CI boots two sizes).
 pub(crate) fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware, accel: Accel, screen: Option<DisplaySize>) -> R<()> {
     if let Some(size) = screen {
         qemu.arg("-vga").arg("none").arg("-device").arg(format!("VGA,xres={},yres={}", size.w, size.h));
     }
     qemu.arg("-M")
         .arg("q35")
-        // CPU model = QEMU's `max`: every feature the emulator can provide,
-        // which is a strict superset of what the kernel requires. The kernel
-        // enables only what it opts into (SMAP/SMEP in `init_protections`;
-        // x87+SSE+AVX in `fpu_init_cpu`'s `XCR0`, never AVX-512 or LA57), so a
-        // richer model changes nothing it doesn't ask for. `max` supplies, in
-        // one word, everything the previous hand-rolled `qemu64,+…` string spelt
-        // out — SMEP/SMAP (user-access protections), the on-chip + x2APIC local
-        // controller, RDRAND/RDSEED (hardware CSPRNG seed), RDTSCP (`current_cpu`
-        // reads `IA32_TSC_AUX`) — **plus** a properly-emulated XSAVE/AVX extended
-        // state. That last point is why we moved off `qemu64`: splicing
-        // `+xsave,+avx` onto the ancient `qemu64` model *hangs* TCG at the
-        // `CR4.OSXSAVE` enable (a QEMU emulation fragility), whereas `max`
-        // emulates the whole XSAVE path and boots clean. The real hardware path
-        // is additionally proven under KVM (`-cpu host`); see the decision log
-        // (2026-07-21 floating-point). x2APIC needs QEMU ≥ 9.0. SMP runs `-smp N`.
+        // CPU model `max`: a superset of what the kernel requires, with a properly-emulated
+        // XSAVE/AVX state. Splicing `+xsave,+avx` onto `qemu64` *hangs* TCG at the `CR4.OSXSAVE`
+        // enable. KVM (`-cpu host`) proves the real hardware path.
         .arg("-m")
         .arg("256M");
-    // `max` (TCG) is every feature the emulator can provide; `host` (KVM) is every
-    // feature the physical CPU has. Both are strict supersets of what the kernel asks
-    // for, and both carry x2APIC — under TCG only from QEMU 9.0, which `preflight_accel`
-    // checks before we get here.
     match accel {
         Accel::Tcg => {
             qemu.arg("-cpu").arg("max");
@@ -102,40 +74,18 @@ pub(crate) fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware, accel: Accel, 
             qemu.arg("-enable-kvm").arg("-cpu").arg("host");
         }
     }
-    // UEFI firmware pflash drive(s) — split CODE+VARS on modern QEMU, or a
-    // single combined image on legacy setups (see `locate_ovmf`).
     for a in firmware_pflash_args(ovmf)? {
         qemu.arg(a);
     }
     Ok(())
 }
 
-/// `cargo xtask qemu` — boot the image in a window, for a person rather than a gate.
-///
-/// ## `--grab`, and why an interactive session needs it
-///
-/// **The guest has a relative pointing device and no absolute one.** A PS/2 mouse reports
-/// *movement*, not position, and there is no USB or virtio input driver here for a tablet
-/// device to talk to — so nothing ever tells the guest where the host's pointer is. The two
-/// cursors are independent: the compositor's starts at the centre of the screen, the host's
-/// starts whereever it was, and the offset between them is permanent. Worse, it cannot be
-/// corrected by pushing into a corner, because the host pointer leaves the window — and stops
-/// generating motion — before the guest's cursor reaches the edge. A person sees "I cannot
-/// reach the left side of the screen", and a scaled window makes it arbitrarily worse.
-///
-/// **And the host desktop keeps `Super` for itself.** Every chord this system binds is
-/// `Super`-something (`Super+A`, `Super+H`, `Super+1`, `Super+Shift+1`, `Super+R`), and GNOME,
-/// KDE and COSMIC all bind `Super` at the compositor. Ungrabbed, those keystrokes are the *host's*,
-/// and the guest is never told they happened.
-///
-/// A grab fixes both: the pointer is confined to the window, so movement keeps arriving and
-/// any edge is reachable, and the keyboard goes to the guest including its modifiers. QEMU's
-/// own binding is `Ctrl-Alt-G`; this flag asks for the grab up front instead.
-///
-/// **On Wayland it also asks GTK for an X11 backend.** A grab is an X server operation, and
-/// under a Wayland session QEMU's GTK window cannot take one — it can only ask the compositor
-/// to inhibit shortcuts, which the compositor may decline. Running the window through XWayland
-/// (`GDK_BACKEND=x11`) gives it the real thing. Nothing else about the guest changes.
+/// `cargo xtask qemu`: boot the image in a window, for a person rather than a gate. **`--grab`**:
+/// the guest has a relative pointing device only, so the host and guest cursors are offset for good
+/// and pushing into a corner cannot fix it; the host desktop also keeps `Super`. A grab confines
+/// the pointer and sends the keyboard to the guest (QEMU's own binding is `Ctrl-Alt-G`). **On
+/// Wayland it asks GTK for an X11 backend** (`GDK_BACKEND=x11`), as QEMU's GTK window cannot grab
+/// there.
 pub(crate) fn cmd_qemu(
     debug: bool,
     mode: BuildMode,
@@ -157,8 +107,7 @@ pub(crate) fn cmd_qemu(
         .arg("-no-shutdown");
     if grab {
         qemu.arg("-display").arg("gtk,grab-on-hover=on");
-        // Only on a Wayland session, and only if XWayland is actually there to talk to: forcing
-        // an X11 backend with no `DISPLAY` would fail to open a window at all.
+        // Only with XWayland there: an X11 backend with no `DISPLAY` opens no window at all.
         let wayland = env::var("XDG_SESSION_TYPE").map(|s| s == "wayland").unwrap_or(false);
         if wayland && env::var("DISPLAY").is_ok() {
             qemu.env("GDK_BACKEND", "x11");
@@ -189,20 +138,14 @@ pub(crate) fn cmd_qemu(
     run(&mut qemu)
 }
 
-/// UEFI firmware for the QEMU pflash. Modern QEMU ships **split** firmware — a
-/// read-only CODE image plus a writable VARS (NVRAM) store — and a CODE-only
-/// pflash will not boot (the firmware needs its variable region). Older setups
-/// shipped a single combined image used as one read-only pflash.
+/// UEFI firmware for the QEMU pflash: modern QEMU ships **split** CODE and VARS images (a CODE-only
+/// pflash will not boot), older setups one combined image.
 pub(crate) enum Firmware {
-    /// Legacy single combined image (e.g. `OVMF.fd`): one read-only pflash.
     Single(PathBuf),
-    /// Split firmware: a read-only CODE image plus a VARS *template* that is
-    /// copied to a writable per-run store before boot.
     Split { code: PathBuf, vars_template: PathBuf },
 }
 
-/// Locate UEFI firmware, preferring the modern split (CODE+VARS) layout that
-/// QEMU bundles under its data dir. `NITROX_OVMF` overrides the CODE/combined
+/// Locate UEFI firmware, preferring the split layout. `NITROX_OVMF` overrides the CODE/combined
 /// image; pair it with `NITROX_OVMF_VARS` to force the split layout.
 pub(crate) fn locate_ovmf() -> R<Firmware> {
     if let Ok(code) = env::var("NITROX_OVMF") {
@@ -217,17 +160,10 @@ pub(crate) fn locate_ovmf() -> R<Firmware> {
             return Ok(Firmware::Single(code));
         }
     }
-    // Split CODE+VARS pairs. QEMU's x86_64 CODE pairs with the (historically
-    // i386-named) VARS template; the `/usr/local` paths are a from-source/tarball
-    // QEMU install's bundled edk2 firmware.
+    // Newest layouts first, so a machine with both prefers a split pair and its writable VARS.
     let split = [
         ("/usr/local/share/qemu/edk2-x86_64-code.fd", "/usr/local/share/qemu/edk2-i386-vars.fd"),
         ("/usr/share/qemu/edk2-x86_64-code.fd", "/usr/share/qemu/edk2-i386-vars.fd"),
-        // Debian/Ubuntu's `ovmf` package has shipped the 4 MB build under these names
-        // since 22.04, and on current releases they are the *only* ones present — the
-        // unsuffixed pair below is older layouts (and the `/usr/share/ovmf/OVMF.fd`
-        // single image at the end is older still). Ordered newest-first so a machine
-        // with both prefers the split pair, which gives a writable VARS store.
         ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
         ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
         ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
@@ -237,7 +173,6 @@ pub(crate) fn locate_ovmf() -> R<Firmware> {
             return Ok(Firmware::Split { code: PathBuf::from(code), vars_template: PathBuf::from(vars) });
         }
     }
-    // Legacy single combined image.
     let single = ["/usr/share/ovmf/OVMF.fd", "/usr/share/qemu/OVMF.fd", "/usr/share/edk2-ovmf/x64/OVMF.fd"];
     for c in single {
         if Path::new(c).exists() {
@@ -249,10 +184,9 @@ pub(crate) fn locate_ovmf() -> R<Firmware> {
         .into())
 }
 
-/// The `-drive if=pflash,…` argument(s) for `firmware`. For split firmware the
-/// read-only VARS template is copied to a fresh writable per-run store under
-/// build-cache (UEFI needs a writable NVRAM region; the shared template is
-/// read-only), emitted as `unit=0` CODE (ro) + `unit=1` VARS (rw).
+/// The `-drive if=pflash,…` argument(s) for `firmware`. UEFI needs a writable NVRAM region, so
+/// split firmware's VARS template is copied to a fresh per-run store: `unit=0` CODE (ro), `unit=1`
+/// VARS (rw).
 fn firmware_pflash_args(firmware: &Firmware) -> R<Vec<String>> {
     match firmware {
         Firmware::Single(code) => {

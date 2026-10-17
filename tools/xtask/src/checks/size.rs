@@ -104,8 +104,8 @@ fn renamed(files: &[(String, usize)], baseline: &Baseline, old: &str, new: &str)
     Ok(out)
 }
 
-/// The lines at the top of a file that any module needs whatever it holds — its doc, `mod` and `use`
-/// lines, attributes and blank lines — which a split does not count against the allowance.
+/// The lines at the top of a file that any module needs whatever it holds — its doc, `mod` and
+/// `use` lines, attributes and blank lines — which a split does not count against the allowance.
 fn leading_overhead(text: &str) -> usize {
     let starts_use = |t: &str| ["use ", "pub use ", "pub(crate) use "].iter().any(|p| t.starts_with(p));
     let mut n = 0;

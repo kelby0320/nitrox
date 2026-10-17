@@ -205,9 +205,9 @@ fn unmoved(diff: &str) -> Vec<String> {
             pairs.push((removed.swap_remove(k), i));
         }
     }
-    // A widened line, or a re-rooted include, splits git's moved block, and a piece of it too short for git to call moved is
-    // left uncoloured: the same lines on both sides, running on from the pair, are that piece. A run
-    // is a hunk's removed lines, or its added ones.
+    // A widened line, or a re-rooted include, splits git's moved block, and a piece of it too
+    // short for git to call moved is left uncoloured: the same lines on both sides, running on
+    // from the pair, are that piece. A run is a hunk's removed lines, or its added ones.
     let mut runs: Vec<Vec<usize>> = Vec::new();
     let mut place = vec![(0, 0); lines.len()];
     for (i, l) in lines.iter().enumerate() {

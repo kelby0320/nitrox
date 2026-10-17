@@ -2,34 +2,24 @@
 
 use crate::*;
 
-/// The FAT stick `check-media` plugs in: its label, and so the name it is mounted under.
 const MEDIA_LABEL: &str = "NXMEDIA";
 
-/// What `check-media` types into the editor, and what the host then reads off the stick.
 const MEDIA_TEXT: &str = "saved onto a stick from nxedit";
 
-/// The name it is saved under, at the stick's root.
 const MEDIA_FILE: &str = "from-nitrox.txt";
 
-/// `cargo xtask check-media` — **removable media in a session** (Phase 6 Part F), on the desktop a
-/// person uses: the **release** live image as the boot stick, beside a copy of the release disk,
-/// logged in at the graphical greeter.
+/// `cargo xtask check-media` — removable media in a session, on the desktop a person uses: the
+/// release live image as the boot stick, beside a copy of the release disk, logged in at the
+/// graphical greeter.
 ///
-/// 1. **Files at Home**: Drives lists the internal disk's `nitrox-root`, mounted read-only on a
-///    live boot, with **no eject button**.
-/// 2. **A FAT stick plugged in** over QMP, and **nothing typed or moved after it**: auto-mounted
-///    writable, and its row with an eject button appears in Files' sidebar — read off screendumps
-///    until it is drawn. Any input would wake Files on its compositor channel and draw the row
-///    whether the watch had woken it or not (PR #366 review).
-/// 3. **Saved from the editor**: text typed, Save As, the chooser's Up to `/` — aimed at where
-///    `libui` lays the button out for the theme the image stages — and `storage/<stick>/<file>`
-///    named in its field, which is joined to `/`.
-/// 4. **Ejected from Files**: a click on the stick's eject button. The chain records the
-///    filesystem clean with no password asked, the row goes, and the stick is pulled.
-/// 5. **On the host**: `fsck.fat -n` clean, and `mtype` reads back what was typed.
-///
-/// **It asserts effects**, not Files' own account of itself: the row on the screen at step 2,
-/// and at step 4 an eject that happens only if the button was drawn where the gate aims.
+/// Files at Home lists the internal disk's `nitrox-root` (read-only, no eject button). A FAT stick
+/// is plugged in over QMP with nothing typed or moved after it, and its row with an eject button
+/// must appear, read off screendumps (any input would wake Files and draw the row whether the watch
+/// had woken it or not). A file is saved to it from the editor through Save As, the chooser's Up
+/// aimed at where `libui` lays it out for the staged theme; ejecting by a click on the button
+/// records the filesystem clean with no password asked, and the host finds it `fsck.fat -n` clean
+/// with `mtype` reading back the text. It asserts effects, not Files' account of itself: an eject
+/// happens only if the button was drawn where the gate aims.
 pub(crate) fn cmd_check_media(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     require_tool("fsck.fat")?;
@@ -108,9 +98,9 @@ pub(crate) fn cmd_check_media(accel: Accel, size: DisplaySize) -> R<()> {
     Ok(())
 }
 
-/// **The stick `check-media` plugs in**: a FAT32 partition behind an MBR, as one is sold, labelled
-/// [`MEDIA_LABEL`] and empty. 300 MiB is what FAT32 by count needs at 4 KiB clusters, the smallest
-/// `fs-server-fat` serves; the file is sparse.
+/// The stick `check-media` plugs in: a FAT32 partition behind an MBR, labelled [`MEDIA_LABEL`] and
+/// empty. 300 MiB is what FAT32 by count needs at 4 KiB clusters, the smallest `fs-server-fat`
+/// serves; the file is sparse.
 fn media_stick(path: &Path) -> R<()> {
     const MIB: u64 = 1024 * 1024;
     let _ = fs::remove_file(path);
@@ -132,8 +122,8 @@ fn media_stick(path: &Path) -> R<()> {
     Ok(())
 }
 
-/// **How much is drawn in a rectangle of a screendump**: the pixels differing from its top-left
-/// one by more than the faintest edge of anti-aliased text. Glyph ink against a flat ground.
+/// How much is drawn in a rectangle of a screendump: the pixels differing from its top-left one by
+/// more than the faintest edge of anti-aliased text. Glyph ink against a flat ground.
 fn ink_in(dump: &(u32, u32, Vec<u8>), x: i32, y: i32, w: i32, h: i32) -> usize {
     let (dw, dh, rgb) = dump;
     let px = |x: i32, y: i32| {
@@ -155,7 +145,6 @@ fn ink_in(dump: &(u32, u32, Vec<u8>), x: i32, y: i32, w: i32, h: i32) -> usize {
     n
 }
 
-/// The steps; see [`cmd_check_media`].
 fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, size: DisplaySize) -> R<()> {
     let secs = std::time::Duration::from_secs;
     let any = |_: &str| true;
@@ -176,7 +165,6 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
         parse_placement(&placed).ok_or_else(|| format!("could not read {program}'s placement from {placed:?}").into())
     };
 
-    // 1. **Log in, and Files at Home**, with the internal disk in Drives and no eject button on it.
     s.expect("desktop-session-mgr: greeter presented")?;
     logout_gate_login(qmp, s, size)?;
     let (files_id, fx, fy) = launch(qmp, s, "nxfiles")?;
@@ -204,7 +192,6 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     }
     println!("  ok: Files lists the internal disk in Drives, with no eject button");
 
-    // 2. **The stick, plugged in with nothing typed after it**: its row read off the screen.
     qmp.execute(&format!(
         r#"{{"execute":"blockdev-add","arguments":{{"driver":"raw","node-name":"media","file":{{"driver":"file","filename":"{}"}}}}}}"#,
         stick.display()
@@ -213,8 +200,7 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     qmp.execute(
         r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"media","bus":"xhci.0","drive":"media"}}"#,
     )?;
-    // **No "left clean" on a writable mount's line**, which says nothing of how it was found: the
-    // mount has marked it in use (`storage.md` §9).
+    // No "left clean" on a writable mount's line: the mount has marked it in use.
     s.line_since(from, &format!("fat '{MEDIA_LABEL}'; mounted at /storage/{MEDIA_LABEL} (rw)"), any, secs(60))?;
     let deadline = std::time::Instant::now() + secs(30);
     loop {
@@ -236,7 +222,6 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     }
     println!("  ok: the stick mounted writable, and its row and eject button appeared with no input");
 
-    // 3. **Saved from the editor**, through Save As.
     launch(qmp, s, "nxedit")?;
     let _ = settle_and_capture(qmp, &dump_at)?;
     for (i, c) in MEDIA_TEXT.chars().enumerate() {
@@ -302,7 +287,6 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     let _ = settle_and_capture(qmp, &dump_at)?;
     println!("  ok: the editor saved onto the stick through Save As: Up to /, then storage/{MEDIA_LABEL}");
 
-    // 4. **Ejected from Files**, by its button: the chain, and no password.
     let from = s.transcript().len();
     let pressed = click_at(qmp, s, side_x + browser::SIDEBAR_W - button_w / 2, drive_top(1) + browser::ROW_H / 2)?;
     if !pressed.contains(&format!("win={files_id}")) {
@@ -331,8 +315,8 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     Ok(())
 }
 
-/// **Where the chooser's Up button is**, inside a chooser window `w`×`h`: laid out by `libui`, as the
-/// editor lays it out, with the theme the image stages — whose `font_px` sizes the title above it.
+/// Where the chooser's Up button is, inside a chooser window `w`×`h`: laid out by `libui` as the
+/// editor lays it out, with the theme the image stages, whose `font_px` sizes the title above it.
 pub(crate) fn chooser_up_at(w: u32, h: u32) -> R<(i32, i32)> {
     let (theme, _) = staged_theme()?;
     if (w, h) != (libui::chooser::CHOOSER_W, libui::chooser::CHOOSER_H) {

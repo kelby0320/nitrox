@@ -2,14 +2,11 @@
 
 use crate::*;
 
-/// The size of the screen QEMU gives the guest (Phase 5 Part E).
-///
-/// **QEMU's EDID prefers the mode, and nothing in the image changes**: `-vga none -device
-/// VGA,xres=…,yres=…` makes OVMF add the mode and boot into it, and Limine hands it over. What
-/// QEMU cannot show is a width that is not a multiple of 8 — its standard VGA rounds `XRES` down
-/// while OVMF's GOP reports the width it asked for, so the guest draws rows QEMU scans out
-/// shorter and the picture shears — which is why the laptop's 1366 is refused here, and why the
-/// gates boot [`DisplaySize::GATE`].
+/// The size of the screen QEMU gives the guest. **QEMU's EDID prefers the mode**: `-vga none
+/// -device VGA,xres=…,yres=…` makes OVMF add the mode and boot into it. **A width that is not a
+/// multiple of 8 shears**: QEMU's standard VGA rounds `XRES` down while OVMF's GOP reports the
+/// width asked for, which is why the laptop's 1366 is refused and the gates boot
+/// [`DisplaySize::GATE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DisplaySize {
     pub(crate) w: u32,
@@ -17,48 +14,31 @@ pub(crate) struct DisplaySize {
 }
 
 impl DisplaySize {
-    /// The laptop's screen as near as QEMU shows it: its 768 rows and its 170×48 console, six
-    /// pixels narrower. Every gate that boots a screen boots this unless told otherwise.
+    /// The laptop's screen as near as QEMU shows it (768 rows, a 170×48 console).
     pub(crate) const GATE: DisplaySize = DisplaySize { w: 1360, h: 768 };
 
-    /// The height of the shell's bars — `desktop_shell::BAR_H`, **written down a second time on
-    /// purpose**: a gate that read the shell's layout to know where to aim could agree with a shell
-    /// that had stopped drawing where it says (M11 decision 2). 30 since the desktop refresh's
-    /// Part C, which took the design's bars; it was 24.
+    /// The height of the shell's bars: `desktop_shell::BAR_H`, **written down a second time on
+    /// purpose**, so a gate cannot agree with a shell that stopped drawing where it says.
     pub(crate) const BAR_H: i32 = 30;
-    /// Where the bottom bar's first task button starts, how wide one is, and the step from one to
-    /// the next — `desktop_shell::panel::TASKS_X`, `TASK_W` and `TASK_PITCH`, for the same reason.
-    /// The show-desktop button and the rule before them are what the 48 pixels are (desktop
-    /// refresh, Part C).
+    /// Where the bottom bar's first task button starts, how wide one is, and the step to the next
+    /// (`desktop_shell::panel::TASKS_X`, `TASK_W`, `TASK_PITCH`); the 48 pixels are the
+    /// show-desktop button and its rule.
     const TASKS_X: i32 = 48;
-    /// See [`TASKS_X`](Self::TASKS_X).
     const TASK_W: i32 = 186;
-    /// See [`TASKS_X`](Self::TASKS_X).
     const TASK_PITCH: i32 = 190;
-    /// The show-desktop button's middle, from the left edge.
     const SHOW_DESKTOP_X: i32 = 20;
-    /// The desktop's name at the switcher's right-hand end, from the screen's right edge. The
-    /// switcher is anchored there and the name is its last part, so this is inside the name for
-    /// any name of two characters or more — which `panel`'s own test pins, at five widths and
-    /// four names.
+    /// The desktop's name at the switcher's right-hand end, from the screen's right edge: inside
+    /// the name for any name of two characters or more (pinned by `panel`'s own test).
     const NAME_FROM_RIGHT: i32 = 30;
-    /// The overview card's width, as a fraction of the screen — `desktop_shell::CARD_W_NUM` over
-    /// `CARD_W_DEN`, for the same reason. **The gate keeps its own copy** (M11 decision 2): a
-    /// gate that read the shell's layout to know where to aim could agree with a shell that had
-    /// stopped drawing where it says. `the_gates_card_metrics_are_the_shells` compares these
-    /// against the shell's source, which is the half that keeps a copy honest.
+    /// The overview card's width as a fraction of the screen (`desktop_shell::CARD_W_NUM` over
+    /// `CARD_W_DEN`): the gate's own copy, kept honest by `the_gates_card_metrics_are_the_shells`.
     pub(crate) const CARD_W_NUM: i32 = 330;
-    /// See [`CARD_W_NUM`](Self::CARD_W_NUM).
     pub(crate) const CARD_W_DEN: i32 = 1440;
     /// A card's border, its gap to the next, and the gap and height of its caption.
     pub(crate) const CARD_BORDER: i32 = 2;
-    /// See [`CARD_BORDER`](Self::CARD_BORDER).
     pub(crate) const CARD_GAP: i32 = 24;
-    /// See [`CARD_BORDER`](Self::CARD_BORDER).
     pub(crate) const CARD_CAPTION_GAP: i32 = 9;
-    /// See [`CARD_BORDER`](Self::CARD_BORDER).
     pub(crate) const CARD_CAPTION_H: i32 = 18;
-    /// The clear space either side of the block of cards.
     pub(crate) const CARD_SIDE_PAD: i32 = 40;
 
     /// Parse `WxH`, refusing a size QEMU cannot show or a guest cannot use.
@@ -82,12 +62,10 @@ impl DisplaySize {
         Ok(DisplaySize { w, h })
     }
 
-    /// The pixel the pointer pins to when it is driven into the bottom-right clamp.
     pub(crate) fn corner(self) -> (i32, i32) {
         (self.w as i32 - 1, self.h as i32 - 1)
     }
 
-    /// The middle of the screen.
     pub(crate) fn centre(self) -> (i32, i32) {
         (self.w as i32 / 2, self.h as i32 / 2)
     }
@@ -97,33 +75,27 @@ impl DisplaySize {
         self.h as i32 - Self::BAR_H
     }
 
-    /// A y halfway down the bottom bar, where a click on it is aimed.
     pub(crate) fn bottom_bar_click_y(self) -> i32 {
         self.bottom_bar_y() + Self::BAR_H / 2
     }
 
-    /// The desktop's name on the bottom bar, which opens the overview — the indicator's job
-    /// before the desktop refresh's Part C gave the switcher its place.
+    /// The desktop's name on the bottom bar, which opens the overview.
     pub(crate) fn desktop_name_click(self) -> (i32, i32) {
         (self.w as i32 - Self::NAME_FROM_RIGHT, self.bottom_bar_click_y())
     }
 
-    /// The middle of the task button in `slot`, counted from the left.
     pub(crate) fn task_click(self, slot: usize) -> (i32, i32) {
         (Self::TASKS_X + Self::TASK_PITCH * slot as i32 + Self::TASK_W / 2, self.bottom_bar_click_y())
     }
 
-    /// The show-desktop button.
     pub(crate) fn show_desktop_click(self) -> (i32, i32) {
         (Self::SHOW_DESKTOP_X, self.bottom_bar_click_y())
     }
 
-    /// One overview card's width, border included.
     pub(crate) fn card_w(self) -> i32 {
         (self.w as i32 * Self::CARD_W_NUM / Self::CARD_W_DEN).max(Self::CARD_BORDER * 2 + 2)
     }
 
-    /// `n` screen pixels at a card's scale.
     fn scaled_to_card(self, n: i32) -> i32 {
         n * (self.card_w() - Self::CARD_BORDER * 2) / self.w.max(1) as i32
     }
@@ -133,21 +105,17 @@ impl DisplaySize {
         self.scaled_to_card(Self::BAR_H) + self.scaled_to_card(self.h as i32 - Self::BAR_H) + Self::CARD_BORDER * 2
     }
 
-    /// A whole card: its box, the gap, and the caption beneath.
     fn card_total_h(self) -> i32 {
         self.card_h() + Self::CARD_CAPTION_GAP + Self::CARD_CAPTION_H
     }
 
-    /// How many cards fit across.
     pub(crate) fn card_cols(self) -> i32 {
         let avail = self.w as i32 - Self::CARD_SIDE_PAD * 2;
         ((avail + Self::CARD_GAP) / (self.card_w() + Self::CARD_GAP)).max(1)
     }
 
-    /// The top-left of card `i` of `n` in the overview — its miniature box.
-    ///
-    /// The shell's `card_rect`, recomputed here. Centred both ways, each row centred on its own,
-    /// and the block sitting between the two bars.
+    /// The top-left of card `i` of `n` in the overview (the shell's `card_rect`, recomputed):
+    /// centred both ways, between the two bars.
     fn card_origin(self, i: i32, n: i32) -> (i32, i32) {
         let (cols, cw) = (self.card_cols(), self.card_w());
         let (row, col) = (i / cols, i % cols);
@@ -162,18 +130,15 @@ impl DisplaySize {
         (x, y)
     }
 
-    /// A point inside card `i` of `n`, clear of its border and of any window drawn in it —
-    /// the bottom-left of its miniature box, where the placement cascade never reaches.
+    /// A point inside card `i` of `n`, clear of its border and of any window: the bottom-left of
+    /// its box.
     pub(crate) fn card_click(self, i: i32, n: i32) -> (i32, i32) {
         let (x, y) = self.card_origin(i, n);
         (x + Self::CARD_BORDER + 6, y + self.card_h() - Self::CARD_BORDER - 6)
     }
 
-    /// The middle of the box a window at `(wx, wy)` sized `(ww, wh)` is drawn in, inside card
-    /// `i` of `n` — where a press that picks that window up has to land.
-    ///
-    /// The shell's `window_box`, recomputed here: the screen's geometry at the card's scale,
-    /// with the top bar as a strip so a window at the top of the screen starts below it.
+    /// The middle of the box a window at `(wx, wy)` sized `(ww, wh)` is drawn in, inside card `i`
+    /// of `n` (the shell's `window_box`, recomputed), where a press that picks it up lands.
     pub(crate) fn window_in_card(self, i: i32, n: i32, w: (i32, i32, u32, u32)) -> (i32, i32) {
         let (cx, cy) = self.card_origin(i, n);
         let sx = self.scaled_to_card(w.0.max(0));
@@ -183,11 +148,9 @@ impl DisplaySize {
         (cx + Self::CARD_BORDER + sx + sw / 2, cy + Self::CARD_BORDER + sy + sh / 2)
     }
 
-    /// How many `(100, 100)` motions pin the pointer into the bottom-right corner from anywhere on
-    /// the screen: its longer side over-driven, and never fewer than the twenty the gates used at
-    /// 1280×800. Twenty was 2000 px of travel, which does not cross a 2560-wide screen — the first
-    /// `check-resolutions` run pinned "to (2559, 1439)" from wherever the pointer was, and every
-    /// click after it landed short (Phase 5 Part E.4).
+    /// How many `(100, 100)` motions pin the pointer into the bottom-right corner from anywhere:
+    /// the longer side over-driven, never fewer than twenty. Twenty (2000 px) does not cross a
+    /// 2560-wide screen.
     pub(crate) fn pin_motions(self) -> usize {
         (self.w.max(self.h) as usize / 100 + 2).max(20)
     }
@@ -201,13 +164,11 @@ impl std::fmt::Display for DisplaySize {
 
 /// One screendump, read as the kernel console would have drawn it.
 pub(crate) struct Frame {
-    /// Per row: its text when every cell is exactly one glyph in ink on paper, trailing blanks
-    /// trimmed; `None` otherwise.
+    /// Per row: its text when every cell is one glyph in ink on paper, trailing blanks trimmed.
     pub(crate) rows: Vec<Option<String>>,
-    /// Cells anywhere that read as a glyph other than a blank — the measure of "console text on
-    /// the screen", which a row-level test would miss when a stray paint covers part of a row.
+    /// Cells anywhere that read as a glyph other than a blank: a stray paint can cover part of a
+    /// row.
     pub(crate) text_cells: usize,
-    /// A few of those cells' characters, for a failure message.
     sample: String,
 }
 
@@ -230,8 +191,8 @@ impl Frame {
                     for x in 0..cw {
                         let i = ((row * ch + y) * w + col * cw + x) * 3;
                         let px = [rgb[i], rgb[i + 1], rgb[i + 2]];
-                        // At scale > 1, a glyph pixel is a block, and it reads as one only if the
-                        // whole block is one colour — OR-ing it would pass a quarter-painted cell.
+                        // At scale > 1 a glyph pixel is a block, read as one only if the whole
+                        // block is one colour: OR-ing it would pass a quarter-painted cell.
                         let b = ((row * ch + y / g.scale * g.scale) * w + col * cw + x / g.scale * g.scale) * 3;
                         if px != [rgb[b], rgb[b + 1], rgb[b + 2]] {
                             clean = false;
@@ -266,18 +227,15 @@ impl Frame {
         frame
     }
 
-    /// Whether the whole screen is console: every row decodes.
     pub(crate) fn is_console(&self) -> bool {
         !self.rows.is_empty() && self.rows.iter().all(Option::is_some)
     }
 
-    /// Whether every one of `wanted` is a row of this frame.
     pub(crate) fn has_all(&self, wanted: &[&str]) -> bool {
         let lines = self.lines();
         wanted.iter().all(|w| lines.contains(w))
     }
 
-    /// The rows that decode, as text.
     pub(crate) fn lines(&self) -> Vec<&str> {
         self.rows.iter().flatten().map(String::as_str).collect()
     }
@@ -287,19 +245,15 @@ impl Frame {
     }
 }
 
-/// How many screendumps the display gate takes waiting for two in a row to match, and how
-/// long it waits between them. ~3s of budget, against a repaint measured in tens of ms.
+/// How many screendumps the display gate takes waiting for two in a row to match, and the wait
+/// between them (~3 s, against a repaint of tens of ms).
 const SCREEN_SETTLE_TRIES: usize = 12;
 
-/// See [`SCREEN_SETTLE_TRIES`].
 const SCREEN_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Screendump until two consecutive captures are identical, and return the settled bytes.
-///
-/// **Two identical dumps, not a sleep.** A fixed delay is a guess that either wastes time or is
-/// too short on a loaded machine, and silently becomes too short again the next time the scene
-/// grows. This waits for the property a comparison actually needs — and it cannot pass a screen
-/// that is wrong but stable, because the comparison still runs afterwards.
+/// Screendump until two consecutive captures are identical. **Two identical dumps, not a sleep**: a
+/// fixed delay is a guess that goes stale as the scene grows, and a stable but wrong screen still
+/// fails the comparison afterwards.
 pub(crate) fn settle_and_capture(qmp: &mut Qmp, shot: &Path) -> R<Vec<u8>> {
     let mut prev: Option<Vec<u8>> = None;
     for _ in 0..SCREEN_SETTLE_TRIES {
@@ -318,13 +272,9 @@ pub(crate) fn settle_and_capture(qmp: &mut Qmp, shot: &Path) -> R<Vec<u8>> {
     .into())
 }
 
-/// Parse a binary PPM (P6) into `(width, height, rgb_bytes)`.
-///
-/// QEMU writes exactly this format, and it is what `libdraw::ppm` emits, so the two ends
-/// of the gate speak the same thing. Hand-rolled because it is a header and raw bytes.
+/// Parse a binary PPM (P6) into `(width, height, rgb_bytes)`: QEMU writes it, as does
+/// `libdraw::ppm`.
 pub(crate) fn parse_ppm(data: &[u8]) -> R<(u32, u32, Vec<u8>)> {
-    // Header fields are whitespace-separated ASCII: "P6", width, height, maxval, then a
-    // single whitespace byte and the body.
     let mut fields: Vec<String> = Vec::new();
     let mut i = 0usize;
     while fields.len() < 4 && i < data.len() {

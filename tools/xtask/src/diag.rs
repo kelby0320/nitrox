@@ -10,10 +10,6 @@ pub(crate) struct ElfSym {
 }
 
 /// Read the `STT_FUNC` symbols out of an ELF64 file, sorted by address.
-///
-/// Hand-rolled rather than shelling out to `nm`/`addr2line`: those are another tool
-/// requirement on every machine that runs the tests, for sixty lines of well-specified
-/// header walking.
 pub(crate) fn elf_function_symbols(path: &Path) -> R<Vec<ElfSym>> {
     let b = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let u16at = |o: usize| -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) };
@@ -71,10 +67,8 @@ pub(crate) fn elf_function_symbols(path: &Path) -> R<Vec<ElfSym>> {
 
 /// Undo rustc's legacy `_ZN…E` name mangling, enough to read a backtrace.
 ///
-/// `_ZN13nitrox_kernel5sched9idle_body17h08d8…E` → `nitrox_kernel::sched::idle_body`. Not a
-/// general Itanium demangler — just the length-prefixed component form rustc emits, with the
-/// trailing hash and any LLVM suffix dropped. Unrecognised names come back unchanged, which
-/// is strictly better than the alternative of not printing them.
+/// `_ZN13nitrox_kernel5sched9idle_body17h08d8…E` → `nitrox_kernel::sched::idle_body`. Only the
+/// length-prefixed form rustc emits; unrecognised names come back unchanged.
 pub(crate) fn demangle(name: &str) -> String {
     let Some(rest) = name.strip_prefix("_ZN") else { return name.to_string() };
     let rest = rest.split(".llvm.").next().unwrap_or(rest);
@@ -98,7 +92,6 @@ pub(crate) fn demangle(name: &str) -> String {
         }
         let part = &rest[i..i + len];
         i += len;
-        // The final `17h<16 hex>` component is the disambiguating hash, not a path element.
         if !(part.len() == 17 && part.starts_with('h') && part[1..].bytes().all(|c| c.is_ascii_hexdigit())) {
             parts.push(part.to_string());
         }
@@ -108,15 +101,13 @@ pub(crate) fn demangle(name: &str) -> String {
 
 /// Name the function containing `addr`, if any.
 ///
-/// Several symbols can share one address — aliased generic instantiations, say — and this
-/// returns an arbitrary one of the group. Read a resolved name as "this address is in this
-/// function's code", not as a unique identification.
+/// Several symbols can share one address, and this returns an arbitrary one of the group: read a
+/// name as "this address is in this function's code".
 pub(crate) fn resolve_symbol(syms: &[ElfSym], addr: u64) -> Option<String> {
     let i = syms.partition_point(|s| s.addr <= addr).checked_sub(1)?;
     let s = &syms[i];
-    // A zero-size symbol still names its entry point; otherwise require containment so a
-    // wildly wrong address is reported as unknown rather than attributed to the last
-    // function before it.
+    // A zero-size symbol still names its entry point; otherwise require containment, so a wild
+    // address is unknown rather than the last function before it.
     if s.size == 0 || addr < s.addr + s.size {
         Some(format!("{}+{:#x}", demangle(&s.name), addr - s.addr))
     } else {
@@ -124,13 +115,8 @@ pub(crate) fn resolve_symbol(syms: &[ElfSym], addr: u64) -> Option<String> {
     }
 }
 
-/// Walk a stack, printing every word that resolves to a kernel function.
-///
-/// A real unwinder needs frame pointers or DWARF; this is the cheap approximation that
-/// works on an optimised kernel: read raw stack words and keep the ones that land inside a
-/// known function. It over-reports (stale return addresses linger below the stack pointer)
-/// and that is fine — the question it answers is *"is this CPU inside this function
-/// twice?"*, which a few spurious frames cannot fake.
+/// Walk a stack, printing every word that resolves to a kernel function: no unwinder, so it
+/// over-reports stale return addresses, which cannot fake *"is this CPU in this function twice?"*.
 fn stack_trace(qmp: &mut Qmp, syms: &[ElfSym], cpu: usize, rsp: u64, depth: usize) {
     if syms.is_empty() || rsp == 0 {
         return;
@@ -141,7 +127,6 @@ fn stack_trace(qmp: &mut Qmp, syms: &[ElfSym], cpu: usize, rsp: u64, depth: usiz
     let Ok(text) = qmp.hmp(&format!("x/{depth}gx {rsp:#x}")) else { return };
     let mut shown = 0usize;
     for line in text.lines() {
-        // `addr: 0xword 0xword`
         let Some((_, words)) = line.split_once(':') else { continue };
         for w in words.split_whitespace() {
             let Some(hex) = w.strip_prefix("0x") else { continue };
@@ -159,17 +144,13 @@ fn stack_trace(qmp: &mut Qmp, syms: &[ElfSym], cpu: usize, rsp: u64, depth: usiz
 
 /// Dump what the guest was doing when it stopped answering.
 ///
-/// The discriminator this exists for: **are all vCPUs halted, or is one spinning?** Every
-/// CPU parked in the idle loop means nothing is runnable — a lost wake, where somebody is
-/// blocked on a completion that was signalled to no one. A CPU spinning in a lock is the
-/// opposite problem. A bare 90-second timeout cannot tell those apart, and the whole cost
-/// of chasing the `test-qemu` flake so far has been that ambiguity.
+/// The discriminator: **are all vCPUs halted, or is one spinning?** Every CPU in the idle loop
+/// is a lost wake; a CPU spinning in a lock is the opposite problem, and a bare timeout cannot
+/// tell them apart.
 pub(crate) fn dump_guest_state(qmp: &mut Qmp) {
     println!("\n─── guest state at timeout ───");
-    // **Stop the guest first.** Without this the vCPUs keep executing between queries, so
-    // the RIP summary, the stack walk and the full register block are three snapshots of
-    // three different moments — and they visibly disagreed when this was first written.
-    // The run is over either way; a stopped guest is the only coherent one.
+    // Stop the guest first, or the RIP summary, the stack walk and the register block are
+    // snapshots of different moments.
     if let Err(e) = qmp.execute(r#"{"execute":"stop"}"#) {
         println!("  (could not pause the guest, readings may be inconsistent: {e})");
     }
@@ -205,7 +186,6 @@ pub(crate) fn dump_guest_state(qmp: &mut Qmp) {
                 if let Some(rest) = line.trim().strip_prefix("CPU#") {
                     cpu = rest.trim().parse().unwrap_or(cpu);
                 }
-                // The monitor prints `RIP=<hex>` on the register dump's second line.
                 if let Some(pos) = line.find("RIP=") {
                     let hex: String = line[pos + 4..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
                     if let Ok(rip) = u64::from_str_radix(&hex, 16) {
@@ -221,10 +201,8 @@ pub(crate) fn dump_guest_state(qmp: &mut Qmp) {
                     }
                 }
             }
-            // The two questions the summary above cannot answer: are the spinning CPUs
-            // waiting on the *same* lock (RBX carries the `&SlabCache` receiver), and is
-            // either of them already inside that function further down its own stack —
-            // which is what re-entrancy looks like.
+            // Are the spinning CPUs waiting on the *same* lock (RBX carries the `&SlabCache`
+            // receiver), and is either already inside that function further down its stack?
             for &(cpu, _rip, rbx, rsp) in &cpu_state {
                 println!("\n  CPU#{cpu}  RBX={rbx:#018x}  RSP={rsp:#018x}  stack:");
                 stack_trace(qmp, &syms, cpu, rsp, 48);
@@ -240,10 +218,8 @@ pub(crate) fn dump_guest_state(qmp: &mut Qmp) {
         }
         Err(e) => println!("  (info cpus failed: {e})"),
     }
-    // The full register block too, verbose but only on a failure. The summary above says
-    // *where* each CPU is; this says *what it is working on* — and for a spin inside a
-    // lock acquire, the lock's address is in a register, which is the only way to tell one
-    // CPU waiting on another from two CPUs waiting on nothing.
+    // The full register block: for a spin inside a lock acquire, the lock's address is in a
+    // register.
     if let Ok(text) = qmp.hmp("info registers -a") {
         println!("\n  --- full registers ---");
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -255,12 +231,9 @@ pub(crate) fn dump_guest_state(qmp: &mut Qmp) {
 
 /// Which of `sent` — the lines typed since the last match — would satisfy `pat` by echo alone.
 ///
-/// **A free function so it can be table-tested.** Inline in [`Session::expect`] the only thing
-/// proving it worked would be a manual mutation of the gate, which is the situation this guard
-/// exists to argue against; the same reasoning is written out at
-/// [`scope_binding`]. The live risk is not the predicate's logic but its inputs: `sent` is
-/// appended to in two places, and a later `send_line`-style wrapper that forgets to do so
-/// disarms the guard for those steps while every gate stays green.
+/// **A free function so it can be table-tested.** The live risk is its inputs: `sent` is
+/// appended to in two places, and a wrapper that forgets to do so disarms the guard while every
+/// gate stays green.
 pub(crate) fn echo_source<'a>(sent: &'a [String], pat: &str) -> Option<&'a str> {
     if pat.is_empty() {
         return None;

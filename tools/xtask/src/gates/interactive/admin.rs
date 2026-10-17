@@ -6,20 +6,14 @@ use crate::*;
 /// an account's life. The number of steps it ran.
 pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     let mut steps = 0usize;
-    // 20b. **`with`: a program in a view** (administration Part A). Everything a person does with
-    //      it, at the real prompt, in the order that makes each claim depend on the last.
-    //
-    //      (a) **Without `with`, no disks** — `nxinstall`'s own answer when its session holds none.
-    //          The baseline the grant is measured against: the same program, a moment later, sees
-    //          them only because the broker bound them.
+    // 20b. **`with`: a program in a view**, at the real prompt, each claim depending on the last.
+    //      (a) **Without `with`, no disks**: `nxinstall`'s own answer when its session holds
+    //          none, the baseline the grant is measured against.
     s.send("nxinstall")?;
-    // "in this view" since administration Part G.2, which also says how to get the disks: the
-    // grant, through `with admin`.
     s.expect("no block devices in this view")?;
     s.expect("/home>")?;
-    //      (b) **Refused by the policy, and nothing asked.** `install` lets alice run `nxinstall`
-    //          and nothing else; a request for `nxsh` there is refused before any password, and
-    //          the refusal says which half — the view or the program — was the problem.
+    //      (b) **Refused by the policy, and nothing asked.** `install` lets alice run only
+    //          `nxinstall`; `nxsh` is refused before any password, naming which half was wrong.
     s.send("with install nxsh")?;
     s.expect("`install` does not let alice run `nxsh`")?;
     s.expect("/home>")?;
@@ -30,12 +24,9 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     //      (d) **A wrong password, then the right one — held for the session's delay — and the
     //          grant arrived.** The right password is typed the moment the second prompt appears;
     //          the broker holds its check until two seconds after the failure, so the listing
-    //          cannot come sooner. And the listing names the ESP, `/dev/blk/1`, which (a) could not.
-    //
-    //          **And what the grant leaves out** (administration Part C.6): the broker asks the
-    //          storage service what is in use first, and `/dev/blk/0` holds `init`'s root, so the
-    //          listing never names it. Until C.6 this step expected `/dev/blk/0` — the disk under
-    //          a live server, handed over raw.
+    //          cannot come sooner. It names the ESP, `/dev/blk/1`, which (a) could not.
+    //          **And what the grant leaves out**: `/dev/blk/0` holds `init`'s root, which the
+    //          broker asks the storage service about first, so the listing never names it.
     const WRONG: &str = WITH_WRONG_PASSWORD;
     s.send("with admin nxinstall")?;
     s.expect("[with admin] password (1 of 3): ")?;
@@ -56,11 +47,10 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     }
     s.expect("/home>")?;
     let listing = s.transcript()[listing_from..].to_string();
-    // **Never a row, and the disk named as what it is** (administration Part G.2). Since G.2 the
-    // installer says, on `stderr`, why a disk it cannot have is missing — and the serial terminal
-    // shows `stderr` beside the table. So the claim is now per line: a line naming a withheld
-    // device must be that message, and `/dev/blk/0`'s must be there, saying it holds the running
-    // system. The root partition, `/dev/blk/2`, is never named at all: the message is per disk.
+    // **Never a row, and the disk named as what it is.** The installer says, on `stderr`, why a
+    // disk it cannot have is missing, and the serial terminal shows `stderr` beside the table, so
+    // the claim is per line: a line naming a withheld device must be that message, and
+    // `/dev/blk/0`'s must be there. The root partition, `/dev/blk/2`, is never named at all.
     for withheld in ["/dev/blk/0", "/dev/blk/2"] {
         if let Some(row) = listing.lines().find(|l| l.contains(withheld) && !l.contains("holds the running system")) {
             return Err(format!(
@@ -75,13 +65,12 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
             format!("`with admin nxinstall` did not say /dev/blk/0 holds the running system: {listing:?}").into()
         );
     }
-    //          **And it said so on the terminal, not on the kernel log.** On this serial console the
-    //          two look alike: a program with no `stderr` writes to `kprint`, which is COM1 too, so
-    //          the line above passed while every program `with` ran had none — and on the laptop,
-    //          whose kernel log nobody sees once the desktop is up, the installer printed nothing
-    //          after the password (2026-09-30). What tells them apart is the shell: it paints each
-    //          error and warning it drains, and `kprint` paints nothing. **A warning's colour** since
-    //          the laptop polish's Part E: the disk is not offered, and that is not a failure.
+    //          **And it said so on the terminal, not on the kernel log.** On this serial
+    //          console the two look alike: a program with no `stderr` writes to `kprint`, which
+    //          is COM1 too, so the line above passed while every program `with` ran had none.
+    //          What tells them apart is the shell: it paints each error and warning it drains,
+    //          and `kprint` paints nothing. **A warning's colour**: the disk is not offered, and
+    //          that is not a failure.
     if !listing.contains("\x1b[93m/dev/blk/0 (") {
         return Err(format!(
             "`with admin nxinstall`'s message about /dev/blk/0 is not in the warning colour: \
@@ -92,11 +81,10 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
         .into());
     }
     println!("  ok: and a program in a view reaches the terminal through its `stderr`");
-    //      (d2) **Remembered, for five minutes, on this terminal** (the laptop polish's Part A).
-    //           (d)'s password opened a window for the serial console and `admin`, so the same view
-    //           again starts without asking, and the audit says why. `with --forget` closes it, and
-    //           (e)'s first prompt is the proof that it did. Audit lines are waited for, not the
-    //           prompt: they reach the console through the logging service, in either order with it.
+    //      (d2) **Remembered, for five minutes, on this terminal**: the same view again starts
+    //           without asking, and the audit says why. `with --forget` closes the window, and
+    //           (e)'s first prompt is the proof. Audit lines are waited for, not the prompt: they
+    //           reach the console through the logging service, in either order with it.
     s.send("with admin whoami")?;
     s.expect_all(&[
         "view: alice admin whoami — allowed, within the grace period",
@@ -105,8 +93,7 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     s.send("with --forget")?;
     s.expect("view: alice — remembered passwords forgotten")?;
     println!("  ok: a password remembered for this terminal and view, and forgotten when asked");
-    //      (e) **Three wrong passwords end a request.** Each check after the first waits out the
-    //          delay, so this costs about four seconds.
+    //      (e) **Three wrong passwords end a request**; each check after the first waits the delay.
     s.send("with admin whoami")?;
     for n in 1..=3 {
         s.expect(&format!("[with admin] password ({n} of 3): "))?;
@@ -114,9 +101,8 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     }
     s.expect("with: three wrong passwords")?;
     s.expect("/home>")?;
-    //      (f) **`Ctrl-C` stops a program started with `with`.** The shell asks `with` to stop,
-    //          `with` asks the broker, and the broker asks the program — which is `sleep`, which
-    //          listens. Sixty seconds is far past what this waits, so only a stop passes.
+    //      (f) **`Ctrl-C` stops a program started with `with`**: the shell asks `with`, which asks
+    //          the broker, which asks `sleep`. Sixty seconds is far past what this waits.
     with_admin_asked(s, "sleep 60")?;
     s.expect("view: alice admin sleep — started")?;
     let asked = std::time::Instant::now();
@@ -128,8 +114,7 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     if asked.elapsed() > std::time::Duration::from_secs(20) {
         return Err("`with admin sleep 60` took more than 20 s to stop after Ctrl-C".into());
     }
-    //      (g) **An audit record for each, and no password in any.** Neither password was echoed —
-    //          the prompts turned echo off — and none reached a log line.
+    //      (g) **An audit record for each, and no password in any**: the prompts turned echo off.
     let t = s.transcript();
     for line in [
         "view: alice install nxsh — denied: `install` does not let alice run `nxsh`",
@@ -148,31 +133,27 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     }
     steps += 1;
 
-    // 20c. **`disk`, with and without the grant** (administration Part C.7).
+    // 20c. **`disk`, with and without the grant.**
     //      (a) `--list` is the storage service's table, from any session: the row mounted at `/`
     //          is `init`'s root, matched on words the command does not contain.
     let row_from = s.transcript().len();
     s.send("disk --list | filter mounted == \"/\"")?;
     s.expect_all(&["blk-2", "init"])?;
     s.expect("/home>")?;
-    //          **And its empty cell is blank** (the laptop polish's Part B): `init`'s root is mounted
-    //          writable, so its `clean` is null, and the shell drew that as `null` until the table
-    //          drew an empty cell blank. The typed command holds no `null`, so any here is the row's.
+    //          **And its empty cell is blank**: `init`'s root is mounted writable, so its `clean`
+    //          is null, which the shell drew as `null`; the typed command holds none.
     let row = s.transcript()[row_from..].to_string();
     if row.contains("null") {
         return Err(format!("`disk --list` drew an empty cell as `null`: {row:?}").into());
     }
-    //          **And a disk is named as the installer names it** (the laptop polish's Part C): the
-    //          `description` column carries the model and serial the SATA disk reports, which the
-    //          typed command does not contain.
+    //          **And a disk is named as the installer names it**: the `description` column
+    //          carries the SATA disk's model and serial, which the typed command does not.
     s.send("disk --list | filter name == \"blk-0\"")?;
     s.expect("QEMU HARDDISK (QM00001)")?;
     s.expect("/home>")?;
-    //          **And `--help` is an answer, not an error** (the laptop polish's Part E). It was sent
-    //          to `stderr`, which the shell paints as an error; now it is text on `stdout`. Drawn
-    //          plain first — what a person saw — and then counted, which tells `stdout` from a
-    //          plain notice: on `stderr`, a pipeline's `count` sees no rows and says 0. Neither
-    //          typed line holds the usage or the count.
+    //          **And `--help` is an answer, not an error**: text on `stdout`, not `stderr`, which
+    //          the shell paints as an error. Drawn plain first, then counted: on `stderr`, a
+    //          pipeline's `count` sees no rows and says 0.
     let help_from = s.transcript().len();
     s.send("disk --help")?;
     s.expect("usage: disk --list")?;
@@ -182,50 +163,41 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
         return Err(format!("`disk --help` was drawn as a diagnostic, not as output: {help:?}").into());
     }
     s.send("format(\"help-rows={}\", (disk --help | count))")?;
-    // Sixteen since Phase 6 Part F gave `--eject` its two lines and the grant's note a third;
-    // twenty-one since Part G gave the usage a second line and `--partition` and `--format` two each.
     s.expect("help-rows=21")?;
     s.expect("/home>")?;
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
-    //          session's `/dev/storage/admin` is its session endpoint at the tables' base, where
-    //          nothing answers, and `disk` names `with`.
+    //          session's `/dev/storage/admin` has nothing answering, and `disk` names `with`.
     s.send("disk --mount /dev/blk/1")?;
     s.expect("need the storage grant")?;
     s.expect("/home>")?;
-    //      (c) **With it, the request reaches the service**, whose own reason comes back: the
-    //          ESP holds a FAT its server refuses for its 512-byte clusters (Phase 6 Part E,
-    //          when a FAT could be served; before, any FAT was refused). On a release boot there is
-    //          nothing it could mount, so the refusal is the evidence the grant arrived; the
-    //          successful mount and unmount through a view are `boot-probe`'s, on a test image's
-    //          scratch disk.
+    //      (c) **With it, the request reaches the service**, whose own reason comes back: the ESP
+    //          holds a FAT its server refuses for its 512-byte clusters. On a release boot nothing
+    //          could mount, so the refusal is the evidence the grant arrived.
     with_admin_asked(s, "disk --mount /dev/blk/1")?;
     s.expect("it holds no filesystem this service can serve")?;
     s.expect("/home>")?;
     steps += 1;
 
-    // 20d. **The policy, changed and put back** (administration Part D.2).
-    //      (a) Outside a view with the `views` grant there is no `/dev/policy`, and `with` names
-    //          the view to use.
+    // 20d. **The policy, changed and put back.**
+    //      (a) Outside a view with the `views` grant there is no `/dev/policy`; `with` names one.
     s.send("with --show")?;
     s.expect("with: cannot show the policy without the views grant")?;
     s.expect("/home>")?;
     let admin = |s: &mut Session, command: &str| -> R<()> { with_admin_asked(s, command) };
     //      (b) A copy of the policy, to put back at the end.
     admin(s, "with --show ./policy.txt")?;
-    //          **And said as a notice** (the laptop polish's Part E): the line on `stderr` names the
-    //          file, where the console's says "a copy", so finding it proves the path — and it is
-    //          drawn plain, where every diagnostic was once drawn as an error. The two arrive in no
-    //          order the guest promises.
+    //          **And said as a notice**: the line on `stderr` names the file, where the console's
+    //          says "a copy", so finding it proves the path — and it is drawn plain, not as an
+    //          error. The two arrive in no order the guest promises.
     s.expect_all(&["with: wrote the policy to a copy", "with: wrote the policy to ./policy.txt ("])?;
     s.expect("/home>")?;
     if s.transcript().contains("\x1b[91mwith: wrote the policy to") {
         return Err("`with --show FILE`'s notice was drawn in the error colour".into());
     }
-    //          **And with no file, on `stdout`** (PR #352 review): the policy as text a pipeline can
-    //          take, where it was one diagnostic and a policy longer than a message went to the
-    //          kernel log. Counted against the copy just written, so the rows are the policy's own
-    //          rather than any at all: on `stderr`, `count` sees none. Asked for its password, as
-    //          every step here is, rather than leaning on (b)'s window lasting under TCG.
+    //          **And with no file, on `stdout`**: the policy as text a pipeline can take. Counted
+    //          against the copy just written, so the rows are the policy's own rather than any at
+    //          all: on `stderr`, `count` sees none. Asked for its password, as every step here is,
+    //          rather than leaning on (b)'s window lasting under TCG.
     s.send("with --forget")?;
     s.expect(&format!("view: {DEMO_USER} — remembered passwords forgotten"))?;
     s.send("format(\"shown={} saved={}\", (with admin with --show | count), (open ./policy.txt | count))")?;
@@ -248,11 +220,9 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     }
     s.expect("/home>")?;
     //      (c) **An edited copy, one view more**, typed as lists of lines — `save` writes a list of
-    //          strings a line each, where a single string would be a character per line. **In
-    //          parts, each under the console's 256-byte input ring**
+    //          strings a line each. **In parts, each under the console's 256-byte input ring**
     //          (`kernel/src/drivers/console.rs`): a longer line can overrun it, lose its end and
-    //          its newline, and never reach the shell. The parts are joined by `open`, whose rows
-    //          are mapped back to strings.
+    //          its newline, and never reach the shell. The parts are joined by `open`.
     let lines = |ls: &[&str]| {
         let quoted: Vec<String> = ls.iter().map(|l| format!("\"{}\"", l.replace('"', "\\\""))).collect();
         format!("[{}]", quoted.join(", "))
@@ -325,11 +295,9 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 20e. **An account's life at the real prompt** (administration Part D.4): `account`, a
-    //      person's way to the accounts the view broker fronts. Bob is a fixture this step makes
-    //      and removes, like `alice`'s build-input password; nothing persists past it.
-    //
-    //      (a) `account --list` from any session: alice, administering, in one session — this one.
+    // 20e. **An account's life at the real prompt**: `account`, a person's way to the accounts
+    //      the view broker fronts. Bob is a fixture this step makes and removes; nothing persists.
+    //      (a) `account --list` from any session: alice, administering, in this one.
     let rows = |what: &str| format!("format(\"{what}={{}}\", (account --list | filter name == \"{what}\" | count))");
     s.send("format(\"alice-row={}\", (account --list | filter name == \"alice\" | filter administers == true | filter sessions == 1 | count))")?;
     s.expect("alice-row=1")?;
@@ -349,8 +317,7 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     s.send(&rows("bob"))?;
     s.expect("bob=1")?;
     s.expect("/home>")?;
-    //      (c) **Bob logs in**, at the same prompt alice did, into the home the broker made — with
-    //          the three folders a file browser offers already in it.
+    //      (c) **Bob logs in** at alice's prompt, into the home the broker made, its folders in it.
     s.send("exit")?;
     s.expect("nitrox login:")?;
     s.send("bob")?;
@@ -397,8 +364,7 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     s.send("exit")?;
     s.expect("nitrox login:")?;
-    //      (f) **Back as alice, bob removed** with his home — he is logged out, so the broker lets
-    //          it happen — after which the list has no bob and his login is refused.
+    //      (f) **Back as alice, bob removed** — he is logged out, so the broker lets it happen.
     s.send(DEMO_USER)?;
     s.expect("password:")?;
     s.send(DEMO_PASSWORD)?;
@@ -429,7 +395,7 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
 /// to the login prompt. The number of steps it ran.
 pub(crate) fn interactive_services_and_relogin(s: &mut Session) -> R<usize> {
     let mut steps = 0usize;
-    // 20f. **`service`, and a restart the session survives** (administration Part E.2b).
+    // 20f. **`service`, and a restart the session survives**.
     //      (a) `--list` is `service-mgr`'s table, from any session: the clipboard running.
     s.send("service --list | filter name == \"clipboard-server\"")?;
     s.expect("running")?;
@@ -447,10 +413,10 @@ pub(crate) fn interactive_services_and_relogin(s: &mut Session) -> R<usize> {
     with_admin_asked(s, "service --restart clipboard-server")?;
     s.expect("service: restarted clipboard-server")?;
     s.expect("/home>")?;
-    //      (e) **And the same session copies and pastes through it.** This session bound
-    //          `/dev/clipboard` at login, before the restart, and never again: what it reaches is
-    //          `service-mgr`'s route, which continues into whichever clipboard server is running
-    //          (Part E.1b). Bound to the server's own endpoint, `clip` would find it gone.
+    //      (e) **And the same session copies and pastes through it.** It bound `/dev/clipboard` at
+    //          login, before the restart, and what it reaches is `service-mgr`'s route into
+    //          whichever clipboard server is running; bound to the server's own, `clip` finds
+    //          it gone.
     s.send("\"after-restart\" | clip --copy")?;
     s.expect("/home>")?;
     s.send("clip")?;
@@ -458,27 +424,25 @@ pub(crate) fn interactive_services_and_relogin(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 20g. **`date --set`, and the clock it leaves** (administration Part E.5).
-    //      (a) **Refused without the grant**, by the kernel: `SYSTEM_CLOCK` is a capability given
-    //          at spawn, and a session's programs are spawned without it.
+    // 20g. **`date --set`, and the clock it leaves.**
+    //      (a) **Refused without the grant**, by the kernel: a session's programs are spawned
+    //          without `SYSTEM_CLOCK`.
     s.send("date --set 2031-01-02T00:00:00Z")?;
     s.expect("needs the clock grant")?;
     s.expect("/home>")?;
     //      (b) **Set through the `clock` grant**: the kernel says the RTC took it, and `date`
-    //          reports the clock as it reads after. The epoch value is matched, since the typed
-    //          command holds the date and would satisfy a match on it.
+    //          reports the clock after. The epoch value is matched, since the typed command
+    //          holds the date.
     with_admin_asked(s, "date --set 2031-01-02T00:00:00Z --unix")?;
     s.expect("wall clock: set to 1925078400 (Unix epoch seconds, UTC); the RTC holds it")?;
     s.expect("1925078")?;
     s.expect("/home>")?;
-    //      (c) **And another program reads it**, outside the view: the kernel's clock, not the
-    //          view's.
+    //      (c) **And another program reads it**, outside the view: the kernel's clock.
     s.send("date --unix")?;
     s.expect("1925078")?;
     s.expect("/home>")?;
-    //      (d) **A shell in the view passes it on**: `nxsh` spawns its stages with what it holds,
-    //          so `date --set` works in `with admin nxsh` as the view's bindings do. A day later,
-    //          so the kernel's line is this set's and not (b)'s.
+    //      (d) **A shell in the view passes it on**: `nxsh` spawns its stages with what it holds.
+    //          A day later, so the kernel's line is this set's and not (b)'s.
     with_admin_asked(s, "nxsh")?;
     s.expect("/home>")?;
     s.send("date --set 2031-01-03T00:00:00Z --unix")?;
@@ -488,23 +452,20 @@ pub(crate) fn interactive_services_and_relogin(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 20h. **`log`, and the audit an earlier step wrote** (administration Part E.6).
-    //      (a) **Refused without the grant**: a session has no `/dev/logs`, and `log` says which
-    //          grant it needs.
+    // 20h. **`log`, and the audit an earlier step wrote.**
+    //      (a) **Refused without the grant**: a session has no `/dev/logs`, and `log` names it.
     s.send("log")?;
     s.expect("needs the logs grant")?;
     s.expect("/home>")?;
-    //      (b) **Read back through the `logs` grant**: the view broker's records, 20g's view among
-    //          them, as a table. The row is the logging service's ring answering `Read`; the same
-    //          record went to the console when it was written, before this was typed, so what is
-    //          matched here can only be the row.
+    //      (b) **Read back through the `logs` grant**: the view broker's records as a table. The
+    //          same record went to the console when it was written, before this was typed, so
+    //          what is matched here can only be the row.
     with_admin_asked(s, "log view-broker")?;
     s.expect("view: alice admin date — started")?;
     s.expect("/home>")?;
-    //      (c) **The kernel's log** (Phase 6 Part B.7): refused without the `kernel-log` grant,
-    //          and through it a row a line from the start of the kernel's log. That line went to
-    //          the console at boot, long before anything here was typed, so a match can only be
-    //          `log`'s row.
+    //      (c) **The kernel's log**: refused without the `kernel-log` grant, and through it a row a
+    //          line from the start of the kernel's log. That line went to the console at boot, long
+    //          before anything here was typed, so a match can only be `log`'s row.
     s.send("log --kernel")?;
     s.expect("needs the kernel-log grant")?;
     s.expect("/home>")?;
@@ -512,20 +473,17 @@ pub(crate) fn interactive_services_and_relogin(s: &mut Session) -> R<usize> {
     s.expect("CPU tables installed (GDT/TSS/IDT)")?;
     s.expect("/home>")?;
     //          **And its last row is its last line**, 20g(d)'s clock, whose own echo the wait there
-    //          consumed. The snapshot's last page is padded with NULs, which were a last row of
-    //          them until `log` trimmed them (PR #371 review, finding 1).
+    //          consumed. The snapshot's last page is padded with NULs, which `log` must trim.
     with_admin_asked(s, "log --kernel | last 1")?;
     s.expect("wall clock: set to 1925164800")?;
     s.expect("/home>")?;
     steps += 1;
 
-    // 21. A bare `exit` still returns to the login prompt, and logging in again works. A
-    //     login that cannot be repeated is not a login.
-    //
-    //     **And the broker hears both** (administration Part A.4): the session that ended is
-    //     closed, and the next login gets a *new* id. Ids are never reused — a program that
-    //     ignored its session's end still holds a namespace with the old base, and a reused id
-    //     would give its requests the next login's identity.
+    // 21. A bare `exit` still returns to the login prompt, and logging in again works.
+    //     **And the broker hears both**: the session that ended is closed, and the next login gets
+    //     a *new* id. Ids are never reused — a program that ignored its session's end still holds
+    //     a namespace with the old base, and a reused id would give its requests the next login's
+    //     identity.
     s.send("exit")?;
     s.expect("view-broker: session ")?;
     let ended = s.rest_of_line()?;
