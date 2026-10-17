@@ -1,34 +1,17 @@
-//! The storage service's decisions (administration Part C.5): everything that can be wrong about a
-//! disk without a boot to show it.
-//!
-//! - [`probe`] — what a device holds: ext4 or FAT, each read the way its server reads it; or
-//!   nothing;
-//! - [`sources`] — which devices `init` mounted, from `init.toml`, and whether this is a live boot;
-//! - [`table`] — the TSM1 tables `/svc/storage/info` serves;
-//! - [`labels`] — what a mount is called under `/storage`;
-//! - [`mounts`] — what is mounted at boot, and how;
-//! - [`suffix`] — what a resolve that reached the service asked for, and where it may ask it;
-//! - [`watch`] — the sessions following the mounts, and who is told when they change.
-//!
-//! The binary is the event loop: taking `block` from the device manager, reading each device, and
-//! serving.
+//! The storage service's decisions: everything that can be wrong about a disk without a boot to
+//! show it. The binary is the event loop: taking `block` from the device manager, reading each
+//! device, and serving.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
 pub mod probe {
-    //! **What a device holds**, read the way the server that would serve it reads it.
-    //!
-    //! - An **ext4** filesystem, if `fs-server-ext4`'s own `check_device` accepts it. That is the
-    //!   check its server runs before it says Ready, so the service never offers to mount what the
-    //!   server would refuse. Its label and whether it was left clean come with it.
-    //! - A **FAT** filesystem (Phase 6 Part E.5), read by `fs-server-fat`'s own check, with its
-    //!   label, how it was left, and — if its server would refuse it — why. A boot sector the
-    //!   library cannot parse is still a FAT if [`fat_label`] recognises it, so a FAT with 4 KiB
-    //!   sectors is reported as one that is not served rather than as nothing.
-    //! - **Nothing** either recognises: a disk holding a partition table, a blank one, or a
-    //!   filesystem neither can read.
+    //! **What a device holds**, read the way the server that would serve it reads it: ext4 by
+    //! `fs-server-ext4`'s own `check_device` (so the service never offers what the server would
+    //! refuse), FAT by `fs-server-fat`'s own check, or nothing. A boot sector the library cannot
+    //! parse is still a FAT if [`fat_label`] recognises it, so a FAT with 4 KiB sectors is
+    //! reported as not served, not as nothing.
 
     use alloc::format;
     use alloc::string::String;
@@ -86,8 +69,7 @@ pub mod probe {
             }
         }
 
-        /// **The server that would serve it**, or `None` for nothing, or a FAT its server would
-        /// refuse.
+        /// The server that would serve it; `None` for nothing, or a FAT its server would refuse.
         pub fn server(&self) -> Option<crate::mounts::Server> {
             use crate::mounts::Server;
             match self {
@@ -117,15 +99,13 @@ pub mod probe {
         Found::Fat { label, clean: fat.was_left_clean().ok(), refused }
     }
 
-    /// **What a device holds, by its record** (PR #365 review, finding 4): [`probe`], and for a
-    /// **whole disk whose first sector carries a partition entry**, never a filesystem of its own.
-    /// Partitioning a stick that held a filesystem whole leaves that filesystem's bytes: `sfdisk`
-    /// and `parted` write the entries into sector 0 and keep the rest. An ext4's superblock at byte
-    /// 1024 then reads as ever, beside the partitions the kernel publishes, and the disk would be
-    /// mounted whole over them — so such a disk holds nothing. A FAT's boot sector is sector 0
+    /// **What a device holds, by its record**: [`probe`], except that a **whole disk whose first
+    /// sector carries a partition entry** never holds a filesystem of its own. `sfdisk` and
+    /// `parted` keep the old bytes, so an ext4's superblock still reads beside the partitions the
+    /// kernel publishes; mounted whole, it would sit over them. A FAT's boot sector is sector 0
     /// itself, which the kernel reads as no table (`kernel/src/drivers/partitions.rs`), so no
-    /// partition is published; mounted, the stale FAT would allocate clusters inside the partition
-    /// nothing can see. It is reported, and refused.
+    /// partition is published and the stale FAT would allocate clusters inside the partition
+    /// nothing can see: reported, and refused.
     pub fn probe_record<R: BlockReader>(r: &R, record: &libkern::device::DeviceRecord) -> Found {
         use libkern::device::DeviceKind;
         let found = probe(r);
@@ -143,9 +123,9 @@ pub mod probe {
     /// Why a whole disk's FAT beside partition entries is not served.
     pub const STALE_FAT: &str = "its first sector holds partition entries too, so this FAT may be stale";
 
-    /// **Whether a disk's first sector carries a partition entry**: signed `0x55AA`, every entry's
-    /// status `0x00` or `0x80` — the check Linux makes, which a filesystem's boot code rarely
-    /// passes — and one entry in use that lies on the disk. GPT's protective entry counts.
+    /// Whether a disk's first sector carries a partition entry: signed `0x55AA`, every entry's
+    /// status `0x00` or `0x80` (Linux's check, which boot code rarely passes), and one entry in
+    /// use that lies on the disk. GPT's protective entry counts.
     pub fn partition_entries(sector: &[u8; 512], blocks: u64) -> bool {
         if sector[510] != 0x55 || sector[511] != 0xAA {
             return false;
@@ -162,14 +142,10 @@ pub mod probe {
         })
     }
 
-    /// **A FAT boot sector's volume label**, or `None` if `sector` is not a FAT boot sector.
-    ///
-    /// Recognised by four things every FAT formatter writes: the `0x55 0xAA` signature, a
-    /// power-of-two sector size from 512 to 4096, the extended boot signature `0x29`, and the
-    /// filesystem-type string after it — `FAT32` at `0x52`, or `FAT12`, `FAT16` or `FAT` at `0x36`.
-    /// The specification calls the type string informational, but every formatter writes it. A
-    /// protective MBR, which is what a GPT disk holds at sector 0, has the same signature and none
-    /// of the other three. `NO NAME` is FAT's word for no label.
+    /// A FAT boot sector's volume label, or `None` if `sector` is not one: the `0x55 0xAA`
+    /// signature, a power-of-two sector size from 512 to 4096, the extended boot signature `0x29`,
+    /// and the type string after it (`FAT32` at `0x52`, or `FAT…` at `0x36`). A GPT disk's
+    /// protective MBR has the signature and none of the rest. `NO NAME` means no label.
     pub fn fat_label(sector: &[u8; 512]) -> Option<String> {
         if sector[510] != 0x55 || sector[511] != 0xAA {
             return None;
@@ -194,20 +170,18 @@ pub mod probe {
 pub mod sources {
     //! **Which devices `init` mounted, and whether this is a live boot.**
     //!
-    //! `init` records its mounts as namespace bindings, and nothing names the device behind one.
-    //! What does is `init.toml`: every `[[mount]]` is critical-path, so on a running system each
-    //! one succeeded, and its source names a partition by one of the two schemes `init` accepts.
+    //! `init` records its mounts as namespace bindings, and nothing names the device behind one;
+    //! `init.toml` does: every `[[mount]]` is critical-path, so on a running system each one
+    //! succeeded, and its source names a partition by one of two schemes.
     //! - `gpt-partlabel:<label>`: the first partition record whose name is the label, as the
-    //!   kernel binds `/dev/disk/by-partlabel/<label>` to the first partition published with it.
+    //!   kernel binds `/dev/disk/by-partlabel/<label>`.
     //! - `gpt-partuuid:<uuid>`: a partition's unique GUID, which the registry does not carry, so it
-    //!   is read from the parent disk's own table. The kernel publishes a disk's partitions in its
-    //!   table's order, skipping unused entries, so the k-th entry in use is the k-th partition
-    //!   record under that disk. Its name and size confirm it, and it is unmatched if they differ.
+    //!   is read from the parent disk's table. The kernel publishes partitions in table order,
+    //!   skipping unused entries, so the k-th entry in use is the k-th partition record under that
+    //!   disk; its name and size confirm it, and it is unmatched if they differ.
     //!
-    //! **A live boot is one whose root is on a RAM disk**: the root's partition belongs to one, or
-    //! the root is one. That is what makes the machine's own disks the install target, so the
-    //! service auto-mounts an internal disk read-only there (a removable one writable, since
-    //! Phase 6 Part F).
+    //! **A live boot is one whose root is on a RAM disk**, which makes the machine's own disks the
+    //! install target: an internal disk is auto-mounted read-only there (a removable one writable).
 
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -298,10 +272,10 @@ pub mod sources {
         out
     }
 
-    /// **Whether `init`'s mounts are known**: its manifest was read (`Some`), named a mount, and
-    /// every mount it named matched a device. Anything less, and a device this service took for
-    /// free could be `init`'s root, so it mounts nothing, refuses an administrator's mount, and
-    /// does not answer `InUse` (PR #336 review, finding 2).
+    /// **Whether `init`'s mounts are known**: its manifest was read, named a mount, and every
+    /// mount matched a device. Anything less, and a device taken for free could be `init`'s root,
+    /// so the service mounts nothing, refuses an administrator's mount, and does not answer
+    /// `InUse`.
     pub fn init_known(mounts: Option<&[InitMount]>) -> bool {
         mounts.is_some_and(|l| !l.is_empty() && l.iter().all(|m| m.device.is_some()))
     }
@@ -321,18 +295,16 @@ pub mod sources {
 
 pub mod table {
     //! **`/svc/storage/info` is typed tables**, as `/dev/devices` is: `all.tsm` with a row per
-    //! block device, then one `<name>.tsm` each. A name is `/dev/devices`' own, `blk-<n>` for
-    //! `/dev/blk/<n>`, so a row here and a row there are the same device.
+    //! block device, then one `<name>.tsm` each, named `blk-<n>` for `/dev/blk/<n>` as
+    //! `/dev/devices` names them.
     //!
     //! Columns: `name`, `kind`, `size`, `filesystem` (`ext4` or `fat`), `label` (the filesystem's
-    //! own), `mounted` (where), `by` (`init` or `storage`), `mode` (`ro` or `rw`), `clean`,
-    //! whether the filesystem was left cleanly unmounted. **`clean` is `Null` for anything but
-    //! ext4 and FAT, and for a filesystem mounted writable**: that one's state says it is in use,
-    //! because it is, and says nothing about how it was left. What a device does not have is
-    //! `Null`. And `removable` (Phase 6 Part F): whether the device is a disk behind USB mass
-    //! storage, or a partition of one — what a session may eject, and what Files puts an eject
-    //! button on. And `note` (Phase 6 Part G): **why a filesystem found is not mounted**, in the
-    //! words the service's log line gives ([`note`](crate::mounts::note)).
+    //! own), `mounted` (where), `by` (`init` or `storage`), `mode` (`ro` or `rw`), `clean`
+    //! (left cleanly unmounted), `removable` (a disk behind USB mass storage, or a partition of
+    //! one: what a session may eject), and `note` (**why a filesystem found is not mounted**, in
+    //! the words of the log line, [`note`](crate::mounts::note)). What a device does not have is
+    //! `Null`; **`clean` is `Null` too for a filesystem mounted writable**, whose state says it is
+    //! in use, not how it was left.
 
     use alloc::format;
     use alloc::string::String;
@@ -416,8 +388,7 @@ pub mod table {
             .field("note", TypeTag::String, nullable)
     }
 
-    /// `d`'s row, mounted as `mount` says, among `all` the devices — which a partition's disk is
-    /// one of, to say whether it is removable.
+    /// `d`'s row, mounted as `mount` says; `all` holds a partition's disk, for `removable`.
     pub fn row(d: &Device, mount: Option<&Mounted>, all: &[Device]) -> Vec<Value> {
         let r = &d.record;
         let text = |s: Option<&str>| s.map_or(Value::Null, |s| Value::Str(String::from(s)));
@@ -428,10 +399,8 @@ pub mod table {
             (Some(c), _) => Value::Bool(c),
             (None, _) => Value::Null,
         };
-        // **What the device calls itself** (the laptop polish's Part C): the model and serial a
-        // SATA disk reports, a RAM disk's module, a partition's name in its table — what `nxinstall`
-        // shows, so `disk --list` names a disk the way the installer does. `blk-<n>` is where it
-        // is, and this is what it is.
+        // What the device calls itself: a SATA disk's model and serial, a RAM disk's module, a
+        // partition's name in its table, as `nxinstall` shows them.
         let described = String::from_utf8_lossy(r.name()).into_owned();
         vec![
             Value::Str(name(r)),
@@ -481,12 +450,9 @@ pub mod table {
 }
 
 pub mod labels {
-    //! **What a mount is called: `/storage/<label>`.** A name anything persistent can use, since
-    //! `/dev/blk/<n>` is discovery order and changes as disks come and go.
-    //!
-    //! The label is the filesystem's own, else its partition's name, else `blk-<n>`, taking the
-    //! first that is valid. A clash takes `-2`, `-3`, … in registry order, so the first device
-    //! found keeps the plain name.
+    //! **What a mount is called: `/storage/<label>`**, a name that outlasts `/dev/blk/<n>`'s
+    //! discovery order. The filesystem's own label, else its partition's name, else `blk-<n>`,
+    //! taking the first that is valid; a clash takes `-2`, `-3`, … in registry order.
 
     use alloc::format;
     use alloc::string::String;
@@ -494,15 +460,13 @@ pub mod labels {
 
     use crate::table::{Device, name};
 
-    /// Longest label accepted, in bytes. Every label this service reads is shorter: GPT's 36,
-    /// ext4's 16, FAT's 11.
+    /// Longest label accepted, in bytes: more than any a disk carries (GPT 36, ext4 16, FAT 11).
     pub const MAX: usize = 64;
 
     /// Whether `s` may be a label: 1 to [`MAX`] bytes of printable ASCII, with no `/`, not
-    /// beginning with `.` or a space and not ending with one. **A name beginning with `.` is
-    /// refused** because `.` and `..` are not path components and a hidden name is not one a
-    /// person looking at `/storage` would find. A space at either end is refused because it
-    /// cannot be seen. Anything else — a non-ASCII label included — falls back to the next source.
+    /// beginning with `.` or a space and not ending with one. `.` and `..` are not path
+    /// components and a hidden name is not one a person would find; a space at either end cannot
+    /// be seen. Anything else, a non-ASCII label included, falls back to the next source.
     pub fn valid(s: &str) -> bool {
         let b = s.as_bytes();
         !b.is_empty()
@@ -513,8 +477,7 @@ pub mod labels {
             && b[b.len() - 1] != b' '
     }
 
-    /// The label `d` would be mounted under, before clashes: its filesystem's own label, else its
-    /// partition's name, else `blk-<n>`.
+    /// The label `d` would be mounted under, before clashes.
     pub fn preferred(d: &Device) -> String {
         if let Some(l) = d.found.label().filter(|l| valid(l)) {
             return String::from(l);
@@ -538,21 +501,19 @@ pub mod labels {
 }
 
 pub mod mounts {
-    //! **What this service mounts at boot.** Every device holding a filesystem it can serve that
-    //! is not already mounted: every ext4 `init` did not mount, and **a FAT on a removable disk**
-    //! (Phase 6 Part E.5) — one behind USB mass storage. An internal disk's FAT is its ESP, most
+    //! **What this service mounts at boot**: every ext4 `init` did not mount, and **a FAT on a
+    //! removable disk** (one behind USB mass storage). An internal disk's FAT is its ESP, most
     //! likely, which nobody asked to have mounted: an administrator's `disk --mount` takes one.
-    //! Whatever it mounts, it spawns the server for its kind ([`Server`]).
+    //! Each mount spawns the server for its kind ([`Server`]).
     //!
-    //! **A live boot mounts the machine's own disks read-only**: the root is on a RAM disk, which
-    //! makes them the install target, and nothing written to one of them by accident could be taken
-    //! back. **A removable disk mounts writable on any boot** (Phase 6 Part F): a stick is the
-    //! session's, which may eject it ([`eject`]). An administrator's explicit mount (C.5c) is
-    //! writable either way; it is the automatic one that has to be careful.
+    //! **A live boot mounts the machine's own disks read-only**: they are the install target, and
+    //! nothing written by accident could be taken back. **A removable disk mounts writable on any
+    //! boot**: a stick is the session's, which may eject it ([`eject`]). An administrator's mount
+    //! is writable either way; it is the automatic one that has to be careful.
     //!
-    //! **A device `disk` has written is read again** (Phase 6 Part G, [`reread`]) and mounted by an
-    //! arrival's rules; and **why a filesystem is not mounted** is said in one place,
-    //! [`unmounted_why`], which the log line and the table's `note` both give.
+    //! A device `disk` has written is read again ([`reread`]) and mounted by an arrival's rules;
+    //! why a filesystem is not mounted is said in one place, [`unmounted_why`], for the log line
+    //! and the table's `note` alike.
 
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -562,13 +523,12 @@ pub mod mounts {
     use crate::probe::Found;
     use crate::table::{Device, Mounted};
 
-    /// **The driver a disk behind USB mass storage is published by**, as its registry record names
-    /// it (`kernel/src/drivers/xhci/storage.rs`). What makes a disk removable, in this phase's
-    /// sense: a SATA disk never is, whatever its bay.
+    /// The driver a disk behind USB mass storage is published by (`kernel/src/drivers/xhci/
+    /// storage.rs`): what makes a disk removable. A SATA disk never is, whatever its bay.
     pub const USB_STORAGE: &[u8] = b"usb-storage";
 
-    /// **The server that serves a filesystem** (Phase 6 Part E.5), spawned from the store's copy,
-    /// since the root is mounted by now.
+    /// The server that serves a filesystem, spawned from the store's copy: the root is mounted by
+    /// now.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Server {
         /// `fs-server-ext4`.
@@ -594,15 +554,13 @@ pub mod mounts {
         pub device: u32,
         /// Its label, unique among the plan's.
         pub label: String,
-        /// `ro` for an internal disk on a live boot, `rw` otherwise (Phase 6 Part F; every mount of
-        /// a live boot was `ro` until then).
+        /// `ro` for an internal disk on a live boot, `rw` otherwise.
         pub mode: Mode,
         /// The server for what it holds.
         pub server: Server,
     }
 
-    /// Why an administrator's mount was refused: a [`KError`](libkern::KError) and the words the
-    /// refusal carries.
+    /// Why an administrator's mount was refused.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Refusal {
         /// No block device has that name.
@@ -653,10 +611,10 @@ pub mod mounts {
     }
 
     /// **An administrator's mount** of the device called `name` (`blk-<n>`), under `label`, or
-    /// under the label the service would choose if `label` is empty. `mounted` is everything
-    /// mounted, `init`'s included; `taken` is the labels in use; `room` is whether a slot is free;
-    /// `init_known` is [`init_known`](crate::sources::init_known)'s answer, and nothing is mounted
-    /// without it. **Always writable**, on a live boot too: the auto-mount is the careful one.
+    /// the label the service would choose if it is empty. `mounted` is everything mounted, `init`'s
+    /// included; `taken` the labels in use; `room` whether a slot is free; `init_known` is
+    /// [`init_known`](crate::sources::init_known)'s answer, and nothing is mounted without it.
+    /// **Always writable**, on a live boot too: the auto-mount is the careful one.
     pub fn explicit(
         devices: &[Device],
         mounted: &[Mounted],
@@ -691,12 +649,9 @@ pub mod mounts {
 
     /// **The devices in use, which must not be granted raw**: every mounted filesystem's device,
     /// `init`'s included, and the disk that holds it, since a raw write to a disk reaches its
-    /// partitions. Registry ids, ascending. **The holder is the parent only if it is a block
-    /// device**: a partition's is its disk or RAM disk, while a whole disk's is the PCI function
-    /// of its controller, which is not one and not grantable.
-    ///
-    /// **And the disk the machine started from** (Phase 6 Part D): it holds the running system,
-    /// whether or not anything on it is mounted, so `disks` withholds it and `nxinstall` says why.
+    /// partitions; registry ids, ascending. **The holder is the parent only if it is a block
+    /// device**: a whole disk's parent is its controller's PCI function, not grantable. **And the
+    /// disk the machine started from**, mounted or not: it holds the running system.
     pub fn in_use(devices: &[Device], mounted: &[Mounted]) -> Vec<u32> {
         use libkern::device::NO_PARENT;
         let mut ids: Vec<u32> = devices.iter().filter(|d| d.record.is_boot_medium()).map(|d| d.record.id).collect();
@@ -721,26 +676,22 @@ pub mod mounts {
         s
     }
 
-    /// The boot's auto-mounts, in registry order. `already` is what is mounted, `init`'s mounts
-    /// among it, and none of those devices is mounted again. **None at all without
-    /// `init_known`**: a device whose `init` mount went unmatched would look free here, and it could
-    /// be the running root.
+    /// The boot's auto-mounts, in registry order; `already` is what is mounted, `init`'s among it.
+    /// **None at all without `init_known`**: a device whose `init` mount went unmatched would look
+    /// free here, and could be the running root.
     ///
-    /// **Nor the installer's source** (administration Part G.1): a partition named
-    /// [`libgpt::INSTALL_SOURCE_LABEL`], the pristine root the install entry loads. Mounted, it
-    /// would be in use, and the `disks` grant would withhold it from `nxinstall`, which copies it.
-    /// **The rule is the name, not "a RAM disk"**: a test image's scratch filesystem is a RAM disk
-    /// this service mounts, for `boot-probe`.
-    ///
-    /// **Nor anything on the disk the machine started from** (Phase 6 Part D): on a live boot the
-    /// stick, which holds the system running from RAM ([`on_boot_medium`]).
+    /// **Nor the installer's source**: a partition named [`libgpt::INSTALL_SOURCE_LABEL`], which
+    /// `nxinstall` copies and the `disks` grant would withhold once it was mounted. **The rule is
+    /// the name, not "a RAM disk"**: a test image's scratch filesystem is a RAM disk this service
+    /// mounts, for `boot-probe`. **Nor anything on the disk the machine started from**
+    /// ([`on_boot_medium`]): on a live boot, the stick the system runs from.
     pub fn automount(devices: &[Device], already: &[Mounted], live: bool, init_known: bool) -> Vec<Plan> {
         plan(devices, devices, already, &[], live, init_known)
     }
 
-    /// **The mounts devices that arrived after the boot get** (Phase 6 Part D): `new`, by the boot's
-    /// rules, among `all` the service knows, with `taken` the labels of the mounts there are. Only
-    /// the new are planned: one an administrator unmounted stays so.
+    /// **The mounts devices that arrived after the boot get**: `new`, by the boot's rules, among
+    /// `all` the service knows, with `taken` the labels in use. Only the new are planned: one an
+    /// administrator unmounted stays so.
     pub fn arrival(
         new: &[Device],
         all: &[Device],
@@ -783,7 +734,7 @@ pub mod mounts {
         plan
     }
 
-    /// **Why a session's eject was refused** (Phase 6 Part F).
+    /// **Why a session's eject was refused.**
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum EjectRefusal {
         /// Nothing is mounted under that name.
@@ -812,17 +763,13 @@ pub mod mounts {
         }
     }
 
-    /// **A session's eject of the drive holding the mount named `name`**: the names of every mount
-    /// this service made on that disk, in the order they were made — `name` among them — if
-    /// something is mounted under `/storage/<name>` on a removable disk.
-    ///
-    /// **The drive, not the one filesystem** (PR #367 review): a stick is pulled whole, so an
-    /// eject that unmounted one partition and said the stick could be pulled left its other
-    /// partitions mounted, their unwritten files lost and their filesystems marked in use — the
-    /// outcome an eject exists to prevent. **The name is the mount's**, what [`at`] made of a
-    /// [`Plan`]'s label — the table's `mounted` column — never the filesystem's own label, which
-    /// two sticks can share and a stick can lack. An internal disk's mount is the `storage`
-    /// grant's to unmount, as it always was; `init`'s mounts are not this service's.
+    /// **A session's eject of the drive holding the mount named `name`**: every mount this service
+    /// made on that disk, in the order made, `name` among them, if `/storage/<name>` is on a
+    /// removable disk. **The drive, not the one filesystem**: a stick is pulled whole, so
+    /// unmounting one partition would leave the others mounted, their unwritten files lost.
+    /// **The name is the mount's** (the table's `mounted` column), never the filesystem's own
+    /// label, which two sticks can share and a stick can lack. An internal disk's mount is the
+    /// `storage` grant's to unmount; `init`'s mounts are not this service's.
     pub fn eject(devices: &[Device], mounted: &[Mounted], name: &str) -> Result<Vec<String>, EjectRefusal> {
         use crate::table::By;
         let want = at(name);
@@ -842,8 +789,8 @@ pub mod mounts {
             .collect())
     }
 
-    /// **What a `Reread` reads again** (Phase 6 Part G), by registry id: a partition, probed again,
-    /// or a disk, which the kernel rescans first.
+    /// **What a `Reread` reads again**, by registry id: a partition, probed again, or a disk, which
+    /// the kernel rescans first.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum Reread {
         /// A partition: its window is unchanged, so what is in it is read again.
@@ -852,7 +799,7 @@ pub mod mounts {
         Disk(u32),
     }
 
-    /// **Why a `Reread` was refused** (Phase 6 Part G).
+    /// **Why a `Reread` was refused.**
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum RereadRefusal {
         /// `init`'s mounts are not all known, so nothing is mounted.
@@ -893,12 +840,11 @@ pub mod mounts {
         }
     }
 
-    /// **An administrator's `Reread` of the device called `name`** (Phase 6 Part G), once `disk` has
-    /// written it: what to read again, or why not. **Refused while mounted** — a partition while it
-    /// is, a disk while anything on it is, since its partitions are about to be replaced; a
-    /// partition beside a mounted sibling is read again, as the `disks` grant gave it (PR #368
-    /// review). **And anything on the disk the machine started from**, mounted or not; mounted is
-    /// asked first, so a boot disk holding `init`'s root says it is mounted.
+    /// **An administrator's `Reread` of the device called `name`**, once `disk` has written it.
+    /// **Refused while mounted**: a partition while it is, a disk while anything on it is, since
+    /// its partitions are about to be replaced; a partition beside a mounted sibling is read
+    /// again, as the `disks` grant gave it. **And anything on the disk the machine started from**;
+    /// mounted is asked first, so a boot disk holding `init`'s root says it is mounted.
     pub fn reread(
         devices: &[Device],
         mounted: &[Mounted],
@@ -924,9 +870,9 @@ pub mod mounts {
         Ok(if partition { Reread::Partition(id) } else { Reread::Disk(id) })
     }
 
-    /// **Why `d`, not mounted, is not**, as the service's log line says it, or `None` for no reason
-    /// but that nothing mounted it: a FAT its server refuses, the installer's source, anything on the
-    /// disk the machine started from, and a FAT on an internal disk. In that order, the log's.
+    /// **Why `d`, not mounted, is not**, in the log line's words, or `None` if nothing mounted it:
+    /// a FAT its server refuses, the installer's source, anything on the disk the machine started
+    /// from, a FAT on an internal disk — in that order. QEMU gates match these words.
     pub fn unmounted_why(d: &Device, all: &[Device]) -> Option<String> {
         if let Found::Fat { refused: Some(why), .. } = &d.found {
             return Some(alloc::format!("not served: {why}"));
@@ -943,9 +889,8 @@ pub mod mounts {
         Some(String::from(why))
     }
 
-    /// **The table's `note`** (Phase 6 Part G, `unmounted-why`): [`unmounted_why`] for a filesystem
-    /// found and not mounted; `None` for a mounted one, and for a device holding nothing — a disk
-    /// holding a table, or a blank stick — whose row says so already.
+    /// **The table's `note`**: [`unmounted_why`] for a filesystem found and not mounted; `None` for
+    /// a mounted one, and for a device holding nothing, whose row says so already.
     pub fn note(d: &Device, all: &[Device], mount: Option<&Mounted>) -> Option<String> {
         if mount.is_some() || d.found.filesystem().is_none() {
             return None;
@@ -953,22 +898,20 @@ pub mod mounts {
         unmounted_why(d, all)
     }
 
-    /// **Whether `d` is on a removable disk** (Phase 6 Part E.5): a disk behind USB mass storage
-    /// ([`USB_STORAGE`]), or one of its partitions.
+    /// Whether `d` is a disk behind USB mass storage ([`USB_STORAGE`]), or one of its partitions.
     pub fn removable(d: &Device, all: &[Device]) -> bool {
         let usb = |r: &libkern::device::DeviceRecord| r.driver() == USB_STORAGE;
         usb(&d.record) || all.iter().any(|p| p.record.id == d.record.parent && usb(&p.record))
     }
 
-    /// **Whether `d` is on the disk the machine started from** (Phase 6 Part D): that disk, flagged
-    /// in its record, or one of its partitions.
+    /// Whether `d` is the disk the machine started from, flagged in its record, or one of its
+    /// partitions.
     pub fn on_boot_medium(d: &Device, all: &[Device]) -> bool {
         d.record.is_boot_medium() || all.iter().any(|p| p.record.id == d.record.parent && p.record.is_boot_medium())
     }
 
     /// Whether `d` is the installer's pristine source: a partition named
-    /// [`libgpt::INSTALL_SOURCE_LABEL`] (administration Part G.1). A partition's record carries
-    /// its GPT name, which is what the build wrote and what `nxinstall` looks for.
+    /// [`libgpt::INSTALL_SOURCE_LABEL`], the GPT name the build wrote and `nxinstall` looks for.
     pub fn is_install_source(d: &Device) -> bool {
         d.record.kind() == libkern::device::DeviceKind::Partition
             && d.record.name() == libgpt::INSTALL_SOURCE_LABEL.as_bytes()
@@ -977,14 +920,11 @@ pub mod mounts {
 
 pub mod suffix {
     //! What a resolve that reached the service asked for, and what it may ask for where it came
-    //! from.
-    //!
-    //! **A session reaches the service through an endpoint of its own** (C.5b), which the login
+    //! from. **A session reaches the service through an endpoint of its own**, which the login
     //! supervisors bind at `/storage` with the base `/fs` and at `/dev/storage` with the base
-    //! `/info` (C.6). A resolve arriving there is [`session_only`]: the filesystems and the tables,
-    //! and nothing that would mint another endpoint. The base alone would not be enough, since a
-    //! holder with `BIND_NAMESPACE` could bind the endpoint with no base; an endpoint that cannot
-    //! mint is a capability it can be handed, as `/dev/devices`' is.
+    //! `/info`. A resolve arriving there is [`session_only`]. The base alone would not be
+    //! enough: a holder with `BIND_NAMESPACE` could bind the endpoint with no base, so an endpoint
+    //! that cannot mint is a capability it can be handed, as `/dev/devices`' is.
 
     /// A forwarded suffix, classified.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1008,12 +948,11 @@ pub mod suffix {
         /// is [`session_only`].
         SessionEndpoint,
         /// `admin-endpoint`: a forwarding endpoint of the service's own, on which any resolve is
-        /// answered with an admin session — a channel for `Storage` requests (C.5c).
+        /// answered with an admin session — a channel for `Storage` requests.
         AdminEndpoint,
-        /// `info/media`: a media session, carrying `Eject` (Phase 6 Part F).
+        /// `info/media`: a media session, carrying `Eject`.
         Media,
-        /// `info/watch`: a watch, on which the service sends a ping per change in the mounts
-        /// (Phase 6 Part F).
+        /// `info/watch`: a watch, on which the service sends a ping per change in the mounts.
         Watch,
         /// Anything else.
         Unknown,
@@ -1055,11 +994,10 @@ pub mod suffix {
         Asked::Unknown
     }
 
-    /// What a resolve arriving on a session endpoint gets: the tables and the filesystems as
-    /// asked, a media session and a watch (Phase 6 Part F), and **any endpoint answered as if it
-    /// did not exist**: another session endpoint, whose holder could then mint more, and above all
-    /// the admin endpoint, which mounts and unmounts. A media session ejects a stick and mounts
-    /// nothing, which is what a session may do.
+    /// What a resolve arriving on a session endpoint gets: the tables, the filesystems, a media
+    /// session and a watch as asked, and **any endpoint answered as if it did not exist**: another
+    /// session endpoint, whose holder could then mint more, and above all the admin endpoint,
+    /// which mounts and unmounts. A media session only ejects, which a session may do.
     pub fn session_only(asked: Asked<'_>) -> Asked<'_> {
         match asked {
             Asked::SessionEndpoint | Asked::AdminEndpoint => Asked::Unknown,
@@ -1069,22 +1007,18 @@ pub mod suffix {
 }
 
 pub mod watch {
-    //! **The sessions following the mounts** (Phase 6 Part F): each a channel the service holds one
-    //! end of and **only sends on** — a bare `Changed` per change — so none takes a slot in the
-    //! service's wait set, and a client holds one for its life at no cost to another's.
-    //!
-    //! **A full queue is a ping already waiting**, since a watch carries nothing else: nothing is
-    //! owed, and a watcher that falls behind loses no change. **A watcher that has gone is found by
-    //! the ping that fails**, `PeerClosed`, and dropped then; when the list is full, every watcher is
-    //! pinged first, which costs the living a needless read of the table and frees the dead.
-    //!
-    //! Nothing here makes a syscall: a ping is the caller's, as an [`Sent`] it reports, so every rule
-    //! is a host test.
+    //! **The sessions following the mounts**: each a channel the service holds one end of and
+    //! **only sends on** — a bare `Changed` per change — so none takes a slot in the service's wait
+    //! set. **A full queue is a ping already waiting**: a watcher that falls behind loses no
+    //! change. **A watcher that has gone is found by the ping that fails**, `PeerClosed`, and
+    //! dropped then; when the list is full, every watcher is pinged first, which costs the living
+    //! a needless read of the table and frees the dead. A ping is the caller's, as a [`Sent`] it
+    //! reports, so every rule is a host test.
 
     use alloc::vec::Vec;
 
-    /// How many watches can be held: the machine's, not a session's, since the service cannot tell
-    /// sessions apart. The shell starts a Files per Places pick and per launch, each holding one.
+    /// How many watches can be held: the machine's, since the service cannot tell sessions apart;
+    /// the shell starts a Files per Places pick and per launch, each holding one.
     pub const MAX_WATCHES: usize = 32;
 
     /// What a ping did.
