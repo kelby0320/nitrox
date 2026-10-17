@@ -1,19 +1,10 @@
 //! Acquiring the system framebuffer from the namespace.
 //!
-//! The one part of `libdraw` that touches syscalls, and therefore the one part behind
-//! the optional `io` feature — the same split `libstream` uses to keep its wire core
-//! dependency-free and host-testable. Everything else in this crate is pure logic over
-//! the [`Framebuffer`](crate::framebuffer::Framebuffer) trait and needs no OS at all.
+//! The one part of `libdraw` that touches syscalls, hence behind the optional `io` feature.
 //!
-//! **Authority is the binding.** There is no display capability to request: a process
-//! can drive the display if and only if `/dev/framebuffer` is in the namespace it was
-//! given (`docs/design/display-substrate.md` §3). [`acquire`] therefore takes a
-//! namespace handle and either finds the binding or does not.
-//!
-//! This lives in the library rather than in whichever program happens to need it first,
-//! because it is the compositor's forever — mapping the aperture and turning firmware's
-//! geometry report into a [`Geometry`] is not throwaway code, even though the program
-//! driving it during Milestone 1 is.
+//! Authority is the binding: a process can drive the display if and only if `/dev/framebuffer`
+//! is in its namespace (`docs/design/display-substrate.md` §3). [`acquire`] takes a namespace
+//! handle and either finds the binding or does not.
 
 use libkern::abi::FramebufferInfo;
 use libkern::handle::{RawHandle, Rights};
@@ -46,13 +37,10 @@ pub const FRAMEBUFFER_INFO_PATH: &str = "/dev/framebuffer/info";
 
 /// Read the framebuffer's geometry without mapping the aperture.
 ///
-/// Useful on its own: a program can report what the display *is* without taking
-/// write access to it.
-///
 /// # Safety
 ///
-/// `root_ns` must be a live namespace handle owned by the caller for the duration of
-/// the call. It is borrowed, never closed.
+/// `root_ns` must be a live namespace handle owned by the caller for the call; it is borrowed,
+/// never closed.
 pub unsafe fn read_info(root_ns: u64) -> Result<FramebufferInfo, AcquireError> {
     // SAFETY: the caller guarantees `root_ns` is live and owned; `borrow` yields a
     // non-owning view that never closes it.
@@ -70,8 +58,7 @@ pub unsafe fn read_info(root_ns: u64) -> Result<FramebufferInfo, AcquireError> {
 
 /// Turn a firmware geometry report into a [`Geometry`].
 ///
-/// Separated out so it can be tested on the host without a namespace: this is where a
-/// channel-order or stride mistake would live, and it is pure arithmetic.
+/// Separate so it can be tested on the host: a channel-order or stride mistake would live here.
 pub fn geometry_from(info: &FramebufferInfo) -> Result<Geometry, AcquireError> {
     if info.bits_per_pixel != 32 {
         return Err(AcquireError::UnsupportedDepth(info.bits_per_pixel));
@@ -81,10 +68,8 @@ pub fn geometry_from(info: &FramebufferInfo) -> Result<Geometry, AcquireError> {
         red: Channel::new(info.red_shift, info.red_size),
         green: Channel::new(info.green_shift, info.green_size),
         blue: Channel::new(info.blue_shift, info.blue_size),
-        // **The display is never an alpha format**, whatever the firmware reports in the fourth
-        // byte — there is nothing behind the screen for a pixel to blend with. Reading one here
-        // would make every `blend_pixel` mix against a byte the hardware leaves at zero, which
-        // is to say paint nothing at all.
+        // The display is never an alpha format whatever firmware reports in the fourth byte; the
+        // hardware leaves it zero, so a blend would paint nothing.
         alpha: None,
     };
     Geometry::with_pitch(info.width, info.height, info.pitch as usize, format).ok_or(AcquireError::ImpossibleGeometry)
@@ -92,15 +77,13 @@ pub fn geometry_from(info: &FramebufferInfo) -> Result<Geometry, AcquireError> {
 
 /// Map the framebuffer and wrap it as a writable [`RawFramebuffer`].
 ///
-/// Reads `/dev/framebuffer/info` for the geometry, then maps `/dev/framebuffer` itself.
-/// The returned framebuffer borrows a mapping that outlives the resolved handles — a
-/// mapping holds its own reference to the object, so closing the handle does not unmap.
+/// Reads `/dev/framebuffer/info` for the geometry, then maps `/dev/framebuffer`. The mapping
+/// holds its own reference to the object, so it outlives the resolved handles.
 ///
 /// # Safety
 ///
-/// `root_ns` must be a live namespace handle owned by the caller for the duration of
-/// the call. The returned [`RawFramebuffer`] must not outlive the process's address
-/// space, and nothing else may write the same mapping concurrently.
+/// `root_ns` must be a live namespace handle owned by the caller for the call. The returned
+/// [`RawFramebuffer`] must not outlive the address space, and nothing else may write the mapping.
 pub unsafe fn acquire(root_ns: u64) -> Result<(RawFramebuffer, FramebufferInfo), AcquireError> {
     // SAFETY: forwarded from this function's own contract.
     let info = unsafe { read_info(root_ns) }?;
@@ -150,8 +133,7 @@ mod tests {
 
     #[test]
     fn a_swapped_channel_report_is_carried_through_not_normalised() {
-        // The bug a self-hash cannot see: firmware reports BGR and the client renders
-        // RGB anyway. The report must survive into the format.
+        // Firmware reports BGR and the client renders RGB anyway: a self-hash cannot see this.
         let mut i = info(32, 5120);
         i.red_shift = 0;
         i.blue_shift = 16;
@@ -162,7 +144,7 @@ mod tests {
 
     #[test]
     fn a_padded_stride_is_preserved_rather_than_recomputed() {
-        // 1280 * 4 = 5120; firmware reporting 5376 means 64 bytes of row padding.
+        // 1280 * 4 = 5120; 5376 means 64 bytes of row padding.
         let g = geometry_from(&info(32, 5376)).unwrap();
         assert_eq!(g.pitch, 5376, "the reported pitch must win over width * bpp");
     }
@@ -175,7 +157,7 @@ mod tests {
 
     #[test]
     fn a_pitch_too_narrow_for_a_row_is_refused() {
-        // Would alias row n+1 onto row n. Better to fail than to render a smear.
+        // Would alias row n+1 onto row n.
         assert_eq!(geometry_from(&info(32, 4096)), Err(AcquireError::ImpossibleGeometry));
     }
 }

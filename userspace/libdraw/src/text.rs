@@ -1,34 +1,9 @@
 //! Glyphs: real TrueType, rasterised at runtime.
 //!
-//! The font is a **file on the root filesystem**, loaded by whoever needs to draw — not
-//! baked into a binary and not in the initramfs, which carries only what is needed to reach
-//! a mounted root. The compositor never loads one: clients render text into their own
-//! buffers and the compositor only composites.
-//!
-//! ## Coverage is blended, since 2026-08-12
-//!
-//! `ab_glyph` hands back 8-bit coverage per pixel — antialiasing — and until M5 Part A this
-//! crate had no way to mix two colours, so coverage was thresholded to one bit. It is not any
-//! more: [`Rgb::blend`](crate::format::Rgb::blend) composites a covered source over what is
-//! already in the buffer, and [`Font::draw_str`] passes the rasteriser's coverage straight
-//! through to it.
-//!
-//! **Glyph coverage is still an argument rather than a channel**, and that is the point of the
-//! shape — M13 Part B added [`PixelFormat::ARGB8888`](crate::format::PixelFormat::ARGB8888) for
-//! surfaces that want to be translucent, and it changed nothing here. A rasterised glyph computes
-//! its coverage per pixel and blends immediately; storing it would mean carrying a channel from
-//! the rasteriser to the compositor to answer a question already answered. Text draws the same
-//! into an opaque surface and a translucent one; coverage is an argument to a blend, not a
-//! fourth byte in a pixel. What made the threshold necessary was the absence of the operation,
-//! not the absence of a channel.
-//!
-//! ## Why a rasteriser rather than a bitmap font
-//!
-//! A bitmap path — a PSF loader, or an embedded glyph table — is code that gets deleted when
-//! real fonts arrive rather than grown into them. `docs/design/display-substrate.md` §6 has
-//! the full argument and the experiment that settled it; the short version is that
-//! `ab_glyph` builds for `x86_64-unknown-nitrox` and the interim compromise moved from the
-//! font to the blend.
+//! The font is a file on the root filesystem, loaded by whoever draws; the compositor never loads
+//! one. `ab_glyph`'s 8-bit coverage goes straight to [`Rgb::blend`](crate::format::Rgb::blend) as
+//! an argument, not a channel, so text draws the same into opaque and translucent surfaces. Why a
+//! rasteriser: `docs/design/display-substrate.md` §6.
 
 use alloc::vec::Vec;
 
@@ -44,16 +19,11 @@ use crate::geom::{Point, Rect, Size};
 /// A loaded font — and, for a UI face, its bold companion if one was found.
 pub struct Font {
     inner: FontVec,
-    /// The same family's bold, which [`bold`](Self::bold) answers with (desktop refresh, Part G).
-    ///
-    /// **A companion rather than a second argument everywhere a font is passed**: a window title
-    /// is the only bold text on the desktop, and threading two faces through every `paint` and
-    /// every metric would put the weight in a hundred signatures for one line of text.
+    /// The same family's bold, which [`bold`](Self::bold) answers with. A companion rather than a
+    /// second argument everywhere a font is passed: a window title is the only bold text.
     bold: Option<alloc::boxed::Box<Font>>,
-    /// The theme's fixed-advance face, which [`mono`](Self::mono) answers with (Part J).
-    ///
-    /// **Beside the bold rather than instead of it**: an editor's buffer is set in this one while
-    /// its chrome stays proportional, so a window needs both at once.
+    /// The theme's fixed-advance face, which [`mono`](Self::mono) answers with. Beside the bold:
+    /// an editor's buffer is set in this one while its chrome stays proportional.
     mono: Option<alloc::boxed::Box<Font>>,
 }
 
@@ -69,10 +39,7 @@ pub struct VMetrics {
 }
 
 impl Font {
-    /// Load a font from its file bytes.
-    ///
-    /// Takes ownership: the bytes come from a file read at runtime, not from a `'static`
-    /// slice, which is what `FontVec` exists for.
+    /// Load a font from its file bytes, taking ownership of the bytes read at runtime.
     pub fn from_bytes(data: Vec<u8>) -> Option<Self> {
         FontVec::try_from_vec(data).ok().map(|inner| Self { inner, bold: None, mono: None })
     }
@@ -83,16 +50,7 @@ impl Font {
         self
     }
 
-    /// This face with `mono` as its fixed-advance companion.
-    ///
-    /// **The same arrangement as [`with_bold`](Self::with_bold), and for the same reason**: a
-    /// window is painted with one face, so a surface that wants a second — an editor's buffer,
-    /// where a proportional face is the largest single difference from the design — carries it
-    /// alongside rather than changing every paint signature (desktop refresh, Part J).
-    ///
-    /// **The theme names this one.** Bold is the built-in face's own companion, chosen by
-    /// `load_ui`; the fixed-advance face is `font_mono`, which a theme may point anywhere, so a
-    /// client loads it with [`load_mono`] and attaches it here.
+    /// This face with `mono` as its fixed-advance companion; the theme names it, see [`load_mono`].
     pub fn with_mono(mut self, mono: Font) -> Self {
         self.mono = Some(alloc::boxed::Box::new(mono));
         self
@@ -103,11 +61,8 @@ impl Font {
         self.mono.as_deref().unwrap_or(self)
     }
 
-    /// The face bold text is drawn in: the companion if there is one, and this face if not.
-    ///
-    /// **The regular face when there is none**, rather than a faked weight: a title in the regular
-    /// weight is a desktop that looks slightly plainer, and a synthetic overstrike smudged the
-    /// counters of every `e` when it was tried against the real bold (Part G).
+    /// The regular face when there is none, rather than a faked weight: a synthetic overstrike
+    /// smudged the counters of every `e`.
     pub fn bold(&self) -> &Font {
         self.bold.as_deref().unwrap_or(self)
     }
@@ -118,12 +73,7 @@ impl Font {
         VMetrics { ascent: s.ascent(), descent: s.descent(), line_height: s.height() + s.line_gap() }
     }
 
-    /// How far the pen advances across `s` at `px`.
-    ///
-    /// **Includes kerning between adjacent pairs.** A monospace font kerns nothing, so this
-    /// is `len × advance` there — but measuring by multiplication would be wrong the moment
-    /// anything proportional is drawn, and the cost of doing it properly is one lookup per
-    /// character.
+    /// How far the pen advances across `s` at `px`, kerning between adjacent pairs included.
     pub fn text_width(&self, s: &str, px: f32) -> u32 {
         let scaled = self.inner.as_scaled(PxScale::from(px));
         let mut w = 0.0f32;
@@ -136,18 +86,12 @@ impl Font {
             w += scaled.h_advance(id);
             prev = Some(id);
         }
-        // Rounded up: a caller laying out a box wants somewhere the text fits, and a box one
-        // pixel short clips the last column of the last glyph.
+        // Rounded up: a box one pixel short clips the last column of the last glyph.
         libm::ceilf(w.max(0.0)) as u32
     }
 
-    /// Whether the face has a glyph for `c`, rather than the substitute it draws instead.
-    ///
-    /// **A missing glyph is a silent failure**, which is why this is worth being able to ask: a
-    /// character the face does not carry maps to `.notdef` and draws as a blank or a box, with
-    /// nothing reported anywhere. Anything that picks a decorative character — a menu's mark, a
-    /// bullet, an arrow — can pin its choice against the shipped face with a host test instead of
-    /// discovering it in a screenshot.
+    /// Whether the face has a glyph for `c`: a missing one draws `.notdef` silently, so a host test
+    /// can pin a decorative character against the shipped face.
     pub fn has_glyph(&self, c: char) -> bool {
         self.inner.glyph_id(c).0 != 0
     }
@@ -158,13 +102,11 @@ impl Font {
         libm::ceilf(scaled.h_advance(scaled.glyph_id(c)).max(0.0)) as u32
     }
 
-    /// Draw `s` with its **left edge and baseline** at `at`, clipped to `clip`.
+    /// Draw `s` with its **left edge and baseline** at `at`, clipped to `clip`; returns the pen
+    /// position after the last glyph.
     ///
-    /// The baseline rather than the top-left, because that is the origin a font's metrics are
-    /// expressed against and the one on which two glyphs of different heights line up.
-    /// [`VMetrics::ascent`] converts from a box's top when a caller wants that instead.
-    ///
-    /// Returns the pen position after the last glyph, so a caller can chain runs.
+    /// The baseline is the origin a font's metrics are expressed against; [`VMetrics::ascent`]
+    /// converts from a box's top.
     pub fn draw_str<F: Framebuffer + ?Sized>(
         &self,
         fb: &mut F,
@@ -187,18 +129,7 @@ impl Font {
                 let bounds = outlined.px_bounds();
                 let (ox, oy) = (bounds.min.x, bounds.min.y);
                 outlined.draw(|gx, gy, coverage| {
-                    // **Blended, since 2026-08-12.** `ab_glyph` hands back 8-bit coverage and
-                    // this used to threshold it at 0.5, because `libdraw` had no way to mix
-                    // two colours. `Rgb::blend` is that way, and the coverage now reaches the
-                    // pixel it was always about.
-                    //
-                    // The `<= 0.5` branch is **gone rather than kept as a fallback**, which is
-                    // a correction to the plan and to `display-substrate.md` §6. A fallback is
-                    // for a caller that cannot take the good path; thresholding is not that,
-                    // it is only worse output. The one caller that could genuinely want it is
-                    // a surface that cannot be read back — and such a surface cannot blend
-                    // *anything*, so that is a `Framebuffer` capability question rather than a
-                    // second glyph loop kept alive against a case nothing has.
+                    // Coverage is blended into what is there (no threshold, no fallback).
                     if coverage <= 0.0 {
                         return;
                     }
@@ -208,13 +139,10 @@ impl Font {
                         return;
                     }
                     let (x, y) = (x as u32, y as u32);
-                    // Rounded, not truncated: coverage is `0.0..=1.0`, and `as u8` on `255.0 *
-                    // c` truncates, so a fully-covered pixel would come out 254 and no glyph
-                    // interior would ever be exactly its own colour.
+                    // Rounded, not truncated: truncating `255.0 * c` would leave a fully covered
+                    // pixel at 254, and no glyph interior would be exactly its own colour.
                     let a = libm::roundf(coverage.clamp(0.0, 1.0) * 255.0) as u8;
-                    // Clipped by the caller's rectangle as well as the framebuffer's own
-                    // bounds: a widget must not draw outside its slot even when the buffer
-                    // would accept the write.
+                    // Clipped by the caller's rectangle too: a widget must stay in its slot.
                     if clip.contains(x as i32, y as i32) {
                         fb.blend_pixel(x, y, colour, a);
                     }
@@ -233,35 +161,18 @@ impl Font {
     }
 }
 
-/// Where the proportional face is bound on the root filesystem — the desktop's own font.
-///
-/// **On the root filesystem, not in the initramfs.** The boot image carries only what cannot
-/// come from a filesystem — see `docs/rationale/deferred-decisions.md`
-/// (`initramfs-minimisation`) — and nothing that draws text runs before the root is mounted.
-/// A 343 KiB font would have been larger than every program in the boot image put together,
-/// and this one is larger still.
+/// The desktop's own font, on the root filesystem rather than in the initramfs, since nothing that
+/// draws text runs before the root is mounted (`initramfs-minimisation`).
 pub const UI_FONT_PATH: &str = "/system/fonts/DejaVuSans.ttf";
 
-/// Where the fixed-advance face is bound — the terminal's.
-///
-/// **Two constants rather than one `SYSTEM_FONT_PATH`, which is the whole of M11 Part D at the
-/// bottom of the stack.** There was one path and every client loaded it, so every label in every
-/// window was monospaced. Deleting the old name rather than keeping it as an alias is the point:
-/// a call site that did not choose a role no longer compiles.
+/// Two constants rather than one `SYSTEM_FONT_PATH`, so a call site must choose a role.
 pub const MONO_FONT_PATH: &str = "/system/fonts/DejaVuSansMono.ttf";
 
-/// Where the proportional face's bold is — a window title's weight (desktop refresh, Part G).
-///
-/// **Not a theme key.** It is the bold of [`UI_FONT_PATH`], loaded beside it only when the theme
-/// uses that face: a theme naming another UI face has no matching bold this system knows of, so
-/// its titles are drawn in that face's regular weight. The same family and the same licence as the
-/// regular face, which is why adding it was a file and not a decision.
+/// The bold of [`UI_FONT_PATH`], loaded beside it only when the theme uses that face; a theme
+/// naming another UI face draws titles in that face's regular weight. Not a theme key.
 pub const UI_BOLD_FONT_PATH: &str = "/system/fonts/DejaVuSans-Bold.ttf";
 
-/// The largest font file [`load`] will read.
-///
-/// A bound rather than trust: the size comes from `sys_handle_stat` on a file this process
-/// does not own, and it is used to size an allocation.
+/// The largest font file [`load`] will read; the size comes from a file this process does not own.
 pub const MAX_FONT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Why loading a font from the namespace failed.
@@ -282,10 +193,7 @@ pub enum LoadError {
 
 #[cfg(feature = "io")]
 impl LoadError {
-    /// Why, in the words a console line wants.
-    ///
-    /// **One phrasing for every caller.** Five programs load fonts and each had spelled these
-    /// out itself, so the same failure read differently depending on which one hit it.
+    /// Why, in the words a console line wants; one phrasing for every caller.
     pub const fn why(self) -> &'static [u8] {
         match self {
             LoadError::NoBinding => b"did not resolve (is it staged into the rootfs?)",
@@ -299,13 +207,9 @@ impl LoadError {
 
 /// Load a font from `path` in `root_ns`.
 ///
-/// The counterpart to [`acquire`](crate::acquire) for the other half of drawing: authority is
-/// the namespace binding, so this either finds the file or does not, and there is no font
-/// capability to ask for.
-///
-/// It maps, copies and unmaps rather than holding the mapping, because [`Font`] owns its
-/// bytes — `ab_glyph`'s parser keeps references into them, and a mapping is a thing another
-/// process could have unmapped underneath us.
+/// Authority is the namespace binding, as for [`acquire`](crate::acquire). It maps, copies and
+/// unmaps rather than holding the mapping: [`Font`] owns its bytes, and `ab_glyph`'s parser keeps
+/// references into them.
 ///
 /// # Safety
 ///
@@ -325,8 +229,7 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
     let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ | Rights::INSPECT) })
         .map_err(|_| LoadError::NoBinding)?;
 
-    // The exact byte length. Mapping is page-granular, so without this the parser would be
-    // handed however much zero padding the last page carries.
+    // The exact byte length: mapping is page-granular and would pad the last page with zeros.
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `&mut info` is a valid 24-byte `HandleInfo` out-param, and `obj` is live.
     let sr = unsafe { syscall2(SYS_HANDLE_STAT, obj.raw().0, (&mut info as *mut HandleInfo) as u64) };
@@ -340,8 +243,7 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
 
     let addr = obj.map(size).map_err(|_| LoadError::Unmappable)?;
     let mut data = Vec::new();
-    // Reserve up front: growing a 343 KiB vector by doubling would map, copy and unmap the
-    // whole thing several times over, which on a demand-paged file means faulting it in twice.
+    // Reserve up front: growing by doubling would fault the demand-paged file in twice.
     data.try_reserve_exact(size).map_err(|_| LoadError::ImpossibleSize(info.size))?;
     // SAFETY: `map` returned a mapping of at least `size` readable bytes.
     data.extend_from_slice(unsafe { core::slice::from_raw_parts(addr as *const u8, size) });
@@ -352,12 +254,9 @@ pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
 
 /// Load the proportional face a theme names, falling back to the built-in one.
 ///
-/// Returns the face **and the path it actually came from**, which is not always the one the
-/// theme asked for — see [`load_themed`]. A caller that reports which font it is using must
-/// report this one, or it names a file it never opened.
-///
-/// `who` prefixes the console line a fallback prints — the calling program's name, as every
-/// other line it writes is prefixed.
+/// Returns the face and the path it actually came from, which may not be the theme's; a caller
+/// reporting the font in use must report this one. `who` prefixes the console line a fallback
+/// prints.
 ///
 /// # Safety
 ///
@@ -367,8 +266,7 @@ pub unsafe fn load_ui(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> 
     let builtin = crate::theme::Theme::light().font_ui;
     // SAFETY: forwarded from this function's own contract.
     let (face, from) = unsafe { load_themed(root_ns, theme.font_ui, builtin, who) }?;
-    // **Its bold, when the face is the built-in one** — see `UI_BOLD_FONT_PATH`. A missing bold
-    // costs the titles their weight and nothing else, so it is said and not fatal.
+    // The built-in face gets its bold; a missing bold costs only the titles their weight.
     if from != builtin {
         return Ok((face, from));
     }
@@ -389,9 +287,8 @@ pub unsafe fn load_ui(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -> 
     }
 }
 
-/// Load the fixed-advance face a theme names, falling back to the built-in one.
-///
-/// Returns the face and the path it came from, as [`load_ui`] does.
+/// Load the fixed-advance face a theme names, falling back to the built-in one; returns the path
+/// it came from, as [`load_ui`] does.
 ///
 /// # Safety
 ///
@@ -402,18 +299,12 @@ pub unsafe fn load_mono(root_ns: u64, theme: &crate::theme::Theme, who: &[u8]) -
     unsafe { load_themed(root_ns, theme.font_mono, crate::theme::Theme::light().font_mono, who) }
 }
 
-/// `wanted`, or `builtin` if `wanted` will not load — the rule written once for both roles, with
-/// the path that was actually opened.
+/// `wanted`, or `builtin` if `wanted` will not load, with the path actually opened.
 ///
-/// **A theme that names a font this machine does not have must not cost the desktop its text.**
-/// That is the same stance the schema takes on every other field: a value that cannot be read
-/// leaves that one thing at its default and the rest of the file still counts. It cannot be
-/// enforced where the rest is, though — `Theme::from_config` runs in the shell, which has no way
-/// to know whether a path resolves in the *application's* namespace, and the answer can differ
-/// between two applications. So the check is here, at the only place that has the namespace.
-///
-/// The fallback is said out loud rather than swallowed: a desktop quietly ignoring the font it
-/// was asked for looks exactly like a theme that never arrived.
+/// A theme naming a font this machine lacks must not cost the desktop its text. That cannot be
+/// checked in the shell (`Theme::from_config`), which does not know what resolves in the
+/// application's namespace, so the check is here. The fallback is said aloud: silence looks like
+/// a theme that never arrived.
 #[cfg(feature = "io")]
 unsafe fn load_themed(
     root_ns: u64,
@@ -424,13 +315,10 @@ unsafe fn load_themed(
     // SAFETY: forwarded from the caller's contract.
     match unsafe { load(root_ns, wanted.as_str()) } {
         Ok(f) => Ok((f, wanted)),
-        // The built-in path itself, so there is nothing to fall back *to*: hand back the error
-        // rather than retrying a lookup, stat and map that can only reach the same answer
-        // (PR #264 review, optional 1).
+        // The built-in path itself: nothing to fall back to, and a retry reaches the same answer.
         Err(e) if wanted == builtin => Err(e),
         Err(e) => {
-            // `s` rather than `untrusted`: a `ThemePath` cannot hold a control byte, which is
-            // most of why it validates at all.
+            // `s` rather than `untrusted`: a `ThemePath` cannot hold a control byte.
             libkern::debug::Line::new()
                 .s(who)
                 .s(b": theme font ")
@@ -452,15 +340,13 @@ mod tests {
     use crate::format::PixelFormat;
     use crate::framebuffer::{Geometry, MemFramebuffer};
 
-    /// The font this system ships, loaded from the tree rather than from the host — the
-    /// image build uses the same file, so a test cannot pass against a different one.
+    /// The shipped font, from the tree, so a test cannot pass against a different file.
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
 
     fn font() -> Font {
         Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
     }
 
-    /// `bold` answers with the companion when there is one and with the face itself when not.
     #[test]
     fn bold_is_the_companion_or_the_face_itself() {
         const REGULAR: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
@@ -478,15 +364,8 @@ mod tests {
         MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888))
     }
 
-    /// Pixels the glyph touched at all — any coverage, not only full.
-    ///
-    /// **The measure `lit` stopped being** when glyphs started blending (2026-08-12). A stroke
-    /// thinner than a pixel now reaches *no* pixel at full coverage, so counting exact-colour
-    /// matches answers "is any part of this glyph solid" rather than "was anything drawn". The
-    /// `.notdef` box is exactly that case and it is what caught this: its outline is one pixel
-    /// wide at 16px, it renders correctly, and the exact-match count is zero.
-    ///
-    /// Buffers here start zeroed, so "not black" is "touched".
+    /// Pixels the glyph touched at all, any coverage: a stroke thinner than a pixel (the `.notdef`
+    /// box at 16px) never reaches full coverage. Buffers start zeroed, so "not black" is touched.
     fn inked(fb: &MemFramebuffer) -> usize {
         let g = fb.geometry();
         let mut n = 0;
@@ -511,8 +390,6 @@ mod tests {
 
     #[test]
     fn a_monospace_font_advances_the_same_for_every_character() {
-        // The property the terminal grid depends on. If this ever fails, the font was
-        // replaced with a proportional one and the grid silently stops being a grid.
         let f = font();
         let w = f.advance('m', 16.0);
         for c in ['i', 'W', '.', '0', 'A'] {
@@ -523,8 +400,6 @@ mod tests {
 
     #[test]
     fn width_counts_characters_not_bytes() {
-        // A byte count is a character count only for ASCII, and getting it wrong mis-sizes
-        // every non-ASCII label — a layout bug in disguise.
         let f = font();
         assert_eq!("é".len(), 2, "two bytes");
         assert_eq!(f.text_width("é", 16.0), f.text_width("m", 16.0), "one cell either way");
@@ -533,15 +408,12 @@ mod tests {
 
     #[test]
     fn width_is_not_additive_because_it_rounds_once_per_string() {
-        // At 16px DejaVu Sans Mono advances ~8.33px, so three of them is 25 and *not*
-        // 3 × ceil(8.33) = 27. A caller sizing a grid must multiply the **advance**, not the
-        // measured width of one character — a first version of this test asserted the
-        // identity and failed against a correct implementation.
+        // At 16px DejaVu Sans Mono advances ~8.33px, so three is 25, not 3 × ceil(8.33) = 27: a
+        // caller sizing a grid must multiply the advance, not one character's measured width.
         let f = font();
         let three = f.text_width("mmm", 16.0);
         assert!(three <= 3 * f.text_width("m", 16.0), "rounding is per string, not per glyph");
         assert!(three >= 3 * f.advance('m', 16.0) - 3, "but only by the rounding: {three}");
-        // Monotone, which is the property layout actually leans on.
         assert!(f.text_width("mm", 16.0) > f.text_width("m", 16.0));
         assert!(three > f.text_width("mm", 16.0));
     }
@@ -556,7 +428,6 @@ mod tests {
         f.draw_str(&mut b, Point::new(10, baseline), "Hi", 16.0, ink, Rect::new(0, 0, 200, 40));
 
         assert!(inked(&b) > 0, "something was drawn");
-        // Nothing to the left of the pen, and nothing below the descent.
         for y in 0..40u32 {
             for x in 0..10u32 {
                 assert_eq!(b.get_pixel(x, y), Some(Rgb::new(0, 0, 0)), "ink left of the pen");
@@ -566,8 +437,6 @@ mod tests {
 
     #[test]
     fn the_clip_rectangle_binds_even_where_the_buffer_would_accept_the_write() {
-        // A widget must not draw outside its slot. Clipping only by the framebuffer's own
-        // bounds lets a long label scribble over its neighbour.
         let f = font();
         let ink = Rgb::new(0xFF, 0xFF, 0xFF);
         let v = f.v_metrics(16.0);
@@ -603,11 +472,7 @@ mod tests {
 
     #[test]
     fn a_space_draws_nothing_and_an_unmapped_codepoint_draws_notdef() {
-        // A client printing arbitrary text must not take the process down, and neither case
-        // is an error. They differ, though, and a first version of this test asserted both
-        // drew nothing: a space has no outline, while an unmapped codepoint gets the font's
-        // `.notdef` box — which is the font behaving correctly, and is how a user sees that
-        // a character is missing rather than silently absent.
+        // A space has no outline; an unmapped codepoint gets `.notdef`.
         let f = font();
         let ink = Rgb::new(0xFF, 0xFF, 0xFF);
         let clip = Rect::new(0, 0, 60, 40);
@@ -623,12 +488,7 @@ mod tests {
 
     #[test]
     fn glyph_edges_land_between_the_ink_and_the_background() {
-        // **The test that says antialiasing is happening.** Every other test here counts
-        // pixels and would pass identically against the thresholded path this replaced —
-        // including `something was drawn`, which is why the change needed its own assertion.
-        //
-        // A curved glyph on a non-black background, so a partially-covered pixel is a colour
-        // that is neither and cannot be produced by any threshold.
+        // Every other test counts pixels and would pass against thresholding.
         let f = font();
         let ink = Rgb::new(0xFF, 0xFF, 0xFF);
         let bg = Rgb::new(0x0E, 0x14, 0x1B);
@@ -653,15 +513,8 @@ mod tests {
 
     #[test]
     fn a_glyph_blends_against_what_is_already_there() {
-        // The destination is *read*, not assumed: a blend hardcoded against black would still
-        // produce partial coverage and pass the test above, while being wrong on any
-        // background but black.
-        //
-        // **Compares only the partially-covered pixels**, which is the correction that made
-        // this test mean anything. A first version compared whole buffers and passed with
-        // thresholding reinstated — of course it did: the two backgrounds differ, so the
-        // pixels the glyph never touched differ, and the assertion was satisfied by the
-        // background rather than by the glyph.
+        // The destination is read, not assumed. Only partially covered pixels are compared: whole
+        // buffers differ by their backgrounds and would pass with thresholding reinstated.
         let f = font();
         let ink = Rgb::new(0xFF, 0xFF, 0xFF);
         let draw = |bg: Rgb| {
@@ -677,7 +530,6 @@ mod tests {
         for y in 0..40 {
             for x in 0..60 {
                 let (pa, pb) = (a.get_pixel(x, y).unwrap(), b.get_pixel(x, y).unwrap());
-                // Partially covered in the first render: neither the ink nor its background.
                 if pa == ink || pa == bg_a {
                     continue;
                 }

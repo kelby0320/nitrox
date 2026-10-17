@@ -1,17 +1,10 @@
 //! Writing a framebuffer out as a PPM image, for looking at a failure.
 //!
-//! The gate compares a 64-bit hash (§8b), which answers *whether* something changed and
-//! nothing about *what*. When the guest and the host disagree, a stride skew, a swapped
-//! channel and a wrong stacking order all present identically: two hex numbers. This
-//! turns that into a picture.
+//! The gate compares a 64-bit hash (§8b), which says whether something changed and not what.
+//! This turns a stride skew, swapped channel or wrong stacking order into a picture.
 //!
-//! **P6 binary PPM**, chosen because it is a text header followed by raw RGB triples —
-//! about ten lines to emit, no dependency, and every image viewer opens it. A PNG would
-//! mean a compressor, and the kernel and userspace both forbid pulling in a crate for
-//! this.
-//!
-//! Only the *visible* pixels are written: row padding is never part of the image, for
-//! the same reason [`hash_visible`](crate::hash::hash_visible) excludes it.
+//! P6 binary PPM: a text header followed by raw RGB triples, with no dependency and openable by
+//! any viewer. Only visible pixels are written, as for [`hash_visible`](crate::hash::hash_visible).
 
 use alloc::vec::Vec;
 
@@ -22,8 +15,7 @@ pub fn to_ppm<F: Framebuffer + ?Sized>(fb: &F) -> Vec<u8> {
     let g = fb.geometry();
     let mut out = Vec::new();
 
-    // Header: "P6\n<width> <height>\n255\n", written without `format!` so this stays
-    // usable from a `no_std` binary with no formatting machinery.
+    // Header: "P6\n<width> <height>\n255\n", written without `format!` so it works in `no_std`.
     out.extend_from_slice(b"P6\n");
     push_decimal(&mut out, g.width as u64);
     out.push(b' ');
@@ -95,8 +87,7 @@ mod tests {
 
     #[test]
     fn a_large_dimension_is_written_in_full() {
-        // `push_decimal` is hand-rolled; a truncated dimension would silently produce
-        // an image that no viewer can open.
+        // `push_decimal` is hand-rolled; a truncated dimension would make an unopenable image.
         let mut out = Vec::new();
         push_decimal(&mut out, 1280);
         assert_eq!(&out[..], b"1280");
