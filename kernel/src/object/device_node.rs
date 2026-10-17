@@ -1,18 +1,10 @@
 //! The [`DeviceNode`] kernel object — the architecture-independent representation
 //! of a discovered device.
 //!
-//! One node represents one device: in Phase 2 a PCI(e) function found by ECAM
-//! enumeration ([`crate::pci`]); later a partition layered over a block device.
-//! A node carries an **identity** (what it is), a **resource descriptor** (the
-//! MMIO windows, interrupt, and bus address a driver needs), a **device class**
-//! (what operations it accepts), and — for block devices — its **geometry**.
-//!
-//! A `DeviceNode` is a handle-accessible object (`KObjectType::DeviceNode`), but
-//! its hardware-facing fields never cross to userspace: a userspace-held handle
-//! is an opaque capability. The block I/O core ([`crate::pci`] /
-//! `sys_io_submit`, later parts) reads block-class nodes; in-kernel Tier 1
-//! drivers read the descriptor directly. Normative shapes:
-//! `docs/spec/device-node.md`.
+//! One node is one device (a PCI(e) function from [`crate::pci`], a char device, a published
+//! disk): an identity, a resource descriptor, a class and, for block devices, a geometry. Its
+//! hardware-facing fields never cross to userspace, where a handle is an opaque capability.
+//! Normative shapes: `docs/spec/device-node.md`.
 
 use crate::io::block::BlockBackend;
 use crate::io::stats::IoStats;
@@ -23,10 +15,8 @@ use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
 use crate::syscall::error::KError;
 
-/// What a device is, from its PCI configuration header.
-///
-/// `#[repr(C)]`, 8 bytes. Kernel-internal (not an ABI-hash input); the field
-/// set mirrors `docs/spec/device-node.md`.
+/// What a device is, from its PCI configuration header (`docs/spec/device-node.md`).
+/// Kernel-internal, like [`ResourceDescriptor`]: not an ABI-hash input.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DeviceIdentity {
@@ -56,10 +46,7 @@ pub const BAR_FLAG_64: u32 = 1 << 0;
 /// `BarWindow::flags` bit: the BAR is prefetchable.
 pub const BAR_FLAG_PREFETCH: u32 = 1 << 1;
 
-/// One PCI base address register, decoded and sized.
-///
-/// `#[repr(C)]`, 24 bytes. A 64-bit BAR occupies one `BarWindow` (its high slot
-/// is recorded as [`BAR_NONE`]).
+/// One PCI base address register, decoded and sized; a 64-bit BAR occupies one window.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BarWindow {
@@ -80,10 +67,8 @@ impl BarWindow {
 
 /// The device's interrupt, as far as enumeration can determine it.
 ///
-/// `#[repr(C)]`, 16 bytes. At enumeration only the raw PCI `line`/`pin` are
-/// known; `gsi`/`trigger`/`polarity` are resolved when a driver routes the
-/// interrupt (the AHCI part). `pin` of `0` means the function asserts no legacy
-/// interrupt.
+/// `#[repr(C)]`, 16 bytes. Enumeration knows only the raw `line`/`pin`; the rest is resolved
+/// when a driver routes the interrupt. A `pin` of `0` means no legacy interrupt.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct InterruptSpec {
@@ -110,17 +95,13 @@ impl InterruptSpec {
         InterruptSpec { gsi: 0, trigger: 0, polarity: 0, line: 0, pin: 0, present: 0, _pad: 0 };
 }
 
-/// The full resource descriptor a driver consumes to drive a device.
-///
-/// `#[repr(C)]`. Kernel-internal (not crossed by modules in Phase 2; not an
-/// ABI-hash input).
+/// The resource descriptor a driver consumes to drive a device; not an ABI-hash input.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ResourceDescriptor {
     /// What the device is.
     pub identity: DeviceIdentity,
-    /// The six PCI BAR slots (a 64-bit BAR fills one slot; its high slot is
-    /// [`BAR_NONE`]).
+    /// The six PCI BAR slots (a 64-bit BAR's high slot is [`BAR_NONE`]).
     pub bars: [BarWindow; 6],
     /// The device's interrupt.
     pub interrupt: InterruptSpec,
@@ -151,11 +132,8 @@ impl ResourceDescriptor {
     };
 }
 
-/// What a device node is and which operations it accepts.
-///
-/// `#[repr(u32)]`. A `Block` node accepts block read/write through the I/O core; a `Char` node
-/// a byte-stream read — the console and the i8042's devices; `Other` is a PCI function, claimed
-/// or not, or a USB device (Phase 6 Part A.3). `Net` and the rest arrive with their first driver.
+/// Which operations a device node accepts: block read/write through the I/O core for `Block`,
+/// a byte-stream read for `Char`, none of its own for `Other`.
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DeviceClass {
@@ -163,8 +141,7 @@ pub enum DeviceClass {
     Other = 0,
     /// A block device: accepts block `Read`/`Write` I/O operations.
     Block = 1,
-    /// A character/stream device (the serial console): accepts byte-stream `Read`
-    /// I/O operations (no block alignment, no device offset).
+    /// A character/stream device: accepts byte-stream `Read` I/O, with no block alignment.
     Char = 2,
 }
 
@@ -180,27 +157,24 @@ impl DeviceClass {
     }
 }
 
-/// A character device's I/O entry point, stored on its [`DeviceNode`] — the
-/// char-class analogue of [`BlockBackend`]. `submit_read` copies up to `max_len`
-/// available bytes into `buffer` at `buf_offset` and completes `po` (immediately if
-/// bytes are buffered, else when they arrive via the device's interrupt); it must
-/// **not** block. Returns `Err` only on a hard failure (e.g. a reader is already
-/// pending — the Phase-2 console is single-reader). `sys_io_submit`'s char path
-/// dispatches a `Read` through this.
+/// A character device's I/O entry point, the char-class analogue of [`BlockBackend`].
+/// `submit_read` completes `po` immediately if bytes are buffered, else when they arrive via
+/// the device's interrupt; it must **not** block, and returns `Err` only on a hard failure
+/// (e.g. a reader already pending).
 #[derive(Copy, Clone)]
 pub struct CharBackend {
     /// Submit a stream read against the device.
     pub submit_read: CharRead,
-    /// **Submit a write to the device**, if it takes one (Phase 6 Part B.5): a keyboard's lights,
-    /// one byte. `None` refuses a write as `Unsupported`, which is every char device before then.
+    /// **Submit a write to the device**, if it takes one: a keyboard's lights, one byte. `None`
+    /// refuses a write as `Unsupported`.
     pub submit_write: Option<CharWrite>,
     /// Device context passed back to `submit_read` and `submit_write` (e.g. the console state).
     pub ctx: *mut (),
 }
 
-/// A char device's read: up to `max_len` bytes into `buffer` at `buf_offset`, completing `po`.
-/// **`offset` is the read's own**, from its `IoOp`: a stream has no position and ignores it, and the
-/// registry's change node reads it as the generation the reader holds (Phase 6 Part C).
+/// A char device's read of up to `max_len` bytes into `buffer` at `buf_offset`, completing
+/// `po`. **`offset` is the read's own**: a stream ignores it; the registry's change node reads
+/// it as the generation the reader holds.
 pub type CharRead = fn(
     buffer: &ObjectRef,
     po: &ObjectRef,
@@ -221,8 +195,7 @@ unsafe impl Send for CharBackend {}
 // SAFETY: as above.
 unsafe impl Sync for CharBackend {}
 
-/// A block device's addressable geometry. Meaningful only for [`DeviceClass::Block`]
-/// nodes; zeroed otherwise. Set by the driver that claims the node.
+/// A block device's addressable geometry; zeroed for other classes, set by the claiming driver.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BlockGeometry {
@@ -237,13 +210,11 @@ impl BlockGeometry {
     pub const ZERO: BlockGeometry = BlockGeometry { logical_block_size: 0, block_count: 0 };
 }
 
-/// A discovered device.
-///
-/// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
+/// A discovered device: `#[repr(C)]` with [`KObjectHeader`] first (see [`crate::object::header`]).
 #[repr(C)]
 pub struct DeviceNode {
     header: KObjectHeader,
-    /// Self-check sentinel; a live object always reads [`DeviceNode::MAGIC`].
+    /// Self-check sentinel.
     magic: u64,
     /// Device class (mutated to `Block` by a claiming driver).
     class: DeviceClass,
@@ -251,18 +222,15 @@ pub struct DeviceNode {
     descriptor: ResourceDescriptor,
     /// Block geometry (zeroed until a block driver claims the node).
     geometry: BlockGeometry,
-    /// What kind of block device this is, and what to call it — the facts a program choosing a
-    /// device needs (Phase 5 Part H.1). Default for a non-block node.
+    /// What kind of block device this is and what to call it — the facts a program choosing a
+    /// device needs. Default for a non-block node.
     block_info: BlockDeviceInfo,
-    /// The block I/O entry point, present iff this is a `Block` node a driver has
-    /// claimed (`sys_io_submit` dispatches through it).
+    /// The block I/O entry point, present iff a driver has claimed this `Block` node.
     block_backend: Option<BlockBackend>,
-    /// The character I/O entry point, present iff this is a `Char` node (the
-    /// console). `sys_io_submit`'s char path dispatches a `Read` through it.
+    /// The character I/O entry point, present iff this is a `Char` node (the console).
     char_backend: Option<CharBackend>,
-    /// **What the device has done** (Phase 6 Part H.2): a disk's driver records each command into
-    /// it, and `/dev/registry/io` serves it. On the node rather than in the driver, since a node
-    /// is never reused and a driver's slot is ([`crate::io::stats`]).
+    /// **What the device has done**, served by `/dev/registry/io`. On the node, since a node is
+    /// never reused and a driver's slot is ([`crate::io::stats`]).
     io: IoStats,
 }
 
@@ -270,8 +238,7 @@ impl DeviceNode {
     /// Sentinel written into [`DeviceNode::magic`] at construction.
     pub const MAGIC: u64 = 0x4465_7669_6365_4e21; // "DeviceN!"
 
-    /// Allocate a device node with a refcount of one (no block backend — the
-    /// enumeration default; a driver claims it later).
+    /// Allocate a device node with a refcount of one and no backend; a driver claims it later.
     pub fn try_new(
         class: DeviceClass,
         descriptor: ResourceDescriptor,
@@ -290,9 +257,7 @@ impl DeviceNode {
         })
     }
 
-    /// Allocate a [`DeviceClass::Char`] node backed by `backend` (the serial
-    /// console). `geometry` is zeroed (meaningless for a char device); the
-    /// descriptor is synthetic ([`ResourceDescriptor::ZERO`] is fine).
+    /// Allocate a [`DeviceClass::Char`] node backed by `backend`, with zeroed geometry.
     pub fn try_new_char(descriptor: ResourceDescriptor, backend: CharBackend) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::DeviceNode),
@@ -307,8 +272,7 @@ impl DeviceNode {
         })
     }
 
-    /// Allocate a [`DeviceClass::Block`] node backed by `backend`, with `geometry`.
-    /// Used by a block driver (the ramdisk; AHCI in Part 3) to publish a disk.
+    /// Allocate a [`DeviceClass::Block`] node backed by `backend`, for a driver publishing a disk.
     pub fn try_new_block(
         descriptor: ResourceDescriptor,
         geometry: BlockGeometry,
@@ -322,10 +286,9 @@ impl DeviceNode {
             class: DeviceClass::Block,
             descriptor,
             geometry,
-            // **The driver says what it published.** Only it knows: the same registry holds
-            // whole disks, the partitions found on them and memory published as a disk, and a
-            // program that cannot tell them apart writes a partition table over a mounted root
-            // (Phase 5 Part H.1).
+            // **The driver says what it published**: the registry mixes whole disks, partitions
+            // and memory published as a disk, and a program that cannot tell them apart writes a
+            // partition table over a mounted root.
             block_info: BlockDeviceInfo::new(kind, geometry.logical_block_size, geometry.block_count, name),
             block_backend: Some(backend),
             char_backend: None,
@@ -374,9 +337,7 @@ impl DeviceNode {
     }
 }
 
-// No `Drop`: a `DeviceNode` owns no out-of-line resources (the descriptor is
-// inline, the MMIO windows are not owned), so the `KBox` drop run by
-// `dispatch_destroy` suffices.
+// No `Drop`: the node owns no out-of-line resources (MMIO windows are not owned).
 
 #[cfg(test)]
 mod tests {

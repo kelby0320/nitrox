@@ -1,11 +1,9 @@
-//! The [`SystemControl`] kernel object — the capability to stop the machine (administration
-//! Part E.3).
+//! The [`SystemControl`] kernel object — the capability to stop the machine.
 //!
 //! **One exists**, made at boot and handed to `init` in `rdx`, with `WRITE` and `INSPECT` and
 //! neither `DUPLICATE` nor `TRANSFER`: `init` cannot duplicate it, send it, grant it at spawn or
 //! bind it in a namespace, so the process that stops the machine is the one the kernel started
-//! first. Like an [`EntropyObject`](super::EntropyObject)
-//! it is a **token** and carries no state — the machine it controls is the one there is.
+//! first. Like an [`EntropyObject`](super::EntropyObject) it is a stateless token.
 //! `sys_power` looks it up, requiring `WRITE`, and flushes, stops and halts or resets through
 //! [`crate::power`]. See `docs/architecture/power.md`.
 
@@ -13,9 +11,8 @@ use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::{AllocError, KBox};
 use crate::object::header::KObjectHeader;
 
-/// The rights `init`'s handle carries: `WRITE`, which `sys_power` requires, and `INSPECT`, so it
-/// can check what it was handed — and neither `DUPLICATE` nor `TRANSFER`, so it can give the
-/// handle to no one.
+/// The rights `init`'s handle carries: `WRITE`, which `sys_power` requires, and `INSPECT`;
+/// neither `DUPLICATE` nor `TRANSFER`, so it can give the handle to no one.
 pub const INIT_RIGHTS: Rights = Rights::WRITE.union(Rights::INSPECT);
 
 /// The capability to stop or reset the machine.

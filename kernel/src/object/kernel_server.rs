@@ -1,22 +1,11 @@
 //! In-kernel resource servers and their dispatch registry.
 //!
-//! A **Kernel Server** is one of the two kinds of resource server (the other,
-//! a Userspace Server, lands in slice 7): an in-kernel function the kernel calls
-//! *during a namespace lookup* to produce a handle. See
-//! `docs/architecture/namespace-and-resource-servers.md` § "Kernel Servers".
-//!
-//! A [`BindingTarget::KernelServer`](crate::object::namespace::BindingTarget)
-//! binding holds a [`KernelServerId`] — a small dispatch id into the registry
-//! below. `sys_ns_lookup` resolves the path to the binding, then calls
-//! [`dispatch`] **in the caller's syscall context** with the lookup *suffix* and
-//! the requested rights; the server answers with an [`OpStatus`]. The syscall
-//! installs the rights-attenuated handle and pre-signals the lookup's
-//! `PendingOperation` — reusing the slice-1 direct-handle delivery path, so an
-//! in-kernel lookup is synchronous (no IPC, no cross-context install, no new ABI).
-//!
-//! The contract mirrors the umbrella resource-server contract exactly
-//! (`lookup(suffix, rights) -> OpStatus`), which is what makes a Kernel Server
-//! substitutable for a Userspace Server at the same path with zero client change.
+//! A **Kernel Server** is an in-kernel function `sys_ns_lookup` calls, in the caller's syscall
+//! context, to produce a handle for a
+//! [`BindingTarget::KernelServer`](crate::object::namespace::BindingTarget) binding; the other
+//! kind is [`super::userspace_server`] (`docs/architecture/namespace-and-resource-servers.md`
+//! § "Kernel Servers"). The syscall installs the rights-attenuated handle and pre-signals the
+//! lookup's `PendingOperation`, so an in-kernel lookup is synchronous.
 
 use crate::libkern::KBox;
 use crate::libkern::handle::{KObjectType, Rights};
@@ -27,95 +16,58 @@ use crate::object::ObjectRef;
 use crate::object::Process;
 use crate::syscall::error::KError;
 
-/// Identifies one in-kernel resource server in the dispatch registry. A
-/// [`BindingTarget::KernelServer`](crate::object::namespace::BindingTarget)
-/// binding holds one of these; [`dispatch`] fans out on it.
-///
-/// `Copy` (no backing allocation) — a `KernelServer` binding therefore needs no
-/// outside-the-lock drop, unlike a direct-handle binding.
+/// Identifies one in-kernel resource server; `Copy`, so a `KernelServer` binding needs no
+/// outside-the-lock drop.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum KernelServerId {
     /// `/dev/entropy` — the kernel CSPRNG (see [`entropy_server`]).
     Entropy,
     /// `/proc/self/process` — the caller's own [`Process`] (see [`proc_self_process`]).
     ProcSelfProcess,
-    /// `/proc/self/thread` — the calling [`Thread`](crate::object::Thread)
-    /// (see [`proc_self_thread`]).
+    /// `/proc/self/thread` — the calling [`Thread`](crate::object::Thread).
     ProcSelfThread,
-    /// `/proc/self/namespace` — the caller's root
-    /// [`Namespace`](crate::object::Namespace) (see [`proc_self_namespace`]).
+    /// `/proc/self/namespace` — the caller's root [`Namespace`](crate::object::Namespace).
     ProcSelfNamespace,
-    /// `/proc/self/status` — the caller's numeric pid/tid as a read-only
-    /// [`MemoryObject`] text snapshot (see [`proc_self_status`]).
+    /// `/proc/self/status` — the caller's pid/tid as a read-only [`MemoryObject`] text snapshot.
     ProcSelfStatus,
     /// `/proc/cmdline` — the command line this boot was given, as text.
     ProcCmdline,
-    /// `/initramfs/<path>` — a file from the boot CPIO blob, served as a
-    /// read-only [`MemoryObject`] copy (see [`initramfs_server`]).
+    /// `/initramfs/<path>` — a boot CPIO file, as a read-only [`MemoryObject`] copy.
     Initramfs,
-    /// `/dev/input/raw/<n>` — the `n`-th raw input device (a char
-    /// [`DeviceNode`](crate::object::DeviceNode)) published by the i8042 driver:
-    /// `0` is the keyboard, `1` the mouse. One binding owns the subtree; the suffix
-    /// indexes it, exactly as `/dev/blk` does. See [`raw_input_server`].
+    /// `/dev/input/raw/<n>` — the `n`-th raw input device (`0` keyboard, `1` mouse).
     RawInput,
-    /// `/dev/blk/<n>` — the `n`-th discovered block device, served as a
-    /// [`DeviceNode`](crate::object::DeviceNode) handle (see [`block_device_server`]).
-    /// One binding (at `/dev/blk`) owns the whole subtree; the suffix indexes the
-    /// device-table registry.
+    /// `/dev/blk/<n>` — the `n`-th block device; one binding owns the subtree.
     BlockDevice,
-    /// `/dev/console` — the serial console (a char [`DeviceNode`](crate::object::DeviceNode))
-    /// the caller reads with `sys_io_submit(Read)` (see [`console_server`]).
+    /// `/dev/console` — the serial console, a char [`DeviceNode`](crate::object::DeviceNode).
     Console,
-    /// `/dev/log` — the kernel log ring, served as a read-only [`MemoryObject`]
-    /// snapshot the caller maps + reads (`cat /dev/log` = dmesg; see [`log_server`]).
+    /// `/dev/log` — the kernel log ring as a read-only [`MemoryObject`] snapshot.
     Log,
-    /// `/proc/sched/stats` — per-CPU scheduler statistics, served as a read-only
-    /// [`MemoryObject`] text snapshot (see [`sched_stats_server`]).
+    /// `/proc/sched/stats` — per-CPU scheduler statistics as a read-only [`MemoryObject`].
     SchedStats,
-    /// `/dev/framebuffer` — the display aperture (see [`framebuffer_server`]). The one
-    /// server with **two leaves**: the bound path itself resolves to the mappable
-    /// aperture, and the `info` suffix to its geometry.
+    /// `/dev/framebuffer` — the display aperture, the one server with **two leaves**.
     Framebuffer,
-    /// `/dev/registry` — the device table (see [`registry_server`]): the bound path is a
-    /// read-only snapshot of every node's record, and `<id>` is that node. **Root namespace only.**
-    /// It is how the `/dev` listing's last limitation is answered — a kernel server owning a
-    /// subtree lists as empty, so the table is read here instead, and served to anyone else by the
-    /// device manager at `/dev/devices` (administration Part B).
+    /// `/dev/registry` — the device table; **root namespace only**, served onward by the device
+    /// manager at `/dev/devices`.
     Registry,
 }
 
-/// The outcome of a resource-server lookup — the umbrella RS contract's return.
-///
-/// A **Kernel Server** answers synchronously, so it returns only [`Completed`] or
-/// [`Rejected`]. The third state, [`Pending`], belongs to the **userspace** path
-/// (slice 7): the kernel forwarded the lookup over IPC and the lookup's
-/// `PendingOperation` will be completed later, when the server replies. An
-/// in-kernel server never returns it (it never blocks).
-///
-/// [`Completed`]: OpStatus::Completed
-/// [`Rejected`]: OpStatus::Rejected
-/// [`Pending`]: OpStatus::Pending
+/// The outcome of a resource-server lookup. A Kernel Server answers synchronously, so it
+/// returns only [`Completed`](OpStatus::Completed) or [`Rejected`](OpStatus::Rejected);
+/// `Pending` belongs to the userspace path.
 pub enum OpStatus {
-    /// The server produced a handle to a kernel object. The caller installs it
-    /// (rights-attenuated) and pre-signals the lookup PO with status `0`.
+    /// A handle to a kernel object; the caller installs it (rights-attenuated), pre-signalling `0`.
     Completed(ObjectRef),
     /// The lookup failed; the caller delivers `err` through the lookup PO.
     Rejected(KError),
-    /// The lookup was forwarded to a Userspace Server; its `PendingOperation` is
-    /// left **uncompleted** and will be signalled when the server's reply arrives
-    /// (the `sys_ns_lookup` forwarding arm). Only the userspace path produces this.
+    /// Forwarded to a Userspace Server: the lookup's `PendingOperation` stays **uncompleted**.
     Pending,
 }
 
-/// Call the in-kernel server identified by `id` with the lookup `suffix` (the
-/// part of the path past the binding prefix, leading `/` stripped — empty on an
-/// exact match) and the `requested` rights. Runs in the caller's syscall
-/// context, so a server may read the calling process/thread directly (the
-/// `/proc/self` servers will, in Part C).
+/// Call the in-kernel server `id` with the lookup `suffix` (past the binding prefix, no
+/// leading `/`; empty on an exact match), in the caller's syscall context.
 ///
-/// Rights *attenuation* is the lookup syscall's job (`requested ∩ binding.rights`
-/// is applied to whatever object the server returns), so a server hands back a
-/// full-rights object and need not attenuate itself.
+/// Rights *attenuation* is the lookup syscall's job (`requested ∩ binding.rights`): a server
+/// returns a full-rights object and ignores `requested`.
 pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatus {
     match id {
         KernelServerId::Entropy => entropy_server(suffix, requested),
@@ -135,10 +87,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
     }
 }
 
-/// Adopt a freshly created [`MemoryObject`] into a [`Completed`](OpStatus::Completed)
-/// lookup answer — the shared tail of every server that synthesizes (or copies
-/// into) a new object per lookup: initramfs, `/dev/log`, `/proc/sched/stats`,
-/// `/proc/self/status`.
+/// Adopt a fresh [`MemoryObject`] into a [`Completed`](OpStatus::Completed) answer.
 fn complete_with_memobj(obj: KBox<MemoryObject>) -> OpStatus {
     // SAFETY: `into_raw` yields the one outstanding creation reference.
     OpStatus::Completed(unsafe {
@@ -146,20 +95,12 @@ fn complete_with_memobj(obj: KBox<MemoryObject>) -> OpStatus {
     })
 }
 
-/// `/dev/entropy` — a **leaf** server: it owns exactly the bound path and has no
-/// sub-resources, so any non-empty `suffix` is *not found*. An exact match mints
-/// a fresh [`EntropyObject`] token onto the global CSPRNG (the same object
-/// `sys_entropy_create` returns); the caller then `sys_entropy_read`s it.
-///
-/// `requested` is accepted to match the RS contract but ignored — the binding's
-/// rights cap what the caller obtains, applied by the lookup syscall.
+/// `/dev/entropy` — a **leaf**; an exact match mints an [`EntropyObject`] on the global CSPRNG.
 fn entropy_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
     }
     match EntropyObject::try_new() {
-        // Adopt the single creation reference into an `ObjectRef` for the caller
-        // to install.
         // SAFETY: `into_raw` yields the one outstanding creation reference.
         Ok(obj) => OpStatus::Completed(unsafe {
             ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), KObjectType::EntropyObject)
@@ -168,15 +109,12 @@ fn entropy_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-// --- /proc/self — self-reference servers (no ambient authority) -----------
+// --- /proc/self — self-reference servers (no ambient authority) ---
 //
-// Each is a **leaf** (non-empty suffix → `NotFound`) that returns the **caller's
-// own** object, derived from the running syscall context — there is no pid
-// parameter to forge, and the facility is reachable only if a supervisor bound it
-// into the caller's namespace. See `docs/architecture/namespace-and-resource-servers.md`
-// § "`/proc/self`". The returned `ObjectRef` is a clone (an atomic refcount bump),
-// owned by the caller; rights attenuation to the binding's cap is the lookup
-// syscall's job. `None` (a kernel/boot thread with no process) → `NotFound`.
+// **Leaves** returning the **caller's own** object from the running syscall context: no pid
+// parameter to forge, reachable only if a supervisor bound it
+// (`docs/architecture/namespace-and-resource-servers.md` § "`/proc/self`"). `None` (a boot
+// thread with no process) → `NotFound`.
 
 /// `/proc/self/process` — the caller's own [`Process`] handle.
 fn proc_self_process(suffix: &[u8], _requested: Rights) -> OpStatus {
@@ -200,8 +138,7 @@ fn proc_self_thread(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/proc/self/namespace` — the caller's root [`Namespace`](crate::object::Namespace)
-/// handle (the same object `Process::namespace` resolves names against).
+/// `/proc/self/namespace` — the caller's root [`Namespace`](crate::object::Namespace).
 fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
@@ -217,14 +154,8 @@ fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/proc/cmdline` — the command line this boot was given, as a fresh read-only
-/// [`MemoryObject`] holding the bytes and nothing else (no trailing newline: it is one line, and
-/// a reader matching words does not want to strip one).
-///
-/// **The kernel does not interpret every word of it.** It reads the flags it acts on at boot
-/// (`cmdline::parse`) and serves the line whole, so a word meant for userspace needs no
-/// kernel-side list to survive the journey. (None is read today; `install` was, from Phase 5 Part
-/// H.1 until administration Part G.3.) A non-empty `suffix` is *not found*; this is a leaf.
+/// `/proc/cmdline` — the boot command line as a read-only [`MemoryObject`]. A leaf, served
+/// whole, so a word meant for userspace needs no kernel-side list to survive the journey.
 fn proc_cmdline(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
@@ -235,22 +166,8 @@ fn proc_cmdline(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/proc/self/status` — a **leaf** server returning the **caller's own**
-/// numeric identity as a fresh read-only [`MemoryObject`] text snapshot:
-///
-/// ```text
-/// pid=2
-/// tid=5
-/// ```
-///
-/// The second consumer of the **capture → format → synthesize** discipline
-/// (see `docs/architecture/scheduler.md` § "The stats surface"): the identity
-/// is read from the running syscall context under one `SCHED` hold
-/// ([`crate::sched::current_pid_tid`]) — like the other `/proc/self` leaves
-/// there is **no pid parameter to forge** — then formatted and wrapped with no
-/// lock held. A kernel/boot caller (no owning process) or a non-empty `suffix`
-/// is *not found*. Closes the deferred numeric-`/proc/self/status` item
-/// (`docs/rationale/deferred-decisions.md`).
+/// `/proc/self/status` — a **leaf**: the caller's own `pid=`/`tid=` as a [`MemoryObject`]
+/// snapshot, captured under one `SCHED` hold ([`crate::sched::current_pid_tid`]).
 fn proc_self_status(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
@@ -268,11 +185,7 @@ fn proc_self_status(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/initramfs/<path>` — serve a file from the boot CPIO blob as a fresh
-/// read-only [`MemoryObject`] (a copy of the file's bytes; the caller maps it
-/// `MAP_READ`). The `suffix` is the path under `/initramfs` (no leading `/`); an
-/// empty suffix, no loaded initramfs, or an absent file is `NotFound`. Unlike the
-/// other in-kernel servers this is a **subtree** server: it uses the suffix.
+/// `/initramfs/<path>` — a **subtree** server: a read-only [`MemoryObject`] copy of a boot file.
 fn initramfs_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     if suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
@@ -289,21 +202,11 @@ fn initramfs_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/dev/blk/<n>` — a **subtree** server over the block-device registry. The
-/// `suffix` is a decimal index (`/dev/blk/0` ⇒ `b"0"`); it resolves to the
-/// `n`-th block [`DeviceNode`](crate::object::DeviceNode), on which the caller
-/// issues `sys_io_submit` reads. An empty or non-numeric suffix, or an index
-/// past the discovered disks, is *not found*. One binding (at `/dev/blk`) serves
-/// every disk; the binding is read-only in Phase 2, so the lookup attenuates the
-/// returned handle to `READ` (write IoOps are rejected at the rights gate).
-///
-/// `requested` is accepted to match the RS contract but ignored — the binding's
-/// rights cap what the caller obtains, applied by the lookup syscall.
+/// `/dev/blk/<n>` — a **subtree** server: a decimal index resolves to the `n`-th block
+/// [`DeviceNode`](crate::object::DeviceNode); `<n>/info` yields its `BlockDeviceInfo`.
 fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
-    // **`<n>/info` says what `<n>` is** (Phase 5 Part H.1), the shape `/dev/framebuffer/info`
-    // already uses: one `BlockDeviceInfo`, copied into a fresh read-only object. Without it a
-    // program choosing a device knows only an index, and this registry holds whole disks, the
-    // partitions found on them and memory published as a disk.
+    // `<n>/info` says what `<n>`: without it a program knows only an index, and this registry
+    // mixes whole disks, partitions and memory published as a disk.
     let (index_bytes, want_info) = match suffix.strip_suffix(b"/info") {
         Some(head) => (head, true),
         None => (suffix, false),
@@ -325,18 +228,12 @@ fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/dev/input/raw/<n>` — the `n`-th raw input device, as a char
-/// [`DeviceNode`](crate::object::DeviceNode) the caller reads with `sys_io_submit(Read)`.
-/// A non-numeric suffix, or an index no device answered for, is *not found*.
+/// `/dev/input/raw/<n>` — the `n`-th raw input device, a char
+/// [`DeviceNode`](crate::object::DeviceNode).
 ///
-/// **This binding is the authority to read one device unfiltered**, and it is meant for the
-/// `input-server` alone (`docs/architecture/input-subsystem.md` §5). That exclusivity is a
-/// constraint on whoever binds it, not a property of this code — the same gap the PR #176
-/// review found in `tty-server`'s precedent, where `session-mgr` still projects
-/// `/dev/console` into every session.
-///
-/// `requested` is accepted to match the RS contract but ignored — the binding's rights cap
-/// what the caller obtains, applied by the lookup syscall.
+/// **This binding is the authority to read one device unfiltered**, meant for the
+/// `input-server` alone (`docs/architecture/input-subsystem.md` §5): an exclusivity that
+/// binds whoever binds it, not this code.
 fn raw_input_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     let Some(index) = parse_index(suffix) else {
         return OpStatus::Rejected(KError::NotFound);
@@ -347,24 +244,18 @@ fn raw_input_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/dev/registry` — the device table, and the one way to read it outside the kernel.
+/// `/dev/registry` — the device table, the one way to read it outside the kernel.
 ///
-/// - `""` → a fresh read-only [`MemoryObject`]: a `RegistryHeader` whose **count** is the number
-///   of records, then that many `DeviceRecord`s (`crate::libkern::device`), then zero padding to
-///   the page. The count is the length: the object's size is page-rounded.
-/// - `"<id>"` → node `id` itself, a [`DeviceNode`](crate::object::DeviceNode) handle, so the
-///   device manager can hand a class owner the device it read a record of. **`NotFound` for a
-///   departed device** (Phase 6 Part C): its record stays, and its node is no longer handed out.
-/// - `"changes"` → the change node (Phase 6 Part C): a `Read` on it waits until the table's
-///   generation is past the read's `offset`, then answers with the generation. How the device
-///   manager follows the table.
-/// - `"io"` → a fresh read-only [`MemoryObject`] (Phase 6 Part H.2): an `IoHeader` carrying the page
-///   cache's counters, then an `IoRecord` per disk and RAM disk — what each has done since boot
-///   (`crate::libkern::device`).
+/// - `""` → a read-only [`MemoryObject`]: a `RegistryHeader` whose **count** is the number of
+///   `DeviceRecord`s (`crate::libkern::device`) that follow, zero-padded to the page.
+/// - `"<id>"` → node `id`, so the device manager can hand a class owner its device.
+///   **`NotFound` for a departed device**: its record stays, its node is no longer handed out.
+/// - `"changes"` → the change node: a `Read` waits until the table's generation is past the
+///   read's `offset`, then answers with the generation.
+/// - `"io"` → a read-only [`MemoryObject`]: an `IoHeader` of the page cache's counters, then
+///   an `IoRecord` per disk and RAM disk.
 ///
-/// **Authority is the binding**, which the kernel makes in the root namespace only: `<id>` is
-/// every raw device there is. `requested` is ignored — the binding's rights cap what the caller
-/// obtains, applied by the lookup syscall.
+/// **Authority is the binding**, made in the root namespace only: `<id>` is every raw device.
 fn registry_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     if suffix.is_empty() {
         let bytes = match crate::device::registry_snapshot() {
@@ -401,14 +292,8 @@ fn registry_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/dev/log` — a **leaf** server returning the kernel log ring as a fresh
-/// read-only [`MemoryObject`] snapshot (the caller maps it `MAP_READ` and reads —
-/// `cat /dev/log`, the system `dmesg`). The object is sized to the bytes logged so
-/// far; a partial last page is zero-padded (the reader trims). Any non-empty
-/// `suffix` is *not found*.
-///
-/// `requested` is accepted to match the RS contract but ignored — the binding's
-/// rights cap what the caller obtains, applied by the lookup syscall.
+/// `/dev/log` — a **leaf**: the kernel log ring as a read-only [`MemoryObject`] snapshot
+/// (`dmesg`), the last page zero-padded.
 fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
@@ -418,36 +303,24 @@ fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         Ok(m) => m,
         Err(_) => return OpStatus::Rejected(KError::OutOfMemory),
     };
-    // Copy the log into the object's frames (under the ring lock, in the object's
-    // creation reference before adopting it).
     crate::klog::copy_into_frames(memobj.frames());
     complete_with_memobj(memobj)
 }
 
-/// `/dev/framebuffer` — the display aperture, and the one server with **two leaves**.
+/// `/dev/framebuffer` — the display aperture, with **two leaves**.
 ///
-/// - `""` (the bound path itself) → a **borrowed** [`MemoryObject`] over the firmware
-///   aperture. Borrowed is load-bearing: the frames are MMIO the kernel does not own, and
-///   an owned object would hand those physical addresses to the buddy allocator when the
-///   last handle closed (see [`FrameOwnership`](crate::object::memory_object::FrameOwnership)).
-/// - `"info"` → a read-only [`MemoryObject`] holding one
-///   [`FramebufferInfo`](crate::libkern::framebuffer::FramebufferInfo): width, height,
-///   pitch and channel layout, none of which a client can infer from the bytes.
+/// - `""` → a **borrowed** [`MemoryObject`] over the firmware aperture. Borrowed is
+///   load-bearing: the frames are MMIO, and an owned object would hand them to the buddy
+///   allocator when the last handle closed (see
+///   [`FrameOwnership`](crate::object::memory_object::FrameOwnership)).
+/// - `"info"` → a read-only [`MemoryObject`] of one
+///   [`FramebufferInfo`](crate::libkern::framebuffer::FramebufferInfo): two leaves rather than
+///   a richer `HandleInfo`, a frozen layout shared by every type
+///   (`docs/design/display-substrate.md` §3).
 ///
-/// Two leaves rather than a richer `HandleInfo`, because that struct is a frozen 24-byte
-/// layout shared by every object type and the wrong home for per-type fields — and it is
-/// the same namespace lookup every other server uses, so no new syscall appears
-/// (`docs/design/display-substrate.md` §3, geometry "as an attribute of the resource
-/// rather than a second protocol").
-///
-/// **Authority is the binding.** There is no display capability bit: a process can drive
-/// the display if and only if its namespace contains this path (§3, and the same rule the
-/// fs-server and profile-server live under). `requested` is ignored here — the binding's
-/// rights cap what the caller obtains, applied by the lookup syscall.
-///
-/// Returns `Unsupported` when no aperture was recorded at boot (no framebuffer, or a
-/// depth other than 32 bits), rather than a zero-sized object a client would map and then
-/// scribble past.
+/// **Authority is the binding**: a process can drive the display iff its namespace contains
+/// this path. `Unsupported` when no aperture was recorded at boot, rather than a zero-sized
+/// object a client would map and then scribble past.
 fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     let Some((phys_base, info, caching)) = crate::framebuffer::aperture() else {
         return OpStatus::Rejected(KError::Unsupported);
@@ -463,26 +336,22 @@ fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
                 MemoryObject::try_new_borrowed(
                     phys_base,
                     info.byte_len as usize,
-                    // **What the aperture said it is** (Phase 5 Part G.3), not a second opinion
-                    // about framebuffers: one answer, recorded at boot, reaching every mapping.
+                    // What the aperture said it is, recorded once at boot.
                     caching,
                 )
             } {
                 Ok(obj) => {
-                    // **Said out loud, because nothing else can see it** (PR #306 review): the
-                    // object a client maps is the only place the aperture's answer actually
-                    // reaches userspace, and a handout that quietly minted an ordinary object
-                    // would cost 45x on the laptop with every gate still green. The boot's own
-                    // measurement cannot catch that — it reads the aperture, not this object.
-                    // **`obj`, not the value passed to the constructor.** A first version read
-                    // the aperture's variable here, so a control that minted an ordinary object
-                    // still printed "write-combining" — a line about the wrong thing, twice in
-                    // one part (PR #306 review). What a client maps is what this object says.
+                    // **Said out loud, because nothing else can see it**: the object a client
+                    // maps is the only place the aperture's answer reaches userspace, and a
+                    // handout that quietly minted an ordinary object would cost 45x on the
+                    // laptop with every gate still green. It reads **`obj`**, not the value
+                    // passed to the constructor, so a control minting an ordinary object cannot
+                    // still print "write-combining".
                     crate::kprintln!("framebuffer: handed out as {} memory", obj.caching().name());
                     // **The screen changes hands here**, before the handle exists: the console
-                    // stops painting under its own lock, so nothing it draws can land on a frame
-                    // this client has started. Only on success — a refused handout leaves the
-                    // console as the only thing drawing, which is better than nothing drawing.
+                    // stops painting under its own lock, so nothing it draws can land on a
+                    // frame this client has started. Only on success: a refused handout leaves
+                    // the console drawing.
                     crate::fbcon::yield_to_userspace();
                     complete_with_memobj(obj)
                 }
@@ -497,17 +366,9 @@ fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/proc/sched/stats` — a **leaf** server returning the per-CPU scheduler
-/// statistics as a fresh read-only [`MemoryObject`] text snapshot (`cpus_online=N`
-/// and one `name=value` row per online CPU — see `crate::sched::stats` and
-/// `docs/architecture/scheduler.md` § "The stats surface"). The full
-/// **capture → format → synthesize** discipline in one place: the counters are
-/// copied under a single `SCHED` hold ([`crate::sched::stats_snapshot`]), the
-/// text is formatted with no lock held, and the bytes become the object via
-/// [`MemoryObject::try_new_filled`]. Any non-empty `suffix` is *not found*.
-///
-/// `requested` is accepted to match the RS contract but ignored — the binding's
-/// rights cap what the caller obtains, applied by the lookup syscall.
+/// `/proc/sched/stats` — a **leaf**: per-CPU scheduler statistics as a read-only
+/// [`MemoryObject`] text snapshot, captured under one `SCHED` hold
+/// ([`crate::sched::stats_snapshot`]) and formatted with no lock held.
 fn sched_stats_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
@@ -523,14 +384,8 @@ fn sched_stats_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// `/dev/console` — a **leaf** server returning a counted reference to the serial
-/// console (a char [`DeviceNode`](crate::object::DeviceNode)). An exact match yields
-/// the console node, on which the caller issues `sys_io_submit(Read)` to read
-/// keyboard input; any non-empty `suffix`, or the console not yet up, is *not found*.
-/// The binding is read-only (input), so the lookup attenuates the handle to `READ`.
-///
-/// `requested` is accepted to match the RS contract but ignored — the binding's
-/// rights cap what the caller obtains, applied by the lookup syscall.
+/// `/dev/console` — a **leaf**: the serial console, a char
+/// [`DeviceNode`](crate::object::DeviceNode); *not found* until the console is up.
 fn console_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     if !suffix.is_empty() {
         return OpStatus::Rejected(KError::NotFound);
@@ -541,8 +396,7 @@ fn console_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
-/// Parse `s` as a non-empty run of ASCII decimal digits into a `usize`, or
-/// `None` (empty, non-digit, or overflow).
+/// Parse `s` as a non-empty run of ASCII decimal digits, or `None` (empty, non-digit, overflow).
 fn parse_index(s: &[u8]) -> Option<usize> {
     if s.is_empty() {
         return None;
@@ -579,7 +433,6 @@ mod tests {
         match dispatch(KernelServerId::Entropy, b"", Rights::READ) {
             OpStatus::Completed(obj) => {
                 assert_eq!(obj.object_type(), KObjectType::EntropyObject);
-                // Drop releases the creation reference (no handle installed here).
                 drop(obj);
             }
             OpStatus::Rejected(e) => panic!("expected Completed, got Rejected({e:?})"),
@@ -598,11 +451,8 @@ mod tests {
         }
     }
 
-    // `/proc/sched/stats` is fully host-testable: `stats_snapshot` only locks the
-    // `SCHED` static (no `current_cpu()` read), and host tests never online a CPU
-    // there — so the snapshot is deterministically "all offline" and the rendered
-    // text is exactly the header. The populated multi-CPU rendering is covered by
-    // the formatter tests in `sched::tests`; the live counters by the QEMU selftest.
+    // Host tests never online a CPU, so the snapshot is all offline and the text exactly the
+    // header; the populated rendering is covered in `sched::tests` and the QEMU selftest.
     #[test]
     fn sched_stats_exact_match_yields_text_snapshot_memobj() {
         use crate::mm::{PAGE_SIZE, heap};
@@ -642,11 +492,8 @@ mod tests {
         }
     }
 
-    // The `/proc/self/*` leaves reject a non-empty suffix; that arm runs *before*
-    // any scheduler access, so it is reachable host-side. Their success arms need a
-    // running syscall context (`current_process`/`current_thread`/`current_pid_tid`,
-    // whose `cur_ref` reads `current_cpu()` — not host-safe) and are covered by the
-    // QEMU selftest demos, not host tests.
+    // The `/proc/self/*` leaves reject a non-empty suffix before any scheduler access; their
+    // success arms need a running syscall context and are covered by the QEMU selftest.
     #[test]
     fn proc_self_leaves_reject_non_empty_suffix() {
         for id in [

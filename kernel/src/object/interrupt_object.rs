@@ -1,19 +1,11 @@
-//! The [`InterruptObject`] kernel object — a hardware IRQ source exposed as a
-//! **waitable**.
+//! The [`InterruptObject`] kernel object — a hardware IRQ source exposed as a **waitable**.
 //!
-//! An interrupt service routine signals an `InterruptObject` (via a DPC); a
-//! driver thread blocked in `sys_wait` on its handle wakes and services the
-//! device in thread context. This is the single programming model that works for
-//! both in-kernel (Tier 1) and future userspace (Tier 2) drivers — "hold a
-//! handle to the interrupt, wait on it." See
-//! `docs/architecture/drivers-and-irps.md` § "`InterruptObject`".
+//! An ISR signals it via a DPC; a driver thread blocked in `sys_wait` on its handle services
+//! the device in thread context. See `docs/architecture/drivers-and-irps.md`.
 //!
-//! It is a **latching edge counter**: each `signal` increments a pending count
-//! (an IRQ that arrives with no waiter is not lost), and a `sys_wait` that
-//! returns for the object **consumes** one — so a driver's wait→service→wait
-//! loop wakes once per interrupt. Like [`PendingOperation`](super::pending_op),
-//! all mutable state is reached only under the single-CPU `SCHED` lock, so the
-//! scheduler-only accessors are `unsafe` with a shared safety contract.
+//! A **latching edge counter**: each `signal` increments a pending count (an IRQ with no
+//! waiter is not lost), and a `sys_wait` returning for the object **consumes** one. As in
+//! [`PendingOperation`](super::pending_op), all state is reached only under `SCHED`.
 
 use core::cell::UnsafeCell;
 
@@ -21,26 +13,19 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec};
 use crate::object::header::KObjectHeader;
 
-/// A hardware-interrupt waitable.
-///
-/// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
+/// A hardware-interrupt waitable (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct InterruptObject {
     header: KObjectHeader,
-    /// Self-check sentinel; a live object always reads [`InterruptObject::MAGIC`].
     magic: u64,
     /// All mutable state, reached only under `SCHED`.
     inner: UnsafeCell<InterruptInner>,
 }
 
-/// An `InterruptObject`'s scheduler-owned interior.
 struct InterruptInner {
-    /// Pending unconsumed interrupts (saturating). `> 0` ⇒ the waitable is
-    /// signaled; a `sys_wait` return consumes one.
+    /// Pending unconsumed interrupts (saturating); `> 0` ⇒ the waitable is signaled.
     pending: u32,
-    /// Threads blocked on this object (type-erased `Thread` pointers, non-owning
-    /// — each is kept alive by its own parked `ObjectRef`). Pre-reserved to
-    /// [`MAX_WAITERS`](InterruptObject::MAX_WAITERS).
+    /// Blocked threads, non-owning (each is kept alive by its own parked `ObjectRef`).
     waiters: KVec<*mut ()>,
 }
 
@@ -55,9 +40,8 @@ impl InterruptObject {
     /// Sentinel written into [`InterruptObject::magic`] at construction.
     pub const MAGIC: u64 = 0x49_6e_74_72_4f_62_6a_21; // "IntrObj!"
 
-    /// Maximum simultaneous waiters. A device IRQ almost always has exactly one
-    /// (the driver's service thread); the small reserve bounds `add_waiter` so it
-    /// never allocates under `SCHED`.
+    /// Maximum simultaneous waiters; a device IRQ almost always has one. The reserve bounds
+    /// `add_waiter` so it never allocates under `SCHED`.
     pub const MAX_WAITERS: usize = 4;
 
     /// Allocate an unsignalled `InterruptObject` with a refcount of one.
@@ -76,11 +60,8 @@ impl InterruptObject {
         self.magic == Self::MAGIC
     }
 
-    // --- Scheduler-only accessors --------------------------------------
-    //
-    // SAFETY (shared by all): `obj` addresses a live `InterruptObject` (pinned by
-    // an `ObjectRef` the caller holds), and the caller holds the `SCHED` lock,
-    // which — single-CPU — serialises all access to `inner`.
+    // SAFETY (shared by all): `obj` is a live `InterruptObject` pinned by the caller's
+    // `ObjectRef`, and the caller holds `SCHED`, which serialises all access to `inner`.
 
     /// Borrow the interior mutably. Must not outlive the `SCHED` hold nor alias.
     ///
@@ -96,9 +77,7 @@ impl InterruptObject {
         unsafe { &mut *p.inner.get() }
     }
 
-    /// Record an interrupt: increment the pending count (saturating). Returns
-    /// `true` (callers always wake waiters on a signal). One IRQ that arrives
-    /// with no waiter latches in `pending` and is delivered to the next waiter.
+    /// Record an interrupt (saturating); returns `true`, as callers always wake waiters.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -109,8 +88,7 @@ impl InterruptObject {
         true
     }
 
-    /// Consume one pending interrupt (a `sys_wait` returned for this object).
-    /// Idempotent at zero.
+    /// Consume one pending interrupt (a `sys_wait` returned for this object); idempotent at zero.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -122,8 +100,7 @@ impl InterruptObject {
         }
     }
 
-    /// `true` iff at least one interrupt is pending — the `sys_wait` fast-path
-    /// predicate.
+    /// `true` iff an interrupt is pending — the `sys_wait` fast-path predicate.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -132,8 +109,7 @@ impl InterruptObject {
         unsafe { Self::inner(obj) }.pending > 0
     }
 
-    /// Register `thread` as a waiter. `Err(())` if already at
-    /// [`MAX_WAITERS`](Self::MAX_WAITERS); never grows the vector under the lock.
+    /// Register `thread` as a waiter; `Err(())` at [`MAX_WAITERS`](Self::MAX_WAITERS).
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -143,12 +119,9 @@ impl InterruptObject {
         if inner.waiters.len() < Self::MAX_WAITERS {
             inner
                 .waiters
-                // `push_within_capacity`, not `try_push`: this runs under `SCHED`
-                // (`wait_on` → `obj_add_waiter` with the guard held), and `try_push` grows,
-                // which is `kmalloc` under the rank-1 lock (F11). Safe either way today —
-                // construction reserves `MAX_WAITERS` with `?`, so `len < MAX ⟹ len < cap` —
-                // but the type is what should say so, since this is the shape a new waiter
-                // list gets copied from (PR #205 review, optional 5).
+                // `push_within_capacity`, not `try_push`: this runs under `SCHED`, and `try_push`
+                // grows, which is `kmalloc` under the rank-1 lock. Construction reserves
+                // `MAX_WAITERS`, so `len < MAX ⟹ len < cap`; the type should say so.
                 .push_within_capacity(thread)
                 .expect("within reserved waiter capacity");
             Ok(())
@@ -169,8 +142,7 @@ impl InterruptObject {
         }
     }
 
-    /// Drain every waiter into `out` (clearing the set), returning the count.
-    /// `out` must be at least [`MAX_WAITERS`](Self::MAX_WAITERS) long.
+    /// Drain every waiter into `out` (at least [`MAX_WAITERS`](Self::MAX_WAITERS) long).
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -189,9 +161,7 @@ impl InterruptObject {
 
 impl Drop for InterruptObject {
     fn drop(&mut self) {
-        // A live object should never be dropped with waiters still parked on it
-        // (each waiter is removed before it unparks). Mirror `PendingOperation`.
-        // `&mut self` is exclusive, so no `SCHED` is needed at drop.
+        // Each waiter is removed before it unparks, so none may remain.
         let inner = self.inner.get_mut();
         debug_assert!(inner.waiters.is_empty(), "InterruptObject dropped with waiters still parked");
     }
@@ -228,13 +198,11 @@ mod tests {
         unsafe {
             assert!(InterruptObject::signal(p));
             assert!(InterruptObject::already_signaled(p));
-            // A second IRQ before service latches a second pending count.
             InterruptObject::signal(p);
             InterruptObject::consume(p);
             assert!(InterruptObject::already_signaled(p), "second IRQ still pending");
             InterruptObject::consume(p);
             assert!(!InterruptObject::already_signaled(p));
-            // Consume at zero is a no-op.
             InterruptObject::consume(p);
             assert!(!InterruptObject::already_signaled(p));
         }
