@@ -125,7 +125,7 @@ fn map_copy(src_handle: u64, dst_handle: u64, size: u64) -> Result<(), FileError
         return Err(FileError::Io(dst_addr as i32));
     }
 
-    // SAFETY: `size` bytes are mapped at both addresses, in distinct objects, so disjoint.
+    // SAFETY: `size` bytes are mapped at both addresses, and the regions are disjoint.
     unsafe {
         core::ptr::copy_nonoverlapping(src_addr as *const u8, dst_addr as *mut u8, size as usize);
     }

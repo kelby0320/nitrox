@@ -281,8 +281,9 @@ pub(super) fn services_test(root_ns: u64) -> bool {
 ///   `InvalidArgument`;
 /// - `Shutdown` on an admin session, refused `NoAccess`;
 /// - a third power endpoint while two are held, refused `WouldBlock`, and another taken at once
-///   once one is let go. **The view broker holds the first** by then: `view_broker_test` has had
-///   it build `admin` views, whose `power` grant takes one for the boot.
+///   when one is let go, which is `serve_services` answering closes before resolves. **The view
+///   broker holds the first** by then: `view_broker_test` has had it build `admin` views, whose
+///   `power` grant takes one for the boot.
 pub(super) fn power_endpoint_test(root_ns: u64) -> bool {
     use libkern::{KError, SYS_NS_BIND, SYS_NS_CREATE};
     use librsproto::services::{OP_SERVICES_SHUTDOWN, OP_SERVICES_START, SHUTDOWN_HALT, SHUTDOWN_REBOOT};
