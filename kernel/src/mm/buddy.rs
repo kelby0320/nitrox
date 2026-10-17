@@ -1,20 +1,13 @@
 //! Physical-memory buddy allocator.
 //!
-//! A single `BuddyAllocator` covers every usable RAM region above 1 MiB.
-//! Free blocks of order `o` (size `PAGE_SIZE << o`) live on an intrusive
-//! singly-linked list whose next pointer is stored in the first 8 bytes of
-//! each free frame, accessed through the higher-half direct map. A
-//! coalesce bitmap carved out of physical memory at init time tracks
-//! buddy-pair occupancy at each order: bit set means exactly one of the
-//! pair is free.
+//! One `BuddyAllocator` covers every usable RAM region above 1 MiB. Free blocks of order `o`
+//! (`PAGE_SIZE << o`) sit on an intrusive singly-linked list whose next pointer is the first 8
+//! bytes of each free frame, reached through the HHDM. A coalesce bitmap carved out of physical
+//! memory at init tracks buddy-pair occupancy per order: bit set means exactly one of the pair is
+//! free.
 //!
-//! Locking is the caller's responsibility; the allocator is `!Sync`. Once
-//! wrapped in a spinlock, `alloc` and `free` are non-blocking,
-//! non-allocating, and safe to call from interrupt context (coalesce
-//! recursion is bounded by `MAX_ORDER`).
-//!
-//! See `docs/architecture/overview.md` §"Memory management" for the
-//! three-layer plan this fits into.
+//! Locking is the caller's job (`!Sync`). Under a spinlock, `alloc` and `free` never block or
+//! allocate and are safe from interrupt context (coalesce recursion is bounded by `MAX_ORDER`).
 
 use crate::limine::{MEMMAP_USABLE, MemoryMapEntry, MemoryMapResponse};
 use crate::mm::{PAGE_SHIFT, PAGE_SIZE, PhysAddr};
@@ -25,42 +18,25 @@ pub const MAX_ORDER: usize = 10;
 /// Number of order levels (orders 0..=MAX_ORDER).
 pub const NUM_ORDERS: usize = MAX_ORDER + 1;
 
-/// Frames below 1 MiB are excluded from the allocator. Legacy DMA buffers,
-/// the BIOS data area, and the AP bring-up trampoline (Phase 1.5+) need
-/// to live there; reserving the range wholesale costs us 256 frames and
-/// removes a class of subtle bugs.
+/// Frames below 1 MiB are excluded: legacy DMA, the BIOS data area and the AP trampoline use them.
 const LOW_MEMORY_LIMIT: u64 = 0x10_0000;
 
-/// Sentinel `next` value meaning "end of list". `PhysAddr(0)` is safe to
-/// reserve because it sits below `LOW_MEMORY_LIMIT` and never enters the
-/// allocator.
+/// Sentinel `next` meaning "end of list"; `PhysAddr(0)` is below `LOW_MEMORY_LIMIT`, so never used.
 const NEXT_SENTINEL: u64 = 0;
 
 /// Physical-memory buddy allocator.
 ///
-/// **Locking.** This struct is not `Sync`. The kernel memory manager
-/// wraps it in a spinlock; all `alloc` and `free` operations execute
-/// under that lock.
-///
-/// **Allocation tracking.** The allocator only tracks *free* frames. The
-/// caller must remember the order it requested and pass the same order
-/// back to `free`; mismatched orders silently corrupt the coalesce bitmap.
+/// Not `Sync`: the memory manager runs every `alloc` and `free` under a spinlock. Only *free*
+/// frames are tracked, so the caller must pass `free` the order it requested; a mismatched order
+/// silently corrupts the coalesce bitmap.
 pub struct BuddyAllocator {
-    /// Head of each per-order free list. `None` if empty.
     free_lists: [Option<PhysAddr>; NUM_ORDERS],
-    /// Pointer to the coalesce bitmap as accessed through the HHDM.
     coalesce_bits: *mut u64,
-    /// Total `u64` words backing the bitmap.
     coalesce_words: usize,
-    /// Word offset within `coalesce_bits` of each order's row.
     row_offsets: [usize; NUM_ORDERS],
-    /// First frame number in the managed range.
     base_frame: usize,
-    /// Total frames covered by `[base_frame, base_frame + num_frames)`.
-    /// Holes within this range are simply never freed in.
+    /// Frames covered by `[base_frame, base_frame + num_frames)`; holes are never freed in.
     num_frames: usize,
-    /// HHDM offset. `phys + hhdm_offset` is a virtual address usable to
-    /// touch the corresponding physical byte.
     hhdm_offset: u64,
 }
 
@@ -72,11 +48,9 @@ unsafe impl Send for BuddyAllocator {}
 impl BuddyAllocator {
     /// Build a buddy allocator from a Limine memory map.
     ///
-    /// Two passes: first compute the managed frame range and reserve a
-    /// coalesce bitmap inside a usable region; then walk every usable
-    /// frame above 1 MiB (skipping the bitmap itself) and feed it to
-    /// `free_frame(_, 0)`. The bitmap's XOR-on-free behaviour merges
-    /// adjacent frees into higher-order blocks naturally.
+    /// Two passes: compute the managed frame range and reserve a coalesce bitmap in a usable
+    /// region; then feed every usable frame above 1 MiB (except the bitmap) to `free_frame(_, 0)`,
+    /// whose XOR-on-free merges adjacent frees upward.
     ///
     /// # Safety
     ///
@@ -91,7 +65,6 @@ impl BuddyAllocator {
     ///   code must not read or write those frames until they are handed
     ///   out by `alloc`.
     pub unsafe fn new(memory_map: &MemoryMapResponse, hhdm_offset: u64) -> Self {
-        // Pass 1: scan usable entries to find the bounding frame range.
         let mut min_base = u64::MAX;
         let mut max_end = 0u64;
         // SAFETY: caller asserts `memory_map` is valid.
@@ -111,22 +84,15 @@ impl BuddyAllocator {
         }
         assert!(min_base < max_end, "buddy: no usable RAM above 1 MiB in Limine memory map");
 
-        // The bit-index formula `(frame - base_frame) >> (order + 1)`
-        // assumes `base_frame` aligns with the natural pair structure at
-        // every order. To make it valid up to MAX_ORDER, round base_frame
-        // down to a `2^(MAX_ORDER+1)`-frame boundary. The skipped frames
-        // become permanent "phantoms": they have bitmap bits but the
-        // second pass never feeds them in, so they stay marked as
-        // allocated and out of reach.
+        // `(frame - base_frame) >> (order + 1)` assumes `base_frame` aligns with the pair
+        // structure at every order, so round it down to a `2^(MAX_ORDER+1)`-frame boundary. The
+        // skipped frames are permanent phantoms: pass 2 never feeds them in.
         let raw_base = (min_base >> PAGE_SHIFT) as usize;
         let raw_end = (max_end >> PAGE_SHIFT) as usize;
         let pair_align = 1usize << (MAX_ORDER + 1);
         let base_frame = raw_base & !(pair_align - 1);
         let num_frames = raw_end - base_frame;
 
-        // Compute per-order bitmap row sizes. Each order `o` has at most
-        // `ceil(num_frames / 2^(o+1))` buddy pairs; round each row up to a
-        // whole `u64` so toggle math stays word-aligned.
         let mut row_offsets = [0usize; NUM_ORDERS];
         let mut total_words = 0usize;
         let mut o = 0;
@@ -139,22 +105,15 @@ impl BuddyAllocator {
         }
         let bitmap_bytes = total_words * 8;
         let bitmap_pages = bitmap_bytes.div_ceil(PAGE_SIZE);
-        // We reserve whole pages for the bitmap, so the region we need is
-        // the page-rounded size, not `bitmap_bytes`. Searching for only
-        // `bitmap_bytes` could pick a region with `bitmap_bytes <= span <
-        // bitmap_pages * PAGE_SIZE`, leaving `bitmap_phys_end` past the
-        // entry's end — the pass-2 skip check would then strip frames from
-        // the *next* usable entry.
+        // Whole pages are reserved, so size the search by the page-rounded size: otherwise
+        // pass 2's skip could strip frames from the *next* usable entry.
         let bitmap_reservation = (bitmap_pages * PAGE_SIZE) as u64;
 
-        // Reserve a contiguous region for the bitmap. Must be page-aligned
-        // and above 1 MiB.
         // SAFETY: caller asserts `memory_map` is valid.
         let bitmap_phys = unsafe { find_bitmap_region(memory_map, bitmap_reservation) }
             .expect("buddy: no usable region large enough for coalesce bitmap");
         let bitmap_phys_end = bitmap_phys + bitmap_reservation;
 
-        // Zero the bitmap through the HHDM.
         let bitmap_ptr = (bitmap_phys + hhdm_offset) as *mut u64;
         // SAFETY: `bitmap_phys..+bitmap_bytes` was returned by
         // `find_bitmap_region` from a Usable entry; the HHDM maps that
@@ -173,14 +132,8 @@ impl BuddyAllocator {
             hhdm_offset,
         };
 
-        // TODO: zone split — DMA (<16 MiB) and Normal zones per
-        // docs/architecture/memory-management.md. For now a single flat
-        // allocator covers all usable memory; ISA-DMA-bound allocations
-        // have no fast path.
+        // TODO: zone split (DMA below 16 MiB, Normal) per docs/architecture/memory-management.md.
 
-        // Pass 2: feed every page in every Usable entry into the allocator
-        // at order 0, skipping the bitmap's own pages. Coalescing builds
-        // the higher-order free lists from the ground up.
         // SAFETY: caller asserts `memory_map` is valid.
         unsafe {
             for_each_usable(memory_map, |entry| {
@@ -205,27 +158,19 @@ impl BuddyAllocator {
         alloc
     }
 
-    /// Allocate a block of `2^order` contiguous pages.
-    ///
-    /// Returns `None` if no block at the requested order can be served,
-    /// even after splitting higher orders.
+    /// Allocate `2^order` contiguous pages; `None` if none can be served.
     pub fn alloc(&mut self, order: usize) -> Option<PhysAddr> {
         debug_assert!(order <= MAX_ORDER, "buddy: alloc order {order} > MAX_ORDER");
         if order > MAX_ORDER {
             return None;
         }
         if let Some(addr) = self.pop_free(order) {
-            // The pair's bit was 1 (we were the lone free buddy); toggle
-            // to 0 to reflect that no buddy is free at this order anymore.
             self.toggle_coalesce_bit(addr.frame(), order);
             return Some(addr);
         }
         if order == MAX_ORDER {
             return None;
         }
-        // Split a higher-order block. The recursive `alloc` consumes its
-        // pair's bit; we then push the unused upper half onto our order's
-        // free list (which toggles our pair's bit from 0 to 1).
         let block = self.alloc(order + 1)?;
         let upper = PhysAddr(block.as_u64() + ((PAGE_SIZE as u64) << order));
         self.push_free(upper, order);
@@ -233,8 +178,7 @@ impl BuddyAllocator {
         Some(block)
     }
 
-    /// Return a block to the allocator. `order` must match the order
-    /// originally passed to `alloc`.
+    /// Return a block; `order` must match the one passed to `alloc`.
     pub fn free(&mut self, addr: PhysAddr, order: usize) {
         debug_assert!(order <= MAX_ORDER, "buddy: free order {order} > MAX_ORDER");
         debug_assert!(addr.is_page_aligned(), "buddy: free of unaligned address {:#x}", addr.as_u64());
@@ -246,8 +190,7 @@ impl BuddyAllocator {
         self.free_frame(addr, order);
     }
 
-    /// Smallest order whose block size is `>= size` bytes. `size == 0`
-    /// returns 0 (single-page allocation).
+    /// Smallest order whose block holds `size` bytes; `0` for `size == 0`.
     pub const fn order_for_size(size: usize) -> usize {
         let pages = if size == 0 { 1 } else { size.div_ceil(PAGE_SIZE) };
         let mut o = 0usize;
@@ -259,19 +202,13 @@ impl BuddyAllocator {
         o
     }
 
-    // --- Internals ------------------------------------------------------
-
     fn free_frame(&mut self, addr: PhysAddr, order: usize) {
         let frame = addr.frame();
         let bit_after = self.toggle_coalesce_bit(frame, order);
         if order == MAX_ORDER || bit_after == 1 {
-            // Buddy is not free at this order (bit_after == 1) or there
-            // is no higher order to coalesce into.
             self.push_free(addr, order);
             return;
         }
-        // bit_after == 0: buddy was the lone free block at this order;
-        // both halves are now free, merge upward.
         let buddy_frame = frame ^ (1 << order);
         let buddy_addr = PhysAddr((buddy_frame as u64) << PAGE_SHIFT);
         let removed = self.remove_from_free_list(buddy_addr, order);
@@ -326,8 +263,6 @@ impl BuddyAllocator {
         false
     }
 
-    /// XOR the coalesce bit for `(frame, order)`'s pair. Returns the bit
-    /// value after the toggle (0 or 1).
     fn toggle_coalesce_bit(&mut self, frame: usize, order: usize) -> u64 {
         let bit = (frame - self.base_frame) >> (order + 1);
         let word_idx = self.row_offsets[order] + (bit / 64);
@@ -375,8 +310,6 @@ impl BuddyAllocator {
     }
 }
 
-// --- Memory-map helpers --------------------------------------------------
-
 /// Run `f` on every `Usable` entry of `memory_map`.
 ///
 /// # Safety
@@ -401,9 +334,7 @@ unsafe fn for_each_usable<F: FnMut(&MemoryMapEntry)>(memory_map: &MemoryMapRespo
     }
 }
 
-/// Return the page-aligned `[start, end)` of a usable entry, clipped
-/// against `LOW_MEMORY_LIMIT`. Returns `(0, 0)` if the entry is wholly
-/// below 1 MiB or otherwise empty after alignment.
+/// The page-aligned `[start, end)` of a usable entry above `LOW_MEMORY_LIMIT`; `(0, 0)` if empty.
 fn clip_to_managed(entry: &MemoryMapEntry) -> (u64, u64) {
     let end = entry.base.saturating_add(entry.length);
     if end <= LOW_MEMORY_LIMIT {
@@ -415,10 +346,8 @@ fn clip_to_managed(entry: &MemoryMapEntry) -> (u64, u64) {
     if end <= start { (0, 0) } else { (start, end) }
 }
 
-/// Find a page-aligned, above-1-MiB physical address inside some Usable
-/// entry where `reservation_bytes` consecutive bytes will fit. Callers
-/// pass the page-rounded reservation size (not the bare bitmap length)
-/// so the chosen region fully contains every page the bitmap occupies.
+/// A page-aligned, above-1-MiB physical address inside a Usable entry with room for
+/// `reservation_bytes` (the page-rounded size, so every bitmap page is contained).
 ///
 /// # Safety
 /// `memory_map` must be a valid Limine response.
@@ -442,21 +371,10 @@ unsafe fn find_bitmap_region(memory_map: &MemoryMapResponse, reservation_bytes: 
     chosen
 }
 
-// --- Tests ---------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A heap-backed substitute for physical memory. The buffer's host
-    /// virtual address doubles as the "physical" address the buddy
-    /// allocator sees; the HHDM offset is therefore 0 and any
-    /// `(phys + hhdm_offset) as *mut _` resolves to a valid host pointer
-    /// inside `_backing`.
-    ///
-    /// Heap-stable layers (`Vec`'s allocation pointer and `Box`'s contents
-    /// don't move when their owning struct moves) keep the pointer chain
-    /// `response -> entries -> entry` valid for the lifetime of `FakeMem`.
     struct FakeMem {
         _backing: Vec<u8>,
         _entries: Vec<MemoryMapEntry>,
@@ -465,14 +383,8 @@ mod tests {
     }
 
     impl FakeMem {
-        /// `bytes` of usable RAM, page-aligned. Real host virtual
-        /// addresses sit well above 1 MiB, so the buddy allocator's
-        /// low-memory cutoff doesn't reject the region.
         fn new(bytes: usize) -> Self {
             assert!(bytes.is_multiple_of(PAGE_SIZE));
-            // Over-allocate so the page-aligned start lies inside the
-            // buffer with room for whatever bitmap pages the allocator
-            // carves off the front.
             let mut backing = vec![0u8; bytes + 2 * PAGE_SIZE];
             let raw = backing.as_mut_ptr() as u64;
             let aligned = (raw + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
@@ -546,11 +458,6 @@ mod tests {
     #[test]
     fn freeing_two_buddies_coalesces() {
         let (_mem, mut a) = make_alloc(PAGE_SIZE * 64);
-        // Pull a known order-1 block so the two halves are guaranteed
-        // buddies at order 0. Then free both at order 0 — the bitmap's
-        // XOR semantics are symmetric, so two order-0 frees of buddies
-        // must coalesce back into a single order-1 block at the lower
-        // half's address.
         let block = a.alloc(1).expect("alloc order 1");
         assert_eq!(block.frame() & 1, 0, "order-1 block must be order-1-aligned");
         let hi = PhysAddr(block.as_u64() + PAGE_SIZE as u64);
@@ -563,12 +470,6 @@ mod tests {
     #[test]
     fn split_higher_order_to_satisfy_lower() {
         let (_mem, mut a) = make_alloc(PAGE_SIZE * 64);
-        // The split path puts the unused upper half onto `free_lists[0]`
-        // so the very next alloc returns its buddy. Detect that pattern
-        // by checking each consecutive pair of successful allocs in a
-        // sliding window — at least one pair must be a true order-0
-        // buddy pair (lower half on an even frame, halves one page
-        // apart) before the allocator runs out.
         let mut last: Option<PhysAddr> = None;
         let mut observed_buddy_pair = false;
         while let Some(cur) = a.alloc(0) {

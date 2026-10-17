@@ -1,27 +1,11 @@
 //! Per-thread kernel stack with guard page.
 //!
-//! Each kernel thread that will ever run in ring 0 (via syscall,
-//! interrupt, or exception entry) needs its own kernel stack —
-//! switching between threads switches between stacks. Today nothing
-//! creates threads, so [`KernelStack`] has no production consumer; it
-//! lands now because the underlying infrastructure (the kernel-vmap
-//! allocator + guard-page discipline) belongs with the memory
-//! subsystem rather than with the future threading slice.
+//! Each stack is `KERNEL_STACK_PAGES + 1` vmap pages: a deliberately unmapped guard page at the
+//! bottom plus `KERNEL_STACK_PAGES` writable / NX / kernel-only pages above, so an overflow faults
+//! loudly instead of corrupting whatever sits below.
 //!
-//! Each stack occupies `KERNEL_STACK_PAGES + 1` virtual pages in the
-//! kernel vmap region: a guard page at the bottom (deliberately
-//! unmapped) plus `KERNEL_STACK_PAGES` writable / NX / kernel-only
-//! pages above. Stack overflow into the guard page faults loudly via
-//! the page-fault handler instead of silently corrupting whatever
-//! sits below.
-//!
-//! ## Drop
-//!
-//! `Drop` unmaps the stack PTEs and returns the frames to the buddy.
-//! The vmap region itself is **not** released — the bump allocator
-//! has no freelist. That's fine for Phase 1; if kernel stacks ever
-//! churn heavily (they shouldn't — a stack lives as long as its
-//! thread), a vmap freelist is a local addition.
+//! `Drop` unmaps the PTEs and returns the frames to the buddy; the vmap range is **not**
+//! released (the bump allocator has no freelist).
 
 use crate::arch::Paging;
 use crate::arch::paging::{ArchPaging, PageFlags};
@@ -34,44 +18,28 @@ pub const KERNEL_STACK_PAGES: usize = 4;
 /// Bytes of usable stack space.
 pub const KERNEL_STACK_BYTES: u64 = (KERNEL_STACK_PAGES as u64) * (PAGE_SIZE as u64);
 
-/// A per-thread kernel stack: `KERNEL_STACK_PAGES` of mapped,
-/// writable, non-executable, kernel-only memory in the kernel vmap
-/// region, preceded by one unmapped guard page.
+/// A per-thread kernel stack: `KERNEL_STACK_PAGES` of mapped, writable, non-executable,
+/// kernel-only vmap memory above one unmapped guard page.
 ///
-/// Construction takes the page-table `root` the stack should be
-/// installed into. The shared kernel-vmap PDPT means the resulting
-/// PTEs are visible to every address space, regardless of which
-/// `root` was passed — `root` is stored so `Drop` can clear the
-/// PTEs symmetrically.
+/// Construction takes the page-table `root` to install into; the shared vmap PDPT makes the PTEs
+/// visible to every address space, and `root` is kept for `Drop`.
 pub struct KernelStack {
-    /// Exclusive top of the stack — the value to load into the
-    /// initial RSP. Stack grows down from here.
+    /// Exclusive top of the stack: the initial RSP. The stack grows down from here.
     top: VirtAddr,
-    /// Inclusive base of the mapped stack region.
     base: VirtAddr,
-    /// Physical frames backing the stack pages, low-address-first.
     frames: [PhysAddr; KERNEL_STACK_PAGES],
-    /// Page-table root the stack was installed into. Drop uses it.
     root: PhysAddr,
 }
 
 impl KernelStack {
-    /// Allocate a kernel stack: reserve `KERNEL_STACK_PAGES + 1`
-    /// virtual pages in the kernel vmap, allocate frames for the top
-    /// `KERNEL_STACK_PAGES`, install them writable / NX / kernel-only.
-    /// The bottom page is the guard — left unmapped.
-    ///
-    /// Returns [`AllocError`] if the vmap allocator, the buddy, or
-    /// page-table-frame allocation fails. On a partial failure the
-    /// already-allocated frames and installed PTEs are rolled back so
-    /// the caller sees an all-or-nothing outcome.
+    /// Allocate a kernel stack: `KERNEL_STACK_PAGES + 1` vmap pages, frames for the top
+    /// `KERNEL_STACK_PAGES`, the bottom page left unmapped as the guard. [`AllocError`] if the
+    /// vmap, the buddy or page-table-frame allocation fails; a partial failure is rolled back.
     pub fn new(root: PhysAddr) -> Result<Self, AllocError> {
-        // Reserve N+1 virtual pages: 1 guard + N stack.
         let guard_base = kvmap::vmap_alloc_pages(KERNEL_STACK_PAGES as u64 + 1)?;
         let base = VirtAddr::new(guard_base.as_u64() + PAGE_SIZE as u64);
         let top = VirtAddr::new(base.as_u64() + KERNEL_STACK_BYTES);
 
-        // Allocate one frame per stack page. Roll back on any failure.
         let mut frames = [PhysAddr::new(0); KERNEL_STACK_PAGES];
         let mut allocated_frames = 0usize;
         for slot in &mut frames {
@@ -89,8 +57,7 @@ impl KernelStack {
             }
         }
 
-        // Install PTEs. Roll back installed PTEs + free all frames on
-        // any failure (out of intermediate page-table frames).
+        // Install PTEs; on failure (out of intermediate page-table frames) unmap and free all.
         let flags = PageFlags::WRITABLE | PageFlags::NO_EXECUTE;
         let mut installed = 0usize;
         for i in 0..KERNEL_STACK_PAGES {
@@ -118,22 +85,13 @@ impl KernelStack {
             }
         }
 
-        // No shootdown on *install*: adding a mapping (not-present → present) needs
-        // no cross-CPU invalidation on x86 — the vmap VA is freshly allocated (no
-        // CPU has a cached translation for it), and the PD/PT are installed into
-        // the shared-by-reference vmap hierarchy, so every address space sees them.
-        // (Matches Linux, which shoots down only on unmap / permission-restrict.)
-        //
-        // **This argument was re-checked on 2026-08-24 and stands**, which is worth saying
-        // because an intermittent `#DF` is open (`TODO(unexplained-df)`) and the 2026-05-29
-        // log pointed at this area. The "freshly allocated" premise is load-bearing and holds:
-        // `kvmap`'s allocator is a bump pointer that **never reclaims VA**, so no CPU can hold
-        // a cached translation — stale or otherwise — for a VA being mapped here. A first
-        // draft of the deferral asserted the opposite and was wrong.
+        // No shootdown on *install*: a not-present to present change needs no cross-CPU
+        // invalidation on x86. The vmap VA is freshly allocated (the bump allocator **never
+        // reclaims VA**, so no CPU holds a cached translation for it), and the PD/PT hang off the
+        // shared vmap hierarchy every address space sees.
+        // Re-checked against the open intermittent `#DF` (`TODO(unexplained-df)`): it stands.
 
-        // Paint the fresh stack so its high-water mark is measurable later (see
-        // `watermark`). Instrumentation only — a production stack is left as the buddy
-        // handed it over.
+        // Paint the fresh stack so its high-water mark is measurable later (see `watermark`).
         #[cfg(feature = "test-harness")]
         // SAFETY: the whole `[base, top)` range was just mapped writable above, and no
         // thread runs on this stack until the caller installs it.
@@ -144,22 +102,17 @@ impl KernelStack {
         Ok(KernelStack { top, base, frames, root })
     }
 
-    /// Exclusive top of the stack — the value to load into RSP when
-    /// switching to a thread that owns this stack. Pre-decrement
-    /// convention: pushes write at `top - 8` first.
+    /// Exclusive top of the stack: the RSP to load for its thread.
     pub fn top(&self) -> VirtAddr {
         self.top
     }
 
-    /// Inclusive base of the mapped stack region. The guard page sits
-    /// at `base - PAGE_SIZE` and is unmapped — a stack-overflow write
-    /// to it page-faults.
+    /// Inclusive base of the mapped region; the guard page below it is unmapped.
     pub fn base(&self) -> VirtAddr {
         self.base
     }
 
-    /// Base of the guard page. Reading from or writing to this address
-    /// page-faults — that's the overflow detector.
+    /// Base of the guard page; any access to it page-faults.
     pub fn guard_page(&self) -> VirtAddr {
         VirtAddr::new(self.base.as_u64() - PAGE_SIZE as u64)
     }
@@ -167,37 +120,21 @@ impl KernelStack {
 
 /// Kernel-stack high-water measurement (`test-harness` builds only).
 ///
-/// Exists because the kernel stack budget was being reasoned about from *estimates* — the
-/// `MAX_WAIT_HANDLES` sizing argument (Slice C3) summed array widths on paper. This
-/// replaces that with a number.
+/// Fresh stacks are painted with [`POISON`]; the deepest point a thread has reached is the lowest
+/// address whose word is no longer poison. Sampling at context-switch-out covers every thread
+/// that runs. The sample is O(1) unless a new record is being set; the mark is monotonic.
 ///
-/// Fresh stacks are painted with [`POISON`]; the deepest point any thread has ever reached
-/// is then just the lowest address whose word is no longer poison. Sampling that at
-/// context-switch-out covers **every** thread that actually runs, including servers that
-/// spend their lives blocked and so never appear in a run queue.
-///
-/// The sample is **O(1) in the common case**: it only reads the word immediately below the
-/// standing record, and walks further down only when that word has been overwritten — i.e.
-/// only when a new record is genuinely being set, which happens a handful of times per
-/// boot. The mark is monotonic, so a thread that ran deep and returned still counts.
-///
-/// It records how deep and whose thread, but not *where* — that needs a return-address
-/// capture at the moment the record is set.
+/// It records how deep and whose thread, not *where*.
 /// TODO(stack-attribution): `docs/rationale/deferred-decisions.md`.
 #[cfg(feature = "test-harness")]
 pub mod watermark {
     use super::{KERNEL_STACK_BYTES, VirtAddr};
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-    /// Fill word for an untouched stack. Chosen to be implausible as a real value: not a
-    /// canonical address, not a small integer.
+    /// Fill word for an untouched stack: not a canonical address, not a small integer.
     pub const POISON: u64 = 0x5041_494e_5445_4421; // "PAINTED!"
 
-    /// Deepest number of bytes any kernel stack has been observed to use.
     static DEEPEST: AtomicU64 = AtomicU64::new(0);
-    /// Owning pid of the thread that set the standing record (`0` = a kernel thread).
-    /// A depth on its own says "something went deep"; this says *who*, which is the
-    /// difference between a number and a lead.
     static DEEPEST_PID: AtomicU32 = AtomicU32::new(0);
 
     /// Paint `bytes` of freshly-mapped stack starting at `base`.
@@ -212,10 +149,8 @@ pub mod watermark {
         }
     }
 
-    /// Update the mark from a stack whose exclusive top is `top`.
-    ///
-    /// Called with the *outgoing* thread's stack at a context switch. Cheap enough for that
-    /// path: one load unless the record actually moves.
+    /// Update the mark from a stack whose exclusive top is `top`; called with the outgoing
+    /// thread's stack at a context switch (one load unless the record moves).
     ///
     /// # Safety
     /// `top` must be the exclusive top of a live, painted kernel stack — so
@@ -223,8 +158,6 @@ pub mod watermark {
     pub unsafe fn sample(top: u64, pid: u32) {
         let base = top - KERNEL_STACK_BYTES;
         let record = DEEPEST.load(Ordering::Relaxed);
-        // The word just below the standing record. Still poison ⇒ nothing new; this is the
-        // whole cost on all but a few switches per boot.
         let probe = top - record - 8;
         if probe < base {
             return; // the record already reaches the guard page
@@ -233,7 +166,6 @@ pub mod watermark {
         if unsafe { (probe as *const u64).read_volatile() } == POISON {
             return;
         }
-        // A new record: walk down to the first still-poison word.
         let mut addr = probe;
         while addr > base {
             // SAFETY: `addr` stays within `[base, top)` by the loop condition.
@@ -243,14 +175,12 @@ pub mod watermark {
             addr -= 8;
         }
         let used = top - addr - 8;
-        // Record the pid only if this sample actually won, so the two stay consistent.
         if DEEPEST.fetch_max(used, Ordering::Relaxed) < used {
             DEEPEST_PID.store(pid, Ordering::Relaxed);
         }
     }
 
-    /// Deepest kernel-stack usage observed so far: `(bytes, percent of one stack, pid of
-    /// the thread that reached it)`. All zero before any sample.
+    /// Deepest usage so far: `(bytes, percent of one stack, pid)`; all zero before any sample.
     pub fn deepest() -> (u64, u64, u32) {
         let used = DEEPEST.load(Ordering::Relaxed);
         (used, used * 100 / KERNEL_STACK_BYTES, DEEPEST_PID.load(Ordering::Relaxed))
@@ -259,26 +189,20 @@ pub mod watermark {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        // Clear the PTEs first (do **not** free the frames yet).
+        // Clear the PTEs first; the frames are freed only after the shootdown.
         for i in 0..KERNEL_STACK_PAGES {
             let virt = VirtAddr::new(self.base.as_u64() + (i as u64) * (PAGE_SIZE as u64));
             // SAFETY: every page was mapped by `new` and lives in the
             // shared kernel vmap; unmap reverses the install.
             let _ = unsafe { Paging::unmap_page(self.root, virt) };
         }
-        // Publish the cleared mappings to every CPU before the backing frames
-        // return to the allocator: these pages live in the **shared** kernel vmap,
-        // so another CPU could still hold a cached translation for them — it must
-        // drop it before the frame is recycled (else it would read/write, or
-        // deliver an exception onto, memory that now belongs to someone else).
+        // Publish the cleared mappings to every CPU before the frames return to the allocator:
+        // the vmap is shared, so another CPU may still cache a translation, and would otherwise
+        // touch memory that now belongs to someone else.
         crate::tlb::shootdown_all();
         for i in 0..KERNEL_STACK_PAGES {
             heap::buddy_free(self.frames[i], 0);
         }
-        // The vmap region (KERNEL_STACK_PAGES + 1 pages) is not
-        // reclaimed — the bump allocator has no freelist. Phase 1
-        // kernel stacks are constructed once per thread and freed
-        // when the thread ends; churn is negligible.
     }
 }
 
@@ -296,18 +220,15 @@ mod tests {
         let asp = AddressSpace::new().unwrap();
         let stack = KernelStack::new(asp.root()).unwrap();
 
-        // Every stack page must be mapped.
         for i in 0..KERNEL_STACK_PAGES as u64 {
             let v = VirtAddr::new(stack.base.as_u64() + i * PAGE_SIZE as u64);
             // SAFETY: read-only walk against the AS we just mapped into.
             let p = unsafe { Paging::translate(asp.root(), v) };
             assert!(p.is_some(), "stack page {i} not mapped");
         }
-        // The guard page must NOT be mapped.
         // SAFETY: read-only walk.
         let guard = unsafe { Paging::translate(asp.root(), stack.guard_page()) };
         assert!(guard.is_none(), "guard page must be unmapped");
-        // The page at `top` is past the stack and also unmapped.
         // SAFETY: read-only walk.
         let above = unsafe { Paging::translate(asp.root(), stack.top) };
         assert!(above.is_none(), "page at top should be unmapped");
@@ -335,9 +256,6 @@ mod tests {
         let asp = AddressSpace::new().unwrap();
         let s1 = KernelStack::new(asp.root()).unwrap();
         let s2 = KernelStack::new(asp.root()).unwrap();
-        // The vmap bump allocator hands out monotonically-increasing
-        // ranges, so whichever was allocated first must end before
-        // the other begins (no overlap).
         let (lo, hi) = if s1.base.as_u64() < s2.base.as_u64() { (&s1, &s2) } else { (&s2, &s1) };
         assert!(
             lo.top.as_u64() <= hi.guard_page().as_u64(),
