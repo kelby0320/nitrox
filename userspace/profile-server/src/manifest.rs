@@ -1,23 +1,20 @@
 //! A focused parser for the system profile manifest
 //! (`docs/architecture/profiles-and-namespace-projection.md`).
 //!
-//! The manifest is TOML: a `[profile]` table (name/generation, used for display) plus
-//! a `[[package]]` table array — one per package, each with `name`, `version`, and the
-//! store `path`. The profile server projects each package's `bin/` into `/bin` by
-//! probing the packages in **manifest order** (first match wins). This parser extracts
-//! that ordered package list; `[profile]` keys and unknown keys/sections are ignored
-//! (forward-compat).
-//!
-//! Slice 1 needs only the store `path` (to probe) + name/version (for logging), so this
-//! stays deliberately small — it is *not* a general TOML parser.
+//! The manifest is TOML: a `[profile]` table (display only) plus a `[[package]]` array,
+//! each with `name`, `version` and the store `path`. Packages are consulted in **manifest
+//! order** (first match wins). Unknown keys and sections are ignored. Not a general TOML
+//! parser.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// One package a profile projects: its store path (the identity) + display name/version.
+/// One package a profile projects; its store path is its identity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Package {
+    /// Display name.
     pub name: String,
+    /// Display version.
     pub version: String,
     /// The store path, e.g. `/store/<hash>-<name>-<version>`.
     pub path: String,
@@ -39,9 +36,8 @@ fn key_string(line: &str) -> Option<(&str, &str)> {
     Some((k.trim(), v))
 }
 
-/// Parse the manifest's ordered package list. Malformed lines are skipped; a package
-/// with an empty `path` is dropped (it can't be projected). Returns the packages in
-/// manifest order (projection priority).
+/// Parse the ordered package list. Malformed lines are skipped; a package with no `path`
+/// is dropped.
 pub fn parse(text: &str) -> Vec<Package> {
     let mut packages: Vec<Package> = Vec::new();
     let mut cur: Option<Package> = None;
@@ -57,7 +53,6 @@ pub fn parse(text: &str) -> Vec<Package> {
             }
             cur = Some(Package::default());
         } else if line.starts_with('[') {
-            // Any other section header (e.g. `[profile]`) ends a pending package.
             if let Some(p) = cur.take() {
                 packages.push(p);
             }
@@ -75,7 +70,6 @@ pub fn parse(text: &str) -> Vec<Package> {
     if let Some(p) = cur.take() {
         packages.push(p);
     }
-    // Drop packages with no store path — nothing to project.
     packages.retain(|p| !p.path.is_empty());
     packages
 }
