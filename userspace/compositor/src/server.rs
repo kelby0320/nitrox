@@ -1,22 +1,13 @@
 //! Request dispatch — the server's decision-making, with no IPC in it.
 //!
-//! Shaped like `fs-server-ext4`'s `serve`: take a decoded request and a reply buffer,
-//! decide, write the reply. The IPC loop, the framebuffer, and mapping the client's
-//! transferred `MemoryObject`s are the bin's job; everything here is a pure function of
-//! (connection, request, [`WindowStack`]) and host-tests without a kernel.
+//! A pure function of (connection, request, [`WindowStack`]): the IPC loop, the framebuffer and
+//! mapping the client's transferred `MemoryObject`s are the bin's job.
 //!
-//! ## Connections are the security boundary
-//!
-//! `docs/spec/rsproto-surface-ops.md` requires that **window ids are scoped to the
-//! connection that created them**: a client may only name its own windows, and naming
-//! another's is `NotFound`, exactly as if the id did not exist.
-//!
-//! That rule cannot live in [`WindowStack`], which is deliberately compositor-wide — a
-//! desktop shell holding `/dev/draw` with broader rights has to be able to address any
-//! window. So ownership is tracked here, per connection, and checked **before** dispatch
-//! reaches the stack. Without it, holding `/dev/draw` — which the spec makes the whole of
-//! the authority to *create* windows — would also be the authority to destroy anyone
-//! else's.
+//! Window ids are scoped to the connection that created them
+//! (`docs/spec/rsproto-surface-ops.md`): naming another connection's window is `NotFound`, as if
+//! it did not exist. [`WindowStack`] is compositor-wide so a shell can address any window, so
+//! ownership is tracked here, per connection, and checked before dispatch reaches the stack;
+//! otherwise the authority to create windows would be the authority to destroy anyone else's.
 
 use alloc::vec::Vec;
 
@@ -35,11 +26,8 @@ use crate::{MAX_WINDOWS_PER_CONNECTION, StackError, WindowStack, union};
 pub struct Connection {
     /// Windows created over this connection, in creation order.
     owned: Vec<u32>,
-    /// Rejections logged for this connection so far.
-    ///
-    /// Per connection rather than per process so that one noisy client cannot spend the
-    /// whole machine's diagnostic budget — `Connection::new` resets it, and a session slot
-    /// is reused only by a different client.
+    /// Rejections logged so far; per connection so one noisy client cannot spend the whole
+    /// machine's diagnostic budget.
     pub rejections_logged: u32,
 }
 
@@ -61,14 +49,9 @@ impl Connection {
 
     /// Drop `window` from what this connection claims. Silent if it never held it.
     ///
-    /// **For removals this connection did not ask for** — a manager's `Manage::Close`, and
-    /// anything later that destroys a window on someone else's behalf. Its own `DestroyWindow`
-    /// prunes inline (it has the connection in hand); this is how the *other* paths reach the
-    /// same state, called once for every id the stack reports removed. Without it a client
-    /// outlives its window still claiming it: its own `DestroyWindow` would then answer
-    /// `InvalidArgument` (`Rejected(NoSuchWindow)`) where every other request answers
-    /// `NotFound`, and a manager could ask the compositor to send `CloseRequested` about a
-    /// window that no longer exists.
+    /// For removals this connection did not ask for (a manager's `Manage::Close`); without it the
+    /// client's own `DestroyWindow` would answer `InvalidArgument` where the rest answer
+    /// `NotFound`.
     pub fn disown(&mut self, window: u32) {
         self.owned.retain(|id| *id != window);
     }
@@ -81,14 +64,9 @@ pub enum Outcome {
     Reply(usize),
     /// A window was created: reply with `reply_len` bytes, **then** send this `Configure`.
     ///
-    /// Two messages for one request, which no other op needs, so it is a variant rather than a
-    /// field on [`Reply`](Outcome::Reply). The order is the contract: a client blocked in
-    /// `Window::new` reads the reply for the id and then waits for the configure, and a
-    /// compositor that sent them the other way round would deadlock every client at startup.
-    ///
-    /// **The configure is what makes the window compositable** — see
-    /// [`WindowStack::mark_configured`]. Until it arrives the client has no size it is entitled
-    /// to commit at, which is the ordering that lets a manager place a window before it is seen.
+    /// The order is the contract: a client in `Window::new` reads the id and then waits for the
+    /// configure, so the other way round would deadlock every client at startup. The configure
+    /// is what makes the window compositable ([`WindowStack::mark_configured`]).
     Created {
         /// Length of the `CreateWindow` reply body already written.
         reply_len: usize,
@@ -102,26 +80,14 @@ pub enum Outcome {
         release: Option<(u32, u32)>,
         /// The screen region this request changed, in screen coordinates.
         ///
-        /// **`None` means "everything"**, which is the safe answer and the one anything that
-        /// cannot name its region must give. `Some(empty)` means nothing changed on screen —
-        /// attaching a buffer, for instance, which a later commit will display.
-        ///
-        /// This exists because the compositor recomposited the **whole screen on every
-        /// request** until 2026-08-12, on a comment from Milestone 2 that said damage-bounded
-        /// repaint was "an optimisation the protocol already carries and this does not yet
-        /// exploit — a full repaint is always correct, and this milestone has one client".
-        /// The premise expired: with three clients and an 812×480 terminal window, a boot
-        /// spent a whole CPU compositing, which `test-harness`'s idle-occupancy check caught
-        /// as a starved core (M5 Part B).
+        /// `None` means "everything", the safe answer for anything that cannot name its region;
+        /// `Some(empty)` means nothing changed on screen (attaching a buffer, say).
         dirty: Option<Rect>,
     },
-    /// A window was renamed; the manager needs telling.
-    ///
-    /// A variant rather than an [`Applied`](Outcome::Applied) with a flag, because a title
-    /// changes nothing on screen — the compositor draws no titles — and folding it into the
-    /// damage-carrying variant would invite a repaint for a request that dirtied nothing.
+    /// A window was renamed; the manager needs telling. A title changes nothing on screen, so this
+    /// is not an [`Applied`](Outcome::Applied).
     TitleSet {
-        /// The renamed window. Its new title is on the [`Window`](crate::Window).
+        /// The renamed window.
         window: u32,
     },
     /// The request was rejected.
@@ -130,33 +96,24 @@ pub enum Outcome {
 
 /// Why a request was refused.
 ///
-/// Deliberately coarse where it faces the client: a window belonging to another
-/// connection is [`SurfaceError::NotFound`], the same answer as one that never existed, so
-/// the reply cannot be used to probe for other clients' window ids.
+/// Another connection's window is [`SurfaceError::NotFound`], so replies cannot probe for ids.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SurfaceError {
     /// Undecodable body for this op.
     Malformed,
     /// The op is not one this server implements.
     Unsupported,
-    /// No such window *for this connection* — including one that exists but belongs to
-    /// somebody else.
+    /// No such window *for this connection*, including another connection's.
     NotFound,
     /// The request was well-formed but could not be applied.
     Rejected(StackError),
 }
 
 /// Whether an over-long title has already been reported.
-///
-/// Single-threaded, like every other counter in this server.
 static mut TITLE_TRUNCATED_LOGGED: bool = false;
 
-/// Report the **first** over-long title and then stay quiet.
-///
-/// Once, not per occurrence: a client that sends a long title once usually sends it on every
-/// update, and the cap is a normal outcome rather than a fault — the alternative is a serial
-/// write on a request path, which is what a per-motion log cost `check-input` on 2026-08-24.
-/// One line is enough to explain a title that came back shorter than it went out.
+/// Report the **first** over-long title only: a serial write per request is too costly on this
+/// path, and one line explains a title that came back shorter than it went out.
 fn note_title_truncated(len: usize) {
     // SAFETY: single-threaded server; the same access pattern as the input diagnostics.
     unsafe {
@@ -176,25 +133,20 @@ fn note_title_truncated(len: usize) {
 
 /// Dispatch one Surface-category request arriving on `conn`.
 ///
-/// `body` is the request body (the envelope is the caller's concern, as in `fs-server`).
-/// A reply body, when there is one, is written into `reply`.
+/// `body` excludes the envelope; a reply body, when there is one, goes into `reply`.
 pub fn dispatch(conn: &mut Connection, stack: &mut WindowStack, op: u16, body: &[u8], reply: &mut [u8]) -> Outcome {
     match op {
         OP_CREATE_WINDOW => {
             let Some(req) = parse_create_window_request(body) else {
                 return Outcome::Failed(SurfaceError::Malformed);
             };
-            // **Bounded per connection.** A client may legitimately hold several windows
-            // since M6 C3 — a menu is a second window on its parent's session — and nothing
-            // else bounded it: `conn.owned` and the stack are both plain `Vec`s. The old
-            // one-window-per-connection API was the only thing keeping this finite, and it
-            // was an accident of `libsurface` rather than a rule.
+            // Bounded: a client may hold several windows (a menu is a second one), and `conn.owned`
+            // and the stack are plain `Vec`s.
             if conn.owned.len() >= MAX_WINDOWS_PER_CONNECTION {
                 return Outcome::Failed(SurfaceError::Rejected(StackError::TooManyWindows));
             }
-            // A parent must be one of *this* connection's windows. Otherwise a client
-            // could parent a popup onto a stranger's window and have it destroyed when
-            // that window closes — or learn that the id exists.
+            // A parent must be one of *this* connection's windows, or a popup could be parented
+            // onto a stranger's window and learn that the id exists.
             if let Some(parent) = parent_of(&req.role)
                 && !conn.owns(parent)
             {
@@ -205,14 +157,9 @@ pub fn dispatch(conn: &mut Connection, stack: &mut WindowStack, op: u16, body: &
                     conn.owned.push(id);
                     match build_create_window_reply(reply, id) {
                         Some(n) => {
-                            // **The default answer: the client's own request echoed back.**
-                            // This is what the client is told when nobody has an opinion — no
-                            // manager attached, or one that did not answer in time.
-                            //
-                            // A manager's answer does *not* land here. The bin holds this
-                            // record when a manager is attached and releases it with the
-                            // geometry as it stands once the manager has acted (M6 B4), so
-                            // this library half stays free of both the manager and the clock.
+                            // The default answer: the client's own request echoed back. With a
+                            // manager attached the bin holds this and releases it with the geometry
+                            // as it stands once the manager has acted.
                             let w = stack.window(id).expect("just created");
                             Outcome::Created {
                                 reply_len: n,
@@ -253,54 +200,28 @@ pub fn dispatch(conn: &mut Connection, stack: &mut WindowStack, op: u16, body: &
             if !conn.owns(req.window) {
                 return Outcome::Failed(SurfaceError::NotFound);
             }
-            // **Read before the commit.** `Window::bounds` reports the *committed* buffer's
-            // geometry, so a window whose new buffer is smaller than its old one would have its
-            // damage clipped to the new, smaller rectangle — and the band the old buffer
-            // occupied and the new one does not would keep the old pixels until something
-            // unrelated forced a repaint. Before damage-bounded repaint the unconditional
-            // full recomposite covered that; now it has to be said (PR #192 review, finding 3).
-            //
-            // **`painted_bounds` and whether it was on screen at all**, both since M13 Part C. A
-            // window's shadow is outside its bounds, so a rectangle clipped to `bounds` — which is
-            // every ordinary commit — cannot repaint one. That is invisible until the *first*
-            // commit, where it is the whole of the bug: a launching window drew its own pixels and
-            // no shadow, and the shadow appeared later when a click or a drag happened to damage
-            // the larger rectangle. Reported from a real session, 2026-09-03.
+            // Read before the commit: `bounds` reports the committed buffer, so a shrunk window
+            // would clip its damage to the new rectangle and keep old pixels in the vacated band.
+            // Painted bounds and whether it was drawn matter too: a shadow lies outside `bounds`,
+            // so the first commit must repaint it.
             let was = stack.window(req.window).map(|w| (w.bounds(), w.painted_bounds()));
             let was_drawn = stack.window(req.window).is_some_and(|w| w.committed.is_some());
             match stack.commit(&req) {
                 Ok(previous) => {
-                    // **The damage the client sent**, translated into screen coordinates and
-                    // clipped to the window it belongs to — old bounds unioned with new, so a
-                    // shrunk window still repaints what it vacated.
-                    //
-                    // **The clip is a bound on work, not a barrier against a leak.** An earlier
-                    // version of this comment claimed an unclipped rectangle would "repaint a
-                    // neighbour's pixels from this window's buffer", which is not how
-                    // compositing works here: `libdraw::compose` clears the damaged area and
-                    // blits *every* surface clipped to its own bounds, so an over-large
-                    // rectangle produces a correct recomposite of that area, just a needlessly
-                    // large one. What a client does control is how much work each commit costs
-                    // — unclipped, every commit is a full-screen recomposite, which is exactly
-                    // the cost this change exists to remove (PR #192 review, finding 4).
+                    // The damage the client sent, in screen coordinates, clipped to the window: the
+                    // clip bounds the work a commit can cost, not a leak (compositing clips every
+                    // surface to its own bounds).
                     let dirty = stack.window(req.window).map(|w| {
                         let local = Rect::new(req.damage_x as i32, req.damage_y as i32, req.damage_w, req.damage_h);
                         let bounds = w.bounds();
-                        // **A window nothing has drawn yet repaints all of itself, shadow and
-                        // all**, whatever damage it named: the client is describing what changed
-                        // inside its buffer, and what changed on *screen* is the whole window
-                        // appearing. Before shadows this was invisible, because the client's first
-                        // damage is its whole buffer in practice and the buffer was the whole of
-                        // what the window painted.
+                        // A window nothing has drawn yet repaints all of itself, shadow included,
+                        // whatever damage it named.
                         if !was_drawn {
                             return w.painted_bounds();
                         }
-                        // **A window that changed shape repaints both shapes, whatever it
-                        // said.** The vacated band cannot be in the client's damage — the
-                        // client is describing its *new* buffer — and a rectangle cannot
-                        // express "old minus new", so the union of the two is the tightest
-                        // correct answer. Painted bounds on both sides, so the shadow moves
-                        // with the shape rather than being left where the old one was.
+                        // A window that changed shape repaints both shapes: the vacated band cannot
+                        // be in the client's damage, and a rectangle cannot say "old minus new".
+                        // Painted bounds, for the shadow.
                         if let Some((_, before)) = was.filter(|(b, _)| *b != bounds) {
                             return union(before, w.painted_bounds());
                         }
@@ -322,8 +243,7 @@ pub fn dispatch(conn: &mut Connection, stack: &mut WindowStack, op: u16, body: &
             let Some((id, title)) = librsproto::surface::title::read(body) else {
                 return Outcome::Failed(SurfaceError::Malformed);
             };
-            // Same ownership rule as every other op: a window belonging to another connection
-            // answers `NotFound`, so a reply cannot be used to probe for other clients' ids.
+            // Same ownership rule as every other op: another connection's window is `NotFound`.
             if !conn.owns(id) {
                 return Outcome::Failed(SurfaceError::NotFound);
             }
@@ -334,9 +254,8 @@ pub fn dispatch(conn: &mut Connection, stack: &mut WindowStack, op: u16, body: &
             if kept.len() < title.len() {
                 note_title_truncated(title.len());
             }
-            // Unchanged titles do not become manager traffic: a client that re-sets the same
-            // title on every frame is not hypothetical, and the outbox is a bounded queue that
-            // discards its oldest when it fills.
+            // An unchanged title is not manager traffic: the outbox is bounded and drops its
+            // oldest.
             if w.title == kept {
                 return Outcome::Applied { release: None, dirty: Some(Rect::new(0, 0, 0, 0)) };
             }
@@ -355,14 +274,10 @@ pub fn dispatch(conn: &mut Connection, stack: &mut WindowStack, op: u16, body: &
             let before: Vec<(u32, Rect)> = stack.windows().iter().map(|w| (w.id, w.painted_bounds())).collect();
             match stack.destroy(window) {
                 Ok(()) => {
-                    // Destroy is transitive, so this connection's descendants of `window`
-                    // are gone from the stack too. Drop every id it no longer holds, or
-                    // the connection keeps claiming ownership of windows that do not
-                    // exist — and a later id reuse would hand it someone else's window.
+                    // Destroy is transitive: drop every id this connection no longer holds, or a
+                    // later id reuse could hand it someone else's window.
                     conn.owned.retain(|id| stack.window(*id).is_some());
-                    // **The union of every window that vanished**, not just the named one:
-                    // destroy is transitive, so a popup's children go with it and their pixels
-                    // have to be repainted too.
+                    // The union of every window that vanished: a popup's children go with it.
                     let mut dirty: Option<Rect> = None;
                     for (id, bounds) in before {
                         if stack.window(id).is_none() {
@@ -384,9 +299,8 @@ pub fn dispatch(conn: &mut Connection, stack: &mut WindowStack, op: u16, body: &
 
 /// Drop everything a connection owns — what the bin calls when a client disconnects.
 ///
-/// A client that exits without destroying its windows must not leave them on screen
-/// forever. Destroy is transitive, so a parent takes its popups with it and the remaining
-/// ids simply resolve to nothing.
+/// Destroy is transitive, so a parent takes its popups with it and the remaining ids resolve
+/// to nothing.
 pub fn disconnect(conn: &mut Connection, stack: &mut WindowStack) {
     for id in core::mem::take(&mut conn.owned) {
         // Already gone if an ancestor took it; that is not an error.
@@ -394,7 +308,6 @@ pub fn disconnect(conn: &mut Connection, stack: &mut WindowStack) {
     }
 }
 
-/// The parent a role names, if it names one.
 fn parent_of(role: &librsproto::surface::Role) -> Option<u32> {
     match role {
         librsproto::surface::Role::Popup { parent } | librsproto::surface::Role::Dialog { parent } => Some(*parent),
@@ -406,10 +319,6 @@ fn parent_of(role: &librsproto::surface::Role) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// Assert an outcome applied, with the given release and whatever region.
-    ///
-    /// `dirty` has tests of its own below. Spelling a rectangle into every assertion here
-    /// would make each one about two things, and the release is what they were written for.
     #[track_caller]
     fn assert_applied(o: Outcome, release: Option<(u32, u32)>) {
         match o {
@@ -418,7 +327,6 @@ mod tests {
         }
     }
 
-    /// The region an outcome reports dirtying.
     #[track_caller]
     fn dirty_of(o: Outcome) -> Option<Rect> {
         match o {
@@ -436,8 +344,6 @@ mod tests {
         create_sized(conn, stack, role, 8, 8)
     }
 
-    /// `create` at a stated size. Most tests do not care and use the 8×8 default; the ones
-    /// that do care are the ones where a child must *not* be a subset of its parent.
     fn create_sized(
         conn: &mut Connection,
         stack: &mut WindowStack,
@@ -449,16 +355,10 @@ mod tests {
         let n = build_create_window_request(&mut body, &CreateWindowRequest::new(width, height, role)).unwrap();
         let mut reply = [0u8; 32];
         match dispatch(conn, stack, OP_CREATE_WINDOW, &body[..n], &mut reply) {
-            // Create answers with a reply *and* the window's first `Configure` — the ordering
-            // that lets a manager place a window before it is seen. Most tests care only about
-            // the id; `create_configured` is for the ones that care about the configure.
             Outcome::Created { reply_len, .. } => {
                 let id = parse_create_window_reply(&reply[..reply_len]).unwrap();
-                // **Standing in for the bin**, which marks a window configured the instant it
-                // sends the first `Configure` — immediately, when no manager is attached, which
-                // is the case every test in this module models. Without it these windows are
-                // held, and since B4 a held window is neither composited, focusable, nor
-                // clickable.
+                // Stands in for the bin, which marks a window configured when it sends the first
+                // `Configure`.
                 stack.mark_configured(id);
                 Ok(id)
             }
@@ -471,7 +371,6 @@ mod tests {
         attach_sized(conn, stack, window, buffer, 8, 8)
     }
 
-    /// `attach` at a stated size — see [`create_sized`].
     fn attach_sized(
         conn: &mut Connection,
         stack: &mut WindowStack,
@@ -490,7 +389,6 @@ mod tests {
         dispatch(conn, stack, OP_ATTACH_BUFFER, &body[..n], &mut reply)
     }
 
-    /// `commit` with an explicit damage rectangle.
     fn commit_damage(
         conn: &mut Connection,
         stack: &mut WindowStack,
@@ -537,8 +435,6 @@ mod tests {
 
     #[test]
     fn one_connection_cannot_touch_another_s_window() {
-        // The spec's rule. Holding `/dev/draw` is the authority to create windows; it must
-        // not be the authority to destroy anyone else's.
         let mut stack = WindowStack::new();
         let (mut a, mut b) = (Connection::new(), Connection::new());
         let owned_by_a = create(&mut a, &mut stack, Role::Normal).unwrap();
@@ -551,50 +447,36 @@ mod tests {
 
     #[test]
     fn a_commit_dirties_the_damage_it_named_and_no_more() {
-        // **The whole point of the field.** Until 2026-08-12 every request recomposited the
-        // screen, and with an 812×480 terminal window in the stack that cost a permanently
-        // busy CPU — caught by `test-harness`'s idle-occupancy check, which is the only thing
-        // in the tree that could have caught it.
         let mut a = Connection::new();
         let mut stack = WindowStack::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
         assert_applied(attach(&mut a, &mut stack, w, 0), None);
-        // **The first commit is the exception, and it is asserted rather than stepped over**
-        // (M13 Part C): a window nothing has drawn yet repaints all of itself, shadow included,
-        // because what changed on screen is the whole window appearing rather than whatever the
-        // client redrew inside its buffer.
+        // The first commit repaints the whole window, shadow included: the window appearing.
         let first = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (2, 3, 4, 5)));
         let painted = stack.window(w).expect("in the stack").painted_bounds();
         assert_eq!(first, Some(painted), "a window's first frame paints its shadow too");
         assert!(painted.origin.x < 0, "the premise: painted bounds reach outside the window");
 
-        // Every commit after it names its own damage and no more, which is the field's point.
         let d = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (2, 3, 4, 5)));
         assert_eq!(d, Some(Rect::new(2, 3, 4, 5)));
     }
 
     #[test]
     fn a_commits_damage_is_clipped_to_its_own_window() {
-        // A client is not trusted to bound its own rectangle. A damage larger than the window
-        // would repaint a *neighbour's* pixels out of this window's buffer.
+        // A client is not trusted to bound its own rectangle.
         let mut a = Connection::new();
         let mut stack = WindowStack::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
         assert_applied(attach(&mut a, &mut stack, w, 0), None);
-        // Past the first commit, which repaints the window whole — see the test above.
         assert_applied(commit(&mut a, &mut stack, w, 0), None);
-        // The window is 8×8 at the origin; the client claims 400×400 of damage.
         let d = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (0, 0, 400, 400)));
         assert_eq!(d, Some(Rect::new(0, 0, 8, 8)));
-        // And damage entirely outside the window dirties nothing rather than something.
         let d = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (100, 100, 4, 4)));
         assert_eq!(d.map(|r| (r.size.w, r.size.h)), Some((0, 0)));
     }
 
     #[test]
     fn attaching_a_buffer_dirties_nothing() {
-        // The buffer reaches the screen at the commit. A repaint here is work for a picture
-        // that has not changed.
         let mut a = Connection::new();
         let mut stack = WindowStack::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
@@ -604,16 +486,8 @@ mod tests {
 
     #[test]
     fn destroying_dirties_what_vanished_including_a_child_bigger_than_its_parent() {
-        // Destroy is transitive: a popup's children go with it, and their pixels have to be
-        // repainted too. Naming only the window in the request would leave a child's pixels on
-        // screen after it was gone.
-        //
-        // **The child is 16×16 to the parent's 8×8**, which is the whole point of the test. A
-        // first version created one childless window and asserted its own bounds — so an
-        // implementation that reported only the named window's rectangle passed the entire
-        // file, and neither the transitive union nor `union()` itself was exercised (PR #192
-        // review, finding 1). A child whose bounds are a subset of its parent's cannot tell
-        // the two apart either.
+        // The child is 16×16 to the parent's 8×8: a child that is a subset of its parent cannot
+        // tell the union from the named window alone.
         let mut a = Connection::new();
         let mut stack = WindowStack::new();
         let parent = create(&mut a, &mut stack, Role::Normal).unwrap();
@@ -629,8 +503,7 @@ mod tests {
             "the premise: the child is larger than its parent",
         );
 
-        // Both windows' *painted* bounds, captured before the destroy: what has to be repainted
-        // is what vanished, and since M13 Part C a window's shadow vanishes with it.
+        // Painted bounds, captured before the destroy.
         let want = union(
             stack.window(parent).expect("still here").painted_bounds(),
             stack.window(popup).expect("still here").painted_bounds(),
@@ -643,35 +516,26 @@ mod tests {
 
     #[test]
     fn a_window_whose_buffer_shrinks_repaints_what_it_vacated() {
-        // `Window::bounds` reports the *committed* buffer, so damage clipped after the commit
-        // is clipped to the new, smaller rectangle — and the band the old buffer occupied and
-        // the new one does not keeps the old pixels until something unrelated forces a full
-        // repaint. Before damage-bounded repaint the unconditional recomposite covered it, so
-        // this was a regression this PR introduced (PR #192 review, finding 3).
-        //
-        // Not reachable in-tree today — every window in the image is fixed-size and M6 owns
-        // resize — which is exactly why it needs a test rather than a client to find it.
+        // `Window::bounds` reports the committed buffer, so a shrunk window must repaint the band
+        // it vacated.
         let mut a = Connection::new();
         let mut stack = WindowStack::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
         assert_applied(attach(&mut a, &mut stack, w, 0), None);
         assert_applied(commit(&mut a, &mut stack, w, 0), None);
 
-        // A 4×4 buffer replaces the 8×8 one. The client honestly damages its whole new buffer.
         assert_applied(attach_sized(&mut a, &mut stack, w, 1, 4, 4), None);
         let before = stack.window(w).expect("in the stack").painted_bounds();
         let d = dirty_of(commit_damage(&mut a, &mut stack, w, 1, (0, 0, 4, 4))).expect("a commit names a region");
         let after = stack.window(w).expect("in the stack").painted_bounds();
-        // The union of what it painted before and what it paints now — the shadow moved in with
-        // the shape, so both sides are painted bounds (M13 Part C).
+        // The union of what it painted before and now (painted bounds).
         assert_eq!(d, union(before, after), "only the new 4x4 was repainted, vacating a band");
         assert!(d.size.w > 8, "the premise: the vacated band and the shadow are both in it");
     }
 
     #[test]
     fn another_connection_s_window_is_not_found_not_denied() {
-        // The two answers must be indistinguishable, or the reply is an oracle for probing
-        // which window ids exist.
+        // The two answers must be indistinguishable, or replies probe for which ids exist.
         let mut stack = WindowStack::new();
         let (mut a, mut b) = (Connection::new(), Connection::new());
         let real = create(&mut a, &mut stack, Role::Normal).unwrap();
@@ -680,10 +544,6 @@ mod tests {
     }
 
     /// A connection cannot hold more than [`MAX_WINDOWS_PER_CONNECTION`] windows at once.
-    ///
-    /// Nothing bounded this before C3: `conn.owned` and the stack are plain `Vec`s, and the
-    /// only thing keeping a client to one window was `libsurface`'s API owning the transport.
-    /// A session type removes that accident, so the bound has to be real.
     #[test]
     fn a_connection_is_bounded_in_how_many_windows_it_may_hold() {
         let mut stack = WindowStack::new();
@@ -697,14 +557,11 @@ mod tests {
             "the one past the bound is refused, and says why"
         );
 
-        // **Destroying one makes room again**, so the bound is on what is held rather than on
-        // how many have ever been created — a client that opens and closes menus forever must
-        // not eventually be unable to open another.
+        // Destroying one makes room again: the bound is on what is held.
         let first = conn.owned()[0];
         assert!(matches!(destroy(&mut conn, &mut stack, first), Outcome::Applied { .. }));
         create(&mut conn, &mut stack, Role::Normal).expect("room again");
 
-        // Another connection is unaffected: the bound is per connection, not global.
         let mut other = Connection::new();
         create(&mut other, &mut stack, Role::Normal).expect("a different client is not punished");
     }
@@ -723,25 +580,9 @@ mod tests {
 
     #[test]
     fn a_create_moves_focus_and_is_not_an_applied() {
-        // **The trap, stated where a host test can hold it shut.** `focus_candidate` is the
-        // topmost focus-taking window and a create puts one on top, so focus moves on the
-        // create itself — before the client has attached a buffer, let alone committed. But
-        // create is the one op that answers with a window id, so it returns `Outcome::Reply`
-        // and never goes near the `Applied` path.
-        //
-        // The compositor announced focus from inside that path, so a create told nobody: the
-        // previously focused window kept blinking a caret it no longer owned while its keys
-        // went to a window that had not painted (PR #184 review, finding 2). `serve_session`
-        // now announces after every request whatever its outcome.
-        //
-        // **What this test does and does not hold shut.** It pins the *premise* — a create
-        // is a `Reply`, and focus moves on it — so anyone who reads `Applied` as "the ops
-        // that change things" is contradicted here. It does **not** catch the regression
-        // itself: `announce_focus`'s call site is in the bin, and moving it back inside the
-        // `Applied` arm leaves every assertion below still true. What catches that is the
-        // boot gate's ordering check — a window's *first* event must be its focus change —
-        // added for exactly this reason, because the gate as it stood passed with the bug
-        // reintroduced.
+        // A create answers `Created`, not `Applied`, yet moves focus; `serve_session` must announce
+        // focus after every request. This pins the premise only; the boot gate's check that a
+        // window's first event is its focus change is what catches the regression.
         let mut stack = WindowStack::new();
         let mut a = Connection::new();
         let first = create(&mut a, &mut stack, Role::Normal).unwrap();
@@ -761,12 +602,8 @@ mod tests {
 
         assert_ne!(second, first);
 
-        // **Since B4 the create alone is not enough: focus follows the configure.** A window
-        // that is not on screen must not hold the keyboard, and one whose configure is held is
-        // not on screen. The premise this test exists for survives — focus still moves without
-        // an attach, a commit, or an `Applied` — but the step that moves it is the first
-        // `Configure`, which the bin sends immediately when no manager is attached and holds
-        // when one is (PR #218 review, finding 3).
+        // Focus follows the first `Configure`, not the create: a held window is not on screen and
+        // must not hold the keyboard.
         assert_eq!(
             stack.focus_candidate(),
             Some(first),
@@ -790,14 +627,11 @@ mod tests {
         assert_applied(attach(&mut a, &mut stack, w, 1), None);
 
         assert_applied(commit(&mut a, &mut stack, w, 0), None);
-        // The buffer that left the screen, never the one that arrived.
         assert_applied(commit(&mut a, &mut stack, w, 1), Some((w, 0)));
     }
 
     #[test]
     fn destroying_a_parent_drops_the_descendants_from_the_connection_too() {
-        // Otherwise the connection keeps claiming ids that no longer exist, and a later id
-        // reuse hands it a window it does not own.
         let mut stack = WindowStack::new();
         let mut a = Connection::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
@@ -814,19 +648,14 @@ mod tests {
 
     #[test]
     fn a_window_removed_by_someone_else_stops_being_owned() {
-        // **The manager's `Manage::Close` removes a window its owner still believes in.** That
-        // path does not run `destroy` here — it destroys through the stack — so the connection
-        // is pruned by the compositor's removal drain calling [`Connection::disown`]. Without
-        // it the client's own `DestroyWindow` is the one request that answers
-        // `Rejected(NoSuchWindow)` — mapped to `InvalidArgument` — where `AttachBuffer`,
-        // `Commit` and `SetTitle` all answer `NotFound`, and the spec says `NotFound`. A client
-        // that outlives its window is precisely the wedged one `Manage::Close` exists for.
+        // A manager's `Manage::Close` removes a window its owner still believes in; the removal
+        // drain calls `Connection::disown`. Without it the client's own `DestroyWindow` would
+        // answer `InvalidArgument` where every other request answers `NotFound`.
         let mut stack = WindowStack::new();
         let mut a = Connection::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
         let menu = create(&mut a, &mut stack, Role::Popup { parent: w }).unwrap();
 
-        // Exactly what the manager arm does, and then what the drain does with `take_removed`.
         stack.destroy(w).unwrap();
         for gone in stack.take_removed() {
             a.disown(gone);
@@ -898,7 +727,6 @@ mod title_tests {
     use crate::Role;
     use librsproto::surface::{MAX_TITLE, title};
 
-    /// Build a `SetTitle` body and dispatch it.
     fn set_title(conn: &mut Connection, stack: &mut WindowStack, window: u32, s: &str) -> Outcome {
         let mut body = alloc::vec![0u8; 4 + s.len()];
         let n = title::write(window, s, &mut body).expect("fits");
@@ -916,8 +744,6 @@ mod title_tests {
         assert_eq!(stack.window(w).unwrap().title, "nxterm");
     }
 
-    /// Re-setting the same title must not become manager traffic: a client that sets it every
-    /// frame would otherwise push the bounded queue's older events out.
     #[test]
     fn an_unchanged_title_produces_no_manager_event() {
         let mut stack = WindowStack::new();
@@ -928,12 +754,9 @@ mod title_tests {
             matches!(set_title(&mut a, &mut stack, w, "same"), Outcome::Applied { .. }),
             "the same title was announced twice"
         );
-        // Negative control: a different title is announced.
         assert!(matches!(set_title(&mut a, &mut stack, w, "other"), Outcome::TitleSet { .. }));
     }
 
-    /// The same ownership rule as every other op — and `NotFound` rather than a distinct
-    /// error, so a reply cannot be used to probe for another client's window ids.
     #[test]
     fn another_connections_window_cannot_be_renamed() {
         let mut stack = WindowStack::new();
@@ -942,11 +765,9 @@ mod title_tests {
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
         assert!(matches!(set_title(&mut b, &mut stack, w, "mine now"), Outcome::Failed(SurfaceError::NotFound)));
         assert_eq!(stack.window(w).unwrap().title, "", "the window was renamed anyway");
-        // A window that never existed answers the same thing.
         assert!(matches!(set_title(&mut b, &mut stack, w + 99, "ghost"), Outcome::Failed(SurfaceError::NotFound)));
     }
 
-    /// Stored truncated, so a window's cost stays finite however chatty its client is.
     #[test]
     fn an_over_long_title_is_stored_truncated() {
         let mut stack = WindowStack::new();

@@ -1,31 +1,14 @@
-//! `compositor` — the resource server behind `/dev/draw` (plan M2 Part B).
+//! `compositor` — the resource server behind `/dev/draw`.
 //!
-//! **Everything that decides is in the library half** ([`compositor`]): the window stack,
-//! roles and struts, request dispatch, and compositing, all host-tested without a kernel.
-//! This file is the parts that cannot be: the IPC loop, mapping clients' transferred
-//! `MemoryObject`s, and driving the framebuffer.
+//! Everything that decides is in the library half ([`compositor`]), host-tested; this file is the
+//! IPC loop, the mapping of clients' `MemoryObject`s, and the framebuffer.
 //!
-//! ## Shape
+//! 1. Acquire `/dev/framebuffer`: authority is the binding (`display-substrate.md` §3).
+//! 2. Send `Meta::Ready` on the control channel, transferring the end the supervisor binds.
+//! 3. Serve. A resolve of `new` mints a session channel; a request's identity is its endpoint.
 //!
-//! Modelled on `profile-server`, which serves `/bin` the same way:
-//!
-//! 1. Acquire `/dev/framebuffer` — **authority is the binding**, so a compositor is simply
-//!    a process whose namespace contains it (`display-substrate.md` §3).
-//! 2. Mint a forwarding channel pair; send `Meta::Ready` on the control channel
-//!    transferring the kernel end, which the supervisor binds at `/dev/draw`.
-//! 3. Serve. A forwarded resolve of `new` mints a **session channel**: the compositor
-//!    keeps the server end and hands the client end back as the resolve's answer. There is
-//!    no distinct "connection" object — a connection *is* a channel, which is what makes
-//!    the per-connection ownership rule enforceable: a request's identity is the endpoint
-//!    it arrived on.
-//!
-//! ## The one genuinely new mechanism
-//!
-//! `AttachBuffer` carries a `MemoryObject` handle in the message's transfer slot. The
-//! compositor maps it **once** and keeps the mapping for the buffer's life — that is the
-//! whole point of the design (`display-substrate.md` §4: the handle is transferred once,
-//! not per frame). Everything before this milestone was logic testable on the host; this
-//! part can only be proven by booting.
+//! `AttachBuffer` maps a `MemoryObject` once, kept for the buffer's life (`display-substrate.md`
+//! §4).
 
 #![no_std]
 #![no_main]
@@ -57,149 +40,69 @@ use librsproto::surface::{
 };
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
-/// `alloc` backing — the window stack and its buffer lists allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// IPC message buffer length.
 const MSG_LEN: usize = 4096;
-/// Offset of the rsproto payload inside an `IpcMsg`.
 const PAYLOAD_OFF: usize = 24;
-/// The background the screen is cleared to where no window covers.
-///
-/// **Taken from `libdraw::scene` rather than declared here**, which it was until M8 Part B. The
-/// two were the same literal, and the display gate has always depended on that: its reference
-/// render fills with `scene::BACKGROUND` and is compared against pixels this constant painted,
-/// so a change to either alone would have failed the gate with a colour mismatch rather than
-/// naming the duplicate. One constant cannot drift from itself.
+/// The background the screen is cleared to; the display gate's reference render fills with the same
+/// `scene::BACKGROUND`, so the two must be one constant.
 const BACKGROUND: Rgb = libdraw::scene::BACKGROUND;
 
-/// Largest Surface request body.
+/// Largest Surface request body, sized by `SetTitle`, the only variable-length one; the assertion
+/// below ties it to `MAX_TITLE`.
 ///
-/// **Sized by `SetTitle`, which is the only variable-length one** — the fixed records are 24
-/// bytes or fewer. At 64 this silently capped a title at 60 bytes while the spec, the
-/// deferral and `truncate_title` all said 256, and the cut was at a raw byte offset: a title
-/// whose 61st byte began a multi-byte character came back `Malformed` and the rename never
-/// happened, which is the exact corruption `truncate_title` exists to prevent, reintroduced
-/// one frame further up. It also made `truncate_title`'s walk-back and `note_title_truncated`
-/// unreachable in the shipped binary, because `title.len()` could never exceed 60 (PR #233
-/// review, finding 1).
-///
-/// The assertion below is the point: this is a number two files away from the one it has to
-/// track, and nothing else would notice them drifting apart again.
+/// A smaller body cut titles at a raw byte offset, which failed `Malformed` mid-character.
 const MAX_BODY: usize = 4 + librsproto::surface::MAX_TITLE;
 const _: () = assert!(MAX_BODY >= 4 + librsproto::surface::MAX_TITLE);
 
-/// Four less than the wait limit: the forwarding endpoint, the input-server consumer channel, the
-/// manager channel, and since administration Part E.2 the control channel `service --stop` asks
-/// on. It was two less when this was written, and the history below is that version's.
-///
-/// It is `- 2` rather than `- 1` because the wait set is built from *all* of them at once.
-/// Leaving it at `- 1` would overrun `WAIT_HANDLES` by exactly one entry on the boot where
-/// every session slot is in use and input connected — the rarest configuration, and the
-/// only one that would ever have shown it.
+/// Four less than the wait limit: the forwarding, input, manager and control channels.
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 4;
 
-/// The wait-set bound, as a compile error rather than a comment.
-///
-/// The invariant is now spread across two constants, and the serve loop's `SAFETY` note used
-/// to assert `1 + MAX_SESSIONS` — true before the input channel joined the set and quietly
-/// false after. Anyone adding a fixed handle should be stopped by the compiler, not by
-/// re-reading prose (PR #180 review, finding 4).
-///
-/// It worked: the manager channel is the **third** fixed handle (M6 Part B), and this line is
-/// what said so. The control channel is the fourth (administration Part E.2).
 const _: () = assert!(4 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
 
 /// How many client-driven rejections get logged **per session** before the tap closes.
-///
-/// Per session, not per process. A single global budget is spent by whichever client
-/// misbehaves first and never refills — on a selftest image the churn probe burns all of it
-/// in the first second, so on exactly the builds where a rejection would be diagnostic,
-/// no later one is ever logged (PR #175 review, finding 6). A session's counter resets when
-/// the slot is reused, which is also when the client behind it is a different program.
 const MAX_LOGGED_REJECTIONS: u32 = 8;
 
-/// How many routed input events get logged before the tap closes.
-///
-/// Bounded for the same reason as [`MAX_LOGGED_REJECTIONS`], but more urgently: input is
-/// *continuous*. An unbounded line per event turns a moving mouse into an unbroken stream
-/// of serial output, which on this machine is a slow synchronous device — the compositor
-/// would spend its time printing rather than compositing, and the klog ring would carry
-/// nothing but cursor positions.
+/// How many routed input events get logged before the tap closes; serial is slow and input
+/// continuous.
 const MAX_LOGGED_ROUTES: u32 = 8;
 
-/// How many *input diagnostics* — a press and where it landed, a dropped batch — get logged.
-///
-/// A separate, far larger bound than [`MAX_LOGGED_ROUTES`] because the thing that constant
-/// argues about does not apply: these are **edge-triggered**, one line per real click or per
-/// genuine loss, not one per event in a continuous stream. A moving mouse produces none of
-/// them. But the argument for having *a* bound survives — serial is a slow synchronous device
-/// and an hour of desktop clicking should not fill the klog ring with press lines — so this is
-/// generous rather than absent: any gate needs a handful, and 256 outlives every one of them.
+/// How many edge-triggered input diagnostics (a press and where it landed, a dropped batch) get
+/// logged. Generous, since any gate needs a handful, but not absent: serial is slow.
 const MAX_LOGGED_INPUT_DIAGS: u32 = 256;
 
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-/// Sized by the **kernel's** limit, not by what this server expects.
-///
-/// `sys_channel_recv` takes no capacity argument: it copies `handle_count * 8` bytes here,
-/// where the count is the sender's and is bounded only by `IPC_HANDLE_MAX`. A `[u64; 4]`
-/// therefore let any client with a session overrun this static by 32 bytes into whatever
-/// the linker placed next, by sending eight transfers (PR #175 review, finding 1). Every
-/// other resource server in the tree already sizes it this way.
+/// Sized by the kernel's limit: `sys_channel_recv` takes no capacity and copies the sender's
+/// `handle_count * 8` bytes, bounded only by `IPC_HANDLE_MAX`.
 static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
 static mut RECV_COUNT: u64 = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
-/// The manager's channel, or `0` when nobody is managing.
-///
-/// **One, not a table.** Two managers placing windows is a race with no arbiter, and the failure
-/// looks like windows moving on their own — so a second resolve is refused rather than served.
+/// The manager's channel, or `0`. One, not a table: two managers placing windows race with no
+/// arbiter, so a second resolve is refused.
 static mut MANAGER_CH: u64 = 0;
-/// Routed input events logged so far — see [`MAX_LOGGED_ROUTES`].
 static mut ROUTES_LOGGED: u32 = 0;
-/// Input diagnostics logged so far — see [`MAX_LOGGED_INPUT_DIAGS`].
 static mut INPUT_DIAGS_LOGGED: u32 = 0;
-/// Scratch for `sys_clock_read`.
 static mut CLOCK_BUF: u64 = 0;
 
 /// How long to sleep before retrying a parked message, in nanoseconds.
 ///
-/// **A parked message has no wakeup of its own.** A channel endpoint signals when it has
-/// something to *read*, so a client draining its receive ring produces no signal here — the
-/// compositor would sit in an infinite `sys_wait` holding a message the client is waiting
-/// for. For input that is merely late; for a `Release` it is the permanent hang this whole
-/// mechanism exists to prevent, and worse than the drop-and-log it replaced, because at
-/// least that said something (PR #181 review, finding 1).
-///
-/// Ten milliseconds because that is the scheduler tick, so a shorter deadline buys nothing.
-/// The cost is bounded to exactly the periods when something is parked: with every outbox
-/// empty the wait is still infinite and an idle compositor does not wake at all.
+/// A parked message has no wakeup of its own (a draining client signals nothing), so the wait is
+/// bounded while any is parked. Ten ms is the scheduler tick.
 const RETRY_INTERVAL_NS: u64 = 10_000_000;
 
-/// How long a new window waits for the manager to place it before it is shown anyway (M6 B4).
-///
-/// **A deadline, not a promise the manager will answer.** A wedged or slow shell must delay a
-/// window, never lose it — a client blocked forever in `Window::new` because nobody ran the
-/// desktop is a worse failure than a window that appears where the compositor put it. 200ms is
-/// far longer than a scheduled round trip on an idle machine and short enough that a user who
-/// hits it sees a slow launch rather than a hung one.
+/// How long a new window waits for the manager to place it before it is shown anyway: a slow shell
+/// must delay a window, never lose it. 200ms outlasts an idle round trip.
 const CONFIGURE_DEADLINE_NS: u64 = 200_000_000;
 
-/// How many outbox discards get logged **per session** before the tap closes.
-///
-/// Bounded for the same reason as [`MAX_LOGGED_REJECTIONS`], and the argument that a client
-/// generating these "has a problem worth the lines" is the same one that was made about
-/// rejections before a churn probe buried every other service's output. A wedged client with
-/// a key held at repeat rate is tens of lines a second on a shared console.
 const MAX_LOGGED_OVERFLOWS: u32 = 8;
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 
-/// A client buffer the compositor has mapped.
 struct MappedBuffer {
     window: u32,
     buffer: u32,
@@ -208,20 +111,8 @@ struct MappedBuffer {
 }
 
 impl Drop for MappedBuffer {
-    /// Unmap when the record goes away — **the record is not the mapping**.
-    ///
-    /// All three places that shrink `Server::buffers` do it with `Vec::retain`, which drops the
-    /// removed records and nothing else — the two that follow a window going away, and, since
-    /// M9 Part D, the one in `map_attached_buffer` that drops the mapping a re-attach replaces. Dropping a `MappedBuffer` used to leave the VMA
-    /// behind, so the comment at the destroy site — "otherwise a client looping
-    /// create/attach/destroy grows the compositor's address space without bound" — described
-    /// an intent the code did not carry out. It leaked on the ordinary application
-    /// lifecycle: every window closed, every client that exits.
-    ///
-    /// Worse than the address space, it pinned the **client's** memory. `map_attached_buffer`
-    /// closes its handle immediately and relies on the mapping to hold the object alive, so
-    /// a stale mapping meant a client's framebuffer was never freed after that client was
-    /// gone — at a real window size, megabytes per window.
+    /// Unmap when the record goes away: the `Vec::retain` calls that shrink `Server::buffers` rely
+    /// on it.
     fn drop(&mut self) {
         // SAFETY: `addr`/`len` came from a successful `sys_memory_map` in
         // `map_attached_buffer`; a record is dropped once, so this unmaps once.
@@ -229,66 +120,33 @@ impl Drop for MappedBuffer {
     }
 }
 
-/// Everything the serve loop owns.
 struct Server {
     stack: WindowStack,
-    /// Per-session connection state, parallel to `SESSION_CH`.
     conns: [Connection; MAX_SESSIONS],
-    /// Mapped client buffers, in attach order.
     buffers: alloc::vec::Vec<MappedBuffer>,
     /// Device triples → logical events. Reset by a `SYN_DROPPED` the server forwards.
     interp: Interpreter,
-    /// Cursor, crossing state and the implicit grab.
     router: InputRouter,
     /// The consumer channel from `/dev/input/new`, or 0 if input is unavailable.
     input_ch: u64,
-    /// The key currently repeating, if one is held.
     repeat: Option<compositor::Repeat>,
-    /// Windows created while a manager is attached, still holding their first `Configure`.
-    ///
-    /// `(window, deadline_ns)`. The client is blocked waiting for that configure, so nothing
-    /// here may be dropped without sending one — see [`release_configure`] and
-    /// [`CONFIGURE_DEADLINE_NS`].
+    /// `(window, deadline_ns)` of windows holding their first `Configure`; none may be dropped
+    /// without one sent: see [`release_configure`].
     pending_configure: alloc::vec::Vec<(u32, u64)>,
-    /// The screen, as the framebuffer reports it. Fixed for this process's life.
-    ///
-    /// Kept here so that the work area — which every path that changes a strut has to be able to
-    /// re-answer — does not need the framebuffer threaded through it.
     screen: Rect,
-    /// The layout last announced to the manager, so a change can be told from a repeat.
     last_layout: Option<librsproto::surface::MgrLayout>,
-    /// The gesture outline's rectangle, or `None` when nothing is drawing one.
-    ///
-    /// **Written by two gestures**: a resize's own rectangle, and the target a move is previewing
-    /// over a snap zone. **Held here rather than asked of the router**, because every repaint
-    /// needs it and `repaint_region` takes the server immutably — the same shape as the cursor's
-    /// position, which is drawn over the composed stack by the same call.
+    /// The gesture outline's rectangle, or `None`. Held here, not asked of the router, because
+    /// `repaint_region` takes the server immutably.
     outline: Option<Rect>,
-    /// The window last told it has the keyboard, if any.
-    ///
-    /// Kept so a focus change can be *detected* rather than re-announced: `focus_candidate`
-    /// is recomputed after anything that could move it, and most of those do not. Announcing
-    /// unconditionally would send a `FocusEvent` on every commit.
     announced_focus: Option<u32>,
-    /// Pending messages per session, parallel to `SESSION_CH`.
-    ///
-    /// On the heap rather than in this struct by value: `Server` lives on `_start`'s stack,
-    /// and thirty inline queues would be tens of kilobytes against a 32 KiB user stack —
-    /// the same trap `libsurface` documents for holding a transport by value.
+    /// Pending messages per session, on the heap: thirty inline queues would overrun the 32 KiB
+    /// stack.
     outbox: alloc::vec::Vec<Outbox>,
-    /// Events owed to the manager, if one is attached. See [`MgrOutbox`].
     mgr_outbox: MgrOutbox,
-    /// The keyboard lights the input server was last told, or `None` before it has been told any
-    /// (Phase 6 Part B.5). See [`send_lights`].
     lights_sent: Option<u8>,
 }
 
 impl Server {
-    /// The session slot owning `window`, if any.
-    ///
-    /// A window's owner is the connection that created it, which is the only connection
-    /// allowed to name it — so this is a search of the same table `dispatch` authorises
-    /// against, not a second notion of ownership that could disagree with it.
     fn session_of(&self, window: u32) -> Option<usize> {
         (0..MAX_SESSIONS).find(|&i| self.conns[i].owns(window))
     }
@@ -305,25 +163,11 @@ impl BufferSource for Server {
     }
 }
 
-/// Receive-ring depth for a client **session** channel.
-///
-/// Sixteen, which is the kernel's own `IPC_DEFAULT_QUEUE_DEPTH`. The previous value was
-/// `4` — not chosen, but a literal copied into every resource server in the tree, and a
-/// quarter of the system default by accident rather than by argument.
-///
-/// **This is 4× the old threshold, not a different kind of bound**, and it is worth being
-/// precise about that. Coalescing bounds the *outbox*, not this ring: two motions collapse
-/// only while both are queued, and a compositor that flushes every loop iteration sends each
-/// one as its own message — for a PS/2 mouse, one per IRQ. What actually removes the cliff is
-/// the retry: a refused send parks at the head of the outbox instead of being dropped, so the
-/// ring's depth decides how long a stalled client can go before its motion starts coalescing,
-/// not whether anything is lost (PR #181 review, finding 4).
-///
-/// It is not free: a slot is a whole 4 KiB `IpcMsg` whatever the payload, and both endpoints
-/// get one ring, so this is 128 KiB of kernel memory per session against 32 KiB before.
+/// Receive-ring depth for a client **session** channel: the kernel's `IPC_DEFAULT_QUEUE_DEPTH`. A
+/// stalled client's motion coalesces only after this many queue; 128 KiB of kernel memory per
+/// session.
 const SESSION_QUEUE_DEPTH: u64 = 16;
 
-/// The monotonic clock, in nanoseconds.
 fn now_ns() -> u64 {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
@@ -331,7 +175,6 @@ fn now_ns() -> u64 {
     unsafe { (&raw const CLOCK_BUF).read() }
 }
 
-/// Create a connected channel pair with a `depth`-slot ring each. Returns `(a, b)`.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
     let cr =
@@ -343,7 +186,6 @@ fn make_channel(depth: u64) -> Option<(u64, u64)> {
     Some(unsafe { ((&raw const CTRL_OUT0).read(), (&raw const CTRL_OUT1).read()) })
 }
 
-/// Send `Meta::Ready` on the control channel, transferring `kernel_end`.
 fn send_ready(control: u64, kernel_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let Some(body_len) = librsproto::meta::ready(&mut body, b"compositor") else { return false };
@@ -374,10 +216,6 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
     sr == 0
 }
 
-/// Reply to a forwarded resolve by handing back `client_end` as the answer.
-///
-/// A connection has no distinct object kind: it *is* a live channel, the same shape
-/// `profile-server` uses for a directory session.
 fn reply_session(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
@@ -401,7 +239,6 @@ fn reply_session(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     }
 }
 
-/// Reply to a forwarded resolve with an error.
 fn reply_resolve_error(serve_end: u64, request_id: u64, err: KError) -> bool {
     let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
     let elen = librsproto::error::error_body(&mut ebody, err.as_i32(), 0, b"").unwrap_or(0);
@@ -430,11 +267,6 @@ fn reply_resolve_error(serve_end: u64, request_id: u64, err: KError) -> bool {
     }
 }
 
-/// Send a reply body on a **session** channel.
-///
-/// The half of the protocol that was missing: `dispatch` produced replies and this never
-/// sent them, so a client could not learn its window id and never saw a `Release`. The
-/// spec has said "Reply, 4 bytes: the new `window` id" since Part A.
 fn reply_on_session(session: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
     // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
     unsafe {
@@ -454,21 +286,15 @@ fn reply_on_session(session: u64, op: u16, request_id: u64, body: &[u8]) -> bool
     }
 }
 
-/// Send one server-initiated record. Returns `false` if the channel would not take it.
-///
-/// No request id: nothing asked for these. A refusal is **not** a drop any more — the caller
-/// leaves the message at the head of the session's outbox and tries again next time round,
-/// which is the whole difference between this and the `NOBLOCK`-and-forget it replaced.
+/// Send one server-initiated record, with no request id. `false` if the channel would not take it:
+/// the caller leaves the message at the head of its outbox and retries.
 fn send_input(session: u64, op: u16, body: &[u8]) -> bool {
     reply_on_session(session, op, 0, body)
 }
 
-/// **Tell the input server the lights the locks call for**, if they are not what it was last told
-/// (Phase 6 Part B.5): an `Input::Lights` on the consumer channel, which the server writes to every
-/// keyboard. The locks live here, in the interpreter, so this is the one process that knows them.
+/// Tell the input server the lights the locks call for, if not what it was last told.
 ///
-/// **A send that fails is tried again after the next input pass**: `lights_sent` moves only when
-/// one goes, so a full channel delays the lights rather than losing them.
+/// `lights_sent` moves only on a send, so a full channel delays the lights rather than losing them.
 fn send_lights(srv: &mut Server) {
     let lights = libinput::lights(srv.interp.locks());
     if srv.input_ch == 0 || srv.lights_sent == Some(lights) {
@@ -497,20 +323,10 @@ fn send_lights(srv: &mut Server) {
     }
 }
 
-/// Log a routed record, up to [`MAX_LOGGED_ROUTES`] of them.
 fn log_route(rec: &Outbound) {
-    // **A drop is not part of the stream this cap exists for.** The cap bounds *input* —
-    // motion, keys, buttons — which arrives continuously and would fill a console on its own. A
-    // drop is one record per completed gesture, it is the only evidence outside the receiving
-    // client that a payload was handed over, and by the time a person has dragged anything the
-    // cap is long since spent. Excluded rather than raised: raising it would mean more motion
-    // logged for the sake of one line (M10 Part E).
-    //
-    // **A dismissal is excluded for the same three reasons** (M11 Part E batch 5): one record per
-    // popup, the only evidence outside the client that the compositor said anything, and it
-    // happens long after the cap is spent — which is exactly how it was found. The mechanism
-    // worked and the line was silently suppressed, so the gate asserting it timed out on a
-    // system that was behaving correctly.
+    // A drop or a dismissal bypasses the cap: one record per gesture, long after it is spent, and
+    // the only evidence the compositor acted (`check-login` waits on `drop win=`, `dismissed
+    // win=`).
     if !matches!(rec, Outbound::Dropped { .. } | Outbound::Dismissed { .. }) {
         // SAFETY: single-threaded server; this counter is touched only from the serve loop.
         let n = unsafe { ROUTES_LOGGED };
@@ -551,10 +367,8 @@ fn log_route(rec: &Outbound) {
             l.s(b"compositor: dismissed win=").u(*window as u64);
         }
         Outbound::Dropped { window, acceptor, kind, name, x, y, .. } => {
-            // **The name, never the path.** What is being dragged is a path in somebody's home
-            // directory, and a console line naming it is a log of what they were doing with
-            // which file — the same reason the chord log carries the modifier and not the key
-            // beside it. The display name is what is already on screen under the pointer.
+            // The name, never the path: a console line naming a file in somebody's home is a log of
+            // what they were doing.
             l.s(b"compositor: drop win=").u(*window as u64);
             l.s(b" on=").untrusted(acceptor.as_bytes());
             l.s(b" kind=").u(*kind as u64);
@@ -570,14 +384,8 @@ fn log_route(rec: &Outbound) {
     l.end();
 }
 
-/// Take an outline change and put it on screen: remember it, and repaint what it disturbed.
-///
-/// **Both rectangles, and only their edges.** The union of where an outline was and where it is
-/// is very nearly a window, and repainting that per motion is the recompose that starves input;
-/// the strips of where it *was* are what erase it, since an outline is drawn over the composed
-/// stack rather than being in it. `StartResize` has its own copy of this loop because
-/// `start_resize` hands back the rectangle rather than the change — the two shapes are worth
-/// merging the next time a third gesture draws one, and are not worth a signature change now.
+/// Take an outline change and put it on screen: repaint the strips of where it was and is, not
+/// their union, which would starve input.
 fn apply_outline(srv: &mut Server, screen: &mut Screen<RawFramebuffer>, outline: Option<compositor::input::Outline>) {
     let Some(o) = outline else { return };
     srv.outline = o.now;
@@ -588,11 +396,6 @@ fn apply_outline(srv: &mut Server, screen: &mut Screen<RawFramebuffer>, outline:
     }
 }
 
-/// Queue everything the router produced.
-///
-/// Records addressed to a window whose session has already gone are dropped rather than
-/// broadcast: `session_of` returning `None` means the owner disconnected between the event
-/// arriving and this running.
 fn deliver(srv: &mut Server, out: &[Outbound]) {
     for rec in out {
         let Some(slot) = srv.session_of(rec.window()) else {
@@ -603,23 +406,12 @@ fn deliver(srv: &mut Server, out: &[Outbound]) {
     }
 }
 
-/// Send a repeat if one is due.
-///
-/// Queued through the outbox like every other record, so it cannot be displaced by input and
-/// arrives in order with the press it continues.
 fn fire_repeat(srv: &mut Server) {
     let now = now_ns();
     let Some(mut r) = srv.repeat else { return };
-    // **The whole reason repeat is compositor-side**, and checked here rather than cleared
-    // at each focus-moving site: a key held while focus moves must not keep typing into the
-    // window that lost it, and no client can know that happened. Validating against the
-    // stack means a *new* way to move focus cannot forget to stop the repeat — the same
-    // reasoning as `Router::prune` asking the tree rather than being told.
-    //
-    // **Not covered end to end**, and the comment says so rather than implying otherwise:
-    // `check-input` never moves focus while a key is held, because doing so needs a second
-    // windowed client. Removing this check leaves the gate green. `Repeat`'s *timing* is
-    // host-tested; this predicate is not.
+    // Checked here, not at each focus-moving site, so a new way to move focus cannot forget: a
+    // held key must not keep typing into the window that lost focus. No gate covers it
+    // (`check-input` never moves focus while a key is held).
     if srv.stack.focus_candidate() != Some(r.window) {
         srv.repeat = None;
         return;
@@ -628,8 +420,6 @@ fn fire_repeat(srv: &mut Server) {
         return;
     }
     srv.repeat = Some(r);
-    // The window may have gone since the key went down — the client exited mid-keystroke —
-    // in which case the repeat is dropped and the state with it.
     let Some(slot) = srv.session_of(r.window) else {
         srv.repeat = None;
         return;
@@ -640,24 +430,13 @@ fn fire_repeat(srv: &mut Server) {
 }
 
 /// Tell the affected windows if focus moved since the last announcement.
-///
-/// **Called after anything that could move it** — a window created, destroyed, raised, or a
-/// session closed — rather than from each of those sites, because the question "did focus
-/// change" has one answer and four ways to provoke it. Comparing against what was last
-/// announced is what keeps a commit from producing a `FocusEvent`.
-///
-/// Both halves go out: the window that lost the keyboard is told, and so is the one that
-/// gained it. A client that only heard about gaining would keep a caret blinking behind
-/// whatever took focus from it.
 fn announce_focus(srv: &mut Server) {
     let now = srv.stack.focus_candidate();
     let Some((was, now)) = compositor::focus_transition(srv.announced_focus, now) else {
         return;
     };
     srv.announced_focus = now;
-    // **The manager hears about every transition, including ones no session owns.** A window
-    // whose client has gone still leaves focus, and a manager tracking who has the keyboard
-    // needs that edge as much as the client that gained it does.
+    // The manager hears every transition, including a window whose client has gone.
     if let Some(old) = was {
         mgr_emit(srv, MgrEvent::Focus { window: old, focused: false });
     }
@@ -680,7 +459,6 @@ fn announce_focus(srv: &mut Server) {
     }
 }
 
-/// Queue one message for a session, logging if the queue had to discard.
 fn enqueue(srv: &mut Server, slot: usize, rec: Outbound) {
     if srv.outbox[slot].push(rec) {
         let n = srv.outbox[slot].dropped();
@@ -695,20 +473,11 @@ fn enqueue(srv: &mut Server, slot: usize, rec: Outbound) {
     }
 }
 
-/// Push as much of each session's queue down its channel as the channel will take.
+/// Push as much of each session's queue down its channel as it will take.
 ///
-/// Returns `true` if anything is still parked, which is what makes the serve loop's next
-/// `sys_wait` bounded rather than infinite.
-///
-/// **Head-of-line, and it stops at the first refusal.** Skipping a stuck message to deliver
-/// a later one would reorder a client's event stream — a release arriving before the commit
-/// it answers, or a button before the motion that positioned it.
-///
-/// **There is no writability signal to wait on.** A channel endpoint signals when it has
-/// something to read, so a client draining its ring does not wake the compositor at all.
-/// That is why this reports whether anything is still parked: the serve loop then waits with
-/// a [`RETRY_INTERVAL_NS`] deadline instead of forever, and polls *only* while it owes
-/// somebody a message.
+/// Returns `true` if anything is parked, giving the next `sys_wait` a [`RETRY_INTERVAL_NS`]
+/// deadline (there is no writability signal). Stops at the first refusal: skipping would reorder a
+/// client's stream.
 fn flush_outboxes(srv: &mut Server) -> bool {
     #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
     for slot in 0..MAX_SESSIONS {
@@ -725,9 +494,7 @@ fn flush_outboxes(srv: &mut Server) -> bool {
             srv.outbox[slot].pop();
         }
     }
-    // The manager's events drain the same way and for the same reason: a manager whose ring is
-    // briefly full must not lose a `created`, because unlike a dropped input event that is a
-    // window it will never place and never hear about again.
+    // Drained as the clients' are: a manager that lost a `created` would never place that window.
     // SAFETY: reading our own manager slot.
     let mgr = unsafe { MANAGER_CH };
     if mgr == 0 {
@@ -743,34 +510,19 @@ fn flush_outboxes(srv: &mut Server) -> bool {
     (0..MAX_SESSIONS).any(|i| !srv.outbox[i].is_empty()) || !srv.mgr_outbox.is_empty()
 }
 
-/// Announce everything the stack recorded since this was last called — moves, then removals.
-///
-/// **Called after every dispatch, not only after the ops that obviously change something.** A
-/// client disconnecting destroys its windows, one destroy removes a whole menu chain, and a
-/// commit can resize a window — so what changed is not something a call site can name from the
-/// op it just handled. Draining unconditionally also keeps the stack's logs from growing while
-/// no manager is attached, because they are emptied either way.
+/// Announce everything the stack recorded since the last call, after every dispatch, as the op
+/// cannot name what changed.
 fn drain_stack_events(srv: &mut Server) {
-    // **Here, because every path that can change a strut ends here.** A panel is created,
-    // destroyed, re-placed or committed at a different size through four different requests, and
-    // all four drain their stack events — so one comparison in the one place they meet is what
-    // keeps a manager's work area current without hunting for the causes (M9 Part B).
     announce_layout(srv);
     for window in srv.stack.take_geometry_changes() {
-        // Gone already — destroyed in the same batch that moved it. Its removal is announced
-        // just below; a rectangle for a window that no longer exists is not.
         let Some(w) = srv.stack.window(window) else { continue };
         let b = w.bounds();
         let ev = ConfigureEvent { window, width: b.size.w, height: b.size.h, x: b.origin.x, y: b.origin.y };
         mgr_emit(srv, MgrEvent::Geometry(ev));
     }
     for window in srv.stack.take_removed() {
-        // **The owner stops claiming it here**, whoever removed it. A client's own
-        // `DestroyWindow` prunes its connection inline, but a manager's `Manage::Close` and a
-        // transitive destroy of someone else's child do not pass through that code — and this
-        // loop is the one place every removal, from every cause, is already enumerated. A
-        // connection that outlives its window is exactly the wedged client `Manage::Close`
-        // exists for, so this is not a hypothetical: see [`Connection::disown`].
+        // The owner stops claiming it, whoever removed it: a manager's `Manage::Close` or a
+        // transitive destroy bypasses the client's inline prune. See [`Connection::disown`].
         for conn in srv.conns.iter_mut() {
             conn.disown(window);
         }
@@ -780,51 +532,30 @@ fn drain_stack_events(srv: &mut Server) {
 
 /// Send `window`'s held first `Configure` and make it compositable. `true` if this was the one.
 ///
-/// **The client is blocked on this.** Every path that removes a window from
-/// [`Server::pending_configure`] must come through here or send a configure itself, or that
-/// client waits forever in `Window::new`. The geometry is read from the stack at this moment
-/// rather than from what was stashed at creation, so a manager that placed the window first
-/// releases it *at the placed origin* — which is the entire point of holding it.
+/// The client is blocked on it: every path removing a window from [`Server::pending_configure`]
+/// must come through here. Geometry is read now, so a manager's placement is honoured.
 fn release_configure(srv: &mut Server, screen: &mut Screen<RawFramebuffer>, window: u32) -> bool {
     let Some(i) = srv.pending_configure.iter().position(|&(w, _)| w == window) else {
         return false;
     };
     srv.pending_configure.remove(i);
     let Some(w) = srv.stack.window(window) else {
-        // Destroyed while pending. Nobody is owed a configure for a window that is gone, and
-        // the client learns it went by the destroy it asked for.
         return false;
     };
     let (width, height) = w.size;
     let origin = w.origin;
-    // **Painted bounds, because this rectangle is damage**: a window becoming drawable has to
-    // repaint its shadow as well as itself.
     let bounds = w.painted_bounds();
     srv.stack.mark_configured(window);
     let sent = configure_window(srv, window, width, height, origin);
-    // **Both of these belong here rather than at the call sites**, because releasing is what
-    // changes the window's visibility and there are four paths that release. Two of them
-    // originally did neither, which is a window that becomes drawable and is not drawn until
-    // some unrelated damage arrives, and a keyboard that stays where it was (PR #218 review,
-    // findings 3 and 7).
-    //
-    // The window's own rectangle, not the whole screen: nothing else changed, and the ordinary
-    // release runs on every window creation while a manager is attached.
+    // Both belong here, as releasing changes visibility on four paths. Only the window's rectangle
+    // is repainted: this runs on every creation while a manager is attached.
     repaint_region(srv, screen, bounds);
     announce_focus(srv);
     sent
 }
 
-/// Show every window whose manager never answered in time.
-///
-/// **The window appears where the compositor put it rather than not at all.** A shell that is
-/// wedged, slow to start, or simply not interested must cost a launch some latency, never a
-/// window — a client blocked forever in `Window::new` is the failure this deadline exists to
-/// rule out.
 fn fire_configure_deadlines(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
-    // Free when nothing is held, which is the overwhelming majority of iterations — and it has
-    // to be free, because this runs every time round the serve loop rather than only on a
-    // timeout. Reading the clock unconditionally would put a syscall in the hot path.
+    // Free when nothing is held, as this runs every pass: no clock read in the hot path.
     if srv.pending_configure.is_empty() {
         return false;
     }
@@ -834,6 +565,7 @@ fn fire_configure_deadlines(srv: &mut Server, screen: &mut Screen<RawFramebuffer
     let fired = !due.is_empty();
     for window in due {
         let mut l = Line::new();
+        // `check-display` waits on this line, and `check-login` fails if it appears.
         l.s(b"compositor: no manager answer for window ").u(window as u64).s(b"; showing it");
         l.end();
         release_configure(srv, screen, window);
@@ -841,11 +573,6 @@ fn fire_configure_deadlines(srv: &mut Server, screen: &mut Screen<RawFramebuffer
     fired
 }
 
-/// Queue one event for the manager, if there is one. Logs a discard the way `enqueue` does.
-///
-/// **A no-op with no manager attached**, rather than an error: M6 has no manager in the boot
-/// path at all, and the compositor manages itself perfectly well without one. The events exist
-/// for whoever holds the channel, and nobody holding it is the ordinary case.
 fn mgr_emit(srv: &mut Server, ev: MgrEvent) {
     // SAFETY: reading our own manager slot.
     if unsafe { MANAGER_CH } == 0 {
@@ -864,32 +591,21 @@ fn mgr_emit(srv: &mut Server, ev: MgrEvent) {
     }
 }
 
-/// A manager event that would not serialise: log it, and let the queue move on.
-///
-/// **Logged, unlike the client-facing equivalent in [`send_outbound`].** These events are
-/// queued precisely because losing one leaves a manager's window list wrong forever with no
-/// resync op, so the one path that can still lose one must not do it quietly.
+/// A manager event that would not serialise: log it and let the queue move on. Logged, unlike the
+/// client-facing equivalent, since losing one leaves a manager's window list wrong forever.
 fn unserialisable(what: &[u8]) -> bool {
     let mut l = Line::new();
     l.s(b"compositor: manager ").s(what).s(b" would not serialise; dropped");
     l.end();
-    // `true` means "the queue may move on". Retrying forever would wedge every event behind
-    // a record that cannot be written no matter how often it is tried.
+    // `true` lets the queue move on; retrying would wedge every event behind it.
     true
 }
 
-/// Send one queued manager event. `false` if the channel would not take it.
 fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     use librsproto::surface::{
         MgrHotkey, MgrWindowCreated, MgrWindowRef, OP_MGR_HOTKEY, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
         OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, OP_MGR_WINDOW_TITLE,
     };
-    // Sized **from the types**, not from the byte counts the spec publishes — the same rule
-    // `send_outbound` states and for the same reason: widening `PointerEvent` left a
-    // hand-written `[0u8; 16]` there, and `write` refuses a short buffer by returning `None`,
-    // so every event of that kind would have been dropped with the spec still saying it was
-    // sent. A queue whose purpose is that nothing is lost must not be one field away from
-    // losing everything (PR #217 review, finding 5).
     match ev {
         MgrEvent::Hotkey(hk) => {
             let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];
@@ -942,8 +658,6 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
             }
         }
         MgrEvent::Title { window, title } => {
-            // The one variable-length manager body, so its buffer is sized from the cap rather
-            // than from a type — `MAX_TITLE` plus the window id.
             let mut body = [0u8; 4 + librsproto::surface::MAX_TITLE];
             match librsproto::surface::title::write(*window, title, &mut body) {
                 Some(n) => send_input(ch, OP_MGR_WINDOW_TITLE, &body[..n]),
@@ -961,19 +675,14 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     }
 }
 
-/// Send one queued message. Returns `false` if the channel would not take it.
 fn send_outbound(ch: u64, rec: &Outbound) -> bool {
-    // Sized **from the types**, not from the byte counts the spec publishes. Widening
-    // `PointerEvent` to carry modifiers left a hand-written `[0u8; 16]` here, and `write`
-    // refuses a short buffer by returning `None` — so every pointer event would have been
-    // silently dropped, with the compositor and the spec both still saying it was sent.
+    // Sized from the types, not the spec's byte counts: `write` refuses a short buffer, which would
+    // drop every event of that kind.
     match rec {
         Outbound::Key { event, .. } => {
             let mut body = [0u8; core::mem::size_of::<KeyEvent>()];
             match event.write(&mut body) {
                 Some(_) => send_input(ch, OP_KEY_EVENT, &body),
-                // Unserialisable is not "retry forever": dropping it clears the queue head
-                // so everything behind it can still move.
                 None => true,
             }
         }
@@ -1015,16 +724,14 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
         }
         Outbound::Dropped { window, acceptor, kind, path, name, x, y } => {
             use librsproto::surface::{DroppedEvent, MAX_EVENT_BODY, OP_DROPPED};
-            // **The same constant the client sizes its receive buffer from**, so the two cannot
-            // drift: a sender that can emit more than a receiver can take is a record that
-            // vanishes on delivery, which is what PR #260's review found here.
+            // The constant the client sizes its receive buffer from, so a sender cannot emit more
+            // than a receiver takes.
             let mut body = [0u8; MAX_EVENT_BODY];
             let ev = DroppedEvent { window: *window, kind: *kind, x: *x, y: *y, acceptor_len: 0, path_len: 0 };
             match ev.write(&mut body, acceptor.as_bytes(), path.as_bytes(), name.as_bytes()) {
                 Some(n) => send_input(ch, OP_DROPPED, &body[..n]),
-                // Unreachable with the caps enforced at both edges — and reported rather than
-                // silently dropped, because a drop that vanishes is a gesture the user made and
-                // the system forgot.
+                // Unreachable with the caps enforced at both edges; reported, as a vanished drop is
+                // a gesture the system forgot.
                 None => {
                     kprint(b"compositor: a drop would not serialise\n");
                     true
@@ -1042,10 +749,8 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
     }
 }
 
-/// Resolve `/dev/input/new` and return the consumer channel, or `None` if there is none.
-///
-/// Not fatal. A machine with no i8042 has no input server, and a compositor that refused to
-/// start without one would take the display down with it — the screen is still worth having.
+/// Resolve `/dev/input/new` and return the consumer channel, or `None`. Not fatal: a machine with
+/// no i8042 has no input server, and the display is still worth having.
 fn connect_input(root_ns: u64) -> Option<u64> {
     use libkern::handle::{RawHandle, Rights};
     use libos::{Handle, Namespace, NsReadOnly, Only, Resource, block_on};
@@ -1061,41 +766,17 @@ fn connect_input(root_ns: u64) -> Option<u64> {
     Some(ch.into_raw().0)
 }
 
-/// Serve every request already queued on the manager's channel and every client's, **between
-/// receiving an input pass and routing it** — so each batch is routed against every request
-/// sent before it arrived.
+/// Serve every request already queued on the manager's channel and every client's, between
+/// receiving an input pass and routing it, so each batch is routed against every request sent
+/// before it arrived.
 ///
-/// **What went wrong without it.** The wait loop serves input first when both are ready, and a
-/// client's channel one request per wake. So a busy compositor woke to a key *and* a menu's
-/// destroy, routed the key to the menu — which still existed and still held the keyboard — and
-/// then destroyed it. The client had let the menu go when it sent the destroy, so the key named
-/// a window it no longer had and `libsurface` dropped it: `check-login` timing out on
-/// `nxfiles: name so far 1 chars` in CI. The destroy had been sent *before the key existed* —
-/// the gate types only once `nxfiles` reports the prompt open, which it does after sending it —
-/// so nothing on the client's side could have ordered them. Holding the compositor busy for a
-/// second after a menu click reproduced it every time, and did the same to a click on the panel
-/// just after the overview closed, so it was never only the keyboard's.
+/// Otherwise a key and a menu's destroy ready together were served input first: the key went to a
+/// menu the client had let go and `libsurface` dropped it (`check-login`, `nxfiles: name so far 1
+/// chars`). Routing nothing until the drain also keeps the cursor's bookkeeping honest: a repaint
+/// mid-pass would draw the cursor where a batch moved it, with nothing to erase it.
 ///
-/// **Why between, and not before the pass** (PR #327 review). Run before the first receive, as it
-/// first was, it left a gap: a batch arriving *after* the drain had passed a client's channel —
-/// while it served later slots, or during `serve_input`'s own receive loop — was routed without
-/// the requests that reached that channel after the visit. Reproduced with a click, a motion
-/// right after it to wake the compositor, and `nxfiles` slow to send the menu's destroy: the key
-/// went to the menu, 800 ms after the destroy was queued. Draining after the last receive closes
-/// it — a request sent before a batch arrived was queued before that batch was received, so
-/// before this runs — and routing nothing until then keeps the cursor's bookkeeping honest: a
-/// request that repaints mid-pass would otherwise draw the cursor where a batch had moved it,
-/// and nothing would erase it there.
-///
-/// **It also routes a batch against requests sent after it arrived**, up to the drain — a key
-/// typed just before a popup is requested reaches the popup. That is the mirror of the old order
-/// and the better default for type-ahead; nothing here can tell the two apart, since a request
-/// carries no time.
-///
-/// **One pass over each channel, bounded by its depth.** `SESSION_QUEUE_DEPTH` is everything a
-/// channel can hold, so it is everything that was queued when the pass was received; a client
-/// that keeps sending cannot hold input off by doing so. The manager goes first because it arranges
-/// the stack the sessions' windows are in.
+/// One pass per channel, bounded by `SESSION_QUEUE_DEPTH`, so a sending client cannot hold input
+/// off. The manager goes first: it arranges the stack.
 fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
     for _ in 0..SESSION_QUEUE_DEPTH {
         // SAFETY: reading our own manager slot.
@@ -1121,8 +802,8 @@ fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) 
             match serve_session(slot, srv, screen) {
                 Served::One => {}
                 Served::Empty => break,
-                // As the wait loop closes one, and for its reason: through `repaint`, so the
-                // pointer survives a client dying under it.
+                // As the wait loop closes one: through `repaint`, so the pointer survives a client
+                // dying.
                 Served::Closed => {
                     close_session(slot, srv);
                     repaint(srv, screen);
@@ -1133,33 +814,24 @@ fn serve_queued_requests(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) 
     }
 }
 
-/// Batches to take from the input channel in one pass.
-///
-/// **A bound, not a target.** The loop drains what is queued and stops; this only keeps a
-/// continuously-moving mouse from starving the client and manager channels in the same wait set.
-/// One batch is one group, so this is about a second of a 100 Hz mouse.
+/// Batches to take from the input channel in one pass: a bound, so a moving mouse cannot starve the
+/// client and manager channels (about a second of a 100 Hz mouse).
 const INPUT_DRAIN_MAX: usize = 128;
 
-/// Drain every queued `Input::Events` batch, serve the requests already queued, route the
-/// batches, and repaint once. `false` if the channel died.
+/// Drain every queued `Input::Events` batch, serve the requests already queued, route the batches,
+/// and repaint once. `false` if the channel died.
 ///
-/// **Once for the whole drain, not once per batch.** Each repaint is a compose plus a write to
-/// the framebuffer, and it happens with no input being read; doing it per message made the
-/// compositor's throughput the ceiling on how fast a mouse could move, and everything past that
-/// ceiling piled up in a queue the input server had to give up on (2026-08-26). Coalescing costs
-/// nothing visually: the cursor is drawn at one place at a time, so painting the intermediate
-/// positions of a movement already finished is work whose result is immediately overwritten.
+/// Once for the drain: a repaint is a compose with no input read, so one per message capped mouse
+/// speed.
 fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     let mut out = alloc::vec::Vec::new();
-    // The regions a restack disturbed this pass, plus the cursor's old and new positions. The
-    // cursor's *old* position is where it was last painted, which is where this pass starts —
-    // intermediate positions were never drawn, so they need no erasing.
+    // Regions a restack disturbed this pass, plus the cursor's old and new positions; intermediate
+    // positions were never drawn.
     let mut damage: alloc::vec::Vec<Rect> = alloc::vec::Vec::new();
     let cursor_was = srv.router.pointer();
     let mut alive = true;
-    // **Receive the whole pass, then serve the requests, then route** — see
-    // [`serve_queued_requests`]. Each batch is copied out because `RECV_MSG` is the buffer every
-    // receive in this process uses, the drain's included.
+    // Receive the whole pass, then serve the requests, then route (see [`serve_queued_requests`]).
+    // Each batch is copied out because `RECV_MSG` is shared by every receive.
     let mut batches: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
     while batches.len() < INPUT_DRAIN_MAX {
         // SAFETY: valid recv out-params (an events batch carries no transferred handles).
@@ -1173,9 +845,8 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
             )
         };
         if rr != 0 {
-            // The ordinary end of the drain: nothing more is queued. `PeerClosed` means the
-            // input server is gone and the handle must leave the wait set, or the loop spins on
-            // it forever; anything else is a spurious signal with nothing behind it.
+            // The ordinary end of the drain. `PeerClosed` means the input server is gone and the
+            // handle must leave the wait set or the loop spins; anything else is spurious.
             alive = rr != KError::PeerClosed.as_i32() as i64;
             break;
         }
@@ -1194,17 +865,12 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     send_lights(srv);
 
     deliver(srv, &out);
-    // **What routing did to the stack, told to the manager.** Input is the third path that
-    // mutates windows — a click raises one, and since M9 Part A a drag moves one — and it was
-    // the only one that never drained: the manager and session paths both do it after their
-    // dispatch, so a geometry change made by the pointer sat in the log until some *other*
-    // request happened to flush it. The drag at the end of a gesture is exactly that case.
+    // What routing did to the stack, told to the manager: input is the third path that mutates
+    // windows and was the only one that never drained, so a pointer-made change sat in the log.
     drain_stack_events(srv);
-    // A click that raised a window moved focus with it.
     announce_focus(srv);
-    // Erase the cursor where it was last drawn and draw it where it is now, along with anything
-    // a restack disturbed. One `present_into` for the lot: overlapping rectangles compose the
-    // same pixels twice, which is cheap, while a second call would be a second traversal.
+    // Erase the cursor where last drawn and draw it where it is, with any restack damage, in one
+    // `present_into`.
     let cursor_now = srv.router.pointer();
     if cursor_now != cursor_was {
         damage.push(compositor::cursor_rect(cursor_was));
@@ -1216,8 +882,7 @@ fn serve_input(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     alive
 }
 
-/// Route the batch sitting in `RECV_MSG`, appending client records to `out` and repaint regions
-/// to `damage`.
+/// Route one input batch, appending client records to `out` and repaint regions to `damage`.
 fn route_one_batch(
     srv: &mut Server,
     out: &mut alloc::vec::Vec<Outbound>,
@@ -1234,9 +899,6 @@ fn route_one_batch(
         if m.op != librsproto::OP_INPUT_EVENTS {
             return;
         }
-        // A trailing partial record is dropped rather than guessed at. `as_chunks` says so
-        // at the type level; `chunks` would hand `read` a short slice and get `None`, which
-        // reads as "malformed" for a batch that is merely truncated.
         for raw in m.body.as_chunks::<INPUT_EVENT_LEN>().0 {
             let Some(ev) = InputEvent::read(raw) else {
                 continue;
@@ -1248,41 +910,29 @@ fn route_one_batch(
                 if let Some(r) = routed.restacked {
                     damage.push(r);
                 }
-                // A dragged window disturbs the union of where it was and where it now is,
-                // which `drag_to` computed from state read before the move.
                 if let Some(r) = routed.moved {
                     damage.push(r);
                 }
-                // **The outline's damage is its edges, not its rectangle.** The union of where
-                // an outline was and where it is is very nearly the window; repainting that per
-                // pointer motion is the full recompose that starves input under emulation.
-                // Four thin strips each side is a few thousand pixels whatever the size — and
-                // the strips of where it *was* are what erase it, since an outline is drawn
-                // over the composed stack and is not in it.
+                // The outline's damage is its edges: repainting the union per motion starves input.
                 if let Some(o) = routed.outline {
                     srv.outline = o.now;
                     for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
                         damage.push(r);
                     }
                 }
-                // **A press landed outside a popup, so its owner is told** (M11 Part E batch 5).
-                // Reported rather than acted on, like the resize below: the window is the
-                // client's, and whether a dismissal ends what it was offering is the client's to
-                // decide. What only this side can know is that the press happened elsewhere.
+                // A press landed outside a popup, so its owner is told. Reported, not acted on:
+                // whether a dismissal ends what it offered is the client's to decide.
                 if let Some(window) = routed.dismissed
                     && let Some(slot) = srv.session_of(window)
                 {
-                    // `log_route` *and* `enqueue`, which is the pair every other site here uses:
-                    // enqueuing alone delivers the event and logs nothing, so the mechanism works
-                    // and no gate can see it.
+                    // `log_route` and `enqueue`, as at every site here, or no gate can see it
+                    // (`check-login`).
                     let rec = Outbound::Dismissed { window };
                     log_route(&rec);
                     enqueue(srv, slot, rec);
                 }
-                // **One event for the gesture, at the release.** The compositor does not resize
-                // the client — that is the manager's, so there is one path to a window's
-                // geometry rather than two that can disagree — so this hands the shell the
-                // rectangle the user let go at and the shell answers with a `Configure`.
+                // One event for the gesture, at the release; the manager answers with a
+                // `Configure`, so a window's geometry has one path.
                 if let Some((window, rect)) = routed.resized {
                     Line::new()
                         .s(b"compositor: interactive resize of window ")
@@ -1307,37 +957,17 @@ fn route_one_batch(
                         }),
                     );
                 }
-                // **Drained per event, not per batch.** A chord and the window events it
-                // causes have to reach the manager in the order they happened, and the
-                // manager acts on this batch before the next one is routed.
+                // Drained per event: a chord and the window events it causes must reach the manager
+                // in order.
                 for hk in srv.router.take_hotkeys() {
                     mgr_emit(srv, MgrEvent::Hotkey(hk));
                 }
-                // **Where a press landed, always — not through `log_route`.** That path is
-                // capped at `MAX_LOGGED_ROUTES` and only sees records that were *delivered*,
-                // so the two things a failing gate most needs are exactly the two it cannot
-                // get: a click that hit no window logs nothing at all, and by the time a
-                // gate has moved the cursor the cap is long spent. A press is rare — one
-                // line per click — so this is not the log volume the cap exists to bound.
-                // **And a dropped batch, which is the other half of the same question.**
-                // `input-server` increments a per-consumer loss counter and announces it as
-                // `SYN_DROPPED`; `libinput` turns that into `Logical::Dropped`. Nothing on
-                // that path prints anything, so a lost batch is invisible — and a lost batch
-                // is the *only* mechanism that moves a press off the point the injector
-                // computed. Without this, a transcript can say the press landed somewhere
-                // unexpected but not whether input was lost getting there, which is exactly
-                // the fork a recurrence needs. Per-consumer accounting also means
-                // `input-testclient` cannot cover it: a loss on the compositor's slot never
-                // reaches the client's event dump.
-                // **And `Super` arriving at all, which is the third question a stuck session
-                // asks.** Every chord this system binds is `Super`-something, and a host desktop
-                // binds `Super` too — so "the Super key does nothing" has two entirely different
-                // causes (the host kept the keystroke; the guest got it and matched no chord)
-                // and no way to tell them apart from outside. One line per transition says which.
-                //
-                // **The modifier only, never the keycode beside it.** A log of what was typed is
-                // a log of the password typed at the greeter; a log of whether the meta key went
-                // down is not, and it is the whole of what this question needs.
+                // Diagnostics always, not through `log_route`, whose cap is spent by the time a
+                // gate moves the cursor and which never sees a press that hit no window. A dropped
+                // batch too: nothing else prints a `SYN_DROPPED`. `Super` arriving separates the
+                // host keeping the keystroke from the guest matching no chord; the modifier only,
+                // never the keycode, which would log passwords.
+                // `check-input`, `check-login` and `check-install` match the press and Super lines.
                 let meta_change = match *l {
                     libinput::Logical::Key { keycode, pressed, .. }
                         if keycode == libkern::abi::KEY_LEFTMETA || keycode == libkern::abi::KEY_RIGHTMETA =>
@@ -1346,17 +976,12 @@ fn route_one_batch(
                     }
                     _ => None,
                 };
-                // **Releases as well as presses, since 2026-09-04.** A *click* is both halves,
-                // and only the press was ever logged — so a gate whose click produced no effect
-                // could not tell whether the release had arrived, and a lost one looked exactly
-                // like a client that ignored the click. `check-login` failed that way in CI with
-                // nothing in the transcript to say which it was. A button is not a keystroke, so
-                // this logs no more about a person than the press beside it already did.
+                // Releases as well as presses, so a lost release is told from a client that ignored
+                // the click (`check-login`). A button is not a keystroke.
                 let diag = meta_change.is_some()
                     || matches!(*l, libinput::Logical::Button { .. } | libinput::Logical::Dropped { .. });
-                // Already inside the enclosing `unsafe` block, so no inner one: the
-                // justification is that this is a single-threaded server and the counter is
-                // touched only from the serve loop, as `ROUTES_LOGGED` is.
+                // Inside the enclosing `unsafe` block: single-threaded, touched only from the serve
+                // loop.
                 let logged = INPUT_DIAGS_LOGGED;
                 if diag && logged < MAX_LOGGED_INPUT_DIAGS {
                     INPUT_DIAGS_LOGGED = logged + 1;
@@ -1368,14 +993,9 @@ fn route_one_batch(
                         _ if meta_change == Some(false) => {
                             pl.s(b"compositor: Super up");
                         }
-                        // **A press whose release never appears here was QEMU holding it**, not
-                        // this path losing it (2026-09-23). Both halves are logged since PR #280
-                        // so that "delivered and ignored" and "never arrived" are different
-                        // sentences; `check-login --kvm` said the second three times. QEMU's PS/2
-                        // queue is sixteen bytes and holds a packet that will not fit until the
-                        // next injected event — and a gate's release is its last. The gates flush
-                        // (`expect_after_pointer` in `tools/xtask`), and this line is what
-                        // told the two apart.
+                        // A press whose release never appears was QEMU holding it (its PS/2 queue
+                        // holds a packet until the next injected event); the gates flush with
+                        // `expect_after_pointer`.
                         libinput::Logical::Dropped { .. } => {
                             pl.s(b"compositor: input batch DROPPED (SYN_DROPPED)");
                         }
@@ -1402,16 +1022,8 @@ fn route_one_batch(
                     }
                     pl.end();
                 }
-                // Repeat follows the *physical* key, so it is armed from the interpreted
-                // transition rather than from what the router decided to do with it: a key
-                // that reached no window still stops repeating when it comes up.
-                //
-                // **Except a key the router consumed**, which is the one case where "reached no
-                // window" is a decision rather than an accident. A registered chord that armed a
-                // repeat would deliver its key to the focused window 400 ms later and 25 times a
-                // second after that — bypassing the router entirely, since `fire_repeat` enqueues
-                // straight to the focused session. Holding `Super+1` while already on desktop 1
-                // filled the terminal with `1`s (PR #241 review, blocking 1).
+                // Repeat follows the physical key, except a consumed chord: `fire_repeat` bypasses
+                // the router and would type it into the focused window.
                 if let libinput::Logical::Key { keycode, pressed, modifiers, locks, .. } = *l
                     && !routed.consumed
                 {
@@ -1425,8 +1037,7 @@ fn route_one_batch(
                         now,
                     );
                 }
-                // A `SYN_DROPPED` means the held-key set is a guess, so a repeat started
-                // from it is too — `libinput` has already reset what it accumulated.
+                // A `SYN_DROPPED` makes the held-key set a guess, so a repeat from it is too.
                 if matches!(l, libinput::Logical::Dropped { .. }) {
                     srv.repeat = None;
                 }
@@ -1435,25 +1046,15 @@ fn route_one_batch(
     }
 }
 
-/// What a forwarded resolve under `/dev/draw` is asking for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Resolved {
-    /// `new` — mint a session.
     New,
-    /// `manage` — mint *the* manager channel.
     Manage,
-    /// `<N>/info` — that window's metadata.
     Info(u32),
-    /// `screen` — the screen's size.
     Screen,
-    /// Anything else.
     Unknown,
 }
 
-/// Classify a resolve suffix.
-///
-/// Suffixes arrive without a leading separator (`/dev/draw/1/info` -> `1/info`), the
-/// convention `Namespace::resolve` uses and one that cost a boot to rediscover in M1.
 fn classify(suffix: &[u8]) -> Resolved {
     if suffix == b"new" {
         return Resolved::New;
@@ -1473,8 +1074,6 @@ fn classify(suffix: &[u8]) -> Resolved {
     Resolved::Unknown
 }
 
-/// Parse a decimal window id. Rejects empty input, non-digits and overflow — a resolve
-/// suffix is client-supplied text.
 fn parse_u32(b: &[u8]) -> Option<u32> {
     if b.is_empty() || b.len() > 10 {
         return None;
@@ -1489,20 +1088,10 @@ fn parse_u32(b: &[u8]) -> Option<u32> {
     Some(n)
 }
 
-/// Answer `<N>/info` with a read-only object holding the window's `WindowInfo`.
-///
-/// The same shape `/dev/framebuffer/info` uses: a resolve answers with an object the caller
-/// maps, not with a message. A fresh object per resolve, holding a snapshot — handing out a
-/// live shared mapping would let readers observe mid-update state.
 fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> bool {
     let Some(info) = srv.stack.info(id) else {
         return reply_resolve_error(serve_end, request_id, KError::NotFound);
     };
-    // **Sized from the constant, not from the number that was right when this was written.**
-    // `WindowInfo` grew from 32 to 40 bytes in M8 Part A, and a literal here would have made
-    // `write` refuse — turning every `info` resolve into `KernelError` — or, if `write` had
-    // filled what it could instead, published a window whose desktop and flags were whatever
-    // the stack memory held.
     let mut bytes = [0u8; librsproto::surface::WINDOW_INFO_LEN];
     if info.write(&mut bytes).is_none() {
         return reply_resolve_error(serve_end, request_id, KError::KernelError);
@@ -1510,8 +1099,6 @@ fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> 
     reply_with_object(serve_end, request_id, &bytes)
 }
 
-/// Answer a `screen` resolve with a `MemoryObject` holding the screen's size
-/// (`rsproto-surface-ops.md`, "Reading the screen's size").
 fn reply_screen_info(serve_end: u64, request_id: u64, srv: &Server) -> bool {
     let info = librsproto::surface::ScreenInfo { width: srv.screen.size.w, height: srv.screen.size.h };
     let mut bytes = [0u8; librsproto::surface::SCREEN_INFO_LEN];
@@ -1521,8 +1108,6 @@ fn reply_screen_info(serve_end: u64, request_id: u64, srv: &Server) -> bool {
     reply_with_object(serve_end, request_id, &bytes)
 }
 
-/// Reply to a resolve with a fresh `MemoryObject` holding `bytes` — the shape `<N>/info` and
-/// `screen` both answer in.
 fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) -> bool {
     // SAFETY: a plain anonymous object of `bytes.len()`.
     let obj = unsafe { syscall4(SYS_MEMORY_CREATE, bytes.len() as u64, 0, 0, 0) };
@@ -1540,11 +1125,8 @@ fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) -> bool {
     }
     // SAFETY: `addr` maps at least `bytes.len()` writable bytes.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
-    // **Unmap before replying.** The mapping was only ever a way to fill the object, and it
-    // holds its own reference to it — so leaving it behind would pin the frames for the
-    // compositor's life even after the handle is transferred away, and nothing records
-    // `addr` to reclaim them later. Any holder of `/dev/draw` can resolve `info` in a loop,
-    // which made this an unbounded leak drivable by any client (PR #175 review, finding 1).
+    // Unmap before replying: the mapping holds a reference that would pin the frames, and any
+    // client can resolve `info` in a loop.
     // SAFETY: unmapping a range this process mapped moments ago and never reads again.
     unsafe { syscall2(libkern::SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
 
@@ -1575,15 +1157,13 @@ fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) -> bool {
         ) == 0
     };
     if !sent {
-        // A failed send leaves the transfers untaken, so the object is still ours — the
-        // same rule `open_session` follows for the endpoint it failed to hand over.
+        // A failed send leaves the transfers untaken, so the object is still ours.
         // SAFETY: closing a handle this process still owns.
         unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
     }
     sent
 }
 
-/// Open a session: mint a channel, keep the server end, hand the client end back.
 fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
     // SAFETY: single-threaded server scanning its own slot table.
     let Some(slot) = (unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == 0) }) else {
@@ -1609,20 +1189,9 @@ fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
     true
 }
 
-/// Tell `window`'s client the compositor would like it at this geometry.
-///
-/// **Sent to the window's own session**, found through the same ownership table `dispatch`
-/// authorises against — so there is no second notion of who owns a window that could disagree
-/// with the first. A window whose session has gone is silently skipped: the manager is allowed
-/// to be a moment behind, and a manager that had to be told about every teardown before it could
-/// speak would need a synchronous protocol.
 /// Queue a `Configure` for `window`'s client. `false` if there is no such session.
 ///
-/// **Queued, not sent.** It used to go out directly with `SENDMODE_NOBLOCK` and the result
-/// discarded, so a client whose receive ring was briefly full — mid-motion-burst, say — simply
-/// never resized, with nothing logged and the manager told it had succeeded. Every other
-/// server-initiated record goes through the outbox precisely so it holds its place and is
-/// retried (PR #216 review, finding 4).
+/// Queued, not sent: a briefly full ring would otherwise drop it, unlogged.
 fn configure_window(srv: &mut Server, window: u32, width: u32, height: u32, origin: Point) -> bool {
     let Some(slot) = srv.session_of(window) else { return false };
     // SAFETY: reading our own slot table.
@@ -1633,11 +1202,6 @@ fn configure_window(srv: &mut Server, window: u32, width: u32, height: u32, orig
     true
 }
 
-/// Scale a window into the manager's buffer and answer. `false` if the manager is gone.
-///
-/// **The compositor gains an operation and no allocation policy.** The manager allocated the
-/// object and sent it; this maps it, writes, unmaps and forgets it — the mirror of a client
-/// allocating a buffer the compositor reads.
 fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64) -> bool {
     let Some(req) = MgrCapture::read(body) else {
         return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::InvalidArgument);
@@ -1648,8 +1212,8 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
     let Some(w) = srv.stack.window(req.window) else {
         return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::NotFound);
     };
-    // What is on screen for this window, which is its *committed* buffer — the same thing
-    // compositing reads, so a thumbnail cannot show a frame the screen never did.
+    // The committed buffer, as compositing reads, so a thumbnail never shows a frame the screen did
+    // not.
     let (Some(buffer_id), id) = (w.committed, w.id) else {
         return reply_error_on_session(ch, OP_MGR_CAPTURE, request_id, KError::WouldBlock);
     };
@@ -1696,23 +1260,15 @@ fn do_capture(srv: &mut Server, ch: u64, request_id: u64, body: &[u8], obj: u64)
     reply_on_session(ch, OP_MGR_CAPTURE, request_id, &[])
 }
 
-/// What one call to [`serve_manager`] or [`serve_session`] found on its channel.
-///
-/// **Three answers, because the queue drain needs the third.** A `bool` said "keep this peer or
-/// close it", which is all the wait loop asks; [`serve_queued_requests`] also has to know when a
-/// channel is *empty*, or it cannot stop draining one without a wasted receive per slot per
-/// input batch.
+/// What one call to [`serve_manager`] or [`serve_session`] found; `Empty` lets
+/// [`serve_queued_requests`] stop draining a channel.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Served {
-    /// A request was handled, and the peer is still there.
     One,
-    /// Nothing was queued — or a spurious signal with nothing behind it.
     Empty,
-    /// The peer has gone, or a reply to it failed; the caller closes it.
     Closed,
 }
 
-/// Handle one request on the manager channel, if one is queued.
 fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
     // SAFETY: reading our own manager slot and valid recv out-params.
     let ch = unsafe { MANAGER_CH };
@@ -1728,27 +1284,16 @@ fn serve_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Serve
         )
     };
     if rr != 0 {
-        // `PeerClosed` means the manager exited. Anything else is an empty ring.
         return if rr == KError::PeerClosed.as_i32() as i64 { Served::Closed } else { Served::Empty };
     }
     if handle_manager_request(ch, srv, screen) { Served::One } else { Served::Closed }
 }
 
-/// Handle the request [`serve_manager`] has just received into `RECV_MSG`. Returns `false` if
-/// the manager is gone.
 fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
     // SAFETY: bounded read-only slice over the just-received message.
     let (op, request_id, body, carried) = unsafe {
-        // **Close every transfer this message carried, except the one `Capture` needs.**
-        // `sys_channel_recv` takes no capacity argument and the kernel installs whatever the
-        // sender attached into this process's table whether or not anything here looks at it.
-        // Left alone they pin a slot in the *global* handle table for the compositor's life,
-        // and a `MemoryObject` would pin the sender's frames with it. `serve_session` closes
-        // its surplus for exactly this reason (PR #175 review, finding 2); the manager path
-        // was the sibling that got missed (PR #216 review, finding 3). In M6 any `/dev/draw`
-        // holder can be the manager — until M7 Part E made the binding the gate — so "the
-        // manager would not
-        // do that" is not a bound.
+        // Close every transfer except the one `Capture` needs: unclosed, each pins a slot in the
+        // global handle table.
         let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
@@ -1756,10 +1301,6 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
         );
         let decoded = decode(req);
-        // **The first handle survives only for the op that takes one**, and every other is
-        // closed here as before. Keeping them all would pin a slot in the *global* handle
-        // table for the compositor's life, and a `MemoryObject` would pin the sender's frames
-        // with it (PR #175 review finding 2, PR #216 review finding 3).
         let takes_handle = matches!(&decoded, Ok(m) if m.op == OP_MGR_CAPTURE);
         let mut carried = 0u64;
         #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
@@ -1781,8 +1322,8 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
         }
     };
     if op == OP_MGR_CAPTURE {
-        // Handled here rather than in `manager::dispatch`, which is given a `WindowStack` and
-        // nothing else: this needs the handle, the pixel source, and syscalls to map with.
+        // Handled here, not in `manager::dispatch`, which sees only the stack: this needs the
+        // handle, the pixel source and syscalls to map with.
         let ok = do_capture(srv, ch, request_id, &body, carried);
         if carried != 0 {
             // SAFETY: the object was installed in this process's table by the recv above; the
@@ -1792,15 +1333,12 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
         return ok;
     }
     if op == librsproto::surface::OP_MGR_REQUEST_CLOSE {
-        // **Handled here rather than in `dispatch`**, which sees only the stack: asking a client
-        // to close means putting a record in *that client's* outbox, and the outboxes are the
-        // server's. Nothing about the window changes — this is the polite half.
+        // Handled here: asking a client to close puts a record in that client's outbox, which the
+        // server owns. The window itself is untouched. `check-login` waits on this line.
         let Some(req) = librsproto::surface::MgrWindowRef::read(&body) else {
             return reply_error_on_session(ch, op, request_id, KError::InvalidArgument);
         };
         let Some(slot) = srv.session_of(req.window) else {
-            // No window, or no session owns it — one answer for both, like every other
-            // ownership question here.
             return reply_error_on_session(ch, op, request_id, KError::NotFound);
         };
         enqueue(srv, slot, Outbound::CloseRequested { window: req.window });
@@ -1808,8 +1346,6 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
         return reply_on_session(ch, op, request_id, &[]);
     }
     if op == librsproto::surface::OP_MGR_QUERY_LAYOUT {
-        // Handled here for the reason `Capture` is: `manager::dispatch` sees a `WindowStack` and
-        // nothing else, and this answer needs the *screen*, which is the framebuffer's.
         let layout = current_layout(srv);
         let mut body = [0u8; core::mem::size_of::<librsproto::surface::MgrLayout>()];
         return match layout.write(&mut body) {
@@ -1818,58 +1354,39 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
         };
     }
     let mgr_outcome = manager::dispatch(&mut srv.stack, op, &body);
-    // **Said on the console, changed or not**, because it is the one proof a boot can give that
-    // the shell's theme reached this process: the compositor never reads the file, and every gate
-    // that boots a session boots the light scheme — the scheme this compositor already started
-    // in — so a line only on a *change* would say nothing on exactly the boots that check it.
+    // Said on the console, changed or not: the one proof a boot can give that the shell's theme
+    // reached this process (`check-login`).
     if op == librsproto::surface::OP_MGR_SET_SCHEME && matches!(mgr_outcome, MgrOutcome::Applied { .. }) {
         Line::new().s(b"compositor: scheme ").s(srv.stack.scheme().as_str().as_bytes()).end();
     }
-    // **A manager acting on a window invalidates what that window last *asked* to be.** The
-    // dedup on `RequestState` compares against a value only client requests were writing, and
-    // the manager changes a window's state by four other routes — a taskbar click, a chord, the
-    // overview. After one of those the shadow was stale, and the *next* identical request was
-    // dropped as a repeat: a minimise button that worked once and then never again, with the
-    // client told it had succeeded (PR #249 review, blocking 1).
-    //
-    // Cleared here rather than in each op, so the next manager op added cannot forget to.
+    // A manager acting on a window invalidates what it last asked to be: the `RequestState` dedup
+    // sees client requests only and would drop the next identical one as a repeat.
     if let MgrOutcome::Applied { window: Some(w), .. } | MgrOutcome::Configure { window: w, .. } = mgr_outcome {
         srv.stack.clear_state_request(w);
     }
     drain_stack_events(srv);
     match mgr_outcome {
         MgrOutcome::Applied { window, dirty } => {
-            // **The manager has acted on this window, so its held configure is answered.**
-            // A manager that only wants to position a window sends `Place` and nothing else;
-            // making it wait out the deadline would mean every launch is slow by design. The
-            // configure goes out carrying the origin the manager just set.
-            // `None` is a request that named no window — `SetCurrentDesktop` or `SetScheme` —
-            // so there is no held configure to release.
+            // The manager has acted on this window, so its held configure is answered; `None` names
+            // no window.
             if let Some(window) = window {
                 release_configure(srv, screen, window);
             }
             match dirty {
-                // Nothing on screen changed — placing a window that has not committed, which
-                // is the manager's ordinary case during the handshake.
                 Some(r) if r.size.w == 0 || r.size.h == 0 => {}
                 Some(r) => repaint_region(srv, screen, r),
                 None => repaint(srv, screen),
             }
-            // **Focus may have moved.** A restack changes who is topmost-focusable, and the
-            // clients on either side of that have to be told — the same announcement
-            // click-to-focus makes, for the same reason.
             announce_focus(srv);
             reply_on_session(ch, op, request_id, &[]);
         }
         MgrOutcome::RegisterZone(z) => {
-            // **Applied here because the table is the router's**, like a chord — and *replacing*
-            // rather than refusing an id already registered, because a zone table is a layout a
-            // shell recomputes whenever the work area changes rather than a set of distinct
-            // things (M9 Part F).
+            // Applied here because the table is the router's, and replacing rather than refusing an
+            // id already registered, as a zone table is a layout recomputed on a work-area change.
             match srv.router.register_zone(z) {
                 Ok(disturbed) => {
-                    // A registration that replaced the zone a drag is previewing moves the
-                    // outline with it; anything else disturbs no pixels.
+                    // A registration that replaced the zone a drag is previewing moves the outline
+                    // with it.
                     if let Some(o) = disturbed {
                         srv.outline = o.now;
                         for r in o.was.into_iter().chain(o.now).flat_map(compositor::outline_edges) {
@@ -1899,11 +1416,8 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
             }
         }
         MgrOutcome::RegisterHotkey(hk) => {
-            // **Applied here because the table is the router's**, and answered with the same
-            // empty body every other manager request gets: the manager chose the id, so there
-            // is nothing to tell it back. A refusal is a refusal — never a silent replacement,
-            // which would leave a manager holding two chords under one id and wondering why
-            // one of them never fires.
+            // Applied here because the table is the router's; a refusal is never a silent
+            // replacement.
             match srv.router.register_hotkey(hk) {
                 Ok(()) => {
                     Line::new()
@@ -1918,46 +1432,22 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
                     reply_on_session(ch, op, request_id, &[]);
                 }
                 Err(_) => {
-                    // **`InvalidArgument` for all three, which is what the spec publishes and
-                    // what `surface_errno` maps `Rejected` to for every other request here.**
-                    // The first version answered a duplicate id and a full table with
-                    // `WouldBlock` — and this server uses `WouldBlock` for a genuinely
-                    // transient condition, a `manage` resolve arriving while another manager
-                    // holds the channel. There is no unregister, so a full table never empties:
-                    // a manager that read "busy, retry" would retry forever (PR #241 review,
-                    // finding 4).
+                    // `InvalidArgument` for all three, as the spec publishes: a full table never
+                    // empties, so `WouldBlock` would make a manager retry forever.
                     kprint(b"compositor: a hotkey registration was refused\n");
                     reply_error_on_session(ch, op, request_id, KError::InvalidArgument);
                 }
             }
         }
         MgrOutcome::Configure { window, width, height, origin } => {
-            // Forwarded to the window's *client*, which is a third party: the manager asked,
-            // the client is told. Nothing changes on screen until that client commits, so the
-            // reply says the compositor accepted and queued the request — never that the
-            // client adopted it, which is not knowable here.
-            // **A manager `Configure` on a held window *is* its initial configure**, which is
-            // why the op carries an origin as well as a size: one message answers both halves,
-            // so a window neither jumps nor resizes after it is first painted. A manager that
-            // wants to set both should use this rather than `Place` followed by `Configure` —
-            // the first of those pair releases the hold, and the second then arrives as an
-            // ordinary later configure, after first paint.
-            // The manager's answer *is* this window's initial configure, so the hold is
-            // discharged here rather than by `release_configure` — the configure below carries
-            // the manager's geometry, which is more than the stack knows.
+            // A manager `Configure` on a held window is its initial configure, which is why it
+            // carries an origin: one message answers both halves. The reply says the request was
+            // queued, never that the client adopted it.
             let was_held = srv.pending_configure.iter().any(|&(w, _)| w == window);
             srv.pending_configure.retain(|&(w, _)| w != window);
             let became_visible = srv.stack.mark_configured(window);
-            // **The origin is applied, not merely forwarded.** The comment above has always said
-            // this op answers "where does this go" as well as "how big", and told managers to use
-            // it rather than `Place` followed by `Configure` — while nothing here wrote the
-            // origin, so a manager that followed that advice set only the size. Part B is the
-            // first production caller, so it was never exercised: maximise would have resized a
-            // window it could not move, leaving it hanging off the screen from wherever it was
-            // dragged (PR #249 review, blocking 2).
-            //
-            // Through `place`, so the same rules apply as to any other placement — including the
-            // refusal for a window the user is dragging, which a manager must not fight.
+            // The origin is applied through `place`, so its rules hold, including the refusal for a
+            // dragged window.
             let moved = match srv.stack.place(window, origin) {
                 Ok(d) => Some(d.rect()),
                 Err(compositor::StackError::Dragging) => {
@@ -1965,18 +1455,14 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
                 }
                 Err(_) => None,
             };
-            // **Drained again, because this arm mutates after the drain above.** Every other
-            // manager op does its work inside `dispatch`, which is why one drain immediately
-            // after it has always been enough; this one places from out here, so the geometry
-            // change it produces would otherwise wait for the next unrelated request — the same
-            // gap the input path had in Part A.
+            // Drained again: this arm mutates after the drain above, so its geometry change would
+            // wait for the next unrelated request.
             drain_stack_events(srv);
             if configure_window(srv, window, width, height, origin) {
                 if let Some(r) = moved.filter(|r| !r.is_empty()) {
                     repaint_region(srv, screen, r);
                 }
                 if became_visible || was_held {
-                    // Newly drawable, and newly a focus candidate — see `release_configure`.
                     let r = srv.stack.window(window).map(|w| w.painted_bounds());
                     if let Some(r) = r {
                         repaint_region(srv, screen, r);
@@ -1985,8 +1471,8 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
                 }
                 reply_on_session(ch, op, request_id, &[]);
             } else {
-                // No session owns that window, so nobody can be told: a refusal, not a
-                // success with nothing behind it.
+                // No session owns that window, so nobody can be told: a refusal, not a hollow
+                // success.
                 reply_error_on_session(ch, op, request_id, surface_errno(SurfaceError::NotFound));
             }
         }
@@ -1998,18 +1484,10 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
 }
 
 /// Mint the manager channel, or refuse because one is already attached.
-///
-/// **A capability by binding, and in Milestone 6 that binding gates nothing** — `/dev/draw` is
-/// bound unscoped into init's root namespace and every graphical client inherits it, so any of
-/// them could ask. What actually separates them here is *order*: the intended manager resolves
-/// first. That is written down as an ordering rather than dressed up as a capability —
-/// Closed by M7 Part E's per-application namespaces: an application's binds `/dev/draw/new`
-/// alone, so `manage` resolves to nothing there.
 fn open_manager(serve_end: u64, request_id: u64) -> bool {
     // SAFETY: single-threaded server reading its own state.
     if unsafe { MANAGER_CH } != 0 {
-        // **Refused, not replaced.** Handing the channel to a second asker would silently
-        // depose the first, and two managers placing windows is a race with no arbiter.
+        // Refused, not replaced: a second manager would silently depose the first.
         kprint(b"compositor: a second manager was refused\n");
         return reply_resolve_error(serve_end, request_id, KError::WouldBlock);
     }
@@ -2030,27 +1508,15 @@ fn open_manager(serve_end: u64, request_id: u64) -> bool {
     true
 }
 
-/// Drop the manager channel — it went away, so the compositor manages itself again.
-///
-/// **Clears the event queue with it.** Anything still queued describes windows as they were
-/// while the departed manager was watching; handing that backlog to whoever attaches next
-/// would tell a fresh manager about creations it never saw and, after enough churn, about
-/// windows that no longer exist — with no resync op to repair the picture.
+/// Drop the manager channel, so the compositor manages itself again, and clear its event queue: a
+/// backlog would describe windows the next manager never saw.
 fn close_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
     srv.mgr_outbox.clear();
-    // **The chord table goes with it**, for the reason the queued events do: it is routing
-    // policy the departed manager asked for. Left behind, every registered chord keeps being
-    // consumed and delivered to nobody — `mgr_emit` early-returns with no channel — so the key
-    // silently reaches nothing for the life of the compositor, and a replacement manager
-    // inherits the dead one's ids and is refused its own (PR #241 review, finding 3).
+    // The chord table goes with it: left behind, its chords are consumed and delivered to nobody
+    // (`mgr_emit` returns with no channel), and a replacement inherits the dead one's ids.
     srv.router.clear_hotkeys();
-    // **And the snap zones**: they are a layout the departed manager computed from a work area
-    // it was watching, and a replacement manager inherits nothing it did not register.
-    //
-    // **Unlike the chord table, this one can be drawing something.** A shell exiting while the
-    // user is mid-drag over a zone leaves a previewed rectangle on the screen — and every path
-    // that would take it down is gated on the zone the table no longer has, so it would be
-    // re-drawn by every later compose for the life of the process (PR #254 review, blocking 1).
+    // And the snap zones, which can be drawing something: a shell exiting mid-drag over a zone
+    // leaves a previewed rectangle that nothing would take down.
     if let Some(o) = srv.router.clear_zones() {
         srv.outline = o.now;
         for r in o.was.into_iter().flat_map(compositor::outline_edges) {
@@ -2059,17 +1525,14 @@ fn close_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
             }
         }
     }
-    // **And the scheme it named** (desktop refresh, Part A; PR #312 review, optional 5). It came
-    // from the departed session's theme, and what is drawn next — the greeter, after a logout —
-    // is drawn from the built-in one. Left behind, a dark session's shadows would fall under a
-    // light greeter at two and a half times the strength until the next shell said otherwise.
+    // And the scheme it named: what is drawn next, the greeter after a logout, uses the built-in
+    // one, and a dark session's shadows would fall too strongly under it.
     if srv.stack.set_scheme(libdraw::theme::Scheme::Light) {
         repaint(srv, screen);
         kprint(b"compositor: scheme light (the manager that named another went away)\n");
     }
-    // **Every window it was going to place is shown now, not after the deadline.** The clients
-    // holding those windows are blocked, and waiting out a timer for a manager that has
-    // demonstrably gone is latency bought for nothing.
+    // Every window it was going to place is shown now: those clients are blocked, and waiting out a
+    // timer for a manager that has gone is latency for nothing.
     let waiting: alloc::vec::Vec<u32> = srv.pending_configure.iter().map(|&(w, _)| w).collect();
     for window in waiting {
         release_configure(srv, screen, window);
@@ -2084,7 +1547,6 @@ fn close_manager(srv: &mut Server, screen: &mut Screen<RawFramebuffer>) {
     kprint(b"compositor: the manager went away\n");
 }
 
-/// Close session `slot` and destroy everything the client had on screen.
 fn close_session(slot: usize, srv: &mut Server) {
     // SAFETY: closing our own endpoint and clearing the slot.
     unsafe {
@@ -2093,24 +1555,15 @@ fn close_session(slot: usize, srv: &mut Server) {
             SESSION_CH[slot] = 0;
         }
     }
-    // Nothing queued for a closed session is owed to whoever reuses the slot.
     srv.outbox[slot].clear();
-    // A client that exits without destroying its windows must not leave them on screen.
     disconnect(&mut srv.conns[slot], &mut srv.stack);
     drain_stack_events(srv);
     srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
-    // Its windows are gone, so focus has almost certainly moved — and the *departing*
-    // session must not be told, which `session_of` handles by no longer finding it.
     announce_focus(srv);
 }
 
-/// Map a client's transferred `MemoryObject` and record it for `BufferSource`.
-///
-/// Mapped **once, at attach**, and kept for the buffer's life — the handle crosses the
-/// channel a single time, not per frame.
-///
-/// **Always consumes `handle`**, on every path. A transferred handle nobody closes keeps
-/// its object — and so the client's frames — alive for the compositor's life.
+/// Map a client's transferred `MemoryObject` and record it for `BufferSource`, once at attach.
+/// Always consumes `handle`, on every path.
 fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
     let Some(req) = librsproto::surface::parse_attach_buffer_request(body) else {
         // SAFETY: we are not mapping it, so drop it rather than leaking the object.
@@ -2118,15 +1571,8 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
         return false;
     };
     let len = req.pitch as usize * req.height as usize;
-    // **The mapping this replaces goes first, not last.** Re-attaching an id is a resize
-    // (M9 Part D), and `dispatch` has already accepted the *new* geometry for it — so a
-    // moment where the old, smaller mapping is still what `Server::pixels` finds is a
-    // moment where compositing reads a large geometry out of a small allocation.
-    // `Vec::retain` drops the record, and dropping a `MappedBuffer` unmaps it.
-    //
-    // Dropping it before the new mapping is also what makes a *failed* map safe: the window
-    // is left with no pixels for that buffer, which composites as nothing, rather than with
-    // the wrong ones.
+    // The replaced mapping goes first: `dispatch` accepted the new geometry, and a failed map must
+    // leave no pixels, not the wrong ones.
     srv.buffers.retain(|b| !(b.window == req.window && b.buffer == req.buffer));
     // SAFETY: `handle` is a `MemoryObject` the client transferred; mapping it read-only
     // with the size its own geometry declares.
@@ -2138,64 +1584,40 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
         return false;
     }
     srv.buffers.push(MappedBuffer { window: req.window, buffer: req.buffer, addr: addr as *mut u8, len });
-    // The mapping holds its own reference to the object, so the handle can go.
     // SAFETY: closing our reference; the mapping outlives it.
     unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
     true
 }
 
-/// Recomposite the whole screen.
-///
-/// **The fallback, not the norm, since M5 Part B.** `Outcome::Applied` names the region it
-/// dirtied and the serve loop repaints that; this is what an `Applied { dirty: None }` — "I
-/// cannot name what I changed" — and the first frame use. The comment that stood here said
-/// damage-bounded repaint was an optimisation the compositor did not yet exploit, "and this
-/// milestone has one client"; with an 812×480 terminal in the stack, recompositing 1280×800 on
-/// every request cost a permanently busy CPU. See the decision log, 2026-08-12.
+/// Recomposite the whole screen: the fallback for `Applied { dirty: None }` and the first frame.
 fn repaint(srv: &Server, screen: &mut Screen<RawFramebuffer>) {
     let bounds = screen.geometry().bounds();
     repaint_region(srv, screen, bounds);
 }
 
-/// Recompose `region` and draw the cursor over it.
-///
-/// **The cursor goes on last.** A cursor under a window is not a cursor, and compositing it
-/// into the stack would make it a window — with a position in the stacking order, a client
-/// that could cover it, and hit-testing that would have to skip it.
+/// Recompose `region` and draw the cursor over it, last: compositing it into the stack would make
+/// it a window with a stacking position and a hit-test to skip.
 fn repaint_region(srv: &Server, screen: &mut Screen<RawFramebuffer>, region: Rect) {
     screen.present(&srv.stack, BACKGROUND, srv, &[region], srv.router.pointer(), srv.outline);
 }
 
-/// The wire error a rejected request reports.
 fn surface_errno(e: SurfaceError) -> KError {
     match e {
         SurfaceError::Malformed => KError::InvalidArgument,
         SurfaceError::Unsupported => KError::Unsupported,
-        // A window belonging to another connection reports exactly what a nonexistent one
-        // does. **This is ownership enforcement, not secrecy** — a distinction worth being
-        // exact about, because this comment used to claim the reply "cannot be used to probe
-        // which ids exist" and that has not been true since `/dev/draw/<N>/info` landed:
-        // a namespace resolve answers the same question for any holder of `/dev/draw`
-        // (PR #175 review, finding 2). What collapsing the two cases still buys is that a
-        // client learns nothing *from acting* — it cannot tell "not yours" from "not there",
-        // so there is no oracle to walk by attempting operations, and the session channel
-        // remains the only place anything can be changed. Enumeration lives at the
-        // namespace, deliberately; see `docs/spec/rsproto-surface-ops.md`.
+        // A window of another connection reports what a nonexistent one does: ownership
+        // enforcement, not secrecy (a namespace resolve answers the same question), but acting
+        // teaches nothing.
         SurfaceError::NotFound => KError::NotFound,
-        // **`WouldBlock`, because it is true again in a moment.** A `Place` refused because the
-        // user is dragging that window is not a malformed request and not a permanent no: the
-        // manager asked for something reasonable at a moment when the pointer owns the window.
-        // `InvalidArgument` would tell it to fix its request, which is not the problem.
+        // `WouldBlock`, because it is true again in a moment: a `Place` refused for a drag is
+        // neither malformed nor a permanent no.
         SurfaceError::Rejected(compositor::StackError::Dragging) => KError::WouldBlock,
         SurfaceError::Rejected(_) => KError::InvalidArgument,
     }
 }
 
-/// The screen and the work area, as they are now.
-///
-/// **The work area is the compositor's to compute** — every `panel` declares a strut and only
-/// this process sees all of them. A manager that subtracted its own bars would be right only for
-/// as long as it owned every panel.
+/// The screen and the work area, as they are now. The work area is the compositor's to compute:
+/// only this process sees every panel's strut.
 fn current_layout(srv: &Server) -> librsproto::surface::MgrLayout {
     let screen = srv.screen;
     let work = srv.stack.work_area(screen);
@@ -2209,13 +1631,8 @@ fn current_layout(srv: &Server) -> librsproto::surface::MgrLayout {
     }
 }
 
-/// Tell the manager when the work area is not what it was.
-///
-/// **Compared rather than triggered**, and the comparison is the whole design: what a manager
-/// needs to know is that the answer changed, not why. Today only a panel appearing or going away
-/// can change it — a window's role, and so its strut, is written once at creation — so a
-/// cause-driven version would have exactly two triggers and would silently grow a third the day
-/// a strut becomes settable.
+/// Tell the manager when the work area is not what it was: compared, not triggered, since it needs
+/// the change and not its cause.
 fn announce_layout(srv: &mut Server) {
     let now = current_layout(srv);
     if srv.last_layout == Some(now) {
@@ -2225,7 +1642,6 @@ fn announce_layout(srv: &mut Server) {
     mgr_emit(srv, MgrEvent::LayoutChanged(now));
 }
 
-/// Send an error reply on a session channel.
 fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -> bool {
     let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
     let elen = librsproto::error::error_body(&mut ebody, err.as_i32(), 0, b"").unwrap_or(0);
@@ -2249,7 +1665,6 @@ fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -
     }
 }
 
-/// Serve one request on session `slot`, if one is queued.
 fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> Served {
     // SAFETY: SESSION_CH is only written by this single-threaded loop, and `slot` indexes it in bounds
     let ch = unsafe { SESSION_CH[slot] };
@@ -2264,36 +1679,22 @@ fn serve_session(slot: usize, srv: &mut Server, screen: &mut Screen<RawFramebuff
         )
     };
     if rr != 0 {
-        // `PeerClosed` is the client going away, which is the normal end of a session.
         return if rr == KError::PeerClosed.as_i32() as i64 { Served::Closed } else { Served::Empty };
     }
     if handle_session_request(slot, ch, srv, screen) { Served::One } else { Served::Closed }
 }
 
-/// Handle the request [`serve_session`] has just received into `RECV_MSG`. Returns `false` if
-/// the session should close.
 fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut Screen<RawFramebuffer>) -> bool {
-    // Copy the body out rather than holding a borrow of `RECV_MSG` across dispatch; the
-    // alternative is two live `static mut` borrows at once. `MAX_BODY` is sized so a whole
-    // `SetTitle` fits — this `min` is a bounds check, not a policy, and when it *was* a policy
-    // it silently shortened titles to 60 bytes.
+    // Copied out to avoid two live `static mut` borrows. `MAX_BODY` fits a whole `SetTitle`, so
+    // this `min` is a bounds check, not a policy.
     let mut body_buf = [0u8; MAX_BODY];
     // SAFETY: RECV_MSG and RECV_HANDLES were filled by the recv in the caller; the slice is clamped to the payload
     // region and is copied out before anything else touches the statics
     let (op, request_id, body_len, handle) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(&raw const RECV_MSG[PAYLOAD_OFF], payload_len.min(MSG_LEN - PAYLOAD_OFF));
-        // Take the handles out **before** anything can fail. A message that does not decode
-        // can still have carried one, and returning early without closing it pins the
-        // client's object for the compositor's life — a leak a client drives by sending one
-        // malformed message.
-        //
-        // **Every** transfer, not just the first. No Surface op takes more than one handle,
-        // but a client is free to send up to `IPC_HANDLE_MAX`, and the kernel installs all
-        // of them in this process's table whether or not anything here looks at them. The
-        // surplus is closed immediately: it can never be wanted, and leaving it was the
-        // same unbounded leak as the three fixed above, differing only in how it arrived
-        // (PR #175 review, finding 2).
+        // Take the handles out before anything can fail: a message that does not decode may still
+        // carry some, and the surplus past the first is closed at once.
         let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
         #[allow(clippy::needless_range_loop, reason = "an iterator would borrow a `static mut`")]
         for i in 1..hcount {
@@ -2314,11 +1715,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
     };
     let body = &body_buf[..body_len];
 
-    // **`StartMove` is answered here rather than in `dispatch`**, for the reason `Capture` is:
-    // it needs the router, which owns the pointer grab this request is checked against, and
-    // `dispatch` deliberately sees only a connection and the stack. Ownership is checked the same
-    // way every other op checks it — a window belonging to another connection answers `NotFound`,
-    // so a reply cannot be used to probe for other clients' ids.
+    // `StartMove` is answered here as `dispatch` sees no router, which owns the grab this is
+    // checked against. A foreign window answers `NotFound`.
     if op == librsproto::surface::OP_START_MOVE {
         if handle != 0 {
             // SAFETY: closing a handle this process owns and will never interpret.
@@ -2329,23 +1727,17 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
             Some(req) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
             Some(req) => match srv.router.start_move(req.window, &mut srv.stack) {
                 Ok(damage) => {
-                    // **The catch-up is painted here.** The pointer has already moved by the
-                    // time this request lands, so the window is somewhere new the instant the
-                    // drag begins — and `Logical::Button` reports no movement, so a
-                    // press-flick-release with no motion event after it would leave the window
-                    // drawn where it used to be until something unrelated repainted
-                    // (PR #248 review, finding 3).
+                    // The catch-up is painted here: with no motion event after a
+                    // press-flick-release, the window would stay drawn where it was.
                     if let Some(r) = damage.filter(|r| !r.is_empty()) {
                         repaint_region(srv, screen, r);
                     }
+                    // `check-login` waits on this line and on the resize and drag lines below.
                     Line::new().s(b"compositor: interactive move of window ").u(req.window as u64).end();
                     None
                 }
-                // The caller does not hold the grab, or the window has gone. One answer for
-                // both, like every other ownership question here — but **said out loud**,
-                // because a refusal that logged nothing is a client whose drag silently does
-                // not happen, and the gate that found this could not tell "refused" from
-                // "never arrived".
+                // One answer for no grab or a gone window, but said out loud: a silent refusal
+                // looks like a request that never arrived.
                 Err(_) => {
                     Line::new()
                         .s(b"compositor: refused a move of window ")
@@ -2362,10 +1754,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
         };
     }
 
-    // **`StartResize` is answered here for the reason `StartMove` is**: it needs the router,
-    // which owns the pointer grab this request is checked against. What it does *not* do is
-    // resize anything — the window keeps its rectangle for the whole gesture, an outline follows
-    // the pointer, and the manager hears one event at the release (M9 Part E).
+    // `StartResize` is answered here for the reason `StartMove` is. It resizes nothing: an outline
+    // follows the pointer and the manager hears one event at the release.
     if op == librsproto::surface::OP_START_RESIZE {
         if handle != 0 {
             // SAFETY: closing a handle this process owns and will never interpret.
@@ -2377,9 +1767,6 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
             Some(req) => match srv.router.start_resize(req.window, req.edges, &mut srv.stack) {
                 Ok(outline) => {
                     srv.outline = outline;
-                    // Drawn at once, like a move's catch-up: the pointer has already travelled
-                    // during the round trip that brought this request, and a press-flick-release
-                    // with no motion event after it would otherwise show nothing at all.
                     for r in outline.into_iter().flat_map(compositor::outline_edges) {
                         if !r.is_empty() {
                             repaint_region(srv, screen, r);
@@ -2393,9 +1780,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
                         .end();
                     None
                 }
-                // The caller does not hold the grab, the window has gone, or the edges name no
-                // gesture. Said out loud for the reason a refused move is: a drag that silently
-                // does not happen is indistinguishable from a request that never arrived.
+                // Refused: no grab, no window, or edges that name no gesture. Said out loud like a
+                // refused move.
                 Err(e) => {
                     Line::new()
                         .s(b"compositor: refused a resize of window ")
@@ -2419,10 +1805,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
         };
     }
 
-    // **A window says what it takes, once** — `Surface::DeclareAcceptor` (M10 Part E).
-    // (`apply_outline` is defined below, beside the other repaint helpers.) The
-    // compositor holds the table so it can answer "would this window take this drag?" per
-    // motion without a round trip to the client, which is the path that has to stay cheap.
+    // A window says what it takes, once. The compositor holds the table so "would this window take
+    // this drag?" is answered per motion without a round trip.
     if op == librsproto::surface::OP_DECLARE_ACCEPTOR {
         if handle != 0 {
             // SAFETY: closing a handle this process owns and will never interpret.
@@ -2460,10 +1844,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
         };
     }
 
-    // **A drag is a gesture the compositor runs, like a move and a resize** — and refused the
-    // same way, because the grab is what makes "the user is dragging this" true. What differs is
-    // what it ends in: not a rectangle for the manager, but a payload for whatever window it was
-    // let go over.
+    // A drag is a gesture the compositor runs, refused like a move and a resize without the grab;
+    // it ends in a payload for the window it was let go over.
     if op == librsproto::surface::OP_START_DRAG {
         if handle != 0 {
             // SAFETY: closing a handle this process owns and will never interpret.
@@ -2475,12 +1857,9 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
             Some((req, path, name)) => {
                 match srv.router.start_drag(req.window, req.kind, path, name, &srv.stack) {
                     Ok(outline) => {
-                        // The highlight is drawn at once for the reason a resize's outline is:
-                        // the pointer has already travelled during the round trip.
                         apply_outline(srv, screen, outline);
-                        // **The kind and the display name, never the path.** What is being
-                        // dragged is a file in somebody's home directory; the console is not the
-                        // place for a record of which files they move around.
+                        // The kind and the display name, never the path: the console is no record
+                        // of which files somebody moves. `check-login` waits on this line.
                         Line::new()
                             .s(b"compositor: drag from window ")
                             .u(req.window as u64)
@@ -2508,11 +1887,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
         };
     }
 
-    // **`RequestState` is forwarded, not applied.** Minimising is `Manage::SetMinimized` and
-    // maximising is a `Configure` to a rectangle computed from the work area; both are manager
-    // operations, and a client that could reach either could put another client's window away or
-    // place itself. So the compositor's whole part is to check the caller owns the window and
-    // hand the manager the question (M9 Part B).
+    // `RequestState` is forwarded, not applied: minimising and maximising are manager operations,
+    // so the compositor only checks ownership and hands the manager the question.
     if op == librsproto::surface::OP_REQUEST_STATE {
         if handle != 0 {
             // SAFETY: closing a handle this process owns and will never interpret.
@@ -2523,15 +1899,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
             Some(req) if req.state > librsproto::surface::WINDOW_STATE_MAXIMIZED => Some(KError::InvalidArgument),
             Some(req) if !srv.conns[slot].owns(req.window) => Some(KError::NotFound),
             Some(req) => {
-                // **Repeats produce nothing**, which is the bound this event needs: it is the
-                // only manager event a client's own rate drives, and the manager's queue does
-                // not coalesce and discards its oldest — so a client looping on one state would
-                // otherwise push a `WindowCreated` off the front of the shell's view of the
-                // world. The same argument `SetTitle` already makes for an unchanged title.
-                //
-                // What it cannot dedup is *alternation*, and that is correct rather than a gap:
-                // a window asked to maximise and then to restore has changed state twice, and a
-                // manager that missed either would be wrong about where the window belongs.
+                // Repeats produce nothing: a client's own rate drives this event and the manager's
+                // queue does not coalesce.
                 if srv.stack.note_state_request(req.window, req.state) {
                     mgr_emit(srv, MgrEvent::StateRequest(req));
                 }
@@ -2549,17 +1918,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
         unsafe { dispatch(&mut srv.conns[slot], &mut srv.stack, op, body, &mut REPLY_MSG[PAYLOAD_OFF + 16..]) };
     drain_stack_events(srv);
 
-    // **Map only after `dispatch` accepted the attach.** Mapping first would record the
-    // client's memory under ids it does not own: `dispatch` would answer `NotFound`, the
-    // entry would stay, and `Server::pixels` resolves by first match — so another client's
-    // pixels would be painted into the rightful owner's window. Doing it in this order
-    // makes the ownership boundary cover the pixels, not just the stack.
-    //
-    // Whatever happens, the handle is **disposed of exactly once**. It is only ever consumed
-    // by `map_attached_buffer`, which closes it on all of its own paths; everything else —
-    // a rejected attach, or a handle riding an op that has no business carrying one, which a
-    // client is free to send — closes it here. Anything left unclosed keeps the client's
-    // object, and therefore its frames, alive for the compositor's life.
+    // Map only after `dispatch` accepted the attach, or a rejected one would record the client's
+    // memory under ids it does not own. The handle is disposed of exactly once.
     let mut consumed = false;
     if op == OP_ATTACH_BUFFER && handle != 0 && matches!(outcome, Outcome::Applied { .. }) {
         consumed = true;
@@ -2582,19 +1942,12 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
                 body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
             }
             if !reply_on_session(ch, op, request_id, &body[..n]) {
-                // The client is blocked in `request` waiting for exactly this. A silent
-                // failure parks it forever, so say so — see `send_release` below.
                 kprint(b"compositor: DROPPED a reply (client receive ring full)\n");
             }
-            // **No repaint.** The only request that replies is `CreateWindow`, and a window
-            // with no committed buffer contributes no pixels. This used to recomposite the
-            // whole screen; see `Outcome::Applied`'s `dirty`.
         }
         Outcome::Created { reply_len, configure } => {
-            // **The reply first, then the configure**, in that order and on the same channel.
-            // The client is blocked in `Window::new` reading the reply for its id, and then
-            // waits for the configure before it may commit — so sending them the other way
-            // round would park every client at startup.
+            // The reply first, then the configure, on the same channel: the client reads its id and
+            // then waits for the configure before it may commit.
             let mut body = [0u8; MAX_BODY];
             let n = reply_len.min(MAX_BODY);
             // SAFETY: `dispatch` wrote `reply_len` bytes at this offset in REPLY_MSG, and `n` is clamped to MAX_BODY;
@@ -2602,11 +1955,8 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
             unsafe {
                 body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
             }
-            // **The manager hears about it, with the role and the size the client asked for.**
-            // An id alone is useless to a manager: a panel is not placed like a normal window,
-            // a popup is placed by its own client, and centring needs a size. All of it is
-            // already known here, so an event that made the shell ask a follow-up question
-            // would be a seam with a round trip in it (M6 B3).
+            // The manager hears of it with the role and size asked for: a follow-up question would
+            // be a seam with a round trip in it.
             if let Some(w) = srv.stack.window(configure.window) {
                 let ev = librsproto::surface::MgrWindowCreated::for_role(
                     configure.window,
@@ -2620,27 +1970,9 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
             if !sent {
                 kprint(b"compositor: a create reply did not send\n");
             }
-            // **Held when a manager is attached: this is M6 B4.** The client may not commit
-            // until it has this configure, so holding it is what gives the manager a window of
-            // opportunity to place the window *before* anyone sees it. Without the hold the
-            // interval between `CreateWindow` and the first `Commit` is the client's — it
-            // issues `AttachBuffer` and `Commit` back to back — and the manager, a different
-            // process that must be woken and scheduled, loses that race often enough to make
-            // every launch visibly jump.
-            //
-            // With no manager there is nobody to ask, so it goes out at once and nothing about
-            // the client's behaviour changes.
-            //
-            // **A popup is never held**, however many managers are attached. Its position is
-            // its creator's business — a menu drops from an item only the client knows the
-            // position of — so there is nobody to wait for, and holding it would spend the full
-            // deadline on the interaction most sensitive to latency: every menu open would cost
-            // 200 ms the moment a shell attached (M6 C1).
-            //
-            // **A `dialog` is held like a `normal`.** It names a parent, but a manager places
-            // it, so there *is* somebody to wait for. Exempting it alongside popups was C1
-            // treating two roles as one because they share a wire shape; what they share is a
-            // parent field, not a placement rule.
+            // Held when a manager is attached, so it can place the window before anyone sees it. A
+            // popup is never held: its creator places it, and every menu open would cost the
+            // deadline. A `dialog` is held like a `normal`.
             let placed_by_creator = srv
                 .stack
                 .window(configure.window)
@@ -2655,56 +1987,37 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
                 let mut cfg = [0u8; core::mem::size_of::<ConfigureEvent>()];
                 srv.stack.mark_configured(configure.window);
                 if sent && configure.write(&mut cfg).is_some() && !send_input(ch, OP_CONFIGURE, &cfg) {
-                    // The client will wait for this and nothing else will produce it, so a
-                    // silent failure parks it forever — the same reason the reply above says so.
+                    // The client waits for this and nothing else produces it; a silent failure
+                    // parks it forever.
                     kprint(b"compositor: a window's first configure did not send\n");
                 }
             }
-            // **No repaint.** A window with no committed buffer contributes no pixels.
         }
         Outcome::Applied { release, dirty } => {
-            // A destroy is transitive, so drop every mapping whose window is gone.
-            // Otherwise a client looping create/attach/destroy grows the compositor's
-            // address space without bound.
+            // A destroy is transitive, so drop every mapping whose window is gone, or a looping
+            // client grows the compositor's address space.
             srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
 
-            // **Paint before releasing.** A `Release` is the client's evidence that the
-            // commit it displaced has been dealt with; sending it first tells the client
-            // the frame is done while the pixels are still unpainted. The client then
-            // reports progress, and anything pacing off that — the display gate, or a
-            // second client — observes a screen that has not caught up. Same shape as
-            // announcing `Ready` before clearing the screen.
+            // Paint before releasing: a `Release` tells the client the frame is done, and pacing
+            // off that would see an unpainted screen.
             match dirty {
-                // Nothing changed on screen — an attach, or a destroy of a window that was
-                // never committed.
                 Some(r) if r.size.w == 0 || r.size.h == 0 => {}
                 Some(r) => repaint_region(srv, screen, r),
-                // A request that could not name its region. Correct, and the thing this
-                // milestone stopped doing on every request.
                 None => repaint(srv, screen),
             }
             if let Some((window, buffer)) = release {
-                // **Through the outbox, like everything else.** Sent directly it competed
-                // with input on the same ring, and input is continuous while a release is
-                // not, so the cheap message reliably evicted the expensive one. Queued, it
-                // holds its place ahead of anything arriving later and cannot be coalesced
-                // away — a release is never motion.
+                // Through the outbox: sent directly it competed with continuous input on the same
+                // ring and was evicted. Queued, it holds its place and is never coalesced away.
                 enqueue(srv, slot, Outbound::Release { window, buffer });
             }
         }
         Outcome::TitleSet { window } => {
-            // Nothing on screen changed — the compositor draws no titles — so there is no
-            // repaint here, only the manager event.
             let title = srv.stack.window(window).map(|w| w.title.clone()).unwrap_or_default();
             mgr_emit(srv, MgrEvent::Title { window, title });
         }
         Outcome::Failed(e) => {
-            // **Logged a bounded number of times.** A rejection is client-driven, so this
-            // is an unbounded write to a shared console: one misbehaving client can bury
-            // every other service's output, and the churn probe alone produced 80 identical
-            // lines per boot (PR #175 review, finding 6). The first few are the diagnostic;
-            // the rest are noise, and the error still goes back to the client that caused
-            // it either way.
+            // Logged a bounded number of times: a rejection is client-driven. The error still goes
+            // to the client.
             srv.conns[slot].rejections_logged += 1;
             let n = srv.conns[slot].rejections_logged;
             if n <= MAX_LOGGED_REJECTIONS {
@@ -2722,38 +2035,19 @@ fn handle_session_request(slot: usize, ch: u64, srv: &mut Server, screen: &mut S
         }
     }
 
-    // **After the request, whatever it was.** `announce_focus` compares against what was
-    // last announced, so an op that did not move focus costs a comparison and sends nothing
-    // — which means there is no list of focus-moving ops to keep correct here, and that is
-    // the point. An earlier version called this inside the `Applied` arm and named create as
-    // one of the ops it covered; create is the one op that replies with a window id, so it
-    // returns `Outcome::Reply` and never reached it. A new window goes on top of the stack
-    // and `focus_candidate` is topmost-focusable, so focus had already moved and neither
-    // client was told — the old window kept a caret it no longer owned while its keys went
-    // to a window that had not painted yet (PR #184 review, finding 2).
-    //
-    // After the reply rather than before it: a client cannot make sense of gaining focus for
-    // a window whose id it has not been handed yet.
+    // After the request, whatever it was: `announce_focus` compares with the last announcement, so
+    // no list of focus-moving ops need stay correct (create replies without reaching `Applied`).
+    // After the reply, as a client cannot use focus for an id it lacks.
     announce_focus(srv);
     true
 }
 
-/// The serve loop: the forwarding endpoint plus every open session.
 fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Server, mut control: u64) -> ! {
     kprint(b"compositor: serving /dev/draw\n");
     let mut parked = false;
     loop {
-        // **Every iteration, not only on a timeout.** Checked in the `TimedOut` arm alone, the
-        // configure deadline would be a floor rather than a bound: any iteration where a handle
-        // was ready would skip it, so a busy compositor could hold a window well past 200 ms.
-        // It self-corrects at the first idle instant, which is why this is a bound rather than
-        // a bug fix — but a deadline that only holds when nothing is happening is not one worth
-        // documenting as 200 ms (PR #218 review, finding 8). Free when nothing is held.
-        //
-        // **Flushed here, not left to the next pass.** Releasing *queues* the configure, and
-        // the client is blocked on it; going straight back to `sys_wait` with it unsent means
-        // sleeping until something unrelated happens — and having just emptied the pending
-        // list, there is no longer a deadline to wake for.
+        // Every iteration, not only on a timeout, or the configure deadline holds only when idle.
+        // Flushed here: a released configure is queued and the client is blocked on it.
         if fire_configure_deadlines(srv, &mut screen) {
             parked = flush_outboxes(srv);
         }
@@ -2783,9 +2077,8 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
                     n += 1;
                 }
             }
-            // Bounded while something is parked **or** a key is repeating — the two
-            // deadline sources, whichever is sooner. An idle compositor with nothing held
-            // still sleeps indefinitely, which is what keeps this from becoming a poll.
+            // Bounded while something is parked or a key is repeating, whichever is sooner; an idle
+            // compositor still sleeps indefinitely, so this is not a poll.
             let now = now_ns();
             let mut deadline = u64::MAX;
             if parked {
@@ -2794,15 +2087,12 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
             if let Some(r) = srv.repeat {
                 deadline = deadline.min(r.next_at);
             }
-            // A third source: a window still waiting for a manager that may never answer.
             for &(_, at) in &srv.pending_configure {
                 deadline = deadline.min(at);
             }
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, deadline)
         };
         if waited < 1 {
-            // `TimedOut` is a tick, not an error: whichever deadline expired, do its work
-            // and go back to waiting rather than spinning.
             fire_repeat(srv);
             parked = flush_outboxes(srv);
             continue;
@@ -2828,9 +2118,8 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
                 serve_signalled = true;
                 continue;
             }
-            // **`service --stop`** (administration Part E.2). Every window goes with this process:
-            // its clients find their channels closed. A compositor started again takes the screen
-            // again — the kernel hands `/dev/framebuffer` out on each resolve.
+            // `service --stop`: every window goes with this process and its clients find their
+            // channels closed; a restarted compositor takes the screen again.
             if control != 0 && h == control {
                 match libkern::control::recv(control) {
                     libkern::control::Control::Op(libkern::abi::CTRL_OP_SHUTDOWN) => {
@@ -2843,9 +2132,8 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
                 continue;
             }
             if srv.input_ch != 0 && h == srv.input_ch && !serve_input(srv, &mut screen) {
-                // The input server died. Close the endpoint and carry on serving the
-                // display — the alternative is a compositor that exits because a mouse
-                // went away.
+                // The input server died: carry on serving the display rather than exit because a
+                // mouse went away.
                 kprint(b"compositor: input server gone\n");
                 // SAFETY: closing an endpoint this process owns and stops using.
                 unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, srv.input_ch, 0, 0, 0) };
@@ -2864,16 +2152,11 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
                 && serve_session(slot, srv, &mut screen) == Served::Closed
             {
                 close_session(slot, srv);
-                // Through `repaint`, so the pointer survives a client dying under it. It did
-                // not: this composed directly and nothing redrew the cursor afterwards, so it
-                // stayed gone until the next mouse movement (PR #185 review, finding 1).
                 repaint(srv, &mut screen);
             }
         }
-        // **Before the early `continue`.** Everything above may have queued messages, and
-        // the common iteration — input arrived, no resolve — takes that `continue`. Flushing
-        // only on the resolve path would leave every routed event sitting in its queue until
-        // a client happened to connect.
+        // Before the early `continue`: everything above may have queued messages, and the common
+        // iteration (input, no resolve) takes that `continue`.
         fire_repeat(srv);
         parked = flush_outboxes(srv);
 
@@ -2881,9 +2164,9 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
             continue;
         }
 
-        // A forwarded resolve: `new` mints a session, `manage` mints the manager channel
-        // (one holder), `<N>/info` answers with window metadata, `screen` with the screen's size. A bare `<N>` is a later
-        // milestone; `<N>/ports/...` is unscheduled — see `TODO(port-shape-rework)`.
+        // A forwarded resolve: `new` mints a session, `manage` the manager channel, `<N>/info`
+        // window metadata, `screen` the screen's size. `<N>/ports/...` is unscheduled:
+        // `TODO(port-shape-rework)`.
         // SAFETY: valid recv out-params (a Resolve carries no transferred handles).
         let rr = unsafe {
             syscall4(
@@ -2934,17 +2217,14 @@ fn serve_loop(serve_end: u64, mut screen: Screen<RawFramebuffer>, srv: &mut Serv
     }
 }
 
-/// Called by the kernel's ELF entry with the standard bootstrap arguments; `ctrl` is the
-/// control channel the supervisor spawned this server with.
+/// Called by the kernel's ELF entry; `ctrl` is the control channel the supervisor spawned us with.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     kprint(b"compositor: up\n");
 
-    // **The shadow buffer is allocated before the screen changes hands** (PR #306 review,
-    // optional 4). Acquiring `/dev/framebuffer` is what makes the kernel's console stop drawing,
-    // so a refusal after it is a refusal nobody can read: on a machine with no serial port — the
-    // one this is for — the screen would simply stop at `compositor: up`. Reading the geometry
-    // does not take the screen; only `acquire` does.
+    // The shadow buffer is allocated before the screen changes hands: acquiring `/dev/framebuffer`
+    // stops the kernel console drawing, so a later refusal would be unreadable on a machine with no
+    // serial port (`check-fbcon`). Reading the geometry does not take the screen; `acquire` does.
     //
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let shadow =
@@ -2962,7 +2242,6 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
             }
         };
 
-    // Authority is the binding: a compositor is a process whose namespace has this.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let (aperture, info) = match unsafe { libdraw::acquire::acquire(root_ns) } {
         Ok(pair) => pair,
@@ -2972,16 +2251,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         }
     };
     let _ = info;
-    // **From here on the aperture is unreachable except through `screen`.** Frames are composed
-    // in the shadow buffer and copied out, so nothing is ever scanned out half-painted (M13
-    // Part A).
-    //
-    // **And without the buffer there is no serving at all** (Phase 5 Part G.4), which is why the
-    // allocation happened above rather than here. Until then this logged a line and carried on:
-    // composing straight into the display cost a flicker, which is worse than a desktop but
-    // better than none. The framebuffer is write-combining since Part G.3, and composing into it
-    // directly reads it back — reads from write-combining memory are uncached, 54 MiB/s on the
-    // laptop, which is not a flicker but a second a frame.
+    // From here the aperture is reachable only through `screen`: frames are composed in the shadow
+    // buffer and copied out, so nothing is scanned out half-painted. There is no serving without
+    // it: composing into the write-combining framebuffer reads it back uncached, a second a frame.
     let mut screen = Screen::with_shadow(aperture, shadow);
 
     let Some((kernel_end, serve_end)) = make_channel(SESSION_QUEUE_DEPTH) else {
@@ -3002,8 +2274,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         outbox: (0..MAX_SESSIONS).map(|_| Outbox::new()).collect(),
         mgr_outbox: MgrOutbox::new(),
         interp: Interpreter::new(),
-        // The router clamps the cursor to the screen it was told about, so it has to be the
-        // screen this compositor actually acquired — not a constant that happens to match.
+        // The cursor clamps to the screen actually acquired, not a constant that happens to match.
         router: InputRouter::new(screen_bounds),
         input_ch: 0,
         lights_sent: None,
@@ -3011,24 +2282,17 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     match connect_input(root_ns) {
         Some(ch) => {
             srv.input_ch = ch;
+            // `check-input` waits on this line.
             kprint(b"compositor: input connected\n");
-            // Num Lock is on from the start, so its light is too.
             send_lights(&mut srv);
         }
         None => kprint(b"compositor: no /dev/input/new -- display only\n"),
     }
 
-    // Clear **before** announcing readiness, so `Meta::Ready` means "I have taken the
-    // screen" rather than "I am about to".
-    //
-    // Announcing first left the clear racing whatever was spawned next: `bind_compositor`
-    // would return while the clear was still pending, and on `-smp 4` two processes then
-    // held `/dev/framebuffer` mapped read-write with nothing arbitrating. Ordering it here
-    // costs nothing and removes the window entirely, where pacing it against a later signal
-    // would only narrow it.
-    // The pointer is drawn here too, so it exists from the moment the compositor owns the
-    // screen rather than from whenever the mouse first moves — which on a machine with no
-    // client and no mouse activity was never.
+    // Clear before announcing readiness, so `Meta::Ready` means the screen is taken: announcing
+    // first left the clear racing the next spawn, and on `-smp 4` two processes held
+    // `/dev/framebuffer` mapped read-write. The pointer is drawn here too, so it exists before the
+    // mouse first moves.
     repaint(&srv, &mut screen);
 
     if !send_ready(ctrl, kernel_end) {
