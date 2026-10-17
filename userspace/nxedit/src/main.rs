@@ -167,11 +167,7 @@ fn clip_read(ns: u64, index: u32, expect: u64, out: &mut [u8]) -> Result<Option<
     }
 }
 
-/// Entry point.
-///
-/// # Safety
-///
-/// Called by the kernel's ELF entry with the standard bootstrap arguments.
+/// Entry point, called by the kernel's ELF entry with the standard bootstrap arguments.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> ! {
     kprint(b"nxedit: up\n");
