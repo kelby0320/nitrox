@@ -1,23 +1,10 @@
 //! `heartbeat` — a trivial supervised service, the demo subject for `service-mgr`.
 //!
-//! A minimal long-running daemon: it beats on a timer and **listens on its control
-//! channel** for a shutdown command (`service-mgr` keeps the other end). On a
-//! `CTRL_OP_SHUTDOWN` it stops cleanly. It waits on the control endpoint with a
-//! per-beat deadline, so the same `sys_wait` both paces the beats (on timeout) and
-//! delivers control messages (on signal) — no second thread.
-//!
-//! If spawned without a control channel (`control == 0`) it falls back to a bounded
-//! run so it never hangs unsupervised.
-//!
-//! It emits its beats as a **typed stream** (TSM1, via `libstream`) to its `log` endpoint
-//! (handed in by service-mgr at `rcx`): each beat is a one-row typed table
-//! `{ seq, uptime_ns, healthy }` — the logging service detects the `TSM1` magic and renders
-//! the decoded row. Its "up" status and the app-facing **self-registration** `worker`
-//! source (`liblog::open_source`) still send text `LogRecord`s via `liblog`, so both log
-//! paths — and the logging service's magic-based routing between them — are exercised.
-//!
-//! `#![no_std]` + `#![no_main]`; `alloc` (via `libheap`) for the typed encoder;
-//! `libkern` + `libstream` + `liblog`.
+//! Beats on a timer while waiting on its control channel with a per-beat deadline, so one
+//! `sys_wait` paces the beats and delivers `CTRL_OP_SHUTDOWN`. Beats are a typed TSM1 stream to
+//! the `log` endpoint; the "up" status and the `worker` source send text `LogRecord`s, so a gate
+//! sees both log paths and the logging service's magic-based routing. With no control channel
+//! it runs a bounded loop.
 
 #![no_std]
 #![no_main]
@@ -33,14 +20,11 @@ use liblog::Logger;
 use libstream::wire::Result as StreamResult;
 use libstream::{Schema, SliceSink, TableWriter, TypeModifiers, TypeTag, TypedRecord, Value, WireError};
 
-/// The global allocator — the typed-beat encoder allocates a small schema + row.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The `IpcMsg` payload offset (after the 24-byte header), mirroring `liblog`.
 const PAYLOAD_OFF: usize = 24;
 
-/// One beat: a row of the typed stream heartbeat emits on its log endpoint.
 struct Beat {
     seq: i64,
     uptime_ns: i64,
@@ -71,9 +55,9 @@ impl TypedRecord for Beat {
     }
 }
 
-/// Beat interval — the deadline between beats while idle-waiting on control.
+/// Deadline between beats while waiting on control.
 const BEAT_INTERVAL_NS: u64 = 300_000_000; // 300 ms
-/// Fallback beat count when spawned without a control channel.
+/// Beats when spawned without a control channel.
 const FALLBACK_BEATS: u32 = 3;
 
 static mut WAIT_HANDLES: [u64; 1] = [0];
@@ -83,7 +67,6 @@ static mut RECV_MSG: IpcMsg = IpcMsg::ZEROED;
 static mut RECV_HANDLES: [u64; 8] = [0; 8];
 static mut RECV_COUNT: u64 = 0;
 
-/// Emit `msg` to the serial console via the debug kprint syscall.
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`; the slice is valid.
     unsafe {
@@ -91,7 +74,6 @@ fn kprint(msg: &[u8]) {
     }
 }
 
-/// Print a small unsigned decimal.
 fn kprint_u32(mut v: u32) {
     let mut buf = [0u8; 10];
     let mut i = buf.len();
@@ -107,7 +89,6 @@ fn kprint_u32(mut v: u32) {
     kprint(&buf[i..]);
 }
 
-/// Exit the process with `code` (does not return).
 fn exit(code: i64) -> ! {
     // SAFETY: SYS_PROCESS_EXIT terminates this process; it does not return.
     unsafe { syscall1(SYS_PROCESS_EXIT, code as u64) };
@@ -116,7 +97,6 @@ fn exit(code: i64) -> ! {
     }
 }
 
-/// Read the monotonic clock (nanoseconds).
 fn clock_now() -> u64 {
     // SAFETY: CLOCK_BUF is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
@@ -125,8 +105,7 @@ fn clock_now() -> u64 {
     unsafe { (&raw const CLOCK_BUF).read() }
 }
 
-/// Encode `beat` as a complete one-row TSM1 stream into `payload` (an `IpcMsg` body),
-/// returning the byte length, or `None` if it does not fit.
+/// Encode `beat` as a one-row TSM1 stream into `payload`; `None` if it does not fit.
 fn encode_beat(payload: &mut [u8], beat: &Beat) -> Option<usize> {
     let mut sink = SliceSink::new(payload);
     {
@@ -138,8 +117,7 @@ fn encode_beat(payload: &mut [u8], beat: &Beat) -> Option<usize> {
     Some(sink.len())
 }
 
-/// Emit a beat as a typed stream to the log endpoint. With no endpoint (unsupervised /
-/// no logging service) it beats visibly to the serial console instead.
+/// Emit a beat to the log endpoint, or to the serial console when there is none.
 fn emit_beat_typed(log_ep: u64, beat: &Beat) {
     if log_ep == 0 {
         kprint(b"heartbeat: beat ");
@@ -152,7 +130,7 @@ fn emit_beat_typed(log_ep: u64, beat: &Beat) {
         Some(n) => n,
         None => return, // does not fit — drop this beat
     };
-    // Stamp the IpcMsg header: payload_len @4, handle_count @8 = 0 (mirrors liblog).
+    // IpcMsg header: payload_len at 4, handle_count at 8.
     buf[4..8].copy_from_slice(&(body_len as u32).to_le_bytes());
     buf[8] = 0;
     let no_handles = [0u64; 1];
@@ -163,11 +141,8 @@ fn emit_beat_typed(log_ep: u64, beat: &Beat) {
     }
 }
 
-/// Wait (bounded) for service-mgr's log-endpoint handoff on the control channel and
-/// return the transferred handle (`0` if none arrives in time). The handoff is the
-/// service's **first** control message — one moved handle, empty payload — so this runs
-/// once at startup before the beat loop. The spawn ABI delivers only the control handle
-/// to a register; the log endpoint arrives here instead.
+/// Wait up to 2 s for the log endpoint service-mgr moves over the control channel as its
+/// first message (`0` if none); the spawn ABI passes only the control handle.
 fn recv_log_handoff(control: u64) -> u64 {
     // SAFETY: CLOCK_BUF is a writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
@@ -207,13 +182,10 @@ fn recv_log_handoff(control: u64) -> u64 {
     }
 }
 
-/// The daemon loop: beat on a deadline, exit on a control shutdown. Beats emit as log
-/// records through `logger` (the service's `log` endpoint).
+/// The daemon loop: beat on a deadline, exit on a control shutdown.
 fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
     kprint(b"heartbeat: up (daemon)\n");
-    // Self-registration demo: resolve a named `worker` source ourselves and log through
-    // it — the app-facing register-then-log path. Records on it carry source="worker"
-    // (from the path label, stamped by the logging service).
+    // The app-facing path: records on this source carry source="worker" from the path label.
     if root_ns != 0 {
         let worker = liblog::open_source(root_ns, b"/log/system/heartbeat/worker");
         worker.info("worker source online");
@@ -223,13 +195,10 @@ fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
     }
     let start_ns = clock_now();
     let mut beat = 1i64;
-    // Emit the first typed beat immediately (before the timed loop), so the typed path is
-    // demonstrated even under a fast boot where the verdict ends the run within one beat
-    // interval. Subsequent beats fire on the timer below.
+    // Beat once before the timed loop so a fast boot's verdict still sees a typed beat.
     emit_beat_typed(log_ep, &Beat { seq: beat, uptime_ns: 0, healthy: true });
     beat += 1;
     loop {
-        // Arm the beat deadline (absolute monotonic) and wait on the control endpoint.
         let now = clock_now();
         let deadline = now.saturating_add(BEAT_INTERVAL_NS);
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
@@ -238,15 +207,12 @@ fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
         };
         if waited >= 1 {
-            // The control endpoint signalled — a message is waiting.
             match libkern::control::recv(control) {
                 Control::Op(CTRL_OP_SHUTDOWN) => {
                     kprint(b"heartbeat: shutdown requested, exiting\n");
                     exit(0);
                 }
-                // **Its supervisor has gone**, and the channel would stay signalled for good: a
-                // loop that waited on it again would spin (administration Part E.2). It is the one
-                // thing this waits on, so there is nothing left to do.
+                // The channel stays signalled once closed; waiting again would spin.
                 Control::Closed => {
                     kprint(b"heartbeat: its supervisor has gone, exiting\n");
                     exit(0);
@@ -254,17 +220,13 @@ fn run_daemon(control: u64, log_ep: u64, logger: &Logger, root_ns: u64) -> ! {
                 _ => { /* unknown/empty op — ignore and keep beating */ }
             }
         } else {
-            // Deadline reached, no control message — emit a typed beat.
             emit_beat_typed(log_ep, &Beat { seq: beat, uptime_ns: now.saturating_sub(start_ns) as i64, healthy: true });
             beat = beat.wrapping_add(1);
         }
     }
 }
 
-/// Bootstrap registers (see init): `rdi` = notification channel, `rsi` = namespace,
-/// `rdx` = the control-channel endpoint moved in by service-mgr (0 if none). The `log`
-/// endpoint is *not* a spawn register — service-mgr hands it over the control channel
-/// (see [`recv_log_handoff`]).
+/// Entry point: `rsi` = namespace, `rdx` = control endpoint from service-mgr (0 if none).
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     // Receive the log endpoint service-mgr transfers over the control channel, then log
