@@ -1,6 +1,4 @@
-//! **ext4 as a [`Volume`]** (Phase 6 Part E.1): what `libfsserver`'s server loop calls, over this
-//! crate's library. Until the loop moved into `libfsserver` these calls were made from the
-//! binary directly; the wrapper is all that is left of them here.
+//! **ext4 as a [`Volume`]**: what `libfsserver`'s server loop calls, over this crate's library.
 
 use crate::ext4::{self, Unservable};
 use crate::{BlockReader, BlockRun, BlockWriter, FsError};
@@ -255,7 +253,7 @@ mod tests {
         }
     }
 
-    /// Build a `RESOLVE_FILE_LAZY` resolve request (the slice-8 kernel's form).
+    /// Build a `RESOLVE_FILE_LAZY` resolve request (the kernel's form).
     fn make_lazy_request(request_id: u64, suffix: &[u8]) -> ([u8; 512], usize) {
         let mut body = [0u8; 256];
         let body_len = resolve_request(&mut body, 0x8000, RESOLVE_FILE_LAZY, suffix).unwrap();
@@ -317,10 +315,10 @@ mod tests {
         }
     }
 
-    /// **A grow's reply marks the blocks it added `UNWRITTEN`, and only that reply** (Phase 6 Part
-    /// H.4): through ext4's volume, a file grown from 4,196 bytes to five blocks of 4 KiB is replied
-    /// with blocks 2 to 4 marked — the first two are its old ones, the second holding its old end —
-    /// and a plain resolve of it after marks nothing, since by then the kernel may have written them.
+    /// **A grow's reply marks the blocks it added `UNWRITTEN`, and only that reply**: through
+    /// ext4's volume, a file grown from 4,196 bytes to five blocks of 4 KiB is replied with blocks
+    /// 2 to 4 marked (the first two are its old ones, the second holding its old end), and a plain
+    /// resolve of it after marks nothing, since by then the kernel may have written them.
     #[test]
     fn a_grows_reply_marks_the_blocks_it_added_and_a_plain_resolve_does_not() {
         use crate::test_support::RwImage;
@@ -453,7 +451,7 @@ mod tests {
         }
     }
 
-    // ---- the refusal in place of Ready (Phase 5) ----
+    // ---- the refusal in place of Ready ----
 
     use crate::ext4::Unservable;
 
