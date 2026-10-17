@@ -1,58 +1,33 @@
 //! The output parser: a program's bytes become grid operations.
 //!
-//! ## It emits operations rather than driving a grid
+//! The parser emits [`Op`]s and touches no state but its own, so an escape-sequence bug and a
+//! wrapping bug cannot present identically. It does not own current attributes either: `SGR`
+//! emits an effect and the grid applies it, because attributes are what `DECSC` saves and `RIS`
+//! resets.
 //!
-//! [`Parser::feed`] returns [`Op`]s and touches no state but its own. The alternative — a
-//! parser holding a `&mut Grid` and applying as it goes — fuses two state machines that fail
-//! differently: an escape-sequence bug and a wrapping bug would present identically, and
-//! neither could be tested without the other. This way A3 lands before A4 and each has tests
-//! that name what they are about.
-//!
-//! **The parser does not own current attributes either.** `SGR` emits an effect and the grid
-//! applies it, because attributes are terminal state — the thing `DECSC` saves and `RIS`
-//! resets — and splitting them across two owners is how they end up disagreeing.
-//!
-//! ## What it handles, and why that is the list
-//!
-//! Bounded by what `nxsh` and the coreutils emit, plus what a person's `Ctrl-L` needs: cursor
-//! addressing and relative movement, erase in display and line, and `SGR` for bold, underline,
-//! reverse and the sixteen colours. Parameters are parsed **generically** — a bounded list of
-//! numbers — so 256-colour becomes a match arm rather than a reshape.
-//!
-//! ## An unrecognised sequence is consumed, never printed
-//!
-//! The failure this exists to prevent is `[0m` appearing in the middle of someone's output. A
-//! parser that abandons a sequence it does not know must still swallow every byte of it,
-//! including the final one. `tty_server::Discipline` learned this on the input side; the rule
-//! is the same here and the tests are the ones that check the *next* character survives.
+//! It handles cursor addressing and relative movement, erase in display and line, and `SGR`
+//! for bold, underline, reverse and the sixteen colours. **An unrecognised sequence is consumed
+//! whole, never printed**, so `[0m` cannot appear in someone's output.
 
 use crate::cell::{Ansi, Colour};
 
-/// The most operations one byte can complete.
+/// The most operations one byte can complete: an `SGR` with a full parameter list.
 ///
-/// Sized from the worst case rather than guessed, the way `libinput`'s `MAX_PER_GROUP` is: an
-/// `SGR` with a full parameter list, which [`MAX_PARAMS`] bounds. Two other paths produce more
-/// than one — a broken UTF-8 sequence emits a replacement *and* re-feeds the offending byte,
-/// and a C0 control inside a CSI executes in place — and both are bounded well below this.
+/// A broken UTF-8 sequence (a replacement plus the re-fed byte) and a C0 control inside a CSI
+/// produce more than one too, both well below this.
 pub const MAX_PER_BYTE: usize = MAX_PARAMS;
 
 /// Parameters retained in one CSI sequence.
 ///
-/// Sixteen, which is what `xterm` allows and more than anything in this system emits.
-/// **Excess parameters are dropped, and the sequence still executes** — the alternative is
-/// abandoning a sequence because it was too enthusiastic, which loses the effects that did
-/// fit and is more surprising than ignoring the tail.
+/// Sixteen, as `xterm` allows. **Excess parameters are dropped and the sequence still
+/// executes**, which is less surprising than abandoning it.
 pub const MAX_PARAMS: usize = 16;
 
 /// How many bytes of an `OSC` payload are retained.
 ///
-/// **A bound, because the payload arrives from the program on the other end.** A sequence with
-/// no terminator would otherwise grow a buffer for as long as it kept writing. A payload that
+/// The payload comes from the program on the other end, so it is bounded. A payload that
 /// overruns is *discarded whole* rather than truncated: acting on half a path would take the
-/// terminal somewhere the shell never named.
-///
-/// 256 because that is longer than any path this system's namespace can produce and short
-/// enough that a runaway sequence costs nothing.
+/// terminal somewhere the shell never named. 256 exceeds any path the namespace can produce.
 pub const MAX_OSC: usize = 256;
 
 /// How much of a region an erase covers.
@@ -73,8 +48,7 @@ pub enum Sgr {
     Reset,
     /// `1`.
     Bold,
-    /// `22` — the "normal intensity" that turns bold off. Not `21`, which is double-underline
-    /// in ECMA-48 and only historically a bold-off.
+    /// `22` — normal intensity. Not `21`, which is double-underline in ECMA-48.
     NoBold,
     /// `4`.
     Underline,
@@ -91,10 +65,8 @@ pub enum Sgr {
 }
 
 /// What the parser asks the grid to do.
-///
-/// Movement is expressed as the terminal expresses it — relative counts and a one-based
-/// absolute position converted to zero-based here — and **clamping is the grid's**, because
-/// only the grid knows how big it is.
+/// Movement is relative counts and a one-based absolute position converted to zero-based here;
+/// **clamping is the grid's**, because only the grid knows its size.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     /// Put a character at the cursor and advance.
@@ -132,41 +104,27 @@ pub enum Op {
 /// Where the parser is in a sequence.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
-    /// Ordinary text.
     Ground,
-    /// `ESC` seen.
     Escape,
-    /// `ESC` and an intermediate byte seen — `ESC ( B` (charset), `ESC # 8` (DECALN). One
-    /// more byte completes it, and swallowing only two would print the third.
+    /// `ESC` and an intermediate byte — `ESC ( B` (charset), `ESC # 8` (DECALN). One more byte
+    /// completes it.
     EscapeIntermediate,
-    /// `ESC [` seen; accumulating parameters.
     Csi,
-    /// Inside a CSI this build does not implement — a private sequence such as `ESC [ ? 25 l`.
-    /// Every byte is swallowed up to and including the final one.
+    /// Inside a CSI this build does not implement, such as `ESC [ ? 25 l`; swallowed whole.
     CsiIgnore,
-    /// Inside an `OSC`/`DCS`/`PM`/`APC` *string* sequence, whose payload runs until `BEL` or
-    /// `ST` (`ESC \\`) rather than until a final byte.
+    /// Inside an `OSC`/`DCS`/`PM`/`APC` string, whose payload runs until `BEL` or `ST` (`ESC \\`).
     ///
-    /// `osc` is set for `ESC ]` alone, and is what decides whether the payload is *kept*: the
-    /// other three introducers have nothing this build reads, and buffering their bytes would
-    /// be paying [`MAX_OSC`] for a string nobody looks at.
+    /// `osc` is set for `ESC ]` alone: only an `OSC` payload is kept.
     String {
-        /// Whether this is an `OSC`, whose payload is accumulated.
         osc: bool,
     },
-    /// `ESC` seen inside a string — `\\` ends it, anything else starts a new sequence.
     StringEscape {
-        /// Carried through from [`String`](State::String), so the terminator finishes the
-        /// sequence it actually belongs to.
         osc: bool,
     },
-    /// Mid-character in a UTF-8 sequence.
     Utf8 {
-        /// Bits decoded so far.
         acc: u32,
-        /// Continuation bytes still expected.
         left: u8,
-        /// Smallest scalar this many bytes may legally encode — the shortest-form check.
+        /// Smallest scalar this many bytes may legally encode (rejects over-longs).
         min: u32,
     },
 }
@@ -177,17 +135,11 @@ enum State {
 #[derive(Clone, Debug)]
 pub struct Parser {
     state: State,
-    /// Parameters of the CSI in progress. `None` is "absent", which is not the same as zero:
-    /// `ESC [ ; 5 H` has an absent first parameter and a present second.
+    /// Parameters of the CSI in progress. `None` is "absent", not zero: `ESC [ ; 5 H`.
     params: [Option<u16>; MAX_PARAMS],
-    /// How many parameter slots the sequence has used, saturating at [`MAX_PARAMS`].
     count: usize,
-    /// The `OSC` payload accumulating, bounded by [`MAX_OSC`].
     osc: alloc::vec::Vec<u8>,
-    /// Whether the payload in progress ran past [`MAX_OSC`], so that the terminator discards
-    /// it instead of acting on the part that fit.
     osc_overran: bool,
-    /// Where the program last said it is — see [`Parser::directory`].
     directory: Option<alloc::string::String>,
 }
 
@@ -197,7 +149,6 @@ impl Default for Parser {
     }
 }
 
-/// Replacement character, for a UTF-8 sequence that does not decode.
 const REPLACEMENT: char = '\u{FFFD}';
 
 /// Whether `c` is a C0 or C1 control, which has no glyph and must never reach a cell.
@@ -207,9 +158,7 @@ const fn is_control(c: char) -> bool {
 
 /// The C0 control this build acts on, if any.
 ///
-/// Shared by the ground state and the CSI state, which must agree: a control arriving
-/// mid-sequence is *executed* rather than dropped (see [`Parser::csi`]), and two copies of this
-/// mapping would be two chances for them to diverge.
+/// Shared by the ground and CSI states, which must agree: a control mid-CSI is executed.
 const fn c0_op(b: u8) -> Option<Op> {
     Some(match b {
         b'\r' => Op::CarriageReturn,
@@ -235,55 +184,35 @@ impl Parser {
 
     /// Where the program on the other end last said it is, if it has ever said.
     ///
-    /// Set by `OSC 7` — `ESC ] 7 ; <path> BEL`, or with `ST` in place of `BEL` — which is the
-    /// sequence a shell emits beside its prompt to tell its terminal its working directory.
-    /// `nxterm` puts it in the window's title bar, which is the design's subtitle
-    /// (desktop refresh, Part K).
+    /// Set by `OSC 7` (`ESC ] 7 ; <path> BEL` or `ST`), which a shell emits beside its prompt.
     ///
-    /// **A path, not a `file://` URL.** Elsewhere the payload is conventionally a URL, whose
-    /// authority names the host the path is on and whose octets are percent-encoded. Nitrox has
-    /// no hosts and no URL type, so accepting one would mean writing a percent-decoder and an
-    /// authority parser for a form nothing on this system emits — and half-reading a URL is
-    /// worse than not claiming to read one. If a foreign program ever arrives, this is where
-    /// the URL form goes.
-    ///
-    /// **This is on the parser rather than in an [`Op`]**, which is the one place this module
-    /// departs from "the parser emits operations and owns no terminal state". An `Op` is `Copy`
-    /// and carries no payload, and a marker variant would leave the consumer reaching in here
-    /// anyway. The argument that keeps SGR attributes on the grid does not reach this: a
-    /// working directory sets no cell, is not what `DECSC` saves, and is not what `RIS` resets
-    /// — it is a fact about the *stream*, which is what this type parses.
+    /// **A path, not a `file://` URL**: Nitrox has no hosts, and half-reading a URL is worse
+    /// than not claiming to. It lives on the parser rather than in an [`Op`] because it is a
+    /// fact about the stream, not terminal state `DECSC` saves or `RIS` resets.
     pub fn directory(&self) -> Option<&str> {
         self.directory.as_deref()
     }
 
     /// Feed one byte. Returns how many of `out`'s slots were filled.
     ///
-    /// `out` must be at least [`MAX_PER_BYTE`] long; the return is `0` for every byte that
-    /// does not complete something, which is most of them inside a sequence.
+    /// `out` must be at least [`MAX_PER_BYTE`] long.
     pub fn feed(&mut self, b: u8, out: &mut [Op]) -> usize {
         match self.state {
             State::Ground => self.ground(b, out),
             State::Escape => self.escape(b),
             State::EscapeIntermediate => {
                 match b {
-                    // `ESC` cancels, here as everywhere else. This branch ate it until the
-                    // test that checks every mid-sequence state, rather than one of them.
                     0x1B => self.state = State::Escape,
-                    // Another intermediate: `ESC $ ( C` is a multibyte charset selection.
-                    // ECMA-48 allows any number, so this loops rather than assuming one.
+                    // Another intermediate: `ESC $ ( C`; ECMA-48 allows any number.
                     0x20..=0x2F => {}
-                    // A final byte ends it.
                     _ => self.state = State::Ground,
                 }
                 0
             }
             State::Csi => self.csi(b, out),
             State::String { osc } => {
-                // **Swallowed to the terminator, not to a final byte.** `ESC ] 0 ; title BEL`
-                // is the most common escape sequence in the wild — every prompt that sets a
-                // window title emits one — and treating its introducer as a two-byte sequence
-                // dumps `0;title` into the grid on every redraw (PR #189 review, finding 2).
+                // Swallowed to `BEL`/`ST`, not a final byte: window-title `OSC`s are on every
+                // prompt and would otherwise dump `0;title` into the grid.
                 match b {
                     0x07 => {
                         self.state = State::Ground;
@@ -302,28 +231,21 @@ impl Parser {
             }
             State::StringEscape { osc } => {
                 if b == b'\\' {
-                    // `ST` — the proper terminator.
                     self.state = State::Ground;
                     if osc {
                         self.finish_osc();
                     }
                     0
                 } else {
-                    // A lone `ESC` inside a string is illegal, and this parser's rule
-                    // everywhere else is that `ESC` cancels and restarts. Applied here too, so
-                    // an unterminated string cannot swallow the rest of the session.
-                    //
-                    // **And the payload is dropped with it.** A sequence nothing terminated
-                    // announced nothing; keeping the bytes would let the next `OSC` inherit
-                    // the tail of an abandoned one.
+                    // A lone `ESC` inside a string cancels and restarts, so an unterminated
+                    // string cannot swallow the session; the payload is dropped with it.
                     self.state = State::Escape;
                     self.discard_osc();
                     self.escape(b)
                 }
             }
             State::CsiIgnore => {
-                // Swallow to the final byte. A sequence abandoned halfway would spill its
-                // remaining bytes into the grid, which is the `[0m`-in-your-output failure.
+                // Swallow to the final byte, or the rest would spill into the grid.
                 if b == 0x1B {
                     self.state = State::Escape;
                 } else if (0x40..=0x7E).contains(&b) {
@@ -337,8 +259,7 @@ impl Parser {
 
     /// Whether the parser is mid-sequence.
     ///
-    /// For a caller that needs to know a flush is not going to lose half a character — the
-    /// render, deciding whether the grid is in a consistent state to draw.
+    /// For a caller that must not flush half a character.
     pub fn is_idle(&self) -> bool {
         self.state == State::Ground
     }
@@ -349,16 +270,13 @@ impl Parser {
                 self.state = State::Escape;
                 return 0;
             }
-            // BEL and every other C0 this build does not act on are dropped rather than
-            // printed: a control character rendered as a glyph is worse than a silent one.
+            // BEL and every other C0 not acted on are dropped, not printed.
             0x00..=0x1F | 0x7F => match c0_op(b) {
                 Some(op) => op,
                 None => return 0,
             },
             0x20..=0x7E => Op::Print(b as char),
-            // UTF-8. A lead byte starts a sequence; a stray continuation byte is a decoding
-            // error on its own and becomes one replacement character rather than being
-            // silently eaten, so a desynchronised stream shows up rather than shortening.
+            // UTF-8 lead byte; a stray continuation byte becomes one replacement character.
             0xC2..=0xDF => {
                 self.state = State::Utf8 { acc: (b & 0x1F) as u32, left: 1, min: 0x80 };
                 return 0;
@@ -384,30 +302,21 @@ impl Parser {
                 self.count = 0;
                 self.state = State::Csi;
             }
-            // **`ESC` cancels and restarts.** A program interrupted mid-sequence emits a fresh
-            // one, and a parser that treated the new `ESC` as the old sequence's payload would
-            // print the replacement sequence as text.
+            // `ESC` cancels and restarts, so the new sequence is not printed as text.
             0x1B => {}
-            // An intermediate byte: `ESC ( B` selects a charset, `ESC # 8` is DECALN. Three
-            // bytes, not two — swallowing two prints the third, which is how `\x1b(B` used to
-            // leak a `B` into the grid.
+            // An intermediate byte: three bytes, not two, or `\x1b(B` leaks a `B`.
             0x20..=0x2F => self.state = State::EscapeIntermediate,
-            // String introducers: `OSC`, `DCS`, `PM`, `APC`. Their payload is terminated by
-            // `BEL` or `ST`, not by their own second byte.
+            // String introducers: `OSC`, `DCS`, `PM`, `APC`; ended by `BEL` or `ST`.
             b']' | b'P' | b'^' | b'_' => {
-                // The payload is kept for `OSC` alone, which is the only one this build reads
-                // anything out of.
                 self.discard_osc();
                 self.state = State::String { osc: b == b']' };
             }
-            // `ESC` and a final byte: `RIS`, keypad modes, `ESC 7`/`ESC 8`. None implemented
-            // here; consumed whole.
+            // `ESC` and a final byte (`RIS`, keypad modes, `ESC 7`/`ESC 8`): consumed whole.
             _ => self.state = State::Ground,
         }
         0
     }
 
-    /// Add a byte to the `OSC` payload, or note that it did not fit.
     fn push_osc(&mut self, b: u8) {
         if self.osc.len() >= MAX_OSC {
             self.osc_overran = true;
@@ -416,29 +325,23 @@ impl Parser {
         self.osc.push(b);
     }
 
-    /// Forget the payload in progress, leaving what was already announced alone.
     fn discard_osc(&mut self) {
         self.osc.clear();
         self.osc_overran = false;
     }
 
-    /// A terminated `OSC`: read what this build understands out of it, and forget the rest.
     fn finish_osc(&mut self) {
         let payload = core::mem::take(&mut self.osc);
         let overran = core::mem::take(&mut self.osc_overran);
         if overran {
             return;
         }
-        // `7` is the working directory. `0`, `1` and `2` are window and icon titles, which this
-        // build has no use for — `nxterm` names itself — and every other number is somebody
-        // else's extension. All of them are swallowed either way; this only decides what is
-        // *read*.
+        // `7` is the working directory. Titles (`0`, `1`, `2`) and other numbers are swallowed
+        // unread.
         let Some(rest) = payload.strip_prefix(b"7;") else { return };
         let Ok(path) = core::str::from_utf8(rest) else { return };
-        // **An absolute path with nothing in it that is not a character.** The value goes
-        // straight into a title bar, so a payload carrying a newline or an escape would let the
-        // program on the other end put anything it liked in a window's chrome. A path that does
-        // not start at the root is not a place this could name, so it is not accepted either.
+        // The value goes into a title bar, so it must be absolute and free of controls: a
+        // payload with an escape would let the program put anything in a window's chrome.
         if !path.starts_with('/') || path.chars().any(is_control) {
             return;
         }
@@ -447,9 +350,8 @@ impl Parser {
 
     fn utf8(&mut self, b: u8, acc: u32, left: u8, min: u32, out: &mut [Op]) -> usize {
         if b & 0xC0 != 0x80 {
-            // Not a continuation byte. The sequence is broken, and **the byte is re-fed**
-            // rather than dropped: it is the start of something valid, and eating it would
-            // turn one malformed character into two.
+            // Not a continuation byte: broken sequence; the byte is re-fed, being the start of
+            // something valid.
             self.state = State::Ground;
             out[0] = Op::Print(REPLACEMENT);
             return 1 + self.feed(b, &mut out[1..]);
@@ -460,15 +362,8 @@ impl Parser {
             return 0;
         }
         self.state = State::Ground;
-        // Surrogates and out-of-range values fail in `from_u32`. **Over-longs are rejected
-        // explicitly**, which an earlier version did not do on the grounds that they "decode to
-        // a valid scalar" — true, and the scalar can be a *control character*. `E0 80 9B`
-        // decoded to `U+001B` and was printed as a cell, bypassing the rule one branch up that
-        // drops the direct byte `0x1B` (PR #189 review, finding 3).
-        //
-        // Filtering the decoded scalar as well closes the class rather than that instance:
-        // `C2 9B` is a legal encoding of the 8-bit `CSI`, and printing *that* as a glyph is the
-        // same mistake with a valid encoding.
+        // Over-longs are rejected explicitly, and so is any control scalar: `E0 80 9B` decodes
+        // to `U+001B`, and `C2 9B` is the 8-bit `CSI`; printing either bypasses the `0x1B` rule.
         let c = match char::from_u32(acc) {
             Some(c) if acc >= min && !is_control(c) => c,
             _ => REPLACEMENT,
@@ -477,10 +372,8 @@ impl Parser {
         1
     }
 
-    /// Accumulate a parameter digit, or dispatch on a final byte.
     fn csi(&mut self, b: u8, out: &mut [Op]) -> usize {
         match b {
-            // `ESC` cancels this sequence and starts a new one — see `escape`.
             0x1B => {
                 self.state = State::Escape;
                 0
@@ -491,30 +384,20 @@ impl Parser {
                 }
                 if let Some(slot) = self.params.get_mut(self.count - 1) {
                     let v = slot.unwrap_or(0);
-                    // Saturating: a parameter of a thousand digits is malformed input, and
-                    // wrapping it would turn a clamp into a jump to somewhere plausible.
+                    // Saturating: wrapping would turn a clamp into a jump somewhere plausible.
                     *slot = Some(v.saturating_mul(10).saturating_add((b - b'0') as u16));
                 }
                 0
             }
-            // `;` and `:` both advance to the next parameter. **`:` is a sub-parameter
-            // separator in ECMA-48**, not a different kind of byte, and it was the one value
-            // of the `0x30..=0x3F` parameter range with no arm here — so `ESC [ 38:2:255:0:0 m`
-            // fell to the malformed branch and leaked `2:255:0:0m` into the grid (PR #189
-            // review, finding 1). Treating it as a separator is an approximation — the
-            // sub-parameter grouping is lost — and it is enough for the one rule that matters:
-            // never leak.
+            // `;` and `:` both advance to the next parameter. `:` is ECMA-48's sub-parameter
+            // separator; grouping is lost, but `ESC [ 38:2:255:0:0 m` must not leak.
             b';' | b':' => {
                 self.count = self.count.saturating_add(1).max(2);
                 0
             }
-            // **A C0 control mid-sequence is executed, and the sequence continues.** That is
-            // what xterm does, and it is the only option of three that neither loses the
-            // control nor leaks the rest of the sequence: abandoning to `Ground` printed the
-            // remaining bytes, and swallowing to the final byte dropped the control (PR #189
-            // review, finding 7).
+            // A C0 control mid-sequence is executed and the sequence continues, as in xterm:
+            // abandoning would print the rest, swallowing would drop the control.
             0x18 | 0x1A => {
-                // `CAN` and `SUB` cancel, which is their whole purpose.
                 self.state = State::Ground;
                 0
             }
@@ -525,15 +408,12 @@ impl Parser {
                 }
                 None => 0,
             },
-            // A private-parameter marker (`?`, `<`, `=`, `>`) means a sequence outside the
-            // standard set — `ESC [ ? 25 l` hides the cursor, and this build has no cursor
-            // visibility to hide. Swallowed to the final byte.
+            // A private-parameter marker (`?`, `<`, `=`, `>`): outside the standard set; swallowed.
             0x3C..=0x3F => {
                 self.state = State::CsiIgnore;
                 0
             }
-            // Intermediate bytes. None of the sequences here use them, and a sequence that
-            // does is one this build does not implement.
+            // Intermediate bytes: no sequence here uses them, so it is unimplemented.
             0x20..=0x2F => {
                 self.state = State::CsiIgnore;
                 0
@@ -542,7 +422,6 @@ impl Parser {
                 self.state = State::Ground;
                 self.dispatch(b, out)
             }
-            // Anything else inside a CSI is malformed. Abandon without printing.
             _ => {
                 self.state = State::Ground;
                 0
@@ -552,17 +431,15 @@ impl Parser {
 
     /// Parameter `i`, or `None` if it was absent or past [`MAX_PARAMS`].
     ///
-    /// **Bounded by the array, not only by `count`.** `count` records how many parameters the
-    /// *sender* supplied, which is unbounded — seventeen semicolons make it seventeen — so
-    /// indexing on `i < count` alone panics on the first read past the cap.
+    /// Bounded by the array as well as `count`, which the sender controls: seventeen
+    /// semicolons would otherwise index past the cap.
     fn param(&self, i: usize) -> Option<u16> {
         if i < self.count { self.params.get(i).copied().flatten() } else { None }
     }
 
     /// Parameter `i` as a movement count: absent or zero means one.
     ///
-    /// The rule for `CUU`/`CUD`/`CUF`/`CUB` and for `CUP`'s two coordinates. `ESC [ 0 A` moves
-    /// one line, not none — an off-by-one here makes a program that emits `0` stop moving.
+    /// The rule for `CUU`/`CUD`/`CUF`/`CUB` and `CUP`: `ESC [ 0 A` moves one line, not none.
     fn count_at(&self, i: usize) -> u16 {
         match self.param(i) {
             None | Some(0) => 1,
@@ -580,15 +457,12 @@ impl Parser {
             b'B' => one(Op::MoveBy { rows: self.count_at(0) as i32, cols: 0 }, out),
             b'C' => one(Op::MoveBy { rows: 0, cols: self.count_at(0) as i32 }, out),
             b'D' => one(Op::MoveBy { rows: 0, cols: -(self.count_at(0) as i32) }, out),
-            // `CUP`, and `HVP` (`f`) which is the same operation under a different name.
-            // **One-based on the wire, zero-based here**: the conversion belongs at the
-            // boundary, so nothing below this line has to remember which convention it is in.
+            // `CUP`, and `HVP` (`f`). One-based on the wire, zero-based from here on.
             b'H' | b'f' => one(Op::MoveTo { row: self.count_at(0) - 1, col: self.count_at(1) - 1 }, out),
             b'J' => one(Op::EraseInDisplay(self.erase_at(0)), out),
             b'K' => one(Op::EraseInLine(self.erase_at(0)), out),
             b'm' => self.sgr(out),
-            // A CSI this build does not implement — scroll regions, insert/delete line,
-            // device status reports. Consumed and dropped, which is the whole point.
+            // Unimplemented CSIs (scroll regions, insert/delete line, DSR): consumed and dropped.
             _ => 0,
         }
     }
@@ -604,8 +478,7 @@ impl Parser {
 
     /// Decode every `SGR` parameter into an effect.
     ///
-    /// A bare `ESC [ m` is `ESC [ 0 m` — a reset — which is what a shell emits at the end of a
-    /// coloured prompt more often than it emits the explicit form.
+    /// A bare `ESC [ m` is `ESC [ 0 m`, a reset.
     fn sgr(&self, out: &mut [Op]) -> usize {
         if self.count == 0 {
             out[0] = Op::Attr(Sgr::Reset);
@@ -614,17 +487,8 @@ impl Parser {
         let mut n = 0;
         for i in 0..self.count.min(MAX_PARAMS) {
             let p = self.param(i).unwrap_or(0);
-            // **`38` and `48` stop the scan.** They introduce an extended colour whose
-            // sub-parameters this build does not implement, and whose *count* differs between
-            // the forms — `38;5;n`, `38;2;r;g;b`, and the ITU `38:2::r:g:b` with an empty
-            // colour-space slot. Reading past one misinterprets its payload as ordinary codes:
-            // `ESC [ 38;2;255;0;0 m` emitted **two spurious `Reset`s** from the two zeroes,
-            // silently clearing attributes a prompt had just set. That is worse than the leak
-            // in PR #189's finding 1, because nothing visible says it happened.
-            //
-            // Everything *before* the extended colour still applies; everything after is
-            // dropped. Implementing 256-colour turns this into a real parse rather than
-            // changing the shape.
+            // `38` and `48` stop the scan: their sub-parameter counts differ by form, and
+            // reading on takes their zeroes for spurious `Reset`s. What precedes still applies.
             if p == 38 || p == 48 {
                 break;
             }
@@ -637,8 +501,7 @@ impl Parser {
 
     /// One `SGR` parameter, or `None` for a code this build does not implement.
     ///
-    /// **Unknown codes are skipped, not abandoned.** `ESC [ 3 ; 31 m` is italic-then-red, and
-    /// there is no italic here; dropping the whole sequence would lose the red as well.
+    /// Unknown codes are skipped, not abandoned: `ESC [ 3 ; 31 m` must keep its red.
     fn sgr_effect(p: u16) -> Option<Sgr> {
         Some(match p {
             0 => Sgr::Reset,
@@ -664,7 +527,6 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
 
-    /// Feed a whole string and collect everything it produced.
     fn run(s: &str) -> Vec<Op> {
         run_bytes(s.as_bytes())
     }
@@ -701,15 +563,11 @@ mod tests {
 
     #[test]
     fn an_ignored_control_produces_nothing_rather_than_a_glyph() {
-        // BEL and the rest. A control rendered as a character is worse than a silent one, and
-        // `0x07 as char` is a printable-looking box in most fonts.
         assert_eq!(run("a\x07\x00\x7Fb"), alloc::vec![Op::Print('a'), Op::Print('b')]);
     }
 
     #[test]
     fn cursor_movement_defaults_to_one_and_zero_means_one() {
-        // `ESC [ 0 A` moves one line. A program that emits the zero form stops moving if this
-        // is wrong, which looks like the program's bug rather than the terminal's.
         assert_eq!(run("\x1b[A"), alloc::vec![Op::MoveBy { rows: -1, cols: 0 }]);
         assert_eq!(run("\x1b[0A"), alloc::vec![Op::MoveBy { rows: -1, cols: 0 }]);
         assert_eq!(run("\x1b[5B"), alloc::vec![Op::MoveBy { rows: 5, cols: 0 }]);
@@ -719,20 +577,15 @@ mod tests {
 
     #[test]
     fn cup_is_one_based_on_the_wire_and_zero_based_here() {
-        // The conversion happens once, at the boundary. Everything below this line is
-        // zero-based, so nothing else has to remember which convention it is in.
         assert_eq!(run("\x1b[H"), alloc::vec![Op::MoveTo { row: 0, col: 0 }]);
         assert_eq!(run("\x1b[1;1H"), alloc::vec![Op::MoveTo { row: 0, col: 0 }]);
         assert_eq!(run("\x1b[10;40H"), alloc::vec![Op::MoveTo { row: 9, col: 39 }]);
-        // `HVP` is the same operation spelled `f`.
         assert_eq!(run("\x1b[10;40f"), alloc::vec![Op::MoveTo { row: 9, col: 39 }]);
     }
 
     #[test]
     fn an_absent_parameter_is_not_a_zero() {
-        // `ESC [ ; 5 H` has an absent row and a present column. Treating absent as zero would
-        // move to row -1 before the default rule, and treating it as "no parameters at all"
-        // would lose the 5.
+        // `ESC [ ; 5 H` has an absent row and a present column.
         assert_eq!(run("\x1b[;5H"), alloc::vec![Op::MoveTo { row: 0, col: 4 }]);
     }
 
@@ -742,8 +595,7 @@ mod tests {
         assert_eq!(run("\x1b[0J"), alloc::vec![Op::EraseInDisplay(Erase::ToEnd)]);
         assert_eq!(run("\x1b[1J"), alloc::vec![Op::EraseInDisplay(Erase::ToStart)]);
         assert_eq!(run("\x1b[2J"), alloc::vec![Op::EraseInDisplay(Erase::All)]);
-        // `3J` is "erase scrollback" in xterm; treated as `All` rather than ignored, because
-        // a `Ctrl-L` that clears less than asked is more surprising than one that clears more.
+        // `3J` (erase scrollback in xterm) is treated as `All`: clearing less than asked surprises.
         assert_eq!(run("\x1b[3J"), alloc::vec![Op::EraseInDisplay(Erase::All)]);
         assert_eq!(run("\x1b[K"), alloc::vec![Op::EraseInLine(Erase::ToEnd)]);
         assert_eq!(run("\x1b[1K"), alloc::vec![Op::EraseInLine(Erase::ToStart)]);
@@ -764,7 +616,6 @@ mod tests {
 
     #[test]
     fn a_bare_sgr_is_a_reset() {
-        // What a shell emits at the end of a coloured prompt, more often than `ESC [ 0 m`.
         assert_eq!(run("\x1b[m"), alloc::vec![Op::Attr(Sgr::Reset)]);
         assert_eq!(run("\x1b[0m"), alloc::vec![Op::Attr(Sgr::Reset)]);
     }
@@ -789,16 +640,11 @@ mod tests {
 
     #[test]
     fn an_unknown_sgr_parameter_is_skipped_and_its_neighbours_survive() {
-        // `3` is italic and there is none here. Abandoning the sequence would lose the red,
-        // which is the visible half.
         assert_eq!(run("\x1b[3;31m"), alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red)))]);
     }
 
     #[test]
     fn an_unknown_sequence_is_swallowed_whole() {
-        // **The failure this parser exists to avoid**: `[0m` scattered through someone's
-        // output. Every byte of an abandoned sequence goes, including the final one, and the
-        // character *after* it must survive.
         for seq in ["\x1b[6n", "\x1b[?25l", "\x1b[1;2r", "\x1b[ q", "\x1b(B", "\x1b#8"] {
             let ops = run(&alloc::format!("a{seq}b"));
             assert_eq!(printed(&ops), "ab", "{seq:?} leaked");
@@ -807,15 +653,11 @@ mod tests {
 
     #[test]
     fn every_byte_of_the_parameter_range_keeps_the_sequence_intact() {
-        // **Swept rather than sampled**, which is how PR #189's review found that `:` — the one
-        // value of ECMA-48's `0x30..=0x3F` parameter range with no arm here — fell to the
-        // malformed branch and leaked the rest of the sequence. The six hand-picked probes in
-        // `an_unknown_sequence_is_swallowed_whole` were all semicolon-form and missed it.
+        // Swept, not sampled: `:` was the one byte of the `0x30..=0x3F` range with no arm.
         for b in 0x30u8..=0x3F {
             let s = alloc::format!("a\x1b[1{}mZ", b as char);
             assert_eq!(printed(&run(&s)), "aZ", "parameter byte {:#04x} leaked", b);
         }
-        // The real sequences that byte appears in.
         for seq in ["\x1b[38:2:255:0:0m", "\x1b[38:5:196m", "\x1b[4:3m", "\x1b[58:5:1m"] {
             let ops = run(&alloc::format!("a{seq}Z"));
             assert_eq!(printed(&ops), "aZ", "{seq:?} leaked");
@@ -824,20 +666,15 @@ mod tests {
 
     #[test]
     fn an_extended_colour_does_not_have_its_payload_read_as_codes() {
-        // The bug the sweep turned up beside the leak, and the worse of the two: `38`'s
-        // sub-parameters were read as ordinary SGR codes, so the two zeroes of an RGB triple
-        // became two `Reset`s — silently clearing attributes with nothing visible to say so.
+        // `38`'s sub-parameters must not be read as codes: an RGB triple's zeroes were `Reset`s.
         assert_eq!(run("\x1b[38;2;255;0;0m"), alloc::vec![]);
         assert_eq!(run("\x1b[48;5;0m"), alloc::vec![]);
-        // Codes *before* it still apply; codes after are dropped rather than misread.
         assert_eq!(run("\x1b[1;38;2;0;0;0m"), alloc::vec![Op::Attr(Sgr::Bold)]);
     }
 
     #[test]
     fn a_string_sequence_is_swallowed_to_its_terminator() {
-        // `ESC ] 0 ; title BEL` is the most common escape sequence in the wild — every prompt
-        // that sets a window title emits one — and treating its introducer as an ordinary
-        // two-byte escape dumped the payload into the grid on every redraw.
+        // `ESC ] 0 ; title BEL` is on every prompt; its payload must not reach the grid.
         for seq in [
             "\x1b]0;my title\x07",   // OSC, BEL-terminated
             "\x1b]0;my title\x1b\\", // OSC, ST-terminated
@@ -847,16 +684,13 @@ mod tests {
         ] {
             assert_eq!(printed(&run(&alloc::format!("a{seq}Z"))), "aZ", "{seq:?} leaked");
         }
-        // A payload containing what looks like a CSI final byte must not end it early.
         assert_eq!(printed(&run("a\x1b]0;m[1H\x07Z")), "aZ");
-        // An unterminated string does not swallow the session: `ESC` restarts, as everywhere.
         assert_eq!(
             run("\x1b]0;oops\x1b[31mZ"),
             alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red))), Op::Print('Z')]
         );
     }
 
-    /// Feed a string and hand back the parser, so a test can ask it what it learned.
     fn parse(s: &str) -> Parser {
         let mut p = Parser::new();
         let mut out = [Op::Print('\0'); MAX_PER_BYTE];
@@ -869,22 +703,16 @@ mod tests {
     #[test]
     fn osc_7_is_where_the_program_says_it_is() {
         assert_eq!(Parser::new().directory(), None, "nothing said, nothing claimed");
-        // Both terminators, because a shell may emit either.
         for seq in ["\x1b]7;/home/alice\x07", "\x1b]7;/home/alice\x1b\\"] {
             assert_eq!(parse(seq).directory(), Some("/home/alice"), "{seq:?}");
         }
-        // **And none of it is printed** — the payload is read *and* swallowed, which are two
-        // different things and a version that emitted the path as text would pass the line
-        // above.
+        // Read and swallowed are two things; this one must not print the path.
         assert_eq!(printed(&run("a\x1b]7;/home/alice\x07Z")), "aZ");
-        // The last one wins: a shell announces beside every prompt, and `cd` is what changes it.
         assert_eq!(parse("\x1b]7;/a\x07\x1b]7;/b\x07").directory(), Some("/b"));
     }
 
     #[test]
     fn an_osc_this_build_does_not_read_leaves_the_directory_alone() {
-        // Every one of these is a payload a program might send. None of them may become a
-        // place, and none may leak into the grid.
         for seq in [
             "\x1b]0;a title\x07",       // a window title, not a directory
             "\x1b]77;/home/alice\x07",  // a number that merely starts with 7
@@ -897,39 +725,24 @@ mod tests {
             assert_eq!(p.directory(), Some("/start"), "{seq:?} was taken for a place");
             assert_eq!(printed(&run(&alloc::format!("a{seq}Z"))), "aZ", "{seq:?} leaked");
         }
-        // **An `ESC` in the payload is not a payload byte** — it cancels, which is this
-        // parser's rule in every state. So this is an abandoned `OSC` followed by a real
-        // `SGR`: no place is announced, and the `b` after it is ordinary text rather than
-        // something swallowed. Written out rather than folded into the loop above, because
-        // the loop asserts nothing is printed and here something correctly is.
+        // An `ESC` in the payload cancels: an abandoned `OSC` then a real `SGR`, so the `b` prints.
         let esc = "\x1b]7;/home/a\x1b[31mb\x07";
         assert_eq!(parse(&alloc::format!("\x1b]7;/start\x07{esc}")).directory(), Some("/start"));
         assert_eq!(printed(&run(&alloc::format!("a{esc}Z"))), "abZ");
-        // **An abandoned payload is not inherited by the next sequence.** `ESC` restarts, so
-        // the `/bad` below never terminated and the `7;` that follows is a fresh payload — a
-        // parser that kept the bytes would read `7;/bad7;/good` and announce nothing at all.
+        // An abandoned payload is not inherited: `7;/bad7;/good` would announce nothing.
         assert_eq!(parse("\x1b]7;/bad\x1b]7;/good\x07").directory(), Some("/good"));
     }
 
     #[test]
     fn an_osc_payload_is_bounded_and_an_overrun_announces_nothing() {
-        // The bytes come from the program on the other end, so the buffer is a thing it can
-        // grow. Past the bound the whole payload is dropped rather than truncated: a path cut
-        // to 256 bytes is a different directory, and a title bar showing one would be a lie
-        // rather than an omission.
+        // Past the bound the whole payload is dropped: a truncated path is a different directory.
         let long = alloc::format!("/{}", "x".repeat(MAX_OSC));
         let p = parse(&alloc::format!("\x1b]7;/start\x07\x1b]7;{long}\x07"));
         assert_eq!(p.directory(), Some("/start"), "an overrun payload was acted on");
-        // And the sequence is still swallowed whole, overrun or not.
         assert_eq!(printed(&run(&alloc::format!("a\x1b]7;{long}\x07Z"))), "aZ");
 
-        // **The limit itself, from both sides.** A payload that is merely *large* says nothing
-        // about where the bound is: with `>=` loosened to `>` in `push_osc` the two assertions
-        // above and the one below all still pass, and the parser then takes a payload one byte
-        // past the `MAX_OSC` its own doc comment states (PR #322 review, optional 1).
-        //
-        // `7;` is two of the payload's bytes, so a path of `MAX_OSC - 2` makes it exactly one
-        // too long — and the same path a byte shorter makes it exactly full.
+        // The bound from both sides: `7;` takes two bytes, so `MAX_OSC - 2` is one too long and
+        // `MAX_OSC - 3` exactly fits.
         let over = alloc::format!("/{}", "x".repeat(MAX_OSC - 2));
         let p = parse(&alloc::format!("\x1b]7;/start\x07\x1b]7;{over}\x07"));
         assert_eq!(p.directory(), Some("/start"), "a payload one byte past the bound was taken");
@@ -939,9 +752,7 @@ mod tests {
 
     #[test]
     fn a_control_character_never_reaches_a_cell_however_it_is_encoded() {
-        // The rule `ground` applies to a direct `0x1B` has to hold for an encoded one too.
-        // An over-long is the obvious hole; a *legal* encoding of a C1 control is the same
-        // mistake with valid input, which is why both are checked here.
+        // Over-longs and legal encodings of C1 controls (`C2 9B` is the 8-bit `CSI`) both.
         for bytes in [
             &b"\xE0\x80\x80"[..],     // over-long NUL
             &b"\xE0\x80\x9B"[..],     // over-long ESC
@@ -957,17 +768,12 @@ mod tests {
                 ref o => panic!("{bytes:x?} produced {o:?}"),
             }
         }
-        // And a shortest-form non-control still decodes normally.
         assert_eq!(printed(&run_bytes(b"\xC3\xA9")), "\u{e9}");
     }
 
     #[test]
     fn a_malformed_csi_does_not_swallow_the_rest_of_the_stream() {
-        // A byte that can appear in no CSI ends it. The alternative is a parser that eats
-        // everything after one corrupt byte, which is a terminal that goes silent.
-        //
-        // `0x7F` and anything above `0x7E` are the only such bytes now: C0 controls used to be
-        // here, and are executed in place since PR #189's review.
+        // Only `0x7F` and bytes above `0x7E` end a CSI unexecuted; the stream must resynchronise.
         for bad in [0x7Fu8, 0x80, 0xFF] {
             let mut s = alloc::vec::Vec::from(*b"a\x1b[1");
             s.push(bad);
@@ -978,27 +784,20 @@ mod tests {
 
     #[test]
     fn a_c0_control_inside_a_csi_executes_and_the_sequence_continues() {
-        // Three options and only one is right: abandoning to ground prints the rest of the
-        // sequence, swallowing to the final byte drops the control, and this loses neither.
+        // Abandoning would print the rest and swallowing would drop the control.
         assert_eq!(
             run("\x1b[1\rm"),
             alloc::vec![Op::CarriageReturn, Op::Attr(Sgr::Bold)],
             "the carriage return was lost, or `m` leaked"
         );
-        // **The parameter accumulates *across* the control**, so `1` and `2` are the one
-        // number 12 rather than two parameters. That is what "the sequence continues" means,
-        // and asserting `Bold` here instead would have been asserting a different design.
+        // The parameter accumulates across the control: `1` and `2` make 12.
         assert_eq!(run("\x1b[1\n2A"), alloc::vec![Op::LineFeed, Op::MoveBy { rows: -12, cols: 0 }]);
-        // `CAN` and `SUB` cancel instead — that is their purpose — and take the sequence with
-        // them without printing it.
         assert_eq!(printed(&run("a\x1b[1\x18Zb")), "aZb");
         assert_eq!(printed(&run("a\x1b[1\x1aZb")), "aZb");
     }
 
     #[test]
     fn parameters_past_the_cap_are_dropped_and_the_sequence_still_runs() {
-        // Seventeen parameters, the last of which is red. The cap loses it; what matters is
-        // that the sixteen that fit still take effect rather than the whole sequence dying.
         let mut s = alloc::string::String::from("\x1b[");
         for _ in 0..MAX_PARAMS {
             s.push_str("1;");
@@ -1011,12 +810,7 @@ mod tests {
 
     #[test]
     fn a_parameter_index_past_the_cap_is_none_rather_than_a_panic() {
-        // **Tested against the private accessor on purpose.** `param`'s bound is unreachable
-        // through `feed` today — the only loop over parameters stops at `MAX_PARAMS`, and the
-        // cursor and erase dispatches read indices 0 and 1 — so breaking it changes nothing
-        // any public test observes. That makes it exactly the kind of defensive bound that
-        // rots: the panic it prevents is what the seventeen-parameter case originally hit, and
-        // the next caller that loops to `count` would hit it again.
+        // The bound is unreachable through `feed`, so only the private accessor can pin it.
         let mut p = Parser::new();
         let mut out = [Op::Print('\0'); MAX_PER_BYTE];
         for b in b"\x1b[".iter().chain(b"1;".repeat(20).iter()) {
@@ -1030,8 +824,6 @@ mod tests {
 
     #[test]
     fn a_huge_parameter_saturates_rather_than_wrapping() {
-        // Wrapping would turn a clamp into a jump to somewhere plausible-looking, which is
-        // much harder to diagnose than a cursor pinned to the last row.
         assert_eq!(run("\x1b[99999999A"), alloc::vec![Op::MoveBy { rows: -(u16::MAX as i32), cols: 0 }]);
     }
 
@@ -1042,19 +834,13 @@ mod tests {
 
     #[test]
     fn a_broken_utf8_sequence_yields_one_replacement_and_keeps_the_next_byte() {
-        // A truncated lead byte followed by ASCII: the `b` is the start of something valid and
-        // eating it would turn one malformed character into two.
         assert_eq!(printed(&run_bytes(b"a\xC3b")), "a\u{FFFD}b");
-        // A stray continuation byte on its own.
         assert_eq!(printed(&run_bytes(b"a\x80b")), "a\u{FFFD}b");
-        // A surrogate, which encodes but is not a scalar value.
         assert_eq!(printed(&run_bytes(b"a\xED\xA0\x80b")), "a\u{FFFD}b");
     }
 
     #[test]
     fn a_sequence_split_across_feeds_still_parses() {
-        // The real delivery shape: bytes arrive in whatever chunks the channel gives, and a
-        // parser that only worked on whole sequences would be a parser that worked in tests.
         let mut p = Parser::new();
         let mut all = Vec::new();
         let mut out = [Op::Print('\0'); MAX_PER_BYTE];
@@ -1081,16 +867,13 @@ mod tests {
         assert!(!p.is_idle());
         p.feed(b'm', &mut out);
         assert!(p.is_idle(), "the sequence finished and the parser is still mid-sequence");
-        // Mid-character counts too: a render that drew here would show half a glyph missing.
         p.feed(0xC3, &mut out);
         assert!(!p.is_idle());
     }
 
     #[test]
     fn escape_restarts_from_every_state_that_can_hold_one() {
-        // `ESC` cancels whatever is in flight. Checked from each state that can be mid-sequence
-        // rather than from one, because each has its own branch and only the CSI one was
-        // written first — the private-sequence state swallowed a following `ESC` for a while.
+        // `ESC` cancels whatever is in flight, from each state that can be mid-sequence.
         for prefix in [
             "\x1b[1",   // mid-CSI, parameters accumulated
             "\x1b[?25", // mid private sequence
@@ -1108,19 +891,13 @@ mod tests {
 
     #[test]
     fn a_three_byte_escape_sequence_consumes_exactly_three() {
-        // `ESC ( B` and `ESC # 8`. Two-byte swallowing prints the third, which is how a
-        // charset selection used to leak a `B`; four-byte swallowing eats the next character.
         assert_eq!(printed(&run("\x1b(BX")), "X");
         assert_eq!(printed(&run("\x1b#8X")), "X");
-        // And the two-byte forms still take exactly two.
         assert_eq!(printed(&run("\x1b7X")), "X");
     }
 
     #[test]
     fn an_escape_inside_a_sequence_starts_a_new_one() {
-        // A program that gets interrupted mid-sequence and starts another must not have its
-        // second sequence eaten by the first. `ESC` is not in the CSI's accepted set, so the
-        // malformed branch ends the old sequence — and the new `ESC` is the next byte fed.
         let ops = run("\x1b[1\x1b[31mX");
         assert_eq!(ops, alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red))), Op::Print('X')]);
     }
