@@ -1,24 +1,12 @@
 //! The `nxsh` syntax tree — §8/§9 of the design, as data.
 //!
-//! Milestone 3 Part A. Two things here are worth reading before the types themselves,
-//! because both are places where the tree deliberately keeps a distinction the grammar
-//! makes rather than flattening it.
+//! Two distinctions the grammar makes are kept rather than flattened:
 //!
-//! ## Command calls carry their category
-//!
-//! §3 splits commands four ways — keyword, shell-state builtin, generic value operator,
-//! external program — and that split is not documentation: it is what decides whether
-//! arguments were read as expressions or as barewords (D1, see [`crate::lex`]). The
-//! parser resolves the category and records it in [`Call::kind`], so the evaluator never
-//! has to re-derive from the argument shape what the parser already knew.
-//!
-//! ## Sugar is desugared here, not at evaluation
-//!
-//! §8b's bareword predicate (`filter size > 1000`) is defined as sugar for an implicit
-//! closure (`filter { |it| it.size > 1000 }`). The parser performs that expansion, so
-//! there is exactly one closure representation downstream and the evaluator has no idea
-//! two spellings ever existed. Same treatment as `expect`/ascription: one primitive,
-//! several surfaces.
+//! - **A call carries its category** (§3: keyword, builtin, operator, external) in
+//!   [`Call::kind`]. It decides whether arguments are expressions or barewords (see
+//!   [`crate::lex`]), so the evaluator never re-derives it.
+//! - **Sugar is desugared by the parser.** §8b's bareword predicate (`filter size > 1000`)
+//!   becomes an implicit closure, so there is one closure representation downstream.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -30,18 +18,12 @@ pub struct Script {
     pub stmts: Vec<Stmt>,
 }
 
-/// Which of §3's four categories a command head resolved to.
-///
-/// Resolved at parse time because it selects the argument grammar (D1). `Def` and
-/// `External` differ in call *syntax*, not just in what they run: a `def` uses the parens
-/// convention (§5b) and an external program takes barewords.
+/// Which of §3's four categories a head resolved to; it selects the argument grammar.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CallKind {
-    /// A generic value operator — `filter`, `sort`, `save`, … (§5c). Runs in-process on
-    /// the `Value` tree; takes expression-mode arguments and may take a closure.
+    /// A generic value operator — `filter`, `sort`, `save` (§5c); may take a closure.
     Operator,
-    /// A shell-state builtin — `cd`, `exit` (§3). Must mutate the shell's own process
-    /// state, which an external program structurally cannot do.
+    /// A shell-state builtin — `cd`, `exit` (§3); it must mutate the shell's own state.
     Builtin,
     /// A script function called with the parens/named-argument convention (§5b).
     Def,
@@ -70,8 +52,7 @@ pub enum Arg {
     Flag(String, Option<Expr>),
     /// `-abc`, a run of short flags (§10f).
     ShortFlags(String),
-    /// `_` — the explicit pipeline-fill placeholder, required whenever a `def` call has
-    /// an argument list at all (§5b).
+    /// `_` — the pipeline-fill placeholder, required once a `def` call has arguments (§5b).
     PipeFill,
 }
 
@@ -111,12 +92,7 @@ pub enum Expr {
     /// `x[i]`.
     Index(Box<Expr>, Box<Expr>),
     /// `try { … } catch (e) { … }` — an **expression** (§9c, v1.2), so a failure can
-    /// produce a fallback *value*. Sugar over branching on a failure, not stack unwinding
-    /// (§2).
-    ///
-    /// This variant previously held `x?`, which retired in v1.2: propagation needs a
-    /// `Result` *value* to mark, §6 forbids one, and a raise already crosses every
-    /// boundary — so `?` had nothing to mark and was the identity function.
+    /// produce a fallback *value*. Sugar over branching on a failure, not unwinding (§2).
     Try {
         body: Vec<Stmt>,
         catch_binding: Option<String>,
@@ -132,8 +108,7 @@ pub enum Expr {
         body: Vec<Stmt>,
     },
 
-    /// A block in expression position; its value is the last expression-shaped statement
-    /// (§9a).
+    /// A block in expression position; its value is its last expression-shaped statement.
     Block(Vec<Stmt>),
     If {
         cond: Box<Expr>,
@@ -146,13 +121,12 @@ pub enum Expr {
     },
     /// `expect T` — ascription in expression position (§6).
     Expect(Box<Expr>, TypeExpr),
-    /// `parse T` — conversion, `expect`'s converting sibling (§6). Same grammar, same
-    /// fail-loud contract; `expect` asserts a value *is* a `T`, `parse` reads one as a `T`.
+    /// `parse T` — conversion, `expect`'s converting sibling (§6); same fail-loud contract.
     Parse(Box<Expr>, TypeExpr),
     /// `assert (predicate)` — a content check, deliberately not folded into `expect` (§6).
     Assert(Box<Expr>),
-    /// `time PIPELINE` (Phase 6 Part H.2): the pipeline's value, and a line on `stderr` when it
-    /// ends saying how long it took and what the disks and the page cache did meanwhile (§3).
+    /// `time PIPELINE`: the pipeline's value, and a line on `stderr` when it ends with the
+    /// elapsed time and the disk and page-cache activity (§3).
     Time(Box<Expr>),
 }
 
@@ -179,9 +153,7 @@ pub enum BinOp {
     Ne,
     /// `~=` — regex match (§10b).
     Match,
-    /// `in` — membership (§8a, §10b). An infix comparison rather than a pipeline operator,
-    /// because the pipeline form would be a second spelling of one idea and this is the
-    /// one that reads correctly inside an `if`.
+    /// `in` — membership (§8a, §10b); infix because that reads correctly inside an `if`.
     In,
     And,
     Or,
@@ -194,9 +166,8 @@ pub enum BinOp {
 pub struct Param {
     pub name: String,
     pub ty: Option<TypeExpr>,
-    /// Evaluated fresh per call, in the function's own parameter scope — which is what
-    /// avoids Python's shared-mutable-default trap and lets a later default reference an
-    /// earlier parameter (§5b).
+    /// Evaluated fresh per call in the function's parameter scope, so a later default can
+    /// reference an earlier parameter and no mutable default is shared (§5b).
     pub default: Option<Expr>,
     /// `...paths: List<String>` — must be the last positional parameter.
     pub variadic: bool,
@@ -210,15 +181,14 @@ pub struct MatchArm {
     pub body: Vec<Stmt>,
 }
 
-/// A pattern (§9f). Capitalisation carries meaning: a capitalised head is a type test, a
-/// bare lowercase identifier is a catch-all binding.
+/// A pattern (§9f). A capitalised head is a type test, a bare lowercase identifier a catch-all.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Pattern {
     /// `_`.
     Wildcard,
     /// A lowercase identifier: matches anything, binds the whole value.
     Bind(String),
-    /// `Int`, `Table`, `Record(…)` — a variant/type test, optionally destructuring.
+    /// `Int`, `Table`, `Record(…)` — a type test, optionally destructuring.
     Variant(String, Vec<Pattern>),
     /// `{ name, size: s }` — subset match, extra fields ignored (§6).
     Record(Vec<(String, Option<Pattern>)>),
@@ -228,19 +198,16 @@ pub enum Pattern {
     Range { start: Expr, end: Expr, inclusive: bool },
     /// `x @ pattern`.
     Capture(String, Box<Pattern>),
-    /// `a | b | c`. Never collides with pipeline `|`: patterns are a separate production
-    /// and `match_arm` never calls into `expr`'s pipeline rule (§9f).
+    /// `a | b | c`; never collides with pipeline `|`, which `match_arm` never reaches (§9f).
     Or(Vec<Pattern>),
 }
 
-/// A type annotation. §6: this is a textual notation for a TSM1 `Schema`, not a separate
-/// concept — checking one is comparing it against the schema already in a stream header.
+/// A type annotation: a textual notation for a TSM1 `Schema` (§6).
 #[derive(Clone, PartialEq, Debug)]
 pub enum TypeExpr {
     /// `Int`, `Table<{…}>`, `List<T>` — a named type with optional parameters.
     Named { name: String, params: Vec<TypeExpr>, nullable: bool },
-    /// `{ name: String, size?: Int }` — a record shape. `size?: T` is sugar for
-    /// `size: T?`, and both spellings are kept because each reads better somewhere (§9e).
+    /// `{ name: String, size?: Int }`; `size?: T` is sugar for `size: T?` (§9e).
     Record { fields: Vec<(String, TypeExpr)>, nullable: bool },
 }
 
@@ -305,21 +272,17 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
-    /// `break` / `continue` (§9c). **Legal only inside a `for`/`while` body in the same
-    /// function**, which the parser enforces — see `Parser::loop_depth`. Emitting them
-    /// here at all therefore means the check has already passed.
+    /// `break` / `continue` (§9c). Legal only inside a loop body in the same function; the
+    /// parser enforces it (`Parser::loop_depth`).
     ///
     /// Unlabelled: both break the innermost loop only.
     /// TODO(shell-labelled-break): `docs/rationale/deferred-decisions.md`.
     Break,
     Continue,
-    /// `strict { … }` — first stage failure terminates the rest (§1). Deliberately a
-    /// local block rather than a global `pipefail`-style mode switch.
+    /// `strict { … }` — first stage failure terminates the rest (§1); a local block, not a mode.
     Strict(Vec<Stmt>),
     Return(Option<Expr>),
-    /// `fail expr` (§2). A `String` is the message with the default `kind`; a `Record` is
-    /// raised as the error value itself, for a caller that wants to `match` on more than
-    /// a message (§9f).
+    /// `fail expr` (§2). A `String` is the message; a `Record` is raised as the error value.
     Fail(Expr),
     /// `use "./lib/utils.nx" { helper }` or `… as utils` (§9h).
     Use {
@@ -328,15 +291,12 @@ pub enum Stmt {
         names: Option<Vec<String>>,
         alias: Option<String>,
     },
-    /// A bare expression. Auto-displayed in the REPL, discarded in a script (§11e) — the
-    /// two modes differ, which is why the statement keeps no opinion of its own.
+    /// A bare expression. Auto-displayed in the REPL, discarded in a script (§11e).
     Expr(Expr),
 }
 
 impl Expr {
-    /// Whether this expression is a call to a `def` or an external program — the two
-    /// forms that can be a pipeline *stage* running as a process or a function, as
-    /// opposed to a value computed in place.
+    /// Whether this expression is a call to a `def` or an external program.
     pub fn is_call(&self) -> bool {
         matches!(self, Expr::Call(_))
     }
@@ -345,15 +305,9 @@ impl Expr {
 impl Stmt {
     /// Whether a block ending in this statement has that statement's value (§9a).
     ///
-    /// `let`, `return`, `for`, `while`, `def`, `break` and `continue` produce no value, so
-    /// a block ending in one evaluates to `Null`. **`try` is no longer named here** — it
-    /// is an expression as of v1.2, so a block ending in one is a `Stmt::Expr` and covered
-    /// by the first arm. **`if` and `try` do** — §9a names only the first list as
-    /// valueless, and §9f's own example uses `try`/`catch` in expression position. `if` is
-    /// what
-    /// makes the implicit-last-expression return rule work when a function ends in an
-    /// `if`/`else`, and the parser emits `Stmt::If` for a statement-position `if` even
-    /// when its value is wanted.
+    /// `let`, `return`, `for`, `while`, `def`, `break` and `continue` produce no value. `if`
+    /// does: the implicit-last-expression return rule needs a function ending in `if`/`else`
+    /// to yield it. `try` is an expression and arrives as `Stmt::Expr`.
     pub fn is_expression_shaped(&self) -> bool {
         matches!(self, Stmt::Expr(_) | Stmt::If { .. })
     }

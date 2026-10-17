@@ -1,59 +1,44 @@
 //! The `nxsh` lexer — tokens, and the three context decisions the grammar needs.
 //!
-//! Milestone 3 Part A. A shell's lexer is not the boring part: three of the plan's
-//! design gaps (D1, D2, D3) are lexical, and each is a place where a naive tokenizer
-//! silently produces the wrong thing rather than failing.
+//! D1, D2 and D3 are lexical, and each is a place where a naive tokenizer silently
+//! produces the wrong thing rather than failing.
 //!
 //! ## D1 — word mode and expression mode are different languages
-//!
-//! The design specifies both of these, and no single tokenizer can serve them:
 //!
 //! ```text
 //! filter size > 1000        # §8b: an expression. `size` is field shorthand on `it`
 //! list --long /some/path    # §5b: barewords. `/some/path` is a string
 //! ```
 //!
-//! Read as an expression, `/some/path` is a division operator with no left operand, and
-//! `README.md` is field access on `README`. Read as words, `size > 1000` is three
-//! meaningless strings.
-//!
-//! So the lexer has **two modes**, and the *parser* selects between them — it is the only
-//! party that knows whether it is reading an argument list, and whose head token decides
-//! the category (§3). [`Lexer::peek`] and [`Lexer::bump`] therefore take a [`Mode`], and
-//! a token is re-lexed from its own start if it is asked for again in the other mode.
-//! Modes differ *only* in how a token starting with a non-operator character is read:
-//! delimiters, strings and numbers lex identically in both.
+//! As an expression `/some/path` is a division with no left operand and `README.md` is
+//! field access; as words `size > 1000` is three meaningless strings. So the lexer has
+//! **two modes** and the *parser* selects between them: it alone knows whether it is
+//! reading an argument list, and whose head token decides the category (§3).
+//! [`Lexer::peek`] and [`Lexer::bump`] take a [`Mode`], and a token asked for again in the
+//! other mode is re-lexed from its own start. Modes differ *only* in how a token starting
+//! with a non-operator character is read.
 //!
 //! ## D2 — newlines end statements, except when they demonstrably do not
 //!
-//! §9a settles that the grammar is newline-delimited with no semicolons, and §11b asserts
-//! that a whole script parses leading-`|` style unambiguously — but nothing states the
-//! rule that makes that true. It is implemented here, in [`Lexer::suppress_newline`],
-//! because the lexer is what holds the bracket depth and the previous token:
+//! §9a makes the grammar newline-delimited with no semicolons, and §11b asserts that a
+//! script parses leading-`|` style without stating the rule. [`Lexer::suppress_newline`]
+//! holds it, because the lexer holds the bracket depth and the previous token:
 //!
-//! - Inside `(` or `[`, a newline is plain whitespace. **Not** inside `{`: a block's
-//!   statements need their separators. A multi-line record literal still works, because
-//!   it is covered by the trailing-comma rule below.
+//! - Inside `(` or `[`, a newline is whitespace. **Not** inside `{`: a block's statements
+//!   need their separators. A multi-line record still works, via the trailing comma.
 //! - After a token that cannot end a statement — `|`, `&&`, `,`, any binary operator, an
-//!   opening delimiter, `=`, `->`, `=>`, `:`, `.` — the newline is suppressed. This is
-//!   bash's `PS2` rule and Go's semicolon insertion, from the same reasoning: the parser
-//!   is demonstrably mid-production, not guessing.
-//! - **Before** a leading `|`, `else` or `catch`. This is the one that needs lookahead,
-//!   and the one §11b depends on: `ls\n  | filter …` is one pipeline in a file because
-//!   the lexer looks past the newline and finds a `|` that cannot begin a statement.
+//!   opening delimiter, `=`, `->`, `=>`, `:`, `.` — the newline is suppressed (bash's
+//!   `PS2` rule, Go's semicolon insertion): the parser is demonstrably mid-production.
+//! - **Before** a leading `|`, `else` or `catch`. This needs lookahead, and it is what §11b
+//!   depends on: `ls\n  | filter …` is one pipeline because a `|` cannot begin a statement.
 //!
 //! Every rule is a case the parser could *prove* incomplete. Nothing here is a heuristic.
 //!
 //! ## D3 — `/` begins a path or a regex, and the difference is one token of context
 //!
-//! `list /system` and `name ~= /\.rs$/` both put `/` where an operand belongs. The rule:
-//! **a regex literal is lexed only immediately after `~=`**, the one operator that takes
-//! one (§10b); a leading `/` anywhere else begins a path word. This is the same shape as
-//! JavaScript's regex-versus-divide problem, with a far narrower trigger — one operator
-//! rather than a general "could an operand appear here" analysis.
-//!
-//! `./x` and `../x` need no rule at all: `.` is otherwise strictly infix, so a `.` with
-//! no left operand is already unambiguous.
+//! `list /system` and `name ~= /\.rs$/` both put `/` where an operand belongs. **A regex
+//! literal is lexed only immediately after `~=`** (§10b); a leading `/` anywhere else
+//! begins a path word. `./x` and `../x` need no rule: `.` is otherwise strictly infix.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -63,15 +48,13 @@ use alloc::vec::Vec;
 pub enum Mode {
     /// Operators, identifiers and literals — the §8 expression grammar.
     Expr,
-    /// Barewords: an unquoted run of non-whitespace is a [`Tok::Word`], and operator
-    /// characters inside it are ordinary text. Flags (`--long`, `-f`) are recognised.
+    /// Barewords: an unquoted run is a [`Tok::Word`]; operator characters in it are text.
     Word,
 }
 
 /// A lexed token. Positions are carried by [`Spanned`], not here.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Tok {
-    // --- literals -----------------------------------------------------------
     Int(i64),
     Float(f64),
     /// A quoted string. No interpolation — §8d settled on `format()` instead.
@@ -86,7 +69,6 @@ pub enum Tok {
     /// `-f`, in word mode. A run like `-abc` lexes as one `ShortFlags("abc")`.
     ShortFlags(String),
 
-    // --- keywords -----------------------------------------------------------
     Let,
     Mut,
     Const,
@@ -117,7 +99,6 @@ pub enum Tok {
     False,
     Null,
 
-    // --- operators and punctuation ------------------------------------------
     Pipe,
     OrOr,
     AndAnd,
@@ -169,13 +150,11 @@ pub enum Tok {
 }
 
 impl Tok {
-    /// Whether a statement could legally end on this token. Drives the D2 rule that a
-    /// newline after an incomplete construct is not a terminator.
+    /// Whether a statement could legally end on this token (the D2 rule).
     ///
-    /// Deliberately a *whitelist of enders* rather than a list of continuers: a new
-    /// operator added to the language should default to "continues", which produces a
-    /// parse error on the next line, rather than to "ends", which silently splits one
-    /// statement into two.
+    /// Deliberately a *whitelist of enders*: a new operator defaults to "continues", which
+    /// gives a parse error on the next line, rather than to "ends", which silently splits
+    /// one statement into two.
     fn can_end_statement(&self) -> bool {
         matches!(
             self,
@@ -212,9 +191,8 @@ pub struct Spanned {
     pub line: u32,
     /// Whether whitespace separated this token from the previous one.
     ///
-    /// Load-bearing, not decoration: `a - b` and `list -l` differ only here, and so do
-    /// `x.field` and a command taking `.field` as an argument. Shells have always read
-    /// these by spacing; making it explicit is what lets D9 be decided without guessing.
+    /// Load-bearing: `a - b` and `list -l` differ only here, as do `x.field` and a command
+    /// taking `.field` as an argument.
     pub space_before: bool,
 }
 
@@ -231,24 +209,17 @@ type Result<T> = core::result::Result<T, LexError>;
 /// The lexer. Pull-driven: the parser asks for one token at a time in a [`Mode`] it
 /// chooses, because mode is a parser-level fact (D1).
 ///
-/// One token of lookahead is cached. If it is asked for again in a *different* mode it is
-/// re-lexed from its own start offset, which is why [`pending_start`](Self::pending_start)
-/// is kept — re-lexing has to be exact, not approximate.
+/// One token of lookahead is cached; asked for in a *different* mode it is re-lexed from
+/// [`pending_start`](Self::pending_start), exactly.
 ///
-/// **`Clone` is the parser's second token of lookahead.** One place needs to see the token
-/// *after* an identifier before deciding what the identifier is — `f(name: v)` against
-/// `f(name.field)` — and cloning the whole lexer, looking, and putting it back is exact by
-/// construction. A hand-picked snapshot of "the fields that matter" would be the thing that
-/// goes stale the next time this struct gains a field, and the failure would be a
-/// mis-parse rather than a compile error. The clone costs at most one cached token and
-/// happens once per argument that begins with a name.
+/// **`Clone` is the parser's second token of lookahead** (`f(name: v)` against
+/// `f(name.field)`). Cloning the whole lexer is exact by construction; a hand-picked
+/// snapshot goes stale when the struct gains a field and fails as a mis-parse.
 #[derive(Clone)]
 pub struct Lexer<'a> {
     src: &'a [u8],
-    /// Offset just past the cached token, or the scan position when nothing is cached.
     pos: usize,
     line: u32,
-    /// The cached token, the mode it was lexed in, and where it began.
     pending: Option<Spanned>,
     pending_mode: Mode,
     pending_start: usize,
@@ -258,11 +229,9 @@ pub struct Lexer<'a> {
     depth: u32,
     /// Whether the previous significant token licenses a **regex literal** (D3).
     ///
-    /// Two tokens do: `~=`, and the `capture` operator. Both are places a pattern is the
-    /// only thing that can follow, which is what keeps `/` unambiguous everywhere else —
-    /// a leading `/` is a path, and an infix one is division.
+    /// Two tokens do: `~=` and `capture`, the places a pattern is the only thing that can
+    /// follow. A leading `/` elsewhere is a path, an infix one division.
     after_match_op: bool,
-    /// The previous significant token, for the newline rule.
     prev: Option<Tok>,
 }
 
@@ -288,7 +257,6 @@ impl<'a> Lexer<'a> {
             if self.pending_mode == mode {
                 return Ok(p.clone());
             }
-            // Asked for in the other mode: rewind to where it started and read again.
             self.pos = self.pending_start;
             self.line = self.pending_line;
             self.pending = None;
@@ -315,14 +283,10 @@ impl<'a> Lexer<'a> {
 
     /// After a peeked token, is there **nothing left that could be its right operand**?
     ///
-    /// Pure lookahead over the raw source from just past the cached token: horizontal
-    /// whitespace and comments are skipped, then the answer is yes at end of input, at a
-    /// newline, and at each closer that ends an argument list (`|`, `)`, `]`, `}`, `,`).
-    ///
-    /// This exists for one decision — a bare `/` (see [`Parser::starts_an_argument`]) —
-    /// and deliberately does **not** skip newlines. A binary operator at end of line is
-    /// mid-production under D2, so "the line ended" is a real answer here, not a gap to
-    /// look past.
+    /// Lookahead over the raw source: horizontal whitespace and comments are skipped, then
+    /// the answer is yes at end of input, at a newline, and at each closer (`|`, `)`, `]`,
+    /// `}`, `,`). It exists for a bare `/` (see [`Parser::starts_an_argument`]) and does
+    /// **not** skip newlines: a binary operator at end of line is mid-production under D2.
     pub fn no_operand_follows(&self) -> bool {
         let mut i = self.pos;
         loop {
@@ -339,8 +303,7 @@ impl<'a> Lexer<'a> {
         matches!(self.at(i), 0 | b'\n' | b'|' | b')' | b']' | b'}' | b',')
     }
 
-    /// Tokenize the whole input in [`Mode::Expr`]. Only useful for tests and for the
-    /// lexer's own diagnostics — real parsing is pull-driven, since mode is contextual.
+    /// Tokenize the whole input in [`Mode::Expr`], for tests and diagnostics.
     pub fn tokenize_expr(src: &str) -> Result<Vec<Tok>> {
         let mut lx = Lexer::new(src);
         let mut out = Vec::new();
@@ -354,8 +317,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    // --- scanning -----------------------------------------------------------
-
     fn at(&self, i: usize) -> u8 {
         if i < self.src.len() { self.src[i] } else { 0 }
     }
@@ -366,7 +327,6 @@ impl<'a> Lexer<'a> {
 
     fn scan(&mut self, mode: Mode) -> Result<Spanned> {
         let before = self.pos;
-        // Horizontal whitespace and comments never produce tokens. A newline may.
         loop {
             match self.at(self.pos) {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
@@ -401,16 +361,11 @@ impl<'a> Lexer<'a> {
         Ok(Spanned { tok, start, line, space_before })
     }
 
-    /// The D2 decision, in one place: does the newline just consumed get discarded?
-    ///
-    /// Three independent reasons, all of them cases the parser could prove rather than
-    /// guess. See the module docs.
+    /// The D2 decision: does the newline just consumed get discarded? See the module docs.
     fn suppress_newline(&mut self) -> bool {
-        // 1. Inside `(` or `[` a newline carries no meaning.
         if self.depth > 0 {
             return true;
         }
-        // 2. The previous token cannot end a statement, so this one is mid-construct.
         match &self.prev {
             None => return true, // leading blank lines
             Some(t) if !t.can_end_statement() => return true,
@@ -422,9 +377,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// Scan forward over whitespace, comments and further newlines; report whether what
-    /// follows can only be a continuation of the previous statement.
-    ///
-    /// Does not move `self.pos` — this is pure lookahead.
+    /// follows can only continue the previous statement. Pure lookahead.
     fn starts_continuation(&self) -> bool {
         let mut i = self.pos;
         loop {
@@ -441,9 +394,8 @@ impl<'a> Lexer<'a> {
         if i >= self.src.len() {
             return false;
         }
-        // A single `|` — a leading pipeline stage. `||` is logical-or, which cannot begin
-        // a statement either, but treating it as a continuation would be guessing at a
-        // construct nobody writes; keep the rule to the one §11b names.
+        // A single `|` — a leading pipeline stage. `||` is not taken as a continuation:
+        // that would guess at a construct nobody writes.
         if self.at(i) == b'|' && self.at(i + 1) != b'|' {
             return true;
         }
@@ -455,8 +407,6 @@ impl<'a> Lexer<'a> {
         starts_keyword(&self.src[i..], b"else") || starts_keyword(&self.src[i..], b"catch")
     }
 
-    // --- expression mode ----------------------------------------------------
-
     fn scan_expr(&mut self, start: usize) -> Result<Tok> {
         let c = self.at(start);
 
@@ -464,9 +414,8 @@ impl<'a> Lexer<'a> {
         if c == b'/' && self.after_match_op {
             return self.scan_regex(start);
         }
-        // A path in expression position: `/etc/x`, `./x`, `../x`. `/` is otherwise
-        // division, and `.` is otherwise field access — both strictly infix, so a
-        // leading one is unambiguous.
+        // A path in expression position: `/etc/x`, `./x`, `../x`. `/` and `.` are otherwise
+        // strictly infix, so a leading one is unambiguous.
         if c == b'/' && is_path_char(self.at(start + 1)) {
             return Ok(Tok::Word(self.scan_bareword(start)));
         }
@@ -491,7 +440,6 @@ impl<'a> Lexer<'a> {
         let c = self.at(start);
         let d = self.at(start + 1);
         let e = self.at(start + 2);
-        // Longest match first, always — `..=` before `..` before `.`, and so on.
         let (tok, len) = match (c, d, e) {
             (b'.', b'.', b'.') => (Tok::Ellipsis, 3),
             (b'.', b'.', b'=') => (Tok::DotDotEq, 3),
@@ -541,11 +489,8 @@ impl<'a> Lexer<'a> {
         Ok(tok)
     }
 
-    // --- word mode ----------------------------------------------------------
-
-    /// In word mode almost everything is a bareword. Only quoting, flags and the
-    /// delimiters that *end* an argument list are special — an argument list has to be
-    /// able to end, and `ls foo | wc` has to find its pipe.
+    /// In word mode almost everything is a bareword. Only quoting, flags and the delimiters
+    /// that *end* an argument list are special: `ls foo | wc` has to find its pipe.
     fn scan_word_mode(&mut self, start: usize) -> Result<Tok> {
         let c = self.at(start);
         if c == b'"' {
@@ -562,7 +507,6 @@ impl<'a> Lexer<'a> {
             let flags = self.scan_bareword(self.pos);
             return Ok(Tok::ShortFlags(flags));
         }
-        // Structure that must stay visible so an argument list can end.
         let structural = match c {
             b'|' if self.at(start + 1) != b'|' => Some((Tok::Pipe, 1)),
             b'|' => Some((Tok::OrOr, 2)),
@@ -583,15 +527,10 @@ impl<'a> Lexer<'a> {
             return Ok(tok);
         }
         let word = self.scan_bareword(start);
-        // **A zero-length token is an infinite loop, not a wrong answer.** `scan_bareword`
-        // stops at anything that is not a word character, and `]`/`)`/`}` are handled
-        // above as structure — but their *openers* are not, so `list [x]` scanned nothing,
-        // made no progress, and the argument loop bumped the same empty `Word` forever.
-        // It is the same failure `scan_ident` documents for `$`, one mode over.
-        //
-        // Refusing here makes the hang impossible for any character, rather than for the
-        // ones somebody thought of: every path out of this function now advances `pos` or
-        // returns an error.
+        // **A zero-length token is an infinite loop, not a wrong answer.** `]`/`)`/`}` are
+        // structure above but their *openers* are not, so `list [x]` scanned nothing and the
+        // argument loop bumped the same empty `Word` forever (`scan_ident` has the same
+        // failure for `$`). Refusing here means every path advances `pos` or returns an error.
         if word.is_empty() {
             return self.err(
                 "this character cannot begin a bareword argument — quote it if it is part \
@@ -602,8 +541,6 @@ impl<'a> Lexer<'a> {
         Ok(Tok::Word(word))
     }
 
-    /// An unquoted run, ending at whitespace or at structure that could close the
-    /// argument list. Operator characters inside it are ordinary text: `a+b` is one word.
     fn scan_bareword(&mut self, start: usize) -> String {
         let mut i = start;
         while i < self.src.len() && is_word_char(self.at(i)) {
@@ -613,14 +550,10 @@ impl<'a> Lexer<'a> {
         String::from_utf8_lossy(&self.src[start..i]).into_owned()
     }
 
-    // --- literals -----------------------------------------------------------
-
     fn scan_ident(&mut self, start: usize) -> &'a str {
-        // Start past the first byte: the caller has already checked `is_ident_start`, and
-        // a start character need not also be a *continue* character. `$` is exactly that
-        // case — scanning from `start` consumed nothing and made no progress, so the outer
-        // loop spun forever. An infinite loop, not a wrong token, which is why it showed
-        // up as a hung test run rather than a failure.
+        // Start past the first byte: the caller checked `is_ident_start`, and a start
+        // character need not also continue one. `$` is that case; scanning from `start`
+        // consumed nothing, so the outer loop spun forever.
         let mut i = start + 1;
         while i < self.src.len() && is_ident_char(self.at(i)) {
             i += 1;
@@ -630,8 +563,7 @@ impl<'a> Lexer<'a> {
         core::str::from_utf8(&self.src[start..i]).unwrap_or("")
     }
 
-    /// `"…"` with backslash escapes. No interpolation — §8d rejected it, so a string
-    /// literal never becomes a recursive parse.
+    /// `"…"` with backslash escapes. No interpolation (§8d).
     fn scan_string(&mut self, start: usize) -> Result<Tok> {
         let mut out = String::new();
         let mut i = start + 1;
@@ -685,7 +617,6 @@ impl<'a> Lexer<'a> {
                     i += 2;
                 }
                 b'\\' => {
-                    // Every other escape is the regex engine's to interpret, not ours.
                     out.push('\\');
                     out.push(self.at(i + 1) as char);
                     i += 2;
@@ -700,11 +631,9 @@ impl<'a> Lexer<'a> {
 
     /// Integers (decimal, `0x`, `0b`) and floats, with `_` separators stripped (§8e).
     ///
-    /// No leading-zero octal: `010` is ten, deliberately, because a silent `010 == 8` is
-    /// a well-known C footgun and §8e rejects it outright.
+    /// No leading-zero octal: `010` is ten; a silent `010 == 8` is a C footgun (§8e).
     fn scan_number(&mut self, start: usize) -> Result<Tok> {
         let mut i = start;
-        // Radix prefixes.
         if self.at(i) == b'0' && matches!(self.at(i + 1), b'x' | b'X' | b'b' | b'B') {
             let radix: u32 = if matches!(self.at(i + 1), b'x' | b'X') { 16 } else { 2 };
             i += 2;
@@ -786,16 +715,10 @@ impl<'a> Lexer<'a> {
     }
 }
 
-// --- character classes ------------------------------------------------------
-
 /// What may begin an identifier.
 ///
-/// `$` is included so the REPL's own bindings — `$last` (§11d) and `$env` — are nameable
-/// from source at all. Part F bound `$last` and nothing could refer to it, because the
-/// lexer had no way to produce that token: a silent dead end rather than an error.
-///
-/// It is deliberately *only* a start character, so `a$b` is not one identifier and `$` has
-/// no meaning mid-word. Nothing else in the grammar uses it.
+/// `$` is included so the REPL's own bindings, `$last` (§11d) and `$env`, are nameable.
+/// It is *only* a start character, so `a$b` is not one identifier.
 fn is_ident_start(c: u8) -> bool {
     c.is_ascii_alphabetic() || c == b'_' || c == b'$'
 }
@@ -806,41 +729,32 @@ fn is_ident_char(c: u8) -> bool {
 
 /// What may follow a leading `/` for it to be a path rather than division.
 ///
-/// **Expression mode only, and narrower than [`is_word_char`].** It answers one question at
-/// one place — is this `/` a path or a division sign — and is not the general "what is a
-/// word" rule. Completion used it for that and got a word boundary the lexer does not
-/// share: `+` fails this test, so `cd my+not` was cut into `my+` and `not`, and Tab
-/// completed the tail into a path nobody typed (PR #291 review, 2).
+/// **Expression mode only, and narrower than [`is_word_char`]**: it is not the general
+/// "what is a word" rule. Completion once used it as one and cut `cd my+not` into `my+` and
+/// `not`, completing the tail into a path nobody typed.
 fn is_path_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'/')
 }
 
 /// What continues a bareword. Ends at whitespace and at the structure that can close an
-/// argument list — everything else, operators included, is ordinary text in a word.
+/// argument list; operators are ordinary text.
 ///
-/// **Also what [`crate::complete`] takes as the extent of the word under the cursor**, and
-/// shared rather than copied because it is genuinely the same question: an argument is
-/// lexed in word mode, so this is the run the shell will read as one token. A completion
-/// that cut the word anywhere else would either offer to finish something the lexer then
-/// reads as two tokens, or — the way round it actually failed — splice a candidate into the
-/// middle of a word the person had typed.
+/// **Also the extent of the word under the cursor for [`crate::complete`]**, shared
+/// because it is the same question: cutting the word anywhere else would splice a
+/// candidate into the middle of a word the lexer reads as one token.
 pub(crate) fn is_word_char(c: u8) -> bool {
     !matches!(c, 0 | b' ' | b'\t' | b'\r' | b'\n' | b'|' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"')
 }
 
-/// Whether `s` begins with `kw` as a whole word.
 fn starts_keyword(s: &[u8], kw: &[u8]) -> bool {
     s.len() >= kw.len() && &s[..kw.len()] == kw && (s.len() == kw.len() || !is_ident_char(s[kw.len()]))
 }
 
 /// The language's keywords, and the token each becomes.
 ///
-/// **One table rather than a `match` plus a list of names**, because there are two consumers
-/// now: the lexer, which turns a word into a token, and completion, which offers the words.
-/// A `match` cannot be enumerated, so the second consumer would have been a hand-copied list
-/// — and the failure of a stale copy is silent, a keyword that simply never appears when you
-/// press Tab. Linear scan over 27 entries, on the same reasoning `Interp`'s scopes use: at
-/// this size it beats hashing, and identifiers are lexed one line at a time here.
+/// **One table rather than a `match` plus a list of names**: completion also offers these
+/// words, a `match` cannot be enumerated, and a hand-copied list goes stale silently. A
+/// linear scan over 27 entries beats hashing at this size.
 pub(crate) const KEYWORDS: &[(&str, Tok)] = &[
     ("let", Tok::Let),
     ("mut", Tok::Mut),
@@ -878,8 +792,6 @@ fn keyword_or_ident(w: &str) -> Tok {
     }
 }
 
-// --- numeric conversion (no `std`, so these are hand-rolled) ----------------
-
 fn parse_i64(s: &str) -> Option<i64> {
     let mut v: i64 = 0;
     for c in s.bytes() {
@@ -892,9 +804,7 @@ fn parse_i64(s: &str) -> Option<i64> {
 /// Decimal float parsing, sufficient for source literals.
 ///
 /// Scales an integer mantissa by a power of ten rather than accumulating digit by digit
-/// in floating point: `0.1` and `1.5` come out as the nearest `f64` to the written value,
-/// which digit-wise accumulation does not guarantee. The same integer-scaling reasoning
-/// as `coreutils::time::parse_duration`.
+/// in floating point, so `0.1` and `1.5` come out as the nearest `f64` to what was written.
 fn parse_f64(s: &str) -> Option<f64> {
     let b = s.as_bytes();
     let mut i = 0;
@@ -940,10 +850,8 @@ fn parse_f64(s: &str) -> Option<f64> {
     if i != b.len() {
         return None;
     }
-    // Divide by an exact power of ten rather than multiplying by its reciprocal: `1/1000`
-    // is not representable, so `2675 * 0.001` is not `2.675`, while `2675.0 / 1000.0` is
-    // correctly rounded. Same reasoning as scaling `parse_duration`'s fractions as
-    // integers — do the exact operation, not the convenient one.
+    // Divide by an exact power of ten rather than multiplying by its reciprocal: `2675 *
+    // 0.001` is not `2.675`, while `2675.0 / 1000.0` is correctly rounded.
     Some(if scale < 0 { mantissa as f64 / pow10(-scale) } else { mantissa as f64 * pow10(scale) })
 }
 
@@ -978,15 +886,12 @@ mod tests {
         assert_eq!(toks("1_000_000"), vec![Tok::Int(1_000_000), Tok::Eof]);
         assert_eq!(toks("0xff"), vec![Tok::Int(255), Tok::Eof]);
         assert_eq!(toks("0b1010"), vec![Tok::Int(10), Tok::Eof]);
-        // No leading-zero octal: §8e rejects the C footgun explicitly.
         assert_eq!(toks("010"), vec![Tok::Int(10), Tok::Eof]);
         assert_eq!(toks("1.5"), vec![Tok::Float(1.5), Tok::Eof]);
         assert_eq!(toks("1e3"), vec![Tok::Float(1000.0), Tok::Eof]);
         assert_eq!(toks("1.5e-2"), vec![Tok::Float(0.015), Tok::Eof]);
     }
 
-    /// `1..5` must be a range, not `1.` followed by `.5`. A float needs a digit after
-    /// the dot, which is what keeps `x.field` safe too.
     #[test]
     fn a_dot_only_starts_a_float_before_a_digit() {
         assert_eq!(toks("1..5"), vec![Tok::Int(1), Tok::DotDot, Tok::Int(5), Tok::Eof]);
@@ -1006,29 +911,22 @@ mod tests {
         assert_eq!(toks("||"), vec![Tok::OrOr, Tok::Eof]);
     }
 
-    // --- D3: paths and regexes both begin with `/` --------------------------
-
     #[test]
     fn a_leading_slash_is_a_path_not_division() {
         assert_eq!(toks("/system"), vec![Tok::Word("/system".into()), Tok::Eof]);
         assert_eq!(toks("./data.csv"), vec![Tok::Word("./data.csv".into()), Tok::Eof]);
         assert_eq!(toks("../x"), vec![Tok::Word("../x".into()), Tok::Eof]);
-        // …but a `/` with a left operand is still division.
         assert_eq!(toks("a / b"), vec![Tok::Ident("a".into()), Tok::Slash, Tok::Ident("b".into()), Tok::Eof]);
     }
 
-    /// The rule that makes D3 decidable: a regex is lexed only after `~=`.
     #[test]
     fn a_regex_literal_needs_the_match_operator_before_it() {
         assert_eq!(
             toks("name ~= /\\.rs$/"),
             vec![Tok::Ident("name".into()), Tok::Match_, Tok::Regex("\\.rs$".into()), Tok::Eof]
         );
-        // Without `~=` the same text is a path — which is the whole point of the rule.
         assert!(matches!(toks("/x/")[0], Tok::Word(_)));
     }
-
-    // --- D1: the two modes --------------------------------------------------
 
     #[test]
     fn word_mode_reads_arguments_that_expression_mode_would_mangle() {
@@ -1039,9 +937,6 @@ mod tests {
         assert_eq!(lx.bump(Mode::Word).unwrap().tok, Tok::Eof);
     }
 
-    /// The same source, read in the other mode, is a different token stream. This is the
-    /// concrete statement of D1: `README.md` is a filename or a field access, and only
-    /// the parser knows which.
     #[test]
     fn the_same_text_lexes_differently_per_mode() {
         assert_eq!(toks("README.md"), vec![Tok::Ident("README".into()), Tok::Dot, Tok::Ident("md".into()), Tok::Eof]);
@@ -1049,36 +944,28 @@ mod tests {
         assert_eq!(lx.bump(Mode::Word).unwrap().tok, Tok::Word("README.md".into()));
     }
 
-    /// Peeking in one mode must not commit the token: the parser decides the mode only
-    /// after it has seen the head, so a re-read in the other mode has to be exact.
     #[test]
     fn a_peeked_token_is_relexed_when_the_mode_changes() {
         let mut lx = Lexer::new("size > 1000");
         assert_eq!(lx.peek(Mode::Word).unwrap().tok, Tok::Word("size".into()));
         assert_eq!(lx.peek(Mode::Expr).unwrap().tok, Tok::Ident("size".into()));
-        // …and consuming it now consumes exactly one token, not two.
         assert_eq!(lx.bump(Mode::Expr).unwrap().tok, Tok::Ident("size".into()));
         assert_eq!(lx.bump(Mode::Expr).unwrap().tok, Tok::Gt);
         assert_eq!(lx.bump(Mode::Expr).unwrap().tok, Tok::Int(1000));
     }
 
-    /// A bareword swallows operator characters. `a+b` is one argument, not three tokens.
     #[test]
     fn word_mode_does_not_split_on_operators() {
         let mut lx = Lexer::new("a+b*c");
         assert_eq!(lx.bump(Mode::Word).unwrap().tok, Tok::Word("a+b*c".into()));
     }
 
-    /// …but structure that could *end* the argument list stays visible, or `list x | wc`
-    /// would swallow its own pipe.
     #[test]
     fn word_mode_still_sees_the_pipe() {
         let mut lx = Lexer::new("x | wc");
         assert_eq!(lx.bump(Mode::Word).unwrap().tok, Tok::Word("x".into()));
         assert_eq!(lx.bump(Mode::Word).unwrap().tok, Tok::Pipe);
     }
-
-    // --- D2: newlines -------------------------------------------------------
 
     #[test]
     fn a_newline_ends_a_statement() {
@@ -1091,15 +978,13 @@ mod tests {
         assert_eq!(toks("a +\nb"), vec![Tok::Ident("a".into()), Tok::Plus, Tok::Ident("b".into()), Tok::Eof]);
     }
 
-    /// §11b asserts that a whole script parses leading-`|` style unambiguously without
-    /// saying why. This is why: the lexer looks past the newline for a `|`.
+    /// §11b's leading-`|` style: the lexer looks past the newline for a `|`.
     #[test]
     fn a_leading_pipe_on_the_next_line_continues_the_previous_one() {
         assert_eq!(
             toks("ls\n  | filter"),
             vec![Tok::Ident("ls".into()), Tok::Pipe, Tok::Ident("filter".into()), Tok::Eof]
         );
-        // Even across a comment and a blank line.
         assert_eq!(
             toks("ls\n  # why\n\n  | filter"),
             vec![Tok::Ident("ls".into()), Tok::Pipe, Tok::Ident("filter".into()), Tok::Eof]
@@ -1112,7 +997,6 @@ mod tests {
         assert_eq!(t, vec![Tok::RBrace, Tok::Else, Tok::Eof]);
         let t = toks("}\ncatch");
         assert_eq!(t, vec![Tok::RBrace, Tok::Catch, Tok::Eof]);
-        // But an identifier that merely *starts* with `else` is not the keyword.
         assert_eq!(toks("}\nelsewhere"), vec![Tok::RBrace, Tok::Newline, Tok::Ident("elsewhere".into()), Tok::Eof]);
     }
 
@@ -1122,15 +1006,12 @@ mod tests {
             toks("(a\nb)"),
             vec![Tok::LParen, Tok::Ident("a".into()), Tok::Ident("b".into()), Tok::RParen, Tok::Eof]
         );
-        // A block's statements need their separators.
         assert_eq!(
             toks("{a\nb}"),
             vec![Tok::LBrace, Tok::Ident("a".into()), Tok::Newline, Tok::Ident("b".into()), Tok::RBrace, Tok::Eof]
         );
     }
 
-    /// A multi-line record literal works without a brace rule, because the newline
-    /// follows a comma.
     #[test]
     fn a_trailing_comma_carries_a_record_across_lines() {
         assert_eq!(
@@ -1156,12 +1037,9 @@ mod tests {
         assert_eq!(toks("\n\n\na"), vec![Tok::Ident("a".into()), Tok::Eof]);
     }
 
-    // --- strings ------------------------------------------------------------
-
     #[test]
     fn strings_escape_but_never_interpolate() {
         assert_eq!(toks(r#""a\nb""#), vec![Tok::Str("a\nb".into()), Tok::Eof]);
-        // §8d: no interpolation, so braces inside a string are just characters.
         assert_eq!(toks(r#""hello {}""#), vec![Tok::Str("hello {}".into()), Tok::Eof]);
     }
 
@@ -1178,12 +1056,10 @@ mod tests {
         assert!(Lexer::tokenize_expr("0x").is_err());
     }
 
-    /// §11d writes `$last`, so it has to lex. Part F bound it and nothing could name it.
     #[test]
     fn a_dollar_may_begin_an_identifier() {
         assert_eq!(toks("$last"), vec![Tok::Ident("$last".into()), Tok::Eof]);
         assert_eq!(toks("$env.PWD"), vec![Tok::Ident("$env".into()), Tok::Dot, Tok::Ident("PWD".into()), Tok::Eof]);
-        // …but only at the start: `a$b` is not one name.
         assert_eq!(toks("a$b"), vec![Tok::Ident("a".into()), Tok::Ident("$b".into()), Tok::Eof]);
     }
 
@@ -1194,8 +1070,6 @@ mod tests {
         assert_eq!(toks("_"), vec![Tok::Underscore, Tok::Eof]);
     }
 
-    /// Floats are scaled from an integer mantissa, so a literal is the nearest `f64` to
-    /// what was written rather than an accumulation of rounding steps.
     #[test]
     fn float_literals_are_exact_to_the_written_value() {
         assert_eq!(toks("0.1"), vec![Tok::Float(0.1), Tok::Eof]);
@@ -1203,17 +1077,12 @@ mod tests {
         assert_eq!(toks("1_000.5"), vec![Tok::Float(1000.5), Tok::Eof]);
     }
 
-    /// **A token that consumes nothing is a hang, not a wrong answer.**
-    ///
-    /// `]`, `)` and `}` are structural in word mode; their openers were not, so
-    /// `scan_bareword` at `[` scanned zero characters and left `pos` where it was — and
-    /// the caller bumped that empty `Word` forever. `list [x]` locked the shell up, on a
-    /// path that had nothing to do with the feature that finally surfaced it.
+    /// **A token that consumes nothing is a hang, not a wrong answer.** `scan_bareword` at
+    /// `[` scanned zero characters, and the caller bumped that empty `Word` forever.
     #[test]
     fn a_bareword_that_scans_nothing_is_an_error_not_an_empty_token() {
         let mut lx = Lexer::new("[x]");
         assert!(lx.bump(Mode::Word).is_err(), "an empty word means no progress");
-        // The characters that *do* start a word still do.
         let mut lx = Lexer::new("file[1].txt");
         assert_eq!(lx.bump(Mode::Word).unwrap().tok, Tok::Word("file".into()));
     }
