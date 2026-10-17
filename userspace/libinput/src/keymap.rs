@@ -1,25 +1,11 @@
-//! Keycode + modifiers → text. The **US layout**, and the reason a layout is not in the
-//! kernel.
-//!
-//! `display-substrate.md` §5: "A keymap is *policy and data* — layout, locale, dead keys,
-//! compose sequences. It has no business in the kernel, and putting it there would make a
-//! keyboard layout a kernel rebuild." Putting one copy per application instead would be the
-//! same mistake one layer up, which is why this sits in a library both ends can use.
-//!
-//! ## What this is not
-//!
-//! Not an input method. No dead keys, no compose sequences, no locale — those are the reasons
-//! the boundary is *here* rather than in the kernel, and they get built when something needs
-//! them. What exists is enough to type into a terminal, which is Milestone 5's requirement.
+//! Keycode + modifiers → text, for the US layout. A layout is policy and data
+//! (`display-substrate.md` §5), so it lives here and not in the kernel. No dead keys, compose
+//! sequences or locale.
 
 use librsproto::surface::{LOCK_CAPS, LOCK_NUM, MOD_CTRL, MOD_SHIFT};
 
-/// The printable keys of the US layout, as `(keycode, unshifted, shifted)`.
-///
-/// Only the keycodes that produce characters. Anything absent — function keys, arrows,
-/// modifiers themselves — yields `None`, which is not the same as producing nothing: a caller
-/// that wants "the user pressed Home" reads the keycode, and a caller that wants text asks
-/// here and gets told there is none.
+/// The printable keys of the US layout, as `(keycode, unshifted, shifted)`; absent keycodes
+/// yield `None`.
 const US: &[(u16, u8, u8)] = &[
     (2, b'1', b'!'),
     (3, b'2', b'@'),
@@ -73,8 +59,8 @@ const US: &[(u16, u8, u8)] = &[
     (57, b' ', b' '),
 ];
 
-/// **The keypad's digits and point**, text when Num Lock is on (Phase 6 Part B.5). With it off the
-/// interpreter delivers them as the navigation keys they stand for, so they never reach here.
+/// The keypad's digits and point, text when Num Lock is on. With it off the interpreter delivers
+/// them as navigation keys, so they never reach here.
 const KEYPAD_NUM: &[(u16, u8)] = &[
     (71, b'7'),
     (72, b'8'),
@@ -89,19 +75,15 @@ const KEYPAD_NUM: &[(u16, u8)] = &[
     (83, b'.'),
 ];
 
-/// **The keypad's operators**: text whatever Num Lock says, and folded by nothing.
+/// The keypad's operators: text whatever Num Lock says, and folded by nothing.
 const KEYPAD_OPS: &[(u16, u8)] = &[(98, b'/'), (55, b'*'), (74, b'-'), (78, b'+')];
 
-/// **The character a keycode produces under `modifiers` and `locks`**, if any (Phase 6 Part
-/// B.5) — `KeyEvent::locks`, which the compositor carries beside the modifiers rather than in them.
+/// The character a keycode produces under `modifiers` and `locks` (`KeyEvent::locks`), if any.
 ///
-/// - **Caps Lock gives a letter its other case**, which Shift then reverses, and touches nothing
-///   else: `1` stays `1`.
-/// - **Num Lock makes the keypad's digits and point text**; its operators are text either way.
-/// - **Control folds to the C0 range**, so Ctrl-C is `0x03` — the convention every terminal
-///   expects, and the reason the shell can tell Ctrl-C from the letter `c` at all. Only letters
-///   fold; `Ctrl-1` has no C0 meaning and yields the unmodified character rather than
-///   something invented.
+/// - Caps Lock gives a letter its other case, which Shift reverses; it touches nothing else.
+/// - Num Lock makes the keypad's digits and point text; its operators are text either way.
+/// - Control folds a letter to the C0 range, so Ctrl-C is `0x03`. A non-letter yields its
+///   unmodified character: `Ctrl-1` has no C0 meaning.
 pub fn text(keycode: u16, modifiers: u16, locks: u16) -> Option<u8> {
     if let Some(&(_, c)) = KEYPAD_OPS.iter().find(|(k, _)| *k == keycode) {
         return Some(c);
@@ -123,17 +105,12 @@ pub fn text(keycode: u16, modifiers: u16, locks: u16) -> Option<u8> {
     Some(base)
 }
 
-/// The character a keycode produces under `modifiers`, with **no lock on**: [`text`] without
-/// Caps Lock or Num Lock. For callers that have no `KeyEvent` to read locks from — a key a test
-/// names — since every key a window receives carries its locks.
+/// [`text`] with no lock on, for callers with no `KeyEvent` to read locks from.
 pub fn to_char(keycode: u16, modifiers: u16) -> Option<u8> {
     text(keycode, modifiers, 0)
 }
 
 /// Whether a keycode produces text at all.
-///
-/// Cheaper than [`to_char`] when the answer is all a caller wants, and clearer at a call
-/// site than comparing against `None`.
 pub fn is_text(keycode: u16) -> bool {
     US.iter().any(|(k, _, _)| *k == keycode) || KEYPAD_NUM.iter().chain(KEYPAD_OPS).any(|(k, _)| *k == keycode)
 }
@@ -153,8 +130,6 @@ mod tests {
 
     #[test]
     fn shifted_digits_are_symbols_not_uppercase_digits() {
-        // The case a naive `to_ascii_uppercase` gets wrong: shift-1 is `!`, and `1` has no
-        // uppercase. A table is why this is right rather than a lucky transformation.
         assert_eq!(to_char(2, 0), Some(b'1'));
         assert_eq!(to_char(2, MOD_SHIFT), Some(b'!'));
         assert_eq!(to_char(11, MOD_SHIFT), Some(b')'));
@@ -163,8 +138,6 @@ mod tests {
 
     #[test]
     fn control_folds_letters_to_the_c0_range() {
-        // Ctrl-C is 0x03, which is how a shell tells it from the letter `c` — the whole
-        // reason a byte stream needed modifiers in the first place.
         assert_eq!(to_char(46, MOD_CTRL), Some(0x03), "ctrl-c");
         assert_eq!(to_char(30, MOD_CTRL), Some(0x01), "ctrl-a");
         assert_eq!(to_char(44, MOD_CTRL), Some(0x1A), "ctrl-z");
@@ -172,22 +145,18 @@ mod tests {
 
     #[test]
     fn control_folds_from_either_case() {
-        // Ctrl-Shift-C is still 0x03: the fold is about the letter, not its case.
         assert_eq!(to_char(46, MOD_CTRL | MOD_SHIFT), Some(0x03));
     }
 
     #[test]
     fn control_on_a_non_letter_is_not_invented() {
-        // `Ctrl-1` has no C0 meaning; returning the character beats returning a made-up
-        // control code that some consumer would then have to special-case back out.
         assert_eq!(to_char(2, MOD_CTRL), Some(b'1'));
         assert_eq!(to_char(53, MOD_CTRL), Some(b'/'));
     }
 
     #[test]
     fn keys_with_no_text_report_none_rather_than_a_placeholder() {
-        // Escape, F1, the modifiers themselves. A caller wanting "the user pressed Home"
-        // reads the keycode; a caller wanting text is told there is none.
+        // Escape, F1, the modifiers themselves.
         for k in [1u16, 59, 42, 29, 103] {
             assert_eq!(to_char(k, 0), None, "keycode {k} produces no text");
             assert!(!is_text(k));
@@ -196,8 +165,7 @@ mod tests {
 
     #[test]
     fn alt_and_meta_do_not_change_the_character() {
-        // They are routing information — a hotkey, a menu mnemonic — not text. Folding them
-        // into bytes is what makes Alt-F indistinguishable from a stray `f`.
+        // Routing information (a hotkey), not text: folded into bytes, Alt-F would read as `f`.
         assert_eq!(to_char(33, MOD_ALT), Some(b'f'));
         assert_eq!(to_char(33, MOD_META), Some(b'f'));
         assert_eq!(to_char(33, MOD_ALT | MOD_SHIFT), Some(b'F'));
@@ -213,16 +181,13 @@ mod tests {
 
     #[test]
     fn the_table_has_no_duplicate_keycodes() {
-        // A duplicate makes one entry unreachable and is invisible at a glance in a
-        // fifty-row table.
         for (i, &(k, _, _)) in US.iter().enumerate() {
             for &(k2, _, _) in &US[i + 1..] {
                 assert_ne!(k, k2, "keycode {k} appears twice");
             }
         }
     }
-    /// **Caps Lock gives a letter its other case, and Shift reverses it** (Phase 6 Part B.5); it
-    /// touches nothing that is not a letter, and Control still folds.
+
     #[test]
     fn caps_lock_inverts_a_letters_case_alone() {
         assert_eq!(text(30, 0, LOCK_CAPS), Some(b'A'));
@@ -234,8 +199,6 @@ mod tests {
         assert_eq!(text(30, 0, 0), to_char(30, 0), "no lock is to_char");
     }
 
-    /// **The keypad**: digits and the point with Num Lock on and none with it off, the operators
-    /// either way, and none of it Shift's or Caps Lock's.
     #[test]
     fn the_keypad_is_text_under_num_lock() {
         let num = LOCK_NUM;
