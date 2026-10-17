@@ -1,59 +1,43 @@
 //! `disk` — the machine's disks: what each holds, and mounting and unmounting what it can serve.
 //!
-//! ```text
-//! disk --list                        # every block device, its filesystem, where it is mounted
-//! disk --mount /dev/blk/1 [LABEL]    # mount it writable at /storage/<label>
-//! disk --unmount LABEL               # unmount it, leaving the filesystem clean
-//! disk --eject NAME                  # unmount the stick holding /storage/<name>, to pull it
-//! disk --partition DISK [--mbr|--gpt] # one partition spanning a removable disk
-//! disk --format DEVICE fat|ext4 [LABEL] [--mbr|--gpt]  # a filesystem; on a disk, a table first
-//! ```
-//!
 //! ## Two endpoints, two authorities
 //!
 //! **`--list` reads what every session can**: `/dev/storage/all.tsm`, the storage service's
-//! table, through the session endpoint every login binds (administration Part C.6). It needs no
-//! grant, and it is the same table a pipeline can `open` and `filter`.
+//! table, through the session endpoint every login binds. It needs no grant.
 //!
-//! **So does `--eject`** (Phase 6 Part F): a **media session**, `/dev/storage/media` on the same
-//! endpoint, carries `Eject` by the name a stick is mounted under — the table's `mounted` column,
-//! not its `label`. The service runs the unmount chain on **every** filesystem it mounted on that
+//! **So does `--eject`**: a **media session**, `/dev/storage/media` on the same endpoint,
+//! carries `Eject` by the name a stick is mounted under — the table's `mounted` column, not its
+//! `label`. The service runs the unmount chain on **every** filesystem it mounted on that
 //! removable drive, or on none, since a stick is pulled whole; an internal disk's is refused,
 //! naming `--unmount`, which still needs the grant.
 //!
 //! **`--mount` and `--unmount` need the `storage` grant.** They speak `Storage`
 //! (`rsproto-storage-ops.md`) on `/dev/storage/admin`, which the view broker binds only into a
-//! view whose profile grants `storage`. Without it that path reaches the session endpoint instead,
-//! at the base `/info`, where `admin` is no table and nothing answers: `disk` says so and names
-//! `with`. **The service does the refusing that matters** — a device in use, one holding nothing it
-//! can serve, a label taken, a file still open — and its reason is printed as it gave it.
+//! view whose profile grants `storage`. Without it that path reaches the session endpoint
+//! instead, where nothing answers: `disk` says so and names `with`. **The service does the
+//! refusing that matters** — a device in use, one holding nothing it can serve, a label taken, a
+//! file still open — and its reason is printed as it gave it.
 //!
-//! ## Partitioning and formatting (Phase 6 Part G)
+//! ## Partitioning and formatting
 //!
 //! **`--partition` and `--format` write the device themselves**, through the raw device the
-//! `disks` grant gives (`/dev/blk/<n>`), as `nxinstall` does: the long writes stay out of the
-//! storage service, which is one thread. Then they ask the service, on the admin session, to
-//! **read the device again** (`Reread`): it mounts what it finds by the rules a device arriving
-//! meets, and a disk's table is read again by the kernel, whose new partition arrives as a stick's
-//! does. So **both grants are needed**: `with admin`.
+//! `disks` grant gives (`/dev/blk/<n>`): the long writes stay out of the storage service, which
+//! is one thread. Then they ask it to **read the device again** (`Reread`), so **both grants are
+//! needed**: `with admin`.
 //!
 //! **Everything is decided before a byte is written** (`coreutils::format`): the disk the machine
 //! started from is refused, the target or its disk, by `/dev/devices`' `boot` flag; a table goes
 //! only on a removable disk; the default table follows the filesystem, an MBR for FAT and a GPT for
 //! ext4, and a GPT for either from 2 TiB; the filesystem fits its partition; the label fits the
 //! filesystem; and the kernel's entropy answers, for the IDs. **A mounted device is never
-//! written**: it is refused here by name, and the grant would not hold it anyway — unmount it,
-//! format it, and the service mounts it again.
+//! written**: it is refused here by name, and the grant would not hold it anyway.
 //!
 //! **For a disk, `disk` waits for the new partition's row** on a watch, bounded: after `--format`
 //! mounted, or saying why not; after `--partition`, holding nothing, and named `blk-<n>` for the
 //! `--format` that follows.
 //!
-//! ## A typed result, and a line on the console
-//!
-//! Each verb writes a table on stdout, text when there is none, like every `--list` here. And
-//! each says what happened on the console too, since a terminal on a release image renders
-//! nothing a gate can read.
+//! Each verb writes a table on stdout, text when there is none, and says what happened on the
+//! console too, since a terminal on a release image renders nothing a gate can read.
 
 #![no_std]
 #![no_main]
@@ -81,17 +65,13 @@ use libstream::table::TableWriter;
 use libstream::wire::Table;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: the TSM1 encoder and decoder allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The table of what each disk holds, through the session endpoint.
 const TABLE: &[u8] = b"/dev/storage/all.tsm";
-/// Where the `storage` grant binds the admin endpoint.
 const ADMIN: &[u8] = b"/dev/storage/admin";
-/// A media session, through the session endpoint (Phase 6 Part F).
 const MEDIA: &[u8] = b"/dev/storage/media";
-/// A watch, through the session endpoint (Phase 6 Part F): pinged when the mounts or the devices
+/// A watch, through the session endpoint: pinged when the mounts or the devices
 /// change.
 const WATCH: &[u8] = b"/dev/storage/watch";
 /// `/dev/devices`' table: what each block device is, its disk, its driver, and the boot flag.
@@ -182,11 +162,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(code)
 }
 
-/// Say `text` where the person reads it and on the console, where a gate does.
-///
-/// **Once on the console, and escaped there.** Without a `stderr`, `diag` is the console already.
-/// The console's copy goes through [`Line::untrusted`], since it carries a label someone typed and
-/// the service's reason.
+/// Say `text` where the person reads it and on the console, where a gate does; the console's
+/// copy is escaped by [`Line::untrusted`], since it carries a label someone typed.
 fn say(stage: &Stage, text: &str) {
     if stage.streams.stderr.is_some() {
         stage.diag(text.as_bytes());
@@ -194,7 +171,6 @@ fn say(stage: &Stage, text: &str) {
     Line::new().untrusted(text.trim_end_matches('\n').as_bytes()).end();
 }
 
-/// `disk --list`: the storage service's table, as it gave it.
 fn list(stage: &Stage) -> i64 {
     let table = match libfs::read_file(stage.namespace, TABLE).ok().and_then(|b| Table::decode(&b).ok()) {
         Some(t) => t,
@@ -224,7 +200,6 @@ fn list(stage: &Stage) -> i64 {
     EXIT_OK
 }
 
-/// A value as a table cell's text.
 fn cell(v: &Value) -> String {
     match v {
         Value::Null => String::from("-"),
@@ -235,7 +210,6 @@ fn cell(v: &Value) -> String {
     }
 }
 
-/// Write `rows` under `schema` on the stdout stream.
 fn write_table(stage: &Stage, stdout: u64, schema: &Schema, rows: &[Vec<Value>]) {
     let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, schema).and_then(|()| {
@@ -250,7 +224,6 @@ fn write_table(stage: &Stage, stdout: u64, schema: &Schema, rows: &[Vec<Value>])
     }
 }
 
-/// A device operand as the tables name it: `blk-<n>`, from `/dev/blk/<n>` or as given.
 fn device_name(operand: &str) -> Option<String> {
     let n = operand.strip_prefix("/dev/blk/").or_else(|| operand.strip_prefix("blk-"))?;
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("blk-{n}"))
@@ -263,20 +236,15 @@ enum Failure {
     /// The endpoint is here and opened no session, for this reason: every session of the kind in
     /// use is `WouldBlock`.
     Unopened(KError),
-    /// The session broke, or its reply did not parse.
     Transport,
-    /// The service refused, with its reason.
     Refused(String),
 }
 
-/// Open a session at `at` — an admin session on `/dev/storage/admin`, or a media session on
-/// `/dev/storage/media` — send one request, and return the reply's body.
+/// Open a session at `at` (admin or media), send one request, and return the reply's body.
 ///
-/// **No grant, told apart from a busy one.** Without the grant the admin path resolves through the
-/// session endpoint at the base `/info`, where `info/admin` is no table, or through nothing at all:
-/// `NotFound` either way. That is the one answer that means "not in a view with `storage`". Any
-/// other is the service's, and is printed as such: telling a person with the grant to go and get
-/// it is worse than saying nothing.
+/// **No grant, told apart from a busy one.** Without the grant the admin path resolves to no
+/// table, or to nothing: `NotFound` either way, the one answer that means "not in a view with
+/// `storage`". Any other is the service's, and is printed as such.
 fn ask(stage: &Stage, at: &[u8], op: u16, body: &[u8]) -> Result<Vec<u8>, Failure> {
     let (st, session) = libfs::lookup_wait(stage.namespace, at, librsproto::session::DIR_SESSION_RIGHTS);
     if st == KError::NotFound.as_i32() {
@@ -304,7 +272,6 @@ fn ask(stage: &Stage, at: &[u8], op: u16, body: &[u8]) -> Result<Vec<u8>, Failur
     Ok(msg.body.to_vec())
 }
 
-/// Report a failed request about `what`, and return the exit status for it.
 fn failed(stage: &Stage, verb: &str, what: &str, f: Failure) -> i64 {
     let text = match f {
         Failure::NotHere if verb == "eject" => {
@@ -327,7 +294,6 @@ fn failed(stage: &Stage, verb: &str, what: &str, f: Failure) -> i64 {
     EXIT_FAILURE
 }
 
-/// `disk --mount DEVICE [LABEL]`.
 fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
     let Some(device) = device_name(operand) else {
         say(stage, "disk: a device is /dev/blk/N or blk-N\n");
@@ -359,7 +325,6 @@ fn mount(stage: &Stage, operand: &str, label: &str) -> i64 {
     EXIT_OK
 }
 
-/// `disk --unmount LABEL`.
 fn unmount(stage: &Stage, label: &str) -> i64 {
     if let Err(f) = ask(stage, ADMIN, OP_STORAGE_UNMOUNT, label.as_bytes()) {
         return failed(stage, "unmount", label, f);
@@ -382,7 +347,7 @@ fn unmount(stage: &Stage, label: &str) -> i64 {
 }
 
 /// `disk --eject NAME`: a media session's `Eject`, answered once the stick can be pulled. `NAME`
-/// may be given as its path, `/storage/NAME`, as `--list` shows it.
+/// may be `/storage/NAME`, as `--list` shows it.
 ///
 /// **The drive goes whole**: the service unmounts every filesystem it mounted on the same stick,
 /// and answers with their names, a row each — two partitions are two rows, whichever was named.
@@ -415,7 +380,6 @@ fn eject(stage: &Stage, name: &str) -> i64 {
     EXIT_OK
 }
 
-/// `disk --format DEVICE FS [LABEL]`: [`write`], with the filesystem named.
 fn format_device(stage: &Stage, device: &str, fs: &str, label: Option<&str>, mbr: bool, gpt: bool) -> i64 {
     let Some(fs) = Fs::parse(fs) else {
         say(stage, "disk: a filesystem is fat or ext4\n");
@@ -424,7 +388,6 @@ fn format_device(stage: &Stage, device: &str, fs: &str, label: Option<&str>, mbr
     write(stage, device, Some(fs), label, mbr, gpt)
 }
 
-/// `/dev/devices`' rows, as [`format::target`] reads them; `None` if the table would not read.
 fn device_rows(ns: u64) -> Option<Vec<format::Row>> {
     let t = libfs::read_file(ns, DEVICES).ok().and_then(|b| Table::decode(&b).ok())?;
     let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
@@ -446,7 +409,6 @@ fn device_rows(ns: u64) -> Option<Vec<format::Row>> {
     )
 }
 
-/// One row of the storage service's table, as `--partition` and `--format` read it.
 struct Held {
     name: String,
     filesystem: Option<String>,
@@ -454,7 +416,6 @@ struct Held {
     note: Option<String>,
 }
 
-/// The storage service's table, as [`Held`] rows; `None` if it would not read.
 fn storage_rows(ns: u64) -> Option<Vec<Held>> {
     let t = libfs::read_file(ns, TABLE).ok().and_then(|b| Table::decode(&b).ok())?;
     let col = |name: &str| t.schema.fields.iter().position(|f| f.name == name);
@@ -474,7 +435,6 @@ fn storage_rows(ns: u64) -> Option<Vec<Held>> {
     )
 }
 
-/// **The device's own facts**, from its `info` leaf: its logical sector and how many.
 fn device_info(ns: u64, path: &str) -> Option<BlockDeviceInfo> {
     let leaf = format!("{path}/info");
     let (st, h) = libfs::lookup_wait(ns, leaf.as_bytes(), libkern::RIGHT_MAP_READ);
@@ -501,7 +461,6 @@ fn close(h: u64) {
     unsafe { libkern::syscall::syscall1(libkern::syscall::SYS_HANDLE_CLOSE, h) };
 }
 
-/// Seconds since the epoch, or 0 if the clock will not read.
 fn now_secs() -> i64 {
     let mut nanos: u64 = 0;
     // SAFETY: a valid writable `u64` out-param.
@@ -515,7 +474,6 @@ fn now_secs() -> i64 {
     if r < 0 { 0 } else { (nanos / 1_000_000_000) as i64 }
 }
 
-/// The monotonic clock, in nanoseconds.
 fn monotonic_ns() -> u64 {
     let mut now = 0u64;
     // SAFETY: a valid writable `u64` out-param.
@@ -529,7 +487,6 @@ fn monotonic_ns() -> u64 {
     now
 }
 
-/// **Have the drive write its cache to its medium**, and wait until it has.
 fn flush(device: u64) -> bool {
     let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
     // SAFETY: `device` is a block device handle with WRITE; `&op` is a valid `IoOp`.
@@ -581,7 +538,6 @@ fn wait_ping(watch: u64, deadline: u64) -> bool {
     }
 }
 
-/// Write `len` zero bytes at `at` through `io`, 64 KiB at a time.
 fn zero(io: &PartitionIo, at: u64, len: u64) -> Result<(), String> {
     let zeros = alloc::vec![0u8; 64 * 1024];
     let mut done = 0;
@@ -606,7 +562,6 @@ fn progress<'a>(stage: &'a Stage, what: &'static str) -> impl FnMut(u32, u32) + 
     }
 }
 
-/// The IDs a write needs, read from the kernel's entropy before anything is written.
 struct Ids {
     disk_id: u32,
     disk_guid: [u8; 16],
@@ -761,7 +716,6 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
             String::from("this view does not hold it: the disks grant withholds a device in use")
         });
     }
-    // **The device's own size and sector**, which are what is written by.
     let Some(info) = device_info(ns, &path) else {
         close(handle);
         return refuse("its info would not read");
@@ -812,7 +766,6 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
     };
     Line::new().s(b"disk: wrote ").s(name.as_bytes()).s(b" ").s(what.as_bytes()).end();
 
-    // **Read again**, then, for a disk, the new partition waited for.
     let mounted = match ask(stage, ADMIN, OP_STORAGE_REREAD, name.as_bytes()) {
         Ok(reply) => librsproto::storage::ejected_names(&reply)
             .map(|n| String::from_utf8_lossy(n).into_owned())
@@ -863,7 +816,6 @@ fn write(stage: &Stage, operand: &str, fs: Option<Fs>, label: Option<&str>, mbr:
     let at = held.as_ref().and_then(|h| h.mounted.clone()).or_else(|| mounted.first().map(|m| format!("/storage/{m}")));
     let note = held.as_ref().and_then(|h| h.note.clone());
     let holds = held.as_ref().and_then(|h| h.filesystem.clone());
-    // What became of it, in words: mounted, why not, or holding nothing.
     let outcome = match (&at, &note, &holds) {
         (Some(at), _, _) => format!("mounted at {at}"),
         (None, Some(note), _) => format!("not mounted: {note}"),

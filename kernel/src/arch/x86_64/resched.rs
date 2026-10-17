@@ -1,26 +1,15 @@
-//! x86_64 reschedule-IPI transport: the inter-processor interrupt one CPU sends
-//! to another to make it re-run the scheduler *now* — used when a thread is made
-//! runnable on a **remote** CPU (a cross-CPU wake, or a spawn/placement onto an
-//! otherwise-idle CPU). The coordination policy (who to poke, and what the target
-//! does with it) is architecture-neutral and lives in [`crate::sched`]; this module
-//! only knows how to *reach* another CPU, resolving its x2APIC id through the
-//! bring-up identity map ([`super::smp::apic_of_dense`]).
+//! x86_64 reschedule-IPI transport: reaches another CPU so it re-runs the scheduler *now*.
 //!
-//! Without this, a woken thread parked on an idle CPU's run queue would not run
-//! until that CPU's next periodic tick (a latency floor at best, and — since a
-//! halted vCPU's self-timer is not a dependable wake source — a lost wakeup at
-//! worst). The IPI makes cross-CPU wake delivery immediate and reliable: an
-//! incoming IPI resumes a halted CPU and drives the reschedule directly.
+//! Policy lives in [`crate::sched`]. Without the IPI a thread woken onto an idle CPU would wait
+//! for that CPU's next tick, and a halted vCPU's self-timer is not a dependable wake source.
 
-/// IPI vector for a remote reschedule. In the free range above the device-IRQ
-/// vectors (`0x30..=0x37`) and the TLB-shootdown vector (`0x40`), below the
-/// spurious vector (`0xFF`). A *returning* interrupt (EOI + `iretq`), like the
-/// timer and the shootdown IPI.
+/// IPI vector for a remote reschedule, between the shootdown vector (`0x40`) and the spurious
+/// vector (`0xFF`). A *returning* interrupt (EOI + `iretq`).
 pub const RESCHEDULE_VECTOR: u8 = 0x41;
 
-/// Send the reschedule IPI to the CPU with dense index `cpu`, resolving its
-/// x2APIC id through the bring-up identity map. No-op if `cpu` is out of range or
-/// unbound (a parked/unbound core runs no threads, so poking it is pointless).
+/// Send the reschedule IPI to the CPU with dense index `cpu`.
+///
+/// No-op if `cpu` is out of range or unbound: a parked core runs no threads.
 pub fn send_reschedule_ipi(cpu: usize) {
     if let Some(apic) = super::smp::apic_of_dense(cpu) {
         // SAFETY: ring-0; x2APIC is enabled on this CPU (reschedules are only sent

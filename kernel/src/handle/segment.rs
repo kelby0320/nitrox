@@ -1,30 +1,16 @@
 //! Per-segment storage and shuffled freelist initialisation.
 //!
-//! A segment is a fixed-size block of [`SEGMENT_LEN`] [`HandleEntry`]
-//! slots — exactly 256 KiB, one buddy order-6 block — pointed at by
-//! one entry of the handle table's directory. Per-segment metadata
-//! (`free_head`, `free_count`) lives in [`HandleTable::Inner`] rather
-//! than inline so the on-heap block is *exactly* the size the spec
-//! requires; otherwise the buddy allocator would round 256 KiB + a
-//! few u32s up to a 512 KiB block and waste half.
+//! A segment is [`SEGMENT_LEN`] [`HandleEntry`] slots, exactly 256 KiB (one
+//! buddy order-6 block), pointed at by one directory entry; its metadata lives
+//! in [`HandleTable::Inner`] since 256 KiB plus a few `u32`s would round up to a
+//! 512 KiB block.
 //!
-//! ## Shuffled freelist
-//!
-//! Segment construction performs a Fisher-Yates shuffle of the slot
-//! indices `0..SEGMENT_LEN` and threads them through the entries'
-//! `free_next` fields, so successive allocations from a fresh segment
-//! return slot indices in a pseudo-random order. Combined with the
-//! 32-bit generation counter and the owner-PID check, this means the
-//! low 20 bits of a freshly-issued handle reveal nothing about other
-//! handles in the same segment.
-//!
-//! The Fisher-Yates pass uses a 16 KiB scratch buffer (one `u32` per
-//! slot) which is itself allocated from the buddy via `kmalloc`/
-//! `large_alloc`, then freed before this function returns. Sticking
-//! the permutation in the entries' `free_next` fields and then
-//! converting in-place would be marginally cheaper but fragile —
-//! consecutive in-place rewrites would clobber the permutation
-//! values they still need to read.
+//! Construction Fisher-Yates shuffles the slot indices through the entries'
+//! `free_next`, so a fresh segment hands out slots in pseudo-random order: with
+//! the generation counter and owner-PID check, the low 20 bits of a fresh handle
+//! reveal nothing about its neighbours. The shuffle uses a 16 KiB scratch buffer
+//! from `kmalloc`, freed before returning; permuting in place would clobber
+//! values still to be read.
 
 use core::ptr::{self, NonNull};
 use core::sync::atomic::Ordering;
@@ -36,21 +22,16 @@ use super::SEGMENT_LEN;
 use super::entry::{FREE_NEXT_TAIL, HandleEntry};
 use super::prng::Xorshift64;
 
-/// Storage for one segment's worth of [`HandleEntry`] slots.
-///
-/// The directory holds `AtomicPtr<SegmentEntries>` slots; a non-null
-/// pointer is a fully-initialised, shuffled-freelist segment that
-/// lives until [`HandleTable`](super::table::HandleTable) drops.
+/// Storage for one segment's [`HandleEntry`] slots. A non-null directory pointer
+/// is a fully-initialised segment that lives until the table drops.
 pub(crate) type SegmentEntries = [HandleEntry; SEGMENT_LEN];
 
 /// Metadata for one allocated segment, indexed by segment id in
-/// [`HandleTable::Inner`]. Updated only under the table's rank-3 lock,
-/// so plain `u32`s are sound — readers never touch this struct, they
-/// only walk `SegmentEntries`.
+/// [`HandleTable::Inner`]. Updated only under the rank-3 lock; readers walk
+/// `SegmentEntries` and never touch it.
 #[derive(Copy, Clone)]
 pub(crate) struct SegmentMeta {
-    /// Head of the segment's freelist (slot index), or [`FREE_NEXT_TAIL`]
-    /// when no free slots remain.
+    /// Head of the freelist (slot index), or [`FREE_NEXT_TAIL`] if none are free.
     pub free_head: u32,
     /// Number of free slots in the segment.
     pub free_count: u32,
@@ -63,33 +44,24 @@ impl SegmentMeta {
     }
 }
 
-/// Allocate a fresh segment, initialise every entry to its
-/// `HandleEntry::new()` defaults, then Fisher-Yates shuffle slot
-/// indices `0..SEGMENT_LEN` and thread them through the freelist.
+/// Allocate a segment, initialise every entry, Fisher-Yates shuffle the slot
+/// indices and thread them through the freelist; returns the entries block and
+/// the metadata to install in [`HandleTable::Inner::segment_meta`]. The block is
+/// a 256 KiB buddy order-6 allocation, the scratch buffer order 2.
 ///
-/// Returns the pointer to the entries block together with the
-/// metadata to install in [`HandleTable::Inner::segment_meta`].
-///
-/// `kmalloc(256 KiB)` routes to `large_alloc` and through the buddy
-/// at order 6 (4 × 64 = 256 KiB). The scratch permutation buffer is
-/// 16 KiB and also routes through the buddy at order 2.
-///
-/// This function does **not** take the rank-3 lock; in fact callers
-/// must drop it before allocating. See `kernel/CLAUDE.md` §
-/// "Forbidden patterns": no allocations while holding a spinlock.
+/// Does **not** take the rank-3 lock: callers must have dropped it, since
+/// nothing may allocate under a spinlock (`kernel/CLAUDE.md` § "Forbidden
+/// patterns").
 pub(crate) fn try_alloc_initialised(seed: u64) -> Result<(NonNull<SegmentEntries>, SegmentMeta), AllocError> {
-    // --- Allocate the 256 KiB entries block. ---
     let entries_bytes = core::mem::size_of::<SegmentEntries>();
     let entries_align = core::mem::align_of::<SegmentEntries>();
     let entries_raw = kmalloc(entries_bytes, entries_align) as *mut SegmentEntries;
     let entries_ptr = NonNull::new(entries_raw).ok_or(AllocError)?;
 
-    // SAFETY: `entries_raw` is a freshly-allocated 256 KiB region with
-    // alignment matching `SegmentEntries`; it currently holds undefined
-    // bytes. Writing a fresh `HandleEntry` into each slot leaves the
-    // region fully initialised. No other thread holds a reference to
-    // this region — the directory pointer is published only after we
-    // return.
+    // SAFETY: `entries_raw` is a fresh 256 KiB region aligned for
+    // `SegmentEntries`, holding undefined bytes; writing a `HandleEntry` into
+    // each slot initialises it fully. No other thread holds a reference: the
+    // directory pointer is published only after we return.
     unsafe {
         let entries_first: *mut HandleEntry = entries_raw as *mut HandleEntry;
         for i in 0..SEGMENT_LEN {
@@ -97,7 +69,6 @@ pub(crate) fn try_alloc_initialised(seed: u64) -> Result<(NonNull<SegmentEntries
         }
     }
 
-    // --- Allocate the scratch permutation buffer. ---
     let perm_bytes = SEGMENT_LEN * core::mem::size_of::<u32>();
     let perm_align = core::mem::align_of::<u32>();
     let perm_raw = kmalloc(perm_bytes, perm_align) as *mut u32;
@@ -117,7 +88,6 @@ pub(crate) fn try_alloc_initialised(seed: u64) -> Result<(NonNull<SegmentEntries
         }
     }
 
-    // --- Fisher-Yates shuffle in place. ---
     let mut prng = Xorshift64::new(seed);
     for i in (1..SEGMENT_LEN).rev() {
         let j = prng.gen_below((i as u32) + 1) as usize;
@@ -131,7 +101,6 @@ pub(crate) fn try_alloc_initialised(seed: u64) -> Result<(NonNull<SegmentEntries
         }
     }
 
-    // --- Thread the freelist through the entries. ---
     // SAFETY: each `perm_raw.add(k)` is in-bounds and initialised; the
     // entries pointer was just fully populated above.
     unsafe {
@@ -162,10 +131,9 @@ pub(crate) fn try_alloc_initialised(seed: u64) -> Result<(NonNull<SegmentEntries
 ///
 /// # Safety
 ///
-/// `entries` must be a pointer returned by [`try_alloc_initialised`],
-/// not yet freed, with no outstanding references into the entries
-/// block. The handle table guarantees this by only freeing segments
-/// during its own `Drop` after every directory entry has been cleared.
+/// `entries` is a pointer from [`try_alloc_initialised`], not yet freed, with
+/// no outstanding references into the block. The table frees segments only in
+/// its own `Drop`, after every directory entry is cleared.
 pub(crate) unsafe fn free_entries(entries: NonNull<SegmentEntries>) {
     // SAFETY: `kfree` is the matching deallocator for `kmalloc`; safety of
     // this call is forwarded from the function contract on
@@ -189,8 +157,6 @@ mod tests {
         init_global_heap();
         let (entries, meta) = try_alloc_initialised(0xCAFE_BABE).unwrap();
         assert_eq!(meta.free_count, SEGMENT_LEN as u32);
-        // Walking the freelist must visit exactly SEGMENT_LEN distinct
-        // slot indices.
         // SAFETY: `try_alloc_initialised` returned an initialised segment this test owns.
         let entries_ref = unsafe { entries.as_ref() };
         let mut seen = [false; SEGMENT_LEN];
@@ -217,7 +183,6 @@ mod tests {
         let (entries, meta) = try_alloc_initialised(0x9E37_79B9_7F4A_7C15).unwrap();
         // SAFETY: `try_alloc_initialised` returned an initialised segment this test owns.
         let entries_ref = unsafe { entries.as_ref() };
-        // Collect the slot order from the freelist.
         let mut order = [0u32; 16];
         let mut idx = meta.free_head;
         for slot in &mut order {
@@ -225,10 +190,8 @@ mod tests {
             *slot = idx;
             idx = entries_ref[idx as usize].free_next.load(Ordering::Relaxed);
         }
-        // The first 16 slots in a shuffled freelist must not be the
-        // sequential 0..16 — that would mean we returned the identity
-        // permutation. The xorshift PRNG is deterministic, so this is a
-        // stable test, not a flaky probabilistic one.
+        // The PRNG is deterministic: an identity prefix means the shuffle did
+        // nothing.
         let identity: [u32; 16] = core::array::from_fn(|i| i as u32);
         assert_ne!(order, identity, "freelist matches identity — Fisher-Yates failed");
 

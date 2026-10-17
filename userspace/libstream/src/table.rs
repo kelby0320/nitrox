@@ -1,10 +1,6 @@
 //! Record-level typed streams: [`TableWriter`] (schema → rows → terminator) and
 //! [`TableReader`] (iterate the records back), composed over the [`wire`](crate::wire)
-//! codec. This is the surface application code uses; the wire bytes stay hidden.
-//!
-//! **v1 works with dynamic [`Value`] rows.** `#[derive(TypedRecord)]` — writing/reading
-//! typed structs directly — layers on top in a later part; it lowers to these same
-//! calls.
+//! codec. Rows are dynamic [`Value`]s.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -64,8 +60,6 @@ impl<W: ByteSink> TableWriter<W> {
             return Err(WireError::SchemaMismatch);
         }
         put_u8(&mut self.sink, REC_DATA)?;
-        // The value framing (count/type checks + `NULLABLE` presence bytes) is shared
-        // with `Value::Record`/`Table` rows — see `wire::write_row_values`.
         write_row_values(&mut self.sink, &self.schema, values)
     }
 
@@ -104,10 +98,8 @@ pub enum Item {
     End(i32),
 }
 
-/// Reads a typed stream from a complete in-memory buffer: the header up front (its
-/// schema + flags exposed), then [`next`](Self::next) iterates the records until the
-/// terminator. (Incremental reading of a still-arriving stream is a later refinement;
-/// v1 receivers reassemble a whole stream first.)
+/// Reads a typed stream from a complete in-memory buffer: the header up front, then
+/// [`next`](Self::next) iterates the records until the terminator.
 pub struct TableReader<'a> {
     src: ByteSource<'a>,
     schema: Schema,
@@ -166,15 +158,13 @@ impl<'a> TableReader<'a> {
     }
 
     fn read_row(&mut self) -> Result<Vec<Value>> {
-        // Shares its framing with `Value::Record`/`Table` rows — see `wire::read_row_values`.
         read_row_values(&mut self.src, &self.schema)
     }
 }
 
 /// Write a **text-fallback** stream: [`StreamFlags::TEXT_FALLBACK`], a one-column schema
-/// `{ line: String }`, one row per line, then the terminator. This is how a plain-text
-/// producer's output is wrapped so it flows through the same typed pipeline (the "Unix
-/// floor" — every generic operator still works on it).
+/// `{ line: String }`, one row per line, then the terminator — how a plain-text
+/// producer's output flows through the typed pipeline.
 pub fn write_text_fallback(sink: &mut impl ByteSink, lines: &[&str], exit_status: i32) -> Result<()> {
     let schema = Schema::new().field("line", TypeTag::String, TypeModifiers::NONE);
     let mut tw = TableWriter::new(sink);
@@ -259,14 +249,10 @@ mod tests {
         );
         let mut buf = Vec::new();
         let mut tw = TableWriter::new(&mut buf);
-        // Row before schema.
         assert_eq!(tw.write_row(&[Value::Int(1)]), Err(WireError::SchemaMismatch));
         tw.write_schema(StreamFlags::NONE, &schema).unwrap();
-        // Wrong field count.
         assert_eq!(tw.write_row(&[Value::Int(1)]), Err(WireError::SchemaMismatch));
-        // Wrong type in column b (Int where String expected).
         assert_eq!(tw.write_row(&[Value::Int(1), Value::Int(2)]), Err(WireError::SchemaMismatch));
-        // Null in a non-nullable column.
         assert_eq!(tw.write_row(&[Value::Null, Value::Str(String::from("x"))]), Err(WireError::SchemaMismatch));
     }
 
@@ -274,7 +260,6 @@ mod tests {
     fn slice_sink_fills_and_overflows() {
         let schema = Schema::new().field("x", TypeTag::Int, TypeModifiers::NONE);
 
-        // Roomy buffer: encode fully, then read back from `as_bytes`.
         let mut store = [0u8; 128];
         let bytes_len;
         {
@@ -288,7 +273,6 @@ mod tests {
         assert_eq!(tr.next().unwrap().unwrap(), Item::Row(vec![Value::Int(0x1122_3344)]));
         assert_eq!(tr.next().unwrap().unwrap(), Item::End(0));
 
-        // Tiny buffer: the header alone overflows → SinkFull (backpressure, no truncation).
         let mut tiny = [0u8; 4];
         let mut tw = TableWriter::new(SliceSink::new(&mut tiny));
         assert_eq!(tw.write_schema(StreamFlags::NONE, &schema), Err(WireError::SinkFull));
@@ -310,7 +294,6 @@ mod tests {
 
     #[test]
     fn truncated_body_reports_error_once() {
-        // Valid header + a data-record tag but no field bytes.
         let schema = Schema::new().field("x", TypeTag::Int, TypeModifiers::NONE);
         let mut buf = Vec::new();
         encode_header(&mut buf, StreamFlags::NONE, &schema).unwrap();

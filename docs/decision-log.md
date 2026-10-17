@@ -36343,3 +36343,44 @@ second declined.
   6.1 minutes. CI's wall clock goes from 14.1 minutes, the QEMU job's, to 5.7 on the PR's first
   run: its slowest group, `images`, whose `check-images` took 189 s there against 147 in the
   measurement — runner to runner, that gate varies most.
+
+## 2026-10-17 — Before Phase 7, Part B.4: the comments, cut
+
+- **75,605 comment lines to 36,374**, as `check-comments` classifies them (a `SAFETY` comment or
+  `# Safety` section is not counted to its fifth line), over 172,532 lines of code. Every cut is
+  held by `check-comments --only-comments`, which compares each file's code with its comments
+  stripped, so no code changed but xtask's, for the checks this part built.
+- **The budget is 0.15 of a crate's code on top of its required docs** (the maintainer's call,
+  after the first batch): a line for each `pub` item and field, each `TODO(tag)` and each module,
+  so the share does not pay for the docs the rules require, as it does not for a `SAFETY`
+  comment. `check-comments --ratio DIR` holds it, and fails on a citation too.
+- **48 of the 50 crates are within it; the kernel and xtask are not**: the kernel at 12,567 lines
+  against 9,104, xtask at 2,629 against 2,415. Both were cut until what was left was why — the
+  kernel's boot order, the arguments its `SAFETY` comments rest on, its hardware and wire facts,
+  its lock and shootdown protocols; why each of xtask's gates waits for what it waits for — and
+  going under would move that into `docs/` or lose it. **Both stay over** (the maintainer's call):
+  the rule's floor is the docs the code needs, and there the why is that floor. Userspace as a
+  whole is 645 lines under.
+- **No separate review** (the maintainer's call): the author read every line an implementer cut,
+  and every crate needed something back, a why, a contract or a public item's doc. Each part was
+  also held mechanically: its code unchanged; every `SAFETY` comment and `# Safety` section of five
+  lines or fewer compared whole against the base, continuation lines included; missing docs and
+  rustdoc warnings against the base; CI's `clippy`; the host tests.
+- **Reading the cuts found claims the source contradicts**, each corrected to it:
+  - two spec contracts: a spawned process's and a new thread's `arg0` arrive in `rcx`, not `rdx`,
+    and `sys_wait` takes an `InterruptObject` (`process-spawn-args.md`, `thread-args.md`,
+    `syscall-abi.md`);
+  - `SAFETY` arguments that rested on one CPU: `Partition`'s `Send` and `Sync`, the AHCI ISR's, and
+    `SCHED` "single-CPU" in five object modules; `ArchSmp::send_ipi`'s `# Safety`, which said its
+    stub panics; `this_cpu_block`'s, which bounded its index by `cpu_count()`; two in the timer
+    that named the x2APIC's "MMIO";
+  - two stubs nothing tracked, now `TODO(smp-cpu-count)` (`cpu_count` returns `1`) and
+    `TODO(gpt-crc)` (the GPT reader checks no CRC), each with its deferral entry;
+  - four doc comments above the wrong item since an earlier edit, `build_resolve_request`'s among
+    them, leaving its function undocumented.
+- **What the cuts did wrong**, each now swept for: whys gone in every crate; a `SAFETY` comment
+  cut short by an implementer whose `grep SAFETY` saw its first line unchanged, and another given a
+  new reason that was wrong; a link-reference definition joined to the paragraph above it; a
+  sentence opening with the word that ended the last. A final pass over the branch ran each sweep,
+  positive-controlled.
+- **`check-size`'s baseline comes down with the files**, from 62 entries to 50.

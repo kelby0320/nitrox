@@ -1,10 +1,7 @@
 //! Handle encoding and rights — mirrored from `kernel/src/libkern/handle.rs`.
 //!
-//! [`RawHandle`] is the opaque 64-bit handle value; [`Rights`] is the rights
-//! bitfield; [`KObjectType`] is the object-type discriminant. Convenience
-//! `RIGHT_*` (`u64`) and `KOBJ_*` (`u32`) aliases are provided for raw-syscall
-//! call sites that pass plain integers; they derive from the canonical typed
-//! constants below, so there is one source of truth for each bit/discriminant.
+//! The `RIGHT_*` (`u64`) and `KOBJ_*` (`u32`) aliases are for raw-syscall call sites that pass
+//! plain integers; they derive from the typed constants, so each bit has one source of truth.
 
 use core::ops::{BitAnd, BitOr};
 
@@ -30,12 +27,12 @@ impl RawHandle {
 }
 
 /// A rights bitfield. Subset semantics: `r1.is_subset_of(r2)` iff `(r1 & r2) == r1`.
+/// Bits 0–3 apply to every handle type, 8–19 are per-type principal rights, 32+ modifiers.
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Rights(u64);
 
 impl Rights {
-    // --- Generic rights (apply to all handle types) --------------------
     /// `sys_handle_duplicate` is permitted.
     pub const DUPLICATE: Rights = Rights(1 << 0);
     /// Handle may be transferred across an IPC boundary.
@@ -45,7 +42,6 @@ impl Rights {
     /// `sys_wait` accepts this handle.
     pub const WAIT: Rights = Rights(1 << 3);
 
-    // --- Principal rights (type-specific) ------------------------------
     /// I/O read.
     pub const READ: Rights = Rights(1 << 8);
     /// I/O write.
@@ -71,7 +67,6 @@ impl Rights {
     /// IPC receive.
     pub const RECV: Rights = Rights(1 << 19);
 
-    // --- Modifier rights -----------------------------------------------
     /// Seek within a stream resource.
     pub const SEEK: Rights = Rights(1 << 32);
     /// Append-only write.
@@ -167,7 +162,7 @@ pub enum KObjectType {
     DeviceNode = 12,
     UserspaceServerReg = 13,
     FileObject = 14,
-    /// The capability to stop the machine, which only `init` holds (administration Part E.3).
+    /// The capability to stop the machine, which only `init` holds.
     SystemControl = 15,
 }
 

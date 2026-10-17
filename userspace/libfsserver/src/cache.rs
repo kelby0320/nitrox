@@ -1,34 +1,26 @@
-//! **A cache of the metadata a server reads** (Phase 6 Part H.4).
-//!
-//! A filesystem server walks a path, scans a directory, reads an inode, a bitmap, a descriptor and
-//! the superblock for every operation, and the laptop's runs found it doing so for every file of a
-//! copy: a file of `small/` cost 782 reads on the stick's FAT, a directory scanned a sector at a
-//! time, and 432 within ext4 (the decision log, 2026-10-09). [`MetaCache`] sits between the server
-//! and its device and keeps the blocks those reads touch.
+//! **A cache of the metadata a server reads**: [`MetaCache`] sits between a server and its device
+//! and keeps the blocks its metadata reads touch.
 //!
 //! **What it may hold is what only the server writes.** The kernel writes a file's data to the
-//! device itself, behind the server's back (Model A), so a cached copy of a data block could be
-//! stale. Only [`BlockReader::read_meta`] reads through the cache — the filesystem libraries call
-//! it for their own structures and nothing else — and every other read goes to the device. Every
+//! device itself, behind the server's back (Model A), so a cached data block could be stale. Only
+//! [`BlockReader::read_meta`] reads through the cache; every other read goes to the device. Every
 //! write goes to the device and then into any cached copy, so a cached block is never behind the
 //! device for anything the server wrote; and [`BlockWriter::forget`], which a server calls on what
-//! it frees, lets the blocks go before they can become a file's data.
+//! it frees, lets the blocks go before they can become a file's data. The least recently used
+//! block makes room.
 
 use crate::{BlockReader, BlockWriter, FsError};
 use core::cell::{Cell, RefCell};
 
-/// The cache's unit: a 4 KiB block of the device, aligned to the device's start.
+/// The cache's unit: a 4 KiB block of the device.
 pub const BLOCK: usize = 4096;
-/// **How many blocks a server keeps**: 1 MiB. A copy's working set — the two directories it is
-/// between, a few inode-table blocks, the bitmaps, the descriptors and the superblock — is a few
-/// dozen; the rest keeps a tree's directories as a copy walks it.
+/// **How many blocks a server keeps**: 1 MiB. A copy's working set is a few dozen; the rest keeps
+/// a tree's directories as a copy walks it.
 pub const SERVER_BLOCKS: usize = 256;
-/// A slot holding nothing. A tag is a block's number plus one, so an empty store is all zeroes and a
-/// server's `static` of one costs its binary nothing (`.bss`).
+/// A slot holding nothing: a tag is a block's number plus one, so an empty store is all zeroes.
 const EMPTY: u64 = 0;
 
-/// **The cache's memory**: `N` blocks, each with the device block it holds and when it was last
-/// used. A server keeps one in a `static`, since it holds no heap.
+/// **The cache's memory**: `N` blocks, each with the device block it holds and its last use.
 pub struct Store<const N: usize> {
     blocks: [[u8; BLOCK]; N],
     tags: [u64; N],
@@ -45,12 +37,10 @@ impl<const N: usize> Store<N> {
         self.tags.iter().position(|&t| t == block + 1)
     }
 
-    /// The slot to fill: an empty one, or the one used longest ago.
     fn victim(&self) -> usize {
         (0..N).min_by_key(|&i| if self.tags[i] == EMPTY { 0 } else { self.used[i] + 1 }).unwrap_or(0)
     }
 
-    /// The device blocks `[offset, offset + len)` touches, each with the part of it touched.
     fn spans(offset: u64, len: usize) -> impl Iterator<Item = (u64, usize, usize)> {
         let end = offset + len as u64;
         let first = offset / BLOCK as u64;
@@ -69,8 +59,8 @@ impl<const N: usize> Default for Store<N> {
     }
 }
 
-/// **A device with a metadata cache in front of it** — what a server serves its filesystem through
-/// (see the module's doc for what it may hold).
+/// **A device with a metadata cache in front of it**, which a server serves its filesystem
+/// through.
 pub struct MetaCache<'a, D, const N: usize> {
     dev: &'a D,
     store: RefCell<&'a mut Store<N>>,
@@ -89,9 +79,7 @@ impl<'a, D: BlockReader + BlockWriter, const N: usize> MetaCache<'a, D, N> {
         self.dev
     }
 
-    /// **Whether the cache holds the block `offset` is in** — what a server's test asks of the
-    /// blocks it freed, which it must have let go ([`BlockWriter::forget`]) though nothing it does
-    /// today would read them back stale (PR #371 review, finding 4).
+    /// **Whether the cache holds the block `offset` is in**: asked of blocks freed and forgotten.
     pub fn holds(&self, offset: u64) -> bool {
         self.store.borrow().slot_of(offset / BLOCK as u64).is_some()
     }
@@ -103,9 +91,9 @@ impl<D: BlockReader + BlockWriter, const N: usize> BlockReader for MetaCache<'_,
         self.dev.read_at(offset, buf)
     }
 
-    /// **Through the cache**: a block it holds is answered from memory, and one it does not is read
-    /// whole, kept, and answered. A block the device cannot read whole — the end of a partition that
-    /// is not whole blocks — is read as asked, and not kept.
+    /// **Through the cache**: a block it holds is answered from memory, and one it does not is
+    /// read whole, kept, and answered. A block the device cannot read whole (the end of a
+    /// partition that is not whole blocks) is read as asked, and not kept.
     fn read_meta(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
         let mut done = 0;
         for (block, within, n) in Store::<N>::spans(offset, buf.len()) {
@@ -190,7 +178,7 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
-    /// An image in memory that counts the reads and writes reaching it, and can refuse a range.
+    /// An image in memory that counts the reads and writes reaching it.
     struct Device {
         bytes: RefCell<Vec<u8>>,
         reads: Cell<u32>,
@@ -226,16 +214,12 @@ mod tests {
             v.get_mut(offset as usize..end).ok_or(FsError::Io)?.copy_from_slice(buf);
             Ok(())
         }
-        /// One write, however long — as `Disk`'s large commands, so a test can tell them from the
-        /// default's 4 KiB at a time.
+        /// One write, however long, so a test can tell it from the default's 4 KiB at a time.
         fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
             self.write_at(offset, &vec![0; len as usize])
         }
     }
 
-    /// **A block read as metadata is read from the device once**, whole, and every later read of it
-    /// — of any part — answered from memory; a read across two blocks reads each once. A read that
-    /// is not metadata always reaches the device.
     #[test]
     fn metadata_is_read_from_the_device_once_and_data_every_time() {
         let dev = Device::new(8 * BLOCK);
@@ -254,9 +238,6 @@ mod tests {
         assert_eq!(dev.taken(), (2, 0), "data reads reach the device every time");
     }
 
-    /// **A write reaches the device, and then any copy the cache holds**, so the next metadata read
-    /// sees it without a read; a write the device refused lets the copy go, so the next read asks the
-    /// device. `forget` lets a block go.
     #[test]
     fn a_write_reaches_the_device_and_the_copy_and_forget_lets_a_block_go() {
         let dev = Device::new(8 * BLOCK);
@@ -285,9 +266,6 @@ mod tests {
         assert_eq!((b[0], dev.taken()), (42, (1, 0)), "a forgotten block is read afresh");
     }
 
-    /// **Zeroes go to the device as the device writes them**, and then into any copy the cache holds
-    /// — the parts of a block at either end as well as a whole one; zeroes the device refused let
-    /// the copies go.
     #[test]
     fn zeroes_reach_the_device_in_its_own_writes_and_then_the_copies() {
         let dev = Device::new(8 * BLOCK);
@@ -313,9 +291,6 @@ mod tests {
         assert_eq!(dev.taken(), (1, 0), "a failed write's block is read again");
     }
 
-    /// **The block used longest ago goes**, so a working set the size of the cache stays in it; and
-    /// a block the device cannot read whole — a partition's ragged end — is read as asked and not
-    /// kept.
     #[test]
     fn the_block_used_longest_ago_goes_and_a_ragged_end_is_read_as_asked() {
         let dev = Device::new(6 * BLOCK + 512);

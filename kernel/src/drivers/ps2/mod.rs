@@ -1,26 +1,10 @@
 //! The **i8042** controller driver (Tier 1) — PS/2 keyboard and mouse.
 //!
-//! `docs/architecture/input-subsystem.md`. One driver, because the keyboard and the mouse are two
-//! *devices behind one controller*: they share data port `0x60`, are configured through
-//! command port `0x64`, and enabling the mouse is a read-modify-write of the same config
-//! byte that carries the keyboard's IRQ-1 enable. Two drivers initialising independently
-//! race on that byte and produce a machine that intermittently boots with a dead keyboard.
-//!
-//! It publishes **two** char `DeviceNode`s — `/dev/input/raw/0` (keyboard) and
-//! `/dev/input/raw/1` (mouse) — each delivering
-//! [`InputEvent`](crate::libkern::input::InputEvent) records.
-//!
-//! ## What is here and what is in `arch`
-//!
-//! Port I/O and interrupt arming are x86-only and stay behind `crate::arch::ps2`, exactly as
-//! the serial console keeps COM1's registers and IRQ behind `crate::arch::serial`. The
-//! decision is older than this driver: `arch/mod.rs` refuses to re-export `install_isa_irq`
-//! neutrally because "ISA" is x86 jargon, and "a fixed legacy platform device wires its own
-//! interrupt inside the arch layer". The i8042 is exactly that class of device.
-//!
-//! This module owns what is portable: the scancode table and the mouse packet framing. Each
-//! node's ring, the read parked on it and its hand-off to thread context are
-//! [`crate::drivers::input`]'s, shared with USB HID since Phase 6 Part B.1.
+//! `docs/architecture/input-subsystem.md`. One driver: the keyboard and the mouse are two *devices
+//! behind one controller*, and enabling the mouse is a read-modify-write of the config byte that
+//! carries the keyboard's IRQ-1 enable; two drivers would race on it and boot with a dead keyboard.
+//! It publishes `/dev/input/raw/0` (the keyboard) and `/dev/input/raw/1` (the mouse). Port I/O
+//! and interrupt arming stay behind `crate::arch::ps2`.
 
 pub mod lights;
 pub mod mouse;
@@ -48,56 +32,41 @@ pub const DEV_MOUSE: usize = 1;
 /// How many raw nodes exist.
 pub const DEV_COUNT: usize = 2;
 
-/// Everything the driver owns, behind one lock.
-///
-/// **One lock for both devices, deliberately.** They share the controller: a single status
-/// read decides which port a byte came from, so the two ISRs cannot be made independent
-/// anyway, and two locks would only add an ordering rule to get wrong.
+/// Everything the driver owns, behind one lock for both devices: a single status read decides which
+/// port a byte came from.
 struct Inner {
-    /// Each node's reader side, by its index. The DPC owns a read it takes out of one until it
-    /// hands it back, and never drops it: see [`crate::drivers::input`].
+    /// Each node's reader side, by index; the DPC owns a read it takes out until it hands it back.
     devices: [Reader; DEV_COUNT],
     keys: scancode::Decoder,
     mouse: mouse::Decoder,
-    /// **The lights exchange in flight** (Phase 6 Part B.5), and the write it serves.
     lights: Option<lights::Exchange>,
     lights_po: Option<ObjectRef>,
-    /// The latest write that came while one was in flight: started when that one ends.
     lights_next: Option<(ObjectRef, u8)>,
-    /// Finished writes and their status, for the DPC to complete and thread context to drop, as a
-    /// read's are. A write whose slot is not yet free waits in `lights_po` with its status here.
     lights_done: [Option<LightsDone>; 4],
     lights_unreported: Option<i32>,
-    /// What the DPC is to log about the exchange that ended, outside this lock: the serial port's
-    /// lock ranks above it.
+    /// What the DPC logs about the exchange that ended, outside this lock (the serial port's lock
+    /// ranks above it).
     lights_say: Option<Say>,
 }
 
-/// A finished lights write: its operation, its status, and how far the DPC has got with it.
 struct LightsDone {
     po: ObjectRef,
     status: i32,
     state: Completion,
 }
 
-/// How far a finished lights write has got.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Completion {
-    /// Waiting for the DPC.
     Waiting,
     /// The DPC took it and is completing it **outside this lock** — completing takes the
     /// scheduler's, which ranks above it — so thread context must not drop it yet.
     Completing,
-    /// Completed: thread context drops it.
     Completed,
 }
 
-/// What the log says about an exchange.
 #[derive(Copy, Clone)]
 enum Say {
-    /// The keyboard took its lights, for the first time.
     Acknowledged,
-    /// The keyboard did not take them.
     Refused(lights::Failure),
 }
 
@@ -116,9 +85,9 @@ impl Inner {
         }
     }
 
-    /// **A byte from the keyboard port**: the lights exchange's answer while one is in flight —
-    /// taken here, *ahead of* the decoder, so an answer between an `E0` prefix and its code cannot
-    /// become a key (PR #357 review) — or what the decoder makes of it.
+    /// **A byte from the keyboard port**: the exchange's answer while one is in flight, taken
+    /// *ahead of* the decoder (an answer between an `E0` prefix and its code must not become a
+    /// key), or what the decoder makes of it.
     fn keyboard_byte(&mut self, byte: u8, now: u64) -> KeyboardByte {
         if let Some(x) = self.lights.as_mut()
             && let Some(action) = x.on_byte(byte, now)
@@ -128,8 +97,8 @@ impl Inner {
         KeyboardByte::Key(self.keys.feed(byte))
     }
 
-    /// **Act on the exchange's `action`**: send what it says, or end it — reporting the write, and
-    /// starting the one that waited. Whether a write is now there for the DPC to complete.
+    /// **Act on the exchange's `action`**: send, or end it and start the write that waited. Whether
+    /// a write is ready for the DPC.
     fn lights_action(&mut self, action: lights::Action, now: u64) -> bool {
         match action {
             lights::Action::Send(byte) => {
@@ -146,7 +115,6 @@ impl Inner {
         }
     }
 
-    /// End the exchange in flight with `result`, and start the next write if one waited.
     fn lights_end(&mut self, result: Result<(), KError>, now: u64) -> bool {
         self.lights = None;
         LIGHTS_IN_FLIGHT.store(false, Ordering::Release);
@@ -163,7 +131,6 @@ impl Inner {
         true
     }
 
-    /// Move a finished write into a free slot for the DPC.
     fn report_lights(&mut self) {
         let Some(status) = self.lights_unreported else { return };
         let Some(slot) = self.lights_done.iter_mut().find(|d| d.is_none()) else { return };
@@ -173,8 +140,7 @@ impl Inner {
         self.lights_unreported = None;
     }
 
-    /// Begin an exchange for `po` with `lights`. A keyboard the controller would not send to ends it
-    /// at once, failed.
+    /// Begin an exchange for `po` with `lights`; a failed send ends it at once.
     fn lights_start(&mut self, po: ObjectRef, lights: u8, now: u64) {
         let (exchange, first) = lights::Exchange::start(lights, now);
         self.lights_po = Some(po);
@@ -187,38 +153,26 @@ impl Inner {
     }
 }
 
-/// What a byte from the keyboard port was.
 enum KeyboardByte {
-    /// The lights exchange's answer.
     Answer(lights::Action),
-    /// What the scancode decoder made of it.
     Key(scancode::Decoded),
 }
 
-/// An exchange is in flight: what the tick checks before taking the lock for its bound.
 static LIGHTS_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-/// The keyboard took lights once: what the log says, the first time.
 static LIGHTS_TAKEN: AtomicBool = AtomicBool::new(false);
 
 static PS2: IrqSpinLock<Inner> = IrqSpinLock::new(LockRank::Leaf, Inner::new());
 
-/// Completes parked reads after an ISR deposits events.
 static PS2_DPC: Dpc = Dpc::new(ps2_intr_dpc, core::ptr::null_mut());
 
-/// Set once a device has answered and the handlers are armed. Guards [`poll`] — see there for
-/// why an absent controller would otherwise be drained on every tick.
 static PRESENT: AtomicBool = AtomicBool::new(false);
 
-/// `ps2-hold-gate` only: nothing is drained from the controller before this monotonic time.
 #[cfg(feature = "ps2-hold-gate")]
 static HOLD_UNTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// How long an F9 press holds the drain, in a `ps2-hold-gate` kernel: long enough for the host to
-/// inject a walk and a click into it, short enough that a gate spends little time waiting.
 #[cfg(feature = "ps2-hold-gate")]
 const HOLD_NS: u64 = 300_000_000;
 
-/// Whether the drain is held at `now` — never, in a kernel without `ps2-hold-gate`.
 fn holding(now: u64) -> bool {
     #[cfg(feature = "ps2-hold-gate")]
     {
@@ -231,15 +185,10 @@ fn holding(now: u64) -> bool {
     }
 }
 
-/// Bytes one interrupt may take from the controller before yielding.
-///
-/// Generous for a burst — a held key repeats at ~30 Hz and a mouse reports at 100 Hz, so
-/// nothing legitimate approaches it — while keeping the interrupts-off window bounded.
+/// Bytes one interrupt may take before yielding, bounding the interrupts-off window.
 const MAX_DRAIN_PER_IRQ: u32 = 64;
 
-/// [`CharBackend::submit_read`] for a raw input node: satisfy immediately if the ring has
-/// anything, else park until the next interrupt. `max_len` is floored to whole records
-/// ([`input::read_len`]).
+/// [`CharBackend::submit_read`] for a raw input node; `max_len` is floored to whole records.
 fn submit_read(
     buffer: &ObjectRef,
     po: &ObjectRef,
@@ -287,24 +236,20 @@ fn read(
     Ok(())
 }
 
-/// DPC: complete any parked read whose device has events. Queued by the ISRs.
 fn ps2_intr_dpc(_ctx: *mut ()) {
     let now = crate::arch::Timer::read_ns();
     for index in 0..DEV_COUNT {
         let mut tmp = [0u8; DRAIN_MAX];
-        // **Take exclusive ownership for the duration**, and hand it back after: see
-        // `drivers::input`.
+        // Exclusive ownership while delivering; handed back after (see `drivers::input`).
         let ready = PS2.lock().devices[index].take_ready(&mut tmp, now);
         if let Some((read, n)) = ready {
             input::deliver(&read, &tmp[..n]);
             PS2.lock().devices[index].owe(read);
         }
     }
-    // **Finished lights writes**, completed here and dropped in thread context, as reads are: the
-    // operation is completed by pointer, and the reference stays in its slot until reclaimed.
-    // **Taken under the lock and completed outside it**, as a read is delivered: completing takes
-    // the scheduler's lock, which ranks above this leaf. The slot says `Completing` meanwhile, so
-    // thread context cannot drop the operation before it is completed.
+    // **Finished lights writes**: taken under the lock and completed outside it (completing takes
+    // the scheduler's lock, which ranks above this leaf); `Completing` keeps thread context from
+    // dropping them first.
     let mut taken: [Option<(usize, *mut (), i32)>; 4] = [None; 4];
     let say = {
         let mut g = PS2.lock();
@@ -335,14 +280,8 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
     }
 }
 
-/// Drop any read the DPC has finished with. **Thread context only.**
-///
-/// This is where the two `ObjectRef`s a completed read pinned are actually released — the
-/// frees that `ps2_intr_dpc` must not do. Called from `sched::reap_pending` (so any CPU
-/// going idle reclaims) and from [`submit_read`] before parking a new read.
-///
-/// Safe to run concurrently with a DPC on another CPU: the DPC owns its entry outright until
-/// it publishes it, so there is nothing here to race with.
+/// Drop any read the DPC has finished with, from `sched::reap_pending` and before a new read parks
+/// — **thread context only**, being the frees `ps2_intr_dpc` must not do.
 pub fn reclaim_completed() {
     reclaim(&PS2);
 }
@@ -353,8 +292,6 @@ fn reclaim(ps2: &IrqSpinLock<Inner>) {
         let owed = ps2.lock().devices[index].take_owed();
         drop(owed);
     }
-    // And the lights writes the DPC completed; then a write that waited for a slot, and the
-    // write that waited behind it.
     let mut done: [Option<LightsDone>; 4] = [const { None }; 4];
     let started = {
         let mut g = ps2.lock();
@@ -381,10 +318,9 @@ fn reclaim(ps2: &IrqSpinLock<Inner>) {
     }
 }
 
-/// [`CharBackend::submit_write`] for the keyboard's node: **its lights** (Phase 6 Part B.5), one
-/// byte in HID's order. Completed when the keyboard has acknowledged them, or failed. A write that
-/// comes while another is in flight waits for it, and replaces one already waiting, which is then
-/// completed as done: the lights it would have set are older than the ones that will be.
+/// [`CharBackend::submit_write`] for the keyboard's node: **its lights**, one byte in HID's order.
+/// A write arriving while one is in flight waits, replacing any already waiting, which completes as
+/// done.
 fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError> {
     if ctx as usize != DEV_KEYBOARD {
         return Err(KError::Unsupported);
@@ -406,41 +342,27 @@ fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, c
         unsafe { crate::sched::complete_pending_op(old.as_ptr(), 0, 1) };
         drop(old);
     }
-    // A start that failed at once has a write for the DPC to complete.
     crate::dpc::enqueue(&PS2_DPC);
     Ok(())
 }
 
-/// The key the `fbcon-gate` feature panics on: F10, the tenth of the consecutive function keys.
 #[cfg(feature = "fbcon-gate")]
 const CRASH_KEY: u16 = crate::libkern::input::KEY_F1 + 9;
 
-/// Drain the controller into the rings. Shared by both ISRs, because **both ports deliver
-/// through the same data port**: whichever line fires, the byte waiting might belong to
-/// either device, and the status bit is the only discriminator. Draining everything from
-/// either handler is therefore both correct and necessary.
-///
-/// Returns whether any device now has a parked reader to wake.
+/// Drain the controller into the rings, for both ISRs: **both ports deliver through the same data
+/// port**, so whichever line fires the byte might be either device's and the status bit is the only
+/// discriminator; returns whether any device now has a parked reader to wake.
 fn drain_controller() -> bool {
     let now = crate::arch::Timer::read_ns();
     let mut g = PS2.lock();
-    // **Bounded.** The lock masks interrupts, so an unbounded drain is an unbounded
-    // interrupts-off window: a device that streams without pause — a mouse left reporting
-    // after a bad reset, a keyboard repeating a stuck key — would hold this CPU forever and
-    // the machine simply stops. The console's equivalent loop is unbounded and gets away
-    // with it because a UART with nothing arriving stops immediately; an input controller
-    // with two attached devices is not that.
+    // **Bounded**: the lock masks interrupts, so an unbounded drain is an unbounded interrupts-off
+    // window (a stuck repeating key would hold this CPU forever).
     //
-    // **Anything still waiting is collected by [`poll`], not by the next interrupt.** This
-    // comment used to say the opposite — "the controller will raise because the byte is still
-    // there" — and that is false for this device: it raises when a byte *becomes* available,
-    // so a byte already sitting in the output buffer produces no further edge, and the buffer
-    // stays full forever. That sentence cost three investigations; the tick-driven sweep is
-    // what actually recovers the byte.
+    // **Anything left waiting is collected by [`poll`]**: the controller raises only when a byte
+    // *becomes* available, so one already in the output buffer produces no further edge.
     let mut budget = MAX_DRAIN_PER_IRQ;
     let mut lights_finished = false;
-    // A `ps2-hold-gate` hold reads nothing at all, so everything injected meanwhile queues in
-    // the host's device — the condition that gate exists to build.
+    // A `ps2-hold-gate` hold reads nothing, so injected input queues in the host's device.
     while budget > 0
         && !holding(now)
         && let Some((port, byte)) = crate::arch::ps2::read_byte()
@@ -458,13 +380,10 @@ fn drain_controller() -> bool {
                 if let scancode::Decoded::Key { code, pressed } = decoded {
                     #[cfg(feature = "fbcon-gate")]
                     if pressed && code == CRASH_KEY {
-                        // **With this leaf lock held, deliberately**: a driver that panics
-                        // usually holds its own lock, and the panic's message must still reach
-                        // the screen. Until the rank tracker stopped ordering `try_lock`, the
-                        // panic path's tee into the log ring tripped it here and the screen
-                        // showed `lock-order violation: acquiring Klog (rank 72) while holding
-                        // Leaf (rank 90)` instead — so `check-fbcon` is that fix's regression
-                        // test as well as the console's.
+                        // **With this leaf lock held, deliberately**: the message must still reach
+                        // the screen. `check-fbcon` is the regression test for `lock-order
+                        // violation: acquiring Klog (rank 72) while holding Leaf (rank 90)` from
+                        // the panic path's `try_lock` tee.
                         panic!("fbcon-gate: F10 pressed, and this kernel was built to stop on it");
                     }
                     if pressed {
@@ -495,41 +414,24 @@ fn drain_controller() -> bool {
     lights_finished || g.devices.iter().any(|d| d.has_parked())
 }
 
-/// Collect anything the interrupt path missed. Called from the timer IRQ dispatcher, ahead of
-/// the DPC drain so a byte recovered here wakes its reader on this tick rather than the next.
+/// Collect anything the interrupt path missed. Called from the timer IRQ dispatcher, ahead of the
+/// DPC drain so a byte recovered here wakes its reader on this tick.
 ///
-/// **This exists because an i8042 interrupt can be lost, and the loss is unrecoverable
-/// without it.** The controller has a *one-byte* output buffer and its IRQ line is a level
-/// that the interrupt controller turns into an edge. A byte that arrives after a drain's last
-/// status read but while the line is still asserted produces **no new edge** — and because
-/// nobody then reads the buffer, the line never drops, so no later byte can produce one
-/// either. The device and the driver deadlock: a byte sits in the buffer forever and every
-/// keystroke and mouse movement after it is discarded by a full controller.
-///
-/// That is not hypothetical. It is what made `check-input` and `check-terminal` intermittent
-/// through Milestones 5 and 6, and the state was captured directly: `status=0x1d` (output full,
-/// keyboard byte) with the ISR counters frozen and the last drain having exited on
-/// `status=0x1c` (output *empty*) — the driver did everything right and was never called again.
-///
-/// **The race cannot be closed by re-checking harder**: however many times the drain re-reads
-/// the status, there is a last read, and a byte can always arrive after it. A periodic sweep is
-/// the standard answer — Linux's i8042 carries a polling timer for the same class of fault —
-/// and one `inb` per tick is not a cost worth optimising.
+/// **An i8042 interrupt can be lost, and nothing else recovers it.** The controller has a
+/// *one-byte* output buffer and its IRQ line is a level the interrupt controller turns into an
+/// edge: a byte arriving after a drain's last status read, while the line is asserted, produces
+/// **no new edge**, and since nobody reads the buffer the line never drops. Re-checking cannot
+/// close it (there is always a last read), so a periodic sweep is the answer.
 pub fn poll() {
-    // **A machine with no i8042 must not pay for one.** An absent controller floats its
-    // status port high, so `output_pending` reads `0xFF` — which has `STATUS_OUTPUT_FULL`
-    // set — and an unguarded sweep would take the lock and run the full drain budget on
-    // every tick, forever: 128 port reads per tick per CPU with interrupts masked, buying
-    // nothing. Worse, `0xFF` also has the mouse packet's sync bit set, so three of them
-    // decode as a valid three-button-down packet. `arch::ps2::init` promises such a machine
-    // "reports both absent and the boot continues"; this is what keeps that true.
+    // **A machine with no i8042 must not pay for one**: an absent controller floats its status port
+    // high, so `output_pending` reads `0xFF`, an unguarded sweep would run the full drain budget
+    // every tick with interrupts masked, and three `0xFF` bytes decode as a valid mouse packet.
     if !PRESENT.load(Ordering::Acquire) {
         return;
     }
     // **A lights exchange the keyboard has not answered** fails on the tick after its bound.
     if LIGHTS_IN_FLIGHT.load(Ordering::Acquire) {
         let now = crate::arch::Timer::read_ns();
-        // The DPC is queued after the lock is let go: its queue's lock is a leaf too.
         let ended = {
             let mut g = PS2.lock();
             match g.lights.as_ref().and_then(|x| x.on_tick(now)) {
@@ -549,17 +451,14 @@ pub fn poll() {
     }
 }
 
-/// `true` once a keyboard has answered and its interrupt is armed — the only case in which this
+/// `true` once a keyboard has answered and its interrupt is armed, the only case in which this
 /// driver can move [`input::key_presses`].
 pub fn keyboard_present() -> bool {
     PRESENT.load(Ordering::Acquire) && crate::device::has(crate::libkern::device::DeviceKind::Keyboard)
 }
 
-/// Throw away every keyboard event waiting in the ring. Returns how many bytes of records went.
-///
-/// For keys pressed before anyone could have meant them for a program — the hardware report's
-/// page turns — so the first reader of `/dev/input/raw/0` does not receive them. Thread context;
-/// no reader is parked this early, so there is nothing to complete.
+/// Throw away every keyboard event waiting in the ring (thread context), returning how many bytes
+/// went: keys pressed before anyone could mean them for a program.
 pub fn drain_keyboard() -> usize {
     let now = crate::arch::Timer::read_ns();
     let mut scratch = [0u8; DRAIN_MAX];
@@ -587,12 +486,9 @@ extern "C" fn aux_isr() {
     }
 }
 
-/// Bring up the i8042 and publish its device nodes. Call once at boot, after the interrupt
-/// router is initialised and with interrupts masked — [`crate::arch::ps2::init`] polls, and
-/// must consume every controller response before the scancode decoder can see a byte.
-///
-/// Logs a one-line result; not a `panic!` path. A machine with no i8042 publishes no nodes
-/// and boots normally.
+/// Bring up the i8042 and publish its device nodes: call once at boot with interrupts masked, since
+/// [`crate::arch::ps2::init`] polls and must consume every controller response before the decoder
+/// sees a byte.
 pub fn init() {
     // SAFETY: ring-0 at boot, before `arm`, and nothing else touches 0x60/0x64.
     let present = unsafe { crate::arch::ps2::init() };
@@ -601,14 +497,10 @@ pub fn init() {
         return;
     }
     if present.wheel {
-        // **The decoder cannot work this out for itself**, and it is not a feature flag: a
-        // mouse that answered the knock sends four-byte packets from now on, so a decoder
-        // still framing three would read every one of them at an offset. Done here rather
-        // than inside `arch::ps2::init` because the packet layout is this module's — the arch
-        // layer owns ports and interrupts, not what the bytes mean.
-        //
-        // Safe without ordering care: `PRESENT` is still false and the interrupts are not
-        // armed, so nothing can be feeding the decoder yet.
+        // **The decoder cannot work this out itself**: a mouse that answered the knock sends
+        // four-byte packets from now on, so a decoder still framing three would read every one at
+        // an offset. Done here because the packet layout is this module's. Needs no ordering care:
+        // `PRESENT` is false and the interrupts are not armed.
         PS2.lock().mouse.enable_wheel();
     }
 
@@ -619,9 +511,7 @@ pub fn init() {
         let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: index as *mut () };
         match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
             Ok(node) => {
-                // **Owned by the device table**, which `/dev/input/raw/<n>` resolves through:
-                // the index is this driver's, and the table records it as the node's served
-                // index, which is also what `/dev/registry` reports (administration Part B).
+                // **Owned by the device table**, which `/dev/input/raw/<n>` resolves through.
                 // SAFETY: `into_raw` yields the single creation reference; the table adopts it.
                 let r =
                     unsafe { ObjectRef::from_raw(KBox::into_raw(node).as_ptr() as *mut (), KObjectType::DeviceNode) };
@@ -640,21 +530,16 @@ pub fn init() {
     // are valid for the kernel's lifetime and the rings are ready to receive.
     let (kbd_vec, aux_vec) = unsafe { crate::arch::ps2::arm(kbd_isr, aux_isr) };
     // Only now may `poll` touch the ports: a device answered, so the status port is the
-    // controller's and not a floating bus.
-    //
-    // **Last, and that ordering is load-bearing in the other direction.** Setting this before
-    // `arch::ps2::init`'s polled handshake would let a tick's sweep consume the controller's
-    // own `0xFA`/`0xAA` replies as if they were scancodes — the phantom-modifier failure this
-    // module's header warns about. Today no tick can land here at all (the periodic timer
-    // starts in `sched_bringup`, after this runs), so the window is unreachable rather than
-    // merely harmless; storing last is what keeps it unreachable if that ever changes.
+    // controller's and not a floating bus. **Last, deliberately**: set before `arch::ps2::init`'s
+    // polled handshake, a tick's sweep could consume its `0xFA`/`0xAA` replies as scancodes. No
+    // tick can land here today (the periodic timer starts after this), so storing last keeps that
+    // unreachable.
     PRESENT.store(true, Ordering::Release);
     crate::kprintln!(
         "ps2: {}{}{}armed (kbd vec{:#x}, aux vec{:#x})",
         if present.keyboard { "keyboard " } else { "" },
         if present.mouse { "mouse " } else { "" },
-        // Logged because it changes how every mouse packet is *framed*, so a boot where the
-        // knock silently failed and one where it worked must not look the same in a transcript.
+        // Logged because it changes how every mouse packet is *framed*.
         if present.wheel { "wheel " } else { "" },
         kbd_vec,
         aux_vec
@@ -688,10 +573,8 @@ mod tests {
         }
     }
 
-    /// **An acknowledgement between an `E0` prefix and its code is the exchange's, not a key**
-    /// (Phase 6 Part B.5; PR #357 review). Taken by the decoder, `E0 FA 48` — Up with an answer in
-    /// the middle — is keypad 8 pressed and never released, which is what the second half shows
-    /// the decoder alone still does.
+    /// **An acknowledgement between an `E0` prefix and its code is the exchange's, not a key**: the
+    /// decoder alone reads `E0 FA 48` as keypad 8 pressed and never released.
     #[test]
     fn an_answer_between_e0_and_its_code_is_the_exchanges() {
         let mut g = Inner::new();

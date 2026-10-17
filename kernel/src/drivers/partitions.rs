@@ -1,17 +1,16 @@
-//! **A disk's partition table, parsed** (Phase 6 Part D.1): GPT, MBR, or none.
+//! **A disk's partition table, parsed**: GPT, MBR, or none.
 //!
-//! Whoever can read the disk reads it: the boot's polled read for a SATA disk or a RAM disk
-//! ([`crate::drivers::gpt::init`]), and a USB disk's binding, which reads before the disk is
-//! published. Both hand [`read`] a function that reads 512-byte blocks, and get back what the table
-//! says. **Nothing here touches a device**, so every rule below is a host test over bytes.
+//! Whoever can read the disk reads it: the boot's polled read ([`crate::drivers::gpt::init`]) and a
+//! USB disk's binding, which reads before the disk is published; both hand [`read`] a function that
+//! reads 512-byte blocks. **Nothing here touches a device**, so every rule is a host test over
+//! bytes.
 //!
 //! - **GPT** first: a header at block 1 signed `EFI PART`, its entries where it says, and the
 //!   disk's own GUID, which is how the boot disk is recognised ([`is_boot`]).
-//! - **MBR** otherwise: block 0 signed `0x55AA`, its four primary entries. An extended entry is
-//!   passed over and counted: its logical partitions are not read. **A filesystem's boot sector is
-//!   not an MBR**, though it carries the same signature: a FAT, NTFS or exFAT volume written to a
-//!   whole stick starts with one, and its boot code where the entries would be.
-//! - **None**: the disk is the filesystem, or blank. The storage service probes it as it is.
+//! - **MBR** otherwise: block 0 signed `0x55AA`, its four primary entries; an extended entry is
+//!   passed over and counted. **A filesystem's boot sector is not an MBR** though it carries the
+//!   same signature: a FAT, NTFS or exFAT volume written to a whole stick starts with one.
+//! - **None**: the disk is the filesystem, or blank.
 //!
 //! An entry that does not fit the disk is passed over, in either scheme: a window past the disk's
 //! end would forward reads to blocks that do not exist.
@@ -41,8 +40,8 @@ pub struct Part {
     pub first_lba: u64,
     /// How many blocks it spans.
     pub count: u64,
-    /// **Its number, from 1**: a GPT partition's place among the entries in use, as the kernel has
-    /// always numbered them; an MBR partition's slot, as every other system numbers them.
+    /// **Its number, from 1**: a GPT partition's place among the entries in use; an MBR partition's
+    /// slot.
     pub number: u32,
     /// What the scheme says of it.
     pub kind: PartKind,
@@ -137,7 +136,7 @@ fn gpt(hdr: &[u8], blocks: u64, read_blocks: &mut dyn FnMut(u64, u64, &mut [u8])
         }
         let (first, last) = (u64_at(e, 32), u64_at(e, 40));
         // **Counted only where it cannot overflow**: a stick's table is anyone's bytes, and an
-        // entry from 0 to the last LBA there could be would panic the add (PR #363 review).
+        // entry from 0 to the last LBA there could be would panic the add.
         let Some(count) = last.checked_sub(first).and_then(|n| n.checked_add(1)) else {
             continue;
         };
@@ -213,8 +212,8 @@ fn is_volume_boot_sector(b: &[u8]) -> bool {
     fat16 || fat32
 }
 
-/// Whether `[first, first + count)` lies on a disk of `blocks` blocks. Every caller knows the disk's
-/// size, so a disk of none holds nothing.
+/// Whether `[first, first + count)` lies on a disk of `blocks` blocks; a disk of none holds
+/// nothing.
 fn fits(first: u64, count: u64, blocks: u64) -> bool {
     first.checked_add(count).is_some_and(|end| end <= blocks)
 }
@@ -271,11 +270,10 @@ mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
 
-    /// A disk image in memory, read as a device would be: its first [`STORED`] blocks held, and its
-    /// size what it says, since a table is read from its first blocks alone.
+    /// A disk image in memory, read as a device would be; only its first [`STORED`] blocks are
+    /// held.
     struct Image(KVec<u8>, u64);
 
-    /// Blocks an image holds: a GPT's header and entries, and room.
     const STORED: usize = 64;
 
     impl Image {
@@ -307,7 +305,6 @@ mod tests {
         }
     }
 
-    /// An MBR entry at `slot`: status, type, first block, block count.
     fn mbr_entry(img: &mut Image, slot: usize, status: u8, kind: u8, first: u32, count: u32) {
         let e = img.at(0x1BE + 16 * slot);
         e[0] = status;
@@ -348,8 +345,6 @@ mod tests {
         img
     }
 
-    /// **GPT as the kernel has always read it**, and now its disk's GUID: entries in use numbered
-    /// by their place among those in use, an unused entry between them skipped.
     #[test]
     fn a_gpt_gives_its_entries_in_use_and_its_disk_guid() {
         init_global_heap();
@@ -365,8 +360,8 @@ mod tests {
         assert_eq!(&name[..6], b"n\0i\0t\0", "its name as stored");
     }
 
-    /// **A GPT entry past the disk's end is passed over**, and one whose last block precedes its
-    /// first: a window there would forward reads to blocks that do not exist.
+    /// **A GPT entry past the disk's end is passed over**, as is one whose last block precedes its
+    /// first.
     #[test]
     fn a_gpt_entry_off_the_disk_is_passed_over() {
         init_global_heap();
@@ -377,7 +372,7 @@ mod tests {
                 (0x83, 2048, 4095, "fits"),
                 (0x83, 2048, 4096, "past"),
                 (0x83, 3000, 2999, "back"),
-                // **Every LBA there could be** (PR #363 review): its count overflows, and must not panic.
+                // Every LBA there could be: its count overflows, and must not panic.
                 (0x83, 0, u64::MAX, "all"),
                 (0x83, 1, u64::MAX, "rest"),
             ],
@@ -387,8 +382,7 @@ mod tests {
         assert_eq!(t.parts[0].count, 2048, "the last block is the disk's last");
     }
 
-    /// **A GPT whose entries are off the disk is not read** (PR #363 review): the header says where
-    /// they are, and a stick's header is anyone's bytes. The disk's last block is on it.
+    /// **A GPT whose entries are off the disk is not read**: a stick's header is anyone's bytes.
     #[test]
     fn a_gpt_whose_entries_are_off_the_disk_is_unsupported() {
         init_global_heap();
@@ -404,8 +398,6 @@ mod tests {
         }
     }
 
-    /// **A disk of no blocks holds no partition**: every caller knows its disk's size, and an entry
-    /// cannot lie on none.
     #[test]
     fn a_disk_of_no_blocks_holds_no_partition() {
         init_global_heap();
@@ -416,7 +408,6 @@ mod tests {
         assert_eq!(img.read().unwrap().parts.len(), 0);
     }
 
-    /// An entry size that does not divide a block is not a table this parser takes.
     #[test]
     fn a_gpt_with_odd_entries_is_unsupported() {
         init_global_heap();
@@ -425,8 +416,8 @@ mod tests {
         assert!(matches!(img.read(), Err(Unread::Unsupported(_))));
     }
 
-    /// **An MBR's primary entries**: a protective one with no GPT behind it skipped, an extended one
-    /// counted and passed over, and each partition numbered by its slot.
+    /// **An MBR's primary entries** are numbered by slot; a protective one is skipped, an extended
+    /// one counted.
     #[test]
     fn an_mbr_gives_its_primary_entries_by_slot() {
         init_global_heap();
@@ -444,8 +435,6 @@ mod tests {
         assert_eq!((t.parts[1].number, t.parts[1].first_lba, t.parts[1].count), (4, 6144, 2048));
     }
 
-    /// An MBR entry starting at block 0, empty, or running past the disk is passed over. The last
-    /// block of the disk is the first that does not fit.
     #[test]
     fn an_mbr_entry_off_the_disk_is_passed_over() {
         init_global_heap();
@@ -460,7 +449,6 @@ mod tests {
         assert_eq!(t.parts[0].number, 4, "ending on the disk's last block fits");
     }
 
-    /// **No signature, no table**: a whole-disk ext4's block 0 is zeros, and a blank stick's too.
     #[test]
     fn a_block_without_the_signature_is_no_table() {
         init_global_heap();
@@ -471,7 +459,6 @@ mod tests {
         assert!(t.parts.is_empty());
     }
 
-    /// **A status byte an MBR never has means boot code, not entries**: no table.
     #[test]
     fn a_status_byte_an_mbr_never_has_is_no_table() {
         init_global_heap();
@@ -484,9 +471,8 @@ mod tests {
         assert_eq!(img.read().unwrap().scheme, Scheme::Mbr, "every status 0x00 or 0x80");
     }
 
-    /// **A FAT volume written to a whole stick is not an MBR**, though it is signed as one and its
-    /// boot code may pass the status check: its jump, sector size and extended boot signature say
-    /// what it is, for FAT32 and for FAT12/16 alike.
+    /// **A FAT volume written to a whole stick is not an MBR**, though signed as one: its jump,
+    /// sector size and extended boot signature say what it is.
     #[test]
     fn a_fat_boot_sector_is_no_table() {
         init_global_heap();
@@ -510,7 +496,6 @@ mod tests {
         assert_eq!(img.read().unwrap().scheme, Scheme::Mbr);
     }
 
-    /// NTFS and exFAT, named after the jump, are not MBRs either.
     #[test]
     fn an_ntfs_or_exfat_boot_sector_is_no_table() {
         init_global_heap();
@@ -523,22 +508,17 @@ mod tests {
         }
     }
 
-    /// A read that fails is said, not taken as no table: a disk that cannot be read is not blank.
     #[test]
     fn a_failed_read_is_not_no_table() {
         init_global_heap();
         assert!(matches!(read(64, &mut |_, _, _| false), Err(Unread::Io)));
     }
 
-    /// **A GUID shows as `sgdisk` prints it**: the bytes the spike read off the live stick's record
-    /// are the GUID `sgdisk -p` named for that image.
     #[test]
     fn a_guid_shows_in_its_canonical_form() {
         assert_eq!(format!("{}", Guid(&DISK_GUID)), "54E3387F-156E-4CD0-A689-E20758FEEAB8");
     }
 
-    /// **The boot disk is the one whose GUID Limine named**, and an all-zero GUID — Limine's for a
-    /// volume that is not GPT — is no one's.
     #[test]
     fn the_boot_disk_is_the_one_limine_named() {
         let other = [1u8; 16];

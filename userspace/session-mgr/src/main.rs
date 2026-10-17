@@ -1,31 +1,7 @@
-//! `session-mgr` — the userspace **session manager** (Phase 3, auth + session slice).
-//!
-//! The Tier-5 supervisor that logs a user in and hands them a sandboxed shell. It
-//! holds re-delegated `BIND_NAMESPACE` (from service-mgr) and the building-block
-//! endpoints — the fs-server forwarding endpoint + a channel to auth-service — from
-//! which it composes each login's per-user namespace. See
-//! `docs/architecture/session-and-auth.md`.
-//!
-//! **What it does:** receive the handed-over endpoints, prompt for a credential on a
-//! terminal it opens, authenticate it against auth-service over the auth channel, construct
-//! a session namespace binding the user's `/home` as a subtree of the fs-server
-//! (`BIND_NAMESPACE` + subtree scoping + shared registration), spawn the user shell into it,
-//! reap it, tear the session down, and prompt again.
-//!
-//! **One login path, in every build.** This file has no build-mode `cfg` and the crate
-//! declares no features. It used to auto-log-in a hardcoded credential under `test-harness`
-//! and run a fixed `-c` script, with the interactive `login()` and the whole `tty_*` layer
-//! compiled out — so the gate that adjudicated the boot proved a string comparison worked.
-//! Removed 2026-08-21; `cargo xtask test-interactive` types at the real prompt instead. See
-//! `docs/planning/test-path-retrofit.md`, and `userspace/session-mgr/CLAUDE.md` § Forbidden.
-//!
-//! `#![no_std]` + `#![no_main]`, **with `alloc`**. The no-`alloc` rule was lifted on
-//! 2026-07-31 because session-mgr hands each session its environment, and every step of
-//! that needs a heap: a TSM1 `Record` holds `Vec`s, `send_setup` builds a `Vec<String>`,
-//! and encoding returns a `Vec<u8>`. Without it the *parent* cannot give the child its
-//! environment — which is what Milestone 3.5 is built on. `std` stays unported and there
-//! is no runtime to hand a `main`, so those two rules are unchanged.
-//! See `userspace/session-mgr/CLAUDE.md`.
+//! `session-mgr` — the Tier-5 supervisor that logs a user in and hands them a sandboxed shell:
+//! authenticate against auth-service, build a per-user namespace, spawn the shell, reap it, tear
+//! the session down, prompt again. One login path in every build: no build-mode `cfg`.
+//! `no_std` + `no_main` with `alloc` (the setup message and environment record allocate).
 
 #![no_std]
 #![no_main]
@@ -35,7 +11,6 @@ extern crate alloc;
 use libkern::debug::Line;
 use libkern::*;
 
-/// `alloc` backing: the environment record and the setup-message codec both allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 use librsproto::{decode, encode};
@@ -48,8 +23,7 @@ const MSG_LEN: usize = 4096;
 /// Room for what a wait waits for and, beside it, the notification channel ([`wait_one`]).
 static mut WAIT_HANDLES: [u64; 2] = [0; 2];
 static mut WAIT_RESULTS: [u8; 48] = [0; 48];
-/// This supervisor's notification channel, where a shutdown's terminate request arrives: set once
-/// at startup, and watched beside whatever [`wait_one`] waits for (administration Part E.4c).
+/// This supervisor's notification channel, where a shutdown's terminate request arrives.
 static mut NOTIF_CH: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut RECV_HANDLES: [u64; 8] = [0; 8];
@@ -57,21 +31,13 @@ static mut RECV_COUNT: usize = 0;
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
 
-/// Emit `msg` to the serial console.
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
-/// Park forever. Reached only when this supervisor cannot usefully continue — today, when
-/// its endpoint handoff did not arrive, so no session can be built.
-///
-/// **Parks, never spins.** This was a `pause` loop, which burns a CPU for as long as the
-/// machine is up. The cost is not the cycles: a run queue that is never empty means the
-/// idle thread never runs, and deferred handle reclamation lives there — so a spinning
-/// supervisor stops *every* exited process on the system from being reclaimed, and their
-/// pipes from ever closing. That is exactly the `logging-service` bug of 2026-07-31,
-/// which took an afternoon to find from a hung shell three subsystems away.
+/// Park until a shutdown asks for a stop. Parks, never spins: a spinning supervisor starves the
+/// idle thread, where deferred handle reclamation runs.
 fn idle(notif: u64) -> ! {
     loop {
         wait_one(notif);
@@ -81,9 +47,8 @@ fn idle(notif: u64) -> ! {
     }
 }
 
-/// **A shutdown asked this supervisor to stop** (administration Part E.4c), and it has no session
-/// running: say so and exit. `service-mgr` sees the exit as its control channel closing. A session
-/// running when the request came is ended first, by `libsession::spawn_leader` passing it on.
+/// A shutdown asked this supervisor to stop with no session running: exit.
+/// A running session is ended first, by `libsession::spawn_leader`.
 fn stop() -> ! {
     kprint(b"session-mgr: asked to stop, exiting\n");
     // SAFETY: terminating this process; the terminal it held closes with its handles.
@@ -91,17 +56,14 @@ fn stop() -> ! {
     park();
 }
 
-/// Park forever without a handle to wait on — the panic path, which has no notification
-/// channel in scope. Sleeps in long hops rather than spinning, for the reason [`idle`]
-/// gives: a spinning process starves deferred reclamation system-wide.
+/// Park on the panic path, which has no handle to wait on: long sleeps, never a spin.
 fn park() -> ! {
     loop {
         sleep_ms(60_000);
     }
 }
 
-/// Sleep `ms` milliseconds on a one-shot timer. Best-effort: on any failure it returns
-/// immediately (every caller is pacing, not depending on the delay).
+/// Sleep `ms` on a one-shot timer; best-effort, as every caller only paces.
 fn sleep_ms(ms: u64) {
     // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
     let th = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
@@ -129,12 +91,8 @@ fn sleep_ms(ms: u64) {
     }
 }
 
-/// Block on `handle`; returns `true` if it signalled (vs. a spurious wake).
-///
-/// **The notification channel is watched beside it** (administration Part E.4c), so a shutdown's
-/// terminate request reaches a supervisor waiting at the login prompt, where it has no session to
-/// end: it [`stop`]s. This supervisor has no child between sessions, so nothing it needs is among
-/// the notifications read here.
+/// Block on `handle`; `true` if it signalled. The notification channel is watched beside it, so a
+/// shutdown's terminate request reaches a supervisor at the prompt, which [`stop`]s.
 fn wait_one(handle: u64) -> bool {
     // SAFETY: single-threaded; set once at startup.
     let notif = unsafe { NOTIF_CH };
@@ -166,8 +124,7 @@ fn wait_one(handle: u64) -> bool {
     }
 }
 
-/// Receive the next control message on `ctrl` and return its transferred `handles[0]`
-/// (a handoff carries exactly one moved handle, no payload). `0` on failure.
+/// Receive the next control message and return its one moved handle, or `0` on failure.
 fn recv_handoff(ctrl: u64) -> u64 {
     if !wait_one(ctrl) {
         return 0;
@@ -192,11 +149,6 @@ fn recv_handoff(ctrl: u64) -> u64 {
     unsafe { (&raw const RECV_HANDLES[0]).read() }
 }
 
-// `authenticate`, `build_namespace`, `session_has_bin`/`session_has_tty` and `ns_lookup`
-// moved to `libsession` in M7 Part B — the shared session core both supervisors run. What
-// stays here is the *greeter*: prompting on a terminal, which is where the two columns
-// genuinely differ (`docs/architecture/graphical-session.md` §4).
-
 /// Bootstrap registers: `rdi` = notification channel (reaps the user shell), `rsi` =
 /// the inherited (LOOKUP-only) root namespace, `rdx` = the control channel service-mgr
 /// hands the endpoints over, `rcx` = `arg0` (unused).
@@ -205,67 +157,33 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     kprint(b"session-mgr: up\n");
     // SAFETY: single-threaded; written once, here, before any wait reads it.
     unsafe { NOTIF_CH = notif };
-    // Receive the handed-over endpoints, in order: (1) fs-server endpoint, (2) profile
-    // server endpoint, (3) tty server endpoint. Positional — service-mgr sends an empty message
-    // for an endpoint it does not have, so a missing one shortens no one's count. **All but the
-    // first two are `service-mgr`'s routes** (administration Part E.1b), not the servers' own
-    // endpoints, so a session bound before a server restarts still reaches it after.
+    // Positional: service-mgr sends an empty message (`0`) for an endpoint that did not come up,
+    // so none shifts. All but the first two are `service-mgr`'s routes, which outlive a restart.
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
     let tty_endpoint = recv_handoff(control);
-    // The clipboard server's forwarding endpoint (M12 Part E). **The serial column gets one
-    // too**: M12 decision 4 makes the clipboard reachable as a path so a pipeline can use it,
-    // and this is the column where pipelines are typed.
     let clipboard_endpoint = recv_handoff(control);
-    // The view broker's forwarding endpoint (administration Part A.4), bound into every session
-    // at `/dev/views` with that session's base. `0` on a boot without a broker.
     let views_endpoint = recv_handoff(control);
-    // An info-only endpoint of the device manager's (administration Part B.4), bound into every
-    // session at `/dev/devices` with the base `/info`. `0` on a boot without a manager.
     let devices_endpoint = recv_handoff(control);
-    // **The storage service's session endpoint** (administration Part C.6), bound at `/storage`
-    // and `/dev/storage` in every session. `0` on a boot without the service. **Couriered since
-    // Part E.1b**: it was resolved here, which minted one that died with the service;
-    // `service-mgr` asks for it each time the service comes up, and this is the route to whichever
-    // is current.
     let storage_endpoint = recv_handoff(control);
-    // `service-mgr`'s own session endpoint for its services (administration Part E.2b), bound at
-    // `/dev/services` in every session: the table of services. `0` binds nothing.
     let services_endpoint = recv_handoff(control);
-    // **The auth channel is resolved, not couriered** (M7 Part C). `service-mgr` starts
-    // `auth-service` and binds `/svc/auth` (administration Part E.1a; `init` did until then), and
-    // every supervisor asks the namespace for a session of its own — which is what lets
-    // `desktop-session-mgr` have one too. Before this it arrived
-    // here positionally as a fourth handle, and there was only ever one to hand out.
-    //
-    // Resolved once, at startup rather than per login: the oracle's lifetime is the machine's,
-    // and re-resolving on each attempt would mint a session per login.
-    // `RIGHT_WAIT` is not optional: `libsession::authenticate` blocks on this channel for
-    // the reply, and a handle without it makes `sys_wait` reject the whole set — which
-    // presents as a login that prompts, takes the password, and then never answers.
+    // Resolved once: the oracle lives as long as the machine. `RIGHT_WAIT` is required, or
+    // `sys_wait` rejects the set and a login prompts, takes the password, and never answers.
     let (auth_status, auth_ch) = ns_lookup(root_ns, b"/svc/auth", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if auth_status != 0 || auth_ch == 0 {
         kprint(b"session-mgr: /svc/auth resolve FAIL; no session can authenticate\n");
     }
     if fs_endpoint == 0 || auth_ch == 0 {
-        // No verdict here any more. A supervisor that cannot build sessions is a boot
-        // failure, but adjudicating one is not a session supervisor's job — it says what
-        // happened and stops. `test-qemu` requires the success line below in the
-        // transcript, so this path fails the run without this process knowing a run exists
-        // (`docs/planning/test-path-retrofit.md` Part B).
+        // No verdict: say what happened and stop; `test-qemu` requires the success line below.
         kprint(b"session-mgr: endpoint handoff FAIL\n");
         idle(notif);
     }
-    // A session without `/bin` is the pre-Part-F shell: the language works, nothing
-    // spawns. Degraded, not broken — worth reporting and worth not failing the login over.
     if profile_endpoint == 0 {
         kprint(b"session-mgr: no profile endpoint -- sessions will have no /bin\n");
     }
     kprint(b"session-mgr: received fs + profile endpoints; auth resolved from /svc/auth\n");
-    // **A supervisor channel to the view broker**, resolved once, for `/svc/auth`'s reason: its
-    // lifetime is the machine's. On it this supervisor opens a session for each login and closes
-    // it when the shell exits — the broker's only way to know a session has ended, since a view's
-    // program keeps the session's `/dev/views` registration alive after logout.
+    // Resolved once. A broker session opened per login and closed at logout is the broker's only
+    // way to know it ended.
     let views_sup = if views_endpoint != 0 {
         ns_lookup(root_ns, b"/svc/views/session", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT).1
     } else {
@@ -275,23 +193,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         kprint(b"session-mgr: /svc/views/session resolve FAIL; sessions will have no `with`\n");
     }
 
-    // The session loop: authenticate a user, construct their per-user namespace, spawn
-    // the shell into it, and reap it — the same way in every build.
     let mut home = [0u8; 256];
     let mut user = [0u8; 64];
-    // **The session loop.** It was a single `match` — log in once, run a shell, then park
-    // forever — so typing `exit` left a machine with no prompt and no way back short of a
-    // reboot. A login that cannot be repeated is not a login.
     loop {
-        // One terminal per session: it serves the login prompt, is bound into the session's
-        // namespace for the shell, and is closed when the session ends.
         let tty = tty_open(root_ns);
 
         match login(tty, auth_ch, &mut home, &mut user) {
             Some((hl, ul)) => {
                 Line::new().s(b"session-mgr: login ok -> home=").s(&home[..hl]).end();
-                // **A session with the view broker, before the namespace** — its base is part of what
-                // the namespace binds. `None` builds the session without `/dev/views`.
                 let mut views_base = [0u8; 24];
                 let views = if views_sup != 0 {
                     libsession::views_open_session(views_sup, &user[..ul], &mut views_base)
@@ -308,15 +217,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     user: &user[..ul],
                     // A serial session renders no text, so it takes no fonts.
                     bind_fonts: false,
-                    // The console *is* this column's terminal, so the serial session binds it.
-                    // The graphical column will pass `false` — governing decision 3.
+                    // The console is this column's terminal, so the serial session binds it.
                     bind_console: true,
                     views_endpoint: if views.is_some() { views_endpoint } else { 0 },
                     views_base: &views_base[..views.map_or(0, |v| v.1)],
                     devices_endpoint,
                     storage_endpoint,
                     services_endpoint,
-                    // A session lists its desktop entries; the window pieces are an application's.
                     bind_applications: true,
                     draw_endpoint: 0,
                     desktop_endpoint: 0,
@@ -326,14 +233,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     if let Some((id, _)) = views {
                         libsession::views_close_session(views_sup, id);
                     }
-                    // One bad session: go back to the prompt rather than bricking the console,
-                    // since a permanent park is a worse answer than letting someone try again.
                     continue;
                 }
                 kprint(b"session-mgr: session namespace built (/home subtree + /dev/console");
-                // Named separately because it is the one member that can be absent, and a
-                // run with the bind disabled proved the unconditional message would announce
-                // a `/bin` that was not there — the log has to be able to say "no".
                 if session_has_bin() {
                     kprint(b" + /bin");
                 }
@@ -350,42 +252,21 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     kprint(b" + /storage");
                 }
                 kprint(b")\n");
-                // The payoff: an unprivileged shell in the per-user namespace writes to home.
-                // `nxsh` here; the graphical column will pass `desktop-shell`. Everything
-                // else about the spawn -- the empty syscaps, the session namespace, the Tier-1
-                // setup channel carrying argv and the environment -- is identical, which is what
-                // made it worth sharing.
                 let code = spawn_leader(root_ns, session_ns, notif, "nxsh", &[], 0, &[]);
-                // **Tell the broker the session ended**, before the namespace goes: it asks whatever
-                // it started for this session to stop, and takes back their grants.
+                // Tell the broker the session ended before the namespace goes.
                 if let Some((id, _)) = views {
                     libsession::views_close_session(views_sup, id);
                 }
 
-                // Tear the session down. The shell has been reaped, so this drops the last
-                // reference to the namespace and with it every binding in it — the `/home`
-                // and `/bin` registrations and the `/session/user` snapshot. Without it each
-                // logout would leak a namespace, which is only harmless while there is
-                // exactly one login per boot.
+                // The shell is reaped, so this drops the last reference and every binding with it.
                 // SAFETY: closing the namespace we created for this session.
                 unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
-                // And the terminal. `Close` is the revocation — a process that outlived the
-                // session cannot have its handle taken back, so the server declining to serve
-                // is what ends the terminal.
                 if tty != 0 {
                     tty_close(tty);
                 }
 
-                // The shell exited because the user asked it to. Say what happened and nothing
-                // more — this used to sit beside a harness branch claiming "verified its
-                // environment + wrote to home", a check an interactive session never ran.
                 {
-                    // **One `kprint`, not four.** The console is shared, so a line assembled
-                    // from several calls can be torn by any other process that logs between
-                    // them — this one came back as `session ended (shell exit tty-server:
-                    // terminal closed\n3)`, because the tty server logs the close while the
-                    // status is being written. A log line that another writer can split down
-                    // the middle is not a log line; assemble it, then emit it once.
+                    // One `kprint`: another process logging between calls would tear the line.
                     let mut line = alloc::string::String::from("session-mgr: session ended (shell exit ");
                     let mut buf = [0u8; 20];
                     if code < 0 {
@@ -396,7 +277,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                     line.push_str(")\n");
                     kprint(line.as_bytes());
                 }
-                // **A shutdown ended this session** (administration Part E.4c): no prompt after it.
                 if libsession::stop_asked() {
                     stop();
                 }
@@ -406,30 +286,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 if tty != 0 {
                     tty_close(tty);
                 }
-                // Re-prompt rather than locking out. A serial console has no second way in,
-                // so a lockout bricks the machine; the pause is what keeps repeated failure
-                // from being a free brute-force oracle.
+                // Re-prompt, never lock out (a serial console has no other way in); the pause
+                // denies a free brute-force oracle.
                 sleep_ms(2000);
             }
         }
     }
 }
 
-/// Authenticate a user, returning `(home_len, user_len)` with the home path copied into
-/// `home_out` and the authenticated name into `user_out`, or `None` if denied.
-///
-/// The name comes back because the session namespace publishes it at `/session/user`:
-/// we are the component that authenticated, so we are the one that knows who this is.
-///
-/// Prompts for a username and a password on the terminal, up to a few attempts.
-///
-/// **There used to be two of these**, and the other one is why
-/// `docs/planning/test-path-retrofit.md` exists: under `test-harness` this function was
-/// replaced by an auto-login of a hardcoded demo credential, so the gate that adjudicated
-/// the whole boot ran a build in which the prompt below, the echo discipline, and the whole
-/// `tty_*` layer were compiled out. What it proved about logging in was that a string
-/// comparison worked. The real path is now driven from the host by
-/// `cargo xtask test-interactive`, against the release image.
+/// Authenticate a user in up to three attempts: `(home_len, user_len)` with the home path in
+/// `home_out` and the name (published at `/session/user`) in `user_out`, or `None` if denied.
 fn login(tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Option<(usize, usize)> {
     if tty == 0 {
         kprint(b"session-mgr: no terminal for login\n");
@@ -443,14 +309,11 @@ fn login(tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Op
 
         tty_write(tty, b"password: ");
         let mut pass = [0u8; 128];
-        // The server stops echoing; this cannot be forgotten the way a `bool` argument
-        // could, and the discipline also stops *erasing* on screen, so a backspace in a
-        // password reveals nothing about its length.
+        // The server stops echoing and erasing, so a backspace reveals nothing of the length.
         tty_set_echo(tty, false);
         let plen = tty_read_line(tty, &mut pass);
         tty_set_echo(tty, true);
-        // Nothing was echoed for the password, so the newline the user typed was not shown
-        // either: supply it here so what follows starts on its own line.
+        // The password's newline was not echoed either: supply it.
         tty_write(tty, b"\r\n");
 
         if let Some(hl) = authenticate(auth_ch, &user[..ulen], &pass[..plen], home_out) {
@@ -463,11 +326,7 @@ fn login(tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Op
     None
 }
 
-/// Open a terminal: resolve `/dev/tty`, which yields a fresh per-caller channel.
-///
-/// One tty per session. It serves the login prompt first, is then bound into the session's
-/// namespace for the shell, and is closed when the session ends — the terminal belongs to
-/// the session, not to session-mgr.
+/// Open a terminal: `/dev/tty` yields a fresh per-caller channel, which belongs to the session.
 fn tty_open(root_ns: u64) -> u64 {
     let (st, ch) = ns_lookup(root_ns, b"/dev/tty", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_TRANSFER);
     if st != 0 { 0 } else { ch }
@@ -523,35 +382,24 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
     }
 }
 
-/// Write `text` to the terminal. Output through a handle the process *holds* — not the
-/// ambient debug syscall every program used to print with.
 fn tty_write(ch: u64, text: &[u8]) {
     let mut scratch = [0u8; 1];
     let _ = tty_request(ch, librsproto::OP_TTY_WRITE, text, &mut scratch);
 }
 
-/// Turn echo on or off.
-///
-/// **This is why the tty server exists.** It was a `bool` every caller of `read_line` had
-/// to remember to pass, so reading a password safely depended on each of them getting it
-/// right. Now it is the server's state and a client cannot forget it.
+/// Turn echo on or off; server-side state, so a caller cannot forget it for a password.
 fn tty_set_echo(ch: u64, on: bool) {
     let flags = [if on { librsproto::TTY_MODE_ECHO } else { 0 }];
     let mut scratch = [0u8; 1];
     let _ = tty_request(ch, librsproto::OP_TTY_SET_MODE, &flags, &mut scratch);
 }
 
-/// Read one edited line. The line discipline — backspace, kill, echo — is the server's,
-/// so this is a request rather than a byte loop.
 fn tty_read_line(ch: u64, out: &mut [u8]) -> usize {
     tty_request(ch, librsproto::OP_TTY_READ_LINE, &[], out).unwrap_or(0)
 }
 
-/// Tell the server this terminal is finished, then drop the handle.
-///
-/// **Revocation, not release.** Handles are refcounted and this kernel has none, so closing
-/// cannot take a tty back from a process that outlived the session. The server declining to
-/// serve the channel is what makes teardown a guarantee.
+/// Tell the server this terminal is finished, then drop the handle. Revocation, not release: a
+/// surviving process keeps its handle, so only the server declining to serve ends it.
 fn tty_close(ch: u64) {
     let mut scratch = [0u8; 1];
     let _ = tty_request(ch, librsproto::OP_TTY_CLOSE, &[], &mut scratch);

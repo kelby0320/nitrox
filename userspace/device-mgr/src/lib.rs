@@ -1,9 +1,8 @@
 //! `device-mgr` — the part of the device manager that can be wrong about a device.
 //!
 //! The manager learns what devices the machine has and hands each to the service that owns its
-//! class: the keyboard and mouse to `input-server`, disks to the storage service (administration
-//! Part C). It does not drive devices. `docs/planning/administration.md` § *Part B in detail* is
-//! the design; `docs/spec/rsproto-devices-ops.md` the protocol.
+//! class: the keyboard and mouse to `input-server`, disks to the storage service. It does not
+//! drive devices. `docs/spec/rsproto-devices-ops.md` is the protocol.
 //!
 //! This library is everything it decides with, apart from the syscalls, so it can be tested on
 //! the host:
@@ -35,9 +34,8 @@ pub mod names {
             DeviceKind::Console => String::from("console"),
             DeviceKind::PciFunction if r.seg == 0 => format!("pci-{:02x}.{:02x}.{}", r.bus, r.dev, r.func),
             DeviceKind::PciFunction => format!("pci-{:04x}.{:02x}.{:02x}.{}", r.seg, r.bus, r.dev, r.func),
-            // **After its id, never its port** (PR #353 review): a port is reused when one device
-            // leaves and another arrives, while the first's record stays; a connector even has two
-            // port numbers. The id is never reused, as `blk-<served>`'s index is not.
+            // After its id, never its port: a port is reused when one device leaves and another
+            // arrives, while the first's record stays. The id is never reused.
             DeviceKind::UsbDevice => format!("usb-{}", r.id),
             DeviceKind::Unknown => format!("dev-{}", r.id),
         }
@@ -85,7 +83,7 @@ pub mod classes {
     pub enum Class {
         /// Keyboards and mice — `input-server`'s.
         Input,
-        /// Disks, partitions and RAM disks — the storage service's, from Part C.
+        /// Disks, partitions and RAM disks — the storage service's.
         Block,
     }
 
@@ -98,8 +96,8 @@ pub mod classes {
             match kind {
                 DeviceKind::Keyboard | DeviceKind::Mouse => Some(Class::Input),
                 DeviceKind::Disk | DeviceKind::Partition | DeviceKind::RamDisk => Some(Class::Block),
-                // A USB device is no class's until a driver binds an interface of it (Phase 6 Parts
-                // B and D): what is handed out then is the keyboard or the disk, not the device.
+                // A USB device is no class's until a driver binds an interface of it: what is
+                // handed out then is the keyboard or the disk, not the device.
                 DeviceKind::Console | DeviceKind::PciFunction | DeviceKind::UsbDevice | DeviceKind::Unknown => None,
             }
         }
@@ -123,7 +121,7 @@ pub mod classes {
     }
 
     /// The devices a new owner of `class` is sent, in table order — the replay that is coldplug.
-    /// **A departed device is left out** (Phase 6 Part C): it is not there to hand over.
+    /// **A departed device is left out**: it is not there to hand over.
     pub fn replay(records: &[DeviceRecord], class: Class) -> Vec<&DeviceRecord> {
         records.iter().filter(|r| !r.is_departed() && Class::of(r.kind()) == Some(class)).collect()
     }
@@ -133,7 +131,7 @@ pub mod classes {
     #[derive(Debug, Default)]
     pub struct Owners {
         owner: [Option<u64>; 2],
-        /// **The devices each class's owner has been handed**, by registry id (PR #361 review): a
+        /// **The devices each class's owner has been handed**, by registry id: a
         /// `Departed` is owed for these alone. A device whose `Arrived` did not send, or whose node
         /// the manager never took, was not handed over.
         handed: [Vec<u32>; 2],
@@ -215,10 +213,10 @@ pub mod table {
     //!
     //! Columns: `name`, `kind`, `path`, `size` (bytes, a block device's), `description` (a disk's
     //! model and serial, a partition's label, a RAM disk's module and path, a PCI function's ids, a
-    //! USB device's name, ids, class, port and speed),
-    //! `parent` (the name of the device it belongs to), `driver`, and `boot` (whether it is the disk
-    //! the machine started from, Phase 6 Part D). What a device does not have is `Null`, not zero or
-    //! empty: a keyboard has no size, which is different from a size of nothing.
+    //! USB device's name, ids, class, port and speed), `parent` (the name of the device it belongs
+    //! to), `driver`, and `boot` (whether it is the disk the machine started from). What a device
+    //! does not have is `Null`, not zero or empty: a keyboard has no size, which is different from
+    //! a size of nothing.
 
     use alloc::format;
     use alloc::string::String;
@@ -258,9 +256,7 @@ pub mod table {
                 r.vendor, r.device, r.pci_class, r.subclass, r.prog_if
             )))
         } else if r.kind() == DeviceKind::UsbDevice {
-            // Its name, then where and what it is: the ids and the class a driver will match on,
-            // and the port and speed a person can see from the outside of the machine. A device
-            // with no strings is named by its ids, which this says once.
+            // A device with no strings is named by its ids, which this says once.
             let ids = format!("{:04x}:{:04x}", r.vendor, r.device);
             let mut d = String::from_utf8_lossy(r.name()).into_owned();
             if d == ids {
@@ -279,7 +275,6 @@ pub mod table {
             ));
             Some(Value::Str(d))
         } else if matches!(r.kind(), DeviceKind::Keyboard | DeviceKind::Mouse | DeviceKind::Console) {
-            // The name *is* the kind for these; a description repeating it says nothing.
             None
         } else {
             text(r.name())
@@ -300,12 +295,12 @@ pub mod table {
             or_null(description),
             or_null(parent),
             or_null(driver),
-            // **The disk the machine started from** (Phase 6 Part D): what `nxinstall` refuses.
+            // The disk the machine started from: what `nxinstall` refuses.
             Value::Bool(r.is_boot_medium()),
         ]
     }
 
-    /// A USB device's speed, by the xHCI's default speed IDs, as the record carries it.
+    /// A USB device's speed, by the xHCI's default speed IDs.
     pub fn usb_speed(id: u8) -> &'static str {
         match id {
             1 => "full-speed",
@@ -326,7 +321,7 @@ pub mod table {
     }
 
     /// `all.tsm`: every present device, a row each, in table order. **A departed device has no
-    /// row** (Phase 6 Part C): the tables say what the machine has.
+    /// row**: the tables say what the machine has.
     pub fn all(records: &[DeviceRecord]) -> Vec<u8> {
         encode(records.iter().filter(|r| !r.is_departed()).map(|r| row(r, records)).collect())
     }
@@ -337,7 +332,7 @@ pub mod table {
         Some(encode(vec![row(r, records)]))
     }
 
-    /// The directory's entries: `all.tsm` and `io.tsm`, then each present device's, in table order.
+    /// The directory's entries: `all.tsm`, `io.tsm`, then each present device's.
     pub fn entries(records: &[DeviceRecord]) -> Vec<String> {
         let mut out = vec![String::from("all.tsm"), String::from("io.tsm")];
         out.extend(records.iter().filter(|r| !r.is_departed()).map(|r| format!("{}.tsm", names::name(r))));
@@ -346,18 +341,16 @@ pub mod table {
 }
 
 pub mod io {
-    //! **`io.tsm`: what the disks and the page cache have done since boot** (Phase 6 Part H.2), from
+    //! **`io.tsm`: what the disks and the page cache have done since boot**, from
     //! `/dev/registry/io`, read afresh for each resolve. A row per present disk and RAM disk, named
-    //! as in `all.tsm`, then one named `page-cache`. `nxsh`'s `time` reads it before and after a
-    //! pipeline and prints the difference; `open /dev/devices/io.tsm | save` takes it off the
-    //! machine whole.
+    //! as in `all.tsm`, then one named `page-cache`.
     //!
     //! Columns: `name`; `reads`, `writes`, `flushes` and `errors`, the commands the device's driver
     //! saw retire; `read_bytes` and `written_bytes`; `busy_ns`, the nanoseconds commands were on the
     //! device; and the page cache's own `hits` and `holes`. **The page cache's row** counts its fills
     //! as `reads` and their pages as `read_bytes`, its write-back IRPs as `writes` and their pages
-    //! as `written_bytes`, and the time both took as `busy_ns` — time spent waiting on the devices,
-    //! so it overlaps theirs rather than adding to it. What a row does not have is `Null`.
+    //! as `written_bytes`, and the time both took as `busy_ns`, which overlaps the devices' own.
+    //! What a row does not have is `Null`.
 
     use alloc::string::String;
     use alloc::vec;
@@ -379,7 +372,7 @@ pub mod io {
             .fold(s, int)
     }
 
-    /// A count as a cell: an `Int`, saturating at `i64::MAX`.
+    /// A count as an `Int`, saturating.
     fn n(v: u64) -> Value {
         Value::Int(v.min(i64::MAX as u64) as i64)
     }
@@ -421,16 +414,15 @@ pub mod io {
         ]);
         let table = Table { flags: StreamFlags::NONE, schema: schema(), rows };
         let mut out = Vec::new();
-        // A `Vec` sink cannot fail, and every row has the schema's shape by construction.
         let _ = table.encode(&mut out);
         out
     }
 }
 
 pub mod follow {
-    //! **What changed in the table between two reads** (Phase 6 Part C). The manager keeps the
-    //! records of its last read and, each time `/dev/registry/changes` answers, reads the table again
-    //! and diffs. An id is a record's place, so a record is found in the old read by its id.
+    //! **What changed in the table between two reads.** The manager keeps the records of its last
+    //! read and, each time `/dev/registry/changes` answers, reads the table again and diffs. An id
+    //! is a record's place, so a record is found in the old read by its id.
 
     use alloc::vec::Vec;
     use libkern::device::DeviceRecord;
@@ -450,7 +442,7 @@ pub mod follow {
     /// - **a record that arrived and departed between the two reads is told to no one**: it was
     ///   never handed over, so there is nothing to take back.
     ///
-    /// A departure is final, so a record held departed and present now cannot be, and is ignored.
+    /// A departure is final, so a record held departed and present now is ignored.
     pub fn diff(held: &[DeviceRecord], now: &[DeviceRecord]) -> Vec<Change> {
         let at = |id: u32| held.get(id as usize).filter(|r| r.id == id);
         now.iter()
@@ -468,12 +460,12 @@ pub mod suffix {
     //! from.
     //!
     //! **A session reaches the manager through an endpoint of its own**, not the one bound at
-    //! `/svc/devices` (administration Part B.4). `service-mgr` resolves `info-endpoint` once and
+    //! `/svc/devices`. `service-mgr` resolves `info-endpoint` once and
     //! the supervisors bind what it gets at `/dev/devices`, with the base `/info`; a resolve
     //! arriving there is [`info_only`] — **the information and nothing else**, whatever its suffix.
     //! The base alone would not be enough: `desktop-shell` holds the endpoint and `BIND_NAMESPACE`,
     //! so it could bind it with no base, and a suffix like `block` would then be a subscription to
-    //! every disk. An endpoint that cannot subscribe is a capability the shell can be handed.
+    //! every disk.
 
     use crate::classes::Class;
 
@@ -564,9 +556,8 @@ mod tests {
         r
     }
 
-    /// A boot's table, as the kernel's registry reports it: an AHCI controller that claimed
-    /// itself a disk, a function nobody claimed, the disk and its partition, a RAM disk, the
-    /// console, the keyboard and the mouse.
+    /// A boot's table: two PCI functions, a disk and its partition, a RAM disk, the console, the
+    /// keyboard and the mouse.
     fn boot() -> Vec<DeviceRecord> {
         let mut ahci = rec(0, DeviceKind::PciFunction, NOT_SERVED, NO_PARENT, "");
         (ahci.vendor, ahci.device, ahci.pci_class, ahci.subclass, ahci.prog_if) = (0x8086, 0x2922, 1, 6, 1);
@@ -591,8 +582,8 @@ mod tests {
         ]
     }
 
-    /// **A name is its path's**, and the `<n>` is the served index — the keyboard is `input-0`
-    /// though the console sits between it and the disks.
+    /// The `<n>` is the served index: the keyboard is `input-0` though the console sits between it
+    /// and the disks.
     #[test]
     fn a_device_is_named_by_the_path_that_serves_it() {
         let b = boot();
@@ -606,9 +597,6 @@ mod tests {
         assert_eq!(name(&far), "pci-0001.00.1f.2", "a second segment is named");
     }
 
-    /// **A USB device** (Phase 6 Part A.3): named by its id, never its port; no path; the kind
-    /// `usb`; no class's until a driver binds an interface of it; and described by its name, ids,
-    /// class, port and speed, with the controller as its parent.
     #[test]
     fn a_usb_device_is_named_by_its_id_and_described_by_where_it_is() {
         let b = boot();
@@ -631,7 +619,6 @@ mod tests {
             Value::Str(String::from("QEMU USB Keyboard (42), 0627:0001 class 03/01/01, port 9, high-speed"))
         );
         assert_eq!(row[5], Value::Str(name(&b[1])), "the controller is its parent");
-        // The kernel names a device with no strings by its ids, `vvvv:pppp`.
         let unnamed = rec(8, DeviceKind::UsbDevice, NOT_SERVED, 1, "0627:0001");
         let unnamed = DeviceRecord { vendor: kbd.vendor, device: kbd.device, port: 9, speed: 3, ..unnamed };
         let unnamed = DeviceRecord { pci_class: 3, subclass: 1, prog_if: 1, ..unnamed };
@@ -642,8 +629,6 @@ mod tests {
         );
     }
 
-    /// **The replay is the class, in table order** — and the console, a `Char` device like the
-    /// keyboard, is nobody's.
     #[test]
     fn a_new_owner_is_sent_its_class_in_table_order() {
         let b = boot();
@@ -654,7 +639,6 @@ mod tests {
         assert_eq!(Class::of(DeviceKind::PciFunction), None);
     }
 
-    /// **One owner per class**, and a class is taken again once its owner goes.
     #[test]
     fn a_class_has_one_owner_at_a_time() {
         let mut o = Owners::new();
@@ -670,9 +654,6 @@ mod tests {
         assert_eq!(chans, [11, 12]);
     }
 
-    /// **A `Departed` is owed only for a device the owner was handed**, once (PR #361 review;
-    /// `rsproto-devices-ops.md`): not for one whose `Arrived` never went, nor to the next owner for
-    /// what the last one was handed — its replay hands it again.
     #[test]
     fn a_departed_is_owed_for_what_the_owner_was_handed_once() {
         let mut o = Owners::new();
@@ -692,8 +673,6 @@ mod tests {
         assert!(!o.departed(Class::Input, 4), "handed twice, owed once");
     }
 
-    /// **The rows decode as the shell's `open` decodes them**, with `Null` where a device has no
-    /// value — a keyboard's size is absent, not zero.
     #[test]
     fn all_tsm_is_a_table_a_row_per_device() {
         let mut b = boot();
@@ -718,9 +697,8 @@ mod tests {
         assert_eq!(cell(3, "boot"), Value::Bool(false), "not its partition");
     }
 
-    /// **The file the shell opens is page-padded**, as a memory object is: the table still
-    /// decodes to its rows. `Table::decode` stops at the terminator — pinned here, where the
-    /// padding is real, because a round trip over the exact bytes cannot see it.
+    /// The file the shell opens is page-padded, as a memory object is; a round trip over the
+    /// exact bytes cannot see that `Table::decode` stops at the terminator.
     #[test]
     fn a_padded_table_decodes_to_its_rows() {
         let b = boot();
@@ -732,8 +710,6 @@ mod tests {
         assert!(table::one(&b, "blk-9").is_none());
     }
 
-    /// **`all.tsm` and `io.tsm` first, then a file per device** — so `list /dev/devices` names every
-    /// device.
     #[test]
     fn the_directory_lists_all_then_each_device() {
         let b = boot();
@@ -743,10 +719,7 @@ mod tests {
         assert!(e.contains(&"input-1.tsm".to_string()));
     }
 
-    /// **`io.tsm`: a row per present disk and RAM disk, by its name, then the page cache's** (Phase 6
-    /// Part H.2). No row for a departed disk, nor for one the manager has not read a record of yet;
-    /// the cache's fills and write-backs in a disk's columns, in their pages' bytes, and its hits and
-    /// holes in columns a disk has as `Null`.
+    /// No row for a departed disk, nor for one the manager has not read a record of yet.
     #[test]
     fn io_has_a_row_per_present_disk_and_one_for_the_page_cache() {
         use libkern::device::{CacheCounts, DEPARTED, IoRecord};
@@ -795,15 +768,12 @@ mod tests {
             (Value::Int(100), Value::Int(100), Value::Int(2), Value::Null)
         );
 
-        // The disk departs: its row goes, whichever side says so.
         b[2].flags = DEPARTED;
         assert_eq!(Table::decode(&super::io::table(cache, &[disk, ram], &b)).unwrap().rows.len(), 2);
         let gone = IoRecord { flags: DEPARTED as u32, ..ram };
         assert_eq!(Table::decode(&super::io::table(cache, &[gone], &boot())).unwrap().rows.len(), 1);
     }
 
-    /// **What a session can reach is the information and nothing else**: its base is `/info`, so
-    /// every resolve from a session arrives under it, and a class is a bare name.
     #[test]
     fn a_suffix_asks_for_a_class_the_directory_or_a_file() {
         assert_eq!(suffix::parse(b"input"), Asked::Subscribe(Class::Input));
@@ -817,10 +787,6 @@ mod tests {
         }
     }
 
-    /// **An info-only endpoint answers the information and nothing else** — whatever suffix
-    /// reaches it, which is what makes it safe to hand to a process that could bind it with any
-    /// base. Every suffix the root endpoint would subscribe or mint on is refused here, and the
-    /// information passes as asked.
     #[test]
     fn an_info_only_endpoint_answers_the_information_and_nothing_else() {
         for asked in [b"input".as_slice(), b"block", b"info-endpoint"] {
@@ -838,7 +804,7 @@ mod tests {
         r
     }
 
-    /// A USB keyboard plugged in after the boot's table: its device, then its keyboard node.
+    /// A USB device and its keyboard node, plugged in after the boot's table.
     fn plugged(table: &mut Vec<DeviceRecord>) -> (u32, u32) {
         let usb = table.len() as u32;
         table.push(rec(usb, DeviceKind::UsbDevice, NOT_SERVED, 0, "QEMU USB Keyboard"));
@@ -846,9 +812,6 @@ mod tests {
         (usb, usb + 1)
     }
 
-    /// **What changed between two reads** (Phase 6 Part C): a device plugged in arrives, the same
-    /// device unplugged departs, and both in one read — a device that came and went between two
-    /// reads — is told to no one. A read with nothing new says nothing.
     #[test]
     fn a_diff_finds_arrivals_and_departures_and_skips_what_came_and_went() {
         use super::follow::{Change, diff};
@@ -865,8 +828,6 @@ mod tests {
         assert!(diff(&gone, &gone).is_empty(), "a departure is told once");
     }
 
-    /// **A departed device is in no replay and no table** (Phase 6 Part C), so an owner subscribing
-    /// after it went is not handed it, and `/dev/devices` does not list it.
     #[test]
     fn a_departed_device_is_in_no_replay_and_no_table() {
         let mut t = boot();

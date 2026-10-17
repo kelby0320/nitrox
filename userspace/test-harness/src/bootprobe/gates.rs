@@ -19,7 +19,7 @@ fn parse_field(text: &[u8], key: &[u8]) -> Option<u64> {
 }
 
 /// Count the `cpu=` rows in a `/proc/sched/stats` snapshot whose `switches`
-/// counter is nonzero — the clause-3 "CPUs visibly active" measure.
+/// counter is nonzero.
 fn cpus_with_switches(text: &[u8]) -> u64 {
     let mut n = 0;
     for line in text.split(|&b| b == b'\n') {
@@ -30,38 +30,26 @@ fn cpus_with_switches(text: &[u8]) -> u64 {
     n
 }
 
-/// The Phase 4 **hardware floating point** verdict gate, checked synchronously at the
-/// single PASS point — the same placement, and for the same reason, as [`sched_gate`].
+/// The **hardware floating point** verdict gate, checked at the single PASS point like
+/// [`sched_gate`]. It proves from ring 3 that `f64` arithmetic and the kernel's FP register
+/// swap on context switch work:
 ///
-/// Userspace now compiles for `x86_64-unknown-nitrox`, a hard-float target: `f64`
-/// arithmetic lowers to `mulsd`/`addsd` instead of the `__muldf3` libcalls the old
-/// soft-float target emitted, and the kernel swaps the FP register file on every context
-/// switch. This gate proves that actually works, from ring 3:
-///
-/// - **Against integer math.** Σ v[k]² is computed in `f64` and again in `u64` and must
-///   agree *exactly* — every value is a small exact integer, so the comparison is
-///   bit-exact rather than epsilon-fuzzy. A self-consistent-but-wrong FPU (a bad
-///   multiply, a stuck rounding mode, an `MXCSR` we failed to initialise) fails here
-///   where a float-only check would not.
-/// - **Round trip across a syscall.** `x → 2x+1 → (x-1)/2` is exactly invertible at
-///   these magnitudes. The forward half runs, the process crosses into the kernel (and
-///   may be preempted and migrated), and the inverse half must reproduce the original
-///   bit patterns.
+/// - **Against integer math.** Σ v[k]² is computed in `f64` and again in `u64` and must agree
+///   *exactly* (every value is a small exact integer), so a self-consistent-but-wrong FPU (a
+///   bad multiply, a stuck rounding mode, an uninitialised `MXCSR`) fails here where a
+///   float-only check would not.
+/// - **Round trip across a syscall.** `x → 2x+1 → (x-1)/2` is exactly invertible at these
+///   magnitudes; the process crosses into the kernel (and may be preempted and migrated)
+///   between the halves, and the inverse must reproduce the original bit patterns.
 /// - **Scalar vs. AVX2, and `XCR0` from ring 3.** When the CPU has AVX2 *and* the OS
-///   enabled the SSE+AVX state components — read back with `XGETBV`, which is userspace
-///   independently confirming the `XCR0` write the kernel made in `fpu_init_cpu` — the
-///   same sum computed through `#[target_feature(enable = "avx2")]` intrinsics must
-///   match exactly. That is the per-function opt-in pattern the GUI toolkit's font and
-///   image crates will use.
+///   enabled the SSE+AVX state components (read back with `XGETBV`, independently confirming
+///   the kernel's `XCR0` write), the same sum through `#[target_feature(enable = "avx2")]`
+///   intrinsics must match exactly.
 ///
-/// **Why beside the verdict and not in the demo `parent`.** It was in `parent` first, and a
-/// KVM boot-loop showed it completing in only 2 of 15 runs: whoever owns the verdict races
-/// the demo chain, so on a fast boot the run was adjudicated PASS while the FP workers were
-/// still running — the check silently did not execute. Running it *immediately before* the
-/// only `SYS_TEST_EXIT(PASS)` call is what makes it airtight, and that property moved here
-/// intact when the verdict did: `boot-probe` is now the single PASS point, and `init` starts
-/// it only after the demo chain has exited zero. `parent` keeps a *concurrent* multi-process
-/// version as extra breadth; this one is the guarantee.
+/// **Why beside the verdict and not in the demo `parent`.** Whoever owns the verdict races
+/// the demo chain: on a fast boot the run was adjudicated PASS while the FP workers were still
+/// running, so the check silently did not execute. Running it immediately before the only
+/// `SYS_TEST_EXIT(PASS)` call is what makes it airtight.
 pub(super) fn fp_gate() -> bool {
     const LANES: usize = 8;
     let mut v = [0f64; LANES];
@@ -87,7 +75,6 @@ pub(super) fn fp_gate() -> bool {
         return false;
     }
 
-    // Round trip across a syscall, with the transformed values live.
     for x in v.iter_mut() {
         *x = *x * 2.0 + 1.0;
     }
@@ -192,14 +179,11 @@ unsafe fn fp_sum_squares_avx2(v: &[f64; 8]) -> f64 {
     }
 }
 
-/// The Phase 3 **clause 3** verdict gate, checked synchronously at the single
-/// PASS point: resolve `/proc/sched/stats` through the inherited namespace, map
-/// the snapshot, and require **≥ 2 CPUs with `switches` > 0** ("two CPUs
-/// visibly active via `/proc`"). Login proving alone must not PASS a boot whose
-/// SMP substrate has died — and because this runs *before* the only
-/// `SYS_TEST_EXIT(PASS)` call, a failure cannot lose a race to the verdict (the
-/// demo `parent`'s richer sched-stats check exits nonzero for init to fail the
-/// run, but that path races the login chain; this placement is airtight).
+/// The scheduler verdict gate, checked at the single PASS point: resolve `/proc/sched/stats`
+/// through the inherited namespace, map the snapshot, and require **at least two CPUs with
+/// nonzero `switches`**. Login proving alone must not PASS a boot whose SMP substrate has died,
+/// and running before the only `SYS_TEST_EXIT(PASS)` call means a failure cannot lose a race to
+/// the verdict.
 pub(super) fn sched_gate(root_ns: u64) -> bool {
     let (st, mem) = ns_lookup(root_ns, b"/proc/sched/stats", RIGHT_MAP_READ);
     if st != 0 || mem == 0 {

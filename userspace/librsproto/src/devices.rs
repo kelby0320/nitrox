@@ -1,18 +1,14 @@
 //! `Devices` (`op = 0x0Fxx`) — the device manager, served at `/svc/devices`. See
-//! `docs/spec/rsproto-devices-ops.md` and `docs/planning/administration.md` § Part B.
+//! `docs/spec/rsproto-devices-ops.md`.
 //!
 //! **A class owner subscribes by resolving `/svc/devices/<class>`.** The resolve's answer is a
-//! channel, and the manager sends on it, unsolicited: an [`OP_DEVICES_ARRIVED`] for every present
-//! device of the class, each carrying the device's handle, then one [`OP_DEVICES_SETTLED`]. That
-//! replay is coldplug. Later arrivals — Phase 6's — and [`OP_DEVICES_DEPARTED`] follow on the same
-//! channel. **A class has one owner at a time**: a second resolve is refused with `AlreadyExists`
-//! while the first channel is open, because a raw device has one reader in the kernel and a second
-//! would drain the first one's events.
-//!
-//! The information side — `/svc/devices/info`, a directory of TSM1 tables — speaks the ordinary
-//! `File` and `Namespace` operations, not these.
-//!
-//! Bodies are little-endian and byte-serialised into a caller buffer, like every category here.
+//! channel, and the manager sends on it, unsolicited: an [`OP_DEVICES_ARRIVED`] for every
+//! present device of the class, each carrying the device's handle, then one
+//! [`OP_DEVICES_SETTLED`] (coldplug); later arrivals and [`OP_DEVICES_DEPARTED`] follow on the
+//! same channel. **A class has one owner at a time**: a second resolve is refused with
+//! `AlreadyExists` while the first channel is open, because a raw device has one reader in the
+//! kernel. The information side (`/svc/devices/info`, TSM1 tables) speaks the ordinary `File`
+//! and `Namespace` operations.
 
 use crate::{get_u32, put_u32};
 
@@ -21,12 +17,9 @@ use crate::{get_u32, put_u32};
 /// (`libkern::device::DeviceRecord`). `handles[0]`: the device node — the owner's own duplicate.
 pub const OP_DEVICES_ARRIVED: u16 = 0x0F00;
 /// Manager → owner, unsolicited: every device present when the owner subscribed has arrived.
-/// Body [`build_settled`]: how many did. An owner that serves only once it has its devices waits
-/// for this, not for a count it cannot know.
+/// Body [`build_settled`]: how many did (`rsproto-devices-ops.md`).
 pub const OP_DEVICES_SETTLED: u16 = 0x0F01;
 /// Manager → owner, unsolicited: a device has gone. Body [`build_departed`]: its registry id.
-/// **Nothing sends one until Phase 6** gives the kernel an event source; it is specified now so an
-/// owner is written against it from the start.
 pub const OP_DEVICES_DEPARTED: u16 = 0x0F02;
 
 /// Bytes of a registry record — `libkern::device::DeviceRecord`'s size, which both sides assert.
@@ -34,8 +27,7 @@ pub const RECORD_LEN: usize = 144;
 /// Bytes of a `Settled` or `Departed` body.
 pub const WORD_LEN: usize = 4;
 
-/// Build an `Arrived` body: the record's bytes. `None` if `record` is not [`RECORD_LEN`] bytes or
-/// `out` is too small.
+/// Build an `Arrived` body; `None` if `record` is not [`RECORD_LEN`] bytes or `out` is short.
 pub fn build_arrived(out: &mut [u8], record: &[u8]) -> Option<usize> {
     if record.len() != RECORD_LEN || out.len() < RECORD_LEN {
         return None;
@@ -91,7 +83,6 @@ mod tests {
         let mut out = [0u8; 256];
         let n = build_arrived(&mut out, &record).unwrap();
         assert_eq!(parse_arrived(&out[..n]), Some(&record[..]));
-        // What a correct manager never sends: a record cut short, or with bytes after it.
         assert_eq!(parse_arrived(&out[..n - 1]), None);
         assert_eq!(parse_arrived(&out[..n + 1]), None);
         assert_eq!(build_arrived(&mut out, &record[..RECORD_LEN - 1]), None, "not a record");

@@ -1,32 +1,10 @@
 //! The shared session core: **authenticate → construct the namespace → spawn the leader →
 //! reap → tear down**.
 //!
-//! The same sequence runs in both columns — `session-mgr` on a terminal and, from M7 Part D,
-//! `desktop-session-mgr` in a window — against different arguments. Following Linux's PAM
-//! precedent this is a **shared library, not a merged process**
-//! (`docs/architecture/graphical-session.md` §4): the two supervisors stay separate principals with
-//! separate lifetimes, and only the logic they genuinely share lives here.
-//!
-//! **The greeter is not here.** Prompting on a terminal and drawing a login window have
-//! nothing in common but their result, so each supervisor keeps its own. What this crate
-//! starts with is credentials in hand, and what it ends with is a leader that has exited.
-//!
-//! ## Why this crate exists before its second caller
-//!
-//! `session-mgr` moves onto it first and `cargo xtask test-interactive` stays green, which is
-//! the point: the serial column proves the core before the graphical one depends on it. The
-//! alternative is a crate whose only caller is also new, where a bug in either is
-//! indistinguishable from a bug in the other.
-//!
-//! It is also why `docs/planning/test-path-retrofit.md` was a prerequisite for this milestone
-//! rather than a follow-up: factoring a `login()` that had two compilations would have carried
-//! the fork into the shared crate.
-//!
-//! ## Constraints
-//!
-//! `#![no_std]` with `alloc`, and **no `libos`** — `session-mgr` links this and that is its
-//! rule (`userspace/session-mgr/CLAUDE.md`). `alloc` is needed for the same reason it was
-//! allowed there on 2026-07-31: a session's environment is a TSM1 `Record` of `Vec`s.
+//! `session-mgr` and `desktop-session-mgr` run the same sequence against different arguments: a
+//! **shared library, not a merged process** (`docs/architecture/graphical-session.md` §4).
+//! **The greeter is not here**; it starts with credentials in hand and ends with a leader that
+//! has exited. `no_std` with `alloc`, and **no `libos`** (`userspace/session-mgr/CLAUDE.md`).
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -44,32 +22,16 @@ const PAYLOAD_OFF: usize = 24;
 /// The largest IPC message this crate sends or receives.
 const MSG_LEN: usize = 4096;
 
-/// **This crate's own message buffers**, not shared with its caller's.
-///
-/// A supervisor keeps `.bss` buffers rather than allocating per message, and reaching across
-/// the crate boundary for the caller's would make two unrelated conversations — a session's
-/// authentication and a supervisor's terminal I/O — share one buffer. Two 4 KiB buffers is
-/// the price of them not being able to tread on each other.
+/// **This crate's own message buffers**, not the caller's, so the two conversations cannot collide.
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-/// See [`RECV_MSG`].
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-/// See [`RECV_MSG`].
 static mut RECV_HANDLES: [u64; 8] = [0; 8];
-/// See [`RECV_MSG`].
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
-/// See [`RECV_MSG`].
 static mut RECV_COUNT: usize = 0;
-/// See [`RECV_MSG`].
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 
-/// See [`RECV_MSG`].
 static mut WAIT_HANDLES: [u64; 1] = [0; 1];
 
-/// Block until `handle` is signalled. `false` if the wait did not report it.
-///
-/// A copy of `session-mgr`'s rather than a shared one, for the same reason the message
-/// buffers are: it owns a `.bss` handle array, and two callers sharing one would be two
-/// conversations sharing a slot.
 fn wait_one(handle: u64) -> bool {
     wait_until(handle, u64::MAX)
 }
@@ -85,7 +47,6 @@ fn wait_until(handle: u64, deadline: u64) -> bool {
     waited == 1
 }
 
-/// The monotonic clock, in nanoseconds.
 fn now_ns() -> u64 {
     let mut now: u64 = 0;
     // SAFETY: `&now` is a valid writable u64 out-param.
@@ -93,25 +54,20 @@ fn now_ns() -> u64 {
     now
 }
 
-/// Whether a terminate request has reached this process (administration Part E.4c): what a
-/// shutdown sends each login supervisor. Set by [`spawn_leader`] and [`drain_for_stop`].
+/// Whether a terminate request has reached this process; set by [`spawn_leader`] and the drain.
 static STOP_ASKED: AtomicBool = AtomicBool::new(false);
 
-/// How long a session's leader has, once asked to stop, before its supervisor goes on without it.
-/// Shorter than `service-mgr`'s bound on the supervisor itself, 10 s, which must cover it.
-/// **Public, because a leader's own wait must fit inside it** — `desktop-shell`'s for its windows
-/// (administration Part F.2), whose host test compares the two.
+/// How long a leader has, once asked to stop, before its supervisor goes on without it; under
+/// `service-mgr`'s 10 s bound. **Public, because a leader's own wait must fit inside it.**
 pub const LEADER_STOP_NS: u64 = 5_000_000_000;
 
-/// **Whether this process has been asked to stop** (administration Part E.4c). A supervisor asks
-/// after a session ends, and exits rather than prompting again: a shutdown is under way.
+/// **Whether this process has been asked to stop**: a supervisor exits rather than prompting again.
 pub fn stop_asked() -> bool {
     STOP_ASKED.load(Ordering::Relaxed)
 }
 
-/// Read every notification queued on `notif`, and say whether a terminate request was among them
-/// — for a supervisor between sessions, whose waits watch its notification channel beside what
-/// they wait for. It has no child then, so no `ChildExited` it needs can be among what this drops.
+/// Drain `notif`, saying whether a terminate request was among it; for a supervisor between
+/// sessions, with no child whose `ChildExited` could be dropped.
 pub fn drain_for_stop(notif: u64) -> bool {
     loop {
         // SAFETY: NOTIF is a valid 64-byte writable out-param.
@@ -126,23 +82,13 @@ pub fn drain_for_stop(notif: u64) -> bool {
     }
 }
 
-/// Write one line to the debug console.
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
-/// What a session's namespace — **or an application's** — is built from.
-///
-/// A struct rather than seven positional arguments because the two columns differ in exactly
-/// one of them and a bool in the seventh position is unreadable at the call site.
-///
-/// **One vocabulary, three builders** (administration Part F.1): both login supervisors build a
-/// session with this, and `desktop-shell` builds each application's namespace with it too, so
-/// the two cannot drift. They had: an application's builder was `desktop-shell`'s own until F.1,
-/// and it never bound `/session/user`, so `whoami` in a desktop terminal said "no session
-/// identity". The view broker derives a view from its caller's namespace and builds nothing from
-/// a recipe.
+/// What a session's namespace — **or an application's** — is built from: both login supervisors
+/// and `desktop-shell` (per application) build with this, so they cannot drift.
 pub struct NamespaceSpec<'a> {
     /// The namespace direct handles are resolved from: the supervisor's own — the root namespace —
     /// for a session, and **the session's** for an application.
@@ -151,119 +97,53 @@ pub struct NamespaceSpec<'a> {
     pub fs_endpoint: u64,
     /// The profile-server endpoint, bound whole-tree at `/bin`.
     pub profile_endpoint: u64,
-    /// The tty server's, bound at `/dev/tty`.
-    ///
-    /// **This and every server endpoint below is `service-mgr`'s route to the server**
-    /// (administration Part E.1b), not the server's own endpoint: a resolve on it continues into
-    /// whichever instance is running, so a session built before a server restarts reaches the new
-    /// one. Each route reaches one server and nothing else, which is what lets `desktop-shell` be
-    /// handed them.
+    /// The tty server's, bound at `/dev/tty`. **This and every server endpoint below is
+    /// `service-mgr`'s route to the server**, not its own, so a session survives a restart. Each
+    /// route reaches one server and nothing else, which is what lets `desktop-shell` hold them.
     pub tty_endpoint: u64,
-    /// The clipboard server's, bound at `/dev/clipboard`. `0` binds nothing.
-    ///
-    /// **Both columns get it, and that makes it the odd one out.** `/dev/draw` goes only to
-    /// the graphical session because a serial one has no compositor; the clipboard is
-    /// reachable as a *path* precisely so a pipeline can use it (M12 decision 4), and a
-    /// pipeline runs in either. So this is a `u64` rather than a `bool` flag beside
-    /// [`bind_fonts`](Self::bind_fonts): what varies is whether the endpoint exists at all —
-    /// a boot where `clipboard-server` did not start — not which column asked for it.
+    /// The clipboard server's, bound at `/dev/clipboard` in **both columns**, as a pipeline uses it
+    /// as a path. `0` binds nothing.
     pub clipboard_endpoint: u64,
     /// The user's home directory, as the subtree base for `/home`.
     pub home: &'a [u8],
     /// The user's name, snapshotted at `/session/user`.
     pub user: &'a [u8],
-    /// Bind `/system/fonts` into the session, read-only.
-    ///
-    /// **A graphical session needs a font and a constructed namespace has none.** Every GUI
-    /// client before M7 Part E ran with an inherited *root* namespace and read its font from
-    /// there; `desktop-shell` is the first to run in a namespace someone built, and it could not
-    /// find one — the symptom was a leader that logged "up" and exited.
-    ///
-    /// The directory rather than a file, which is what let M11 Part D put a second face in it
-    /// without touching a session's authority: what a client loads is named by its theme, and
-    /// both faces are under this one bind.
-    ///
-    /// **A flag rather than always**, symmetric with [`bind_console`](Self::bind_console) and
-    /// for the same reason: a serial session has no use for a font, and a member bound for
-    /// nothing is still authority held. `session-mgr/CLAUDE.md` states the rule — adding a
-    /// member to a session namespace is a design decision each time.
-    ///
-    /// The alternative was vendoring the font into each binary, which is what `nxterm`'s
-    /// *host tests* do. At ~347 KiB per application that scales badly, and it would put a
-    /// resource in the binary that the system already serves as a resource.
+    /// Bind `/system/fonts` read-only; **a flag** because a member bound for nothing is still
+    /// authority held (`session-mgr/CLAUDE.md`).
     pub bind_fonts: bool,
-    /// Bind `/dev/console` into the session.
-    ///
-    /// **False for a graphical session**, and that is a decision rather than an omission:
-    /// `graphical-session.md`'s governing decision 3 records what binding a shared console
-    /// into a windowed session costs. The serial column binds it because the console *is* its
-    /// terminal.
+    /// Bind `/dev/console`. **False for a graphical session** (`graphical-session.md`, governing
+    /// decision 3); the serial column binds it as its terminal.
     pub bind_console: bool,
-    /// The view broker's, bound at `/dev/views` with
-    /// [`views_base`](Self::views_base) as its subtree base. `0` binds nothing — a boot where
-    /// the broker did not start, whose sessions simply have no `with`.
-    ///
-    /// **The base is the session's identity** (administration Part A): the broker learns which
-    /// session a request comes from by the suffix a resolve reaches it with, and no program in the
-    /// session can choose another base — except `desktop-shell`, which is handed this endpoint to
-    /// bind into its applications (`graphical-session.md` §3). The endpoint rather than the
-    /// session's binding of it, for `/dev/tty`'s reason — a binding resolves to a registration,
-    /// never back to an endpoint.
+    /// The view broker's, bound at `/dev/views` with [`views_base`](Self::views_base) as its base.
+    /// `0` binds nothing. **The base is the session's identity**: the broker learns whose request
+    /// it is from the suffix, and no program here can choose another — except `desktop-shell`,
+    /// handed this endpoint to bind into applications.
     pub views_endpoint: u64,
     /// `/s/<session>`, from [`views_open_session`]. Empty binds nothing.
     pub views_base: &'a [u8],
-    /// An **info-only** endpoint of the device manager's, bound at `/dev/devices` with the
-    /// subtree base `/info` (administration Part B.4). `0` binds nothing — a boot where the
-    /// manager did not start, whose sessions simply have no device listing.
-    ///
-    /// **The endpoint, not the base, is what keeps a session from taking a device.** `service-mgr`
-    /// resolves it at `info-endpoint` each time the manager comes up and hands on its route to it,
-    /// and the manager answers only its tables on it, whatever suffix arrives; a class to subscribe
-    /// to is reachable only through `/svc/devices` in the root namespace. The base names what a
-    /// session reaches: `/dev/devices` is the directory, `/dev/devices/all.tsm` a table.
+    /// An **info-only** endpoint of the device manager's, bound at `/dev/devices` with the base
+    /// `/info`. `0` binds nothing. **The endpoint keeps a session from taking a device**: the
+    /// manager answers only its tables on it, whatever suffix arrives.
     pub devices_endpoint: u64,
-    /// A **session endpoint** of the storage service's, bound twice (administration Part C.6):
-    /// at `/storage` with the base `/fs`, so `/storage/<label>/…` is a mounted filesystem, and
-    /// at `/dev/storage` with the base `/info`, so `/dev/storage/all.tsm` is the table of what
-    /// each disk holds. `0` binds nothing — a boot without the service, whose sessions have no
-    /// `/storage`.
-    ///
-    /// **The endpoint, not the bases, is what keeps a session from mounting.** `service-mgr`
-    /// resolves it at `session-endpoint` each time the service comes up and hands on its route to
-    /// it (each supervisor resolved one until Part E.1b), and the service answers the filesystems
-    /// and the tables on it and nothing else: `admin-endpoint` is `NotFound` there however it is
-    /// bound, so `desktop-shell`, which holds it with `BIND_NAMESPACE`, cannot mint an admin
-    /// endpoint from it either.
+    /// A **session endpoint** of the storage service's, bound at `/storage` (base `/fs`) and
+    /// `/dev/storage` (base `/info`). `0` binds nothing. **The endpoint keeps a session from
+    /// mounting**: `admin-endpoint` is `NotFound` there, so even `desktop-shell` cannot mint one.
     pub storage_endpoint: u64,
-    /// `service-mgr`'s **session endpoint** for its services, bound at `/dev/services`
-    /// (administration Part E.2b), so `/dev/services/all.tsm` is the table of every service. `0`
-    /// binds nothing.
-    ///
-    /// **The endpoint is the boundary again.** It answers the table and nothing else:
-    /// `admin-endpoint` is `NotFound` there however it is bound, so no session starts or stops a
-    /// service without the view broker's `services` grant, which binds an admin endpoint at
-    /// `/dev/services/admin` in a view.
+    /// `service-mgr`'s **session endpoint**, bound at `/dev/services`; it answers only the table.
+    /// `0` binds nothing.
     pub services_endpoint: u64,
-    /// Bind `/applications`, the profile server's projection of each package's desktop entries.
-    /// **True for a session**, whose shell and desktop list them; **false for an application**,
-    /// which launches nothing by name from a menu (administration Part F.1).
+    /// Bind `/applications`: **true for a session**, **false for an application**.
     pub bind_applications: bool,
     /// The compositor's forwarding endpoint, bound at **`/dev/draw/new` alone**, with the base
-    /// `/new`: an application may open windows and nothing else there, and `manage` — the desktop
-    /// shell's — is unreachable. `0` binds nothing, as for a session: the graphical supervisor
-    /// binds `/dev/draw` whole for `desktop-shell` itself. **Required when asked for**: a build
-    /// whose `new` does not bind fails, since an application that cannot draw is not one
-    /// (administration Part F.1, from `desktop-shell`'s own builder).
+    /// `/new`: an application may open windows, and `manage` is unreachable. `0` binds nothing
+    /// (the graphical supervisor binds `/dev/draw` whole for `desktop-shell`). **Required when
+    /// asked for**: the build fails if it does not bind.
     pub draw_endpoint: u64,
-    /// `desktop-shell`'s own endpoint, bound at `/dev/desktop`, so an application can name the
-    /// desktops (M8 Part F). `0` binds nothing, as for a session.
+    /// `desktop-shell`'s own endpoint, bound at `/dev/desktop`. `0` binds nothing.
     pub desktop_endpoint: u64,
 }
 
-/// **What a namespace built from a [`NamespaceSpec`] holds**, as its builder found it: the
-/// namespace, and which of its optional members bound. `desktop-shell` reports from this; the
-/// supervisors read it through [`session_has_bin`] and its siblings, which
-/// [`build_namespace`] records.
+/// **What a namespace built from a [`NamespaceSpec`] holds**: it, and which optional members bound.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Built {
     /// The namespace handle.
@@ -286,20 +166,16 @@ pub struct Built {
     pub desktop: bool,
 }
 
-/// Authenticate `(user, pass)` against auth-service over `auth_ch`: build + send an
-/// `Authenticate` request, receive the reply, and copy the returned home path into
-/// `home_out` (returning its length). Returns `Some(home_len)` if AUTHENTICATED, `None`
-/// if DENIED or on any protocol error.
+/// Authenticate `(user, pass)` against auth-service over `auth_ch`, copying the home path into
+/// `home_out`. `Some(home_len)` if AUTHENTICATED, `None` if DENIED or on any protocol error.
 pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8]) -> Option<usize> {
-    // Build the request body, then wrap it in the rsproto envelope at the payload offset.
     let mut body = [0u8; 512];
     let body_len = build_authenticate_request(&mut body, user, pass);
     // SAFETY: SEND_MSG is a valid 4 KiB buffer; the envelope goes at offset 24.
     let rs_len =
         body_len.and_then(|n| unsafe { encode(&mut SEND_MSG[PAYLOAD_OFF..], OP_AUTHENTICATE, 1, 0, &body[..n], 0) });
-    // **Both copies of the password go as soon as it is sent**, sent or not: `body` is this
-    // frame's, and `SEND_MSG` is the crate's and outlives it — every later message here restamps
-    // only as much as it needs. A supervisor and the view broker both live as long as the machine.
+    // **Both copies of the password go as soon as it is sent**, sent or not: `SEND_MSG` outlives
+    // this frame, and a supervisor lives as long as the machine.
     let Some(rs_len) = rs_len else {
         scrub(&mut body);
         return None;
@@ -326,7 +202,6 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
     if sr != 0 {
         return None;
     }
-    // Await + receive the reply on the same channel.
     if !wait_one(auth_ch) {
         return None;
     }
@@ -365,9 +240,7 @@ pub fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8])
     if result_ok { Some(home_len) } else { None }
 }
 
-/// One request to the view broker on `ch`, and its reply's body copied into `out`. `None` if the
-/// exchange failed or the broker answered with an error. The broker is the one server this crate
-/// speaks to besides `auth-service`, and a supervisor's only exchanges with it are these two.
+/// One request to the view broker on `ch`; `None` if it failed or the broker answered an error.
 fn views_call(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
     // SAFETY: SEND_MSG is a valid buffer; single-threaded supervisor.
     let rs_len = unsafe { encode(&mut SEND_MSG[PAYLOAD_OFF..], op, 1, 0, body, 0)? };
@@ -417,10 +290,8 @@ fn views_call(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
-/// Open a session with the view broker for `principal`, over a supervisor channel resolved at
-/// `/svc/views/session`, and write the session's base — `/s/<id>`, what [`NamespaceSpec::views_base`]
-/// wants — into `base_out`. Returns the id and the base's length, or `None` if the broker did not
-/// answer: the session is then built without `/dev/views`.
+/// Open a session with the view broker for `principal` over `sup`, writing its base `/s/<id>` into
+/// `base_out`. Returns the id and the base's length, or `None` if the broker did not answer.
 pub fn views_open_session(sup: u64, principal: &[u8], base_out: &mut [u8; 24]) -> Option<(u64, usize)> {
     let mut reply = [0u8; 8];
     let n = views_call(sup, librsproto::views::OP_VIEWS_OPEN_SESSION, principal, &mut reply)?;
@@ -433,10 +304,8 @@ pub fn views_open_session(sup: u64, principal: &[u8], base_out: &mut [u8; 24]) -
     Some((id, 3 + d.len()))
 }
 
-/// Tell the view broker that session `id` has ended, so it asks what it started there to stop and
-/// takes back the grants. **The supervisor's job, not the endpoint closing's**: a program running
-/// in a view still binds the session's `/dev/views`, so the registration outlives the login
-/// (`docs/planning/administration.md` § *Identity is the endpoint you call on*).
+/// Tell the view broker that session `id` has ended. **The supervisor's job**: a program in a view
+/// still binds `/dev/views`, so the registration outlives the login.
 pub fn views_close_session(sup: u64, id: u64) {
     let mut body = [0u8; 8];
     if let Some(n) = librsproto::views::build_session_id(&mut body, id) {
@@ -444,17 +313,9 @@ pub fn views_close_session(sup: u64, id: u64) {
     }
 }
 
-/// Construct a session namespace for a login whose home is `home` (an absolute path,
-/// e.g. `/home/alice`): a fresh namespace binding the user's home subtree of the
-/// fs-server at `/home` (RW) and the console at `/dev/console` (so the shell has I/O).
-/// Deliberately **omits** everything else (other homes, the raw fs root) — absence is the
-/// sandbox. `/dev/blk` is omitted too, for every session: a program reaches a disk only through the
-/// view broker's `disks` grant (administration Part G.3). Proves `BIND_NAMESPACE` + subtree scoping + shared-
-/// registration bind-mount. Returns the session-namespace handle, or `0` on failure.
-/// `root_ns` is session-mgr's inherited namespace (to resolve the console).
-///
-/// [`build`], recording what bound for [`session_has_bin`] and its siblings — the supervisors'
-/// shape, one session built at a time.
+/// [`build`] a session namespace, recording what bound for [`session_has_bin`] and its siblings.
+/// Returns the namespace handle, or `0` on failure. **Absence is the sandbox**: `/dev/blk` is
+/// omitted from every session; a disk is reached only through the view broker's `disks` grant.
 pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
     let Some(b) = build(spec) else { return 0 };
     // SAFETY: single-threaded supervisor; one namespace is built at a time.
@@ -470,10 +331,9 @@ pub fn build_namespace(spec: &NamespaceSpec<'_>) -> u64 {
     b.ns
 }
 
-/// **Build a namespace from `spec`**, a session's or an application's, and say what bound
-/// (administration Part F.1). `None` if a member it cannot do without did not: the namespace
-/// itself, `/home` when there is a home, or `/dev/draw/new` when asked for. Every other member is
-/// reported and skipped when it fails, since a session or an application without it still runs.
+/// **Build a namespace from `spec`** and say what bound. `None` if a member it cannot do without
+/// did not: the namespace, `/home` when there is a home, or `/dev/draw/new` when asked for. Every
+/// other member is reported and skipped on failure; a session without it still runs.
 pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
     let NamespaceSpec {
         root_ns,
@@ -494,7 +354,6 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         draw_endpoint,
         desktop_endpoint,
     } = *spec;
-    // A fresh, owned namespace (full rights — this is *our* namespace to compose).
     // SAFETY: register-only syscall; returns a fresh namespace handle or an error.
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
@@ -508,10 +367,8 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
         None
     };
-    // `/dev/draw/new` → the compositor, **narrowly** (administration Part F.1, from
-    // `desktop-shell`'s own builder): the six-argument bind with the base `/new`, so a resolve of
-    // `/dev/draw/new` reaches the compositor as `new` and nothing under `/dev/draw` reaches
-    // `manage`. `desktop-shell` checks that before it launches (`verify_app_namespace`).
+    // `/dev/draw/new` → the compositor, **narrowly**: the base `/new` keeps `manage` unreachable;
+    // `desktop-shell` checks that before it launches (`verify_app_namespace`).
     if draw_endpoint != 0 {
         let path = b"/dev/draw/new";
         let base = b"/new";
@@ -531,10 +388,8 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
             return give_up(b"libsession: /dev/draw/new bind FAIL\n");
         }
     }
-    // `/home` → the fs-server endpoint scoped to the user's home subtree. The kernel
-    // shares init's fs registration (bind-mount) and prepends `home` to every forwarded
-    // suffix. Requires BIND_NAMESPACE (re-delegated) + BIND on `ns`. **Required when there is a
-    // home**: an application starts with `PWD=/home`, and a session's shell with its home.
+    // `/home` → the fs-server scoped to the user's subtree: the kernel prepends `home` to every
+    // forwarded suffix. **Required when there is a home**: `PWD` starts at `/home`.
     if !home.is_empty() {
         let sub = b"/home";
         // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
@@ -553,29 +408,16 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
             return give_up(b"libsession: /home subtree bind FAIL\n");
         }
     }
-    // `/bin` → the profile server, whole-tree (no subtree base): a lookup of `/bin/list`
-    // reaches it with suffix `list`, and it probes the system profile's packages in the
-    // store. The same endpoint init bound in the root namespace, so the kernel *shares*
-    // that registration rather than minting a rival — one server connection, two names,
-    // exactly as `/home` shares the fs-server's.
-    //
-    // **Why a profile and not `/initramfs/sbin`.** Binding the boot image would be one
-    // line and would work today. It also hands every session every binary the system
-    // booted with, which is precisely the ambient authority per-process namespaces exist
-    // to refuse — "absence is the sandbox" means nothing if absence is never arranged. A
-    // profile is a *choice* about what a user may run; the initramfs is an accident of
-    // what booting needed.
-    //
-    // Non-fatal: a session with no `/bin` still has the whole in-process language, and
-    // failing the login would trade a working shell for a missing `list`.
+    // `/bin` → the profile server. **Not `/initramfs/sbin`**: that hands every session every boot
+    // binary, the ambient authority namespaces refuse; a profile is a *choice* of what a user may
+    // run. Non-fatal: a session with no `/bin` still has the in-process language.
     let mut has_bin = false;
     let mut has_tty = false;
     let mut has_console = false;
     let mut has_clipboard = false;
     if profile_endpoint != 0 {
         let bin = b"/bin";
-        // **Scoped**, like every other bind of this endpoint (M14 Part H): the server projects
-        // more than one package directory and tells them apart by the suffix's first component.
+        // **Scoped**: the server tells package directories apart by the suffix's first component.
         // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
         let pr = unsafe {
             syscall6(
@@ -591,26 +433,12 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         if pr != 0 {
             kprint(b"libsession: /bin bind FAIL (session has no programs)\n");
         }
-        // `/applications` → the *same* profile server, with a subtree base. A resolve of
-        // `/applications/nxterm.toml` reaches it as `applications/nxterm.toml`, and it projects
-        // each package's `applications/` directory the way it projects `bin/` (M14 Part H).
-        //
-        // **Why a second projection rather than a directory of files somewhere.** A desktop entry
-        // says "this program is one a person launches, and here is what to call it" — which is a
-        // fact about a *package*, not about a machine. Projecting it means installing a package
-        // brings its applications with it and removing one takes them away, with no list anywhere
-        // to keep in step. The alternative, a file the image build writes, needs the build to know
-        // every application on the system, which is the coupling the store exists to remove.
-        //
-        // Non-fatal for the same reason `/bin` is: a session that cannot enumerate applications
-        // still runs every one of them by name.
-        // **A session's alone** (administration Part F.1): an application launches nothing by
-        // name from a menu, and a member bound for nothing is still authority held.
+        // `/applications` → the same server, projecting each package's `applications/`. Non-fatal.
+        // **A session's alone**: an application launches nothing from a menu.
         if bind_applications {
             let apps = b"/applications";
-            // **Absolute**: `SubtreeBase::from_path` runs `validate_path`, which rejects a bare
-            // component. The forwarded suffix therefore carries the leading slash too, which is what
-            // `profile-server`'s `split_suffix` strips.
+            // **Absolute**: `SubtreeBase::from_path` rejects a bare component; `profile-server`'s
+            // `split_suffix` strips the leading slash.
             let base = b"/applications";
             // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
             let ar = unsafe {
@@ -631,43 +459,19 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         has_bin = pr == 0;
     }
 
-    // `/session/user` → who this session belongs to.
-    //
-    // Nitrox has no kernel user identity — authority is capabilities, so there is nothing
-    // for the kernel to report and identity is a session concept. We are the component
-    // that authenticated the login, so we are the one that knows, and the way a process is
-    // told about its world here is *namespace construction*: the shell does not ask us
-    // where home is, it sees `/home`. "Who am I" is the same shape of question.
-    //
-    // A direct-handle bind of a memory object, i.e. a snapshot — correct because a
-    // session's user is immutable for its lifetime (changing user means a new session).
-    // The first genuinely *mutable* `/session/*` member is the trigger to put a resource
-    // server behind this prefix instead; clients do not change when that happens, because
-    // a server answers a resolve with a memory object too. See
-    // `TODO(session-metadata-server)`.
-    //
-    // **An application's too** (administration Part F.1): `desktop-shell` reads its session's and
-    // passes the name on, so `whoami` in a desktop terminal answers as it does at a serial prompt.
-    // An empty name binds nothing.
+    // `/session/user` → who this session belongs to; the kernel has no user identity. A memory
+    // object is a snapshot, right while a session's user is immutable: the first mutable
+    // `/session/*` member is the trigger for `TODO(session-metadata-server)`. **An application's
+    // too**: `desktop-shell` passes the name on. An empty name binds nothing.
     if !user.is_empty() {
         bind_session_user(ns, user);
     }
 
-    // `/dev/tty` → the terminal server, so a program in the session can obtain a *cooked*
-    // terminal it can also write to — and, once every client has moved, has no way to
-    // reach the raw device at all.
+    // `/dev/tty` → the terminal server's **forwarding** endpoint, so each resolve mints the
+    // program its *own* terminal. A minted channel bound instead would answer `Namespace::Resolve`
+    // with `Unsupported`: the kernel adopts *any* bound channel as a server.
     if tty_endpoint != 0 {
         let dev = b"/dev/tty";
-        // The tty server's **forwarding** endpoint — the channel the kernel sends resolves
-        // down — so a program in the session resolving `/dev/tty` gets its *own* terminal,
-        // freshly minted, exactly as session-mgr did for the login prompt.
-        //
-        // Binding a minted tty channel here instead would silently produce a namespace
-        // entry that answers `Namespace::Resolve` with `Unsupported`: the kernel adopts
-        // *any* bound channel as a server, and a client channel does not speak resolve.
-        // Both are `IpcChannel`s; only the role differs.
-        //
-        // Sharing init's registration, exactly as `/home` shares the fs-server's.
         // SAFETY: valid namespace handle, path pointer, and endpoint handle; no base.
         let tr = unsafe { syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, tty_endpoint, 0, 0) };
         if tr != 0 {
@@ -676,30 +480,21 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         has_tty = tr == 0;
     }
 
-    // `/dev/clipboard` → the clipboard server, so anything in the session can copy and paste
-    // — and, because it is a path, so a *pipeline* can (M12 decision 4).
-    //
-    // **This binding is the authority**, which is the whole of M12 decision 1: there is no
-    // ambient clipboard, so a session built without this line has none, and an endpoint
-    // attenuated to `RIGHT_SEND` before it reaches here would be a session that can copy and
-    // not read. The forwarding endpoint, for `/dev/tty`'s reason — a client resolving this
-    // gets its own session channel, and binding a *minted* one would produce an entry that
-    // answers `Namespace::Resolve` with `Unsupported`.
+    // `/dev/clipboard` → the clipboard server. **This binding is the authority**: there is no
+    // ambient clipboard, and an endpoint attenuated to `RIGHT_SEND` would copy but not read.
+    // The forwarding endpoint, for `/dev/tty`'s reason.
     if clipboard_endpoint != 0 {
         let dev = b"/dev/clipboard";
         // SAFETY: valid namespace handle, path pointer, and endpoint handle; no base.
         let cr = unsafe { syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, clipboard_endpoint, 0, 0) };
         if cr != 0 {
-            // Non-fatal: the session exists, copy and paste do nothing in it.
             kprint(b"libsession: /dev/clipboard bind FAIL (no copy and paste)\n");
         }
         has_clipboard = cr == 0;
     }
 
-    // `/dev/views` → the view broker, **at this session's base** (administration Part A.4): a
-    // process here resolving `/dev/views` reaches the broker with the suffix `s/<session>`, which
-    // is how the broker knows whose request it is. Non-fatal, like the clipboard: a session
-    // without it has no `with`, and nothing else in it notices.
+    // `/dev/views` → the view broker **at this session's base**, so a resolve reaches it as
+    // `s/<session>`. Non-fatal.
     let mut has_views = false;
     if views_endpoint != 0 && !views_base.is_empty() {
         let dev = b"/dev/views";
@@ -721,11 +516,8 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         has_views = vr == 0;
     }
 
-    // `/dev/devices` → the device manager's info-only endpoint, **at the base `/info`**
-    // (administration Part B.4): `/dev/devices` reaches it as `info`, the directory of tables, and
-    // `/dev/devices/all.tsm` as `info/all.tsm`. The manager answers nothing but the tables on this
-    // endpoint, so nothing here can subscribe to a keyboard or a disk. Non-fatal, like the
-    // clipboard: a session without it has no device listing, and nothing else in it notices.
+    // `/dev/devices` → the device manager's info-only endpoint **at the base `/info`**, the
+    // directory of tables. Non-fatal.
     let mut has_devices = false;
     if devices_endpoint != 0 {
         let dev = b"/dev/devices";
@@ -748,10 +540,8 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         has_devices = dvr == 0;
     }
 
-    // `/storage` and `/dev/storage` → the storage service's session endpoint, twice
-    // (administration Part C.6): the mounted filesystems at the base `/fs`, and the table of what
-    // each disk holds at `/info`. Non-fatal, like `/dev/devices`: a session without them has no
-    // `/storage`, and nothing else in it notices.
+    // `/storage` (base `/fs`) and `/dev/storage` (base `/info`), both from the one endpoint.
+    // Non-fatal.
     let has_storage = storage_endpoint != 0
         && [(&b"/storage"[..], &b"/fs"[..]), (b"/dev/storage", b"/info")].iter().all(|&(at, base)| {
             // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
@@ -772,8 +562,7 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         kprint(b"libsession: /storage bind FAIL (no filesystems in this session)\n");
     }
 
-    // `/dev/services` → `service-mgr`'s session endpoint (administration Part E.2b), with no base:
-    // its one answer is `all.tsm`, the table of services. Non-fatal, like `/dev/devices`.
+    // `/dev/services` → `service-mgr`'s session endpoint, with no base. Non-fatal.
     if services_endpoint != 0 {
         let at = b"/dev/services";
         // SAFETY: valid namespace handle, path pointer and endpoint handle.
@@ -783,9 +572,7 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         }
     }
 
-    // `/system/fonts` → the fs-server endpoint scoped to that subtree, the same shape `/home`
-    // uses. Read-only by construction: a subtree bind forwards to the same registration, and
-    // nothing in the session has a writable handle to it.
+    // `/system/fonts` → the fs-server scoped to that subtree. Read-only: no writable handle.
     if bind_fonts && fs_endpoint != 0 {
         let sub = b"/system/fonts";
         let base = b"/system/fonts";
@@ -802,18 +589,12 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
             )
         };
         if fr != 0 {
-            // Non-fatal: the session exists, its clients just cannot render text. Worth
-            // reporting rather than failing a login over.
             kprint(b"libsession: /system/fonts bind FAIL (clients cannot render text)\n");
         }
     }
 
-    // `/dev/console` → a direct-handle bind of the console device (resolved from our own
-    // namespace), so the shell can do console I/O within its sandbox. Non-fatal if absent.
-    //
-    // **Skipped entirely for a graphical session** — see [`NamespaceSpec::bind_console`]. Not
-    // "bound and then unused": a binding a session holds is authority it has, and the console
-    // is shared with every other session on the machine.
+    // `/dev/console` → a direct-handle bind, resolved from our own namespace. **Skipped for a
+    // graphical session** (see [`NamespaceSpec::bind_console`]): the console is shared.
     let (cst, console) =
         if bind_console { ns_lookup(root_ns, b"/dev/console", RIGHT_READ | RIGHT_TRANSFER) } else { (0, 0) };
     if cst == 0 && console != 0 {
@@ -821,8 +602,7 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
         // SAFETY: valid namespace handle, path pointer, and console handle (a device
         // node → a direct-handle bind; no subtree base).
         let cr = unsafe { syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, console, 0, 0) };
-        // The bind cloned its own reference; drop ours.
-        // SAFETY: closing our own handle.
+        // SAFETY: the bind cloned its own reference; close ours.
         unsafe { syscall1(SYS_HANDLE_CLOSE, console) };
         if cr != 0 {
             kprint(b"libsession: /dev/console bind FAIL (shell has no console)\n");
@@ -830,8 +610,7 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
             has_console = true;
         }
     }
-    // `/dev/desktop` → `desktop-shell`'s own endpoint, for an application (M8 Part F): the
-    // desktops, named. No base. Non-fatal: an application without it still draws.
+    // `/dev/desktop` → `desktop-shell`'s own endpoint, for an application. No base. Non-fatal.
     let mut has_desktop = false;
     if desktop_endpoint != 0 {
         let at = b"/dev/desktop";
@@ -855,26 +634,12 @@ pub fn build(spec: &NamespaceSpec<'_>) -> Option<Built> {
     })
 }
 
-/// **Hand every block device `from_ns`'s registry lists to `to_ns`, leaving out the devices whose
-/// registry ids are in `withheld`**, each with its `info` snapshot, and return how many were bound
-/// — the view broker's `disks` grant (administration Part C.6), and since Part G.3 the only way a
-/// disk reaches a program. The broker asks the storage service what is in use — a mounted
-/// filesystem's device, `init`'s included, and the disk that holds it — and hands on the rest: a
-/// raw write to a mounted filesystem's device, or to the disk under it, would land underneath a
-/// live server.
-///
-/// **A supervisor cannot re-bind `/dev/blk` itself**: it is a *kernel-server* binding and
-/// `sys_ns_bind` takes endpoints and direct handles, which a boot answered with "not in this
-/// supervisor's namespace" the first time this was tried (Phase 5 Part H.1). So each device is
-/// resolved and bound individually, which is also what lets one be withheld.
-///
-/// **Only a source with a registry can withhold**, since the ids are the registry's, and only one
-/// with a registry hands anything on. The broker's source is the root namespace, which has one.
-/// Until Part G.3 a session manager handed an installer session every disk, and `desktop-shell`
-/// passed a session's on from its own bindings; no session holds a disk now.
-///
-/// Each device's `info` is a snapshot object, resolved once and bound beside its device: device
-/// facts do not change while a machine runs.
+/// **Hand every block device `from_ns`'s registry lists to `to_ns`, except those whose registry
+/// ids are in `withheld`**, each with its `info` snapshot; returns how many were bound. The view
+/// broker's `disks` grant, the only way a disk reaches a program; it withholds what is in use,
+/// since a raw write would land underneath a live server. `sys_ns_bind` cannot re-bind the
+/// kernel-server `/dev/blk`, so each device is bound singly. **Only a source with a registry hands
+/// anything on**; the broker's is the root namespace.
 pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -> usize {
     let mut bound = 0;
     for n in block_indices(from_ns, withheld) {
@@ -885,9 +650,7 @@ pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -
             RIGHT_READ | RIGHT_WRITE | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER,
         );
         if st != 0 || dev == 0 {
-            // **Not the end of the list**, which the probe this replaced took it to be: a source
-            // granted one disk has a gap before it, and a device bound read-only here is one this
-            // cannot hand on with write, not a reason to stop at the next.
+            // Not the end of the list: a source granted one disk has a gap before it.
             continue;
         }
         // SAFETY: valid namespace handle, path pointer and device handle — a direct-handle bind, so
@@ -899,6 +662,7 @@ pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -
             continue;
         }
         bound += 1;
+        // A snapshot, resolved once: device facts do not change while a machine runs.
         let info_path = blk_path(n, true);
         let (ist, info) = ns_lookup(from_ns, info_path.as_bytes(), RIGHT_MAP_READ | RIGHT_TRANSFER);
         if ist == 0 && info != 0 {
@@ -918,21 +682,14 @@ pub fn rebind_block_devices_except(from_ns: u64, to_ns: u64, withheld: &[u32]) -
     bound
 }
 
-/// Take back what [`rebind_block_devices_except`] bound into `ns`: each `/dev/blk/<n>` and its `info`.
-/// Returns how many devices were unbound.
-///
-/// **The view broker's, for a session that ended** (`docs/planning/administration.md` § Part A).
-/// It asks every program it started for the session to exit, and unbinds their grants so nothing
-/// new can be resolved through them. A handle a program already holds is not taken back — the
-/// kernel has no revocation — which is why this is half of ending a session rather than all of it.
-///
-/// **What is bound, read from `ns` itself**, not a fixed range of indices: a range would miss an
-/// index past its end, and leave that disk reachable after the session it was granted to.
+/// Take back what [`rebind_block_devices_except`] bound into `ns`; returns how many devices were
+/// unbound. A handle a program already holds is not taken back — the kernel has no revocation.
+/// **What is bound is read from `ns` itself**, not a fixed range, which could miss a disk.
 pub fn unbind_block_devices(ns: u64) -> usize {
     let mut unbound = 0;
     for n in bound_block_indices(ns) {
-        // The leaf first, so the device's binding is never left without the one beside it —
-        // and `NotFound` for a leaf that was never bound is no error.
+        // The leaf first, so a device is never left without its `info`; `NotFound` for a leaf
+        // never bound is no error.
         let info_path = blk_path(n, true);
         // SAFETY: valid namespace handle and path.
         unsafe { syscall3(SYS_NS_UNBIND, ns, info_path.as_ptr() as u64, info_path.len() as u64) };
@@ -945,13 +702,8 @@ pub fn unbind_block_devices(ns: u64) -> usize {
     unbound
 }
 
-/// The `/dev/blk/<n>` indices `ns` can reach, ascending (administration Part B.5), less the
-/// devices whose registry ids are in `withheld` (Part C.6).
-///
-/// **From the registry** — the root namespace's, where `/dev/blk` is one kernel-server binding
-/// whose children no enumeration can see. A source with no registry yields nothing: since
-/// administration Part G.3 nothing hands on a namespace's own bindings, which is what reading
-/// them was for.
+/// The `/dev/blk/<n>` indices `ns` can reach, less `withheld` registry ids. **From the registry**:
+/// `/dev/blk` is one kernel-server binding whose children no enumeration sees.
 fn block_indices(ns: u64, withheld: &[u32]) -> alloc::vec::Vec<u32> {
     let Some(blocks) = registry_blocks(ns) else { return alloc::vec::Vec::new() };
     let mut out: alloc::vec::Vec<u32> =
@@ -961,8 +713,6 @@ fn block_indices(ns: u64, withheld: &[u32]) -> alloc::vec::Vec<u32> {
     out
 }
 
-/// The block devices `/dev/registry` lists, as `(registry id, /dev/blk index)`. `None` if `ns` has
-/// no registry, or it does not read.
 fn registry_blocks(ns: u64) -> Option<alloc::vec::Vec<(u32, u32)>> {
     let (st, snap) = ns_lookup(ns, b"/dev/registry", RIGHT_MAP_READ | RIGHT_INSPECT);
     if st != 0 || snap == 0 {
@@ -993,8 +743,6 @@ fn registry_blocks(ns: u64) -> Option<alloc::vec::Vec<(u32, u32)>> {
     Some(out)
 }
 
-/// The `/dev/blk/<n>` bindings `ns` itself holds, ascending. Enumeration is local — the kernel
-/// walks the namespace, nothing is forwarded — and sees each binding a supervisor made.
 fn bound_block_indices(ns: u64) -> alloc::vec::Vec<u32> {
     let mut out = alloc::vec::Vec::new();
     let mut entry = abi::NsEntry::zeroed();
@@ -1014,9 +762,8 @@ fn bound_block_indices(ns: u64) -> alloc::vec::Vec<u32> {
     out
 }
 
-/// The `<n>` of a binding at exactly `/dev/blk/<n>` — not its `info` leaf, not `/dev/blk` itself,
-/// and not a name that only starts with digits. Decimal, with no leading zero but `0` itself, so
-/// one device has one spelling.
+/// The `<n>` of a binding at exactly `/dev/blk/<n>`; decimal with no leading zero, so a device
+/// has one spelling.
 fn blk_binding_index(path: &[u8]) -> Option<u32> {
     let digits = path.strip_prefix(b"/dev/blk/")?;
     if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) || (digits.len() > 1 && digits[0] == b'0') {
@@ -1025,92 +772,68 @@ fn blk_binding_index(path: &[u8]) -> Option<u32> {
     core::str::from_utf8(digits).ok()?.parse().ok()
 }
 
-/// `/dev/blk/<n>`, or `/dev/blk/<n>/info`.
 fn blk_path(n: u32, info: bool) -> alloc::string::String {
     if info { alloc::format!("/dev/blk/{n}/info") } else { alloc::format!("/dev/blk/{n}") }
 }
 
-/// Whether the last-built session namespace got its `/bin`. Read only for the log line —
-/// nothing branches on it.
+/// Whether the last-built session namespace got its `/bin`. The `session_has_*` readers exist so
+/// a log line can say "no".
 pub fn session_has_bin() -> bool {
     // SAFETY: single-threaded session-mgr.
     unsafe { SESSION_HAS_BIN }
 }
 
-/// Set by [`build_session_namespace`]; see [`session_has_bin`].
 static mut SESSION_HAS_BIN: bool = false;
 
 /// Whether the last [`build_namespace`] bound `/dev/console`.
-///
-/// **Reported rather than assumed**, and that distinction was not free: the graphical
-/// supervisor printed a hardcoded "(no /dev/console)" until 2026-08-25, so its gate's
-/// assertion passed just as happily with `bind_console: true`. A message that states a fact
-/// it did not check is decoration, and the control is what found it.
 pub fn session_has_console() -> bool {
     // SAFETY: single-threaded supervisor; one namespace is built at a time.
     unsafe { SESSION_HAS_CONSOLE }
 }
 
 /// Whether the last [`build_namespace`] bound `/dev/clipboard`.
-///
-/// **Reported rather than assumed**, for [`session_has_console`]'s reason — which is not a
-/// hypothetical here either: that one was a hardcoded string for three weeks and its gate's
-/// assertion passed against a build that bound the opposite.
 pub fn session_has_clipboard() -> bool {
     // SAFETY: single-threaded supervisor; one namespace is built at a time.
     unsafe { SESSION_HAS_CLIPBOARD }
 }
 
-/// Set by [`build_namespace`]; see [`session_has_clipboard`].
 static mut SESSION_HAS_CLIPBOARD: bool = false;
 
-/// Whether the last [`build_namespace`] bound `/dev/views` — reported, for the log line that has
-/// to be able to say "no".
+/// Whether the last [`build_namespace`] bound `/dev/views`.
 pub fn session_has_views() -> bool {
     // SAFETY: single-threaded supervisor; one namespace is built at a time.
     unsafe { SESSION_HAS_VIEWS }
 }
 
-/// Set by [`build_namespace`]; see [`session_has_views`].
 static mut SESSION_HAS_VIEWS: bool = false;
 
-/// Whether the last [`build_namespace`] bound `/dev/devices` — reported, for the log line that
-/// has to be able to say "no".
+/// Whether the last [`build_namespace`] bound `/dev/devices`.
 pub fn session_has_devices() -> bool {
     // SAFETY: single-threaded supervisor; one namespace is built at a time.
     unsafe { SESSION_HAS_DEVICES }
 }
 
-/// Set by [`build_namespace`]; see [`session_has_devices`].
 static mut SESSION_HAS_DEVICES: bool = false;
 
-/// Whether the last [`build_namespace`] bound `/storage` and `/dev/storage` — reported, for the
-/// log line that has to be able to say "no".
+/// Whether the last [`build_namespace`] bound `/storage` and `/dev/storage`.
 pub fn session_has_storage() -> bool {
     // SAFETY: single-threaded supervisor; one namespace is built at a time.
     unsafe { SESSION_HAS_STORAGE }
 }
 
-/// Set by [`build_namespace`]; see [`session_has_storage`].
 static mut SESSION_HAS_STORAGE: bool = false;
 
-/// See [`session_has_console`].
 static mut SESSION_HAS_CONSOLE: bool = false;
 
-/// Whether the last-built session namespace got a terminal. Read only for the log line —
-/// which has to be able to say "no", the same reason `/bin` is reported separately.
+/// Whether the last-built session namespace got a terminal.
 pub fn session_has_tty() -> bool {
     // SAFETY: single-threaded session-mgr.
     unsafe { SESSION_HAS_TTY }
 }
 
-/// Set by [`build_session_namespace`]; see [`session_has_tty`].
 static mut SESSION_HAS_TTY: bool = false;
 
-/// Publish `user` at `/session/user` in `ns`, as a read-only memory object.
-///
-/// Non-fatal: a session whose identity could not be published is still a usable session,
-/// and failing the login over it would trade a working shell for a missing `whoami`.
+/// Publish `user` at `/session/user` in `ns`, as a read-only memory object. Non-fatal.
 fn bind_session_user(ns: u64, user: &[u8]) {
     // SAFETY: a page-sized anonymous object; the syscall returns a handle or a negative error.
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
@@ -1136,13 +859,11 @@ fn bind_session_user(ns: u64, user: &[u8]) {
         dst[n] = 0;
         syscall4(SYS_MEMORY_UNMAP, base as u64, 4096, 0, 0);
     }
-    // Bind read-only: a session's user is something to be told, not something to edit.
     let path = b"/session/user";
     // SAFETY: valid namespace handle, path pointer, and object handle (a direct-handle
     // bind — no subtree base).
     let br = unsafe { syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, mem, 0, 0) };
-    // The bind cloned its own reference; drop ours either way.
-    // SAFETY: closing our own handle.
+    // SAFETY: the bind cloned its own reference; close ours either way.
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
     if br != 0 {
         kprint(b"libsession: /session/user bind FAIL (whoami will report no identity)\n");
@@ -1161,7 +882,7 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
         unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
         return (-1, 0);
     }
-    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns the static
+    // SAFETY: bytes 8..24 are inside WAIT_RESULTS, filled by the wait above; this thread owns it
     let (status, handle) = unsafe {
         (
             i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
@@ -1182,17 +903,11 @@ pub fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     (status, handle)
 }
 
-/// The notification slot this crate reaps into.
 static mut NOTIF: Notification = Notification::zeroed();
 
-/// Spawn args for the user shell: run in the **constructed session namespace** with
-/// **empty syscaps** (a fully unprivileged sandbox). `image`/`namespace` are filled at
-/// spawn.
 static mut SPAWN_SHELL: SpawnArgs = SpawnArgs {
     image: 0,
-    // One handle: the setup channel. The shell is a **Tier-1** stage — it receives its
-    // `argv` and its **environment** the same way every pipeline stage does, rather than
-    // through a special case (Milestone 3.5 Part D).
+    // One handle: the setup channel, through which a Tier-1 stage gets `argv` and environment.
     handle_count: 1,
     move_mask: 1,
     arg0: 0,
@@ -1202,23 +917,11 @@ static mut SPAWN_SHELL: SpawnArgs = SpawnArgs {
     syscaps: 0,   // set at spawn — see `spawn_leader`
 };
 
-/// The user's home *as seen from inside the session*.
-///
-/// session-mgr binds the user's home subtree at `/home`, so from within the session that
-/// path **is** the home directory — the outside path (`/home/alice`) is not nameable, and
-/// that is the point: absence is the sandbox.
+/// The user's home *as seen from inside the session*; the outside path is not nameable.
 const SESSION_HOME: &str = "/home";
 
-/// Build the environment a session starts with.
-///
-/// A TSM1 `Record`, so it is typed: `PATH` is a `List<String>` rather than a colon-joined
-/// string, which makes a path *containing* a colon representable and leaves no room for two
-/// readers to split it differently.
-///
-/// **`USER` is deliberately absent.** Identity lives at `/session/user`, a namespace
-/// binding a process cannot forge because it cannot bind at all. Copying it into the
-/// environment would hand that property away for nothing: any process could then tell a
-/// child it was somebody else.
+/// Build the session's environment, a TSM1 `Record`. **`USER` is deliberately absent**: identity
+/// lives at `/session/user`, which a process cannot forge; an env var it could tell a child.
 pub fn session_env() -> libstream::wire::Record {
     use libstream::wire::{Record, Schema, TypeModifiers, TypeTag, Value};
     let schema = Schema::new()
@@ -1230,31 +933,19 @@ pub fn session_env() -> libstream::wire::Record {
         schema,
         values: alloc::vec![
             Value::Str(alloc::string::String::from(SESSION_HOME)),
-            // A session begins at home, which is also what makes a bare `list` mean
-            // something useful the moment you log in.
             Value::Str(alloc::string::String::from(SESSION_HOME)),
             Value::List(alloc::sync::Arc::from(path)),
         ],
     }
 }
 
-/// Spawn the user shell (`/initramfs/sbin/nxsh`) into `session_ns` (empty syscaps),
-/// then block on `notif` for its `ChildExited` and return its exit code. `-1` if the
-/// shell could not be spawned. This is the login's payoff: an unprivileged process in a
-/// per-user namespace, reaped by session-mgr.
-/// **`syscaps` is the caller's to choose, and the two columns choose differently.** The serial
-/// leader gets `0` — `nxsh` is a sandboxed user shell and holds nothing. **And `0` is what every
-/// command in the session gets** (PR #344 review): since administration Part E.5 `nxsh` passes
-/// each stage it spawns whatever it holds, so a capability given to it here is given to all of
-/// them. The graphical leader
-/// gets `SYSCAP_BIND_NAMESPACE`, because `desktop-shell` constructs a namespace per application
-/// it launches: `ui-composition-model.md` §5a rests the guarantee that "an application cannot
-/// compose other applications" on the shell being the process that built them.
+/// Spawn the leader `program` into `session_ns`, then block on `notif` for its `ChildExited` and
+/// return its exit code. `-1` if it could not be spawned.
 ///
-/// That is what reconciles a process which both *serves* and *constructs* with
-/// [`syscaps.md`](../../../docs/architecture/syscaps.md) — the shell holds the capability to
-/// build application namespaces continuously, not to register itself once, and it does not
-/// bind its own endpoint at all (`graphical-session.md` §3).
+/// **`syscaps` is the caller's to choose.** The serial leader gets `0`, **and `0` is what every
+/// command in the session gets**: `nxsh` passes each stage whatever it holds. The graphical
+/// leader gets `SYSCAP_BIND_NAMESPACE`, because `desktop-shell` constructs a namespace per
+/// application (`ui-composition-model.md` §5a, `graphical-session.md` §3).
 pub fn spawn_leader(
     root_ns: u64,
     session_ns: u64,
@@ -1266,10 +957,7 @@ pub fn spawn_leader(
 ) -> i32 {
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_env};
 
-    // `/bin/<program>`, resolved from the *supervisor's* namespace. The session's own `/bin`
-    // is the profile projection and is what the leader will resolve its children through;
-    // the leader's own image has to come from here, because the session namespace exists to
-    // be handed to it and not to be searched by its parent.
+    // Resolved from the *supervisor's* namespace: the session's exists to be handed to the leader.
     let mut path = alloc::string::String::from("/bin/");
     path.push_str(program);
     let image = ns_lookup(root_ns, path.as_bytes(), RIGHT_MAP_READ).1;
@@ -1277,13 +965,8 @@ pub fn spawn_leader(
         Line::new().s(b"libsession: ").s(program.as_bytes()).s(b" image not found").end();
         return -1;
     }
-    // **Sized from what is actually sent**, not a constant that used to be big enough. The
-    // channel carries the Tier-1 setup message plus one message per extra endpoint, and the
-    // sends are `NOBLOCK` — so a queue one short does not block, it *drops the last handle
-    // silently*. That is what happened the first time this carried four endpoints instead of
-    // one: `pipe(4)`, five messages, and the leader launched applications into namespaces with
-    // no `/bin`. The failure was a terminal that opened with nothing in it, two processes away
-    // (M7 Part F).
+    // **Sized from what is sent**: sends are `NOBLOCK`, so a queue one short *drops the last
+    // handle silently*.
     let depth = (1 + extras.len()) as u32;
     let (setup_mgr, setup_shell) = match pipe(depth) {
         Ok(p) => p,
@@ -1301,14 +984,11 @@ pub fn spawn_leader(
         SPAWN_SHELL.arg0 = bootstrap_arg0(true);
         syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SHELL) as u64)
     };
-    // The kernel copied the ELF during spawn; close our image handle.
-    // SAFETY: closing our own handle.
+    // SAFETY: the kernel copied the ELF during spawn; close our image handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
     if h < 0 {
         Line::new().s(b"libsession: ").s(program.as_bytes()).s(b" spawn FAIL").end();
-        // The same leak `launch` had, in the function `launch` was modelled on — a failed spawn
-        // never took `handles[0]`, so both ends are still ours. `session-mgr` retries a login
-        // after this returns, so the leak repeats per attempt (PR #238 review, finding 7).
+        // A failed spawn never took `handles[0]`; a login is retried, so the leak would repeat.
         // SAFETY: closing a setup channel pair for a process that does not exist.
         unsafe {
             syscall1(SYS_HANDLE_CLOSE, setup_mgr);
@@ -1317,67 +997,29 @@ pub fn spawn_leader(
         return -1;
     }
 
-    // Hand the shell its `argv` and its environment. No streams: an interactive shell
-    // reads `/dev/console` from its own namespace, which is a capability it was *given*
-    // rather than a stream it was handed.
-    //
-    // **One `argv`, in every build.** Under `test-harness` this used to be a `-c` script —
-    // `$env.PWD == $env.HOME`, a write to home read back, and `list .` finding something —
-    // run after an auto-login, so the boot had a deterministic verdict without anyone
-    // typing. It proved the right three things in a build where the *typed* login did not
-    // exist: `login()` was a different function and the whole `tty_*` layer was compiled
-    // out. Those three assertions are now steps 5a–5c of `cargo xtask test-interactive`,
-    // which drives the release image (`docs/planning/test-path-retrofit.md` Part B).
-    // **`argv_rest` exists so a leader can be told something its namespace cannot show it.**
-    // `desktop-shell` needs the user's real home (`/home/alice`) to scope the `/home` it binds
-    // into each application namespace, and it cannot read that anywhere: its own `HOME` is
-    // `/home`, which is true *inside the session* precisely because `build_namespace` already
-    // scoped it, and a binding never resolves back to the base it was made with. Passing it as
-    // an argument is how a parent states a fact rather than delegating authority — the fs
-    // endpoint is what carries the authority, and the shell already has that.
+    // **`argv_rest` tells a leader what its namespace cannot show it**: `desktop-shell` needs the
+    // user's real home to scope the `/home` it binds into applications, and a binding never
+    // resolves back to its base. It states a fact; the fs endpoint carries the authority.
     let mut argv_buf: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(1 + argv_rest.len());
     argv_buf.push(program);
     argv_buf.extend_from_slice(argv_rest);
     let argv: &[&str] = &argv_buf;
 
+    // No streams: a leader's I/O is what its namespace gives it, not a stream it was handed.
     let sent = send_setup_env(setup_mgr, &Streams::default(), argv, &session_env());
-    // **A second handle, after the setup message and only if there is one.**
-    //
-    // Only `handles[0]` of a `SpawnArgs` reaches a child, so anything past the setup channel
-    // has to arrive *over* it — `service-mgr` makes the same observation where it couriers
-    // endpoints. The graphical leader needs the compositor's forwarding endpoint: it builds a
-    // namespace per application and binds `/dev/draw/new` into each, and a *binding* is not
-    // re-bindable — it resolves to a kernel registration and never back to the endpoint.
-    //
-    // Ordered after the setup message, so a leader reads `argv` and its environment first and
-    // this second message is simply the next one on the same channel.
-    // **One message per extra, in the order given.** Only `handles[0]` of a `SpawnArgs` reaches
-    // a child, so everything past the setup channel arrives *over* it — and a leader that binds
-    // resources into namespaces it constructs needs the endpoints themselves, because a
-    // *binding* resolves to a kernel registration and never back to one.
+    // **One message per extra, in order, after the setup message.** Only `handles[0]` reaches a
+    // child, so the rest arrive *over* the setup channel; a leader binding resources needs the
+    // endpoints themselves, as a *binding* never resolves back to one.
     for &extra in extras {
         if sent.is_err() {
             continue;
         }
         // **A missing endpoint sends an empty message, not nothing.** The leader reads these
-        // positionally, so skipping one shifts every later endpoint up a slot — `desktop-shell`
-        // would take the profile server's endpoint for the tty server's, bind `/dev/tty` to it
-        // in every application namespace, and bind no `/bin` at all. `nxterm` would then resolve
-        // `/dev/tty`, get a profile-server channel and fail at `AttachBackend`, while the shell's
-        // own "no fonts or no terminal" warning stayed quiet because it saw a non-zero handle.
-        //
-        // Reachable: `init`'s `bind_tty_server` failure is non-fatal and merely prints "sessions
-        // will have no /dev/tty", so a zero propagates all the way here. This is the rule
-        // `init::send_handle` and `service-mgr::send_handle` already state and implement; this
-        // loop was the level that broke it (PR #238 review, finding 2).
-        //
-        // A failed duplicate and a failed send take the same path, for the same reason: the
-        // leader must see a gap where an endpoint was, not a shorter list.
-        // **Duplicated, because a handle on an IPC message is always a *move*.** `sys_channel_send`
-        // closes the sender's handle on success, so sending `extra_handle` directly would leave
-        // the caller's copy dead — and the caller reuses it for every later session. The symptom
-        // was every graphical login after the first getting no `/dev/draw` at all (PR #237
-        // review, finding 2).
+        // positionally, so skipping one shifts every later endpoint up a slot: `desktop-shell`
+        // would bind the profile server at `/dev/tty` and no `/bin`. Reachable: `init`'s non-fatal
+        // `bind_tty_server` failure propagates a zero. A failed duplicate or send does too.
+        // **Duplicated, because a handle on an IPC message is always a *move***: the caller reuses
+        // `extra` for every later session.
         let moved = if extra == 0 {
             0
         } else {
@@ -1387,17 +1029,12 @@ pub fn spawn_leader(
         if moved < 0 {
             kprint(b"libsession: could not duplicate the leader's extra handle\n");
         }
-        // Zero handles when there is nothing to send — the message still goes, holding the slot.
         let count: u64 = if moved > 0 { 1 } else { 0 };
         {
             // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; one moved handle, no payload.
             let r = unsafe {
-                // **Scrub the payload first.** This buffer is the crate's, and holds whatever
-                // was sent last — once, an `Authenticate` request, the username and password in
-                // the clear, which `authenticate` now scrubs itself. Restamping only the header
-                // would send all `MSG_LEN` bytes anyway, so the leader would receive whatever was
-                // there and hold it in `.bss` for the life of the process (PR #237 review,
-                // finding 1).
+                // **Scrub the payload first**: restamping only the header would send all `MSG_LEN`
+                // bytes of whatever was sent last, such as an `Authenticate` request.
                 SEND_MSG[PAYLOAD_OFF..].fill(0);
                 SEND_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
                 SEND_MSG[8] = count as u8;
@@ -1411,9 +1048,6 @@ pub fn spawn_leader(
                     SENDMODE_NOBLOCK,
                 )
             };
-            // Checked and reported, like `send_setup_env`'s result three lines up. Silence here
-            // is what made finding 2 invisible: the supervisor announced a session starting
-            // normally while the leader had been given nothing.
             if r != 0 {
                 kprint(b"libsession: the leader's extra handle was not delivered\n");
                 if count == 1 {
@@ -1421,8 +1055,7 @@ pub fn spawn_leader(
                     unsafe { syscall1(SYS_HANDLE_CLOSE, moved as u64) };
                 }
             } else if count == 0 {
-                // Said out loud, because the leader will read a live message holding nothing and
-                // has no other way to tell that apart from an endpoint that was never wanted.
+                // The leader cannot tell this from an endpoint that was never wanted.
                 kprint(b"libsession: an endpoint the leader expects is absent (placeholder sent)\n");
             }
         }
@@ -1438,12 +1071,9 @@ pub fn spawn_leader(
         .s(program.as_bytes())
         .s(b" spawned into the session namespace with its environment")
         .end();
-    // Reap it: block on the notification channel for its ChildExited, then read the code.
-    //
-    // **A terminate request is passed on** (administration Part E.4c): a shutdown asks the
-    // supervisor, and the session is the leader's to end. It then has [`LEADER_STOP_NS`] to exit,
-    // and past that the supervisor goes on without it — a stop is a request, and there is no
-    // forcible kill.
+    // **A terminate request is passed on**: a shutdown asks the supervisor, and the session is the
+    // leader's to end. It has [`LEADER_STOP_NS`] to exit, and past that the supervisor goes on
+    // without it — a stop is a request, and there is no forcible kill.
     let mut until = u64::MAX;
     loop {
         if !wait_until(notif, until) {
@@ -1459,7 +1089,6 @@ pub fn spawn_leader(
             }
             continue;
         }
-        // Drain queued notifications.
         loop {
             // SAFETY: NOTIF is a valid 64-byte writable out-param.
             let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
@@ -1491,9 +1120,7 @@ pub fn spawn_leader(
 mod tests {
     use super::blk_binding_index;
 
-    /// **A binding is a device only at exactly `/dev/blk/<n>`**: the `info` leaf beside it, the
-    /// kernel server's own `/dev/blk`, a lookalike prefix and a second spelling of an index are
-    /// not devices — each would otherwise be bound or unbound as one.
+    /// A binding is a device only at exactly `/dev/blk/<n>`; lookalikes must not be (un)bound.
     #[test]
     fn a_device_binding_is_exactly_dev_blk_and_an_index() {
         assert_eq!(blk_binding_index(b"/dev/blk/0"), Some(0));

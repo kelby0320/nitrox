@@ -4,10 +4,8 @@ use super::*;
 
 /// Serve one request on an open `/dev/desktop` session. Returns whether the shell must redraw.
 ///
-/// **The one place another process changes the desktop model**, and it goes through exactly the
-/// operations the shell's own chords do — `switch_desktop` and the name field — rather than
-/// touching the lists directly. A second path into the same state is a second place for the
-/// lifecycle rule to be forgotten.
+/// The one place another process changes the desktop model, through the same operations the
+/// chords use (`switch_desktop`, the name field), so the lifecycle rule has one path.
 #[allow(clippy::too_many_arguments, reason = "the session's state lives in separate locals of the caller")]
 pub(super) fn serve_desktop_session(
     ch: u64,
@@ -34,11 +32,8 @@ pub(super) fn serve_desktop_session(
             (&raw mut DS_COUNT) as u64,
         )
     };
-    // **Close whatever came with it.** No desktop op takes a handle, but that is a property of
-    // the *peer* rather than of this server — and a SAFETY comment that assumes it was the other
-    // half of blocking 2. The kernel installs whatever the sender attached into this process's
-    // table whether or not anything here looks at it, so left alone they pin slots in the global
-    // handle table for the shell's life. `serve_manager` in the compositor states the same rule.
+    // Close whatever came with it: the kernel installs attached handles whether or not anything
+    // looks at them, and they would pin slots in the global handle table.
     // SAFETY: closing handles the kernel just installed for us.
     unsafe {
         let n = ((&raw const DS_COUNT).read()).min(libkern::abi::IPC_HANDLE_MAX);
@@ -84,8 +79,7 @@ pub(super) fn serve_desktop_session(
                 desktops.iter().take(MAX_LISTED).map(|d| DesktopEntry { id: d.id, name: d.name.as_str() }).collect();
             let mut out = [0u8; 1024];
             let Some(n) = write_list(&mut out, cur as u32, &listed, desktops.len() > MAX_LISTED) else {
-                // Server-side data this server cannot encode — not a kernel fault, which is
-                // what `KernelError` claims and what a caller would chase.
+                // Server-side data, not a kernel fault, which `KernelError` would claim.
                 kprint(b"desktop-shell: a desktop list would not serialise\n");
                 return bad(KError::InvalidArgument);
             };
@@ -127,32 +121,24 @@ pub(super) fn serve_desktop_session(
             true
         }
         OP_DESKTOP_OPEN => {
-            // **The client names a path; the shell decides what runs.** An application holds no
-            // authority to spawn — it has no `/bin` and no way to build a namespace — so
-            // "open this" is a question rather than an instruction, and the answer is the
-            // shell's policy. A request that named the *program* would be ambient authority
-            // wearing a protocol.
+            // The client names a path; the shell decides what runs. An application holds no
+            // authority to spawn, so "open this" is a question, and a request naming the program
+            // would be ambient authority wearing a protocol.
             let Ok(path) = core::str::from_utf8(&body) else {
                 return bad(KError::InvalidArgument);
             };
             if path.is_empty() || path.len() > MAX_OPEN_PATH || !path.starts_with('/') {
-                // **Absolute only.** A relative path would be relative to *something*, and the
-                // only candidate is a working directory this shell does not have and the
-                // caller's namespace does not share.
+                // Absolute only: a relative path needs a working directory this shell does not
+                // have.
                 return bad(KError::InvalidArgument);
             }
-            // **And nothing bounds how many times this may be asked.** `Open` is the first
-            // spawn path a *program* can drive — the menus need a person — and the handler
-            // checks the path's shape and launches. `MAX_DESKTOP_SESSIONS` is not the bound
-            // (`nxfiles` opens a session per file, so a per-session counter resets every call),
-            // and this shell does not reap what it launches, so it cannot count what is alive.
+            // Nothing bounds how many times this may be asked: `Open` is the first spawn path a
+            // program can drive, `MAX_DESKTOP_SESSIONS` is no bound, and the shell does not reap
+            // what it launches.
             // TODO(open-amplification): bound this once the shell has that record.
             //
-            // **Not stat'ed here, deliberately.** The shell could ask whether the path is a
-            // file, and the answer would be about the *shell's* namespace rather than the
-            // caller's or the editor's — three namespaces that agree today because one process
-            // builds all three, which is exactly the kind of agreement not to lean on. What
-            // opens the path reports what it found, in the window the person is looking at.
+            // Not stat'ed here, deliberately: the answer would be about the shell's namespace,
+            // not the caller's or the editor's.
             if !launcher.launch(OPENER, &[path]) {
                 return bad(KError::Unsupported);
             }
@@ -164,21 +150,14 @@ pub(super) fn serve_desktop_session(
     }
 }
 
-/// What opens a path.
-///
-/// **One program, and a constant rather than a table, because there is one.** Dispatching on an
-/// extension is what this grows into the first time a second program can open something — an
-/// image viewer, a `.tsm` table — and writing the table now would be writing a mechanism with
-/// one entry and no second case to check it against. M12 names the applications that give it
-/// one.
+/// What opens a path: one program, a constant rather than a table, until a second can open
+/// something.
 const OPENER: &str = "nxedit";
 
-/// Answer one message on the desktop endpoint's serve end — a resolve, minting a session.
+/// Answer one message on the desktop endpoint's serve end: a resolve, minting a session.
 ///
-/// **The shell is a resource server here, which is the thing `graphical-session.md` §3 had to
-/// reconcile.** It does not *register* itself: nothing binds this endpoint into a namespace a
-/// supervisor owns. It binds it into the namespaces it **constructs** for the applications it
-/// launches, which is the constructor role it already holds `BIND_NAMESPACE` for.
+/// The shell is a resource server here but does not register itself: it binds this endpoint into
+/// the namespaces it constructs.
 pub(super) fn serve_desktop_endpoint() {
     use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
     use librsproto::{OP_NS_RESOLVE, decode};
@@ -203,9 +182,8 @@ pub(super) fn serve_desktop_endpoint() {
         let payload_len = u32::from_le_bytes([DS_MSG[4], DS_MSG[5], DS_MSG[6], DS_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(((&raw const DS_MSG) as *const u8).add(24), payload_len.min(4096 - 24));
         match decode(req) {
-            // **An empty suffix only.** `/dev/desktop` is the resource itself; a suffix names
-            // something beneath it, and the per-object paths composition §2a sketches are not
-            // built — so answering one would invent a second level this server does not have.
+            // An empty suffix only: `/dev/desktop` is the resource itself, with no per-object
+            // paths beneath.
             Ok(m) if m.op == OP_NS_RESOLVE => match parse_resolve_request(m.body) {
                 Some(r) if r.suffix.is_empty() => (m.op, m.request_id, true),
                 _ => (m.op, m.request_id, false),
@@ -234,8 +212,7 @@ pub(super) fn serve_desktop_endpoint() {
         ds_reply(serve, op, request_id, &b, 0, true);
         return;
     };
-    // Bound before replying, so a fast client's first request cannot arrive before the slot is
-    // live — the same ordering `auth-service` states.
+    // Bound before replying, so a fast client's first request finds the slot live.
     // SAFETY: `slot` is free.
     unsafe { DESKTOP_SESSIONS[slot] = session_end };
     let mut body = [0u8; 32];
@@ -252,10 +229,8 @@ pub(super) fn serve_desktop_endpoint() {
     kprint(b"desktop-shell: /dev/desktop session opened\n");
 }
 
-/// How many clients may hold a `/dev/desktop` session at once.
-///
-/// Small on purpose: the only consumer is a short-lived command, and every slot costs a waiter
-/// in a set the compositor session and the manager channel are also in.
+/// How many clients may hold a `/dev/desktop` session at once; small, as every slot costs a
+/// waiter in the main wait set.
 pub(super) const MAX_DESKTOP_SESSIONS: usize = 4;
 
 /// The desktop endpoint's serve end, and its open sessions.
@@ -263,15 +238,11 @@ pub(super) static mut DESKTOP_SERVE: u64 = 0;
 /// See [`DESKTOP_SERVE`].
 pub(super) static mut DESKTOP_SESSIONS: [u64; MAX_DESKTOP_SESSIONS] = [0; MAX_DESKTOP_SESSIONS];
 static mut DS_MSG: [u8; 4096] = [0; 4096];
-/// Sized from the **ABI**, not from what this server expects to receive.
+/// Sized from the ABI, not from what this server expects.
 ///
-/// `sys_channel_recv` passes no receiver-side capacity: the kernel copies out `n * 8` bytes
-/// where `n` is the *sender's* stamped count, bounded only by `IPC_HANDLE_MAX`. At four this
-/// was a 32-byte static the kernel would write 64 bytes into — and `/dev/desktop` is bound into
-/// **every** application namespace this shell constructs, so any client sending a request with
-/// eight handles attached smashes whatever `.bss` follows. No bug in the client is needed; a
-/// careless one does it (PR #245 review, blocking 2). Every other server in the tree sizes this
-/// `[u64; IPC_HANDLE_MAX]` for exactly this reason.
+/// `sys_channel_recv` copies out `n * 8` bytes for the sender's stamped count, up to
+/// `IPC_HANDLE_MAX`, and `/dev/desktop` is bound into every application namespace, so a client
+/// attaching eight handles would smash whatever `.bss` follows a smaller array.
 static mut DS_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi::IPC_HANDLE_MAX];
 static mut DS_COUNT: usize = 0;
 static mut DS_REPLY: [u8; 4096] = [0; 4096];
@@ -290,7 +261,6 @@ pub(super) fn make_channel() -> Option<(u64, u64)> {
     Some(unsafe { ((&raw const CH_OUT0).read(), (&raw const CH_OUT1).read()) })
 }
 
-/// Send a reply on `ch` for `request_id`, optionally transferring `handle`.
 fn ds_reply(ch: u64, op: u16, request_id: u64, body: &[u8], handle: u64, err: bool) -> bool {
     use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY};
     let flags = if err { RS_FLAG_REPLY | RS_FLAG_ERROR } else { RS_FLAG_REPLY };
@@ -314,12 +284,9 @@ fn ds_reply(ch: u64, op: u16, request_id: u64, body: &[u8], handle: u64, err: bo
     }
 }
 
-/// Tell the compositor which scheme the session's theme named.
-///
-/// **Sent whatever the scheme is, light included**, though the compositor starts light. Every gate
-/// that boots a session boots the staged theme, which is light — so a message sent only for dark
-/// would be a path no boot ever took, and the compositor's `scheme light` line is the one piece of
-/// evidence a boot can give that the theme reached it.
+/// Tell the compositor which scheme the session's theme named. Sent whatever the scheme is: every
+/// gate boots the light staged theme, and the compositor's `scheme light` line is the evidence it
+/// arrived.
 pub(super) fn tell_scheme(mgr: &mut ChannelTransport, scheme: libdraw::theme::Scheme) {
     use librsproto::surface::{MgrScheme, OP_MGR_SET_SCHEME, SCHEME_DARK, SCHEME_LIGHT};
     let value = match scheme {
@@ -338,13 +305,9 @@ pub(super) fn tell_scheme(mgr: &mut ChannelTransport, scheme: libdraw::theme::Sc
     }
 }
 
-/// Tell the compositor which desktop to composite, and say so.
-///
-/// **The only thing the compositor is told about desktops.** Which ones exist, what they are
-/// called and when they disappear never leaves this process — `ui-composition-model.md` §6's
-/// split. **What keeps the two in step is `told`**, the desktop the compositor was last told,
-/// because the shell's current desktop also moves by a route that is not a switch — see
-/// [`sync_current`].
+/// Tell the compositor which desktop to composite, and say so: the only thing it is told about
+/// desktops. `told` is the desktop it was last told, since the current desktop also moves by a
+/// route that is not a switch: see [`sync_current`].
 pub(super) fn switch_desktop(
     mgr: &mut ChannelTransport,
     desktops: &[Desktop],
@@ -364,7 +327,6 @@ pub(super) fn switch_desktop(
     true
 }
 
-/// Send `SetCurrentDesktop`, saying so if it would not go.
 fn tell_current(mgr: &mut ChannelTransport, to: u32) -> bool {
     use librsproto::surface::{MgrDesktop, OP_MGR_SET_CURRENT_DESKTOP};
     let mut body = [0u8; core::mem::size_of::<MgrDesktop>()];
@@ -380,24 +342,13 @@ fn tell_current(mgr: &mut ChannelTransport, to: u32) -> bool {
     true
 }
 
-/// Bring the compositor back into step with the shell's current desktop, when something other
-/// than a switch has moved it.
+/// Bring the compositor back into step with the shell's current desktop when something other than
+/// a switch moved it.
 ///
-/// **`normalize_desktops` moves it**: an emptied, unnamed current desktop is removed, and the
-/// shell lands on the one that takes its place. Until the desktop refresh's Part C nothing told
-/// the compositor, which went on compositing the removed desktop and stamping new windows with
-/// its number — while `place_new_windows` recorded the shell's number for the same windows, on
-/// the grounds that the two are "the same number read from the other side". They were not, and
-/// nothing showed it until a switch: `check-login`'s switcher step went to a desktop and back and
-/// found its terminal on a desktop the compositor was no longer compositing — listed, unfocused,
-/// and not on screen. The chords had the same hole.
-///
-/// **Called at three points a pass, rather than at each of the eight normalisations**: before the
-/// manager drain, after it, and after the event drain. What matters is that the compositor has
-/// been told before a window is drained, because a window arrives only through the manager drain
-/// and is recorded there on the shell's current desktop. The call *before* the drain is the one a
-/// first version lacked: the desktop endpoint runs ahead of it and can normalise too (PR #314
-/// review, optional 6).
+/// `normalize_desktops` removes an emptied, unnamed current desktop and the shell lands on its
+/// successor; left untold, the compositor stamps new windows with the removed desktop's number.
+/// Called before the manager drain, after it and after the event drain: the compositor must be
+/// told before a window is drained, and the desktop endpoint can normalise ahead of the drain.
 pub(super) fn sync_current(mgr: &mut ChannelTransport, desktops: &[Desktop], current: u32, told: &mut u32) {
     if current == *told {
         return;

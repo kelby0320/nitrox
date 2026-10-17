@@ -7,10 +7,10 @@
 //! spelling stays in the architecture's private submodule, as
 //! `docs/conventions/arch-boundary.md` requires.
 //!
-//! **Why this exists at all** (Phase 5 Part G's measurement): the laptop's first boot drew the
-//! desktop slowly in proportion to the area repainted, and the suspected reason is that the
-//! framebuffer's range is uncacheable while every mapping this kernel makes is write-back. That
-//! is a claim about the machine, so the machine is asked rather than assumed.
+//! **Why this exists at all:** a laptop's first boot drew the desktop slowly in proportion to
+//! the area repainted, and the suspected reason is that the framebuffer's range is uncacheable
+//! while every mapping this kernel makes is write-back. That is a claim about the machine, so
+//! the machine is asked rather than assumed.
 
 /// How the hardware treats reads and writes to a range of physical memory.
 ///
@@ -61,8 +61,7 @@ pub enum Policy {
     /// entries out of the old table.
     Replaced,
     /// This CPU has no such table at all, so there is nothing to install and no attribute to
-    /// select: every mapping is whatever the range registers say. No x86-64 part ships like this,
-    /// and the case is handled rather than assumed away because the check for it is one bit.
+    /// select: every mapping is whatever the range registers say.
     NoTable,
 }
 
@@ -78,9 +77,9 @@ pub trait ArchMemoryTypes {
     /// What the *mapping* of `virt` asks for, or `None` if it is not mapped.
     ///
     /// Distinct from [`at`](ArchMemoryTypes::at), which answers for the physical memory: the two
-    /// disagreeing is the whole of Phase 5 Part G. What the hardware then does is the stronger of
-    /// the two, except that a mapping asking for write-combining raises an uncacheable range —
-    /// the one case where a page table wins, and the one the fix uses.
+    /// disagreeing is the problem this module exists to expose. What the hardware then does is
+    /// the stronger of the two, except that a mapping asking for write-combining raises an
+    /// uncacheable range — the one case where a page table wins, and the one the fix uses.
     ///
     /// # Safety
     /// Ring 0. Walks the active page tables.

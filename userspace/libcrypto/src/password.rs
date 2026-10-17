@@ -10,8 +10,8 @@ pub const VERIFIER_LEN: usize = 32;
 
 /// Default PBKDF2 iteration count. Modest on purpose — this is a hobby OS proving
 /// the login path under emulation, not a production authenticator; the count is
-/// stored per record (see the auth user-DB format) so it can be raised without a
-/// format change. Chosen to be noticeable but not slow the headless test boot.
+/// stored per record (see the auth user-DB format) so it can be raised without a format change.
+/// Chosen to be noticeable but not slow the headless test boot.
 pub const DEFAULT_ITERATIONS: u32 = 4096;
 
 /// Derive the `VERIFIER_LEN`-byte verifier for `password` under `salt` +

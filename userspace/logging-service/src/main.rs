@@ -1,21 +1,17 @@
-//! `logging-service` — the userspace **logging service** (Phase 3).
+//! `logging-service` — the userspace **logging service**.
 //!
-//! A namespace-bound resource server that collects structured log records from any
-//! process holding a logging endpoint, stamps them with **trusted, capability-derived**
-//! provenance, and fans them out to sinks. Bound at a logging path by a supervisor
-//! (init/service-mgr); a client resolves `<tier>/<principal>[/<source>]` under it and the
-//! server hands back a per-principal write channel (an `OBJECT_KIND_CHANNEL` resolve
-//! reply). The client then streams raw `LogRecord` appends on that channel; the server
-//! stamps `principal`/`tier` (from *which* channel the record arrived on),
-//! `timestamp`/`sequence`, and routes to sinks. See `docs/architecture/logging.md`.
+//! A namespace-bound resource server that collects log records from any process holding a
+//! logging endpoint, stamps them with **trusted, capability-derived** provenance, and fans
+//! them out to sinks. A client resolves `<tier>/<principal>[/<source>]` under the path a
+//! supervisor bound it at and gets a per-principal write channel; the server stamps
+//! `principal`/`tier` (from *which* channel a record arrived on), `timestamp` and `sequence`.
+//! See `docs/architecture/logging.md`.
 //!
-//! **And it reads back** (administration Part E.6). Resolving `read-endpoint` on the serving
-//! endpoint mints a **read endpoint**, which the view broker's `logs` grant binds at `/dev/logs`;
-//! any resolve on that opens a **read session**, a channel that answers `Log::Read` from the ring —
-//! the most recent records, bounded by bytes (`docs/spec/rsproto-log-ops.md`). Only a holder of
-//! the root namespace reaches `read-endpoint`, as with every server's admin endpoint.
-//!
-//! `#![no_std]` + `#![no_main]`; `libkern` + `libheap` + `librsproto`.
+//! **And it reads back.** Resolving `read-endpoint` on the serving endpoint mints a **read
+//! endpoint**, which the view broker's `logs` grant binds at `/dev/logs`; any resolve on that
+//! opens a **read session**, a channel that answers `Log::Read` from the ring
+//! (`docs/spec/rsproto-log-ops.md`). Only a holder of the root namespace reaches
+//! `read-endpoint`, as with every server's admin endpoint.
 
 #![no_std]
 #![no_main]
@@ -38,33 +34,28 @@ use logging_service::ring::{NAME_MAX, Record, Ring, claimed_source};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
+/// The `IpcMsg` payload offset, after its 24-byte header.
 const PAYLOAD_OFF: usize = 24;
+/// The size of each IPC message buffer.
 const MSG_LEN: usize = 4096;
-/// Read endpoints held at once (administration Part E.6): the view broker's, which it keeps for the
-/// boot once a `logs` grant has been used, and one more — `boot-probe`'s, in a test image. A third
+/// Read endpoints held at once: the view broker's, and `boot-probe`'s in a test image. A third
 /// is refused `WouldBlock`.
 const MAX_READ_ENDPOINTS: usize = 2;
-/// Read sessions open at once: a `log` running, and one more. A session is closed by its reader
-/// when it has read what it wanted, so this bounds readers at the same moment, not in a boot.
+/// Read sessions open at once: a `log` running, and one more. A reader closes its session when
+/// done, so this bounds concurrent readers.
 const MAX_READ_SESSIONS: usize = 2;
-/// The most per-principal log channels the server reads from at once.
+/// The most per-principal log channels read at once.
 ///
 /// **Derived, not chosen**: the server waits on one set holding the serving endpoint, the control
-/// channel (administration Part E.4), the read endpoints and sessions (Part E.6) and every source,
-/// so the ceiling is the kernel's fan-out limit less the rest. Written
-/// this way rather than restating the number so that raising [`MAX_WAIT_HANDLES`] moves it
-/// — this and `fs-server-ext4`'s session cap were separately-written `7`s until Slice C3.
+/// channel, the read endpoints and sessions and every source, so the ceiling is the kernel's
+/// fan-out limit less the rest. Raising [`MAX_WAIT_HANDLES`] moves it.
 /// Escaping the limit rather than raising it is `TODO(server-fanout)`; see
 /// `docs/architecture/logging.md`.
 const MAX_SOURCES: usize = MAX_WAIT_HANDLES - 2 - MAX_READ_ENDPOINTS - MAX_READ_SESSIONS;
-/// `KError::PeerClosed` — the writer of a source channel is gone. Distinguished from
-/// `WouldBlock` because the two demand opposite responses: wait again, or stop waiting
-/// **forever**. See [`drain_source`].
+/// `KError::PeerClosed`: unlike `WouldBlock`, stop waiting on the handle. See [`drain_source`].
 const E_PEER_CLOSED: i64 = -13;
-/// The resolve suffix, on the serving endpoint, that mints a read endpoint.
+/// The resolve suffix that mints a read endpoint.
 const READ_ENDPOINT: &str = "read-endpoint";
-/// A `Read` reply's body: an IPC payload less the rsproto header.
 const READ_BODY_CAP: usize = IPC_PAYLOAD_SIZE - RS_HEADER_LEN;
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
@@ -82,17 +73,16 @@ static mut READ_BODY: [u8; READ_BODY_CAP] = [0; READ_BODY_CAP];
 
 /// A per-principal log channel the server holds the read end of.
 struct Source {
-    /// The kept (read) endpoint; the client holds the transferred write end.
+    /// The kept (read) endpoint.
     handle: u64,
     principal: String,
     tier: u8,
-    /// A named-source sub-label from the resolve path (`<principal>/<label>`), stamped on
-    /// every record on this channel unless the record carries its own `source`.
+    /// The resolve path's sub-label, stamped on records that carry no `source` of their own.
     label: Option<String>,
 }
 
-/// A destination for stamped records. The serial sink is one; a disk or network sink slots in
-/// behind this trait later. The ring is not one: `Read` answers from it, so it is [`Log`]'s own.
+/// A destination for stamped records. The ring is not one: `Read` answers from it, so it is
+/// [`Log`]'s own.
 trait Sink {
     fn write(&mut self, rec: &Record);
 }
@@ -123,8 +113,7 @@ impl Sink for SerialSink {
     }
 }
 
-/// **Where a stamped record goes**: every sink, then the ring. Holds the sequence counter, so
-/// every record is stamped by the one place that keeps them.
+/// **Where a stamped record goes**: every sink, then the ring. Holds the sequence counter.
 struct Log {
     sinks: Vec<Box<dyn Sink>>,
     ring: Ring,
@@ -132,7 +121,6 @@ struct Log {
 }
 
 impl Log {
-    /// Stamp a record with the trusted fields and send it on.
     fn record(&mut self, principal: String, tier: u8, level: u8, message: String, source: Option<String>) {
         self.seq += 1;
         let rec = Record {
@@ -152,13 +140,11 @@ impl Log {
     }
 }
 
-/// Emit `msg` to the serial console.
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`.
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
-/// Exit the process (does not return).
 fn exit(code: i64) -> ! {
     // SAFETY: SYS_PROCESS_EXIT terminates this process.
     unsafe { syscall1(SYS_PROCESS_EXIT, code as u64) };
@@ -167,7 +153,6 @@ fn exit(code: i64) -> ! {
     }
 }
 
-/// Read the monotonic clock (nanoseconds).
 fn clock_now() -> u64 {
     let mut out: u64 = 0;
     // SAFETY: `&out` is a valid writable u64 out-param.
@@ -183,7 +168,6 @@ fn wall_now() -> Option<u64> {
     (r == 0).then_some(out)
 }
 
-/// Create a connected channel pair into `(o0, o1)`; returns `(end0, end1)` or `None`.
 fn make_channel(o0: *mut u64, o1: *mut u64) -> Option<(u64, u64)> {
     // SAFETY: o0/o1 are valid writable out-params.
     let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, o0 as u64, o1 as u64, 4, 0) };
@@ -194,8 +178,7 @@ fn make_channel(o0: *mut u64, o1: *mut u64) -> Option<(u64, u64)> {
     Some(unsafe { (o0.read(), o1.read()) })
 }
 
-/// Receive one message on `endpoint` into the RECV_* statics. Returns the syscall result
-/// (0 = a message was received; non-zero = WouldBlock / error).
+/// Receive one message on `endpoint` into the RECV_* statics; 0 means one arrived.
 fn recv(endpoint: u64) -> i64 {
     // SAFETY: RECV_* are valid writable buffers.
     unsafe {
@@ -210,7 +193,7 @@ fn recv(endpoint: u64) -> i64 {
 }
 
 /// Send `Meta::Ready` on the control channel, transferring `kernel_end` (the endpoint the
-/// supervisor binds at the logging path). `false` on any failure.
+/// supervisor binds at the logging path).
 fn send_ready(control: u64, kernel_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let body_len = match librsproto::meta::ready(&mut body, b"logging-service") {
@@ -224,7 +207,7 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
             None => return false,
         }
     };
-    // SAFETY: stamp the IpcMsg header (payload_len @4, handle_count @8) + handle slot.
+    // SAFETY: stamp the `IpcMsg` header (payload_len @4, handle_count @8) and the handle slot.
     unsafe {
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
         REPLY_MSG[8] = 1;
@@ -245,12 +228,10 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
     sr == 0
 }
 
-/// Reply to a forwarded resolve on `serve_end`, transferring `write_end` as the resolved
-/// `OBJECT_KIND_CHANNEL` capability (the client's per-principal log channel). `true` on a
-/// successful send (the handle has moved to the caller).
+/// Reply to a forwarded resolve, transferring `write_end` as the resolved channel. `true` once
+/// the handle has moved to the caller.
 fn reply_channel(serve_end: u64, request_id: u64, write_end: u64) -> bool {
     let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
-    // content_len is unused for a channel; the handle rides in handles[0].
     let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
     // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset 24.
     let rs_len = unsafe {
@@ -276,7 +257,6 @@ fn reply_channel(serve_end: u64, request_id: u64, write_end: u64) -> bool {
     sr == 0
 }
 
-/// Send an error reply on `serve_end` (no transferred handle).
 fn reply_error(serve_end: u64, request_id: u64, op: u16, kerror: i32) {
     let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
     let elen = error_body(&mut ebody, kerror, 0, b"").unwrap_or(0);
@@ -306,15 +286,14 @@ fn reply_error(serve_end: u64, request_id: u64, op: u16, kerror: i32) {
 enum Asked {
     /// A log channel for `(tier, principal, source label)`.
     Source(u8, String, Option<String>),
-    /// A read endpoint (administration Part E.6).
+    /// A read endpoint.
     ReadEndpoint,
 }
 
-/// Handle one forwarded `Namespace::Resolve` on the serving endpoint: `read-endpoint` mints a read
-/// endpoint; anything else is classified as a log path, and mints a per-principal channel (keep
-/// the read end tagged, transfer the write end). Bad paths / over-capacity get an error reply.
+/// Handle one forwarded `Namespace::Resolve`: `read-endpoint` mints a read endpoint; anything
+/// else is classified as a log path and mints a per-principal channel (keep the read end tagged,
+/// transfer the write end). Bad paths and over-capacity get an error reply.
 fn process_resolve(serve_end: u64, sources: &mut Vec<Source>, read_ends: &mut Vec<u64>) {
-    // Decode the rsproto request from the IpcMsg payload (offset 24, payload_len).
     // SAFETY: read the header length + form a bounded read-only slice over RECV_MSG.
     let (request_id, asked) = unsafe {
         let payload_len = u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
@@ -329,14 +308,14 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>, read_ends: &mut Ve
                         (m.request_id, Some(Asked::ReadEndpoint))
                     }
                     Some(suffix) => match path::classify(suffix) {
-                        // **Names are bounded** (Part E.6): a principal is identity, so one too
-                        // long to keep whole is refused rather than cut.
+                        // A principal is identity, so one too long to keep whole is refused,
+                        // not cut.
                         Some(c) if c.principal.len() > NAME_MAX || c.source.is_some_and(|l| l.len() > NAME_MAX) => {
                             reply_error(serve_end, m.request_id, m.op, KError::InvalidArgument.as_i32());
                             (m.request_id, None)
                         }
                         Some(c) => {
-                            // Owned copies before we touch the shared buffers again.
+                            // Owned copies: `c` borrows the receive buffer the next message reuses.
                             let label = c.source.map(String::from);
                             (m.request_id, Some(Asked::Source(c.tier, String::from(c.principal), label)))
                         }
@@ -381,7 +360,6 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>, read_ends: &mut Ve
             return;
         }
     };
-    // Transfer the write end to the resolving client; keep the read end tagged.
     if reply_channel(serve_end, request_id, write_end) {
         match &label {
             Some(l) => kprint(format!("logging-service: opened {}/{}/{}\n", tier_name(tier), principal, l).as_bytes()),
@@ -389,21 +367,20 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>, read_ends: &mut Ve
         }
         sources.push(Source { handle: read_end, principal, tier, label });
     } else {
-        // Reply failed (the write end did not move): reclaim both ends.
+        // The reply failed, so the write end did not move: close both.
         close(read_end);
         close(write_end);
     }
 }
 
-/// Close one of this service's handles.
 fn close(h: u64) {
     // SAFETY: closing a handle this process owns.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
 }
 
-/// **Mint a read endpoint** (administration Part E.6): a channel whose other end is the answer to
-/// the resolve, which a supervisor binds as a server endpoint — the view broker, at `/dev/logs` —
-/// so every resolve there arrives here, on the end kept. At most [`MAX_READ_ENDPOINTS`].
+/// **Mint a read endpoint**: a channel whose other end is the answer to the resolve, which a
+/// supervisor binds as a server endpoint (the view broker, at `/dev/logs`), so every resolve
+/// there arrives here, on the end kept. At most [`MAX_READ_ENDPOINTS`].
 fn mint_read_endpoint(serve_end: u64, request_id: u64, read_ends: &mut Vec<u64>) {
     if read_ends.len() >= MAX_READ_ENDPOINTS {
         return reply_error(serve_end, request_id, OP_NS_RESOLVE, KError::WouldBlock.as_i32());
@@ -440,9 +417,9 @@ fn received() -> Option<librsproto::Message<'static>> {
     }
 }
 
-/// **A resolve on a read endpoint opens a read session**, whatever its suffix: a channel of its
-/// own, at most [`MAX_READ_SESSIONS`] at once. `false` once the endpoint's binding is gone, so it
-/// leaves the wait set rather than being signalled forever.
+/// **A resolve on a read endpoint opens a read session**, whatever its suffix, at most
+/// [`MAX_READ_SESSIONS`] at once. `false` once the binding is gone, so the endpoint leaves the
+/// wait set rather than being signalled forever.
 fn serve_read_endpoint(from: u64, sessions: &mut Vec<u64>) -> bool {
     loop {
         let rc = recv(from);
@@ -475,8 +452,7 @@ fn serve_read_endpoint(from: u64, sessions: &mut Vec<u64>) -> bool {
     }
 }
 
-/// **A read session**: each `Log::Read` answered from the ring, and anything else refused.
-/// `false` once its reader has closed it.
+/// **A read session**: each `Log::Read` answered from the ring. `false` once its reader closed it.
 fn serve_read_session(h: u64, ring: &Ring) -> bool {
     loop {
         let rc = recv(h);
@@ -499,9 +475,8 @@ fn serve_read_session(h: u64, ring: &Ring) -> bool {
     }
 }
 
-/// Answer a `Read`: the records after `after`, oldest first, as many as one reply holds and no
-/// more than `max` (`0` for no limit) — [`Ring::fill_reply`]. None left is an empty reply, which is
-/// how a reader knows it has read to the end.
+/// Answer a `Read` with [`Ring::fill_reply`]. None left is an empty reply, which is how a
+/// reader knows it has read to the end.
 fn reply_records(to: u64, request_id: u64, ring: &Ring, after: u64, max: u32) {
     #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
     // SAFETY: READ_BODY is this single-threaded service's scratch, used by no one else.
@@ -535,10 +510,9 @@ fn reply_records(to: u64, request_id: u64, ring: &Ring, after: u64, max: u32) {
     }
 }
 
-/// Decode a `TSM1` typed-stream message and render its rows through the sinks (each row as
-/// a `name=value …` line, stamped like any other record), plus a one-time marker naming the
-/// schema's columns — the end-to-end demonstration of a typed stream flowing through the log
-/// channel. A malformed / truncated stream is dropped, never fatal.
+/// Decode a `TSM1` typed-stream message and render each row as a `name=value …` record, after a
+/// one-time marker naming the schema's columns. A malformed or truncated stream is dropped,
+/// never fatal.
 fn render_typed(body: &[u8], principal: &str, tier: u8, chan_label: &Option<String>, log: &mut Log) {
     let mut tr = match libstream::TableReader::new(body) {
         Ok(t) => t,
@@ -548,7 +522,6 @@ fn render_typed(body: &[u8], principal: &str, tier: u8, chan_label: &Option<Stri
         }
     };
     let schema = tr.schema().clone();
-    // One-time marker: the typed header decoded; show which columns arrived.
     let mut cols = String::from("logging-service: typed stream from ");
     cols.push_str(principal);
     cols.push_str(" [");
@@ -577,7 +550,6 @@ fn render_typed(body: &[u8], principal: &str, tier: u8, chan_label: &Option<Stri
     }
 }
 
-/// Render one decoded row as `name=value name=value …`.
 fn format_typed_row(schema: &libstream::Schema, values: &[libstream::Value]) -> String {
     use core::fmt::Write;
     use libstream::Value;
@@ -602,7 +574,7 @@ fn format_typed_row(schema: &libstream::Schema, values: &[libstream::Value]) -> 
             Some(Value::Handle(v)) => {
                 let _ = write!(s, "{:#x}", v);
             }
-            // Collection cells are summarised compactly — a log line stays one line.
+            // Collection cells are summarised so a log line stays one line.
             Some(Value::List(items)) => {
                 let _ = write!(s, "<list:{}>", items.len());
             }
@@ -618,29 +590,20 @@ fn format_typed_row(schema: &libstream::Schema, values: &[libstream::Value]) -> 
     s
 }
 
-/// Drain and stamp every queued `LogRecord` on the source channel `h`, routing each through
-/// `log` to the sinks and the ring.
+/// Drain and stamp every queued `LogRecord` on source channel `h`. `true` once its writer is gone.
 fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
     let (principal, tier, chan_label) = match sources.iter().find(|s| s.handle == h) {
         Some(s) => (s.principal.clone(), s.tier, s.label.clone()),
-        // An unknown handle is not a live source, so reporting it dead is also what gets
-        // it out of the wait set rather than leaving it to be re-signaled forever.
+        // An unknown handle is no live source: reported dead, it leaves the wait set.
         None => return true,
     };
     loop {
         let rc = recv(h);
         if rc == E_PEER_CLOSED {
-            // The principal holding the write end exited. **Terminal, and it has to be
-            // acted on** — this is the one recv outcome that must not be retried.
-            //
-            // A closed peer is permanently `signaled`, so a dead handle left in the wait
-            // set makes `sys_wait` return instantly, every time, forever: this service
-            // spins at 100% of a CPU. The cost is not the wasted cycles. Deferred handle
-            // reclamation runs in the **idle thread**, and a run queue that is never
-            // empty means the CPU never idles — so *no exited process on the system is
-            // ever reclaimed*, and every pipe they held stays open. One coreutil leaving
-            // a log channel behind hung the shell on an unrelated pipe, three subsystems
-            // away. See the 2026-07-31 decision-log entry.
+            // **Terminal, and never retried.** A closed peer is permanently `signaled`, so a
+            // dead handle left in the wait set makes `sys_wait` return at once, forever: this
+            // service spins, the idle thread never runs, and with it no exited process on the
+            // system is reclaimed (decision log, 2026-07-31).
             return true;
         }
         if rc != 0 {
@@ -654,8 +617,7 @@ fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
                 payload_len.min(MSG_LEN - PAYLOAD_OFF),
             )
         };
-        // Route by the leading magic: a TSM1 typed stream is decoded + rendered; anything
-        // else is a text LogRecord append.
+        // A TSM1 typed stream is rendered; anything else is a text `LogRecord` append.
         if body.starts_with(&libstream::wire::MAGIC) {
             render_typed(body, &principal, tier, &chan_label, log);
             continue;
@@ -671,13 +633,11 @@ fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
 }
 
 /// The serve loop: multi-wait on the serving endpoint, the control channel, the read endpoints and
-/// sessions, and every per-principal channel; forwarded resolves mint channels or read endpoints,
-/// log appends are stamped and sunk, and `Read`s answered from the ring. Never returns.
+/// sessions, and every per-principal channel. Never returns.
 ///
-/// **It exits on `CTRL_OP_SHUTDOWN`** (administration Part E.4), after sinking every record
-/// already queued: a shutdown asks the services in the reverse of their start order, so by then
-/// everything started after the log has said its last. `service --stop` never sends it, since
-/// the log is `essential`.
+/// **It exits on `CTRL_OP_SHUTDOWN`**, after sinking every record already queued: a shutdown asks
+/// the services in the reverse of their start order, so by then everything started after the log
+/// has said its last. `service --stop` never sends it, since the log is `essential`.
 fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
     kprint(b"logging-service: serving\n");
     let mut sources: Vec<Source> = Vec::new();
@@ -685,10 +645,8 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
     let mut sessions: Vec<u64> = Vec::new();
     let mut dead: Vec<u64> = Vec::new();
     loop {
-        // Build the wait set: [serve_end, control?] + read endpoints + read sessions + sources.
-        // SAFETY: WAIT_HANDLES has MAX_WAIT_HANDLES slots, and each list is capped — the sources
-        // at MAX_SOURCES, which is what is left of MAX_WAIT_HANDLES after the rest — so `count`
-        // never passes it.
+        // SAFETY: WAIT_HANDLES has MAX_WAIT_HANDLES slots, and each list is capped (the sources at
+        // MAX_SOURCES, what is left after the rest), so `count` never passes it.
         let count = unsafe {
             let mut count = 0;
             let mut put = |h: u64| {
@@ -710,7 +668,7 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
         if waited < 1 {
             continue;
         }
-        // Each signaled handle is one 24-byte IoResult (handle @0).
+        // Each signaled handle is one 24-byte `IoResult` (handle @0).
         let signalled: Vec<u64> = (0..waited as usize)
             .map(|j| {
                 let off = j * 24;
@@ -729,10 +687,10 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
                 }
             })
             .collect();
-        // **Closes before resolves, in every wake** (the lesson of the view broker's, PR #343's
-        // E.4a): a reader that lets go of a session or an endpoint and asks for another at once
-        // must find the first retired, or it is refused a slot that is free. So the sessions and
-        // sources first, then the read endpoints, then the serving endpoint.
+        // **Closes before resolves, in every wake**: a reader that lets go of a session or an
+        // endpoint and asks for another at once must find the first retired, or it is refused a
+        // slot that is free. So the sessions and sources first, then the read endpoints, then the
+        // serving endpoint.
         for &h in &signalled {
             if h == control {
                 match libkern::control::recv(control) {
@@ -755,9 +713,7 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
                 dead.push(h);
             }
         }
-        // Retire dead sources *after* their sweep — `drain_source` borrows `sources`, and a
-        // source removed mid-iteration would shift the handles the results still name. **A dead
-        // source is retired, not waited on**: a closed peer is signalled forever.
+        // Retired after the sweep, since `drain_source` borrows `sources`.
         for h in dead.drain(..) {
             sources.retain(|s| s.handle != h);
             close(h);
@@ -769,7 +725,6 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
             }
         }
         if signalled.contains(&serve_end) {
-            // Drain every queued forwarded resolve.
             while recv(serve_end) == 0 {
                 process_resolve(serve_end, &mut sources, &mut read_ends);
             }
@@ -777,9 +732,8 @@ fn serve_loop(serve_end: u64, mut control: u64, log: &mut Log) -> ! {
     }
 }
 
-/// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the inherited root
-/// namespace (unused — clients bring their own log endpoint by resolving), `rdx` = the
-/// control-channel endpoint the supervisor installed, `rcx` = `arg0` (unused).
+/// Bootstrap registers: `rdx` is the control-channel endpoint the supervisor installed; the rest
+/// are unused, as clients bring their own log endpoint by resolving.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"logging-service: up\n");

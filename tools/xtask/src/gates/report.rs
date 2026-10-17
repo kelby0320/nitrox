@@ -2,15 +2,12 @@
 
 use crate::*;
 
-/// The facts `check-report`'s boot adds to [`EMULATED_MACHINE_FACTS`]: the laptop's shape — a USB
-/// stick, an **empty** AHCI controller that is therefore declined, and no UART — and the command
-/// line the menu entry passed. **And the stick itself, enumerated** (Phase 6 Part A): the line a
-/// person photographs off the laptop's report to say what its controller found.
+/// The facts `check-report`'s boot adds to [`EMULATED_MACHINE_FACTS`]: the laptop's shape (a USB
+/// stick, an empty AHCI controller that is declined, no UART) and the stick enumerated.
 const REPORT_FACTS: &[&[&str]] = &[
     &["boot: HHDM ", ", cmdline \"hwreport\""],
     &["drivers: 00:1f.2 declined by ahci: no SATA disk on any implemented port"],
     &["usb: port 1: 46f4:0001 class 08/06/50, SuperSpeed, \"QEMU USB HARDDRIVE (", "\": mass storage, bulk-only"],
-    // **Its disk, beside it** (Phase 6 Part D), and the disk the machine started from.
     &["usb: port 1: LUN 0: disk \"QEMU QEMU HARDDISK (", " blocks of 512 bytes, record "],
     &["gpt: the disk the machine started from: its GUID is the one Limine loaded from"],
     &["usb: first round: 1 device(s) in "],
@@ -19,21 +16,13 @@ const REPORT_FACTS: &[&[&str]] = &[
     &["console: no UART at COM1"],
 ];
 
-/// `cargo xtask check-report` — **the hardware report, read the way it will be read on the
-/// laptop** (Phase 5 Part D.4).
+/// `cargo xtask check-report` — the hardware report, read the way it will be read on the laptop.
 ///
-/// Boots the live image as a USB stick with the AHCI controller empty and **`-serial none`**, so
-/// nothing comes from COM1: the machine this is for has none. Then, off the screen alone:
-///
-/// 1. **The menu.** Finds Limine's menu with a detector of its own — the kernel console's decoder
-///    reads only the console's cells — presses Down, sees the highlight move, and presses Enter.
-/// 2. **The pages.** Reads each report page with the console's decoder, whole off one frame, by
-///    its prompt row, and presses a key for the next; the last key ends the report.
-/// 3. **The facts.** The pages together carry [`EMULATED_MACHINE_FACTS`] and [`REPORT_FACTS`]: a
-///    declined AHCI controller, the module disk and its partition, no COM1.
-/// 4. **The boot goes on**: the console hands the screen to the compositor.
-///
-/// Between them, this and `test-qemu` cover a claimed and a declined function, and COM1 both ways.
+/// Boots the live image as a USB stick with the AHCI controller empty and `-serial none`, then
+/// works off the screen alone: finds Limine's menu with a detector of its own (the console's
+/// decoder reads only the console's cells), presses Down and Enter, reads each report page with the
+/// console's decoder, whole off one frame by its prompt row, and checks the pages carry
+/// [`EMULATED_MACHINE_FACTS`] and [`REPORT_FACTS`].
 pub(crate) fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image_live()?;
@@ -56,7 +45,6 @@ pub(crate) fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<
         .arg("none")
         .arg("-qmp")
         .arg(format!("unix:{},server,nowait", qmp_sock.display()))
-        // No UART at all: the report has to say so, and nothing here could read one.
         .arg("-serial")
         .arg("none")
         .arg("-smp")
@@ -65,8 +53,8 @@ pub(crate) fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    // **`--usb`: the same machine with no i8042** (Phase 6 Part B), so every page turns on a USB
-    // key press: the report counts any keyboard's, and holds its pages for one.
+    // `--usb`: the same machine with no i8042, so every page turns on a USB key press (the report
+    // counts any keyboard's and holds its pages for one).
     if usb {
         usb_input_args(&mut cmd, false);
     }
@@ -78,7 +66,6 @@ pub(crate) fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<
         parse_ppm(&fs::read(&dump)?)
     };
 
-    // 1. The menu, and its second entry chosen.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     let first = loop {
         let (w, h, rgb) = look(&mut qmp)?;
@@ -109,7 +96,6 @@ pub(crate) fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<
     press(&mut qmp, "ret")?;
     println!("  ok: found Limine's menu, moved to its second entry, and chose it");
 
-    // 2. The pages, each read whole off one frame by its prompt, and a key for the next.
     let mut pages: Vec<Vec<String>> = Vec::new();
     let mut total: Option<usize> = None;
     let mut console_seen = false;
@@ -197,15 +183,12 @@ pub(crate) fn cmd_check_report(accel: Accel, usb: bool, size: DisplaySize) -> R<
         "  ok: the pages say what this machine is — a declined AHCI controller, the module disk, the stick \
          enumerated, no COM1"
     );
-    // **And the first page says which build** (the laptop polish's Part D): the line a person
-    // checks first on a machine that misbehaves, before anything else on the report.
     let built_from = built_from_line();
     if !pages.first().is_some_and(|p| p.iter().any(|l| l.contains(&built_from))) {
         return Err(format!("the report's first page does not say `{built_from}`").into());
     }
     println!("  ok: the first page names the build — {built_from}");
 
-    // 4. The boot goes on, and the console hands the screen over.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         let (w, h, rgb) = look(&mut qmp)?;
@@ -246,17 +229,10 @@ fn report_prompt(row: &str) -> Option<(usize, usize)> {
 /// Limine's boot menu, as Limine 12.2.0 draws it on OVMF's framebuffer: `Some(y)` — the first pixel
 /// row of the highlighted entry's bar — when `rgb` is that menu, `None` otherwise.
 ///
-/// **A detector of its own**, because the console's decoder reads only the console's cells.
-/// Calibrated on screendumps of the menu (2026-09-14): a black ground, grey entries and help text,
-/// the title in cyan along the top, green key names and countdown, a bright-green countdown digit,
-/// and the highlighted entry drawn black on a grey bar. All three of these must hold:
-///
-/// - **Every pixel is one of those five colours.** OVMF's screens carry its logo's colours and the
-///   kernel console draws ink on slate, so neither passes this alone.
-/// - **The title's cyan, and only along the top**: a line of text's worth, none of it below the
-///   top tenth of the screen.
-/// - **A highlight bar**: a row with a run of grey wider than any glyph stroke. Its `y` is how the
-///   gate sees that Down moved the selection.
+/// A detector of its own, calibrated on screendumps. All three must hold: every pixel is one of the
+/// menu's five colours (OVMF's screens carry its logo's colours, the kernel console draws ink on
+/// slate); a cyan title along the top only; a highlight bar, a row with a run of grey wider than
+/// any glyph stroke, whose `y` shows Down moved the selection.
 pub(crate) fn limine_menu(w: u32, h: u32, rgb: &[u8]) -> Option<usize> {
     const BLACK: [u8; 3] = [0, 0, 0];
     const GREY: [u8; 3] = [170, 170, 170];

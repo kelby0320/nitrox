@@ -1,15 +1,11 @@
-//! What the console shows, independent of where it is drawn.
+//! What the console shows, independent of where it is drawn: plain data and arithmetic, for
+//! the host tests and `xtask`'s `-serial none` gate, which compiles this file and
+//! [`glyphs`](super::glyphs) by path to read a screendump back with the kernel's palette,
+//! geometry and glyphs.
 //!
-//! Plain data and arithmetic — no locks, no pointers, no hardware — for two readers besides the
-//! kernel: the host tests, and `xtask`'s `-serial none` gate, which compiles this file and
-//! [`glyphs`](super::glyphs) by path so that it reads a screendump back into text with the same
-//! palette, geometry and glyphs the kernel drew it with.
-//!
-//! The byte stream is what COM1 receives, so it is mostly ASCII lines and occasionally something
-//! else: UTF-8 (the kernel's messages are full of em dashes), and the escape sequences a
-//! program writes to a terminal. The first is drawn when the face has the character and drawn as
-//! `?` when it does not; the second is swallowed, since a console with one colour has nothing
-//! to do with it, and drawing `[1;32m` into the middle of a line is worse than dropping it.
+//! The byte stream is what COM1 receives: ASCII lines, UTF-8 (drawn when the face has the
+//! character, else `?`) and terminal escape sequences, which are swallowed: a one-colour
+//! console has nothing to do with them and drawing `[1;32m` into a line is worse.
 
 use super::glyphs::{self, BLANK, GLYPH_H, GLYPH_W};
 
@@ -31,16 +27,10 @@ pub const PAPER: [u8; 3] = [0x0a, 0x18, 0x2c];
 
 /// How far the text jumps when it reaches the bottom, as a fraction of the rows: a quarter.
 ///
-/// **A jump rather than a line at a time**, because scrolling repaints every cell whose glyph
-/// changed, which after a scroll is nearly all of them. A quarter makes that a quarter as often
-/// and still leaves three quarters of the screen as context above the newest line. The newest
-/// line is always drawn before the write that produced it returns — this changes how often the
-/// screen repaints, not what it shows when the machine stops.
-///
-/// Measured 2026-09-14 under TCG, from the first line on screen to `compositor: up` — about 90
-/// lines of a release boot, read off `check-fbcon`'s screendumps: 536 and 568 ms jumping a
-/// quarter, 773 and 814 ms a line at a time. That is the emulator; a framebuffer mapped without
-/// write-combining (Phase 5 Part G) makes every pixel dearer on the laptop, not cheaper.
+/// **A jump rather than a line at a time**, because a scroll repaints nearly every cell; a
+/// quarter makes that a quarter as often and leaves three quarters of the screen as context.
+/// The newest line is always drawn before its write returns. Under TCG a boot's ~90 lines took
+/// about 550 ms jumping a quarter and 800 ms a line at a time.
 const JUMP_DIVISOR: usize = 4;
 
 /// The console's layout on one screen.
@@ -113,18 +103,16 @@ enum State {
     /// After `ESC ]`, `ESC P`, `ESC ^` or `ESC _` — a *string* sequence, whose payload runs to
     /// `BEL` or `ST` (`ESC \`) rather than to a final byte.
     ///
-    /// **Not a two-byte escape.** `ESC ] 7 ; /home BEL` is what `nxsh` writes beside every
-    /// prompt to tell its terminal where it is, and `ESC ] 0 ; title BEL` is what most of the
-    /// world writes; taking the introducer for a whole sequence drew the payload on the screen.
-    /// The rule this restores is the one stated everywhere else in this system — an
+    /// **Not a two-byte escape**: `nxsh` writes `ESC ] 7 ; /home BEL` beside every prompt, and
+    /// taking the introducer for a whole sequence drew the payload on the screen. An
     /// unrecognised sequence is consumed, never printed.
     String,
     /// `ESC` inside a string: `\` ends it, anything else cancels and starts afresh.
     StringEscape,
 }
 
-/// Turns bytes into [`Action`]s, carrying state across writes — a `kprintln!` arrives as several
-/// `write_str` calls, and nothing stops one of them ending partway through a character.
+/// Turns bytes into [`Action`]s, carrying state across writes: a `kprintln!` arrives as several
+/// `write_str` calls, and one may end partway through a character.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Decoder {
     state: State,
@@ -136,7 +124,7 @@ impl Decoder {
         Self { state: State::Ground }
     }
 
-    /// Feed one byte, passing whatever it completes to `out` — nothing, one action, or two when a
+    /// Feed one byte, passing whatever it completes to `out`: nothing, one action, or two when a
     /// byte both ends a broken sequence and starts something of its own.
     pub fn feed(&mut self, byte: u8, out: &mut impl FnMut(Action)) {
         match self.state {
@@ -169,19 +157,16 @@ impl Decoder {
             State::String => match byte {
                 0x07 => self.state = State::Ground,
                 0x1B => self.state = State::StringEscape,
-                // **Everything else, controls included.** A newline inside a string is part of
-                // the payload here, unlike inside a CSI: a string has an explicit terminator,
-                // so there is no ambiguity to resolve by guessing that the sequence was
-                // abandoned.
+                // Everything else, controls included: a string has an explicit terminator, so a
+                // newline inside it is payload, unlike inside a CSI.
                 _ => {}
             },
             State::StringEscape => {
                 if byte == b'\\' {
-                    // `ST` — the proper terminator.
                     self.state = State::Ground;
                 } else {
-                    // A lone `ESC`, which cancels here as it does in a CSI. Without this an
-                    // unterminated string would swallow every byte the kernel printed after it.
+                    // A lone `ESC` cancels, as in a CSI; otherwise an unterminated string would
+                    // swallow every byte the kernel printed after it.
                     self.state = State::Escape;
                     self.feed(byte, out);
                 }
@@ -190,7 +175,6 @@ impl Decoder {
                 if (0x40..=0x7E).contains(&byte) {
                     self.state = State::Ground;
                 } else if byte < 0x20 {
-                    // A control inside a sequence ends it, and still does what it says.
                     self.state = State::Ground;
                     self.ground(byte, out);
                 }
@@ -209,9 +193,7 @@ impl Decoder {
             0xC2..=0xDF => self.state = State::Utf8 { cp: (byte & 0x1F) as u32, owed: 1 },
             0xE0..=0xEF => self.state = State::Utf8 { cp: (byte & 0x0F) as u32, owed: 2 },
             0xF0..=0xF4 => self.state = State::Utf8 { cp: (byte & 0x07) as u32, owed: 3 },
-            // A stray continuation byte, or one no UTF-8 encoder writes.
             0x80..=0xFF => out(Action::Glyph(glyphs::REPLACEMENT)),
-            // Every other C0 control, and DEL: nothing to draw.
             _ => {}
         }
     }
@@ -225,19 +207,16 @@ impl Default for Decoder {
 
 /// Rows of text: what each cell holds, where the cursor is, and which rows changed.
 ///
-/// Rows are a **ring**: logical row 0 (the top of the screen) is physical row `top`, so a scroll
-/// moves `top` and clears the rows it exposes instead of copying every cell up. That matters
-/// after userspace has the screen, when every line anyone prints still lands here (a later stop
-/// repaints from it) and nothing is drawn.
+/// Rows are a **ring**: logical row 0 is physical row `top`, so a scroll moves `top` and
+/// clears the exposed rows instead of copying (every line still lands here once userspace has
+/// the screen).
 pub struct Grid {
     geometry: Geometry,
-    /// Glyph indices, `MAX_COLS` to a physical row.
     cells: [u8; CELLS],
     top: usize,
     row: usize,
     col: usize,
     decoder: Decoder,
-    /// Logical rows changed since [`take_damage`](Self::take_damage), inclusive.
     damage: Option<(usize, usize)>,
 }
 
@@ -365,19 +344,17 @@ impl Decoder {
     }
 }
 
-/// A byte stream cut into pages that each fit `rows` rows `cols` wide **without scrolling** — the
-/// hardware report's pages (Phase 5 Part D.3).
-///
-/// Rows are counted by the same [`Decoder`] and the same wrap rule as [`Grid`] — a glyph past the
-/// last column starts a row, a tab stops at the edge — so a page written into a freshly reset grid
-/// of at least `rows` rows lands entirely on screen. A page ends:
+/// A byte stream cut into pages that each fit `rows` rows `cols` wide **without scrolling**: the
+/// hardware report's pages. Rows are counted by the same [`Decoder`] and wrap rule as [`Grid`]
+/// (a glyph past the last column starts a row, a tab stops at the edge), so a page written into
+/// a freshly reset grid of at least `rows` rows lands entirely on screen. A page ends:
 ///
 /// - at the newline that would start a row past the last, **which is left out of both pages** (in
 ///   a grid that newline is what scrolls), or
 /// - for a line too long for the rows left, just before the character that would start that row.
 ///
-/// Each page decodes from a fresh decoder, as a reset grid does, and every cut is on a character
-/// boundary, so a page never begins partway through a UTF-8 sequence.
+/// Each page decodes from a fresh decoder, and every cut is on a character boundary, so a page
+/// never begins partway through a UTF-8 sequence.
 pub struct Pages<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -403,14 +380,12 @@ impl<'a> Iterator for Pages<'a> {
         let (cols, rows, start) = (self.cols, self.rows, self.at);
         let mut decoder = Decoder::new();
         let (mut row, mut col) = (0usize, 0usize);
-        // Where the character now being decoded began: a cut before it goes here.
         let mut char_start = start;
         let mut i = start;
         while i < self.bytes.len() {
             if decoder.at_boundary() {
                 char_start = i;
             }
-            // `Some(end, resume)`: the page is `start..end`, and the next one starts at `resume`.
             let mut cut: Option<(usize, usize)> = None;
             decoder.feed(self.bytes[i], &mut |action| {
                 if cut.is_some() {
@@ -462,7 +437,6 @@ mod tests {
         g
     }
 
-    /// Logical row `row` as text, trailing blanks trimmed.
     fn line(g: &Grid, row: usize) -> String {
         let s: String =
             (0..g.geometry().cols).map(|c| glyphs::char_of(g.glyph_at(row, c)).unwrap_or('\u{FFFD}')).collect();
@@ -494,7 +468,6 @@ mod tests {
         let dash = glyphs::index_of('—').unwrap();
         let mut g = grid(20, 3);
         let bytes = "a—b".as_bytes();
-        // Every split point, including inside the three-byte dash.
         for split in 0..=bytes.len() {
             g.reset(g.geometry());
             g.write(&bytes[..split]);
@@ -526,10 +499,8 @@ mod tests {
     #[test]
     fn a_string_sequence_is_swallowed_to_its_terminator() {
         use Action::*;
-        // **The sequence `nxsh` writes beside every prompt** (desktop refresh, Part K), and the
-        // window title every other shell in the world writes. Taken for a two-byte escape, the
-        // payload landed on the screen — which is what this console is *for* on a machine with
-        // no serial port, so it was the boot log with `7;/home` down the middle of it.
+        // `nxsh` writes this beside every prompt, as other shells write a window title; taken
+        // for a two-byte escape, the payload landed on the screen.
         for seq in [
             &b"\x1b]7;/home/alice\x07"[..], // OSC, BEL-terminated
             &b"\x1b]0;a title\x1b\\"[..],   // OSC, ST-terminated
@@ -542,11 +513,9 @@ mod tests {
             bytes.push(b'z');
             assert_eq!(actions(&bytes), [Glyph(b'a'), Glyph(b'z')], "{seq:x?} leaked");
         }
-        // A newline inside a string is payload, not a terminator: a string says where it ends.
         assert_eq!(actions(b"a\x1b]0;one\ntwo\x07z"), [Glyph(b'a'), Glyph(b'z')]);
-        // **And an unterminated one does not swallow the rest of the boot log.** `ESC` cancels,
-        // which is the rule a CSI already follows — without it one stray introducer would take
-        // the screen for the rest of the run.
+        // An unterminated string does not swallow the rest of the boot log: `ESC` cancels, as in
+        // a CSI.
         assert_eq!(actions(b"\x1b]0;oops\x1b[31mz"), [Glyph(b'z')]);
     }
 
@@ -578,14 +547,12 @@ mod tests {
         for i in 0..8 {
             g.write(format!("line{i}\n").as_bytes());
         }
-        // The eighth newline wanted a ninth row: two rows (a quarter of eight) scrolled off.
         assert_eq!(line(&g, 0), "line2");
         assert_eq!(line(&g, 5), "line7");
         assert_eq!((line(&g, 6).as_str(), line(&g, 7).as_str()), ("", ""), "the exposed rows are clear");
         assert_eq!(g.cursor(), (6, 0));
         g.write(b"next");
         assert_eq!(line(&g, 6), "next");
-        // Far past one lap of the ring.
         for i in 0..1000 {
             g.write(format!("n{i}\n").as_bytes());
         }
@@ -606,20 +573,17 @@ mod tests {
         assert_eq!(g.take_damage(), Some((0, 7)), "a scroll moves every row");
     }
 
-    /// Write each page into a fresh grid exactly `rows` tall, as the report draws it, and read it
-    /// back — failing if a page scrolled, which is the property the pager exists for.
+    /// Write each page into a fresh grid `rows` tall as the report draws it; fail if one scrolled.
     fn draw_pages(bytes: &[u8], cols: usize, rows: usize) -> Vec<Vec<String>> {
         Pages::new(bytes, cols, rows).map(|page| drawn_without_scrolling(page, cols, rows)).collect()
     }
 
-    /// Write `page` into a grid `rows` tall, assert it did not scroll, and return its rows.
-    ///
-    /// The reference is the same page in a grid [`MAX_ROWS`] tall, where a page for `rows` rows
-    /// has room to spare: the short grid must read row for row as the roomy one's top, the roomy
-    /// one must have nothing below that, and both cursors must agree — the last catches a run of
-    /// newlines that scrolls nothing but blank rows. **Not `top == 0`**, which a scroll can leave
-    /// unchanged: at one row a jump is the whole grid, and at three rows three jumps come back
-    /// round (PR #300 review).
+    /// Write `page` into a grid `rows` tall, assert it did not scroll, and return its rows. The
+    /// reference is the same page in a grid [`MAX_ROWS`] tall: the short grid must read row for
+    /// row as the roomy one's top, the roomy one must have nothing below that, and both cursors
+    /// must agree (the last catches a run of newlines that scrolls nothing but blank rows).
+    /// **Not `top == 0`**, which a scroll can leave unchanged: at one row a jump is the whole
+    /// grid, and at three rows three jumps come back round.
     fn drawn_without_scrolling(page: &[u8], cols: usize, rows: usize) -> Vec<String> {
         let mut g = grid(cols, rows);
         g.write(page);
@@ -644,12 +608,10 @@ mod tests {
 
     #[test]
     fn a_wrapped_line_costs_its_rows_and_a_line_too_long_for_the_rest_is_cut_by_character() {
-        // "abcdefghij" is two rows at 5 columns; with three rows a page, "xy" fits beside it.
         let log = "abcdefghij\nxy\n—bcdefghijklmnop\n".as_bytes();
         let drawn = draw_pages(log, 5, 3);
         assert_eq!(drawn[0], ["abcde", "fghij", "xy"]);
-        // A 16-character line needs four rows: three fit, and the cut falls between characters,
-        // so the dash (three bytes) is never split and the next page starts with "p".
+        // Three rows fit; the cut falls between characters, so the dash is never split.
         assert_eq!(drawn[1], ["—bcde", "fghij", "klmno"]);
         assert_eq!(drawn[2], ["p", "", ""]);
         assert_eq!(drawn.len(), 3);
@@ -657,8 +619,6 @@ mod tests {
 
     #[test]
     fn every_page_fits_without_scrolling_and_together_they_are_the_whole_log() {
-        // Lines of every length from empty to several rows wide, tabs and a UTF-8 character,
-        // across page sizes down to one row.
         let mut log = Vec::new();
         for i in 0..200usize {
             log.extend(std::iter::repeat_n(b'x', i % 37));
@@ -674,7 +634,6 @@ mod tests {
                 drawn_without_scrolling(page, cols, rows);
                 assert_eq!(&log[offset..offset + page.len()], *page, "a page is not the log's next bytes");
                 offset += page.len();
-                // The only byte a cut may leave out is the newline it was made at.
                 if offset < log.len() && log[offset] == b'\n' {
                     offset += 1;
                 }

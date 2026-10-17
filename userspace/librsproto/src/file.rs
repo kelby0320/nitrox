@@ -1,17 +1,13 @@
-//! `File` category (`op = 0x06xx`) bodies. Slice 8 defines `ReadRange` — the
-//! Model-B page-cache fill: the kernel, demand-faulting a file-backed mapping,
-//! asks the resource server for a byte range of a file and the server replies with
-//! the bytes in a transferred `MemoryObject`. See `docs/spec/rsproto-file-ops.md`.
+//! `File` category (`op = 0x06xx`) bodies. `ReadRange` is the Model-B page-cache fill: the
+//! kernel, demand-faulting a file-backed mapping, asks the resource server for a byte range
+//! of a file and the server replies with the bytes in a transferred `MemoryObject`. See
+//! `docs/spec/rsproto-file-ops.md`.
 //!
-//! `File` is the **file-content access** category — positioned, stateless reads of
-//! a file resolved lazily (`Namespace::Resolve` with `RESOLVE_FILE_LAZY`, reply
-//! `OBJECT_KIND_FILE`). It is deliberately distinct from `Stream` (`0x02`,
-//! cursor-based streaming) and `Block` (`0x03`, extent/block-level — Model A's
-//! future home).
+//! `File` is the **file-content access** category — positioned, stateless reads of a file
+//! resolved lazily (`Namespace::Resolve` with `RESOLVE_FILE_LAZY`, reply `OBJECT_KIND_FILE`),
+//! distinct from `Stream` (`0x02`) and `Block` (`0x03`).
 
 use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
-
-// --- ReadRange request ------------------------------------------------------
 
 /// Fixed prefix of a `ReadRangeRequest` (before the suffix bytes).
 pub const READ_RANGE_REQUEST_PREFIX_LEN: usize = 16;
@@ -23,8 +19,7 @@ pub struct ReadRangeRequest<'a> {
     pub offset: u64,
     /// Number of bytes requested (the page-cache caller asks at most one page).
     pub len: u32,
-    /// The path suffix naming the file (UTF-8, no leading `/`) — the fill is
-    /// stateless, so each `ReadRange` re-identifies its file by path.
+    /// The path suffix naming the file (UTF-8, no leading `/`); the fill is stateless.
     pub suffix: &'a [u8],
 }
 
@@ -62,17 +57,13 @@ pub fn parse_read_range_request(body: &[u8]) -> Option<ReadRangeRequest<'_>> {
     })
 }
 
-// --- ReadRange reply (success) ----------------------------------------------
-
-/// `ReadRangeReply` wire length (the filled bytes ride in `IpcMsg.handles[0]` as a
-/// read-only `MemoryObject` of at most one page).
+/// `ReadRangeReply` wire length (the filled bytes ride in `handles[0]` as a read-only page).
 pub const READ_RANGE_REPLY_LEN: usize = 8;
 
 /// A parsed success `ReadRangeReply`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ReadRangeReply {
-    /// Valid bytes in `handles[0]` (≤ the requested `len`); the rest of the page,
-    /// if any, is zero — a short tail at end-of-file.
+    /// Valid bytes in `handles[0]` (≤ the requested `len`); the rest of the page is zero.
     pub content_len: u32,
 }
 
@@ -94,14 +85,11 @@ pub fn parse_read_range_reply(body: &[u8]) -> Option<ReadRangeReply> {
     Some(ReadRangeReply { content_len: get_u32(body, 0) })
 }
 
-// --- ReadDir (open-directory-handle enumeration) ----------------------------
 //
 // `ReadDir` is client-initiated on an **open directory handle** — a session channel the
-// server minted, scoped to one directory (the fs-server mints it when a directory path resolves). The
-// request names no path: the channel *is* the directory, so entries are addressed by name
-// and there is nothing to escape confinement with. Listings that exceed one message
-// paginate via an opaque `cursor` (0 = from the start; the reply returns the next cursor,
-// 0 = no more).
+// fs-server minted, scoped to one directory. The request names no path: the channel *is* the
+// directory, so entries are addressed by name. Listings that exceed one message paginate via
+// an opaque `cursor` (0 = from the start; the reply returns the next cursor, 0 = no more).
 
 /// Neutral directory-entry kind (independent of any on-disk `file_type` encoding).
 pub const DIRENT_KIND_UNKNOWN: u8 = 0;
@@ -118,9 +106,7 @@ pub const READ_DIR_REQUEST_LEN: usize = 8;
 /// A parsed `ReadDirRequest`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ReadDirRequest {
-    /// Opaque resume position: `0` starts from the first entry; otherwise the
-    /// `next_cursor` a prior reply returned. The server defines its meaning (for the
-    /// ext4 server it is a byte offset into the directory's logical data).
+    /// Opaque resume position: `0` starts at the first entry, else a prior reply's `next_cursor`.
     pub cursor: u64,
 }
 
@@ -142,16 +128,9 @@ pub fn parse_read_dir_request(body: &[u8]) -> Option<ReadDirRequest> {
 }
 
 /// Parse a `File::Touch` request body: the `file_id: u64` the file's `FILE_BLOCKS` reply
-/// carried. Returns the id. By id rather than by suffix since administration Part C.1: the
-/// kernel flushes a cached file at a sync or an unmount, long after the resolve that named it,
-/// and a rename may have given that name to another file by then.
-///
-/// Unlike every other `File::*` op this arrives on the server's **forwarding endpoint**
-/// rather than a directory session, is sent by the **kernel** rather than a client, and
-/// expects **no reply**. All three follow from what it is for: a Model A write is invisible
-/// to the server (the kernel moves the data straight to the device), so after a flush the
-/// kernel tells it the file changed, and the server stamps `mtime` from **its own** clock —
-/// the timestamp is deliberately not on the wire. See `docs/spec/rsproto-file-ops.md`.
+/// carried (by id, not suffix: the kernel flushes long after the resolve). Arrives on the
+/// server's **forwarding endpoint**, from the **kernel**, with **no reply**; the server stamps
+/// `mtime` from **its own** clock (`rsproto-file-ops.md` § Touch).
 pub fn parse_touch_request(body: &[u8]) -> Option<u64> {
     if body.len() < TOUCH_REQUEST_LEN {
         return None;
@@ -167,9 +146,7 @@ pub const FORGET_REQUEST_LEN: usize = 8;
 
 /// Build a `File::Forget` request **body** into `out`: the `file_id` of a file the server is
 /// about to free, the id its `FILE_BLOCKS` replies carried. The caller wraps it in an envelope
-/// with [`crate::OP_FILE_FORGET`] and sends it on its forwarding endpoint `SENDMODE_BLOCK`;
-/// the kernel reads it (`kernel/src/rsproto.rs`) and answers through the send's
-/// `PendingOperation`. `None` if `out` is short.
+/// with [`crate::OP_FILE_FORGET`] (`rsproto-file-ops.md` § Forget). `None` if `out` is short.
 pub fn forget_request(out: &mut [u8], file_id: u64) -> Option<usize> {
     if out.len() < FORGET_REQUEST_LEN {
         return None;
@@ -183,10 +160,7 @@ pub const READ_DIR_REPLY_HEADER_LEN: usize = 12;
 /// Fixed prefix of each packed directory entry, before its name bytes:
 /// `inode: u32`, `kind: u8`, `name_len: u8`, `mode: u16`, `size: u64`, `mtime: i64`.
 ///
-/// The metadata rides in the entry rather than in a separate per-name `Stat` op so that
-/// listing an N-entry directory stays **one round trip per reply**, not `1 + N`: the
-/// server reads each inode locally, which is far cheaper than a client round trip. `mode`
-/// occupies what would otherwise be alignment padding ahead of `size`.
+/// Listing stays one round trip per reply; `mode` fills what would be alignment padding.
 pub const DIR_ENTRY_PREFIX_LEN: usize = 24;
 
 /// The header of a success `ReadDirReply` (the entries follow, packed).
@@ -201,27 +175,27 @@ pub struct ReadDirReplyHeader {
 /// One decoded directory entry (borrowing its name from the reply body).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry<'a> {
+    /// The entry's inode number.
     pub inode: u32,
     /// One of the `DIRENT_KIND_*` constants.
     pub kind: u8,
-    /// Permission + format bits, in the POSIX `st_mode` encoding every filesystem
-    /// already speaks. `0` if the server does not report a mode.
+    /// Permission + format bits in the POSIX `st_mode` encoding; `0` if the server reports none.
     pub mode: u16,
     /// The entry's byte size (a directory reports its own directory-data size).
     pub size: u64,
     /// Modification time, seconds since the Unix epoch. `0` if unknown.
     pub mtime: i64,
+    /// The entry's name, without a terminator.
     pub name: &'a [u8],
 }
 
 /// The longest entry name a `ReadDir` reply can carry (its `name_len` is a `u8`).
 pub const MAX_NAME: usize = 255;
 
-/// A [`DirEntry`] copied out of the reply buffer, so it outlives the message it arrived
-/// in. A borrowed entry is only valid until the next reply overwrites the buffer; any
-/// caller accumulating a listing (every file coreutil) wants this form.
+/// A [`DirEntry`] copied out of the reply buffer, so it outlives the message that held it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct OwnedEntry {
+    /// The entry's inode number; `0` for a binding.
     pub inode: u32,
     /// One of the `DIRENT_KIND_*` constants.
     pub kind: u8,
@@ -236,14 +210,9 @@ pub struct OwnedEntry {
 }
 
 impl OwnedEntry {
-    /// Copy a borrowed entry's fields, including its name.
-    ///
-    /// A name is capped at [`MAX_NAME`], which is also the longest a wire entry can
-    /// express (`name_len` is a `u8`), so no name a server can legally send is truncated.
     /// An entry that is **not** a filesystem object: a namespace binding surfaced in a
     /// listing. Every file field is zero because none of them applies — a binding has no
-    /// inode, no size, and no modification time — and reporting a plausible-looking `0`
-    /// is honest where inventing a value would not be.
+    /// inode, no size, and no modification time.
     pub fn binding(name: &[u8], kind: u8) -> OwnedEntry {
         let mut buf = [0u8; MAX_NAME];
         let n = name.len().min(MAX_NAME);
@@ -251,6 +220,9 @@ impl OwnedEntry {
         OwnedEntry { inode: 0, kind, mode: 0, size: 0, mtime: 0, name: buf, name_len: n as u8 }
     }
 
+    /// Copy a borrowed entry's fields, including its name.
+    ///
+    /// A name is capped at [`MAX_NAME`], the longest a wire entry can express.
     pub fn from_entry(e: &DirEntry<'_>) -> OwnedEntry {
         let mut name = [0u8; MAX_NAME];
         let n = e.name.len().min(MAX_NAME);
@@ -278,9 +250,9 @@ impl Default for OwnedEntry {
     }
 }
 
-/// Builds a `ReadDirReply` body incrementally, packing entries until the buffer is full.
-/// The server appends entries with [`push`](DirReplyWriter::push) until one is rejected
-/// (buffer full), then calls [`finish`](DirReplyWriter::finish) with the next cursor.
+/// Builds a `ReadDirReply` body incrementally. The server appends entries with
+/// [`push`](DirReplyWriter::push) until one is rejected (buffer full), then calls
+/// [`finish`](DirReplyWriter::finish) with the next cursor.
 pub struct DirReplyWriter<'a> {
     buf: &'a mut [u8],
     len: usize,
@@ -288,8 +260,7 @@ pub struct DirReplyWriter<'a> {
 }
 
 impl<'a> DirReplyWriter<'a> {
-    /// Start a writer over `buf`, reserving the header. Returns `None` if `buf` cannot
-    /// hold even the header.
+    /// Start a writer over `buf`, reserving the header; `None` if `buf` cannot hold it.
     pub fn new(buf: &'a mut [u8]) -> Option<Self> {
         if buf.len() < READ_DIR_REPLY_HEADER_LEN {
             return None;
@@ -300,8 +271,7 @@ impl<'a> DirReplyWriter<'a> {
     /// Try to append one entry. Returns `false` (appending nothing) if it would not fit —
     /// the caller stops and resumes it in the next reply via the cursor.
     ///
-    /// `mode`/`size`/`mtime` are the entry's inode metadata; a server that does not track
-    /// one passes `0` (see [`DirEntry`]).
+    /// `mode`/`size`/`mtime` are inode metadata; a server that does not track one passes `0`.
     pub fn push(&mut self, inode: u32, kind: u8, mode: u16, size: u64, mtime: i64, name: &[u8]) -> bool {
         if name.len() > u8::MAX as usize {
             return false;
@@ -327,8 +297,7 @@ impl<'a> DirReplyWriter<'a> {
         self.count == 0
     }
 
-    /// Finalise: stamp the header with `next_cursor` and the entry count, returning the
-    /// total body length.
+    /// Finalise: stamp the header with `next_cursor` and the entry count; returns the body length.
     pub fn finish(self, next_cursor: u64) -> usize {
         put_u64(self.buf, 0, next_cursor);
         put_u16(self.buf, 8, self.count);
@@ -337,8 +306,7 @@ impl<'a> DirReplyWriter<'a> {
     }
 }
 
-/// Parse a `ReadDirReply` body into its header and an [`iterator`](DirEntryIter) over
-/// entries.
+/// Parse a `ReadDirReply` body into its header and an [`iterator`](DirEntryIter) over entries.
 pub fn parse_read_dir_reply(body: &[u8]) -> Option<(ReadDirReplyHeader, DirEntryIter<'_>)> {
     if body.len() < READ_DIR_REPLY_HEADER_LEN {
         return None;
@@ -382,12 +350,10 @@ impl<'a> Iterator for DirEntryIter<'a> {
     }
 }
 
-// --- name-addressed mutation requests (Mkdir / Unlink / Rmdir / Rename) ------
 //
-// The mutation ops are sent on an open directory handle and address entries by **name**,
-// never path — the handle already identifies the directory. Their replies carry no body
-// on success (an `RS_FLAG_REPLY` with an empty body) and the standard `ErrorBody` on
-// failure, so no reply codec is needed here.
+// The mutation ops are sent on an open directory handle and address entries by **name**.
+// Their replies carry no body on success and the standard `ErrorBody` on failure, so no reply
+// codec is needed here.
 
 /// Write a single-name request body (`Mkdir`/`Unlink`/`Rmdir`): a `u16` length + the name.
 pub fn name_request(out: &mut [u8], name: &[u8]) -> Option<usize> {
@@ -449,8 +415,6 @@ pub fn parse_rename_request(body: &[u8]) -> Option<(&[u8], &[u8])> {
 mod tests {
     use super::*;
 
-    /// **A forget is written as the kernel reads it** — the id, little-endian, at the start of
-    /// the body — checked against the bytes, since the reader is the kernel's.
     #[test]
     fn a_forget_is_the_file_id() {
         let mut out = [0xAAu8; 10];
@@ -459,8 +423,6 @@ mod tests {
         assert_eq!(forget_request(&mut out[..7], 1), None);
     }
 
-    /// **A touch is read as the kernel writes it** — eight little-endian bytes of id at the
-    /// start of the body, laid out by hand here since the writer is the kernel's.
     #[test]
     fn a_touch_is_the_file_id() {
         let body = [0xed, 0xfe, 0, 0, 0, 0, 0, 0x01];
@@ -473,7 +435,6 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = name_request(&mut buf, b"subdir").unwrap();
         assert_eq!(parse_name_request(&buf[..n]).unwrap(), b"subdir");
-        // Empty and truncated bodies are rejected.
         assert!(parse_name_request(&[0u8; 1]).is_none());
         let mut short = [0u8; 8];
         super::put_u16(&mut short, 0, 20); // claims 20 bytes, body has 6
@@ -517,7 +478,6 @@ mod tests {
                 (2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b".".to_vec()),
                 (2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b"..".to_vec()),
                 (11, DIRENT_KIND_FILE, 0o100644, 13, 1_800_000_001, b"hello.txt".to_vec()),
-                // A server with no metadata to report zeroes the fields.
                 (12, DIRENT_KIND_DIR, 0, 0, 0, b"subdir".to_vec()),
             ]
         );
@@ -525,8 +485,6 @@ mod tests {
 
     #[test]
     fn owned_entry_copies_every_field_out_of_the_reply_buffer() {
-        // The listing path decodes into a shared 4 KiB buffer that the next reply
-        // overwrites, so a caller accumulating entries must get a real copy.
         let mut buf = [0u8; 128];
         let mut w = DirReplyWriter::new(&mut buf).unwrap();
         w.push(42, DIRENT_KIND_FILE, 0o100644, 1234, 1_700_000_000, b"notes.txt");
@@ -545,8 +503,6 @@ mod tests {
 
     #[test]
     fn owned_entry_keeps_a_maximum_length_name() {
-        // `name_len` is a u8, so 255 bytes is the longest name a server can send; it must
-        // survive the copy whole rather than losing a byte to an off-by-one.
         let long = [b'x'; MAX_NAME];
         let e = DirEntry { inode: 1, kind: DIRENT_KIND_DIR, mode: 0, size: 0, mtime: 0, name: &long };
         let owned = OwnedEntry::from_entry(&e);
@@ -555,8 +511,6 @@ mod tests {
 
     #[test]
     fn entry_metadata_survives_the_full_range() {
-        // The wide fields must not be silently truncated: a >4 GiB size and a post-2038
-        // mtime both need their full width on the wire.
         let mut buf = [0u8; 128];
         let mut w = DirReplyWriter::new(&mut buf).unwrap();
         let big_size = 5 * 1024 * 1024 * 1024u64; // 5 GiB — past a u32
@@ -570,7 +524,6 @@ mod tests {
 
     #[test]
     fn writer_stops_when_full_and_cursor_resumes() {
-        // A tiny buffer holds the header + exactly one 1-char-name entry.
         let mut buf = [0u8; READ_DIR_REPLY_HEADER_LEN + DIR_ENTRY_PREFIX_LEN + 1];
         let mut w = DirReplyWriter::new(&mut buf).unwrap();
         assert!(w.push(2, DIRENT_KIND_DIR, 0, 0, 0, b"a"));
@@ -585,12 +538,10 @@ mod tests {
 
     #[test]
     fn parse_tolerates_a_truncated_tail() {
-        // Header claims 2 entries but only one full entry's bytes are present.
         let mut buf = [0u8; 256];
         let mut w = DirReplyWriter::new(&mut buf).unwrap();
         w.push(2, DIRENT_KIND_DIR, 0, 0, 0, b"only");
         let mut n = w.finish(0);
-        // Forge the count to 2, then hand the parser a body cut mid-second-entry.
         super::put_u16(&mut buf, 8, 2);
         n += 3; // a few stray bytes, far short of a second entry
         let (h, iter) = parse_read_dir_reply(&buf[..n]).unwrap();
@@ -615,7 +566,6 @@ mod tests {
         let n = read_range_reply(&mut buf, 4096).unwrap();
         assert_eq!(n, READ_RANGE_REPLY_LEN);
         assert_eq!(parse_read_range_reply(&buf[..n]).unwrap(), ReadRangeReply { content_len: 4096 });
-        // A short end-of-file tail.
         read_range_reply(&mut buf, 100).unwrap();
         assert_eq!(parse_read_range_reply(&buf).unwrap().content_len, 100);
     }
@@ -623,7 +573,6 @@ mod tests {
     #[test]
     fn parse_rejects_truncated() {
         assert!(parse_read_range_request(&[0u8; 8]).is_none());
-        // suffix_len claims 50 bytes but the body is short.
         let mut buf = [0u8; 32];
         super::put_u16(&mut buf, 12, 50);
         assert!(parse_read_range_request(&buf).is_none());

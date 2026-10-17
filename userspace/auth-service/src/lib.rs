@@ -6,10 +6,9 @@
 //! the database's bytes, the buffers, and a salt from the kernel's entropy source, and does the
 //! writing. Under `cargo test` it builds as host `std`.
 //!
-//! **The database's format is `libusers`'** (administration Part D.1): a `passwd`-style line file,
+//! **The database's format is `libusers`'**: a `passwd`-style line file,
 //! `name:salt_hex:iterations:verifier_hex:home`, whose `verifier` is
-//! `PBKDF2-HMAC-SHA256(password, salt, iterations)` — one-way; the password is never stored. It was
-//! parsed here until the build's seeder and `account`'s offline mode needed to write it too. See
+//! `PBKDF2-HMAC-SHA256(password, salt, iterations)` — one-way; the password is never stored. See
 //! `userspace/auth-service/CLAUDE.md`.
 
 #![cfg_attr(not(test), no_std)]
@@ -31,9 +30,8 @@ pub enum AuthOutcome<'a> {
     Denied,
 }
 
-/// A fixed dummy salt + verifier used to run an equivalent PBKDF2 for an **unknown**
-/// user, so "no such user" and "wrong password" take the same time and reveal the
-/// same `Denied` — no user-enumeration / timing oracle (`rsproto-auth-ops.md`).
+/// A dummy salt + verifier, to run an equivalent PBKDF2 for an **unknown** user: "no such user" and
+/// "wrong password" take the same time and reveal the same `Denied` — no enumeration oracle.
 const DUMMY_SALT: [u8; 8] = [0xa5; 8];
 const DUMMY_VERIFIER: [u8; VERIFIER_LEN] = [0u8; VERIFIER_LEN];
 
@@ -56,9 +54,8 @@ pub fn authenticate<'a>(db: &'a [u8], username: &[u8], password: &[u8]) -> AuthO
     }
 }
 
-/// Serve one `Authenticate` request: parse the request body, authenticate against
-/// `db`, and write the reply body into `reply_out`, returning its length. Returns
-/// `None` on a **malformed** request (a truncated body) — the caller answers with an
+/// Serve one `Authenticate` request, writing the reply body into `reply_out` and returning its
+/// length. `None` on a **malformed** request (a truncated body) — the caller answers with an
 /// rsproto `ERROR` reply; a *denied* credential is a normal `Some(_)` reply.
 pub fn serve_authenticate(request_body: &[u8], db: &[u8], reply_out: &mut [u8]) -> Option<usize> {
     let req = parse_authenticate_request(request_body)?;
@@ -70,7 +67,7 @@ pub fn serve_authenticate(request_body: &[u8], db: &[u8], reply_out: &mut [u8]) 
     }
 }
 
-// --- administration (Part D.1) ------------------------------------------------------------------
+// --- administration ------------------------------------------------------------------
 
 /// What an administrator's request comes to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -137,7 +134,7 @@ pub fn serve_admin(
 }
 
 /// [`serve_admin`], deriving at `iterations` — for a test that cannot afford the real count, as
-/// `libusers`' `*_with` edits are (PR #338 review: one admin test took 21 s at the real count).
+/// `libusers`' `*_with` edits are (one admin test took 21 s at the real count).
 pub fn serve_admin_with(
     op: u16,
     body: &[u8],
@@ -184,8 +181,7 @@ mod tests {
     use super::*;
     use librsproto::auth::{build_account_request, parse_account_list};
 
-    /// Build a one-line DB for `user`/`password` with the given `home`, using the
-    /// real KDF (so the test exercises the same path the seeder + verifier do).
+    /// A one-line DB, through the real KDF.
     fn db_line(user: &str, password: &str, salt: &[u8], home: &str) -> std::string::String {
         let mut out = [0u8; libusers::MAX_FILE];
         let n = libusers::write_record(&mut out, user.as_bytes(), home.as_bytes(), password.as_bytes(), salt).unwrap();
@@ -251,7 +247,6 @@ mod tests {
     fn serve_rejects_malformed_request() {
         let db = db_line("alice", "pw", b"salt5678", "/home/alice");
         let mut reply = [0u8; 64];
-        // A body too short to hold the request prefix → None (caller sends ERROR).
         assert!(serve_authenticate(&[0u8; 2], db.as_bytes(), &mut reply).is_none());
     }
 
@@ -262,8 +257,6 @@ mod tests {
     /// record keeps its own count, so `authenticate` reads these back at this one.
     const IT: u32 = 2;
 
-    /// [`db_line`] at [`IT`]: an administrator's request never derives the existing records, and a
-    /// login checked against one here should not cost the real count either.
     fn cheap_line(user: &str, password: &str, salt: &[u8], home: &str) -> std::string::String {
         let mut out = [0u8; libusers::MAX_FILE];
         let n = libusers::write_record_with(&mut out, user.as_bytes(), home.as_bytes(), password.as_bytes(), salt, IT)
@@ -271,7 +264,6 @@ mod tests {
         std::string::String::from_utf8(out[..n].to_vec()).unwrap()
     }
 
-    /// One admin request against `db`: what it came to, and the new file if it wrote one.
     fn admin(op: u16, body: &[u8], db: &str) -> (Admin, std::string::String) {
         let mut new_db = [0u8; libusers::MAX_FILE];
         let mut reply = [0u8; 4096];
@@ -289,9 +281,6 @@ mod tests {
         b[..n].to_vec()
     }
 
-    /// **An account added, its password set, then removed — each step authenticating as the file
-    /// it wrote says.** The service installs what `Write` holds, so this is the whole of what an
-    /// administrator's request does to the database.
     #[test]
     fn an_account_is_added_changed_and_removed() {
         let db = format!("# header\n{}", cheap_line("alice", "apw", b"s1", "/home/alice"));
@@ -318,7 +307,6 @@ mod tests {
         assert!(db.starts_with("# header\n"));
     }
 
-    /// **`List` names every account and its home**, and writes nothing.
     #[test]
     fn a_list_names_every_account() {
         let db = format!(
@@ -336,7 +324,6 @@ mod tests {
         assert_eq!(got, [(&b"alice"[..], &b"/home/alice"[..]), (&b"bob"[..], &b"/home/bob"[..])]);
     }
 
-    /// **Each refusal, with the error a client is answered with.**
     #[test]
     fn an_admin_request_is_refused_for_each_reason() {
         use libusers::Refusal;
@@ -350,7 +337,7 @@ mod tests {
         assert_eq!(refused(OP_AUTH_ADD, &account("Bob", "x")), edit(Refusal::BadName, KError::InvalidArgument));
         assert_eq!(refused(OP_AUTH_ADD, &account("bob", "")), edit(Refusal::BadPassword, KError::InvalidArgument));
         assert_eq!(refused(OP_AUTH_REMOVE, b"bob"), edit(Refusal::NoSuchAccount, KError::NotFound));
-        // **A bad name is refused as one by every op**, not reported missing (PR #338 review).
+        // **A bad name is refused as one by every op**, not reported missing.
         assert_eq!(refused(OP_AUTH_REMOVE, b"Bad Name"), edit(Refusal::BadName, KError::InvalidArgument));
         assert_eq!(
             refused(OP_AUTH_SET_PASSWORD, &account("Bad Name", "x")),
@@ -375,8 +362,7 @@ mod tests {
         );
     }
 
-    /// **A list too long for the reply buffer is refused**, not cut short: a partial list would
-    /// read as the whole of it.
+    /// A list too long for the reply buffer is refused, not cut: a partial one reads as whole.
     #[test]
     fn a_list_that_does_not_fit_is_refused() {
         let db = cheap_line("alice", "a", b"s1", "/home/alice");

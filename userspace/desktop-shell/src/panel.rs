@@ -1,22 +1,9 @@
-//! The shell's two bars and the menus that hang from the top one, as element trees (desktop
-//! refresh, Part C).
+//! The shell's two bars and the menus that hang from the top one, as element trees.
 //!
-//! **Pure, so the layout is host-tested** — and tested against the gates' own aims, which
-//! `xtask` writes down a second time on purpose (M11 decision 2: a gate that read the shell's
-//! layout to know where to click could agree with a shell that had stopped drawing where it
-//! says). The tests here pin those aims as literals, so the two copies cannot part without one of
-//! them failing — the arrangement `libui`'s `dialog_buttons_land_where_the_constants_say` made for
-//! the dialogs.
-//!
-//! **What the design asks for and what is here.** The top panel is the design's: 30 pixels on the
-//! panel ground with a rule beneath, an `Applications` button with its accent dot, a `Places`
-//! button, and the clock centred on the screen. Its right-hand end — quick settings and a
-//! notifications tray — is not built, because neither exists (`desktop-shell.md` §9); **a power
-//! button is there instead** since administration Part F.2, opening the menu that ends the
-//! session (`desktop-shell.md` §4b). The
-//! Applications menu is the design's menu with no categories and a filter field above the rows,
-//! because typing to narrow it is the fastest way to a program and the only one without a pointer
-//! (`docs/planning/desktop-refresh.md`, Part C).
+//! Pure, so the layout is host-tested against the gates' own aims, which `xtask` writes down a
+//! second time on purpose; the tests pin them as literals so the two copies cannot part. The
+//! right-hand end of the design's top panel (quick settings, notifications) is not built
+//! (`desktop-shell.md` §9); a power button is there instead.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -41,7 +28,7 @@ use crate::{Application, BAR_H, matches_app};
 pub const APPS: usize = 0;
 /// The Places menu's.
 pub const PLACES: usize = 1;
-/// The power menu's (administration Part F.2).
+/// The power menu's.
 pub const POWER: usize = 2;
 
 /// What a press on the top bar asks for.
@@ -54,17 +41,14 @@ pub enum TopMsg {
 /// What choosing a menu row asks for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuMsg {
-    /// Launch the application at this index into the **unfiltered** list.
-    ///
-    /// Unfiltered, so the message still names the right program after a filter has reordered
-    /// what is shown — the rule `modal_rows` kept before this was a menu (M11 Part E batch 4).
+    /// Launch the application at this index into the unfiltered list, so the message still names
+    /// the right program after a filter reorders what is shown.
     Launch(usize),
     /// Open the place at this index into [`libfs::places`].
     Place(usize),
-    /// **End the session** (administration Part F.2): the power menu's rows.
+    /// End the session: the power menu's rows.
     End(Ending),
-    /// What a row that cannot be chosen carries. A disabled row never produces its message; it
-    /// has to have one all the same.
+    /// What a row that cannot be chosen carries; a disabled row never produces it.
     Nothing,
 }
 
@@ -72,12 +56,10 @@ pub enum MenuMsg {
 pub const APPS_KEY: u64 = 1;
 /// The Places button's.
 pub const PLACES_KEY: u64 = 2;
-/// The empty stretch after them, keyed because its siblings are.
 const REST_KEY: u64 = 3;
-/// The power button's, at the bar's right-hand end (administration Part F.2).
+/// The power button's, at the bar's right-hand end.
 pub const POWER_KEY: u64 = 4;
-/// The power button's width: a square a little wider than the bar is tall, so the glyph has the
-/// same room as a window control and the press a target the size of a word's.
+/// The power button's width: a little wider than the bar is tall.
 pub const POWER_W: u32 = BAR_H + 4;
 /// The filter field's key, above the rows.
 pub const FILTER_KEY: u64 = 10;
@@ -95,10 +77,8 @@ const APPS_GAP: u32 = 7;
 /// The Places button's sides: `padding: 0 10px`.
 const PLACES_PAD: Insets = Insets { top: 0, right: 10, bottom: 0, left: 10 };
 
-/// The Applications menu's width: the design's 252 pixels.
-///
-/// **Fixed rather than measured**, because the filter field in it measures as whatever has been
-/// typed: a menu sized to its contents would widen and narrow a keystroke at a time.
+/// The Applications menu's width: the design's 252 pixels, fixed because the filter field
+/// measures as whatever has been typed.
 pub const APPS_MENU_W: u32 = 252;
 /// How far a menu hangs in from the left of the word that opened it: the design's 8 pixels.
 pub const MENU_INSET_X: i32 = 8;
@@ -109,15 +89,10 @@ pub const MENU_DROP: i32 = 2;
 pub const PROMPT_W: u32 = APPS_MENU_W;
 
 /// The top bar: `Applications` and `Places` on the left, the clock centred on the screen, and a
-/// rule along its foot.
-///
-/// `open` is the menu that is open, which lights its word as the pointer does; `hovered` is the
-/// key under the pointer. The ground is the caller's — `paint` clears to the theme's
-/// `background`, and the shell paints a bar with `panel` there.
+/// rule along its foot. `open` lights its word as the pointer does; `hovered` is the key under
+/// the pointer. The ground is the caller's.
 pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &Theme) -> Element<TopMsg> {
     let hover = theme.scheme.hover_coverage();
-    // **Lit under the pointer and while its menu is open**, the design's `--soft`: the word a
-    // menu hangs from says which one it is.
     let face = |on: bool, body: Element<TopMsg>| {
         let mut layers = Vec::with_capacity(2);
         if on {
@@ -128,8 +103,6 @@ pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &T
     };
     let lit = |key: u64, menu: usize| hovered == Some(key) || open == Some(menu);
 
-    // The dot and its ring. The ring is the accent at the hover's coverage over the panel —
-    // `--soft`, made opaque, because a wash is square and this is round.
     let halo = theme.accent.blend(theme.panel, hover);
     let side = DOT + 2 * DOT_RING;
     let dot = sized(
@@ -155,13 +128,9 @@ pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &T
     let places =
         face(lit(PLACES_KEY, PLACES), padding(PLACES_PAD, words)).on_press(TopMsg::Menu(PLACES)).key(PLACES_KEY);
 
-    // **Above the rule, not over it**: a lit word's wash would otherwise run across the rule's
-    // pixel and break the line under it.
+    // Above the rule, not over it: a lit word's wash would break the rule's pixel.
     let above_rule = Insets { top: 0, right: 0, bottom: 1, left: 0 };
-    // **The power button, at the right-hand end** (administration Part F.2, the maintainer's call):
-    // the power symbol, lit as the words are, opening the menu that ends the session. The
-    // design's right-hand end is quick settings and notifications, which do not exist; this is
-    // where a person looks for the way out.
+    // The power button, at the right-hand end, lit as the words are.
     let power = face(lit(POWER_KEY, POWER), sized(Size::new(POWER_W, BAR_H - 1), icon(IconKind::Power)))
         .on_press(TopMsg::Menu(POWER))
         .key(POWER_KEY);
@@ -171,20 +140,13 @@ pub fn top_bar(clock: &str, open: Option<usize>, hovered: Option<u64>, theme: &T
     );
     let rule =
         column(alloc::vec![sized(Size::new(0, 0), text("")).flex(1), sized(Size::new(0, 1), fill(theme.border)),]);
-    // **Centred on the screen, not on what the words leave** — a layer of its own spanning the
-    // bar, which is what the balancing slot the old bar carried was approximating. Beneath the
-    // words in the stack, so a press over the clock lands on the empty stretch rather than on a
-    // layer with nothing to answer it.
+    // Centred on the screen, not on what the words leave: a layer beneath the words.
     let clock = padding(above_rule, center(text(clock)));
     stack(alloc::vec![rule, clock, words])
 }
 
 /// The three menus the bar opens: the applications `query` matches, the places, and the power
-/// menu (administration Part F.2).
-///
-/// **One table, indexed by [`APPS`], [`PLACES`] and [`POWER`]**, because `MenuState` moves between them
-/// with Left and Right the way a window's menu bar does — the only way to reach `Places` on a
-/// machine with no pointer.
+/// menu, indexed by [`APPS`], [`PLACES`] and [`POWER`] for `MenuState`'s Left and Right.
 pub fn menus(
     apps: &[Application],
     query: &str,
@@ -195,10 +157,8 @@ pub fn menus(
     alloc::vec![apps_menu(apps, query), places_menu(places, home, theme), power_menu()]
 }
 
-/// **The power menu** (administration Parts F.2 and F.3): ending the session, or the machine.
-/// **Restart and Shut down are destructive rows**, drawn in `deny`: they end every session on the
-/// machine, not just this one. Neither asks here — the windows are asked to close first, and the
-/// policy decides.
+/// The power menu: ending the session, or the machine. Restart and Shut down are destructive rows
+/// (`deny`); neither asks here, as the windows are asked first and the policy decides.
 pub fn power_menu() -> Menu<MenuMsg> {
     let row = |e: Ending| Item::plain(e.title(), MenuMsg::End(e));
     Menu {
@@ -211,11 +171,8 @@ pub fn power_menu() -> Menu<MenuMsg> {
     }
 }
 
-/// The applications `query` matches, **keyed by index into the unfiltered list**.
-///
-/// **A row that says why there is nothing**, rather than an empty menu: a filter that matches
-/// nothing and a session with no desktop entries would otherwise both look like a menu that
-/// failed to draw.
+/// The applications `query` matches, keyed by index into the unfiltered list; a row says why
+/// there is nothing.
 pub fn apps_menu(apps: &[Application], query: &str) -> Menu<MenuMsg> {
     let mut items: Vec<Item<MenuMsg>> = apps
         .iter()
@@ -230,11 +187,7 @@ pub fn apps_menu(apps: &[Application], query: &str) -> Menu<MenuMsg> {
     Menu { title: "Applications", items }
 }
 
-/// The places, each with a swatch and its path beside it.
-///
-/// **Root's swatch is `deny`**, the design's, and the reason is the one `theme.deny` gives: it is
-/// the place that reaches past the person's own files. Matched on the path rather than the name,
-/// because the path is what makes it so.
+/// The places, each with a swatch and its path; Root's swatch is `deny`.
 pub fn places_menu(places: &[libfs::Place], home: &str, theme: &Theme) -> Menu<MenuMsg> {
     let items = places
         .iter()
@@ -248,9 +201,6 @@ pub fn places_menu(places: &[libfs::Place], home: &str, theme: &Theme) -> Menu<M
 }
 
 /// `path` as a person reads it: the home written `~`.
-///
-/// The design's Places menu shows `~/Documents`, and an application's home is `/home` — a path
-/// that is true inside the application's namespace and says nothing about whose home it is.
 pub fn tilde(path: &str, home: &str) -> String {
     if home.is_empty() || home == "/" {
         return String::from(path);
@@ -265,10 +215,7 @@ pub fn tilde(path: &str, home: &str) -> String {
     }
 }
 
-/// The open menu's tree: the Applications menu with its filter field, or the Places menu.
-///
-/// `which` is the menu's index, `table` is [`menus`]' answer, and `hovered` is the row key under
-/// the pointer — the popup window's own, not the bar's.
+/// The open menu's tree; `hovered` is the row key under the pointer in the popup window.
 pub fn menu_view(
     which: usize,
     table: &[Menu<MenuMsg>],
@@ -279,8 +226,6 @@ pub fn menu_view(
 ) -> Element<MenuMsg> {
     let Some(menu) = table.get(which) else { return text("") };
     if which == APPS {
-        // **Active whenever the menu is up**: the popup holds the keyboard, and every key the
-        // menu does not claim is the field's.
         let field = text_field(query, false, WidgetState { active: true, ..Default::default() }, theme).key(FILTER_KEY);
         sized(Size::new(APPS_MENU_W, 0), popup_headed(menu, state, ROW_KEY_BASE, hovered, field, theme))
     } else {
@@ -288,35 +233,26 @@ pub fn menu_view(
     }
 }
 
-/// The desktop-name prompt: a line saying what it is for, and the field.
-///
-/// **A popup of its own since Part C.** It borrowed the applications modal until the modal became
-/// a menu — a field over a list whose rows ignored clicks, because choosing a program is not
-/// naming a desktop.
+/// The desktop-name prompt: a line saying what it is for, and the field, in a popup of its own.
 pub fn name_prompt(name: &TextFieldState, theme: &Theme) -> Element<()> {
     let field = text_field(name, false, WidgetState { active: true, ..Default::default() }, theme);
     let body = with_spacing(column(alloc::vec![ink(theme.foreground_dim, text("Name this desktop")), field]), 6);
     sized(Size::new(PROMPT_W, 0), popup_frame(padding(Insets { top: 8, right: 12, bottom: 10, left: 12 }, body), theme))
 }
 
-/// Where the menu at `which` hangs, in the top bar's coordinates — which, the bar being at the
-/// screen's origin, are the screen's.
-///
-/// `word` is the rectangle of the word that opens it, from a layout of [`top_bar`].
+/// Where the menu at `which` hangs, in the top bar's (the screen's) coordinates; `word` is the
+/// rectangle of the word that opens it.
 pub fn menu_anchor(word: libdraw::geom::Rect) -> (i32, i32) {
     (word.origin.x + MENU_INSET_X, BAR_H as i32 + MENU_DROP)
 }
 
-/// Where a menu `width` wide hangs from a word at the **right-hand end** of the bar: its right
-/// edge [`MENU_INSET_X`] in from the word's, as a left-hung menu's left edge is from its word's —
-/// so the power menu stays on the screen (administration Part F.2).
+/// Where a menu `width` wide hangs from a word at the right-hand end of the bar: its right edge
+/// [`MENU_INSET_X`] in from the word's, so the power menu stays on the screen.
 pub fn menu_anchor_right(word: libdraw::geom::Rect, width: u32) -> (i32, i32) {
     (word.origin.x + word.size.w as i32 - MENU_INSET_X - width as i32, BAR_H as i32 + MENU_DROP)
 }
 
-// ---- the waiting dialog ---------------------------------------------------------------------
-
-/// What the waiting dialog's controls ask for (administration Part F.2).
+/// What the waiting dialog's controls ask for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EndingMsg {
     /// Destroy what is still open, and end the session.
@@ -336,11 +272,10 @@ pub const ENDING_END_KEY: u64 = 202;
 /// Its Cancel button's.
 pub const ENDING_CANCEL_KEY: u64 = 203;
 
-/// **The waiting dialog** (administration Part F.2): what a session end is still waiting for —
-/// [`Closing::question`](crate::ending::Closing::question)'s two lines — with **End anyway** and
-/// **Cancel**. `libui`'s fixed question, two lines over two buttons, so its buttons land where
-/// `DIALOG_LEFT_CX` and `DIALOG_RIGHT_CX` say, which `check-logout` aims at. Closing it is Cancel:
-/// the frame must not be a way to end a session.
+/// The waiting dialog: what a session end is still waiting for
+/// ([`Closing::question`](crate::ending::Closing::question)'s two lines), with End anyway and
+/// Cancel. Its buttons land where `DIALOG_LEFT_CX` and `DIALOG_RIGHT_CX` say, which
+/// `check-logout` aims at. Closing it is Cancel: the frame must not end a session.
 pub fn ending_dialog(
     ending: Ending,
     question: &(String, String),
@@ -365,9 +300,7 @@ pub fn ending_dialog(
     dialog_frame(bar, lines, answers, true, theme)
 }
 
-// ---- the refusal ----------------------------------------------------------------------------
-
-/// What the refusal dialog's controls ask for (administration Part F.3).
+/// What the refusal dialog's controls ask for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RefusalMsg {
     /// Put it away.
@@ -385,10 +318,8 @@ pub const REFUSAL_GAP_KEY: u64 = 212;
 /// Its Close button's.
 pub const REFUSAL_CLOSE_KEY: u64 = 213;
 
-/// **Why a Restart or a Shut down did not happen** (administration Part F.3): the [`Refusal`]'s two
-/// lines, and **Close**. A report, not a question, so it has one answer, in the right-hand half
-/// where the waiting dialog's Cancel is — `DIALOG_RIGHT_CX` names it — and closing the frame means
-/// the same. Hung where the waiting dialog is, under the power button.
+/// Why a Restart or a Shut down did not happen: the [`Refusal`]'s two lines, and Close, in the
+/// right-hand half where the waiting dialog's Cancel is (`DIALOG_RIGHT_CX`).
 pub fn refusal_dialog(ending: Ending, refusal: &Refusal, hovered: Option<u64>, theme: &Theme) -> Element<RefusalMsg> {
     let buttons = TitleButtons { minimise: None, maximise: None, close: Some(RefusalMsg::Close) };
     let bar =
@@ -406,8 +337,6 @@ pub fn refusal_dialog(ending: Ending, refusal: &Refusal, hovered: Option<u64>, t
     let answers = with_spacing(row(alloc::vec![text("").key(REFUSAL_GAP_KEY).flex(1), close]), DIALOG_GAP);
     dialog_frame(bar, lines, answers, true, theme)
 }
-
-// ---- the bottom bar -------------------------------------------------------------------------
 
 /// What the bottom bar knows about one window: enough to draw its button.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -438,9 +367,8 @@ pub struct Desktops<'a> {
 pub enum BottomMsg {
     /// Minimise everything on this desktop, or bring back what the last press put away.
     ShowDesktop,
-    /// The window with this id — raise it, or put it away if it holds the keyboard. A middle
-    /// click closes it instead, which the shell reads off the event, since a message cannot say
-    /// which button made it.
+    /// The window with this id: raise it, or put it away if it holds the keyboard. A middle click
+    /// closes it instead, which the shell reads off the event.
     Task(u32),
     /// Go to the desktop at this index.
     Desktop(usize),
@@ -454,11 +382,8 @@ pub enum BottomMsg {
 
 /// The show-desktop button's key.
 pub const SHOW_KEY: u64 = 1;
-/// The rule after it.
 const RULE_KEY: u64 = 2;
-/// The empty stretch between the tasks and the switcher.
 const SPREAD_KEY: u64 = 3;
-/// The switcher, as one group.
 const SWITCHER_KEY: u64 = 4;
 /// The back arrow.
 pub const PREV_KEY: u64 = 5;
@@ -466,7 +391,6 @@ pub const PREV_KEY: u64 = 5;
 pub const NEXT_KEY: u64 = 6;
 /// The desktop's name.
 pub const NAME_KEY: u64 = 7;
-/// The cells, as a group.
 const CELLS_KEY: u64 = 8;
 /// Where the cells are keyed from, by desktop index.
 pub const CELL_KEY_BASE: u64 = 100;
@@ -482,9 +406,7 @@ pub const BAR_GAP: u32 = 4;
 pub const SHOW_W: u32 = 26;
 /// Every control's height on the bar: `22px`.
 const CONTROL_H: u32 = 22;
-// The design's `--r` — which buttons on the bar share with windows and, since the refresh's
-// Part D, with a field inside one — is `libui::widget::CONTROL_RADIUS`, imported above. There
-// was a second 8 here until a field needed the same curve.
+// The design's `--r`, shared with windows and fields, is `libui::widget::CONTROL_RADIUS`.
 /// The rule after the show-desktop button: one pixel with `margin: 0 3px`.
 const RULE_W: u32 = 1 + 2 * 3;
 /// A task button's width: `186px`.
@@ -499,8 +421,7 @@ const TASK_GAP: u32 = 7;
 pub const TASKS_X: u32 = BAR_PAD_X + SHOW_W + BAR_GAP + RULE_W + BAR_GAP;
 /// From one task button's left edge to the next.
 pub const TASK_PITCH: u32 = TASK_W + BAR_GAP;
-/// Everything on the bar that is not a task button or the switcher: both paddings, the
-/// show-desktop button, the rule, and the gaps around the empty stretch.
+/// Everything on the bar that is not a task button or the switcher.
 const FIXED_W: u32 = 2 * BAR_PAD_X + SHOW_W + RULE_W + 3 * BAR_GAP;
 
 /// The switcher's padding: `padding: 0 8px`, inside its `border-left`.
@@ -520,12 +441,8 @@ const NAME_PAD: Insets = Insets { top: 0, right: 5, bottom: 0, left: 5 + 2 };
 /// The most cells the switcher shows at once.
 pub const MAX_CELLS: usize = 3;
 
-/// Which desktops the switcher shows cells for: up to [`MAX_CELLS`], around the current one.
-///
-/// **`min(3, total)`, never fewer** (the plan's rule, from the review that corrected a reading of
-/// a screenshot with two desktops open): with three or more, three cells, the current one in the
-/// middle where it can be — first, it is the first cell and the back arrow is disabled; last, it
-/// is the last.
+/// Which desktops the switcher shows cells for: up to [`MAX_CELLS`], around the current one, the
+/// current one in the middle where it can be.
 pub fn switcher_cells(current: usize, total: usize) -> core::ops::Range<usize> {
     if total <= MAX_CELLS {
         return 0..total;
@@ -534,12 +451,9 @@ pub fn switcher_cells(current: usize, total: usize) -> core::ops::Range<usize> {
     start..start + MAX_CELLS
 }
 
-/// How many task buttons fit beside a switcher `switcher_w` wide on a bar `width` wide.
-///
-/// **The invariant is the product**: the bar laid out with this many never puts a button under
-/// the switcher. Entries past it are not shown; the window is still there, and on the overview.
-/// The switcher's width is measured rather than written down because it carries the desktop's
-/// name — see [`switcher_width`].
+/// How many task buttons fit beside a switcher `switcher_w` wide on a bar `width` wide, so the
+/// bar never puts a button under the switcher. The switcher's width is measured, as it carries
+/// the desktop's name: [`switcher_width`].
 pub fn task_capacity(width: u32, switcher_w: u32) -> usize {
     (width.saturating_sub(FIXED_W + switcher_w) / TASK_PITCH) as usize
 }
@@ -549,9 +463,8 @@ pub fn switcher_width(d: &Desktops<'_>, theme: &Theme, m: &dyn Metrics) -> u32 {
     measure(&switcher(d, None, theme), Constraints::loose(Size::new(u32::MAX / 4, u32::MAX / 4)), m).w
 }
 
-/// A rounded box with a one-pixel border, on the bar: the border colour, then the ground a pixel
-/// in. `None` for either leaves it out, so a borderless box is its ground and a hollow one is a
-/// ring on the bar's own.
+/// A rounded box with a one-pixel border: the border colour, then the ground a pixel in; `None`
+/// leaves either out.
 fn boxed<Msg>(border: Option<Rgb>, ground: Option<Rgb>, radius: u32, panel: Rgb) -> Vec<Element<Msg>> {
     let mut layers = Vec::with_capacity(2);
     match (border, ground) {
@@ -566,10 +479,8 @@ fn boxed<Msg>(border: Option<Rgb>, ground: Option<Rgb>, radius: u32, panel: Rgb)
 }
 
 /// The bottom bar: show-desktop, a rule, one button per window, and the switcher at the right.
-///
-/// `tasks` is what fits — [`task_capacity`] is the caller's, because the chord that minimises the
-/// focused window has to be bounded by the same count. `shown` is whether show-desktop is holding
-/// windows to bring back, which lights it. The ground is the caller's, as the top bar's is.
+/// `tasks` is what fits ([`task_capacity`] is the caller's, as the minimise chord is bounded by
+/// the same count); `shown` lights show-desktop while it holds windows.
 pub fn bottom_bar(
     tasks: &[Task<'_>],
     shown: bool,
@@ -580,8 +491,6 @@ pub fn bottom_bar(
     let soft = theme.accent.blend(theme.panel, theme.scheme.hover_coverage());
     let line_soft = theme.border.blend(theme.panel, 128);
 
-    // **Show desktop**: lit in the accent while it is holding windows, so the second press has a
-    // visible reason to exist.
     let (bd, bg, fg) = if shown {
         (theme.accent, soft, theme.accent)
     } else {
@@ -603,8 +512,7 @@ pub fn bottom_bar(
     let mut items = alloc::vec![show, rule];
     for t in tasks {
         let key = TASK_KEY_BASE + t.id as u64;
-        // **The dot says what the window is doing**: put away, holding the keyboard, or simply
-        // there — the design's three states, where the old bar had a character in the label.
+        // The dot says what the window is doing: put away, holding the keyboard, or simply there.
         let dot = if t.minimized {
             theme.foreground_dim
         } else if t.focused {
@@ -612,8 +520,6 @@ pub fn bottom_bar(
         } else {
             theme.ok
         };
-        // **The focused window is a raised face**, bordered, on the window's own ground; the
-        // pointer draws the border in the accent on any of them.
         let border = if hovered == Some(key) {
             Some(theme.accent)
         } else if t.focused && !t.minimized {
@@ -648,13 +554,12 @@ pub fn bottom_bar(
     ])
 }
 
-/// The switcher: `‹`, up to three cells, `›`, and the desktop's name — which opens the overview.
+/// The switcher: `‹`, up to three cells, `›`, and the desktop's name, which opens the overview.
 fn switcher(d: &Desktops<'_>, hovered: Option<u64>, theme: &Theme) -> Element<BottomMsg> {
     let soft = theme.accent.blend(theme.panel, theme.scheme.hover_coverage());
     let line_soft = theme.border.blend(theme.panel, 128);
     let total = d.occupied.len();
 
-    // An arrow: dim, and deaf, when there is nowhere to go.
     let arrow = |glyph: &'static str, key: u64, live: bool, msg: BottomMsg| {
         let mut layers = Vec::with_capacity(2);
         if live && hovered == Some(key) {
@@ -669,9 +574,7 @@ fn switcher(d: &Desktops<'_>, hovered: Option<u64>, theme: &Theme) -> Element<Bo
     let mut cells = Vec::with_capacity(MAX_CELLS);
     for i in switcher_cells(d.current, total) {
         let (cur, occ) = (i == d.current, d.occupied.get(i).copied().unwrap_or(false));
-        // **An empty desktop's border is the faint rule**, where the design dashes it: the
-        // difference it draws is "nothing here", and the missing mark already says that — a
-        // dashed rectangle is a primitive this toolkit does not have, for one border.
+        // An empty desktop's border is the faint rule; this toolkit has no dashed primitive.
         let border = if cur {
             theme.accent
         } else if occ {
@@ -726,8 +629,8 @@ mod tests {
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
 
-    /// `check-login`'s aim at the forward arrow, from the screen's right edge, with `work`
-    /// current and one scratch desktop after it.
+    /// `check-login`'s aim at the forward arrow, from the right edge, with `work` current and one
+    /// scratch desktop after it.
     const NEXT_FROM_RIGHT: i32 = 67;
     /// Its aim at the first cell, from the right edge, with `Desktop 2` current of two.
     const FIRST_CELL_FROM_RIGHT: i32 = 148;
@@ -736,25 +639,16 @@ mod tests {
         Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses")
     }
 
-    /// The text sizes every aim must hold at: **12, what the image stages** — `xtask`'s
-    /// `THEME_FONT_PX`, and so what every gate boots — and 13, the built-in theme's, for a session
-    /// with no theme file (both since the desktop refresh's Part G; they were 14 and 16). The bars
-    /// are laid out in the session's theme, so an aim pinned at one size could drift out of its
-    /// target at the other with nothing failing; the first version of these tests pinned the
-    /// built-in size alone while the guest drew the staged one (PR #314 review, finding 4).
+    /// The text sizes every aim must hold at: 12, what the image stages (`xtask`'s
+    /// `THEME_FONT_PX`), and 13, the built-in theme's.
     const FONT_SIZES: [f32; 2] = [12.0, 13.0];
 
-    /// `check-login`'s presses on the two top-bar words, as it writes them.
     const APPS_CLICK: i32 = 60;
     const PLACES_CLICK: i32 = 141;
 
-    /// How far inside its word each of those presses must land, at either text size.
-    ///
-    /// Twenty rather than one: a word's face moves as the size does — five pixels between the
-    /// two — so an aim wants room for several such steps, not proof that it fits this pair.
+    /// How far inside its word each press must land, at either text size.
     const AIM_MARGIN: i32 = 20;
 
-    /// The light theme at each of [`FONT_SIZES`].
     fn themes() -> impl Iterator<Item = Theme> {
         FONT_SIZES.into_iter().map(|px| Theme { font_px: px, ..Theme::light() })
     }
@@ -763,12 +657,10 @@ mod tests {
         Application { name: String::from(name), exec: String::from(exec) }
     }
 
-    /// The three staged applications, in the order `read_applications` sorts them.
     fn staged() -> Vec<Application> {
         alloc::vec![app("Files", "nxfiles"), app("Terminal", "nxterm"), app("Text Editor", "nxedit")]
     }
 
-    /// Press and release at `(x, y)` through a router, as a click arrives.
     fn click<M: Clone>(e: &Element<M>, bounds: Rect, m: &FontMetrics<'_>, x: i32, y: i32) -> Vec<M> {
         let l = layout(e, bounds, m);
         let mut tree = Tree::new();
@@ -782,17 +674,9 @@ mod tests {
         out
     }
 
-    /// **The gate's aims, as literals** — `check-login`'s `APPS_CLICK` and `PLACES_CLICK`.
-    ///
-    /// Written down in `xtask` a second time on purpose; pinned here so a change to the bar that
-    /// moves a word under them fails a host test rather than a boot.
-    ///
-    /// **And the margin is asserted, not described** (PR #316 review, finding 1). A word's face
-    /// moves between the two text sizes — `Large` widened `Applications` by five pixels and
-    /// pushed `Places` right by the same — so an aim that merely lands today can be a pixel
-    /// inside an edge and nobody would know. The second half asserts each aim is
-    /// [`AIM_MARGIN`] inside its word at **both** sizes, which is the claim `check-login`'s
-    /// comment used to make in prose and get wrong.
+    /// The gate's aims, as literals (`check-login`'s `APPS_CLICK`, `PLACES_CLICK`), so a bar
+    /// change that moves a word under them fails a host test, not a boot; each [`AIM_MARGIN`]
+    /// inside its word at both sizes.
     #[test]
     fn the_gates_aims_land_on_the_words_they_name() {
         let f = font();
@@ -805,10 +689,8 @@ mod tests {
                 assert_eq!(apps, [TopMsg::Menu(APPS)], "APPS_CLICK at {width}");
                 let places = click(&bar, bounds, &m, PLACES_CLICK, 12);
                 assert_eq!(places, [TopMsg::Menu(PLACES)], "PLACES_CLICK at {width}");
-                // And the clock is not a control: a press on it is a press on the bar.
                 assert!(click(&bar, bounds, &m, width as i32 / 2, 12).is_empty(), "the clock at {width}");
             }
-            // The press lands well inside the word, not against an edge of it.
             let bar = top_bar("12:34", None, None, &theme);
             let l = layout(&bar, Rect::new(0, 0, 1360, BAR_H), &m);
             let aims = [(APPS_CLICK, APPS_KEY, "APPS_CLICK"), (PLACES_CLICK, PLACES_KEY, "PLACES_CLICK")];
@@ -826,7 +708,6 @@ mod tests {
         }
     }
 
-    /// The clock is centred on the **screen**, which is what the old bar's balancing slot was for.
     #[test]
     fn the_clock_is_centred_on_the_bar_whatever_is_left_of_it() {
         let f = font();
@@ -835,7 +716,6 @@ mod tests {
             for width in [1024u32, 1360, 2560] {
                 let bar = top_bar("12:34", None, None, &theme);
                 let l = layout(&bar, Rect::new(0, 0, width, BAR_H), &m);
-                // The clock layer is the stack's second: padding → center → text.
                 let t = l.children[1].children[0].children[0].rect;
                 let mid = t.origin.x + t.size.w as i32 / 2;
                 assert!((mid - width as i32 / 2).abs() <= 1, "clock centred at {mid}, not {}", width / 2);
@@ -844,7 +724,6 @@ mod tests {
         }
     }
 
-    /// A menu hangs 8 pixels in from its word and 2 below the bar — the design's positions.
     #[test]
     fn a_menu_hangs_from_the_word_that_opened_it() {
         let f = font();
@@ -860,9 +739,8 @@ mod tests {
         }
     }
 
-    /// **The power button is the bar's right-hand end**, at every screen width, and a press on it
-    /// opens the power menu (administration Part F.2). `check-logout` aims `POWER_W / 2` in from
-    /// the screen's right edge, so that is where this presses.
+    /// The power button is the bar's right-hand end at every width; `check-logout` aims `POWER_W
+    /// / 2` in from the right edge.
     #[test]
     fn the_power_button_is_the_bars_right_hand_end() {
         let f = font();
@@ -882,9 +760,8 @@ mod tests {
         }
     }
 
-    /// **The power menu is Log out, Restart and Shut down**, in that order — `check-logout` reaches
-    /// each by pressing Down that many times — the last two destructive, and it is the table's
-    /// third menu (administration Parts F.2 and F.3).
+    /// The power menu is Log out, Restart and Shut down in that order (`check-logout` presses
+    /// Down that many times), the last two destructive.
     #[test]
     fn the_power_menu_logs_out_restarts_and_shuts_down() {
         let table = menus(&staged(), "", &libfs::places("/home"), "/home", &Theme::light());
@@ -908,13 +785,9 @@ mod tests {
                 ("Shut down", MenuMsg::End(Ending::ShutDown), true),
             ]
         );
-        // Every row is a choice: nothing the keyboard's Down would stop on and choose nothing with.
         assert_eq!(table[POWER].items.len(), rows.len());
     }
 
-    /// **The power menu hangs right-aligned and stays on the screen**: its right edge
-    /// `MENU_INSET_X` in from the screen's, at every width and both text sizes — where hung from
-    /// the left of its button, as the other two are, it would run off the edge.
     #[test]
     fn the_power_menu_hangs_right_aligned_on_the_screen() {
         let f = font();
@@ -931,15 +804,12 @@ mod tests {
                 assert!(x >= 0, "off the left at {width}");
                 assert_eq!(x + size.w as i32, width as i32 - MENU_INSET_X, "right edge at {width}");
                 assert_eq!(y, BAR_H as i32 + MENU_DROP);
-                // And hung from the left, it would not have fitted.
                 assert!(menu_anchor(word).0 + size.w as i32 > width as i32, "the left anchor fits after all");
             }
         }
     }
 
-    /// **The waiting dialog's buttons land where `libui` publishes** — End anyway on the left,
-    /// Cancel on the right — and its close button is Cancel: `check-logout` aims at those
-    /// constants, so a dialog that moved them fails here, not after a boot.
+    /// The waiting dialog's buttons land where `libui` publishes (`check-logout` aims at them).
     #[test]
     fn the_waiting_dialogs_buttons_land_where_libui_says() {
         use libui::widget::{DIALOG_BUTTON_CY, DIALOG_H, DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_W};
@@ -956,15 +826,12 @@ mod tests {
         let l = layout(&view, bounds, &m);
         let text_rect = locate(&view, &l, ENDING_TEXT_KEY).expect("the question");
         assert!(text_rect.size.h > 0 && text_rect.size.w > 0);
-        // The title bar's close button, pressed at its centre.
         let close = locate(&view, &l, libui::widget::TITLE_CLOSE_KEY).expect("the close button");
         let (cx, cy) = (close.origin.x + close.size.w as i32 / 2, close.origin.y + close.size.h as i32 / 2);
         assert_eq!(click(&view, bounds, &m, cx, cy), [EndingMsg::Cancel], "closing the dialog is Cancel");
     }
 
-    /// **The refusal dialog's Close lands where the waiting dialog's Cancel does**, the left half
-    /// answers nothing, and closing the frame is Close — the fixed frame, so `DIALOG_RIGHT_CX` names
-    /// its button as it does the other's.
+    /// The refusal dialog's Close lands where the waiting dialog's Cancel does.
     #[test]
     fn the_refusal_dialogs_close_lands_where_libui_says() {
         use libui::widget::{DIALOG_BUTTON_CY, DIALOG_H, DIALOG_LEFT_CX, DIALOG_RIGHT_CX, DIALOG_W};
@@ -983,16 +850,14 @@ mod tests {
         assert_eq!(click(&view, bounds, &m, cx, cy), [RefusalMsg::Close]);
     }
 
-    /// **Every refusal the shell can say fits the dialog's width**, at both text sizes — two lines
-    /// in `libui`'s fixed question, where a line that runs past the frame is cut off mid-reason.
-    /// The broker's own reasons can name a person, which no test can bound; these are the rest.
+    /// Every refusal the shell can say fits the dialog's width: a longer line is cut off
+    /// mid-reason.
     #[test]
     fn every_refusal_the_shell_says_fits_the_dialog() {
         use crate::ending::failed;
         let f = font();
         let refusals = [
             Refusal::Password,
-            // The broker's own words, from `view_broker::policy::Policy::would`, for a short name.
             Refusal::Refused(String::from("no rule lets alice use `power`")),
             Refusal::Refused(String::from("`power` does not let alice run `shutdown`")),
             Refusal::Failed(String::from(failed::NO_BROKER)),
@@ -1023,8 +888,6 @@ mod tests {
         }
     }
 
-    /// The bar keeps diffing as a word lights and its menu opens — a shape `diff` refuses is a bar
-    /// that stops drawing, the failure `menu::popup`'s note describes.
     #[test]
     fn the_bar_diffs_as_its_words_light() {
         let (f, theme) = (font(), Theme::light());
@@ -1040,7 +903,6 @@ mod tests {
         }
     }
 
-    /// Filtering narrows the rows and keeps each one keyed by its place in the unfiltered list.
     #[test]
     fn the_applications_menu_narrows_and_remembers_what_each_row_launches() {
         let apps = staged();
@@ -1056,12 +918,9 @@ mod tests {
             })
             .collect();
         assert_eq!(msgs, [MenuMsg::Launch(1)], "`term` is the terminal, which is the second entry");
-        // The program as well as the name — somebody who knows the system types `nxedit`.
         assert!(matches!(apps_menu(&apps, "nxedit").items[..], [Item::Action { msg: MenuMsg::Launch(2), .. }]));
     }
 
-    /// A filter that matches nothing says so, in a row that cannot be chosen — and says which
-    /// kind of nothing it is.
     #[test]
     fn an_empty_menu_says_why() {
         let apps = staged();
@@ -1069,14 +928,12 @@ mod tests {
         assert!(matches!(&none.items[..], [Item::Action { label, enabled: false, .. }] if label == "Nothing matches"));
         let empty = apps_menu(&[], "");
         assert!(matches!(&empty.items[..], [Item::Action { label, enabled: false, .. }] if label == "No applications"));
-        // Enter has nothing to choose: the cursor lands nowhere.
         let mut s = MenuState::new(3);
         s.toggle(APPS);
         s.select_first(&[none, apps_menu(&apps, "")]);
         assert_eq!(s.cursor(), None);
     }
 
-    /// The places are `libfs`'s, in its order, with `~` for home and Root in `deny`.
     #[test]
     fn the_places_menu_is_libfs_places_with_their_paths_beside_them() {
         let theme = Theme::light();
@@ -1108,16 +965,13 @@ mod tests {
         assert_eq!(tilde("/home/Documents", "/home"), "~/Documents");
         assert_eq!(tilde("/home/Documents", "/home/"), "~/Documents", "a trailing separator on home");
         assert_eq!(tilde("/", "/home"), "/");
-        // A sibling that merely *starts* with home's spelling is not under it.
         assert_eq!(tilde("/homework", "/home"), "/homework");
-        // No home, or a home that is the root, abbreviates nothing.
         assert_eq!(tilde("/home", ""), "/home");
         assert_eq!(tilde("/Documents", "/"), "/Documents");
     }
 
-    /// **`check-login`'s row aims, as literals.** The Applications menu hangs at `(8, 32)`, and
-    /// the gate types `nxterm` and clicks the one row left at `ROW1`; it opens `Places` and
-    /// clicks `Documents` at `PLACE_DOCUMENTS`. Both are screen coordinates.
+    /// `check-login`'s row aims, as literals: the one row left after typing `nxterm` at `ROW1`,
+    /// and `Documents` at `PLACE_DOCUMENTS`, in screen coordinates.
     #[test]
     fn the_gates_row_aims_land_on_the_rows_they_name() {
         let f = font();
@@ -1128,7 +982,6 @@ mod tests {
             let bar = top_bar("", None, None, &theme);
             let bl = layout(&bar, Rect::new(0, 0, 1360, BAR_H), &m);
 
-            // The popup's own coordinates are the screen's less its anchor.
             let aim = |which: usize, query: &str, key: u64, (sx, sy): (i32, i32)| {
                 let word = locate(&bar, &bl, if which == APPS { APPS_KEY } else { PLACES_KEY }).unwrap();
                 let (ax, ay) = menu_anchor(word);
@@ -1157,8 +1010,6 @@ mod tests {
         }
     }
 
-    /// The name prompt measures to a size a popup can be created at — nothing, and everything,
-    /// are both refusals in `Child::open`.
     #[test]
     fn the_name_prompt_has_a_size() {
         let (f, theme) = (font(), Theme::light());
@@ -1169,19 +1020,15 @@ mod tests {
         assert!(s.h > 20 && s.h < 200, "{s:?}");
     }
 
-    // --- the bottom bar -------------------------------------------------------------------------
-
     fn tasks(n: usize) -> Vec<Task<'static>> {
         (0..n).map(|i| Task { id: 10 + i as u32, title: "nxterm", focused: i == 0, minimized: false }).collect()
     }
 
-    /// The plan's rule: `min(3, total)` cells, the current one in the middle where it can be.
     #[test]
     fn the_switcher_shows_three_cells_around_the_current_desktop() {
         assert_eq!(switcher_cells(0, 1), 0..1);
         assert_eq!(switcher_cells(1, 2), 0..2);
         assert_eq!(switcher_cells(0, 3), 0..3);
-        // On desktop 1 of three or more: three cells, not "two when there is no previous".
         assert_eq!(switcher_cells(0, 5), 0..3);
         assert_eq!(switcher_cells(1, 5), 0..3);
         assert_eq!(switcher_cells(2, 5), 1..4);
@@ -1196,8 +1043,6 @@ mod tests {
         }
     }
 
-    /// **No task button is ever laid out under the switcher**, at any screen and any name — the
-    /// product the capacity exists for — and the capacity is tight: one more would not fit.
     #[test]
     fn no_task_is_ever_laid_out_under_the_switcher() {
         let f = font();
@@ -1212,7 +1057,6 @@ mod tests {
                         let ts = tasks(n);
                         let bar = bottom_bar(&ts, false, &d, None, &theme);
                         let l = layout(&bar, Rect::new(0, 0, width, BAR_H), &m);
-                        // The whole group, from its rule — not the name, which starts further in.
                         let sw = locate(&bar, &l, SWITCHER_KEY).expect("the switcher is laid out");
                         assert_eq!(sw.size.w, switcher_width(&d, &theme, &m), "{width}/{label}: squeezed");
                         for t in &ts {
@@ -1225,7 +1069,6 @@ mod tests {
                         }
                         let name = locate(&bar, &l, NAME_KEY).expect("the name is laid out");
                         assert!(name.right() <= width as i64, "{width}/{label}: the name runs off the bar");
-                        // Tight: the next button would not have fitted.
                         let next_right = TASKS_X + n as u32 * TASK_PITCH + TASK_W;
                         let switcher_x = width - BAR_PAD_X - switcher_width(&d, &theme, &m);
                         assert!(next_right + BAR_GAP > switcher_x - BAR_GAP, "{width}/{label}: room for one more");
@@ -1235,10 +1078,10 @@ mod tests {
         }
     }
 
-    /// **`check-login`'s bottom-bar aims, as literals.** Show-desktop at x 20; the first task's
-    /// middle at 141 and the next at 331; the bar's empty stretch at 600; the desktop's name at
-    /// 30 in from the right edge; and, with the desktops named `work` and one scratch, the
-    /// forward arrow and the first cell measured from the right edge too. All at half the bar.
+    /// `check-login`'s bottom-bar aims, as literals: show-desktop at x 20; the first task's
+    /// middle at 141 and the next at 331; the empty stretch at 600; the desktop's name 30 in from
+    /// the right; the forward arrow and first cell measured from the right edge. All at half the
+    /// bar.
     #[test]
     fn the_gates_bottom_bar_aims_land_on_what_they_name() {
         let f = font();
@@ -1259,13 +1102,10 @@ mod tests {
                     assert!(click(&bar, bounds, &m, 600, y).is_empty(), "{width}: 600 is not empty space");
                     assert_eq!(click(&bar, bounds, &m, w - 30, y), [BottomMsg::Overview], "{width}/{label}");
                 }
-                // The two the switcher step aims at, with `work` current and the scratch desktop
-                // after it — the state `check-login` is in when it presses them.
                 let occupied = [true, false];
                 let d = Desktops { occupied: &occupied, current: 0, label: "work" };
                 let bar = bottom_bar(&tasks(1), false, &d, None, &theme);
                 assert_eq!(click(&bar, bounds, &m, w - NEXT_FROM_RIGHT, y), [BottomMsg::Next], "{width}");
-                // …and from the second desktop, named `Desktop 2`, the first cell and the back arrow.
                 let d = Desktops { occupied: &occupied, current: 1, label: "Desktop 2" };
                 let bar = bottom_bar(&[], false, &d, None, &theme);
                 assert_eq!(click(&bar, bounds, &m, w - FIRST_CELL_FROM_RIGHT, y), [BottomMsg::Desktop(0)], "{width}");
@@ -1273,7 +1113,6 @@ mod tests {
         }
     }
 
-    /// An arrow with nowhere to go does nothing, and says so by its ink.
     #[test]
     fn an_arrow_with_nowhere_to_go_is_deaf() {
         let (f, theme) = (font(), Theme::light());
@@ -1295,8 +1134,6 @@ mod tests {
         }
     }
 
-    /// Every colour the bar draws a state in, read off the tree: the dots, the focused face,
-    /// show-desktop lit, and the current cell.
     #[test]
     fn the_bar_draws_each_state_in_its_colour() {
         let theme = Theme::light();
@@ -1308,9 +1145,7 @@ mod tests {
                 fills(c, out);
             }
         }
-        // **The task's own element, found by its key** — not the whole bar, whose current desktop
-        // cell draws in the accent too and hid a focused dot of any colour (PR #314 review,
-        // blocking 3).
+        // Found by key: the current-desktop cell draws in the accent too.
         fn keyed<M>(e: &Element<M>, key: u64) -> Option<&Element<M>> {
             if e.key == Some(key) {
                 return Some(e);
@@ -1346,8 +1181,6 @@ mod tests {
         assert!(lit.contains(&soft) && quiet.contains(&theme.face_hover));
     }
 
-    /// The bar keeps diffing as windows come and go, focus moves and the pointer lights things —
-    /// a shape `diff` refuses is a bar that stops drawing.
     #[test]
     fn the_bottom_bar_diffs_as_its_windows_change() {
         let (f, theme) = (font(), Theme::light());
@@ -1369,8 +1202,7 @@ mod tests {
         }
     }
 
-    /// The arrows are characters, and a character the shipped face does not carry draws as
-    /// nothing with nothing reported — the reason `libui` pins its menu mark the same way.
+    /// An arrow the shipped face lacks draws as nothing, with nothing reported.
     #[test]
     fn the_arrows_exist_in_the_shipped_face() {
         let f = font();

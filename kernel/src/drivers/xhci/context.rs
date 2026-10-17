@@ -133,7 +133,7 @@ fn endpoint0(ctx: &mut [u8], l: Layout, ring: u64, cycle: bool, max_packet: u16)
 /// Endpoint type 7, Interrupt IN, in dword 1 bits 5:3.
 const EP_TYPE_INTERRUPT_IN: u32 = 7 << 3;
 
-/// **An interrupt-IN endpoint to configure** (Phase 6 Part B.2): its Device Context Index, maximum
+/// **An interrupt-IN endpoint to configure**: its Device Context Index, maximum
 /// packet and burst, interval exponent ([`interval`]), and transfer ring with its cycle state.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Interrupt {
@@ -171,7 +171,7 @@ const EP_TYPE_BULK_IN: u32 = 6 << 3;
 /// A bulk endpoint's Average TRB Length: 3 KiB, which xHCI 1.2 §4.14.1.1 suggests for bulk.
 const BULK_AVERAGE_TRB: u32 = 3072;
 
-/// **A bulk endpoint to configure** (Phase 6 Part D.2): its Device Context Index, direction,
+/// **A bulk endpoint to configure**: its Device Context Index, direction,
 /// maximum packet and SuperSpeed burst, and transfer ring with its cycle state.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Bulk {
@@ -184,13 +184,12 @@ pub struct Bulk {
     pub cycle: bool,
 }
 
-/// **The input context for Configure Endpoint** (Phase 6 Part B.2): the slot — its speed, its root
-/// port, and its context entries raised to the highest endpoint's index — and each endpoint in
-/// `endpoints` added as *Interrupt IN*, with three retries, its maximum packet and burst, its
-/// interval, its ring, its Max ESIT Payload, and an Average TRB Length of the TRB each is given,
-/// its maximum packet. **And each in `bulks` added as Bulk IN or OUT** (Part D.2): three retries,
-/// its maximum packet and burst, no streams, its ring, and the average TRB length bulk is given.
-/// `ctx` must be `input_len` bytes, zeroed.
+/// **The input context for Configure Endpoint**: the slot — its speed, its root port, and its
+/// context entries raised to the highest endpoint's index — and each endpoint in `endpoints` added
+/// as *Interrupt IN* (three retries, maximum packet and burst, interval, ring, Max ESIT Payload,
+/// and an Average TRB Length of its maximum packet), and each in `bulks` as Bulk IN or OUT (three
+/// retries, maximum packet and burst, no streams, ring, bulk's average TRB length). `ctx` must be
+/// `input_len` bytes, zeroed.
 pub fn configure_endpoints(ctx: &mut [u8], l: Layout, port: u8, speed_id: u8, endpoints: &[Interrupt], bulks: &[Bulk]) {
     let mut add = ADD_SLOT;
     let mut entries = 1u32;
@@ -229,8 +228,7 @@ mod tests {
         u32::from_le_bytes(ctx[off..off + 4].try_into().unwrap())
     }
 
-    /// **The same Address Device context at both entry sizes**, each field where the specification
-    /// puts it: the slot at entry 1, the default endpoint at entry 2.
+    /// **The same Address Device context at both entry sizes**, each field where the spec puts it.
     #[test]
     fn address_device_lays_out_the_slot_and_ep0_at_either_size() {
         for (csz, entry) in [(false, 32), (true, 64)] {
@@ -252,7 +250,6 @@ mod tests {
         }
     }
 
-    /// Evaluate Context names the default endpoint alone, and leaves the slot entry empty.
     #[test]
     fn evaluate_names_only_the_default_endpoint() {
         let l = Layout::new(false);
@@ -264,9 +261,8 @@ mod tests {
         assert_eq!(dword(&ctx, 64 + 8), 0x8000, "cycle state 0");
     }
 
-    /// **Bulk endpoints beside an interrupt one** (Phase 6 Part D.2): each where its index puts it,
-    /// typed IN or OUT, with its burst and maximum packet, no streams, its ring and cycle state,
-    /// and bulk's average TRB length; the slot's entries raised to the highest index.
+    /// **Bulk endpoints beside an interrupt one**: each typed IN or OUT where its index puts it,
+    /// the slot's entries raised to the highest index.
     #[test]
     fn bulk_endpoints_are_typed_by_direction_beside_an_interrupt_one() {
         let l = Layout::new(false);
@@ -334,9 +330,8 @@ mod tests {
     }
 
     /// **A Max ESIT Payload past sixteen bits takes the high byte** of the endpoint's first word,
-    /// bits 31:24 (xHCI 1.2 §6.2.3). No interrupt endpoint a descriptor describes reaches it — 2047
-    /// bytes sixteen times is under 32 KiB — so this pins the field's encoding, which the other
-    /// test's eight bytes cannot (PR #358 review).
+    /// bits 31:24 (xHCI 1.2 §6.2.3). No descriptor's interrupt endpoint reaches it, so this pins
+    /// the field's encoding.
     #[test]
     fn a_max_esit_payload_past_sixteen_bits_takes_the_high_byte() {
         let l = Layout::new(false);

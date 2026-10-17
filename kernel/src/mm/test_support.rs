@@ -1,16 +1,5 @@
-//! Host-test helpers for the memory-management subsystem.
-//!
-//! Compiled only under `cfg(test)`. The key helper is
-//! [`init_global_heap`], which boots the production `BUDDY` /
-//! `SLAB_CACHES` statics against a leaked host allocation, so that
-//! `kmalloc` / `kfree` — and the `libkern` containers layered on them —
-//! can be exercised by `cargo test`.
-//!
-//! This deliberately drives the *global* allocator path. The buddy
-//! module's own `FakeMem` and the slab module's copy of it build *local*
-//! allocators instead, to keep those modules' tests hermetic; the
-//! `libkern` containers have no allocator-injection seam, so they need
-//! the real statics to be live.
+//! Host-test helpers (`cfg(test)`): [`init_global_heap`] boots the production `BUDDY` /
+//! `SLAB_CACHES` statics for the `libkern` containers, which have no allocator-injection seam.
 
 use std::sync::Once;
 
@@ -21,21 +10,13 @@ use crate::mm::{PAGE_SIZE, PhysAddr, heap, slab};
 
 static HEAP_INIT: Once = Once::new();
 
-/// Boot the global buddy and slab allocators once, against a leaked
-/// 16 MiB host buffer.
-///
-/// Idempotent and thread-safe: every test may call it unconditionally.
-/// The heap is initialised exactly once and then shared — it is
-/// internally locked, exactly as on the real kernel, so parallel tests
-/// allocating against it is sound. The HHDM offset is `0` because the
-/// fake "physical" addresses are real host addresses.
+/// Boot the global buddy and slab allocators once, against a leaked 16 MiB host buffer. Idempotent
+/// and thread-safe; the HHDM offset is `0` because fake physical addresses are host addresses.
 pub fn init_global_heap() {
     HEAP_INIT.call_once(|| {
         const HEAP_BYTES: usize = 16 * 1024 * 1024;
 
-        // Leak a page-aligned backing region that outlives the test
-        // process; the buddy hands frames out of it for the run's
-        // lifetime. The extra two pages give slack for alignment.
+        // Leaked page-aligned backing region; two spare pages for alignment.
         let backing: &'static mut [u8] = vec![0u8; HEAP_BYTES + 2 * PAGE_SIZE].leak();
         let base = backing.as_mut_ptr() as usize;
         let aligned = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -54,12 +35,8 @@ pub fn init_global_heap() {
         unsafe { heap::init_buddy(response, 0) };
         slab::slab_init();
 
-        // Initialise the kernel-half PML4 template from a fresh,
-        // all-zero frame: tests don't exercise kernel-half mappings,
-        // they just need `AddressSpace::new()`'s
-        // `inherit_kernel_mappings` call not to panic. The 8 KiB
-        // leaked allocation gives us a page-aligned base regardless
-        // of what the host allocator returned for `vec`.
+        // All-zero template so `AddressSpace::new`'s `inherit_kernel_mappings` does not panic; the
+        // 8 KiB allocation guarantees a page-aligned base.
         let template_backing: &'static mut [u8] = vec![0u8; 2 * PAGE_SIZE].leak();
         let raw = template_backing.as_mut_ptr() as usize;
         let aligned = (raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);

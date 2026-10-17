@@ -1,25 +1,8 @@
-//! `init` — PID 1 (bootstrapping form, Phase 2 slice 4 Part 5).
-//!
-//! The kernel loads init as the first userspace process (`run_first_userspace`),
-//! handing it a notification channel (`rdi`) and a full-rights root namespace
-//! (`rsi`) carrying the boot kernel-server bindings (`/initramfs`, `/dev/entropy`,
-//! `/proc/self/*`). init:
-//!
-//! 1. reports the handle set it received;
-//! 2. reads + parses `/initramfs/etc/init.toml` and **processes its mounts** in
-//!    dependency order — for each, resolving the device, spawning an
-//!    `fs-server-ext4`, handing it the device, awaiting `Meta::Ready`, and
-//!    `sys_ns_bind`ing its forwarding endpoint at the mount point (the Resource
-//!    Server Startup Protocol); then reads `/system/current-generation` through the
-//!    freshly-mounted root (the slice-7 milestone — the whole stack end to end);
-//! 3. binds the profile server at `/bin`;
-//! 4. spawns `service-mgr`, handing it a root handle with init's own rights and the root
-//!    filesystem's and profile server's endpoints — **`service-mgr` starts the system's servers**
-//!    since administration Part E.1a, which init did before;
-//! 5. enters the reaping loop, which also answers the terminal channel to `service-mgr`.
-//!
-//! Per `userspace/init/CLAUDE.md`, init uses `libkern` + `alloc` only and never
-//! `panic!`s in normal operation.
+//! `init` — PID 1. The kernel hands it a notification channel (`rdi`), a full-rights root
+//! namespace (`rsi`) with the boot kernel-server bindings, and the system-control object (`rdx`).
+//! It processes `/initramfs/etc/init.toml`'s mounts in dependency order, binds the profile server
+//! at `/bin`, spawns `service-mgr` (which starts every other server), then reaps orphans and
+//! answers the terminal channel. It never `panic!`s in normal operation (see its `CLAUDE.md`).
 
 #![no_std]
 #![no_main]
@@ -34,76 +17,54 @@ use libkern::debug::Line;
 use libkern::*;
 use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
 
-// The freeing userspace heap (slice 4). Replaces init's former fixed bump arena,
-// which never freed — fine for init's one-shot bootstrap, but init is now the first
-// consumer of the real allocator (`docs/architecture/libheap.md`).
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// One page; init.toml is assumed to fit (true for the bootstrapping manifest).
 const PAGE: u64 = 4096;
 
-/// Bounded wait for an fs-server's Ready (the CLAUDE.md mount timeout): init must
-/// not wait forever for a server that never reports up.
+/// Bounded wait for an fs-server's Ready: init must not wait forever for a server.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 
-/// The notification channel and the terminal channel: what [`reap_loop`] waits on. Other
-/// callers use the first slot with a count of one.
+/// The notification and terminal channels, what [`reap_loop`] waits on; others use slot 0.
 static mut WAIT_HANDLES: [u64; 2] = [0; 2];
 static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 static mut NOTIF: Notification = Notification::zeroed();
 
-/// Control-channel endpoints for an fs-server handshake (init keeps `[0]`, the
-/// server gets `[1]`). Reused across mounts (processed one at a time).
+/// Control-channel endpoints of an fs-server handshake: init keeps `[0]`, the server gets `[1]`.
 static mut CTRL0: u64 = 0;
 static mut CTRL1: u64 = 0;
 
-/// The root fs-server's forwarding endpoint, retained after the `/` mount so init
-/// can hand it to service-mgr (→ session-mgr binds it as each login's `/home`
-/// subtree, sharing the one registration — Part B.2). `0` until the root is mounted.
+/// The root fs-server's endpoint, kept after the `/` mount for service-mgr, which hands it on for
+/// each login's `/home`. `0` until mounted.
 static mut FS_ENDPOINT: u64 = 0;
-/// The profile server's forwarding endpoint, retained after the `/bin` bind so init can
-/// hand it to service-mgr (→ session-mgr binds it as each login's `/bin`, sharing the one
-/// registration exactly as `/home` shares the fs-server's). `0` until `/bin` is bound.
-///
-/// A session cannot reach the store any other way. A `UserspaceServer` binding resolves to
-/// a kernel registration record, not to the endpoint, so a process holding a LOOKUP-only
-/// root namespace can *use* `/bin` but can never obtain the thing needed to bind it
-/// elsewhere. Retaining it here is what makes the projection delegable at all.
+/// The profile server's endpoint, kept after the `/bin` bind for service-mgr (→ session-mgr). `0`
+/// until bound. A `UserspaceServer` binding resolves to a registration record, not the endpoint,
+/// so a session with a LOOKUP-only root could never obtain what binds `/bin` elsewhere.
 static mut PROFILE_ENDPOINT: u64 = 0;
-/// **The terminal channel** to `service-mgr` (administration Part E.1): the handoff channel,
-/// kept open once its three handoffs are sent. `service-mgr` asks for the emergency shell on it
-/// when a critical server does not come up at boot, and its closing is how `init` learns that
-/// `service-mgr` has gone. `0` while there is none.
+/// **The terminal channel** to `service-mgr`: the handoff channel, kept open. `0` while none.
 static mut TERMINAL: u64 = 0;
 
-/// The system-control object (administration Part E.3), or 0 without one: the handle
-/// `sys_power` takes, which E.4's shutdown uses as its last step.
+/// The system-control object, or 0 without one: what `sys_power` takes at a shutdown's last step.
 static mut SYSTEM_CONTROL: u64 = 0;
 
-/// **`init`'s own mounts**, in the order they were made, each with its server's control channel:
-/// kept since administration Part E.4, for a shutdown's last filesystem step ([`finish`]). A
-/// server's control channel used to be closed as soon as its `Meta::Ready` came.
+/// **`init`'s own mounts**, in the order made, each with its server's control channel ([`finish`]).
 static mut KEPT: Vec<Kept> = Vec::new();
 
-/// How long a filesystem server may take to answer `Meta::Unmount` at shutdown. Its write-back
-/// came first, in `sys_ns_sync`, so what is left is one superblock write.
+/// How long a filesystem server may take to answer `Meta::Unmount`: its write-back came first, so
+/// what is left is one superblock write.
 const UNMOUNT_TIMEOUT_NS: u64 = 10_000_000_000;
 
-/// A mount `init` made: where, and the control channel its server takes `Meta::Unmount` on.
 struct Kept {
     mount_point: String,
     control: u64,
 }
 /// The size of an `IpcMsg`: a 24-byte header, then the payload.
 const IPC_MSG_LEN: usize = 4096;
-/// One IPC message + transferred-handle scratch for the setup send / Ready recv.
 static mut IPC_MSG: [u8; IPC_MSG_LEN] = [0; IPC_MSG_LEN];
 static mut IPC_HANDLES: [u64; init::ready::IPC_HANDLE_MAX] = [0; init::ready::IPC_HANDLE_MAX];
 static mut IPC_COUNT: usize = 0;
-/// Spawn args for an `fs-server-ext4`: one moved handle — the control channel — in
-/// `handles[0]` (delivered to the child in `rdx`); it inherits a LOOKUP-only handle
-/// to init's root namespace (it resolves nothing — it gets the device by IPC).
+/// Spawn args for an `fs-server-ext4`: the control channel in `handles[0]` (`rdx`), a LOOKUP root.
 static mut SPAWN_FS: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/fs-server-ext4
     handle_count: 1,
@@ -114,12 +75,7 @@ static mut SPAWN_FS: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
-/// Spawn args for the system `profile-server` (slice: store + profiles): one moved
-/// handle — the control channel — in `handles[0]` (delivered in `rdx`); it inherits a
-/// LOOKUP-only handle to init's root namespace. Unlike an fs-server it gets **no**
-/// device by IPC: it uses its inherited namespace to read its manifest from
-/// `/initramfs/...` and to resolve packages under `/store/...`, then re-exports the
-/// resolved store handle as the reply to a forwarded `/bin/...` resolve.
+/// Spawn args for the system `profile-server`: the control channel in `handles[0]`, a LOOKUP root.
 static mut SPAWN_PROFILE: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/profile-server
     handle_count: 1,
@@ -130,10 +86,7 @@ static mut SPAWN_PROFILE: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
-/// Spawn args for the interactive emergency shell `eshell` (slice 9): no handles,
-/// inherit a LOOKUP-only handle to init's root namespace (so it resolves
-/// `/dev/console` for input and `/dev/blk/*` for `lsblk`). It runs as the
-/// persistent interactive console.
+/// Spawn args for `eshell`: no handles, a LOOKUP-only root (for `/dev/console`, `/dev/blk/*`).
 static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/eshell
     handle_count: 0,
@@ -144,19 +97,10 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // the recovery shell needs no ambient capabilities
 };
-/// Spawn args for the service manager (the normal handoff). It inherits a LOOKUP-only
-/// handle to init's root namespace and holds `BIND_NAMESPACE` — its defining
-/// supervisor capability (registering service endpoints, re-delegating to
-/// session-mgr) — and `SYSTEM_CLOCK`, which it holds only to pass on to the view broker, whose
-/// `clock` grant is that capability at a program's spawn (administration Part E.5). See
-/// `docs/architecture/service-manager.md` § Capability posture. The
-/// bind-righted root it binds the servers with — the second gate — is sent down the
-/// handoff channel rather than inherited (administration Part E.1a).
-/// `handles[0]` is that **handoff channel** end, moved to service-mgr, over which init sends
-/// the root handle, then the fs-server and profile-server forwarding endpoints, in that
-/// order. It carries `TRANSFER` so those endpoints can be handed onward, and
-/// `SEND`/`RECV`/`WAIT` so the channel itself works; init keeps its own end as the
-/// **terminal channel**. Spawned in **both** boots.
+/// Spawn args for the service manager: a LOOKUP-only root, `BIND_NAMESPACE` (its supervisor
+/// capability) and `SYSTEM_CLOCK` (only to pass to the view broker). `handles[0]` is the **handoff
+/// channel** end: init sends the bind-righted root, then the fs-server and profile-server
+/// endpoints, so it carries `TRANSFER`, to hand those on, and `SEND`/`RECV`/`WAIT`.
 static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /bin/service-mgr
     handle_count: 1,
@@ -168,8 +112,8 @@ static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
     syscaps: SYSCAP_BIND_NAMESPACE | SYSCAP_SYSTEM_CLOCK,
 };
 
-/// Resolve `path` in namespace `ns` requesting `rights`, wait the PO, and return
-/// `(status, resolved_handle)` (`IoResult`: status at bytes 8..12, handle 16..24).
+/// Resolve `path` in `ns` requesting `rights` and wait the PO: `(status, resolved_handle)`, from
+/// the `IoResult`'s bytes 8..12 and 16..24.
 fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     // SAFETY: valid path pointer + namespace handle.
     let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
@@ -206,11 +150,8 @@ fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     (status, resolved)
 }
 
-/// Resolve a program `path` to its ELF `MemoryObject` (via the namespace, MAP_READ),
-/// stamp the handle into `args.image`, spawn, and close init's handle to the image
-/// (the kernel copies the ELF during spawn). Returns the child process handle, or a
-/// negative error (`-1` if the image can't be resolved). This is the path-based spawn
-/// that replaced the kernel-embedded `ImageId` selector.
+/// Resolve a program `path` to its ELF `MemoryObject`, stamp it into `args.image`, spawn, and close
+/// the image, which the kernel has copied. Returns the child's handle, or a negative error.
 ///
 /// # Safety
 /// `args` must point to a valid, writable `SpawnArgs` (its `image` field is overwritten).
@@ -222,26 +163,21 @@ unsafe fn spawn_program(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> i64 
     }
     // SAFETY: caller guarantees `args` is a valid writable SpawnArgs.
     unsafe { (*args).image = img };
-    // SAFETY: `args` is the SpawnArgs the caller guarantees valid, with its image stamped by the line above
+    // SAFETY: `args` is the SpawnArgs the caller guarantees valid, with its image stamped above
     let h = unsafe { syscall1(SYS_PROCESS_SPAWN, args as u64) };
     // SAFETY: closing our own handle to the image object (the child has its own copy).
     unsafe { syscall1(SYS_HANDLE_CLOSE, img) };
     h
 }
 
-/// Read + parse `/initramfs/etc/init.toml`, log the topo-sorted mount plan, and
-/// return the mounts (shallowest-first) for [`mount_all`] to process. `None` on any
-/// failure (missing / unmappable / malformed manifest) — init would drop to the
-/// emergency shell (slice 9); for now it logs and skips mounting.
+/// Read and parse `/initramfs/etc/init.toml`, logging the mount plan; `None` on any failure.
 fn read_manifest(root_ns: u64) -> Option<Manifest> {
     let (st, mem) = ns_lookup_wait(root_ns, b"/initramfs/etc/init.toml", RIGHT_MAP_READ);
     if st != 0 || mem == 0 {
         kprint(b"init: /initramfs/etc/init.toml not found (would drop to eshell)\n");
         return None;
     }
-    // Map the read-only MemoryObject the initramfs server handed back. init.toml
-    // is text and fits in one page; the server zero-fills the tail, so we trim
-    // trailing NULs to recover the exact file content.
+    // init.toml fits in one page; the server zero-fills the tail, so trailing NULs are trimmed.
     // SAFETY: `mem` is a MemoryObject handle with MAP_READ.
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
     if addr < 0 {
@@ -307,15 +243,10 @@ fn read_manifest(root_ns: u64) -> Option<Manifest> {
     result
 }
 
-/// Process the manifest: every mount in order (shallowest first), then every bind over them.
-/// Returns `true` iff all succeeded. A failure is critical-path — the mounts are all
-/// `required_for = boot`, and a bind that silently did not happen is how a later lookup fails
-/// for a reason nobody can see — and routes init to the emergency shell.
-///
-/// **Every mount's forwarding endpoint is held until the binds are done**, since a bind's
-/// source may be any mount. Then the root's is kept (handed on to `service-mgr`, which gives
-/// it to `session-mgr` for each login's `/home`) and the rest are closed — each binding took
-/// its own reference.
+/// Process the manifest: every mount shallowest first, then every bind; `true` iff all succeeded. A
+/// failure is critical-path: a bind that silently did not happen is how a later lookup fails for a
+/// reason nobody can see. **Every mount's endpoint is held until the binds are done**, as a bind's
+/// source may be any mount; then the root's is kept for `service-mgr` and the rest closed.
 fn mount_all(root_ns: u64, manifest: &Manifest) -> bool {
     let mut ok = true;
     let mut endpoints: Vec<(&str, u64)> = Vec::new();
@@ -346,13 +277,10 @@ fn mount_all(root_ns: u64, manifest: &Manifest) -> bool {
     ok
 }
 
-/// Bind one `[[bind]]`: the source mount's forwarding endpoint again at `b.path`, scoped to
-/// `b.subtree`. The kernel shares the source's server registration across both names rather
-/// than minting a rival that would take its replies — the same thing `session-mgr` does for
-/// each login's `/home`. Returns `true` on success.
+/// Bind one `[[bind]]`: the source mount's endpoint again at `b.path`, scoped to `b.subtree`. The
+/// kernel shares the source's server registration across both names rather than minting a rival.
 fn bind_one(root_ns: u64, b: &BindSpec, endpoints: &[(&str, u64)]) -> bool {
-    // The parser checked the source names a mount; it is absent here only if that mount failed,
-    // which `mount_all` has already reported.
+    // The parser checked the source names a mount; it is absent only if that mount failed.
     let Some(&(_, endpoint)) = endpoints.iter().find(|(point, _)| *point == b.source) else {
         return false;
     };
@@ -385,17 +313,13 @@ fn bind_one(root_ns: u64, b: &BindSpec, endpoints: &[(&str, u64)]) -> bool {
     true
 }
 
-/// Mount one `[[mount]]`: the Resource Server Startup Protocol from init's side.
-/// Returns the server's forwarding endpoint on success (the fs-server is bound at
-/// `m.mount_point`); the caller owns it.
+/// Mount one `[[mount]]`: the Resource Server Startup Protocol from init's side. Returns the
+/// server's endpoint, bound at `m.mount_point`; the caller owns it.
 fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
-    // Only `fs-server-ext4` exists in slice 7.
     if m.fs_server != "fs-server-ext4" {
         Line::new().s(b"init: unknown fs_server '").s(m.fs_server.as_bytes()).s(b"'").end();
         return None;
     }
-    // 1. Resolve the block-device handle: READ (for the server's `sys_io_submit`)
-    //    + TRANSFER (to hand it to the server).
     let dev_path = match manifest::device_ns_path(&m.device) {
         Some(p) => p,
         None => {
@@ -403,8 +327,8 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
             return None;
         }
     };
-    // READ+WRITE (the RW fs-server writes filesystem metadata) + TRANSFER (hand it to the
-    // server) + DUPLICATE (the server hands a copy to the kernel for the Model A data path).
+    // READ+WRITE (the RW server writes metadata) + TRANSFER (to hand it over) + DUPLICATE (the
+    // server hands the kernel a copy for the data path).
     let (st, device) =
         ns_lookup_wait(root_ns, dev_path.as_bytes(), RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER | RIGHT_DUPLICATE);
     if st != 0 || device == 0 {
@@ -412,7 +336,6 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
         return None;
     }
 
-    // 2. Create the control channel (init keeps end 0, the server gets end 1).
     // SAFETY: CTRL0/CTRL1 are valid writable out-params.
     let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0) };
     if cr != 0 {
@@ -423,7 +346,6 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
-    // 3. Spawn the fs-server, moving the control endpoint into it (delivered in rdx).
     // SAFETY: SPAWN_FS is a valid writable arg block; spawn_program resolves the ELF
     // image from the initramfs, stamps it, spawns, and closes the image handle.
     let fs_h = unsafe {
@@ -441,8 +363,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
         return None;
     }
 
-    // 4. Setup message: transfer the device handle to the server, with one flags byte — read-only
-    //    for a `"ro"` mount (administration Part C.3). NoBlock — the control ring is empty.
+    // Setup message: the device and a flags byte (read-only for `"ro"`); NoBlock, ring empty.
     // SAFETY: IPC_MSG/IPC_HANDLES are valid buffers; transferring one handle.
     let sr = unsafe {
         IPC_MSG[4..8].copy_from_slice(&1u32.to_le_bytes());
@@ -459,7 +380,6 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
     };
     if sr != 0 {
         kprint(b"init: device handoff FAIL\n");
-        // The device handle was not moved (send failed) — close it + the rest.
         // SAFETY: closing our own handles; the failed send did not move the device
         unsafe {
             syscall1(SYS_HANDLE_CLOSE, device);
@@ -467,9 +387,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
         }
         return None;
     }
-    // The device handle has moved to the server; init no longer owns it.
 
-    // 5. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
     let who: [&[u8]; 4] = [b"fs-server-ext4 for ", m.mount_point.as_bytes(), b" on ", m.device.as_bytes()];
     let endpoint = match wait_ready(ctrl_init, &who) {
         Some(e) => e,
@@ -479,13 +397,9 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
             return None;
         }
     };
-    // The handshake is done. **The control channel is kept** (administration Part E.4), once the
-    // mount is made: a shutdown's `Meta::Unmount` goes down it, last mount first ([`finish`]).
+    // The control channel is kept for a shutdown's `Meta::Unmount` ([`finish`]).
 
-    // 6. Bind the forwarding endpoint at the mount point. The kernel sees an
-    //    IpcChannel and adopts it as a Userspace Server (slice-7 forwarding). The
-    //    binding takes its own reference; the endpoint goes back to `mount_all`, which
-    //    may bind it again for a `[[bind]]` before closing it or handing it on.
+    // Bind the endpoint at the mount point; `mount_all` may bind it again for a `[[bind]]`.
     // SAFETY: valid namespace handle + path pointer + endpoint handle.
     let br =
         unsafe { syscall4(SYS_NS_BIND, root_ns, m.mount_point.as_ptr() as u64, m.mount_point.len() as u64, endpoint) };
@@ -512,14 +426,9 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> Option<u64> {
 }
 
 /// Wait (bounded) for a resource server's `Meta::Ready` on `ctrl` and return the endpoint it
-/// transfers (`handles[0]`). `None` if there is none — and then **init has already said why**,
-/// naming the server as the `who` pieces spell it.
-///
-/// The message is parsed by [`init::ready`] (hand-parsed, host-tested). The four ways a
-/// handshake fails are four different problems on a machine nobody can attach a debugger to, and
-/// until Phase 5 every caller printed the same `Ready timeout/invalid` for all of them: the server
-/// took too long, it exited first, it sent something else, or it **refused** — a server that
-/// cannot serve what it was given says so in place of the Ready, and its reason is printed here.
+/// transfers. `None` if there is none — and then **init has already said why**, naming the server
+/// as the `who` pieces spell it: the four failures (too slow, exited first, sent something else,
+/// **refused** with a reason) are four problems on a machine nobody can attach a debugger to.
 fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
     let say = |what: &[u8]| {
         let mut line = Line::new();
@@ -531,7 +440,6 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
         line
     };
 
-    // Absolute deadline = now + READY_TIMEOUT_NS (monotonic clock).
     let mut now: u64 = 0;
     // SAFETY: `&now` is a valid writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
@@ -588,7 +496,6 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
     }
     match first {
         init::ready::First::Ready => return Some(handles[0]),
-        // A reason crossed the wire, so it is printed as one; `Line` marks it if it is cut.
         init::ready::First::Refused(reason) if !reason.is_empty() => say(b" refused: ").untrusted(reason).end(),
         init::ready::First::Refused(_) => say(b" refused, giving no reason init could read").end(),
         init::ready::First::Unexpected => say(b" sent something other than a Ready").end(),
@@ -596,15 +503,10 @@ fn wait_ready(ctrl: u64, who: &[&[u8]]) -> Option<u64> {
     None
 }
 
-/// Spawn the system profile server and bind its forwarding endpoint at `/bin`. This is
-/// the Resource Server Startup Protocol from init's side (mirrors [`mount_one`]) minus
-/// the device handoff: the profile server needs no device — it resolves its manifest
-/// and the store through the LOOKUP-only root namespace it inherits, and answers
-/// forwarded `/bin/<prog>` resolves by re-exporting the matching `/store/.../bin/<prog>`
-/// handle. Returns `true` once bound at `/bin`. A failure is critical-path: without
-/// `/bin`, no program resolves for the services init is about to launch.
+/// Spawn the system profile server and bind its endpoint at `/bin`: [`mount_one`] minus the device.
+/// It answers forwarded `/bin/<prog>` resolves with the matching `/store/.../bin/<prog>` handle.
+/// A failure is critical-path: without `/bin`, no program resolves for the services.
 fn bind_profile_server(root_ns: u64) -> bool {
-    // 1. Create the control channel (init keeps end 0, the server gets end 1).
     // SAFETY: CTRL0/CTRL1 are valid writable out-params.
     let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0) };
     if cr != 0 {
@@ -613,8 +515,6 @@ fn bind_profile_server(root_ns: u64) -> bool {
     // SAFETY: `sys_channel_create` just wrote both endpoints; init is single-threaded.
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
-    // 2. Spawn the profile server, moving the control endpoint into it (in rdx). No
-    //    setup message follows — it uses its inherited namespace, not a handed device.
     // SAFETY: SPAWN_PROFILE is a valid writable arg block; spawn_program resolves the
     // ELF image from the initramfs, stamps it, spawns, and closes the image handle.
     let ps_h = unsafe {
@@ -631,7 +531,6 @@ fn bind_profile_server(root_ns: u64) -> bool {
         return false;
     }
 
-    // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
     let endpoint = match wait_ready(ctrl_init, &[b"profile-server".as_slice()]) {
         Some(e) => e,
         None => {
@@ -640,17 +539,12 @@ fn bind_profile_server(root_ns: u64) -> bool {
             return false;
         }
     };
-    // The handshake is done; the control channel is no longer needed.
     // SAFETY: closing our own control endpoint.
     unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
 
-    // 4. Keep a second handle to the endpoint *before* binding, for service-mgr to carry
-    //    down to session-mgr. Duplicating first rather than after means a failure here is
-    //    a failure to bind at all, instead of a bound `/bin` that no session can ever be
-    //    given — the second being much harder to notice.
-    //
-    //    `TRANSFER | DUPLICATE` are the rights the hand-down needs and all it needs: this
-    //    copy is carried and re-bound, never sent on.
+    // Keep a second handle to the endpoint *before* binding, for service-mgr to carry to
+    // session-mgr, so a failure is a failure to bind at all. `TRANSFER | DUPLICATE` is all the
+    // hand-down needs.
     // SAFETY: duplicating our own endpoint handle with attenuated rights.
     let retained = unsafe { syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE) };
     if retained < 0 {
@@ -660,16 +554,10 @@ fn bind_profile_server(root_ns: u64) -> bool {
         return false;
     }
 
-    // 5. Bind the forwarding endpoint at `/bin`. The kernel adopts the IpcChannel as a
-    //    Userspace Server; the binding takes its own reference, so init closes its
-    //    endpoint handle after. The retained duplicate keeps the *same* endpoint alive,
-    //    so a later bind of it shares this registration rather than minting a rival.
-    //
-    // **Scoped to `/bin`, not whole-tree** (M14 Part H). The profile server projects more than
-    // one of a package's directories now, and it tells them apart by the first component of the
-    // suffix — so every bind of it carries a base naming the directory it projects. Unscoped,
-    // `/bin/applications` would forward as a bare `applications` and reach the *applications*
-    // projection, which is an alias nobody asked for.
+    // Bind the endpoint at `/bin`; the retained duplicate keeps the *same* endpoint alive, so a
+    // later bind shares this registration. **Scoped to `/bin`, not whole-tree**: the server tells a
+    // package's projected directories apart by the suffix's first part, so unscoped,
+    // `/bin/applications` would reach the *applications* projection.
     // SAFETY: valid namespace handle, path pointer, endpoint handle and subtree base.
     let br =
         unsafe { syscall6(SYS_NS_BIND, root_ns, b"/bin".as_ptr() as u64, 4, endpoint, b"/bin".as_ptr() as u64, 4) };
@@ -690,16 +578,8 @@ fn bind_profile_server(root_ns: u64) -> bool {
     true
 }
 
-/// The slice-7 milestone: look up `/system/current-generation` through the just-
-/// mounted root fs-server (the kernel forwards the lookup, the server reads the
-/// file and replies a `MemoryObject`), map it, and log its content — proving the
-/// whole stack end to end.
+/// Read and log `/system/current-generation` through the root fs-server: the stack end to end.
 fn read_current_generation(root_ns: u64) {
-    // libos path (the init dogfood for slice 5): borrow the process-owned root
-    // namespace, then `lookup(...).block_on()` + `map()` — replacing the hand-rolled
-    // `ns_lookup_wait` (submit → sys_wait → byte-offset decode → close). The resolved
-    // handle is an owning libos `Handle` that closes itself on drop, so the two manual
-    // `sys_handle_close`s go away.
     // SAFETY: `root_ns` is init's live root namespace, owned for its whole run; a
     // borrowed Handle is a non-owning view and never closes it.
     let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
@@ -724,26 +604,13 @@ fn read_current_generation(root_ns: u64) {
     let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     kprint(b"init: /system/current-generation = ");
     kprint(&bytes[..len]); // the file content ends in '\n'
-    // `mem` drops at end of scope → closes the resolved handle.
 }
 
-/// Spawn the demo `parent`, then reap exited children forever. As PID 1, init is
-/// the eventual parent of every orphan; here its only child is `parent`.
-/// Spawn the interactive emergency shell as the persistent serial console (it runs
-/// forever; init keeps no handle). Launched once the demo chain has exited, so the
-/// shell has the disk and console to itself.
-/// Integration-test build only: report the run's verdict to the `xtask test-qemu`
-/// runner via `SYS_TEST_EXIT` — which, under the kernel's `test-harness` feature,
-/// writes `isa-debug-exit` and terminates QEMU. `ok` selects PASS/FAIL. Modelled as
-/// returning `()` rather than `!`: the syscall does not return in practice, but
-/// letting callers fall through means a missing exit device degrades to a normal
-/// boot instead of a hang. See `docs/conventions/qemu-integration-tests.md`.
-///
-/// **Unconditional, in every build** (retrofit Part C2). `SYS_TEST_EXIT` exists in `libkern`
-/// always and is served only by a kernel built with its own `test-harness` feature; anywhere
-/// else the syscall number is unknown and the call returns `Unsupported`. So a release init
-/// makes one pointless syscall on a path that is already a boot failure, and gains a code
-/// path identical to the tested one. `init` only ever fires **FAIL** — PASS is `boot-probe`'s.
+/// Report the run's verdict to `xtask test-qemu` via `SYS_TEST_EXIT`, which ends QEMU under the
+/// kernel's `test-harness` feature. Returns `()`, not `!`, so a missing exit device degrades to a
+/// normal boot, not a hang. **Unconditional, in every build**: elsewhere it returns `Unsupported`,
+/// on a path that is already a boot failure. `init` only ever fires **FAIL**; PASS is
+/// `boot-probe`'s.
 fn test_exit(ok: bool) {
     let code = if ok { TEST_EXIT_SUCCESS } else { TEST_EXIT_FAILURE };
     kprint(if ok { b"init: test-harness verdict PASS\n" } else { b"init: test-harness verdict FAIL\n" });
@@ -765,18 +632,9 @@ fn spawn_eshell(root_ns: u64) {
     }
 }
 
-/// Spawn the service manager — the normal boot handoff. Returns the process handle, or a negative
-/// error. [`supervise`] closes the handle at once: `service-mgr`'s death, a critical fault init
-/// must observe, is learned from the **terminal channel** closing (administration Part E.1a),
-/// which names it exactly, where a `ChildExited` names only a pid.
-///
-/// **`handles[0]` is a handoff channel, not an endpoint.** It carried the fs-server
-/// endpoint directly until a second endpoint (the profile server's) needed to go the same
-/// way, and only `handles[0]` reaches a child — the kernel seeds `rdx` with it and there
-/// is no register left for `handles[1]`, nor any documented way to learn its handle value.
-/// Rather than invent one, this uses the mechanism the boot chain already uses one link
-/// further down: service-mgr hands *its* children endpoints over a control channel. Adding
-/// a third endpoint later is now one more `send_handle`, not another ABI question.
+/// Spawn the service manager, the normal boot handoff: its process handle, or a negative error.
+/// [`supervise`] closes it at once: the terminal channel closing names its death ([`reap_loop`]).
+/// Only `handles[0]` reaches a child (`rdx`), so the endpoints travel on a channel.
 fn spawn_service_mgr(root_ns: u64) -> i64 {
     kprint(b"init: handing off to service manager\n");
     // **The terminal channel.** Depth 4: three handoffs, queued before `service-mgr` runs — a ring
@@ -800,8 +658,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     };
     if h < 0 {
         kprint(b"init: service-mgr spawn FAIL\n");
-        // Nothing moved (the spawn failed) — close both ends and the endpoints they
-        // were about to carry, so a failed handoff leaks nothing.
+        // A failed spawn moved nothing: close both ends and the endpoints they would have carried.
         // SAFETY: closing our own handles.
         unsafe {
             syscall1(SYS_HANDLE_CLOSE, init_end);
@@ -811,12 +668,9 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         return h;
     }
 
-    // The handoffs, in the order service-mgr receives them (administration Part E.1):
-    //
-    // 1. **The root, with init's own rights**, `BIND` and `UNBIND` among them. A spawned process
-    //    only ever gets a lookup-only root, which is why every server was bound here until now;
-    //    `service-mgr` sits in init's trust tier since E.1, the maintainer's call, and binds them.
-    // 2. The root filesystem's endpoint, and 3. the profile server's, for the login chain.
+    // The handoffs, in the order service-mgr receives them: 1. **the root, with init's own rights**
+    // (`BIND` and `UNBIND`: a spawned process gets only a lookup-only root, and `service-mgr` binds
+    // the servers); 2. the root filesystem's endpoint; 3. the profile server's.
     // SAFETY: duplicating init's own root handle with every right it holds; single-threaded init,
     // and each endpoint moves once — the sends null the statics.
     unsafe {
@@ -829,20 +683,14 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         FS_ENDPOINT = 0;
         send_handle(init_end, PROFILE_ENDPOINT);
         PROFILE_ENDPOINT = 0;
-        // Kept: the terminal channel, for the rest of the boot.
         TERMINAL = init_end;
     }
     h
 }
 
-/// Transfer one `handle` to a child over a handoff channel — an IPC message with a single
-/// moved handle and no payload. On failure the handle did not move, so it is closed here:
-/// a supervisor that drops a server endpoint on the floor keeps the server alive with
-/// nothing able to reach it, which is worse than losing it outright.
-///
-/// A zero `handle` sends **an empty message**, not nothing. The receiver reads the
-/// handoffs positionally, so skipping a send would shift every later one up a slot and
-/// hand service-mgr the profile endpoint where it expects the fs-server's.
+/// Transfer one `handle` over a handoff channel: an IPC message with a single moved handle and no
+/// payload. On failure it did not move, so it is closed here. A zero `handle` sends **an empty
+/// message**, not nothing: the receiver reads the handoffs positionally.
 fn send_handle(ctrl: u64, handle: u64) {
     let count = if handle == 0 { 0 } else { 1 };
     // SAFETY: IPC_MSG/IPC_HANDLES are valid buffers; transferring `count` handles with an
@@ -868,8 +716,7 @@ fn send_handle(ctrl: u64, handle: u64) {
     }
 }
 
-/// Close whichever server endpoints init is still holding for the handoff. Only reached
-/// when the handoff cannot happen at all.
+/// Close whichever server endpoints init still holds for the handoff, when it cannot happen.
 ///
 /// # Safety
 /// Single-threaded init; the statics are init's own handles.
@@ -887,36 +734,11 @@ unsafe fn close_retained_endpoints() {
     }
 }
 
-/// The healthy supervise path. **Normally**, hand off to the service manager: spawn
-/// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
-/// reap_loop drops to the emergency console as the interim recovery, until a reboot
-/// path exists; see `docs/architecture/service-manager.md` § Recovery). **Under
-/// `selftest`**, bring up the login chain (service-mgr → auth-service + session-mgr) and
-/// the Phase-1/2 demo chain (`parent`) **concurrently**, then supervise via [`reap_loop`].
-/// Running them together is deliberate: `parent`'s direct `/dev/blk` reads overlap the
-/// login chain's fs-mediated block I/O (session-mgr/nxsh's forwarded `/home` reads), so
-/// the default test exercises concurrent direct + fs-mediated block I/O across all CPUs —
-/// the scenario that originally surfaced the cross-CPU-wake hang (now fixed by the
-/// reschedule IPI; see the 2026-07-20 decision log). The prior demo→login *sequencing* was
-/// a workaround for that hang and is no longer needed. (This is a concurrency *smoke test*,
-/// not a deterministic catch of that specific timing bug, which only reproduced under
-/// sustained multi-second load.)
-///
-/// **This function's ordering is the argument that the boot verdict is airtight**, so it is
-/// worth stating rather than leaving implicit. The demo chain runs **synchronously** and a
-/// non-zero exit fails the run here; only then is the login chain handed off, and only then
-/// does `service-mgr` start `boot-probe`, which runs the SMP and floating-point gates and
-/// fires the single `SYS_TEST_EXIT(PASS)`. So everything the run adjudicates has already
-/// happened when those gates run. That placement is why `fp_gate` was moved out of the demo
-/// `parent` in the first place — it completed in 2 of 15 KVM runs there, because whoever owns
-/// the verdict races the demo chain — and it survived the verdict moving out of `session-mgr`
-/// (retrofit Part B) only because of the sequencing below.
+/// The healthy supervise path: spawn `service-mgr` and supervise it via [`reap_loop`].
 fn supervise(notif: u64, root_ns: u64) -> ! {
     let service_mgr_h = spawn_service_mgr(root_ns);
     if service_mgr_h <= 0 {
-        // No `service-mgr` is no server at all since E.1, `auth-service` and `logging-service`
-        // among them — the pair this path caught when init started them. The console is free:
-        // nothing that holds it has started.
+        // No `service-mgr` is no server at all (`auth-service`, `logging-service`): console free.
         emergency(notif, root_ns);
     }
     // SAFETY: closing init's reference to the process; it runs independently. Its death is
@@ -925,35 +747,26 @@ fn supervise(notif: u64, root_ns: u64) -> ! {
     reap_loop(notif, root_ns);
 }
 
-/// The **emergency** path: a critical-path boot failure (bad manifest, failed
-/// mount). Drop straight to the interactive shell so the operator can inspect the
-/// broken system (`cat /dev/log`, `mounts`, `lsblk`) — no demo chain, no milestones.
-/// See `userspace/init/CLAUDE.md` § "Failure → eshell".
+/// The **emergency** path: a critical-path boot failure. Drop straight to the interactive shell
+/// so the operator can inspect the broken system (`userspace/init/CLAUDE.md` § Failure → eshell).
 fn emergency(notif: u64, root_ns: u64) -> ! {
     kprint(b"init: critical-path failure -- dropping to emergency shell\n");
-    // A critical-path boot failure is a failed test run. Outside `test-qemu` the verdict
-    // device is absent, the syscall returns `Unsupported`, and the boot carries on to the
-    // emergency shell below — which is what an operator wants on real hardware.
+    // A critical-path boot failure is a failed test run. Outside `test-qemu` the verdict device is
+    // absent, the syscall returns `Unsupported`, and the boot goes on to the shell, as on hardware.
     test_exit(false);
     spawn_eshell(root_ns);
     reap_loop(notif, root_ns);
 }
 
 /// Reap exited children forever (init is the eventual parent of every orphan), and answer the
-/// terminal channel.
+/// terminal channel: `TERMINAL_OP_EMERGENCY` (a critical server did not come up) starts the
+/// emergency shell, once, the console being still free; `TERMINAL_OP_FINISH` runs [`finish`].
 ///
-/// **The terminal channel** (administration Part E.1) carries one request today:
-/// `TERMINAL_OP_EMERGENCY`, sent when a critical server did not come up at boot, or the
-/// declarations have lost their critical servers and nothing was started. The emergency shell is
-/// started then, once; the console is still free, since the critical servers start before the
-/// terminal server.
-///
-/// **Its closing is `service-mgr`'s death**, which is attributed exactly, as a control channel
-/// closing is — `KIND_CHILD_EXITED` names a pid, and nothing maps a handle to one. That death is
-/// **reported, and not answered with a restart**, which `init` did until E.1. Every server path, in
-/// every session, now goes through `service-mgr`'s routes, so its death takes them all; a second
-/// one would start a second copy of every server; and the emergency shell cannot take a console
-/// the terminal server still holds. So the machine needs a restart.
+/// **The channel's closing is `service-mgr`'s death**, attributed exactly (`KIND_CHILD_EXITED`
+/// names a pid, and nothing maps a handle to one). It is **reported, not answered with a restart**:
+/// its death takes every server path with it, a second `service-mgr` would start a second copy of
+/// every server, and the emergency shell cannot take a console the terminal server still holds. The
+/// machine needs a restart.
 fn reap_loop(notif: u64, root_ns: u64) -> ! {
     kprint(b"init: entering reaping loop\n");
     let mut shell_started = false;
@@ -972,7 +785,6 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
         if waited < 1 {
             continue;
         }
-        // Drain every queued notification this wake delivered.
         loop {
             // SAFETY: NOTIF is a valid 64-byte writable out-param.
             let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
@@ -988,8 +800,8 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
                     .s(b"init: reaped pid=")
                     .u(cpid as u64)
                     .s(b" code=")
-                    // `.i`, not `.u`: an exit code is signed, and `-1` widened through
-                    // `as u64` prints 18446744073709551615 (PR #181 review, finding 8).
+                    // `.i`, not `.u`: an exit code is signed; `-1` widened through `as u64` prints
+                    // 18446744073709551615.
                     .i(code as i64)
                     .end();
             }
@@ -997,7 +809,6 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
         if terminal == 0 {
             continue;
         }
-        // The terminal channel: requests, or its closing.
         loop {
             // SAFETY: IPC_MSG/IPC_HANDLES/IPC_COUNT are valid writable out-params.
             let rr = unsafe {
@@ -1058,25 +869,17 @@ fn reap_loop(notif: u64, root_ns: u64) -> ! {
     }
 }
 
-/// **Finish a shutdown** (administration Part E.4). `service-mgr` has asked every session and
-/// service to stop, and says so with `Finish`. What is left is `init`'s own: its mounts, last
-/// first — each written back with `sys_ns_sync`, then told `Meta::Unmount`, on which its server
-/// records the filesystem clean and exits — and then the machine, through `sys_power`.
+/// **Finish a shutdown.** `service-mgr` has asked every session and service to stop. What is left
+/// is `init`'s own: its mounts, last first — each written back with `sys_ns_sync`, then told
+/// `Meta::Unmount`, on which its server records the filesystem clean and exits — and then the
+/// machine, through `sys_power`. Whatever one mount answers, the next is still unmounted, since one
+/// stopped half way leaves every later filesystem not clean; whatever still runs writes after the
+/// sync at its own risk, as at a power cut.
 ///
-/// **Whether or not a file is held**, by the maintainer's call: whatever still runs writes after
-/// the sync at its own risk, as at a power cut, and every filesystem is left clean. And whatever
-/// one mount answers, the next is still unmounted: a shutdown that stopped half way would leave
-/// every later filesystem not clean.
-///
-/// **The sync is the one wait `init` does not bound** (PR #343 review). `sys_ns_sync` returns when
-/// its write IRPs complete, and an interrupt-driven IRP has no force-complete timeout yet, so a
-/// disk that stops completing writes holds the shutdown here and `sys_power` is never reached.
-/// That is `deferred-decisions.md` § *IRP cancellation and the completion timeout*, whose trigger
-/// this is; each `Meta::Unmount` answer is bounded, by `UNMOUNT_TIMEOUT_NS`.
-///
-/// Returns only if the machine cannot be stopped — with no system-control object, or one
-/// `sys_power` refused — after saying so. The filesystems are unmounted by then, so the machine
-/// is as safe to turn off as a halt would have left it.
+/// **The sync is the one wait `init` does not bound**: it waits on write IRPs, and an
+/// interrupt-driven IRP has no force-complete timeout yet (`deferred-decisions.md` § *IRP
+/// cancellation and the completion timeout*); each `Meta::Unmount` answer is bounded by
+/// `UNMOUNT_TIMEOUT_NS`. Returns only if the machine cannot be stopped, after saying so.
 fn finish(root_ns: u64, reboot: bool) {
     kprint(if reboot {
         b"init: finishing the shutdown, to reboot: its own filesystems, last mounted first\n"
@@ -1110,9 +913,7 @@ fn finish(root_ns: u64, reboot: bool) {
         .end();
 }
 
-/// Unmount one of `init`'s mounts at shutdown: every dirty file written back, then
-/// `Meta::Unmount` on its server's control channel, and the answer said. Each step is tried
-/// whatever the one before it did.
+/// Unmount one of `init`'s mounts at shutdown; each step is tried whatever the last did.
 fn unmount_one(root_ns: u64, m: &Kept) {
     let at = m.mount_point.as_bytes();
     // SAFETY: a namespace handle init holds, and a valid path.
@@ -1189,7 +990,6 @@ fn unmount_one(root_ns: u64, m: &Kept) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, m.control) };
 }
 
-/// The monotonic clock, in nanoseconds.
 fn now_ns() -> u64 {
     let mut now: u64 = 0;
     // SAFETY: `&now` is a valid writable u64 out-param.
@@ -1197,7 +997,6 @@ fn now_ns() -> u64 {
     now
 }
 
-/// Wait for `h` to signal, until `deadline`. `true` if it did.
 fn wait_one_until(h: u64, deadline: u64) -> bool {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter, with a deadline. The reaping
     // loop that also uses them is this call's caller, and is not waiting.
@@ -1208,14 +1007,9 @@ fn wait_one_until(h: u64, deadline: u64) -> bool {
     }
 }
 
-/// **Keep the system-control object**, the capability to stop the machine (administration Part
-/// E.3), if `rdx` holds it: a handle to a `SystemControl` with `WRITE`. The kernel makes one and
-/// hands it to init alone, without the rights to give it away, so the process that stops the
-/// machine is this one: a shutdown (administration Part E.4) ends with `sys_power` on it, once
-/// everything else has stopped.
-///
-/// A boot without it goes on, and says so: nothing before the stop needs it, and a shutdown
-/// would reach every step but the last.
+/// **Keep the system-control object**, the capability to stop the machine, if `rdx` holds it: a
+/// `SystemControl` handle with `WRITE`. A boot without it goes on, and says so: only a shutdown's
+/// last step needs it.
 fn keep_system_control(h: u64) {
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
@@ -1230,9 +1024,7 @@ fn keep_system_control(h: u64) {
     }
 }
 
-/// Bootstrap registers: `rdi` = notification channel, `rsi` = root namespace
-/// (full-rights, kernel-bound servers), `rdx` = the system-control object
-/// (administration Part E.3), `rcx` unused (init takes no arg0 from the kernel).
+/// Registers: `rdi` = notification channel, `rsi` = root namespace, `rdx` = system-control object.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, system_control: u64, _arg0: u64) -> ! {
     kprint(b"init: up (pid 1)\n");
@@ -1250,11 +1042,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, system_control: u64, _arg0: u
         .s(b")")
         .end();
 
-    // Read the manifest and process its mounts (spawn fs-servers → Ready → bind). A
-    // missing/invalid manifest or a failed required mount is a **critical-path
-    // failure** → drop to the emergency shell (the operator inspects the broken
-    // system). On success, prove the stack end to end (the slice-7/8 milestones) and
-    // enter the normal supervise path.
     let booted = match read_manifest(root_ns) {
         Some(manifest) => mount_all(root_ns, &manifest),
         None => {
@@ -1267,55 +1054,21 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, system_control: u64, _arg0: u
     }
 
     read_current_generation(root_ns);
-    // The filesystem tests that used to run here — large-file read-through, overwrite,
-    // grow, create — are `boot-probe`'s now (retrofit Part C). They exercise
-    // `fs-server-ext4` through the namespace, which any program with the right bindings can
-    // do, and a failing one there does not take PID 1 with it. They also *gate* the run now,
-    // which they never did here: every failure path was a bare `return` after a `FAIL`
-    // print, so a broken filesystem passed the boot.
 
-    // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
-    // Critical-path: without `/bin`, no program resolves for the services init launches.
     if !bind_profile_server(root_ns) {
         emergency(notif, root_ns);
     }
 
-    // **The servers are `service-mgr`'s to start** (administration Part E.1). `init` used to start
-    // nine here — `auth-service`, `logging-service`, the terminal server, the clipboard, the view
-    // broker, the device manager, the storage service, the input server and the compositor —
-    // and bind each in the root namespace. They are declarations now, started by `service-mgr` in
-    // that order, each `Meta::Ready` awaited before the next, and bound through its registry so a
-    // restart reaches every binding. `init` starts only what it takes to reach `service-mgr`:
-    // its mounts, the profile server at `/bin`, and `service-mgr` itself, which is what
-    // `docs/architecture/service-manager.md` has said since Phase 3.
-    //
-    // Two of them were critical-path here: a boot without `auth-service` or `logging-service`
-    // dropped to the emergency shell. They still are, as `critical` declarations: `service-mgr`
-    // asks for the shell over the terminal channel, and `reap_loop` starts it.
-    //
-    // The display self-test, the GUI terminal and the two test clients used to be spawned
-    // here under `selftest`. They are **service declarations** now (retrofit Part C2), started
-    // by `service-mgr` from `/system/services.toml` on the root — which carries them only in a test
-    // image, so this file is byte-identical in both. Their order is the file's order: `nxterm`
-    // before `ui-testclient`, so that the terminal's window exists by the time `ui-testclient`
-    // raises its reference windows over it. (Creation order was the stacking until
-    // administration C.1 showed it to be a race; the raise is what stacks them now.)
-    //
-    // **And the real answer arrived (M7 Part F, 2026-08-25.)** The comment this file carried
-    // from 2026-08-12 — *"Until Milestone 7 there is nothing to launch `nxterm` from"* — is
-    // answered twice over: retrofit C2 gave the test image a declaration, and `desktop-shell`
-    // now launches a terminal from the applications modal into a namespace it constructed, in
-    // a **release** image, which is what `cargo xtask check-login` boots. The declarations
-    // above stay, and are not a duplicate of that path: they put a terminal and the test
-    // clients on screen *without a login*, which is what lets `check-display` and
-    // `check-terminal` test the display arm without depending on authentication.
+    // **The servers are `service-mgr`'s to start**, as declarations; a `critical` one that does not
+    // come up makes it ask over the terminal channel for the emergency shell, which `reap_loop`
+    // starts. The test image's self-test, terminal and test clients are declarations too, which
+    // `check-display` and `check-terminal` need without a login, so this file is identical in both
+    // images; `nxterm` precedes `ui-testclient`, which raises its windows over the terminal's.
     supervise(notif, root_ns);
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    // init must not panic in normal operation (`userspace/init/CLAUDE.md`); this
-    // is the last-ditch handler. Report and spin (no eshell handoff yet — slice 9+).
     kprint(b"init: PANIC\n");
     loop {
         // SAFETY: `pause` is always valid in ring 3 and has no effects.

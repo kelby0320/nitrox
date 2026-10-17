@@ -1,24 +1,13 @@
-//! `nxedit` — the text editor, minus the syscalls.
+//! `nxedit` — the text editor, minus the syscalls: a function of values, host-tested in
+//! milliseconds. Reading the file, writing it and pumping events are the binary's.
 //!
-//! The split `nxterm` and `nxfiles` use: what an editor *is* — a buffer, a name, whether what
-//! is on screen matches what is on disk, and what happens when a save fails — is a function of
-//! values and host-tests in milliseconds. Reading the file, writing it and pumping events are
-//! the binary's.
+//! **A save that fails keeps the buffer.** [`App::saved`] turns a failure into a *message*,
+//! never a state change: the buffer stays modified and the text where it was. The
+//! write-and-rename that makes the disk half safe is `main`'s.
 //!
-//! ## The two decisions here
-//!
-//! **A save that fails keeps the buffer.** That is the whole of the failure design: an editor
-//! that loses your work quietly is the one thing an editor must never be, so [`App::saved`]
-//! takes a failure and turns it into a *message*, never into a state change. The buffer stays
-//! modified, the text stays exactly where it was, and the person can try again somewhere else.
-//! The write-and-rename that makes the disk half safe is [`main`](../src/main.rs)'s, because it
-//! is syscalls; what is here is the rule that a failure is reported rather than absorbed.
-//!
-//! **A buffer that could not be read refuses to be written.** Opening a path the editor cannot
-//! read shows an empty window, and an empty window saved over a file is that file destroyed —
-//! by an editor that never showed its contents. [`App::blocked`] is what a load failure sets,
-//! and a blocked buffer declines to save with the reason on screen. A *missing* file is not a
-//! failure: opening a path that is not there yet is how a file gets made.
+//! **A buffer that could not be read refuses to be written**: an empty window saved over an
+//! unreadable file destroys it. [`App::blocked`] is what a load failure sets. A *missing* file
+//! is not a failure; it is how a file gets made.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -47,15 +36,10 @@ use libui::widget::{
     status_separator, status_text, tab_strip, text_area, text_field, title_bar, window_frame_with_grip,
 };
 
-/// The status bar's height in pixels — one row of chrome along the window's foot since the
-/// desktop refresh's Part J, where it sat under the title bar.
-///
-/// **The toolkit's since the desktop refresh's Part H**: the strip is `libui`'s `status_bar` now,
-/// so its height is that widget's and a second 24 here would have clamped it.
+/// The status bar's height in pixels: `libui`'s `status_bar`, along the window's foot.
 pub const STATUS_H: u32 = libui::widget::STATUS_BAR_H;
 
-/// What kind of window this is, beside the name of the file in it — the design's
-/// `theme.toml — Text Editor`, as a title and the dim subtitle after it.
+/// What kind of window this is, beside the file's name: a title and a dim subtitle.
 pub const EDITOR_KIND: &str = "Text Editor";
 
 /// The element key on the strip's line-and-column readout.
@@ -86,25 +70,16 @@ pub const AREA_PANE_KEY: u64 = 25;
 
 /// The text style the buffer is drawn in — and so the one anything measuring it must use.
 ///
-/// **One constant, two readers** (desktop refresh, Part J): the view wraps the document in
-/// `mono` and the binary turns a pointer's `x` into a column by measuring with a style. Those
-/// being different faces is a caret that lands further from the pointer the further into the
-/// line it goes, and nothing about the press looks wrong — so the pair is named here and
-/// `the_buffer_is_drawn_in_the_style_the_caret_is_measured_in` pins that the view agrees.
+/// The view draws in it and the binary measures a pointer's `x` with it; different faces put
+/// the caret further off the further into the line it goes.
 pub const BUFFER_STYLE: libui::element::TextStyle =
     libui::element::TextStyle { size: libui::element::TextSize::Body, bold: false, mono: true };
 
-/// The document's own key inside the area's dock — see [`AREA_KEY`].
-///
-/// **Not 40**, which is [`MENU_BAR_KEY`] and the *base* of a range: the first version of this
-/// used it, and `locate` answered with the menu bar — a control at the top of the window
-/// standing in for the document, which is the aliasing `nxfiles` filed a test against in M14
-/// Part D after a listing row lit whichever chrome shared its number.
+/// The document's own key inside the area's dock. Not 40 (`MENU_BAR_KEY`), which `locate` hits.
 pub const AREA_INNER_KEY: u64 = 20;
 /// The document scrollbar's key.
 pub const AREA_BAR_KEY: u64 = 21;
-/// How wide the document's scrollbar is, in pixels. `nxterm`'s number, for one desktop's worth
-/// of muscle memory.
+/// How wide the document's scrollbar is, in pixels.
 pub const SCROLL_W: u32 = 12;
 /// The element key on the save control.
 pub const SAVE_KEY: u64 = 2;
@@ -114,10 +89,7 @@ pub const TITLE_KEY: u64 = 3;
 pub const GRIP_KEY: u64 = 4;
 /// The element key on the status strip.
 ///
-/// **Every docked child needs one**: the diff requires a container's children to be all keyed
-/// or all unkeyed, and one bare sibling makes the whole first frame `MixedKeying` — which in a
-/// client like this one means no window ever appears. See `nxfiles`' `STRIP_KEY`, which carries
-/// the full account of the two errors and their two symptoms.
+/// Every docked child needs a key, or the first frame is `MixedKeying` and no window appears.
 pub const STRIP_KEY: u64 = 5;
 /// The element key on the status text.
 pub const STATUS_KEY: u64 = 6;
@@ -126,45 +98,24 @@ pub const TAB_STRIP_KEY: u64 = 7;
 
 /// Where buffer keys start, and therefore where the tabs' element keys do.
 ///
-/// **Because a tab's key is an element key too.** `Router::hovered_key` walks up to the nearest
-/// keyed ancestor and reports *that* number, across the whole window's tree — so a tab keyed `2`
-/// and the save button keyed `2` are one number, and hovering the tab would draw the button
-/// hovered.
-///
-/// **The top bit, not a large number.** This was `1000`, which is far from the chrome's keys and
-/// not *disjoint* from a list's — a browser keys its rows by index and a directory can hold more
-/// than a thousand entries, so row 1000 and the first tab would have been one number (PR #270
-/// review, optional 6). Setting the high bit makes the two namespaces disjoint by construction,
-/// which is what this doc already claimed.
+/// `Router::hovered_key` reports the nearest keyed ancestor across the whole tree, so a tab
+/// sharing a number with the save button would hover with it. The top bit keeps these disjoint
+/// from a list's row keys by construction.
 pub const TAB_KEY_BASE: u64 = 1 << 63;
 
 /// The element key on the confirmation dialog's title bar.
-///
-/// **A separate window's keys, in the same space.** Keys are per *tree*, and the dialog is a
-/// tree of its own — nothing would break if these repeated the numbers above. They do not,
-/// because a key that appears in two trees is a thing two `hovered ==` comparisons can both
-/// match, and the hover the router reports is already one of the two id spaces that look alike
-/// (M11 Part E batch 3).
 pub const CONFIRM_TITLE_KEY: u64 = 10;
 /// The element key on the dialog's question.
 pub const CONFIRM_TEXT_KEY: u64 = 11;
-/// The element key on the dialog's button strip.
-///
-/// **Unused since `dialog_frame` took the strip** (M12 Part B) — the helper builds it and does
-/// not key it, wrapping both of the dock's children so the caller's keys sit one level down.
-/// Kept because the numbers below are spent and reusing this one would put two meanings on it.
+/// The element key on the dialog's button strip. Unused since `dialog_frame` took the strip;
+/// kept so the number is not reused.
 pub const CONFIRM_STRIP_KEY: u64 = 12;
 /// The element key on the dialog's *discard* button.
 pub const CONFIRM_DISCARD_KEY: u64 = 13;
 /// The element key on the dialog's *keep editing* button.
 pub const CONFIRM_KEEP_KEY: u64 = 14;
 
-/// The confirmation dialog's geometry, **which is `libui`'s** since M12 Part B.
-///
-/// It was published from here for `check-login` to aim at, and `nxfiles` then grew a
-/// confirmation of its own — so the five metrics, the four aim points and the measurable frame
-/// moved down to [`libui::widget`] where both dialogs share one table. What stays here is what
-/// this dialog *says*.
+/// The confirmation dialog's geometry, which is `libui`'s: both dialogs share one table.
 pub use libui::widget::{
     DIALOG_BUTTON_CY as CONFIRM_BUTTON_CY, DIALOG_H as CONFIRM_H, DIALOG_LEFT_CX, DIALOG_RIGHT_CX,
     DIALOG_W as CONFIRM_W,
@@ -173,29 +124,16 @@ pub use libui::widget::{
 /// The window's size in pixels at startup, before any manager places it.
 pub const START_SIZE: Size = Size::new(560, 420);
 
-/// What this window calls the acceptor it declares.
-///
-/// **A name rather than an index**, because it is a port in waiting (M10 decision 2): the same
-/// string is what a command line will address when ports arrive, and an editor that called its
-/// sink `0` would have to be re-specified to be addressed by anything but a pointer.
+/// What this window calls the acceptor it declares: a name a command line can address.
 pub const ACCEPTOR: &str = "document";
 
-/// The key that saves, with Ctrl held: `s`.
-///
-/// **A literal, because `libkern::abi` names only the keys with no character** — the arrows,
-/// Enter, the modifiers. A letter is a keycode the keymap turns into text, and nothing has
-/// needed to name one until a chord did. `31` is `KEY_S` in the Linux set the input stack
-/// speaks (`libinput::keymap`, which maps it to `s`/`S`), and the test below pins it to that
-/// table rather than to this comment.
+/// The key that saves, with Ctrl held: `s`. A literal, since `libkern::abi` names only keys
+/// with no character; a test pins `31` to `libinput::keymap`.
 pub const SAVE_KEYCODE: u16 = 31;
 
-/// The key that undoes, with Ctrl held: `z`.
-///
-/// Literals for the reason [`SAVE_KEYCODE`] is one — `libkern::abi` names only the keys with no
-/// character — and pinned against `libinput`'s table by a test rather than by this comment.
+/// The key that undoes, with Ctrl held: `z`. A literal, pinned against `libinput` by a test.
 pub const UNDO_KEYCODE: u16 = 44;
-/// The key that redoes: `y`. Not `Ctrl+Shift+Z`, which needs a modifier this editor does not
-/// otherwise read, and which every application that offers both spells differently anyway.
+/// The key that redoes: `y`. Not `Ctrl+Shift+Z`, which needs a modifier read nowhere else.
 pub const REDO_KEYCODE: u16 = 21;
 /// The key that opens the find field: `f`.
 pub const FIND_KEYCODE: u16 = 33;
@@ -206,12 +144,8 @@ pub const MENU_BAR_H: u32 = 24;
 /// Where the menu bar's words are keyed from: `MENU_BAR_KEY + i` for menu `i`.
 pub const MENU_BAR_KEY: u64 = 40;
 
-/// The element key on the menu bar itself.
-///
-/// **Not optional.** `diff` rejects a parent whose children are *partly* keyed, and the dock's
-/// other two `Top` children have carried keys since they were written — so an unkeyed bar makes
-/// the whole window undiffable and nothing draws at all. `nxfiles` keys its bar for the same
-/// reason; this one was missed and `check-login` said `nxedit: the view is not diffable`.
+/// The element key on the menu bar itself. Not optional: a partly keyed parent makes the
+/// window undiffable and nothing draws.
 pub const BAR_KEY: u64 = 15;
 
 /// Where the open popup's rows are keyed from: `MENU_ROW_KEY + i` for item `i`.
@@ -220,50 +154,30 @@ pub const MENU_ROW_KEY: u64 = 100;
 /// Where the chooser's element keys start — clear of this window's own.
 pub const CHOOSER_KEY: u64 = 200;
 
-/// Where the chooser's *rows* are keyed from.
-///
-/// **A range of its own, not indices from zero.** `libui::chooser` matches `hovered` against its
-/// buttons' keys and `list_view` matches it against the rows', so a row whose key happened to
-/// equal a button's would light that button as the pointer crossed it — row 202 of a long
-/// directory against a Cancel keyed `CHOOSER_KEY + 2` (PR #284 review, finding 6). Far enough
-/// above the widget's own seven that no directory reaches it.
+/// Where the chooser's *rows* are keyed from, a range of its own: a row keyed like a button
+/// would light that button as `hovered` is matched against both.
 pub const CHOOSER_ROW_KEY: u64 = 1000;
 
 /// The key that opens the file chooser: `o`, with Ctrl.
 pub const OPEN_KEYCODE: u16 = 24;
-/// The key that opens it to save under a new name: `s`, with Ctrl and **Shift** — the same letter
-/// as Save, because it is the same verb with a question attached.
+/// The key that opens the chooser to save under a new name: `s`, with Ctrl and **Shift**.
 pub const SAVE_AS_KEYCODE: u16 = 31;
 
-/// The key that opens a *window*: `n`, with Ctrl and **Shift**.
-///
-/// Shift because `Ctrl+N` is "new" in the singular everywhere and an editor's singular is a
-/// buffer; the window is the larger thing, and every application that offers both spells it this
-/// way.
+/// The key that opens a *window*: `n`, with Ctrl and **Shift** (`Ctrl+N` is a buffer's).
 pub const NEW_WINDOW_KEYCODE: u16 = 49;
 /// The key that quits: `q`, with Ctrl. **Quit is not Close** — see [`Msg::Quit`].
 pub const QUIT_KEYCODE: u16 = 16;
 
 /// The key that opens a tab: `t`.
 pub const NEW_TAB_KEYCODE: u16 = 20;
-/// The key that closes one: `w`. Closing the last tab closes the window, which is what the
-/// chord means everywhere else it exists.
+/// The key that closes one: `w`. Closing the last tab closes the window.
 pub const CLOSE_TAB_KEYCODE: u16 = 17;
 
-/// The key that copies the selection: `c`.
-///
-/// **`Ctrl+C` here, not `Ctrl+Shift+C`.** M12 decision 6: what fingers already know, and this
-/// is not a terminal — nothing in an editor claims `Ctrl+C` for an interrupt, so there is
-/// nothing to work around. `nxterm` is the one that has to differ, and its own constants say
-/// why.
+/// The key that copies the selection: `c`. `Ctrl+C`, as nothing here claims it for an interrupt.
 pub const COPY_KEYCODE: u16 = 46;
 /// The key that cuts: `x`.
 pub const CUT_KEYCODE: u16 = 45;
-/// The key that selects the whole buffer: `a`, with Ctrl.
-///
-/// **No Shift here, unlike `nxterm`'s.** The terminal needs it because `Ctrl+A` belongs to
-/// whatever is running inside it; an editor has no such tenant, and `Ctrl+A` is Select All
-/// everywhere an editor exists.
+/// The key that selects the whole buffer: `a`, with Ctrl. No Shift, unlike `nxterm`'s.
 pub const SELECT_ALL_KEYCODE: u16 = 30;
 /// The key that opens Replace: `h`, with Ctrl — where every editor puts it.
 pub const REPLACE_KEYCODE: u16 = 35;
@@ -273,10 +187,7 @@ pub const GO_TO_KEYCODE: u16 = 34;
 pub const PASTE_KEYCODE: u16 = 47;
 
 /// Whether `k` is `Ctrl+Shift+V` — the one key that *continues* a paste rather than ending it.
-///
-/// A function rather than a condition spelled twice: [`App::key`] asks it to decide whether to
-/// end a cycling sequence and the chord's own arm asks it to act, and two spellings of one rule
-/// is how the sequence ends on the key that was meant to continue it.
+/// One function: two spellings of the rule would end a cycle on the key meant to continue it.
 fn is_cycle_chord(k: KeyEvent) -> bool {
     k.keycode == PASTE_KEYCODE && k.modifiers & MOD_CTRL != 0 && k.modifiers & MOD_SHIFT != 0
 }
@@ -287,10 +198,6 @@ const NAME_CONFIRM: u16 = libkern::abi::KEY_ENTER;
 const NAME_CANCEL: u16 = libkern::abi::KEY_ESC;
 
 /// Join a directory and a file name — `libfs::join`'s rule, on `str`.
-///
-/// The same helper `nxfiles` keeps for the same reason: this half of the application never sees
-/// a path as bytes, and converting to call `libfs` would be a round trip through a lossy
-/// conversion for a rule that is one line.
 fn join(dir: &str, name: &str) -> String {
     let mut s = String::from(dir);
     if !s.ends_with('/') {
@@ -300,78 +207,42 @@ fn join(dir: &str, name: &str) -> String {
     s
 }
 
-/// One open file: everything that belongs to a buffer rather than to the editor.
-///
-/// **Split out in M12 Part D**, when the window grew tabs. What stays on [`App`] is what a
-/// *window* has — its size, its focus, the outboxes, the strip's field, the question it may be
-/// asking — and what moves here is what a person would expect to survive switching tabs. Getting
-/// that line wrong is how a second tab inherits the first's undo history, which is the shape this
-/// split exists to make impossible rather than careful.
+/// One open file: what survives switching tabs. [`App`] keeps what a *window* has, so a second
+/// tab cannot inherit the first's undo.
 pub struct Buffer {
-    /// Identity across frames and across the tab strip.
-    ///
-    /// **Not the index**: closing a tab renumbers every one after it, and a message naming an
-    /// index outlives the frame that produced it.
+    /// Identity across frames and tabs; not the index, which renumbers when a tab closes.
     key: u64,
     /// The absolute path being edited, or empty for a buffer that has never been named.
     path: String,
     /// The last component of [`path`](Self::path), for the tab and the title bar.
     name: String,
-    /// The text, and the whole of the editing model — `libui` owns those rules, including the
-    /// undo history, which is per buffer because it is part of the text.
+    /// The text and the whole editing model, including undo, which is per buffer.
     text: TextAreaState,
-    /// The buffer's revision when it was last read or written.
-    ///
-    /// **A number rather than a flag**, because the flag has to be cleared by every path that
-    /// makes the buffer match the disk and set by every path that does not — and a save's
-    /// success arrives from the binary, one frame after the keystroke that asked for it.
-    /// Comparing revisions makes "modified" a derived fact.
+    /// The buffer's revision when it was last read or written. A number, not a flag, so
+    /// "modified" is derived: a save's success arrives a frame after the keystroke.
     saved_at: u64,
     /// Why this buffer may not be written, or `None` when it may.
     blocked: Option<String>,
-    /// The language this buffer's **name** implies, or `None` for plain text.
-    ///
-    /// Named by [`App::language_name`] for the receipt the binary prints.
-    ///
-    /// Settled when the buffer is named — at open, and again when Save As renames it — because
-    /// that is when it can change. Rescanning on a rename is what makes `Save As … .md` colour
-    /// the text without reopening it.
+    /// The language this buffer's **name** implies, or `None`; settled at open and on Save As.
     lang: Option<syntax::Language>,
-    /// What was open at the start of each line: the scanner's state, cached per line.
-    ///
-    /// **The whole of the multi-line problem.** A block comment or a fenced block makes line
-    /// *N*'s colours depend on where line *N−1* ended, so a line cannot be scanned alone — and
-    /// scanning from the top of the file on every frame is O(file) per keystroke. This is the
-    /// small half that is cached; the *runs* are recomputed for the visible lines each frame,
-    /// which is what keeps them from ever being stale.
+    /// What was open at the start of each line: the scanner's state, cached per line. The *runs*
+    /// are recomputed for the visible lines each frame, so they are never stale.
     starts: alloc::vec::Vec<syntax::State>,
     /// The revision [`starts`](Self::starts) was computed for.
     scanned_at: u64,
-    /// The lowest line an edit has touched since the last scan.
+    /// The lowest line an edit has touched since the last scan; `usize::MAX` if none.
     ///
-    /// **The rescan cannot start below this**, and it cannot early-exit above it: an edit
-    /// changes the state entering every line *after* it, so a scan that stopped at the first
-    /// matching state before reaching the edit would stop immediately and leave every colour
-    /// below it stale. `usize::MAX` means nothing has been touched.
+    /// The rescan cannot start below it nor early-exit above it: an edit changes the state
+    /// entering every later line.
     dirty_from: usize,
     /// The buffer did not match the file the moment it was read.
     ///
-    /// **Because reading is not always lossless.** `TextAreaState::with_text` drops a `\r` from
-    /// the end of every line, so a CRLF file is *already* something else by the time it is on
-    /// screen — and a `saved_at` taken after that says the buffer matches a file it does not.
-    /// The consequence was an editor that could open a file, be told nothing had changed, and
-    /// rewrite it two bytes shorter per line on the first `Ctrl+S` (PR #259 review, finding 3).
-    ///
-    /// So it is folded into [`App::modified`]: what the title bar marks is "this is not what is
-    /// on disk", which is true from the first frame here.
+    /// `with_text` drops the `\r` from every line, so a CRLF file is already something else on
+    /// screen and the first `Ctrl+S` would rewrite it shorter. Folded into [`App::modified`].
     differs: bool,
 }
 
-/// A chooser the editor has open: which job, where it is looking, and what is there.
-///
-/// **The entries are here because the application was given them**, not because this crate read
-/// them — `libui::chooser` renders over what it is handed and `main` does the listing, which is
-/// decision 3's rule seen from the other side.
+/// A chooser the editor has open; `main` does the listing, `libui::chooser` renders it.
 pub struct Chooser {
     /// Open a file, or name one to save.
     pub mode: chooser::Mode,
@@ -385,16 +256,11 @@ pub struct Chooser {
 
 /// Everything the editor is.
 pub struct App {
-    /// A pointer event over the document, awaiting the metrics that can resolve it.
-    ///
-    /// **One, not a queue.** Each is a position, and the newest is the answer: a press followed
-    /// by three motions in one batch means the caret goes where the last one was, which is what
-    /// a drag looks like when the loop is behind.
+    /// A pointer event over the document, awaiting the metrics that resolve it. One, not a queue.
     area_pointer: Option<PointerEvent>,
     /// Where within the document scrollbar's thumb a drag took hold.
     scroll_grab: libui::widget::ScrollGrab,
-    /// The open buffers, in the order their tabs are drawn. **Never empty**: the last one closing
-    /// closes the window, so every method below can assume there is a current buffer.
+    /// The open buffers, in tab order. **Never empty**: the last one closing closes the window.
     buffers: Vec<Buffer>,
     /// Which buffer's tab is current, by [`Buffer::key`].
     current: u64,
@@ -404,26 +270,17 @@ pub struct App {
     chooser_list: Option<String>,
     /// A path the binary is being asked to open into a tab.
     open_requested: Option<String>,
-    /// What a replace is looking for, captured when the first stage was answered.
-    ///
-    /// **Beside the field rather than inside it**, because `Field` is a plain marker the strip
-    /// reads for a label and giving it a payload would make every match on it carry one.
+    /// What a replace is looking for, beside the field so `Field` stays a plain marker.
     replacing: Option<String>,
     /// How many replacements the running replace has made, for the strip to report.
     replaced: usize,
     /// Another window has been asked for, and the binary has not made it yet.
     new_window: bool,
-    /// A quit has been asked for. **The binary owns what that means**, because it is the only
-    /// thing that knows how many windows there are.
+    /// A quit has been asked for. The binary owns what that means: it knows the window count.
     quit: bool,
     /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
-    ///
-    /// **New in M14 Part A**: this editor had no menu bar at all, only chords and a save button,
-    /// so everything it could do was either advertised nowhere or advertised once in a status
-    /// line. `nxterm` and `nxfiles` had one each and a hand-rolled popup apiece.
     pub menus: MenuState,
-    /// The next key to hand out. Monotonic, so a key is never reused and a stale message can
-    /// never name a buffer that has taken its place.
+    /// The next key to hand out. Monotonic, so a stale message never names a replacement.
     next_key: u64,
     /// What the status strip says.
     status: String,
@@ -435,14 +292,8 @@ pub struct App {
     maximized: bool,
     /// A save the binary owes the filesystem, and **which buffer asked for it**.
     ///
-    /// **The key, not a flag** (PR #270 review, worth fixing 3). A `bool` was right when there
-    /// was one buffer; with tabs, `take_save` and `path()` both read whatever is current when
-    /// `main` gets round to the write — the top of the *next* iteration, after the whole batch
-    /// has been applied. A `Ctrl+S` and a tab click in one drain therefore wrote the other tab's
-    /// bytes to the other tab's path, marked *that* buffer saved, and left the one the person
-    /// asked to save dirty with nothing to show anything had gone wrong. The batch is reachable
-    /// whenever the client is behind, which `pool.acquire` blocking on the third commit makes
-    /// ordinary. Same resolution rule as `confirming`: capture the subject when it is asked for.
+    /// The key, not a flag: `main` writes after the whole batch is applied, so a `Ctrl+S` and a
+    /// tab click in one drain wrote the other tab's bytes to its path.
     save_requested: Option<u64>,
     /// What the editor owes the clipboard — see [`ClipRequest`].
     clip_request: Option<ClipRequest>,
@@ -456,64 +307,30 @@ pub struct App {
     resize_requested: Option<u32>,
     /// The editor has been asked to close, and the binary owes an exit.
     closing: bool,
-    /// What is being closed over an unsaved buffer, and the person has not answered yet.
-    ///
-    /// **`true` is a second window**, not an overlay. `Surface::CloseRequested` says outright
-    /// that "a client that wants to ask 'save first?' opens a dialog and closes when that
-    /// resolves"; until M12 Part A no application had ever created one, so this editor answered
-    /// every close by exiting and the buffer went with it. The binary reads this each frame and
-    /// opens or destroys a `Role::Dialog` window to match — the same shape `nxterm` uses for its
-    /// menu, and the reason [`libui::window::Child`] exists.
+    /// What is being closed over an unsaved buffer, unanswered. The binary opens or destroys a
+    /// `Role::Dialog` window to match each frame.
     confirming: Option<Closing>,
-    /// Whether the *dialog* holds the keyboard, which its own title bar shows.
-    ///
-    /// **Not [`focused`](Self::focused)**, which is the main window's: a dialog taking focus
-    /// from its parent sends both halves down one channel, and a title bar drawn from the wrong
-    /// one would show two active windows or none.
+    /// Whether the *dialog* holds the keyboard, for its own title bar. Not `focused`: a focus
+    /// change sends both halves down one channel.
     pub confirm_focused: bool,
-    /// Whether the **chooser's** window holds the keyboard, for the same reason and read the
-    /// same way: its frame is edged in the accent only while it does (desktop refresh, Part H,
-    /// PR #319 review).
+    /// Whether the **chooser's** window holds the keyboard, read as `confirm_focused` is.
     pub chooser_focused: bool,
-    /// The dialog's title bar was dragged, and the binary owes the compositor a `StartMove` **on
-    /// the dialog's window**.
-    ///
-    /// A second flag rather than a second use of [`move_requested`](Self::move_requested),
-    /// because the two name different windows: an interactive move is a request on one window
-    /// id, and one flag would have moved whichever window the binary happened to pass.
+    /// The dialog's title bar was dragged; the binary owes a `StartMove` **on the dialog's
+    /// window**. Not [`move_requested`](Self::move_requested): the two name different windows.
     confirm_move_requested: bool,
     /// Text being typed into the status strip's field, and what it is for.
     ///
-    /// **`Some` is a mode**, and it is the first one this editor has: while a name is being typed
-    /// the keys belong to it rather than to the buffer, and the status strip shows the field
-    /// instead of what last happened. It exists because an editor launched from the applications
-    /// menu has no `argv[1]` — it used to print "no file to edit" and exit, which is what "nxedit
-    /// doesn't launch from the menu" turned out to be (M11 Part E batch 7).
-    ///
-    /// **In the editor rather than through the shell.** A `Desktop` op that asked the shell to
-    /// collect a name would make the shell a dialog provider for arbitrary clients — an authority
-    /// question — and would need a blocking exchange over an async protocol. A field in this
-    /// window is no protocol at all, and this crate's own key path already noted that "the first
-    /// widget that wants a key needs exactly this shape".
+    /// `Some` is a mode: the keys belong to the field, not the buffer. In the editor rather than
+    /// collected through the shell, which would become a dialog provider for any client.
     field: Option<(Field, TextFieldState)>,
     /// Where an untitled buffer is saved, from the session's `HOME`.
     home: String,
-    /// The last search's answer, which the binary owes the console.
-    ///
-    /// `Some(Some(line))` for a hit, `Some(None)` for a miss, and `None` once reported.
-    ///
-    /// **A line number, not the needle.** A gate driving a release image cannot read this window,
-    /// so a search needs an outside receipt — and what somebody is looking for in their own file
-    /// is theirs, the same rule that keeps the buffer's receipt a count and the compositor's
-    /// chord log to the modifier alone.
+    /// The last search's answer, which the binary owes the console: `Some(Some(line))` for a hit,
+    /// `Some(None)` for a miss, `None` once reported. A line number, not the needle.
     find_report: Option<Option<usize>>,
 }
 
-/// What a confirmation is about.
-///
-/// **Resolved when the question is asked**, which is M12 Part B's lesson applied one part later:
-/// a tab's key is captured here rather than re-read when the answer arrives, so a question about
-/// one tab cannot end up closing another that has since become current.
+/// What a confirmation is about; a tab's key is captured when asked, so the answer cannot retarget.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Closing {
     /// The whole window, and every buffer in it.
@@ -522,24 +339,15 @@ enum Closing {
     Tab(u64),
 }
 
-/// What the status strip's field is collecting.
-///
-/// **One mode with two purposes, because they are the same shape** — the plan's words for find
-/// were "reuses the shape the save-as field established: a mode in which the keys are the field's
-/// rather than the buffer's". That shape was called "the first widget that wants a key" when it
-/// arrived in M11 Part E batch 7; this is the second, and a second copy of it would be two places
-/// that can disagree about what `Esc` does.
+/// What the status strip's field is collecting: one mode, or `Esc` could mean two things.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Field {
     /// A name for a buffer that has never had one, on the way to a save.
     Naming,
     /// Text to look for in the buffer.
     Finding,
-    /// Text to look for, on the way to replacing it.
-    ///
-    /// **A stage of its own rather than a flag on `Finding`**, because the strip's label is what
-    /// tells a person which of the two they are in — and "find" over a field whose Enter is about
-    /// to start replacing things would be the label lying.
+    /// Text to look for, on the way to replacing it. A stage of its own, or "find" would label a
+    /// field whose Enter starts replacing.
     ReplaceFind,
     /// What to put in its place.
     ReplaceWith,
@@ -547,32 +355,21 @@ pub enum Field {
     GoingTo,
 }
 
-/// What the editor owes the clipboard, which only `main` can do.
-///
-/// An outbox, like [`App::take_save`]: `update` is a function of values and `/dev/clipboard` is
-/// IPC, so the application records what it wants and the binary that owns the namespace
-/// performs it.
+/// What the editor owes the clipboard, which only `main` can do — an outbox, like
+/// [`App::take_save`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ClipRequest {
     /// Push this text onto the ring.
     Copy(String),
     /// Fetch the newest entry and insert it.
     Paste,
-    /// Fetch the entry **after** the one just pasted, replacing what that paste inserted.
-    ///
-    /// M12 decision 3's rule, and the reason this is a separate request rather than a paste
-    /// with an index: cycling is only valid *immediately after a paste*, and what makes a stale
-    /// position unreachable is that any other action ends the sequence. [`App::cycling`] is that
-    /// state, and everything else clears it.
+    /// Fetch the entry **after** the one just pasted, replacing what that paste inserted. Valid
+    /// only immediately after a paste: any other action ends it ([`App::cycling`]).
     Cycle,
 }
 
-/// Where a paste put its text, and which entry it was.
-///
-/// **The whole of the cycling rule, in one `Option`.** It exists only between a paste and the
-/// next thing the person does; every other action clears it, so a position from five minutes ago
-/// cannot be reached. The serial is what the *server* checks — a pipeline can push while
-/// somebody is mid-cycle, and then the index means a different entry.
+/// Where a paste put its text, and which entry it was. Exists only between a paste and the
+/// next action; the serial is what the server checks, as a pipeline can push mid-cycle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cycling {
     /// The buffer the paste went into. A cycle after switching tabs is not a cycle.
@@ -615,11 +412,8 @@ pub enum Msg {
     ResizeWindow(u32),
     /// A title-bar button asking the manager for a window state.
     RequestState(u32),
-    /// Somebody wants this window gone — its own close button, or the shell asking.
-    ///
-    /// **Over an unsaved buffer this asks rather than closes**, which is the whole of M12 Part
-    /// A: it raises [`App::confirming`] and the binary turns that into a real dialog window.
-    /// Only [`Msg::Discard`] ends the run.
+    /// Somebody wants this window gone — its own close button, or the shell asking. Over an
+    /// unsaved buffer this raises [`App::confirming`]; only [`Msg::Discard`] ends the run.
     Close,
     /// The dialog's *discard* answer: close, and the buffer goes with it.
     Discard,
@@ -638,9 +432,7 @@ pub enum Msg {
     MenuBar(usize),
     /// Open the chooser to pick a file — `Ctrl+O`, or File ▸ Open.
     OpenFile,
-    /// Open the chooser to name this buffer — `Ctrl+Shift+S`, or File ▸ Save As.
-    ///
-    /// **Not Save with a prompt.** See [`App::adopt_path`] for what accepting it changes.
+    /// Open the chooser to name this buffer — `Ctrl+Shift+S`; see [`App::adopt_path`].
     SaveAs,
     /// A row of the chooser was activated: descend into it, or choose it.
     ChooserRow(u64),
@@ -652,35 +444,20 @@ pub enum Msg {
     ChooserUp,
     /// The wheel turned over the chooser — see [`ListState::wheel`](libui::widget::ListState::wheel).
     ChooserWheel(PointerEvent),
-    /// A pointer event over the document — a press places the caret, a drag selects.
-    ///
-    /// **Recorded rather than acted on**, because turning a pixel into a column means measuring
-    /// text and this crate has no glyphs. The binary resolves it with the metrics it drew with;
-    /// see [`App::take_area_pointer`].
+    /// A pointer over the document. Recorded: a pixel needs metrics ([`App::take_area_pointer`]).
     AreaPointer(PointerEvent),
     /// A pointer event over the document's scrollbar.
     AreaScroll(PointerEvent),
     /// The wheel turned over the document.
     AreaWheel(PointerEvent),
-    /// Open another window of this editor — `Ctrl+Shift+N`, or File ▸ New Window.
-    ///
-    /// **Recorded, not done.** A window is a compositor object and this crate makes no syscalls;
-    /// the binary takes the request and creates one, the same seam `nxterm`'s tabs use for their
-    /// ttys.
+    /// Open another window — `Ctrl+Shift+N`. Recorded; the binary makes it.
     NewWindow,
-    /// Close every window of this application — `Ctrl+Q`, or File ▸ Quit.
-    ///
-    /// **Quit is not Close**, and the difference is only visible once there are several windows:
-    /// Close is this window, Quit is all of them. Each is asked exactly as its own close button
-    /// asks — there is no second question for quitting — and **cancelling one aborts the quit and
-    /// leaves the rest open** (M14 decision 4). Windows already closed stay closed, because a
-    /// close cannot be taken back.
+    /// Close every window of this application — `Ctrl+Q`. **Quit is not Close**: each window is
+    /// asked as its own close button asks, **cancelling one aborts the quit**, and windows
+    /// already closed stay closed.
     Quit,
-    /// Undo the last edit — `Ctrl+Z`, or Edit ▸ Undo.
-    ///
-    /// **A message rather than a branch inside `key`**, since M14 Part A: the menu declares the
-    /// chord and [`libui::menu::accel_match`] routes it, so the label and the binding are one
-    /// statement rather than two that can drift (M14 decision 2). The five below are the same.
+    /// Undo the last edit — `Ctrl+Z`. The menu declares the chord and [`libui::menu::accel_match`]
+    /// routes it, so label and binding cannot drift.
     Undo,
     /// Redo what was undone — `Ctrl+Y`. See [`Undo`](Msg::Undo).
     Redo,
@@ -696,20 +473,13 @@ pub enum Msg {
     Copy,
     /// Cut the selection — `Ctrl+X`. See [`Undo`](Msg::Undo).
     Cut,
-    /// Paste the newest clipboard entry — `Ctrl+V`. See [`Undo`](Msg::Undo).
-    ///
-    /// **Not the cycle**, which is `Ctrl+Shift+V` and is a continuation gesture rather than an
-    /// action: it only means anything immediately after a paste, so it is not a menu row and is
-    /// matched before the table is consulted.
+    /// Paste the newest clipboard entry — `Ctrl+V`. Not the cycle (`Ctrl+Shift+V`), a continuation
+    /// matched before the table.
     Paste,
 }
 
-/// What a token kind is drawn in.
-///
-/// **The one place this application maps meaning onto a colour**, and the reason `libui` is
-/// handed colours rather than kinds: a toolkit that took kinds would have to know what a
-/// keyword is, and `Theme` would have to carry a table indexed by an enum belonging to one
-/// application. [`syntax::Kind::Plain`] never reaches here — it is not emitted as a run.
+/// What a token kind is drawn in: the one place meaning maps onto a colour, as `libui` is handed
+/// colours. [`syntax::Kind::Plain`] is never emitted as a run.
 fn colour_of(kind: syntax::Kind, theme: &UiTheme) -> libdraw::format::Rgb {
     match kind {
         syntax::Kind::Keyword => theme.syntax_keyword,
@@ -718,14 +488,9 @@ fn colour_of(kind: syntax::Kind, theme: &UiTheme) -> libdraw::format::Rgb {
         syntax::Kind::Number => theme.syntax_number,
         syntax::Kind::Heading => theme.syntax_heading,
         syntax::Kind::Variable => theme.syntax_variable,
-        // **A key takes the variable's colour** (desktop refresh, Part J), which no language
-        // that has keys also uses for variables. The design paints a TOML key in its accent;
-        // ours is the focus ring and a selection is made from it, and a third meaning for one
-        // colour is how a person stops being able to read either. **Whether the six syntax
-        // colours become the design's is a palette decision**, which Part A left open and this
-        // part does not settle.
+        // A key takes the variable's colour: no language that has keys also has variables, and
+        // the accent the design uses is the focus ring and selection here.
         syntax::Kind::Key => theme.syntax_variable,
-        // Plain text is the theme's foreground, which the widget draws without being told.
         syntax::Kind::Plain => theme.foreground,
     }
 }
@@ -750,14 +515,8 @@ impl Buffer {
 
     /// Bring [`starts`](Self::starts) up to date with the text, if it is not already.
     ///
-    /// **Downward from the edit until the state matches what was cached**, which is the whole
-    /// of the incremental part: typing inside a string re-scans to the end of that string and
-    /// stops, rather than to the end of the file.
-    ///
-    /// **Except when the line count changed**, where the early exit is unsound: inserting a line
-    /// shifts every cached entry below it, so a "match" is a comparison against a *different*
-    /// line's state. Then it runs to the end, which is a paste or a newline rather than a
-    /// keystroke.
+    /// Downward from the edit until the state matches the cache. Not when the line count changed:
+    /// entries below an inserted line shifted, so a "match" compares another line's state.
     fn rescan(&mut self) {
         let rev = self.text.revision();
         if self.scanned_at == rev {
@@ -773,14 +532,8 @@ impl Buffer {
         let n = lines.len();
         let count_changed = self.starts.len() != n;
         self.starts.resize(n, syntax::State::Normal);
-        // **An edit nobody located means the whole buffer, exit and all.** `usize::MAX` is
-        // "nothing was touched", so reaching it with a changed revision means somebody edited
-        // without saying where — and the answer has to be the *safe* one rather than the cheap
-        // one. Clamping it into range names the **last** line, which re-derives a single state
-        // and leaves every one above it stale; starting at zero is no better on its own,
-        // because the early exit then fires on line 0 for any edit further down. Both are
-        // needed, which is why `unknown` also suppresses the exit below (PR #289 review,
-        // blocking 1: `pasted` was such a path for the whole of Part G).
+        // An edit nobody located means the whole buffer, exit and all: clamping `usize::MAX` names
+        // the last line, and starting at zero alone lets the early exit fire at once.
         let unknown = self.dirty_from == usize::MAX;
         let from = if unknown { 0 } else { self.dirty_from.min(n.saturating_sub(1)) };
         self.dirty_from = usize::MAX;
@@ -817,9 +570,7 @@ impl App {
             replaced: 0,
             new_window: false,
             quit: false,
-            // **Zero, because the length is set every frame.** `set_anchors` replaces this
-            // vector before anything reads it, and sizing it here from a constant is
-            // what drifted (M15 Part E).
+            // Zero: the length is set every frame by `set_anchors`.
             menus: MenuState::new(0),
             next_key: TAB_KEY_BASE + 1,
             field: None,
@@ -847,11 +598,8 @@ impl App {
         }
     }
 
-    /// Remove the tab keyed `k`, and close the window if it was the last one.
-    ///
-    /// **The last tab closing closes the window**, which is what keeps `buffers` non-empty — the
-    /// invariant every accessor here relies on. The alternative, an editor showing no buffer at
-    /// all, is a window with nothing in it and no way to get one back.
+    /// Remove the tab keyed `k`, and close the window if it was the last one, which keeps
+    /// `buffers` non-empty.
     fn drop_tab(&mut self, k: u64) {
         if self.buffers.len() <= 1 {
             self.closing = true;
@@ -860,18 +608,13 @@ impl App {
         let Some(i) = self.buffers.iter().position(|b| b.key == k) else { return };
         self.buffers.remove(i);
         if self.current == k {
-            // The tab to its left, or the first — whichever survives. A person closing a tab is
-            // looking at where it was, so the neighbour is the least surprising place to land.
+            // The neighbour on the left, or the first: the least surprising place to land.
             self.current = self.buffers[i.saturating_sub(1).min(self.buffers.len() - 1)].key;
         }
     }
 
-    /// The buffer whose tab is current.
-    ///
-    /// **Never `None`**, and that is an invariant rather than a hope: `buffers` starts with one
-    /// and the close path turns "the last tab" into "the window", so there is always a current
-    /// buffer. Panicking here would be a `no_std` client dying in front of somebody, so it falls
-    /// back to the first — a wrong buffer is recoverable and a dead editor is not.
+    /// The buffer whose tab is current. Never `None` (closing the last tab closes the window);
+    /// falls back to the first rather than panicking.
     fn buf(&self) -> &Buffer {
         self.buffers.iter().find(|b| b.key == self.current).unwrap_or(&self.buffers[0])
     }
@@ -883,9 +626,8 @@ impl App {
         &mut self.buffers[i]
     }
 
-    /// Open `path` in a **new tab** and make it current, returning its key.
-    ///
-    /// The caller reads the file into it afterwards, the way `main` already does for the first.
+    /// Open `path` in a **new tab** and make it current, returning its key; the caller reads
+    /// the file into it.
     pub fn open_tab(&mut self, path: &str) -> u64 {
         let key = self.next_key;
         self.next_key += 1;
@@ -915,21 +657,14 @@ impl App {
         self.buffers.len()
     }
 
-    /// The file held `raw`, which decoded to `text`.
-    ///
-    /// **Both, because the buffer may already differ from the file.** Line endings are
-    /// normalised on the way in, so a CRLF file is not what is on screen — and an editor that
-    /// called that "unmodified" would rewrite it, shorter, on a `Ctrl+S` the person pressed out
-    /// of habit. Comparing what *would be written* against what was read is the only honest
-    /// answer, and it is one comparison at open rather than a rule about encodings.
+    /// The file held `raw`, which decoded to `text`. Both, because line endings are normalised on
+    /// the way in: a CRLF file is not what is on screen, and calling it unmodified would rewrite
+    /// it shorter on a habitual `Ctrl+S`.
     pub fn loaded(&mut self, text: &str, raw: &[u8]) {
         let b = self.buf_mut();
         b.text = TextAreaState::with_text(text);
-        // A whole new buffer, so everything below line 0 is unscanned. **`starts` is cleared
-        // as well as invalidated**: leaving the old file's states in place with the same length
-        // as the new one would let the early exit compare against them and return on line 0
-        // (PR #289 review, optional 5 — latent today, since this only ever runs on a fresh
-        // buffer, and one line to close).
+        // `starts` is cleared as well as invalidated: stale states of the same length would let
+        // the early exit compare against them and return on line 0.
         b.starts.clear();
         b.dirty_from = 0;
         b.scanned_at = u64::MAX;
@@ -943,11 +678,8 @@ impl App {
         }
     }
 
-    /// There is nothing at this path yet, which is not a failure.
-    ///
-    /// An editor opened on a path that does not exist is how a file gets made, so the buffer
-    /// stays empty and writable and the strip says which of the two happened — a person who
-    /// meant to open an existing file wants to know they did not.
+    /// There is nothing at this path yet, which is not a failure: the buffer stays empty and
+    /// writable and the strip says "new file", so a person who meant an existing file notices.
     pub fn absent(&mut self) {
         let b = self.buf_mut();
         b.text = TextAreaState::new();
@@ -957,12 +689,8 @@ impl App {
         self.status = String::from("new file");
     }
 
-    /// The file could not be read, so this buffer must not be written over it.
-    ///
-    /// **The empty window is the danger.** A failed read leaves nothing on screen, and saving
-    /// nothing over a file is that file destroyed by an editor that never showed it. So a
-    /// blocked buffer stays blocked for the run: what would clear it is a successful read, and
-    /// this editor reads once.
+    /// The file could not be read, so this buffer must not be written over it. It stays blocked
+    /// for the run: only a successful read would clear it, and this editor reads once.
     pub fn blocked(&mut self, why: &str) {
         let b = self.buf_mut();
         b.text = TextAreaState::new();
@@ -982,21 +710,14 @@ impl App {
         self.buf().text.text()
     }
 
-    /// How many times the buffer has been edited — the receipt a keystroke reached it.
-    ///
-    /// **The one externally visible sign that typing arrived**, which is what the gate paces on:
-    /// an editor's echo is its own window, and a gate driving a *release* image has no rendered
-    /// grid to read. A count rather than the text, deliberately — what somebody is typing into
-    /// an editor is theirs, and the same rule that keeps the compositor's chord log to the
-    /// modifier alone applies here.
+    /// How many times the buffer has been edited — the receipt a keystroke reached it, which
+    /// gates pace on. A count, not the text: what somebody types is theirs.
     pub fn revision(&self) -> u64 {
         self.buf().text.revision()
     }
 
-    /// Whether what is on screen differs from what is on disk.
-    ///
-    /// Two ways for that to be true: something was typed, or the file did not survive being read
-    /// unchanged — see [`differs`](Self::differs).
+    /// Whether what is on screen differs from what is on disk: something was typed, or the file
+    /// did not survive being read unchanged (see `differs`).
     pub fn modified(&self) -> bool {
         self.buf().modified()
     }
@@ -1006,16 +727,8 @@ impl App {
         &self.status
     }
 
-    /// Where the cursor is, as a person counts: `line 3, col 12`.
-    ///
-    /// **One-based, and converted here rather than in the buffer.** The text area counts from
-    /// zero because it indexes with these numbers; a person comparing against a compiler's error
-    /// message needs them from one, and the single place they are displayed is the right place
-    /// for the conversion.
-    ///
-    /// **Column counts characters, not bytes.** A cursor after `é` is in column 2, not column 3 —
-    /// the buffer's `col` is a byte offset, which is the right thing for indexing and the wrong
-    /// thing to show anybody.
+    /// Where the cursor is, as a person counts: `line 3, col 12`. One-based, and the column counts
+    /// characters, not bytes.
     pub fn position_text(&self) -> String {
         let t = &self.buf().text;
         let (line, col) = t.cursor();
@@ -1028,11 +741,8 @@ impl App {
         self.buf().blocked.as_deref()
     }
 
-    /// Copy the selection onto the ring, deleting it as well when `cut`.
-    ///
-    /// **Nothing selected is not a request.** A copy that pushed an empty entry would move the
-    /// ring's serial under every client that was mid-cycle, for a gesture that had nothing to
-    /// copy — and it would push whatever was last copied one place further back.
+    /// Copy the selection onto the ring, deleting it as well when `cut`. Nothing selected is not a
+    /// request: an empty entry would move the ring's serial under a client mid-cycle.
     fn copy(&mut self, cut: bool) {
         let Some(text) = self.buf().text.selected_text() else {
             self.status = String::from(if cut { "nothing to cut" } else { "nothing to copy" });
@@ -1053,34 +763,22 @@ impl App {
     }
 
     /// Where a cycle would continue from, or `None` — see [`Cycling`].
-    ///
-    /// The binary reads this to build a cycle's request: which index to ask for next, and which
-    /// serial to carry.
     pub fn cycling(&self) -> Option<Cycling> {
         self.cycling
     }
 
-    /// Insert `text` as a paste, and remember where it went so a cycle can replace it.
-    ///
-    /// `index` and `serial` are what the server answered with. A caller that pasted the newest
-    /// entry passes `0` and the serial it came back with.
+    /// Insert `text` as a paste and remember where it went; `index` and `serial` are the server's.
     pub fn pasted(&mut self, text: &str, index: u32, serial: u64) {
         let buffer = self.current;
         let (from, to) = self.buf_mut().text.insert_text(text);
-        // **A paste is an edit that never passed through `update`**, so it reports its own
-        // position — see [`Buffer::dirty_from`]. `Msg::Paste` only asks the clipboard; this is
-        // called when the answer arrives (PR #289 review, blocking 1).
+        // A paste's answer does not pass through `update`, so it reports its own position.
         self.edited_at(from.0);
         self.cycling = Some(Cycling { buffer, from, to, index, serial });
         self.status = String::from("pasted");
     }
 
-    /// Replace what the last paste inserted with `text` — a cycle's answer.
-    ///
-    /// **Does nothing without a live [`cycling`](Self::cycling)**, and nothing if the current
-    /// buffer is not the one that was pasted into: the range names positions in *that* buffer's
-    /// text, and applying it to another would replace whatever happens to be at those
-    /// coordinates.
+    /// Replace what the last paste inserted with `text` — a cycle's answer. Does nothing without a
+    /// live [`cycling`](Self::cycling) or if the current buffer is not the one pasted into.
     pub fn cycled(&mut self, text: &str, index: u32, serial: u64) {
         let Some(c) = self.cycling else { return };
         if c.buffer != self.current {
@@ -1088,8 +786,6 @@ impl App {
         }
         self.buf_mut().text.select_range(c.from, c.to);
         let (from, to) = self.buf_mut().text.insert_text(text);
-        // The replaced range starts where the previous paste did, which is at or above where
-        // this one starts.
         self.edited_at(c.from.0.min(from.0));
         self.cycling = Some(Cycling { buffer: c.buffer, from, to, index, serial });
         self.status = String::from("pasted the one before");
@@ -1101,11 +797,10 @@ impl App {
         self.status = String::from(why);
     }
 
-    /// The save the binary owes, as the bytes to write. Clears the record.
+    /// The save the binary owes, as `(key, path, bytes)`. Clears the record.
     ///
-    /// `None` when nothing asked for one — **or when this buffer is blocked**, which is where
-    /// the refusal is enforced rather than merely displayed. The status strip says why, so a
-    /// person pressing save on a file that could not be read is answered rather than ignored.
+    /// `None` when nothing asked, or when this buffer is blocked: that is where the refusal is
+    /// enforced, and the strip says why.
     pub fn take_save(&mut self) -> Option<(u64, String, String)> {
         let key = core::mem::take(&mut self.save_requested)?;
         let b = self.buffers.iter().find(|b| b.key == key)?;
@@ -1113,51 +808,34 @@ impl App {
             self.status = alloc::format!("not saved — {why}");
             return None;
         }
-        // **The path comes from the buffer that asked**, not from `path()`, which answers for
-        // whatever is current now.
+        // The path comes from the buffer that asked, not from the current one.
         Some((key, b.path.clone(), b.text.text()))
     }
 
-    /// Take `path` as the file to edit, if this buffer can be given up.
-    ///
-    /// **A modified buffer refuses**, which is the same rule the save path follows from the
-    /// other side: opening a dropped file would replace what is on screen, and an editor that
-    /// discarded unsaved work because something was dragged onto it is the failure mode this
-    /// application exists to not have. The status strip says so, because a drop that visibly
-    /// does nothing is indistinguishable from one that was not delivered.
-    ///
-    /// **And dropping the file already open switches to it** rather than opening it twice: two
-    /// tabs on one file are two buffers that can disagree about what is in it, and the last one
-    /// saved wins silently.
+    /// Take `path` as a file to edit, in a new tab; `false` if it is already open, which is
+    /// switched to instead (two tabs on one file can disagree, and the last saved wins).
     pub fn accept_drop(&mut self, path: &str) -> bool {
         if let Some(b) = self.buffers.iter().find(|b| b.path == path) {
             self.current = b.key;
             self.status = alloc::format!("{} is already open", libfs::basename_str(path));
             return false;
         }
-        // **A new tab, since M12 Part D.** It used to replace the buffer, and had to refuse when
-        // that buffer was modified — a drop that visibly did nothing, for a reason the person had
-        // to read the strip to discover. With tabs there is nothing to lose by taking it.
         self.open_tab(path);
         true
     }
 
     /// A save finished: `Ok(bytes written)`, or `Err(what went wrong)`.
     ///
-    /// **A failure changes nothing but the message.** The buffer stays as it is and stays
-    /// modified, because the alternative — marking it saved and letting the person close the
-    /// window — is the editor losing their work while telling them it did not.
+    /// A failure changes nothing but the message: the buffer stays modified, as marking it saved
+    /// would let the person close the window and lose their work.
     pub fn saved(&mut self, key: u64, result: Result<usize, &str>) {
         match result {
             Ok(n) => {
                 let Some(i) = self.buffers.iter().position(|b| b.key == key) else { return };
                 let b = &mut self.buffers[i];
                 b.saved_at = b.text.revision();
-                // The file is now what the buffer holds, whatever it held before.
                 b.differs = false;
-                // **A save closes the undo group.** What a person wants back after saving is
-                // what they have typed since it — not everything since the file was opened,
-                // which is what one long group would give them.
+                // A save closes the undo group: undo should reach back to the save, not the open.
                 b.text.end_group();
                 self.status = describe(n, "saved");
             }
@@ -1167,14 +845,8 @@ impl App {
 
     /// Apply a message.
     pub fn update(&mut self, msg: Msg) {
-        // **Where an edit landed, recorded here rather than by the toolkit** (M14 Part G). The
-        // highlighter needs the lowest line a change touched, and the cursor's line before and
-        // after bracket every edit this application can make: an insertion runs from where the
-        // cursor was to where it ended up, a deleted selection leaves the cursor at its start,
-        // and an undo moves it to where the edit being undone began. The minimum of the two is
-        // therefore at or above the first line whose colours can have changed.
-        //
-        // **Outside the match**, so a message added later cannot forget to do it.
+        // Where an edit landed, for the highlighter: the cursor's line before and after bracket
+        // every edit. Outside the match, so a message added later cannot forget it.
         let was = (self.current, self.buf().text.cursor().0, self.buf().text.revision());
         self.dispatch(msg);
         if self.current == was.0 && self.buf().text.revision() != was.2 {
@@ -1185,28 +857,21 @@ impl App {
         }
     }
 
-    /// Record that an edit touched line `from`, so the next scan starts at or above it.
-    ///
-    /// **For the paths that do not go through [`update`](Self::update)** — a clipboard answer
-    /// arrives from the binary rather than as a message, so the bracket `update` computes never
-    /// sees it.
+    /// Record that an edit touched line `from`, so the next scan starts at or above it. For
+    /// the paths that do not go through [`update`](Self::update), such as a clipboard answer.
     fn edited_at(&mut self, from: usize) {
         let b = self.buf_mut();
         b.dirty_from = b.dirty_from.min(from);
     }
 
-    /// The body of [`update`](Self::update). See there for what wraps it.
+    /// The body of [`update`](Self::update).
     fn dispatch(&mut self, msg: Msg) {
-        // **Every message that is not a key is an action, and an action ends a cycle** — see
-        // `key`, which handles its own case because one key is the exception. Switching tabs,
-        // saving, and closing a dialog are all "something else happened".
+        // Any message but a key is an action and ends a cycle; `key` handles its own case.
         if !matches!(msg, Msg::Key(_)) {
             self.cycling = None;
         }
-        // **Choosing dismisses the menu, whichever row it was** — a menu that stayed open would
-        // cover the thing it just acted on. Asked of the table rather than repeated in the arms,
-        // so a row added later cannot forget. A message that is not a row leaves it alone, which
-        // is what keeps `MenuBar` able to open one.
+        // Choosing dismisses the menu, asked of the table so a row added later cannot forget.
+        // A message that is not a row leaves it alone, so `MenuBar` can open one.
         if self
             .menu_table()
             .iter()
@@ -1220,9 +885,8 @@ impl App {
             Msg::MenuBar(i) => self.menus.toggle(i),
             Msg::OpenFile => self.open_chooser(chooser::Mode::Open),
             Msg::SaveAs => self.open_chooser(chooser::Mode::Save),
-            // **The message carries a key and this takes an index**, converted at the one place
-            // that knows the row numbering — and a key below the base is not a row at all rather
-            // than row zero, which is what a saturating subtraction would have made it.
+            // The message carries a key; a key below the base is not a row, where a saturating
+            // subtraction would have made it row zero.
             Msg::ChooserRow(key) => {
                 if let Some(row) = key.checked_sub(CHOOSER_ROW_KEY) {
                     self.chooser_activate(row);
@@ -1230,10 +894,7 @@ impl App {
             }
             Msg::ChooserAccept => self.chooser_accept(),
             Msg::ChooserCancel => self.chooser = None,
-            // **The root is its own parent**, so this is a no-op there rather than an error —
-            // `libfs::parent` states that rule and `nxfiles` relies on the same one, which is
-            // why neither greys the control: a control that disables itself at the root is one
-            // more state to draw for a case nobody is surprised by.
+            // The root is its own parent, so this is a no-op there, and the control is not greyed.
             Msg::ChooserUp => {
                 if let Some(c) = self.chooser.as_ref() {
                     let up = core::str::from_utf8(libfs::parent(c.dir.as_bytes())).unwrap_or("/");
@@ -1242,13 +903,8 @@ impl App {
                     }
                 }
             }
-            // **Declined when no chooser is open**, which is not defensive: the dialog is a
-            // second window and its records arrive on the same session, so one in flight when
-            // the dialog closes reaches this.
-            // **Kept, not resolved.** The binary hands it back through `take_area_pointer` with
-            // something that can measure a string — the same seam `note_press` uses in `nxterm`
-            // for the same reason: this half of the application makes no syscalls and holds no
-            // font.
+            // Kept, not resolved: the binary hands it back through `take_area_pointer` with
+            // metrics, since this half holds no font.
             Msg::AreaPointer(p) => self.area_pointer = Some(p),
             Msg::AreaScroll(p) => {
                 let visible = (self.area_h() / ROW_H) as usize;
@@ -1280,14 +936,8 @@ impl App {
                 let ok = self.buf_mut().text.redo();
                 self.status = String::from(if ok { "redone" } else { "nothing to redo" });
             }
-            // **Reached only when no field is open** by the chord, because a field takes the keys
-            // before the chord match is looked at — so `Ctrl+F` while finding is swallowed by the
-            // field (the keymap folds it to a control byte, which `apply` declines) and never
-            // arrives. The first version guarded against re-opening, and that guard could not
-            // fire: a guard that cannot fire reads as protecting an invariant it does not (PR
-            // #269 review, worth fixing 1). **The menu row can reach it while a field is open**,
-            // which is new — and re-opening find while finding is the same as opening it, so the
-            // field starts empty either way and there is still nothing to guard.
+            // Reached by the chord only when no field is open, since a field takes the keys first;
+            // the menu row can reach it while one is, and re-opening is the same as opening.
             Msg::Find => {
                 self.field = Some((Field::Finding, TextFieldState::new()));
                 self.status = String::from("find, then Enter");
@@ -1302,16 +952,11 @@ impl App {
                 self.field = Some((Field::GoingTo, TextFieldState::new()));
                 self.status = String::from("line number, then Enter");
             }
-            // **From the start to the end of the last line**, which `select_range` clamps into
-            // the buffer — so an empty buffer selects nothing rather than a zero-width range the
-            // copy path would then treat as a selection.
+            // `select_range` clamps, so an empty buffer selects nothing rather than a zero-width
+            // range the copy path would treat as a selection.
             Msg::SelectAll => {
-                // **A byte offset, because `select_range` takes one** — it clamps with
-                // `lines[line].len()` and walks back to a char boundary, exactly as `cursor()`
-                // documents. `chars().count()` is short by one per multi-byte character, so
-                // Select All quietly dropped the last character of a line ending in one
-                // (PR #287 review, blocking 4). The *display* conversion is `position_text`'s,
-                // and it is the other direction.
+                // A byte offset, because `select_range` takes one: a character count is short
+                // for a line ending in a multi-byte character.
                 let text = &self.buf().text;
                 let last = text.lines().len().saturating_sub(1);
                 let end = text.lines().get(last).map_or(0, |l| l.len());
@@ -1320,16 +965,12 @@ impl App {
             Msg::Copy => self.copy(false),
             Msg::Cut => self.copy(true),
             Msg::Paste => self.clip_request = Some(ClipRequest::Paste),
-            // **Saving an untitled buffer asks for a name first.** The write itself is the
-            // binary's, as always; what changes here is that there may be nowhere to write to
-            // yet, and inventing a path would be a file somebody did not choose.
+            // Saving an untitled buffer asks for a name first: inventing a path would make a
+            // file somebody did not choose.
             Msg::Save => {
                 if self.buf().path.is_empty() {
-                    // **Any field but a naming one is replaced**, not treated as "already
-                    // asking" (PR #269 review, worth fixing 2). `field.is_none()` was right
-                    // when naming was the only mode; once find joined it, clicking *save* with
-                    // the find field open did nothing at all — a control that looks live and is
-                    // not, in an application whose own tests exist to catch exactly that.
+                    // Any field but a naming one is replaced: clicking *save* with the find
+                    // field open must not do nothing.
                     if self.field_kind() != Some(Field::Naming) {
                         self.field = Some((Field::Naming, TextFieldState::new()));
                         self.status = String::from("name it, then Enter");
@@ -1338,20 +979,13 @@ impl App {
                     self.save_requested = Some(self.current);
                 }
             }
-            // Nothing here: the payload is in the event the binary is holding, and *which*
-            // widget took the drop is all the toolkit can say. The binary pairs them.
+            // The payload is in the event the binary holds, which pairs it with the widget.
             Msg::Dropped => {}
             Msg::DragWindow => self.move_requested = true,
             Msg::DragConfirm => self.confirm_move_requested = true,
             Msg::ResizeWindow(edges) => self.resize_requested = Some(edges),
-            // **A modified buffer never closes on this message, however many times it
-            // arrives.** The obvious spelling — "ask if we are not already asking, otherwise
-            // close" — turns a *second* `CloseRequested` into an exit, and a shell that asks
-            // twice is exactly what a person clicking a taskbar entry twice produces. So the
-            // only route out of a modified buffer is the answer the person gave.
-            // **Any modified buffer stops it**, not just the current one: closing the window
-            // takes every tab with it, so a question about only what is on screen would let the
-            // others go silently.
+            // A modified buffer never closes on this message, however often it arrives (a double
+            // click on a taskbar entry would otherwise exit). Any modified tab stops it.
             Msg::Close => {
                 if self.buffers.iter().any(Buffer::modified) {
                     self.confirming = Some(Closing::Window);
@@ -1364,8 +998,7 @@ impl App {
                     self.current = k;
                 }
             }
-            // **A new tab is an untitled buffer**, the same thing the applications menu launches
-            // the editor into — so `Ctrl+T` and a launch with no argument reach one state.
+            // A new tab is an untitled buffer, as a launch with no argument gives.
             Msg::NewTab => {
                 self.open_tab("");
                 self.status = String::from("untitled — save to name it");
@@ -1382,8 +1015,7 @@ impl App {
                 Some(Closing::Window) | None => self.closing = true,
                 Some(Closing::Tab(k)) => self.drop_tab(k),
             },
-            // **The status strip says so**, because a dialog that vanishes with nothing changed
-            // is indistinguishable from one that took the other answer.
+            // The strip says so: a dialog that vanishes with nothing changed looks like discard.
             Msg::KeepEditing => {
                 self.confirming = None;
                 self.status = String::from("still editing — nothing was discarded");
@@ -1399,35 +1031,19 @@ impl App {
 
     /// Editing keys go to the buffer; `Ctrl+S` saves.
     ///
-    /// **The chord is checked before the buffer sees the key**, and that ordering is load
-    /// bearing: `libinput`'s keymap folds `Ctrl+S` to `0x13`, which `TextAreaState::apply`
-    /// declines as unprintable — so the buffer would ignore it today and the editor would still
-    /// work. It would stop working the moment the toolkit learned another control character,
-    /// and the failure would be a keystroke that both saved and typed something.
+    /// The chord is checked before the buffer sees the key: `libinput` folds `Ctrl+S` to `0x13`,
+    /// which `apply` declines today, but a new control character could make one key do both.
     fn key(&mut self, k: KeyEvent) {
         if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
             return;
         }
-        // **Every key but the cycle itself ends a cycling sequence** — M12 decision 3, and the
-        // whole reason a stale ring position is unreachable rather than merely unlikely. The
-        // position exists only inside one uninterrupted gesture, so this is where "uninterrupted"
-        // is enforced: one place, before any arm can forget.
+        // Every key but the cycle itself ends a cycling sequence, here, before any arm can
+        // forget: this is what makes a stale ring position unreachable.
         if !is_cycle_chord(k) {
             self.cycling = None;
         }
-        // **While a name is being typed the keys are the field's**, buffer and chords included.
-        // A `Ctrl+S` here would ask to save the thing that has no name yet, which is what is
-        // already being answered.
-        // **The tab chords are the window's, and are checked first** — the rule `nxfiles`
-        // follows, made to agree here (PR #270 review, optional 7). The two applications grew
-        // the same widget in the same part and disagreed about this: a `Ctrl+T` during a find
-        // opened no tab, because the field's branch returned before the chords were looked at.
-        //
-        // The line is *what the chord acts on*. `Ctrl+T` and `Ctrl+W` act on the **window** and
-        // are checked before any field; `Ctrl+S`, `Ctrl+Z`, `Ctrl+Y` and `Ctrl+F` act on the
-        // **buffer**, and while a field is open the buffer is not what is being addressed — a
-        // `Ctrl+S` mid-name would ask to save the thing that has no name yet, which is exactly
-        // what is already being answered.
+        // The tab chords act on the window, so they come before any field; chords that act on
+        // the buffer do not, as a `Ctrl+S` mid-name would ask to save what has no name yet.
         if k.modifiers & MOD_CTRL != 0 && matches!(k.keycode, NEW_TAB_KEYCODE | CLOSE_TAB_KEYCODE) {
             if k.keycode == NEW_TAB_KEYCODE {
                 self.update(Msg::NewTab);
@@ -1437,38 +1053,28 @@ impl App {
             }
             return;
         }
-        // **While a field is open the rest of the keys are the field's**, buffer and chords
-        // included.
-        //
-        // **What was typed is read out before anything else is touched.** The field lives in
-        // `self`, and both answers below reach for another part of `self` — the buffer, to name
-        // it or to search it. Holding the field's borrow across that is the shape the split into
-        // `Buffer` turned from "works" into "will not compile", which is the better failure.
+        // While a field is open the rest of the keys are the field's, chords included. What was
+        // typed is read out first so the field's borrow ends before the buffer work.
         if let Some((which, _)) = self.field.as_ref() {
             let which = *which;
             match k.keycode {
                 NAME_CANCEL => {
                     self.field = None;
-                    // **Naming says what it did not do; find leaves the strip alone.** Blanking
-                    // it was a control answering with nothing, and what it would have erased is
-                    // the answer to the last search — which is still the most recent thing that
-                    // happened (PR #269 review, optional 3).
+                    // Naming says what it did not do; find leaves the strip alone, so the last
+                    // search's answer stays.
                     if which == Field::Naming {
                         self.status = String::from("not saved");
                     }
                 }
                 NAME_CONFIRM => {
-                    // **Owned**, so the field's borrow ends here rather than spanning the
-                    // buffer work below. `TextFieldState::text` hands back a `&str` into the
-                    // field, which is exactly the borrow that must not be alive.
+                    // Owned, so the field's borrow ends before the buffer work below.
                     let typed: String = self.field.as_ref().map(|(_, f)| String::from(f.text())).unwrap_or_default();
                     match which {
                         Field::Naming => {
                             let name = typed.trim().to_string();
                             if name.is_empty() {
-                                // Nothing typed is not a name, and an empty one would save to
-                                // the directory itself. Left open rather than cancelled: the
-                                // person is mid-answer.
+                                // An empty name would save to the directory itself. Left open:
+                                // the person is mid-answer.
                                 self.status = String::from("a name, then Enter");
                                 return;
                             }
@@ -1476,9 +1082,7 @@ impl App {
                             self.field = None;
                             self.adopt_path(&path);
                         }
-                        // **The field stays open**, which is the whole of what makes Enter walk
-                        // through the matches: a find that closed on its first hit would need
-                        // re-typing to see the second. `Esc` is what ends it.
+                        // The field stays open so Enter walks the matches; `Esc` ends it.
                         Field::Finding => {
                             let hit = self.buf_mut().text.find(&typed);
                             let line = self.buf().text.cursor().0;
@@ -1486,21 +1090,16 @@ impl App {
                                 if hit { alloc::format!("found {typed}") } else { alloc::format!("no {typed}") };
                             self.find_report = Some(hit.then_some(line));
                         }
-                        // **The first stage answers with a needle and finds it**, so the person
-                        // can see what is about to be replaced before typing what to put there.
-                        // An empty needle ends the replace rather than matching everything.
+                        // The first stage finds the needle, so the person sees what is about to
+                        // be replaced. An empty needle ends the replace.
                         Field::ReplaceFind => {
                             if typed.is_empty() {
                                 self.field = None;
                                 self.status = String::from("nothing to replace");
                                 return;
                             }
-                            // **A needle that is not there does not move to stage two.** `find`
-                            // leaves the anchor alone when it misses, so a selection made *before*
-                            // Replace was opened is still sitting there — and stage two's guard
-                            // was "is anything selected", not "is the match selected". Typing a
-                            // replacement then destroyed that selection and reported replacing a
-                            // needle the buffer does not contain (PR #287 review, blocking 3).
+                            // A needle that is not there does not advance: `find` leaves the anchor
+                            // alone on a miss, so an earlier selection would be replaced.
                             if !self.buf_mut().text.find(&typed) {
                                 self.status = alloc::format!("no {typed}");
                                 return;
@@ -1509,15 +1108,8 @@ impl App {
                             self.field = Some((Field::ReplaceWith, TextFieldState::new()));
                             self.status = alloc::format!("replace {typed} with, then Enter");
                         }
-                        // **Each Enter replaces the match that is showing and finds the next**,
-                        // which is the shape Find already has: the field stays open so Enter
-                        // walks, and `Esc` ends it. Replacing everything at once would be a
-                        // different row, and one whose undo is a single step over a whole file.
-                        // **Clamped to the buffer rather than refused**, which is what every
-                        // editor's go-to-line does: asking for line 900 of a 40-line file means
-                        // the end, and an error message there would be pedantry about a request
-                        // whose intent is unambiguous. A number that is not one *is* refused,
-                        // because that is a typo rather than an intent.
+                        // Clamped to the buffer, as every go-to-line is: line 900 of 40 means the
+                        // end. A number that is not one is refused as a typo.
                         Field::GoingTo => {
                             let Ok(want) = typed.parse::<usize>() else {
                                 self.status = alloc::format!("{typed} is not a line number");
@@ -1535,9 +1127,8 @@ impl App {
                                 self.field = None;
                                 return;
                             };
-                            // **The selection must be the match**, not merely present: `find`
-                            // selects what it hit, and anything else selected is somebody's own
-                            // selection that this has no business replacing.
+                            // The selection must be the match: anything else is somebody's own.
+                            // Each Enter replaces and finds the next, not all at once.
                             if self.buf().text.selected_text().as_deref() == Some(needle.as_str()) {
                                 self.buf_mut().text.insert_text(&typed);
                                 self.replaced += 1;
@@ -1562,72 +1153,41 @@ impl App {
             return;
         }
         if k.modifiers & MOD_CTRL != 0 {
-            // **The cycle is taken before the table**, because it is not a menu row: `Ctrl+Shift+V`
-            // continues a paste rather than starting an action, and it means nothing except
-            // immediately after one. `Accel::matches` is exact on modifiers, so `Ctrl+V` and
-            // `Ctrl+Shift+V` could not be confused — but a *continuation* has no business in a
-            // list of things you can choose.
+            // The cycle is taken before the table: it continues a paste and means nothing
+            // otherwise, so it has no business in a list of things to choose.
             if is_cycle_chord(k) {
                 self.clip_request = Some(ClipRequest::Cycle);
                 return;
             }
-            // **Matched against the menu table rather than a `match` on keycodes** (M14 decision
-            // 2). The constants above are still the source of truth — the table names them — but
-            // there is now one statement of "Ctrl+Z undoes" rather than a label in a menu and a
-            // branch here that could stop agreeing with it.
+            // Matched against the menu table, so "Ctrl+Z undoes" is stated once.
             if let Some(msg) = libui::menu::accel_match(&self.menu_table(), &k) {
                 self.update(msg);
                 return;
             }
-            // **Every other chord is swallowed, not passed on.** `Ctrl+X` folding to a
-            // printable character would otherwise type it, which is how an editor inserts junk
-            // when a person reaches for a shortcut it does not have. This used to be a `match`
-            // with a `_` arm; the table above answers the named ones now, so what is left is the
-            // fall-through and it needs no arms.
+            // Every other chord is swallowed, not passed on: `Ctrl+X` folding to a printable
+            // character would otherwise type it.
             return;
         }
         self.buf_mut().text.apply(k.keycode, k.modifiers, k.locks);
     }
 
     /// Record where each bar word sits, so an open menu knows where to hang from.
-    ///
-    /// **Here rather than in the binary, since M15 Part E.** Three applications each copied this
-    /// loop, and the count in it was a constant beside a `menu_table` that grew: `nxfiles` asked
-    /// for two anchors while its bar had three menus, so *View* opened a popup with nowhere to
-    /// go and drew nothing at all. In the binary it was untestable — no host test builds a
-    /// `main.rs` — which is why it could be wrong for two milestones. Here it is one method with
-    /// one count, and a test walks the whole bar through it.
     pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
         let n = self.menu_count();
         self.menus.set_anchors((0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect());
     }
 
-    /// How many menus the bar has — **derived from the table, never declared**.
-    ///
-    /// **A constant here drifted and cost the View menu** (M15 Part E). `MENU_COUNT` was 2 while
-    /// `menu_table` returned three menus, so the binary asked for two anchors,
-    /// `MenuState::anchor` answered `None` for the third, and clicking *View* opened a menu that
-    /// had nowhere to hang from — a bar word that did nothing, with no error anywhere. Two
-    /// numbers that must be equal are one number.
+    /// How many menus the bar has — derived from the table, never declared, as a constant drifted.
     pub fn menu_count(&self) -> usize {
         self.menu_table().len()
     }
 
-    /// The bar's menus, in bar order.
-    ///
-    /// **Built rather than stored**, and it takes `&self` because half the rows depend on state:
-    /// Cut and Copy need a selection, and Save is pointless on a buffer that matches the disk.
-    /// The chords are the same constants the keyboard used to `match` on — the table is where
-    /// they are declared now, and [`libui::menu::accel_match`] is what reads it back.
+    /// The bar's menus, in bar order. Built rather than stored: half the rows depend on state.
+    /// The chords are declared here and read back by [`libui::menu::accel_match`].
     pub fn menu_table(&self) -> Vec<Menu<Msg>> {
         let has_selection = self.buf().text.has_selection();
-        // **Nothing is available while a field is open** (PR #280 review, worth fixing 3). `key`
-        // has always given every keystroke to an open field — "while a name is being typed the
-        // keys are the field's", chords included — and the menu rows this part added were a way
-        // *around* that rule rather than a second statement of it: Find while naming replaced the
-        // field and silently abandoned the save, and Undo edited the buffer behind an open
-        // prompt. Greying the whole bar says the same thing in the vocabulary this part
-        // introduced, and Esc is one key away from a menu that works again.
+        // Nothing is available while a field is open: `key` gives an open field every keystroke,
+        // and a menu row would be a way around that.
         let free = self.field.is_none();
         let act = |it: Item<Msg>| it.enabled(free);
         vec![
@@ -1637,11 +1197,8 @@ impl App {
                     act(Item::new("New Tab", Accel::ctrl(NEW_TAB_KEYCODE, "T"), Msg::NewTab)),
                     act(Item::new("Close Tab", Accel::ctrl(CLOSE_TAB_KEYCODE, "W"), Msg::CloseTab(self.current))),
                     Item::Separator,
-                    // **Enabled on a clean buffer too.** Saving one is a no-op on disk, but an
-                    // untitled buffer is "dirty or not" independently of whether it has a path,
-                    // and a Save that greyed out would hide the *name* prompt behind a state a
-                    // person cannot see. `nxfiles`'s greying is about a selection, which is
-                    // visible; this is not.
+                    // Save is enabled on a clean buffer too: greying it would hide the name
+                    // prompt of an untitled buffer behind a state a person cannot see.
                     act(Item::new("Open…", Accel::ctrl(OPEN_KEYCODE, "O"), Msg::OpenFile)),
                     act(Item::new("Save", Accel::ctrl(SAVE_KEYCODE, "S"), Msg::Save)),
                     act(Item::new("Save As…", Accel::ctrl_shift(SAVE_AS_KEYCODE, "S"), Msg::SaveAs)),
@@ -1661,13 +1218,10 @@ impl App {
                     Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::Cut).enabled(free && has_selection),
                     Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::Copy).enabled(free && has_selection),
                     act(Item::new("Paste", Accel::ctrl(PASTE_KEYCODE, "V"), Msg::Paste)),
-                    // **Offered whenever the buffer holds anything**, which is not the same as
-                    // "there is a selection": making one is what this row is for.
+                    // Offered whenever the buffer holds anything: making a selection is its job.
                     Item::new("Select All", Accel::ctrl(SELECT_ALL_KEYCODE, "A"), Msg::SelectAll)
-                        // **Never `text()`**, which is `lines.join("\n")` — a fresh copy of the
-                        // whole file, and `menu_table` is rebuilt on every keystroke for
-                        // `accel_match`. This is the defect `has_selection` was added to remove
-                        // one milestone ago, with a larger object (PR #287 review, worth fixing 9).
+                        // Never `text()`: a copy of the whole file, and this table is rebuilt on
+                        // every keystroke for `accel_match`.
                         .enabled(free && self.buf().text.lines().iter().any(|l| !l.is_empty())),
                     Item::Separator,
                     act(Item::new("Find", Accel::ctrl(FIND_KEYCODE, "F"), Msg::Find)),
@@ -1678,18 +1232,12 @@ impl App {
         ]
     }
 
-    /// The chooser's tree — the root of a window of its own, like the menu and the question.
-    ///
-    /// **Empty when nothing is being chosen**, which cannot be drawn because the window only
-    /// exists while a chooser does — but the type demands an answer and a caller should not have
-    /// to think about it.
+    /// The chooser's tree, the root of a window of its own. Empty when nothing is being chosen.
     pub fn chooser_view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let Some(c) = self.chooser.as_mut() else {
             return libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui);
         };
-        // **The row keys are indices**, which is safe here and nowhere else: a chooser's listing
-        // cannot change under it — nothing lists a directory while one is open — so unlike a tab
-        // or a buffer there is no renumbering for a stale message to fall foul of.
+        // Row keys are indices, safe here because no listing happens while a chooser is open.
         let rows: Vec<libui::widget::ListRow<'_>> = c
             .entries
             .iter()
@@ -1716,21 +1264,13 @@ impl App {
             self.chooser_focused,
             ui,
         )
-        // **The whole dialog takes the wheel** (M14 Part I), from outside the widget rather than
-        // through an eleventh parameter to it: a wheel bubbles to the nearest handler, so hanging
-        // it here catches one turned over the rows, the path strip or the buttons — and a chooser
-        // that could not be scrolled while the browser beside it could is one listing behaving
-        // two ways, which is what `chooser-hidden` was filed about.
+        // The whole dialog takes the wheel, from outside the widget: a wheel bubbles to the
+        // nearest handler, so one turned over the rows, the path strip or the buttons scrolls.
         .on_wheel(Msg::ChooserWheel)
     }
 
-    /// The coloured runs of the lines that are on screen.
-    ///
-    /// **The runs are recomputed every frame and only the start states are cached**, which is
-    /// what makes a stale colour impossible: a run is derived from the line's text *as it is
-    /// now*, so the worst a stale cache can do is start a line in the wrong state, and that is
-    /// the one thing [`Buffer::rescan`] maintains. Caching runs instead would mean holding a
-    /// `Vec` per line of the file to save scanning the forty that are visible.
+    /// The coloured runs of the lines that are on screen, recomputed every frame; only the start
+    /// states are cached ([`Buffer::rescan`]).
     fn ink(&mut self, theme: &UiTheme, visible: usize) -> Vec<InkRun> {
         self.buf_mut().text.ensure_visible(visible);
         self.buf_mut().rescan();
@@ -1754,14 +1294,10 @@ impl App {
         out
     }
 
-    /// Resolve a pointer event over the document, given a way to measure text.
+    /// Resolve a pointer event over the document, given a way to measure text as drawn.
     ///
-    /// **Called by the binary after `update`**, with `width` measuring a string the way the area
-    /// was drawn — `|s| metrics.text_size(s).w`. A press places the caret and drops the
-    /// selection; a motion with a button held extends it. Anything else is ignored, which is
-    /// what keeps a hover from moving somebody's cursor.
-    ///
-    /// Answers whether anything changed, so the caller can decide to redraw.
+    /// A press places the caret and drops the selection; a motion with a button held extends
+    /// it; anything else is ignored. Answers whether anything changed.
     pub fn take_area_pointer(&mut self, width: impl Fn(&str) -> u32) -> bool {
         let Some(p) = self.area_pointer.take() else { return false };
         let pressed =
@@ -1779,21 +1315,15 @@ impl App {
         true
     }
 
-    /// How big the buffer is, as the tab strip says it: `1173 bytes`.
-    ///
-    /// **What would be written, not what was read**: the count follows the text as it is typed,
-    /// which is the number a person is watching when they decide to save (desktop refresh,
-    /// Part J).
+    /// How big the buffer is, as the tab strip says it: `1173 bytes`. What would be written,
+    /// not what was read.
     pub fn size_text(&self) -> String {
         let n = to_bytes(&self.buf().text.text()).len();
         if n == 1 { String::from("1 byte") } else { alloc::format!("{n} bytes") }
     }
 
-    /// What the current buffer is being highlighted as, for a receipt.
-    ///
-    /// **A name rather than a boolean**, because the interesting failure is not "highlighting
-    /// off" but "highlighted as the wrong thing" — a `.toml` read as Markdown colours nothing
-    /// and looks exactly like a scanner that never ran.
+    /// What the current buffer is being highlighted as, for a receipt: a name, since the
+    /// failure to catch is "highlighted as the wrong thing", not "off".
     pub fn language_name(&self) -> &'static str {
         syntax::name_of(self.buf().lang)
     }
@@ -1817,18 +1347,12 @@ impl App {
         core::mem::take(&mut self.quit)
     }
 
-    /// Drive the chooser from the keyboard.
-    ///
-    /// **The application types into the field, not the toolkit** — the same arrangement the
-    /// naming field has had since M12: `text_field` draws a value and a caret, and what a
-    /// keystroke *means* is the application's, because only it knows whether a key is text or an
-    /// answer. `Esc` and `Enter` are the two answers; the arrows move the list; everything else
-    /// is a character, and only when there is a field to put it in.
+    /// Drive the chooser from the keyboard: `Esc` and `Enter` answer, the arrows move the list,
+    /// and everything else is a character when there is a field to put it in. Only the
+    /// application knows whether a key is text or an answer.
     pub fn chooser_key(&mut self, k: KeyEvent) -> bool {
-        // **Fully qualified, as every other keycode in this file is.** `KEY_DOWN` names two
-        // different things one import apart — `librsproto::surface::KEY_DOWN` is a key's *state*
-        // and is what the rest of this file means by it, while `libkern::abi::KEY_DOWN` is the
-        // arrow. Importing the second here would shadow the first inside this one function.
+        // `librsproto::surface::KEY_DOWN` is a key's state; `libkern::abi::KEY_DOWN` is the
+        // arrow. Fully qualified, as every keycode here is, so the two cannot be confused.
         if k.pressed == 0 {
             return false;
         }
@@ -1848,16 +1372,13 @@ impl App {
                     libkern::abi::KEY_UP => {
                         c.state.list.up();
                     }
-                    // **Backspace goes up while opening**, which is the browser's own binding:
-                    // one desktop, one way to leave a directory. In `Save` it edits the name
-                    // instead — there is a field holding the keyboard, and a key that navigated
-                    // out from under a half-typed filename would be the surprise.
+                    // Backspace goes up while opening, as in the browser. In `Save` it edits the
+                    // name: navigating out from under a half-typed filename would surprise.
                     libkern::abi::KEY_BACKSPACE if c.mode == chooser::Mode::Open => {
                         self.update(Msg::ChooserUp);
                     }
-                    // **Nothing to type into when opening**, and swallowing the key is the point:
-                    // a dialog holds the keyboard, so a character that fell through would reach
-                    // nothing at all rather than the buffer behind it.
+                    // Nothing to type into when opening: the dialog holds the keyboard, so the
+                    // key is swallowed rather than reaching nothing.
                     _ if c.mode == chooser::Mode::Save => {
                         c.state.name.apply(code, k.modifiers, k.locks);
                     }
@@ -1893,16 +1414,12 @@ impl App {
         let Some(c) = self.chooser.as_mut() else { return };
         c.dir = String::from(dir);
         c.entries = entries;
-        // **The selection resets**, for `nxfiles::show`'s reason: a listing of a *different*
-        // directory has no row the old selection refers to, and a clamped stale index silently
-        // selects whatever happens to sit at that position.
+        // The selection resets: a different directory has no row the old index refers to.
         c.state.list = libui::widget::ListState::at(None, 0);
     }
 
-    /// Open the chooser, looking at the current buffer's directory.
-    ///
-    /// **Where the buffer already is**, not `home`: a Save As almost always means "beside this
-    /// file, under another name", and an untitled buffer has no directory of its own to offer.
+    /// Open the chooser, looking at the current buffer's directory, where a Save As almost
+    /// always means to stay. An untitled buffer offers `home`.
     fn open_chooser(&mut self, mode: chooser::Mode) {
         let path = String::from(self.buf().path.as_str());
         let dir = match path.rfind('/') {
@@ -1912,22 +1429,15 @@ impl App {
         let dir = if path.is_empty() { String::from(&self.home) } else { dir };
         let state = match mode {
             chooser::Mode::Open => ChooserState::new(),
-            // Seeded with what the file is called, so Save As starts from the name rather than
-            // from nothing.
+            // Seeded with the file's name, so Save As starts from it.
             chooser::Mode::Save => ChooserState::saving(&self.buf().name),
         };
         self.chooser_list = Some(dir.clone());
         self.chooser = Some(Chooser { mode, dir, entries: Vec::new(), state });
     }
 
-    /// A row was activated: descend into a directory, or take a file as the answer.
-    ///
-    /// **One statement of what activating a row means**, reached by the pointer and by `Enter`
-    /// alike. They were two before, and they disagreed: this checked `is_dir` and the accepting
-    /// branch did not, so arrowing onto a directory and pressing `Enter` *answered with the
-    /// directory* — closing the chooser and leaving a new, empty, permanently-blocked tab named
-    /// after a folder, while clicking the same row descended into it. A selection the keyboard
-    /// can make and the keyboard cannot correctly act on (PR #284 review, blocking 2).
+    /// A row was activated: descend into a directory, or take a file as the answer. One
+    /// statement for the pointer and `Enter`, which once disagreed about directories.
     fn chooser_activate(&mut self, row: u64) {
         let Some(c) = self.chooser.as_ref() else { return };
         let Some((name, is_dir)) = c.entries.get(row as usize).cloned() else { return };
@@ -1936,9 +1446,8 @@ impl App {
             self.chooser_list = Some(path);
             return;
         }
-        // **A file is the answer in either mode**, and in Save it becomes the *name* rather than
-        // the choice — picking an existing file to overwrite is how a Save dialog is used, and
-        // the accepting button is still what commits it.
+        // A file is the answer in either mode; in Save it becomes the name, and the accepting
+        // button still commits it (overwriting an existing file is how a Save dialog is used).
         match c.mode {
             chooser::Mode::Open => {
                 self.chooser = None;
@@ -1956,10 +1465,8 @@ impl App {
     fn chooser_accept(&mut self) {
         let Some(c) = self.chooser.as_ref() else { return };
         match c.mode {
-            // **Through the row, not around it.** Accepting a selection *is* activating that row,
-            // so this delegates rather than joining a path of its own — which is what let the two
-            // disagree about directories. There is no recursion here: `chooser_activate` answers
-            // or descends, and never accepts.
+            // Through the row, so the two paths cannot disagree about directories. No
+            // recursion: `chooser_activate` answers or descends, and never accepts.
             chooser::Mode::Open => {
                 let Some(i) = c.state.list.selected else {
                     self.status = String::from("nothing chosen");
@@ -1971,8 +1478,7 @@ impl App {
                 let name = String::from(c.state.name.text());
                 let name = name.trim();
                 if name.is_empty() {
-                    // Left open rather than cancelled: the person is mid-answer. The same
-                    // decision the naming field makes, for the same reason.
+                    // Left open: the person is mid-answer, as with the naming field.
                     self.status = String::from("a name, then Save");
                     return;
                 }
@@ -1985,21 +1491,13 @@ impl App {
 
     /// Make `path` what the current buffer **is**, and save it there.
     ///
-    /// **This is the whole of "Save As is not Save with a prompt"** (M14 Part C). A prompt that
-    /// only chose a destination would write the bytes and leave the buffer believing it is still
-    /// the file it was opened as — so the tab would keep the old name, the unsaved marker would
-    /// be about the old file, and the *next* `Ctrl+S` would write back to it. Changing what the
-    /// buffer is makes all three follow, because each of them reads the buffer's path.
-    ///
-    /// Shared with the naming field an untitled buffer already had, which does exactly this with
-    /// a name joined to `home` — one statement of what naming a buffer means rather than two.
+    /// Save As is not Save with a prompt: the tab's name, the unsaved marker and the next
+    /// `Ctrl+S` all read the buffer's path. The naming field shares this.
     pub fn adopt_path(&mut self, path: &str) {
         let name = String::from(libfs::basename_str(path));
         let b = self.buf_mut();
         b.path = String::from(path);
-        // **The language is settled by the name, so a rename re-settles it.** Saving an untitled
-        // buffer as `notes.md` colours it without reopening the file, which is what a person
-        // naming a file expects to see happen.
+        // The language is settled by the name, so a rename re-settles it.
         b.lang = syntax::for_name(&name);
         b.starts.clear();
         b.dirty_from = 0;
@@ -2036,16 +1534,8 @@ impl App {
 
     /// How many characters have been typed into the strip's field, or `None` when none is open.
     ///
-    /// **Either field** — a name or a search — since M12 Part C, which is why the receipt that
-    /// reports it says *which*: [`Field::label`], read through [`field_kind`](Self::field_kind).
-    /// A caller that assumed this was only ever a name would build a line a gate waits on for
-    /// ever while somebody types a search.
-    ///
-    /// **The receipt for the things typed here that are not the buffer.** `revision` covers
-    /// edits; naming an untitled buffer changes nothing the revision counter can see, and a
-    /// gate driving a release image has no rendered field to read — so seven injected
-    /// keystrokes were seven chances to lose one and discover it as a file called `scrath`.
-    /// A count rather than the text, for the reason `revision` is a count.
+    /// The receipt for what is typed that is not the buffer (`revision` cannot see it), which
+    /// says *which* field ([`Field::label`]). A count, not the text.
     pub fn naming_len(&self) -> Option<usize> {
         self.field.as_ref().map(|(_, f)| f.text().chars().count())
     }
@@ -2065,27 +1555,15 @@ impl App {
         core::mem::take(&mut self.confirm_move_requested)
     }
 
-    /// The dialog could not be opened, so the question cannot be asked.
-    ///
-    /// **The window stays, and the buffer stays.** The two alternatives are both worse: exiting
-    /// would discard unsaved work on the strength of a failed window creation, and leaving
-    /// [`confirming`](Self::confirming) set would make an editor that can never be closed at
-    /// all, because every later `Close` would try to open the same dialog again. So the close is
-    /// abandoned and the strip says why — a person can save and close, which is the thing they
-    /// were being asked about.
+    /// The dialog could not be opened, so the question cannot be asked. The window and buffer
+    /// stay: exiting would discard work, and staying `confirming` would retry on every `Close`.
     pub fn confirm_failed(&mut self) {
         self.confirming = None;
         self.status = String::from("could not ask about the unsaved buffer — save, then close");
     }
 
-    /// What the dialog does with a key.
-    ///
-    /// **`Esc` only, and it is the cautious answer.** A modal a person cannot dismiss from the
-    /// keyboard is a modal that has taken the keyboard hostage, and `Esc` is what the naming
-    /// field already uses for "never mind" — one rule for the two places in this editor where
-    /// the keys stop being the buffer's. There is deliberately no key for *discard*: `Enter` is
-    /// the obvious candidate and the obvious accident, since the question arrives while somebody
-    /// is typing.
+    /// What the dialog does with a key: `Esc` only, the cautious answer. There is no key for
+    /// *discard*, as `Enter` is the obvious accident.
     pub fn confirm_key(&self, k: KeyEvent) -> Option<Msg> {
         if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
             return None;
@@ -2109,47 +1587,25 @@ impl App {
 
     /// The height the text area is laid out at — the window less its chrome and the grip.
     pub fn area_h(&self) -> u32 {
-        // `WINDOW_FRAME_H` too, since M11 Part E batch 2b — see `nxfiles::App::list_h`. And
-        // `MENU_BAR_H` since M14 Part A: a bar that took its height out of the text area would
-        // be chrome the person paid for in rows of their document.
-        // **No `GRIP_W` since the refresh's Part J** (PR #321 review, blocking 2). The grip is an
-        // overlay in the window's corner, and it was subtracted so that no row of the document
-        // sat under it — but the status bar moved to the foot in this same part, so the grip now
-        // covers the *bar*. Subtracting it left a 16-pixel band of bare window face between the
-        // document and the bar, and one line of the file that the window had room for and did
-        // not show. `nxfiles::list_h` dropped it in Part I for the same reason.
+        // No `GRIP_W`: the grip overlays the status bar now, and subtracting it left a band of
+        // bare window face above the bar.
         self.window.h.saturating_sub(TITLE_BAR_H + MENU_BAR_H + TAB_STRIP_H + STATUS_H + WINDOW_FRAME_H)
     }
 
-    /// What the title bar shows: the file's name, marked when the buffer differs from the disk.
-    ///
-    /// **A leading marker rather than a trailing one**, so it is in the same place whatever the
-    /// name's length — a mark that moves is a mark that has to be looked for. The window's
-    /// *title* (what the taskbar shows) is set once and stays the name alone: retitling on every
-    /// keystroke is a message per keystroke to say something the window itself already shows.
+    /// What the title bar shows: the file's name, with a leading mark when the buffer differs
+    /// from the disk. The window's *title* (the taskbar's) stays the name alone.
     pub fn title(&self) -> String {
         if self.buf().name.is_empty() {
-            // **Named for what it is, not left blank.** A window whose title bar says nothing
-            // reads as a window that failed to load something.
+            // Named for what it is: a blank title reads as a failed load.
             return if self.modified() { String::from("* untitled") } else { String::from("untitled") };
         }
         if self.modified() { alloc::format!("* {}", self.buf().name) } else { self.buf().name.clone() }
     }
 
-    /// The element tree for the current state.
-    ///
-    /// `&mut self` because `text_area` scrolls the state it is handed — see `nxfiles::App::view`
-    /// for the bug the value-returning shape shipped.
-    ///
-    /// **The theme is the caller's**, because the caller paints this tree — and a tree built from
-    /// one theme and painted with another is two themes in one frame, which one type makes easy
-    /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
-    /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
-    /// handed down, rather than being fetched from a default in the middle of a view.
+    /// The element tree for the current state; `&mut self` because `text_area` scrolls its state.
     pub fn view(&mut self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let title = title_bar(
             self.title(),
-            // The design names the kind of window beside the file it holds.
             Some(EDITOR_KIND),
             self.focused,
             Msg::DragWindow,
@@ -2167,21 +1623,16 @@ impl App {
         )
         .key(TITLE_KEY);
 
-        // **The foot of the window, where the design puts it** (desktop refresh, Part J): what
-        // last happened on the left, and what the buffer is and where the caret is on the right.
-        // Its rule faces the content above it, which is what makes it read as a floor.
+        // The foot of the window: the last message on the left, the buffer and caret on the right.
         let reading = match self.field.as_ref() {
-            // **The field replaces the status, it does not sit beside it.** The bar is one row
-            // of chrome and a name being typed *is* what last happened — showing both would make
-            // a person read two things to find out which one is asking for an answer.
+            // The field replaces the status: a name being typed is what last happened.
             Some((_, f)) => padding(
                 Insets { top: 2, right: 6, bottom: 2, left: 0 },
                 text_field(f, false, WidgetState { active: true, ..Default::default() }, ui),
             ),
             None => status_text(self.status.clone(), ui),
         };
-        // **`language · ln N, col M`**, in the fixed-advance face so the numbers do not shuffle
-        // the line about as the caret moves through a file.
+        // `language · ln N, col M`, in the fixed-advance face so the numbers do not shuffle.
         let position = libui::element::row(alloc::vec![
             status_text(self.language_name(), ui),
             status_separator(ui),
@@ -2189,16 +1640,14 @@ impl App {
         ]);
         let strip = status_bar(reading.key(STATUS_KEY), Some(position.key(POSITION_KEY)), Edge::Top, ui);
 
-        // **The tab strip, drawn whatever the count.** A strip that appeared with the second
-        // tab would move everything below it the moment a file was dropped in — the window's
-        // content jumping under the pointer that dropped it. One tab is a strip with one tab.
+        // The tab strip is drawn whatever the count, or dropping in a file would move the
+        // content under the pointer that dropped it.
         let tabs: Vec<(u64, String, bool)> = self.tabs();
         let items: Vec<libui::widget::Tab<'_>> = tabs
             .iter()
             .map(|(k, name, marked)| libui::widget::Tab { key: *k, label: name.as_str(), marked: *marked })
             .collect();
-        // **The file's own controls ride on the tab strip** (desktop refresh, Part J), which is
-        // where the design puts them: how big the buffer is, and the one action that changes it.
+        // The file's own controls ride on the tab strip: how big the buffer is, and Save.
         let controls = libui::element::row(alloc::vec![
             center_v(mono(status_text(self.size_text(), ui))).key(BYTES_KEY),
             sized(Size::new(STATUS_GAP, 0), text("")).key(BYTES_GAP_KEY),
@@ -2219,58 +1668,34 @@ impl App {
         );
 
         let h = self.area_h();
-        // **Before the widget is built, and against the same window it will draw.** `text_area`
-        // scrolls the state to follow the cursor as its first act, so runs computed from the
-        // offset as it stands now would be for a different set of lines whenever a keystroke
-        // moved the view. Calling it here settles the offset first; the widget's own call then
-        // finds nothing to do.
+        // Before the widget is built: `text_area` scrolls to follow the cursor first, so runs
+        // computed from the old offset would be for different lines.
         let ink = self.ink(ui, (h / ROW_H) as usize);
-        // **The text area takes drops; the chrome does not.** That distinction is the whole of
-        // what decision 3 buys — the compositor knows only that this window declared an
-        // acceptor, and *where* on the window a drop means something is decided here, by which
-        // element is under the point. Dropping a file on the title bar does nothing, which is
-        // the honest answer: the title bar is not where a document goes.
+        // The text area takes drops; the chrome does not. The compositor knows only that this
+        // window declared an acceptor; which element is under the point decides the rest.
         let focused = self.focused;
         let visible = (h / ROW_H) as usize;
         let bar = self.buf().text.bar(visible);
-        // **The buffer is set in the fixed-advance face** (desktop refresh, Part J): code in a
-        // proportional face was the largest single difference between this window and the
-        // design, and it is the difference between columns that line up and columns that do not.
-        // The chrome around it stays proportional — `mono` wraps what is inside it and nothing
-        // else, which is how a window comes to be painted in two faces at once.
+        // The buffer is set in the fixed-advance face so columns line up; `mono` wraps only what
+        // is inside it, so the chrome stays proportional.
         let area = mono(
             text_area(&mut self.buf_mut().text, h, ROW_H, focused, &ink, Some(Msg::AreaPointer), ui)
                 .on_drop(Msg::Dropped)
                 .on_wheel(Msg::AreaWheel),
         );
-        // **The line-number gutter** (desktop refresh, Part J): 36 pixels on `face_hover` with a
-        // rule down its right edge, the numbers right-aligned a little clear of it in the dim
-        // step of the same fixed-advance face the buffer uses.
-        //
-        // **A sibling of the document, not a wrapper round it.** The router hands a widget
-        // pointer events in its *own* coordinates, so a gutter beside the area leaves the
-        // caret's arithmetic alone; a gutter inside it would shift every column by 36 pixels and
-        // the caret would land that much to the left of the pointer.
+        // The line-number gutter is a sibling of the document, not a wrapper: a gutter inside
+        // the area would shift every column.
         let first = self.buf().text.offset();
         let last = self.buf().text.lines().len();
         let mut numbers = alloc::vec::Vec::with_capacity(visible);
-        // **`row` and `ink` are taken here** — the loop's index and the highlighter's runs — so
-        // the element builders are named in full rather than shadowed.
+        // `row` and `ink` are taken here, so the element builders are named in full.
         for n in 0..visible {
             let line = first + n;
             let label = if line < last { alloc::format!("{}", line + 1) } else { String::new() };
-            // **At the body size and against the top of the row**, which is what puts a number
-            // on the line it belongs to: the document sets each line at the top of its box at
-            // the body size, and a smaller number centred in the same box sat three pixels low
-            // — worse as `font_px` grows, since the two steps diverge (PR #321 review, worth
-            // fixing 3). The design's gutter is the same size as its text for this reason.
+            // At the body size and the top of the row, where the document sets its line: a
+            // smaller number centred in the box sat three pixels low, more as `font_px` grows.
             let number = libui::element::ink(ui.foreground_dim, mono(text(label)));
-            // **Against the top of the row, where the document puts its line** (PR #321 review,
-            // worth fixing 3). A row centres its children down the box it is given, so a
-            // centred number sits four pixels below the line it belongs to; the flexible space
-            // underneath pins it up. The number is also at the body step, not a step below —
-            // the design's gutter is the same size as its text, and two steps in one row is
-            // what made the original three pixels out.
+            // A row centres its children, so the flexible space underneath pins the number up.
             numbers.push(sized(
                 Size::new(0, ROW_H),
                 column(alloc::vec![
@@ -2295,17 +1720,8 @@ impl App {
             ]),
         );
 
-        // **A scrollbar beside it, which this editor never had** (M15). `text_area` draws none —
-        // its own doc says so, and says it is the application's to compose, which `nxterm` does
-        // for its grid and this window did not. Without it a document longer than the window had
-        // nothing to say so, and no way to move but the arrow keys.
-        // **Both children keyed**, as the diff requires of a container: the gutter carries its
-        // own and the document keeps `AREA_KEY` one level down, inside the sized box the dock
-        // places.
-        // **`AREA_INNER_KEY` stays on the document itself**, which is what it names and what
-        // every test and gate aims from: putting it on the pair would move the origin to the
-        // gutter's left edge, and a press computed from it would land a gutter to the left of
-        // the column it meant.
+        // A scrollbar beside the document (`text_area` draws none). `AREA_INNER_KEY` stays on
+        // the document itself, which tests and gates aim from.
         let pane = libui::element::row(alloc::vec![
             gutter.key(GUTTER_KEY),
             padding(Insets::all(0), area).key(AREA_INNER_KEY).flex(1),
@@ -2323,12 +1739,8 @@ impl App {
             title,
             dock(
                 alloc::vec![
-                    // **The menu bar is above the tab strip** (M14 Part A). A dock's `Top`
-                    // children stack in order, so being first is what puts it there — and the
-                    // order is the decision: `nxfiles` docks its bar above its strip, and a
-                    // person who learned where the menus are in one window should not have to
-                    // look somewhere else in the next. A bar *below* a tab strip also reads as
-                    // belonging to the tab rather than to the window, which it does not.
+                    // The menu bar is above the tab strip, as in `nxfiles`: a dock's `Top`
+                    // children stack in order, and below the strip it would read as the tab's.
                     docked(
                         Edge::Top,
                         libui::menu::bar(
@@ -2343,13 +1755,11 @@ impl App {
                         .key(BAR_KEY),
                     ),
                     docked(Edge::Top, sized(Size::new(0, TAB_STRIP_H), strip_tabs).key(TAB_STRIP_KEY),),
-                    // **At the foot since Part J**, where it was under the chrome: a status bar
-                    // is a floor, and the design draws it along the bottom of the window.
+                    // At the foot: a status bar is a floor.
                     docked(Edge::Bottom, sized(Size::new(0, STATUS_H), strip).key(STRIP_KEY)),
                 ],
-                // Sized to the height it was built for, like every scrolling widget in this tree:
-                // the dock's flex child otherwise gets whatever is left, and the widget would build
-                // rows for one height and be drawn at another.
+                // Sized to the height it was built for, like every scrolling widget: otherwise the
+                // dock's flex child gets what is left and rows are built for another height.
                 sized(Size::new(0, h), area).key(AREA_KEY),
             ),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), ui).key(GRIP_KEY),
@@ -2361,36 +1771,24 @@ impl App {
 
     /// The element tree for the confirmation dialog — a **second window's** whole face.
     ///
-    /// **Sized rather than measured**, which is why the frame below is `window_frame` like every
-    /// other window's rather than something that could report a natural size: `libui`'s `Dock`
-    /// measures as everything it is offered, deliberately, so a tree containing one has no
-    /// natural size at all and [`libui::window::Child::open`] refuses it. Wrapping the whole
-    /// thing in a fixed `sized` is what makes the measurement exact — see [`CONFIRM_W`] for why
-    /// a dialog wants a fixed size in the first place.
-    ///
-    /// **The name is on its own line.** Folded into the question it would push a long file name
-    /// off the right edge and take the `?` with it, so what clips is the name and never the
-    /// sentence.
+    /// Sized rather than measured: a `Dock` has no natural size, so `Child::open` refuses one
+    /// unsized. The file's name is on its own line, so a long name clips, never the sentence.
     pub fn confirm_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let title = title_bar(
             "Unsaved changes",
             None,
             self.confirm_focused,
             Msg::DragConfirm,
-            // **One button, and it is the cautious answer.** Minimise and maximise are absent
-            // rather than present-and-inert: a control that looks live and is not is the defect
-            // M8's overview shipped three of, and `title_bar` draws only the buttons it is given
-            // a message for. Closing the question is *keep editing* — the dialog's own frame
-            // must not be a third way to discard a buffer.
+            // One button, the cautious answer. Minimise and maximise are absent, not inert; the
+            // dialog's frame must not be a third way to discard a buffer.
             TitleButtons { minimise: None, maximise: None, close: Some(Msg::KeepEditing) },
             hovered,
             ui,
         )
         .key(CONFIRM_TITLE_KEY);
 
-        // **The buffer the question is about, which is not always the current one**: closing a
-        // *tab* asks about that tab even if the person switched away while the dialog was up.
-        // The key was captured when the question was asked — M12 Part B's lesson, one part on.
+        // The buffer the question is about, not always the current one: closing a tab asks about
+        // that tab even if the person switched away while the dialog was up.
         let subject = match self.confirming {
             Some(Closing::Tab(k)) => self.buffers.iter().find(|b| b.key == k),
             _ => Some(self.buf()),
@@ -2402,10 +1800,7 @@ impl App {
         )
         .key(CONFIRM_TEXT_KEY);
 
-        // **Two buttons sharing the width equally**, which is what the published aim points
-        // name: a quarter across and three quarters across, at a fixed height off the bottom.
-        // `dialog_frame` supplies the strip and the fixed size; the labels, the messages and the
-        // keys are this application's.
+        // Two buttons sharing the width equally, at the published aim points.
         //
         // **Two answers and not three** — `TODO(dialog-save-answer)`. *Save and close* is the
         // obvious third, and it is not a button: an untitled buffer has nowhere to save to, so
@@ -2424,7 +1819,7 @@ impl App {
     }
 }
 
-/// `"<n> bytes <what>"`, the status strip's one sentence.
+/// `"<what> — <n> bytes"`, the status strip's one sentence.
 fn describe(bytes: usize, what: &str) -> String {
     let mut s = String::new();
     s.push_str(what);
@@ -2439,13 +1834,8 @@ pub fn bounds(size: Size) -> Rect {
     Rect::new(0, 0, size.w, size.h)
 }
 
-/// The buffer as bytes, with a trailing newline if the last line has text.
-///
-/// **What a text file is**, and the editor is where the convention is applied rather than in
-/// `libfs`: every line in a text file ends with a newline, so a file whose last line does not
-/// is a file that `open` and every other reader treats as one line shorter than it looks. A
-/// buffer whose last line is empty already ends with one — `TextAreaState::text` joins lines
-/// with `\n`, so `"a\n"` is two lines, the second empty.
+/// The buffer as bytes, with a trailing newline if the last line has text: every line in a
+/// text file ends with one, and the editor applies that convention, not `libfs`.
 pub fn to_bytes(text: &str) -> Vec<u8> {
     let mut out = Vec::from(text.as_bytes());
     if !out.is_empty() && !out.ends_with(b"\n") {
@@ -2458,25 +1848,16 @@ pub fn to_bytes(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// An editor with `hello` open, as if the file had been read.
     fn app() -> App {
         let mut a = App::new("/home/notes.txt", "/home");
-        // `hello\n` on disk, which is what `hello` writes back — so this buffer starts matching
-        // its file, which every test below depends on.
         a.loaded("hello", b"hello\n");
         a
     }
 
-    /// A key press, as the compositor delivers one.
     fn key(a: &mut App, keycode: u16, modifiers: u16) {
         a.update(Msg::Key(KeyEvent::new(1, keycode, KEY_DOWN, modifiers)));
     }
 
-    /// Type `text` one keystroke at a time, as a person would.
-    ///
-    /// **Through the keymap rather than a hand-written table**, so a test that types `cat` is
-    /// pressing the keys the guest would press — the same reason the chord constants are pinned
-    /// against `libinput::keymap` rather than against their comments.
     fn type_into(a: &mut App, text: &str) {
         for want in text.bytes() {
             let code = (1u16..=90)
@@ -2486,28 +1867,18 @@ mod tests {
         }
     }
 
-    /// A bare key press, spelled as the other tests spell it.
     fn press_key(a: &mut App, keycode: u16) {
         key(a, keycode, 0);
     }
 
-    /// `x`, the one letter these tests type.
     const KEY_X: u16 = 45;
-    /// `1` — the key that tells a swallowed chord from an unprintable one.
     const KEY_1: u16 = 2;
 
     /// Every key this window uses names a different element.
     ///
-    /// **A key is a number and nothing checks it** — the diff pairs by key within a parent, and
-    /// `locate` answers with the first node carrying one, so two constants that collide make a
-    /// control stand in for another. `AREA_INNER_KEY` was written as 40, which is
-    /// [`MENU_BAR_KEY`] and the *base of a range*: `locate` returned the menu bar's rectangle
-    /// for the document, and the press that should have moved the caret landed on the chrome.
-    /// `nxfiles` grew the same test in M14 Part D after a listing row lit whichever chrome
-    /// shared its number (M15 Part B).
+    /// `AREA_INNER_KEY` was once 40, `MENU_BAR_KEY`, and a press on the document hit the chrome.
     #[test]
     fn every_element_key_in_this_window_is_its_own() {
-        // The menu bar is a base: one key per menu, from `MENU_BAR_KEY` upwards.
         let menus = App::new("/home/x", "/home").menu_table().len() as u64;
         let mut keys: Vec<u64> = alloc::vec![
             AREA_KEY,
@@ -2521,16 +1892,10 @@ mod tests {
             TAB_STRIP_KEY,
             POSITION_KEY,
             BAR_KEY,
-            // Part J's four, added when they were (PR #321 review, worth fixing 2): a key is a
-            // number nothing checks, and this list is the check.
             GUTTER_KEY,
             AREA_PANE_KEY,
             BYTES_KEY,
             BYTES_GAP_KEY,
-            // **The toolkit's own keys, which live in this window too** — its title bar's three
-            // buttons and a tab's `×` (desktop refresh, after Part K). They are numbered from the
-            // top of the key space and from the tab key with `TAB_CLOSE_BIT` set, far from
-            // anything above; listed so that "far" is checked rather than assumed.
             libui::widget::TITLE_MINIMISE_KEY,
             libui::widget::TITLE_MAXIMISE_KEY,
             libui::widget::TITLE_CLOSE_KEY,
@@ -2538,9 +1903,6 @@ mod tests {
             libui::widget::tab_close_key(TAB_KEY_BASE),
         ];
         keys.extend(MENU_BAR_KEY..MENU_BAR_KEY + menus);
-        // **A tab's `×` is its tab's key with `TAB_CLOSE_BIT` set, which relies on the tab keys
-        // leaving it clear.** They are numbered upward from the base; four billion tabs later
-        // they still do.
         for k in [TAB_KEY_BASE, TAB_KEY_BASE + (1 << 32)] {
             assert_eq!(k & libui::widget::TAB_CLOSE_BIT, 0, "tab key {k:#x} sets the close bit");
         }
@@ -2550,43 +1912,26 @@ mod tests {
         assert_eq!(sorted.len(), keys.len(), "two of {keys:?} are the same number");
     }
 
-    // ---- the pointer over the document (M15 Part B) ----
-
-    /// Eight pixels a character, which is what `CELL` gives these tests.
     fn width(s: &str) -> u32 {
         (s.chars().count() * 8) as u32
     }
 
-    /// The byte count on the tab strip counts what would be written, and says "1 byte" once.
-    ///
-    /// **The one new user-visible string in this part** and it had no test (PR #321 review).
-    /// It follows the buffer rather than the file, which is the number a person is watching
-    /// when they decide to save.
     #[test]
     fn the_byte_count_follows_the_buffer() {
         let mut a = App::new("/home/notes.txt", "/home");
         a.loaded("", b"");
         assert_eq!(a.size_text(), "0 bytes", "an empty buffer is plural, like every other count");
-        // **`to_bytes` ends the file with a newline**, which is what the editor writes — so a
-        // one-character buffer is two bytes, and the singular is the buffer that is *only* that
-        // newline. This is the half "what would be written" is about.
         a.loaded("\n", b"\n");
         assert_eq!(a.size_text(), "1 byte", "one is singular");
         a.loaded("x", b"x\n");
         assert_eq!(a.size_text(), "2 bytes", "a character and the newline after it");
         a.loaded("hello", b"hello\n");
         assert_eq!(a.size_text(), "6 bytes");
-        // **It follows the buffer, not the file**: typing changes it before any save does.
         a.buf_mut().text.place(0, 5);
         a.buf_mut().text.insert('!');
         assert_eq!(a.size_text(), "7 bytes", "the count followed the keystroke");
     }
 
-    /// A line's number sits on the line it numbers.
-    ///
-    /// **Measured as baselines, which is what an eye reads** (PR #321 review, worth fixing 3):
-    /// the document sets each line at the top of its box and a number centred in the same box at
-    /// a smaller step sat three pixels low — worse as `font_px` grows, since the steps diverge.
     #[test]
     fn a_line_number_sits_on_its_line() {
         const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
@@ -2598,27 +1943,20 @@ mod tests {
             let ui = UiTheme { font_px, ..UiTheme::default() };
             let m = libui::paint::FontMetrics::new(&face, ui.font_px);
             let mut a = App::new("/home/notes.txt", "/home");
-            // **No ascenders or descenders**: `1` is cap-height and `l` is taller, so comparing
-            // the *tops* of two inks compares glyph shapes. `nn` sits between the baseline and
-            // the x-height, and a digit's foot is the baseline too — so the ink *bottoms* are
-            // the same line when the two are aligned.
+            // No ascenders or descenders: `1` and `l` differ in height, so comparing tops would
+            // compare glyph shapes. `nn` and a digit share a baseline, so ink bottoms line up.
             a.loaded("nn\nnn\n", b"nn\nnn\n");
             a.resize(Size::new(600, 300));
             let e = a.view(&ui, None);
             let l = libui::layout::layout(&e, Rect::new(0, 0, 600, 300), &m);
             let doc = libui::layout::locate(&e, &l, AREA_INNER_KEY).expect("the document");
             let gutter = libui::layout::locate(&e, &l, GUTTER_KEY).expect("the gutter");
-            // Both put their first row at the same inset from their own top, so the rows line
-            // up when the boxes do and the text inside them starts at the same height.
             assert_eq!(
                 doc.origin.y, gutter.origin.y,
                 "the gutter and the document start at the same height at font_px {font_px}"
             );
-            // **Where the ink lands, not what a constant says.** A first version compared two
-            // `text_size_as` calls with the *test's* own style and passed against a number set
-            // a step smaller — the same round trip through the test's metric that review found
-            // in the press test. So this paints the window and compares the top of the number's
-            // ink with the top of the line's.
+            // Where the ink lands, not what a constant says: comparing two `text_size_as` calls
+            // with the test's own style once passed against a number a step too small.
             use libdraw::format::PixelFormat;
             use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
             let (w, h) = (600u32, 300u32);
@@ -2626,9 +1964,6 @@ mod tests {
             fb.clear(ui.background);
             let mut custom = |_: u32, _: Rect, _: Rect, _: &mut MemFramebuffer| {};
             libui::paint::paint(&mut fb, &face, &ui, &e, &l, Rect::new(0, 0, w, h), &mut custom);
-            // **The gutter's rule is ink too**, and it runs the whole height — so a scan that
-            // counted it found the band's last row every time and passed against anything. The
-            // border colour is excluded, and the number's column stops short of the rule.
             let foot_ink = |x0: u32, x1: u32, y0: u32, y1: u32| {
                 (y0..y1).rev().find(|y| {
                     (x0..x1).any(|x| {
@@ -2637,14 +1972,10 @@ mod tests {
                             && c != Some(ui.background)
                             && c != Some(ui.face_hover)
                             && c != Some(ui.border)
-                            // **And the caret**, which is a full-height fill in the accent: a
-                            // scan that counted it found the row's own bottom on whichever line
-                            // the cursor was on.
                             && c != Some(ui.accent)
                     })
                 })
             };
-            // Exactly the first row, so the second line's ink cannot be mistaken for it.
             let band = (doc.origin.y as u32, doc.origin.y as u32 + ROW_H);
             let number =
                 foot_ink(gutter.origin.x as u32, (gutter.origin.x + gutter.size.w as i32) as u32 - 2, band.0, band.1);
@@ -2656,11 +1987,7 @@ mod tests {
                 "the number's ink ends at {number} and the line's at {line}, at font_px \
                  {font_px}"
             );
-            // **And the number carries no size step**, which the ink cannot say on its own: at
-            // the small step the two feet differ by a single pixel here, inside any tolerance
-            // an antialiased glyph needs. The rule is that a gutter's numbers are set at the
-            // body size like the lines they number — the design's are — so this asserts the
-            // rule rather than one of its consequences (PR #321 review, worth fixing 3).
+            // And no size step, which the ink cannot say: the small step's feet differ by a pixel.
             fn scaled_inside<M>(e: &Element<M>) -> bool {
                 matches!(e.node, libui::element::Node::Scale { .. }) || e.children().any(scaled_inside)
             }
@@ -2675,12 +2002,7 @@ mod tests {
         }
     }
 
-    /// The document reaches the status bar, with no band of bare window between them.
-    ///
-    /// **The grip is an overlay on the bar, not a row of the document** (PR #321 review,
-    /// blocking 2): `area_h` subtracted it while the bar was under the chrome, and kept doing so
-    /// when the bar moved to the foot — leaving sixteen pixels of window face below the gutter
-    /// and one line of the file that the window had room for and did not show.
+    /// The document reaches the status bar: the grip overlays the bar, not the document.
     #[test]
     fn the_document_reaches_the_status_bar() {
         let mut a = App::new("/home/notes.txt", "/home");
@@ -2693,7 +2015,6 @@ mod tests {
         let (area, strip, gutter) = (at(AREA_KEY), at(STRIP_KEY), at(GUTTER_KEY));
         assert_eq!(area.origin.y + area.size.h as i32, strip.origin.y, "the document stops short of the status bar");
         assert_eq!(gutter.origin.y + gutter.size.h as i32, strip.origin.y, "and so does the gutter's own column");
-        // The grip still sits over chrome rather than over a row: it is in the bar's band.
         let grip = at(GRIP_KEY);
         assert!(
             grip.origin.y >= strip.origin.y,
@@ -2701,19 +2022,11 @@ mod tests {
         );
     }
 
-    /// The gutter numbers the lines that are on screen, and scrolls with them.
-    ///
-    /// **Painted rather than read off the tree** for the numbers' *place*, and read off the tree
-    /// for which numbers they are: a gutter that showed `1..n` whatever the scroll would look
-    /// right in a screenshot of the top of a file and be wrong everywhere else (desktop refresh,
-    /// Part J).
     #[test]
     fn the_gutter_numbers_the_lines_that_are_showing() {
         let mut a = App::new("/home/long.txt", "/home");
         let body: String = (1..=40).map(|n| alloc::format!("line {n}\n")).collect::<Vec<_>>().concat();
         a.loaded(&body, body.as_bytes());
-        // Tall enough to show a dozen lines: the default window fits one, and a gutter with one
-        // number in it cannot say whether it follows the scroll.
         a.resize(Size::new(600, 400));
         let theme = UiTheme::default();
         let numbers = |a: &mut App| -> Vec<String> {
@@ -2745,13 +2058,10 @@ mod tests {
         let top = numbers(&mut a);
         assert_eq!(top.first().map(String::as_str), Some("1"), "the first line is 1");
         assert!(top.len() > 1, "and the gutter numbers more than one line");
-        // **Scrolled, the numbers follow.** `scroll_to` is what the wheel and the bar both use.
         let visible = top.len();
         a.buf_mut().text.scroll_to(10, visible);
         let scrolled = numbers(&mut a);
         assert_eq!(scrolled.first().map(String::as_str), Some("11"), "ten lines down, the gutter starts at eleven");
-        // **And it stops at the end of the file rather than numbering past it** — the buffer's
-        // own count, which is 41 here because a file ending in a newline has an empty last line.
         let lines = a.buf().text.lines().len();
         a.buf_mut().text.scroll_to(lines.saturating_sub(2), visible);
         let last = numbers(&mut a);
@@ -2761,10 +2071,6 @@ mod tests {
             "the last number is the last line"
         );
         assert!(last.len() <= visible, "and the gutter does not number past the end: {last:?}");
-        // **A file shorter than the window**, which is the case that actually exercises the
-        // guard and the common one (PR #321 review, worth fixing 4): scrolling a long file
-        // clamps the offset, so the visible rows never run past the last line and an
-        // unconditional `line + 1` passed this test either way.
         let mut short = App::new("/home/short.txt", "/home");
         short.loaded("one\ntwo\nthree\n", b"one\ntwo\nthree\n");
         short.resize(Size::new(600, 400));
@@ -2776,19 +2082,11 @@ mod tests {
         );
     }
 
-    /// The view draws the buffer in the style [`BUFFER_STYLE`] names.
-    ///
-    /// **The link between the two readers** (desktop refresh, Part J): the binary measures a
-    /// pointer's `x` with that constant, and this asserts the tree wraps the document to match.
-    /// Without it the pair can drift with nothing failing — the caret simply lands in the wrong
-    /// column, further off the further into a line it goes.
     #[test]
     fn the_buffer_is_drawn_in_the_style_the_caret_is_measured_in() {
         const { assert!(BUFFER_STYLE.mono, "the buffer is fixed-advance") };
         let mut a = app();
         let e = a.view(&UiTheme::default(), None);
-        // **The wrapper is inside the keyed element**, not above it: the key goes on the sized
-        // box the dock places, and `mono` wraps the widget within it.
         fn keyed<M>(e: &Element<M>, key: u64) -> Option<&Element<M>> {
             if e.key == Some(key) {
                 return Some(e);
@@ -2798,28 +2096,17 @@ mod tests {
         fn has_mono<M>(e: &Element<M>) -> bool {
             matches!(e.node, libui::element::Node::Mono { .. }) || e.children().any(has_mono)
         }
-        // **`AREA_INNER_KEY`, not `AREA_KEY`** (PR #321 review, blocking 1): the outer box holds
-        // the scrollbar *and* the pane, and the pane holds the gutter — whose numbers are `mono`
-        // too. Searching from there, this assertion was satisfied by the gutter, and deleting
-        // the wrapper from the document left all 103 tests passing.
+        // `AREA_INNER_KEY`, not `AREA_KEY`: the outer box holds the gutter, whose numbers are
+        // `mono` too, and would satisfy the assertion with the document's wrapper deleted.
         let area = keyed(&e, AREA_INNER_KEY).expect("the document is keyed");
         assert!(has_mono(area), "the document is not drawn in the face the caret is measured in");
-        // **And the gutter is outside it**, which is what makes the search above mean the
-        // document: if the two ever nest, this test goes back to passing for the wrong reason.
         assert!(
             keyed(area, GUTTER_KEY).is_none(),
             "the gutter is inside the document's subtree, so `has_mono` proves nothing"
         );
     }
 
-    /// The buffer's glyphs are *painted* at fixed advances, end to end.
-    ///
-    /// **The claim carried by ink rather than by the shape of the tree** (PR #321 review,
-    /// blocking 1). The wrapper test asserts a `Mono` node is above the document; this one
-    /// renders the real window with the real faces and measures how far the drawn line reaches.
-    /// A proportional face draws `iiiimmmm` a great deal wider than a fixed-advance one, so the
-    /// reach says which face put the glyphs down — and the control is that the *other* face's
-    /// width is nothing like it.
+    /// The buffer's glyphs are *painted* at fixed advances; the other face is the control.
     #[test]
     fn the_buffers_glyphs_are_painted_at_fixed_advances() {
         use libdraw::format::PixelFormat;
@@ -2833,9 +2120,6 @@ mod tests {
         let theme = UiTheme::default();
         let m = libui::paint::FontMetrics::new(&face, theme.font_px);
         let mut a = App::new("/home/notes.txt", "/home");
-        // **All narrow glyphs**: `iiiimmmm` averages out — 56 proportional against 54 mono —
-        // and a test that cannot tell the two apart proves nothing. Eight `i`s are half as wide
-        // in the proportional face as in the fixed-advance one.
         a.loaded("iiiiiiii\n", b"iiiiiiii\n");
         a.resize(Size::new(600, 300));
         let (w, h) = (600u32, 300u32);
@@ -2847,7 +2131,6 @@ mod tests {
         fb.clear(theme.background);
         let mut custom = |_: u32, _: Rect, _: Rect, _: &mut MemFramebuffer| {};
         libui::paint::paint(&mut fb, &face, &theme, &e, &l, all, &mut custom);
-        // How far the first line's ink reaches, inside the document's own column.
         let row = (doc.origin.y + libui::widget::TEXT_AREA_PAD.top as i32) as u32;
         let band = row..(row + ROW_H);
         let left = doc.origin.x as u32;
@@ -2868,7 +2151,6 @@ mod tests {
             proportional.abs_diff(in_mono) > 8,
             "the two faces must differ for this to discriminate: {proportional} against {in_mono}"
         );
-        // Within a couple of pixels: a glyph's ink stops short of its advance.
         assert!(
             drawn.abs_diff(in_mono) <= 4,
             "the line reaches {drawn}, the fixed-advance face would put it at {in_mono} \
@@ -2876,13 +2158,7 @@ mod tests {
         );
     }
 
-    /// A press in the buffer lands on the column the **drawn** face puts there.
-    ///
-    /// **The other tests here cannot tell the two faces apart**: they lay out with a `FixedCell`
-    /// of eight pixels and measure with eight-per-character, so a proportional face and a
-    /// fixed-advance one are the same to them. This one uses the real faces, which is the only
-    /// way to catch a caret measured in one and drawn in the other — the pointer would land
-    /// further from the column the further into the line it went (desktop refresh, Part J).
+    /// A press lands on the column the **drawn** face puts there (real faces, not a `FixedCell`).
     #[test]
     fn a_press_in_the_buffer_lands_where_the_mono_face_draws() {
         const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
@@ -2894,19 +2170,12 @@ mod tests {
         use libui::layout::Metrics as _;
         let m = libui::paint::FontMetrics::new(&face, theme.font_px);
         let in_buffer = libui::element::TextStyle { mono: true, ..libui::element::TextStyle::default() };
-        // A line of `i`s and `m`s: in the fixed-advance face they are the same width, and in the
-        // proportional one an `m` is more than twice an `i`. Pressing past the `i`s is what
-        // separates the two.
         let mut a = App::new("/home/notes.txt", "/home");
         a.loaded("iiiimmmm", b"iiiimmmm\n");
         let size = a.window_size();
         let e = a.view(&theme, None);
         let l = libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &m);
-        // **From the document, not the pane**: `AREA_KEY` is the box that holds the gutter too
-        // since Part J, and a press computed from its edge would be a gutter to the left.
         let area = libui::layout::locate(&e, &l, AREA_INNER_KEY).expect("the document is keyed");
-        // **The prefix's width, not six times one glyph**: the widget walks boundaries by
-        // measuring prefixes, and in integer pixels those are not the same number.
         let prefix = m.text_size_as("iiiimm", in_buffer).w as i32;
         let inset = libui::widget::TEXT_AREA_PAD;
         let x = area.origin.x + inset.left as i32 + prefix;
@@ -2928,8 +2197,6 @@ mod tests {
         }
         a.take_area_pointer(|s| m.text_size_as(s, in_buffer).w);
         assert_eq!(a.buf().text.cursor(), (0, 6), "the caret is in the column pressed");
-        // **The control, run here rather than by hand**: the same press measured in the
-        // proportional face lands somewhere else entirely.
         let mut b = App::new("/home/notes.txt", "/home");
         b.loaded("iiiimmmm", b"iiiimmmm\n");
         for msg in r.pointer(&tree, &e, &l, p).0 {
@@ -2943,7 +2210,6 @@ mod tests {
         );
     }
 
-    /// A pointer event over the document, routed through the real tree.
     fn area_event(a: &mut App, kind: u16, flags: u16, buttons: u16, x: i32, y: i32) {
         let theme = UiTheme::default();
         let size = a.window_size();
@@ -2959,7 +2225,6 @@ mod tests {
         a.take_area_pointer(width);
     }
 
-    /// Where the document starts inside the window, in window coordinates.
     fn area_origin(a: &mut App) -> (i32, i32) {
         let theme = UiTheme::default();
         let size = a.window_size();
@@ -2969,12 +2234,6 @@ mod tests {
         (r.origin.x, r.origin.y)
     }
 
-    /// A press puts the caret where it landed — **through the real tree**.
-    ///
-    /// **The editor could not be clicked into at all until M15.** `TextAreaState::place` has
-    /// existed since M10, documented as "what a press does", and no widget ever handed it
-    /// anything: `text_area` took no pointer events, so the only way to move a caret was the
-    /// arrow keys.
     #[test]
     fn a_press_places_the_caret_where_it_landed() {
         let mut a = App::new("/home/notes.txt", "/home");
@@ -2982,7 +2241,6 @@ mod tests {
         assert_eq!(a.buf().text.cursor(), (0, 0), "precondition: at the start");
 
         let (ox, oy) = area_origin(&mut a);
-        // Four characters into the second row.
         area_event(
             &mut a,
             librsproto::surface::POINTER_BUTTON,
@@ -2995,7 +2253,6 @@ mod tests {
         assert!(a.buf().text.selection().is_none(), "a press selects nothing");
     }
 
-    /// A press and a drag select the range between them.
     #[test]
     fn a_drag_selects_from_the_press_to_the_pointer() {
         let mut a = App::new("/home/notes.txt", "/home");
@@ -3006,13 +2263,11 @@ mod tests {
         area_event(&mut a, librsproto::surface::POINTER_MOTION, 0, 1, ox + 6 + 5 * 8, y);
         assert_eq!(a.buf().text.selected_text().as_deref(), Some("hello"), "the drag did not select from the press");
 
-        // A motion with nothing held is a hover, and must not move anything.
         let before = a.buf().text.cursor();
         area_event(&mut a, librsproto::surface::POINTER_MOTION, 0, 0, ox + 6, y);
         assert_eq!(a.buf().text.cursor(), before, "a hover moved the caret");
     }
 
-    /// The document has a scrollbar, and dragging it scrolls without moving the caret.
     #[test]
     fn the_document_scrollbar_scrolls_and_leaves_the_caret_alone() {
         let mut a = App::new("/home/notes.txt", "/home");
@@ -3054,13 +2309,6 @@ mod tests {
     }
 
     /// Typing brings the view back to the caret, however far it was scrolled away.
-    ///
-    /// **The regression Part D introduced and Part B made reachable** (PR #290 review, 1).
-    /// `ensure_visible` keyed its "already followed" flag on the cursor's *line*, and typing does
-    /// not change the line — so after a scrollbar drag the guard fired on every repaint, the
-    /// character went into line 0, and the person went on looking at line 142. Before this branch
-    /// a text area had no scrollbar and no wheel, so there was no way to scroll away from the
-    /// caret at all.
     #[test]
     fn typing_brings_the_view_back_to_the_caret() {
         let mut a = App::new("/home/notes.txt", "/home");
@@ -3068,22 +2316,15 @@ mod tests {
         a.loaded(&text, text.as_bytes());
         let visible = (a.area_h() / ROW_H) as usize;
 
-        // A frame first, as the application draws one before anything is touched — otherwise
-        // the *first* `ensure_visible` is the one that follows, and the scroll below never
-        // happened from the widget's point of view.
         a.buf_mut().text.ensure_visible(visible);
-        // Scroll a long way from the caret, which is at (0, 0).
         a.buf_mut().text.scroll_to(142, visible);
         a.buf_mut().text.ensure_visible(visible);
         assert_eq!(a.buf().text.offset(), 142, "precondition: scrolled away and staying there");
 
-        // Now type. The character lands on line 0 — where the caret is — so the view has to
-        // come back to it, which is what every editor does.
         type_into(&mut a, "a");
         a.buf_mut().text.ensure_visible(visible);
         assert_eq!(a.buf().text.offset(), 0, "the character went into a line the person cannot see");
 
-        // And moving the caret does the same, even without changing its line.
         a.buf_mut().text.scroll_to(142, visible);
         a.buf_mut().text.ensure_visible(visible);
         assert_eq!(a.buf().text.offset(), 142, "precondition: scrolled away again");
@@ -3092,10 +2333,7 @@ mod tests {
         assert_eq!(a.buf().text.offset(), 0, "a caret that moved was left off screen");
     }
 
-    /// A document scroll survives the repaint that follows it — see `nxfiles`' twin of this.
-    ///
-    /// **`text_area` followed the caret on every build**, so a scrollbar drag was undone before
-    /// anything was drawn: the bar moved and the document did not (M15 Part D).
+    /// A document scroll survives the repaint that follows it.
     #[test]
     fn a_document_scroll_survives_the_next_repaint() {
         let mut a = App::new("/home/notes.txt", "/home");
@@ -3132,18 +2370,12 @@ mod tests {
         assert_eq!(a.buf().text.offset(), scrolled, "the repaint put the document back where its caret is");
     }
 
-    // ---- syntax highlighting (M14 Part G) ----
-
-    /// An editor holding `text` from a file called `name`.
     fn coloured(name: &str, text: &str) -> App {
         let mut a = App::new(&alloc::format!("/home/{name}"), "/home");
         a.loaded(text, text.as_bytes());
         a
     }
 
-    /// Type `text`, reaching for shift when a character needs it.
-    ///
-    /// `type_into` presses unshifted keys only, which cannot spell `/*`.
     fn type_shifted(a: &mut App, text: &str) {
         for want in text.bytes() {
             let (code, mods) = (1u16..=90)
@@ -3159,7 +2391,6 @@ mod tests {
         }
     }
 
-    /// The runs the current buffer would draw, as `(line, text, colour)`.
     fn ink_of(a: &mut App) -> Vec<(usize, String, libdraw::format::Rgb)> {
         let ui = UiTheme::default();
         let lines: Vec<String> = a.buf().text.lines().to_vec();
@@ -3181,14 +2412,11 @@ mod tests {
             ]
         );
 
-        // A name this system knows nothing about is plain text, which is an answer rather than
-        // a gap: no runs at all, and the widget draws one colour.
         let mut a = coloured("notes.txt", "[server]\nport = 80\n");
         assert_eq!(a.language_name(), "plain");
         assert!(ink_of(&mut a).is_empty());
     }
 
-    /// Naming a buffer settles its language — the Save As path.
     #[test]
     fn saving_under_a_new_name_recolours_the_buffer() {
         let mut a = coloured("untitled", "# a heading\n");
@@ -3204,11 +2432,6 @@ mod tests {
     }
 
     /// An edit above a block comment recolours the lines **below** it.
-    ///
-    /// **The failure the plan named**: colours going stale below an edit is what a per-line
-    /// cache gets wrong, and it is invisible unless a test asks. Opening a comment on line 0
-    /// must turn lines 1 and 2 into comment, and closing it again must turn them back —
-    /// neither line was touched by the keystroke.
     #[test]
     fn opening_a_block_comment_recolours_the_lines_below_the_edit() {
         let ui = UiTheme::default();
@@ -3216,7 +2439,6 @@ mod tests {
         let keywords = |a: &mut App| ink_of(a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count();
         assert_eq!(keywords(&mut a), 2, "precondition: two `let`s are coloured");
 
-        // Type `/*` at the very start, which is where the cursor is.
         type_shifted(&mut a, "/*");
         assert_eq!(keywords(&mut a), 0, "the lines below the edit are still code");
         let runs = ink_of(&mut a);
@@ -3226,22 +2448,14 @@ mod tests {
         );
         assert_eq!(runs.len(), 3, "one run per line, each the whole line");
 
-        // …and closing it puts them back, which is the same staleness in the other direction.
         type_shifted(&mut a, "*/");
         assert_eq!(keywords(&mut a), 2, "closing the comment left the lines below stale");
     }
 
-    /// The rescan starts at or **above** the edit, even when the cursor ends up below it.
-    ///
-    /// **The case a "rescan from the cursor's line" rule gets wrong**, and the reason `update`
-    /// takes the minimum of the cursor before and after. Pressing Enter leaves the cursor on the
-    /// *new* line — one below the line that was split — so a rescan starting there would begin
-    /// from a cached state belonging to a line that has since moved down, and read the whole of
-    /// the shifted line as a string.
+    /// The rescan starts at or **above** the edit: Enter leaves the cursor below it.
     #[test]
     fn a_newline_rescans_from_the_line_that_was_split_not_from_the_cursor() {
         let ui = UiTheme::default();
-        // A Rust string that spans lines, so there is a state to get wrong.
         let mut a = coloured("lib.rs", "let a = \"x\ny\";\n");
         assert_eq!(
             ink_of(&mut a).iter().filter(|(_, _, c)| *c == ui.syntax_keyword).count(),
@@ -3249,7 +2463,6 @@ mod tests {
             "precondition: `let` is coloured and the string runs to the next line"
         );
 
-        // Enter at the very start: every line moves down one, and the cursor ends on line 1.
         press_key(&mut a, libkern::abi::KEY_ENTER);
         assert_eq!(a.buf().text.cursor().0, 1, "precondition: the cursor is below the split");
         let runs = ink_of(&mut a);
@@ -3259,18 +2472,7 @@ mod tests {
         );
     }
 
-    /// A paste recolours the lines below it, exactly as typing the same bytes does.
-    ///
-    /// **A paste does not go through `update`.** `Msg::Paste` only asks the clipboard; the
-    /// binary calls [`App::pasted`] when the answer arrives, so the bookkeeping `update` does
-    /// for every message is skipped — and `dirty_from` left at its "nothing was touched" value
-    /// clamps to the *last* line, which re-derives one line and leaves every state above it as
-    /// it was before the pasted text existed. Both `let`s stayed coloured under an open block
-    /// comment, permanently: `rescan` records the revision either way, so nothing later put it
-    /// right (PR #289 review, blocking 1).
-    ///
-    /// **Typing the same two bytes is the control**, and it passed throughout — which is the
-    /// asymmetry the test above cannot see.
+    /// A paste recolours the lines below it, as typing the same bytes does; it bypasses `update`.
     #[test]
     fn a_pasted_block_comment_recolours_the_lines_below_it() {
         let ui = UiTheme::default();
@@ -3281,20 +2483,13 @@ mod tests {
         a.pasted("/*\n", 0, 1);
         assert_eq!(keywords(&mut a), 0, "the lines below the paste kept the colours they had before it");
 
-        // **A paste that adds no line, below the top**, which is the case the fallback alone
-        // cannot answer: with the line count unchanged the scan may exit at the first state
-        // that matches, and starting from line 0 it matches immediately — so the edit is never
-        // reached. This is what makes `pasted` reporting its own position load-bearing rather
-        // than merely an optimisation.
-        // The pasted line carries no keyword of its own, so what the assertion sees is the
-        // line *below* it — which is the only place the staleness shows.
+        // A paste that adds no line, below the top: the scan from line 0 would exit at once.
         let mut a = coloured("lib.rs", "fn f() {\nx\n    let a = 1;\n}\n");
         assert_eq!(keywords(&mut a), 2, "precondition: `fn` and `let`");
         press_key(&mut a, libkern::abi::KEY_DOWN);
         a.pasted("/*", 0, 1);
         assert_eq!(keywords(&mut a), 1, "only `fn`, above the comment, is still a keyword");
 
-        // …and cycling the ring to another entry is the same path, with the same hole.
         let mut a = coloured("lib.rs", "let a = 1;\nlet b = 2;\n");
         assert_eq!(keywords(&mut a), 2);
         a.pasted("//\n", 0, 1);
@@ -3304,15 +2499,6 @@ mod tests {
     }
 
     /// An edit that reports nothing still recolours correctly — slowly, rather than wrongly.
-    ///
-    /// **The contract that makes the next bypass a performance bug instead of a silent one.**
-    /// `pasted` was exactly such a path for the whole of Part G: it edits the buffer without
-    /// going through `update`, so `dirty_from` stayed at "nothing was touched" and the rescan
-    /// re-derived the last line only. This reaches into the buffer the same way, and asserts
-    /// the colours below the edit are right anyway.
-    ///
-    /// **Both halves of the fallback are needed and this needs both**: starting at line 0 is
-    /// not enough on its own, because the early exit fires on line 0 for an edit further down.
     #[test]
     fn an_edit_that_says_nothing_about_where_it_landed_still_recolours_below_itself() {
         let ui = UiTheme::default();
@@ -3320,22 +2506,12 @@ mod tests {
         let mut a = coloured("lib.rs", "fn f() {\nx\n    let a = 1;\n}\n");
         assert_eq!(keywords(&mut a), 2, "precondition: `fn` and `let`");
 
-        // Straight into the state, naming no line and changing none of the count.
         a.buf_mut().text.select_range((1, 0), (1, 0));
         a.buf_mut().text.insert_text("/*");
         assert_eq!(keywords(&mut a), 1, "the lines below an unreported edit went stale");
     }
 
     /// Inserting a line above a block comment does not leave the cache one line out of step.
-    ///
-    /// **The early exit is unsound when the line count changed**, which is what the guard on it
-    /// is for: `starts` is indexed by line, so inserting a line shifts every entry below the
-    /// insertion and a "the state here already matches" comparison is then against a *different
-    /// line's* state. It exits on the first line and everything below keeps the colours of the
-    /// line that used to be there.
-    ///
-    /// The closer is what makes it visible: `*/` inside a block comment is a comment, and `*/`
-    /// outside one is not anything at all.
     #[test]
     fn inserting_a_line_above_a_block_comment_does_not_shift_the_cache_under_it() {
         let ui = UiTheme::default();
@@ -3353,10 +2529,8 @@ mod tests {
 
     #[test]
     fn a_failed_save_keeps_the_buffer_and_says_so() {
-        // **The one rule this application exists to get right.** An editor that loses your work
-        // quietly is the one thing an editor must never be, so a failure changes the message and
-        // nothing else: the text stays, and it stays *modified*, because a buffer marked saved
-        // is one a person can close without being asked.
+        // A failure changes the message and nothing else: the text stays and stays *modified*,
+        // since a buffer marked saved can be closed without being asked.
         let mut a = app();
         key(&mut a, KEY_X, 0);
         let text = a.text();
@@ -3367,7 +2541,6 @@ mod tests {
         assert!(a.modified(), "and it is still unsaved");
         assert!(a.status().contains("NOT saved"), "status was {:?}", a.status());
 
-        // And a save that works clears exactly that.
         a.update(Msg::Save);
         let (saved_key, _, owed) = a.take_save().expect("a save was asked for");
         a.saved(saved_key, Ok(owed.len()));
@@ -3376,8 +2549,6 @@ mod tests {
 
     #[test]
     fn a_buffer_that_could_not_be_read_refuses_to_be_written() {
-        // The danger is the empty window: a failed read shows nothing, and saving nothing over a
-        // file is that file destroyed by an editor that never displayed it.
         let mut a = App::new("/home/notes.txt", "/home");
         a.blocked("could not be read");
         key(&mut a, KEY_X, 0);
@@ -3389,10 +2560,8 @@ mod tests {
 
     #[test]
     fn a_file_that_did_not_survive_being_read_opens_modified() {
-        // **The one case where the editor would write something it never showed.** Reading
-        // normalises line endings, so a CRLF file is already something else on screen — and an
-        // editor that called that unmodified would rewrite it, two bytes shorter per line, on a
-        // `Ctrl+S` pressed out of habit (PR #259 review, finding 3).
+        // The one case where the editor would write something it never showed: reading
+        // normalises line endings, and a habitual `Ctrl+S` would rewrite a CRLF file shorter.
         let mut a = App::new("/home/dos.txt", "/home");
         a.loaded("alpha\nbeta\n", b"alpha\r\nbeta\r\n");
         assert!(a.modified(), "the buffer is not what the file holds");
@@ -3400,15 +2569,12 @@ mod tests {
         assert!(a.status().contains("line endings"), "status was {:?}", a.status());
         assert_eq!(a.refusal(), None, "it is writable — it just is not the same bytes");
 
-        // Saving makes the file match the buffer, which is what clears it.
         a.update(Msg::Save);
         let (saved_key, _, owed) = a.take_save().expect("a blocked buffer is a different thing");
         a.saved(saved_key, Ok(owed.len()));
         assert!(!a.modified());
         assert_eq!(a.title(), "dos.txt");
 
-        // And a file that *does* survive is not marked: this must distinguish, or it is a
-        // permanent asterisk rather than an answer.
         let mut b = App::new("/home/unix.txt", "/home");
         b.loaded("alpha\nbeta\n", b"alpha\nbeta\n");
         assert!(!b.modified());
@@ -3416,11 +2582,6 @@ mod tests {
 
     #[test]
     fn a_drop_opens_a_tab_and_never_costs_the_one_that_is_open() {
-        // **The rule this replaces, and why it went** (M12 Part D). A drop used to *replace* the
-        // buffer, so it had to be refused while there was unsaved work — a drop that visibly did
-        // nothing, for a reason the person had to read the strip to find. With tabs there is
-        // nothing to lose by taking it, so the refusal is gone and the protection is stronger:
-        // the modified buffer is not touched at all.
         let mut a = app();
         key(&mut a, KEY_X, 0);
         assert!(a.modified(), "precondition: there is something to lose");
@@ -3430,7 +2591,6 @@ mod tests {
         assert_eq!(a.path(), "/home/other.txt", "and it is what is on screen now");
         assert_eq!(a.tab_count(), 2);
 
-        // The first buffer is still there, still modified, still exactly as it was.
         a.update(Msg::SelectTab(TAB_KEY_BASE));
         assert_eq!(a.path(), "/home/notes.txt");
         assert_eq!(a.text(), before);
@@ -3439,8 +2599,6 @@ mod tests {
 
     #[test]
     fn dropping_a_file_that_is_already_open_switches_to_its_tab() {
-        // Two tabs on one file are two buffers that can disagree about what is in it, and the
-        // last one saved wins silently.
         let mut a = app();
         a.accept_drop("/home/other.txt");
         assert_eq!(a.tab_count(), 2);
@@ -3454,8 +2612,6 @@ mod tests {
 
     #[test]
     fn dropping_the_file_already_open_does_nothing() {
-        // The likeliest accident with a browser beside an editor — and re-reading would be a
-        // way to lose an unsaved buffer that the rule above has just protected.
         let mut a = app();
         assert!(!a.accept_drop("/home/notes.txt"));
         assert!(a.status().contains("already open"), "status was {:?}", a.status());
@@ -3464,22 +2620,14 @@ mod tests {
 
     #[test]
     fn an_untitled_buffer_is_named_on_save_and_saved_where_it_was_named() {
-        // **This is what "nxedit doesn't launch from the menu" was**: the applications modal
-        // passes no arguments, the editor required `argv[1]`, so it started and exited (M11
-        // Part E batch 7).
         let mut a = App::new("", "/home/alice");
         assert_eq!(a.title(), "untitled", "an unnamed buffer has no title to show");
         assert!(a.take_save().is_none(), "an untitled buffer had somewhere to be written");
 
-        // Save asks rather than writes. **The control is `take_save`**: a version that set the
-        // flag anyway would pass an assertion about the status text alone.
         a.update(Msg::Save);
         assert!(a.take_save().is_none(), "an untitled save wrote to a path nobody chose");
         assert!(a.status().contains("name it"), "status was {:?}", a.status());
 
-        // The keys are the field's now, buffer included.
-        // "notes", by keycode — the codes the keymap maps to those letters, which is what an
-        // injected keystroke carries.
         for c in [49u16, 24, 20, 18, 31] {
             key(&mut a, c, 0);
         }
@@ -3487,8 +2635,6 @@ mod tests {
 
         key(&mut a, libkern::abi::KEY_ENTER, 0);
         assert_eq!(a.path(), "/home/alice/notes", "named into the wrong directory");
-        // Unmarked: naming a buffer is not editing it, and this one has had nothing typed into
-        // it — the keys went to the field. The mark means "not what is on disk".
         assert_eq!(a.title(), "notes", "the title bar still says untitled");
         assert!(a.take_save().is_some(), "confirming a name did not ask for the save");
     }
@@ -3502,7 +2648,6 @@ mod tests {
         assert_eq!(a.path(), "", "escaping the prompt named the buffer anyway");
         assert!(a.take_save().is_none(), "escaping the prompt saved it anyway");
 
-        // And an empty name is not a name: it would write to the directory itself.
         a.update(Msg::Save);
         key(&mut a, libkern::abi::KEY_ENTER, 0);
         assert_eq!(a.path(), "", "an empty name became a path");
@@ -3512,7 +2657,6 @@ mod tests {
 
     #[test]
     fn a_named_buffer_saves_without_asking() {
-        // The control for the two above: the path that *has* a name must not grow a prompt.
         let mut a = app();
         a.update(Msg::Save);
         assert!(a.take_save().is_some(), "a named buffer asked for a name");
@@ -3520,9 +2664,6 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_not_a_failure() {
-        // Opening a path that is not there is how a file gets made, so the buffer is writable —
-        // and the strip says which of the two happened, because a person who meant to open an
-        // existing file wants to know they did not.
         let mut a = App::new("/home/new.txt", "/home");
         a.absent();
         assert_eq!(a.refusal(), None);
@@ -3546,7 +2687,6 @@ mod tests {
         let (saved_key, _, owed) = a.take_save().unwrap();
         a.saved(saved_key, Ok(owed.len()));
         assert_eq!(a.title(), "notes.txt");
-        // Edited again after a save is modified again — the revision never goes backwards.
         key(&mut a, KEY_X, 0);
         assert_eq!(a.title(), "* notes.txt");
     }
@@ -3558,17 +2698,13 @@ mod tests {
         assert_eq!(a.text(), "hello", "nothing was typed");
         assert_eq!(a.take_save().map(|(_, _, t)| t).as_deref(), Some("hello"), "and a save is owed");
 
-        // **A digit, because a letter proves nothing here.** `libinput`'s keymap folds
-        // `Ctrl`+letter to a control byte, which `TextAreaState::apply` already declines — so a
-        // test using `Ctrl+X` passes with this guard deleted, which is what the first version of
-        // it did. The keymap folds *letters only*: `Ctrl+1` is still `1`, printable, and typed
-        // straight into the file by an editor that passes chords through.
+        // A digit, because a letter proves nothing: `libinput` folds `Ctrl`+letter to a control
+        // byte that `apply` declines, so `Ctrl+X` passes with this guard deleted. `Ctrl+1` is
+        // still printable `1`.
         key(&mut a, KEY_1, MOD_CTRL);
         assert_eq!(a.text(), "hello", "a chord this editor does not have types nothing");
         assert_eq!(a.take_save(), None, "and asks for nothing");
 
-        // The same key without the chord is ordinary text, so what is being tested is the
-        // modifier and not the key.
         key(&mut a, KEY_1, 0);
         assert_eq!(a.text(), "1hello");
     }
@@ -3585,7 +2721,6 @@ mod tests {
 
     #[test]
     fn a_key_release_does_nothing() {
-        // Both edges arrive; acting on both types every character twice.
         let mut a = app();
         a.update(Msg::Key(KeyEvent::new(1, KEY_X, 0, 0)));
         assert_eq!(a.text(), "hello");
@@ -3593,9 +2728,6 @@ mod tests {
 
     #[test]
     fn what_is_written_ends_with_a_newline() {
-        // **What a text file is.** A last line with no newline reads as one line shorter than it
-        // looks to `open` and to every other reader, so the editor applies the convention at the
-        // one point it writes bytes.
         assert_eq!(to_bytes("one\ntwo"), b"one\ntwo\n");
         assert_eq!(to_bytes("one\n"), b"one\n", "and does not double it");
         assert_eq!(to_bytes(""), b"", "an empty buffer is an empty file, not a blank line");
@@ -3603,8 +2735,6 @@ mod tests {
 
     #[test]
     fn the_name_is_the_last_component() {
-        // The title's name comes from `libfs`, so this pins what this application depends on
-        // rather than re-testing that crate: a trailing separator must not give an empty title.
         let named = |p: &str| App::new(p, "/home").title();
         assert_eq!(named("/home/alice/notes.txt"), "notes.txt");
         assert_eq!(named("notes.txt"), "notes.txt");
@@ -3613,12 +2743,9 @@ mod tests {
 
     #[test]
     fn the_chord_keycodes_are_the_ones_the_keymap_names() {
-        // **The three this part added, pinned like the rest** (PR #287 review, optional 11).
         assert_eq!(libinput::keymap::to_char(SELECT_ALL_KEYCODE, 0), Some(b'a'));
         assert_eq!(libinput::keymap::to_char(REPLACE_KEYCODE, 0), Some(b'h'));
         assert_eq!(libinput::keymap::to_char(GO_TO_KEYCODE, 0), Some(b'g'));
-        // Pinned against the table they have to agree with rather than against the comments
-        // beside them, the way the save chord already is.
         assert_eq!(libinput::keymap::to_char(UNDO_KEYCODE, 0), Some(b'z'));
         assert_eq!(libinput::keymap::to_char(REDO_KEYCODE, 0), Some(b'y'));
         assert_eq!(libinput::keymap::to_char(FIND_KEYCODE, 0), Some(b'f'));
@@ -3641,10 +2768,8 @@ mod tests {
 
     #[test]
     fn a_save_is_an_undo_boundary() {
-        // **Found by the gate rather than by a host test**, which is worth recording: the editor
-        // opened an empty file, six characters were typed, it was saved, two more were typed —
-        // and one undo emptied the buffer, because nothing had closed the group across the save.
-        // Undoing past a save is fine; undoing *through* one in a single step is not.
+        // Found by a gate: six typed, saved, two more typed, and one undo emptied the buffer
+        // because nothing closed the group across the save.
         let mut a = App::new("/home/notes.txt", "/home");
         a.loaded("", b"");
         for _ in 0..2 {
@@ -3664,8 +2789,6 @@ mod tests {
 
     #[test]
     fn an_undo_with_nothing_behind_it_says_so_rather_than_nothing() {
-        // A chord that silently does nothing is indistinguishable from one the editor does not
-        // have — which is the discoverability problem, one keystroke at a time.
         let mut a = app();
         key(&mut a, UNDO_KEYCODE, MOD_CTRL);
         assert!(a.status().contains("nothing to undo"), "status was {:?}", a.status());
@@ -3675,8 +2798,6 @@ mod tests {
 
     #[test]
     fn undoing_makes_the_buffer_modified_again() {
-        // The whole point of undo in an editor: what is on screen no longer matches the file, so
-        // closing has to ask. `modified` is derived from the revision, and `undo` moves it.
         let mut a = app();
         key(&mut a, KEY_X, 0);
         a.update(Msg::Save);
@@ -3695,7 +2816,6 @@ mod tests {
         key(&mut a, FIND_KEYCODE, MOD_CTRL);
         assert_eq!(a.field_kind(), Some(Field::Finding), "the keys are the field's now");
 
-        // `t`, `w`, `o` — typed into the field rather than into the buffer.
         for code in [20u16, 17, 24] {
             key(&mut a, code, 0);
         }
@@ -3704,36 +2824,25 @@ mod tests {
 
         key(&mut a, libkern::abi::KEY_ENTER, 0);
         assert!(a.status().contains("found"), "status was {:?}", a.status());
-        // **The field stays open**, so Enter again is the next match rather than a re-type.
         assert_eq!(a.field_kind(), Some(Field::Finding));
 
         key(&mut a, libkern::abi::KEY_ESC, 0);
         assert_eq!(a.field_kind(), None, "and Escape ends it");
     }
 
-    // --- the clipboard (M12 Part E) -----------------------------------------
-
-    /// Select `needle` in the current buffer, the way `Ctrl+F` does.
     fn select(a: &mut App, needle: &str) {
         assert!(a.buf_mut().text.find(needle), "the fixture contains {needle}");
     }
 
     #[test]
     fn copying_nothing_is_not_a_request() {
-        // **A copy that pushed an empty entry would move the ring's serial** under every client
-        // that was mid-cycle, and push whatever was last copied one place further back — for a
-        // gesture that had nothing to copy.
-        //
-        // **Two guards since M14 Part A, and they say different things.** The Edit row is greyed
-        // with no selection, so `Ctrl+C` is declined by the table before it reaches anything —
-        // the chord and the row agree, which is the whole of decision 2. Reaching `copy` some
-        // other way still gets the explanation.
+        // An empty entry would move the ring's serial under a client mid-cycle. The Edit row is
+        // greyed, so the table declines the chord; reaching `copy` another way gets the message.
         let mut a = app();
         let before = String::from(a.status());
         key(&mut a, COPY_KEYCODE, MOD_CTRL);
         assert_eq!(a.take_clip_request(), None);
         assert_eq!(a.status(), before, "a greyed row's chord does nothing, silently");
-        // The row is greyed, which is what makes the silence legible rather than a bug.
         let edit = a.menu_table().into_iter().find(|m| m.title == "Edit").expect("an Edit menu");
         for row in ["Cut", "Copy"] {
             assert!(
@@ -3744,45 +2853,30 @@ mod tests {
                 "{row} is offered with nothing selected"
             );
         }
-        // And the message is still there for a caller that arrives another way.
         a.update(Msg::Copy);
         assert_eq!(a.take_clip_request(), None);
         assert_eq!(a.status(), "nothing to copy");
-        // **The negative control**: with a selection the same chord does reach the clipboard,
-        // so the silence above is about the selection and not about the chord being unwired.
         select(&mut a, "ell");
         key(&mut a, COPY_KEYCODE, MOD_CTRL);
         assert_eq!(a.take_clip_request(), Some(ClipRequest::Copy(String::from("ell"))));
     }
 
-    /// No menu row acts while a field is open, which is the rule `key` has always followed.
-    ///
-    /// **The demonstrated failure** (PR #280 review, worth fixing 3): with an untitled buffer's
-    /// naming prompt open and a filename half typed, Edit ▸ Find replaced the field — losing the
-    /// name and silently abandoning the save — and Edit ▸ Undo edited the buffer behind the
-    /// prompt. The menu was a way *around* the "while a name is being typed the keys are the
-    /// field's" invariant rather than a second statement of it.
+    /// No menu row acts while a field is open: Find once replaced a naming field.
     #[test]
     fn no_menu_row_acts_while_a_field_is_open() {
-        // An untitled buffer, so Save asks for a name.
         let mut a = App::new("", "/home");
         a.update(Msg::Save);
         key(&mut a, 30, 0); // `a`, one character of the filename
         assert_eq!(a.field_kind(), Some(Field::Naming));
         assert_eq!(a.naming_len(), Some(1), "a name is half typed");
 
-        // **Every row, not the two that were demonstrated.** A rule asked of the table has to be
-        // checked against the table, or the next row added is the one that forgets.
         for it in a.menu_table().iter().flat_map(|m| m.items.iter()) {
             let Item::Action { label, enabled, .. } = it else { continue };
             assert!(!enabled, "{label} is offered while a name is being typed");
         }
-        // Nothing reached the field or the buffer: the state is exactly what it was.
         assert_eq!(a.field_kind(), Some(Field::Naming));
         assert_eq!(a.naming_len(), Some(1));
 
-        // **The negative control**, and it is the whole test: close the field and the same rows
-        // come back. Without it this would pass for a version that disabled everything always.
         key(&mut a, libkern::abi::KEY_ESC, 0);
         assert_eq!(a.field_kind(), None, "Esc closed the prompt");
         let live = a
@@ -3794,9 +2888,6 @@ mod tests {
         assert_eq!(live, 14, "everything but Cut and Copy, which want a selection");
     }
 
-    // --- Select All and Replace (M14 Part E) ---------------------------------
-
-    /// Select All takes the whole buffer, and an empty one has nothing to take.
     #[test]
     fn select_all_takes_the_buffer_and_an_empty_one_stays_empty() {
         let mut a = app();
@@ -3804,30 +2895,18 @@ mod tests {
         a.update(Msg::SelectAll);
         assert_eq!(a.buf().text.selected_text().as_deref(), Some("one\ntwo\nthree"), "every line, including the last");
 
-        // **An empty buffer selects nothing** — and this holds without a guard in `SelectAll`,
-        // because `TextAreaState::selection` returns `None` for a collapsed range. The guard that
-        // used to be here claimed to prevent "a zero-width range the copy path would treat as a
-        // selection", a hazard that cannot occur since `has_selection` delegates to `selection`;
-        // it is gone, and this asserts the property rather than the guard (PR #287 review, worth
-        // fixing 7).
         let mut b = app();
         b.loaded("", b"");
         b.update(Msg::SelectAll);
         assert!(b.buf().text.selection().is_none(), "nothing to select");
         assert!(!b.buf().text.has_selection(), "and nothing for Copy to find");
 
-        // **A last line ending in a multi-byte character** — `select_range` takes a *byte* offset,
-        // and a character count is short by one per such character.
         let mut c = app();
         c.loaded("one\néxy", "one\néxy".as_bytes());
         c.update(Msg::SelectAll);
         assert_eq!(c.buf().text.selected_text().as_deref(), Some("one\néxy"), "the last character is not dropped");
     }
 
-    /// Replace asks what, then with what, and each Enter takes the next match.
-    ///
-    /// **The field stays open so Enter walks**, which is the shape Find already has — a replace
-    /// that closed on the first hit would need re-opening for the second.
     #[test]
     fn replace_walks_the_matches_one_enter_at_a_time() {
         let mut a = app();
@@ -3852,16 +2931,10 @@ mod tests {
     }
 
     /// A needle that is not in the buffer does not consume somebody's selection.
-    ///
-    /// **`find` leaves the anchor alone when it misses**, so a selection made *before* Replace was
-    /// opened is still there — and stage two's guard used to be "is anything selected" rather than
-    /// "is the match selected". Typing a replacement then destroyed that selection and reported a
-    /// replacement of a needle the buffer does not contain (PR #287 review, blocking 3).
     #[test]
     fn replacing_an_absent_needle_leaves_the_selection_alone() {
         let mut a = app();
         a.loaded("hello world", b"hello world");
-        // A selection the person made themselves.
         a.buf_mut().text.select_range((0, 6), (0, 11));
         assert_eq!(a.buf().text.selected_text().as_deref(), Some("world"));
 
@@ -3875,17 +2948,12 @@ mod tests {
             "it stays on the first stage rather than asking what to replace it with"
         );
 
-        // …and even if the person types on, nothing is replaced.
         type_into(&mut a, "qq");
         press_key(&mut a, libkern::abi::KEY_ENTER);
         assert_eq!(a.text(), "hello world", "the buffer is untouched");
     }
 
     /// A selection made *between* the two stages is not what gets replaced.
-    ///
-    /// **The second guard, and it is reachable**: stage one refusing a miss keeps a *stale*
-    /// selection out, but nothing stops somebody clicking elsewhere while the "replace with"
-    /// field is open. The guard is "the selection is the match", not "something is selected".
     #[test]
     fn a_selection_made_between_the_stages_is_not_replaced() {
         let mut a = app();
@@ -3895,7 +2963,6 @@ mod tests {
         press_key(&mut a, libkern::abi::KEY_ENTER);
         assert_eq!(a.field_kind(), Some(Field::ReplaceWith), "the match was found");
 
-        // The person selects something else before answering.
         a.buf_mut().text.select_range((0, 8), (0, 11));
         assert_eq!(a.buf().text.selected_text().as_deref(), Some("dog"));
 
@@ -3904,7 +2971,6 @@ mod tests {
         assert_eq!(a.text(), "cat and dog", "`dog` was not replaced");
     }
 
-    /// An empty needle ends the replace rather than matching everything.
     #[test]
     fn replacing_nothing_is_refused() {
         let mut a = app();
@@ -3916,11 +2982,6 @@ mod tests {
         assert_eq!(a.text(), "hello", "and the buffer is untouched");
     }
 
-    /// The strip reports the cursor from one, and counts characters rather than bytes.
-    ///
-    /// **Bytes would be the easy answer and the wrong one**: `col` is a byte offset because that
-    /// is what indexes a `String`, so a cursor after a two-byte character would read column 3
-    /// where a person sees column 2.
     #[test]
     fn the_strip_reports_the_position_a_person_counts() {
         let mut a = app();
@@ -3930,14 +2991,12 @@ mod tests {
         a.buf_mut().text.place(1, 3);
         assert_eq!(a.position_text(), "line 2, col 4");
 
-        // A multi-byte character: the cursor sits after `é`, which is one character and two bytes.
         let mut b = app();
         b.loaded("é!", "é!".as_bytes());
         b.buf_mut().text.place(0, 2);
         assert_eq!(b.position_text(), "line 1, col 2", "characters, not bytes");
     }
 
-    /// Go to Line jumps, clamps past the end, and refuses what is not a number.
     #[test]
     fn go_to_line_clamps_and_refuses() {
         let mut a = app();
@@ -3950,19 +3009,14 @@ mod tests {
         assert_eq!(a.buf().text.cursor().0, 1, "line 2 is index 1");
         assert_eq!(a.field_kind(), None, "and the field closed");
 
-        // **Past the end means the end**, which is what every editor does: the intent is
-        // unambiguous and an error there would be pedantry.
         a.update(Msg::GoTo);
         type_into(&mut a, "900");
         press_key(&mut a, libkern::abi::KEY_ENTER);
         assert_eq!(a.buf().text.cursor().0, 2, "clamped to the last line");
-        // **The cursor alone cannot see this**: `TextAreaState::place` clamps too, so line 900
-        // lands on the last line with or without the clamp here. What differs is what the strip
-        // *says* and what the binary is told to scroll to (PR #287 review, worth fixing 8).
+        // `place` clamps too: the strip's message and the scroll line are what differ.
         assert_eq!(a.status(), "line 3", "and says where it actually went");
         assert_eq!(a.take_find_report(), Some(Some(2)), "the scroll target is the real line");
 
-        // **A typo is refused**, because that is not an unambiguous intent.
         a.update(Msg::GoTo);
         type_into(&mut a, "x");
         press_key(&mut a, libkern::abi::KEY_ENTER);
@@ -3970,42 +3024,20 @@ mod tests {
         assert_eq!(a.field_kind(), Some(Field::GoingTo), "and the field stays open");
     }
 
-    /// The chord a menu row advertises does what choosing that row does.
+    /// The chord a menu row advertises does what choosing that row does, via `App::key`.
     ///
-    /// **This drives `App::key`**, which is the whole point and is what the first version of this
-    /// test did not do (PR #280 review, worth fixing 4). It built an event from a row's `Accel`
-    /// and asked `accel_match` about it — both sides of one table, with the application never
-    /// consulted. That pins the table against shadowing chords, which is worth having and is
-    /// asserted below; it does not pin that anything *routes* through it, and the test passed
-    /// with `App::key`'s `accel_match` call deleted.
-    ///
-    /// **The property is stated as an equivalence rather than per row**, which is what keeps it
-    /// from being a second list of what each action does: two identical editors, one sent the
-    /// row's message and one sent the row's chord, must end in the same state. A per-row
-    /// assertion here would be exactly the drift decision 2 exists to prevent.
+    /// Stated as an equivalence: two editors, one sent the message and one the chord, end alike.
     #[test]
     fn every_advertised_chord_does_what_its_row_says() {
-        /// Everything about an editor that any of these rows can move.
         fn digest(a: &mut App) -> String {
             let clip = a.take_clip_request();
             let save = a.take_save();
-            // **Every outbox, and this is the third time the control below has said so** — Close
-            // Tab, Save, and now New Window and Quit, each of which changes nothing a digest
-            // watching only the buffer can see.
+            // Every outbox: several rows change nothing a digest of the buffer alone can see.
             let (nw, q) = (a.take_new_window(), a.take_quit());
-            // **And the chooser's**, which is the fourth time this control has caught a digest
-            // that could not see a new outbox: opening a chooser changes no buffer and no tab.
             let (cl, op) = (a.take_chooser_list(), a.take_open());
             let choosing = a.chooser().map(|c| c.mode);
-            // **`closing` and `save` are in here because the negative control found them
-            // missing.** Close Tab on a lone tab closes the *window* — the chord means that
-            // everywhere it exists — and Save on a titled buffer records an outbox entry rather
-            // than touching the text. A digest that watched only the buffer said both rows
-            // changed nothing, which is exactly what that control is for.
-            // **And the selection's extent** — the fifth time. The fixture starts *with* a
-            // selection so that Cut and Copy are live, so a digest that watched only whether one
-            // exists cannot see Select All widening it, and the control below rejected the row
-            // for changing nothing (M14 Part E).
+            // `closing` and `save` are here because the negative control found them missing; so is
+            // the selection's extent (Select All widens it).
             let sel = a.buf().text.selection();
             alloc::format!(
                 "{:?}|{}|{:?}|{clip:?}|{save:?}|{}|{:?}|{}{}|{nw}{q}|{cl:?}{op:?}{choosing:?}|{sel:?}",
@@ -4018,8 +3050,6 @@ mod tests {
                 a.confirming(),
             )
         }
-        // **With a selection**, so Cut and Copy are live: the loop below skips disabled rows,
-        // and a table built from an untouched editor would quietly check seven of the nine.
         let mut fixture = app();
         select(&mut fixture, "ell");
         let table = fixture.menu_table();
@@ -4029,8 +3059,6 @@ mod tests {
                 continue;
             };
             checked += 1;
-            // The table has no two rows on one chord, which is the property the old version of
-            // this test pinned and the only one it pinned.
             let ev = KeyEvent::new(1, acc.key(), KEY_DOWN, acc.mods());
             assert_eq!(
                 libui::menu::accel_match(&table, &ev).as_ref(),
@@ -4038,8 +3066,6 @@ mod tests {
                 "{label} advertises {} and the table hands it to another row",
                 acc.label()
             );
-            // …and the application routes through it. Two editors from the same fixture, with a
-            // selection so the rows that need one are live.
             let (mut by_row, mut by_chord) = (app(), app());
             for a in [&mut by_row, &mut by_chord] {
                 select(a, "ell");
@@ -4048,14 +3074,9 @@ mod tests {
             by_chord.update(Msg::Key(ev));
             let mut untouched = app();
             select(&mut untouched, "ell");
-            // **Each digest is taken exactly once**, because it is destructive: it drains the
-            // clipboard and save outboxes, which is the only way to see them. Calling it twice
-            // on one editor reports the second call's emptiness as a difference — which is what
-            // the first version of this test did, and it read as "Save changes nothing".
+            // Each digest is taken once: it drains the outboxes.
             let (by_row, by_chord, untouched) = (digest(&mut by_row), digest(&mut by_chord), digest(&mut untouched));
             assert_eq!(by_chord, by_row, "{label}: {} does not do what choosing the row does", acc.label());
-            // **The negative control**: the two agreeing is only evidence if the row moved
-            // something. An editor that ignored both would pass the assertion above.
             assert_ne!(by_row, untouched, "{label} changes nothing, so this row proves nothing about routing");
         }
         assert_eq!(checked, 16, "every row but Close Window carries a chord");
@@ -4099,9 +3120,7 @@ mod tests {
 
     #[test]
     fn anything_but_the_cycle_chord_ends_the_sequence() {
-        // **M12 decision 3's rule, and the whole reason a stale ring position is unreachable
-        // rather than merely unlikely.** The position exists only inside one uninterrupted
-        // gesture, so a typed character, a save, a tab switch — anything — has to end it.
+        // The position exists only inside one uninterrupted gesture; anything else ends it.
         for (name, act) in [
             ("a typed character", (|a: &mut App| key(a, KEY_X, 0)) as fn(&mut App)),
             ("a copy chord", |a| key(a, COPY_KEYCODE, MOD_CTRL)),
@@ -4115,7 +3134,6 @@ mod tests {
             act(&mut a);
             assert_eq!(a.cycling(), None, "{name} should have ended the sequence");
         }
-        // …and the cycle chord itself does not.
         let mut a = app();
         a.pasted("WORLD", 0, 7);
         key(&mut a, PASTE_KEYCODE, MOD_CTRL | MOD_SHIFT);
@@ -4124,16 +3142,10 @@ mod tests {
 
     #[test]
     fn a_cycle_into_a_different_tab_does_nothing() {
-        // The range names positions in the buffer that was pasted into. Applying it to another
-        // would replace whatever happens to be at those coordinates — a silent edit to a file
-        // the person was not looking at.
         let mut a = app();
         a.pasted("WORLD", 0, 7);
         let c = a.cycling().expect("armed");
         a.update(Msg::NewTab);
-        // **Re-armed by hand, with the *first* tab's key.** `NewTab` cleared the state, which is
-        // the rule the test above covers; what is under test here is the other guard — a
-        // `Cycling` naming a buffer that is no longer current.
         a.cycling = Some(c);
         let before = a.text();
         a.cycled("MARS", 1, 7);
@@ -4143,8 +3155,6 @@ mod tests {
 
     #[test]
     fn a_paste_is_one_undo_step() {
-        // Grouped with typing, one undo would take back the paste *and* the word before it. A
-        // person who pastes and then undoes means "not that".
         let mut a = app();
         key(&mut a, KEY_X, 0);
         a.pasted("WORLD", 0, 7);
@@ -4155,8 +3165,6 @@ mod tests {
 
     #[test]
     fn a_multi_line_paste_keeps_what_followed_the_cursor() {
-        // The tail of the line moves to the end of what was inserted. Without that, pasting
-        // into the middle of a line silently eats the rest of it.
         let mut a = app();
         a.pasted("one\ntwo", 0, 1);
         assert_eq!(a.text(), "one\ntwohello");
@@ -4164,11 +3172,7 @@ mod tests {
 
     #[test]
     fn a_tab_chord_during_a_find_still_opens_a_tab() {
-        // **The two applications agree about this now** (PR #270 review, optional 7). They grew
-        // the same widget in the same part and disagreed: `nxfiles` checked the tab chords before
-        // its prompt and this one let the field's branch return first, so `Ctrl+T` during a find
-        // did nothing. The line is what the chord acts on — a tab is the *window's*, and the
-        // buffer chords stay the field's while a field is open.
+        // Tab chords act on the window, before the prompt; buffer chords stay the field's.
         let mut a = app();
         key(&mut a, FIND_KEYCODE, MOD_CTRL);
         for code in [20u16, 19, 24] {
@@ -4179,8 +3183,6 @@ mod tests {
         key(&mut a, NEW_TAB_KEYCODE, MOD_CTRL);
         assert_eq!(a.tab_count(), 2, "the chord reached the window");
 
-        // And a buffer chord in the same state is still the field's: `Ctrl+S` while naming asks
-        // nothing new, because a name is what is already being asked for.
         let mut a = App::new("", "/home");
         a.absent();
         a.update(Msg::Save);
@@ -4193,13 +3195,8 @@ mod tests {
 
     #[test]
     fn a_save_writes_the_buffer_that_asked_even_if_the_tab_changes_first() {
-        // **The batch is what makes this reachable**: `Ctrl+S` only records that a save is owed,
-        // and `main` performs it at the top of the *next* iteration — after every event in the
-        // drain has been applied. A tab click in the same drain used to move both the bytes and
-        // the path to the other buffer, so the wrong file was written, the wrong buffer was
-        // marked saved, and the one the person asked for stayed dirty with nothing to show for
-        // it (PR #270 review, worth fixing 3). Events queue whenever the client is behind, which
-        // `pool.acquire` blocking on the third commit makes ordinary.
+        // `Ctrl+S` only records that a save is owed; a tab click in the same drain once moved the
+        // bytes and the path to the other buffer.
         let mut a = app(); // /home/notes.txt holding "hello"
         a.accept_drop("/home/other.txt");
         a.absent();
@@ -4209,7 +3206,6 @@ mod tests {
         a.update(Msg::SelectTab(notes));
         key(&mut a, KEY_X, 0);
         a.update(Msg::Save);
-        // …and the same drain carries a tab click.
         a.update(Msg::SelectTab(other));
 
         let (asked, path, text) = a.take_save().expect("a save was asked for");
@@ -4217,8 +3213,6 @@ mod tests {
         assert_eq!(path, "/home/notes.txt");
         assert_eq!(text, "xhello");
 
-        // And the result lands on that buffer too: marking the *current* one saved would leave
-        // the written one dirty and the untouched one claiming to match a file it never wrote.
         a.saved(asked, Ok(text.len()));
         a.update(Msg::SelectTab(notes));
         assert!(!a.modified(), "the buffer that was written is the one marked saved");
@@ -4228,11 +3222,6 @@ mod tests {
 
     #[test]
     fn tabs_hold_their_own_buffer_cursor_and_history() {
-        // **The whole point of the split into `Buffer`.** What a person expects to survive
-        // switching tabs is everything about the file — its text, whether it is modified, and
-        // what undo would take back. Getting the line wrong is how a second tab inherits the
-        // first's history, and it is a mistake that reads as correct until somebody presses
-        // `Ctrl+Z` in the wrong tab.
         let mut a = app(); // /home/notes.txt holding "hello"
         key(&mut a, KEY_X, 0);
         key(&mut a, KEY_X, 0);
@@ -4243,11 +3232,9 @@ mod tests {
         assert_eq!(a.text(), "", "a new tab is an untitled empty buffer");
         assert_eq!(a.path(), "");
 
-        // Undo in the new tab has nothing to take: the history did not come with it.
         key(&mut a, UNDO_KEYCODE, MOD_CTRL);
         assert!(a.status().contains("nothing to undo"), "status was {:?}", a.status());
 
-        // And the first tab still has both its text and its history.
         a.update(Msg::SelectTab(TAB_KEY_BASE));
         assert_eq!(a.text(), first);
         key(&mut a, UNDO_KEYCODE, MOD_CTRL);
@@ -4290,9 +3277,7 @@ mod tests {
 
     #[test]
     fn a_question_about_one_tab_survives_switching_to_another() {
-        // **M12 Part B's lesson, one part on.** The key is captured when the question is asked,
-        // so switching tabs while the dialog is up cannot make the answer close a different one
-        // — and the dialog goes on naming the tab it asked about.
+        // The key is captured when asked, so switching tabs cannot retarget the answer.
         let mut a = app();
         key(&mut a, KEY_X, 0); // notes.txt is modified
         a.update(Msg::NewTab);
@@ -4309,8 +3294,6 @@ mod tests {
 
     #[test]
     fn closing_the_last_tab_closes_the_window() {
-        // Which is what keeps `buffers` non-empty — the invariant every accessor relies on. An
-        // editor showing no buffer at all is a window with nothing in it and no way back.
         let mut a = app();
         assert_eq!(a.tab_count(), 1);
         a.update(Msg::CloseTab(TAB_KEY_BASE));
@@ -4319,8 +3302,6 @@ mod tests {
 
     #[test]
     fn closing_the_window_asks_about_any_modified_tab_not_just_the_current_one() {
-        // Closing takes every tab, so a question about only what is on screen would let the
-        // others go silently.
         let mut a = app();
         key(&mut a, KEY_X, 0); // tab 0 modified
         a.update(Msg::NewTab); // tab 1 clean, and current
@@ -4333,11 +3314,7 @@ mod tests {
 
     #[test]
     fn save_while_finding_asks_for_a_name_rather_than_doing_nothing() {
-        // **The save button stays in the strip and stays clickable while a search is open**, and
-        // "already asking" was written when naming was the only field there could be. With find
-        // beside it, pressing save did nothing at all and the strip did not change — a control
-        // that looks live and is not, one test over from the one that exists to catch that
-        // (PR #269 review, worth fixing 2).
+        // The save button stays clickable during a search, and once did nothing there.
         let mut a = App::new("", "/home");
         a.absent();
         key(&mut a, FIND_KEYCODE, MOD_CTRL);
@@ -4347,8 +3324,6 @@ mod tests {
         assert_eq!(a.field_kind(), Some(Field::Naming), "the search gives way to the question");
         assert!(a.status().contains("name it"), "status was {:?}", a.status());
 
-        // And a second save while *naming* is still "already asking", which is what that guard
-        // was for: it must not throw away what has been typed so far.
         key(&mut a, KEY_X, 0);
         a.update(Msg::Save);
         assert_eq!(a.naming_len(), Some(1), "the name survives a second press");
@@ -4356,8 +3331,6 @@ mod tests {
 
     #[test]
     fn escaping_a_search_leaves_the_strip_saying_what_last_happened() {
-        // Blanking it was a control answering with nothing, and what it erased was the answer to
-        // the search being escaped — still the most recent thing that happened.
         let mut a = App::new("/home/notes.txt", "/home");
         a.loaded("one two", b"one two\n");
         key(&mut a, FIND_KEYCODE, MOD_CTRL);
@@ -4373,15 +3346,10 @@ mod tests {
 
     #[test]
     fn typing_after_a_find_replaces_what_was_found() {
-        // **Find leaves its match selected, and typing replaces a selection.** Both halves are
-        // right on their own, and together they are hand-made find-and-replace — which is worth
-        // a test because it is also a surprise: `check-login` typed a character two steps after a
-        // search and edited the middle of the file rather than appending to it, and the seven
-        // bytes that reached disk were the first anybody knew (M12 Part D).
+        // Find leaves its match selected and typing replaces it (a gate once hit this).
         let mut a = App::new("/home/notes.txt", "/home");
         a.loaded("nitroxab", b"nitroxab\n");
         key(&mut a, FIND_KEYCODE, MOD_CTRL);
-        // `t`, `r`, `o`
         for code in [20u16, 19, 24] {
             key(&mut a, code, 0);
         }
@@ -4391,8 +3359,6 @@ mod tests {
         key(&mut a, KEY_X, 0);
         assert_eq!(a.text(), "nixxab", "the match was replaced, not appended to");
 
-        // And a movement first is what appends — which is the shape a person uses to get out of
-        // a search, and what the gate does now.
         let mut a = App::new("/home/notes.txt", "/home");
         a.loaded("nitroxab", b"nitroxab\n");
         key(&mut a, FIND_KEYCODE, MOD_CTRL);
@@ -4418,8 +3384,6 @@ mod tests {
 
     #[test]
     fn a_chord_the_editor_does_not_have_still_types_nothing() {
-        // The rule the save chord established, now that three more chords have joined it: every
-        // other one is swallowed rather than folded into a printable character.
         let mut a = app();
         let before = a.text();
         key(&mut a, KEY_1, MOD_CTRL);
@@ -4428,18 +3392,11 @@ mod tests {
 
     #[test]
     fn the_save_keycode_is_the_one_the_keymap_calls_s() {
-        // The constant is a literal, so it is pinned against the table it has to agree with
-        // rather than against the comment beside it.
         assert_eq!(libinput::keymap::to_char(SAVE_KEYCODE, 0), Some(b's'));
     }
 
-    // ---- M12 Part A: the confirmation ----
-
     #[test]
     fn closing_a_modified_buffer_asks_rather_than_exiting() {
-        // **The rule the whole part exists for.** Until M12 Part A this editor answered
-        // `CloseRequested` by exiting, and its own comment said so: "an editor with somewhere to
-        // put a question would ask it — and this one has no dialog to ask in".
         let mut a = app();
         key(&mut a, KEY_X, 0);
         a.update(Msg::Close);
@@ -4449,8 +3406,6 @@ mod tests {
 
     #[test]
     fn closing_a_clean_buffer_asks_nothing() {
-        // The other half, and the one that keeps the ordinary close a single click: a buffer
-        // that matches its file has nothing to lose, so there is nothing to ask about.
         let mut a = app();
         a.update(Msg::Close);
         assert!(!a.confirming(), "nothing to ask about");
@@ -4459,11 +3414,7 @@ mod tests {
 
     #[test]
     fn a_second_close_request_does_not_discard_the_buffer() {
-        // **The control for the obvious wrong spelling.** "Ask if we are not already asking,
-        // otherwise close" reads fine and turns the *second* `CloseRequested` into an exit —
-        // and a second one is exactly what a person clicking a taskbar entry twice produces,
-        // which since this part is also how they force a wedged window shut. With that spelling
-        // this test fails on the `closing` assertion.
+        // "Ask unless already asking" would turn a second `CloseRequested` into an exit.
         let mut a = app();
         key(&mut a, KEY_X, 0);
         a.update(Msg::Close);
@@ -4478,7 +3429,6 @@ mod tests {
         key(&mut a, KEY_X, 0);
         a.update(Msg::Close);
 
-        // Keeping ends the question and nothing else — the buffer is byte-for-byte what it was.
         let text = a.text();
         a.update(Msg::KeepEditing);
         assert!(!a.confirming(), "the question is answered");
@@ -4487,7 +3437,6 @@ mod tests {
         assert!(a.modified(), "keeping does not mark it saved");
         assert!(a.status().contains("still editing"), "status was {:?}", a.status());
 
-        // Asking again, and discarding this time.
         a.update(Msg::Close);
         assert!(a.confirming());
         a.update(Msg::Discard);
@@ -4497,8 +3446,6 @@ mod tests {
 
     #[test]
     fn saving_removes_the_reason_to_ask() {
-        // Derived rather than remembered: `confirming` is decided by `modified()` at the moment
-        // of the close, so a save between the two makes the question go away by itself.
         let mut a = app();
         key(&mut a, KEY_X, 0);
         a.update(Msg::Save);
@@ -4513,24 +3460,18 @@ mod tests {
 
     #[test]
     fn the_dialog_answers_escape_and_nothing_else() {
-        // **`Esc` because a modal a keyboard cannot dismiss has taken the keyboard hostage**,
-        // and nothing else because `Enter` is the obvious accident: the question arrives while
-        // somebody is typing.
         let a = app();
         let ev = |code: u16, pressed: u16| KeyEvent::new(1, code, pressed, 0);
         assert_eq!(a.confirm_key(ev(NAME_CANCEL, KEY_DOWN)), Some(Msg::KeepEditing));
         assert_eq!(a.confirm_key(ev(NAME_CONFIRM, KEY_DOWN)), None, "Enter must not discard");
         assert_eq!(a.confirm_key(ev(KEY_X, KEY_DOWN)), None);
-        // A release is not a press. Without this guard `Esc` would answer twice, and the second
-        // answer would arrive after the window it belongs to had been destroyed.
+        // A release is not a press: otherwise `Esc` answers twice, once after the window is gone.
         assert_eq!(a.confirm_key(ev(NAME_CANCEL, 0)), None, "a release is not an answer");
     }
 
     #[test]
     fn a_dialog_that_will_not_open_leaves_the_window_alone() {
-        // **Neither of the two tempting failures.** Exiting would discard unsaved work because a
-        // window could not be created; staying `confirming` would make an editor that can never
-        // be closed, since every later `Close` would try the same failing creation again.
+        // Exiting would discard work; staying `confirming` would retry the dialog on every `Close`.
         let mut a = app();
         key(&mut a, KEY_X, 0);
         a.update(Msg::Close);
@@ -4538,22 +3479,15 @@ mod tests {
         assert!(!a.confirming());
         assert!(!a.closing(), "a failed dialog must not discard the buffer");
         assert!(a.status().contains("save, then close"), "status was {:?}", a.status());
-        // And the editor is still usable: a later save works.
         a.update(Msg::Save);
         assert!(a.take_save().is_some());
     }
 
-    /// A fake face: every character an 8x16 box, which is all these tests need.
     const CELL: libui::layout::FixedCell = libui::layout::FixedCell { w: 8, h: 16 };
 
     #[test]
     fn the_left_answer_discards_and_the_right_one_keeps() {
-        // **Which button means what, which is all that is left here.** The dialog's geometry —
-        // that it measures to exactly its declared size, and that the two aim points are the
-        // buttons' centres — moved into `libui` with `dialog_frame` when `nxfiles` grew the
-        // second confirmation, and is tested there against a tree built the same way. What this
-        // application still decides is which message each half carries, and getting *that* the
-        // wrong way round is a click that discards a buffer when it was asked to keep it.
+        // Swapped, a click discards a buffer it was asked to keep.
         let a = app();
         let ui = a.confirm_view(&UiTheme::default(), None);
         let l = libui::layout::layout(&ui, Rect::new(0, 0, CONFIRM_W, CONFIRM_H), &CELL);
@@ -4581,19 +3515,12 @@ mod tests {
 
     #[test]
     fn the_dialogs_close_button_keeps_the_buffer() {
-        // **A dialog's own frame must not be a third way to discard.** `title_bar` draws only
-        // the buttons it is given a message for, so the question here is which message the one
-        // button carries — and the cautious answer is the only defensible default for a control
-        // whose meaning is "make this go away".
         let a = app();
         let ui = a.confirm_view(&UiTheme::default(), None);
         let l = libui::layout::layout(&ui, Rect::new(0, 0, CONFIRM_W, CONFIRM_H), &CELL);
         let mut tree = libui::diff::Tree::new();
         tree.update(&ui, &l).expect("the dialog is diffable");
         let mut router = libui::route::Router::new();
-        // The rightmost title-bar button. This re-derived it from contiguous slots and still
-        // landed inside after the desktop refresh's Part B gave the buttons gaps — by the luck of
-        // the arithmetic — so it asks the toolkit where the button is instead.
         let (x, y) = libui::widget::title_button_centre(CONFIRM_W, 0);
         let at = |flags: u16, buttons: u16| librsproto::surface::PointerEvent {
             kind: librsproto::surface::POINTER_BUTTON,
@@ -4608,13 +3535,8 @@ mod tests {
         let (msgs, _) = router.pointer(&tree, &ui, &l, at(0, 0));
         assert_eq!(msgs, alloc::vec![Msg::KeepEditing]);
     }
-    /// The window's own tree survives being diffed frame to frame.
-    ///
-    /// **The class of bug this catches cost a QEMU round trip** (M14 Part A): `diff` rejects a
-    /// parent whose children are *partly* keyed, and adding one unkeyed sibling to a keyed row
-    /// makes the whole window undiffable — so nothing draws at all, in a way no layout or paint
-    /// test can see. The states below are the ones a menu bar introduces: shut, open, and a word
-    /// under the pointer, each of which changes a row's shape.
+    /// The window's own tree survives being diffed frame to frame: one unkeyed sibling makes it
+    /// undiffable and nothing draws, which no layout or paint test sees.
     #[test]
     fn the_window_tree_diffs_across_the_menu_states() {
         let mut a = app();
@@ -4637,51 +3559,35 @@ mod tests {
         check(&mut a, None, &mut tree, "back to shut");
     }
 
-    // --- the file chooser (M14 Part C) --------------------------------------
-
-    /// **Save As is not Save with a prompt**, which is the whole of what this part owes.
-    ///
-    /// A prompt that only chose a destination would write the bytes and leave the buffer
-    /// believing it is still the file it was opened as. Three things read the buffer's path, and
-    /// all three would be wrong: the tab's label, the title bar's unsaved marker, and — the one
-    /// that loses work — where the *next* `Ctrl+S` writes.
+    /// Save As changes what the buffer is: tab, unsaved marker and next `Ctrl+S` follow.
     #[test]
     fn save_as_changes_what_the_buffer_is() {
         let mut a = app();
         assert_eq!(a.path(), "/home/notes.txt");
 
         a.update(Msg::SaveAs);
-        // The chooser opens on the buffer's own directory, seeded with its name.
         let c = a.chooser().expect("a chooser is open");
         assert_eq!(c.dir, "/home");
         assert_eq!(c.state.name.text(), "notes.txt");
         assert_eq!(a.take_chooser_list().as_deref(), Some("/home"), "and it asked for a listing");
 
-        // Type a different name and accept.
         let c = a.chooser_mut().expect("a chooser is open");
         c.state.name = libui::widget::TextFieldState::with_text("other.txt");
         a.update(Msg::ChooserAccept);
 
         assert!(a.chooser().is_none(), "accepting closes it");
         assert_eq!(a.path(), "/home/other.txt", "the buffer *is* the new file");
-        // The tab's label follows, because it reads the buffer's name.
         assert!(a.tabs().iter().any(|(_, label, _)| label.contains("other.txt")), "{:?}", a.tabs());
-        // And the save that was requested is for the new path, not the old one.
         let (_, path, _) = a.take_save().expect("a save was requested");
         assert_eq!(path, "/home/other.txt", "the next write goes to the new file");
     }
 
-    /// The wheel scrolls the chooser's list, **through the real dialog tree and router**.
-    ///
-    /// **A dialog is a window, so it has its own tree**, and the wheel is hung on the element
-    /// `chooser::view` returns rather than passed into it. Nothing but a routed event can say
-    /// that line is there — every other chooser test drives `update` directly.
+    /// The wheel scrolls the chooser's list, through the real dialog tree and router.
     #[test]
     fn the_wheel_scrolls_the_choosers_list() {
         let mut a = app();
         a.update(Msg::OpenFile);
         let _ = a.take_chooser_list();
-        // More rows than the dialog shows, or the offset clamps straight back to zero.
         a.show_chooser("/home", (0..60).map(|i| (alloc::format!("f{i}.txt"), false)).collect());
 
         let ui = a.chooser_view(&UiTheme::default(), None);
@@ -4705,11 +3611,6 @@ mod tests {
         assert_eq!(a.chooser().expect("still open").state.list.offset, libui::click::WHEEL_UNITS as usize,);
     }
 
-    /// The chooser can leave the directory it opened in.
-    ///
-    /// **What "navigation" means in a dialog with no location bar** (M15 Part C). Before this
-    /// the only moves were *down* — a row, if it was a directory — so a chooser opened in the
-    /// wrong place had to be cancelled and reopened from a buffer that was somewhere else.
     #[test]
     fn the_chooser_goes_up_by_control_and_by_backspace() {
         let mut a = app();
@@ -4721,22 +3622,16 @@ mod tests {
         assert_eq!(a.take_chooser_list().as_deref(), Some("/home/papers"));
         a.show_chooser("/home/papers", alloc::vec![(String::from("b.txt"), false)]);
 
-        // Backspace is the browser's binding for the same move — one desktop, one way up.
         a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_BACKSPACE, 1, 0));
         assert_eq!(a.take_chooser_list().as_deref(), Some("/home"));
         a.show_chooser("/", alloc::vec![(String::from("home"), true)]);
 
-        // **The root is its own parent**, so this asks for nothing rather than erroring.
         a.update(Msg::ChooserUp);
         assert_eq!(a.take_chooser_list(), None, "the root tried to go somewhere");
         assert!(a.chooser().is_some(), "and the dialog is still open");
     }
 
     /// In `Save`, Backspace edits the name instead of navigating.
-    ///
-    /// **The one place the two bindings disagree, and it has to be this way**: a key that walked
-    /// out of the directory from under a half-typed filename would be the surprise, and there is
-    /// a field holding the keyboard to prove the intent.
     #[test]
     fn backspace_edits_the_name_while_saving() {
         let mut a = app();
@@ -4751,7 +3646,6 @@ mod tests {
         assert_eq!(a.chooser().expect("open").state.name.text().len(), before.len() - 1, "the name was not edited");
     }
 
-    /// Opening walks into directories and answers with a file.
     #[test]
     fn the_chooser_descends_and_then_answers() {
         let mut a = app();
@@ -4759,32 +3653,27 @@ mod tests {
         let _ = a.take_chooser_list();
         a.show_chooser("/home", alloc::vec![(String::from("papers"), true), (String::from("notes.txt"), false),]);
 
-        // A directory row asks for its listing rather than answering.
         a.update(Msg::ChooserRow(CHOOSER_ROW_KEY));
         assert_eq!(a.take_chooser_list().as_deref(), Some("/home/papers"));
         assert!(a.chooser().is_some(), "descending does not close the chooser");
         assert_eq!(a.take_open(), None, "and it is not an answer");
 
         a.show_chooser("/home/papers", alloc::vec![(String::from("draft.txt"), false)]);
-        // A file row is the answer, in Open.
         a.update(Msg::ChooserRow(CHOOSER_ROW_KEY));
         assert!(a.chooser().is_none(), "choosing closes it");
         assert_eq!(a.take_open().as_deref(), Some("/home/papers/draft.txt"));
     }
 
-    /// A listing resets the selection, and an empty name is not an answer.
     #[test]
     fn the_chooser_refuses_the_answers_that_are_not_answers() {
         let mut a = app();
         a.update(Msg::OpenFile);
         a.show_chooser("/home", alloc::vec![(String::from("notes.txt"), false)]);
-        // Nothing selected: accepting says so rather than choosing the first row.
         a.update(Msg::ChooserAccept);
         assert!(a.chooser().is_some(), "it stayed open");
         assert_eq!(a.take_open(), None);
         assert_eq!(a.status(), "nothing chosen");
 
-        // Saving with an empty name is the same shape.
         let mut a = app();
         a.update(Msg::SaveAs);
         let c = a.chooser_mut().expect("a chooser is open");
@@ -4796,11 +3685,6 @@ mod tests {
     }
 
     /// `Enter` on a selected directory descends, exactly as clicking it does.
-    ///
-    /// **The two paths were separate and disagreed** (PR #284 review, blocking 2). This is the
-    /// keyboard half; `the_chooser_descends_and_then_answers` is the pointer half, and it passed
-    /// throughout — which is why the divergence survived: each path had a test and neither had
-    /// the other's.
     #[test]
     fn enter_on_a_directory_descends_rather_than_answering_with_it() {
         let mut a = app();
@@ -4808,18 +3692,15 @@ mod tests {
         let _ = a.take_chooser_list();
         a.show_chooser("/home", alloc::vec![(String::from("papers"), true), (String::from("notes.txt"), false),]);
 
-        // Arrow onto the directory and press Enter.
         a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_DOWN, 1, 0));
         assert_eq!(a.chooser().unwrap().state.list.selected, Some(0), "the directory is selected");
         a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_ENTER, 1, 0));
 
         assert!(a.chooser().is_some(), "descending does not close the chooser");
         assert_eq!(a.take_chooser_list().as_deref(), Some("/home/papers"), "it asked to list it");
-        // The failure this pins: the path went out as something to *open*, which `open_into`
-        // then refuses as a directory — a new, empty, blocked tab named after a folder.
+        // The failure: the directory went out to `open_into`, which refuses it as a blocked tab.
         assert_eq!(a.take_open(), None, "a directory is not an answer");
 
-        // And a file under it still answers, so the descent did not break the accepting half.
         a.show_chooser("/home/papers", alloc::vec![(String::from("draft.txt"), false)]);
         a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_DOWN, 1, 0));
         a.chooser_key(KeyEvent::new(1, libkern::abi::KEY_ENTER, 1, 0));
@@ -4827,24 +3708,15 @@ mod tests {
         assert_eq!(a.take_open().as_deref(), Some("/home/papers/draft.txt"));
     }
 
-    /// The keyboard drives the chooser, and what a key *means* is decided here rather than by the
-    /// toolkit.
-    ///
-    /// **A dialog holds the keyboard**, so a key this function declines does not fall through to
-    /// the buffer behind it — it reaches nothing at all. That is why a character in `Open` is
-    /// swallowed rather than ignored, and the assertion that says so is the buffer's text being
-    /// unchanged.
+    /// The keyboard drives the chooser; a declined key reaches nothing, as the buffer's text shows.
     #[test]
     fn the_chooser_reads_the_keyboard_itself() {
         let ev = |code: u16, pressed: u16| KeyEvent::new(1, code, pressed, 0);
         let listing = || alloc::vec![(String::from("a.txt"), false), (String::from("b.txt"), false)];
 
-        // Nothing to drive when nothing is being chosen — and *false*, so a caller can tell that
-        // the key is still its own.
         let mut a = app();
         assert!(!a.chooser_key(ev(libkern::abi::KEY_ESC, 1)), "no chooser, no claim");
 
-        // The arrows move the selection, and `up` from nothing does not wrap round the bottom.
         a.update(Msg::OpenFile);
         a.show_chooser("/home", listing());
         a.chooser_key(ev(libkern::abi::KEY_UP, 1));
@@ -4852,33 +3724,26 @@ mod tests {
         a.chooser_key(ev(libkern::abi::KEY_DOWN, 1));
         a.chooser_key(ev(libkern::abi::KEY_DOWN, 1));
         assert_eq!(a.chooser().unwrap().state.list.selected, Some(1));
-        // …and it stops at the end rather than running past the listing it was given.
         a.chooser_key(ev(libkern::abi::KEY_DOWN, 1));
         assert_eq!(a.chooser().unwrap().state.list.selected, Some(1), "clamped to the last row");
 
-        // A release is not a keystroke. **The negative control for the whole test**: without it,
-        // every assertion above would pass for a handler that acted on both transitions.
         assert!(!a.chooser_key(ev(libkern::abi::KEY_UP, 0)), "a release is declined");
         assert_eq!(a.chooser().unwrap().state.list.selected, Some(1), "and moved nothing");
 
-        // A character in Open has nowhere to go, and is swallowed rather than reaching the buffer.
         let before = a.text();
         assert!(a.chooser_key(ev(KEY_X, 1)), "claimed even though it does nothing");
         assert_eq!(a.text(), before, "the buffer behind the dialog is untouched");
 
-        // Enter answers with the selected row.
         a.chooser_key(ev(libkern::abi::KEY_ENTER, 1));
         assert!(a.chooser().is_none(), "Enter closed it");
         assert_eq!(a.take_open().as_deref(), Some("/home/b.txt"));
 
-        // Esc closes without answering — and in Save, without writing.
         a.update(Msg::SaveAs);
         let _ = a.take_chooser_list();
         a.chooser_key(ev(libkern::abi::KEY_ESC, 1));
         assert!(a.chooser().is_none(), "Esc closed it");
         assert_eq!(a.take_save(), None, "and nothing was saved");
 
-        // A character in Save reaches the field, which is the one mode that has one.
         a.update(Msg::SaveAs);
         let seeded = String::from(a.chooser().unwrap().state.name.text());
         a.chooser_key(ev(KEY_X, 1));
@@ -4887,12 +3752,6 @@ mod tests {
     }
 
     /// **Every** menu in the bar can be opened, not just the ones a test happened to name.
-    ///
-    /// **The View menu did nothing for two milestones** (M15 Part E). `MENU_COUNT` was a
-    /// constant beside a `menu_table` that grew: the binary asked for two anchors, the third
-    /// menu's `anchor()` answered `None`, and the popup had nowhere to hang from — a bar word
-    /// that opened nothing, silently. The count is derived now, and this walks the *whole* bar
-    /// rather than a menu chosen when the test was written.
     #[test]
     fn every_menu_in_the_bar_has_somewhere_to_hang_from() {
         let mut a = app();
@@ -4902,8 +3761,6 @@ mod tests {
         let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
         let n = a.menu_count();
         assert!(n >= 2, "a bar with fewer than two menus is not this window's");
-        // **Through the method the binary calls**, which is the whole point of it being a
-        // method: the loop that was wrong lived in a `main.rs` no test builds.
         a.place_menus(&view, &l);
         for i in 0..n {
             a.menus.toggle(i);

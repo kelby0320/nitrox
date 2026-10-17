@@ -8,10 +8,8 @@ fn rows<'a>(labels: &'a [(u64, &'a str)]) -> alloc::vec::Vec<ListRow<'a>> {
 
 /// A heading sits over its column whether or not the list scrolls.
 ///
-/// **The doc says "the two cannot drift apart" and they did** (PR #320 review, worth fixing
-/// 5): a list that overflows puts its rows beside a scrollbar, so every column moved twelve
-/// pixels left of its heading — in any directory long enough to scroll, which is most.
-/// Measured as the right edge of each, which is what has to agree.
+/// A list that overflows puts its rows beside a scrollbar, so every column once moved twelve
+/// pixels left of its heading. Measured as the right edge of each.
 #[test]
 fn a_heading_sits_over_its_column_whether_or_not_the_list_scrolls() {
     use libdraw::format::PixelFormat;
@@ -21,9 +19,8 @@ fn a_heading_sits_over_its_column_whether_or_not_the_list_scrolls() {
     let columns = [ListColumn { width: 70, align: ColumnAlign::Right }];
     const DEJAVU: &[u8] = include_bytes!("../../../../assets/fonts/DejaVuSans.ttf");
     let font = libdraw::text::Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font");
-    // **Where the ink lands, not where the box is**: the reservation moves a cell *inside*
-    // the strip, so an outer rect is the same either way — a first version of this test
-    // compared those and passed against the bug.
+    // Where the ink lands, not where the box is: the reservation moves a cell *inside* the
+    // strip, so an outer rect is the same either way.
     let rightmost_ink = |e: &Element<u64>| {
         let all = libdraw::geom::Rect::new(0, 0, w, 25);
         let m = crate::paint::FontMetrics::new(&font, t.font_px);
@@ -32,8 +29,7 @@ fn a_heading_sits_over_its_column_whether_or_not_the_list_scrolls() {
         fb.clear(t.background);
         let mut custom = |_: u32, _: libdraw::geom::Rect, _: libdraw::geom::Rect, _: &mut MemFramebuffer| {};
         crate::paint::paint(&mut fb, &font, &t, e, &l, all, &mut custom);
-        // **Text only**: a scrolling list draws its bar at the right edge, and the bar is
-        // ink too — what has to line up is the cell's glyphs against the heading's.
+        // Text only: a scrolling list draws its bar at the right edge, and the bar is ink too.
         (0..w)
             .rev()
             .find(|x| {
@@ -60,8 +56,7 @@ fn a_heading_sits_over_its_column_whether_or_not_the_list_scrolls() {
         let header: Element<u64> = list_header("Name", &["Size"], &columns, false, scrolls, &t);
         (rightmost_ink(&list), rightmost_ink(&header), scrolls)
     };
-    // **`848` under `Size`, both right-aligned, so their ink ends at the same x** — within a
-    // pixel, since the two strings are different glyphs.
+    // `848` under `Size`, both right-aligned, so their ink ends within a pixel of each other.
     let (short_row, short_head, short_scrolls) = right_edges(2);
     assert!(!short_scrolls, "two rows do not overflow");
     assert!(short_row.abs_diff(short_head) <= 1, "with no scrollbar: row ends at {short_row}, heading at {short_head}");
@@ -71,10 +66,9 @@ fn a_heading_sits_over_its_column_whether_or_not_the_list_scrolls() {
     assert!(long_row < short_row, "and a scrolling list gave up the scrollbar's width");
 }
 
-/// **A row's button is a target of its own** (Phase 6 Part F): a press on it is `activate`
-/// with its key, not the row's, and not a grab of the row; a press beside it is the row's. The
-/// row stays lit while the pointer is over its button, the glyph is drawn at the row's trailing
-/// end — and a row without one draws nothing there.
+/// A row's button is a target of its own: a press on it is `activate` with its key, not a grab
+/// of the row, and a press beside it is the row's. The row stays lit while the pointer is on
+/// the button.
 #[test]
 fn a_rows_button_is_its_own_target_and_keeps_the_row_lit() {
     use crate::diff::Tree;
@@ -148,10 +142,8 @@ fn a_rows_button_is_its_own_target_and_keeps_the_row_lit() {
     );
 }
 
-/// **A press on a row's button is still the button's after a repaint lights the row** (Phase 6
-/// Part F, `check-media`'s third run): the press establishes hover, the next frame draws the
-/// row washed and the button's face behind its glyph, and the release that follows lands in
-/// that frame. Every pairing of the two frames, each way round.
+/// A press on a row's button is still the button's after a repaint lights the row
+/// (`check-media`): every pairing of the two frames, each way round.
 #[test]
 fn a_rows_button_keeps_its_click_across_a_repaint_that_lights_it() {
     use crate::diff::Tree;
@@ -199,9 +191,8 @@ fn a_rows_button_keeps_its_click_across_a_repaint_that_lights_it() {
     }
 }
 
-/// **An inactive tab's `×` keeps its click across the repaint that lights the tab**, the class
-/// of [`RowButton`]'s bug: the hover face an inactive tab gains came before its label and `×`,
-/// and moved them along one.
+/// An inactive tab's `×` keeps its click across the repaint that lights the tab, the class of
+/// [`RowButton`]'s bug.
 #[test]
 fn a_tabs_close_box_keeps_its_click_across_a_repaint_that_lights_it() {
     use crate::diff::Tree;
@@ -245,9 +236,8 @@ fn a_tabs_close_box_keeps_its_click_across_a_repaint_that_lights_it() {
     }
 }
 
-/// **A title bar's buttons keep their click across a repaint that changes focus or hover** — the
-/// class of [`RowButton`]'s bug, swept: a click on an unfocused window is a raise between the
-/// press and the release, so the release always meets a repainted bar.
+/// A title bar's buttons keep their click across a repaint that changes focus or hover: a click
+/// on an unfocused window raises it between the press and the release.
 #[test]
 fn a_title_bars_buttons_keep_their_click_across_a_repaint() {
     use crate::diff::Tree;
@@ -311,11 +301,9 @@ fn a_title_bars_buttons_keep_their_click_across_a_repaint() {
 
 /// A row's columns are where the list declares them, and its swatch is drawn.
 ///
-/// **Painted, and written before the screendump this time.** Three parts running have shipped
-/// a widget that was in the tree, routed correctly and drew nothing — so what this asserts is
-/// ink: a swatch's colour at the row's left end, a right-aligned cell's text inside its own
-/// column and not the one beside it, and the name giving way to the columns rather than the
-/// other way round (desktop refresh, Part I).
+/// Asserts ink, since widgets have shipped that were in the tree, routed correctly and drew
+/// nothing: the swatch at the row's left end, a right-aligned cell inside its own column, and
+/// the name giving way to the columns.
 #[test]
 fn a_rows_cells_land_in_their_columns_and_its_swatch_is_drawn() {
     use libdraw::format::PixelFormat;
@@ -364,10 +352,8 @@ fn a_rows_cells_land_in_their_columns_and_its_swatch_is_drawn() {
     };
     assert!(ink_in(size_from, kind_from) > 10, "the size cell is drawn in its column");
     assert!(ink_in(kind_from, w - ROW_PAD.right) > 10, "and the kind cell in its own");
-    // **Right-aligned means against the right edge**, which nothing pinned: making
-    // `ColumnAlign::Right` behave as `Left` passed this test (PR #320 review, 10). The size
-    // column's ink sits in its second half, and the kind column's — left-aligned — in its
-    // first.
+    // Right-aligned means against the right edge: making `ColumnAlign::Right` behave as `Left`
+    // once passed this test.
     let half = |x0: u32, x1: u32| (x0 + x1) / 2;
     assert_eq!(
         ink_in(size_from, half(size_from, kind_from)),
@@ -375,11 +361,8 @@ fn a_rows_cells_land_in_their_columns_and_its_swatch_is_drawn() {
         "a right-aligned cell puts nothing in the left half of its column"
     );
     assert!(ink_in(kind_from, half(kind_from, w - ROW_PAD.right)) > 0, "…and a left-aligned one does");
-    // **The name gives way, not the columns.** A long name is clipped at the column's edge
-    // rather than pushing it along — asserted by *which ink* is in the columns' band, since
-    // the name is body ink and a cell is the dim step: the darkest pixel there must be no
-    // darker than `foreground_dim`. (A first version asserted a blank gap before the
-    // columns, which a name is entitled to fill.)
+    // The name gives way, not the columns, asserted by which ink is in the columns' band: the
+    // darkest pixel there must be no darker than `foreground_dim`.
     let darkness = |c: Rgb| c.r as u32 + c.g as u32 + c.b as u32;
     let darkest = (size_from..w)
         .flat_map(|x| (0..h).map(move |y| (x, y)))
@@ -395,11 +378,8 @@ fn a_rows_cells_land_in_their_columns_and_its_swatch_is_drawn() {
 
 /// The wheel moves the offset by whole rows, and stops at the top.
 ///
-/// **The bottom is not clamped here and that is deliberate** — `list_view` does it against
-/// the rows it is handed, which is the only place the count is known. This checks the half
-/// that *is* here: the direction, the multiplier, and that scrolling up past the first row
-/// stops rather than wrapping to an enormous offset (`offset` is unsigned, so the failure
-/// would be a list showing nothing at all).
+/// The bottom is clamped by `list_view`, which knows the count; scrolling up past the first
+/// row must stop rather than wrap to an enormous offset.
 #[test]
 fn the_wheel_moves_whole_rows_and_stops_at_the_top() {
     let mut st = ListState::at(None, 0);
@@ -413,9 +393,8 @@ fn the_wheel_moves_whole_rows_and_stops_at_the_top() {
 
 /// A saturated delta scrolls a long way down rather than wrapping upward.
 ///
-/// **20 000 rather than `i16::MAX`**: `32767 * 3` wraps back round to a *positive* `i16`, so
-/// the largest value passes against the broken arithmetic this exists to catch. The value
-/// has to be one whose overflow is visible — the same trap `nxterm`'s copy of this test hit.
+/// 20 000 rather than `i16::MAX`: `32767 * 3` wraps back to a positive `i16` and would pass
+/// against the broken arithmetic.
 #[test]
 fn a_huge_wheel_delta_does_not_wrap_upward() {
     let mut st = ListState::at(None, 100);
@@ -425,22 +404,17 @@ fn a_huge_wheel_delta_does_not_wrap_upward() {
 
 /// A row rests on the list's own ground, and is lit from it.
 ///
-/// **A row used to fill `theme.track` whatever the list's ground was** (M15 Part F), so a
-/// panel with a ground of its own had list-coloured tiles painted over it — the panel showed
-/// only in the gap below the last row, which is not what a panel is. The hover is a wash of
-/// the accent over that ground since the desktop refresh's Part B — "this surface, lit",
-/// which a hover derived by shading the ground only approximated.
+/// A panel with a ground of its own once had list-coloured tiles painted over it. The hover is a
+/// wash of the accent over that ground.
 #[test]
 fn a_rows_ground_is_the_lists_and_its_hover_is_a_wash_over_it() {
     use crate::element::Node;
     let p = Theme::default();
     let data = [(1u64, "alpha"), (2, "beta")];
     let panel = Rgb::new(0xDD, 0xDA, 0xD6);
-    // **A selection is kept, and the hover is on a *different* row.** With nothing selected
-    // a hovered row is the primary highlight, so a fixture without a selection never reaches
-    // the hover branch at all (M11 Part E, batch 5).
-    //
-    // Each row's fill and wash, in order.
+    // A selection is kept and the hover is on a different row: with nothing selected a hovered
+    // row is the primary highlight, so the hover branch is never reached. Each row's fill and
+    // wash, in order.
     let rows_of = |ground: Option<Rgb>, hovered: Option<u64>| {
         let mut st = ListState::at(Some(0), 0);
         let e: Element<u64> = list_view(&rows(&data), &[], &mut st, 100, 20, |k| k, None, None, hovered, ground, &p);
@@ -464,27 +438,22 @@ fn a_rows_ground_is_the_lists_and_its_hover_is_a_wash_over_it() {
     let sel = libdraw::theme::SELECTION_COVERAGE;
 
     // The default list: rows on `track`; the selected row washed at 20%, the hovered one at
-    // the hover's coverage, both over their own ground.
+    // the hover's coverage.
     assert_eq!(
         rows_of(None, Some(2)),
         [(Some(p.track), Some((p.accent, sel))), (Some(p.track), Some((p.accent, hover)))]
     );
-    // A list on a panel rests on the panel, and the same washes land on it.
     assert_eq!(
         rows_of(Some(panel), Some(2)),
         [(Some(panel), Some((p.accent, sel))), (Some(panel), Some((p.accent, hover)))]
     );
-    // And a row nobody is pointing at is its ground and nothing more.
     assert_eq!(rows_of(Some(panel), None)[1], (Some(panel), None));
 }
 
 /// A **marked** row is drawn as a selected one, and an unmarked one is not.
 ///
-/// **Asserted on the tree, because nothing else can be.** `check-display` renders the guest's
-/// expected picture with this same code, so a broken highlight is identical on both sides by
-/// construction; `check-login` presses rows and reads no pixels. Breaking `|| r.marked` left
-/// the entire host suite green — 309 tests — until this existed (PR #285 review, worth fixing
-/// 5).
+/// Asserted on the tree, because `check-display` renders its expected picture with this same
+/// code and `check-login` reads no pixels: breaking `|| r.marked` left the host suite green.
 #[test]
 fn a_marked_row_is_drawn_like_a_selected_one() {
     fn nodes<M>(e: &Element<M>) -> usize {
@@ -504,7 +473,6 @@ fn a_marked_row_is_drawn_like_a_selected_one() {
     assert_eq!(marked, selected, "and be drawn as the selected row is");
 }
 
-/// The whole point of the widget: a hundred rows cost as many elements as fit.
 #[test]
 fn only_the_visible_rows_become_elements() {
     let data: alloc::vec::Vec<(u64, &str)> = (0..100u64).map(|i| (i, "row")).collect();
@@ -514,8 +482,8 @@ fn only_the_visible_rows_become_elements() {
     assert_eq!(keys(&e).len(), 5, "the list built rows it cannot show");
 }
 
-/// Without keys the diff pairs by position, and its own doc names the failure: insert at
-/// the top and "row 2's widget" pairs with "row 3's element".
+/// Without keys the diff pairs by position: a row inserted at the top pairs row 2's widget with
+/// row 3's element.
 #[test]
 fn every_row_carries_its_key_not_its_index() {
     let data = [(70u64, "a"), (80, "b"), (90, "c")];
@@ -535,7 +503,6 @@ fn every_row_carries_its_key_not_its_index() {
     assert_eq!(keys(&e), alloc::vec![70, 80, 90], "rows are keyed by position");
 }
 
-/// The window-list caller: rows reorder in place on every raise.
 #[test]
 fn a_reordered_window_list_keeps_each_rows_identity() {
     let before = [(1u64, "term"), (2, "editor")];
@@ -570,8 +537,8 @@ fn a_reordered_window_list_keeps_each_rows_identity() {
     assert_eq!(keys(&b), alloc::vec![2, 1], "the reorder did not move the keys");
 }
 
-/// The launcher caller: results are replaced wholesale on every keystroke, so the list
-/// gets shorter under a scroll offset that was valid a frame ago.
+/// The launcher caller: results are replaced wholesale on every keystroke, so the list gets
+/// shorter under a scroll offset that was valid a frame ago.
 #[test]
 fn a_list_that_shrinks_under_a_stale_offset_still_renders() {
     let long: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "hit")).collect();
@@ -585,11 +552,8 @@ fn a_list_that_shrinks_under_a_stale_offset_still_renders() {
     assert_eq!(state.offset, 0, "a stale offset survived the list shrinking");
     assert_eq!(keys(&e).len(), 3, "the list rendered blank");
 
-    // **The selection half, which the first version of this test did not assert and so
-    // passed against a widget that left it dangling** (PR #233 review, finding 2). A
-    // selection of 19 into three rows highlights nothing, and `down` is *dead*: it takes
-    // `Some(i) if i + 1 < len` and otherwise returns `i` unchanged, so a stale index never
-    // comes back into range on its own.
+    // The selection half: 19 into three rows highlights nothing, and `down` is dead on a stale
+    // index, which never comes back into range on its own.
     assert_eq!(state.selected, Some(2), "the selection still indexes the longer list");
     assert!(
         row_washes(&e).iter().any(|w| *w == Some((Theme::default().accent, libdraw::theme::SELECTION_COVERAGE))),
@@ -600,7 +564,6 @@ fn a_list_that_shrinks_under_a_stale_offset_still_renders() {
     assert_eq!(state.selected, Some(1));
 }
 
-/// Shrinking to nothing leaves nothing selected, rather than row `-1`.
 #[test]
 fn a_list_that_empties_clears_the_selection() {
     let mut state = ListState::at(Some(3), 2);
@@ -609,51 +572,41 @@ fn a_list_that_empties_clears_the_selection() {
     assert_eq!(state.offset, 0);
 }
 
-/// A selection moved with the keyboard must stay on screen.
-/// Following the selection does not undo a deliberate scroll.
+/// A selection moved with the keyboard must stay on screen, and following it does not undo a
+/// deliberate scroll.
 ///
-/// **The bug the maintainer reported as "the scrollbar doesn't work"** (M15 Part D). Both
-/// `list_view` and `text_area` call `ensure_visible` on every build, and an application
-/// repaints after every event — so with the selection on row 0, a scrollbar drag computed
-/// the right offset and the very next frame put it back. The bar moved and the list did not.
-/// `nxterm` was unaffected because its grid follows nothing: it keeps a `view_top` instead.
+/// Both `list_view` and `text_area` call `ensure_visible` on every build, so with the selection
+/// on row 0 a scrollbar drag was put back by the next frame.
 #[test]
 fn following_a_selection_happens_once_per_selection_not_once_per_build() {
     let mut s = ListState::at(Some(0), 0);
     s.ensure_visible(5);
     assert_eq!(s.offset, 0);
 
-    // A scrollbar drag, then the repaint that follows every event.
     s.offset = 20;
     s.ensure_visible(5);
     assert_eq!(s.offset, 20, "the repaint dragged the list back to its selection");
     s.ensure_visible(5);
     assert_eq!(s.offset, 20, "…and again on the frame after that");
 
-    // **But a selection that *moves* is still followed**, which is what the rule is for.
+    // A selection that moves is still followed.
     s.down(40);
     s.ensure_visible(5);
     assert_eq!(s.offset, 1, "the selection moved and the view did not follow it");
 }
 
-/// A window that gets shorter brings the selection back into view.
-///
-/// **The case a key of "the selection we last followed" alone gets wrong**, and the one
-/// flagged when Part D landed: a shrink can put the selection off screen without the
-/// selection moving, so a rule that waits for it to move leaves a list highlighting a row
-/// nobody can see (PR #290 review, 1).
+/// A window that gets shorter brings the selection back into view: a shrink can put the
+/// selection off screen without the selection moving.
 #[test]
 fn a_shorter_window_brings_the_selection_back() {
     let mut s = ListState::at(Some(9), 0);
     s.ensure_visible(10);
     assert_eq!(s.offset, 0, "precondition: ten rows fit, so nothing moved");
 
-    // Four fit now, and the selection is past the bottom.
     s.ensure_visible(4);
     assert_eq!(s.offset, 6, "the selection was left below a window that shrank");
 }
 
-/// The same rule for a document's caret.
 #[test]
 fn a_document_scrolls_away_from_its_caret_and_stays_there() {
     let mut a = TextAreaState::with_text("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
@@ -664,7 +617,6 @@ fn a_document_scrolls_away_from_its_caret_and_stays_there() {
     a.ensure_visible(3);
     assert_eq!(a.offset(), 6, "the repaint dragged the document back to its caret");
 
-    // Typing moves the caret, and the view follows it again.
     a.apply(KEY_DOWN, 0, 0);
     a.ensure_visible(3);
     assert_eq!(a.offset(), 1, "the caret moved to line 1 and the view did not follow it");
@@ -683,7 +635,6 @@ fn the_scroll_follows_the_selection_in_both_directions() {
     assert_eq!(s.offset, 1, "a visible selection scrolled anyway");
 }
 
-/// Down from nothing selects the first row.
 #[test]
 fn down_from_nothing_selects_the_first_row() {
     let mut s = ListState::default();
@@ -693,7 +644,6 @@ fn down_from_nothing_selects_the_first_row() {
     assert_eq!(s.selected, Some(1));
 }
 
-/// Both ends stop rather than wrapping, and report no change.
 #[test]
 fn the_selection_stops_at_both_ends() {
     let mut s = ListState::at(Some(2), 0);
@@ -705,7 +655,6 @@ fn the_selection_stops_at_both_ends() {
     assert_eq!(empty.selected, None);
 }
 
-/// Enter and Escape belong to whatever owns the list.
 #[test]
 fn declines_the_keys_that_belong_above_it() {
     for key in [28u16, 1, 15] {
@@ -724,7 +673,6 @@ fn a_menu_item_highlights_under_the_pointer_and_is_flat_otherwise() {
     let hot: Element<u8> = menu_item("Clear", 1, true, &p);
     let cold: Element<u8> = menu_item("Clear", 1, false, &p);
 
-    // Every painting node in the item, whatever its kind.
     let paints = |e: &Element<u8>| {
         let mut out = alloc::vec::Vec::new();
         walk(e, &mut |n| match &n.node {
@@ -735,27 +683,21 @@ fn a_menu_item_highlights_under_the_pointer_and_is_flat_otherwise() {
         out
     };
 
-    // **One layer: the accent washed over the bar at the hover's coverage** (desktop refresh,
-    // Part B) — the design's `--soft`. It was a border in the accent and the selection
-    // bevelled inside it.
+    // One layer: the accent washed over the bar at the hover's coverage.
     assert_eq!(
         paints(&hot),
         alloc::vec![(p.accent, p.scheme.hover_coverage())],
         "the hovered item is not the hover wash"
     );
 
-    // **And nothing at all otherwise**, which is the half that fails if a highlight sticks:
-    // an item that paints a face when it is not hovered is a menu with every row lit.
+    // Nothing at all otherwise: an item that paints a face when not hovered lights every row.
     assert!(paints(&cold).is_empty(), "an idle item drew a face");
 }
 
 #[test]
 fn the_scrollbar_takes_the_pointer_only_when_the_caller_offered_somewhere_to_send_it() {
-    // **The missing half was the handler, not the arithmetic.** `ScrollState::offset_at` has
-    // been right since M5 and `nxterm` has always dragged with it; a *list's* bar was built
-    // without an `on_pointer` at all, so the events never left the router. This asserts the
-    // wiring, and the `None` case is the control — without it the test would pass for a
-    // widget that attached a handler unconditionally, which is a different bug.
+    // The handler was missing, not the arithmetic. The `None` case is the control: without it
+    // the test would pass for a widget that attached a handler unconditionally.
     let p = Theme::default();
     let many: alloc::vec::Vec<(u64, &str)> = (0..20u64).map(|i| (i, "x")).collect();
     let handlers = |e: &Element<u64>| {
@@ -775,7 +717,6 @@ fn the_scrollbar_takes_the_pointer_only_when_the_caller_offered_somewhere_to_sen
     assert_eq!(handlers(&without), 0, "a handler appeared with nowhere to send it");
 }
 
-/// A press at `y` on a bar, and the offset it asks for.
 fn press_bar(g: &mut ScrollGrab, st: ScrollState, track: u32, y: i32) -> Option<u32> {
     g.apply(
         st,
@@ -791,20 +732,16 @@ fn press_bar(g: &mut ScrollGrab, st: ScrollState, track: u32, y: i32) -> Option<
     )
 }
 
-/// A motion to `y` with the button still held.
 fn drag_bar(g: &mut ScrollGrab, st: ScrollState, track: u32, y: i32) -> Option<u32> {
     g.apply(st, track, PointerEvent { kind: librsproto::surface::POINTER_MOTION, buttons: 1, y, ..Default::default() })
 }
 
 #[test]
 fn a_drag_on_the_track_moves_the_offset_and_a_release_does_not() {
-    // **The scrollbar was decoration.** `list_view` built one and gave it no pointer handler,
-    // so a list showed its position and could not be dragged — a control that looks live and
-    // is not, which is the defect this crate's own notes keep naming. `nxterm` builds its
-    // scrollbar directly and has always wired this (M11 Part E batch 6).
+    // A list's scrollbar once had no pointer handler, so it showed a position and could not be
+    // dragged.
     let mut st = ListState::default();
     let mut g = ScrollGrab::new();
-    // Twenty rows of 20px in a 100px viewport: five visible, fifteen of travel.
     let bar = |st: &ListState| st.bar(100, 20, 20);
     st.offset = press_bar(&mut g, bar(&st), 100, 100).expect("a press on the track scrolls") as usize;
     assert!(st.offset > 0, "a drag to the bottom of the track moved nothing");
@@ -813,7 +750,6 @@ fn a_drag_on_the_track_moves_the_offset_and_a_release_does_not() {
     assert_eq!(st.offset, 0, "a drag to the top did not come back");
     assert!(bottom <= 15, "the offset ran past the last full screen of rows");
 
-    // The release moves nothing and ends the drag.
     let released = g.apply(
         bar(&st),
         100,
@@ -823,26 +759,21 @@ fn a_drag_on_the_track_moves_the_offset_and_a_release_does_not() {
     assert!(!g.dragging());
     assert_eq!(drag_bar(&mut g, bar(&st), 100, 90), None, "and the bar stopped following");
 
-    // A list that fits has nowhere to go, and must not be moved by a drag on a track that is
-    // not drawn — the case the position arithmetic returns zero for.
+    // A list that fits has nowhere to go, and a drag on an undrawn track must not move it.
     let mut st = ListState::default();
     let mut g = ScrollGrab::new();
     st.offset = press_bar(&mut g, st.bar(100, 20, 3), 100, 100).unwrap_or(0) as usize;
     assert_eq!(st.offset, 0, "a list shorter than its viewport scrolled");
 }
 
-/// Grabbing the thumb by its end does not move it — the `scroll-grab` deferral, closed.
+/// Grabbing the thumb by its end does not move it.
 ///
-/// **The defect this exists for is a *jump* on the press**, before the drag has begun: with
-/// only "put the thumb's centre under the cursor" available, a press on the thumb's top edge
-/// moved the content by half a thumb, so aiming at the thumb threw away the position you
-/// were looking at. Every toolkit that avoids it remembers where within the thumb the press
-/// landed.
+/// With only "put the thumb's centre under the cursor", a press on the thumb's top edge moved
+/// the content by half a thumb before the drag began.
 #[test]
 fn a_press_on_the_thumb_does_not_move_it_and_the_drag_then_tracks_the_pointer() {
-    // A long scrollback: 1000 units, 20 visible, in a 200px track. The thumb is clamped to
-    // `MIN_THUMB`, so it is *much* shorter than the travel — which is when a re-centring
-    // grab is least noticeable and a wrong one still throws the view a long way.
+    // 1000 units, 20 visible, in a 200px track: the thumb is clamped to `MIN_THUMB`, so it is
+    // much shorter than the travel.
     let track = 200;
     let st = ScrollState { offset: 400, visible: 20, total: 1000 };
     let (pos, len) = st.thumb(track);
@@ -853,8 +784,6 @@ fn a_press_on_the_thumb_does_not_move_it_and_the_drag_then_tracks_the_pointer() 
         assert_eq!(press_bar(&mut g, st, track, y), Some(400), "{what}: taking hold of the thumb moved the content");
         assert!(g.dragging());
 
-        // And from there it follows the pointer: ten pixels down the track is ten pixels of
-        // thumb travel, whichever end it was taken by.
         let moved = drag_bar(&mut g, st, track, y + 10).expect("dragging");
         let expected = st.offset_for_thumb_top(track, pos as i32 + 10);
         assert_eq!(moved, expected, "{what}: the thumb did not follow by the distance moved");
@@ -863,13 +792,8 @@ fn a_press_on_the_thumb_does_not_move_it_and_the_drag_then_tracks_the_pointer() 
 
 /// A second button tapped mid-drag neither ends the drag nor re-takes it.
 ///
-/// **The router delivers every button's events to the captured widget**, and clears its own
-/// capture only when *all* of them come up (`released && event.buttons == 0`) — so pressing
-/// the right button without letting go of the left arrives here as a press and a release of
-/// a button this grab knows nothing about. Answering either of them would strand the bar:
-/// the router still believes the gesture is live, so the person goes on dragging and
-/// nothing follows. The code this replaced (`if p.buttons != 0` in each application) kept
-/// following, so this is a regression the review caught (PR #288, finding 1).
+/// The router delivers every button's events to the captured widget and clears its capture only
+/// when all are up, so answering the second button's press or release would strand the bar.
 #[test]
 fn a_second_buttons_press_and_release_do_not_disturb_the_drag() {
     const RIGHT: u16 = 0x111;
@@ -880,13 +804,11 @@ fn a_second_buttons_press_and_release_do_not_disturb_the_drag() {
     press_bar(&mut g, st, track, pos as i32);
     assert!(g.dragging(), "precondition: the left button took the thumb");
 
-    // The right button goes down while the left is still held: two buttons in the mask.
     let other = |flags: u16, buttons: u16| PointerEvent {
         kind: POINTER_BUTTON,
         button: RIGHT,
         buttons,
         flags,
-        // Far from the thumb, so re-taking the grab here would visibly jump the bar.
         y: track as i32 - 1,
         ..Default::default()
     };
@@ -894,16 +816,12 @@ fn a_second_buttons_press_and_release_do_not_disturb_the_drag() {
     assert_eq!(g.apply(st, track, other(0, 0b001)), None, "the release answered");
     assert!(g.dragging(), "a button this grab never took ended it");
 
-    // And the drag still tracks the pointer, from the offset it was taken at.
     let moved = drag_bar(&mut g, st, track, pos as i32 + 10).expect("still dragging");
     assert_eq!(moved, st.offset_for_thumb_top(track, pos as i32 + 10));
 }
 
-/// A press on the track still jumps, and holds the thumb centred afterwards.
-///
-/// **The other half of the rule**, and the reason the grab is not simply "always keep the
-/// press offset": a click on empty track means "go there", and there is no thumb under the
-/// cursor to preserve a relationship with.
+/// A press on the track still jumps, and holds the thumb centred afterwards: there is no thumb
+/// under the cursor to preserve a relationship with.
 #[test]
 fn a_press_on_the_track_jumps_and_then_holds_the_thumb_centred() {
     let track = 200;
@@ -925,15 +843,12 @@ fn a_press_on_the_track_jumps_and_then_holds_the_thumb_centred() {
 
 #[test]
 fn with_nothing_selected_the_hovered_row_is_the_highlight() {
-    // **The applications modal is this list**, and it keeps no selection at all — Enter takes
-    // the first filtered entry — so before batch 5 every hover landed on the quiet branch and
-    // a menu that is nothing *but* hover highlighted in grey. One primary highlight is the
-    // rule; where there is no selection to compete with, the pointer's is not competing.
+    // The applications modal is this list and keeps no selection, so every hover once landed on
+    // the quiet branch and a menu of nothing but hover highlighted in grey.
     let p = Theme::default();
     let data = [(1u64, "a"), (2, "b")];
     let e: Element<u64> =
         list_view(&rows(&data), &[], &mut ListState::default(), 100, 20, |k| k, None, None, Some(2), None, &p);
-    // The primary highlight is the selection's wash, not the quieter hover's.
     let sel = Some((p.accent, libdraw::theme::SELECTION_COVERAGE));
     assert_eq!(row_washes(&e)[1], sel, "the hovered row is not the primary highlight");
     assert_eq!(row_washes(&e)[0], None, "an untouched row reacted");
@@ -944,34 +859,27 @@ fn with_nothing_selected_the_hovered_row_is_the_highlight() {
 fn a_hovered_row_is_quieter_than_a_selected_one_and_loses_to_it() {
     let p = Theme::default();
     let data = [(1u64, "a"), (2, "b")];
-    // Row 1 selected, row 0 hovered: two different highlights, and they must not be the
-    // same weight — two answers to "what happens if I act now" is one too many.
+    // Row 1 selected, row 0 hovered: two highlights that must not be the same weight.
     let e: Element<u64> =
         list_view(&rows(&data), &[], &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, Some(1), None, &p);
-    // Quieter: the hover's coverage against the selection's — 10% against 20% in the light
-    // scheme, which is the whole difference in weight.
     let washes = row_washes(&e);
     assert_eq!(washes[0], Some((p.accent, p.scheme.hover_coverage())), "the hovered row did not react");
     assert_eq!(washes[1], Some((p.accent, libdraw::theme::SELECTION_COVERAGE)), "the selected row lost it");
     assert!(p.scheme.hover_coverage() < libdraw::theme::SELECTION_COVERAGE, "the hover is not quieter");
 
-    // And hovering the *selected* row leaves it selected rather than downgrading it.
     let e: Element<u64> =
         list_view(&rows(&data), &[], &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, Some(2), None, &p);
     assert_eq!(row_washes(&e)[1], Some((p.accent, libdraw::theme::SELECTION_COVERAGE)), "selection lost to hover");
 }
 
-/// The selected row paints differently, or selection is invisible.
 #[test]
 fn the_selected_row_is_painted_differently() {
     let data = [(1u64, "a"), (2, "b")];
     let p = Theme::default();
     let e: Element<u64> =
         list_view(&rows(&data), &[], &mut ListState::at(Some(1), 0), 100, 20, |k| k, None, None, None, None, &p);
-    // **The ground and a wash over it** (desktop refresh, Part B): both rows rest on the
-    // list's ground, and the selected one carries the accent at the selection's 20%. It was a
-    // one-pixel accent border and the selection bevelled inside it (M11 Part E, batch 2); the
-    // design is flat, so a gradient on either row is now the regression.
+    // Both rows rest on the list's ground and the selected one carries the accent's wash; the
+    // design is flat, so a gradient on either row is the regression.
     let faces = row_faces(&e);
     assert_eq!(faces, [p.track, p.track], "a row is not on the list's own ground");
     let washes = row_washes(&e);
@@ -984,7 +892,6 @@ fn the_selected_row_is_painted_differently() {
     assert_eq!(row_bevels(&e), [None, None], "a row is drawn with a gradient");
 }
 
-/// A scrollbar that is always there wastes width; one that never appears strands rows.
 #[test]
 fn the_scrollbar_appears_only_when_there_is_more_than_fits() {
     let p = Theme::default();
@@ -998,7 +905,6 @@ fn the_scrollbar_appears_only_when_there_is_more_than_fits() {
     assert!(has_row_node(&e), "a list that overflows drew no scrollbar");
 }
 
-/// Each row's activation message carries that row's key.
 #[test]
 fn a_rows_message_carries_its_own_key() {
     let data = [(11u64, "a"), (22, "b")];
@@ -1018,7 +924,6 @@ fn a_rows_message_carries_its_own_key() {
     assert_eq!(presses(&e), alloc::vec![11, 22], "a row sent another row's message");
 }
 
-/// Zero row height must not divide by zero.
 #[test]
 fn a_degenerate_row_height_is_not_a_division() {
     let data = [(1u64, "a")];
@@ -1065,8 +970,7 @@ fn presses(e: &Element<u64>) -> alloc::vec::Vec<u64> {
     out
 }
 
-/// The wash each row carries, if any — `(colour, coverage)` — which is how a selected or a
-/// hovered row is drawn since the desktop refresh's Part B.
+/// The wash each row carries, if any, as `(colour, coverage)`.
 fn row_washes<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Option<(Rgb, u8)>> {
     let mut out = alloc::vec::Vec::new();
     walk(e, &mut |n| {
@@ -1086,8 +990,7 @@ fn row_washes<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Option<(Rgb, u8)>> {
     out
 }
 
-/// The bevelled fill each row carries, if any — the visible face of a selected row from M11
-/// Part E until the desktop refresh's Part B, and the negative a flat design has to keep.
+/// The bevelled fill each row carries, if any: the negative a flat design has to keep.
 fn row_bevels<Msg>(e: &Element<Msg>) -> alloc::vec::Vec<Option<Rgb>> {
     let mut out = alloc::vec::Vec::new();
     walk(e, &mut |n| {

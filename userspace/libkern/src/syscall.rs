@@ -1,15 +1,12 @@
 //! Syscall numbers and the raw `syscall`-instruction wrappers.
 //!
 //! The `SYS_*` numbers are pinned to `kernel/src/syscall/table.rs` (the canonical
-//! source); they are sequential from `0` and frozen at v1.0
-//! (`docs/spec/syscall-abi.md`). Each `syscallN` is `unsafe` — the `syscall`
-//! instruction is unsafe and the caller is responsible for valid arguments and
-//! pointers. Higher layers wrap these in safe `Result`-returning helpers (see
-//! [`crate::error::from_raw`]).
+//! source); they are sequential from `0` and frozen at v1.0 (`docs/spec/syscall-abi.md`).
+//! Each `syscallN` is `unsafe`: the caller is responsible for valid arguments and pointers.
+//! Higher layers wrap these in `Result`-returning helpers (see [`crate::error::from_raw`]).
 //!
-//! Register convention (System V-derived, matching the kernel entry stub): `rax`
-//! = number, args in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`; `rcx`/`r11` are
-//! clobbered by the `syscall` instruction; the `isize` result returns in `rax`.
+//! Registers: `rax` = number, args in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9`; `rcx`/`r11` are
+//! clobbered by `syscall`; the `isize` result returns in `rax`.
 
 use core::arch::asm;
 
@@ -73,7 +70,7 @@ pub const SYS_ENTROPY_CREATE: u64 = 26;
 pub const SYS_ENTROPY_READ: u64 = 27;
 /// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
 pub const SYS_IO_SUBMIT: u64 = 28;
-/// `sys_io_cancel` — request cancellation (Phase 2: `Unsupported`).
+/// `sys_io_cancel` — request cancellation (currently `Unsupported`).
 pub const SYS_IO_CANCEL: u64 = 29;
 /// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
 pub const SYS_NS_ENUMERATE: u64 = 30;
@@ -86,38 +83,36 @@ pub const SYS_FILE_CREATE: u64 = 33;
 /// `sys_file_truncate` — resolve a file, **shrinking** it to a target size first.
 pub const SYS_FILE_TRUNCATE: u64 = 34;
 /// `sys_file_rename` — rename a path to another path **within the same filesystem**
-/// (a3/a4 = destination pointer/length, a5 = `RENAME_*` flags). Returns a
-/// `PendingOperation`; the completion carries status only, no handle. A destination on a
-/// different binding fails with `Unsupported` — the caller's cue to fall back to
-/// copy-then-unlink, the way `mv` does across devices.
+/// (a3/a4 = destination pointer/length, a5 = `RENAME_*` flags). Returns a `PendingOperation`
+/// whose completion carries status only. A destination on a different binding fails with
+/// `Unsupported` — the cue to copy then unlink.
 pub const SYS_FILE_RENAME: u64 = 35;
 /// `sys_process_terminate` — **ask** a process to exit; it is delivered as a
 /// `TerminateRequested` notification and nothing stops a process that ignores it (§11h).
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
-/// `sys_ns_derive(ns)` — a new namespace holding a **copy of `ns`'s bindings**, returned as a
-/// handle with full namespace rights (so it can be transferred, which a process's own root
-/// cannot). Requires `LOOKUP` on `ns`. A snapshot: later changes to either do not reach the other.
+/// `sys_ns_derive(ns)` — a new namespace holding a **snapshot of `ns`'s bindings**, returned with
+/// full namespace rights (so it can be transferred, which a process's own root cannot). Requires
+/// `LOOKUP` on `ns`.
 pub const SYS_NS_DERIVE: u64 = 37;
 /// `sys_ns_sync(ns, path, path_len)` — write back every dirty file cached under the userspace
 /// server `path` resolves to in `ns`, returning how many were written. Requires `LOOKUP` on
 /// `ns`. **Blocks** until the writes complete, like `sys_file_sync` — a durability point.
 pub const SYS_NS_SYNC: u64 = 38;
 /// `sys_ns_held(ns, path, path_len)` — how many of the files the userspace server `path` resolves
-/// to handed out are still held by something: a handle, a mapping, an IRP, or a dirty pin. Asked
-/// after `sys_ns_sync`, a non-zero answer means the mount is in use (administration Part C.5c).
+/// to handed out are still held (a handle, mapping, IRP or dirty pin). Asked after `sys_ns_sync`,
+/// non-zero means the mount is in use.
 pub const SYS_NS_HELD: u64 = 39;
 /// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt
 /// ([`POWER_HALT`]) or reset ([`POWER_REBOOT`]). Needs `WRITE` on the system-control object,
-/// which only `init` holds, and **returns only to refuse** (administration Part E.3).
+/// which only `init` holds, and **returns only to refuse**.
 pub const SYS_POWER: u64 = 40;
 /// `sys_power`'s halt: the machine stays on, saying it is safe to turn it off.
 pub const POWER_HALT: u64 = 0;
 /// `sys_power`'s reboot: the FADT's reset register, then the 8042, then a triple fault.
 pub const POWER_REBOOT: u64 = 1;
 /// `sys_clock_set(clock, ns)` — set the wall clock to `ns` since the epoch, and the machine's RTC
-/// under it (administration Part E.5). `clock` must be
-/// [`CLOCK_REALTIME`](crate::abi::CLOCK_REALTIME) and `ns` in 2000–2099, or `InvalidArgument`; then
-/// the caller needs `SYSTEM_CLOCK`, or `NoAccess`. Returns
+/// under it. `clock` must be [`CLOCK_REALTIME`](crate::abi::CLOCK_REALTIME) and `ns` in
+/// 2000–2099, or `InvalidArgument`; then the caller needs `SYSTEM_CLOCK`, or `NoAccess`. Returns
 /// [`CLOCK_SET_KEPT`](crate::abi::CLOCK_SET_KEPT) or
 /// [`CLOCK_SET_THIS_BOOT`](crate::abi::CLOCK_SET_THIS_BOOT).
 pub const SYS_CLOCK_SET: u64 = 41;
@@ -128,25 +123,19 @@ pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// `test-harness` feature; a production kernel returns `Unsupported`. Not ABI-stable.
 ///
 /// **This returns whenever the device is absent, which is the normal case for every gate
-/// except `test-qemu`** — they boot the `test-harness` image without the device because
-/// they need the guest alive afterwards. The answer is `Unsupported` there too, so it means
-/// "no verdict was delivered" rather than "wrong kernel build". Do not wrap this in a `-> !`
-/// helper. (`0xFFFF_0001` was the long-retired process-exit
-/// `sys_debug_exit`; this is a distinct syscall at the next number.) See
-/// `docs/conventions/qemu-integration-tests.md`.
+/// except `test-qemu`**: they need the guest alive afterwards. The answer is `Unsupported`
+/// there too, so it means "no verdict was delivered". Do not wrap this in a `-> !` helper.
+/// See `docs/conventions/qemu-integration-tests.md`.
 pub const SYS_TEST_EXIT: u64 = 0xFFFF_0002;
 
-/// `SYS_TEST_EXIT` verdict: the integration-test run passed. QEMU exits `(0x10 <<
-/// 1) | 1 = 33`, which the xtask runner maps to success.
+/// `SYS_TEST_EXIT` verdict: the run passed. QEMU exits `(0x10 << 1) | 1 = 33`.
 pub const TEST_EXIT_SUCCESS: u32 = 0x10;
-/// `SYS_TEST_EXIT` verdict: the integration-test run failed. QEMU exits `(0x11 <<
-/// 1) | 1 = 35`, which the xtask runner maps to failure.
+/// `SYS_TEST_EXIT` verdict: the run failed. QEMU exits `(0x11 << 1) | 1 = 35`.
 pub const TEST_EXIT_FAILURE: u32 = 0x11;
 
 // --- Raw `syscall`-instruction wrappers ------------------------------------
 
-/// The 6-argument base wrapper; the others zero unused argument registers and
-/// delegate here. Returns the kernel's `isize` result (as `i64`).
+/// The 6-argument base wrapper; the others delegate here. Returns the kernel's `isize` result.
 ///
 /// # Safety
 /// `nr` must be a valid syscall number and `a0..a5` valid for it (including any
@@ -177,7 +166,6 @@ pub unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
 /// Zero-argument syscall.
 ///
 /// # Safety
-///
 /// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall0(nr: u64) -> i64 {
@@ -188,7 +176,6 @@ pub unsafe fn syscall0(nr: u64) -> i64 {
 /// One-argument syscall.
 ///
 /// # Safety
-///
 /// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
@@ -199,7 +186,6 @@ pub unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
 /// Two-argument syscall.
 ///
 /// # Safety
-///
 /// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
@@ -210,7 +196,6 @@ pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
 /// Three-argument syscall.
 ///
 /// # Safety
-///
 /// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
@@ -221,7 +206,6 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 /// Four-argument syscall.
 ///
 /// # Safety
-///
 /// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
@@ -232,7 +216,6 @@ pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 /// Five-argument syscall.
 ///
 /// # Safety
-///
 /// See [`syscall6`].
 #[inline]
 pub unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {

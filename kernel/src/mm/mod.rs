@@ -1,11 +1,8 @@
 //! Memory management.
 //!
-//! Three-layer design (per `docs/architecture/overview.md` §"Memory
-//! management"): the buddy allocator manages physical page frames; a
-//! SLUB-inspired slab allocator handles kernel object allocation on top
-//! of the buddy; the VMM owns per-process address spaces. This module
-//! holds the buddy allocator and the common types both upper layers
-//! consume.
+//! Three layers (`docs/architecture/overview.md` §"Memory management"): the buddy allocator
+//! manages physical frames; a SLUB-inspired slab allocator serves kernel objects on top of it; the
+//! VMM owns per-process address spaces. This module holds the types they share.
 
 pub mod addr_space;
 pub mod buddy;
@@ -25,15 +22,10 @@ pub(crate) mod test_support;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Count of anonymous pages faulted in on demand by
-/// [`AddressSpace::fault_in`](addr_space::AddressSpace::fault_in) since boot.
-/// A diagnostic-only counter (relaxed, lock-free): it makes the otherwise-
-/// invisible demand-paging path observable — the boot demo logs it to prove
-/// lazily-reserved stacks are faulted in rather than eagerly allocated.
+/// Anonymous pages faulted in on demand since boot. Diagnostic only (relaxed, lock-free).
 static DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
 
-/// Record one successful demand fault-in. Called from `fault_in` on each
-/// [`FaultIn::Mapped`](addr_space::FaultIn::Mapped) for an anonymous page.
+/// Record one successful anonymous demand fault-in.
 pub fn record_demand_fault() {
     DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
@@ -43,21 +35,16 @@ pub fn demand_fault_count() -> u64 {
     DEMAND_FAULTS.load(Ordering::Relaxed)
 }
 
-/// Page size in bytes. The kernel uses 4 KiB pages on x86_64; large pages
-/// are an optimisation handled inside the VMM, not a different unit of
-/// allocation.
+/// Page size in bytes: 4 KiB on x86_64; large pages are an optimisation inside the VMM.
 pub const PAGE_SIZE: usize = 4096;
 
-/// How a mapping of some memory should be cached (Phase 5 Part G.2).
+/// How a mapping of some memory should be cached.
 ///
-/// **A property of the memory, carried by every mapping of it.** A device aperture wants the same
-/// treatment whoever maps it, and two mappings of one aperture that disagree are the aliasing the
-/// vendor's manuals warn about — which is what this system had until Part G: the bootloader mapped
-/// the framebuffer write-combining and every `/dev/framebuffer` mapping asked for write-back, which
-/// the firmware's uncacheable range then overrode. The laptop measured that at 54 MiB/s against
-/// 2924 through the bootloader's mapping of the same pixels.
+/// A property of the memory, carried by every mapping of it: two mappings of one device aperture
+/// that disagree on caching are an aliasing hazard (a write-back mapping of a framebuffer is
+/// overridden by the firmware's uncacheable range, and is far slower than a write-combining one).
 ///
-/// Only the two cases the system has. Anything finer belongs to the day something needs it.
+/// Only the two cases the system has.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Caching {
     /// Ordinary memory: cached, and the page table says nothing about it. Every anonymous and
@@ -82,12 +69,9 @@ impl Caching {
 /// `log2(PAGE_SIZE)`. Pre-shifted so frame arithmetic is `addr >> PAGE_SHIFT`.
 pub const PAGE_SHIFT: u32 = 12;
 
-/// A physical address. Newtype rather than a bare `u64` so that mixing
-/// physical and virtual addresses is a type error.
+/// A physical address. A newtype so mixing physical and virtual addresses is a type error.
 ///
-/// Not `#[repr(C)]`: `PhysAddr` is internal to the kernel and never
-/// crosses the syscall ABI. The `#[repr(transparent)]` is for layout
-/// parity with `u64` only.
+/// Not `#[repr(C)]`: it never crosses the syscall ABI.
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PhysAddr(pub u64);
@@ -117,13 +101,9 @@ impl PhysAddr {
     }
 }
 
-/// A virtual (linear) address. Newtype over `u64` for the same reason as
-/// [`PhysAddr`]: so a physical address can never be used where a virtual
-/// one is meant, and vice versa.
+/// A virtual (linear) address; a newtype for the same reason as [`PhysAddr`].
 ///
-/// Not `#[repr(C)]`: `VirtAddr` is internal to the kernel and never
-/// crosses the syscall ABI. The `#[repr(transparent)]` is for layout
-/// parity with `u64` only.
+/// Not `#[repr(C)]`: it never crosses the syscall ABI.
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct VirtAddr(pub u64);
@@ -142,12 +122,9 @@ impl VirtAddr {
         (self.0 & (PAGE_SIZE as u64 - 1)) == 0
     }
 
-    /// `true` if this address is canonical for 4-level paging: bits 63:48
-    /// must all replicate bit 47. The CPU `#GP`s on a non-canonical
-    /// address, so the paging layer rejects them before walking a table.
+    /// `true` if this address is canonical for 4-level paging: bits 63:48 replicate bit 47. The CPU
+    /// `#GP`s on a non-canonical address, so the paging layer rejects them before walking a table.
     pub const fn is_canonical(self) -> bool {
-        // Sign-extend bit 47 across the top 16 bits; a canonical address
-        // is unchanged by the round trip.
         let sign_extended = ((self.0 << 16) as i64 >> 16) as u64;
         sign_extended == self.0
     }
@@ -167,7 +144,6 @@ mod tests {
 
     #[test]
     fn virt_canonical_low_half() {
-        // Bit 47 clear: canonical iff bits 63:48 are also clear.
         assert!(VirtAddr::new(0).is_canonical());
         assert!(VirtAddr::new(0x0000_7FFF_FFFF_F000).is_canonical());
         assert!(!VirtAddr::new(0x0001_0000_0000_0000).is_canonical());
@@ -176,8 +152,6 @@ mod tests {
 
     #[test]
     fn virt_canonical_high_half() {
-        // Bit 47 set: canonical iff bits 63:48 are all set — the
-        // higher-half kernel range.
         assert!(VirtAddr::new(0xFFFF_8000_0000_0000).is_canonical());
         assert!(VirtAddr::new(0xFFFF_FFFF_8000_0000).is_canonical());
         assert!(!VirtAddr::new(0xFFFE_8000_0000_0000).is_canonical());

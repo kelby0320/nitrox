@@ -1,25 +1,18 @@
 //! The evaluator core — §9's statements and §8's operators, in process.
 //!
-//! Milestone 3 Part B. Everything here runs on the `Value` tree inside the shell: no
-//! spawning, no IPC, no syscalls. That is not a simplification for testing's sake, it is
-//! the design's actual claim (§5c) — most of a typical pipeline never crosses a process
-//! boundary, so the in-process evaluator is the common path rather than a stub for one.
-//!
-//! Part C adds the boundary, Part D the generic operators, Part E functions and `match`.
-//! Reaching any of those from here is a clean "not yet" error rather than a wrong answer.
+//! Everything here runs on the `Value` tree inside the shell: no spawning, no IPC, no syscalls.
+//! That is the design's claim (§5c): most of a typical pipeline never crosses a process boundary,
+//! so the in-process evaluator is the common path.
 //!
 //! ## Two decisions worth stating
 //!
-//! **There is no truthiness.** `if 1 { … }` is an error, not a true branch. §6 makes
-//! mismatch an error rather than a warning and §1 makes the default fail-loud; coercing
-//! an `Int` to a condition is exactly the silent reinterpretation both rules exist to
-//! prevent. The cost is a keystroke (`if n != 0`), the benefit is that a condition means
-//! one thing.
+//! **There is no truthiness.** `if 1 { … }` is an error. §6 makes mismatch an error and §1 makes
+//! the default fail-loud; coercing an `Int` to a condition is the silent reinterpretation both
+//! rules exist to prevent. The cost is a keystroke (`if n != 0`).
 //!
-//! **Arithmetic overflow and division by zero are errors.** Not wrapping, not `inf`. A
-//! shell that silently produced `-9223372036854775808` from an addition would be
-//! reporting a fabricated number, the same category of thing as `date` printing 1970 when
-//! the clock is unset.
+//! **Arithmetic overflow and division by zero are errors.** Not wrapping, not `inf`: a shell that
+//! printed `-9223372036854775808` from an addition would be reporting a fabricated number, like
+//! `date` printing 1970 when the clock is unset.
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -33,29 +26,25 @@ use crate::host::{Host, PipelineRun, StageSpec, StageStatus};
 use crate::ops;
 use crate::value::{Func, Val, render_i64};
 
-/// A runtime failure. The message is built for a person: it names the operation and the
-/// types involved, which is the §6 "schema diff, not a vague mismatch" posture applied to
-/// scalars.
+/// A runtime failure. The message is built for a person: it names the operation and the types
+/// involved (§6's "schema diff, not a vague mismatch").
 ///
-/// `kind` is §2's vocabulary — small and closed at any moment, so matching on it is worth
-/// doing, and extensible because §6's subset match means a `catch` that reads only
-/// `message` keeps working when a kind is added.
+/// `kind` is §2's vocabulary — small and closed at any moment, and extensible because §6's subset
+/// match lets a `catch` that reads only `message` survive a new kind.
 #[derive(Clone, PartialEq, Debug)]
 pub struct EvalError {
     pub message: String,
     pub kind: String,
     /// The §1 per-stage report, carried only by a [`PIPELINE_FAILED`].
     ///
-    /// This is where `PipelineStatus` actually arrives (§2). A pipeline's *value* is its
-    /// data, and on failure it never reaches the binding at all — so the report rides on
-    /// the error, which is the one thing that does reach the `catch`.
+    /// A pipeline's value never reaches the binding on failure, so the report rides on the error,
+    /// the one thing that reaches the `catch` (§2).
     pub stages: Option<Value>,
     /// `exit N` (§11f) travelling out — **not a failure**, despite the channel.
     ///
-    /// It uses the error path because that is the only one that already crosses every
-    /// boundary in this interpreter: a loop, a `def`, a closure, a `match` arm. The one
-    /// place that must not treat it as an error is `catch`, which re-raises rather than
-    /// handling it — leaving a shell is not something a script recovers from by accident.
+    /// The error path is the only one already crossing every boundary: a loop, a `def`, a closure,
+    /// a `match` arm. `catch` re-raises it rather than handling it, so a script cannot prevent
+    /// leaving the shell by accident.
     pub exit: Option<i32>,
 }
 
@@ -65,9 +54,8 @@ pub const TYPE_ERROR: &str = "TypeError";
 pub const PARSE_ERROR: &str = "ParseError";
 pub const ASSERTION_FAILED: &str = "AssertionFailed";
 pub const PIPELINE_FAILED: &str = "PipelineFailed";
-/// §11h. Catchable on purpose: a script gets to clean up after `Ctrl-C`, exactly as it
-/// does after any other failure. `exit` is the one that is *not* catchable, and the
-/// asymmetry is deliberate — leaving is a decision, being interrupted is an event.
+/// §11h. Catchable on purpose, so a script can clean up after `Ctrl-C`. `exit` is not: leaving is a
+/// decision, being interrupted is an event.
 pub const INTERRUPTED: &str = "Interrupted";
 
 impl EvalError {
@@ -90,9 +78,8 @@ impl EvalError {
 
     /// The error as a `Record`, which is what `catch (e)` binds (§2).
     ///
-    /// Deliberately an ordinary record so §9f's patterns take it apart with no new
-    /// grammar — and built here, once, so the vocabulary cannot drift between the sites
-    /// that raise it.
+    /// An ordinary record so §9f's patterns take it apart with no new grammar, built here once so
+    /// the vocabulary cannot drift between the sites that raise it.
     fn to_record(&self) -> Val {
         let mut schema = Schema::new().field("kind", libstream::wire::TypeTag::String, TypeModifiers::NONE).field(
             "message",
@@ -116,10 +103,10 @@ enum Flow {
     Normal(Val),
     Return(Val),
     /// `break` / `continue` (§9c), travelling out to the nearest enclosing loop.
+    /// `break` / `continue` (§9c), travelling out to the nearest enclosing loop.
     ///
-    /// **Every `match` on `Flow` is a place one of these can be swallowed**, which is why
-    /// none of them uses a wildcard arm: an exhaustive match makes the compiler ask the
-    /// question at each site rather than letting a `break` quietly become a no-op.
+    /// **Every `match` on `Flow` can swallow one of these**, so none uses a wildcard arm:
+    /// exhaustiveness makes the compiler ask at each site.
     Break,
     Continue,
 }
@@ -135,11 +122,9 @@ struct Slot {
 
 /// Whether a bare top-level expression is displayed (§11e).
 ///
-/// The two modes differ deliberately: a REPL appends `| display` to an unassigned
-/// pipeline, while a script discards it, because a script full of `remove`/`move` calls
-/// for their side effects would otherwise flood its output. The difference lives here, at
-/// the driver, rather than in the statement — a statement has no opinion about who is
-/// watching.
+/// The two modes differ deliberately: a REPL appends `| display` to an unassigned pipeline, while a
+/// script discards it, or a script of `remove`/`move` calls would flood its output. The difference
+/// lives at the driver, not in the statement.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
     /// Bare expression values are discarded.
@@ -150,43 +135,34 @@ pub enum Mode {
 
 /// The interpreter's state.
 pub struct Interp {
-    /// A stack of scopes, innermost last. A `Vec` rather than a map because a scope holds
-    /// a handful of names and linear scan beats hashing at that size — and it keeps
-    /// shadowing order explicit.
+    /// A stack of scopes, innermost last. A `Vec` because a scope holds a handful of names, where
+    /// linear scan beats hashing, and shadowing order stays explicit.
     scopes: Vec<Vec<(String, Slot)>>,
     /// The environment: a TSM1 `Record`, handed to every stage this shell spawns.
     ///
-    /// Also bound as `$env`, so it is an ordinary value — `display $env`, `$env.PWD` and
-    /// `env.EDITOR = "vi"` need no machinery beyond field access and the operators that
-    /// already exist (§6: `Value` is exactly what TSM1 can represent).
+    /// Also bound as `$env`, so it is an ordinary value: `$env.PWD` and `env.EDITOR = "vi"` need
+    /// nothing beyond field access (§6).
     env: Record,
     /// Hoisted `def` bindings, visible from inside any call.
     ///
-    /// §5a says a named function does not capture its enclosing scope — its parameter
-    /// list is a complete account of its *inputs*. But it must still be able to **call**
-    /// other functions, or mutual recursion is impossible and every helper has to be
-    /// passed in. Declarations and values are different things, so they live in different
-    /// places: a `def` goes here and is always reachable, a `let` stays in `scopes` and is
-    /// not.
+    /// §5a: a named function captures nothing, but it must still be able to **call** other
+    /// functions, or mutual recursion is impossible. So a `def` goes here and is always reachable,
+    /// while a `let` stays in `scopes` and is not.
     functions: Vec<(String, Val)>,
-    /// Everything that touches the operating system (Part C's seam).
     host: alloc::boxed::Box<dyn Host>,
     mode: Mode,
     /// Whether the statement currently executing is inside a `strict { }` block (§1).
     strict: bool,
     /// The most recent pipeline's `PipelineStatus`, for `$last.status` (§11d).
     ///
-    /// A private field rather than the `__status` *binding* it used to be: that binding
-    /// was a name a user could type for a feature the language does not have, and it was
-    /// dropped on the failure path — the one case the report exists for. The report now
-    /// rides on the error (§2); this is only the REPL's convenience copy.
+    /// A private field, not a `__status` binding: that was a name a user could type and was dropped
+    /// on the failure path. The report rides on the error (§2); this is only the REPL's convenience
+    /// copy.
     last_status: Option<Val>,
     /// The runaway backstop, [`MAX_ITERATIONS`] in every build.
     ///
-    /// A field rather than the constant read directly so the guard is **testable in
-    /// microseconds**: proving it fires otherwise means actually running ten million
-    /// iterations, which costs more wall-clock than the whole suite. Not user-facing and
-    /// not a resource policy — see the constant.
+    /// A field so the guard is **testable in microseconds**; proving it at ten million iterations
+    /// would cost more than the whole suite. Not a resource policy.
     iteration_limit: u64,
 }
 
@@ -222,10 +198,8 @@ impl Interp {
 
     /// The working directory, from the environment's conventional `PWD` entry.
     ///
-    /// A *conventional* entry rather than a distinct field (Milestone 3.5): Unix has two
-    /// sources of truth for this — `$PWD` and `getcwd()` — and the interesting bugs live
-    /// in the gap. There is no kernel cwd here, so this is the truth and has nothing to
-    /// disagree with.
+    /// A *conventional* entry, not a distinct field: Unix has two sources of truth, `$PWD` and
+    /// `getcwd()`, and the bugs live in the gap. There is no kernel cwd here to disagree.
     pub fn cwd(&self) -> Option<&str> {
         let i = self.env.schema.fields.iter().position(|f| f.name == "PWD")?;
         self.env.values.get(i)?.as_str()
@@ -233,7 +207,7 @@ impl Interp {
 
     /// Resolve a path the *shell itself* will use, against `PWD`.
     ///
-    /// Only for the shell's own lookups — `open`, `save`, a script path. A spawned stage's
+    /// Only for the shell's own lookups (`open`, `save`, a script path). A spawned stage's
     /// arguments are passed through as written; see [`Host::run`].
     fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
         let mut buf = [0u8; 1024];
@@ -267,23 +241,18 @@ impl Interp {
 
     /// What a Tab press at the end of `line` should offer (§11c).
     ///
-    /// **The gathering half of completion**; the deciding half is [`crate::complete`], which
-    /// is pure and where the rules are tested. This is here because the answer needs things
-    /// only an interpreter has: the `def`s that have been typed, and a `Host` to ask what is
-    /// in a directory.
+    /// The gathering half of completion; the deciding half is [`crate::complete`]. It lives here
+    /// because the answer needs the `def`s typed so far and a `Host` to list a directory.
     ///
-    /// **A word containing a `/` is a path wherever it appears**, including at the head of a
-    /// stage. `./script.nx` and `/bin/list` are commands written as paths, and §9h's rule
-    /// for `use` is the same one — an explicit relative path rather than a search. So the
-    /// slash decides before the position does.
+    /// **A word containing a `/` is a path wherever it appears**, including at the head of a stage:
+    /// `./script.nx` and `/bin/list` are commands written as paths, as in §9h's `use`.
     pub fn complete(&mut self, line: &str) -> crate::complete::Completion {
         use crate::complete::{Completion, Where, matching_names, matching_paths, split_path, word_at_end};
         let w = word_at_end(line);
         let as_path = w.at == Where::Argument || w.text.contains('/');
         if !as_path {
-            // §3's four categories, plus what the person has defined. Keywords whose spelling
-            // is not a word are skipped: `_` is in the table because it is a token, and
-            // offering it at a prompt would be offering punctuation.
+            // §3's four categories plus the person's `def`s. Keywords that are not words, like `_`,
+            // are skipped: offering punctuation at a prompt is noise.
             let keywords = crate::lex::KEYWORDS
                 .iter()
                 .map(|(k, _)| *k)
@@ -298,11 +267,10 @@ impl Interp {
         }
 
         let (dir, frag) = split_path(w.text);
-        // An empty directory part means the word is a bare name, which is relative to `PWD`.
         let target = match self.resolve_path(if dir.is_empty() { "." } else { dir }) {
             Ok(p) => p,
-            // A path that will not resolve has nothing under it to offer. Not an error: a
-            // Tab that finds nothing does nothing, and the line is unfinished by definition.
+            // A path that will not resolve has nothing to offer; a Tab that finds nothing does
+            // nothing.
             Err(_) => return Completion::none(w.start),
         };
         let entries = self.host.list_dir(&target);
@@ -316,40 +284,28 @@ impl Interp {
 
     /// Run a whole script, returning the value of its last expression statement.
     ///
-    /// A script discards bare expression values (§11e) — this returns the last one anyway
-    /// because it is what `nxsh -c` and the tests need to observe. The *auto-display*
-    /// difference between REPL and script is Part C's, and lives at the driver, not here.
+    /// A script discards bare expression values (§11e); this returns the last one anyway for `nxsh
+    /// -c` and the tests. The REPL/script auto-display difference lives at the driver.
     pub fn run(&mut self, script: &Script) -> Result<Val> {
         boundary_value(self.exec_block(&script.stmts)?)
     }
 
-    /// Run one interactive line: execute it, bind `$last`, and return what the REPL
-    /// should print (§11d, §11e).
+    /// Run one interactive line: execute it, bind `$last`, and return what the REPL should print
+    /// (§11d, §11e).
     ///
-    /// `$last` is deliberately a small `Record` of **both** halves. §2 left it ambiguous
-    /// whether a pipeline's "value" and its `PipelineStatus` were the same thing; §11d
-    /// settles that they are not and should not be conflated — `$last.value` is what you
-    /// just computed, `$last.status` is whether it worked. Purely REPL bookkeeping: it is
-    /// not visible inside a function or a script, so real code still has no ambient state
-    /// to read.
+    /// `$last` is a small `Record` of **both** halves, since §11d keeps a pipeline's value and its
+    /// `PipelineStatus` distinct: `$last.value` is what you computed, `$last.status` whether it
+    /// worked. REPL bookkeeping only, not visible inside a function or script.
     pub fn run_line(&mut self, src: &str) -> Result<Option<alloc::string::String>> {
         let script =
             crate::parse_script(src).map_err(|e| EvalError::new(alloc::format!("line {}: {}", e.line, e.message)))?;
         // **Hoist, exactly as a block does.** `exec` treats `Stmt::Def` as a no-op because
-        // definitions are registered here, not executed (§5a — hoisting is what makes
-        // mutual recursion possible). `exec_block` had the only call, so a whole script
-        // hoisted and a REPL line did not: a `def` typed at a prompt parsed, evaluated to
-        // nothing, and vanished, and the next line reported no such function.
-        //
-        // A line is a block's worth of statements, so it gets a block's treatment.
+        // definitions are registered here (§5a); without it a `def` typed at a prompt vanished.
         self.hoist_defs(&script.stmts)?;
         let mut out = None;
         for stmt in &script.stmts {
-            // **Anything `exec_block` does to a list of statements, `run_line` owes them
-            // too** (`nxsh/CLAUDE.md`) — and this is the third time that rule has been
-            // learned here, after `hoist_defs` and the stale `cd` guard. The interrupt
-            // checkpoint lived only in `exec_block`, so a line typed at a prompt was
-            // checked *inside* its loops and never *between* its statements.
+            // **Anything `exec_block` does to a list of statements, `run_line` owes them too**
+            // (`nxsh/CLAUDE.md`): the interrupt checkpoint between statements lived only there.
             self.check_interrupt()?;
             let value = boundary_value(self.exec(stmt)?)?;
             self.bind_last(&value)?;
@@ -379,8 +335,6 @@ impl Interp {
             status.as_data().cloned().unwrap_or(Value::Null),
         ];
         let rec = Val::Data(Value::Record(Arc::new(Record { schema, values })));
-        // `$last` is rebound every line, so it is a `mut` slot rather than a fresh
-        // binding stacking up in the scope.
         if let Some(slot) = self.lookup_mut("$last") {
             slot.val = rec;
             return Ok(());
@@ -394,8 +348,6 @@ impl Interp {
             crate::parse_script(src).map_err(|e| EvalError::new(alloc::format!("line {}: {}", e.line, e.message)))?;
         Interp::new().run(&script)
     }
-
-    // --- scopes -------------------------------------------------------------
 
     fn push_scope(&mut self) {
         self.scopes.push(Vec::new());
@@ -432,22 +384,17 @@ impl Interp {
         Ok(())
     }
 
-    // --- statements ---------------------------------------------------------
-
     /// A block's value is its last statement's, if that statement is expression-shaped
     /// (§9a). Anything else — a `let`, a `for` — leaves the block evaluating to `Null`.
     fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Flow> {
         self.hoist_defs(stmts)?;
         let mut last = Val::NULL;
         for (i, s) in stmts.iter().enumerate() {
-            // §11h's checkpoint. **Between statements**, which is what makes it cheap and
-            // what guarantees it can never tear an assignment in half: everything the
-            // interpreter was doing is finished, and the next thing has not started.
+            // §11h's checkpoint, **between statements**: cheap, and it cannot tear an assignment.
             self.check_interrupt()?;
             match self.exec(s)? {
                 Flow::Return(v) => return Ok(Flow::Return(v)),
-                // A block does not decide what these mean — the enclosing loop does, so
-                // they leave immediately and the statements after them do not run.
+                // The enclosing loop decides what these mean; the rest of the block is skipped.
                 Flow::Break => return Ok(Flow::Break),
                 Flow::Continue => return Ok(Flow::Continue),
                 Flow::Normal(v) => {
@@ -492,15 +439,14 @@ impl Interp {
                 } else if let Some(b) = otherwise {
                     self.scoped_block(b)
                 } else {
-                    // §9a: `if` without `else` is `Null` when the condition is false.
                     Ok(Flow::Normal(Val::NULL))
                 }
             }
             Stmt::While { cond, body } => {
                 let mut guard = 0u64;
                 while self.condition(cond)? {
-                    // A loop body can be empty — `while true { }` is the case §11h exists
-                    // for — so the per-statement checkpoint is not enough on its own.
+                    // A loop body can be empty (`while true { }`, the case §11h exists for), so the
+                    // per-statement checkpoint is not enough.
                     self.check_interrupt()?;
                     guard += 1;
                     if guard > self.iteration_limit {
@@ -522,15 +468,14 @@ impl Interp {
                 for item in items {
                     self.check_interrupt()?;
                     self.push_scope();
-                    // The loop variable is immutable and fresh each turn, so a closure
-                    // made in the body captures *this* iteration's value (§5a).
+                    // The loop variable is fresh each turn, so a closure captures *this*
+                    // iteration's value (§5a).
                     self.bind(binding, item, false, false)?;
                     let r = self.exec_block(body);
                     self.pop_scope();
                     match r? {
                         Flow::Return(v) => return Ok(Flow::Return(v)),
                         Flow::Break => break,
-                        // `continue` is the loop's own business and stops here.
                         Flow::Continue | Flow::Normal(_) => {}
                     }
                 }
@@ -543,16 +488,13 @@ impl Interp {
                 };
                 Ok(Flow::Return(v))
             }
-            // §2's raising half. `try`/`catch` could catch an error and nothing in the
-            // language could produce one — so a `def` could validate its arguments and
-            // could not say what was wrong with them.
+            // §2's raising half: `try`/`catch` could catch an error but nothing could produce one.
             Stmt::Fail(e) => {
                 let v = self.eval(e)?;
                 Err(match v.as_data() {
                     Some(Value::Str(m)) => EvalError::of(ERROR, m.clone()),
-                    // A record is raised as the error value itself, so a caller can match
-                    // on more than a message. It must carry one, though: an error whose
-                    // `message` is missing is the vague failure §6 spends its diff on.
+                    // A record is raised as the error value itself and must carry a `message`:
+                    // without one it is the vague failure §6 spends its diff on.
                     Some(Value::Record(r)) => {
                         let field =
                             |n: &str| r.schema.fields.iter().position(|f| f.name == n).and_then(|i| r.values.get(i));
@@ -574,21 +516,15 @@ impl Interp {
                     )),
                 })
             }
-            // The parser has already established that these sit inside a loop body in
-            // this function (§9c), so there is nothing left to check here.
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
-            // `try` is an expression, but in statement position its control flow must
-            // still reach the enclosing loop or function — so it is unwrapped here rather
-            // than going through `eval`, which can only return a value.
+            // `try` in statement position is unwrapped here, not via `eval`, which can only return
+            // a value: its control flow must still reach the enclosing loop or function.
             Stmt::Expr(Expr::Try { body, catch_binding, catch_body }) => self.exec_try(body, catch_binding, catch_body),
             Stmt::Expr(e) => Ok(Flow::Normal(self.eval(e)?)),
-            // Already bound by `hoist_defs` at block entry (§5a), so the declaration
-            // itself does nothing further.
             Stmt::Def { .. } => Ok(Flow::Normal(Val::NULL)),
-            // §1: deliberately a local, visible block rather than a bash-`pipefail`-style
-            // ambient mode switch — the same no-ambient-state stance as the rejection of
-            // a global `$?` and of implicit env inheritance.
+            // §1: a local, visible block rather than a `pipefail`-style ambient mode, in line with
+            // rejecting a global `$?` and implicit env inheritance.
             Stmt::Strict(body) => {
                 let saved = self.strict;
                 self.strict = true;
@@ -605,31 +541,26 @@ impl Interp {
 
     /// `try { … } catch (e) { … }` — one implementation, two entry points.
     ///
-    /// §2: sugar over branching on a failure, **not** stack unwinding across unrelated
-    /// frames — consistent with the system's rejection of hidden non-local control flow
-    /// everywhere else (no signals).
+    /// §2: sugar over branching on a failure, **not** stack unwinding.
     ///
-    /// It returns `Flow` rather than a `Val` **so statement position keeps working**:
-    /// `for x in xs { try { … } catch { continue } }` has to reach the loop, and a `return`
-    /// inside a `try` has to leave the function. `exec` propagates that; `eval` reduces it
-    /// with `expression_value`, which is where a `break` in *value* position is refused
-    /// (`TODO(control-flow-in-expression-position)`). Making `try` an expression is
-    /// exactly the change that entry predicted would bite here.
+    /// It returns `Flow` rather than a `Val` **so statement position keeps working**: `for x in xs
+    /// { try { … } catch { continue } }` must reach the loop, and a `return` inside a `try` must
+    /// leave the function. `eval` reduces it with `expression_value`, which refuses a `break` in
+    /// *value* position (`TODO(control-flow-in-expression-position)`).
     fn exec_try(&mut self, body: &[Stmt], catch_binding: &Option<String>, catch_body: &[Stmt]) -> Result<Flow> {
         let e = match self.scoped_block(body) {
             Ok(flow) => return Ok(flow),
             Err(e) => e,
         };
-        // **`exit` is not a failure** (§11f): it travels the error path because that is
-        // the only channel crossing every boundary, and a `catch` that swallowed it would
-        // make leaving a shell something a script prevents by accident.
+        // **`exit` is not a failure** (§11f): a `catch` that swallowed it would let a script
+        // prevent leaving the shell by accident.
         if e.is_exit() {
             return Err(e);
         }
         self.push_scope();
         if let Some(n) = catch_binding {
-            // An ordinary `Record`, built in one place (see `EvalError::to_record`), so
-            // `match err { … }` needs no new grammar — §9f's payoff.
+            // An ordinary `Record` built in one place (`EvalError::to_record`), so `match err { …
+            // }` needs no new grammar.
             let _ = self.bind(n, e.to_record(), false, false);
         }
         let r = self.exec_block(catch_body);
@@ -639,9 +570,8 @@ impl Interp {
 
     /// Ask the host whether the terminal wants this evaluation to stop (§11h).
     ///
-    /// An interrupt unwinds as an ordinary error, so `try`/`catch` still runs and the REPL
-    /// prints one line and returns to the prompt. It is *not* an `exit`: leaving is a
-    /// decision a script makes, being interrupted is something that happens to it.
+    /// An interrupt unwinds as an ordinary error, so `try`/`catch` still runs. It is *not* an
+    /// `exit`: leaving is a decision, being interrupted is something that happens.
     fn check_interrupt(&mut self) -> Result<()> {
         if self.host.interrupted() {
             return Err(EvalError::of(INTERRUPTED, "interrupted"));
@@ -661,8 +591,8 @@ impl Interp {
         })
     }
 
-    /// What `for` walks. A range, a list, or a table's rows — the three things that are
-    /// sequences; anything else is an error rather than a one-element loop.
+    /// What `for` walks: a range, a list, or a table's rows. Anything else is an error, not a
+    /// one-element loop.
     fn iterate(&mut self, e: &Expr) -> Result<Vec<Val>> {
         let v = self.eval(e)?;
         match &v {
@@ -694,8 +624,8 @@ impl Interp {
 
     /// `lvalue = value` (§9d). Legal only if the root binding is `mut`.
     fn assign(&mut self, target: &LValue, value: Val) -> Result<()> {
-        // Evaluate any index expressions before touching the binding, so the borrow of
-        // the slot does not overlap evaluation that could itself read it.
+        // Evaluate index expressions before touching the binding, so the slot borrow does not
+        // overlap evaluation that could read it.
         let mut steps: Vec<Step> = Vec::new();
         for s in &target.path {
             steps.push(match s {
@@ -736,8 +666,6 @@ impl Interp {
         }
     }
 
-    // --- expressions --------------------------------------------------------
-
     pub fn eval(&mut self, e: &Expr) -> Result<Val> {
         match e {
             Expr::Int(v) => Ok(Val::int(*v)),
@@ -745,19 +673,15 @@ impl Interp {
             Expr::Str(v) | Expr::Word(v) => Ok(Val::str(v.clone())),
             Expr::Bool(v) => Ok(Val::bool(*v)),
             Expr::Null => Ok(Val::NULL),
-            // Inside a keyword stage `_` *is* the value flowing past (§8c); anywhere else
-            // it is still the placeholder it has always been.
+            // Inside a keyword stage `_` is the value flowing past (§8c).
             Expr::Underscore => match self.lookup_any(UNDERSCORE) {
                 Some(v) => Ok(v),
                 None => Err(EvalError::new("`_` is a pipeline placeholder and has no value on its own")),
             },
-            // A `/pattern/` literal is its source text; `~=` compiles it. Keeping it a
-            // String means a pattern can equally be built at run time, which a filter over
-            // a user-supplied name needs.
+            // A `/pattern/` literal is its source text, so a pattern can also be built at run time.
             Expr::Regex(p) => Ok(Val::str(p.clone())),
-            // D4's resolution order, completed: a local binding first, then a command.
-            // A bare name that is neither gets a message naming *both* searches, because
-            // "not found" leaves a reader guessing which one they meant to satisfy.
+            // D4: a local binding first, then a command. A name that is neither gets a message
+            // naming *both* searches.
             Expr::Ident(name) => match self.lookup_any(name) {
                 Some(v) => Ok(v),
                 None => {
@@ -768,13 +692,9 @@ impl Interp {
                         forced_external: false,
                     }));
                     self.pipeline(core::slice::from_ref(&call)).map_err(|e| {
-                        // **Only rewrap when the name was the problem.** D4's message
-                        // names both searches because "not found" leaves a reader guessing
-                        // which one they meant to satisfy — but if the program was found
-                        // and *ran*, the search succeeded and the failure is the
-                        // program's. Rewrapping that one buried its `kind` and threw away
-                        // the per-stage report (§2), which is the one case the report
-                        // exists for.
+                        // **Only rewrap when the name was the problem.** If the program was found
+                        // and *ran*, the failure is the program's; rewrapping it buried its `kind`
+                        // and the per-stage report (§2).
                         if e.kind == PIPELINE_FAILED || e.is_exit() {
                             return e;
                         }
@@ -829,9 +749,8 @@ impl Interp {
                 Ok(Val::Data(Value::Record(Arc::new(Record { schema, values }))))
             }
             Expr::Closure { params, body } => {
-                // Capture by value at creation (§5a): snapshot every binding currently
-                // visible. Simple, and it is what makes the loop-variable bug impossible
-                // rather than merely unlikely.
+                // Capture by value at creation (§5a): snapshot every visible binding, which makes
+                // the loop-variable bug impossible rather than unlikely.
                 let mut captured = Vec::new();
                 for scope in &self.scopes {
                     for (n, slot) in scope {
@@ -867,21 +786,14 @@ impl Interp {
                 index_of(&b, &k)
             }
             Expr::Match { scrutinee, arms } => self.eval_match(scrutinee, arms),
-            // §2's `?`. In this interpreter an operation that fails raises, and a raise
-            // already exits the current function and reaches its caller — so `?` is the
-            // *default* behaviour rather than a change to it, and this is a pass-through.
-            //
-            // It becomes load-bearing the moment an operation returns a Result-shaped
-            // **value** instead of raising, which is what makes `?` distinct in Rust. None
-            // does yet. Recorded rather than pretended: writing `?` is accepted, means
-            // what §2 says, and costs nothing.
+            // §2's `?`: an operation that fails already raises and exits the function, so `?` is
+            // the default behaviour and this a pass-through. It becomes load-bearing only once an
+            // operation returns a Result-shaped **value** instead of raising; none does yet.
             Expr::Try { body, catch_binding, catch_body } => {
                 expression_value(self.exec_try(body, catch_binding, catch_body)?)
             }
-            // §6: `expect` is ascription in expression position, and `assert` its sibling
-            // for a *content* predicate. Deliberately separate keywords rather than one
-            // verb overloaded on argument type, so the message says "shape mismatch" or
-            // "assertion failed" rather than merging two jobs into one.
+            // §6: `expect` is ascription, `assert` its sibling for a *content* predicate. Separate
+            // keywords so the message says "shape mismatch" or "assertion failed".
             Expr::Expect(inner, t) => {
                 let v = self.eval(inner)?;
                 check_type(&v, t)?;
@@ -904,17 +816,14 @@ impl Interp {
             Expr::Pipeline(stages) => self.pipeline(stages),
             Expr::Time(timed) => self.time(timed),
             Expr::Call(c) => {
-                // D4: a **local binding wins** over a command name for a bare,
-                // argument-less reference. That is what stops the operator set behaving
-                // like a list of reserved words — `last` and `count` are §10b operators
-                // and perfectly ordinary variable names.
+                // D4: a **local binding wins** over a command name for a bare, argument-less
+                // reference, so the operator set does not behave like reserved words (`last` and
+                // `count` are §10b operators and ordinary variable names). Inside a pipeline the
+                // precedence is the other way round; see `pipeline`.
                 //
-                // Inside a pipeline the precedence is the other way round: a stage with a
-                // piped operand is unambiguously an invocation. See `pipeline`.
-                // A bare, argument-less *mention* prefers a local binding — but `f()` is
-                // a call with an empty list, not a mention, and a `Def`-kind call only
-                // ever comes from the parens form (§5b). Conflating the two made `f()`
-                // evaluate to the function itself instead of calling it.
+                // `f()` is a call with an empty list, not a mention, and a `Def`-kind call only
+                // comes from the parens form (§5b); conflating them made `f()` evaluate to the
+                // function itself.
                 if c.args.is_empty()
                     && !c.forced_external
                     && c.kind != CallKind::Def
@@ -939,19 +848,14 @@ impl Interp {
         }
     }
 
-    // --- functions (Part E) -------------------------------------------------
-
     /// Bind every `def` in a block before executing any of it (§5a).
     ///
-    /// Hoisting is not a convenience: mutual recursion needs it, and `let` deliberately
-    /// does *not* hoist because it is tied to evaluation order while a `def` is a
-    /// declaration.
+    /// Mutual recursion needs it, and `let` deliberately does not hoist: it is tied to evaluation
+    /// order while a `def` is a declaration.
     fn hoist_defs(&mut self, stmts: &[Stmt]) -> Result<()> {
         for s in stmts {
             if let Stmt::Def { name, params, ret: _, body, .. } = s {
-                // A named function captures **nothing** (§5a): its parameter list is a
-                // complete, honest account of its inputs. Only a closure captures, and
-                // that is the deliberate exception.
+                // A named function captures **nothing** (§5a); only a closure captures.
                 let f = Val::Func(Arc::new(Func {
                     name: Some(name.clone()),
                     params: params.clone(),
@@ -976,11 +880,9 @@ impl Interp {
         fill: bool,
     ) -> Result<Val> {
         let mut positional = positional.to_vec();
-        // §5b's pipeline-fill rule: `_` marks where the piped value goes when an argument
-        // list is present; a bare, argument-free call fills its sole slot implicitly.
-        // Pure implicit-first-parameter fill was rejected on a correctness gap — nothing
-        // guarantees a function's first parameter is the data slot — so the explicit form
-        // is required whenever there is a list to be explicit in.
+        // §5b's pipeline-fill rule: `_` marks where the piped value goes when an argument list is
+        // present; a bare, argument-free call fills its sole slot. Implicit first-parameter fill
+        // was rejected: nothing guarantees the first parameter is the data slot.
         if let Some(v) = operand {
             if fill {
                 positional.insert(0, v);
@@ -1029,10 +931,9 @@ impl Interp {
             let value = match supplied {
                 Some(v) => v,
                 None => match &p.default {
-                    // §5b: defaults are evaluated **fresh per call, in the function's own
-                    // parameter scope**. That avoids Python's shared-mutable-default trap
-                    // and lets a later default reference an earlier parameter, since the
-                    // earlier one is already bound in this scope.
+                    // §5b: defaults are evaluated **fresh per call, in the function's own parameter
+                    // scope**: no shared-mutable-default trap, and a later default can use an
+                    // earlier parameter.
                     Some(d) => match self.eval(d) {
                         Ok(v) => v,
                         Err(e) => {
@@ -1113,8 +1014,6 @@ impl Interp {
         self.call_function(&f, &positional, &named, operand, fill)
     }
 
-    // --- match (§9f) --------------------------------------------------------
-
     fn eval_match(&mut self, scrutinee: &Expr, arms: &[MatchArm]) -> Result<Val> {
         let v = self.eval(scrutinee)?;
         for arm in arms {
@@ -1126,8 +1025,7 @@ impl Interp {
             for (n, bv) in &bindings {
                 let _ = self.bind(n, bv.clone(), false, false);
             }
-            // A guard runs *with the arm's bindings in scope* — that is the whole point of
-            // `{ name, size } if size > 1000`.
+            // A guard runs *with the arm's bindings in scope*: `{ name, size } if size > 1000`.
             let passed = match &arm.guard {
                 Some(g) => match self.eval(g)?.as_bool() {
                     Some(b) => b,
@@ -1146,10 +1044,8 @@ impl Interp {
             self.pop_scope();
             return expression_value(r?);
         }
-        // §9f: no static exhaustiveness check — there is no compiler pass to run one, and
-        // §6 already made that call for the type system generally. A value hitting no arm
-        // is a runtime `MatchError`, styled like a `TypeError`, rather than falling
-        // through silently.
+        // §9f: no static exhaustiveness check (§6 made that call for the type system). A value
+        // hitting no arm is a runtime `MatchError`, styled like a `TypeError`.
         Err(EvalError::new(alloc::format!("MatchError: no arm matched a {} value", v.type_name())))
     }
 
@@ -1170,8 +1066,8 @@ impl Interp {
             }
             Pattern::Or(alts) => {
                 for a in alts {
-                    // Each alternative gets a fresh binding set, so a failed alternative
-                    // leaves nothing behind.
+                    // Each alternative gets a fresh binding set, so a failed one leaves nothing
+                    // behind.
                     let mut trial = Vec::new();
                     if self.pattern_matches(a, v, &mut trial)? {
                         out.extend(trial);
@@ -1180,8 +1076,8 @@ impl Interp {
                 }
                 false
             }
-            // §9f: variant patterns reuse the **ascription vocabulary** (§6) rather than
-            // inventing a second set of names for the same things.
+            // §9f: variant patterns reuse the **ascription vocabulary** (§6), not a second set of
+            // names.
             Pattern::Variant(name, inner) => {
                 if v.type_name() != name {
                     return Ok(false);
@@ -1189,7 +1085,6 @@ impl Interp {
                 if inner.is_empty() {
                     return Ok(true);
                 }
-                // `Int(n)` binds the value itself; a container destructures positionally.
                 match v {
                     Val::Data(Value::List(items)) => {
                         if inner.len() != items.len() {
@@ -1210,7 +1105,7 @@ impl Interp {
                     }
                 }
             }
-            // §6's subset match, for free: "is this a Record with at least these fields".
+            // §6's subset match for free: "a Record with at least these fields".
             Pattern::Record(fields) => {
                 let Val::Data(Value::Record(rec)) = v else { return Ok(false) };
                 for (name, sub) in fields {
@@ -1246,13 +1141,10 @@ impl Interp {
         })
     }
 
-    // --- modules (§9h) ------------------------------------------------------
-
     /// `use "./lib/utils.nx" { helper }` / `… as utils`.
     ///
-    /// Explicit relative path only, no search algorithm — §9h rejects `PATH`-like
-    /// resolution for the same reason the system rejects ambient env and ambient
-    /// authority: a name crossing a boundary should be visible at the crossing.
+    /// Explicit relative path only, no search: §9h rejects `PATH`-like resolution for the reason
+    /// the system rejects ambient authority, a name crossing a boundary should be visible.
     fn exec_use(&mut self, path: &str, names: &Option<Vec<String>>, alias: &Option<String>) -> Result<()> {
         let bytes = self.host.read_file(path).map_err(EvalError::new)?;
         let src = alloc::string::String::from_utf8(bytes)
@@ -1260,9 +1152,8 @@ impl Interp {
         let module = crate::parse_script(&src)
             .map_err(|e| EvalError::new(alloc::format!("{path} line {}: {}", e.line, e.message)))?;
 
-        // Run the module in a scope of its own, then take only what it exported. Its
-        // `def`s land in `functions` rather than the scope (see `hoist_defs`), so both
-        // have to be swept — and `functions` is snapshotted first so a module cannot
+        // Run the module in a scope of its own and take only what it exported. Its `def`s land in
+        // `functions`, so both are swept; `functions` is snapshotted first so a module cannot
         // export something the *caller* had already defined.
         let before = self.functions.len();
         self.push_scope();
@@ -1276,8 +1167,7 @@ impl Interp {
         self.pop_scope();
         r?;
 
-        // `pub` is what crosses the file boundary (§9h) — the same recurring rule as env
-        // vars crossing a process boundary or data crossing IPC.
+        // `pub` is what crosses the file boundary (§9h).
         let public: Vec<&String> = module
             .stmts
             .iter()
@@ -1304,12 +1194,9 @@ impl Interp {
                 }
             }
             (None, Some(a)) => {
-                // `use "…" as utils` binds `utils.helper`, not a record called `utils`.
-                //
-                // A module's exports are usually functions, and a function is deliberately
-                // not TSM1-representable (§5c) — so a `Record` could not hold one. The
-                // alias is therefore a *naming device* rather than a value, which also
-                // keeps `utils.helper(…)` reading as one qualified name.
+                // `use "…" as utils` binds `utils.helper`, not a record called `utils`: exports are
+                // usually functions, which are not TSM1-representable (§5c), so a `Record` could
+                // not hold them. The alias is a *naming device*.
                 for n in &public {
                     if let Some((_, v)) = exported.iter().find(|(en, _)| &en == n) {
                         self.bind(&alloc::format!("{a}.{n}"), v.clone(), false, false)?;
@@ -1323,18 +1210,10 @@ impl Interp {
         Ok(())
     }
 
-    // --- generic value operators (Part D) -----------------------------------
-
     /// Invoke a closure with one argument.
     ///
-    /// Part D needs this because §8b's sugar *is* a closure: `filter size > 1000` desugars
-    /// to `filter { |it| it.size > 1000 }`, so an operator that could not call one could
-    /// not implement the design's commonest spelling. Part E extends the same primitive
-    /// with `def`'s named arguments, defaults and variadics.
-    ///
-    /// The closure runs in a scope built from its **captured snapshot** (§5a), not from
-    /// the caller's scope: capture is by value at creation, so what a closure sees is what
-    /// was visible when it was written.
+    /// §8b's sugar *is* a closure (`filter size > 1000` is `filter { |it| it.size > 1000 }`). It
+    /// runs in a scope built from its **captured snapshot** (§5a), not the caller's.
     pub fn call_closure(&mut self, f: &Func, args: &[Val]) -> Result<Val> {
         if args.len() != f.params.len() {
             return Err(EvalError::new(alloc::format!(
@@ -1343,9 +1222,8 @@ impl Interp {
                 render_i64(args.len() as i64)
             )));
         }
-        // A fresh scope stack: a closure cannot see the caller's locals, only its own
-        // capture. Anything else would make `filter` able to read the pipeline's
-        // internals by accident.
+        // A fresh scope stack: a closure sees only its capture, or `filter` could read the
+        // pipeline's internals by accident.
         let saved = core::mem::replace(&mut self.scopes, alloc::vec![Vec::new()]);
         for (n, v) in &f.captured {
             let _ = self.bind(n, v.clone(), false, false);
@@ -1360,11 +1238,10 @@ impl Interp {
         boundary_value(r?)
     }
 
-    /// **`time PIPELINE`** (Phase 6 Part H.2, §3): the pipeline evaluated as ever, its value — or its
-    /// failure — passed through, and one line on `stderr` when it ends: the time it took by the
-    /// host's monotonic clock, and what the disks and the page cache did meanwhile, from
-    /// `/dev/devices/io.tsm` read before and after ([`crate::timing`]). Reading the table is a
-    /// resolve the device manager answers from the kernel's counters, so it touches no disk.
+    /// **`time PIPELINE`** (§3): the pipeline evaluated as ever, its value or failure passed
+    /// through, and one line on `stderr` when it ends: the elapsed time by the host's monotonic
+    /// clock, and what the disks and page cache did, from `/dev/devices/io.tsm` read before and
+    /// after ([`crate::timing`]). That read is answered from kernel counters, so touches no disk.
     fn time(&mut self, timed: &Expr) -> Result<Val> {
         let before = self.io_rows();
         let started = self.host.now_ns();
@@ -1384,19 +1261,16 @@ impl Interp {
         crate::timing::rows(&bytes)
     }
 
-    /// §3's shell-state builtins: they mutate *this* process, which an external program
-    /// structurally cannot do.
+    /// §3's shell-state builtins: they mutate *this* process, which an external cannot.
     fn apply_builtin(&mut self, c: &Call) -> Result<Val> {
         match c.name.as_str() {
             "cd" => {
                 let target = match c.args.first() {
                     Some(Arg::Positional(e)) => match e {
-                        // A bare path argument, unevaluated — `cd /system`, `cd ..`.
                         Expr::Word(w) | Expr::Str(w) | Expr::Ident(w) => w.clone(),
                         other => self.eval(other)?.render(),
                     },
-                    // `cd` with no argument goes home, and says so if there is no home
-                    // rather than silently doing nothing.
+                    // `cd` with no argument goes home, and says so if there is no home.
                     None => match self.env_str("HOME") {
                         Some(h) => h,
                         None => {
@@ -1406,32 +1280,24 @@ impl Interp {
                     Some(_) => return Err(EvalError::new("`cd` takes one path")),
                 };
                 let resolved = self.resolve_path(&target)?;
-                // **Resolve first, set second.** The invariant is "PWD named something
-                // real when you went there", not "PWD is whatever you typed" — otherwise
-                // every later relative path fails somewhere far from the mistake.
+                // **Resolve first, set second.** The invariant is "PWD named something real when
+                // you went there", not "PWD is whatever you typed".
                 if !self.path_exists(&resolved) {
                     return Err(EvalError::new(alloc::format!("`{resolved}` does not exist, so PWD was left alone")));
                 }
                 self.set_env_entry("PWD", Value::Str(resolved));
                 Ok(Val::NULL)
             }
-            // `exit` is handled by the driver, which owns the process.
-            // §11f. `exit` is a shell-state builtin, so it is a *control outcome of
-            // evaluation* rather than a string the REPL loop watches for — the driver used
-            // to compare the typed line against `"exit"`, which is why `exit 1` reached
-            // here at all and why a script could not set its own status.
-            //
-            // It travels the error channel deliberately: that is the only path already
-            // crossing a `def`, a closure and a loop. `catch` re-raises it (see
-            // `exec_try`), so leaving is not something a script prevents by accident.
+            // §11f. `exit` is a *control outcome of evaluation*, not a string the REPL loop watches
+            // for (`exit 1` once missed that comparison). It travels the error channel because that
+            // already crosses a `def`, a closure and a loop; `catch` re-raises it (see `exec_try`).
             "exit" => {
                 let status = match c.args.first() {
                     None => 0,
                     Some(Arg::Positional(e)) => {
-                        // A builtin's argument is a **bareword**, not an expression (`cd ..`
-                        // and `cd /system` both choke in expression mode), so `exit 3`
-                        // arrives as the text `"3"`. Reading it with the same scanner
-                        // `parse` uses keeps one definition of what a number looks like.
+                        // A builtin's argument is a **bareword**, so `exit 3` arrives as the text
+                        // `"3"`; the `parse` scanner keeps one definition of what a number looks
+                        // like.
                         let v = self.eval(e)?;
                         match v.as_data() {
                             Some(Value::Int(n)) => *n as i32,
@@ -1471,28 +1337,19 @@ impl Interp {
 
     /// Apply a generic operator to the value arriving on its left.
     ///
-    /// `operand` is `None` when the operator was written outside a pipeline. Most need
-    /// one — `filter` with nothing to filter is a mistake, not an empty result — and the
-    /// message says so rather than quietly answering for an empty stream.
+    /// `operand` is `None` outside a pipeline. Most operators need one: `filter` with nothing to
+    /// filter is a mistake, not an empty result.
     fn apply_operator(&mut self, c: &Call, operand: Option<Val>) -> Result<Val> {
-        // §6's `ls | assert (count > 0)`. Inside a keyword stage the value flowing past is
-        // bound to `_`, so an operator with nothing piped *into* it means that value —
-        // which is what lets a predicate be written the way §6 writes it. `_` is bound
-        // nowhere else (the parser will not accept it as a binding name), so this cannot
-        // reach past the stage it belongs to.
+        // §6's `ls | assert (count > 0)`: inside a keyword stage the value flowing past is bound to
+        // `_`, so an operator with nothing piped *into* it means that value. `_` is bound nowhere
+        // else, so this cannot reach past its stage.
         let operand = operand.or_else(|| self.lookup_any(UNDERSCORE));
         let name = c.name.as_str();
-        // Positional arguments, evaluated once.
         let mut flags: Vec<&str> = Vec::new();
         let mut closures: Vec<Val> = Vec::new();
-        // Positional arguments are kept **unevaluated** and interpreted per operator.
-        //
-        // The two readings genuinely differ: `sort size` names a *column* (the same
-        // reading §8b gives a bare identifier inside a predicate, where `size` means
-        // `it.size`), while `display files` names a *binding*. A single global rule gets
-        // one of them wrong — routing every bare name to a field name broke `display
-        // files`, and evaluating every one broke `sort size` with "`size` is not a
-        // program". So the operator decides, because only the operator knows.
+        // Positional arguments are kept **unevaluated** and interpreted per operator: `sort size`
+        // names a *column* (as in §8b's predicates), while `display files` names a *binding*. A
+        // global rule breaks one of them, so the operator decides, because only it knows.
         let mut raw: Vec<&Expr> = Vec::new();
         for a in &c.args {
             match a {
@@ -1507,8 +1364,7 @@ impl Interp {
                 }
                 Arg::ShortFlags(f) => {
                     for ch in f.chars() {
-                        // Short flags map to their long form, the GNU convention §10f
-                        // adopts.
+                        // Short flags map to their long form (the GNU convention, §10f).
                         if ch == 'r' {
                             flags.push("reverse");
                         }
@@ -1535,7 +1391,6 @@ impl Interp {
             })
         };
         let wrap = |r: core::result::Result<Val, alloc::string::String>| -> Result<Val> { r.map_err(EvalError::new) };
-        // A bare name read as a **column**, not evaluated.
         let field_names: Vec<alloc::string::String> = raw
             .iter()
             .filter_map(|e| match e {
@@ -1546,7 +1401,7 @@ impl Interp {
 
         match name {
             "count" => wrap(ops::count(&need(operand)?)),
-            // §10b Part E. Argument-free scalar operators: the operand is the whole input.
+            // §10b: argument-free scalar operators; the operand is the whole input.
             "trim" | "upper" | "lower" | "keys" | "values" | "round" | "floor" | "ceil" | "trunc" | "abs" => {
                 let v = need(operand)?;
                 wrap(match name {
@@ -1576,12 +1431,10 @@ impl Interp {
                 };
                 wrap(ops::replace(&v, from, to))
             }
-            // §10b: `~=` answers yes or no, so text that matched could not be taken
-            // apart. `capture` is the only operator with real engine work behind it —
-            // submatch slots in the Pike VM — and the only one that returns `null` for a
-            // failure rather than raising, because "did not match" is an ordinary answer
-            // that `??` and `== null` already handle (§9e). Groups are positional; naming
-            // them needs a name table threaded through the compiler.
+            // §10b: `capture` is the only operator with real engine work behind it (submatch slots
+            // in the Pike VM) and the only one returning `null` for a failure rather than raising:
+            // "did not match" is an ordinary answer that `??` and `== null` handle (§9e). Groups
+            // are positional; naming them needs a name table in the compiler.
             // TODO(regex-named-captures): `docs/rationale/deferred-decisions.md`.
             "capture" => {
                 let v = need(operand)?;
@@ -1603,8 +1456,7 @@ impl Interp {
                         groups
                             .iter()
                             .map(|g| match g {
-                                // A group that did not participate is Null, not "" —
-                                // "did not match" is not "matched nothing".
+                                // A group that did not participate is Null, not "".
                                 None => Value::Null,
                                 Some((a, b)) => Value::Str(chars[*a..*b].iter().collect()),
                             })
@@ -1620,8 +1472,7 @@ impl Interp {
                 let other = self.eval(e)?;
                 wrap(ops::merge(&v, &other))
             }
-            // §10b's reductions. A bareword is a *column* — the `sort size` reading — and
-            // with none, the rows are the values.
+            // §10b's reductions. A bareword is a *column*; with none, the rows are the values.
             "sum" | "min" | "max" | "avg" => {
                 let v = need(operand)?;
                 let field = field_names.first().map(|s| s.as_str());
@@ -1632,15 +1483,13 @@ impl Interp {
                     _ => ops::avg(&v, field),
                 })
             }
-            // `reduce` lives here rather than in `ops` for the same reason `filter` does:
-            // it calls back into the interpreter, and a closure is not something the
-            // operator layer can run on its own (§5c).
+            // `reduce` lives here, not in `ops`: it calls back into the interpreter (§5c).
             "reduce" => {
                 let v = need(operand)?;
                 let f = self.one_closure(&closures, name)?;
                 let rows = ops::rows(&v).map_err(EvalError::new)?;
-                // **The two forms differ precisely on the empty case**, which is why both
-                // exist: seeded returns the seed, unseeded has nothing to return.
+                // **The two forms differ precisely on the empty case**: seeded returns the seed,
+                // unseeded has nothing to return.
                 let mut acc = match raw.first() {
                     Some(e) => Some(self.eval(e)?),
                     None => None,
@@ -1716,8 +1565,7 @@ impl Interp {
                 wrap(ops::table_from_records(out))
             }
             "each" => {
-                // `each` is for effects, so it returns its input unchanged — a chain does
-                // not narrow just because something looked at every row.
+                // `each` is for effects, so it returns its input unchanged.
                 let v = need(operand)?;
                 let f = self.one_closure(&closures, name)?;
                 for row in ops::rows(&v).map_err(EvalError::new)? {
@@ -1730,11 +1578,8 @@ impl Interp {
                 for e in &raw {
                     vals.push(self.eval(e)?);
                 }
-                // **In stage position the value flowing past is the subject**, so it is
-                // argument 0: `… | format("{}")` renders what arrived. It used to be
-                // ignored, and the template's own `{}` was then reported as a missing
-                // argument. The template itself is `vals[0]` below, so the operand slots
-                // in right after it.
+                // **In stage position the value flowing past is the subject**, argument 0: `… |
+                // format("{}")` renders what arrived.
                 if let Some(v) = operand {
                     vals.insert(1.min(vals.len()), v);
                 }
@@ -1745,8 +1590,8 @@ impl Interp {
                 wrap(ops::format(&template, &vals[1..]).map(Val::str))
             }
             "display" => {
-                // §7 writes `display files` as well as `… | display`, so an explicit
-                // operand stands in for a piped one.
+                // §7 writes `display files` as well as `… | display`: an explicit operand stands
+                // in.
                 let v = match operand {
                     Some(v) => v,
                     None => match raw.first() {
@@ -1757,8 +1602,8 @@ impl Interp {
                 let styled = self.host.styled();
                 let text = ops::display(&v, styled);
                 self.host.out(&text);
-                // A terminal operator: the chain ends here, so it yields Null rather than
-                // passing the value on to be displayed twice.
+                // A terminal operator ends the chain, so it yields Null rather than passing the
+                // value on to be displayed twice.
                 Ok(Val::NULL)
             }
             "save" => {
@@ -1776,8 +1621,7 @@ impl Interp {
                 if paths.is_empty() {
                     return Err(EvalError::new("`open` needs at least one path"));
                 }
-                // §4: several paths concatenate into one stream, which is what absorbs
-                // `cat` rather than adding a second near-identical verb.
+                // §4: several paths concatenate into one stream, which absorbs `cat`.
                 let mut acc: Option<Val> = None;
                 for path in &paths {
                     let path = self.resolve_path(path)?;
@@ -1804,19 +1648,12 @@ impl Interp {
         }
     }
 
-    // --- pipelines (Part C) -------------------------------------------------
-
     /// Evaluate `a | b | c`.
     ///
-    /// Stages are grouped into **runs of consecutive external commands**, and each run is
-    /// handed to the host as one connected chain. That grouping is the whole point: §1
-    /// makes the pipes between adjacent processes the kernel's business, with real
-    /// backpressure through bounded channels, so the shell must not serialise them by
-    /// running one stage at a time and shuttling bytes.
-    ///
-    /// Between runs — where an in-process operator sits — the value is materialised. §5c
-    /// says that is the common case and cheap: the dense middle of a pipeline runs on the
-    /// `Value` tree with no spawn at all.
+    /// Stages are grouped into **runs of consecutive external commands**, each handed to the host
+    /// as one connected chain: §1 makes the pipes between adjacent processes the kernel's business,
+    /// with real backpressure, so the shell must not run one stage at a time. Between runs an
+    /// in-process operator materialises the value (§5c).
     fn pipeline(&mut self, stages: &[Expr]) -> Result<Val> {
         let mut carried: Option<Val> = None;
         let mut statuses: Vec<StageStatus> = Vec::new();
@@ -1824,7 +1661,6 @@ impl Interp {
 
         while i < stages.len() {
             if let Some(spec) = self.as_external(&stages[i], i == 0)? {
-                // Collect the whole run of externals so the host can chain them.
                 let mut run = alloc::vec![spec];
                 i += 1;
                 while i < stages.len() {
@@ -1847,9 +1683,7 @@ impl Interp {
                 continue;
             }
 
-            // An in-process stage: a generic operator running on the `Value` tree with no
-            // spawn at all (§5c). This is the common case, not the exception — the dense
-            // middle of a pipeline never crosses a process boundary.
+            // An in-process stage: a generic operator on the `Value` tree, no spawn (§5c).
             if let Expr::Call(c) = &stages[i] {
                 if matches!(c.kind, CallKind::Operator) {
                     carried = Some(self.apply_operator(c, carried.take())?);
@@ -1862,7 +1696,6 @@ impl Interp {
                     continue;
                 }
             }
-            // A bare name bound to a function: §5b's argument-free call form.
             if let Expr::Ident(n) = &stages[i]
                 && let Some(Val::Func(f)) = self.lookup_any(n)
             {
@@ -1871,14 +1704,10 @@ impl Interp {
                 i += 1;
                 continue;
             }
-            // **A keyword stage** — `expect T`, `parse T`, `assert (P)` (§8c).
-            //
-            // The parser has always accepted these after a `|`; the evaluator rejected
-            // them, which is why every example in §6 was written mid-pipeline and none of
-            // them ran. They read the value flowing past rather than taking an operand of
-            // their own, so the operand is bound to `_` for the length of the stage and
-            // `Expr::Underscore` picks it up — no separate operand channel, and
-            // `assert (count > 0)` works because a nullary operator finds `_` too.
+            // **A keyword stage** — `expect T`, `parse T`, `assert (P)` (§8c). They read the value
+            // flowing past, so it is bound to `_` for the length of the stage and
+            // `Expr::Underscore` picks it up; `assert (count > 0)` works because a nullary operator
+            // finds `_` too.
             if matches!(&stages[i], Expr::Expect(..) | Expr::Parse(..) | Expr::Assert(_)) {
                 let operand = carried.take().ok_or_else(|| {
                     EvalError::new(
@@ -1890,14 +1719,11 @@ impl Interp {
                 let r = self.eval(&stages[i]);
                 self.pop_scope();
                 let v = r?;
-                // `assert` is a check, not a transform: §6 puts it in the same pipeline
-                // slot as `expect`, so the value has to continue down the chain rather
-                // than the chain ending on a Null.
+                // `assert` is a check, not a transform: the value continues down the chain.
                 carried = Some(if matches!(&stages[i], Expr::Assert(_)) { operand } else { v });
                 i += 1;
                 continue;
             }
-            // The head stage may be an ordinary value supplying the pipeline's input.
             if i == 0 && !matches!(&stages[0], Expr::Call(_)) {
                 carried = Some(self.eval(&stages[0])?);
                 i += 1;
@@ -1909,22 +1735,17 @@ impl Interp {
             });
         }
 
-        // §1 and §2: the pipeline *is* an expression, so its data value is what a `let`
-        // binds. `PipelineStatus` is orthogonal execution metadata, which is why there is
-        // no global `$?` for it to live in — the two are kept apart deliberately (§11d).
+        // §1/§2: the pipeline *is* an expression, so its data value is what a `let` binds.
+        // `PipelineStatus` is orthogonal metadata (there is no global `$?`, §11d).
         self.last_status = Some(pipeline_status(&statuses));
 
-        // **An interrupted pipeline reports as interrupted** (§11h). The host noticed the
-        // terminal while it was waiting for the stages and asked them to stop; without
-        // this the chain returns as though it had simply finished, and the *shell* only
-        // discovers the interrupt at its next prompt — reporting `^C` for something that
-        // cut a running command short. This is the one place that knows both.
+        // **An interrupted pipeline reports as interrupted** (§11h): the host noticed the terminal
+        // while waiting and asked the stages to stop; without this the shell reports `^C` only at
+        // its next prompt, for something that cut a command short.
         self.check_interrupt()?;
 
-        // Fail loud, don't fail silent (§1): a non-zero or crashed stage anywhere makes
-        // the pipeline report as failed. Downstream stages are *not* torn down — they
-        // still finish whatever they already received — which is why this is checked
-        // after the run rather than during it.
+        // Fail loud (§1): a non-zero or crashed stage anywhere fails the pipeline. Downstream
+        // stages are *not* torn down, so this is checked after the run rather than during it.
         if let Some(bad) = statuses.iter().find(|s| !s.succeeded()) {
             let mut msg = alloc::string::String::from("pipeline failed: `");
             msg.push_str(&bad.command);
@@ -1937,9 +1758,8 @@ impl Interp {
                 msg.push_str(" exited ");
                 msg.push_str(&render_i64(bad.exit_status as i64));
             }
-            // **Where `PipelineStatus` actually arrives** (§2). The pipeline's value is
-            // its data and the failure never reaches the binding, so the per-stage report
-            // travels on the error — the one thing that does reach the `catch`.
+            // The per-stage report travels on the error, the one thing that reaches the `catch`
+            // (§2).
             let mut e = EvalError::of(PIPELINE_FAILED, msg);
             e.stages = Some(stage_rows(&statuses));
             return Err(e);
@@ -1949,17 +1769,14 @@ impl Interp {
 
     /// If this stage is an external command, build its [`StageSpec`].
     ///
-    /// This is D4's resolution order at the point it matters. Inside a pipeline a stage
-    /// with a piped operand is unambiguously an *invocation*, so a command name is not
-    /// shadowed by a local binding here — the opposite of the bare-reference rule in
-    /// [`Interp::eval`], and for the opposite reason.
+    /// D4 where it matters: a stage with a piped operand is unambiguously an *invocation*, so a
+    /// command name is not shadowed by a local binding here, the opposite of [`Interp::eval`]'s
+    /// bare-reference rule and for the opposite reason.
     fn as_external(&mut self, stage: &Expr, at_head: bool) -> Result<Option<StageSpec>> {
-        // A bare name in stage position is a command — except at the *head*, where it may
-        // equally be the value being piped onward. That asymmetry is D4 again: only a
-        // stage with something arriving on its left is unambiguously an invocation.
+        // A bare name in stage position is a command, except at the *head*, where it may be the
+        // value being piped onward (D4).
         if let Expr::Ident(name) = stage {
-            // A bound *function* named bare in a stage is a call, not a value: `ls |
-            // summarize` is §5b's argument-free form, which fills the sole slot.
+            // A bound *function* named bare in a stage is a call: `ls | summarize` (§5b).
             if matches!(self.lookup_any(name), Some(Val::Func(_))) {
                 return Ok(None);
             }
@@ -2012,8 +1829,6 @@ impl Interp {
     }
 
     fn binary(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<Val> {
-        // Short-circuit before evaluating the right side, or `&&`/`||`/`??` would not be
-        // short-circuiting at all.
         match op {
             BinOp::And => {
                 let l = self.eval(a)?;
@@ -2047,8 +1862,7 @@ impl Interp {
     }
 }
 
-/// "That command cannot run yet, and here is which part brings it." Names the category
-/// and the part rather than failing vaguely, so a script written against the finished
+/// "That command cannot run yet": names the category so a script written against the finished
 /// language fails informatively against a half-built one.
 fn unavailable(c: &Call) -> EvalError {
     EvalError::new(alloc::format!(
@@ -2070,16 +1884,10 @@ fn unavailable(c: &Call) -> EvalError {
 
 /// Encode a value as a TSM1 stream for a stage's `stdin`.
 ///
-/// **Text is wrapped rather than refused**, which is what `StreamFlags::TEXT_FALLBACK` is for:
-/// a `String` becomes a one-column stream with a row per line, and so does a `List` of them.
-/// The spec calls that the "Unix floor" — plain text carried through the typed pipeline so
-/// every generic operator still works on it — and until M12 Part E nothing in the tree either
-/// wrote one or read one. `"hello" | clip --copy` is what made the gap visible: a clipboard you
-/// cannot pipe a string into is not usable from a pipeline, which is the checkbox.
-///
-/// **Only those two shapes.** A `List` of Ints is not text, and inventing a rendering for it
-/// here would put a display decision in the transport — the error below names what does work
-/// instead.
+/// **Text is wrapped rather than refused** (`StreamFlags::TEXT_FALLBACK`): a `String` becomes a
+/// one-column stream with a row per line, and so does a `List` of them: the spec's "Unix floor".
+/// **Only those two shapes**: inventing a rendering for a `List` of Ints would put a display
+/// decision in the transport.
 fn encode_stream(v: &Val) -> Result<Vec<u8>> {
     if let Some(bytes) = encode_text_stream(v) {
         return bytes.map_err(|_| EvalError::new("could not encode the piped text"));
@@ -2096,10 +1904,10 @@ fn encode_stream(v: &Val) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// `Some` if `v` is text — a `String`, or a `List` of them — encoded as a text-fallback stream.
+/// `Some` if `v` is text, a `String` or a `List` of them, encoded as a text-fallback stream.
 ///
-/// `None` means "not text", which is different from "text that would not encode": the caller
-/// falls through to the table path for the first and reports for the second.
+/// `None` is "not text", distinct from "text that would not encode": the caller falls through to
+/// the table path for the first and reports the second.
 fn encode_text_stream(v: &Val) -> Option<core::result::Result<Vec<u8>, libstream::wire::WireError>> {
     let lines: Vec<&str> = match v {
         Val::Data(Value::Str(s)) => s.split('\n').collect(),
@@ -2108,8 +1916,8 @@ fn encode_text_stream(v: &Val) -> Option<core::result::Result<Vec<u8>, libstream
             for i in items.iter() {
                 match i {
                     Value::Str(s) => out.push(s.as_str()),
-                    // One non-string element and this is not a list of text. Falling through
-                    // rather than dropping it: a partial encode would silently lose data.
+                    // One non-string element means not a list of text; falling through beats a
+                    // partial encode that silently loses data.
                     _ => return None,
                 }
             }
@@ -2117,16 +1925,14 @@ fn encode_text_stream(v: &Val) -> Option<core::result::Result<Vec<u8>, libstream
         }
         _ => return None,
     };
-    // `Vec<u8>` is itself a `ByteSink` — no wrapper needed, and no bound to get wrong.
     let mut buf: Vec<u8> = Vec::new();
     Some(libstream::table::write_text_fallback(&mut buf, &lines, 0).map(|()| buf))
 }
 
 /// Decode a stage run's captured output into a value.
 ///
-/// Absent output is `Null`, not an empty table: a stage that produced no stream (a
-/// mutation like `remove`) genuinely has no value, and inventing an empty table would let
-/// `| count` answer 0 for something that never counted anything.
+/// Absent output is `Null`, not an empty table: a mutation like `remove` has no value, and an empty
+/// table would let `| count` answer 0 for something that never counted.
 fn decode_output(run: &PipelineRun) -> Result<Option<Val>> {
     let Some(bytes) = &run.output else { return Ok(None) };
     if bytes.is_empty() {
@@ -2137,16 +1943,10 @@ fn decode_output(run: &PipelineRun) -> Result<Option<Val>> {
     Ok(Some(Val::Data(Value::Table(Arc::new(t)))))
 }
 
-/// Build §1's `PipelineStatus` as an ordinary value.
-///
-/// Deliberately a `Record` holding a `List` of `Record`s and not a new mechanism: §1 says
-/// so, and §2 explains why there is no scalar `$?` to collapse it into — several stages
-/// do not have one status between them. `all_ok` is the derived boolean that covers the
-/// casual case without losing the per-stage detail a script may want.
 /// The §1 per-stage rows: `List<{command, exit_status, crashed, cancelled}>`.
 ///
-/// One definition, used by `$last.status` and by the error a failed pipeline raises, so
-/// the two cannot describe the same run differently.
+/// One definition, used by `$last.status` and the error a failed pipeline raises, so the two cannot
+/// describe the same run differently.
 fn stage_rows(stages: &[StageStatus]) -> Value {
     let mut rows: Vec<Value> = Vec::with_capacity(stages.len());
     for s in stages {
@@ -2187,14 +1987,11 @@ fn describe_expr(e: &Expr) -> &'static str {
     }
 }
 
-/// The name `_` is bound to inside a keyword stage (§8c). A real binding rather than a
-/// side channel: `expect`/`parse` reach it through `Expr::Underscore`, and a nullary
-/// operator reaches it when it has no piped operand, which is what makes §6's
-/// `ls | assert (count > 0)` mean what it reads like.
+/// The name `_` is bound to inside a keyword stage (§8c): a real binding, so `expect`/`parse` reach
+/// it through `Expr::Underscore` and a nullary operator with no piped operand finds it.
 const UNDERSCORE: &str = "_";
 
-/// Guard against a runaway `while` or an absurd range. Not a resource policy — a
-/// backstop, like the parser's depth bound.
+/// Guard against a runaway `while` or an absurd range; a backstop, not a resource policy.
 const MAX_ITERATIONS: u64 = 10_000_000;
 
 enum Step {
@@ -2209,9 +2006,8 @@ enum IndexKey {
 
 /// Walk `steps` into `data` and replace the leaf.
 ///
-/// Rebuilds rather than mutating in place: `Value`'s collections are `Arc`-shared and
-/// persistent by design, so another binding holding the same list must not see this
-/// write. `Arc::make_mut` does the copy exactly when one is needed.
+/// Rebuilds rather than mutating in place: `Value`'s collections are `Arc`-shared, so another
+/// binding holding the same list must not see the write. `Arc::make_mut` copies when needed.
 fn set_path(data: &mut Value, steps: &[Step], value: Value) -> Result<()> {
     let Some((first, rest)) = steps.split_first() else {
         *data = value;
@@ -2266,8 +2062,7 @@ fn bounded_index(i: i64, len: usize) -> Result<usize> {
     Ok(i as usize)
 }
 
-/// `x.field`. `lenient` is the `?.` form, which yields `Null` for a missing field rather
-/// than failing — §9e's "handle the absent case" reading of `?`.
+/// `x.field`. `lenient` is the `?.` form: `Null` for a missing field, not a failure (§9e).
 fn field_of(base: &Val, name: &str, lenient: bool) -> Result<Val> {
     match base {
         Val::Data(Value::Record(r)) => match r.schema.fields.iter().position(|f| f.name == name) {
@@ -2320,12 +2115,9 @@ fn index_of(base: &Val, key: &IndexKey) -> Result<Val> {
 
 /// The value of a block that has run to the end of a **function, closure or script**.
 ///
-/// `break`/`continue` cannot legally arrive here: the parser refuses them outside a loop
-/// body and resets its loop count at every `def` and closure (§9c), so a loop on the far
-/// side of that boundary is invisible to them. The arm states the invariant rather than
-/// handling a case that runs — and says the rule, so that if some future construct ever
-/// builds this tree without going through the parser, the result is a sentence rather
-/// than a silent `Null`.
+/// `break`/`continue` cannot arrive here: the parser refuses them outside a loop body and resets
+/// its loop count at every `def` and closure (§9c). The arm states that invariant, so a tree built
+/// without the parser gets a sentence rather than a silent `Null`.
 fn boundary_value(flow: Flow) -> Result<Val> {
     match flow {
         Flow::Normal(v) | Flow::Return(v) => Ok(v),
@@ -2336,17 +2128,12 @@ fn boundary_value(flow: Flow) -> Result<Val> {
     }
 }
 
-/// The value of a block used **in expression position** — `let x = { … }`, an `if` whose
-/// value is taken, a `match` arm.
+/// The value of a block used **in expression position** — `let x = { … }`, an `if` whose value is
+/// taken, a `match` arm.
 ///
-/// A `break` here is legal per §9c (it may well sit inside a loop) and still cannot work:
-/// `eval` returns a *value*, so there is no channel for control flow to travel back
-/// through, and the expression it is inside has to produce something. Refused with the
-/// fix in the message, because the statement-position form is what a person means anyway.
-///
-/// `return` reaches this same wall and *silently* yields its operand as the block's value
-/// instead of leaving the function — a pre-existing divergence from §5b, not something
-/// this change introduces. Both want the same mechanism; filed together as
+/// A `break` here is legal per §9c yet cannot work: `eval` returns a *value*, with no channel for
+/// control flow. Refused with the fix in the message. `return` hits the same wall and *silently*
+/// yields its operand instead of leaving the function (a divergence from §5b); both are filed as
 /// `TODO(control-flow-in-expression-position)`.
 fn expression_value(flow: Flow) -> Result<Val> {
     match flow {
@@ -2359,11 +2146,8 @@ fn expression_value(flow: Flow) -> Result<Val> {
     }
 }
 
-/// `parse T` (§6) — conversion, the direction v1.1 left out entirely.
-///
-/// `expect T` asserts a value already *is* a `T` and passes it through; this reads one
-/// *as* a `T` and produces it. Fail-loud on anything it cannot read, because the whole
-/// reason §6 has no implicit coercion is that a silent one is unrecoverable.
+/// `parse T` (§6) — conversion. `expect T` asserts a value already *is* a `T`; this reads one *as*
+/// a `T`. Fail-loud on anything it cannot read, since a silent coercion is unrecoverable.
 fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
     let bad = |m: String| EvalError::of(PARSE_ERROR, m);
     let (name, nullable) = match t {
@@ -2386,16 +2170,14 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
             )))
         };
     }
-    // Already a `T`. Not a special case so much as the identity one: `parse` asks whether
-    // the value can be read as a `T`, and a `T` trivially can.
+    // Already a `T`: the identity case.
     if v.type_name() == name {
         return Ok(v);
     }
     let got = v.type_name();
     match (v.as_data(), name) {
         (Some(Value::Str(s)), "Int" | "Float") => {
-            // §6 is strict about surrounding whitespace *because* `trim` exists: quietly
-            // accepting `" 42"` is the coercion this design spends its fail-loud rule on.
+            // §6 is strict about surrounding whitespace *because* `trim` exists.
             if s.trim() != s.as_str() {
                 return Err(bad(alloc::format!(
                     "cannot parse {s:?} as {name} — it has surrounding whitespace; \
@@ -2406,9 +2188,8 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
                 (Some(Val::Data(Value::Int(i))), "Int") => Ok(Val::int(i)),
                 (Some(Val::Data(Value::Int(i))), "Float") => Ok(Val::float(i as f64)),
                 (Some(Val::Data(Value::Float(f))), "Float") => Ok(Val::float(f)),
-                // The distinction is the point: `Int` and `Float` are different types
-                // everywhere else in this language (§6), so `"3.5" | parse Int` truncating
-                // would be the one silent coercion left standing.
+                // `Int` and `Float` are different types (§6); truncating `"3.5" | parse Int` would
+                // be a silent coercion.
                 (Some(Val::Data(Value::Float(_))), "Int") => Err(bad(alloc::format!(
                     "cannot parse {s:?} as Int — it reads as a Float; `parse Float` it, or \
                      round it"
@@ -2416,8 +2197,8 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
                 _ => Err(bad(alloc::format!("cannot parse {s:?} as {name}"))),
             }
         }
-        // No `1`/`yes`/`on`. That list is where every configuration language has gone
-        // wrong, and this one has `==` for anything else a script means.
+        // No `1`/`yes`/`on`: that list is where configuration languages went wrong; `==` covers the
+        // rest.
         (Some(Value::Str(s)), "Bool") => match s.as_str() {
             "true" => Ok(Val::bool(true)),
             "false" => Ok(Val::bool(false)),
@@ -2432,14 +2213,12 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
         },
         (Some(Value::Int(i)), "Float") => {
             let f = *i as f64;
-            // Widening is lossless up to 2^53 and silently lossy past it, which is a
-            // fabricated number by any other name (§8a).
+            // Widening is lossy past 2^53, a fabricated number (§8a).
             if f as i64 != *i {
                 return Err(bad(alloc::format!("cannot parse {} as Float without losing precision", render_i64(*i))));
             }
             Ok(Val::float(f))
         }
-        // The other direction is `format`'s job, and saying so is more use than "cannot".
         (_, "String") => Err(bad(alloc::format!(
             "cannot parse {got} as String — rendering a value as text is `format(\"{{}}\", …)` \
              (§8d)"
@@ -2450,14 +2229,10 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
 
 /// Read a numeric literal — **by running the lexer over it**.
 ///
-/// §6 says what a number looks like to `parse` is what it looks like to the lexer, and
-/// this is that sentence rather than a second scanner that agrees with the first until
-/// someone edits one: radix prefixes, `_` separators, exponents and the no-octal rule all
-/// arrive for free and stay in step (§8e).
-///
-/// The sign is handled here because a literal is unsigned in the grammar — `-5` is
-/// negation applied to one — which also means `parse Int` cannot read `i64::MIN`, exactly
-/// as no literal can write it.
+/// §6: what a number looks like to `parse` is what it looks like to the lexer, so radix prefixes,
+/// `_` separators, exponents and the no-octal rule stay in step (§8e). The sign is handled here
+/// because a literal is unsigned in the grammar, which also means `parse Int` cannot read
+/// `i64::MIN`, as no literal can write it.
 fn scan_number(text: &str) -> Option<Val> {
     use crate::lex::{Lexer, Tok};
     match Lexer::tokenize_expr(text).ok()?.as_slice() {
@@ -2495,19 +2270,16 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
     match op {
         Eq => return Ok(Val::bool(values_equal(&l, &r))),
         Ne => return Ok(Val::bool(!values_equal(&l, &r))),
-        // §8a puts `++` at the additive tier: string concatenation, spelled apart from
-        // `+` so that adding numbers and joining text are never the same operator.
+        // §8a: `++` is string concatenation, spelled apart from `+`.
         Concat => {
             let mut s = l.render();
             s.push_str(&r.render());
             return Ok(Val::str(s));
         }
-        // §8a/§10b. Membership is an infix comparison because that is where the question
-        // is actually asked — inside an `if` — and a pipeline `contains` would be a second
-        // spelling of one idea.
+        // §8a/§10b. Membership is an infix comparison because that is where the question is asked,
+        // inside an `if`; a pipeline `contains` would be a second spelling.
         In => {
             return match r.as_data() {
-                // Substring, for the case that reads exactly like it: `"x" in name`.
                 Some(Value::Str(text)) => {
                     let Some(Value::Str(needle)) = l.as_data() else {
                         return Err(EvalError::new(alloc::format!(
@@ -2517,8 +2289,7 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
                     };
                     Ok(Val::bool(text.contains(needle.as_str())))
                 }
-                // A Record's membership is over its *field names*: `"size" in row`. Its
-                // values are reachable with `values` when that is the question (§10b).
+                // A Record's membership is over its *field names*: `"size" in row` (§10b).
                 Some(Value::Record(rec)) => {
                     let Some(Value::Str(name)) = l.as_data() else {
                         return Err(EvalError::new(alloc::format!(
@@ -2530,8 +2301,7 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
                     Ok(Val::bool(rec.schema.fields.iter().any(|f| &f.name == name)))
                 }
                 _ => match &r {
-                    // A Range answers without materialising: this is the one membership
-                    // test that would otherwise build ten million values to look at one.
+                    // A Range answers without materialising millions of values.
                     Val::Range { start, end, inclusive } => {
                         let Some(Value::Int(n)) = l.as_data() else {
                             return Err(EvalError::new(alloc::format!(
@@ -2548,7 +2318,6 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
                 },
             };
         }
-        // §10b: the gap `grep` left was a missing *operator*, not a missing program.
         Match => {
             let (Some(Value::Str(text)), Some(Value::Str(pattern))) = (l.as_data(), r.as_data()) else {
                 return Err(EvalError::new(alloc::format!(
@@ -2576,8 +2345,8 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
         }
     };
 
-    // Strings compare, but do not do arithmetic — `+` on two strings is a common slip in
-    // a language that also has `++`, so it earns a message that points at the fix.
+    // Strings compare but do no arithmetic; `+` on two strings is a common slip, so its message
+    // points at `++`.
     if let (Value::Str(x), Value::Str(y)) = (a, b) {
         return match op {
             Lt => Ok(Val::bool(x < y)),
@@ -2595,8 +2364,7 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => int_op(op, *x, *y),
         (Value::Float(x), Value::Float(y)) => float_op(op, *x, *y),
-        // Mixed arithmetic widens to Float, which is the only choice that does not lose
-        // information — the alternative truncates silently.
+        // Mixed arithmetic widens to Float, the only choice that loses no information.
         (Value::Int(x), Value::Float(y)) => float_op(op, *x as f64, *y),
         (Value::Float(x), Value::Int(y)) => float_op(op, *x, *y as f64),
         _ => Err(EvalError::new(alloc::format!(
@@ -2672,9 +2440,8 @@ fn float_op(op: BinOp, x: f64, y: f64) -> Result<Val> {
     }
 }
 
-/// Structural equality. `Int(1)` and `Float(1.0)` compare equal *numerically*, because a
-/// shell reading `1` from one program and `1.0` from another should not find them
-/// different — but they still render differently and still ascribe differently.
+/// Structural equality. `Int(1)` and `Float(1.0)` compare equal *numerically* but still render and
+/// ascribe differently.
 fn values_equal(l: &Val, r: &Val) -> bool {
     match (l.as_data(), r.as_data()) {
         (Some(Value::Int(a)), Some(Value::Float(b))) | (Some(Value::Float(b)), Some(Value::Int(a))) => *a as f64 == *b,
@@ -2704,13 +2471,12 @@ fn op_name(op: BinOp) -> &'static str {
     }
 }
 
-/// Check a value against an ascription (§6). Part B covers the scalar cases; `Table<{…}>`
-/// against a stream header is Part D, where a stream exists to check.
+/// Check a value against an ascription (§6). Scalars only; `Table<{…}>` against a stream header is
+/// not checked here.
 fn check_type(v: &Val, t: &TypeExpr) -> Result<()> {
     let (name, nullable) = match t {
         TypeExpr::Named { name, nullable, .. } => (name.as_str(), *nullable),
-        // A record shape needs the field-by-field comparison that produces §6's schema
-        // diff; it arrives with the operators that consume schemas.
+        // A record shape would need the field-by-field comparison behind §6's schema diff.
         TypeExpr::Record { nullable, .. } => {
             if v.is_null() && *nullable {
                 return Ok(());
@@ -2724,9 +2490,8 @@ fn check_type(v: &Val, t: &TypeExpr) -> Result<()> {
         }
     };
     if v.is_null() {
-        // §9e: this is the whole point of the nullable suffix — a non-nullable annotation
-        // rejects `Null` outright, so a false `if` without `else` is caught at the
-        // binding rather than propagating.
+        // §9e: a non-nullable annotation rejects `Null` outright, so a false `if` without `else` is
+        // caught at the binding.
         return if nullable {
             Ok(())
         } else {
@@ -2740,8 +2505,7 @@ fn check_type(v: &Val, t: &TypeExpr) -> Result<()> {
         };
     }
     let actual = v.type_name();
-    // Subset match by default (§6): a container annotation names the container, and its
-    // element shape is checked where the elements are.
+    // Subset match by default (§6): a container annotation names the container only.
     if actual == name {
         return Ok(());
     }
@@ -2770,8 +2534,6 @@ mod tests {
         ok(src).render()
     }
 
-    // --- arithmetic ---------------------------------------------------------
-
     #[test]
     fn arithmetic_follows_the_precedence_table() {
         assert_eq!(rendered("1 + 2 * 3"), "7");
@@ -2781,8 +2543,6 @@ mod tests {
         assert_eq!(rendered("-3 + 1"), "-2");
     }
 
-    /// Mixed arithmetic widens rather than truncating: the alternative loses information
-    /// silently, which is the thing this language keeps refusing to do.
     #[test]
     fn mixed_int_and_float_widens_to_float() {
         assert_eq!(rendered("1 + 1.5"), "2.5");
@@ -2790,6 +2550,7 @@ mod tests {
         assert_eq!(rendered("2.0 * 2"), "4.0");
     }
 
+    /// Arithmetic overflow and division by zero are errors, never wrapped or fabricated values.
     #[test]
     fn overflow_and_division_by_zero_are_errors_not_wrapped_values() {
         assert!(err("9223372036854775807 + 1").contains("overflows"));
@@ -2798,17 +2559,13 @@ mod tests {
         assert!(err("1 % 0").contains("remainder by zero"));
     }
 
-    /// `+` and `++` are deliberately separate (§8a), so joining strings with `+` gets a
-    /// message that points at the right operator instead of a bare type error.
+    /// `+` and `++` are separate (§8a): `+` on strings earns a message pointing at `++`.
     #[test]
     fn plus_does_not_join_strings() {
         assert_eq!(rendered("\"a\" ++ \"b\""), "ab");
         assert!(err("\"a\" + \"b\"").contains("`++`"));
-        // `++` renders whatever it is given, so the trivial mixed case works.
         assert_eq!(rendered("\"n=\" ++ 5"), "n=5");
     }
-
-    // --- comparison and equality --------------------------------------------
 
     #[test]
     fn comparison_works_on_numbers_and_strings() {
@@ -2819,33 +2576,25 @@ mod tests {
         assert_eq!(rendered("1 != 2"), "true");
     }
 
-    /// `1` and `1.0` compare equal, because one program emitting an Int and another a
-    /// Float should not make a pipeline disagree with itself.
     #[test]
     fn int_and_float_compare_numerically() {
         assert_eq!(rendered("1 == 1.0"), "true");
         assert_eq!(rendered("1 != 1.0"), "false");
-        // …while still being different values.
         assert_eq!(rendered("1"), "1");
         assert_eq!(rendered("1.0"), "1.0");
     }
 
-    // --- no truthiness ------------------------------------------------------
-
-    /// The decision, tested: a non-Bool condition is an error rather than a coercion.
     #[test]
     fn there_is_no_truthiness() {
         let e = err("if 1 { 2 }");
         assert!(e.contains("Bool"), "{e}");
         assert!(e.contains("no truthiness"), "{e}");
         assert!(err("true && 1").contains("no truthiness"));
-        // Spelling the comparison out is all it costs.
         assert_eq!(rendered("if 1 != 0 { 2 } else { 3 }"), "2");
     }
 
     #[test]
     fn logical_operators_short_circuit() {
-        // The right operand is never evaluated, so its error never surfaces.
         assert_eq!(rendered("false && (1 / 0) == 0"), "false");
         assert_eq!(rendered("true || (1 / 0) == 0"), "true");
     }
@@ -2856,8 +2605,6 @@ mod tests {
         assert_eq!(rendered("3 ?? (1 / 0)"), "3");
     }
 
-    // --- bindings and mutability (§9d) --------------------------------------
-
     #[test]
     fn let_is_immutable_and_mut_is_not() {
         assert_eq!(rendered("let x = 5\nx"), "5");
@@ -2867,8 +2614,7 @@ mod tests {
         assert!(e.contains("mut"), "{e}");
     }
 
-    /// An operator name is not a reserved word. `last` is a §10b operator *and* an
-    /// ordinary name for a variable, and assigning to one must not parse as a call.
+    /// An operator name is not a reserved word: `last` is both, and assigning to it is not a call.
     #[test]
     fn an_operator_name_can_still_be_a_variable() {
         assert_eq!(rendered("mut last = 1\nlast = 2\nlast"), "2");
@@ -2881,8 +2627,7 @@ mod tests {
         assert!(err("const X = 1\nX = 2").contains("only a `mut`"));
     }
 
-    /// D4's order, and the message it earns: a bare name is looked for as a binding and
-    /// then as a program, and a failure names both searches rather than one.
+    /// D4: a bare name is looked for as a binding and then as a program; a failure names both.
     #[test]
     fn an_unbound_name_says_what_was_searched() {
         let e = err("nope");
@@ -2890,14 +2635,10 @@ mod tests {
         assert!(e.contains("as a program"), "{e}");
     }
 
-    // --- blocks are expressions (§9a) ---------------------------------------
-
     #[test]
     fn a_block_evaluates_to_its_last_expression() {
         assert_eq!(rendered("if true { 1 + 1 }"), "2");
-        // A block ending in a non-expression statement is Null.
         assert_eq!(rendered("if true { let x = 1 }"), "null");
-        // …and `if` without `else`, when false, is Null (§9a).
         assert_eq!(rendered("if false { 1 }"), "null");
     }
 
@@ -2907,8 +2648,7 @@ mod tests {
         assert_eq!(rendered("if false { 1 } else if false { 2 } else { 3 }"), "3");
     }
 
-    /// §9e: the nullable suffix is what defuses if-without-else, and it only helps if a
-    /// non-nullable annotation genuinely rejects `Null`.
+    /// §9e: the nullable suffix defuses if-without-else, if a non-nullable annotation rejects `Null`.
     #[test]
     fn ascription_rejects_null_unless_the_type_is_nullable() {
         assert_eq!(rendered("let x: Int? = if false { 5 }\nx"), "null");
@@ -2918,15 +2658,11 @@ mod tests {
         assert!(err("let x: Int = \"s\"").contains("expected Int, got String"));
     }
 
-    // --- scoping ------------------------------------------------------------
-
     #[test]
     fn inner_scopes_shadow_and_do_not_leak() {
         assert_eq!(rendered("let x = 1\nif true { let x = 2 }\nx"), "1");
         assert!(err("if true { let y = 2 }\ny").contains("not a binding"));
     }
-
-    // --- control flow -------------------------------------------------------
 
     #[test]
     fn for_walks_ranges_lists_and_accumulates() {
@@ -2946,15 +2682,12 @@ mod tests {
         assert!(e.contains("cannot iterate"), "{e}");
     }
 
-    // --- collections --------------------------------------------------------
-
     #[test]
     fn lists_and_records_build_and_read_back() {
         assert_eq!(rendered("[1, 2, 3]"), "[1, 2, 3]");
         assert_eq!(rendered("[1, 2, 3][1]"), "2");
         assert_eq!(rendered("{ a: 1, b: \"x\" }"), "{ a: 1, b: \"x\" }");
         assert_eq!(rendered("{ a: 1 }.a"), "1");
-        // §8e's record shorthand.
         assert_eq!(rendered("let name = \"n\"\n{ name }"), "{ name: \"n\" }");
     }
 
@@ -2972,16 +2705,13 @@ mod tests {
         assert!(e.contains("a, b"), "{e}");
     }
 
-    /// §9e: `?.` is the "handle the absent case" spelling, so it yields Null rather than
-    /// failing — including on a Null base, which is the point of chaining.
+    /// §9e: `?.` yields Null rather than failing, including on a Null base, so it chains.
     #[test]
     fn safe_navigation_yields_null_instead_of_failing() {
         assert_eq!(rendered("{ a: 1 }?.missing"), "null");
         assert_eq!(rendered("null?.a"), "null");
         assert_eq!(rendered("{ a: 1 }?.missing ?? \"unknown\""), "unknown");
     }
-
-    // --- field and index mutation (§9d) -------------------------------------
 
     #[test]
     fn field_and_index_assignment_reach_into_collections() {
@@ -2990,8 +2720,8 @@ mod tests {
         assert_eq!(rendered("mut r = { inner: { v: 1 } }\nr.inner.v = 7\nr.inner.v"), "7");
     }
 
-    /// The collections are persistent and `Arc`-shared, so a write through one binding
-    /// must not be visible through another that was copied from it.
+    /// A write through one binding must not be visible through a copy (collections are
+    /// `Arc`-shared).
     #[test]
     fn assignment_does_not_leak_through_a_shared_copy() {
         assert_eq!(rendered("mut a = [1, 2]\nlet b = a\na[0] = 9\nb"), "[1, 2]");
@@ -3003,46 +2733,32 @@ mod tests {
         assert!(err("let r = { a: 1 }\nr.a = 2").contains("only a `mut`"));
     }
 
-    // --- language-only values (§5c) -----------------------------------------
-
     #[test]
     fn a_closure_is_a_value_but_not_a_tsm1_one() {
         assert_eq!(rendered("let f = { |x| x + 1 }\nf"), "<closure>");
-        // …and cannot be put where TSM1 would have to encode it.
         assert!(err("let f = { |x| x }\n[f]").contains("TSM1"));
     }
 
-    /// §5a: capture is by value at creation, which is what makes the classic
-    /// loop-variable bug impossible rather than merely unlikely. The closure made on the
-    /// last iteration must hold that iteration's value, not a live reference.
+    /// §5a: capture is by value, so the closure made on the last iteration holds that iteration's
+    /// value.
     #[test]
     fn closures_capture_by_value_at_creation() {
         let v = ok("mut made = null\nfor i in 0..3 { made = { |x| x } }\nmade");
         assert!(matches!(v, Val::Func(_)));
-        // The captured environment is a snapshot: three iterations, three snapshots.
         let Val::Func(f) = v else { panic!() };
         assert!(f.captured.iter().any(|(n, _)| n == "i"));
         let (_, captured_i) = f.captured.iter().rev().find(|(n, _)| n == "i").unwrap();
         assert_eq!(captured_i.render(), "2");
     }
 
-    // --- the parts that are not here yet ------------------------------------
-
-    /// Reaching a later part is a clean "not yet", naming the part — not a wrong answer
-    /// and not a panic.
     #[test]
     fn later_parts_report_themselves_rather_than_misbehaving() {
-        // With no host attached, a command says so rather than pretending to run.
         assert!(err("ls").contains("no host attached"));
     }
-
-    // --- pipelines, against a mock host (Part C) ----------------------------
 
     use crate::host::MockHost;
     use alloc::boxed::Box;
 
-    /// A TSM1 stream of one column `n`, with the given values — a stand-in for whatever
-    /// a real program would emit.
     fn stream(name: &str, values: &[i64]) -> alloc::vec::Vec<u8> {
         use libstream::wire::{StreamFlags, Table, TypeTag};
         let schema = Schema::new().field(name, TypeTag::Int, TypeModifiers::NONE);
@@ -3056,9 +2772,7 @@ mod tests {
         buf
     }
 
-    /// Run `src` against `host`, returning the result and the log of what the host was
-    /// asked to do — the log is shared, so it stays readable after the interpreter has
-    /// taken ownership of the host.
+    /// Run `src` against `host`, returning the result and the shared log of what it was asked.
     fn run_with(
         host: MockHost,
         src: &str,
@@ -3070,11 +2784,8 @@ mod tests {
         (r, log)
     }
 
-    /// **`time PIPELINE`** (Phase 6 Part H.2): the whole pipeline after it is timed — both stages
-    /// here, the value `count` gives coming through — and its line goes to `stderr`: the time
-    /// between the host's two clock reads, then, where `io.tsm` reads, what moved, which here is
-    /// nothing. A failure comes through too, with its line said first. And `time` that is not a
-    /// prefix — alone, or assigned to — is an ordinary name.
+    /// **`time PIPELINE`** times the whole pipeline after it, passes its value (or failure)
+    /// through, and writes its line to `stderr`; alone, or assigned to, `time` is an ordinary name.
     #[test]
     fn time_passes_a_pipelines_value_through_and_says_how_long_it_took() {
         let host = MockHost::new().with_program("list", Some(stream("n", &[1, 2, 3]))).with_clock(250_000_000);
@@ -3110,12 +2821,8 @@ mod tests {
         assert_eq!(r.expect("a name").render(), "4");
     }
 
-    /// **The throughput stick's script, as the maintainer runs it** (Phase 6 Part H.3):
-    /// `cargo xtask throughput-stick` puts `tools/xtask/src/throughput/h3.nx` on the stick, and a
-    /// laptop with no serial port `use`s it at a prompt — where a script that does not parse, or a
-    /// set that runs the wrong copy, costs a boot to find out. Each set: its commands, their
-    /// arguments, in order, each timed but set 4's last, which removes set 1's copies so the next
-    /// round starts where this one did; its answer; and a set out of range refused.
+    /// **The throughput stick's script, as the maintainer runs it**: a script that does not parse,
+    /// or a set that runs the wrong copy, otherwise costs a boot to find out.
     #[test]
     fn the_throughput_sticks_script_runs_each_set_timed() {
         const H3: &str = include_str!("../../../tools/xtask/src/throughput/h3.nx");
@@ -3191,14 +2898,12 @@ mod tests {
         let (r, log) = run_with(host, "list /system");
         let v = r.expect("runs");
         assert_eq!(v.render(), "<table 3 rows [n]>");
-        // The argv the host was handed, including the bareword path (D1).
         assert_eq!(log.borrow().runs.len(), 1);
         assert_eq!(log.borrow().runs[0][0].argv, alloc::vec!["list", "/system"]);
     }
 
-    /// Consecutive external stages go to the host as **one chain**, not one call per
-    /// stage. §1 makes the pipes between them the kernel's business, with real
-    /// backpressure; running them one at a time would serialise what should stream.
+    /// Consecutive external stages go to the host as **one chain** (§1): running them one at a time
+    /// would serialise what should stream.
     #[test]
     fn consecutive_external_stages_are_handed_over_as_one_chain() {
         let host = MockHost::new().with_program("list", None).with_program("xform", Some(stream("n", &[7])));
@@ -3216,7 +2921,6 @@ mod tests {
         assert_eq!(log.borrow().runs[0][0].argv, alloc::vec!["list", "--long", "-rf", "/system"]);
     }
 
-    /// §1: fail loud, don't fail silent — a non-zero stage anywhere fails the pipeline.
     #[test]
     fn a_failing_stage_fails_the_pipeline() {
         let host = MockHost::new().with_failing("nope", 3);
@@ -3225,10 +2929,7 @@ mod tests {
         assert!(e.message.contains("exited 3"), "{}", e.message);
     }
 
-    /// **Where `PipelineStatus` actually arrives** (§2). v1.1 claimed `let r = my_pipeline`
-    /// put the status in hand; it cannot — the pipeline's value is its *data*, and on
-    /// failure it never reaches the binding. The report rides on the error instead, which
-    /// is the one thing that does reach the `catch`.
+    /// The per-stage report rides on the error, the one thing that reaches the `catch` (§2).
     #[test]
     fn a_failed_pipeline_carries_its_per_stage_report() {
         let host = MockHost::new().with_failing("nope", 3);
@@ -3240,15 +2941,12 @@ mod tests {
         let Value::List(rows) = stages else { panic!("expected a list of stages") };
         assert_eq!(rows.len(), 1);
         let Value::Record(r0) = &rows[0] else { panic!("expected a stage record") };
-        // The §1 shape, unchanged, delivered where the question is asked.
         let names: Vec<&str> = r0.schema.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["command", "exit_status", "crashed", "cancelled"]);
         assert_eq!(r0.values[0], Value::Str(alloc::string::String::from("nope")));
         assert_eq!(r0.values[1], Value::Int(3));
     }
 
-    /// …and a script can read it, which is the point: "which stage failed, and how" is one
-    /// field away rather than unanswerable.
     #[test]
     fn a_script_can_read_which_stage_failed() {
         let host = MockHost::new().with_failing("nope", 3);
@@ -3256,7 +2954,6 @@ mod tests {
         assert_eq!(r.expect("caught").render(), "1");
     }
 
-    /// A crash and a non-zero exit are different things, and the report keeps them apart.
     #[test]
     fn a_crashed_stage_is_reported_as_crashed_not_as_an_exit_code() {
         let host = MockHost::new().with_crashing("boom");
@@ -3265,15 +2962,12 @@ mod tests {
         assert!(e.message.contains("crashed"), "{}", e.message);
     }
 
-    /// §1's eager-abort opt-in. Without `strict` every stage runs; with it, the stages
-    /// after a failure are terminated and reported as *cancelled* — which is neither
-    /// "succeeded" nor "failed", and is exactly the distinction a per-stage status exists
-    /// to preserve.
+    /// §1's eager-abort opt-in: with `strict`, stages after a failure are terminated and reported
+    /// *cancelled*, which is neither succeeded nor failed.
     #[test]
     fn strict_cancels_the_remaining_stages() {
         let host = MockHost::new().with_failing("bad", 1).with_program("after", None);
         let (r, _log) = run_with(host, "bad | after");
-        // Without `strict`, `after` still ran.
         assert!(r.is_err());
 
         let host = MockHost::new().with_failing("bad", 1).with_program("after", None);
@@ -3282,22 +2976,15 @@ mod tests {
         assert!(e.message.contains("exited 1") || e.message.contains("cancelled"), "{}", e.message);
     }
 
-    /// The value flowing between two external runs is re-encoded as a stream. Here the
-    /// first stage's table is handed to the second run's `stdin`.
+    /// The value flowing between two external runs is re-encoded as a stream.
     #[test]
     fn a_value_piped_into_a_program_is_encoded_as_a_stream() {
         let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2]))).with_program("sink", None);
-        // Two separate runs would need an in-process stage between them, which is Part D;
-        // this checks the single-chain case still threads input correctly when there is
-        // none.
         let (r, log) = run_with(host, "src | sink");
         r.expect("runs");
         assert_eq!(log.borrow().inputs[0], None, "a head stage has no piped input");
     }
 
-    /// A stage that produced no stream is `Null`, not an empty table — a mutation like
-    /// `remove` genuinely has no value, and an invented empty table would let a later
-    /// `count` answer 0 for something that never counted anything.
     #[test]
     fn a_stage_with_no_output_yields_null_not_an_empty_table() {
         let host = MockHost::new().with_program("remove", None);
@@ -3305,8 +2992,7 @@ mod tests {
         assert!(r.expect("runs").is_null());
     }
 
-    /// §5b: an external program takes its input from the pipe, so the `def` conventions
-    /// are refused rather than silently ignored.
+    /// §5b: an external program takes its input from the pipe, so the `def` conventions are refused.
     #[test]
     fn def_calling_conventions_are_refused_for_an_external() {
         let host = MockHost::new().with_program("prog", None);
@@ -3314,37 +3000,31 @@ mod tests {
         assert!(r.is_err());
     }
 
-    /// D4 in a pipeline: a stage with a piped operand is unambiguously an invocation, so
-    /// a local binding does **not** shadow a command name here — the opposite of the
-    /// bare-reference rule, and for the opposite reason.
+    /// D4 in a pipeline: a stage with a piped operand is unambiguously an invocation, so a local
+    /// binding does **not** shadow a command name here, the opposite of the bare-reference rule.
     #[test]
     fn a_local_binding_does_not_shadow_a_command_inside_a_pipeline() {
-        // The operand has to be a *bare name in a non-head stage*, which is the only
-        // place the rule applies. A first attempt used `list /system` — a call with
-        // arguments, which never reaches the branch at all, so deleting the rule left the
-        // test passing. A control caught it.
+        // The operand has to be a *bare name in a non-head stage*, the only place the rule applies;
+        // a call with arguments never reaches the branch.
         let host = MockHost::new().with_program("src", Some(stream("n", &[1]))).with_program("sink", None);
         let (r, log) = run_with(host, "let sink = 5\nsrc | sink");
         r.expect("runs");
         assert_eq!(log.borrow().runs[0].len(), 2, "the second stage ran as a command, not as the binding");
     }
 
-    /// …and at the *head* the precedence is the other way round: a bare name that is
-    /// bound is the value being piped onward, not a command.
+    /// At the *head* the precedence is the other way round: a bound bare name is the value
+    /// being piped onward, not a command.
     #[test]
     fn a_head_stage_prefers_a_local_binding() {
         let host = MockHost::new().with_program("t", None).with_program("sink", None);
         let (r, _log) = run_with(host, "let t = 5\nt | sink");
-        // `t` resolved to the Int binding — which then cannot be piped into a program,
-        // and that error is the proof. Had it been spawned as the command `t` (which the
-        // mock knows), the run would have succeeded and proved nothing.
+        // `t` resolved to the Int binding, which cannot be piped into a program; that error is the
+        // proof, since the mock knows a command `t`.
         let e = r.expect_err("an Int cannot be piped into a program");
         assert!(e.message.contains("only a Table or text can be piped"), "{}", e.message);
     }
 
-    /// Text *can* be piped into a program, wrapped as the stream the spec calls the "Unix
-    /// floor" — M12 Part E, where `"hello" | clip --copy` found that nothing in the tree had
-    /// ever written a `TEXT_FALLBACK` stream.
+    /// Text can be piped into a program, wrapped as a `TEXT_FALLBACK` stream (the "Unix floor").
     #[test]
     fn a_string_and_a_list_of_strings_reach_a_program_as_a_text_stream() {
         // `\\n` in the *shell* source: the literal has to carry a newline for the split to be
@@ -3367,7 +3047,6 @@ mod tests {
         }
     }
 
-    /// …and a list that is *not* text is still refused, rather than half-encoded.
     #[test]
     fn a_list_with_one_non_string_is_not_text() {
         let host = MockHost::new().with_program("sink", None);
@@ -3376,23 +3055,18 @@ mod tests {
         assert!(e.message.contains("only a Table or text can be piped"), "{}", e.message);
     }
 
-    // --- generic value operators, end to end (Part D) -----------------------
-
-    /// The plan's stated Part D deliverable, with a mock supplying the one external stage.
     #[test]
     fn the_deliverable_pipeline_runs() {
         let host = MockHost::new().with_program("list", Some(stream("size", &[5, 200, 3000])));
         let (r, log) = run_with(host, "list | filter size > 100 | sort size | take 5 | display");
         r.expect("runs");
         let out = log.borrow().output.concat();
-        // Two rows survived the filter, in ascending order, laid out as a table.
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "size");
         assert_eq!(lines[1], "200");
         assert_eq!(lines[2], "3000");
     }
 
-    /// §8b's sugar reaches the operator as a closure, and the closure is *called*.
     #[test]
     fn a_bareword_predicate_filters() {
         let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2, 3])));
@@ -3400,7 +3074,6 @@ mod tests {
         assert_eq!(r.expect("runs").render(), "2");
     }
 
-    /// …and the explicit closure form does the same thing, since one desugars to the other.
     #[test]
     fn an_explicit_closure_filters_identically() {
         let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2, 3])));
@@ -3408,9 +3081,8 @@ mod tests {
         assert_eq!(r.expect("runs").render(), "2");
     }
 
-    /// §5a: capture is by value at creation, so a closure written in a pipeline can reach
-    /// a local — which the *sugared* form deliberately cannot, since a bare name there is
-    /// a field on `it` (§8b).
+    /// An explicit closure can reach a local; the sugared form cannot (a bare name there is a
+    /// field, §8b).
     #[test]
     fn an_explicit_closure_can_close_over_a_local() {
         let host = MockHost::new().with_program("src", Some(stream("n", &[1, 5, 9])));
@@ -3422,8 +3094,7 @@ src | filter { |row| row.n > threshold } | count",
         assert_eq!(r.expect("runs").render(), "2");
     }
 
-    /// §5c's headline, made concrete: only the first stage is a process. Everything after
-    /// it runs on the `Value` tree, so the host is asked to spawn exactly once.
+    /// §5c: only the first stage is a process; the rest runs on the `Value` tree.
     #[test]
     fn only_the_external_stage_costs_a_spawn() {
         let host = MockHost::new().with_program("list", Some(stream("n", &[1, 2, 3])));
@@ -3433,15 +3104,13 @@ src | filter { |row| row.n > threshold } | count",
         assert_eq!(log.borrow().runs[0].len(), 1);
     }
 
-    /// An operator with nothing on its left is a mistake, not an empty answer.
     #[test]
     fn an_operator_without_an_operand_says_so() {
         let e = err("count");
         assert!(e.contains("needs an operand"), "{e}");
     }
 
-    /// `each` is for effects, so the chain does not narrow just because something looked
-    /// at every row.
+    /// `each` is for effects, so the chain does not narrow because something looked at every row.
     #[test]
     fn each_passes_its_input_through() {
         let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2])));
@@ -3449,8 +3118,8 @@ src | filter { |row| row.n > threshold } | count",
         assert_eq!(r.expect("runs").render(), "2");
     }
 
-    /// §6: `expect` checks shape, `assert` checks content, and they are separate keywords
-    /// so the message says which kind of thing went wrong.
+    /// §6: `expect` checks shape, `assert` checks content; separate keywords so the message
+    /// says which kind of thing went wrong.
     #[test]
     fn expect_and_assert_are_different_checks() {
         assert_eq!(
@@ -3464,11 +3133,8 @@ x"
         assert!(err("assert (5)").contains("needs a Bool"));
     }
 
-    /// B5: `save` then `open` round-trips through the host.
     #[test]
     fn save_and_open_round_trip() {
-        // These use relative paths, so they need a working directory — which is the
-        // behaviour Part C introduced, not a change of intent.
         let host = MockHost::new().with_program("src", Some(stream("n", &[7, 8])));
         let (r, _log) = run_env(host, env_with(&[("PWD", "/tmp")]), "src | save ./out.tsm");
         r.expect("saves");
@@ -3478,15 +3144,12 @@ x"
         assert_eq!(r.expect("opens").render(), "2");
     }
 
-    /// §4: several paths concatenate into one stream — which is what absorbed `cat`.
     #[test]
     fn open_concatenates_several_paths() {
         let host = MockHost::new().with_file("/tmp/a.txt", "one\n").with_file("/tmp/b.txt", "two\nthree\n");
         let (r, _log) = run_env(host, env_with(&[("PWD", "/tmp")]), "open ./a.txt ./b.txt | count");
         assert_eq!(r.expect("opens").render(), "3");
     }
-
-    // --- functions (Part E, §5b) --------------------------------------------
 
     #[test]
     fn a_def_is_callable_with_positional_and_named_arguments() {
@@ -3504,9 +3167,8 @@ x"
         );
     }
 
-    /// §5b: defaults are evaluated fresh per call **in the function's own parameter
-    /// scope**, which is what lets a later default reference an earlier parameter — and
-    /// what avoids Python's shared-mutable-default trap.
+    /// §5b: defaults are evaluated fresh per call in the function's own parameter scope, so a
+    /// later default can reference an earlier parameter and no mutable default is shared.
     #[test]
     fn a_default_can_reference_an_earlier_parameter() {
         assert_eq!(rendered("def f(a: Int, b: Int = a + 1) -> Int { b }\nf(5)"), "6");
@@ -3526,24 +3188,24 @@ x"
         assert_eq!(rendered("def n(...rest: List<Int>) -> Int { rest | count }\nn(1, 2, 3)"), "3");
     }
 
-    /// §5a: `def` bindings hoist, so two functions can call each other regardless of
-    /// textual order. `let` deliberately does not, being tied to evaluation.
+    /// §5a: `def` bindings hoist, so two functions can call each other in any textual order;
+    /// `let` does not.
     #[test]
     fn defs_hoist_so_mutual_recursion_works() {
         let src = "def even(n: Int) -> Bool { if n == 0 { true } else { odd(n - 1) } }\n                   def odd(n: Int) -> Bool { if n == 0 { false } else { even(n - 1) } }\n                   even(4)";
         assert_eq!(rendered(src), "true");
     }
 
-    /// §5a: a named function captures **nothing** — its parameter list is a complete
-    /// account of its inputs, which is the same rule as no ambient env and no global `$?`.
+    /// §5a: a named function captures **nothing**; its parameter list is a complete account of
+    /// its inputs.
     #[test]
     fn a_def_does_not_capture_its_enclosing_scope() {
         let e = err("let outside = 1\ndef f() -> Int { outside }\nf()");
         assert!(e.contains("not a binding"), "{e}");
     }
 
-    /// §5b's pipeline-fill rule: `_` is required whenever an argument list is present,
-    /// because nothing guarantees a function's first parameter is the data slot.
+    /// §5b: `_` is required whenever an argument list is present; nothing guarantees the first
+    /// parameter is the data slot.
     #[test]
     fn the_pipeline_fill_placeholder_is_explicit_when_a_list_is_present() {
         let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2])));
@@ -3553,12 +3215,10 @@ x"
         );
         assert_eq!(r.expect("runs").render(), "2");
 
-        // A bare call fills its sole slot without `_`.
         let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2])));
         let (r, _l) = run_with(host, "def rows(t: Table) -> Int { t | count }\nsrc | rows");
         assert_eq!(r.expect("runs").render(), "2");
 
-        // …but an argument list without `_` is a refusal, not a guess.
         let host = MockHost::new().with_program("src", Some(stream("n", &[1])));
         let (r, _l) = run_with(
             host,
@@ -3566,8 +3226,6 @@ x"
         );
         assert!(r.expect_err("should refuse").message.contains("`_`"));
     }
-
-    // --- match (§9f) --------------------------------------------------------
 
     #[test]
     fn match_covers_the_9f_pattern_forms() {
@@ -3578,36 +3236,28 @@ x"
         assert_eq!(rendered("match { name: \"a\", size: 2 } { { name } => name\n _ => \"?\" }"), "a");
     }
 
-    /// A guard runs with the arm's bindings in scope — the point of
-    /// `{ name, size } if size > 1000`.
     #[test]
     fn a_guard_sees_the_arms_bindings() {
         let src = "match { name: \"big\", size: 2000 } {\n                   { name, size } if size > 1000 => name\n                   { name } => \"small\"\n}";
         assert_eq!(rendered(src), "big");
     }
 
-    /// §9f: no static exhaustiveness check, so an unmatched value is a runtime
-    /// `MatchError` styled like a `TypeError` — not a silent fallthrough.
+    /// §9f: no static exhaustiveness check, so an unmatched value is a runtime `MatchError`,
+    /// not a silent fallthrough.
     #[test]
     fn an_unmatched_value_is_a_match_error() {
         let e = err("match 5 { 0 => 1 }");
         assert!(e.contains("MatchError"), "{e}");
     }
 
-    // --- try / catch (§2) ---------------------------------------------------
-
-    /// §2: sugar over branching on a failure, not stack unwinding — and the error arrives
-    /// as an ordinary `Record`, so `match err { … }` needs no new grammar.
+    /// §2: the error arrives as an ordinary `Record`, so `match err { … }` needs no new grammar.
     #[test]
     fn try_catch_binds_the_error_as_a_record() {
         assert_eq!(rendered("try { 1 / 0 } catch (e) { e.message }"), "division by zero");
         assert_eq!(rendered("try { 1 } catch (e) { 2 }"), "1");
-        // …and it composes with `match` for free (§9f's payoff).
         let src = "try { 1 / 0 } catch (e) {\n                   match e { { kind: \"Error\" } => \"handled\"\n _ => \"?\" }\n}";
         assert_eq!(rendered(src), "handled");
     }
-
-    // --- modules (§9h) ------------------------------------------------------
 
     #[test]
     fn use_imports_only_what_is_exported() {
@@ -3616,8 +3266,6 @@ x"
         let (r, _l) = run_with(host, "use \"./lib.nx\" { helper }\nhelper(1)");
         assert_eq!(r.expect("imports").render(), "2");
 
-        // §9h: `pub` is what crosses the file boundary — the same recurring rule as env
-        // vars crossing a process boundary or data crossing IPC.
         let host = MockHost::new().with_file("./lib.nx", "def hidden() -> Int { 0 }\n");
         let (r, _l) = run_with(host, "use \"./lib.nx\" { hidden }\nhidden()");
         assert!(r.expect_err("not exported").message.contains("pub"));
@@ -3630,18 +3278,14 @@ x"
         assert_eq!(r.expect("imports").render(), "8");
     }
 
-    // --- `~=` (Part G, §10b) ------------------------------------------------
-
     #[test]
     fn the_match_operator_works_end_to_end() {
         assert_eq!(rendered("\"parse.rs\" ~= /\\.rs$/"), "true");
         assert_eq!(rendered("\"parse.py\" ~= /\\.rs$/"), "false");
-        // A pattern may equally be a String built at run time.
         assert_eq!(rendered("let p = \"^a\"\n\"abc\" ~= p"), "true");
     }
 
-    /// §10a: `filter` plus `~=` covers `grep`'s job entirely — the gap was a missing
-    /// operator, not a missing program.
+    /// §10a: `filter` plus `~=` covers `grep`'s job; the gap was an operator, not a program.
     #[test]
     fn filter_with_a_regex_replaces_grep() {
         use libstream::wire::{StreamFlags, Table, TypeTag};
@@ -3668,8 +3312,6 @@ x"
         assert!(err("\"x\" ~= /a{2}/").contains("counted repetition"));
     }
 
-    // --- environment and `cd` (Milestone 3.5 Part C) ------------------------
-
     fn env_with(pairs: &[(&str, &str)]) -> libstream::wire::Record {
         let mut schema = Schema::new();
         let mut values = Vec::new();
@@ -3680,21 +3322,15 @@ x"
         Record { schema, values }
     }
 
-    /// Drive a **sequence of REPL lines** through one interpreter, the way a person at a
-    /// prompt does — each `run_line` a separate parse and execute against state the last
-    /// one left behind.
-    ///
-    /// This helper is the point of the exercise. Every prior test fed the evaluator a
-    /// *whole script* through `run`, so nothing exercised `run_line` at all — and three
-    /// interactive-only bugs got in that way (the stale `cd` guard, `list /`, and the
-    /// `def` this covers). The interactive path is not a variation of the scripted one.
+    /// Drive a **sequence of REPL lines** through one interpreter, each a separate parse and
+    /// execute against the state the last left. Whole-script tests via `run` cannot see
+    /// interactive-only bugs.
     fn repl(lines: &[&str]) -> core::result::Result<Option<alloc::string::String>, EvalError> {
         let mut interp = Interp::with_host(Box::new(MockHost::new()), Mode::Repl);
         let mut last = None;
         for l in lines {
             last = interp.run_line(l)?;
         }
-        // `display` terminates with a newline; the tests care about the value.
         Ok(last.map(|s| alloc::string::String::from(s.trim_end())))
     }
 
@@ -3724,30 +3360,21 @@ x"
         i
     }
 
-    /// A stage head offers §3's four categories and the `def`s that have been typed.
-    ///
-    /// **All four, checked separately**, because they come from four different places — a
-    /// table in the lexer, two in the parser, the interpreter's own map, and the host — and
-    /// a single assertion on one prefix would pass with three of the five sources unwired.
+    /// A stage head offers all four categories, checked separately: they come from four sources,
+    /// and one assertion on one prefix passes with the rest unwired.
     #[test]
     fn a_stage_head_completes_every_category_of_name() {
         let mut i = completing();
         i.run_line("def deploy() { 1 }").expect("a def at the prompt");
 
-        // A language keyword.
         assert_eq!(i.complete("le").candidates, alloc::vec![String::from("let")]);
-        // A shell-state builtin. `exi` rather than `ex`, which `expect` also answers to —
-        // a prefix shared by two sources proves neither.
+        // `exi`, not `ex`: a prefix shared by two sources proves neither.
         assert_eq!(i.complete("exi").candidates, alloc::vec![String::from("exit")]);
-        // A generic value operator.
         assert_eq!(i.complete("ded").candidates, alloc::vec![String::from("dedupe")]);
-        // An external program, which only the host knows about.
         assert_eq!(i.complete("who").candidates, alloc::vec![String::from("whoami")]);
-        // And the function just defined, which nothing but this interpreter knows.
         assert_eq!(i.complete("dep").candidates, alloc::vec![String::from("deploy")]);
     }
 
-    /// `_` is a token, not something to offer at a prompt.
     #[test]
     fn punctuation_in_the_keyword_table_is_not_a_candidate() {
         let mut i = completing();
@@ -3757,46 +3384,31 @@ x"
         );
     }
 
-    /// An argument completes against the filesystem, relative to `PWD`.
     #[test]
     fn an_argument_completes_a_path() {
         let mut i = completing();
-        // Relative: the bare fragment is resolved against `PWD`, which is `/home`.
         assert_eq!(
             i.complete("list Do").candidates,
             alloc::vec![String::from("Documents/"), String::from("Downloads/")],
         );
-        // Absolute: the directory part comes back on every candidate, so replacing the
-        // whole word with one is right.
         assert_eq!(i.complete("list /home/n").candidates, alloc::vec![String::from("/home/notes.txt")],);
-        // A directory the mock does not know is not an error, it is nothing to offer.
         assert!(i.complete("list /nowhere/x").candidates.is_empty());
     }
 
-    /// `..` completes to the parent, and a second Tab lists what is in it.
-    ///
-    /// **Reported from using it**: `cd ..<TAB>` erased the `..`. Two things were wrong —
-    /// `..` was not a candidate at all, and a completion that found nothing replaced the
-    /// word with the empty string instead of leaving it alone.
+    /// `..` completes to the parent, and a second Tab lists what is in it. `cd ..<TAB>` once erased
+    /// the `..`: it was no candidate, and a completion finding nothing replaced the word with the
+    /// empty string.
     #[test]
     fn the_parent_directory_completes_and_then_lists() {
         let mut i = completing();
-        // `..` is a directory, so it gains a slash rather than a space…
         assert_eq!(i.complete("cd ..").candidates, alloc::vec![String::from("../")]);
-        // …and the slash is what makes the next Tab a listing of the parent, which from
-        // `/home` is the root.
         assert_eq!(i.complete("cd ../").candidates, alloc::vec![String::from("../bin/"), String::from("../home/")],);
-        // A dot alone is the start of both, and `.` is a real place to name.
         assert_eq!(i.complete("cd .").candidates, alloc::vec![String::from("../"), String::from("./")],);
-        // Through a `..` to something under it.
         assert_eq!(i.complete("cd ../ho").candidates, alloc::vec![String::from("../home/")]);
     }
 
-    /// Two files whose names differ in an accent complete without taking the shell down.
-    ///
-    /// The unit test for this is on `common_prefix`; this is the path a person actually
-    /// walks — `libfs::list_dir` hands back names through `from_utf8_lossy`, which keeps
-    /// valid non-ASCII rather than flattening it, so the bytes reach the prefix scan.
+    /// Two files whose names differ in an accent complete without panicking: `list_dir` keeps valid
+    /// non-ASCII via `from_utf8_lossy`, so the bytes reach the prefix scan.
     #[test]
     fn accented_names_complete_rather_than_panicking() {
         let mut h = completing_host();
@@ -3812,14 +3424,9 @@ x"
         assert_eq!(c.filled("list /home/notes/ca").as_deref(), Some("list /home/notes/caf"));
     }
 
-    /// Tab must never splice a candidate into the **middle** of what was typed.
-    ///
-    /// **`+` is an ordinary character in a filename and an operator in an expression**, and
-    /// the first version cut the word at the lexer's *expression*-mode path rule — so
-    /// `cd my+not<TAB>` completed the trailing `not` and handed back `cd my+notes.txt`, a
-    /// path the person never typed and which does not exist (PR #291 review, 2). An argument
-    /// is read in **word** mode, where the run is unbroken, so the word is `my+not`, it
-    /// matches nothing, and the line is left alone.
+    /// Tab must never splice a candidate into the **middle** of what was typed. An argument is read
+    /// in **word** mode, where `+` is ordinary text, so `cd my+not<TAB>` has the word `my+not`,
+    /// matches nothing, and leaves the line alone.
     #[test]
     fn a_candidate_is_never_spliced_into_the_middle_of_a_word() {
         let mut i = completing();
@@ -3832,20 +3439,14 @@ x"
             );
             assert_eq!(c.filled(line), None, "{line} would have been rewritten");
         }
-        // …and the same word with a separator in front of it still completes.
         assert_eq!(i.complete("cd not").candidates, alloc::vec![String::from("notes.txt")]);
-        // The unspaced binding is the sharpest case: `let x=not` used to become
-        // `let x=notes.txt`, which is a filename substituted for the start of an expression.
+        // `let x=not` once became `let x=notes.txt`, a filename where an expression starts.
         assert!(i.complete("let x=not").candidates.is_empty());
-        // But a space is a real boundary, so this is still an ordinary path completion.
         assert_eq!(i.complete("let x = not").candidates, alloc::vec![String::from("notes.txt")]);
     }
 
-    /// The second line of a statement completes as the statement, not as a fresh prompt.
-    ///
-    /// The console loop hands `complete` the accumulated statement rather than the physical
-    /// line for exactly this; without it the newline reads as a statement boundary and an
-    /// argument list is offered command names (PR #291 review, 3).
+    /// The second line of a statement completes as the statement: the console loop hands `complete`
+    /// the accumulated statement, or the newline reads as a boundary.
     #[test]
     fn a_continuation_line_completes_in_the_statement_it_continues() {
         let mut i = completing();
@@ -3854,15 +3455,11 @@ x"
             alloc::vec![String::from("Documents/"), String::from("Downloads/")],
             "a continuation line was completed as if it were a new statement"
         );
-        // And a finished statement followed by a newline is still a fresh head.
         assert_eq!(i.complete("whoami\nwho").candidates, alloc::vec![String::from("whoami")]);
     }
 
-    /// A word that matches nothing leaves the line exactly as it was typed.
-    ///
-    /// The bug the `..` report actually found, and it was never about `..`: any unmatched
-    /// word was replaced by the empty common prefix. `filled` returns `None` so that the
-    /// console loop cannot do it.
+    /// A word that matches nothing leaves the line as typed; `filled` returns `None` so the console
+    /// loop cannot replace it with the empty common prefix.
     #[test]
     fn a_completion_that_matches_nothing_leaves_the_word_alone() {
         let mut i = completing();
@@ -3873,24 +3470,17 @@ x"
         }
     }
 
-    /// A word with a slash in it is a path even at the head of a stage.
-    ///
-    /// `./script.nx` and `/bin/list` are commands written as paths, and this shell has no
-    /// search path to resolve a bare name against anyway (§9h). Offering `list`, `let` and
-    /// `lower` for `/bi` would be offering names that cannot go there.
+    /// A word with a slash is a path even at the head of a stage: `./script.nx` and `/bin/list` are
+    /// commands written as paths, and there is no search path (§9h).
     #[test]
     fn a_command_written_as_a_path_completes_as_a_path() {
         let mut i = completing();
         assert_eq!(i.complete("/bi").candidates, alloc::vec![String::from("/bin/")]);
-        // …and a second Tab descends into it, which is what the trailing slash is for.
         assert_eq!(i.complete("/bin/li").candidates, alloc::vec![String::from("/bin/list")]);
     }
 
-    /// Completing does not run anything, and leaves the interpreter as it found it.
-    ///
-    /// A Tab press is not an evaluation, and the one thing that would make this unusable is
-    /// a completion with a side effect — `list_dir` on the real host opens a directory
-    /// session, so this is the assertion that it stayed a *read*.
+    /// Completing runs nothing: `list_dir` on the real host opens a directory session, so this
+    /// asserts it stayed a *read*.
     #[test]
     fn completing_runs_nothing() {
         let host = completing_host();
@@ -3904,12 +3494,8 @@ x"
         assert!(log.borrow().diagnostics.is_empty(), "completing wrote a diagnostic");
     }
 
-    /// A call in an argument list is **evaluated**, which is what the report was about.
-    ///
-    /// "`let x = age_plus_n(my_age(), 3)` won't compile because `my_age()` isn't
-    /// evaluated." It parses now, and this is the other half: the inner call runs, its
-    /// value becomes the outer call's argument, and the answer is 44 rather than a
-    /// function object or a name.
+    /// A call in an argument list is **evaluated**: the inner call runs and its value becomes the
+    /// outer call's argument.
     #[test]
     fn a_call_in_an_argument_list_is_evaluated() {
         let out =
@@ -3917,24 +3503,14 @@ x"
                 .expect("the report's own script should run");
         assert_eq!(out.as_deref(), Some("44"));
 
-        // Nested into an operator, and two deep, so the argument is not merely passed
-        // along unevaluated to something that would have called it anyway.
         let out = repl(&["def double(n) { n * 2 }", "format(\"n={}\", double(double(3)))"])
             .expect("a nested call inside an operator should run");
         assert_eq!(out.as_deref(), Some("n=12"));
     }
 
-    /// **A parenthesised expression is how you compute an external program's argument**, and
-    /// a bareword beside it stays literal.
-    ///
-    /// Both halves matter and they pull opposite ways. A bareword must not be evaluated —
-    /// `copy /home/a /home/b` names two paths, and `sort size` names a column — so argument
-    /// position lexes words, not expressions. That makes `copy src format("f-{}", i)` a parse
-    /// error and `copy src "f-" ++ i` three separate words, which is easy to mistake for "the
-    /// shell cannot compute an argument at all" (I did, 2026-09-17, and told the maintainer a
-    /// loop could not be written). Parentheses are the escape hatch, and nothing tested them
-    /// on an *external* call — the neighbouring test covers a call inside a **function**'s
-    /// argument list, which is a different grammar.
+    /// **A parenthesised expression computes an external program's argument**, and a bareword
+    /// beside it stays literal: `copy /home/a /home/b` names two paths and `sort size` a column, so
+    /// argument position lexes words. Nothing had tested the parens on an *external* call.
     #[test]
     fn a_parenthesised_argument_to_an_external_program_is_evaluated() {
         let mut h = MockHost::new();
@@ -3950,8 +3526,6 @@ x"
         assert_eq!(argv[0], ["copy", "/src", "/dst-1.png"]);
         assert_eq!(argv[2], ["copy", "/src", "/dst-3.png"]);
 
-        // And the bareword half: without the parentheses the words go through untouched,
-        // which is what makes paths and column names work.
         let mut h = MockHost::new();
         h.programs.push((String::from("copy"), 0, None));
         let log = h.log();
@@ -3965,11 +3539,8 @@ x"
         );
     }
 
-    /// Argument-position arithmetic means what it means everywhere else.
-    ///
-    /// The parser had a second copy of the binary tiers reachable only from an argument
-    /// that began with an identifier, and it folded flat — so this returned 12, not 8,
-    /// and nothing said so.
+    /// Argument-position arithmetic means what it means everywhere else (a second copy of the
+    /// binary tiers once folded flat: 12, not 8).
     #[test]
     fn arithmetic_in_an_argument_list_keeps_its_precedence() {
         let out = repl(&["let a = 2", "let b = 3", "let c = 2", "format(\"{}\", a + b * c)"])
@@ -3977,55 +3548,43 @@ x"
         assert_eq!(out.as_deref(), Some("8"), "an argument list changed what `+` and `*` mean");
     }
 
-    /// **A `def` typed at the prompt has to be callable on the next line.**
-    ///
-    /// It was not: `exec` treats `Stmt::Def` as a no-op because definitions are registered
-    /// by `hoist_defs`, which only ran from `exec_block`. A whole script therefore hoisted
-    /// and a REPL line did not, so the definition parsed, evaluated to nothing, and
-    /// vanished — "no such function" on the very next line.
+    /// **A `def` typed at the prompt has to be callable on the next line.** `exec` treats
+    /// `Stmt::Def` as a no-op because `hoist_defs` registers definitions, and it once ran only from
+    /// `exec_block`.
     #[test]
     fn a_def_typed_at_the_prompt_is_callable_afterwards() {
         let out = repl(&["def add(a, b) { a + b }", "add(1, 2)"]).expect("both lines run");
         assert_eq!(out.as_deref(), Some("3"));
     }
 
-    /// Hoisting inside one line still works, so a REPL line behaves like a script.
     #[test]
     fn defs_on_one_repl_line_hoist_like_a_script() {
         let out = repl(&["def a(n) { b(n) + 1 }\ndef b(n) { n * 2 }", "a(3)"]).expect("runs");
         assert_eq!(out.as_deref(), Some("7"));
     }
 
-    /// Redefining replaces rather than shadowing-forever, which `hoist_defs`'s `retain`
-    /// already intends — worth pinning now that the REPL can reach it.
     #[test]
     fn redefining_a_function_at_the_prompt_takes_effect() {
         let out = repl(&["def f() { 1 }", "def f() { 2 }", "f()"]).expect("runs");
         assert_eq!(out.as_deref(), Some("2"));
     }
 
-    /// **An `if` typed at the prompt shows its value.**
-    ///
-    /// §9a makes `if` expression-shaped — a block ending in one evaluates to it — but the
-    /// REPL's `should_display` asked only for `Stmt::Expr`, so the value was computed and
-    /// silently dropped. Same family as the `def` bug above: the language's rule and the
-    /// interactive path's rule had drifted apart, and only the scripted one was tested.
+    /// **An `if` typed at the prompt shows its value** (§9a): `should_display` once asked only for
+    /// `Stmt::Expr`.
     #[test]
     fn an_if_expression_shows_its_value_at_the_prompt() {
         let out = repl(&["let n = 5", "if n > 3 { \"big\" } else { \"small\" }"]).expect("runs");
         assert_eq!(out.as_deref(), Some("big"));
     }
 
-    /// The suppression that `should_display` exists for still holds: a chain ending in a
-    /// terminal operator must not echo, or the REPL prints what `display` already printed.
+    /// A chain ending in a terminal operator must not echo what `display` already printed.
     #[test]
     fn a_terminal_operator_still_suppresses_the_echo() {
         let out = repl(&["[1, 2] | display"]).expect("runs");
         assert_eq!(out, None, "`display` already printed; the REPL must not print again");
     }
 
-    /// `let` still does **not** hoist — it is tied to evaluation order, and the fix must
-    /// not have quietly made declarations of both kinds behave alike.
+    /// `let` still does **not** hoist: it is tied to evaluation order.
     #[test]
     fn let_still_does_not_hoist_across_repl_lines() {
         let mut interp = Interp::with_host(Box::new(MockHost::new()), Mode::Repl);
@@ -4048,18 +3607,14 @@ x"
         (r, log)
     }
 
-    /// §6 makes `Value` exactly what TSM1 can represent, so the environment is an
-    /// ordinary value: field access and assignment already work, with no new machinery.
     #[test]
     fn the_environment_is_an_ordinary_value() {
         let (r, _l) = run_env(MockHost::new(), env_with(&[("PWD", "/home/alice")]), "$env.PWD");
         assert_eq!(r.expect("reads").render(), "/home/alice");
     }
 
-    /// **The property this whole slice exists for.** The shell passes a stage's arguments
-    /// through *as written* and hands it the same `PWD`, so both sides resolve a relative
-    /// path identically. Pre-resolving in the shell would put the shell's reading into a
-    /// program that might read it differently.
+    /// A stage's arguments pass through *as written* with the same `PWD`, so both sides resolve a
+    /// relative path identically.
     #[test]
     fn a_spawned_stage_receives_the_environment_and_unrewritten_arguments() {
         let host = MockHost::new().with_program("list", None);
@@ -4072,8 +3627,6 @@ x"
         assert_eq!(env.values[i].as_str(), Some("/system"), "same PWD handed over");
     }
 
-    /// `cd` resolves **first** and sets `PWD` only if the path is real, so the invariant
-    /// is "PWD named something that existed" rather than "PWD is what you typed".
     #[test]
     fn cd_commits_only_to_a_path_that_exists() {
         let host = MockHost::new().with_dir("/system");
@@ -4087,7 +3640,6 @@ x"
         assert!(e.message.contains("PWD was left alone"), "{}", e.message);
     }
 
-    /// …and a relative `cd` resolves against the current `PWD`, `..` included.
     #[test]
     fn cd_accepts_a_relative_path() {
         let host = MockHost::new().with_dir("/home");
@@ -4095,8 +3647,6 @@ x"
         assert_eq!(r.expect("cd ..").render(), "/home");
     }
 
-    /// `cd` with no argument goes to `HOME`, and says so when there is none rather than
-    /// silently doing nothing.
     #[test]
     fn bare_cd_goes_home_or_explains() {
         let host = MockHost::new().with_dir("/home/alice");
@@ -4107,8 +3657,6 @@ x"
         assert!(r.expect_err("no HOME").message.contains("HOME is not set"));
     }
 
-    /// The shell's *own* lookups resolve against `PWD` — which is what closes the gap
-    /// where design §4 and §7 write `open ./data.csv`.
     #[test]
     fn the_shell_resolves_its_own_relative_paths() {
         let host = MockHost::new().with_file("/home/alice/notes.txt", "one\ntwo\n");
@@ -4116,7 +3664,6 @@ x"
         assert_eq!(r.expect("opens").render(), "2");
     }
 
-    /// With no `PWD`, a relative path fails rather than being resolved against `/`.
     #[test]
     fn without_a_pwd_a_relative_path_is_refused() {
         let host = MockHost::new().with_file("/notes.txt", "x\n");
@@ -4126,16 +3673,11 @@ x"
 
     #[test]
     fn the_deliverable_computes() {
-        // The plan's stated Part B deliverable.
         assert_eq!(rendered("let x = 2 + 3\nx"), "5");
     }
 
-    // --- `break` / `continue` (§9c) -----------------------------------------
-
-    /// The motivating case, and the reason the gap was not cosmetic: **stop at the first
-    /// match.** Before `break`, this could only be written by letting the loop run to the
-    /// end with a sentinel — `return` was the sole early exit and it leaves the whole
-    /// function, which is not available at a prompt at all.
+    /// The motivating case: **stop at the first match**. `return` was the sole early exit and it
+    /// leaves the whole function.
     #[test]
     fn break_stops_at_the_first_match() {
         assert_eq!(
@@ -4146,23 +3688,18 @@ x"
 
     #[test]
     fn break_and_continue_do_what_they_say() {
-        // `break`: 0 + 1 + 2, then out.
         assert_eq!(rendered("mut t = 0\nfor x in 0..10 {\n if x == 3 { break }\n t = t + x\n}\nt"), "3");
-        // `continue`: the odd values only.
         assert_eq!(rendered("mut t = 0\nfor x in 0..5 {\n if x % 2 == 0 { continue }\n t = t + x\n}\nt"), "4");
-        // …and in a `while`, where `break` is the only way out of `true`.
         assert_eq!(rendered("mut i = 0\nwhile true {\n i = i + 1\n if i == 3 { break }\n}\ni"), "3");
     }
 
-    /// `break` leaves **one** loop. No labels (§9c), so the outer loop keeps going —
-    /// which is the behaviour a reader assumes and therefore the one worth pinning.
+    /// `break` leaves **one** loop; there are no labels (§9c).
     #[test]
     fn break_leaves_only_the_innermost_loop() {
         assert_eq!(rendered("mut n = 0\nfor x in 0..3 {\n for y in 0..3 { break }\n n = n + 1\n}\nn"), "3");
     }
 
-    /// The regression that matters for the `Flow` change: `return` still travels *past* a
-    /// loop to leave the function. Every `match` on `Flow` is a place that can be dropped.
+    /// `return` still travels *past* a loop to leave the function.
     #[test]
     fn return_still_escapes_a_loop_and_its_function() {
         assert_eq!(
@@ -4171,16 +3708,14 @@ x"
             ),
             "5"
         );
-        // …and a loop that never returns still falls through to the last expression.
         assert_eq!(
             rendered("def first_odd(xs) {\n for x in xs {\n if x % 2 == 1 { return x }\n }\n -1\n}\nfirst_odd([2, 4])"),
             "-1"
         );
     }
 
-    /// A block whose *value* is being taken cannot also be a jump: `eval` returns a value
-    /// and has no channel for control flow. Refused with the fix in the message rather
-    /// than silently evaluating to `Null`. See `TODO(control-flow-in-expression-position)`.
+    /// A block whose *value* is taken cannot also be a jump; see
+    /// `TODO(control-flow-in-expression-position)`.
     #[test]
     fn break_where_a_value_is_expected_is_refused() {
         let e = err("for x in 0..3 {\n let y = if true { break } else { 1 }\n}");
@@ -4188,14 +3723,9 @@ x"
         assert!(e.contains("statement position"), "{e}");
     }
 
-    /// A `continue` that skips the increment is an infinite loop in every language that
-    /// has one. Here it hits the runaway backstop and says so, rather than hanging the
-    /// shell — which matters more than usual until `Ctrl-C` exists (§11h).
-    ///
-    /// The real assertion is that **`continue` still counts**: a guard incremented only on
-    /// a normally-completing body would let this run forever. The limit is lowered for the
-    /// test because proving it at ten million costs more wall-clock than the entire suite
-    /// — and this is the backstop's first coverage either way, `while`'s and the range's.
+    /// A `continue` that skips the increment hits the runaway backstop instead of hanging.
+    /// **`continue` must still count**, or a guard incremented only on a normally-completing body
+    /// runs forever. The limit is lowered because ten million iterations outcost the suite.
     #[test]
     fn a_continue_that_skips_the_increment_is_caught_not_hung() {
         let mut i = Interp::new();
@@ -4205,29 +3735,20 @@ x"
             .expect_err("a loop with no way to advance");
         assert!(e.message.contains("iteration limit"), "{}", e.message);
 
-        // The sibling guard, on materialising a range.
         let e = i.run(&crate::parse::parse_script("for x in 0..100000 { }").unwrap()).expect_err("an absurd range");
         assert!(e.message.contains("too large to iterate"), "{}", e.message);
     }
 
-    // --- keyword stages and `parse T` (§6, Part B) --------------------------
-
-    /// **§6's own examples, which is the point of this part.** Every one of them is
-    /// written mid-pipeline, and none of them ran: the parser accepted a keyword stage
-    /// and the evaluator answered "a value cannot be a pipeline stage", so ascription —
-    /// the type system's one real mechanism — was reachable only at a binding site.
+    /// §6's own examples are written mid-pipeline; the evaluator once refused a keyword stage.
     #[test]
     fn expect_and_assert_work_as_pipeline_stages() {
         assert_eq!(rendered("[1, 2] | expect List | count"), "2");
         assert_eq!(rendered("[1, 2] | assert (count > 0) | count"), "2");
-        // A mismatch still fails loud, mid-chain.
         assert!(err("[1, 2] | expect Int").contains("expected Int, got List"));
         assert!(err("[1, 2] | assert (count > 5)").contains("assertion failed"));
     }
 
-    /// `assert` is a check, not a transform (§6): it occupies the same slot as `expect`,
-    /// so the value has to keep going. Returning `Null` would end every chain it appears
-    /// in — which is what the expression form does, correctly, since there is no chain.
+    /// `assert` is a check, not a transform: the value keeps going down the chain.
     #[test]
     fn assert_passes_its_value_through() {
         assert_eq!(rendered("[1, 2, 3] | assert (count == 3) | take 2 | count"), "2");
@@ -4239,100 +3760,73 @@ x"
     fn underscore_is_the_value_in_a_stage_and_nothing_outside_one() {
         assert_eq!(rendered("[1, 2] | expect List | count"), "2");
         assert!(err("_").contains("placeholder"));
-        // …and it does not leak out of the stage that bound it.
         assert!(err("[1, 2] | expect List\n_").contains("placeholder"));
     }
 
-    /// A keyword stage reads what arrives, so it has to have something arriving — and the
-    /// two ways of getting that wrong are different mistakes and get different messages.
+    /// A keyword stage needs something arriving; the two ways to get that wrong get different
+    /// messages.
     #[test]
     fn a_keyword_stage_needs_something_arriving() {
-        // At the head of a real pipeline: nothing has flowed in yet.
         assert!(err("expect Int | count").contains("nothing is arriving"));
-        // With no pipeline at all it is not a stage, and `_` is what it always was.
         assert!(err("expect Int").contains("placeholder"));
     }
 
-    /// D4 still holds inside a predicate: a bare, argument-free name is a *binding* first
-    /// and a command second. Allowing a command head in there is what makes `count` mean
-    /// the operator; it must not make `n` stop meaning `n`.
+    /// D4 still holds inside a predicate: a bare, argument-free name is a *binding* first.
     #[test]
     fn a_binding_still_wins_inside_an_assert_predicate() {
         assert_eq!(rendered("let n = 5\n[1, 2] | assert (n > 0) | count"), "2");
         assert!(err("let n = 0\n[1, 2] | assert (n > 0)").contains("assertion failed"));
     }
 
-    /// **Conversion, the direction the language did not have.** Text read from a file, a
-    /// program, or a prompt could never become a number.
     #[test]
     fn parse_reads_text_as_a_number() {
         assert_eq!(rendered("\"42\" | parse Int"), "42");
         assert_eq!(rendered("\"-5\" | parse Int"), "-5");
         assert_eq!(rendered("\"3.5\" | parse Float"), "3.5");
-        // An Int reads as a Float; the widening is the lossless direction.
         assert_eq!(rendered("\"42\" | parse Float"), "42.0");
         assert_eq!(rendered("42 | parse Float"), "42.0");
     }
 
-    /// §6: what a number looks like to `parse` is what it looks like to the lexer — and
-    /// it is that sentence rather than a second scanner, so radix prefixes, separators
-    /// and exponents arrive without being reimplemented (§8e).
+    /// What a number looks like to `parse` is what it looks like to the lexer (§6, §8e).
     #[test]
     fn parse_accepts_exactly_the_literals_the_lexer_does() {
         assert_eq!(rendered("\"0xff\" | parse Int"), "255");
         assert_eq!(rendered("\"0b1010\" | parse Int"), "10");
         assert_eq!(rendered("\"1_000_000\" | parse Int"), "1000000");
         assert_eq!(rendered("\"1e3\" | parse Float"), "1000.0");
-        // …including what it *refuses*: no leading-zero octal, so this is ten.
         assert_eq!(rendered("\"010\" | parse Int"), "10");
     }
 
-    /// Every refusal here is a coercion that another language would have performed
-    /// silently, which is the whole reason §6 has no implicit conversion.
+    /// Every refusal here is a coercion another language would perform silently (§6).
     #[test]
     fn parse_fails_loud_on_everything_it_cannot_read() {
-        // Strict about whitespace *because* `trim` exists.
         assert!(err("\" 42 \" | parse Int").contains("whitespace"));
-        // Int and Float are different types everywhere else in this language.
         let e = err("\"3.5\" | parse Int");
         assert!(e.contains("reads as a Float"), "{e}");
         assert!(err("\"abc\" | parse Int").contains("cannot parse"));
-        // No `1`/`yes`/`on` — the list every config language got wrong.
         assert_eq!(rendered("\"true\" | parse Bool"), "true");
         assert!(err("\"yes\" | parse Bool").contains("only \"true\" and \"false\""));
-        // Precision loss is a fabricated number by another name (§8a).
         assert!(err("9007199254740993 | parse Float").contains("losing precision"));
-        // And the other direction names the verb that does do it.
         assert!(err("42 | parse String").contains("format"));
     }
 
-    /// A value that is already a `T` reads as one — the identity case, not a special one.
     #[test]
     fn parse_of_the_type_it_already_is_passes_through() {
         assert_eq!(rendered("42 | parse Int"), "42");
         assert_eq!(rendered("\"x\" | parse String"), "x");
-        // Null needs the nullable form, exactly as an ascription does (§9e).
         assert_eq!(rendered("null | parse Int?"), "null");
         assert!(err("null | parse Int").contains("annotate `Int?`"));
     }
 
-    /// The round trip that says the two halves meet: a value rendered to text and read
-    /// back is the value again.
     #[test]
     fn format_and_parse_round_trip() {
         assert_eq!(rendered("format(\"{}\", 42) | parse Int"), "42");
         assert_eq!(rendered("format(\"{}\", 2.5) | parse Float"), "2.5");
     }
 
-    // --- errors: `fail`, kinds, `e.stages`, `exit` (§2, §11f, Part C) -------
-
-    /// **The half `try`/`catch` was missing.** A `def` could validate its arguments and
-    /// could not say what was wrong with them: the only in-language failure was `assert`,
-    /// whose message is permanently "assertion failed".
     #[test]
     fn fail_raises_a_catchable_error_with_a_message() {
         assert_eq!(rendered("try { fail \"bad path\" } catch (e) { e.message }"), "bad path");
-        // …and it travels out of a `def`, which is the case that matters.
         assert_eq!(
             rendered(
                 "def check(n) {\n if n < 0 { fail \"negative\" }\n n\n}\ntry { check(-1) } catch (e) { e.message }"
@@ -4341,9 +3835,8 @@ x"
         );
     }
 
-    /// A Record is raised as the error *value*, so a caller can match on more than a
-    /// message (§9f) — and must carry one, since an error without a message is the vague
-    /// failure §6 spends its schema diff on.
+    /// A Record is raised as the error *value*, so a caller can match on more than a message;
+    /// it must carry one, since an error without a message is the vague failure §6 avoids.
     #[test]
     fn fail_can_raise_a_record_and_demands_a_message() {
         assert_eq!(
@@ -4357,8 +3850,6 @@ x"
         assert!(err("fail 42").contains("String message or a Record"));
     }
 
-    /// §2's vocabulary, at each site that raises one. Matching on `kind` is only worth
-    /// doing if the kinds are actually distinct.
     #[test]
     fn each_kind_of_failure_names_itself() {
         let kind = |src: &str| rendered(&alloc::format!("try {{ {src} }} catch (e) {{ e.kind }}"));
@@ -4368,15 +3859,14 @@ x"
         assert_eq!(kind("let x: Int = \"s\""), "TypeError");
     }
 
-    /// §6's subset match is what makes the vocabulary extensible: a `catch` that reads
-    /// only `message` keeps working when a kind is added.
+    /// §6's subset match makes the vocabulary extensible: a `catch` reading only `message`
+    /// keeps working when a kind is added.
     #[test]
     fn a_catch_that_reads_only_the_message_is_unaffected_by_kinds() {
         assert_eq!(rendered("try { assert (false) } catch (e) { e.message }"), "assertion failed");
     }
 
-    /// **`exit` is a control outcome, not an error** (§11f) — and `catch` must not swallow
-    /// it, or leaving a shell becomes something a script prevents by accident.
+    /// **`exit` is a control outcome, not an error** (§11f): `catch` must not swallow it.
     #[test]
     fn exit_is_not_catchable_and_carries_its_status() {
         let mut i = Interp::new();
@@ -4386,11 +3876,9 @@ x"
         assert!(e.is_exit(), "a catch swallowed `exit`");
         assert_eq!(e.exit, Some(3));
 
-        // A bare `exit` is status 0…
         let mut i = Interp::new();
         let e = i.run(&crate::parse::parse_script("exit").unwrap()).expect_err("exit");
         assert_eq!(e.exit, Some(0));
-        // …and it leaves a `def` too, rather than stopping at the boundary.
         let mut i = Interp::new();
         let e = i.run(&crate::parse::parse_script("def quit() { exit 7 }\nquit()").unwrap()).expect_err("exit");
         assert_eq!(e.exit, Some(7));
@@ -4401,65 +3889,50 @@ x"
         assert!(err("exit \"now\"").contains("status Int"));
     }
 
-    // --- `try` is an expression (§9c) ---------------------------------------
-
-    /// The point of the change: a failure can produce a fallback **value**, chosen by the
-    /// catch branch — which is strictly more than a propagation operator could offer,
-    /// since the branch sees the error.
+    /// A failure can produce a fallback **value** chosen by the catch branch, which sees the error.
     #[test]
     fn try_catch_produces_a_value() {
         assert_eq!(rendered("let n = try { \"x\" | parse Int } catch { 8080 }\nn"), "8080");
         assert_eq!(rendered("let n = try { \"42\" | parse Int } catch { 8080 }\nn"), "42");
-        // The branch can vary the answer by what went wrong.
         assert_eq!(
             rendered("let n = try { fail \"nope\" } catch (e) { if e.kind == \"Error\" { 1 } else { 2 } }\nn"),
             "1"
         );
     }
 
-    /// Statement position must keep working, and that is not automatic: `try` is now an
-    /// expression, and control flow cannot leave one. It is evaluated through a
-    /// `Flow`-returning path from `exec` for exactly this reason.
+    /// Statement position must keep working: control flow cannot leave an expression, so `exec`
+    /// evaluates `try` through a `Flow`-returning path.
     #[test]
     fn control_flow_still_escapes_a_try_in_statement_position() {
-        // `continue` from a catch reaches the loop.
         assert_eq!(
             rendered("mut n = 0\nfor x in 0..4 {\n try { fail \"x\" } catch { continue }\n n = n + 1\n}\nn"),
             "0"
         );
-        // `return` from a try body leaves the function.
         assert_eq!(rendered("def f() {\n try { return 5 } catch { 0 }\n 9\n}\nf()"), "5");
-        // `break` from a catch leaves the loop.
         assert_eq!(rendered("mut n = 0\nfor x in 0..4 {\n n = n + 1\n try { fail \"x\" } catch { break }\n}\nn"), "1");
     }
 
-    /// …and in *value* position it is refused rather than silently dropped, which is the
-    /// wall `TODO(control-flow-in-expression-position)` describes.
+    /// In *value* position it is refused rather than silently dropped
+    /// (`TODO(control-flow-in-expression-position)`).
     #[test]
     fn control_flow_inside_a_try_used_as_a_value_is_refused() {
         let e = err("for x in 0..3 {\n let y = try { fail \"x\" } catch { break }\n}");
         assert!(e.contains("where a value is expected"), "{e}");
     }
 
-    // --- sequences and reduction (§10b, Part D) -----------------------------
-
-    /// **A String is a sequence of its characters**, which is where length, substring and
-    /// slicing come from — without a second vocabulary of string-only verbs.
+    /// **A String is a sequence of its characters**, which gives length, substring and slicing
+    /// without a second vocabulary of string-only verbs.
     #[test]
     fn a_string_is_a_sequence_of_its_characters() {
         assert_eq!(rendered("\"hello\" | count"), "5");
         assert_eq!(rendered("\"hello\" | take 3"), "hel");
         assert_eq!(rendered("\"hello\" | skip 2 | take 2"), "ll");
         assert_eq!(rendered("\"hello\" | last 2"), "lo");
-        // The shape it went in is the shape it comes back: a filtered String is a String.
         assert_eq!(rendered("\"banana\" | filter { |c| c != \"a\" }"), "bnn");
-        // …and mapping to something that is not text falls back to a List, the same rule a
-        // ragged table already takes.
         assert_eq!(rendered("\"ab\" | map { |c| 1 }"), "[1, 1]");
     }
 
-    /// A Range's elements are its values — so a range can be summed, filtered and counted
-    /// without first being written out as a list.
+    /// A Range's elements are its values, so it can be summed or filtered without a list.
     #[test]
     fn a_range_is_a_sequence_of_its_values() {
         assert_eq!(rendered("0..5 | count"), "5");
@@ -4468,41 +3941,33 @@ x"
         assert_eq!(rendered("0..10 | filter { |n| n % 3 == 0 } | count"), "4");
     }
 
-    /// A scalar is still not a sequence: silently treating `5` as `[5]` is the coercion §6
-    /// spends its fail-loud rule on.
+    /// A scalar is still not a sequence: treating `5` as `[5]` is the coercion §6 refuses.
     #[test]
     fn a_scalar_is_still_not_a_sequence() {
         let e = err("5 | count");
         assert!(e.contains("scalar is not one"), "{e}");
-        // A Record is one *thing*, not rows — "its keys or its pairs?" has no right answer,
-        // and `keys`/`values` (Part E) answer both without the operator guessing.
         assert!(err("{ a: 1 } | count").contains("scalar is not one"));
     }
 
-    /// The reductions `count` was alone in. Without them "the total size of these files"
-    /// needs a `mut` and a `for` loop.
     #[test]
     fn reductions_fold_a_sequence_to_a_value() {
         assert_eq!(rendered("[1, 2, 3] | sum"), "6");
         assert_eq!(rendered("[3, 1, 2] | min"), "1");
         assert_eq!(rendered("[3, 1, 2] | max"), "3");
         assert_eq!(rendered("[1, 2] | avg"), "1.5");
-        // A bareword names a column, the same reading `sort size` has.
         let src = "[{ n: \"a\", size: 10 }, { n: \"b\", size: 32 }]";
         assert_eq!(rendered(&alloc::format!("{src} | sum size")), "42");
         assert_eq!(rendered(&alloc::format!("{src} | max size")), "32");
         assert_eq!(rendered(&alloc::format!("{src} | avg size")), "21.0");
     }
 
-    /// `avg` is always a Float, even over Ints — the alternative truncates silently — and
-    /// a sum that overflows is an error rather than a wrapped, fabricated total (§8a).
+    /// `avg` is always a Float, and a sum that overflows is an error rather than a wrapped total (§8a).
     #[test]
     fn reductions_do_not_fabricate_numbers() {
         assert_eq!(rendered("[1, 2] | avg"), "1.5");
         assert_eq!(rendered("[2, 4] | avg"), "3.0");
         assert!(err("[9223372036854775807, 1] | sum").contains("overflows"));
         assert!(err("[1, \"x\"] | sum").contains("needs numbers"));
-        // Mixed types are an error, not an ordering invented at the point of comparison.
         assert!(err("[1, \"x\"] | max").contains("cannot order"));
     }
 
@@ -4515,45 +3980,32 @@ x"
         assert!(err("[] | avg").contains("no divisor"));
     }
 
-    /// `reduce` has two forms because they differ *precisely* on the empty case.
+    /// `reduce` has two forms because they differ precisely on the empty case.
     #[test]
     fn reduce_folds_with_and_without_a_seed() {
         assert_eq!(rendered("[1, 2, 3] | reduce { |a, b| a + b }"), "6");
         assert_eq!(rendered("[1, 2, 3] | reduce --from 10 { |a, b| a + b }"), "16");
-        // Seeded returns the seed for an empty sequence; unseeded has nothing to return.
         assert_eq!(rendered("[] | reduce --from 10 { |a, b| a + b }"), "10");
         assert!(err("[] | reduce { |a, b| a + b }").contains("has no value"));
-        // …and it is not numeric-only: folding text is the same operation.
         assert_eq!(rendered("[\"a\", \"b\", \"c\"] | reduce { |a, b| a ++ \"-\" ++ b }"), "a-b-c");
     }
 
-    /// `sort` uses **every** key it is given: the second is a tie-break within the first.
-    /// Taking the first and discarding the rest is neither acceptable behaviour.
     #[test]
     fn sort_uses_every_key_it_is_given() {
         let src = "[{ d: 2, n: \"b\" }, { d: 1, n: \"z\" }, { d: 2, n: \"a\" }]";
         assert_eq!(rendered(&alloc::format!("{src} | sort d n | map {{ |r| r.n }}")), "[\"z\", \"a\", \"b\"]");
-        // **The pair is what makes this test mean anything.** With only the first key the
-        // sort is stable, so the two `d: 2` rows keep their input order — a different
-        // answer, and exactly the one the multi-key case would give if the second key were
-        // being silently dropped.
+        // The pair makes the test mean something: with only the first key a stable sort keeps input
+        // order for the two `d: 2` rows.
         assert_eq!(rendered(&alloc::format!("{src} | sort d | map {{ |r| r.n }}")), "[\"z\", \"b\", \"a\"]");
     }
 
-    /// `format` in stage position formats the value flowing past it. It used to ignore the
-    /// operand and then report the template's own `{}` as a missing argument.
     #[test]
     fn format_in_stage_position_formats_its_operand() {
         assert_eq!(rendered("42 | format(\"n={}\")"), "n=42");
         assert_eq!(rendered("[1, 2] | count | format(\"{} rows\")"), "2 rows");
-        // The explicit form is unchanged.
         assert_eq!(rendered("format(\"{} {}\", 1, 2)"), "1 2");
     }
 
-    // --- strings, records, numbers, `in` (§10b, Part E) ---------------------
-
-    /// v1.1 could *test* text with `~=` and never take it apart. `split`/`join` are the
-    /// inverse pair; `trim` is what makes `parse`'s strictness workable (§6).
     #[test]
     fn strings_can_be_taken_apart_and_put_back() {
         assert_eq!(rendered("\"a,b,c\" | split \",\" | count"), "3");
@@ -4562,47 +4014,35 @@ x"
         assert_eq!(rendered("\"a-b\" | replace \"-\" \"+\""), "a+b");
         assert_eq!(rendered("\"Ab\" | upper"), "AB");
         assert_eq!(rendered("\"Ab\" | lower"), "ab");
-        // The pair that closes Part B's loop: trim, then parse.
         assert_eq!(rendered("\" 42 \" | trim | parse Int"), "42");
     }
 
-    /// `join` renders its elements the way `++` does, so one definition of "this value as
-    /// text" serves both rather than two that disagree.
     #[test]
     fn join_renders_the_way_concatenation_does() {
         assert_eq!(rendered("[1, 2] | join \",\""), "1,2");
         assert_eq!(rendered("[1, 2] | join \",\""), rendered("1 ++ \",\" ++ 2"));
     }
 
-    /// An empty separator is refused rather than quietly meaning "characters" — the String
-    /// is already a sequence of those (§10b).
+    /// An empty separator is refused rather than quietly meaning "characters" (§10b).
     #[test]
     fn split_refuses_an_empty_separator() {
         assert!(err("\"ab\" | split \"\"").contains("already a sequence"));
         assert!(err("42 | trim").contains("works on a String"));
     }
 
-    /// A Record was readable by known field name only, so nothing could walk one it did
-    /// not itself write.
     #[test]
     fn records_can_be_walked_and_merged() {
         assert_eq!(rendered("{ a: 1, b: 2 } | keys"), "[\"a\", \"b\"]");
         assert_eq!(rendered("{ a: 1, b: 2 } | values"), "[1, 2]");
-        // The right operand wins a conflict; the result schema is the union, and a merge
-        // does not reorder what it did not change.
         assert_eq!(rendered("{ a: 1, b: 2 } | merge { b: 9, c: 3 }"), "{ a: 1, b: 9, c: 3 }");
-        // …and `keys` is what makes a record walkable at all, since `for` deliberately
-        // does not iterate one (§10b).
         assert_eq!(rendered("{ a: 1, b: 2 } | keys | join \"+\""), "a+b");
     }
 
-    /// Float → Int, named by **which way** it loses information (§6). A cast that silently
-    /// truncated would be the one fabricated value left standing.
+    /// Float → Int, named by **which way** it loses information (§6).
     #[test]
     fn rounding_says_which_direction_it_loses() {
         assert_eq!(rendered("2.4 | round"), "2");
         assert_eq!(rendered("2.5 | round"), "3");
-        // Half **away from zero**, which is the half of this rule that needed saying.
         assert_eq!(rendered("-2.5 | round"), "-3");
         assert_eq!(rendered("2.9 | floor"), "2");
         assert_eq!(rendered("-2.1 | floor"), "-3");
@@ -4612,19 +4052,16 @@ x"
         assert_eq!(rendered("2.9 | trunc"), "2");
     }
 
-    /// `abs` keeps its type, since it loses nothing — and refuses the one Int that has no
-    /// positive counterpart rather than wrapping to itself (§8a).
+    /// `abs` keeps its type and refuses the one Int with no positive counterpart (§8a).
     #[test]
     fn abs_keeps_its_type_and_refuses_to_wrap() {
         assert_eq!(rendered("-3 | abs"), "3");
         assert_eq!(rendered("-2.5 | abs"), "2.5");
         assert!(err("-9223372036854775808 | abs").contains("overflows"));
-        // A Float too large for an Int is refused rather than saturating.
         assert!(err("1e30 | round").contains("cannot turn"));
     }
 
-    /// **Membership is an infix comparison** (§8a), because that is where the question is
-    /// asked. The trap it has to survive is the other `in`.
+    /// **Membership is an infix comparison** (§8a); the trap is the other `in`, in `for`.
     #[test]
     fn in_tests_membership_and_does_not_collide_with_for() {
         assert_eq!(rendered("1 in [1, 2]"), "true");
@@ -4632,73 +4069,54 @@ x"
         assert_eq!(rendered("\"ell\" in \"hello\""), "true");
         assert_eq!(rendered("\"a\" in { a: 1 }"), "true");
         assert_eq!(rendered("\"z\" in { a: 1 }"), "false");
-        // A Range answers without materialising ten million values to look at one.
         assert_eq!(rendered("5 in 0..10"), "true");
         assert_eq!(rendered("10 in 0..10"), "false");
         assert_eq!(rendered("10 in 0..=10"), "true");
 
-        // **The pair that matters**: both `in`s in one script. `for` consumes its own
-        // before any expression is parsed, which is true until someone reorders the parser.
+        // **The pair that matters**: both `in`s in one script; `for` consumes its own first.
         assert_eq!(rendered("mut hits = 0\nfor x in [1, 2, 3] {\n if x in [2, 3] { hits = hits + 1 }\n}\nhits"), "2");
     }
 
-    /// It composes with the reductions, which is the point of having both: a question about
-    /// a stream reads as one line rather than a loop.
     #[test]
     fn membership_composes_with_the_rest() {
         assert_eq!(rendered("[{ n: \"a\" }, { n: \"b\" }] | filter { |r| r.n in [\"b\"] } | count"), "1");
     }
 
-    // --- `capture` (§10b, Part F) -------------------------------------------
-
-    /// `~=` answers yes or no, so text that matched could not be taken apart. This is the
-    /// half that could not be written without engine work.
     #[test]
     fn capture_returns_the_match_and_its_groups() {
         assert_eq!(rendered("\"a12b\" | capture /(\\d+)/"), "[\"12\", \"12\"]");
         assert_eq!(rendered("\"12-345\" | capture /(\\d+)-(\\d+)/"), "[\"12-345\", \"12\", \"345\"]");
-        // Element 0 is always the whole match, even with no groups at all.
         assert_eq!(rendered("\"abc\" | capture /b./"), "[\"bc\"]");
     }
 
-    /// **No match is `null`, not an error** — an ordinary answer that `??` and `== null`
-    /// already handle (§9e), and the reason `capture` composes with the rest.
+    /// **No match is `null`, not an error**: an ordinary answer that `??` and `== null` handle (§9e).
     #[test]
     fn no_match_is_null_and_composes() {
         assert_eq!(rendered("\"abc\" | capture /(\\d+)/"), "null");
         assert_eq!(rendered("(\"abc\" | capture /(\\d+)/) ?? [\"none\"]"), "[\"none\"]");
-        // The shape §10b writes: capture, then read a group, then convert it.
         assert_eq!(rendered("let g = \"port 8080\" | capture /(\\d+)/\ng[1] | parse Int"), "8080");
     }
 
-    /// A group that did not participate is `null`. "Did not match" is not "matched
-    /// nothing", and a shell that conflated them would make the two indistinguishable.
+    /// A group that did not participate is `null`: "did not match" is not "matched nothing".
     #[test]
     fn a_group_that_did_not_participate_is_null() {
         assert_eq!(rendered("\"b\" | capture /(a)|(b)/"), "[\"b\", null, \"b\"]");
     }
 
-    /// A pattern only lexes as one where a pattern can go (D3): after `~=`, and now after
-    /// `capture`. Everywhere else a leading `/` is still a path and an infix one division —
-    /// the property that made `list /` and `6 / 2` work as a pair.
+    /// A pattern only lexes as one where a pattern can go (D3): after `~=` and `capture`.
     #[test]
     fn a_regex_literal_still_only_lexes_where_a_pattern_belongs() {
         assert_eq!(rendered("6 / 2"), "3");
         assert_eq!(rendered("\"x.rs\" ~= /\\.rs$/"), "true");
-        // …and `capture` refuses what it cannot work on rather than guessing.
         assert!(err("42 | capture /x/").contains("works on a String"));
     }
-
-    // --- interrupting an evaluation (§11h, Part G) --------------------------
 
     fn interrupted_after(n: u32, src: &str) -> EvalError {
         let mut i = Interp::with_host(Box::new(MockHost::new().with_interrupt_after(n)), Mode::Script);
         i.run(&crate::parse::parse_script(src).unwrap()).expect_err("interrupted")
     }
 
-    /// **The hazard §11h exists for.** `while true { }` has no exit and, until the tty
-    /// delivers an interrupt, no way to be stopped — on a system with no `SIGINT` that
-    /// meant a reboot.
+    /// `while true { }` has no exit and, with no `SIGINT`, would need a reboot (§11h).
     #[test]
     fn an_endless_loop_can_be_interrupted() {
         let e = interrupted_after(5, "while true { }");
@@ -4706,8 +4124,7 @@ x"
         assert_eq!(e.message, "interrupted");
     }
 
-    /// The checkpoint is at statement boundaries and between iterations, so a loop with an
-    /// **empty body** is still interruptible — the case a per-statement check alone misses.
+    /// The checkpoint covers a loop with an **empty body**, which a per-statement check misses.
     #[test]
     fn the_checkpoint_covers_both_loop_forms_and_empty_bodies() {
         assert_eq!(interrupted_after(3, "while true { }").kind, INTERRUPTED);
@@ -4715,9 +4132,7 @@ x"
         assert_eq!(interrupted_after(3, "mut n = 0\nwhile true {\n n = n + 1\n}").kind, INTERRUPTED);
     }
 
-    /// It unwinds as an ordinary error, so a script still gets to clean up — being
-    /// interrupted is something that *happens to* a script, and `try`/`catch` is how a
-    /// script responds to things that happen to it.
+    /// It unwinds as an ordinary error, so a script can clean up; `exit` is not catchable.
     #[test]
     fn an_interrupt_is_catchable_unlike_exit() {
         let mut i = Interp::with_host(Box::new(MockHost::new().with_interrupt_after(4)), Mode::Script);
@@ -4727,8 +4142,6 @@ x"
         assert_eq!(v.render(), "Interrupted");
     }
 
-    /// An evaluation that finishes before the interrupt arrives is unaffected — the
-    /// checkpoint is a question, not a poll that can fire late.
     #[test]
     fn an_evaluation_that_finishes_first_is_untouched() {
         let mut i = Interp::with_host(Box::new(MockHost::new().with_interrupt_after(1000)), Mode::Script);

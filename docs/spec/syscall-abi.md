@@ -238,7 +238,7 @@ fn sys_wait(
 ```
 Blocks until at least one handle in `handles[0..count]` signals, or until `deadline` (absolute monotonic nanoseconds) passes. Special deadline values: `0` = poll, `u64::MAX` = no timeout. Writes one `IoResult` per signaled handle to `results`. Returns the count of signaled handles (positive), `TimedOut` if the deadline elapsed with nothing signaled, or `WouldBlock` for a poll (`deadline == 0`) that found nothing ready. (Syscall number `10`.)
 
-**Implemented for `Timer`, `NotificationChannel`, `IpcChannel`, and `PendingOperation` handles** (a notification channel is signaled when its queue is non-empty; an IPC endpoint when its receive ring is non-empty or its peer has closed; a `PendingOperation` when its operation completes — its completion `status` is written to the `IoResult`); `Process` (exit) returns `Unsupported` until its slice lands. `count` is capped at `MAX_WAIT_HANDLES` (**32** since 2026-07-29; 8 before). That constant is
+**Implemented for `Timer`, `NotificationChannel`, `IpcChannel`, `PendingOperation` and `InterruptObject` handles** (a notification channel is signaled when its queue is non-empty; an IPC endpoint when its receive ring is non-empty or its peer has closed; a `PendingOperation` when its operation completes — its completion `status` is written to the `IoResult`; an `InterruptObject` when its interrupt has fired, which the wait consumes); `Process` (exit) returns `Unsupported` until its slice lands. `count` is capped at `MAX_WAIT_HANDLES` (**32** since 2026-07-29; 8 before). That constant is
 the **fan-out limit of every resource server**: a server holding a channel per client waits
 on its serving endpoint plus one slot per client, so it serves at most `MAX_WAIT_HANDLES - 1`
 of them at once. It is a fixed per-thread array (so registering a wait never allocates under
@@ -430,7 +430,7 @@ The image (`args.image`) is a **`MemoryObject` handle** holding the child's ELF:
 ```rust
 fn sys_thread_create(args: UserPtr<ThreadArgs>) -> isize
 ```
-Creates a new thread in the **calling process** and returns a `Thread` handle (`SIGNAL | TERMINATE | INSPECT | DUPLICATE`). The new thread begins at `args.entry` (ring 3) with `rsp = args.user_sp` and `rdx = args.arg0`; the caller owns the user stack (allocate + map it via `sys_memory_create` / `sys_memory_map`, pass its top). `entry`/`user_sp` must be non-null user-half addresses — that they are *mapped* is the caller's responsibility. See [ThreadArgs spec](thread-args.md). (Syscall number `19`.) This is the supervisor primitive behind exception handling: a sibling thread holds a faulting thread's handle and acts on it via `sys_thread_get_registers` / `sys_exception_resume`.
+Creates a new thread in the **calling process** and returns a `Thread` handle (`SIGNAL | TERMINATE | INSPECT | DUPLICATE`). The new thread begins at `args.entry` (ring 3) with `rsp = args.user_sp` and `rcx = args.arg0`; the caller owns the user stack (allocate + map it via `sys_memory_create` / `sys_memory_map`, pass its top). `entry`/`user_sp` must be non-null user-half addresses — that they are *mapped* is the caller's responsibility. See [ThreadArgs spec](thread-args.md). (Syscall number `19`.) This is the supervisor primitive behind exception handling: a sibling thread holds a faulting thread's handle and acts on it via `sys_thread_get_registers` / `sys_exception_resume`.
 
 ```rust
 fn sys_thread_exit(status: i32) -> !

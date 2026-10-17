@@ -7,26 +7,15 @@ use core::marker::PhantomData;
 use core::ops::Range;
 use libkern::*;
 
-/// One page; the scratch buffer's size.
 const PAGE: u64 = 4096;
-/// The [`Disk`] device transfer unit: one **4 KiB filesystem block** (= one scratch
-/// page). The AHCI path does the 8-sector transfer in a single command (it computes
-/// `sector_count = length / 512`), so reading or writing a whole block costs **one**
-/// `sys_io_submit` + one completion wake, not eight — 8× fewer block-I/O round trips than
-/// the original 512-byte-sector-at-a-time path. The device's logical sector is still 512
-/// bytes; this is the I/O granularity, aligned to the 4 KiB block. See
-/// `docs/rationale/deferred-decisions.md` (fs-server 4 KiB-block I/O). The ext4 fs is
-/// 4 KiB-block-aligned within a partition ≥ its size, so a covering-block access never
-/// runs past the device.
+/// The [`Disk`] transfer unit: one **4 KiB filesystem block** in **one** `sys_io_submit`. The
+/// ext4 fs is block-aligned within a partition at least its size, so a covering-block access
+/// never runs past the device.
 const IO_BLOCK: usize = 4096;
 
-/// Wait on one `PendingOperation`, then read its `(status, result)` (`IoResult`: status @8,
-/// result @16) and close it.
-///
-/// **On buffers of its own** (Phase 6 Part E.1). Until the loop moved here this used the server
-/// loop's wait arrays, and a read made while the loop was walking a batch of results overwrote
-/// the batch's first record: one extra trip round the loop, since a handle so lost was still
-/// signalled the next time. `File::Forget` already waited on its own for that reason.
+/// Wait on one `PendingOperation`, read its `(status, result)` (`IoResult`: status @8, result
+/// @16) and close it. **On buffers of its own**: it must not overwrite the batch of results the
+/// server loop is walking.
 pub fn po_wait(po: u64) -> (i32, u64) {
     let handles = [po];
     let mut results = [0u8; WAIT_RESULT_SIZE];
@@ -48,37 +37,23 @@ pub fn po_wait(po: u64) -> (i32, u64) {
     if waited != 1 { (-1, 0) } else { (status, result) }
 }
 
-/// A [`BlockReader`]/[`BlockWriter`] over the block device: each `read_at` reads the
-/// covering **4 KiB blocks** via `sys_io_submit` into a one-page scratch `MemoryObject`
-/// (mapped R/W) and copies the requested sub-range out; `write_at` is a per-block
-/// read-modify-write. One `sys_io_submit` per 4 KiB block (the AHCI path does the 8-sector
-/// transfer in a single command), not one per 512-byte sector — 8× fewer block-I/O round
-/// trips, which is what made the same-CPU wake latency so acute (see the decision log,
-/// 2026-07-23). The parser's individual reads are small (≤ one 4 KiB filesystem block).
-///
-/// **One block per `sys_io_submit` was a suspect in `TODO(fs-throughput)`**, which Phase 6
-/// Part H measured on the laptop and closed. Metadata reads now reach it through the server's
-/// cache, and a grow's zeroes go 64 KiB a command; what still comes through a block at a time is
-/// the metadata a mutation writes, each change as it is made (`TODO(ext4-metadata-writes)` in
-/// `docs/rationale/deferred-decisions.md`).
+/// A [`BlockReader`]/[`BlockWriter`] over the block device in **4 KiB blocks**, through a
+/// one-page scratch `MemoryObject`; `write_at` is a per-block read-modify-write. The metadata a
+/// mutation writes still goes a block at a time (`TODO(ext4-metadata-writes)`).
 pub struct Disk {
-    /// The block-device handle (from the setup message).
     device: u64,
-    /// A one-page scratch `MemoryObject` the device DMAs sectors into.
     scratch: u64,
-    /// `scratch`, mapped R/W into this process — where read sectors land.
     scratch_addr: u64,
-    /// **[`SPAN`] bytes of zeroes**, a `MemoryObject` never written — created zeroed — so a grow's
-    /// zeroes go to the device in large commands ([`BlockWriter::write_zeroes`], Phase 6 Part H.4).
+    /// **[`SPAN`] bytes of zeroes**, a `MemoryObject` never written, so a grow's zeroes go to the
+    /// device in large commands.
     zeroes: u64,
-    /// **Not `Sync`**: every transfer passes through the one scratch, which two threads would
-    /// share (Phase 6 Part G.2, found moving [`PartitionIo`] beside it).
+    /// **Not `Sync`**: every transfer passes through the one scratch.
     _one_thread: PhantomData<Cell<()>>,
 }
 
-/// **How [`Disk`] writes `len` zeroes from `offset`**, as byte ranges `(head, whole, tail)`, any of
-/// them empty: the part of a block at each end, each written by `write_at`, which reads the block
-/// first, and between them whole blocks, in commands of up to [`SPAN`].
+/// **How [`Disk`] writes `len` zeroes from `offset`**, as byte ranges `(head, whole, tail)`, any
+/// empty: the part of a block at each end, written by `write_at`, and whole blocks between, in
+/// commands of up to [`SPAN`].
 pub fn split_zeroes(offset: u64, len: u64) -> (Range<u64>, Range<u64>, Range<u64>) {
     let end = offset + len;
     let first = offset.next_multiple_of(IO_BLOCK as u64).min(end);
@@ -87,8 +62,8 @@ pub fn split_zeroes(offset: u64, len: u64) -> (Range<u64>, Range<u64>, Range<u64
 }
 
 impl Disk {
-    /// **A disk over `device`**, with its scratch page made and mapped; or why it could not be,
-    /// as the line a server prints.
+    /// A disk over `device`, with its scratch made and mapped; or why not, as the line a server
+    /// prints.
     pub fn new(device: u64) -> Result<Disk, &'static [u8]> {
         // SAFETY: register-only syscall.
         let scratch = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
@@ -114,7 +89,6 @@ impl Disk {
         self.device
     }
 
-    /// DMA `block` (4 KiB) into the scratch object in a single command; `Io` on any failure.
     fn read_block(&self, block: u64) -> Result<(), FsError> {
         let op = IoOp {
             opcode: IO_OPCODE_READ,
@@ -136,8 +110,6 @@ impl Disk {
         Ok(())
     }
 
-    /// Write the scratch object's first 4 KiB to device `block` in a single command; `Io`
-    /// on failure.
     fn write_block(&self, block: u64) -> Result<(), FsError> {
         let op = IoOp {
             opcode: IO_OPCODE_WRITE,
@@ -180,8 +152,6 @@ impl BlockReader for Disk {
 }
 
 impl BlockWriter for Disk {
-    /// **Whole blocks in commands of up to [`SPAN`]**, from the zero span; a part of a block at
-    /// either end goes through [`write_at`](Self::write_at) ([`split_zeroes`]).
     fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
         static ZERO: [u8; IO_BLOCK] = [0; IO_BLOCK];
         let (head, whole, tail) = split_zeroes(offset, len);
@@ -212,8 +182,7 @@ impl BlockWriter for Disk {
             let block = cur / IO_BLOCK as u64;
             let in_block = (cur % IO_BLOCK as u64) as usize;
             let n = core::cmp::min(IO_BLOCK - in_block, buf.len() - done);
-            // Read-modify-write for a partial block: read it into scratch first so the
-            // untouched bytes are preserved. A full-block write skips the read.
+            // A partial block is read first so the untouched bytes are preserved.
             if n != IO_BLOCK {
                 self.read_block(block)?;
             }
@@ -231,28 +200,21 @@ impl BlockWriter for Disk {
 /// The [`SectorDisk`]'s largest transfer: 64 KiB, sixteen pages, within every block driver's
 /// fragment bound (AHCI's 248, USB storage's 64).
 pub const SPAN: usize = 64 * 1024;
-/// A sector: the unit [`SectorDisk`] aligns to.
 const SECTOR: u64 = 512;
 
-/// **The block device in sectors, many to a submit** (Phase 6 Part E.3): a [`BlockReader`] and
-/// [`BlockWriter`] that moves any 512-byte-aligned range in one `sys_io_submit` of up to [`SPAN`]
-/// bytes, through a 64 KiB scratch `MemoryObject`.
-///
-/// **For `fs-server-fat`**, whose structures are sector-aligned rather than 4 KiB-aligned, whose
-/// partition's last sectors need not fill a 4 KiB block, and whose write path batches — a grow
-/// zeroes what it adds 64 KiB at a time, and the FAT's dirty sectors go out a run at a time. A
-/// write that is not sector-aligned reads its edge sectors first. **`fs-server-ext4` keeps
-/// [`Disk`]**, so Phase 6 Part H measures it as it is.
+/// **The block device in sectors, many to a submit**: any 512-byte-aligned range in one
+/// `sys_io_submit` of up to [`SPAN`] bytes. **For `fs-server-fat`**, whose structures are
+/// sector-aligned and whose partition's last sectors need not fill a 4 KiB block. A write that is
+/// not sector-aligned reads its edge sectors first.
 pub struct SectorDisk {
     device: u64,
     scratch: u64,
     scratch_addr: u64,
-    /// Not `Sync`, as [`Disk`] is not.
     _one_thread: PhantomData<Cell<()>>,
 }
 
 impl SectorDisk {
-    /// **A disk over `device`**, with its 64 KiB scratch made and mapped; or why it could not be.
+    /// A disk over `device`, with its 64 KiB scratch made and mapped; or why not.
     pub fn new(device: u64) -> Result<SectorDisk, &'static [u8]> {
         // SAFETY: register-only syscall.
         let scratch = unsafe { syscall4(SYS_MEMORY_CREATE, SPAN as u64, 0, 0, 0) };
@@ -273,8 +235,6 @@ impl SectorDisk {
         self.device
     }
 
-    /// Move `len` bytes, sector-aligned and at most [`SPAN`], between device byte `at` and the
-    /// scratch's start, in one submit.
     fn transfer(&self, opcode: u32, at: u64, len: usize) -> Result<(), FsError> {
         let op = IoOp { opcode, flags: 0, buffer: self.scratch, buf_offset: 0, offset: at, length: len as u64 };
         // SAFETY: `device` is a block DeviceNode with READ (and WRITE for a write); `&op` is valid.
@@ -289,7 +249,6 @@ impl SectorDisk {
         Ok(())
     }
 
-    /// Copy scratch bytes `[from, from + dst.len())` out into `dst`.
     fn copy_out(&self, from: usize, dst: &mut [u8]) {
         assert!(from + dst.len() <= SPAN);
         // SAFETY: `scratch_addr` maps `SPAN` bytes R/W for this process's life, and the range is
@@ -299,7 +258,6 @@ impl SectorDisk {
         };
     }
 
-    /// Copy `src` into scratch bytes `[from, from + src.len())`.
     fn copy_in(&self, from: usize, src: &[u8]) {
         assert!(from + src.len() <= SPAN);
         // SAFETY: as for `copy_out`, the other way.
@@ -356,42 +314,29 @@ impl BlockWriter for SectorDisk {
 }
 
 /// The [`PartitionIo`]'s scratch, and so its largest transfer: 128 KiB, within every block
-/// driver's fragment bound, as [`SPAN`] is. Larger than the 64 KiB `nxinstall`'s copy hands over
-/// at once, so a file's data crosses in one transfer rather than two.
+/// driver's fragment bound. Larger than the 64 KiB `nxinstall`'s copy hands over at once.
 pub const WINDOW_SPAN: usize = 128 * 1024;
 
-/// **A window onto a device** (Phase 6 Part G.2): a [`BlockReader`] and [`BlockWriter`] over
-/// `[base, base + len)` of a block device, which a filesystem library addresses from byte 0 — what a
-/// program making a filesystem on a disk it holds writes through, where a server is handed a
-/// partition of its own.
-///
-/// **`nxinstall`'s, until `disk --format` needed it too**: a helper with two consumers belongs below
-/// both. A range past the window is refused rather than reaching the neighbouring partition. Any
-/// byte range is turned into the sector-aligned transfers `sys_io_submit` takes, read first where a
-/// write covers a sector only in part, since a filesystem writes 32-byte group descriptors and
-/// 256-byte inodes, and a device moves 512-byte sectors.
-///
-/// **One scratch object for both directions**, made and mapped by [`PartitionIo::new`] and
-/// unmapped when the window is dropped, so a copy costs a fixed amount of memory whatever the size
-/// of the disk. **Not `Sync`**, as the device types above are not: every transfer passes through
-/// the one scratch, which two threads would share.
+/// **A window onto a device**: `[base, base + len)` of a block device, addressed from byte 0 — for
+/// a program making a filesystem on a disk it holds. A range past the window is refused rather
+/// than reaching the neighbouring partition. Any byte range becomes sector-aligned transfers,
+/// read first where a write covers a sector only in part (a filesystem writes 32-byte
+/// descriptors, a device moves 512-byte sectors). **One scratch object for both directions**,
+/// unmapped on drop. **Not `Sync`**: every transfer passes through the one scratch.
 pub struct PartitionIo {
-    /// The block-device handle, with read and write.
     device: u64,
     /// Byte offset of the window's first sector on that device.
     base: u64,
-    /// The window's length in bytes.
     len: u64,
-    /// A `MemoryObject` of [`WINDOW_SPAN`] bytes every transfer passes through.
+    /// A `MemoryObject` of [`WINDOW_SPAN`] bytes.
     scratch: u64,
-    /// `scratch`, mapped read-write into this process.
     scratch_addr: u64,
     _one_thread: PhantomData<Cell<()>>,
 }
 
 impl PartitionIo {
-    /// **A window onto `device`'s `[base, base + len)` bytes**, `base` sector-aligned, with its
-    /// scratch made and mapped; or `None` if the scratch could not be.
+    /// A window onto `device`'s `[base, base + len)` bytes, `base` sector-aligned; `None` if the
+    /// scratch could not be made.
     pub fn new(device: u64, base: u64, len: u64) -> Option<PartitionIo> {
         // SAFETY: register-only syscall.
         let scratch = unsafe { syscall4(SYS_MEMORY_CREATE, WINDOW_SPAN as u64, 0, 0, 0) };
@@ -410,8 +355,6 @@ impl PartitionIo {
         Some(PartitionIo { device, base, len, scratch, scratch_addr: addr as u64, _one_thread: PhantomData })
     }
 
-    /// Move `length` bytes between the device at `offset` and the scratch's start. `offset` and
-    /// `length` are sector-aligned and `length` is at most [`WINDOW_SPAN`].
     fn submit(&self, opcode: u32, offset: u64, length: u64) -> Result<(), FsError> {
         let op = IoOp { opcode, flags: 0, buffer: self.scratch, buf_offset: 0, offset, length };
         // SAFETY: `device` is a block device handle held by this process; `&op` is a valid `IoOp`
@@ -427,7 +370,6 @@ impl PartitionIo {
         Ok(())
     }
 
-    /// Copy scratch bytes `[from, from + dst.len())` out into `dst`.
     fn copy_out(&self, from: usize, dst: &mut [u8]) {
         assert!(from + dst.len() <= WINDOW_SPAN);
         // SAFETY: `new` mapped `WINDOW_SPAN` read-write bytes at `scratch_addr`, which stay mapped
@@ -437,7 +379,6 @@ impl PartitionIo {
         };
     }
 
-    /// Copy `src` into scratch bytes `[from, from + src.len())`.
     fn copy_in(&self, from: usize, src: &[u8]) {
         assert!(from + src.len() <= WINDOW_SPAN);
         // SAFETY: as for `copy_out`, the other way.
@@ -484,8 +425,8 @@ impl BlockWriter for PartitionIo {
             let (start, span, intra) =
                 window(self.base, self.len, WINDOW_SPAN, offset + done as u64, buf.len() - done)?;
             let take = (buf.len() - done).min(span as usize - intra);
-            // **Read first unless the write covers whole sectors**: a partial sector written without
-            // its surroundings replaces bytes the filesystem is still using.
+            // **Read first unless the write covers whole sectors**: a partial sector written
+            // without its surroundings replaces bytes the filesystem is still using.
             if intra != 0 || take != span as usize {
                 self.submit(IO_OPCODE_READ, start, span)?;
             }
@@ -512,9 +453,6 @@ impl Drop for PartitionIo {
 mod tests {
     use super::*;
 
-    /// **A run of zeroes splits into a block's part at each end and whole blocks between**, which
-    /// cover it exactly — aligned, ragged at either end or both, inside one block, across one
-    /// boundary, and empty.
     #[test]
     fn zeroes_split_into_a_ragged_head_whole_blocks_and_a_ragged_tail() {
         const B: u64 = IO_BLOCK as u64;
@@ -530,9 +468,6 @@ mod tests {
         }
     }
 
-    /// **The chunks a request moves in** cover it exactly: sector-aligned, contiguous, none over
-    /// [`SPAN`], and the request's bytes within each — for aligned and unaligned starts and ends,
-    /// one sector, and a request just over a span.
     #[test]
     fn a_request_is_covered_by_aligned_chunks_of_at_most_a_span() {
         for (offset, len) in
@@ -555,9 +490,6 @@ mod tests {
         }
     }
 
-    /// **A window's transfers** stay inside it and inside the scratch: a range past its end is
-    /// refused, a range up to it is taken, and each transfer is sector-aligned on the device and
-    /// covers the bytes asked for from where they begin.
     #[test]
     fn a_window_refuses_past_its_end_and_moves_sector_aligned_spans() {
         let (base, len) = (1 << 20, 10 * 512);

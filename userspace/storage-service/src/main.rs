@@ -1,44 +1,34 @@
 //! `storage-service` — the event loop. Everything that decides is in the library half
-//! ([`storage_service`]); this file is what cannot be tested on the host: taking `block` from the
-//! device manager, reading each device, reading `init.toml`, and serving forwarded resolves.
-//!
-//! ## Shape (administration Part C.5a)
+//! ([`storage_service`]); this file is what cannot be tested on the host.
 //!
 //! 1. **Own `block`.** Resolve `/svc/devices/block`: the device manager has already queued an
 //!    `Arrived` per disk, partition and RAM disk, each carrying this service's own duplicate of the
 //!    device's node, then `Settled`. `service-mgr` spawns this service straight after the manager,
-//!    so it is the class's owner from boot on and nothing else can take the disks.
-//! 2. **Read what is there.** Each device is probed as its server would read it: ext4 through
-//!    `fs-server-ext4`'s own checks, FAT through `fs-server-fat`'s, or nothing. Each disk's
-//!    partition table is read too, for `init.toml`'s UUID sources.
-//! 3. **Read `init.toml`**, and match each of `init`'s mounts to the device it is on. Those are
-//!    reported and never mounted here. Whether the root is on a RAM disk decides whether this is
-//!    a live boot.
-//! 4. **Mount what it can serve** (C.5b): every ext4 `init` did not mount, and a FAT on a
-//!    removable disk (Phase 6 Part E.5) — an internal disk's read-only on a live boot, a removable
-//!    one's writable on any (Part F). Each gets the server for its kind spawned over it and a
+//!    so it owns the class from boot on and nothing else can take the disks.
+//! 2. **Read what is there**: each device as its server would read it, and each disk's partition
+//!    table, for `init.toml`'s UUID sources.
+//! 3. **Read `init.toml`**, and match each of `init`'s mounts to its device. Those are reported
+//!    and never mounted here. A root on a RAM disk makes this a live boot.
+//! 4. **Mount what it can serve**: each gets the server for its kind spawned over it and a
 //!    namespace of its own with that server bound at `/`, and is named by its label.
 //! 5. **Serve.** Mint a forwarding endpoint and answer `Meta::Ready`; `service-mgr` binds it at
 //!    `/svc/storage`. `info` is a directory session, `info/<name>.tsm` a table as a fresh
 //!    read-only memory object, `fs` a directory of labels, and `fs/<label>/…` a `SUBNAMESPACE`
-//!    reply: the kernel continues the resolve in the mount's namespace, so a file fills through
-//!    the mounted server's own registration and nothing passes through this service.
-//!    `session-endpoint` mints an endpoint on which only `info` and `fs` are answered, and
-//!    `admin-endpoint` one on which any resolve opens an **admin session**: a channel for
-//!    `Storage` requests (C.5c) — `Mount`, `Unmount` and `InUse`. `info/media` opens a **media
-//!    session**, carrying `Eject` alone, and `info/watch` a **watch**, which this service only
-//!    pings when the mounts change — on a session endpoint as at `/svc/storage` (Phase 6 Part F;
-//!    [`storage_service::watch`]).
+//!    reply: the kernel continues the resolve in the mount's namespace, so nothing passes through
+//!    this service. `session-endpoint` mints an endpoint on which only `info`, `fs`, `info/media`
+//!    and `info/watch` are answered; `admin-endpoint` one on which any resolve opens an **admin
+//!    session** for `Mount`, `Unmount`, `Reread` and `InUse`. A **media session** carries `Eject`
+//!    alone; a **watch** is only pinged when the mounts change ([`storage_service::watch`]).
 //!
-//! **An unmount is a chain** (C.5c): the label leaves `fs`, every dirty file is written back
+//! **An unmount is a chain**: the label leaves `fs`, every dirty file is written back
 //! (`sys_ns_sync`), the unmount is refused if a file is still held (`sys_ns_held`), the server
 //! records the filesystem clean and exits (`Meta::Unmount`), the drive's cache is flushed, and
 //! the namespace is dropped.
 //!
-//! **A shutdown unmounts everything** (administration Part E.4). On `CTRL_OP_SHUTDOWN` — which
-//! only a shutdown sends, since this service is `essential` — it runs the chain on every mount,
-//! last mounted first, **without the held check**, by the maintainer's call: a write made after
-//! the sync is lost, as at a power cut, and every filesystem is left clean. Then it exits.
+//! **A shutdown unmounts everything.** On `CTRL_OP_SHUTDOWN` (sent only by a shutdown, since this
+//! service is `essential`) it runs the chain on every mount, last mounted first, **without the
+//! held check**, by the maintainer's call: a write made after the sync is lost, as at a power
+//! cut, and every filesystem is left clean. Then it exits.
 
 #![no_std]
 #![no_main]
@@ -78,29 +68,24 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
-/// Where the block class is taken from.
 const SUBSCRIPTION: &[u8] = b"/svc/devices/block";
-/// Where `init`'s manifest is. The initramfs is `init`'s root namespace's, which this service
-/// inherits.
+/// Where `init`'s manifest is, in the initramfs this service inherits.
 const INIT_TOML: &[u8] = b"/initramfs/etc/init.toml";
-/// How long one message of the replay may take to arrive. The manager queues the whole replay
-/// before the subscription's resolve completes, so this bounds a manager that broke that rule,
-/// not an ordinary wait.
+/// How long one message of the replay may take. The manager queues the whole replay before the
+/// resolve completes, so this bounds a manager that broke that rule.
 const REPLAY_WAIT_NS: u64 = 2_000_000_000;
-/// Session endpoints at once. The two login supervisors ask for one each at boot (C.6); the rest
-/// is headroom, not a use.
+/// Session endpoints at once: one per login supervisor, the rest headroom.
 const MAX_SESSION_ENDPOINTS: usize = 4;
 /// Mounts at once. Each keeps its server's control channel in the wait set, to see it exit.
 const MAX_MOUNTS: usize = 8;
-/// Admin endpoints at once. The view broker asks for one at boot (C.6); the second is headroom.
+/// Admin endpoints at once. The view broker asks for one at boot; the second is headroom.
 const MAX_ADMIN_ENDPOINTS: usize = 2;
 /// Admin sessions open at once: a `disk --mount` or `--unmount` is one, briefly.
 const MAX_ADMIN_SESSIONS: usize = 4;
-/// **Media sessions open at once** (Phase 6 Part F): each is held for an `Eject`, by Files or
-/// `disk --eject`, and closed after. A watch is not one, and takes no slot ([`storage_service::watch`]).
+/// Media sessions at once: each is held for one `Eject`. A watch takes no slot.
 const MAX_MEDIA_SESSIONS: usize = 2;
-/// Directory sessions open at once: the wait set, less the endpoint, the subscription, the control
-/// channel, and every other kind's bound.
+/// Directory sessions at once: the wait set less every other kind's bound, the endpoint, the
+/// subscription and the control channel.
 const MAX_DIRS: usize = MAX_WAIT_HANDLES
     - 3
     - MAX_SESSION_ENDPOINTS
@@ -111,12 +96,10 @@ const MAX_DIRS: usize = MAX_WAIT_HANDLES
 /// How long a filesystem server may take to answer `Meta::Ready`: `init`'s bound for its own.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000;
 /// How many times an unmount asks whether a file is held before it believes the answer, and how
-/// long it parks between: long enough for an IRP's completion on another CPU to finish, short
-/// enough that a refused unmount is still prompt.
+/// long it parks between: long enough for an IRP's completion on another CPU to finish.
 const HELD_ASKS: u32 = 3;
 const HELD_PARK_NS: u64 = 5_000_000;
-/// The scratch every device read passes through: 64 KiB, enough for the front of a disk's
-/// partition table in one read.
+/// The scratch every device read passes through: enough for a partition table's front in one.
 const SCRATCH: usize = 64 * 1024;
 
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
@@ -141,7 +124,6 @@ fn now_ns() -> u64 {
     now
 }
 
-/// Wait on `h` until `deadline`. `true` if it became ready.
 fn wait_until(h: u64, deadline: u64) -> bool {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid; one waiter.
     unsafe {
@@ -172,21 +154,19 @@ fn po_wait(po: u64) -> (i64, u64) {
         let w = syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX);
         let word = |off: usize| u64::from_le_bytes(WAIT_RESULTS[off..off + 8].try_into().unwrap_or([0; 8]));
         // The status is an `i32`, beside a zero reserved word: read whole, `AlreadyExists` would
-        // never compare equal (PR #361 review, the class of its finding 4).
+        // never compare equal.
         (w == 1, word(8) as u32 as i32 as i64, word(16))
     };
     close(po);
     if done { (status, value) } else { (-1, 0) }
 }
 
-/// Send `body` on `ch` as `op`, echoing `request_id`, with `flags`, moving `handles`.
 fn send(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
     send_raw(ch, op, request_id, flags, body, handles) == 0
 }
 
-/// [`send`], answering the syscall's own result: `0`, or `WouldBlock` for a full queue, or
-/// `PeerClosed`. **Through `REPLY_MSG`**, whole: the kernel copies a full message from the pointer
-/// it is given, so a buffer the size of the message alone would have it read past the end.
+/// [`send`], answering the syscall's own result. **Through `REPLY_MSG`**, whole: the kernel
+/// copies a full message from the pointer it is given, so a smaller buffer would be read past.
 fn send_raw(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> i64 {
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
     unsafe {
@@ -209,7 +189,7 @@ fn send_raw(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles:
 }
 
 /// **Ping a watch**: a bare `Changed`, never blocking. A full queue is a ping already waiting, and
-/// a refused send is a client gone (Phase 6 Part F).
+/// a refused send is a client gone.
 fn ping(ch: u64) -> Sent {
     match send_raw(ch, OP_STORAGE_CHANGED, 0, 0, &[], &[]) {
         0 => Sent::Queued,
@@ -227,10 +207,9 @@ fn reply_error(ch: u64, op: u16, request_id: u64, err: KError) {
 }
 
 /// **Reply to a resolve carrying `handle`, or refuse it if the reply will not go.** The handle is
-/// moved on success and closed otherwise, and a failed send is answered with an error. A resolve
-/// the kernel forwarded waits for its answer with no deadline, so a reply that silently failed
-/// would leave the caller blocked for good. That is how a `SUBNAMESPACE` reply first failed here:
-/// its namespace lacked `TRANSFER`, which every moved handle needs. `false` if the reply did not go.
+/// moved on success and closed otherwise. A forwarded resolve waits for its answer with no
+/// deadline, so a silently failed reply would block the caller for good (a namespace lacking
+/// `TRANSFER` fails every move). `false` if the reply did not go.
 fn reply_with_handle(serve_end: u64, request_id: u64, body: &[u8], handle: u64) -> bool {
     if send(serve_end, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, body, &[handle]) {
         return true;
@@ -241,21 +220,18 @@ fn reply_with_handle(serve_end: u64, request_id: u64, body: &[u8], handle: u64) 
     false
 }
 
-/// **Every dirty file of the mount whose namespace is `ns` written back** (`sys_ns_sync`), whether
-/// or not anything still holds it. `false` if a write-back failed.
+/// Write back every dirty file of the mount in `ns` (`sys_ns_sync`), held or not. `false` if one
+/// failed.
 fn sync_mount(ns: u64) -> bool {
     let root = b"/";
     // SAFETY: a namespace handle this process holds, and a valid path.
     unsafe { syscall3(SYS_NS_SYNC, ns, root.as_ptr() as u64, root.len() as u64) >= 0 }
 }
 
-/// **How many of the mount's files something still holds** (`sys_ns_held`), asked after a sync,
-/// which let go of every dirty pin a write-back could clean — so what is left is someone's, **once
-/// a finished IRP has let go of its file too**. The kernel frees finished IRPs before it counts,
-/// but one whose completion is still running on another CPU holds its file for that moment
-/// (`sys_ns_held`, `syscall-abi.md`), so a count is asked again after a short park before it is
-/// believed. A real holder is still holding a few milliseconds later. A count other than zero is
-/// said, naming `label`.
+/// **How many of the mount's files something still holds** (`sys_ns_held`), asked after a sync.
+/// An IRP whose completion is still running on another CPU holds its file for that moment
+/// (`syscall-abi.md`), so a nonzero count is asked again after a park before it is believed; a
+/// real holder still holds. A nonzero count is said, naming `label`.
 fn held_files(label: &str, ns: u64) -> i64 {
     let root = b"/";
     let mut held = 0;
@@ -281,7 +257,6 @@ fn held_files(label: &str, ns: u64) -> i64 {
     held
 }
 
-/// Make a channel pair of `depth`. `(a, b)`.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
     let (mut a, mut b) = (0u64, 0u64);
     // SAFETY: valid writable out-params.
@@ -289,7 +264,6 @@ fn make_channel(depth: u64) -> Option<(u64, u64)> {
     (r == 0).then_some((a, b))
 }
 
-/// One message received: its op, request id, body and the handles that came with it.
 struct Received {
     op: u16,
     flags: u32,
@@ -348,7 +322,6 @@ fn recv_request(ch: u64) -> Result<Option<Received>, ()> {
     Ok(m)
 }
 
-/// Resolve `path` in `ns` for `rights`. `(status, handle)`.
 fn lookup(ns: u64, path: &[u8], rights: u64) -> (i64, u64) {
     // SAFETY: a valid path pointer and a namespace handle this process holds.
     let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
@@ -358,7 +331,6 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> (i64, u64) {
     po_wait(po as u64)
 }
 
-/// Map a read-only memory object whole, run `f` over its bytes, and unmap it.
 fn with_mapped<T>(obj: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
     let mut info = abi::HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
     // SAFETY: `info` is a writable 24-byte `HandleInfo`, the layout the kernel writes.
@@ -377,8 +349,7 @@ fn with_mapped<T>(obj: u64, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
     Some(out)
 }
 
-/// **One memory object every device read passes through**, mapped once for the life of the
-/// service. Reads are sector-aligned and at most [`SCRATCH`] bytes at a time.
+/// The one memory object every device read passes through, mapped for the life of the service.
 struct Scratch {
     mem: u64,
     addr: u64,
@@ -401,7 +372,6 @@ impl Scratch {
     }
 }
 
-/// A device, read through [`Scratch`]: `len` bytes of it, in `sector`-byte units.
 struct DeviceIo<'a> {
     node: u64,
     len: u64,
@@ -457,8 +427,7 @@ impl BlockReader for DeviceIo<'_> {
     }
 }
 
-/// Take `block`: every device the manager queued before the resolve completed, until `Settled`.
-/// `Err` with the reason if the class could not be taken.
+/// Take `block`: every device queued before `Settled`. `Err` with why if the class was not taken.
 #[allow(clippy::type_complexity, reason = "the pair is returned once and a name for it would only be read here")]
 fn take_block(root_ns: u64) -> Result<(u64, Vec<(DeviceRecord, u64)>), &'static [u8]> {
     let (st, sub) = lookup(root_ns, SUBSCRIPTION, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
@@ -487,7 +456,6 @@ fn take_block(root_ns: u64) -> Result<(u64, Vec<(DeviceRecord, u64)>), &'static 
     }
 }
 
-/// A disk's partition table, as `libgpt` reads it: its entries in use, in array order.
 fn read_table(io: &DeviceIo, disk: u32) -> Option<DiskTable> {
     let mut front = alloc::vec![0u8; libgpt::table::FRONT_BYTES];
     io.read_at(0, &mut front).ok()?;
@@ -500,8 +468,7 @@ fn read_table(io: &DeviceIo, disk: u32) -> Option<DiskTable> {
     Some(DiskTable { disk, entries })
 }
 
-/// `init`'s manifest, or why it could not be read — each way it can fail says so, since a service
-/// that only said "no manifest" would leave the reason to a debugger.
+/// `init`'s manifest, or why it could not be read: each way it can fail says so.
 fn read_manifest(root_ns: u64) -> Result<manifest::Manifest, &'static [u8]> {
     // `INSPECT` as well as `MAP_READ`: the object's size comes from `sys_handle_stat`.
     let (st, obj) = lookup(root_ns, INIT_TOML, RIGHT_MAP_READ | RIGHT_INSPECT);
@@ -520,7 +487,6 @@ fn read_manifest(root_ns: u64) -> Result<manifest::Manifest, &'static [u8]> {
     parsed.unwrap_or(Err(b"it would not map"))
 }
 
-/// Reply to a resolve with a fresh read-only memory object holding `bytes`.
 fn reply_with_object(serve_end: u64, request_id: u64, bytes: &[u8]) {
     // SAFETY: a plain anonymous object of `bytes.len()`.
     let obj = unsafe { syscall4(SYS_MEMORY_CREATE, bytes.len() as u64, 0, 0, 0) };
@@ -552,10 +518,9 @@ fn reply_channel(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     reply_with_handle(serve_end, request_id, &body, client_end)
 }
 
-/// Reply to a resolve with `ns` and the bytes of the suffix it stands for: the kernel continues the
-/// resolve there, at `/` joined with the rest of the suffix (`rsproto-namespace-ops.md` § *The
-/// `SUBNAMESPACE` body*). The handle sent is a duplicate with `LOOKUP`, which is all a continuation
-/// needs, and `TRANSFER`, which moving it needs; this service keeps its own.
+/// Reply to a resolve with `ns` and the bytes of the suffix it stands for: the kernel continues
+/// the resolve there (`rsproto-namespace-ops.md` § *The `SUBNAMESPACE` body*). The handle sent is
+/// a duplicate with `LOOKUP`, all a continuation needs, and `TRANSFER`, which moving it needs.
 fn reply_subnamespace(serve_end: u64, request_id: u64, ns: u64, consumed: usize) {
     let mut body = [0u8; SUBNAMESPACE_PREFIX_LEN + 1];
     let Some(n) = u16::try_from(consumed).ok().and_then(|c| subnamespace_reply(&mut body, c, b"/")) else {
@@ -569,7 +534,6 @@ fn reply_subnamespace(serve_end: u64, request_id: u64, ns: u64, consumed: usize)
     reply_with_handle(serve_end, request_id, &body[..n], dup as u64);
 }
 
-/// A filesystem this service mounted.
 struct Mount {
     /// Its device's registry id.
     device: u32,
@@ -577,15 +541,15 @@ struct Mount {
     mode: Mode,
     /// A namespace of its own, with the server bound at `/`: what a `SUBNAMESPACE` reply hands on.
     ns: u64,
-    /// The server's control channel: kept, for the unmount it will carry (C.5c), and waited on,
-    /// since its closing means the server has gone.
+    /// The server's control channel: kept, for the unmount it will carry, and waited on, since
+    /// its closing means the server has gone.
     control: u64,
     /// The server's process handle.
     process: u64,
 }
 
-/// Spawn `path` with `control_end` moved into it. The process handle, or `None` with
-/// `control_end` closed, since a failed spawn moves nothing.
+/// Spawn `path` with `control_end` moved into it; on `None` it is closed, a failed spawn moving
+/// nothing.
 fn spawn(root_ns: u64, path: &[u8], control_end: u64) -> Option<u64> {
     let (st, image) = lookup(root_ns, path, RIGHT_MAP_READ);
     if st != 0 || image == 0 {
@@ -634,8 +598,7 @@ fn send_setup(control: u64, device: u64, flags: u8) -> bool {
     }
 }
 
-/// Wait, bounded, for a server's `Meta::Ready` and take the endpoint it carries. `Err` with what
-/// happened instead: nothing in time, an exit, a refusal, or something else.
+/// Wait, bounded, for a server's `Meta::Ready` and take its endpoint; `Err` says what came instead.
 fn wait_ready(control: u64) -> Result<u64, &'static [u8]> {
     if !wait_until(control, now_ns().saturating_add(READY_TIMEOUT_NS)) {
         return Err(b"it sent no Ready in time");
@@ -658,10 +621,8 @@ fn wait_ready(control: u64) -> Result<u64, &'static [u8]> {
     }
 }
 
-/// **Flush the drive's volatile write cache** (`IoOpcode::Flush`): `true` once it completes. A
-/// partition passes it to its disk, a RAM disk completes it at once, and AHCI sends `FLUSH CACHE
-/// EXT` ([`drivers-and-irps.md`](../../../docs/architecture/drivers-and-irps.md) § Flush). Needs
-/// `WRITE` on the node, which the device manager's duplicate carries.
+/// **Flush the drive's volatile write cache** (`IoOpcode::Flush`; `drivers-and-irps.md` § Flush):
+/// `true` once it completes. Needs `WRITE` on the node, which the manager's duplicate carries.
 fn flush(node: u64) -> bool {
     let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
     // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
@@ -669,10 +630,9 @@ fn flush(node: u64) -> bool {
     po >= 0 && po_wait(po as u64).0 == 0
 }
 
-/// **Have the kernel read a disk's partition table again** (`IoOpcode::Rescan`, Phase 6 Part G):
-/// its partitions depart and those its table now holds are published, as arrivals this service
-/// reads from its subscription after. How many were published, or the kernel's refusal —
-/// `Unsupported` for every disk but a USB disk's. Needs `WRITE` on the node, as `Flush` does.
+/// **Have the kernel read a disk's partition table again** (`IoOpcode::Rescan`): its partitions
+/// depart and the table's are published, as arrivals read from the subscription after. How many
+/// were published, or the kernel's refusal (`Unsupported` for every disk but a USB disk's).
 fn rescan(node: u64) -> Result<u64, KError> {
     let op = IoOp { opcode: IO_OPCODE_RESCAN, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
     // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
@@ -686,9 +646,8 @@ fn rescan(node: u64) -> Result<u64, KError> {
     }
 }
 
-/// Mount `plan`'s device, whose node is `node`: spawn a server over it, and build its namespace.
-/// The server gets a duplicate of the node; this service keeps its own, for the flush that ends an
-/// unmount and for a later mount of the same device.
+/// Mount `plan`'s device: spawn a server over it, and build its namespace. The server gets a
+/// duplicate of `node`; this service keeps its own, for the flush and for a later mount.
 fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
     // **The server's handle, narrowed to the mode**: a read-only mount's server cannot write the
     // device even if it tried, whatever `ReadOnly` does above it.
@@ -708,12 +667,10 @@ fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
         close(control);
         return Err(b"its server would not spawn");
     };
-    // **From here a failure lets the server go** (PR #336 review, finding 3): its control channel
-    // and its handle closed. **That, not the terminate, is what ends it** (PR #362 review): a
-    // terminate is a request, which neither filesystem server reads. A server that refused `Ready`
-    // has exited already; one that had not answered finds its control channel closed when it does,
-    // and exits; and one that answered and is then let go here exits when its forwarding endpoint
-    // loses its peer (Phase 6 Part D.4). The terminate stays, for a server that does listen.
+    // **From here a failure lets the server go**: its control channel and handle closed. **That,
+    // not the terminate, ends it**, a request neither filesystem server reads: a server that had
+    // not answered `Ready` finds its control channel closed and exits; one that had exits when its
+    // forwarding endpoint loses its peer. The terminate stays, for a server that does listen.
     let abandon = |control: u64| {
         close(control);
         // SAFETY: the Process handle the spawn returned, with SIGNAL.
@@ -753,12 +710,9 @@ fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
     Ok(Mount { device: plan.device, label: plan.label.clone(), mode: plan.mode, ns, control, process })
 }
 
-/// What a directory session lists.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Listing {
-    /// `info`: the tables.
     Tables,
-    /// `fs`: a subdirectory per mount.
     Mounts,
 }
 
@@ -769,47 +723,38 @@ struct Service {
     /// class, and the disks would be anyone's.
     subscription: u64,
     devices: Vec<Device>,
-    /// Every device's node, by registry id: this service's own duplicate, from the replay. Kept,
-    /// since an administrator may mount any of them and an unmount flushes the drive.
+    /// Every device's node, by registry id: this service's own duplicate, kept for mounts and for
+    /// the flush an unmount ends with.
     nodes: Vec<(u32, u64)>,
-    /// `init`'s mounts, as the table reports them. This service's own are [`mounted`](Self::mounted).
+    /// `init`'s mounts, as the table reports them.
     init: Vec<Mounted>,
     /// Whether every one of `init`'s mounts was placed on a device ([`init_known`]). Without it
     /// this service mounts nothing and does not answer `InUse`: a device it took for free could
     /// be the running root.
     init_known: bool,
-    /// **A live boot**: the root on a RAM disk, so the machine's disks — and, until Phase 6 Part F,
-    /// a stick plugged in — mount read-only.
+    /// **A live boot**: the root on a RAM disk, so the machine's internal disks mount read-only.
     live: bool,
     mounted: Vec<Mount>,
-    /// The buffer every device read passes through, kept past the boot's probe for a device read
-    /// again ([`refresh`](Self::refresh)).
+    /// The buffer every device read passes through, kept for [`refresh`](Self::refresh).
     scratch: Scratch,
-    /// This service's ends of the session endpoints it has minted: resolves arriving here are
-    /// [`session_only`].
+    /// Ends of the session endpoints minted: resolves on them are [`session_only`].
     session_ends: Vec<u64>,
-    /// This service's ends of the admin endpoints it has minted: any resolve on one opens an admin
-    /// session.
+    /// Ends of the admin endpoints minted: any resolve on one opens an admin session.
     admin_ends: Vec<u64>,
-    /// Admin sessions: channels carrying `Storage` requests.
     admin_sessions: Vec<u64>,
-    /// **Media sessions** (Phase 6 Part F): channels carrying `Eject`, in the wait set.
+    /// Channels carrying `Eject`, in the wait set.
     media_sessions: Vec<u64>,
-    /// **Watches** (Phase 6 Part F): channels this service only sends a ping on, outside the wait
-    /// set.
+    /// Channels this service only sends a ping on, outside the wait set.
     watches: Watches,
     dirs: Vec<(u64, Listing)>,
 }
 
 impl Service {
-    /// **Read device `id` again**: what it holds, and how an ext4 was left. The boot's probe goes
-    /// stale as soon as anything writes the device, whether this service's own mounts or a raw
-    /// writer through the `disks` grant. So what reads a device's `found` refreshes it first: a
-    /// table, and an administrator's mount (PR #336 review, finding 1).
-    ///
-    /// **This is the one place `found` changes after the boot.** The unmount reads the device for
-    /// its own line with [`read_found`](Self::read_found), which stores nothing, so a table that
-    /// failed to refresh would show it rather than being kept right by some other path.
+    /// **Read device `id` again.** The boot's probe goes stale as soon as anything writes the
+    /// device, a mount of this service's or a raw writer through the `disks` grant, so what reads
+    /// a device's `found` (a table, an administrator's mount) refreshes it first. **This is the
+    /// one place `found` changes after the boot**: the unmount reads the device for its own line
+    /// with [`read_found`](Self::read_found), which stores nothing.
     fn refresh(&mut self, id: u32) {
         let Some(found) = self.read_found(id) else {
             return;
@@ -819,8 +764,7 @@ impl Service {
         }
     }
 
-    /// What device `id` holds now, read through its node; `None` if this service holds no node
-    /// for it.
+    /// What device `id` holds now; `None` if this service holds no node for it.
     fn read_found(&self, id: u32) -> Option<Found> {
         let &(_, node) = self.nodes.iter().find(|(d, _)| *d == id)?;
         let d = self.devices.iter().find(|d| d.record.id == id)?;
@@ -828,8 +772,7 @@ impl Service {
     }
 
     /// [`refresh`](Self::refresh) every device nothing has mounted. A mounted one is left to its
-    /// server: a writable mount's state reads "in use" and the table says nothing of it, and a
-    /// read-only one's cannot change under it.
+    /// server: a writable mount's state reads "in use", a read-only one's cannot change.
     fn refresh_unmounted(&mut self) {
         let mounted: Vec<u32> = self.all_mounts().iter().map(|m| m.device).collect();
         let ids: Vec<u32> = self.devices.iter().map(|d| d.record.id).filter(|id| !mounted.contains(id)).collect();
@@ -838,7 +781,6 @@ impl Service {
         }
     }
 
-    /// Every mount, `init`'s and this service's, as the table reports them.
     fn all_mounts(&self) -> Vec<Mounted> {
         let mut all = self.init.clone();
         all.extend(self.mounted.iter().map(|m| Mounted {
@@ -850,9 +792,8 @@ impl Service {
         all
     }
 
-    /// Answer one forwarded resolve arriving on `from` — the endpoint bound at `/svc/storage`, or,
-    /// when `session`, a session endpoint — replying on the endpoint it came from. `false` if that
-    /// endpoint has gone.
+    /// Answer one forwarded resolve on `from`, the endpoint at `/svc/storage` or, when `session`, a
+    /// session endpoint. `false` if that endpoint has gone.
     fn serve_resolve(&mut self, from: u64, session: bool) -> bool {
         let m = match recv_request(from) {
             Ok(Some(m)) => m,
@@ -893,9 +834,8 @@ impl Service {
         true
     }
 
-    /// Answer with a forwarding endpoint of this service's own, on which only the tables and the
-    /// filesystems are answered. **Minted only on the root endpoint**: [`session_only`] refuses the
-    /// suffix on a session endpoint, so its holder cannot make more.
+    /// Answer with a session endpoint. **Minted only on the root endpoint**: [`session_only`]
+    /// refuses the suffix on a session endpoint, so its holder cannot make more.
     fn mint_session_endpoint(&mut self, reply_to: u64, request_id: u64) {
         if self.session_ends.len() >= MAX_SESSION_ENDPOINTS {
             return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
@@ -911,10 +851,9 @@ impl Service {
         }
     }
 
-    /// Answer with a forwarding endpoint of this service's own, on which any resolve opens an admin
-    /// session. **Minted only on the root endpoint**: [`session_only`] refuses the suffix on a
-    /// session endpoint, so a session cannot reach mounting at all. Who holds one is the view
-    /// broker's `storage` grant to decide (C.6).
+    /// Answer with an admin endpoint. **Minted only on the root endpoint**: [`session_only`]
+    /// refuses the suffix on a session endpoint, so a session cannot reach mounting at all. Who
+    /// holds one is the view broker's `storage` grant to decide.
     fn mint_admin_endpoint(&mut self, reply_to: u64, request_id: u64) {
         if self.admin_ends.len() >= MAX_ADMIN_ENDPOINTS {
             return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);
@@ -930,8 +869,7 @@ impl Service {
         }
     }
 
-    /// **Answer with a media session** (Phase 6 Part F): a channel carrying `Eject`, which ejects a
-    /// stick and mounts nothing — so a session endpoint answers it, as it answers the tables.
+    /// Answer with a media session, which only ejects, so a session endpoint answers it.
     /// `WouldBlock` with every one taken: each is held for a request, so a retry finds one.
     fn open_media_session(&mut self, reply_to: u64, request_id: u64) {
         if self.media_sessions.len() >= MAX_MEDIA_SESSIONS {
@@ -947,8 +885,7 @@ impl Service {
         }
     }
 
-    /// **Answer with a watch** (Phase 6 Part F): a channel this service only sends a ping on, kept
-    /// outside its wait set. `WouldBlock` once every watch is held by a client still there.
+    /// Answer with a watch. `WouldBlock` once every watch is held by a client still there.
     fn open_watch(&mut self, reply_to: u64, request_id: u64) {
         let Some((client_end, ours)) = make_channel(2) else {
             return reply_error(reply_to, OP_NS_RESOLVE, request_id, KError::KernelError);
@@ -968,21 +905,18 @@ impl Service {
         }
     }
 
-    /// **Tell every watch the mounts changed**, and let go of the ones whose clients have gone.
     fn mounts_changed(&mut self) {
         self.watches.changed(ping).into_iter().for_each(close);
     }
 
-    /// **What a watch is told has changed**: the names mounted under `/storage`, in order, and the
-    /// devices there are — since Phase 6 Part G, when a partition a rescan published holding
-    /// nothing changes no mount, and `disk --partition` waits for its row.
+    /// What a watch is told has changed: the names mounted and the devices there are — a partition
+    /// a rescan published holding nothing changes no mount, and `disk --partition` waits for it.
     fn watched(&self) -> (Vec<String>, Vec<u32>) {
         let names = self.mounted.iter().map(|m| m.label.clone()).collect();
         (names, self.devices.iter().map(|d| d.record.id).collect())
     }
 
-    /// One `Eject` on media session `i` (Phase 6 Part F): the unmount chain, held check included,
-    /// on a removable mount the service made, refused for anything else.
+    /// One `Eject` on media session `i`: the unmount chain, held check included.
     fn serve_media(&mut self, i: usize) {
         let ch = self.media_sessions[i];
         let m = match recv_request(ch) {
@@ -1007,9 +941,8 @@ impl Service {
             Ok(names) => names,
             Err(r) => return refuse(r.kerror(), r.why()),
         };
-        // **The whole stick or none of it** (PR #367 review): every mount on it is written back and
-        // asked whether a file is held before any is unmounted, so a held file on one partition
-        // leaves the others mounted too rather than half a stick ejected.
+        // **The whole stick or none of it**: every mount is synced and asked whether a file is
+        // held before any is unmounted, so a held file leaves no half-ejected stick.
         for n in &names {
             let Some(ns) = self.mounted.iter().find(|x| &x.label == n).map(|x| x.ns) else { continue };
             if !sync_mount(ns) {
@@ -1028,13 +961,11 @@ impl Service {
         }
         let said = names.join(", ");
         Line::new().s(b"storage-service: ejected ").untrusted(said.as_bytes()).s(b", safe to remove").end();
-        // **The reply names what was unmounted**, a name per line: the drive's, not only the one
-        // asked about (`rsproto-storage-ops.md` § `Eject`).
+        // The reply names every mount of the drive, a name per line (`rsproto-storage-ops.md`).
         let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, names.join("\n").as_bytes(), &[]);
     }
 
-    /// A resolve on an admin endpoint: whatever its suffix, answer with an admin session. `false`
-    /// if the endpoint has gone.
+    /// A resolve on an admin endpoint, whatever its suffix, gets an admin session. `false` if gone.
     fn serve_admin_endpoint(&mut self, from: u64) -> bool {
         let m = match recv_request(from) {
             Ok(Some(m)) => m,
@@ -1061,7 +992,6 @@ impl Service {
         true
     }
 
-    /// One `Storage` request on admin session `i`.
     fn serve_admin(&mut self, i: usize) {
         let ch = self.admin_sessions[i];
         let m = match recv_request(ch) {
@@ -1115,8 +1045,8 @@ impl Service {
             }
             OP_STORAGE_IN_USE => {
                 // **Not answered unless `init`'s mounts are known**: an answer would leave out a
-                // root it could not place, and the view broker would hand that disk over raw. The
-                // broker refuses `disks` when this goes unanswered.
+                // root it could not place, and the broker would hand that disk over raw.
+                // Unanswered, the broker refuses `disks`.
                 if !self.init_known {
                     return refuse(
                         KError::NoAccess,
@@ -1136,7 +1066,6 @@ impl Service {
         }
     }
 
-    /// An administrator's `Mount`: the label it went under, or why not.
     fn mount_explicit(&mut self, device: &str, label: &str) -> Result<String, (KError, &'static [u8])> {
         self.refresh_unmounted();
         let taken: Vec<String> = self.mounted.iter().map(|x| x.label.clone()).collect();
@@ -1152,10 +1081,9 @@ impl Service {
         Ok(plan.label)
     }
 
-    /// **An administrator's `Reread`** (Phase 6 Part G): the device called `name` read again after
-    /// `disk` wrote it, and mounted by an arrival's rules; the names it was mounted under, or why
-    /// not. **A disk is rescanned first**, and its new partitions are mounted when they arrive, after
-    /// the reply: the kernel publishes them, and the device manager passes them on.
+    /// **An administrator's `Reread`**: device `name` read again after `disk` wrote it and mounted
+    /// by an arrival's rules. **A disk is rescanned first**, and its new partitions are mounted
+    /// when they arrive, after the reply: the kernel publishes them, the manager passes them on.
     fn reread(&mut self, name: &str) -> Result<Vec<String>, (KError, &'static [u8])> {
         let what = mounts::reread(&self.devices, &self.all_mounts(), self.init_known, name)
             .map_err(|r| (r.kerror(), r.why()))?;
@@ -1188,8 +1116,7 @@ impl Service {
         Ok(names)
     }
 
-    /// **Mount `d` by an arrival's rules** beside the mounts there are — a device that arrived, or
-    /// one read again — through `node`; the names it was mounted under. A mount that fails is said.
+    /// Mount `d`, arrived or read again, by an arrival's rules: the names mounted; failures said.
     fn mount_as_arrival(&mut self, d: &Device, node: u64) -> Vec<String> {
         let taken: Vec<String> = self.mounted.iter().map(|m| m.label.clone()).collect();
         let plan = mounts::arrival(
@@ -1226,21 +1153,17 @@ impl Service {
         names
     }
 
-    /// **Unmount `label`: the chain**, each link only once the one before it held. An `Err` names
-    /// the link that refused. A refusal before the server is told leaves the mount as it was.
-    ///
-    /// `held_check` is `false` only for a shutdown's unmount ([`shut_down`](Self::shut_down)),
-    /// which goes on whatever still holds a file.
+    /// **Unmount `label`: the chain**, each link only once the one before it held; an `Err` names
+    /// the link that refused, and a refusal before the server is told leaves the mount as it was.
+    /// `held_check` is `false` only for a shutdown's ([`shut_down`](Self::shut_down)).
     fn unmount(&mut self, label: &str, held_check: bool) -> Result<(), (KError, &'static [u8])> {
         let Some(i) = self.mounted.iter().position(|x| x.label == label) else {
             return Err((KError::NotFound, b"nothing is mounted with that label"));
         };
         // 1. **The label leaves `fs`**: taken out of the list, so a resolve under it is `NotFound`
-        //    from here, and put back if a link before the server's refuses. This service is one
-        //    thread, so nothing is answered in between anyway; taking it out says what the chain
-        //    assumes.
+        //    from here, and put back if a link before the server's refuses.
         let x = self.mounted.remove(i);
-        // 2. **Every dirty file written back**, whether or not anything still holds it.
+        // 2. **Every dirty file written back**, held or not.
         if !sync_mount(x.ns) {
             self.mounted.insert(i, x);
             return Err((KError::IoError, b"its files could not all be written back"));
@@ -1273,17 +1196,16 @@ impl Service {
                 b"its server did not record it clean, and the filesystem was not left clean",
             ));
         }
-        // 5. **The drive's cache written to its medium**: a writable mount's writes are only
-        //    durable once it is. A read-only mount wrote nothing.
+        // 5. **The drive's cache flushed**: a writable mount's writes are durable only then.
         if x.mode == Mode::Rw
             && let Some(&(_, node)) = self.nodes.iter().find(|(id, _)| *id == x.device)
             && !flush(node)
         {
             return Err((KError::IoError, b"the drive's cache could not be flushed"));
         }
-        // 6. The namespace went with the handle closed above. **What is said of the filesystem is
-        //    what the device says**, read again now: a read-only mount wrote nothing, so one it
-        //    found not clean is not clean still, whatever its server answered.
+        // 6. **What is said of the filesystem is what the device says**, read again now: a
+        //    read-only mount wrote nothing, so one found not clean is not clean still. The QEMU
+        //    gates match this line.
         let clean = self.read_found(x.device).and_then(|f| f.clean()) == Some(true);
         let mut l = Line::new();
         l.s(b"storage-service: unmounted ").untrusted(x.label.as_bytes());
@@ -1295,9 +1217,9 @@ impl Service {
         Ok(())
     }
 
-    /// **A shutdown's unmount**: every mount this service made, last mounted first, each by the
-    /// chain without its held check, and each outcome said — then exit. `init`'s own mounts are
-    /// `init`'s to unmount, after every service has stopped.
+    /// **A shutdown's unmount**: every mount this service made, last mounted first, by the chain
+    /// without its held check, each outcome said (the QEMU gates match it) — then exit. `init`'s
+    /// own mounts are `init`'s to unmount.
     fn shut_down(&mut self) -> ! {
         while let Some(x) = self.mounted.last() {
             let label = x.label.clone();
@@ -1349,7 +1271,6 @@ impl Service {
             _ => return reply_error(ch, m.op, m.request_id, KError::Unsupported),
         };
         let mounts = self.all_mounts();
-        // `(name, kind, size)` for every entry, in order.
         let entries: Vec<(String, u8, u64)> = match listing {
             Listing::Tables => table::entries(&self.devices)
                 .into_iter()
@@ -1382,10 +1303,9 @@ impl Service {
         let _ = send(ch, OP_FILE_READ_DIR, m.request_id, RS_FLAG_REPLY, &out[..n], &[]);
     }
 
-    /// A mount's control channel: its server sends nothing on it unasked, so a message is closed
-    /// and dropped, and its closing means the server has gone. **The mount goes with it**: a label
-    /// whose namespace forwards to a server that no longer answers would fail every resolve under
-    /// it, and saying "gone" is better than saying "there" and failing.
+    /// A mount's control channel: its server sends nothing on it unasked, so a message is dropped,
+    /// and its closing means the server has gone. **The mount goes with it**: a label forwarding
+    /// to a server that no longer answers would fail every resolve under it.
     fn serve_control(&mut self, i: usize) {
         loop {
             match recv(self.mounted[i].control) {
@@ -1407,10 +1327,9 @@ impl Service {
         }
     }
 
-    /// The subscription. **After `Settled` the manager sends a disk's `Arrived` or `Departed`** when
-    /// one comes or goes (Phase 6 Part C), and **this follows them** (Part D): an arrival read and
-    /// mounted by the boot's rules, a departure's mount torn down. Anything else is said and its
-    /// handles closed. The manager going away is said once.
+    /// The subscription: after `Settled` the manager sends `Arrived` or `Departed`, and **this
+    /// follows them**: an arrival read and mounted by the boot's rules, a departure's mount torn
+    /// down. Anything else is said and its handles closed; the manager going away is said once.
     fn serve_subscription(&mut self) {
         loop {
             match recv(self.subscription) {
@@ -1442,8 +1361,8 @@ impl Service {
 }
 
 impl Service {
-    /// **A device that arrived after the boot** (Phase 6 Part D): read as at boot, kept with its
-    /// node, mounted by the boot's rules beside the mounts there are, and said.
+    /// A device that arrived after the boot: read as at boot, kept with its node, mounted by the
+    /// boot's rules, and said.
     fn arrived(&mut self, record: DeviceRecord, node: u64) {
         let found = probe_record(&DeviceIo::new(node, &record, &self.scratch), &record);
         let d = Device { found, record };
@@ -1453,8 +1372,8 @@ impl Service {
         report(&d, &self.all_mounts(), &self.devices);
     }
 
-    /// **A device that departed** (Phase 6 Part D): a mount on it torn down, then the device out of
-    /// the table and its node closed.
+    /// **A device that departed**: a mount on it torn down, then the device out of the table and
+    /// its node closed. The `departed` line is matched by the QEMU gates.
     fn departed(&mut self, id: u32) {
         let Some(at) = self.devices.iter().position(|d| d.record.id == id) else {
             return;
@@ -1470,12 +1389,9 @@ impl Service {
     }
 
     /// **Tear down mount `i`, whose device has gone**: as an unmount, but nothing can be kept.
-    /// 1. Its label leaves `fs`.
-    /// 2. `sys_ns_sync`: every dirty file's write-back is refused, its device gone, and the kernel
-    ///    lets each such file go rather than keeping it for the boot.
-    /// 3. `Meta::Unmount`: the server's attempt to record the filesystem clean fails, and it answers
-    ///    and exits. **Not a terminate**, which it does not read (PR #362 review).
-    /// 4. The namespace is closed.
+    /// `sys_ns_sync` has every write-back refused and the kernel lets each file go; `Meta::Unmount`
+    /// has the server fail to record the filesystem clean, answer and exit (**not a terminate**,
+    /// which it does not read). The line it says is matched by the QEMU gates.
     fn tear_down(&mut self, i: usize) {
         let x = self.mounted.remove(i);
         let root = b"/";
@@ -1499,9 +1415,8 @@ impl Service {
 }
 
 /// Say what one device holds, and whose it is. How a filesystem was left is not said while it is
-/// mounted writable, for the reason the table's `clean` is `Null` then: its state says "in use".
-/// **A device not mounted says why** (Phase 6 Part E.5; [`mounts::unmounted_why`] since Part G):
-/// what its server would refuse a FAT for, that its disk is not removable, and the rest.
+/// mounted writable, as the table's `clean` is `Null` then. **A device not mounted says why**
+/// ([`mounts::unmounted_why`]). The QEMU gates match these lines.
 fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
     let r = &d.record;
     let mount = mounts.iter().find(|m| m.device == r.id);
@@ -1539,9 +1454,8 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
         line.s(b"; ").s(if m.by == By::Init { b"init's".as_slice() } else { b"mounted" });
         line.s(b" at ").untrusted(m.at.as_bytes()).s(if m.mode == Mode::Ro { b" (ro)".as_slice() } else { b" (rw)" });
     } else if let Some(why) = mounts::unmounted_why(d, all) {
-        // **Said, not left to an absence** (administration Part G.1): a gate can then match the
-        // reason a device was passed over, rather than only fail to find its mount. The table's
-        // `note` gives the same words (Phase 6 Part G).
+        // **Said, not left to an absence**: a gate can then match the reason a device was passed
+        // over. The table's `note` gives the same words.
         line.s(b"; ").s(why.as_bytes());
     }
     line.end();
@@ -1563,10 +1477,9 @@ fn refuse(control: u64, err: KError, why: &[u8]) -> ! {
     exit(1);
 }
 
-/// **A refusal's body, sized to its reason** (PR #369 review's gate run). Each was built in a fixed
-/// buffer, and a reason longer than it made `error_body` decline: the reply went out flagged an
-/// error with no body, its code and its reason both lost — which `Reread`'s 108-byte `CannotRescan`
-/// did, and which `boot-probe` caught as an answer of no error at all.
+/// **A refusal's body, sized to its reason**: in a fixed buffer, a reason longer than it makes
+/// `error_body` decline, and the reply goes out flagged an error with no body, its code and its
+/// reason both lost (`Reread`'s 108-byte `CannotRescan` did).
 fn error_reply(err: KError, why: &[u8]) -> Vec<u8> {
     let mut body = alloc::vec![0u8; librsproto::error::ERROR_BODY_LEN + why.len()];
     let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, why).unwrap_or(0);
@@ -1632,8 +1545,8 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     }
     let live = live_boot(init_list.as_deref().unwrap_or(&[]), &records);
 
-    // Mount what can be served. A mount hands its server a duplicate of the node; the service
-    // keeps every node, for an administrator's mount and for an unmount's flush.
+    // A mount hands its server a duplicate of the node; the service keeps every node, for an
+    // administrator's mount and for an unmount's flush.
     let mut plan = automount(&devices, &init, live, known);
     plan.truncate(MAX_MOUNTS);
     let mut mounted = Vec::new();
@@ -1687,8 +1600,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
         exit(1);
     }
     s.serve_end = serve_end;
-    // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN` (administration Part E.4).
-    // `0` once `service-mgr` is gone.
+    // **The control channel**, for a shutdown's `CTRL_OP_SHUTDOWN`. `0` once `service-mgr` is gone.
     let mut control = control;
     loop {
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots: the endpoint, the subscription, the
@@ -1726,10 +1638,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             }
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
-        // **What a watch is told** (Phase 6 Part F): the names mounted and the devices there are
-        // before this turn, against after it. Compared here, once, rather than at each place that
-        // mounts, unmounts or follows a device, so no path — an arrival, an eject, an
-        // administrator's request, a departure — can miss a ping.
+        // **What a watch is told**: the names mounted and the devices there are before this turn,
+        // against after it. Compared here, once, rather than at each place that mounts, unmounts
+        // or follows a device, so no path can miss a ping.
         let before = s.watched();
         for j in 0..waited.max(0) as usize {
             // SAFETY: `waited` records were written; the handle is the first word of each.
@@ -1740,7 +1651,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
             if h == s.serve_end {
                 // A root endpoint with no peer is the end of this service, not a message to skip:
                 // the kernel keeps a peer-closed channel signalled, so going round again would spin
-                // a CPU (PR #333 review, finding 1, in `device-mgr`).
+                // a CPU.
                 if !s.serve_resolve(h, false) {
                     kprint(b"storage-service: forwarding endpoint closed\n");
                     exit(1);

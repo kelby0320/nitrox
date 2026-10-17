@@ -1,61 +1,33 @@
-//! Kernel-thread context switch, emitted from Rust. Shared by the cooperative
-//! (`yield_now`/`exit`) and preemptive (timer-IRQ) scheduler paths.
+//! Kernel-thread context switch, shared by the cooperative (`yield_now`/`exit`) and
+//! preemptive (timer-IRQ) scheduler paths.
 //!
-//! The switch is a `#[unsafe(naked)]` function using `naked_asm!`, not a
-//! standalone NASM file — consistent with every other piece of kernel
-//! assembly (`idt.rs`, `gdt.rs`, `regs.rs`, `user_access.rs`), and so the
-//! scheduler can couple `Thread.arch.rsp` to this code via compile-time
-//! `offset_of!` rather than a hand-maintained numeric offset (decision
-//! log, 2026-05-29).
+//! [`context_switch`] is the xv6/Linux `swtch` as a `#[unsafe(naked)]` function, so the
+//! scheduler couples `Thread.arch.rsp` to it by `offset_of!` (decision log, 2026-05-29): park
+//! the six callee-saved registers on the outgoing stack, store RSP in the outgoing slot, load
+//! the incoming RSP, pop its six registers, `ret`. Caller-saved registers and RFLAGS are not
+//! saved (a normal `call`; the scheduler masks interrupts across the switch, see
+//! `kernel/docs/lock-ordering.md`). CR3 is not switched here.
 //!
-//! ## Model
-//!
-//! Standard xv6/Linux `swtch`: [`context_switch`] parks the six callee-
-//! saved registers on the *outgoing* thread's stack, records the resulting
-//! RSP into the outgoing thread's saved-rsp slot, loads the *incoming*
-//! thread's saved RSP, restores its six callee-saved registers, and
-//! `ret`s. The caller-saved registers are not touched — by the SysV C ABI
-//! they are already clobbered across any `call`, and `context_switch` is
-//! reached only by a normal `call` from the scheduler.
-//!
-//! RFLAGS is deliberately not saved/restored here: DF / the arithmetic flags
-//! are caller-saved per the ABI exactly as after any `call`, and the interrupt
-//! flag is handled around the switch by the scheduler, not inside it. The
-//! **preemptive** path reuses this same function from inside the timer IRQ
-//! handler: the interrupted thread's full register frame (CPU-pushed
-//! `rip/cs/rflags/rsp/ss` + the stub-pushed GPRs) already sits on its kernel
-//! stack *below* the callee-saved frame this switch parks, so when that thread
-//! is later resumed it returns up through `context_switch` into the timer-stub
-//! epilogue, which `iretq`s the original interrupt frame (including IF) back.
-//! The scheduler holds interrupts masked across the switch in both paths (see
-//! `sched.rs` and `kernel/docs/lock-ordering.md`).
-//!
-//! CR3 is not switched: every kernel thread shares the boot PML4 and the
-//! shared kernel vmap. Address-space switching arrives with the userspace
-//! slice.
+//! On the preemptive path the interrupted thread's full frame (CPU-pushed
+//! `rip/cs/rflags/rsp/ss` plus the stub's GPRs) sits *below* the frame parked here, so on
+//! resume it returns up through `context_switch` into the timer-stub epilogue, whose `iretq`
+//! restores IF.
 
 use core::arch::naked_asm;
 
-/// Saved architectural register state for a parked kernel thread.
-///
-/// Phase 1 stores only the saved kernel **stack pointer** at the thread's
-/// resume point (the x86_64 RSP; AArch64's SP); the six callee-saved
-/// registers live on the stack that pointer addresses (parked by
-/// [`context_switch`] or zeroed by [`fabricate_frame`]). The field is
-/// private so the arch-specific representation never leaks out of this
-/// module — callers go through [`saved_sp`](ArchThreadContext::saved_sp) /
+/// A parked kernel thread's saved state: its kernel stack pointer at the resume point. The
+/// callee-saved registers live on that stack (parked by [`context_switch`] or zeroed by
+/// [`fabricate_frame`]). Private so callers use [`saved_sp`](ArchThreadContext::saved_sp) /
 /// [`sp_slot`](ArchThreadContext::sp_slot).
 #[repr(C)]
 pub struct ArchThreadContext {
-    /// Saved kernel stack pointer at the thread's resume point. Written by
-    /// `context_switch`'s `mov [rdi], rsp` when the thread is switched out;
-    /// loaded into RSP when it is switched in.
+    /// Saved kernel stack pointer at the thread's resume point, written by `context_switch`'s
+    /// `mov [rdi], rsp`.
     sp: u64,
 }
 
 impl ArchThreadContext {
-    /// A zeroed context. The boot thread starts here — its saved stack
-    /// pointer is written by the first switch-out before it is ever read.
+    /// A zeroed context; the boot thread's slot is written by its first switch-out.
     pub const fn new() -> Self {
         Self { sp: 0 }
     }
@@ -69,8 +41,7 @@ impl ArchThreadContext {
         unsafe { core::ptr::read(&raw const (*ctx).sp) }
     }
 
-    /// A raw pointer to the saved-stack-pointer word, for
-    /// [`context_switch`]'s store into the outgoing thread.
+    /// A raw pointer to the saved-stack-pointer word, for [`context_switch`]'s store.
     ///
     /// # Safety
     /// `ctx` must point at a valid, aligned `ArchThreadContext`.
@@ -86,37 +57,27 @@ impl Default for ArchThreadContext {
     }
 }
 
-/// Number of `u64` slots the fabricated initial frame occupies: six
-/// callee-saved register slots plus the `ret` target. Must equal the
-/// number of `push`/`pop` pairs in [`context_switch`] plus one.
+/// Number of `u64` slots in the fabricated initial frame: six callee-saved slots plus the
+/// `ret` target; one more than the `push`/`pop` pairs in [`context_switch`].
 pub const FABRICATED_FRAME_SLOTS: usize = 7;
 /// Byte size of the fabricated initial frame.
 pub const FABRICATED_FRAME_BYTES: u64 = (FABRICATED_FRAME_SLOTS as u64) * 8;
 
-/// The saved stack pointer for a freshly fabricated frame whose stack top
-/// (exclusive) is `top`.
 const fn fabricated_sp(top: u64) -> u64 {
     top - FABRICATED_FRAME_BYTES
 }
 
 /// Cooperatively switch from the current thread to another.
 ///
-/// `prev_sp_slot` is `&mut current.arch.rsp` — `context_switch` stores the
-/// outgoing thread's resume RSP there. `next_sp` is the incoming thread's
-/// saved RSP (parked by a prior switch, or fabricated by
-/// [`fabricate_frame`] for a never-run thread). Returns to the caller only
-/// when some later switch selects the outgoing thread again.
+/// `prev_sp_slot` is `&mut current.arch.rsp`, where the outgoing resume RSP is stored;
+/// `next_sp` is the incoming thread's saved RSP (parked, or from [`fabricate_frame`]).
+/// Returns only when a later switch selects the outgoing thread again.
 ///
-/// `prev_on_cpu` is a `*mut u8` at the outgoing thread's `on_cpu` guard (see
-/// [`Thread::on_cpu`](crate::object::Thread)). After the outgoing resume RSP is
-/// committed — and *only* then — this routine clears the guard to `0`,
-/// publishing "my parked context is now valid to resume". A stealer on another
-/// CPU spins/skips while the guard is set, so it can never load a half-written
-/// `saved_sp`. On x86's TSO the plain store ordering (sp-commit store, then
-/// guard-clear store) is a release with respect to the stealer's load, so no
-/// explicit fence is needed. `prev_on_cpu` may be null to skip the clear (a
-/// path whose outgoing thread is not re-enqueued anywhere a stealer can see —
-/// e.g. a thread parked in `blocked`/`reap`); today all callers pass it.
+/// `prev_on_cpu` points at the outgoing thread's `on_cpu` guard (see
+/// [`Thread::on_cpu`](crate::object::Thread)), cleared to `0` only after the resume RSP is
+/// committed: a stealer on another CPU skips the thread while it is set, so it never loads a
+/// half-written `saved_sp`. x86's TSO orders the two plain stores, so no fence is needed.
+/// Null skips the clear, for a thread no stealer can see.
 ///
 /// SysV AMD64: `rdi = prev_sp_slot`, `rsi = next_sp`, `rdx = prev_on_cpu`.
 ///
@@ -130,16 +91,11 @@ const fn fabricated_sp(top: u64) -> u64 {
 #[allow(clippy::unnecessary_safety_comment, reason = "the asm's safety argument; `naked_asm!` has no `unsafe` block")]
 #[unsafe(naked)]
 pub unsafe extern "C" fn context_switch(prev_sp_slot: *mut u64, next_sp: u64, prev_on_cpu: *mut u8) {
-    // SAFETY: naked — no prologue/epilogue; every register effect is
-    // written explicitly. Reached only via a normal `call` from
-    // `sched::yield_now`/`exit`, so on entry SysV holds: rdi is a live,
-    // writable `*mut u64` into the outgoing thread's `arch.rsp`, rsi is
-    // the saved RSP of a live, refcount-pinned incoming thread, and rdx is
-    // null or a live `*mut u8` at the outgoing thread's `on_cpu` byte. Caller-
-    // saved registers are already dead per the ABI; we preserve exactly the
-    // six callee-saved registers by parking them on the outgoing stack and
-    // restoring them from the incoming stack. The push order here MUST
-    // mirror the slot layout in `fabricate_frame`.
+    // SAFETY: naked — no prologue/epilogue; every register effect is written explicitly.
+    // Reached only via a normal `call` from `sched::yield_now`/`exit`: rdi is a live
+    // `*mut u64` into the outgoing `arch.rsp`, rsi the saved RSP of a live, refcount-pinned
+    // incoming thread, rdx null or a live `*mut u8` at its `on_cpu`. Exactly the six
+    // callee-saved registers are preserved; the push order MUST mirror `fabricate_frame`.
     naked_asm!(
         // Park callee-saved registers on the outgoing stack.
         "push rbp",
@@ -176,11 +132,9 @@ pub unsafe extern "C" fn context_switch(prev_sp_slot: *mut u64, next_sp: u64, pr
 
 /// Trampoline a never-run thread lands on via the fabricated frame's `ret`.
 ///
-/// The fabricated frame leaves RSP at the (16-aligned) stack top, which is
-/// the *post-`ret`* state, not the post-`call` state SysV expects at a
-/// function entry. We re-align defensively and `call` the Rust entry so it
-/// observes the normal `rsp % 16 == 8` on entry. [`thread_enter`] never
-/// returns, so the `ud2` is an unreachable tripwire.
+/// RSP is at the (16-aligned) stack top, the post-`ret` state rather than the post-`call`
+/// state SysV expects at entry; it re-aligns and `call`s `thread_enter` so that sees
+/// `rsp % 16 == 8`. [`thread_enter`] never returns, so the `ud2` is a tripwire.
 ///
 /// [`thread_enter`]: crate::sched::thread_enter
 #[allow(clippy::unnecessary_safety_comment, reason = "the asm's safety argument; `naked_asm!` has no `unsafe` block")]
@@ -202,23 +156,17 @@ pub extern "C" fn thread_trampoline() -> ! {
     );
 }
 
-/// Write a fabricated initial switch frame into the `FABRICATED_FRAME_SLOTS`
-/// `u64` slots ending at `top` (exclusive) and return the matching initial
-/// [`ArchThreadContext`] (saved stack pointer `top - FABRICATED_FRAME_BYTES`).
+/// Write a fabricated initial switch frame into the `FABRICATED_FRAME_SLOTS` `u64` slots
+/// ending at `top` (exclusive) and return the matching [`ArchThreadContext`].
 ///
-/// The frame is laid out so that the first [`context_switch`] *into* this
-/// thread pops six zeroed callee-saved registers and `ret`s into
-/// `trampoline`:
+/// The first [`context_switch`] into the thread pops six zeroed callee-saved registers and
+/// `ret`s into `trampoline`:
 ///
 /// ```text
 ///   top-8  : trampoline           ← consumed by `ret`
 ///   top-16 : 0 (rbp)   top-24 : 0 (rbx)   top-32 : 0 (r12)
 ///   top-40 : 0 (r13)   top-48 : 0 (r14)   top-56 : 0 (r15)  ← saved sp
 /// ```
-///
-/// Returning the whole `ArchThreadContext` (rather than a bare stack
-/// pointer) keeps the saved-context representation entirely inside the arch
-/// layer — the caller stores the result opaquely.
 ///
 /// # Safety
 /// `top` must be 8-aligned with at least `FABRICATED_FRAME_BYTES` writable
@@ -253,8 +201,7 @@ mod tests {
 
     #[test]
     fn fabricate_frame_lays_out_trampoline_and_zeroed_regs() {
-        // Eight u64 slots = 64 bytes; treat one-past-the-end as the
-        // exclusive stack top so the seven-slot frame lands in buf[1..=7].
+        // The seven-slot frame lands in buf[1..=7], below the exclusive top.
         let mut buf = [0xAAu64; 8];
         // SAFETY: one-past-the-end pointer used only as an address; the
         // seven writes land in valid buf slots [1, 8).

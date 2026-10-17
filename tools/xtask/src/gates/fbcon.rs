@@ -2,31 +2,18 @@
 
 use crate::*;
 
-/// `cargo xtask check-fbcon` — **the boot is legible with no serial port at all** (Phase 5
-/// Part B).
+/// `cargo xtask check-fbcon` — the boot is legible with no serial port at all.
 ///
 /// Boots the release userspace with `-serial none` and reads the screen back into text with the
-/// kernel console's own glyphs, palette and geometry (`glyphs` and `text`, compiled here by path).
-/// Nothing is learned from COM1, because on the machine this is for there is no COM1. Three claims:
+/// kernel console's own glyphs, palette and geometry: the boot is on the screen, the console lets
+/// go once the compositor has drawn, and a panic after the desktop is up repaints the console with
+/// the diagnosis at the bottom, nothing drawing over it. Builds [`BuildMode::FbconGate`] for the
+/// `fbcon-gate` kernel feature.
 ///
-/// 1. **The boot is on the screen**: the kernel's first and last lines, and userspace's lines up to
-///    the compositor — the last thing printed before a client takes the screen.
-/// 2. **The console lets go**: once the compositor has drawn, no console text reappears over it,
-///    although every service goes on printing.
-/// 3. **A stop takes the screen back**: a panic after the desktop is up repaints the console with
-///    the diagnosis at the bottom, and nothing draws over it afterwards.
-///
-/// All three rest on the `fbcon-gate` kernel feature, which is why this gate builds
-/// [`BuildMode::FbconGate`] rather than booting `check-login`'s image.
-///
-/// **Held frames, not lucky samples.** A dump costs 4–18 ms depending on the host, and a
-/// scrolling console does not wait for it: the first version of this gate required
-/// `compositor: up` to be *seen*, and that line is on screen only from its own paint to the
-/// compositor's first frame — one dump in 1640 on a fast host, and missed 3 runs in 5 with a
-/// dump slowed to CI's rate (PR #296 review). So the kernel holds the screen still for a second
-/// after the timer is calibrated and again at the handout, and each claim below is read off one
-/// of those frames — **all of its lines together, in a single frame**, which a hold guarantees
-/// and no run of transient sightings can imitate.
+/// Held frames, not lucky samples: a dump costs 4–18 ms and a scrolling console does not wait
+/// (requiring `compositor: up` to be seen missed 3 runs in 5 at CI's dump rate). So the kernel
+/// holds the screen still for a second after the timer is calibrated and again at the handout, and
+/// each claim is read off one of those frames, all its lines together.
 pub(crate) fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::FbconGate)?;
@@ -45,8 +32,6 @@ pub(crate) fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
         .arg("none")
         .arg("-qmp")
         .arg(format!("unix:{},server,nowait", qmp_sock.display()))
-        // **The point of the gate.** No UART is created, so nothing the guest writes to COM1
-        // goes anywhere, and the port reads back as a floating bus.
         .arg("-serial")
         .arg("none")
         .arg("-smp")
@@ -71,16 +56,9 @@ pub(crate) fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
         Ok(frame)
     };
 
-    // 1. The boot, read off the two held frames. Each group must appear whole in one frame.
-    //
-    // **The handout group's first line is the input server's bind, not the kernel's last line**
-    // (administration Part B.4, moved again by Part E.1). It was the kernel's last line until the
-    // boot grew past what one frame shows: Part B's device manager put 41 lines between it and
-    // `compositor: up`, against the 36 a held frame guarantees. Then it was `init`'s auth-service
-    // bind, until `service-mgr` took the servers over and logs two lines for each between. The
-    // input server is bound just before the compositor starts. The kernel's own lines are the
-    // early group's claim; this group's is that `sys_kprint` lines reach the screen up to the
-    // handout, which any userspace line proves.
+    // 1. The boot, read off the two held frames; each group must appear whole in one frame. The
+    // handout group's first line is the input server's bind, just before the compositor starts:
+    // earlier lines fell more than the 36 a held frame guarantees before `compositor: up`.
     const EARLY: &[&str] = &["Nitrox kernel — diagnostics online", "allocators up"];
     const HANDOUT: &[&str] = &["service-mgr: input-server bound at /dev/input/new", "compositor: up"];
     let (mut early, mut handout, mut console_seen) = (false, false, false);
@@ -95,8 +73,7 @@ pub(crate) fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
         early |= frame.has_all(EARLY);
         handout |= frame.has_all(HANDOUT);
         // The handover: a frame that is not the console and has no console glyph anywhere on it,
-        // after the console has been seen. Not "after a given line", which is what made the
-        // first version of this loop wait on a sighting.
+        // after the console has been seen; not "after a given line".
         if console_seen && frame.text_cells == 0 && !frame.is_console() {
             break;
         }
@@ -136,8 +113,8 @@ pub(crate) fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
         "  ok: held at the handout — a line init printed bringing its services up, and \"compositor: up\", on one screen"
     );
 
-    // 2. The console let go. Every service keeps printing through all of this — the greeter's
-    //    redraws, the heartbeat — so a console still drawing would put text over the desktop.
+    // 2. The console let go. Every service keeps printing, so a console still drawing would put
+    // text over the desktop.
     const SETTLE: std::time::Duration = std::time::Duration::from_secs(6);
     let until = std::time::Instant::now() + SETTLE;
     let mut dumps = 0;
@@ -160,7 +137,6 @@ pub(crate) fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
         SETTLE.as_secs()
     );
 
-    // 3. A stop takes it back.
     qmp.send_key("f10", true)?;
     qmp.send_key("f10", false)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -183,13 +159,10 @@ pub(crate) fn cmd_check_fbcon(accel: Accel, size: DisplaySize) -> R<()> {
         return Err(format!("the panic reached the screen without its message {message:?}").into());
     }
     println!("  ok: the panic took the screen back from the desktop, message and all");
-    // Held, not merely drawn: the other CPUs were told to halt before the repaint, so nothing —
-    // least of all the compositor — draws over it. **The pointer is moved to give something a
-    // reason to.** An idle greeter draws nothing for seconds on end, so without the motion this
-    // check passed with the stop's NMIs deleted and the compositor still running (measured
-    // 2026-09-14). A running machine answers motion with a cursor, drawn over the text; a stopped
-    // one does not answer — the PS/2 bytes sit in the controller, since every CPU that would
-    // drain them, by interrupt or by its tick, is halted.
+    // Held, not merely drawn: the other CPUs were told to halt before the repaint. The pointer is
+    // moved because an idle greeter draws nothing for seconds, so this once passed with the stop's
+    // NMIs deleted; a stopped machine does not answer motion with a cursor (the PS/2 bytes sit in
+    // the controller).
     for _ in 0..6 {
         qmp.send_motion(60, 40)?;
     }

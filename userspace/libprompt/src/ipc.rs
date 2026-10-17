@@ -1,12 +1,5 @@
-//! **One request, one reply** — the channel plumbing a client of the view broker needs: send a
-//! message, wait, and take the answer to it.
-//!
-//! Moved out of `with` when `account` became its second user (administration Part D.4), into
-//! `coreutils::ipc`; out of `coreutils` into `libviews` when the desktop became a third (Part F.3);
-//! and into `libprompt` with the prompts that use it (Part G.2), since `nxinstall` asks a terminal
-//! and never the broker. `libviews` speaks to the broker with it. A password passes through these buffers on the way to either, so **every buffer
-//! here is zeroed once the kernel has the message** — a copy left in a stack frame is a copy nothing
-//! else will overwrite.
+//! One request, one reply. A password passes through these buffers, so **every buffer here is
+//! zeroed once the kernel has the message**: a stack copy would outlive it.
 
 use alloc::vec::Vec;
 use libkern::abi::{IPC_MSG_SIZE, IPC_PAYLOAD_SIZE};
@@ -31,9 +24,6 @@ pub fn wait(handles: &[u64]) -> Option<usize> {
 }
 
 /// [`wait`], giving up at `deadline` on the monotonic clock: `None` then too.
-///
-/// **For a caller that must not hang on the broker**: `with` has nothing else to do while it waits,
-/// and the desktop has a screen to keep answering.
 pub fn wait_until(handles: &[u64], deadline: u64) -> Option<usize> {
     let mut results = [0u8; 24 * 4];
     if handles.len() > 4 {
@@ -50,9 +40,7 @@ pub fn wait_until(handles: &[u64], deadline: u64) -> Option<usize> {
     handles.iter().position(|&x| x == h)
 }
 
-/// Receive one message on `ch`. `Ok(None)` if nothing was queued — a wake with nothing behind
-/// it — and `Err(())` if the peer has gone, which are different answers to a caller waiting on
-/// a program's exit. Handles that came with it are closed: nothing here expects one.
+/// Receive one message on `ch`: `Ok(None)` if none queued, `Err(())` if the peer has gone.
 #[allow(clippy::result_unit_err, reason = "the only error is the peer having gone")]
 pub fn recv(ch: u64) -> Result<Option<Msg>, ()> {
     let mut buf = [0u8; IPC_MSG_SIZE];
@@ -105,8 +93,7 @@ pub fn send(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> 
     sent
 }
 
-/// Send `op` and wait for the reply to it, as `(is_error, body)`. `None` if it could not be sent
-/// or the peer went away first.
+/// Send `op` and wait for its reply, as `(is_error, body)`; `None` on a send failure or dead peer.
 pub fn call(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> Option<(bool, Vec<u8>)> {
     if !send(ch, op, request_id, body, handles) {
         return None;
@@ -114,8 +101,7 @@ pub fn call(ch: u64, op: u16, request_id: u64, body: &[u8], handles: &[u64]) -> 
     answer(ch, request_id, u64::MAX)
 }
 
-/// The reply to `request_id` on `ch`, as `(is_error, body)`, skipping anything else that arrives
-/// first. `None` if the peer went away, or `deadline` passed, before it came.
+/// The reply to `request_id` on `ch`, skipping other messages; `None` on a gone peer or `deadline`.
 pub fn answer(ch: u64, request_id: u64, deadline: u64) -> Option<(bool, Vec<u8>)> {
     loop {
         wait_until(&[ch], deadline)?;

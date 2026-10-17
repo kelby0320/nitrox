@@ -1,12 +1,7 @@
 //! The serial **console input** driver (Tier 1) — COM1 receive.
 //!
-//! The kernel owns the UART (port I/O is kernel-only), so getting keyboard input
-//! from the serial line to userspace is an in-kernel driver. It is reached through
-//! the **universal device interface**: the console is a char-class
-//! [`DeviceNode`] bound at `/dev/console`, read with `sys_io_submit(Read)` like any
-//! device. There is no console-specific syscall.
-//!
-//! ## Flow
+//! The kernel owns the UART, so serial input reaches userspace as a char-class [`DeviceNode`] at
+//! `/dev/console`, read with `sys_io_submit(Read)`; echo and line editing live in userspace.
 //!
 //! ```text
 //! COM1 RX IRQ4 → console_isr (drain UART → ring) → enqueue CONSOLE_DPC
@@ -14,17 +9,9 @@
 //!                ring empty      → park the read; CONSOLE_DPC completes it later
 //! ```
 //!
-//! The read's [`PendingOperation`](crate::object::PendingOperation) is the wait
-//! target (mirroring block I/O's IRP completion) — no internal `InterruptObject` is
-//! needed. Echo and line editing live in userspace (eshell); the kernel delivers
-//! raw bytes.
-//!
-//! ## Locking
-//!
-//! All state lives behind one [`IrqSpinLock`] (masks interrupts while held), so the
-//! ISR cannot preempt a syscall-context ring operation. The lock is released before
-//! touching the buffer `MemoryObject` or `complete_pending_op` (which takes the
-//! rank-1 `SCHED` lock) — never nested. Single-reader (eshell) in Phase 2.
+//! All state lives behind one [`IrqSpinLock`], so the ISR cannot preempt a ring operation; the lock
+//! is released before touching the buffer `MemoryObject` or `complete_pending_op` (rank-1 `SCHED`),
+//! never nested. One reader at a time.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -38,12 +25,9 @@ use crate::object::device_node::{CharBackend, ResourceDescriptor};
 use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
 
-/// Capacity of the RX ring — ample for an interactive command line; excess input
-/// (rare) is dropped rather than blocking the ISR.
+/// Capacity of the RX ring; input beyond it is dropped rather than blocking the ISR.
 const RING_CAP: usize = 256;
 
-/// A parked `sys_io_submit(Read)` awaiting input: the references it pins and where
-/// to land the bytes. Completed (and dropped) by [`console_intr_dpc`].
 struct ParkedRead {
     po: ObjectRef,
     buffer: ObjectRef,
@@ -51,19 +35,13 @@ struct ParkedRead {
     max_len: usize,
 }
 
-/// All console-input state, behind [`CONSOLE`].
 struct Inner {
-    /// Circular RX byte ring (`head` = next byte to read, `len` = bytes present).
     ring: [u8; RING_CAP],
     head: usize,
     len: usize,
-    /// The single outstanding parked read, or `None`.
     parked: Option<ParkedRead>,
-    /// A satisfied `ParkedRead` the DPC has finished with, awaiting a thread-context drop.
-    /// The DPC **owns** the entry while it uses its pointers and publishes it here last —
-    /// see [`console_intr_dpc`] and [`reclaim_completed`].
+    /// A satisfied `ParkedRead` awaiting a thread-context drop; the DPC publishes it here last.
     to_drop: Option<ParkedRead>,
-    /// The DPC has taken the parked read and not yet published it to `to_drop`.
     delivering: bool,
 }
 
@@ -72,7 +50,6 @@ impl Inner {
         Inner { ring: [0; RING_CAP], head: 0, len: 0, parked: None, to_drop: None, delivering: false }
     }
 
-    /// Push one received byte; drops it if the ring is full.
     fn push(&mut self, b: u8) {
         if self.len < RING_CAP {
             let tail = (self.head + self.len) % RING_CAP;
@@ -81,7 +58,6 @@ impl Inner {
         }
     }
 
-    /// Pop up to `dst.len()` buffered bytes into `dst`; returns the count.
     fn pop_into(&mut self, dst: &mut [u8]) -> usize {
         let n = self.len.min(dst.len());
         for d in dst.iter_mut().take(n) {
@@ -92,7 +68,6 @@ impl Inner {
         n
     }
 
-    /// What a read finds: bytes, another reader, the read before not yet reclaimed, or room to park.
     fn read_now(&mut self, out: &mut [u8]) -> ReadNow {
         if self.len > 0 {
             ReadNow::Drained(self.pop_into(out))
@@ -105,7 +80,6 @@ impl Inner {
         }
     }
 
-    /// The DPC's half: the parked read, if bytes have come for it, and what it drained into `out`.
     fn take_ready(&mut self, out: &mut [u8]) -> Option<(ParkedRead, usize)> {
         if self.len == 0 {
             return None;
@@ -116,7 +90,6 @@ impl Inner {
         Some((pr, n))
     }
 
-    /// Hand a delivered read back for thread context to drop.
     fn owe(&mut self, pr: ParkedRead) {
         debug_assert!(self.to_drop.is_none(), "a second completion before a reclaim");
         self.to_drop = Some(pr);
@@ -126,17 +99,13 @@ impl Inner {
 
 static CONSOLE: IrqSpinLock<Inner> = IrqSpinLock::new(LockRank::Leaf, Inner::new());
 
-/// Completes the parked read after the ISR deposits bytes (queued by the ISR).
 static CONSOLE_DPC: Dpc = Dpc::new(console_intr_dpc, core::ptr::null_mut());
 
-/// The leaked-`'static` console [`DeviceNode`] (refcount never drops to zero);
-/// [`device_ref`] hands out counted references for `/dev/console` lookups.
 static CONSOLE_NODE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Copy `src` into `buffer`'s frames starting at byte `buf_offset`, via the HHDM.
-/// The caller has bounds-checked `buf_offset + src.len() <= buffer.size()`
-/// (`sys_io_submit` does). Runs outside the console lock; the `MemoryObject` frames
-/// are kernel memory (not user memory), so this is sound from a DPC too.
+/// Copy `src` into `buffer`'s frames at byte `buf_offset`, via the HHDM; the caller has
+/// bounds-checked it. Runs outside the console lock; the frames are kernel memory, so it is sound
+/// from a DPC.
 ///
 /// # Safety
 ///
@@ -149,10 +118,8 @@ unsafe fn copy_into_memobj(buffer: *const (), buf_offset: u64, src: &[u8]) {
     mo.copy_in(buf_offset as usize, src);
 }
 
-/// [`CharBackend::submit_read`] for the console: satisfy the read immediately from
-/// the RX ring if any bytes are buffered (pre-signalling the PO), else park it for
-/// the next RX interrupt. Returns `WouldBlock` if a read is already pending (the
-/// Phase-2 console is single-reader). Runs in syscall context.
+/// [`CharBackend::submit_read`] for the console: satisfy the read now from the ring or park it for
+/// the next RX interrupt; `WouldBlock` if one is already pending. Syscall context.
 fn submit_read(
     buffer: &ObjectRef,
     po: &ObjectRef,
@@ -172,7 +139,6 @@ fn read(
     max_len: usize,
 ) -> Result<(), KError> {
     let mut tmp = [0u8; RING_CAP];
-    // Decide under the lock; do the copy + PO completion after releasing it.
     let found = input::read_or_park(
         || reclaim(console),
         || {
@@ -198,13 +164,11 @@ fn read(
     }
 }
 
-/// DPC: if a read is parked and the ring has bytes, drain them into the parked
-/// buffer and complete its PO (waking the reader). Queued by [`console_isr`].
+/// DPC: if a read is parked and the ring has bytes, drain them into it and complete its PO.
 fn console_intr_dpc(_ctx: *mut ()) {
     let mut tmp = [0u8; RING_CAP];
-    // **Take exclusive ownership for the duration** — see `Inner::to_drop`. Leaving the
-    // entry visible and merely flagging it reclaimable lets another CPU's `reap_pending`
-    // drop the last reference mid-copy (PR #178 review, blocking 1).
+    // **Exclusive ownership while delivering** (see `Inner::to_drop`): flagging it reclaimable
+    // would let another CPU's `reap_pending` drop it mid-copy.
     let completed = CONSOLE.lock().take_ready(&mut tmp);
     if let Some((pr, n)) = completed {
         // SAFETY: `pr` owns the `ObjectRef` pinning this `MemoryObject`, and `pr` is a local
@@ -212,23 +176,17 @@ fn console_intr_dpc(_ctx: *mut ()) {
         unsafe { copy_into_memobj(pr.buffer.as_ptr(), pr.buf_offset, &tmp[..n]) };
         // SAFETY: `pr` owns the reference pinning its `PendingOperation`.
         unsafe { crate::sched::complete_pending_op(pr.po.as_ptr(), 0, n as u64) };
-        // **Nothing is dropped here, deliberately.** This DPC used to release the parked
-        // read's `po`/`buffer` refs, justified by "refcount decrements only — the caller's
-        // handles keep the objects alive". That is false: nothing cancels a parked read, so
-        // a process that submits one and exits leaves the *last* references here, and
-        // `ObjectRef::drop` then runs `dispatch_destroy` → `SlabCache::free` in DPC context
-        // — the same-CPU allocator deadlock fixed for `io::block` (decision log,
-        // 2026-08-06). Publishing the entry for thread context is the hand-off; doing it
-        // **last** is what keeps it from being freed while the pointers above are in use.
+        // **Nothing is dropped here, deliberately.** Nothing cancels a parked read, so a process
+        // that submits one and exits leaves the *last* references here, and dropping them in DPC
+        // context runs `SlabCache::free` — the same-CPU allocator deadlock fixed for `io::block`
+        // (decision log, 2026-08-06). Publishing **last** keeps the entry live while the pointers
+        // above are in use.
         CONSOLE.lock().owe(pr);
     }
 }
 
-/// Drop a `ParkedRead` the DPC has finished with. **Thread context only** — this is where
-/// the refs a completed console read pinned are actually released.
-///
-/// Called from `sched::reap_pending` (so any CPU going idle reclaims) and from
-/// [`submit_read`] before parking a new read.
+/// Drop a `ParkedRead` the DPC has finished with, from `sched::reap_pending` and before a new read
+/// parks: **thread context only**, as the refs it pinned are released here.
 pub fn reclaim_completed() {
     reclaim(&CONSOLE);
 }
@@ -239,10 +197,8 @@ fn reclaim(console: &IrqSpinLock<Inner>) {
     drop(owed);
 }
 
-/// COM1 RX interrupt handler: drain every available byte into the ring, then — if a
-/// read is parked — queue the completion DPC. Minimal (no `SCHED`, no copy); the
-/// dispatch epilogue EOIs the local APIC after this returns. Reading `REG_DATA`
-/// clears the UART's RX-data-available condition.
+/// COM1 RX interrupt handler: drain every available byte into the ring, then queue the completion
+/// DPC if a read is parked. Minimal — no `SCHED`, no copy.
 extern "C" fn console_isr() {
     let parked = {
         let mut g = CONSOLE.lock();
@@ -257,8 +213,7 @@ extern "C" fn console_isr() {
     }
 }
 
-/// A counted reference to the console [`DeviceNode`] (for the `/dev/console`
-/// kernel server), or `None` before [`init`] runs.
+/// A counted reference to the console [`DeviceNode`], or `None` before [`init`] runs.
 pub fn device_ref() -> Option<ObjectRef> {
     let p = CONSOLE_NODE.load(Ordering::Acquire);
     if p.is_null() {
@@ -269,15 +224,11 @@ pub fn device_ref() -> Option<ObjectRef> {
     unsafe { ObjectRef::try_acquire(p, KObjectType::DeviceNode) }
 }
 
-/// Bring up console input: self-test the RX path via internal loopback, publish the
-/// console `DeviceNode`, then arm COM1's RX interrupt (IRQ 4). Call once at boot,
-/// after the interrupt router is initialised and with interrupts masked (the
-/// loopback self-test polls, so it must run before RX IRQs are armed). Logs a
-/// one-line result; not a `panic!` path.
+/// Bring up console input: self-test RX by internal loopback, publish the console `DeviceNode`, arm
+/// COM1's RX interrupt (IRQ 4). Call once at boot with interrupts masked (the self-test polls).
 pub fn init() {
-    // 1. Prove the RX register path deterministically (interrupts still masked) — once a UART
-    // is known to be there. Without one the self-test fails as surely as on a broken UART, and
-    // the laptop has none (Phase 5 Part D.1): say which it is.
+    // 1. Prove the RX path once a UART is known to be there; the laptop has none, and without one
+    // the self-test fails as on a broken UART.
     if !crate::arch::serial::console_present() {
         crate::kprintln!("console: no UART at COM1");
     } else if crate::arch::serial::console_rx_loopback_selftest() {
@@ -286,17 +237,13 @@ pub fn init() {
         crate::kprintln!("console: RX loopback self-test FAIL");
     }
 
-    // 2. Publish the console as a char DeviceNode (leaked `'static`).
     let backend = CharBackend { submit_read, submit_write: None, ctx: core::ptr::null_mut() };
     match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
         Ok(node) => {
-            // Leak the creation reference: the console lives for the kernel's
-            // lifetime. `device_ref` hands out counted references off this pointer.
             let ptr = KBox::into_raw(node).as_ptr() as *mut ();
             CONSOLE_NODE.store(ptr, Ordering::Release);
-            // **And in the device table**, with a counted reference of its own, so
-            // `/dev/registry` lists every node the kernel has (administration Part B). The
-            // console is served at `/dev/console`, which no index names.
+            // **And in the device table**, so `/dev/registry` lists it; it is served at
+            // `/dev/console`, which no index names.
             if let Some(r) = device_ref() {
                 crate::device::register_char(
                     r,
@@ -312,8 +259,7 @@ pub fn init() {
         }
     }
 
-    // 3. Arm RX: route the console UART's interrupt to our ISR and enable RX. The
-    // platform wiring (which IRQ, how routed) stays inside the arch console module.
+    // 3. Arm RX; which IRQ and how it is routed stays inside the arch console module.
     // SAFETY: ring-0, after `IrqRouter::init`; `console_isr` is valid for the
     // kernel's lifetime and we are ready to receive the IRQ.
     let vector = unsafe { crate::arch::serial::console_arm_rx(console_isr) };

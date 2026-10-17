@@ -2,47 +2,23 @@
 
 use super::*;
 
-/// The wallpaper, once it is on screen.
-///
-/// **The composed picture is kept**, which costs four megabytes for the machine's life and buys
-/// the overview its ground: the overview is a full-screen opaque window, so without this it
-/// covers the wallpaper with a flat colour and the desktop appears to lose its picture whenever
-/// you look at the desktops (reported from a real session, 2026-09-02). The alternatives are
-/// re-reading and re-decoding the file on every open — tens of milliseconds on a gesture that
-/// should feel instant — or keeping the *decoded* image instead, which is twice the size.
+/// The wallpaper, once it is on screen. The composed picture is kept (four megabytes) so the
+/// overview, a full-screen window, can draw it as its ground instead of re-decoding on every
+/// open.
 pub(super) struct Wallpaper {
     /// The window it lives in: named among the shell's own, and made sticky.
     pub(super) window: u32,
-    /// The screen-sized XRGB8888 composition, pitch [`Screen::pitch`]. Ground and picture,
-    /// exactly as committed.
+    /// The screen-sized XRGB8888 composition, pitch [`Screen::pitch`].
     pub(super) picture: alloc::vec::Vec<u8>,
 }
 
 /// Put the theme's wallpaper on screen, if it names one.
 ///
-/// **`Role::Panel` with a zero reservation, and that is the whole of "bottom-most and out of the
-/// way".** It is the one role that cannot take focus, so a press on the picture raises nothing
-/// and changes no focus — which is exactly what a press on bare desktop did before there was a
-/// picture there. A press on it still *dismisses* an open popup, because the compositor's rule
-/// is "anywhere that is not the popup" rather than "on a window" (M11 Part E batch 5), so the
-/// applications menu goes on closing when you click the desktop. And `reserve: 0` means a
-/// maximised window is still the work area: the wallpaper occupies the screen without claiming
-/// any of it.
-///
-/// A new `Role::Background` was the alternative and is not taken: it would be a wire change, a
-/// compositor stacking rule and a `check-display` reference, to express something three existing
-/// properties already say.
-///
-/// **Two buffers, and the second is dead.** `libsurface` refuses fewer, for a reason that is
-/// exactly right in general and does not apply here: a buffer is busy from commit until the
-/// compositor releases it, and the compositor releases the one that *left* the screen — so a
-/// single-buffered client can never draw a second frame. This window draws one frame ever and
-/// never asks for another, but the library cannot tell that kind of client from a stalled one.
-/// Four megabytes at 1280x800, on a 256 MB machine; a `create_static` that took the promise
-/// instead of the count is where this would go if it ever mattered.
-///
-/// Every failure returns `None` after saying which one it was: the desktop falls back to its
-/// ground colour, which is what a session with no wallpaper looks like anyway.
+/// `Role::Panel` with a zero reservation is the whole of "bottom-most and out of the way": it
+/// cannot take focus, so a press raises nothing yet still dismisses an open popup, and a
+/// maximised window is still the work area. Two buffers, the second dead: `libsurface` refuses
+/// fewer, as a single-buffered client can never draw a second frame. Every failure returns `None`
+/// after saying which; the desktop falls back to its ground colour.
 pub(super) fn open_wallpaper(
     ns: u64,
     session: &mut Session<ChannelTransport>,
@@ -53,9 +29,6 @@ pub(super) fn open_wallpaper(
     let bytes = match libfs::read_file(ns, path.as_str().as_bytes()) {
         Ok(b) => b,
         Err(e) => {
-            // **Absent and unreadable are different**, the same distinction `read_theme` makes:
-            // a person who named a file that is sitting there needs to know it was the *reading*
-            // that failed.
             let why: &[u8] = match e {
                 libfs::FileError::NotFound => b" is not there",
                 libfs::FileError::TooLarge => b" is too large to read",
@@ -73,7 +46,6 @@ pub(super) fn open_wallpaper(
         }
     };
     let size = Size::new(screen.width, screen.height);
-    // **Fit or fill, as the theme says** (M12 decision 7's key; `fill` since Phase 5 Part E).
     let plan = theme.wallpaper_mode.plan(Size::new(image.width(), image.height()), size);
     let pitch = screen.pitch();
     let len = pitch * screen.height as usize;
@@ -95,14 +67,9 @@ pub(super) fn open_wallpaper(
             return None;
         }
     };
-    // **Everything past `create` unwinds through one exit, because the window now exists.**
-    // Returning `None` from the middle would leave the compositor holding a full-screen,
-    // configured, hit-testable `panel` with nothing committed to it, for the life of the
-    // process — no manager is attached this early, so its initial `Configure` goes out at once.
-    // `open_overview` in `overview.rs` says this, and the modal it had before the Applications menu
-    // said it too, each after a review found it (PR #244 blocking 3, PR #237 finding 7); this is
-    // the third (PR #272 review, worth fixing 3). `Child::open`, which the menus use, says it in
-    // `libui`.
+    // Everything past `create` unwinds through one exit, because the window now exists: returning
+    // `None` would leave a full-screen, hit-testable `panel` with nothing committed, for the life
+    // of the process.
     let mut ok = true;
     for i in 0..BUFFERS {
         let Some((handle, addr)) = shared_buffer(len) else {
@@ -125,8 +92,6 @@ pub(super) fn open_wallpaper(
         }
     }
     if ok {
-        // A pattern guard cannot borrow mutably, so the commit is a statement rather than a
-        // `match` arm's condition.
         match session.window(id) {
             Some(mut w) => {
                 if w.commit(0, (0, 0, screen.width, screen.height)).is_err() {
@@ -146,15 +111,9 @@ pub(super) fn open_wallpaper(
         }
         return None;
     }
-    // **After the commit, not before it.** The first version of this line was printed as soon as
-    // the picture had been decoded and placed — so it said the wallpaper was fitted while
-    // `CreateWindow` went on to fail, and the gate asserting it passed against a desktop with no
-    // picture on it. A line has to be printed where the thing it claims has happened.
-    //
-    // **Both sizes, because they answer different questions.** The decoded size can only have
-    // come from an `IHDR` that was read; the drawn size can only have come from the placement
-    // arithmetic — fit or fill — having run on it. A gate asserting one proves less than a gate
-    // asserting both.
+    // After the commit, not before: a line must be printed where the thing it claims has
+    // happened. Both sizes: the decoded proves the `IHDR` was read, the drawn that the placement
+    // ran.
     Line::new()
         .s(b"desktop-shell: wallpaper ")
         .u(image.width() as u64)
@@ -176,27 +135,17 @@ pub(super) fn open_wallpaper(
 
 /// Read the session's theme from `THEME_PATH`, falling back to the built-in one.
 ///
-/// **In the user's home rather than in `/etc`**, and that is a namespace decision rather than a
-/// filing preference. A session namespace binds `/home`, `/bin`, `/dev/tty` and — for a
-/// graphical one — `/system/fonts`; it has no `/etc`, and `session-mgr/CLAUDE.md` says adding a
-/// member is a design decision each time. A theme is *a user's*, so the subtree a user already
-/// owns is where it belongs, and no new authority is needed to read it. It is also what makes
-/// the missing-file case testable from a prompt: the file is somewhere the person can delete.
-///
-/// **Every failure lands on the default**, silently as far as the screen is concerned: no file,
-/// an unreadable one, bytes that are not UTF-8, or a file of nothing but typos all produce the
-/// desktop that shipped. A theme is decoration, and a desktop that will not start because its
-/// colours did not parse is a worse failure than any colour could be.
+/// In the user's home, not `/etc`: a session namespace has none, and adding a member is a design
+/// decision (`session-mgr/CLAUDE.md`). Every failure lands on the default: a desktop that will
+/// not start because its colours did not parse is worse than any colour.
 pub(super) fn read_theme(ns: u64) -> Theme {
-    // **One line whatever happens, beginning the same way**, so a gate can assert that the shell
-    // *decided* about a theme without asserting which way it went — which is what makes "delete
-    // the file and everything still renders" a control that can be re-run against the committed
-    // gate rather than one that needs a step edited out (PR #263 review, finding 4).
+    // One line whatever happens, beginning the same way, so a gate can assert the shell decided
+    // about a theme without asserting which way.
     let bytes = match libfs::read_file(ns, THEME_PATH.as_bytes()) {
         Ok(b) => b,
         Err(e) => {
-            // **Absent and unreadable are different**, and saying "no such file" about a file
-            // that is sitting there is how somebody spends an afternoon looking for it.
+            // Absent and unreadable are different: "no such file" about one that is there costs
+            // an afternoon.
             let why: &[u8] = match e {
                 libfs::FileError::NotFound => b" absent; using the built-in theme",
                 libfs::FileError::TooLarge => b" too large to read; using the built-in theme",
@@ -235,8 +184,7 @@ pub(super) fn read_theme(ns: u64) -> Theme {
         .s(b" ignored), font_px ")
         .u(theme.font_px as u64)
         .end();
-    // **Each one named, up to a bound.** A person editing colours needs the line number, and a
-    // file of a thousand bad lines must not become a thousand console lines.
+    // Each one named, up to a bound: a thousand bad lines must not become a thousand console lines.
     for issue in issues.iter().take(MAX_LOGGED_THEME_ISSUES) {
         Line::new()
             .s(b"desktop-shell: theme line ")
@@ -251,7 +199,6 @@ pub(super) fn read_theme(ns: u64) -> Theme {
     theme
 }
 
-/// Where the session's theme lives, in the user's own subtree.
 const THEME_PATH: &str = "/home/theme.toml";
 
 /// How many bad theme lines are named before the rest are counted only.

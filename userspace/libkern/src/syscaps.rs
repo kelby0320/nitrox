@@ -1,10 +1,8 @@
 //! [`SysCaps`] — the userspace mirror of the kernel's process-capability bitmask.
 //!
-//! Ambient *per-process* authority, distinct from per-handle [`Rights`](crate::Rights).
-//! Userspace constructs a `SysCaps` value into [`SpawnArgs`](crate::abi::SpawnArgs) to
-//! grant a child a (necessarily ⊆-its-own) capability set. The bit positions are
-//! normative and must match `kernel/src/libkern/syscaps.rs`. See
-//! `docs/architecture/syscaps.md`.
+//! Ambient *per-process* authority, distinct from per-handle [`Rights`](crate::Rights);
+//! [`SpawnArgs`](crate::abi::SpawnArgs) grants a child a ⊆-its-own set. The bit positions
+//! must match `kernel/src/libkern/syscaps.rs`. See `docs/architecture/syscaps.md`.
 
 use core::ops::{BitAnd, BitOr, BitOrAssign};
 
@@ -64,7 +62,7 @@ impl SysCaps {
 pub const SYSCAP_BIND_NAMESPACE: u64 = SysCaps::BIND_NAMESPACE.bits();
 /// `u64` alias for `REAL_TIME`.
 pub const SYSCAP_REAL_TIME: u64 = SysCaps::REAL_TIME.bits();
-/// `u64` alias for `SYSTEM_CLOCK`: `sys_clock_set`'s authority (administration Part E.5).
+/// `u64` alias for `SYSTEM_CLOCK`: `sys_clock_set`'s authority.
 pub const SYSCAP_SYSTEM_CLOCK: u64 = SysCaps::SYSTEM_CLOCK.bits();
 
 impl BitOr for SysCaps {

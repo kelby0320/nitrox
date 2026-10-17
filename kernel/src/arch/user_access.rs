@@ -9,9 +9,6 @@
 //! impl. The neutral [`UserPtr`](crate::mm::user_access::UserPtr) /
 //! validation / public `copy_*_user` API is the arch-neutral half in
 //! `crate::mm::user_access`.
-//!
-//! The active architecture's implementation is re-exported from
-//! `crate::arch` as `UserAccess` (see `kernel/src/arch/mod.rs`).
 
 pub use crate::arch::x86_64::user_access::CstrCopyOutcome;
 

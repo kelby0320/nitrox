@@ -2,22 +2,21 @@
 
 use super::*;
 
-/// **The view broker, through its own protocol** (administration Part A.3), before any shell or
+/// **The view broker, through its own protocol**, before any shell or
 /// `with` exists to drive it. `boot-probe` holds the unscoped root namespace, so it can be both a
 /// supervisor — opening a session for the demo account — and a client in that session, at
 /// `/svc/views/s/<id>`, which is exactly what a session's `/dev/views` reaches.
 ///
-/// What it proves, in the order it runs, each a thing a later piece depends on:
+/// What it proves, in the order it runs:
 /// 1. a request the policy allows asks for a password;
-/// 2. a wrong password is refused with a retry, and the right one — offered straight after — is
+/// 2. a wrong password is refused with a retry, and the right one, offered straight after, is
 ///    **held for the session's delay** before it is answered;
 /// 3. **the grant arrived**: `nxinstall` is sent a copy of this namespace with `/dev/blk`
-///    removed, and still exits 0, which is "listed the devices it can see" — its 1 would be
-///    "none";
+///    removed, and still exits 0 ("listed the devices it can see"; 1 would be "none");
 /// 4. a client the broker lets in can start its program with its exit heard, even when the
 ///    broker has let in all it can;
 /// 5. **one guess per delay, however many requests**: passwords queued on two requests during
-///    one delay are answered a delay apart, not together when it ends;
+///    one delay are answered a delay apart;
 /// 6. a program outside a rule's `run` is refused by the policy;
 /// 7. `with --check`'s op refuses a policy nobody could administer, and a handle sent with an op
 ///    that takes none is closed rather than kept;
@@ -92,9 +91,8 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
         Some((false, body)) if matches!(parse_outcome(&body), Some((Outcome::Started, _))) => {}
         _ => return fail(b"the right password did not start the program"),
     }
-    // **Held, not merely slow.** The delay is two seconds; the scheduler's tick is ten
-    // milliseconds, so anything past 1.9 s is the broker holding the check, and an answer much
-    // sooner is a broker that did not.
+    // **Held, not merely slow.** The delay is two seconds and the scheduler's tick ten
+    // milliseconds, so past 1.9 s is the broker holding the check, and much sooner is not.
     let held = clock_ns().saturating_sub(refused_at);
     if held < 1_900_000_000 {
         return fail(b"the password after a wrong one was answered without the session's delay");
@@ -122,16 +120,14 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
     // SAFETY: closing our own handle; the request is done.
     unsafe { syscall1(SYS_HANDLE_CLOSE, cli) };
 
-    // 3b. **What `disks` leaves out** (administration Part C.6). The broker asks the storage
-    // service `InUse` first. `nxinstall` with no operand writes the devices it can reach to stdout
-    // as a table, so a pipe goes with the request and the listing is read back and held to the
-    // registry: **the ESP is in it, and the disk holding `init`'s root, the root itself and the
-    // mounted scratch disk are not**.
+    // 3b. **What `disks` leaves out.** The broker asks the storage service `InUse` first.
+    // `nxinstall` with no operand writes the devices it can reach to stdout as a table, so a
+    // pipe goes with the request and the listing is held to the registry: **the ESP is in it,
+    // and the disk holding `init`'s root, the root itself and the mounted scratch disk are not**.
     //
-    // **The listing, not an exit code.** The first version ran `nxinstall /dev/blk/0` and wanted 1.
-    // A control that handed over every disk passed it, because `nxinstall` refuses each in-use
-    // device by its own rules whether or not the grant withheld it: the running root's disk, a
-    // partition, a RAM disk.
+    // **The listing, not an exit code.** `nxinstall` refuses each in-use device by its own rules
+    // whether or not the grant withheld it, so a control that handed over every disk would
+    // still exit 1.
     let Some(registry) = registry_records(root_ns) else {
         return fail(b"the registry does not read");
     };
@@ -217,9 +213,8 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
     }
 
     // 4. **A client let in can always start its program.** Open clients until the broker refuses
-    // one, then start a program on the last it let in: that program's exit must still be heard.
-    // Admitting by what was open let the last channel into the last slot, and its program's life
-    // channel then had none — an exit never seen (PR #329 review, finding 5).
+    // one, then start a program on the last it let in: its exit must still be heard (admitting by
+    // what was open left its life channel no slot).
     let mut filled = alloc::vec::Vec::new();
     let refused = loop {
         let (st, ch) = ns_lookup(root_ns, client_path.as_bytes(), chan);
@@ -268,8 +263,8 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
     }
 
     // 5. Two more requests, `b` and `c`. `b` fails; then a password goes on each before the
-    // delay ends. Both are held — and when the first of them fails too, it holds the second
-    // (PR #329 review, blocking finding 1: they were once checked back to back).
+    // delay ends. Both are held, and when the first fails it holds the second, so they are
+    // not answered back to back.
     let mut pair = [0u64; 2];
     for (k, slot) in pair.iter_mut().enumerate() {
         let (st, ch) = ns_lookup(root_ns, client_path.as_bytes(), chan);
@@ -320,7 +315,6 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
         syscall1(SYS_HANDLE_CLOSE, c);
     }
 
-    // A second client in the same session: a program the `install` view does not include.
     let (st, cli2) = ns_lookup(root_ns, client_path.as_bytes(), chan);
     if st != 0 || cli2 == 0 {
         return fail(b"a second client channel");
@@ -341,7 +335,7 @@ pub(super) fn view_broker_test(root_ns: u64) -> bool {
     }
     // **A handle sent with anything but a request is closed.** Each op carries one end of a new
     // channel; the broker closing it is what the other end sees as `PeerClosed` — a leak would
-    // leave it open, and any program in any session can send handles (PR #329 review, finding 4).
+    // leave it open, and any program in any session can send handles.
     for (k, op) in [OP_VIEWS_STOP, OP_VIEWS_LIST, OP_VIEWS_CHECK].into_iter().enumerate() {
         let (mut ours, mut theirs) = (0u64, 0u64);
         // SAFETY: valid writable out-params.

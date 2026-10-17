@@ -1,37 +1,18 @@
-//! `input-server` — the userspace resource server behind `/dev/input/new` (plan M3 Part B).
+//! `input-server` — the userspace resource server behind `/dev/input/new`.
 //!
-//! **Everything that decides is in the library half** ([`input_server`]): the merge and what
-//! a slow consumer is owed, both host-tested without a kernel. This file is the parts that
-//! cannot be: reading the raw device nodes, serving forwarded resolves, and sending on
-//! channels.
+//! Decisions live in the library half ([`input_server`]); this file reads device nodes, serves
+//! resolves and sends.
 //!
-//! ## Shape
+//! 1. Subscribe to `/svc/devices/input`: the manager replays every keyboard and mouse as an
+//!    `Arrived` carrying its node, then `Settled` (`docs/spec/rsproto-devices-ops.md`). This is
+//!    the class's one reader; a second would drain events meant for the first.
+//! 2. Serve from `Settled` with whatever arrived, none included: send `Meta::Ready` transferring
+//!    the kernel end of a forwarding pair, which the supervisor binds at `/dev/input/new`.
+//! 3. A forwarded resolve of `new` mints a consumer channel; the other end is the answer.
 //!
-//! Modelled on `tty-server`, which sits over `/dev/console` the same way:
-//!
-//! 1. **Subscribe to `/svc/devices/input`** (administration Part B.3). The device manager
-//!    replays every keyboard and mouse as an `Arrived` carrying its node, then says `Settled`
-//!    (`docs/spec/rsproto-devices-ops.md`). The class has one owner, and this is it: a second
-//!    reader of a raw device would drain events meant for the first (`input-subsystem.md` §5).
-//! 2. **Serve from `Settled`, with whatever arrived** — none included. A machine without a
-//!    mouse, or without the manager, still has an input server, and later arrivals join it.
-//!    Mint a forwarding channel pair; send `Meta::Ready` on the control channel transferring
-//!    the kernel end, which the supervisor binds at `/dev/input/new`.
-//! 3. Serve. A forwarded resolve of `new` mints a **consumer channel**: the server keeps its
-//!    end and hands the other back as the resolve's answer, the directory-session shape
-//!    `/dev/draw/new` and `/dev/tty` already use.
-//!
-//! ## The read loop is the interesting part
-//!
-//! Every device is read with `sys_io_submit(Read)`, which returns a `PendingOperation` —
-//! and a PO is waitable, so one `sys_wait` covers the forwarding endpoint, the subscription,
-//! every outstanding read and every consumer channel. There is no polling and no thread per
-//! device.
-//!
-//! Each wakeup harvests whatever completed, merges it (`input_server::merge`), and forwards
-//! it — one batch for a keyboard and a mouse, more for more devices, each ending on a group
-//! boundary. Ordering is **batch-scoped** — see `docs/spec/rsproto-input-ops.md`, which
-//! states it normatively and says why a global order is not on offer.
+//! Every read is a waitable `PendingOperation`, so one `sys_wait` covers the forwarding endpoint,
+//! the subscription, every read and every consumer: no polling, no thread per device. Ordering
+//! is batch-scoped (`docs/spec/rsproto-input-ops.md`).
 
 #![no_std]
 #![no_main]
@@ -55,77 +36,50 @@ use libkern::{
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::{OP_INPUT_LIGHTS, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
-/// `alloc` backing. Nothing here allocates on the event path; the heap exists because
-/// `librsproto` and the panic path expect one.
+// Nothing allocates on the event path; `librsproto` and the panic path expect a heap.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// IPC message buffer length.
 const MSG_LEN: usize = 4096;
 /// Offset of the rsproto payload inside an `IpcMsg`.
 const PAYLOAD_OFF: usize = 24;
-/// One page for each device's read buffer.
 const PAGE: u64 = 4096;
 
 /// Where the device manager hands over input devices: resolving it is the subscription.
 const SUBSCRIPTION: &[u8] = b"/svc/devices/input";
 
-/// How long to wait for the manager's `Settled` before serving with what has arrived.
-///
-/// The manager queues the whole replay before the subscription's resolve completes, so `Settled`
-/// is waiting the moment the channel is; this bounds a manager that is not behaving, well inside
-/// the thirty seconds `service-mgr` gives a `Ready`. Anything that arrives after it still joins.
+/// How long to wait for `Settled` before serving with what arrived: it only bounds a
+/// misbehaving manager, well inside the thirty seconds `service-mgr` gives a `Ready`.
 const SETTLE_TIMEOUT_NS: u64 = 5_000_000_000;
 
-/// Consumers served at once.
-///
-/// One is the compositor; the rest leave room for a hotkey daemon or a diagnostic reader
-/// without making the wait set interesting.
+/// Consumers served at once: the compositor, and room for a hotkey daemon or a diagnostic reader.
 const MAX_CONSUMERS: usize = 4;
 
 /// Messages a consumer's ring holds before a send starts failing.
 ///
-/// **Sized against a repaint, not against the mouse.** One group is one message, so a 100 Hz
-/// mouse fills four slots in 40 ms — less than a single full-screen recompose takes the
-/// compositor under emulation. Deferral (see [`Consumer`]) is what makes the *cursor* immune to
-/// that, but a key or a button in an overflowing batch is still a real gap, and a gap resets the
-/// consumer's modifier and grab state. Sixteen covers a repaint at TCG speeds; each slot is a
-/// 4 KiB kernel message, so this is 64 KiB per consumer and worth it.
+/// Sized against a repaint: a 100 Hz mouse fills four slots in 40 ms, less than a recompose
+/// under emulation. Deferral keeps the cursor exact, but a lost key or button resets the
+/// consumer's modifier and grab state. Each slot is 4 KiB, so 64 KiB per consumer.
 const CONSUMER_QUEUE_DEPTH: u64 = 16;
 
-/// Messages the control ring holds. Requests here are rare and answered immediately.
 const CONTROL_QUEUE_DEPTH: u64 = 4;
 
-/// How many overruns to report before going quiet.
-///
-/// A bound rather than a rate limit: the interesting fact is *that* a consumer overran, and a
-/// consumer that has stopped reading for good would otherwise print one of these every 5 ms.
+/// Overruns to report before going quiet; a stopped consumer would print one every 5 ms.
 const MAX_LOGGED_OVERRUNS: u32 = 16;
 
-/// How many overruns have been reported. See [`MAX_LOGGED_OVERRUNS`].
 static mut OVERRUNS_LOGGED: u32 = 0;
 
-/// How long to wait before retrying a consumer that is holding deferred motion.
-///
-/// Short enough that a person cannot see the catch-up, long enough that a stalled consumer costs
-/// a handful of wakeups rather than a spin: the compositor's worst recompose is ~100 ms under
-/// emulation, so this is about twenty attempts across one, each of which is a `sys_wait` return
-/// and one non-blocking send.
+/// Retry interval for a consumer holding deferred motion: short enough that a person cannot see
+/// the catch-up, long enough that a stalled one costs a handful of wakeups rather than a spin
+/// (about twenty across a ~100 ms emulated recompose).
 const FLUSH_INTERVAL_NS: u64 = 5_000_000;
 
-/// Scratch for [`now_ns`].
 static mut CLOCK_BUF: u64 = 0;
 
 /// The monotonic clock in nanoseconds, or `None` if the read failed.
 ///
-/// Only the flush path needs this: every event the devices produce already carries the time its
-/// interrupt fired.
-///
-/// **The return is checked, and the second `SAFETY` used to assert what it did not check.**
-/// `CLOCK_MONOTONIC` with a valid out-pointer cannot fail today, so this is defensive — but the
-/// failure it defends against is not benign: `CLOCK_BUF` would keep a stale value, the flush
-/// deadline would land in the past on every iteration, and the 5 ms retry would become a spin
-/// (PR #246 review, optional 9). Callers turn `None` into "wait indefinitely" instead.
+/// Checked because a failed read would leave `CLOCK_BUF` stale, the flush deadline in the past
+/// and the 5 ms retry a spin; callers turn `None` into "wait indefinitely".
 fn now_ns() -> Option<u64> {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
@@ -146,7 +100,6 @@ static mut SEND_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] = [0; libkern::abi:
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] = [0; libkern::abi::MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] = [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
 
-/// Close `h` if it is a handle at all.
 fn close(h: u64) {
     if h != 0 {
         // SAFETY: closing a handle this process owns and will not use again.
@@ -154,15 +107,14 @@ fn close(h: u64) {
     }
 }
 
-/// One device: its node, its kind, its registry id, its read buffer, the read currently outstanding
-/// on it, and where it is in leaving.
+/// One device: its node, read buffer and outstanding read.
 struct Device {
     node: u64,
-    /// What the manager said it is — which decides whether it is written the lights.
+    /// Decides whether it is written the lights.
     kind: DeviceKind,
     /// Its registry id, which the manager's `Departed` names.
     id: u32,
-    /// Where it is in leaving (Phase 6 Part C): see [`input_server::leaving`].
+    /// See [`input_server::leaving`].
     leaving: Leaving,
     /// Both its node and the manager have said it has gone: the serve loop retires its slot.
     retire_due: bool,
@@ -173,8 +125,7 @@ struct Device {
 }
 
 impl Device {
-    /// Take `node` — the handle an `Arrived` carried — and map a read buffer for it. `None`, with
-    /// the node closed, if the buffer cannot be had.
+    /// Map a read buffer for `node`; `None`, with the node closed, if it cannot be had.
     fn adopt(node: u64, kind: DeviceKind, id: u32) -> Option<Self> {
         // SAFETY: register-only syscall.
         let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
@@ -193,11 +144,8 @@ impl Device {
         Some(Self { node, kind, id, leaving: Leaving::Present, retire_due: false, buf_h, buf_addr, po: 0 })
     }
 
-    /// Let the device go: its read, its buffer and its node.
-    ///
-    /// **A read still parked in the kernel is safe to walk away from**: the driver holds its own
-    /// reference to the buffer object (`ps2`'s `submit_read` clones it), so what it writes lands
-    /// in memory the kernel keeps alive, not in this process's freed mapping.
+    /// A read still parked in the kernel is safe to abandon: the driver holds its own reference
+    /// to the buffer object, so it never writes freed memory.
     fn retire(self) {
         close(self.po);
         // SAFETY: unmapping this device's own read buffer, which nothing here reads again.
@@ -206,8 +154,7 @@ impl Device {
         close(self.node);
     }
 
-    /// **Its node answered `PeerClosed`** (Phase 6 Part C): it is not read again, the line is logged
-    /// once, and the slot is due for retiring if the manager has already said `Departed`.
+    /// Its node answered `PeerClosed`: not read again, logged once.
     fn peer_closed(&mut self) {
         let (news, act) = self.leaving.peer_closed();
         if news {
@@ -216,8 +163,7 @@ impl Device {
         self.retire_due |= act == Act::Retire;
     }
 
-    /// Submit a read if none is outstanding and its node is still read. Idempotent, so the caller
-    /// can call it after every harvest without tracking state.
+    /// Submit a read if none is outstanding and its node is still read. Idempotent.
     fn arm(&mut self) {
         if self.po != 0 || !self.leaving.reading() {
             return;
@@ -235,20 +181,16 @@ impl Device {
         if po > 0 {
             self.po = po as u64;
         } else if po == KError::PeerClosed.as_i32() as i64 {
-            // **Its device has gone, and its node has nothing left to read** (Phase 6 Part C).
+            // Its device has gone and its node has nothing left to read.
             self.peer_closed();
         } else {
-            // The device drops out of the wait set until something else wakes the loop, and
-            // on a quiet machine nothing may — so this is a device that stops delivering.
-            // Diagnosable rather than silent (PR #179 review, finding 8).
+            // The device drops out of the wait set and may stop delivering; say so.
             kprint(b"input-server: read submit FAILED -- device may stall\n");
         }
     }
 
-    /// Harvest a completed read into `out`, returning how many events arrived.
-    ///
-    /// Consumes the `PendingOperation` handle, so the next [`arm`](Self::arm) submits a
-    /// fresh read.
+    /// Harvest a completed read into `out`, consuming its `PendingOperation` so the next
+    /// [`arm`](Self::arm) submits a fresh one. Returns how many events arrived.
     fn harvest(&mut self, out: &mut [InputEvent]) -> usize {
         if self.po == 0 {
             return 0;
@@ -297,7 +239,6 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     if status != 0 || resolved == 0 { None } else { Some(resolved) }
 }
 
-/// Block until `h` signals.
 fn wait_one(h: u64) {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers for one waiter.
     unsafe {
@@ -308,16 +249,10 @@ fn wait_one(h: u64) {
 
 /// Read a completed `PendingOperation`'s `(status, result)` from the last wait's records.
 ///
-/// Re-waits with an immediate deadline rather than trusting a stale record: a PO that has
-/// completed is **level**-signalled and is never consumed by a wait (unlike an
-/// `InterruptObject`), so this returns at once.
-///
-/// **It clobbers `WAIT_RESULTS[0..24]`, and that is only safe because of a fact worth
-/// stating.** `serve_loop` is iterating that same buffer when it calls this. The inner wait
-/// passes `count = 1`, so the kernel writes exactly one record — and the outer loop has
-/// already read the record for the handle it is currently processing. Widening this call to
-/// wait on more than one handle would silently corrupt the loop's iteration (PR #179 review,
-/// which verified the current form and noted nothing said why it holds).
+/// A completed PO is level-signalled and never consumed by a wait, so the immediate-deadline
+/// re-wait returns at once. It clobbers `WAIT_RESULTS[0..24]` while `serve_loop` iterates that
+/// buffer, which is safe because `count = 1` writes one record and the loop has already read
+/// its current one; waiting on more handles here would corrupt it.
 fn po_completion(po: u64) -> (i32, u64) {
     // SAFETY: one waiter, valid buffers; a completed PO is already signalled.
     let n = unsafe {
@@ -344,8 +279,7 @@ fn po_completion(po: u64) -> (i32, u64) {
     }
 }
 
-/// Create a connected channel pair with a `depth`-message ring each. Returns `(kernel_end,
-/// serve_end)`.
+/// Returns `(kernel_end, serve_end)`, each with a `depth`-message ring.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
     let cr =
@@ -357,7 +291,6 @@ fn make_channel(depth: u64) -> Option<(u64, u64)> {
     Some(unsafe { ((&raw const CTRL_OUT0).read(), (&raw const CTRL_OUT1).read()) })
 }
 
-/// Send `Meta::Ready` on the control channel, transferring `kernel_end`.
 fn send_ready(control: u64, kernel_end: u64) -> bool {
     let mut body = [0u8; librsproto::meta::READY_PREFIX_LEN + 16];
     let Some(body_len) = librsproto::meta::ready(&mut body, b"input-server") else { return false };
@@ -384,7 +317,6 @@ fn send_ready(control: u64, kernel_end: u64) -> bool {
     }
 }
 
-/// Answer a forwarded resolve by handing back `client_end` as a channel.
 fn reply_session(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
     if resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0).is_none() {
@@ -410,7 +342,6 @@ fn reply_session(serve_end: u64, request_id: u64, client_end: u64) -> bool {
     }
 }
 
-/// Answer a forwarded resolve with an error.
 fn reply_resolve_error(serve_end: u64, request_id: u64, err: KError) -> bool {
     let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
     let elen = librsproto::error::error_body(&mut ebody, err.as_i32(), 0, b"").unwrap_or(0);
@@ -439,10 +370,8 @@ fn reply_resolve_error(serve_end: u64, request_id: u64, err: KError) -> bool {
     }
 }
 
-/// Send one `Input::Events` batch to a consumer. Returns whether it went.
 fn send_events(channel: u64, events: &[InputEvent]) -> bool {
-    // `FRAME_MAX`, not `BATCH_MAX`: what goes on the wire is a *framed* batch, which can carry
-    // a loss marker and a recovered motion group in front of it.
+    // `FRAME_MAX`, not `BATCH_MAX`: a framed batch also carries a loss marker and recovered motion.
     let mut body = [0u8; FRAME_MAX * INPUT_EVENT_LEN];
     let n = events.len() * INPUT_EVENT_LEN;
     if n > body.len() {
@@ -476,27 +405,22 @@ fn send_events(channel: u64, events: &[InputEvent]) -> bool {
 
 /// Everything the serve loop owns.
 struct Server {
-    /// The devices, by slot — `table` says which registry id holds each.
     devices: [Option<Device>; MAX_DEVICES],
     table: Table,
-    /// The subscription to [`SUBSCRIPTION`], or `0` when there is none: the manager was not
-    /// there, or has gone. The devices already read stay read either way.
+    /// The subscription to [`SUBSCRIPTION`], or `0` when the manager was not there or has gone.
     subscription: u64,
     /// Consumer channel handles, `0` for a free slot.
     channels: [u64; MAX_CONSUMERS],
-    /// What each consumer is owed, parallel to `channels`.
     consumers: [Consumer; MAX_CONSUMERS],
-    /// The control channel, for `service --stop` (administration Part E.2); `0` once its
-    /// supervisor has gone, when it would stay signalled for good.
+    /// The control channel, for `service --stop`; `0` once its supervisor has gone, when it would
+    /// stay signalled for good.
     control: u64,
-    /// The lights a consumer last asked for, or `None` before any has (Phase 6 Part B.5): until
-    /// one does, a keyboard keeps whatever its driver set.
+    /// The lights a consumer last asked for; until one does, a keyboard keeps its driver's.
     lights: Option<u8>,
-    /// The page a lights write is read from — `(handle, address)`, made by the first request.
+    /// The page a lights write is read from, `(handle, address)`.
     lights_buf: Option<(u64, u64)>,
 }
 
-/// The page [`write_lights`] reads its byte from, made the first time it is needed.
 fn lights_buffer(srv: &mut Server) -> Option<(u64, u64)> {
     if srv.lights_buf.is_none() {
         // SAFETY: register-only syscall.
@@ -515,12 +439,8 @@ fn lights_buffer(srv: &mut Server) -> Option<(u64, u64)> {
     srv.lights_buf
 }
 
-/// **Write `lights` to `d`** if it is a keyboard (Phase 6 Part B.5): one byte, through its node.
-///
-/// **Fire and forget.** The driver reads the byte when the write is submitted — so one page serves
-/// every keyboard and every request — and completes the write once the keyboard has answered;
-/// nothing here waits on that, so the operation's handle is closed at once. A keyboard that does
-/// not answer costs a line in the kernel's log, not a stalled input stream.
+/// Fire and forget: the driver reads the byte at submit, so one page serves every keyboard, and
+/// nothing waits for the keyboard's answer.
 fn write_lights(srv: &mut Server, d: &Device, lights: u8) {
     if d.kind != DeviceKind::Keyboard {
         return;
@@ -541,7 +461,6 @@ fn write_lights(srv: &mut Server, d: &Device, lights: u8) {
     }
 }
 
-/// **Set every keyboard's lights to `lights`**, and remember them for keyboards still to come.
 fn set_lights(srv: &mut Server, lights: u8) {
     srv.lights = Some(lights);
     for slot in 0..MAX_DEVICES {
@@ -552,8 +471,6 @@ fn set_lights(srv: &mut Server, lights: u8) {
     }
 }
 
-/// The lights a consumer's message, just received into `RECV_MSG`, asks for — or `None` if it is
-/// not an `Input::Lights` with a valid body.
 fn consumer_lights() -> Option<u8> {
     // SAFETY: a bounded read of the payload the kernel just wrote.
     let payload = unsafe {
@@ -567,7 +484,6 @@ fn consumer_lights() -> Option<u8> {
     lights_request(m.body)
 }
 
-/// Mint a consumer channel and answer the resolve with it.
 fn open_consumer(serve_end: u64, request_id: u64, srv: &mut Server) {
     let Some(slot) = srv.channels.iter().position(|&c| c == 0) else {
         reply_resolve_error(serve_end, request_id, KError::OutOfHandles);
@@ -580,8 +496,7 @@ fn open_consumer(serve_end: u64, request_id: u64, srv: &mut Server) {
     srv.channels[slot] = server_end;
     srv.consumers[slot] = Consumer::new();
     if !reply_session(serve_end, request_id, consumer_end) {
-        // The reply failed, so the consumer never received its end: drop both rather than
-        // leaving a slot occupied by a peer that does not exist.
+        // The consumer never received its end: drop both rather than hold a slot for no peer.
         // SAFETY: closing two handles this process owns and will not use.
         unsafe {
             syscall4(SYS_HANDLE_CLOSE, consumer_end, 0, 0, 0);
@@ -593,27 +508,17 @@ fn open_consumer(serve_end: u64, request_id: u64, srv: &mut Server) {
 
 /// Whether any **live** consumer is owed a send.
 ///
-/// **Live, which is the whole of the fix.** `forward` skips a slot whose channel is zero, so a
-/// debt recorded against a consumer that then disconnected can never be cleared — and the two
-/// callers of this decide whether to arm a 5 ms retry. Scanning `consumers` alone made a
-/// graphical session that ended mid-debt into a permanent 200 Hz wakeup loop for the rest of the
-/// boot, doing nothing on each pass (PR #246 review, finding 2). The reap also clears the debt;
-/// this makes the question un-askable wrongly rather than merely answered right once.
+/// A debt against a disconnected consumer can never be cleared; counting it would arm the 5 ms
+/// retry forever.
 fn owes_send(srv: &Server) -> bool {
     (0..MAX_CONSUMERS).any(|i| srv.channels[i] != 0 && srv.consumers[i].owes_send())
 }
 
 /// Forward one merged batch to every consumer.
 ///
-/// A send that fails is **not** retried here and now: the records are handed back to the
-/// consumer, which carries the relative motion among them forward and counts the rest as a gap
-/// to announce with `SYN_DROPPED` (`rsproto-input-ops.md` § Loss). That is what lets this server
-/// have no flow control — a consumer that falls behind is caught up on the next send rather than
-/// stalling everyone else — and it is why the cursor cannot drift: **the motion is deferred, not
-/// dropped**.
-///
-/// `batch` may be empty, which is the flush pass: a consumer that owes deferred motion is sent it
-/// on the next wakeup rather than on the next thing the user happens to do.
+/// A failed send is not retried: the records go back to the consumer (`rsproto-input-ops.md`
+/// § Loss), so there is no flow control and a slow consumer never stalls the others. An empty
+/// `batch` is the flush pass.
 fn forward(srv: &mut Server, batch: &[InputEvent], now_ns: u64) {
     let mut framed = [InputEvent::default(); FRAME_MAX];
     for i in 0..MAX_CONSUMERS {
@@ -621,20 +526,14 @@ fn forward(srv: &mut Server, batch: &[InputEvent], now_ns: u64) {
             continue;
         }
         match srv.consumers[i].frame(batch, now_ns, &mut framed) {
-            // Nothing new and nothing owed: an empty message would wake the consumer to read
-            // no events, which on a flush pass is every consumer that was already up to date.
+            // Nothing new and nothing owed: an empty message would wake the consumer for nothing.
             Some(0) => {}
             Some(n) if send_events(srv.channels[i], &framed[..n]) => {}
-            // **What was framed, not the batch it came from.** `frame` clears both debts as it
-            // writes them, so handing back the batch would forget the marker and the recovered
-            // motion that had just been prepended to it.
+            // Hand back what was framed, not the batch: `frame` cleared both debts as it wrote
+            // them, so the batch alone would forget the marker and recovered motion.
             Some(n) => {
-                // **Said out loud, bounded.** An overrun is invisible from outside — the whole
-                // point of deferral is that the consumer cannot tell — so a gate asserting that
-                // motion survived one has no way to know an overrun happened, and would pass
-                // just as well against a run where the ring never filled. That is exactly how
-                // the first version of this guard passed under KVM (PR #246 review, blocking 1).
-                // This line is its precondition.
+                // Deferral hides an overrun from the consumer, so a gate that asserts motion
+                // survived one needs this line to know the ring really filled.
                 // SAFETY: single-threaded server; the counter is touched only from this loop.
                 unsafe {
                     if OVERRUNS_LOGGED < MAX_LOGGED_OVERRUNS {
@@ -656,7 +555,6 @@ fn forward(srv: &mut Server, batch: &[InputEvent], now_ns: u64) {
     }
 }
 
-/// The word for `kind` in a log line.
 fn kind_word(kind: DeviceKind) -> &'static [u8] {
     match kind {
         DeviceKind::Keyboard => b"keyboard",
@@ -676,8 +574,7 @@ fn apply(srv: &mut Server, n: Notice, handles: &[u64]) -> bool {
         Notice::Arrived { id, kind } => match srv.table.arrive(id) {
             Arrival::Slot(slot) => match Device::adopt(handles[0], kind, id) {
                 Some(d) => {
-                    // **A keyboard that arrives is told the lights already on**, or plugging one
-                    // in beside a keyboard with Caps Lock on would show it off.
+                    // A new keyboard is told the lights already on, or it would show Caps Lock off.
                     if let Some(l) = srv.lights {
                         write_lights(srv, &d, l);
                     }
@@ -716,8 +613,8 @@ fn apply(srv: &mut Server, n: Notice, handles: &[u64]) -> bool {
                 .end();
         }
         Notice::Settled(_) => return true,
-        // **Retired once its node has answered `PeerClosed` too** (Phase 6 Part C): until then the
-        // releases its driver pushed may still be in its ring, and it is read.
+        // Retired once its node has answered `PeerClosed` too: until then its ring may still hold
+        // releases, so it is read.
         Notice::Departed(id) => {
             if let Some(slot) = srv.table.slot(id)
                 && let Some(d) = srv.devices[slot].as_mut()
@@ -738,7 +635,6 @@ fn apply(srv: &mut Server, n: Notice, handles: &[u64]) -> bool {
     false
 }
 
-/// **Retire every slot both its node and the manager have let go** (Phase 6 Part C).
 fn retire_due(srv: &mut Server) {
     for slot in 0..MAX_DEVICES {
         if !srv.devices[slot].as_ref().is_some_and(|d| d.retire_due) {
@@ -754,8 +650,7 @@ fn retire_due(srv: &mut Server) {
 
 /// Take every message waiting on the subscription. Returns whether one of them was `Settled`.
 ///
-/// **A manager that has gone takes nothing with it**: the devices already read keep being read,
-/// and only arrivals stop — which is all the manager was for.
+/// A manager that has gone takes nothing with it: devices already read stay read.
 fn take_notices(srv: &mut Server) -> bool {
     let mut settled = false;
     while srv.subscription != 0 {
@@ -800,8 +695,7 @@ fn take_notices(srv: &mut Server) -> bool {
     settled
 }
 
-/// Take the manager's replay — every keyboard and mouse it has — until `Settled`, or until
-/// [`SETTLE_TIMEOUT_NS`] says to serve with what came. Returns whether it settled.
+/// Take the manager's replay until `Settled` or [`SETTLE_TIMEOUT_NS`]. Returns whether it settled.
 fn settle(srv: &mut Server) -> bool {
     let deadline = now_ns().map(|t| t.saturating_add(SETTLE_TIMEOUT_NS));
     while srv.subscription != 0 {
@@ -844,12 +738,9 @@ fn serve_forward(serve_end: u64, srv: &mut Server) -> bool {
         match decode(req) {
             Ok(m) if m.op == OP_NS_RESOLVE => {
                 let suffix = librsproto::namespace::parse_resolve_request(m.body).map(|r| r.suffix).unwrap_or(b"");
-                // **The empty suffix is the match**, not `b"new"`. This server is bound
-                // at the *leaf* `/dev/input/new`, so a resolve of that path arrives with
-                // nothing left over. The compositor's `b"new"` check looks similar and is
-                // not the same case: it is bound at the subtree `/dev/draw`, so
-                // `/dev/draw/new` leaves `new` behind. Binding a subtree at `/dev/input`
-                // instead would collide with the kernel's `/dev/input/raw`.
+                // The empty suffix is the match: this server is bound at the leaf
+                // `/dev/input/new`, so nothing is left over. (A subtree at `/dev/input` would
+                // collide with the kernel's `/dev/input/raw`.)
                 (m.request_id, suffix.is_empty(), true)
             }
             Ok(m) => (m.request_id, false, true),
@@ -867,8 +758,6 @@ fn serve_forward(serve_end: u64, srv: &mut Server) -> bool {
     true
 }
 
-/// The serve loop: the forwarding endpoint, the subscription, every device's read, and every
-/// consumer channel, all under one `sys_wait`.
 fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
     kprint(b"input-server: serving /dev/input/new\n");
     let mut harvested = [[InputEvent::default(); PER_DEVICE]; MAX_DEVICES];
@@ -906,12 +795,8 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                     n += 1;
                 }
             }
-            // **Bounded while anything is owed.** A consumer that could not be sent to is
-            // holding movement the user already made; waiting indefinitely would hold it until
-            // the next event, so the cursor would stop short and then jump when the mouse was
-            // next touched. With nothing owed this is still an indefinite sleep, not a poll.
-            // A clock that will not answer means no deadline rather than one in the past: an
-            // expired deadline is a spin, and waiting for the next event is a delay.
+            // Bounded only while something is owed; otherwise an indefinite sleep. No clock
+            // means no deadline rather than one in the past, which would spin.
             let deadline = match owes_send(srv).then(now_ns).flatten() {
                 Some(t) => t.saturating_add(FLUSH_INTERVAL_NS),
                 None => u64::MAX,
@@ -919,25 +804,20 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, n as u64, (&raw mut WAIT_RESULTS) as u64, deadline)
         };
         if waited < 1 {
-            // **A timeout is the flush pass**, not an error: the deadline above is set only
-            // when a consumer owes deferred motion, so waking with no handle ready means it is
-            // time to try that consumer again.
+            // A timeout is the flush pass, not an error.
             if waited == KError::TimedOut.as_i32() as i64 {
-                // The stamp only reaches records this server synthesises — a loss marker and a
-                // recovered motion group — and nothing reads it today, so a clock that will not
-                // answer costs a zero rather than a dropped flush.
+                // The stamp reaches only synthesised records, so no clock costs a zero.
                 forward(srv, &[], now_ns().unwrap_or(0));
                 continue;
             }
-            // Otherwise the error path — retrying it silently spins the loop at 100% with
-            // nothing to show for it.
+            // Retrying an error silently would spin the loop.
             kprint(b"input-server: sys_wait FAILED\n");
             continue;
         }
 
         let mut forward_pending = false;
-        // **The subscription is read after the harvest, not during it.** A departure closes a
-        // device's read, and a later record in this same wait's results could name that handle.
+        // The subscription is read after the harvest: a departure closes a device's read, and a
+        // later record in this wait's results could name that handle.
         let mut notices_pending = false;
         let mut counts = [0usize; MAX_DEVICES];
         for j in 0..(waited as usize) {
@@ -975,15 +855,8 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                 // A read that completed `PeerClosed` is retired at the top of the next pass, after
                 // what this one harvested from the other devices is forwarded.
             } else if let Some(slot) = srv.channels.iter().position(|&c| c == h && c != 0) {
-                // **A signal here means one of two things, and they must be told apart.**
-                // The kernel signals an endpoint when its receive queue is non-empty *or*
-                // its peer is gone. Treating both as "gone" — which this did first — cuts
-                // the input stream of any consumer that ever sends, with no error to either
-                // side: a Part C hotkey registration, a `Meta::QueryCaps`, or a stray reply
-                // from a client library would all silently unsubscribe it
-                // (PR #179 review, finding 4). Nothing sends today, which is exactly why the
-                // bug would have waited for the consumer that does.
-                //
+                // A signal means the receive queue is non-empty or the peer is gone; treating
+                // both as gone would silently cut the stream of any consumer that ever sends.
                 // SAFETY: valid recv out-params on a live endpoint.
                 let rr = unsafe {
                     syscall4(
@@ -997,14 +870,11 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
                 if rr == KError::PeerClosed.as_i32() as i64 {
                     close(srv.channels[slot]);
                     srv.channels[slot] = 0;
-                    // **And what it was owed goes with it.** A debt outlives its consumer
-                    // otherwise: nothing can deliver it, and `owes_send` would keep arming the
-                    // flush deadline over it forever.
+                    // Its debt goes with it: nothing could deliver it.
                     srv.consumers[slot] = Consumer::new();
                 } else if rr == 0 {
-                    // A message from a consumer: the lights it wants (Phase 6 Part B.5), and
-                    // nothing else — anything else is drained and ignored rather than guessed at,
-                    // with a line, because a client sending into silence is worth one in the log.
+                    // A consumer's message is the lights it wants; anything else is drained and
+                    // ignored, with a line.
                     match consumer_lights() {
                         Some(l) => set_lights(srv, l),
                         None => kprint(b"input-server: ignoring an unexpected message from a consumer\n"),
@@ -1016,25 +886,14 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
         if counts.iter().any(|&c| c > 0) {
             let sources: [&[InputEvent]; MAX_DEVICES] = core::array::from_fn(|i| &harvested[i][..counts[i]]);
             let n = merge(&sources, &mut merged);
-            // **One batch for a keyboard and a mouse; more, in order, for more devices** — each
-            // ends on a group boundary, so no group is split across messages.
             for run in batches(&merged[..n], BATCH_MAX) {
-                // The stamp on the loss marker and on recovered motion only: every real event
-                // already carries the time its interrupt fired, which is the point of `time_ns`.
-                //
-                // **The batch's *first* timestamp, because both are written in front of it.**
-                // Stamping them with the last one made `time_ns` run backwards inside a single
-                // framed message, and `rsproto-input-ops.md` § Ordering invites a consumer to
-                // sort by it for a total order — which would move the recovered motion after the
-                // batch, the one placement `frame` documents as wrong. Nothing reads `time_ns`
-                // today; that is a reason to fix it cheaply, not to leave it (PR #246 review,
-                // optional 8).
+                // Stamps the marker and recovered motion written in front of the batch, so it is
+                // the batch's first time: a later one would run `time_ns` backwards.
                 let stamp = merged[run.start].time_ns;
                 forward(srv, &merged[run], stamp);
             }
         } else if owes_send(srv) {
-            // Woken by something else — a resolve, a consumer's message — with motion still
-            // owed. Sending it now costs one message and saves a whole flush interval.
+            // Woken by something else with motion still owed: send it now.
             forward(srv, &[], now_ns().unwrap_or(0));
         }
         if notices_pending {
@@ -1047,8 +906,7 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
     }
 }
 
-/// Called by the kernel's ELF entry with the standard bootstrap arguments; `ctrl` is the
-/// control channel the supervisor spawned this server with.
+/// ELF entry; `ctrl` is the control channel the supervisor spawned this server with.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     kprint(b"input-server: up\n");
@@ -1063,10 +921,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         lights: None,
         lights_buf: None,
     };
-    // **Devices come from the manager, and there is no fallback to the raw paths**
-    // (administration Part B): a second path that runs only when the first is broken is a path
-    // nobody tests. Without a manager, or with no devices, this still serves — a consumer gets a
-    // stream with nothing in it, which is the truth — where it used to exit for want of a mouse.
+    // Devices come from the manager with no fallback to raw paths: a path that runs only when
+    // the first is broken is one nobody tests. With no manager or devices it still serves an
+    // empty stream.
     srv.subscription = lookup(root_ns, SUBSCRIPTION, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT).unwrap_or(0);
     if srv.subscription == 0 {
         Line::new().s(b"input-server: could not subscribe at ").s(SUBSCRIPTION).s(b" -- serving no devices").end();

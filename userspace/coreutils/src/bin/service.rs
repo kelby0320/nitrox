@@ -1,34 +1,20 @@
 //! `service` — the system's services: what each is doing, and starting, stopping and restarting
-//! them (administration Part E.2).
-//!
-//! ```text
-//! service --list               # every declared service, its state, and how often it restarted
-//! service --start NAME         # start a service that is not running
-//! service --stop NAME          # ask a running service to stop
-//! service --restart NAME       # stop it and start it again
-//! ```
+//! them.
 //!
 //! ## Two endpoints, two authorities
 //!
 //! **`--list` reads what every session can**: `/dev/services/all.tsm`, `service-mgr`'s table,
-//! through the session endpoint every login binds. It needs no grant, and it is the same table a
-//! pipeline can `open` and `filter`.
+//! through the session endpoint every login binds. It needs no grant.
 //!
 //! **`--start`, `--stop` and `--restart` need the `services` grant.** They speak `Services`
 //! (`rsproto-services-ops.md`) on `/dev/services/admin`, which the view broker binds only into a
-//! view whose profile grants `services`. Without it that path reaches the session endpoint, where
-//! `admin` is no table and nothing answers: `service` says so and names `with`. **`service-mgr`
-//! does the refusing that matters** — an essential service, a name nothing declares, a stop not
-//! honoured — and its reason is printed as it gave it.
+//! view whose profile grants `services`. Without it nothing answers there: `service` says so and
+//! names `with`. **`service-mgr` does the refusing that matters** — an essential service, a name
+//! nothing declares, a stop not honoured — and its reason is printed as it gave it. Each is
+//! answered once it has happened, and `service` waits for that answer.
 //!
-//! Each is answered once it has happened: a stop once the service has exited, a start once it is
-//! up. `service` waits for that answer.
-//!
-//! ## A typed result, and a line on the console
-//!
-//! Each verb writes a table on stdout, text when there is none, like `disk`. And each says what
-//! happened on the console too, since a terminal on a release image renders nothing a gate can
-//! read.
+//! Each verb writes a table on stdout, text when there is none, and says what happened on the
+//! console too, since a terminal on a release image renders nothing a gate can read.
 
 #![no_std]
 #![no_main]
@@ -51,13 +37,10 @@ use libstream::table::TableWriter;
 use libstream::wire::Table;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: the TSM1 encoder and decoder allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The table of every service, through the session endpoint.
 const TABLE: &[u8] = b"/dev/services/all.tsm";
-/// Where the `services` grant binds the admin endpoint.
 const ADMIN: &[u8] = b"/dev/services/admin";
 
 const FLAGS: [Flag; 4] = [
@@ -110,11 +93,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(code)
 }
 
-/// Say `text` where the person reads it and on the console, where a gate does.
-///
-/// **Once on the console, and escaped there.** Without a `stderr`, `diag` is the console already.
-/// The console's copy goes through [`Line::untrusted`], since it carries a name someone typed and
-/// `service-mgr`'s reason.
+/// Say `text` where the person reads it and on the console, where a gate does; the console's
+/// copy is escaped by [`Line::untrusted`], since it carries a name someone typed.
 fn say(stage: &Stage, text: &str) {
     if stage.streams.stderr.is_some() {
         stage.diag(text.as_bytes());
@@ -122,7 +102,6 @@ fn say(stage: &Stage, text: &str) {
     Line::new().untrusted(text.trim_end_matches('\n').as_bytes()).end();
 }
 
-/// `service --list`: `service-mgr`'s table, as it gave it.
 fn list(stage: &Stage) -> i64 {
     let table = match libfs::read_file(stage.namespace, TABLE).ok().and_then(|b| Table::decode(&b).ok()) {
         Some(t) => t,
@@ -152,7 +131,6 @@ fn list(stage: &Stage) -> i64 {
     EXIT_OK
 }
 
-/// A value as a table cell's text.
 fn cell(v: &Value) -> String {
     match v {
         Value::Null => String::from("-"),
@@ -163,7 +141,6 @@ fn cell(v: &Value) -> String {
     }
 }
 
-/// Write `rows` under `schema` on the stdout stream.
 fn write_table(stage: &Stage, stdout: u64, schema: &Schema, rows: &[Vec<Value>]) {
     let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(stdout), IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, schema).and_then(|()| {
@@ -195,7 +172,6 @@ impl Verb {
         }
     }
 
-    /// The verb, as `--<verb>` and "cannot <verb>".
     fn word(self) -> &'static str {
         match self {
             Verb::Start => "start",
@@ -204,7 +180,6 @@ impl Verb {
         }
     }
 
-    /// What happened, as "<name> <done>".
     fn done(self) -> &'static str {
         match self {
             Verb::Start => "started",
@@ -213,7 +188,6 @@ impl Verb {
         }
     }
 
-    /// The state the service is in once it has.
     fn state(self) -> &'static str {
         match self {
             Verb::Stop => "stopped",
@@ -229,18 +203,15 @@ enum Failure {
     /// The admin endpoint is here and opened no session, for this reason: every admin session in
     /// use is `WouldBlock`.
     Unopened(KError),
-    /// The session broke, or its reply did not parse.
     Transport,
-    /// `service-mgr` refused, with its reason.
     Refused(String),
 }
 
-/// Open an admin session on `/dev/services/admin`, send one request, and wait for its answer —
+/// Open an admin session on `/dev/services/admin`, send one request, and wait for its answer,
 /// which comes once the thing is done.
 ///
-/// **No grant, told apart from a refusal.** Without the grant the path resolves through the
-/// session endpoint, where `admin` is no table, or through nothing at all: `NotFound` either way.
-/// That is the one answer that means "not in a view with `services`".
+/// **No grant, told apart from a refusal**: without it the path resolves to no table, or to
+/// nothing — `NotFound`, the one answer that means "not in a view with `services`".
 fn ask(stage: &Stage, op: u16, body: &[u8]) -> Result<(), Failure> {
     let (st, session) = libfs::lookup_wait(stage.namespace, ADMIN, librsproto::session::DIR_SESSION_RIGHTS);
     if st == KError::NotFound.as_i32() {
@@ -268,7 +239,6 @@ fn ask(stage: &Stage, op: u16, body: &[u8]) -> Result<(), Failure> {
     Ok(())
 }
 
-/// `service --start`, `--stop` or `--restart NAME`.
 fn act(stage: &Stage, verb: Verb, name: &str) -> i64 {
     if let Err(f) = ask(stage, verb.op(), name.as_bytes()) {
         let word = verb.word();

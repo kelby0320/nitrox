@@ -1,10 +1,7 @@
-//! Architecture-neutral syscall dispatch.
-//!
-//! The arch layer owns the privilege transition — the entry stub, the
-//! register save/restore, the per-CPU kernel stack — and the register
-//! frame it builds. It decodes the syscall number and arguments and calls
-//! [`table::dispatch`]. This module holds only the architecture-independent
-//! surface: the dispatch table ([`table`]) and the kernel error space
+//! Architecture-neutral syscall dispatch: the dispatch table ([`table`]) and the kernel error
+//! space ([`error`]). The arch layer owns the privilege transition and the register frame; it
+//! decodes the syscall number and arguments and calls [`table::dispatch`]. See
+//! `docs/spec/syscall-abi.md`.
 //! ([`error`]). See `docs/spec/syscall-abi.md`.
 
 pub mod error;

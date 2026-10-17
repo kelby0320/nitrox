@@ -2,13 +2,11 @@
 //! the accounts it validates against. See `docs/spec/rsproto-auth-ops.md`. `Authenticate`
 //! (`0x0800`): `(username, password) → { AUTHENTICATED, principal, home } | DENIED`. A denied
 //! credential is a normal reply (`result = DENIED`), not an `RsFlags::ERROR`. `List`, `Add`,
-//! `Remove` and `SetPassword` (`0x0801`–`0x0804`, administration Part D.1) are asked on an admin
-//! session, and a refusal there *is* an error reply.
+//! `Remove` and `SetPassword` (`0x0801`–`0x0804`) are asked on an admin session, and a refusal
+//! there *is* an error reply.
 //!
-//! Bodies are little-endian, byte-serialised into a caller buffer (the `IpcMsg`
-//! payload), like the other categories. The password crosses the channel in
-//! cleartext (a kernel-mediated local IPC, no network); the server hashes it and
-//! stores only a one-way verifier.
+//! The password crosses the channel in cleartext (a kernel-mediated local IPC, no network);
+//! the server hashes it and stores only a one-way verifier.
 
 use crate::{get_u16, put_u16};
 
@@ -17,23 +15,21 @@ pub const AUTH_REQUEST_PREFIX_LEN: usize = 4;
 /// Fixed prefix of an `AuthenticateReply` (before the principal/home bytes).
 pub const AUTH_REPLY_PREFIX_LEN: usize = 8;
 
-/// `result` value: the credential is invalid (wrong password / unknown user /
-/// malformed field). No reason is disclosed.
+/// `result`: the credential is invalid; no reason is disclosed.
 pub const AUTH_RESULT_DENIED: u16 = 0;
 /// `result` value: the credential is valid; `principal` / `home` are populated.
 pub const AUTH_RESULT_AUTHENTICATED: u16 = 1;
 
-// --- Authenticate request ---------------------------------------------------
-
 /// A parsed `AuthenticateRequest`.
 #[derive(Copy, Clone, Debug)]
 pub struct AuthenticateRequest<'a> {
+    /// The account name.
     pub username: &'a [u8],
+    /// The cleartext password.
     pub password: &'a [u8],
 }
 
-/// Write an `AuthenticateRequest` body; returns its length. `None` if a field is
-/// longer than `u16::MAX` or `out` is too small.
+/// Write an `AuthenticateRequest` body; `None` if a field is over `u16::MAX` or `out` is short.
 pub fn build_authenticate_request(out: &mut [u8], username: &[u8], password: &[u8]) -> Option<usize> {
     if username.len() > u16::MAX as usize || password.len() > u16::MAX as usize {
         return None;
@@ -65,11 +61,10 @@ pub fn parse_authenticate_request(body: &[u8]) -> Option<AuthenticateRequest<'_>
     Some(AuthenticateRequest { username: &body[AUTH_REQUEST_PREFIX_LEN..u_end], password: &body[u_end..p_end] })
 }
 
-// --- Authenticate reply -----------------------------------------------------
-
 /// A parsed `AuthenticateReply`.
 #[derive(Copy, Clone, Debug)]
 pub struct AuthenticateReply<'a> {
+    /// `AUTH_RESULT_DENIED` or `AUTH_RESULT_AUTHENTICATED`.
     pub result: u16,
     /// The canonical principal (empty on `DENIED`).
     pub principal: &'a [u8],
@@ -84,8 +79,7 @@ impl AuthenticateReply<'_> {
     }
 }
 
-/// Write an `AuthenticateReply` body; returns its length. On `DENIED`, pass empty
-/// `principal` / `home`. `None` if a field is too long or `out` is too small.
+/// Write an `AuthenticateReply` body; `None` if a field is too long or `out` is too small.
 pub fn build_authenticate_reply(out: &mut [u8], result: u16, principal: &[u8], home: &[u8]) -> Option<usize> {
     if principal.len() > u16::MAX as usize || home.len() > u16::MAX as usize {
         return None;
@@ -104,8 +98,7 @@ pub fn build_authenticate_reply(out: &mut [u8], result: u16, principal: &[u8], h
     Some(total)
 }
 
-/// Write a `DENIED` reply (no principal/home). Convenience over
-/// [`build_authenticate_reply`].
+/// Write a `DENIED` reply (no principal/home); see [`build_authenticate_reply`].
 pub fn build_denied_reply(out: &mut [u8]) -> Option<usize> {
     build_authenticate_reply(out, AUTH_RESULT_DENIED, &[], &[])
 }
@@ -126,8 +119,6 @@ pub fn parse_authenticate_reply(body: &[u8]) -> Option<AuthenticateReply<'_>> {
     Some(AuthenticateReply { result, principal: &body[AUTH_REPLY_PREFIX_LEN..p_end], home: &body[p_end..h_end] })
 }
 
-// --- Administration (administration Part D.1) -------------------------------
-
 /// `Auth::List` — every account's name and home. Asked on an admin session.
 pub const OP_AUTH_LIST: u16 = 0x0801;
 /// `Auth::Add` — a new account: a name and a password. Its home is `/home/<name>`.
@@ -137,8 +128,7 @@ pub const OP_AUTH_REMOVE: u16 = 0x0803;
 /// `Auth::SetPassword` — a new password for an account, by name.
 pub const OP_AUTH_SET_PASSWORD: u16 = 0x0804;
 
-/// Write an `Add` or `SetPassword` body: a name and a password, laid out as `Authenticate`'s
-/// request.
+/// Write an `Add` or `SetPassword` body, laid out as `Authenticate`'s request.
 pub fn build_account_request(out: &mut [u8], name: &[u8], password: &[u8]) -> Option<usize> {
     build_authenticate_request(out, name, password)
 }
@@ -150,8 +140,7 @@ pub fn parse_account_request(body: &[u8]) -> Option<AuthenticateRequest<'_>> {
     (AUTH_REQUEST_PREFIX_LEN + r.username.len() + r.password.len() == body.len()).then_some(r)
 }
 
-/// Writes `List`'s reply: `count: u16`, then per account `name_len: u8`, the name, `home_len: u8`,
-/// the home.
+/// `List`'s reply: `count: u16`, then per account `name_len: u8`, name, `home_len: u8`, home.
 pub struct AccountListWriter<'a> {
     out: &'a mut [u8],
     at: usize,
@@ -164,8 +153,7 @@ impl<'a> AccountListWriter<'a> {
         (out.len() >= 2).then_some(AccountListWriter { out, at: 2, count: 0 })
     }
 
-    /// Add an account. `None`, and nothing written, if a field is over 255 bytes or it will not
-    /// fit.
+    /// Add an account; `None`, writing nothing, if a field is over 255 bytes or it will not fit.
     pub fn push(&mut self, name: &[u8], home: &[u8]) -> Option<()> {
         if name.len() > 255 || home.len() > 255 || self.count == u16::MAX {
             return None;
@@ -201,8 +189,7 @@ pub struct AccountList<'a> {
     count: u16,
 }
 
-/// Parse a `List` reply. `None` if an entry runs past the body, or the entries do not account for
-/// it exactly.
+/// Parse a `List` reply; `None` if an entry runs past the body or the entries do not fill it.
 pub fn parse_account_list(body: &[u8]) -> Option<AccountList<'_>> {
     if body.len() < 2 {
         return None;
@@ -256,7 +243,6 @@ impl<'a> AccountList<'a> {
 mod tests {
     use super::*;
 
-    /// **A list round-trips**, in order.
     #[test]
     fn an_account_list_round_trips() {
         let mut buf = [0u8; 128];
@@ -272,8 +258,7 @@ mod tests {
         assert!(parse_account_list(&buf[..empty]).unwrap().is_empty());
     }
 
-    /// **The reader, on bytes a correct writer never makes**: a count past the entries, an entry
-    /// past the body, and bytes left over.
+    /// The reader, on bytes a correct writer never makes.
     #[test]
     fn an_account_list_that_does_not_add_up_is_refused() {
         assert!(parse_account_list(&[]).is_none());
@@ -284,7 +269,6 @@ mod tests {
         assert!(parse_account_list(&[0, 0, 7]).is_none(), "bytes after an empty list");
     }
 
-    /// **A list that will not fit writes nothing of the entry that did not fit.**
     #[test]
     fn an_account_list_writer_stops_at_its_buffer() {
         let mut buf = [0u8; 10];
@@ -295,8 +279,6 @@ mod tests {
         assert_eq!(parse_account_list(&buf[..n]).unwrap().len(), 1);
     }
 
-    /// **An account request must be exactly its fields**, where `Authenticate`'s parser lets trailing
-    /// bytes pass.
     #[test]
     fn an_account_request_is_exact() {
         let mut buf = [0u8; 32];
@@ -351,7 +333,6 @@ mod tests {
     fn truncated_bodies_rejected() {
         assert!(parse_authenticate_request(&[0u8; 2]).is_none());
         assert!(parse_authenticate_reply(&[0u8; 4]).is_none());
-        // A length prefix that overruns the buffer.
         let mut buf = [0u8; 8];
         put_u16(&mut buf, 0, 100); // username_len = 100, but body is 8
         assert!(parse_authenticate_request(&buf).is_none());

@@ -2,13 +2,13 @@
 
 use crate::*;
 
-/// **Sticks that come and go** (Phase 6 Part D), after the disk's steps, plugged and pulled over
+/// **Sticks that come and go**, after the disk's steps, plugged and pulled over
 /// QMP. Each wait reads from the moment of its action, since the kernel, the device manager and the
 /// storage service each answer one and their lines land in any order.
 ///
 /// 1. **The boot stick is passed over**: the kernel flags it, and the service says so.
 /// 2. **An MBR stick plugged in**: its disk and partition read in the kernel, the partition's ext4
-///    auto-mounted **writable**, on a live boot too (Part F), and written through a mapping without
+///    auto-mounted **writable**, on a live boot too, and written through a mapping without
 ///    a sync. **An eject while a file on it is held is refused**, and `disk --eject` then ejects it
 ///    with no password. Pulled then, its records depart and the service drops it.
 /// 3. **A whole-disk stick pulled while mounted** writable, with a file left dirty: the teardown's
@@ -18,7 +18,6 @@ use crate::*;
 pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     let secs = std::time::Duration::from_secs;
     let any = |_: &str| true;
-    // The whole line holding `pat` after `from`, waited for.
     let line_of = |s: &mut Session, from: usize, pat: &str| -> R<String> {
         s.line_since(from, pat, |_: &str| true, std::time::Duration::from_secs(60))?;
         let t = s.transcript();
@@ -64,9 +63,9 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     }
     println!("  ok: the boot stick is flagged, and passed over");
 
-    // 1b. **The internal FAT is not mounted, and the release disk's ESP not served** (Phase 6 Part
-    //     E.6): the first servable and on a disk that is not removable, the second refused for its
-    //     512-byte clusters. Read from the boot's report, as the boot stick's line is.
+    // 1b. **The internal FAT is not mounted, and the release disk's ESP not served**: the first
+    //     servable and on a disk that is not removable, the second refused for its 512-byte
+    //     clusters. Read from the boot's report, as the boot stick's line is.
     let internal = format!(
         "(partition {INTERNAL_FAT_PARTLABEL}): fat '{INTERNAL_FAT_LABEL}', left clean; not removable, so not mounted"
     );
@@ -119,10 +118,9 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
         ))?;
         s.expect("/home>")?;
     }
-    // **Refused while a file on the stick is held** — on its *other* partition (PR #367 review):
-    // a session's eject takes the whole stick, so a file held on either refuses it, and both stay
-    // mounted. `test-pattern` holds the file and asks, since a shell with no background jobs
-    // cannot hold one while it runs `disk`.
+    // **Refused while a file on the stick is held** — on its *other* partition: a session's eject
+    // takes the whole stick, so a file held on either refuses it. `test-pattern` holds the file
+    // and asks, since a shell with no background jobs cannot hold one while it runs `disk`.
     s.send(&format!("test-pattern --eject-held {} {STICK_MBR_LABEL}", ats[1]))?;
     s.expect(&format!("storage-service: {STICK_MBR_LABEL_2} is in use: 1 file(s) still open or mapped"))?;
     s.expect(&format!(
@@ -168,8 +166,7 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     pull(qmp, "stickwhole")?;
     s.line_since(from, &format!("usb: port {port}: disconnected; slot "), any, secs(30))?;
     // **The teardown's I/O to a disk that has gone comes back at once**: the write-back of the
-    // file left dirty — whose refusal lets it go — and the server's attempt to record the
-    // filesystem clean.
+    // file left dirty, whose refusal lets it go, and the server's attempt to record it clean.
     s.line_since(from, "file: its device has gone; a dirty file and its ", any, secs(30))?;
     s.line_since(from, "fs-server: unmounted, but the filesystem could not be recorded clean", any, secs(30))?;
     s.line_since(
@@ -181,7 +178,7 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     s.line_since(from, &format!("storage-service: blk-{whole} departed"), any, secs(30))?;
     // **The stick as the pull left it, copied now**, for the host to find still marked in use: the
     // same stick plugged in again below is mounted writable, which marks it in use whatever the
-    // pull did (Phase 6 Part F; read-only until then, which wrote nothing).
+    // pull did.
     fs::copy(&whole_img, whole_img.with_file_name("stick-whole-pulled.img"))?;
     let from = s.transcript().len();
     s.send("list /storage")?;
@@ -204,8 +201,8 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     }
     println!("  ok: plugged in again: blk-{again}, a new index, mounted again");
 
-    // 5. **A FAT stick** (Phase 6 Part E.6), served by `fs-server-fat`: auto-mounted writable, on a
-    //    live boot too (Part F), and what the host put there listed and read.
+    // 5. **A FAT stick**, served by `fs-server-fat`: auto-mounted writable, on a live boot
+    //    too, and what the host put there listed and read.
     let fat_img = build_cache().join("check-storage").join("stick-fat.img");
     add_node(qmp, "stickfat", &fat_img)?;
     let from = s.transcript().len();
@@ -221,8 +218,7 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     s.line_since(from, "fs-server: ready (fat, read-write)", any, secs(30))?;
     println!("  ok: a FAT stick plugged in, its FAT32 mounted writable by fs-server-fat at /storage/{STICK_FAT_LABEL}");
     let root = format!("/storage/{STICK_FAT_LABEL}");
-    // **What a command printed**: everything up to the prompt after it, its echo and the prompt
-    // aside.
+    // **What a command printed**: everything after its echo, up to the next prompt.
     let output = |s: &mut Session, command: &str| -> R<String> {
         let from = s.transcript().len();
         s.send(command)?;
@@ -302,13 +298,11 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     Ok(())
 }
 
-/// **`disk --eject NAME`, as a session runs it** (Phase 6 Part F): no `with`, and no password asked.
-/// The chain writes back and records the filesystem clean before the service says the stick can
-/// be pulled, and `disk` says so after.
+/// **`disk --eject NAME`, as a session runs it**: no `with`, and no password asked. The chain
+/// writes back and records the filesystem clean before the service says the stick can be pulled.
 ///
-/// **The drive goes whole** (PR #367 review): `names` are every filesystem on the stick, the first
-/// the one named, and each is unmounted, in the order mounted, before the service and `disk` name
-/// them all.
+/// **The drive goes whole**: `names` are every filesystem on the stick, the first the one named,
+/// and each is unmounted, in the order mounted, before the service and `disk` name them all.
 pub(crate) fn eject_stick(s: &mut Session, names: &[&str]) -> R<()> {
     let from = s.transcript().len();
     s.send(&format!("disk --eject {}", names[0]))?;
@@ -326,13 +320,11 @@ pub(crate) fn eject_stick(s: &mut Session, names: &[&str]) -> R<()> {
     Ok(())
 }
 
-/// The sticks, once the machine has stopped (Phase 6 Part D): the ejected one's partition carved
-/// out by its MBR, `e2fsck -fn` clean, `s_state` clean and the pattern read with `debugfs`; the
-/// pulled one — `whole`, copied as the pull left it — still marked in use, which is what an unplug
-/// without an eject leaves.
+/// The sticks, once the machine has stopped: the ejected one's partitions carved out by their
+/// MBR, `e2fsck -fn` clean, `s_state` clean and the pattern read with `debugfs`; the pulled one,
+/// copied as the pull left it, still marked in use — what an unplug without an eject leaves.
 pub(crate) fn check_sticks(mbr: &Path, whole: &Path, work: &Path) -> R<()> {
     use std::io::{Read, Seek, SeekFrom};
-    // **Each partition, carved by its MBR entry**: one eject took both (PR #367 review).
     let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
     for ((first, count), label) in STICK_MBR_PARTS.into_iter().zip([STICK_MBR_LABEL, STICK_MBR_LABEL_2]) {
         let part = work.join(format!("stick-mbr-{label}.ext4"));
@@ -374,7 +366,6 @@ pub(crate) fn check_sticks(mbr: &Path, whole: &Path, work: &Path) -> R<()> {
 pub(crate) fn carve_fat_clean(stick: &Path, part: &Path, what: &str) -> R<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     const MIB: u64 = 1024 * 1024;
-    // Carved sparsely: nearly all of it never written.
     let mut from = fs::File::open(stick)?;
     let len = from.metadata()?.len() - MIB;
     from.seek(SeekFrom::Start(MIB))?;
@@ -408,7 +399,7 @@ pub(crate) fn carve_fat_clean(stick: &Path, part: &Path, what: &str) -> R<()> {
     Ok(())
 }
 
-/// **The FAT stick, once the machine has stopped** (Phase 6 Part E.6): its partition carved out,
+/// **The FAT stick, once the machine has stopped**: its partition carved out,
 /// `fsck.fat -n` clean — the dirty bit among what it checks — and mtools reading what the guest
 /// did: the names it made, long and Unicode, the host's file under its new name, the one removed
 /// gone, the copy's bytes, and the pattern it wrote through a mapping.

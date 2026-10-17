@@ -1,43 +1,28 @@
 //! The `nxsh` parser — §8/§9 of the design, recursive descent.
 //!
-//! Milestone 3 Part A. Three things here are decisions rather than transcription; the
-//! rest follows the grammar sketches in §8c and §9c directly.
+//! ## D1 — the argument grammar follows the head's spelling
 //!
-//! ## D1, and how it turned out simpler than planned
+//! No hoisting pre-pass is needed to resolve a command head, because of §5b: a `def` is
+//! called with the parens/named-argument convention, never with barewords. So a head
+//! followed by `(` is a parenthesised call with expression arguments; a head in the
+//! static operator or builtin set takes expression arguments in bareword form; anything
+//! else is an external program with word-mode arguments. A bare `def` call in a pipeline
+//! (`ls | summarize`) has no arguments, so the mode never comes up. **The head's spelling
+//! and whether a `(` follows it** decide, in one token of lookahead, with no scope tracking.
 //!
-//! The plan proposed resolving a command head against "keywords ∪ builtins ∪ generic
-//! operators ∪ the `def`s visible in the file", the last requiring a hoisting pre-pass
-//! (§5a says `def`s hoist, so they *are* knowable at parse time).
+//! ## D9 — a bare identifier at the head of a statement is a command
 //!
-//! **The pre-pass is unnecessary, and the reason is §5b.** A `def` is called with the
-//! parens/named-argument convention, never with barewords. So a head followed by `(` is
-//! a parenthesised call and its arguments are expressions; a head in the static operator
-//! or builtin set takes expression arguments in bareword form; anything else is an
-//! external program and takes word-mode arguments. A bare `def` call in a pipeline
-//! (`ls | summarize`) has no arguments at all, so the mode it would have used never
-//! comes up.
-//!
-//! What decides the argument grammar is therefore **the head's spelling and whether a
-//! `(` follows it** — both visible in one token of lookahead, with no scope tracking.
-//!
-//! ## D9 — a bare identifier at the head of a statement is a command (new)
-//!
-//! Not in the design doc and not in the plan; it surfaced here. In expression position
-//! `x` is a variable, but at the head of a statement or a pipeline stage, `ls` has to be
-//! a command — and nothing distinguishes the two syntactically.
-//!
-//! Resolved by parsing head position as a call, always, and leaving *resolution* to the
-//! evaluator's D4 order (keyword → builtin → operator → `def` → external), which can
-//! also find a local binding of that name. The parser commits to the shape, not the
-//! meaning. Costs nothing: a bare head with no arguments is mode-independent, so nothing
-//! was lexed wrongly if it turns out to be a variable.
+//! In expression position `x` is a variable; at the head of a statement or pipeline stage
+//! `ls` has to be a command, and nothing distinguishes the two syntactically. Head position
+//! is parsed as a call, always, and *resolution* is left to the evaluator's D4 order
+//! (keyword → builtin → operator → `def` → external), which can also find a local binding.
+//! A bare head with no arguments is mode-independent, so nothing was lexed wrongly.
 //!
 //! ## `??` has no tier in §8a
 //!
-//! The precedence table predates §9e, which adds `??` without placing it. Put here
-//! between `&&` and `||`: both are short-circuit fallbacks, and `??` binds tighter so
-//! `a ?? b || c` reads as `(a ?? b) || c`. They rarely mix — `??` consumes a nullable and
-//! `||` a boolean — so the tier is a tie-break rather than a load-bearing choice.
+//! §9e adds `??` without placing it. It sits between `&&` and `||`, both short-circuit
+//! fallbacks, and binds tighter, so `a ?? b || c` is `(a ?? b) || c`. They rarely mix
+//! (`??` takes a nullable, `||` a boolean), so the tier is a tie-break.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -47,12 +32,11 @@ use crate::ast::*;
 use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 
 /// Generic value operators (§3, §5c, §10b). Closed at parse time because it selects the
-/// argument grammar; §5c's "the category is open" stays true semantically, since a
-/// user-defined generic `def` is called with parens and is syntactically distinct.
+/// argument grammar; a user-defined generic `def` is called with parens, so it is
+/// syntactically distinct.
 ///
-/// The bitwise family (`band`/`bor`/`bxor`/`shl`/`shr`) would join this table rather than
-/// take symbols, every conventional one being spoken for — `|` is the pipe, `&` the
-/// background suffix, `^` the force-external prefix.
+/// The bitwise family (`band`/`bor`/`bxor`/`shl`/`shr`) would join this table: `|`, `&` and
+/// `^` are all spoken for.
 /// TODO(shell-bitwise): `docs/rationale/deferred-decisions.md`.
 pub(crate) const OPERATORS: &[&str] = &[
     "filter", "sort", "select", "save", "open", "each", "map", "display", "format", "last", "skip", "dedupe", "take",
@@ -71,26 +55,22 @@ const PREDICATE_OPERATORS: &[&str] = &["filter", "each", "map", "reduce"];
 
 /// Operators whose argument may open with `{`.
 ///
-/// A predicate operator takes a **closure**; `merge` takes a **record**. `brace_expr` tells
-/// the two apart by looking for the `|` (§8c), so the only thing needed here is permission
-/// to read a `{` as an argument at all rather than as an enclosing block.
+/// A predicate operator takes a **closure**, `merge` a **record**; `brace_expr` tells them
+/// apart by the `|` (§8c), so this only grants reading a `{` as an argument rather than as
+/// an enclosing block.
 const BRACE_ARG_OPERATORS: &[&str] = &["filter", "each", "map", "reduce", "merge"];
 
 /// Operators that take **no** arguments at all.
 ///
-/// `sum`/`min`/`max`/`avg` are deliberately *not* here: they take an optional column name,
-/// so `sum size` has to keep reading `size` as an argument.
-///
-/// Knowing this at parse time is what lets `(count > 0)` read as a comparison rather than
-/// as `count` applied to `> 0`. Without it a paren could not open a pipeline whose first
-/// stage is a command — `(list /system | …)` — because the fix for one broke the other.
+/// `sum`/`min`/`max`/`avg` are not here: they take an optional column, so `sum size` must
+/// keep reading `size`. Knowing this at parse time lets `(count > 0)` read as a comparison
+/// rather than `count` applied to `> 0`, while a paren can still open a pipeline whose
+/// first stage is a command.
 const NULLARY_OPERATORS: &[&str] =
     &["count", "dedupe", "trim", "upper", "lower", "keys", "values", "round", "floor", "ceil", "trunc", "abs"];
 
-/// Deepest nesting the parser will descend (D5). A recursive-descent parser recurses on
-/// user input on a fixed userspace stack, so a pathological expression must be an error
-/// rather than an overflow — the same discipline `MAX_TREE_DEPTH` applies in the
-/// coreutils.
+/// Deepest nesting the parser will descend (D5): recursion on user input must end in an
+/// error, not an overflow of the fixed userspace stack.
 pub const MAX_DEPTH: u32 = 64;
 
 /// A parse failure, with enough position to point at the source.
@@ -119,33 +99,23 @@ pub struct Parser<'a> {
     depth: u32,
     /// Whether the next identifier parsed may be a *command head* rather than a variable.
     ///
-    /// True only where a command can actually appear — the start of a statement and the
-    /// start of a pipeline stage — and cleared as soon as one head is read, so nothing
-    /// nested inside an argument list is mistaken for another command. Without it,
-    /// `sort size --reverse` parses as `sort` applied to the command `size --reverse`,
-    /// which is a plausible reading and the wrong one.
+    /// True only at the start of a statement or pipeline stage, and cleared once a head is read, so
+    /// nothing inside an argument list is taken for a command: `sort size --reverse` would
+    /// otherwise parse as `sort` applied to the command `size --reverse`.
     head_ok: bool,
     /// Nesting depth inside a generic operator's bareword argument list.
     ///
-    /// Inside one, a `-` that has a space before it and none after introduces a **flag**
-    /// rather than a subtraction: `sort size --reverse` is an operator, an argument and a
-    /// flag, not `size - (-reverse)`. The rule is scoped to this position deliberately —
-    /// applying it everywhere would turn `let y = x -1` into a flag, and arithmetic is
-    /// the commoner reading outside an argument list.
+    /// Inside one, a `-` with a space before and none after is a **flag**, not a subtraction (`sort
+    /// size --reverse`). Scoped here because elsewhere arithmetic is the commoner reading (`let y =
+    /// x -1`).
     in_op_args: u32,
-    /// How many `for`/`while` bodies enclose the statement being parsed — **within the
-    /// current function**.
+    /// How many `for`/`while` bodies enclose the statement being parsed, **within the current
+    /// function**.
     ///
-    /// `break`/`continue` are legal only where this is non-zero, which makes both of §9c's
-    /// rules one mechanism. Loop-only is the counter itself. "Does not cross a function
-    /// boundary" is the *reset*: a `def` or closure body parses with the count at zero, so
-    /// a `break` inside `filter { |it| … }` cannot see the loop outside it — there is no
-    /// loop there to break, since the iteration belongs to the operator and is not even
-    /// written in this language.
-    ///
-    /// Doing it here rather than in the evaluator is what makes both diagnostics
-    /// parse-time. The parser already knows the answer; making the user run the script to
-    /// find out would be choosing the worse of two available errors.
+    /// `break`/`continue` are legal only where this is non-zero. Loop-only is the counter; "does
+    /// not cross a function boundary" is the reset: a `def` or closure body parses with zero, so a
+    /// `break` inside `filter { |it| … }` cannot see a loop outside it. Doing it here makes both
+    /// diagnostics parse-time.
     loop_depth: u32,
     probe: u64,
 }
@@ -171,8 +141,6 @@ impl<'a> Parser<'a> {
         self.loop_depth = saved;
         body
     }
-
-    // --- plumbing -----------------------------------------------------------
 
     fn peek(&mut self) -> Result<Tok> {
         self.probe += 1;
@@ -236,8 +204,6 @@ impl<'a> Parser<'a> {
             _ => self.fail(message),
         }
     }
-
-    // --- script and statements ---------------------------------------------
 
     pub fn script(&mut self) -> Result<Script> {
         let mut stmts = Vec::new();
@@ -307,13 +273,11 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 let binding = self.ident("expected a loop variable")?;
                 self.expect(&Tok::In, "expected `in`")?;
-                // §9b restricts the iterable so that a bare `|` cannot appear at its top
-                // level — otherwise `{ … }` is ambiguous between the loop body and a
-                // trailing closure argument. It names `or_expr`, but that tier also
-                // excludes **ranges**, and `for i in 0..5` is the commonest loop there
-                // is. `range_expr` is the tier that removes exactly the ambiguity §9b
-                // describes and nothing else, so the iterable is parsed there; a piped
-                // iterable still needs its parens.
+                // §9b restricts the iterable so a bare `|` cannot appear at its top level, else `{
+                // … }` is ambiguous between the loop body and a trailing closure. It names
+                // `or_expr`, which also excludes ranges, and `for i in 0..5` is the commonest loop;
+                // so the iterable is parsed at `range_expr`. A piped iterable still needs its
+                // parens.
                 let iterable = self.range_expr()?;
                 let body = self.loop_body()?;
                 Ok(Stmt::For { binding, iterable, body })
@@ -343,9 +307,8 @@ impl<'a> Parser<'a> {
                 }
                 Ok(if kw == Tok::Break { Stmt::Break } else { Stmt::Continue })
             }
-            // `try` is an expression (§9c), so statement position is just an expression
-            // statement — one node and one evaluator path, rather than a statement form
-            // and an expression form that drift.
+            // `try` is an expression (§9c), so statement position is just an expression statement:
+            // one node and one evaluator path.
             Tok::Try => Ok(Stmt::Expr(self.try_expr()?)),
             Tok::Strict => {
                 self.bump()?;
@@ -361,8 +324,6 @@ impl<'a> Parser<'a> {
             }
             Tok::Use => self.use_stmt(),
             _ => {
-                // Either an assignment or a bare expression. Both start with an
-                // expression, so parse one and look for `=`.
                 let e = self.expr()?;
                 if self.peek()? == Tok::Eq {
                     self.bump()?;
@@ -408,9 +369,8 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Bind { kind, name, ty, value, public })
     }
 
-    /// `try { … } catch (e) { … }` (§9c). One production, reached from statement position
-    /// and from `primary` alike — which is what makes `let x = try { … } catch { … }` work
-    /// without a second implementation of the same construct.
+    /// `try { … } catch (e) { … }` (§9c). One production, reached from statement position and from
+    /// `primary`, so `let x = try { … } catch { … }` needs no second implementation.
     fn try_expr(&mut self) -> Result<Expr> {
         self.bump()?; // try
         let body = self.block()?;
@@ -514,9 +474,6 @@ impl<'a> Parser<'a> {
         Ok((cond, then, otherwise))
     }
 
-    // --- expressions --------------------------------------------------------
-
-    /// `expr := pipeline` (§8c).
     fn expr(&mut self) -> Result<Expr> {
         self.enter()?;
         let e = self.pipeline();
@@ -694,10 +651,9 @@ impl<'a> Parser<'a> {
                     self.expect(&Tok::RBracket, "expected `]`")?;
                     Expr::Index(Box::new(e), Box::new(idx))
                 }
-                // `utils.helper(…)` — a call on a **qualified name** (§9h's `use … as`).
-                // The alias binds `utils.helper` as one name rather than a record, since a
-                // module's exports are functions and a function is deliberately not
-                // TSM1-representable (§5c) — so there is no record to hold them.
+                // `utils.helper(…)` — a call on a **qualified name** (§9h's `use … as`). The alias
+                // binds `utils.helper` as one name, not a record: a module's exports are functions,
+                // which are deliberately not TSM1-representable (§5c).
                 Tok::LParen => {
                     let Expr::Field(base, field) = &e else { return Ok(e) };
                     let Expr::Ident(root) = base.as_ref() else { return Ok(e) };
@@ -760,11 +716,9 @@ impl<'a> Parser<'a> {
             }
             Tok::LParen => {
                 self.bump()?;
-                // §3's expression-position escape hatch: a full pipeline inside parens.
-                // A `(` opens a fresh expression, which may be a whole pipeline whose
-                // first stage is a command: `(list /system | filter …)`. So it *is* a
-                // command position. `(count > 0)` still reads as a comparison because
-                // `count` is nullary and takes no arguments to swallow the `>`.
+                // §3's expression-position escape hatch. A `(` opens a fresh expression, possibly a
+                // pipeline whose first stage is a command: `(list /system | filter …)`. `(count >
+                // 0)` is still a comparison because `count` is nullary and swallows nothing.
                 self.head_ok = true;
                 let e = self.expr()?;
                 self.expect(&Tok::RParen, "expected `)`")?;
@@ -810,11 +764,9 @@ impl<'a> Parser<'a> {
             Tok::Assert => {
                 self.bump()?;
                 self.expect(&Tok::LParen, "`assert` takes a parenthesised predicate")?;
-                // **A command head is legal inside the predicate**, which is what makes
-                // §6's `ls | assert (count > 0)` mean what it reads like: `count` there is
-                // the operator applied to the value flowing past, not an unbound variable.
-                // D4 still puts a local binding first for a bare, argument-free name, so
-                // `assert (n > 0)` over a `let n` is unaffected.
+                // **A command head is legal inside the predicate**, so §6's `ls | assert (count >
+                // 0)` applies the operator `count` to the value flowing past. D4 still puts a local
+                // binding first for a bare name, so `assert (n > 0)` over a `let n` is unaffected.
                 self.head_ok = true;
                 let e = self.expr()?;
                 self.expect(&Tok::RParen, "expected `)`")?;
@@ -920,22 +872,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // --- command calls ------------------------------------------------------
-
     /// An identifier at the head of a statement or pipeline stage (D1, D9), or an
     /// ordinary variable reference elsewhere in an expression.
     fn command_or_ident(&mut self) -> Result<Expr> {
         let forced_external = self.eat(&Tok::Caret)?;
-        // One head per statement or stage: everything nested below is an operand.
         let at_head = self.head_ok;
         self.head_ok = false;
 
-        // A **hyphenated** name at head position is one command name, not a subtraction.
-        // Real programs here are called `fs-server-ext4` and `test-stage`; reading the
-        // head in expression mode would take `fs` and leave `- server - ext4` behind, and
-        // the resulting "`fs` is not a program" is a baffling way to report a typo in a
-        // name that does exist. Arithmetic at the head of a statement is written with
-        // spaces (`a - b`) or parens, which is how it is written anyway.
+        // A **hyphenated** name at head position is one command name, not a subtraction: programs
+        // here are called `fs-server-ext4`, and reading the head in expression mode would leave `-
+        // server - ext4` behind. Arithmetic at statement head is written with spaces or parens.
         if at_head || forced_external {
             let w = self.lx.peek(crate::lex::Mode::Word)?;
             if let Tok::Word(text) = &w.tok
@@ -950,17 +896,15 @@ impl<'a> Parser<'a> {
         }
         let name = self.ident("expected a command or a name")?;
 
-        // An `=` immediately after the head makes this an assignment target, whatever
-        // the name would otherwise resolve to. Operator names are not reserved words:
-        // `last` is a §10b operator and a perfectly ordinary variable name, and
-        // `last = 2` has to be an assignment rather than a call to `last`.
+        // An `=` immediately after the head makes this an assignment target: operator names are not
+        // reserved words, and `last = 2` must assign rather than call `last` (§10b).
         if self.peek()? == Tok::Eq {
             return Ok(Expr::Ident(name));
         }
 
-        // **`time PIPELINE`** (Phase 6 Part H.2, §3): at a head and followed by an argument, the
-        // word times the whole pipeline after it — every stage, so `time list /home | count`
-        // times both. Alone, or before `=`, it is a name like any other (D9).
+        // **`time PIPELINE`** (§3): at a head and followed by an argument, the word times the whole
+        // pipeline after it, every stage (`time list /home | count` times both). Alone, or before
+        // `=`, it is a name like any other (D9).
         if name == "time" && at_head && !forced_external && self.peek()? != Tok::LParen && self.starts_an_argument()? {
             self.head_ok = true;
             let timed = self.expr()?;
@@ -985,10 +929,8 @@ impl<'a> Parser<'a> {
         let is_operator = at_head && !forced_external && OPERATORS.contains(&name.as_str());
         let is_builtin = at_head && !forced_external && BUILTINS.contains(&name.as_str());
         if is_builtin {
-            // A builtin takes a **path**, not an expression: `cd ..` and `cd /system` are
-            // both things `operator_args` would choke on, because `..` is a range operator
-            // and `/system` a division. Word mode is the same reading an external program
-            // gets, which is the right one for a path.
+            // A builtin takes a **path**, not an expression: `cd ..` and `cd /system` break
+            // `operator_args` (a range, a division). Word mode is how an external gets its paths.
             let args = self.word_args()?;
             return Ok(Expr::Call(Box::new(Call { name, kind: CallKind::Builtin, args, forced_external })));
         }
@@ -997,13 +939,9 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Call(Box::new(Call { name, kind: CallKind::Operator, args, forced_external })));
         }
 
-        // Not a keyword, builtin or operator: either a variable or an external command,
-        // and what follows decides which (D9).
         if !forced_external && (!at_head || !self.starts_an_argument()?) {
-            // A variable reference, or a bare command with no arguments — indistinguishable
-            // here, and deliberately left that way. The evaluator resolves the name
-            // against D4's order and can find a local binding first; a bare head has no
-            // arguments, so nothing was lexed in the wrong mode either way.
+            // A variable reference or a bare command, indistinguishable here and left so: the
+            // evaluator resolves it in D4's order, and a bare head has no arguments to mis-lex.
             return Ok(Expr::Ident(name));
         }
         let args = self.word_args()?;
@@ -1021,26 +959,20 @@ impl<'a> Parser<'a> {
         Ok(matches!(w.tok, Tok::Flag(_) | Tok::ShortFlags(_)))
     }
 
-    /// After a command head, does the next token begin an *argument* rather than continue
-    /// an expression? This is D9's decision procedure.
+    /// After a command head, does the next token begin an *argument* rather than continue an
+    /// expression? This is D9's decision procedure.
     ///
-    /// The hard case is `-`, which is a binary operator and a flag prefix. It is read the
-    /// way a person reads it: `a - b` has a space on both sides of the operator, while
-    /// `list -l` and `list --long` have the flag pressed against its dashes. So a `-`
-    /// that is preceded by space and *not* followed by one introduces a flag.
-    ///
-    /// The other cases are unambiguous. A postfix (`.`, `[`, `(`, `?`) pressed against
-    /// the name continues an expression; any other infix operator continues an
-    /// expression; `{` is a block or a record, never an argument, which is what lets
-    /// `if loud { … }` parse under §9b.
+    /// `-` is both a binary operator and a flag prefix, read as a person reads it: `a - b` has
+    /// space on both sides, `list -l` has the flag pressed against its dashes. So a `-` preceded by
+    /// space and *not* followed by one introduces a flag. A postfix (`.`, `[`, `(`, `?`) pressed
+    /// against the name continues an expression, as does any infix operator; `{` is a block or a
+    /// record, never an argument, which lets `if loud { … }` parse under §9b.
     fn starts_an_argument(&mut self) -> Result<bool> {
         let s = self.lx.peek(Mode::Expr)?;
         Ok(match s.tok {
-            // Nothing follows: a bare name.
             Tok::Eof | Tok::Newline | Tok::Pipe | Tok::OrOr | Tok::AndAnd | Tok::Comma
             | Tok::RParen | Tok::RBrace | Tok::RBracket | Tok::LBrace | Tok::Colon
             | Tok::FatArrow | Tok::Arrow => false,
-            // Postfix against the name — `x.field`, `x[0]`, `f(…)`, `x?`.
             Tok::Dot | Tok::LBracket | Tok::LParen | Tok::Question | Tok::QuestionDot
                 if !s.space_before =>
             {
@@ -1053,22 +985,14 @@ impl<'a> Parser<'a> {
             Tok::Plus | Tok::PlusPlus | Tok::Star | Tok::Percent | Tok::Lt
             | Tok::Le | Tok::Gt | Tok::Ge | Tok::EqEq | Tok::Ne | Tok::Match_ | Tok::Eq
             | Tok::QuestionQuestion | Tok::DotDot | Tok::DotDotEq
-            // `in` joined this list when it became an infix comparison (§8a). Before that
-            // it could not follow a command head at all — `for x in xs` consumes its own
-            // — so `x in [1, 2]` read as the *program* `x` with word-mode arguments, and
-            // word mode on `[` was the lexer hang above.
+            // `in` is on this list because it is an infix comparison (§8a): `x in [1, 2]` must not
+            // read as the *program* `x` with word-mode arguments.
             | Tok::In => false,
-            // `/` is division — except where division is impossible. `/system` already
-            // lexes as one path word, so a *lone* `Slash` here means the next thing is
-            // whitespace or a closer, and `list /` and `list / | count` have no right
-            // operand for a division to use. The only reading left is the root path,
-            // which is also what a person typing `list /` meant.
-            //
-            // Spacing matters for the same reason it does for `-`: `a/b` is division
-            // written the way division is written, and nothing should turn it into an
-            // argument.
+            // `/` is division except where division is impossible. `/system` lexes as one path
+            // word, so a *lone* `Slash` means whitespace or a closer follows: `list /` and `list /
+            // | count` have no right operand, and the only reading left is the root path. Spacing
+            // matters as for `-`: `a/b` is division and nothing should turn it into an argument.
             Tok::Slash => s.space_before && self.lx.no_operand_follows(),
-            // The one that needs spacing to disambiguate.
             Tok::Minus => {
                 let flagged = self.lx.peek(Mode::Word)?;
                 s.space_before && matches!(flagged.tok, Tok::Flag(_) | Tok::ShortFlags(_))
@@ -1089,19 +1013,14 @@ impl<'a> Parser<'a> {
             if self.eat(&Tok::Underscore)? {
                 args.push(Arg::PipeFill);
             } else if let Tok::Ident(n) = self.peek()? {
-                // `name: value` — a named argument. `:` is legal only in fixed positions
-                // (§8a), and this is one of them. Telling it from an ordinary expression
-                // needs the token *after* the identifier, which is one more than the lexer
-                // caches — so take a mark, look, and put it back if there was no `:`.
+                // `name: value` — a named argument. Telling it from an expression needs the token
+                // *after* the identifier, one more than the lexer caches: take a mark, look, and
+                // rewind if there was no `:`.
                 //
-                // **The rewind is what makes an argument an expression like any other.**
-                // The first version consumed the identifier and resumed in a hand-written
-                // copy of the expression tiers, and that copy was wrong in two ways at
-                // once: it had no arm for a `(` (so `add(2, 3)` and `utils.helper(1)` were
-                // both syntax errors as arguments), and its binary tier folded flat (so
-                // `format("{}", a + b * c)` was `(a + b) * c` while the same expression
-                // anywhere else was not). Both are gone with the copy — see the resolved
-                // `shell-nested-call` entry.
+                // **The rewind is what makes an argument an expression like any other.** Resuming
+                // in a hand-written copy of the expression tiers had no arm for a `(` (`add(2, 3)`
+                // failed as an argument) and folded binary operators flat (`format("{}", a + b *
+                // c)` was `(a + b) * c`).
                 let mark = self.lx.clone();
                 self.bump()?;
                 if self.eat(&Tok::Colon)? {
@@ -1123,11 +1042,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Bareword-form arguments to a generic operator or builtin: expressions and flags,
-    /// up to whatever ends the stage.
-    ///
-    /// §8b's sugar is applied here rather than at evaluation, so there is one closure
-    /// representation downstream.
+    /// Bareword-form arguments to a generic operator or builtin: expressions and flags, up to
+    /// whatever ends the stage. §8b's sugar is applied here, not at evaluation.
     fn operator_args(&mut self, name: &str) -> Result<Vec<Arg>> {
         let mut args = Vec::new();
         if NULLARY_OPERATORS.contains(&name) {
@@ -1138,17 +1054,12 @@ impl<'a> Parser<'a> {
             match self.peek()? {
                 Tok::Pipe | Tok::Newline | Tok::Eof | Tok::RParen | Tok::RBrace | Tok::RBracket | Tok::Comma => break,
                 // `=` never begins an argument, so an operator name followed by one is an
-                // assignment to a binding that happens to share the name. Found by a test
-                // that used `last` as a variable — which is both a §10b operator and an
-                // entirely reasonable name for one. Operator names are not reserved
-                // words, and this is what keeps them from behaving like reserved words at
-                // the head of a statement.
+                // assignment to a binding that shares the name (`last` is both a §10b operator and
+                // a reasonable variable).
                 Tok::Eq => break,
-                // A `{` after an operator is a closure argument only for the operators
-                // that take one; everywhere else it is the block of an enclosing `for`
-                // or `if`. `for line in open ./log.txt { … }` is the case that needs
-                // this: without it the block is read as a record literal argument to
-                // `open`. Same disambiguation §8c uses for `{`, applied one level up.
+                // A `{` after an operator is a closure argument only for operators that take one;
+                // elsewhere it is the block of an enclosing `for` or `if`. `for line in open
+                // ./log.txt { … }` would otherwise read the block as a record argument to `open`.
                 Tok::LBrace if !BRACE_ARG_OPERATORS.contains(&name) => break,
                 // A flag in expression-mode argument position. Re-lex in word mode: it is
                 // `--reverse`, not minus-minus-reverse.
@@ -1207,15 +1118,12 @@ impl<'a> Parser<'a> {
                     args.push(Arg::Positional(Expr::Str(v)));
                 }
                 Tok::LParen => {
-                    // An expression argument, explicitly parenthesised.
                     args.push(Arg::Positional(self.expr()?));
                 }
                 _ => return Ok(args),
             }
         }
     }
-
-    // --- patterns -----------------------------------------------------------
 
     fn pattern(&mut self) -> Result<Pattern> {
         self.enter()?;
@@ -1317,8 +1225,6 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
-    // --- types --------------------------------------------------------------
-
     /// `type_expr := base_type "?"?` (§9c). §6: this is a notation for a TSM1 `Schema`,
     /// not a separate concept.
     fn type_expr(&mut self) -> Result<TypeExpr> {
@@ -1384,12 +1290,9 @@ fn make_nullable(t: TypeExpr) -> TypeExpr {
 
 /// §8b: `filter size > 1000` is sugar for `filter { |it| it.size > 1000 }`.
 ///
-/// Applied at parse time so exactly one closure representation reaches the evaluator.
-/// The rewrite turns every bare identifier into field access on `it`, which is what §8b
-/// specifies — and it means the sugared form cannot reach a *local* variable, since a
-/// bare name there is a field. The explicit closure form exists for that case, and this
-/// is a place worth watching: `filter size > threshold` reads as though it closes over
-/// `threshold` and does not.
+/// Every bare identifier becomes field access on `it`, so the sugared form cannot reach a *local*
+/// variable: `filter size > threshold` reads as though it closes over `threshold` and does not. The
+/// explicit closure form exists for that case.
 fn desugar_predicate(args: &mut [Arg]) {
     if args.len() != 1 {
         return;
@@ -1440,17 +1343,9 @@ mod tests {
         }
     }
 
-    /// **The root directory is a path, not a division sign.**
-    ///
-    /// `list /` is the first thing anyone types at a new shell, and it did not parse: a
-    /// lone `/` after a command head was read as division, so the line died with
-    /// "expected an expression". `/system` was never affected — it lexes as one path word
-    /// — which is exactly why the gap survived every test until someone typed `list /` at
-    /// a real prompt.
-    ///
-    /// The rule is decidable, not a preference: a lone `Slash` in argument position means
-    /// what follows is whitespace or a closer, so there is no right operand and division
-    /// is *impossible*. Reading it as the root path is the only reading left.
+    /// **The root directory is a path, not a division sign.** A lone `/` in argument position has
+    /// no right operand, so division is impossible; `/system` lexes as one path word and was never
+    /// affected, which is why `list /` went untested.
     #[test]
     fn a_lone_slash_in_argument_position_is_the_root_path() {
         for src in ["list /", "list / | count", "(list /)", "list /\nlist /home"] {
@@ -1458,26 +1353,19 @@ mod tests {
         }
     }
 
-    /// The other half of the same rule, and the reason it is spelled in terms of "could
-    /// anything follow" rather than "is this a command": division must keep working, and
-    /// a test that only checked the new case would not notice if it stopped.
+    /// Division must keep working: a test of only the new case would not notice.
     #[test]
     fn division_is_still_division() {
         for src in ["let x = 6 / 2", "let x = a / b", "let x = a/b", "let x = (a / b) / c"] {
             assert!(parse_script(src).is_ok(), "{src} should parse");
         }
-        // The shape that decides it: `a / b` is a division, not `a` called with two
-        // arguments. Checking it parses is not enough — both readings parse.
+        // `a / b` is a division, not `a` called with two arguments; both readings parse.
         match one_expr("a / b") {
             Expr::Binary(..) => {}
             other => panic!("`a / b` should be a division, got {other:?}"),
         }
     }
 
-    // --- D1: the argument grammar follows the head's category ---------------
-
-    /// The concrete statement of D1. Same shape of source, two different parses, decided
-    /// by whether the head is a known operator.
     #[test]
     fn an_operator_takes_expressions_and_an_external_takes_words() {
         // `sort` is an operator: `size` is an expression, `--reverse` a flag.
@@ -1495,9 +1383,6 @@ mod tests {
         assert_eq!(c.args[1], Arg::Positional(Expr::Word("README.md".into())));
     }
 
-    /// Real programs here are called `fs-server-ext4` and `test-stage`. Reading the head
-    /// in expression mode would take `fs` and leave `- server - ext4` behind, reporting a
-    /// typo in a name that exists.
     #[test]
     fn a_hyphenated_command_name_is_one_name() {
         let e = one_expr("fs-server-ext4 --check /dev/disk");
@@ -1509,7 +1394,6 @@ mod tests {
         assert!(matches!(one_expr("a - b"), Expr::Binary(BinOp::Sub, _, _)));
     }
 
-    /// The case that motivated D1 in the plan: a bare path as an external argument.
     #[test]
     fn a_bare_path_reaches_an_external_program_intact() {
         let e = one_expr("list --long /some/path");
@@ -1527,8 +1411,6 @@ mod tests {
         assert_eq!(c.args[0], Arg::Positional(Expr::Word("a.b".into())));
     }
 
-    /// A `def` is called with parens (§5b), so it needs no hoisting pre-pass to be told
-    /// apart from an external program — the finding that simplified D1.
     #[test]
     fn a_parenthesised_call_is_a_def_and_takes_expressions() {
         let e = one_expr("summarize(_, label: \"src files\")");
@@ -1538,16 +1420,10 @@ mod tests {
         assert_eq!(c.args[1], Arg::Named("label".into(), Expr::Str("src files".into())));
     }
 
-    // --- D9: a bare head ----------------------------------------------------
-
-    /// A bare identifier with no arguments stays an identifier; the evaluator resolves it
-    /// against D4's order, and a bare head is mode-independent so nothing was mis-lexed.
     #[test]
     fn a_bare_identifier_is_left_for_the_evaluator_to_resolve() {
         assert_eq!(one_expr("x"), Expr::Ident("x".into()));
     }
-
-    // --- §8b sugar ----------------------------------------------------------
 
     #[test]
     fn a_bareword_predicate_desugars_to_a_closure() {
@@ -1558,7 +1434,6 @@ mod tests {
         };
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].name, "it");
-        // `size` became `it.size`.
         assert_eq!(
             body[0],
             Stmt::Expr(Expr::Binary(
@@ -1569,7 +1444,6 @@ mod tests {
         );
     }
 
-    /// An explicit closure is already in the target form and must not be wrapped twice.
     #[test]
     fn an_explicit_closure_is_left_alone() {
         let e = one_expr("filter { |row| row.size > 1000 }");
@@ -1578,11 +1452,8 @@ mod tests {
         assert_eq!(params[0].name, "row");
     }
 
-    // --- precedence (§8a) ---------------------------------------------------
-
     #[test]
     fn precedence_follows_8a() {
-        // `*` binds tighter than `+`.
         assert_eq!(
             one_expr("1 + 2 * 3"),
             Expr::Binary(
@@ -1591,15 +1462,12 @@ mod tests {
                 Box::new(Expr::Binary(BinOp::Mul, Box::new(Expr::Int(2)), Box::new(Expr::Int(3)))),
             )
         );
-        // `&&` binds tighter than `||`.
         let e = one_expr("a && b || c");
         assert!(matches!(e, Expr::Binary(BinOp::Or, _, _)));
-        // Comparison binds tighter than equality.
         let e = one_expr("a < b == c");
         assert!(matches!(e, Expr::Binary(BinOp::Eq, _, _)));
     }
 
-    /// `|` is the lowest tier (§8a), so a pipeline contains whole expressions.
     #[test]
     fn the_pipe_is_the_loosest_operator() {
         let e = one_expr("1 + 2 | display");
@@ -1608,13 +1476,7 @@ mod tests {
         assert!(matches!(stages[0], Expr::Binary(BinOp::Add, _, _)));
     }
 
-    // --- §9b: conditions sit below the pipe ---------------------------------
-
-    /// The ambiguity §9b removes structurally: with a bare pipeline allowed in a
-    /// condition, `{ … }` could be the `if` body or a trailing closure argument.
-    /// A paren may open a pipeline whose first stage is a command, *and* `(count > 0)`
-    /// must still be a comparison. Both work because the nullary operators take no
-    /// arguments to swallow the operator that follows.
+    /// A paren may open a pipeline or hold a comparison: nullary operators take no arguments.
     #[test]
     fn a_paren_can_open_a_pipeline_or_hold_a_comparison() {
         let e = one_expr("(list /system | count)");
@@ -1629,14 +1491,10 @@ mod tests {
 
     #[test]
     fn a_piped_condition_must_be_parenthesised() {
-        // Parenthesised: fine.
         let s = script("if (files | count) > 0 { display files }");
         assert!(matches!(s.stmts[0], Stmt::If { .. }));
-        // Unparenthesised: the `|` cannot appear at a condition's top level.
         assert!(parse_script("if ls | count > 0 { display files }").is_err());
     }
-
-    // --- §9: statements -----------------------------------------------------
 
     #[test]
     fn bindings_carry_their_mutability_and_type() {
@@ -1676,8 +1534,6 @@ mod tests {
         assert!(ret.is_some());
     }
 
-    /// `try` is an **expression** as of v1.2, so statement position is an expression
-    /// statement — one node, reached from both places. `strict` remains a statement.
     #[test]
     fn try_catch_is_an_expression_and_strict_is_a_statement() {
         let s = script("try { open ./x } catch (err) { print }");
@@ -1686,7 +1542,6 @@ mod tests {
         };
         assert_eq!(catch_binding.as_deref(), Some("err"));
 
-        // …and the same production in value position, which is the point of the change.
         let s = script("let x = try { open ./x } catch { 0 }");
         let Stmt::Bind { value: Expr::Try { .. }, .. } = &s.stmts[0] else {
             panic!("expected a bound try expression, got {:?}", s.stmts[0])
@@ -1704,13 +1559,11 @@ mod tests {
         let e = parse_script("let x = a?").expect_err("`?` is gone");
         assert!(e.message.contains("retired"), "{}", e.message);
         assert!(e.message.contains("try"), "{}", e.message);
-        // The other three `?` spellings are untouched (§2's table).
         script("let a: Int? = null");
         script("let r: { size?: Int } = { size: 1 }");
         script("let n = a?.size ?? 0");
     }
 
-    /// §9h: no wildcard import — name what is imported, or bind the whole module.
     #[test]
     fn imports_must_name_what_they_bring_in() {
         let s = script("use \"./lib/utils.nx\" { helper, other_fn }");
@@ -1726,9 +1579,6 @@ mod tests {
         assert!(parse_script("use \"./lib/utils.nx\" { }").is_err());
     }
 
-    // --- §8c: the brace ambiguity -------------------------------------------
-
-    /// The fix §8c describes: mandatory pipes make `{` unambiguous.
     #[test]
     fn a_brace_is_a_closure_only_when_pipes_follow() {
         let s = script("let f = { |x| x + 1 }");
@@ -1737,17 +1587,13 @@ mod tests {
 
         let s = script("let r = { name }");
         let Stmt::Bind { value, .. } = &s.stmts[0] else { panic!() };
-        // `{ name }` is record shorthand for `{ name: name }` (§8e).
         assert_eq!(*value, Expr::Record(alloc::vec![("name".into(), Expr::Ident("name".into()))]));
 
-        // An empty parameter list is `||`, still unambiguous.
         let s = script("let f = { || 1 }");
         let Stmt::Bind { value, .. } = &s.stmts[0] else { panic!() };
         let Expr::Closure { params, .. } = value else { panic!("expected a closure") };
         assert!(params.is_empty());
     }
-
-    // --- §9f: patterns ------------------------------------------------------
 
     #[test]
     fn patterns_cover_the_9f_forms() {
@@ -1772,8 +1618,6 @@ mod tests {
         assert!(matches!(arms[5].pattern, Pattern::Wildcard));
     }
 
-    /// §9f: capitalisation decides variant-test versus catch-all binding, formalising a
-    /// convention the design used by hand throughout.
     #[test]
     fn capitalisation_separates_a_type_test_from_a_binding() {
         let e = one_expr("match v { Int => 1\n other => 2 }");
@@ -1782,8 +1626,6 @@ mod tests {
         assert_eq!(arms[1].pattern, Pattern::Bind("other".into()));
     }
 
-    /// Pattern `|` and pipeline `|` never collide, because a match arm never calls into
-    /// the expression grammar's pipeline rule (§9f).
     #[test]
     fn pattern_alternation_does_not_collide_with_the_pipe() {
         let e = one_expr("match n { 1 | 2 => \"low\"\n _ => \"high\" }");
@@ -1792,15 +1634,12 @@ mod tests {
         assert_eq!(alts.len(), 2);
     }
 
-    // --- §9e: nullability ---------------------------------------------------
-
     #[test]
     fn nullable_types_have_two_spellings_that_mean_one_thing() {
         let a = script("let x: Int? = 1");
         let Stmt::Bind { ty: Some(t), .. } = &a.stmts[0] else { panic!() };
         assert_eq!(*t, TypeExpr::Named { name: "Int".into(), params: alloc::vec![], nullable: true });
 
-        // `size?: Int` inside a record shape is sugar for `size: Int?`.
         let b = script("let x: { size?: Int } = y");
         let Stmt::Bind { ty: Some(TypeExpr::Record { fields, .. }), .. } = &b.stmts[0] else { panic!() };
         assert_eq!(fields[0].1, TypeExpr::Named { name: "Int".into(), params: alloc::vec![], nullable: true });
@@ -1813,9 +1652,6 @@ mod tests {
         assert!(matches!(*lhs, Expr::TryField(_, _)));
     }
 
-    // --- D5: depth ----------------------------------------------------------
-
-    /// A pathological nesting must be a clean error, not a stack overflow.
     #[test]
     fn nesting_past_the_limit_is_an_error() {
         let mut src = String::new();
@@ -1830,11 +1666,6 @@ mod tests {
         assert_eq!(e.message, "expression nests too deeply");
     }
 
-    // --- the design doc's own examples --------------------------------------
-
-    /// §7's illustrative sketch, which is the closest thing the design has to a
-    /// conformance suite. If the grammar cannot parse its own worked example, the grammar
-    /// is wrong.
     #[test]
     fn the_section_7_sketch_parses() {
         let src = r#"
@@ -1874,8 +1705,6 @@ for line in open ./log.txt {
         assert_eq!(s.stmts.len(), 9);
     }
 
-    /// The leading-pipe pipeline from that sketch is *one* statement, which is the
-    /// property §11b claims for a whole file and D2 implements.
     #[test]
     fn a_leading_pipe_pipeline_is_one_statement() {
         let s = script("ls --long\n  | sort size\n  | display");
@@ -1894,17 +1723,12 @@ for line in open ./log.txt {
         assert!(parse_script("let a = 1 let b = 2").is_err());
     }
 
-    // --- `break` / `continue` (§9c) -----------------------------------------
-
-    /// Both rules §9c states are one mechanism — a loop counter that **resets** at every
-    /// function boundary — so they are tested as a pair. Loop-only is the counter; "does
-    /// not cross a `def` or closure" is the reset.
+    /// Loop-only is the counter; "does not cross a `def` or closure" is the reset.
     #[test]
     fn break_and_continue_are_legal_only_inside_a_loop() {
         script("for x in 0..3 { break }");
         script("for x in 0..3 { continue }");
         script("while true { break }");
-        // …and inside a nested `if`, which is where they are actually written.
         script("for x in 0..3 { if x == 1 { break } }");
 
         for src in ["break", "continue", "if true { break }", "def f() { break }"] {
@@ -1913,21 +1737,17 @@ for line in open ./log.txt {
         }
     }
 
-    /// A `break` inside a closure does **not** break the loop outside it: the closure is a
-    /// function body, and the iteration it is called from belongs to the operator — it is
-    /// not even written in this language.
+    /// The closure is a function body; its iteration belongs to the operator.
     #[test]
     fn break_does_not_cross_a_closure_or_a_def() {
         let e = parse_script("for x in 0..3 { let f = { || break } }").expect_err("closure");
         assert!(e.message.contains("closure"), "{}", e.message);
         let e = parse_script("for x in 0..3 { def f() { break } }").expect_err("def");
         assert!(e.message.contains("`for` or `while`"), "{}", e.message);
-        // The reset restores, rather than clearing: a `break` after the closure is fine.
         script("for x in 0..3 { let f = { || 1 }\n break }");
     }
 
-    /// The counter has to come back down, or every statement after the first loop in a
-    /// file would accept a stray `break`.
+    /// The counter must come back down, or a stray `break` after the first loop would pass.
     #[test]
     fn the_loop_counter_unwinds_after_the_body() {
         script("for x in 0..3 { break }");
@@ -1935,17 +1755,10 @@ for line in open ./log.txt {
         assert!(e.message.contains("`for` or `while`"), "{}", e.message);
     }
 
-    /// `in` is an infix comparison (§8a), so a bare name in front of it is an **operand**,
-    /// not a command head with arguments.
-    ///
-    /// It is the first operator that can follow a head at all — `for x in xs` consumes its
-    /// own `in` before any expression is parsed — and reading it as a command sent `[1, 2]`
-    /// into word mode, where the lexer hung. Both halves are fixed; this pins the parse.
     #[test]
     fn a_name_before_in_is_an_operand_not_a_command() {
         let e = one_expr("x in [1, 2]");
         assert!(matches!(e, Expr::Binary(BinOp::In, _, _)), "got {e:?}");
-        // …and the `for` form is untouched, which is the pair that matters.
         let s = script("for x in [1, 2] {\n x\n}");
         assert!(matches!(s.stmts[0], Stmt::For { .. }));
     }
@@ -1962,46 +1775,28 @@ mod argument_list_tests {
         }
     }
 
-    /// The argument of a call is an **expression**, with no exceptions for how it begins.
-    ///
-    /// **Reported from using the shell**: `let x = age_plus_n(my_age(), 3)` would not
-    /// compile, because `my_age()` was not evaluated — it was not even parsed. Every shape
-    /// here failed with "expected `,` or `)` in an argument list" while a parenthesised
-    /// *pipeline* in the same position parsed, which is why the gap survived: the escape
-    /// hatch people reach for when something does not parse happened to be the one thing
-    /// that worked.
+    /// The argument of a call is an **expression**, however it begins: `age_plus_n(my_age(), 3)`
+    /// once failed with "expected `,` or `)`".
     #[test]
     fn a_call_can_be_an_argument() {
         for src in [
-            // The report, verbatim in shape.
             "def my_age() { 41 }\ndef age_plus_n(a, n) { a + n }\nlet x = age_plus_n(my_age(), 3)",
-            // A `def` call inside an operator's argument list.
             "def add(a, b) { a + b }\nformat(\"add={}\", add(2, 3))",
-            // An operator called in call form, nested.
             "format(\"n={}\", count([1, 2, 3]))",
             // A qualified name — §9h's `use … as` — which failed for a *different* reason.
             "format(\"x={}\", utils.helper(1))",
-            // Nested two deep, and in the first argument rather than a later one.
             "def f(a) { a }\nf(f(f(1)))",
-            // Named arguments still work, and mix with calls.
             "def g(a, b) { a }\ndef h() { 1 }\ng(h(), b: h())",
             // The workaround this replaces, which must keep working.
             "def add(a, b) { a + b }\nlet sum = add(2, 3)\nformat(\"add={}\", sum)",
-            // And the shape that always parsed, as a control on the fix.
             "format(\"len={}\", (\"hello\" | count))",
         ] {
             script(src);
         }
     }
 
-    /// An argument that begins with an identifier gets the **same** precedence as one that
-    /// does not.
-    ///
-    /// **This is the finding the deferral did not have.** `paren_args` consumed an
-    /// identifier to see whether a `:` followed, and resumed in a hand-rolled copy of the
-    /// binary tiers that folded flat — so `format("{}", a + b * c)` was `(a + b) * c`
-    /// while `format("{}", 1 + 2 * 3)` and `let z = a + b * c` were both right. Silently
-    /// wrong arithmetic rather than a parse error, and reachable from any argument list.
+    /// An argument starting with an identifier binds like any other: `format("{}", a + b * c)` once
+    /// folded flat into `(a + b) * c` through a hand-rolled copy of the tiers.
     #[test]
     fn an_argument_starting_with_a_name_binds_like_any_other() {
         let by_name = one_arg("format(\"{}\", a + b * c)");
@@ -2017,10 +1812,6 @@ mod argument_list_tests {
     }
 
     /// Every tier below the top one, exercised from argument position.
-    ///
-    /// The old copy listed its operators by hand, so the question "does this tier exist in
-    /// both places" had to be asked operator by operator. It is one tier now; this pins
-    /// that it is.
     #[test]
     fn an_argument_reaches_every_tier() {
         for (src, want) in [

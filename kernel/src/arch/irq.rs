@@ -2,12 +2,7 @@
 //!
 //! [`ArchIrq`] is the per-CPU local interrupt controller (the local APIC on
 //! x86_64, the GIC CPU interface on aarch64): bring-up, end-of-interrupt, and
-//! identity. The timer local-vector is programmed by the timekeeping slice
-//! (`ArchTimer`), and the preemptive-scheduling slice added the IRQ entry stubs
-//! and raised `IF=1`, so the periodic timer now drives the scheduler.
-//!
-//! The active architecture's implementation is re-exported from
-//! `crate::arch` as `Irq` (see `kernel/src/arch/mod.rs`).
+//! identity. The timer's local vector is programmed by `ArchTimer`.
 
 use crate::libkern::AllocError;
 
@@ -25,8 +20,8 @@ pub const TIMER_VECTOR: u8 = 0x20;
 /// Per-CPU local interrupt-controller operations.
 pub trait ArchIrq {
     /// Bring up this CPU's local interrupt controller and software-enable it
-    /// with the spurious vector. Does **not** unmask CPU interrupts (IF stays
-    /// 0 this slice) and arms no interrupt source. Returns [`AllocError`] if a
+    /// with the spurious vector. Does **not** unmask CPU interrupts and arms no
+    /// interrupt source. Returns [`AllocError`] if a
     /// mapping the bring-up needs (e.g. the controller's MMIO page) cannot be
     /// established.
     ///

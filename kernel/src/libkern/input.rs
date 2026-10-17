@@ -1,19 +1,10 @@
 //! The input event ABI — one record, from the driver to the compositor unchanged.
 //!
 //! `docs/architecture/input-subsystem.md` §3. A single `#[repr(C)]` record travels from a Tier 1
-//! driver, through the raw char node, through the userspace `input-server`, to the
-//! compositor. There is no translation step and no second format.
-//!
-//! **Extensibility lives in the enums, not the layout.** A touchscreen is [`EV_ABS`] codes
-//! that do not exist yet; a dial is an [`EV_REL`] code; a device class nobody has thought of
-//! is a `kind` value. [`InputEvent`] itself never changes, so no future device breaks the
-//! wire — which is exactly the corner a "fat" record with named `x`/`y`/`modifiers` fields
-//! paints you into at the *second* device class.
-//!
-//! The shape and the numbering are deliberately Linux's `evdev`. Twenty-five years across
-//! mice, tablets, touchscreens and accelerometers without a layout break is the strongest
-//! evidence available, and matching the numbering means existing keycode knowledge
-//! transfers.
+//! driver, through the raw char node and the userspace `input-server`, to the compositor, with no
+//! translation step. **Extensibility lives in the enums, not the layout** (a touchscreen is
+//! [`EV_ABS`] codes, a new device class a `kind` value), so no future device breaks the wire. The
+//! shape and numbering are deliberately Linux's `evdev`.
 //!
 //! ## Grouping, and loss
 //!
@@ -22,10 +13,9 @@
 //! on each record.
 //!
 //! When events are lost, [`SYN_DROPPED`] is delivered and the consumer must **discard its
-//! accumulated state and resynchronise** from the next `SYN_REPORT`. This is not optional
-//! politeness: after a loss the consumer's idea of which keys are held and where the pointer
-//! is are both stale, and silently carrying on is how a phantom held modifier survives for
-//! the rest of a session.
+//! accumulated state and resynchronise** from the next `SYN_REPORT`: after a loss its idea of
+//! which keys are held and where the pointer is are both stale, and carrying on silently is
+//! how a phantom held modifier survives the rest of a session.
 
 use core::mem::{align_of, offset_of, size_of};
 
@@ -44,14 +34,9 @@ pub struct InputEvent {
     /// [`KEY_RELEASE`]/[`KEY_PRESS`]/[`KEY_REPEAT`] for [`EV_KEY`]; a signed delta for
     /// [`EV_REL`]; an absolute position for [`EV_ABS`].
     pub value: i32,
-    /// Kernel monotonic time **at the interrupt**, not at delivery.
-    ///
-    /// Load-bearing for merging, not a convenience for double-click. The `input-server`
-    /// reads several device nodes over *independent* `sys_io_submit` round trips, so without
-    /// an interrupt-time stamp the only order available to it is the order its own reads
-    /// happened to complete in — scheduling noise, which would put a keystroke before or
-    /// after a click depending on when the server was descheduled. Stamping here is the only
-    /// place the true order still exists.
+    /// Kernel monotonic time **at the interrupt**, not at delivery: the `input-server` reads
+    /// several device nodes over independent round trips, and this stamp is the only place the true
+    /// order across them still exists.
     pub time_ns: u64,
 }
 
@@ -66,9 +51,7 @@ const _: () = assert!(offset_of!(InputEvent, time_ns) == 8);
 /// number of these — see [`crate::drivers::ps2`]'s ring, which drops whole records.
 pub const INPUT_EVENT_LEN: usize = size_of::<InputEvent>();
 
-// ---------------------------------------------------------------------------
 // Event classes (`kind`). evdev numbering.
-// ---------------------------------------------------------------------------
 
 /// Group separator; see [`SYN_REPORT`] and [`SYN_DROPPED`].
 pub const EV_SYN: u16 = 0x00;
@@ -79,12 +62,10 @@ pub const EV_REL: u16 = 0x02;
 /// An absolute axis was reported. `code` is an `ABS_*`; `value` is device-space.
 ///
 /// Nothing emits this yet — no absolute device exists. Reserved so a touchscreen needs no
-/// wire change (`deferred-decisions.md`, input).
+/// wire change.
 pub const EV_ABS: u16 = 0x03;
 
-// ---------------------------------------------------------------------------
 // `EV_SYN` codes.
-// ---------------------------------------------------------------------------
 
 /// End of a logical event group. Everything since the previous `SYN_REPORT` happened
 /// together.
@@ -93,21 +74,17 @@ pub const SYN_REPORT: u16 = 0;
 /// [`SYN_REPORT`]: held-key and pointer state are both stale across a drop.
 pub const SYN_DROPPED: u16 = 3;
 
-// ---------------------------------------------------------------------------
 // `EV_KEY` values.
-// ---------------------------------------------------------------------------
 
 /// The key came up.
 pub const KEY_RELEASE: i32 = 0;
 /// The key went down.
 pub const KEY_PRESS: i32 = 1;
-/// Autorepeat while held. Nothing emits this yet — key repeat is deferred to `libinput`
-/// (`deferred-decisions.md`, input) — but the value is reserved so it needs no wire change.
+/// Autorepeat while held. Nothing emits this yet — key repeat is deferred to `libinput` —
+/// but the value is reserved so it needs no wire change.
 pub const KEY_REPEAT: i32 = 2;
 
-// ---------------------------------------------------------------------------
 // `EV_REL` codes.
-// ---------------------------------------------------------------------------
 
 /// Horizontal motion; positive is right.
 pub const REL_X: u16 = 0x00;
@@ -116,22 +93,18 @@ pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
 /// Wheel detents; positive is **down**, toward the user.
 ///
-/// **The same direction [`REL_Y`] is positive in**, and deliberately *not* Linux's, which is
-/// positive-up. This table takes Linux's codes; the sign convention here is the screen's, so
-/// that everything above the driver — `libinput`, the compositor, a client adding a delta to a
-/// scroll offset — needs no sign of its own. The PS/2 wire already reports positive as toward
-/// the user, so unlike `REL_Y` nothing negates it. Stated in
-/// `docs/spec/rsproto-input-ops.md` beside `REL_Y`'s note, because a wheel that scrolls the
-/// wrong way is a one-character mistake and an unmistakable symptom.
+/// **The same direction [`REL_Y`] is positive in**, and deliberately *not* Linux's, which
+/// is positive-up. The sign convention here is the screen's, so everything above the driver
+/// needs no sign of its own. The PS/2 wire already reports positive as toward the user, so
+/// unlike `REL_Y` nothing negates it. Stated in `docs/spec/rsproto-input-ops.md` beside
+/// `REL_Y`'s note.
 pub const REL_WHEEL: u16 = 0x08;
 
-// ---------------------------------------------------------------------------
 // Keycodes — `EV_KEY` codes for keyboard keys.
 //
-// These are Linux keycodes, and for `0x01..=0x53` they are numerically identical to AT
-// scancode set 1, because Linux derived them from it. `scancode.rs` relies on that: the base
-// table is the identity, and only the `E0`-prefixed keys need a mapping.
-// ---------------------------------------------------------------------------
+// These are Linux keycodes, and for `0x01..=0x53` numerically identical to AT scancode set 1.
+// `scancode.rs` relies on that: the base table is the identity, and only the `E0`-prefixed
+// keys need a mapping.
 
 /// Escape. Also the lowest valid keycode: `0` is "no key".
 pub const KEY_ESC: u16 = 1;
@@ -190,18 +163,15 @@ pub const KEY_PAGEDOWN: u16 = 109;
 pub const KEY_INSERT: u16 = 110;
 /// Delete (`E0 53`).
 pub const KEY_DELETE: u16 = 111;
-/// Left Meta / "Super" (`E0 5B`) — the desktop shell's motivating hotkey
-/// (`display-substrate.md` §5a).
+/// Left Meta / "Super" (`E0 5B`) — the desktop shell's motivating hotkey.
 pub const KEY_LEFTMETA: u16 = 125;
 /// Right Meta (`E0 5C`).
 pub const KEY_RIGHTMETA: u16 = 126;
 /// Menu / Compose (`E0 5D`).
 pub const KEY_COMPOSE: u16 = 127;
 
-// ---------------------------------------------------------------------------
-// Buttons — also `EV_KEY` codes, in evdev's `0x110` block. Buttons are keys: it is the
-// same state machine (down, up, held), so giving them a separate class would duplicate it.
-// ---------------------------------------------------------------------------
+// Buttons — also `EV_KEY` codes, in evdev's `0x110` block: the same state machine as a
+// key (down, up, held), so a separate class would duplicate it.
 
 /// Primary button.
 pub const BTN_LEFT: u16 = 0x110;
@@ -210,8 +180,8 @@ pub const BTN_RIGHT: u16 = 0x111;
 /// Wheel click.
 pub const BTN_MIDDLE: u16 = 0x112;
 
-/// **A keyboard's lights**, the one byte a write to its raw node carries (Phase 6 Part B.5), in HID's
-/// order: Num Lock in bit 0. Typed `u16` with the codes above so the two copies are held together;
+/// **A keyboard's lights**, the one byte a write to its raw node carries, in HID's order:
+/// Num Lock in bit 0. Typed `u16` with the codes above so the two copies are held together;
 /// the byte is their low eight bits.
 pub const LIGHT_NUM: u16 = 0x01;
 /// Caps Lock's light.
@@ -236,7 +206,7 @@ impl InputEvent {
     }
 
     /// The loss marker. `value` carries how many whole records were discarded, which is
-    /// diagnostic only — a consumer resynchronises identically whatever the count.
+    /// diagnostic only.
     pub const fn dropped(lost: i32, time_ns: u64) -> Self {
         Self { kind: EV_SYN, code: SYN_DROPPED, value: lost, time_ns }
     }
@@ -269,10 +239,9 @@ mod tests {
 
     #[test]
     fn an_event_sits_at_the_offsets_the_spec_publishes() {
-        // A round trip cannot see a swapped pair — `write` and `read` agree with each other
-        // whatever they agree on. This is a kernel↔userspace ABI with a published byte
-        // table, so the bytes are pinned, not merely their symmetry. (The same gap cost a
-        // finding on `WindowInfo` in PR #175.)
+        // A round trip cannot see a swapped pair — `write` and `read` agree whatever they agree
+        // on. This is a kernel↔userspace ABI with a published byte table, so the bytes are pinned,
+        // not merely their symmetry.
         let e = InputEvent { kind: 0x1112, code: 0x2122, value: -2, time_ns: 0x8182_8384_8586_8788 };
         let mut b = [0u8; INPUT_EVENT_LEN];
         e.write(&mut b);
@@ -308,8 +277,6 @@ mod tests {
 
     #[test]
     fn buttons_are_keys_not_a_separate_class() {
-        // Deliberate: a button has the same down/up/held state machine as a key, so it
-        // shares `EV_KEY` and a consumer needs one code path, not two.
         assert_eq!(InputEvent::key(BTN_LEFT, KEY_PRESS, 1).kind, EV_KEY);
         const { assert!(BTN_LEFT > KEY_COMPOSE, "button codes must not collide with keycodes") };
     }

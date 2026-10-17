@@ -5,18 +5,13 @@ use crate::*;
 /// The label `throughput-stick` gives its FAT.
 const THROUGHPUT_LABEL: &str = "THROUGHPUT";
 
-/// **What the throughput stick holds**, as `(directory, name, bytes)` — the tree Phase 6 Part H's
-/// laptop runs copy, the same every run (`docs/planning/phase-6-usb.md` § *Part H in detail*):
-/// - `big/`: 32 files of 8 MiB — the per-byte cost, at the copy limit;
-/// - `small/`: 4,096 files of 16 KiB in one directory — the per-file cost, and the directory scan;
-/// - `tree/`: 16 directories of 64 files of 64 KiB — a home's shape.
-///
-/// **Every name is unique**, so a file's pattern can be its name's: a copy checks wherever it was
-/// put and whatever its directory was called. **And every name is a FAT short name already** — eight
-/// characters, a dot, three, as a camera names its photos — because `mcopy` given four thousand long
-/// names alike searches for a free `~N` alias for each, scanning the directory for every candidate:
-/// with `small-0000.bin` and its kind, writing the image ran past ten minutes. The check compares
-/// names without case, since a short name's case is a matter of display.
+/// **What the throughput stick holds**, as `(directory, name, bytes)`: `big/`, 32 files of 8 MiB
+/// (the per-byte cost); `small/`, 4,096 files of 16 KiB in one directory (the per-file cost and the
+/// directory scan); `tree/`, 16 directories of 64 files of 64 KiB (a home's shape). **Every name is
+/// unique**, so a file's pattern can be its name's and a copy is checked wherever it was put. **And
+/// every name is a FAT short name**: given thousands of similar long names `mcopy` searches for a
+/// free `~N` alias per file, and writing the image ran past ten minutes. The check compares names
+/// without case.
 pub(crate) fn throughput_files() -> Vec<(String, String, u64)> {
     const KIB: u64 = 1024;
     let mut out = Vec::new();
@@ -53,12 +48,11 @@ pub(crate) fn throughput_pattern(name: &str, len: u64) -> Vec<u8> {
     out
 }
 
-/// **`cargo xtask throughput-stick`** (Phase 6 Part H.2): write `tools/build-cache/throughput-stick.img`
-/// — a GiB, sparse, an MBR naming one FAT32 partition from 1 MiB with 4 KiB clusters, holding
-/// [`throughput_files`] and [`THROUGHPUT_SCRIPTS`] — to write to a stick. Half of it is free, for the
-/// run that copies the tree back onto the stick. **`--check PATH`** reads an image — or the stick
-/// read back into one, its device given the permission, or the stick mounted — and checks every
-/// pattern file on it, wherever it is.
+/// **`cargo xtask throughput-stick`**: write `tools/build-cache/throughput-stick.img`, a sparse GiB
+/// with an MBR naming one FAT32 partition from 1 MiB with 4 KiB clusters, holding
+/// [`throughput_files`] and [`THROUGHPUT_SCRIPTS`]; half of it is free for the run that copies the
+/// tree back. **`--check PATH`** reads an image, or the stick read back into one or mounted, and
+/// checks every pattern file on it, wherever it is.
 pub(crate) fn cmd_throughput_stick(args: &[String]) -> R<()> {
     if let Some(i) = args.iter().position(|a| a == "--check") {
         let path = args.get(i + 1).ok_or("`--check` takes the image or device to read")?;
@@ -117,19 +111,16 @@ pub(crate) fn cmd_throughput_stick(args: &[String]) -> R<()> {
     Ok(())
 }
 
-/// **The scripts the stick carries** (Phase 6 Part H.3), as `(name on the stick, text)`: `h3.nx`
-/// runs the laptop's sets in `nxsh`, one a boot, and `linux.sh` the same four under Linux on the
-/// same laptop, writing its times to `RESULTS/` on the stick. The check counts them among the other
-/// files and prints what `RESULTS/` holds.
+/// **The scripts the stick carries**, as `(name on the stick, text)`: `h3.nx` runs the laptop's
+/// sets in `nxsh`, one a boot, and `linux.sh` the same under Linux, writing its times to
+/// `RESULTS/`.
 const THROUGHPUT_SCRIPTS: [(&str, &str); 2] =
     [("h3.nx", include_str!("throughput/h3.nx")), ("linux.sh", include_str!("throughput/linux.sh"))];
 
-/// **Every pattern file on a throughput stick, checked** (Phase 6 Part H.2): `img`'s first MBR
-/// partition — or the whole of it, with no MBR — copied off by `mcopy`, every file whose name is
-/// the stick's checked against its pattern wherever it is, and the tree `throughput-stick` wrote
-/// required whole where it wrote it. Copies the laptop's runs made are checked too, and counted.
-/// **`img` may be the stick mounted** (Part H.3) — a directory, read where the desktop put it, so
-/// the check needs no `sudo` — and what `linux.sh` wrote to `RESULTS/` is printed either way.
+/// **Every pattern file on a throughput stick, checked**: `img`'s first MBR partition (or the whole
+/// of it, with no MBR) copied off by `mcopy`, or a mounted directory, which needs no `sudo`. Each
+/// file whose name is the stick's is checked against its pattern wherever it is; the tree
+/// `throughput-stick` wrote is required whole where it wrote it; `RESULTS/` is printed.
 fn check_throughput_stick(img: &Path) -> R<()> {
     use std::io::Read;
     let extracted = !img.is_dir();

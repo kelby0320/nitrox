@@ -1,15 +1,5 @@
-//! Raw x86_64 hardware-register access: I/O ports, control registers,
-//! and model-specific registers.
-//!
-//! Per `kernel/CLAUDE.md`, port I/O and hardware-register reads/writes
-//! live behind wrapper functions in this module rather than as `asm!`
-//! calls scattered through the codebase. The diagnostics slice needs the
-//! port primitives (the 16550 UART speaks port I/O) and a `CR2` read (the
-//! page-fault handler reports the faulting linear address from it). The
-//! paging slice adds `CR3` access, `invlpg`, and MSR read/write — the
-//! page-table root, single-page TLB invalidation, and `EFER.NXE`. The
-//! timekeeping slice adds `rdtsc` — the cycle counter the monotonic clock
-//! reads.
+//! Raw x86_64 hardware-register access: I/O ports, control registers and MSRs, behind
+//! wrapper functions rather than `asm!` scattered through the kernel (`kernel/CLAUDE.md`).
 
 use core::arch::asm;
 
@@ -59,16 +49,11 @@ pub unsafe fn inb(port: u16) -> u8 {
     val
 }
 
-// Word (16-bit) and doubleword (32-bit) port I/O (`outw`/`inw`/`outl`/`inl`)
-// were removed when the arch boundary was made private: only the byte
-// variants are used today (the 16550 serial driver). Re-add the wider
-// variants here when a device driver needs them.
+// Only `outb`, `inb` and `outl` exist (the 16550 serial port, and a reset through PCI
+// configuration space); add the others when a driver needs them.
 
-/// Read control register `CR2` — the linear address of the most recent
-/// page fault.
-///
-/// Safe: reading `CR2` has no side effects and is always valid in ring 0,
-/// which is the only ring the kernel runs in.
+/// Read control register `CR2`, the linear address of the most recent page fault. Safe:
+/// no side effects, valid in ring 0.
 #[inline]
 pub fn read_cr2() -> u64 {
     let val: u64;
@@ -81,11 +66,8 @@ pub fn read_cr2() -> u64 {
     val
 }
 
-/// Read control register `CR0` — the mode/arithmetic-coprocessor control
-/// bits (paging enable, write protect, and the x87/SSE emulation and
-/// task-switched flags the FPU slice configures).
-///
-/// Safe: reading `CR0` has no side effects and is always valid in ring 0.
+/// Read control register `CR0`: paging enable, write protect, and the x87/SSE emulation and
+/// task-switched flags. Safe: no side effects, valid in ring 0.
 #[inline]
 pub fn read_cr0() -> u64 {
     let val: u64;
@@ -156,10 +138,8 @@ pub unsafe fn write_xcr0(value: u64) {
     }
 }
 
-/// Read control register `CR4` — the bag of feature-enable bits for
-/// paging extensions, user-access protections, and others.
-///
-/// Safe: reading `CR4` has no side effects and is always valid in ring 0.
+/// Read control register `CR4`, the feature-enable bits. Safe: no side effects, valid in
+/// ring 0.
 #[inline]
 pub fn read_cr4() -> u64 {
     let val: u64;
@@ -192,28 +172,18 @@ pub unsafe fn write_cr4(value: u64) {
     }
 }
 
-/// Execute `cpuid` with `leaf` in `EAX` and `subleaf` in `ECX`,
-/// returning `(eax, ebx, ecx, edx)`.
-///
-/// Safe in ring 0: `cpuid` has no memory side effects and touches no
-/// arithmetic flags. The leaf must be one the CPU actually
-/// implements; querying an unsupported leaf yields zeros rather than
-/// faulting (this is the architectural contract since the original
-/// Pentium).
+/// Execute `cpuid` with `leaf` in `EAX` and `subleaf` in `ECX`, returning
+/// `(eax, ebx, ecx, edx)`. Safe in ring 0: no memory side effects. An unsupported leaf
+/// yields zeros rather than faulting.
 #[inline]
 pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let eax: u32;
     let ebx: u32;
     let ecx: u32;
     let edx: u32;
-    // SAFETY: `cpuid` reads `eax`/`ecx` for input and writes
-    // `eax`/`ebx`/`ecx`/`edx` for output. No memory side effects, no
-    // flag changes. LLVM reserves `rbx` for its own use and refuses
-    // to accept it as a register operand, so we route the cpuid
-    // result through a different register via `xchg`: save the
-    // kernel's rbx into `tmp`, run cpuid (clobbers rbx with the
-    // result), swap again so `tmp` holds the result and rbx is
-    // restored. The compiler then reads `tmp` as `ebx`.
+    // SAFETY: `cpuid` reads `eax`/`ecx` and writes `eax`/`ebx`/`ecx`/`edx`; no memory or flag
+    // effects. LLVM reserves `rbx` and refuses it as an operand, so `xchg` saves the kernel's
+    // rbx into `tmp`, runs cpuid, and swaps back: `tmp` holds the result, rbx is restored.
     unsafe {
         asm!(
             "xchg rbx, {tmp:r}",
@@ -229,15 +199,10 @@ pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     (eax, ebx, ecx, edx)
 }
 
-/// Execute one `RDRAND` and return the 64-bit value, or `None` if the CPU had no
-/// random value ready this attempt (CF=0).
+/// Execute one `RDRAND` and return the 64-bit value, or `None` if none was ready (CF=0).
 ///
-/// `RDRAND` reads a hardware DRBG reseeded from the on-die entropy source. The
-/// caller **must** have confirmed CPUID advertises it (`CPUID.01H:ECX[30]`);
-/// executing it on a CPU without support is `#UD`. A `None` is normal under load
-/// and should be retried a bounded number of times (see `arch::Entropy`). This is
-/// a single-instruction primitive; the retry/fallback policy lives in the entropy
-/// arch impl, not here.
+/// The caller **must** have confirmed CPUID advertises it (`CPUID.01H:ECX[30]`); otherwise
+/// `#UD`. `None` is normal under load; retry policy lives in the `arch::Entropy` impl.
 #[inline]
 pub fn rdrand_u64() -> Option<u64> {
     let val: u64;
@@ -257,15 +222,12 @@ pub fn rdrand_u64() -> Option<u64> {
     if ok != 0 { Some(val) } else { None }
 }
 
-/// Execute one `RDSEED` and return the 64-bit value, or `None` if no
-/// freshly-conditioned seed was ready this attempt (CF=0).
+/// Execute one `RDSEED` and return the 64-bit value, or `None` if no conditioned seed was
+/// ready (CF=0).
 ///
-/// `RDSEED` samples the conditioned entropy source directly — the right primitive
-/// for *seeding* a software CSPRNG (vs. `RDRAND`, a DRBG). The caller **must** have
-/// confirmed CPUID advertises it (`CPUID.07H:EBX[18]`); executing it unsupported is
-/// `#UD`. `None` is more frequent than for `RDRAND` (the source needs time to
-/// recondition) and should be retried a bounded number of times, falling back to
-/// `RDRAND`. Single-instruction primitive; policy lives in the entropy arch impl.
+/// The right primitive for seeding a software CSPRNG (vs. `RDRAND`, a DRBG). The caller
+/// **must** have confirmed CPUID advertises it (`CPUID.07H:EBX[18]`); otherwise `#UD`. `None`
+/// is more frequent than for `RDRAND`; policy lives in the entropy arch impl.
 #[inline]
 pub fn rdseed_u64() -> Option<u64> {
     let val: u64;
@@ -284,18 +246,13 @@ pub fn rdseed_u64() -> Option<u64> {
     if ok != 0 { Some(val) } else { None }
 }
 
-// `stac` and `clac` are deliberately not Rust-visible wrappers. They
-// would be `unsafe fn` callable from anywhere in the kernel, which
-// breaks the project's "only inside copy primitives" SMAP discipline
-// (kernel/CLAUDE.md). The instructions are emitted directly inside
-// the copy primitives' inline asm in `arch::x86_64::user_access`,
-// where they are bracketed by the exception-table window and never
-// outlive it.
+// `stac` and `clac` have no Rust-visible wrappers: an `unsafe fn` callable anywhere would
+// break the "only inside copy primitives" SMAP discipline (`kernel/CLAUDE.md`). They are
+// emitted in the copy primitives' asm in `arch::x86_64::user_access`, inside the
+// exception-table window.
 
-/// Read control register `CR3` — the physical base of the active
-/// top-level page table in bits 51:12, plus its low control flags.
-///
-/// Safe: reading `CR3` has no side effects and is always valid in ring 0.
+/// Read control register `CR3`: the physical base of the active top-level page table in bits
+/// 51:12, plus its low control flags. Safe: no side effects, valid in ring 0.
 #[inline]
 pub fn read_cr3() -> u64 {
     let val: u64;
@@ -335,16 +292,12 @@ pub unsafe fn write_cr3(value: u64) {
 /// runs in. The caller should already have updated the page tables so
 /// the invalidation reflects a real change.
 #[inline]
-// Under `cfg(test)` the body below is a no-op stub and every caller is
-// `#[cfg(not(test))]` (the instruction `#GP`s in ring 3), leaving it callerless —
-// keep the stub for the host-exercisable fault-in path, just don't warn on it.
+// Under `cfg(test)` the body is a no-op stub and every caller is `#[cfg(not(test))]`,
+// leaving it callerless.
 #[cfg_attr(test, allow(dead_code, reason = "a host build elides its only caller, which runs in ring 0"))]
 pub unsafe fn invlpg(virt: u64) {
-    // Host unit tests run in ring 3, where `invlpg` would `#GP`. The kernel
-    // proper always runs in ring 0; the instruction only evicts a TLB entry,
-    // which a host test (no MMU state of its own) cannot observe, so a test
-    // build elides it. This lets the demand-paging fault-in path — which must
-    // flush after installing a PTE — be exercised host-side.
+    // Host unit tests run in ring 3, where `invlpg` would `#GP`; a test build elides it so the
+    // demand-paging fault-in path, which must flush after installing a PTE, runs host-side.
     #[cfg(test)]
     let _ = virt;
     #[cfg(not(test))]
@@ -358,11 +311,8 @@ pub unsafe fn invlpg(virt: u64) {
     }
 }
 
-/// Read `RFLAGS`.
-///
-/// Safe in ring 0: `pushfq` then a pop snapshots the flags into a GPR with
-/// no lasting side effect (the push/pop pair is balanced). Used to read the
-/// interrupt-enable bit (`IF`, bit 9) for the `IrqSpinLock` save/restore.
+/// Read `RFLAGS`. Safe in ring 0: `pushfq` then a pop is balanced. Used to read `IF` (bit 9)
+/// for the `IrqSpinLock` save/restore.
 #[inline]
 pub fn read_rflags() -> u64 {
     let val: u64;
@@ -375,7 +325,7 @@ pub fn read_rflags() -> u64 {
     val
 }
 
-/// Clear the interrupt flag (`cli`) — mask maskable interrupts on this CPU.
+/// Clear the interrupt flag (`cli`), masking maskable interrupts on this CPU.
 ///
 /// # Safety
 /// Ring-0 only. Leaving interrupts masked indefinitely stalls preemption;
@@ -390,7 +340,7 @@ pub unsafe fn cli() {
     }
 }
 
-/// Set the interrupt flag (`sti`) — unmask maskable interrupts on this CPU.
+/// Set the interrupt flag (`sti`), unmasking maskable interrupts on this CPU.
 ///
 /// # Safety
 /// Ring-0 only. The IDT must be installed and a sane interrupt environment
@@ -404,17 +354,10 @@ pub unsafe fn sti() {
     }
 }
 
-/// Read the Time-Stamp Counter — a 64-bit cycle counter that increments
-/// monotonically with the core clock (the value is returned across
-/// `edx:eax`).
+/// Read the Time-Stamp Counter, a 64-bit cycle counter returned across `edx:eax`.
 ///
-/// Safe in ring 0: `rdtsc` has no memory side effects and touches no
-/// arithmetic flags. It is **not** serializing — the CPU may reorder it a
-/// few instructions either way. That is acceptable for the monotonic wall
-/// clock built on it (a handful of cycles of skew is far below the clock's
-/// nanosecond resolution); a caller needing an exact instruction-boundary
-/// timestamp would use a serializing variant, which the kernel does not
-/// yet need.
+/// Safe in ring 0. **Not** serializing: the CPU may reorder it a few instructions, a skew far
+/// below the monotonic clock's nanosecond resolution.
 #[inline]
 pub fn rdtsc() -> u64 {
     let low: u32;
@@ -428,12 +371,10 @@ pub fn rdtsc() -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-/// Read `IA32_TSC_AUX` (the per-CPU logical id the kernel programs there) via
-/// `RDTSCP`, discarding the timestamp. `RDTSCP` (`CPUID.80000001H:EDX[27]`) is
-/// present on every CPU in the project's ≈2014 hardware baseline; note it is *not*
-/// in the bare `qemu64` model's defaults, so the dev loop opts it in with `+rdtscp`
-/// (a missing feature `#UD`s here). This is the architecture's "which CPU am I"
-/// primitive — see `docs/architecture/scheduler.md` §Per-CPU access.
+/// Read `IA32_TSC_AUX` (the per-CPU logical id the kernel programs there) via `RDTSCP`,
+/// discarding the timestamp. `RDTSCP` (`CPUID.80000001H:EDX[27]`) is in the project's hardware
+/// baseline but not in bare `qemu64`, so the dev loop passes `+rdtscp` (absent, it `#UD`s).
+/// The "which CPU am I" primitive — see `docs/architecture/scheduler.md` §Per-CPU access.
 #[inline]
 pub fn rdtscp_aux() -> u32 {
     let aux: u32;
@@ -485,10 +426,8 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     }
 }
 
-/// Write back and invalidate every cache on this CPU (`wbinvd`).
-///
-/// Ring 0, and expensive — the whole point is that it is: the vendor's procedure for changing a
-/// cache-policy register requires the caches to hold nothing that the old policy described.
+/// Write back and invalidate every cache on this CPU (`wbinvd`). Expensive: changing a
+/// cache-policy register requires the caches to hold nothing the old policy described.
 ///
 /// # Safety
 /// Ring 0. Discards nothing (everything dirty is written back first), but it stalls this CPU for

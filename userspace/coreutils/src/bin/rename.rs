@@ -1,24 +1,16 @@
 //! `rename` — re-point a name at the same file.
 //!
-//! Milestone 2 Part B, and the thin half of it: one `sys_file_rename`, no fallback. Where
-//! [`move`](../move) will copy when it has to, `rename` only ever re-points a directory
-//! entry — so it is O(1), it preserves the file's identity, and it either works or says
-//! why.
-//!
-//! ```text
-//! rename OLD NEW            # within a directory, or across directories
-//! rename --force OLD NEW    # replace an existing NEW
-//! ```
+//! One `sys_file_rename`, no fallback. Where [`move`](../move) will copy when it has to,
+//! `rename` only ever re-points a directory entry — O(1), identity-preserving, and it either
+//! works or says why.
 //!
 //! ## Deliberate behaviours
 //!
-//! - **No copy fallback, on purpose.** That is `move`'s job. Keeping the two apart means
-//!   a caller who needs the cheap, identity-preserving operation can *ask for it* and be
-//!   told when it is impossible, rather than silently getting an expensive copy. A
-//!   cross-mount `rename` is an error here.
-//! - **An existing destination is an error** unless `--force`, matching `copy` (§1).
-//! - **It emits a table.** `Table<{from: String, to: String}>` — one row, but a row, so a
-//!   pipeline sees a stream rather than silence.
+//! - **No copy fallback, on purpose.** That is `move`'s job: a caller who needs the cheap,
+//!   identity-preserving operation is told when it is impossible, rather than silently
+//!   getting an expensive copy. A cross-mount `rename` is an error here.
+//! - **An existing destination is an error** unless `--force`, matching `copy`.
+//! - **It emits a table.** `Table<{from: String, to: String}>`, one row.
 
 #![no_std]
 #![no_main]
@@ -36,7 +28,6 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: the TSM1 encoder allocates.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
@@ -72,7 +63,6 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.die(b"rename: need exactly OLD and NEW (try --help)\n", EXIT_USAGE);
     }
 
-    // Resolved at the boundary: this is where a user-typed path enters (M3.5 Part B).
     let from_owned = stage.path(args.operands[0].as_bytes());
     let from = from_owned.as_slice();
     let to = args.operands[1].as_bytes();
@@ -82,9 +72,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     match libfs::rename(stage.namespace, from, to, args.has("force")) {
         Ok(()) => {}
-        // The one error worth naming specifically: it is not a failure of the filesystem
-        // but a statement that this operation cannot express what was asked, and the
-        // caller has a different tool for it.
+        // Not a filesystem failure: this operation cannot express it, and `move` can.
         Err(FileError::CrossDevice) => {
             stage.die(b"rename: source and destination are on different mounts (use `move`)\n", EXIT_FAILURE)
         }
@@ -108,7 +96,6 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(EXIT_OK)
 }
 
-/// Write the single row as a TSM1 table on the `stdout` stream.
 fn emit(stage: &Stage, stdout: u64, from: &str, to: &str) {
     let schema = Schema::new().field("from", TypeTag::String, TypeModifiers::NONE).field(
         "to",

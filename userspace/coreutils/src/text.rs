@@ -1,4 +1,4 @@
-//! **Bytes as lines** (Phase 6 Part B.7): what `log --kernel` reads the kernel's log by.
+//! **Bytes as lines** what `log --kernel` reads the kernel's log by.
 
 /// **The lines of `bytes`**, split at each `\n` with a `\r` before it dropped: a last line with no
 /// newline is still a line, and the nothing after a final newline is not one.

@@ -1,16 +1,16 @@
-//! **USB mass storage, bulk-only** (Phase 6 Part D.2–D.3): a stick bound as a disk.
+//! **USB mass storage, bulk-only**: a stick bound as a disk.
 //!
-//! `docs/planning/phase-6-usb.md` § *Part D in detail*. **Binding is the hub thread's** ([`bind`]):
+//! See `docs/planning/phase-6-usb.md`. **Binding is the hub thread's** ([`bind`]):
 //! `GET MAX LUN`, then for each unit `INQUIRY`, `TEST UNIT READY` until it is ready, and `READ
-//! CAPACITY(10)` — `(16)` for a unit too big for it (Phase 6 Part G) — then its partition table,
+//! CAPACITY(10)` — `(16)` for a unit too big for it — then its partition table,
 //! read before the disk is published — every command the thread's own, waited for and bounded at
 //! five seconds, with nothing else yet waiting on the disk.
 //!
 //! **A unit of 2³² blocks or more** — 2 TiB of 512-byte blocks — is read and written with the
-//! sixteen-byte commands, `READ(16)` and `WRITE(16)` (Phase 6 Part G); every other unit keeps the
-//! ten-byte ones, which every stick answers and older ones answer alone.
+//! sixteen-byte commands, `READ(16)` and `WRITE(16)`; every other unit keeps the ten-byte ones,
+//! which every stick answers and older ones answer alone.
 //!
-//! **A rescan is the hub thread's too** ([`rescan`], Phase 6 Part G): a `Rescan` IRP on a disk's
+//! **A rescan is the hub thread's too** ([`rescan`]): a `Rescan` IRP on a disk's
 //! node wakes it, and it retires the disk's partitions' windows, lets what they forwarded drain,
 //! holds the device, departs the partitions, reads the table again as at the disk's arrival, and
 //! publishes what it says.
@@ -29,10 +29,10 @@
 //! ended. **A departure** takes the device out of the table and completes what it held `PeerClosed`.
 //!
 //! **The devices are a value** ([`Disks`]), one static in a boot, eight slots under an epoch as the
-//! HID nodes are (PR #361's lesson): a node's context names its slot and the epoch it was made in,
-//! so a handle to a departed stick is refused rather than served the next one's. Its methods decide
-//! and return what to do — an IRP to complete, the hub thread to wake — and a host test drives them
-//! with heap memory standing in for the rings.
+//! HID nodes are: a node's context names its slot and the epoch it was made in, so a handle to a
+//! departed stick is refused rather than served the next one's. Its methods decide and return what
+//! to do — an IRP to complete, the hub thread to wake — and a host test drives them with heap
+//! memory standing in for the rings.
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
@@ -73,8 +73,6 @@ pub const DEADLINE_NS: u64 = 30_000_000_000;
 const BIND_DATA: usize = 32 * 512;
 /// The status wrapper's place in the wrapper page; the command wrapper is at 0.
 const CSW_AT: u64 = 64;
-
-// --- Bulk-only's wrappers (USB Mass Storage Class Bulk-Only Transport 1.0 §5) ------------------
 
 /// A command block wrapper's length, and its signature, `USBC`.
 pub const CBW_LEN: usize = 31;
@@ -125,8 +123,6 @@ pub fn csw(b: &[u8], tag: u32) -> Status {
     }
 }
 
-// --- SCSI (SPC-4, SBC-3) ---------------------------------------------------------------------
-
 /// The commands this driver sends, each its CDB's bytes, and the answers it reads.
 pub mod scsi {
     /// `TEST UNIT READY`.
@@ -157,13 +153,13 @@ pub mod scsi {
     }
 
     /// `READ CAPACITY(16)` — `SERVICE ACTION IN(16)`, service action `0x10` — for its answer's
-    /// first [`CAPACITY16_LEN`] bytes: a unit too big for `READ CAPACITY(10)` (Phase 6 Part G).
+    /// first [`CAPACITY16_LEN`] bytes: a unit too big for `READ CAPACITY(10)`.
     pub const fn read_capacity16() -> [u8; 16] {
         [0x9E, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CAPACITY16_LEN as u8, 0, 0]
     }
 
     /// `READ(16)` or `WRITE(16)` of `count` blocks from `lba`, big-endian: a unit of 2³² blocks or
-    /// more (Phase 6 Part G).
+    /// more.
     pub fn rw16(write: bool, lba: u64, count: u32) -> [u8; 16] {
         let l = lba.to_be_bytes();
         let c = count.to_be_bytes();
@@ -265,11 +261,7 @@ pub mod scsi {
     }
 }
 
-// --- The devices ------------------------------------------------------------------------------
-
-/// A slot no device has had.
 const FREE: u8 = 0;
-/// A slot whose device is bound.
 const BOUND: u8 = 1;
 /// A slot whose device has departed: the next device may take it, under a new epoch.
 const RETIRED: u8 = 2;
@@ -280,13 +272,11 @@ fn context(slot: usize, lun: u8, epoch: u32) -> *mut () {
     ((epoch as usize) << 16 | (lun as usize) << 8 | slot) as *mut ()
 }
 
-/// The slot, unit and epoch a context names.
 fn decode(ctx: *mut ()) -> (usize, u8, u32) {
     let c = ctx as usize;
     (c & 0xFF, (c >> 8) as u8, (c >> 16) as u32)
 }
 
-/// What a command in flight is for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Owner {
     /// A block IRP's command; `retried` once a unit attention has sent it again.
@@ -305,8 +295,7 @@ enum Stage {
     Status { csw_trb: u64 },
 }
 
-/// A command in flight: whose, its tag, where it is, its deadline, and when it was issued — for its
-/// time on the device (Phase 6 Part H.2).
+/// A command in flight: whose, its tag, where it is, its deadline, and when it was issued.
 #[derive(Copy, Clone, Debug)]
 struct Command {
     owner: Owner,
@@ -327,14 +316,12 @@ pub enum Fault {
     Deadline,
 }
 
-/// What the hub thread's own command found.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum HubResult {
     Status(Status),
     Fault(Fault),
 }
 
-/// A ring the driver writes, by its virtual and physical bases.
 #[derive(Debug)]
 struct Ring {
     producer: Producer,
@@ -390,13 +377,11 @@ impl Ring {
         }
     }
 
-    /// Where the controller will next read: the dequeue pointer a Set TR Dequeue Pointer skips to.
     fn next(&self) -> (u64, bool) {
         (self.phys + self.producer.next_slot() as u64 * 16, self.producer.cycle())
     }
 }
 
-/// A logical unit: its size in blocks and its block size; zero blocks for one not published.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct Lun {
     blocks: u64,
@@ -409,7 +394,6 @@ struct Lun {
 /// which the hub thread holds and frees after its slot is disabled; this keeps where they are.
 #[derive(Debug)]
 pub(super) struct Dev {
-    /// Its xHCI slot, its interface, and its endpoints' indices, addresses and maximum packets.
     slot: u8,
     interface: u8,
     in_dci: u8,
@@ -426,14 +410,11 @@ pub(super) struct Dev {
     /// The binding's data buffer, [`BIND_DATA`] bytes: what the hub thread's commands read into.
     data_virt: u64,
     data_phys: u64,
-    /// The doorbell array's base: the controller's, or a host test's.
     db: u64,
     tag: u32,
     luns: [Lun; MAX_LUNS],
     inflight: Option<Command>,
-    /// A command the DPC found going wrong, for the hub thread.
     fault: Option<Fault>,
-    /// What the hub thread's own last command found.
     hub_result: Option<HubResult>,
     /// **The hub thread is recovering it**: a submit queues rather than starting a command under
     /// the recovery's feet.
@@ -441,13 +422,12 @@ pub(super) struct Dev {
     /// **An IRP a failed recovery could not stop**: its command's TRBs may still move its data, so it
     /// is completed only by the departure that follows, once the slot is disabled.
     stranded: Option<*mut Irp>,
-    /// **A `Rescan` waiting for the hub thread** (Phase 6 Part G), and the unit it names: not a
-    /// command on the rings, so held here rather than queued. **The device goes on meanwhile**:
-    /// what is queued drains, so what the disk's windows forwarded before they were retired reaches
-    /// the disk before the new table is published (PR #369 review).
+    /// **A `Rescan` waiting for the hub thread**, and the unit it names: not a command on the
+    /// rings, so held here rather than queued. **The device goes on meanwhile**: what is queued
+    /// drains, so what the disk's windows forwarded before they were retired reaches the disk
+    /// before the new table is published.
     rescan: Option<(*mut Irp, u8)>,
     queue: Queue,
-    /// Each published unit's disk node's counters, attached as it is published (Phase 6 Part H.2).
     counted: [Counted; MAX_LUNS],
 }
 
@@ -455,7 +435,7 @@ pub(super) struct Dev {
 // the IRPs are owned by their submitters until completed, and the operation by the waiting thread.
 unsafe impl Send for Dev {}
 
-/// **A command's CDB**: ten bytes, or sixteen for a unit of 2³² blocks or more (Phase 6 Part G).
+/// **A command's CDB**: ten bytes, or sixteen for a unit of 2³² blocks or more.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Cdb {
     bytes: [u8; 16],
@@ -463,7 +443,6 @@ struct Cdb {
 }
 
 impl Cdb {
-    /// The CDB whose bytes are `b`, sixteen at most.
     fn of(b: &[u8]) -> Cdb {
         let mut bytes = [0u8; 16];
         let len = b.len().min(16);
@@ -471,7 +450,6 @@ impl Cdb {
         Cdb { bytes, len: len as u8 }
     }
 
-    /// Its bytes.
     fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
     }
@@ -500,7 +478,6 @@ struct IrpCmd {
 }
 
 impl IrpCmd {
-    /// The IRP's op, by what its command is: what the counters file it under.
     fn op(&self) -> u32 {
         if self.flush {
             IrpOp::Flush as u32
@@ -512,7 +489,6 @@ impl IrpCmd {
     }
 }
 
-/// The IRPs waiting for the one in flight, in order.
 #[derive(Debug)]
 struct Queue {
     ring: [Option<IrpCmd>; QUEUE],
@@ -567,7 +543,6 @@ pub(super) struct Disks {
     devs: [IrqSpinLock<Option<Dev>>; MAX_DEVICES],
 }
 
-/// The boot's storage devices.
 static DISKS: Disks = Disks::new();
 
 /// **The command for a block IRP**: its CDB, its length in the wrapper, its direction, whether it is
@@ -594,20 +569,19 @@ fn irp_command(op: u32, offset: u64, length: u64, lun: Lun) -> Result<(Cdb, u32,
     Ok((rw_cdb(lun.blocks, write, lba, count as u16), length as u32, !write, false))
 }
 
-/// How many packets of `mps` bytes `remaining` bytes take, for a TRB's TD Size.
 fn packets(remaining: u64, mps: u16) -> u32 {
     remaining.div_ceil(mps.max(1) as u64).min(31) as u32
 }
 
 impl Dev {
     /// **Put a command on the rings**: its wrapper written, the command wrapper on bulk OUT, the
-    /// data as a Normal TRB per fragment on the side it moves, the last interrupting on completion —
-    /// or, with no data, the command wrapper itself — then the doorbells. **The status wrapper is
-    /// asked for when that stage ends** ([`Dev::ask_status`]), not queued behind it: QEMU's
-    /// `usb-storage` takes a status read that arrives while its data is still coming as part of the
-    /// data stage, and never answers it — measured in `test-qemu`, where a `READ(10)`, whose data
-    /// comes from QEMU's disk asynchronously, hung while `INQUIRY`, answered at once, did not. Linux
-    /// asks for each stage after the last, which is why it never meets this.
+    /// data as a Normal TRB per fragment on the side it moves, the last interrupting on
+    /// completion — or, with no data, the command wrapper itself — then the doorbells. **The status
+    /// wrapper is asked for when that stage ends** ([`Dev::ask_status`]), not queued behind it:
+    /// QEMU's `usb-storage` takes a status read that arrives while its data is still coming as
+    /// part of the data stage, and never answers it, so a `READ(10)`, whose data comes from QEMU's
+    /// disk asynchronously, hung while an `INQUIRY` answered at once. Linux asks for each stage
+    /// after the last, which is why it never meets this.
     #[allow(clippy::too_many_arguments, reason = "a command's owner, unit, CDB, length, direction and buffer")]
     fn issue(&mut self, owner: Owner, lun: u8, cdb: &[u8], len: u32, input: bool, frags: &[PhysFrag], now: u64) {
         self.tag = self.tag.wrapping_add(1);
@@ -651,8 +625,7 @@ impl Dev {
         }
     }
 
-    /// **Ask for the status wrapper**, the command's data stage over: its TRB on bulk IN,
-    /// interrupting on completion, and IN's doorbell.
+    /// **Ask for the status wrapper**, the command's data stage over: on bulk IN, interrupting.
     fn ask_status(&mut self) {
         let mut csw_trb = 0;
         let trb = Trb::bulk(self.wrap_phys + CSW_AT, CSW_LEN as u32, false, true, true, 0);
@@ -663,14 +636,12 @@ impl Dev {
         self.ring(self.in_dci);
     }
 
-    /// Ring endpoint `dci`'s doorbell.
     fn ring(&self, dci: u8) {
         // SAFETY: `db` is the controller's doorbell array, or a host test's stand-in for it, with an
         // entry per slot.
         unsafe { core::ptr::write_volatile((self.db + 4 * self.slot as u64) as *mut u32, dci as u32) };
     }
 
-    /// The status wrapper as the device wrote it.
     fn read_csw(&self) -> [u8; CSW_LEN] {
         let mut b = [0u8; CSW_LEN];
         for (i, v) in b.iter_mut().enumerate() {
@@ -681,7 +652,6 @@ impl Dev {
         b
     }
 
-    /// **The command for `irp` on unit `lun`**, or the error to refuse it with.
     fn command_for(&self, irp: *mut Irp, lun: u8) -> Result<IrpCmd, KError> {
         let unit = self.luns.get(lun as usize).copied().unwrap_or_default();
         // SAFETY: `irp` is live and owned by its submitter until completed.
@@ -690,7 +660,6 @@ impl Dev {
         Ok(IrpCmd { irp, lun, cdb, len, input, flush })
     }
 
-    /// **Start an IRP's command**: on the rings whole.
     fn start(&mut self, c: IrpCmd, retried: bool, now: u64) {
         // SAFETY: `c.irp` is live and owned by its submitter until completed.
         let (count, frags) = unsafe { ((*c.irp).buffer.count, (*c.irp).buffer.frags) };
@@ -726,12 +695,10 @@ impl Disks {
         (queued, [inflight, dev.stranded.take(), dev.rescan.take().map(|(irp, _)| irp)])
     }
 
-    /// The xHCI slot's storage device's table slot, if one is bound there.
     fn slot_of(&self, slot: u8) -> Option<usize> {
         (0..MAX_DEVICES).find(|&i| self.devs[i].lock().as_ref().is_some_and(|d| d.slot == slot))
     }
 
-    /// Every slot free.
     const fn new() -> Disks {
         Disks {
             states: [const { AtomicU8::new(FREE) }; MAX_DEVICES],
@@ -740,7 +707,6 @@ impl Disks {
         }
     }
 
-    /// Whether a context's node is still its slot's: the slot has not been given to another device.
     fn current(&self, ctx: *mut ()) -> bool {
         let (i, _, epoch) = decode(ctx);
         self.epochs.get(i).is_some_and(|e| e.load(Ordering::Acquire) == epoch)
@@ -772,8 +738,8 @@ impl Disks {
         let Some(dev) = d.as_mut().filter(|_| self.current(ctx)) else {
             return refuse(KError::PeerClosed);
         };
-        // **A rescan is the hub thread's** (Phase 6 Part G): held for it, and it woken — it reads
-        // the table through its own commands once the device is quiet.
+        // **A rescan is the hub thread's**: held for it, and it woken — it reads the table through
+        // its own commands once the device is quiet.
         // SAFETY: `irp` is live and owned by its submitter until completed.
         if unsafe { (*irp).op } == IrpOp::Rescan as u32 {
             if dev.luns.get(lun as usize).and_then(|u| u.record).is_none() {
@@ -789,9 +755,8 @@ impl Disks {
             Ok(c) => c,
             Err(e) => return refuse(e),
         };
-        // **Not while a rescan waits** (PR #369 review): until the hub thread takes the device, it
-        // runs as ever, so what is queued drains before the table is read. Once taken, `recovering`
-        // holds it.
+        // **Not while a rescan waits**: until the hub thread takes the device, it runs as ever, so
+        // what is queued drains before the table is read. Once taken, `recovering` holds it.
         if dev.inflight.is_some() || dev.fault.is_some() || dev.recovering {
             return if dev.queue.push(c) { Action::None } else { refuse(KError::IoError) };
         }
@@ -815,7 +780,7 @@ impl Disks {
             // **A command with a fault recorded is the hub thread's**, which will reset what is on
             // its rings: a later event of it changes nothing. A deadline marked as the command was
             // ending is not such a fault — the command made it, and its completion below clears
-            // the mark rather than leave it to be charged to the next command (PR #363 review).
+            // the mark rather than leave it to be charged to the next command.
             if dev.fault.is_some_and(|f| f != Fault::Deadline) {
                 return Some(Action::None);
             }
@@ -852,7 +817,6 @@ impl Disks {
             }
             let Owner::Irp { cmd: c, .. } = cmd.owner else { return Some(Action::None) };
             if let Some(f) = fault {
-                // Left in flight, for the hub thread to recover and end.
                 dev.fault = Some(f);
                 return Some(Action::Wake);
             }
@@ -860,7 +824,7 @@ impl Disks {
             dev.fault = None;
             dev.counted[c.lun as usize % MAX_LUNS].record(c.op(), true, c.len as u64, now.saturating_sub(cmd.started));
             // **Not while the hub thread holds the device.** A rescan waiting does not hold it: the
-            // queue drains for it, and it takes the device once nothing is left (PR #369 review).
+            // queue drains for it, and it takes the device once nothing is left.
             if !dev.recovering
                 && let Some(next) = dev.queue.pop()
             {
@@ -872,7 +836,6 @@ impl Disks {
     }
 }
 
-/// Complete an IRP: its status set and its DPC queued. No lock held.
 fn complete(irp: *mut Irp, status: i32, transferred: u64) {
     // SAFETY: `irp` is live and uniquely this driver's until its DPC runs.
     unsafe {
@@ -882,8 +845,8 @@ fn complete(irp: *mut Irp, status: i32, transferred: u64) {
 }
 
 /// Do what an [`Action`] says. No lock held. `x` is the controller, to wake the hub thread through:
-/// the DPC's, the hub thread's, and a submit's — which wakes it only for a rescan (Phase 6 Part G);
-/// a command's deadline it learns from [`Disks::bound`].
+/// the DPC's, the hub thread's, and a submit's — which wakes it only for a rescan; a command's
+/// deadline it learns from [`Disks::bound`].
 fn act(a: Action, x: Option<&Xhci>) {
     match a {
         Action::None => {}
@@ -899,10 +862,7 @@ fn act(a: Action, x: Option<&Xhci>) {
     }
 }
 
-// --- The backend --------------------------------------------------------------------------------
-
-/// [`BlockBackend::submit`] for a USB disk: [`Disks::submit`], on the boot's — waking the hub thread,
-/// through the controller, for a rescan (Phase 6 Part G).
+/// [`BlockBackend::submit`] for a USB disk: [`Disks::submit`], on the boot's.
 fn submit(irp: *mut Irp, ctx: *mut ()) {
     let a = DISKS.submit(irp, ctx, crate::arch::Timer::read_ns());
     act(a, super::controller());
@@ -924,8 +884,6 @@ pub(super) fn on_transfer(x: &Xhci, trb: &Trb) -> bool {
         None => false,
     }
 }
-
-// --- Binding, in the hub thread ----------------------------------------------------------------
 
 /// A bulk-only interface prepared for its device's one configuration: its endpoints' rings and its
 /// pages, which [`bind`] puts in the table.
@@ -994,7 +952,6 @@ pub(super) fn prepare(port: u8, mem: &mut DeviceMem, config: &[u8]) -> Option<Pr
         data_virt: data.virt() as u64,
         data_phys: data.phys().as_u64(),
     };
-    // **The device's memory**: freed with it, and only after its slot is disabled.
     for b in [rin, rout, wrap, data] {
         if mem.class.try_push(b).is_err() {
             crate::kprintln!("usb: port {port}: no memory for its storage endpoints; not bound");
@@ -1004,10 +961,10 @@ pub(super) fn prepare(port: u8, mem: &mut DeviceMem, config: &[u8]) -> Option<Pr
     Some(p)
 }
 
-/// **Bind the bulk-only interface `p` of the device in `slot`**, its configuration set: put it in the
-/// table, then for each logical unit that is a ready direct-access device of under 2 TiB, read its
-/// partition table and publish it — a `Disk` under the `UsbDevice` record `parent`, named by its
-/// INQUIRY strings and `serial`, and its partitions under it.
+/// **Bind the bulk-only interface `p` of the device in `slot`**, its configuration set: put it in
+/// the table, then for each logical unit that is a ready direct-access device, read its partition
+/// table and publish it — a `Disk` under the `UsbDevice` record `parent`, named by its INQUIRY
+/// strings and `serial`, and its partitions under it.
 pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: Prepared, parent: Option<u32>, serial: &[u8]) {
     let dev = Dev {
         slot,
@@ -1074,15 +1031,12 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: Prepare
     }
 }
 
-/// What a unit is, from the binding's commands.
 struct Unit {
     inquiry: scsi::Inquiry,
     blocks: u64,
     block_len: u32,
 }
 
-/// **A binding in progress**: the hub thread's, on device slot `i`, with the device's memory for its
-/// default endpoint's requests.
 struct Binding<'a> {
     x: &'a Xhci,
     port: u8,
@@ -1095,9 +1049,9 @@ struct Binding<'a> {
 
 impl Binding<'_> {
     /// **What unit `lun` is**: a ready direct-access device's INQUIRY, block count and size, or
-    /// `None` for one left alone — another kind, or no medium — which is said. `Err` when the device
-    /// stopped answering, which ends the binding. **A unit of 2³² blocks or more**, which `READ
-    /// CAPACITY(10)` cannot describe, is asked again with `READ CAPACITY(16)` (Phase 6 Part G).
+    /// `None` for one left alone — another kind, or no medium — which is said. `Err` when the
+    /// device stopped answering, which ends the binding. **A unit of 2³² blocks or more**, which
+    /// `READ CAPACITY(10)` cannot describe, is asked again with `READ CAPACITY(16)`.
     fn unit(&mut self, lun: u8) -> Result<Option<Unit>, &'static str> {
         let port = self.port;
         let mut buf = [0u8; scsi::INQUIRY_LEN];
@@ -1161,7 +1115,6 @@ impl Binding<'_> {
         Ok(Some(Unit { inquiry, blocks, block_len }))
     }
 
-    /// `REQUEST SENSE`'s key, code and qualifier.
     fn sense(&mut self, lun: u8) -> Result<(u8, u8, u8), &'static str> {
         let mut buf = [0u8; scsi::SENSE_LEN];
         match self.run(lun, &scsi::request_sense(), &mut buf) {
@@ -1170,7 +1123,6 @@ impl Binding<'_> {
         }
     }
 
-    /// One of the hub thread's commands on this device, its data read into `out`: [`run`].
     fn run(&mut self, lun: u8, cdb: &[u8], out: &mut [u8]) -> Result<Status, Failed> {
         run(self.x, self.i, lun, cdb, out, self.mem)
     }
@@ -1206,8 +1158,7 @@ impl Binding<'_> {
         let Some(id) = crate::device::register_block_under(node.clone(), parent, "usb-storage") else {
             return false;
         };
-        // Kept with the unit, for a rescan to depart the disk's partitions by (Phase 6 Part G), and
-        // its counters with it (Part H.2).
+        // Kept with the unit, for a rescan to depart the disk's partitions by, and its counters.
         if let Some(dev) = DISKS.devs[self.i].lock().as_mut() {
             dev.luns[lun as usize].record = Some(id);
             // SAFETY: `node` was just registered, and the table holds it for the kernel's lifetime.
@@ -1226,9 +1177,9 @@ impl Binding<'_> {
     }
 }
 
-/// **Read unit `lun`'s partition table** through the hub thread's commands, as at its disk's arrival
-/// and again for a rescan (Phase 6 Part G): `None` for a unit of other than 512-byte blocks, which
-/// is said, since the table reader takes those alone.
+/// **Read unit `lun`'s partition table** through the hub thread's commands, as at its disk's
+/// arrival and again for a rescan: `None` for a unit of other than 512-byte blocks, which is said,
+/// since the table reader takes those alone.
 fn read_table(
     x: &Xhci,
     i: usize,
@@ -1252,19 +1203,19 @@ fn read_table(
     }))
 }
 
-/// **Rescan a USB disk's table** (Phase 6 Part G), for the `Rescan` IRP device `i` holds, from the
-/// hub thread with the device's memory:
+/// **Rescan a USB disk's table**, for the `Rescan` IRP device `i` holds, from the hub thread with
+/// the device's memory:
 /// 1. **the disk's partitions' windows retired first**, so nothing more comes through them, and
 ///    waited out until no submit is between a window's check and its forward ([`window_busy`]);
 /// 2. **the device left to drain** — what those windows forwarded before, queued or in flight,
-///    reaches the disk at the old table's offsets now, never after the new one is published (PR
-///    #369 review) — a fault recovered on the way; then taken, every later submit queued;
+///    reaches the disk at the old table's offsets now, never after the new one is published — a
+///    fault recovered on the way; then taken, every later submit queued;
 /// 3. the partitions' records departed, the table read again as at the disk's arrival and
 ///    published, and the IRP completed with how many partitions it found — or `IoError` if the
 ///    table would not read.
 ///
 /// **`Ended` for a device to end as on an unplug**: one whose recovery failed meanwhile, which
-/// nothing will make quiet (PR #369 review). Its departure completes the rescan.
+/// nothing will make quiet. Its departure completes the rescan.
 ///
 /// [`window_busy`]: crate::io::block::window_busy
 pub(super) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut DeviceMem) -> Recovered {
@@ -1282,8 +1233,8 @@ pub(super) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut DeviceMem) -> Recov
             let _ = windows.try_push(node);
         }
     }
-    // **Giving up** — a device that never went quiet — leaves the retired windows' records departed,
-    // since they refuse everything: the disk then lists no partition until a rescan succeeds.
+    // **Giving up** — a device that never went quiet — leaves the retired windows' records
+    // departed, since they refuse everything: the disk lists no partition until a rescan succeeds.
     let give_up = |why: &str| {
         if let Some(irp) = DISKS.drop_rescan(i) {
             crate::kprintln!("usb: port {port}: its disk {why}; not rescanned");
@@ -1409,7 +1360,6 @@ fn run(x: &Xhci, i: usize, lun: u8, cdb: &[u8], out: &mut [u8], mem: &mut Device
     result
 }
 
-/// A field of device `i`, or zero if it has gone.
 fn dev_field<T: Default>(i: usize, f: impl FnOnce(&Dev) -> T) -> T {
     DISKS.devs[i].lock().as_ref().map(f).unwrap_or_default()
 }
@@ -1434,7 +1384,7 @@ fn run_once(i: usize, lun: u8, cdb: &[u8], len: u32, status_only: bool) -> Resul
             TakeBack::Taken => return Err(Failed::Timeout),
             TakeBack::Gone => return Err(Failed::Device("its device has gone")),
             // **The DPC took it first**, and completes `po` only once it has let the device's lock
-            // go: so `po` is not dropped until then, as `hub::wait` waits (PR #363 review).
+            // go: so `po` is not dropped until then, as `hub::wait` waits.
             TakeBack::OnItsWay => {
                 use crate::sched::{WaitResult, wait_on};
                 // SAFETY: `po` pins the `PendingOperation` waited on, and outlives the closure.
@@ -1489,12 +1439,9 @@ fn reset_recovery(x: &Xhci, i: usize, mem: &mut DeviceMem) -> Result<(), Failed>
     clear_halt(x, i, out_dci, mem)
 }
 
-/// Give device `i`'s slot back: nothing of it was published, so nothing was submitted to it.
 fn retire(i: usize) {
     let _ = DISKS.depart(i);
 }
-
-// --- Recovery, deadlines and departure, in the hub thread ----------------------------------------
 
 /// **How long the hub thread may sleep** at `now` ([`Disks::bound`]).
 pub(super) fn bound(now: u64) -> Option<u64> {
@@ -1514,7 +1461,6 @@ pub(super) enum Recovered {
     Ended,
 }
 
-/// **How a recovery ends** ([`Disks::end_recovery`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum End {
     /// The IRP completes with this status, and the next queued starts.
@@ -1523,11 +1469,10 @@ enum End {
     Retry,
     /// **Reset recovery failed**, so the bulk endpoints may never have stopped and the command's
     /// TRBs may still move the IRP's data. It is held for the departure, which completes it once
-    /// the slot is disabled, as it completes a command in flight (PR #363 review).
+    /// the slot is disabled, as it completes a command in flight.
     Stranded,
 }
 
-/// **What a hub command whose wait ran out is doing** ([`Disks::take_back`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum TakeBack {
     /// Taken back before the DPC reached it: nothing will complete its operation.
@@ -1539,13 +1484,11 @@ enum TakeBack {
 }
 
 impl Disks {
-    /// **How long the hub thread may sleep at `now`** (PR #363 review): until the earliest deadline of
-    /// an IRP's command in flight, and **never longer than a deadline's length while any disk is
-    /// bound**. A command started while it sleeps has a deadline at least that far off, so the
-    /// thread sees it by its deadline with nothing waking it: one wake a deadline's length on an idle
-    /// machine with a stick in, rather than one a command. `None` with no disk bound. (Until the
-    /// review it slept until the earliest deadline or without a bound, so a command started during
-    /// an unbounded sleep went unwatched until something else woke the thread.)
+    /// **How long the hub thread may sleep at `now`**: until the earliest deadline of an IRP's
+    /// command in flight, and **never longer than a deadline's length while any disk is bound**, so
+    /// a command started while it sleeps is seen by its deadline with nothing waking the thread:
+    /// one wake a deadline's length on an idle machine with a stick in, rather than one a command.
+    /// `None` with no disk bound.
     fn bound(&self, now: u64) -> Option<u64> {
         let mut bound = None;
         for s in &self.devs {
@@ -1562,9 +1505,9 @@ impl Disks {
         bound
     }
 
-    /// **The devices the hub thread must look at**: by table slot, the xHCI slot of each with a fault
-    /// the DPC recorded, an IRP's command past its deadline at `now`, which is marked here, or a
-    /// rescan waiting (Phase 6 Part G).
+    /// **The devices the hub thread must look at**: by table slot, the xHCI slot of each with a
+    /// fault the DPC recorded, an IRP's command past its deadline at `now`, which is marked here,
+    /// or a rescan waiting.
     fn due(&self, now: u64) -> [Option<u8>; MAX_DEVICES] {
         core::array::from_fn(|i| {
             let mut d = self.devs[i].lock();
@@ -1598,10 +1541,10 @@ impl Disks {
         }
     }
 
-    /// **End device `i`'s recovery of `cmd`** as `end` says, in the one lock scope that lets submits
-    /// start again: so none can start between the recovery's end and a retry, and have its command
-    /// replaced by the retry's (PR #363 review). A stranded command keeps the device recovering, so
-    /// nothing starts on a device about to be ended. What to do after, with no lock held.
+    /// **End device `i`'s recovery of `cmd`** as `end` says, in the one lock scope that lets
+    /// submits start again: so none can start between the recovery's end and a retry, and have its
+    /// command replaced by the retry's. A stranded command keeps the device recovering, so nothing
+    /// starts on a device about to be ended. What to do after, with no lock held.
     fn end_recovery(&self, i: usize, cmd: IrpCmd, end: End, now: u64) -> Action {
         let mut d = self.devs[i].lock();
         let Some(dev) = d.as_mut() else {
@@ -1664,10 +1607,10 @@ impl Disks {
         dev.luns.get(lun as usize).copied()
     }
 
-    /// **Begin device `i`'s rescan** (Phase 6 Part G): once nothing is in flight, queued or
-    /// recovering, its `Rescan` taken and the device held — every submit queued — until
-    /// [`Disks::end_rescan`]. **`Ended` for a device a failed recovery stranded** (PR #369 review),
-    /// which nothing will make quiet: the hub thread ends it, and the departure completes the rescan.
+    /// **Begin device `i`'s rescan**: once nothing is in flight, queued or recovering, its `Rescan`
+    /// taken and the device held — every submit queued — until [`Disks::end_rescan`]. **`Ended` for
+    /// a device a failed recovery stranded**, which nothing will make quiet: the hub thread ends
+    /// it, and the departure completes the rescan.
     fn begin_rescan(&self, i: usize) -> BeginRescan {
         let mut d = self.devs[i].lock();
         let Some(dev) = d.as_mut() else { return BeginRescan::Nothing };
@@ -1760,14 +1703,13 @@ pub(super) fn recover(x: &Xhci, i: usize, mem: &mut DeviceMem) -> Recovered {
     if end == End::Stranded { Recovered::Ended } else { Recovered::Done }
 }
 
-/// **Where a rescan stands** (Phase 6 Part G).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum BeginRescan {
     /// No rescan is waiting, or the device has gone.
     Nothing,
     /// One is waiting, behind a command in flight, one queued, or a recovery.
     Busy,
-    /// One is waiting on a device a failed recovery stranded, which is to be ended (PR #369 review).
+    /// One is waiting on a device a failed recovery stranded, which is to be ended.
     Ended,
     /// It is the hub thread's, for unit `lun`, and the device is held.
     Ready { irp: *mut Irp, lun: u8, unit: Lun },
@@ -1777,10 +1719,10 @@ enum BeginRescan {
 /// failed recovery stranded, and a rescan waiting.
 pub(super) struct Departed([Option<*mut Irp>; 3]);
 
-/// **The device in xHCI slot `slot` has gone** (Phase 6 Part D.3): out of the table, so the DPC
-/// touches none of its memory; its queue completed `PeerClosed` now, and any later submit refused so
-/// by its slot's epoch. The command in flight is handed back, for [`finish`] once the slot is
-/// disabled: until then the controller may still move its data. From the hub thread.
+/// **The device in xHCI slot `slot` has gone**: out of the table, so the DPC touches none of its
+/// memory; its queue completed `PeerClosed` now, and any later submit refused so by its slot's
+/// epoch. The command in flight is handed back, for [`finish`] once the slot is disabled: until
+/// then the controller may still move its data. From the hub thread.
 pub(super) fn depart(slot: u8) -> Departed {
     let Some(i) = DISKS.slot_of(slot) else {
         return Departed([None; 3]);
@@ -1809,8 +1751,6 @@ mod tests {
     use crate::io::irp::IrpBuffer;
     use crate::mm::test_support::init_global_heap;
 
-    /// **A command block wrapper** where bulk-only puts each field: the signature, the tag, the
-    /// length, IN in the flags' top bit, the unit, the CDB's length and the CDB.
     #[test]
     fn a_command_wrapper_is_laid_out_as_bulk_only_says() {
         let w = cbw(0x1234_5678, 4096, true, 3, &scsi::rw10(false, 0x0102_0304, 8));
@@ -1832,8 +1772,6 @@ mod tests {
         b
     }
 
-    /// **A status wrapper reads as its status only when it is this command's**: a wrong signature
-    /// or tag is no wrapper, nor a status past 2; and a residue is carried.
     #[test]
     fn a_status_wrapper_is_this_commands_or_invalid() {
         assert_eq!(csw(&status(b"USBS", 7, 0, 0), 7), Status::Passed { residue: 0 });
@@ -1846,7 +1784,6 @@ mod tests {
         assert_eq!(csw(&status(b"USBS", 7, 0, 0)[..12], 7), Status::Invalid, "short");
     }
 
-    /// **Each CDB's bytes**, as SPC-4 and SBC-3 give them, the LBA and count big-endian.
     #[test]
     fn each_cdb_is_as_scsi_gives_it() {
         assert_eq!(scsi::test_unit_ready(), [0; 6]);
@@ -1857,8 +1794,6 @@ mod tests {
         assert_eq!(scsi::synchronize_cache(), [0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
-    /// **What the answers say**: a direct-access device and a CD-ROM; a capacity, and one of 2 TiB,
-    /// which the ten-byte commands cannot address; a sense key and its code.
     #[test]
     fn the_answers_read_as_scsi_gives_them() {
         let mut inq = [0u8; 36];
@@ -1883,8 +1818,6 @@ mod tests {
         assert_eq!(scsi::sense_answer(&sense), (scsi::UNIT_ATTENTION, 0x28, 0));
     }
 
-    /// **A block IRP's command fits its unit or is refused**: aligned to its blocks, within it, and
-    /// not empty; a flush whatever its range; nothing on a unit not published.
     #[test]
     fn an_irp_fits_its_unit_or_is_refused() {
         let unit = Lun { blocks: 1024, block_len: 512, record: None };
@@ -1901,8 +1834,6 @@ mod tests {
         assert_eq!(irp_command(IrpOp::Flush as u32, 0, 0, Lun::default()), Err(KError::InvalidArgument));
     }
 
-    /// **The sixteen-byte commands, as SBC-3 lays them out** (Phase 6 Part G), and `READ CAPACITY(16)`'s
-    /// answer read from bytes laid out by hand: a 3 TiB unit of 512-byte blocks.
     #[test]
     fn the_sixteen_byte_commands_are_as_scsi_gives_them() {
         assert_eq!(scsi::read_capacity16(), [0x9E, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0]);
@@ -1923,9 +1854,7 @@ mod tests {
         assert_eq!(scsi::capacity_answer(&ten), None, "what sends a unit to READ CAPACITY(16)");
     }
 
-    /// **A unit takes the sixteen-byte commands from 2³² blocks plus one**: at exactly 2³² every block's
-    /// address fits in 32 bits, and its last block is still a `READ(10)`; one block more and every
-    /// command is a `READ(16)` — the last block's address, past 32 bits, among them.
+    /// At exactly 2³² blocks the last block still fits in 32 bits, so it is a `READ(10)`.
     #[test]
     fn a_unit_past_two_to_the_thirty_two_blocks_is_read_with_the_sixteen_byte_commands() {
         let r = IrpOp::Read as u32;
@@ -1940,7 +1869,6 @@ mod tests {
         assert_eq!(rw_cdb(3 << 31, true, 5, 8).as_slice(), &scsi::rw16(true, 5, 8));
     }
 
-    /// A TD's packets still to come, clamped to 31.
     #[test]
     fn a_td_size_counts_the_packets_left() {
         assert_eq!(packets(0, 512), 0);
@@ -1949,7 +1877,6 @@ mod tests {
         assert_eq!(packets(1 << 20, 512), 31);
     }
 
-    /// **A USB disk is named as a SATA one**: its model, padding trimmed, and its serial.
     #[test]
     fn a_usb_disk_is_named_by_its_model_and_serial() {
         let inq = scsi::Inquiry { direct_access: true, vendor: *b"QEMU    ", product: *b"QEMU HARDDISK   " };
@@ -1960,10 +1887,8 @@ mod tests {
         assert_eq!(&out[..n], b"QEMU QEMU HARDDISK");
     }
 
-    // --- The fast path, driven ----------------------------------------------------------------
-
     /// Heap memory standing in for a device's rings, wrapper page, binding buffer and the doorbell
-    /// array: its "physical" addresses are its virtual ones, which only appear inside TRBs.
+    /// array: its "physical" addresses are its virtual ones.
     struct Fake {
         rings: [crate::libkern::KVec<u64>; 2],
         wrap: crate::libkern::KVec<u64>,
@@ -2031,7 +1956,6 @@ mod tests {
             }
         }
 
-        /// The device answers its last command: a status wrapper for `tag` with `status`.
         fn answer(&mut self, tag: u32, status_byte: u8) {
             let b = status(b"USBS", tag, 0, status_byte);
             let w = self.wrap.as_mut_ptr() as *mut u8;
@@ -2041,7 +1965,6 @@ mod tests {
             }
         }
 
-        /// TRB `i` of ring `r` (0 IN, 1 OUT).
         fn trb(&self, r: usize, i: usize) -> Trb {
             RawSlots(self.rings[r].as_ptr() as u64).read(i)
         }
@@ -2056,7 +1979,6 @@ mod tests {
         Irp::new_block(op, core::ptr::null(), offset, length, buffer, core::ptr::null_mut(), 0)
     }
 
-    /// The status wrapper's TRB a command waits on, once asked for.
     fn csw_trb(d: &Disks, i: usize) -> u64 {
         match d.devs[i].lock().as_ref().unwrap().inflight.unwrap().stage {
             Stage::Status { csw_trb } => csw_trb,
@@ -2065,9 +1987,7 @@ mod tests {
     }
 
     /// **A read's status is asked for when its data stage ends, and it completes at its status
-    /// wrapper**: the command wrapper on OUT, a TRB per fragment on IN, the last interrupting, both
-    /// doorbells rung; then, at the data stage's event — short, here — the status wrapper on IN; and
-    /// the next IRP, queued meanwhile, starts when the first completes.
+    /// wrapper**; the IRP queued meanwhile starts when the first completes.
     #[test]
     fn a_reads_status_is_asked_for_when_its_data_ends_and_the_next_starts_at_its_status() {
         init_global_heap();
@@ -2115,9 +2035,8 @@ mod tests {
         assert_eq!(disks.on_transfer(8, 3, code::SUCCESS, at, 1), None, "another slot's event is not this driver's");
     }
 
-    /// **Each command is counted on its own disk, with its time on the device** (Phase 6 Part H.2):
-    /// from its issue to its status wrapper — a queued write's from when it starts, not from its
-    /// submit — and a command the hub thread recovers as an error, with none of the recovery's time.
+    /// A queued write is timed from when it starts, not from its submit; a recovered error counts
+    /// with none of the recovery's time.
     #[test]
     fn each_command_is_counted_on_its_disk_with_its_time_on_the_device() {
         static FIRST: crate::io::stats::IoStats = crate::io::stats::IoStats::new();
@@ -2146,7 +2065,6 @@ mod tests {
         let r = FIRST.record_for(0, 0);
         assert_eq!((r.writes, r.written_bytes, r.busy_ns), (1, 512, 300 + 600));
 
-        // A flush that fails is the hub thread's to end; ended with an error, it is one.
         let mut flush = irp(IrpOp::Flush, 0, 0, &[]);
         disks.submit(&mut flush, ctx, 2000);
         disks.on_transfer(9, 4, code::SUCCESS, 0, 2100);
@@ -2158,7 +2076,6 @@ mod tests {
         let r = FIRST.record_for(0, 0);
         assert_eq!((r.flushes, r.errors, r.busy_ns), (0, 1, 900), "an error, and no recovery time");
 
-        // Another device's disk counts on its own.
         let (j, e2) = disks.take(fake.dev(3)).unwrap();
         disks.devs[j].lock().as_ref().unwrap().counted[0].attach_static(&OTHER);
         let mut other = irp(IrpOp::Flush, 0, 0, &[]);
@@ -2170,14 +2087,9 @@ mod tests {
         assert_eq!(FIRST.record_for(0, 0).flushes, 0);
     }
 
-    /// **A rescan is held for the hub thread, which takes the device only once its queue has drained**
-    /// (Phase 6 Part G; PR #369 review): the `Rescan` IRP wakes the thread rather than going on the
-    /// rings, and a second waits its turn refused. **While it waits the device runs as ever** — the
-    /// command in flight ending starts the one queued behind it — so what the disk's windows forwarded
-    /// before they were retired reaches the disk at the old table's offsets, never after the new table
-    /// is published. Once nothing is in flight or queued the rescan takes the device, a submit then
-    /// queues, and the rescan's end starts it. A unit not published is refused, and a departure hands
-    /// the waiting rescan back.
+    /// **A rescan is held for the hub thread**: it wakes the thread rather than going on the rings,
+    /// and **while it waits the device runs as ever**, so what the disk's windows forwarded before
+    /// they were retired reaches the disk at the old table's offsets, never after the new table.
     #[test]
     fn a_rescan_takes_the_device_only_once_its_queue_has_drained() {
         init_global_heap();
@@ -2199,7 +2111,6 @@ mod tests {
             Action::Complete { irp: &mut again, status: KError::WouldBlock as i32, transferred: 0 }
         );
         assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "a command in flight, and one queued");
-        // The read ends, and **the write queued before the rescan starts**, under it.
         disks.on_transfer(5, 3, code::SUCCESS, 0x10_000, 1);
         fake.answer(1, 0);
         let at = csw_trb(&disks, i);
@@ -2227,7 +2138,6 @@ mod tests {
         }
         assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "a command queued, nothing in flight");
         assert!(disks.devs[i].lock().as_mut().unwrap().queue.pop().is_some());
-        // Nothing left: the rescan takes the device, and a submit then queues for its end.
         let unit = Lun { blocks: 2048, block_len: 512, record: Some(7) };
         assert_eq!(disks.rescan_unit(i), Some(unit), "the unit the hub thread retires the windows of");
         assert_eq!(disks.begin_rescan(i), BeginRescan::Ready { irp: &mut rescan, lun: 0, unit });
@@ -2238,23 +2148,18 @@ mod tests {
         assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "queued while the rescan runs");
         assert_eq!(disks.end_rescan(i, 4), Action::None);
         assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_some(), "and started at its end");
-        // A unit nothing was published for.
         let mut stray = irp(IrpOp::Rescan, 0, 0, &[]);
         assert_eq!(
             disks.submit(&mut stray, context(i, 1, epoch), 0),
             Action::Complete { irp: &mut stray, status: KError::Unsupported as i32, transferred: 0 }
         );
-        // A departure hands a waiting rescan back, to be completed `PeerClosed`.
         let mut waiting = irp(IrpOp::Rescan, 0, 0, &[]);
         disks.submit(&mut waiting, ctx, 0);
         let (_, held) = disks.depart(i);
         assert_eq!(held[2], Some(&mut waiting as *mut Irp));
     }
 
-    /// **A rescan waiting on a device a failed recovery stranded ends the device** (PR #369 review):
-    /// nothing will make that device quiet — its stranded command keeps it recovering — so
-    /// `begin_rescan` says `Ended`, for the hub thread to end it as on an unplug, whose departure
-    /// completes the rescan, rather than waiting out its deadline with every submit queued behind it.
+    /// A rescan waiting on a device a failed recovery stranded ends the device.
     #[test]
     fn a_rescan_on_a_stranded_device_ends_it() {
         init_global_heap();
@@ -2277,8 +2182,6 @@ mod tests {
         assert_eq!(held[2], Some(&mut rescan as *mut Irp), "and the rescan");
     }
 
-    /// **A command that goes wrong is the hub thread's**: a failed status or a stall leaves it in
-    /// flight with its fault, wakes the thread, and a submit meanwhile waits.
     #[test]
     fn a_command_that_goes_wrong_is_left_for_the_hub_thread() {
         init_global_heap();
@@ -2301,7 +2204,6 @@ mod tests {
         assert_eq!(disks.submit(&mut b, ctx, 0), Action::None);
         assert_eq!(disks.devs[i].lock().as_ref().unwrap().queue.len, 1, "waits behind the recovery");
 
-        // While the hub thread recovers — the fault taken, nothing in flight — a submit still waits.
         {
             let mut d = disks.devs[i].lock();
             let dev = d.as_mut().unwrap();
@@ -2321,11 +2223,6 @@ mod tests {
         assert_eq!(disks.devs[j].lock().as_ref().unwrap().fault, Some(Fault::Transfer { dci: 4, code: code::STALL }));
     }
 
-    /// **The hub thread sleeps no longer than a deadline's length while a disk is bound** (PR #363
-    /// review: a stick that stalled on an idle machine was timed out only once another device
-    /// arrived). Idle, it sleeps a deadline's length; with a command in flight, until that command's
-    /// deadline if sooner. So a command started while it sleeps is seen by its own deadline, though
-    /// nothing wakes the thread for it. With no disk bound, nothing bounds the sleep.
     #[test]
     fn the_hub_thread_sleeps_no_longer_than_a_deadline_while_a_disk_is_bound() {
         init_global_heap();
@@ -2337,7 +2234,6 @@ mod tests {
         let until = disks.bound(slept);
         assert_eq!(until, Some(slept + DEADLINE_NS), "idle: a deadline's length");
 
-        // A command started while it sleeps, with nothing to wake it: seen by its own deadline.
         let mut a = irp(IrpOp::Flush, 0, 0, &[]);
         assert_eq!(disks.submit(&mut a, context(i, 0, ei), 150), Action::None, "no wake");
         let woke = until.unwrap();
@@ -2346,16 +2242,12 @@ mod tests {
         assert_eq!(disks.bound(woke), Some(150 + DEADLINE_NS), "so sleeps until its deadline");
         assert_eq!(disks.due(150 + DEADLINE_NS + 1)[i], Some(5), "and marks it then");
 
-        // Another disk's command, sooner than a deadline's length: the earliest bounds the sleep.
         let (j, ej) = disks.take(other.dev(6)).unwrap();
         let mut b = irp(IrpOp::Flush, 0, 0, &[]);
         disks.submit(&mut b, context(j, 0, ej), 120);
         assert_eq!(disks.bound(130), Some(120 + DEADLINE_NS), "the earliest command's deadline");
     }
 
-    /// **A deadline marked as its command ends is not charged to the next** (PR #363 review): the
-    /// status arriving before the hub thread takes the command completes it, clears the mark, and
-    /// leaves the next command running, with nothing for the hub thread to recover.
     #[test]
     fn a_deadline_marked_as_its_command_ends_is_not_charged_to_the_next() {
         init_global_heap();
@@ -2379,8 +2271,6 @@ mod tests {
         assert_eq!(disks.due(DEADLINE_NS + 3)[i], None, "inside its own deadline");
     }
 
-    /// **A command left for the hub thread ignores its later events**: after its command wrapper
-    /// stalls, the data stage's event asks for no status on rings the hub thread is about to reset.
     #[test]
     fn a_command_left_for_the_hub_thread_ignores_its_later_events() {
         init_global_heap();
@@ -2396,9 +2286,6 @@ mod tests {
         assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Transfer { dci: 4, code: code::STALL }));
     }
 
-    /// **A recovery ends in the scope that lets submits start again** (PR #363 review): a submit during
-    /// it waits, and a retry is the command in flight with the waiting one behind it — neither
-    /// replaced, and a departure hands back both.
     #[test]
     fn a_retry_is_in_flight_with_the_submit_that_waited_behind_it() {
         init_global_heap();
@@ -2425,9 +2312,6 @@ mod tests {
         assert_eq!(held, [Some(&mut a as *mut Irp), None, None], "and the retry");
     }
 
-    /// **A command a failed recovery stranded is the departure's** (PR #363 review): reset recovery
-    /// may never have stopped its endpoints, so it is not completed until the slot is disabled, and
-    /// nothing starts meanwhile.
     #[test]
     fn a_stranded_command_waits_for_the_departure() {
         init_global_heap();
@@ -2450,9 +2334,6 @@ mod tests {
         assert_eq!(held, want, "the stranded command, for after the slot is disabled");
     }
 
-    /// **A hub command whose wait ran out is taken back only if the DPC has not reached it** (PR #363
-    /// review): once the DPC has, its completion of the operation is on its way and is waited for,
-    /// as `hub::wait` waits.
     #[test]
     fn a_hub_command_the_dpc_reached_is_waited_for() {
         init_global_heap();
@@ -2472,8 +2353,6 @@ mod tests {
         assert_eq!(result, Some(HubResult::Status(Status::Passed { residue: 0 })));
     }
 
-    /// **A command's TRBs never straddle the Link** (PR #363 review): a three-fragment read that would
-    /// not fit before it goes after it, the slots before it filled with No Ops.
     #[test]
     fn a_transfer_that_would_straddle_the_link_goes_after_it() {
         init_global_heap();
@@ -2493,9 +2372,9 @@ mod tests {
         assert_ne!(fake.trb(0, 0).cycle(), fake.trb(0, before).cycle(), "on the ring's next pass");
     }
 
-    /// **The status is its wrapper's own event** (PR #363 review): a read whose first TRB comes up
-    /// short raises an event there and another at its last TRB, which interrupts. The second arrives
-    /// on IN once the status is asked for, and is not the status, though the device has answered.
+    /// **The status is its wrapper's own event**: a read whose first TRB comes up short raises an
+    /// event there and another at its last TRB, which arrives on IN once the status is asked for
+    /// and is not the status.
     #[test]
     fn a_short_reads_last_data_event_is_not_its_status() {
         init_global_heap();
@@ -2515,9 +2394,6 @@ mod tests {
         assert_eq!(done, Some(Action::Complete { irp: &mut r, status: 0, transferred: 8192 }), "the status wrapper's");
     }
 
-    /// **A slot taken, departed and taken again serves its old node nothing of the new device**
-    /// (PR #361's lesson): the departure hands back the queue and the command in flight, a submit
-    /// through the old context is refused `PeerClosed`, and the new device's context is served.
     #[test]
     fn a_departed_devices_node_is_refused_and_its_slot_reused_under_a_new_epoch() {
         init_global_heap();

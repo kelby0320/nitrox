@@ -1,42 +1,41 @@
 //! A RAM-backed block device: the I/O spine's bring-up disk, and a Limine module's.
 //!
-//! The ramdisk was the first [`BlockBackend`] producer: it proved
-//! initiate → DPC → `PendingOperation` → `sys_wait` end-to-end without real hardware (Part 2),
-//! and AHCI (Part 3) plugged a real driver into the same seam. That bring-up disk still exists —
-//! a 64 KiB pattern-filled [`KVec`] the I/O self-test reads back.
-//!
-//! **Since Phase 5 Part C it is also how the live image gets a root.** Every Limine module after
-//! the first (the initramfs) is published as a block device over the module's own memory, before
-//! `drivers::probe`'s GPT pass, so its partitions are named by the code AHCI disks already use and
-//! `init.toml` can mount one. Nothing here knows about the live image; a module is a disk.
+//! The ramdisk was the first [`BlockBackend`] producer, proving
+//! initiate → DPC → `PendingOperation` → `sys_wait` without hardware; the
+//! bring-up disk is a 64 KiB pattern-filled [`KVec`] the I/O self-test reads
+//! back. It is also how the live image gets a root: every Limine module after
+//! the initramfs is published as a block device over the module's own memory,
+//! before `drivers::probe`'s GPT pass, so `init.toml` can mount its partitions
+//! like an AHCI disk's.
 //!
 //! ## Completing where a device completes
 //!
-//! `submit` does the whole transfer — a `memcpy` against the backing — and queues the IRP's
-//! completion DPC. DPCs drain only at an interrupt tail, and a RAM disk raises no interrupt, so a
-//! completion left there waits for the next 10 ms timer tick: every block I/O serialised on the
-//! tick, the fs-server "I/O hang" of 2026-07-23 again (PR #297 review, measured at 0.10 s against
-//! 4.85 s from mount to greeter). **So the disk raises its own completion interrupt** —
-//! [`install_software`](crate::arch::irq_install::ArchIrqInstall::install_software) once, then
-//! [`raise_on_self`](crate::arch::irq::ArchIrq::raise_on_self) after each enqueue — and the
-//! completion runs where AHCI's does: `device_irq_dispatch` drains the DPC in a fresh interrupt
-//! lock scope and reschedules an idle CPU. Completing inline in `submit` would run the completion
-//! (which takes `SCHED`) in whatever lock context the submitter happens to hold.
+//! `submit` does the whole transfer (a `memcpy`) and queues the IRP's completion
+//! DPC. DPCs drain only at an interrupt tail and a RAM disk raises no interrupt,
+//! so a completion would wait for the next 10 ms timer tick and every block I/O
+//! would serialise on it (the fs-server "I/O hang" again: 0.10 s against 4.85 s
+//! from mount to greeter). **So the disk raises its own completion interrupt**
+//! ([`install_software`](crate::arch::irq_install::ArchIrqInstall::install_software)
+//! once, [`raise_on_self`](crate::arch::irq::ArchIrq::raise_on_self) after each
+//! enqueue), and the completion runs where AHCI's does: `device_irq_dispatch`
+//! drains the DPC in a fresh interrupt lock scope and reschedules an idle CPU.
+//! Completing inline in `submit` would run the completion (which takes `SCHED`)
+//! in whatever lock context the submitter holds.
 //!
 //! ## Concurrency
 //!
-//! A root disk takes submits from the fs-server and from page-cache fills on any CPU. Each
-//! transfer runs under the disk's lock, so a read racing a write of the same block sees one or the
-//! other — never a torn block, which a real disk never returns either.
+//! A root disk takes submits from the fs-server and page-cache fills on any CPU.
+//! Each transfer runs under the disk's lock, so a read racing a write of the same
+//! block sees one or the other, never a torn block.
 //!
-//! **Do not `kprintln!` inside `transfer`** while debugging: the lock is `Leaf` and the serial
-//! port ranks above it, so the rank tracker panics with `acquiring Serial (rank 70) while holding
-//! Leaf (rank 90)` — correctly — before the line prints (PR #298 review). Print before or after the
-//! lock is taken.
+//! **Do not `kprintln!` inside `transfer`**: the lock is `Leaf` and the serial
+//! port ranks above it, so the rank tracker panics with `acquiring Serial (rank
+//! 70) while holding Leaf (rank 90)` before the line prints.
 //!
-//! **The completion vector is one of eight device vectors** (`DEVICE_IRQ_COUNT`), shared by every
-//! ramdisk. A release boot uses five (AHCI, COM1, the i8042's two, this); `register_device_handler`
-//! asserts on exhaustion, which a machine with more controllers could reach.
+//! **The completion vector is one of eight device vectors** (`DEVICE_IRQ_COUNT`),
+//! shared by every ramdisk. A release boot uses five (AHCI, COM1, the i8042's
+//! two, this); `register_device_handler` asserts on exhaustion, which a machine
+//! with more controllers could reach.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -75,7 +74,7 @@ pub struct RamDisk {
     block_size: u32,
     /// Held across each transfer. See the module docs § Concurrency.
     busy: IrqSpinLock<()>,
-    /// The disk node's counters, attached once it is registered (Phase 6 Part H.2).
+    /// The disk node's counters, attached once it is registered.
     counted: Counted,
 }
 
@@ -93,9 +92,9 @@ impl RamDisk {
         (i as u8).wrapping_mul(31).wrapping_add(7)
     }
 
-    /// Allocate a ramdisk with its backing filled with [`pattern_byte`]. Built
-    /// by appending into a [`KVec`] (never a large stack temporary, which would
-    /// overflow the kernel stack).
+    /// Allocate a ramdisk with its backing filled with [`pattern_byte`], built by
+    /// appending into a [`KVec`] (a large stack temporary would overflow the
+    /// kernel stack).
     ///
     /// [`pattern_byte`]: RamDisk::pattern_byte
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
@@ -148,9 +147,10 @@ impl RamDisk {
         self.block_size
     }
 
-    /// **Serve one IRP, counted** (Phase 6 Part H.2): the transfer, timed by `clock` in nanoseconds —
-    /// a RAM disk's command is a copy, so its time on the device is the copy's — and recorded into
-    /// the node's counters. Returns `(status, transferred)`, as [`transfer`](Self::transfer).
+    /// **Serve one IRP, counted**: the transfer, timed by `clock` in nanoseconds
+    /// (a RAM disk's command is a copy, so its time on the device is the copy's)
+    /// and recorded into the node's counters. Returns `(status, transferred)`, as
+    /// [`transfer`](Self::transfer).
     fn serve(&self, irp: &Irp, clock: impl Fn() -> u64) -> (i32, u64) {
         let started = clock();
         let (status, transferred) = self.transfer(irp);
@@ -174,7 +174,7 @@ impl RamDisk {
             op if op == IrpOp::Write as u32 => false,
             // A RAM disk's memory is its medium: nothing is cached, so a flush is done.
             op if op == IrpOp::Flush as u32 => return (IrpStatus::Success as i32, 0),
-            // A RAM disk's table is the bootloader's module, read once (Phase 6 Part G).
+            // A RAM disk's table is the bootloader's module, read once.
             op if op == IrpOp::Rescan as u32 => return (KError::Unsupported as i32, 0),
             _ => return (KError::InvalidArgument as i32, 0),
         };
@@ -239,12 +239,10 @@ fn ramdisk_submit(irp: *mut Irp, ctx: *mut ()) {
     crate::dpc::enqueue(unsafe { &(*irp).dpc });
     let vector = COMPLETION_VECTOR.load(Ordering::Acquire);
     if vector != 0 {
-        // SAFETY: ring 0, and this CPU's local controller is up — for two different reasons
-        // depending on the caller. The first submits come from `drivers::probe`'s GPT pass on the
-        // BSP, before the scheduler, and that is sound **only because `kernel_main` runs
-        // `Irq::init` before `drivers::probe`**: move the probe earlier (to reach a disk sooner on
-        // new hardware, say) and this MSR write `#GP`s with x2APIC off. Every later submit runs on
-        // a CPU executing threads, which `ap_cpu_init` or `Irq::init` has already brought up.
+        // SAFETY: ring 0, and this CPU's local controller is up. The first submits come from
+        // `drivers::probe`'s GPT pass on the BSP, sound **only because `kernel_main` runs
+        // `Irq::init` before `drivers::probe`** (earlier, this MSR write `#GP`s with x2APIC
+        // off); every later submit runs on a CPU `ap_cpu_init` or `Irq::init` has brought up.
         // `vector` was installed with `ramdisk_completion_isr` by `try_new_device`.
         unsafe { crate::arch::Irq::raise_on_self(vector) };
     }
@@ -256,11 +254,9 @@ fn ramdisk_poll(_ctx: *mut ()) {
     crate::dpc::run_pending();
 }
 
-/// Build a block [`DeviceNode`] for `rd`. `rd` must outlive every IRP submitted
-/// to it (it does — a ramdisk is leaked/'static).
-///
-/// The first call installs the completion vector. Boot-time only — two first calls racing would
-/// each take a vector.
+/// Build a block [`DeviceNode`] for `rd`, which must outlive every IRP submitted
+/// to it (a ramdisk is leaked `'static`). The first call installs the completion
+/// vector; boot-time only, since two first calls racing would each take a vector.
 pub fn try_new_device(rd: &'static RamDisk, name: &[u8]) -> Result<KBox<DeviceNode>, AllocError> {
     if COMPLETION_VECTOR.load(Ordering::Acquire) == 0 {
         // SAFETY: ring 0 at boot, after the interrupt table; the handler is a `'static` fn.
@@ -271,10 +267,9 @@ pub fn try_new_device(rd: &'static RamDisk, name: &[u8]) -> Result<KBox<DeviceNo
         submit: ramdisk_submit,
         poll: ramdisk_poll,
         ctx: rd as *const RamDisk as *mut (),
-        // **No hardware limit to inherit.** The ramdisk copies fragment by fragment
-        // in a loop with nothing fixed-size to overrun, so it declines to impose a
-        // ceiling rather than borrowing a plausible-looking one from a real
-        // controller — a limit nothing enforces would be a number to maintain.
+        // **No hardware limit to inherit**: the ramdisk copies fragment by fragment
+        // with nothing fixed-size to overrun, and a limit nothing enforces would be
+        // a number to maintain.
         max_frags: u32::MAX,
     };
     let geometry = BlockGeometry {
@@ -291,12 +286,10 @@ pub fn try_new_device(rd: &'static RamDisk, name: &[u8]) -> Result<KBox<DeviceNo
         func: 0,
         _pad: [0; 3],
     };
-    // **A RAM disk says so** (Phase 5 Part H.1): it is memory, it disappears at power-off, and an
-    // installer that wrote to one would install onto something that will not be there.
+    // **A RAM disk says so**: it is memory and disappears at power-off, so an
+    // installer writing to one would install onto something that will not be there.
     DeviceNode::try_new_block(descriptor, geometry, BlockKind::RamDisk, name, backend)
 }
-
-// --- Limine modules as disks --------------------------------------------------------------
 
 /// Most modules after the initramfs the kernel will publish. The live image uses one.
 pub const MAX_MODULE_DISKS: usize = 4;
@@ -404,7 +397,6 @@ mod tests {
         let (status, n) = rd.transfer(&irp(IrpOp::Write, 512, &[frag(&mut out)]));
         assert_eq!((status, n), (IrpStatus::Success as i32, 512));
 
-        // Split across two fragments on the way back, as a page-cache fill can be.
         let (mut a, mut b) = ([0u8; 100], [0u8; 412]);
         let (status, n) = rd.transfer(&irp(IrpOp::Read, 512, &[frag(&mut a), frag(&mut b)]));
         assert_eq!((status, n), (IrpStatus::Success as i32, 512));
@@ -414,9 +406,9 @@ mod tests {
         assert!(module[..512].iter().all(|&x| x == 0), "and nowhere else");
     }
 
-    /// **A RAM disk counts what it serves** (Phase 6 Part H.2): each transfer by its op, the bytes
-    /// it moved, and the clock's time across the copy; a transfer past the end as an error; and a
-    /// rescan, which is no command, not at all.
+    /// A RAM disk counts what it serves: each transfer by its op, the bytes it
+    /// moved and the clock's time across the copy; a transfer past the end as an
+    /// error; a rescan, which is no command, not at all.
     #[test]
     fn a_ram_disk_counts_what_it_serves() {
         static IO: crate::io::stats::IoStats = crate::io::stats::IoStats::new();
@@ -440,9 +432,9 @@ mod tests {
         assert_eq!((r.errors, r.busy_ns), (1, 15), "three commands of 5 ticks each; the rescan none");
     }
 
-    /// **A flush completes at once and writes nothing** — a RAM disk's memory is its medium
-    /// — even handed a buffer, which a write would have copied in. And an op it does not
-    /// know is refused rather than taken for a write, which is what "not a read" used to mean.
+    /// A flush completes at once and writes nothing (memory is the medium), even
+    /// handed a buffer a write would have copied in; an unknown op is refused
+    /// rather than taken for a write.
     #[test]
     fn a_flush_is_done_at_once_and_an_unknown_op_is_not_a_write() {
         init_global_heap();
@@ -485,7 +477,6 @@ mod tests {
 
     #[test]
     fn modules_are_recorded_until_the_table_is_full_with_their_paths_cut_to_fit() {
-        // The table is a process-global static; this is the only test that touches it.
         let long = [b'p'; 100];
         for i in 0..MAX_MODULE_DISKS {
             // SAFETY: never published — `publish_modules` is not called here.

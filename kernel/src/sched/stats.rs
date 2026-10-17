@@ -3,21 +3,18 @@ use core::fmt::Write;
 use crate::arch::MAX_CPUS;
 use crate::libkern::{AllocError, KString};
 
-/// One CPU's monotonic scheduler event counters. Owned by
-/// [`SchedState`](super::SchedState) under the rank-1 `SCHED` lock;
-/// snapshot-copied by [`stats_snapshot`](super::stats_snapshot).
+/// One CPU's monotonic scheduler event counters. Owned by [`SchedState`](super::SchedState)
+/// under the rank-1 `SCHED` lock; copied out by [`stats_snapshot`](super::stats_snapshot).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Counters {
-    /// Context switches performed by this CPU — every [`switch_into`]
-    /// (super), across all four parking dispositions (ready / blocked /
-    /// suspended / reap). Nonzero on ≥2 CPUs is the Phase 3 milestone's
-    /// "two CPUs visibly active" witness.
+    /// Context switches performed by this CPU — every [`switch_into`] (super), across all
+    /// four parking dispositions (ready / blocked / suspended / reap).
     pub switches: u64,
     /// Threads this CPU stole from a peer's ready queue (`steal_one`).
     pub steals: u64,
-    /// Runnable threads placed **onto** this CPU's ready queue by spawn
-    /// placement or wake re-homing (`place_thread`) — placements *received*,
-    /// counted against the target CPU, possibly performed by another.
+    /// Runnable threads placed **onto** this CPU's ready queue by spawn placement or wake
+    /// re-homing (`place_thread`) — counted against the target CPU, which may not be the
+    /// one that performed the placement.
     pub placed: u64,
     /// Reschedule IPIs handled by this CPU (`on_reschedule_ipi`).
     pub resched_ipis: u64,
@@ -30,8 +27,7 @@ impl Counters {
     pub const ZERO: Counters = Counters { switches: 0, steals: 0, placed: 0, resched_ipis: 0, ticks: 0 };
 }
 
-/// One CPU's row in a [`Snapshot`]: its [`Counters`] plus instantaneous
-/// state read at capture time.
+/// One CPU's row in a [`Snapshot`]: its [`Counters`] plus state read at capture time.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CpuSnapshot {
     /// Whether this CPU's scheduler state is initialized (`cpu_online`).
@@ -49,15 +45,14 @@ impl CpuSnapshot {
     pub const OFFLINE: CpuSnapshot = CpuSnapshot { online: false, idle: false, ready: 0, counters: Counters::ZERO };
 }
 
-/// A consistent point-in-time copy of every CPU's scheduler statistics,
-/// captured under one `SCHED` hold by [`stats_snapshot`](super::stats_snapshot).
+/// A consistent point-in-time copy of every CPU's scheduler statistics, captured under one
+/// `SCHED` hold by [`stats_snapshot`](super::stats_snapshot).
 #[derive(Clone, Copy, Debug)]
 pub struct Snapshot {
     /// Per-CPU rows, indexed by dense CPU index.
     pub cpus: [CpuSnapshot; MAX_CPUS],
-    /// Handle tables the reaper has closed since boot. Machine-wide, not per-CPU —
-    /// there is one reaper. Carried *in the snapshot* rather than read inside
-    /// [`format`], which is documented pure and host-tested as such.
+    /// Handle tables the reaper has closed since boot. Machine-wide (there is one reaper),
+    /// and carried *in the snapshot* because [`format`] is pure and host-tested.
     pub reaper_closed: u64,
     /// Handles closed by processes in their own exit syscall (exit-context teardown).
     pub exit_closed: u64,
@@ -70,9 +65,8 @@ impl Snapshot {
     }
 }
 
-/// Render `snap` as the `/proc/sched/stats` text: a `cpus_online=N` header
-/// line, then one `name=value` row per **online** CPU (offline CPUs are
-/// omitted — their counters are zero by construction). Booleans render as
+/// Render `snap` as the `/proc/sched/stats` text: a `cpus_online=N` header line, then one
+/// `name=value` row per **online** CPU (offline CPUs are omitted). Booleans render as
 /// `0`/`1`. Pure (host-tested); the only failure is heap exhaustion.
 ///
 /// ```text
@@ -84,8 +78,7 @@ impl Snapshot {
 /// ```
 pub fn format(snap: &Snapshot) -> Result<KString, AllocError> {
     let mut out = KString::new();
-    // `fmt::Error` from a `KString` sink only ever means allocation failure
-    // (see `KString`'s `Write` impl).
+    // `fmt::Error` from a `KString` sink only ever means allocation failure.
     (|| -> Result<(), core::fmt::Error> {
         writeln!(out, "cpus_online={}", snap.cpus_online())?;
         writeln!(out, "reaper_closed={}", snap.reaper_closed)?;

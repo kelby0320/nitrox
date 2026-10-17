@@ -271,7 +271,7 @@ pub struct ModuleResponse {
 /// A loaded module descriptor (`struct limine_file`). `address` is an HHDM-virtual pointer,
 /// directly dereferenceable.
 ///
-/// **The media fields after `path` say where the file was loaded from** (Phase 6 Part D): for a
+/// **The media fields after `path` say where the file was loaded from**: for a
 /// GPT volume, `gpt_disk_uuid` is its disk's GUID **in the byte order a GPT header stores it** —
 /// measured on a live-stick boot and a disk boot against `sgdisk -p` — and the boot disk is the one
 /// whose header holds the same bytes. Zero for a volume that is not GPT.
@@ -517,7 +517,7 @@ pub struct DateAtBootResponse {
 // --- Executable command line request -------------------------------------
 //
 // The `cmdline:` of the boot entry Limine booted, which is how a boot-menu entry selects a
-// kernel mode (Phase 5 Part D's `hwreport`).
+// kernel mode (`hwreport`).
 
 const EXECUTABLE_CMDLINE_ID_2: u64 = 0x4b161536e598651e;
 const EXECUTABLE_CMDLINE_ID_3: u64 = 0xb390ad4a2f1f303a;

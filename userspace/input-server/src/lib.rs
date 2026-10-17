@@ -1,13 +1,9 @@
 //! `input-server` — the merge, and nothing that needs a kernel.
 //!
-//! The half of the input server with all the behaviour and none of the syscalls: taking the
-//! devices' event streams and producing one ordered stream, tracking what a consumer missed, and
-//! keeping the set of devices the device manager hands over ([`devices`]). `main.rs` is the part
-//! that cannot be host-tested — subscribing, reading the device nodes, serving `/dev/input/new`,
-//! and sending on channels.
-//!
-//! See `docs/spec/rsproto-input-ops.md` for the contract this implements and
-//! `docs/architecture/input-subsystem.md` for why the server exists at all.
+//! The behaviour without the syscalls: merging the devices' event streams into one ordered
+//! stream, tracking what a consumer missed, and the set of devices the manager hands over
+//! ([`devices`]). Contract: `docs/spec/rsproto-input-ops.md`; why the server exists:
+//! `docs/architecture/input-subsystem.md`.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -16,37 +12,26 @@ use libkern::abi::{
     EV_REL, EV_SYN, InputEvent, LIGHT_CAPS, LIGHT_NUM, LIGHT_SCROLL, REL_WHEEL, REL_X, REL_Y, SYN_DROPPED, SYN_REPORT,
 };
 
-/// Events buffered from one device per wakeup.
-///
-/// A PS/2 mouse reports at 100 Hz and a key repeat at ~30 Hz, so a wakeup that has fallen a
-/// whole scheduler quantum behind still has far fewer than this waiting.
+/// Events buffered from one device per wakeup; a 100 Hz mouse is far below it.
 pub const PER_DEVICE: usize = 32;
 
-/// Devices read at once: a keyboard and a mouse today, with room for Phase 6's.
+/// Devices read at once.
 pub const MAX_DEVICES: usize = 8;
 
 /// Events one wakeup can harvest — every device's read — and so what [`merge`] must hold.
 pub const MERGE_MAX: usize = PER_DEVICE * MAX_DEVICES;
 
-/// Events in one `Events` message's batch.
-///
-/// **Two devices' worth**, so a keyboard and a mouse — today's machine — always fit one message.
-/// A wakeup that harvested more is sent as consecutive batches, each ending on a group boundary
-/// ([`batches`]): one message cannot hold every device's worth, since eight devices' reads are
-/// more records than a message's payload.
+/// Events in one `Events` message: two devices' worth, so a keyboard and a mouse fit one; a
+/// larger harvest goes as consecutive batches ([`batches`]), as eight devices exceed a payload.
 pub const BATCH_MAX: usize = PER_DEVICE * 2 + 1;
 
 // A group is at most one device's read, so every group fits in a batch.
 const _: () = assert!(PER_DEVICE < BATCH_MAX);
 
-/// The relative axes a deferred batch carries forward, in the order they are re-emitted.
+/// The relative axes a deferred batch carries forward, in re-emit order.
 ///
-/// **Relative axes are the state, so they cannot be resynchronised.** A key or a button has a
-/// current value the consumer can be told to re-derive, which is what `SYN_DROPPED` asks for; a
-/// `REL_X` of −7 *is* the movement, and a consumer that misses it has no way to learn what it
-/// missed. Summing the deltas of a batch that could not be sent and re-emitting them later is
-/// therefore lossless, not approximate: addition is what the consumer was going to do with them
-/// anyway (2026-08-26, the cursor that could not reach the left edge).
+/// A `REL_X` of −7 *is* the movement, so unlike a key it cannot be re-derived after
+/// `SYN_DROPPED`; summing unsent deltas and re-emitting them is lossless.
 pub const DEFERRED_AXES: [u16; 3] = [REL_X, REL_Y, REL_WHEEL];
 
 /// Records one recovered group needs: one per axis that moved, plus its `SYN_REPORT`.
@@ -63,30 +48,18 @@ fn axis_of(e: &InputEvent) -> Option<usize> {
     DEFERRED_AXES.iter().position(|&code| code == e.code)
 }
 
-/// Merge the devices' event streams into one run, ordered by `time_ns`. `sources` is each
-/// device's harvest, by slot; an empty one takes no part, and past [`MAX_DEVICES`] are ignored.
+/// Merge the devices' event streams into one run, ordered by `time_ns`; returns the count
+/// written to `out`. `sources` is each device's harvest, by slot; an empty one takes no part.
 ///
-/// **Groups move whole.** The merge advances a `SYN`-terminated group at a time rather than
-/// a record at a time, comparing the *first* record of each source's next group. Sorting
-/// records individually would be wrong twice over: records within a group share a timestamp,
-/// so their relative order would depend on the sort's stability, and a group split across
-/// the output is exactly what `rsproto-input-ops.md` promises never happens.
-///
-/// **Ordering is batch-scoped**, which is the guarantee the spec states and the strongest
-/// one available: a global order would need every keystroke held until the slowest device
-/// had spoken. Two events that happen close together are both buffered by the time the
-/// server wakes, and those sort correctly — which is the shift-click case merging exists
-/// for.
-///
-/// Returns the number of events written to `out`.
+/// Groups move whole, compared by their first record: sorting records could split a group,
+/// which the spec promises never happens. Ordering is batch-scoped, since a global order would
+/// hold every keystroke until the slowest device had spoken.
 pub fn merge(sources: &[&[InputEvent]], out: &mut [InputEvent]) -> usize {
     let mut cursor = [0usize; MAX_DEVICES];
     let mut n = 0usize;
     loop {
-        // The source whose next group starts earliest. **Ties go to the lower slot**: arbitrary,
-        // but *deterministic*, which the display arm's determinism rule asks of anything a test
-        // hashes or matches on. Coldplug arrives in registry order, so the keyboard holds the
-        // lower slot and wins a tie, as it did when this merged exactly two.
+        // The source whose next group starts earliest. Ties go to the lower slot: arbitrary but
+        // deterministic, and coldplug order gives the keyboard the lower slot.
         let mut best: Option<(usize, (usize, usize))> = None;
         for (s, src) in sources.iter().enumerate().take(MAX_DEVICES) {
             let Some(span) = group_at(src, cursor[s]) else { continue };
@@ -100,10 +73,8 @@ pub fn merge(sources: &[&[InputEvent]], out: &mut [InputEvent]) -> usize {
         }
         let Some((s, span)) = best else { break };
         let src = sources[s];
-        // **All of the group or none of it.** Copying record-by-record and stopping when
-        // `out` fills delivers a partial group — the one thing the protocol promises never
-        // to do — and the caller cannot tell, because a short return looks like "that is all
-        // there was". Caught by `a_full_output_truncates_at_a_group_boundary_not_inside_one`.
+        // All of the group or none of it: a partial group is undetectable to the caller, since
+        // a short return looks like "that is all there was".
         let len = span.1 - span.0;
         if n + len > out.len() {
             return n;
@@ -115,18 +86,13 @@ pub fn merge(sources: &[&[InputEvent]], out: &mut [InputEvent]) -> usize {
     n
 }
 
-/// Split `events` into consecutive runs of at most `max` records, **each ending on a group
-/// boundary** — how a wakeup that harvested more than one message holds is sent, in order, as
-/// several. Together the runs are `events`, whole.
-///
-/// A group longer than `max` goes alone rather than split. A device's read cannot produce one — a
-/// group is at most one read, and a read at most [`PER_DEVICE`] — so this is the answer to a bug
-/// upstream, and it keeps the promise that matters to a consumer: a group is never split.
+/// Split `events` into consecutive runs of at most `max` records, each ending on a group
+/// boundary. A group longer than `max` goes alone rather than split.
 pub fn batches(events: &[InputEvent], max: usize) -> Batches<'_> {
     Batches { events, at: 0, max }
 }
 
-/// The runs [`batches`] yields, as ranges of its `events`.
+/// The runs [`batches`] yields.
 pub struct Batches<'a> {
     events: &'a [InputEvent],
     at: usize,
@@ -155,9 +121,8 @@ impl Iterator for Batches<'_> {
 
 /// The half-open range of the group starting at `from`, or `None` at the end.
 ///
-/// A group runs to and including its `SYN_REPORT`. A trailing run with no terminator — a
-/// batch that ended mid-group, which the driver's ring is built never to produce — is
-/// returned whole rather than dropped, so a bug upstream loses ordering rather than events.
+/// A group runs through its `SYN_REPORT`; an unterminated trailing run is returned whole, so
+/// an upstream bug loses ordering, not events.
 fn group_at(events: &[InputEvent], from: usize) -> Option<(usize, usize)> {
     if from >= events.len() {
         return None;
@@ -175,31 +140,15 @@ fn group_at(events: &[InputEvent], from: usize) -> Option<(usize, usize)> {
 
 /// What a consumer is owed: motion it has not been given, and a loss to announce first.
 ///
-/// A batch that cannot be delivered is **deferred, not discarded**, and the two halves of it
-/// are owed differently:
+/// A batch that cannot be delivered is deferred, and its halves are owed differently:
 ///
-/// - **Relative motion is carried forward.** Its deltas are summed into this consumer and
-///   re-emitted as one group in front of the next batch that does go out. Nothing is lost, so
-///   nothing about it is announced.
-/// - **Everything else is announced.** Keys, buttons and an upstream `SYN_DROPPED`'s own count
-///   go into `lost`, and the next batch is preceded by a `SYN_DROPPED` carrying it — the same
-///   contract as the kernel's per-device ring, **including the unit** (whole records), which is
-///   why a consumer never has to know which producer told it.
-///
-/// **The split is the correction of 2026-08-26.** This discarded whole batches, on the reasoning
-/// that a consumer which falls behind "degrades to one that resynchronises". That is true of
-/// state a consumer can re-derive and false of a relative axis, where the delta *is* the state:
-/// the compositor's cursor ended up permanently offset from the host pointer, by exactly the
-/// motion thrown away while it was busy repainting, and no `SYN_DROPPED` could tell it how far.
+/// - **Relative motion is carried forward**, re-emitted as one group in front of the next
+///   batch that goes out. Nothing is lost, so nothing is announced.
+/// - **Everything else is announced**: the next batch is preceded by a `SYN_DROPPED` counting
+///   whole records, like the kernel's per-device ring.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Consumer {
-    /// **Records** discarded since the last successful send — not batches.
-    ///
-    /// The unit matters and was wrong here first. `SYN_DROPPED.value` means "how many whole
-    /// records were discarded" wherever it comes from: the kernel's per-device ring counts
-    /// records, the spec says records, and a consumer cannot tell which producer sent a given
-    /// marker — so counting batches here would have made the same field mean two things and
-    /// left a stalled consumer under-reporting by the batch size (PR #179 review, blocking 1).
+    /// Records (not batches) discarded since the last successful send.
     lost: u32,
     /// Relative movement summed from batches that could not be sent, by [`DEFERRED_AXES`] index.
     pending: [i32; DEFERRED_AXES.len()],
@@ -213,16 +162,9 @@ impl Consumer {
 
     /// Take back records that could not be delivered.
     ///
-    /// Relative motion is summed into `pending` and owed as movement; everything else is
-    /// counted into `lost` and owed as an announcement. A `SYN_REPORT` is neither — it delimits
-    /// a group, and the records it delimited are accounted for individually — and an upstream
-    /// `SYN_DROPPED` contributes **its own count** rather than one record, so a gap does not
-    /// shrink each time it is re-deferred.
-    ///
-    /// **Pass what was framed, not the batch it came from.** [`frame`](Self::frame) clears both
-    /// debts as it writes them, so a send that then fails must hand the framed records back
-    /// here; deferring the original batch instead would forget the marker and the motion that
-    /// were prepended to it.
+    /// An upstream `SYN_DROPPED` contributes its own count, so a gap does not shrink each time
+    /// it is re-deferred. Pass what was framed, not its batch: [`frame`](Self::frame) clears
+    /// both debts as it writes them.
     pub fn defer(&mut self, records: &[InputEvent]) {
         let mut announce = 0u32;
         for e in records {
@@ -243,24 +185,17 @@ impl Consumer {
         self.lost > 0
     }
 
-    /// Whether anything is owed — an announcement, deferred motion, or both.
-    ///
-    /// The server uses this to send to a consumer that has no new events: deferred motion is
-    /// movement the user already made, and holding it until the next thing happens would leave
-    /// the cursor short of where the mouse actually is until it is moved again.
+    /// Whether anything is owed. Deferred motion is sent without new events, or the cursor
+    /// would stay short until the mouse moved again.
     pub fn owes_send(&self) -> bool {
         self.lost > 0 || self.pending.iter().any(|&v| v != 0)
     }
 
     /// Build the records to send for `batch`, prepending `SYN_DROPPED` if one is owed.
     ///
-    /// Returns the count written, or `None` if `out` cannot hold the whole thing — the
-    /// caller must not send a partial batch, because a truncated group is exactly what the
-    /// protocol promises never to deliver.
-    ///
-    /// **Clears both debts as it writes them**, so a caller whose send then fails must hand the
-    /// framed records back to [`defer`](Self::defer) — not the batch they came from, which no
-    /// longer carries the marker and the recovered motion prepended to it here.
+    /// Returns the count written, or `None` if `out` cannot hold all of it (never a partial
+    /// group). Clears both debts as it writes them: a failed send hands the framed records to
+    /// [`defer`](Self::defer).
     pub fn frame(&mut self, batch: &[InputEvent], now_ns: u64, out: &mut [InputEvent]) -> Option<usize> {
         let moved = self.pending.iter().filter(|&&v| v != 0).count();
         let extra = usize::from(self.lost > 0) + if moved > 0 { moved + 1 } else { 0 };
@@ -273,21 +208,9 @@ impl Consumer {
             n = 1;
             self.lost = 0;
         }
-        // **The recovered motion goes after the marker and before the batch**, which is where it
-        // happened. `libinput` resets what it has accumulated when it sees `SYN_DROPPED`, so
-        // motion placed in front of the marker would be reset away; motion placed after the
-        // batch would arrive out of order with movement that came later.
-        //
-        // Stamped with `now_ns` rather than with the time it was first seen: the batch it
-        // belonged to is gone, and a timestamp older than records already delivered would break
-        // the ordering the merge exists to provide. What it carries is the movement, not when it
-        // happened.
-        //
-        // **The caller passes the *oldest* timestamp in the batch being framed**, not the
-        // newest, so that these prepended records do not carry a time later than the records
-        // they precede. `rsproto-input-ops.md` § Ordering invites a consumer to sort by
-        // `time_ns`, and a sort that moved the recovered motion after the batch would undo the
-        // placement this comment is about (PR #246 review, optional 8).
+        // Recovered motion goes after the marker (`libinput` resets at `SYN_DROPPED`) and before
+        // the batch (after it, it would be out of order). Stamped `now_ns`, the batch's oldest
+        // time, so a consumer sorting by `time_ns` keeps that placement.
         if moved > 0 {
             for (i, &code) in DEFERRED_AXES.iter().enumerate() {
                 if self.pending[i] != 0 {
@@ -304,9 +227,8 @@ impl Consumer {
     }
 }
 
-/// **The lights an `Input::Lights` asks for** (Phase 6 Part B.5): its one byte, or `None` for a
-/// body of another length or with a bit that is not a light. A refused request writes nothing, so
-/// a malformed byte never reaches a keyboard's node, which would refuse it anyway.
+/// The lights an `Input::Lights` asks for: its one byte, or `None` for another length or a bit
+/// that is not a light.
 pub fn lights_request(body: &[u8]) -> Option<u8> {
     match *body {
         [b] if b as u16 & !(LIGHT_NUM | LIGHT_CAPS | LIGHT_SCROLL) == 0 => Some(b),
@@ -315,13 +237,10 @@ pub fn lights_request(body: &[u8]) -> Option<u8> {
 }
 
 pub mod leaving {
-    //! **A device leaving** (Phase 6 Part C). Two things say a device has gone, and they arrive in
-    //! no fixed order: its node answers a read `PeerClosed`, once the releases its driver pushed have
-    //! been read, and the manager sends `Departed`. **A slot is retired only when both have come**:
-    //! retired on `Departed` alone, it would close the node with releases still in its ring — a
-    //! mouse unplugged mid-drag, more than a harvest behind, would lose its button's release (PR
-    //! #360 review). And a node that has answered `PeerClosed` is not read again, so it cannot be
-    //! read in a spin.
+    //! A device leaving: its node answers a read `PeerClosed` once its releases have been read,
+    //! and the manager sends `Departed`, in no fixed order. A slot is retired only when both
+    //! have come, or a mouse unplugged mid-drag would lose its release still in the ring. A
+    //! node that answered `PeerClosed` is not read again, so it cannot spin.
 
     /// Where a device is in leaving.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -361,7 +280,7 @@ pub mod leaving {
             }
         }
 
-        /// Its node answered `PeerClosed`: whether that is news — the one line to log — and what to do.
+        /// Its node answered `PeerClosed`: whether that is news (the one line to log), and what to do.
         pub fn peer_closed(&mut self) -> (bool, Act) {
             match *self {
                 Leaving::Present => {
@@ -379,14 +298,9 @@ pub mod leaving {
 }
 
 pub mod devices {
-    //! **The devices this server reads are the device manager's to hand over** (administration
-    //! Part B.3). The server subscribes to `/svc/devices/input`; the manager replays every
-    //! keyboard and mouse as an `Arrived` carrying its node, then says `Settled`
-    //! (`docs/spec/rsproto-devices-ops.md`). This is what the server decides with: what each
-    //! message on that channel is, and which slot each device holds.
-    //!
-    //! **A slot is where a device lives in `main.rs`** — its node, its read buffer and its
-    //! outstanding read — and its place in the merge, where the lower slot wins a tie.
+    //! The devices the manager hands over (`docs/spec/rsproto-devices-ops.md`): what each
+    //! message is, and which slot each device holds. A slot is where a device lives in `main.rs`
+    //! and its place in the merge, where the lower slot wins a tie.
 
     use super::MAX_DEVICES;
     use libkern::device::{DeviceKind, DeviceRecord};
@@ -404,8 +318,7 @@ pub mod devices {
             /// Keyboard or mouse.
             kind: DeviceKind,
         },
-        /// A device that is not input. The manager never sends one on this class; if it did,
-        /// reading a disk as input events would be worse than refusing it, so its node is closed.
+        /// A device that is not input; its node is closed rather than read as events.
         NotInput {
             /// Its registry id.
             id: u32,
@@ -416,13 +329,11 @@ pub mod devices {
         Settled(u32),
         /// The device with this registry id has gone.
         Departed(u32),
-        /// Anything else: an op this category does not have, a body of the wrong size, or an
-        /// arrival without exactly one node.
+        /// An unknown op, a body of the wrong size, or an arrival without exactly one node.
         Malformed,
     }
 
-    /// Classify a message on the subscription: its `op`, its `body`, and how many handles came
-    /// with it.
+    /// Classify a message by its `op`, `body` and handle count.
     pub fn notice(op: u16, body: &[u8], handles: usize) -> Notice {
         match op {
             OP_DEVICES_ARRIVED if handles == 1 => match parse_arrived(body).and_then(DeviceRecord::read) {
@@ -443,8 +354,7 @@ pub mod devices {
     pub enum Arrival {
         /// It holds this slot now.
         Slot(usize),
-        /// It already held one. A second node for the same device would be a second reader,
-        /// which the kernel refuses, so the new node is closed.
+        /// It already held one; a second node would be a second reader, so it is closed.
         Already,
         /// Every slot is taken.
         Full,
@@ -536,8 +446,6 @@ mod tests {
 
     #[test]
     fn the_older_group_comes_first_whichever_device_it_is_on() {
-        // The case merging exists for: a click and a keystroke that happened together must
-        // arrive in the order they happened, not the order the reads completed.
         let kbd = [key(30, 100), syn(100)];
         let mouse = [InputEvent { kind: EV_KEY, code: BTN_LEFT, value: 1, time_ns: 95 }, syn(95)];
         let mut out = [InputEvent::default(); BATCH_MAX];
@@ -549,15 +457,8 @@ mod tests {
 
     #[test]
     fn a_group_is_never_split_by_the_merge() {
-        // The property the whole group-at-a-time walk exists for. A record-wise sort would
-        // interleave these, because the mouse's motion sits between the keyboard's key and
-        // its terminator in time.
-        // Chosen so group-wise and record-wise walks disagree. The keyboard group starts
-        // first (100 < 105) but *ends* last (110 > 106), so the mouse's records fall inside
-        // the keyboard's span: sorting record-by-record would emit key@100, rel@105,
-        // syn@106, syn@110 — both groups shredded. An earlier version of this test used data
-        // where the two walks happened to agree, and a break that made `group_at` return
-        // single records left it green.
+        // The keyboard group starts first (100 < 105) but ends last (110 > 106), so a
+        // record-wise sort would interleave the two groups.
         let kbd = [key(30, 100), syn(110)];
         let mouse = [rel(5, 105), syn(106)];
         let mut out = [InputEvent::default(); BATCH_MAX];
@@ -582,8 +483,6 @@ mod tests {
 
     #[test]
     fn a_tie_is_broken_deterministically() {
-        // Not arbitrary in the sense of "unspecified": a test that matches on output needs
-        // the same answer every run.
         let kbd = [key(30, 50), syn(50)];
         let mouse = [rel(1, 50), syn(50)];
         let mut a = [InputEvent::default(); BATCH_MAX];
@@ -604,15 +503,11 @@ mod tests {
 
     #[test]
     fn a_trailing_group_with_no_terminator_is_still_delivered() {
-        // The driver's ring never produces this. If it ever did, losing ordering beats
-        // losing the events.
         let kbd = [key(30, 10)];
         let mut out = [InputEvent::default(); BATCH_MAX];
         assert_eq!(merge(&[&kbd], &mut out), 1);
     }
 
-    /// **More than two devices merge the same way**: by group start, whole groups, and a tie to
-    /// the lower slot — here the third device's group ties the second's and follows it.
     #[test]
     fn three_devices_merge_by_group_start_with_ties_to_the_lower_slot() {
         let a = [key(30, 30), syn(30)];
@@ -624,8 +519,6 @@ mod tests {
         assert_eq!(order, vec![(10, 1), (20, 2), (20, 9), (30, KEY_PRESS)]);
     }
 
-    /// **A slot with nothing harvested takes no part**, wherever it sits — a departed device's
-    /// slot between two live ones is an empty source.
     #[test]
     fn an_empty_source_between_two_takes_no_part() {
         let kbd = [key(30, 10), syn(10)];
@@ -636,10 +529,8 @@ mod tests {
         assert_eq!((out[0].kind, out[2].kind), (EV_REL, EV_KEY));
     }
 
-    /// **Every device's worth fits one merge**: `MERGE_MAX` is what `main.rs` sizes its buffer
-    /// with, and a merge that ran out of room would drop the groups it did not reach. Held to the
-    /// harvest, not to `MERGE_MAX` — a buffer sized too small would fill exactly and agree with
-    /// itself.
+    // Held to the harvest, not to `MERGE_MAX`: a too-small buffer would fill exactly and agree
+    // with itself.
     #[test]
     fn a_full_harvest_from_every_device_merges_whole() {
         let one: Vec<InputEvent> = (0..PER_DEVICE as u64 / 2).flat_map(|t| [rel(1, t), syn(t)]).collect();
@@ -650,8 +541,6 @@ mod tests {
         assert_eq!(merge(&sources, &mut out), harvest);
     }
 
-    /// **A harvest is sent as batches that end on group boundaries**, in order, each at most a
-    /// message's worth, and together the whole harvest.
     #[test]
     fn a_long_harvest_is_split_only_between_groups() {
         // Groups of three records: a batch of eight holds two, never two and two-thirds.
@@ -667,8 +556,6 @@ mod tests {
         assert_eq!(batches(&[], 8).count(), 0, "nothing to send, no batch");
     }
 
-    /// **A group longer than a batch goes alone rather than split** — which a device's read cannot
-    /// produce, and which would otherwise be the one way to break the promise a consumer relies on.
     #[test]
     fn a_group_longer_than_a_batch_goes_whole_and_alone() {
         let events = [rel(1, 1), rel(2, 1), rel(3, 1), syn(1), key(30, 2), syn(2)];
@@ -694,8 +581,6 @@ mod tests {
             out[..n].to_vec()
         }
 
-        /// **Each message is what it says, and nothing else is**: an arrival needs its node, a
-        /// `Settled` or `Departed` carries none, and a body of another size is refused.
         #[test]
         fn a_notice_is_classified_by_op_body_and_handles() {
             let kbd = arrived(6, DeviceKind::Keyboard);
@@ -714,8 +599,6 @@ mod tests {
             assert_eq!(notice(0x0F7F, &w[..n], 0), Notice::Malformed, "an op the category lacks");
         }
 
-        /// **Arrivals in any order**: whichever comes first takes the lowest slot, and the set is
-        /// the same.
         #[test]
         fn arrivals_in_any_order_each_take_the_lowest_free_slot() {
             let mut t = Table::new();
@@ -726,8 +609,6 @@ mod tests {
             assert_eq!(t.len(), 2);
         }
 
-        /// **A keyboard alone is a table of one** — where the server used to exit for want of a
-        /// mouse.
         #[test]
         fn a_keyboard_alone_is_served() {
             let mut t = Table::new();
@@ -736,8 +617,6 @@ mod tests {
             assert!(Table::new().is_empty(), "and none is a table too");
         }
 
-        /// **A departure mid-stream frees its slot for the next arrival**, and names nothing it
-        /// does not hold.
         #[test]
         fn a_departure_frees_its_slot_and_only_its_own() {
             let mut t = Table::new();
@@ -751,7 +630,6 @@ mod tests {
             assert_eq!(t.arrive(11), Arrival::Slot(1), "the gap is reused");
         }
 
-        /// **Past the last slot a device is refused**, and the table is unchanged.
         #[test]
         fn a_device_past_the_last_slot_is_refused() {
             let mut t = Table::new();
@@ -777,9 +655,7 @@ mod tests {
     #[test]
     fn a_loss_is_announced_before_the_next_batch_and_only_once() {
         let mut c = Consumer::new();
-        // Two deferred batches of 20 and 6 unrecoverable records: the marker must say 26, not
-        // 2. The unit is the kernel ring's — whole records — because a consumer cannot tell
-        // which producer sent a `SYN_DROPPED` and must not have to.
+        // Batches of 20 and 6 records: the marker says 26 (records), not 2 (batches).
         let first: Vec<InputEvent> = (0..20).map(|i| key(30, i)).collect();
         let second: Vec<InputEvent> = (0..6).map(|i| key(31, i)).collect();
         c.defer(&first);
@@ -795,7 +671,6 @@ mod tests {
         assert_eq!(out[0].value, 26, "records lost, not batches");
         assert_eq!(&out[1..n], &batch);
 
-        // Cleared: the next batch is clean.
         let n2 = c.frame(&batch, 100, &mut out).expect("fits");
         assert_eq!(n2, 2, "no second announcement for the same gap");
         assert!(!c.owes_announcement());
@@ -803,8 +678,6 @@ mod tests {
 
     #[test]
     fn a_batch_that_does_not_fit_is_refused_rather_than_truncated() {
-        // Sending half a batch would deliver a partial group, which is the one thing the
-        // protocol promises never to do.
         let mut c = Consumer::new();
         c.defer(&[key(30, 1), key(31, 1)]);
         let batch = [key(30, 10), syn(10)];
@@ -819,10 +692,6 @@ mod tests {
 
     #[test]
     fn motion_that_could_not_be_sent_is_carried_forward_rather_than_announced() {
-        // The whole point. A dropped motion batch used to become a `SYN_DROPPED` and nothing
-        // else, and the consumer had no way to recover the pixels: the compositor's cursor
-        // stayed offset from the host pointer by exactly this much, for the life of the
-        // session.
         let mut c = Consumer::new();
         c.defer(&[rel_code(REL_X, -6, 10), rel_code(REL_Y, -3, 10), syn(10)]);
         assert!(c.owes_send(), "movement is owed");
@@ -854,8 +723,7 @@ mod tests {
 
     #[test]
     fn a_key_in_a_deferred_batch_is_announced_while_its_motion_survives() {
-        // The mixed case, and the reason the split is per record rather than per batch: the
-        // key press is genuinely gone and must be announced, and the motion beside it is not.
+        // The split is per record: the key is gone and announced, the motion beside it is not.
         let mut c = Consumer::new();
         c.defer(&[key(30, 10), rel_code(REL_X, -5, 10), syn(10)]);
         let mut out = [InputEvent::default(); FRAME_MAX];
@@ -869,9 +737,6 @@ mod tests {
 
     #[test]
     fn framed_records_handed_back_keep_both_debts() {
-        // `frame` clears as it writes, so a send that fails afterwards must return what was
-        // framed. Deferring the *batch* instead would drop the marker and the recovered motion
-        // that had just been prepended to it — the send path's one sharp edge.
         let mut c = Consumer::new();
         c.defer(&[key(30, 5), rel_code(REL_X, -7, 5), syn(5)]);
         let batch = [rel_code(REL_Y, -2, 10), syn(10)];
@@ -889,8 +754,6 @@ mod tests {
 
     #[test]
     fn an_upstream_gap_keeps_its_own_count_when_deferred() {
-        // A `SYN_DROPPED` from the kernel's ring counts what *it* lost. Counting it as one
-        // record would shrink the gap every time the batch carrying it was re-deferred.
         let mut c = Consumer::new();
         c.defer(&[InputEvent { kind: EV_SYN, code: SYN_DROPPED, value: 7, time_ns: 1 }]);
         let mut out = [InputEvent::default(); FRAME_MAX];
@@ -901,8 +764,6 @@ mod tests {
 
     #[test]
     fn a_consumer_owing_nothing_frames_an_empty_batch_as_nothing() {
-        // The server sends only when this is non-zero: an empty message would wake every
-        // consumer for no reason.
         let mut c = Consumer::new();
         let mut out = [InputEvent::default(); FRAME_MAX];
         assert_eq!(c.frame(&[], 99, &mut out), Some(0));
@@ -911,9 +772,7 @@ mod tests {
 
     #[test]
     fn the_frame_buffer_is_big_enough_for_the_worst_case() {
-        // `FRAME_MAX` is what `main.rs` sizes its buffer with, and a `frame` that does not fit
-        // is deferred again — so an undersized buffer is not a truncation but a consumer that
-        // never receives anything again.
+        // An undersized `FRAME_MAX` would defer forever, not truncate.
         let mut c = Consumer::new();
         c.defer(&[key(30, 1), rel_code(REL_X, 1, 1), rel_code(REL_Y, 1, 1), rel_code(REL_WHEEL, 1, 1), syn(1)]);
         let batch = [InputEvent::default(); BATCH_MAX];
@@ -921,10 +780,6 @@ mod tests {
         assert_eq!(c.frame(&batch, 99, &mut out), Some(FRAME_MAX));
     }
 
-    /// **A slot is retired when its node has answered `PeerClosed` and the manager has said
-    /// `Departed`, in either order** (Phase 6 Part C): `Departed` first keeps the node read until it
-    /// answers, so the releases in its ring are delivered; `PeerClosed` first stops it being read. And
-    /// `PeerClosed` is news once, the one line logged.
     #[test]
     fn a_slot_retires_when_its_node_and_the_manager_have_both_said_so() {
         use super::leaving::{Act, Leaving};
@@ -940,8 +795,6 @@ mod tests {
         assert_eq!(p.departed(), Act::Retire);
     }
 
-    /// **One byte of lights, and nothing else**: each light alone and together, then the
-    /// neighbours of a valid request — a fourth bit, no byte, two bytes.
     #[test]
     fn a_lights_request_is_one_byte_of_lights() {
         assert_eq!(lights_request(&[0]), Some(0));

@@ -1,21 +1,9 @@
 //! `nxterm` — the terminal, minus the syscalls.
 //!
-//! The split every subsystem in this tree uses: state, `view` and `update` are functions of
-//! values and host-test in milliseconds; the window, the buffers and the event pump are the
-//! binary's.
-//!
-//! ## Where the bytes come from
-//!
-//! **A tty, since Part C.** A key press is encoded by [`libterm::encode`] into an *outbox*; the
-//! binary drains it to the tty server's backend channel, and what the server sends back —
-//! echo, and the shell's output — arrives at [`App::feed`] and goes through [`libterm::parse`]
-//! into the grid.
-//!
-//! Nothing here translates. A loopback stood in until Part C and turned `\r` into `\r\n`,
-//! because `LF` is *index* and Enter alone would overwrite the line just typed. **That is
-//! `ONLCR`, and it is the line discipline's** — which is now genuinely on the other side of the
-//! channel, so the translation left with it. The one comment worth keeping from that period:
-//! it lived in a single obvious place precisely so it could be deleted rather than found.
+//! State, `view` and `update` are host-tested; the window, buffers and event pump are the binary's.
+//! A key press is encoded by [`libterm::encode`] into an outbox the binary drains to the tty
+//! server's backend, and the server's reply arrives at [`App::feed`]. Nothing here translates:
+//! `ONLCR` is the line discipline's.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -47,52 +35,25 @@ use libui::widget::{ScrollState, TAB_STRIP_H, TextFieldState, Theme as UiTheme, 
 pub const GRID_KIND: u32 = 0x4772_6964;
 
 /// Where the menu bar's words are keyed from: `MENU_BAR_KEY + i` for menu `i`.
-///
-/// [`libui::layout::locate`] turns each into the rectangle its popup hangs under. **Ten rather
-/// than one** so the range stays clear of [`GRID_KEY`], which shares this window.
 pub const MENU_BAR_KEY: u64 = 10;
 
 /// Where the open popup's rows are keyed from: `MENU_ROW_KEY + i` for item `i`.
-///
-/// **Keys are what make hover possible**: `Router::inside` reports the id of the keyed widget
-/// under the pointer, so an unkeyed item is one the router cannot name (M11 Part E batch 3).
-/// A different range from the bar's because a row and a word are different widgets, even though
-/// they live in different windows and could not collide.
 pub const MENU_ROW_KEY: u64 = 100;
 
 /// The menu the harness opens with F1, and the one whose rows `check-terminal` clicks.
-///
-/// Named rather than spelled `1` at the two sites that need it: the gate's expectations are
-/// written against *this* menu's first row, and a reordering that moved it would otherwise
-/// break the gate somewhere that never mentions menus.
 pub const HARNESS_MENU: usize = 1;
 
 /// The key on the grid, so the window can give it the keyboard on its first frame.
-///
-/// Focus has to start somewhere and the toolkit will not guess: `focus_next` would land on the
-/// menu button, being first in tree order, and a terminal whose first keystroke opens a menu is
-/// not a terminal. [`Tree::find_by_key`](libui::diff::Tree::find_by_key) turns this into the
-/// widget id the router takes.
 pub const GRID_KEY: u64 = 2;
 
 /// The key on the menu bar, and [`SCROLLBAR_KEY`] on the scrollbar.
-///
-/// **Keyed because [`GRID_KEY`] is.** The diff pairs a parent's children either all by key or
-/// all by position and refuses a mixture — deliberately, since a half-keyed list has two
-/// answers for which child is which. Naming one of the window's three regions therefore means
-/// naming all three, which they earn: they are fixed roles for the window's whole life.
 pub const BAR_KEY: u64 = 3;
 /// The key on the scrollbar — see [`BAR_KEY`].
 pub const SCROLLBAR_KEY: u64 = 4;
 /// The key on the title bar — see [`BAR_KEY`].
 pub const TITLE_KEY: u64 = 5;
 
-/// The resize grip's key.
-///
-/// Read by `the_grip_does_not_cover_any_part_of_the_scrollbar` and
-/// `pressing_the_corner_produces_the_resize_and_not_a_move`, which find it with
-/// [`locate`](libui::layout::locate) rather than by walking the tree — the same reason the
-/// scrollbar and the menu item carry keys.
+/// The resize grip's key, found by tests with [`locate`](libui::layout::locate).
 pub const GRIP_KEY: u64 = 6;
 
 /// Height of the menu bar, in pixels.
@@ -104,89 +65,47 @@ pub const TITLE: &str = "nxterm";
 /// Width of the scrollbar, in pixels.
 pub const SCROLL_W: u32 = 12;
 
-/// What the chrome costs the grid horizontally: the scrollbar, the window's frame, and the pane's
-/// margin either side of the cells.
-///
-/// **What fits the cells, and only that.** `resize` fits them with this and `grid_origin` places
-/// them inside the margin. They were three open-coded sums of `BAR_H + TITLE_BAR_H`, which agreed
-/// only because nothing had ever been added between the window's edge and its content; M11 Part E
-/// batch 2b added something (PR #265).
+/// What the chrome costs the grid horizontally: the scrollbar, the frame, and the pane's margins.
 const CHROME_W: u32 = SCROLL_W + libui::widget::WINDOW_FRAME_W + 2 * GRID_PAD_X;
 
-/// And vertically: the bars above the pane, the window's frame, and the pane's margin.
 const CHROME_H: u32 = BARS_H + 2 * GRID_PAD_Y;
 
-/// What stands above and below the **pane** — the title bar, the menu bar, the tab strip and the
-/// frame — which is the box the scrollbar sits beside.
-///
-/// **Not `CHROME_H`, since the pane gained a margin** (desktop refresh, Part B). The margin is
-/// *inside* the pane, around the cells; the scrollbar is beside the pane and runs its full height.
-/// `track_h` took `CHROME_H` and sized the bar 18 pixels short of its slot, leaving a patch of the
-/// window's face between the bar and the grip (PR #313 review, finding 2).
+/// What stands above and below the pane (title bar, menu bar, tab strip, frame), the box the
+/// scrollbar sits beside.
 const BARS_H: u32 = BAR_H + TAB_STRIP_H + TITLE_BAR_H + libui::widget::WINDOW_FRAME_H;
 
-/// The margin between the grid's cells and the edge of the pane they sit in, across — in the
-/// terminal's own ground.
-///
-/// **The design's `padding: 9px 11px`** (desktop refresh, Part B). The terminal had none of its
-/// own: the window's three-pixel frame was its only margin, and when Part B ran a window's content
-/// flush to its border, the first column of text touched the window's edge. So the pane keeps a
-/// margin, and the cells start inside it.
+/// The margin between the grid's cells and the edge of their pane, across.
 const GRID_PAD_X: u32 = 11;
 
-/// And down — the design's 9.
 const GRID_PAD_Y: u32 = 9;
 
 /// The element key on the tab strip.
 pub const TAB_STRIP_KEY: u64 = 7;
 
 /// The element key on the pane the grid sits in — its ground and its margin.
-///
-/// **Keyed because the dock's other children are**: the diff pairs a parent's children all by key
-/// or all by position, and the grid itself is now one level down, inside the pane.
 pub const GRID_PANE_KEY: u64 = 8;
 
-/// The key that selects everything, with **Ctrl and Shift** held: `a`.
-///
-/// **Shift for the reason Copy has it**: `Ctrl+A` belongs to whatever is running in the terminal —
-/// it is start-of-line in every shell built on readline — and a terminal that swallowed it would
-/// take a key away from the program the person is actually using.
+/// The key that selects everything, with Ctrl and Shift held: `a`. Shift keeps `Ctrl+A`
+/// (start-of-line) the program's.
 pub const SELECT_ALL_KEYCODE: u16 = 30;
 /// The key that opens Find, with **Ctrl and Shift**: `f`.
 pub const FIND_KEYCODE: u16 = 33;
-/// The key that clears the scrollback, with **Ctrl and Shift**: `k`.
-///
-/// **`k` rather than `l`.** `Ctrl+L` is clear-the-screen in every shell and belongs to the tenant;
-/// this drops the *history*, which is a different thing and the shell has no opinion about.
+/// The key that clears the scrollback, with Ctrl and Shift: `k`; `Ctrl+L` clears the screen and is
+/// the shell's.
 pub const CLEAR_KEYCODE: u16 = 37;
 
-/// The key that copies the selection, with **Ctrl and Shift** held: `c`.
-///
-/// **Shift is not decoration here** — M12 decision 6. `Ctrl+C` means *interrupt* in a terminal
-/// and always will; it is the one binding this system cannot take for copy, and the reason
-/// every real terminal emulator spells the pair with Shift. A literal for the reason
-/// `nxedit::SAVE_KEYCODE` is one, and pinned against `libinput`'s table by a test rather than
-/// by this comment.
+/// The key that copies the selection, with Ctrl and Shift held: `c`. Shift because `Ctrl+C` is the
+/// interrupt; pinned against `libinput`'s table by a test.
 pub const COPY_KEYCODE: u16 = 46;
-/// The key that opens a *window*: `n`, with Ctrl and Shift.
-///
-/// Shift for [`NEW_TAB_KEYCODE`]'s reason — a terminal must not take a bare `Ctrl` chord from the
-/// program it hosts — and because `Ctrl+N` is "new" in the singular, which here is a tab.
+/// The key that opens a window: `n`, with Ctrl and Shift.
 pub const NEW_WINDOW_KEYCODE: u16 = 49;
-/// The key that quits: `q`, with Ctrl and Shift. **Quit is every window of this terminal**, where
-/// Close Window is this one. Shift again, because `Ctrl+Q` is flow control to a terminal's
-/// program and always has been.
+/// The key that quits every window: `q`, with Ctrl and Shift (`Ctrl+Q` is flow control).
 pub const QUIT_KEYCODE: u16 = 16;
 
-/// The key that opens a tab: `t`, with **Ctrl and Shift**.
-///
-/// **Shift for [`COPY_KEYCODE`]'s reason**, not for symmetry: `Ctrl+T` belongs to whatever is
-/// running in the terminal — it is `transpose-chars` in a readline shell — and a terminal that
-/// took it would be taking a binding from the program it exists to host. Every terminal emulator
-/// spells new-tab with Shift for exactly this.
+/// The key that opens a tab: `t`, with Ctrl and Shift (`Ctrl+T` is `transpose-chars` in a readline
+/// shell).
 pub const NEW_TAB_KEYCODE: u16 = 20;
-/// The key that closes one: `w`, with Ctrl and Shift — see [`NEW_TAB_KEYCODE`]. Closing the last
-/// tab closes the window, which is what the chord means everywhere else it exists.
+/// The key that closes a tab: `w`, with Ctrl and Shift; closing the last closes the window.
 pub const CLOSE_TAB_KEYCODE: u16 = 17;
 
 /// The key that pastes: `v`, with Ctrl and Shift — see [`COPY_KEYCODE`].
@@ -198,20 +117,12 @@ pub enum Msg {
     /// A word on the menu bar was clicked: open that menu, or close it if it was the open one.
     MenuBar(usize),
     /// Open another window of this terminal — `Ctrl+Shift+N`, or File ▸ New Window.
-    ///
-    /// **Recorded, not done**: a window is a compositor object and this crate makes no syscalls,
-    /// the same seam the tabs use for their ttys.
     NewWindow,
     /// Close every window of this terminal — `Ctrl+Shift+Q`, or File ▸ Quit.
     Quit,
     /// Open a tab — `Ctrl+Shift+T`, or File ▸ New Tab.
-    ///
-    /// **The tty is not this crate's**: opening a tab adds a `Term` with an empty grid, and the
-    /// binary notices a tab with no backend and gives it one. That seam is what keeps `update` a
-    /// function of values.
     NewTab,
-    /// Close the tab with this key — `Ctrl+Shift+W`, or File ▸ Close Tab. Closing the last one
-    /// closes the window.
+    /// Close the tab with this key — `Ctrl+Shift+W`, or File ▸ Close Tab.
     CloseTab(u64),
     /// Make the tab with this key current — a click on the strip.
     SelectTab(u64),
@@ -222,143 +133,80 @@ pub enum Msg {
     /// Drop the scrollback, keeping the screen — `Ctrl+Shift+K`, or Edit ▸ Clear Scrollback.
     ClearScrollback,
     /// Copy the selection to the clipboard — `Ctrl+Shift+C`, or Edit ▸ Copy.
-    ///
-    /// **A message rather than a branch inside `key`**, since M14 Part A: the menu declares the
-    /// chord and [`libui::menu::accel_match`] routes it, so the label and the binding are one
-    /// statement. Before, they were two and could drift apart silently.
     Copy,
-    /// Fetch the newest clipboard entry and type it at the shell — `Ctrl+Shift+V`, or Edit ▸
-    /// Paste. See [`Copy`](Msg::Copy) for why it is a message.
+    /// Fetch the newest clipboard entry and type it at the shell — `Ctrl+Shift+V`, or Edit ▸ Paste.
     Paste,
     /// Erase the screen and home the cursor — `Ctrl-L`'s effect, from the menu.
     Clear,
     /// Erase the screen **and** the scrollback, and reset attributes.
     Reset,
-    /// A key reached the grid. Raw, because whether it types is the terminal's decision and
-    /// not the toolkit's: a release does not type, a **repeat does**, and `on_key` is a plain
-    /// function pointer with nothing to decide it with.
+    /// A key reached the grid, raw: whether it types is the terminal's decision (a release does
+    /// not, a repeat does).
     Key(KeyEvent),
-    /// Something happened to the scrollbar. Carries the raw event because most of them are not
-    /// a scroll: the router delivers motion whether or not a button is held, and a bar that
-    /// moved on hover would be unusable.
+    /// Something happened to the scrollbar, raw: most events are not a scroll, as motion arrives
+    /// with no button held.
     Scroll(PointerEvent),
     /// The wheel turned over the terminal — see [`App::wheel`].
     Wheel(PointerEvent),
     /// The title bar was pressed somewhere that moves the window.
-    ///
-    /// The answer is one request and no arithmetic: the compositor already holds the grab this
-    /// press opened and knows where the window is, and this terminal knows neither.
     DragWindow,
     /// The window should close — its own close button, or the shell asking.
-    ///
-    /// **One message for both**, because they mean the same thing to this terminal: somebody
-    /// wants it gone. Which of them it was is not something it has to act on differently.
     Close,
     /// The resize grip was pressed: the compositor is owed a `StartResize`.
-    ///
-    /// **Carries the edges** for the same reason [`RequestState`](Msg::RequestState) carries the
-    /// state: which corner a grip is, is the *grip's* business, and this crate would only be
-    /// deciding it a second time.
     ResizeWindow(u32),
     /// A title-bar button asking the manager for a window state.
-    ///
-    /// **Carries the state rather than being three messages**, because the terminal does nothing
-    /// with it but pass it on: which of them a button means is the *bar's* business, and this
-    /// crate would only be re-deciding it.
     RequestState(u32),
     /// The pointer did something over the grid — a selection gesture, or motion that is not one.
-    ///
-    /// Raw for [`Scroll`](Msg::Scroll)'s reason: most of what arrives here is not a selection,
-    /// because the router delivers motion whether or not a button is held, and a grid that
-    /// selected on hover would be unusable.
     GridPointer(PointerEvent),
 }
 
 /// What the terminal wants done with the clipboard, which only `main` can do.
-///
-/// **An outbox, like every other syscall this crate does not make.** `update` is a function of
-/// values; talking to `/dev/clipboard` is IPC, so the app records what it wants and the binary
-/// that owns the namespace performs it — the same shape `nxedit`'s `take_save` has.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ClipRequest {
     /// Push this text onto the ring.
     Copy(alloc::string::String),
     /// Fetch the newest entry and type it at the shell.
     ///
-    /// **There is no cycle here, and that is a decision rather than an omission.** M12 decision
-    /// 3 makes cycling a *continuation* of a paste that **replaces what was just inserted** — and
-    /// a terminal cannot: a paste is bytes already sent down the pty to a program that has read
-    /// them. Taking them back would mean sending backspaces to something that may not be a line
-    /// editor at all. So cycling lives in the editor, where the buffer is the client's own, and
-    /// `Ctrl+Shift+V` here always pastes the newest.
+    /// No cycle: a pasted byte has already gone to a program that may not be a line editor, so it
+    /// cannot be replaced; cycling lives in the editor.
     Paste,
 }
 
 /// What a [`resize`](App::resize) did, beyond changing the size.
-///
-/// **Only the eviction, because only the eviction is not derivable.** Everything else about the
-/// new shape is readable from the grid afterwards; how many lines the bounded scrollback dropped
-/// on the way is not, and it is the difference between "the rewrap lost lines" and "the history
-/// was already full" — see [`libterm::grid::Reflow::evicted_lines`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Resized {
     /// Logical lines the ring dropped during the rewrap.
     pub evicted: usize,
 }
 
-/// The most tabs one window can hold, **derived rather than chosen**.
+/// The most tabs one window can hold, derived from `MAX_WAIT_HANDLES`.
 ///
-/// `main` waits on the compositor's handle plus one per tab in a single `sys_wait`, which is the
-/// fan-out shape `MAX_WAIT_HANDLES`' own doc describes — and its instruction is that a server
-/// with this shape derives its cap from the constant rather than restating a number. Past the
-/// limit the kernel rejects the wait outright, so the loop would stop blocking and spin at full
-/// tilt (PR #282 review, worth fixing 4).
-///
-/// **Reachable, not theoretical**: `key` admits `KEY_REPEAT` and `accel_match` fires on any press,
-/// so *holding* `Ctrl+Shift+T` opens a tab per repeat.
+/// `main` waits on the compositor plus one handle per tab in one `sys_wait`, and the kernel rejects
+/// a larger count.
 pub const MAX_TABS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
 
-/// Where tab keys start. Far from the element keys so a tab and a widget cannot be confused in
-/// a debug line; `nxedit` numbers its buffers the same way and for the same reason.
+/// Where tab keys start, far from the element keys so a tab and a widget cannot be confused.
 pub const TAB_KEY_BASE: u64 = 1 << 62;
 
 /// One tab: a terminal, and everything that is *its* rather than the window's.
 ///
-/// **The line between this and [`App`] is the one `nxedit` and `nxfiles` drew** (M12 Part D), and
-/// getting it wrong is how a second tab inherits the first's scrollback. What belongs here is
-/// what a person would be surprised to see shared: the screen, the scrollback, where the view is
-/// scrolled to, what is selected, and the bytes typed but not yet sent. What stays on `App` is
-/// the window — its size, its chrome, its menus, whether it has the keyboard.
-///
-/// **The shell is deliberately absent.** A tab's other half is a tty and a process, and this
-/// crate makes no syscalls; `main` keeps a backend per tab and reconciles the two by [`key`].
+/// The shell is absent: `main` keeps a backend per tab and reconciles the two by [`key`].
 ///
 /// [`key`]: Self::key
 pub struct Term {
-    /// Identity across frames and across the tab strip.
-    ///
-    /// **Not the index**: closing a tab renumbers every one after it, and a message naming an
-    /// index outlives the frame that produced it — the same reasoning `nxedit::Buffer` records.
+    /// Identity across frames; not the index, as closing a tab renumbers the rest.
     key: u64,
     /// The screen, the cursor, and the scrollback.
     pub grid: Grid,
-    /// Bytes to grid operations. Held across writes because a sequence can be split across
-    /// them — which is the ordinary case once a real backend is delivering in chunks.
+    /// Bytes to grid operations; held across writes because a sequence can be split between them.
     parser: Parser,
-    /// Where the scrollback view is anchored, or `None` to follow the cursor.
     view_top: Option<u64>,
-    /// Whether the view moved this frame, so the whole grid is repainted rather than only the
-    /// rows the parser touched.
     view_moved: bool,
-    /// Bytes the user typed, waiting for the binary to send them to *this* tab's tty.
     outbox: Vec<u8>,
-    /// Whether the shell in this tab has announced a *new* working directory since the binary
-    /// last asked — see [`take_directory_change`](Self::take_directory_change).
     directory_changed: bool,
 }
 
 impl Term {
-    /// A tab with an empty grid of `cols` x `rows`.
     fn new(key: u64, cols: usize, rows: usize) -> Self {
         Self {
             key,
@@ -382,19 +230,12 @@ impl Term {
     }
 
     /// Where the shell in this tab last said it is, or `None` if it has never said.
-    ///
-    /// `OSC 7`, read by [`libterm::parse::Parser::directory`]. The title bar shows it; the
-    /// binary logs each change.
     pub fn directory(&self) -> Option<&str> {
         self.parser.directory()
     }
 
-    /// Whether the directory changed since this was last called, clearing it.
-    ///
-    /// The same shape as [`take_outbox`](Self::take_outbox) and `App::take_move_request`: the
-    /// binary asks once per turn of its loop and acts on a `true` exactly once. A shell
-    /// announces beside *every* prompt, so a console line per announcement would be a line per
-    /// command — this is what makes it a line per `cd`.
+    /// Whether the directory changed since this was last called, clearing it: a log line per `cd`,
+    /// not per prompt.
     pub fn take_directory_change(&mut self) -> bool {
         core::mem::take(&mut self.directory_changed)
     }
@@ -402,97 +243,35 @@ impl Term {
 
 /// Everything the terminal is.
 pub struct App {
-    /// Counts runs of presses, so a second click means a word and a third means a line.
-    ///
-    /// **Fed by the binary**, which is the only half that can read a clock — the same arrangement
-    /// `nxfiles` uses, and the reason `libui::click` counts a *run* rather than answering
-    /// "double?": this is the caller that wanted three.
+    /// Counts runs of presses, so a second click means a word and a third a line.
     clicks: libui::click::Clicks,
-    /// Where within the thumb the scrollbar was taken hold of — see [`ScrollGrab`].
-    ///
-    /// **Held here for `clicks`' reason**: it is interaction state that outlives one event, and
-    /// the widgets it belongs to are rebuilt every frame.
     scroll_grab: libui::widget::ScrollGrab,
-    /// What number the press being routed now is in its run.
     click_run: u32,
-    /// The find field, while one is open.
-    ///
-    /// **On the window rather than the tab**, because it replaces the tab strip while it is up —
-    /// there is nowhere to show a per-tab one, and a find that survived a tab switch would be
-    /// searching a grid the person is no longer looking at.
     find: Option<TextFieldState>,
-    /// The open tabs, in the order the strip draws them. **Never empty**: closing the last one
-    /// closes the window, so every method below can assume there is a current tab.
+    /// The open tabs, in strip order. Never empty: closing the last closes the window.
     tabs: Vec<Term>,
-    /// Which tab is current, by [`Term::key`].
     current: u64,
-    /// The next key to hand out. Monotonic, so a key is never reused and a stale message can
-    /// never name a tab that has taken its place.
+    /// The next key to hand out; monotonic, so a stale message never names a replacement tab.
     next_key: u64,
-    /// Another window has been asked for, and the binary has not made it yet.
     new_window: bool,
-    /// A quit has been asked for. **The binary owns what that means**, because it is the only
-    /// thing that knows how many windows there are.
     quit: bool,
     /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
-    ///
-    /// **The toolkit's, since M14 Part A.** This was a `bool` and a `Rect` here, a two-element
-    /// array and an enum in `nxfiles`, and the same open/close/anchor/dismiss logic in both.
     pub menus: MenuState,
-    /// Whether this window holds the keyboard, which the title bar shows.
-    ///
-    /// **The compositor's answer, not a guess.** `FocusEvent` says so on every change; a title
-    /// bar that inferred focus from the last click would disagree with the compositor the first
-    /// time focus moved by a chord.
-    ///
-    /// **Starts `true`, matching `libui::Router`'s own `window_focused`** — which starts that
-    /// way deliberately, because starting `false` makes a client's first paint dim. Two pieces
-    /// of the same state disagreeing for one frame is worse than either answer (PR #248 review,
-    /// finding 7).
+    /// Whether this window holds the keyboard, which the title bar shows; starts `true` like
+    /// `libui::Router`'s `window_focused`.
     pub focused: bool,
     /// Cell metrics, so `view` can size the grid node.
     pub metrics: Metrics,
     /// Colours for the cells.
     pub palette: Palette,
-    /// The terminal has been asked to close, and the binary owes an exit.
-    ///
-    /// **A flag rather than an `exit` here.** `update` is a function of values — it has no
-    /// syscalls and no way to tear down a session — and a terminal that vanished mid-frame would
-    /// leave its buffers mapped and its window undestroyed.
     closing: bool,
-    /// A title-bar button was pressed, and the binary owes the compositor a `RequestState`.
-    ///
-    /// **The last one wins, and there is only ever one.** The buttons are mutually exclusive
-    /// answers to "what should this window be", so a frame that saw two presses has had the
-    /// second one supersede the first.
     state_requested: Option<u32>,
-    /// The grip was pressed, and the binary owes the compositor a `StartResize` for these edges.
-    ///
-    /// **An outbox of one**, like [`move_requested`](Self::move_requested): `update` is a
-    /// function of values and "send a request on a channel" is a syscall.
     resize_requested: Option<u32>,
-    /// The title bar was dragged, and the binary owes the compositor a `StartMove`.
-    ///
-    /// **An outbox of one**, for the reason `outbox` is one: `update` is a function of values
-    /// and "send a request on a channel" is a syscall. The application says what happened; the
-    /// `main` that owns the session performs it.
     move_requested: bool,
-    /// This window last asked to be maximised, so its maximise button now asks for normal.
-    ///
-    /// See [`Msg::RequestState`]'s arm in [`update`](App::update) for why it is what was
-    /// *asked* rather than what the window is.
+    /// This window last asked to be maximised, so its button now asks for normal.
     maximized: bool,
-    /// The window's size in pixels — what the client commits, not what the grid needs.
-    ///
-    /// **These are not the same number once a manager is involved** (M9 Part D). A maximised
-    /// terminal is exactly the work area; the grid inside it is the largest whole number of
-    /// cells that fits, and the few pixels left over are background. Deriving the window from
-    /// the grid instead — which is what [`window_size`](App::window_size) did until Part D, and
-    /// still does at startup — would make a maximised window a cell smaller than it was asked
-    /// for in each axis, so "the window is the work area" would be false by a rounding error
-    /// and the shell's own geometry log would say so.
+    /// The window's size in pixels: what the client commits, not what the grid needs.
     window: Size,
-    /// What the terminal owes the clipboard — see [`ClipRequest`].
     clip_request: Option<ClipRequest>,
 }
 
@@ -505,8 +284,6 @@ impl App {
             scroll_grab: libui::widget::ScrollGrab::new(),
             click_run: 1,
             find: None,
-            // The same two sums `resize` subtracts, so the window this opens at is a window
-            // whose grid is exactly `cols` x `rows` — and stays so after the first `Configure`.
             window: Size::new(g.w + CHROME_W, g.h + CHROME_H),
             maximized: false,
             tabs: alloc::vec![Term::new(TAB_KEY_BASE, cols, rows)],
@@ -514,16 +291,11 @@ impl App {
             next_key: TAB_KEY_BASE + 1,
             new_window: false,
             quit: false,
-            // **Zero, because the length is set every frame.** `set_anchors` replaces this
-            // vector before anything reads it, and sizing it here from a constant is
-            // what drifted (M15 Part E).
+            // Zero: the length is set every frame by `set_anchors`.
             menus: MenuState::new(0),
             focused: true,
             metrics,
-            // `libterm`'s ANSI palette — the sixteen colours a program addresses with
-            // `ESC[31m` — and deliberately *not* the desktop theme. M11 Part B collapsed
-            // `libui`'s `Palette` into the shared `Theme`; this one stays where it is, because
-            // it is defined by what programs expect rather than by how this system looks.
+            // `libterm`'s ANSI palette, deliberately not the desktop theme: programs expect it.
             palette: Palette::default(),
             move_requested: false,
             resize_requested: None,
@@ -534,30 +306,15 @@ impl App {
     }
 
     /// The size of this terminal's window in pixels.
-    ///
-    /// At startup it is the grid plus its chrome — the title bar is part of this window like
-    /// every other pixel, because client-side decorations mean the chrome is in the buffer.
-    /// After a [`resize`](App::resize) it is whatever the manager asked for, and the grid is
-    /// what fits inside it.
     pub fn window_size(&self) -> Size {
         self.window
     }
 
-    /// Take the window to `size`, refitting the grid and rewrapping the history.
+    /// Take the window to `size`, refitting the grid and rewrapping the history (the answer to
+    /// `Configure`).
     ///
-    /// **This is the client's answer to `Configure`**, and it accepts rather than declines — the
-    /// thing M9 Part D exists to change. The window becomes exactly the size asked for; the grid
-    /// becomes the largest whole number of cells that fits inside the chrome, which is at least
-    /// one of each so that a hostile or degenerate size cannot produce a grid with no valid
-    /// cursor position.
-    ///
-    /// **The scrolled-back viewport is carried across the rewrap**, because a resize changes how
-    /// many lines the history has: a reader who has scrolled up sees the same text after the
-    /// resize as before it, not the same line number.
-    ///
-    /// `None` if nothing changed, so a caller can skip reallocating buffers for a `Configure`
-    /// that repeats the size a window already has — which is every `Configure` that follows a
-    /// move. `Some` carries what the resize cost the history: see [`Resized`].
+    /// At least one cell each way, so a degenerate size leaves a valid cursor. `None` if the size
+    /// is unchanged; `Some` carries the eviction.
     pub fn resize(&mut self, size: Size) -> Option<Resized> {
         if size == self.window {
             return None;
@@ -565,27 +322,19 @@ impl App {
         self.window = size;
         let cols = (size.w.saturating_sub(CHROME_W) / self.metrics.cell_w).max(1) as usize;
         let rows = (size.h.saturating_sub(CHROME_H) / self.metrics.cell_h).max(1) as usize;
-        // **Every tab, not the one on screen** (PR #282 review, blocking 2). A window has one
-        // shape and every tab is drawn into it, so a background tab left at the old `cols` is a
-        // grid the next `view()` sizes from stale numbers — a band of ground down the right and
-        // along the bottom, and a shell still wrapping at a column count nothing has any more.
-        // Shrinking is the worse direction, because the stale grid is then *larger* than the area
-        // it is laid into. It compounds too: `open_tab` takes its shape from the current tab.
+        // Every tab, not the one on screen: a background tab left at the old shape draws from stale
+        // numbers.
         let current = self.current;
         let mut evicted = 0;
         for t in &mut self.tabs {
             let reflow = t.grid.resize(cols, rows);
-            // **Through the map, not around it.** `view_top` is an absolute line number and the
-            // rewrap changed how many lines exist above it.
+            // Through the map: `view_top` is an absolute line number.
             t.view_top = t.view_top.map(|v| t.grid.clamp_view(reflow.map_line(v)));
             t.view_moved = true;
             if t.key == current {
                 evicted = reflow.evicted_lines();
             }
         }
-        // **The current tab's eviction**, because that is what the caller reports and what a
-        // person could check: a count summed across tabs would name a number nothing on screen
-        // corresponds to.
         Some(Resized { evicted })
     }
 
@@ -593,30 +342,18 @@ impl App {
     pub fn grid_origin(&self) -> libdraw::geom::Point {
         libdraw::geom::Point::new(
             (WINDOW_CONTENT_X + GRID_PAD_X) as i32,
-            // **`TAB_STRIP_H` since M14 Part B**, and leaving it out draws the grid *underneath*
-            // the strip — which `the_window_is_the_grid_plus_its_chrome` caught, because it adds
-            // the chrome up rather than checking the parts it remembers. **And the pane's margin
-            // since the desktop refresh's Part B**: the cells start inside it, and this is what
-            // maps a pointer to a cell, so a margin the origin did not know about would move
-            // every click by it.
+            // `TAB_STRIP_H` and the margin: this maps a pointer to a cell.
             (WINDOW_CONTENT_Y + TITLE_BAR_H + BAR_H + TAB_STRIP_H + GRID_PAD_Y) as i32,
         )
     }
 
     /// Feed bytes from the program on the other end.
-    ///
-    /// The one call Part C replaces: today the loopback hands it what the keyboard produced,
-    /// and then it will be what the tty server wrote.
     pub fn feed(&mut self, bytes: &[u8]) {
         let key = self.current;
         self.feed_tab(key, bytes);
     }
 
-    /// Queue `bytes` for the program on the other end.
-    ///
-    /// **Typing snaps the view back to the bottom**, which is what every terminal does and what
-    /// makes scrollback usable rather than a trap: the alternative is a prompt that answers
-    /// somewhere you cannot see, and a user who concludes the terminal has hung.
+    /// Queue `bytes` for the program on the other end; typing snaps the view back to the bottom.
     pub fn send(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -660,10 +397,7 @@ impl App {
     }
 
     /// The absolute line number of the viewport's first row.
-    ///
-    /// Clamped on every read rather than corrected when the scrollback evicts: the grid is
-    /// where lines go, and an anchor kept in step by a callback is an anchor that is wrong
-    /// whenever somebody adds a second path into the grid.
+    /// Clamped on every read rather than corrected on eviction.
     pub fn view_line(&self) -> u64 {
         match self.tab().view_top {
             Some(t) => self.tab().grid.clamp_view(t),
@@ -671,15 +405,9 @@ impl App {
         }
     }
 
-    /// The **viewport** rows this frame must repaint, taking the grid's damage as it goes.
-    ///
-    /// The grid reports *screen* rows, which are the same thing only while the view is
-    /// following the bottom. Scrolled back by `k`, screen row `s` is on show at viewport row
-    /// `s + k` — and at `s + k >= rows` it is below the viewport entirely and repaints nothing.
-    ///
-    /// A moved viewport repaints all of itself, and the grid's record is still taken in that
-    /// case: [`Grid::take_damage`]'s contract is "I am about to draw these rows", which a full
-    /// repaint satisfies, and leaving it unread would carry stale rows into the next frame.
+    /// The viewport rows this frame must repaint, taking the grid's damage as it goes.
+    /// The grid reports screen rows; scrolled back by `k`, screen row `s` shows at viewport row `s
+    /// + k`.
     pub fn damage_rows(&mut self) -> Vec<usize> {
         let back = (self.tab_mut().grid.top_line() - self.view_line()) as usize;
         let rows = self.tab_mut().grid.rows();
@@ -691,13 +419,11 @@ impl App {
         dirty.into_iter().filter_map(|s| s.checked_add(back).filter(|v| *v < rows)).collect()
     }
 
-    /// The current tab. **Never `None`** — `tabs` is never empty, and a `current` that named a
-    /// closed tab would be a bug this would hide rather than report.
+    /// The current tab. Never `None`: `tabs` is never empty.
     fn tab(&self) -> &Term {
         self.tabs.iter().find(|t| t.key == self.current).unwrap_or(&self.tabs[0])
     }
 
-    /// The current tab, mutably. See [`tab`](Self::tab).
     fn tab_mut(&mut self) -> &mut Term {
         let cur = self.current;
         match self.tabs.iter().position(|t| t.key == cur) {
@@ -723,10 +449,6 @@ impl App {
 
     /// What the strip draws: a label and a key per tab, current first-class.
     pub fn tab_labels(&self) -> Vec<(u64, alloc::string::String)> {
-        // **Numbered rather than named.** A terminal tab is named after what is running in it,
-        // and nothing tells this application that yet — the shell would have to set a title. A
-        // number is the honest label until it does, and it is the one thing that distinguishes
-        // two tabs showing the same prompt.
         self.tabs.iter().enumerate().map(|(i, t)| (t.key, alloc::format!("Terminal {}", i + 1))).collect()
     }
 
@@ -736,9 +458,6 @@ impl App {
     }
 
     /// The current tab's grid, mutably.
-    ///
-    /// **Published for tests and for the selection**, which is the one thing outside this crate
-    /// that drives the grid rather than reading it.
     pub fn grid_mut(&mut self) -> &mut Grid {
         &mut self.tab_mut().grid
     }
@@ -748,18 +467,10 @@ impl App {
         self.tab_mut().grid.damage_all();
     }
 
-    /// Feed bytes from tab `key`'s tty into *that tab's* parser.
-    ///
-    /// **Named rather than current**, which is the whole of what makes a background tab work: a
-    /// shell prints when it likes, and routing its output to whatever tab happens to be on screen
-    /// would interleave two sessions into one grid.
+    /// Feed bytes from tab `key`'s tty into that tab's parser.
     pub fn feed_tab(&mut self, key: u64, bytes: &[u8]) {
         let Some(i) = self.tabs.iter().position(|t| t.key == key) else { return };
         let t = &mut self.tabs[i];
-        // **Compared rather than counted.** A shell announces beside every prompt, so "the
-        // parser saw an `OSC 7`" is true once a command; "the answer is different from the one
-        // before" is true once a `cd`, which is what the title bar and the console line are
-        // about.
         let before = t.parser.directory().map(alloc::string::String::from);
         let mut out = [Op::Print('\0'); MAX_PER_BYTE];
         for &b in bytes {
@@ -772,16 +483,9 @@ impl App {
     }
 
     /// Open a tab and make it current, returning its key.
-    ///
-    /// **The grid is a fresh one of the same shape**, which is the whole of what a tab is here:
-    /// a second terminal in the same window. Inheriting the first's scrollback is the mistake
-    /// this split exists to prevent, and it is a mistake you make by *sharing* rather than by
-    /// forgetting to copy — so nothing is copied.
     pub fn open_tab(&mut self) -> u64 {
         if self.tabs.len() >= MAX_TABS {
-            // **Said rather than silently refused.** A chord that does nothing and explains
-            // nothing is the shape this milestone has spent three parts removing; the grid is
-            // where this application talks to the person using it.
+            // Said rather than silently refused.
             self.feed(b"\r\nnxterm: no more tabs in this window\r\n");
             return self.current;
         }
@@ -789,38 +493,19 @@ impl App {
         self.next_key += 1;
         let (cols, rows) = (self.tab().grid.cols(), self.tab().grid.rows());
         self.tabs.push(Term::new(key, cols, rows));
-        // A fresh `Grid` starts fully dirty, so this repaint is already owed — but going through
-        // the one function that makes a tab current is what keeps it that way.
         self.show_tab(key);
         key
     }
 
-    /// Make tab `key` current **and repaint the grid**.
-    ///
-    /// **The repaint is the whole of this function** (PR #282 review, blocking 1). The grid is a
-    /// `custom` node, and `diff` fingerprints one by its kind and size — so switching tabs, which
-    /// changes neither, reports no damage at all, and `paint` draws strictly inside the damage
-    /// rect. The strip would highlight the tab you clicked while the grid below it kept the other
-    /// tab's pixels, until something else happened to damage it: a scroll, a resize, or output
-    /// from this tab's shell, which repaints only the rows it writes and so leaves one fresh line
-    /// over five stale ones.
-    ///
-    /// **`nxedit` has no such problem** because its content is a `text_area` *inside* the diffed
-    /// tree; this grid is outside it, which is what makes the damage this application's to
-    /// declare.
+    /// Make tab `key` current and repaint the grid, which no diff will do: `diff` fingerprints the
+    /// `custom` node by kind and size.
     fn show_tab(&mut self, key: u64) {
         self.current = key;
-        // `view_moved` rather than `damage_all`, because it is the flag `damage_rows` already
-        // reads to mean "every row of the viewport" — and the viewport is what changed.
         self.tab_mut().view_moved = true;
     }
 
-    /// Close tab `key`. Returns whether anything was closed.
-    ///
-    /// **Closing the last tab closes the window**, which is what the chord means everywhere else
-    /// it exists — `nxedit` settled that in M12 Part D and this follows it rather than inventing
-    /// a second answer. The window's own close path is the one that runs, so an application that
-    /// grows something to ask about unsaved work asks here too.
+    /// Close tab `key`; closing the last tab closes the window. Returns whether anything was
+    /// closed.
     pub fn close_tab(&mut self, key: u64) -> bool {
         let Some(i) = self.tabs.iter().position(|t| t.key == key) else { return false };
         if self.tabs.len() == 1 {
@@ -829,9 +514,7 @@ impl App {
         }
         self.tabs.remove(i);
         if self.current == key {
-            // The one that took its place, or the last if it was the end — never an index that
-            // no longer exists. **Through `show_tab`**, so the grid is repainted: a closed tab
-            // leaves its pixels behind exactly as a switched-away one does.
+            // Through `show_tab`: a closed tab leaves pixels behind.
             let next = self.tabs[i.min(self.tabs.len() - 1)].key;
             self.show_tab(next);
         }
@@ -840,11 +523,7 @@ impl App {
 
     /// Apply a message from the chrome.
     pub fn update(&mut self, msg: Msg) {
-        // **Choosing dismisses the menu, whichever row it was** — a menu that stayed open would
-        // cover the thing it just acted on. Asked of the table rather than repeated in the arms,
-        // because before M14 Part A exactly two of them remembered to do it and the rest were a
-        // row away from forgetting. A message that is not a row leaves it alone, which is what
-        // keeps `MenuBar` able to open one.
+        // Choosing dismisses the menu, whichever row; a message that is not a row leaves it alone.
         if self
             .menu_table()
             .iter()
@@ -868,64 +547,35 @@ impl App {
                     self.show_tab(key);
                 }
             }
-            // **Nothing selected is not a request.** A copy that pushed an empty entry would move
-            // the ring's serial under every client that was mid-cycle, for a gesture that had
-            // nothing to copy. The Edit row is disabled in that state too, so this is the second
-            // of two guards rather than the only one — the chord reaches here with no menu open.
+            // Nothing selected is not a request: an empty copy would move the ring's serial under
+            // clients mid-cycle.
             Msg::Copy => {
                 if let Some(text) = self.tab_mut().grid.selected_text() {
                     self.clip_request = Some(ClipRequest::Copy(text));
                 }
             }
-            // **Everything the grid holds, scrollback included** — the screen is a window onto
-            // it, and a Select All that took only the visible rows would copy a different thing
-            // depending on where you had scrolled to.
             Msg::SelectAll => {
                 if self.tab_mut().grid.select_all() {
-                    // The rows it just highlighted are mostly *scrollback* rows, which
-                    // `damage_all` does not reach — see `find_next`.
                     self.tab_mut().view_moved = true;
                 }
             }
-            // **Reopening keeps what was typed.** `Ctrl+Shift+F` is a plausible thing to press
-            // twice, and a fresh field would silently discard a needle mid-search — the chord's
-            // own doc said it "can reopen it", which was only true in the sense that it emptied
-            // it (PR #287 review, optional 13).
             Msg::Find => {
                 if self.find.is_none() {
                     self.find = Some(TextFieldState::new());
                 }
             }
-            // **The screen stays; the history goes.** `Ctrl+L` clears the screen and belongs to
-            // the shell — this is the other thing, and the two are worth not confusing.
             Msg::ClearScrollback => {
-                // **Snapped *before* the history goes, and the order is the whole fix.**
-                // `snap_to_bottom` decides whether to repaint by comparing the clamped view
-                // against the screen — and once the scrollback is gone there is nothing above the
-                // screen to clamp to, so afterwards it always compares equal and repaints
-                // nothing. Assigning `view_top = None` directly had the same effect for a
-                // different reason (PR #287 review, blocking 2).
+                // Snapped before the history goes: afterwards there is nothing above the screen to
+                // clamp to, so it repaints nothing.
                 self.snap_to_bottom();
                 self.tab_mut().grid.clear_scrollback();
             }
             Msg::Paste => self.clip_request = Some(ClipRequest::Paste),
-            // The compositor is the one holding the grab this press opened, so all this does is
-            // record that the binary owes it a request.
             Msg::DragWindow => self.move_requested = true,
-            // Likewise for the corner: the compositor holds the grab, and this records the ask.
             Msg::ResizeWindow(edges) => self.resize_requested = Some(edges),
-            // Likewise: minimising and maximising are the manager's, and this records the ask.
             Msg::RequestState(s) => {
-                // **The maximise button is a toggle**, and this bit is the whole of what makes
-                // it one: a window that asked to be maximised asks to be *normal* next, which
-                // is what reaches the shell's restore path. Before M9 Part D the button was
-                // one-way because maximising did nothing visible — the client declined the
-                // `Configure` — so a window could not be un-maximised and nothing on the system
-                // ever sent `WINDOW_STATE_NORMAL`.
-                //
-                // **What was asked for, not what happened**, like every other half of this
-                // exchange: a shell that ignored the request leaves this bit wrong for exactly
-                // one click, which the next one corrects.
+                // The maximise button toggles on what was asked, not what happened; a shell that
+                // ignored it leaves the bit wrong for one click.
                 if s == WINDOW_STATE_MAXIMIZED || s == WINDOW_STATE_NORMAL {
                     self.maximized = s == WINDOW_STATE_MAXIMIZED;
                 }
@@ -933,8 +583,6 @@ impl App {
             }
             Msg::Close => self.closing = true,
             Msg::Clear => {
-                // Through the parser, so "clear" means exactly what `Ctrl-L` means and there is
-                // one implementation of it rather than a menu-shaped second one.
                 self.feed(b"\x1b[2J\x1b[H");
             }
             Msg::Reset => {
@@ -967,9 +615,8 @@ impl App {
 
     /// Deliver what a paste fetched: type it at the shell.
     ///
-    /// **Sent as input, not printed into the grid.** What is on screen is the *program's*
-    /// output, and a terminal that drew pasted text itself would show something the shell never
-    /// received. Sending it down the pty is what makes a pasted command a command.
+    /// Sent as input, not printed: the screen shows the program's output, and the shell must
+    /// receive it.
     pub fn pasted(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -979,21 +626,12 @@ impl App {
 
     /// A pointer event over the grid: press to anchor, drag to extend, release to end.
     ///
-    /// **Only the left button, and only while it is held.** The router delivers motion and
-    /// crossings unconditionally — `scroll_to` makes the same check for the same reason — so a
-    /// grid that extended on every motion would select whatever the pointer passed over on its
-    /// way to the scrollbar.
+    /// Only the left button, and only while held: the router delivers motion unconditionally.
     fn grid_pointer(&mut self, p: PointerEvent) {
         let Some((line, col)) = self.cell_at(p.x, p.y) else { return };
         if p.kind == POINTER_BUTTON && p.button == BTN_LEFT {
             if p.flags & POINTER_PRESSED != 0 {
-                // **One press starts a sweep, two take a word, three take a line** — the run
-                // `libui::click` counts, which was built counting past two for this caller.
-                //
-                // **Past three wraps back to a sweep** rather than counting on, because a fourth
-                // click has no larger unit to select and leaving it as "still a line" would make
-                // a person who clicked once too often unable to start a new selection without
-                // pausing.
+                // Past three wraps back to a sweep, as a fourth click has no larger unit.
                 match self.click_run {
                     2 => {
                         self.tab_mut().grid.select_word_at(line, col);
@@ -1001,11 +639,8 @@ impl App {
                     3 => {
                         self.tab_mut().grid.select_line_at(line);
                     }
-                    // A press with no drag selects nothing and *clears* what was selected — which
-                    // is what a click anywhere else in the window means too.
                     _ => self.tab_mut().grid.select_from(line, col),
                 }
-                // **The viewport, not the screen** — see [`view_moved`](Self::view_moved).
                 self.tab_mut().view_moved = true;
             }
             return;
@@ -1016,21 +651,13 @@ impl App {
         }
     }
 
-    /// Record a pointer press at `at`, `at_ms` milliseconds into the monotonic clock.
-    ///
-    /// **Called before the event is routed**, so the press it produces can ask what number the
-    /// click was — the same seam `nxfiles::App::note_press` describes, and the same reason: this
-    /// crate makes no syscalls.
-    ///
-    /// **A run past three restarts**, because there is no unit larger than a line to select.
+    /// Record a pointer press at `at`, `at_ms` milliseconds into the monotonic clock, before the
+    /// event is routed so it can ask which click it was.
     pub fn note_press(&mut self, at: libdraw::geom::Point, at_ms: u64) {
         let n = self.clicks.press(at, at_ms);
         self.click_run = if n > 3 {
-            // **Re-seeded, not merely forgotten.** A bare `reset` would make this press a first
-            // click *and the next one too*, because the run it would have continued no longer
-            // exists — so a person who clicked four times would have to click twice more to get
-            // a word. Pressing again after the reset makes this press the first of a new run, so
-            // the one after it is the second.
+            // Re-seeded, not merely forgotten: a bare `reset` would make this press a first click
+            // and the next one too.
             self.clicks.reset();
             self.clicks.press(at, at_ms)
         } else {
@@ -1039,10 +666,6 @@ impl App {
     }
 
     /// The absolute `(line, column)` a grid-local pixel falls in, or `None` outside it.
-    ///
-    /// **Absolute, because a selection is** — see [`libterm::grid::Selection`]. The conversion
-    /// is here rather than at the call site for `rows_in`'s reason: two places doing this
-    /// arithmetic is two places to disagree about which cell a pixel is in.
     pub fn cell_at(&self, x: i32, y: i32) -> Option<(u64, usize)> {
         if x < 0 || y < 0 || self.metrics.cell_w == 0 || self.metrics.cell_h == 0 {
             return None;
@@ -1052,45 +675,23 @@ impl App {
         if row >= self.tab().grid.rows() {
             return None;
         }
-        // Clamped rather than refused: a drag that runs off the right edge means "to the end of
-        // the line", which is what every text selection does and what a `None` here would turn
-        // into a gesture that stops moving.
+        // Clamped rather than refused: a drag off the right edge means "to the end of the line".
         Some((self.view_line() + row as u64, col.min(self.tab().grid.cols())))
     }
 
     /// Type what a key produced, if it is a key that types.
-    ///
-    /// **A repeat types and a release does not.** A terminal sends on the way down, and a
-    /// repeat is that press continuing — which is the whole of what the compositor's key-repeat
-    /// generator is *for*, and the point at which it reaches something that acts on it rather
-    /// than a test client that prints it.
     fn key(&mut self, k: KeyEvent) {
         if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
             return;
         }
-        // **The menu's chords are taken before anything is encoded**, which is the whole reason
-        // they carry Shift: `libterm::encode` folds `Ctrl+C` to `0x03`, the interrupt, and a
-        // terminal that copied on it would have taken the one binding a terminal cannot give away
-        // (M12 decision 6). Checked here rather than in `update` for the reason the two
-        // applications settled in Part D: a chord that acts on the *window* is the window's, and
-        // typing is what the grid does with everything else.
-        //
-        // **Matched against the menu table rather than against a `match` on keycodes** (M14
-        // decision 2). The pair of constants that used to be tested here are still the source of
-        // truth — the table names them — but there is now one statement of "Ctrl+Shift+C copies"
-        // instead of a label in the menu and a branch here that could stop agreeing with it.
+        // The menu's chords are taken before anything is encoded: `libterm::encode` folds `Ctrl+C`
+        // to the interrupt `0x03`, so they carry Shift.
         if let Some(msg) = libui::menu::accel_match(&self.menu_table(), &k) {
             self.update(msg);
             return;
         }
-        // **While a find is open the keys are the field's, not the tenant's** — which is a
-        // stronger claim here than in an editor, because what a terminal normally does with a
-        // keystroke is *send it to a program*. A find field that let characters through would
-        // type them into the shell while the person believed they were searching.
-        //
-        // After the chord check, so `Ctrl+Shift+F` can reopen it and the copy and paste chords
-        // still work with a find up; before the encoder, which is what the field is protecting
-        // the person from.
+        // While a find is open the keys are the field's, or they would type into the shell; after
+        // the chord check so `Ctrl+Shift+F` can reopen it.
         if self.find.is_some() {
             match k.keycode {
                 libkern::abi::KEY_ESC => {
@@ -1105,12 +706,8 @@ impl App {
             }
             return;
         }
-        // **Typing clears the selection.** It is the same rule the kill ring's cycle follows —
-        // any other action ends the gesture — and without it a highlight stays on screen over
-        // text that has since scrolled away under it.
-        //
-        // The return value is the repaint: clearing nothing must not damage the viewport, or
-        // every keystroke in a terminal with no selection would repaint every row.
+        // Typing clears the selection; the return value is the repaint, so no selection means no
+        // damage per keystroke.
         if self.tab_mut().grid.clear_selection() {
             self.tab_mut().view_moved = true;
         }
@@ -1120,11 +717,6 @@ impl App {
     }
 
     /// Find the next match and show it, or say there is none.
-    ///
-    /// **Walks from just after the current match**, so pressing Enter repeatedly steps through
-    /// them — the same shape `nxedit`'s find has, and the reason the field stays open. Wraps to
-    /// the oldest line when it runs out, because a terminal's history is a loop a person scrolls
-    /// rather than a document with an end.
     fn find_next(&mut self) {
         let Some(needle) = self.find.as_ref().map(|f| alloc::string::String::from(f.text())) else {
             return;
@@ -1146,27 +738,14 @@ impl App {
         let t = self.tab_mut();
         t.grid.select_from(line, col);
         t.grid.extend(line, col + n);
-        // **Scrolled to, because a match nobody can see is not a find.** Clamped by the grid, so
-        // a hit on the screen leaves the view where it is.
-        // **Through `scroll_to_line`, which the file calls "the one place the view changes"** —
-        // it clamps and sets `view_moved` when the anchor actually moves. Assigning `view_top`
-        // here left the repaint out: `select_from` damages *screen* rows and `damage_rows` drops
-        // every row whose viewport position is off the bottom, so a view scrolled back by a whole
-        // screen reported no damage and the match was selected on a screen nobody redrew — the
-        // one case Find exists for (PR #287 review, blocking 1).
+        // Through `scroll_to_line`, which sets `view_moved`: `select_from` damages screen rows,
+        // which a view scrolled back a screen does not show.
         self.scroll_to_line(line);
     }
 
     /// Move the view to where a scrollbar interaction points.
-    ///
-    /// Only while a button is held: the router delivers motion and crossings unconditionally,
-    /// and a bar that tracked the cursor on hover would scroll whenever the pointer passed over
-    /// it on its way somewhere else.
     fn scroll_to(&mut self, p: PointerEvent) {
         let s = self.scroll();
-        // **The grab decides whether this event is part of a drag at all**, which is what the
-        // old `buttons == 0` test was standing in for: a press takes hold, a motion follows,
-        // a release lets go, and anything else answers `None` (M14 Part I).
         let Some(offset) = self.scroll_grab.apply(s, self.track_h(), p) else {
             return;
         };
@@ -1176,43 +755,27 @@ impl App {
 
     /// Scroll the viewport by a turn of the wheel.
     ///
-    /// **[`WHEEL_UNITS`](libui::click::WHEEL_UNITS) lines a detent**, which is the toolkit's
-    /// number rather than this application's: a wheel that moved three lines here and five rows
-    /// in the file browser is a desktop that feels wrong without anyone being able to say why.
-    ///
-    /// **Through [`scroll_to_line`](Self::scroll_to_line)**, so the wheel and the scrollbar
-    /// have one implementation of what a viewport position means — including the clamp at both
-    /// ends and the repaint, which is the half that goes missing when a second path is written.
-    /// It follows that a wheel down to the bottom *parks* there rather than resuming the
-    /// bottom-follow, exactly as dragging the thumb to the end does: a program printing
-    /// afterwards must not pull the view along with it. Typing resumes following.
+    /// A wheel down to the bottom parks there rather than resuming bottom-follow; typing resumes
+    /// following.
     fn wheel(&mut self, p: PointerEvent) {
         if p.wheel == 0 {
             return;
         }
-        // **Widened before multiplying.** `wheel` is `i16` and saturates at the compositor,
-        // so a long stall delivers 32767 detents; in `i16` arithmetic times three that is a
-        // scroll in the wrong direction.
+        // Widened before multiplying: `wheel` is an `i16` that saturates.
         let lines = i64::from(p.wheel) * i64::from(libui::click::WHEEL_UNITS);
         let top = self.view_line();
-        // Positive is down, so it moves the viewport's first line forward. `scroll_to_line`
-        // clamps, which is what makes running off either end stop rather than wrap.
         let want = if lines < 0 { top.saturating_sub(lines.unsigned_abs()) } else { top.saturating_add(lines as u64) };
         self.scroll_to_line(want);
     }
 
     /// Anchor the viewport at absolute line `top`, clamped, repainting if that moved it.
-    ///
-    /// The one place the view changes, so that the mouse wheel and a `Shift-PageUp` are a
-    /// coordinate conversion away from working rather than a second copy of this.
     pub fn scroll_to_line(&mut self, top: u64) {
         let want = self.tab_mut().grid.clamp_view(top);
         if want != self.view_line() {
             self.tab_mut().view_moved = true;
         }
-        // **Recorded even at the bottom**, rather than becoming `None` again: dragging the thumb
-        // to the end means "show me the last screen", and a program printing afterwards must not
-        // pull the view along with it. Following resumes when the user types.
+        // Recorded even at the bottom, so a program printing afterwards does not pull the view
+        // along.
         self.tab_mut().view_top = Some(want);
     }
 
@@ -1225,75 +788,32 @@ impl App {
     }
 
     /// The height the scrollbar's track is laid out at.
-    ///
-    /// The bar sizes itself to whatever the `Dock` leaves it, and `scrollbar` is told a height
-    /// separately for the thumb arithmetic — so this is the one number both the view and the
-    /// drag have to agree on, and it exists so they cannot disagree.
     pub fn track_h(&self) -> u32 {
-        // **What the `Dock` will actually leave it**, which since M9 Part D is not the grid's
-        // pixel height: a window is whatever size the manager asked for, and the grid is the
-        // whole cells that fit inside it. Sizing the thumb against the grid instead would make
-        // it a fraction of a cell short in a maximised window, and the error would grow with
-        // the leftover.
-        //
-        // **Less the grip's square, which the bar must stop above** (PR #253 review, finding 4).
-        // `GRIP_W` is wider than `SCROLL_W`, the grip is the topmost layer, and hit-testing
-        // takes the topmost — so any part of the track under it is a part of the track that
-        // cannot be pressed. That is not hypothetical: `MIN_THUMB` is 16 and a following view
-        // puts the thumb at the very bottom, so a 24-row terminal with a full scrollback had
-        // its thumb *entirely* under the grip.
+        // What the `Dock` will leave it, less the grip's square: the grip is the topmost layer, so
+        // a track under it cannot be pressed.
         self.window.h.saturating_sub(BARS_H + GRIP_W)
     }
 
     /// Record where each bar word sits, so an open menu knows where to hang from.
-    ///
-    /// **Here rather than in the binary, since M15 Part E.** Three applications each copied this
-    /// loop, and the count in it was a constant beside a `menu_table` that grew: `nxfiles` asked
-    /// for two anchors while its bar had three menus, so *View* opened a popup with nowhere to
-    /// go and drew nothing at all. In the binary it was untestable — no host test builds a
-    /// `main.rs` — which is why it could be wrong for two milestones. Here it is one method with
-    /// one count, and a test walks the whole bar through it.
     pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
         let n = self.menu_count();
         self.menus.set_anchors((0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect());
     }
 
-    /// How many menus the bar has — **derived from the table, never declared**.
-    ///
-    /// **A constant here drifted and cost the View menu** (M15 Part E). `MENU_COUNT` was 2 while
-    /// `menu_table` returned three menus, so the binary asked for two anchors,
-    /// `MenuState::anchor` answered `None` for the third, and clicking *View* opened a menu that
-    /// had nowhere to hang from — a bar word that did nothing, with no error anywhere. Two
-    /// numbers that must be equal are one number.
+    /// How many menus the bar has, derived from the table.
     pub fn menu_count(&self) -> usize {
         self.menu_table().len()
     }
 
-    /// The element tree for the current state.
-    ///
-    /// **The theme is the caller's**, because the caller paints this tree — and a tree built from
-    /// one theme and painted with another is two themes in one frame, which one type makes easy
-    /// to write and the old `Theme`/`Palette` split made impossible (PR #262 review, optional 5).
     /// The bar's menus, in bar order.
     ///
-    /// **Built rather than stored**, because it is a function of almost nothing: a cached copy
-    /// would be a second place for the same constants, and this is cheap. It takes `&self`
-    /// because Copy is only offered when there is a selection — the one row here whose
-    /// availability is a fact about the terminal rather than about the menu.
-    ///
-    /// **Clear and Reset are under Edit rather than in a Terminal menu of their own.** Two menus
-    /// is what M14 Part A scopes, and of the two they are edits to what is on screen. GNOME
-    /// Terminal puts them under `Terminal`; if a third menu arrives they move there, and the
-    /// accelerator table does not care which menu an item is in.
+    /// Built rather than stored; Clear and Reset sit under Edit.
     pub fn menu_table(&self) -> Vec<Menu<Msg>> {
         vec![
             Menu {
                 title: "File",
                 items: vec![
                     Item::new("New Tab", Accel::ctrl_shift(NEW_TAB_KEYCODE, "T"), Msg::NewTab),
-                    // **Enabled on the last tab too**, unlike `nxfiles`: there closing the last
-                    // tab is a no-op, so the row would offer nothing; here it closes the window,
-                    // which is what the chord means everywhere else it exists.
                     Item::new("Close Tab", Accel::ctrl_shift(CLOSE_TAB_KEYCODE, "W"), Msg::CloseTab(self.current)),
                     Item::Separator,
                     Item::new("New Window", Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"), Msg::NewWindow),
@@ -1305,22 +825,12 @@ impl App {
             Menu {
                 title: "Edit",
                 items: vec![
-                    // **Greyed with nothing selected**, which is what `enabled` is for: the
-                    // copy path already declines an empty selection, and a row that looks
-                    // available but declines is the thing that reads as a broken menu.
                     Item::new("Copy", Accel::ctrl_shift(COPY_KEYCODE, "C"), Msg::Copy)
                         .enabled(self.tab().grid.has_selection()),
                     Item::new("Paste", Accel::ctrl_shift(PASTE_KEYCODE, "V"), Msg::Paste),
-                    // **Offered whenever there is anything to select**, which is not the same as
-                    // "there is a selection": Select All's whole job is to make one.
                     Item::new("Select All", Accel::ctrl_shift(SELECT_ALL_KEYCODE, "A"), Msg::SelectAll)
-                        // **Offered when there is anything to select.** The old test here compared
-                        // `oldest_line() <= top_line()`, which is true by construction — `select_all`
-                        // is the one that knows, and it says so by returning `false`.
                         .enabled(self.tab().grid.line_text(self.tab().grid.top_line()).is_some()),
                     Item::new("Find", Accel::ctrl_shift(FIND_KEYCODE, "F"), Msg::Find),
-                    // **Offered only when there is history to drop**, which is what `enabled` is
-                    // for: a row that looks available and does nothing reads as a broken menu.
                     Item::new("Clear Scrollback", Accel::ctrl_shift(CLEAR_KEYCODE, "K"), Msg::ClearScrollback)
                         .enabled(self.tab().grid.oldest_line() < self.tab().grid.top_line()),
                     Item::Separator,
@@ -1331,31 +841,19 @@ impl App {
         ]
     }
 
-    /// It is also the shape Part C needs: a theme read from a file arrives in `main` and is
-    /// handed down, rather than being fetched from a default in the middle of a view.
+    /// The element tree for the current state.
+    ///
+    /// The theme is the caller's, as it paints this tree.
     pub fn view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let grid_px = self.metrics.pixel_size(self.tab().grid.cols(), self.tab().grid.rows());
 
-        // **The bar is `libui::menu`'s, and so is what hangs off it.** It was one hand-rolled
-        // `button` labelled "Terminal"; the word a menu bar carries is not a button, and the
-        // popup under it was a second copy of `nxfiles`'s.
         let bar = libui::menu::bar(&self.menu_table(), &self.menus, MENU_BAR_KEY, hovered, Msg::MenuBar, ui, BAR_H);
-        // **The tab strip, below the menu bar and above the grid** (M14 Part B). Same order as
-        // `nxedit` and `nxfiles`, which is the point: a person who learned where the tabs are in
-        // one window should not have to look somewhere else in the next.
-        //
-        // **Always drawn, even with one tab.** Both siblings do, and a strip that appeared on the
-        // second tab would move every row of the grid down the moment you opened one — a terminal
-        // reflowing its scrollback because you pressed a chord.
+        // Always drawn: a strip that appeared on the second tab would move every row of the grid.
         let labels = self.tab_labels();
         let tabs: Vec<libui::widget::Tab<'_>> =
             labels.iter().map(|(key, label)| libui::widget::Tab { key: *key, label, marked: false }).collect();
-        // **The find field takes the tab strip's row rather than adding one** (M14 Part E). A
-        // strip of its own is where a find bar conventionally goes and would have changed the
-        // grid's height — which is the number every gate that measures this terminal asserts, and
-        // which a person would see as the window reflowing when they pressed `Ctrl+Shift+F`. The
-        // strip is one row of chrome and a find *is* what the window is doing, which is the same
-        // argument `nxedit`'s strip makes for replacing its status with a field.
+        // The find field takes the tab strip's row, so the grid's height (which gates assert) does
+        // not change.
         let strip = match self.find.as_ref() {
             Some(f) => libui::element::sized(
                 Size::new(0, TAB_STRIP_H),
@@ -1375,17 +873,8 @@ impl App {
             ),
         };
 
-        // **The title bar is the terminal's own chrome** (M9 Part A), and since Part C all three
-        // of its buttons do something: minimise and maximise ask the shell, close is this
-        // client's own answer.
         let title = title_bar(
             TITLE,
-            // **Where the shell in this tab says it is** (desktop refresh, Part K), which is
-            // what the design puts beside the window's name. It arrives as `OSC 7`, which
-            // `nxsh` emits beside every prompt — so it follows a `cd`, and a tab that has never
-            // heard from a shell simply has no subtitle rather than a guessed one.
-            //
-            // **Per tab**, since each runs its own shell: switching tabs changes the bar.
             self.tab().parser.directory(),
             self.focused,
             Msg::DragWindow,
@@ -1396,55 +885,28 @@ impl App {
                 } else {
                     WINDOW_STATE_MAXIMIZED
                 })),
-                // **Close sends nothing.** It is the one button whose answer is entirely this
-                // client's: it exits, and the compositor tears down its windows with its
-                // session. A `Manage::Close` exists for a client that will *not* do this, and it
-                // is the shell's to reach for (M9 Part C).
+                // Close sends nothing: the client exits and the compositor tears down its windows.
                 close: Some(Msg::Close),
             },
             hovered,
             ui,
         )
         .key(TITLE_KEY);
-        // **The grip sits over the bottom-right corner, not beside it** (M9 Part E). A strip
-        // reserved for it would take a row of cells from every terminal for a control that is
-        // only ever aimed at; over the corner it costs nothing and is exactly where a person
-        // reaches. `window_frame_with_grip` places it, inside the border and under it, since the
-        // desktop refresh's Part B — this stacked it over the finished frame, which painted over
-        // the border's bottom-right curve.
         let body = window_frame_with_grip(
             title,
             dock(
                 vec![
                     docked(Edge::Top, bar.key(BAR_KEY)),
-                    // `tab_strip` already returns itself `sized` to `TAB_STRIP_H`, so this only
-                    // needs the key (PR #282 review, optional 9).
                     docked(Edge::Top, strip.key(TAB_STRIP_KEY)),
                     docked(
                         Edge::Right,
-                        // **Sized, so the bar ends where the grip begins.** The dock's right slot
-                        // is the full remaining height; without this the scrollbar is laid out
-                        // under the grip and the bottom `GRIP_W` of its track is unpressable — see
-                        // [`track_h`](Self::track_h).
-                        // The key goes on the wrapper, because the diff requires a container's
-                        // children to be all keyed or all unkeyed and this one's siblings are keyed.
+                        // Sized so the bar ends where the grip begins, or its bottom `GRIP_W` is
+                        // unpressable (see [`track_h`](Self::track_h)). The key goes on the
+                        // wrapper: the diff needs all siblings keyed.
                         sized(
                             Size::new(SCROLL_W, self.track_h()),
-                            // **Drawn only when there is history to reach** (desktop refresh,
-                            // Part K). The design's terminal shows no scrollbar at all, and ours
-                            // drew a full-height thumb in `border` down the right of a near-black
-                            // pane whether or not anything had scrolled off — a light strip against
-                            // the darkest surface on the screen, so the one thing the eye found in
-                            // an empty terminal was a control that did nothing.
-                            //
-                            // **The column is kept, not removed.** Taking `SCROLL_W` out of
-                            // `CHROME_W` when there is nothing to scroll would give the grid a
-                            // wider box, and the grid would reflow the first time output ran off
-                            // the top — a terminal rewrapping its screen because a command printed
-                            // one line too many. That is the tab strip's argument one widget over.
-                            // So the slot stays and carries the terminal's own ground, which is
-                            // what the pane beside it is filled with: the pane simply looks that
-                            // much wider until there is a bar to put there.
+                            // Drawn only when there is history to reach; the column is kept so the
+                            // grid's box does not widen and reflow.
                             if self.scroll().scrollable() {
                                 scrollbar(self.scroll(), SCROLL_W, self.track_h(), ui).on_pointer(Msg::Scroll)
                             } else {
@@ -1454,12 +916,8 @@ impl App {
                         .key(SCROLLBAR_KEY),
                     ),
                 ],
-                // **The pane: the terminal's own ground, and the cells inside its margin**
-                // (desktop refresh, Part B). A custom node takes the size it declares, so the
-                // grid's node covers the cells and nothing else; the first version of the margin
-                // moved the cells and left the margin showing the window's face under them —
-                // measured on a screendump, not seen in a test. The ground is filled across the
-                // whole pane here, in the palette the cells are drawn in.
+                // The pane: the terminal's ground, filled across the whole pane; a custom node
+                // covers only its declared cells.
                 libui::element::stack(vec![
                     libui::element::fill(self.palette.background),
                     libui::element::padding(
@@ -1472,18 +930,13 @@ impl App {
                         custom(GRID_KIND, grid_px)
                             .key(GRID_KEY)
                             .on_key(|k| Some(Msg::Key(k)))
-                            // **The grid takes the pointer since M12 Part E.** It had none:
-                            // nothing in the terminal reacted to the pointer except the scrollbar
-                            // and the chrome.
                             .on_pointer(Msg::GridPointer),
                     ),
                 ])
                 .key(GRID_PANE_KEY),
             )
-            // **The wheel is the whole body's, not the grid's** (M14 Part I). A wheel walks up
-            // from whatever it landed on, so hanging it here means turning it over the
-            // scrollbar or the tab strip scrolls the terminal too — which is what a person
-            // expects, and what putting it on the grid alone would have made a dead zone of.
+            // The wheel is the whole body's, so turning it over the scrollbar or tab strip scrolls
+            // too.
             .on_wheel(Msg::Wheel),
             resize_grip(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM), ui).key(GRIP_KEY),
             self.window,
@@ -1491,35 +944,16 @@ impl App {
             ui,
         );
 
-        // **The menu is not in this tree.** It used to be a `Stack` layer over the whole
-        // window — a layer inside the 24-pixel bar would have been clipped to 24 pixels, so it
-        // was hoisted to the first ancestor big enough to hold it. Since M6 C3 it is a *window*:
-        // a `popup`, parented to this one and clipped only by the screen, which is what a menu
-        // has always needed and what `libui`'s `offset` cannot give it. See [`menu_view`].
-        //
-        // [`menu_view`]: Self::menu_view
+        // The menu is not in this tree: a `popup` window of its own, clipped only by the screen.
         body
     }
 
     /// The menu popup's own element tree — the root of a second window, not a layer in this one.
-    ///
-    /// Separate from [`view`](Self::view) because it is painted into a different surface with
-    /// its own diff state. It carries no `Fill` sizing of its own beyond the backing, so
-    /// `libui::layout::measure` under loose constraints gives the size the popup window should
-    /// be created at.
-    ///
-    /// **The theme is the caller's**, like [`view`](Self::view)'s: the popup is painted by the
-    /// binary, and a menu built from one theme beside a window painted with another is the same
-    /// two-themes mistake one surface further out.
     pub fn menu_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         self.menu(ui, hovered)
     }
 
     /// The popup's contents: whichever menu is open, framed.
-    ///
-    /// **An empty frame when none is**, which cannot be drawn because the popup window only
-    /// exists while one is open — but is a shape the type demands and the caller must not have
-    /// to think about.
     fn menu(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let menus = self.menu_table();
         match self.menus.open().and_then(|i| menus.get(i)) {
@@ -1530,11 +964,6 @@ impl App {
 }
 
 /// The rows of the grid a window-space rectangle covers.
-///
-/// The bridge between the toolkit's damage — one rectangle in window coordinates — and
-/// `libterm`'s, which is a list of cell rows. The custom node's paint callback is handed a
-/// clip and has to turn it into rows, and doing that arithmetic at the call site is how the
-/// two disagree about which row a pixel is in.
 pub fn rows_in(clip: Rect, grid_origin: libdraw::geom::Point, m: &Metrics, rows: usize) -> Vec<usize> {
     let top = clip.origin.y - grid_origin.y;
     let bottom = clip.bottom() as i32 - grid_origin.y;
@@ -1542,7 +971,6 @@ pub fn rows_in(clip: Rect, grid_origin: libdraw::geom::Point, m: &Metrics, rows:
         return Vec::new();
     }
     let first = (top.max(0) as u32 / m.cell_h) as usize;
-    // `bottom` is exclusive, so the last covered row is the one holding `bottom - 1`.
     let last = ((bottom - 1).max(0) as u32 / m.cell_h) as usize;
     (first..=last.min(rows.saturating_sub(1))).collect()
 }
@@ -1561,14 +989,10 @@ mod tests {
         App::new(20, 6, Metrics::new(&f, 16.0))
     }
 
-    // --- selection and the clipboard (M12 Part E) ---------------------------
-
-    /// A pointer event over the grid, in grid-local pixels.
     fn ptr(kind: u16, buttons: u16, flags: u16, x: i32, y: i32) -> PointerEvent {
         PointerEvent { kind, button: BTN_LEFT, buttons, flags, x, y, ..Default::default() }
     }
 
-    /// A key press, as the compositor delivers one.
     fn press(a: &mut App, keycode: u16, modifiers: u16) {
         a.update(Msg::Key(KeyEvent::new(1, keycode, KEY_DOWN, modifiers)));
     }
@@ -1582,21 +1006,13 @@ mod tests {
         a.update(Msg::GridPointer(ptr(POINTER_MOTION, 1, 0, 5 * w, h / 2)));
         press(&mut a, COPY_KEYCODE, MOD_CTRL | MOD_SHIFT);
         assert_eq!(a.take_clip_request(), Some(ClipRequest::Copy(alloc::string::String::from("hello"))));
-        // …and the chord did not reach the shell as an interrupt.
         assert!(a.take_outbox().is_empty(), "the chord was consumed, not typed");
     }
 
     #[test]
     fn motion_after_a_release_does_not_go_on_selecting() {
-        // The router delivers motion whether or not a button is down, so without
-        // `grid_pointer`'s `buttons` check the pointer crossing the grid on its way to the
-        // scrollbar would drag the head of a finished selection along with it.
-        //
-        // **It has to select first.** A version of this that only sent motion passed against the
-        // guard *and* against its removal: with no anchor, `Grid::extend` returns early either
-        // way, so what it pinned was `libterm`'s own no-anchor guard rather than this one
-        // (PR #271 review, blocking 1). A release does not clear the anchor — that is what makes
-        // the state after one the discriminating case.
+        // Select first: with no anchor `Grid::extend` returns early either way, so a motion-only
+        // test would pin libterm's guard, not this one.
         let mut a = app();
         a.feed(b"hello world");
         let (w, h) = (a.metrics.cell_w as i32, a.metrics.cell_h as i32);
@@ -1614,8 +1030,6 @@ mod tests {
 
     #[test]
     fn copying_nothing_is_not_a_request() {
-        // A copy that pushed an empty entry would move the ring's serial under every client
-        // that was mid-cycle, for a gesture that had nothing to copy.
         let mut a = app();
         a.feed(b"hello");
         press(&mut a, COPY_KEYCODE, MOD_CTRL | MOD_SHIFT);
@@ -1624,9 +1038,6 @@ mod tests {
 
     #[test]
     fn ctrl_c_without_shift_is_still_the_interrupt() {
-        // **The one binding a terminal cannot give away** — M12 decision 6, and the reason the
-        // copy chord carries Shift at all. Without the modifier check this chord would copy,
-        // and nothing would be able to interrupt a running program.
         let mut a = app();
         a.feed(b"hello");
         a.grid_mut().select_from(0, 0);
@@ -1638,8 +1049,6 @@ mod tests {
 
     #[test]
     fn a_paste_is_typed_at_the_shell_rather_than_drawn() {
-        // What is on screen is the *program's* output. A terminal that drew pasted text itself
-        // would show something the shell never received.
         let mut a = app();
         a.pasted("ls\n");
         assert_eq!(a.take_outbox(), alloc::vec![b'l', b's', b'\n']);
@@ -1647,8 +1056,6 @@ mod tests {
 
     #[test]
     fn typing_clears_the_selection() {
-        // The same rule the kill ring's cycle follows: any other action ends the gesture.
-        // Without it a highlight stays on screen over text that has scrolled away under it.
         let mut a = app();
         a.feed(b"hello");
         a.grid_mut().select_from(0, 0);
@@ -1659,11 +1066,8 @@ mod tests {
 
     #[test]
     fn a_selection_made_in_the_scrollback_repaints_what_is_being_looked_at() {
-        // **The two damage spaces, from a new direction** (M12 Part E). `Grid::select_from`
-        // damages every *screen* row; a view scrolled back into the history is showing none of
-        // them, and `damage_rows` filters what does not map. So a drag in the scrollback
-        // highlighted nothing, exactly as scrolling once painted nothing — the bug
-        // `view_moved` was added for.
+        // `select_from` damages screen rows; a view scrolled into history shows none of them, so
+        // `damage_rows` must still repaint.
         let mut a = app();
         for i in 0..40 {
             a.feed(alloc::format!("line {i}\r\n").as_bytes());
@@ -1678,28 +1082,19 @@ mod tests {
 
     #[test]
     fn the_copy_and_paste_keycodes_are_the_letters_they_claim() {
-        // **All five of this terminal's chords, not two** — a constant naming the wrong letter
-        // would make the menu advertise a chord nothing types, and the digests prove routing from
-        // that same table so nothing else would notice (PR #287 review, optional 11).
         assert_eq!(libinput::keymap::to_char(SELECT_ALL_KEYCODE, 0), Some(b'a'));
         assert_eq!(libinput::keymap::to_char(FIND_KEYCODE, 0), Some(b'f'));
         assert_eq!(libinput::keymap::to_char(CLEAR_KEYCODE, 0), Some(b'k'));
-        // Pinned against `libinput`'s table rather than against the constants' own comments —
-        // the same check `nxedit`'s chords get.
         assert_eq!(libinput::keymap::to_char(COPY_KEYCODE, 0), Some(b'c'));
         assert_eq!(libinput::keymap::to_char(PASTE_KEYCODE, 0), Some(b'v'));
-        // The tab chords, added in M14 Part B and claimed in a comment until PR #282's review.
         assert_eq!(libinput::keymap::to_char(NEW_TAB_KEYCODE, 0), Some(b't'));
         assert_eq!(libinput::keymap::to_char(CLOSE_TAB_KEYCODE, 0), Some(b'w'));
     }
 
     #[test]
     fn the_grip_does_not_cover_any_part_of_the_scrollbar() {
-        // **A control that cannot be pressed is worse than one that is absent.** The grip is the
-        // topmost layer and hit-testing takes the topmost, so any part of the track under it is
-        // a part of the track that does nothing — and `MIN_THUMB` is 16 while a following view
-        // puts the thumb at the very bottom, so a 24-row terminal with a full scrollback had
-        // its thumb *entirely* underneath (PR #253 review, finding 4).
+        // The grip is the topmost layer, so any track under it cannot be pressed; a following view
+        // puts the thumb at the bottom, under it.
         let f = Font::from_bytes(DEJAVU.to_vec()).expect("the vendored font parses");
         let mut a = App::new(80, 24, Metrics::new(&f, 16.0));
         for i in 0..1200 {
@@ -1713,23 +1108,14 @@ mod tests {
         let bar = locate(&e, &l, SCROLLBAR_KEY).expect("the scrollbar is keyed");
         let grip = locate(&e, &l, GRIP_KEY).expect("the grip is keyed");
         assert!(bar.intersect(&grip).is_none(), "the grip {grip:?} overlaps the scrollbar {bar:?}");
-        // **And it ends where the grip begins**, not short of it. Not overlapping is half of it: a
-        // bar sized against the wrong box stopped 19 pixels above the grip and left a patch of the
-        // window's face between them, which the half above passes (PR #313 review, finding 2).
         assert_eq!(bar.bottom(), grip.origin.y as i64, "the scrollbar {bar:?} stops short of the grip {grip:?}");
-        // **In the corner, inside the border** — since the desktop refresh's Part B the frame places
-        // the grip under its border, so the border is drawn over the grip's corner.
         let border = libui::widget::WINDOW_BORDER as i64;
         assert_eq!(grip.bottom(), bounds.bottom() - border, "and the grip is still in the corner");
         assert_eq!(grip.right(), bounds.right() - border);
     }
 
-    /// The title bar carries the working directory the shell in *this tab* announced.
-    ///
-    /// **Painted and measured, not read off the tree** (desktop refresh, Part K). `title_bar`
-    /// takes the subtitle as an `Option<&str>` and draws nothing for `None`, so a tree test
-    /// would be asserting that a string reached an argument — which is the half that was never
-    /// in doubt. What is in doubt is whether it reaches the *bar*, which is ink.
+    /// Painted and measured rather than read off the tree: a tree test only shows the string
+    /// reached an argument.
     #[test]
     fn the_title_bar_shows_where_the_shell_in_this_tab_says_it_is() {
         use libdraw::format::PixelFormat;
@@ -1740,8 +1126,6 @@ mod tests {
         let ui = UiTheme::default();
         let (w, h) = (a.window_size().w, a.window_size().h);
 
-        // How far right ink reaches along the title bar, left of the buttons — which is the
-        // title, and then the subtitle after it.
         let reach = |a: &App| {
             let e = a.view(&ui, None);
             let l = layout(&e, Rect::new(0, 0, w, h), &FixedCell { w: 8, h: 16 });
@@ -1750,14 +1134,10 @@ mod tests {
             fb.clear(ui.background);
             let mut custom = |_: u32, _: Rect, _: Rect, _: &mut MemFramebuffer| {};
             libui::paint::paint(&mut fb, &f, &ui, &e, &l, Rect::new(0, 0, w, h), &mut custom);
-            // Stop short of the leftmost button, whose glyph is ink in the same bar.
             let (minimise, _) = libui::widget::title_button_centre(w, 2);
             let right = (minimise - libui::widget::TITLE_BUTTON_W as i32) as u32;
-            // **The text's own rows, not the whole bar.** The bar carries a rule along its
-            // bottom edge that runs its full width, so a scan over every row finds ink at
-            // whatever column it stops at and answers the same number for every subtitle —
-            // which is what the first version of this test did. The middle band holds the
-            // words and nothing else.
+            // The text's own rows: the bar's bottom rule spans the full width and would give every
+            // subtitle the same answer.
             let inset = bar.size.h / 4;
             let band = (bar.origin.y as u32 + inset)..(bar.bottom() as u32 - inset);
             (bar.origin.x as u32..right)
@@ -1776,9 +1156,6 @@ mod tests {
         let with_place = reach(&a);
         assert!(with_place > bare, "the bar reached {with_place} with a directory and {bare} without — no subtitle");
 
-        // **A second tab has its own shell and its own answer.** A directory kept on the
-        // window rather than on the tab passes everything above and shows the first tab's
-        // place in the second's bar.
         a.update(Msg::NewTab);
         assert_eq!(reach(&a), bare, "a fresh tab inherited the first tab's directory");
         a.feed(b"\x1b]7;/home/alice/Documents\x07");
@@ -1786,12 +1163,8 @@ mod tests {
         assert!(deeper > with_place, "the second tab's own, deeper, path did not reach the bar");
     }
 
-    /// A shell announces beside every prompt; only a different answer is a change.
-    ///
-    /// **What makes the console line one per `cd` rather than one per command.** The binary
-    /// logs on `take_directory_change`, and `cargo xtask check-terminal` cannot assert the
-    /// absence of a line — `expect` scans forward past whatever it does not match — so the
-    /// claim is made here.
+    /// Only a different answer is a change, so the console line is one per `cd`; `check-terminal`
+    /// cannot assert a line's absence.
     #[test]
     fn a_repeated_announcement_is_not_a_change() {
         let mut a = app();
@@ -1805,29 +1178,18 @@ mod tests {
         assert!(tab(&mut a, key).take_directory_change(), "the first answer is a change");
         assert!(!tab(&mut a, key).take_directory_change(), "and it is owed exactly once");
 
-        // The same place again, which is what every prompt after this one says.
         a.feed(b"\x1b]7;/home\x07");
         assert!(!tab(&mut a, key).take_directory_change(), "the same place is not a change");
 
-        // And a `cd` is.
         a.feed(b"\x1b]7;/home/alice\x07");
         assert!(tab(&mut a, key).take_directory_change(), "a different place is a change");
 
-        // **A sequence that announces nothing changes nothing**, even though the parser saw an
-        // `OSC`: a version that flagged every terminated sequence would pass everything above.
         a.feed(b"\x1b]0;a title\x07");
         assert!(!tab(&mut a, key).take_directory_change(), "a window title moved the terminal");
     }
 
-    /// The scrollbar's column carries the terminal's ground until there is history in it.
-    ///
-    /// **Painted and scanned, not read off the tree** (desktop refresh, Part K). The widget is
-    /// in the slot either way — the wrapper keeps its key and its size so the grid's box never
-    /// changes — so "is there a bar" is a question about pixels, and a tree test would pass for
-    /// a bar drawn in the ground's own colour as readily as for one that is absent.
-    ///
-    /// **Both halves, in one test**, because each is the other's control: hide the bar always
-    /// and the second half fails, hide it never and the first does.
+    /// Painted and scanned rather than read off the tree: the widget is in the slot either way.
+    /// Both halves in one test, each the other's control.
     #[test]
     fn the_scrollbar_appears_only_once_there_is_something_to_scroll() {
         use libdraw::format::PixelFormat;
@@ -1838,15 +1200,12 @@ mod tests {
         let ui = UiTheme::default();
         let (w, h) = (a.window_size().w, a.window_size().h);
 
-        // How many pixels in the bar's own column are neither the terminal's ground nor the
-        // window's face — that is, belong to a groove or a thumb.
         let bar_ink = |a: &App| {
             let e = a.view(&ui, None);
             let l = layout(&e, Rect::new(0, 0, w, h), &FixedCell { w: 8, h: 16 });
             let bar = locate(&e, &l, SCROLLBAR_KEY).expect("the scrollbar's slot is keyed");
             let mut fb = MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888));
             fb.clear(ui.background);
-            // The grid is a `Custom` node and draws nothing here; none of it is in this column.
             let mut custom = |_: u32, _: Rect, _: Rect, _: &mut MemFramebuffer| {};
             libui::paint::paint(&mut fb, &f, &ui, &e, &l, Rect::new(0, 0, w, h), &mut custom);
             let mut n = 0;
@@ -1862,14 +1221,10 @@ mod tests {
             (bar, n)
         };
 
-        // **A terminal nothing has scrolled off the top of.** The eight rows hold what is
-        // written, so there is no history and nothing to reach with a bar.
         assert!(!a.scroll().scrollable(), "precondition: nothing has scrolled away yet");
         let (bar, ink) = bar_ink(&a);
         assert_eq!(ink, 0, "an empty terminal drew a bar in {bar:?}");
 
-        // **And once output has run off the top**, which is the moment the control becomes
-        // worth having.
         produce(&mut a, 40);
         assert!(a.scroll().scrollable(), "precondition: there is history now");
         let (bar2, ink2) = bar_ink(&a);
@@ -1879,10 +1234,6 @@ mod tests {
 
     #[test]
     fn the_grip_asks_the_binary_for_a_resize_and_asks_once() {
-        // The same shape as the title bar's drag: `update` has no syscalls, so what a press
-        // produces is an outbox of one. Taking it clears it — a second `StartResize` for a
-        // gesture the compositor is already running would mean this client believes in a drag
-        // it is not in.
         let mut a = app();
         assert_eq!(a.take_resize_request(), None, "nothing owed before the corner is touched");
         a.update(Msg::ResizeWindow(RESIZE_RIGHT | RESIZE_BOTTOM));
@@ -1892,9 +1243,6 @@ mod tests {
 
     #[test]
     fn pressing_the_corner_produces_the_resize_and_not_a_move() {
-        // **Through the router, at the grip's own laid-out rectangle.** The message is carried
-        // by an `on_press_down` inside a `Stack` layer over the window's body; a press there
-        // must reach the grip rather than the title bar's drag or the grid's keys.
         let mut a = app();
         let (t, l, mut r) = window(&a);
         let e = a.view(&UiTheme::default(), None);
@@ -1917,16 +1265,10 @@ mod tests {
 
     #[test]
     fn the_maximise_button_alternates_between_maximised_and_normal() {
-        // **The only thing that ever sends `WINDOW_STATE_NORMAL`.** The shell has had a restore
-        // path since M9 Part B and nothing could reach it: the button was one-way, which was
-        // invisible while maximising did nothing and is a window you cannot get back the moment
-        // it does (M9 Part D).
         let mut a = app();
         a.update(Msg::RequestState(WINDOW_STATE_MAXIMIZED));
         assert_eq!(a.take_state_request(), Some(WINDOW_STATE_MAXIMIZED));
 
-        // The *button* now carries the other message — clicked where a person clicks it, so
-        // this also says the toggle is on the bar rather than only in the state.
         click_maximise(&mut a);
         assert_eq!(a.take_state_request(), Some(WINDOW_STATE_NORMAL));
         click_maximise(&mut a);
@@ -1935,9 +1277,8 @@ mod tests {
 
     #[test]
     fn minimising_does_not_disturb_which_way_the_maximise_button_points() {
-        // Three buttons, one message type: an arm that took every `RequestState` as an answer
-        // about maximisation would flip on a minimise, and the maximise button would then
-        // restore a window that had never been maximised.
+        // Three buttons, one message type: treating every `RequestState` as about maximisation
+        // would flip on a minimise.
         let mut a = app();
         a.update(Msg::RequestState(WINDOW_STATE_MAXIMIZED));
         a.update(Msg::RequestState(WINDOW_STATE_MINIMIZED));
@@ -1948,31 +1289,19 @@ mod tests {
 
     #[test]
     fn a_configure_takes_the_window_exactly_and_fits_the_grid_inside_it() {
-        // **The window is the size the manager asked for**, to the pixel — that is what makes
-        // "the maximised terminal is the work area" a true statement rather than one off by a
-        // rounding error in each axis. The grid is the whole cells that fit inside the chrome,
-        // and what is left over is background.
         let mut a = app();
         let m = a.metrics;
         let want = Size::new(1280, 752);
         assert!(a.resize(want).is_some(), "a new size is a change");
         assert_eq!(a.window_size(), want, "committed at exactly what was asked for");
-        // **The whole chrome, frame included** — `CHROME_W` and `CHROME_H`, the sums the terminal
-        // lays itself out with. These lines left the window's frame out and agreed only while the
-        // rounding happened to; the desktop refresh's Part B took the frame from 3 pixels to none
-        // and moved the answer by a row.
         assert_eq!(a.grid().cols(), ((1280 - CHROME_W) / m.cell_w) as usize);
         assert_eq!(a.grid().rows(), ((752 - CHROME_H) / m.cell_h) as usize);
-        // And the cells really do fit: chrome plus grid is no larger than the window.
         let g = m.pixel_size(a.grid().cols(), a.grid().rows());
         assert!(g.w + CHROME_W <= want.w && g.h + CHROME_H <= want.h);
     }
 
     #[test]
     fn a_configure_repeating_the_current_size_is_not_a_resize() {
-        // A `Configure` follows every *move* as well as every resize, carrying the origin. A
-        // client that reallocated its buffers and rewrapped its history for each one would do
-        // both per pointer motion of a drag.
         let mut a = app();
         let want = a.window_size();
         assert!(a.resize(want).is_none(), "same size, nothing to do");
@@ -1980,9 +1309,6 @@ mod tests {
 
     #[test]
     fn a_degenerate_configure_still_leaves_a_usable_grid() {
-        // Smaller than the chrome. A grid of zero columns has no valid cursor position, so the
-        // floor is one of each rather than a refusal — the compositor composites whatever it is
-        // given, and a client that panicked here would be one a manager could crash.
         let mut a = app();
         assert!(a.resize(Size::new(1, 1)).is_some());
         assert_eq!((a.grid().cols(), a.grid().rows()), (1, 1));
@@ -1991,17 +1317,12 @@ mod tests {
 
     #[test]
     fn a_scrolled_back_view_shows_the_same_text_after_a_resize() {
-        // The anchor is an absolute line number and a rewrap changes how many lines there are.
-        // This is `Grid::resize`'s `Reflow` reaching the one place outside the grid that holds
-        // such a number.
         let mut a = app();
         for i in 0..30 {
             a.feed(alloc::format!("line{i} and some more text here\r\n").as_bytes());
         }
-        // **An even line, because each of those 29-character lines is two rows at 20 columns**
-        // and nothing has been evicted: line 4 is where "line2" starts. Anchoring on a
-        // *continuation* row would make the assertion below wrong rather than the code — the
-        // row that then holds that text is the rejoined line, and the text is in its middle.
+        // An even line: each 29-character line is two rows at 20 columns, and a continuation row
+        // would make the assertion wrong.
         a.scroll_to_line(a.grid().oldest_line() + 4);
         let want = line(&a, 0);
         assert!(want.starts_with("line2"), "the anchor is where it is thought to be: {want:?}");
@@ -2015,18 +1336,12 @@ mod tests {
         );
     }
 
-    /// The characters **on show** at viewport `row`, trailing blanks trimmed.
-    ///
-    /// Through the view rather than the screen, so that a test about a scrolled-back terminal
-    /// asks what the user can see. The two are the same thing while the view follows the
-    /// bottom, which is every test written before scrollback existed.
     fn line(a: &App, row: usize) -> alloc::string::String {
         let s: alloc::string::String =
             (0..a.grid().cols()).map(|c| a.grid().view_cell(a.view_line(), row, c).map_or(' ', |x| x.ch)).collect();
         s.trim_end().into()
     }
 
-    /// Type `code` and return what the terminal would send to the tty.
     fn typed(a: &mut App, code: u16) -> alloc::vec::Vec<u8> {
         a.update(Msg::Key(key_ev(code, KEY_DOWN)));
         a.take_outbox()
@@ -2034,25 +1349,16 @@ mod tests {
 
     #[test]
     fn a_key_press_becomes_bytes_in_the_outbox_and_nothing_on_the_grid() {
-        // **What Part C changed.** A keystroke goes *out*; what appears on screen is whatever
-        // comes back. Before Part C this looped internally, which made the two halves
-        // indistinguishable — and a terminal that echoed locally would double every character
-        // the moment a real shell echoed too.
         let mut a = app();
         assert_eq!(typed(&mut a, 35), b"h", "h");
         assert_eq!(line(&a, 0), "", "the keystroke drew itself without being echoed");
 
-        // ...and the bytes coming back are what lands.
         a.feed(b"h");
         assert_eq!(line(&a, 0), "h");
     }
 
     #[test]
     fn the_terminal_translates_nothing_on_the_way_out() {
-        // Enter sends `\r` and only `\r`. The `\r\n` a user sees is the line discipline's
-        // `ONLCR`, which is on the other side of the channel since Part C — a terminal that
-        // translated here would send two bytes where a program expects one, and `read` of a
-        // single keystroke would return a spurious newline.
         let mut a = app();
         assert_eq!(typed(&mut a, libkern::abi::KEY_ENTER), b"\r");
     }
@@ -2066,8 +1372,6 @@ mod tests {
 
     #[test]
     fn output_from_the_program_is_what_reaches_the_grid() {
-        // The other direction, end to end through the parser: this is what `Tty::Output`
-        // delivers.
         let mut a = app();
         a.feed(b"hi\r\n\x1b[1mbold\x1b[m");
         assert_eq!(line(&a, 0), "hi");
@@ -2087,8 +1391,6 @@ mod tests {
 
     #[test]
     fn clear_keeps_the_scrollback_and_reset_does_not() {
-        // The distinction that makes two menu items rather than one: `Ctrl-L` clears what you
-        // can see, and a reset throws away the history too.
         let mut a = app();
         for _ in 0..10 {
             a.feed(b"x\r\n");
@@ -2104,7 +1406,6 @@ mod tests {
 
     #[test]
     fn reset_forgets_attributes_that_were_in_force() {
-        // A reset that only cleared cells would leave the *next* character bold and red.
         let mut a = app();
         a.feed(b"\x1b[1;31m");
         a.update(Msg::Reset);
@@ -2114,8 +1415,6 @@ mod tests {
 
     #[test]
     fn reset_also_abandons_a_half_finished_sequence() {
-        // The parser is state too. A reset that kept it would apply the tail of a sequence
-        // from before the reset to whatever came after.
         let mut a = app();
         a.feed(b"\x1b[1"); // mid-sequence
         a.update(Msg::Reset);
@@ -2131,8 +1430,6 @@ mod tests {
         assert_eq!(a.menus.open(), Some(1));
         a.update(Msg::MenuBar(1));
         assert_eq!(a.menus.open(), None, "the same word again closes it");
-        // And a *different* word moves the menu rather than closing it, which is the half a
-        // one-menu bar could not have.
         a.update(Msg::MenuBar(0));
         a.update(Msg::MenuBar(1));
         assert_eq!(a.menus.open(), Some(1));
@@ -2140,9 +1437,6 @@ mod tests {
 
     #[test]
     fn choosing_an_item_closes_the_menu() {
-        // A menu that stayed open after its item was chosen would cover the thing it just
-        // acted on. **Every row, not the two that used to remember**: the rule is asked of the
-        // table now, so this walks the table.
         let names = app().menu_table();
         let rows: Vec<Msg> = names
             .iter()
@@ -2154,28 +1448,19 @@ mod tests {
             .collect();
         assert!(rows.len() >= 5, "the table is not empty, or this test proves nothing");
         for msg in rows {
-            // Close would end the process in a real run; here it only sets a flag.
             let mut a = app();
             a.update(Msg::MenuBar(1));
             a.update(msg);
             assert_eq!(a.menus.open(), None, "{msg:?} left the menu open");
         }
-        // **The negative control**: the bar's own word is not a row, so it must *not* be caught
-        // by the rule above — otherwise no menu could ever be opened.
+        // Negative control: the bar's own word is not a row, or no menu could ever open.
         let mut a = app();
         a.update(Msg::MenuBar(0));
         assert_eq!(a.menus.open(), Some(0));
     }
 
-    /// Arrowing sideways changes both where the popup hangs and how big it must be.
-    ///
-    /// **Why this is a test rather than an observation** (PR #280 review, blocking 2): the binary
-    /// used to rebuild the popup window on `open().is_some()`, so moving from File to Edit left
-    /// the window at File's word and at File's size. `Child::present` lays the new tree into a
-    /// rectangle fixed when the window was created, so Edit's five rows were drawn into a
-    /// one-row window and four of them were clipped away. Nothing in the binary is host-testable;
-    /// what is, is that the two menus genuinely differ in both respects — which is what makes
-    /// rebuilding on a *change* necessary rather than tidy.
+    /// Arrowing sideways changes both where the popup hangs and how big it must be, so the binary
+    /// rebuilds the window on a change.
     #[test]
     fn the_two_menus_hang_from_different_words_and_measure_differently() {
         let mut a = app();
@@ -2199,40 +1484,18 @@ mod tests {
 
         assert!(file_at.is_some() && edit_at.is_some(), "both words were laid out");
         assert_ne!(file_at, edit_at, "the two menus hang from different words");
-        // **Different, not ordered.** File was one row when this was written and is five now;
-        // what the popup rebuild depends on is that the two menus measure *differently*, which is
-        // the property, and asserting which is taller made it a fact about today's menus.
         assert_ne!(edit_size, file_size, "the two menus measure the same, so a rebuild would be undetectable here");
     }
 
-    /// The chord a menu row advertises does what choosing that row does.
-    ///
-    /// **This drives `App::key`**, which is the point and is what the first version did not do
-    /// (PR #280 review, worth fixing 4). It built an event from a row's `Accel` and asked
-    /// `accel_match` about it — both sides of one table, with the terminal never consulted. That
-    /// pins the table against two rows on one chord, which is asserted below; it does not pin
-    /// that anything *routes* through it, and it passed with `App::key`'s `accel_match` deleted.
-    ///
-    /// **Stated as an equivalence rather than per row**, so it does not become a second list of
-    /// what each action does — which is the drift decision 2 exists to prevent.
+    /// Drives `App::key`, not `accel_match` on a row's own `Accel` (both sides of one table); an
+    /// equivalence, not a second list of what each action does.
     #[test]
     fn every_advertised_chord_does_what_its_row_says() {
-        /// Everything about a terminal that any of these rows can move.
         fn digest(a: &mut App) -> alloc::string::String {
             let clip = a.take_clip_request();
-            // **Every outbox**, New Window and Quit included — the negative control below has now
-            // caught three separate additions that changed nothing a narrower digest could see.
+            // Every outbox, tab count and current tab, selection extent and whether a find is open:
+            // each was something the negative control below caught the digest unable to see.
             let (nw, q) = (a.take_new_window(), a.take_quit());
-            // **The tab count and the current tab are in here** since M14 Part B: New Tab changes
-            // neither the grid nor the clipboard, so a digest without them would call it a row
-            // that does nothing and the negative control below would fail for the wrong reason.
-            // **The selection's extent, not merely whether there is one** — the fixture starts
-            // with a selection, so a bool cannot see Select All widening it, and the negative
-            // control below rejected the row for changing "nothing" (M14 Part E). That is the
-            // fourth addition this control has caught, each one an outbox or a field the digest
-            // could not observe.
-            // **And whether a find is open** — the sixth thing this control has caught the digest
-            // unable to see. Opening one changes no grid, no clipboard and no tab.
             let finding = a.find.as_ref().map(|f| alloc::string::String::from(f.text()));
             alloc::format!(
                 "{clip:?}|{}|{}|{:?}|{:?}|{}|{}|{nw}{q}|{finding:?}",
@@ -2244,7 +1507,6 @@ mod tests {
                 a.current_tab(),
             )
         }
-        /// A terminal with text on screen and five characters of it swept out, so Copy is live.
         fn selected() -> App {
             let mut a = app();
             a.feed(b"hello world");
@@ -2270,24 +1532,14 @@ mod tests {
             let (mut by_row, mut by_chord) = (selected(), selected());
             by_row.update(*msg);
             by_chord.update(Msg::Key(ev));
-            // Each digest exactly once: it drains the clipboard outbox, which is the only way to
-            // see it, so a second call on the same terminal reports its own emptiness.
             let (by_row, by_chord, untouched) = (digest(&mut by_row), digest(&mut by_chord), digest(&mut selected()));
             assert_eq!(by_chord, by_row, "{label}: {} does not do what choosing the row does", acc.label());
-            // **The negative control**: the two agreeing is only evidence if the row moved
-            // something. A terminal that ignored both would pass the assertion above.
+            // Negative control: the two agreeing is evidence only if the row moved something.
             assert_ne!(by_row, untouched, "{label} changes nothing, so this row proves nothing about routing");
         }
         assert_eq!(checked, 8, "the four tab and clipboard rows, Select All and Find, plus New Window and Quit");
     }
-    // --- Find, Clear Scrollback and the click runs (M14 Part E) --------------
 
-    /// A find takes the keys, walks the matches, and `Esc` gives them back.
-    ///
-    /// **The keys are the field's while it is open**, which matters more here than in an editor:
-    /// what a terminal normally does with a keystroke is send it to a program, so a field that
-    /// let characters through would type them into the shell while the person believed they were
-    /// searching.
     #[test]
     fn a_find_takes_the_keys_and_walks_the_matches() {
         let mut a = app();
@@ -2308,12 +1560,8 @@ mod tests {
         assert!(a.find.is_none(), "Esc closed it");
     }
 
-    /// A find that scrolls to a match in the scrollback **repaints**.
-    ///
-    /// **The case Find exists for is the one that was broken.** `Grid::select_from` damages
-    /// *screen* rows, and `damage_rows` drops every row whose viewport position is off the
-    /// bottom — so a view scrolled back by a whole screen reported no damage at all and the match
-    /// was selected on a screen nobody redrew (PR #287 review, blocking 1).
+    /// `select_from` damages screen rows and `damage_rows` drops those off the bottom, so a view
+    /// scrolled back a screen would select a match nobody redrew.
     #[test]
     fn a_find_that_scrolls_back_repaints_the_viewport() {
         let mut a = app();
@@ -2336,16 +1584,11 @@ mod tests {
         assert_eq!(a.damage_rows().len(), a.grid().rows(), "a viewport that moved repaints all of itself");
     }
 
-    /// A second press takes a word and a third takes the line; a fourth starts again.
-    ///
-    /// **Past three there is no larger unit**, and leaving a fourth click as "still a line" would
-    /// strand somebody who clicked once too often.
     #[test]
     fn click_runs_take_a_word_then_a_line() {
         let mut a = app();
         a.feed(b"hello world");
         let at = libdraw::geom::Point::new(4, 4);
-        // The first cell of the first row: inside `hello`.
         let press = |a: &mut App| {
             let h = a.metrics.cell_h as i32;
             a.update(Msg::GridPointer(ptr(POINTER_BUTTON, 1, POINTER_PRESSED, 0, h / 2)));
@@ -2363,10 +1606,8 @@ mod tests {
         press(&mut a);
         assert_eq!(a.grid().selected_text().as_deref(), Some("hello world"), "three take the line");
 
-        // **A fourth is a first**, not a fourth — and the *fifth* is what proves it. A fourth
-        // click selects nothing whether the run restarted or merely ran off the end of the
-        // match, so asserting on it distinguishes nothing; the difference shows on the next
-        // press, which is a word again only if the run went back to one.
+        // A fourth selects nothing either way; the fifth proves the run restarted, being a word
+        // again only then.
         a.note_press(at, 1_300);
         press(&mut a);
         assert_eq!(a.grid().selected_text(), None, "a fourth selects nothing either way");
@@ -2380,7 +1621,6 @@ mod tests {
         );
     }
 
-    /// Clearing the scrollback keeps the screen and forgets a scrolled-back view.
     #[test]
     fn clearing_the_scrollback_returns_the_view() {
         let mut a = app();
@@ -2390,31 +1630,22 @@ mod tests {
         let top = a.grid().top_line();
         assert!(a.grid().oldest_line() < top, "there is history");
 
-        // **Scrolled back first, which the first version of this test never did** — so it
-        // asserted only what `Grid::clear_scrollback` provides and passed with the view handling
-        // deleted (PR #287 review, worth fixing 6).
+        // Scrolled back first, or the test passes with the view handling deleted.
         a.tab_mut().view_top = Some(a.grid().oldest_line());
         assert_ne!(a.view_line(), top, "the view is in the history");
 
-        // Drain the frame's damage, as `main` does, so what follows is this action's alone.
         let _ = a.damage_rows();
 
         a.update(Msg::ClearScrollback);
         assert_eq!(a.grid().oldest_line(), top, "the history is gone");
         assert_eq!(a.view_line(), top, "and the view came back to the screen");
-        // **The repaint is the assertion.** `view_line` clamps on read, so it reports the screen
-        // whether or not the view was reset — the difference a person sees is whether anything is
-        // *redrawn*, and a viewport that moved from history to the screen without damage leaves
-        // every pixel stale (PR #287 review, worth fixing 6, second attempt).
+        // The repaint is the assertion: `view_line` clamps on read, so it reports the screen either
+        // way.
         assert_eq!(a.damage_rows().len(), a.grid().rows(), "moving the viewport repaints all of it");
     }
 
-    /// `check-terminal` clicks the Edit menu's `Clear` by number; this is that number.
-    ///
-    /// **The same guard `nxfiles` has, added after the same failure.** A gate cannot link this
-    /// crate, so it spells the row as a constant — and M14 Part E's three new rows moved `Clear`
-    /// from 3 to 6, which the gate discovered as "never saw `menu chose Clear`" after clicking
-    /// `Find` instead. This makes it wrong in a second rather than in a boot.
+    /// `check-terminal` clicks the Edit menu's `Clear` by number; this is that number, as the gate
+    /// cannot link this crate.
     #[test]
     fn the_gate_clicks_the_row_it_means() {
         // The constant in `tools/xtask/src/gates/terminal.rs`, as `MENU_ROW_KEY + n`.
@@ -2430,12 +1661,6 @@ mod tests {
         }
     }
 
-    /// The menu is **never** in the window's tree, open or closed.
-    ///
-    /// It was a `Stack` layer over the whole window until M6 C3 — hoisted there because a layer
-    /// inside the 24-pixel bar would have been clipped to 24 pixels. It is a `popup` *window*
-    /// now, parented to this one and clipped only by the screen, so the window's tree is the
-    /// body and nothing else.
     #[test]
     fn the_menu_is_not_a_layer_in_the_windows_tree() {
         for (open, anchor) in [(false, None), (true, Some(Rect::new(4, 0, 60, BAR_H))), (true, None)] {
@@ -2444,11 +1669,6 @@ mod tests {
                 a.menus.toggle(0);
             }
             a.menus.set_anchors(vec![anchor, None]);
-            // **The same shape whether the menu is open or not**, which is the property: the
-            // menu is a *window*, so opening it adds nothing here. The root is the framed window
-            // — its face, the content, the resize grip in the corner, and the border over all of
-            // them, since the desktop refresh's Part B moved the grip inside the frame (it was a
-            // stack of two, the body and the grip over it, from M9 Part E) — and that is fixed.
             let libui::element::Node::Stack(layers) = &a.view(&UiTheme::default(), None).node else {
                 panic!("open={open}: the window's tree is the framed window");
             };
@@ -2460,11 +1680,6 @@ mod tests {
         }
     }
 
-    /// The anchor sits directly under the menu item, and is what the popup is placed at.
-    ///
-    /// `locate` finds the item; the anchor it yields becomes the popup window's offset from its
-    /// parent's origin (`CreateWindowRequest::at`). The value is the same one the old in-window
-    /// `offset` consumed — what changed is who reads it.
     #[test]
     fn the_anchor_is_under_the_menu_item_and_escapes_the_bar() {
         let mut a = app();
@@ -2476,22 +1691,12 @@ mod tests {
         let item = locate(&view, &l, MENU_BAR_KEY).expect("the menu's first word is keyed");
         a.menus.set_anchors(vec![Some(item), None]);
         a.menus.toggle(0);
-        // The anchor the popup is created at is the word's bottom-left, which is what
-        // `MenuState` computes now — and the assertion below is about the *word*, so this
-        // checks the two agree rather than restating one of them.
         assert_eq!(a.menus.anchor(), Some((item.origin.x, item.bottom() as i32)));
 
-        // The popup hangs from the item's left edge, immediately below it. The menu bar sits
-        // *under* the title bar since M9 Part A, so "inside the bar" is measured from there —
-        // and inside the window's frame since M11 Part E batch 2b, which moves both bars down by
-        // the top border. Written as the sum rather than a number, so the next thing added to
-        // the chrome moves this with it.
         let bar_top = (WINDOW_CONTENT_Y + TITLE_BAR_H) as i32;
         assert!(item.origin.y >= bar_top, "the item is below the title bar");
         assert!(item.bottom() <= (bar_top as u32 + BAR_H) as i64, "the item is inside the menu bar");
 
-        // And the menu it will hold has a real size to be created at — measured, not guessed,
-        // because a popup window needs its extent before it exists.
         let menu = a.menu_view(&UiTheme::default(), None);
         let size = libui::layout::measure(&menu, libui::layout::Constraints::loose(bounds.size), &cell);
         assert!(size.w > 0 && size.h > 0, "the menu measures to something");
@@ -2503,17 +1708,9 @@ mod tests {
 
     #[test]
     fn the_window_is_the_grid_plus_its_chrome() {
-        // **Including the title bar, which is the whole of what client-side decorations means
-        // here**: the window grew by exactly its height, and the grid did not shrink. A client
-        // that added a title bar by taking the space out of its own content would have chrome
-        // that costs the user a row of text.
         let a = app();
         let g = a.metrics.pixel_size(20, 6);
         assert_eq!(a.window_size(), Size::new(g.w + CHROME_W, g.h + CHROME_H));
-        // **And the grid starts inside the frame**, not at the window's edge: the origin is what
-        // maps a pointer to a cell, so a frame the origin did not know about would offset every
-        // click by four pixels — invisible until a click near a cell boundary lands one column
-        // over (M11 Part E batch 2b).
         assert_eq!(
             a.grid_origin(),
             libdraw::geom::Point::new(
@@ -2522,8 +1719,6 @@ mod tests {
             ),
             "the grid starts below the bars and the tab strip, inside the frame and the pane's margin"
         );
-        // The window is the grid plus chrome, and the chrome is *all* of it — a test that added
-        // up only the parts it remembered would pass for a frame that took space from the grid.
         assert_eq!(
             a.window_size().h - a.grid_origin().y as u32 - g.h,
             GRID_PAD_Y + libui::widget::WINDOW_BORDER + libui::widget::WINDOW_FRAME,
@@ -2533,10 +1728,6 @@ mod tests {
 
     #[test]
     fn dragging_the_title_bar_asks_the_binary_for_a_move_and_asks_once() {
-        // `update` has no syscalls, so the request it produces is an outbox of one — the same
-        // shape as the typed bytes. Taking it clears it: a second `StartMove` for a gesture the
-        // compositor is already running would be answered, and would mean this client believes
-        // a drag it is not in.
         let mut a = app();
         assert!(!a.take_move_request(), "nothing is owed before the bar is touched");
         a.update(Msg::DragWindow);
@@ -2560,7 +1751,6 @@ mod tests {
         assert_eq!(s.total, a.grid().scrollback().len() as u32 + 6);
     }
 
-    /// A press-and-drag on the scrollbar to `y`, in widget-local coordinates.
     fn grab(a: &mut App, y: i32) {
         a.update(Msg::Scroll(PointerEvent {
             kind: librsproto::surface::POINTER_BUTTON,
@@ -2572,7 +1762,6 @@ mod tests {
         }));
     }
 
-    /// Fill the scrollback with numbered lines.
     fn produce(a: &mut App, n: usize) {
         for i in 0..n {
             a.feed(alloc::format!("{i}\r\n").as_bytes());
@@ -2594,17 +1783,12 @@ mod tests {
         assert_eq!(a.view_line(), a.grid().top_line(), "the bottom is the live screen again");
     }
 
-    /// Taking hold of the thumb does not move the view — the `scroll-grab` deferral, closed.
-    ///
-    /// **The application-level half.** `ScrollGrab`'s own tests pin the arithmetic; what this
-    /// says is that the terminal *uses* it — the wiring is one call, and the version before it
-    /// re-centred the thumb on every press, so aiming at the thumb threw away the screen you
-    /// were reading before the drag began.
+    /// The terminal uses `ScrollGrab`: re-centring the thumb on press would throw away the screen
+    /// being read.
     #[test]
     fn taking_hold_of_the_thumb_does_not_move_the_view() {
         let mut a = app();
         produce(&mut a, 200);
-        // Somewhere in the middle, so the thumb has track on both sides of it.
         let mid = a.track_h() as i32 / 2;
         grab(&mut a, mid);
         let parked = a.view_line();
@@ -2613,12 +1797,10 @@ mod tests {
 
         let (pos, len) = a.scroll().thumb(a.track_h());
         for (what, y) in [("its top", pos as i32), ("its bottom", pos as i32 + len as i32 - 1)] {
-            // A fresh press each time: two presses in a row, as a person aiming twice would.
             grab(&mut a, y);
             assert_eq!(a.view_line(), parked, "the press on {what} moved the view");
         }
 
-        // …and from there it follows the pointer.
         let before = a.view_line();
         a.update(Msg::Scroll(PointerEvent {
             kind: librsproto::surface::POINTER_MOTION,
@@ -2631,8 +1813,6 @@ mod tests {
 
     #[test]
     fn a_pointer_over_the_scrollbar_with_no_button_held_does_not_scroll() {
-        // The router delivers motion and crossings unconditionally. A bar that tracked the
-        // cursor would scroll whenever the pointer crossed it on its way somewhere else.
         let mut a = app();
         produce(&mut a, 40);
         grab(&mut a, 0);
@@ -2647,7 +1827,6 @@ mod tests {
         assert_eq!(a.view_line(), parked, "a hover moved the view");
     }
 
-    /// One turn of the wheel, `dz` detents.
     fn turn(a: &mut App, dz: i16) {
         a.update(Msg::Wheel(PointerEvent {
             kind: librsproto::surface::POINTER_WHEEL,
@@ -2670,12 +1849,8 @@ mod tests {
         assert_eq!(a.view_line(), bottom - 6, "positive is down, back toward the live screen");
     }
 
-    /// The wheel repaints the viewport, which is not the same as changing the grid.
-    ///
-    /// **The bug this exists for is silent**: the view moves and nothing redraws, so the
-    /// terminal shows the old rows until something else happens to damage them. `Grid`'s own
-    /// damage is about *cells that changed*, and scrolling changes none — it changes which
-    /// ones are on show. PR #287's review found exactly this omission twice in one part.
+    /// Scrolling changes which cells are on show, not the grid's own damage, so the wheel must
+    /// repaint the viewport explicitly.
     #[test]
     fn scrolling_by_wheel_repaints_the_viewport() {
         let mut a = app();
@@ -2697,10 +1872,6 @@ mod tests {
         assert_eq!(a.view_line(), a.grid().top_line(), "and past the live screen");
     }
 
-    /// A wheel of zero detents is not a scroll.
-    ///
-    /// Cheap, and it is the guard that keeps the handler honest about *why* it acts: every
-    /// other pointer kind reaching this message would carry `wheel == 0`.
     #[test]
     fn a_wheel_record_with_no_detents_does_not_move_the_view() {
         let mut a = app();
@@ -2711,17 +1882,9 @@ mod tests {
         assert_eq!(a.view_line(), parked);
     }
 
-    /// A huge delta scrolls a very long way in the right direction.
-    ///
-    /// **The arithmetic is the point**: `wheel` is `i16` and the compositor saturates it, so a
-    /// consumer that stalled while somebody scrolled receives thousands of detents. Multiplied
-    /// by three in `i16` that overflows, and the terminal jumps to the *top* of its history
-    /// when the person scrolled down.
-    ///
-    /// **20 000 rather than `i16::MAX`, and the difference is the whole test.** `32767 * 3`
-    /// wraps back round to `32765` — still positive, still downward — so a version of this
-    /// written with the largest value passes against the broken arithmetic it exists to
-    /// catch. Found by running that control: the value has to be one whose wrap is *visible*.
+    /// `wheel` is `i16` and saturates, so a stalled consumer gets thousands of detents. 20 000, not
+    /// `i16::MAX`: `32767 * 3` wraps to a still-positive `32765` and would pass against the broken
+    /// arithmetic.
     #[test]
     fn a_huge_wheel_delta_scrolls_down_rather_than_wrapping_upward() {
         let mut a = app();
@@ -2735,8 +1898,6 @@ mod tests {
 
     #[test]
     fn typing_snaps_the_view_back_to_the_bottom() {
-        // What makes scrollback usable rather than a trap: the alternative is a prompt that
-        // answers somewhere off screen, and a user who concludes the terminal has hung.
         let mut a = app();
         produce(&mut a, 40);
         grab(&mut a, 0);
@@ -2745,7 +1906,6 @@ mod tests {
         typed(&mut a, 35); // h
         assert_eq!(a.view_line(), a.grid().top_line(), "typing did not come back to the bottom");
 
-        // ...and a key that encodes to nothing does not, because it is not typing.
         grab(&mut a, 0);
         let scrolled = a.view_line();
         typed(&mut a, libkern::abi::KEY_LEFTSHIFT);
@@ -2754,8 +1914,6 @@ mod tests {
 
     #[test]
     fn output_arriving_does_not_drag_a_scrolled_back_view_with_it() {
-        // **The reason the anchor is a line number.** With an offset counted from the bottom,
-        // every line a program prints moves the reader's page up by one.
         let mut a = app();
         produce(&mut a, 40);
         grab(&mut a, 0);
@@ -2768,8 +1926,6 @@ mod tests {
 
     #[test]
     fn the_scrollbar_reports_where_the_view_is_not_only_how_much_there_is() {
-        // A bar whose offset was always the bottom would draw its thumb at the end while the
-        // user reads the top — the state and the picture disagreeing.
         let mut a = app();
         produce(&mut a, 40);
         let s = a.scroll();
@@ -2781,14 +1937,10 @@ mod tests {
 
     #[test]
     fn damage_is_reported_in_viewport_rows_and_drops_what_is_below_the_view() {
-        // The grid names *screen* rows and the viewport may be somewhere else entirely. Getting
-        // this wrong repaints the wrong row — or, scrolled far back, repaints rows for changes
-        // that are not on screen at all.
         let mut a = app();
         produce(&mut a, 40);
         let _ = a.damage_rows();
 
-        // Scrolled back by exactly one line: screen row 0 shows at viewport row 1.
         let back_one = a.grid().top_line() - 1;
         a.scroll_to_line(back_one);
         let _ = a.damage_rows(); // the scroll itself damaged everything
@@ -2797,7 +1949,6 @@ mod tests {
         assert!(d.contains(&1), "screen row 0 should show at viewport row 1, got {d:?}");
         assert!(!d.contains(&0), "and not at viewport row 0: {d:?}");
 
-        // Scrolled far back: the change is below the viewport and repaints nothing.
         grab(&mut a, 0);
         let _ = a.damage_rows();
         a.feed(b"\x1b[1;1Hy");
@@ -2806,8 +1957,6 @@ mod tests {
 
     #[test]
     fn moving_the_view_repaints_all_of_it() {
-        // Every row shows different text afterwards, so a scroll that damaged nothing would
-        // leave the old page on screen under a thumb that had moved.
         let mut a = app();
         produce(&mut a, 40);
         let _ = a.damage_rows();
@@ -2816,31 +1965,23 @@ mod tests {
         grab(&mut a, 0);
         assert_eq!(a.damage_rows().len(), a.grid().rows(), "a scroll must repaint the viewport");
 
-        // ...and snapping back does too.
         let _ = a.damage_rows();
         a.snap_to_bottom();
         assert_eq!(a.damage_rows().len(), a.grid().rows());
 
-        // A scroll that lands where the view already is repaints nothing.
         let _ = a.damage_rows();
         a.snap_to_bottom();
         assert!(a.damage_rows().is_empty(), "an idempotent snap still repainted");
     }
 
-    /// A key event as the compositor sends it.
-    ///
-    /// The window id is arbitrary: by the time a record reaches the application, `libsurface`
-    /// has already established that it belongs to this window.
     fn key_ev(code: u16, pressed: u16) -> KeyEvent {
         KeyEvent::new(1, code, pressed, 0)
     }
 
     #[test]
     fn the_grid_sits_in_a_margin_of_the_terminals_own_ground() {
-        // **What a screendump showed and no test did** (desktop refresh, Part B): the first
-        // version moved the cells in by the margin and left the margin itself showing the
-        // window's face, because a custom node covers only the cells it declares. So the pane is
-        // an element of its own, and this pins its three properties.
+        // A custom node covers only the cells it declares, so the pane is an element of its own;
+        // this pins its three properties.
         let a = app();
         let (t, _, _) = window(&a);
         fn find(w: &libui::diff::Widget, key: u64) -> Option<&libui::diff::Widget> {
@@ -2852,19 +1993,14 @@ mod tests {
         let root = t.root().expect("a frame");
         let grid = find(root, GRID_KEY).expect("the grid is keyed");
         let pane = find(root, GRID_PANE_KEY).expect("the pane is keyed");
-        // The cells' node starts where `grid_origin` says — the origin maps a pointer to a cell,
-        // and the cells are drawn from it.
         assert_eq!(grid.rect.origin, a.grid_origin(), "the cells are not where the origin says");
-        // The pane surrounds it by the margin.
         assert_eq!(grid.rect.origin.x - pane.rect.origin.x, GRID_PAD_X as i32);
         assert_eq!(grid.rect.origin.y - pane.rect.origin.y, GRID_PAD_Y as i32);
-        // And its ground is the terminal's, across the whole of it.
         let ground = pane.children.first().expect("the pane has its ground");
         assert_eq!(ground.print, libui::diff::Fingerprint::Fill(a.palette.background));
         assert_eq!(ground.rect, pane.rect, "the ground does not fill the pane");
     }
 
-    /// The tree, layout and router of a live window, with the grid focused as `main` does it.
     fn window(a: &App) -> (libui::diff::Tree, libui::layout::Layout, libui::route::Router) {
         let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
         let e = a.view(&UiTheme::default(), None);
@@ -2877,13 +2013,8 @@ mod tests {
         (t, l, r)
     }
 
-    /// Press and release the maximise button, at the coordinates a person would hit.
-    ///
-    /// **Through the router**, because the message the button carries is the thing under test:
-    /// reading the state instead would pass for a toggle that never reached the bar. The
-    /// buttons are laid out from the right edge — close, maximise, minimise — and
-    /// `title_button_centre` is where the second one is; this re-derived it from contiguous
-    /// 26-pixel slots until the desktop refresh's Part B gave them gaps.
+    /// Through the router: reading the state instead would pass for a toggle that never reached the
+    /// bar.
     fn click_maximise(a: &mut App) {
         let (t, l, mut r) = window(a);
         let e = a.view(&UiTheme::default(), None);
@@ -2907,16 +2038,8 @@ mod tests {
         }
     }
 
-    /// A wheel turned over the window scrolls it — **through the real tree and router**.
-    ///
-    /// **The half the direct-`update` tests above cannot reach.** They prove `App::wheel` does
-    /// the arithmetic; nothing in them says the view *carries* an `on_wheel`, so deleting it
-    /// leaves every one of them green and the terminal silently unable to scroll. Handlers get
-    /// dropped by exactly this kind of edit — the wheel hangs on the body's `dock`, which is a
-    /// node somebody restructuring the chrome would rebuild.
-    ///
-    /// **Over the grid and over the scrollbar**, because hanging it on the body is what makes
-    /// the second one work, and a version that put it on the grid alone would pass the first.
+    /// Through the real tree and router: direct-`update` tests cannot see `on_wheel` being deleted.
+    /// Over the grid and the scrollbar, as hanging it on the body is what makes the second work.
     #[test]
     fn a_wheel_over_the_window_scrolls_it_through_the_router() {
         for (what, x) in [
@@ -2952,10 +2075,6 @@ mod tests {
 
     #[test]
     fn a_key_repeat_reaches_the_grid_through_the_router_and_types() {
-        // **B4.** Repeat is generated compositor-side and already had a consumer that *prints*
-        // it; what is new is a repeat reaching a widget through `libui::route` and being
-        // encoded exactly like the press it continues. Held-down keys are how anyone deletes a
-        // line, so this is the difference between a demo and a terminal.
         let mut a = app();
         let (t, _l, r) = window(&a);
         let e = a.view(&UiTheme::default(), None);
@@ -2967,15 +2086,11 @@ mod tests {
         ] {
             a.update(msg.expect("the focused grid claims the key"));
         }
-        // Observed at the outbox, not on the grid: since Part C what a keystroke produces is
-        // bytes on their way to the shell, and what reaches the grid is whatever comes back.
         assert_eq!(a.take_outbox(), b"hhh", "a repeat did not type");
     }
 
     #[test]
     fn a_key_release_reaching_the_grid_types_nothing() {
-        // The other half, and the one that goes wrong silently: a terminal sends on the way
-        // down, so acting on the release too doubles every character typed.
         let mut a = app();
         let (t, _l, r) = window(&a);
         let e = a.view(&UiTheme::default(), None);
@@ -2986,10 +2101,6 @@ mod tests {
 
     #[test]
     fn the_menu_bars_accelerator_path_still_works_while_the_grid_holds_the_keyboard() {
-        // The grid claims every key it is given, so a key can only reach the chrome by the
-        // chrome being focused. Asserted because the alternative — a grid that declines some
-        // keys — is a decision, and this records that it was not taken: the menu is reached
-        // with the pointer, and `route`'s bubbling is there for a keyboard menu that M6 owns.
         let a = app();
         let (t, _l, r) = window(&a);
         let e = a.view(&UiTheme::default(), None);
@@ -3001,20 +2112,15 @@ mod tests {
         let a = app();
         let m = &a.metrics;
         let o = a.grid_origin();
-        // The whole grid.
         let all = rows_in(Rect::new(0, o.y, 100, m.cell_h * 6), o, m, 6);
         assert_eq!(all, alloc::vec![0, 1, 2, 3, 4, 5]);
 
-        // Exactly one row, and the *right* one: a clip on row 2's first pixel is row 2.
         let one = rows_in(Rect::new(0, o.y + (m.cell_h * 2) as i32, 100, m.cell_h), o, m, 6);
         assert_eq!(one, alloc::vec![2]);
 
-        // A clip that stops one pixel short of the next row must not include it — the
-        // off-by-one that repaints twice as much as it needs to.
         let short = rows_in(Rect::new(0, o.y, 100, m.cell_h), o, m, 6);
         assert_eq!(short, alloc::vec![0]);
 
-        // A clip straddling a boundary covers both.
         let two = rows_in(Rect::new(0, o.y + m.cell_h as i32 - 1, 100, 2), o, m, 6);
         assert_eq!(two, alloc::vec![0, 1]);
     }
@@ -3024,19 +2130,12 @@ mod tests {
         let a = app();
         let m = &a.metrics;
         let o = a.grid_origin();
-        // Entirely in the menu bar, above the grid.
         assert!(rows_in(Rect::new(0, 0, 100, BAR_H), o, m, 6).is_empty());
-        // Past the bottom: clamped to the last row rather than naming rows that do not exist.
         let past = rows_in(Rect::new(0, o.y, 100, m.cell_h * 99), o, m, 6);
         assert_eq!(*past.last().unwrap(), 5);
     }
-    /// The window's own tree survives being diffed frame to frame.
-    ///
-    /// **The class of bug this catches cost a QEMU round trip** (M14 Part A): `diff` rejects a
-    /// parent whose children are *partly* keyed, and adding one unkeyed sibling to a keyed row
-    /// makes the whole window undiffable — so nothing draws at all, in a way no layout or paint
-    /// test can see. The states below are the ones a menu bar introduces: shut, open, and a word
-    /// under the pointer, each of which changes a row's shape.
+    /// `diff` rejects a parent whose children are partly keyed, which makes the whole window
+    /// undiffable where no layout or paint test can see it.
     #[test]
     fn the_window_tree_diffs_across_the_menu_states() {
         let mut a = app();
@@ -3059,15 +2158,8 @@ mod tests {
         check(&mut a, None, &mut tree, "back to shut");
     }
 
-    // --- tabs (M14 Part B) --------------------------------------------------
-
-    /// A tab's `×` can have a key of its own, because no tab key sets the bit it uses.
-    ///
-    /// **The toolkit's half of a contract with this crate** (desktop refresh, after Part K):
-    /// `libui` keys a tab's close box as the tab's key with `TAB_CLOSE_BIT` set, so hover can tell
-    /// the `×` from the tab around it. That works only while this terminal's tab keys — numbered
-    /// from `TAB_KEY_BASE`, at most `MAX_TABS` of them live, and never reused — leave the bit
-    /// clear. Tested against the toolkit's constant rather than a copy of it.
+    /// `libui` keys a tab's close box as the tab's key with `TAB_CLOSE_BIT` set, so tab keys must
+    /// leave that bit clear.
     #[test]
     fn a_tabs_close_box_can_have_a_key_of_its_own() {
         let mut a = app();
@@ -3078,16 +2170,9 @@ mod tests {
             assert_eq!(t.key() & libui::widget::TAB_CLOSE_BIT, 0, "tab key {:#x} sets the close bit", t.key());
             assert_ne!(libui::widget::tab_close_key(t.key()), t.key());
         }
-        // Keys are never reused, so the bound that matters is how many a session could open.
         assert_eq!((TAB_KEY_BASE + (1 << 32)) & libui::widget::TAB_CLOSE_BIT, 0);
     }
 
-    /// A second tab is a second terminal, sharing nothing with the first.
-    ///
-    /// **The failure this is written against is inheritance, not absence.** Tabs built by adding
-    /// a strip over one grid look right until you type in the second one and the first scrolls;
-    /// the plan names it exactly — "getting it wrong is how a second tab inherits the first's
-    /// scrollback".
     #[test]
     fn a_second_tab_shares_nothing_with_the_first() {
         let mut a = app();
@@ -3101,19 +2186,15 @@ mod tests {
 
         a.feed(b"second");
         assert_eq!(line(&a, 0), "second");
-        // …and the first is untouched, which is the half that inheritance breaks.
         a.update(Msg::SelectTab(one));
         assert_eq!(line(&a, 0), "first", "the first tab kept its own screen");
 
-        // The outboxes are separate too: what is typed into one tab must not reach the other's
-        // shell. `take_outbox` is drained per tab by the binary, so this checks them by key.
         a.update(Msg::Key(KeyEvent::new(1, 30, KEY_DOWN, 0))); // `a`
         let outboxes: alloc::vec::Vec<(u64, usize)> =
             a.tabs_mut().iter_mut().map(|t| (t.key(), t.take_outbox().len())).collect();
         assert_eq!(outboxes, alloc::vec![(one, 1), (two, 0)], "only the current tab was typed at");
     }
 
-    /// Closing the last tab closes the window; closing any other leaves a tab current.
     #[test]
     fn closing_the_last_tab_closes_the_window() {
         let mut a = app();
@@ -3130,7 +2211,6 @@ mod tests {
         assert!(a.closing(), "the last tab takes the window with it");
     }
 
-    /// Closing the current tab picks a neighbour rather than an index that no longer exists.
     #[test]
     fn closing_the_current_tab_falls_to_a_neighbour() {
         let mut a = app();
@@ -3140,23 +2220,16 @@ mod tests {
         a.update(Msg::NewTab);
         let three = a.current_tab();
 
-        // The middle one: what takes its place is the one after it.
         a.update(Msg::SelectTab(two));
         a.update(Msg::CloseTab(two));
         assert_eq!(a.current_tab(), three, "the tab that took its place");
 
-        // The last one: there is nothing after it, so the one before.
         a.update(Msg::SelectTab(three));
         a.update(Msg::CloseTab(three));
         assert_eq!(a.current_tab(), one, "the end falls back rather than off");
         assert!(!a.closing());
     }
 
-    /// A key names a tab that has gone, and nothing happens to the tab that took its number.
-    ///
-    /// **Why keys are not indices**, asserted rather than asserted-in-a-comment: a message
-    /// naming a position outlives the frame that produced it, and the tab now at that position
-    /// is a different session.
     #[test]
     fn a_message_naming_a_closed_tab_does_nothing() {
         let mut a = app();
@@ -3166,7 +2239,6 @@ mod tests {
         a.update(Msg::CloseTab(two));
         assert_eq!(a.current_tab(), one);
 
-        // Both of these named the tab that is gone.
         a.update(Msg::SelectTab(two));
         assert_eq!(a.current_tab(), one, "selecting a closed tab changes nothing");
         a.update(Msg::CloseTab(two));
@@ -3174,13 +2246,8 @@ mod tests {
         assert_eq!(a.tab_labels().len(), 1);
     }
 
-    /// Switching to a tab repaints the grid, which no diff will do for it.
-    ///
-    /// **The grid is outside the diffed tree** — a `custom` node fingerprinted by kind and size —
-    /// so a switch, which changes neither, produces no damage at all and `paint` draws strictly
-    /// inside the damage rect. The strip would highlight the tab you clicked while the grid below
-    /// it kept the other tab's pixels (PR #282 review, blocking 1). `nxedit` has no such problem
-    /// because its content is inside the tree; this damage is the application's to declare.
+    /// The grid is outside the diffed tree, so a switch reports no damage and the application must
+    /// declare it.
     #[test]
     fn switching_tabs_repaints_the_grid() {
         let mut a = app();
@@ -3192,13 +2259,10 @@ mod tests {
         a.feed(b"second");
         let _ = a.damage_rows(); // …and the frame that drew tab two
 
-        // Nothing has happened to tab one's grid since it was last drawn, so its *own* damage is
-        // empty — which is exactly why the switch has to declare it.
         a.update(Msg::SelectTab(one));
         assert_eq!(a.damage_rows().len(), a.grid().rows(), "switching tabs left the other tab's pixels on screen");
     }
 
-    /// Closing a tab repaints too: the survivor's pixels are as stale as a switch's.
     #[test]
     fn closing_the_current_tab_repaints_the_survivor() {
         let mut a = app();
@@ -3213,13 +2277,8 @@ mod tests {
         assert_eq!(a.damage_rows().len(), a.grid().rows(), "the survivor was not repainted");
     }
 
-    /// A `Configure` reshapes **every** tab, not the one on screen.
-    ///
-    /// **A window has one shape and every tab is drawn into it** (PR #282 review, blocking 2). A
-    /// background tab left at the old `cols` is a grid the next `view()` sizes from stale
-    /// numbers — a band of ground down two edges, and a shell wrapping at a column count nothing
-    /// has any more. Shrinking is worse: the stale grid is then larger than the area it is laid
-    /// into. It compounds, because `open_tab` takes its shape from the current tab.
+    /// A background tab left at the old shape is drawn from stale numbers; shrinking is worse, and
+    /// `open_tab` takes its shape from the current tab.
     #[test]
     fn a_resize_reshapes_every_tab() {
         let mut a = app();
@@ -3238,17 +2297,12 @@ mod tests {
             now,
             "a background tab kept the old shape and would be drawn from stale numbers"
         );
-        // …and a tab opened afterwards inherits the *current* shape rather than a stale one.
         a.update(Msg::NewTab);
         assert_eq!((a.grid().cols(), a.grid().rows()), now);
     }
 
-    /// A window holds at most `MAX_TABS`, and says so rather than spinning.
-    ///
-    /// **The cap is `MAX_WAIT_HANDLES - 1`** because `main` waits on the compositor plus one
-    /// handle per tab: past the limit the kernel rejects the wait, which returns immediately and
-    /// turns the render loop into a spin (PR #282 review, worth fixing 4). Holding
-    /// `Ctrl+Shift+T` is enough to reach it, since a key repeat opens a tab.
+    /// The cap is `MAX_WAIT_HANDLES - 1`: past it the kernel rejects the wait and the render loop
+    /// spins. Holding `Ctrl+Shift+T` reaches it.
     #[test]
     fn a_window_holds_at_most_max_tabs() {
         let mut a = app();
@@ -3257,17 +2311,9 @@ mod tests {
         }
         assert_eq!(a.tabs().len(), MAX_TABS, "the cap did not hold");
         const { assert!(MAX_TABS < libkern::abi::MAX_WAIT_HANDLES, "…and it leaves room for the window") };
-        // The refusal is visible: the last one said so in the grid rather than doing nothing.
         assert!((0..a.grid().rows()).any(|r| line(&a, r).contains("no more tabs")), "the refusal was silent");
     }
 
-    /// **Every** menu in the bar can be opened, not just the ones a test happened to name.
-    ///
-    /// **The View menu did nothing for two milestones** (M15 Part E). `MENU_COUNT` was a
-    /// constant beside a `menu_table` that grew: the binary asked for two anchors, the third
-    /// menu's `anchor()` answered `None`, and the popup had nowhere to hang from — a bar word
-    /// that opened nothing, silently. The count is derived now, and this walks the *whole* bar
-    /// rather than a menu chosen when the test was written.
     #[test]
     fn every_menu_in_the_bar_has_somewhere_to_hang_from() {
         let mut a = app();
@@ -3277,8 +2323,6 @@ mod tests {
         let l = layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
         let n = a.menu_count();
         assert!(n >= 2, "a bar with fewer than two menus is not this window's");
-        // **Through the method the binary calls**, which is the whole point of it being a
-        // method: the loop that was wrong lived in a `main.rs` no test builds.
         a.place_menus(&view, &l);
         for i in 0..n {
             a.menus.toggle(i);

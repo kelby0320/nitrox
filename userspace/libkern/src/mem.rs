@@ -1,28 +1,15 @@
 //! Freestanding `mem*` intrinsics for the bare userspace target.
 //!
-//! `core`/`alloc` (and any `[u8; N]` copy/compare the compiler lowers to a
-//! libcall) reference `memcpy`/`memmove`/`memset`/`memcmp`. On this
-//! `x86_64-unknown-nitrox`, non-PIE/`/DISCARD/`-`.plt` target the
-//! `compiler_builtins` versions resolve incorrectly — the `memcpy` symbol lands in
-//! the middle of an unrelated function, so a call jumps into garbage and faults
-//! (the 2026-06-22 codegen hazard, now hit for real by init's `alloc` use). We
-//! provide our own **strong** definitions, which override `compiler_builtins`'
-//! weak ones, so every userspace binary that links `libkern` gets correct
-//! intrinsics.
+//! On the non-PIE, `/DISCARD/`-`.plt` `x86_64-unknown-nitrox` target the `compiler_builtins`
+//! `mem*` symbols resolve incorrectly (`memcpy` lands in the middle of an unrelated function),
+//! so these **strong** definitions override its weak ones.
 //!
-//! The loops use `read_volatile`/`write_volatile` so LLVM's loop-idiom recogniser
-//! cannot fold them back into a `memcpy`/`memset` call (which would recurse). The
-//! copies here are small and not hot (init's `alloc`, the demos), so the lost
-//! vectorisation does not matter.
+//! The loops use `read_volatile`/`write_volatile` so LLVM's loop-idiom recogniser cannot fold
+//! them back into a `memcpy`/`memset` call (which would recurse). Built only for the bare target.
 //!
-//! Built only for the bare target (`cfg(not(test))`): under `cargo test` libkern
-//! is a host `std` crate and must not redefine libc's `mem*`.
-//!
-//! The signatures use [`c_void`] rather than `u8` because rustc checks these
-//! well-known runtime symbols against the shapes the standard library expects, and
-//! warns on a mismatch. (They also mean `-Z build-std-features=compiler-builtins-mem`
-//! must stay **off** in the userspace build — these strong definitions are the ones
-//! we want, and enabling that feature would define the same symbols twice.)
+//! The signatures use [`c_void`] because rustc checks these runtime symbols against the shapes
+//! the standard library expects. `-Z build-std-features=compiler-builtins-mem` must stay **off**
+//! in the userspace build, or the same symbols would be defined twice.
 
 use core::ffi::c_void;
 

@@ -1,47 +1,30 @@
 //! The [`UserspaceServerReg`] kernel object — the kernel's registration record
-//! for a **Userspace Server** (the second kind of resource server; the first,
-//! a Kernel Server, is in [`crate::object::kernel_server`]).
+//! for a **Userspace Server** (the other kind of resource server is a Kernel Server, in
+//! [`crate::object::kernel_server`]).
 //!
-//! A [`BindingTarget::UserspaceServer`](crate::object::namespace::BindingTarget)
-//! binding holds an `ObjectRef` to one of these. It owns the kernel's private
-//! end of an IPC channel (an [`IpcChannel`] whose *peer* the server process
-//! services) and the small **pending-lookup table** that correlates an
-//! in-flight forwarded `sys_ns_lookup` with the reply that completes it. See
-//! `docs/architecture/namespace-and-resource-servers.md` § "Userspace Servers"
-//! and `docs/spec/rsproto-namespace-ops.md`.
+//! A [`BindingTarget::UserspaceServer`](crate::object::namespace::BindingTarget) binding holds
+//! an `ObjectRef` to one. It owns the kernel's private end of an IPC channel (an
+//! [`IpcChannel`] whose *peer* the server process services) and the **pending tables**
+//! correlating in-flight forwarded requests, by `request_id`, with the replies that complete
+//! them. See `docs/architecture/namespace-and-resource-servers.md` § "Userspace Servers" and
+//! `docs/spec/rsproto-namespace-ops.md`.
 //!
-//! ## How a forwarded lookup flows
-//!
-//! 1. `sys_ns_lookup` resolves a path to a `UserspaceServer` binding and calls
-//!    [`crate::sched::us_forward_originate`], which — under `SCHED` —
-//!    [`begin`](UserspaceServerReg::begin)s a pending entry (assigning a
-//!    `request_id`) and pushes a `Namespace::Resolve` request into the server's
-//!    inbox (the peer of [`endpoint`](UserspaceServerReg::endpoint_ptr)). The
-//!    lookup's `PendingOperation` is left **uncompleted**.
-//! 2. The server replies on its endpoint. The kernel detects that the send's peer
-//!    is this registration's endpoint (the `IpcChannel` back-pointer), drains the
-//!    reply inline in the send syscall,
-//!    [`take_pending_matching`](UserspaceServerReg::take_pending_matching) the
-//!    request, cross-context-installs the transferred `MemoryObject`, and
-//!    completes the lookup PO.
+//! `sys_ns_lookup` forwards a resolve via [`crate::sched::us_forward_originate`], leaving the
+//! lookup's `PendingOperation` **uncompleted**; the server's reply is drained inline in its
+//! send syscall (the peer is this endpoint, found by the `IpcChannel` back-pointer), which
+//! takes the matching entry and completes the PO.
 //!
 //! ## Mutation discipline
 //!
-//! Exactly like [`IpcChannel`] / [`Timer`](crate::object::Timer): all interior
-//! state lives in an [`UnsafeCell`] touched **only while the rank-1 `SCHED` lock
-//! is held**. The owned `endpoint` / pending `po` `ObjectRef`s are released only
-//! when the registration is destroyed (the `KBox` drop, run by `dispatch_destroy`
-//! **outside** `SCHED`) or moved out of a `take_pending_*` return for the caller
-//! to drop outside `SCHED` — never dropped under the lock.
+//! As for [`IpcChannel`] / [`Timer`](crate::object::Timer): all interior state lives in an
+//! [`UnsafeCell`] touched **only under the rank-1 `SCHED` lock**. The owned `endpoint` and
+//! pending `po` `ObjectRef`s are dropped only when the registration is destroyed
+//! (`dispatch_destroy`, **outside** `SCHED`) or by the caller of a `take_pending_*`, never
+//! under the lock.
 //!
-//! The pending table holds up to [`US_PENDING_MAX`] outstanding lookups (and,
-//! independently, fills), correlated to replies by `request_id`. A single server
-//! endpoint is shared by *many* namespace bindings — one connection, many names
-//! (bind-mount semantics; see `docs/architecture/namespace-and-resource-servers.md`
-//! § Subtree scoping) — so several consumers can have a request in flight at once; a
-//! full table fails a new request `WouldBlock`. (Slice 7 shipped this at N = 1, when
-//! init issued lookups one at a time; sharing one endpoint across bindings made
-//! concurrent in-flight requests real, so the slot became a small table.)
+//! One endpoint is shared by *many* bindings (`docs/architecture/namespace-and-resource-servers.md`
+//! § Subtree scoping), so up to [`US_PENDING_MAX`] lookups and, independently, fills can be in
+//! flight; a full table fails a new request `WouldBlock`.
 
 use core::cell::UnsafeCell;
 
@@ -52,18 +35,14 @@ use crate::mm::PhysAddr;
 use crate::object::header::KObjectHeader;
 use crate::object::{FileObject, Forgotten, ObjectRef};
 
-/// Largest lookup suffix a [`PendingLookup`] stores inline (so a lazy `File`
-/// resolve can name the file in its page-cache producer without allocating under
-/// `SCHED`). A longer suffix is recorded with its true `suffix_len` but a
-/// truncated buffer — harmless for an eager `MEMOBJ` reply (the suffix is unused),
-/// but a `FILE` reply for such a path fails `TooLarge` (see the completion path).
-/// 256 bytes covers every milestone path; a heap-backed suffix is a later concern.
+/// Largest lookup suffix a [`PendingLookup`] stores inline (no allocation under `SCHED`). A
+/// longer one keeps its true `suffix_len` but a truncated buffer: harmless for an eager
+/// `MEMOBJ` reply, but a `FILE` reply for it fails `TooLarge`.
 pub const LOOKUP_SUFFIX_MAX: usize = 256;
 
 /// **What a forwarded resolve asks its server to do**, kept with the pending lookup so a
-/// `SUBNAMESPACE` reply can send the same request on into another namespace (administration Part
-/// C.4). By then the syscall that started it is gone, and with it the user pointers its
-/// `ResolveOp` carried; these are values.
+/// `SUBNAMESPACE` reply can send the same request on into another namespace. The syscall that
+/// started it is gone by then, and with it its user pointers; these are values.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ForwardOp {
     /// A plain lookup.
@@ -77,8 +56,8 @@ pub enum ForwardOp {
     },
 }
 
-/// A forwarded resolve's request, beyond its suffix: the operation, a rename's destination —
-/// mount-relative, as sent — and how many `SUBNAMESPACE` replies it has already followed.
+/// A forwarded resolve's request, beyond its suffix: the operation, a rename's mount-relative
+/// destination, and how many `SUBNAMESPACE` replies it has already followed.
 #[derive(Copy, Clone)]
 pub struct Forward<'a> {
     pub op: ForwardOp,
@@ -91,28 +70,21 @@ impl Forward<'_> {
     pub const PLAIN: Forward<'static> = Forward { op: ForwardOp::Plain, dest: b"", depth: 0 };
 }
 
-/// One outstanding forwarded lookup: everything needed to complete its
-/// `PendingOperation` when the server's reply arrives. Moved out of the table by
-/// [`take_pending_matching`](UserspaceServerReg::take_pending_matching) /
-/// [`take_pending_any`](UserspaceServerReg::take_pending_any); its `po` is then
-/// dropped by the caller **outside** `SCHED`.
+/// One outstanding forwarded lookup: what completing its `PendingOperation` needs when the
+/// reply arrives. Moved out by `take_pending_matching` / `take_pending_next`; the caller drops
+/// its `po` **outside** `SCHED`.
 pub struct PendingLookup {
-    /// The `request_id` the kernel stamped on the Resolve request; the reply must
-    /// echo it.
+    /// The `request_id` stamped on the Resolve request; the reply must echo it.
     pub(crate) request_id: u64,
-    /// The lookup's `PendingOperation` (a clone of the handle the client holds),
-    /// pinning it so the reply can complete it even if the client closed its handle.
+    /// The lookup's `PendingOperation` (a clone of the client's), pinned so the reply can
+    /// complete it even if the client closed its handle.
     pub(crate) po: ObjectRef,
     /// The client process to install the resolved handle into (cross-context).
     pub(crate) owner_pid: u32,
-    /// The `Rights` the lookup requested; the installed handle's rights are
-    /// `requested ∩ (the rights the server granted on the transferred object)`.
+    /// The `Rights` the lookup requested; the installed handle gets `requested ∩ granted`.
     pub(crate) requested: Rights,
-    /// The lookup's path suffix, stored inline (`suffix[..suffix_len.min(MAX)]`).
-    /// A `FILE` reply uses it to name the file in the page-cache producer; an eager
-    /// `MEMOBJ` reply ignores it. `suffix_len` is the *true* length even if it
-    /// exceeds [`LOOKUP_SUFFIX_MAX`] (then the buffer is truncated and a `FILE`
-    /// reply fails `TooLarge`).
+    /// The path suffix, inline (`suffix[..suffix_len.min(MAX)]`); `suffix_len` is the *true*
+    /// length. A `FILE` reply names its file with it; an eager `MEMOBJ` reply ignores it.
     pub(crate) suffix: [u8; LOOKUP_SUFFIX_MAX],
     pub(crate) suffix_len: u16,
     /// What the request asked for, so a `SUBNAMESPACE` reply can ask it again elsewhere.
@@ -131,22 +103,17 @@ impl PendingLookup {
         if n > LOOKUP_SUFFIX_MAX { None } else { Some(&self.dest[..n]) }
     }
 
-    /// The stored suffix bytes, or `None` if the true length overran
-    /// [`LOOKUP_SUFFIX_MAX`] (the inline buffer is then incomplete — a `FILE` reply
-    /// for it cannot recover the path).
+    /// The stored suffix bytes, or `None` if the true length overran [`LOOKUP_SUFFIX_MAX`] (the
+    /// path is then unrecoverable).
     pub(crate) fn suffix(&self) -> Option<&[u8]> {
         let n = self.suffix_len as usize;
         if n > LOOKUP_SUFFIX_MAX { None } else { Some(&self.suffix[..n]) }
     }
 }
 
-/// One outstanding forwarded **page-cache fill** (`File::ReadRange`): everything the
-/// reply needs to land the page and wake the faulting thread. Parallels
-/// [`PendingLookup`] but for the fill seam — the kernel originates the range-read
-/// when a `FileObject` page faults, parks the faulter on `po`, and the reply copies
-/// the bytes into `frame`, marks the page ready, and completes `po`. Moved out by
-/// [`take_pending_fill_matching`](UserspaceServerReg::take_pending_fill_matching);
-/// its `po` / `file_obj` are dropped by the caller **outside** `SCHED`.
+/// One outstanding forwarded **page-cache fill** (`File::ReadRange`): the faulting thread is
+/// parked on `po`, and the reply copies the bytes into `frame`, marks the page ready and
+/// completes `po`. The caller drops `po` / `file_obj` **outside** `SCHED`.
 pub struct PendingFill {
     /// The `request_id` stamped on the `ReadRange` request; the reply echoes it.
     pub(crate) request_id: u64,
@@ -160,24 +127,17 @@ pub struct PendingFill {
     pub(crate) index: usize,
 }
 
-/// Concurrent outstanding forwarded requests a single registration tracks, for
-/// lookups and (independently) for fills. Because one server endpoint is now shared
-/// by *many* namespace bindings (bind-mount semantics — see
-/// `docs/architecture/namespace-and-resource-servers.md` § Subtree scoping), several
-/// consumers can have a lookup/fill in flight at once; a full table fails a new
-/// request `WouldBlock` (the caller retries). Small and pre-sized — the fs-server
-/// drains quickly, so the in-flight count is low.
+/// Concurrent outstanding forwarded requests a registration tracks, for lookups and
+/// (independently) fills. One endpoint is shared by *many* bindings, so several can be in
+/// flight; a full table fails a new request `WouldBlock` (the caller retries).
 pub const US_PENDING_MAX: usize = 8;
 
 struct Inner {
     /// The kernel's IPC endpoint; its peer is the endpoint the server services.
     endpoint: ObjectRef,
-    /// Outstanding forwarded lookups (up to [`US_PENDING_MAX`]), correlated to
-    /// replies by `request_id`. A free slot is `None`.
+    /// Outstanding forwarded lookups, by `request_id`; a free slot is `None`.
     pending: [Option<PendingLookup>; US_PENDING_MAX],
-    /// Outstanding forwarded page-cache fills (up to [`US_PENDING_MAX`]). Separate
-    /// from `pending` — a lookup and a fill correlate by distinct `request_id`s and
-    /// route by reply op.
+    /// Outstanding forwarded fills; separate from `pending`, routed by reply op.
     pending_fill: [Option<PendingFill>; US_PENDING_MAX],
     /// Monotonic `request_id` stamp (shared across lookups and fills).
     next_id: u64,
@@ -189,31 +149,27 @@ struct CachedFile {
     /// The object, **weakly**: a lookup must `try_acquire` it. The object's `Drop` takes its
     /// entry out, by address, so an entry never outlives the memory it names.
     obj: *mut (),
-    /// **Its server forgot it with I/O of it in flight** (`File::Forget`). The entry stays so a
-    /// second `Forget` of the id finds the object and waits on the first one's answer. No
-    /// resolve or sync sees it, and it goes with the object.
+    /// **Its server forgot it with I/O in flight** (`File::Forget`): the entry stays so a second
+    /// `Forget` finds the object and waits on the first one's answer. No resolve or sync sees
+    /// it, and it goes with the object.
     forgotten: bool,
 }
 
-/// The kernel's registration record for one Userspace Server.
-///
-/// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
+/// The kernel's registration record for one Userspace Server (`#[repr(C)]`, header first).
 #[repr(C)]
 pub struct UserspaceServerReg {
     header: KObjectHeader,
-    /// Self-check sentinel; a live object always reads [`UserspaceServerReg::MAGIC`].
     magic: u64,
-    /// All mutable state, reached only under `SCHED`.
     inner: UnsafeCell<Inner>,
-    /// **The file cache: one `FileObject` per file this server's replies named**, keyed by
-    /// the file id a `FILE_BLOCKS` reply carries (administration Part C.1). Every resolve of a
-    /// file shares its one object, and a sync or an unmount can enumerate them. An index only
-    /// — the objects are held by their users, or by themselves while dirty.
+    /// **The file cache: one `FileObject` per file this server's replies named**, keyed by the
+    /// id a `FILE_BLOCKS` reply carries, so every resolve shares one object and a sync or unmount
+    /// can enumerate them. An index only: users hold the objects, or they hold themselves while
+    /// dirty.
     ///
-    /// Its own lock, not `SCHED`, since the objects it hands out are cloned and dropped:
-    /// ranked [`Registry`](LockRank::Registry), above the page caches it indexes — it
-    /// allocates while held, and is never taken inside a `FileObject`'s lock. **No reference
-    /// is ever dropped under it**, since the last one would re-enter it from `FileObject::drop`.
+    /// Its own lock, not `SCHED`, since the objects it hands out are cloned and dropped: ranked
+    /// [`Registry`](LockRank::Registry), above the page caches it indexes (it allocates while
+    /// held), and never taken inside a `FileObject`'s lock. **No reference is ever dropped
+    /// under it**, since the last one would re-enter it from `FileObject::drop`.
     files: SpinLock<KVec<CachedFile>>,
 }
 
@@ -227,10 +183,9 @@ impl UserspaceServerReg {
     /// Sentinel written into [`UserspaceServerReg::magic`] at construction.
     pub const MAGIC: u64 = 0x55_73_53_72_76_52_67_21; // "UsSrvRg!"
 
-    /// Allocate a registration owning `endpoint` (the kernel's IPC endpoint),
-    /// refcount one, with an empty pending table. The caller installs the back-
-    /// pointer from `endpoint` to this object (under `SCHED`) and binds the
-    /// returned object as a `UserspaceServer` target.
+    /// Allocate a registration owning `endpoint` (the kernel's IPC endpoint), refcount one, with
+    /// empty pending tables. The caller installs the back-pointer from `endpoint` to this
+    /// object (under `SCHED`) and binds it as a `UserspaceServer` target.
     pub fn try_new(endpoint: ObjectRef) -> Result<KBox<Self>, AllocError> {
         debug_assert_eq!(endpoint.object_type(), KObjectType::IpcChannel);
         KBox::try_new(Self {
@@ -248,11 +203,10 @@ impl UserspaceServerReg {
 
     // --- The file cache (its own lock; never under `SCHED`) --------------
 
-    /// **The one object for file `id`, or `obj` becomes it.** If a live object for `id` is
-    /// cached, a new reference to it is returned and `obj` is left for the caller to drop —
-    /// outside this lock. Otherwise `obj` is entered under `id` (replacing an entry whose
-    /// object is mid-teardown) and `Ok(None)` returned. `Err` only if the index cannot grow.
-    /// A forgotten entry is passed by: its file has been freed, or is about to be.
+    /// **The one object for file `id`, or `obj` becomes it.** A live cached object is returned as
+    /// a new reference, `obj` left for the caller to drop outside this lock; otherwise `obj` is
+    /// entered under `id` (replacing a mid-teardown entry) and `Ok(None)` returned. `Err` only if
+    /// the index cannot grow. A forgotten entry is passed by: its file is freed or about to be.
     pub fn cache_get_or_insert(&self, id: u64, obj: &ObjectRef) -> Result<Option<ObjectRef>, AllocError> {
         debug_assert_eq!(obj.object_type(), KObjectType::FileObject);
         let mut g = self.files.lock();
@@ -276,12 +230,10 @@ impl UserspaceServerReg {
     /// A live entry is the file the server means. Failing that, the entry an earlier `Forget`
     /// left because I/O of the file was in flight: this is a second `Forget` while the first
     /// waits, and [`FileObject::forget`] hands it the first one's PO. The entry is marked
-    /// forgotten, so no later resolve of the id — which after a free may name a new file —
-    /// and no sync finds the object. It goes now if nothing is in flight, else with the object.
-    ///
-    /// The first version took the entry out on every `Forget`. A second then found nothing and
-    /// was answered at once, with the first one's IRP still in flight (PR #335 review).
-    /// [`Forgotten::Now`] if the id is not cached.
+    /// forgotten, so no later resolve of the id (which after a free may name a new file) and
+    /// no sync finds the object; it goes now if nothing is in flight, else with the object.
+    /// Taking the entry out on every `Forget` would answer a second one at once, with the
+    /// first one's IRP still in flight. [`Forgotten::Now`] if the id is not cached.
     pub fn forget_file(&self, id: u64, answer: &ObjectRef) -> Forgotten {
         let obj = {
             let mut g = self.files.lock();
@@ -351,22 +303,13 @@ impl UserspaceServerReg {
         self.magic == Self::MAGIC
     }
 
-    // --- Scheduler-only accessors --------------------------------------
-    //
-    // SAFETY (shared by all): `reg` addresses a live `UserspaceServerReg` (pinned
-    // by an `ObjectRef` the caller holds), and the caller holds `SCHED`, which —
-    // single-CPU — serialises all access to `inner`.
+    // SAFETY (shared by all): `reg` is a live `UserspaceServerReg` pinned by the caller's
+    // `ObjectRef`, and the caller holds `SCHED`, which serialises all access to `inner`.
 
-    /// Is `reg` a live registration? Reads the [`MAGIC`](Self::MAGIC) sentinel.
-    ///
-    /// The raw-pointer counterpart of [`magic_ok`](Self::magic_ok), for the case that
-    /// method cannot serve: when all you hold is a pointer that *might* be dangling,
-    /// forming the `&self` it needs is already unsound.
-    ///
-    /// The sentinel existed but was never read by anything, which is how a
-    /// dangling back-pointer went unnoticed: `IpcChannel.us_reg` is a raw pointer
-    /// nothing clears, so an endpoint that outlives its registration follows it
-    /// into freed memory. `ipc_endpoint_closing` checks this before draining.
+    /// Is `reg` a live registration? Reads the [`MAGIC`](Self::MAGIC) sentinel: the raw-pointer
+    /// counterpart of [`magic_ok`](Self::magic_ok) for a pointer that *might* dangle:
+    /// `IpcChannel.us_reg`, should any path outlive `Drop`'s clearing (`ipc_endpoint_closing`
+    /// checks).
     ///
     /// # Safety
     /// `reg` must be non-null and point at readable memory (a freed-but-mapped
@@ -385,8 +328,7 @@ impl UserspaceServerReg {
     /// See the accessor contract above.
     #[allow(clippy::mut_from_ref, reason = "this accessor's contract makes the `&mut` the only reference")]
     unsafe fn inner<'a>(reg: *mut ()) -> &'a mut Inner {
-        // The sentinel is cheap and catches a stale back-pointer at the moment it is
-        // followed, rather than as garbage read out of the pending table.
+        // The sentinel catches a stale back-pointer when followed, not as garbage in the table.
         // SAFETY: the accessor contract makes `reg` a registration's memory, so readable.
         debug_assert!(unsafe { Self::is_live(reg) }, "UserspaceServerReg accessor on a dead/stale registration");
         // SAFETY: forming a shared `&UserspaceServerReg` to reach the `UnsafeCell`,
@@ -397,8 +339,8 @@ impl UserspaceServerReg {
         unsafe { &mut *r.inner.get() }
     }
 
-    /// The kernel-held endpoint pointer (type-erased) — the object a forwarded
-    /// Resolve request is sent on (it lands in the *peer*'s inbox).
+    /// The kernel-held endpoint pointer (type-erased): a forwarded Resolve request is sent on
+    /// it and lands in the *peer*'s inbox.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -407,7 +349,7 @@ impl UserspaceServerReg {
         unsafe { Self::inner(reg) }.endpoint.as_ptr()
     }
 
-    /// A plain lookup's [`begin_forward`](Self::begin_forward) — the tests' shorthand.
+    /// A plain lookup's [`begin_forward`](Self::begin_forward), the tests' shorthand.
     ///
     /// # Safety
     /// As [`begin_forward`](Self::begin_forward).
@@ -423,12 +365,11 @@ impl UserspaceServerReg {
         unsafe { Self::begin_forward(reg, po, owner_pid, requested, suffix, Forward::PLAIN) }
     }
 
-    /// Reserve a free pending-lookup slot for a new forwarded lookup, assigning and
-    /// returning its `request_id`; `None` if all [`US_PENDING_MAX`] slots are in
-    /// flight (the caller fails the new lookup `WouldBlock`). Stores a clone of `po`
-    /// (an atomic bump, sound under `SCHED`) so the reply can complete it later.
+    /// Reserve a free pending-lookup slot, returning its new `request_id`; `None` if all
+    /// [`US_PENDING_MAX`] are in flight (the caller fails the lookup `WouldBlock`).
     ///
-    /// `fwd` is what the request asked for, kept so a `SUBNAMESPACE` reply can send it on.
+    /// Stores a clone of `po` (an atomic bump, sound under `SCHED`) so the reply can complete
+    /// it, and `fwd`, what the request asked for, so a `SUBNAMESPACE` reply can send it on.
     ///
     /// # Safety
     /// See the accessor contract above; `po` references a live `PendingOperation`.
@@ -442,12 +383,11 @@ impl UserspaceServerReg {
     ) -> Option<u64> {
         // SAFETY: the accessor contract: `reg` is a live `UserspaceServerReg` its caller pins, and `SCHED` is held.
         let inner = unsafe { Self::inner(reg) };
-        // First free slot, or `None` when the table is full (all in flight).
         let slot = inner.pending.iter().position(Option::is_none)?;
         let request_id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
-        // Copy the suffix inline (a memcpy, no allocation — sound under `SCHED`);
-        // record the *true* length so an overrun is detectable later.
+        // A memcpy, no allocation (sound under `SCHED`); the *true* length is recorded so an
+        // overrun is detectable later.
         let mut sbuf = [0u8; LOOKUP_SUFFIX_MAX];
         let n = suffix.len().min(LOOKUP_SUFFIX_MAX);
         sbuf[..n].copy_from_slice(&suffix[..n]);
@@ -469,11 +409,9 @@ impl UserspaceServerReg {
         Some(request_id)
     }
 
-    /// Reserve the (single) pending-**fill** slot for a new forwarded
-    /// `File::ReadRange`, assigning and returning its `request_id`; `None` if a fill
-    /// is already outstanding (N = 1). Stores clones of `po` and `file_obj` (atomic
-    /// bumps, sound under `SCHED`) so the reply can land the page even if the
-    /// faulting thread's references changed.
+    /// Reserve a free pending-**fill** slot for a forwarded `File::ReadRange`, returning its
+    /// `request_id`; `None` if all [`US_PENDING_MAX`] are in flight. Stores clones of `po` and
+    /// `file_obj` so the reply can land the page even if the faulting thread's references changed.
     ///
     /// # Safety
     /// See the accessor contract above; `po` / `file_obj` reference live objects.
@@ -494,10 +432,8 @@ impl UserspaceServerReg {
         Some(request_id)
     }
 
-    /// Take the pending fill **iff** some slot's `request_id` matches (a `ReadRange`
-    /// reply's echoed id); `None` on a mismatch or no such slot. The returned
-    /// [`PendingFill`]'s `po` / `file_obj` are dropped by the caller **outside**
-    /// `SCHED`.
+    /// Take the pending fill **iff** a slot's `request_id` matches the `ReadRange` reply's
+    /// echoed id; `None` otherwise. The caller drops `po` / `file_obj` **outside** `SCHED`.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -508,10 +444,8 @@ impl UserspaceServerReg {
         inner.pending_fill[slot].take()
     }
 
-    /// Take the pending lookup **iff** some slot's `request_id` matches `request_id`
-    /// (a reply's echoed id); `None` on a mismatch or no such slot (a duplicate /
-    /// stale reply). The returned [`PendingLookup`]'s `po` is dropped by the caller
-    /// **outside** `SCHED`.
+    /// Take the pending lookup **iff** a slot's `request_id` matches the reply's echoed id;
+    /// `None` for a duplicate or stale reply. The caller drops `po` **outside** `SCHED`.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -522,9 +456,8 @@ impl UserspaceServerReg {
         inner.pending[slot].take()
     }
 
-    /// Take the next occupied pending lookup (lowest slot), for **draining** the
-    /// table when the server dies — the caller loops until `None`, failing each. The
-    /// returned `po` is dropped by the caller **outside** `SCHED`.
+    /// Take the next occupied pending lookup, for **draining** the table when the server dies:
+    /// the caller loops until `None`, failing each, and drops `po` **outside** `SCHED`.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -537,34 +470,25 @@ impl UserspaceServerReg {
 }
 
 impl Drop for UserspaceServerReg {
-    /// Detach from the endpoint that points back at this registration, and complete
-    /// anything still outstanding on it — both while the registration is still whole.
+    /// Detach from the endpoint that points back at this registration, and complete anything
+    /// still outstanding on it, both while the registration is still whole.
     ///
-    /// `IpcChannel.us_reg` is a raw, uncounted back-pointer. It has to be uncounted:
-    /// the registration owns the endpoint, so a counted edge the other way would be a
-    /// reference cycle. But nothing used to clear it, and an endpoint can outlive its
-    /// registration (a server handle, a blocked waiter still holds a reference), which
-    /// left **four** consumers dereferencing freed memory — `ipc_endpoint_closing`'s
-    /// two drains, `us_forward_reg_for_send`, and `us_forward_existing_reg`, the last
-    /// of which would resurrect a dead object's refcount and hand out an owned
-    /// reference to it. Clearing the pointer here is what makes all four safe, instead
-    /// of each having to recognise a corpse.
+    /// `IpcChannel.us_reg` is a raw, **uncounted** back-pointer (the registration owns the
+    /// endpoint, so a counted edge back would be a cycle), and an endpoint can outlive its
+    /// registration. Clearing it here keeps every consumer (`ipc_endpoint_closing`,
+    /// `us_forward_reg_for_send`, `us_forward_existing_reg`) from dereferencing freed memory or
+    /// resurrecting a dead object's refcount.
     ///
-    /// This runs **before** the fields drop, which is exactly the window needed: the
-    /// pending table is still populated (so its waiters can be woken `PeerClosed`
-    /// rather than left hanging), and `endpoint` is still a live reference (so the
-    /// back-pointer can be cleared before anything can follow it). The field drops
-    /// that follow then release the endpoint, and if that is its last reference
-    /// `ipc_endpoint_closing` runs and correctly finds nothing to drain.
+    /// This runs **before** the fields drop: the pending table is still populated (so its
+    /// waiters are woken `PeerClosed` rather than left hanging) and `endpoint` is still live
+    /// (so the back-pointer is cleared before anything can follow it). The field drops that
+    /// follow release the endpoint, and if that is its last reference `ipc_endpoint_closing`
+    /// runs and finds nothing to drain.
     fn drop(&mut self) {
         // SAFETY: `self` is being dropped: its memory whole, its last reference gone.
         unsafe { crate::sched::us_reg_detach(self as *mut Self as *mut ()) };
-        // Poison the sentinel last, once nothing here needs the accessors. A dangling
-        // pointer that survives this — via a path not yet known — then fails
-        // `is_live` and is caught at the dereference, instead of reading a recycled
-        // allocation. Poisoning is what makes that check sound: a *reused* allocation
-        // fails the magic by luck, whereas a freed-but-untouched one would still
-        // read `UsSrvRg!` and sail through.
+        // Poison the sentinel last, so a dangling pointer that survives this fails `is_live`: a
+        // freed-but-untouched allocation would still read `UsSrvRg!`.
         self.magic = 0;
     }
 }
@@ -576,14 +500,11 @@ mod tests {
     use crate::object::header::test_probe;
     use crate::object::{IpcChannel, PendingOperation};
 
-    /// A live `IpcChannel` endpoint adopted into an `ObjectRef` (the registration's
-    /// kernel end; its peer is dropped immediately — irrelevant to these unit
-    /// tests, which never send).
+    /// A live `IpcChannel` endpoint adopted into an `ObjectRef`; its peer is dropped at once.
     fn endpoint() -> ObjectRef {
         let (a, b) = IpcChannel::try_new_pair(4).unwrap();
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let a_ref = unsafe { ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel) };
-        // Drop the peer's creation reference (nulls `a`'s peer — fine here).
         // SAFETY: adopts the peer's creation reference, to drop it.
         drop(unsafe { ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel) });
         a_ref
@@ -599,7 +520,6 @@ mod tests {
         }
     }
 
-    /// Adopt a registration into an `ObjectRef` (the form a binding holds).
     fn reg() -> ObjectRef {
         let r = UserspaceServerReg::try_new(endpoint()).unwrap();
         assert!(r.magic_ok());
@@ -607,12 +527,9 @@ mod tests {
         unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) }
     }
 
-    /// The regression this file's `Drop` exists for. An endpoint can outlive its
-    /// registration — a server handle or a blocked waiter still holds a reference —
-    /// and the endpoint's `us_reg` back-pointer is raw and uncounted. Before the
-    /// `Drop` impl nothing cleared it, so four consumers went on to dereference freed
-    /// memory; on hardware that surfaced as `#GP`/`#PF` in `signal_pending_op` with a
-    /// `po` made of recycled bytes, about one boot in four under load.
+    /// An endpoint can outlive its registration, and its `us_reg` back-pointer is raw and
+    /// uncounted, so `Drop` must clear it: without that, four consumers dereferenced freed
+    /// memory (`#GP`/`#PF` in `signal_pending_op`, about one boot in four under load).
     #[test]
     fn dropping_a_registration_clears_its_endpoints_back_pointer() {
         init_global_heap();
@@ -631,7 +548,6 @@ mod tests {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         let reg_ref =
             unsafe { ObjectRef::from_raw(KBox::into_raw(r).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
-        // Wire the back-pointer the way `us_server_attach` does at bind time.
         // SAFETY: both objects are live and this test is single-threaded.
         unsafe { IpcChannel::set_us_reg(ep, reg_ref.as_ptr()) };
         // SAFETY: the test's references keep `ep` live, and it is single-threaded.
@@ -701,7 +617,6 @@ mod tests {
         // SAFETY: adopt the creation reference.
         let old_ref =
             unsafe { ObjectRef::from_raw(KBox::into_raw(old).as_ptr() as *mut (), KObjectType::UserspaceServerReg) };
-        // A successor takes over the endpoint's back-pointer.
         let successor = 0xdead_beef_usize as *mut ();
         // SAFETY: single-threaded test; the value is only compared, never dereferenced.
         unsafe { IpcChannel::set_us_reg(ep, successor) };
@@ -726,16 +641,13 @@ mod tests {
         init_global_heap();
         let r = reg();
         let po = make_po();
-        // Fill every slot: each `begin` succeeds with the next monotonic id.
         for expect in 1..=US_PENDING_MAX as u64 {
             // SAFETY: `r` pins the registration, and the test is single-threaded.
             let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") };
             assert_eq!(id, Some(expect));
         }
-        // The table is now full → the next `begin` is `None` (caller: WouldBlock).
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         assert_eq!(unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") }, None);
-        // Free one slot; a `begin` succeeds again with the next id.
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let taken = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) };
         assert_eq!(taken.as_ref().map(|p| p.request_id), Some(1));
@@ -743,17 +655,15 @@ mod tests {
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 9, Rights::MAP_READ, b"sys/gen") };
         assert_eq!(id, Some(US_PENDING_MAX as u64 + 1));
-        // Drain the rest before dropping.
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         while unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.is_some() {}
         drop(po);
         drop(r);
     }
 
-    /// **A pending lookup keeps what it asked for** (administration Part C.4): the operation, a
-    /// rename's destination and the depth come back with it, so a `SUBNAMESPACE` reply can send
-    /// the same request on. A destination longer than the inline buffer reads as absent rather
-    /// than as a truncated path, which would continue somewhere else.
+    /// **A pending lookup keeps what it asked for**: the operation, a rename's destination and
+    /// the depth come back with it. A destination longer than the inline buffer reads as absent
+    /// rather than as a truncated path, which would continue somewhere else.
     #[test]
     fn a_pending_lookup_keeps_its_operation_for_a_continuation() {
         init_global_heap();
@@ -785,13 +695,11 @@ mod tests {
         init_global_heap();
         let r = reg();
         let po = make_po();
-        // Two lookups in flight at once (impossible under the old N = 1 slot).
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let a = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"one") }.unwrap();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let b = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 2, Rights::MAP_READ, b"two") }.unwrap();
         assert_ne!(a, b);
-        // Replies arrive out of order: each takes exactly its own entry.
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let tb = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), b) }.unwrap();
         assert_eq!(tb.owner_pid, 2);
@@ -813,16 +721,13 @@ mod tests {
         let po = make_po();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 7, Rights::MAP_READ, b"sys/gen") }.unwrap();
-        // A mismatched id leaves the entry in place.
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         assert!(unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id ^ 0xFF) }.is_none());
-        // The matching id takes it, carrying the recorded fields.
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let taken = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.unwrap();
         assert_eq!(taken.request_id, id);
         assert_eq!(taken.owner_pid, 7);
         assert_eq!(taken.requested, Rights::MAP_READ);
-        // Now empty: a second take (matching or not) is None.
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         assert!(unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.is_none());
         drop(taken);
@@ -860,13 +765,11 @@ mod tests {
         let po = make_po();
         let fo = file_obj();
         let frame = PhysAddr::new(0x5000);
-        // A lookup and a fill can coexist (separate slots, shared id counter).
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let lid = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"x") }.unwrap();
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let fid = unsafe { UserspaceServerReg::begin_fill(r.as_ptr(), &po, &fo, frame, 2) }.unwrap();
         assert_ne!(lid, fid); // distinct request ids
-        // A mismatched id leaves the fill in place; the matching id takes it.
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         assert!(unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid ^ 0xFF) }.is_none());
         // SAFETY: `r` pins the registration, and the test is single-threaded.
@@ -874,7 +777,6 @@ mod tests {
         assert_eq!(pf.request_id, fid);
         assert_eq!(pf.frame, frame);
         assert_eq!(pf.index, 2);
-        // The lookup slot is untouched by fill operations.
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         let pl = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.unwrap();
         assert_eq!(pl.request_id, lid);
@@ -894,8 +796,6 @@ mod tests {
         test_probe::reset();
         assert_eq!(test_probe::userspace_server_reg_destroys(), 0);
         assert_eq!(test_probe::ipc_channel_destroys(), 0);
-        // The kernel endpoint is owned by the registration; dropping the last ref
-        // runs the destructor, which cascades to the owned endpoint `ObjectRef`.
         drop(r);
         assert_eq!(test_probe::userspace_server_reg_destroys(), 1, "reg destructor ran");
         assert_eq!(test_probe::ipc_channel_destroys(), 1, "owned endpoint cascaded");
@@ -907,7 +807,6 @@ mod tests {
         test_probe::reset();
         let r = reg();
         let po = make_po();
-        // Leave a lookup outstanding, then drop the registration.
         // SAFETY: `r` pins the registration, and the test is single-threaded.
         unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"sys/gen") };
         assert_eq!(test_probe::pending_op_destroys(), 0);

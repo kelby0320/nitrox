@@ -1,13 +1,9 @@
-//! **The file allocation table** (Phase 6 Parts E.2 and E.3), read and written through a cache of
+//! **The file allocation table**, read and written through a cache of
 //! its sectors.
 //!
 //! An entry says what follows a cluster in its chain: another cluster, the end of the chain,
 //! nothing (the cluster is free), or that the cluster is bad. FAT12 packs entries in 12 bits — so
 //! one can straddle two sectors — FAT16 in 16, FAT32 in the low 28 of 32.
-//!
-//! **The cache is where the write path batches**: entries are changed in it, and its dirty sectors
-//! written at the points a change orders them — adjacent ones in one write, to every copy of the
-//! FAT. A slot is evicted dirty only by a write path, which writes it out first.
 
 use crate::bpb::{Geometry, Kind, SECTOR};
 use crate::{BlockReader, BlockWriter, FsError};
@@ -70,7 +66,6 @@ impl Cache {
         }
     }
 
-    /// The slot holding `sector`, if one does, its use recorded.
     fn hit(&mut self, sector: u32) -> Option<usize> {
         self.clock = self.clock.wrapping_add(1);
         let i = self.slots.iter().position(|s| s.sector == sector)?;
@@ -86,7 +81,6 @@ impl Cache {
             .min_by_key(|&i| (self.slots[i].sector != u32::MAX, self.slots[i].used))
     }
 
-    /// Read FAT sector `sector` into slot `i`.
     fn load<R: BlockReader>(&mut self, r: &R, g: &Geometry, i: usize, sector: u32) -> Result<usize, FsError> {
         self.slots[i].sector = u32::MAX;
         r.read_meta(g.fat_byte(0) + sector as u64 * SECTOR as u64, &mut self.slots[i].data)?;
@@ -129,19 +123,16 @@ impl Cache {
         self.load(rw, g, i, sector)
     }
 
-    /// Byte `at` of the first FAT.
     fn byte<R: BlockReader>(&mut self, r: &R, g: &Geometry, at: u64) -> Result<u8, FsError> {
         let i = self.slot(r, g, (at / SECTOR as u64) as u32)?;
         Ok(self.slots[i].data[(at % SECTOR as u64) as usize])
     }
 
-    /// [`Cache::byte`] for a write path.
     fn byte_rw<RW: BlockReader + BlockWriter>(&mut self, rw: &RW, g: &Geometry, at: u64) -> Result<u8, FsError> {
         let i = self.slot_rw(rw, g, (at / SECTOR as u64) as u32)?;
         Ok(self.slots[i].data[(at % SECTOR as u64) as usize])
     }
 
-    /// Byte `at` of the first FAT, to be changed: its slot marked dirty.
     fn byte_mut<RW: BlockReader + BlockWriter>(&mut self, rw: &RW, g: &Geometry, at: u64) -> Result<&mut u8, FsError> {
         let i = self.slot_rw(rw, g, (at / SECTOR as u64) as u32)?;
         self.slots[i].dirty = true;
@@ -162,7 +153,6 @@ impl Cache {
         classify(g, self.raw(r, g, c)?)
     }
 
-    /// [`Cache::next`] for a write path, which may have every slot dirty.
     fn next_rw<RW: BlockReader + BlockWriter>(&mut self, rw: &RW, g: &Geometry, c: u32) -> Result<Next, FsError> {
         if !g.valid_cluster(c) {
             return Err(FsError::Corrupt);
@@ -330,7 +320,7 @@ impl Cache {
     }
 
     /// **Free the chain from `first`**, every cluster of it, bounded as a walk is. A freed cluster
-    /// is forgotten by a metadata cache, since it may next be a file's (Phase 6 Part H.4).
+    /// is forgotten by a metadata cache, since it may next be a file's.
     pub fn free_chain<RW: BlockReader + BlockWriter>(
         &mut self,
         rw: &RW,
@@ -399,7 +389,6 @@ fn entry(kind: Kind, c: u32, mut byte: impl FnMut(u64) -> Result<u8, FsError>) -
     })
 }
 
-/// What an entry's value says follows its cluster.
 fn classify(g: &Geometry, v: u32) -> Result<Next, FsError> {
     let (bad, end) = match g.kind {
         Kind::Fat12 => (0xFF7, 0xFF8),

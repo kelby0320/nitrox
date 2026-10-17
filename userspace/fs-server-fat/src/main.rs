@@ -1,4 +1,4 @@
-//! `fs-server-fat` — the server `[[bin]]` (Phase 6 Part E.4).
+//! `fs-server-fat` — the server `[[bin]]`.
 //!
 //! A FAT12, FAT16 or FAT32 filesystem served over a block device, as `fs-server-ext4` serves
 //! ext4: **the protocol is `libfsserver`'s**, and this binary is the library's [`Fat`] as a
@@ -18,7 +18,7 @@ use libfsserver::cache::{MetaCache, SERVER_BLOCKS, Store};
 use libfsserver::disk::SectorDisk;
 use libfsserver::server;
 
-/// The metadata cache's memory (Phase 6 Part H.4): all zeroes, so `.bss`.
+/// The metadata cache's memory: all zeroes, so `.bss`.
 static mut STORE: Store<SERVER_BLOCKS> = Store::new();
 
 /// `_start` bootstrap registers (`kernel/src/syscall/table.rs`): `rdi` = the notification
@@ -26,11 +26,9 @@ static mut STORE: Store<SERVER_BLOCKS> = Store::new();
 /// `rdx` = the **control channel** endpoint its supervisor installed, `rcx` = `arg0` (unused).
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -> ! {
-    // 1–2. The block device, and whether to serve it read-only, from the setup message.
     let (disk, read_only) = server::bootstrap(control, SectorDisk::new);
     let device = disk.device();
     #[allow(clippy::deref_addrof, reason = "a `static mut` is reached only through a raw pointer")]
-    // The device through a metadata cache (Phase 6 Part H.4).
     // SAFETY: `_start` runs once, and this is the only reference `STORE` ever has.
     let cached = MetaCache::new(&disk, unsafe { &mut *(&raw mut STORE) });
     // 3–6. Check, Ready, serve — a read-only mount through the type that refuses every write,

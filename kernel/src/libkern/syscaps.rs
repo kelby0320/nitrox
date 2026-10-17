@@ -1,16 +1,15 @@
 //! [`SysCaps`] — the process-level capability bitmask.
 //!
-//! The **second axis of authority** (see `docs/architecture/syscaps.md`): ambient
-//! *per-process* capabilities for privileged classes of operation, distinct from
-//! per-handle [`Rights`](super::handle::Rights) (per-object authority). A process
-//! holds a `SysCaps` set on its [`Process`](crate::object::Process); it is granted at
-//! spawn (`child = parent & args.syscaps`, never amplified), immutable thereafter, and
-//! checked at the syscall boundary (`require_syscap`).
+//! The **second axis of authority** (see `docs/architecture/syscaps.md`): ambient *per-process*
+//! capabilities for privileged classes of operation, distinct from per-handle
+//! [`Rights`](super::handle::Rights). A process holds a `SysCaps` set on its
+//! [`Process`](crate::object::Process); it is granted at spawn (`child = parent &
+//! args.syscaps`, never amplified), immutable thereafter, and checked at the syscall boundary
+//! (`require_syscap`).
 //!
-//! Hand-rolled bitflags in the [`Rights`](super::handle::Rights) style (the kernel
-//! forbids the `bitflags` crate). The bit positions are normative and mirrored in
-//! `userspace/libkern/src/syscaps.rs`; the set is the v5.1-committed six
-//! (`docs/archive/os-design-v5.1.md` § "System Capability Bitmask").
+//! Hand-rolled bitflags in the [`Rights`](super::handle::Rights) style. The bit positions are
+//! normative and mirrored in `userspace/libkern/src/syscaps.rs`; the set is the v5.1-committed
+//! six (`docs/archive/os-design-v5.1.md` § "System Capability Bitmask").
 
 use core::ops::{BitAnd, BitOr, BitOrAssign};
 
@@ -22,9 +21,8 @@ pub struct SysCaps(u64);
 impl SysCaps {
     /// Load/unload a Tier-2 loadable kernel module.
     pub const LOAD_MODULE: SysCaps = SysCaps(1 << 0);
-    /// Bind names into namespaces (`sys_ns_bind`) — construct namespaces at all.
-    /// Concentrated in supervisors (init, service-mgr, session-mgr); never held by an
-    /// ordinary resource server.
+    /// Bind names into namespaces (`sys_ns_bind`) — construct namespaces at all. Concentrated in
+    /// supervisors (init, service-mgr, session-mgr); never held by an ordinary resource server.
     pub const BIND_NAMESPACE: SysCaps = SysCaps(1 << 1);
     /// Map arbitrary physical memory (boot-path/recovery only).
     pub const PHYSICAL_MEMORY: SysCaps = SysCaps(1 << 2);
@@ -35,8 +33,8 @@ impl SysCaps {
     /// Manage the audit subsystem.
     pub const AUDIT_CONTROL: SysCaps = SysCaps(1 << 5);
 
-    /// The bitmask of all defined capabilities — the set the kernel grants init at
-    /// boot. Update alongside the constants above.
+    /// The bitmask of all defined capabilities — the set the kernel grants init at boot.
+    /// Update alongside the constants above.
     const ALL_BITS: u64 = (1 << 6) - 1;
 
     /// The empty set (no authority).
@@ -49,9 +47,9 @@ impl SysCaps {
         SysCaps(Self::ALL_BITS)
     }
 
-    /// Wrap a raw bit pattern, **dropping unknown bits**. A `SpawnArgs.syscaps` word
-    /// from userspace may set reserved bits; they carry no authority (nothing matches
-    /// them) and the ⊆-parent intersection at spawn bounds what takes effect anyway.
+    /// Wrap a raw bit pattern, **dropping unknown bits**: reserved bits in a
+    /// `SpawnArgs.syscaps` word carry no authority, and the ⊆-parent intersection at spawn bounds
+    /// what takes effect anyway.
     pub const fn from_bits_truncate(bits: u64) -> Self {
         SysCaps(bits & Self::ALL_BITS)
     }
@@ -71,8 +69,7 @@ impl SysCaps {
         SysCaps(self.0 | other.0)
     }
 
-    /// Bitwise intersection — the spawn attenuation operator
-    /// (`child = parent & args.syscaps`).
+    /// Bitwise intersection — the spawn attenuation operator.
     pub const fn intersection(self, other: SysCaps) -> Self {
         SysCaps(self.0 & other.0)
     }
@@ -125,7 +122,6 @@ mod tests {
             SysCaps::SYSTEM_CLOCK,
             SysCaps::AUDIT_CONTROL,
         ];
-        // all six are subsets of `all`, pairwise distinct, and non-empty.
         let mut seen = 0u64;
         for c in caps {
             assert!(c.is_subset_of(SysCaps::all()));
@@ -149,7 +145,6 @@ mod tests {
 
     #[test]
     fn from_bits_truncate_drops_unknown() {
-        // A reserved/high bit carries no authority — it truncates away.
         let c = SysCaps::from_bits_truncate(0xFFFF_FFFF_FFFF_FFFF);
         assert_eq!(c, SysCaps::all());
         assert_eq!(SysCaps::from_bits_truncate(1 << 40).bits(), 0);

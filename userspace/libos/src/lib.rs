@@ -3,10 +3,8 @@
 //! The typed/async face of the raw `libkern` syscall surface. Design contract:
 //! `docs/architecture/libos.md`.
 //!
-//! This slice (Phase 3 slice 5) ships the **async core** — the [`Op`] future over
-//! `sys_wait` and [`block_on`], plus an `io::Error`-shaped [`Error`] — and (in later
-//! parts) the `Handle<T, M>` typestate wrappers. It is **`#![no_std]` with no
-//! `alloc`**, so the heap-free binaries (eshell/parent/fs-server) can use it too.
+//! It is **`#![no_std]` with no `alloc`**, so the heap-free binaries (eshell, fs-server)
+//! can use it too.
 //!
 //! ## The async core
 //!
@@ -20,9 +18,7 @@
 //! let n = done.result as usize;               // bytes read
 //! ```
 //!
-//! [`block_on`] is the single-task driver — the same poll→`sys_wait`→re-poll loop a
-//! future multi-task executor would run, minus the ready queue (deferred; see the
-//! design doc). It collapses the `po_wait` idiom copy-pasted into every binary today.
+//! [`block_on`] is the single-task driver: poll, `sys_wait`, re-poll.
 
 #![cfg_attr(not(test), no_std)]
 

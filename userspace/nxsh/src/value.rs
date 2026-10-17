@@ -1,20 +1,8 @@
 //! Runtime values, and how they render.
 //!
-//! Milestone 3 Part B. The shape of [`Val`] is the design's §6 rule made structural
-//! rather than remembered:
-//!
-//! > `Value` is exactly what TSM1 can represent — no more, no less.
-//!
-//! So [`Val::Data`] wraps `libstream::wire::Value` **unchanged** — the same type the wire
-//! codec and every coreutil already use, not a parallel copy the shell would have to keep
-//! in step. Everything the language has that TSM1 cannot carry sits *outside* that
-//! variant: a range and a closure are real first-class values (§5c, §8c) that simply
-//! cannot cross a process boundary, and putting them beside `Value` rather than inside it
-//! is what stops the type system from acquiring a member that provably cannot survive
-//! IPC.
-//!
-//! The practical payoff is that a pipeline stage's output needs no conversion: what comes
-//! off the wire *is* a `Val::Data`.
+//! [`Val::Data`] wraps `libstream::wire::Value` unchanged, so a stage's output needs no
+//! conversion. What TSM1 cannot carry (a range, a closure) sits beside `Value`, not inside it, so
+//! the type never gains a member that cannot survive IPC.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -31,11 +19,8 @@ pub struct Func {
     pub name: Option<String>,
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
-    /// Captured bindings, **by value at creation** (§5a). Snapshotting here rather than
-    /// holding a reference to the defining scope is what avoids the classic
-    /// "every closure sees the loop variable's final value" bug without a borrow checker.
-    /// A named `def` captures nothing: its parameter list is a complete account of its
-    /// inputs.
+    /// Captured bindings, by value at creation: snapshotting avoids every closure seeing the loop
+    /// variable's final value. A named `def` captures nothing.
     pub captured: Vec<(String, Val)>,
 }
 
@@ -44,9 +29,8 @@ pub struct Func {
 pub enum Val {
     /// Anything TSM1 can represent. The wire type itself, not a copy of it.
     Data(Value),
-    /// `a..b` / `a..=b`. Always ascending, `i64`, no step — deliberately minimal (§8c).
-    /// Language-only: a range would be materialised into a `List<Int>` before it could
-    /// leave the process.
+    /// `a..b` / `a..=b`: ascending, `i64`, no step. Language-only; it is materialised into a
+    /// `List<Int>` before it can leave the process.
     Range { start: i64, end: i64, inclusive: bool },
     /// A function or closure (§5c).
     Func(Arc<Func>),
@@ -81,9 +65,7 @@ impl Val {
 
     /// The `Value` inside, or an error naming why this one has none.
     ///
-    /// The error message is the §5c rule in the place a user meets it: a list or a record
-    /// is a TSM1 container, so putting a closure in one would produce a value that cannot
-    /// be encoded — better refused at construction than discovered at a pipe.
+    /// A closure in a list or record would not encode, so it is refused at construction.
     pub fn into_data(self) -> Result<Value, &'static str> {
         match self {
             Val::Data(v) => Ok(v),
@@ -112,8 +94,7 @@ impl Val {
         matches!(self, Val::Data(Value::Null))
     }
 
-    /// The name used in error messages — the §6 type vocabulary, which is also what
-    /// patterns test against (§9f), so one word means one thing everywhere.
+    /// The §6 type vocabulary, which is also what patterns test against.
     pub fn type_name(&self) -> &'static str {
         match self {
             Val::Data(Value::Null) => "Null",
@@ -154,8 +135,7 @@ impl Val {
     }
 }
 
-/// Render a `Value`. `nested` quotes strings, because `["a", "b"]` and `[a, b]` are
-/// different things and a list of strings should look like one.
+/// Render a `Value`; `nested` quotes strings, so a list of strings looks like one.
 fn render_value(v: &Value, nested: bool) -> String {
     match v {
         Value::Null => String::from("null"),
@@ -215,8 +195,6 @@ fn render_record(r: &Record) -> String {
     s
 }
 
-/// A one-line summary. Rendering a table *properly* — aligned columns — is `display`'s
-/// job in Part D, and belongs there rather than half-done here.
 fn render_table(t: &Table) -> String {
     let mut s = String::from("<table ");
     s.push_str(&render_i64(t.rows.len() as i64));
@@ -254,17 +232,8 @@ pub fn render_i64(v: i64) -> String {
     s
 }
 
-/// Render a float (C6).
-///
-/// Two rules beyond what `core`'s formatter does on its own, both of them about a typed
-/// shell rather than about arithmetic:
-///
-/// - **A whole float keeps its point.** `core` renders `1.0f64` as `1`, which in this
-///   language is indistinguishable from `Int(1)` — and the two are genuinely different
-///   values that a schema, an ascription and a pattern all tell apart (§6, §9f). So a
-///   rendering with no `.`, `e` or sign of non-finiteness gets `.0` appended.
-/// - **Non-finite values are named, not printed as symbols.** `inf` and `NaN` are what
-///   they are called in the type vocabulary and in every error message.
+/// Render a float. A whole float keeps its point (`1.0`, not `1`), so it stays distinguishable
+/// from `Int(1)`; `inf` and `NaN` are named, as in the type vocabulary.
 pub fn render_f64(v: f64) -> String {
     if v.is_nan() {
         return String::from("NaN");
@@ -272,7 +241,6 @@ pub fn render_f64(v: f64) -> String {
     if v.is_infinite() {
         return String::from(if v > 0.0 { "inf" } else { "-inf" });
     }
-    // `core::fmt` carries the shortest-round-trip float formatter; no `std` needed.
     let s = v.to_string();
     if s.bytes().any(|c| c == b'.' || c == b'e' || c == b'E') {
         return s;
@@ -289,8 +257,6 @@ mod tests {
 
     #[test]
     fn a_whole_float_is_distinguishable_from_an_int() {
-        // The reason this rule exists: `1` and `1.0` are different values in a language
-        // whose schemas, ascriptions and patterns all tell `Int` from `Float`.
         assert_eq!(Val::float(1.0).render(), "1.0");
         assert_eq!(Val::int(1).render(), "1");
         assert_eq!(Val::float(-2.0).render(), "-2.0");
@@ -319,8 +285,6 @@ mod tests {
         assert_eq!(Val::int(i64::MIN).render(), "-9223372036854775808");
     }
 
-    /// A bare string renders as itself; inside a collection it is quoted, because
-    /// `[a, b]` and `["a", "b"]` are not the same value.
     #[test]
     fn strings_quote_only_when_nested() {
         assert_eq!(Val::str("hi").render(), "hi");
@@ -328,7 +292,6 @@ mod tests {
         assert_eq!(l.render(), "[\"a\", 1]");
     }
 
-    /// §5c, enforced where a user meets it: a closure cannot go into a TSM1 container.
     #[test]
     fn language_only_values_are_refused_by_tsm1_containers() {
         let r = Val::list(vec![Val::Range { start: 0, end: 3, inclusive: false }]);

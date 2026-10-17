@@ -1,26 +1,16 @@
-//! `service-mgr` — the userspace service manager (Phase 3).
+//! `service-mgr` — the userspace service manager.
 //!
-//! Spawned by init once critical-path boot is stable, it starts, supervises, and
-//! restarts the system's services. See `docs/architecture/service-manager.md`.
+//! Starts, supervises and restarts the system's services; see
+//! `docs/architecture/service-manager.md`.
 //!
-//! **The supervision spine:** parse the declarations from `/system/services.toml` on the root
-//! (`service_toml`; the initramfs until administration Part E.1c), start **every** service in
-//! the file, and on a child's exit apply *that child's* restart policy + backoff. Each service
-//! gets a **control channel**: service-mgr keeps one end, moves the other to the service at
-//! spawn, and can send lifecycle commands — a graceful `CTRL_OP_SHUTDOWN`. A
-//! supervisor-requested shutdown is distinguished from an unexpected exit, so it is *not*
-//! restarted even under `policy = always`. **Nothing requests one today**: the 1.1 s demo stop
-//! went with Part E.1a, since it stopped the *first* declared service, `auth-service` by then;
-//! `service --stop` (Part E.2) is the real one.
+//! It parses `/system/services.toml`, starts **every** service in it, and on a child's exit
+//! applies *that child's* restart policy + backoff. Each service gets a **control channel**:
+//! service-mgr keeps one end and can send a graceful `CTRL_OP_SHUTDOWN`. A requested shutdown is
+//! never restarted, even under `policy = always`.
 //!
-//! That control channel is also how a child's exit is **attributed**: `KIND_CHILD_EXITED`
-//! names a child by pid and nothing maps a process handle to a pid, so the discriminator
-//! is which endpoint closed rather than which pid died. See [`supervise`], and
-//! `TODO(child-exit-attribution)` for what that still leaves open.
-//!
-//! `#![no_std]` + `#![no_main]`. Slice A uses `libkern` (raw syscalls) + `libheap`
-//! (the `#[global_allocator]`); the design's `librsproto`/`libos` surface arrives with
-//! the RS startup protocol in slice B.
+//! That channel is also how a child's exit is **attributed**: `KIND_CHILD_EXITED` names a pid
+//! and nothing maps a process handle to one, so the discriminator is which endpoint closed. See
+//! `TODO(child-exit-attribution)`.
 
 #![no_std]
 #![no_main]
@@ -37,42 +27,24 @@ use service_mgr::registry;
 use service_mgr::service_toml::{self, Backoff, RestartConfig, RestartPolicy, ServiceDecl};
 use service_mgr::services;
 
-/// The freeing userspace heap (slice 4), backing `alloc` for the declaration parser.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// How many declared services this supervisor holds at once.
-///
-/// **No longer bounded by the wait set** (administration Part E.1b): only a server that is still
-/// starting has its control channel waited on — for its `Ready` — since a death is also a
-/// `ChildExited` on the notification channel, and each pass looks at every channel. Until then one
-/// per running service was, which capped this at 31.
-///
-/// Twenty-four. Since administration Part E.1 a release image declares the **nine servers**
-/// `init` used to start, and nothing else since E.1c took `heartbeat` out of it; a test image
-/// adds `heartbeat` and seven more. It was twelve while only the demo and the test clients were
-/// declared.
+/// How many declared services this supervisor holds at once. Not bounded by the wait set: only a
+/// server still starting has its control channel waited on, since a death is also a
+/// `ChildExited` on the notification channel.
 const MAX_SERVICES: usize = 24;
-/// The most `sys_wait` takes at once.
 const WAIT_MAX: usize = libkern::abi::MAX_WAIT_HANDLES;
 
-/// The wait set [`Mgr::run`] builds: the notification channel, every route's serving end, and the
-/// control channel of each server still starting (`registry::STARTING_ROOM` of them). Other
-/// callers use the first slot with a count of one.
+/// The wait set [`Mgr::run`] builds.
 static mut WAIT_HANDLES: [u64; WAIT_MAX] = [0; WAIT_MAX];
-/// One 24-byte `IoResult` per waited handle.
 static mut WAIT_RESULTS: [u8; 24 * WAIT_MAX] = [0; 24 * WAIT_MAX];
-/// The routes' receive buffers: resolves, forwarded from every binding of a server's path.
 static mut SRV_MSG: [u8; 4096] = [0; 4096];
 static mut SRV_HANDLES: [u64; 8] = [0; 8];
 static mut SRV_COUNT: usize = 0;
-/// The login supervisors' process handles and control channels, **kept** since administration
-/// Part E.1: shutdown (E.4) asks them to end their sessions. They used to be closed after the
-/// handoff.
+/// The login supervisors' process and control handles, kept for a shutdown.
 static mut SUPERVISORS: [u64; 4] = [0; 4];
-/// How deep each route is. Every forwarded resolve on a server's path queues on its route, and a
-/// full ring answers the resolver `WouldBlock` at once, so it is far deeper than a server's usual
-/// four.
+/// How deep each route is: a full ring answers the resolver `WouldBlock` at once.
 const SERVE_DEPTH: u64 = 64;
 static mut NOTIF: Notification = Notification::zeroed();
 static mut CLOCK_BUF: u64 = 0;
@@ -80,18 +52,14 @@ static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut SEND_MSG: IpcMsg = IpcMsg::ZEROED;
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
-/// Recv buffers for a resource server's `Meta::Ready` (auth-service's client endpoint).
 static mut RDY_MSG: [u8; 4096] = [0; 4096];
 static mut RDY_HANDLES: [u64; 8] = [0; 8];
 static mut RDY_COUNT: usize = 0;
 
-/// Bounded wait for a spawned server's Ready.
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 
-/// Spawn args for `session-mgr`: its control endpoint is moved in at `rdx`
-/// (`handles[0]`), over which service-mgr hands it the fs-server endpoint + the auth
-/// channel. Re-delegated `BIND_NAMESPACE` (⊆ service-mgr's) so it can construct
-/// per-session namespaces.
+/// Spawn args for `session-mgr`: its control endpoint is moved in at `handles[0]`, and it is
+/// re-delegated `BIND_NAMESPACE` to construct per-session namespaces.
 static mut SPAWN_SESSION: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 1,
@@ -103,13 +71,8 @@ static mut SPAWN_SESSION: SpawnArgs = SpawnArgs {
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
 
-/// Spawn args for `desktop-session-mgr` — `session-mgr`'s graphical twin, same shape.
-///
-/// **Two supervisors, unaware of each other.** Neither arbitrates and there is no registry:
-/// serial stays the recovery path by construction rather than by care, which is
-/// `graphical-session.md` governing decision 3 holding trivially. It matches Linux, where
-/// `getty` and `gdm` do not coordinate either. The accepted cost is on the record: the same
-/// user may be logged in twice, with two namespaces.
+/// Spawn args for `desktop-session-mgr`. **The two supervisors are unaware of each other**, so
+/// serial stays the recovery path; the same user may be logged in twice.
 static mut SPAWN_DESKTOP_SESSION: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 1,
@@ -121,9 +84,6 @@ static mut SPAWN_DESKTOP_SESSION: SpawnArgs = SpawnArgs {
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
 
-/// Spawn args for the service being started/restarted. `image` and the control-channel
-/// handle are filled per spawn; a leaf service inherits a LOOKUP-only handle to
-/// service-mgr's namespace and holds no ambient capabilities.
 static mut SPAWN_SERVICE: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 0,
@@ -135,7 +95,6 @@ static mut SPAWN_SERVICE: SpawnArgs = SpawnArgs {
     syscaps: 0,
 };
 
-/// Emit `msg` to the serial console via the debug kprint syscall.
 fn kprint(msg: &[u8]) {
     // SAFETY: SYS_DEBUG_KPRINT copies `len` bytes from `ptr`; the slice is valid.
     unsafe {
@@ -143,7 +102,6 @@ fn kprint(msg: &[u8]) {
     }
 }
 
-/// The display name of a restart policy (for logging).
 fn restart_name(p: RestartPolicy) -> &'static [u8] {
     match p {
         RestartPolicy::Never => b"never",
@@ -152,10 +110,7 @@ fn restart_name(p: RestartPolicy) -> &'static [u8] {
     }
 }
 
-/// Resolve `path` in namespace `ns` (MAP_READ) and return the resolved handle, or `0`
-/// on failure. The `PendingOperation` is waited + closed; the resolved handle is the
-/// caller's to close. Used both to resolve config files (mapped by `read_file`) and
-/// program-image `MemoryObject`s (passed to spawn as `SpawnArgs.image`).
+/// Resolve `path` in `ns`: the handle, the caller's to close, or `0` on failure.
 fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     // SAFETY: valid path pointer + namespace handle.
     let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
@@ -167,7 +122,6 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
         WAIT_HANDLES[0] = po as u64;
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
-    // IoResult: status at bytes 8..12, resolved handle at 16..24.
     // SAFETY: bytes 8..24 are inside `WAIT_RESULTS`, a static of plain bytes only this thread
     // touches; they hold the wait's result only when it returned 1.
     let (status, handle) = unsafe {
@@ -190,20 +144,15 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     if waited != 1 || status != 0 { 0 } else { handle }
 }
 
-/// Resolve the service's System-tier log endpoint — `/log/<name>` under the logging
-/// service, at the `system/` subtree (only a supervisor's namespace permits it). Returns
-/// a `SEND`-righted channel handle (the service's `log`), or `0` if the logging service
-/// is unavailable (spawn then proceeds without structured logging — non-fatal). The
-/// logging service stamps the trusted `principal = <name>` / `tier = system` from *this*
-/// channel; the service never names itself. See `docs/architecture/logging.md`.
+/// Resolve the service's log endpoint under the logging service's `system/` subtree (only a
+/// supervisor's namespace permits it), or `0`. The logging service stamps the trusted
+/// `principal` and `tier` from *this* channel; the service never names itself.
 fn resolve_log_endpoint(registry: u64, name: &str) -> u64 {
     let path = format!("/logging-service/system/{name}");
-    // `TRANSFER` so service-mgr can move the endpoint into the child at spawn; the child
-    // itself receives it attenuated to `SEND` (the spawn grant mask, below).
+    // `TRANSFER` to move it into the child at spawn, which receives it attenuated to `SEND`.
     ns_lookup(registry, path.as_bytes(), RIGHT_SEND | RIGHT_TRANSFER)
 }
 
-/// The backoff wait (ns) for the `attempts`-th restart (0-based) under `cfg`.
 fn compute_backoff(cfg: &RestartConfig, attempts: u32) -> u64 {
     match cfg.backoff {
         Backoff::None => 0,
@@ -212,7 +161,6 @@ fn compute_backoff(cfg: &RestartConfig, attempts: u32) -> u64 {
     }
 }
 
-/// Whether a service that exited with `code` should be restarted under `policy`.
 fn should_restart(policy: RestartPolicy, code: i32) -> bool {
     match policy {
         RestartPolicy::Never => false,
@@ -221,7 +169,6 @@ fn should_restart(policy: RestartPolicy, code: i32) -> bool {
     }
 }
 
-/// Read the monotonic clock (ns).
 fn now_ns() -> u64 {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
@@ -229,19 +176,12 @@ fn now_ns() -> u64 {
     unsafe { (&raw const CLOCK_BUF).read() }
 }
 
-/// Create a connected control-channel pair (depth 4). Returns `(smgr_end, svc_end)`:
-/// service-mgr keeps `smgr_end`, the service receives `svc_end`. `None` on failure.
 fn create_control_channel() -> Option<(u64, u64)> {
     // **Depth 10, and the number bounds the send count rather than being a round one.** The
     // handoffs below are `SENDMODE_NOBLOCK` against a child that has not run yet, so a ring shorter
-    // than the number of them does not block — it **drops the last handle silently**. This was 4
-    // while the graphical column sent four; M12 Part E's clipboard made it five, and the symptom
-    // was a session whose namespace had no `/dev/clipboard` and a copy that failed two processes
-    // away, with the send reporting success. **Nine since administration Part E.2b** go to
-    // `desktop-session-mgr` — the storage service's route the eighth since E.1b, and
-    // `service-mgr`'s own services endpoint the ninth — so it is ten deep for one spare.
-    // `libsession::spawn_leader` carries the same warning from the same failure in M7 Part F —
-    // which is what named this one on sight.
+    // than the number of them does not block — it **drops the last handle silently**, and the
+    // send reports success. Nine handoffs go to `desktop-session-mgr`, so it is ten deep for one
+    // spare. `libsession::spawn_leader` carries the same warning.
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
     let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 10, 0) };
     if cr != 0 {
@@ -252,10 +192,7 @@ fn create_control_channel() -> Option<(u64, u64)> {
     Some((a, b))
 }
 
-/// Hand the resolved log endpoint to a service over its control endpoint, **transferring**
-/// it (the service receives it as its first control message — a message with one moved
-/// handle and no payload). After this, `log_ep` has moved to the service, or is closed if
-/// the transfer failed.
+/// Move the log endpoint to a service as its first control message; closed if that failed.
 fn send_log_handoff(ctrl: u64, log_ep: u64) {
     // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; transfer one handle, empty payload.
     let sr = unsafe {
@@ -271,14 +208,11 @@ fn send_log_handoff(ctrl: u64, log_ep: u64) {
         )
     };
     if sr != 0 {
-        // The transfer failed; the handle did not move — reclaim it.
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, log_ep) };
     }
 }
 
-/// Send a control opcode to a service over its control endpoint (`ctrl`). No handles,
-/// non-blocking (the control ring is otherwise idle).
 fn send_control(ctrl: u64, op: u8) {
     if ctrl == 0 {
         return;
@@ -298,8 +232,6 @@ fn send_control(ctrl: u64, op: u8) {
     }
 }
 
-/// Tell `init` to finish a shutdown, on the terminal channel (administration Part E.4):
-/// `TERMINAL_OP_FINISH`, then whether to reboot.
 fn send_finish(terminal: u64, reboot: bool) {
     if terminal == 0 {
         kprint(b"service-mgr: no terminal channel, so init cannot be told to finish\n");
@@ -321,24 +253,11 @@ fn send_finish(terminal: u64, reboot: bool) {
     }
 }
 
-/// Read + parse the service declarations, **from the root filesystem** at
-/// `/system/services.toml` (administration Part E.1c; the initramfs's `etc/services.toml` until
-/// then). `init` has mounted the root before it spawns this process, and there the file can be
-/// edited. Empty (with a logged reason) if the file is absent or holds nothing well-formed. Each
-/// `executable` is resolved to a `MemoryObject` at spawn time.
-///
-/// **One file, every service in it.** The schema said each file declares one service and
-/// the manager scans the directory; nothing can enumerate a directory of `.toml` files
-/// (the initramfs is a CPIO archive the kernel looks up by name, `sys_ns_enumerate` lists
-/// namespace bindings rather than directory entries, and `profile-server` projects only
-/// packages' `bin/`), so the schema changed on 2026-08-21 instead. See the decision log.
-///
-/// This is what lets a **test image differ from a release image by data**: the same
-/// `service-mgr` binary reads a file with one more table in it.
-///
-/// **With whether a critical declaration was skipped**: each skipped one is said here, by name and
-/// reason, since the parser cannot log, and a critical one is a critical server that did not come
-/// up (`bringup::unfit`).
+/// Read + parse the declarations from `/system/services.toml` on the root filesystem, which
+/// `init` has mounted before it spawns this process. Empty (with a logged reason) if the file is
+/// absent or holds nothing well-formed. A **test image differs from a release image by data**.
+/// Also returns whether a critical declaration was skipped, each skipped one being said here
+/// since the parser cannot log (`bringup::unfit`).
 fn load_declarations(root_ns: u64) -> (alloc::vec::Vec<ServiceDecl>, bool) {
     let read = libfs::read_file(root_ns, b"/system/services.toml").ok();
     let text = match read.and_then(|b| String::from_utf8(b).ok()) {
@@ -363,8 +282,8 @@ fn load_declarations(root_ns: u64) -> (alloc::vec::Vec<ServiceDecl>, bool) {
         kprint(b"service-mgr: declaration parse error\n");
         return (decls, skipped_critical);
     }
-    // More than the wait set can hold: keep the first `MAX_SERVICES` and **say** which
-    // were dropped. A silent truncation would read as "everything declared is running".
+    // Keep the first `MAX_SERVICES` and **say** which were dropped: a silent truncation would
+    // read as "everything declared is running".
     while decls.len() > MAX_SERVICES {
         let dropped = decls.pop().expect("len > MAX_SERVICES");
         Line::new()
@@ -389,11 +308,9 @@ fn load_declarations(root_ns: u64) -> (alloc::vec::Vec<ServiceDecl>, bool) {
     (decls, skipped_critical)
 }
 
-/// Spawn the service `decl` names (image already resolved), with a fresh control
-/// channel whose service end is moved to the child. Returns `(proc_handle,
-/// control_end)`; `control_end` is `0` if the channel couldn't be created.
+/// Spawn the service `decl` names with a fresh control channel; returns `(proc_handle,
+/// control_end)`, the latter `0` if there is no channel.
 fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) {
-    // Resolve the declared executable to its ELF `MemoryObject` (path-based spawn).
     let image = ns_lookup(root_ns, decl.executable.as_bytes(), RIGHT_MAP_READ);
     if image == 0 {
         Line::new().s(b"service-mgr: image not found: ").s(decl.executable.as_bytes()).end();
@@ -406,34 +323,18 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) 
             (0, 0)
         }
     };
-    // Resolve the service's System-tier log endpoint (the `log` handle + stdout/stderr
-    // routing). Non-fatal: a service without it just has no structured logging.
-    //
-    // **Not for a server** (administration Part E.1): a server resolves its own log, as it did
-    // under `init`, and its first control message is its `Meta::Ready` — a log handoff first is
-    // a message none of them expects. And it is resolved **in the registry**, not through
-    // `/log`: that path forwards to this process, which would be waiting on itself.
+    // **Not for a server**: it resolves its own log, and its first control message is its
+    // `Meta::Ready`. And it is resolved **in the registry**, not through `/log`: that path
+    // forwards to this process, which would be waiting on itself.
     let log_ep = if decl.endpoint.is_some() { 0 } else { resolve_log_endpoint(registry, &decl.name) };
     if log_ep == 0 && decl.endpoint.is_none() {
         kprint(b"service-mgr: log endpoint resolve FAIL (spawning without logging)\n");
     }
     Line::new().s(b"service-mgr: starting service '").s(decl.name.as_bytes()).s(b"'").end();
-    // The control endpoint moves into the child (RECV + WAIT only) at `rdx`. The spawn ABI delivers only one handle to a
-    // register, so the log endpoint is handed over the control channel after spawn (below),
-    // mirroring init's device handoff to an fs-server.
-    // **Declared authority.** Almost every service declares none; the demo chain declares
-    // `BIND_NAMESPACE` because it constructs a namespace and binds `/session/user` into it.
-    //
-    // **The kernel *attenuates*, it does not refuse.** `sys_process_spawn` computes
-    // `child = parent & requested` — a silent intersection — so a declaration asking for more
-    // than service-mgr holds spawns successfully with the extra bits simply gone. An earlier
-    // version of this comment said the spawn fails; it does not, and the log line below said
-    // "granted" for bits the child never received (PR #229 review, finding 2).
-    //
-    // service-mgr cannot check the subset itself: nothing reports a process its own syscaps
-    // (`/proc/self/status` carries pid and tid only), so it cannot know what it holds without
-    // hardcoding a second copy of init's grant. Filed as `TODO(spawn-syscap-attenuation)`.
-    // Until then the honest thing is to log what was **requested** and say so.
+    // **The kernel *attenuates*, it does not refuse**: `child = parent & requested`, so a
+    // declaration asking for more than service-mgr holds spawns with the extra bits gone.
+    // Nothing reports a process its own syscaps, so it cannot check the subset itself
+    // (`TODO(spawn-syscap-attenuation)`); it logs what was **requested** and says so.
     for u in &decl.unknown_syscaps {
         Line::new()
             .s(b"service-mgr: '")
@@ -444,8 +345,6 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) 
             .end();
     }
     if decl.syscaps != 0 {
-        // "requested", not "granted": the kernel intersects this with what service-mgr holds
-        // and reports nothing about what it dropped.
         Line::new()
             .s(b"service-mgr: '")
             .s(decl.name.as_bytes())
@@ -454,8 +353,8 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) 
             .s(b" (the kernel grants the subset service-mgr holds)")
             .end();
     }
-    // SAFETY: SPAWN_SERVICE is this process's spawn block, owned by this single thread; `image` and `svc_end` are
-    // handles we hold, and the kernel copies the block during the call
+    // SAFETY: SPAWN_SERVICE is this process's spawn block, owned by this single thread; `image`
+    // and `svc_end` are handles we hold, and the kernel copies the block during the call
     let h = unsafe {
         SPAWN_SERVICE.image = image;
         SPAWN_SERVICE.syscaps = decl.syscaps;
@@ -463,8 +362,7 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) 
             SPAWN_SERVICE.handles[0] = svc_end;
             SPAWN_SERVICE.handle_count = 1;
             SPAWN_SERVICE.move_mask = 1;
-            // A server's end is what `init` gave one: it sends `Meta::Ready`, moving its
-            // endpoint. Any other service's is one-way, so it cannot send at all.
+            // A server sends `Meta::Ready`; any other service's end is one-way.
             SPAWN_SERVICE.rights[0] = if decl.endpoint.is_some() {
                 RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT
             } else {
@@ -476,12 +374,10 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) 
         }
         syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SERVICE) as u64)
     };
-    // The kernel copied the ELF during spawn; close service-mgr's image handle.
-    // SAFETY: closing our own handle.
+    // SAFETY: the kernel copied the ELF during spawn; closing our own image handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
     if h < 0 {
         kprint(b"service-mgr: spawn FAIL\n");
-        // Nothing was moved (spawn failed) — close the control ends + the log endpoint.
         // SAFETY: closing our own handles (0 is ignored by the kernel).
         unsafe {
             if smgr_end != 0 {
@@ -494,25 +390,19 @@ fn spawn_service(root_ns: u64, registry: u64, decl: &ServiceDecl) -> (i64, u64) 
         }
         return (h, 0);
     }
-    // Hand the log endpoint to the service over its control channel (an IPC transfer —
-    // the child receives it as its first control message). service-mgr thus vouches the
-    // identity (it resolved `system/<name>`) without the child ever naming itself.
+    // The spawn ABI delivers one handle to a register, so the log endpoint follows on the
+    // control channel.
     if log_ep != 0 {
         if smgr_end != 0 {
             send_log_handoff(smgr_end, log_ep);
         } else {
-            // No control channel to hand it over — drop it.
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, log_ep) };
         }
     }
-    // `svc_end` has moved to the child; retain `smgr_end` as the control endpoint.
     (h, smgr_end)
 }
 
-/// Spawn a child (resolved from `path`) with a fresh control channel whose child end
-/// is moved in at `handles[0]`; returns `(proc_handle, smgr_control_end)`. The caller
-/// fills the rest of `args` (rights/syscaps). `smgr_control_end` is `0` on failure.
 fn spawn_with_control(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> (i64, u64) {
     let image = ns_lookup(root_ns, path, RIGHT_MAP_READ);
     if image == 0 {
@@ -538,7 +428,6 @@ fn spawn_with_control(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> (i64, 
     // SAFETY: the kernel copied the ELF during spawn; close our image handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
     if h < 0 {
-        // Nothing moved (spawn failed) — close both control ends.
         // SAFETY: closing our own handles.
         unsafe {
             syscall1(SYS_HANDLE_CLOSE, smgr_end);
@@ -549,14 +438,8 @@ fn spawn_with_control(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> (i64, 
     (h, smgr_end)
 }
 
-/// Receive one handle from init's handoff channel: an empty message carrying at most one
-/// transferred handle. Returns `0` if the message was empty (init had that endpoint
-/// missing) or the receive failed.
-///
-/// **Bounded, not indefinite.** init sends all three handoffs straight after the spawn,
-/// so they are in the ring or about to be; a wait that could not end would mean a
-/// supervisor hung on a message that is either there or never coming. The same
-/// deadline the `Ready` handshake uses is more than enough.
+/// Receive one handle from init's handoff channel; `0` if the message was empty or the receive
+/// failed. **Bounded**: an unbounded wait would hang the supervisor on a message never coming.
 fn recv_handoff(ctrl: u64) -> u64 {
     let mut now: u64 = 0;
     // SAFETY: `&now` is a valid u64 out-param
@@ -591,13 +474,8 @@ fn recv_handoff(ctrl: u64) -> u64 {
     unsafe { (&raw const RDY_HANDLES[0]).read() }
 }
 
-/// Transfer a single `handle` to a child over its control channel (`ctrl`) — an IPC
-/// message with one moved handle and no payload (the child receives it as its next
-/// control message). On failure the handle did not move; it is closed.
-///
-/// A zero `handle` sends **an empty message**, not nothing. The receiver reads the
-/// handoffs positionally, so skipping the send would shift every later one up a slot and
-/// hand session-mgr the auth channel where it expects the profile endpoint.
+/// Move `handle` to a child over its control channel; closed if the send fails. A zero `handle`
+/// sends **an empty message**: the receiver reads the handoffs positionally.
 fn send_handle(ctrl: u64, handle: u64) {
     let count = if handle == 0 { 0 } else { 1 };
     // SAFETY: SEND_MSG/SEND_HANDLES valid; transfer `count` handles, empty payload.
@@ -619,38 +497,30 @@ fn send_handle(ctrl: u64, handle: u64) {
     }
 }
 
-/// **What the login supervisors are handed**, in the order they receive it. `fs` and `profile` are
-/// `init`'s servers' own endpoints, couriered: this manager does not *use* either, and holds
-/// neither longer than the trip down. Every other is a **route** of this manager's (administration
-/// Part E.1b) — a duplicate of the one the server's root path is bound to, or of the one to an
-/// endpoint the server mints for sessions — so a restarted server is reached again from every
-/// session bound before it. `0` for one this boot does not have, and a session binds nothing
-/// there.
+/// **What the login supervisors are handed**, in order. `fs` and `profile` are `init`'s servers'
+/// own endpoints, couriered: this manager uses neither. Every other is a **route**, so a
+/// restarted server is reached again from every session. `0` for one this boot lacks.
 #[derive(Default)]
 struct ChainEndpoints {
     fs: u64,
     profile: u64,
     tty: u64,
-    /// The compositor's, which only the graphical column takes: a serial session has no screen.
+    /// The compositor's, which only the graphical column takes.
     draw: u64,
     clip: u64,
     views: u64,
     devices: u64,
     storage: u64,
-    /// `service-mgr`'s own session endpoint for `/svc/services` (administration Part E.2b): the
-    /// table of services, and nothing that starts or stops one.
+    /// The session endpoint for `/svc/services`: the table, and no admin.
     services: u64,
 }
 
 impl ChainEndpoints {
-    /// Every handle, in the order `desktop-session-mgr` receives them; `session-mgr` receives the
-    /// same with no `draw`.
+    /// Every handle, in the order `desktop-session-mgr` receives them.
     fn all(&self) -> [u64; 9] {
         [self.fs, self.profile, self.tty, self.draw, self.clip, self.views, self.devices, self.storage, self.services]
     }
 
-    /// A second set of everything but `draw`, which only one column takes. `TRANSFER |
-    /// DUPLICATE` is what the hand-down needs and all it needs.
     fn duplicate(&self) -> ChainEndpoints {
         // SAFETY: each is a handle this process holds, or `0`.
         unsafe {
@@ -668,8 +538,7 @@ impl ChainEndpoints {
         }
     }
 
-    /// Close every handle in a set no supervisor took. This manager never exits, so a set
-    /// dropped on an abort path would be held for the life of the boot.
+    /// Close a set no supervisor took: this manager never exits, so it would be held for good.
     fn close(&self) {
         for h in self.all() {
             close(h);
@@ -677,22 +546,15 @@ impl ChainEndpoints {
     }
 }
 
-/// Bring up the login chain: `session-mgr`, then `desktop-session-mgr`, each spawned with
-/// re-delegated `BIND_NAMESPACE` and handed its endpoints over its control channel. Both resolve
-/// `/svc/auth` themselves.
-///
-/// **The serial column's set is duplicated before it is sent**, since `send_handle` moves: a
-/// failure here then costs the graphical login, not both.
+/// Bring up the login chain: `session-mgr`, then `desktop-session-mgr`, each handed its
+/// endpoints over its control channel. **The serial set is duplicated before it is sent**, since
+/// `send_handle` moves: a failure here then costs the graphical login, not both.
 fn bring_up_login_chain(root_ns: u64, chain: ChainEndpoints) {
     if chain.fs == 0 {
-        // A profile endpoint without an fs endpoint is no more usable — a session with programs
-        // but no home is not a session — and nor is any route.
         kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
         chain.close();
         return;
     }
-    // Not fatal: a session without `/bin` is the pre-Part-F shell — usable for the in-process
-    // language, unable to spawn. Losing the login entirely over it would be a worse trade.
     if chain.profile == 0 {
         kprint(b"service-mgr: no profile endpoint; sessions will have no /bin\n");
     }
@@ -707,35 +569,23 @@ fn bring_up_login_chain(root_ns: u64, chain: ChainEndpoints) {
         desktop.close();
         return;
     }
-    // **Positional**, so the order is the contract: a reorder here silently makes a session bind
-    // its home over IPC to the profile server. The fs server's, the profile server's, then the
-    // routes to the terminal server, the clipboard (M12 Part E), the view broker (administration
-    // Part A.4), the device manager's info-only endpoint (Part B.4) and the storage service's
-    // session endpoint (Part C.6; resolved by each supervisor until Part E.1b), then this
-    // manager's own session endpoint for `/svc/services` (Part E.2b).
+    // **Positional**: a reorder silently makes a session bind its home to the profile server.
     let s = &serial;
     for h in [s.fs, s.profile, s.tty, s.clip, s.views, s.devices, s.storage, s.services] {
         send_handle(sess_ctrl, h);
     }
-    // **Kept, not closed** (administration Part E.1): shutdown asks the supervisors to end their
-    // sessions, which takes their process handles.
+    // Kept, not closed: shutdown asks the supervisors to end their sessions.
     // SAFETY: single-threaded; the supervisors' slots.
     unsafe {
         SUPERVISORS[0] = sess_h as u64;
         SUPERVISORS[1] = sess_ctrl;
     }
     if !bring_up_desktop_session(root_ns, desktop) {
-        // Non-fatal by design. A machine with a serial login and no graphical one is
-        // degraded; a machine with neither is unreachable, and the serial column is already
-        // up by this point.
         kprint(b"service-mgr: no graphical login (serial login is unaffected)\n");
     }
     kprint(b"service-mgr: login chain up (auth-service + session-mgr)\n");
 }
 
-/// Spawn `desktop-session-mgr` and hand it its set, `draw` included. `false` if it could not be
-/// started. Its greeter is a compositor client too, which resolves `/dev/draw/new` from the
-/// inherited root, as every other graphical client does.
 fn bring_up_desktop_session(root_ns: u64, set: ChainEndpoints) -> bool {
     if set.fs == 0 {
         set.close();
@@ -747,12 +597,9 @@ fn bring_up_desktop_session(root_ns: u64, set: ChainEndpoints) -> bool {
         set.close();
         return false;
     }
-    // The serial column's order with the compositor's fourth — nine of the control channel's
-    // ten, see `create_control_channel`.
     for h in set.all() {
         send_handle(ctrl, h);
     }
-    // Kept, as `session-mgr`'s are: shutdown asks this one to end its sessions too.
     // SAFETY: single-threaded; the supervisors' slots.
     unsafe {
         SUPERVISORS[2] = h as u64;
@@ -761,8 +608,6 @@ fn bring_up_desktop_session(root_ns: u64, set: ChainEndpoints) -> bool {
     true
 }
 
-/// Duplicate an endpoint handle for a second supervisor, or `0` if there was none.
-///
 /// # Safety
 /// `h` must be a handle this process owns, or `0`.
 unsafe fn dup_endpoint(h: u64) -> u64 {
@@ -774,17 +619,16 @@ unsafe fn dup_endpoint(h: u64) -> u64 {
     if d < 0 { 0 } else { d as u64 }
 }
 
-/// Bootstrap registers (see init's `_start`): `rdi` = notification channel, `rsi` = the root
-/// namespace, lookup-only as every spawned process gets it, `rdx` = the **terminal channel** init
-/// moved in, `rcx` unused.
+/// Bootstrap registers: `rdi` = notification channel, `rsi` = the lookup-only root namespace,
+/// `rdx` = the **terminal channel** init moved in, `rcx` unused.
 ///
-/// **What comes down the terminal channel first** (administration Part E.1):
-/// 1. a root handle with `init`'s own rights, `BIND` and `UNBIND` among them. `service-mgr` sits in
-///    `init`'s trust tier, the maintainer's call, since binding the servers is its job now;
+/// **What comes down the terminal channel first:**
+/// 1. a root handle with `init`'s own rights, `BIND` and `UNBIND` among them, since binding the
+///    servers is this manager's job and it is in `init`'s trust tier;
 /// 2. the root filesystem's endpoint, and 3. the profile server's, both for the login chain.
 ///
-/// The channel then stays open: it is how `service-mgr` asks `init` for the emergency shell.
-/// `0` means `init` could not make it, and then no server can be bound, which is said.
+/// The channel then stays open for asking `init` for the emergency shell. `0` means `init` made
+/// no root handle, and then no server can be bound, which is said.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) -> ! {
     kprint(b"service-mgr: up\n");
@@ -845,9 +689,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
         reported: false,
         shutdown: None,
     };
-    // **A file that has lost its critical servers starts nothing** (PR #340 review, finding 2):
-    // with no declarations, or none critical, bring-up would go straight to a login chain with no
-    // `auth-service` behind it, and no critical server would be there to fail.
+    // **A file that has lost its critical servers starts nothing**: bring-up would reach a login
+    // chain with no `auth-service` behind it, and no critical server would be there to fail.
     if let Some(why) = bringup::unfit(&m.entries, skipped_critical) {
         Line::new().s(b"service-mgr: ").s(why.as_bytes()).s(b" -- starting nothing").end();
         m.ask_for_the_emergency_shell();
@@ -856,7 +699,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, _arg0: u64) ->
     m.run()
 }
 
-/// Make a channel pair of `depth`: `(a, b)`.
 fn make_channel(depth: u64) -> Option<(u64, u64)> {
     let (mut a, mut b) = (0u64, 0u64);
     // SAFETY: valid writable out-params.
@@ -864,7 +706,6 @@ fn make_channel(depth: u64) -> Option<(u64, u64)> {
     (r == 0).then_some((a, b))
 }
 
-/// Close `h` if it is a handle.
 fn close(h: u64) {
     if h != 0 {
         // SAFETY: closing a handle this process owns.
@@ -872,7 +713,7 @@ fn close(h: u64) {
     }
 }
 
-/// Bind `endpoint` at `path` in `ns`, forwarding with `base` if there is one. `0` on success.
+/// Bind `endpoint` at `path` in `ns`, forwarding with `base` if any; `0` on success.
 fn bind(ns: u64, path: &[u8], endpoint: u64, base: Option<&[u8]>) -> i64 {
     let (bp, bl) = base.map_or((0, 0), |b| (b.as_ptr() as u64, b.len() as u64));
     // SAFETY: a namespace handle this process holds with BIND, a valid path and base, and an
@@ -880,16 +721,13 @@ fn bind(ns: u64, path: &[u8], endpoint: u64, base: Option<&[u8]>) -> i64 {
     unsafe { syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, endpoint, bp, bl) }
 }
 
-/// Unbind `path` in `ns`. `NotFound` for a path nothing is bound at, which callers expect.
 fn unbind(ns: u64, path: &[u8]) {
     // SAFETY: a namespace handle this process holds with UNBIND, and a valid path.
     unsafe { syscall3(SYS_NS_UNBIND, ns, path.as_ptr() as u64, path.len() as u64) };
 }
 
-/// The reply buffer for this manager's own endpoint.
 static mut REPLY_BUF: [u8; 4096] = [0; 4096];
 
-/// Send an rsproto message on `ch`, moving `handles`.
 fn send_rs(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: &[u64]) -> bool {
     // SAFETY: REPLY_BUF is this process's; single-threaded.
     unsafe {
@@ -910,8 +748,8 @@ fn send_rs(ch: u64, op: u16, request_id: u64, flags: u32, body: &[u8], handles: 
     }
 }
 
-/// An error reply: the whole twelve-byte `ErrorBody`, since a shorter one on a forwarded resolve
-/// reaches the resolver as `KernelError`.
+/// An error reply: the whole twelve-byte `ErrorBody`, since a shorter one reaches a forwarded
+/// resolve's resolver as `KernelError`.
 fn reply_error(ch: u64, op: u16, request_id: u64, err: KError) {
     let mut body = [0u8; librsproto::error::ERROR_BODY_LEN];
     let n = librsproto::error::error_body(&mut body, err.as_i32(), 0, b"").unwrap_or(0);
@@ -920,8 +758,8 @@ fn reply_error(ch: u64, op: u16, request_id: u64, err: KError) {
 }
 
 /// Answer a resolve with `SUBNAMESPACE`: `ns`, at `base`, standing for the first `consumed` bytes
-/// of the suffix. **A failed send is answered with an error**, since a forwarded resolve has no
-/// deadline and one left unanswered hangs its resolver.
+/// of the suffix. **A failed send is answered with an error**: a forwarded resolve has no
+/// deadline, and one left unanswered hangs its resolver.
 fn reply_subnamespace(ch: u64, request_id: u64, ns: u64, consumed: usize, base: &[u8]) {
     use librsproto::namespace::{SUBNAMESPACE_PREFIX_LEN, subnamespace_reply};
     let mut body = [0u8; SUBNAMESPACE_PREFIX_LEN + 64];
@@ -942,15 +780,13 @@ fn reply_subnamespace(ch: u64, request_id: u64, ns: u64, consumed: usize, base: 
     }
 }
 
-/// One message on this manager's own endpoint: `(op, request_id, body)`. Handles that came with it
-/// are closed: a resolve carries none. `None` when nothing is queued.
+/// One message on this manager's own endpoint, its handles closed; `None` when none is queued.
 fn recv_serve(ch: u64) -> Option<(u16, u64, alloc::vec::Vec<u8>)> {
     recv_request(ch).ok().flatten()
 }
 
-/// [`recv_serve`], telling **a peer that has gone** apart: `Err(())`. A caller serving a channel
-/// someone else can close must act on it — a closed channel stays signalled, and waited on again it
-/// would spin the loop. A route's cannot close: this manager holds its other end.
+/// [`recv_serve`], telling **a peer that has gone** apart: `Err(())`. A closed channel stays
+/// signalled, so a caller must drop it or the wait loop would spin. A route's cannot close.
 fn recv_request(ch: u64) -> Result<Option<(u16, u64, alloc::vec::Vec<u8>)>, ()> {
     loop {
         // SAFETY: valid recv out-params.
@@ -999,7 +835,6 @@ fn refuse(ch: u64, op: u16, request_id: u64, err: KError, why: &[u8]) {
     let _ = send_rs(ch, op, request_id, flags, &body[..n], &[]);
 }
 
-/// Answer request `op` on `ch` with an empty body; `0` answers no one, as for [`refuse`].
 fn reply_ok(ch: u64, op: u16, request_id: u64) {
     if ch == 0 {
         return;
@@ -1007,7 +842,6 @@ fn reply_ok(ch: u64, op: u16, request_id: u64) {
     let _ = send_rs(ch, op, request_id, librsproto::RS_FLAG_REPLY, &[], &[]);
 }
 
-/// Answer a resolve with a channel, moving `client_end`; closed if it would not send.
 fn reply_channel(ch: u64, request_id: u64, client_end: u64) -> bool {
     use librsproto::namespace::{OBJECT_KIND_CHANNEL, RESOLVE_REPLY_LEN, resolve_reply};
     let mut body = [0u8; RESOLVE_REPLY_LEN];
@@ -1021,7 +855,6 @@ fn reply_channel(ch: u64, request_id: u64, client_end: u64) -> bool {
     sent
 }
 
-/// Answer a resolve with `bytes`, as a fresh read-only memory object: a table.
 fn reply_table(ch: u64, request_id: u64, bytes: &[u8]) {
     use librsproto::namespace::{OBJECT_KIND_MEMOBJ, RESOLVE_REPLY_LEN, resolve_reply};
     let resolve = librsproto::OP_NS_RESOLVE;
@@ -1040,8 +873,8 @@ fn reply_table(ch: u64, request_id: u64, bytes: &[u8]) {
     }
     // SAFETY: `addr` maps at least `bytes.len()` writable bytes.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
-    // Unmapped before the reply, as the device manager does: the mapping holds its own reference,
-    // so left behind it would pin every table ever served.
+    // Unmapped before the reply: the mapping holds its own reference, so left behind it would
+    // pin every table ever served.
     // SAFETY: unmapping a range this process mapped moments ago and never reads again.
     unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
     let rights = RIGHT_MAP_READ | RIGHT_INSPECT | RIGHT_TRANSFER;
@@ -1060,19 +893,15 @@ fn reply_table(ch: u64, request_id: u64, bytes: &[u8]) {
     }
 }
 
-/// What a starting server's control channel held.
 enum Ready {
     /// A `Meta::Ready`, and the endpoint it moved.
     Endpoint(u64),
     /// A refusal, with its reason; or a message that was no `Ready`.
     Refused(alloc::string::String),
-    /// Nothing yet.
     Nothing,
-    /// The server has gone.
     Closed,
 }
 
-/// Look for a starting server's `Meta::Ready` on its control channel, without waiting.
 fn take_ready(ctrl: u64) -> Ready {
     // SAFETY: RDY_MSG/RDY_HANDLES/RDY_COUNT are valid writable out-params; non-blocking receive.
     let rr = unsafe {
@@ -1119,154 +948,123 @@ fn take_ready(ctrl: u64) -> Ready {
     }
 }
 
-/// Where a declared service is in its life.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Phase {
     /// Not running, or running and not usable — a server that never became ready.
     Down,
-    /// A server spawned and not yet ready: its `Meta::Ready` is due by `deadline`.
+    /// A server whose `Meta::Ready` is due by `deadline`.
     Starting { deadline: u64 },
-    /// Running: a server bound in the registry, or any other service.
+    /// Running.
     Up,
 }
 
-/// **A route**: one of this manager's own endpoints, reaching one place in the registry
-/// (administration Part E.1b). Every binding of a server's path — the root's, each session's,
-/// each application's — is a route, never the server's own endpoint, so a restart is reached from
-/// all of them. And one route reaches **one** server: an endpoint that reached any server by the
-/// suffix could not be handed to a session, since `desktop-shell` holds what it is handed with
-/// `BIND_NAMESPACE` and could bind it at a base of its choosing.
+/// **A route**: one of this manager's own endpoints, reaching one place in the registry.
+/// Every binding of a server's path — the root's, each session's, each application's — is a
+/// route, never the server's own endpoint, so a restart is reached from all of them. And one
+/// route reaches **one** server: one that reached any server by the suffix could not be handed
+/// to a session, since `desktop-shell` could bind it at a base of its choosing.
 struct Route {
-    /// The server, as an index into `Mgr::svcs`.
     svc: usize,
-    /// `None` for the server's own path; `Some(suffix)` for an endpoint the server mints for
-    /// sessions by a resolve of `suffix` (`registry::DERIVED`).
+    /// `None` for the server's own path; `Some(suffix)` for an endpoint it mints for sessions.
     through: Option<&'static str>,
     /// Where in the registry each resolve continues: `/<name>` or `/<name>.<suffix>`.
     base: String,
-    /// The end every binding holds.
     client: u64,
-    /// The end this manager answers on.
     serve: u64,
-    /// A derived route's endpoint, as the server minted it, bound at `base`. `0` otherwise, and
-    /// while there is none.
+    /// A derived route's endpoint as the server minted it, bound at `base`; else `0`.
     target: u64,
-    /// Whether something is bound at `base`. A resolve while it is not is `NotFound`.
+    /// Whether something is bound at `base`; else a resolve is `NotFound`.
     live: bool,
 }
 
-/// **An admin request waiting for what it asked** (administration Part E.2): a stop for the
-/// service's exit, a start for it to come up. Answered then — never by a wait here, since every
-/// resolve on a server's path waits on this process.
+/// **An admin request waiting for what it asked**, answered then, never by a wait here.
 struct Held {
-    /// The admin session to answer on, or `0` once it has closed: **what was asked goes on**, a
-    /// restart's start included, and only the answer is lost (PR #341 review, finding 1). The
-    /// handle is not kept, since it may be reused, and an answer must not reach whatever it names
-    /// next.
+    /// The session to answer on, or `0` once it has closed: **what was asked goes on**, a
+    /// restart's start included, and only the answer is lost. The handle is not kept, since it
+    /// may be reused.
     session: u64,
     request_id: u64,
     op: u16,
-    /// The service, as an index into `Mgr::svcs`.
     svc: usize,
     awaits: Awaits,
 }
 
-/// What a [`Held`] request waits for.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Awaits {
-    /// The service's exit, by `until`; then a start too, for a restart.
+    /// The service's exit by `until`, then a start for a restart.
     Exit { then_start: bool, until: u64 },
-    /// The service to come up: a server's `Meta::Ready`, bounded by its own deadline.
+    /// A server's `Meta::Ready`, bounded by its own deadline.
     Up,
 }
 
-/// How long a stopped service has to exit before its stop is answered "asked, and still
-/// running", unless its declaration says (`stop_timeout`). There is no forcible kill; a stop is a
-/// request.
+/// How long a service has to exit before its stop is answered "still running", unless it
+/// declares `stop_timeout`. There is no forcible kill.
 const STOP_TIMEOUT_NS: u64 = 5_000_000_000;
 
-/// How long the login supervisors have, at shutdown, to end their sessions and exit. Each gives its
-/// session's leader a bound of its own first, so this is the longer.
+/// How long the login supervisors have at shutdown; longer than each gives its session leader.
 const SESSIONS_TIMEOUT_NS: u64 = 10_000_000_000;
 
 /// How long each service has, at shutdown, to exit once asked, **unless its declaration says**
-/// (`stop_timeout`). Shorter than a `service --stop`'s: no person waits on the answer, and a
-/// service that does not honour it holds up only the stop. A service whose stop is real work —
-/// the storage service, writing back every filesystem it mounted — declares its own (PR #343
-/// review): past this bound `init` would stop the machine mid-write.
+/// (`stop_timeout`). The storage service, writing back every filesystem it mounted, declares its
+/// own: past this bound `init` would stop the machine mid-write.
 const SHUTDOWN_STOP_NS: u64 = 3_000_000_000;
 
-/// **A shutdown under way** (administration Part E.4b): whether it ends in a reboot, and what it
-/// waits for now. Its order is [`service_mgr::shutdown`]'s.
+/// **A shutdown under way**, in [`service_mgr::shutdown`]'s order.
 struct Shutdown {
     reboot: bool,
     stage: Stage,
 }
 
-/// Where a shutdown has got to. Each wait is a deadline in the one loop, as every wait here is.
 #[derive(Copy, Clone)]
 enum Stage {
-    /// The login supervisors have been asked to end their sessions, and have until `until`.
+    /// The login supervisors are ending their sessions, until `until`.
     Sessions { until: u64 },
-    /// Service `i` has been asked to stop, and has until `until`.
+    /// Service `i` was asked to stop, until `until`.
     Service { i: usize, until: u64 },
-    /// `init` has been told to finish: its own filesystems, then the machine.
+    /// `init` has been told to finish.
     Finished,
 }
 
-/// **What serves `/svc/services`** (administration Part E.2): its own endpoint, bound there in the
-/// root; the admin endpoints minted from it, and the admin sessions opened on those.
+/// **What serves `/svc/services`**: its own endpoint, bound there in the root; the admin
+/// endpoints minted from it, and the admin sessions opened on those.
 #[derive(Default)]
 struct Services {
-    /// The end this manager answers `/svc/services` on.
     serve: u64,
-    /// **The session endpoint** (Part E.2b), and the end it is answered on: the table and nothing
-    /// else. Every login binds a duplicate at `/dev/services`.
+    /// **The session endpoint**, and the end it is answered on: the table and nothing else.
+    /// Every login binds a duplicate at `/dev/services`.
     session_client: u64,
     session_serve: u64,
     admin_ends: alloc::vec::Vec<u64>,
     admin_sessions: alloc::vec::Vec<u64>,
-    /// **The power endpoints and sessions** (Part E.4b): a session opened on one takes `Shutdown`
-    /// and nothing else.
+    /// A session opened on a power endpoint takes `Shutdown` and nothing else.
     power_ends: alloc::vec::Vec<u64>,
     power_sessions: alloc::vec::Vec<u64>,
 }
 
-/// One supervised service: its declaration, its child, and the state the restart
-/// policy needs across exits.
+/// One supervised service: its declaration, its child, and the state its restart policy needs.
 struct Supervised {
     decl: ServiceDecl,
-    /// The child's process handle, or `0` when it is not running.
     proc_h: i64,
-    /// service-mgr's end of the child's control channel, or `0` when it is not running
-    /// (or the channel could not be created). **This is the exit discriminator** — see
-    /// [`Mgr::poll`].
+    /// service-mgr's end of the child's control channel, or `0` when it is not running or the
+    /// channel could not be created. **This is the exit discriminator** — see [`Mgr::poll`].
     ctrl: u64,
-    /// Restarts applied so far, against `decl.restart.max_attempts`.
     attempts: u32,
     running: bool,
-    /// A supervisor-requested shutdown is intentional and is never restarted, whatever
-    /// the policy says.
+    /// A requested stop is never restarted, whatever the policy says.
     requested_shutdown: bool,
     phase: Phase,
-    /// This manager's copy of a server's endpoint while it is up — what the login supervisors are
-    /// given copies of. `0` otherwise.
+    /// This manager's copy of a server's endpoint while it is up, else `0`.
     endpoint: u64,
-    /// Whether the server's root path is bound to this manager's endpoint. Once is enough: a
-    /// restart rebinds in the registry, and every binding reaches the new server through it.
+    /// Whether the server's root path is bound to its route; once is enough, a restart rebinds
+    /// in the registry.
     root_bound: bool,
-    /// When a restart is due, its backoff over. **A deadline, never a sleep**: every resolve on a
-    /// server's path waits on this process.
+    /// When a restart is due. **A deadline, never a sleep**: every resolve on a server's path
+    /// waits on this process.
     restart_at: Option<u64>,
-    /// How it last exited: `None` if it never has, `Some(None)` if its code never came.
     exited: Option<Option<i32>>,
-    /// Restarts over the boot, by its policy or asked for — the table's `restarts`, which a
-    /// start asked for does not reset as it resets `attempts`.
     restarts: u32,
 }
 
-/// **The service manager's state, and its one loop** (administration Part E.1).
-///
 /// **It never blocks on anything that can wait on it.** Every resolve on a server's path — the
 /// root's `/log`, `/svc/auth`, `/dev/tty` — comes to this process first, so a wait on a server
 /// that is itself resolving one of those would be two processes waiting on each other. So a
@@ -1276,40 +1074,32 @@ struct Supervised {
 ///
 /// **The registry.** Each server's endpoint is bound in a namespace of this manager's own, under
 /// the server's name, and every other binding of the server's path is one of this manager's
-/// [`Route`]s. A resolve there is answered `SUBNAMESPACE` into the registry, so it continues into
-/// whichever server is bound there now, and a restart rebinds there alone.
+/// [`Route`]s, answered `SUBNAMESPACE` into the registry, so a restart rebinds there alone.
 struct Mgr {
     notif: u64,
-    /// The root, lookup-only, as this process was spawned with: for lookups.
+    /// The lookup-only root, for lookups.
     root_ns: u64,
-    /// The root with `init`'s rights, for binding the servers' paths. `0` without one.
+    /// The root with `init`'s rights, for binding the servers' paths; `0` without one.
     root_bind: u64,
     registry: u64,
-    /// This manager's own endpoints, one per server path and derived endpoint, made as each is
-    /// first needed and kept for the boot.
+    /// One per server path and derived endpoint, kept for the boot.
     routes: alloc::vec::Vec<Route>,
-    /// `/svc/services`: the list, and starting and stopping on an admin session.
     services: Services,
-    /// Admin requests waiting for what they asked.
     held: alloc::vec::Vec<Held>,
     terminal: u64,
-    /// The login chain's endpoints from `init`, until the chain takes them.
+    /// `init`'s endpoints for the login chain, until it takes them.
     fs_endpoint: u64,
     profile_endpoint: u64,
     svcs: alloc::vec::Vec<Supervised>,
     entries: alloc::vec::Vec<Entry>,
-    /// Declarations started so far, in file order.
     started: usize,
     chain_started: bool,
     /// The server bring-up is waiting on: its `Ready` before the next declaration starts.
     awaiting: Option<usize>,
-    /// When waiting for the next declaration's `after` gives up.
     after_until: Option<u64>,
-    /// A critical server failed at boot: nothing more starts.
+    /// A critical server failed at boot, or a shutdown began: nothing more starts.
     halted: bool,
-    /// Whether the supervised list has been reported.
     reported: bool,
-    /// A shutdown under way, once one is asked for.
     shutdown: Option<Shutdown>,
 }
 
@@ -1318,9 +1108,8 @@ impl Mgr {
         loop {
             self.advance();
             // **The notification channel, every route, and the servers still starting** — whose
-            // `Ready` is the one thing a control channel brings. A death needs no slot: it closes
-            // the channel and queues `ChildExited` on the notification channel, and each pass looks
-            // at every channel ([`Mgr::poll`]).
+            // `Ready` is the one thing a control channel brings. A death needs no slot: it queues
+            // `ChildExited`, and each pass looks at every channel ([`Mgr::poll`]).
             let mut count = 0usize;
             // SAFETY: WAIT_HANDLES holds WAIT_MAX slots, and `push` stops there.
             unsafe {
@@ -1359,7 +1148,6 @@ impl Mgr {
                     deadline,
                 )
             };
-            // **Level-triggered, so everything is looked at**, whichever handle woke the wait.
             self.serve_resolves();
             self.serve_services();
             let mut codes = alloc::vec::Vec::new();
@@ -1367,18 +1155,15 @@ impl Mgr {
             self.poll(&mut codes);
             self.due();
             self.shutdown_step();
-            // Anything left belongs to a child this manager does not supervise — the login
-            // supervisors, whose exits reach this same channel. Reported rather than dropped.
             for code in codes {
                 Line::new().s(b"service-mgr: an unsupervised child exited code=").i(code as i64).end();
             }
         }
     }
 
-    /// The soonest thing that is due: a server's `Ready` deadline, a restart, an `after`.
     fn next_deadline(&self) -> u64 {
         // **Not an `after` once halted**: nothing more starts, so nothing clears it, and a deadline
-        // left in the past would spin this loop (PR #340 review, finding 3).
+        // left in the past would spin this loop.
         let mut d = if self.halted { u64::MAX } else { self.after_until.unwrap_or(u64::MAX) };
         for h in &self.held {
             if let Awaits::Exit { until, .. } = h.awaits {
@@ -1400,8 +1185,8 @@ impl Mgr {
         d
     }
 
-    /// Answer every resolve queued on every route: `SUBNAMESPACE` into the registry at the route's
-    /// base — the whole suffix continuing — while something is bound there, `NotFound` while not.
+    /// Answer every resolve queued on every route: `SUBNAMESPACE` into the registry at the
+    /// route's base while something is bound there, `NotFound` while not.
     fn serve_resolves(&mut self) {
         for r in &self.routes {
             while let Some((op, request_id, body)) = recv_serve(r.serve) {
@@ -1419,8 +1204,6 @@ impl Mgr {
         }
     }
 
-    /// Start what bring-up allows: declarations in file order, each server's `Ready` awaited
-    /// before the next, and the login chain after the last server.
     fn advance(&mut self) {
         while !self.halted && self.awaiting.is_none() {
             match bringup::next(&self.entries, self.started, self.chain_started) {
@@ -1451,9 +1234,9 @@ impl Mgr {
         }
     }
 
-    /// Whether declaration `i`'s `after` dependencies have finished — or the wait for them has
-    /// run out, which is reported and then taken as yes. **`after` means "has exited"**, and it
-    /// orders backwards only: a name declared later has not started, and cannot be waited for.
+    /// Whether declaration `i`'s `after` dependencies have finished, or the wait has run out
+    /// (reported, then taken as yes). **`after` means "has exited"** and orders backwards only: a
+    /// name declared later has not started, and cannot be waited for.
     fn after_finished(&mut self, i: usize) -> bool {
         let name = self.svcs[i].decl.name.clone();
         let mut waiting = alloc::vec::Vec::new();
@@ -1507,7 +1290,6 @@ impl Mgr {
         }
     }
 
-    /// Spawn declaration `i`. A server becomes `Starting`, and bring-up waits for its `Ready`.
     fn start(&mut self, i: usize, bringup: bool) -> bool {
         let server = self.svcs[i].decl.endpoint.is_some();
         let (h, ctrl) = spawn_service(self.root_ns, self.registry, &self.svcs[i].decl);
@@ -1521,8 +1303,8 @@ impl Mgr {
             } else {
                 Phase::Up
             };
-            // **Only bring-up waits** (PR #340 review, finding 3): a restart after boot holds
-            // nothing up, and one during bring-up must not displace the server it is waiting on.
+            // **Only bring-up waits**: a restart after boot holds nothing up, and one during
+            // bring-up must not displace the server it is waiting on.
             if server && bringup {
                 self.awaiting = Some(i);
             }
@@ -1536,25 +1318,20 @@ impl Mgr {
             true
         } else {
             if bringup && server {
-                // The spawn already said why. A server that is not running did not come up.
                 self.awaiting = Some(i);
                 self.failed_to_start(i);
             }
-            // Otherwise the caller's: a restart's policy, or an administrator's answer.
             false
         }
     }
 
-    /// Look at every running service's control channel: a starting server's `Ready`, and
-    /// deaths — then pair the deaths with the codes this wake collected.
-    ///
     /// **Which child exited is decided by its control channel closing**, not by the
     /// notification: `KIND_CHILD_EXITED` names a pid, and nothing maps a handle to one
     /// (`TODO(child-exit-attribution)`). The code is taken from the notification queue in arrival
     /// order, and **the close can come first**: `sys_process_exit` closes a child's handles
     /// before it queues the notification, so a wake with more deaths than codes waits for the
-    /// rest, up to [`CODE_GRACE_NS`] — answering resolves meanwhile. A death still without a code
-    /// is treated as a failure.
+    /// rest, up to [`CODE_GRACE_NS`], answering resolves meanwhile. A death still without a code
+    /// is a failure.
     fn poll(&mut self, codes: &mut alloc::vec::Vec<i32>) {
         let mut dead = alloc::vec::Vec::new();
         for i in 0..self.svcs.len() {
@@ -1593,16 +1370,14 @@ impl Mgr {
         }
     }
 
-    /// Wait on the notification channel until `deadline` — answering resolves meanwhile, since
-    /// they wait on this process. `false` once the deadline has passed.
     fn wait_codes(&mut self, deadline: u64) -> bool {
         let w = self.wait_serving(self.notif, deadline).is_some();
         self.serve_resolves();
         w
     }
 
-    /// Wait for `h` or any route until `deadline`: `h`'s 24-byte result if it was ready, `None`
-    /// if not. The routes are only woken on; the caller answers them.
+    /// Wait for `h` or any route until `deadline`: `h`'s result if ready; the caller answers
+    /// the routes.
     fn wait_serving(&self, h: u64, deadline: u64) -> Option<[u8; 24]> {
         let mut handles = [0u64; WAIT_MAX];
         let mut n = 0;
@@ -1621,8 +1396,7 @@ impl Mgr {
     }
 
     /// Resolve `path` in `ns`, **answering resolves until it completes** or `deadline` passes:
-    /// the handle, or `0`. What a server mints for sessions is asked for this way, since the
-    /// server may be resolving through a route at that moment itself.
+    /// the server asked may be resolving through a route itself.
     fn lookup_serving(&mut self, ns: u64, path: &[u8], rights: u64, deadline: u64) -> u64 {
         // SAFETY: a namespace handle this process holds, and a valid path.
         let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
@@ -1634,7 +1408,6 @@ impl Mgr {
             let done = self.wait_serving(po, deadline);
             self.serve_resolves();
             if let Some(e) = done {
-                // IoResult: status at 8..12, the resolved handle at 16..24.
                 let status = i32::from_le_bytes([e[8], e[9], e[10], e[11]]);
                 let handle = u64::from_le_bytes(e[16..24].try_into().unwrap_or([0; 8]));
                 break if status == 0 { handle } else { 0 };
@@ -1647,9 +1420,8 @@ impl Mgr {
         got
     }
 
-    /// A server's `Meta::Ready` arrived: bind its endpoint in the registry — replacing a
-    /// predecessor's — and, the first time, its root path to its route. Then ask it for each
-    /// endpoint it mints for sessions.
+    /// A server's `Meta::Ready` arrived: bind its endpoint in the registry, replacing a
+    /// predecessor's, and the first time its root path to its route; then derive its endpoints.
     fn register(&mut self, i: usize, endpoint: u64) {
         let name = self.svcs[i].decl.name.clone();
         let path = self.svcs[i].decl.endpoint.clone().unwrap_or_default();
@@ -1697,9 +1469,8 @@ impl Mgr {
         close(s.endpoint);
         s.endpoint = endpoint;
         s.phase = Phase::Up;
-        // **Said only when it is so** (PR #340 review, finding 4): a gate reads this line as the
-        // server reachable at its path. Without the root binding it is reachable through the
-        // routes the sessions hold, and not at its path.
+        // **Said only when it is so**: a gate reads this line as the server reachable at its
+        // path, and without the root binding it is reachable only through the session routes.
         if s.root_bound {
             Line::new().s(b"service-mgr: ").s(name.as_bytes()).s(b" bound at ").s(path.as_bytes()).end();
         } else {
@@ -1715,10 +1486,8 @@ impl Mgr {
         self.settle_up(i, true);
     }
 
-    /// Ask server `i` for the endpoint it mints for sessions by a resolve of `through`, and bind
-    /// it at its place in the registry, where the route to it continues. Each time the server
-    /// comes up: the last one went with its predecessor. A server that does not answer is said,
-    /// and its sessions are not handed the route.
+    /// Ask server `i` for the endpoint it mints by a resolve of `through`, and bind it in the
+    /// registry, each time it comes up. One that does not answer is said, and gets no route.
     fn derive(&mut self, i: usize, through: &'static str) {
         let name = self.svcs[i].decl.name.clone();
         let path = format!("{}/{}", registry::base(&name), through);
@@ -1752,8 +1521,8 @@ impl Mgr {
             .end();
     }
 
-    /// The route for server `i`'s own path (`through` = `None`) or a derived endpoint of its,
-    /// made the first time it is needed. `None` when there is no room, which is said.
+    /// The route for server `i`'s own path or a derived endpoint, made when first needed. `None`
+    /// when there is no room, which is said.
     fn route(&mut self, i: usize, through: Option<&'static str>) -> Option<usize> {
         if let Some(r) = self.routes.iter().position(|r| r.svc == i && r.through == through) {
             return Some(r);
@@ -1774,9 +1543,8 @@ impl Mgr {
         Some(self.routes.len() - 1)
     }
 
-    /// A duplicate of the route to server `name` — its own path, or `through` one it minted —
-    /// for a login supervisor, while something is bound there; `0` otherwise, and the sessions
-    /// bind nothing.
+    /// A duplicate of the route to server `name` for a login supervisor while something is bound
+    /// there; `0` otherwise.
     fn route_copy(&self, name: &str, through: Option<&str>) -> u64 {
         let found = self.routes.iter().find(|r| r.live && r.through == through && self.svcs[r.svc].decl.name == name);
         match found {
@@ -1786,16 +1554,16 @@ impl Mgr {
         }
     }
 
-    /// Start nothing more, and ask `init` for the emergency shell over the terminal channel. Only
-    /// ever before the terminal server is up, which is what lets the shell take the console.
+    /// Start nothing more, and ask `init` for the emergency shell. Only before the terminal
+    /// server is up, which is what lets the shell take the console.
     fn ask_for_the_emergency_shell(&mut self) {
         self.halted = true;
         kprint(b"service-mgr: asking init for the emergency shell\n");
         send_control(self.terminal, TERMINAL_OP_EMERGENCY);
     }
 
-    /// Server `i` did not come up. At bring-up, a critical one stops the boot and asks `init` for
-    /// the emergency shell; any other is reported and passed.
+    /// Server `i` did not come up. At bring-up, a critical one stops the boot; any other is
+    /// reported and passed.
     fn failed_to_start(&mut self, i: usize) {
         self.svcs[i].phase = Phase::Down;
         self.settle_up(i, false);
@@ -1819,8 +1587,7 @@ impl Mgr {
         }
     }
 
-    /// Service `i` has exited with `code`: take its registry binding away, and apply its
-    /// restart policy — a restart **scheduled**, after its backoff.
+    /// Service `i` has exited with `code`: unbind it, and apply its restart policy.
     fn reap(&mut self, i: usize, code: Option<i32>) {
         let was = self.svcs[i].phase;
         {
@@ -1861,9 +1628,9 @@ impl Mgr {
         self.settle_exit(i);
     }
 
-    /// Apply service `i`'s restart policy to an exit with `code` — or to a restart that could not
-    /// spawn, as a failure. `was` is its phase before: one that died starting and will not be
-    /// restarted did not come up.
+    /// Apply service `i`'s restart policy to an exit with `code`, or to a restart that could not
+    /// spawn. `was` is its phase before: one that died starting and will not be restarted did
+    /// not come up.
     fn apply_policy(&mut self, i: usize, code: Option<i32>, was: Phase) {
         let s = &self.svcs[i];
         let restarting = !s.requested_shutdown
@@ -1913,7 +1680,7 @@ impl Mgr {
         s.restart_at = Some(now_ns().saturating_add(backoff));
     }
 
-    /// Whatever is due: a restart whose backoff is over, and a server whose `Ready` is late.
+    /// Whatever is due: a restart, a late `Ready`, a stop past its bound.
     fn due(&mut self) {
         let now = now_ns();
         // **A stop not honoured within its bound** is answered so, and stays asked: an exit after
@@ -1938,15 +1705,14 @@ impl Mgr {
             if self.svcs[i].restart_at.is_some_and(|at| at <= now) {
                 self.svcs[i].restart_at = None;
                 self.svcs[i].attempts += 1;
-                // A restart is bring-up's only when it is of the server bring-up is waiting on —
-                // one that died starting, and replaces the attempt that did.
+                // A restart is bring-up's only when it replaces the attempt of the server
+                // bring-up is waiting on, which died starting.
                 let bringup = self.awaiting == Some(i);
                 self.svcs[i].restarts += 1;
                 if !self.start(i, bringup) && !bringup {
                     // **A restart that could not spawn is a restart that failed**, and its policy
                     // decides what next — never the bring-up rule, which would ask for the
-                    // emergency shell with the terminal server holding the console (PR #340
-                    // review, finding 3).
+                    // emergency shell with the terminal server holding the console.
                     Line::new()
                         .s(b"service-mgr: '")
                         .s(self.svcs[i].decl.name.as_bytes())
@@ -1954,8 +1720,7 @@ impl Mgr {
                         .end();
                     self.apply_policy(i, Some(-1), Phase::Down);
                     // **A start that waited for this one is answered** once its policy has
-                    // nothing more to try (PR #341 review, finding 5); otherwise it waits for the
-                    // next attempt.
+                    // nothing more to try; otherwise it waits for the next attempt.
                     if self.svcs[i].restart_at.is_none() {
                         self.settle_up(i, false);
                     }
@@ -1976,8 +1741,7 @@ impl Mgr {
         }
     }
 
-    /// **Serve `/svc/services`** (administration Part E.2): an endpoint of this manager's own, bound
-    /// there in the root. It answers the table, and mints admin endpoints.
+    /// **Serve `/svc/services`** from an endpoint bound there in the root.
     fn open_services(&mut self) {
         let Some((client, serve)) = make_channel(SERVE_DEPTH) else {
             kprint(b"service-mgr: /svc/services channel create FAIL\n");
@@ -1993,8 +1757,7 @@ impl Mgr {
         close(client);
         self.services.serve = serve;
         kprint(b"service-mgr: serving /svc/services\n");
-        // The session endpoint: made once, answered on its own end, so its holder is told apart —
-        // a session reaches the table and never an admin endpoint.
+        // Answered on its own end, so a session reaches the table and never an admin endpoint.
         match make_channel(SERVE_DEPTH) {
             Some((client, serve)) => {
                 self.services.session_client = client;
@@ -2004,7 +1767,6 @@ impl Mgr {
         }
     }
 
-    /// The table: a row per declaration, in file order.
     fn table(&self) -> alloc::vec::Vec<u8> {
         let rows: alloc::vec::Vec<(&str, services::State, u32)> = self
             .svcs
@@ -2019,15 +1781,11 @@ impl Mgr {
         services::table(&rows)
     }
 
-    /// Answer everything queued on `/svc/services`, its admin and power endpoints and their
-    /// sessions.
-    ///
     /// **Sessions, then endpoints, then resolves**, so that a slot a closed channel frees is free
     /// before a new one is asked for in the same wake: a session before an endpoint opens another,
     /// and an endpoint before `/svc/services` mints another. Answered the other way round, a
     /// `power-endpoint` resolve arriving with its last holder's close was refused `WouldBlock` with
-    /// the one slot about to be freed — the view broker's own race, found by `boot-probe` in
-    /// administration Part E.4a.
+    /// the one slot about to be freed.
     fn serve_services(&mut self) {
         let mut k = 0;
         while k < self.services.admin_sessions.len() {
@@ -2065,8 +1823,6 @@ impl Mgr {
             match recv_request(end) {
                 Ok(Some((op, request_id, _))) => self.open_admin_session(end, op, request_id),
                 Ok(None) => k += 1,
-                // Its holder has gone: the broker, or a view with the grant, and every view made
-                // from it.
                 Err(()) => {
                     close(end);
                     self.services.admin_ends.remove(k);
@@ -2099,8 +1855,7 @@ impl Mgr {
                 }
             }
         }
-        // A session endpoint's holders are the logins and what they spawn; this manager holds its
-        // other end, so it cannot close.
+        // This manager holds its other end, so it cannot close.
         let session = self.services.session_serve;
         if session != 0 {
             while let Ok(Some((op, request_id, body))) = recv_request(session) {
@@ -2109,8 +1864,8 @@ impl Mgr {
         }
     }
 
-    /// A resolve on `/svc/services` (`session` = `false`) or a session endpoint: the table, or on
-    /// the first only, a new admin endpoint.
+    /// A resolve on `/svc/services` or a session endpoint: the table, or on the first only, an
+    /// admin or power endpoint.
     fn answer_resolve(&mut self, from: u64, op: u16, request_id: u64, body: &[u8], session: bool) {
         let resolve = librsproto::OP_NS_RESOLVE;
         if op != resolve {
@@ -2153,7 +1908,6 @@ impl Mgr {
         }
     }
 
-    /// A resolve on an admin endpoint: whatever its suffix, an admin session.
     fn open_admin_session(&mut self, end: u64, op: u16, request_id: u64) {
         let resolve = librsproto::OP_NS_RESOLVE;
         if op != resolve {
@@ -2172,7 +1926,7 @@ impl Mgr {
         }
     }
 
-    /// A resolve on a power endpoint: whatever its suffix, a power session.
+    /// A resolve on an admin or power endpoint opens a session, whatever its suffix.
     fn open_power_session(&mut self, end: u64, op: u16, request_id: u64) {
         let resolve = librsproto::OP_NS_RESOLVE;
         if op != resolve {
@@ -2191,9 +1945,8 @@ impl Mgr {
         }
     }
 
-    /// `Shutdown`, on power session `session`: answered as soon as it has begun, since nothing
-    /// comes back after it, and refused while one is under way. A power session asks for nothing
-    /// else.
+    /// `Shutdown`, on a power session: answered as soon as it has begun, since nothing comes back
+    /// after it, and refused while one is under way.
     fn power_request(&mut self, session: u64, op: u16, request_id: u64, body: &[u8]) {
         use librsproto::services::{OP_SERVICES_SHUTDOWN, parse_shutdown};
         if op != OP_SERVICES_SHUTDOWN {
@@ -2212,16 +1965,14 @@ impl Mgr {
     }
 
     /// **Begin a shutdown**: nothing more starts, every waiting request is refused, and the login
-    /// supervisors are asked to end their sessions — the first of [`service_mgr::shutdown`]'s
-    /// steps. [`shutdown_step`](Self::shutdown_step) takes the rest as each is done.
+    /// supervisors are asked to end their sessions; [`Self::shutdown_step`] takes the rest.
     fn begin_shutdown(&mut self, reboot: bool) {
         kprint(if reboot {
             b"service-mgr: shutting down, to reboot, as asked\n"
         } else {
             b"service-mgr: shutting down, as asked\n"
         });
-        // Nothing more starts — not bring-up, not a policy's restart — and whatever exits from here
-        // was asked to.
+        // Nothing more starts, bring-up or restart, and whatever exits from here was asked to.
         self.halted = true;
         for s in &mut self.svcs {
             s.restart_at = None;
@@ -2231,8 +1982,8 @@ impl Mgr {
         for h in core::mem::take(&mut self.held) {
             refuse(h.session, h.op, h.request_id, KError::WouldBlock, b"the machine is shutting down");
         }
-        // The sessions first. Each supervisor passes the request on to its session's leader, closes
-        // the session at the broker, and exits; its control channel closing is how that is seen.
+        // The sessions first: each supervisor ends its session and exits, and its control channel
+        // closing is how that is seen.
         kprint(b"service-mgr: asking the login supervisors to end their sessions\n");
         for k in [0, 2] {
             // SAFETY: single-threaded; the supervisors' slots.
@@ -2246,9 +1997,8 @@ impl Mgr {
         self.shutdown = Some(Shutdown { reboot, stage: Stage::Sessions { until } });
     }
 
-    /// **Take a shutdown as far as it can go now**: past the sessions once both supervisors have
-    /// exited, past a service once it has exited, each at the latest when its bound runs out —
-    /// a stop is a request, and one not honoured holds up only the machine's stop. Then `init` is
+    /// **Take a shutdown as far as it can go now**: past each stage once it is done or its bound
+    /// has run out, since a stop not honoured holds up only the machine's stop. Then `init` is
     /// told to finish.
     fn shutdown_step(&mut self) {
         let Some((reboot, stage)) = self.shutdown.as_ref().map(|s| (s.reboot, s.stage)) else {
@@ -2333,8 +2083,7 @@ impl Mgr {
         }
     }
 
-    /// `Start`, `Stop` or `Restart`, on admin session `session`: refused now, or answered once it
-    /// has happened.
+    /// `Start`, `Stop` or `Restart`, on an admin session: refused now, or answered once done.
     fn admin_request(&mut self, session: u64, op: u16, request_id: u64, body: &[u8]) {
         if op == librsproto::services::OP_SERVICES_SHUTDOWN {
             let why = b"a shutdown is asked on a power session, which the `power` grant opens";
@@ -2397,9 +2146,8 @@ impl Mgr {
         }
     }
 
-    /// Start service `i` because it was asked, and answer `held` when it is up — at once, for one
-    /// that is not a server — or say why not. A start asked for starts afresh: no stop stands, and
-    /// its restart attempts begin again.
+    /// Start service `i` because it was asked, answering `held` when it is up. A start asked for
+    /// starts afresh: no stop stands, and its restart attempts begin again.
     fn start_asked(&mut self, i: usize, held: Held) {
         let s = &mut self.svcs[i];
         s.requested_shutdown = false;
@@ -2416,7 +2164,7 @@ impl Mgr {
         }
     }
 
-    /// Service `i` has exited: answer a stop that waited for it, or start it again for a restart.
+    /// Service `i` has exited: answer a stop that waited for it, or restart it.
     fn settle_exit(&mut self, i: usize) {
         let waits_exit = |h: &Held| h.svc == i && matches!(h.awaits, Awaits::Exit { .. });
         let Some(k) = self.held.iter().position(waits_exit) else {
@@ -2437,7 +2185,6 @@ impl Mgr {
         }
     }
 
-    /// Server `i` came up (`up`), or did not: answer a start that waited for it.
     fn settle_up(&mut self, i: usize, up: bool) {
         let Some(k) = self.held.iter().position(|h| h.svc == i && h.awaits == Awaits::Up) else {
             return;
@@ -2451,7 +2198,7 @@ impl Mgr {
     }
 
     /// Start the login chain with `init`'s two endpoints and a route to each server a session
-    /// binds — never the server's own endpoint, so a session reaches a restarted server too.
+    /// binds, never the server's own endpoint.
     fn start_login_chain(&mut self) {
         let chain = ChainEndpoints {
             fs: core::mem::take(&mut self.fs_endpoint),
@@ -2469,23 +2216,19 @@ impl Mgr {
     }
 }
 
-/// How long a server has to answer for an endpoint it mints for sessions — resolves answered
-/// meanwhile. It answers from its serving loop, already up, so this only bounds one that is not.
+/// How long a server has to answer for an endpoint it mints for sessions.
 const DERIVE_TIMEOUT_NS: u64 = 5_000_000_000;
 
 /// How long to wait for a service named in another's `after` to finish.
 ///
 /// Bounded because the wait is for something that may never happen: `after` means "has
 /// exited", and nothing stops a declaration from naming a service that keeps running. A hang
-/// there would present as a boot that stops with no message, which is the worst failure this
-/// supervisor can produce; timing out and saying so is strictly better.
+/// would be a boot that stops with no message.
 const AFTER_TIMEOUT_NS: u64 = 20_000_000_000; // 20 s
 
-/// How long a service found dead waits for its exit code. **The close can come first.**
-/// `sys_process_exit` closes the child's handles, its control endpoint among them, before it
-/// queues `ChildExited`. So on another CPU, a wake can find a service dead with its code still to
-/// come. `check-terminal` saw `'boot-probe' exited code=unknown` that way (administration C.7).
-/// The gap is the rest of one exit syscall; this bound only matters for a code that never comes.
+/// How long a service found dead waits for its exit code. **The close can come first**:
+/// `sys_process_exit` closes the child's handles before it queues `ChildExited`, so a wake on
+/// another CPU can find it dead with the code still to come, and log `code=unknown`.
 const CODE_GRACE_NS: u64 = 1_000_000_000;
 
 /// Take every `ChildExited` queued on `notif`, logging each, and append its code to `codes`.
@@ -2516,21 +2259,17 @@ fn drain_codes(notif: u64, codes: &mut alloc::vec::Vec<i32>) {
 
 /// Whether `ch`'s peer has gone: drain the endpoint until it answers.
 ///
-/// `sys_channel_recv` distinguishes the two empty cases — `WouldBlock` (`-11`) when the
-/// ring is merely empty and the peer is alive, `PeerClosed` (`-13`) when it is empty and
-/// the peer is gone. That difference is what makes a control channel an exit
-/// discriminator; see [`Mgr::poll`].
+/// `sys_channel_recv` answers `WouldBlock` when the ring is merely empty and the peer is alive,
+/// `PeerClosed` when it is empty and the peer is gone; that is what makes a control channel an exit
+/// discriminator (see [`Mgr::poll`]). **A drain, not a single receive**, because a receive that
+/// returns `0` has *consumed* a message: a queued message would otherwise mask the close behind it.
+/// A service that is not a server cannot send here — its control end is granted `RECV | WAIT` and
+/// no `SEND` — but **a server can**, and this is where a `Ready` lands that came after its
+/// deadline.
 ///
-/// **A drain, not a single receive**, because a receive that returns `0` has *consumed* a
-/// message: a queued message would otherwise mask the close behind it and be silently
-/// eaten on the way. A service that is not a server cannot send here — its control end is
-/// granted `RECV | WAIT` and no `SEND` (`spawn_service`) — but **a server can**, since it sends
-/// its `Meta::Ready` on this channel (administration Part E.1a), and this is where a `Ready` lands
-/// that came after its deadline.
-///
-/// A message found here is reported, and **every handle it carried is closed** (PR #340 review,
-/// finding 5): a late `Ready` carries the server's endpoint, which nothing binds now, and a server
-/// whose endpoint has closed ends itself — its exit is then attributed here, as any other's.
+/// A message found here is reported, and **every handle it carried is closed**: a late `Ready`
+/// carries the server's endpoint, which nothing binds now, and a server whose endpoint has
+/// closed ends itself — its exit is then attributed here, as any other's.
 fn channel_peer_closed(ch: u64) -> bool {
     loop {
         // SAFETY: RDY_MSG/RDY_HANDLES/RDY_COUNT are valid writable out-params; this is a

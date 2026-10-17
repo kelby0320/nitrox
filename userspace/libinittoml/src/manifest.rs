@@ -6,8 +6,8 @@
 //! topologically sorts the mounts by mount-point depth (shallowest first, so a
 //! parent path is bound before its children). Binds are validated against the mounts —
 //! each names one as its source — and kept in file order. The mount *processing* loop (spawn
-//! fs-server → Ready handshake → `sys_ns_bind`) is slice-4 Part 5 / slice 7; this
-//! module is the pure, host-testable front half.
+//! fs-server → Ready handshake → `sys_ns_bind`) lives in `init`; this module is the pure,
+//! host-testable front half.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -24,10 +24,9 @@ pub enum Mode {
 
 impl Mode {
     /// The flags byte of the fs-server's **setup message** for this mode: `1` — read-only — for
-    /// `"ro"` (administration Part C.3). Since then `"ro"` is the server's too: it refuses every
-    /// mutation and marks every file read-only, where before only the binding's rights changed,
-    /// and forwarded resolves ignore those. Stated here rather than taken from `librsproto`,
-    /// which init does not link; a host test holds the two equal.
+    /// `"ro"`. The server enforces it, refusing every mutation and marking every file read-only,
+    /// since forwarded resolves ignore the binding's rights. Stated here rather than taken from
+    /// `librsproto`, which init does not link; a host test holds the two equal.
     pub fn setup_flags(self) -> u8 {
         match self {
             Mode::Ro => 1,
@@ -37,7 +36,7 @@ impl Mode {
 }
 
 /// One validated `[[mount]]` entry. `options` (the optional `[mount.options]`
-/// subtable) is kept verbatim to forward to the fs-server at Ready (slice 7);
+/// subtable) is kept verbatim to forward to the fs-server at Ready;
 /// `required_for` is validated to be `"boot"` but not stored (the only value).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountSpec {
@@ -53,7 +52,7 @@ pub struct MountSpec {
 ///
 /// It shares the source's server registration rather than spawning a rival server for the
 /// same device, which is what a second `[[mount]]` of that device would do. `session-mgr`
-/// binds each login's `/home` the same way, from the same endpoint (Phase 5 Part C.1).
+/// binds each login's `/home` the same way, from the same endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindSpec {
     /// Where the binding appears. Absolute.
@@ -73,7 +72,7 @@ pub struct Manifest {
 }
 
 /// Why an `init.toml` manifest was rejected. Init logs this and drops to the
-/// emergency shell (Part 5); the `line`/field detail aids the operator.
+/// emergency shell; the `line`/field detail aids the operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
     /// The file was not valid TOML (carries the parser's error).
@@ -185,7 +184,7 @@ fn depth(path: &str) -> usize {
 /// its block device (`docs/spec/init-toml-schema.md`): `gpt-partlabel:<l>` →
 /// `/dev/disk/by-partlabel/<l>`, `gpt-partuuid:<u>` → `/dev/disk/by-partuuid/<u>`.
 /// `None` for an unknown scheme (init logs it and drops the mount). The kernel
-/// (slice 6 GPT driver) binds these paths to the partition's device node at boot.
+/// binds these paths to the partition's device node at boot.
 pub fn device_ns_path(device: &str) -> Option<String> {
     let (prefix, value) = if let Some(v) = device.strip_prefix("gpt-partlabel:") {
         ("/dev/disk/by-partlabel/", v)
@@ -329,7 +328,7 @@ required_for=\"boot\"
         assert_eq!(parse(&bad), Err(ManifestError::NonAbsoluteMountPoint { index: 0 }));
     }
 
-    /// The test image's shape: the root mount, and two binds over it (Part C.1).
+    /// The test image's shape: the root mount, and two binds over it.
     const ROOT_AND_BINDS: &str = "\
 [[mount]]
 fs_server    = \"fs-server-ext4\"

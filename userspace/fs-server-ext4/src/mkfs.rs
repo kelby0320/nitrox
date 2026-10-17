@@ -1,14 +1,11 @@
-//! Making an empty ext4 filesystem — **layout only** (Phase 5 Part H.2).
+//! Making an empty ext4 filesystem — **layout only**.
 //!
-//! The writer beside it ([`crate::ext4`]) populates a filesystem; this one creates the thing
-//! it populates: superblock and backups, the group-descriptor table, per-group bitmaps and
-//! inode tables, and a root directory. Nothing here allocates a file — `create_file` and
-//! `mkdir_at` do that, against exactly the structures this laid out.
+//! The writer beside it ([`crate::ext4`]) populates a filesystem; this one creates what it
+//! populates: superblock and backups, the group-descriptor table, per-group bitmaps and inode
+//! tables, and a root directory. `create_file` and `mkdir_at` allocate against what it lays out.
 //!
-//! It exists because `nxinstall` has to make a filesystem the size of a disk, and the only
-//! other way to get one is `mke2fs` on a build machine — which is how H.1 shipped: it copied
-//! a 24 MiB filesystem onto a 931 GiB partition and the filesystem did not know about the
-//! space around it.
+//! It exists because `nxinstall` must make a filesystem the size of its partition, not of a
+//! `mke2fs` image.
 //!
 //! ## What it declares, and therefore what it must produce
 //!
@@ -18,57 +15,40 @@
 //! ```
 //!
 //! **`sparse_super` is implemented**, because it is a rule rather than a layout: backup
-//! superblocks and descriptor tables go in groups 0, 1, and the powers of 3, 5 and 7. On a
-//! 931 GiB disk that is 15 groups rather than 7,600, which is 1.8 GiB of backups not written.
+//! superblocks and descriptor tables go in groups 0, 1, and the powers of 3, 5 and 7.
 //!
-//! **`flex_bg` is not**, and the feature bit is not set. It packs several groups' bitmaps and
-//! inode tables together to make metadata sequential; it is an optimisation, and declaring it
-//! without doing it would describe a layout that is not there. Our images from `mke2fs` do
-//! have it, which is why `check-images` compares filesystems by their *contents* and not
-//! their bytes.
+//! **`flex_bg` is not**, and the feature bit is not set: declaring it without doing it would
+//! describe a layout that is not there. `mke2fs` images do have it, so `check-images` compares
+//! filesystems by their *contents*.
 //!
-//! **`metadata_csum` is not**, matching every other image in this tree: the reader maintains
-//! no checksums, and a filesystem that claimed them would be one `e2fsck` calls corrupt after
-//! the first write.
+//! **`metadata_csum` and the journal are not**: the reader maintains no checksums (a filesystem
+//! that claimed them would be one `e2fsck` calls corrupt after the first write) and has no jbd2.
 //!
-//! **No journal.** `has_journal` needs jbd2 and replay, which the server does not have.
-//!
-//! ## The oracle
-//!
-//! `e2fsck -fn` accepts what this writes, and [`crate::ext4`] reads it back. Neither alone is
-//! enough: `e2fsck` would accept a filesystem our reader cannot parse, and our reader would
-//! accept its own mistakes.
+//! `e2fsck -fn` accepts what this writes, and [`crate::ext4`] reads it back; neither alone is
+//! enough, since each would accept the other's mistakes.
 
 use crate::{BlockWriter, FsError};
 
-/// Reserved inode numbers. 1 is the bad-blocks inode, 2 the root directory, 3–10 are
-/// reserved by the format; the first inode a file may use is 11 (`s_first_ino`).
+/// Reserved inode numbers: 1 is bad-blocks, 2 the root directory, 3–10 reserved by the format;
+/// the first a file may use is 11 (`s_first_ino`).
 const FIRST_INO: u32 = 11;
-/// Inode 2 is the root directory, by definition of the format.
 const ROOT_INO: u32 = 2;
-/// Bytes per inode record. 256 like every other image in this tree — 128 would drop the
-/// nanosecond timestamps and the `extra_isize` the writer stamps.
+/// Bytes per inode record. 256 like every other image here: 128 would drop the nanosecond
+/// timestamps and the `extra_isize` the writer stamps.
 const INODE_SIZE: u32 = 256;
-/// `i_extra_isize`: how much of a 256-byte inode past the 128-byte base is in use.
 const EXTRA_ISIZE: u16 = 32;
-/// Group-descriptor size without `64bit`.
 const DESC_SIZE: u32 = 32;
 
 /// `s_feature_incompat`: `filetype` (directory entries carry a type byte) and `extent`.
 const INCOMPAT: u32 = 0x0002 | 0x0040;
-/// `s_feature_ro_compat`: `sparse_super`, `large_file`, `huge_file`, `dir_nlink`,
-/// `extra_isize`.
+/// `s_feature_ro_compat`: `sparse_super`, `large_file`, `huge_file`, `dir_nlink`, `extra_isize`.
 const RO_COMPAT: u32 = 0x0001 | 0x0002 | 0x0008 | 0x0020 | 0x0040;
 
-/// `EXT4_EXTENTS_FL`.
 const EXTENTS_FL: u32 = 0x0008_0000;
-/// The extent header's magic.
 const EXTENT_MAGIC: u16 = 0xF30A;
-/// `S_IFDIR | 0755`.
 const ROOT_MODE: u16 = 0x41ED;
 
-/// The smallest filesystem this will make: enough blocks for one group's metadata and a root
-/// directory with somewhere to put entries.
+/// The smallest filesystem this will make: one group's metadata and a root directory.
 const MIN_BLOCKS: u64 = 64;
 
 /// What to make.
@@ -78,15 +58,13 @@ pub struct Params {
     pub blocks: u64,
     /// Bytes per block: 1024, 2048 or 4096. The reader's scratch is one block.
     pub block_size: u32,
-    /// Bytes of filesystem per inode, `mke2fs -i`. See [`Geometry::inodes_count`] for the cap
-    /// that bounds what this can cost.
+    /// Bytes of filesystem per inode, `mke2fs -i`; [`Geometry::new`] caps what it can cost.
     pub bytes_per_inode: u32,
-    /// The filesystem's UUID. **Caller-supplied**, like `libgpt`'s: this module has no
-    /// entropy, and a filesystem whose UUID is a constant is one that collides with every
-    /// other machine's.
+    /// The filesystem's UUID. **Caller-supplied**: this module has no entropy, and a constant UUID
+    /// collides with every other machine's.
     pub uuid: [u8; 16],
-    /// The volume label, cut to 16 bytes. Not what a partition is found by — that is the GPT
-    /// name — so this is for a person reading `dumpe2fs`.
+    /// The volume label, cut to 16 bytes; for a person reading `dumpe2fs`, not what a partition is
+    /// found by.
     pub label: [u8; 16],
     /// Seconds since the epoch, for the superblock's times. The caller reads the clock.
     pub now: i64,
@@ -127,8 +105,8 @@ pub struct Geometry {
     pub block_size: u32,
     /// Blocks in the filesystem.
     pub blocks_count: u64,
-    /// Block numbering origin: 1 for 1 KiB blocks (the superblock occupies block 0's second
-    /// half and nothing else fits), 0 otherwise.
+    /// Block numbering origin: 1 for 1 KiB blocks (the superblock takes block 0's second half),
+    /// else 0.
     pub first_data_block: u32,
     /// Blocks per group: `8 * block_size`, one bit per block in a one-block bitmap.
     pub blocks_per_group: u32,
@@ -159,58 +137,38 @@ impl Geometry {
         if addressable < MIN_BLOCKS {
             return Err(MkfsError::TooSmall { have: p.blocks, need: MIN_BLOCKS });
         }
-        // **The filesystem may be smaller than the partition**, by up to one short final
-        // group — see the loop at the end of this function, which is why `blocks_count` is a
-        // variable rather than `p.blocks`.
+        // The filesystem may be smaller than the partition by one short final group (see the loop
+        // below), which is why `blocks_count` is a variable.
         let mut blocks_count = p.blocks;
         let mut groups = blocks_count.saturating_sub(first_data_block as u64).div_ceil(blocks_per_group as u64) as u32;
         let mut gdt_blocks = (groups as u64 * DESC_SIZE as u64).div_ceil(p.block_size as u64) as u32;
 
-        // **Inodes: the ratio, then a cap.** The table is written out in full — there is no
-        // `lazy_itable_init` without `metadata_csum` — so every inode costs 256 bytes of
-        // zeroes written at install time. At `mke2fs`'s default ratio a 931 GiB disk asks for
-        // 61 million of them, which is 16 GiB to write before the first file exists. A
-        // million inodes is a generous ceiling for a personal machine's root and costs 256
-        // MiB, so that is the cap.
+        // **Inodes: the ratio, then a cap.** The table is written out in full (there is no
+        // `lazy_itable_init` without `metadata_csum`), so every inode costs 256 bytes of zeroes at
+        // install time: `mke2fs`'s ratio asks for 61 million on a 931 GiB disk, 16 GiB. A million
+        // costs 256 MiB, so that is the cap.
         let by_ratio = p.blocks.saturating_mul(p.block_size as u64) / p.bytes_per_inode.max(1) as u64;
         let wanted = by_ratio.clamp(FIRST_INO as u64 + 1, MAX_INODES);
-        // Round the per-group count so an inode table is a whole number of blocks, and keep
-        // it at least one block: a group with a fraction of a block of inodes has nowhere to
-        // put them. **Rounded down**, so the cap above is a ceiling rather than a target that
-        // the rounding then overshoots — at one inode more per group than asked for, a
-        // 7,452-group disk ends up 25,000 inodes over.
+        // Whole blocks of inode table, at least one. **Rounded down**, so the cap is a ceiling
+        // that the rounding cannot overshoot.
         let per_block = p.block_size / INODE_SIZE;
         let mut inodes_per_group = (wanted / groups as u64) as u32 / per_block * per_block;
         inodes_per_group = inodes_per_group.max(per_block);
-        // A group cannot hold more inodes than it has blocks to describe them with.
         inodes_per_group = inodes_per_group.min(blocks_per_group / 2 * per_block);
-        // **And no more than a group descriptor can count.** `bg_free_inodes_count_lo` is 16
-        // bits, so a group of more than 65,535 inodes would have its free count truncated on
-        // the way to disk and every descriptor would claim a number that is not true. No
-        // in-tree caller gets near it — `bytes_per_inode` is 16384 everywhere — but `Params`
-        // is public, and `bytes_per_inode = 512` on a single-group 4 KiB filesystem asks for
-        // 262,144 (PR #310 review). Clamped here, where the number is chosen, rather than
-        // where it is written out.
+        // **And no more than a group descriptor can count**: `bg_free_inodes_count_lo` is 16 bits,
+        // so a larger group would have its free count truncated on the way to disk. `Params` is
+        // public, so a small `bytes_per_inode` on one group can ask for it.
         inodes_per_group = inodes_per_group.min(u16::MAX as u32 / per_block * per_block);
         let itable_blocks = inodes_per_group / per_block;
 
         // **Drop a final group too short to hold its own metadata**, as `mke2fs` does.
         //
-        // Group 0 carries the most *overhead* and the last group can carry the fewest
-        // *blocks*, and those are independent: a filesystem can end with a group of 7 blocks
-        // that needs 68. The first version of this compared group 0 against itself and called
-        // that sufficient — "group 0 carries the most metadata, so if the root fits there it
-        // fits" — which is true of overhead and says nothing about the tail. `format` then
-        // wrote past the end of the filesystem, and `descriptor`'s free-block count
-        // underflowed. At `nxinstall`'s parameters roughly **one partition size in 400** lands
-        // there (PR #310 review, finding 1).
-        //
-        // Dropping costs at most one short group, which is by definition fewer blocks than its
-        // own metadata — about 70 on a 4 KiB filesystem, a quarter of a megabyte. Refusing
-        // instead would mean an installer that turns down one disk in 400 for a reason nobody
-        // could act on. Looping because dropping a group can shrink the descriptor table,
-        // which lowers every group's overhead; it terminates because `blocks_count` strictly
-        // decreases.
+        // Group 0 carries the most overhead and the last group can carry the fewest blocks, and
+        // those are independent: a filesystem can end with a group of 7 blocks that needs 68.
+        // Writing it would run past the end of the filesystem. Dropping costs at most one short
+        // group (about 70 blocks on a 4 KiB filesystem); refusing would turn down one disk in 400.
+        // It loops because dropping a group can shrink the descriptor table, which lowers every
+        // group's overhead, and ends because `blocks_count` strictly decreases.
         let g = loop {
             let g = Geometry {
                 block_size: p.block_size,
@@ -232,7 +190,6 @@ impl Geometry {
             if groups == 1 || g.overhead(last) < g.blocks_in_group(last) as u64 {
                 break g;
             }
-            // Cut the filesystem at the start of the group being dropped.
             blocks_count = g.group_start(last);
             groups -= 1;
             gdt_blocks = (groups as u64 * DESC_SIZE as u64).div_ceil(p.block_size as u64) as u32;
@@ -276,20 +233,18 @@ impl Geometry {
         })
     }
 
-    /// Blocks of `group` taken by metadata: its superblock and descriptor copy if it has one,
-    /// then its two bitmaps and its inode table.
+    /// Blocks of `group` taken by metadata: its superblock and descriptor copy if it has one, its
+    /// two bitmaps, and its inode table.
     pub fn overhead(&self, group: u32) -> u64 {
         let sb = if self.has_super(group) { 1 + self.gdt_blocks as u64 } else { 0 };
         sb + 2 + self.itable_blocks as u64
     }
 
-    /// The first block of `group`'s block bitmap, inode bitmap and inode table.
     fn metadata_start(&self, group: u32) -> u64 {
         let sb = if self.has_super(group) { 1 + self.gdt_blocks as u64 } else { 0 };
         self.group_start(group) + sb
     }
 
-    /// Total free blocks once the layout is written and the root directory placed.
     fn free_blocks(&self) -> u64 {
         let used: u64 = (0..self.groups).map(|g| self.overhead(g)).sum();
         let total: u64 = (0..self.groups).map(|g| self.blocks_in_group(g) as u64).sum();
@@ -297,31 +252,26 @@ impl Geometry {
     }
 }
 
-/// The most inodes this will make, whatever the ratio asks for. See [`Geometry::new`].
 const MAX_INODES: u64 = 1 << 20;
 
 /// Write an empty filesystem over `w`, and return the layout it wrote.
 ///
-/// **Writes metadata only.** Data blocks are left as they were — an install writes over them
-/// immediately, and zeroing a terabyte to make an empty filesystem is time spent for nothing.
-/// Every structure a reader or `e2fsck` looks at *is* written, including the parts of a
-/// bitmap and an inode table that describe nothing yet, because those are read.
+/// **Writes metadata only.** Data blocks are left as they were: an install writes over them
+/// immediately. Every structure a reader or `e2fsck` looks at *is* written, including the parts
+/// of a bitmap and an inode table that describe nothing yet, because those are read.
 pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u32)) -> Result<Geometry, FsError> {
     let g = Geometry::new(p).map_err(MkfsError::fs_error)?;
     let bs = p.block_size as usize;
 
-    // The root directory's data block: the first block after group 0's metadata.
     let root_block = g.metadata_start(0) + 2 + g.itable_blocks as u64;
 
     let mut block = [0u8; MAX_BLOCK];
     for group in 0..g.groups {
-        // --- the two bitmaps and the inode table -------------------------------------
         let meta = g.metadata_start(group);
         let (bbitmap, ibitmap, itable) = (meta, meta + 1, meta + 2);
 
-        // Block bitmap: this group's own metadata, the root block if it is here, and every
-        // bit past the group's real length — a short final group's spare bits address blocks
-        // that are not there, and a filesystem that left them clear would hand one out.
+        // Block bitmap: this group's metadata, the root block if it is here, and every bit past the
+        // group's real length (a short final group's spare bits address blocks that are not there).
         block[..bs].fill(0);
         let overhead = g.overhead(group) as usize;
         for i in 0..overhead {
@@ -335,8 +285,7 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u
         }
         w.write_at(bbitmap * p.block_size as u64, &block[..bs])?;
 
-        // Inode bitmap: the reserved inodes in group 0, and the padding past the group's
-        // share everywhere.
+        // Inode bitmap: the reserved inodes in group 0, and the padding past the group's share.
         block[..bs].fill(0);
         if group == 0 {
             for i in 0..(FIRST_INO - 1) as usize {
@@ -348,13 +297,9 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u
         }
         w.write_at(ibitmap * p.block_size as u64, &block[..bs])?;
 
-        // The inode table, zeroed. `e2fsck` reads every inode, so a slot holding whatever the
-        // disk held before is a slot it may decide is a file.
-        //
-        // **This is where the time goes.** A 931 GiB disk has 7,452 groups, and writing each
-        // one's two bitmaps and inode table is about 300 MiB in total — minutes on a spinning
-        // disk, one command at a time, with nothing else to show for it. Hence `progress`:
-        // silence for that long is indistinguishable from a hang.
+        // The inode table, zeroed: `e2fsck` reads every inode, so a slot holding old bytes may be
+        // taken for a file. **This is where the time goes** (about 300 MiB over a 931 GiB disk's
+        // 7,452 groups): hence `progress`, since silence that long looks like a hang.
         block[..bs].fill(0);
         for b in 0..g.itable_blocks as u64 {
             w.write_at((itable + b) * p.block_size as u64, &block[..bs])?;
@@ -362,9 +307,8 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u
         progress(group + 1, g.groups);
     }
 
-    // --- the root directory ----------------------------------------------------------
-    // Two entries: `.` and `..`, both the root itself. The second one's `rec_len` covers the
-    // rest of the block, which is what makes the block a complete chain.
+    // Two entries, `.` and `..`, both the root. The second's `rec_len` covers the rest of the
+    // block.
     block[..bs].fill(0);
     write_dirent(&mut block[0..], ROOT_INO, 12, b".", 2);
     write_dirent(&mut block[12..], ROOT_INO, (bs - 12) as u16, b"..", 2);
@@ -379,7 +323,6 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u
     wr_u16(&mut inode, 26, 2); // i_links_count: `.` and `..`
     wr_u32(&mut inode, 28, p.block_size / 512); // i_blocks_lo, in 512-byte units
     wr_u32(&mut inode, 32, EXTENTS_FL);
-    // One inline extent covering the single block.
     wr_u16(&mut inode, 40, EXTENT_MAGIC);
     wr_u16(&mut inode, 42, 1); // eh_entries
     wr_u16(&mut inode, 44, 4); // eh_max — four fit in i_block
@@ -393,16 +336,12 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u
     let root_off = itable0 * p.block_size as u64 + (ROOT_INO as u64 - 1) * INODE_SIZE as u64;
     w.write_at(root_off, &inode)?;
 
-    // --- the group descriptors, then the superblock and its backups -------------------
     let free = g.free_blocks();
     let mut sb = [0u8; 1024];
     wr_u32(&mut sb, 0, g.inodes_count);
     wr_u32(&mut sb, 4, g.blocks_count as u32);
-    // **No reserved blocks**, where `mke2fs` reserves 5% for the superuser. That reservation
-    // exists so a full disk still leaves root able to log in and clean up; this system has no
-    // root account and no privileged process to reserve for, so the 5% would be 46 GiB of a
-    // terabyte withheld from its owner on behalf of nobody. `alloc_block` ignores the field
-    // either way, so this is a statement about whose disk it is rather than a behaviour change.
+    // **No reserved blocks**, where `mke2fs` reserves 5% for the superuser: this system has no
+    // root account to reserve for. `alloc_block` ignores the field either way.
     wr_u32(&mut sb, 8, 0); // s_r_blocks_count_lo
     wr_u32(&mut sb, 12, free as u32);
     wr_u32(&mut sb, 16, g.inodes_count - (FIRST_INO - 1));
@@ -434,16 +373,8 @@ pub fn format<W: BlockWriter>(w: &W, p: &Params, progress: &mut dyn FnMut(u32, u
     Ok(g)
 }
 
-/// One group's descriptor.
-///
-/// Computed on demand rather than held in a table, which is the whole reason this is a
-/// function: the table for a 931 GiB disk is 7,452 descriptors — **238 KiB, or 59 blocks** —
-/// and the first version of this built it in a single one-block buffer. It indexed past the
-/// end at group 128 and the installer died on a real disk with no message, because a panic in
-/// a program whose diagnostics go to the terminal prints through `kprint` instead. The gate's
-/// filesystem has four groups, 128 bytes of descriptors, so nothing under QEMU could reach it
-/// — the same shape of blindness as the single-group fixture that hid group-0-only allocation
-/// (2026-09-17).
+/// One group's descriptor, computed on demand rather than held in a table: a 931 GiB disk's is
+/// 7,452 descriptors (**238 KiB or 59 blocks**) and this library holds one block of scratch.
 fn descriptor(g: &Geometry, group: u32) -> [u8; DESC_SIZE as usize] {
     let meta = g.metadata_start(group);
     let mut d = [0u8; DESC_SIZE as usize];
@@ -462,14 +393,11 @@ fn descriptor(g: &Geometry, group: u32) -> [u8; DESC_SIZE as usize] {
     d
 }
 
-/// Write the superblock and descriptor table into group 0 and every backup group.
-///
-/// A backup's `s_block_group_nr` names its own group, which is how `e2fsck -b` knows which
-/// copy it is reading.
+/// Write the superblock and descriptor table into group 0 and every backup group. A backup's
+/// `s_block_group_nr` names its own group, which is how `e2fsck -b` knows which copy it reads.
 fn write_super_and_gdt<W: BlockWriter>(w: &W, g: &Geometry, sb: &[u8; 1024]) -> Result<(), FsError> {
     let bs = g.block_size as u64;
-    // **A block of descriptors at a time**, filled from [`descriptor`]. The table is 59 blocks
-    // on a terabyte, and this library holds one block of scratch.
+    // **A block of descriptors at a time**, filled from [`descriptor`].
     let per_block = (g.block_size / DESC_SIZE) as usize;
     let mut block = [0u8; MAX_BLOCK];
     for group in 0..g.groups {
@@ -478,8 +406,8 @@ fn write_super_and_gdt<W: BlockWriter>(w: &W, g: &Geometry, sb: &[u8; 1024]) -> 
         }
         let mut copy = *sb;
         wr_u16(&mut copy, 90, group as u16); // s_block_group_nr
-        // The primary superblock lives at byte 1024 whatever the block size; a backup starts
-        // at its group's first block.
+        // The primary superblock lives at byte 1024 whatever the block size; a backup at its
+        // group's first block.
         let (sb_at, gdt_at) = if group == 0 {
             (1024, (g.first_data_block as u64 + 1) * bs)
         } else {
@@ -542,9 +470,7 @@ mod tests {
         }
     }
 
-    /// `sparse_super`'s rule, which decides where 1.8 GiB of backups do not go on a large
-    /// disk. Stated as the set it produces rather than as the predicate, so a wrong
-    /// predicate has to produce the right set to pass.
+    /// `sparse_super`'s rule, stated as the set it produces so a wrong predicate fails.
     #[test]
     fn backups_land_on_0_1_and_the_powers_of_3_5_and_7() {
         let g = Geometry::new(&params(1 << 20, 4096)).unwrap();
@@ -552,8 +478,8 @@ mod tests {
         assert_eq!(with, [0, 1, 3, 5, 7, 9, 25, 27, 49, 81, 125, 243, 343], "0 and 1 always, then 3^n, 5^n and 7^n");
     }
 
-    /// The last group is short whenever the size does not divide, and every other group is
-    /// full. Getting this wrong hands out a block past the end of the device.
+    /// The last group is short whenever the size does not divide; getting it wrong hands out a
+    /// block past the end of the device.
     #[test]
     fn the_final_group_holds_only_what_is_left() {
         let g = Geometry::new(&params(24576, 1024)).unwrap();
@@ -564,29 +490,22 @@ mod tests {
         assert_eq!(total, g.blocks_count - g.first_data_block as u64);
     }
 
-    /// The inode count is capped however generous the ratio, because the table is written
-    /// out in full: at `mke2fs`'s default ratio a 931 GiB disk asks for 61 million inodes,
-    /// which is 16 GiB of zeroes before the first file exists.
+    /// The inode count is capped however generous the ratio.
     #[test]
     fn the_inode_count_is_capped_for_a_large_disk() {
         let big = Geometry::new(&params(244_190_000, 4096)).unwrap(); // ~931 GiB
         assert!(big.inodes_count as u64 <= MAX_INODES, "{} inodes", big.inodes_count);
         assert!(big.inodes_count > 100_000, "still a usable number of files");
-        // The table it costs, which is the number the cap exists to bound.
         let itable_bytes = big.itable_blocks as u64 * big.block_size as u64 * big.groups as u64;
         assert!(itable_bytes < 512 * 1024 * 1024, "{itable_bytes} bytes of inode table");
-        // A small filesystem is governed by the ratio instead, not the cap.
         let small = Geometry::new(&params(24576, 1024)).unwrap();
         assert!((small.inodes_count as u64) < MAX_INODES);
     }
 
     /// **A final group shorter than its own metadata is dropped, not written past.**
     ///
-    /// Both sizes are the reviewer's, reproduced (PR #310, finding 1): 8,200 blocks at 1 KiB
-    /// gives a second group of 7 blocks needing 68, and 26,214,401 blocks at 4 KiB — a size
-    /// `nxinstall` can be handed — gives group 800 a single block needing 83. The old guard
-    /// compared group 0 against itself and accepted both; `format` then wrote past the end of
-    /// the filesystem, and `descriptor`'s free-block count underflowed.
+    /// 8,200 blocks at 1 KiB gives a second group of 7 blocks needing 68; 26,214,401 blocks at
+    /// 4 KiB gives group 800 a single block needing 83.
     #[test]
     fn a_final_group_too_short_for_its_metadata_is_dropped() {
         for (blocks, bs) in [(8200u64, 1024u32), (26_214_401, 4096)] {
@@ -598,16 +517,16 @@ mod tests {
                 g.blocks_in_group(last),
                 g.overhead(last)
             );
-            // **Every group, not just the last** — the loop lowers the descriptor table as it
-            // drops groups, so the claim is about the geometry it settles on.
+            // **Every group, not just the last**: the loop lowers the descriptor table as it drops
+            // groups.
             for n in 0..g.groups {
                 assert!(
                     g.overhead(n) < g.blocks_in_group(n) as u64,
                     "{blocks} blocks at {bs}: group {n} cannot hold its own metadata"
                 );
             }
-            // The filesystem never claims more than the partition, and gives up at most the
-            // one short group — far less than a whole one.
+            // The filesystem never claims more than the partition, and gives up at most one short
+            // group.
             assert!(g.blocks_count <= blocks);
             assert!(
                 blocks - g.blocks_count < g.blocks_per_group as u64,
@@ -617,8 +536,7 @@ mod tests {
         }
     }
 
-    /// The same property over a sweep, because the reviewer found it at 0.25% of sizes and a
-    /// hand-picked pair proves only the two that were picked.
+    /// The same property over a sweep, since a hand-picked pair proves only the two picked.
     #[test]
     fn no_size_produces_a_group_that_cannot_hold_its_metadata() {
         // `nxinstall`'s parameters, around 100 GiB, stepping by a group so the tail varies.

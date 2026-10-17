@@ -1,16 +1,12 @@
 //! The single process-wide kernel handle table and its one-time init.
 //!
-//! The handle table is **global** — one globally-numbered segmented table
-//! with a per-entry `owner_pid` checked on every lookup (per-process tables
-//! are rejected; see `docs/rationale/rejected-approaches.md`). This module
-//! owns the single instance.
-//!
-//! It is stored inline (no `Box::leak` — forbidden by `kernel/CLAUDE.md`) in
-//! a once-init cell. [`init`] runs exactly once in early boot after the heap
-//! is up; [`get`] returns a shared `&'static HandleTable` whose `&self`
-//! methods carry their own interior synchronisation (per-entry seqlock for
-//! lookups + the rank-3 alloc lock). No coarse lock wraps the table, so
-//! lookups stay lock-free.
+//! The handle table is **global**: one segmented table with a per-entry
+//! `owner_pid` checked on every lookup (per-process tables are rejected; see
+//! `docs/rationale/rejected-approaches.md`). It is stored inline in a once-init
+//! cell: [`init`] runs once in early boot after the heap is up, and [`get`]
+//! returns a shared `&'static HandleTable` whose `&self` methods synchronise
+//! themselves (seqlock lookups, the rank-3 alloc lock). No coarse lock wraps it,
+//! so lookups stay lock-free.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -28,13 +24,10 @@ struct GlobalTable {
 }
 
 // SAFETY: the inner `HandleTable` is published only after `state` reaches
-// `READY` with a `Release` store; `get` reads `state` with `Acquire`, so any
-// reader that observes `READY` also observes the fully-initialised table.
-// After `READY` the table is never mutated through the cell (its own `&self`
-// methods provide all interior mutability) and is never moved or dropped for
-// the kernel's lifetime, so handing out `&'static` shared borrows is sound.
-// `HandleTable` is itself `Sync`; the `UnsafeCell` only mediates the one-time
-// initialisation, which single-CPU boot cannot race.
+// `READY` with a `Release` store, and `get` reads `state` with `Acquire`. After
+// `READY` the table is never mutated through the cell (its `&self` methods
+// provide all interior mutability), moved or dropped, so `&'static` shared
+// borrows are sound; the one-time init is guarded by a CAS.
 unsafe impl Sync for GlobalTable {}
 
 static GLOBAL: GlobalTable = GlobalTable { state: AtomicU8::new(UNINIT), slot: UnsafeCell::new(MaybeUninit::uninit()) };
@@ -45,16 +38,14 @@ static GLOBAL: GlobalTable = GlobalTable { state: AtomicU8::new(UNINIT), slot: U
 /// drawn from the CSPRNG), and **before** any userspace can issue a handle
 /// syscall. Returns `Err` if the table allocation fails.
 pub fn init() -> Result<(), HandleError> {
-    // Single-CPU boot can't actually race, but a CAS makes the
-    // initialise-once invariant explicit (and SMP-ready).
+    // The CAS makes the initialise-once invariant explicit.
     if GLOBAL.state.compare_exchange(UNINIT, INITIALISING, Ordering::AcqRel, Ordering::Acquire).is_err() {
         debug_assert!(false, "handle::global::init called more than once");
         return Ok(());
     }
-    // Seed the per-segment free-list shuffle from the CSPRNG (keyed by
-    // `entropy::init`, which boot runs first). The seed only randomizes free-list
-    // scan order — defence-in-depth on handle-value unpredictability, atop the
-    // owner-PID check + per-slot generation counter that actually unforge handles.
+    // The seed only randomizes free-list scan order: defence in depth on
+    // handle-value unpredictability, atop the owner-PID check and per-slot
+    // generation that actually unforge handles.
     let table = HandleTable::try_new(crate::entropy::seed_u64())?;
     // SAFETY: we won the `UNINIT -> INITIALISING` transition, so we have
     // exclusive access to the cell; no reader can be in `get` because `state`
@@ -76,37 +67,28 @@ pub fn get() -> &'static HandleTable {
     unsafe { (*GLOBAL.slot.get()).assume_init_ref() }
 }
 
-/// Handles closed per batch by [`close_all_owned_by`].
-///
-/// Each entry is a pointer + a type tag, so the batch is ~32 bytes on the sweeping
-/// thread's kernel stack. Small enough to be free, large enough that a process with a
-/// handful of handles is reclaimed in one pass.
+/// Handles closed per batch by [`close_all_owned_by`]; each entry is a pointer
+/// plus a type tag, so a batch is small on the sweeping thread's kernel stack.
 const SWEEP_BATCH: usize = 16;
 
-/// Close **every** handle owned by `pid` and release the objects they pinned.
-///
-/// This is what makes a process's handles die with it. Without it a dead process's
-/// entries persist — the table is global with a per-entry `owner_pid`, and nothing else
-/// sweeps it — pinning every object they reference. The visible consequence is that the
-/// process's end of a pipe never closes, so a peer blocked on it never observes
-/// `PeerClosed` (see the decision log, 2026-07-24).
+/// Close **every** handle owned by `pid` and release the objects they pinned;
+/// otherwise a dead process's entries pin their objects forever (its end of a
+/// pipe never closes, so a peer never sees `PeerClosed`).
 ///
 /// # Context
 ///
-/// Must run in **thread context, outside `SCHED`, and not in IRQ context**: releasing the
-/// references runs object destructors, which reach the rank-6 allocator and — for an IPC
-/// endpoint — take rank-1 `SCHED` to wake blocked receivers. Holding rank-1 or rank-3
-/// across that would invert the ranking. The sweep therefore works in batches: entries are
-/// unlinked under the rank-3 lock, and each batch's references are dropped after that lock
-/// is released. Preemption is disabled across the drops for the same reason
-/// [`reap_pending`](crate::sched::reap_pending) does it — a descheduled holder of an
-/// allocator spinlock starves every CPU spinning on it (F12, decision log 2026-07-21).
+/// Thread context only: outside `SCHED`, not in IRQ context. Releasing
+/// references runs object destructors, which reach the rank-6 allocator and,
+/// for an IPC endpoint, take rank-1 `SCHED`; holding rank-1 or rank-3 across
+/// that would invert the ranking. So entries are unlinked in batches under the
+/// rank-3 lock and each batch is dropped after it is released, with preemption
+/// disabled across the drops as [`reap_pending`](crate::sched::reap_pending)
+/// does: a descheduled holder of an allocator spinlock starves every CPU
+/// spinning on it.
 ///
-/// Safe against pid reuse because pids are monotonic and never reused
-/// ([`alloc_pid`](crate::sched::alloc_pid)).
-/// Returns **how many handles it actually closed**, which is what distinguishes "this pid
-/// had nothing left" from "this never ran" — the difference between exit-context teardown
-/// working and silently not being on the path.
+/// Safe against pid reuse: pids are monotonic and never reused
+/// ([`alloc_pid`](crate::sched::alloc_pid)). Returns how many handles it closed,
+/// which tells "nothing left" from "never ran".
 pub fn close_all_owned_by(pid: u32) -> usize {
     use super::table::{ClosedObject, SweepCursor};
     use crate::object::ObjectRef;

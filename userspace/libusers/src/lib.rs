@@ -1,5 +1,5 @@
 //! **`/system/users`, the credential file** — its format, the rules for what may go in it, and
-//! the edits that change it (administration Part D.1).
+//! the edits that change it.
 //!
 //! ```text
 //! # comment and blank lines are kept as they are
@@ -18,9 +18,7 @@
 //! **No `alloc`.** An edit writes the whole new file into a buffer its caller owns, and refuses
 //! one longer than [`MAX_FILE`] — the most `auth-service` loads at boot. A file over it is one the
 //! service will not load, and then nobody logs in, so the bound is the file's rather than the
-//! service's (PR #337 review).
-//!
-//! `#![no_std]`, and `std` under `cargo test`.
+//! service's.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -118,8 +116,7 @@ impl<'a> Record<'a> {
     }
 }
 
-/// The file's lines, each with its end: `(start, end)` where `end` includes the `\n`, if there
-/// is one.
+/// The file's lines as `(start, end)`, `end` past the `\n` if there is one.
 fn lines(file: &[u8]) -> impl Iterator<Item = (usize, usize)> + '_ {
     let mut at = 0;
     core::iter::from_fn(move || {
@@ -151,15 +148,13 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> + '_ {
 /// The first record named `name`. The first, because that is the one `auth-service` has always
 /// authenticated against.
 ///
-/// **Found by [`line_of`], the lookup the edits use**, so the record a password is set on is the
-/// record a login is checked against even in a file that names someone twice — a hand-edited one,
-/// being recovered with `account --users`, say (PR #338 review). Two lookups could drift apart.
+/// Found by [`line_of`], the lookup the edits use, so the record a password is set on is the
+/// record a login is checked against even in a file that names someone twice.
 pub fn find<'a>(file: &'a [u8], name: &[u8]) -> Option<Record<'a>> {
     let (s, e) = line_of(file, name)?;
     record_of(&file[s..e])
 }
 
-/// Where the first record named `name` is: its line's `(start, end)`.
 fn line_of(file: &[u8], name: &[u8]) -> Option<(usize, usize)> {
     lines(file).find(|&(s, e)| record_of(&file[s..e]).is_some_and(|r| r.name == name))
 }
@@ -194,7 +189,7 @@ pub fn write_record(out: &mut [u8], name: &[u8], home: &[u8], password: &[u8], s
     write_record_with(out, name, home, password, salt, ITERATIONS)
 }
 
-/// [`write_record`], at `iterations` — for a test that cannot afford the real count, and for a
+/// [`write_record`], at `iterations`: for a test that cannot afford the real count, and for a
 /// seeder that wants a record's cost fixed.
 pub fn write_record_with(
     out: &mut [u8],
@@ -255,11 +250,10 @@ pub fn add_with(
     splice(out, &[file, gap, &line[..ln]])
 }
 
-/// **The file with `name`'s record taken out**, every other line kept byte for byte.
+/// The file with `name`'s record taken out, every other line kept byte for byte.
 ///
-/// **A name the rules refuse is refused as one**, before the lookup, as [`add`] refuses it — not
-/// reported missing (PR #338 review). So a record a hand-edited file holds under such a name is
-/// never edited by any tool, which the view broker, refusing the name first, already ensured.
+/// A name the rules refuse is refused as one before the lookup, not reported missing, so a record
+/// a hand-edited file holds under such a name is never edited by any tool.
 pub fn remove(file: &[u8], out: &mut [u8], name: &[u8]) -> Result<usize, Refusal> {
     if !valid_name(name) {
         return Err(Refusal::BadName);
@@ -268,10 +262,10 @@ pub fn remove(file: &[u8], out: &mut [u8], name: &[u8]) -> Result<usize, Refusal
     splice(out, &[&file[..s], &file[e..]])
 }
 
-/// **The file with `name`'s password replaced**: a new verifier under `salt`, in the record's own
-/// place, keeping its name and home. Every other line is kept byte for byte. The line grows when
-/// the new salt is longer than the old — the build's 8 bytes against [`SALT_LEN`]'s 16 — so this
-/// can be refused as [`Refusal::TooLarge`] too.
+/// The file with `name`'s password replaced: a new verifier under `salt`, in the record's own
+/// place, keeping its name and home; every other line is kept byte for byte. The line grows when
+/// the new salt is longer than the old (the build's 8 bytes against [`SALT_LEN`]), so this can be
+/// [`Refusal::TooLarge`] too.
 pub fn set_password(file: &[u8], out: &mut [u8], name: &[u8], password: &[u8], salt: &[u8]) -> Result<usize, Refusal> {
     set_password_with(file, out, name, password, salt, ITERATIONS)
 }
@@ -285,7 +279,6 @@ pub fn set_password_with(
     salt: &[u8],
     iterations: u32,
 ) -> Result<usize, Refusal> {
-    // The rules first, as [`remove`] and [`add`] apply them: a bad name is not a missing one.
     if !valid_name(name) {
         return Err(Refusal::BadName);
     }
@@ -301,7 +294,6 @@ pub fn set_password_with(
     splice(out, &[&file[..s], &line[..ln], &file[e..]])
 }
 
-/// Concatenate `parts` into `out`; its length, or [`Refusal::TooLarge`] past [`MAX_FILE`] or `out`.
 fn splice(out: &mut [u8], parts: &[&[u8]]) -> Result<usize, Refusal> {
     let n: usize = parts.iter().map(|p| p.len()).sum();
     if n > MAX_FILE || n > out.len() {
@@ -315,7 +307,6 @@ fn splice(out: &mut [u8], parts: &[&[u8]]) -> Result<usize, Refusal> {
     Ok(n)
 }
 
-/// Bytes appended to a caller's buffer, refusing past its end.
 struct Writer<'a> {
     out: &'a mut [u8],
     at: usize,
@@ -338,7 +329,6 @@ impl Writer<'_> {
     }
 }
 
-/// `v` in decimal, written into `buf`; the digits.
 fn fmt_u32(mut v: u32, buf: &mut [u8; 10]) -> &[u8] {
     let mut i = buf.len();
     loop {
@@ -351,7 +341,6 @@ fn fmt_u32(mut v: u32, buf: &mut [u8; 10]) -> &[u8] {
     }
 }
 
-/// Trim leading and trailing spaces, tabs and `\r`, and a trailing `\n`.
 fn trim(s: &[u8]) -> &[u8] {
     let ws = |c: u8| c == b' ' || c == b'\t' || c == b'\r' || c == b'\n';
     let a = s.iter().position(|&c| !ws(c)).unwrap_or(s.len());
@@ -359,7 +348,6 @@ fn trim(s: &[u8]) -> &[u8] {
     &s[a..b]
 }
 
-/// A decimal `u32`; `None` if empty, not all digits, or overflowing.
 fn parse_u32(s: &[u8]) -> Option<u32> {
     if s.is_empty() {
         return None;

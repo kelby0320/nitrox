@@ -1,16 +1,12 @@
 //! x86_64's answer to [`crate::arch::memory_types`]: the variable-range MTRRs, the default type,
 //! and the page-attribute table (PAT), read and reported.
 //!
-//! **Read, and written.** The reading came first, in Part G's measurement: what the firmware set,
-//! and what a full-screen write therefore costs, because a fix judged against an expectation is
-//! not judged. The writing is [`install_policy`](ArchMemoryTypes::install_policy), which every CPU
-//! calls during bring-up so the table's meanings stop depending on a bootloader's choice.
+//! Every CPU calls [`install_policy`](ArchMemoryTypes::install_policy) during bring-up so the
+//! table's meanings stop depending on a bootloader's choice.
 //!
-//! **The effective type is the stronger of the range registers and the page table.** That is why
-//! the range registers used to decide the framebuffer's fate: a mapping with no attribute is
-//! write-back, and write-back under an uncacheable range is uncacheable. The one way a page table
-//! can *raise* such a range is an attribute of write-combining, which is what a
-//! [`Caching::WriteCombining`](crate::mm::Caching) object now asks for.
+//! **The effective type is the stronger of the range registers and the page table:** write-back
+//! under an uncacheable range is uncacheable, and a page table can only *raise* such a range
+//! with write-combining ([`Caching::WriteCombining`](crate::mm::Caching)).
 
 use super::regs;
 use crate::arch::memory_types::{ArchMemoryTypes, MemoryType, Policy};
@@ -24,47 +20,35 @@ const MSR_MTRR_PHYSBASE0: u32 = 0x200;
 /// `IA32_PAT`: eight type entries, selected by a page's PAT/PCD/PWT bits.
 const MSR_PAT: u32 = 0x277;
 
-/// `CPUID.01H:EDX` bit 12 — the CPU has memory-type range registers.
 const CPUID_EDX_MTRR: u32 = 1 << 12;
-/// `CPUID.01H:EDX` bit 16 — the CPU has a page-attribute table.
 const CPUID_EDX_PAT: u32 = 1 << 16;
 
-/// `IA32_MTRR_DEF_TYPE` bit 11: the range registers are in effect at all.
 const DEF_TYPE_ENABLED: u64 = 1 << 11;
-/// `IA32_MTRR_DEF_TYPE` bit 10: the fixed ranges (below 1 MiB) are in effect.
 const DEF_TYPE_FIXED_ENABLED: u64 = 1 << 10;
-/// `IA32_MTRR_PHYSMASK` bit 11: this range is in use.
 const PHYSMASK_VALID: u64 = 1 << 11;
-/// The address bits of a base or mask register.
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// The fixed ranges cover the first mebibyte, and nothing this kernel asks about lives there.
 const FIXED_RANGE_TOP: u64 = 0x10_0000;
-/// Ranges are read into a fixed array; the architecture allows at most this many.
 const MAX_RANGES: usize = 64;
 
-/// `CR0.CD` — no-fill cache mode, which the vendor's procedure enters before the table changes.
+/// `CR0.CD`: no-fill cache mode, entered before the table changes.
 const CR0_CACHE_DISABLE: u64 = 1 << 30;
-/// `CR0.NW` — not-write-through. Cleared alongside `CD`, as the procedure requires.
+/// `CR0.NW`: not-write-through, cleared alongside `CD`.
 const CR0_NOT_WRITE_THROUGH: u64 = 1 << 29;
-/// `CR4.PGE` — global pages, cleared and restored around the change so global TLB entries go too.
+/// `CR4.PGE`: global pages, cleared around the change so global TLB entries go too.
 const CR4_GLOBAL_PAGES: u64 = 1 << 7;
 
-/// The attribute table this kernel programs, entry 0 first:
-/// write-back, write-through, `UC-`, uncacheable, write-protected, **write-combining**,
-/// uncacheable, uncacheable.
+/// The attribute table this kernel programs, entry 0 first: write-back, write-through, `UC-`,
+/// uncacheable, write-protected, **write-combining**, uncacheable, uncacheable.
 ///
-/// **These are the values Limine already leaves**, on the laptop and under QEMU alike, and that is
-/// deliberate rather than lazy: mappings made before the kernel takes the table over chose their
-/// entries out of it. Two such entries are live — the console's framebuffer mapping selects 5, and
-/// every `kvmap` MMIO mapping selects 2 — so a layout that moved either would change what an
-/// in-flight mapping means. What owning it buys is that the meanings stop depending on a
-/// bootloader's choice; what keeping the values buys is that nothing in flight changes.
+/// **These are the values Limine already leaves**, deliberately: mappings made before the kernel
+/// takes the table over chose their entries out of it (the framebuffer selects 5, every `kvmap`
+/// MMIO mapping selects 2).
 const KERNEL_PAT: u64 = 0x0000_0105_0007_0406;
 
 /// x86_64's memory-type configuration.
 pub struct X86MemoryTypes;
 
-/// One variable range, as the registers describe it.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 struct Range {
     base: u64,
@@ -81,9 +65,8 @@ fn decode(kind: u8) -> MemoryType {
         4 => MemoryType::WriteThrough,
         5 => MemoryType::WriteProtected,
         6 => MemoryType::WriteBack,
-        // `UC-`: a page-attribute entry only. A range register never names it, so `at` can never
-        // return it — but `log_configuration` prints the table, where it is the default for two
-        // of the eight entries.
+        // `UC-`: a page-attribute entry only, so `at` never returns it, but `log_configuration`
+        // prints the table.
         7 => MemoryType::UncacheableWeak,
         other => MemoryType::Other(other),
     }
@@ -91,11 +74,9 @@ fn decode(kind: u8) -> MemoryType {
 
 /// The type a set of ranges gives `phys`.
 ///
-/// **The rules are the vendor's, not a simplification of them.** Disabled range registers make
-/// every address uncacheable — not "whatever the page table says", which is the reading that
-/// would quietly excuse a machine that had turned them off. Where ranges overlap, uncacheable
-/// wins over everything, and write-through wins over write-back; any other overlap is undefined
-/// by the architecture, so the first match is taken and the caller can see the overlap in the log.
+/// **The rules are the vendor's.** Disabled range registers make every address uncacheable.
+/// Where ranges overlap, uncacheable wins over everything and write-through over write-back; any
+/// other overlap is undefined, so the first match is taken.
 fn type_for(phys: u64, ranges: &[Range], default: MemoryType, enabled: bool) -> MemoryType {
     if !enabled {
         return MemoryType::Uncacheable;
@@ -141,7 +122,6 @@ unsafe fn read_ranges(out: &mut [Range; MAX_RANGES]) -> usize {
     used
 }
 
-/// Print an attribute table, entry by entry.
 fn log_table(what: &str, pat: u64) {
     crate::kprintln!(
         "cache policy: {what} 0:{} 1:{} 2:{} 3:{} 4:{} 5:{} 6:{} 7:{}",
@@ -165,9 +145,8 @@ impl ArchMemoryTypes for X86MemoryTypes {
         let def = unsafe { regs::rdmsr(MSR_MTRR_DEF_TYPE) };
         let enabled = def & DEF_TYPE_ENABLED != 0;
         if phys < FIXED_RANGE_TOP && enabled && def & DEF_TYPE_FIXED_ENABLED != 0 {
-            // The fixed registers describe the first mebibyte in 88 sub-ranges. Nothing in this
-            // kernel asks about an address down there, so they are not read rather than read
-            // wrongly — and saying "unknown" is the honest answer to a question not implemented.
+            // The fixed registers describe the first mebibyte in 88 sub-ranges; nothing here asks
+            // about it, so the answer is "unknown".
             return None;
         }
         let mut ranges = [Range { base: 0, mask: 0, kind: MemoryType::Uncacheable }; MAX_RANGES];
@@ -195,10 +174,9 @@ impl ArchMemoryTypes for X86MemoryTypes {
         }
         // SAFETY: CPUID advertises the attribute table, so `IA32_PAT` is implemented.
         let had = unsafe { regs::rdmsr(MSR_PAT) };
-        // **The vendor's sequence** (SDM vol. 3, "Programming the PAT"), which exists because the
-        // caches may hold lines whose memory type the old table described: enter no-fill mode,
-        // write everything back, drop the TLB including its global entries, change the table,
-        // write back again, and only then let the caches fill.
+        // **The vendor's sequence** (SDM vol. 3, "Programming the PAT"), because the caches may
+        // hold lines typed by the old table: no-fill mode, write back, drop the TLB including
+        // global entries, change the table, write back again, then let the caches fill.
         //
         // SAFETY: ring 0 during this CPU's bring-up, per this function's contract. Interrupts are
         // off across the window, so nothing runs on this CPU while its caches are disabled — a
@@ -224,8 +202,7 @@ impl ArchMemoryTypes for X86MemoryTypes {
         if had == KERNEL_PAT {
             return Policy::Unchanged;
         }
-        // The "before" half of G.1's before-and-after: a table nobody expected is worth printing
-        // once, because every mapping made before this call named an entry in it.
+        // Every mapping made before this call named an entry in the old table.
         log_table("the bootloader's table was", had);
         Policy::Replaced
     }
@@ -248,8 +225,8 @@ impl ArchMemoryTypes for X86MemoryTypes {
             // SAFETY: as above.
             let used = unsafe { read_ranges(&mut ranges) };
             for r in &ranges[..used] {
-                // The mask's set bits are the address bits that must match, so the range's size
-                // is the lowest set bit — the span a `(phys & mask) == (base & mask)` test admits.
+                // The size is the lowest set mask bit: the span a `(phys & mask) == (base & mask)`
+                // test admits.
                 let size = if r.mask == 0 { 0 } else { 1u64 << r.mask.trailing_zeros() };
                 crate::kprintln!(
                     "cache policy: range {:#x}..{:#x} {}",
@@ -265,11 +242,9 @@ impl ArchMemoryTypes for X86MemoryTypes {
         }
         // SAFETY: CPUID advertises the page-attribute table, so `IA32_PAT` is implemented.
         let pat = unsafe { regs::rdmsr(MSR_PAT) };
-        // Entry `n` is byte `n`; a page selects one with its PAT, PCD and PWT bits. **Two
-        // entries are in use today**: a mapping with no cache flags lands on entry 0, and
-        // `PageFlags::NO_CACHE` sets `PCD` alone, which selects entry 2 — `UC-`, not plain
-        // uncacheable. Every kernel MMIO mapping (`kvmap`, the interrupt router) is entry 2
-        // (PR #305 review, finding 2).
+        // A page selects entry `n` (byte `n`) with its PAT, PCD and PWT bits. No cache flags
+        // select entry 0; `PageFlags::NO_CACHE` sets `PCD` alone, which selects entry 2, `UC-`
+        // rather than plain uncacheable. Every kernel MMIO mapping is entry 2.
         log_table("page attributes", pat);
     }
 }
@@ -282,8 +257,6 @@ mod tests {
         Range { base, mask: !(size - 1) & ADDR_MASK, kind }
     }
 
-    /// The laptop's shape, as the first boot found it: RAM write-back, and the framebuffer in a
-    /// graphics aperture no range covers, so it falls to the default type.
     #[test]
     fn an_address_outside_every_range_takes_the_default() {
         let ranges = [range(0, 0x8000_0000, MemoryType::WriteBack)];
@@ -301,12 +274,10 @@ mod tests {
         let ranges =
             [range(0, 0x8000_0000, MemoryType::WriteBack), range(0xa000_0000, 0x1000_0000, MemoryType::WriteCombining)];
         assert_eq!(type_for(0xa000_0000, &ranges, MemoryType::Uncacheable, true), MemoryType::WriteCombining);
-        // The last byte of the range, and the first byte past it.
         assert_eq!(type_for(0xafff_f000, &ranges, MemoryType::Uncacheable, true), MemoryType::WriteCombining);
         assert_eq!(type_for(0xb000_0000, &ranges, MemoryType::Uncacheable, true), MemoryType::Uncacheable);
     }
 
-    /// The architecture's overlap rules, which are not "the last one wins".
     #[test]
     fn overlapping_ranges_follow_the_architectures_precedence() {
         let uc_over_wb =
@@ -316,7 +287,6 @@ mod tests {
             MemoryType::Uncacheable,
             "uncacheable wins over everything"
         );
-        // And in the other order, since a table walked in a different order must not differ.
         let wb_over_uc = [uc_over_wb[1], uc_over_wb[0]];
         assert_eq!(type_for(0xa000_0000, &wb_over_uc, MemoryType::WriteBack, true), MemoryType::Uncacheable);
         let wt_and_wb =
@@ -328,8 +298,6 @@ mod tests {
         );
     }
 
-    /// Range registers turned off make **everything** uncacheable, whatever the ranges say — the
-    /// case a "no range matched, so use the default" reading would report as write-back.
     #[test]
     fn disabled_range_registers_make_everything_uncacheable() {
         let ranges = [range(0, 0x1_0000_0000, MemoryType::WriteBack)];
@@ -349,10 +317,6 @@ mod tests {
         assert_eq!(decode(3), MemoryType::Other(3));
     }
 
-    /// **The table this kernel programs, spelled out.** A `u64` of packed type bytes is exactly
-    /// the kind of constant that is wrong in a way nothing notices: the first version of it had
-    /// the entries shifted, and only a boot — which compared it against the bootloader's and said
-    /// they DIFFERED — caught that. This is the same check, in a second.
     #[test]
     fn the_kernels_table_is_the_layout_its_doc_claims() {
         let entry = |n: u32| decode((KERNEL_PAT >> (8 * n) & 0xFF) as u8);

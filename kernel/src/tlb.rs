@@ -1,52 +1,32 @@
-//! Cross-CPU TLB shootdown — architecture-neutral coordination.
+//! Cross-CPU TLB shootdown: architecture-neutral coordination.
 //!
-//! x86 (and every SMP arch we target) keeps *memory* coherent across CPUs in
-//! hardware, but **not** the per-CPU TLB / paging-structure caches. After a CPU
-//! edits a page table — unmapping a page, tightening its protection, or freeing a
-//! page-table / kernel-stack frame for reuse — every *other* CPU that might hold a
-//! cached translation for that address must invalidate it before the edit can be
-//! relied upon (and, for a freed frame, before it is handed back to the allocator).
+//! Hardware keeps *memory* coherent across CPUs but not the per-CPU TLB and paging-structure
+//! caches. After a page-table edit (an unmap, a tighter protection, a page-table or kernel-stack
+//! frame freed for reuse) every other CPU that might cache the translation must invalidate it
+//! before the edit can be relied on, and before a freed frame goes back to the allocator.
 //!
-//! This module drives that invalidation: it publishes what to invalidate, signals
-//! the other online CPUs via the architecture's shootdown IPI
-//! ([`crate::arch::send_shootdown_ipi`]), and **waits** until every target has
-//! acknowledged. The transport (the IPI itself, the dense-index → APIC-id map) is
-//! in the arch layer; the protocol here is arch-neutral.
+//! This module publishes what to invalidate, signals the online CPUs via the arch shootdown IPI
+//! ([`crate::arch::send_shootdown_ipi`]), and **waits** until every target has acknowledged.
 //!
-//! ## Model (v1: broadcast + synchronous, IF-robust)
-//! One shootdown at a time system-wide (serialised by [`LOCK`]); it targets
-//! **every online CPU, including the initiator's own** (a self-IPI rather than a
-//! local invalidation — see below), rather than only those currently running the
-//! affected address space. That is always correct and is required for the kernel
-//! vmap (kernel-stack mappings live in every address space); per-address-space
-//! targeting is a later optimisation.
+//! ## Model
 //!
-//! The whole request — lock acquisition, IPIs, ack spin — runs with **interrupts
-//! enabled**, saving and restoring the caller's interrupt state (F1, decision log
-//! 2026-07-21). Two consequences:
+//! One shootdown at a time system-wide (serialised by [`LOCK`]), targeting **every online CPU, the
+//! initiator's own included** (a self-IPI): always correct, and required for the kernel vmap, whose
+//! kernel-stack mappings live in every address space.
 //!
-//! - **No mutual-wait deadlock, from any caller.** Callers reach here from
-//!   IF-masked contexts (syscall bodies run masked end-to-end; the ring-3
-//!   exception path) via `reap_pending → KernelStack::Drop`. An IF-masked
-//!   spinner — on [`LOCK`] or on the acks — could never service *another*
-//!   initiator's shootdown IPI, so two IF=0 initiators deadlocked. Enabling IF
-//!   for the window restores the invariant the ack protocol depends on: anyone
-//!   waiting can always take an incoming shootdown IPI.
-//! - **The initiator may be preempted — and migrate — mid-window**, so the
-//!   request must not depend on *where* the initiator runs. Targeting every
-//!   online CPU (self included) makes the target set position-independent:
-//!   whichever CPU the initiator resumes on, every CPU that could hold the stale
-//!   translation invalidates exactly once, and the ack count is exact.
+//! The whole request runs with **interrupts enabled** (the caller's state is restored; decision log
+//! 2026-07-21), because callers arrive IF-masked (syscall bodies, the ring-3 exception path, via
+//! `reap_pending` and `KernelStack::Drop`) and an IF-masked spinner, on [`LOCK`] or on the acks,
+//! could never service another initiator's IPI: two such initiators deadlock. With IF on, anyone
+//! waiting can always take an incoming shootdown IPI.
 //!
 //! ## Caller contract
-//! Call from **preemptible kernel context only** — a thread body, a syscall, or
-//! the ring-3 exception path — never from an IRQ handler or DPC (the window
-//! enables interrupts, and frees — the only initiators — are already forbidden
-//! there), and **never while holding any spinlock** (in particular not `SCHED`:
-//! remote CPUs spin for it IF-masked and could not ack; and preemption while
-//! holding a lock stalls every other waiter). Shootdown sites live in the mm
-//! layer (unmap / frame free), reached via `reap_pending` outside all locks,
-//! which satisfies this.
+//!
+//! Call from **preemptible kernel context only**, never from an IRQ handler or DPC (the window
+//! enables interrupts, and frees, the only initiators, are forbidden there) and **never while
+//! holding a spinlock**: not `SCHED` (remote CPUs spin for it IF-masked and could not ack), and
+//! preempting a lock holder stalls every waiter. The mm layer's shootdown sites are reached via
+//! `reap_pending` outside all locks.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -58,36 +38,29 @@ use crate::libkern::SpinLock;
 use crate::libkern::lockrank::LockRank;
 use crate::mm::VirtAddr;
 
-/// Serialises shootdown initiators: only one request is in flight system-wide, so
-/// the single global request block below is unambiguous. A **plain** spinlock (not
-/// IRQ-masking) so a CPU spinning for acknowledgements still takes shootdown IPIs.
-///
-/// Interrupt work therefore runs beneath this lock — a DPC drain at an interrupt tail, a
-/// timer tick taking `SCHED`. That is ordinary rather than exceptional: the rank order
-/// restarts at an interrupt boundary (see `libkern::lockrank` § Interrupt scopes), so this
-/// is an ordinary rank and not, as it was when it first landed, an exemption. The caller
-/// contract above — **no other lock held** — is stricter than the rank and is asserted
-/// separately in debug builds.
+/// Serialises initiators: one request in flight system-wide, so the single request block below is
+/// unambiguous. A **plain** spinlock (not IRQ-masking) so a CPU spinning for acknowledgements still
+/// takes shootdown IPIs, which means interrupt work (a DPC drain, a tick taking `SCHED`) runs
+/// beneath it; the rank order restarts at an interrupt boundary (see `libkern::lockrank` §
+/// Interrupt scopes). The caller contract above, **no other lock held**, is stricter than the rank
+/// and is asserted separately in debug builds.
 static LOCK: SpinLock<()> = SpinLock::new(LockRank::TlbShootdown, ());
 
 /// `true` for a whole-TLB flush (CR3 reload), `false` for a single-page `invlpg`.
 static REQUEST_ALL: AtomicBool = AtomicBool::new(false);
 /// The page to invalidate when `REQUEST_ALL == false` (linear address).
 static REQUEST_VA: AtomicU64 = AtomicU64::new(0);
-/// A dense CPU index must fit in [`ACKED`]'s bits. `on_ipi` shifts by `current_cpu()` with
-/// no range guard of its own — deliberately, since a CPU servicing an IPI has an identity by
-/// construction — so this is where that assumption is stated rather than assumed.
+// `on_ipi` shifts by `current_cpu()` with no range guard, since a CPU servicing an IPI has an
+// identity by construction; this states that a dense index must fit in [`ACKED`]'s bits.
 const _: () = assert!(MAX_CPUS <= 64, "ACKED is a u64 bitmask indexed by dense CPU id");
 
 /// Bitmask of CPUs that have acknowledged the current request (dense index → bit).
 ///
-/// **A mask rather than a countdown, and that is a correctness choice.** A count cannot say
-/// *which* CPU is outstanding, and [`shootdown`] now has to answer exactly that: a CPU that
-/// parks between the target snapshot and its acknowledgement can never send one, and the
-/// initiator must be able to tell that case from "not yet". A count also makes a late
-/// decrement dangerous — it would silently satisfy the *next* request — whereas a stale
-/// `fetch_or` can only set a bit for a CPU that has left the online set, which no later
-/// request targets.
+/// **A mask rather than a countdown, as a correctness choice.** A count cannot say *which* CPU is
+/// outstanding, and [`shootdown`] must tell a CPU that parked between the target snapshot and its
+/// acknowledgement from one that is merely late. A late decrement would also silently satisfy the
+/// *next* request, whereas a stale `fetch_or` only sets the bit of a CPU that has left the online
+/// set, which no later request targets.
 static ACKED: AtomicU64 = AtomicU64::new(0);
 
 /// Invalidate the translation for `va` on this CPU and every other online CPU,
@@ -122,27 +95,20 @@ fn shootdown(va: Option<VirtAddr>) {
     let me = Smp::current_cpu() as usize;
     let online = crate::sched::online_mask();
 
-    // Fast path: sole online CPU (or pre-SMP boot) — just invalidate locally.
-    // With no other CPU there is no cross-CPU stale entry, no possible second
-    // initiator, and no preemption target to migrate to.
+    // Sole online CPU (or pre-SMP boot): invalidate locally; no other CPU holds a stale entry.
     if online & !(1u64 << me) == 0 {
         // SAFETY: ring-0; local invalidation of a caller-owned page-table change.
         unsafe { invalidate_local(va) };
         return;
     }
 
-    // Run the whole request with **preemption disabled** but interrupts
-    // **enabled**, restoring the caller's IF state after. The split matters:
-    // - IF enabled (F1): an IF-masked spinner here could never service another
-    //   initiator's shootdown IPI — two IF=0 initiators deadlock.
-    // - Preemption disabled (F12): a holder of [`LOCK`] descheduled mid-window
-    //   starves every spinner for a scheduling round — and *forever* when the
-    //   holder is the idle thread (reaping stacks), which is never re-picked
-    //   while the spinners keep every CPU busy. Only the switch is deferred;
-    //   IRQ handlers (this CPU's own shootdown IPI included) still run.
-    // With preemption off the initiator cannot migrate mid-window; the
-    // all-online-CPUs target set (self-IPI included) is kept anyway — it is
-    // simpler than a local-invalidate special case and immune to revisiting.
+    // Preemption **disabled**, interrupts **enabled**, the caller's IF restored after. IF on, so a
+    // spinner here still services another initiator's IPI. Preemption off, because a descheduled
+    // holder of [`LOCK`] starves every spinner, *forever* if it is the idle thread (reaping
+    // stacks), which is never re-picked while the spinners keep every CPU busy. Only the switch is
+    // deferred; IRQ handlers, this CPU's own shootdown IPI included, still run. The initiator
+    // therefore cannot migrate mid-window; the all-online target set is kept as simpler than a
+    // local special case.
     crate::sched::preempt_disable();
     let prev_if = Cpu::interrupts_enabled();
     // SAFETY: ring-0, preemptible kernel context (the caller contract); the IDT
@@ -152,75 +118,57 @@ fn shootdown(va: Option<VirtAddr>) {
     {
         let _guard = LOCK.lock();
 
-        // Publish the request before signalling any target (Release pairs with
-        // the targets' Acquire loads in `on_ipi`).
+        // Publish the request before signalling any target (Release pairs with `on_ipi`'s Acquire).
         REQUEST_ALL.store(va.is_none(), Ordering::Relaxed);
         REQUEST_VA.store(va.map(|v| v.as_u64()).unwrap_or(0), Ordering::Relaxed);
         ACKED.store(0, Ordering::Release);
 
-        // Signal every online CPU — including the one we are running on (a
-        // self-IPI, serviced during the ack spin below). A CPU that comes
-        // online after this snapshot cannot hold the stale translation: the
-        // caller cleared the PTEs *before* initiating, so a later walk caches
-        // only the new state.
+        // Signal every online CPU, this one included (a self-IPI, serviced in the ack spin). A CPU
+        // that comes online after this snapshot cannot hold the stale translation: the caller
+        // cleared the PTEs *before* initiating, so a later walk caches only the new state.
         for cpu in 0..MAX_CPUS {
             if online & (1u64 << cpu) != 0 {
                 send_shootdown_ipi(cpu);
             }
         }
 
-        // Wait for every target (self included) to acknowledge. Interrupts are
-        // enabled, so this CPU services its own IPI — and any other initiator's
-        // — while spinning.
+        // Wait for every target to acknowledge; interrupts are on, so this CPU services its own IPI
+        // and any other initiator's while spinning.
         //
-        // **Stop waiting on a target that has left the online set.** `online` was sampled
-        // before the IPIs went out; a CPU that parks inside that window has already run
-        // `sched::leave_online` and is on its way to `cli; hlt`, so its IPI is either
-        // unserviced or never will be — and waiting for it hangs this request forever,
-        // taking [`LOCK`] and every later initiator with it. That is the same
-        // whole-machine deadlock a park caused before it cleared its bit (2026-08-13); this
-        // closes the residual window the fix left open.
-        //
-        // **Skipping it is sound because the CPU is gone, not merely slow.** A bit is
-        // cleared only by `leave_online`, whose sole caller is `Cpu::halt_loop` — after
-        // which that CPU executes nothing but the halt loop's own text forever. It cannot
-        // use a stale translation, so the invalidation it never performed cannot be
-        // observed. This is *not* a timeout: a live CPU that is merely late is still in the
-        // mask and is still waited for, however long it takes.
+        // **Stop waiting on a target that has left the online set.** `online` was sampled before
+        // the IPIs went out; a CPU that parks in that window has run `sched::leave_online` and is
+        // on its way to `cli; hlt`, so it may never service its IPI, and waiting would hang this
+        // request, [`LOCK`] and every later initiator (the whole-machine deadlock of 2026-08-13).
+        // Sound because the CPU is gone, not slow: a bit is cleared only by `leave_online`, whose
+        // sole caller is `Cpu::halt_loop`, after which the CPU runs nothing but the halt loop's own
+        // text and cannot use a stale translation. Not a timeout: a live CPU that is merely late
+        // stays in the mask and is waited for however long it takes.
         while !wait_satisfied(online, ACKED.load(Ordering::Acquire), crate::sched::online_mask()) {
             core::hint::spin_loop();
         }
     }
 
-    // **This caller needs `interrupts_restore` to be unconditional**, and is the only one
-    // that does: `prev_if` is false (SFMASK masked `IF` at syscall entry), but *this function
-    // enabled interrupts itself* above, so "restoring" false has real work to do. While the
-    // `else` arm was a no-op — commented "leave IF clear — it already is" — the rest of every
-    // SMP `sys_memory_unmap` ran with `IF` set, out through the `sysretq` stub's window on the
-    // user stack. Do not reintroduce that no-op; `syscall_dispatch` asserts against it.
+    // Unconditional `interrupts_restore`: on the syscall path `prev_if` is false (SFMASK masked
+    // `IF`) but this function enabled interrupts itself, so restoring false has real work to do. A
+    // no-op there ran the rest of every SMP `sys_memory_unmap` with `IF` set, out through the
+    // `sysretq` stub's window on the user stack; `syscall_dispatch` asserts against it.
     // SAFETY: ring-0; restore the interrupt state captured above.
     unsafe { Cpu::interrupts_restore(prev_if) };
-    // Re-enable preemption last; a reschedule latched during the window (a
-    // wake IPI aimed at this CPU, or a tick expiry) is replayed here.
+    // Re-enable preemption last; a reschedule latched during the window is replayed here.
     crate::sched::preempt_enable();
 }
 
-/// Whether the initiator may stop waiting: every target has either acknowledged, or has
-/// left the online set and so can never acknowledge.
-///
-/// Split out from the spin so the rule is pinned by a host test. **Not a timeout** — a live
-/// target that is merely slow stays in `still_online` and is still waited for.
+/// Whether the initiator may stop waiting: every target has either acknowledged or left the online
+/// set and so can never acknowledge. Split out so a host test pins the rule. **Not a timeout**: a
+/// live target that is merely slow stays in `still_online` and is waited for.
 fn wait_satisfied(targets: u64, acked: u64, still_online: u64) -> bool {
-    // One clause, not two: `outstanding == 0` is already covered, since an empty set
-    // intersects nothing. An earlier version spelt both out and no test could tell them
-    // apart, which is a fair definition of dead code.
+    // One clause: an empty `outstanding` already intersects nothing.
     let outstanding = targets & !acked;
     outstanding & still_online == 0
 }
 
-/// Handle an incoming TLB-shootdown IPI on this CPU: invalidate as the current
-/// request directs, then acknowledge. Called by the arch IPI dispatcher (which
-/// EOIs afterward). Never blocks.
+/// Handle an incoming TLB-shootdown IPI on this CPU: invalidate as the current request directs,
+/// then acknowledge. Called by the arch IPI dispatcher (which EOIs afterward). Never blocks.
 pub fn on_ipi() {
     let va = if REQUEST_ALL.load(Ordering::Acquire) {
         None
@@ -229,8 +177,8 @@ pub fn on_ipi() {
     };
     // SAFETY: ring-0 IPI context; performs only a TLB invalidation.
     unsafe { invalidate_local(va) };
-    // Acknowledge after the invalidation is issued, so the initiator observes
-    // completion only once this CPU can no longer use the stale translation.
+    // Acknowledge after the invalidation is issued: the initiator sees completion only once this
+    // CPU can no longer use the stale translation.
     ACKED.fetch_or(1u64 << (Smp::current_cpu() as usize), Ordering::Release);
 }
 
@@ -238,34 +186,24 @@ pub fn on_ipi() {
 mod tests {
     use super::wait_satisfied;
 
-    /// The initiator waits for a live target and gives up on a departed one — and nothing
-    /// else.
-    ///
-    /// The third case is the bug this exists for: before it, a CPU that parked between the
-    /// target snapshot and its acknowledgement hung the request forever, holding `LOCK` and
-    /// with it every later shootdown on the machine.
+    /// The initiator waits for a live target and gives up on a departed one, and nothing else.
     #[test]
     fn waiting_ends_on_acknowledgement_or_departure_but_never_on_lateness() {
         let targets = 0b1111;
 
-        // Nobody has acked yet, everyone is up: keep waiting.
         assert!(!wait_satisfied(targets, 0b0000, 0b1111));
 
-        // All acked: done, regardless of who is still up.
         assert!(wait_satisfied(targets, 0b1111, 0b1111));
         assert!(wait_satisfied(targets, 0b1111, 0b0001));
 
-        // CPU 2 has not acked and has left the online set: it never will — stop.
+        // CPU 2 has not acked and has left the online set: it never will.
         assert!(wait_satisfied(targets, 0b1011, 0b1011));
 
-        // CPU 2 has not acked and is still up: it is merely late — keep waiting. This is
-        // what makes the rule a departure check and not a timeout.
+        // CPU 2 has not acked and is still up: merely late, so keep waiting (not a timeout).
         assert!(!wait_satisfied(targets, 0b1011, 0b1111));
 
-        // Two outstanding, one departed and one still up: the live one still holds it.
         assert!(!wait_satisfied(targets, 0b1001, 0b1101));
 
-        // A CPU that was never a target cannot hold the request up, however it is marked.
         assert!(wait_satisfied(0b0011, 0b0011, 0b1111));
     }
 }

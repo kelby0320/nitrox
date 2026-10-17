@@ -2,40 +2,13 @@
 
 use crate::*;
 
-/// `cargo xtask check-display` — prove the pixels actually reach the screen.
-///
-/// **What a self-hash structurally cannot answer** (`docs/design/display-substrate.md`
-/// §8c): a compositor can hash its own buffer correctly while writing to the wrong base
-/// address, the wrong stride, or with the channels swapped. Nothing inside the guest can
-/// detect that, because the guest stays perfectly consistent with itself. So the picture
-/// has to be read from outside, which is what QEMU's `screendump` is for.
-///
-/// The division worth remembering: **`test-qemu` tests the compositor, this tests the
-/// framebuffer binding.**
-///
-/// **No golden image.** The expected picture is rendered here by the same `libdraw` the
-/// guest uses, so there is no binary artefact in the repo to regenerate, and no
-/// brittle-image maintenance problem. That is sound precisely because what is under test
-/// is the *binding* — base address, stride, channel order — not the compositing, which
-/// §8b already covers.
-///
 /// `cargo xtask preview [ui|ui-dark|term|all]` — render the toolkit on the host and write it as a PNG.
 ///
-/// **The whole point is that a judgement about how something looks should cost a glance rather
-/// than a boot** (M11 Part A). Polish is a hundred small decisions, and a decision that costs
-/// three minutes of QEMU is a decision not made — so this puts the same renders `check-display`
-/// adjudicates against into a file anyone can open, plus `ui-dark`, the one no gate adjudicates
-/// (see [`preview_frames`]).
-///
-/// **The same renderer, deliberately.** `xtask` already links `libui`, `libdraw` and `libterm`
-/// because the display gate renders the expected picture here rather than checking in a golden
-/// file. This is a second entry point onto that, not a second renderer: a preview that could
-/// differ from what the gate demands of the guest would be a picture of nothing in particular.
-///
-/// **What it cannot show**, said plainly so nobody reads more into it: anything the *compositor*
-/// draws — the cursor, the drag outline, the background between windows — and the arrangement of
-/// real windows on a real screen. Those are composed in the guest by clients that have to run.
-/// What this covers is the toolkit's own surfaces, which is where most of the polish lives.
+/// **A judgement about how something looks should cost a glance rather than a boot.** This puts the
+/// same renders `check-display` adjudicates against into a file, plus `ui-dark` (see
+/// [`preview_frames`]): a second entry point onto the one renderer, so a preview cannot differ from
+/// what the gate demands. It cannot show what the *compositor* draws (the cursor, the drag outline,
+/// the ground between windows) or real windows on a real screen.
 pub(crate) fn cmd_preview(what: &str) -> R<()> {
     let faces = host_faces()?;
     let dir = build_cache();
@@ -43,8 +16,6 @@ pub(crate) fn cmd_preview(what: &str) -> R<()> {
     let frames = preview_frames(&faces);
     let names: Vec<&str> = frames.iter().map(|(n, _)| *n).collect();
     if what != "all" && !names.contains(&what) {
-        // Checked before anything is drawn: the first version reported this by rendering both
-        // references a second time purely to list their names.
         return Err(format!("no preview called {what:?} — try `all` or one of: {}", names.join(", ")).into());
     }
     for (name, frame) in &frames {
@@ -63,28 +34,21 @@ pub(crate) fn cmd_preview(what: &str) -> R<()> {
 /// [--contact-radius N] [--contact-strength N] [--contact-drop N] [--corner N] [--dark]` — try the
 /// overview's opacity and a window's shadow **without booting**.
 ///
-/// The shadow has two layers since the desktop refresh's Part A: `--radius`, `--strength` and
-/// `--drop` are the wide one, as they always were, and the `--contact-` three are the tight one
-/// that seats a window's edge. `--corner` rounds the mock windows, so a shadow can be judged
-/// against the corners it will actually be cast from.
+/// The shadow has two layers: `--radius`, `--strength` and `--drop` are the wide one, the
+/// `--contact-` three the tight one that seats a window's edge. `--corner` rounds the mock windows.
 ///
-/// **The loop `preview` exists for, pointed at the two things `preview` could not show** (M13
-/// Part C). `preview` renders the toolkit's own surfaces; the overview's translucency and a
-/// window's shadow are *compositing*, which happened only in the guest — so judging either cost a
-/// three-minute boot, and picking a number by eye needs half a dozen looks.
+/// **The loop `preview` exists for, pointed at compositing**: the overview's translucency and a
+/// window's shadow happened only in the guest, and picking a number by eye needs half a dozen
+/// looks.
 ///
-/// **The desktop underneath is the real one**, read back from `shot-windows.png` when a
-/// `cargo xtask shot` has left one there, and the wallpaper otherwise. That is what makes the
-/// answer trustworthy: the question is how much of the *actual* desktop should show through, and
-/// a mock of it would be a picture of my guess rather than of the screen. The overview's own
-/// content is stood in for — rectangles where thumbnails go — because the thing being judged is
-/// the ground behind them, not the labels on them.
+/// **The desktop underneath is the real one**, read back from `shot-windows.png` when `cargo xtask
+/// shot` has left one there, and the wallpaper otherwise. The overview's own content is stood in
+/// for by rectangles: the ground behind it is what is judged.
 ///
-/// It writes `tune-shadow.png` and `tune-overview.png`, and prints the values it used so a good
-/// one can be copied into `libdraw::theme::window_shadow` and `desktop-shell`'s constants.
+/// It writes `tune-shadow.png` and `tune-overview.png`, and prints the values it used, for
+/// `libdraw::theme::window_shadow` and `desktop-shell`'s constants.
 ///
-/// `--dark` starts from the dark scheme's shadow and draws the mock windows in the dark scheme,
-/// because a shadow's strength is judged against the windows it falls on.
+/// `--dark` starts from the dark scheme's shadow and draws the mock windows in that scheme.
 pub(crate) fn cmd_tune(args: &[String]) -> R<()> {
     use libdraw::compose::{Shadow, ShadowLayer, SurfaceRef, compose_exposed};
     use libdraw::format::{PixelFormat, Rgb};
@@ -120,22 +84,18 @@ pub(crate) fn cmd_tune(args: &[String]) -> R<()> {
             },
         ],
     };
-    // What ships, like every other default here: floating windows are rounded since Part B.
     let corner = num("--corner", libdraw::corner::WINDOW_RADIUS)?;
     let ground_alpha = num("--ground", 210)?.min(255) as u8;
     let side_alpha = num("--side", 150)?.min(255) as u8;
 
     let dir = build_cache();
     fs::create_dir_all(&dir).ok();
-    // **The size of the screen that was photographed**, when one was — it is the real desktop an
-    // opacity is judged over — and the gates' size for the mock scene otherwise. It was a fixed
-    // 1280×800 until Phase 5 Part E, which silently ignored a screendump of any other size.
+    // The size of the screen that was photographed, when one was; the gates' size otherwise.
     let shot = dir.join("shot-windows.png");
     let from_shot = read_rgb_png(&shot).ok();
     let (sw, sh) = from_shot.as_ref().map_or((DisplaySize::GATE.w, DisplaySize::GATE.h), |(w, h, _)| (*w, *h));
     let g = Geometry::packed(sw, sh, PixelFormat::XRGB8888);
 
-    // --- the desktop underneath: the real screen if one has been photographed ---
     let mut desktop = MemFramebuffer::new(g);
     match &from_shot {
         Some((_, _, rgb)) => {
@@ -158,11 +118,8 @@ pub(crate) fn cmd_tune(args: &[String]) -> R<()> {
         }
     }
 
-    // --- 1. the shadow, over a wallpaper with two mock windows ---
-    //
-    // Drawn fresh rather than over the screendump, because the screendump already *has* the
-    // shipped shadow baked into it: comparing a new one against it would be comparing two
-    // shadows and calling the sum an answer.
+    // 1. The shadow, drawn fresh rather than over the screendump, which already has the shipped
+    // shadow baked in.
     let (wp, wg) = wallpaper_for_screen(sw, sh)?;
     let mut shot_fb = MemFramebuffer::new(g);
     let faces = host_faces()?;
@@ -171,8 +128,7 @@ pub(crate) fn cmd_tune(args: &[String]) -> R<()> {
         let ug = Framebuffer::geometry(&ui);
         (ug.width, ug.height)
     };
-    // The top bar, as a strip of its ground: 30 pixels of `panel` since the desktop refresh's
-    // Part C.
+    // The top bar, as a strip of its ground: 30 pixels of `panel`.
     let panel = MemFramebuffer::filled(
         Geometry::packed(sw, 30, PixelFormat::XRGB8888),
         libdraw::theme::Theme::for_scheme(scheme).panel,
@@ -191,18 +147,15 @@ pub(crate) fn cmd_tune(args: &[String]) -> R<()> {
     let p1 = dir.join("tune-shadow.png");
     write_png(&p1, w1, h1, &rgb1)?;
 
-    // --- 2. the overview's ground and sidebar, over the real desktop ---
     let mut over = desktop;
     let side_w = 200u32;
-    // **The bars stay uncovered**, which is what the guest does — the shell's two panels sit above
-    // the overview popup, and a mock that dimmed them would show a picture the screen never has.
-    // Compare `shot-overview.png`: its top bar and taskbar are at full brightness.
+    // The bars stay uncovered, as in the guest: the shell's two panels sit above the overview
+    // popup.
     let bar_h = 24u32;
     let body = Rect::new(0, bar_h as i32, sw, sh - bar_h * 2);
     let side = Rect::new((sw - side_w) as i32, bar_h as i32, side_w, sh - bar_h * 2);
-    // The ground first, then the sidebar over it, then opaque stand-ins for the thumbnails —
-    // the same order `render_overview` uses, so the layering is the shell's rather than a
-    // rearrangement of it.
+    // The ground first, then the sidebar, then stand-ins for the thumbnails: `render_overview`'s
+    // order.
     blend_rect(&mut over, body, Rgb::new(0, 0, 0), ground_alpha);
     blend_rect(&mut over, side, Rgb::new(0x1B, 0x3A, 0x4E), side_alpha);
     for (i, r) in [Rect::new(60, 90, 420, 300), Rect::new(540, 210, 400, 280)].iter().enumerate() {
@@ -243,10 +196,8 @@ pub(crate) fn cmd_tune(args: &[String]) -> R<()> {
     Ok(())
 }
 
-/// The staged wallpaper, cropped and scaled to a `sw`x`sh` screen, as XRGB8888 pixels.
-///
-/// The same crop the image build stages and the same downscale the shell performs, so the ground
-/// under a preview is the ground the guest would show.
+/// The staged wallpaper, cropped and scaled to a `sw`x`sh` screen, as XRGB8888 pixels: the same
+/// crop the image build stages and the same downscale the shell performs.
 fn wallpaper_for_screen(sw: u32, sh: u32) -> R<(Vec<u8>, libdraw::framebuffer::Geometry)> {
     use libdraw::format::{PixelFormat, Rgb};
     use libdraw::framebuffer::Geometry;
@@ -263,8 +214,7 @@ fn wallpaper_for_screen(sw: u32, sh: u32) -> R<(Vec<u8>, libdraw::framebuffer::G
             src[off..off + 4].copy_from_slice(&src_g.format.encode(c).to_le_bytes());
         }
     }
-    // **Placed as the shell places it** — filled, the staged theme's mode — rather than stretched to
-    // the screen, which is what this did until Phase 5 Part E and what no desktop ever showed.
+    // Placed as the shell places it, filled (the staged theme's mode), not stretched.
     let dst_g = Geometry::packed(sw, sh, PixelFormat::XRGB8888);
     let mut dst = vec![0u8; dst_g.byte_len()];
     let plan = libdraw::theme::WallpaperMode::Fill
@@ -276,8 +226,8 @@ fn wallpaper_for_screen(sw: u32, sh: u32) -> R<(Vec<u8>, libdraw::framebuffer::G
     Ok((dst, dst_g))
 }
 
-/// Fill `rect` by blending `colour` into what is already there — the host's stand-in for a
-/// translucent surface the compositor would blend at scanout.
+/// Fill `rect` by blending `colour` into what is already there: a stand-in for scanout
+/// blending.
 fn blend_rect(
     fb: &mut libdraw::framebuffer::MemFramebuffer,
     rect: libdraw::geom::Rect,

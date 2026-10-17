@@ -1,7 +1,7 @@
-//! **USB HID, bound** (Phase 6 Part B.2): a boot keyboard's or mouse's interrupt-IN endpoint
-//! configured, polled by the DPC, and its reports turned into events on an input node.
+//! **USB HID, bound**: a boot keyboard's or mouse's interrupt-IN endpoint configured, polled by the
+//! DPC, and its reports turned into events on an input node.
 //!
-//! `docs/planning/phase-6-usb.md` § *Part B in detail*. The hub thread binds during enumeration
+//! See `docs/planning/phase-6-usb.md`. The hub thread binds during enumeration
 //! ([`bind`]); from then on the DPC owns the endpoint's polling ([`on_transfer`]), and the hub
 //! thread comes back only to reset an endpoint that halted ([`recover`]) or to let a departing
 //! device's keyboards and mice go before its slot is disabled ([`depart`]).
@@ -9,11 +9,11 @@
 //! **What a report means is `drivers::hid`'s**: this module fetches reports and hands them over.
 //!
 //! **An input node's state is one of [`MAX_NODES`] slots in a static [`Nodes`]**, its
-//! `CharBackend` context the slot and the slot's epoch: a static is what lives as long as the device
-//! table, which never drops a node, without leaking a box. **A departed device's slot is given
-//! back** (Phase 6 Part C) once its node has retired, and its epoch bumped then, so a handle to the
-//! old node is refused rather than served the next device's ring. The served index above it is
-//! never reissued.
+//! `CharBackend` context the slot and the slot's epoch: a static is what lives as long as the
+//! device table, which never drops a node, without leaking a box. **A departed device's slot is
+//! given back** once its node has retired, and its epoch bumped then, so a handle to the old node
+//! is refused rather than served the next device's ring. The served index above it is never
+//! reissued.
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
@@ -43,32 +43,25 @@ pub(super) const MAX_BOUND: usize = 16;
 /// A third halt in a device's life leaves its endpoint stopped.
 const HALTS_MAX: u8 = 3;
 
-/// A slot no node has had.
 const FREE: u8 = 0;
-/// A slot whose node is bound to a device.
 const BOUND: u8 = 1;
-/// A slot whose device has departed (Phase 6 Part C): its node reads what its ring holds and then
-/// refuses, and the slot may be given to the next device.
+/// A slot whose device has departed: its node reads what its ring holds and then refuses.
 const RETIRED: u8 = 2;
 
-/// **The USB input nodes, by slot**: each slot's state, its epoch, its reader side and a lights write
-/// waiting on it, and which slots hold keyboards. A node's `CharBackend` context names its slot and
-/// the epoch it was made in ([`context`]).
+/// **The USB input nodes, by slot**: each slot's state, epoch, reader side, lights write waiting,
+/// and which slots hold keyboards. A node's `CharBackend` context names its slot and the epoch it
+/// was made in ([`context`]).
 ///
-/// One static in a boot, [`NODES`]. **A value so a host test can drive it** (PR #361 review): no
-/// boot reuses a slot, which takes sixteen nodes bound at once, so a table of a test's own is where a
-/// slot is taken, retired and taken again, and the node it had before read and written through.
+/// One static in a boot, [`NODES`]; **a value so a host test can drive** slot reuse, which no
+/// boot reaches.
 struct Nodes {
     /// Each slot's state: [`FREE`], [`BOUND`] or [`RETIRED`]. Changed by the hub thread alone.
     states: [AtomicU8; MAX_NODES],
-    /// **Each slot's epoch**, bumped when a retired slot is given to another device (Phase 6 Part
-    /// C), so a handle to a node retired from a slot since reused is refused `PeerClosed`, rather
-    /// than served the next device's ring.
+    /// **Each slot's epoch**, bumped when a retired slot is given to another device, so a handle to
+    /// a node retired from a slot since reused is refused `PeerClosed`.
     epochs: [AtomicU32; MAX_NODES],
-    /// Each slot's reader side.
     readers: [IrqSpinLock<Reader>; MAX_NODES],
-    /// **A lights write waiting for the hub thread**, by slot (Phase 6 Part B.5): its operation and
-    /// the lights.
+    /// **A lights write waiting for the hub thread**, by slot: its operation and the lights.
     lights: IrqSpinLock<[Option<(ObjectRef, u8)>; MAX_NODES]>,
     /// Which slots hold keyboards, one bit each: what takes lights, and what the hardware report
     /// drains.
@@ -77,15 +70,12 @@ struct Nodes {
 
 const _: () = assert!(MAX_NODES <= 32, "`Nodes::keyboards` has a bit per slot");
 
-/// The boot's USB input nodes.
 static NODES: Nodes = Nodes::new();
 
-/// A node's `CharBackend` context: its slot, and the slot's epoch when the node was made.
 fn context(slot: usize, epoch: u32) -> *mut () {
     ((epoch as usize) << 8 | slot) as *mut ()
 }
 
-/// The slot and the epoch a context names.
 fn slot_of(ctx: *mut ()) -> (usize, u32) {
     let c = ctx as usize;
     (c & 0xFF, (c >> 8) as u32)
@@ -98,7 +88,6 @@ fn choose(states: &[u8; MAX_NODES]) -> Option<usize> {
 }
 
 impl Nodes {
-    /// Every slot free.
     const fn new() -> Nodes {
         Nodes {
             states: [const { AtomicU8::new(FREE) }; MAX_NODES],
@@ -109,17 +98,15 @@ impl Nodes {
         }
     }
 
-    /// **Whether a context's node is still its slot's**: its epoch the slot's now, so the slot has
-    /// not been given to another device since it was made (Phase 6 Part C).
     fn current(&self, ctx: *mut ()) -> bool {
         let (index, epoch) = slot_of(ctx);
         self.epochs.get(index).is_some_and(|e| e.load(Ordering::Acquire) == epoch)
     }
 
-    /// **Take a slot for a new node** (Phase 6 Part C), a keyboard's or not: a free one, else a
-    /// retired one, reset — its epoch first, so a stale handle's next read finds it changed under the
-    /// node's lock, then its reader and any lights write still waiting on it. The slot and its epoch,
-    /// for the node's context, or `None` when every slot is bound. From the hub thread.
+    /// **Take a slot for a new node**: a free one, else a retired one, reset — its epoch first,
+    /// so a stale handle's next read finds it changed under the node's lock, then its reader and
+    /// any lights write still waiting on it. The slot and its epoch, or `None` when every slot is
+    /// bound. From the hub thread.
     fn take(&self, keyboard: bool) -> Option<(usize, u32)> {
         let states: [u8; MAX_NODES] = core::array::from_fn(|i| self.states[i].load(Ordering::Acquire));
         let index = choose(&states)?;
@@ -148,9 +135,8 @@ impl Nodes {
     }
 
     /// **Retire slot `index`'s node**, its device gone: push `releases`, answer a waiting read with
-    /// them, or refuse it if there are none, and complete a waiting lights write `PeerClosed`. Thread
-    /// context, with no lock held: completing takes the scheduler's lock, and a drop may reach the
-    /// allocator.
+    /// them, or refuse it if there are none, and complete a waiting lights write `PeerClosed`.
+    /// Thread context, no lock held: completing takes the scheduler's lock, and a drop may free.
     fn retire(&self, index: usize, releases: &[InputEvent], now: u64) {
         let mut scratch = [0u8; DRAIN_MAX];
         let (ready, refused) = {
@@ -177,15 +163,13 @@ impl Nodes {
         self.states[index].store(RETIRED, Ordering::Release);
     }
 
-    /// **Events decoded from slot `index`'s device**, whose node was made in `epoch`: pushed to its
-    /// ring, and a read waiting there taken if they answer it. From the DPC.
+    /// **Events decoded from slot `index`'s device**, made in `epoch`: pushed to its ring, and a
+    /// read waiting there taken if they answer it. From the DPC.
     ///
-    /// **Dropped once the node has retired** (PR #361 review), under the lock retiring takes: the
-    /// DPC decodes a report under the bound table's lock and pushes it after letting that go, so a
-    /// report decoded before a departure could otherwise land after the releases it pushed — a key
-    /// down on a keyboard that has gone, with nothing left to let it up. Its release reaches the
-    /// reader without it instead, which lets go of a key never seen pressed. And dropped when the
-    /// slot has been given to another device since, whose ring this is not.
+    /// **Dropped once the node has retired**, under the lock retiring takes: the DPC decodes under
+    /// the bound table's lock and pushes after letting it go, so a report decoded before a
+    /// departure could land after the releases, leaving a key down on a keyboard that has gone. And
+    /// dropped when the slot has been given to another device since, whose ring this is not.
     fn push(
         &self,
         index: usize,
@@ -201,7 +185,6 @@ impl Nodes {
         r.take_ready(scratch, now)
     }
 
-    /// **A read of a node** at `now`: [`CharBackend::submit_read`]'s, as PS/2's is.
     fn read(
         &self,
         buffer: &ObjectRef,
@@ -242,8 +225,6 @@ impl Nodes {
         Ok(())
     }
 
-    /// **A lights write to a node**: [`CharBackend::submit_write`]'s, with the controller `x` —
-    /// `None` before one is published.
     fn write(
         &self,
         x: Option<&Xhci>,
@@ -257,7 +238,7 @@ impl Nodes {
         if index >= MAX_NODES {
             return Err(KError::Unsupported);
         }
-        // A node from an earlier epoch is gone, whatever its slot holds now (Phase 6 Part C).
+        // A node from an earlier epoch is gone, whatever its slot holds now.
         if !self.current(ctx) {
             return Err(KError::PeerClosed);
         }
@@ -296,7 +277,6 @@ impl Nodes {
         }
     }
 
-    /// Throw away every keyboard's waiting events.
     fn drain_keyboards(&self, now: u64) {
         let keyboards = self.keyboards.load(Ordering::Relaxed);
         let mut scratch = [0u8; DRAIN_MAX];
@@ -311,14 +291,13 @@ impl Nodes {
 /// What a bound endpoint's reports are.
 #[derive(Copy, Clone, Debug)]
 pub(super) enum Decoder {
-    /// A keyboard by its layout (Part B.7), and the keys it holds.
+    /// A keyboard by its layout, and the keys it holds.
     Keyboard { layout: keyboard::Layout, held: keyboard::Held },
     /// A mouse by its layout, and the buttons it holds.
     Mouse { layout: mouse::Layout, buttons: u8 },
 }
 
 impl Decoder {
-    /// The report ID its keyboard's lights take, if it is a keyboard whose lights have one.
     fn lights_id(&self) -> Option<u8> {
         match self {
             Decoder::Keyboard { layout, .. } => layout.lights.and_then(|l| l.report_id),
@@ -327,7 +306,6 @@ impl Decoder {
     }
 }
 
-/// **What a report descriptor says a device's report is** (Parts B.3 and B.7).
 #[derive(Copy, Clone, Debug)]
 enum Layout {
     Keyboard(keyboard::Layout),
@@ -335,7 +313,6 @@ enum Layout {
 }
 
 impl Layout {
-    /// The bytes its report takes, report ID included.
     fn report_bytes(&self) -> u16 {
         match self {
             Layout::Keyboard(l) => l.report_bytes(),
@@ -350,9 +327,7 @@ impl Layout {
 pub(super) struct Bound {
     slot: u8,
     dci: u8,
-    /// The interface it is, which a keyboard's lights are addressed to.
     interface: u8,
-    /// Its node's slot, and the slot's epoch when the node was made.
     node: usize,
     epoch: u32,
     decoder: Decoder,
@@ -361,9 +336,7 @@ pub(super) struct Bound {
     ring_phys: u64,
     buf_phys: u64,
     buf_virt: u64,
-    /// What each TRB asks for: the endpoint's maximum packet.
     len: u16,
-    /// Halted, and the hub thread asked to reset it.
     halted: bool,
     /// Times it has halted, counted when the DPC sees each: the third leaves it stopped.
     halts: u8,
@@ -413,7 +386,6 @@ impl Slots for RawSlots {
     }
 }
 
-/// One interface to bind: its number, what it is, and its interrupt-IN endpoint.
 struct Candidate {
     interface: u8,
     is_keyboard: bool,
@@ -422,8 +394,8 @@ struct Candidate {
     report_len: u16,
 }
 
-/// **A device's boot keyboard and mouse interfaces, prepared** for its one configuration (Phase 6
-/// Part D.2): each one's ring and report buffer, and the endpoints Configure Endpoint adds for them.
+/// **A device's boot keyboard and mouse interfaces, prepared** for its one configuration: each
+/// one's ring and report buffer, and the endpoints Configure Endpoint adds for them.
 pub(super) struct HidPrepared {
     prepared: [Option<Prepared>; 4],
     eps: [context::Interrupt; 4],
@@ -437,11 +409,10 @@ impl HidPrepared {
     }
 }
 
-/// **Prepare every boot keyboard and boot mouse interface of a device** (Part B.2): memory for each
-/// endpoint, the device's own, freed with it. `None` when it has none, or memory ran out, which is
-/// said. The hub sends Configure Endpoint and `SET_CONFIGURATION` once for every class it binds, and
-/// then [`bind`] (Phase 6 Part D.2: a second `SET_CONFIGURATION` would reset the first class's
-/// endpoints).
+/// **Prepare every boot keyboard and boot mouse interface of a device**: memory for each endpoint,
+/// the device's own, freed with it. `None` when it has none, or memory ran out, which is said. The
+/// hub sends Configure Endpoint and `SET_CONFIGURATION` once for every class it binds, and then
+/// [`bind`]: a second `SET_CONFIGURATION` would reset the first class's endpoints.
 pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]) -> Option<HidPrepared> {
     let mut found: [Option<Candidate>; 4] = [None, None, None, None];
     let mut n = 0;
@@ -500,28 +471,26 @@ pub(super) fn prepare(port: u8, speed_id: u8, mem: &mut DeviceMem, config: &[u8]
     Some(HidPrepared { prepared, eps, n })
 }
 
-/// **Bind the prepared HID interfaces `p` of the device in `slot`**, its configuration set (Part
-/// B.2): set each to boot protocol, ask keyboards to report on change only, register a node for
-/// each, and start polling. `parent` is its `UsbDevice` record. Logged; a failure is the device's or
-/// the interface's (`phase-6-usb.md` § *Part B in detail*).
+/// **Bind the prepared HID interfaces `p` of the device in `slot`**, its configuration set: set
+/// each to boot protocol, ask keyboards to report on change only, register a node for each, and
+/// start polling. `parent` is its `UsbDevice` record. Logged (`phase-6-usb.md` has the detail).
 pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrepared, parent: Option<u32>) {
     let HidPrepared { prepared, .. } = p;
 
-    // **Each interface's steps**: a stall ends that interface alone, and the others go on. **Any
-    // other failure on the default endpoint ends the binding there** (PR #358 review): the request
-    // may still be on the endpoint's ring, so nothing more is asked of it. That interface is not
-    // bound, nor any after it, and those before it stay bound, on endpoints of their own — **and
-    // take no lights** (Part B.5), since a lights request is the default endpoint's too.
+    // **Each interface's steps**: a stall ends that interface alone. **Any other failure on the
+    // default endpoint ends the binding there**: the request may still be on the endpoint's ring,
+    // so nothing more is asked of it. That interface is not bound, nor any after it; those before
+    // it stay bound, on endpoints of their own, **and take no lights** — a lights request is the
+    // default endpoint's too.
     let mut in_doubt_at = false;
     for p in prepared.into_iter().flatten() {
         let c = &p.c;
         let what = if c.is_keyboard { "keyboard" } else { "mouse" };
-        // **A keyboard's `SET_IDLE (0)` first**, so it reports a change and not a held state —
-        // before its report descriptor is read since Part B.7, which is Linux's order
-        // (`usbhid_parse`): a Corsair K70 plugged in after boot fell back to boot protocol, and so
-        // to the wrong keys, where one plugged in before boot did not. A stall is passed over: an
-        // unchanged report decodes to nothing. Any other failure ends the binding here, as every
-        // request's does.
+        // **A keyboard's `SET_IDLE (0)` first**, so it reports a change and not a held state,
+        // before its report descriptor is read, as Linux does (`usbhid_parse`): a Corsair K70
+        // plugged in after boot fell back to boot protocol, and so to the wrong keys, where one
+        // plugged in before boot did not. A stall is passed over: an unchanged report decodes to
+        // nothing.
         if c.is_keyboard
             && let Err(e) = interface_request(x, slot, mem, [0x21, 0x0A, 0, 0, c.interface, 0, 0, 0])
         {
@@ -534,10 +503,9 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
             }
             crate::kprintln!("usb: port {port}: its keyboard refused SET_IDLE ({e}); passed over");
         }
-        // **Its layout, from its report descriptor** (Parts B.3 and B.7): report protocol when it
-        // describes a plain mouse, or a keyboard this driver reads, boot protocol otherwise. A
-        // keyboard is read by its descriptor even where it offers boot protocol: a Corsair K70 says
-        // it is in boot protocol and goes on sending its bitmap.
+        // **Its layout, from its report descriptor**: report protocol when it describes a plain
+        // mouse or a keyboard this driver reads, boot protocol otherwise. A keyboard is read by its
+        // descriptor even where it offers boot protocol: a Corsair K70 goes on sending its bitmap.
         let described = match report_layout(x, slot, mem, c) {
             Ok(d) => d,
             Err(e) => {
@@ -615,8 +583,8 @@ pub(super) fn bind(x: &Xhci, port: u8, slot: u8, mem: &mut DeviceMem, p: HidPrep
 
 /// **Whether a failure on the default endpoint leaves it in doubt**: any failure but a stall may
 /// leave its request on the ring, to complete into the device's data page whenever it does, so
-/// nothing more may be asked of that endpoint — `hub::control_in`'s rule, which enumeration keeps by
-/// ending the device. A stall is the request's answer, and the endpoint is recovered after it.
+/// nothing more may be asked of that endpoint. A stall is the request's answer, and the endpoint
+/// is recovered after it.
 fn in_doubt(e: &Failed) -> bool {
     !matches!(e, Failed::Code(code::STALL))
 }
@@ -627,17 +595,15 @@ const DESCRIPTOR_TRIES: u8 = 4;
 /// The pause before asking again — what a device just plugged in may need to settle.
 const DESCRIPTOR_RETRY_NS: u64 = 100_000_000;
 
-/// **The tries before the one that read a report descriptor whole** (Part B.7): how many came back
-/// short, and how many the device stalled.
+/// **The tries before the one that read a report descriptor whole**: those short or stalled.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct Tries {
     short: u8,
     stalled: u8,
 }
 
-/// **What reading an interface's report descriptor came to** (Parts B.3 and B.7): a layout, or why
-/// the device runs in boot protocol — which the bind's log line says, since a wrong layout is
-/// otherwise only wrong keys on the screen.
+/// **What reading an interface's report descriptor came to**: a layout, or why the device runs in
+/// boot protocol, which the bind's log line says.
 #[derive(Copy, Clone, Debug)]
 enum Described {
     /// A layout this driver reads, read whole after these tries.
@@ -652,7 +618,6 @@ enum Described {
 }
 
 impl Described {
-    /// The layout, if there is one.
     fn layout(&self) -> Option<Layout> {
         match *self {
             Described::Layout(l, _) => Some(l),
@@ -661,8 +626,6 @@ impl Described {
     }
 }
 
-/// **How a bound interface's descriptor went**, as its log line ends: its protocol, and in boot
-/// protocol why.
 struct Said<'a>(&'a Described);
 
 impl core::fmt::Display for Said<'_> {
@@ -719,12 +682,11 @@ impl core::fmt::Display for Said<'_> {
     }
 }
 
-/// **A mouse's or keyboard's layout from its report descriptor** (Parts B.3 and B.7), or why there
-/// is none. **A stall, or an answer shorter than the descriptor, is asked again**, up to
-/// [`DESCRIPTOR_TRIES`] times with a pause between, as Linux asks (Part B.7): a Corsair K70 plugged
-/// in after boot sent its descriptor without its first packet. A stall is the request's answer, and
-/// the endpoint is recovered after it. An error for any other failure, which may leave the transfer
-/// on the default endpoint's ring.
+/// **A mouse's or keyboard's layout from its report descriptor**, or why there is none. **A stall,
+/// or an answer shorter than the descriptor, is asked again**, up to [`DESCRIPTOR_TRIES`] times
+/// with a pause between, as Linux asks: a Corsair K70 plugged in after boot sent its descriptor
+/// without its first packet. A stall is the request's answer, and the endpoint is recovered after
+/// it. Any other failure is an error: it may leave the transfer on the default endpoint's ring.
 fn report_layout(x: &Xhci, slot: u8, mem: &mut DeviceMem, c: &Candidate) -> Result<Described, Failed> {
     if c.report_len == 0 {
         return Ok(Described::None);
@@ -764,7 +726,6 @@ fn report_layout(x: &Xhci, slot: u8, mem: &mut DeviceMem, c: &Candidate) -> Resu
     Ok(Described::Unanswered { tries, last })
 }
 
-/// The bytes a report in `layout` takes: its last field's end, and the report ID before it.
 fn report_bytes(layout: &mouse::Layout) -> u16 {
     let end = [Some(layout.x), Some(layout.y), layout.wheel]
         .into_iter()
@@ -776,7 +737,6 @@ fn report_bytes(layout: &mouse::Layout) -> u16 {
     (end.div_ceil(8) + layout.report_id.is_some() as u32) as u16
 }
 
-/// An interface's endpoint with its memory placed, before the device is configured.
 struct Prepared {
     c: Candidate,
     producer: Producer,
@@ -802,8 +762,8 @@ fn interface_request(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8]) 
 }
 
 /// **A node for a USB keyboard or mouse**, registered under `parent`: its slot here, the slot's
-/// epoch, and the index `/dev/input/raw` serves it at. `None` when every slot is bound or the table
-/// cannot hold it.
+/// epoch, and the index `/dev/input/raw` serves it at. `None` when every slot is bound or the
+/// table is full.
 fn publish(kind: DeviceKind, parent: Option<u32>) -> Option<(usize, u32, u32)> {
     let (index, epoch) = NODES.take(kind == DeviceKind::Keyboard)?;
     LIGHTS_TAKEN.fetch_and(!(1u32 << index), Ordering::Relaxed);
@@ -830,7 +790,6 @@ fn start(x: &Xhci, mut bound: Bound) -> bool {
     true
 }
 
-/// Queue `bound`'s TRB and ring its doorbell.
 fn queue(x: &Xhci, b: &mut Bound) {
     b.ring.push(&mut RawSlots(b.ring_virt), Trb::normal(b.buf_phys, b.len as u32));
     write32(x.db, 4 * b.slot as u64, b.dci as u32);
@@ -872,7 +831,7 @@ pub(super) fn on_transfer(x: &Xhci, trb: &Trb) {
     };
     // **The hub thread is woken with the table's lock let go**: waking takes the scheduler's
     // lock, which ranks above this leaf, and the lock-order tracker in every kernel this
-    // project builds panics on the other order (PR #358 review, probed with a halt simulated).
+    // project builds panics on the other order.
     if halted {
         x.hid_halted.store(true, Ordering::Release);
         // SAFETY: `hub_wake` is the controller's `InterruptObject`, held for its life.
@@ -880,9 +839,9 @@ pub(super) fn on_transfer(x: &Xhci, trb: &Trb) {
     }
     let Some((node, epoch)) = target else { return };
     // **Each batch decoded under the table's lock and pushed after it**: one, unless a bitmap
-    // keyboard's report changed more keys than a batch holds (Part B.7). The next report waits,
-    // this event being the DPC's until it returns; a device gone meanwhile has had its releases
-    // pushed, and its entry with them, so it gets no more.
+    // keyboard's report changed more keys than a batch holds. The next report waits, this event
+    // being the DPC's until it returns; a device gone meanwhile has had its entry taken, so it
+    // gets no more.
     each_batch(
         |out| {
             let mut t = x.hid.lock();
@@ -893,9 +852,8 @@ pub(super) fn on_transfer(x: &Xhci, trb: &Trb) {
     );
 }
 
-/// **Every batch of one change** (Part B.7): `step` decodes the next into the buffer it is handed —
-/// `None` once there is nothing to decode it with, its device gone — and each batch is handed to
-/// `deliver`, until a step says none remain.
+/// **Every batch of one change**: `step` decodes the next into the buffer it is handed — `None`
+/// once its device is gone — and each batch goes to `deliver`, until a step says none remain.
 fn each_batch(
     mut step: impl FnMut(&mut [InputEvent; keyboard::EVENTS_MAX]) -> Option<(usize, bool)>,
     mut deliver: impl FnMut(&[InputEvent]),
@@ -928,9 +886,8 @@ fn deliver(node: usize, epoch: u32, events: &[InputEvent], now: u64) {
     }
 }
 
-/// **Decode `report` with `decoder` into `out`**, keeping what the next report is decoded against:
-/// how many events, and whether more of this report's change remains for another batch — a
-/// keyboard's alone can have more.
+/// **Decode `report` with `decoder` into `out`**, keeping what the next report is decoded
+/// against: how many events, and whether more remain for another batch — a keyboard's alone can.
 fn decode(
     decoder: &mut Decoder,
     report: &[u8],
@@ -953,14 +910,13 @@ fn decode(
     }
 }
 
-/// **Reset every halted endpoint**, from the hub thread: Reset Endpoint, then Set TR Dequeue Pointer
-/// to its enqueue point, then its TRB again. No `SYN_DROPPED`: the next report, decoded against the
-/// last, says what changed (PR #357 review). A third halt leaves it stopped, as does a reset that
-/// fails; either is the hub thread's for good, so a later pass, woken by another endpoint's halt,
-/// passes it over.
+/// **Reset every halted endpoint**, from the hub thread: Reset Endpoint, then Set TR Dequeue
+/// Pointer to its enqueue point, then its TRB again. No `SYN_DROPPED`: the next report, decoded
+/// against the last, says what changed. A third halt, or a reset that fails, leaves it stopped
+/// for good: `halted` is cleared, so a later pass passes it over.
 ///
-/// **Nothing is printed with the table's lock held**: the serial port's lock ranks above this leaf
-/// (PR #358 review). Each entry's outcome is settled under the lock and said after it.
+/// **Nothing is printed with the table's lock held**: the serial port's lock ranks above this
+/// leaf. Each entry's outcome is settled under the lock and said after it.
 pub(super) fn recover(x: &Xhci) {
     if !x.hid_halted.swap(false, Ordering::AcqRel) {
         return;
@@ -1004,7 +960,7 @@ pub(super) fn recover(x: &Xhci) {
     }
 }
 
-/// **A departing device's keyboards and mice, let go** (Phase 6 Part C), before its slot is
+/// **A departing device's keyboards and mice, let go**, before its slot is
 /// disabled and its memory freed. In this order:
 /// 1. **what each holds is released**: a keyboard's last report decoded against an empty one, a
 ///    mouse's held buttons from its decoder's state;
@@ -1032,7 +988,7 @@ pub(super) fn depart(x: &Xhci, slot: u8) {
     }
     for (node, decoder) in gone.into_iter().flatten() {
         match decoder {
-            // **Its keys in batches** (Part B.7), every one pushed before the node retires.
+            // **Its keys in batches**, every one pushed before the node retires.
             Decoder::Keyboard { mut held, .. } => {
                 each_batch(
                     |out| Some(keyboard::release_all(&mut held, now, out)),
@@ -1051,7 +1007,6 @@ pub(super) fn depart(x: &Xhci, slot: u8) {
     }
 }
 
-/// [`CharBackend::submit_read`] for a USB input node: [`Nodes::read`], on the boot's.
 fn submit_read(
     buffer: &ObjectRef,
     po: &ObjectRef,
@@ -1063,14 +1018,13 @@ fn submit_read(
     NODES.read(buffer, po, buf_offset, max_len, ctx, crate::arch::Timer::read_ns())
 }
 
-/// Which keyboards have taken lights once: what the log says, the first time.
 static LIGHTS_TAKEN: AtomicU32 = AtomicU32::new(0);
 
-/// [`CharBackend::submit_write`] for a USB keyboard's node: **its lights** (Phase 6 Part B.5), one
-/// byte in HID's order, sent by the hub thread as a `SET_REPORT`, which owns the default endpoint. A
-/// write to a keyboard that has left is refused at once, `PeerClosed`, and to one that takes no more
-/// lights, `IoError`; one that comes while another waits replaces it, which is completed as done,
-/// its lights being older than the ones that will be set. [`Nodes::write`], on the boot's.
+/// [`CharBackend::submit_write`] for a USB keyboard's node: **its lights**, one byte in HID's
+/// order, sent by the hub thread as a `SET_REPORT`, which owns the default endpoint. A write to a
+/// keyboard that has left is refused at once, `PeerClosed`, and to one that takes no more lights,
+/// `IoError`; one that comes while another waits replaces it, which is completed as done, its
+/// lights being older than the ones that will be set. [`Nodes::write`], on the boot's.
 fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, ctx: *mut ()) -> Result<(), KError> {
     // SAFETY: the controller is published once and never withdrawn; null before.
     let x = unsafe { super::XHCI.load(Ordering::Acquire).as_ref() };
@@ -1080,7 +1034,7 @@ fn submit_write(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, len: u64, c
 /// Where a keyboard's waiting lights go.
 pub(super) enum LightsTo {
     /// To its slot's default endpoint, addressed to its interface, with its report ID if its lights
-    /// take one (Part B.7).
+    /// take one.
     Send { slot: u8, interface: u8, report_id: Option<u8> },
     /// Nowhere: a request on its default endpoint is in doubt, so it takes no more lights.
     Dead,
@@ -1118,8 +1072,8 @@ pub(super) fn lights_taken(node: usize) -> bool {
 
 /// **The `SET_REPORT` that sets a keyboard's lights** (HID 1.11 §7.2.2): a class request to
 /// `interface`, for an Output report — type 2, in `wValue`'s high byte — with its report ID in the
-/// low byte, `0` for none, and one byte long, two with an ID, whose data then begins with it (Part
-/// B.7). The lights byte is the node's as written: HID's order is the wire format's.
+/// low byte, `0` for none, and one byte long, two with an ID, whose data then begins with it. The
+/// lights byte is the node's as written: HID's order is the wire format's.
 pub(super) const fn set_lights_request(interface: u8, report_id: Option<u8>) -> [u8; 8] {
     let (id, len) = match report_id {
         Some(id) => (id, 2),

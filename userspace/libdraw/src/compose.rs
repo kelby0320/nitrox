@@ -1,9 +1,7 @@
 //! Surfaces, and compositing as a pure function.
 //!
-//! `docs/design/display-substrate.md` §8a: "The piece that *looks* like it needs a
-//! screen is compositing, and it does not." Given surfaces, geometry, damage and
-//! stacking, the output bytes are determined — so this is an ordinary function with
-//! ordinary tests, and §7's determinism requirement is what keeps it that way.
+//! `docs/design/display-substrate.md` §8a: compositing needs no screen, as the output bytes are
+//! determined by the arguments (§7).
 
 use crate::format::Rgb;
 use crate::framebuffer::{Framebuffer, Geometry};
@@ -11,38 +9,24 @@ use crate::geom::{Point, Rect};
 
 /// A client's pixel buffer, positioned on screen.
 ///
-/// Borrowed rather than owned: in the compositor these bytes are a mapped
-/// `MemoryObject` the client drew into (§4), and in tests they are an ordinary
-/// allocation. Neither case wants this type to own them.
+/// Borrowed: in the compositor the bytes are a mapped `MemoryObject` the client drew into (§4).
 #[derive(Clone, Copy, Debug)]
 pub struct SurfaceRef<'a> {
-    /// The surface's own shape — its size, stride and format, which need not match
-    /// the framebuffer's.
+    /// The surface's own size, stride and format, which need not match the framebuffer's.
     pub geometry: Geometry,
     /// Where the surface's top-left corner sits in screen space. May be negative.
     pub origin: Point,
     /// The surface's pixels, at least `geometry.byte_len()` bytes.
     pub pixels: &'a [u8],
-    /// The shadow cast around this surface, if it casts one.
+    /// The shadow cast around this surface, if any.
     ///
-    /// **A property of the surface rather than an argument to `compose`**, and that is what keeps
-    /// this change from touching every caller. A shadow has to be drawn *between* surfaces — over
-    /// everything below this one and under this one itself — so it cannot be a separate pass; but
-    /// carrying it here means [`compose`] and [`compose_exposed`] grew no parameter, every
-    /// existing construction still says `None`, and the equivalence tests between them keep
-    /// meaning what they meant.
+    /// A property of the surface so it can be drawn between surfaces without a parameter on
+    /// [`compose`].
     pub shadow: Option<Shadow>,
     /// The radius its corners are rounded to, or zero for square ones.
     ///
-    /// **A property of the surface, for the reason [`shadow`](Self::shadow) is**: no parameter on
-    /// [`compose`], so the equivalence between it and [`compose_exposed`] keeps meaning what it
-    /// meant. The pixels outside the curve are *not written* — whatever the surfaces below put
-    /// there shows through — and the pixels on it are blended at the curve's coverage. See
-    /// `blit_clipped` for the mechanism and [`corner`](crate::corner) for the curve.
-    ///
-    /// **Not an alpha channel**, which would round a corner too, at the cost of the row `memcpy`
-    /// on every pixel of the surface rather than a blend on a few per corner row (desktop
-    /// refresh, Part B). Clamped to half the surface's shorter side.
+    /// Pixels outside the curve are not written and pixels on it blend at its coverage; see
+    /// `blit_clipped` and [`corner`](crate::corner). Clamped to half the shorter side.
     pub corner: u32,
 }
 
@@ -62,8 +46,7 @@ impl<'a> SurfaceRef<'a> {
         Self { corner: radius, ..self }
     }
 
-    /// The corner radius this surface is actually drawn with: [`corner`](Self::corner), clamped
-    /// to what its size can hold.
+    /// The corner radius actually drawn: [`corner`](Self::corner) clamped to what the size holds.
     pub const fn radius(&self) -> u32 {
         crate::corner::clamp(self.corner, self.geometry.width, self.geometry.height)
     }
@@ -73,11 +56,8 @@ impl<'a> SurfaceRef<'a> {
         Rect::new(self.origin.x, self.origin.y, self.geometry.width, self.geometry.height)
     }
 
-    /// Everything this surface puts on screen, its shadow included.
-    ///
-    /// **What damage has to be computed from.** [`bounds`](Self::bounds) is where the surface
-    /// *is* — what a click hits, what covers the background — and it is deliberately not this.
-    /// Expanding one rectangle to serve both would make the shadow clickable.
+    /// Everything this surface paints, shadow included: what damage is computed from, unlike
+    /// [`bounds`](Self::bounds), which a click hits.
     pub const fn painted_bounds(&self) -> Rect {
         match self.shadow {
             Some(sh) => sh.around(self.bounds()),
@@ -88,23 +68,10 @@ impl<'a> SurfaceRef<'a> {
 
 /// A soft dark edge drawn around a surface, under it and over everything below it.
 ///
-/// **Drawn by the compositor rather than carried in a client's pixels.** The alternative — a
-/// client drawing its own shadow into a translucent margin, which is how client-side decorations
-/// usually work — would put the shadow inside the window's bounds, and then the compositor's
-/// answer to "what did the pointer hit" would include a region nobody can see or click. Here the
-/// shadow is outside `bounds` by construction and hit-testing needs to know nothing about it.
-///
-/// ## Two layers (desktop refresh, Part A)
-///
-/// **A wide soft layer for depth and a tight dark one for contact**, which is how the design
-/// specifies it — `0 10px 28px` at 22% and `0 2px 6px` at 14% — and how most desktops draw one. A
-/// single layer has to choose: wide enough to read as depth leaves the window's edge floating on
-/// a haze, and tight enough to seat the edge is a dark outline with no depth behind it. The wide
-/// layer is drawn first, so the tight one darkens it where they overlap, as two real shadows do.
-///
-/// A layer whose strength or radius is zero contributes nothing — its [`around`](ShadowLayer::around)
-/// is the surface itself and [`draw_shadow`] skips it — so [`single`](Self::single) is how a
-/// one-layer shadow is still said.
+/// Drawn by the compositor so the shadow stays outside `bounds` and hit-testing ignores it. Two
+/// layers: a wide soft one for depth (the design's `0 10px 28px` at 22%) and a tight one for
+/// contact (`0 2px 6px` at 14%). A layer with zero strength or radius draws nothing, so
+/// [`single`](Self::single) says a one-layer shadow.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Shadow {
     /// The layers, drawn in order: the wide one first.
@@ -117,8 +84,7 @@ impl Shadow {
         Self { layers: [layer, ShadowLayer::NONE] }
     }
 
-    /// The rectangle this shadow can paint into, around a surface at `bounds` — every layer's
-    /// [`around`](ShadowLayer::around), unioned.
+    /// The rectangle this shadow can paint into around `bounds`: its layers' reach, unioned.
     pub const fn around(&self, bounds: Rect) -> Rect {
         let a = self.layers[0].around(bounds);
         let b = self.layers[1].around(bounds);
@@ -134,7 +100,7 @@ impl Shadow {
 pub struct ShadowLayer {
     /// How far the layer reaches beyond the surface, in pixels.
     pub radius: u32,
-    /// How far the layer is displaced, in pixels — positive `y` drops it downward.
+    /// How far the layer is displaced; positive `y` drops it downward.
     pub offset: Point,
     /// The layer's colour, blended at a coverage that falls off with distance.
     pub colour: Rgb,
@@ -151,15 +117,8 @@ impl ShadowLayer {
         self.radius > 0 && self.strength > 0
     }
 
-    /// The rectangle this layer can paint into, around a surface at `bounds`.
-    ///
-    /// **Unioned with `bounds`, which matters at an offset larger than the radius.** Callers use
-    /// this as the region to repaint, and an offset that displaces the shadow further than it
-    /// reaches would start the rectangle *inside* the window — leaving a band of the window itself
-    /// unrepainted after a move. The shipped values cannot do that; `cargo xtask tune --drop 20`
-    /// invites exactly that comparison, and someone liking the result would edit the constant
-    /// (PR #276 review, optional 9). Cheaper to make the union unconditional than to make the
-    /// constraint a rule nobody reads.
+    /// The rectangle this layer can paint into around `bounds`, unioned with `bounds` so a large
+    /// offset cannot start it inside the window and leave a band unrepainted after a move.
     pub const fn around(&self, bounds: Rect) -> Rect {
         if !self.is_visible() {
             return bounds;
@@ -190,37 +149,15 @@ const fn max_i32(a: i32, b: i32) -> i32 {
 
 /// Draw `shadow` around `bounds` on `fb`, painting only inside `clip`.
 ///
-/// **The falloff is `strength * (1 - d/r)²`**, where `d` is the distance from the surface's edge.
-/// The shape matters more than the constant: this starts at `strength` and is already down to a
-/// quarter of it a *quarter* of the way out, so most of the radius is a faint tail. The obvious
-/// cheaper curve — `strength * (r² - d²) / r²`, which needs no `d` and therefore no square root —
-/// was what shipped first, and it holds three quarters of its opacity half way out. That reads as
-/// a dark band with a sudden edge rather than as a shadow, which is what a real desktop's looks
-/// nothing like (reported 2026-09-03).
+/// The falloff is `strength * (1 - d/r)²` for edge distance `d`, a faint tail; the cheaper
+/// `(r² - d²) / r²` holds three quarters of its opacity half way out and reads as a dark band.
+/// Integer arithmetic (`isqrt`), since `check-display` compares host and target pixel for pixel;
+/// public because it applies the same shadow.
 ///
-/// **Still integer, which is the constraint that matters.** `d` comes from `isqrt`, not from a
-/// float: `check-display` compares a host build against an `x86_64-unknown-nitrox` one pixel for
-/// pixel, so a floating-point operation here would be the one place in compositing where the two
-/// could legitimately disagree.
-///
-/// Pixels inside the surface itself are skipped: the surface is about to be blitted over them, so
-/// darkening them first is work with no output, and for a *translucent* surface it would be work
-/// with the wrong output.
-///
-/// **Public because `check-display` calls it.** That gate renders what each reference window
-/// should contain and compares the guest's screen against it, and a window above now darkens the
-/// one below — so the host has to apply the same shadow rather than tolerate the difference.
-/// `tools/CLAUDE.md`: the gate is "the place a gate's expected answer is *computed*, not stored".
-///
-/// ## A rounded surface casts a rounded shadow
-///
-/// `corner` is the surface's corner radius, and it changes two things. The distance is measured
-/// to the *rounded* rectangle — the cast shrunk by `corner` on every side, then `corner` taken off
-/// the distance — so the shadow's own corners follow the window's rather than squaring off
-/// beneath them. And a pixel inside `bounds` is skipped only when the curve covers it *entirely*:
-/// outside the curve the blit leaves the pixel alone, so the shadow is all it will get, and on the
-/// curve the blit blends the window's edge over whatever is there, which has to include the
-/// shadow. At `corner == 0` both reduce exactly to the square case.
+/// Pixels inside the surface are skipped, as it is blitted over them. A rounded surface casts a
+/// rounded shadow: distance is measured to the rounded rectangle, and a pixel inside `bounds` is
+/// skipped only where the curve covers it entirely, since outside the curve the blit leaves it
+/// alone and on the curve it blends over the shadow.
 pub fn draw_shadow<F: Framebuffer + ?Sized>(fb: &mut F, bounds: Rect, corner: u32, shadow: &Shadow, clip: &Rect) {
     for layer in &shadow.layers {
         draw_layer(fb, bounds, corner, layer, clip);
@@ -233,8 +170,7 @@ fn draw_layer<F: Framebuffer + ?Sized>(fb: &mut F, bounds: Rect, corner: u32, sh
         return;
     }
     let c = crate::corner::clamp(corner, bounds.size.w, bounds.size.h);
-    // The cast with its corners' centres as its own corners: distance to *this*, less `c`, is
-    // distance to the rounded shape.
+    // Distance to this, less `c`, is the distance to the rounded shape.
     let inner = Rect::new(
         bounds.origin.x + shadow.offset.x + c as i32,
         bounds.origin.y + shadow.offset.y + c as i32,
@@ -244,22 +180,14 @@ fn draw_layer<F: Framebuffer + ?Sized>(fb: &mut F, bounds: Rect, corner: u32, sh
     let Some(area) = shadow.around(bounds).intersect(clip) else { return };
     let r = shadow.radius as i64;
     let rr = r * r;
-    // `inner` is empty on an axis where the surface is exactly `2c` across, and then its right
-    // edge is its left: `right() - 1` would sit one pixel *before* the origin and every pixel
-    // between would measure a distance of one.
+    // Empty where the surface is exactly `2c` across: `right() - 1` would precede the origin.
     let (ix0, ix1) = (inner.origin.x, (inner.right() as i32 - 1).max(inner.origin.x));
     let (iy0, iy1) = (inner.origin.y, (inner.bottom() as i32 - 1).max(inner.origin.y));
     let (left, right) = (bounds.origin.x, bounds.right() as i32);
     let (top, bottom) = (bounds.origin.y, bounds.bottom() as i32);
     for y in area.origin.y..area.bottom() as i32 {
-        // **The part of this row the surface covers whole, skipped as a span** (desktop refresh,
-        // Part A). This loop used to visit every pixel of the damage and reject the covered ones
-        // one at a time — for a window-sized damage rectangle, the whole window, per layer, and a
-        // second layer doubled it: the two-layer shadow measured 2.0x the single one on the host
-        // and failed `test-qemu`'s idle check under emulation — and failed it again when this
-        // loop was put back, which is what makes it the cause rather than a coincidence. The span
-        // is exactly the pixels `covered` answers 255 for — the row between the curves, from
-        // `corner::row`.
+        // The span the surface covers whole is skipped, not visited per pixel (the two-layer
+        // shadow cost 2.0x the single one); it is where `covered` answers 255.
         let (skip_from, skip_to) = if y >= top && y < bottom {
             let shape = crate::corner::row(c, (y - top).min(bottom - 1 - y) as u32);
             let inset = (shape.clear + shape.partial) as i32;
@@ -275,10 +203,8 @@ fn draw_layer<F: Framebuffer + ?Sized>(fb: &mut F, bounds: Rect, corner: u32, sh
                 continue;
             }
             let dx = (ix0 - x).max(x - ix1).max(0) as i64;
-            // Beside a straight edge one of the two is zero and the distance is the other,
-            // exactly — `isqrt` of a perfect square is its root — so the root is taken only off
-            // the corners, where both are non-zero. `isqrt` floors, so a pixel is never darker
-            // than its true distance would make it.
+            // `isqrt` of a perfect square is its root, so the root is taken only off the corners;
+            // it floors, so a pixel is never darker than its true distance.
             let d = match (dx, dy) {
                 (0, d) | (d, 0) => d,
                 _ => ((dx * dx + dy * dy) as u64).isqrt() as i64,
@@ -296,17 +222,9 @@ fn draw_layer<F: Framebuffer + ?Sized>(fb: &mut F, bounds: Rect, corner: u32, sh
 
 /// Composite `surfaces` onto `fb` within `damage`.
 ///
-/// `surfaces` is in stacking order, **bottom first**; later entries paint over
-/// earlier ones. Each damage rectangle is repainted from scratch: `background`, then
-/// every surface that intersects it. Rectangles outside the screen contribute
-/// nothing, and overlapping damage rectangles are simply painted twice, which is
-/// wasteful but not wrong.
-///
-/// **Determinism** (§7) is a property of this function, and it is what the gate rests
-/// on: output depends only on the arguments, in the order given. No clock, no
-/// allocation order, no dependence on which client committed first. The one subtlety
-/// is that a damaged region is *cleared before* the surfaces are drawn, so a pixel no
-/// surface covers is `background` rather than whatever it previously held.
+/// `surfaces` is bottom first. Each damage rectangle is repainted from scratch: `background`, then
+/// every surface that intersects it; overlapping damage is painted twice. Deterministic (§7),
+/// which the gate rests on: output depends only on the arguments.
 pub fn compose<F: Framebuffer + ?Sized>(fb: &mut F, background: Rgb, surfaces: &[SurfaceRef<'_>], damage: &[Rect]) {
     let screen = fb.geometry().bounds();
     for area in damage {
@@ -318,34 +236,12 @@ pub fn compose<F: Framebuffer + ?Sized>(fb: &mut F, background: Rgb, surfaces: &
     }
 }
 
-/// Composite `surfaces` over `background`, **filling only the background nobody covers**.
+/// Composite `surfaces` over `background`, filling only the background nobody covers.
 ///
-/// The same output as [`compose`], and measurably less work. `compose` fills every damage
-/// rectangle with the background and *then* blits the surfaces over it, so in a window drag most
-/// pixels are written twice — once as background and once as the window. This fills only the
-/// *exposed* part: the damage rectangle minus every surface that is going to cover it.
-///
-/// **The two are the same picture, and a test asserts exactly that** rather than asserting either
-/// one's pixels: the property that matters is that removing work removed no output.
-///
-/// ## Why this is sound, and the one case where it is not
-///
-/// A surface in a format with no alpha channel is opaque, and [`blit_clipped`] writes every pixel
-/// of the intersection it is given. So background under such a surface is background nobody can
-/// see. A translucent surface is neither of those things and is excluded by [`covers`].
-///
-/// The exception is a **malformed surface**: one whose `pixels` are shorter than its `geometry`
-/// claims. `blit_clipped` skips those pixels rather than reading past the buffer, and today the
-/// fill underneath is what the viewer sees instead. Skipping the fill would turn that into
-/// whatever the framebuffer held before — stale pixels rather than background. So a surface only
-/// counts as covering when its buffer is long enough to make the blit's guarantee real, which is
-/// the check [`covers`] makes.
-///
-/// ## Where the flicker went
-///
-/// This is also the flicker's cause, seen from the other side (M13 Part A): the fill *is* the
-/// flash. A frame that never paints background over a region a window is about to occupy has no
-/// intermediate state for a scanout to catch there.
+/// The same output as [`compose`] with less work: a window drag writes most pixels twice there.
+/// A surface covers only if it is opaque ([`covers`]) and its buffer holds its geometry, else its
+/// skipped pixels would show stale framebuffer contents. The fill is also the flicker's cause: a
+/// frame that never paints background where a window is about to be leaves nothing to scan out.
 pub fn compose_exposed<F: Framebuffer + ?Sized>(
     fb: &mut F,
     background: Rgb,
@@ -355,20 +251,15 @@ pub fn compose_exposed<F: Framebuffer + ?Sized>(
     let screen = fb.geometry().bounds();
     for area in damage {
         let Some(area) = area.intersect(&screen) else { continue };
-        // The exposed region: the damage rectangle with every covering surface cut out of it.
-        // Accumulated as a small list of rectangles, because subtracting one rectangle from
-        // another leaves up to four.
+        // The damage rectangle with every covering surface cut out (up to four pieces per cut).
         let mut exposed: [Option<Rect>; MAX_EXPOSED] = [None; MAX_EXPOSED];
         exposed[0] = Some(area);
         for surface in surfaces {
             if !covers(surface) {
                 continue;
             }
-            // A rounded surface covers its rectangle less its four corner squares, and the
-            // background under those corners must still be filled: the blit leaves the outside
-            // of each curve unwritten and blends the curve itself, so either way the pixel
-            // shows what was painted beneath it. Cutting the whole rectangle would leave the
-            // corners holding whatever the framebuffer last held.
+            // A rounded surface's corner squares still need background: the blit leaves outside
+            // the curve unwritten.
             for cut in covered_by(surface).iter().flatten() {
                 subtract_from(&mut exposed, cut);
             }
@@ -382,14 +273,9 @@ pub fn compose_exposed<F: Framebuffer + ?Sized>(
     }
 }
 
-/// One surface and the shadow it casts, in the order they belong on screen.
-///
-/// **The shadow goes down first, immediately before its own surface.** That is the whole of the
-/// ordering rule: everything below this surface has already been painted, so the shadow falls on
-/// it, and the surface then covers the part of its own shadow that the offset put underneath it.
-/// A separate pass over all the shadows — before or after the surfaces — would put every shadow
-/// under every window or over every window, and both are visibly wrong the moment two windows
-/// overlap.
+/// One surface and the shadow it casts. The shadow goes down first, so it falls on what is below
+/// and the surface covers the part under it; a separate shadow pass would put every shadow under
+/// or over every window.
 fn paint_surface<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, area: &Rect) {
     if let Some(shadow) = &surface.shadow {
         draw_shadow(fb, surface.bounds(), surface.radius(), shadow, area);
@@ -397,45 +283,19 @@ fn paint_surface<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, 
     blit_clipped(fb, surface, area);
 }
 
-/// How many rectangles the exposed region is allowed to become.
-///
-/// **A fixed array rather than a `Vec`, and a bound rather than a guarantee.** Subtracting one
-/// rectangle from another leaves up to four, so the region can in principle grow without limit as
-/// surfaces are cut out of it. When a subtraction will not fit, [`subtract_from`] abandons *that
-/// subtraction entirely* and leaves the region as it found it — which fills more background than
-/// strictly necessary and is therefore always correct, just less of a saving. Sixteen covers any
-/// arrangement a drag produces; a desktop full of overlapping windows falls back toward
-/// [`compose`]'s behaviour rather than toward being wrong.
-///
-/// **The value is a tuning choice and nothing rests on it**, which is the property to preserve:
-/// `compose_exposed` must draw `compose`'s picture at *any* bound, so lowering this can only cost
-/// speed. It did not always hold — see [`subtract_from`].
+/// How many rectangles the exposed region may become. A bound, not a guarantee: [`subtract_from`]
+/// abandons a subtraction that will not fit, which over-fills and is always correct, so lowering
+/// this can only cost speed.
 const MAX_EXPOSED: usize = 16;
 
-/// Whether `surface` is one that skipping the fill underneath is safe for — see
-/// [`compose_exposed`]'s doc.
-///
-/// **Two conditions, and the second arrived with alpha.** A surface hides what is under it only
-/// if its blit writes every pixel of the intersection *and* those writes do not depend on what
-/// was there. A short buffer breaks the first — [`blit_clipped`] skips the pixels it cannot read.
-/// An alpha channel breaks the second: a blended pixel reads the destination, so skipping the
-/// background fill would blend the window against whatever the framebuffer last held rather than
-/// against the background. That is a colour-shifted window instead of a hole — the same class of
-/// defect, harder to see and harder to trace.
-///
-/// The PR #274 review asked for this to be named here before Part B landed, on the grounds that
-/// the Part B author would be standing in this function. They were; it was.
+/// Whether skipping the fill underneath `surface` is safe: its blit must write every pixel of the
+/// intersection (a short buffer breaks this) without depending on what was there (alpha does).
 fn covers(surface: &SurfaceRef<'_>) -> bool {
     !surface.geometry.format.has_alpha() && surface.pixels.len() >= surface.geometry.byte_len()
 }
 
-/// The rectangles a [`covers`] surface paints every pixel of, opaquely: its bounds, or — rounded
-/// — its bounds less the four corner squares, as three bands.
-///
-/// **Three cuts rather than one, and any subset of them is safe.** [`subtract_from`] refuses a cut
-/// that does not fit and leaves the region as it was, so a crowded region may take the middle band
-/// and not the other two. That over-fills the strips above and below, which the surface then
-/// covers — the failure mode `subtract_from` is built to have.
+/// The rectangles a [`covers`] surface paints every pixel of: its bounds, or three bands when
+/// rounded. Any subset is safe, as [`subtract_from`] refuses a cut that does not fit.
 fn covered_by(surface: &SurfaceRef<'_>) -> [Option<Rect>; 3] {
     let b = surface.bounds();
     let r = surface.radius();
@@ -444,39 +304,22 @@ fn covered_by(surface: &SurfaceRef<'_>) -> [Option<Rect>; 3] {
     }
     let (x, y, w, h) = (b.origin.x, b.origin.y, b.size.w, b.size.h);
     [
-        // The full-width middle, between the two rows of corners.
         Some(Rect::new(x, y + r as i32, w, h - 2 * r)),
-        // Above and below it, between the corners.
         Some(Rect::new(x + r as i32, y, w - 2 * r, r)),
         Some(Rect::new(x + r as i32, y + (h - r) as i32, w - 2 * r, r)),
     ]
 }
 
-/// Cut `cut` out of every rectangle in `region`, in place — **or leave `region` untouched**.
+/// Cut `cut` out of every rectangle in `region`, in place, or leave `region` untouched.
 ///
-/// Each surviving piece is one of the up-to-four bands around the removed part.
-///
-/// **All of the subtraction, or none of it.** The result is written into a scratch array and only
-/// installed once every piece has fitted; running out of room returns with `region` as it was.
-/// That makes the failure mode an over-fill — the caller paints background a surface is about to
-/// cover — which costs the work this function exists to save and cannot be wrong.
-///
-/// **This was a hole, and the shape of the bug is worth keeping.** The bound used to be enforced
-/// two ways that did not agree: an `n + 4 > MAX_EXPOSED` guard before splitting a piece, and a
-/// `push` that silently discarded when the array was full. Between them `n` could reach exactly
-/// `MAX_EXPOSED`, and every remaining piece was then **dropped** rather than kept — background
-/// that nothing fills and no surface covers, so the framebuffer keeps whatever it last held. Five
-/// interior windows on a bare desktop were enough (PR #274 review). Two mechanisms guarding one
-/// invariant is how an invariant gets lost; there is now one, and it is the array's own capacity.
+/// All or nothing: running out of room is an over-fill, never a hole. A bound enforced two ways
+/// that disagreed once dropped pieces, leaving background nothing fills and no surface covers.
 fn subtract_from(region: &mut [Option<Rect>], cut: &Rect) {
-    // The capacity is the region's own length rather than the constant, so a test can run this
-    // at every size and pin "any bound is safe" as a property instead of a claim about 16.
+    // The capacity is the region's length, so a test can run this at every size.
     let cap = region.len().min(MAX_EXPOSED);
     let mut out: [Option<Rect>; MAX_EXPOSED] = [None; MAX_EXPOSED];
     let mut n = 0usize;
-    // `false` when the piece will not fit, which abandons the subtraction. An empty band is not a
-    // piece and is skipped rather than refused — the four bands around a cut are usually not all
-    // present, and treating a zero-width one as a failure would over-fill almost every time.
+    // `false` when the piece will not fit; an empty band is skipped, not refused.
     let push = |r: Rect, n: &mut usize, out: &mut [Option<Rect>; MAX_EXPOSED]| -> bool {
         if r.size.w == 0 || r.size.h == 0 {
             return true;
@@ -499,8 +342,7 @@ fn subtract_from(region: &mut [Option<Rect>], cut: &Rect) {
         let (r, b) = (piece.right() as i32, piece.bottom() as i32);
         let (hl, ht) = (hit.origin.x, hit.origin.y);
         let (hr, hb) = (hit.right() as i32, hit.bottom() as i32);
-        // Above, below, and the two side bands between them — a partition, so no pixel is in
-        // two pieces and none is missed.
+        // Above, below and the two side bands: a partition, so no pixel is doubled or missed.
         let bands = [
             Rect::new(l, t, (r - l) as u32, (ht - t).max(0) as u32),
             Rect::new(l, hb, (r - l) as u32, (b - hb).max(0) as u32),
@@ -518,18 +360,13 @@ fn subtract_from(region: &mut [Option<Rect>], cut: &Rect) {
     }
 }
 
-/// Composite over the whole screen. Equivalent to [`compose`] with one full-screen
-/// damage rectangle; the shape a first frame takes, before anything is incremental.
+/// Equivalent to [`compose`] with one full-screen damage rectangle.
 pub fn compose_full<F: Framebuffer + ?Sized>(fb: &mut F, background: Rgb, surfaces: &[SurfaceRef<'_>]) {
     let screen = fb.geometry().bounds();
     compose(fb, background, surfaces, &[screen]);
 }
 
-/// Draw the part of `surface` that falls inside `area`.
-///
-/// Pixels are translated through `Rgb` rather than copied as words, because a surface
-/// need not share the framebuffer's channel order. Copying raw words would be faster
-/// and would silently swap channels the moment the two formats differ.
+/// Draw the part of `surface` inside `area`, through `Rgb` since formats may differ in order.
 fn blit_clipped<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, area: &Rect) {
     let Some(visible) = surface.bounds().intersect(area) else { return };
     let r = surface.radius();
@@ -537,12 +374,8 @@ fn blit_clipped<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, a
         blit_span(fb, surface, visible);
         return;
     }
-    // **The masked blit** (desktop refresh, Part A). A rounded surface is three bands: the rows
-    // of its top corners, the rows between, and the rows of its bottom corners. The middle band
-    // is a plain rectangle and goes down the path it always did — the `memcpy`, for every real
-    // window. Each corner row is a shorter span between the two curves, down the same path, plus
-    // the few pixels *on* each curve, blended at their coverage. Pixels outside the curve are
-    // not touched, so what the surfaces below painted there is what shows.
+    // The masked blit: a plain middle band (the `memcpy` path), and per corner row a span between
+    // the curves plus the pixels on each curve blended at their coverage.
     let b = surface.bounds();
     let (top, bottom) = (b.origin.y, b.bottom() as i32);
     let middle = Rect::new(b.origin.x, top + r as i32, b.size.w, b.size.h - 2 * r);
@@ -571,9 +404,8 @@ fn blit_clipped<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, a
     }
 }
 
-/// One pixel of `surface` at screen `(x, y)`, blended at `coverage` — the edge of a rounded
-/// corner. A surface with its own alpha has the two multiplied, so a translucent window's curve
-/// is as translucent as the rest of it.
+/// One pixel of `surface` at screen `(x, y)` blended at `coverage`, the edge of a rounded corner;
+/// the surface's own alpha is multiplied in.
 fn blend_one<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, x: i32, y: i32, coverage: u8) {
     let src = surface.geometry;
     let (sx, sy) = ((x - surface.origin.x) as u32, (y - surface.origin.y) as u32);
@@ -589,13 +421,8 @@ fn blend_one<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, x: i
 fn blit_span<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visible: Rect) {
     let src = surface.geometry;
 
-    // **The formats match on every real path, and then a row is a `memcpy`.** A client's surface
-    // and the framebuffer both come from the same Limine-reported mode, so `decode` followed by
-    // `encode` is a round trip through `Rgb` that lands on the bytes it started from. Doing it a
-    // pixel at a time — two `offset_of`s, six bounds checks, an unpack and a repack — is what the
-    // compositor actually spends a drag's time on, which is not obvious until it is measured:
-    // removing *half the pixel writes* from a frame (`compose_exposed`) bought 6%, because the
-    // writes were never the cost. See the M13 Part A entry in `docs/decision-log.md`.
+    // On every real path the formats match and a row is a `memcpy`; the per-pixel path is what a
+    // drag spends its time on (halving pixel writes bought 6%).
     if src.format.has_alpha() {
         blit_blended(fb, surface, visible);
     } else if src.format == fb.geometry().format {
@@ -605,18 +432,9 @@ fn blit_span<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visi
     }
 }
 
-/// Composite `visible` from a surface that carries its own opacity, a pixel at a time.
-///
-/// **The slow path, taken only by surfaces that asked for it** (M13 Part B). Blending has to read
-/// the destination before writing it, so it cannot be a row copy and cannot be reordered with the
-/// surfaces below — which is exactly why the alpha channel is opt-in and `XRGB8888` remains the
-/// default. A desktop of ordinary windows never reaches this function.
-///
-/// [`Framebuffer::blend_pixel`] already handles the three coverage classes, and the two extremes
-/// matter here rather than being tidiness: a fully transparent pixel writes nothing, and a fully
-/// opaque one is a plain store rather than a read-modify-write. A surface that is mostly one or
-/// the other — the usual shape, a translucent panel carrying opaque text — pays the blend only on
-/// the pixels that need it.
+/// The slow path, for surfaces with an alpha channel: blending reads the destination, so it is not
+/// a row copy (hence alpha is opt-in). [`Framebuffer::blend_pixel`] skips transparent pixels and
+/// stores opaque ones.
 fn blit_blended<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visible: Rect) {
     let src = surface.geometry;
     let bpp = src.format.bytes_per_pixel();
@@ -641,19 +459,13 @@ fn blit_blended<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, v
     }
 }
 
-/// Copy `visible` from `surface` to `fb` a pixel at a time, converting each through [`Rgb`].
-///
-/// The general case, and — since it is the one that handles a format change — the definition of
-/// what [`blit_rows`] must agree with. A test runs the two against each other over the arrangements
-/// where the row maths could go wrong, which is the only thing standing between the fast path and
-/// a silent wrong picture: every caller takes the fast path, so no test of `compose`'s *output*
-/// can see this one.
+/// The general case, and the definition [`blit_rows`] must agree with: every caller takes the fast
+/// path, so a test compares them.
 fn blit_pixels<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visible: Rect) {
     let src = surface.geometry;
     let src_bpp = src.format.bytes_per_pixel();
     for row in 0..visible.size.h {
         let dst_y = visible.origin.y + row as i32;
-        // Where this screen row sits inside the surface.
         let src_y = (dst_y - surface.origin.y) as u32;
         for col in 0..visible.size.w {
             let dst_x = visible.origin.x + col as i32;
@@ -673,18 +485,10 @@ fn blit_pixels<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, vi
     }
 }
 
-/// Copy `visible` from `surface` to `fb` a row at a time, for the case where the two share a
-/// pixel format.
+/// Copy `visible` from `surface` to `fb` a row at a time, for surfaces sharing the pixel format.
 ///
-/// **The one behaviour worth stating is the short surface**, because it is the same hazard
-/// [`compose_exposed`] guards: a client whose buffer is shorter than its geometry claims. The
-/// per-pixel path copies the pixels that are there and skips the rest, leaving whatever was
-/// underneath, so this clamps each row's copy to the bytes the buffer actually holds and rounds
-/// down to a whole pixel. A row that starts past the end copies nothing.
-///
-/// The padding bits ride along. Where the per-pixel path rebuilds each word through `Rgb` and so
-/// writes zero into an `XRGB8888` alpha byte, this copies the source's. Nothing reads those bits
-/// — the format's name is what says so — and the picture is identical either way.
+/// A short surface is clamped to the bytes held, rounded down to a whole pixel, matching the
+/// per-pixel path. Padding bits ride along; nothing reads them.
 fn blit_rows<F: Framebuffer + ?Sized>(fb: &mut F, surface: &SurfaceRef<'_>, visible: Rect) {
     let src = surface.geometry;
     let dst = fb.geometry();
@@ -718,15 +522,8 @@ mod tests {
     use super::*;
     use crate::format::PixelFormat;
 
-    /// How much of the screen pixel `(x, y)` a surface at `bounds` with corners of `radius` covers.
-    ///
-    /// `(x, y)` must be inside `bounds`; `radius` must already be clamped to it. Mirrors the pixel
-    /// into the nearest corner and asks [`corner::coverage`](crate::corner::coverage), so all four
-    /// corners are the one curve.
-    ///
-    /// **Test-only since the span skip** (desktop refresh, Part A): `draw_layer` found its covered
-    /// span per row instead of asking this per pixel, and this stayed as the per-pixel definition
-    /// the tests and `draw_layer_reference` are written against.
+    /// How much of screen pixel `(x, y)` a surface at `bounds` with corners of `radius` covers: the
+    /// per-pixel definition `draw_layer_reference` and the tests use.
     fn covered(bounds: Rect, radius: u32, x: i32, y: i32) -> u8 {
         if radius == 0 {
             return 255;
@@ -736,18 +533,9 @@ mod tests {
         crate::corner::coverage(radius, dx, dy)
     }
 
-    // ---- compose_exposed (M13 Part A) ----
-
-    /// A framebuffer that counts the **background pixels filled** through it.
-    ///
-    /// **The saving is a count, not a duration**: a timing here would measure this machine, and
-    /// what the change claims is that it fills less background for the same picture.
-    ///
-    /// It counts fills and `put_pixel`s, which since the row-copy fast path landed means fills
-    /// alone — [`blit_rows`] writes through `bytes_mut` and is invisible here. That is the right
-    /// quantity anyway: `compose` and `compose_exposed` blit *identically*, and the fill is the
-    /// entire difference between them. A counter that also saw the blits would dilute the ratio
-    /// with a term the change does not move.
+    /// A framebuffer that counts background pixels filled (a count, not a duration, which would
+    /// measure this machine). Only fills and `put_pixel`s count: the blits are identical and the
+    /// fill is the whole difference between `compose` and `compose_exposed`.
     struct Counting {
         inner: crate::framebuffer::MemFramebuffer,
         writes: core::cell::Cell<usize>,
@@ -779,15 +567,10 @@ mod tests {
         }
     }
 
-    /// The geometry the tests below compose into. Named apart from the module's existing
-    /// `screen()`, which hands back a framebuffer rather than its shape.
     fn screen_geom() -> Geometry {
         Geometry::with_pitch(64, 48, 64 * 4, PixelFormat::XRGB8888).unwrap()
     }
 
-    // ---- shadows (M13 Part C) ----
-
-    /// The shadow the tests below cast: reaching 6px, dropped 2px, black.
     fn shade() -> Shadow {
         Shadow::single(ShadowLayer { radius: 6, offset: Point::new(0, 2), colour: Rgb::new(0, 0, 0), strength: 160 })
     }
@@ -803,27 +586,17 @@ mod tests {
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         compose(&mut fb, bg, &surfaces, &[g.bounds()]);
 
-        // Inside the surface: the surface's own colour, untouched by its shadow.
         assert_eq!(fb.get_pixel(25, 20), Some(ink));
-        // Just outside its left edge: darker than the background.
         let left = fb.get_pixel(19, 20).unwrap();
         assert!(left.r < bg.r, "no shadow beside the surface: {left:?}");
-        // Far away: the background exactly.
         assert_eq!(fb.get_pixel(5, 5), Some(bg));
     }
 
     #[test]
     fn the_shadow_falls_off_fast_near_the_surface_and_leaves_a_faint_tail() {
-        // **The shape, not the constants** (PR #276 review, finding 5). The curve this replaced —
-        // `strength * (r² - d²) / r²`, which needs no square root — holds three quarters of its
-        // opacity half a radius out, so every window wore a dark band with a sudden edge and
-        // turning `strength` down produced a fainter band rather than a shadow. Substituting it
-        // back passed all 549 host tests, and `check-display` cannot catch it either because the
-        // gate computes its expected shadow through this same function.
-        //
-        // Asserted as ratios against the edge value, so the numbers here survive a change of
-        // `strength` or `radius` and only a change of *curve* breaks them. The old curve gives
-        // 94% / 75% / 44% at these three points; this one gives 56% / 25% / 6%.
+        // The shape, not the constants: the replaced `(r² - d²) / r²` passed every other test.
+        // Ratios against the edge value, so only a change of curve breaks them: that curve gives
+        // 94% / 75% / 44% at these points, this one 56% / 25% / 6%.
         let g = screen_geom();
         let bg = Rgb::new(255, 255, 255);
         let sh = Shadow::single(ShadowLayer {
@@ -836,7 +609,6 @@ mod tests {
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(sh)], &[g.bounds()]);
 
-        // Coverage read off a white ground: 255 - the pixel's value.
         let cov = |d: i32| 255 - fb.get_pixel((24 - 1 - d) as u32, 12).unwrap().r as i32;
         let edge = cov(0);
         assert!(edge > 150, "the premise: the edge is dark, got {edge}");
@@ -854,8 +626,6 @@ mod tests {
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(shade())], &[g.bounds()]);
 
-        // Walking left from the edge, each step is lighter than the last, and the last is the
-        // background: a falloff that saturated, or one that stopped short, fails one or the other.
         let mut last = 0u8;
         for (i, x) in (14..20).rev().enumerate() {
             let v = fb.get_pixel(x, 20).unwrap().r;
@@ -869,10 +639,8 @@ mod tests {
 
     #[test]
     fn a_shadow_falls_on_the_window_below_it_and_under_its_own() {
-        // **The ordering rule, and the only test that can see it.** A pass that drew every shadow
-        // before every surface would put this shadow under the lower window; one that drew them
-        // all afterwards would put it over the upper window. Both draw the same picture when only
-        // one window is on screen.
+        // The ordering rule: all shadows before all surfaces would put this under the lower
+        // window, all after would put it over the upper.
         let g = screen_geom();
         let bg = Rgb::new(120, 120, 120);
         let under = Rgb::new(240, 240, 240);
@@ -884,18 +652,13 @@ mod tests {
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         compose(&mut fb, bg, &surfaces, &[g.bounds()]);
 
-        // On the lower window, beside the upper one: darkened.
         let on_under = fb.get_pixel(19, 20).unwrap();
         assert!(on_under.r < under.r, "the shadow did not fall on the window below: {on_under:?}");
-        // The upper window itself is untouched by its own shadow.
         assert_eq!(fb.get_pixel(25, 20), Some(over));
     }
 
     #[test]
     fn compose_exposed_draws_the_same_picture_as_compose_with_shadows() {
-        // The equivalence again, now that a surface can paint outside its own bounds. The exposed
-        // region is cut by `bounds`, so the ground under a shadow is still filled — and if it
-        // were not, the shadow would blend against whatever the buffer last held.
         let g = screen_geom();
         let bg = Rgb::new(120, 120, 120);
         let stale = Rgb::new(240, 0, 240);
@@ -917,24 +680,18 @@ mod tests {
 
     #[test]
     fn damage_bounds_a_shadow_the_way_it_bounds_a_surface() {
-        // A shadow is painted through the same clip as everything else, or a partial repaint
-        // would leave a band of the old one behind.
         let g = screen_geom();
         let bg = Rgb::new(120, 120, 120);
         let (sg, px, o) = surface(20, 16, 12, 10, Rgb::new(200, 30, 30));
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         fb.clear(bg);
         compose(&mut fb, bg, &[SurfaceRef::new(sg, o, &px).with_shadow(shade())], &[Rect::new(20, 16, 12, 10)]);
-        // Only the surface's own rectangle was damaged, so its shadow is nowhere.
         assert_eq!(fb.get_pixel(19, 20), Some(bg), "the shadow escaped the damage rectangle");
     }
 
     #[test]
     fn a_shadow_offset_past_its_radius_still_covers_the_surface() {
-        // `around` is what damage is computed from, so it must never start inside the window: an
-        // offset larger than the radius would otherwise leave a band of the window itself
-        // unrepainted after a move. Not reachable with the shipped constants — which is exactly
-        // why it needs a test rather than a person (PR #276 review, optional 9).
+        // `around` must never start inside the window, or a move leaves a band unrepainted.
         let bounds = Rect::new(40, 30, 20, 16);
         let far = Shadow::single(ShadowLayer {
             radius: 4,
@@ -950,27 +707,20 @@ mod tests {
                 && r.bottom() >= bounds.bottom(),
             "{r:?} does not contain {bounds:?}"
         );
-        // …and it still reaches the displaced shadow, which is the other half of its job.
         assert!(r.bottom() >= bounds.bottom() + 30 + 4);
     }
 
     #[test]
     fn painted_bounds_includes_the_shadow_and_bounds_does_not() {
-        // **The split damage rests on.** One rectangle serving both would make the shadow
-        // clickable, since hit-testing asks `bounds`.
         let (sg, px, o) = surface(20, 16, 12, 10, Rgb::new(1, 2, 3));
         let plain = SurfaceRef::new(sg, o, &px);
         assert_eq!(plain.painted_bounds(), plain.bounds());
 
         let shadowed = plain.with_shadow(shade());
         assert_eq!(shadowed.bounds(), Rect::new(20, 16, 12, 10), "bounds must not grow");
-        // 6px each way, dropped 2: x 14..38, y 12..34.
         assert_eq!(shadowed.painted_bounds(), Rect::new(14, 12, 24, 22));
     }
 
-    // ---- alpha (M13 Part B) ----
-
-    /// A `w`x`h` `ARGB8888` surface at `(x, y)`, one colour at one opacity.
     fn translucent(x: i32, y: i32, w: u32, h: u32, c: Rgb, alpha: u8) -> (Geometry, alloc::vec::Vec<u8>, Point) {
         let g = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::ARGB8888).unwrap();
         let word = g.format.encode_alpha(c, alpha).to_le_bytes();
@@ -991,23 +741,15 @@ mod tests {
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         compose(&mut fb, bg, &surfaces, &[g.bounds()]);
 
-        // Half of the source over a black background — the same arithmetic `Rgb::blend` does,
-        // asserted against `blend` rather than against hand-computed numbers so this pins the
-        // *plumbing* (channel positions, which operand is which) and not the mixing rule.
+        // Asserted against `blend` to pin the plumbing (channels, operands), not the mixing rule.
         assert_eq!(fb.get_pixel(5, 5), Some(Rgb::new(200, 100, 50).blend(bg, 128)));
-        // Not the source, and not the background: a wrong alpha position would give one of those.
         assert_ne!(fb.get_pixel(5, 5), Some(Rgb::new(200, 100, 50)));
         assert_ne!(fb.get_pixel(5, 5), Some(bg));
-        // Outside the surface, background as usual.
         assert_eq!(fb.get_pixel(20, 20), Some(bg));
     }
 
     #[test]
     fn a_fully_opaque_argb_surface_draws_what_an_xrgb_one_draws() {
-        // **The equivalence that catches a misplaced alpha channel.** At alpha 255 the two
-        // formats describe the same picture, so any disagreement is plumbing rather than blending
-        // — and `blend_pixel`'s 255 arm makes this a plain store, so it also checks that the fast
-        // arm of the slow path writes what the fast path would.
         let g = screen_geom();
         let bg = Rgb::new(9, 9, 9);
         let colour = Rgb::new(200, 100, 50);
@@ -1036,15 +778,8 @@ mod tests {
 
     #[test]
     fn a_translucent_surface_blends_against_the_background_not_the_last_frame() {
-        // **The trap PR #274's review predicted for this part, made a test.** `compose_exposed`
-        // skips the background fill where a surface will cover it — sound only while the blit
-        // ignores what was there. A blended pixel does not, so a translucent surface must *not*
-        // count as covering: with the fill skipped it would mix with whatever the framebuffer
-        // last held, which is a plausible-looking colour rather than an obvious hole.
-        //
-        // Both framebuffers start holding a previous frame, which is what makes the difference
-        // visible at all — on a fresh buffer the stale pixels would be black and the bug could
-        // pass for a dark blend.
+        // A translucent surface must not count as covering: skipping the fill would blend it
+        // against stale pixels. The buffers start holding a previous frame to make that visible.
         let g = screen_geom();
         let bg = Rgb::new(9, 9, 9);
         let stale = Rgb::new(240, 0, 240);
@@ -1064,27 +799,19 @@ mod tests {
 
     #[test]
     fn a_short_translucent_surface_blends_what_it_has_and_skips_the_rest() {
-        // **The one line of the alpha path with no negative control** (PR #275 review, optional
-        // 5). `blit_blended` mirrors `blit_pixels`' short-buffer skip, and the compositor drops
-        // short surfaces before compose ever sees them, so this is defensive — but "defensive"
-        // is a claim about a code path, and an untested one reads past a client's buffer if the
-        // comparison is ever written the wrong way round.
+        // Defensive: the compositor drops short surfaces first, but an untested skip could read
+        // past a client's buffer.
         let g = screen_geom();
         let bg = Rgb::new(9, 9, 9);
         let ink = Rgb::new(200, 100, 50);
         let (sg, px, o) = translucent(2, 2, 10, 8, ink, 128);
 
-        // Two whole rows and a fragment: enough that some pixels blend and the rest do not.
         let short = &px[..sg.pitch * 2 + 5];
         let mut fb = crate::framebuffer::MemFramebuffer::new(g);
         compose(&mut fb, bg, &[SurfaceRef::new(sg, o, short)], &[g.bounds()]);
 
-        // A pixel the buffer covers blended; one past its end is the background the fill left,
-        // not a read past the end and not an untouched pixel.
         assert_eq!(fb.get_pixel(3, 2), Some(ink.blend(bg, 128)));
         assert_eq!(fb.get_pixel(3, 6), Some(bg));
-        // The control: with the whole buffer that second pixel *does* blend, so the assertion
-        // above is about the truncation rather than about the geometry.
         let mut full = crate::framebuffer::MemFramebuffer::new(g);
         compose(&mut full, bg, &[SurfaceRef::new(sg, o, &px)], &[g.bounds()]);
         assert_eq!(full.get_pixel(3, 6), Some(ink.blend(bg, 128)));
@@ -1092,9 +819,6 @@ mod tests {
 
     #[test]
     fn an_opaque_surface_still_covers_and_a_translucent_one_does_not() {
-        // `covers` decides whether the fill underneath can be skipped, and it is the whole reason
-        // the test above passes. Asserted directly so a change to either condition is visible
-        // here rather than only as a picture two functions away.
         let (og, opx, oo) = surface(0, 0, 8, 8, Rgb::new(1, 2, 3));
         assert!(covers(&SurfaceRef::new(og, oo, &opx)));
         let (tg, tpx, to) = translucent(0, 0, 8, 8, Rgb::new(1, 2, 3), 255);
@@ -1102,20 +826,10 @@ mod tests {
         assert!(!covers(&SurfaceRef::new(og, oo, &opx[..4])), "a short buffer covers nothing");
     }
 
-    /// `subtract_from` never loses a pixel, at any capacity — the invariant the hole broke.
-    ///
-    /// **Two directions, and both matter.** A point that was exposed must still be exposed unless
-    /// the cut took it: losing one is background nothing paints, which is the stale-pixel hole
-    /// that PR #274's review found. And no point may *appear*: the region is what gets filled with
-    /// background, so a piece growing past where it started would paint over a window.
-    ///
-    /// Run at every capacity from 1 up, because the bug lived entirely in the overflow path and
-    /// the shipped bound of 16 is generous enough that ordinary arrangements never reach it. A
-    /// capacity of 1 can barely represent any cut at all and must still be correct — it simply
-    /// declines to subtract, which is the over-fill the design allows.
+    /// `subtract_from` never loses a pixel and never invents one, at any capacity, including the
+    /// overflow path the shipped bound of 16 rarely reaches.
     #[test]
     fn subtracting_never_loses_a_pixel_at_any_capacity() {
-        // Every point of a small grid that the region covers.
         fn covered(region: &[Option<Rect>]) -> alloc::vec::Vec<(i32, i32)> {
             let mut out = alloc::vec::Vec::new();
             for y in 0..24 {
@@ -1161,8 +875,6 @@ mod tests {
                     assert!(before.contains(p), "cap {cap}: {p:?} appeared from nowhere");
                 }
             }
-            // The control: at a generous capacity the subtraction actually happened, so the
-            // assertions above were not all trivially satisfied by a region that never changed.
             if cap == MAX_EXPOSED {
                 assert!(
                     covered(&region[..cap]).len() < 24 * 24,
@@ -1172,20 +884,8 @@ mod tests {
         }
     }
 
-    /// Enough surfaces to overflow the exposed region, and the picture is still `compose`'s.
-    ///
-    /// **The bound has to fail toward over-filling.** `subtract_from` represents the un-covered
-    /// background as at most [`MAX_EXPOSED`] rectangles, and cutting one surface out of one
-    /// rectangle leaves up to four — so a busy enough arrangement runs out of room. Filling a
-    /// rectangle a surface is about to cover anyway costs only the work this function saves;
-    /// *dropping* one leaves background that nothing paints and nothing covers, and the
-    /// framebuffer keeps whatever it last held there. Those are not two shades of the same
-    /// mistake: one is slower, the other is a hole.
-    ///
-    /// This arrangement is from the PR #274 review, which found the second happening — five
-    /// interior surfaces on this module's own screen left a 9x4 block of stale pixels at (55,14).
-    /// Both framebuffers start filled with a colour that is neither the background nor any
-    /// surface, so a pixel nobody wrote is visible as itself rather than passing for a fill.
+    /// Enough surfaces to overflow the exposed region: it must over-fill, not leave a hole (five
+    /// interior surfaces once left a 9x4 block of stale pixels at (55,14)).
     #[test]
     fn overflowing_the_exposed_region_over_fills_rather_than_leaving_a_hole() {
         let g = screen_geom();
@@ -1206,25 +906,16 @@ mod tests {
         compose_exposed(&mut exposed, bg, &surfaces, &damage);
 
         assert_eq!(plain.bytes(), exposed.bytes(), "a region was left neither filled nor covered");
-        // The control the equality needs: `never` must be gone, or two blank screens would agree.
         assert_eq!(plain.get_pixel(55, 14), Some(bg));
         assert_ne!(exposed.get_pixel(55, 14), Some(never), "stale pixels at the reported spot");
     }
 
-    /// The row-copy fast path and the per-pixel reference produce identical bytes.
-    ///
-    /// **Every caller takes the fast path**, so no test of `compose`'s output can tell the two
-    /// apart — this is the only thing between a wrong row calculation and a silently wrong
-    /// picture. The arrangements are the ones where that calculation can go wrong: a surface
-    /// hanging off each edge (so the copy starts mid-row and mid-surface), one clipped to a
-    /// narrow strip, one whose buffer is a byte short of a whole pixel, and one so short that
-    /// most rows have nothing to copy at all.
+    /// The row-copy fast path and the per-pixel reference agree, over surfaces off each edge, a
+    /// narrow strip, a buffer a byte short of a pixel and one so short most rows copy nothing.
     #[test]
     fn the_row_copy_agrees_with_the_per_pixel_blit() {
         let g = screen_geom();
         let bg = Rgb::new(0x2A, 0x55, 0x70);
-        // A gradient rather than a flat colour: a flat surface would survive almost any wrong
-        // offset, which is the whole failure mode this test exists to catch.
         let mk = |w: u32, h: u32| {
             let sg = Geometry::with_pitch(w, h, w as usize * 4 + 12, PixelFormat::XRGB8888).unwrap();
             let mut px = alloc::vec![0u8; sg.pitch * h as usize];
@@ -1269,8 +960,6 @@ mod tests {
             blit_pixels(&mut slow, &surface, visible);
 
             assert_eq!(fast.bytes(), slow.bytes(), "{name}: the two blits disagree");
-            // A negative control on the case itself: if the blit drew nothing, the comparison
-            // above is two identical background fills and proves nothing.
             if damage.intersect(&g.bounds()).is_some() && !pixels.is_empty() {
                 let mut plain = crate::framebuffer::MemFramebuffer::new(g);
                 plain.fill_rect(g.bounds(), bg);
@@ -1279,7 +968,6 @@ mod tests {
         }
     }
 
-    /// A `w`x`h` surface at `(x, y)`, every pixel the same colour.
     fn surface(x: i32, y: i32, w: u32, h: u32, c: Rgb) -> (Geometry, alloc::vec::Vec<u8>, Point) {
         let g = Geometry::with_pitch(w, h, w as usize * 4, PixelFormat::XRGB8888).unwrap();
         let word = g.format.encode(c).to_le_bytes();
@@ -1290,8 +978,6 @@ mod tests {
         (g, px, Point::new(x, y))
     }
 
-    /// The two produce the same picture, over arrangements that exercise every band of the
-    /// subtraction: fully covered, partly covered, untouched, and two overlapping surfaces.
     #[test]
     fn compose_exposed_draws_the_same_picture_as_compose() {
         let g = screen_geom();
@@ -1300,15 +986,10 @@ mod tests {
         let (tg, tpx, _) = surface(0, 0, 24, 24, Rgb::new(30, 200, 30));
 
         for (origin_a, origin_b, damage) in [
-            // The surface exactly covers the damage: the fill should vanish entirely.
             (Point::new(4, 4), Point::new(40, 40), alloc::vec![Rect::new(4, 4, 20, 16)]),
-            // A drag: where it was, and where it is.
             (Point::new(9, 4), Point::new(40, 40), alloc::vec![Rect::new(8, 4, 20, 16), Rect::new(9, 4, 20, 16),]),
-            // Damage nothing covers.
             (Point::new(4, 4), Point::new(40, 40), alloc::vec![Rect::new(50, 30, 10, 10)]),
-            // Two surfaces overlapping each other inside one damage rectangle.
             (Point::new(4, 4), Point::new(14, 10), alloc::vec![Rect::new(0, 0, 40, 40)]),
-            // Partly off-screen, so the clip and the subtraction interact.
             (Point::new(-6, -4), Point::new(56, 40), alloc::vec![Rect::new(0, 0, 64, 48)]),
         ] {
             let surfaces = [SurfaceRef::new(sg, origin_a, &spx), SurfaceRef::new(tg, origin_b, &tpx)];
@@ -1326,8 +1007,6 @@ mod tests {
         let bg = Rgb::new(120, 120, 120);
         let bounds = Rect::new(20, 12, 20, 14);
         let wide = ShadowLayer { radius: 12, offset: Point::new(0, 5), colour: Rgb::BLACK, strength: 60 };
-        // Coloured, so the order of the two blends is visible where they overlap: two black
-        // layers commute to within a rounding, and a test built on them could not tell.
         let contact = ShadowLayer { radius: 3, offset: Point::new(0, 1), colour: Rgb::new(200, 0, 0), strength: 120 };
         let draw = |layers: &[ShadowLayer]| {
             let mut fb = crate::framebuffer::MemFramebuffer::filled(g, bg);
@@ -1341,32 +1020,25 @@ mod tests {
         assert_eq!(both, draw(&[wide, contact]), "the pair is its layers, wide first");
         assert_ne!(both, draw(&[contact, wide]), "and the order is observable");
 
-        // Its reach is the union: the wide layer's here, which contains the contact layer's.
         let sh = Shadow { layers: [wide, contact] };
         assert_eq!(sh.around(bounds), wide.around(bounds));
-        // **And a layer that sticks out past the other widens it.** The assertion above passes
-        // for an `around` that reads only the first layer, because in that fixture the wide
-        // layer contains the contact one — as it does in both shipped schemes. A contact layer
-        // dropped further than the wide one reaches is what `tune --contact-drop 40` makes, and
-        // missing that strip would leave shadow behind every move (PR #312 review, finding 2).
+        // A layer sticking out past the other must widen `around`; the wide layer contains the
+        // contact one in both shipped schemes, so only a different layer shows it.
         let dropped = ShadowLayer { radius: 3, offset: Point::new(0, 30), colour: Rgb::BLACK, strength: 60 };
         let sticks_out = Shadow { layers: [wide, dropped] };
         let reach = sticks_out.around(bounds);
         assert!(reach.bottom() > wide.around(bounds).bottom(), "the dropped layer's strip is missing");
         assert_eq!(reach.bottom(), dropped.around(bounds).bottom());
         assert_eq!(reach.origin, wide.around(bounds).origin, "and the wide layer still sets the rest");
-        // And a layer with nothing to draw neither draws nor widens the damage.
         assert_eq!(Shadow::single(wide).around(bounds), wide.around(bounds));
         assert_eq!(ShadowLayer::NONE.around(bounds), bounds);
     }
 
     #[test]
     fn the_span_skipping_shadow_draws_exactly_what_the_per_pixel_one_did() {
-        // **Byte for byte**, because every gate's expected picture is drawn by this function and
-        // the change was made for speed alone. Arrangements chosen to hit each thing the fast
-        // path does differently: a corner of every size (the skipped span narrows along a curve),
-        // an offset past and inside the radius, a clip that starts or ends inside the skipped
-        // span, a window exactly `2c` across, and one partly off the screen.
+        // Byte for byte: every gate's expected picture is drawn by this function. Cases: corners
+        // of every size, an offset past and inside the radius, a clip inside the skipped span, a
+        // window exactly `2c` across, one partly off screen.
         let g = screen_geom();
         let (pg, ground) = patterned(64, 48, 64 * 4, 0x33);
         for corner in [0u32, 1, 3, 6, 8, 20] {
@@ -1396,8 +1068,6 @@ mod tests {
         }
     }
 
-    /// The per-pixel `draw_layer` this module shipped before the span skip, kept as the
-    /// definition the fast one must agree with byte for byte.
     fn draw_layer_reference<F: Framebuffer + ?Sized>(
         fb: &mut F,
         bounds: Rect,
@@ -1409,8 +1079,6 @@ mod tests {
             return;
         }
         let c = crate::corner::clamp(corner, bounds.size.w, bounds.size.h);
-        // The cast with its corners' centres as its own corners: distance to *this*, less `c`, is
-        // distance to the rounded shape.
         let inner = Rect::new(
             bounds.origin.x + shadow.offset.x + c as i32,
             bounds.origin.y + shadow.offset.y + c as i32,
@@ -1422,7 +1090,6 @@ mod tests {
         let rr = r * r;
         for y in area.origin.y..area.bottom() as i32 {
             for x in area.origin.x..area.right() as i32 {
-                // Inside the surface, where the blit is about to cover this pixel whole.
                 if x >= bounds.origin.x
                     && y >= bounds.origin.y
                     && x < bounds.right() as i32
@@ -1431,14 +1098,10 @@ mod tests {
                 {
                     continue;
                 }
-                // `inner` is empty on an axis where the surface is exactly `2c` across, and then its
-                // right edge is its left: `right() - 1` would sit one pixel *before* the origin and
-                // every pixel between would measure a distance of one.
                 let (ix0, ix1) = (inner.origin.x, (inner.right() as i32 - 1).max(inner.origin.x));
                 let (iy0, iy1) = (inner.origin.y, (inner.bottom() as i32 - 1).max(inner.origin.y));
                 let dx = (ix0 - x).max(x - ix1).max(0) as i64;
                 let dy = (iy0 - y).max(y - iy1).max(0) as i64;
-                // `isqrt` floors, so a pixel is never darker than its true distance would make it.
                 let d = ((dx * dx + dy * dy) as u64).isqrt() as i64 - c as i64;
                 let d = d.max(0);
                 if d >= r {
@@ -1451,10 +1114,7 @@ mod tests {
         }
     }
 
-    // ---- rounded corners (desktop refresh, Part A) ----
-
-    /// A screen whose every pixel differs from its neighbours, so a corner that wrote the wrong
-    /// thing — the background colour, or a neighbour's pixel — cannot match by accident.
+    /// A screen whose every pixel differs from its neighbours, so a wrong corner cannot match.
     fn patterned_ground() -> crate::framebuffer::MemFramebuffer {
         let (pg, ground) = patterned(64, 48, 64 * 4, 0x33);
         let mut fb = crate::framebuffer::MemFramebuffer::new(pg);
@@ -1462,8 +1122,7 @@ mod tests {
         fb
     }
 
-    /// What a rounded surface should put at every pixel of its bounds, computed the slow and
-    /// obvious way: the surface's own colour blended over `under` at the curve's coverage.
+    /// What a rounded surface should put at every pixel of its bounds, the slow obvious way.
     fn rounded_expectation(
         under: &crate::framebuffer::MemFramebuffer,
         surface: &SurfaceRef<'_>,
@@ -1487,8 +1146,6 @@ mod tests {
 
     #[test]
     fn a_rounded_surface_blends_its_curve_and_leaves_the_outside_to_what_is_below() {
-        // Over a patterned ground rather than a flat one: a corner that copied the background
-        // colour instead of leaving the pixel alone would pass against a flat ground.
         let g = screen_geom();
         let under = patterned_ground();
         let (sg, spx) = patterned(30, 20, 30 * 4 + 8, 0x90);
@@ -1497,16 +1154,13 @@ mod tests {
         let mut got = under.clone();
         blit_clipped(&mut got, &surface, &g.bounds());
         assert_eq!(got, rounded_expectation(&under, &surface));
-        // And the corners really were left: the very corner pixel is the ground's.
         assert_eq!(got.get_pixel(9, 7), under.get_pixel(9, 7));
         assert_ne!(got.get_pixel(9, 15), under.get_pixel(9, 15), "the straight edge was drawn");
     }
 
     #[test]
     fn every_blit_path_rounds_the_same_curve() {
-        // The mask sits in front of three paths — the row copy, the per-pixel translation for a
-        // surface in another channel order, and the blend for one with alpha. Each must cut the
-        // same corner; the expectation is computed per pixel from the curve, not from any path.
+        // The mask sits in front of three paths; each must cut the same corner.
         let g = screen_geom();
         let under = patterned_ground();
         let (sg, spx) = patterned(24, 18, 24 * 4, 0x90);
@@ -1529,14 +1183,12 @@ mod tests {
                 (Point::new(20, 15), g.bounds()),
                 (Point::new(-5, -3), g.bounds()),
                 (Point::new(50, 38), g.bounds()),
-                // A damage rectangle that cuts a corner in half.
                 (Point::new(20, 15), Rect::new(24, 18, 5, 40)),
             ] {
                 let surface = SurfaceRef::new(geometry, origin, pixels).with_corner(6);
                 let mut got = under.clone();
                 blit_clipped(&mut got, &surface, &damage);
                 let mut want = rounded_expectation(&under, &surface);
-                // Outside the damage the expectation must be the ground again.
                 for y in 0..48 {
                     for x in 0..64 {
                         if !damage.contains(x, y) {
@@ -1552,10 +1204,7 @@ mod tests {
 
     #[test]
     fn compose_exposed_draws_the_same_picture_as_compose_with_rounded_corners() {
-        // **The test the mask most needs.** A rounded window still covers most of its rectangle,
-        // so `compose_exposed` still skips most of the fill under it — but not the corners, where
-        // the blit writes nothing or blends. Cut the whole rectangle and the corners keep
-        // whatever the framebuffer last held, which the stale colour here makes visible.
+        // Cutting the whole rectangle would leave the corners stale, which the stale colour shows.
         let g = screen_geom();
         let bg = Rgb::new(0x2A, 0x55, 0x70);
         let stale = Rgb::new(240, 0, 240);
@@ -1564,7 +1213,6 @@ mod tests {
         for (a_at, b_at, damage) in [
             (Point::new(4, 4), Point::new(40, 40), alloc::vec![Rect::new(4, 4, 20, 16)]),
             (Point::new(9, 4), Point::new(40, 40), alloc::vec![Rect::new(8, 4, 20, 16), Rect::new(9, 4, 20, 16),]),
-            // Overlapping, so one window's corner shows the other rather than the background.
             (Point::new(4, 4), Point::new(14, 10), alloc::vec![Rect::new(0, 0, 40, 40)]),
             (Point::new(-6, -4), Point::new(56, 40), alloc::vec![Rect::new(0, 0, 64, 48)]),
         ] {
@@ -1587,10 +1235,6 @@ mod tests {
 
     #[test]
     fn a_rounded_window_over_another_shows_that_window_in_its_corner() {
-        // The claim the plan rests on: "a skipped pixel keeps whatever lower surface already
-        // painted there — the desktop where nothing is behind, the window below where something
-        // is". Checked as pixels rather than as an equivalence, so it cannot pass by both sides
-        // being wrong the same way.
         let g = screen_geom();
         let bg = Rgb::new(0x2A, 0x55, 0x70);
         let below = Rgb::new(30, 200, 30);
@@ -1610,8 +1254,6 @@ mod tests {
 
     #[test]
     fn a_rounded_surface_repainted_in_pieces_is_the_same_picture() {
-        // The curve belongs to the surface: damage that cuts across a corner must not round the
-        // cut. Many small rectangles against one big one.
         let g = screen_geom();
         let bg = Rgb::new(0x2A, 0x55, 0x70);
         let (sg, spx) = patterned(30, 22, 30 * 4, 0x60);
@@ -1631,9 +1273,6 @@ mod tests {
 
     #[test]
     fn a_rounded_surface_casts_a_rounded_shadow_into_its_own_corners() {
-        // Outside the curve the blit writes nothing, so the shadow is all that pixel gets — and a
-        // shadow that skipped the whole of `bounds`, as the square one did, would leave a notch
-        // of bare ground at every corner of every window.
         let g = screen_geom();
         let bg = Rgb::new(120, 120, 120);
         let (sg, spx, o) = surface(20, 16, 20, 14, Rgb::new(200, 30, 30));
@@ -1649,12 +1288,8 @@ mod tests {
         let corner = fb.get_pixel(20, 16).unwrap();
         assert!(corner.r < bg.r, "the very corner is shadowed, not bare ground: {corner:?}");
 
-        // And the shadow's own corner follows the window's. **Compared against the square
-        // shadow, not against the rounded one's own edge**: the first version of this test said
-        // "a pixel off the corner is lighter than one off an edge", which a square shadow also
-        // satisfies — distance to a rectangle is already Euclidean round its corners — and a
-        // control that squared the distance left it passing. Beside a straight edge the two
-        // shapes are the same distance away; off the corner the rounded one is further.
+        // Compared against the square shadow: beside a straight edge they are equally far, off the
+        // corner the rounded one is further.
         let draw = |corner: u32| {
             let mut fb = crate::framebuffer::MemFramebuffer::filled(g, bg);
             draw_shadow(&mut fb, Rect::new(20, 16, 20, 14), corner, &sh, &g.bounds());
@@ -1668,12 +1303,8 @@ mod tests {
 
     #[test]
     fn a_square_surface_draws_what_it_drew_before_corners_existed() {
-        // `corner: 0` is every existing caller, and every gate's expected picture. So the picture
-        // is checked against **the definitions that predate corners**, assembled by hand: the
-        // ground, then each layer of the shadow through the old per-pixel loop, then the surface
-        // through the unmasked blit. This compared `compose` against itself until the PR #312
-        // review — a surface `with_corner(0)` is the same struct as one without, so the two calls
-        // could not differ, and a shadow off by one at `c == 0` passed it.
+        // `corner: 0` is every gate's expected picture, so check it against the definitions that
+        // predate corners; comparing `compose` to itself cannot differ.
         let g = screen_geom();
         let bg = Rgb::new(0x2A, 0x55, 0x70);
         let (sg, spx) = patterned(20, 16, 20 * 4, 0x60);
@@ -1690,13 +1321,11 @@ mod tests {
         assert_eq!(covered_by(&surface), [Some(surface.bounds()), None, None]);
     }
 
-    /// And it is less work — which is the whole point, and would otherwise be a refactor.
     #[test]
     fn compose_exposed_fills_far_less_background_for_the_same_picture() {
         let g = screen_geom();
         let bg = Rgb::new(0x2A, 0x55, 0x70);
         let (sg, spx, _) = surface(0, 0, 20, 16, Rgb::new(200, 30, 30));
-        // A one-pixel drag, which is the workload the flicker was reported from.
         let damage = [Rect::new(8, 4, 20, 16), Rect::new(9, 4, 20, 16)];
         let surfaces = [SurfaceRef::new(sg, Point::new(9, 4), &spx)];
 
@@ -1707,20 +1336,13 @@ mod tests {
 
         assert_eq!(plain.inner.bytes(), exposed.inner.bytes(), "same picture");
         let (p, e) = (plain.writes.get(), exposed.writes.get());
-        // Plain fills both rectangles whole: 2 x 20 x 16 = 640. Exposed fills only the sliver of
-        // the old rectangle the window has moved off — one column, 16 tall. A bound of a twentieth
-        // is loose enough to survive a clipping change and tight enough that filling any whole
-        // rectangle fails it, which a `e < p` would not.
+        // Plain fills both rectangles whole (2 x 20 x 16 = 640), exposed one column. A twentieth
+        // fails if any whole rectangle is filled, which `e < p` would not.
         assert_eq!(p, 640, "plain should fill both damage rectangles whole");
         assert!(e * 20 < p, "expected a sliver, got {e} filled against {p}");
     }
 
-    /// **A surface whose buffer is short does not count as covering.**
-    ///
-    /// `blit_clipped` skips the pixels it cannot read, and today the fill underneath is what the
-    /// viewer sees. Treating such a surface as opaque would replace that background with whatever
-    /// the framebuffer happened to hold — the one case where skipping the fill changes the
-    /// picture, and the reason `covers` exists.
+    /// A short surface must not count as covering: its unread pixels would be stale.
     #[test]
     fn a_short_surface_still_gets_its_background() {
         let g = screen_geom();
@@ -1732,8 +1354,6 @@ mod tests {
 
         let mut a = crate::framebuffer::MemFramebuffer::new(g);
         let mut b = crate::framebuffer::MemFramebuffer::new(g);
-        // Both start from something that is neither the background nor the surface, so a pixel
-        // left untouched is visible as itself rather than as a coincidence.
         a.fill_rect(g.bounds(), Rgb::new(1, 2, 3));
         b.fill_rect(g.bounds(), Rgb::new(1, 2, 3));
         compose(&mut a, bg, &surfaces, &damage);
@@ -1745,11 +1365,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    /// A surface whose pixel content varies in **both** axes.
-    ///
-    /// This matters more than it looks: a solid fill, or a pattern that varies in
-    /// only one axis, hashes identically when rows or columns are transposed — so it
-    /// cannot catch a stride bug, which is the most likely blit defect.
+    /// Varies in both axes: a solid or one-axis pattern hashes identically when transposed.
     fn patterned(w: u32, h: u32, pitch: usize, seed: u8) -> (Geometry, Vec<u8>) {
         let g = Geometry::with_pitch(w, h, pitch, PixelFormat::XRGB8888).unwrap();
         let mut px = vec![0u8; g.byte_len()];
@@ -1784,7 +1400,6 @@ mod tests {
                 assert_eq!(fb.get_pixel(x + 2, y + 1), Some(g.format.decode(word)), "surface pixel ({x},{y})");
             }
         }
-        // Outside the surface stays background.
         assert_eq!(fb.get_pixel(1, 1), Some(Rgb::BLACK));
         assert_eq!(fb.get_pixel(6, 1), Some(Rgb::BLACK));
     }
@@ -1799,11 +1414,9 @@ mod tests {
             Rgb::BLACK,
             &[SurfaceRef::new(ga, Point::new(0, 0), &pa), SurfaceRef::new(gb, Point::new(3, 3), &pb)],
         );
-        // In the overlap, the top surface wins.
         let off = gb.offset_of(0, 0).unwrap();
         let word = u32::from_le_bytes([pb[off], pb[off + 1], pb[off + 2], pb[off + 3]]);
         assert_eq!(fb.get_pixel(3, 3), Some(gb.format.decode(word)));
-        // Outside the overlap, the bottom one is intact.
         let off = ga.offset_of(0, 0).unwrap();
         let word = u32::from_le_bytes([pa[off], pa[off + 1], pa[off + 2], pa[off + 3]]);
         assert_eq!(fb.get_pixel(0, 0), Some(ga.format.decode(word)));
@@ -1811,8 +1424,6 @@ mod tests {
 
     #[test]
     fn stacking_order_is_not_symmetric() {
-        // A guard against the previous test passing because both surfaces happen to
-        // agree: swapping the order must change the result.
         let (ga, pa) = patterned(6, 6, 24, 0x10);
         let (gb, pb) = patterned(6, 6, 24, 0x90);
         let a = SurfaceRef::new(ga, Point::new(0, 0), &pa);
@@ -1831,11 +1442,9 @@ mod tests {
         let mut fb = screen();
         compose_full(&mut fb, Rgb::BLACK, &[SurfaceRef::new(g, Point::new(-3, -2), &px)]);
 
-        // Screen (0,0) shows the surface's (3,2), not its (0,0).
         let off = g.offset_of(3, 2).unwrap();
         let word = u32::from_le_bytes([px[off], px[off + 1], px[off + 2], px[off + 3]]);
         assert_eq!(fb.get_pixel(0, 0), Some(g.format.decode(word)));
-        // The clipped-away columns must not have wrapped to the far edge.
         assert_eq!(fb.get_pixel(31, 0), Some(Rgb::BLACK));
     }
 
@@ -1845,8 +1454,6 @@ mod tests {
         let mut fb = screen();
         compose_full(&mut fb, Rgb::BLACK, &[SurfaceRef::new(g, Point::new(28, 12), &px)]);
         assert!(fb.get_pixel(31, 15).is_some());
-        // Nothing was written past the visible area — the buffer is exactly as long
-        // as its geometry says, so an overrun would have panicked.
         assert_eq!(fb.bytes().len(), fb.geometry().byte_len());
     }
 
@@ -1861,7 +1468,6 @@ mod tests {
         let mut partial = screen();
         compose(&mut partial, Rgb::BLACK, &surfaces, &[Rect::new(0, 0, 4, 8)]);
 
-        // Inside the damage the two agree; outside it, only the full composite drew.
         assert_eq!(partial.get_pixel(2, 2), full.get_pixel(2, 2));
         assert_ne!(partial.get_pixel(6, 2), full.get_pixel(6, 2));
         assert_eq!(partial.get_pixel(6, 2), Some(Rgb::BLACK));
@@ -1869,7 +1475,6 @@ mod tests {
 
     #[test]
     fn compositing_the_same_inputs_twice_produces_identical_bytes() {
-        // §7 in one assertion: the gate cannot exist without this.
         let (ga, pa) = patterned(9, 7, 40, 0x21);
         let (gb, pb) = patterned(5, 11, 20, 0x8C);
         let surfaces = [SurfaceRef::new(ga, Point::new(-2, 3), &pa), SurfaceRef::new(gb, Point::new(27, 9), &pb)];
@@ -1882,7 +1487,6 @@ mod tests {
 
     #[test]
     fn a_surface_in_a_different_channel_order_is_translated_not_copied() {
-        // The compositor must not memcpy words between mismatched formats.
         let g_bgr = Geometry::packed(2, 1, PixelFormat::XBGR8888);
         let colour = Rgb::new(0x10, 0x20, 0x30);
         let mut px = vec![0u8; g_bgr.byte_len()];

@@ -1,21 +1,9 @@
 //! Cells to pixels.
 //!
-//! The one place `libterm` reaches for `libdraw`, and the reason the crate depends on it at
-//! all. Everything else here is a function of values with no notion of a pixel.
-//!
-//! ## Cell metrics are derived, not chosen
-//!
-//! A cell is as wide as the font's advance and as tall as its line height, so a grid's pixel
-//! size falls out of the font rather than being asserted next to it. Choosing a cell size and
-//! hoping the font fits is how a terminal ends up with glyphs clipped on the right or rows
-//! that overlap by a pixel — and the two numbers would then have to be kept in step by hand.
-//!
-//! ## Damage is per cell row
-//!
-//! [`render_rows`] draws the rows it is given, and [`Grid::take_damage`] is what produces that
-//! list. A keystroke dirties one row; the union of dirty rows is the rectangle that reaches
-//! `Commit`. Repainting a window per keystroke is exactly what the toolkit's diff exists to
-//! avoid one layer up, and a terminal that did it there would undo that work.
+//! The one place `libterm` reaches for `libdraw`. A cell is as wide as the font's advance and
+//! as tall as its row, so a grid's pixel size falls out of the font. Damage is per cell row:
+//! [`render_rows`] draws the rows [`Grid::take_damage`] produced, so a keystroke repaints one
+//! row, not the window.
 
 use libdraw::framebuffer::Framebuffer;
 use libdraw::geom::{Point, Rect, Size};
@@ -39,38 +27,26 @@ pub struct Metrics {
 
 /// How tall a row is, as a multiple of the text's size: the design's 19.5 on 12.
 ///
-/// **Set here rather than taken from the face**, because a face's own line height is about what
-/// keeps its glyphs from colliding and says nothing about how a page should read. Every other
-/// surface on this desktop is set with room around its text; a terminal that used the face's
-/// figure alone was the one window that looked cramped (desktop refresh, Part K).
+/// Set here rather than taken from the face, whose own line height only keeps glyphs from
+/// colliding and reads cramped beside the desktop's other windows.
 pub const LINE_HEIGHT: f32 = 1.6;
 
 impl Metrics {
     /// Measure `font` at `px`.
     ///
-    /// Width comes from `M`'s advance rather than from an average: in a monospace font every
-    /// advance is the same, and taking one glyph's says so. If a proportional font is ever
-    /// passed here the grid will be wrong, which is correct — a proportional font has no cell
-    /// width, and silently averaging one would hide that.
-    ///
-    /// Every value is at least 1: a zero-width cell makes a grid of zero-width columns, and
-    /// every rectangle below would be empty.
+    /// Width is `M`'s advance: in a monospace font every advance is the same, and a proportional
+    /// font has no cell width, which should show rather than be averaged away. Every value is at
+    /// least 1, or every rectangle below would be empty.
     pub fn new(font: &Font, px: f32) -> Metrics {
         let v = font.v_metrics(px);
-        // **A row is the design's leading, not the face's own line height** (desktop refresh,
-        // Part K). The page sets 12-pixel text on 19.5-pixel rows — 1.6 times the size — where
-        // DejaVu Sans Mono's own line height is about 1.17, so a terminal read cramped beside
-        // every other window on the desktop. The leading is applied to the *size*, as a
-        // typographer sets it, and then held to at least the face's own line height so that no
-        // face can be given rows its glyphs do not fit in.
+        // The leading applies to the size, held to at least the face's own line height so no
+        // face gets rows its glyphs do not fit in.
         let leading = libm::ceilf(px * LINE_HEIGHT) as u32;
         let natural = libm::ceilf(v.line_height) as u32;
         Metrics {
             cell_w: font.advance('M', px).max(1),
             cell_h: leading.max(natural).max(1),
-            // **The baseline moves down with the extra room**, so the leading is split above and
-            // below the glyphs rather than all piling under them: a line sitting hard against
-            // the top of a tall cell reads as a line with a gap after it, not as a line.
+            // The baseline moves down so the leading is split above and below the glyphs.
             ascent: libm::ceilf(v.ascent).max(0.0) as u32 + leading.saturating_sub(natural) / 2,
             px,
         }
@@ -108,11 +84,8 @@ fn draw_cell<F: Framebuffer + ?Sized>(
     let r = m.cell_rect(row, col);
     let rect = Rect::new(origin.x + r.origin.x, origin.y + r.origin.y, r.size.w, r.size.h);
     let (fg, bg) = cell.attrs.resolve(palette);
-    // **The cursor is the cell drawn inverted**, not a shape drawn over it. That is what makes
-    // the character under it stay readable, and it needs no colour of its own — a cursor with
-    // its own colour is a third thing to keep in step with a theme. Since M12 Part E a
-    // *selected* cell arrives here the same way, which is why the parameter is `invert` rather
-    // than `cursor`: this function draws an inverted cell and does not need to know why.
+    // The cursor is the cell drawn inverted: the character stays readable and the cursor needs
+    // no colour of its own. A selected cell arrives the same way, hence `invert`.
     let (fg, bg) = if invert { (bg, fg) } else { (fg, bg) };
 
     fb.fill_rect(rect, bg);
@@ -128,8 +101,6 @@ fn draw_cell<F: Framebuffer + ?Sized>(
         );
     }
     if cell.attrs.flags.contains(Flags::UNDERLINE) {
-        // One pixel below the baseline, clamped inside the cell so a font whose descent is
-        // shallow cannot draw into the row beneath.
         let y = (rect.origin.y + m.ascent as i32 + 1).min(rect.bottom() as i32 - 1);
         fb.fill_rect(Rect::new(rect.origin.x, y, rect.size.w, 1), fg);
     }
@@ -137,12 +108,7 @@ fn draw_cell<F: Framebuffer + ?Sized>(
 
 /// Draw `rows` of `grid` into `fb`, with the grid's top-left at `origin`.
 ///
-/// Rows outside the grid are skipped rather than refused: [`Grid::take_damage`] cannot produce
-/// one, but a caller that unions damage across a resize could. **The skip comes from
-/// [`Grid::cell`] being total** — it returns `None` outside the screen and the loop below
-/// continues on that — rather than from a bounds check of its own. There was one, and a
-/// break-test showed it changed nothing: two guards for one condition, only one of them
-/// reachable.
+/// Rows outside the grid are skipped: [`Grid::cell`] is total, so the loop just continues.
 pub fn render_rows<F: Framebuffer + ?Sized>(
     fb: &mut F,
     grid: &Grid,
@@ -157,10 +123,8 @@ pub fn render_rows<F: Framebuffer + ?Sized>(
 
 /// Draw `rows` of a view whose first line is absolute line `top`.
 ///
-/// The scrolled-back render. `rows` are **viewport** rows, not screen rows, and everything the
-/// difference implies is [`Grid::view_cell`]'s and [`Grid::view_cursor`]'s: which half of the
-/// history a row comes from, and whether the cursor is in view at all. That keeps this loop the
-/// same loop it was for the live screen, which is what stops the two renders drifting apart.
+/// `rows` are viewport rows; which half of the history a row comes from, and whether the cursor
+/// is in view, are [`Grid::view_cell`]'s and [`Grid::view_cursor`]'s.
 #[allow(clippy::too_many_arguments, reason = "a view's drawing context and extent are separate inputs")]
 pub fn render_view<F: Framebuffer + ?Sized>(
     fb: &mut F,
@@ -176,7 +140,6 @@ pub fn render_view<F: Framebuffer + ?Sized>(
 }
 
 #[allow(clippy::too_many_arguments, reason = "a view's drawing context and extent are separate inputs")]
-/// The shared body of [`render`], [`render_rows`] and [`render_view`].
 fn render_each<F: Framebuffer + ?Sized>(
     fb: &mut F,
     grid: &Grid,
@@ -193,15 +156,8 @@ fn render_each<F: Framebuffer + ?Sized>(
         for col in 0..grid.cols() {
             let Some(cell) = grid.view_cell(top, row, col) else { continue };
             let cursor = cursor_at == Some((row, col));
-            // **A selected cell is drawn inverted, exactly as the cursor is** (M12 Part E).
-            // That reuses the mechanism rather than adding a colour, for the reason
-            // [`draw_cell`] gives for the cursor: a highlight with its own colour is a third
-            // thing to keep in step with a theme, and `libterm` deliberately carries its own
-            // two defaults rather than the desktop's (M11's settled decision 2).
-            //
-            // **The cursor wins where they overlap** — inverting twice is not inverting, so a
-            // cursor inside a selection would appear as a hole in it. The cursor is the more
-            // urgent of the two: it says where typing goes.
+            // A selected cell is inverted as the cursor is, with no colour of its own. The
+            // cursor wins where they overlap: inverting twice would leave a hole in the selection.
             let selected =
                 !cursor && selection.is_some_and(|s| top.checked_add(row as u64).is_some_and(|l| s.contains(l, col)));
             draw_cell(fb, font, m, palette, origin, row, col, cell, cursor || selected);
@@ -218,28 +174,15 @@ pub fn render<F: Framebuffer + ?Sized>(
     palette: &Palette,
     origin: Point,
 ) {
-    // Iterating rather than collecting a `Vec` of every index: a full repaint is not hot, and
-    // an allocation whose only purpose is to be immediately iterated is one a reader has to
-    // stop and think about.
     render_each(fb, grid, font, m, palette, origin, grid.top_line(), 0..grid.rows());
 }
 
 /// The fixed grid the display gate compares, and the render of it.
 ///
-/// The same idea as [`libdraw::scene`] and `libui::reference`, for the third layer: both sides
-/// render *this* and compare pixel for pixel, so a target build that rasterises or lays out
-/// differently from the host shows up as a named pixel rather than as a picture someone has to
-/// judge.
-///
-/// **On screen since M5 Part B**: `ui-testclient` presents it in a window of its own, between
-/// the toolkit's and the scene's, and `cargo xtask check-display` compares that region against
-/// this module rendered on the host. Until then it was a fixture with tests on it rather than a
-/// gate (PR #190 review, finding 3).
-///
-/// **This rather than `nxterm`'s own window**, which is also on screen and is deterministic on
-/// its first frame. A live terminal showing a boot banner exercises one plain line of text; this
-/// stream is built so that each of its lines fails differently, and a gate should compare the
-/// picture that discriminates rather than the one that happens to be there.
+/// Both the host and the target render *this* and compare pixel for pixel, so a difference in
+/// rasterising or layout shows up as a named pixel. `ui-testclient` presents it and
+/// `cargo xtask check-display` compares that region. Its stream is built so each line fails
+/// differently, which a live terminal's boot banner would not.
 pub mod reference {
     use super::*;
     use crate::parse::{MAX_PER_BYTE, Op, Parser};
@@ -273,11 +216,8 @@ pub mod reference {
         "\x1b[6;4Hxy",
     );
 
-    /// The reference grid, built by feeding [`SOURCE`] through the real parser.
-    ///
-    /// Through the parser rather than by calling `Grid` directly: this is the only place all
-    /// three of A3, A4 and A5 are exercised together, and a mismatch in what an `Op` *means*
-    /// would otherwise survive both halves being individually right.
+    /// Fed through the real parser, so a mismatch in what an `Op` means cannot hide behind two
+    /// halves each being right.
     pub fn grid() -> Grid {
         let mut g = Grid::new(COLS, ROWS);
         let mut p = Parser::new();
@@ -291,19 +231,16 @@ pub mod reference {
 
     /// The size the reference renders at with `font`.
     ///
-    /// A function rather than a constant, unlike `libui::reference::WIDTH`: a terminal's size
-    /// *is* its cell metrics, so the number cannot exist before the font does. Both ends of the
-    /// gate have the font — the client reads it off the disk, the host reads it out of
-    /// `assets/` — so this is what they agree through.
+    /// A function rather than a constant: a terminal's size is its cell metrics, which cannot
+    /// exist before the font does.
     pub fn size(font: &Font) -> libdraw::geom::Size {
         Metrics::new(font, FONT_PX).pixel_size(COLS, ROWS)
     }
 
     /// The stride [`render_with`] uses, for `font`.
     ///
-    /// **Padded**, for the reason `libdraw::scene::SCREEN_PITCH` is: code that computes a row
-    /// offset from the width rather than the pitch skews every row after the first, and equal
-    /// numbers hide it.
+    /// Padded, so code that computes a row offset from the width rather than the pitch skews
+    /// every row after the first.
     pub fn pitch(font: &Font) -> usize {
         size(font).w as usize * 4 + 12
     }
@@ -321,8 +258,6 @@ pub mod reference {
             .expect("a padded pitch always holds a row");
         let mut fb = MemFramebuffer::new(geometry);
         let palette = Palette::default();
-        // Cleared first: `render` draws each cell's background, but a caller comparing the
-        // whole buffer needs the padding-adjacent bytes deterministic too.
         fb.clear(palette.background);
         render(&mut fb, &g, font, &m, &palette, Point::new(0, 0));
         fb
@@ -339,8 +274,6 @@ mod tests {
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
 
-    /// The *other* face the image ships — the desktop's, since M11 Part D. Here only as a
-    /// counterexample; nothing in this crate should ever draw with it.
     const DEJAVU_SANS: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
 
     fn font() -> Font {
@@ -352,11 +285,8 @@ mod tests {
         MemFramebuffer::new(Geometry::packed(s.w, s.h, PixelFormat::XRGB8888))
     }
 
-    /// Whether a cell is drawn *inverted* — the cursor's rendering.
-    ///
-    /// **Not "contains the foreground colour"**, which is what the first version of the phantom
-    /// test asked and which is true of any cell holding a glyph: ink is the foreground. An
-    /// inverted cell is foreground almost everywhere, so counting is what tells the two apart.
+    /// Whether a cell is drawn inverted. Counting foreground pixels is what tells an inverted
+    /// cell from one holding a glyph, since ink is foreground too.
     fn is_inverted(fb: &MemFramebuffer, r: Rect, p: &Palette) -> bool {
         let mut fg = 0usize;
         for y in r.origin.y..r.bottom() as i32 {
@@ -369,7 +299,6 @@ mod tests {
         fg * 2 > (r.size.w * r.size.h) as usize
     }
 
-    /// Every distinct colour in a rectangle.
     fn colours(fb: &MemFramebuffer, r: Rect) -> alloc::vec::Vec<Rgb> {
         let mut v = alloc::vec::Vec::new();
         for y in r.origin.y..r.bottom() as i32 {
@@ -386,24 +315,17 @@ mod tests {
 
     #[test]
     fn cell_metrics_come_from_the_font() {
-        // Derived, not chosen. A hardcoded 8x16 would be wrong for this font at this size, and
-        // wrong in a way that clips glyphs rather than one that fails a build.
         let f = font();
         let m = Metrics::new(&f, 16.0);
         assert_eq!(m.cell_w, f.advance('M', 16.0));
-        // **A row is the design's leading, and the glyphs sit in the middle of it** (desktop
-        // refresh, Part K). Nothing pinned `cell_h` before this, so multiplying it by 1.6 broke
-        // no test at all.
+        // A row is the design's leading, with the glyphs in the middle of it.
         assert_eq!(m.cell_h, libm::ceilf(m.px * LINE_HEIGHT) as u32, "a row is {LINE_HEIGHT} times the text's size");
         let natural = libm::ceilf(font().v_metrics(m.px).line_height) as u32;
         assert!(m.cell_h > natural, "the leading adds room: {} against the face's own {natural}", m.cell_h);
-        // The extra room is split, so the text is not hard against the top of its cell.
         let bare = libm::ceilf(font().v_metrics(m.px).ascent) as u32;
         assert!(m.ascent > bare, "the baseline moved down with the leading: {} against {bare}", m.ascent);
         assert!(m.cell_h >= m.ascent, "the baseline is below the cell: {m:?}");
         assert!(m.cell_w > 0 && m.cell_h > 0);
-        // A monospace font gives every glyph the same advance, which is the assumption the
-        // grid rests on. Checked rather than believed.
         for c in ['i', 'M', 'W', '.', '0'] {
             assert_eq!(f.advance(c, 16.0), m.cell_w, "{c:?} has a different advance");
         }
@@ -411,16 +333,8 @@ mod tests {
 
     #[test]
     fn the_desktops_own_font_would_fail_the_test_above() {
-        // **The negative control for the assertion above, and it is the reason two fonts ship.**
-        // "Every glyph has the same advance" is a claim about the *file*, and until M11 Part D
-        // there was only one file in the system, so nothing could tell a test that checks the
-        // property from one that restates which font was loaded. Since Part D `nxterm` loads two
-        // — the proportional face for its menus, this one for its grid — and picking the wrong
-        // one is a live mistake rather than an impossible one.
-        //
-        // What it would look like is not a crash: `Metrics::new` takes `M`'s advance and every
-        // other glyph then draws at the wrong x, so the columns drift across the row and the
-        // damage rectangles stop matching the cells. Cheap to catch here, expensive to see.
+        // The negative control for the test above: with a proportional face the columns would
+        // drift across the row and the damage rectangles stop matching the cells.
         let sans = Font::from_bytes(DEJAVU_SANS.to_vec()).expect("the vendored font parses");
         let m = Metrics::new(&sans, 16.0);
         assert!(
@@ -442,10 +356,8 @@ mod tests {
         let f = font();
         let m = Metrics::new(&f, 16.0);
         let p = Palette::default();
-        // Three columns, and the cursor parked on the middle one: the cell *after* a print is
-        // where the cursor lands, and it is drawn inverted — so checking "the neighbour kept
-        // the default" one cell along measures the cursor, not the neighbour. The first
-        // version of this test did exactly that and failed for the right reason.
+        // The cursor is parked on the middle column: the cell after a print is drawn inverted, so
+        // checking a neighbour one along would measure the cursor.
         let mut g = Grid::new(3, 1);
         let mut fb = fb_for(&m, 3, 1);
         g.apply_all(&[Op::Attr(Sgr::Background(Colour::Ansi(Ansi::Blue))), Op::Print(' ')]);
@@ -456,7 +368,6 @@ mod tests {
             "the cell's background did not reach the pixels"
         );
         assert_eq!(g.cursor(), (0, 1), "the cursor is not where this test assumes");
-        // Column 2: past the cursor, so its default background is its own.
         assert_eq!(fb.get_pixel(m.cell_w * 2 + 1, 1), Some(p.background));
     }
 
@@ -479,17 +390,12 @@ mod tests {
 
     #[test]
     fn a_selected_cell_is_drawn_inverted_and_its_neighbour_is_not() {
-        // **The highlight had no test at all** (PR #271 review, worth fixing 3): `cursor ||
-        // selected` could be reduced to `cursor` and all 164 host tests stayed green, and no
-        // guest gate drags a pointer over a grid — `check-display` never types, `check-terminal`
-        // types but never drags, and step 9d asserts the paste through the filesystem. A person
-        // would have swept across the terminal and seen nothing.
+        // `cursor || selected` could be reduced to `cursor` with no other test noticing.
         let f = font();
         let m = Metrics::new(&f, 16.0);
         let p = Palette::default();
         let mut g = Grid::new(4, 1);
         g.apply_all(&[Op::Print('a'), Op::Print('b'), Op::Print('c')]);
-        // Columns 0 and 1, half-open at the head — so `c` in column 2 is outside it.
         g.select_from(0, 0);
         g.extend(0, 2);
         let mut fb = fb_for(&m, 4, 1);
@@ -502,11 +408,7 @@ mod tests {
 
     #[test]
     fn the_cursor_still_reads_as_the_cursor_inside_a_selection() {
-        // **Inverting twice is not inverting.** A cursor inside a selection drawn by both rules
-        // would come out as a *hole* in the highlight — the one cell that looks unselected being
-        // the one the person is about to type at. The cursor wins, so it stays inverted and the
-        // cell is indistinguishable from its selected neighbours, which is the intended answer:
-        // the row reads as one highlighted run.
+        // Inverting twice is not inverting: the cursor must not leave a hole in the selection.
         let f = font();
         let m = Metrics::new(&f, 16.0);
         let p = Palette::default();
@@ -528,8 +430,7 @@ mod tests {
 
     #[test]
     fn only_the_rows_asked_for_are_drawn() {
-        // The whole point of per-row damage. A render that ignored its row list would repaint
-        // the window on every keystroke, undoing the toolkit's diff one layer up.
+        // A render that ignored its row list would repaint the window on every keystroke.
         let f = font();
         let m = Metrics::new(&f, 16.0);
         let p = Palette::default();
@@ -548,11 +449,8 @@ mod tests {
 
     #[test]
     fn the_damage_pairing_leaves_no_phantom_cursor() {
-        // **The bug that lived between A4 and A5**, and the level it had to be tested at.
-        // Each half was defensible on its own: the grid reported no damage for a cursor that
-        // moved, and the render painted the cursor into its cell. Driving the documented
-        // `take_damage` -> `render_rows` pairing is what shows the pair is wrong — a phantom
-        // inverted block left at the end of every line a paragraph wraps on.
+        // Driving the documented `take_damage` -> `render_rows` pairing: a cursor that moved
+        // once left a phantom inverted block at the end of every wrapped line.
         let f = font();
         let m = Metrics::new(&f, 16.0);
         let p = Palette::default();
@@ -564,7 +462,6 @@ mod tests {
         render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &d);
         assert!(is_inverted(&fb, m.cell_rect(0, 3), &p), "the cursor is not drawn where it rests");
 
-        // One more character wraps it to row 1.
         g.apply(Op::Print('e'));
         let d = g.take_damage();
         render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &d);
@@ -574,8 +471,7 @@ mod tests {
 
     #[test]
     fn a_cursor_key_moves_the_block_on_screen() {
-        // Scenario A: no printing at all, just movement. The row the cursor left has to
-        // repaint or the block does not move.
+        // Movement only: the row the cursor left must repaint.
         let f = font();
         let m = Metrics::new(&f, 16.0);
         let p = Palette::default();
@@ -605,8 +501,6 @@ mod tests {
 
     #[test]
     fn the_origin_offsets_everything() {
-        // The grid is drawn inside a window with chrome around it, so it never starts at the
-        // buffer's corner in practice.
         let f = font();
         let m = Metrics::new(&f, 16.0);
         let p = Palette::default();
@@ -631,11 +525,8 @@ mod tests {
         let f = font();
         let m = Metrics::new(&f, 16.0);
         let p = Palette::default();
-        // **The cursor is parked two rows away**, which the first version of this test did not
-        // do — and on a one-column grid the cursor stays on the cell it just wrote, so the
-        // underlined cell was drawn *inverted* and filled with the foreground. The test then
-        // passed on the inversion rather than on the underline, and stayed green when the rule
-        // was moved into the next row. Found by a break-test.
+        // The cursor is parked two rows away: on the underlined cell it would draw inverted and
+        // the test would pass on the inversion.
         let mut g = Grid::new(1, 3);
         g.apply_all(&[
             Op::Attr(Sgr::Underline),
@@ -652,20 +543,14 @@ mod tests {
         let row0 = colours(&fb, m.cell_rect(0, 0));
         assert!(row0.contains(&p.foreground), "no underline was drawn: {row0:?}");
         assert!(row0.contains(&p.background), "the cell was filled, not underlined: {row0:?}");
-        // It must not bleed into the row beneath, which would look like the next line's text
-        // having a stray rule over it.
         let row1 = colours(&fb, m.cell_rect(1, 0));
         assert!(!row1.contains(&p.foreground), "the underline reached the next row");
     }
 
     #[test]
     fn the_underline_clamp_keeps_a_tight_cell_in_bounds() {
-        // The clamp on the underline's `y` never engages for DejaVu at 16px — `ascent + 1` is
-        // comfortably inside the cell — so removing it fails nothing. That makes it *unproven*
-        // rather than redundant, which is the opposite of the bounds check removed from
-        // `render_rows`: a font whose line height equals its ascent reaches it.
-        //
-        // Constructed rather than found, because no font in the tree has those metrics.
+        // The clamp never engages for DejaVu at 16px, so it is constructed: a cell as tall as
+        // its ascent.
         let f = font();
         let mut m = Metrics::new(&f, 16.0);
         m.cell_h = m.ascent; // baseline flush with the bottom of the cell
@@ -674,16 +559,13 @@ mod tests {
         g.apply_all(&[Op::Attr(Sgr::Underline), Op::Print(' '), Op::CarriageReturn, Op::LineFeed]);
         let mut fb = fb_for(&m, 1, 2);
         render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &[0]);
-        // Row 1 was not drawn at all, so any ink there came from row 0's underline.
         let row1 = colours(&fb, m.cell_rect(1, 0));
         assert!(!row1.contains(&p.foreground), "the underline escaped its cell: {row1:?}");
     }
 
     #[test]
     fn the_reference_grid_exercises_what_it_claims() {
-        // The gate compares pixels; this asserts the *picture* is worth comparing. A reference
-        // that lost its attributes to a typo in `SOURCE` would still compare equal on both
-        // sides and prove nothing — the same vacuity `libdraw::scene` guards against.
+        // The gate compares pixels; this asserts the picture is worth comparing.
         let g = reference::grid();
         let mut bold = 0;
         let mut underline = 0;
@@ -710,9 +592,7 @@ mod tests {
         assert!(underline >= 3, "only {underline} underlined cells");
         assert!(reverse >= 3, "only {reverse} reversed cells");
         assert!(coloured_blank >= 10, "the erase-with-background line is not there");
-        // The wrap: line 4 is longer than the grid is wide, so it must have continued.
         assert_ne!(g.cell(4, 0).unwrap().ch, ' ', "the long line did not wrap onto row 4");
-        // The cursor was addressed to the last row, mid-line.
         assert_eq!(g.cursor(), (5, 5));
     }
 
@@ -734,7 +614,6 @@ mod tests {
         let fb = reference::render_with(&f);
         assert_eq!(fb.geometry().width, m.pixel_size(reference::COLS, reference::ROWS).w);
         assert_eq!(fb.geometry().height, m.pixel_size(reference::COLS, reference::ROWS).h);
-        // The padded stride is the point of padding it.
         assert!(fb.geometry().pitch > fb.geometry().width as usize * 4);
     }
 }

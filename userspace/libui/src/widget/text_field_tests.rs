@@ -1,9 +1,7 @@
 use super::*;
 use crate::element::Node;
 
-/// Tab, Enter and Escape are the whole reason `on_key` returns an `Option`. A field that
-/// claimed them would make traversal, submission and dismissal impossible from a focused
-/// field — the exact failure `Element::on_key`'s doc names.
+/// Tab, Enter and Escape belong to whatever is above the field.
 #[test]
 fn declines_the_keys_that_belong_above_it() {
     const KEY_TAB: u16 = 15;
@@ -16,8 +14,6 @@ fn declines_the_keys_that_belong_above_it() {
     }
 }
 
-/// Negative control for the test above: a key the field *does* claim must answer `true`,
-/// or "declines everything" would pass it.
 #[test]
 fn claims_the_keys_it_handles() {
     const KEY_A: u16 = 30;
@@ -26,8 +22,7 @@ fn claims_the_keys_it_handles() {
     assert_eq!(f.text(), "a");
 }
 
-/// Ctrl-C folds to `0x03` in the keymap because a terminal needs it to. A field that
-/// inserted what `to_char` returned would put an unprintable byte in a password.
+/// Ctrl-C folds to `0x03` in the keymap; inserting it would put an unprintable byte in a password.
 #[test]
 fn control_characters_are_not_text() {
     const KEY_C: u16 = 46;
@@ -39,9 +34,7 @@ fn control_characters_are_not_text() {
     assert_eq!(f.text(), "c");
 }
 
-/// **A field types under the key's locks** (Phase 6 Part B.5; PR #359 review): Caps Lock
-/// upper-cases a letter and Num Lock makes keypad 1 a digit, each only if the lock reaches the
-/// keymap. No gate types into a field under a lock.
+/// Caps Lock upper-cases a letter and Num Lock makes keypad 1 a digit, once the lock arrives.
 #[test]
 fn a_field_types_under_the_keys_locks() {
     use librsproto::surface::{LOCK_CAPS, LOCK_NUM};
@@ -53,8 +46,7 @@ fn a_field_types_under_the_keys_locks() {
     assert_eq!(f.text(), "A1");
 }
 
-/// The caret is a byte offset that must never land inside a character. Every mutation
-/// keeps it on a boundary, and slicing at it is what would panic if one did not.
+/// The caret must never land inside a character; slicing at it would panic.
 #[test]
 fn the_caret_stays_on_character_boundaries() {
     let mut f = TextFieldState::new();
@@ -108,8 +100,7 @@ fn home_and_end_report_only_real_movement() {
     assert!(!f.end(), "End at the end reported a move");
 }
 
-/// A mask must count characters. Repeating a byte would print three stars for a
-/// two-character string containing one multi-byte character.
+/// A mask counts characters, not bytes.
 #[test]
 fn masking_counts_characters_not_bytes() {
     let f = TextFieldState::with_text("aé");
@@ -132,8 +123,7 @@ fn the_caret_appears_only_when_active() {
     assert_eq!(row_children(&idle), 2, "an inactive field drew a caret");
 }
 
-/// The split is *at the cursor*, which is what puts the caret in the middle of the text
-/// rather than always at the end.
+/// The split is at the cursor, not the end.
 #[test]
 fn the_caret_splits_the_text_at_the_cursor() {
     let mut f = TextFieldState::with_text("abcd");

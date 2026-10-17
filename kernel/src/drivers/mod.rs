@@ -1,9 +1,6 @@
-//! In-kernel **Tier 1** device drivers (compiled into the kernel ELF).
-//!
-//! [`probe`] matches discovered [`DeviceNode`]s against the built-in driver
-//! table and brings up the ones it recognises: [`ahci`], and since Phase 6 Part A
-//! the USB host controller, [`xhci`]. See `docs/architecture/drivers-and-irps.md`
-//! § "Module tiers".
+//! In-kernel **Tier 1** device drivers (compiled into the kernel ELF): [`probe`] matches discovered
+//! [`DeviceNode`]s against the built-in driver table and brings up the ones it recognises. See
+//! `docs/architecture/drivers-and-irps.md` § "Module tiers".
 
 pub mod ahci;
 pub mod console;
@@ -23,14 +20,12 @@ use crate::libkern::io_op::IoOpcode;
 use crate::object::device_node::DeviceClass;
 use crate::object::{DeviceNode, MemoryObject, ObjectRef, PendingOperation};
 
-/// PCI class/subclass/prog-if for an AHCI 1.0 controller.
 const PCI_CLASS_AHCI: (u8, u8, u8) = (0x01, 0x06, 0x01);
 
-/// Match discovered devices against the Tier 1 driver table and bring up the
-/// ones recognised. Boot-time; call after [`crate::device::init`] and the IRQ
-/// router. Snapshots the device table, so it never holds the device lock across
-/// driver allocation. `flags` is the command line: `usb=off` leaves the USB host
-/// controller to no driver.
+/// Match discovered devices against the Tier 1 driver table and bring up the ones recognised.
+/// Boot-time, after [`crate::device::init`] and the IRQ router. Snapshots the device table, so it
+/// never holds the device lock across driver allocation. `flags` is the command line: `usb=off`
+/// leaves the USB host controller to no driver.
 pub fn probe(flags: &crate::cmdline::Flags) {
     let devices = crate::device::snapshot();
     for node in devices.iter() {
@@ -45,13 +40,13 @@ pub fn probe(flags: &crate::cmdline::Flags) {
         }
     }
 
-    // Limine modules after the initramfs are disks too (Phase 5 Part C): publish them now, so the
-    // GPT pass below scans them exactly as it scans a SATA disk.
+    // Limine modules after the initramfs are disks too: publish them now, so the GPT pass below
+    // scans them as it scans a SATA disk.
     crate::io::ramdisk::publish_modules();
 
-    // Controllers have published their disks; parse each disk's GPT and publish
-    // its partitions. Re-snapshot *now* so the (block-class) disks are visible but
-    // the partitions gpt::init creates are not re-scanned.
+    // Controllers have published their disks; parse each disk's table and publish its partitions.
+    // Re-snapshot *now* so the disks are visible but the partitions `gpt::init` creates are not
+    // re-scanned.
     let disks = crate::device::snapshot();
     for node in disks.iter() {
         // SAFETY: each entry pins a live `DeviceNode`.
@@ -61,29 +56,24 @@ pub fn probe(flags: &crate::cmdline::Flags) {
         }
     }
 
-    // What became of every enumerated function, now that every driver has had its turn.
     crate::device::log_outcomes();
 }
 
-/// **Start what drivers do after boot**: the USB hub thread (Phase 6 Part A.2). After the
-/// scheduler and the APs are up.
+/// **Start what drivers do after boot**: the USB hub thread, once the scheduler and APs are up.
 pub fn start() {
     xhci::start();
 }
 
-/// **Wait, bounded, for what [`start`] began to settle**: the USB hub thread's first round, so the
-/// hardware report lists what is attached and the registry holds it before userspace reads it
-/// (Phase 6 Part A.3). Before the report and `init`.
+/// **Wait, bounded, for what [`start`] began to settle**: the USB hub thread's first round, so
+/// the report and the registry list what is attached before userspace reads them.
 pub fn settle() {
     xhci::settle(xhci::FIRST_ROUND_NS);
 }
 
-/// Boot self-test: read sector 0 of the first block device and verify the boot
-/// signature (`0x55AA` at offset 510). Proves the real driver's read path end to
-/// end — `dispatch_block_irp` → controller DMA → completion. Mirrors the IOAPIC
-/// PIT self-test: it briefly enables interrupts so a hardware completion IRQ can
-/// fire, with a bounded polled fallback if the IRQ does not (e.g. an unrouted
-/// GSI). Reports a one-line pass/fail; not a `panic!` path.
+/// Boot self-test: read sector 0 of the first block device and verify the boot signature (`0x55AA`
+/// at offset 510), proving `dispatch_block_irp` → controller DMA → completion. Briefly enables
+/// interrupts so the completion IRQ can fire, with a bounded polled fallback. Reports a one-line
+/// pass/fail; not a `panic!` path.
 pub fn self_test() {
     let devices = crate::device::snapshot();
     let disk = devices.iter().find(|node| {
@@ -95,10 +85,8 @@ pub fn self_test() {
         return; // no block device (no AHCI disk) — nothing to test
     };
 
-    // **First, because it shares nothing with the read below but the handle.** It used to be
-    // the last statement of this function, so any earlier failure — a dispatch error, a bad
-    // status — skipped it silently, and the gate that reads its absence then blamed the wrong
-    // thing (PR #293 review, 2).
+    // **First, because it shares nothing with the read below but the handle**: an earlier failure
+    // here must not silently skip it, or the gate that reads its absence blames the wrong thing.
     oversize_refused(disk);
 
     let buffer = match MemoryObject::try_new(512) {
@@ -116,8 +104,7 @@ pub fn self_test() {
         return;
     }
 
-    // Brief interrupt-enabled window for the completion IRQ (only the AHCI line
-    // is unmasked; the scheduler is not yet running). Fall back to polling.
+    // Brief interrupt-enabled window for the completion IRQ (only the AHCI line is unmasked).
     let mut via_irq = false;
     let start = crate::arch::Timer::read_ns();
     // SAFETY: ring-0; IF was 0 here and is restored to 0 below.
@@ -153,33 +140,22 @@ pub fn self_test() {
     }
 }
 
-/// Boot self-test: a transfer needing more fragments than the device can describe in one
-/// command is **refused**, not attempted.
+/// Boot self-test: a transfer needing more fragments than the device can describe in one command is
+/// **refused**, not attempted.
 ///
-/// **This is the only test of that guard that goes through the real path.** The host tests
-/// beside it check the two halves — that `build_frags` emits one fragment per page with no
-/// ceiling of its own, and that AHCI's PRDT capacity is what fits in its command table — and
-/// every one of them passes with the check in `dispatch_block_irp` deleted. What cannot be
-/// host-tested is the dispatch itself: it needs a live `DeviceNode`, `MemoryObject` and
-/// `PendingOperation`, which is what this function has and a unit test does not.
-///
-/// Before 2026-09-11 this read was attempted: the driver zeroed and wrote PRDT entries past
-/// the one-page command table it owns, and the controller then read descriptors out of
-/// whatever followed and DMAed to the addresses it found there.
-///
-/// **Runs before the sector-0 read**, not after it: the two share only the disk handle, and
-/// ordering this second made every failure of the first silently skip it.
+/// **The only test of that guard through the real path**: the host tests check its halves and pass
+/// with the check in `dispatch_block_irp` deleted, which would let the driver write PRDT entries
+/// past its one-page command table. Runs before the sector-0 read, as the two share only the disk
+/// handle.
 fn oversize_refused(disk: &ObjectRef) {
     // SAFETY: `disk` pins a live `DeviceNode` (found by class above).
     let dn: &DeviceNode = unsafe { &*(disk.as_ptr() as *const DeviceNode) };
     let Some(backend) = dn.block_backend() else {
         return;
     };
-    // **Ask the device what it can do, then ask for one fragment more.** Taking the bound
-    // from the backend rather than from a constant is what makes this a test of the
-    // *plumbing*: a driver that published the wrong `max_frags`, or a dispatch that read it
-    // from somewhere else, fails here. A backend with no limit (the ramdisk) has nothing to
-    // exceed, so there is nothing to prove.
+    // **Ask the device what it can do, then ask for one fragment more**: a driver that published
+    // the wrong `max_frags` fails here. A backend with no limit (the ramdisk) has nothing to
+    // exceed.
     if backend.max_frags == u32::MAX {
         return;
     }
@@ -187,7 +163,6 @@ fn oversize_refused(disk: &ObjectRef) {
     let bytes = pages * crate::mm::PAGE_SIZE;
     let big = match MemoryObject::try_new(bytes) {
         Ok(mo) => adopt(mo, KObjectType::MemoryObject),
-        // Not enough memory to build the probe is not a failure of the guard.
         Err(_) => return,
     };
     let po = match PendingOperation::try_new() {
@@ -199,7 +174,6 @@ fn oversize_refused(disk: &ObjectRef) {
             crate::kprintln!("ahci: oversize self-test OK ({} frags > {} refused)", pages, backend.max_frags)
         }
         Err(e) => crate::kprintln!("ahci: oversize self-test FAIL (refused, but with {:?} not InvalidArgument)", e),
-        // It was accepted: the command was built past the end of its table.
         Ok(()) => crate::kprintln!(
             "ahci: oversize self-test FAIL ({} frags accepted, table holds {})",
             pages,
@@ -208,8 +182,7 @@ fn oversize_refused(disk: &ObjectRef) {
     }
 }
 
-/// Read the little-endian 16-bit value at offset 510 of `buffer`'s first frame
-/// (the boot signature: `0xAA55`).
+/// Read the little-endian 16-bit boot signature (`0xAA55`) at offset 510 of `buffer`'s first frame.
 fn read_boot_signature(buffer: &ObjectRef) -> u16 {
     // SAFETY: `buffer` pins a live `MemoryObject` of ≥ 512 bytes.
     let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
@@ -219,7 +192,6 @@ fn read_boot_signature(buffer: &ObjectRef) -> u16 {
     unsafe { (va.add(510) as *const u16).read_unaligned() }
 }
 
-/// Adopt a freshly-created kernel object box into an owning [`ObjectRef`].
 pub(crate) fn adopt<T>(obj: KBox<T>, ty: KObjectType) -> ObjectRef {
     // SAFETY: `into_raw` yields the single creation reference of a `ty` object.
     unsafe { ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), ty) }

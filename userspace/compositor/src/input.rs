@@ -1,23 +1,11 @@
 //! Where an input event goes: focus for keys, hit-testing for the pointer.
 //!
-//! `libinput` turns device triples into [`Logical`] events but deliberately stops there —
-//! it has no screen to clamp a delta against and no window stack to hit-test. **This is the
-//! half that needs both**, and like the rest of this crate it is a pure function of state
-//! the caller owns, so a click landing on the wrong window is a host test rather than a
-//! boot.
-//!
-//! ## The rules
-//!
-//! - **Keys follow focus**, which is the topmost window whose role takes it
-//!   ([`WindowStack::focus_candidate`]). A panel never takes a keystroke: clicking the clock
-//!   must not stop the terminal receiving what you type next.
-//! - **The pointer follows the cursor**, hit-testing every role — a panel that cannot take
-//!   keyboard focus can still be clicked, which is the entire point of a panel.
-//! - **A press grabs.** Every pointer event up to the matching release goes to the window
-//!   the press landed on, even after the cursor leaves it. Without this a drag that ends
-//!   outside the window delivers a press with no release, and the client believes a button
-//!   is held forever. The grab is why [`PointerEvent`]'s coordinates are **signed**: during
-//!   one, window-local x can legitimately be negative.
+//! - **Keys follow focus**, the topmost window whose role takes it
+//!   ([`WindowStack::focus_candidate`]). A panel never takes a keystroke.
+//! - **The pointer follows the cursor**, hit-testing every role.
+//! - **A press grabs.** Every pointer event up to the release goes to the window the press landed
+//!   on, so a drag ending outside still delivers its release. That is why [`PointerEvent`]'s
+//!   coordinates are **signed**: window-local x can be negative.
 
 use alloc::vec::Vec;
 
@@ -33,58 +21,27 @@ use crate::outbox::Outbound;
 use crate::{Damage, StackError, WindowStack};
 
 /// What routing one event did, beyond what it put in `out`.
-///
-/// **`consumed` exists because the caller cannot otherwise tell.** `route` used to answer only
-/// "did the stack restack", so a chord press and an ordinary keystroke were indistinguishable
-/// from outside — and the binary arms key repeat from the *physical* transition, deliberately,
-/// so a consumed chord went on to repeat its key into the focused window at 25/s. Holding
-/// `Super+1` while already on desktop 1 filled the terminal with `1`s: exactly the outcome
-/// consumption exists to prevent, by the one path consumption could not see (PR #241 review,
-/// blocking 1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Routed {
-    /// The region a restack disturbed, or `None` if the stack was not reordered.
-    ///
-    /// **The rectangle rather than a flag**, because the flag made the caller repaint the
-    /// screen. A raise changes only the pixels the raised window covers (the argument is on
-    /// [`WindowStack::raise`](crate::WindowStack::raise)), and a full recompose is ~100 ms under
-    /// emulation with no input read during it — so every click that raised a window threw away
-    /// the mouse movement around it (2026-08-26).
+    /// The region a restack disturbed, or `None`; a rectangle so the caller recomposes only that.
     pub restacked: Option<Rect>,
-    /// The region an interactive move disturbed, or `None` if no window moved.
-    ///
-    /// Separate from [`restacked`](Self::restacked) because the two mean different things to the
-    /// caller: a restack also changes who is focused and has to be announced, and a move does
-    /// not. Both are repainted the same way.
+    /// The region an interactive move disturbed, or `None`; unlike a restack it changes no focus.
     pub moved: Option<Rect>,
-    /// The event was taken by a registered chord and reached no window.
+    /// The event was taken by a registered chord and reached no window; its key must not repeat.
+    ///
+    /// Repeat is armed from the physical transition, so without this holding `Super+1` on desktop
+    /// 1 filled the focused terminal with `1`s.
     pub consumed: bool,
     /// The outline moved: where it was, and where it is now. See [`Outline`].
-    ///
-    /// Produced by both gestures — a resize's own rectangle, and the target a move is previewing
-    /// over a snap zone.
     pub outline: Option<Outline>,
-    /// A gesture ended, and this is the rectangle it asks for.
-    ///
-    /// **The gesture's one report**, from either that produces one: a resize (where the user let
-    /// go) or a move released in a snap zone (that zone's target). The compositor does not apply
-    /// it — changing a window's geometry is the manager's, so this becomes a `DragEnded` event
-    /// and the manager answers with the `Configure` it would have sent anyway (M9 Parts E, F).
+    /// A gesture ended, and this is the rectangle it asks for; the manager applies it, so it
+    /// becomes a `DragEnded`.
     pub resized: Option<(u32, Rect)>,
-    /// A popup a press landed outside of, which its owner should be told about.
-    ///
-    /// **The compositor reports rather than acts**, as it does for a close request and a resize:
-    /// the window belongs to the client, and whether a dismissal ends what the popup was offering
-    /// is the client's to decide. What only the compositor can know is that the press happened
-    /// somewhere else at all (M11 Part E batch 5).
+    /// A popup a press landed outside of; the compositor reports, its owner decides to close.
     pub dismissed: Option<u32>,
 }
 
-/// Where the resize outline was and where it is now, both to repaint.
-///
-/// **Both, because an outline is drawn over the composed stack** — like the cursor, and unlike a
-/// window — so the region it leaves has to be recomposed to erase it. `None` on either side is a
-/// gesture beginning or ending.
+/// Where the resize outline was and where it is now, both to repaint: it is drawn over the stack.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Outline {
     /// The rectangle the outline occupied before this event.
@@ -93,69 +50,35 @@ pub struct Outline {
     pub now: Option<Rect>,
 }
 
-/// An interactive move the compositor is running on a client's behalf.
-///
-/// **The window's origin is remembered, not recomputed.** Adding the pointer's delta to the
-/// *current* origin each time would accumulate rounding and drift against the clamp; taking it
-/// from where the window and the pointer both were when the grab was taken makes every motion an
-/// absolute answer that cannot drift.
+/// An interactive move run on a client's behalf, from an absolute origin so it cannot drift.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Drag {
-    /// The window being moved.
     window: u32,
-    /// Where the pointer was when the grab was taken.
     from: Point,
-    /// Where the window's origin was then.
     origin: Point,
 }
 
-/// A drag-and-drop gesture the compositor is running on a client's behalf.
-///
-/// **The payload is a path and never a handle** (M10 decision 1): a handle would have to belong
-/// to somebody while the gesture is in flight, and a transfer the receiver refuses has no clean
-/// owner. A path is a name the receiving program opens for itself, and reports its own errors
-/// about in its own window.
+/// A drag-and-drop gesture run on a client's behalf; the payload is a path, never a handle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Carrying {
-    /// The window the drag came out of — the one that must hold the grab.
     window: u32,
-    /// What the payload is: exactly one of `DROP_KIND_FILE` and friends.
     kind: u32,
-    /// What is being offered.
     path: alloc::string::String,
-    /// What to call it on screen.
     name: alloc::string::String,
 }
 
-/// An interactive resize the compositor is running on a client's behalf.
-///
-/// **The window does not move and does not change size while this runs.** Only an outline does,
-/// and the client is told nothing until the button comes up — decision 3 of Milestone 9: a
-/// `Configure` per motion makes the client allocate, map, re-lay-out and repaint per motion,
-/// which is the expensive path and is a client cost rather than a protocol one.
-///
-/// The starting rectangle is remembered for the same reason [`Drag`] remembers the origin:
-/// deriving each step from the last accumulates against the clamp, and taking every step from
-/// where the window and the pointer both were at the press makes each one an absolute answer.
+/// An interactive resize run on a client's behalf. The window does not change while it runs: a
+/// `Configure` per motion would cost the client a repaint per motion.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Resize {
-    /// The window being resized.
     window: u32,
-    /// Where the pointer was when the grab was taken.
     from: Point,
-    /// The window's rectangle then.
     rect: Rect,
-    /// Which edges are being dragged — a mask of `RESIZE_LEFT` and friends.
     edges: u32,
 }
 
-/// The smallest rectangle a resize will offer.
-///
-/// **A floor rather than a client's own minimum**, which the protocol has no way to state: a
-/// `Configure` is a request, so a client that cannot be this small commits whatever it likes and
-/// the compositor composites what it is given. What this prevents is the *outline* collapsing to
-/// nothing or inverting as the pointer crosses the far edge, which is a drawing problem rather
-/// than a policy one.
+/// The smallest rectangle a resize will offer: a floor against the outline inverting, as the
+/// protocol cannot state a client's minimum.
 pub const MIN_RESIZE: u32 = 64;
 
 /// Why a chord could not be registered.
@@ -171,157 +94,65 @@ pub enum HotkeyError {
     TableFull,
 }
 
-/// Whether a window the router still names is usable, hidden, or gone.
-///
-/// Three states rather than a boolean because the two failure cases need different treatment:
-/// a hidden window can still be *told* it is losing the pointer, and a destroyed one cannot.
+/// Whether a window the router still names is usable, hidden (still told it loses the pointer), or
+/// gone.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WindowState {
-    /// In the stack and on screen.
     OnScreen,
-    /// In the stack, but minimized or on another desktop — reachable, not visible.
     OffScreen,
-    /// No longer in the stack.
     Gone,
 }
 use WindowState::{Gone, OffScreen, OnScreen};
 
 /// Cursor position, crossing state, and the implicit grab.
-///
-/// Not part of [`WindowStack`]: the stack is what the screen looks like, and none of this
-/// changes a pixel. Keeping it separate is also what lets the whole router be exercised
-/// against a stack built by hand.
 pub struct InputRouter {
-    /// Where the cursor is, in screen coordinates, always inside `screen`.
     pointer: Point,
-    /// The screen the pointer is clamped to.
     screen: Rect,
-    /// The window the cursor is currently inside, if any — what makes enter/leave edges.
     inside: Option<u32>,
-    /// The window holding the implicit grab, if a button is down.
     grab: Option<u32>,
-    /// Where the pointer was when [`grab`](Self::grab) was taken.
-    ///
-    /// **Recorded at the press, not read when somebody asks.** An interactive move is requested
-    /// by the client, which learns about the press, routes it through its own toolkit, decides
-    /// it landed on a title bar, and only then sends `StartMove` — a full round trip later, by
-    /// which time the pointer has moved, and by which time coalescing may have handed that
-    /// client a position older still. A drag whose offset is measured at the request jumps by
-    /// however far the pointer travelled in between, which is the same defect
-    /// the `scroll-grab` deferral described for a scrollbar thumb (PR #247 review, finding 4).
-    /// Both are now solved the same way, a layer apart: this records the pointer at the press,
-    /// and `libui::widget::ScrollGrab` records where within the thumb it landed.
+    /// Where the pointer was when [`grab`](Self::grab) was taken: `StartMove` arrives a round trip
+    /// later.
     grab_at: Point,
-    /// The interactive move in progress, if any.
     drag: Option<Drag>,
-    /// The interactive resize in progress, if any.
-    ///
-    /// **Never both**: a grab is opened by one press and carries one gesture, so `start_move`
-    /// and `start_resize` each refuse while the other is running rather than replacing it.
+    /// The interactive resize in progress, if any. Never both this and `drag`.
     resize: Option<Resize>,
-    /// The drag-and-drop gesture in progress, if any — the third thing a grab can carry.
-    ///
-    /// **The payload lives here for the gesture's life**, because that is exactly how long it
-    /// exists: a drag is an offer, and an offer that outlived the button would be a payload
-    /// belonging to nobody. Cleared wherever the grab ends, like the other two.
+    /// The drag-and-drop gesture in progress, if any. Cleared wherever the grab ends.
     carrying: Option<Carrying>,
-    /// The window a drop would land on right now — what the highlight is drawn around.
-    ///
-    /// Kept rather than recomputed at the release for the reason the snap zone's id is: the
-    /// window the user let go over must be the one they were *shown*, and two hit tests of the
-    /// same pointer are two chances to disagree.
+    /// The window a drop would land on right now, kept so the drop lands where it was shown.
     over: Option<u32>,
-    /// The rectangle the outline is drawn at, if anything is drawing one.
-    ///
-    /// **Two gestures write it**, which is what makes `resize.is_none()` say nothing about it: a
-    /// resize derives it from its edges and the pointer, and a move over a snap zone sets it to
-    /// that zone's target. Kept rather than recomputed because the *previous* value is what a
-    /// repaint needs in order to erase what was there — so every path that stops drawing has to
-    /// hand it back rather than merely forget it.
+    /// The rectangle the outline is drawn at; every path that stops drawing hands the old value
+    /// back.
     outline: Option<Rect>,
-    /// Which button opened [`grab`](Self::grab) — the one a synthetic release names when the
-    /// grab is taken away by something other than that button coming up.
-    ///
-    /// One code rather than a mask: a grab is opened by exactly one press (`grab.is_none()`
-    /// gates it), so this is the button whose sequence the compositor promised to finish.
-    /// A second button pressed during a drag never opened a grab and is not owed a close.
+    /// Which button opened [`grab`](Self::grab), named by a synthetic release if the grab is lost.
     grab_button: u16,
-    /// A grab ended because its window left the screen, and the buttons are still down.
-    ///
-    /// **Until they come up, pointer input goes nowhere.** Without this, `target` falls
-    /// through to `hit` and the window *underneath* receives the release for a press it never
-    /// saw — and in `libui` a bare release fires nothing, so the defect is silent until the
-    /// day a client acts on one. The sequence belonged to a window that can no longer receive
-    /// it; handing its tail to a different window is not a repair (PR #240 review, blocking 1b).
+    /// A grab ended because its window left the screen with buttons still down: pointer input goes
+    /// nowhere until they come up.
     grab_broken: bool,
-    /// Buttons held, mirrored from the last event that carried them.
-    ///
-    /// Stamped onto **every** record, not just `POINTER_BUTTON`. A drag is motion with a
-    /// button held, so a client told `buttons == 0` on motion cannot implement one without
-    /// re-accumulating the state itself — the duplication the Surface layer exists to
-    /// avoid (PR #180 review, finding 2).
+    /// Buttons held, stamped onto every record so a client need not re-accumulate them for a drag.
     buttons: u16,
-    /// Modifiers held, mirrored the same way — what makes shift-click and shift-drag
-    /// expressible on the wire rather than only in `libinput`.
+    /// Modifiers held, mirrored the same way.
     modifiers: u16,
-    /// When the event being routed happened, mirrored the same way and for the same reason.
-    ///
-    /// **Mirrored rather than passed down**, because the records this router emits are not all
-    /// caused by an event that has one: enter and leave are *generated here*, and a leave
-    /// synthesised because a window was minimized mid-drag still has to be stamped. Taking the
-    /// time from whatever event provoked it is what lets every record of one batch agree —
-    /// exactly the argument `buttons` and `modifiers` are mirrored on.
-    ///
-    /// **Nanoseconds here, milliseconds on the wire.** The kernel's stamp is `time_ns` and the
-    /// division happens once, at [`emit`](Self::emit) — dividing earlier would round twice.
+    /// When the event being routed happened, mirrored so a batch's records agree. Nanoseconds;
+    /// divided once, at [`emit`](Self::emit).
     time_ns: u64,
-    /// Keycodes whose press this router **delivered**, awaiting their release.
-    ///
-    /// **The other half of `consumed`, and it is what keeps presses and releases balanced.**
-    /// A key already down cannot begin a chord: pressing `2`, then holding `Super`, makes the
-    /// *repeat* of `2` match `Super+2` — so the chord would be recorded as consumed and the
-    /// physical release swallowed, leaving the window with a press it never saw released
-    /// (PR #241 review, finding 2). A press whose keycode is already here is a repeat of a
-    /// delivered press, and is delivered.
+    /// Keycodes whose press this router **delivered**, awaiting release: a repeat must not begin a
+    /// chord.
     held: Vec<u16>,
-    /// Chords a manager asked to receive instead of the focused window.
-    ///
-    /// Held here rather than in [`WindowStack`] because this is input *routing* policy and the
-    /// stack is what the screen looks like. Bounded at [`MAX_HOTKEYS`].
+    /// Chords a manager asked to receive instead of the focused window. Bounded at [`MAX_HOTKEYS`].
     hotkeys: Vec<MgrHotkey>,
-    /// Regions a manager asked to be told about, and what a window dropped in each becomes.
-    ///
-    /// Held here for the reason `hotkeys` is: matching a pointer against a table is routing, and
-    /// what the numbers *mean* — a half, a quarter, how close counts — is the manager's and
-    /// never reaches this side. Bounded at [`MAX_SNAP_ZONES`].
+    /// Regions a manager asked to be told about, bounded at [`MAX_SNAP_ZONES`].
     zones: Vec<MgrSnapZone>,
-    /// The zone the pointer is in during a move, if any — what the outline is previewing.
-    ///
-    /// Kept rather than recomputed at the release so that the outline and the rectangle finally
-    /// asked for cannot come from different tests of the same pointer.
+    /// The zone the pointer is in during a move, kept so outline and result use one test.
     in_zone: Option<u32>,
-    /// Chords matched since the last [`take_hotkeys`](Self::take_hotkeys).
-    ///
-    /// **Drained by the caller rather than pushed into `out`.** `Outbound` is addressed to a
-    /// *window* — `Outbound::window()` is the one place delivery is decided — and a hotkey is
-    /// addressed to the manager, which is not a window and has its own queue. Threading a
-    /// second out-param through `route` would put it in the signature of every caller that
-    /// cannot produce one.
+    /// Chords matched since the last [`take_hotkeys`](Self::take_hotkeys); they go to the manager.
     fired: Vec<MgrHotkey>,
-    /// Keycodes whose press was consumed as a hotkey, awaiting their release.
-    ///
-    /// **By keycode, not by re-matching the chord.** A user who lets go of `Super` before `2`
-    /// releases a chord that no longer matches, so re-testing the modifiers on release would
-    /// deliver a release for a press the focused window never saw — the same defect as handing
-    /// a broken pointer grab's release to the window underneath.
+    /// Keycodes whose press was consumed as a hotkey, awaiting release; by keycode, as `Super` may
+    /// come up first.
     consumed: Vec<u16>,
 }
 
 impl InputRouter {
     /// A router with the cursor at the centre of `screen`.
-    ///
-    /// The centre rather than the origin because `(0, 0)` is a corner a panel usually
-    /// occupies, and starting inside a window would owe an enter event nobody sent.
     pub fn new(screen: Rect) -> Self {
         let pointer =
             Point::new(screen.origin.x + (screen.size.w / 2) as i32, screen.origin.y + (screen.size.h / 2) as i32);
@@ -356,12 +187,6 @@ impl InputRouter {
     }
 
     /// The rectangle an outline is being drawn at, if anything is drawing one.
-    ///
-    /// **The compositor already keeps its own copy** — `Server::outline`, which is what
-    /// `present_into` reads — and this is the router's, which is what that copy is *derived*
-    /// from through the `Outline` changes `route` hands back. Exposed so a test can ask the
-    /// state rather than accumulating the changes itself, which would be a test that
-    /// re-implements the thing it checks.
     pub fn outline(&self) -> Option<Rect> {
         self.outline
     }
@@ -387,14 +212,9 @@ impl InputRouter {
     }
 
     /// Route one logical event, appending what to send to `out`.
-    ///
-    /// The [`Routed`] it returns names the region a restack disturbed — a press raises the window
-    /// it lands on, and the caller has to recompose exactly that much when it does.
     pub fn route(&mut self, ev: &Logical, stack: &mut WindowStack, out: &mut Vec<Outbound>) -> Routed {
-        // Mirror the interpreter's state before anything is emitted. Enter and leave are
-        // generated *by* the router rather than arriving as events, so they have no state of
-        // their own to read; taking it from the event that provoked them is what lets every
-        // record carry the same answer.
+        // Mirror the interpreter's state first: generated enters and leaves take their stamps from
+        // it.
         match *ev {
             Logical::Key { modifiers, time_ns, .. } => {
                 self.modifiers = modifiers;
@@ -407,10 +227,7 @@ impl InputRouter {
                 self.modifiers = modifiers;
                 self.time_ns = time_ns;
             }
-            // **The time is kept, where the state is thrown away.** A loss says nothing about
-            // *when* it happened being wrong — it is the one thing about a `Dropped` that is
-            // still known — and the crossings this arm synthesises need a stamp like any other
-            // record. Zeroing it here would date them to the beginning of the clock.
+            // The time survives a `Dropped`; synthesised crossings need a stamp.
             Logical::Dropped { time_ns } => {
                 self.buttons = 0;
                 self.modifiers = 0;
@@ -418,63 +235,32 @@ impl InputRouter {
             }
         }
 
-        // **Reconcile with the stack — after the mirror above, not before it.** A window can
-        // be destroyed between one event and the next, and since M8 Part A it can also be
-        // minimized or moved to another desktop, which leaves it in the stack. The router is
-        // on none of those paths, so it asks the stack rather than being called back: the
-        // stack is the authority, and a question asked here cannot go out of date.
-        //
-        // It runs *after* the mirror because it emits — the leave below is a record like any
-        // other, and records in one batch have to agree about `buttons` and `modifiers`. When
-        // this block ran first it stamped the *previous* event's state onto them, so a release
-        // that ended a shift-drag produced a leave saying shift was still down beside a button
-        // record saying it was not (PR #240 review, blocking 1c).
+        // Reconcile after the mirror: it emits, and one batch's records must agree on `buttons`.
         self.reconcile_with(stack, out);
-        // What a gesture ending on this event owes the caller. Filled in wherever a grab ends —
-        // the invariant just below, the release, and `Dropped` — and carried out through every
-        // arm's `Routed`, because any of them can be the event that notices.
         let mut ended: Option<(u32, Rect)> = None;
         let mut outline_gone: Option<Outline> = None;
-        // **A drag implies a grab, enforced here rather than trusted.** `reconcile_with` breaks
-        // the grab of a window that has left the screen — minimized, or moved to another desktop
-        // mid-gesture — and it takes the stack immutably, so the drag is torn down on its way
-        // out instead. Stating it as an invariant rather than as a branch also covers the next
-        // path that clears a grab without knowing a drag exists (PR #248 review, blocking 2).
+        // A drag implies a grab, enforced here: `reconcile_with` breaks a grab but cannot reach the
+        // drag.
         if self.grab.is_none() {
             (ended, outline_gone) = self.stop_drag(stack, false);
-            // A resize goes with its grab for the same reason — and an outline left on screen
-            // with nothing driving it is the visible version of that phantom. **`finished` is
-            // false**: a grab taken away is not a gesture the user completed, so the outline
-            // comes down and the shell is asked for nothing. (Twice over, in fact: this path is
-            // reached when `reconcile_with` breaks a grab, which it does only for a window that
-            // has left the screen — the other condition `stop_resize` requires.)
+            // A resize goes with its grab; `finished` is false, so the shell is asked for nothing.
             let (r, gone) = self.stop_resize(stack, false);
             ended = ended.or(r);
             outline_gone = outline_gone.or(gone);
-            // **And a payload goes with the grab that was carrying it.** `finished` is false, so
-            // nothing is delivered: a grab taken away is not somebody letting go, and a drop
-            // handed to a window because the gesture was interrupted is a file opened by an
-            // application nobody dropped it on.
+            // So does a payload; nothing is delivered.
             let (_, gone) = self.stop_carrying(stack, false);
             outline_gone = outline_gone.or(gone);
         }
 
         match *ev {
             Logical::Key { keycode, pressed, modifiers, locks, .. } => {
-                // **Before focus routing, and consuming rather than copying.** A chord that
-                // also reached the focused window would type into it — `Super+2` would switch
-                // desktops *and* put a `2` in the terminal.
+                // Before focus routing, and consuming: a copy would type the `2` of `Super+2` too.
                 if self.take_as_hotkey(keycode, pressed, modifiers) {
                     return Routed { consumed: true, resized: ended, outline: outline_gone, ..Routed::default() };
                 }
                 let Some(window) = stack.focus_candidate() else {
-                    // Nothing focusable. Dropping beats delivering to the pointer's window,
-                    // which would make typing depend on where the cursor happens to rest.
-                    //
-                    // **The gesture's ending still gets out.** `reconcile_with` can break a
-                    // grab on any event — a window minimized mid-drag — so a keystroke is a
-                    // path on which a resize ends, and a `Routed::default()` here would leave
-                    // the outline on screen with the shell never told.
+                    // Nothing focusable: dropped, not sent to the pointer's window, or typing would
+                    // follow the cursor. A gesture ending on this event still gets out.
                     return Routed { resized: ended, outline: outline_gone, ..Routed::default() };
                 };
                 // TODO(focus-change-key-balance): a key held across a focus change is delivered
@@ -490,18 +276,11 @@ impl InputRouter {
 
             Logical::Motion { dx, dy, .. } => {
                 self.move_by(dx, dy);
-                // **The drag first, so what follows describes where the window now is.** The
-                // crossing pass and the motion record both read the stack, and a window that has
-                // moved under the pointer this instant is the state a client should be told
-                // about — not the one it was in a frame ago.
+                // The drag first, so the crossing pass and the motion record see the window where
+                // it now is.
                 let moved = self.drag_to_pointer(stack);
-                // The outline follows the pointer the same way, and reaches no window at all:
-                // it is drawn over the composed stack, like the cursor.
-                //
-                // **Two gestures produce one**, and they cannot both be running: a resize moves
-                // it to the rectangle the edges say, and a *move* over a registered snap zone
-                // shows that zone's target — a preview of what letting go there would ask for
-                // (M9 Part F).
+                // The outline follows the pointer and reaches no window; a resize or a move over a
+                // snap zone makes it.
                 let outline = self
                     .outline_to_pointer()
                     .or_else(|| self.preview_zone())
@@ -518,40 +297,19 @@ impl InputRouter {
                 let mut restacked = None;
                 let mut dismissed = None;
                 if pressed && self.grab.is_none() {
-                    // **Before the grab**, or the first click after boot is delivered to a
-                    // window that was never entered: nothing has moved the cursor, `inside`
-                    // is still `None`, and once grabbed the crossing pass early-returns —
-                    // so the enter would only be derived on release, after a whole click had
-                    // been processed for a pointer the client believes is elsewhere
-                    // (PR #180 review, finding 7).
+                    // Before the grab, or the first click after boot reaches a window never
+                    // entered.
                     self.update_crossing(stack, out);
-                    // The press decides the grab. Taking it before the raise reads as the
-                    // careful order, but it is only the clearer one: hit-testing picks the
-                    // topmost window *containing the point*, and raising that window leaves
-                    // it topmost there too, so re-testing afterwards cannot differ.
+                    // Taken before the raise, which cannot change it: the hit is already topmost.
                     self.grab = self.hit(stack);
-                    // **Where it was pressed, kept with the grab it opened.** This is what an
-                    // interactive move offsets by; see the field's own doc for why reading the
-                    // pointer when `StartMove` arrives is a different, wrong number.
                     self.grab_at = self.pointer;
-                    // Remembered for the release the compositor owes this window if the grab
-                    // ends any way other than this button coming up.
+                    // The release owed this window if the grab ends any way but this button coming
+                    // up.
                     self.grab_button = button;
-                    // **A press that is not on the popup dismisses it** (M11 Part E batch 5).
-                    // Focus almost covers this and does not: focus here is a consequence of
-                    // stacking, so pressing on a *window* raises it and the popup hears about it
-                    // — while pressing the desktop or a panel raises nothing, changes no focus,
-                    // and left every popup in the system open. The press is still delivered
-                    // wherever it landed; this only tells the popup's owner.
-                    //
-                    // **Anywhere that is not the popup, its parent included.** A first version
-                    // exempted the parent, meaning to protect the button that opened a menu from
-                    // racing a dismissal — and it was wrong twice over: a popup's parent is the
-                    // whole *bar*, not the button, so clicking the bar left the menu up; and the
-                    // handler it was protecting is inert while a modal is open anyway, so
-                    // dismissing is precisely what makes clicking the button a second time close
-                    // the thing it opened. The opening press cannot dismiss: the popup does not
-                    // exist yet when it is routed.
+                    // A press not on the popup dismisses it: pressing the desktop or a panel raises
+                    // nothing, so focus alone left popups open. Its parent counts as outside, so
+                    // clicking the opening button again closes the menu. The press is still
+                    // delivered.
                     if let Some(top) = stack.focus_candidate()
                         && stack.window(top).is_some_and(|w| w.role.is_popup())
                         && self.grab != Some(top)
@@ -561,13 +319,8 @@ impl InputRouter {
                     if let Some(window) = self.grab
                         && stack.window(window).is_some_and(|w| w.role.takes_focus())
                     {
-                        // Click to focus. `focus_candidate` is topmost-focusable, so the
-                        // raise *is* the focus change — no second piece of state to
-                        // disagree with the stack about who has focus.
-                        //
-                        // Empty damage is the press that changed nothing — the window was
-                        // already on top — and reports no restack at all, so the caller neither
-                        // recomposes nor announces a focus change that did not happen.
+                        // Click to focus: the raise is the focus change. Empty damage (already on
+                        // top) reports no restack.
                         restacked = stack.raise(window).ok().filter(|d| !d.is_empty()).map(Damage::rect);
                     }
                 }
@@ -578,33 +331,22 @@ impl InputRouter {
                 }
 
                 if !pressed && buttons == 0 {
-                    // The drag ends with the grab that carries it, and the stack records the
-                    // one geometry change the whole gesture produced — **plus the snap zone it
-                    // was dropped in**, if the pointer was in one (M9 Part F).
+                    // The drag ends with its grab; the stack records the gesture's one geometry
+                    // change.
                     let (r, gone) = self.stop_drag(stack, true);
                     ended = ended.or(r);
                     outline_gone = outline_gone.or(gone);
-                    // **And this is where a resize becomes a request.** The whole gesture has
-                    // moved an outline; the manager hears one event, now, carrying the
-                    // rectangle the user let go at.
                     let (r, gone) = self.stop_resize(stack, true);
                     ended = ended.or(r);
                     outline_gone = outline_gone.or(gone);
-                    // **And this is where a drag becomes a drop.** Over a window that takes the
-                    // payload it is one message to that window; over anything else the gesture
-                    // is simply over — a drop on nothing is how somebody changes their mind, not
-                    // an error to report to either side.
+                    // A drag becomes a drop on a window that takes the payload; elsewhere the
+                    // gesture just ends.
                     let (drop, gone) = self.stop_carrying(stack, true);
                     outline_gone = outline_gone.or(gone);
                     if let Some(rec) = drop {
                         out.push(rec);
                     }
-                    // Last button up: the grab ends, and the cursor may have been dragged
-                    // somewhere else entirely while it was held, so re-derive the crossing.
-                    //
-                    // This is also where a *broken* grab is finally settled: the sequence it
-                    // belonged to is over, so input resumes and the window under the cursor
-                    // gets its enter — the half deliberately withheld until now.
+                    // Last button up: re-derive the crossing, which also settles a broken grab.
                     self.grab = None;
                     self.grab_broken = false;
                     self.update_crossing(stack, out);
@@ -612,15 +354,8 @@ impl InputRouter {
                 Routed { restacked, resized: ended, outline: outline_gone, dismissed, ..Routed::default() }
             }
 
-            // **The wheel goes where the pointer is**, like every other pointer record and
-            // unlike a key: scrolling acts on what is under the cursor, which is what every
-            // desktop does and what makes a wheel usable over an unfocused window. `target`
-            // is the same answer motion and buttons get, so a wheel turned mid-drag reaches
-            // the window holding the grab rather than whatever the cursor has wandered over.
-            //
-            // **No crossing pass and no restack.** The cursor did not move, so nothing was
-            // entered or left, and scrolling a window is not a reason to raise it — a wheel
-            // that raised would reorder the screen for a gesture people make without looking.
+            // The wheel goes where the pointer is (the grab holder mid-drag). No crossing pass or
+            // restack: scrolling is no reason to raise a window.
             Logical::Wheel { dz, .. } => {
                 if let Some(window) = self.target(stack) {
                     self.emit_wheel(window, dz, stack, out);
@@ -629,37 +364,23 @@ impl InputRouter {
             }
 
             Logical::Dropped { .. } => {
-                // Buttons are no longer trustworthy — a release may be the event that was
-                // lost, and a grab that outlives its button never ends. `libinput` has
-                // already reset what it accumulated; this is the same reset one layer up.
-                //
-                // A broken grab is cleared here too: `Dropped` says the button state itself is
-                // unknown, so waiting for a release that may never be reported would wedge
-                // input for the life of the process.
+                // Buttons are no longer trustworthy, so the grab and its gestures go too, or input
+                // would wedge.
                 let had = self.grab.take().is_some() || self.grab_broken;
                 self.grab_broken = false;
-                // And the drag derived from it — a window still tracking a pointer with nothing
-                // held is the same phantom this arm exists to clear, one layer up. An outline
-                // left on screen with nothing driving it is the visible version of it.
                 let (r, gone) = self.stop_drag(stack, false);
                 ended = ended.or(r);
                 outline_gone = outline_gone.or(gone);
                 let (r, gone) = self.stop_resize(stack, false);
                 ended = ended.or(r);
                 outline_gone = outline_gone.or(gone);
-                // The payload too: `Logical::Dropped` says the pointer's position is a guess,
-                // and a guess is the last thing to hand another application a file on.
                 let (_, gone) = self.stop_carrying(stack, false);
                 outline_gone = outline_gone.or(gone);
                 if had {
                     self.update_crossing(stack, out);
                 }
-                // **Key beliefs go too.** `Dropped` says the held-key state is unknown, and
-                // `consumed` and `held` are both beliefs about held keys: a swallowed release
-                // would otherwise leave a keycode recorded forever, so the *next* ordinary
-                // press of it is delivered and its release swallowed — a window holding a key
-                // down for the rest of its life, which is the phantom-held-key bug `Dropped`
-                // exists one layer down to prevent (PR #241 review, finding 2).
+                // Key beliefs go too: a stale `consumed` or `held` record would swallow a later
+                // release.
                 self.consumed.clear();
                 self.held.clear();
                 Routed { resized: ended, outline: outline_gone, ..Routed::default() }
@@ -667,15 +388,10 @@ impl InputRouter {
         }
     }
 
-    /// Drop router state that names a window which is gone or no longer on screen.
-    ///
-    /// **Two cases, and they differ in whether the window can be told.** A destroyed window is
-    /// unreachable, so its id is simply forgotten. One that is merely off screen — minimized,
-    /// or on another desktop — is still in the stack, still has a client, and is mid-way
-    /// through an interaction the compositor promised to finish. It is told.
+    /// Drop router state that names a window which is gone or off screen; an off-screen one is
+    /// told.
     fn reconcile_with(&mut self, stack: &WindowStack, out: &mut Vec<Outbound>) {
         let cur = stack.current_desktop();
-        // Borrow-free classification: `emit` takes `&self`, so decide first, then act.
         let state = |id: u32| match stack.window(id) {
             None => Gone,
             Some(w) if !w.visible_on(cur) => OffScreen,
@@ -685,46 +401,24 @@ impl InputRouter {
         if let Some(id) = self.grab
             && !matches!(state(id), OnScreen)
         {
-            // **The grab is why filtering hit-testing alone is not enough.** Every pointer
-            // event up to the matching release goes to the grab holder *without* consulting
-            // `hit`, so minimizing or switching away mid-drag would keep delivering motion and
-            // the release to a window that is not on screen — the "invisible but still
-            // hit-testable" bug, by the one path a hit-test filter cannot see (PR #239 review,
-            // finding 2).
+            // The grab holder gets every event without consulting `hit`, so filtering hit-testing
+            // alone leaves motion going to a hidden window.
             if matches!(state(id), OffScreen) {
-                // **Close the sequence, do not abandon it.** The grab exists so that a press
-                // and its release reach one window even when the cursor leaves it; the window
-                // going off screen ends the grab, and the release is the last thing the
-                // compositor owes it. Without this the client is left holding a pointer
-                // capture that only a release clears — in `libui`, `capture` survives, and the
-                // next press after the window comes back routes to the stale widget rather
-                // than the one clicked (PR #240 review, blocking 1b).
-                //
-                // This is not "input to an off-screen window": it is the tail of a sequence
-                // granted while it was on screen, which is the same reason a grab delivers
-                // outside the window's own bounds.
+                // Close the sequence: the release is owed, else the client keeps a pointer capture.
+                // It is the tail of a sequence granted on screen.
                 self.emit(id, POINTER_BUTTON, self.grab_button, 0, stack, out);
             }
             self.grab = None;
-            // **Unconditionally, not `self.buttons != 0`.** The mirror above has already
-            // absorbed the provoking event, so when that event *is* the release the mask reads
-            // zero and a condition on it would leave the flag clear — letting `target` fall
-            // through to `hit` and deliver this very release to the window underneath, which
-            // is the case this flag exists for. A grab existing at all means a button was
-            // down; the sequence is broken either way. The last-button-up branch below clears
-            // it in the same event when the release is what provoked this.
+            // Unconditionally: the mirror has absorbed the provoking event, so a condition on
+            // `buttons` would let a release reach the window underneath.
             self.grab_broken = true;
         }
 
         if let Some(id) = self.inside {
             match state(id) {
                 OnScreen => {}
-                // **The leave is emitted before the id is forgotten**, which is the whole of
-                // the ordering. The first version cleared `inside` and then called
-                // `update_crossing`, which derives the leave *from* `inside` — so the router
-                // had already forgotten who was owed one and emitted only the enter. A client
-                // whose window is minimized under the cursor kept its hover state forever,
-                // because nothing else would tell it (PR #240 review, blocking 1a).
+                // The leave goes out before the id is forgotten: `update_crossing` derives it from
+                // `inside`.
                 OffScreen => {
                     self.emit(id, POINTER_LEAVE, 0, 0, stack, out);
                     self.inside = None;
@@ -734,13 +428,10 @@ impl InputRouter {
         }
     }
 
-    /// Move the cursor by a delta, clamped to the screen.
     fn move_by(&mut self, dx: i32, dy: i32) {
-        // Saturating, because a mouse held against the edge accumulates deltas forever and
-        // `i32::MIN` would wrap the clamp below into placing the cursor at the far edge.
+        // Saturating: a mouse held against the edge accumulates forever, and `i32::MIN` would wrap.
         let x = self.pointer.x.saturating_add(dx);
         let y = self.pointer.y.saturating_add(dy);
-        // `right()`/`bottom()` are exclusive, so the last addressable pixel is one less.
         self.pointer = Point::new(
             x.clamp(self.screen.left(), self.screen.right() as i32 - 1),
             y.clamp(self.screen.top(), self.screen.bottom() as i32 - 1),
@@ -749,32 +440,10 @@ impl InputRouter {
 
     /// Begin an interactive move of `window` on the client's behalf — `Surface::StartMove`.
     ///
-    /// **The grab is the authority.** The request is refused unless the caller's window is the
-    /// one holding the implicit pointer grab, which is what makes "the user is dragging me"
-    /// true: without the check a client could move its window at any time, from anywhere, with
-    /// nobody touching it — a `Place` for itself by another name, and `Place` is deliberately a
-    /// manager op.
-    ///
-    /// **Refused while a resize or a drag-and-drop is running** — one grab carries one gesture.
-    /// The resize half of that rule was enforced in one direction only until the M9 Part E
-    /// review found it; the drag half was missing in *both* directions until a Part E test
-    /// asked, which would have let a window follow the pointer while a payload was in flight
-    /// out of it and made the release mean two things at once. Both gestures would
-    /// run: the window would follow the pointer *and* the outline would follow the pointer,
-    /// and the release would hand the shell a rectangle built from the window's origin at the
-    /// *resize* press — an origin the move has since changed. The window jumps back by
-    /// however far it was dragged, and the compositor's own move record and the `ResizeEnded`
-    /// disagree about the origin in the same release. That is precisely the "two paths to a
-    /// window's geometry that can disagree" this part exists to prevent, arriving through the
-    /// one door left open. A client is not required to have good manners; the grab is the
-    /// compositor's trust boundary.
-    ///
-    /// A second `StartMove` while one is running **changes nothing** and reports the same
-    /// success. It cannot be treated as a fresh request: `from` is the press, which has not
-    /// moved, but the window's origin has — so rebuilding the drag from where the window is
-    /// *now* applies the distance already travelled a second time, and the window jumps by it.
-    /// One gesture holds one grab and is one drag; the second request names the drag that is
-    /// already running (PR #248 review, blocking 1).
+    /// The grab is the authority: refused unless `window` holds it, else a client could move itself
+    /// unprompted (`Place` is a manager op). Refused while a resize or drag-and-drop runs: one grab
+    /// carries one gesture. A second call changes nothing, as rebuilding from the current origin
+    /// would apply the travel twice.
     ///
     /// Returns the region the catch-up disturbed, which the caller must repaint.
     pub fn start_move(&mut self, window: u32, stack: &mut WindowStack) -> Result<Option<Rect>, StackError> {
@@ -787,34 +456,15 @@ impl InputRouter {
         let origin = stack.window(window).ok_or(StackError::NoSuchWindow)?.origin;
         stack.begin_drag(window)?;
         self.drag = Some(Drag { window, from: self.grab_at, origin });
-        // **Applied at once, not at the next motion.** The pointer has already moved by the time
-        // this request arrives — that round trip is the reason the press position is recorded at
-        // all — so a drag that waited for the next event would leave the window trailing until
-        // one happened, and would never move it at all for a press-and-drag that ended in the
-        // meantime. **And its damage is returned rather than dropped**: `Logical::Button` reports
-        // no movement, so a press-flick-release with no motion event in between left the window
-        // painted where it used to be until something unrelated repainted (PR #248 review,
-        // finding 3).
+        // Applied at once: the pointer moved during the round trip. Its damage is returned.
         Ok(self.drag_to_pointer(stack))
     }
 
     /// Begin an interactive resize of `window` on the client's behalf — `Surface::StartResize`.
     ///
-    /// **The grab is the authority**, exactly as it is for [`start_move`](Self::start_move): a
-    /// client that could resize itself at any time from anywhere would be sending itself a
-    /// `Configure`, and `Configure` is deliberately a manager op.
-    ///
-    /// **Nothing about the window changes.** The window keeps its rectangle for the whole
-    /// gesture; what moves is an outline the compositor draws over the composed stack, and the
-    /// manager hears one `DragEnded` when the button comes up. The stack is marked as being
-    /// dragged all the same, so a `Place` landing mid-gesture is refused rather than fighting
-    /// the pointer — the same reason a move refuses it.
-    ///
-    /// A second `StartResize` while one is running changes nothing and reports success, for the
-    /// reason a second `StartMove` does: one gesture holds one grab and is one drag, and
-    /// rebuilding from where things are *now* would apply the distance already travelled twice.
-    /// A `StartResize` while a *move* is running is refused: they are two gestures and there is
-    /// one grab.
+    /// The grab is the authority, as for [`start_move`](Self::start_move). The window keeps its
+    /// rectangle while an outline moves; the stack is marked dragged so a mid-gesture `Place` is
+    /// refused. A second call changes nothing; one during a move is refused.
     ///
     /// Returns the outline's first rectangle, which the caller must draw.
     pub fn start_resize(
@@ -835,30 +485,16 @@ impl InputRouter {
         let rect = stack.window(window).ok_or(StackError::NoSuchWindow)?.bounds();
         stack.begin_drag(window)?;
         self.resize = Some(Resize { window, from: self.grab_at, rect, edges });
-        // Drawn at once rather than at the next motion, for the reason a move is applied at
-        // once: the pointer has already travelled during the round trip that brought this
-        // request, and a press-flick-release with no motion event in between would otherwise
-        // show no outline at all and end at the rectangle it started from.
         self.outline = Some(self.outline_now());
         Ok(self.outline)
     }
 
     /// Begin a drag-and-drop gesture out of `window` — `Surface::StartDrag`.
     ///
-    /// **The grab is the authority**, exactly as it is for [`start_move`](Self::start_move) and
-    /// [`start_resize`](Self::start_resize), and for a reason that is sharper here: a drag is an
-    /// *offer of a payload* to whatever window it ends over. A client that could start one with
-    /// nobody touching it could push a path into another application's window at any moment.
+    /// The grab is the authority, sharper here: a drag offers a payload to whatever window it ends
+    /// over. Refused while a move or resize runs; a second call replaces the payload.
     ///
-    /// **Refused while a move or a resize is running**, and they refuse while this is — one grab
-    /// carries one gesture. A second `StartDrag` while one is running replaces the payload
-    /// rather than being refused: the gesture is the same gesture, and a client that decided
-    /// what it was dragging a moment later than it decided *that* it was dragging is not doing
-    /// anything wrong.
-    ///
-    /// Returns the highlight to draw, if the pointer already stands over a window that takes it
-    /// — for the reason a move applies its first step at once: the pointer has travelled during
-    /// the round trip that brought this request.
+    /// Returns the highlight to draw, if the pointer already stands over a window that takes it.
     pub fn start_drag(
         &mut self,
         window: u32,
@@ -879,22 +515,16 @@ impl InputRouter {
         Ok(self.highlight_target(stack))
     }
 
-    /// Whether a drag is in flight — for a caller deciding what a release means.
+    /// Whether a drag is in flight, for a caller deciding what a release means.
     pub fn is_dragging_payload(&self) -> bool {
         self.carrying.is_some()
     }
 
-    /// Move the highlight to whatever window would take the drag now.
-    ///
-    /// **The topmost window under the pointer, and only if it takes this kind** — not the
-    /// topmost *acceptor*. A window that does not take the payload is still a window: a drag
-    /// passing over it must not highlight something behind it, because letting go there drops on
-    /// nothing, and a highlight that lies about where a payload will land is worse than none.
+    /// Move the highlight to whatever window would take the drag now: the topmost under the
+    /// pointer, and only if it takes this kind, so it never lies about where a payload lands.
     fn highlight_target(&mut self, stack: &WindowStack) -> Option<Outline> {
         let Some(c) = &self.carrying else { return None };
-        // **The source window is skipped.** A drag out of a window that also accepts drops would
-        // otherwise highlight itself the instant it began, which is a gesture nobody is making —
-        // and dropping a thing back where it came from is the definition of a no-op.
+        // The source window is skipped, or a drag would highlight its own origin.
         let found = self.hit(stack).filter(|&w| w != c.window).filter(|&w| stack.acceptor_for(w, c.kind).is_some());
         if found == self.over {
             return None;
@@ -905,15 +535,9 @@ impl InputRouter {
         Some(Outline { was, now: self.outline })
     }
 
-    /// End a drag-and-drop gesture, if one is running.
-    ///
-    /// **The drop is reported only if `finished`**, which is the same rule a resize follows and
-    /// for the same reason: a gesture whose grab was taken away, or whose input stream reported
-    /// a loss, is not somebody letting go. Here the stakes are plainer than a rectangle — a drop
-    /// hands a payload to another application, and one delivered because the pointer's position
-    /// was a guess is a file opened by a window nobody dropped it on.
-    ///
-    /// Returns the event to deliver (if any) and the highlight to take down.
+    /// End a drag-and-drop gesture, if one is running. The drop is reported only if `finished`: a
+    /// lost grab or guessed position is not somebody letting go. Returns the event to deliver and
+    /// the highlight to take down.
     fn stop_carrying(&mut self, stack: &WindowStack, finished: bool) -> (Option<Outbound>, Option<Outline>) {
         let Some(c) = self.carrying.take() else { return (None, None) };
         let target = self.over.take();
@@ -921,8 +545,7 @@ impl InputRouter {
         let event = finished
             .then_some(target)
             .flatten()
-            // Re-read here rather than trusted: the window may have gone between the last
-            // motion and this release, and `acceptor_for` is what says it still takes this.
+            // Re-read: the window may have gone since the last motion.
             .and_then(|w| {
                 let acceptor = stack.acceptor_for(w, c.kind)?;
                 let rect = stack.window(w)?.bounds();
@@ -932,8 +555,6 @@ impl InputRouter {
                     kind: c.kind,
                     path: c.path.clone(),
                     name: c.name.clone(),
-                    // **Window-local, like a `PointerEvent`'s**, which is what lets the client
-                    // route it to a widget without the protocol knowing about regions.
                     x: self.pointer.x - rect.origin.x,
                     y: self.pointer.y - rect.origin.y,
                 })
@@ -941,12 +562,8 @@ impl InputRouter {
         (event, gone)
     }
 
-    /// The rectangle the outline should occupy for the pointer's current position.
-    ///
-    /// Every edge in the mask moves by the pointer's travel since the press; the opposite edge
-    /// stays where it was. Each is clamped so the rectangle keeps at least [`MIN_RESIZE`] in
-    /// each axis — a dragged edge that crossed its opposite would otherwise invert the
-    /// rectangle, which is a shape no repaint can describe.
+    /// The rectangle the outline should occupy for the pointer's position, each axis at least
+    /// [`MIN_RESIZE`] so a crossed edge cannot invert it.
     fn outline_now(&self) -> Rect {
         let Some(r) = self.resize else { return Rect::new(0, 0, 0, 0) };
         let (dx, dy) = (self.pointer.x - r.from.x, self.pointer.y - r.from.y);
@@ -969,14 +586,11 @@ impl InputRouter {
         if r.edges & RESIZE_BOTTOM != 0 {
             h = (h + dy as i64).max(min);
         }
-        // **Clamped per edge, not per rectangle.** The floor belongs to the axes the gesture is
-        // actually dragging; running it over both makes a window narrower than `MIN_RESIZE`,
-        // resized by its bottom edge alone, report a rectangle wider than it was — a
-        // `Configure` widening an axis the user never touched (PR #253 review, optional 8).
+        // Clamped per edge: the floor belongs to the axes being dragged, or a window narrower than
+        // `MIN_RESIZE` resized by its bottom edge would widen.
         Rect::new(x, y, w.max(0) as u32, h.max(0) as u32)
     }
 
-    /// Move the outline to follow the pointer, reporting where it was and where it is.
     fn outline_to_pointer(&mut self) -> Option<Outline> {
         self.resize?;
         let was = self.outline;
@@ -988,16 +602,10 @@ impl InputRouter {
         Some(Outline { was, now: Some(now) })
     }
 
-    /// Show, or stop showing, the snap target under the pointer during a move.
-    ///
-    /// **Only during a move**, because that is the gesture a zone answers: a resize already has
-    /// an outline of its own, and a pointer wandering over a zone with no drag in flight is a
-    /// pointer wandering. `None` when nothing changed, so a drag across the middle of the screen
-    /// costs one table lookup per motion and no damage at all.
+    /// Show, or stop showing, the snap target under the pointer during a move; `None` if unchanged.
     fn preview_zone(&mut self) -> Option<Outline> {
         if self.drag.is_none() {
-            // A gesture that is not a move shows no preview — and anything left over from one
-            // goes, which is what makes a drag ending outside a zone take its outline down.
+            // Not a move shows no preview, and anything left over from one goes.
             return self.leave_zone();
         }
         let found = self.zone_at(self.pointer);
@@ -1014,7 +622,6 @@ impl InputRouter {
         }
     }
 
-    /// Take down a snap preview, if one is showing.
     fn leave_zone(&mut self) -> Option<Outline> {
         self.in_zone.take()?;
         let was = self.outline.take();
@@ -1023,82 +630,46 @@ impl InputRouter {
 
     /// End an interactive resize, if one is running. Reports a rectangle only if `finished`.
     ///
-    /// **Called wherever the grab ends**, like [`stop_drag`](Self::stop_drag) and for the same
-    /// reason: a gesture is a belief derived from the grab, and one that outlives it leaves an
-    /// outline on the screen with nothing driving it.
-    ///
-    /// **`finished` is true only for the button coming up**, and that distinction is where a
-    /// resize stops being modelled on a move. A move has *applied* every step as it went, so
-    /// ending it however it ends merely stops something already on screen. A resize has applied
-    /// nothing — so reporting *initiates* a change, and initiating one from a gesture the user
-    /// has not finished is a window jumping to a half-chosen size while they are still holding
-    /// the button. `Logical::Dropped` is the clearest case: it means events were lost upstream
-    /// and the pointer position is a guess, which is exactly the state not to derive a new
-    /// window rectangle from (PR #253 review, finding 5).
+    /// Called wherever the grab ends, like [`stop_drag`](Self::stop_drag). `finished` is true only
+    /// for the button coming up: a resize has applied nothing, so reporting from a guessed position
+    /// (`Dropped`) would jump the window to a half-chosen size.
     fn stop_resize(&mut self, stack: &mut WindowStack, finished: bool) -> (Option<(u32, Rect)>, Option<Outline>) {
-        // **Read before the state is taken**, because that is what it is derived from.
         let Some(r) = self.resize else { return (None, None) };
         let final_rect = self.outline_now();
         self.resize = None;
         stack.end_drag();
         let gone = self.outline.take().map(|was| Outline { was: Some(was), now: None });
-        // **Three things have to be true to ask the shell for anything.**
-        //
-        // The gesture was *finished* — the button came up — rather than ended by something
-        // else; see this function's own doc for why that is the whole difference from a move.
-        //
-        // The window is still on screen. A client that exits mid-gesture is ordinary and there
-        // is nobody to configure; a window *put away* mid-gesture is a gesture the user
-        // interrupted, and resizing a window somebody just put away to a rectangle they were
-        // half-way through choosing is not what they asked for.
-        //
-        // And the rectangle actually changed. A gesture that ended where it started is an
-        // ordinary click on the grip: the manager's queue does not coalesce, and a `Configure`
-        // to the size a window already has is a round trip through the client for no change.
+        // A request needs the gesture finished, the window on screen, and the rectangle changed.
         let on_screen = stack.window(r.window).is_some_and(|w| w.visible_on(stack.current_desktop()));
         let rect = (finished && final_rect != r.rect && on_screen).then_some((r.window, final_rect));
         (rect, gone)
     }
 
-    /// End an interactive move, if one is running.
-    ///
-    /// **Called wherever the grab ends, not only where a button comes up.** A drag is a belief
-    /// derived from the grab — `Logical::Dropped` says the button state is unknown, and
-    /// `reconcile_with` breaks a grab whose window left the screen — and a belief that outlives
-    /// what it was derived from is the defect those two arms already exist to prevent. Left
-    /// behind, the window went on following a pointer with nothing held, and every `Place`
-    /// naming it was refused until the next click (PR #248 review, blocking 2).
+    /// End an interactive move, if one is running, wherever the grab ends: a drag outliving it kept
+    /// following a pointer with nothing held.
     fn stop_drag(&mut self, stack: &mut WindowStack, finished: bool) -> (Option<(u32, Rect)>, Option<Outline>) {
         let Some(d) = self.drag.take() else { return (None, None) };
         stack.end_drag();
-        // **The zone the drag ended in, if it ended in one and the user ended it** (M9 Part F).
-        // Read from `in_zone` rather than re-tested here, so the rectangle asked for is the one
-        // whose outline the user was looking at — two tests of the same pointer are two chances
-        // to disagree. `finished` is the same gate a resize has, for the same reason: a drag
-        // whose grab was taken away, or whose input stream reported a loss, is not a drop.
+        // The zone it ended in, read from `in_zone` so the rectangle asked for is the one shown.
         let asked = self
             .in_zone
             .filter(|_| finished)
             .and_then(|id| self.zones.iter().find(|z| z.id == id))
-            // A second line rather than the first: `reconcile_with` has already broken the grab
-            // of a window that has gone, so no path through `route` reaches this with `finished`
-            // true. Pinned directly by `a_gesture_whose_window_has_gone_asks_for_nothing…`.
+            // A second line behind `reconcile_with`; pinned by
+            // `a_gesture_whose_window_has_gone_asks_for_nothing…`.
             .filter(|_| stack.window(d.window).is_some())
             .map(|z| (d.window, Rect::new(z.target_x, z.target_y, z.target_w, z.target_h)));
         (asked, self.leave_zone())
     }
 
     /// Move the dragged window so it keeps the same point under the pointer.
-    ///
-    /// `None` when no drag is in flight, or when the window has gone — a client that exits with
-    /// the button still down is ordinary, not an error.
     fn drag_to_pointer(&mut self, stack: &mut WindowStack) -> Option<Rect> {
         let d = self.drag?;
         let origin = Point::new(d.origin.x + (self.pointer.x - d.from.x), d.origin.y + (self.pointer.y - d.from.y));
         match stack.drag_to(d.window, origin) {
             Ok(damage) => Some(damage.rect()),
             Err(_) => {
-                // The window has gone; there is nobody to snap and nothing to report.
+                // The window has gone; there is nobody to snap.
                 let _ = self.stop_drag(stack, false);
                 None
             }
@@ -1107,9 +678,8 @@ impl InputRouter {
 
     /// Register a chord, to be delivered to the manager instead of the focused window.
     ///
-    /// `Err` if `id` is zero, already registered, or the table is full — never a silent
-    /// replacement, because a manager that registered two chords under one id would be told
-    /// nothing and then wonder why one of them never fires.
+    /// `Err` for a zero or duplicate id, a duplicate chord, or a full table — never a silent
+    /// replacement.
     pub fn register_hotkey(&mut self, hk: MgrHotkey) -> Result<(), HotkeyError> {
         if hk.id == 0 {
             return Err(HotkeyError::ZeroId);
@@ -1117,10 +687,8 @@ impl InputRouter {
         if self.hotkeys.iter().any(|h| h.id == hk.id) {
             return Err(HotkeyError::DuplicateId);
         }
-        // **And a duplicate *chord*, for the reason a duplicate id is refused.** `find` returns
-        // the first match, so a second registration of the same `mods`+`code` would be
-        // permanently silent — the manager told nothing, then wondering why one of them never
-        // fires. That argument does not care which field collides (PR #241 review, finding 7).
+        // A duplicate chord is refused too: `find` returns the first match, so a second would be
+        // silent.
         if self.hotkeys.iter().any(|h| h.mods == hk.mods && h.code == hk.code) {
             return Err(HotkeyError::DuplicateChord);
         }
@@ -1133,28 +701,16 @@ impl InputRouter {
 
     /// Register a snap zone, **replacing** any zone already under that id.
     ///
-    /// `Err` if `id` is zero — reserved so a zeroed body registers nothing — or if the table is
-    /// full and this is a new id. `Ok(Some(_))` when this replaced the zone a drag is currently
-    /// previewing, which the caller must repaint.
-    ///
-    /// **Replacing rather than refusing** is the difference between this table and the chord
-    /// table beside it, and it follows from what each one is. A chord table is a set of distinct
-    /// chords, so a duplicate id is a manager confusing itself. A zone table is a *layout*,
-    /// recomputed wholesale whenever the work area changes — a shell re-registering its eight
-    /// ids with new rectangles is doing the ordinary thing, and a refusal would leave it holding
-    /// zones for a screen that has changed shape with no way to say so.
+    /// `Err` if `id` is zero or the table is full and this is a new id. `Ok(Some(_))` when this
+    /// replaced the zone a drag is previewing, which the caller must repaint. Replacing, unlike
+    /// chords: a shell recomputes the whole layout when the work area changes.
     pub fn register_zone(&mut self, z: MgrSnapZone) -> Result<Option<Outline>, HotkeyError> {
         if z.id == 0 {
             return Err(HotkeyError::ZeroId);
         }
         if let Some(existing) = self.zones.iter_mut().find(|e| e.id == z.id) {
             *existing = z;
-            // **A preview of the zone just replaced follows it.** A shell re-registers on
-            // `LayoutChanged`, which can arrive mid-drag — a panel appearing while a window is
-            // being dragged — and leaving the old rectangle on screen would break the one
-            // promise `stop_drag` makes: that what is asked for is what the user was looking at.
-            // Re-previewed rather than re-tested, so the two cannot come apart (PR #254 review,
-            // optional 5).
+            // A preview of the zone just replaced follows it: `LayoutChanged` can arrive mid-drag.
             if self.in_zone == Some(z.id) {
                 let was = self.outline;
                 self.outline = Some(Rect::new(z.target_x, z.target_y, z.target_w, z.target_h));
@@ -1169,26 +725,14 @@ impl InputRouter {
         Ok(None)
     }
 
-    /// Forget every snap zone — the manager that registered them has gone.
-    ///
-    /// **Returns the preview it took down**, and the caller must repaint it. Clearing the table
-    /// while a preview is showing is the one path that disturbs the outline without going
-    /// through `stop_drag`: every other way of taking it down is gated on `in_zone`, so an
-    /// outline left behind here is never reported to anybody and is redrawn by every later
-    /// compose for the life of the process. That is reachable by the compositor's *designed*
-    /// manager-death path — a shell exiting while the user is mid-drag over a zone — and it is
-    /// the same phantom two other comments in this file already name (PR #254 review,
-    /// blocking 1).
+    /// Forget every snap zone — the manager has gone. Returns the preview it took down, which the
+    /// caller must repaint.
     pub fn clear_zones(&mut self) -> Option<Outline> {
         self.zones.clear();
         self.leave_zone()
     }
 
-    /// The zone whose trigger region contains `at`, if any.
-    ///
-    /// **First match wins**, and overlapping triggers are the manager's business: it wrote the
-    /// table, and a compositor arbitrating between two of its rectangles would be making the
-    /// policy this design keeps out of here.
+    /// The zone whose trigger region contains `at`; first match wins.
     fn zone_at(&self, at: Point) -> Option<MgrSnapZone> {
         self.zones
             .iter()
@@ -1201,28 +745,21 @@ impl InputRouter {
         core::mem::take(&mut self.fired)
     }
 
-    /// Consume a key transition if it belongs to a registered chord.
-    ///
-    /// Returns `true` when the key must **not** reach the focused window. A press matches on
-    /// `mods` **exactly** — a prefix match would make `Super+Shift+2` fire `Super+2` as well —
-    /// and its release is swallowed by keycode, whatever the modifiers say by then.
+    /// Consume a key transition if it belongs to a registered chord; `true` when it must not reach
+    /// the focused window. A press matches `mods` exactly, and its release is swallowed by keycode.
     fn take_as_hotkey(&mut self, keycode: u16, pressed: bool, modifiers: u16) -> bool {
         if !pressed {
-            // The release half. Removing the record here is what stops one press from
-            // swallowing every later release of the same key.
+            // Removing the record stops one press swallowing every later release of the key.
             if let Some(i) = self.consumed.iter().position(|&k| k == keycode) {
                 self.consumed.swap_remove(i);
                 return true;
             }
-            // A key this router delivered is no longer held; its release is delivered too.
             if let Some(i) = self.held.iter().position(|&k| k == keycode) {
                 self.held.swap_remove(i);
             }
             return false;
         }
-        // **A key already down cannot begin a chord.** Its press was delivered, so its release
-        // must be too — and a repeat arriving after a modifier went down would otherwise match
-        // and swallow it. A chord fires on the transition *into* the chord.
+        // A key already down cannot begin a chord: its release must be delivered too.
         if self.held.contains(&keycode) {
             return false;
         }
@@ -1233,26 +770,17 @@ impl InputRouter {
             return false;
         };
         self.fired.push(*hk);
-        // Guarded against a repeat: an auto-repeating press would otherwise push the same
-        // keycode again and again, and only the first release would be swallowed.
+        // Guarded against a repeat, or only the first release would be swallowed.
         if !self.consumed.contains(&keycode) {
             self.consumed.push(keycode);
         }
         true
     }
 
-    /// Forget every chord a manager registered.
-    ///
-    /// **Called when the manager channel closes.** Without it the table outlives its owner:
-    /// every registered chord keeps being consumed and delivered to nobody, so the key silently
-    /// reaches nothing for the life of the compositor — and a replacement manager inherits the
-    /// dead one's ids, so re-registering its own returns `DuplicateId` (PR #241 review,
-    /// finding 3). The same reasoning `close_manager` already applies to its queued events:
-    /// they describe a world the departed manager asked about.
+    /// Forget every chord a manager registered, when its channel closes: they would be consumed and
+    /// delivered to nobody.
     pub fn clear_hotkeys(&mut self) {
         self.hotkeys.clear();
-        // Anything mid-chord loses its owner with the table. Leaving `consumed` populated
-        // would swallow releases for presses nothing will ever act on.
         self.consumed.clear();
     }
 
@@ -1262,24 +790,16 @@ impl InputRouter {
             .windows()
             .iter()
             .rev()
-            // **Only what is on screen can be clicked.** An unconfigured window still occupies
-            // its rectangle in the stack — at the default origin, at its requested size — so
-            // without this a click anywhere inside it lands on a window the compositor has
-            // decided not to draw, in front of the visible one underneath (PR #218 review,
-            // finding 3). Since M8 Part A the same is true of a minimized window and of one on
-            // another desktop, and all three clauses are `visible_on` so that this and
-            // `compose_into` cannot answer differently.
+            // Only what is on screen can be clicked; `visible_on` is shared with `compose_into`.
             .find(|w| w.visible_on(stack.current_desktop()) && w.bounds().contains(self.pointer.x, self.pointer.y))
             .map(|w| w.id)
     }
 
-    /// Who a pointer event goes to: the grab holder if there is one, else what is under the
-    /// cursor.
+    /// Who a pointer event goes to: the grab holder, else what is under the cursor.
     fn target(&self, stack: &WindowStack) -> Option<u32> {
         if self.grab_broken {
-            // The sequence still running belonged to a window that can no longer receive it.
-            // `hit` would hand its tail to whoever is underneath — a release for a press that
-            // window never saw.
+            // The sequence belonged to a window that can no longer receive it; `hit` would hand its
+            // tail on.
             return None;
         }
         self.grab.or_else(|| self.hit(stack))
@@ -1288,13 +808,8 @@ impl InputRouter {
     /// Emit leave/enter if the cursor changed windows. A no-op while grabbed.
     fn update_crossing(&mut self, stack: &WindowStack, out: &mut Vec<Outbound>) {
         if self.grab.is_some() || self.grab_broken {
-            // Crossings during a drag would tell a window the cursor left while it is still
-            // receiving that cursor's events — two contradictory statements at once.
-            //
-            // **A broken grab counts as a drag for this purpose**, because from the user's
-            // side it is one: a button is still down. Resuming crossings the moment the grab
-            // is taken away would walk enters and leaves across every window the cursor
-            // crosses on the way to the release, none of which can receive the release.
+            // Crossings during a drag would contradict what the grab holder receives; a broken grab
+            // counts.
             return;
         }
         let now = self.hit(stack);
@@ -1310,23 +825,14 @@ impl InputRouter {
         }
     }
 
-    /// Build one pointer record with the cursor in `window`'s coordinates.
     fn emit(&self, window: u32, kind: u16, button: u16, flags: u16, stack: &WindowStack, out: &mut Vec<Outbound>) {
         if let Some(event) = self.record(window, kind, button, flags, stack) {
             out.push(Outbound::Pointer { event });
         }
     }
 
-    /// Emit a `POINTER_WHEEL` record carrying `dz` detents.
-    ///
-    /// Built from the same [`record`](Self::record) as every other kind, so the window-local
-    /// coordinates a client scrolls *at* cannot come from a second piece of arithmetic.
-    ///
-    /// **Saturating into `i16`.** The wire field is 16 bits and the accumulator is 32: a
-    /// consumer that stopped reading has its deltas summed and carried forward by
-    /// `input-server`, so an arbitrarily long stall is an arbitrarily large number. Saturating
-    /// scrolls a very long way, which is what the person did; wrapping would scroll the other
-    /// way.
+    /// Emit a `POINTER_WHEEL` record carrying `dz` detents, saturating into the wire's `i16`:
+    /// wrapping would scroll the other way.
     fn emit_wheel(&self, window: u32, dz: i32, stack: &WindowStack, out: &mut Vec<Outbound>) {
         if let Some(event) = self.record(window, POINTER_WHEEL, 0, 0, stack) {
             let dz = dz.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
@@ -1334,7 +840,6 @@ impl InputRouter {
         }
     }
 
-    /// One pointer record for `window`, or `None` if the window is not in the stack.
     fn record(&self, window: u32, kind: u16, button: u16, flags: u16, stack: &WindowStack) -> Option<PointerEvent> {
         let w = stack.window(window)?;
         let origin = w.bounds().origin;
@@ -1345,15 +850,11 @@ impl InputRouter {
             self.buttons,
             flags,
             self.modifiers,
-            // Signed and unclamped: under a grab the cursor is routinely outside the
-            // window, and reporting a clamped edge position would make a drag look like it
-            // stopped at the border.
+            // Signed and unclamped: under a grab the cursor is outside the window.
             self.pointer.x.saturating_sub(origin.x),
             self.pointer.y.saturating_sub(origin.y),
-            // **The interrupt's time, divided once.** A client reading its own clock instead
-            // measures when *it* got round to the event, which is a different number whenever
-            // anything queued in between — the error the `press-time` deferral recorded, paid off in
-            // M14 Part I.
+            // The interrupt's time, divided once; a client's own clock measures when it got round
+            // to it.
             self.time_ns / 1_000_000,
         ))
     }
@@ -1370,17 +871,10 @@ mod tests {
     const SCREEN: Rect = Rect::new(0, 0, 640, 480);
     const BTN_LEFT: u16 = 0x110;
 
-    /// A window at `(x, y)` of `w × h`, committed **and configured** — a window that is on
-    /// screen, which is the only kind routing has anything to say about.
-    ///
-    /// Configured because since B4 neither hit-testing nor focus considers a window that is
-    /// not: a held window occupies its rectangle in the stack but is not drawn, and routing a
-    /// click or a keystroke to it would send input somewhere nobody can see.
+    /// A window at `(x, y)` of `w × h`, committed and configured: routing ignores any other.
     fn win(stack: &mut WindowStack, role: Role, x: i32, y: i32, w: u32, h: u32) -> u32 {
         let id = stack.create(&CreateWindowRequest::new(w, h, role)).expect("create");
         stack.mark_configured(id);
-        // Damage ignored: this helper positions a window for a routing test, and nothing
-        // in these tests paints.
         let _ = stack.place(id, Point::new(x, y)).expect("origin");
         stack
             .attach(&AttachBufferRequest {
@@ -1398,34 +892,25 @@ mod tests {
         id
     }
 
-    /// Route one event and return what came out.
     fn go(r: &mut InputRouter, s: &mut WindowStack, ev: Logical) -> Vec<Outbound> {
         let mut out = Vec::new();
         r.route(&ev, s, &mut out);
         out
     }
 
-    /// Put the cursor at an absolute screen position, discarding what that produced.
     fn warp(r: &mut InputRouter, s: &mut WindowStack, x: i32, y: i32) {
         let p = r.pointer();
         go(r, s, motion(x - p.x, y - p.y));
     }
 
-    /// The interrupt time every helper below stamps, in nanoseconds.
-    ///
-    /// Chosen so its milliseconds are not zero and not round: a record stamped from
-    /// somewhere other than the event carries a visibly different number rather than one
-    /// that could be either.
+    /// The interrupt time every helper stamps; its milliseconds are neither zero nor round.
     const T: u64 = 7_123_456_789;
-    /// What `T` becomes on the wire.
     const T_MS: u64 = T / 1_000_000;
 
-    /// Motion with nothing held.
     fn motion(dx: i32, dy: i32) -> Logical {
         Logical::Motion { dx, dy, buttons: 0, modifiers: 0, time_ns: T }
     }
 
-    /// Motion with the left button held — what `libinput` emits mid-drag.
     fn drag(dx: i32, dy: i32) -> Logical {
         Logical::Motion { dx, dy, buttons: 1, modifiers: 0, time_ns: T }
     }
@@ -1434,27 +919,20 @@ mod tests {
         Logical::Key { keycode, pressed, modifiers: 0, locks: librsproto::surface::LOCK_NUM, time_ns: T }
     }
 
-    /// A key transition with modifiers held — what a chord looks like on the wire. **With Num Lock
-    /// on**, as every key is from boot (Phase 6 Part B.5): a chord matches on modifiers alone.
+    /// A key transition with modifiers held, Num Lock on as from boot: a chord ignores locks.
     fn chord(keycode: u16, pressed: bool, modifiers: u16) -> Logical {
         Logical::Key { keycode, pressed, modifiers, locks: librsproto::surface::LOCK_NUM, time_ns: T }
     }
 
-    /// The "Super" key is `MOD_SUPER` on the wire — the name the modifier bitmask uses.
     const MOD_SUPER: u16 = librsproto::surface::MOD_META;
-    /// `2` in the keycode table `libkern::abi` mirrors.
     const KEY_2: u16 = 3;
 
-    // ---- drag and drop (M10 Part E) ----
-
-    /// Two windows side by side: a source at the left and a target at the right.
     fn two_windows(s: &mut WindowStack) -> (u32, u32) {
         let src = win(s, Role::Normal, 0, 0, 200, 200);
         let dst = win(s, Role::Normal, 400, 0, 200, 200);
         (src, dst)
     }
 
-    /// Press inside `src`, ask to carry `kind`, and drag to `(x, y)`.
     fn begin_drag(r: &mut InputRouter, s: &mut WindowStack, src: u32, kind: u32, to: (i32, i32)) -> Option<Outline> {
         warp(r, s, 20, 20);
         go(r, s, button(true));
@@ -1464,7 +942,6 @@ mod tests {
         started
     }
 
-    /// The drop record a release produced, if any.
     fn drop_of(out: &[Outbound]) -> Option<&Outbound> {
         out.iter().find(|o| matches!(o, Outbound::Dropped { .. }))
     }
@@ -1488,17 +965,12 @@ mod tests {
             (acceptor.as_str(), kind, path.as_str(), name.as_str()),
             ("document", &DROP_KIND_FILE, "/home/a.txt", "a.txt")
         );
-        // **Window-local, like a press's**, which is what lets the client route it to a widget.
         assert_eq!((*x, *y), (50, 60), "the pointer, relative to the window it landed on");
         assert_eq!(r.outline(), None, "and the highlight goes with the gesture");
     }
 
     #[test]
     fn a_window_that_does_not_take_this_kind_is_neither_highlighted_nor_dropped_on() {
-        // **The first of Part E's two controls.** An editor that declares `file` must be inert
-        // for a folder: a mechanism that highlighted everything would pass the positive test
-        // above on its own, and the person dragging would be told a drop was possible where it
-        // is not.
         let mut s = WindowStack::new();
         let (src, dst) = two_windows(&mut s);
         s.declare_acceptor(dst, "document", DROP_KIND_FILE).unwrap();
@@ -1513,9 +985,7 @@ mod tests {
 
     #[test]
     fn a_window_with_no_acceptor_is_neither_highlighted_nor_dropped_on() {
-        // **The second control**, and the one that says the table is consulted at all: a window
-        // that never declared anything must be exactly as inert as one that declared the wrong
-        // kind — otherwise "declares nothing" would mean "takes everything".
+        // A window that declared nothing is as inert as one that declared the wrong kind.
         let mut s = WindowStack::new();
         let (src, dst) = two_windows(&mut s);
         let _ = dst;
@@ -1530,8 +1000,6 @@ mod tests {
 
     #[test]
     fn a_drag_does_not_highlight_the_window_it_came_out_of() {
-        // A browser that also took drops would otherwise outline itself the instant a drag
-        // began — a gesture nobody is making, and one whose completion means nothing.
         let mut s = WindowStack::new();
         let src = win(&mut s, Role::Normal, 0, 0, 200, 200);
         s.declare_acceptor(src, "self", DROP_KIND_FILE).unwrap();
@@ -1546,14 +1014,7 @@ mod tests {
 
     #[test]
     fn a_drag_that_ends_any_way_but_the_button_delivers_nothing() {
-        // **The same rule a resize follows, and the stakes are plainer here**: a drop hands a
-        // payload to another application, and one delivered because the pointer's position was
-        // a guess is a file opened by a window nobody dropped it on.
-        // **The two ways a gesture ends without the button coming up**, and they are the two
-        // the router models: the input stream reporting a loss, and the grab being taken away
-        // because the window carrying it left the screen. (Motion arriving with no buttons held
-        // is *not* one of them — a lost release is what `Logical::Dropped` exists to say, and
-        // the router does not guess from a mirrored field.)
+        // Two ways a gesture ends without the button: an input loss, and the grab's window leaving.
         for lost_input in [true, false] {
             let mut s = WindowStack::new();
             let (src, dst) = two_windows(&mut s);
@@ -1566,8 +1027,6 @@ mod tests {
             let out = if lost_input {
                 go(&mut r, &mut s, Logical::Dropped { time_ns: T })
             } else {
-                // The source window goes away mid-gesture: `reconcile_with` breaks the grab,
-                // and the invariant at the top of `route` tears the drag down with it.
                 s.set_minimized(src, true).expect("minimize");
                 go(&mut r, &mut s, drag(1, 0))
             };
@@ -1578,13 +1037,7 @@ mod tests {
 
     #[test]
     fn the_finished_guard_is_what_refuses_a_drop_and_not_only_its_callers() {
-        // **A guard nothing can fail is documentation.** `stop_carrying`'s `finished` parameter
-        // was defence in depth behind two call sites that both discard the record anyway — so
-        // deleting the guard left all seventy tests in this module passing, and the doc comment
-        // describing it was the only thing asserting it (PR #260 review, optional 3).
-        //
-        // Called directly, because that is the only way to see the parameter rather than the
-        // callers: the state is set up exactly as a real gesture would leave it.
+        // Called directly: only a direct call can see the `finished` guard.
         let mut s = WindowStack::new();
         let (src, dst) = two_windows(&mut s);
         s.declare_acceptor(dst, "document", DROP_KIND_FILE).unwrap();
@@ -1604,10 +1057,8 @@ mod tests {
         let (src, dst) = two_windows(&mut s);
         let mut r = InputRouter::new(SCREEN);
 
-        // Nothing pressed at all.
         assert!(r.start_drag(src, DROP_KIND_FILE, "/a", "a", &s).is_err());
 
-        // Pressed on the *other* window: the grab is what says the user is dragging *this*.
         warp(&mut r, &mut s, 450, 20);
         go(&mut r, &mut s, button(true));
         assert!(r.start_drag(src, DROP_KIND_FILE, "/a", "a", &s).is_err());
@@ -1616,8 +1067,6 @@ mod tests {
 
     #[test]
     fn one_grab_carries_one_gesture() {
-        // A move and a drag would both run: the window would follow the pointer while a payload
-        // was in flight from it, and the release would be both a drop and a snap.
         let mut s = WindowStack::new();
         let src = win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -1650,8 +1099,6 @@ mod tests {
             Err(StackError::TooManyAcceptors),
             "refused rather than evicting one the client still believes in"
         );
-        // **Re-declaring is not a new entry**, so a client that changes its mind is not
-        // eventually refused for saying the same thing again.
         s.declare_acceptor(w, "sink0", DROP_KIND_DIR).expect("replaces");
         assert_eq!(s.acceptor_for(w, DROP_KIND_DIR), Some("sink0"));
     }
@@ -1673,18 +1120,13 @@ mod tests {
         );
         assert!(r.take_hotkeys().is_empty(), "and told once");
 
-        // **The release too.** Delivering it would hand the window a release for a press it
-        // never saw — the same defect as a broken pointer grab's tail going to whoever is
-        // underneath.
+        // The release too: delivering it hands the window a release for a press it never saw.
         let out = go(&mut r, &mut s, chord(KEY_2, false, MOD_SUPER));
         assert!(out.is_empty(), "the release is consumed with the press");
     }
 
     #[test]
     fn a_chords_release_is_swallowed_by_keycode_even_after_the_modifiers_change() {
-        // Letting go of `Super` before `2` is the ordinary way to release a chord, and by then
-        // the modifiers no longer match. A compositor that re-tested them here would deliver
-        // the release alone.
         let mut s = WindowStack::new();
         win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -1694,16 +1136,12 @@ mod tests {
         let out = go(&mut r, &mut s, chord(KEY_2, false, 0));
         assert!(out.is_empty(), "released after Super came up, and still swallowed");
 
-        // And only that one release: the next press of the same key, without the chord, is an
-        // ordinary keystroke again.
         let out = go(&mut r, &mut s, key(KEY_2, true));
         assert_eq!(out.len(), 1, "an unmodified press is delivered normally");
     }
 
     #[test]
     fn modifiers_must_match_exactly() {
-        // A prefix match would make `Super+Shift+2` fire `Super+2` as well, so a shell binding
-        // both would switch desktops every time you asked it to move a window to one.
         let mut s = WindowStack::new();
         win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -1716,8 +1154,7 @@ mod tests {
 
     #[test]
     fn an_auto_repeating_chord_does_not_leave_a_release_owed_twice() {
-        // A held chord repeats presses. Recording the keycode once per press would leave two
-        // entries and swallow the *next* unrelated release of that key as well.
+        // One record per press would swallow the next unrelated release of the key too.
         let mut s = WindowStack::new();
         win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -1735,12 +1172,7 @@ mod tests {
 
     #[test]
     fn a_consumed_chord_tells_the_caller_so_it_does_not_arm_a_repeat() {
-        // **The one thing `route` could not say.** The binary arms key repeat from the physical
-        // transition — deliberately, so a key that reached no window still stops repeating when
-        // it comes up — and a consumed chord looked exactly like an ordinary keystroke from
-        // outside. So it armed, and 400 ms later delivered its key straight to the focused
-        // window's session, bypassing the router: holding `Super+1` while already on desktop 1
-        // filled the terminal with `1`s (PR #241 review, blocking 1).
+        // The binary arms key repeat from the physical transition, so a consumed chord must say so.
         let mut s = WindowStack::new();
         win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -1756,30 +1188,23 @@ mod tests {
 
     #[test]
     fn a_key_already_down_cannot_begin_a_chord() {
-        // Press `2` alone — delivered — then hold `Super`. The hardware repeat of `2` now
-        // matches `Super+2`, so without this the chord would fire and the *physical* release
-        // would be swallowed, leaving the window a press it never saw released
-        // (PR #241 review, finding 2).
+        // `2` delivered, then Super held: the repeat would match `Super+2` and swallow the
+        // physical release.
         let mut s = WindowStack::new();
         win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
         r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).unwrap();
 
         assert_eq!(go(&mut r, &mut s, key(KEY_2, true)).len(), 1, "delivered while unmodified");
-        // The repeat, now with Super held.
         let out = go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
         assert_eq!(out.len(), 1, "a key already down is a repeat, not a new chord");
         assert!(r.take_hotkeys().is_empty(), "and it fires nothing");
-        // The release balances the delivered press.
         assert_eq!(go(&mut r, &mut s, key(KEY_2, false)).len(), 1, "its release is delivered");
     }
 
     #[test]
     fn dropped_forgets_which_keys_were_consumed() {
-        // `Dropped` says the held-key state is unknown. A swallowed release would otherwise
-        // leave the keycode recorded forever: the next *ordinary* press of it is delivered and
-        // its release swallowed, so the window holds that key down for the rest of its life —
-        // the phantom-held-key bug `Dropped` exists one layer down to prevent.
+        // `Dropped` says held-key state is unknown: a stale record would swallow a later release.
         let mut s = WindowStack::new();
         win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -1787,7 +1212,6 @@ mod tests {
 
         go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
         go(&mut r, &mut s, Logical::Dropped { time_ns: T });
-        // The release the chord was owed never arrives; the drop is what stands in for it.
         assert_eq!(go(&mut r, &mut s, key(KEY_2, true)).len(), 1, "an ordinary press after");
         assert_eq!(
             go(&mut r, &mut s, key(KEY_2, false)).len(),
@@ -1798,9 +1222,6 @@ mod tests {
 
     #[test]
     fn clearing_the_table_stops_chords_being_consumed_by_nobody() {
-        // The table used to outlive the manager that registered it: every chord kept being
-        // consumed and delivered to a channel that no longer existed, so the key silently
-        // reached nothing for the life of the compositor (PR #241 review, finding 3).
         let mut s = WindowStack::new();
         win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -1811,7 +1232,6 @@ mod tests {
         r.clear_hotkeys();
         let out = go(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
         assert_eq!(out.len(), 1, "with no table the chord is an ordinary keystroke again");
-        // And the id is free for a replacement manager.
         assert!(r.register_hotkey(MgrHotkey { id: 1, mods: MOD_SUPER, code: KEY_2 }).is_ok());
     }
 
@@ -1846,8 +1266,6 @@ mod tests {
 
     #[test]
     fn keys_go_to_the_topmost_focusable_window_not_the_one_under_the_cursor() {
-        // The distinction the whole focus/hit-test split exists for: typing must not
-        // depend on where the mouse happens to be resting.
         let mut s = WindowStack::new();
         let under = win(&mut s, Role::Normal, 0, 0, 100, 100);
         let top = win(&mut s, Role::Normal, 300, 300, 100, 100);
@@ -1860,8 +1278,6 @@ mod tests {
         assert_eq!(out[0].window(), top, "the key went to the focused window");
     }
 
-    /// **A key carries its locks to the window** (Phase 6 Part B.5; PR #359 review): the event the
-    /// router builds has the transition's locks, which only `check-terminal`'s Caps Lock step saw.
     #[test]
     fn a_key_carries_its_locks_to_the_window() {
         use librsproto::surface::{LOCK_CAPS, LOCK_NUM};
@@ -1876,22 +1292,11 @@ mod tests {
         }
     }
 
-    /// A window whose first `Configure` is still held takes neither the keyboard nor a click.
-    ///
-    /// It is on top of the stack and occupies its rectangle there, but the compositor has
-    /// decided it is not on screen (M6 B4). Routing to it would send keystrokes into a window
-    /// nobody can see and make a click land on it rather than on the visible window underneath
-    /// — for as long as the hold lasts, which on the deadline path is a bounded 200 ms during
-    /// every window launch (PR #218 review, finding 3).
     #[test]
     fn a_window_whose_configure_is_held_takes_neither_focus_nor_a_click() {
         let mut s = WindowStack::new();
         let visible = win(&mut s, Role::Normal, 0, 0, 200, 200);
-        // Created *over* the visible one and never configured — a launch in progress. Built
-        // with `create` rather than `win`, precisely because `win` configures.
         let held = s.create(&CreateWindowRequest::new(200, 200, Role::Normal)).expect("create");
-        // No commit needed: `bounds()` falls back to the requested size, which is exactly the
-        // rectangle a held window occupies in the stack and the reason it could be clicked.
 
         let mut r = InputRouter::new(SCREEN);
         warp(&mut r, &mut s, 50, 50);
@@ -1901,7 +1306,6 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].window(), visible, "and so does the keystroke");
 
-        // Configured, and it takes both — it was topmost all along.
         s.mark_configured(held);
         warp(&mut r, &mut s, 51, 51);
         assert_eq!(r.inside(), Some(held));
@@ -1911,8 +1315,6 @@ mod tests {
 
     #[test]
     fn a_panel_never_takes_a_keystroke_but_does_take_a_click() {
-        // Clicking the clock must not stop the terminal receiving what you type next —
-        // and a panel you cannot click is not a panel.
         let mut s = WindowStack::new();
         let term = win(&mut s, Role::Normal, 0, 100, 640, 380);
         let panel = win(&mut s, Role::Panel { dock: Edge::Top, reserve: 100 }, 0, 0, 640, 100);
@@ -1932,9 +1334,6 @@ mod tests {
 
     #[test]
     fn a_window_on_another_desktop_cannot_be_clicked() {
-        // The fresh-press half of "invisible but still hit-testable". `hit()` is where the
-        // filter lives, so this is the half a filter in `hit()` does catch — and on its own it
-        // is not enough to prove the rule, which is what the next test is for.
         let mut s = WindowStack::new();
         let here = win(&mut s, Role::Normal, 0, 0, 200, 200);
         let gone = win(&mut s, Role::Normal, 0, 0, 200, 200);
@@ -1943,8 +1342,6 @@ mod tests {
         warp(&mut r, &mut s, 50, 50);
 
         let out = go(&mut r, &mut s, button(true));
-        // `gone` is above `here` in the stack and covers the same pixels, so without the
-        // filter it would take the click.
         assert!(
             out.iter().any(|o| matches!(o, Outbound::Pointer { event } if event.window == here)),
             "the click went to the window that is actually on screen"
@@ -1957,12 +1354,8 @@ mod tests {
 
     #[test]
     fn switching_desktops_mid_drag_takes_the_grab_away_from_the_hidden_window() {
-        // **The half a filter in `hit()` cannot reach**, and the reason this rule needed two
-        // controls. `target()` is `grab.or_else(hit)`, so once a press has grabbed, every
-        // event until the release bypasses hit-testing entirely — and nothing clears `grab` on
-        // a desktop switch, which is not a destroy, not a last-button-up and not a `Dropped`.
-        // An implementation that filters only `hit()` passes the test above and fails here
-        // (PR #239 review, finding 2).
+        // The half a filter in `hit()` cannot reach: after a press every event bypasses
+        // hit-testing.
         let mut s = WindowStack::new();
         let dragged = win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -1973,12 +1366,8 @@ mod tests {
             "precondition: the press landed and grabbed"
         );
 
-        // The manager switches desktops while the button is still held.
         s.set_current_desktop(2).unwrap();
 
-        // The next event is what the router reconciles on. The window is owed exactly two
-        // things and no more: the release that closes the sequence it was granted, and the
-        // leave that says the cursor is no longer in it.
         let out = go(&mut r, &mut s, drag(10, 10));
         let to_dragged: Vec<_> = out
             .iter()
@@ -2002,8 +1391,6 @@ mod tests {
             "the synthetic button record is a release, not a press"
         );
 
-        // And from here it is owed nothing at all: motion during the rest of the drag, and the
-        // real release, both go nowhere.
         let out = go(&mut r, &mut s, drag(5, 5));
         assert!(out.is_empty(), "no records at all while a broken grab's buttons are down");
         let out = go(&mut r, &mut s, button(false));
@@ -2015,9 +1402,6 @@ mod tests {
 
     #[test]
     fn minimizing_the_grab_holder_takes_the_grab_away_too() {
-        // The same rule by the other route. Named separately because the two reach
-        // `visible_on` through different attributes, and a fix that special-cased the desktop
-        // comparison would pass the test above and fail this one.
         let mut s = WindowStack::new();
         let dragged = win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -2047,12 +1431,6 @@ mod tests {
 
     #[test]
     fn minimizing_the_window_under_the_cursor_pairs_a_leave_with_the_enter() {
-        // **The leave has to be emitted before the id is forgotten.** The first version cleared
-        // `inside` and *then* re-derived the crossing, which derives the leave from `inside` —
-        // so it emitted the enter alone and the window under the cursor at minimize time never
-        // learned the pointer had gone. In `libui` that leaves the hovered widget highlighted
-        // for as long as the window stays hidden, since nothing else would clear it
-        // (PR #240 review, blocking 1a).
         let mut s = WindowStack::new();
         let under = win(&mut s, Role::Normal, 0, 0, 200, 200);
         let over = win(&mut s, Role::Normal, 0, 0, 200, 200);
@@ -2077,10 +1455,6 @@ mod tests {
 
     #[test]
     fn breaking_a_grab_gives_the_release_to_nobody_else() {
-        // The tail of a sequence belongs to the window that was granted it. Handing it to
-        // whatever is underneath means a release for a press that window never saw — and in
-        // `libui` a bare release fires nothing, so the defect stays silent until a client acts
-        // on one (PR #240 review, blocking 1b).
         let mut s = WindowStack::new();
         let under = win(&mut s, Role::Normal, 0, 0, 200, 200);
         let over = win(&mut s, Role::Normal, 0, 0, 200, 200);
@@ -2096,8 +1470,6 @@ mod tests {
                     && event.kind == POINTER_BUTTON)),
             "the window underneath must not receive a release for a press it never saw"
         );
-        // **An enter is fine and correct**: the buttons are up, the sequence is over, and the
-        // cursor really is inside `under`. What must not arrive is the button record.
         assert!(
             out.iter().any(|o| matches!(
                 o, Outbound::Pointer { event } if event.window == under
@@ -2105,7 +1477,6 @@ mod tests {
             "and once the sequence is over it is entered normally"
         );
 
-        // Once the buttons are up the world resumes: the next press reaches `under` normally.
         let out = go(&mut r, &mut s, button(true));
         assert!(
             out.iter().any(|o| matches!(
@@ -2117,11 +1488,6 @@ mod tests {
 
     #[test]
     fn the_records_a_broken_grab_emits_carry_the_provoking_events_modifiers() {
-        // Every record in one batch has to agree about `buttons` and `modifiers` — the router
-        // generates enters and leaves itself, so it stamps them from the event that provoked
-        // them. Reconciling *before* that mirror stamped the previous event's state instead, so
-        // a release ending a shift-drag produced a leave saying shift was still held beside a
-        // button record saying it was not (PR #240 review, blocking 1c).
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 0, 0, 200, 200);
         let mut r = InputRouter::new(SCREEN);
@@ -2133,7 +1499,6 @@ mod tests {
         );
 
         s.set_minimized(w, true).unwrap();
-        // Shift released along with the button — the provoking event says neither is held.
         let out = go(
             &mut r,
             &mut s,
@@ -2149,8 +1514,6 @@ mod tests {
 
     #[test]
     fn a_sticky_window_is_clickable_on_every_desktop() {
-        // The reserved value has to work, not merely be reserved: `desktop == 0` is the one
-        // value `visible_on` accepts regardless of the current desktop.
         let mut s = WindowStack::new();
         let bar = win(&mut s, Role::Normal, 0, 0, 200, 200);
         s.set_window_desktop(bar, librsproto::surface::STICKY_DESKTOP).unwrap();
@@ -2167,34 +1530,24 @@ mod tests {
 
     #[test]
     fn a_press_outside_a_popup_dismisses_it_and_one_inside_does_not() {
-        // **The case focus cannot cover.** Pressing a *window* raises it, and the raise is the
-        // focus change the popup hears about — so an early version of this behaviour looked
-        // complete while the reported bug survived: a press on the desktop or on a panel raises
-        // nothing, changes no focus, and left every popup in the system open.
         let mut s = WindowStack::new();
         let bar = win(&mut s, Role::Panel { dock: Edge::Top, reserve: 24 }, 0, 0, 640, 24);
         let menu = win(&mut s, Role::Popup { parent: bar }, 0, 24, 120, 200);
         let mut r = InputRouter::new(SCREEN);
         assert_eq!(s.focus_candidate(), Some(menu), "the popup is topmost and takes focus");
 
-        // On the panel, well clear of the popup: nothing is raised, because a panel does not take
-        // focus — so no focus change occurs and nothing else would have told the popup anything.
         warp(&mut r, &mut s, 400, 10);
         let mut out = Vec::new();
         let routed = r.route(&button(true), &mut s, &mut out);
         assert_eq!(routed.dismissed, Some(menu), "a press on a panel did not dismiss the popup");
         assert_eq!(routed.restacked, None, "a panel raise would be the other mechanism");
 
-        // **Inside it is not outside it.** Choosing from a menu is a press on the menu, and a
-        // dismissal there would race the client's own handling of the choice.
         let mut r = InputRouter::new(SCREEN);
         warp(&mut r, &mut s, 40, 100);
         let routed = r.route(&button(true), &mut s, &mut out);
         assert_eq!(routed.dismissed, None, "pressing the popup dismissed it");
 
-        // **Its parent counts as outside**, which is what makes clicking the applications button
-        // a second time close the menu it opened: the parent is the whole bar, and the handler
-        // that would otherwise reopen the modal is inert while one is up.
+        // Its parent counts as outside, so clicking the opening button again closes the menu.
         let mut r = InputRouter::new(SCREEN);
         warp(&mut r, &mut s, 300, 10);
         let routed = r.route(&button(true), &mut s, &mut out);
@@ -2212,11 +1565,7 @@ mod tests {
         warp(&mut r, &mut s, 50, 50);
         let mut out = Vec::new();
         let routed = r.route(&button(true), &mut s, &mut out);
-        // **`painted_bounds`, not a literal** (M13 Part C): a raised window repaints its shadow
-        // along with itself, so the rectangle is larger than the window. Written as the window's
-        // own painted bounds rather than the new numbers, so it says "this window and nothing
-        // else" at any shadow size — and the containment check below is what keeps that from
-        // being a tautology, by asserting the region really did grow past the window.
+        // `painted_bounds`, not a literal: the raised window's shadow grows the region.
         let want = s.window(lower).expect("in the stack").painted_bounds();
         assert!(
             want.origin.x < 0 && want.size.w > 100,
@@ -2225,10 +1574,6 @@ mod tests {
         assert_eq!(routed.restacked, Some(want), "the caller must recompose, and only where the raised window is");
         assert_eq!(s.focus_candidate(), Some(lower), "the raise *is* the focus change");
 
-        // **And the second click on the same window recomposes nothing.** Click-to-focus
-        // raises on every press; a raise that changes no order changes no pixels, and
-        // answering "recompose" to it is what made every click on the focused window cost a
-        // full-screen repaint — ~100 ms under emulation, with no input read during it.
         let again = r.route(&button(false), &mut s, &mut out);
         assert_eq!(again.restacked, None);
         let again = r.route(&button(true), &mut s, &mut out);
@@ -2237,23 +1582,16 @@ mod tests {
 
     #[test]
     fn an_interactive_move_offsets_by_where_the_press_landed_not_by_where_the_request_arrived() {
-        // **The whole point of recording the press position.** `StartMove` arrives a round trip
-        // after the press — the client has to receive it, route it through its own toolkit and
-        // decide it landed on a title bar — and the pointer keeps moving meanwhile. A drag that
-        // takes its origin from the pointer *at the request* jumps by that distance and then
-        // tracks correctly, which is the defect the `scroll-grab` deferral described for a scrollbar.
+        // An origin taken at the request rather than the press would jump by the pointer's travel.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
 
-        // Press 20 px into the window, then move 40 px before the request is dispatched.
         warp(&mut r, &mut s, 120, 110);
         go(&mut r, &mut s, button(true));
         go(&mut r, &mut s, drag(40, 0));
         r.start_move(w, &mut s).expect("the grab is on that window");
 
-        // One more motion. The window must sit where the *press* offset says, which is the
-        // pointer minus the 20 px into the window — not the pointer minus 60.
         go(&mut r, &mut s, drag(10, 5));
         let origin = s.window(w).expect("still there").origin;
         assert_eq!(
@@ -2265,11 +1603,7 @@ mod tests {
 
     #[test]
     fn a_second_start_move_in_one_gesture_changes_nothing() {
-        // **The offsets are not the same, which the spec used to claim.** `from` is the press
-        // and does not move; the window's origin does — so rebuilding the drag from where the
-        // window is *now* applies the distance already travelled a second time. Reachable by
-        // pressing a second button mid-drag, which used to re-fire the toolkit's press handler
-        // (PR #248 review, blocking 1).
+        // A second `StartMove` must not rebuild the drag: the origin moved, the press did not.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2285,9 +1619,6 @@ mod tests {
 
     #[test]
     fn a_drag_ends_when_a_dropped_batch_takes_its_grab_away() {
-        // `Dropped` says the button state is unknown, so the grab is cleared — and a drag is a
-        // belief derived from that grab. Left behind, the window follows a pointer with nothing
-        // held and `Place` for it stays refused until the next click.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2305,9 +1636,6 @@ mod tests {
 
     #[test]
     fn a_drag_ends_when_its_window_leaves_the_screen() {
-        // Minimizing or moving a dragged window to another desktop breaks the grab —
-        // `reconcile_with` emits the release the client is owed. A window that went on tracking
-        // the pointer would contradict that release, invisibly.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2325,8 +1653,7 @@ mod tests {
 
     #[test]
     fn a_drag_that_moved_nothing_reports_no_geometry_change() {
-        // An ordinary click on a title bar is a drag of zero pixels. Recording one puts a no-op
-        // event into the manager's queue — the one that does not coalesce and evicts its oldest.
+        // A click on a title bar is a drag of zero pixels; the manager's queue does not coalesce.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2341,9 +1668,7 @@ mod tests {
 
     #[test]
     fn the_catch_up_at_the_start_of_a_drag_reports_its_damage() {
-        // The pointer has already moved by the time `StartMove` arrives, so the window moves the
-        // instant the drag begins — and `Logical::Button` reports no movement, so if this damage
-        // were dropped a press-flick-release would leave the window drawn where it used to be.
+        // A press-flick-release has no motion event to report the damage, so `StartMove` must.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2358,8 +1683,6 @@ mod tests {
 
     #[test]
     fn a_move_needs_the_grab_on_that_window() {
-        // Without this a client could move its own window at any time from anywhere, which is
-        // `Place` for itself — and `Place` is a manager op deliberately.
         let mut s = WindowStack::new();
         let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
         let b = win(&mut s, Role::Normal, 300, 0, 100, 100);
@@ -2373,20 +1696,17 @@ mod tests {
         assert!(r.start_move(b, &mut s).is_ok(), "and this is the one being pressed");
     }
 
-    /// Route one event and return what it did to the stack and the outline.
     fn go_routed(r: &mut InputRouter, s: &mut WindowStack, ev: Logical) -> Routed {
         let mut out = Vec::new();
         r.route(&ev, s, &mut out)
     }
 
-    /// Press at `(x, y)` on the window under it and begin resizing `edges`.
     fn grip(r: &mut InputRouter, s: &mut WindowStack, w: u32, x: i32, y: i32, edges: u32) {
         warp(r, s, x, y);
         go(r, s, button(true));
         r.start_resize(w, edges, s).expect("the grab is on that window");
     }
 
-    /// A zone whose trigger is `t` and whose target is `g`.
     fn zone(id: u32, t: (i32, i32, u32, u32), g: (i32, i32, u32, u32)) -> MgrSnapZone {
         MgrSnapZone {
             id,
@@ -2401,7 +1721,6 @@ mod tests {
         }
     }
 
-    /// Press on `w` at `(x, y)` and begin an interactive move.
     fn hold(r: &mut InputRouter, s: &mut WindowStack, w: u32, x: i32, y: i32) {
         warp(r, s, x, y);
         go(r, s, button(true));
@@ -2410,22 +1729,16 @@ mod tests {
 
     #[test]
     fn a_move_into_a_zone_previews_its_target_and_a_drop_asks_for_it() {
-        // **The whole of Part F.** The compositor matches the pointer against a table it was
-        // given and knows nothing about halves or edges; what it shows is that zone's *target*,
-        // and what it asks for at the release is the same rectangle — so the user cannot be
-        // shown one thing and given another.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
         let mut r = InputRouter::new(SCREEN);
         r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
         hold(&mut r, &mut s, w, 240, 240);
 
-        // Across the middle: no zone, no outline, and the window follows as it always did.
         let routed = go_routed(&mut r, &mut s, drag(-100, 0));
         assert!(routed.outline.is_none(), "nothing is previewed away from a zone");
         assert!(routed.moved.is_some(), "and the move is unaffected");
 
-        // Into the band at the left edge.
         let routed = go_routed(&mut r, &mut s, drag(-130, 0));
         let o = routed.outline.expect("the zone is previewed");
         assert_eq!(o.now, Some(Rect::new(0, 0, 320, 480)), "the target, not the trigger");
@@ -2442,9 +1755,6 @@ mod tests {
 
     #[test]
     fn a_drag_that_passes_through_a_zone_without_stopping_snaps_nothing() {
-        // The control the plan names. A preview shown and taken down again must leave nothing
-        // behind: the gesture is decided by where the button comes up, not by where the pointer
-        // has been.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
         let mut r = InputRouter::new(SCREEN);
@@ -2461,10 +1771,6 @@ mod tests {
 
     #[test]
     fn a_zone_id_registers_once_and_is_replaced_rather_than_refused() {
-        // **The difference from a chord table, and it is what the table is.** Zones are a
-        // layout: a shell recomputes all of them when the work area changes and re-registers
-        // the same ids. A refusal would leave it holding zones for a screen that has changed
-        // shape with no way to say so.
         let mut r = InputRouter::new(SCREEN);
         assert_eq!(r.register_zone(zone(0, (0, 0, 1, 1), (0, 0, 1, 1))), Err(HotkeyError::ZeroId));
         r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
@@ -2489,19 +1795,12 @@ mod tests {
 
     #[test]
     fn zones_go_with_the_manager_that_registered_them_and_so_does_the_preview() {
-        // They are a layout that manager computed from a work area it was watching; a
-        // replacement inherits nothing it did not register, exactly as with chords.
         let mut r = InputRouter::new(SCREEN);
         r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
         assert!(r.zone_at(Point::new(5, 5)).is_some());
         assert_eq!(r.clear_zones(), None, "nothing was being previewed");
         assert!(r.zone_at(Point::new(5, 5)).is_none());
 
-        // **And the pixels go with the table.** A shell exiting mid-drag is the compositor's
-        // designed manager-death path, and every other way of taking a preview down is gated on
-        // the zone this just removed — so an outline left here is never reported to anybody and
-        // is redrawn by every later compose for the life of the process (PR #254 review,
-        // blocking 1).
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
         let mut r = InputRouter::new(SCREEN);
@@ -2513,17 +1812,12 @@ mod tests {
         let taken = r.clear_zones().expect("the preview is handed back to be repainted");
         assert_eq!(taken.was, Some(Rect::new(0, 0, 320, 480)), "the rectangle to erase");
         assert_eq!(taken.now, None);
-        // And nothing is left for a later event to report, because there is nothing left.
         assert!(go_routed(&mut r, &mut s, drag(5, 0)).outline.is_none());
         assert!(go_routed(&mut r, &mut s, button(false)).outline.is_none());
     }
 
     #[test]
     fn re_registering_the_zone_under_the_pointer_moves_the_preview_with_it() {
-        // A shell re-registers its whole table on `LayoutChanged`, which can arrive mid-drag —
-        // a panel appearing while a window is being dragged. Leaving the old rectangle on screen
-        // would break the one promise the drop makes: that what is asked for is what the user
-        // was looking at (PR #254 review, optional 5).
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
         let mut r = InputRouter::new(SCREEN);
@@ -2546,14 +1840,6 @@ mod tests {
 
     #[test]
     fn a_drag_the_user_did_not_finish_snaps_nothing() {
-        // **The rule Part E's review required, on the other gesture.** A `Logical::Dropped` says
-        // events were lost and the pointer position is a guess; a grab taken away says the
-        // gesture was interrupted. Neither is a drop, and snapping a window somebody is still
-        // holding is what asking for one here would mean.
-        //
-        // The gate met this before the test did: its first version injected motions fast enough
-        // to overrun the consumer ring, and the drag correctly asked for nothing (PR #254
-        // review, finding 2).
         for interrupted_by_loss in [true, false] {
             let mut s = WindowStack::new();
             let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
@@ -2565,8 +1851,6 @@ mod tests {
             let routed = if interrupted_by_loss {
                 go_routed(&mut r, &mut s, Logical::Dropped { time_ns: T })
             } else {
-                // The window leaves the screen under the pointer; `reconcile_with` breaks the
-                // grab on the next event and the invariant tears the gesture down.
                 s.set_minimized(w, true).expect("put away mid-drag");
                 go_routed(&mut r, &mut s, key(30, true))
             };
@@ -2577,12 +1861,6 @@ mod tests {
 
     #[test]
     fn a_gesture_whose_window_has_gone_asks_for_nothing_even_when_finished() {
-        // **Called directly, because no route through `route` reaches it.** `reconcile_with`
-        // runs before every arm and breaks the grab of a window that is not on screen, so by
-        // the time `finished` can be true the window is there — which makes these two checks a
-        // second line rather than the first. Asserting that through `route` would be asserting
-        // `reconcile_with`, which has its own tests; this states what the guards themselves do,
-        // so that a later change to the ordering does not silently make them wrong.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
         let mut r = InputRouter::new(SCREEN);
@@ -2603,10 +1881,7 @@ mod tests {
 
     #[test]
     fn a_zone_previews_only_during_a_move() {
-        // A pointer wandering over a zone with nothing held is a pointer wandering. **The
-        // approach has to happen inside the assertion**: `warp` is itself a motion, so warping
-        // *into* the zone consumes the transition and the next event finds nothing changed —
-        // which is how the first version of this test passed with the guard removed.
+        // The approach must happen inside the assertion: `warp` is itself a motion.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
         let mut r = InputRouter::new(SCREEN);
@@ -2619,21 +1894,12 @@ mod tests {
         );
 
         let _ = w;
-        // **A resize is not asserted here, and the reason is worth stating rather than
-        // asserting badly.** `preview_zone` is reached through an `.or_else` after
-        // `outline_to_pointer`, which returns `Some` for every motion while a resize runs — so
-        // no implementation in reach consults the table during one, and a test saying "a resize
-        // is not snapped" passes for every version of this code including the ones that would
-        // be wrong. It was there, it was decoration, and a control found it (PR #254 review,
-        // optional 6). What keeps a resize from being snapped is that `start_move` and
-        // `start_resize` refuse each other, which has its own test.
+        // A resize is not asserted: `preview_zone` sits behind `outline_to_pointer`, so such a test
+        // passes for wrong code too. `start_move` and `start_resize` refusing each other stops it.
     }
 
     #[test]
     fn a_resize_needs_the_grab_and_a_pair_of_edges_that_name_a_gesture() {
-        // The grab is what makes "the user is dragging my edge" true, exactly as it is for a
-        // move: without it a client could resize itself from anywhere with nobody touching it,
-        // which is a `Configure` for itself — and `Configure` is a manager op deliberately.
         let mut s = WindowStack::new();
         let a = win(&mut s, Role::Normal, 0, 0, 200, 200);
         let b = win(&mut s, Role::Normal, 300, 0, 100, 100);
@@ -2644,8 +1910,6 @@ mod tests {
         go(&mut r, &mut s, button(true));
         assert!(r.start_resize(a, RESIZE_RIGHT, &mut s).is_err(), "the grab is elsewhere");
 
-        // Opposite edges together is no gesture — nobody drags a window's left and right at
-        // once — and neither is naming none, which would hold a grab and change nothing.
         for edges in [0, RESIZE_LEFT | RESIZE_RIGHT, RESIZE_TOP | RESIZE_BOTTOM, 1 << 9] {
             assert_eq!(r.start_resize(b, edges, &mut s), Err(StackError::BadGeometry), "edges {edges:#x}");
         }
@@ -2654,10 +1918,6 @@ mod tests {
 
     #[test]
     fn the_outline_follows_the_pointer_and_the_window_does_not_move() {
-        // **The whole of decision 3.** A resize that changed the window per motion would make
-        // the client allocate, map, re-lay-out and repaint per motion. What moves is an outline
-        // the compositor draws over the composed stack; the client hears nothing until the
-        // button comes up.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2678,8 +1938,6 @@ mod tests {
 
     #[test]
     fn dragging_a_top_or_left_edge_moves_the_origin_rather_than_only_the_size() {
-        // The half that is easy to get wrong: a left edge dragged right makes the window
-        // narrower *and* moves it, because the right edge stays where it is.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2691,9 +1949,7 @@ mod tests {
 
     #[test]
     fn an_edge_dragged_past_its_opposite_stops_rather_than_inverting() {
-        // A rectangle with a negative width is a shape no repaint can describe. The floor is
-        // the compositor's own, not a client's minimum — the protocol has no way to state one,
-        // and a `Configure` is a request the client may decline anyway.
+        // The floor is the compositor's own: the protocol cannot state a client's minimum.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2702,7 +1958,6 @@ mod tests {
         let o = go_routed(&mut r, &mut s, drag(-400, -400)).outline.expect("moved");
         assert_eq!(o.now, Some(Rect::new(100, 100, MIN_RESIZE, MIN_RESIZE)));
 
-        // And from the other side, where the *origin* is what the clamp has to hold still.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2716,9 +1971,7 @@ mod tests {
 
     #[test]
     fn the_floor_holds_only_the_axis_being_dragged() {
-        // A window already narrower than the floor, dragged by its bottom edge alone: its width
-        // is nobody's business here, and a rectangle-wide clamp would widen it to `MIN_RESIZE`
-        // and hand the shell a `Configure` for an axis the user never touched.
+        // Dragging the bottom edge alone must not widen a window already narrower than the floor.
         let narrow = MIN_RESIZE / 2;
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 10, 10, narrow, 200);
@@ -2749,15 +2002,11 @@ mod tests {
             Rect::new(100, 100, 200, 100),
             "and the compositor still has not resized the client"
         );
-        // A second release reports nothing: the gesture is over.
         assert_eq!(go_routed(&mut r, &mut s, button(false)).resized, None);
     }
 
     #[test]
     fn a_grip_click_that_moves_nothing_reports_nothing() {
-        // An ordinary click on the corner is a resize of zero pixels. The manager's queue does
-        // not coalesce, and a `Configure` to the size a window already has is a round trip
-        // through the client for no change — the same argument `end_drag` makes for a move.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2775,10 +2024,6 @@ mod tests {
         r.start_move(w, &mut s).expect("the move takes the grab");
         assert!(r.start_resize(w, RESIZE_RIGHT, &mut s).is_err(), "one gesture per grab");
 
-        // **And the other way round, which was enforced in one direction only.** With both
-        // running the window follows the pointer *and* the outline does, and the release
-        // reports a rectangle built from the origin the window had before the move — so it
-        // jumps back by however far it was dragged (PR #253 review, blocking 1).
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2791,8 +2036,6 @@ mod tests {
             "and the window did not move while its outline did"
         );
 
-        // And a second `StartResize` during a resize is the same gesture, not a new one:
-        // rebuilding from where things are now would apply the travel so far a second time.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2808,17 +2051,8 @@ mod tests {
 
     #[test]
     fn a_resize_refuses_a_place_and_a_dropped_batch_ends_it_without_committing() {
-        // A resize marks the window as being dragged for the reason a move does: a `Place` that
-        // landed mid-gesture would fight the pointer. And a gesture is a belief derived from the
-        // grab — `Dropped` says the button state is unknown, so an outline left on screen with
-        // nothing driving it is the visible version of the phantom that arm exists to clear.
-        //
-        // **But it reports nothing**, which is where a resize stops being modelled on a move. A
-        // move has applied every step already; a resize has applied none, so reporting here
-        // would *initiate* a change from a pointer position this arm has just declared a guess,
-        // while the button is still down — the window jumping to a half-chosen size mid-drag.
-        // The failure `Dropped` stands for is a ring overflow under a heavy recompose, which is
-        // the one this milestone keeps meeting (PR #253 review, finding 5).
+        // A resize marks the window dragged so a `Place` is refused. `Dropped` ends it but reports
+        // nothing: a guessed pointer position must not initiate a change.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2834,26 +2068,11 @@ mod tests {
 
     #[test]
     fn a_window_put_away_mid_resize_ends_the_gesture_on_whichever_key_arm_notices() {
-        // **`reconcile_with` breaks a grab on *any* event**, so the path that ends a gesture is
-        // not always a pointer one: a chord that puts the window being resized away ends it on a
-        // keystroke. A `Routed::default()` on such an arm leaves `srv.outline` set in the
-        // compositor, and `repaint_region` then redraws it on every subsequent repaint — an
-        // outline stranded on a desktop with nothing driving it.
-        //
-        // **All three key arms**, because the first version of this test reached exactly one:
-        // it had a single window, so minimizing it left `focus_candidate` empty and every run
-        // took the nothing-focusable early return. Breaking either of the other two failed
-        // nothing in the crate (PR #253 review, finding 3).
-        //
-        // The reachable one is the *hotkey* arm: the user holds the grip and presses a chord.
-        // It is consumed at the press, while the window is still on screen, so nothing is torn
-        // down; the release comes back after the chord has put the window away, is swallowed by
-        // keycode, and returns through that arm — which is the event on which the grab breaks.
+        // `reconcile_with` breaks a grab on any event, so a gesture can end on a key arm; all three
+        // are exercised, the hotkey one by releasing the grip after a chord put the window away.
         for arm in ["nothing focusable", "delivered", "hotkey"] {
             let mut s = WindowStack::new();
             let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
-            // A second window for the arms that need somebody to deliver to, and none for the
-            // arm that needs nobody.
             if arm != "nothing focusable" {
                 win(&mut s, Role::Normal, 400, 0, 100, 100);
             }
@@ -2862,7 +2081,6 @@ mod tests {
             grip(&mut r, &mut s, w, 299, 199, RESIZE_RIGHT | RESIZE_BOTTOM);
             go(&mut r, &mut s, drag(40, 30));
             if arm == "hotkey" {
-                // Consumed while the window is still on screen: the gesture survives this.
                 let held = go_routed(&mut r, &mut s, chord(KEY_2, true, MOD_SUPER));
                 assert!(held.consumed && held.outline.is_none(), "{arm}: nothing torn down yet");
             }
@@ -2887,9 +2105,6 @@ mod tests {
 
     #[test]
     fn a_drag_refuses_a_place_and_releases_it_on_the_button_coming_up() {
-        // The rule a manager and a drag have to agree on. Refused rather than silently
-        // overridden: a `Place` that landed mid-drag would be undone by the next motion, so a
-        // manager racing the pointer would appear to work.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2904,9 +2119,8 @@ mod tests {
 
     #[test]
     fn a_drag_produces_one_geometry_record_however_far_it_moves() {
-        // **The bound that keeps this off the manager's queue.** That queue does not coalesce
-        // and evicts its oldest when full, so a geometry record per motion would push a
-        // `WindowCreated` off the front of a manager's view of the world (PR #247 review).
+        // The manager's queue does not coalesce and evicts its oldest, so a record per motion
+        // would push out `WindowCreated`.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2926,8 +2140,8 @@ mod tests {
 
     #[test]
     fn a_window_destroyed_mid_drag_ends_the_drag_rather_than_wedging_place() {
-        // A client exiting with the button held is ordinary. Left set, the flag would refuse a
-        // `Place` for that id for the compositor's life, since ids are never reused.
+        // A client exiting with the button held is ordinary; ids are never reused, so a leftover
+        // flag would last.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -2942,8 +2156,6 @@ mod tests {
 
     #[test]
     fn clicking_a_panel_does_not_raise_it_over_the_window_it_docks_beside() {
-        // Panels do not take focus, so raising one on click would let a stray click on the
-        // clock permanently cover a window with no way to get it back.
         let mut s = WindowStack::new();
         let panel = win(&mut s, Role::Panel { dock: Edge::Top, reserve: 100 }, 0, 0, 640, 100);
         let normal = win(&mut s, Role::Normal, 0, 100, 640, 380);
@@ -2958,8 +2170,6 @@ mod tests {
 
     #[test]
     fn crossing_a_border_leaves_one_window_before_entering_the_next() {
-        // Order matters: a client that gets enter-then-leave concludes the cursor is
-        // outside when it is in fact inside.
         let mut s = WindowStack::new();
         let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
         let b = win(&mut s, Role::Normal, 200, 0, 100, 100);
@@ -2983,9 +2193,6 @@ mod tests {
 
     #[test]
     fn every_record_carries_the_buttons_and_modifiers_held() {
-        // Not just `POINTER_BUTTON`. A client implementing the standard "on motion, if a
-        // button is down, move the object" needs it on motion, and a crossing generated by
-        // the router — which arrives as no event at all — must agree with its neighbours.
         let mut s = WindowStack::new();
         win(&mut s, Role::Normal, 0, 0, 100, 100);
         let b = win(&mut s, Role::Normal, 200, 0, 100, 100);
@@ -3013,7 +2220,6 @@ mod tests {
         };
         assert_eq!((event.buttons, event.modifiers), (1, MOD_SHIFT), "a shift-drag is expressible from one record");
 
-        // And the release's crossing into `b`, which the router synthesises, agrees.
         let out = go(
             &mut r,
             &mut s,
@@ -3030,10 +2236,8 @@ mod tests {
 
     #[test]
     fn the_first_click_after_boot_enters_the_window_before_the_press() {
-        // Nothing has moved the cursor, so `inside` is still `None` — and once the press
-        // takes the grab the crossing pass early-returns. Deriving it only on release means
-        // a client that arms hover state on `POINTER_ENTER` processes a whole click for a
-        // pointer it believes is elsewhere (PR #180 review, finding 7).
+        // Once the press takes the grab the crossing pass early-returns, so the enter must come
+        // first.
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 0, 0, 640, 480);
         let mut r = InputRouter::new(SCREEN);
@@ -3072,8 +2276,6 @@ mod tests {
 
     #[test]
     fn a_drag_out_of_a_window_still_delivers_the_release_to_it() {
-        // Without the implicit grab the release lands on whatever is under the cursor at
-        // the time — or nothing — and the client believes the button is held forever.
         let mut s = WindowStack::new();
         let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
         let b = win(&mut s, Role::Normal, 200, 0, 100, 100);
@@ -3100,8 +2302,6 @@ mod tests {
 
     #[test]
     fn window_local_x_goes_negative_during_a_drag() {
-        // The reason `PointerEvent`'s coordinates are signed. Clamping them to zero would
-        // make every leftward drag look like it stopped at the window's edge.
         let mut s = WindowStack::new();
         win(&mut s, Role::Normal, 200, 0, 100, 100);
         let mut r = InputRouter::new(SCREEN);
@@ -3122,8 +2322,6 @@ mod tests {
 
     #[test]
     fn the_release_re_derives_the_crossing_the_drag_suppressed() {
-        // A drag that ends over a different window must leave the grab holder and enter
-        // the new one — otherwise the client keeps believing the cursor is inside it.
         let mut s = WindowStack::new();
         let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
         let b = win(&mut s, Role::Normal, 200, 0, 100, 100);
@@ -3149,8 +2347,6 @@ mod tests {
 
     #[test]
     fn a_dropped_batch_ends_the_grab() {
-        // The lost event may have been the release. A grab that outlives its button never
-        // ends, and every later click goes to the wrong window for the rest of the session.
         let mut s = WindowStack::new();
         let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
         let b = win(&mut s, Role::Normal, 200, 0, 100, 100);
@@ -3168,7 +2364,6 @@ mod tests {
 
     #[test]
     fn destroying_the_grab_holder_does_not_route_to_a_dead_id() {
-        // The router is not on the destroy path, so it has to notice by asking the stack.
         let mut s = WindowStack::new();
         let a = win(&mut s, Role::Normal, 0, 0, 100, 100);
         let b = win(&mut s, Role::Normal, 200, 0, 100, 100);
@@ -3195,12 +2390,7 @@ mod tests {
 
     #[test]
     fn a_mouse_held_against_the_edge_does_not_wrap_to_the_other_side() {
-        // `i32` deltas accumulate, and a stuck mouse really does send them without end.
-        // The direction matters: leftward cannot overflow, because the cursor is already
-        // clamped to `>= 0` and `0 + i32::MIN` is representable. **Rightward can** — the
-        // cursor sits at 639, and `639 + i32::MAX` wraps to a large negative, which the
-        // clamp then obediently pins to the *left* edge. A first version of this test
-        // pushed left three times, overflowed nothing, and passed against `wrapping_add`.
+        // Rightward can overflow: `639 + i32::MAX` wraps negative and pins to the left edge.
         let mut s = WindowStack::new();
         let mut r = InputRouter::new(SCREEN);
         for _ in 0..3 {
@@ -3220,13 +2410,6 @@ mod tests {
 
     #[test]
     fn the_press_that_focuses_a_window_is_also_delivered_to_it() {
-        // Click-to-focus must not eat the click: the window that comes to the front is the
-        // window that hears about the press that brought it there.
-        //
-        // Note the *ordering* here is not load-bearing, though it looks as if it should be.
-        // Hit-testing takes the topmost window containing the point, and a raise moves that
-        // same window further up — so re-testing after the raise gives the identical answer.
-        // A break that took the grab after the restack passed every test here, correctly.
         let mut s = WindowStack::new();
         let lower = win(&mut s, Role::Normal, 0, 0, 640, 480);
         win(&mut s, Role::Normal, 300, 300, 100, 100);
@@ -3238,12 +2421,10 @@ mod tests {
         assert_eq!(r.grab(), Some(lower));
     }
 
-    /// A wheel with nothing held.
     fn wheel(dz: i32) -> Logical {
         Logical::Wheel { dz, buttons: 0, modifiers: 0, time_ns: T }
     }
 
-    /// The wheel goes to the window under the cursor, carrying its detents.
     #[test]
     fn a_wheel_reaches_the_window_under_the_pointer() {
         let mut s = WindowStack::new();
@@ -3261,11 +2442,6 @@ mod tests {
         assert_eq!((event.x, event.y), (50, 50), "and window-local, like every other record");
     }
 
-    /// Scrolling does not raise, and does not reorder the stack.
-    ///
-    /// **A gesture people make without looking.** A wheel that raised would bring a window
-    /// forward — and take focus with it, since focus *is* topmost-focusable — for a scroll
-    /// aimed at whatever the cursor happened to rest on.
     #[test]
     fn a_wheel_neither_raises_nor_focuses() {
         let mut s = WindowStack::new();
@@ -3282,7 +2458,6 @@ mod tests {
         let _ = lower;
     }
 
-    /// Mid-drag the wheel follows the grab, not the cursor.
     #[test]
     fn a_wheel_during_a_drag_goes_to_the_grab_holder() {
         let mut s = WindowStack::new();
@@ -3298,10 +2473,6 @@ mod tests {
         assert!(out.iter().all(|o| o.window() == a), "the sequence belongs to the grab holder");
     }
 
-    /// A wheel carries the buttons and modifiers held while it turned.
-    ///
-    /// Ctrl-scroll is a gesture — zoom, in most applications — and it is expressible only
-    /// because the modifier travels on the record, exactly as it does for a click.
     #[test]
     fn a_wheel_carries_the_state_held_while_it_turned() {
         let mut s = WindowStack::new();
@@ -3316,11 +2487,6 @@ mod tests {
     }
 
     /// A delta too large for the wire saturates rather than wrapping.
-    ///
-    /// **Reachable rather than theoretical**: `input-server` sums the relative axes of every
-    /// batch a stalled consumer could not be sent and re-emits the total, so the number arriving
-    /// here is bounded by how long somebody scrolled, not by one packet. Wrapping would scroll
-    /// the other way at the moment the stall ended.
     #[test]
     fn a_wheel_delta_too_large_for_the_wire_saturates() {
         let mut s = WindowStack::new();
@@ -3338,11 +2504,6 @@ mod tests {
     }
 
     /// Every record of a batch carries the interrupt's time, synthesised crossings included.
-    ///
-    /// **The crossing is the half worth testing.** A press produces two records — the enter the
-    /// router *generates* and the button itself — and only the second has an event of its own
-    /// to take a time from. A version that stamped `emit` from a clock, or left the generated
-    /// one at zero, would still pass an assertion that only looked at the button.
     #[test]
     fn every_record_carries_the_time_of_the_event_that_caused_it() {
         let mut s = WindowStack::new();
@@ -3365,8 +2526,6 @@ mod tests {
             "a record was stamped from somewhere other than the event: {times:?}"
         );
 
-        // The leave into the other window is generated too, and by an event that is not a
-        // crossing — so it can only be stamped from the mirror.
         let out = go(&mut r, &mut s, motion(300, 0));
         let leave = out
             .iter()

@@ -1,28 +1,22 @@
 //! IPC wire types — [`IpcMsg`], [`IpcMsgHeader`], and [`SendMode`].
 //!
-//! These are the kernel-level message envelope that `sys_channel_send` /
-//! `sys_channel_recv` move across an [`IpcChannel`](crate::object::IpcChannel)
-//! endpoint pair. `docs/spec/ipc-message-format.md` is the normative source;
-//! this module is its in-kernel embodiment (the value types only — the channel
-//! object lives in [`crate::object::ipc_channel`]).
+//! The kernel-level message envelope that `sys_channel_send` / `sys_channel_recv` move across
+//! an [`IpcChannel`](crate::object::IpcChannel) endpoint pair.
+//! `docs/spec/ipc-message-format.md` is the normative source (the value types only — the
+//! channel object lives in [`crate::object::ipc_channel`]).
 //!
 //! ## Layout
 //!
-//! An [`IpcMsg`] is **exactly one page** (4096 bytes), `#[repr(C, align(4096))]`:
-//! a 24-byte [`IpcMsgHeader`], a 4008-byte inline `payload`, then an 8-entry
-//! transferable-handle array. (The spec's earlier draft listed a 4032-byte
-//! payload, which made the three regions sum to 4120 ≠ 4096; this reconciles it
-//! to a clean one-page envelope — `payload = 4096 − 24 − 64 = 4008`. Source
-//! wins; the spec doc is updated to match. See the decision log.)
+//! An [`IpcMsg`] is **exactly one page** (4096 bytes), `#[repr(C, align(4096))]`: a 24-byte
+//! [`IpcMsgHeader`], a 4008-byte inline `payload`, then an 8-entry transferable-handle array
+//! (`payload = 4096 − 24 − 64`).
 //!
 //! ## ABI
 //!
-//! `IpcMsg` / `IpcMsgHeader` / `SendMode` cross the kernel/userspace boundary,
-//! so their layouts are kernel-ABI-hash inputs (like
-//! [`Notification`](crate::libkern::Notification) /
-//! [`IoResult`](crate::libkern::IoResult)). The hash is not yet computed in
-//! code, so nothing is enforced today — but the offsets here are a contract and
-//! the compile-time asserts pin them.
+//! `IpcMsg` / `IpcMsgHeader` / `SendMode` cross the kernel/userspace boundary, so their layouts
+//! are kernel-ABI-hash inputs (like [`Notification`](crate::libkern::Notification) /
+//! [`IoResult`](crate::libkern::IoResult)). The hash is not yet computed in code, so the
+//! compile-time asserts are what pins the offsets.
 
 use crate::libkern::handle::RawHandle;
 
@@ -32,8 +26,7 @@ pub const IPC_MSG_SIZE: usize = 4096;
 pub const IPC_HEADER_SIZE: usize = 24;
 /// Maximum transferable handles carried by one message.
 pub const IPC_HANDLE_MAX: usize = 8;
-/// Bytes of inline payload per message (`IPC_MSG_SIZE − IPC_HEADER_SIZE −
-/// IPC_HANDLE_MAX × 8`).
+/// Bytes of inline payload per message (`IPC_MSG_SIZE − IPC_HEADER_SIZE − IPC_HANDLE_MAX × 8`).
 pub const IPC_PAYLOAD_SIZE: usize = IPC_MSG_SIZE - IPC_HEADER_SIZE - IPC_HANDLE_MAX * 8;
 
 /// Default per-direction queue depth when the caller passes `0` to
@@ -44,9 +37,8 @@ pub const IPC_MAX_QUEUE_DEPTH: u32 = 1024;
 
 /// The fixed 24-byte message header (`docs/spec/ipc-message-format.md`).
 ///
-/// `sender_pid` and `timestamp` are stamped by the kernel at send time and
-/// cannot be forged by the sender; `handle_count` is forced to `0` this slice
-/// (handle transfer lands with process spawn).
+/// `sender_pid` and `timestamp` are stamped by the kernel at send time and cannot be forged
+/// by the sender.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct IpcMsgHeader {
@@ -75,7 +67,7 @@ pub struct IpcMsg {
     pub header: IpcMsgHeader,
     /// Inline payload bytes (offset 24).
     pub payload: [u8; IPC_PAYLOAD_SIZE],
-    /// Transferable handles (offset 4032); unused until handle transfer lands.
+    /// Transferable handles (offset 4032).
     pub handles: [RawHandle; IPC_HANDLE_MAX],
 }
 
@@ -92,24 +84,20 @@ const _: () = assert!(core::mem::align_of::<IpcMsg>() == 4096);
 const _: () = assert!(core::mem::offset_of!(IpcMsg, header) == 0);
 const _: () = assert!(core::mem::offset_of!(IpcMsg, payload) == IPC_HEADER_SIZE);
 const _: () = assert!(core::mem::offset_of!(IpcMsg, handles) == IPC_HEADER_SIZE + IPC_PAYLOAD_SIZE);
-// The three regions tile the page exactly — no interior padding, so a
-// `StoredMsg` byte view (see `object::ipc_channel`) is fully initialised.
+// The three regions tile the page exactly — no interior padding, so a `StoredMsg` byte
+// view (see `object::ipc_channel`) is fully initialised.
 const _: () = assert!(IPC_HEADER_SIZE + IPC_PAYLOAD_SIZE + IPC_HANDLE_MAX * 8 == IPC_MSG_SIZE);
 
 /// How `sys_channel_send` behaves when the destination queue is full
 /// (`docs/spec/ipc-message-format.md` § "Send modes").
-///
-/// This slice implements [`NoBlock`](SendMode::NoBlock) only; `Block` /
-/// `BlockBounded` (which block via a `PendingOperation`) land with the async-I/O
-/// slice and return `Unsupported` until then.
 #[repr(u32)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum SendMode {
-    /// Block via a `PendingOperation` until the queue has space (deferred).
+    /// Block via a `PendingOperation` until the queue has space.
     Block = 0,
     /// Return `WouldBlock` immediately if the queue is full.
     NoBlock = 1,
-    /// Block up to a deadline, then time out (deferred).
+    /// Block up to a deadline, then time out.
     BlockBounded = 2,
 }
 

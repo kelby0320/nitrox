@@ -1,21 +1,15 @@
 //! Command history and reverse-search.
 //!
-//! Reverse-search steps through matches one at a time rather than showing a list.
 //! TODO(history-pager): `docs/rationale/deferred-decisions.md`.
 //!
-//! Pure logic, so it lives in the library half and host-tests in milliseconds — the same
-//! rule as the rest of `nxsh`. The terminal work (reading keys, redrawing) is the binary
-//! half's; deciding *what* to recall is here.
-//!
-//! History belongs to the shell rather than the tty server because completion will need the
-//! shell's knowledge of commands and schemas, and completion, search and recall are one
-//! editing loop over one buffer — see `docs/architecture/console-and-tty.md`.
+//! Pure logic: the terminal work (reading keys, redrawing) is the binary's, deciding what to
+//! recall is here. History belongs to the shell rather than the tty server because completion,
+//! search and recall are one editing loop over one buffer.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// How many lines are kept. Bounded because this is a shell in a fixed-size heap, and an
-/// unbounded history is a slow leak that only shows up after a long session.
+/// How many lines are kept: a shell in a fixed-size heap cannot grow without bound.
 pub const HISTORY_MAX: usize = 128;
 
 /// Command history: a ring, newest last, with a cursor for recall.
@@ -45,8 +39,7 @@ impl History {
 
     /// Record a submitted line.
     ///
-    /// Consecutive duplicates are not recorded: pressing Enter twice on the same command
-    /// should not cost two presses of Up to walk past.
+    /// Consecutive duplicates are not recorded, so Up does not walk past them.
     pub fn push(&mut self, line: &str) {
         let line = line.trim_end();
         if line.is_empty() {
@@ -61,8 +54,7 @@ impl History {
         self.back = 0;
     }
 
-    /// Walk one entry older. `current` is what is on the line now, stashed on the first
-    /// step so [`newer`](Self::newer) can restore it.
+    /// Walk one entry older; `current` is stashed on the first step for [`newer`](Self::newer).
     pub fn older(&mut self, current: &[u8]) -> Option<&str> {
         if self.back == self.lines.len() {
             return None; // already at the oldest
@@ -90,11 +82,8 @@ impl History {
     /// The most recent entry containing `query`, searching strictly older than `before`
     /// (an index into [`entries`](Self::entries)); `None` starts from the newest.
     ///
-    /// Returns the index so a caller can continue from it — repeated `Ctrl-R` walks back
-    /// through *every* match rather than sticking on the newest one.
-    ///
-    /// An empty query matches nothing. Matching everything would make the first keystroke
-    /// of a search jump the line to an unrelated command.
+    /// Returns the index so repeated `Ctrl-R` can continue from it. An empty query matches nothing:
+    /// matching everything would jump the line to an unrelated command on the first keystroke.
     pub fn search_back(&self, query: &str, before: Option<usize>) -> Option<usize> {
         if query.is_empty() {
             return None;
@@ -135,7 +124,6 @@ mod tests {
         assert_eq!(h.newer(), None, "and no further");
     }
 
-    /// The in-progress line is not lost by starting a recall.
     #[test]
     fn what_was_being_typed_comes_back() {
         let mut h = seeded();
@@ -151,14 +139,12 @@ mod tests {
         assert_eq!(h.older(b""), None);
     }
 
-    /// Pressing Enter twice on one command should not cost two presses of Up.
     #[test]
     fn consecutive_duplicates_are_not_recorded() {
         let mut h = History::new();
         h.push("same");
         h.push("same");
         assert_eq!(h.entries().len(), 1);
-        // ...but the same command later, after something else, is a real entry.
         h.push("other");
         h.push("same");
         assert_eq!(h.entries().len(), 3);
@@ -189,7 +175,6 @@ mod tests {
         assert_eq!(h.get(i), Some("list /bin"));
     }
 
-    /// Repeated `Ctrl-R` must walk through *every* match, not stick on the newest.
     #[test]
     fn search_continues_past_a_match() {
         let h = seeded();
@@ -206,8 +191,6 @@ mod tests {
         assert_eq!(h.get(i), Some("list /bin"));
     }
 
-    /// An empty query matching everything would make the first keystroke of a search jump
-    /// the line to an unrelated command.
     #[test]
     fn an_empty_query_matches_nothing() {
         let h = seeded();

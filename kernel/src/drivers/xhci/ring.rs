@@ -30,8 +30,8 @@ pub mod kind {
     pub const STATUS: u32 = 4;
     /// Link: the next TRB is at the address this one carries.
     pub const LINK: u32 = 6;
-    /// No Op transfer: moves the ring on and transfers nothing (Phase 6 Part D.2, to keep a
-    /// command's TRBs from straddling the Link).
+    /// No Op transfer: moves the ring on and transfers nothing, so a command's TRBs do not
+    /// straddle the Link.
     pub const NO_OP: u32 = 8;
     /// Enable Slot Command: the completion names a free slot.
     pub const ENABLE_SLOT: u32 = 9;
@@ -45,7 +45,7 @@ pub mod kind {
     pub const EVALUATE_CONTEXT: u32 = 13;
     /// Reset Endpoint Command: a halted endpoint to Stopped.
     pub const RESET_ENDPOINT: u32 = 14;
-    /// Stop Endpoint Command: a running endpoint to Stopped (Phase 6 Part D.3).
+    /// Stop Endpoint Command: a running endpoint to Stopped.
     pub const STOP_ENDPOINT: u32 = 15;
     /// Set TR Dequeue Pointer Command.
     pub const SET_TR_DEQUEUE: u32 = 16;
@@ -68,7 +68,7 @@ pub mod code {
     /// A transfer ended short: the device sent less than was asked for.
     pub const SHORT_PACKET: u8 = 13;
     /// A command found its endpoint in a state it does not apply to: Reset Endpoint on one that is
-    /// not halted, say (Phase 6 Part D.3).
+    /// not halted, say.
     pub const CONTEXT_STATE_ERROR: u8 = 19;
 }
 
@@ -81,7 +81,7 @@ const DIR_IN: u32 = 1 << 16;
 /// A Setup TRB's Transfer Type, in dword 3 bits 17:16: no data stage, or an IN one.
 const TRT_NO_DATA: u32 = 0;
 const TRT_IN: u32 = 3 << 16;
-/// A Setup TRB's Transfer Type for an OUT data stage (Phase 6 Part B.5).
+/// A Setup TRB's Transfer Type for an OUT data stage.
 const TRT_OUT: u32 = 2 << 16;
 
 /// Dword 3 bit 0: the cycle bit.
@@ -120,8 +120,7 @@ impl Trb {
         Trb([self.0[0], self.0[1], self.0[2], d3])
     }
 
-    /// An event's first two dwords as one address: a Command Completion Event's command TRB, a
-    /// Transfer Event's transfer TRB.
+    /// An event's first two dwords as one address: the command or transfer TRB it is about.
     pub const fn pointer(&self) -> u64 {
         self.0[0] as u64 | (self.0[1] as u64) << 32
     }
@@ -151,8 +150,7 @@ impl Trb {
         self.0[2] & 0x00FF_FFFF
     }
 
-    /// **A Setup stage** carrying its eight-byte request as immediate data, for a transfer with an
-    /// IN data stage when `data_in` and none otherwise.
+    /// **A Setup stage** carrying its eight-byte request as immediate data; `data_in` if IN data.
     pub const fn setup(request: [u8; 8], data_in: bool) -> Trb {
         let lo = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
         let hi = u32::from_le_bytes([request[4], request[5], request[6], request[7]]);
@@ -160,43 +158,41 @@ impl Trb {
         Trb([lo, hi, 8, kind::SETUP << 10 | IDT | trt])
     }
 
-    /// **A Setup stage for an OUT data stage** (Phase 6 Part B.5): a `SET_REPORT`'s.
+    /// **A Setup stage for an OUT data stage**: a `SET_REPORT`'s.
     pub const fn setup_out(request: [u8; 8]) -> Trb {
         let lo = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
         let hi = u32::from_le_bytes([request[4], request[5], request[6], request[7]]);
         Trb([lo, hi, 8, kind::SETUP << 10 | IDT | TRT_OUT])
     }
 
-    /// **An OUT Data stage** of `len` bytes from `buffer` (Phase 6 Part B.5).
+    /// **An OUT Data stage** of `len` bytes from `buffer`.
     pub const fn data_out(buffer: u64, len: u32) -> Trb {
         Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::DATA << 10])
     }
 
-    /// **An IN Data stage** of `len` bytes into `buffer`, **interrupting on a short packet** (Phase 6
-    /// Part B.7), so its event says how many bytes it did not move: a device that sends less than was
-    /// asked for — a Corsair K70 plugged in after boot, whose report descriptor came back without its
-    /// first packet — is otherwise read as zeroes where the rest should be.
+    /// **An IN Data stage** of `len` bytes into `buffer`, **interrupting on a short packet**, so
+    /// its event says how many bytes it did not move: a device that sends less than was asked for
+    /// (a Corsair K70 plugged in after boot, whose report descriptor came back without its first
+    /// packet) is otherwise read as zeroes where the rest should be.
     pub const fn data_in(buffer: u64, len: u32) -> Trb {
         Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::DATA << 10 | DIR_IN | ISP])
     }
 
-    /// **The Status stage**, interrupting on completion: OUT after an IN data stage, IN after an OUT
-    /// one or when there was none (USB 2.0 §8.5.3).
+    /// **The Status stage**, interrupting on completion: OUT after an IN data stage, else IN.
     pub const fn status(after_data_in: bool) -> Trb {
         let dir = if after_data_in { 0 } else { DIR_IN };
         Trb([0, 0, 0, kind::STATUS << 10 | dir | IOC])
     }
 
-    /// **A Normal TRB** of `len` bytes into `buffer`, interrupting on completion and on a short
-    /// packet (dword 3 bit 2), so a report shorter than asked for still ends it.
+    /// **A Normal TRB** of `len` bytes into `buffer`, interrupting on completion and short packet.
     pub const fn normal(buffer: u64, len: u32) -> Trb {
         Trb([buffer as u32, (buffer >> 32) as u32, len & 0x1_FFFF, kind::NORMAL << 10 | ISP | IOC])
     }
 
-    /// **A Normal TRB of a bulk transfer** (Phase 6 Part D.2): `len` bytes at `buffer`, `chain`ed to
-    /// the next when the transfer goes on, interrupting on completion when `ioc` and on a short
-    /// packet when `isp`. **`td_size`** is how many packets the transfer still has after this TRB,
-    /// clamped to 31, as xHCI 1.2 §4.11.2.4 asks.
+    /// **A Normal TRB of a bulk transfer**: `len` bytes at `buffer`, `chain`ed to the next when the
+    /// transfer goes on, interrupting on completion when `ioc` and on a short packet when `isp`.
+    /// **`td_size`** is how many packets the transfer still has after this TRB, clamped to 31
+    /// (xHCI 1.2 §4.11.2.4).
     pub const fn bulk(buffer: u64, len: u32, chain: bool, ioc: bool, isp: bool, td_size: u32) -> Trb {
         let flags = if chain { CHAIN } else { 0 } | if ioc { IOC } else { 0 } | if isp { ISP } else { 0 };
         let td = if td_size > 31 { 31 } else { td_size };
@@ -213,14 +209,13 @@ impl Trb {
         Trb([0, 0, 0, kind::DISABLE_SLOT << 10 | (slot as u32) << 24])
     }
 
-    /// A command naming an endpoint, `dci` of `slot`: Reset Endpoint, with Transfer State Preserve
-    /// clear.
+    /// A command naming an endpoint, `dci` of `slot`: Reset Endpoint, TSP clear.
     pub const fn endpoint_command(kind: u32, slot: u8, dci: u8) -> Trb {
         Trb([0, 0, 0, kind << 10 | (dci as u32) << 16 | (slot as u32) << 24])
     }
 
-    /// **Set TR Dequeue Pointer** for endpoint `dci` of `slot`: its dequeue pointer to `at`, a TRB's
-    /// address, with `cycle` as its Dequeue Cycle State.
+    /// **Set TR Dequeue Pointer** for endpoint `dci` of `slot`: to TRB address `at`, with `cycle`
+    /// as its Dequeue Cycle State.
     pub const fn set_dequeue(at: u64, cycle: bool, slot: u8, dci: u8) -> Trb {
         let lo = (at as u32 & !0xF) | cycle as u32;
         Trb([lo, (at >> 32) as u32, 0, kind::SET_TR_DEQUEUE << 10 | (dci as u32) << 16 | (slot as u32) << 24])
@@ -266,20 +261,18 @@ impl Producer {
         Producer { enqueue: 0, cycle: true }
     }
 
-    /// The cycle state a reader starts with: the Ring Cycle State a command ring's CRCR, or an
-    /// endpoint context's dequeue pointer, carries.
+    /// The cycle state a reader starts with: what a CRCR or an endpoint dequeue pointer carries.
     pub fn cycle(&self) -> bool {
         self.cycle
     }
 
-    /// The slot the next [`push`](Self::push) writes, so a caller can say which TRB it awaits
-    /// **before** the controller can complete it.
+    /// The slot the next [`push`](Self::push) writes, known **before** the controller completes it.
     pub fn next_slot(&self) -> usize {
         self.enqueue
     }
 
-    /// **How many TRBs fit before the Link**, of a ring of `len` slots (Phase 6 Part D.2): a
-    /// transfer descriptor longer than this would straddle it, which needs the Link chained.
+    /// **How many TRBs fit before the Link**, of a ring of `len` slots: a longer transfer
+    /// descriptor would straddle it, which needs the Link chained.
     pub fn room_before_link(&self, len: usize) -> usize {
         len - 1 - self.enqueue
     }
@@ -326,8 +319,7 @@ impl Consumer {
         Consumer { dequeue: 0, cycle: true }
     }
 
-    /// The slot the next event will be in, which the Event Ring Dequeue Pointer is set to after
-    /// a drain.
+    /// The slot the next event will be in: the Event Ring Dequeue Pointer's value after a drain.
     pub fn dequeue(&self) -> usize {
         self.dequeue
     }
@@ -368,9 +360,8 @@ mod tests {
     const BASE: u64 = 0x1234_5000;
 
     /// **The controller's side of a producer ring**, written from the specification rather than
-    /// from [`Producer`]: start at slot 0 with the producer's cycle state, take a TRB whose cycle
-    /// bit matches, follow a Link and flip on *Toggle Cycle*. A producer whose Link is handed over
-    /// with the wrong bit, or not at all, makes this reader stop or read stale slots.
+    /// from [`Producer`]: take a TRB whose cycle bit matches, follow a Link and flip on *Toggle
+    /// Cycle*. A producer whose Link is handed over wrongly makes it stop or read stale slots.
     struct Controller {
         at: usize,
         cycle: bool,
@@ -413,8 +404,7 @@ mod tests {
         assert_eq!(c.take(&mem), None, "nothing for the controller yet");
     }
 
-    /// **A bulk TRB's fields** (Phase 6 Part D.2): the buffer, the length with the TD size above
-    /// it, clamped, and the chain, completion and short-packet bits only when asked for.
+    /// **A bulk TRB's fields**: the length with the TD size above it, clamped; only bits asked for.
     #[test]
     fn a_bulk_trb_carries_its_td_size_and_only_the_bits_asked_for() {
         let t = Trb::bulk(0x1_2345_6000, 4096, true, false, true, 7);
@@ -426,8 +416,7 @@ mod tests {
         assert_eq!(Trb::no_op().kind(), kind::NO_OP);
     }
 
-    /// **Room before the Link** is every slot but the Link's, less what is written, and the whole
-    /// ring again once it wraps.
+    /// **Room before the Link** shrinks as slots are written and is whole again after the wrap.
     #[test]
     fn the_room_before_the_link_shrinks_and_comes_back_at_the_wrap() {
         let mut mem = Mem(vec![Trb::default(); 8]);
@@ -441,8 +430,7 @@ mod tests {
         assert_eq!(ring.room_before_link(8), 7, "wrapped");
     }
 
-    /// **Three times round a ring of eight**, the controller taking each TRB as it is written:
-    /// every one is seen once, in order, across each wrap.
+    /// **Three times round a ring of eight**: every TRB is seen once, in order, across each wrap.
     #[test]
     fn the_controller_sees_every_trb_once_across_wraps() {
         let mut mem = Mem(vec![Trb::default(); 8]);
@@ -456,8 +444,7 @@ mod tests {
         }
     }
 
-    /// **The same, with the controller behind**: seven written before it looks, which is a full
-    /// ring, then seven more after it has caught up.
+    /// **The same, with the controller behind**: seven written before it looks, then seven more.
     #[test]
     fn a_full_ring_read_late_reads_in_order() {
         let mut mem = Mem(vec![Trb::default(); 8]);
@@ -497,10 +484,8 @@ mod tests {
         assert_eq!(ev.next(&mem), None, "slot 1 still holds last round's event");
     }
 
-    /// **A control transfer's three stages**, each field where xHCI 1.2 §6.4.1.2 puts it: a
-    /// GET_DESCRIPTOR(device, 18) as the Setup stage's immediate data, an IN Data stage that
-    /// interrupts on a short packet (ISP, bit 2, since Phase 6 Part B.7), and the OUT Status stage
-    /// that follows one, which alone interrupts on completion.
+    /// **A control transfer's three stages**, each field where xHCI 1.2 §6.4.1.2 puts it; the IN
+    /// Data stage interrupts on a short packet and the OUT Status stage alone on completion.
     #[test]
     fn a_control_transfers_stages_encode_as_the_specification_lays_them_out() {
         let get = [0x80, 6, 0, 1, 0, 0, 18, 0];
@@ -520,18 +505,17 @@ mod tests {
         let deq = Trb::set_dequeue(0x1_0000_2030, true, 7, 1);
         assert_eq!(deq.0, [0x2031, 0x1, 0, 16 << 10 | 1 << 16 | 7 << 24], "the address with DCS, SCT 0");
         assert_eq!(Trb::set_dequeue(0x2030, false, 7, 1).0[0], 0x2030);
-        // Phase 6 Part B.2: an interrupt endpoint's report, and Configure Endpoint.
+        // An interrupt endpoint's report, and Configure Endpoint.
         let normal = Trb::normal(0x1_0000_4000, 8);
         assert_eq!(normal.0, [0x4000, 0x1, 8, 1 << 10 | 1 << 5 | 1 << 2], "Normal, IOC and ISP");
         let configure = Trb::with_input(kind::CONFIGURE_ENDPOINT, 0x3000, 7);
         assert_eq!(configure.0, [0x3000, 0, 0, 12 << 10 | 7 << 24], "DC clear");
-        // Part B.5: a SET_REPORT's OUT stages, its Status then IN.
+        // A SET_REPORT's OUT stages, its Status then IN.
         let set_report = [0x21, 9, 0, 2, 0, 0, 1, 0];
         assert_eq!(Trb::setup_out(set_report).0[3], kind::SETUP << 10 | 1 << 6 | 2 << 16, "TRT 2: OUT");
         assert_eq!(Trb::data_out(0x5000, 1).0, [0x5000, 0, 1, kind::DATA << 10], "DIR clear: OUT");
     }
 
-    /// A Transfer Event's endpoint and residual, from dwords 3 and 2.
     #[test]
     fn a_transfer_events_endpoint_and_residual_read_from_their_bits() {
         let ev = Trb([
@@ -544,7 +528,6 @@ mod tests {
         assert_eq!(ev.completion_code(), code::SHORT_PACKET);
     }
 
-    /// The producer says where the next TRB goes before it is written, including after a wrap.
     #[test]
     fn the_next_slot_is_known_before_the_push() {
         let mut mem = Mem(vec![Trb::default(); 4]);
@@ -555,8 +538,7 @@ mod tests {
         }
     }
 
-    /// A Command Completion Event as the specification lays it out (xHCI 1.2 §6.4.2.2), read field
-    /// by field.
+    /// A Command Completion Event as xHCI 1.2 §6.4.2.2 lays it out, read field by field.
     #[test]
     fn an_events_fields_read_from_their_dwords() {
         let ev = Trb([

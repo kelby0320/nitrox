@@ -2,7 +2,7 @@
 
 use crate::*;
 
-/// **Partitioning and formatting, through `with admin`** (Phase 6 Part G), after the sticks:
+/// **Partitioning and formatting, through `with admin`**, after the sticks:
 ///
 /// 4. **`disk --list`'s `note`** names the internal FAT's reason, `not removable, so not mounted`.
 /// 5. **`disk --format` of a partition of the boot stick** is refused before anything is written,
@@ -47,7 +47,6 @@ pub(crate) fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R
         t[at + "boot-part=<blk-".len()..].split('>').next().unwrap_or("").to_string()
     };
 
-    // 4. The note.
     s.send(&format!(
         "disk --list | filter name == \"blk-{internal}\" | map {{ |r| format(\"note-is={{}}\", r.note) }}"
     ))?;
@@ -191,10 +190,10 @@ fn carve_sparse(from: &Path, at: u64, len: u64, to: &Path) -> R<()> {
     Ok(())
 }
 
-/// **The stick partitioned and formatted in the guest, on the host** (Phase 6 Part G):
-/// - **as its ext4 was ejected** (`ext4_copy`): a GPT whose one partition is a Linux filesystem from
-///   1 MiB to the last usable sector, holding an ext4 `e2fsck -fn` finds clean, with the pattern
-///   `debugfs` reads;
+/// **The stick partitioned and formatted in the guest, on the host**:
+/// - **as its ext4 was ejected** (`ext4_copy`): a GPT whose one partition is a Linux filesystem
+///   from 1 MiB to the last usable sector, holding an ext4 `e2fsck -fn` finds clean, with the
+///   pattern `debugfs` reads;
 /// - **as it was pulled** (`stick`): an MBR naming one FAT32 partition from 1 MiB to the end, **no
 ///   GPT left** — neither header, front nor back — and the FAT `fsck.fat -n` finds clean, its
 ///   pattern read by `mtype`.
@@ -223,7 +222,7 @@ pub(crate) fn check_formatted_stick(ext4_copy: &Path, stick: &Path, work: &Path)
         )
         .into());
     }
-    // **Every other entry unused** (PR #369 review): entries are 128 bytes, four to a sector, so the
+    // **Every other entry unused**: entries are 128 bytes, four to a sector, so the
     // second is at LBA 2 + 128 — sixteen zero bytes at LBA 3 are the fifth's type.
     let mut array = vec![0u8; 128 * 128];
     fs::File::open(ext4_copy)?.read_exact_at(&mut array, 2 * 512)?;

@@ -1,48 +1,27 @@
-//! User memory access — arch-neutral half.
+//! User memory access: the arch-neutral half.
 //!
-//! The single sanctioned interface for reading or writing user memory
-//! from kernel code. This file owns:
-//!
-//! - The opaque [`UserPtr<T>`] / [`UserMutPtr<T>`] pointer types and
-//!   their validating constructors.
-//! - The [`UserAccessError`] enum.
-//! - The five public copy primitives (`copy_from_user`,
-//!   `copy_to_user`, `copy_slice_from_user`, `copy_slice_to_user`,
-//!   `copy_cstr_from_user`).
-//! - The exception-table lookup walked by the `#PF` handler.
-//!
-//! The arch-specific half — the inline-asm raw byte copy under
-//! SMAP/PAN and the `.user_access_table` entry emission — lives in
-//! `kernel/src/arch/<arch>/user_access.rs` and is reached through
-//! [`crate::arch::user_access`].
+//! The single sanctioned interface for reading or writing user memory from kernel code: the
+//! opaque [`UserPtr<T>`] / [`UserMutPtr<T>`], [`UserAccessError`], the five copy primitives and
+//! the exception-table lookup the `#PF` handler walks. The raw byte copy under SMAP/PAN lives in
+//! `kernel/src/arch/<arch>/user_access.rs` ([`crate::arch::user_access`]).
 //!
 //! ## Discipline rules
 //!
-//! 1. **Opaque pointer types.** `UserPtr<T>` / `UserMutPtr<T>` have
-//!    no `Deref`, no `read` / `write` methods, and no way to recover
-//!    the raw `u64` from outside this module. The kernel may not
-//!    access user memory by any other path; see the project-level
-//!    rule in `kernel/CLAUDE.md`.
+//! 1. **Opaque pointer types.** `UserPtr<T>` / `UserMutPtr<T>` have no `Deref`, no `read` /
+//!    `write`, and no way to recover the raw `u64` from outside this module; the kernel may not
+//!    access user memory by any other path (`kernel/CLAUDE.md`).
 //! 2. **SMAP/PAN discipline.** The protection is enabled at boot
-//!    ([`crate::arch::ensure_smap_smep`] on x86_64). The instructions
-//!    that bracket each user access live only inside the arch
-//!    primitives in `arch::user_access`, never as Rust-visible
-//!    wrappers.
-//! 3. **Fault recovery.** Each raw arch primitive registers a
-//!    `(fault_pc, recovery_pc)` pair in the `.user_access_table`
-//!    section. On a `#PF` whose RIP matches a registered fault site,
-//!    the arch layer's `#PF` handler patches RIP to the
-//!    recovery PC, which closes the protection window and signals
-//!    failure. A user-side fault turns into
-//!    [`UserAccessError::Fault`], not a kernel halt.
+//!    ([`crate::arch::ensure_smap_smep`] on x86_64). The instructions bracketing each user access
+//!    live only inside the arch primitives, never as Rust-visible wrappers.
+//! 3. **Fault recovery.** Each raw arch primitive registers a `(fault_pc, recovery_pc)` pair in
+//!    `.user_access_table`. On a `#PF` whose RIP matches a fault site, the arch `#PF` handler
+//!    patches RIP to the recovery PC, which closes the protection window and signals failure: a
+//!    user-side fault becomes [`UserAccessError::Fault`], not a kernel halt.
 //!
 //! ## Why absolute u64 entries
 //!
-//! Linux uses 32-bit relative offsets to be KASLR-friendly. Nitrox
-//! has no KASLR (and isn't planning any in Phase 1), so absolute
-//! 64-bit PCs are simpler and the per-entry cost (16 vs 8 bytes) is
-//! negligible at the entry counts we expect. Decision recorded in
-//! the slice-1 decision log entry.
+//! Linux uses 32-bit relative offsets to suit KASLR. Nitrox has none, so absolute 64-bit PCs are
+//! simpler and the per-entry cost (16 vs 8 bytes) is negligible.
 
 use core::marker::PhantomData;
 use core::mem::{MaybeUninit, align_of, size_of};
@@ -51,32 +30,23 @@ use crate::arch::UserAccess;
 use crate::arch::abi::USER_VIRT_END;
 use crate::arch::user_access::{ArchUserAccess, CstrCopyOutcome};
 
-/// One entry in the `.user_access_table` section: a (fault_pc,
-/// recovery_pc) pair. Inline asm in the copy primitives emits the
-/// entries with `.quad` directives — Rust and asm have to agree on
-/// the exact byte layout, hence `#[repr(C)]`.
+/// One entry in `.user_access_table`: a (fault_pc, recovery_pc) pair. The copy primitives' inline
+/// asm emits entries with `.quad`, so Rust and asm must agree on the layout: `#[repr(C)]`.
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ExtableEntry {
-    /// Instruction-pointer value the CPU pushes when a fault occurs
-    /// at the registered site. The handler matches against this.
+    /// Instruction pointer on a fault at the registered site.
     pub fault_pc: u64,
-    /// Instruction-pointer value to resume at when the fault matches.
-    /// The recovery code is responsible for `clac` and for signalling
-    /// failure back to the copy primitive's caller.
+    /// Instruction pointer to resume at; the recovery code does the `clac` and signals failure.
     pub recovery_pc: u64,
 }
 
 const _: () = assert!(size_of::<ExtableEntry>() == 16);
 const _: () = assert!(align_of::<ExtableEntry>() == 8);
 
-/// Search the exception table for an entry matching `fault_pc`.
-/// Returns the recovery PC if a match exists, otherwise `None`.
+/// Search the exception table for `fault_pc`; the recovery PC on a match.
 ///
-/// Linear scan; the table holds one entry per copy primitive (five
-/// today), easily fits in a single cacheline, and the lookup happens
-/// only on the rare (faulting) path. Revisit if Phase 2 ever grows
-/// the entry count past a few dozen.
+/// A linear scan: one entry per copy primitive, and it runs only on the rare faulting path.
 pub fn lookup_recovery(fault_pc: u64) -> Option<u64> {
     // SAFETY: the linker provides matching `__start_user_access_table`
     // and `__stop_user_access_table` symbols, both within the kernel
@@ -87,8 +57,7 @@ pub fn lookup_recovery(fault_pc: u64) -> Option<u64> {
     lookup_recovery_in(table, fault_pc)
 }
 
-/// Pure lookup against an explicit table — extracted so host tests can
-/// inject their own entries without needing the linker symbols.
+/// Lookup against an explicit table, so host tests can inject entries without linker symbols.
 fn lookup_recovery_in(table: &[ExtableEntry], fault_pc: u64) -> Option<u64> {
     for entry in table {
         if entry.fault_pc == fault_pc {
@@ -98,9 +67,7 @@ fn lookup_recovery_in(table: &[ExtableEntry], fault_pc: u64) -> Option<u64> {
     None
 }
 
-/// The exception-table slice between the linker-provided start/stop
-/// symbols. Under `cfg(test)` returns an empty slice — host builds
-/// have no linker section for `.user_access_table`.
+/// The exception-table slice between the linker's start/stop symbols; empty under `cfg(test)`.
 ///
 /// # Safety
 /// Only sound when called in a kernel build where the linker has
@@ -128,33 +95,23 @@ unsafe fn exception_table() -> &'static [ExtableEntry] {
     &[]
 }
 
-// --- Public types -------------------------------------------------------
-
 /// Why a user-memory access could not be completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserAccessError {
-    /// The address (or address + length) falls outside the user half
-    /// `[0, USER_VIRT_END)`, or the length arithmetic overflows.
+    /// The address (or address + length) is outside `[0, USER_VIRT_END)`, or the length overflows.
     BadAddress,
     /// The address is not aligned for the access type.
     Misaligned,
-    /// A page fault occurred during the copy. The user's page may be
-    /// unmapped, write-protected (on a `to_user` copy), or otherwise
-    /// inaccessible. The copy is undone for the caller (no kernel-side
-    /// bytes were committed past the point of partial completion).
+    /// A page fault during the copy: the user page may be unmapped, write-protected (on a
+    /// `to_user` copy) or otherwise inaccessible.
     Fault,
-    /// [`copy_cstr_from_user`] filled the destination buffer without
-    /// finding a NUL byte. The caller can grow the buffer and retry.
+    /// [`copy_cstr_from_user`] filled the buffer without finding a NUL; the caller may grow it.
     NoTerminator,
 }
 
-/// A read-only pointer into user memory. Opaque: the held address is
-/// invisible outside this module. Constructed from a `u64` (typically
-/// a syscall argument) via [`UserPtr::new`], which validates that the
-/// address is in the user half and aligned for `T`.
-///
-/// The type parameter `T` is a tag; nothing reads a `T` out of a
-/// `UserPtr<T>` except the copy primitives below.
+/// A read-only pointer into user memory. Opaque: the address is invisible outside this module.
+/// [`UserPtr::new`] validates that it is in the user half and aligned for `T`. `T` is only a
+/// tag: nothing but the copy primitives reads a `T` out of it.
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug)]
 pub struct UserPtr<T> {
@@ -162,8 +119,7 @@ pub struct UserPtr<T> {
     _phantom: PhantomData<*const T>,
 }
 
-/// A read-write pointer into user memory. Twin of [`UserPtr<T>`]
-/// tagged for the writer side; identical validation rules.
+/// A read-write pointer into user memory: the writer-side twin of [`UserPtr<T>`], same validation.
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug)]
 pub struct UserMutPtr<T> {
@@ -172,31 +128,26 @@ pub struct UserMutPtr<T> {
 }
 
 impl<T> UserPtr<T> {
-    /// Construct a `UserPtr<T>` from a raw `u64` address. Returns
-    /// `Err` if the address is outside the user half, or not aligned
-    /// for `T`.
+    /// Construct from a raw `u64`; `Err` if outside the user half or misaligned for `T`.
     pub fn new(addr: u64) -> Result<Self, UserAccessError> {
         validate_user_addr::<T>(addr)?;
         Ok(Self { addr, _phantom: PhantomData })
     }
 
-    /// The raw u64 address. Crate-internal only — nothing outside
-    /// this module should reach for a user address.
+    /// The raw address, crate-internal.
     pub(crate) fn as_u64(&self) -> u64 {
         self.addr
     }
 }
 
 impl<T> UserMutPtr<T> {
-    /// Construct a `UserMutPtr<T>` from a raw `u64` address. Returns
-    /// `Err` if the address is outside the user half, or not aligned
-    /// for `T`.
+    /// Construct from a raw `u64`; `Err` if outside the user half or misaligned for `T`.
     pub fn new(addr: u64) -> Result<Self, UserAccessError> {
         validate_user_addr::<T>(addr)?;
         Ok(Self { addr, _phantom: PhantomData })
     }
 
-    /// The raw u64 address. Crate-internal only.
+    /// The raw address, crate-internal.
     pub(crate) fn as_u64(&self) -> u64 {
         self.addr
     }
@@ -221,16 +172,8 @@ fn validate_user_range(addr: u64, len: u64) -> Result<(), UserAccessError> {
     Ok(())
 }
 
-// --- Copy primitives ----------------------------------------------------
-
-/// Copy a `T` out of user memory by value.
-///
-/// On success, returns the freshly-read value. On fault — the user's
-/// page is unmapped, the address is bad, etc. — returns
-/// [`UserAccessError::Fault`] without committing kernel-side state.
-///
-/// For zero-sized `T` this is a no-op that yields the type's only
-/// inhabitant without touching the user pointer.
+/// Copy a `T` out of user memory; [`UserAccessError::Fault`] commits no kernel-side state. A
+/// zero-sized `T` yields its only value without touching the pointer.
 pub fn copy_from_user<T: Copy>(src: UserPtr<T>) -> Result<T, UserAccessError> {
     let addr = src.as_u64();
     let n = size_of::<T>();
@@ -256,15 +199,9 @@ pub fn copy_from_user<T: Copy>(src: UserPtr<T>) -> Result<T, UserAccessError> {
     Ok(unsafe { out.assume_init() })
 }
 
-/// Copy a `T` from kernel memory into user memory by value.
-///
-/// On success, the bytes of `src` are at the user address. On fault —
-/// the user page is unmapped, read-only, etc. — returns
-/// [`UserAccessError::Fault`]. Partial writes may have completed
-/// before the fault (the user observed some prefix of the bytes);
-/// the kernel-side `src` is untouched.
-///
-/// For zero-sized `T` this is a no-op.
+/// Copy a `T` from kernel memory into user memory. [`UserAccessError::Fault`] on a fault, after
+/// which a prefix of the bytes may already be visible to the user; `src` is untouched. A no-op
+/// for zero-sized `T`.
 pub fn copy_to_user<T: Copy>(dst: UserMutPtr<T>, src: &T) -> Result<(), UserAccessError> {
     let addr = dst.as_u64();
     let n = size_of::<T>();
@@ -280,10 +217,7 @@ pub fn copy_to_user<T: Copy>(dst: UserMutPtr<T>, src: &T) -> Result<(), UserAcce
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
-/// Copy `dst.len()` bytes from user memory into `dst`.
-///
-/// Byte-granular: `src` and `dst` do not need to be aligned beyond
-/// the byte boundary they already satisfy. Empty `dst` is a no-op.
+/// Copy `dst.len()` bytes from user memory into `dst`. Byte-granular; an empty `dst` is a no-op.
 pub fn copy_slice_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<(), UserAccessError> {
     let addr = src.as_u64();
     let n = dst.len();
@@ -311,14 +245,11 @@ pub fn copy_slice_to_user(dst: UserMutPtr<u8>, src: &[u8]) -> Result<(), UserAcc
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
-/// Copy a NUL-terminated string from user memory into `dst`. Stops at
-/// the first NUL byte (which is included in the returned slice) or
-/// when `dst` is full.
+/// Copy a NUL-terminated string from user memory into `dst`, stopping after the first NUL or when
+/// `dst` is full.
 ///
-/// Returns:
-/// - `Ok(&dst[..k])` where the `k`th byte is the NUL terminator;
-/// - `Err(NoTerminator)` if `dst` filled without finding a NUL —
-///   the caller may grow the buffer and retry;
+/// - `Ok(&dst[..k])`: the `k`th byte is the NUL;
+/// - `Err(NoTerminator)`: `dst` filled without a NUL, so the caller may grow it and retry;
 /// - `Err(Fault)` / `Err(BadAddress)` per the normal rules.
 pub fn copy_cstr_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], UserAccessError> {
     let addr = src.as_u64();
@@ -342,8 +273,6 @@ pub fn copy_cstr_from_user(dst: &mut [u8], src: UserPtr<u8>) -> Result<&[u8], Us
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- Exception-table lookup (unchanged from slice 1) ---
 
     #[test]
     fn empty_table_returns_none() {
@@ -390,16 +319,11 @@ mod tests {
 
     #[test]
     fn entry_layout_matches_assembly_contract() {
-        // Inline asm emits entries with `.quad fault_pc; .quad
-        // recovery_pc`. Lock down the layout so those writes can't
-        // drift away from the struct.
         assert_eq!(size_of::<ExtableEntry>(), 16);
         assert_eq!(align_of::<ExtableEntry>(), 8);
         assert_eq!(core::mem::offset_of!(ExtableEntry, fault_pc), 0);
         assert_eq!(core::mem::offset_of!(ExtableEntry, recovery_pc), 8);
     }
-
-    // --- UserPtr / UserMutPtr validation ---
 
     #[test]
     fn user_ptr_rejects_kernel_half_addr() {
@@ -418,10 +342,8 @@ mod tests {
 
     #[test]
     fn user_ptr_rejects_misaligned_addr_for_t() {
-        // u32 has align 4; addresses with bits 0..1 set are misaligned.
         assert!(matches!(UserPtr::<u32>::new(1), Err(UserAccessError::Misaligned),));
         assert!(matches!(UserPtr::<u32>::new(2), Err(UserAccessError::Misaligned),));
-        // Aligned addresses pass.
         assert!(UserPtr::<u32>::new(0).is_ok());
         assert!(UserPtr::<u32>::new(4).is_ok());
         assert!(UserPtr::<u32>::new(0x1000).is_ok());
@@ -429,7 +351,6 @@ mod tests {
 
     #[test]
     fn user_ptr_u8_accepts_any_byte_aligned_addr() {
-        // u8 has align 1; every user-half address is aligned.
         for addr in [0u64, 1, 2, 3, 0x1234, 0x1235, USER_VIRT_END - 1] {
             assert!(UserPtr::<u8>::new(addr).is_ok(), "addr {:#x}", addr);
         }
@@ -440,13 +361,10 @@ mod tests {
 
     #[test]
     fn user_ptr_respects_larger_alignment() {
-        // Aligned16 has align 16.
         assert!(matches!(UserPtr::<Aligned16>::new(8), Err(UserAccessError::Misaligned),));
         assert!(UserPtr::<Aligned16>::new(16).is_ok());
         assert!(UserPtr::<Aligned16>::new(0x1000).is_ok());
     }
-
-    // --- validate_user_range ---
 
     #[test]
     fn range_within_user_half_ok() {
@@ -457,7 +375,6 @@ mod tests {
 
     #[test]
     fn range_crossing_user_boundary_rejected() {
-        // Even one byte past USER_VIRT_END is rejected.
         assert_eq!(validate_user_range(USER_VIRT_END - 8, 9), Err(UserAccessError::BadAddress),);
         assert_eq!(validate_user_range(0, USER_VIRT_END + 1), Err(UserAccessError::BadAddress),);
     }
@@ -469,21 +386,14 @@ mod tests {
 
     #[test]
     fn zero_length_range_is_vacuously_ok() {
-        // A zero-length range accesses no bytes, so it satisfies the
-        // "every byte is in the user half" property vacuously. The
-        // public copy primitives layer per-pointer validation on top
-        // via `UserPtr::new`, which does reject `addr >= USER_VIRT_END`.
+        // A zero-length range accesses no byte, so it passes vacuously.
         assert!(validate_user_range(0, 0).is_ok());
         assert!(validate_user_range(USER_VIRT_END, 0).is_ok());
     }
 
-    // --- Copy primitives against the host memcpy stub ---
-
     #[test]
     fn copy_slice_from_user_rejects_kernel_half() {
         let mut buf = [0u8; 8];
-        // Construct a UserPtr via direct addr; only the bounds check
-        // can trip on a 1-byte read from `USER_VIRT_END - 4` + 8.
         let src = UserPtr::<u8>::new(USER_VIRT_END - 4).expect("low addr ok");
         assert_eq!(copy_slice_from_user(&mut buf, src), Err(UserAccessError::BadAddress),);
     }
@@ -509,28 +419,12 @@ mod tests {
         assert_eq!(copy_cstr_from_user(&mut buf, src), Err(UserAccessError::NoTerminator),);
     }
 
-    // The copy primitives' *success-path* host tests use the host
-    // memcpy stub; they verify only the wrapper plumbing (range
-    // check → raw → bytes land at dst). Their target-side equivalents
-    // exercise SMAP and the exception table — those will land with
-    // the first syscall consumer in a later slice.
-
     #[test]
     fn copy_slice_host_stub_copies_bytes() {
         let src_data: [u8; 5] = [1, 2, 3, 4, 5];
-        // The host test treats the src address as an ordinary kernel
-        // pointer. `UserPtr::new` would reject `src_data.as_ptr() as
-        // u64` because that pointer is above USER_VIRT_END on real
-        // 64-bit Linux. Bypass via the unsafe `pub(crate)` field by
-        // constructing the struct directly within this module.
+        // Treat the src address as a kernel pointer: `UserPtr::new` would reject it.
         let src = UserPtr::<u8> { addr: src_data.as_ptr() as u64, _phantom: PhantomData };
         let mut dst = [0u8; 5];
-        // Validation will reject this if the host address happens to
-        // be above USER_VIRT_END. Skip the assertion in that case —
-        // the host stub's job is only to verify wrapper plumbing,
-        // and stack pointers on Linux are typically in the user
-        // half (below 0x7FFF_FFFF_FFFF) which is also below our
-        // USER_VIRT_END (0x8000_0000_0000).
         if src.addr < USER_VIRT_END && src.addr.checked_add(dst.len() as u64).is_none_or(|e| e <= USER_VIRT_END) {
             assert_eq!(copy_slice_from_user(&mut dst, src), Ok(()));
             assert_eq!(dst, src_data);
@@ -551,10 +445,7 @@ mod tests {
 
     #[test]
     fn copy_cstr_maps_fault_outcome_to_fault_error() {
-        // The host stub never #PFs on its own, so force the step that the
-        // real asm body reaches on a user-side fault and confirm
-        // `copy_cstr_from_user` maps `CstrCopyOutcome::Fault` to
-        // `UserAccessError::Fault`.
+        // Force the user-side fault outcome that the host stub never produces.
         let src_data: [u8; 8] = *b"hello\0XX";
         let src = UserPtr::<u8> { addr: src_data.as_ptr() as u64, _phantom: PhantomData };
         let mut dst = [0u8; 16];

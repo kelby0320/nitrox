@@ -2,6 +2,7 @@
 
 mod abi;
 mod arch;
+mod comment_budget;
 pub(crate) mod comments;
 mod deferrals;
 pub(crate) mod docs;

@@ -1,4 +1,4 @@
-//! **The hub thread** (Phase 6 Part A.2): the root hub's ports, enumerated.
+//! **The hub thread**: the root hub's ports, enumerated.
 //!
 //! A kernel thread from `sched::spawn`, and the first long-lived one to block in `sched::wait_on`:
 //! on a command's or a transfer's `PendingOperation`, which the DPC completes; on the port-change
@@ -12,15 +12,14 @@
 //!
 //! **Per device**: a USB 2 port is reset (a USB 3 one is enabled by link training), a slot is
 //! enabled, the device is addressed, its default endpoint's packet size is read and evaluated, its
-//! device and configuration descriptors and its strings are read, and it is matched against the
-//! class table — **logged, and not configured**: the class driver that binds does that (Parts B
-//! and D). Every command and transfer has a deadline; a device that misses one is logged, and its
-//! slot disabled. A string the device stalls is passed over and its endpoint recovered. A command
-//! that goes unanswered leaves the command ring in doubt, so nothing more is asked of it.
+//! descriptors and strings are read, and it is matched against the class table — **logged, and
+//! not configured**: the class driver that binds does that. Every command and transfer has a
+//! deadline; a device that misses one is logged, and its slot disabled. A command that goes
+//! unanswered leaves the command ring in doubt, so nothing more is asked of it.
 //!
 //! **A slot is disabled before its memory is freed** — on a failed enumeration and on a departure
 //! alike — and one that does not disable keeps its memory ([`release`]). A connect change on a port
-//! with a device is a departure, then an arrival. Departures in the registry are Part C's.
+//! with a device is a departure, then an arrival.
 
 use core::sync::atomic::Ordering;
 
@@ -45,7 +44,6 @@ pub const FIRST_ROUND_NS: u64 = 2_000_000_000;
 
 /// USB 2.0 §7.1.7.3: 100 ms from a connection before the port is reset.
 const DEBOUNCE_NS: u64 = 100_000_000;
-/// A port reset's completion.
 const RESET_NS: u64 = 500_000_000;
 /// USB 2.0 §7.1.7.5: 10 ms after a reset before the device is spoken to.
 const RECOVERY_NS: u64 = 10_000_000;
@@ -53,7 +51,6 @@ const RECOVERY_NS: u64 = 10_000_000;
 const LINK_NS: u64 = 100_000_000;
 /// SET_ADDRESS's recovery interval: USB 2.0 §9.2.6.3 allows 2 ms, and Linux waits 10.
 const SET_ADDRESS_NS: u64 = 10_000_000;
-/// A command's completion, and a control transfer's.
 const COMMAND_NS: u64 = 1_000_000_000;
 const TRANSFER_NS: u64 = 1_000_000_000;
 
@@ -96,19 +93,17 @@ impl core::fmt::Display for Failed {
     }
 }
 
-/// A device on a port: its slot, and the memory the controller reads and writes for it.
 struct Attached {
     slot: u8,
-    /// Its `UsbDevice` record's id, which departs with it (Phase 6 Part C); `None` when the table
-    /// could not take it.
+    /// Its `UsbDevice` record's id, which departs with it; `None` when the table could not take it.
     record: Option<u32>,
     _mem: DeviceMem,
 }
 
 /// One device's input and output contexts, its default endpoint's ring, a page for what its
 /// control transfers read, and **what its bound classes asked for** — HID endpoints' rings and
-/// report buffers (Phase 6 Part B.2), a storage interface's rings, wrapper page and binding buffer
-/// (Part D.2) — which are freed with the rest, only after its slot is disabled.
+/// report buffers, a storage interface's rings, wrapper page and binding buffer — which are freed
+/// with the rest, only after its slot is disabled.
 pub(super) struct DeviceMem {
     pub(super) input: DmaBuffer,
     output: DmaBuffer,
@@ -135,7 +130,6 @@ pub(super) extern "C" fn main(_arg: usize) {
     }
     while attached.push_within_capacity(None).is_ok() {}
 
-    // **The first round.** One debounce for every port, then each connected one in turn.
     let start = crate::arch::Timer::read_ns();
     sleep(DEBOUNCE_NS);
     let mut connected = 0;
@@ -169,9 +163,9 @@ pub(super) extern "C" fn main(_arg: usize) {
     // **Then every later change**, woken by the DPC. The wake latches, so changes that land while
     // a device is being enumerated are found by the scan after it.
     loop {
-        // **Until the earliest storage command's deadline** (Phase 6 Part D.3), and never longer
-        // than a deadline's length while a disk is bound: that is what bounds a stick that stops
-        // answering, including on an idle machine, where nothing else wakes this (PR #363 review).
+        // **Until the earliest storage command's deadline**, and never longer than a deadline's
+        // length while a disk is bound: that bounds a stick that stops answering, including on an
+        // idle machine, where nothing else wakes this.
         let now = crate::arch::Timer::read_ns();
         let until = super::storage::bound(now);
         // SAFETY: `x.hub_wake` pins the `InterruptObject` for the controller's life.
@@ -183,9 +177,7 @@ pub(super) extern "C" fn main(_arg: usize) {
         }
         // A HID endpoint that halted is reset before anything else: its device is still typing.
         super::hid::recover(x);
-        // Then a storage command that went wrong or ran past its deadline (Phase 6 Part D.3).
         storage_round(x, &mut attached);
-        // Then a keyboard's lights (Phase 6 Part B.5).
         lights_round(x, &mut attached);
         for port in 1..=x.max_ports {
             let s = portsc(x, port);
@@ -194,10 +186,9 @@ pub(super) extern "C" fn main(_arg: usize) {
             }
             clear_changes(x, port);
             // **A connect change on a port with a device is that device leaving**, whatever the
-            // port says now: one pulled and another plugged in while this thread was busy — or a
-            // contact that bounced — leaves Current Connect Status set and only the change bit to
-            // say anything happened. Taken as a departure and then, if something is there, an
-            // arrival. The first version cleared the bits and kept the old device (PR #355 review).
+            // port says now: one pulled and another plugged in while this thread was busy, or a
+            // contact that bounced, leaves Current Connect Status set and only the change bit.
+            // Taken as a departure and then, if something is there, an arrival.
             if attached[port as usize].is_some() {
                 depart(x, port, &mut attached);
             }
@@ -213,8 +204,8 @@ pub(super) extern "C" fn main(_arg: usize) {
     }
 }
 
-/// **The storage devices with a fault or a deadline passed** (Phase 6 Part D.3): each recovered, and
-/// one that does not recover ended as on an unplug; then a rescan one holds (Part G).
+/// **The storage devices with a fault or a deadline passed**: each recovered, and one that does
+/// not recover ended as on an unplug; then a rescan one holds.
 fn storage_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
     let now = crate::arch::Timer::read_ns();
     for (i, slot) in super::storage::due(now).into_iter().enumerate() {
@@ -228,8 +219,7 @@ fn storage_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
             depart(x, port as u8, attached);
             continue;
         }
-        // And a rescan its storage service asked for (Phase 6 Part G) — which ends the device, as a
-        // recovery that fails does, when a recovery fails while it waits (PR #369 review).
+        // And a rescan its storage service asked for, which ends the device when a recovery fails.
         if let super::storage::Recovered::Ended = super::storage::rescan(x, i, port as u8, &mut dev._mem) {
             crate::kprintln!("usb: port {port}: its storage did not recover while a rescan waited; it is ended");
             depart(x, port as u8, attached);
@@ -237,7 +227,6 @@ fn storage_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
     }
 }
 
-/// A device connected at `port`: enumerate it, and keep it if that went through. Whether it did.
 fn arrive(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) -> bool {
     clear_changes(x, port);
     if x.wedged.load(Ordering::Relaxed) {
@@ -253,7 +242,7 @@ fn arrive(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) -> bool {
     }
 }
 
-/// **The device at `port` left** (Phase 6 Part C): let its keyboards and mice go, depart its
+/// **The device at `port` left**: let its keyboards and mice go, depart its
 /// records, then disable its slot and free what the controller had of it. Its records stay in the
 /// device table, marked departed, since an id is its place: the table grows by a record a node an
 /// arrival (`TODO(usb-departed-records)`).
@@ -261,11 +250,11 @@ fn depart(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) {
     let Some(dev) = attached[port as usize].take() else {
         return;
     };
-    // **Its keyboards and mice let go first** (Phase 6 Part C): what they held released, their
+    // **Its keyboards and mice let go first**: what they held released, their
     // endpoints out of the DPC's table — so nothing touches a report buffer the release below is
     // about to free — and their nodes retired.
     super::hid::depart(x, dev.slot);
-    // **And its storage** (Phase 6 Part D.3): out of the DPC's table, its queue completed
+    // **And its storage**: out of the DPC's table, its queue completed
     // `PeerClosed`. The command in flight waits until the slot is disabled: until then the
     // controller may still move its data.
     let storage = super::storage::depart(dev.slot);
@@ -283,22 +272,18 @@ fn depart(x: &Xhci, port: u8, attached: &mut KVec<Option<Attached>>) {
     super::storage::finish(storage);
 }
 
-/// What [`release`] did with a slot's memory.
 enum Released {
-    /// The slot is disabled, its context entry cleared, and its memory freed.
     Freed,
     /// Its memory was kept, **deliberately leaked**, because the controller may still own it.
     Kept(&'static str),
 }
 
-/// **Disable `slot`, then free its memory — in that order, and only then.** The controller reads and
-/// writes a slot's contexts and rings until it has disabled the slot: QEMU's Disable Slot itself
-/// writes the default endpoint's output context. Freed first, those pages are the buddy
-/// allocator's while the controller still writes them, which is what the first version did on
-/// every enumeration that failed after Address Device (PR #355 review). So a slot that does not
-/// disable — the command failed, or nothing more may be asked of a wedged controller — keeps its
-/// memory forever: a few pages leaked is the price of not handing the controller memory it may yet
-/// write.
+/// **Disable `slot`, then free its memory — in that order, and only then.** The controller reads
+/// and writes a slot's contexts and rings until it has disabled the slot: QEMU's Disable Slot
+/// itself writes the default endpoint's output context. Freed first, those pages are the buddy
+/// allocator's while the controller still writes them. So a slot that does not disable — the
+/// command failed, or nothing more may be asked of a wedged controller — keeps its memory forever:
+/// a few pages leaked is the price of not handing the controller memory it may yet write.
 fn release(x: &Xhci, slot: u8, mem: DeviceMem) -> Released {
     if x.wedged.load(Ordering::Relaxed) {
         core::mem::forget(mem);
@@ -344,8 +329,6 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
     match address_and_read(x, port, slot, speed_id, &mut mem, &mut config, &mut serial) {
         Ok((facts, config_len, serial_len)) => {
             let id = record(x, port, facts);
-            // **Then its classes bound** under the record just made: HID (Phase 6 Part B.2) and
-            // mass storage (Part D.2), in one configuration.
             bind(x, port, slot, speed_id, &mut mem, &config[..config_len], id, &serial[..serial_len]);
             Ok(Attached { slot, record: id, _mem: mem })
         }
@@ -359,7 +342,7 @@ fn enumerate(x: &Xhci, port: u8) -> Result<Attached, ()> {
     }
 }
 
-/// **Bind what the device's classes match, in one configuration** (Phase 6 Part D.2): each class's
+/// **Bind what the device's classes match, in one configuration**: each class's
 /// endpoints prepared, then one Configure Endpoint adding all of them and one `SET_CONFIGURATION` —
 /// a second would reset the first class's endpoints (USB 2.0 §9.1.1.5) — then each class's own
 /// requests. A failure in the device's steps ends the whole binding.
@@ -402,9 +385,9 @@ fn bind(
     }
 }
 
-/// **Put the device in the registry** (Phase 6 Part A.3): a bare `Other` node, with what it is kept
-/// beside it in the table, under the controller's function. A device the table cannot take is still
-/// attached — it is only missing from `/dev/registry`, which is said.
+/// **Put the device in the registry**: a bare `Other` node, its facts beside it in the table,
+/// under the controller's function. A device the table cannot take stays attached, missing only
+/// from `/dev/registry`, which is said.
 fn record(x: &Xhci, port: u8, facts: UsbFacts) -> Option<u32> {
     let Ok(node) = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO) else {
         crate::kprintln!("usb: port {port}: no memory for its node; it is not in the registry");
@@ -416,10 +399,9 @@ fn record(x: &Xhci, port: u8, facts: UsbFacts) -> Option<u32> {
 /// The longest configuration descriptor kept for the class drivers: QEMU's devices' are 34 to 93
 /// bytes, and a composite keyboard's a few hundred.
 const CONFIG_MAX: usize = 512;
-/// The longest serial string kept: what names a USB disk beside its model (Phase 6 Part D.2).
+/// The longest serial string kept: what names a USB disk beside its model.
 const SERIAL_MAX: usize = 32;
 
-/// A device's memory, or `None` when there is not enough.
 fn device_mem() -> Option<DeviceMem> {
     let input = DmaBuffer::alloc(crate::mm::PAGE_SIZE.max(super::context::Layout::new(true).input_len())).ok()?;
     let output = DmaBuffer::alloc(crate::mm::PAGE_SIZE).ok()?;
@@ -449,8 +431,7 @@ fn address_and_read(
         .map_err(|e| ("Address Device", e))?;
     // **SET_ADDRESS's recovery interval**: USB 2.0 §9.2.6.3 gives a device 2 ms after the request
     // before it must answer at its new address, and Linux waits 10 ms here. QEMU answers at once,
-    // so no gate can see it; a slow device on the laptop would fail its first request without it
-    // (PR #355 review).
+    // so no gate can see it; a slow device on the laptop would fail its first request without it.
     sleep(SET_ADDRESS_NS);
 
     // **The default endpoint's packet**, from the first eight bytes, which every packet size can
@@ -529,12 +510,11 @@ fn address_and_read(
 /// The product string, then ` (serial)` if it fits, into `out`. The length written; zero when the
 /// device names itself with no string.
 ///
-/// **A string the device stalls is passed over, and its endpoint recovered** (PR #355 review).
-/// Devices stall a string request they cannot answer — a bad index or language is common — and a
-/// stall halts the default endpoint until it is reset, so swallowing the failure left the next
-/// request waiting out its deadline behind it, and the device kept with an endpoint that would
-/// answer nothing. **Any other failure abandons the device**, as every other step's does: a transfer
-/// that timed out may still be on the ring.
+/// **A string the device stalls is passed over, and its endpoint recovered.** Devices stall a
+/// string request they cannot answer — a bad index or language is common — and a stall halts the
+/// default endpoint until it is reset, so swallowing the failure would leave the next request
+/// waiting out its deadline behind it. **Any other failure abandons the device**, as every other
+/// step's does: a transfer that timed out may still be on the ring.
 fn name_of(
     x: &Xhci,
     port: u8,
@@ -610,8 +590,7 @@ pub(super) fn recover_ep0(x: &Xhci, slot: u8, mem: &DeviceMem) -> Result<(), Fai
 }
 
 /// **A GET_DESCRIPTOR** of `kind`, index `index`, in language `lang`, up to `len` bytes, on the
-/// device's default endpoint. The bytes, which are as many as asked: a device that sent fewer
-/// left the rest zero, and the descriptor's own lengths say how much is real.
+/// default endpoint. The bytes, as many as asked: a device that sent fewer left the rest zero.
 fn read_descriptor<'m>(
     x: &Xhci,
     slot: u8,
@@ -625,9 +604,8 @@ fn read_descriptor<'m>(
     Ok(data_bytes(mem, len))
 }
 
-/// **A GET_DESCRIPTOR to interface `iface`** (Phase 6 Part B.3): a HID report descriptor, up to `len`
-/// bytes and a page. **The bytes that arrived**, since Part B.7: fewer than asked for when the device
-/// sent less, which a caller that knows the length can tell.
+/// **A GET_DESCRIPTOR to interface `iface`**: a HID report descriptor, up to `len` bytes and a
+/// page. **The bytes that arrived**, fewer than asked for when the device sent less.
 pub(super) fn read_interface_descriptor<'m>(
     x: &Xhci,
     slot: u8,
@@ -641,12 +619,10 @@ pub(super) fn read_interface_descriptor<'m>(
     Ok(data_bytes(mem, got))
 }
 
-/// The eight-byte GET_DESCRIPTOR request.
 fn get_descriptor(kind: u8, index: u8, lang: u16, len: u16) -> [u8; 8] {
     [0x80, 6, index, kind, lang as u8, (lang >> 8) as u8, len as u8, (len >> 8) as u8]
 }
 
-/// The first `len` bytes of the device's data page, after a transfer into it completed.
 fn data_bytes(mem: &DeviceMem, len: u16) -> &[u8] {
     // SAFETY: `data` is a page, and `len` is at most a page; the transfer that wrote it is done.
     unsafe { core::slice::from_raw_parts(mem.data.virt() as *const u8, len as usize) }
@@ -654,7 +630,7 @@ fn data_bytes(mem: &DeviceMem, len: u16) -> &[u8] {
 
 /// **A control transfer reading `len` bytes** into the device's data page: Setup, Data, Status,
 /// and a wait for the Status stage's completion or an error on any stage. **How many bytes
-/// arrived** (Phase 6 Part B.7): `len` less what a short Data stage did not move.
+/// arrived**: `len` less what a short Data stage did not move.
 fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u16) -> Result<u16, Failed> {
     // SAFETY: `data` is a page the controller writes only during a transfer, and none is running on
     // this endpoint: every failure that can leave one live — a timeout, any error but a stall — ends
@@ -686,14 +662,13 @@ fn control_in(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8], len: u1
     }
 }
 
-/// **A control transfer reading one byte** (Phase 6 Part D.2): bulk-only's `GET MAX LUN`.
+/// **A control transfer reading one byte**: bulk-only's `GET MAX LUN`.
 pub(super) fn control_in_byte(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8]) -> Result<u8, Failed> {
     control_in(x, slot, mem, request, 1)?;
     Ok(data_bytes(mem, 1)[0])
 }
 
-/// **A control transfer with no data stage** (Phase 6 Part B.2): Setup, then an IN Status stage,
-/// and a wait for the Status stage's completion or an error on either stage.
+/// **A control transfer with no data stage**: Setup, then an IN Status stage, waited for.
 pub(super) fn control_out(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8]) -> Result<(), Failed> {
     let base = mem.ep0.phys().as_u64();
     let po = new_operation()?;
@@ -714,9 +689,8 @@ pub(super) fn control_out(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8;
     }
 }
 
-/// **A control transfer writing `data`** (Phase 6 Part B.5): Setup, an OUT Data stage from the
-/// device's data page, and an IN Status stage, waited for as `control_in`'s are. A keyboard's
-/// lights, as a `SET_REPORT`.
+/// **A control transfer writing `data`**: Setup, an OUT Data stage from the device's data page, and
+/// an IN Status stage, waited for as `control_in`'s are. A keyboard's lights, as a `SET_REPORT`.
 pub(super) fn control_out_data(
     x: &Xhci,
     slot: u8,
@@ -751,7 +725,7 @@ pub(super) fn control_out_data(
     }
 }
 
-/// **Send the keyboards' lights that wait** (Phase 6 Part B.5): each as a `SET_REPORT` of one byte
+/// **Send the keyboards' lights that wait**: each as a `SET_REPORT` of one byte
 /// to its interface, and its write completed with how that went. A stall recovers the default
 /// endpoint; a timeout leaves the request in doubt on it, so the device takes no more lights.
 fn lights_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
@@ -903,13 +877,11 @@ fn write_portsc(x: &Xhci, port: u8, val: u32) {
     write32(x.op, PORTSC + 0x10 * (port as u64 - 1), val);
 }
 
-/// Clear whichever of `port`'s change bits are set, changing nothing else.
 fn clear_changes(x: &Xhci, port: u8) {
     let s = portsc(x, port);
     write_portsc(x, port, (s & PORT_KEEP) | (s & PORT_CHANGES));
 }
 
-/// A port's speed, from `PORTSC` bits 13:10.
 fn speed_of(s: u32) -> u8 {
     ((s >> 10) & 0xF) as u8
 }
@@ -936,7 +908,6 @@ pub(super) fn sleep(ns: u64) {
     let _ = unsafe { crate::sched::wait_on(&[], now + ns, now) };
 }
 
-/// Look every millisecond until `done`, or `bound_ns` passes. Whether it was done.
 fn poll(bound_ns: u64, mut done: impl FnMut() -> bool) -> bool {
     let start = crate::arch::Timer::read_ns();
     loop {

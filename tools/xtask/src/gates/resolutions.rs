@@ -2,20 +2,16 @@
 
 use crate::*;
 
-/// `cargo xtask check-resolutions` — **resolution independence, checked on demand** (Phase 5
-/// Part E.4). Not in CI, by the maintainer's call: the system should not care what size its screen
-/// is, CI boots two sizes on every run, and this is how the claim gets confirmed across more of them
-/// from time to time without every PR paying for twenty boots.
+/// `cargo xtask check-resolutions` — resolution independence, checked on demand. Not in CI, by the
+/// maintainer's call: CI boots two sizes on every run, and this confirms the claim across more of
+/// them without every PR paying for twenty boots.
 ///
-/// Runs `check-display`, `check-terminal`, `check-login` and `check-fbcon` at each size — every
-/// width a multiple of 8, for the reason `DisplaySize` gives — **one boot at a time**, each as its
-/// own `cargo xtask <gate> --size WxH` child so a failure is exactly what that gate reports. Keeps
-/// every run's output and transcript under `build-cache/resolutions/`, and prints a table.
-///
-/// **What it is allowed to find** besides a gate failure: whether a boot's demo chain finished —
-/// the check `test-qemu` makes, which at 1024×768 failed its dead-log-source step in 2 runs of 3
-/// on 2026-09-15 with nothing yet connecting size to it — and whether the compositor ran without
-/// its shadow buffer, which is what a screen too large for the guest's memory looks like first.
+/// Runs `check-display`, `check-terminal`, `check-login` and `check-fbcon` at each size (every
+/// width a multiple of 8, for the reason `DisplaySize` gives), one boot at a time, each as its own
+/// `cargo xtask <gate> --size WxH` child so a failure is exactly what that gate reports. Output and
+/// transcripts go under `build-cache/resolutions/`, and a table is printed. It may also find an
+/// unfinished demo chain or a compositor without its shadow buffer (a screen too large for the
+/// guest's memory).
 pub(crate) fn cmd_check_resolutions(accel: Accel) -> R<()> {
     const SIZES: &[&str] = &["1024x768", "1280x800", "1360x768", "1920x1080", "2560x1440"];
     const GATES: &[&str] = &["check-display", "check-terminal", "check-login", "check-fbcon"];

@@ -1,14 +1,14 @@
-//! **What each block device has done** (Phase 6 Part H.2): the commands its driver issued and saw
-//! retire, the bytes they moved, and the time they were on the device — counted by the driver
-//! where a command is issued and where it retires, so the time is the device's own, not an IRP's
-//! wait in a driver's queue. A partition's I/O is its disk's: its window forwards to the disk's
-//! driver, which counts it there.
+//! **What each block device has done**: the commands its driver issued and saw
+//! retire, the bytes they moved and the time on the device, counted by the driver
+//! where a command is issued and where it retires, so the time is the device's
+//! own, not an IRP's wait in a driver's queue. A partition's I/O is its disk's:
+//! its window forwards to the disk's driver, which counts it there.
 //!
-//! **Kept on the device's node** ([`DeviceNode::io`](crate::object::DeviceNode::io)) rather than in a
-//! driver's own state, because a USB driver's slot goes to the next device to arrive and a node
-//! never does. A driver holds a [`Counted`] — the node's counters, attached once the node is
-//! registered — and records into it; `/dev/registry/io` serves every disk's
-//! (`docs/spec/device-node.md` § *The registry*).
+//! **Kept on the device's node** ([`DeviceNode::io`](crate::object::DeviceNode::io))
+//! rather than in a driver's state, because a USB driver's slot goes to the next
+//! device to arrive and a node never does. A driver holds a [`Counted`] (the
+//! node's counters, attached once the node is registered); `/dev/registry/io`
+//! serves every disk's (`docs/spec/device-node.md` § *The registry*).
 
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
@@ -140,8 +140,8 @@ impl Default for Counted {
 mod tests {
     use super::*;
 
-    /// Each op lands in its own counters; a failure is an error with its time and nothing else; a
-    /// rescan is nothing at all.
+    /// Each op lands in its own counters; a failure is an error with its time and
+    /// nothing else; a rescan counts for nothing.
     #[test]
     fn each_op_is_counted_as_itself() {
         let io = IoStats::new();

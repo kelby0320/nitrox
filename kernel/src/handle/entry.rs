@@ -1,92 +1,55 @@
 //! [`HandleEntry`] — one slot in a segmented handle table.
 //!
-//! Layout is normative: `docs/spec/handle-encoding.md` § "Handle table
-//! entry layout" requires exactly 64 bytes, 64-byte aligned, so each
-//! entry occupies one x86_64 cache line and a [`Segment`](super::segment::Segment)
-//! of [`SEGMENT_LEN`](super::SEGMENT_LEN) entries is exactly 256 KiB
-//! (one buddy order-6 block).
+//! Layout is normative (`docs/spec/handle-encoding.md` § "Handle table entry
+//! layout"): 64 bytes, 64-byte aligned, so a
+//! [`Segment`](super::segment::Segment) of [`SEGMENT_LEN`](super::SEGMENT_LEN)
+//! entries is exactly 256 KiB (one buddy order-6 block).
 //!
-//! Every data field is an atomic of the matching primitive width so
-//! lookup reads can proceed without `unsafe` pointer-through-reference
-//! writes. The seqlock (`seq`) gives readers an *atomic snapshot of
-//! multiple fields*; on its own each `Atomic*` only guarantees per-field
-//! consistency. The single-writer precondition (only one writer in the
-//! odd-`seq` window) is enforced by the handle table's rank-3 segment
-//! lock — see `kernel/docs/lock-ordering.md`.
+//! Every field is an atomic, so lookups need no `unsafe`; the seqlock `seq`
+//! gives readers an atomic snapshot of several fields. The single-writer
+//! precondition is the rank-3 segment lock (`kernel/docs/lock-ordering.md`).
 //!
-//! ## Writer protocol
-//!
-//! A [`WriteGuard`] toggles `seq` even → odd on construction and
-//! odd → even on drop. Between, the writer stores to the metadata
-//! fields with `Relaxed` (the surrounding Release stores order them).
-//! `debug_assert!` catches a torn writer that enters on an odd seq.
-//!
-//! ## Reader protocol
-//!
-//! [`read_snapshot`] loops until two `Acquire` loads of `seq` bracket
-//! the metadata reads and observe matching even values. Inside the
-//! bracket the field loads are `Relaxed` — `seq` does the ordering.
-//! The returned snapshot carries the `seq` value observed so the
-//! lookup path can perform the spec's step-8 re-check after acquiring
-//! the object refcount.
+//! A [`WriteGuard`] toggles `seq` even → odd on construction and back on drop;
+//! between, metadata stores are `Relaxed`. [`read_snapshot`] loops until two
+//! `Acquire` loads of `seq` bracket the (`Relaxed`) field loads and match on an
+//! even value, and carries `seq` so lookup can re-check it (spec step 8) after
+//! taking the object refcount.
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering, fence};
 
 use crate::libkern::handle::{KObjectType, RawHandle, Rights};
 
-/// One slot in a [`Segment`](super::segment::Segment).
-///
-/// `#[repr(C, align(64))]` for the cache-line alignment the spec
-/// requires. The two `_padN` fields and the implicit pad after
-/// `owner_pid` together make the layout exactly 64 bytes — checked at
-/// compile time below.
+/// One slot in a [`Segment`](super::segment::Segment): exactly 64 bytes
+/// (checked below).
 #[repr(C, align(64))]
 pub(crate) struct HandleEntry {
     /// Seqlock counter. Even = stable; odd = a writer is mid-update.
-    /// Readers loop until two even reads bracket their field loads.
     pub seq: AtomicU32,
-    /// Bumped on every (re-)allocation that uses this slot. Distinct
-    /// generations let an old `RawHandle` for a recycled slot fail the
-    /// step-9 generation check rather than aliasing a different object.
+    /// Bumped on every (re-)allocation, so a stale `RawHandle` for a recycled slot
+    /// fails the generation check instead of aliasing a new object.
     pub generation: AtomicU32,
-    /// PID of the process that owns this handle. Spec § "Validation
-    /// algorithm" step 10 — the security-critical check.
+    /// PID of the owning process — the security-critical check (spec step 10).
     pub owner_pid: AtomicU32,
-    // Implicit 4-byte pad here so `rights` (a u64) is 8-byte aligned.
-    /// Capability bits ([`Rights`]) carried by the handle. Stored as
-    /// raw bits in an `AtomicU64` so loads/stores are lock-free; the
-    /// snapshot path wraps in [`Rights::from_bits_truncate`].
+    /// Capability bits ([`Rights`]) as raw `u64`.
     pub rights: AtomicU64,
-    /// [`KObjectType`] discriminant. Stored as `u32` for atomic access;
-    /// converted back via [`KObjectType::from_u32`] on the snapshot path.
+    /// [`KObjectType`] discriminant.
     pub object_type: AtomicU32,
-    /// Explicit pad (spec § "Handle table entry layout").
+    /// Explicit pad.
     pub _pad1: u32,
-    /// Type-erased pointer to the kernel object. `null` while the slot
-    /// is free or in the deferred-reclaim queue; non-null while live.
-    /// Read in step 6 of the validation algorithm as a single
-    /// `Acquire` load outside the seqlock loop.
+    /// Type-erased object pointer: null while the slot is free or in the
+    /// deferred-reclaim queue. Read in step 6 as one `Acquire` load.
     pub object: AtomicPtr<()>,
-    /// Intrusive list pointer reserved for threading this entry onto its owning
-    /// process's owned-handles list. **Still unused** (`RawHandle::NULL`
-    /// everywhere): release-at-exit is implemented as a segment scan keyed on
-    /// `owner_pid` instead of a list, which keeps every other path free of list
-    /// maintenance under the rank-3 lock. See
-    /// `docs/architecture/handle-system.md` § Releasing a process's handles at
-    /// exit for the trade, and why this field is the optimization to reach for
-    /// if a sweep ever becomes measurable.
+    /// Reserved for an owner's handle list; unused. Release-at-exit is a segment
+    /// scan keyed on `owner_pid`, keeping other paths free of list upkeep under the
+    /// rank-3 lock (`docs/architecture/handle-system.md` § Releasing a process's
+    /// handles at exit).
     pub next_owned: AtomicU64,
-    /// Index of the next free slot within the same segment when this
-    /// slot is on the segment freelist. Meaningless when the slot is
-    /// live. [`u32::MAX`] marks the freelist tail.
+    /// Next free slot in the segment freelist ([`u32::MAX`] = tail).
     pub free_next: AtomicU32,
-    /// Explicit pad (spec § "Handle table entry layout").
+    /// Explicit pad.
     pub _pad2: u32,
 }
 
-// Spec § "Handle table entry layout" demands exactly 64 bytes,
-// 64-byte aligned — required for the segment-as-one-cache-line-per-
-// entry guarantee and for `Segment::entries` to be 256 KiB total.
 const _: () = assert!(core::mem::size_of::<HandleEntry>() == 64);
 const _: () = assert!(core::mem::align_of::<HandleEntry>() == 64);
 
@@ -94,9 +57,7 @@ const _: () = assert!(core::mem::align_of::<HandleEntry>() == 64);
 pub(crate) const FREE_NEXT_TAIL: u32 = u32::MAX;
 
 impl HandleEntry {
-    /// Construct a freshly-initialised entry: `seq = 0` (even, no writer),
-    /// `generation = 0`, object null, `free_next` pointing nowhere yet.
-    /// The owning segment overwrites `free_next` while threading the
+    /// A fresh entry; the owning segment overwrites `free_next` when threading the
     /// freelist.
     pub(crate) const fn new() -> Self {
         Self {
@@ -114,11 +75,8 @@ impl HandleEntry {
     }
 }
 
-/// Snapshot of the metadata fields guarded by the entry's seqlock,
-/// taken as a single atomic tuple. The included `seq` is the value
-/// observed at the bracketing reads; the lookup path re-checks it
-/// after acquiring the object refcount (spec § "Validation algorithm"
-/// step 8).
+/// The seqlock-guarded fields, read as one atomic tuple; `seq` is re-checked
+/// after the refcount is taken (spec step 8).
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct EntrySnapshot {
     pub seq: u32,
@@ -128,12 +86,7 @@ pub(crate) struct EntrySnapshot {
     pub object_type: u32,
 }
 
-/// Read a consistent snapshot of the entry's seqlock-guarded fields.
-///
-/// Spins on `seq` until two `Acquire` loads bracket the metadata reads
-/// and observe matching even values. Returns the snapshot together
-/// with the observed `seq` so the caller can re-check it after object
-/// refcount acquisition.
+/// Read a consistent snapshot of the seqlock-guarded fields.
 pub(crate) fn read_snapshot(entry: &HandleEntry) -> EntrySnapshot {
     loop {
         let s1 = entry.seq.load(Ordering::Acquire);
@@ -150,19 +103,14 @@ pub(crate) fn read_snapshot(entry: &HandleEntry) -> EntrySnapshot {
         if s1 == s2 {
             return EntrySnapshot { seq: s1, generation, owner_pid, rights, object_type };
         }
-        // A writer landed during the read; retry.
     }
 }
 
-/// RAII handle proving the holder is inside the entry's seqlock writer
-/// window. Construction flips `seq` even → odd; `Drop` flips odd →
-/// even, publishing the writes.
-///
-/// The single-writer precondition that lets us use a `Relaxed` initial
-/// load is enforced externally: every caller must hold the handle
-/// table's rank-3 segment lock for the duration of the guard. In
-/// debug builds, entering on an odd `seq` is a panic — a tripwire for
-/// a concurrent-writer bug.
+/// RAII proof the holder is in the entry's seqlock writer window: `seq` flips
+/// even → odd on construction and back on drop, publishing the writes. Callers
+/// must hold the rank-3 segment lock throughout (the single-writer precondition
+/// that lets the first load be `Relaxed`); debug builds panic on entering an odd
+/// `seq`.
 pub(crate) struct WriteGuard<'a> {
     entry: &'a HandleEntry,
     seq_at_enter: u32,
@@ -211,11 +159,9 @@ mod tests {
         let e = HandleEntry::new();
         {
             let _g = WriteGuard::new(&e);
-            // Inside the guard, seq is odd.
             assert_eq!(e.seq.load(Ordering::Relaxed) & 1, 1);
             e.generation.store(7, Ordering::Relaxed);
         }
-        // After drop, seq is even and exactly 2 greater than the start.
         assert_eq!(e.seq.load(Ordering::Relaxed), 2);
         assert_eq!(e.generation.load(Ordering::Relaxed), 7);
     }
@@ -235,7 +181,6 @@ mod tests {
         assert_eq!(snap.owner_pid, 99);
         assert_eq!(snap.rights.bits(), (Rights::READ | Rights::WRITE).bits());
         assert_eq!(snap.object_type, KObjectType::IoRing as u32);
-        // seq returned matches the field
         assert_eq!(snap.seq, e.seq.load(Ordering::Relaxed));
         assert_eq!(snap.seq & 1, 0);
     }

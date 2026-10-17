@@ -10,25 +10,14 @@ const STATUS_PAD_X: u32 = 11;
 
 /// A window's status bar: what it is doing at one end, where it is at the other.
 ///
-/// **The rule is on the edge that faces the content** — `Edge::Top` for a bar along the bottom of
-/// a window, which is where the design puts one and where the editor's went in Part J, and
-/// `Edge::Bottom` for one that sits under the chrome. A bar with its rule on the wrong side reads
-/// as a lid rather than a floor.
+/// The rule is on the edge that faces the content: `Edge::Top` for a bar along the bottom of a
+/// window, `Edge::Bottom` for one under the chrome.
 ///
-/// **The readings are [`TextSize::Small`] and `foreground_dim`** — the design's hierarchy by size
-/// and ink, which is what carries the "read this second" (desktop refresh, Part H).
-///
-/// **The face is the caller's**, and this paragraph used to say otherwise: it argued that a
-/// status bar in the fixed-advance face would be the toolkit's first two-face surface "for the
-/// sake of a byte count". Part J gave `libui` a `mono` wrapper for the editor's buffer, and the
-/// editor wraps its own position readout in it — numbers that shuffle the line about as a caret
-/// moves are what a fixed advance is for. A bar set wholly in it would still be wrong; a reading
-/// inside one is the caller's judgement (PR #321 review, worth fixing 5).
+/// The readings are [`TextSize::Small`] and `foreground_dim`, which carries "read this second".
+/// The face is the caller's: a position readout may sit in `mono`.
 pub fn status_bar<Msg>(left: Element<Msg>, right: Option<Element<Msg>>, rule: Edge, theme: &Theme) -> Element<Msg> {
-    // **Both slots wrapped, and the zero-inset one is not decoration** — `frame_layers`'s rule,
-    // for its reason: the diff wants a container's children all keyed or none, and a caller that
-    // keys its readout would otherwise make this dock `MixedKeying` at the first frame. The
-    // wrapper puts the caller's keys one level down, where they still do their job.
+    // Both slots wrapped, and the zero-inset one is not decoration: a container's children are
+    // all keyed or none, and a caller keying its readout would make this dock `MixedKeying`.
     let bare = |e: Element<Msg>| padding(Insets::all(0), e);
     let inner = match right {
         Some(right) => dock(alloc::vec![docked(Edge::Right, bare(right))], bare(left)),
@@ -63,13 +52,8 @@ pub const STATUS_GAP: u32 = 7;
 
 /// A primary action: the accent as a ground, with its label in the paper colour.
 ///
-/// **The one button in a window that is the answer** — the design's `Save`, and the only place it
-/// fills a control with the accent rather than drawing with it. Everything else on a surface is a
-/// face with an edge, which is what makes this one read as the action rather than as an option
-/// (desktop refresh, Part H).
-///
-/// Hover and press shade the ground rather than swapping it, because an accent that changed hue
-/// under the pointer would read as a different control.
+/// The one button in a window that is the answer. Hover and press shade the ground rather than
+/// swapping it, since a changing hue would read as a different control.
 pub fn pill<Msg>(label: impl Into<String>, msg: Msg, state: WidgetState, theme: &Theme) -> Element<Msg> {
     let ground = if state.pressed {
         theme.accent.shade(-PILL_SHADE)
@@ -78,18 +62,14 @@ pub fn pill<Msg>(label: impl Into<String>, msg: Msg, state: WidgetState, theme: 
     } else {
         theme.accent
     };
-    // **The label is whichever of the surface's two inks stands furthest from the ground** — the
-    // window's paper in the light scheme, which is the design's white on the accent, and its
-    // text colour in the dark one, where the paper is near-black and would sit at 3.8:1 on the
-    // same accent (PR #319 review, optional 9). One rule, so a scheme cannot be picked that
-    // makes this control unreadable.
+    // The label is whichever of the surface's two inks stands furthest from the ground: the dark
+    // scheme's near-black paper would sit at 3.8:1 on the accent.
     let ink_colour = furthest_from(ground, theme.background, theme.foreground);
     let mut layers = alloc::vec::Vec::with_capacity(4);
     layers.push(rounded_fill(ground, CONTROL_RADIUS));
     if state.active {
-        // **A band of the label's colour, inside the edge** — and it has to be a *band*: this
-        // drew the ground inset by the ring over a ground of the same colour, which is the same
-        // colour on the same colour and put down not one different pixel (review, optional 4).
+        // A band of the label's colour inside the edge; it must be a band, since the ground
+        // over a ground of the same colour puts down not one different pixel.
         layers.push(padding(Insets::all(PILL_RING_INSET), rounded_fill(ink_colour, CONTROL_RADIUS - PILL_RING_INSET)));
         layers.push(padding(
             Insets::all(PILL_RING_INSET + RING),
@@ -109,15 +89,11 @@ const PILL_RING_INSET: u32 = 1;
 
 /// Whichever of `a` and `b` stands further from `ground`, by weighted brightness.
 ///
-/// **Weighted rather than a plain sum**, because green carries most of what an eye reads as
-/// light: `0.299r + 0.587g + 0.114b`, the usual integer form, which needs no `powf` — `libdraw`
-/// builds for a bare target and has no floating-point maths beyond arithmetic.
+/// `0.299r + 0.587g + 0.114b` in integers: `libdraw` has no floating-point maths beyond
+/// arithmetic.
 ///
-/// **It picks, and does not promise.** On the accent this system ships, it chooses white in the
-/// light scheme (4.6:1) and the near-white ink in the dark one (3.9:1, where the window's own
-/// paper would be 3.8:1). The dark figure is under WCAG's 4.5 and cannot be fixed here: `accent`
-/// is one colour in both schemes, so a readable pill in the dark scheme is a question about the
-/// palette, for whoever revisits it (PR #319 review, optional 9).
+/// It picks and does not promise: the dark scheme's 3.9:1 is under WCAG's 4.5 and cannot be
+/// fixed here, since `accent` is one colour in both schemes.
 pub(super) fn furthest_from(ground: Rgb, a: Rgb, b: Rgb) -> Rgb {
     let brightness = |c: Rgb| 299 * c.r as i32 + 587 * c.g as i32 + 114 * c.b as i32;
     let (g, a_, b_) = (brightness(ground), brightness(a), brightness(b));

@@ -1,4 +1,4 @@
-//! **A crash between any two writes** (PR #365 review, finding 2). Each change's writes are
+//! **A crash between any two writes.** Each change's writes are
 //! recorded as it makes them, then replayed onto the image it started from one at a time, and after
 //! each the image is checked as a crash there would leave it: every entry's chain allocated, no
 //! cluster in two chains, no file longer than its chain, and what a grow adds reading as zeroes,
@@ -13,7 +13,6 @@ use std::rc::Rc;
 
 const NOW: i64 = 1_791_244_800;
 
-/// A writer that records each write, in order, and passes it on.
 struct Recorder<'a> {
     inner: &'a Overlay,
     log: RefCell<Vec<(u64, Vec<u8>)>>,
@@ -32,8 +31,7 @@ impl BlockWriter for Recorder<'_> {
     }
 }
 
-/// **An image's bytes, its free clusters filled with `0xAB`**, so a cluster linked before it is
-/// zeroed shows.
+/// **An image's bytes, its free clusters filled with `0xAB`**, so an unzeroed link shows.
 fn with_garbage_in_free_clusters(path: &std::path::Path) -> Rc<Vec<u8>> {
     let mut bytes = std::fs::read(path).unwrap();
     let probe = Overlay::new(Rc::new(bytes.clone()));
@@ -60,7 +58,6 @@ fn consistent(img: &Overlay) -> Result<(), String> {
     let g = *fat.geometry().unwrap();
     let cb = g.cluster_bytes() as u64;
     let mut cache = fat.cache.borrow_mut();
-    // Each cluster's owner: the first cluster of the chain it is in, and a name for messages.
     let mut owner: HashMap<u32, (u32, String)> = HashMap::new();
     let mut claim = |c: u32, first: u32, who: &str| match owner.insert(c, (first, who.to_string())) {
         Some((other_first, other)) if other_first != first => {
@@ -123,7 +120,6 @@ fn consistent(img: &Overlay) -> Result<(), String> {
     Ok(())
 }
 
-/// **Bytes `[from, size)` of the file at `path` read as zeroes**, at whatever size its entry says.
 fn zero_past(img: &Overlay, path: &[u8], from: u64) -> Result<(), String> {
     let fat = Fat::new(img);
     let mut buf = vec![0u8; 64 * 1024];
@@ -252,8 +248,6 @@ fn a_crash_anywhere_in_a_mkdir_is_consistent() {
     );
 }
 
-/// **Removing a file and releasing it, and a rename across directories**, crashed everywhere: at
-/// worst the moved file is under both names for a moment, never two files in one cluster.
 #[test]
 fn a_crash_anywhere_in_a_removal_or_a_move_is_consistent() {
     let img = mformat(16, &["-c", "8"]);

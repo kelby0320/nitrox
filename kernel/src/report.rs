@@ -1,28 +1,24 @@
 //! The hardware report: the kernel log, held on the screen a page at a time before userspace
-//! starts, on a boot whose command line asks for it (Phase 5 Part D.3).
+//! starts, on a boot whose command line asks for it.
 //!
-//! Every boot logs what it found (Part D.1), and on a machine with a serial port that is enough.
-//! The laptop Phase 5 targets has none, and its screen holds 48 rows that scroll as userspace
-//! starts and are gone when the compositor takes the display a second later. A report boot stops
-//! here instead — after the drivers have bound, every CPU has come up and the framebuffer is
-//! recorded, before `init` — and shows the log from its first line, holding each page until a key
-//! is pressed. Then the same boot carries on, so it also shows whether userspace comes up.
+//! A laptop with no serial port has a screen of 48 rows that scroll as userspace starts and are
+//! gone when the compositor takes the display. A report boot stops here instead (after the
+//! drivers have bound, every CPU is up and the framebuffer is recorded, before `init`) and shows
+//! the log from its first line, holding each page until a key is pressed. Then the same boot
+//! carries on, so it also shows whether userspace comes up.
 //!
 //! What is shown is the log itself, read back out of [`klog`](crate::klog): there is no second
 //! statement of any fact to drift from the first.
 //!
 //! ## What ends a page, and what ends the report
 //!
-//! - **A key press** turns the page, counted by the i8042 driver as it decodes. Which key is never
-//!   looked at. The keys that turned pages are discarded before userspace starts, so none reaches
-//!   the first program to read the keyboard.
-//! - **No key within the bound** ends the whole report, not the page: a keyboard that does not
-//!   work would otherwise cost the bound once per page, minutes on a long log, which looks exactly
-//!   like the hang a report exists to diagnose. The bound is `hwreport=<seconds>`.
-//! - **No keyboard at all** — no i8042 answered — and nothing is held: the report says so and the
-//!   boot carries on at once.
-//! - **No console on the screen**, and there is nothing to hold either. COM1 already has every
-//!   line.
+//! - **A key press** turns the page, counted by the keyboard drivers as they decode; which key is
+//!   never looked at. The keys that turned pages are discarded before userspace starts.
+//! - **No key within the bound** ends the whole report, not the page: a dead keyboard would
+//!   otherwise cost the bound once per page, minutes on a long log, which looks exactly like the
+//!   hang a report exists to diagnose. The bound is `hwreport=<seconds>`.
+//! - **No keyboard at all**, and nothing is held: the report says so and the boot carries on.
+//! - **No console on the screen**, and nothing is held either: COM1 already has every line.
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::timer::ArchTimer;
@@ -34,17 +30,15 @@ use crate::libkern::KVec;
 /// key. Boot-time, from the boot thread, with interrupts enabled (the key and the clock both
 /// arrive by interrupt) and before any userspace exists.
 pub fn run(page_wait_secs: u32) {
-    // **Any keyboard**: the i8042's, or a USB one the hub thread's first round bound (Phase 6 Part
-    // B.2), since this runs after `drivers::settle`. It asked the i8042 alone until then, and a
-    // machine without one held no page (PR #357 review).
+    // **Any keyboard**: the i8042's, or a USB one the hub thread's first round bound (this runs
+    // after `drivers::settle`).
     if !crate::device::has(crate::libkern::device::DeviceKind::Keyboard) {
         crate::kprintln!("report: no keyboard answered, so nothing can turn a page — not holding");
         return;
     }
 
-    // The log first, then the screen: what is shown is the log as it stood when the report began.
-    // A line printed after this reaches COM1 and the console's grid, and is on the screen again
-    // when the report ends.
+    // The log first, then the screen: what is shown is the log as it stood when the report began. A
+    // later line reaches COM1 and the console's grid, and is on the screen again at the end.
     let mut log: KVec<u8> = KVec::new();
     let size = crate::klog::len();
     if log.try_reserve(size).is_err() {

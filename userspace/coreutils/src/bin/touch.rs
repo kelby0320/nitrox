@@ -1,35 +1,16 @@
 //! `touch` — create a file if it is absent, and stamp its modification time.
 //!
-//! Milestone 2 Part C. Two behaviours in one verb, and they are not variations of each
-//! other: creating a file is a directory mutation, while stamping one is an inode
-//! mutation on a file that already exists.
-//!
-//! ```text
-//! touch PATH...              # create if absent, otherwise stamp mtime
-//! touch --no-create PATH...  # stamp only; a missing PATH is skipped, not created
-//! ```
+//! Two behaviours in one verb: creating a file is a directory mutation, while stamping one is an
+//! inode mutation on a file that already exists.
 //!
 //! ## Deliberate behaviours
 //!
 //! - **The time comes from the filesystem, never from here.** There is no `--date`, and
-//!   the wire carries no timestamp: one a caller could choose would be forgeable
-//!   metadata, so the server reads its own clock. That is why this utility cannot
-//!   express "set mtime to X" and does not pretend to.
-//! - **`--no-create` skips rather than fails.** The flag says "I only want to stamp what
-//!   is there"; erroring on absence would make it useless for its one job, which is
+//!   the wire carries no timestamp: one a caller could choose would be forgeable metadata,
+//!   so the server reads its own clock.
+//! - **`--no-create` skips rather than fails**: erroring on absence would make it useless for
 //!   touching a set of paths without conjuring the missing ones.
-//! - **It emits a table.** `Table<{path: String, created: Bool}>` — the same shape as
-//!   `mkdir`, because the same question ("did this exist already?") is the interesting
-//!   one, and a pipeline can answer it without a second `list`.
-//!
-//! ## Why the session op had to be added first
-//!
-//! `File::Touch` already existed, but only on the **kernel↔server control channel**: it
-//! is how the kernel reports a Model A write that the fs-server cannot otherwise observe
-//! (Slice C4). It is path-addressed, fire-and-forget, and has no client behind it, so a
-//! client session that sent it got `Unsupported`. Part C therefore began by giving it a
-//! session-scoped form — name-addressed inside an open directory, returning a status,
-//! exactly like `mkdir`/`unlink`/`rmdir` — rather than working around its absence.
+//! - **It emits a table.** `Table<{path: String, created: Bool}>` — the same shape as `mkdir`.
 
 #![no_std]
 #![no_main]
@@ -48,7 +29,6 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: path building and the TSM1 encoder both allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
@@ -66,7 +46,6 @@ const HELP: &[u8] = b"usage: touch [--no-create] PATH...\n\
 
 const VERSION: &[u8] = b"touch (nitrox coreutils) 0.1.0\n";
 
-/// One path this run touched, and whether it had to create it.
 struct Touched {
     path: String,
     created: bool,
@@ -111,9 +90,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
             if libfs::create_file(stage.namespace, path).is_err() {
                 stage.die(b"touch: cannot create file\n", EXIT_FAILURE);
             }
-            // A just-created inode is stamped by the server as it creates it, so there is
-            // nothing further to do — and stamping again would be a second round trip for
-            // a timestamp that is already now.
+            // A just-created inode is stamped by the server as it creates it.
             done.push(Touched { path: as_string(path), created: true });
             continue;
         }
@@ -152,7 +129,6 @@ fn as_string(path: &[u8]) -> String {
     String::from_utf8_lossy(path).into_owned()
 }
 
-/// Write the rows as a TSM1 table on the `stdout` stream.
 fn emit(stage: &Stage, stdout: u64, done: &[Touched]) {
     let schema = Schema::new().field("path", TypeTag::String, TypeModifiers::NONE).field(
         "created",

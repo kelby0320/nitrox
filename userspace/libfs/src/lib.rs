@@ -1,37 +1,9 @@
 //! `libfs` — whole-file and path helpers, for anything that touches the filesystem.
 //!
-//! **Whole-file operations, and the composition of directory ones.** A file's *contents* do not
-//! go through the directory protocol at all: a file resolves to a **page-cache object** the
-//! process maps, so copying one is a `memcpy` between two mappings and the kernel moves the data
-//! (Model A; `docs/architecture/filesystem-data-path.md`). That half is the bulk of this crate.
-//!
-//! The directory *protocol* is [`librsproto::session::Dir`] and stays there, beside the wire
-//! format it speaks. What lives here is the rule for putting its answers together —
-//! [`list_dir`], where a path's entries are the filesystem's **plus** the namespace bindings
-//! mounted there, with bindings shadowing. That is not a protocol operation; it is a decision
-//! about two sources, and it had two consumers (PR #257 review, finding 6, which caught this
-//! paragraph still claiming the crate held no directory operations at all).
-//!
-//! Not in `librsproto` either way, because this crate owns no wire format: what is below is
-//! namespace and memory syscalls, and composition on top of somebody else's protocol.
-//!
-//! ## Why it is a crate rather than a module in `coreutils`
-//!
-//! It was `coreutils::fs` until M10 Part A, and moved when a **second consumer** arrived.
-//! `coreutils`' library is otherwise shell-program infrastructure — the Tier-1 stage
-//! prologue, GNU-style argument parsing, TSM1 stdout plumbing — and a graphical file
-//! browser wants the filesystem half and none of that. One application depending on
-//! another application's crate to reach it is the wrong shape, and copying the helpers is
-//! the shape that produces two implementations of `rename`.
-//!
-//! **Moved rather than rewritten**, deliberately: every function below is the code the
-//! coreutils have been running since Milestone 3.5, and the gates that already drive that code
-//! are what a move has to survive. **Which gate is which matters, so it is spelled out**:
-//! `test-qemu` runs `copy`, `move`, `rename` and `remove` against a real filesystem through
-//! `test-harness`'s demos, and `test-interactive` types `list` at a real prompt. An earlier
-//! version of this note credited `test-interactive` with all four — it types none of the other
-//! three — which would have sent somebody editing `copy_tree` to the gate that cannot see it
-//! (PR #256 review, blocking 1).
+//! A file's contents bypass the directory protocol: a file resolves to a page-cache object the
+//! process maps, so a copy is a `memcpy` between two mappings. The directory protocol itself is
+//! [`librsproto::session::Dir`]; this crate owns no wire format, only namespace and memory
+//! syscalls and the composition of directory answers ([`list_dir`]).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -59,34 +31,25 @@ pub enum FileError {
     NotFound,
     /// The destination already exists and no overwrite was requested.
     Exists,
-    /// The destination could not be shrunk to the source's length, so overwriting it
-    /// would have left the old tail behind. See [`copy_file`].
+    /// The destination could not be shrunk to the source's length.
     TruncateFailed,
     /// The file exceeds [`MAX_COPY`].
     TooLarge,
-    /// A [`rename`]'s destination lives on a different filesystem, so the kernel cannot do
-    /// it as one operation. Not a failure to report as-is — the caller falls back to
-    /// [`copy_file`] + unlink, which is what `mv` does across devices.
+    /// A [`rename`] across filesystems; the caller falls back to [`copy_file`] + unlink.
     CrossDevice,
     /// A syscall failed; the payload is its negative return.
     Io(i32),
 }
 
-/// The largest file a coreutil copies in one mapping.
+/// The largest file copied in one mapping.
 ///
-/// A file maps whole (there is no offset argument to `sys_memory_map`), so a copy costs
-/// two mappings of the file's size in *address space* — the pages themselves are
-/// demand-paged, so this bounds VA, not RAM. 8 MiB is far above anything in the current
-/// image and far below anything that would strain a 47-bit user half. **A windowed copy would
-/// not lift it**: unmapping leaves a file's pages with its page-cache object, so a window at a
-/// time still holds every page. The copy through `sys_io_submit` that the syscall
-/// consolidation plans is what lifts it (`copy-limit` in `deferred-decisions.md`).
+/// A file maps whole (`sys_memory_map` has no offset), so this bounds address space, not RAM; a
+/// windowed copy would not lift it, as unmapping leaves the pages with the page-cache object.
+/// A copy through `sys_io_submit` will (`copy-limit` in `deferred-decisions.md`).
 pub const MAX_COPY: u64 = 8 * 1024 * 1024;
 
-/// Resolve `path` and return its size, or `None` if it does not resolve to a file.
-///
-/// Used to answer "does the destination exist?" — a directory does not resolve to a file
-/// object, so this is `None` for one (ask [`librsproto::session::Dir::open`] instead).
+/// Resolve `path` and return its size, or `None` if it does not resolve to a file (a directory
+/// does not).
 pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
     let handle = lookup(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT).ok()?;
     let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
@@ -100,15 +63,8 @@ pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
 
 /// Copy the regular file at `src` to `dst`, returning the bytes copied.
 ///
-/// Fails with [`FileError::Exists`] if `dst` is already there and `overwrite` is false —
-/// the fail-loud default (design §10d: "fail loud if destination exists, unless
-/// `--force`").
-///
-/// **Overwriting a longer file shrinks it first.** Creating an existing file is
-/// idempotent and growing it to a smaller size is a no-op, so without an explicit
-/// truncate the destination's old tail would survive past the new content — a file that
-/// is neither the old one nor the new one. `copy` refused that case outright until the
-/// filesystem gained a truncate (decision log, 2026-07-24).
+/// [`FileError::Exists`] if `dst` exists and `overwrite` is false. A longer `dst` is shrunk first,
+/// else its old tail would survive.
 pub fn copy_file(ns: u64, src: &[u8], dst: &[u8], overwrite: bool) -> Result<u64, FileError> {
     let size = file_size(ns, src).ok_or(FileError::NotFound)?;
     if size > MAX_COPY {
@@ -119,9 +75,7 @@ pub fn copy_file(ns: u64, src: &[u8], dst: &[u8], overwrite: bool) -> Result<u64
             return Err(FileError::Exists);
         }
         if existing > size {
-            // Shrink to the source's length *before* writing, so no byte of the old
-            // tail can survive — and verify it, since a silently-failed truncate would
-            // leave exactly the corruption this is here to prevent.
+            // Shrink before writing and verify: a silent truncate failure would keep the tail.
             truncate(ns, dst, size)?;
             if file_size(ns, dst) != Some(size) {
                 return Err(FileError::TruncateFailed);
@@ -129,8 +83,7 @@ pub fn copy_file(ns: u64, src: &[u8], dst: &[u8], overwrite: bool) -> Result<u64
         }
     }
 
-    // An empty source needs no mapping at all — `sys_memory_map` has no meaning for a
-    // zero-length object — but the destination must still come into existence.
+    // A zero-length object cannot be mapped, but the destination must still exist.
     if size == 0 {
         let dst_handle = create(ns, dst, 0)?;
         // SAFETY: closing our own handle.
@@ -172,18 +125,13 @@ fn map_copy(src_handle: u64, dst_handle: u64, size: u64) -> Result<(), FileError
         return Err(FileError::Io(dst_addr as i32));
     }
 
-    // Both mappings are `size` bytes of the respective page-cache objects, and they are
-    // distinct objects (a self-copy is refused by the caller's path comparison), so the
-    // ranges cannot overlap.
     // SAFETY: `size` bytes are mapped at both addresses, and the regions are disjoint.
     unsafe {
         core::ptr::copy_nonoverlapping(src_addr as *const u8, dst_addr as *mut u8, size as usize);
     }
 
-    // Unmap, then flush through the handle: without the flush the copy lives only in the page
-    // cache until something syncs the file. **Unmapped first**, because a flush that begins
-    // with a writable mapping still in place leaves the file dirty — the mapping could write
-    // again — and the kernel keeps a dirty file's pages until the next flush of it.
+    // Unmap before the flush: a writable mapping still in place leaves the file dirty, and the
+    // kernel keeps a dirty file's pages until the next flush.
     // SAFETY: unmapping our own mappings.
     unsafe {
         syscall2(SYS_MEMORY_UNMAP, dst_addr as u64, size);
@@ -197,8 +145,7 @@ fn map_copy(src_handle: u64, dst_handle: u64, size: u64) -> Result<(), FileError
     Ok(())
 }
 
-/// Shrink `path` to `size` bytes, freeing the blocks past the new end. A no-op if the
-/// file is already that size or shorter — growing is [`create`]'s job.
+/// Shrink `path` to `size` bytes, a no-op if it is no longer; growing is [`create`]'s job.
 fn truncate(ns: u64, path: &[u8], size: u64) -> Result<(), FileError> {
     // SAFETY: valid path slice + namespace handle.
     let po = unsafe {
@@ -209,8 +156,7 @@ fn truncate(ns: u64, path: &[u8], size: u64) -> Result<(), FileError> {
     }
     let (status, handle) = po_wait(po as u64);
     if handle != 0 {
-        // The resolve hands back a file handle as a side effect; the caller only wanted
-        // the size change, so close it rather than leak one per overwrite.
+        // The resolve hands back a file handle we do not want; close it.
         // SAFETY: closing a handle just installed into our table.
         unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
     }
@@ -222,20 +168,8 @@ fn truncate(ns: u64, path: &[u8], size: u64) -> Result<(), FileError> {
 
 /// Read the whole file at `path`.
 ///
-/// **The other half of [`copy_file`], for a caller whose destination is memory.** A file
-/// resolves to a page-cache object and the read is a `memcpy` out of a mapping of it — there is
-/// no read syscall to make and no offset to track, which is Model A's whole point.
-///
-/// Empty files are `Ok(empty)` rather than an error: `sys_memory_map` has no meaning for a
-/// zero-length object, so there is nothing to map and nothing to copy, and an editor opening a
-/// file `touch` just made is the ordinary case rather than an edge one.
-///
-/// **In `libfs` rather than in its one consumer**, which is worth stating because the rule that
-/// moved this crate out of `coreutils` says the opposite: a helper with one consumer belongs to
-/// that consumer. The rule is about *policy* — where a decision lives — and this is mechanism
-/// whose primitives (`lookup`, `create`, `truncate`, the PO wait) are private to this module. A
-/// copy outside it would be a second implementation of the mapping dance, which is the thing
-/// the rule exists to prevent.
+/// An empty file is `Ok(empty)`: there is nothing to map. Lives here rather than with its one
+/// consumer because it is mechanism over this module's private primitives, not policy.
 pub fn read_file(ns: u64, path: &[u8]) -> Result<Vec<u8>, FileError> {
     let size = file_size(ns, path).ok_or(FileError::NotFound)?;
     if size > MAX_COPY {
@@ -263,29 +197,16 @@ pub fn read_file(ns: u64, path: &[u8]) -> Result<Vec<u8>, FileError> {
     Ok(out)
 }
 
-/// **`bytes` without the NULs that end it**: what [`read_file`] read of a snapshot, its padding
-/// trimmed.
-///
-/// **A snapshot is a `MemoryObject`, whose size is its pages'**: the kernel's `/dev/log` is sized
-/// to the bytes logged and zero-pads the last page, leaving the reader to trim (PR #371 review,
-/// finding 1). Read whole and split into lines, the padding was a last line of NULs. A file a
-/// filesystem serves is sized to its bytes, so this is for a reader of text, where a NUL is no
-/// character: a binary file may end in zeroes it means.
+/// `bytes` without the trailing NULs of a snapshot (sized in pages, so `/dev/log` is zero-padded).
+/// For text only: a binary file may end in zeroes it means.
 pub fn unpadded(bytes: &[u8]) -> &[u8] {
     &bytes[..bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1)]
 }
 
-/// Write `bytes` to `path`, replacing whatever was there.
+/// Write `bytes` to `path`, replacing whatever was there, shrinking first as [`copy_file`] does.
 ///
-/// **Shrinks before it writes**, for [`copy_file`]'s reason and with the same verification: a
-/// file grown to a smaller size is a no-op, so without the truncate the old tail would survive
-/// past the new content — a file that is neither what it was nor what it was meant to become.
-///
-/// **This is not a safe save on its own**, and no caller should treat it as one: it truncates
-/// the destination, so a failure between the truncate and the flush leaves a file shorter than
-/// both versions. The safe sequence is to write a temporary and [`rename`] it over the target,
-/// which is atomic on the server side — see `nxedit`, which does exactly that and is the reason
-/// this exists.
+/// Not a safe save: a failure after the truncate leaves a file shorter than both versions.
+/// Write a temporary and [`rename`] it instead.
 pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
     let size = bytes.len() as u64;
     if size > MAX_COPY {
@@ -299,7 +220,6 @@ pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
             return Err(FileError::TruncateFailed);
         }
     }
-    // An empty file still has to come into existence; there is nothing to map.
     if size == 0 {
         let handle = create(ns, path, 0)?;
         // SAFETY: closing our own handle.
@@ -317,7 +237,6 @@ pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
     // SAFETY: `size` bytes are mapped at `addr`, `bytes` holds exactly that many, and a caller's
     // slice cannot alias a mapping this call just made.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, size as usize) };
-    // Unmap, flush through the handle, then close — unmapped first, as in `copy_file`.
     // SAFETY: unmapping our own mapping.
     unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, size) };
     // SAFETY: `handle` is our writable file handle.
@@ -330,11 +249,7 @@ pub fn write_file(ns: u64, path: &[u8], bytes: &[u8]) -> Result<(), FileError> {
     Ok(())
 }
 
-/// Create `path` as an empty file if it is not already there, then release the handle.
-///
-/// The underlying create is idempotent, so this is safe to call on a path that exists —
-/// but callers that care about the distinction should test first, because this cannot
-/// report which happened.
+/// Create `path` as an empty file if absent; idempotent, so it cannot report which happened.
 pub fn create_file(ns: u64, path: &[u8]) -> Result<(), FileError> {
     let handle = create(ns, path, 0)?;
     // SAFETY: closing a handle this function just created and owns.
@@ -342,8 +257,7 @@ pub fn create_file(ns: u64, path: &[u8]) -> Result<(), FileError> {
     Ok(())
 }
 
-/// Create (or open, idempotently) `path` and grow it to `size`, returning a read-write
-/// handle.
+/// Create (or open) `path`, grow it to `size`, and return a read-write handle.
 fn create(ns: u64, path: &[u8], size: u64) -> Result<u64, FileError> {
     // SAFETY: valid path slice + namespace handle.
     let po = unsafe {
@@ -361,29 +275,9 @@ fn create(ns: u64, path: &[u8], size: u64) -> Result<u64, FileError> {
 
 /// The namespace bindings immediately beneath `path`, as `(name, kind)` pairs.
 ///
-/// A path's listing is the **union** of two things: whatever filesystem lies under it, and
-/// the namespace bindings directly beneath it. That is not a special case bolted on for
-/// `/dev` — it is how mount points have always appeared in a parent directory's listing.
-/// Framing it as a union is what removes the question the plan posed ("how does `list`
-/// choose between namespace enumeration and a directory session?"): it does not choose.
-/// It asks both and merges, and each source answers for the part it owns.
-///
-/// `/dev` is then unremarkable — nothing is mounted there, so its listing is entirely
-/// bindings (`entropy`, `blk`, `console`, `log`). `/system` is equally unremarkable in the
-/// other direction: nothing is bound beneath it, so its listing is entirely files. `/` is
-/// the interesting one, and the union is exactly right there — the root filesystem's own
-/// entries plus the mount points and kernel servers bound alongside them.
-///
-/// Enumeration is local and cheap (no IPC — the kernel walks the caller's own namespace),
-/// so doing it unconditionally costs a syscall loop over a handful of bindings.
-///
-/// **Limitation, stated rather than hidden:** a kernel server that owns a *subtree*
-/// (`/dev/blk/<n>`) appears as one binding, so `blk` is reported as a directory that then
-/// lists as empty. The kernel generates those children on demand and the namespace has no
-/// way to ask "what would you serve?". That happens only in the root namespace — anywhere else
-/// each device is a binding of its own, and lists — and **what answers it is not this function
-/// but `/dev/devices`** (administration Part B): the device manager's tables, which name every
-/// device and the path that serves it. The root namespace reads the kernel's `/dev/registry`.
+/// A listing is the union of the filesystem under a path and the bindings beneath it; this is the
+/// bindings half. A kernel server owning a subtree (`/dev/blk/<n>`) appears as one binding that
+/// lists as empty; `/dev/devices` answers that, not this.
 pub fn ns_children(ns: u64, path: &[u8]) -> Vec<(String, u8)> {
     // `path` with exactly one trailing slash, so a prefix test is unambiguous.
     let mut base = String::from_utf8_lossy(path).into_owned();
@@ -408,13 +302,11 @@ pub fn ns_children(ns: u64, path: &[u8]) -> Vec<(String, u8)> {
         if rest.is_empty() {
             continue; // the binding *is* this path, not a child of it
         }
-        // The first component, and whether the binding continues past it.
         let (name, deeper) = match rest.split_once('/') {
             Some((head, _)) => (head.to_string(), true),
             None => (rest.to_string(), false),
         };
-        // An intermediate component is a directory by construction; a leaf binding is a
-        // directory only if it is a filesystem mount.
+        // An intermediate component is a directory; a leaf is one only if it is a mount.
         let kind = if deeper || entry.kind == NS_KIND_MOUNT { DIRENT_KIND_DIR } else { DIRENT_KIND_FILE };
         if !out.iter().any(|(n, _)| *n == name) {
             out.push((name, kind));
@@ -423,15 +315,10 @@ pub fn ns_children(ns: u64, path: &[u8]) -> Vec<(String, u8)> {
     out
 }
 
-/// Rename `src` to `dst`, both absolute namespace paths. With `replace`, an existing
-/// destination is unlinked as part of the rename; without it, an existing destination
-/// fails.
+/// Rename `src` to `dst`, absolute namespace paths; `replace` unlinks an existing destination.
 ///
-/// This is the whole operation in one syscall — no data moves and nothing is mapped, so it
-/// is atomic from a reader's point of view in a way copy-then-unlink is not. It only works
-/// **within one filesystem**: a destination under a different binding returns
-/// [`FileError::CrossDevice`], which is a caller's cue to fall back to
-/// [`copy_file`] + unlink rather than an error to report.
+/// One syscall, atomic to readers. Only within one filesystem: elsewhere it returns
+/// [`FileError::CrossDevice`], the cue to fall back to [`copy_file`] + unlink.
 pub fn rename(ns: u64, src: &[u8], dst: &[u8], replace: bool) -> Result<(), FileError> {
     let flags = if replace { RENAME_REPLACE as u64 } else { 0 };
     // SAFETY: two valid path slices + a namespace handle.
@@ -457,13 +344,8 @@ pub fn rename(ns: u64, src: &[u8], dst: &[u8], replace: bool) -> Result<(), File
     Ok(())
 }
 
-/// Pick out the one rename failure a caller acts on differently — a cross-filesystem
-/// destination, which means "fall back to copy + unlink", not "report an error".
-///
-/// An *occupied* destination is deliberately not distinguished here: the server maps it to
-/// `InvalidArgument`, which a malformed request also produces, so a caller that wants to
-/// refuse an existing destination should test for it with [`file_size`] first (which is
-/// what `copy` does) rather than infer it from this status.
+/// Map a cross-filesystem destination to `CrossDevice`. An occupied one is not distinguished: the
+/// server reports it as `InvalidArgument`, as it does a malformed request; use [`file_size`] first.
 fn map_rename_error(status: i32) -> FileError {
     match KError::from_i32(status) {
         KError::Unsupported => FileError::CrossDevice,
@@ -472,12 +354,7 @@ fn map_rename_error(status: i32) -> FileError {
     }
 }
 
-/// Resolve `path` to a handle with `rights`, returning `(status, handle)`.
-///
-/// The public form of [`lookup`], for callers that resolve something which is not a file
-/// — `whoami` reading the session's `/session/user` binding, for instance. A binding may
-/// be a direct handle or a userspace server that answers with one; this cannot tell, and
-/// deliberately does not need to.
+/// Resolve `path` to a handle with `rights`, returning `(status, handle)`; not only for files.
 pub fn lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     match lookup(ns, path, rights) {
         Ok(h) => (0, h),
@@ -515,18 +392,10 @@ fn po_wait(po: u64) -> (i32, u64) {
     (status, result)
 }
 
-// --- path helpers -----------------------------------------------------------
-
-/// The final component of `path` (`"/a/b/c"` → `"c"`), or the whole path if it has no
-/// separator. A trailing separator is ignored (`"/a/b/"` → `"b"`), so a caller that writes
-/// a directory with a trailing slash still gets a usable name.
 /// Does `path` name a directory?
 ///
-/// Answered by *opening a session on it*, because that is the only question the
-/// directory protocol answers directly: a session opens on a directory and fails on
-/// anything else. Cheap enough for the uses here (one open + close), and it avoids
-/// inferring a type from an error code — see the note on `FsError::Exists` and
-/// `FsError::NotEmpty` both arriving as `InvalidArgument`.
+/// Answered by opening a session on it, which succeeds only on a directory; this avoids inferring
+/// a type from an error code.
 pub fn is_dir(ns: u64, path: &[u8]) -> bool {
     let mut buf = [0u8; 4096];
     match Dir::open(ns, path, &mut buf) {
@@ -538,15 +407,10 @@ pub fn is_dir(ns: u64, path: &[u8]) -> bool {
     }
 }
 
-/// How a directory listing is ordered.
-///
-/// **Here rather than in each viewer** (M14 decision 3). Two consumers order the same listing —
-/// the browser and the file chooser — and sorting in two places is how two directory views come
-/// to disagree about what "newest" means. An enum rather than a comparator because the set is the
-/// one a person can choose from, not an open extension point.
+/// How a directory listing is ordered. An enum: the set is what a person can choose from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Order {
-    /// Name, ascending. The default, and the only order stable under everything but a rename.
+    /// Name, ascending. The default.
     #[default]
     NameAsc,
     /// Name, descending.
@@ -559,16 +423,12 @@ pub enum Order {
 
 /// What [`sort`] needs to know about an entry.
 ///
-/// **A trait so that one comparison serves two shapes.** The browser projects `OwnedEntry` down
-/// to a row type of its own with the fields a view needs, so a `sort` that took only `OwnedEntry`
-/// left it to write the comparison a second time — which it did, and which is the exact
-/// divergence this module was introduced to prevent (PR #284 review, finding 5). Three accessors
-/// rather than a conversion, because building a `Vec<OwnedEntry>` to sort a `Vec<Entry>` would
-/// copy every name to answer a question about order.
+/// A trait so one comparison serves `OwnedEntry` and a caller's own row type, without copying
+/// names into a `Vec<OwnedEntry>` first.
 pub trait Listed {
     /// The entry's name, with no path in it.
     fn sort_name(&self) -> &[u8];
-    /// Whether it is a directory — which decides the *group*, never the order within one.
+    /// Whether it is a directory; decides the group, not the order within it.
     fn sort_is_dir(&self) -> bool;
     /// Modification time, or `0` where the server reports none.
     fn sort_mtime(&self) -> i64;
@@ -586,16 +446,9 @@ impl Listed for OwnedEntry {
     }
 }
 
-/// Sort `entries` in place, **directories first** and then by `order`.
+/// Sort `entries` in place, directories first (whatever the order) and then by `order`.
 ///
-/// **Directories first is not part of the order**, and that is deliberate: it is a fact about
-/// reading a listing rather than something somebody chose, and every file manager does it
-/// whichever sort is selected. Reversing the *name* order does not put files above directories.
-///
-/// **A tie breaks on name, always.** `mtime` is `0` when a server does not report one, and a
-/// directory of zeroes ordered by "newest" would otherwise come back in whatever order the
-/// enumeration produced — not an order anybody chose, and one that would appear to shuffle
-/// between listings of the same directory.
+/// Ties break on name: `mtime` is `0` when a server reports none, and enumeration order would show.
 pub fn sort<T: Listed>(entries: &mut [T], order: Order) {
     entries.sort_by(|a, b| {
         b.sort_is_dir().cmp(&a.sort_is_dir()).then_with(|| match order {
@@ -608,23 +461,9 @@ pub fn sort<T: Listed>(entries: &mut [T], order: Order) {
 }
 
 /// Every entry directly under `path`: the filesystem's, plus the namespace bindings mounted
-/// there, with bindings shadowing same-named files.
+/// there, with bindings shadowing same-named files, as a mount point shadows what it covers.
 ///
-/// **A path's listing is a union, and that is not a policy choice — it is how mount points
-/// appear in a parent's listing.** The filesystem under a path and the namespace bindings
-/// directly beneath it are two sources for one question, so this asks both and lets each answer
-/// for the part it owns: `/dev` is all bindings and no filesystem, `/system` is the other way,
-/// and `/` genuinely needs both. A binding shadows a same-named filesystem entry exactly as a
-/// mount point shadows the directory it covers.
-///
-/// `Err` only when there is neither — no filesystem here *and* nothing bound beneath. A
-/// kernel-served directory like `/dev` is an ordinary success with the bindings as the whole
-/// answer.
-///
-/// **Moved out of `list` in M10 Part B**, when the file browser became the second consumer. The
-/// union rule is the kind that gets re-derived slightly differently by whoever needs it next —
-/// and a browser that forgot the shadowing would show a mount point twice, once as the directory
-/// it covers (M10 Part B; the rule is `userspace/CLAUDE.md`'s).
+/// `Err` only when there is neither a filesystem here nor a binding beneath.
 pub fn list_dir(ns: u64, path: &[u8]) -> Result<Vec<OwnedEntry>, DirError> {
     let ns_entries = ns_children(ns, path);
 
@@ -657,10 +496,7 @@ pub fn list_dir(ns: u64, path: &[u8]) -> Result<Vec<OwnedEntry>, DirError> {
 
 /// The final component of a path (`"/a/b/c"` → `"c"`).
 ///
-/// **Trailing separators are ignored, and that is the rule worth stating**: `"/a/b/"` is `"b"`,
-/// not the empty string. A caller that took the empty name would build `"dir/"` and ask a
-/// directory server to create an entry with no name. `"/"` is itself, since there is no
-/// component to take.
+/// Trailing separators are ignored (`"/a/b/"` is `"b"`, not empty); `"/"` is itself.
 pub fn basename(path: &[u8]) -> &[u8] {
     let end = match path.iter().rposition(|&c| c != b'/') {
         Some(i) => i + 1,
@@ -672,26 +508,14 @@ pub fn basename(path: &[u8]) -> &[u8] {
     }
 }
 
-/// [`basename`] on a `str`, for the callers whose paths are already text.
-///
-/// **Not a second rule, and that is the point of it being here.** The two graphical
-/// applications each grew a private copy — byte-identical, each with a comment explaining that
-/// this half of the application never sees a path as bytes, which was true when there was one
-/// of them (PR #259 review, optional 6). One consumer's helper belongs to that consumer; two
-/// belong below both, which is the rule this crate itself was extracted under.
-///
-/// The conversion is free rather than lossy: a `str` is UTF-8, `/` never occurs inside a
-/// multi-byte sequence, and the bytes handed back are a subslice cut only at one — so the
-/// `from_utf8` **cannot fail**, and the fallback below is unreachable rather than a repair.
-/// Changing what it returns changes no test, which is the evidence for that claim rather than a
-/// gap in the tests: what the test pins is that a non-ASCII name comes back whole.
+/// [`basename`] on a `str`. The `from_utf8` cannot fail: `/` never occurs inside a multi-byte
+/// sequence, so the subslice is still UTF-8 and the fallback is unreachable.
 pub fn basename_str(path: &str) -> &str {
     core::str::from_utf8(basename(path.as_bytes())).unwrap_or(path)
 }
 
-/// Everything before the final component (`"/a/b/c"` → `"/a/b"`), or `"/"` when the path
-/// has a single component — the root is its own parent, which is what a caller opening the
-/// parent directory needs.
+/// Everything before the final component (`"/a/b/c"` → `"/a/b"`), or `"/"` for a single
+/// component: the root is its own parent.
 pub fn parent(path: &[u8]) -> &[u8] {
     let end = match path.iter().rposition(|&c| c != b'/') {
         Some(i) => i + 1,
@@ -714,18 +538,10 @@ pub fn join(dir: &[u8], name: &[u8]) -> String {
     s
 }
 
-/// The folders a session's home holds for a person's own files — between Home and Root in every
-/// list of [`places`].
+/// The folders a session's home holds for a person's own files, between Home and Root in
+/// [`places`].
 ///
-/// **Named here, and made by whoever makes a home**: the image build for the demo home, since
-/// administration Part D.3 the view broker for every account an administrator adds, and since Part
-/// G.2 `nxinstall` for an installed machine's first account.
-/// A place whose directory is absent is still offered — opening it says so, which is the same
-/// answer a typed path gets.
-///
-/// It was `nxfiles::DEFAULT_FOLDERS` until the shell's Places menu needed the same list (desktop
-/// refresh, Part C): a helper with two consumers belongs below both, and a second copy is how the
-/// sidebar and the menu would come to disagree about what a person's places are.
+/// A place whose directory is absent is still offered; opening it says so, as a typed path does.
 pub const HOME_FOLDERS: &[&str] = &["Documents", "Downloads", "Pictures"];
 
 /// Somewhere a person goes often: what it is called, and the path it opens.
@@ -737,14 +553,9 @@ pub struct Place {
     pub path: String,
 }
 
-/// The places for a session whose home is `home`: Home, the [`HOME_FOLDERS`] beneath it, and the
-/// root.
+/// The places for a session whose home is `home`: Home, the [`HOME_FOLDERS`] beneath it, and Root.
 ///
-/// **Built rather than stored**, because every one of them is a function of `home` — a list held
-/// somewhere would be a second answer to "where is home" that could go stale.
-///
-/// **Home is first and Root is last**, which is the order they are wanted in: the folders between
-/// them are where a person's own files go, and `/` is the one you take deliberately.
+/// Built rather than stored: each is a function of `home`, so a held list could go stale.
 pub fn places(home: &str) -> Vec<Place> {
     let mut out = alloc::vec![Place { name: "Home", path: String::from(home) }];
     for name in HOME_FOLDERS {
@@ -758,8 +569,6 @@ pub fn places(home: &str) -> Vec<Place> {
 mod tests {
     use super::*;
 
-    /// The places are Home, the home folders under it, and Root — all relative to the home they
-    /// were asked about rather than to `/home`.
     #[test]
     fn the_places_are_built_from_the_home_they_are_given() {
         let places = places("/home/someone-else");
@@ -773,12 +582,9 @@ mod tests {
                 "{name} should be under this home, not under /home: {places:?}"
             );
         }
-        // A home given with its separator does not grow a second one.
         assert_eq!(super::places("/home/")[1].path, "/home/Documents");
     }
 
-    /// **The NULs that end the bytes go, and no others**: one inside a line stays, as does
-    /// everything when nothing pads it; all NULs are nothing.
     #[test]
     fn unpadded_trims_the_nuls_that_end_it() {
         assert_eq!(unpadded(b"a\nb\n\0\0\0"), b"a\nb\n");
@@ -792,8 +598,6 @@ mod tests {
     fn basename_takes_the_final_component() {
         assert_eq!(basename(b"/a/b/c"), b"c");
         assert_eq!(basename(b"file"), b"file");
-        // A trailing separator must not yield an empty name — a caller would then build
-        // "dir/" and create a nameless entry.
         assert_eq!(basename(b"/a/b/"), b"b");
         assert_eq!(basename(b"/"), b"/");
     }
@@ -803,10 +607,6 @@ mod tests {
         assert_eq!(basename_str("/a/b/c"), "c");
         assert_eq!(basename_str("/a/b/"), "b", "a trailing separator is not the name");
         assert_eq!(basename_str("/"), "/");
-        // **The claim worth pinning**: the byte version can only cut at an ASCII `/`, and a `/`
-        // byte never occurs inside a multi-byte UTF-8 sequence — so the subslice it hands back is
-        // always still text, and the fallback in `basename_str` is unreachable rather than a
-        // silent repair. A name that is not ASCII is what would expose the difference.
         assert_eq!(basename_str("/home/notes-café.txt"), "notes-café.txt");
         assert_eq!(basename_str("café"), "café");
     }
@@ -814,8 +614,7 @@ mod tests {
     #[test]
     fn parent_drops_the_final_component() {
         assert_eq!(parent(b"/a/b/c"), b"/a/b");
-        // A single-component absolute path's parent is the root, not the empty string:
-        // opening "" as a directory would fail where "/" is what was meant.
+        // The root, not the empty string: opening "" as a directory would fail.
         assert_eq!(parent(b"/system"), b"/");
         assert_eq!(parent(b"/a/b/"), b"/a");
         assert_eq!(parent(b"relative"), b".");
@@ -828,9 +627,6 @@ mod tests {
         assert_eq!(join(b"/", b"system"), "/system");
     }
 
-    // --- ordering a listing (M14 Part C) ------------------------------------
-
-    /// An entry with a name, a kind and an mtime — everything `sort` reads.
     fn ent(name: &str, dir: bool, mtime: i64) -> OwnedEntry {
         let kind = if dir { librsproto::file::DIRENT_KIND_DIR } else { librsproto::file::DIRENT_KIND_FILE };
         let mut e = OwnedEntry::binding(name.as_bytes(), kind);
@@ -842,12 +638,6 @@ mod tests {
         v.iter().map(|e| String::from_utf8_lossy(e.name()).into_owned()).collect()
     }
 
-    /// **A second shape sorts identically**, which is what makes one comparison serve two views.
-    ///
-    /// The browser projects `OwnedEntry` down to rows of its own, and before PR #284's review it
-    /// spelled the comparison again over them. This pins the property that made the copy
-    /// unnecessary: the order comes from [`Listed`], so a type with different fields, a different
-    /// name representation and a different notion of "directory" lands in the same sequence.
     #[test]
     fn a_different_shape_takes_the_same_order() {
         struct Row {
@@ -886,11 +676,6 @@ mod tests {
         }
     }
 
-    /// Directories come first whatever the order, including the reversed one.
-    ///
-    /// **The reversal is the case worth writing.** "Z–A" reverses the *names*; a comparison that
-    /// reversed the whole key would put files above directories, which no file manager does and
-    /// which reads as the listing having changed shape rather than order.
     #[test]
     fn directories_lead_every_order() {
         let mut v = alloc::vec![
@@ -922,12 +707,6 @@ mod tests {
         assert_eq!(names(&v), ["a.txt", "b.txt", "c.txt"]);
     }
 
-    /// A whole directory with no `mtime` still comes back in a *stable* order.
-    ///
-    /// **`0` is what a server reports when it does not know**, and it is common rather than
-    /// exotic — the namespace half of a listing has no mtime at all. Ordering by date with every
-    /// key equal would otherwise leave the enumeration's own order showing through, which is not
-    /// an order anybody chose and appears to shuffle between listings of the same directory.
     #[test]
     fn an_undated_listing_is_still_ordered() {
         let mut v = alloc::vec![ent("c", false, 0), ent("a", false, 0), ent("b", false, 0)];
@@ -938,20 +717,10 @@ mod tests {
     }
 }
 
-// --- recursive tree walks ---------------------------------------------------
-//
-// `copy`, `remove` and `move` all walk trees, and they walked three separate copies of
-// the same loop until `move` needed the recursive cross-mount case (2026-07-30). The
-// walks live here now, one each, because the parts that are easy to get subtly wrong are
-// not the loop — they are the session discipline and what the descent is allowed to see,
-// and neither should be re-derived per utility.
-
-/// Deepest tree either walk will descend. Not a resource limit — a runaway guard, since
-/// a cycle cannot occur (no hard links to directories, no symlinks) but a bug could.
+/// Deepest tree either walk descends; a runaway guard, not a resource limit.
 pub const MAX_TREE_DEPTH: u32 = 32;
 
-/// Why a tree walk stopped. Each names the step that failed, so a caller can report
-/// something truer than "it went wrong" without inspecting the tree itself.
+/// Why a tree walk stopped; each names the step that failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TreeError {
     /// [`MAX_TREE_DEPTH`] exceeded.
@@ -960,29 +729,21 @@ pub enum TreeError {
     OpenDir,
     /// A directory could not be enumerated.
     ReadDir,
-    /// A directory could not be created. The payload is the server's `KError`, so a caller
-    /// can tell an occupied name from anything else without a confirming round trip — the
-    /// same reason [`TreeError::Rmdir`] carries one.
+    /// A directory could not be created; the payload is the server's `KError`.
     MakeDir(i32),
     /// A file copy failed.
     Copy(FileError),
     /// An entry could not be unlinked.
     Unlink,
-    /// A directory could not be removed once emptied. `NotEmpty` here means something
-    /// added an entry during the walk — see `remove`'s handling.
+    /// A directory could not be removed once emptied; `NotEmpty` means an entry appeared mid-walk.
     Rmdir(i32),
 }
 
 /// Enumerate `path`'s children, closing the session before returning.
 ///
-/// **Filesystem entries only — deliberately not [`ns_children`].** A binding beneath a
-/// path is a mount point, not content: a descent that followed one would copy or delete
-/// *through* a mount into another server's tree. Every recursive walker in the coreutils
-/// depends on this being the only enumeration it does.
-///
-/// The session is closed before the caller recurses because a session is a scarce server
-/// resource (`MAX_SESSIONS`); holding one per level would cap the depth at the session
-/// table rather than at [`MAX_TREE_DEPTH`].
+/// Filesystem entries only, not [`ns_children`]: a descent following a mount point would copy or
+/// delete through it into another server's tree. Closing first keeps sessions (`MAX_SESSIONS`)
+/// from capping the depth.
 fn children(ns: u64, path: &[u8]) -> Result<Vec<OwnedEntry>, TreeError> {
     let mut entries: Vec<OwnedEntry> = Vec::new();
     let mut buf = [0u8; 4096];
@@ -998,13 +759,9 @@ fn children(ns: u64, path: &[u8]) -> Result<Vec<OwnedEntry>, TreeError> {
     Ok(entries)
 }
 
-/// Copy `src` to `dst`, recursing if `src` is a directory.
+/// Copy `src` to `dst`, recursing if `src` is a directory; `on_file` gets `(src, dst, bytes)`.
 ///
-/// `on_file` is called for each **file** copied, with `(src, dst, bytes)` — directories
-/// are structure, not content, and a caller that wants to report them can see them in the
-/// paths. `force` permits copying *into* an existing destination directory; without it a
-/// pre-existing destination is an error, because merging into someone else's tree is
-/// exactly the surprise a fail-loud default should not spring.
+/// Without `force` an existing destination is an error: merging into a tree should not be silent.
 pub fn copy_tree(
     ns: u64,
     src: &[u8],
@@ -1032,10 +789,7 @@ fn copy_tree_at(
         return Ok(());
     }
 
-    // Create the destination directory. **Through [`mkdir`] rather than open-coded**: this was
-    // the same three lines a third time — open the parent, ask it for the basename, close — and
-    // the browser's *new folder* made it a fourth (M12 Part B). An existing directory is allowed
-    // through under `force`, which is this walk's rule rather than `mkdir`'s.
+    // `force` lets an existing destination directory through: this walk's rule, not `mkdir`'s.
     if let Err(e) = mkdir(ns, dst)
         && !(force && is_dir(ns, dst))
     {
@@ -1050,15 +804,8 @@ fn copy_tree_at(
     Ok(())
 }
 
-/// Remove `path` and everything under it, depth-first.
-///
-/// `on_entry` is called for each entry removed, with `(path, is_dir)`, in the order they
-/// go — children before their parent, which is the order the removal actually happens and
-/// therefore the order a report should show.
-///
-/// The caller is responsible for refusing a `path` that is a **namespace binding**: this
-/// walks what is beneath a path, and cannot tell whether the path itself was handed to it
-/// by mistake. See `remove`'s operand check.
+/// Remove `path` and everything under it, depth-first; `on_entry` gets `(path, is_dir)`, children
+/// first. The caller must refuse a `path` that is a namespace binding; this cannot tell.
 pub fn remove_tree(ns: u64, path: &[u8], on_entry: &mut impl FnMut(&[u8], bool)) -> Result<(), TreeError> {
     remove_tree_at(ns, path, 0, on_entry)
 }
@@ -1083,20 +830,11 @@ fn remove_tree_at(ns: u64, path: &[u8], depth: u32, on_entry: &mut impl FnMut(&[
 
 /// Create the directory named by `path`, via its parent's session.
 ///
-/// **The sibling of [`unlink_at`]**, and it moved down here when a second consumer arrived
-/// (M12 Part B): `mkdir`'s `make_one` was the only caller until `nxfiles` grew a *new folder*
-/// command, and a browser open-coding the same three lines would be the second implementation
-/// of "which directory does this name live in" — which is the rule `libfs` exists to keep in one
-/// place. The `--parents` walk stays in `mkdir`, because creating intermediates is that
-/// program's flag rather than a fact about making a directory.
-///
-/// [`TreeError::MakeDir`] carries the server's `KError`, so a caller can tell an occupied name from
-/// anything else without a confirming round trip — the same reason [`rmdir_at`] carries one.
+/// [`TreeError::MakeDir`] carries the server's `KError` (`0` if none).
 pub fn mkdir(ns: u64, path: &[u8]) -> Result<(), TreeError> {
     let name = basename(path);
     if name.is_empty() {
-        // The root has no parent to create it in, and `basename` of `/` is empty rather than
-        // an error — so this is the one path that cannot be made.
+        // The root has no parent to create it in; `basename` of `/` is empty.
         return Err(TreeError::MakeDir(0));
     }
     let mut buf = [0u8; 4096];
@@ -1119,9 +857,7 @@ pub fn unlink_at(ns: u64, path: &[u8]) -> Result<(), TreeError> {
     r.map_err(|_| TreeError::Unlink)
 }
 
-/// `rmdir` the (empty) directory named by `path`, via its parent's session. The payload
-/// on failure is the server's `KError`, so a caller can tell `NotEmpty` — which after a
-/// completed descent means a concurrent mutator — from anything else.
+/// `rmdir` the empty directory at `path`; `NotEmpty` after a descent means a concurrent mutator.
 fn rmdir_at(ns: u64, path: &[u8]) -> Result<(), TreeError> {
     let mut buf = [0u8; 4096];
     let mut dir = Dir::open(ns, parent(path), &mut buf).map_err(|_| TreeError::OpenDir)?;

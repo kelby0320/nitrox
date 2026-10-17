@@ -8,7 +8,7 @@
 //!
 //! Today the sole neutral fact is the set of **PCIe ECAM regions**: PCI(e)
 //! configuration space is a PCI-SIG standard identical across architectures, so
-//! the neutral PCI enumerator (the storage slice) consumes [`EcamRegion`]s and
+//! the neutral PCI enumerator consumes [`EcamRegion`]s and
 //! builds architecture-independent `DeviceNode`s — only *where the ECAM window
 //! lives* is arch-specific (ACPI MCFG vs. the DTB).
 //!
@@ -18,9 +18,6 @@
 //! caches them internally and the x86 IOAPIC code consumes them directly; they
 //! never appear in neutral names. See `docs/architecture/drivers-and-irps.md`
 //! and the decision log (2026-06-11).
-//!
-//! The active architecture's implementation is re-exported from `crate::arch`
-//! as `Platform` (see `kernel/src/arch/mod.rs`), mirroring `ArchIrq` → `Irq`.
 
 use crate::libkern::AllocError;
 use crate::mm::PhysAddr;
@@ -72,10 +69,9 @@ pub trait ArchPlatform {
     /// Get ready to [`reset`](Self::reset), doing now whatever it will need that allocates or
     /// takes a lock — on x86_64, a mapping for a reset register in memory space. Called while
     /// every processor still runs, since `reset`'s caller stops the others first and one of
-    /// them may stop holding the allocator's lock (administration Part E.3).
+    /// them may stop holding the allocator's lock.
     fn prepare_reset();
-    /// Reset the machine, trying each way the platform offers until one works (administration
-    /// Part E.3). Never returns.
+    /// Reset the machine, trying each way the platform offers until one works. Never returns.
     ///
     /// # Safety
     /// Ring 0, after [`prepare_reset`](Self::prepare_reset), with interrupts masked and every

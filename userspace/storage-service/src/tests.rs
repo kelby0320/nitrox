@@ -25,7 +25,6 @@ const PROTECTIVE_MBR: &[u8; 512] = include_bytes!("../fixtures/gpt-protective-mb
 /// What `fs-server-fat` refuses a Nitrox ESP for: its clusters are a sector.
 const SMALL: &str = "512-byte clusters, smaller than a page";
 
-/// An in-memory device.
 struct Image(RefCell<Vec<u8>>);
 
 impl BlockReader for Image {
@@ -47,7 +46,6 @@ impl BlockWriter for Image {
     }
 }
 
-/// An ext4 filesystem laid out by `mkfs`, labelled `label`.
 fn ext4(label: &[u8]) -> Image {
     let blocks = 4096u64;
     let img = Image(RefCell::new(std::vec![0u8; (blocks * 4096) as usize]));
@@ -69,7 +67,6 @@ fn ext4(label: &[u8]) -> Image {
     img
 }
 
-/// **A FAT `mkfs.fat` made** of `kib` KiB with `args`, read into memory.
 fn mkfs_fat(kib: u64, args: &[&str]) -> Image {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -86,7 +83,6 @@ fn mkfs_fat(kib: u64, args: &[&str]) -> Image {
     Image(RefCell::new(bytes))
 }
 
-/// A device whose first sector is `sector` and the rest zero.
 fn with_sector(sector: &[u8; 512]) -> Image {
     let mut img = std::vec![0u8; 64 * 1024];
     img[..512].copy_from_slice(sector);
@@ -144,7 +140,6 @@ fn guid(first: u8) -> [u8; 16] {
     g
 }
 
-/// The two disks' tables, as `libgpt` reads them: entries in use, in array order.
 fn release_tables() -> Vec<DiskTable> {
     let entry = |g: u8, name: &str, blocks: u64| TableEntry { guid: guid(g), name: name.as_bytes().to_vec(), blocks };
     std::vec![
@@ -157,10 +152,6 @@ fn mount(point: &str, source: &str, mode: Mode, device: Option<u32>) -> InitMoun
     InitMount { mount_point: String::from(point), source: String::from(source), mode, device }
 }
 
-// --- probe -------------------------------------------------------------------------------------
-
-/// **A real FAT32 and a real FAT16 are recognised**, with their labels — `NO NAME` is none — and a
-/// protective MBR, which carries the same `0x55AA` signature, is not.
 #[test]
 fn fat_is_recognised_from_what_mformat_wrote() {
     assert_eq!(fat_label(FAT32).as_deref(), Some("NITROX_ESP"));
@@ -169,7 +160,6 @@ fn fat_is_recognised_from_what_mformat_wrote() {
     assert_eq!(fat_label(&[0u8; 512]), None);
 }
 
-/// **Each of the four marks is needed**: a FAT32 sector that loses any one of them is not FAT.
 #[test]
 fn a_fat_boot_sector_missing_any_mark_is_not_one() {
     for (what, at, value) in [
@@ -184,8 +174,6 @@ fn a_fat_boot_sector_missing_any_mark_is_not_one() {
     }
 }
 
-/// **An ext4 filesystem is found as its server would find it**, with its label and how it was
-/// left; one mounted writable and never unmounted reads as not clean.
 #[test]
 fn ext4_is_found_with_its_label_and_state() {
     let img = ext4(b"nitrox-root");
@@ -195,8 +183,6 @@ fn ext4_is_found_with_its_label_and_state() {
     assert_eq!(probe(&ext4(b"")), Found::Ext4 { label: String::new(), clean: Some(true) });
 }
 
-/// **What `check_device` refuses is not ext4 here either**, even with the magic in place: a root
-/// inode that is not a directory would be refused by the server, so it is not offered.
 #[test]
 fn an_ext4_its_server_would_refuse_is_nothing() {
     let img = ext4(b"broken");
@@ -222,8 +208,6 @@ fn fat_and_nothing_are_found_on_a_device() {
     assert_eq!(probe(&Image(RefCell::new(std::vec![0u8; 100]))), Found::Nothing, "too short to read");
 }
 
-// --- sources -----------------------------------------------------------------------------------
-
 /// **The kernel's own vector**: `format_partuuid_mixed_endian` in `kernel/src/drivers/gpt.rs`.
 /// `init` looks a UUID up by that path, so a service formatting it differently would never match.
 #[test]
@@ -232,8 +216,6 @@ fn a_guid_is_formatted_as_the_kernel_names_it() {
     assert_eq!(partuuid(&g), "12345678-9abc-def0-1234-56789abcdef0");
 }
 
-/// **A label is a partition's name**: the first partition published with it, and never a disk
-/// or a RAM disk of the same name.
 #[test]
 fn a_label_source_is_the_first_partition_with_that_name() {
     let mut records = release_records();
@@ -247,8 +229,6 @@ fn a_label_source_is_the_first_partition_with_that_name() {
     assert_eq!(source_device("device-path:/dev/blk/3", &records, &tables), None, "not a scheme init accepts");
 }
 
-/// **A UUID is found through the parent disk's table**, by position among the entries in use —
-/// on whichever disk holds it.
 #[test]
 fn a_uuid_source_is_found_through_its_disks_table() {
     let (records, tables) = (release_records(), release_tables());
@@ -261,8 +241,6 @@ fn a_uuid_source_is_found_through_its_disks_table() {
     assert_eq!(source_device(&upper, &records, &tables), None, "init's lookup is exact, and so is this");
 }
 
-/// **A position that does not name the partition it points at is no match**: a name or a size
-/// that disagrees means the kernel published something the table does not describe.
 #[test]
 fn a_uuid_whose_partition_disagrees_is_unmatched() {
     let records = release_records();
@@ -279,8 +257,6 @@ fn a_uuid_whose_partition_disagrees_is_unmatched() {
     assert_eq!(source_device(&uuid, &records, &longer), None);
 }
 
-/// **The release image's own manifest** matches its root to the SATA disk's `nitrox-root`, and
-/// the mount keeps its mode and mount point.
 #[test]
 fn init_toml_is_matched_to_its_devices() {
     let toml = "[[mount]]\nfs_server = \"fs-server-ext4\"\ndevice = \"gpt-partlabel:nitrox-root\"\n\
@@ -290,8 +266,6 @@ fn init_toml_is_matched_to_its_devices() {
     assert_eq!(mounts, [mount("/", "gpt-partlabel:nitrox-root", Mode::Rw, Some(7))]);
 }
 
-/// **A live boot is one whose root is on a RAM disk**, through its partition or as the disk
-/// itself. A root on a SATA disk, or one that matched nothing, is not.
 #[test]
 fn a_live_boot_is_a_root_on_a_ram_disk() {
     let records = release_records();
@@ -302,8 +276,6 @@ fn a_live_boot_is_a_root_on_a_ram_disk() {
     assert!(!live_boot(&on(None), &records), "a root nothing matched");
     assert!(!live_boot(&[], &records), "no root at all");
 }
-
-// --- table -------------------------------------------------------------------------------------
 
 fn devices() -> Vec<Device> {
     let found = |r: &DeviceRecord| match r.id {
@@ -328,8 +300,6 @@ fn s(v: &str) -> Value {
     Value::Str(String::from(v))
 }
 
-/// **Every block device is a row**, in registry order, named as `/dev/devices` names it, with
-/// what it holds and who mounted it.
 #[test]
 fn all_tsm_has_a_row_per_device() {
     let mounts = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
@@ -337,7 +307,6 @@ fn all_tsm_has_a_row_per_device() {
     let names: Vec<&Value> = (0..t.rows.len()).map(|i| column(&t, i, "name")).collect();
     assert_eq!(names, [&s("blk-0"), &s("blk-1"), &s("blk-2"), &s("blk-3"), &s("blk-4")]);
     assert_eq!(column(&t, 0, "kind"), &s("disk"));
-    // **What each kind calls itself** (the laptop polish's Part C).
     assert_eq!(column(&t, 0, "description"), &s("QEMU HARDDISK"), "a disk's model and serial");
     assert_eq!(column(&t, 1, "description"), &s("root.img"), "a RAM disk's module");
     assert_eq!(column(&t, 3, "description"), &s("nitrox-root"), "a partition's name in its table");
@@ -357,9 +326,6 @@ fn all_tsm_has_a_row_per_device() {
     assert_eq!(column(&t, 4, "mounted"), &Value::Null);
 }
 
-/// **`clean` says how a filesystem was left, so it is `Null` while one is mounted writable**,
-/// whose state says "in use" because it is. Unmounted, or mounted read-only, the state is what
-/// the last writer left.
 #[test]
 fn clean_is_null_while_mounted_writable() {
     let ds = devices();
@@ -385,8 +351,6 @@ fn a_devices_table_and_the_directory_are_by_name() {
     assert_eq!(table::entries(&ds), ["all.tsm", "blk-0.tsm", "blk-1.tsm", "blk-2.tsm", "blk-3.tsm", "blk-4.tsm"]);
 }
 
-// --- suffix ------------------------------------------------------------------------------------
-
 #[test]
 fn suffixes_name_the_directory_and_its_tables() {
     assert_eq!(suffix::parse(b"info"), Asked::Directory);
@@ -397,10 +361,6 @@ fn suffixes_name_the_directory_and_its_tables() {
     }
 }
 
-// --- labels ------------------------------------------------------------------------------------
-
-/// **A label is a name a person can type and see**: printable ASCII with no `/`, not hidden, with
-/// no invisible space at either end, and not longer than any label a disk carries.
 #[test]
 fn a_label_is_printable_ascii_a_person_can_type() {
     for ok in ["nitrox-root", "NITROX_ESP", "My Disk", "a", &"x".repeat(labels::MAX)] {
@@ -441,9 +401,6 @@ fn a_clash_takes_the_next_free_suffix() {
     assert_eq!(labels::unique("a", &taken(&["a", "a-3"])), "a-2", "the first free one");
 }
 
-// --- mounts ------------------------------------------------------------------------------------
-
-/// **Every ext4 not already mounted, writable, in registry order** — never `init`'s, never FAT.
 #[test]
 fn a_boot_mounts_every_ext4_that_is_not_inits() {
     let init = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
@@ -454,9 +411,6 @@ fn a_boot_mounts_every_ext4_that_is_not_inits() {
     assert_eq!(automount(&devices(), &[], false, true).len(), 2, "with no init mount, both ext4s");
 }
 
-/// **`init`'s mounts are known only if the manifest read, named a mount, and every mount it named
-/// matched a device** (PR #336 review, finding 2). Anything less could leave `init`'s root
-/// looking free.
 #[test]
 fn inits_mounts_are_known_only_when_every_one_matched() {
     let at = |device: Option<u32>| InitMount {
@@ -479,15 +433,12 @@ fn a_boot_that_cannot_place_inits_mounts_mounts_nothing() {
     assert_eq!(automount(&devices(), &[], true, false), [], "a live boot neither");
 }
 
-/// **A live boot mounts read-only** — every disk this fixture has being internal; a stick is
-/// writable there (Phase 6 Part F, `a_stick_mounts_writable_on_any_boot_…`).
 #[test]
 fn a_live_boot_mounts_read_only() {
     let plan = automount(&devices(), &[], true, true);
     assert!(plan.iter().all(|p| p.mode == Mode::Ro));
 }
 
-/// **A clash is settled in registry order**: the first device keeps the name.
 #[test]
 fn two_filesystems_with_one_label_are_told_apart() {
     let mut ds = devices();
@@ -497,12 +448,9 @@ fn two_filesystems_with_one_label_are_told_apart() {
     assert_eq!(labels, ["data", "data-2"]);
 }
 
-/// **The installer's source is passed over, by its name** (administration Part G.1). An install
-/// boot beside a disk holding an older install: the live root, which `init` mounted; the
-/// installable ESP; the pristine root, `install-root.img`'s `nitrox-source`; and the SATA disk's
-/// `nitrox-root`. And a test image's scratch filesystem, a RAM disk holding ext4 with no partition
-/// table, which `boot-probe` needs mounted. Mounted, the source would be in use, and `disks` would
-/// withhold it from `nxinstall`.
+/// **The installer's source is passed over, by its name**: an install boot beside a disk holding
+/// an older install. A test image's scratch RAM disk, ext4 with no table, is still mounted, for
+/// `boot-probe`.
 #[test]
 fn the_installers_source_is_passed_over_and_nothing_else() {
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
@@ -539,8 +487,6 @@ fn a_mount_is_under_storage() {
     assert_eq!(at("nitrox-root"), "/storage/nitrox-root");
 }
 
-// --- suffixes of the mounts --------------------------------------------------------------------
-
 /// **`fs/<label>` answers for exactly `fs/<label>`**, alone or with a path after it, which is the
 /// `consumed` the `SUBNAMESPACE` reply carries and the kernel requires to end a component.
 #[test]
@@ -553,7 +499,6 @@ fn a_mounts_suffix_answers_for_its_label() {
     }
 }
 
-/// **A session endpoint mints no endpoint**, session or admin, and answers everything else as asked.
 #[test]
 fn a_session_endpoint_answers_all_but_another_endpoint() {
     assert_eq!(suffix::parse(b"session-endpoint"), Asked::SessionEndpoint);
@@ -565,13 +510,10 @@ fn a_session_endpoint_answers_all_but_another_endpoint() {
     }
 }
 
-// --- an administrator's mount, and what is in use -----------------------------------------------
-
 fn init_root() -> Vec<Mounted> {
     std::vec![Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }]
 }
 
-/// **A mount by name, writable, under the label asked for or the one the service would choose.**
 #[test]
 fn an_administrator_mounts_by_name() {
     let ds = devices();
@@ -583,9 +525,6 @@ fn an_administrator_mounts_by_name() {
     assert_eq!(explicit(&ds, &init_root(), &taken, true, true, "blk-4", "").unwrap().label, "nitrox-live-2");
 }
 
-/// **Each refusal, for its own reason**: no such device, one already mounted (`init`'s
-/// included), one holding nothing this service serves, a bad label, a taken one, no room, and
-/// `init`'s mounts not all known.
 #[test]
 fn an_administrators_mount_is_refused_for_each_reason() {
     let ds = devices();
@@ -642,8 +581,6 @@ fn nothing_on_the_boot_medium_is_mounted_and_its_disk_is_in_use() {
     assert_eq!(automount(&unflagged, &[], true, true).len(), 2, "the flag is what passes it over");
 }
 
-/// **An arrival is planned alone, by the boot's rules, beside the mounts there are**: a device an
-/// administrator unmounted stays unmounted, and a label in use is numbered past.
 #[test]
 fn an_arrival_is_planned_alone_beside_the_mounts_there_are() {
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
@@ -661,8 +598,6 @@ fn an_arrival_is_planned_alone_beside_the_mounts_there_are() {
     );
 }
 
-/// **What is in use is every mounted device and the disk that holds it** — never a partition's
-/// sibling, and a RAM disk counts as the disk it is.
 #[test]
 fn in_use_is_each_mount_and_its_disk() {
     let ds = devices();
@@ -677,12 +612,8 @@ fn in_use_is_each_mount_and_its_disk() {
     assert_eq!(in_use(&ds, &bare), [3], "the disk's controller (id 1) is not a device to withhold");
 }
 
-// --- FAT (Phase 6 Part E.5) ---------------------------------------------------------------------
-
-/// **A FAT is read by its server's own check**: one with 4 KiB clusters is served, with its label
-/// and how it was left; one with 512-byte clusters is a FAT its server refuses, and says why; and
-/// one whose sectors are 4 KiB, which the library cannot parse but [`fat_label`] recognises, is
-/// still a FAT, refused for its sectors. A FAT found not cleanly unmounted says so.
+/// **A FAT is read by its server's own check**: 512-byte clusters are refused, and say why; 4 KiB
+/// sectors, which the library cannot parse but [`fat_label`] recognises, are still a FAT.
 #[test]
 fn a_fat_is_read_by_its_servers_own_check() {
     let served = mkfs_fat(2048, &["-F", "12", "-s", "8", "-n", "NXSTICK"]);
@@ -704,16 +635,14 @@ fn a_fat_is_read_by_its_servers_own_check() {
     assert_eq!(probe(&served).clean(), Some(false), "the state byte's bit, as fsck.fat reads it");
 }
 
-/// A record published by USB mass storage: a stick's disk.
 fn on_usb(mut r: DeviceRecord) -> DeviceRecord {
     r.driver[..crate::mounts::USB_STORAGE.len()].copy_from_slice(crate::mounts::USB_STORAGE);
     r
 }
 
 /// **A FAT is auto-mounted on a removable disk alone** — a stick's partition, or a stick holding
-/// one whole — by `fs-server-fat`, writable on a live boot too (Phase 6 Part F). An internal disk's
-/// servable FAT is not, nor a stick's FAT its server would refuse; an ext4 is mounted wherever it
-/// is, by `fs-server-ext4`.
+/// one whole — by `fs-server-fat`, writable on a live boot too. An internal disk's servable FAT
+/// is not, nor a stick's FAT its server would refuse; an ext4 is mounted wherever it is.
 #[test]
 fn a_fat_is_auto_mounted_on_a_removable_disk_alone() {
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
@@ -747,8 +676,6 @@ fn a_fat_is_auto_mounted_on_a_removable_disk_alone() {
     assert_eq!(planned, [5, 30], "the driver is what makes the partition's disk removable");
 }
 
-/// **An administrator mounts an internal FAT**, writable and by `fs-server-fat`: the rule above is
-/// the automatic mount's. One its server would refuse is refused here too.
 #[test]
 fn an_administrator_mounts_an_internal_fat_but_not_one_its_server_refuses() {
     let mut ds = devices();
@@ -762,7 +689,6 @@ fn an_administrator_mounts_an_internal_fat_but_not_one_its_server_refuses() {
     );
 }
 
-/// The servers are spawned from the store's copies.
 #[test]
 fn each_server_is_spawned_from_the_store() {
     assert_eq!(Server::Ext4.path(), b"/bin/fs-server-ext4");
@@ -782,12 +708,9 @@ fn mbr_entry_over(img: &Image, kind: u8, first: u32, count: u32) {
     s[511] = 0xAA;
 }
 
-/// **A whole disk whose first sector carries a partition entry is never mounted whole** (PR #365
-/// review, finding 4). A stick formatted FAT whole and then partitioned keeps its FAT's boot sector
-/// beside the entry: reported, and refused, so neither the automatic mount nor an administrator's
-/// takes it. The same bytes as a partition are a FAT like any other. An ext4 made whole and then
-/// partitioned keeps its superblock at 1024: that disk holds nothing, its partitions being what
-/// holds filesystems.
+/// **A whole disk whose first sector carries a partition entry is never mounted whole**: a stale
+/// FAT is reported and refused, an ext4 superblock at 1024 holds nothing. The same bytes as a
+/// partition are a FAT like any other.
 #[test]
 fn a_whole_disk_with_partition_entries_is_never_mounted_whole() {
     use crate::probe::{STALE_FAT, probe_record};
@@ -834,10 +757,6 @@ fn a_fat_made_on_a_whole_stick_is_still_served() {
     assert_eq!(probe_record(&lucky, &disk).server(), Some(Server::Fat), "status 0x33 is no entry's");
 }
 
-// --- removable media for a session (Phase 6 Part F) --------------------------------------------
-
-/// A stick, a partition on it holding `found`, and the release boot's devices: the internal disk,
-/// its ESP and root, and the RAM disk.
 fn with_a_stick(found: Found) -> Vec<Device> {
     let mut ds = devices();
     ds.push(Device { record: on_usb(rec(20, DeviceKind::Disk, 5, 19, "a stick", 614_400)), found: Found::Nothing });
@@ -845,8 +764,6 @@ fn with_a_stick(found: Found) -> Vec<Device> {
     ds
 }
 
-/// **A stick mounts writable on a live boot** (Phase 6 Part F); an internal disk's filesystem stays
-/// read-only there, as the install target. On an installed machine both are writable.
 #[test]
 fn a_stick_mounts_writable_on_any_boot_and_an_internal_disk_read_only_on_a_live_one() {
     let ds = with_a_stick(Found::Fat { label: String::from("NXFAT"), clean: Some(true), refused: None });
@@ -858,11 +775,9 @@ fn a_stick_mounts_writable_on_any_boot_and_an_internal_disk_read_only_on_a_live_
     assert_eq!(modes(false), [(8, Mode::Rw), (21, Mode::Rw)]);
 }
 
-/// **A session ejects a stick, by the name it is mounted under**, and nothing else: not an internal
-/// disk's mount, not `init`'s, not a name nothing is mounted under. **The name is the mount's, not
-/// the filesystem's label** (PR #366 review): two sticks labelled `DATA` are mounted `DATA` and
-/// `DATA-2`, and each name ejects its own; a stick with no label, mounted under its partition's
-/// name, is ejected by that.
+/// **A session ejects a stick, by the name it is mounted under**, and nothing else. **The name is
+/// the mount's, not the filesystem's label**: two sticks labelled `DATA` are mounted `DATA` and
+/// `DATA-2`, and each name ejects its own.
 #[test]
 fn a_session_ejects_a_stick_by_its_mount_name_and_nothing_internal() {
     let fat = |label: &str| Found::Fat { label: String::from(label), clean: Some(true), refused: None };
@@ -889,10 +804,6 @@ fn a_session_ejects_a_stick_by_its_mount_name_and_nothing_internal() {
     assert!(core::str::from_utf8(EjectRefusal::NotRemovable.why()).unwrap().contains("with admin disk --unmount"));
 }
 
-/// **An eject takes the whole stick** (PR #367 review, blocking): a stick with two partitions has
-/// both mounted, and ejecting either names both, in the order they were mounted — so neither is
-/// left mounted, its unwritten files lost, when the stick the reply says can be pulled is pulled.
-/// Another stick's mount is not among them; a stick holding a filesystem whole is its own drive.
 #[test]
 fn an_eject_takes_every_mount_on_the_stick() {
     let fat = |label: &str| Found::Fat { label: String::from(label), clean: Some(true), refused: None };
@@ -913,7 +824,6 @@ fn an_eject_takes_every_mount_on_the_stick() {
     assert_eq!(eject(&ds, &without_one, "TWO"), Ok(std::vec![String::from("TWO")]), "what is left of it");
 }
 
-/// **The table says what is removable**: a stick and its partition, not the internal disk's.
 #[test]
 fn the_table_says_what_is_removable() {
     let ds = with_a_stick(Found::Nothing);
@@ -930,8 +840,6 @@ fn the_table_says_what_is_removable() {
     assert_eq!(removable, want);
 }
 
-/// **A session opens a media session and a watch**, and through a session endpoint too; neither is
-/// a table.
 #[test]
 fn a_session_opens_a_media_session_and_a_watch() {
     assert_eq!(suffix::parse(b"info/media"), Asked::Media);
@@ -941,15 +849,12 @@ fn a_session_opens_a_media_session_and_a_watch() {
     assert_eq!(suffix::parse(b"info/media.tsm"), Asked::File("media"), "a table's name is not the channel");
 }
 
-/// **The watches**: each ping sent; a full queue kept, since it holds a ping already; a gone one
-/// dropped and returned to close. With every one of the 32 held, a new watch pings them all first,
-/// freeing the gone — and is refused when none had gone.
 #[test]
 fn the_watches_keep_the_living_and_free_the_gone() {
     use crate::watch::{MAX_WATCHES, Sent, Watches};
     // **Thirty-two, written down**, not `MAX_WATCHES`: a Files per Places pick and per launch each
-    // hold one for their lives (PR #366 review), so a bound of four — the wait set's — is the
-    // regression this guards.
+    // hold one for their lives, so a bound of four — the wait set's — is the regression this
+    // guards.
     assert_eq!(MAX_WATCHES, 32);
     let mut w = Watches::new();
     for e in 0..32 {
@@ -982,13 +887,9 @@ fn the_watches_keep_the_living_and_free_the_gone() {
     assert_eq!(pinged, MAX_WATCHES, "a change pings every watcher");
 }
 
-// --- read again, and why not mounted (Phase 6 Part G) -------------------------------------------
-
-/// **Each `Reread` refusal, at the device it is about**: a partition mounted, and a disk with
-/// anything on it mounted, `WouldBlock`; **a partition beside a mounted sibling taken** (PR #368
-/// review), as the `disks` grant gives it out; anything on the disk the machine started from
-/// `NoAccess` — but `WouldBlock` when something on it is mounted, which is asked first; a name
-/// nothing has `NotFound`; and `init`'s mounts unknown `NoAccess`.
+/// **Each `Reread` refusal, at the device it is about.** A partition beside a mounted sibling is
+/// taken, as the `disks` grant gives it out; the boot disk is `NoAccess`, but `WouldBlock` when
+/// something on it is mounted, which is asked first.
 #[test]
 fn a_reread_is_refused_while_mounted_and_on_the_boot_disk() {
     use crate::mounts::{Reread, RereadRefusal, reread};
@@ -1027,9 +928,6 @@ fn a_reread_is_refused_while_mounted_and_on_the_boot_disk() {
     }
 }
 
-/// **A device read again is planned as an arrival**: a stick's partition that held nothing, and
-/// then a FAT `disk --format` made, is mounted writable by `fs-server-fat`; an internal disk's
-/// partition formatted FAT is not mounted, and says why.
 #[test]
 fn a_device_read_again_is_planned_as_an_arrival() {
     let dev = |record: DeviceRecord, found: Found| Device { record, found };
@@ -1054,9 +952,9 @@ fn a_device_read_again_is_planned_as_an_arrival() {
     assert_eq!(crate::mounts::note(&ds[1], &ds, None).as_deref(), Some("not removable, so not mounted"));
 }
 
-/// **Each `note` is the log line's reason** (`unmounted-why`), and null for a mounted filesystem and
-/// for a device holding nothing — whose log line still gives its reason: the boot stick's disk is
-/// passed over in the log, and its row says it holds no filesystem.
+/// **Each `note` is the log line's reason**, and null for a mounted filesystem and for a device
+/// holding nothing — whose log line still gives its reason: the boot stick's disk is passed over
+/// in the log, and its row says it holds no filesystem.
 #[test]
 fn each_note_is_the_log_lines_reason_and_null_where_nothing_is_kept_from_anyone() {
     use crate::mounts::{note, unmounted_why};

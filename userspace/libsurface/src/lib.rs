@@ -1,27 +1,9 @@
 //! `libsurface` — the client side of the Surface protocol.
 //!
-//! The role `librsproto` plays for the RS protocol: **the protocol gets a library, and
-//! clients use it**. The plan is explicit about why — if the first application hand-rolls
-//! this, the surface protocol immediately has two implementations and the second one lives
-//! in an application.
-//!
-//! ## The buffer lifecycle is the interesting part
-//!
-//! Sending the messages is mechanical; `librsproto::surface` already encodes them and is
-//! already tested. What a client actually needs from a library is the answer to *"which
-//! buffer may I draw into right now?"* — and getting that wrong produces tearing that is
-//! invisible in testing and obvious in use (`display-substrate.md` §4).
-//!
-//! So that logic sits behind [`Transport`] and host-tests against a mock, rather than
-//! needing a running compositor. See [`WindowRef::next_free`].
-//!
-//! ## Single buffering cannot work, and the library says so
-//!
-//! A buffer is busy from the moment it is committed until the compositor releases it, and
-//! the compositor releases the buffer that *left* the screen — never the one on it. With
-//! one buffer there is never anything to release, so [`WindowRef::next_free`] returns `None`
-//! forever after the first commit. That is not a bug to work around: drawing into the
-//! buffer the compositor is reading is exactly the tearing the protocol exists to prevent.
+//! A buffer is busy from commit until the compositor releases it, and the compositor releases
+//! the buffer that left the screen, never the one on it (`display-substrate.md` §4). With one
+//! buffer there is nothing to release, so [`WindowRef::next_free`] returns `None` forever after
+//! the first commit, and drawing into the buffer the compositor is reading tears.
 //! [`Session::create`] refuses fewer than two.
 
 #![cfg_attr(not(test), no_std)]
@@ -58,30 +40,15 @@ pub enum UiError {
     TooFewBuffers,
     /// No buffer with that id.
     NoSuchBuffer,
-    /// A pixel format with no wire tag — see
-    /// [`attach_with_format`](WindowRef::attach_with_format).
-    ///
-    /// **Refused rather than approximated.** The tag and the client's own geometry are two
-    /// descriptions of the same buffer, and deriving one from the other by a single property
-    /// lets them disagree: a format that is neither of the two named ones would go out as
-    /// `XRGB8888` while the client kept drawing in its own channel order, and the compositor
-    /// would blit it as RGB. Red and blue swap on every pixel with nothing on the path reporting
-    /// anything (PR #275 review, finding 2).
+    /// A pixel format with no wire tag, refused rather than sent as `XRGB8888` with red and
+    /// blue swapped; see [`attach_with_format`](WindowRef::attach_with_format).
     UnsupportedFormat,
-    /// The compositor answered this request with an error.
-    ///
-    /// Distinct from [`UiError::BadReply`]: the reply is well-formed and *is* for this
-    /// request — it just says no. Before this existed, `request` matched on
-    /// `RS_FLAG_REPLY` alone, so an error reply came back as a **successful** one and the
-    /// caller parsed the error body as a result. `Window::new` would have read a window id
-    /// out of an error code.
+    /// The compositor answered this request with an error: well-formed, unlike
+    /// [`UiError::BadReply`], but a refusal.
     Server,
 }
 
-/// How a client talks to the compositor.
-///
-/// The seam that keeps the buffer lifecycle testable. The real implementation is
-/// [`ipc::ChannelTransport`]; tests use a mock that records what was sent.
+/// How a client talks to the compositor; the real one is [`ipc::ChannelTransport`].
 pub trait Transport {
     /// Send a Surface request, optionally transferring a handle, and read the reply body
     /// into `reply`. Returns the reply length, or `None` for ops with no reply.
@@ -96,38 +63,20 @@ pub trait Transport {
     /// Poll for a server-initiated event without blocking. `None` when there is none.
     fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError>;
 
-    /// Whether the transport discarded an event since this was last called, clearing the
-    /// flag.
-    ///
-    /// Defaulted to `false` so a transport that cannot lose anything — a test mock, or one
-    /// with an unbounded queue — says nothing. A transport that *can* must report it, or a
-    /// client tracking held keys carries a phantom modifier for the rest of its life.
+    /// Whether the transport discarded an event since this was last called. One that can must
+    /// report it, or a client tracking held keys carries a phantom modifier.
     fn took_loss(&mut self) -> bool {
         false
     }
 
-    /// The handle a caller may `sys_wait` on to learn an event is pending, or `0` if this
-    /// transport has none.
-    ///
-    /// **For a client with a second source of work.** `wait_event` blocks on this transport
-    /// alone, which is right for a client whose only input is the compositor — and wrong for
-    /// one that also holds, say, a terminal backend: it would render the shell's output only
-    /// after the next keystroke, so a prompt would appear one keypress late. Such a client
-    /// waits on this handle *and* its own, then drains with
-    /// [`poll_event`](Self::poll_event).
-    ///
-    /// `0` for a transport that cannot be waited on — the test mock — so a caller that gets
-    /// one falls back to `wait_event` rather than spinning on a handle the kernel will reject.
+    /// The handle to `sys_wait` on for a pending event, or `0` if none can be waited on (then fall
+    /// back to `wait_event` rather than spin). For a client with a second source of work, since
+    /// `wait_event` blocks on this transport alone.
     fn wait_handle(&self) -> u64 {
         0
     }
 
     /// Block until a server-initiated event arrives, then return it.
-    ///
-    /// The counterpart `poll_event` cannot provide. A client that has drawn everything it
-    /// can and holds no free buffer must **wait**, not spin or give up: the compositor may
-    /// simply not have processed the last commit yet. Without this a client stalls the
-    /// moment it commits more frames than it has buffers, which is every client.
     fn wait_event(&mut self, buf: &mut [u8]) -> Result<(u16, usize), UiError>;
 }
 
@@ -138,22 +87,13 @@ pub struct ClientBuffer {
     pub id: u32,
     /// Shape of the pixels.
     pub geometry: Geometry,
-    /// True from `commit` until the compositor releases it.
-    ///
-    /// **Busy means the compositor may be reading these pixels right now.** Drawing into a
-    /// busy buffer is the tearing case; the whole point of tracking this is to make that
-    /// unrepresentable rather than merely discouraged.
+    /// True from `commit` until the compositor releases it: it may be reading these pixels
+    /// right now, and drawing into a busy buffer tears.
     pub busy: bool,
 }
 
-/// A boxed transport is a transport.
-///
-/// Not a convenience: [`ipc::ChannelTransport`] carries two 4 KiB message buffers plus the
-/// parked-event queue, so it is ~9 KiB, and a userspace thread starts with a **32 KiB**
-/// stack. Holding one by value — and moving it in and out of a `Window` — is enough to run
-/// a client off the end of its stack, which presents as a process that dies in its
-/// prologue and prints nothing at all, before its own first line. Box it and the `Window`
-/// holds a pointer.
+/// A boxed transport is a transport: [`ipc::ChannelTransport`] is ~9 KiB against a 32 KiB user
+/// stack, and moving one by value kills the process in its prologue, printing nothing.
 impl<T: Transport + ?Sized> Transport for alloc::boxed::Box<T> {
     fn request(
         &mut self,
@@ -182,51 +122,23 @@ impl<T: Transport + ?Sized> Transport for alloc::boxed::Box<T> {
     }
 }
 
-/// How many input events a window queues before the oldest are discarded.
-///
-/// A bound, because a client that stops draining must not grow this without limit — and
-/// input is *continuous*, so "stops draining" is the ordinary state of a client rendering a
-/// frame rather than a misbehaviour. Sized for a burst of typing plus a drag, not for a
-/// client that has stopped reading.
+/// How many input events a window queues before the oldest are discarded: a burst of typing
+/// plus a drag.
 pub const EVENT_QUEUE_MAX: usize = 64;
 
-/// One input event, as a window receives it.
-///
-/// **`Clone` rather than `Copy` since M10 Part E**, because a [`Drop`](Self::Drop) carries a path
-/// and two names. Every other variant is still a handful of integers; what changed is that one
-/// of them owns text, which is what a payload is.
+/// One input event, as a window receives it. Not `Copy`: a [`Drop`](Self::Drop) owns text.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum WindowEvent {
     /// A key transition, with the modifiers held at that moment.
     Key(KeyEvent),
     /// Pointer motion, a button, or a crossing.
     Pointer(PointerEvent),
-    /// This window gained or lost the keyboard.
-    ///
-    /// **Not the same as widget focus**, which is the toolkit's and which this must not
-    /// disturb: a window returning to the foreground has to put the caret back where it was.
-    ///
-    /// Filtered to *this* window: one session can hold several, and a popup taking focus
-    /// from its parent sends both halves down the one channel.
+    /// This window gained or lost the keyboard; not widget focus, which is the toolkit's.
     Focus(bool),
-    /// Somebody with the manager channel is asking this window to close.
-    ///
-    /// **A request with no way to refuse it, and none needed.** A client that wants to ask
-    /// "save first?" opens a dialog and closes when that resolves; a client that ignores this
-    /// stays open, and a shell that cares will eventually insist. What this buys is that the
-    /// decision reaches the process holding the work rather than being taken from it.
+    /// Somebody with the manager channel is asking this window to close; ignoring it stays open.
     CloseRequested,
-    /// The compositor would like this window at this position and size.
-    ///
-    /// **A request, not a command.** The compositor cannot resize a client's buffer — the
-    /// client allocates it — so a client answers by committing a buffer of that size, or
-    /// declines by committing whatever it likes. Declining is legal and stays legal: a
-    /// fixed-size window is ordinary.
-    ///
-    /// The **first** one is not delivered here at all: [`Session::create`] waits for it and returns
-    /// once it has arrived, because a window is not composited until it has been configured.
-    /// What reaches a client through this variant is therefore always a *later* opinion — a
-    /// manager moving or resizing a window that is already on screen.
+    /// The compositor would like this window at this position and size: a request, answered by
+    /// committing a buffer of that size. The first is consumed by [`Session::create`].
     Configure {
         /// Suggested width in pixels.
         width: u32,
@@ -237,38 +149,14 @@ pub enum WindowEvent {
         /// Top-left corner in screen coordinates.
         y: i32,
     },
-    /// The queue overflowed and events were discarded.
-    ///
-    /// **Accumulated state must be discarded.** A client tracking which keys or buttons are
-    /// down has to assume it missed a release, exactly as `libinput` requires of a
-    /// `SYN_DROPPED`. A client that ignores this carries a phantom held modifier for the
-    /// rest of its life, which is the failure the marker exists to prevent.
-    ///
-    /// **Called `Dropped` until M10 Part E**, when drag-and-drop gave the word a second meaning
-    /// in the same match. Two variants a client reads as "dropped" — one meaning *lost input*
-    /// and one meaning *somebody handed you a file* — is a mistake waiting in every `match`, and
-    /// the wire never named this one anyway: it is `libsurface`'s own marker, derived from a
-    /// per-window `lost` flag.
+    /// Events were discarded: a client tracking held keys or buttons must assume it missed a
+    /// release. Not on the wire; derived from a per-window `lost` flag.
     InputLost,
-    /// A press landed outside this popup — `Surface::Dismissed`.
-    ///
-    /// **A request, not a fact**: the window is still up, still focused and still yours. Destroy
-    /// it if what it was offering is over, which is what a menu does; ignore it if it is not.
-    ///
-    /// **Distinct from [`CloseRequested`](Self::CloseRequested) on purpose.** That one is
-    /// somebody asking this window to close and may deserve a "save first?"; this one is the
-    /// pointer having gone elsewhere and deserves nothing but going away. Reading them in one arm
-    /// is the mistake `Dropped` and `InputLost` had to be renamed out of.
+    /// A press landed outside this popup — `Surface::Dismissed`. The window is still up; a
+    /// menu destroys itself on it. Distinct from [`CloseRequested`](Self::CloseRequested).
     Dismissed,
-    /// Somebody dragged a payload onto this window and let go — `Surface::Dropped`.
-    ///
-    /// **Only for a window that declared an acceptor** ([`WindowRef::declare_acceptor`]) whose
-    /// kinds include this one; the compositor matches before it highlights, so a client that
-    /// declared nothing never sees this.
-    ///
-    /// `x` and `y` are window-local, like a press's, and are what makes a client-side drop
-    /// *region* possible: route them to the widget under the point and a window can accept a
-    /// drop in one panel and not another.
+    /// A payload was dropped here — `Surface::Dropped`; only for a window whose declared
+    /// acceptor ([`WindowRef::declare_acceptor`]) takes its kind. `x` and `y` are window-local.
     Drop {
         /// The acceptor this landed on, by the name this window declared.
         acceptor: alloc::string::String,
@@ -286,52 +174,25 @@ pub enum WindowEvent {
 }
 
 /// Per-window state on a [`Session`].
-///
-/// Split out from the session itself because a session owns the *connection* and a window owns
-/// what is true of one window: its buffers, its queued input, and whether it has been
-/// configured. The transport is shared; none of this is.
 struct WindowState {
     id: u32,
-    /// The parent this window was created against, for the roles that have one.
-    ///
-    /// Kept so [`WindowRef::destroy`] can drop the descendants the *compositor* drops: destroy
-    /// is transitive there, so a client that forgot a menu's submenu would hold state for a
-    /// window that no longer exists and could never be told about again.
+    /// The parent this window was created against, so [`WindowRef::destroy`] can drop the
+    /// descendants the compositor drops.
     parent: Option<u32>,
     buffers: Vec<ClientBuffer>,
     /// Input delivered but not yet drained by the client.
     events: alloc::collections::VecDeque<WindowEvent>,
     /// Whether the next drain owes the client a [`WindowEvent::InputLost`].
-    ///
-    /// A flag rather than a count: the client's obligation is the same whether it missed one
-    /// event or forty — discard what you believed — so a number would be information nobody
-    /// can act on differently.
     lost: bool,
     /// The most recent `Configure`, or `None` before the first has arrived.
     configured: Option<ConfigureEvent>,
-    /// Whether the handshake configure has been seen.
-    ///
-    /// Separates "the compositor has answered, you may commit" from "the compositor has changed
-    /// its mind". Without it the first configure would reach the client as an event about a
-    /// window it has not drawn to yet — an opinion about a size nothing has been committed at.
+    /// Whether the handshake configure has been seen, so the first is not delivered as an event.
     mapped: bool,
 }
 
-/// One Surface connection and every window on it.
-///
-/// **A session, not a window, is what a client holds.** The protocol has always allowed several
-/// windows on one connection — a popup may only name a parent *its own connection owns* — but
-/// the API did not: the old `Window` owned its `Transport`, so holding a window meant holding
-/// the only handle to the channel, and a client could drive exactly one. That made a menu
-/// impossible to build, which is what this type exists for (M6 C3).
-///
-/// Operate on a window through [`window`](Self::window), which lends one for the length of a
-/// call. Events arrive for the session and are routed to the window they name — see
-/// [`next_event`](Self::next_event).
-///
-/// **Hold this behind a `Box` if `T` is a `ChannelTransport`**: it is ~9 KiB of message buffers
-/// against a 32 KiB user stack, and a client that moves one by value in a loop overflows it and
-/// dies in its prologue.
+/// One Surface connection and every window on it (a popup may only name a parent its own
+/// connection owns). Events are routed to the window they name. Box it if `T` is a
+/// `ChannelTransport`.
 pub struct Session<T: Transport> {
     transport: T,
     windows: Vec<WindowState>,
@@ -343,22 +204,12 @@ impl<T: Transport> Session<T> {
         Self { transport, windows: Vec::new() }
     }
 
-    /// Create a window with `buffers` buffers, returning its id.
+    /// Create a window with `buffers` (at least two) buffers, returning its id.
     ///
-    /// Refuses fewer than two: with one buffer a client can never redraw without drawing into
-    /// pixels the compositor is reading. [`WindowRef::attach`] is called for each, and the
-    /// caller supplies the shared memory each buffer names.
-    ///
-    /// **Blocks until the window's first `Configure` arrives**, which is the client obligation
-    /// the compositor's ordering rests on: a window is not composited until it has been
-    /// configured, and the round trip is deliberately the client's to wait out. The alternative
-    /// — the compositor asking a manager before replying — would put a userspace process on the
-    /// critical path of every window creation, where a wedged shell stops clients starting at
-    /// all. With no manager attached the answer is immediate and this does not block.
-    ///
-    /// **Records that arrive for other windows while it blocks are routed to them**, not lost.
-    /// The old one-window-per-connection API could not do that, and it is the reason a client
-    /// may now open a menu without stalling the window underneath it.
+    /// Blocks until the window's first `Configure` arrives: a window is not composited until
+    /// configured, and asking a manager before replying would put a userspace process on the
+    /// critical path of every window creation. Events for other windows arriving meanwhile are
+    /// routed to them.
     pub fn create(&mut self, req: &CreateWindowRequest, buffers: usize) -> Result<u32, UiError> {
         if buffers < 2 {
             return Err(UiError::TooFewBuffers);
@@ -381,11 +232,8 @@ impl<T: Transport> Session<T> {
             let mut buf = [0u8; librsproto::surface::MAX_EVENT_BODY];
             let (op, n) = match self.transport.wait_event(&mut buf) {
                 Ok(ev) => ev,
-                // **Take the half-made window back out.** Leaving it would break
-                // `WindowRef::configured`'s promise that it is never `None`, and hand the
-                // caller — who has an `Err` in hand and no id — a window it does not know it
-                // owns (PR #222 review, finding 6).
                 Err(e) => {
+                    // Take the half-made window back out: the caller has an `Err` and no id.
                     self.windows.retain(|w| w.id != id);
                     return Err(e);
                 }
@@ -395,11 +243,7 @@ impl<T: Transport> Session<T> {
         Ok(id)
     }
 
-    /// Lend `id` for the length of one call chain. `None` if this session has no such window.
-    ///
-    /// One window is borrowed at a time, which is all any caller needs: operations are
-    /// sequential, and the alternative — handing out several live handles — would mean several
-    /// paths to the one transport.
+    /// Lend `id` for one call chain. `None` if this session has no such window.
     pub fn window(&mut self, id: u32) -> Option<WindowRef<'_, T>> {
         let i = self.idx(id)?;
         Some(WindowRef { session: self, index: i })
@@ -410,18 +254,13 @@ impl<T: Transport> Session<T> {
         self.windows.iter().map(|w| w.id).collect()
     }
 
-    /// Take the next queued input event and the window it belongs to, if any.
-    ///
-    /// Does not talk to the compositor; call [`pump`](Self::pump) first to collect what has
-    /// arrived. **Windows are scanned in creation order**, so a client that drains until this
-    /// returns `None` — which is the intended shape — sees everything, while one that takes a
-    /// single event per iteration favours its oldest window.
+    /// Take the next queued input event and its window, if any, in window creation order.
+    /// Does not talk to the compositor; [`pump`](Self::pump) first.
     pub fn next_event(&mut self) -> Option<(u32, WindowEvent)> {
         for i in 0..self.windows.len() {
             let w = &mut self.windows[i];
+            // The loss first, so a client resets what it believed before applying what survived.
             if w.lost {
-                // Announced before the surviving events, so a client resets its state and
-                // *then* applies what it still has, rather than the other way round.
                 w.lost = false;
                 return Some((w.id, WindowEvent::InputLost));
             }
@@ -444,9 +283,6 @@ impl<T: Transport> Session<T> {
     }
 
     /// Take one event if one is already here, without blocking.
-    ///
-    /// The companion of [`wait_handle`](Self::wait_handle): a client waiting on several sources
-    /// blocks itself and then drains this until it returns `None`.
     pub fn poll_event(&mut self) -> Result<Option<(u32, WindowEvent)>, UiError> {
         self.pump()?;
         loop {
@@ -462,9 +298,7 @@ impl<T: Transport> Session<T> {
     }
 
     /// Block until an input event is available, then take it.
-    ///
-    /// Buffer releases arriving meanwhile are applied rather than discarded — they are the same
-    /// channel, and dropping one strands a buffer forever.
+    /// Releases arriving meanwhile are applied; dropping one strands a buffer forever.
     pub fn wait_event(&mut self) -> Result<(u32, WindowEvent), UiError> {
         self.pump()?;
         loop {
@@ -478,15 +312,9 @@ impl<T: Transport> Session<T> {
     }
 
     /// Drain pending server events, freeing released buffers. Returns how many arrived.
-    ///
-    /// Non-blocking: a client with something to draw calls this, then [`WindowRef::next_free`],
-    /// and only waits if there is still nothing free.
     pub fn pump(&mut self) -> Result<usize, UiError> {
         let mut seen = 0usize;
-        // Loss below this layer is loss to the client. It is not attributable to one window —
-        // the transport dropped a message without decoding it — so every window is told, which
-        // is the safe direction: a client that discards accumulated state it did not have to is
-        // correct, one that keeps state it should have discarded is not.
+        // A loss is not attributable to one window, so every window is told.
         if self.transport.took_loss() {
             for w in &mut self.windows {
                 w.lost = true;
@@ -500,10 +328,8 @@ impl<T: Transport> Session<T> {
         Ok(seen)
     }
 
-    /// Give the transport back, dropping every window's local state.
-    ///
-    /// The windows themselves are **not** destroyed: the compositor keeps them until this
-    /// session's channel closes or they are destroyed explicitly.
+    /// Give the transport back, dropping every window's local state. The windows are not
+    /// destroyed: the compositor keeps them until the channel closes.
     pub fn into_transport(self) -> T {
         self.transport
     }
@@ -512,15 +338,8 @@ impl<T: Transport> Session<T> {
         self.windows.iter().position(|w| w.id == id)
     }
 
-    /// Apply one server event, routing it to the window it names.
-    ///
-    /// Input is **queued here rather than returned**, so a client blocked in `acquire` waiting
-    /// for a buffer does not lose the keystrokes that arrive while it waits. That is the
-    /// ordinary case, not a corner: a client renders, commits, and blocks — which is precisely
-    /// when a user is looking at the result and typing.
-    ///
-    /// A record naming a window this session does not hold is **dropped**, not queued anywhere:
-    /// the compositor may still have had one in flight for a window just destroyed.
+    /// Apply one server event. Input is queued, so a client blocked in `acquire` keeps its
+    /// keystrokes; a record for an unknown window (one just destroyed) is dropped.
     fn apply_event(&mut self, op: u16, body: &[u8]) {
         match op {
             OP_RELEASE => {
@@ -588,9 +407,7 @@ impl<T: Transport> Session<T> {
                     && let Some(i) = self.idx(e.window)
                 {
                     self.windows[i].configured = Some(e);
-                    // The first one is the handshake `create` is waiting on and is not an
-                    // application event; only later ones are. A client that saw the first as an
-                    // event would act on a size it has not yet committed anything at.
+                    // The first is the handshake `create` waits on, not an application event.
                     if self.windows[i].mapped {
                         self.enqueue(i, WindowEvent::Configure { width: e.width, height: e.height, x: e.x, y: e.y });
                     }
@@ -601,13 +418,8 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// Queue an event on window `i`, discarding the oldest if its queue is full.
-    ///
-    /// **Oldest, not newest.** The newest event is the one describing the world as it is now —
-    /// dropping it would leave a client acting on a stale button state forever, where dropping
-    /// the oldest only costs it history it is already behind on.
-    ///
-    /// **Per window, not per session**, so a noisy window cannot evict a quiet one's events.
+    /// Queue an event on window `i`, discarding the oldest if full: the newest describes the
+    /// world as it is now. Per window, so a noisy one cannot evict a quiet one's events.
     fn enqueue(&mut self, i: usize, e: WindowEvent) {
         let w = &mut self.windows[i];
         if w.events.len() >= EVENT_QUEUE_MAX {
@@ -638,9 +450,7 @@ impl<T: Transport> WindowRef<'_, T> {
         self.state().id
     }
 
-    /// The compositor's most recent opinion of this window's position and size.
-    ///
-    /// Never `None`: waiting for the first is what [`Session::create`] does last.
+    /// The compositor's most recent opinion of this window's position and size. Never `None`.
     pub fn configured(&self) -> Option<ConfigureEvent> {
         self.state().configured
     }
@@ -652,41 +462,18 @@ impl<T: Transport> WindowRef<'_, T> {
 
     /// Attach shared memory as buffer `buffer_id`, transferring `handle`.
     ///
-    /// The handle crosses **once per attach**; thereafter the buffer is named by id. `pitch` is
-    /// the client's own row stride and need not be `width * 4`.
-    ///
-    /// **Re-attaching an id replaces it**, which is how a client resizes (M9 Part D): a window
-    /// whose buffers are the wrong size hands the compositor new memory under the same ids
-    /// rather than inventing new ones the compositor would then hold for the window's life.
-    /// The compositor refuses this for the buffer it is currently displaying, so a caller
-    /// replaces a **free** buffer — [`BufferPool`](crate::buffers::BufferPool) is the piece
-    /// that gets that sequence right.
+    /// The handle crosses once per attach. Re-attaching an id replaces its memory, which is how
+    /// a client resizes; the compositor refuses that for the displayed buffer, so replace a
+    /// free one ([`BufferPool`](crate::buffers::BufferPool) does).
     pub fn attach(&mut self, buffer_id: u32, width: u32, height: u32, pitch: u32, handle: u64) -> Result<(), UiError> {
         self.attach_with_format(buffer_id, width, height, pitch, handle, PixelFormat::XRGB8888)
     }
 
     /// [`attach`](Self::attach), naming the buffer's pixel format.
     ///
-    /// **`PixelFormat::ARGB8888` is what makes a window translucent** (M13 Part B), and it is the
-    /// only thing that does: the compositor reads opacity from the pixels, so there is no
-    /// separate "set opacity" request and no window attribute to keep in step with the buffer.
-    /// A client draws with [`PixelFormat::encode_alpha`] where it wants to see through, and with
-    /// the ordinary drawing routines everywhere else — [`PixelFormat::encode`] means an opaque
-    /// pixel in every format.
-    ///
-    /// **Cost, so the choice is made knowingly**: a translucent surface is composited a pixel at
-    /// a time rather than a row at a time, and it cannot hide what is beneath it, so the
-    /// compositor also paints the background under it. Ordinary windows should stay opaque.
-    ///
-    /// **Only the two formats the protocol names are accepted**, and anything else is refused
-    /// here with [`UiError::UnsupportedFormat`] rather than sent under the nearest tag. There is
-    /// no tag for `XBGR8888`, so approximating it as `XRGB8888` would leave the client drawing in
-    /// one channel order and the compositor blitting in the other — red and blue swapped on every
-    /// pixel, with nothing on the path reporting anything.
-    ///
-    /// A format a *newer* client names and an older compositor does not is refused at the wire
-    /// decoder for the same reason, so an old compositor rejects a new client instead of drawing
-    /// it wrong.
+    /// `PixelFormat::ARGB8888` makes a window translucent (opacity is read from the pixels, via
+    /// [`PixelFormat::encode_alpha`]); it composites a pixel at a time, so ordinary windows stay
+    /// opaque. Other formats are [`UiError::UnsupportedFormat`], not sent under the nearest tag.
     pub fn attach_with_format(
         &mut self,
         buffer_id: u32,
@@ -696,9 +483,6 @@ impl<T: Transport> WindowRef<'_, T> {
         handle: u64,
         format: PixelFormat,
     ) -> Result<(), UiError> {
-        // **Matched against the named formats, not derived from one bit of them.** The tag and
-        // the geometry below describe the same buffer, and the two must agree or the compositor
-        // draws something the client did not send — see [`UiError::UnsupportedFormat`].
         let tag = if format == PixelFormat::ARGB8888 {
             SURFACE_FORMAT_ARGB8888
         } else if format == PixelFormat::XRGB8888 {
@@ -714,8 +498,7 @@ impl<T: Transport> WindowRef<'_, T> {
         )
         .ok_or(UiError::Malformed)?;
         self.session.transport.request(OP_ATTACH_BUFFER, &body[..n], Some(handle), &mut [])?;
-        // Replaced in place when the id is already known, so the record count tracks the
-        // compositor's rather than growing by one per resize.
+        // Replaced in place when the id is known, so the count tracks the compositor's.
         match self.state_mut().buffers.iter_mut().find(|b| b.id == buffer_id) {
             Some(b) => b.geometry = geometry,
             None => self.state_mut().buffers.push(ClientBuffer { id: buffer_id, geometry, busy: false }),
@@ -724,29 +507,18 @@ impl<T: Transport> WindowRef<'_, T> {
     }
 
     /// The geometry attached under `buffer_id`, if this window has such a buffer.
-    ///
-    /// What tells a caller its buffers are the wrong size after a `Configure`.
     pub fn buffer_geometry(&self, buffer_id: u32) -> Option<Geometry> {
         self.state().buffers.iter().find(|b| b.id == buffer_id).map(|b| b.geometry)
     }
 
     /// A buffer the client may draw into, or `None` if the compositor holds them all.
-    ///
-    /// Callers should [`Session::pump`] first: a release may already be waiting.
+    /// [`Session::pump`] first: a release may be waiting.
     pub fn next_free(&self) -> Option<u32> {
         self.state().buffers.iter().find(|b| !b.busy).map(|b| b.id)
     }
 
-    /// A buffer to draw into, **waiting** if the compositor holds them all.
-    ///
-    /// This is the call a render loop wants, and the reason `next_free` alone is not enough:
-    /// after committing more frames than it has buffers, a client's next buffer only becomes
-    /// available when a `Release` arrives, and that may not have happened yet when it asks.
-    /// Polling once and failing is how the first real client stalled at its third frame.
-    ///
-    /// Drains pending events first, so a release already waiting costs no block at all — and
-    /// those events go to whichever window they name, so blocking here does not strand a
-    /// sibling's input.
+    /// A buffer to draw into, waiting if the compositor holds them all. Drains pending events
+    /// first, to whichever window they name, so blocking does not strand a sibling's input.
     pub fn acquire(&mut self) -> Result<u32, UiError> {
         self.session.pump()?;
         loop {
@@ -756,7 +528,6 @@ impl<T: Transport> WindowRef<'_, T> {
             if self.state().buffers.is_empty() {
                 return Err(UiError::NoSuchBuffer);
             }
-            // Nothing free: block until the compositor says something, then re-check.
             let mut buf = [0u8; librsproto::surface::MAX_EVENT_BODY];
             let (op, len) = self.session.transport.wait_event(&mut buf)?;
             self.session.apply_event(op, &buf[..len]);
@@ -781,9 +552,7 @@ impl<T: Transport> WindowRef<'_, T> {
             },
         )
         .ok_or(UiError::Malformed)?;
-        // **Marked busy only after the send succeeds.** Setting it first strands the buffer if
-        // the send fails — the compositor never saw the commit and will never release it, so a
-        // double-buffered client stalls forever after two such failures.
+        // Busy only after the send succeeds: the compositor never releases a commit it never saw.
         self.session.transport.request(OP_COMMIT, &body[..n], None, &mut [])?;
         if let Some(b) = self.state_mut().buffers.iter_mut().find(|b| b.id == buffer_id) {
             b.busy = true;
@@ -791,15 +560,7 @@ impl<T: Transport> WindowRef<'_, T> {
         Ok(())
     }
 
-    /// Tell the compositor what to call this window.
-    ///
-    /// **The only client-facing use of `SetTitle`**, which shipped in M7 Part A with a
-    /// compositor that stores titles and a manager event that reports them — and no way for a
-    /// client to set one. So every title was empty, `WindowTitle` was never emitted, and M8
-    /// Part C's window list showed `window 6` for everything (PR #242 review, optional 7).
-    ///
-    /// Longer titles are truncated by the compositor at a character boundary, not refused —
-    /// see `docs/spec/rsproto-surface-ops.md`.
+    /// Tell the compositor what to call this window; a long title is truncated, not refused.
     pub fn set_title(&mut self, title: &str) -> Result<(), UiError> {
         let mut body = [0u8; 4 + librsproto::surface::MAX_TITLE];
         let n = librsproto::surface::title::write(self.id(), title, &mut body).ok_or(UiError::Malformed)?;
@@ -809,13 +570,8 @@ impl<T: Transport> WindowRef<'_, T> {
 
     /// Ask the compositor to move this window with the pointer — `Surface::StartMove`.
     ///
-    /// **Call it from a press handler, and only from one.** The compositor refuses unless this
-    /// window holds the implicit pointer grab, which is what makes "the user is dragging me"
-    /// true; a client cannot move itself at an arbitrary moment, because that would be placing
-    /// itself and `Place` is a manager op.
-    ///
-    /// The move ends when the button comes up. There is nothing to end it from here, and
-    /// deliberately: the compositor is the one that knows when the button was released.
+    /// From a press handler only: the compositor refuses unless this window holds the implicit
+    /// pointer grab, since moving at an arbitrary moment would be placing itself.
     pub fn start_move(&mut self) -> Result<(), UiError> {
         let mut body = [0u8; 4];
         let n = librsproto::surface::StartMove { window: self.id() }.write(&mut body).ok_or(UiError::Malformed)?;
@@ -825,18 +581,9 @@ impl<T: Transport> WindowRef<'_, T> {
 
     /// Hand the compositor an interactive resize of this window — `Surface::StartResize`.
     ///
-    /// **The same authority as [`start_move`](Self::start_move)**: refused unless this window
-    /// holds the pointer grab, which is what makes "the user is dragging my edge" true. Sent
-    /// from the press, not the click, for the reason a move is — the gesture *begins* at the
-    /// press, and by the time a button comes up the drag is over.
-    ///
-    /// **Nothing about the window changes while it runs.** The compositor moves an outline and
-    /// tells the manager where the user let go; the manager sends the `Configure`. So a client
-    /// calling this must expect its size to change through the ordinary `Configure` path, or
-    /// not at all — a shell may decide otherwise, and a fixed-size window declines it anyway.
-    ///
-    /// `edges` is a mask of `RESIZE_LEFT` and friends; a corner is two bits. Naming none, or
-    /// both of an opposite pair, is `InvalidArgument`.
+    /// Refused unless this window holds the pointer grab. The manager sends the `Configure`,
+    /// or not. `edges` is a mask of `RESIZE_LEFT` and friends; naming none, or both of an
+    /// opposite pair, is `InvalidArgument`.
     pub fn start_resize(&mut self, edges: u32) -> Result<(), UiError> {
         let mut body = [0u8; 8];
         let n =
@@ -847,22 +594,9 @@ impl<T: Transport> WindowRef<'_, T> {
 
     /// Say what this window takes when something is dropped on it — `Surface::DeclareAcceptor`.
     ///
-    /// **Declared once, not answered per drag.** The compositor holds the table and matches
-    /// against it while the pointer moves, so a drag costs no round trip to any client; the
-    /// alternative — asking each window mid-gesture — puts a message exchange on the path that
-    /// has to stay cheap enough to run per motion.
-    ///
-    /// `name` is what a [`WindowEvent::Drop`] says it landed on, and what a *port* will address
-    /// when ports arrive — which is why it is a name rather than an index. `kinds` is a mask of
-    /// `DROP_KIND_FILE` and friends: a window that takes files but not folders says so here, and
-    /// nothing else has to know.
-    ///
-    /// **Where on the window a drop is allowed is not part of this.** The event carries the
-    /// pointer's position, and `libui` routes it to the widget under that point exactly as it
-    /// routes a press — so a window can accept a drop in one panel and refuse it in another
-    /// without the protocol growing a rectangle.
-    ///
-    /// Re-declaring a name replaces it. Cleared with the window.
+    /// The compositor matches while the pointer moves, so a drag costs no round trip.
+    /// `name` is what a [`WindowEvent::Drop`] says it landed on; `kinds` a mask of
+    /// `DROP_KIND_FILE` and friends. Re-declaring a name replaces it.
     pub fn declare_acceptor(&mut self, name: &str, kinds: u32) -> Result<(), UiError> {
         let mut body = [0u8; librsproto::surface::DeclareAcceptor::HEAD + librsproto::surface::MAX_ACCEPTOR_NAME];
         let n = librsproto::surface::DeclareAcceptor { window: self.id(), kinds }
@@ -874,19 +608,10 @@ impl<T: Transport> WindowRef<'_, T> {
 
     /// Offer a payload to whatever window the user drags it onto — `Surface::StartDrag`.
     ///
-    /// **The same authority as [`start_move`](Self::start_move)**, and it matters more here:
-    /// refused unless this window holds the pointer grab, because a drag is an *offer* to
-    /// another application and a client that could start one at will could push a path into
-    /// somebody else's window with nobody touching anything.
-    ///
-    /// Sent from a press-and-move, not from a click: by the time a button comes up the gesture
-    /// is over. The compositor runs it from there — highlighting windows that take `kind`, and
-    /// delivering one [`WindowEvent::Drop`] if it ends over one. Ending anywhere else sends
-    /// nothing, to anybody: a drop on nothing is how somebody changes their mind.
-    ///
-    /// **`path` is the payload and `name` is only a label.** A handle would have to belong to
-    /// somebody mid-gesture and a refused transfer has no clean owner; a path is a name the
-    /// receiver opens for itself, reporting its own errors in its own window (M10 decision 1).
+    /// Refused unless this window holds the pointer grab, or a client could push a path into
+    /// another window untouched. One [`WindowEvent::Drop`] is delivered if it ends over a
+    /// window taking `kind`. `path` is the payload and `name` only a label: a path is opened by
+    /// the receiver, which reports its own errors.
     pub fn start_drag(&mut self, kind: u32, path: &str, name: &str) -> Result<(), UiError> {
         use librsproto::surface::{MAX_DROP_NAME, MAX_DROP_PATH, StartDrag};
         let mut body = [0u8; StartDrag::HEAD + MAX_DROP_PATH + MAX_DROP_NAME];
@@ -899,14 +624,8 @@ impl<T: Transport> WindowRef<'_, T> {
 
     /// Ask the manager to minimise, maximise or restore this window — `Surface::RequestState`.
     ///
-    /// **An ask, not a change.** A client cannot minimise or maximise itself: both are manager
-    /// operations, and one a client could reach would let it put another window away or place
-    /// itself. The compositor forwards this to whoever holds the manager channel, and what
-    /// happens next is that manager's decision — a shell may refuse, and a window that is not
-    /// resizable will decline the `Configure` that arrives anyway.
-    ///
-    /// Repeating the state last asked for produces no manager event, so a button held down or a
-    /// view rebuilt every frame costs nothing.
+    /// An ask, not a change: the compositor forwards it to the manager, which may refuse.
+    /// Repeating the state last asked for produces no manager event.
     pub fn request_state(&mut self, state: u32) -> Result<(), UiError> {
         let mut body = [0u8; 8];
         let n =
@@ -917,17 +636,8 @@ impl<T: Transport> WindowRef<'_, T> {
 
     /// Destroy the window, and forget every descendant the compositor destroys with it.
     ///
-    /// **Transitively**, because that is what the compositor does: a popup goes with its parent
-    /// and a submenu with that popup. A client that kept local state for those would be holding
-    /// buffers and queued events for windows that no longer exist, and would never hear about
-    /// them again.
-    ///
-    /// **Consumes the ref**, because after this there is no window for it to refer to. It
-    /// caches an index into the session's list and `retain` below shifts everything after the
-    /// removed entry down — so a ref that outlived its window would silently re-aim at
-    /// whichever window took its place, and `attach` through it would land a buffer on someone
-    /// else's window. Taking `self` by value makes that unrepresentable rather than merely
-    /// unwise (PR #222 review, finding 2).
+    /// Transitively, as the compositor does. Consumes the ref: it caches an index that `retain`
+    /// below shifts, so a ref outliving its window would re-aim at another window.
     pub fn destroy(self) -> Result<(), UiError> {
         let id = self.id();
         let mut body = [0u8; 8];
@@ -967,23 +677,16 @@ mod tests {
     use alloc::vec;
     use librsproto::surface::{MOD_SHIFT, POINTER_MOTION};
 
-    /// Records what was sent and lets a test hand back replies and events.
     #[derive(Default)]
     struct MockTransport {
         sent: Vec<(u16, Vec<u8>, Option<u64>)>,
         next_window: u32,
         events: Vec<(u16, Vec<u8>)>,
-        /// Events that only appear once the client actually blocks.
         deferred: Vec<(u16, Vec<u8>)>,
-        /// How many times the client had to block.
         waits: usize,
         fail: bool,
         /// Answer `CreateWindow`, then fail the wait for its `Configure`.
-        ///
-        /// Models the one failure that can strand a half-made window: the compositor took the
-        /// request and the channel died before the handshake finished.
         fail_after_create: bool,
-        /// Set by a test to model the real transport discarding a parked event.
         lost: bool,
     }
 
@@ -1003,11 +706,7 @@ mod tests {
                 self.next_window += 1;
                 let n = librsproto::surface::build_create_window_reply(reply, self.next_window)
                     .ok_or(UiError::Malformed)?;
-                // **The mock owes the handshake, because the compositor does.** `Window::new`
-                // waits for the first `Configure` before returning, so a mock that replied with
-                // an id and nothing else would hang every test — which is the contract being
-                // modelled rather than an accommodation of it. The geometry echoes the request,
-                // as a compositor with no manager attached does.
+                // `create` waits for a `Configure`; echo the request, as with no manager.
                 let req = librsproto::surface::parse_create_window_request(body).ok_or(UiError::Malformed)?;
                 let mut cfg = [0u8; 20];
                 ConfigureEvent { window: self.next_window, width: req.width, height: req.height, x: 0, y: 0 }
@@ -1021,10 +720,7 @@ mod tests {
 
         fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {
             let Some((op, body)) = self.events.pop() else { return Ok(None) };
-            // **Models the real transport's answer to a body that does not fit**: a loss, not a
-            // shorter body. A mock that panicked here would fail loudly for the wrong reason,
-            // and one that truncated would let a test pass on a shape `ChannelTransport` drops
-            // (PR #260 review, blocking 1).
+            // A body that does not fit is a loss, not a shorter body, as in `ChannelTransport`.
             if body.len() > buf.len() {
                 self.lost = true;
                 return Ok(None);
@@ -1038,13 +734,8 @@ mod tests {
         }
 
         fn wait_event(&mut self, buf: &mut [u8]) -> Result<(u16, usize), UiError> {
-            // Models the real timing: nothing is queued *yet*, and the release only
-            // materialises because we waited. `deferred` is what a test arranges to have
-            // the compositor "send" during the block.
-            // **An event already queued is not a wait**, which the real transport gets right by
-            // polling before it blocks. Counting one here made the create handshake — which
-            // reads a configure the mock queued during the create — look like a block, and the
-            // two `acquire` tests that assert on the count are about *buffer* waits.
+            // `deferred` is what the compositor "sends" during a block. An event already queued
+            // is not a wait, as in the real transport, or the create handshake would count.
             if self.fail_after_create {
                 return Err(UiError::Transport);
             }
@@ -1066,7 +757,6 @@ mod tests {
     }
 
     impl MockTransport {
-        /// Queue a key event as the compositor would send it.
         fn queue_key(&mut self, keycode: u16, pressed: bool, modifiers: u16) {
             let e = KeyEvent::new(self.next_window, keycode, u16::from(pressed), modifiers);
             let mut b = [0u8; core::mem::size_of::<KeyEvent>()];
@@ -1074,7 +764,6 @@ mod tests {
             self.events.insert(0, (OP_KEY_EVENT, b[..n].to_vec()));
         }
 
-        /// Queue a key addressed to `window` — for the multi-window filter test.
         fn queue_key_for(&mut self, window: u32, keycode: u16, pressed: bool, modifiers: u16) {
             let e = KeyEvent::new(window, keycode, u16::from(pressed), modifiers);
             let mut b = [0u8; core::mem::size_of::<KeyEvent>()];
@@ -1082,7 +771,6 @@ mod tests {
             self.events.insert(0, (OP_KEY_EVENT, b[..n].to_vec()));
         }
 
-        /// Queue a pointer record addressed to `window`.
         fn queue_pointer_for(&mut self, window: u32, kind: u16, x: i32, y: i32) {
             let e = PointerEvent { window, kind, x, y, ..Default::default() };
             let mut b = [0u8; core::mem::size_of::<PointerEvent>()];
@@ -1090,7 +778,6 @@ mod tests {
             self.events.insert(0, (OP_POINTER_EVENT, b[..n].to_vec()));
         }
 
-        /// Queue a pointer event as the compositor would send it.
         fn queue_pointer(&mut self, kind: u16, x: i32, y: i32) {
             let e = PointerEvent { window: self.next_window, kind, x, y, ..Default::default() };
             let mut b = [0u8; core::mem::size_of::<PointerEvent>()];
@@ -1098,7 +785,6 @@ mod tests {
             self.events.insert(0, (OP_POINTER_EVENT, b[..n].to_vec()));
         }
 
-        /// A `Dropped` event, built exactly as the compositor builds one.
         fn queue_drop(&mut self, window: u32, acceptor: &str, path: &str, name: &str) {
             use librsproto::surface::{DROP_KIND_FILE, DroppedEvent, MAX_EVENT_BODY, OP_DROPPED};
             let mut b = alloc::vec![0u8; MAX_EVENT_BODY];
@@ -1115,7 +801,6 @@ mod tests {
             self.events.push((OP_RELEASE, b[..n].to_vec()));
         }
 
-        /// A release the compositor only sends once the client blocks for it.
         fn defer_release(&mut self, window: u32, buffer: u32) {
             let mut b = [0u8; 8];
             let n = librsproto::surface::build_release_event(&mut b, window, buffer).unwrap();
@@ -1123,13 +808,8 @@ mod tests {
         }
     }
 
-    // ---- Multi-window: what `Window` could not do -------------------------------------
+    // ---- Multi-window ----
 
-    /// Two windows on one session, and input reaches the one it names.
-    ///
-    /// The whole point of the type. A popup may only name a parent **its own connection owns**,
-    /// so a menu is necessarily a second window on the parent's session — and until the records
-    /// carried a window id and this type existed, a client could not have both.
     #[test]
     fn two_windows_on_one_session_each_get_their_own_input() {
         let mut s = Session::new(MockTransport::default());
@@ -1141,17 +821,11 @@ mod tests {
         s.transport.queue_key_for(parent, 31, true, 0);
         assert_eq!(s.pump().expect("pump"), 2);
 
-        // Scanned in creation order, so the parent's comes first — and each carries its window.
         assert_eq!(s.next_event(), Some((parent, WindowEvent::Key(KeyEvent::new(parent, 31, 1, 0)))),);
         assert_eq!(s.next_event(), Some((menu, WindowEvent::Key(KeyEvent::new(menu, 30, 1, 0)))),);
         assert_eq!(s.next_event(), None);
     }
 
-    /// Destroying a parent drops the descendants the compositor drops with it.
-    ///
-    /// Destroy is transitive on the compositor's side — a popup goes with its parent and a
-    /// submenu with that popup. A session that kept local state for those would hold buffers
-    /// and queued events for windows that no longer exist and can never be mentioned again.
     #[test]
     fn destroying_a_parent_forgets_the_windows_that_went_with_it() {
         let mut s = Session::new(MockTransport::default());
@@ -1168,18 +842,11 @@ mod tests {
         assert!(s.window(submenu).is_none(), "and a popup of that popup");
     }
 
-    /// A sibling's input consumed by another window's handshake is routed, not dropped.
-    ///
-    /// `Session::create` reads from the channel until its window's first `Configure` arrives,
-    /// so it necessarily consumes whatever else is queued ahead of it. Those records belong to
-    /// other windows, and with one window per connection there was nowhere to put them — a
-    /// client could not open a menu without losing what was typed at the window underneath.
     #[test]
     fn input_arriving_while_another_window_is_created_is_kept() {
         let mut s = Session::new(MockTransport::default());
         let parent = s.create(&CreateWindowRequest::new(200, 100, Role::Normal), 2).unwrap();
 
-        // On the wire before the menu's handshake, so `create`'s wait loop is what consumes it.
         s.transport.queue_key_for(parent, 42, true, 0);
 
         let menu = s.create(&CreateWindowRequest::at(40, 60, Role::Popup { parent }, 0, 0), 2).unwrap();
@@ -1192,41 +859,22 @@ mod tests {
         assert!(s.window(menu).unwrap().configured().is_some(), "and the menu was configured");
     }
 
-    /// A `create` that fails mid-handshake leaves nothing behind.
-    ///
-    /// The window exists on the compositor by then — the reply arrived — but the caller has an
-    /// `Err` and no id, so a session that kept the entry would hold a window nobody can name,
-    /// and one whose `configured` is `None`, which [`WindowRef::configured`] promises never
-    /// happens (PR #222 review, finding 6).
     #[test]
     fn a_create_that_fails_during_the_handshake_leaves_no_window_behind() {
-        // The create request is answered; the wait for the configure is not.
         let t = MockTransport { fail_after_create: true, ..Default::default() };
         let mut s = Session::new(t);
         assert!(s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).is_err(), "the handshake failed");
         assert!(s.window_ids().is_empty(), "and the session kept no half-made window");
     }
 
-    /// A drop the size the protocol permits reaches the client whole.
-    ///
-    /// **The test that was missing, and the defect it would have caught.** Every event was a
-    /// handful of integers until M10 Part E, so this library read them into 64 bytes — and
-    /// `Dropped` carries a path. A 33-byte path was enough to overflow it: the record failed its
-    /// own length check and the event vanished with nothing logged anywhere in the client, so a
-    /// completed gesture was silently forgotten. Shorter than that and the *display name* came
-    /// out cut, which parses fine and is simply wrong.
-    ///
-    /// `check-login`'s drag passed by **one byte** (`24 + 8 + 22 + 9 = 63`), which is the reason
-    /// this is a host test and not a longer fixture in the gate: the size is a property of the
-    /// protocol, and pinning it needs the maximum rather than a plausible example
-    /// (PR #260 review, blocking 1).
+    /// A buffer smaller than the protocol's maximum record loses the event silently or cuts the
+    /// display name, so pinning the size needs the maximum.
     #[test]
     fn a_drop_at_the_protocol_maximum_reaches_the_client_whole() {
         use librsproto::surface::{DROP_KIND_FILE, MAX_ACCEPTOR_NAME, MAX_DROP_NAME, MAX_DROP_PATH};
         let mut s = Session::new(MockTransport::default());
         let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).unwrap();
 
-        // Every field at its cap, which is the only size that pins the buffer to the protocol.
         let acceptor = "a".repeat(MAX_ACCEPTOR_NAME);
         let path = alloc::format!("/{}", "p".repeat(MAX_DROP_PATH - 1));
         let name = "n".repeat(MAX_DROP_NAME);
@@ -1249,8 +897,6 @@ mod tests {
             "a maximal drop arrives with nothing shortened"
         );
 
-        // And an ordinary one, the shape the gate drags — kept beside the maximum because the
-        // failure was *size-dependent*, so a test with only one size proves only that size.
         s.transport.queue_drop(w, "document", "/home/papers/quarterly-report.txt", "quarterly-report.txt");
         s.pump().expect("pump");
         let Some((_, WindowEvent::Drop { path, name, .. })) = s.next_event() else {
@@ -1260,17 +906,7 @@ mod tests {
         assert_eq!(name, "quarterly-report.txt");
     }
 
-    /// Transport-level loss is announced to **every** window, not just one.
-    ///
-    /// A message the transport dropped before decoding is not attributable to any window — it
-    /// was never decoded, so nothing says which one it named. Telling only one window leaves
-    /// the others carrying accumulated state they should have discarded: a client with a menu
-    /// open keeps a phantom button-down on the menu for the rest of its life, which is exactly
-    /// what `Dropped` exists to prevent.
-    ///
-    /// The existing loss test runs through the single-window fixture and structurally cannot
-    /// see the difference — narrowing the fan-out to one window leaves it passing
-    /// (PR #222 review, finding 3).
+    /// A message dropped before decoding is not attributable to a window.
     #[test]
     fn transport_loss_is_announced_to_every_window() {
         let mut s = Session::new(MockTransport::default());
@@ -1285,26 +921,18 @@ mod tests {
         assert_eq!(s.next_event(), None, "once each");
     }
 
-    /// One window overflowing its queue does not evict another window's events.
-    ///
-    /// The bound is per window precisely so a noisy window cannot cost a quiet one anything.
-    /// A session-wide budget would let a drag over the terminal evict the menu's queued click
-    /// and mark the *menu* `Dropped` — a window losing events because of traffic it had no part
-    /// in (PR #222 review, finding 4).
     #[test]
     fn one_windows_overflow_does_not_evict_anothers_events() {
         let mut s = Session::new(MockTransport::default());
         let noisy = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).unwrap();
         let quiet = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).unwrap();
 
-        // One event for the quiet window, then far more than the bound for the noisy one.
         s.transport.queue_key_for(quiet, 99, true, 0);
         for i in 0..(EVENT_QUEUE_MAX + 8) {
             s.transport.queue_key_for(noisy, i as u16, true, 0);
         }
         s.pump().expect("pump");
 
-        // The noisy window overflowed and is told so; the quiet one is untouched.
         assert_eq!(
             s.next_event(),
             Some((noisy, WindowEvent::InputLost)),
@@ -1326,7 +954,6 @@ mod tests {
         assert_eq!(from_noisy, EVENT_QUEUE_MAX, "the noisy window kept exactly its bound");
     }
 
-    /// A record naming a window this session does not hold is dropped, not misattributed.
     #[test]
     fn a_record_for_an_unknown_window_is_dropped() {
         let mut s = Session::new(MockTransport::default());
@@ -1336,13 +963,7 @@ mod tests {
         assert_eq!(s.next_event(), None, "and went nowhere");
     }
 
-    /// A session holding exactly one window, with `count` buffers attached.
-    ///
-    /// **A fixture for the single-window shape**, which is what every test below this line was
-    /// written against and what most clients still are. It forwards to the session for the
-    /// calls that are now session-wide and to the window for the rest, so those tests keep
-    /// saying what they always said. The multi-window behaviour that replaced `Window` is
-    /// tested through `Session` directly — see the tests at the end of this module.
+    /// A session holding one window; forwards session-wide calls to the session.
     struct One {
         s: Session<MockTransport>,
         id: u32,
@@ -1403,8 +1024,6 @@ mod tests {
 
     #[test]
     fn single_buffering_is_refused_at_construction() {
-        // Not a limitation to work around: with one buffer, the only thing to draw into is
-        // the buffer the compositor is reading.
         for count in [0, 1] {
             assert_eq!(
                 Session::new(MockTransport::default())
@@ -1420,11 +1039,6 @@ mod tests {
 
     #[test]
     fn re_attaching_an_id_replaces_its_record_rather_than_adding_one() {
-        // **The client half of how a resize works** (M9 Part D). The compositor replaces the
-        // memory behind an id rather than refusing it, so this side must replace the record —
-        // a pushed duplicate would make `buffer_geometry` and `next_free` answer from
-        // whichever copy came first, and a client would go on believing its buffers were the
-        // old size after resizing them.
         let mut w = window(2);
         assert_eq!(w.buffers().len(), 2);
 
@@ -1438,10 +1052,6 @@ mod tests {
 
     #[test]
     fn a_replaced_buffer_keeps_the_busy_state_the_compositor_has_for_it() {
-        // A commit makes a buffer busy; a client must not be able to launder that by
-        // re-attaching. It cannot reach this — the compositor refuses re-attaching the
-        // displayed buffer — but the record here is what `next_free` reads, and a replace that
-        // cleared `busy` would hand the caller a buffer the compositor is still reading back.
         let mut w = window(2);
         w.commit(0, (0, 0, 64, 32)).unwrap();
         w.attach(0, 128, 64, 128 * 4, 201).unwrap();
@@ -1451,8 +1061,6 @@ mod tests {
 
     #[test]
     fn the_handle_is_transferred_once_at_attach_and_never_again() {
-        // The whole point of the shared-memory design: the handle crosses on attach, and
-        // commits thereafter name the buffer by id.
         let mut w = window(2);
         w.commit(0, (0, 0, 64, 32)).unwrap();
         w.commit(1, (0, 0, 64, 32)).unwrap();
@@ -1468,11 +1076,7 @@ mod tests {
 
     #[test]
     fn the_format_a_client_asks_for_is_the_tag_that_goes_on_the_wire() {
-        // **The client half of translucency had no negative control** (PR #275 review, finding
-        // 3): making `attach_with_format` send `SURFACE_FORMAT_XRGB8888` unconditionally left
-        // every test in this crate green while every translucent window a client asked for came
-        // back opaque. Byte 20 of the attach body is the format word — see
-        // `docs/spec/rsproto-surface-ops.md`.
+        // Byte 20 of the attach body is the format word.
         fn tag_of(w: &One) -> u32 {
             let (_, body, _) = w.s.transport.sent.iter().rev().find(|(op, _, _)| *op == OP_ATTACH_BUFFER).unwrap();
             u32::from_le_bytes(body[20..24].try_into().unwrap())
@@ -1483,8 +1087,6 @@ mod tests {
 
         w.w().attach_with_format(0, 64, 32, 64 * 4, 300, PixelFormat::ARGB8888).unwrap();
         assert_eq!(tag_of(&w), SURFACE_FORMAT_ARGB8888);
-        // …and the client's own record agrees with what it sent, which is the pair that must not
-        // drift: the compositor draws from the tag and the client draws into the geometry.
         assert!(w.w().buffer_geometry(0).unwrap().format.has_alpha());
 
         w.w().attach_with_format(0, 64, 32, 64 * 4, 301, PixelFormat::XRGB8888).unwrap();
@@ -1494,16 +1096,11 @@ mod tests {
 
     #[test]
     fn a_format_with_no_wire_tag_is_refused_rather_than_approximated() {
-        // **The bug finding 2 found.** The tag used to be derived from `has_alpha()`, so
-        // `XBGR8888` — a public const in `libdraw`, and the natural thing to pass on firmware
-        // that reports BGR — went out as `XRGB8888` while the client kept drawing in BGR order.
-        // Red and blue swapped on every pixel, with nothing on the path reporting anything.
         let mut w = window(2);
         let before = w.s.transport.sent.len();
         let e = w.w().attach_with_format(0, 64, 32, 64 * 4, 302, PixelFormat::XBGR8888);
         assert_eq!(e, Err(UiError::UnsupportedFormat));
         assert_eq!(w.s.transport.sent.len(), before, "a refused attach must send nothing");
-        // The buffer keeps the geometry it had: a refused attach changes nothing either side.
         assert_eq!(w.w().buffer_geometry(0).unwrap().format, PixelFormat::XRGB8888);
     }
 
@@ -1517,7 +1114,6 @@ mod tests {
         w.commit(1, (0, 0, 1, 1)).unwrap();
         assert_eq!(w.next_free(), None, "the compositor holds both");
 
-        // The compositor releases the one that left the screen.
         w.s.transport.queue_release(1, 0);
         assert_eq!(w.pump().unwrap(), 1);
         assert_eq!(w.next_free(), Some(0));
@@ -1525,8 +1121,6 @@ mod tests {
 
     #[test]
     fn double_buffering_can_draw_forever_without_ever_touching_a_busy_buffer() {
-        // The property the whole design exists for. Ten frames, alternating, never
-        // drawing into a buffer the compositor holds.
         let mut w = window(2);
         let mut previous: Option<u32> = None;
         for frame in 0..10 {
@@ -1534,7 +1128,6 @@ mod tests {
             let b = w.next_free().unwrap_or_else(|| panic!("stalled at frame {frame}"));
             assert!(!w.buffers().iter().find(|x| x.id == b).unwrap().busy);
             w.commit(b, (0, 0, 64, 32)).unwrap();
-            // The compositor releases whatever left the screen.
             if let Some(p) = previous {
                 w.s.transport.queue_release(w.id(), p);
             }
@@ -1544,8 +1137,6 @@ mod tests {
 
     #[test]
     fn a_release_for_another_window_is_ignored() {
-        // Events arrive on a shared channel; a client with two windows must not free a
-        // buffer because the *other* window's buffer was released.
         let mut w = window(2);
         w.commit(0, (0, 0, 1, 1)).unwrap();
         w.s.transport.queue_release(w.id() + 99, 0);
@@ -1579,11 +1170,6 @@ mod tests {
 
     #[test]
     fn a_new_window_has_been_configured_before_it_returns() {
-        // **The handshake.** A window is not composited until it has been configured, so
-        // `Window::new` does not hand back a window a client could commit on before the
-        // compositor has said where it goes. That is what lets a manager place a window before
-        // it is ever seen, with the round trip on the client's side rather than the
-        // compositor's.
         let t = MockTransport { next_window: 6, ..Default::default() };
         let mut s = Session::new(t);
         let id = s.create(&CreateWindowRequest::new(320, 200, Role::Normal), 2).expect("created");
@@ -1595,15 +1181,11 @@ mod tests {
 
     #[test]
     fn the_handshake_configure_is_not_delivered_as_an_event() {
-        // A client acting on the first configure would be acting on a size it has committed
-        // nothing at — it is the permission to draw, not an opinion about a drawing. Only a
-        // *later* configure is news.
         let t = MockTransport { next_window: 1, ..Default::default() };
         let mut s = Session::new(t);
         let id = s.create(&CreateWindowRequest::new(64, 32, Role::Normal), 2).expect("created");
         assert!(s.poll_event().expect("ok").is_none(), "the handshake leaked into the queue");
 
-        // A second one is a manager changing its mind, and that *is* an event.
         let mut cfg = [0u8; 20];
         ConfigureEvent { window: id, width: 100, height: 50, x: 7, y: 9 }.write(&mut cfg).unwrap();
         s.transport.events.push((OP_CONFIGURE, cfg.to_vec()));
@@ -1616,8 +1198,6 @@ mod tests {
 
     #[test]
     fn a_configure_for_another_window_is_not_this_windows_business() {
-        // One session can hold several windows and they share a channel, so the id is what
-        // makes a configure attributable — the same reason `FocusEvent` carries one.
         let t = MockTransport { next_window: 3, ..Default::default() };
         let mut s = Session::new(t);
         let id = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).expect("created");
@@ -1632,15 +1212,11 @@ mod tests {
 
     #[test]
     fn acquire_waits_when_the_compositor_holds_every_buffer() {
-        // The bug the first real client hit: it polled once, found nothing free, and gave
-        // up at frame 3. A release that has not arrived *yet* is not a release that will
-        // never arrive — the compositor may simply not have processed the commit.
         let mut w = window(2);
         w.commit(0, (0, 0, 1, 1)).unwrap();
         w.commit(1, (0, 0, 1, 1)).unwrap();
         assert_eq!(w.next_free(), None, "both are held");
 
-        // The compositor sends the release only once the client blocks.
         w.s.transport.defer_release(1, 0);
         assert_eq!(w.acquire().unwrap(), 0);
         assert_eq!(w.s.transport.waits, 1, "it had to block exactly once");
@@ -1655,8 +1231,6 @@ mod tests {
 
     #[test]
     fn a_render_loop_of_more_frames_than_buffers_never_stalls() {
-        // The end-to-end shape: commit, then acquire the next buffer, for more frames than
-        // there are buffers. This is what `ui-testclient` does in the guest.
         let mut w = window(2);
         let mut previous: Option<u32> = None;
         for frame in 0..8 {
@@ -1671,16 +1245,12 @@ mod tests {
 
     #[test]
     fn a_failed_commit_leaves_the_buffer_drawable() {
-        // If `busy` were set before the send, a failed commit would strand the buffer: the
-        // compositor never saw it and will never release it. Two such failures on a
-        // double-buffered window stall the client forever.
         let mut w = window(2);
         w.s.transport.fail = true;
         assert_eq!(w.commit(0, (0, 0, 1, 1)), Err(UiError::Transport));
         assert_eq!(w.next_free(), Some(0), "buffer 0 must still be drawable");
         assert!(!w.buffers().iter().find(|b| b.id == 0).unwrap().busy);
 
-        // And a subsequent successful commit does mark it.
         w.s.transport.fail = false;
         w.commit(0, (0, 0, 1, 1)).unwrap();
         assert!(w.buffers().iter().find(|b| b.id == 0).unwrap().busy);
@@ -1706,9 +1276,6 @@ mod tests {
 
     #[test]
     fn transport_level_loss_surfaces_as_a_dropped_marker() {
-        // A transport that discarded a parked event must say so, or a client tracking held
-        // keys carries a phantom modifier for the rest of its life. Folded into the same
-        // flag the local queue sets, so both surface as one `Dropped`.
         let mut w = window(2);
         w.s.transport.lost = true;
         w.pump().expect("pump");
@@ -1732,9 +1299,6 @@ mod tests {
 
     #[test]
     fn a_focus_event_for_another_window_is_not_this_windows_business() {
-        // One session can hold several windows — a popup is created on its parent's
-        // connection — so both halves of a focus change arrive on the one channel. Without
-        // the filter a parent would read its own loss as a gain (PR #184 re-review).
         let mut w = window(2);
         let other = w.id() + 1;
         let e = FocusEvent { focused: 1, _pad: 0, window: other };
@@ -1747,30 +1311,18 @@ mod tests {
 
     #[test]
     fn a_truncated_focus_event_is_ignored_rather_than_read_as_unfocused() {
-        // Reading a short record as `focused: false` would dim a window for a malformed
-        // message — the failure mode is invisible, because a dim window looks like a window
-        // that legitimately lost focus.
         let mut w = window(2);
         w.s.transport.events.insert(0, (OP_FOCUS_EVENT, vec![0u8; 7]));
         w.pump().expect("pump");
         assert_eq!(w.next_event(), None);
     }
 
-    /// Input for **another** window on the same connection is not delivered to this one.
-    ///
-    /// This is the whole reason `KeyEvent` and `PointerEvent` gained a window id (M6 C3). A
-    /// session can hold several windows — a popup is created on its parent's connection — and
-    /// until now these two records carried nothing to tell them apart, so every window on a
-    /// connection received every keystroke and every click that arrived on it. With one window
-    /// per connection that was invisible; with a menu open it means a click on the menu is also
-    /// handed to the window underneath, and both act on it.
     #[test]
     fn input_for_another_window_on_the_same_session_is_not_delivered_here() {
         let mut w = window(2);
         let mine = w.id();
         let other = mine + 1;
 
-        // Two records for a sibling window, then one for this one.
         w.s.transport.queue_key_for(other, 30, true, 0);
         w.s.transport.queue_pointer_for(other, POINTER_MOTION, 1, 2);
         w.s.transport.queue_key_for(mine, 31, true, 0);
@@ -1792,8 +1344,6 @@ mod tests {
         assert_eq!(w.pump().expect("pump"), 2);
 
         assert_eq!(w.next_event(), Some(WindowEvent::Key(KeyEvent::new(w.id(), 30, 1, MOD_SHIFT))));
-        // Signed coordinates survive the round trip — an unsigned read here is the
-        // "pointer teleports on a leftward drag" bug, one layer further out.
         assert_eq!(
             w.next_event(),
             Some(WindowEvent::Pointer(PointerEvent {
@@ -1809,15 +1359,12 @@ mod tests {
 
     #[test]
     fn input_arriving_while_blocked_for_a_buffer_is_queued_not_lost() {
-        // The ordinary case, not a corner: a client renders, commits, and blocks — which is
-        // exactly when the user is looking at the result and typing into it.
         let mut w = window(2);
         let b = w.acquire().expect("a free buffer");
         w.commit(b, (0, 0, 64, 32)).expect("commit");
         let b2 = w.acquire().expect("the other buffer");
         w.commit(b2, (0, 0, 64, 32)).expect("commit");
 
-        // Nothing free. The compositor sends a keystroke *and* the release during the block.
         w.s.transport.queue_key(31, true, 0);
         w.s.transport.deferred.push({
             let mut bb = [0u8; 8];
@@ -1835,17 +1382,12 @@ mod tests {
 
     #[test]
     fn a_release_arriving_while_waiting_for_input_is_not_discarded() {
-        // The mirror of the case above, and the one a naive `wait_event` gets wrong by
-        // ignoring anything that is not input — which strands the buffer forever.
         let mut w = window(2);
         let b = w.acquire().expect("free");
         w.commit(b, (0, 0, 64, 32)).expect("commit");
         assert!(w.buffers().iter().find(|x| x.id == b).unwrap().busy);
 
-        // Both arrive **during the block**, release first. Queuing the release up front
-        // instead would have `pump` consume it before `wait_event` ever blocks — which is
-        // how a first version of this test passed against a `wait_event` that discarded
-        // releases outright.
+        // Queued up front, `pump` would consume the release before `wait_event` blocks.
         let wid = w.id();
         w.s.transport.deferred.push({
             let e = KeyEvent::new(wid, 1, 1, 0);
@@ -1872,13 +1414,10 @@ mod tests {
         w.pump().expect("pump");
         assert_eq!(w.events_pending(), EVENT_QUEUE_MAX);
 
-        // The marker comes first, so a client resets what it believed *before* applying
-        // what survived.
         assert_eq!(w.next_event(), Some(WindowEvent::InputLost));
         let Some(WindowEvent::Key(k)) = w.next_event() else { panic!("a key") };
         assert_eq!(k.keycode, 3, "the three oldest went, not the three newest");
 
-        // And it is announced once, not on every subsequent drain.
         while let Some(e) = w.next_event() {
             assert_ne!(e, WindowEvent::InputLost);
         }
@@ -1886,8 +1425,6 @@ mod tests {
 
     #[test]
     fn the_newest_event_is_the_one_kept() {
-        // Dropping the newest would leave a client acting on a stale button state forever;
-        // dropping the oldest only costs it history it is already behind on.
         let mut w = window(2);
         for i in 0..(EVENT_QUEUE_MAX as u16 + 1) {
             w.s.transport.queue_key(i, true, 0);

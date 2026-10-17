@@ -1,21 +1,8 @@
 //! The compositor's window model — the stack, roles and struts, commits, and compositing.
 //!
-//! **No syscalls in here.** This is the same split `fs-server-ext4` uses for its ext4
-//! parser and `nxsh` for its evaluator: the logic that decides *what the screen should
-//! look like* is a pure function of the window stack, and the parts that touch the OS
-//! (IPC, mapped buffers, `/dev/draw`) live in the server bin. Compositing is asserted
-//! pixel-exactly on the host in milliseconds rather than through a 90-second boot.
-//!
-//! Pixels come in through [`BufferSource`] rather than being owned here. In the server
-//! those bytes are a `MemoryObject` the client drew into and shared **once**; owning them
-//! would mean a copy per frame and would defeat the shared-memory design the substrate
-//! doc chose (`docs/design/display-substrate.md` §4).
-//!
-//! ## Scope
-//!
-//! Plan Milestone 2 Part A. Window creation, buffer attachment, commit, release, destroy,
-//! and stacking — plus roles and struts, which land here rather than later because
-//! "retrofitting a role into a shipped protocol touches every client".
+//! No syscalls in here: what the screen should look like is a pure function of the window
+//! stack, so compositing is asserted pixel-exactly on the host. The parts that touch the OS
+//! (IPC, mapped buffers, `/dev/draw`) live in the server bin.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -40,9 +27,6 @@ use librsproto::surface::{
 };
 
 /// Where a window's pixels are, for a given (window, buffer) pair.
-///
-/// The seam that keeps this crate free of syscalls. Tests back it with owned vectors; the
-/// server backs it with mapped shared memory.
 pub trait BufferSource {
     /// The bytes of `buffer` on `window`, or `None` if it is not mapped here.
     fn pixels(&self, window: u32, buffer: u32) -> Option<&[u8]>;
@@ -58,13 +42,6 @@ pub struct AttachedBuffer {
 }
 
 /// The smallest rectangle containing both.
-///
-/// A local copy rather than `libui::damage::union`: `libui` is a sibling of this crate and
-/// neither may depend on the other, and a rectangle union in `libdraw` would be the third
-/// place to look for one. Six lines.
-///
-/// Lives here rather than in `server` because [`WindowStack::place`] returns a union too — the
-/// move damage — and a second copy one module away is how the two would come to disagree.
 pub fn union(a: Rect, b: Rect) -> Rect {
     if a.size.w == 0 || a.size.h == 0 {
         return b;
@@ -81,16 +58,8 @@ pub fn union(a: Rect, b: Rect) -> Rect {
 
 /// A region that must be repainted, returned by the mutations that create one.
 ///
-/// **A newtype purely so it cannot be dropped in silence.** `#[must_use]` on `place` itself is
-/// not enough and the difference matters: `stack.place(id, p)?` *uses* the `Result`, so the
-/// attribute is satisfied and the `Rect` falls on the floor with no diagnostic — which is exactly
-/// how the M5 bug would come back through the API built to prevent it (PR #196 review, finding
-/// 3). The attribute has to be on the thing that survives the `?`.
-///
-/// A **zero-sized** damage is this crate's "nothing changed", the same thing
-/// `Outcome::Applied { dirty: Some(empty) }` means and distinct from its `None`, which means "I
-/// cannot name what changed, repaint everything". [`union`] treats it as the identity, so a
-/// caller folding one into a wider region gets the right answer without a special case.
+/// A newtype so it cannot be dropped in silence: `#[must_use]` on `place` is satisfied by `?`.
+/// A zero-sized damage means "nothing changed"; [`union`] treats it as the identity.
 #[must_use = "a move's damage must be repainted, or the window's old pixels stay on screen"]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Damage(pub Rect);
@@ -109,13 +78,8 @@ impl Damage {
 
 /// One thing a window says it can take a drop of — `Surface::DeclareAcceptor`.
 ///
-/// **A name and a set of kinds, and no rectangle.** Where on the window a drop is allowed is the
-/// client's to decide from the point the event carries (M10 decision 3), so the compositor holds
-/// only what it needs to answer "would this window take this drag?" while the pointer moves.
-///
-/// The name is what a [`Dropped`](librsproto::surface::OP_DROPPED) says it landed on — and what
-/// a port will address when ports arrive, which is decision 2's whole point in keeping this a
-/// name rather than an index.
+/// A name and a set of kinds, no rectangle: where a drop is allowed is the client's to decide
+/// from the point the event carries. The name is what a `Dropped` says it landed on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Acceptor {
     /// What the client calls it.
@@ -141,93 +105,56 @@ pub struct Window {
     pub committed: Option<u32>,
     /// What the client called this window, or empty if it never said.
     ///
-    /// **Stored here rather than derived**, because only the client knows it and only a
-    /// manager wants it — the compositor itself never draws a title. Bounded at
-    /// [`MAX_TITLE`](librsproto::surface::MAX_TITLE) on the way in, so a window's cost stays
-    /// finite however chatty its client is.
+    /// Only a manager reads it; bounded at [`MAX_TITLE`](librsproto::surface::MAX_TITLE) on the way
+    /// in.
     pub title: alloc::string::String,
     /// Whether this window's first `Configure` has been sent to its client.
     ///
-    /// **A window is not composited until it has been configured** — M6 B4. The client is
-    /// obliged to wait for its first `Configure` before committing, so a well-behaved one
-    /// cannot reach the screen early anyway; this flag is what makes that an enforced ordering
-    /// rather than a convention, and it is the gate a manager's window of opportunity is built
-    /// from. Set by [`mark_configured`](WindowStack::mark_configured).
+    /// A window is not composited until it has been: this makes the client's obligation to wait for
+    /// it an enforced ordering. Set by [`mark_configured`](WindowStack::mark_configured).
     pub configured: bool,
     /// Which desktop this window is on; [`STICKY_DESKTOP`] means all of them.
     ///
-    /// Set to the stack's current desktop at creation, and changed only by a manager. **The
-    /// compositor holds the attribute and nothing else about desktops** — no list, no names,
-    /// no lifecycle. Which desktops exist is the desktop shell's, which is what keeps the two
-    /// from being able to disagree.
+    /// Changed only by a manager. The compositor holds the attribute and nothing else about
+    /// desktops.
     pub desktop: u32,
     /// Hidden without leaving its desktop.
     ///
-    /// **A separate attribute rather than a reserved `desktop` value**, because a minimized
-    /// window is still *on* its desktop: it restores there and it belongs in that desktop's
-    /// window list. Folding the two would make restoring a guess about where it came from.
+    /// Not a reserved `desktop` value: a minimized window is still on its desktop and restores
+    /// there.
     pub minimized: bool,
     /// What this window says it takes when something is dropped on it.
     ///
-    /// **Per window, not per session**, which is what makes "cleared with the window" free: a
-    /// client that destroys and recreates a window declares again, and nothing here outlives
-    /// the thing it describes. Bounded at
-    /// [`MAX_ACCEPTORS`](librsproto::surface::MAX_ACCEPTORS) for the reason the title is
-    /// bounded: it arrives off the wire and is held for the window's life (M10 Part E).
+    /// Per window, so it is cleared with the window; bounded at
+    /// [`MAX_ACCEPTORS`](librsproto::surface::MAX_ACCEPTORS) as it arrives off the wire.
     pub acceptors: Vec<Acceptor>,
-    /// The last state this window's client asked the manager for.
-    ///
-    /// **Only to tell a repeat from a change.** The compositor does not act on a state request
-    /// and does not know whether a window is maximised — that is a rectangle the manager
-    /// restores from, and a second copy here could disagree with it. What it does know is what
-    /// was last *asked*, which is enough to keep a looping client off a bounded queue.
+    /// The last state its client asked the manager for; only to tell a repeat from a change.
     pub state_requested: Option<u32>,
     /// The shadow this window casts — what its role casts in the stack's current scheme.
     ///
-    /// **Stored, so the scheme reaches every reader of it without passing through each one.**
-    /// Damage is computed from [`painted_bounds`](Window::painted_bounds) in a dozen places and
-    /// compositing reads the shadow in one; a scheme argument threaded through all of them would
-    /// be a dozen chances to pass the wrong one. Written in exactly two places —
-    /// [`create`](WindowStack::create) and [`set_scheme`](WindowStack::set_scheme) — and a test
-    /// holds every window to [`shadow_for`] after a change.
+    /// Stored so the scheme reaches every reader without being threaded through each; written only
+    /// by [`create`](WindowStack::create) and [`set_scheme`](WindowStack::set_scheme).
     pub shadow: Option<Shadow>,
 }
 
 impl Window {
     /// Whether this window is on screen when `current` is the current desktop.
     ///
-    /// **The one predicate for "on screen", and the reason it is a method.** Compositing,
-    /// focus and hit-testing each need it, and until M8 Part A two of them carried their own
-    /// copy of the `configured` half. A fourth site that forgets a clause is precisely how a
-    /// window becomes invisible but still clickable, which is the bug this part was most
-    /// likely to ship (`display-arm-plan.md`, M8 Part A).
-    ///
-    /// It deliberately says nothing about *whether there is anything to draw* — a window with
-    /// no committed buffer is on screen and empty. Compositing skips it a step later, because
-    /// "has pixels" is a different question from "is visible", and hit-testing wants the
-    /// window that is there rather than the one that has drawn.
+    /// The one predicate for "on screen", shared by compositing, focus and hit-testing so no site
+    /// can forget a clause and leave a window invisible but clickable. It says nothing about
+    /// whether there is anything to draw: a configured window with no buffer is on screen.
     pub fn visible_on(&self, current: u32) -> bool {
         self.configured && !self.minimized && (self.desktop == STICKY_DESKTOP || self.desktop == current)
     }
 }
 
-/// The shadow an ordinary window and a menu cast (M13 Part C) — in the scheme the manager last
-/// named, since the desktop refresh's Part A.
-///
-/// **One shadow, not a per-role palette.** A menu wants a tighter one than a window on most
-/// desktops, and that is a refinement with no request behind it; a second set of numbers here
-/// would be two things to keep looking like each other.
-///
-/// The numbers live in `libdraw` because `check-display` needs them too — it renders what the
-/// screen should show and compares the guest against it, so a window's shadow has to be computed
-/// on both sides from one source. Which *roles* cast one is the decision that stays here.
+/// The shadow an ordinary window and a menu cast, in the scheme the manager last named.
 use libdraw::theme::{Scheme, window_shadow};
 
 /// The shadow `role` casts in `scheme`, if it casts one.
 ///
-/// **Panels do not.** A bar is docked to a screen edge and a wallpaper *is* the ground; a shadow
-/// on either is a dark band along the edge of the screen with nothing above it to cast one. The
-/// three that do are the three that float: an application window, a menu, and a dialog.
+/// Panels do not: a bar is docked to a screen edge and a wallpaper is the ground. The three
+/// that float do: an application window, a menu, and a dialog.
 pub const fn shadow_for(role: Role, scheme: Scheme) -> Option<Shadow> {
     match role {
         Role::Normal | Role::Popup { .. } | Role::Dialog { .. } => Some(window_shadow(scheme)),
@@ -237,15 +164,7 @@ pub const fn shadow_for(role: Role, scheme: Scheme) -> Option<Shadow> {
 
 /// The radius a window of `role` at `bounds` is cut to, on a screen `screen`: [`corner_for`]'s,
 /// unless the window covers the whole screen, when it is square.
-///
-/// **Because a screen-sized window's corners are the screen's**, and there is nothing beside them
-/// for a curve to show. The overview is exactly that — a `Popup` the size of the screen — and the
-/// first version of this rounded it, on the claim that its corners sat under the shell's two bars
-/// and so showed nowhere. They sit *over* them: the overview is created after the bars and never
-/// lowered beneath them, and it dims the whole screen, bars included, so each cut corner showed a
-/// notch of undimmed bar — measured on a screendump by the PR #313 review. A rule about the
-/// screen's shape, rather than about the overview, is what stops the next full-screen surface
-/// from doing the same.
+/// A screen-sized window's corners are the screen's; rounding the overview notched the dimmed bars.
 pub fn corner_of(role: Role, bounds: Rect, screen: Rect) -> u32 {
     let covers = bounds.origin.x <= screen.origin.x
         && bounds.origin.y <= screen.origin.y
@@ -254,18 +173,12 @@ pub fn corner_of(role: Role, bounds: Rect, screen: Rect) -> u32 {
     if covers { 0 } else { corner_for(role) }
 }
 
-/// The radius `role`'s corners are cut to (desktop refresh, Part B).
+/// The radius `role`'s corners are cut to.
 ///
-/// **The roles that float, as for the shadow, and for the same reason**: a window, a menu and a
-/// dialog are shapes over the desktop, and a bar is docked to the screen's edge, where a rounded
-/// corner is a notch of wallpaper beside it. The radius is `libdraw`'s compiled
-/// [`WINDOW_RADIUS`](libdraw::corner::WINDOW_RADIUS), because the window's own toolkit draws its
-/// border along the same curve and the two must not disagree by a crescent.
-///
-/// **A window that covers the whole screen is not rounded** — see [`corner_of`], which is what
-/// compositing asks. A maximised window *is* rounded: it fills the work area, not the screen, and
-/// the compositor does not know a window is maximised (the manager does), so a rule that needed
-/// to would be a second copy of that state.
+/// The floating roles, as for the shadow. The radius is `libdraw`'s compiled
+/// [`WINDOW_RADIUS`](libdraw::corner::WINDOW_RADIUS), as the toolkit draws its border on the
+/// same curve. A maximised window is rounded: it fills the work area, not the screen, and the
+/// compositor does not know it is maximised. A full-screen window is square, see [`corner_of`].
 pub const fn corner_for(role: Role) -> u32 {
     match role {
         Role::Normal | Role::Popup { .. } | Role::Dialog { .. } => libdraw::corner::WINDOW_RADIUS,
@@ -277,11 +190,8 @@ impl Window {
     /// Everything this window puts on screen, **its shadow included** — what damage is computed
     /// from.
     ///
-    /// **Deliberately not [`bounds`](Self::bounds)**, and the split is the point. `bounds` is
-    /// where the window *is*: what a click hits, what its client is told its geometry is, what
-    /// covers the background. This is what repainting has to cover. One rectangle serving both
-    /// would make the shadow clickable and would tell a client it is sixteen pixels bigger than
-    /// it asked to be.
+    /// Not [`bounds`](Self::bounds), which is where the window *is*: what a click hits and what its
+    /// client is told its geometry is. One rectangle for both would make the shadow clickable.
     pub fn painted_bounds(&self) -> Rect {
         match self.shadow {
             Some(sh) => sh.around(self.bounds()),
@@ -313,92 +223,30 @@ pub enum StackError {
     BadGeometry,
     /// A buffer id already attached to this window **and currently on screen**.
     ///
-    /// Re-attaching an id is how a client resizes (M9 Part D) — it replaces the pixels behind
-    /// that id — and the one buffer it may not do that to is the committed one, whose pixels
-    /// the compositor is reading. Replacing that would change what is on screen without a
-    /// commit, which is the tearing case the whole buffer protocol exists to make
-    /// unrepresentable.
+    /// Re-attaching an id is how a client resizes, but replacing the committed buffer's pixels
+    /// would change the screen without a commit: the tearing the buffer protocol exists to prevent.
     DuplicateBuffer,
     /// This connection already holds [`MAX_WINDOWS_PER_CONNECTION`] windows.
     TooManyWindows,
     /// [`STICKY_DESKTOP`] was given where a real desktop was required.
     StickyIsNotADesktop,
-    /// This window already holds [`MAX_ACCEPTORS`](librsproto::surface::MAX_ACCEPTORS)
-    /// acceptors.
-    ///
-    /// **Refused rather than evicting the oldest**, which is the difference between a bounded
-    /// table and a lossy one: dropping an acceptor a client still believes in would stop the
-    /// window taking a drag it says it takes, silently and much later.
+    /// This window already holds [`MAX_ACCEPTORS`](librsproto::surface::MAX_ACCEPTORS) acceptors.
     TooManyAcceptors,
-    /// That window is being dragged by the user, so a manager may not place it.
-    ///
-    /// **Refused rather than silently overridden.** A `Place` that landed mid-drag would move the
-    /// window out from under the pointer and be undone by the next motion event a moment later,
-    /// so a manager that raced a drag would appear to work and fight the pointer. Refusing gives
-    /// it an answer it can act on (M9 Part A).
+    /// That window is being dragged by the user, so a manager may not place it (it would be
+    /// undone).
     Dragging,
 }
 
 /// How many windows one connection may hold at once.
 ///
-/// **Bounded because everything else here is** — the outbox at 32, the manager's at 512,
-/// sessions at `MAX_WAIT_HANDLES - 3`. Until M6 C3 the *API* was the bound: `libsurface`'s
-/// `Window` owned its transport, so a well-behaved client held one window per connection and
-/// nothing needed a number. A session type removes that accident, so the limit becomes a real
-/// one rather than an emergent one.
-///
-/// 64 is far above any honest use — a window, its menu, that menu's submenus and a dialog or
-/// two — and far below what would let one client exhaust the compositor's memory. Sequential
-/// churn is unaffected: `ui-testclient` opens 128 windows in a row and destroys each before the
-/// next, so it never holds more than one.
+/// Bounded like everything else here; 64 is far above honest use (a window, its menus and a
+/// dialog) and far below what would exhaust memory. Sequential churn is unaffected.
 pub const MAX_WINDOWS_PER_CONNECTION: usize = 64;
 
 /// The pointer sprite: a plain arrow, `CURSOR_W × CURSOR_H`.
 ///
-/// **One fixed shape, not a protocol.** Per-client cursors — an I-beam over a terminal grid,
-/// a resize arrow on an edge — are a Surface addition and are deliberately not in this
-/// milestone ([`widget-toolkit.md`](../architecture/widget-toolkit.md) §9.3); a single arrow is what
-/// makes a menu usable by a person, which is Part C's bar.
-///
-/// Two colours so it is visible against both: `#` is the body, `.` the outline, ` ` is
-/// transparent. Drawn from a string because a bitmap you can read is a bitmap you can fix.
-/// **The tail leaves the head while the head is still wide** (M14 Part F), which is the whole of
-/// the redraw. The previous sprite cut the barb back to five columns and then ran a *two*-pixel
-/// diagonal away from it: two pixels stepping one column per row is a staircase, and against an
-/// eight-pixel head it read as a second, smaller shape hanging off the first at an odd angle —
-/// reported as "the tail is at a crooked angle", 2026-09-03. Three pixels, and a barb one column
-/// later, keeps the silhouette continuous.
-///
-/// Rendered magnified to choose it, against three alternatives, rather than judged by reading
-/// rows: a 2-versus-3-pixel diagonal is not a difference anyone can see in a string literal.
-/// **The triangle is MATE's; the tail is MATE's slope with more pixels spent on it.**
-///
-/// The head was measured off MATE's pointer — a screenshot the maintainer supplied, 2026-09-01
-/// 10-51-25, over "Create Document" — by classifying its dark pixels, which is
-/// background-independent where a fill test is not. Vertical left edge, 45-degree right edge,
-/// barb at about 63% of the height. That part is unchanged and should stay unchanged.
-///
-/// **What took four more attempts was the tail, and two things were wrong with it.**
-///
-/// *The slope.* Every earlier version ran the tail at 45 degrees — one column per row — so it
-/// splayed away from the head twice as fast as MATE's, which advances **one column per two rows**.
-///
-/// *The border.* Once the slope was right the tail still read as leaning left, and the reason is
-/// visible only at magnification: the leg's fill and the tail's fill were **one** column apart, so
-/// a single outline pixel served as the right border of one and the left border of the other. The
-/// tail was fused to the leg on that side and free on the other. They are two columns apart now,
-/// so each keeps its own border — which is what the extra row of height buys, and the whole of
-/// why the sprite is 12x17 rather than 12x16.
-///
-/// The tail is **two pixels of fill wide**. Three were tried first, on the theory that a
-/// two-pixel diagonal staircases visibly — but with the borders no longer shared it reads cleanly
-/// at two, and three sat heavy beside the head.
-///
-/// **The last few pixels were chosen by the maintainer**, not argued into place, using
-/// `tools/build-cache/cursor-sprite.py`: edit the art, get a magnified render and the literal
-/// below. Four rounds of description had converged slowly; handing over the loop finished it in
-/// three. That is the note worth keeping — when the judgement is somebody else's, the useful
-/// thing to build is not a better guess, it is the loop they can turn themselves.
+/// `#` is the body, `.` the outline, ` ` transparent. One fixed shape, not a protocol.
+/// `tools/build-cache/cursor-sprite.py` renders edits to it magnified.
 const CURSOR: [&str; CURSOR_H as usize] = [
     ".",
     "..",
@@ -426,31 +274,17 @@ pub const CURSOR_H: u32 = 17;
 
 /// The cursor's fill colour (`#` in the sprite).
 ///
-/// **From the shared theme since M11 Part B**, which is what "one theme the shell, the toolkit
-/// and the decorations share" actually meant: this crate does not link `libui` and should not —
-/// a compositor with opinions about widgets is the wrong shape — so the value lives in
-/// `libdraw`, which both link. A `const fn` constructor is what keeps these constants.
-///
-/// **Compiled in, and that is the one thing the theme *file* does not reach** (M11 decision 1). The
-/// compositor is started by `service-mgr` rather than by the session, so it never sees the setup
-/// record a theme is handed on. Named rather than skipped; the trigger for changing it is a control
-/// panel that wants to restyle the cursor or the drop highlight, and the mechanism would be a
-/// manager op on a channel the shell already holds.
+/// From the shared theme in `libdraw`; compiled in, as the compositor never sees the theme record.
 pub const CURSOR_BODY: Rgb = Theme::light().cursor_body;
 /// The cursor's outline colour (`.` in the sprite), so it stays visible against white.
 pub const CURSOR_OUTLINE: Rgb = Theme::light().cursor_outline;
 
-/// The rectangle a cursor at `at` occupies.
-///
-/// The hotspot is the **top-left**, which is where an arrow points; a cursor whose hotspot is
-/// its centre clicks half a sprite away from where it looks like it is pointing.
+/// The rectangle a cursor at `at` occupies; the hotspot is the top-left.
 pub fn cursor_rect(at: Point) -> Rect {
     Rect::new(at.x, at.y, CURSOR_W, CURSOR_H)
 }
 
-/// Draw the pointer sprite at `at`, clipped to `clip`.
-///
-/// Composited **after** the window stack, because a cursor under a window is not a cursor.
+/// Draw the pointer sprite at `at`, clipped to `clip`, after the window stack is composed.
 pub fn draw_cursor<F: Framebuffer + ?Sized>(fb: &mut F, at: Point, clip: Rect) {
     for (row, line) in CURSOR.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
@@ -461,8 +295,7 @@ pub fn draw_cursor<F: Framebuffer + ?Sized>(fb: &mut F, at: Point, clip: Rect) {
             };
             let x = at.x.saturating_add(col as i32);
             let y = at.y.saturating_add(row as i32);
-            // Clipped by the caller's rectangle *and* by the buffer: a cursor at the screen
-            // edge is the ordinary case, not an error, and it must not wrap to the far side.
+            // Clipped by the rectangle and the buffer: at the screen's edge it must not wrap.
             if x >= 0 && y >= 0 && clip.contains(x, y) {
                 fb.put_pixel(x as u32, y as u32, colour);
             }
@@ -474,21 +307,10 @@ pub fn draw_cursor<F: Framebuffer + ?Sized>(fb: &mut F, at: Point, clip: Rect) {
 pub const OUTLINE_W: u32 = 2;
 
 /// The outline's colour — bright enough to read over any client's pixels.
-///
-/// One colour for all three things an outline marks — a resize, a snap preview, a drop target —
-/// which is a decision deferred rather than taken: what a drop target should look like as
-/// distinct from a resize is a question for M11's polish passes.
 pub const OUTLINE_COLOUR: Rgb = Theme::light().outline;
 
-/// The four edge strips of `rect`, which is what an outline occupies.
-///
-/// **Strips rather than the rectangle**, because this is what gets repainted per pointer motion.
-/// The union of an outline's old and new rectangles is very nearly the window, and repainting
-/// that under emulation is the ~100 ms full recompose that starves input — the failure this
-/// milestone has already met twice. Four thin bands are a few thousand pixels whatever the
-/// window's size.
-///
-/// Empty strips are returned as-is; the compositor's damage handling already skips them.
+/// The four edge strips of `rect`, which is what an outline occupies; strips because it is
+/// repainted per pointer motion and a full recompose starves input.
 pub fn outline_edges(rect: Rect) -> [Rect; 4] {
     let t = OUTLINE_W.min(rect.size.h.max(1));
     let side = OUTLINE_W.min(rect.size.w.max(1));
@@ -501,11 +323,6 @@ pub fn outline_edges(rect: Rect) -> [Rect; 4] {
 }
 
 /// Draw the interactive-resize outline at `rect`, clipped to `clip`.
-///
-/// **Over the composed stack, like the cursor**, and for the same reason: it is not a window. It
-/// has no client, no buffer, no place in the stacking order and nothing can cover it — a
-/// preview of a rectangle the user has not committed to yet. Decision 1 of Milestone 9 refuses
-/// chrome the compositor has to lay out and style; an outline has neither.
 pub fn draw_outline<F: Framebuffer + ?Sized>(fb: &mut F, rect: Rect, clip: Rect) {
     for strip in outline_edges(rect) {
         let Some(r) = strip.intersect(&clip) else { continue };
@@ -520,34 +337,20 @@ pub fn draw_outline<F: Framebuffer + ?Sized>(fb: &mut F, rect: Rect, clip: Rect)
 }
 
 /// How long a key must be held before it starts repeating, in nanoseconds.
-///
-/// Policy with no configuration surface yet. Both constants are what a settings service will
-/// eventually own; until there is one, they are named here rather than spelled inline so the
-/// eventual move is a change of provenance.
 pub const REPEAT_DELAY_NS: u64 = 400_000_000;
 
 /// How long between repeats once they start, in nanoseconds.
 pub const REPEAT_INTERVAL_NS: u64 = 40_000_000;
 
-/// A key held down, and when it next repeats.
-///
-/// **Compositor-side rather than per-client**, because the compositor knows which window has
-/// focus and can therefore stop a repeat when focus moves, with no client involvement. The
-/// alternative is Wayland's — publish a rate and let every client run its own timer — which
-/// is better when clients disagree about what should repeat, a distinction nothing here makes
-/// yet, and costs every client a timer and a state machine
-/// ([`widget-toolkit.md`](../architecture/widget-toolkit.md) §9.2).
+/// A key held down, and when it next repeats; compositor-side so a repeat stops when focus moves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Repeat {
     /// The keycode being repeated.
     pub keycode: u16,
-    /// Modifiers held when it went down.
-    ///
-    /// Frozen at the press rather than re-read: a repeat is that press continuing, so
-    /// releasing shift mid-repeat must not turn `A` into `a` halfway through a run.
+    /// Modifiers held when it went down, frozen so releasing shift mid-repeat does not turn `A`
+    /// into `a`.
     pub modifiers: u16,
-    /// The locks on when it went down (Phase 6 Part B.5), frozen for the same reason: a run of `A`
-    /// under Caps Lock stays `A` whatever happens to the lock mid-run.
+    /// The locks on when it went down, frozen for the same reason.
     pub locks: u16,
     /// The window it is going to.
     pub window: u32,
@@ -561,26 +364,19 @@ impl Repeat {
         Self { keycode, modifiers, locks, window, next_at: now.saturating_add(REPEAT_DELAY_NS) }
     }
 
-    /// **The `KeyEvent` each repeat sends**: the key, `KEY_REPEAT`, and the modifiers and locks it
-    /// went down with.
+    /// The `KeyEvent` each repeat sends: the key, `KEY_REPEAT`, and its modifiers and locks.
     pub fn event(&self) -> librsproto::surface::KeyEvent {
         librsproto::surface::KeyEvent::new(self.window, self.keycode, librsproto::surface::KEY_REPEAT, self.modifiers)
             .with_locks(self.locks)
     }
 
     /// Whether a repeat is due at `now`; advances to the next one if so.
-    ///
-    /// **Advances by adding an interval to the deadline, not to `now`.** Adding to `now`
-    /// makes every late wake-up push the next repeat further out, so a busy compositor
-    /// repeats slower and slower — and the tick that wakes this is 10 ms, so late is the
-    /// normal case rather than the exception.
     pub fn due(&mut self, now: u64) -> bool {
         if now < self.next_at {
             return false;
         }
         self.next_at = self.next_at.saturating_add(REPEAT_INTERVAL_NS);
-        // A wake-up long after the deadline — a stalled compositor, or a debugger — must not
-        // then fire a burst catching up on repeats nobody asked for.
+        // A long stall must not fire a burst catching up on repeats.
         if self.next_at <= now {
             self.next_at = now.saturating_add(REPEAT_INTERVAL_NS);
         }
@@ -589,21 +385,8 @@ impl Repeat {
 
     /// The repeat state after a key transition — arm, disarm, or leave alone.
     ///
-    /// **Here rather than in the server loop**, for the reason [`focus_transition`] gives
-    /// below and finding 2 of PR #185's review proved: the arming *decision* is a function of
-    /// values, the server loop that held it needs syscalls to reach, and the two bugs it
-    /// carried were both decisions rather than plumbing. `Repeat::due` was host-tested from
-    /// the start and was correct; what was not tested was when a repeat starts.
-    ///
-    /// - **A modifier never arms and never disturbs.** Modifiers are ordinary
-    ///   [`Logical::Key`](libinput::Logical::Key) transitions, so an unqualified arm made
-    ///   holding Ctrl send 25 `KEY_REPEAT`s a second — and since there is one slot, pressing
-    ///   Shift while `a` was held replaced `a`'s repeat, after which releasing Shift cleared
-    ///   it and the still-held `a` never repeated again.
-    /// - **Only the repeating key's own release disarms**, which is the same rule from the
-    ///   other side: a repeat outlives any modifier moving under it.
-    /// - **A press with no focus candidate disarms**, rather than leaving the previous key
-    ///   repeating into a window that is no longer focused.
+    /// A modifier or lock key never arms and never disturbs; only the repeating key's own release
+    /// disarms; a press with no focus candidate disarms.
     pub fn after_key(
         current: Option<Repeat>,
         keycode: u16,
@@ -613,8 +396,6 @@ impl Repeat {
         focus: Option<u32>,
         now: u64,
     ) -> Option<Repeat> {
-        // **A lock key neither**: Caps Lock held is not a key to type 25 times a second (Phase 6
-        // Part B.5).
         if libinput::is_modifier(keycode) || libinput::is_lock_key(keycode) {
             return current;
         }
@@ -629,15 +410,8 @@ impl Repeat {
 
 /// The `(lost, gained)` pair a focus change implies, or `None` if focus did not move.
 ///
-/// **The comparison is the whole point.** `focus_candidate` is recomputed after anything that
-/// *could* move focus — a create, a destroy, a raise, a session closing — and most of those
-/// do not move it. Announcing unconditionally would send a `FocusEvent` on every one of them,
-/// which for a client means a stream of messages saying nothing changed, on the same bounded
-/// queue its input arrives on.
-///
-/// Pure, and here rather than in the server, because "did focus change" is a question about
-/// two values and the boot gate can only observe that *a* focus event arrived — not that
-/// exactly one did (PR #183's lesson, applied before the review).
+/// `focus_candidate` is recomputed after anything that could move focus and most do not;
+/// announcing unconditionally would flood a client's bounded queue with no-change events.
 pub fn focus_transition(prev: Option<u32>, now: Option<u32>) -> Option<(Option<u32>, Option<u32>)> {
     (prev != now).then_some((prev, now))
 }
@@ -648,58 +422,29 @@ pub struct WindowStack {
     next_id: u32,
     /// Every id that has left the stack since the last [`take_removed`](Self::take_removed).
     ///
-    /// **A log rather than a return value because one destroy can remove several windows and
-    /// two different callers trigger it.** `DestroyWindow` and a client disconnecting both end
-    /// up in [`destroy`](Self::destroy), and a manager owed a `WindowDestroyed` event needs
-    /// both. Threading an out-param through `dispatch` would put it in the signature of every
-    /// op that cannot remove anything; recording it where the removal happens does not.
-    ///
-    /// The bin drains this after every dispatch whether or not a manager is attached, so it
-    /// holds at most one call's worth and cannot grow while nobody is listening.
+    /// A log because one destroy can remove several windows; the bin drains it every dispatch.
     removed_log: Vec<u32>,
     /// Every id whose [`bounds`](Window::bounds) changed since the last
     /// [`take_geometry_changes`](Self::take_geometry_changes).
     ///
-    /// **Recorded where bounds change, not where a request is dispatched.** A window's
-    /// on-screen rectangle moves for more than one reason — a manager `Place`, and a client
-    /// committing a buffer of a different size — and `WindowGeometry` promises to report it
-    /// *for any reason*. Emitting from the one op the feature was written for is how the
-    /// commit case silently goes unreported, leaving a manager to poll `/dev/draw/<id>/info`
-    /// for the thing this event exists to save it from (PR #217 review, finding 2).
-    ///
-    /// **Including the changes a manager caused itself.** A manager that had to remember which
-    /// moves were its own would be keeping a second copy of the stack, which is the duplicate
-    /// state this event exists to make unnecessary.
-    ///
-    /// Drained like [`removed_log`](Self::removed_log), and for the same reason.
+    /// Recorded where bounds change, whether by a manager `Place` or a client's commit.
     geometry_log: Vec<u32>,
     /// Which desktop is composited. Never [`STICKY_DESKTOP`] — see [`Self::set_current_desktop`].
     current_desktop: u32,
     /// Which scheme the compositor's own drawing follows — today, only how dark a shadow is.
     ///
-    /// **Told, never read**: the compositor is started by `service-mgr` and never sees a theme file
-    /// (M11 decision 1), so the shell, which read one, says which scheme it named with the
-    /// manager's `SetScheme`. Light until then, which is what the built-in theme is and what a
-    /// session with no shell — every self-test boot — keeps.
+    /// Told, never read: the compositor never sees a theme file, so the shell says which scheme it
+    /// named via `SetScheme`. Light until then, as in a session with no shell.
     scheme: Scheme,
     /// The window the user is interactively dragging, and where it was when the drag began.
     ///
-    /// **Here rather than in the router, because two paths need it.** The router runs the drag;
-    /// the *manager* path has to refuse a `Place` for a window being dragged, and it never sees
-    /// the router. The stack is what both of them already hold.
-    ///
-    /// The origin is kept so that [`end_drag`](Self::end_drag) can tell a gesture that moved the
-    /// window from one that did not.
+    /// Here because the manager path must refuse a `Place` for it and never sees the router.
     dragging: Option<(u32, Point)>,
 }
 
 impl Default for WindowStack {
-    /// Delegates to [`WindowStack::new`].
-    ///
-    /// **Not `#[derive(Default)]`.** That would start `next_id` at 0 while `new()` starts
-    /// at 1, so the two constructors would hand out different id spaces — and a client
-    /// using 0 as a "no parent" sentinel would get `Popup { parent: 0 }` *accepted* on a
-    /// derived stack where `new()` returns `NoSuchParent`.
+    /// Delegates to [`WindowStack::new`]; a derive would start `next_id` at 0, not 1, and accept
+    /// `Popup { parent: 0 }`.
     fn default() -> Self {
         Self::new()
     }
@@ -713,9 +458,9 @@ impl WindowStack {
             next_id: 1,
             removed_log: Vec::new(),
             geometry_log: Vec::new(),
-            // **One, not zero.** Zero is `STICKY_DESKTOP`, and a compositor whose current
-            // desktop was the sticky value would composite only sticky windows and make every
-            // window it created afterwards sticky too, by the create-onto-current rule.
+            // One, not zero: zero is `STICKY_DESKTOP`, and a sticky current desktop would make
+            // every new window sticky.
+            // One, not zero: zero is `STICKY_DESKTOP`, which would make every new window sticky.
             current_desktop: 1,
             scheme: Scheme::Light,
             dragging: None,
@@ -733,61 +478,35 @@ impl WindowStack {
     }
 
     /// The window with `id`, mutably.
-    ///
-    /// The read-only [`window`](Self::window) covers every other caller; a title is the first
-    /// thing a request changes on a window without touching geometry or buffers.
     pub fn window_mut(&mut self, id: u32) -> Option<&mut Window> {
         self.windows.iter_mut().find(|w| w.id == id)
     }
 
     /// Create a window and return its id.
-    ///
-    /// A popup or dialog must name a parent that exists — otherwise the compositor would
-    /// be holding a transient window with nothing to be transient to, and stacking it
-    /// would be undefined.
     pub fn create(&mut self, req: &CreateWindowRequest) -> Result<u32, StackError> {
         if let Role::Popup { parent } | Role::Dialog { parent } = req.role
             && self.window(parent).is_none()
         {
             return Err(StackError::NoSuchParent);
         }
-        // **A popup starts where its creator asked, relative to its parent** — the only party
-        // that knows where the menu item it drops from was drawn (M6 C1). Resolved to an
-        // absolute origin once, here: the stack stores absolute origins, and a popup that
-        // tracked its parent would have to be re-placed whenever the parent moved, which is
-        // placement policy — see `TODO(popup-follows-parent)`.
+        // A popup starts where its creator asked, relative to its parent, resolved to an absolute
+        // origin once here; one that tracked its parent would be placement policy:
+        // `TODO(popup-follows-parent)`.
         //
-        // **A `dialog` is not placed this way, though it also names a parent.** Its parent
-        // carries desktop membership and lifetime — not its position (`display-substrate.md`
-        // §4a, `ui-composition-model.md` §6). In placement terms it is an ordinary listed
-        // window that a manager places, exactly like a `normal` — which since M11 Part E batch 8
-        // means it starts where it *asked* rather than at the origin, a preference the manager
-        // then overrides. The arm below says so; this paragraph used to say "lands at the
-        // origin" and was left behind by that change (PR #265 review, finding 3).
+        // A dialog names a parent for desktop membership and lifetime, not position; it is placed
+        // like a `normal` window.
         let origin = match req.role {
-            // **Anywhere its creator asks, at any size, and above the bars** — an application's
-            // popup can cover the whole screen and take the keyboard, which is what a password
-            // prompt must be able to rule out: `TODO(app-covers-panels)`.
+            // Anywhere its creator asks, at any size, above the bars: an application's popup can
+            // cover the whole screen and take the keyboard — `TODO(app-covers-panels)`.
             Role::Popup { parent } => {
-                // The parent is known to exist: checked directly above, and nothing between
-                // here and there can remove it.
                 let base = self.window(parent).expect("checked above").origin;
                 Point::new(base.x.saturating_add(req.offset_x), base.y.saturating_add(req.offset_y))
             }
-            // **A `normal` or `dialog` window starts where it asked, and a manager overrides
-            // it** (M11 Part E batch 8). The configure is *held* until the manager answers, so
-            // with one attached this origin is never seen — placement is still entirely the
-            // manager's. What changes is the case where nobody is managing: the compositor
-            // released such a window at (0, 0) and there was no way for a client to say
-            // otherwise, so the login greeter — which exists precisely so that the thing that
-            // would manage windows can be started — could only ever appear in the corner.
-            //
-            // A preference, not a placement. `CreateWindowRequest::new` asks for (0, 0) and gets
-            // exactly what it always got.
+            // A `normal` or `dialog` window starts where it asked and a manager overrides it: the
+            // configure is held until it answers. Without a manager (the login greeter) it appears
+            // where it asked.
             Role::Normal | Role::Dialog { .. } => Point::new(req.offset_x, req.offset_y),
-            // **A panel is docked, not positioned.** Its `strut` says which edge it reserves
-            // space on, and the shell places it there; an offset here would be a second answer
-            // to a question the role already answers.
+            // A panel is docked, not positioned: its `strut` says which edge it reserves.
             Role::Panel { .. } => Point::new(0, 0),
         };
         let id = self.next_id;
@@ -799,14 +518,11 @@ impl WindowStack {
             size: (req.width, req.height),
             buffers: Vec::new(),
             committed: None,
-            // Created unconfigured, whether or not anyone is going to answer. Whoever sends the
-            // first `Configure` — the compositor at once, or a manager, or the deadline —
-            // marks it, and until then the window exists without being on screen.
+            // Created unconfigured; whoever sends the first `Configure` marks it, and until then
+            // the window is not on screen.
             title: alloc::string::String::new(),
             configured: false,
-            // **Onto the current desktop**, which is what makes "a window is never on no
-            // desktop" true by construction rather than by care: there is no window-exists-
-            // but-is-unassigned moment for anything to have to render.
+            // Onto the current desktop, so no window is ever on no desktop.
             desktop: self.current_desktop,
             minimized: false,
             acceptors: Vec::new(),
@@ -816,11 +532,8 @@ impl WindowStack {
         Ok(id)
     }
 
-    /// Record that `window`'s first `Configure` has gone out, making it compositable.
-    ///
-    /// Idempotent, and returns whether this was the transition. The caller uses that to send
-    /// the record exactly once: a manager may `Place` a pending window and then `Configure` it,
-    /// and the client is owed one initial configure, not two.
+    /// Record that `window`'s first `Configure` has gone out; returns whether this was the
+    /// transition, so the client is owed exactly one.
     pub fn mark_configured(&mut self, window: u32) -> bool {
         match self.windows.iter_mut().find(|w| w.id == window) {
             Some(w) if !w.configured => {
@@ -838,13 +551,8 @@ impl WindowStack {
 
     /// Move `window` to `desktop`; [`STICKY_DESKTOP`] puts it on all of them.
     ///
-    /// Returns whether the window's **visibility** changed, which is what the caller needs to
-    /// decide whether to repaint — moving a window between two desktops that are both not the
-    /// current one changes nothing on screen.
-    ///
-    /// **Any non-zero id is accepted, and zero is an id rather than an error.** This function
-    /// cannot validate a desktop because the compositor does not know which desktops exist;
-    /// that is the desktop shell's, and asking here would be keeping a second copy of it.
+    /// Returns whether the window's visibility changed. Any id is accepted, zero included: which
+    /// desktops exist is the shell's.
     pub fn set_window_desktop(&mut self, window: u32, desktop: u32) -> Result<bool, StackError> {
         let current = self.current_desktop;
         let w = self.windows.iter_mut().find(|w| w.id == window).ok_or(StackError::NoSuchWindow)?;
@@ -862,13 +570,8 @@ impl WindowStack {
         Ok(was != w.visible_on(current))
     }
 
-    /// Switch which desktop is composited. Returns whether it changed.
-    ///
-    /// **`STICKY_DESKTOP` is refused, and it is the only value this validates.** `0` means "on
-    /// every desktop", so a current desktop of `0` would composite only sticky windows *and* —
-    /// by [`create`](Self::create) assigning the current desktop — make every window created
-    /// afterwards silently sticky, which is a state nothing could undo without knowing what
-    /// each window's desktop should have been.
+    /// Switch which desktop is composited. Returns whether it changed. `STICKY_DESKTOP` is refused:
+    /// every window created afterwards would silently be sticky.
     pub fn set_current_desktop(&mut self, desktop: u32) -> Result<bool, StackError> {
         if desktop == STICKY_DESKTOP {
             return Err(StackError::StickyIsNotADesktop);
@@ -884,13 +587,7 @@ impl WindowStack {
     }
 
     /// Follow `scheme` from now on, and re-derive every window's shadow. Returns whether it
-    /// changed.
-    ///
-    /// **The whole screen is dirty when it does**, and a caller repaints all of it: every window
-    /// that casts a shadow now casts a different one, and a dark scheme's reaches further than a
-    /// light one's, so the region to repaint is each window's *old or new* painted bounds, which
-    /// on a desktop with windows on it is most of the screen. Sent once per session, before most
-    /// windows exist, so the full repaint is the honest answer rather than an expensive one.
+    /// changed; the whole screen is dirty when it does.
     pub fn set_scheme(&mut self, scheme: Scheme) -> bool {
         if self.scheme == scheme {
             return false;
@@ -904,24 +601,9 @@ impl WindowStack {
 
     /// Move a window's top-left corner, returning the region that must be repainted.
     ///
-    /// **The damage comes back from the mutation, rather than being computed after it.** That is
-    /// not a style preference: a move dirties the *union* of where the window was and where it
-    /// now is, because a rectangle cannot express "old minus new" — and every other path in this
-    /// compositor computes `dirty` from state read *before* the change, which is a discipline a
-    /// caller can forget. M5 shipped exactly that bug for a resized buffer (PR #192, finding 3).
-    /// Returning it makes the trap unreachable here instead of merely known.
-    ///
-    /// **A window that has never committed dirties nothing.** It is not on screen —
-    /// [`present_into`](Self::present_into) skips windows with no committed buffer — so moving it
-    /// paints over nothing and reveals nothing. This is the ordinary case rather than an edge
-    /// one: placing a window *before* its first commit is what a manager does. That case returns
-    /// a **zero-sized** rectangle, which is this crate's "nothing changed" — the same thing
-    /// `Outcome::Applied { dirty: Some(empty) }` means, and distinct from its `None`, which means
-    /// "I cannot name what changed, repaint everything". A caller unioning this into a `dirty`
-    /// gets the right answer for free, because [`union`] treats a zero rect as the identity.
-    ///
-    /// Returns [`Damage`] rather than a bare `Rect` so that forgetting it is a warning: see that
-    /// type for why `#[must_use]` on this function would not have been enough.
+    /// The damage is the union of where the window was and where it is, returned from the mutation
+    /// so it cannot be computed from state read after the change. A window never committed returns
+    /// a zero-sized rectangle: it is not on screen, and managers place windows before first commit.
     pub fn place(&mut self, id: u32, origin: Point) -> Result<Damage, StackError> {
         if self.dragging.is_some_and(|(d, _)| d == id) {
             return Err(StackError::Dragging);
@@ -936,9 +618,7 @@ impl WindowStack {
 
     /// Begin an interactive drag of `id`, which makes [`place`](Self::place) refuse it.
     ///
-    /// `NoSuchWindow` if it is not in the stack. Beginning a second drag replaces the first: the
-    /// pointer has one grab, so two drags cannot be in flight, and the arithmetic that would
-    /// decide which to keep is arithmetic about a state that cannot happen.
+    /// `NoSuchWindow` if it is not in the stack. A second drag replaces the first.
     pub fn begin_drag(&mut self, id: u32) -> Result<(), StackError> {
         let origin = self.window(id).ok_or(StackError::NoSuchWindow)?.origin;
         self.dragging = Some((id, origin));
@@ -947,17 +627,11 @@ impl WindowStack {
 
     /// End the drag, and record the one geometry change it produced.
     ///
-    /// **One record for the whole gesture, not one per motion.** [`drag_to`](Self::drag_to) does
-    /// not log, because the manager's queue does not coalesce and evicts its oldest when full —
-    /// a five-second drag at 100 Hz would push a `WindowCreated` off the front and leave the
-    /// manager with a window it will never place and never hear about again (PR #247 review).
-    /// What a manager needs is where the window ended up, which is one record.
+    /// One record for the whole gesture, not per motion: the manager's queue does not coalesce and
+    /// a long drag would push a `WindowCreated` off the front of it.
     pub fn end_drag(&mut self) {
-        // **Only if it actually moved**, which `place` has always checked and this did not: an
-        // ordinary click on a title bar is a drag of zero pixels, and it was putting a no-op
-        // record into the queue this whole design exists to protect — the one that does not
-        // coalesce and evicts its oldest — and printing a manager line for a move that did not
-        // happen (PR #248 review, finding 4).
+        // Only if it moved: a click on a title bar is a zero-pixel drag and must not queue a no-op.
+        // Only if it moved: a click on a title bar is a drag of zero pixels.
         if let Some((id, was)) = self.dragging.take()
             && self.window(id).is_some_and(|w| w.origin != was)
         {
@@ -965,10 +639,7 @@ impl WindowStack {
         }
     }
 
-    /// Record a state request, and report whether it differs from the last one.
-    ///
-    /// `false` for a window that does not exist — there is nobody to tell about it — and for a
-    /// repeat of the state last asked for.
+    /// Record a state request; `false` for a repeat of the last one, or for a window that is gone.
     pub fn note_state_request(&mut self, id: u32, state: u32) -> bool {
         let Some(w) = self.windows.iter_mut().find(|w| w.id == id) else {
             return false;
@@ -980,15 +651,8 @@ impl WindowStack {
         true
     }
 
-    /// Record that `window` takes drops of `kinds` under `name` — `Surface::DeclareAcceptor`.
-    ///
-    /// **Re-declaring a name replaces it**, for the reason a snap zone's id does: the set of
-    /// acceptors describes what this window can currently take, so a client whose panel changed
-    /// would otherwise have to remove one to change it — and there is no remove.
-    ///
-    /// `Err(NoSuchWindow)` if it has gone; `Err(TooManyAcceptors)` when the table is full, which is a
-    /// refusal rather than an eviction: dropping the *oldest* acceptor would silently stop a
-    /// window taking what it still says it takes.
+    /// Record that `window` takes drops of `kinds` under `name`; re-declaring a name replaces it.
+    /// `Err(TooManyAcceptors)` when full, a refusal rather than evicting the oldest.
     pub fn declare_acceptor(&mut self, id: u32, name: &str, kinds: u32) -> Result<(), StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         if let Some(a) = w.acceptors.iter_mut().find(|a| a.name == name) {
@@ -1003,22 +667,12 @@ impl WindowStack {
     }
 
     /// The name of the first acceptor on `id` that takes `kind`, or `None`.
-    ///
-    /// **First rather than best**, in declaration order: the compositor has no way to choose
-    /// between two acceptors that both take the kind — where on the window the drop happened is
-    /// the client's question, and the event carries the point for it to answer with.
     pub fn acceptor_for(&self, id: u32, kind: u32) -> Option<&str> {
         let w = self.window(id)?;
         w.acceptors.iter().find(|a| a.kinds & kind != 0).map(|a| a.name.as_str())
     }
 
-    /// Forget what `id` last asked to be, because something else has changed it.
-    ///
-    /// **The shadow is only valid while nothing else has happened.** `state_requested` exists to
-    /// drop a client repeating itself, and it compares against what that client last asked —
-    /// which stops describing the window the moment a *manager* minimises, restores, places or
-    /// configures it by any other route. Clearing it there costs one field write and makes the
-    /// dedup unable to outlive its premise.
+    /// Forget what `id` last asked to be, because a manager changed it by another route.
     pub fn clear_state_request(&mut self, id: u32) {
         if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
             w.state_requested = None;
@@ -1026,14 +680,10 @@ impl WindowStack {
     }
 
     /// Move a window the user is dragging, without logging a geometry change.
-    ///
-    /// Returns `NoSuchWindow` if it has gone, which is the ordinary end of a drag whose client
-    /// exited while the button was down.
     pub fn drag_to(&mut self, id: u32, origin: Point) -> Result<Damage, StackError> {
         self.move_to(id, origin, false)
     }
 
-    /// The body of [`place`](Self::place) and [`drag_to`](Self::drag_to).
     fn move_to(&mut self, id: u32, origin: Point, log: bool) -> Result<Damage, StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         let uncommitted = w.committed.is_none();
@@ -1044,9 +694,8 @@ impl WindowStack {
             self.geometry_log.push(id);
         }
         if uncommitted {
-            // A window with nothing on screen has no pixels to repaint, but it has still
-            // *moved*: `bounds()` is taken from the requested size at this point, so the
-            // record above fires and a manager learns where it will appear.
+            // Nothing on screen, so nothing to repaint, but it has still moved: the record above
+            // fires.
             return Ok(Damage(Rect::new(origin.x, origin.y, 0, 0)));
         }
         Ok(Damage(union(was, now)))
@@ -1054,19 +703,11 @@ impl WindowStack {
 
     /// Attach a buffer to a window.
     ///
-    /// **Unbounded in count — `TODO(window-buffer-cap)`.** Nothing limits how many *distinct*
-    /// ids a window may attach; a client may keep inventing them and the compositor maps each.
-    /// Not reachable from `libsurface`, which attaches exactly what a client asked for at
-    /// creation and — since M9 Part D — *replaces* those ids on a resize rather than adding to
-    /// them, which is why the resize path is bounded while this is still filed. The mappings
-    /// are reclaimed on destroy. Filed because the per-connection window cap made this the one
-    /// thing here that is not bounded.
+    /// Unbounded in count — `TODO(window-buffer-cap)`: nothing limits how many distinct ids a
+    /// window may attach.
     pub fn attach(&mut self, req: &AttachBufferRequest) -> Result<(), StackError> {
-        // **The tag decides whether this surface is opaque**, and nothing else does (M13 Part B).
-        // The wire decoder has already refused anything but these two, so an unrecognised value
-        // cannot arrive here — but defaulting to opaque on one that did would be the dangerous
-        // direction: a translucent surface treated as opaque loses the fill beneath it and
-        // composites against stale pixels, which reads as a colour rather than as an error.
+        // The tag decides whether this surface is opaque. The decoder has refused anything else,
+        // and defaulting to opaque would composite a translucent surface against stale pixels.
         let format = match req.format {
             SURFACE_FORMAT_ARGB8888 => PixelFormat::ARGB8888,
             SURFACE_FORMAT_XRGB8888 => PixelFormat::XRGB8888,
@@ -1075,14 +716,9 @@ impl WindowStack {
         let geometry =
             Geometry::with_pitch(req.width, req.height, req.pitch as usize, format).ok_or(StackError::BadGeometry)?;
         let w = self.windows.iter_mut().find(|w| w.id == req.window).ok_or(StackError::NoSuchWindow)?;
-        // **Re-attaching an id replaces it, and that is how a client resizes** (M9 Part D). A
-        // resize needs buffers of the new size and the protocol has no detach, so the
-        // alternative was a fresh id per resize — which grows this list, and the compositor's
-        // mappings with it, for the life of a window somebody maximises and restores.
-        //
-        // **Except the committed one**, whose pixels the compositor may be reading: replacing
-        // that changes the screen without a commit. A double-buffered client always has a free
-        // buffer to replace first, so this refuses nothing an honest resize needs.
+        // Re-attaching an id replaces it, which is how a client resizes (the protocol has no
+        // detach). Except the committed one, whose pixels the compositor may be reading: replacing
+        // it would change the screen without a commit.
         if let Some(existing) = w.buffers.iter_mut().find(|b| b.id == req.buffer) {
             if w.committed == Some(req.buffer) {
                 return Err(StackError::DuplicateBuffer);
@@ -1096,10 +732,8 @@ impl WindowStack {
 
     /// Apply a commit: the named buffer becomes what compositing reads.
     ///
-    /// Returns the buffer that was on screen before, if any — **that is the one to
-    /// release**. Releasing the newly committed buffer instead would hand the client back
-    /// the memory the compositor is about to read, which is the tearing this protocol
-    /// exists to prevent.
+    /// Returns the buffer that was on screen before, if any — that is the one to release; releasing
+    /// the new one would hand the client memory the compositor is about to read.
     pub fn commit(&mut self, req: &CommitRequest) -> Result<Option<u32>, StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == req.window).ok_or(StackError::NoSuchWindow)?;
         if !w.buffers.iter().any(|b| b.id == req.buffer) {
@@ -1108,32 +742,21 @@ impl WindowStack {
         let previous = w.committed;
         let was = w.painted_bounds();
         w.committed = Some(req.buffer);
-        // **A commit can resize the window.** The committed buffer's geometry is what
-        // `bounds()` reports, so a client that reflows and commits a taller buffer has
-        // changed its on-screen rectangle without any manager involvement at all.
+        // A commit can resize the window: `bounds()` follows the committed buffer's geometry.
         if w.painted_bounds() != was {
             self.geometry_log.push(req.window);
         }
-        // Re-committing the same buffer releases nothing: the client already knows it owns
-        // no other buffer, and reporting a release here would let it draw into the buffer
-        // now on screen.
+        // Re-committing the same buffer releases nothing, or the client could draw into what is
+        // shown.
         Ok(previous.filter(|&p| p != req.buffer))
     }
 
     /// Take every id removed since the last call, parent before the popups it took with it.
-    ///
-    /// Draining is the point: the bin drains after every dispatch, so the log holds at most one
-    /// call's worth and cannot grow while no manager is attached.
     pub fn take_removed(&mut self) -> Vec<u32> {
         core::mem::take(&mut self.removed_log)
     }
 
     /// Take every id whose bounds changed since the last call, each reported once.
-    ///
-    /// Deduplicated because one dispatch can change a window's rectangle twice — a place and
-    /// a commit in the same batch — and a manager gains nothing from hearing the same
-    /// rectangle described a second time. Draining is the point, for the same reason
-    /// [`take_removed`](Self::take_removed) drains.
     pub fn take_geometry_changes(&mut self) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
         for id in core::mem::take(&mut self.geometry_log) {
@@ -1146,23 +769,14 @@ impl WindowStack {
 
     /// Destroy a window and everything attached to it, recording every id removed.
     ///
-    /// **The removed set is recorded because one `DestroyWindow` can remove several windows.**
-    /// A menu chain goes with its parent, transitively, so a caller that has to tell someone
-    /// else which windows disappeared — the manager's `WindowDestroyed` event — cannot work it
-    /// out from the id it passed in. Diffing the stack around the call would be the alternative
-    /// and is worse: it makes every caller responsible for a snapshot, and gets the order wrong
-    /// (the parent should be reported before the popups it took with it).
+    /// One `DestroyWindow` can remove several windows (a menu chain goes with its parent), so the
+    /// removed set is recorded for the manager's `WindowDestroyed`, parent first.
     pub fn destroy(&mut self, id: u32) -> Result<(), StackError> {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         self.windows.remove(i);
         self.removed_log.push(id);
-        // Descendants cannot outlive an ancestor: a popup or dialog with no parent has no
-        // defined desktop or stacking position, and `create` refuses to produce one.
-        //
-        // **Transitively.** A single pass over direct children leaves a submenu — a popup
-        // parented to a popup, which is the canonical nested case — alive with a dead
-        // parent, still compositing and still eligible for focus after the menu chain it
-        // belonged to was closed. Repeat until nothing more is orphaned.
+        // Descendants cannot outlive an ancestor, transitively: a single pass would leave a submenu
+        // alive with a dead parent, still compositing and focusable.
         loop {
             let live: Vec<u32> = self.windows.iter().map(|w| w.id).collect();
             let before = self.windows.len();
@@ -1181,9 +795,7 @@ impl WindowStack {
                 break;
             }
         }
-        // **A drag cannot outlive its window**, and a client exiting with the button held is the
-        // ordinary way that happens. Left set, the flag would refuse a `Place` for an id that no
-        // longer exists — for the life of the compositor, since ids are never reused.
+        // A drag cannot outlive its window, or `Place` would refuse a dead id.
         if self.dragging.is_some_and(|(d, _)| self.window(d).is_none()) {
             self.dragging = None;
         }
@@ -1192,26 +804,14 @@ impl WindowStack {
 
     /// Raise a window to the top of the stack.
     ///
-    /// **The damage is the window's own rectangle, and that is exact.** Moving one window within
-    /// the order changes the relative order of no other pair, so every pixel outside this
-    /// window's bounds is composed from the same windows in the same order as before — only the
-    /// pixels it covers can differ. This used to answer "repaint everything", on the reasoning
-    /// that which pixels change "depends on every overlap in the stack"; that is true of *which*
-    /// of them change and irrelevant to *where* they are.
+    /// The damage is the window's own rectangle, and that is exact: moving one window changes the
+    /// relative order of no other pair, so only the pixels it covers can differ. Repainting the
+    /// whole screen is ~100 ms under emulation with no input read.
     ///
-    /// It is not a micro-optimisation. A full recompose of a 1280×800 screen takes ~100 ms under
-    /// emulation, during which the compositor reads no input, and the input server's ring holds
-    /// a fraction of a second of a moving mouse — so a click that raised a window used to cost a
-    /// visible chunk of the movement around it (2026-08-26).
+    /// A window already topmost reports **empty** damage; click-to-focus raises on every press.
     ///
-    /// A window that is already topmost is left alone and reports **empty** damage: the stack
-    /// did not change, so nothing needs repainting. Click-to-focus raises on every press,
-    /// including the tenth press on the same window.
-    ///
-    /// **A window's transients do not ride up with it, and nothing keeps them above it** —
-    /// `TODO(dialog-stacking)`. Raising a parent puts it over its own `dialog`, which every
-    /// desktop this borrows from prevents; see `deferred-decisions.md` for why M12 Part A did
-    /// not need it and what would make it necessary.
+    /// A window's transients do not ride up with it and nothing keeps them above it:
+    /// `TODO(dialog-stacking)`, see `deferred-decisions.md`.
     pub fn raise(&mut self, id: u32) -> Result<Damage, StackError> {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         if i + 1 == self.windows.len() {
@@ -1224,10 +824,6 @@ impl WindowStack {
     }
 
     /// Send a window to the bottom of the stack.
-    ///
-    /// No caller until the shell (M7): click-to-focus only ever raises. It lands here with
-    /// [`raise_above`](Self::raise_above) because the three are one ordering rule, and a stack
-    /// that can only ever push in one direction is one nobody can write alt-tab against.
     pub fn lower(&mut self, id: u32) -> Result<Damage, StackError> {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         if i == 0 {
@@ -1239,15 +835,8 @@ impl WindowStack {
         Ok(Damage(rect))
     }
 
-    /// Put `id` directly above `other` in the stack.
-    ///
-    /// The op alt-tab needs: "raise this one, but only to where that one was" — a full
-    /// [`raise`](Self::raise) would reorder every window between them, which is visible as the
-    /// rest of the stack shuffling behind the one the user asked for.
-    ///
-    /// `id == other` is a no-op rather than an error: it is the degenerate case of a request
-    /// that is otherwise well-formed, and a shell iterating a window list should not have to
-    /// special-case the window it is already above.
+    /// Put `id` directly above `other`, without reordering the windows between them. `id == other`
+    /// is a no-op.
     pub fn raise_above(&mut self, id: u32, other: u32) -> Result<Damage, StackError> {
         if self.window(id).is_none() || self.window(other).is_none() {
             return Err(StackError::NoSuchWindow);
@@ -1258,45 +847,27 @@ impl WindowStack {
         let i = self.windows.iter().position(|w| w.id == id).expect("checked above");
         let w = self.windows.remove(i);
         let rect = w.painted_bounds();
-        // Recomputed *after* the removal: taking `id` out shifts everything above it down by
-        // one, so an index captured before would place the window one slot too high whenever
-        // `id` sat below `other`.
+        // Recomputed after the removal, which shifts everything above `id` down by one.
         let j = self.windows.iter().position(|w| w.id == other).expect("checked above");
         self.windows.insert(j + 1, w);
-        // Empty when it landed where it already was, for the reason [`raise`](Self::raise)
-        // gives: the order is unchanged, so nothing on screen is.
+        // Empty when it landed where it was: the order is unchanged.
         let moved = j + 1 != i;
         Ok(Damage(if moved { rect } else { Rect::new(0, 0, 0, 0) }))
     }
 
     /// The area left for `normal` windows after every panel's reservation.
     ///
-    /// This is what "a maximised window must not cover the bars" means concretely
-    /// (`display-substrate.md` §4a). Reservations are **declared**, not derived from a
-    /// panel's geometry: the two differ when a window is fullscreen (it covers the
-    /// panel's pixels while the panel still reserves that space for maximised windows).
-    ///
-    /// Over-reservation is clamped rather than allowed to invert the rectangle: panels
-    /// claiming more than the screen leave an empty work area, not a negative one.
-    ///
-    /// **It counts every panel, including ones that are not on screen — deliberately, and this
-    /// is the one place that question is answered differently from
-    /// [`visible_on`](Window::visible_on).** The declared-not-derived rule above was written
-    /// against the fullscreen case, where the panel is still on its desktop and still wants its
-    /// space. M8 Part A added two more ways to be off screen, and neither changes the answer:
-    /// a bar minimized or sitting on another desktop is a bar that is coming back, and a work
-    /// area that grew while it was away would relayout every maximised window twice per desktop
-    /// switch. A panel that should stop reserving is destroyed, not hidden (PR #240 review,
-    /// optional 5).
+    /// Reservations are declared, not derived from a panel's geometry (`display-substrate.md` §4a),
+    /// and clamped so over-reservation leaves an empty area. Every panel counts, including ones not
+    /// on screen: a minimized or other-desktop bar is coming back, and a work area that grew
+    /// meanwhile would relayout every maximised window twice per desktop switch.
     pub fn work_area(&self, screen: Rect) -> Rect {
         let (mut top, mut bottom, mut left, mut right) = (0u32, 0u32, 0u32, 0u32);
         for w in &self.windows {
             if let Some((edge, reserve)) = w.role.strut() {
-                // Saturating, not `+=`. `reserve` is bounded at the protocol edge, but the
-                // *sum* over many panels is not, and a wrap here is worse than a panic: in
-                // release it returns the full screen as the work area, silently defeating
-                // the clamp below. No catch-all arm — `Edge` is an enum, so a new edge is a
-                // compile error rather than a silently ignored reservation.
+                // Saturating: the sum over many panels is unbounded and a wrap would return the
+                // full screen, defeating the clamp below. No catch-all arm, so a new `Edge` is a
+                // compile error.
                 let slot = match edge {
                     Edge::Top => &mut top,
                     Edge::Bottom => &mut bottom,
@@ -1318,10 +889,7 @@ impl WindowStack {
         )
     }
 
-    /// The `info` a window reports at `/dev/draw/<id>/info`.
-    ///
-    /// Reports the **committed** buffer's size when there is one, because that is what is
-    /// actually on screen; the requested size is only a hint until a client commits.
+    /// The `info` a window reports at `/dev/draw/<id>/info`: the committed buffer's size if any.
     pub fn info(&self, id: u32) -> Option<librsproto::surface::WindowInfo> {
         let w = self.window(id)?;
         let bounds = w.bounds();
@@ -1333,8 +901,6 @@ impl WindowStack {
             bounds.size.w,
             bounds.size.h,
         );
-        // Set after construction: `new` takes what `CreateWindow` fixes, and these two are
-        // mutable state a manager changes over the window's life.
         info.desktop = w.desktop;
         if w.minimized {
             info.flags |= WINDOW_FLAG_MINIMIZED;
@@ -1344,37 +910,19 @@ impl WindowStack {
 
     /// The topmost window that may take keyboard focus, if any.
     ///
-    /// Panels are skipped: clicking the clock must not steal input from the terminal.
-    ///
-    /// **There is no input-exclusive window** — `TODO(dialog-modality)`. A `dialog` is the
-    /// topmost focusable one while it is up and stops being so the moment anything else is
-    /// raised, so a confirmation does not prevent its parent from being typed into. Modality
-    /// would be a rule here and in routing rather than anything a client could draw; see
-    /// `deferred-decisions.md` for the trigger.
+    /// Panels are skipped: clicking the clock must not steal input from the terminal. There is no
+    /// input-exclusive window — `TODO(dialog-modality)`: a `dialog` stops being the candidate the
+    /// moment anything else is raised. See `deferred-decisions.md`.
     pub fn focus_candidate(&self) -> Option<u32> {
-        // **Unconfigured windows are not candidates**, for the same reason they are not
-        // composited: the compositor has decided they are not on screen yet, and giving the
-        // keyboard to a window nobody can see loses every keystroke typed into it. A new window
-        // goes on top of the stack, so without this it becomes the candidate the instant it is
-        // created — before anyone has placed it, and for as long as its configure is held
-        // (PR #218 review, finding 3).
+        // Unconfigured windows are not candidates, as they are not composited: the keyboard must
+        // not go to a window nobody can see.
         self.windows.iter().rev().find(|w| w.visible_on(self.current_desktop) && w.role.takes_focus()).map(|w| w.id)
     }
 
     /// Composite the stack into `fb`, repainting `damage` — **without the cursor**.
     ///
-    /// Windows with no committed buffer, or whose buffer the source cannot resolve, are
-    /// skipped rather than drawn as garbage — a client that has created a window but not
-    /// yet drawn into it should show background, not whatever the memory held.
-    ///
-    /// **`pub(crate)`, so the server binary cannot call it**, and must go through
-    /// [`present_into`](Self::present_into) instead. That is not stylistic: the cursor is
-    /// *drawn over* the composed stack rather than composited into it, so every path that
-    /// recomposes has to redraw it, and three of the four paths in the binary had forgotten
-    /// to (PR #185 review, finding 1) — a click erased the pointer until the mouse moved
-    /// next. Making "compose" unreachable from outside means the mistake cannot be made a
-    /// fourth time by adding a fifth path. If a caller ever genuinely wants the stack without
-    /// a pointer over it — a screenshot — widening this is a deliberate act with a reason.
+    /// `pub(crate)` so the binary must go through [`present_into`](Self::present_into): the cursor
+    /// is drawn over the composed stack, so every recompose has to redraw it.
     pub(crate) fn compose_into<F, S>(&self, fb: &mut F, background: Rgb, source: &S, damage: &[Rect])
     where
         F: Framebuffer + ?Sized,
@@ -1383,13 +931,9 @@ impl WindowStack {
         let mut surfaces: Vec<SurfaceRef<'_>> = Vec::new();
         let screen = fb.geometry().bounds();
         for w in &self.windows {
-            // **Not composited unless it is on screen** — configured (M6 B4), not minimized,
-            // and on the current desktop or sticky. A client that commits before its first
-            // `Configure` would otherwise paint at the default origin and then jump when the
-            // manager places it, which is the symptom the configure ordering exists to remove;
-            // the other two clauses are M8 Part A's. All three live in
-            // [`Window::visible_on`](Window::visible_on) so that this site and hit-testing
-            // cannot drift apart.
+            // Not composited unless on screen (configured, not minimized, on the current desktop or
+            // sticky): a client committing before its first `Configure` would paint at the default
+            // origin and jump.
             if !w.visible_on(self.current_desktop) {
                 continue;
             }
@@ -1406,28 +950,15 @@ impl WindowStack {
                 None => surface,
             });
         }
-        // **`compose_exposed`, not `compose`.** Every surface above has just been length-checked,
-        // so each one writes every pixel it claims. That was the whole argument until M13 Part B;
-        // it is now half of one, because `attach` can put a *translucent* surface in this list and
-        // a blended pixel reads what is under it. `covers` carries both conditions, and the fill
-        // beneath a translucent surface is still painted — this call is correct for two reasons
-        // now, and the second is not visible from here (PR #275 review, finding 4). Filling it anyway is the double-write that M13 Part A measured — and,
-        // on the way to the display, the flash the shadow buffer exists to hide.
+        // `compose_exposed`, not `compose`: `attach` can add a translucent surface, whose blend
+        // reads what is beneath it, so `covers` carries both conditions.
         compose_exposed(fb, background, &surfaces, damage);
     }
 
     /// Put `damage` on the screen: composite the stack, then draw the pointer over it.
     ///
-    /// **The one way a screen region is updated.** The pairing lives here rather than in the
-    /// server binary because the binary cannot be host-tested — its screen-update path takes a
-    /// `Server` and a `RawFramebuffer`, both of which need syscalls — so "the cursor survives
-    /// a recompose" had no test it could fail, and did not survive one. Moving the boundary
-    /// down one layer is what makes it testable, and `pub(crate)` on
-    /// [`compose_into`](Self::compose_into) is what makes it unavoidable.
-    ///
-    /// **The cursor goes on last.** A cursor under a window is not a cursor, and compositing
-    /// it into the stack would make it a window — with a position in the stacking order, a
-    /// client that could cover it, and hit-testing that would have to skip it.
+    /// The one way a screen region is updated, so "the cursor survives a recompose" is
+    /// host-testable. The cursor goes on last: it is not a window.
     pub(crate) fn present_into<F, S>(
         &self,
         fb: &mut F,
@@ -1441,8 +972,7 @@ impl WindowStack {
         S: BufferSource + ?Sized,
     {
         self.compose_into(fb, background, source, damage);
-        // **The outline under the cursor, both over everything else.** A cursor hidden behind
-        // the outline it is dragging would be the one pixel the user is actually steering by.
+        // Outline, then cursor, both over everything else: the cursor is what the user steers by.
         for r in damage {
             if let Some(o) = outline {
                 draw_outline(fb, o, *r);
@@ -1454,27 +984,9 @@ impl WindowStack {
 
 /// The display, and the buffer every frame is built in before it reaches it.
 ///
-/// **The flicker, stated exactly.** [`compose_into`](WindowStack::compose_into) repaints a damage
-/// rectangle by painting background and then drawing over it. Done straight into the aperture, the
-/// scanout is free to read the region in between, and on a window drag — where the damage is the
-/// union of where the window was and where it now is — what it reads is the desktop background
-/// across the whole union. That is a flash of background under a moving window, reported
-/// 2026-09-01. Nothing about it is a race in the compositor: every frame it produces is correct,
-/// and the defect is that an *incomplete* one is visible.
-///
-/// So the fix is not a faster frame, it is an ordering property: **the display never holds a
-/// partly-composed frame**. A frame is built somewhere nobody is scanning out, and reaches the
-/// display as a copy — after which every intermediate state has already happened somewhere
-/// invisible. No amount of making the compose quicker substitutes for that, which is why M13
-/// Part A's measurement was framed as pricing it rather than justifying it.
-///
-/// **The display is private and there is no accessor**, for the reason
-/// [`present_into`](WindowStack::present_into) is `pub(crate)`: the shadow is only a mirror of the
-/// screen for as long as *every* write goes through it. One path that painted the aperture
-/// directly would leave the two disagreeing about a region, and the symptom would be stale pixels
-/// that persist until something else damages them — a bug that looks nothing like its cause. The
-/// crate has made this mistake once already with the cursor, where three of four paths forgot it;
-/// that comment is a few lines up and this is the same shape.
+/// Composing straight into the aperture lets the scanout read a half-composed region: a flash of
+/// background under a dragged window. So frames are built in a shadow and copied; the display is
+/// private so no direct write can leave the two disagreeing.
 pub struct Screen<F: Framebuffer> {
     /// Where frames are composed. `None` when the buffer would not fit — see [`Screen::new`].
     shadow: Option<MemFramebuffer>,
@@ -1484,14 +996,9 @@ pub struct Screen<F: Framebuffer> {
 impl<F: Framebuffer> Screen<F> {
     /// Wrap `display`, allocating a shadow buffer the same shape.
     ///
-    /// **The caller must not run without it** — since Phase 5 Part G.4, and this used to say the
-    /// opposite. The argument for degrading was that the fallback costs a *visual* defect, the
-    /// flicker, and taking the session down to avoid one is a poor trade. That argument rested on
-    /// writes to the display being ordinary memory writes. They are not: the framebuffer is
-    /// write-combining now, so composing into it directly *reads* it back, and a read from
-    /// write-combining memory is uncached — the laptop measures such traffic at 54 MiB/s, which
-    /// is a second of compositing per frame rather than a flicker. [`Screen::is_buffered`] still
-    /// reports which happened; `main.rs` now refuses to serve when it is false.
+    /// The caller must not run without it: the framebuffer is write-combining, so composing into it
+    /// directly reads it back uncached (54 MiB/s measured). [`Screen::is_buffered`] reports which
+    /// happened and `main.rs` refuses to serve when it is false.
     pub fn new(display: F) -> Self {
         let shadow = MemFramebuffer::try_new(display.geometry());
         Self { shadow, display }
@@ -1499,20 +1006,13 @@ impl<F: Framebuffer> Screen<F> {
 
     /// Wrap `display` with a shadow buffer the caller already has.
     ///
-    /// **For a caller that must allocate before it acquires the display** — which `main.rs` must,
-    /// because acquiring is what stops the kernel's console drawing, and a refusal after that is
-    /// one nobody on a serial-less machine can read (PR #306 review). The buffer's geometry is the
-    /// display's by construction there: both come from the same `/dev/framebuffer/info`.
+    /// For a caller that must allocate before acquiring the display, which stops the kernel
+    /// console.
     pub fn with_shadow(display: F, shadow: MemFramebuffer) -> Self {
         Self { shadow: Some(shadow), display }
     }
 
-    /// A screen with no shadow buffer — the path [`Screen::new`] falls back to when the
-    /// allocation fails.
-    ///
-    /// Test-only because nothing else should choose it, and it exists at all because the
-    /// fallback is otherwise reachable only by exhausting memory. An untested fallback for an
-    /// out-of-memory condition is the one you find out about during an out-of-memory condition.
+    /// A screen with no shadow buffer, the path [`Screen::new`] falls back to; test-only.
     #[cfg(test)]
     pub(crate) fn unbuffered(display: F) -> Self {
         Self { shadow: None, display }
@@ -1535,8 +1035,6 @@ impl<F: Framebuffer> Screen<F> {
     }
 
     /// Compose `stack` into the shadow, draw the pointer over it, and copy `damage` to the display.
-    ///
-    /// The one way a screen region is updated.
     pub fn present<S>(
         &mut self,
         stack: &WindowStack,
@@ -1559,16 +1057,8 @@ impl<F: Framebuffer> Screen<F> {
 
 /// Copy each damage rectangle from `shadow` to `display`, row by row. Returns the bytes copied.
 ///
-/// The two share a geometry — the shadow is built from the display's — so a row is the same byte
-/// range in both and no offset needs recomputing between them. Rectangles are clipped to the
-/// screen; overlapping ones are copied twice, which is wasteful in the same way and to the same
-/// degree that compositing them twice is.
-///
-/// **The count is returned for a test, and it is the only way to check the bound.** A copy that
-/// ignored damage and pushed the whole shadow every frame would draw *exactly the same picture* —
-/// the shadow is a faithful mirror, so copying more of it is invisible in the output and shows up
-/// only as a full-screen blit behind every one-pixel drag. There is nothing to assert on a screen;
-/// the work done has to be measured directly.
+/// The count is returned for a test: a copy that ignored damage would draw the same picture, so
+/// the bound can only be checked by measuring the work.
 #[must_use]
 fn copy_damage<F: Framebuffer + ?Sized>(display: &mut F, shadow: &MemFramebuffer, damage: &[Rect]) -> usize {
     let g = display.geometry();
@@ -1581,13 +1071,10 @@ fn copy_damage<F: Framebuffer + ?Sized>(display: &mut F, shadow: &MemFramebuffer
             let y = area.origin.y as u32 + row;
             let Some(off) = g.offset_of(area.origin.x as u32, y) else { continue };
             let (src, dst) = (shadow.bytes(), display.bytes_mut());
-            // **Unreachable, and deliberately not the thing keeping this correct.** `area` is
-            // already clipped to the screen, so `off + width` cannot pass the end of a row, and
-            // the shadow was built from this geometry so both buffers are the same length. The
-            // check is here because reading past either would be worse than skipping — but a
-            // skip *is* a row of stale pixels, so it must never become the mechanism that bounds
-            // the copy. That is exactly how `subtract_from` grew a hole (PR #274 review): one
-            // invariant, two guards, and the quiet one won.
+            // Unreachable, and deliberately not what keeps this correct: `area` is clipped and both
+            // buffers share a geometry. A skip is a row of stale pixels, so it must never become
+            // the mechanism that bounds the copy (one invariant, two guards, and the quiet one
+            // won).
             if off + width > src.len() || off + width > dst.len() {
                 continue;
             }
@@ -1606,16 +1093,12 @@ mod tests {
         KEY_RIGHTMETA, KEY_RIGHTSHIFT,
     };
 
-    /// Two ordinary (non-modifier) keycodes — `a` and `b` in the Linux table `libkern::abi`
-    /// mirrors. Named here rather than imported because `abi` exports the modifiers this
-    /// module cares about and not every letter.
+    /// Two ordinary (non-modifier) keycodes, `a` and `b` in the Linux table.
     const KEY_A: u16 = 30;
-    /// See [`KEY_A`].
     const KEY_B: u16 = 48;
 
     #[test]
     fn the_cursors_hotspot_is_its_top_left() {
-        // Where an arrow points. A centre hotspot clicks half a sprite from where it looks.
         let r = cursor_rect(Point::new(40, 30));
         assert_eq!(r.origin, Point::new(40, 30));
         assert_eq!(r.size, libdraw::geom::Size::new(CURSOR_W, CURSOR_H));
@@ -1623,8 +1106,6 @@ mod tests {
 
     #[test]
     fn the_sprite_matches_the_size_it_claims() {
-        // A row longer than `CURSOR_W` draws outside `cursor_rect`, so the damage the
-        // compositor computes from that rectangle would leave a trail behind the pointer.
         assert_eq!(CURSOR.len(), CURSOR_H as usize);
         for (i, line) in CURSOR.iter().enumerate() {
             assert!(
@@ -1641,25 +1122,18 @@ mod tests {
         use libdraw::framebuffer::{Geometry, MemFramebuffer};
         let mut fb = MemFramebuffer::new(Geometry::packed(40, 40, PixelFormat::XRGB8888));
         let clip = Rect::new(0, 0, 40, 40);
-        // Off the right and bottom edges, and off the top-left with negative coordinates.
         draw_cursor(&mut fb, Point::new(36, 36), clip);
         draw_cursor(&mut fb, Point::new(-4, -4), clip);
-        // Nothing wrapped to the opposite side: the far corner from each is untouched.
         assert_eq!(fb.get_pixel(0, 39), Some(Rgb::new(0, 0, 0)));
     }
 
     #[test]
     fn an_outlines_edges_are_four_strips_that_cover_its_border_and_nothing_inside() {
-        // **The arithmetic the whole gesture's damage rests on.** These strips are what gets
-        // repainted per pointer motion, and they are also what *erases* the outline — so a
-        // strip short of an edge leaves a line of it behind, and a strip that covered the middle
-        // would put the full recompose back that this exists to avoid.
         let r = Rect::new(10, 20, 100, 60);
         let e = outline_edges(r);
         for strip in e {
             assert!(strip.intersect(&r).is_some(), "a strip outside the rectangle: {strip:?}");
         }
-        // Every border pixel is in some strip, and no interior pixel is in any.
         for y in r.origin.y..r.bottom() as i32 {
             for x in r.origin.x..r.right() as i32 {
                 let on_border = x < r.origin.x + OUTLINE_W as i32
@@ -1674,9 +1148,6 @@ mod tests {
 
     #[test]
     fn a_degenerate_outline_stays_inside_itself() {
-        // A rectangle thinner than the outline is what a resize clamped to its floor produces
-        // in one axis; the strips must not reach outside it, or the damage names pixels the
-        // repaint will not restore.
         for r in [Rect::new(5, 5, 1, 40), Rect::new(5, 5, 40, 1), Rect::new(5, 5, 0, 0)] {
             for strip in outline_edges(r) {
                 assert!(strip.is_empty() || strip.intersect(&r) == Some(strip), "{strip:?} leaves {r:?}");
@@ -1695,9 +1166,6 @@ mod tests {
                 fb.put_pixel(x, y, bg);
             }
         }
-        // **The clip is on the outline's corner, not inside it.** A clip in the middle of a
-        // large outline intersects no strip at all — the first version of this test used one,
-        // and its "something was drawn" assertion was what caught that rather than the clip.
         let clip = Rect::new(8, 8, 4, 4);
         draw_outline(&mut fb, Rect::new(8, 8, 40, 40), clip);
         let mut ink = 0;
@@ -1714,9 +1182,6 @@ mod tests {
 
     #[test]
     fn presenting_draws_the_outline_over_the_stack_and_into_every_damage_rectangle() {
-        // The same rule the cursor has, and for the same reason: `serve_input` hands one damage
-        // list holding where the outline *was* and where it is, and a `present_into` that drew
-        // into only the first would leave it erased at its destination.
         let s = WindowStack::new();
         let src = MapSource::default();
         let mut fb = big_screen();
@@ -1765,9 +1230,6 @@ mod tests {
 
     #[test]
     fn a_late_wakeup_does_not_slow_the_repeat_rate() {
-        // Advancing by `now + interval` rather than `deadline + interval` makes every late
-        // wake-up push the next repeat further out, so a busy compositor repeats slower and
-        // slower. The tick that wakes this is 10 ms, so late is the normal case.
         let start = 1_000;
         let mut r = Repeat::armed(30, 0, 0, 1, start);
         let first = start + REPEAT_DELAY_NS;
@@ -1781,8 +1243,7 @@ mod tests {
 
     #[test]
     fn a_very_late_wakeup_does_not_fire_a_burst() {
-        // A stalled compositor coming back must not deliver every repeat it missed. One
-        // repeat, then back on cadence from now.
+        // A stalled compositor must not deliver every missed repeat.
         let mut r = Repeat::armed(30, 0, 0, 1, 0);
         let much_later = REPEAT_DELAY_NS + REPEAT_INTERVAL_NS * 1_000;
         assert!(r.due(much_later));
@@ -1792,8 +1253,7 @@ mod tests {
 
     #[test]
     fn modifiers_are_frozen_at_the_press() {
-        // A repeat is that press continuing. Re-reading modifiers would turn `A` into `a`
-        // halfway through a held run if the user let go of shift.
+        // A repeat is that press continuing: `A` must not become `a` if shift is released.
         let r = Repeat::armed(30, 0x0001, 0, 7, 0);
         assert_eq!(r.modifiers, 0x0001);
         assert_eq!(r.keycode, 30);
@@ -1802,15 +1262,12 @@ mod tests {
 
     #[test]
     fn focus_transition_is_silent_when_focus_did_not_move() {
-        // The case that happens on every commit: recomputed, unchanged, nothing sent.
         assert_eq!(focus_transition(Some(3), Some(3)), None);
         assert_eq!(focus_transition(None, None), None);
     }
 
     #[test]
     fn focus_transition_names_both_halves() {
-        // Both, because a client told only that it *gained* focus would keep a caret
-        // blinking behind whatever took focus from it.
         assert_eq!(focus_transition(Some(1), Some(2)), Some((Some(1), Some(2))));
         assert_eq!(focus_transition(None, Some(2)), Some((None, Some(2))), "first window");
         assert_eq!(focus_transition(Some(1), None), Some((Some(1), None)), "last window went");
@@ -1820,7 +1277,6 @@ mod tests {
     use libdraw::framebuffer::MemFramebuffer;
     use librsproto::surface::SURFACE_FORMAT_XRGB8888;
 
-    /// A `BufferSource` backed by owned vectors.
     #[derive(Default)]
     struct MapSource(BTreeMap<(u32, u32), Vec<u8>>);
 
@@ -1838,17 +1294,12 @@ mod tests {
         }
     }
 
-    /// A distinct colour per source row. A uniform fill cannot detect a row-stride error —
-    /// a skew just moves one shade onto an identical one — which is exactly how
-    /// `the_guest_configuration_composites_a_client_surface` passed against a compositor
-    /// reading the source at `width * 4` (PR #175 review, finding 1).
+    /// A distinct colour per source row, so a row-stride error is visible.
     fn row_colour(y: u32) -> Rgb {
         Rgb::new(0x20 + y as u8, 0x40, 0x80)
     }
 
     impl MapSource {
-        /// Fill with [`row_colour`], so which source row reached the screen is *readable
-        /// from the screen*.
         fn put_striped(&mut self, window: u32, buffer: u32, g: Geometry) {
             let mut px = vec![0u8; g.byte_len()];
             for y in 0..g.height {
@@ -1876,12 +1327,6 @@ mod tests {
         AttachBufferRequest { window, buffer, width: w, height: h, pitch: w * 4, format: SURFACE_FORMAT_XRGB8888 }
     }
 
-    /// Create a window and mark it configured — which is what the bin does the instant a
-    /// window is created with no manager attached.
-    ///
-    /// Compositing has been gated on the initial `Configure` since B4, so a test that creates,
-    /// attaches and commits without one is modelling a client that jumped the handshake, and
-    /// gets what that client gets: nothing on screen.
     fn shown(s: &mut WindowStack, req: &CreateWindowRequest) -> u32 {
         let id = s.create(req).expect("create");
         s.mark_configured(id);
@@ -1896,15 +1341,10 @@ mod tests {
         MemFramebuffer::new(Geometry::with_pitch(32, 16, 140, PixelFormat::XRGB8888).unwrap())
     }
 
-    /// A screen with room for the 12×17 cursor sprite away from its edges — [`screen`] is
-    /// 32×16, so a sprite anywhere but the top-left corner falls off it.
     fn big_screen() -> MemFramebuffer {
         MemFramebuffer::new(Geometry::with_pitch(96, 96, 400, PixelFormat::XRGB8888).unwrap())
     }
 
-    /// Two overlapping windows and a screen already showing them, for the restack tests.
-    ///
-    /// Returns the stack, the pixel source, and `(bottom, top)`.
     fn overlapping_pair() -> (WindowStack, MapSource, (u32, u32)) {
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
@@ -1915,7 +1355,6 @@ mod tests {
             src.put(id, 0, geom(20, 10), colour);
             s.commit(&commit(id, 0)).unwrap();
         }
-        // Overlapping by half, so a reorder changes pixels rather than merely the order.
         let _ = s.place(bottom, Point::new(0, 0)).unwrap();
         let _ = s.place(top, Point::new(10, 3)).unwrap();
         (s, src, (bottom, top))
@@ -1923,12 +1362,8 @@ mod tests {
 
     #[test]
     fn the_region_a_raise_reports_is_the_whole_of_what_it_changed() {
-        // **The guard on narrowing a restack's repaint from the whole screen to one rectangle.**
-        // The claim is that reordering one window can only change pixels inside that window's
-        // own bounds, because every other pair keeps its relative order. If that is wrong
-        // anywhere, painting only the reported region leaves stale pixels — so this paints the
-        // reported region into one screen, recomposes the whole of another, and compares every
-        // byte.
+        // Guards narrowing a restack's repaint to one rectangle: paint only the reported region
+        // into one screen, recompose another whole, and compare every byte.
         let (mut s, src, (bottom, _top)) = overlapping_pair();
         let mut painted = screen();
         let full = Rect::new(0, 0, 32, 16);
@@ -1949,8 +1384,6 @@ mod tests {
 
     #[test]
     fn the_region_a_lower_reports_is_the_whole_of_what_it_changed() {
-        // The same claim in the other direction: what a lowered window uncovers is inside its
-        // own rectangle too.
         let (mut s, src, (_bottom, top)) = overlapping_pair();
         let mut painted = screen();
         let full = Rect::new(0, 0, 32, 16);
@@ -1966,9 +1399,6 @@ mod tests {
 
     #[test]
     fn a_restack_that_changes_no_order_reports_no_region() {
-        // Click-to-focus raises on every press, including on the window already on top, and a
-        // manager's window list does the same. Reporting a region for those made every one of
-        // them a repaint.
         let (mut s, _src, (bottom, top)) = overlapping_pair();
         assert!(s.raise(top).expect("in the stack").is_empty(), "already topmost");
         assert!(s.lower(bottom).expect("in the stack").is_empty(), "already bottom-most");
@@ -1983,7 +1413,6 @@ mod tests {
     #[test]
     fn a_raise_that_does_reorder_reports_the_window_it_moved() {
         let (mut s, _src, (bottom, _top)) = overlapping_pair();
-        // Painted bounds: a raised window repaints its shadow with it (M13 Part C).
         let want = s.window(bottom).expect("in the stack").painted_bounds();
         assert!(want.size.w > 20, "the premise: the region includes the shadow");
         assert_eq!(s.raise(bottom).expect("in the stack").rect(), want);
@@ -1991,10 +1420,8 @@ mod tests {
 
     #[test]
     fn a_repeated_state_request_is_not_a_second_event() {
-        // **The bound this event needs.** It is the only manager event a client's own rate
-        // drives, and the manager's queue does not coalesce and discards its oldest — so a
-        // client looping on one state would push a `WindowCreated` off the front of a shell's
-        // view of the world. `SetTitle` makes the same argument for an unchanged title.
+        // The one manager event a client's own rate drives: a client looping on one state would
+        // push a `WindowCreated` off the manager's queue.
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         assert!(s.note_state_request(w, 2), "the first ask is news");
@@ -2006,8 +1433,6 @@ mod tests {
 
     #[test]
     fn the_work_area_shrinks_by_every_panels_strut_not_only_the_first() {
-        // What `QueryLayout` answers with, and the reason a manager cannot compute it: a shell
-        // subtracting only its own bars is right until some other client declares a strut.
         let mut s = WindowStack::new();
         let screen = Rect::new(0, 0, 100, 100);
         assert_eq!(s.work_area(screen), screen, "no panels, no reservation");
@@ -2018,17 +1443,12 @@ mod tests {
 
     #[test]
     fn a_manager_changing_a_windows_state_invalidates_what_it_last_asked_to_be() {
-        // **The dedup compares against a value the manager also changes.** A client minimises
-        // through its title bar; the user restores through the taskbar, which is `SetMinimized`
-        // and not a client request; the next identical minimise was dropped as a repeat, and the
-        // client was told it had succeeded. The button worked once and then never again
-        // (PR #249 review, blocking 1).
+        // The dedup compares against a value the manager also changes: a minimise, a taskbar
+        // restore, then the same minimise must not be dropped as a repeat.
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest::new(80, 60, Role::Normal)).unwrap();
         assert!(s.note_state_request(w, 1), "the first minimise is news");
 
-        // What the shell does with it, and then what the taskbar does — neither is a client
-        // request, and both are reasons the shadow no longer describes the window.
         s.set_minimized(w, true).unwrap();
         s.clear_state_request(w);
         s.set_minimized(w, false).unwrap();
@@ -2071,8 +1491,6 @@ mod tests {
 
     #[test]
     fn commit_returns_the_previous_buffer_to_release_not_the_new_one() {
-        // Releasing the newly committed buffer would hand the client back memory the
-        // compositor is about to read — the tearing this protocol exists to prevent.
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest::new(4, 4, Role::Normal)).unwrap();
         s.attach(&attach(w, 0, 4, 4)).unwrap();
@@ -2081,7 +1499,6 @@ mod tests {
         assert_eq!(s.commit(&commit(w, 0)).unwrap(), None, "nothing was on screen before");
         assert_eq!(s.commit(&commit(w, 1)).unwrap(), Some(0), "buffer 0 is now free");
         assert_eq!(s.commit(&commit(w, 0)).unwrap(), Some(1));
-        // Re-committing the same buffer frees nothing.
         assert_eq!(s.commit(&commit(w, 0)).unwrap(), None);
     }
 
@@ -2095,14 +1512,8 @@ mod tests {
 
     #[test]
     fn re_attaching_a_free_buffer_replaces_it_and_the_committed_one_is_refused() {
-        // **How a client resizes** (M9 Part D). The protocol has no detach, so a resize that
-        // needed new ids would grow this window's buffer list — and the compositor's mappings
-        // — by two for every maximise and every restore. Replacing is bounded by construction.
-        //
-        // Refused for the *committed* buffer, whose pixels the compositor may be reading: that
-        // would change the screen with no commit, which is the tearing the buffer protocol
-        // exists to make unrepresentable. A double-buffered client always has a free buffer to
-        // replace first, so nothing an honest resize does is refused.
+        // A resize replaces buffer ids (the protocol has no detach); the committed buffer is
+        // refused, as its pixels may be being read.
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest::new(4, 4, Role::Normal)).unwrap();
         s.attach(&attach(w, 0, 4, 4)).unwrap();
@@ -2160,7 +1571,6 @@ mod tests {
         let a = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
         let b = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
         s.create(&CreateWindowRequest::new(32, 4, Role::Panel { dock: Edge::Top, reserve: 4 })).unwrap();
-        // The panel is topmost, but must not take focus.
         assert_eq!(s.focus_candidate(), Some(b));
         assert!(!s.raise(a).unwrap().rect().is_empty());
         assert_eq!(s.focus_candidate(), Some(a));
@@ -2173,18 +1583,14 @@ mod tests {
         assert_eq!(s.focus_candidate(), None);
     }
 
-    /// The stack's window ids, bottom-first.
     fn order(s: &WindowStack) -> Vec<u32> {
         s.windows().iter().map(|w| w.id).collect()
     }
 
     #[test]
     fn moving_a_window_dirties_where_it_was_and_where_it_is() {
-        // **A rectangle cannot express "old minus new"**, so the union is the tightest correct
-        // answer — and computing it after the move, the way every other path computes `dirty`,
-        // would repaint the destination and leave the window's old pixels on screen. M5 shipped
-        // that bug once for a resized buffer; `place` returns the damage so it cannot be
-        // computed the wrong way here.
+        // A rectangle cannot say "old minus new", so the union is the answer, computed by `place`
+        // itself from the pre-move state.
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
         let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
@@ -2192,11 +1598,8 @@ mod tests {
         src.put(w, 0, geom(8, 8), Rgb::new(1, 2, 3));
         s.commit(&commit(w, 0)).unwrap();
 
-        // **The union of where it was and where it is, each including its shadow** (M13 Part C).
-        // Written as the arithmetic rather than as the resulting numbers, so it still reads as
-        // "both positions and nothing more" — and the two checks below it are what stop that from
-        // being a restatement of the implementation: the region must strictly contain both window
-        // rectangles, and `bounds` must not have grown.
+        // The union of where it was and where it is, each with its shadow; it must strictly contain
+        // both window rectangles.
         let shadow = window_shadow(Scheme::Light);
         let dirty = s.place(w, Point::new(20, 10)).unwrap();
         assert_eq!(
@@ -2207,18 +1610,13 @@ mod tests {
         assert!(dirty.rect().size.w > 28 && dirty.rect().size.h > 18, "the shadow is included");
         assert_eq!(s.window(w).unwrap().bounds(), Rect::new(20, 10, 8, 8), "bounds must not grow");
 
-        // A move that changes nothing still names the window's own rectangle rather than
-        // nothing — the union of a rect with itself — which is correct and costs one window.
         assert_eq!(s.place(w, Point::new(20, 10)).unwrap().rect(), shadow.around(Rect::new(20, 10, 8, 8)));
     }
 
     #[test]
     fn placing_a_window_that_has_never_committed_dirties_nothing() {
-        // Not an edge case: placing a window *before* its first commit is exactly what a
-        // manager does, and it is the whole point of the initial-configure handshake. An
-        // uncommitted window is skipped by compositing, so moving it paints over nothing and
-        // reveals nothing — reporting its bounds would repaint a region for no reason on every
-        // window launch.
+        // Placing a window before its first commit is what a manager does; it is not on screen, so
+        // nothing is repainted.
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest::new(64, 64, Role::Normal)).unwrap();
         let dirty = s.place(w, Point::new(100, 100)).unwrap();
@@ -2228,10 +1626,6 @@ mod tests {
 
     #[test]
     fn a_zero_sized_damage_is_the_identity_when_folded_into_a_wider_region() {
-        // The convention this crate uses for "nothing changed", and the reason `place` can
-        // return one rather than an `Option`: a caller unioning it into a wider `dirty` needs no
-        // special case, and a caller repainting it directly paints nothing, because `Rect`'s
-        // bounds are exclusive.
         let empty = Rect::new(100, 100, 0, 0);
         let real = Rect::new(4, 4, 10, 10);
         assert_eq!(union(empty, real), real);
@@ -2260,24 +1654,15 @@ mod tests {
 
     #[test]
     fn raise_above_moves_one_window_and_leaves_the_rest_in_order() {
-        // What alt-tab needs. A full `raise` would put the window on top and reorder everything
-        // between, which the user sees as the rest of the stack shuffling behind the one they
-        // asked for.
         let mut s = WindowStack::new();
         let ids: Vec<u32> = (0..4).map(|_| s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap()).collect();
 
-        // Move the bottom window to just above the second — the case where removing it shifts
-        // the target's index, which an index captured before the removal gets wrong by one.
         assert!(!s.raise_above(ids[0], ids[1]).unwrap().rect().is_empty());
         assert_eq!(order(&s), [ids[1], ids[0], ids[2], ids[3]]);
 
-        // And downward, where no such shift happens: the two directions are different code
-        // paths through the same two lines.
         assert!(!s.raise_above(ids[3], ids[1]).unwrap().rect().is_empty());
         assert_eq!(order(&s), [ids[1], ids[3], ids[0], ids[2]]);
 
-        // Already above it: a no-op, not an error — a shell walking a window list should not
-        // have to special-case the window it is already above.
         let before = order(&s);
         assert!(s.raise_above(ids[3], ids[3]).unwrap().rect().is_empty());
         assert_eq!(order(&s), before);
@@ -2301,23 +1686,15 @@ mod tests {
         s.attach(&attach(b, 0, 8, 8)).unwrap();
         src.put(b, 0, geom(8, 8), blue);
         s.commit(&commit(b, 0)).unwrap();
-        // Damage ignored: the test composites the whole screen below.
         let _ = s.place(b, Point::new(4, 4)).unwrap();
 
         let mut fb = screen();
         let full = fb.geometry().bounds();
         s.compose_into(&mut fb, Rgb::BLACK, &src, &[full]);
 
-        // **Two of these are darkened by `b`'s shadow now** (M13 Part C), and saying so is more
-        // honest than moving the sample points: `b` casts over the whole of this 32x16 screen, so
-        // there is nowhere outside it to look. What this test claims is *stacking* — whose pixels
-        // are where — and that claim survives a shadow as "recognisably the lower window's red,
-        // and darker than the raw colour". The two inside `b` are exact, because a surface is
-        // never darkened by its own shadow.
-        //
-        // **Sampled a pixel in from each window's corner** since the desktop refresh's Part B:
-        // both are rounded, and at 8x8 the radius clamps to 4, so a corner pixel is outside the
-        // curve and shows what is below. What is sampled is still whose pixels are where.
+        // Two samples are darkened by `b`'s shadow, so the claim is stacking: the lower window's
+        // red, darker than raw. Sampled a pixel in from each corner, as rounded corners show what
+        // is below.
         let lower = fb.get_pixel(2, 2).unwrap();
         assert!(lower.r > lower.g && lower.r > lower.b, "the lower window: {lower:?}");
         assert!(lower.r < red.r, "the lower window is darkened by the upper's shadow: {lower:?}");
@@ -2332,16 +1709,10 @@ mod tests {
     fn a_window_with_no_committed_buffer_shows_background_not_garbage() {
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
-        // **Configured**, or B4's gate skips the window one line above the `committed` guard
-        // and this test passes without ever reaching what it is named for — the hazard the
-        // comment below already warned about, for the guard after this one (PR #218 review,
-        // finding 1).
+        // Configured, or the visibility gate skips the window before the `committed` guard under
+        // test.
         let w = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
         s.attach(&attach(w, 0, 8, 8)).unwrap();
-        // **The pixels must exist**, or the source-resolution guard catches the window and
-        // this test says nothing about the `committed` guard it is named for. In the server
-        // an attached buffer is real mapped memory holding whatever the client last put
-        // there; showing it before a commit is the bug.
         src.put(w, 0, geom(8, 8), Rgb::new(0xC0, 0x10, 0x10));
         let mut fb = screen();
         let full = fb.geometry().bounds();
@@ -2351,15 +1722,13 @@ mod tests {
 
     #[test]
     fn destroying_an_ancestor_reaches_grandchildren() {
-        // A submenu is a popup parented to a popup. One pass over direct children leaves it
-        // alive with a dead parent — still compositing, still eligible for focus.
+        // A submenu is a popup parented to a popup; one pass over direct children would leave it
+        // alive.
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         let menu = s.create(&CreateWindowRequest::new(4, 4, Role::Popup { parent: w })).unwrap();
         let sub = s.create(&CreateWindowRequest::new(2, 2, Role::Popup { parent: menu })).unwrap();
         let dlg = s.create(&CreateWindowRequest::new(2, 2, Role::Dialog { parent: sub })).unwrap();
-        // Configured, because the last assertion is about focus and since B4 a window that is
-        // not on screen is not a focus candidate.
         let other = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
 
         s.destroy(w).unwrap();
@@ -2372,21 +1741,13 @@ mod tests {
 
     #[test]
     fn strut_accumulation_saturates_rather_than_wrapping() {
-        // `reserve` is bounded at the protocol edge, but `Role`'s fields are **public**, so
-        // the library must not rely on that: anything constructing a `Role` in Rust bypasses
-        // the parser entirely. A wrap here is worse than a panic — in release it returns the
-        // *full* screen as the work area, silently defeating the clamp.
-        //
-        // Sized to actually overflow: two reserves near `u32::MAX` do, where a hundred
-        // legitimate ones do not. An earlier version of this test used 128 panels at the
-        // protocol bound (8.4M total) and could not tell `wrapping_add` from
-        // `saturating_add` at all.
+        // `Role`'s fields are public, so the library must not rely on the parser bounding
+        // `reserve`: a wrap returns the full screen. Two reserves near `u32::MAX` actually
+        // overflow.
         let mut s = WindowStack::new();
         for _ in 0..2 {
-            // Exactly 2^31 each: the sum is 2^32, which wraps to **zero** — the case that
-            // silently returns the full screen. `u32::MAX - 1` twice wraps to a still-huge
-            // number the clamp handles anyway, so it proves nothing; that was this test's
-            // second wrong version.
+            // Exactly 2^31 each: the sum wraps to zero, the case that silently returned the full
+            // screen.
             s.create(&CreateWindowRequest::new(1, 1, Role::Panel { dock: Edge::Top, reserve: 0x8000_0000 })).unwrap();
         }
         let wa = s.work_area(Rect::new(0, 0, 100, 50));
@@ -2396,7 +1757,6 @@ mod tests {
 
     #[test]
     fn a_realistic_pair_of_bars_still_leaves_a_work_area() {
-        // The saturation guard must not swallow ordinary values.
         let mut s = WindowStack::new();
         s.create(&CreateWindowRequest::new(100, 32, Role::Panel { dock: Edge::Top, reserve: 32 })).unwrap();
         s.create(&CreateWindowRequest::new(100, 28, Role::Panel { dock: Edge::Bottom, reserve: 28 })).unwrap();
@@ -2411,16 +1771,12 @@ mod tests {
         assert_eq!(d.create(&req).unwrap(), n.create(&req).unwrap());
     }
 
-    // ---- shadows (M13 Part C) ----
+    // ---- shadows and corners ----
 
     #[test]
     fn every_floating_role_is_rounded_and_a_panel_is_not() {
-        // Through `compose_into`, like the shadow's role test beside it, so this covers the wiring
-        // as well as the rule: the very corner pixel of a rounded window is outside its curve and
-        // shows the ground; a panel's is its own. **All four roles**, because a menu's border is
-        // drawn on the promise that the compositor cuts its corners — with only `Normal` here,
-        // popups and dialogs could stop being rounded and every test would still pass (PR #313
-        // review, finding 3).
+        // Through `compose_into`, covering the wiring: a rounded window's corner pixel shows the
+        // ground. All four roles, so popups and dialogs cannot silently stop being rounded.
         for (make_role, rounded) in [
             ((|_| Role::Normal) as fn(u32) -> Role, true),
             ((|p| Role::Popup { parent: p }) as fn(u32) -> Role, true),
@@ -2429,7 +1785,6 @@ mod tests {
         ] {
             let mut s = WindowStack::new();
             let mut src = MapSource::default();
-            // A parent for the two roles that need one, kept off the sample points below.
             let parent = shown(&mut s, &CreateWindowRequest::new(2, 2, Role::Normal));
             let _ = s.place(parent, Point::new(80, 80));
             let role = make_role(parent);
@@ -2453,10 +1808,8 @@ mod tests {
 
     #[test]
     fn a_window_that_covers_the_screen_is_not_rounded() {
-        // **The overview's shape**: a popup the size of the screen, over a panel. Rounded, each
-        // cut corner showed the panel beneath at full brightness through a dimmed overlay — the
-        // first version claimed the bars sat on top and hid it, and a screendump said otherwise
-        // (PR #313 review, finding 1). Its corners are the screen's; there is nothing to round.
+        // The overview's shape: a popup the size of the screen, over a panel. Its corners are the
+        // screen's; rounding them showed the panel through the dimmed overlay.
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
         let screen = big_screen().geometry().bounds();
@@ -2477,8 +1830,6 @@ mod tests {
         for (x, y) in [(0, 0), (screen.size.w - 1, 0), (0, screen.size.h - 1)] {
             assert_eq!(fb.get_pixel(x, y), Some(cover_ink), "({x},{y}) shows what is beneath the cover");
         }
-        // The rule is about covering the screen, not about being a popup: the same popup a pixel
-        // short of the screen is rounded.
         assert_eq!(corner_of(Role::Popup { parent: bar }, screen, screen), 0);
         let short = Rect::new(0, 0, screen.size.w - 1, screen.size.h);
         assert_eq!(corner_of(Role::Popup { parent: bar }, short, screen), libdraw::corner::WINDOW_RADIUS);
@@ -2486,9 +1837,6 @@ mod tests {
 
     #[test]
     fn a_scheme_change_re_derives_every_windows_shadow_and_darkens_the_picture() {
-        // **The invariant the stored shadow rests on**: after `set_scheme`, every window casts
-        // exactly what `shadow_for` says its role casts in that scheme — including windows created
-        // *before* the change, which is the case a create-time-only derivation would get wrong.
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
         let normal = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
@@ -2514,22 +1862,18 @@ mod tests {
             assert_eq!(w.shadow, shadow_for(w.role, Scheme::Dark), "window {}", w.id);
         }
         assert_eq!(s.window(panel).unwrap().shadow, None, "a panel still casts none");
-        // The dark scheme's shadow reaches further and is stronger — the design's .55 against .22.
         assert!(s.window(normal).unwrap().painted_bounds().size.w > light_bounds.size.w);
         let dark = beside(&s);
         assert!(dark.r < light.r, "beside the window: dark {dark:?}, light {light:?}");
 
-        // A window created after the change is born in it.
         let later = s.create(&CreateWindowRequest::new(4, 4, Role::Normal)).unwrap();
         assert_eq!(s.window(later).unwrap().shadow, shadow_for(Role::Normal, Scheme::Dark));
     }
 
     #[test]
     fn a_window_casts_a_shadow_and_a_panel_does_not() {
-        // **Which roles float.** A bar is docked to a screen edge and the wallpaper *is* the
-        // ground; a shadow on either is a dark band along the edge of the screen with nothing
-        // above it to cast one. Asserted through `compose_into` rather than against
-        // `shadow_for` directly, so it covers the wiring as well as the decision.
+        // Which roles float: a bar or wallpaper with a shadow would show a dark band at the screen
+        // edge.
         for (make_role, shadowed) in [
             ((|_| Role::Normal) as fn(u32) -> Role, true),
             ((|p| Role::Popup { parent: p }) as fn(u32) -> Role, true),
@@ -2538,7 +1882,6 @@ mod tests {
         ] {
             let mut s = WindowStack::new();
             let mut src = MapSource::default();
-            // A parent for the two roles that need one, kept off the sample points below.
             let parent = shown(&mut s, &CreateWindowRequest::new(2, 2, Role::Normal));
             let _ = s.place(parent, Point::new(60, 40));
             let role = make_role(parent);
@@ -2553,7 +1896,6 @@ mod tests {
             let full = fb.geometry().bounds();
             s.compose_into(&mut fb, ground, &src, &[full]);
 
-            // Just left of the window, where a shadow would fall and the window does not reach.
             let beside = fb.get_pixel(10, 6).unwrap();
             assert_eq!(
                 beside != ground,
@@ -2561,16 +1903,14 @@ mod tests {
                 "{role:?} should {} cast a shadow, got {beside:?} against {ground:?}",
                 if shadowed { "" } else { "not" }
             );
-            // Either way the window's own pixels are untouched by it.
             assert_eq!(fb.get_pixel(14, 6), Some(Rgb::new(200, 30, 30)), "{role:?}");
         }
     }
 
     #[test]
     fn a_windows_damage_grows_by_its_shadow_and_its_reported_geometry_does_not() {
-        // The split that keeps a shadow from being clickable or from being told to a client.
-        // `info` is what a client asks for its own size; `painted_bounds` is what repainting
-        // needs. A single rectangle serving both would break one of the two.
+        // A shadow must be neither clickable nor told to a client: `info` and `painted_bounds`
+        // differ.
         let mut s = WindowStack::new();
         let id = shown(&mut s, &CreateWindowRequest::new(40, 30, Role::Normal));
         s.attach(&attach(id, 0, 40, 30)).unwrap();
@@ -2586,13 +1926,10 @@ mod tests {
         assert_eq!((info.x, info.y), (100, 60), "and its own origin");
     }
 
-    // ---- alpha (M13 Part B) ----
+    // ---- alpha ----
 
     #[test]
     fn a_window_attached_in_argb_is_composited_translucent() {
-        // End to end from the wire tag: the attach request's `format` is the only thing that
-        // makes this window translucent, so this covers the mapping `attach` does as well as the
-        // blend itself. A tag ignored on the way in would show up here as a flat red square.
         let mut stack = WindowStack::new();
         let mut src = MapSource::default();
         let id = shown(&mut stack, &CreateWindowRequest::new(8, 8, Role::Normal));
@@ -2622,16 +1959,12 @@ mod tests {
         let full = fb.geometry().bounds();
         stack.compose_into(&mut fb, bg, &src, &[full]);
 
-        // The window's middle rather than `(1, 1)`, which is on its rounded corner's curve since
-        // the desktop refresh's Part B and blends at the curve's coverage as well as its own.
         assert_eq!(fb.get_pixel(4, 4), Some(ink.blend(bg, 128)));
         assert_ne!(fb.get_pixel(4, 4), Some(ink), "the tag was ignored and it drew opaque");
     }
 
-    // ---- Screen: the shadow buffer (M13 Part A) ----
+    // ---- the shadow buffer ----
 
-    /// A stack with one window committed, striped so which source row landed where is readable
-    /// off the screen. Shared by the `Screen` tests below.
     fn one_window(s: &mut WindowStack, src: &mut MapSource, w: u32, h: u32) -> u32 {
         let id = shown(s, &CreateWindowRequest::new(w, h, Role::Normal));
         s.attach(&attach(id, 0, w, h)).unwrap();
@@ -2642,8 +1975,8 @@ mod tests {
 
     #[test]
     fn composing_through_the_shadow_draws_what_composing_directly_draws() {
-        // **The equivalence the whole change rests on.** Everything else about `Screen` is a
-        // claim about *when* pixels appear; this is the claim that the same ones do.
+        // The equivalence the change rests on: buffered and direct composition show the same
+        // pixels.
         let mut stack = WindowStack::new();
         let mut src = MapSource::default();
         one_window(&mut stack, &mut src, 8, 6);
@@ -2660,54 +1993,32 @@ mod tests {
         direct.present(&stack, bg, &src, &[full], pointer, None);
 
         assert_eq!(buffered.display().bytes(), direct.display().bytes());
-        // Negative control: if neither drew anything, the line above compares two blank screens.
         assert_ne!(buffered.display().bytes(), screen().bytes(), "nothing was drawn");
     }
 
     #[test]
     fn only_the_damage_is_copied_to_the_display() {
-        // **Asserted as a byte count, because the picture cannot tell.** A copy that ignored
-        // damage and pushed the whole shadow would put the identical image on screen — the
-        // shadow mirrors the display faithfully — while turning every one-pixel drag back into a
-        // full-screen blit. This was written first as a pixel comparison and a deliberate
-        // copy-everything mutation passed it; see `copy_damage`'s doc.
+        // Asserted as a byte count because the picture cannot tell: a copy of the whole shadow
+        // draws the identical image.
         let mut shadow = MemFramebuffer::new(screen().geometry());
         shadow.clear(Rgb::new(7, 7, 7));
         let mut display = screen();
 
         let corner = Rect::new(0, 0, 4, 4);
         assert_eq!(copy_damage(&mut display, &shadow, &[corner]), 4 * 4 * 4);
-        // …and the four rows that were copied are the right four.
         assert_eq!(display.get_pixel(0, 0), Some(Rgb::new(7, 7, 7)));
         assert_eq!(display.get_pixel(5, 0), Some(Rgb::new(0, 0, 0)));
 
-        // Clipped to the screen rather than refused, and counted as clipped.
         let over = Rect::new(30, 14, 40, 40);
         assert_eq!(copy_damage(&mut display, &shadow, &[over]), 2 * 2 * 4);
-        // Entirely outside: nothing at all.
         assert_eq!(copy_damage(&mut display, &shadow, &[Rect::new(90, 90, 4, 4)]), 0);
     }
 
     #[test]
     fn a_later_small_frame_leaves_the_rest_of_the_display_alone() {
-        // **What this checks is placement, end to end**: a second, small-damage `present` puts the
-        // right pixels at the right coordinates on the real display. It fails if `copy_damage`
-        // mislocates a row — losing the last row of each rectangle was the mutation that proved
-        // it live.
-        //
-        // **It does not bound the work, and the comment here used to say it did** (PR #274
-        // review). Two mutations pass it: recomposing the whole screen into the shadow while
-        // copying only the damage, and copying the whole shadow every frame. Both draw this exact
-        // picture, because the shadow is a faithful mirror — which is the same reason
-        // `only_the_damage_is_copied_to_the_display` had to become a byte count. The recompose
-        // side is bounded by `libdraw`'s `damage_bounds_what_is_repainted`, not by anything here.
-        //
-        // **Nor is it a test that the shadow's contents persist**, which this was first written
-        // as — a deliberate mutation clearing the shadow at the top of every present passed it. That mutation is not a bug either, which is the useful part: each
-        // damage rectangle is *fully* repainted (background where exposed, surfaces over it), so
-        // what the shadow held there beforehand never reaches the screen, and what it holds
-        // outside is never copied. The shadow is a staging buffer, not a cache, and there is no
-        // stale-content hazard to guard against.
+        // Checks placement end to end: a small-damage `present` puts the right pixels at the right
+        // coordinates. It does not bound the work (the byte-count test does), and the shadow is a
+        // staging buffer, not a cache, so its contents need not persist between presents.
         let mut stack = WindowStack::new();
         let mut src = MapSource::default();
         one_window(&mut stack, &mut src, 8, 6);
@@ -2718,19 +2029,13 @@ mod tests {
         sc.present(&stack, bg, &src, &[full], Point::new(20, 12), None);
         let after_full = sc.display().bytes().to_vec();
 
-        // A second frame damaging one corner, with nothing about the stack changed.
         sc.present(&stack, bg, &src, &[Rect::new(0, 0, 2, 2)], Point::new(20, 12), None);
         assert_eq!(sc.display().bytes(), &after_full[..], "the small frame disturbed the screen");
-        // Negative control: the full frame drew something, so the equality above is not two
-        // blank screens agreeing.
         assert_ne!(after_full, screen().bytes(), "the first frame drew nothing");
     }
 
     #[test]
     fn a_screen_with_no_shadow_still_paints() {
-        // The out-of-memory fallback is the old behaviour, not a broken one: the flicker returns
-        // and nothing else changes. A fallback that silently drew nothing would turn a memory
-        // shortage into a black screen.
         let mut stack = WindowStack::new();
         let mut src = MapSource::default();
         one_window(&mut stack, &mut src, 8, 6);
@@ -2739,17 +2044,13 @@ mod tests {
         assert!(!sc.is_buffered());
         let full = screen().geometry().bounds();
         sc.present(&stack, Rgb::new(9, 9, 9), &src, &[full], Point::new(20, 12), None);
-        // Inside the window's rounded corners (Part B), so the row is the window's own.
         assert_eq!(sc.display().get_pixel(4, 3), Some(row_colour(3)));
     }
 
     #[test]
     fn a_buffer_the_source_cannot_resolve_is_skipped_not_drawn() {
-        // The server maps buffers; a client can commit one whose mapping has gone. Drawing
-        // from an unresolvable buffer would read whatever memory happened to be there.
         let mut s = WindowStack::new();
         let src = MapSource::default(); // deliberately empty
-        // Configured, so B4's gate is not what skips this window — see finding 1.
         let w = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
         s.attach(&attach(w, 0, 8, 8)).unwrap();
         s.commit(&commit(w, 0)).unwrap();
@@ -2769,7 +2070,6 @@ mod tests {
             }
         }
         let mut s = WindowStack::new();
-        // Configured, so B4's gate is not what skips this window — see finding 1.
         let w = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
         s.attach(&attach(w, 0, 8, 8)).unwrap();
         s.commit(&commit(w, 0)).unwrap();
@@ -2797,8 +2097,6 @@ mod tests {
 
         let mut fb = screen();
         s.compose_into(&mut fb, Rgb::BLACK, &src, &[full]);
-        // The middle of the overlap, not `(0, 0)`: both windows are rounded since Part B, and
-        // their shared corner pixel shows neither.
         assert_eq!(fb.get_pixel(4, 4), Some(blue), "window 2 is on top");
 
         assert!(!s.raise(1).unwrap().rect().is_empty());
@@ -2809,25 +2107,19 @@ mod tests {
 
     #[test]
     fn a_modifier_press_neither_repeats_nor_hijacks_a_repeat_in_flight() {
-        // **The pair of bugs the arming decision carried while it lived in the server loop.**
-        // Modifiers arrive as ordinary key transitions, so an unqualified arm made holding
-        // Ctrl repeat it, and — one slot — made pressing Shift mid-run replace the run.
+        // Modifiers arrive as ordinary key transitions: arming on them made holding Ctrl repeat,
+        // and pressing Shift mid-run replace the run.
         let now = 1_000;
 
-        // Holding a modifier with nothing repeating starts nothing.
         assert_eq!(Repeat::after_key(None, KEY_LEFTCTRL, true, 0, 0, Some(7), now), None, "a modifier armed a repeat");
 
-        // Pressing a modifier while `a` repeats leaves `a`'s run exactly as it was...
         let run = Repeat::armed(KEY_A, 0, 0, 7, now);
         let after_shift_down = Repeat::after_key(Some(run), KEY_LEFTSHIFT, true, 0, 0, Some(7), now + 50);
         assert_eq!(after_shift_down, Some(run), "a modifier press hijacked the repeat");
 
-        // ...and releasing it leaves the run alone too, which is the half that was already
-        // guarded — it only held because the press half no longer overwrites `keycode`.
         let after_shift_up = Repeat::after_key(after_shift_down, KEY_LEFTSHIFT, false, 0, 0, Some(7), now + 90);
         assert_eq!(after_shift_up, Some(run), "a modifier release stopped the repeat");
 
-        // The held key's own release still stops it.
         assert_eq!(
             Repeat::after_key(after_shift_up, KEY_A, false, 0, 0, Some(7), now + 120),
             None,
@@ -2837,8 +2129,6 @@ mod tests {
 
     #[test]
     fn every_modifier_is_excluded_both_sides() {
-        // Named individually rather than trusting one representative: the table has eight
-        // entries and a keycode missing from it repeats.
         for code in [
             KEY_LEFTSHIFT,
             KEY_RIGHTSHIFT,
@@ -2851,13 +2141,9 @@ mod tests {
         ] {
             assert_eq!(Repeat::after_key(None, code, true, 0, 0, Some(1), 0), None, "keycode {code} armed a repeat");
         }
-        // And an ordinary key still does, or the exclusion is too wide.
         assert!(Repeat::after_key(None, KEY_A, true, 0, 0, Some(1), 0).is_some(), "an ordinary key stopped repeating");
     }
 
-    /// **A lock key neither repeats nor takes a run** (Phase 6 Part B.5): Caps Lock held is not a key
-    /// to send at the repeat rate, and pressing it while `a` repeats leaves `a` repeating — with the
-    /// locks it went down with, which `modifiers_are_frozen_at_the_press` holds for modifiers.
     #[test]
     fn a_lock_key_neither_repeats_nor_takes_a_run() {
         for lock in [KEY_CAPSLOCK, KEY_NUMLOCK] {
@@ -2868,9 +2154,6 @@ mod tests {
         }
     }
 
-    /// **A repeat carries the locks its key went down with** (Phase 6 Part B.5; PR #359 review): a
-    /// held keypad 1 under Num Lock repeats `1`, and a held `a` under Caps Lock repeats `A` — however
-    /// the locks change during the run. Every other repeat test passes no lock, so nothing held this.
     #[test]
     fn a_repeat_carries_the_locks_it_went_down_with() {
         use librsproto::surface::{KEY_REPEAT, LOCK_CAPS, LOCK_NUM, MOD_SHIFT};
@@ -2879,38 +2162,25 @@ mod tests {
         let e = run.event();
         assert_eq!((e.window, e.keycode, e.pressed), (7, KEY_A, KEY_REPEAT));
         assert_eq!((e.modifiers, e.locks), (MOD_SHIFT, LOCK_CAPS | LOCK_NUM), "the press's, sent with each repeat");
-        // Caps Lock pressed mid-run changes nothing the run sends.
         let after = Repeat::after_key(Some(run), KEY_CAPSLOCK, true, MOD_SHIFT, LOCK_NUM, Some(7), 50);
         assert_eq!(after.map(|r| r.event().locks), Some(LOCK_CAPS | LOCK_NUM));
     }
 
     #[test]
     fn a_press_with_no_focus_candidate_disarms_rather_than_leaving_a_stale_run() {
-        // The window a repeat targets is captured at the press. A press while nothing can
-        // take focus must not leave the *previous* key repeating into a window that is no
-        // longer the focus candidate.
         let run = Repeat::armed(KEY_A, 0, 0, 7, 0);
         assert_eq!(Repeat::after_key(Some(run), KEY_B, true, 0, 0, None, 100), None);
     }
 
     #[test]
     fn presenting_leaves_the_pointer_on_screen_over_a_window() {
-        // **The test that was missing.** The cursor is drawn over the composed stack rather
-        // than composited into it, so every path that recomposes has to redraw it — and three
-        // of the four paths in the server binary did not (PR #185 review, finding 1): a click
-        // raised a window, recomposed the whole screen, and erased the pointer until the mouse
-        // moved next. Nothing could fail: the binary's screen-update path takes a `Server` and
-        // a `RawFramebuffer`, so it is unreachable from a host test, and the gate never sees it
-        // because the click that would trigger it is followed by a reply that repaints.
-        //
-        // Pairing the two here is what makes it testable, and `pub(crate)` on `compose_into`
-        // is what stops a fifth path from being added without it.
+        // The cursor is drawn over the composed stack, so every path that recomposes must redraw
+        // it; the binary's screen-update path cannot be host-tested, so pairing them here makes it
+        // testable.
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
         let w = shown(&mut s, &CreateWindowRequest::new(64, 64, Role::Normal));
         s.attach(&attach(w, 0, 64, 64)).unwrap();
-        // A window colour the cursor's body is not, so "the pointer is there" cannot be
-        // satisfied by the window's own pixels.
         let window_colour = Rgb::new(0x10, 0x80, 0x20);
         src.put(w, 0, geom(64, 64), window_colour);
         s.commit(&commit(w, 0)).unwrap();
@@ -2921,13 +2191,9 @@ mod tests {
         s.present_into(&mut fb, Rgb::BLACK, &src, &[full], pointer, None);
 
         assert!(body_pixels(&fb, pointer) > 0, "the pointer is not on screen over the window it is above");
-        // And the window is still underneath it, rather than the cursor having replaced a
-        // recompose that never happened.
-        // `(10, 10)`: inside the window's rounded corner (Part B), and clear of the sprite at 20.
         assert_eq!(fb.get_pixel(10, 10), Some(window_colour), "the stack did not compose");
     }
 
-    /// Cursor body pixels inside the sprite's rectangle at `at`.
     fn body_pixels(fb: &MemFramebuffer, at: Point) -> usize {
         let r = cursor_rect(at);
         let mut n = 0;
@@ -2943,10 +2209,8 @@ mod tests {
 
     #[test]
     fn presenting_draws_the_pointer_into_every_damage_rectangle() {
-        // `serve_input` passes the cursor's old and new rectangles in one damage list — with
-        // whatever a restack disturbed alongside them — and a `present_into` that drew into only
-        // the first would leave the pointer erased at its destination whenever the two
-        // rectangles do not overlap.
+        // `serve_input` passes the cursor's old and new rectangles in one damage list; drawing into
+        // only the first would erase the pointer at its destination.
         let s = WindowStack::new();
         let src = MapSource::default();
         let pointer = Point::new(40, 40);
@@ -2958,14 +2222,9 @@ mod tests {
 
     #[test]
     fn the_guest_configuration_composites_a_client_surface() {
-        // The exact shape `ui-testclient` produces in the guest: a 1280x800 screen at
-        // pitch 5120, a 64x32 client surface at **pitch 268**, window origin (0,0). Written
-        // after the guest showed pure background in the window region with every guard in
-        // `compose_into` passing and the client's pixels verified correct.
-        //
-        // 268 is not 64*4. The padding is the point: a source stride computed from the
-        // width instead of the pitch skews every row after the first, and the two numbers
-        // agreeing would hide it. Keep this in step with `libdraw::scene::SCREEN_PITCH`.
+        // The shape `ui-testclient` produces in the guest: a 1280x800 screen at pitch 5120, a 64x32
+        // surface at pitch 268 (not 64*4): a stride computed from the width skews every row after
+        // the first. Keep in step with `libdraw::scene::SCREEN_PITCH`.
         let mut fb = MemFramebuffer::new(Geometry::with_pitch(1280, 800, 5120, PixelFormat::XRGB8888).unwrap());
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
@@ -2980,32 +2239,21 @@ mod tests {
         })
         .unwrap();
         let g = Geometry::with_pitch(64, 32, 268, PixelFormat::XRGB8888).unwrap();
-        // Striped, not uniform. With a single colour every assertion below holds just as
-        // well against a compositor that reads the source at `width * 4` — which is the
-        // bug the 268 pitch exists to expose, so the test would have been asserting
-        // nothing about the thing it was written for.
         src.put_striped(w, 0, g);
         s.commit(&commit(w, 0)).unwrap();
 
         let bounds = fb.geometry().bounds();
         s.compose_into(&mut fb, Rgb::new(0x0E, 0x14, 0x1B), &src, &[bounds]);
 
-        // Each of these names the source row it must have come from. Read at pitch 256,
-        // screen row 5 lands in source row 4 and row 31 in source row 29 — different
-        // colours, so the skew is a failure rather than a coincidence.
         assert_eq!(fb.get_pixel(6, 5), Some(row_colour(5)), "the client's surface must reach the screen, row for row");
-        // **Its first and last pixels are outside its rounded corners** since the desktop
-        // refresh's Part B, so the ends of the copy are checked where the surface is still square:
-        // the last row up to the curve, and the right edge down to it — the same two boundaries a
-        // wrong stride or a short row would break — and the same at the start.
+        // The first and last pixels are outside the rounded corners, so the ends of the copy are
+        // checked where the surface is still square.
         assert_eq!(fb.get_pixel(55, 31), Some(row_colour(31)), "the last row, to its curve");
         assert_eq!(fb.get_pixel(63, 23), Some(row_colour(23)), "the last column, to its curve");
         assert_eq!(fb.get_pixel(8, 0), Some(row_colour(0)), "and its first row");
         assert_eq!(fb.get_pixel(0, 8), Some(row_colour(8)), "and its first column");
-        // Past the right edge the surface stops — but its shadow does not, so this pixel is the
-        // background darkened rather than the background exactly (M13 Part C). Asserted as "not
-        // the surface's own row colour and no brighter than the ground", which is what "stops at
-        // its edge" means once a window casts one.
+        // Past the right edge the surface stops but its shadow does not: not the surface's colour,
+        // and no brighter than the ground.
         let past = fb.get_pixel(64, 0).unwrap();
         let ground = Rgb::new(0x0E, 0x14, 0x1B);
         assert_ne!(past, row_colour(0), "the surface must stop at its edge");
@@ -3017,8 +2265,6 @@ mod tests {
 
     #[test]
     fn info_reports_the_committed_size_not_the_requested_one() {
-        // A client may create a window at one size and commit a buffer of another; what is
-        // on screen is the buffer, so that is what `info` must report.
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
         let w = s.create(&CreateWindowRequest::new(100, 50, Role::Normal)).unwrap();
@@ -3028,7 +2274,6 @@ mod tests {
         s.attach(&attach(w, 0, 8, 8)).unwrap();
         src.put(w, 0, geom(8, 8), Rgb::BLACK);
         s.commit(&commit(w, 0)).unwrap();
-        // Damage ignored: this test is about the reported geometry, not repainting.
         let _ = s.place(w, Point::new(-3, 12)).unwrap();
 
         let info = s.info(w).unwrap();
@@ -3037,25 +2282,14 @@ mod tests {
         assert_eq!(info.id, w);
     }
 
-    /// A geometry change reports the rectangle that is **on screen**, and reports one for a
-    /// commit as well as for a place.
-    ///
-    /// Two defects in one test, because they share a cause — the event was built at the one
-    /// op it was written for, from the field that op happened to have. It reported the
-    /// *requested* size while `/dev/draw/<id>/info` reports the *committed* one, so a manager
-    /// and a namespace read disagreed about the same window at the same instant; and a client
-    /// that resized itself by committing a different buffer produced no event at all, leaving
-    /// polling as the only way to notice — which is what this event exists to remove
-    /// (PR #217 review, findings 1 and 2).
+    /// A geometry change reports the rectangle that is on screen, for a commit as well as a place.
     #[test]
     fn a_geometry_change_reports_committed_bounds_and_fires_for_a_commit_too() {
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
         let w = s.create(&CreateWindowRequest::new(100, 50, Role::Normal)).unwrap();
-        // Creating alone changes no bounds: there is no previous rectangle to differ from.
         assert!(s.take_geometry_changes().is_empty(), "create is not a geometry change");
 
-        // A commit that resizes the window — no manager involved anywhere.
         s.attach(&attach(w, 0, 8, 8)).unwrap();
         src.put(w, 0, geom(8, 8), Rgb::BLACK);
         s.commit(&commit(w, 0)).unwrap();
@@ -3064,7 +2298,6 @@ mod tests {
         let _ = s.place(w, Point::new(-3, 12)).unwrap();
         assert_eq!(s.take_geometry_changes(), vec![w], "and so is a place");
 
-        // The rectangle a manager would be handed must equal the one `info` answers with.
         let b = s.window(w).unwrap().bounds();
         let info = s.info(w).unwrap();
         assert_eq!(
@@ -3074,12 +2307,10 @@ mod tests {
         );
         assert_eq!((b.size.w, b.size.h), (8, 8), "committed, not the 100x50 requested");
 
-        // Re-committing the same buffer changes nothing, so it announces nothing.
         s.commit(&commit(w, 0)).unwrap();
         assert!(s.take_geometry_changes().is_empty(), "a commit that does not resize is silent");
     }
 
-    /// One dispatch that both moves and resizes a window reports it once, not twice.
     #[test]
     fn geometry_changes_are_deduplicated() {
         let mut s = WindowStack::new();
@@ -3092,18 +2323,9 @@ mod tests {
         assert_eq!(s.take_geometry_changes(), vec![w], "one id, however many times it moved");
     }
 
-    /// A window that has committed but has **not** been configured stays off the screen.
-    ///
-    /// This is M6 B4's ordering rule, and it is the whole of it. A client is obliged to wait
-    /// for its first `Configure` before committing, so a well-behaved one cannot get here —
-    /// which is exactly why the rule needs a test: without one, the gate is unreachable and
-    /// nothing would fail if compositing stopped checking it. What it buys is that a client
-    /// which jumps the handshake paints nothing rather than painting at the default origin
-    /// and jumping when the manager places it.
+    /// A window that has committed but has not been configured stays off the screen.
     #[test]
     fn an_unconfigured_window_is_not_composited_however_much_it_commits() {
-        // Sampled at `(4, 4)`, the window's middle: its `(0, 0)` is outside its rounded corner
-        // since the desktop refresh's Part B, and would read the ground whether it was shown or not.
         let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
         let mut fb = MemFramebuffer::new(screen);
         let mut s = WindowStack::new();
@@ -3121,8 +2343,6 @@ mod tests {
             "committed, but never configured: the client jumped the handshake and is not on screen"
         );
 
-        // The configure arrives — from the compositor, a manager, or the deadline; the stack
-        // does not care which — and the same pixels appear with no further commit.
         assert!(s.mark_configured(w), "this is the transition");
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
         assert_eq!(fb.get_pixel(4, 4), Some(Rgb::new(0xFF, 0xFF, 0xFF)), "configured: now it composites");
@@ -3130,7 +2350,6 @@ mod tests {
         assert!(!s.mark_configured(w), "marking twice is not a second transition");
     }
 
-    /// A configured, committed white 8×8 window at the origin, ready to composite.
     fn drawable(s: &mut WindowStack, src: &mut MapSource) -> u32 {
         let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         s.attach(&attach(w, 0, 8, 8)).unwrap();
@@ -3142,8 +2361,6 @@ mod tests {
 
     #[test]
     fn a_window_on_another_desktop_is_not_composited_and_comes_back_when_you_switch_to_it() {
-        // Sampled at `(4, 4)`, the window's middle: its `(0, 0)` is outside its rounded corner
-        // since the desktop refresh's Part B, and would read the ground whether it was shown or not.
         let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
         let mut fb = MemFramebuffer::new(screen);
         let mut s = WindowStack::new();
@@ -3159,9 +2376,6 @@ mod tests {
         s.compose_into(&mut fb, black, &src, &[screen.bounds()]);
         assert_eq!(fb.get_pixel(4, 4), Some(black), "desktop 2 does not show desktop 1's window");
 
-        // **Nothing was destroyed, and no commit is needed to get it back** — the window kept
-        // its buffer, so switching back is a filter changing its mind rather than a client
-        // being asked to redraw. That is what makes a desktop switch cheap.
         s.set_current_desktop(1).unwrap();
         s.compose_into(&mut fb, black, &src, &[screen.bounds()]);
         assert_eq!(fb.get_pixel(4, 4), Some(white), "and back again, with no further commit");
@@ -3169,8 +2383,6 @@ mod tests {
 
     #[test]
     fn a_sticky_window_composites_on_every_desktop() {
-        // Sampled at `(4, 4)`, the window's middle: its `(0, 0)` is outside its rounded corner
-        // since the desktop refresh's Part B, and would read the ground whether it was shown or not.
         let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
         let mut fb = MemFramebuffer::new(screen);
         let mut s = WindowStack::new();
@@ -3187,8 +2399,6 @@ mod tests {
 
     #[test]
     fn a_minimized_window_is_not_composited_though_it_stays_on_its_desktop() {
-        // Sampled at `(4, 4)`, the window's middle: its `(0, 0)` is outside its rounded corner
-        // since the desktop refresh's Part B, and would read the ground whether it was shown or not.
         let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
         let mut fb = MemFramebuffer::new(screen);
         let mut s = WindowStack::new();
@@ -3199,9 +2409,6 @@ mod tests {
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
         assert_eq!(fb.get_pixel(4, 4), Some(Rgb::new(0, 0, 0)), "minimized: off screen");
 
-        // **Still on desktop 1**, which is the whole reason this is a separate attribute: a
-        // window list is built per desktop, and a minimized window has to appear in the right
-        // one to be restorable from it.
         assert_eq!(s.window(w).unwrap().desktop, 1, "minimizing did not move it");
         assert!(s.set_minimized(w, false).unwrap());
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
@@ -3210,10 +2417,8 @@ mod tests {
 
     #[test]
     fn focus_does_not_land_on_a_window_that_is_not_on_screen() {
-        // Focus is derived from the stack — the topmost focusable window — so a window hidden
-        // by either attribute must stop being a candidate. Otherwise switching desktops leaves
-        // the keyboard pointed at something invisible and every keystroke is lost, which is the
-        // same argument that made unconfigured windows non-candidates in M6 B4.
+        // Focus follows the stack, so a hidden window must stop being a candidate or the keyboard
+        // points at something invisible.
         let mut s = WindowStack::new();
         let lower = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         s.mark_configured(lower);
@@ -3234,8 +2439,6 @@ mod tests {
 
     #[test]
     fn a_window_is_created_onto_the_current_desktop() {
-        // This is what makes "a window is never on no desktop" true by construction rather
-        // than by care — there is no assigned-later moment for anything to have to render.
         let mut s = WindowStack::new();
         let first = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         assert_eq!(s.window(first).unwrap().desktop, 1);
@@ -3248,24 +2451,18 @@ mod tests {
 
     #[test]
     fn the_sticky_value_is_refused_as_a_current_desktop() {
-        // `0` means "on every desktop". A current desktop of `0` would composite only sticky
-        // windows *and*, by create-onto-current, make every window created afterwards sticky —
-        // a state nothing could undo without knowing what each window's desktop should have
-        // been. `desktop switch N` takes N off a command line, so this is one keystroke away
-        // (PR #239 review, finding 7).
+        // A current desktop of 0 would composite only sticky windows and make every later window
+        // sticky; `desktop switch N` takes N off a command line.
         let mut s = WindowStack::new();
         assert_eq!(s.set_current_desktop(STICKY_DESKTOP), Err(StackError::StickyIsNotADesktop));
         assert_eq!(s.current_desktop(), 1, "and the current desktop is unchanged");
 
-        // A *window* may be sticky: the value is reserved, not forbidden.
         let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         assert!(s.set_window_desktop(w, STICKY_DESKTOP).is_ok());
     }
 
     #[test]
     fn moving_a_window_between_two_hidden_desktops_reports_no_visible_change() {
-        // The caller repaints the screen when this says `true`. A shell tidying windows in the
-        // background would otherwise repaint once per window for changes nobody can see.
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         s.mark_configured(w);
@@ -3277,7 +2474,6 @@ mod tests {
         assert!(s.set_minimized(w, false).unwrap(), "back on desktop 1 and un-minimized");
     }
 
-    /// A popup lands at its parent's origin plus the offset its creator asked for (C1).
     #[test]
     fn a_popup_is_created_at_its_offset_from_the_parent() {
         let mut s = WindowStack::new();
@@ -3291,9 +2487,6 @@ mod tests {
             "the parent's origin plus the offset, not the offset alone and not the origin"
         );
 
-        // **The offset is resolved once.** Moving the parent afterwards leaves the popup where
-        // it was — the documented limit of C1, pinned so it is a decision rather than a
-        // surprise. `TODO(popup-follows-parent)`.
         let _ = s.place(parent, Point::new(100, 100)).unwrap();
         assert_eq!(
             s.window(menu).unwrap().origin,
@@ -3302,27 +2495,17 @@ mod tests {
         );
     }
 
-    /// Only a `popup` is offset **from its parent**; the others ask the screen, and a panel does
-    /// not ask at all.
-    ///
-    /// The two parented roles share a wire shape and were treated as one placement rule, which
-    /// they are not: a `dialog`'s parent carries its desktop membership and its lifetime — not
-    /// its position. What changed in M11 Part E batch 8 is the *other* half — a `normal` or
-    /// `dialog` window's requested origin is now a preference the compositor honours until a
-    /// manager overrides it, instead of being discarded. The configure is held for the manager
-    /// either way, so this is only ever visible when nobody is managing.
+    /// Only a `popup` is offset from its parent; the others ask the screen, and a panel does not
+    /// ask.
     #[test]
     fn a_popup_is_offset_from_its_parent_and_the_rest_from_the_screen() {
         let mut s = WindowStack::new();
         let parent = shown(&mut s, &CreateWindowRequest::new(50, 50, Role::Normal));
         let _ = s.place(parent, Point::new(60, 70)).unwrap();
 
-        // **Absolute, not relative to anything.** A `normal` window has no parent to be relative
-        // to, and this one is created while another sits at (60, 70).
         let plain = s.create(&CreateWindowRequest::at(10, 10, Role::Normal, 77, 88)).unwrap();
         assert_eq!(s.window(plain).unwrap().origin, Point::new(77, 88), "the request was dropped");
 
-        // A dialog names a parent and is still not placed relative to it.
         let dlg = s.create(&CreateWindowRequest::at(10, 10, Role::Dialog { parent }, 77, 88)).unwrap();
         assert_eq!(
             s.window(dlg).unwrap().origin,
@@ -3330,28 +2513,18 @@ mod tests {
             "a dialog was offset from its parent, which is the popup rule leaking"
         );
 
-        // **A panel ignores it**: its role says which edge it docks to, and an offset would be a
-        // second answer to that question.
         let bar =
             s.create(&CreateWindowRequest::at(10, 10, Role::Panel { dock: Edge::Top, reserve: 10 }, 77, 88)).unwrap();
         assert_eq!(s.window(bar).unwrap().origin, Point::new(0, 0), "a panel took an offset");
 
-        // **And the default is unchanged**, which is what keeps every existing caller where it
-        // was: `new` asks for (0, 0) and gets it.
         let plain0 = s.create(&CreateWindowRequest::new(10, 10, Role::Normal)).unwrap();
         assert_eq!(s.window(plain0).unwrap().origin, Point::new(0, 0));
 
-        // A popup is offset from its parent, and still is.
         let menu = s.create(&CreateWindowRequest::at(10, 10, Role::Popup { parent }, 5, 6)).unwrap();
         assert_eq!(s.window(menu).unwrap().origin, Point::new(65, 76), "the popup is");
     }
 
-    /// **A popup is not clipped to its parent** — the whole reason popups are windows (C2).
-    ///
-    /// `libui`'s `offset` clips at the parent's edge, which is right one level down; a menu
-    /// that could not leave its window would not be a menu. Nothing in the compositor clips a
-    /// child to a parent, and this is what says so: the popup is drawn on all four sides of a
-    /// parent far too small to contain it.
+    /// A popup is not clipped to its parent — the whole reason popups are windows.
     #[test]
     fn a_popup_is_drawn_outside_its_parents_bounds() {
         let screen = Geometry::packed(64, 64, PixelFormat::XRGB8888);
@@ -3359,7 +2532,6 @@ mod tests {
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
 
-        // A tiny parent in the middle, and a popup that covers far more than it.
         let parent = shown(&mut s, &CreateWindowRequest::new(8, 8, Role::Normal));
         let _ = s.place(parent, Point::new(28, 28)).unwrap();
         s.attach(&attach(parent, 0, 8, 8)).unwrap();
@@ -3374,8 +2546,6 @@ mod tests {
 
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
         let white = Some(Rgb::new(0xFF, 0xFF, 0xFF));
-        // The popup spans (16,16)..(48,48); the parent only (28,28)..(36,36). Sample past the
-        // parent's edge on all four sides.
         assert_eq!(fb.get_pixel(20, 32), white, "left of the parent");
         assert_eq!(fb.get_pixel(44, 32), white, "right of it");
         assert_eq!(fb.get_pixel(32, 20), white, "above it");
@@ -3383,11 +2553,6 @@ mod tests {
     }
 
     /// A popup crossing a screen edge is clipped to the screen, including at a negative origin.
-    ///
-    /// The screen is the only clip left (C2). The negative-origin half is the one worth having:
-    /// `blit_clipped` derives its source coordinates by subtracting the surface origin, so an
-    /// origin left of or above the screen is where that arithmetic would go wrong — and it
-    /// would go wrong by reading the wrong pixels rather than by crashing.
     #[test]
     fn a_popup_crossing_a_screen_edge_is_clipped_not_wrapped() {
         let screen = Geometry::packed(32, 32, PixelFormat::XRGB8888);
@@ -3396,37 +2561,26 @@ mod tests {
         let mut src = MapSource::default();
 
         let parent = shown(&mut s, &CreateWindowRequest::new(4, 4, Role::Normal));
-        // Offset up and left, so the popup's origin is off-screen at (-8, -8).
-        //
-        // **32 across, not 16**, since the desktop refresh's Part B rounds a popup's corners: at
-        // 16 the radius clamps to 8, the popup is a circle, and the visible quarter is all curve.
-        // At 32 the clipped part keeps straight edges, which is what this test reads the rows off.
         let menu = s.create(&CreateWindowRequest::at(32, 32, Role::Popup { parent }, -8, -8)).unwrap();
         assert_eq!(s.window(menu).unwrap().origin, Point::new(-8, -8));
         s.mark_configured(menu);
         s.attach(&attach(menu, 0, 32, 32)).unwrap();
-        // Striped, so a row read from the wrong offset is visible rather than plausible.
         src.put_striped(menu, 0, geom(32, 32));
         s.commit(&commit(menu, 0)).unwrap();
 
         s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
 
-        // The visible part is the popup's bottom-right: screen (0,0) is popup pixel (8,8).
         assert_eq!(
             fb.get_pixel(0, 0),
             Some(row_colour(8)),
             "screen (0,0) shows the popup's row 8 — the clip moved the source, not just the size"
         );
         assert_eq!(fb.get_pixel(0, 23), Some(row_colour(31)), "and the last row it has");
-        // Past the popup's extent (it ends at 24,24) the background shows through.
         assert_eq!(fb.get_pixel(25, 25), Some(Rgb::new(0, 0, 0)), "nothing beyond it");
     }
 
     #[test]
     fn info_publishes_the_desktop_and_the_minimized_bit() {
-        // Deleting either line in `info()` passed every host test until this one existed —
-        // only the guest gate caught it, and a host test is cheaper than a boot
-        // (PR #240 review, optional 4).
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest::new(8, 8, Role::Normal)).unwrap();
         assert_eq!(s.info(w).unwrap().desktop, 1, "created onto the current desktop");
@@ -3464,21 +2618,13 @@ mod tests {
         assert_eq!(s.attach(&req), Err(StackError::BadGeometry));
     }
 
-    /// `take_removed` reports **every** window that went, parent first, and then drains.
-    ///
-    /// The set is what the manager's `WindowDestroyed` event is built from, and a menu chain
-    /// means one `DestroyWindow` can remove several windows — so a stack that recorded only
-    /// the id it was passed would leave a manager holding windows that no longer exist and
-    /// will never be mentioned again. It drains because the bin calls it after every dispatch
-    /// whether or not a manager is attached; a log that did not clear would re-announce the
-    /// same destruction on every later call, and grow without bound when nobody is listening.
+    /// `take_removed` reports every window that went, parent first, and then drains.
     #[test]
     fn take_removed_reports_the_whole_subtree_parent_first_then_drains() {
         let mut s = WindowStack::new();
         let root = s.create(&CreateWindowRequest::new(100, 80, Role::Normal)).unwrap();
         let menu = s.create(&CreateWindowRequest::new(40, 20, Role::Popup { parent: root })).unwrap();
         let submenu = s.create(&CreateWindowRequest::new(30, 15, Role::Popup { parent: menu })).unwrap();
-        // An unrelated window must not appear in the removed set.
         let other = s.create(&CreateWindowRequest::new(10, 10, Role::Normal)).unwrap();
 
         assert!(s.take_removed().is_empty(), "nothing has been destroyed yet");

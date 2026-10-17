@@ -59,7 +59,6 @@ impl Sha256 {
     pub fn update(&mut self, mut data: &[u8]) {
         self.total_len = self.total_len.wrapping_add(data.len() as u64);
 
-        // Complete a partially-filled block first.
         if self.buf_len > 0 {
             let need = BLOCK_LEN - self.buf_len;
             let take = need.min(data.len());
@@ -73,7 +72,6 @@ impl Sha256 {
             }
         }
 
-        // Process whole blocks straight from the input.
         while data.len() >= BLOCK_LEN {
             let mut block = [0u8; BLOCK_LEN];
             block.copy_from_slice(&data[..BLOCK_LEN]);
@@ -81,7 +79,6 @@ impl Sha256 {
             data = &data[BLOCK_LEN..];
         }
 
-        // Stash the remainder.
         if !data.is_empty() {
             self.buf[..data.len()].copy_from_slice(data);
             self.buf_len = data.len();
@@ -224,7 +221,6 @@ mod tests {
 
     #[test]
     fn streaming_matches_oneshot() {
-        // Feeding the message in awkward chunks must equal the one-shot digest.
         let msg: &[u8] = b"The quick brown fox jumps over the lazy dog";
         let one = sha256(msg);
         let mut h = Sha256::new();

@@ -1,4 +1,4 @@
-//! `cargo xtask check-docs`: links, heading anchors, cited source paths and status lines in the docs.
+//! `cargo xtask check-docs`: links, anchors, cited source paths and status lines in the docs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,13 +8,9 @@ use crate::{R, read_text, repo_root};
 
 /// `cargo xtask check-docs` — the documentation cannot point at things that do not exist.
 ///
-/// Three cheap, mechanical checks. None of them can tell whether a doc's *prose* is true;
-/// they exist because the 2026-08-05 consistency pass found that a large share of the
-/// drift was not subtle at all. `docs/architecture/overview.md` — the file the root
-/// `CLAUDE.md` tells you to read first — linked to five documents that had never been
-/// written, and a spec cited a `librsproto` source file that does not exist. A reader who
-/// follows a dead reference goes to the source and builds a private model, which is one of
-/// the ways the docs and the code came apart in the first place.
+/// Three cheap, mechanical checks; none can tell whether a doc's *prose* is true. A reader who
+/// follows a dead reference builds a private model, which is one of the ways the docs and the
+/// code came apart.
 ///
 /// 1. **Link integrity.** Every relative `[text](path.md)` link resolves.
 /// 2. **Cited source paths.** A backticked `kernel/…`, `userspace/…` or `tools/…` path in a
@@ -22,37 +18,32 @@ use crate::{R, read_text, repo_root};
 /// 3. **Status lines.** Every `docs/architecture/*.md` carries one, because `CLAUDE.md`
 ///    promises it and tells readers to trust it over the body's tense.
 ///
-/// **Check 2 is deliberately scoped, and the escape hatch is deliberate too.** It is an
-/// *allowlist*, not a denylist: only `docs/spec/`, `docs/reference/`, `docs/architecture/`
-/// and `docs/conventions/` are scanned for cited source paths (see `describes_current`).
-/// Everything else — `design/`, `archive/`, `planning/`, `rationale/`, the top-level
-/// `docs/*.md`, and the `CLAUDE.md` files — is exempt, because those either do not describe
-/// current behaviour or record what *was* true: a ticked box reading "Retire
-/// `kernel/src/embedded_images.rs` entirely" cites a path absent *because the work
-/// succeeded*, and rewriting it would corrupt the record.
+/// **Check 2 is deliberately scoped.** It is an *allowlist*: only `docs/spec/`,
+/// `docs/reference/`, `docs/architecture/` and `docs/conventions/` are scanned for cited source
+/// paths (see `describes_current`). Everything else — `design/`, `archive/`, `planning/`,
+/// `rationale/`, the top-level `docs/*.md`, and the `CLAUDE.md` files — is exempt, because those
+/// either do not describe current behaviour or record what *was* true: a ticked box reading
+/// "Retire `kernel/src/embedded_images.rs` entirely" cites a path absent *because the work
+/// succeeded*.
 ///
-/// The remaining false positive is the honest forward reference — `user-memory-access.md`
-/// says "*When* aarch64 is implemented its primitives live in …" — so a line carrying
-/// `<!-- check-docs: allow-missing -->` is exempt anywhere. Both shapes were real findings,
-/// not hypotheticals.
+/// The remaining false positive is the honest forward reference — "*When* aarch64 is
+/// implemented its primitives live in …" — so a line carrying
+/// `<!-- check-docs: allow-missing -->` is exempt anywhere.
 pub(crate) fn cmd_check_docs() -> R<()> {
     const ALLOW: &str = "<!-- check-docs: allow-missing -->";
     let root = repo_root();
 
-    // Docs that describe how the system behaves today. `design/` (subsystems not yet
-    // built), `archive/` (superseded artifacts) and `planning/` (intent, with checkboxes)
-    // are excluded from the source-path check for the reason in the doc comment above.
+    // Docs that describe how the system behaves today; `design/`, `archive/` and `planning/` are
+    // excluded from the source-path check for the reason in the doc comment above.
     let describes_current = |p: &Path| {
         let s = p.to_string_lossy().replace('\\', "/");
         ["/docs/spec/", "/docs/reference/", "/docs/architecture/", "/docs/conventions/"].iter().any(|d| s.contains(d))
     };
 
-    // Append-only records. Their backticked path mentions describe the world as it was —
-    // an entry explaining that `docs/history/decision-log.md` moved has to name the old
-    // path — so the cited-path checks are not applied to them, and the alternative was a
-    // `check-docs: allow-missing` marker on every future entry that describes a rename.
-    // Their markdown *links* are still checked: prose about an old path is a record, but a
-    // link is navigation, and a reader will click it.
+    // Append-only records. Their backticked path mentions describe the world as it was — an entry
+    // explaining that `docs/history/decision-log.md` moved has to name the old path — so the
+    // cited-path checks are not applied to them. Their markdown *links* are still checked: a link
+    // is navigation, and a reader will click it.
     let is_record = |p: &Path| {
         let s = p.to_string_lossy().replace('\\', "/");
         s.ends_with("/docs/decision-log.md") || s.contains("/docs/archive/")
@@ -60,9 +51,8 @@ pub(crate) fn cmd_check_docs() -> R<()> {
 
     let mut violations: Vec<String> = Vec::new();
     let (mut links, mut paths) = (0usize, 0usize);
-    // `(citing file, line, target file, anchor)`, resolved after the walk — a link into
-    // *another* document's heading needs that document read, which the per-file pass below
-    // cannot do without re-reading it once per link.
+    // `(citing file, line, target file, anchor)`, resolved after the walk: a link into *another*
+    // document's heading needs that document read, once rather than once per link.
     let mut anchor_refs: Vec<(PathBuf, usize, PathBuf, String)> = Vec::new();
 
     // Every Markdown file git knows or would: the `CLAUDE.md` files and the skills cite doc
@@ -71,7 +61,6 @@ pub(crate) fn cmd_check_docs() -> R<()> {
     let md_files = git_md_files(&root)?;
     md_listing_has_root(&md_files, &root)?;
 
-    // Every `*.md` basename in the repo, so a bare backticked filename can be resolved.
     let known_md: Vec<String> =
         md_files.iter().filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(String::from)).collect();
 
@@ -82,11 +71,8 @@ pub(crate) fn cmd_check_docs() -> R<()> {
             let at = |m: &str| format!("{}:{}: {m}", path.display(), i + 1);
 
             // 1. Relative markdown links to .md files.
-            //
-            // **Inline code is not markdown.** A document that *quotes* link syntax — this
-            // gate's own entry in `decision-log.md` writes ``](#anchor)`` — is talking about
-            // links, not making one. Blanking the code spans first is what lets prose describe
-            // the syntax without the checker chasing it.
+            // **Inline code is not markdown.** A document that *quotes* link syntax is talking
+            // about links, not making one; blanking code spans first lets prose describe it.
             let masked = mask_code_spans(line);
             let mut rest = masked.as_str();
             while let Some(open) = rest.find("](") {
@@ -99,11 +85,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                     continue;
                 }
                 // 1b. `](#anchor)` and `](other.md#anchor)`. A heading link that resolves to
-                // nothing is silent in every renderer — it scrolls nowhere — and this gate
-                // skipped it for years because it split on `#` and dropped what followed. A
-                // Part C link to `#close-0x0925` (the heading is `RequestClose … and Close …`,
-                // which slugs to something else entirely) is what found it; four more were
-                // already broken, one of them since the section was renamed.
+                // nothing is silent in every renderer — it scrolls nowhere.
                 if let Some((_, anchor)) = target.split_once('#')
                     && !anchor.is_empty()
                     // `#L36` is a GitHub line link, not a heading — it resolves on the web
@@ -125,10 +107,8 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                 }
             }
 
-            // 2a. Backticked `docs/…​.md` references, in every doc. These are prose, not
-            // markdown links, so check 1 never sees them — which is exactly how
-            // `docs/history/design-doc-v5.1.md` survived in `overview.md` for months
-            // while the file was really named `os-design-v5.1.md`.
+            // 2a. Backticked `docs/…` references to `.md` files, in every doc. These are prose, not
+            // markdown links, so check 1 never sees them.
             if !line.contains(ALLOW) && !is_record(path) {
                 for piece in line.split('`').skip(1).step_by(2) {
                     // `docs/spec/rsproto-*.md` names a family, not a file.
@@ -141,9 +121,9 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                             violations.push(at(&format!("cited doc does not exist: {piece}")));
                         }
                     } else if !piece.contains('/') {
-                        // A bare filename, e.g. ``see `desktop-shell.md` ``. Renaming a doc
-                        // leaves these behind — the `docs/…`-prefixed form gets swept and
-                        // the bare one does not. Dissolving `docs/history/` left 11 of them.
+                        // A bare filename, e.g. ``see `desktop-shell.md` ``. Renaming a doc leaves
+                        // these behind: the `docs/…`-prefixed form gets swept, the bare one does
+                        // not.
                         paths += 1;
                         if !known_md.iter().any(|k| k == piece) {
                             violations.push(at(&format!("cited doc does not exist anywhere in the repo: {piece}")));
@@ -152,7 +132,6 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                 }
             }
 
-            // 2. Backticked repo-relative source paths, in current-behaviour docs only.
             if describes_current(path) && !line.contains(ALLOW) {
                 for piece in line.split('`').skip(1).step_by(2) {
                     let ok_prefix = ["kernel/", "userspace/", "tools/"].iter().any(|p| piece.starts_with(p));
@@ -179,7 +158,6 @@ pub(crate) fn cmd_check_docs() -> R<()> {
         check(p)?;
     }
 
-    // 1b (continued). Resolve the collected heading links, reading each target once.
     let mut anchor_cache: std::collections::BTreeMap<PathBuf, Vec<String>> = std::collections::BTreeMap::new();
     let anchors = anchor_refs.len();
     for (src, line, target, anchor) in anchor_refs {
@@ -239,11 +217,8 @@ pub(crate) fn cmd_check_docs() -> R<()> {
     }
 
     // 4. The two hand-maintained numeric tables must agree with the kernel.
-    //
     // `abi-sync-check` ties the kernel to `libkern`; nothing tied either to the docs, so
     // `syscall-abi.md` and `error-codes.md` could drift from both and no gate would notice.
-    // They happen to agree today (37 syscalls, 16 error codes, checked 2026-08-05) — this
-    // keeps it that way, for the same reason `abi-sync-check` exists.
     let mut table_stats: Vec<String> = Vec::new();
     for (what, src_rel, doc_rel) in [
         ("syscall", "kernel/src/syscall/table.rs", "docs/spec/syscall-abi.md"),
@@ -264,7 +239,6 @@ pub(crate) fn cmd_check_docs() -> R<()> {
         let mut from_src: Vec<(i64, String)> = Vec::new();
         let mut declared = 0usize;
         if what == "syscall" {
-            // `pub const SYS_FOO_BAR: u64 = 12;` → (12, "sys_foo_bar")
             for line in src_text.lines() {
                 let Some(rest) = line.trim().strip_prefix("pub const SYS_") else { continue };
                 declared += 1;
@@ -273,9 +247,8 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                 from_src.push((num, format!("sys_{}", name.to_ascii_lowercase())));
             }
             // Every declared constant must have parsed. Without this, a number the parser
-            // cannot read is dropped *silently* — and if the doc omits it too, the two
-            // omissions cancel and the check reports agreement it never tested. That is
-            // how `0xFFFF_0000` slipped through: 39 constants, 37 compared, green.
+            // cannot read is dropped *silently* — and if the doc omits it too, the two omissions
+            // cancel and the check reports agreement it never tested (`0xFFFF_0000` once did).
             if declared != from_src.len() {
                 violations.push(format!(
                     "{src_rel}: {declared} `pub const SYS_` declarations but only {} parsed — \
@@ -305,7 +278,6 @@ pub(crate) fn cmd_check_docs() -> R<()> {
             }
         }
 
-        // Markdown rows: `| `<number>` | `<name>` | …`
         let mut from_doc: Vec<(i64, String)> = Vec::new();
         for line in doc_text.lines() {
             let line = line.trim();
@@ -344,8 +316,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
         from_src.sort();
         from_doc.sort();
 
-        // A checker that parses nothing passes silently. That is a vacuous check, and this
-        // project has shipped four vacuous tests; refuse to be the fifth.
+        // A checker that parses nothing passes silently; refuse to be vacuous.
         if from_src.is_empty() || from_doc.is_empty() {
             violations.push(format!(
                 "{what} table: parsed {} entries from {src_rel} and {} from {doc_rel} — \
@@ -443,11 +414,9 @@ fn root_claude_md(text: &str, listed: &[String]) -> Vec<String> {
 /// link, so a scan for `](` cannot find one inside backticks.
 ///
 /// **Only closed pairs, and only within this line.** A code span may wrap across lines —
-/// ``Priority::RealTime`` does, in `thread-args.md` — which leaves a line holding one unmatched
-/// backtick and everything after it looking like code. Masking from an unmatched backtick to the
-/// end of the line would swallow the real links that follow it (two of them, both found the
-/// moment this was written the other way). An unmatched backtick therefore masks nothing, which
-/// errs toward checking a link that was only being quoted rather than skipping one that was not.
+/// ``Priority::RealTime`` does, in `thread-args.md` — leaving one unmatched backtick and
+/// everything after it looking like code. Masking from it to the end of the line would swallow
+/// the real links that follow, so an unmatched backtick masks nothing.
 fn mask_code_spans(line: &str) -> String {
     let mut out: Vec<char> = line.chars().collect();
     let mut open: Option<usize> = None;
@@ -543,7 +512,7 @@ fn git_md_files(root: &Path) -> R<Vec<PathBuf>> {
     Ok(md_paths(root, &out.stdout).into_iter().filter(|p| p.is_file()).collect())
 }
 
-/// The paths in `git ls-files -z` output, each once: a file unmerged mid-merge is listed once a stage.
+/// The paths in `git ls-files -z` output, each once: an unmerged file is listed once a stage.
 fn md_paths(root: &Path, listing: &[u8]) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = listing
         .split(|&b| b == 0)

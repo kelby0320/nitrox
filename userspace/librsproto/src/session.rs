@@ -1,26 +1,13 @@
 //! The **directory-session client** — the caller's side of the `File` directory
 //! operations (`docs/spec/rsproto-file-ops.md`).
 //!
-//! A directory path resolved through the namespace yields a session `IpcChannel` scoped
-//! to one directory inode: the channel *is* the directory, and every op addresses entries
-//! **by name**, never by path, so a holder cannot reach outside it. [`Dir`] wraps such an
-//! endpoint and turns the request/reply codecs in [`file`](crate::file) into ordinary
-//! method calls — the plumbing that was hand-rolled at every call site before.
-//!
-//! ## Why this lives here and not in `libos`
-//!
-//! `libos` sits *below* this crate in the userspace layering and is `no_std` **without
-//! `alloc`**, so it cannot speak a protocol defined above it. The client belongs next to
-//! the wire definition it speaks. Gating it behind the `io` feature keeps the codec core
-//! dependency-free and host-testable — exactly the seam `libstream::channel::IpcPort`
-//! uses (see the decision log, 2026-07-24).
-//!
-//! ## Blocking, but not "a syscall that blocks"
-//!
-//! Each op is a send, a `sys_wait` on the endpoint, and a recv. The thread parks in
-//! `sys_wait` — never inside another syscall — which is the async-first contract, not a
-//! violation of it. Sequential callers (a coreutil listing a directory) want exactly this
-//! shape; a future task-based caller can drive the same codecs over `libos::Op`.
+//! A directory path resolved through the namespace yields a session `IpcChannel` scoped to one
+//! directory inode: the channel *is* the directory, and every op addresses entries **by
+//! name**, never by path. [`Dir`] wraps such an endpoint and turns the codecs in
+//! [`file`](crate::file) into method calls. It lives here, not in `libos`, which sits *below*
+//! this crate; the `io` feature keeps the codec core dependency-free. Each op is a send, a
+//! `sys_wait` on the endpoint, and a recv: the thread parks in `sys_wait`, never inside
+//! another syscall.
 
 use crate::file::{
     DIR_ENTRY_PREFIX_LEN, DirEntry, name_request, parse_read_dir_reply, read_dir_request, rename_request,
@@ -41,17 +28,14 @@ const OFF_PAYLOAD_LEN: usize = 4;
 /// `IpcMsgHeader.handle_count` field offset.
 const OFF_HANDLE_COUNT: usize = 8;
 
-/// The rights a directory session needs: send requests, receive replies, and `sys_wait`
-/// for the reply to arrive.
+/// The rights a directory session needs: send, receive, and `sys_wait` for the reply.
 pub const DIR_SESSION_RIGHTS: u64 = RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT;
 
-/// What can go wrong talking to a directory server. The `Server` variant carries the
-/// `KError` discriminant the server reported, so a caller can distinguish "no such entry"
-/// from "the directory is not empty" without decoding the reply itself.
+/// What can go wrong talking to a directory server. `Server` carries the reported `KError`
+/// discriminant, so a caller can tell "no such entry" from "directory not empty".
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DirError {
-    /// The server replied with an error; the payload is its `KError` discriminant
-    /// (negative, e.g. `KError::NotFound`).
+    /// The server replied with an error; the payload is its negative `KError` discriminant.
     Server(i32),
     /// A syscall failed (the payload is its negative return), or the reply never came.
     Transport(i32),
@@ -62,16 +46,11 @@ pub enum DirError {
 /// Result of a directory operation.
 pub type Result<T> = core::result::Result<T, DirError>;
 
-/// An open directory session: an endpoint handle plus the one message buffer its
-/// request/reply traffic uses.
+/// An open directory session: an endpoint handle plus the one message buffer its traffic uses.
 ///
-/// The buffer is caller-provided (`&mut [u8; IPC_MSG_SIZE]`-sized) so this crate stays
-/// `alloc`-free and a caller controls where a 4 KiB buffer lives — a coreutil puts it on
-/// the stack, a server in `.bss`. The same buffer carries the request out and the reply
-/// back: the request is fully consumed by the time the send returns.
-///
-/// Closing is explicit ([`close`](Self::close)) rather than a `Drop` impl, because
-/// dropping cannot report a failure and a handle close is worth not doing silently.
+/// The buffer is caller-provided so this crate stays `alloc`-free; the same buffer carries the
+/// request out and the reply back. Closing is explicit ([`close`](Self::close)), not a `Drop`,
+/// because dropping cannot report a failure.
 pub struct Dir<'a> {
     endpoint: u64,
     buf: &'a mut [u8],
@@ -82,9 +61,8 @@ pub struct Dir<'a> {
 impl<'a> Dir<'a> {
     /// Resolve `path` in the namespace `ns` to a directory session.
     ///
-    /// `buf` must be at least [`IPC_MSG_SIZE`] bytes. Fails with
-    /// [`DirError::Transport`] if the path does not resolve, or resolves to something
-    /// that is not a directory (the server declines to mint a session for a file).
+    /// `buf` must be at least [`IPC_MSG_SIZE`] bytes. Fails with [`DirError::Transport`] if the
+    /// path does not resolve or resolves to something that is not a directory.
     pub fn open(ns: u64, path: &[u8], buf: &'a mut [u8]) -> Result<Dir<'a>> {
         if buf.len() < IPC_MSG_SIZE {
             return Err(DirError::Protocol);
@@ -104,8 +82,7 @@ impl<'a> Dir<'a> {
         Ok(Dir { endpoint: resolved, buf, next_request_id: 1 })
     }
 
-    /// Wrap an already-resolved session endpoint (a handle received rather than looked
-    /// up). Takes ownership: [`close`](Self::close) closes it.
+    /// Wrap an already-resolved session endpoint; [`close`](Self::close) closes it.
     pub fn from_endpoint(endpoint: u64, buf: &'a mut [u8]) -> Result<Dir<'a>> {
         if buf.len() < IPC_MSG_SIZE {
             return Err(DirError::Protocol);
@@ -124,22 +101,15 @@ impl<'a> Dir<'a> {
         unsafe { syscall1(SYS_HANDLE_CLOSE, self.endpoint) };
     }
 
-    /// Enumerate the directory, calling `f` once per entry — including `.` and `..`,
-    /// which are real entries (filtering them is a display decision).
-    ///
-    /// Pagination is handled internally: replies are drained until the server reports no
-    /// further entries, so `f` sees the whole directory. Return `false` from `f` to stop
-    /// early; enumeration then returns `Ok(false)` without fetching more.
-    ///
-    /// The entry borrows the reply buffer, so it is only valid for the duration of the
-    /// call — a caller that keeps entries copies out the fields it wants.
+    /// Enumerate the directory, calling `f` once per entry — including `.` and `..`.
+    /// Pagination is handled internally; return `false` from `f` to stop early (`Ok(false)`).
+    /// The entry borrows the reply buffer, so it is valid only for the call.
     pub fn read_dir(&mut self, mut f: impl FnMut(&DirEntry<'_>) -> bool) -> Result<bool> {
         let mut cursor = 0u64;
         loop {
             let mut body = [0u8; 8];
             let n = read_dir_request(&mut body, cursor).ok_or(DirError::Protocol)?;
             let reply_len = self.round_trip(OP_FILE_READ_DIR, &body[..n])?;
-            // Re-borrow the reply out of the shared buffer for parsing.
             let payload = &self.buf[PAYLOAD_OFF..PAYLOAD_OFF + reply_len];
             let msg = crate::decode(payload).map_err(|_| DirError::Protocol)?;
             if msg.is_error() {
@@ -178,14 +148,9 @@ impl<'a> Dir<'a> {
         self.name_op(OP_FILE_RMDIR, name)
     }
 
-    /// Stamp `name`'s modification time as "now", where *now* is the **server's** clock.
-    ///
-    /// A caller cannot supply the time: one it could choose would be forgeable metadata,
-    /// so the filesystem is its own authority for it. (The `File::Touch` on the kernel
-    /// control channel is a different thing wearing the same opcode — the kernel telling
-    /// the server about a Model A write it could not otherwise observe, fire-and-forget
-    /// and with no client behind it. This one is name-addressed inside a session and
-    /// returns a status, like the other mutations here.)
+    /// Stamp `name`'s modification time as "now", where *now* is the **server's** clock: a time
+    /// the caller could choose would be forgeable metadata. Not the kernel's `File::Touch`
+    /// (`rsproto-file-ops.md` § Touch): this one is name-addressed and returns a status.
     pub fn touch(&mut self, name: &[u8]) -> Result<()> {
         self.name_op(OP_FILE_TOUCH, name)
     }
@@ -214,8 +179,7 @@ impl<'a> Dir<'a> {
         Ok(())
     }
 
-    /// Send one request on the session and receive its reply into `self.buf`, returning
-    /// the reply's rsproto payload length.
+    /// Send one request and receive its reply into `self.buf`; returns the reply's payload length.
     fn round_trip(&mut self, op: u16, body: &[u8]) -> Result<usize> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
@@ -224,11 +188,8 @@ impl<'a> Dir<'a> {
 }
 
 /// What a round trip on a session channel can fail with, before any protocol on top of it.
-///
-/// **Not [`DirError`]**, because this is the transport under *every* session client and the
-/// directory protocol is only one of them. Each client maps it into its own error type, which
-/// is where "the server refused" — a well-formed reply carrying an error — belongs; a refusal
-/// is not a transport fault and this layer never sees one.
+/// Not [`DirError`]: this is the transport under *every* session client, each of which maps it
+/// into its own error type; a refusal (a well-formed error reply) is not a transport fault.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WireError {
     /// A syscall failed; the payload is its negative return.
@@ -247,14 +208,8 @@ impl From<WireError> for DirError {
 }
 
 /// Send one request on `endpoint` and receive its reply into `buf`, returning the reply's
-/// rsproto payload length.
-///
-/// **Shared, because a session channel is a session channel.** [`Dir`] had this to itself until
-/// M10 Part D put a second client on the other end of the same envelope
-/// ([`crate::desktop::Desktop`]) — and the alternative was a second copy of the send, the
-/// `sys_wait`, the recv and the handle sweep, which is how two implementations of one wire
-/// format come to disagree. The rule this follows is the one `libfs` was extracted under: a
-/// helper with two consumers belongs below both.
+/// rsproto payload length. Shared by [`Dir`] and [`crate::desktop::Desktop`], so the
+/// send/wait/recv/handle sweep has one copy.
 pub fn round_trip(
     endpoint: u64,
     buf: &mut [u8],
@@ -267,16 +222,15 @@ pub fn round_trip(
     buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4].copy_from_slice(&(rs_len as u32).to_le_bytes());
     buf[OFF_HANDLE_COUNT] = 0;
 
-    // A session reply is one message on a channel we are the sole client of, so the
-    // ring always has room: a non-blocking send is correct and avoids a PO round trip.
+    // The sole client of a session channel expects one reply, so the ring always has room and a
+    // non-blocking send is correct.
     // SAFETY: `buf` is a valid IPC_MSG_SIZE buffer; no handles accompany the request.
     let sent = unsafe { syscall5(SYS_CHANNEL_SEND, endpoint, buf.as_ptr() as u64, 0, 0, SENDMODE_NOBLOCK) };
     if sent != 0 {
         return Err(WireError::Transport(sent as i32));
     }
 
-    // Park until the reply lands, then take it. `sys_wait` is where the thread
-    // blocks — never inside the send or the recv.
+    // `sys_wait` is where the thread blocks, never the send or the recv.
     let handles = [endpoint];
     let mut results = [0u8; 24];
     // SAFETY: valid handle array + result out-buffer for one waiter.
@@ -300,9 +254,8 @@ pub fn round_trip(
     if got != 0 {
         return Err(WireError::Transport(got as i32));
     }
-    // Close anything the server transferred: no session op above this layer sends handles
-    // back, and leaking one on a misbehaving server would exhaust the table over a long
-    // listing.
+    // Close anything the server transferred: no session op sends handles back, and a
+    // misbehaving server would exhaust the table.
     for h in transferred.iter().take(count.min(8)) {
         // SAFETY: closing a handle just installed into our table.
         unsafe { syscall1(SYS_HANDLE_CLOSE, *h) };
@@ -329,8 +282,7 @@ fn server_error(body: &[u8]) -> i32 {
 
 /// Wait on a `PendingOperation`, returning its `(status, result)` and closing it.
 ///
-/// `pub(crate)` since M10 Part D: [`crate::desktop::Desktop`] resolves its endpoint the same
-/// way, and a second copy of eight lines of `sys_wait` plumbing is a second thing to get wrong.
+/// `pub(crate)`: [`crate::desktop::Desktop`] resolves its endpoint the same way.
 pub(crate) fn po_wait(po: u64) -> (i32, u64) {
     let handles = [po];
     let mut r = [0u8; 24];
@@ -346,6 +298,5 @@ pub(crate) fn po_wait(po: u64) -> (i32, u64) {
     (status, result)
 }
 
-/// The most entries one `ReadDir` reply can carry — the bound a caller sizes a per-reply
-/// entry array against. (Real entries are larger: every name costs at least one byte.)
+/// The most entries one `ReadDir` reply can carry — what a caller sizes a per-reply array by.
 pub const MAX_REPLY_ENTRIES: usize = crate::RS_MAX_BODY / DIR_ENTRY_PREFIX_LEN;

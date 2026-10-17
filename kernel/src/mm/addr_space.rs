@@ -1,49 +1,14 @@
 //! Per-process virtual address space.
 //!
-//! [`AddressSpace`] pairs a [`VmaTree`] (per-AS catalogue of virtual
-//! memory areas) with a top-level page-table root (the PML4 base on
-//! x86_64) under a single [`SpinLock`]. It is the bridge between the
-//! VMM's bookkeeping (the tree) and the hardware MMU's actual
-//! translations (the page tables): `map_vma` updates both atomically;
-//! `unmap_covering` does the inverse.
+//! [`AddressSpace`] pairs a [`VmaTree`] with a top-level page-table root (the PML4 on x86_64)
+//! under one [`SpinLock`]: `map_vma` updates both atomically, `unmap_covering` does the inverse.
 //!
-//! ## What this layer is for
-//!
-//! Every process gets exactly one `AddressSpace`. Today nothing
-//! *consumes* one — there is no scheduler, no first userspace process —
-//! but the address-spaces-and-paging slice needs to deliver something
-//! that can actually represent a process's memory. Without
-//! `AddressSpace`, the [`VmaTree`] is structurally testable but
-//! disconnected from any real translation; with it, a `Vma` going into
-//! the tree is the same operation as PTEs going into the hardware.
-//!
-//! ## Phase 1 limitations
-//!
-//! - **No kernel-half mapping yet.** A fresh `AddressSpace` has an
-//!   all-zero PML4: switching `CR3` to its root would triple-fault
-//!   immediately because the kernel code currently executing wouldn't
-//!   be mapped. The next sub-item in the slice (higher-half kernel
-//!   mapping shared across all address spaces) closes that gap. Until
-//!   then this type is "installable but not loadable."
-//! - **No TLB flushing.** No `AddressSpace` is ever loaded onto a CPU
-//!   today, so the TLB never holds entries for the new mappings. When
-//!   the scheduler arrives it will gain a `set_active` entry point
-//!   that takes responsibility for flushing.
-//! - **Eager vs lazy anonymous allocation.** [`map_vma`](AddressSpace::map_vma)
-//!   allocates one frame per page up front; [`map_vma_lazy`](AddressSpace::map_vma_lazy)
-//!   reserves the range with no frames and lets
-//!   [`fault_in`](AddressSpace::fault_in) back each page on first touch (the
-//!   demand-paging slice; the `#PF` handler now resolves not-present user
-//!   faults against the VMA tree). The ELF loader reserves stacks lazily;
-//!   object- and the (future) file-backed paths have their own backing
-//!   sources. Lazy `MemoryObject` backing — which would lift the eager-
-//!   allocation DoS cap — is the next consumer of this machinery.
-//! - **Intermediate page-table frames are not reclaimed on unmap.**
-//!   This matches the deferred decision documented for
-//!   `ArchPaging::unmap_page` (see [deferred-decisions.md]). `Drop`
-//!   reclaims leaf frames and the top-level PML4; the PDPT / PD / PT
-//!   levels in between leak. For a single Phase 1 address space this
-//!   is negligible.
+//! - **Eager vs lazy anonymous allocation.** `map_vma` allocates a frame per page up front;
+//!   `map_vma_lazy` reserves the range and [`fault_in`](AddressSpace::fault_in) backs each page
+//!   on first touch. Object- and file-backed mappings have their own backing sources.
+//! - **Intermediate page-table frames are not reclaimed on unmap** (the deferred decision on
+//!   `ArchPaging::unmap_page`, [deferred-decisions.md]): `Drop` reclaims leaf frames and the
+//!   PML4, and the PDPT / PD / PT levels leak.
 //!
 //! [deferred-decisions.md]: ../../docs/rationale/deferred-decisions.md
 
@@ -59,101 +24,68 @@ use crate::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma, VmaT
 use crate::mm::{Caching, PAGE_SIZE, PhysAddr, VirtAddr, heap};
 use crate::object::{FileObject, MemoryObject, ObjectRef};
 
-/// Base of the `hint == 0` ("anywhere") mapping window for
-/// [`AddressSpace::find_free_range`]: above the ELF image (loaded at
-/// `0x40_0000`) and well below the default user stack. See `arch::abi`.
+/// Base of the `hint == 0` ("anywhere") window: above the ELF image, well below the user stack.
 const MMAP_BASE: u64 = 0x1_0000_0000;
 
 /// Lowest address of the initial thread's stack region.
 pub const USER_STACK_BOTTOM: u64 = DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_SIZE;
 
-/// Lowest address of the guard gap below the stack. Nothing may be mapped in
-/// `[USER_STACK_GUARD_BOTTOM, USER_STACK_BOTTOM)`.
+/// Lowest address of the guard gap below the stack; nothing may be mapped in it.
 pub const USER_STACK_GUARD_BOTTOM: u64 = USER_STACK_BOTTOM - USER_STACK_GUARD_SIZE;
 
-/// Exclusive upper bound of the mapping window — kept below the **guard gap**, so an
-/// "anywhere" mapping can never sit adjacent to the stack.
-///
-/// This bounds `find_free_range` and therefore only the `hint == 0` path. A *hinted*
-/// mapping is bounded by [`AddressSpace::in_stack_guard`] at the syscall, because
-/// `MMAP_MAX` alone would leave the gap protecting against the kernel's own placement and
-/// nothing else — and a hinted mapping inside it restores exactly the silent overrun the
-/// gap exists to remove (PR #182 review, finding 3).
+/// Exclusive upper bound of the "anywhere" window, below the **guard gap**. It bounds only the
+/// `hint == 0` path; a *hinted* mapping is bounded by [`AddressSpace::in_stack_guard`], or it
+/// could sit in the gap and restore the silent stack overrun the gap removes.
 const MMAP_MAX: u64 = USER_STACK_GUARD_BOTTOM;
 
-/// Why [`AddressSpace::map_vma`] could not install a mapping.
-///
-/// On error the caller's [`KBox<Vma>`] is returned in the tuple
-/// alongside the variant so it can be inspected, dropped, or retried.
+/// Why [`AddressSpace::map_vma`] could not install a mapping; the caller's [`KBox<Vma>`] comes
+/// back alongside.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MapError {
-    /// A range endpoint was not canonical for 4-level paging.
+    /// A range endpoint was not canonical.
     NotCanonical,
     /// The range falls outside the user half (`[0, USER_VIRT_END)`).
-    /// Kernel-half mappings are installed by a separate path.
     NotUserHalf,
     /// The range overlaps an existing VMA in this address space.
     Overlap,
-    /// Physical-frame allocation (a leaf, or an intermediate page-table
-    /// frame) failed. Any frames installed before the failure are
-    /// rolled back before this is returned.
+    /// Frame allocation failed; frames installed before the failure are rolled back first.
     OutOfMemory,
 }
 
-/// Outcome of [`AddressSpace::fault_in`] — the resolution of a page fault
-/// against this address space. Only [`Mapped`](FaultIn::Mapped) lets the
-/// faulting instruction retry; every other variant means the fault is fatal to
-/// the thread (the arch handler turns them into a SegFault notification).
+/// Outcome of [`AddressSpace::fault_in`]. Only [`Mapped`](FaultIn::Mapped) lets the instruction
+/// retry; every other variant is fatal to the thread.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FaultIn {
-    /// A frame was faulted in (or was already present): the faulting
-    /// instruction may be retried.
+    /// A frame was faulted in (or was already present): retry the instruction.
     Mapped,
-    /// No VMA covers the faulting address — an access to unmapped memory.
+    /// No VMA covers the faulting address.
     NoVma,
-    /// A VMA covers the address but does not permit the attempted access
-    /// (a write to a read-only mapping, or a fetch from a non-exec one).
+    /// A VMA covers the address but forbids the access.
     Protection,
-    /// A VMA covers the address and permits the access, but a backing frame
-    /// could not be allocated.
+    /// A VMA permits the access but no backing frame could be allocated.
     Oom,
-    /// The address falls in a [`FileBacked`](MappingKind::FileBacked) mapping: a
-    /// **not-present file fault** the caller must service through the page cache —
-    /// fetch the backing ([`file_backing`](AddressSpace::file_backing)), ensure the
-    /// page is resident (blocking on the producer if needed), and install the PTE
-    /// ([`map_file_page`](AddressSpace::map_file_page)). `fault_in` itself does *not*
-    /// touch the file's page cache (its lock is rank-4, like this AS lock — they are
-    /// never nested), so this arm only *signals*; the fill happens outside the AS
-    /// lock. Until the fault path wires that up (slice 8 Part 2b) a file fault stays
-    /// fatal.
+    /// A [`FileBacked`](MappingKind::FileBacked) not-present fault. `fault_in` only *signals*:
+    /// the caller fetches the backing ([`file_backing`](AddressSpace::file_backing)), makes the
+    /// page resident and installs the PTE ([`map_file_page`](AddressSpace::map_file_page)) outside
+    /// the AS lock, since the file's page-cache lock is rank 4 like this one and they never nest.
     FileBacked,
 }
 
-/// A per-process virtual address space.
-///
-/// All state lives behind a single `SpinLock<Inner>` (rank 4 per
-/// [kernel/docs/lock-ordering.md]). Public methods acquire and release
-/// the lock internally; callers cannot reach the inner state otherwise.
+/// A per-process virtual address space: all state behind one rank-4 `SpinLock<Inner>`
+/// ([kernel/docs/lock-ordering.md]), taken and released inside the public methods.
 pub struct AddressSpace {
     inner: SpinLock<Inner>,
 }
 
 struct Inner {
     vma_tree: VmaTree,
-    /// Physical base of the top-level page-table frame (the PML4 on
-    /// x86_64). Allocated at construction, freed in `Drop` after the
-    /// tree is torn down.
+    /// Physical base of the top-level page-table frame; freed in `Drop` after the tree.
     root: PhysAddr,
 }
 
 impl AddressSpace {
-    /// Build an empty (user-half) address space sharing the boot
-    /// kernel's higher-half mappings: allocate a fresh PML4 frame, zero
-    /// it, inherit the kernel-half entries from the boot template
-    /// (`ArchPaging::inherit_kernel_mappings`), and pair it with an
-    /// empty VMA tree. Returns [`AllocError`] if the PML4 frame
-    /// allocation fails; panics if called before
-    /// `arch::init_kernel_template`.
+    /// Build an empty address space: a zeroed PML4 frame inheriting the kernel-half entries from
+    /// the boot template, and an empty VMA tree. Panics before `arch::init_kernel_template`.
     pub fn new() -> Result<Self, AllocError> {
         let root = heap::buddy_alloc(0).ok_or(AllocError)?;
         // SAFETY: the frame was just returned by the buddy and is not
@@ -169,10 +101,7 @@ impl AddressSpace {
         Ok(AddressSpace { inner: SpinLock::new(LockRank::KernelObject, Inner { vma_tree: VmaTree::new(), root }) })
     }
 
-    /// Physical base of this address space's top-level page table. The
-    /// future scheduler will hand this to
-    /// [`ArchPaging::set_page_table`](crate::arch::paging::ArchPaging::set_page_table)
-    /// to make the address space active.
+    /// Physical base of this address space's top-level page table.
     pub fn root(&self) -> PhysAddr {
         self.inner.lock().root
     }
@@ -185,20 +114,13 @@ impl AddressSpace {
         self.inner.lock().vma_tree.len()
     }
 
-    /// Install a VMA: allocate and zero a frame for every page, install
-    /// each PTE, then insert the VMA into the tree. The whole sequence
-    /// runs under the AS lock so the tree and the page tables can never
-    /// disagree about what is mapped.
-    ///
-    /// Returns the box back to the caller on any rejection.
+    /// Install a VMA: allocate and zero a frame per page, install each PTE, then insert the VMA,
+    /// all under the AS lock so tree and page tables never disagree. The box is returned on any
+    /// rejection.
     pub fn map_vma(&self, boxed: KBox<Vma>) -> Result<(), (KBox<Vma>, MapError)> {
         let range = boxed.range;
 
-        // Canonicality: both endpoints of the half-open range must be
-        // canonical. The end is exclusive, so we test `end - 1` (the
-        // last byte covered); that handles the edge case where `end ==
-        // USER_VIRT_END` (a non-canonical address in itself, but the
-        // covered bytes stop one short of it).
+        // Both endpoints must be canonical; test `end - 1` since the end is exclusive.
         let last_byte = VirtAddr::new(range.end().as_u64() - 1);
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((boxed, MapError::NotCanonical));
@@ -209,8 +131,7 @@ impl AddressSpace {
 
         let mut guard = self.inner.lock();
 
-        // Pre-check overlap so a doomed insert doesn't run frame
-        // allocations that we'd just have to roll back.
+        // Pre-check overlap so a doomed insert runs no frame allocations to roll back.
         if guard.vma_tree.find_first_overlapping(range).is_some() {
             return Err((boxed, MapError::Overlap));
         }
@@ -228,7 +149,6 @@ impl AddressSpace {
                 return Err((boxed, MapError::OutOfMemory));
             };
 
-            // Anonymous mapping: zero the freshly allocated frame.
             // SAFETY: `phys` was just allocated, is not aliased, and is
             // HHDM-reachable.
             unsafe {
@@ -249,20 +169,17 @@ impl AddressSpace {
                     return Err((boxed, MapError::OutOfMemory));
                 }
                 Err(ArchMapError::AlreadyMapped) => {
-                    // Impossible: we hold the AS lock and pre-checked
-                    // overlap; a PTE for this virt can't already exist.
+                    // Impossible: AS lock held and overlap pre-checked.
                     unreachable!("ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check");
                 }
                 Err(ArchMapError::Misaligned) => {
-                    // Impossible: VAddrRange enforces page alignment,
-                    // and the per-page virt is start + i*PAGE_SIZE.
+                    // Impossible: `VAddrRange` enforces page alignment.
                     unreachable!("ArchPaging::map_page returned Misaligned for a page-aligned per-page address");
                 }
             }
         }
 
-        // Commit. The tree's insert can't reject — we still hold the
-        // lock and re-checked overlap above.
+        // Commit. The insert cannot reject: the lock is held and overlap was checked above.
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
             Err(b) => {
@@ -272,25 +189,14 @@ impl AddressSpace {
         }
     }
 
-    /// Reserve an **anonymous** VMA without backing it: insert the `Vma` into
-    /// the tree but allocate **no** frames and install **no** PTEs. The pages
-    /// are faulted in lazily — zeroed one at a time on first touch — by
-    /// [`fault_in`](Self::fault_in) when the running thread takes a not-present
-    /// page fault in the range.
-    ///
-    /// This is the demand-paged counterpart to [`map_vma`](Self::map_vma)'s
-    /// eager allocation. It is anonymous-only: object- and (future)
-    /// file-backed mappings have their own backing-frame sources.
-    /// `boxed.mapping` must be [`MappingKind::Anonymous`].
-    ///
-    /// Same canonicality / user-half / overlap rejections as `map_vma`; the
-    /// box is returned on any rejection. Allocates nothing, so the only error
-    /// is a structural rejection — never [`OutOfMemory`](MapError::OutOfMemory).
+    /// Reserve an **anonymous** VMA with no frames and no PTEs; [`fault_in`](Self::fault_in)
+    /// zeroes and maps each page on first touch. `boxed.mapping` must be
+    /// [`MappingKind::Anonymous`]. Same rejections as `map_vma` (box returned), but it allocates
+    /// nothing, so never [`OutOfMemory`](MapError::OutOfMemory).
     pub fn map_vma_lazy(&self, boxed: KBox<Vma>) -> Result<(), (KBox<Vma>, MapError)> {
         debug_assert_eq!(boxed.mapping, MappingKind::Anonymous, "map_vma_lazy is for anonymous mappings only");
         let range = boxed.range;
 
-        // Endpoint canonicality (same reasoning as map_vma: test end-1).
         let last_byte = VirtAddr::new(range.end().as_u64() - 1);
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((boxed, MapError::NotCanonical));
@@ -304,8 +210,6 @@ impl AddressSpace {
             return Err((boxed, MapError::Overlap));
         }
 
-        // No frame allocation, no PTE install — the range is reserved in the
-        // tree only; `fault_in` backs each page on demand.
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
             // Unreachable: overlap was pre-checked under the same lock.
@@ -313,34 +217,20 @@ impl AddressSpace {
         }
     }
 
-    /// Resolve a page fault at `addr` for the access `access`, against this
-    /// (currently-loaded) address space. Called from the architecture's
-    /// page-fault handler for a **not-present** ring-3 fault, before it falls
-    /// back to delivering a fatal segmentation fault.
+    /// Resolve a page fault at `addr` for `access` against this (currently loaded) address space.
+    /// Called from the arch `#PF` handler for a **not-present** ring-3 fault.
     ///
-    /// Looks up the covering VMA, checks the attempted access against its
-    /// protection, and — for an [`Anonymous`](MappingKind::Anonymous) mapping —
-    /// allocates and zeroes one frame, installs the leaf PTE for the faulting
-    /// page, and flushes that page's stale (not-present) TLB entry. Returns
-    /// [`FaultIn::Mapped`] on success (the instruction may retry); every other
-    /// outcome is fatal to the thread.
-    ///
-    /// The faulting address space **is live in the MMU** when this runs (unlike
-    /// the eager `map_vma`, which maps into a not-yet-loaded AS), so the TLB
-    /// flush here is mandatory: the CPU cached the not-present translation when
-    /// it faulted.
+    /// For an [`Anonymous`](MappingKind::Anonymous) VMA permitting the access, allocates and zeroes
+    /// a frame, installs the leaf PTE and flushes that page's stale not-present TLB entry. The
+    /// address space **is live in the MMU** (unlike eager `map_vma`), so the flush is mandatory.
+    /// Only [`FaultIn::Mapped`] means retry.
     pub fn fault_in(&self, addr: VirtAddr, access: FaultAccess) -> FaultIn {
-        // The page-table install writes through `guard.root` (a `PhysAddr`
-        // copied out below), not through the guard, and the tree is only read
-        // here — so an immutable guard suffices.
         let guard = self.inner.lock();
 
         let Some(vma) = guard.vma_tree.find_covering(addr) else {
             return FaultIn::NoVma;
         };
 
-        // Protection check: a present VMA is always readable, so only writes
-        // and instruction fetches can be refused.
         match access {
             FaultAccess::Write if !vma.prot.contains(Protection::WRITE) => {
                 return FaultIn::Protection;
@@ -354,7 +244,6 @@ impl AddressSpace {
         let flags = page_flags_for(vma.prot, vma.caching);
         let kind = vma.mapping;
         let root = guard.root;
-        // Round the faulting address down to its page base.
         let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
 
         match kind {
@@ -379,8 +268,7 @@ impl AddressSpace {
                         heap::buddy_free(phys, 0);
                         return FaultIn::Oom;
                     }
-                    // Impossible: not-present fault ⇒ no existing PTE; and
-                    // `page_base` is page-aligned by construction.
+                    // Impossible: a not-present fault means no PTE, and `page_base` is aligned.
                     Err(ArchMapError::AlreadyMapped | ArchMapError::Misaligned) => {
                         heap::buddy_free(phys, 0);
                         unreachable!("fault_in: map_page rejected a fresh page-aligned not-present mapping");
@@ -394,38 +282,26 @@ impl AddressSpace {
                 crate::mm::record_demand_fault();
                 FaultIn::Mapped
             }
-            // Object mappings are installed eagerly by `map_object`; a
-            // not-present fault on one is a bug or a torn-down race — treat it
-            // as an access to nothing.
+            // Installed eagerly by `map_object`; a fault here is a bug or teardown race.
             MappingKind::Object => FaultIn::NoVma,
-            // A file-backed not-present fault: signal the caller to page it in
-            // from the file's cache. We do NOT touch that cache here — its lock is
-            // rank 4, same as this AS lock, and the two must never nest — so the
-            // caller fetches the backing + fills + installs the PTE outside this
-            // lock (`file_backing` → fill → `map_file_page`). See slice 8 Part 2.
+            // Signal only: the file cache's lock is rank 4 like this one and they never nest
+            // (see `FaultIn::FileBacked`).
             MappingKind::FileBacked => FaultIn::FileBacked,
         }
     }
 
-    /// Map a [`MemoryObject`]'s **own** frames over `range`, holding `object`
-    /// alive for the mapping's lifetime. Unlike [`map_vma`](Self::map_vma)
-    /// this allocates and zeroes **nothing** — it installs PTEs pointing at
-    /// the object's pre-allocated frames — so mapping the same object twice
-    /// aliases the same physical memory. The recorded VMA owns `object`; the
-    /// frames are freed by the object on its last-ref drop, not by unmap.
+    /// Map a [`MemoryObject`]'s **own** frames over `range`, holding `object` alive. Allocates and
+    /// zeroes **nothing**: mapping the object twice aliases the same memory. The object frees the
+    /// frames on its last-ref drop, not unmap.
     ///
-    /// `object` must reference a [`MemoryObject`] with at least
-    /// `range.pages()` frames (the syscall layer checks `size <= obj.size`).
-    /// On any failure the `object` reference is handed back in the error
-    /// tuple so the caller can drop it.
+    /// `object` needs at least `range.pages()` frames (the syscall layer checks). On failure it
+    /// is handed back in the error tuple.
     pub fn map_object(
         &self,
         range: VAddrRange,
         prot: Protection,
         object: ObjectRef,
     ) -> Result<(), (ObjectRef, MapError)> {
-        // Canonicality / user-half checks (as map_vma), before consuming
-        // anything — `object` is returned untouched on rejection.
         let last_byte = VirtAddr::new(range.end().as_u64() - 1);
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((object, MapError::NotCanonical));
@@ -434,25 +310,19 @@ impl AddressSpace {
             return Err((object, MapError::NotUserHalf));
         }
 
-        // Read the backing frames through the live object. The slice is
-        // derived from a raw pointer, so its lifetime is not tied to
-        // `object`'s ownership — we may move `object` into the VMA later
-        // while still holding `frames` for the install loop.
         debug_assert_eq!(object.object_type(), KObjectType::MemoryObject);
         // SAFETY: `object` holds a reference to a live `MemoryObject` (its
         // header is at offset 0); we only read its frame list.
         let mobj = unsafe { &*(object.as_ptr() as *const MemoryObject) };
+        // `frames` borrows through the raw pointer, not `object`, so `object` can move into the VMA
+        // below while the install loop still reads it; the object stays alive throughout.
         let frames = mobj.frames();
-        // **The object decides how its pages are cached**, and the VMA carries the answer rather
-        // than each site asking again (Phase 5 Part G.2).
         let caching = mobj.caching();
         let npages = range.pages();
         debug_assert!(frames.len() as u64 >= npages, "object too small for range");
 
-        // Build the VMA box (with no object yet) BEFORE taking the lock — the
-        // no-alloc-under-spinlock rule. This is the only fallible step that
-        // happens before `object` is consumed, so its failure path can still
-        // return `object`.
+        // Build the VMA box before the lock (no allocation under a spinlock); the only fallible
+        // step before `object` is consumed, so failure can return it.
         let mut boxed = match KBox::try_new(Vma::new(range, prot, MappingKind::Object)) {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
@@ -493,7 +363,6 @@ impl AddressSpace {
             }
         }
 
-        // PTEs are in; now move `object` into the VMA and commit to the tree.
         boxed.object = Some(object);
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
@@ -506,15 +375,11 @@ impl AddressSpace {
     }
 
     /// Reserve `range` as a **lazy file-backed** mapping of `object` (a
-    /// [`FileObject`](crate::object::FileObject)) — like [`map_vma_lazy`], but
-    /// `MappingKind::FileBacked` with the object held in the VMA, and **no PTEs**.
-    /// Each page is faulted in from the file's page cache on first touch
-    /// (`fault_in` → [`FaultIn::FileBacked`] → fill → [`map_file_page`]). The VMA
-    /// keeps `object` alive, so its cache frames outlive the mapping; `unmap`
-    /// removes the PTEs but never frees them (the object owns them). On any
-    /// rejection `object` is handed back untouched.
+    /// [`FileObject`](crate::object::FileObject)) with **no PTEs**; pages come in through
+    /// `fault_in`, [`FaultIn::FileBacked`], fill, [`map_file_page`]. The VMA keeps `object` alive
+    /// so its cache frames outlive the mapping; `unmap` removes the PTEs but never frees the
+    /// frames. On rejection `object` is handed back.
     ///
-    /// [`map_vma_lazy`]: AddressSpace::map_vma_lazy
     /// [`map_file_page`]: AddressSpace::map_file_page
     pub fn map_file(
         &self,
@@ -523,7 +388,6 @@ impl AddressSpace {
         object: ObjectRef,
     ) -> Result<(), (ObjectRef, MapError)> {
         debug_assert_eq!(object.object_type(), KObjectType::FileObject);
-        // Canonicality / user-half checks before consuming `object`.
         let last_byte = VirtAddr::new(range.end().as_u64() - 1);
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((object, MapError::NotCanonical));
@@ -531,15 +395,13 @@ impl AddressSpace {
         if range.end().as_u64() > USER_VIRT_END {
             return Err((object, MapError::NotUserHalf));
         }
-        // Build the VMA box (no object yet) before the lock (no alloc under it).
         let mut boxed = match KBox::try_new(Vma::new(range, prot, MappingKind::FileBacked)) {
             Ok(b) => b,
             Err(_) => return Err((object, MapError::OutOfMemory)),
         };
-        // **A writable mapping is counted, and dirties the file, before the lock** — the file's
-        // own lock is never taken inside this one (administration Part C.1). The VMA's `Drop`
-        // lowers the count again; a mapping refused below undoes it here, since its VMA drops
-        // without its object.
+        // A writable mapping is counted, and dirties the file, before the lock (the file's lock
+        // is never taken inside this one). The VMA's `Drop` lowers the count; a refusal below
+        // undoes it here, since its VMA drops without its object.
         let writable = prot.contains(Protection::WRITE);
         if writable {
             FileObject::writable_mapped(&object);
@@ -557,7 +419,6 @@ impl AddressSpace {
             return refused(object, MapError::Overlap);
         }
         boxed.object = Some(object);
-        // No PTEs — `fault_in` backs each page on demand from the page cache.
         match guard.vma_tree.insert(boxed) {
             Ok(()) => Ok(()),
             Err(mut b) => {
@@ -568,13 +429,10 @@ impl AddressSpace {
         }
     }
 
-    /// For a `FileBacked` fault at `addr` (signalled by [`FaultIn::FileBacked`]),
-    /// return the backing [`FileObject`](crate::object::FileObject) (a **cloned**
-    /// `ObjectRef`, owned by the caller) and the **page index** within the file
-    /// (`(page_base − vma.start) / PAGE`; the mapping covers the file from offset 0).
-    /// `None` if no VMA covers `addr` or it is not file-backed (a teardown race).
-    /// A separate, fresh lock acquisition from `fault_in` — so the file's page cache
-    /// is reached only **outside** this AS lock, never nested under it.
+    /// For a `FileBacked` fault at `addr`: the backing [`FileObject`](crate::object::FileObject)
+    /// (a cloned `ObjectRef`) and the page index within the file; `None` if no file-backed VMA
+    /// covers `addr` (a teardown race). A fresh lock acquisition, so the page cache is reached
+    /// only **outside** this AS lock.
     pub fn file_backing(&self, addr: VirtAddr) -> Option<(ObjectRef, usize)> {
         let guard = self.inner.lock();
         let vma = guard.vma_tree.find_covering(addr)?;
@@ -587,15 +445,11 @@ impl AddressSpace {
         Some((object, index))
     }
 
-    /// Install the leaf PTE for the file-backed page containing `addr`, pointing at
-    /// `frame` (a now-resident cache frame the producer filled), with the covering
-    /// VMA's protection. Re-validates under the AS lock that a `FileBacked` VMA for
-    /// the **same** `object` still covers `addr` (the fault may have raced an unmap /
-    /// process exit while it blocked on the fill). Returns `true` if the page is now
-    /// present (installed here, or already mapped by a racing fault) — the
-    /// instruction may retry; `false` if the VMA is gone/changed (fatal) or a
-    /// page-table allocation failed. The frame is **not** owned by the VMA (the
-    /// object owns it), so `unmap` will remove this PTE without freeing it.
+    /// Install the leaf PTE for the file-backed page at `addr` pointing at `frame`. Re-validates
+    /// under the AS lock that a `FileBacked` VMA for the **same** `object` still covers `addr`
+    /// (the fault may have raced an unmap or exit). `true` if the page is now present (installed
+    /// here or by a racing fault); `false` if the VMA is gone or changed, or a page-table
+    /// allocation failed. The object owns the frame, so `unmap` removes the PTE without freeing it.
     pub fn map_file_page(&self, addr: VirtAddr, object: &ObjectRef, frame: PhysAddr) -> bool {
         let guard = self.inner.lock();
         let Some(vma) = guard.vma_tree.find_covering(addr) else {
@@ -611,8 +465,6 @@ impl AddressSpace {
         // the file object owns and keeps alive (the VMA holds its `ObjectRef`);
         // `page_base` is page-aligned and in the validated user-half VMA range.
         match unsafe { Paging::map_page(root, page_base, frame, flags) } {
-            // Installed, or a concurrent fault already mapped it — either way the
-            // page is present and the instruction may retry.
             Ok(()) | Err(ArchMapError::AlreadyMapped) => {
                 // SAFETY: ring-0 `invlpg` evicting the not-present entry cached on
                 // the fault we are servicing.
@@ -620,43 +472,29 @@ impl AddressSpace {
                 true
             }
             Err(ArchMapError::OutOfMemory) => false,
-            // Impossible: `page_base` is page-aligned by construction.
             Err(ArchMapError::Misaligned) => {
                 unreachable!("map_file_page: Misaligned for a page-aligned address")
             }
         }
     }
 
-    /// Whether `[start, end)` overlaps the stack guard gap.
-    ///
-    /// **The gap is only a guarantee if the hinted path honours it.** `MMAP_MAX` bounds
-    /// `find_free_range`, which serves `sys_memory_map(hint = 0)` alone; a hinted mapping
-    /// validates page alignment and the user-half bound and nothing else. Without this
-    /// check the gap would protect against the kernel's own placement and no more, and a
-    /// stack overrun would once again land in mapped memory — silently, which is the single
-    /// property the gap exists to remove.
+    /// Whether `[start, end)` overlaps the stack guard gap. `MMAP_MAX` bounds only
+    /// `find_free_range` (`hint = 0`); a hinted mapping otherwise validates just alignment and the
+    /// user-half bound, so without this check a stack overrun could land in mapped memory.
     pub fn in_stack_guard(start: u64, end: u64) -> bool {
         start < USER_STACK_BOTTOM && end > USER_STACK_GUARD_BOTTOM
     }
 
-    /// Find the lowest free virtual range of `size` bytes in the "anywhere"
-    /// mapping window (`[MMAP_BASE, MMAP_MAX)`), for `sys_memory_map(hint=0)`.
+    /// Lowest free range of `size` bytes in the "anywhere" window, for `sys_memory_map(hint=0)`.
     pub fn find_free_range(&self, size: u64) -> Option<VAddrRange> {
         let guard = self.inner.lock();
         guard.vma_tree.find_free_range(VirtAddr::new(MMAP_BASE), VirtAddr::new(MMAP_MAX), size)
     }
 
-    /// Remove the VMA covering `addr`: drop it from the tree, then walk
-    /// its range uninstalling every PTE and freeing the backing frame
-    /// (for anonymous mappings). Returns the VMA box, or `None` if no
-    /// VMA covers `addr`.
+    /// Remove the VMA covering `addr`, uninstall its PTEs and free its anonymous frames.
     ///
-    /// **Host tests only.** Freeing frames in place is wrong on SMP — another
-    /// CPU running this address space may still hold live TLB translations for
-    /// the range (F3, decision log 2026-07-21); the production unmap is
-    /// [`unmap_covering_deferred`](Self::unmap_covering_deferred), which defers
-    /// every frame release until after a cross-CPU shootdown. Host tests have
-    /// no remote TLBs, so the simpler in-lock free stays valid there.
+    /// **Host tests only.** Freeing in place is wrong on SMP, where another CPU may still hold
+    /// TLB translations; production uses [`unmap_covering_deferred`](Self::unmap_covering_deferred).
     #[cfg(test)]
     pub fn unmap_covering(&self, addr: VirtAddr) -> Option<KBox<Vma>> {
         let mut guard = self.inner.lock();
@@ -665,23 +503,18 @@ impl AddressSpace {
         Some(boxed)
     }
 
-    /// Remove the VMA covering `addr` and uninstall its PTEs, **deferring every
-    /// frame release to the caller**: anonymous leaf frames are collected into
-    /// `frames` (whose spare capacity must already hold them — nothing grows
-    /// under the lock) instead of being freed here, and the returned [`Vma`]
-    /// still holds its backing-object reference.
+    /// Remove the VMA covering `addr` and uninstall its PTEs, **deferring every frame release to
+    /// the caller**: anonymous leaf frames go into `frames` (whose spare capacity must already
+    /// hold them: nothing grows under the lock) and the returned [`Vma`] keeps its backing-object
+    /// reference.
     ///
-    /// This is the production unmap (`sys_memory_unmap`): another CPU running
-    /// this address space may still hold live TLB translations for the removed
-    /// range, so no frame may become reusable until they are invalidated (F3,
-    /// decision log 2026-07-21). The caller must broadcast a TLB shootdown
-    /// after this returns and only then free the collected frames and drop the
-    /// returned `Vma` (whose drop can release the backing `MemoryObject`'s
-    /// frames).
+    /// The production unmap (`sys_memory_unmap`). Another CPU running this address space may
+    /// still hold TLB translations for the range, so the caller must broadcast a TLB shootdown
+    /// after this returns, and only then free the collected frames and drop the `Vma` (whose drop
+    /// can release a `MemoryObject`'s frames).
     ///
-    /// Returns `Err(pages)` — with the tree and PTEs untouched — if `frames`'
-    /// spare capacity cannot hold the VMA's page count; the caller reserves
-    /// (outside this lock) and retries.
+    /// `Err(pages)`, tree and PTEs untouched, if `frames` has too little spare capacity; reserve
+    /// outside the lock and retry.
     pub fn unmap_covering_deferred(
         &self,
         addr: VirtAddr,
@@ -713,27 +546,16 @@ impl AddressSpace {
 }
 
 impl Drop for AddressSpace {
-    /// Tear down every VMA (uninstall PTEs, free leaf frames), drop
-    /// the (now-empty) tree, then free the top-level PML4 frame.
-    /// Intermediate page-table frames leak per the deferred decision.
+    /// Tear down every VMA, drop the empty tree, then free the PML4 frame. Intermediate
+    /// page-table frames leak per the deferred decision.
     ///
-    /// **`get_mut`, not `lock`, and that is a bug fix rather than an optimisation.** A VMA
-    /// owns an `ObjectRef` to whatever backs it, and the last reference to a `FileObject`
-    /// drops when the VMA does — taking the *file's* lock. That lock and this one are both
-    /// `LockRank::KernelObject`, so releasing a VMA while holding this guard is a same-rank
-    /// acquisition: `lock-order violation: acquiring KernelObject … while holding
-    /// KernelObject`, and the kernel panics.
-    ///
-    /// It stayed hidden because it needs a process to **exit** holding the last reference to
-    /// a file-backed mapping. `init` ran the filesystem tests and never exits; moving them to
-    /// `boot-probe`, which maps `/system/large.bin`, closes its handle and then exits, hit it
-    /// on the first boot (retrofit Part C). `&mut self` in `Drop` means there is nothing to
-    /// exclude, so not locking is also simply correct.
+    /// **`get_mut`, not `lock`, and that is a bug fix.** Dropping a VMA can drop the last
+    /// reference to a `FileObject`, taking the *file's* lock; both are `LockRank::KernelObject`,
+    /// so releasing a VMA under this guard is a same-rank acquisition and panics. `&mut self`
+    /// means there is nothing to exclude anyway.
     fn drop(&mut self) {
         let guard = self.inner.get_mut();
 
-        // Drain the tree leftmost-first: peek via iter (an immutable
-        // borrow that ends before the mutating remove), then remove.
         loop {
             let leftmost_start = {
                 let mut it = guard.vma_tree.iter();
@@ -744,16 +566,13 @@ impl Drop for AddressSpace {
                 break;
             };
             free_vma_pages(guard.root, &boxed);
-            // `boxed` drops at the end of this iteration, returning
-            // the Vma to the slab.
         }
 
         heap::buddy_free(guard.root, 0);
     }
 }
 
-/// Walk a VMA's range, uninstall every PTE, and free each leaf frame.
-/// Used by both `unmap_covering` and `Drop`.
+/// Uninstall every PTE of a VMA's range and free each anonymous leaf frame.
 fn free_vma_pages(root: PhysAddr, vma: &Vma) {
     let range = vma.range;
     for i in 0..range.pages() {
@@ -765,10 +584,7 @@ fn free_vma_pages(root: PhysAddr, vma: &Vma) {
         if let Ok(phys) = r {
             match vma.mapping {
                 MappingKind::Anonymous => heap::buddy_free(phys, 0),
-                // Object-backed: the frames are owned by the `MemoryObject`
-                // (held alive by `vma.object`). They are freed by the object
-                // on its last-ref drop — which includes this VMA's `object`
-                // reference being released when `vma` drops — never here.
+                // The `MemoryObject` owns the frames and frees them on its last-ref drop.
                 MappingKind::Object => {}
                 // TODO(phase-2 page cache): file pages are owned by the page
                 // cache, not this mapping, so (like Object) the PTE is removed
@@ -780,9 +596,7 @@ fn free_vma_pages(root: PhysAddr, vma: &Vma) {
     }
 }
 
-/// Roll back a partial map_vma: walk `installed` pages starting at
-/// `start`, uninstall each PTE, and free each leaf frame. Used only on
-/// failure paths inside `map_vma`.
+/// Roll back a partial `map_vma`: uninstall `installed` PTEs from `start`, freeing each frame.
 fn rollback_partial_map(root: PhysAddr, start: VirtAddr, installed: u64) {
     for i in 0..installed {
         let virt = VirtAddr::new(start.as_u64() + i * (PAGE_SIZE as u64));
@@ -795,10 +609,8 @@ fn rollback_partial_map(root: PhysAddr, start: VirtAddr, installed: u64) {
     }
 }
 
-/// Roll back a partial [`map_object`](AddressSpace::map_object): uninstall the
-/// `installed` PTEs starting at `start`. Like [`rollback_partial_map`] but
-/// **does not free the frames** — they belong to the `MemoryObject`, not the
-/// mapping.
+/// Roll back a partial `map_object`: uninstall `installed` PTEs from `start` but **do not free
+/// the frames** (the `MemoryObject` owns them).
 fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) {
     for i in 0..installed {
         let virt = VirtAddr::new(start.as_u64() + i * (PAGE_SIZE as u64));
@@ -809,20 +621,13 @@ fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) {
     }
 }
 
-/// Translate the VMA-level [`Protection`] and [`Caching`] into hardware
-/// [`PageFlags`]. `NO_EXECUTE` is inverted because the hardware default
-/// is executable (NX is opt-in), but [`Protection`]'s default is
-/// non-executable (W^X by default).
+/// Translate the VMA-level [`Protection`] and [`Caching`] into hardware [`PageFlags`].
+/// `NO_EXECUTE` is inverted: hardware is executable by default, [`Protection`] non-executable.
 ///
-/// **The caching comes from the object, through the VMA** (Phase 5 Part G.2), so every mapping of
-/// one aperture asks for the same thing. Until then this carried no attribute at all, which meant
-/// `/dev/framebuffer` mappings asked for write-back over memory the firmware calls uncacheable —
-/// the stronger wins, so they were uncached, measured on the laptop at 54 MiB/s against 2924
-/// through the bootloader's write-combining mapping of the same pixels, and 2451 after.
-///
-/// **Public because the boot measures through it.** `report_framebuffer_cost` maps the aperture
-/// the way a `/dev/framebuffer` mapping is made, and a measurement holding its own copy of this
-/// translation is one that passes when the translation is deleted (PR #306 review, blocking 1).
+/// The caching comes from the object via the VMA, so every mapping of one aperture asks for the
+/// same thing (a write-back request over firmware-uncacheable memory made `/dev/framebuffer`
+/// mappings far slower). Public because the boot's `report_framebuffer_cost` measures through it,
+/// and a measurement with its own copy would pass with this translation deleted.
 pub fn page_flags_for(prot: Protection, caching: Caching) -> PageFlags {
     let mut f = PageFlags::empty();
     if prot.contains(Protection::WRITE) {
@@ -844,48 +649,34 @@ pub fn page_flags_for(prot: Protection, caching: Caching) -> PageFlags {
 mod tests {
     use super::*;
 
-    /// The guard gap sits directly below the stack, is non-empty, and the "anywhere"
-    /// window stops below it.
     #[test]
     fn the_mapping_window_stops_below_the_guard_gap() {
         const { assert!(USER_STACK_GUARD_SIZE > 0, "a zero-width gap guards nothing") };
         assert_eq!(USER_STACK_GUARD_BOTTOM + USER_STACK_GUARD_SIZE, USER_STACK_BOTTOM);
         assert_eq!(MMAP_MAX, USER_STACK_GUARD_BOTTOM);
-        // The property the gap exists for: the highest address the anywhere-window can hand
-        // out is strictly below the stack, with the whole gap in between.
         const { assert!(MMAP_MAX + USER_STACK_GUARD_SIZE <= USER_STACK_BOTTOM) };
         const { assert!(MMAP_BASE < MMAP_MAX, "the window must not be empty") };
     }
 
-    /// `in_stack_guard` catches every way a range can touch the gap, and nothing else.
     #[test]
     fn in_stack_guard_catches_overlap_not_adjacency() {
         let page = PAGE_SIZE as u64;
-        // Wholly inside.
+        // Inside, straddling either edge, and spanning the gap with neither endpoint in it (what an
+        // endpoint test misses); then ending at its first byte or starting at the stack's is clear.
         assert!(AddressSpace::in_stack_guard(USER_STACK_GUARD_BOTTOM + page, USER_STACK_GUARD_BOTTOM + 2 * page));
-        // Straddling the bottom edge, which is the case a "contains the start" test misses.
         assert!(AddressSpace::in_stack_guard(USER_STACK_GUARD_BOTTOM - page, USER_STACK_BOTTOM));
-        // Straddling the top edge, into the stack itself.
         assert!(AddressSpace::in_stack_guard(USER_STACK_BOTTOM - page, USER_STACK_BOTTOM + page));
-        // Spanning the whole gap without either endpoint inside it — the case a
-        // "contains an endpoint" test misses, and the one a large mapping actually takes.
         assert!(AddressSpace::in_stack_guard(USER_STACK_GUARD_BOTTOM - page, USER_STACK_BOTTOM + page));
 
-        // Ending exactly at the gap's first byte is *not* an overlap; refusing it would
-        // make the window one page smaller than it says it is.
         assert!(!AddressSpace::in_stack_guard(USER_STACK_GUARD_BOTTOM - page, USER_STACK_GUARD_BOTTOM));
-        // Starting exactly at the stack's first byte is above the gap, not in it.
         assert!(!AddressSpace::in_stack_guard(USER_STACK_BOTTOM, USER_STACK_BOTTOM + page));
-        // Far below.
         assert!(!AddressSpace::in_stack_guard(MMAP_BASE, MMAP_BASE + page));
     }
 
-    /// The stack is 8 MiB, and the guard is the size the post-Stack-Clash default is.
     #[test]
     fn the_stack_and_guard_are_the_sizes_the_rationale_claims() {
         assert_eq!(DEFAULT_USER_STACK_SIZE, 8 * 1024 * 1024);
         assert_eq!(USER_STACK_GUARD_SIZE, 256 * (PAGE_SIZE as u64));
-        // Both page-aligned, or the arithmetic above lands mid-page.
         assert_eq!(DEFAULT_USER_STACK_SIZE % PAGE_SIZE as u64, 0);
         assert_eq!(USER_STACK_GUARD_SIZE % PAGE_SIZE as u64, 0);
         assert_eq!(USER_STACK_GUARD_BOTTOM % PAGE_SIZE as u64, 0);
@@ -915,7 +706,6 @@ mod tests {
         let asp = AddressSpace::new().expect("new must succeed");
         assert!(asp.is_empty());
         assert_eq!(asp.len(), 0);
-        // Root must be a real, page-aligned physical address.
         let root = asp.root();
         assert!(root.is_page_aligned());
         assert_ne!(root.as_u64(), 0);
@@ -932,7 +722,6 @@ mod tests {
         // just populated. The root is owned by `asp`.
         let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 4)) };
         assert!(phys.is_some());
-        // Address just past the page should be unmapped.
         // SAFETY: `asp`'s root is the live page table this test built.
         let beyond = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) };
         assert!(beyond.is_none());
@@ -946,8 +735,6 @@ mod tests {
         let r = range(PAGE * 8, PAGE * 16);
         asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect("map must succeed");
 
-        // Each page in the range is mapped; the addresses immediately
-        // before and after are not.
         for i in 8..16 {
             // SAFETY: `asp`'s root is the live page table this test built.
             let p = unsafe { Paging::translate(asp.root(), va(PAGE * i)) };
@@ -990,13 +777,10 @@ mod tests {
             .map_vma(anon_box(range(PAGE * 6, PAGE * 10), Protection::WRITE | Protection::USER))
             .expect_err("overlapping map must fail");
         assert_eq!(err.1, MapError::Overlap);
-        // The returned box should still carry the rejected range.
         assert_eq!(err.0.range, range(PAGE * 6, PAGE * 10));
 
-        // The original mapping must be untouched.
         // SAFETY: `asp`'s root is the live page table this test built.
         assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_some());
-        // The rejected range's pages must NOT have been installed.
         // SAFETY: `asp`'s root is the live page table this test built.
         assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 9)) }.is_none());
         assert_eq!(asp.len(), 1);
@@ -1006,13 +790,10 @@ mod tests {
     fn map_rejects_kernel_half_range() {
         init_global_heap();
         let asp = AddressSpace::new().expect("new must succeed");
-        // A range that ends past USER_VIRT_END is rejected.
         let r = VAddrRange::new(va(USER_VIRT_END - PAGE), va(USER_VIRT_END + PAGE)).unwrap();
         let err = asp
             .map_vma(anon_box(r, Protection::WRITE | Protection::USER))
             .expect_err("kernel-half range must be rejected");
-        // The error is NotUserHalf, or NotCanonical depending on which
-        // check triggers first — both are acceptable rejections.
         assert!(matches!(err.1, MapError::NotUserHalf | MapError::NotCanonical));
     }
 
@@ -1021,7 +802,6 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().expect("new must succeed");
         assert!(asp.unmap_covering(va(PAGE * 100)).is_none());
-        // Even with one mapped VMA, an addr not covered returns None.
         asp.map_vma(anon_box(range(PAGE * 4, PAGE * 8), Protection::WRITE | Protection::USER)).unwrap();
         assert!(asp.unmap_covering(va(PAGE * 20)).is_none());
         assert_eq!(asp.len(), 1);
@@ -1029,10 +809,8 @@ mod tests {
 
     #[test]
     fn drop_tears_down_populated_address_space() {
-        // Verify Drop is well-behaved: build a populated AS, drop it,
-        // do it again. Across 8 iterations of 16 pages each this
-        // would gradually exhaust the 16 MiB test heap if Drop leaked
-        // leaf frames or the PML4.
+        // Drop must free the leaf frames and the PML4: eight iterations of 16 pages would
+        // otherwise exhaust the 16 MiB test heap.
         init_global_heap();
         for _ in 0..8 {
             let asp = AddressSpace::new().expect("new must succeed");
@@ -1041,15 +819,11 @@ mod tests {
                 asp.map_vma(anon_box(range(start, start + PAGE * 4), Protection::WRITE | Protection::USER))
                     .expect("map must succeed");
             }
-            // Drop runs at end of iteration.
         }
     }
 
-    // --- Object-backed mappings --------------------------------------
-
     use crate::object::header::test_probe;
 
-    /// Adopt a `MemoryObject`'s creation reference into an `ObjectRef`.
     fn into_obj(m: KBox<MemoryObject>) -> ObjectRef {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         unsafe { ObjectRef::from_raw(KBox::into_raw(m).as_ptr() as *mut (), KObjectType::MemoryObject) }
@@ -1069,8 +843,6 @@ mod tests {
 
         asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_object must succeed");
 
-        // Each mapped page translates to the object's own frame — not a
-        // freshly allocated one (this is what makes the object shareable).
         for i in 0..3u64 {
             // SAFETY: `asp`'s root is the live page table this test built.
             let phys = unsafe { Paging::translate(asp.root(), va(PAGE * (4 + i))) }.expect("page must be mapped");
@@ -1107,20 +879,14 @@ mod tests {
         let asp = AddressSpace::new().unwrap();
         let m = MemoryObject::try_new(PAGE as usize).unwrap();
         let obj = into_obj(m);
-        // Hold an extra reference so unmapping (which drops the VMA's ref)
-        // does not destroy the object — then we can prove it survived.
         let keep = obj.clone();
 
         asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
         let removed = asp.unmap_covering(va(PAGE * 4)).expect("unmap must find the covering vma");
-        // PTE is gone.
         // SAFETY: `asp`'s root is the live page table this test built.
         assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_none());
-        // Dropping the removed VMA releases its object reference, but `keep`
-        // still holds one — the object (and its frames) must NOT be freed.
         drop(removed);
         assert_eq!(test_probe::memory_object_destroys(), 0, "unmap freed shared frames");
-        // The last reference now drops: object destroyed, frames freed.
         drop(keep);
         assert_eq!(test_probe::memory_object_destroys(), 1);
     }
@@ -1129,46 +895,23 @@ mod tests {
     fn find_free_range_picks_a_gap_in_the_mmap_window() {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
-        // An empty AS yields the window base.
         let r = asp.find_free_range(PAGE).expect("empty AS has room");
         assert_eq!(r.start().as_u64(), MMAP_BASE);
         assert_eq!(r.len(), PAGE);
     }
 
-    // --- File-backed mappings (slice 8 Part 2a) --------------------------
-
     use crate::object::{FileObject, Producer, Reserve};
 
-    /// Adopt a `FileObject`'s creation reference into an `ObjectRef`.
     fn into_file(f: KBox<FileObject>) -> ObjectRef {
         // SAFETY: `into_raw` yields the single creation reference; adopt it.
         unsafe { ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject) }
     }
 
     /// **Dropping an address space must release its file-backed VMAs without a lock-order
-    /// violation**, which it did not until 2026-08-21.
-    ///
-    /// A VMA owns an `ObjectRef` to what backs it. Here the mapping holds the *last*
-    /// reference to the `FileObject`, so dropping the address space drops the file — taking
-    /// the file's `LockRank::KernelObject` lock. `Drop` used to hold its own lock of the same
-    /// rank across that release, and the rank checker panics on it: "acquiring KernelObject …
-    /// while holding KernelObject".
-    ///
-    /// It needed a **process that exits** holding the last reference to a file mapping to
-    /// show up: `init` ran the filesystem tests and never exits. Moving them to `boot-probe`
-    /// (retrofit Part C) panicked the kernel on the first boot, in `check-terminal` — not
-    /// `test-qemu`, where the probe's verdict stops the machine before it can exit.
-    ///
-    /// **This test does not catch the ordering bug, and saying so is the point.** The rank
-    /// tracker is `#[cfg(not(all(debug_assertions, not(test))))]` — *inert under `cfg(test)`*,
-    /// because it needs per-CPU state the host harness has no equivalent for. Reverting `drop`
-    /// to `self.inner.lock()` leaves this test passing. **No host test in this kernel can
-    /// catch a lock-order violation**; the reproduction is a QEMU boot, and for this one it is
-    /// `cargo xtask check-terminal`.
-    ///
-    /// What it does pin is the half that is testable and that a future refactor could break
-    /// on its own: an address space that is the last holder of a file mapping **releases the
-    /// file when it drops**, rather than leaking it.
+    /// violation** (`Drop` once held its own `KernelObject` lock across the release). This test
+    /// does **not** catch that: the rank tracker is inert under `cfg(test)`, so no host test can
+    /// catch a lock-order violation; the reproduction is `cargo xtask check-terminal`. It pins
+    /// that the last holder of a file mapping releases the file when it drops.
     #[test]
     fn dropping_an_address_space_releases_a_file_mapping_it_last_holds() {
         init_global_heap();
@@ -1176,12 +919,8 @@ mod tests {
         test_probe::reset();
         let obj = into_file(FileObject::try_new(3 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
         asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_file must succeed");
-        // The VMA is now the only reference: `obj` was moved into it above.
         assert_eq!(test_probe::file_object_destroys(), 0, "the mapping holds the file alive");
         drop(asp);
-        // Dropping the address space dropped the file — from inside `Drop`, which is the
-        // whole point. Under `lock()` the run never reaches this line: the rank checker
-        // panics as the VMA is released.
         assert_eq!(test_probe::file_object_destroys(), 1, "dropping the AS released the file");
     }
 
@@ -1192,7 +931,6 @@ mod tests {
         let obj = into_file(FileObject::try_new(3 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
         asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj).expect("map_file must succeed");
         assert_eq!(asp.len(), 1, "the VMA is reserved");
-        // No frame is backed yet — every page is lazy.
         for i in 0..3u64 {
             assert!(!is_mapped(&asp, va(PAGE * (4 + i))), "page {i} must be lazy");
         }
@@ -1206,17 +944,13 @@ mod tests {
         let obj_ptr = obj.as_ptr();
         asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj).unwrap();
 
-        // A not-present fault in the mapping signals FileBacked (no fill here).
         assert_eq!(asp.fault_in(va(PAGE * 5), FaultAccess::Read), FaultIn::FileBacked);
 
-        // file_backing returns the same object + the page index within the file
-        // (the VMA maps the file from offset 0, so VMA page i == file page i).
         for (vma_page, want_index) in [(4u64, 0usize), (5, 1), (7, 3)] {
             let (got_obj, index) = asp.file_backing(va(PAGE * vma_page)).expect("covered by the file mapping");
             assert_eq!(got_obj.as_ptr(), obj_ptr, "same backing object");
             assert_eq!(index, want_index, "page index for vma page {vma_page}");
         }
-        // Outside the mapping, no backing.
         assert!(asp.file_backing(va(PAGE * 2)).is_none());
     }
 
@@ -1225,7 +959,6 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let f = FileObject::try_new(4 * PAGE as usize, Producer::Stub { base: 0 }).unwrap();
-        // Reserve + ready file page 1, mimicking a completed fill.
         let frame = match f.reserve(1) {
             Reserve::New(frame) => frame,
             other => panic!("expected New, got {other:?}"),
@@ -1234,12 +967,10 @@ mod tests {
         let obj = into_file(f);
         asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj.clone()).unwrap();
 
-        // File page 1 lives at VMA page 5 (range starts at page 4). Map it.
         assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
         // SAFETY: `asp`'s root is the live page table this test built.
         let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) }.expect("page must now be mapped");
         assert_eq!(phys, frame, "PTE points at the cache frame");
-        // Idempotent: a racing re-map of the same page still reports present.
         assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
     }
 
@@ -1256,12 +987,9 @@ mod tests {
         let obj = into_file(f);
         asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
 
-        // A different object is rejected (the VMA backs `obj`, not `other`).
         let other = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
         assert!(!asp.map_file_page(va(PAGE * 4), &other, frame));
-        // An address outside any VMA is rejected.
         assert!(!asp.map_file_page(va(PAGE * 99), &obj, frame));
-        // The legitimate mapping still works.
         assert!(asp.map_file_page(va(PAGE * 4), &obj, frame));
     }
 
@@ -1282,21 +1010,16 @@ mod tests {
         asp.map_file_page(va(PAGE * 4), &keep, frame);
         assert!(is_mapped(&asp, va(PAGE * 4)));
 
-        // Unmap: the PTE goes, but the cache frame is owned by the FileObject —
-        // the FileBacked teardown arm removes the PTE without freeing it.
         let removed = asp.unmap_covering(va(PAGE * 4)).expect("covering vma");
         assert!(!is_mapped(&asp, va(PAGE * 4)), "PTE removed");
         drop(removed);
         assert_eq!(test_probe::file_object_destroys(), 0, "object still referenced");
-        // The last reference drops → the object is destroyed and frees its frames.
         drop(keep);
         assert_eq!(test_probe::file_object_destroys(), 1);
     }
 
-    /// **A writable mapping is counted for as long as its VMA exists** (administration Part
-    /// C.1), whichever way the VMA goes — an unmap, or its address space dropping — and a map
-    /// that is refused counts nothing. A read-only mapping is never counted. The count is what
-    /// keeps a dirty file from being called clean while something could still write it.
+    /// A writable mapping is counted for as long as its VMA exists, however it goes; a refused
+    /// map counts nothing and a read-only mapping is never counted.
     #[test]
     fn a_writable_file_mapping_is_counted_while_its_vma_exists() {
         init_global_heap();
@@ -1308,17 +1031,13 @@ mod tests {
         };
         asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
         assert_eq!(fo().writable_maps(), 1);
-        // Refused for overlapping the first: counted and uncounted again.
         let (back, _) = asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap_err();
         drop(back);
         assert_eq!(fo().writable_maps(), 1, "a refused map leaves no count behind");
-        // Read-only: not counted.
         asp.map_file(range(PAGE * 8, PAGE * 9), Protection::USER, obj.clone()).unwrap();
         assert_eq!(fo().writable_maps(), 1);
-        // An unmap uncounts.
         drop(asp.unmap_covering(va(PAGE * 4)).unwrap());
         assert_eq!(fo().writable_maps(), 0);
-        // And so does an address space dropping with one still in place.
         let asp2 = AddressSpace::new().unwrap();
         asp2.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
         assert_eq!(fo().writable_maps(), 1);
@@ -1327,9 +1046,6 @@ mod tests {
         drop(asp);
     }
 
-    // --- Demand paging: lazy reservation + on-fault backing --------------
-
-    /// Probe whether a page currently translates in `asp`.
     fn is_mapped(asp: &AddressSpace, v: VirtAddr) -> bool {
         // SAFETY: read-only walk of `asp`'s own page tables.
         unsafe { Paging::translate(asp.root(), v) }.is_some()
@@ -1341,9 +1057,7 @@ mod tests {
         let asp = AddressSpace::new().unwrap();
         let r = range(PAGE * 4, PAGE * 8);
         asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER)).expect("lazy reserve must succeed");
-        // The VMA is in the tree...
         assert_eq!(asp.len(), 1);
-        // ...but no page is backed yet.
         for i in 4..8 {
             assert!(!is_mapped(&asp, va(PAGE * i)), "page {i} unexpectedly backed");
         }
@@ -1356,12 +1070,9 @@ mod tests {
         let r = range(PAGE * 4, PAGE * 8);
         asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER)).unwrap();
 
-        // Fault in only the page at PAGE*5 (a sub-page-aligned address rounds
-        // down to its page base).
         let outcome = asp.fault_in(va(PAGE * 5 + 0x40), FaultAccess::Write);
         assert_eq!(outcome, FaultIn::Mapped);
         assert!(is_mapped(&asp, va(PAGE * 5)), "faulted page not backed");
-        // Its neighbours stay unbacked — fault-in is per-page, not per-VMA.
         assert!(!is_mapped(&asp, va(PAGE * 4)));
         assert!(!is_mapped(&asp, va(PAGE * 6)));
     }
@@ -1377,12 +1088,9 @@ mod tests {
     fn fault_in_write_to_readonly_is_protection() {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
-        // USER but not WRITE: a read-only user mapping.
         asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 5), Protection::USER)).unwrap();
         assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Write), FaultIn::Protection);
-        // Refused — still unbacked.
         assert!(!is_mapped(&asp, va(PAGE * 4)));
-        // A read to the same range is permitted and backs the page.
         assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Read), FaultIn::Mapped);
         assert!(is_mapped(&asp, va(PAGE * 4)));
     }
@@ -1391,7 +1099,6 @@ mod tests {
     fn fault_in_exec_from_nonexec_is_protection() {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
-        // WRITE|USER but not EXEC.
         asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 5), Protection::WRITE | Protection::USER)).unwrap();
         assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Execute), FaultIn::Protection);
         assert!(!is_mapped(&asp, va(PAGE * 4)));
@@ -1399,9 +1106,6 @@ mod tests {
 
     #[test]
     fn dropping_a_partially_faulted_lazy_as_frees_only_backed_frames() {
-        // A lazily-reserved 4-page VMA with only 2 pages faulted in: unmap
-        // must free the 2 backed frames and skip the 2 never-backed pages
-        // (their unmap_page returns Err and is ignored) — no panic, no leak.
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let r = range(PAGE * 4, PAGE * 8);
@@ -1412,7 +1116,6 @@ mod tests {
         let removed = asp.unmap_covering(va(PAGE * 5)).expect("covering vma");
         assert_eq!(removed.range, r);
         assert!(asp.is_empty());
-        // Every page — backed or not — is unmapped afterwards.
         for i in 4..8 {
             assert!(!is_mapped(&asp, va(PAGE * i)), "page {i} still mapped");
         }
@@ -1420,8 +1123,6 @@ mod tests {
 
     #[test]
     fn fault_in_is_idempotent_friendly_across_a_lazy_drop() {
-        // Repeatedly build, lazily reserve, fault a few pages, and drop: this
-        // would exhaust the test heap if drop leaked the demand-faulted frames.
         init_global_heap();
         for _ in 0..8 {
             let asp = AddressSpace::new().unwrap();
@@ -1429,14 +1130,11 @@ mod tests {
             for i in 4..12u64 {
                 assert_eq!(asp.fault_in(va(PAGE * i), FaultAccess::Write), FaultIn::Mapped);
             }
-            // Drop frees all eight faulted frames + the PML4.
         }
     }
 
-    /// **The translation the fix runs through** (Phase 5 Part G.2). A control that deleted the
-    /// write-combining branch of `page_flags_for` left every test and every gate green, because
-    /// nothing tested this function and the one boot line that named it was computed from a copy
-    /// of it (PR #306 review, blocking 1).
+    /// The write-combining branch of `page_flags_for` once went untested while every gate stayed
+    /// green.
     #[test]
     fn a_write_combining_mapping_asks_for_it_and_an_ordinary_one_asks_for_nothing() {
         let prot = Protection::WRITE | Protection::USER;
@@ -1444,7 +1142,6 @@ mod tests {
         let wc = page_flags_for(prot, Caching::WriteCombining);
         assert!(!normal.contains(PageFlags::WRITE_COMBINING), "ordinary memory asks for nothing");
         assert!(wc.contains(PageFlags::WRITE_COMBINING));
-        // Everything else about the two mappings is the same — the attribute is not a protection.
         assert!(wc.contains(PageFlags::WRITABLE) && wc.contains(PageFlags::USER));
         assert_eq!(
             normal.contains(PageFlags::NO_EXECUTE),
@@ -1453,10 +1150,8 @@ mod tests {
         );
     }
 
-    /// **End to end, in page tables**: an aperture object that says write-combining is mapped with
-    /// the entry that means it, and an ordinary object is not. This is the path
-    /// `/dev/framebuffer` takes — `map_object` reading the object's own answer — and the one the
-    /// laptop's 45x came from.
+    /// End to end: an aperture object saying write-combining is mapped with the matching entry,
+    /// an ordinary one is not.
     #[test]
     fn mapping_an_aperture_object_selects_the_write_combining_entry() {
         init_global_heap();
@@ -1471,11 +1166,9 @@ mod tests {
         let ordinary = MemoryObject::try_new(PAGE as usize).unwrap();
         asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), into_obj(ordinary)).expect("map_object must succeed");
 
-        // Entry 5 is write-combining and entry 0 is write-back in the table the kernel programs
-        // (`KERNEL_PAT`); the numbers are the architecture's, so they are read here rather than
-        // named again.
         // SAFETY: `asp`'s root is the live page table this test built.
         let index = |v: u64| unsafe { Paging::attribute_index(asp.root(), va(v)) };
+        // Entry 5 is write-combining and entry 0 write-back in the table the kernel programs.
         assert_eq!(index(PAGE * 4), Some(5), "the aperture's mapping");
         assert_eq!(index(PAGE * 8), Some(0), "ordinary memory's");
         assert_eq!(index(PAGE * 16), None, "nothing is mapped there");

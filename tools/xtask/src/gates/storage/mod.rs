@@ -16,21 +16,18 @@ pub(crate) const STORAGE_PATTERN_FILE: &str = "check-storage.bin";
 /// `byte` must match these.
 pub(crate) const STORAGE_PATTERN_LEN: usize = 3 * 4096 + 1234;
 
-/// Byte `i` of [`STORAGE_PATTERN_LEN`]'s pattern.
 pub(crate) fn storage_pattern_byte(i: usize) -> u8 {
     ((i >> 12) as u8).wrapping_mul(0x5B) ^ (i as u8) ^ 0xA5
 }
 
 /// `cargo xtask check-storage` — **the storage chain, with the host holding the result**
-/// (administration Part C.8).
 ///
 /// The test live image boots as a USB stick beside **a copy of the release disk** on the AHCI
-/// controller: the laptop with Nitrox installed and a stick in it. That is the one topology with a
-/// second disk the host can read afterwards, since the only other second disk a boot can have is a
-/// RAM disk, whose writes never reach a host file.
+/// controller: the one topology with a second disk the host can read afterwards, since the only
+/// other second disk a boot can have is a RAM disk, whose writes never reach a host file.
 ///
-/// The copy's root is first marked **not cleanly unmounted**, as an installed machine's is until
-/// Part E's `shutdown`. On the serial console:
+/// The copy's root is first marked **not cleanly unmounted**, as an installed machine's is
+/// until its `shutdown`. On the serial console:
 /// - the storage service reports it so and auto-mounts it read-only, it being a live boot, and a
 ///   write there is refused;
 /// - the table's `clean` column says no, and still says no after the read-only unmount, which
@@ -60,16 +57,16 @@ pub(crate) fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     mark_root_not_clean(&disk)?;
     add_internal_fat(&disk)?;
     cmd_image_live_for(BuildMode::Selftest)?;
-    // **Two sticks to plug in** (Phase 6 Part D): an MBR one holding an ext4 partition, which is
-    // ejected and read on the host, and a whole-disk ext4, which is pulled while mounted.
+    // **Two sticks to plug in**: an MBR one holding an ext4 partition, which is ejected and read
+    // on the host, and a whole-disk ext4, which is pulled while mounted.
     let stick_mbr = work.join("stick-mbr.img");
     mbr_ext4_stick(&stick_mbr, 48, [STICK_MBR_LABEL, STICK_MBR_LABEL_2])?;
     let stick_whole = work.join("stick-whole.img");
     whole_ext4_stick(&stick_whole, 16, STICK_WHOLE_LABEL)?;
-    // **And a FAT stick** (Phase 6 Part E.6), for `fs-server-fat`.
+    // **And a FAT stick**, for `fs-server-fat`.
     let stick_fat = work.join("stick-fat.img");
     fat32_stick(&stick_fat, &work)?;
-    // **And a blank one** (Phase 6 Part G), 2 GiB and sparse, partitioned and formatted in the guest.
+    // **And a blank one**, 2 GiB and sparse, partitioned and formatted in the guest.
     let stick_blank = work.join(BLANK_STICK);
     let _ = fs::remove_file(&stick_blank);
     fs::File::create(&stick_blank).and_then(|f| f.set_len(2 << 30))?;
@@ -129,10 +126,9 @@ pub(crate) fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     Ok(())
 }
 
-/// The labels of `check-storage`'s two sticks (Phase 6 Part D).
 pub(crate) const STICK_MBR_LABEL: &str = "nxstick";
 
-/// The MBR stick's second partition's label (PR #367 review): an eject takes the whole stick.
+/// The MBR stick's second partition's label: an eject takes the whole stick.
 pub(crate) const STICK_MBR_LABEL_2: &str = "nxstick2";
 
 /// The MBR stick's two partitions, as sectors: the first 31 MiB from 1 MiB, the second 15 MiB from
@@ -144,7 +140,6 @@ pub(crate) const STICK_WHOLE_LABEL: &str = "nxwhole";
 /// `mke2fs`'s features for a filesystem `fs-server-ext4` serves: the live image's root's.
 const SERVED_EXT4_FEATURES: &str = "^has_journal,^64bit,^metadata_csum,^resize_inode";
 
-/// **An ext4 of `blocks` 4 KiB blocks labelled `label`, made in the file `path`.**
 fn served_ext4(path: &Path, blocks: u64, label: &str) -> R<()> {
     require_tool("mke2fs")?;
     run(Command::new("mke2fs")
@@ -163,10 +158,10 @@ fn served_ext4(path: &Path, blocks: u64, label: &str) -> R<()> {
 }
 
 /// **A stick with an MBR naming one Linux partition**, `mib` MiB, the partition from 1 MiB to the
-/// end holding an ext4 labelled `label` (Phase 6 Part D).
+/// end holding an ext4 labelled `label`.
 ///
-/// **Two partitions since PR #367's review**, an ext4 in each of [`STICK_MBR_PARTS`], so an eject
-/// named for one is seen to take the other.
+/// **Two partitions**, an ext4 in each of [`STICK_MBR_PARTS`], so an eject named for one is seen
+/// to take the other.
 fn mbr_ext4_stick(path: &Path, mib: u64, labels: [&str; 2]) -> R<()> {
     let f = fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     f.set_len(mib * 1024 * 1024)?;
@@ -182,13 +177,12 @@ fn mbr_ext4_stick(path: &Path, mib: u64, labels: [&str; 2]) -> R<()> {
     Ok(())
 }
 
-/// **A stick that is a filesystem**: `mib` MiB of ext4 labelled `label`, with no table at all.
 fn whole_ext4_stick(path: &Path, mib: u64, label: &str) -> R<()> {
     let _ = fs::remove_file(path);
     served_ext4(path, mib * 256, label)
 }
 
-/// The FAT stick's label, and the names the host puts on it (Phase 6 Part E.6): a long name, a
+/// The FAT stick's label, and the names the host puts on it: a long name, a
 /// Unicode one, a file two directories down, and one the guest removes. Beside them, the pattern
 /// at [`STORAGE_PATTERN_FILE`], which the guest reads back.
 pub(crate) const STICK_FAT_LABEL: &str = "NXFAT";
@@ -215,12 +209,10 @@ pub(crate) const FAT_RENAMED: &str = "renamed from the host.txt";
 
 pub(crate) const FAT_WRITTEN: &str = "written-by-nitrox.bin";
 
-/// The internal FAT: the third partition's name and its filesystem's label.
 pub(crate) const INTERNAL_FAT_PARTLABEL: &str = "internal-fat";
 
 pub(crate) const INTERNAL_FAT_LABEL: &str = "NXINTERNAL";
 
-/// The host's bytes for each file it puts on the FAT stick: told apart by name.
 pub(crate) fn fat_host_bytes(name: &str) -> Vec<u8> {
     match name {
         FAT_LONG_NAME => (0..9_000u32).map(|i| (i % 251) as u8).collect(),
@@ -238,7 +230,7 @@ pub(crate) fn mtools_cmd(tool: &str) -> Command {
     c
 }
 
-/// **A FAT stick for `fs-server-fat`** (Phase 6 Part E.6): 300 MiB, sparse, an MBR naming one FAT32
+/// **A FAT stick for `fs-server-fat`**: 300 MiB, sparse, an MBR naming one FAT32
 /// partition from 1 MiB, formatted `mformat -F -c 8` — **FAT32 by its cluster count, with 4 KiB
 /// clusters, and its data region off a 4 KiB boundary**, which is the case maps in sectors exist
 /// for and is asserted here from the boot sector, so a formatter that aligned it would fail the
@@ -303,7 +295,7 @@ fn fat32_stick(path: &Path, work: &Path) -> R<()> {
     Ok(())
 }
 
-/// **An internal disk's FAT** (Phase 6 Part E.6): a third partition on the copy of the release
+/// **An internal disk's FAT**: a third partition on the copy of the release
 /// disk, grown for it — 64 MiB of FAT32 with 4 KiB clusters, which `fs-server-fat` would serve,
 /// on a disk that is not removable, so nothing mounts it by itself. On the same disk because the
 /// AHCI driver binds the first SATA disk it finds.
@@ -313,7 +305,6 @@ fn add_internal_fat(disk: &Path) -> R<()> {
     const MIB: u64 = 1024 * 1024;
     let len = fs::metadata(disk)?.len();
     fs::OpenOptions::new().write(true).open(disk)?.set_len(len + 65 * MIB)?;
-    // The backup GPT to the new end, then the partition in the space between.
     run(Command::new("sgdisk").arg("-e").arg(disk))?;
     run(Command::new("sgdisk")
         .arg("-n")
@@ -338,10 +329,8 @@ fn add_internal_fat(disk: &Path) -> R<()> {
 }
 
 /// Mark the disk image's `nitrox-root` **not cleanly unmounted**, as an installed machine's is:
-/// nothing unmounts `init`'s root until Part E's `shutdown`, so a live boot on the laptop finds its
-/// disk this way. It is also what makes the table's `clean` column mean something here: after the
-/// read-only unmount it must still say no, and only the writable one may make it say yes
-/// (PR #336 review, finding 1).
+/// nothing unmounts `init`'s root until `shutdown`. It is also what makes the table's `clean`
+/// column mean something: after the read-only unmount it must still say no.
 pub(crate) fn mark_root_not_clean(disk: &Path) -> R<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     let (lba, _) = partition_extent(disk, 2)?;
@@ -355,14 +344,12 @@ pub(crate) fn mark_root_not_clean(disk: &Path) -> R<()> {
     Ok(())
 }
 
-/// The SATA disk's `nitrox-root`, as it stands in the disk image `disk`, carved into `work`.
 pub(crate) fn storage_root_fs(disk: &Path, work: &Path) -> R<PathBuf> {
     let fs_img = work.join("nitrox-root.ext4");
     carve_partition(disk, 2, &fs_img)?;
     Ok(fs_img)
 }
 
-/// `path`'s bytes in the ext4 image `fs_img`, read with `debugfs`; `None` if it is not there.
 pub(crate) fn debugfs_cat(fs_img: &Path, path: &str) -> R<Option<Vec<u8>>> {
     let out = Command::new("debugfs")
         .arg("-R")
@@ -379,9 +366,8 @@ pub(crate) fn debugfs_cat(fs_img: &Path, path: &str) -> R<Option<Vec<u8>>> {
     Ok(Some(out.stdout))
 }
 
-/// The superblock's `s_state` in the ext4 image `fs_img`: bytes 58–59 of the superblock at 1024.
-/// Read here rather than through `fs_server_ext4::ext4::was_left_clean`, which is the code under
-/// test.
+/// The superblock's `s_state` in the ext4 image `fs_img`: bytes 58–59 of the superblock at 1024,
+/// read here rather than through `fs_server_ext4::ext4::was_left_clean`, the code under test.
 pub(crate) fn ext4_s_state(fs_img: &Path) -> R<u16> {
     let bytes = fs::read(fs_img)?;
     let at = 1024 + 58;
@@ -428,14 +414,12 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
          live boot"
     );
 
-    // 1b. **`boot-probe` has finished, before anything is typed** (Phase 6 Part D). It starts once
-    //     the test harness's chain has, and the sticks made this gate long enough to meet it: a
-    //     `--kvm` run had it starting while a stick was pulled. Its later tests open view-broker
-    //     clients until the broker refuses one, and install a policy, either of which a `with
-    //     admin` here could meet halfway. **Its verdict is not this gate's**: on this machine it
-    //     takes the SATA disk's `nitrox-root` for the root it wrote, and finds no scratch disk, so
-    //     it fails. It writes no disk directly, so the one the host checks is still the gate's.
-    //     Waited for as `check-shutdown` waits, whatever its code.
+    // 1b. **`boot-probe` has finished, before anything is typed.** It starts once the test
+    //     harness's chain has, and a `--kvm` run had it starting while a stick was pulled. Its
+    //     later tests open view-broker clients until the broker refuses one, and install a
+    //     policy, either of which a `with admin` here could meet halfway. **Its verdict is not
+    //     this gate's**: it takes the SATA disk's `nitrox-root` for the root it wrote, finds no
+    //     scratch disk, and fails. Waited for as `check-shutdown` waits, whatever its code.
     if !s.expect_within("service-mgr: 'boot-probe' exited code=", std::time::Duration::from_secs(300))? {
         return Err("`boot-probe` did not exit within five minutes of the storage service's report".into());
     }
@@ -472,7 +456,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     s.expect(&format!("test-pattern: {at} refused: NoAccess (-2)"))?;
     s.expect("/home>")?;
     println!("  ok: a write to it is refused NoAccess");
-    //    **And a session's eject of it is refused** (Phase 6 Part F): an internal disk is the
+    //    **And a session's eject of it is refused**: an internal disk is the
     //    `storage` grant's to unmount, and the refusal says how — with no password asked.
     let from = s.transcript().len();
     s.send(&format!("disk --eject {ROOT_PARTLABEL}"))?;
@@ -512,10 +496,8 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     // 6. **On the host, the file is on the disk and the pattern is not** — so what the last step
     //    finds, the unmount put there. Read while the guest runs: QEMU writes the image file as
     //    the guest writes the disk, and nothing on this filesystem is moving between steps. The
-    //    file's being there, at its size, is what makes the pattern's absence mean something:
-    //    this is the live filesystem the host is reading, and its data has not been written yet.
-    //    And the superblock says it is mounted writable, so a clean one at the end is the
-    //    unmount's doing.
+    //    file's being there, at its size, is what makes the pattern's absence mean something, and
+    //    the superblock says it is mounted writable, so a clean one at the end is the unmount's.
     let fs_img = storage_root_fs(disk, work)?;
     let path = format!("/{STORAGE_PATTERN_FILE}");
     match debugfs_cat(&fs_img, &path)? {
@@ -574,7 +556,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     Ok(())
 }
 
-/// **The blank stick `check-storage` partitions and formats** (Phase 6 Part G), and the copy of it
+/// **The blank stick `check-storage` partitions and formats**, and the copy of it
 /// taken once its ext4 was ejected, before an MBR replaced the GPT.
 pub(crate) const BLANK_STICK: &str = "stick-blank.img";
 
@@ -591,7 +573,6 @@ pub(crate) fn line_after(s: &mut Session, from: usize, pat: &str) -> R<String> {
         .ok_or_else(|| format!("no line holding {pat:?}").into())
 }
 
-/// The `<n>` of the first `blk-<n>` in `line`.
 pub(crate) fn blk_in(line: &str) -> R<String> {
     line.split_whitespace()
         .find_map(|w| w.strip_prefix("blk-"))

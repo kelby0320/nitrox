@@ -1,24 +1,11 @@
 //! The `Surface` category (`op = 0x09xx`) bodies — windows and their pixels. See
 //! `docs/spec/rsproto-surface-ops.md`.
 //!
-//! The compositor is a resource server bound at `/dev/draw` with a subtree base, the
-//! same binding kind `/home` uses, so window paths are forwarded resolves and nobody
-//! calls `sys_ns_bind` when a window opens
-//! (`docs/architecture/ui-composition-model.md` §2a).
-//!
-//! **This category adds no kernel surface.** A client creates a `MemoryObject`, maps it,
-//! draws, and transfers the handle **once** — not per frame. Thereafter it sends
-//! [`Commit`](build_commit_request) naming a buffer and a damage rectangle, and the
-//! compositor sends [`Release`](build_release_event) back when it is done reading. Every
-//! syscall that needs is already there: `sys_memory_create`/`_map`, handle transfer on an
-//! IPC message, and notifications (`display-substrate.md` §4).
-//!
-//! Bodies are little-endian and byte-serialised into a caller buffer, like every other
-//! category.
+//! The compositor is bound at `/dev/draw`; a client transfers its buffer handle **once** and
+//! then sends [`Commit`](build_commit_request) per frame, the compositor answering
+//! [`Release`](build_release_event) (`rsproto-surface-ops.md` § The buffer lifecycle).
 
 use crate::{get_u16, get_u32, put_u16, put_u32};
-
-// --- Operation numbers ------------------------------------------------------
 
 /// `CreateWindow` — mint a window; the reply carries its id.
 pub const OP_CREATE_WINDOW: u16 = 0x0900;
@@ -31,23 +18,13 @@ pub const OP_RELEASE: u16 = 0x0903;
 /// `DestroyWindow` — drop the window and everything attached to it.
 pub const OP_DESTROY_WINDOW: u16 = 0x0904;
 
-// --- Window roles -----------------------------------------------------------
-
 /// `normal` — an ordinary application window.
 pub const ROLE_NORMAL: u16 = 0;
-/// `panel` — a bar. Docks to a screen edge, is visible on every desktop, and **never
-/// takes keyboard focus**, so clicking the clock does not steal input from the terminal.
+/// `panel` — a bar that **never takes keyboard focus** (`rsproto-surface-ops.md` § Window roles).
 pub const ROLE_PANEL: u16 = 1;
-/// `popup` — a menu or modal. Transient, parented, and may extend beyond its parent's
-/// bounds (a menu clipped to its window is not a menu).
+/// `popup` — a menu or modal, parented and placed by its creator (§ Window roles).
 pub const ROLE_POPUP: u16 = 2;
-/// `dialog` — parented, on its parent's desktop, and **listed**.
-///
-/// The parent carries this window's desktop membership and its lifetime — destroy is
-/// transitive — but **not its position**: a manager places a dialog as it places any other
-/// listed window, and it is held for one like any other. Only a `popup` is placed by its
-/// creator. (An earlier definition also said "not offered as a wirable node on the composition
-/// canvas"; that canvas was cut, and the rest stands without it.)
+/// `dialog` — parented, **listed**, and placed by a manager (`rsproto-surface-ops.md` § Roles).
 pub const ROLE_DIALOG: u16 = 3;
 
 /// Wire tag for the top edge.
@@ -61,12 +38,7 @@ pub const EDGE_RIGHT: u16 = 3;
 
 /// A screen edge a panel can dock to.
 ///
-/// An enum rather than a raw `u16` so an edge that does not exist is **unrepresentable**
-/// rather than merely rejected by the parser. `Role`'s fields are public: with a raw tag,
-/// `Role::Panel { dock: 9, .. }` is constructible in Rust, and then a compositor's `match`
-/// needs a catch-all arm that silently reserves nothing while `strut()` still reports a
-/// reservation — two components disagreeing about the same window. `libdraw` pushed the
-/// depth check into `Geometry::with_pitch` for exactly this reason.
+/// An enum rather than a raw `u16`, so an edge that does not exist is **unrepresentable**.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Edge {
     /// Top of the screen.
@@ -104,34 +76,24 @@ impl Edge {
 
 /// Largest strut a panel may reserve, in pixels.
 ///
-/// Bounded **at the protocol edge**, where an unbounded `u32` arrives straight off the
-/// wire from a client. Two panels each reserving `0x8000_0000` overflow a `u32`
-/// accumulator: in a debug build that is a client-triggered compositor panic, and in
-/// release (how `xtask` builds userspace) it wraps to zero and silently returns the *full*
-/// screen as the work area — defeating the clamp this protocol promises. The compositor
-/// also saturates, but a value no display could ever need has no business being accepted.
+/// Bounded at the protocol edge: two panels each reserving `0x8000_0000` would overflow the
+/// compositor's `u32` accumulator (`rsproto-surface-ops.md` § Struts).
 pub const MAX_STRUT_RESERVE: u32 = 1 << 16;
 
 /// A window's role, and the extra facts a role carries.
 ///
-/// **Immutable after creation.** A role change would force the compositor to redo struts,
-/// focus policy and stacking mid-flight; a client that wants a different role creates a
-/// different window — which is what a menu or a dialog already is.
+/// **Immutable after creation** (`rsproto-surface-ops.md` § Window roles).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Role {
     /// An ordinary application window.
     Normal,
     /// A bar docked to `dock`, reserving `reserve` pixels along that edge.
     ///
-    /// **The reservation is declared, not derived from geometry.** They differ in a case
-    /// that matters: a fullscreen window covers a panel's pixels while the panel still
-    /// reserves that space for *maximised* windows. Deriving would also make a
-    /// partial-width bar, or one that reserves less than it occupies, inexpressible.
+    /// **Declared, not derived from geometry** (`rsproto-surface-ops.md` § Struts).
     Panel {
         /// Which screen edge the panel docks to.
         dock: Edge,
-        /// Pixels reserved along that edge, subtracted from the area offered to
-        /// `normal` windows.
+        /// Pixels reserved along that edge, subtracted from the area offered to `normal` windows.
         reserve: u32,
     },
     /// A menu or modal, parented to `parent`.
@@ -158,9 +120,6 @@ impl Role {
     }
 
     /// Whether a window in this role may take keyboard focus.
-    ///
-    /// A panel must not: clicking a clock or a window-list entry would otherwise steal
-    /// input from whatever the user was typing into.
     pub const fn takes_focus(&self) -> bool {
         !matches!(self, Role::Panel { .. })
     }
@@ -179,20 +138,9 @@ impl Role {
     }
 }
 
-// --- Window info ------------------------------------------------------------
-
 /// What `/dev/draw/<N>/info` reports about a window.
 ///
-/// Served as the bytes of a small read-only `MemoryObject`, the same shape
-/// `/dev/framebuffer/info` uses — a resolve answers with an object the caller maps, not
-/// with a message.
-///
-/// **Readable by anyone holding `/dev/draw`, deliberately.** A resolve arrives on the
-/// forwarding endpoint with no connection identity attached, so the compositor could not
-/// scope this per client even if it wanted to. That is the right answer rather than a
-/// concession: the composition model expects a canvas or desktop shell to enumerate windows
-/// and read their metadata, and `display-substrate.md` §4b gates *pixels* — not titles,
-/// roles or geometry — as the thing that actually leaks.
+/// Readable by any holder of `/dev/draw`, deliberately (`rsproto-surface-ops.md` § metadata).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct WindowInfo {
@@ -217,18 +165,12 @@ pub struct WindowInfo {
     /// Which desktop the window is on. **[`STICKY_DESKTOP`] (`0`) means every desktop.**
     pub desktop: u32,
     /// Window state bits — see [`WINDOW_FLAG_MINIMIZED`]. All other bits are reserved and zero.
-    ///
-    /// **A bitfield rather than a `minimized` boolean**, so the next window state (`maximized`,
-    /// which M9 needs) costs a bit instead of another growth of this struct, and so a reader
-    /// that does not know a bit degrades to "not set" rather than to a length mismatch.
     pub flags: u32,
 }
 
 /// The `desktop` value meaning **every** desktop — a sticky window.
 ///
-/// Reserved rather than discovered: `0` is what an uninitialised field holds, and a window
-/// whose desktop was never set showing up everywhere is a far more legible failure than one
-/// that vanishes.
+/// `0` is what an uninitialised field holds, so a forgotten desktop shows everywhere.
 pub const STICKY_DESKTOP: u32 = 0;
 
 /// [`WindowInfo::flags`] bit 0 — the window is minimized.
@@ -247,9 +189,7 @@ impl WindowInfo {
             Role::Panel { dock, reserve } => (dock.tag(), reserve, 0),
             Role::Popup { parent } | Role::Dialog { parent } => (0, 0, parent),
         };
-        // `desktop` and `flags` are set by the caller after construction: this constructor
-        // takes what `CreateWindow` fixes, and both of those are mutable state the compositor
-        // owns rather than creation parameters.
+        // `desktop` and `flags` are mutable compositor state, not `CreateWindow` parameters.
         Self { id, width, height, x, y, role: role.tag(), dock, reserve, parent, desktop: STICKY_DESKTOP, flags: 0 }
     }
 
@@ -296,14 +236,9 @@ impl WindowInfo {
     }
 }
 
-// --- Screen info ------------------------------------------------------------
-
 /// What `/dev/draw/screen` reports: the size of the screen the compositor draws on.
 ///
-/// Served like [`WindowInfo`], as the bytes of a small `MemoryObject` a resolve answers with.
-/// **Readable by anyone holding `/dev/draw`**: the size grants no placement authority, and a
-/// client with no manager channel — a greeter, before any shell runs — has no other way to learn
-/// it. Before Phase 5 Part E nothing did, so the two clients that needed it wrote 1280×800 down.
+/// Readable by any holder of `/dev/draw` (`rsproto-surface-ops.md` § Reading the screen's size).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ScreenInfo {
     /// Visible width in pixels.
@@ -328,8 +263,7 @@ impl ScreenInfo {
         Some(SCREEN_INFO_LEN)
     }
 
-    /// Parse from a mapped `screen` object. `None` for a slice shorter than
-    /// [`SCREEN_INFO_LEN`], which would otherwise read as a screen of zero size.
+    /// Parse from a mapped `screen` object; `None` for a slice shorter than [`SCREEN_INFO_LEN`].
     pub fn read(b: &[u8]) -> Option<Self> {
         if b.len() < SCREEN_INFO_LEN {
             return None;
@@ -338,22 +272,13 @@ impl ScreenInfo {
     }
 }
 
-// --- CreateWindow -----------------------------------------------------------
-
 /// Body length of a `CreateWindowRequest`.
-///
-/// Grew from 16 to 24 in M6 C1, when popups gained an offset. Named rather than written out
-/// at each call site: every buffer in the tree is sized from this, so the record can grow
-/// without a search for stale literals.
 pub const CREATE_WINDOW_REQUEST_LEN: usize = 24;
 /// Body length of a `CreateWindowReply`.
 pub const CREATE_WINDOW_REPLY_LEN: usize = 4;
 
 // **The record's length is a contract**, published in `docs/spec/rsproto-surface-ops.md` and
-// read by a second implementation. Nothing pinned it before C1 — `ConfigureEvent` and
-// `FocusEvent` both carry asserts and this, the record every client sends first, did not — so
-// the spec and the encoder could drift apart silently. The offsets below are what the spec
-// table names.
+// read by a second implementation; the offsets below are what the spec table names.
 const _: () = assert!(CREATE_WINDOW_REQUEST_LEN == 24);
 const _: () = assert!(CREATE_WINDOW_REPLY_LEN == 4);
 
@@ -366,29 +291,10 @@ pub struct CreateWindowRequest {
     pub height: u32,
     /// The window's role, fixed for its lifetime.
     pub role: Role,
-    /// Offset from the parent's origin. **`popup` only.**
-    ///
-    /// Role-specific like the aux words, and written and read as zero for every other role —
-    /// including `dialog`, which names a parent but is not placed relative to it.
-    ///
-    /// For a `popup` this is the whole of its placement: a menu is positioned by its *creator*,
-    /// the only party that knows where the item it drops from was drawn. A `dialog` is an
-    /// ordinary listed window that happens to name a parent — the parent carries its desktop
-    /// membership and its lifetime, not its position (`display-substrate.md` §4a,
-    /// `ui-composition-model.md` §6) — so a manager places it, and a manager needs nothing from
-    /// the client to do so: `MgrWindowCreated` already carries the parent id and the requested
-    /// size, which is what centring on a parent takes.
-    ///
-    /// **Carried here rather than sent afterwards** so that a popup's position is atomic with
-    /// its existence. A separate op between `CreateWindow` and the first `Commit` would put a
-    /// second message on the path of every menu open, and would create the window at `(0, 0)`
-    /// before moving it — never *seen* there, since nothing is composited before its first
-    /// commit, but briefly wrong rather than never wrong, and a spurious `WindowGeometry` for
-    /// the manager.
-    ///
-    /// **Resolved once, at creation.** The compositor stores absolute origins; a popup that
-    /// tracked its parent would have to be re-placed whenever the parent moved, which is
-    /// placement policy and belongs with the shell — see `TODO(popup-follows-parent)`.
+    /// Where the window wants to be; zero for a `panel` (`rsproto-surface-ops.md` §
+    /// `CreateWindow`). Carried here, not sent afterwards, so a popup's position is atomic with
+    /// its existence. **Resolved once, at creation**: tracking the parent is placement policy —
+    /// see `TODO(popup-follows-parent)`.
     pub offset_x: i32,
     /// Vertical half of [`offset_x`](Self::offset_x).
     pub offset_y: i32,
@@ -396,26 +302,13 @@ pub struct CreateWindowRequest {
 
 impl CreateWindowRequest {
     /// A window with no offset — the only meaningful shape for a role that has no parent.
-    ///
-    /// **Constructors rather than struct literals**, so the record can gain a role-specific
-    /// word without touching every caller in the tree. Adding the offset in C1 broke 66 literal
-    /// sites; the next field breaks none.
     pub const fn new(width: u32, height: u32, role: Role) -> Self {
         Self { width, height, role, offset_x: 0, offset_y: 0 }
     }
 
     /// A window at `(x, y)` — from its parent's origin for a popup, from the screen's otherwise.
     ///
-    /// **What it means depends on the role, and that is the point.** A popup's offset is where it
-    /// hangs from the item that opened it, and only its creator knows that. A `normal` or
-    /// `dialog` window's is a **preference**: the compositor holds such a window's first
-    /// configure until a manager places it, so with a manager attached this is never seen, and
-    /// without one it is the only answer there is (M11 Part E batch 8). A `panel` ignores it —
-    /// its role already says which edge it docks to.
-    ///
-    /// Before that batch every role but `popup` landed at the origin, which meant a client that
-    /// runs *before* the window manager — the login greeter, which exists so that the manager can
-    /// be started — could only ever appear in the corner.
+    /// A `normal` or `dialog` offset is a preference; a `panel` ignores it.
     pub const fn at(width: u32, height: u32, role: Role, x: i32, y: i32) -> Self {
         Self { width, height, role, offset_x: x, offset_y: y }
     }
@@ -438,13 +331,7 @@ pub fn build_create_window_request(out: &mut [u8], req: &CreateWindowRequest) ->
     };
     put_u16(out, 10, aux16);
     put_u32(out, 12, aux32);
-    // **Zero for a `panel` only**, since M11 Part E batch 8. A panel's role already says which
-    // edge it docks to, so an offset would be a second answer to that question — and the aux
-    // words are zeroed for the same reason: two identical requests must produce identical bytes.
-    //
-    // The others carry it. For a popup it is where the menu hangs from the item that opened it;
-    // for a `normal` or `dialog` it is a *preference*, which a manager overrides and which is the
-    // only answer there is when nothing is managing — the case the login greeter lives in.
+    // Zero for a `panel` only; identical requests must produce identical bytes.
     let (ox, oy) = match req.role {
         Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => (req.offset_x, req.offset_y),
         Role::Panel { .. } => (0, 0),
@@ -476,9 +363,7 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
         ROLE_DIALOG => Role::Dialog { parent: aux32 },
         _ => return None,
     };
-    // **Read for every role but `panel`**, matching what the writer sends. Reading a word the
-    // writer zeroes is harmless; *not* reading one it sends is a request silently discarded,
-    // which is what a centred greeter ran into.
+    // Read for every role but `panel`, matching the writer: an ignored word is a discarded request.
     let (offset_x, offset_y) = match role {
         Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => (get_u32(body, 16) as i32, get_u32(body, 20) as i32),
         Role::Panel { .. } => (0, 0),
@@ -503,8 +388,6 @@ pub fn parse_create_window_reply(body: &[u8]) -> Option<u32> {
     Some(get_u32(body, 0))
 }
 
-// --- AttachBuffer -----------------------------------------------------------
-
 /// Body length of an `AttachBufferRequest`.
 pub const ATTACH_BUFFER_REQUEST_LEN: usize = 24;
 
@@ -516,8 +399,7 @@ pub const ATTACH_BUFFER_REQUEST_LEN: usize = 24;
 pub struct AttachBufferRequest {
     /// Window the buffer belongs to.
     pub window: u32,
-    /// Client-chosen buffer id, unique within the window. The client picks it so it can
-    /// name the buffer in a later `Commit` without waiting for a reply.
+    /// Client-chosen buffer id, unique within the window.
     pub buffer: u32,
     /// Buffer width in pixels.
     pub width: u32,
@@ -525,8 +407,7 @@ pub struct AttachBufferRequest {
     pub height: u32,
     /// Bytes per row. Not `width * 4`: the client may pad rows.
     pub pitch: u32,
-    /// Pixel format tag; see `docs/spec/rsproto-surface-ops.md`. `0` (XRGB8888) and `1`
-    /// (ARGB8888) are accepted, and an unknown value is rejected rather than assumed.
+    /// Pixel format tag: `0` XRGB8888 or `1` ARGB8888; anything else is rejected.
     pub format: u32,
 }
 
@@ -534,15 +415,7 @@ pub struct AttachBufferRequest {
 pub const SURFACE_FORMAT_XRGB8888: u32 = 0;
 
 /// Pixel format tag for `0xAARRGGBB` — a surface that carries its own opacity.
-///
-/// **The extension the tag was added for.** `format` has been on the wire since M4 with exactly
-/// one accepted value and an explicit "unknown is rejected rather than assumed", so a second
-/// value costs no wire change and no version negotiation: a client built before M13 Part B sends
-/// `0` and gets what it always got, and one that sends `1` to a compositor built before it is
-/// refused rather than misread as opaque.
-///
-/// A surface in this format is composited a pixel at a time and cannot hide what is under it —
-/// see `libdraw::compose`. Ask for it only when translucency is wanted.
+/// Unknown `format` values were always rejected, so adding this cost no wire change.
 pub const SURFACE_FORMAT_ARGB8888: u32 = 1;
 
 /// Write an `AttachBufferRequest` body.
@@ -561,8 +434,7 @@ pub fn build_attach_buffer_request(out: &mut [u8], req: &AttachBufferRequest) ->
 
 /// Parse an `AttachBufferRequest` body.
 ///
-/// Rejects a pitch too small to hold a row: accepting it would alias rows onto each other
-/// in a buffer the *client* owns, which the compositor cannot detect any other way.
+/// Rejects a pitch too small to hold a row (`rsproto-surface-ops.md` § `AttachBuffer`).
 pub fn parse_attach_buffer_request(body: &[u8]) -> Option<AttachBufferRequest> {
     if body.len() < ATTACH_BUFFER_REQUEST_LEN {
         return None;
@@ -583,8 +455,6 @@ pub fn parse_attach_buffer_request(body: &[u8]) -> Option<AttachBufferRequest> {
     }
     Some(req)
 }
-
-// --- Commit / Release -------------------------------------------------------
 
 /// Body length of a `CommitRequest`.
 pub const COMMIT_REQUEST_LEN: usize = 24;
@@ -655,8 +525,6 @@ pub fn parse_release_event(body: &[u8]) -> Option<(u32, u32)> {
     Some((get_u32(body, 0), get_u32(body, 4)))
 }
 
-// --- DestroyWindow ----------------------------------------------------------
-
 /// Body length of a `DestroyWindowRequest`.
 pub const DESTROY_WINDOW_REQUEST_LEN: usize = 4;
 
@@ -677,15 +545,8 @@ pub fn parse_destroy_window_request(body: &[u8]) -> Option<u32> {
     Some(get_u32(body, 0))
 }
 
-// ---------------------------------------------------------------------------
-// Input delivered to a window (M3 Part C).
-//
-// **Surface-layer events, not device records.** The device layer carries `InputEvent`
-// triples with a `SYN` state machine; a client should never see one. `libinput` runs that
-// machine on the compositor's side and hands a window something already usable — which is
-// the same split `display-substrate.md` §5 makes for the keyboard, and the reason its
-// `KeyEvent` carries modifiers the device layer has no field for.
-// ---------------------------------------------------------------------------
+// Input delivered to a window. **Surface-layer events, not device records**: `libinput` runs
+// the device layer's `SYN` state machine on the compositor's side (`display-substrate.md` §5).
 
 /// `Surface::KeyEvent` — a key transition delivered to the focused window.
 pub const OP_KEY_EVENT: u16 = 0x0905;
@@ -695,17 +556,9 @@ pub const OP_POINTER_EVENT: u16 = 0x0906;
 pub const OP_FOCUS_EVENT: u16 = 0x0907;
 /// `Surface::Configure` — where and how large the compositor would like this window to be.
 ///
-/// **Server → client, unsolicited, no reply.** A *request*, not a command: the compositor cannot
-/// resize a client's buffer, because the client allocates it. A client answers by attaching and
-/// committing a buffer of that size, or declines by committing whatever it likes — and declining
-/// stays legal, because a fixed-size window is an ordinary thing and a protocol that required
-/// compliance would make every client implement reflow before it could exist.
-///
-/// **The first one is different, and it is an ordering rule rather than a stronger request.** A
-/// window is not composited until it has been configured, so a client waits for its first
-/// `Configure` before its first `Commit`. That is what lets a manager place a window *before* it
-/// is ever seen, without putting the manager on the critical path of window creation: the round
-/// trip belongs to the client. See `docs/spec/rsproto-surface-ops.md`.
+/// **Server → client, unsolicited, no reply.** A *request*, not a command. The first one is an
+/// ordering rule: a client waits for it before its first `Commit` (`rsproto-surface-ops.md`
+/// § Configure).
 pub const OP_CONFIGURE: u16 = 0x0908;
 
 /// The key was released.
@@ -713,66 +566,36 @@ pub const KEY_UP: u16 = 0;
 /// The key was pressed.
 pub const KEY_DOWN: u16 = 1;
 /// The key is still held and the repeat interval elapsed.
-///
-/// Distinct from [`KEY_DOWN`] so that a consumer counting presses does not count a held key
-/// forever — a shell's history stepping wants repeats, and a "press any key" prompt does not.
 pub const KEY_REPEAT: u16 = 2;
 
 /// A key transition, as a window sees it.
 ///
-/// The shape `display-substrate.md` §5 fixed, and the reason the boundary is key events
-/// rather than characters: **modifiers travel with the key**. A byte stream cannot express
-/// Shift-Enter — `\n` is `\n` whatever was held — and a terminal that wants it needs the
-/// modifier state at the instant the key went down, not whatever it is by the time a
-/// character arrives.
+/// **Modifiers travel with the key** (`rsproto-surface-ops.md` § KeyEvent).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct KeyEvent {
     /// Which window this is about.
-    ///
-    /// **A session can hold several windows** — a popup is created on its parent's connection —
-    /// so without this a client with a menu open cannot tell a keystroke meant for the menu
-    /// from one meant for the window under it. `Release`, `FocusEvent` and `Configure` all
-    /// carry one and `libsurface` filters on it; these two were shipped before the gap was
-    /// found, so closing it is a wire break rather than two spare bytes (M6 C3; filed at the
-    /// PR #184 re-review, whose stated trigger was "the first client with two windows").
     pub window: u32,
     /// The keycode (an `EV_KEY` code from the device layer, unchanged).
     pub keycode: u16,
     /// [`KEY_UP`], [`KEY_DOWN`] or [`KEY_REPEAT`].
-    ///
-    /// **Non-zero means "the key is down"**, which is what a client that ignores repeat
-    /// reads it as — so treating this as a boolean gives the behaviour most callers want
-    /// without them knowing repeat exists. One that cares tells a repeat from a fresh press
-    /// by the exact value, the same way the device layer's `InputEvent::value` does
-    /// (`input-subsystem.md` §3, which reserved `2` for this).
     pub pressed: u16,
     /// Modifiers held **at this transition** — see the `MOD_*` constants.
     pub modifiers: u16,
-    /// **The locks on at this transition** — [`LOCK_CAPS`], [`LOCK_NUM`] (Phase 6 Part B.5). What
+    /// **The locks on at this transition** — [`LOCK_CAPS`], [`LOCK_NUM`]; what
     /// `libinput::keymap::text` reads to give a letter its case and the keypad its digits.
     ///
-    /// **A field of its own, not modifier bits**: the compositor matches a chord with
-    /// `modifiers == hotkey`, so a lock in `modifiers` would break every chord while Num Lock was
-    /// on, which is from boot. It was a reserved `u16`, zero, so the layout is unchanged and a
-    /// reader that ignores it reads every key as it did.
+    /// Not modifier bits: a lock there would break every `modifiers == hotkey` chord match.
     pub locks: u16,
 }
 
 const _: () = assert!(core::mem::size_of::<KeyEvent>() == 12);
 
-/// Modifier bits.
+/// Modifier bits, carried by [`KeyEvent::modifiers`] and [`PointerEvent::modifiers`].
 ///
-/// Carried by both [`KeyEvent::modifiers`] and [`PointerEvent::modifiers`].
-///
-/// Left and right share a bit, as X11's `ShiftMask` and Wayland's xkb mask also do: a client
-/// asking "was shift held" should not have to ask twice. What stays distinct is the
-/// **keycode** — `KEY_LEFTSHIFT` and `KEY_RIGHTSHIFT` arrive unchanged — so a consumer that
-/// genuinely needs the side reads that, and adding `MOD_*_R` bits later is additive.
-///
-/// A sender must derive these from *which modifier keys are down*, not by clearing the bit on
-/// each release: with both shifts held, releasing one has to leave `MOD_SHIFT` set. That is a
-/// tracking obligation, not a layout one — see `libinput`'s `Interpreter::held_mods`.
+/// Left and right share a bit; the **keycode** (`KEY_LEFTSHIFT`, `KEY_RIGHTSHIFT`) stays
+/// distinct. A sender must derive these from *which modifier keys are down*, not by clearing
+/// a bit on release: with both shifts held, releasing one must leave `MOD_SHIFT` set.
 pub const MOD_SHIFT: u16 = 1 << 0;
 /// Either control key.
 pub const MOD_CTRL: u16 = 1 << 1;
@@ -781,8 +604,7 @@ pub const MOD_ALT: u16 = 1 << 2;
 /// Either meta/"super" key.
 pub const MOD_META: u16 = 1 << 3;
 
-/// Lock bits, carried by [`KeyEvent::locks`] (Phase 6 Part B.5): Caps Lock gives a letter its other
-/// case.
+/// Lock bits, carried by [`KeyEvent::locks`]: Caps Lock gives a letter its other case.
 pub const LOCK_CAPS: u16 = 1 << 0;
 /// Num Lock: the keypad's digits and point are text. On from boot.
 pub const LOCK_NUM: u16 = 1 << 1;
@@ -802,51 +624,22 @@ pub const POINTER_WHEEL: u16 = 4;
 pub const POINTER_PRESSED: u16 = 1 << 0;
 
 /// A pointer event, as a window sees it.
-///
-/// **Coordinates are window-local**, so a client can use them without knowing where it sits
-/// on screen, and they stay correct when the window moves — which a client is not told about
-/// and should not have to be.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct PointerEvent {
     /// Which window this is about — see [`KeyEvent::window`].
-    ///
-    /// Pointer records need it more than keys do, not less: a key goes to the focused window,
-    /// which a client can track from `FocusEvent`, but a pointer record goes to the window
-    /// *under the cursor* or to the grab holder. There is nothing to infer it from.
     pub window: u32,
     /// `POINTER_MOTION`, `POINTER_BUTTON`, `POINTER_ENTER` or `POINTER_LEAVE`.
     pub kind: u16,
     /// The button for `POINTER_BUTTON` (a `BTN_*` code), otherwise zero.
     pub button: u16,
     /// Every button currently held, as `BTN_LEFT`→bit 0, `BTN_RIGHT`→bit 1, `BTN_MIDDLE`→bit 2.
-    ///
-    /// Meaningful on **every** kind, not only `POINTER_BUTTON` — a drag is motion with a
-    /// button held, and a client that has to re-derive this from the button events is doing
-    /// the accumulation this layer exists to do once.
     pub buttons: u16,
     /// `POINTER_PRESSED` on a press; zero on a release.
     pub flags: u16,
     /// Modifiers held — `MOD_SHIFT` and friends — on every kind.
-    ///
-    /// Here for the same reason they ride [`KeyEvent`]: shift-click and shift-drag are not
-    /// expressible otherwise. A client that instead tracked shift from `KeyEvent`s would get
-    /// it right only while it also held keyboard focus, so shift-clicking an unfocused
-    /// window would silently behave as a plain click (PR #180 review, finding 3).
     pub modifiers: u16,
-    /// Wheel detents on `POINTER_WHEEL`, otherwise zero. **Positive is down.**
-    ///
-    /// The same direction [`y`](Self::y) grows in, and the same direction Wayland's
-    /// `wl_pointer.axis` is positive in, so a client adding this to a scroll offset needs no
-    /// sign of its own. The device layer's `REL_WHEEL` is positive-down for the same reason —
-    /// see `rsproto-input-ops.md`, where the deviation from Linux's opposite convention is
-    /// stated rather than left to be discovered.
-    ///
-    /// **A count, not a distance.** One detent is one, and a client decides what a detent is
-    /// worth — three lines in a terminal, a row in a list. Several can arrive at once when the
-    /// device reports faster than the compositor sends.
-    ///
-    /// This took the record's two reserved bytes, which is what they were reserved for.
+    /// Wheel detents on `POINTER_WHEEL`, otherwise zero; **positive is down**, a count.
     pub wheel: i16,
     /// Window-local x.
     pub x: i32,
@@ -854,34 +647,14 @@ pub struct PointerEvent {
     pub y: i32,
     /// Monotonic milliseconds **at the interrupt** that produced this event.
     ///
-    /// **Not when the client received it**, which is the whole reason the field exists. A
-    /// double click is two presses close in time, and a client with no timestamp has to read
-    /// its own clock at delivery — so a client stalled between two *deliberate* single clicks
-    /// receives them closer together than they were made and reads them as a double. Delivery
-    /// cannot pull events further apart than a stall bunched them, so the error runs one way
-    /// only, which is why this was deferred (`press-time`) rather than blocking; it is
-    /// paid off here because the wheel wanted the same record widened.
-    ///
-    /// **Milliseconds, and 64 bits.** The kernel stamps nanoseconds and the compositor divides
-    /// once, because a client that has to divide is a client that can forget to — and passing
-    /// nanoseconds to a double-click interval expressed in milliseconds fails *silently*, as a
-    /// desktop where double click stopped working. X11 and Wayland both carry milliseconds and
-    /// both carry 32 of them, which wraps every 49 days and makes every toolkit special-case
-    /// it; there is no reason to inherit that.
+    /// At the interrupt, **not at delivery**; 64 bits so it never wraps.
     pub time_ms: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<PointerEvent>() == 32);
 
 /// This window gained or lost the keyboard.
-///
-/// **A toolkit needs this and cannot derive it.** A caret blinks only when *both* the widget
-/// has focus within its window and the window has the keyboard; those are two facts from two
-/// sources, and a client with only the first would keep blinking behind another window.
-///
-/// Sent when the answer changes, not on every event that could have changed it — the
-/// compositor compares against what it last told each window, so a raise that does not move
-/// focus sends nothing.
+/// Sent when the answer changes, not on every event that could have changed it.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct FocusEvent {
@@ -890,146 +663,65 @@ pub struct FocusEvent {
     /// Reserved; zero.
     pub _pad: u16,
     /// Which window this is about.
-    ///
-    /// **Focus is per-window state, and one session can hold several windows** — a menu
-    /// popup is created on its parent's connection and takes focus from it, so both halves
-    /// of that change arrive on one channel. Without an id a client cannot attribute them,
-    /// and per-window focus state is exactly what a toolkit keeps.
-    ///
-    /// `KeyEvent` and `PointerEvent` have the same shortcoming and are not fixed here: they
-    /// are shipped, and widening them is a wire break. This record was one commit old when
-    /// the gap was found, so it cost two bytes that were already reserved
-    /// (PR #184 re-review, finding 3). The others are filed.
     pub window: u32,
 }
 
-// --- The manager channel ----------------------------------------------------
 //
-// **A third channel role in this category.** A client holds a *session* and speaks the ops
-// above about windows it created; a **manager** holds one channel for the whole compositor and
-// speaks the ops below about *any* window. The ops live here rather than in a category of their
-// own because they are about windows, and splitting them would put the two halves of one
-// subsystem in two files — the same call `Tty` made for its backend ops.
+// A **manager** holds one channel for the whole compositor and speaks the ops below about
+// *any* window.
 //
-// **The capability is the binding, not a check.** None of these verifies ownership; that is the
-// point of a manager. `/dev/draw/manage` is what bounds who may hold one, and as of M7 Part E
-// that binding **does** gate: `desktop-shell` binds `/dev/draw/new` alone into every
-// application namespace it builds, with subtree base `/new`, so `manage` is not a
-// component-boundary prefix match against it and resolves to nothing. The shell's own session
-// namespace binds the `/dev/draw` subtree unscoped and gets both. See
-// `docs/architecture/graphical-session.md` §3.
-// ---------------------------------------------------------------------------
+// **The capability is the binding, not a check**: `/dev/draw/manage` bounds who may hold one.
+// `desktop-shell` binds `/dev/draw/new` alone into every application namespace it builds, so
+// `manage` resolves to nothing there (`docs/architecture/graphical-session.md` §3).
 
 /// `Manage::Place` — put a window's top-left corner at an absolute screen position.
-///
-/// Absolute rather than relative: a manager computes positions from the work area and from other
-/// windows, so it always knows the answer in screen coordinates. A relative `Move` would serve
-/// only an interactive drag, which needs a grab offset the compositor does not keep.
 pub const OP_MGR_PLACE: u16 = 0x0910;
 /// `Manage::Raise` — to the top of the stack.
 pub const OP_MGR_RAISE: u16 = 0x0911;
 /// `Manage::Lower` — to the bottom of the stack.
 pub const OP_MGR_LOWER: u16 = 0x0912;
-/// `Manage::RaiseAbove` — directly above another window, which is what alt-tab needs: a full
-/// raise reorders everything in between, and the user sees the rest of the stack shuffle.
+/// `Manage::RaiseAbove` — directly above another window (alt-tab), not a full raise.
 pub const OP_MGR_RAISE_ABOVE: u16 = 0x0913;
 /// `Manage::SetFocus` — give a window the keyboard.
 pub const OP_MGR_SET_FOCUS: u16 = 0x0914;
 /// `Manage::SetWindowDesktop` — move a window to a desktop; [`STICKY_DESKTOP`] for all of them.
-///
-/// The compositor stores the attribute and filters on it, and knows nothing about *which*
-/// desktops exist — that is the desktop shell's, and this way the two cannot disagree.
 pub const OP_MGR_SET_WINDOW_DESKTOP: u16 = 0x0916;
 /// `Manage::SetMinimized` — hide a window without moving it off its desktop.
-///
-/// **A second attribute rather than a reserved `desktop` value**: a minimized window is still
-/// on its desktop, restores there, and belongs in that desktop's window list, so folding the
-/// two would make restoring a guess.
 pub const OP_MGR_SET_MINIMIZED: u16 = 0x0917;
 /// `Manage::Capture` — scale a window's current contents into a buffer the manager allocated.
-///
-/// The mirror of [`AttachBuffer`](OP_ATTACH_BUFFER): there a client allocates and the compositor
-/// reads, here the manager allocates and the compositor writes. Capability-gated by being a
-/// manager request — handing a client another window's pixels is the leak per-application
-/// namespaces exist to prevent.
 pub const OP_MGR_CAPTURE: u16 = 0x0920;
 
 /// `Manage::QueryLayout` — the screen, and the work area every panel's strut leaves.
-///
-/// Empty request body; the reply is a [`MgrLayout`]. **The first thing a manager needs that it
-/// cannot compute**: struts are declared by every `panel`, and only the compositor sees them all.
-/// `Place`'s own note has always said "a manager computes positions from the work area", which
-/// was not something it could do until this existed (M9 Part B).
 pub const OP_MGR_QUERY_LAYOUT: u16 = 0x0921;
 
 /// `Manage::LayoutChanged` — a manager event: the work area is not what it was.
 ///
-/// Body: [`MgrLayout`]. Sent when the work area **differs from the one last announced**, not on
-/// any particular cause. A manager that maximised a window against the old numbers would be
-/// leaving it under a panel, and nothing else would report it.
-///
-/// Today only a panel appearing or going away can change the answer — a window's role, and so
-/// its strut, is fixed at creation — but the comparison is deliberately blind to that: it stays
-/// correct if a strut ever becomes settable, which is the kind of change that otherwise quietly
-/// stops an event firing.
+/// Body: [`MgrLayout`]. Sent when the work area differs from the one last announced.
 pub const OP_MGR_LAYOUT_CHANGED: u16 = 0x0922;
 
 /// `Manage::RequestClose` — ask a window's client to close it.
 ///
-/// Request: [`MgrWindowRef`] (`other` unused). The compositor forwards
-/// [`CloseRequested`](OP_CLOSE_REQUESTED) to that window's client and answers when it has;
-/// nothing about the window changes. `NotFound` if no such window, or if no session owns it.
-///
-/// **This is the polite half and it is the one a shell reaches for first.** A window holds a
-/// process's work, and a taskbar that destroyed it would take the decision away from the only
-/// participant that knows whether that matters.
+/// Request: [`MgrWindowRef`] (`other` unused); `NotFound` if no such window or no session owns
+/// it. The polite half (`rsproto-surface-ops.md` § `RequestClose`).
 pub const OP_MGR_REQUEST_CLOSE: u16 = 0x0924;
 
 /// `Manage::Close` — destroy a window whose client will not.
 ///
-/// Request: [`MgrWindowRef`] (`other` unused). The window is removed from the stack exactly as
-/// [`DestroyWindow`](OP_DESTROY_WINDOW) removes one, descendants and all, and
-/// [`WindowDestroyed`](OP_MGR_WINDOW_DESTROYED) is sent. `NotFound` if no such window.
-///
-/// **Distinct from `DestroyWindow`, which is a client's request on its own session.** This one
-/// names a window the caller does not own, which is what the manager channel is for — and it is
-/// the only answer available to a desktop whose applications draw their own chrome: a close
-/// button the client paints cannot close a client that has stopped answering.
-///
-/// The client is not told, because there is nothing it could do with the information that it
-/// could not have done with [`RequestClose`](OP_MGR_REQUEST_CLOSE). Its next request naming that
-/// window is answered `NotFound`, as for any window that no longer exists.
+/// Request: [`MgrWindowRef`] (`other` unused). Removes the window exactly as
+/// [`DestroyWindow`](OP_DESTROY_WINDOW) does; the client is not told and its next request
+/// naming it is `NotFound` (`rsproto-surface-ops.md` § `Close`).
 pub const OP_MGR_CLOSE: u16 = 0x0925;
 
 /// `Manage::WindowStateRequest` — a manager event: a client asked to be minimised or maximised.
 ///
-/// Body: [`WindowState`]. The client's [`RequestState`](OP_REQUEST_STATE), forwarded. **The
-/// manager decides**; the compositor neither applies it nor remembers it, because a window being
-/// maximised is a rectangle the manager restores from and a second copy here could disagree.
+/// Body: [`WindowState`]. **The manager decides**; the compositor neither applies nor remembers.
 pub const OP_MGR_WINDOW_STATE_REQUEST: u16 = 0x0923;
 
 /// `Manage::DragEnded` — **server → manager. Unsolicited, no reply.**
 ///
-/// Body: a [`ConfigureEvent`], carrying the window and the rectangle the gesture asks for.
-///
-/// **One event for a whole gesture**, sent when the button comes up. Two gestures produce it and
-/// they mean the same thing to a manager: an interactive **resize** ([`StartResize`](OP_START_RESIZE))
-/// asks for the rectangle the user let go at, and an interactive **move** released inside a
-/// registered [snap zone](OP_MGR_REGISTER_SNAP_ZONE) asks for that zone's target. The name says
-/// *drag* rather than *resize* because a manager's answer does not depend on which it was — it
-/// was `ResizeEnded` for one part, before the second gesture that produces it existed (M9 Part F).
-///
-/// Nothing is sent per motion: the manager's queue does not coalesce and evicts its oldest when
-/// full, so a five-second drag at 100 Hz would push a `WindowCreated` off the front and leave the
-/// shell with a window it will never place and never hear about again. The outline the user sees
-/// while dragging — the resize's rectangle, or the zone's target previewed under the pointer — is
-/// the compositor's own drawing and crosses no wire at all.
-///
-/// **It carries a `ConfigureEvent` because that is what the manager sends back.** The shell's
-/// whole answer is `Manage::Configure` with these five numbers — the compositor deliberately
-/// does not apply them itself, so there is one path to a window's geometry rather than two that
-/// can disagree, and a shell that decided the window may not have that rectangle is behaving
-/// correctly.
+/// Body: a [`ConfigureEvent`] carrying the rectangle a finished gesture asks for: a resize's
+/// final rectangle or a [snap zone](OP_MGR_REGISTER_SNAP_ZONE)'s target. One event per
+/// gesture, none per motion (`rsproto-surface-ops.md` § `DragEnded`).
 pub const OP_MGR_DRAG_ENDED: u16 = 0x0926;
 /// `Manage::RegisterHotkey` — route a key chord to the manager instead of the focused window.
 ///
@@ -1039,90 +731,42 @@ pub const OP_MGR_REGISTER_HOTKEY: u16 = 0x091E;
 /// `Manage::Hotkey` — a registered chord was pressed. Compositor → manager.
 pub const OP_MGR_HOTKEY: u16 = 0x091F;
 /// How many chords one manager may register.
-///
-/// Bounded because everything else here is. Sixteen covers a launcher chord plus switching and
-/// moving across the single-digit desktops, which is what M8's shell binds.
 pub const MAX_HOTKEYS: usize = 16;
 
 /// `Manage::RegisterSnapZone` — a region of the screen, and the rectangle a window dropped in it
-/// takes.
 ///
-/// **A table the compositor matches against, exactly as [`RegisterHotkey`](OP_MGR_REGISTER_HOTKEY)
-/// gave it chords it does not understand.** During an interactive move the compositor tests the
-/// pointer against this table, shows the matching zone's *target* as the outline, and — if the
-/// button comes up inside one — hands the manager that rectangle. The policy is entirely in the
-/// numbers: which region means which rect, and how close counts, are the manager's to compute and
-/// re-register. The compositor evaluates a lookup and knows nothing about halves or corners
-/// (M9 Part F).
-///
-/// **Registering an existing id replaces it**, which is where this differs from a chord — and the
-/// difference is what the two tables are. A chord table is a set of *distinct* chords, so a
-/// duplicate id is a manager confusing itself and is refused. A zone table is a **layout**: it is
-/// recomputed wholesale whenever the work area changes, and a manager re-registering the same
-/// eight ids with new rectangles is doing the ordinary thing rather than a mistake.
+/// A table the compositor matches during an interactive move; **registering an existing id
+/// replaces it** (`rsproto-surface-ops.md` § `RegisterSnapZone`).
 pub const OP_MGR_REGISTER_SNAP_ZONE: u16 = 0x0927;
 
 /// How many snap zones the compositor holds at once.
-///
-/// Bounded for the reason [`MAX_HOTKEYS`] is: it arrives off the wire and is held for the
-/// manager's life. Eight is the shape a desktop uses — four edges and four corners — and this
-/// leaves room for a shell that wants a few more without being a table a manager can grow
-/// without limit.
 pub const MAX_SNAP_ZONES: usize = 16;
 /// `Manage::SetCurrentDesktop` — switch which desktop is composited.
 ///
-/// **Numbered outside the `0x0910`–`0x0917` request block on purpose**: every request in that
-/// block names a window in its first four bytes and this one names none, because it is a
-/// property of the screen. `0` is refused — see [`MgrDesktop`]. (This said "every other manager
-/// request", which `RegisterHotkey`, `QueryLayout` and now `SetScheme` all contradict.)
+/// Numbered outside the `0x0910`–`0x0917` block because it names no window; `0` is refused.
 pub const OP_MGR_SET_CURRENT_DESKTOP: u16 = 0x091D;
 /// `Manage::SetScheme` — which built-in scheme the compositor's own drawing follows.
 ///
-/// **The compositor never reads a theme file** — `init` starts it, and a theme reaches a session
-/// on the setup record (M11 decision 1) — so the shell, which read the file, says which scheme it
-/// named. Today that decides one thing: how dark a window's shadow is, which the design specifies
-/// per palette (desktop refresh, Part A). Shaped like [`SetCurrentDesktop`](OP_MGR_SET_CURRENT_DESKTOP):
-/// it names no window, because it is a property of the screen. See [`MgrScheme`].
+/// Names no window. See [`MgrScheme`] and `rsproto-surface-ops.md` § `SetScheme`.
 pub const OP_MGR_SET_SCHEME: u16 = 0x0928;
 /// `Manage::Configure` — ask a window to be a given size and position.
 ///
-/// The manager's half of the [`Configure`](OP_CONFIGURE) a client receives. Sent in answer to a
-/// [`WindowCreated`](OP_MGR_WINDOW_CREATED) it is what releases the client from the
-/// initial-configure handshake; sent later it is an ordinary request the client may decline.
+/// The manager's half of the [`Configure`](OP_CONFIGURE) a client receives; sent in answer to
+/// a [`WindowCreated`](OP_MGR_WINDOW_CREATED) it ends the initial-configure handshake.
 pub const OP_MGR_CONFIGURE: u16 = 0x0915;
 
 /// `Manage::WindowCreated` — server → manager, when a window is created.
 ///
-/// **Carries the role and the requested geometry, not just an id.** A manager cannot place from
-/// an id alone: a `panel` is not placed like a `normal`, a `popup` is placed by its own client,
-/// and centring needs a size. All of it is already in the create request, so an event that made
-/// the manager ask a follow-up question would be a seam with a round trip in it.
-///
-/// Body: [`MgrWindowCreated`], 20 bytes.
+/// Body: [`MgrWindowCreated`], 20 bytes; carries the role and requested geometry.
 pub const OP_MGR_WINDOW_CREATED: u16 = 0x0918;
 /// `Manage::WindowDestroyed` — server → manager, when a window goes away.
 ///
-/// Body: [`MgrWindowRef`], 8 bytes; `other` is unused and sent as 0. Reusing the request shape
-/// rather than minting a 4-byte one keeps the manager channel to three body layouts, and the
-/// request side already spends `other` the same way on `Raise`/`Lower`/`SetFocus`.
+/// Body: [`MgrWindowRef`], 8 bytes; `other` is unused and sent as 0.
 pub const OP_MGR_WINDOW_DESTROYED: u16 = 0x0919;
 /// `Manage::WindowGeometry` — server → manager: this window's position or size changed.
 ///
-/// Sent whenever a window's bounds change for any reason, **including the manager's own
-/// `Place`** — a manager that had to remember which changes were its own would be keeping a
-/// second copy of the stack. A window list that learned about size changes by polling is the
-/// thing this exists to avoid.
-///
-/// **"Any reason" includes a commit, and the size is the committed one.** A window's bounds
-/// are its *committed* buffer's rectangle, which is what `/dev/draw/<id>/info` reports and
-/// what is actually on screen — not the size the client named at `CreateWindow`. So a client
-/// that reflows and commits a different-sized buffer has changed its bounds with no manager
-/// involved, and is reported. Sending the requested size here instead would put the manager
-/// and a namespace read in disagreement about one window at one instant (PR #217 review,
-/// findings 1 and 2).
-///
-/// Body: [`ConfigureEvent`], 20 bytes — the same layout the client-facing `Configure` uses,
-/// because it says the same thing about the same window.
+/// Sent whenever a window's bounds change, with the *committed* size. Body: [`ConfigureEvent`],
+/// 20 bytes.
 pub const OP_MGR_WINDOW_GEOMETRY: u16 = 0x091A;
 /// `Manage::WindowFocus` — server → manager: the keyboard moved.
 ///
@@ -1130,46 +774,26 @@ pub const OP_MGR_WINDOW_GEOMETRY: u16 = 0x091A;
 pub const OP_MGR_WINDOW_FOCUS: u16 = 0x091B;
 /// `Manage::WindowTitle` — server → manager: this window's title changed.
 ///
-/// Body: [`title`] — a window id then UTF-8 bytes. Sent when a client names its window with
-/// [`OP_SET_TITLE`], which is the only way a title changes. Built in M7 Part A, closing the
-/// `m6-b3b-titles` deferral; the four lifecycle events above shipped in M6 B3.
+/// Body: [`title`]; sent when a client names its window with [`OP_SET_TITLE`].
 pub const OP_MGR_WINDOW_TITLE: u16 = 0x091C;
 
 /// `Surface::SetTitle` — a client naming its own window. Client → server, **silent on
 /// success**; a malformed body gets the usual error reply.
 ///
 /// Body: [`title`] — the window id, then UTF-8 bytes. Longer than [`MAX_TITLE`] is truncated
-/// on a character boundary rather than refused, for the reason
-/// [`title::truncate_title`] gives. A title is the one piece of a window a *manager* needs
-/// and only the *client* knows.
+/// on a character boundary rather than refused (see [`title::truncate_title`]).
 pub const OP_SET_TITLE: u16 = 0x0909;
 
 /// `Surface::StartMove` — hand the compositor an interactive move of this window.
 ///
-/// **A client request, and the only kind of geometry change a client may originate.** Everything
-/// else about where a window sits is the manager's: `Place` and `Configure` are manager ops, and
-/// a client asking to be moved *to a position* would be asking to place itself. This asks for
-/// something different — that the window follow the pointer the user is already holding down on
-/// it — which is not a position the client knows or could compute (M9 Part A).
-///
-/// Refused unless the caller holds the pointer grab on that window: the grab is what makes
-/// "the user is dragging me" true, and without the check a client could move its window while
-/// nobody was touching it.
+/// The only geometry change a client may originate; refused unless the caller holds the pointer
+/// grab on that window (`rsproto-surface-ops.md` § `StartMove`).
 pub const OP_START_MOVE: u16 = 0x090A;
 
 /// `Surface::RequestState` — ask to be minimised, maximised, or returned to normal.
 ///
-/// **A client cannot do any of these itself, and must not be able to.** Minimising is
-/// `Manage::SetMinimized` and maximising is `Manage::Configure` to a rectangle computed from the
-/// work area; both are manager operations, and a client holding either could put another
-/// client's window away or place itself. So this asks, the compositor forwards it to the manager
-/// as [`WindowStateRequest`](OP_MGR_WINDOW_STATE_REQUEST), and the manager answers with the
-/// request it would have sent anyway — the same shape as a resource server asking a supervisor
-/// to bind it (M9 Part B).
-///
-/// The reply says the compositor accepted and forwarded it, **not** that anything happened: what
-/// a manager does with it is the manager's, and a shell that decided a window may not be
-/// maximised is behaving correctly.
+/// The compositor forwards this as [`WindowStateRequest`](OP_MGR_WINDOW_STATE_REQUEST); the
+/// reply says it was accepted, **not** that anything happened.
 pub const OP_REQUEST_STATE: u16 = 0x090B;
 
 /// [`RequestState`](OP_REQUEST_STATE): the window is neither minimised nor maximised.
@@ -1181,30 +805,15 @@ pub const WINDOW_STATE_MAXIMIZED: u32 = 2;
 
 /// `Surface::CloseRequested` — **server → client. Unsolicited, `request_id` 0, no reply.**
 ///
-/// Body, 4 bytes: `window` (u32). Somebody with the manager channel is asking this window to
-/// close — the taskbar's close, or anything else a shell offers. **It is a request and there is
-/// no way to refuse it**, which is deliberate: a client that wants to ask "save first?" opens a
-/// dialog and closes when that resolves, and a client that ignores this simply stays open.
-///
-/// What a client does *not* have to do is guess. The alternative — a manager destroying the
-/// window outright — takes the decision away from the process that owns the work in it, which is
-/// why the shell asks first and only insists when nothing happens (M9 Part C).
+/// Body, 4 bytes: `window` (u32). **A request that cannot be refused**: a client that ignores
+/// it simply stays open (`rsproto-surface-ops.md` § `CloseRequested`).
 pub const OP_CLOSE_REQUESTED: u16 = 0x090C;
 
 /// `Surface::StartResize` — hand the compositor an interactive resize of this window.
 ///
-/// **The same shape as [`StartMove`](OP_START_MOVE), and refused the same way**: unless the
-/// caller holds the pointer grab on that window, which is what makes "the user is dragging my
-/// edge" true. What differs is what the compositor does with it — a move changes the window's
-/// origin as the pointer travels, and a resize changes *nothing*. It tracks a rectangle, draws
-/// an outline over the composed stack, and when the button comes up it hands the manager the
-/// rectangle the user let go at ([`DragEnded`](OP_MGR_DRAG_ENDED)).
-///
-/// **The compositor never resizes a client**, which is why the gesture ends in a manager event
-/// rather than in a `Configure` from here: there is one path to a window's geometry — the
-/// manager's — rather than two that can disagree. That the outline moves per motion and the
-/// `Configure` goes out once is decision 3 of Milestone 9: a `Configure` per motion is a client
-/// cost (new buffers, mapped, re-laid-out, repainted) and not a protocol one (M9 Part E).
+/// **The same shape as [`StartMove`](OP_START_MOVE), refused the same way**; the manager gets
+/// the final rectangle ([`DragEnded`](OP_MGR_DRAG_ENDED)) and the compositor never resizes a
+/// client (`rsproto-surface-ops.md` § `StartResize`).
 pub const OP_START_RESIZE: u16 = 0x090D;
 
 /// [`StartResize`](OP_START_RESIZE): the pointer is dragging the window's left edge.
@@ -1217,39 +826,18 @@ pub const RESIZE_TOP: u32 = 1 << 2;
 pub const RESIZE_BOTTOM: u32 = 1 << 3;
 /// Every edge [`StartResize`](OP_START_RESIZE) understands; anything else is `InvalidArgument`.
 ///
-/// **A corner is two bits**, which is the whole reason this is a mask rather than an enum of
-/// eight directions: the bottom-right grip is `RESIZE_RIGHT | RESIZE_BOTTOM`, and the arithmetic
-/// that moves an edge is written once per axis rather than once per direction. Opposite edges
-/// together (`LEFT | RIGHT`) is refused — there is no gesture that drags both — as is naming no
-/// edge at all, which would be a drag that changes nothing while holding a grab.
+/// A corner is two bits; opposite edges together, or no edge, are refused.
 pub const RESIZE_EDGES: u32 = RESIZE_LEFT | RESIZE_RIGHT | RESIZE_TOP | RESIZE_BOTTOM;
 
 /// `Surface::DeclareAcceptor` — this window takes drops of these kinds, under this name.
 ///
-/// Body: `window` (u32), `kinds` (u32), then the acceptor's name as UTF-8 — at most
-/// [`MAX_ACCEPTOR_NAME`] bytes, with the body's own length giving it, as
-/// [`SetTitle`](OP_SET_TITLE) does.
-///
-/// **A name rather than a rectangle, and that is M10 decision 2.** An acceptor is a *port in
-/// waiting*: today it is addressed by a drag ending over the window, and when ports arrive the
-/// same name is what a command line addresses. A protocol that described a *region* instead
-/// would have to be re-specified to be addressed any other way — and regions are the client's
-/// anyway (decision 3), routed from the pointer position the drop carries, exactly as a press is.
-///
-/// **Declared once, not queried per drag.** The compositor holds the table and matches against
-/// it while the pointer moves; asking the client mid-gesture would put a round trip per motion
-/// on the path that has to stay cheap. It supersedes the composition model's `QueryCaps`.
-///
-/// Bounded per window like every other table the compositor holds ([`MAX_ACCEPTORS`]), and
-/// **cleared with the window** — an acceptor is a property of a window, not of a session, so a
-/// client that destroys and recreates a window declares again.
-///
-/// Re-declaring an existing name **replaces** it, for the reason a snap zone does: a set of
-/// acceptors is a description of what this window is currently able to take, and a client whose
-/// panel changed would otherwise have to remove one to change it.
+/// Body: `window` (u32), `kinds` (u32), then the acceptor's name as UTF-8, at most
+/// [`MAX_ACCEPTOR_NAME`] bytes (the body's own length gives it). Declared once; bounded per
+/// window ([`MAX_ACCEPTORS`]), cleared with the window; re-declaring a name replaces it
+/// (`rsproto-surface-ops.md` § `DeclareAcceptor`).
 ///
 /// `InvalidArgument` for an empty name, a name over the cap, one that is not UTF-8, or `kinds`
-/// naming nothing this protocol knows. `NoSuchWindow` for another session's window.
+/// naming nothing this protocol knows. `NotFound` for another session's window.
 /// `Unsupported` when the window's table is full.
 pub const OP_DECLARE_ACCEPTOR: u16 = 0x090E;
 
@@ -1258,25 +846,13 @@ pub const OP_DECLARE_ACCEPTOR: u16 = 0x090E;
 /// Body: `window` (u32), `kind` (u32), `path_len` (u32), then `path_len` bytes of path followed
 /// by the display name, both UTF-8.
 ///
-/// **The same shape as [`StartMove`](OP_START_MOVE) and [`StartResize`](OP_START_RESIZE), and
-/// refused the same way**: unless the caller holds the pointer grab on that window. The grab is
-/// what makes "the user is dragging this" true — without the check a client could start a drag
-/// with nobody touching it, and a drag is an offer of a payload to whatever window it ends over.
-///
-/// **The payload is a path, which is M10 decision 1.** A handle would have to belong to somebody
-/// while the gesture is in flight, and a refused transfer has no clean owner; a path is a name
-/// the receiving program opens for itself, reporting its own errors in its own window. The
-/// consequence is that both ends must be able to resolve it, which is true here because
-/// `desktop-shell` binds `/home` identically into every application namespace it builds.
-///
-/// The compositor runs the gesture: it highlights windows whose acceptors take `kind`, and on
-/// release inside one sends [`Dropped`](OP_DROPPED) to that window. Released anywhere else
-/// **nothing is sent** and the drag is simply over — a drop on nothing is not an error, it is
-/// the ordinary way to change your mind.
+/// Refused unless the caller holds the pointer grab, as [`StartMove`](OP_START_MOVE) is. **The
+/// payload is a path**, not a handle; on release over an acceptor the compositor sends
+/// [`Dropped`](OP_DROPPED), elsewhere **nothing** (`rsproto-surface-ops.md` § `StartDrag`).
 ///
 /// `InvalidArgument` for an empty path, one over [`MAX_DROP_PATH`], a name over
 /// [`MAX_DROP_NAME`], bytes that are not UTF-8, or a `kind` that is not exactly one known kind.
-/// `NoSuchWindow` when the caller does not hold the grab, or a move or resize is already running.
+/// `NotFound` when the caller does not hold the grab, or a move or resize is already running.
 pub const OP_START_DRAG: u16 = 0x090F;
 
 /// `Surface::Dropped` — a drag ended over this window, on this acceptor.
@@ -1284,47 +860,19 @@ pub const OP_START_DRAG: u16 = 0x090F;
 /// Body: `window` (u32), `kind` (u32), `x` (i32), `y` (i32), `acceptor_len` (u32),
 /// `path_len` (u32), then the acceptor's name, the path, and the display name in that order.
 ///
-/// **`x` and `y` are window-local, like a [`PointerEvent`]'s**, because that is what makes a
-/// client-side drop *region* possible without the protocol knowing about one: `libui` routes
-/// this to the widget under the point exactly as it routes a press, so a window can accept a
-/// drop in one panel and not another (decision 3).
-///
-/// **0x0930 rather than 0x0910**: the client block 0x0900–0x090F is full, and 0x0910–0x092F is
-/// the manager's. This begins the second client block rather than borrowing a number from a
-/// range that means something else.
+/// **`x` and `y` are window-local.** **0x0930 rather than 0x0910**: the client block
+/// 0x0900–0x090F is full and 0x0910–0x092F is the manager's.
 pub const OP_DROPPED: u16 = 0x0930;
 
 /// `Surface::Dismissed` — **server → client. Unsolicited, `request_id` 0, no reply.**
 ///
-/// Body, 4 bytes: `window` (u32). A press landed somewhere that is not this popup, so whatever it
-/// was offering is no longer what the person is doing. **A request, like
-/// [`CloseRequested`](OP_CLOSE_REQUESTED), and refusable the same way**: the client destroys the
-/// window, and one that ignores this simply stays open.
+/// Body, 4 bytes: `window` (u32). A press landed somewhere that is not this popup. **A
+/// request, refusable like [`CloseRequested`](OP_CLOSE_REQUESTED)**: one that ignores it
+/// simply stays open.
 ///
-/// **Its own op rather than a second meaning for an existing one.** `CloseRequested` says
-/// somebody asked this window to close; this says the pointer went elsewhere. Two things a client
-/// reads as "close" in one match arm is the mistake `Dropped`/`InputLost` had to be renamed out
-/// of — and the difference is real, because a client may well answer them differently: an editor
-/// asks "save first?" when *closed* and a menu just goes away when dismissed.
-///
-/// **Why the compositor has to say it at all.** A popup's owner never sees a press aimed at
-/// another window, so "click outside to dismiss" is not something a client can implement. Focus
-/// almost covers it and does not: focus here is a consequence of stacking, so clicking a *window*
-/// raises it and the popup hears about it — but clicking the desktop or a panel raises nothing,
-/// changes no focus, and left every popup in the system open (M11 Part E batch 5).
-///
-/// **Sent for a press anywhere that is not the popup itself — its parent included.** A first
-/// version exempted the parent, meaning to protect the button that opened a menu from racing a
-/// dismissal, and that was wrong twice: a popup's parent is the whole *bar* rather than the
-/// button, so clicking the bar left the menu up — and dismissing is precisely what makes clicking
-/// that button a second time close the thing it opened. The press that *opens* a popup cannot
-/// dismiss it: the popup does not exist when that press is routed.
-///
-/// **Only the topmost popup is told.** With two up at once — a menu, and a rename prompt opened
-/// by a manager hotkey that reaches the shell whatever holds focus — a press outside both
-/// dismisses the upper one, and the next press dismisses the other. Self-healing rather than
-/// stuck, and the alternative is a client hearing about a press that landed on a popup covering
-/// it, which is not "outside" from where that client sits.
+/// Sent for a press anywhere that is not the popup itself, its parent included; the press that
+/// *opens* a popup cannot dismiss it; only the topmost popup is told
+/// (`rsproto-surface-ops.md` § `Dismissed`).
 pub const OP_DISMISSED: u16 = 0x0931;
 
 /// A drop payload that is one file.
@@ -1332,21 +880,12 @@ pub const DROP_KIND_FILE: u32 = 1 << 0;
 /// A drop payload that is one directory.
 pub const DROP_KIND_DIR: u32 = 1 << 1;
 /// Every kind this protocol knows; anything else is `InvalidArgument`.
-///
-/// **A mask, because an *acceptor* takes a set** — "files but not folders" is the distinction
-/// M10's details pass named as the thing a window must be able to draw. A *drag* carries exactly
-/// one bit: a payload is one thing, and a drag offering "file or directory" would be asking the
-/// receiver to guess.
 pub const DROP_KINDS_KNOWN: u32 = DROP_KIND_FILE | DROP_KIND_DIR;
 
 /// The longest acceptor name accepted, in bytes.
 pub const MAX_ACCEPTOR_NAME: usize = 32;
 
 /// How many acceptors one window may declare.
-///
-/// Small on purpose: an acceptor is a *sink* a window offers, not a widget. A window with four
-/// distinct kinds of drop target is already a design worth questioning, and the bound is what
-/// stops a client from making the compositor's per-window state unbounded.
 pub const MAX_ACCEPTORS: usize = 4;
 
 /// The longest path a drag may carry, in bytes.
@@ -1357,29 +896,16 @@ pub const MAX_DROP_NAME: usize = 64;
 
 /// The largest Surface **event** body, in bytes — what a client must be able to receive.
 ///
-/// **A cap on a record is a promise to the receiver**, and until M10 Part E every event was a
-/// handful of integers, so `libsurface` read them into 64 bytes and nothing noticed. `Dropped`
-/// is the first record that can exceed that, and a client sized for the old maximum truncates
-/// the path — or fails to parse it at all, and the whole gesture vanishes with nothing logged
-/// (PR #260 review, blocking 1).
-///
-/// So the size lives here, beside the caps it is derived from, and both ends spell it the same
-/// way: the compositor's send buffer and every client receive buffer are this expression rather
-/// than a number that happened to agree.
+/// Both ends spell the size as this expression, so `Dropped` (the first event over 64 bytes)
+/// is not truncated.
 pub const MAX_EVENT_BODY: usize = DroppedEvent::HEAD + MAX_ACCEPTOR_NAME + MAX_DROP_PATH + MAX_DROP_NAME;
 
 /// The longest window title accepted, in bytes.
 ///
-/// Bounded at the protocol edge for the reason [`MAX_STRUT_RESERVE`] is: it arrives off the wire
-/// from a client, it is stored per window for the compositor's life, and a manager forwarding it
-/// has to fit it in a message. Long enough for any sentence anyone puts in a title bar.
+/// Bounded at the protocol edge, like [`MAX_STRUT_RESERVE`].
 pub const MAX_TITLE: usize = 256;
 
-/// A manager request naming one window and one `u32` — [`SetWindowDesktop`](OP_MGR_SET_WINDOW_DESKTOP)
-/// and [`SetMinimized`](OP_MGR_SET_MINIMIZED).
-///
-/// Shared because the two have the same shape and the same failure (`NotFound`); the field is
-/// named `value` rather than `desktop` so neither op reads as the other's special case.
+/// A manager request naming one window and one `u32` —
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MgrWindowValue {
@@ -1410,9 +936,6 @@ impl MgrWindowValue {
 }
 
 /// A capture request: which window, and the geometry of the buffer travelling with it.
-///
-/// The handle is sent alongside rather than named here, the way every other handle on this
-/// protocol travels — a body cannot carry one.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MgrCapture {
@@ -1449,16 +972,10 @@ impl MgrCapture {
 }
 
 /// A key chord — the body of both [`RegisterHotkey`](OP_MGR_REGISTER_HOTKEY) and the
-/// [`Hotkey`](OP_MGR_HOTKEY) event it produces.
-///
-/// **One type for the request and the event**, because the event's job is to say *which* chord
-/// fired and the manager already knows the chord by the id it chose. Echoing `mods` and `code`
-/// costs four bytes and means a manager that lost track can still tell them apart.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MgrHotkey {
-    /// Manager-chosen identity, the way a client chooses a buffer id. **Never zero** — that is
-    /// reserved so a zeroed body cannot register anything.
+    /// Manager-chosen identity. **Never zero**: reserved so a zeroed body registers nothing.
     pub id: u32,
     /// Modifiers that must be held, matched **exactly**: `Super+Shift+2` is not `Super+2`.
     pub mods: u16,
@@ -1553,10 +1070,8 @@ impl MgrHotkey {
 /// A manager request naming a desktop and no window —
 /// [`SetCurrentDesktop`](OP_MGR_SET_CURRENT_DESKTOP).
 ///
-/// **`0` is not a legal current desktop**, and it is the one value this request validates.
-/// `0` means sticky, so a current of `0` would blank every non-sticky window *and* — by the
-/// rule that a window is created onto the current desktop — make everything created afterwards
-/// silently sticky.
+/// **`0` is not a legal current desktop**: it means sticky, so a current of `0` would blank
+/// every non-sticky window and make everything created afterwards silently sticky.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MgrDesktop {
@@ -1585,10 +1100,8 @@ impl MgrDesktop {
 
 /// A manager request naming a scheme — [`SetScheme`](OP_MGR_SET_SCHEME).
 ///
-/// **A number rather than a name**, like every other body on this channel, and only the two
-/// below are legal: anything else is refused as `Malformed` rather than taken as the nearest
-/// scheme, because a shell and a compositor that disagreed about what `2` meant would each look
-/// right on its own.
+/// Only the two below are legal; anything else is `Malformed` (`rsproto-surface-ops.md`
+/// § `SetScheme`).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MgrScheme {
@@ -1647,8 +1160,8 @@ impl WindowRef {
     }
 }
 
-/// A window and a state it is asked to be in — [`RequestState`](OP_REQUEST_STATE), and the
-/// [`WindowStateRequest`](OP_MGR_WINDOW_STATE_REQUEST) event that forwards it.
+/// A window and a state it is asked to be in — [`RequestState`](OP_REQUEST_STATE) and its forwarded
+/// [`WindowStateRequest`](OP_MGR_WINDOW_STATE_REQUEST).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct WindowState {
@@ -1678,11 +1191,7 @@ impl WindowState {
     }
 }
 
-/// The screen, and the part of it a maximised window may have — [`QueryLayout`](OP_MGR_QUERY_LAYOUT).
-///
-/// **The work area is not derivable by the manager.** Every `panel` reserves an edge, and the
-/// compositor is what knows all of them: a shell that subtracted only its *own* bars would put a
-/// maximised window under any other panel-role client, with nothing able to notice.
+/// The screen, and the part a maximised window may have ([`QueryLayout`](OP_MGR_QUERY_LAYOUT)).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MgrLayout {
@@ -1823,8 +1332,7 @@ impl DeclareAcceptor {
 
     /// Parse a request body into the head and the name it carries.
     ///
-    /// **The name is validated here rather than by each reader**, because there is exactly one
-    /// rule and two would eventually differ: non-empty, within the cap, and UTF-8.
+    /// The name is validated here, once: non-empty, within the cap, and UTF-8.
     pub fn read(b: &[u8]) -> Option<(Self, &str)> {
         if b.len() < Self::HEAD {
             return None;
@@ -1834,8 +1342,7 @@ impl DeclareAcceptor {
             return None;
         }
         let head = Self { window: get_u32(b, 0), kinds: get_u32(b, 4) };
-        // A declaration naming no kind this protocol knows accepts nothing, which is a window
-        // asking to be highlighted for drags it cannot take.
+        // A declaration naming no known kind accepts nothing.
         if head.kinds == 0 || head.kinds & !DROP_KINDS_KNOWN != 0 {
             return None;
         }
@@ -1878,8 +1385,7 @@ impl StartDrag {
 
     /// Parse a request body into the head, the path and the display name.
     ///
-    /// **`kind` must be exactly one bit**: a drag carries one payload, and one offering "file or
-    /// directory" would be asking whatever it lands on to guess.
+    /// **`kind` must be exactly one bit**: a drag carries one payload.
     pub fn read(b: &[u8]) -> Option<(Self, &str, &str)> {
         if b.len() < Self::HEAD {
             return None;
@@ -1889,8 +1395,7 @@ impl StartDrag {
             return None;
         }
         let len = head.path_len as usize;
-        // **The declared length must fit what arrived**, or a short body would slice past the
-        // end — the reader's half of the bound the writer already checks.
+        // The declared length must fit what arrived: the reader's half of the writer's bound.
         if len == 0 || len > MAX_DROP_PATH || Self::HEAD + len > b.len() {
             return None;
         }
@@ -1969,9 +1474,7 @@ impl DroppedEvent {
         };
         let a = head.acceptor_len as usize;
         let p = head.path_len as usize;
-        // **Both lengths checked against what arrived, and their sum checked for overflow.**
-        // Two fields that each fit and together do not is exactly the shape a length-prefixed
-        // record gets wrong.
+        // Both lengths checked against what arrived, and their sum for overflow.
         let end = Self::HEAD.checked_add(a)?.checked_add(p)?;
         if a == 0 || a > MAX_ACCEPTOR_NAME || p == 0 || p > MAX_DROP_PATH || end > b.len() {
             return None;
@@ -2023,12 +1526,8 @@ impl MgrPlace {
     }
 }
 
-/// A manager request naming one window, and optionally a second — `Raise`, `Lower`, `SetFocus`,
-/// `RaiseAbove`.
-///
-/// One body for four ops because they differ only in what the compositor does, not in what they
-/// carry: `other` is the reference window for [`RaiseAbove`](OP_MGR_RAISE_ABOVE) and **zero** for
-/// the rest, which is not a valid window id (ids start at 1).
+/// A manager request naming one window and optionally a second: `other` is zero (not a valid
+/// id) for `Raise`, `Lower` and `SetFocus`.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MgrWindowRef {
@@ -2040,28 +1539,16 @@ pub struct MgrWindowRef {
 
 const _: () = assert!(core::mem::size_of::<MgrWindowRef>() == 8);
 
-/// The **first variable-length Surface record**, shared by [`OP_SET_TITLE`] (client → server)
-/// and [`OP_MGR_WINDOW_TITLE`] (server → manager).
-///
-/// Layout: a 4-byte little-endian window id, then the title's UTF-8 bytes, **and nothing
-/// else**. There is no length field: the body's own length gives it, because a Surface body
-/// arrives inside a message that already carries one. Adding a second length would create two
-/// sources of truth for the same number and a way for them to disagree.
-///
-/// This is the wire-format question the `m6-b3b-titles` deferral split off from M6 B3 — "a
-/// length convention, a cap, and a decision about what a client sending 64 KiB of title gets
-/// back".
-/// The convention is above, the cap is [`MAX_TITLE`], and the answer to the third is
-/// [`truncate_title`].
+/// The **first variable-length Surface record**, shared by [`OP_SET_TITLE`] and
+/// [`OP_MGR_WINDOW_TITLE`]: a 4-byte window id then UTF-8, with no length field (the body's
+/// own length gives it). The cap is [`MAX_TITLE`].
 pub mod title {
     use super::MAX_TITLE;
 
     /// Parse a title record into `(window, title)`.
     ///
-    /// `None` on a body too short to hold a window id, or one whose title is not UTF-8 — a
-    /// title is displayed, so a client that sends bytes nobody can render is malformed rather
-    /// than merely unlucky. The returned title is **not** truncated; that is
-    /// [`truncate_title`]'s job at the point of storage, so a parser stays a parser.
+    /// `None` on a body too short to hold a window id, or one whose title is not UTF-8. The
+    /// title is **not** truncated; that is [`truncate_title`]'s job at storage.
     pub fn read(b: &[u8]) -> Option<(u32, &str)> {
         if b.len() < 4 {
             return None;
@@ -2073,9 +1560,7 @@ pub mod title {
 
     /// Serialise `(window, title)`. `None` if `out` cannot hold it.
     ///
-    /// The caller is expected to have passed `title` through [`truncate_title`] already; this
-    /// does not silently shorten, because a writer that truncates hides the one place the
-    /// decision should be visible.
+    /// The caller passes `title` through [`truncate_title`] first; this does not shorten.
     pub fn write(window: u32, title: &str, out: &mut [u8]) -> Option<usize> {
         let n = 4 + title.len();
         if out.len() < n {
@@ -2086,18 +1571,9 @@ pub mod title {
         Some(n)
     }
 
-    /// The longest prefix of `title` that fits in [`MAX_TITLE`] bytes, **cut on a character
-    /// boundary**.
-    ///
-    /// **Truncate rather than reject**, decided 2026-08-25. [`OP_SET_TITLE`] is silent on
-    /// success and has no reply a client reads, so rejecting would need an error path built
-    /// for the one op that was specified not to have one — and a dropped tail on a title is
-    /// benign in a way a dropped message is not. Every windowing system in use does the same.
-    ///
-    /// **On a character boundary**, which is the part that is easy to get wrong: slicing at
-    /// `MAX_TITLE` bytes can land inside a multi-byte character, and the result is not UTF-8
-    /// at all — so a cap meant to bound memory would instead corrupt the string, and a
-    /// manager decoding it would see a malformed record rather than a shortened title.
+    /// The longest prefix of `title` that fits in [`MAX_TITLE`] bytes, cut on a character
+    /// boundary. **Truncate rather than reject**: [`OP_SET_TITLE`] has no reply a client reads,
+    /// and a dropped tail is benign.
     pub fn truncate_title(title: &str) -> &str {
         if title.len() <= MAX_TITLE {
             return title;
@@ -2135,11 +1611,6 @@ impl MgrWindowRef {
 
 impl MgrWindowCreated {
     /// Build the event for a window of `role` with the geometry it asked for.
-    ///
-    /// The `role`/`aux16`/`aux32` split is the **same encoding `CreateWindowRequest` uses** —
-    /// tag, then the role's extra field: a panel's dock edge and strut reserve, a popup's or
-    /// dialog's parent. Sharing it rather than inventing a second one means a manager decoding
-    /// this reads the role exactly as the compositor did.
     pub fn for_role(window: u32, role: Role, width: u32, height: u32) -> Self {
         let (aux16, aux32) = match role {
             Role::Normal => (0, 0),
@@ -2202,10 +1673,6 @@ impl MgrWindowCreated {
 }
 
 /// The body of a [`Surface::Configure`](OP_CONFIGURE): where and how large.
-///
-/// Carries an **origin as well as a size** because the manager's answer to "where does this go"
-/// is a placement, and a client that had to learn its position through some other message would
-/// be reconciling two mechanisms that can disagree.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ConfigureEvent {
@@ -2281,14 +1748,11 @@ impl FocusEvent {
 
 impl KeyEvent {
     /// A key record for `window`.
-    ///
-    /// **A constructor, so the next field costs no call sites.** Widening this record for the
-    /// window id broke every literal in the tree; the one after it will not.
     pub const fn new(window: u32, keycode: u16, pressed: u16, modifiers: u16) -> Self {
         Self { window, keycode, pressed, modifiers, locks: 0 }
     }
 
-    /// This record with `locks` on (Phase 6 Part B.5).
+    /// This record with `locks` on.
     pub const fn with_locks(self, locks: u16) -> Self {
         Self { locks, ..self }
     }
@@ -2323,12 +1787,6 @@ impl KeyEvent {
 
 impl PointerEvent {
     /// A pointer record for `window` at window-local `(x, y)`, `time_ms` into the clock.
-    ///
-    /// A constructor for the same reason [`KeyEvent::new`] is one. **The time is an argument
-    /// rather than a builder** — every record has one, and a defaulted timestamp is a record
-    /// stamped zero that reads as "the beginning of time" to anything comparing two of them.
-    /// The wheel is the builder ([`with_wheel`](Self::with_wheel)), because only one kind
-    /// carries it.
     #[allow(clippy::too_many_arguments, reason = "a pointer event's fields, in wire order")]
     pub const fn new(
         window: u32,
@@ -2391,13 +1849,6 @@ impl PointerEvent {
 mod tests {
     use super::*;
 
-    /// **Only a `popup` carries an offset.** Every other role, `dialog` included, sends zero.
-    ///
-    /// **Only a `panel` discards it, since M11 Part E batch 8.** A panel's role already says which
-    /// edge it docks to, so an offset would be a second answer to that question. A `normal` or
-    /// `dialog` window's offset is a *preference* the compositor honours until a manager
-    /// overrides it — which was previously discarded on the wire, so a client that runs before
-    /// any manager exists could only ever appear at the origin.
     #[test]
     fn a_panel_discards_an_offset_and_the_other_roles_carry_it() {
         let mut buf = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
@@ -2405,16 +1856,13 @@ mod tests {
         build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, panel, 77, 88)).expect("encodes");
         assert_eq!(&buf[16..24], &[0u8; 8], "a panel put an offset on the wire");
 
-        // **Then put an offset there by hand.** Parsing the buffer the correct encoder just
-        // zeroed asserts nothing: it holds for a parser that reads those words too, because
-        // there is nothing in them to read. The reader is a separate arm and needs a body
-        // that would betray it (PR #220 review, finding 1).
+        // Then put an offset there by hand: parsing the buffer the correct encoder just zeroed
+        // asserts nothing, so the reader needs a body that would betray it.
         put_u32(&mut buf, 16, 77);
         put_u32(&mut buf, 20, 88);
         let back = parse_create_window_request(&buf).expect("parses");
         assert_eq!((back.offset_x, back.offset_y), (0, 0), "a panel took an offset that was on the wire");
 
-        // And the roles that carry one, round-tripped.
         for role in [Role::Normal, Role::Dialog { parent: 9 }] {
             let mut buf = [0u8; CREATE_WINDOW_REQUEST_LEN];
             build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, role, 77, -88)).expect("encodes");
@@ -2422,7 +1870,6 @@ mod tests {
             assert_eq!((back.offset_x, back.offset_y), (77, -88), "{role:?} lost the origin it asked for");
         }
 
-        // And the one role that does.
         let mut buf = [0u8; CREATE_WINDOW_REQUEST_LEN];
         let req = CreateWindowRequest::at(8, 8, Role::Popup { parent: 3 }, 77, -88);
         build_create_window_request(&mut buf, &req).expect("encodes");
@@ -2430,15 +1877,9 @@ mod tests {
         assert_eq!((back.offset_x, back.offset_y), (77, -88), "a popup's offset survives");
     }
 
-    /// `for_role` puts the role in the same two aux words `CreateWindowRequest` does — for
-    /// **every** role, not just the one a gate happens to create.
-    ///
-    /// The mirror is the whole contract: a manager reads `WindowCreated` and must arrive at
-    /// the role the client asked for. The two encoders are separate code with the same match
-    /// arms, so nothing but a test holds them together — and every gate in the tree creates
-    /// `Role::Normal`, where all three branches agree on `(0, 0)` and any mix-up is invisible.
-    /// Swapping `(dock.tag(), reserve)` to `(reserve as u16, dock as u32)` leaves the suite
-    /// green without this (PR #217 review, finding 6).
+    /// `for_role` puts the role in the same two aux words `CreateWindowRequest` does, for
+    /// **every** role: the two encoders are separate code with the same match arms, and every
+    /// gate creates `Role::Normal`, where all branches agree on `(0, 0)`.
     #[test]
     fn for_role_encodes_every_role_the_way_a_create_request_does() {
         for role in [
@@ -2456,7 +1897,6 @@ mod tests {
             assert_eq!(ev.aux16, get_u16(&req, 10), "aux16 for {role:?}");
             assert_eq!(ev.aux32, get_u32(&req, 12), "aux32 for {role:?}");
 
-            // And the whole way round: what a manager decodes is the role that was asked for.
             let mut body = [0u8; 20];
             let n = ev.write(&mut body).expect("event encodes");
             let back = MgrWindowCreated::read(&body[..n]).expect("event decodes");
@@ -2467,24 +1907,12 @@ mod tests {
         }
     }
 
-    /// `MgrWindowCreated`'s 20-byte layout.
-    ///
-    /// Written when this struct had no sender and no receiver — B3 was open, so nothing
-    /// exercised the encoding end to end, and an event carrying role and geometry so a manager
-    /// need not ask a follow-up question is exactly the kind of struct a byte-offset slip goes
-    /// unnoticed in. `MgrPlace` and `MgrWindowRef` were at least driven through
-    /// `manager::dispatch`; this had nothing (PR #216 review, finding 5). Both ends exist as of
-    /// PR #217 — the compositor sends it and `ui-testclient` decodes it — so this now pins a
-    /// layout that is on the wire rather than one that is only declared.
     #[test]
     fn mgr_window_created_round_trips_including_the_role_aux_fields() {
         let cases = [
             MgrWindowCreated { window: 1, role: ROLE_NORMAL, aux16: 0, aux32: 0, width: 64, height: 32 },
-            // A panel carries its dock edge and strut reserve in the aux fields.
             MgrWindowCreated { window: 4096, role: ROLE_PANEL, aux16: 3, aux32: 28, width: 1280, height: 28 },
-            // A popup carries its parent in `aux32`.
             MgrWindowCreated { window: 7, role: ROLE_POPUP, aux16: 0, aux32: 12, width: 180, height: 96 },
-            // Extremes, to catch a field written at the wrong offset or the wrong width.
             MgrWindowCreated {
                 window: u32::MAX,
                 role: u16::MAX,
@@ -2506,7 +1934,6 @@ mod tests {
             assert_eq!(got.height, want.height);
         }
 
-        // Short buffers are refused rather than truncated, both directions.
         let mut short = [0u8; 19];
         assert_eq!(cases[0].write(&mut short), None, "19 bytes must not serialise");
         assert!(MgrWindowCreated::read(&short).is_none(), "19 bytes must not parse");
@@ -2538,7 +1965,6 @@ mod tests {
         let p = Role::Panel { dock: Edge::Top, reserve: 32 };
         assert_eq!(p.strut(), Some((Edge::Top, 32)));
         assert!(!p.takes_focus(), "a panel must never take keyboard focus");
-        // Everything else focuses and reserves nothing.
         for r in [Role::Normal, Role::Popup { parent: 1 }, Role::Dialog { parent: 1 }] {
             assert_eq!(r.strut(), None);
             assert!(r.takes_focus());
@@ -2567,9 +1993,6 @@ mod tests {
 
     #[test]
     fn a_strut_larger_than_any_display_is_rejected() {
-        // Unbounded on the wire, this overflows the compositor's accumulator: a panic in
-        // debug, and in release a wrap to zero that returns the *full* screen as the work
-        // area — silently defeating the clamp the spec promises.
         let mut buf = [0u8; CREATE_WINDOW_REQUEST_LEN];
         put_u32(&mut buf, 0, 100);
         put_u32(&mut buf, 4, 32);
@@ -2595,24 +2018,19 @@ mod tests {
 
     #[test]
     fn unused_role_words_are_written_zero() {
-        // A `Normal` window must not leak whatever the caller's buffer held, or two
-        // otherwise-identical requests would differ on the wire.
         let mut buf = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
         let req = CreateWindowRequest::new(4, 4, Role::Normal);
         build_create_window_request(&mut buf, &req).unwrap();
-        // **10..24, not 10..16.** The record grew two words in C1 and the invariant covers them:
-        // the offset is meaningless without a parent, so a `normal` request that left those
-        // bytes alone would put the caller's stack contents on the wire and two identical
-        // requests would differ (PR #219 review, finding 4).
+        // **10..24, not 10..16**: the offset is meaningless without a parent, so a `normal`
+        // request that left those bytes alone would put the caller's stack contents on the wire.
         assert_eq!(&buf[10..24], &[0u8; 14]);
     }
 
     #[test]
     fn attach_accepts_the_two_known_formats_and_refuses_the_rest() {
-        // **The bytes are edited directly, not built.** A builder can only emit tags it knows
-        // about, so round-tripping one would test the encoder and leave the decoder's rejection —
-        // the half that protects an old compositor from a new client — unexercised. Byte 20 is
-        // the format word; see `docs/spec/rsproto-surface-ops.md`.
+        // **The bytes are edited directly, not built**: a builder only emits tags it knows, so
+        // round-tripping one would leave the decoder's rejection unexercised. Byte 20 is the
+        // format word.
         let mut buf = [0u8; ATTACH_BUFFER_REQUEST_LEN];
         build_attach_buffer_request(
             &mut buf,
@@ -2632,9 +2050,6 @@ mod tests {
             let got = parse_attach_buffer_request(&buf).expect("a known format is accepted");
             assert_eq!(got.format, tag, "the tag must survive the parse, not be normalised");
         }
-        // **Rejected rather than treated as opaque**, which is the direction that matters: a
-        // translucent surface mistaken for an opaque one loses the background fill beneath it and
-        // composites against stale pixels, which reads as a colour rather than as an error.
         for tag in [2u32, 3, 0xFFFF_FFFF, 0x8000_0000] {
             buf[20..24].copy_from_slice(&tag.to_le_bytes());
             assert!(parse_attach_buffer_request(&buf).is_none(), "format {tag} was accepted");
@@ -2683,9 +2098,7 @@ mod tests {
         assert_eq!(&b[8..10], &0x3132u16.to_le_bytes(), "modifiers @8");
         assert_eq!(&b[10..12], &0u16.to_le_bytes(), "locks @10, none");
         assert_eq!(KeyEvent::read(&b), Some(e));
-        // A short body is refused rather than read from whatever follows it.
         assert!(KeyEvent::read(&b[..11]).is_none(), "11 bytes is not a key record");
-        // **The locks, in the bytes that were reserved** (Phase 6 Part B.5), read back.
         let locked = e.with_locks(LOCK_CAPS | LOCK_NUM);
         locked.write(&mut b).unwrap();
         assert_eq!(&b[10..12], &3u16.to_le_bytes(), "locks @10");
@@ -2695,8 +2108,6 @@ mod tests {
 
     #[test]
     fn a_pointer_event_sits_at_the_offsets_the_spec_publishes() {
-        // Signed coordinates: a pointer can be dragged past a window's left or top edge,
-        // and a client that read them unsigned would see it teleport.
         let e = PointerEvent::new(
             0x4142_4344,
             POINTER_BUTTON,
@@ -2725,12 +2136,6 @@ mod tests {
         assert!(PointerEvent::read(&b[..31]).is_none(), "31 bytes is not a pointer record");
     }
 
-    /// The reader takes the wheel and the time from the bytes, rather than defaulting them.
-    ///
-    /// **Handed bytes a correct writer would not produce**, which is the only way to test a
-    /// reader: a round trip through `write` passes for a `read` that returned `wheel: 0` and
-    /// `time_ms: 0` whenever the writer happened to be given zeros, and the compositor's
-    /// records carry zero in one field or the other most of the time.
     #[test]
     fn a_pointer_record_reads_its_wheel_and_its_clock_from_the_wire() {
         let mut b = [0u8; 32];
@@ -2786,10 +2191,6 @@ mod tests {
 
     #[test]
     fn window_info_sits_at_the_offsets_the_spec_publishes() {
-        // A round trip cannot see a swapped pair — `write` and `read` agree with each other
-        // whatever they agree on. `docs/spec/rsproto-surface-ops.md` publishes an exact
-        // byte table as a contract for other implementations, so the bytes are pinned here
-        // rather than only their symmetry (PR #175 review, finding 7).
         let info = WindowInfo {
             id: 0x1112_1314,
             width: 0x2122_2324,
@@ -2820,10 +2221,6 @@ mod tests {
 
     #[test]
     fn a_short_info_buffer_is_refused_rather_than_written_partially() {
-        // **The growth from 32 to 40 bytes is exactly where a short write becomes plausible.**
-        // Every existing caller sized its buffer at 32, and a `write` that filled what it could
-        // would hand a reader a window whose desktop and flags are whatever the memory held —
-        // for a sticky, minimized window in the worst case, which is invisible *and* everywhere.
         let info = WindowInfo::new(1, Role::Normal, 0, 0, 8, 8);
         let mut small = [0u8; 32];
         assert_eq!(info.write(&mut small), None, "a 32-byte buffer must be refused, not filled");
@@ -2833,10 +2230,6 @@ mod tests {
 
     #[test]
     fn a_new_window_info_is_not_accidentally_sticky_or_minimized() {
-        // `STICKY_DESKTOP` is 0, which is also what an uninitialised field holds — so the
-        // constructor's defaults are the one place that reserved value can be shipped by
-        // accident. The compositor sets `desktop` from its current one straight after; this
-        // pins what the struct itself claims.
         let info = WindowInfo::new(7, Role::Normal, 1, 2, 8, 8);
         assert_eq!(info.desktop, STICKY_DESKTOP);
         assert_eq!(info.flags & WINDOW_FLAG_MINIMIZED, 0);
@@ -2891,8 +2284,6 @@ mod tests {
     fn a_truncated_info_is_refused_rather_than_read_short() {
         let mut buf = [0u8; WINDOW_INFO_LEN];
         WindowInfo::new(1, Role::Normal, 0, 0, 8, 8).write(&mut buf).unwrap();
-        // Up to and including 32 — the size this struct was before M8 Part A grew it, and so
-        // the length every existing caller's buffer happens to be.
         for short in 0..WINDOW_INFO_LEN {
             assert!(WindowInfo::read(&buf[..short]).is_none(), "len {short}");
         }
@@ -2911,7 +2302,6 @@ mod tests {
 
     #[test]
     fn a_screen_info_reader_ignores_the_reserved_bytes_and_refuses_a_short_object() {
-        // Bytes this writer never produces: a later compositor's use of the reserved half.
         let mut bytes = [0xFFu8; SCREEN_INFO_LEN];
         bytes[0..4].copy_from_slice(&1024u32.to_le_bytes());
         bytes[4..8].copy_from_slice(&768u32.to_le_bytes());
@@ -2956,8 +2346,6 @@ mod tests {
         assert!(build_create_window_request(&mut small, &req).is_none());
     }
 
-    // ---- drag and drop (M10 Part E) ----
-
     #[test]
     fn the_three_drop_records_round_trip() {
         let mut b = [0u8; 256];
@@ -2982,8 +2370,6 @@ mod tests {
 
     #[test]
     fn a_drag_carries_exactly_one_kind() {
-        // **A payload is one thing.** A drag offering "file or directory" asks whatever it lands
-        // on to guess, and an acceptor's mask is the only place a *set* belongs.
         let mut b = [0u8; 64];
         let head = StartDrag { window: 1, kind: DROP_KIND_FILE, path_len: 0 };
         let n = head.write(&mut b, b"/a", b"a").unwrap();
@@ -2997,8 +2383,6 @@ mod tests {
 
     #[test]
     fn a_reader_refuses_lengths_a_writer_would_never_produce() {
-        // **Hand-built bytes, because a round trip only ever tests the writer.** Every case here
-        // is one a correct sender cannot emit and a hostile or broken one can.
         let mut b = [0u8; 64];
         let n = StartDrag { window: 1, kind: DROP_KIND_FILE, path_len: 0 }.write(&mut b, b"/a", b"a").unwrap();
 
@@ -3012,11 +2396,9 @@ mod tests {
         let mut d = [0u8; 128];
         let ev = DroppedEvent { window: 1, kind: DROP_KIND_FILE, x: 0, y: 0, acceptor_len: 0, path_len: 0 };
         let n = ev.write(&mut d, b"e", b"/a", b"a").unwrap();
-        // Each length fits on its own; together they run past the end.
         put_u32(&mut d, 16, 20);
         put_u32(&mut d, 20, 20);
         assert!(DroppedEvent::read(&d[..n]).is_none(), "two lengths that only overflow together");
-        // And the sum that overflows the addition itself rather than the buffer.
         put_u32(&mut d, 16, u32::MAX);
         put_u32(&mut d, 20, u32::MAX);
         assert!(DroppedEvent::read(&d[..n]).is_none());
@@ -3028,9 +2410,7 @@ mod tests {
         let n = DeclareAcceptor { window: 1, kinds: DROP_KINDS_KNOWN }.write(&mut b, b"e").unwrap();
         assert!(DeclareAcceptor::read(&b[..n]).is_some(), "both known kinds is a fine acceptor");
 
-        // No name: nothing for a `Dropped` to say it landed on, and nothing for a port to be.
         assert!(DeclareAcceptor::read(&b[..DeclareAcceptor::HEAD]).is_none());
-        // Kinds nobody defines — an acceptor that would be highlighted for drags it cannot take.
         for bad in [0u32, 1 << 9, DROP_KIND_FILE | (1 << 9)] {
             put_u32(&mut b, 4, bad);
             assert!(DeclareAcceptor::read(&b[..n]).is_none(), "kinds {bad} was accepted");
@@ -3048,7 +2428,6 @@ mod title_tests {
     use super::MAX_TITLE;
     use super::title::{read, truncate_title, write};
 
-    /// The body's own length carries the title's, so a round trip must not need a length field.
     #[test]
     fn a_title_round_trips_without_a_length_field() {
         let mut buf = [0u8; 4 + MAX_TITLE];
@@ -3057,7 +2436,6 @@ mod title_tests {
         assert_eq!(read(&buf[..n]), Some((7, "nxterm")));
     }
 
-    /// An empty title is a title — a client clearing its name, not a malformed record.
     #[test]
     fn an_empty_title_is_valid() {
         let mut buf = [0u8; 8];
@@ -3066,7 +2444,6 @@ mod title_tests {
         assert_eq!(read(&buf[..n]), Some((3, "")));
     }
 
-    /// Fewer than four bytes cannot name a window.
     #[test]
     fn a_body_too_short_for_a_window_id_is_refused() {
         for len in 0..4 {
@@ -3074,23 +2451,16 @@ mod title_tests {
         }
     }
 
-    /// A title is displayed, so bytes nobody can render are malformed rather than unlucky.
     #[test]
     fn a_title_that_is_not_utf8_is_refused() {
         let body = [1u8, 0, 0, 0, 0xFF, 0xFE];
         assert_eq!(read(&body), None);
     }
 
-    /// The whole point of the cap: slicing at `MAX_TITLE` bytes can land inside a character,
-    /// and the result would not be UTF-8 at all — a cap meant to bound memory corrupting the
-    /// string it bounds.
     #[test]
     fn truncation_cuts_on_a_character_boundary() {
-        // **The fixture is offset by one byte on purpose.** 'é' is two bytes (0xC3 0xA9), so a
-        // string of nothing but 'é' has a boundary at byte 256 and a naive `&s[..MAX_TITLE]`
-        // would pass this test — which is what a first version of it did, caught by running
-        // the control. One leading ASCII byte puts every boundary at an odd offset, so the
-        // cap lands *inside* a character and the walk back is the only thing that can work.
+        // The fixture is offset by one byte: 'é' is two bytes, so a string of only 'é' has a
+        // boundary at byte 256 and a naive `&s[..MAX_TITLE]` would pass.
         let mut raw = [0u8; 259];
         raw[0] = b'a';
         for pair in raw[1..].as_chunks_mut::<2>().0 {
@@ -3102,14 +2472,11 @@ mod title_tests {
         let kept = truncate_title(s);
         assert!(kept.len() <= MAX_TITLE, "the cap was exceeded");
         assert_eq!(kept.len(), 255, "the straddling character was not dropped whole");
-        // It is still a string: the bug this guards would make this line fail to even exist.
         assert!(core::str::from_utf8(kept.as_bytes()).is_ok());
     }
 
-    /// Where the cap falls mid-character, the character goes rather than being split.
     #[test]
     fn a_character_straddling_the_cap_is_dropped_whole() {
-        // 255 ASCII bytes, then a two-byte character straddling byte 256.
         let mut raw = [b'a'; 257];
         raw[255] = 0xC3;
         raw[256] = 0xA9;
@@ -3120,7 +2487,6 @@ mod title_tests {
         assert!(kept.ends_with('a'));
     }
 
-    /// A title that fits is returned untouched — the negative control for the two above.
     #[test]
     fn a_title_within_the_cap_is_not_touched() {
         let s = "a normal window title";
@@ -3130,7 +2496,6 @@ mod title_tests {
         assert_eq!(truncate_title(exact).len(), MAX_TITLE, "an exactly-sized title was cut");
     }
 
-    /// `write` refuses a buffer it would overrun rather than shortening silently.
     #[test]
     fn write_refuses_a_buffer_it_would_overrun() {
         let mut small = [0u8; 8];

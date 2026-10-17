@@ -1,36 +1,23 @@
 //! `copy` — duplicate files and directories.
 //!
-//! The second Nitrox coreutil (shell design §10c/§10d). Where [`list`](../list) exercises
-//! the *read* side of the filesystem, `copy` exercises the *mutation* side: creating
-//! files, growing them, writing their contents, and building directory trees.
-//!
-//! ```text
-//! copy SOURCE DEST          # file → file, or directory → directory
-//! copy SOURCE... DIR        # several sources into an existing directory
-//! copy --force SOURCE DEST  # overwrite an existing destination
-//! ```
+//! Where [`list`](../list) exercises the *read* side of the filesystem, `copy` exercises the
+//! *mutation* side: creating files, writing their contents, and building directory trees.
 //!
 //! ## Deliberate behaviours
 //!
-//! - **Directories copy recursively with no flag.** Unlike `remove`, which requires
-//!   `--recursive` as a safety rail, copying a directory has no destructive-by-default
-//!   hazard — so demanding a flag would be ceremony (§10d).
-//! - **An existing destination is an error** unless `--force`. Fail loud, don't fail
-//!   silent (§1).
-//! - **Overwriting a *longer* file shrinks it first.** Creating an existing file is
-//!   idempotent and growing it smaller is a no-op, so without an explicit truncate the
-//!   old tail would survive past the new content — a file that is neither the old one nor
-//!   the new one. `copy` refused that case outright until the filesystem gained truncate.
-//! - **Measured against Linux on real storage** (Phase 6 Part H, closing
-//!   `TODO(fs-throughput)`). On the laptop, copying to a USB stick takes half Linux's time for
-//!   small files and 1.65 times it for 8 MiB ones; the costs left are the filesystems', not
-//!   this program's: a grow's zeroes (`TODO(grow-zeroes)`) and ext4's metadata written a file
-//!   at a time (`TODO(ext4-metadata-writes)`). The runs are in `docs/decision-log.md`
+//! - **Directories copy recursively with no flag.** Unlike `remove`, copying has no
+//!   destructive-by-default hazard.
+//! - **An existing destination is an error** unless `--force`.
+//! - **Overwriting a *longer* file shrinks it first**: creating an existing file is idempotent
+//!   and growing it smaller is a no-op, so without an explicit truncate the old tail would
+//!   survive past the new content.
+//! - **Measured against Linux on real storage.** On the laptop, copying to a USB stick takes half
+//!   Linux's time for small files and 1.65 times it for 8 MiB ones; the costs left are the
+//!   filesystems': a grow's zeroes (`TODO(grow-zeroes)`) and ext4's metadata written a file at
+//!   a time (`TODO(ext4-metadata-writes)`). The runs are in `docs/decision-log.md`
 //!   (2026-10-13); measure with `nxsh`'s `time` before changing what a copy asks for.
 //! - **It emits a table.** `Table<{source: String, destination: String, bytes: Int}>`, one
-//!   row per file copied. A stage that produced nothing would leave a downstream consumer
-//!   waiting on a stream that never arrives, and "what did it actually copy" is exactly
-//!   what a pipeline wants to see (`copy a b | display`).
+//!   row per file copied (`copy a b | display`).
 
 #![no_std]
 #![no_main]
@@ -49,7 +36,6 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: path building and the TSM1 encoder both allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
@@ -66,7 +52,6 @@ const HELP: &[u8] = b"usage: copy [--force] SOURCE... DEST\n\
 
 const VERSION: &[u8] = b"copy (nitrox coreutils) 0.1.0\n";
 
-/// One completed file copy, as reported on stdout.
 struct Copied {
     source: String,
     destination: String,
@@ -97,8 +82,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let dest = dest_owned.as_slice();
     let dest_is_dir = libfs::is_dir(stage.namespace, dest);
 
-    // Several sources only make sense into a directory: with a file destination they
-    // would each overwrite the last, which is never what was meant.
+    // With a file destination, several sources would each overwrite the last.
     if sources.len() > 1 && !dest_is_dir {
         stage.die(b"copy: destination must be a directory when copying several sources\n", EXIT_USAGE);
     }
@@ -107,8 +91,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     for source in sources {
         let src_owned = stage.path(source.as_bytes());
         let src = src_owned.as_slice();
-        // Into an existing directory, a source keeps its own name; otherwise the
-        // destination path names the copy itself.
+        // Into an existing directory a source keeps its name; otherwise `dest` names the copy.
         let target = if dest_is_dir {
             libfs::join(dest, libfs::basename(src))
         } else {
@@ -131,12 +114,9 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(EXIT_OK)
 }
 
-/// Copy `src` to `dst` — a file, or a directory and everything under it.
-///
-/// The walk itself is [`libfs::copy_tree`], shared with `move`'s cross-mount fallback: it was
-/// duplicated here until `move` needed the recursive case, and a recursive walker is not a
-/// thing to keep two of. What stays here is this program's *reporting* — one row per file,
-/// and the message each failure earns.
+/// Copy `src` to `dst` — a file, or a directory and everything under it — with
+/// [`libfs::copy_tree`], shared with `move`; what stays here is one row per file and the message
+/// each failure earns.
 fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<Copied>) {
     let r = libfs::copy_tree(stage.namespace, src, dst, force, &mut |s, d, bytes| {
         done.push(Copied {
@@ -145,8 +125,7 @@ fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<C
             bytes,
         });
     });
-    // A partial copy is reported by the rows already emitted; the run is not silently
-    // called a success.
+    // A partial copy is reported by the rows already emitted, and the run fails.
     match r {
         Ok(()) => {}
         Err(TreeError::TooDeep) => stage.die(b"copy: maximum recursion depth exceeded\n", EXIT_FAILURE),
@@ -159,7 +138,7 @@ fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<C
 }
 
 /// Write the report as a TSM1 table on `stdout`. As in `list`, a closed consumer is a
-/// clean end, not a failure (design §1).
+/// clean end, not a failure.
 fn emit(stage: &Stage, stdout: u64, done: &[Copied]) {
     let schema = Schema::new()
         .field("source", TypeTag::String, TypeModifiers::NONE)
@@ -185,7 +164,6 @@ fn emit(stage: &Stage, stdout: u64, done: &[Copied]) {
     }
 }
 
-/// The Tier-0 rendering (no `stdout` stream): one line per copy on the kernel log.
 fn report_text(c: &Copied) {
     let mut line = String::from("copied ");
     line.push_str(&c.source);
@@ -195,7 +173,6 @@ fn report_text(c: &Copied) {
     kprint(line.as_bytes());
 }
 
-/// A diagnostic naming the paths and the specific reason.
 fn describe(src: &[u8], dst: &[u8], e: FileError) -> String {
     let mut s = String::from("copy: ");
     s.push_str(&String::from_utf8_lossy(src));
@@ -209,8 +186,7 @@ fn describe(src: &[u8], dst: &[u8], e: FileError) -> String {
              leave a corrupt tail\n"
         }
         FileError::TooLarge => ": file is too large to copy in one mapping\n",
-        // `copy` never renames, so this cannot arise here; named rather than folded into
-        // a wildcard so that adding a `FileError` still breaks this match loudly.
+        // Cannot arise (`copy` never renames); named so a new `FileError` still breaks this match.
         FileError::CrossDevice => ": destination is on a different filesystem\n",
         FileError::Io(_) => ": I/O error\n",
     });
