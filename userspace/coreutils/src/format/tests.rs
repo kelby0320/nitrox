@@ -38,8 +38,6 @@ fn t(name: &str) -> Target {
     target(&rows(), name).unwrap()
 }
 
-/// **A target folds in its disk's driver and flag**: a partition of a stick is removable, and a
-/// partition of the boot stick is on it.
 #[test]
 fn a_partition_is_removable_and_on_the_boot_disk_as_its_disk_is() {
     let p = t("blk-5");
@@ -53,8 +51,6 @@ fn a_partition_is_removable_and_on_the_boot_disk_as_its_disk_is() {
     assert_eq!(partitions_of(&rows(), "blk-5"), [] as [&str; 0], "a partition has none");
 }
 
-/// **The default table follows the filesystem, and is a GPT from 2 TiB** — at its neighbours, for
-/// `--partition` as for `--format` — where `--mbr` is refused, naming `--gpt` (PR #368 review).
 #[test]
 fn the_default_table_follows_the_filesystem_and_is_a_gpt_from_two_tib() {
     for fs in [None, Some(Fs::Fat)] {
@@ -70,8 +66,6 @@ fn the_default_table_follows_the_filesystem_and_is_a_gpt_from_two_tib() {
     assert_eq!(scheme(None, 4 << 21, true, true), Err(Refusal::BothTables));
 }
 
-/// **The one partition runs from 1 MiB to the end** — an MBR's to the disk's last sector, a GPT's
-/// to its last usable one — and each table builder takes exactly that, and refuses a sector more.
 #[test]
 fn the_partition_runs_from_one_mib_to_the_end_or_to_the_gpts_backup() {
     let disk = 4_194_304; // 2 GiB
@@ -94,16 +88,12 @@ fn the_partition_runs_from_one_mib_to_the_end_or_to_the_gpts_backup() {
     assert_eq!(extent(Scheme::Gpt, 2048 + 33), None);
 }
 
-/// **The wipes are the first two mebibytes and the last**, clamped to a disk smaller than that.
 #[test]
 fn the_wipes_are_the_first_two_mebibytes_and_the_last() {
     assert_eq!(wipes(4_194_304), [(0, 2 << 20), ((2 << 30) - (1 << 20), 1 << 20)]);
     assert_eq!(wipes(2048), [(0, 1 << 20), (0, 1 << 20)], "a 1 MiB disk, wiped whole");
 }
 
-/// **Every refusal before a byte is written**: anything on the boot stick, a table or a whole-disk
-/// format on an internal disk or a RAM disk, a table on a partition, a table chosen for a
-/// partition's format, other sector sizes — and what is taken.
 #[test]
 fn what_is_refused_is_refused_before_anything_is_written() {
     assert_eq!(partition(&t("blk-2"), false, false), Err(Refusal::BootDisk));
@@ -124,8 +114,6 @@ fn what_is_refused_is_refused_before_anything_is_written() {
     assert!(format(&t("blk-5"), Fs::Ext4, None, false, false).is_ok());
 }
 
-/// **A filesystem too small for its partition, or a label it cannot hold, is refused before the
-/// table is written for it** — the FAT formatter's own words.
 #[test]
 fn a_filesystem_too_small_or_a_bad_label_is_refused_before_a_table() {
     let stick = |mib: i64| {
@@ -149,7 +137,7 @@ fn a_filesystem_too_small_or_a_bad_label_is_refused_before_a_table() {
     assert_eq!(ext4("seventeen-chars-x").unwrap_err().to_string(), "an ext4 label is at most 16 characters");
     assert_eq!(ext4("a/b").unwrap_err().to_string(), "an ext4 label here cannot hold '/'");
     assert_eq!(ext4("é").unwrap_err().to_string(), "an ext4 label here cannot hold the byte 0xc3");
-    // **What the storage service could not name a mount by** (PR #369 review), for either.
+    // What the storage service could not name a mount by, for either.
     for bad in [".data", " data", "data "] {
         assert!(matches!(ext4(bad), Err(Refusal::Label(_))), "ext4 {bad:?}");
         assert!(matches!(fat(bad), Err(Refusal::Label(_))), "FAT {bad:?}");
@@ -157,9 +145,6 @@ fn a_filesystem_too_small_or_a_bad_label_is_refused_before_a_table() {
     assert!(ext4("my.data").is_ok() && fat("MY DATA").is_ok(), "a dot or a space within is a label");
 }
 
-/// **What each verb plans**: `--partition`, an MBR typed for FAT; `--format DISK`, the table the
-/// filesystem calls for with the filesystem at 1 MiB filling its partition; `--format PART`, no
-/// table and the partition whole.
 #[test]
 fn a_plan_puts_the_filesystem_in_its_one_partition() {
     let disk = 4_194_304;
@@ -188,7 +173,6 @@ fn a_plan_puts_the_filesystem_in_its_one_partition() {
     );
 }
 
-/// The type a partition is given: by the FAT to be made, for an MBR; basic data or Linux, for a GPT.
 #[test]
 fn a_partition_is_typed_for_what_it_holds() {
     use fs_server_fat::bpb::Kind as Fat;

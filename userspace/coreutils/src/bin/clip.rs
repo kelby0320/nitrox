@@ -1,38 +1,23 @@
 //! `clip` — read and write the clipboard from a pipeline.
 //!
-//! M12 decision 4, and the more interesting half of it: *"a clipboard that only graphical
-//! applications can reach would be the first resource in this system that a pipeline cannot."*
-//! There is no generic read/write verb here — a resource server speaks its own ops, as the tty
-//! does — so shell access is a small utility either side of the pipe rather than a new file
-//! interface.
-//!
-//! ```text
-//! clip                       # write the newest entry to stdout
-//! clip 2                     # write the third-newest (0 is the newest)
-//! clip --list                # what the ring holds: index, kind, length
-//! ... | clip --copy          # push the upstream stream's text onto the ring
-//! ```
+//! A clipboard that only graphical applications can reach would be the first resource in this
+//! system that a pipeline cannot. A resource server speaks its own ops, as the tty does, so shell
+//! access is a small utility either side of the pipe rather than a file interface.
 //!
 //! ## Deliberate behaviours
 //!
-//! - **`clip` is a paste and takes no serial.** Decision 3: an ordinary paste asks for index 0
-//!   and gets whatever was last copied, by anyone. The serial exists for *cycling*, which is a
-//!   continuation of a paste inside one application — a shell command is never in the middle of
-//!   one, so it never has one to carry.
-//! - **The output is a text-fallback stream**, one row per line. That is the "Unix floor" this
-//!   system defines for plain text (`libstream::write_text_fallback`), so every generic operator
-//!   still works on it and `nxsh` prints exactly what was copied.
+//! - **`clip` is a paste and takes no serial.** An ordinary paste asks for index 0 and gets
+//!   whatever was last copied; the serial exists for *cycling* inside one application.
+//! - **The output is a text-fallback stream**, one row per line (`libstream::write_text_fallback`),
+//!   so every generic operator works on it and `nxsh` prints exactly what was copied.
 //! - **`--list` says how long each entry is, not what it says.** The server's `List` carries no
-//!   bytes — a reply holding [`CLIP_RING`] entries at the cap would not fit one message — and a
-//!   listing that quietly showed a prefix of somebody's password would be a worse answer than a
-//!   length.
-//! - **`--copy` renders, because a clipboard holds text.** The upstream stream is typed, so
-//!   this turns each row into a line: fields joined by tabs, each rendered the way a person
-//!   would read it. A stream that was already text (one `line: String` column, which is what
-//!   every plain-text producer here emits) comes back out byte-identical.
-//! - **An entry over the cap is refused by the server**, not truncated here. `TODO(clipboard-chunking)`
-//!   is the trigger; a utility that silently copied the first 3964 bytes would make that trigger
-//!   unobservable.
+//!   bytes — a reply holding [`CLIP_RING`] entries at the cap would not fit one message — and
+//!   showing a prefix of somebody's password would be worse than a length.
+//! - **`--copy` renders, because a clipboard holds text**: each row of the typed upstream
+//!   stream becomes a line, fields joined by tabs. A stream that was already text (one
+//!   `line: String` column) comes back out byte-identical.
+//! - **An entry over the cap is refused by the server**, not truncated here, so
+//!   `TODO(clipboard-chunking)`'s trigger stays observable.
 
 #![no_std]
 #![no_main]
@@ -54,7 +39,6 @@ use libstream::table::{TableReader, TableWriter, write_text_fallback};
 use libstream::wire::Value;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag};
 
-/// `alloc` backing: the TSM1 codec and the rendering both allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
@@ -109,16 +93,12 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let mut buf = [0u8; IPC_MSG_SIZE];
     let mut clip = match Clipboard::connect(stage.namespace, &mut buf) {
         Ok(c) => c,
-        // **Three causes, and the message says which class.** A session built without a
-        // clipboard, a server that did not start, and a malformed reply are different repairs,
-        // and "clipboard unavailable" for all three is the diagnosis-of-the-operand mistake
-        // this tree keeps finding.
+        // Three causes, and the message says which: a session built without a clipboard, a
+        // server that did not start, and a malformed reply are different repairs.
         Err(ClipError::Transport(_)) => stage.die(b"clip: no /dev/clipboard in this namespace\n", EXIT_FAILURE),
         Err(_) => stage.die(b"clip: the clipboard did not answer\n", EXIT_FAILURE),
     };
 
-    // Each of the three diverges — they own the exit status, and a shared `exit(EXIT_OK)`
-    // after them would be unreachable code claiming otherwise.
     if copying {
         do_copy(&stage, &mut clip)
     } else if listing {
@@ -130,8 +110,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Parse a decimal index, refusing anything that is not entirely digits.
 ///
-/// `str::parse` would do, but the bound matters: an index past the ring is a `NotFound` from
-/// the server, and an index past `u32` is a number this protocol cannot carry at all.
+/// An index past the ring is a `NotFound` from the server; past `u32` the protocol cannot carry it.
 fn parse_index(s: &str) -> Option<u32> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -139,30 +118,25 @@ fn parse_index(s: &str) -> Option<u32> {
     s.parse::<u32>().ok()
 }
 
-/// Write entry `index` to stdout as a text-fallback stream.
 fn do_paste(stage: &Stage, clip: &mut Clipboard<'_>, index: u32) -> ! {
     let mut bytes = [0u8; MAX_CLIP_BYTES];
     let (_, kind, len) = match clip.paste(index, CLIP_ANY_SERIAL, &mut bytes) {
         Ok(t) => t,
         Err(e) if e.is_empty() => {
-            // **Not an error.** An empty ring is a clipboard nobody has copied into, and an
-            // index past the end is a question with a legitimate answer. Both produce an empty
-            // stream and exit zero, so `clip | ...` in a script does not have to special-case
-            // "nothing has been copied yet".
+            // **Not an error**: an empty ring, or an index past the end, gives an empty stream
+            // and exit zero, so a script need not special-case "nothing copied yet".
             emit_text(stage, "");
             exit(EXIT_OK)
         }
         Err(_) => stage.die(b"clip: the clipboard refused the read\n", EXIT_FAILURE),
     };
     if kind != CLIP_KIND_TEXT {
-        // The tag exists so a second kind is not a second clipboard; this program only speaks
-        // one of them, and saying so beats printing an image's bytes at a terminal.
+        // This program only speaks text; saying so beats printing an image's bytes at a terminal.
         stage.die(b"clip: the newest entry is not text\n", EXIT_FAILURE);
     }
     if len > bytes.len() {
-        // Cannot happen while the server caps at `MAX_CLIP_BYTES`, and worth checking anyway:
-        // `paste` returns the entry's **whole** length precisely so a caller can tell that its
-        // buffer was too small rather than pasting a truncated value silently.
+        // Cannot happen while the server caps at `MAX_CLIP_BYTES`; `paste` returns the **whole**
+        // length so a too-small buffer is not pasted truncated.
         stage.die(b"clip: the entry is larger than this program can hold\n", EXIT_FAILURE);
     }
     match core::str::from_utf8(&bytes[..len]) {
@@ -172,7 +146,6 @@ fn do_paste(stage: &Stage, clip: &mut Clipboard<'_>, index: u32) -> ! {
     exit(EXIT_OK)
 }
 
-/// Write `text` as a text-fallback stream, one row per line.
 fn emit_text(stage: &Stage, text: &str) {
     let lines: Vec<&str> = if text.is_empty() { Vec::new() } else { text.split('\n').collect() };
     match stage.streams.stdout {
@@ -194,7 +167,6 @@ fn emit_text(stage: &Stage, text: &str) {
     }
 }
 
-/// Emit `Table<{index: Int, kind: Int, bytes: Int}>`, newest first.
 fn do_list(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
     let mut rows = [ClipInfo::default(); CLIP_RING];
     let (_, n) = match clip.list(&mut rows) {
@@ -234,11 +206,10 @@ fn do_list(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
     exit(EXIT_OK)
 }
 
-/// Read stdin and push its text onto the ring.
 fn do_copy(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
     let Some(stdin) = stage.streams.stdin else {
-        // **Not a paste with a typo.** `clip --copy` with nothing upstream would otherwise
-        // block forever on a stream that will never arrive, which reads as a hung shell.
+        // `clip --copy` with nothing upstream would otherwise block forever on a stream that
+        // will never arrive.
         stage.die(b"clip: --copy needs something upstream (try `... | clip --copy`)\n", EXIT_USAGE);
     };
     let bytes = match ChannelReceiver::new(IpcPort::new(stdin)).receive() {
@@ -250,7 +221,6 @@ fn do_copy(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
         None => stage.die(b"clip: the upstream stream did not decode\n", EXIT_FAILURE),
     };
     if text.len() > MAX_CLIP_BYTES {
-        // Refused rather than truncated — see this module's header.
         stage.die(b"clip: that is larger than one clipboard entry (TODO(clipboard-chunking))\n", EXIT_FAILURE);
     }
     match clip.copy(CLIP_KIND_TEXT, text.as_bytes()) {
@@ -259,12 +229,8 @@ fn do_copy(stage: &Stage, clip: &mut Clipboard<'_>) -> ! {
     }
 }
 
-/// Turn a typed stream into the text a person would read: one line per row, fields joined by
-/// tabs.
-///
-/// **A text-fallback stream comes back byte-identical**, which is the case that matters: every
-/// plain-text producer in this system emits one `line: String` column, so joining "all the
-/// fields" of a one-field row is the identity and the tabs never appear.
+/// Turn a typed stream into one line per row, fields joined by tabs. **A text-fallback stream
+/// comes back byte-identical**: a one-field row joins to itself.
 fn render(bytes: &[u8]) -> Option<String> {
     let mut tr = TableReader::new(bytes).ok()?;
     let mut out = String::new();
@@ -290,11 +256,8 @@ fn render(bytes: &[u8]) -> Option<String> {
     Some(out)
 }
 
-/// Render one field the way a person would read it.
-///
-/// The composite kinds get a placeholder rather than a serialisation: a clipboard holds text,
-/// and pasting `[list]` is a visibly wrong answer where pasting a struct's wire bytes is an
-/// invisibly wrong one.
+/// Render one field as a person would read it. The composite kinds get a placeholder, not a
+/// serialisation: `[list]` is a visibly wrong paste where wire bytes would be an invisible one.
 fn push_value(out: &mut String, v: &Value) {
     match v {
         Value::Null => {}
@@ -314,12 +277,10 @@ fn push_value(out: &mut String, v: &Value) {
     }
 }
 
-/// Append a decimal integer. `format!` would pull in `core::fmt`'s machinery for one number.
 fn push_int(out: &mut String, mut v: i64) {
     if v < 0 {
         out.push('-');
-        // `i64::MIN` has no positive counterpart; the wrapping negation is the standard
-        // two's-complement handling and the digits below read it unsigned.
+        // `i64::MIN` has no positive counterpart; the digits below read the negation unsigned.
         v = v.wrapping_neg();
     }
     let mut digits = [0u8; 20];

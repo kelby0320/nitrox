@@ -1,34 +1,17 @@
 //! `list` — enumerate a directory as a typed stream.
 //!
-//! The first Nitrox coreutil (shell design §10c/§10d). Emits
-//! `Table<{name: String, size: Int, kind: String, modified: Int}>` as TSM1 on `stdout`,
-//! one row per entry, so the rest of a pipeline operates on *data* rather than on
-//! re-parsed text: `list /system | filter size > 1000 | sort name`.
+//! Emits `Table<{name: String, size: Int, kind: String, modified: Int}>` as TSM1 on `stdout`,
+//! one row per entry: `list /system | filter size > 1000 | sort name`.
 //!
-//! Named `list`, not `ls` — the friendly name is the real program, and the Unix-familiar
-//! short name is a namespace bind pointing at it (§10e), not a shell alias.
+//! Named `list`, not `ls`: the Unix-familiar short name is a namespace bind pointing at it.
 //!
-//! ## What it emits
+//! `name` is the entry name, or the path relative to the listed directory under `--recursive`;
+//! `size` is bytes (a directory reports its own directory-data size); `kind` is `"file"`,
+//! `"dir"`, `"symlink"` or `"unknown"`, a string because the consumer is a shell predicate;
+//! `modified` is Unix epoch seconds. `.` and `..` are **not** emitted: structure, not content.
 //!
-//! - `name` — the entry name, or the path relative to the listed directory under
-//!   `--recursive` (otherwise a recursive listing could not distinguish two same-named
-//!   files in different subdirectories).
-//! - `size` — bytes. A directory reports its own directory-data size, as the server does.
-//! - `kind` — `"file"` / `"dir"` / `"symlink"` / `"unknown"`. A string rather than an
-//!   integer because the consumer is a shell predicate (`filter kind == "dir"`), not C.
-//! - `modified` — Unix epoch seconds. Rendering it as a date belongs to `display`/`date`,
-//!   not here: a stage emits data, and formatting is the terminal end of a pipeline.
-//!
-//! `.` and `..` are **not** emitted. They are real directory entries and the protocol
-//! carries them, but they are structure rather than content — every consumer would filter
-//! them, so filtering belongs here once.
-//!
-//! ## Streams
-//!
-//! With a `stdout` stream (a shell-spawned Tier-1 stage) the table goes there as TSM1.
-//! Without one (Tier 0 — spawned directly, before a shell exists) it renders as plain
-//! text to the kernel log, so the program is observable on its own. That is the text
-//! floor, not a second data path: the typed stream is the contract.
+//! With a `stdout` stream the table goes there as TSM1; without one (Tier 0) it renders as plain
+//! text to the kernel log.
 
 #![no_std]
 #![no_main]
@@ -47,7 +30,6 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: entry accumulation and the TSM1 encoder both allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
@@ -64,15 +46,9 @@ const HELP: &[u8] = b"usage: list [--recursive] [path...]\n\
 
 const VERSION: &[u8] = b"list (nitrox coreutils) 0.1.0\n";
 
-/// The directory listed when no operand is given.
-///
-/// A shell would supply the working directory, but `cd` is a shell-state builtin that
-/// does not exist yet (§3) and there is no ambient cwd in the kernel by design — so the
-/// namespace root is the honest default until the shell can pass one.
 const DEFAULT_PATH: &[u8] = b"/";
 
-/// Recursion depth cap. A symlink loop or a pathological tree must not run forever, and
-/// the fail-loud default says stop with an error rather than silently truncating.
+/// Recursion depth cap: a symlink loop must stop with an error, not truncate silently.
 const MAX_DEPTH: u32 = 32;
 
 #[unsafe(no_mangle)]
@@ -90,15 +66,10 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.answer(VERSION);
     }
 
-    // No operand: list the default directory. Several operands list each in turn, into
-    // one stream — a pipeline stage emits one table, not one per argument.
-    // Resolved at the boundary, against this stage's own `PWD` (M3.5 Part B) — the shell
-    // passes the argument through as written and hands over the working directory, so
-    // `list .` means the same thing here as `open ./x` does in the shell.
+    // Several operands list each in turn, into one stream: a stage emits one table.
     let mut paths: Vec<String> = args.operands.clone();
     if paths.is_empty() {
-        // With no operand, the default is the working directory when there is one — which
-        // is what makes a bare `list` mean "here" rather than always meaning the root.
+        // A bare `list` means "here" when there is a working directory.
         paths.push(match &stage.cwd {
             Some(cwd) => cwd.clone(),
             None => owned(DEFAULT_PATH),
@@ -124,16 +95,12 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Enumerate the directory at `path`, appending `(reported_name, entry)` for each entry.
 ///
-/// `prefix` is the reported path of `path` **relative to the directory the user named**:
-/// empty at the top level (so a plain listing reports bare names, as one would expect),
-/// and `"sub/dir"` inside a recursive descent. Without it a recursive listing could not
-/// distinguish two same-named files in different subdirectories — every row would read as
-/// a bare name with no indication of where it came from.
+/// `prefix` is the reported path of `path` **relative to the directory the user named**: empty at
+/// the top level, `"sub/dir"` inside a recursive descent, so same-named files in different
+/// subdirectories stay distinguishable.
 ///
-/// Each directory's entries are collected and its session **closed before descending**, so
-/// a deep tree holds one session at a time rather than one per level — the server's
-/// concurrent-session cap is small (`MAX_SESSIONS`), and a recursive listing must not be
-/// what exhausts it.
+/// Each directory's session is **closed before descending**, so a deep tree holds one session at
+/// a time: the server's concurrent-session cap (`MAX_SESSIONS`) is small.
 fn collect(
     stage: &Stage,
     path: &[u8],
@@ -147,9 +114,7 @@ fn collect(
         return Err(DirError::Protocol);
     }
     // The union of the filesystem under this path and the namespace bindings beneath it, with
-    // bindings shadowing. `libfs` owns that rule since M10 Part B, when the file browser became
-    // its second consumer — a listing that is *two* sources merged is exactly the kind of rule
-    // a second implementation gets subtly wrong.
+    // bindings shadowing; `libfs` owns that rule.
     let entries = libfs::list_dir(stage.namespace, path)?;
 
     for e in &entries {
@@ -158,10 +123,6 @@ fn collect(
     if recursive {
         for e in &entries {
             if e.kind == DIRENT_KIND_DIR {
-                // Two different paths: the filesystem path to open, and the relative
-                // path to report. Conflating them would either break the open (a
-                // relative path does not resolve) or the report (an absolute path
-                // buries what the user asked about).
                 let child_path = libfs::join(path, e.name());
                 let child_prefix = reported(prefix, e.name());
                 collect(stage, child_path.as_bytes(), &child_prefix, true, depth + 1, out)?;
@@ -171,15 +132,12 @@ fn collect(
     Ok(())
 }
 
-/// Bytes to an owned `String`, replacing any invalid UTF-8 rather than failing: a name on
-/// disk is a byte string, and a listing must not be unprintable because one entry is not
-/// valid UTF-8. (`String::from_utf8_lossy_owned` would be tidier but is a nightly library
-/// feature, which this project does not use.)
+/// Bytes to an owned `String`, replacing invalid UTF-8: a listing must not be unprintable
+/// because one name is not valid UTF-8.
 fn owned(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 
-/// The name a row reports: bare at the top level, `prefix/name` inside a descent.
 fn reported(prefix: &str, name: &[u8]) -> String {
     if prefix.is_empty() {
         return owned(name);
@@ -190,11 +148,8 @@ fn reported(prefix: &str, name: &[u8]) -> String {
     s
 }
 
-/// Write the rows as a TSM1 table on the `stdout` stream.
-///
-/// A `PeerClosed` — the consumer closed its read end, the `yes | head -1` case — is a
-/// **clean** end, not a failure: the stage stops producing and exits `0` (design §1). Any
-/// other write error is a real failure.
+/// Write the rows as a TSM1 table. A `PeerClosed` — the consumer closed its read end, the
+/// `yes | head -1` case — is a **clean** end: the stage exits `0`. Any other write error fails.
 fn emit_stream(stage: &Stage, stdout: u64, rows: &[(String, OwnedEntry)]) -> ! {
     let schema = Schema::new()
         .field("name", TypeTag::String, TypeModifiers::NONE)
@@ -235,8 +190,7 @@ fn finish_write(stage: &Stage, e: libstream::wire::WireError) -> ! {
     stage.die(b"list: write failed\n", EXIT_FAILURE)
 }
 
-/// Render the rows as plain text to the kernel log — the Tier-0 path, where the program
-/// was spawned without a shell and so has no `stdout` stream to write a table to.
+/// Render the rows as plain text to the kernel log: the Tier-0 path, with no `stdout` stream.
 ///
 /// `TODO(tier0-output-sink)`: the kernel log is the wrong destination for program output.
 /// `kprint` is a kernel *diagnostic* path and the klog is a bounded ring, so this evicts
@@ -256,7 +210,6 @@ fn emit_text(rows: &[(String, OwnedEntry)]) {
     }
 }
 
-/// The wire kind as the string the table carries.
 fn kind_name(kind: u8) -> &'static str {
     match kind {
         DIRENT_KIND_FILE => "file",
@@ -266,8 +219,6 @@ fn kind_name(kind: u8) -> &'static str {
     }
 }
 
-/// Append `v` in decimal. (`core` has no `format!` without `alloc`'s machinery, and the
-/// text path is a fallback, not the contract — a tiny helper beats pulling in more.)
 fn push_u64(s: &mut String, mut v: u64) {
     if v == 0 {
         s.push('0');
@@ -286,8 +237,6 @@ fn push_u64(s: &mut String, mut v: u64) {
     }
 }
 
-/// A diagnostic naming both the path and what went wrong — "list: /nope: not found"
-/// beats "list: failed".
 fn describe(path: &[u8], e: DirError) -> String {
     let mut s = String::from("list: ");
     s.push_str(&owned(path));
@@ -302,7 +251,6 @@ fn describe(path: &[u8], e: DirError) -> String {
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     kprint(b"list: panic\n");
-    // A coreutil is not critical-path (unlike init/eshell), so a panic exits rather than
-    // hanging: its supervisor observes the non-zero status.
+    // Not critical-path (unlike init/eshell): exit, and the supervisor sees the status.
     exit(EXIT_FAILURE);
 }

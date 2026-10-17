@@ -1,40 +1,28 @@
 //! `account` — the accounts on this machine: who they are, and adding, removing and changing their
-//! passwords (`docs/planning/administration.md` § Part D).
-//!
-//! ```text
-//! account --list                        # every account, its sessions, and who administers
-//! account --password                    # change your own, proved with the current one
-//! account --add NAME                    # add NAME, asking for its password twice
-//! account --remove NAME [--home]        # remove NAME, and its home only if asked
-//! account --password NAME               # set NAME's, with no current one to prove
-//! account --password NAME --users FILE  # set NAME's in a users file directly: recovery
-//! ```
+//! passwords.
 //!
 //! ## Three authorities
 //!
 //! **`--list` and your own `--password` need none.** They ask the view broker on this session's
-//! `/dev/views`, which knows whose session it is: the list is anyone's to read, as a Unix `passwd`
-//! file is, and your own password is proved with the current one, checked under the session's delay
-//! after a wrong one (`rsproto-views-ops.md` § `Accounts`, `ChangePassword`).
+//! `/dev/views`, which knows whose session it is; your own password is proved with the current
+//! one, checked under the session's delay after a wrong one (`rsproto-views-ops.md`).
 //!
 //! **`--add`, `--remove` and `--password NAME` need the `accounts` grant.** They speak on
-//! `/dev/accounts`, which the broker binds only into a view whose profile grants `accounts`, so
-//! they run as `with admin account …`. Without it that path is not there, and `account` says so
-//! and names `with`. **The broker does the refusing that matters** — a removal while the account is
-//! logged in, one that would leave nobody able to administer — and its reason is printed as given.
+//! `/dev/accounts`, which the broker binds only into a view whose profile grants `accounts`
+//! (`with admin account …`); without it `account` says so and names `with`. **The broker does
+//! the refusing that matters** — a removal while the account is logged in, one that would leave
+//! nobody able to administer — and its reason is printed as given.
 //!
 //! **`--users FILE` needs no service at all**: it edits a users file with `libusers`, writing
 //! `FILE.new` and renaming it over. That is recovery from the live image, where an installed
-//! disk's `/system/users` is reachable once `with admin disk` has mounted it writable. The running
-//! system's own file is never under `/storage`, so this cannot reach it (administration Part C.5).
+//! disk's `/system/users` is reachable once `with admin disk` has mounted it. The running
+//! system's own file is never under `/storage`, so this cannot reach it.
 //!
 //! ## Passwords
 //!
-//! Asked on the terminal the shell handed this stage, echo off, a new one twice
-//! (`libprompt`, shared with `with`). **Never from a stream**, and never echoed, logged or
-//! kept: every copy is zeroed once it has been sent. What the broker or the file edit said is
-//! written to `stderr` and, escaped, on the console, since a terminal on a release image renders
-//! nothing a gate can read.
+//! Asked on the terminal the shell handed this stage, echo off, a new one twice (`libprompt`).
+//! **Never from a stream**, and never echoed, logged or kept: every copy is zeroed once sent.
+//! What the broker or the file edit said goes to `stderr` and, escaped, to the console.
 
 #![no_std]
 #![no_main]
@@ -60,13 +48,11 @@ use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 use libviews::outcome;
 
-/// `alloc` backing: the TSM1 encoder allocates.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Where the `accounts` grant binds the broker's accounts endpoint.
 const ACCOUNTS: &[u8] = b"/dev/accounts";
-/// This session's view broker.
 const VIEWS: &[u8] = b"/dev/views";
 
 const FLAGS: [Flag; 5] = [
@@ -142,7 +128,6 @@ fn say(stage: &Stage, text: &str) {
     say_at(stage, Level::Error, text);
 }
 
-/// [`say`], at `level`.
 fn say_at(stage: &Stage, level: Level, text: &str) {
     if stage.streams.stderr.is_some() {
         let mut line = String::from("account: ");
@@ -153,7 +138,6 @@ fn say_at(stage: &Stage, level: Level, text: &str) {
     Line::new().s(b"account: ").untrusted(text.as_bytes()).end();
 }
 
-/// The terminal to ask on, or a failure saying there is none.
 fn terminal(stage: &Stage) -> Result<u64, i64> {
     stage.terminal.ok_or_else(|| {
         say(stage, "a password is needed and there is no terminal to ask on");
@@ -161,7 +145,6 @@ fn terminal(stage: &Stage) -> Result<u64, i64> {
     })
 }
 
-/// A channel on this session's view broker.
 fn views(stage: &Stage) -> Result<u64, i64> {
     let ch = lookup(stage.namespace, VIEWS, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if ch == 0 {
@@ -182,7 +165,6 @@ fn accounts(stage: &Stage, verb: &str) -> Result<u64, i64> {
     Ok(ch)
 }
 
-/// Ask the broker `op` on `ch`, and report its answer: `EXIT_OK` if it did it.
 fn ask(stage: &Stage, ch: u64, op: u16, body: &[u8]) -> i64 {
     let answer = call(ch, op, 1, body, &[]);
     let (o, why) = match answer {
@@ -251,7 +233,6 @@ fn list(stage: &Stage) -> i64 {
     EXIT_OK
 }
 
-/// `account --add NAME`: the name checked, the password asked twice, then `AddAccount`.
 fn add(stage: &Stage, name: &str) -> i64 {
     if let Err(code) = checked_name(stage, name) {
         return code;
@@ -281,7 +262,6 @@ fn add(stage: &Stage, name: &str) -> i64 {
     code
 }
 
-/// `account --remove NAME [--home]`.
 fn remove(stage: &Stage, name: &str, home: bool) -> i64 {
     if let Err(code) = checked_name(stage, name) {
         return code;
@@ -297,7 +277,6 @@ fn remove(stage: &Stage, name: &str, home: bool) -> i64 {
     }
 }
 
-/// `account --password NAME`: an administrator setting it, with no current one to prove.
 fn set(stage: &Stage, name: &str) -> i64 {
     if let Err(code) = checked_name(stage, name) {
         return code;

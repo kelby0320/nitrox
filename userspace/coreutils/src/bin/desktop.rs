@@ -1,40 +1,13 @@
 //! `desktop` — list, switch and name the graphical session's desktops.
 //!
-//! ```text
-//! desktop                  # list them, marking the current one
-//! desktop switch 2         # make the second one current
-//! desktop name 2 code      # name it, which is what makes it persist
-//! ```
-//!
-//! ## Why this exists at all
-//!
-//! **It is `/dev/desktop`'s first consumer, and it shipped in the same part as the binding.**
-//! the `desktop-endpoint` deferral refused to bind an endpoint nothing resolved, on the grounds that
-//! this milestone had three times shipped a capability that was specified, tested in isolation,
-//! and unreachable on the path a caller actually uses. So the endpoint and something that
-//! reaches it land together, and if this command had slipped the binding would have slipped
-//! with it.
-//!
-//! It is also the first evidence that desktops are a *resource* rather than a shell feature:
-//! the same model the bar and the overview drive is reachable from a command line, through a
-//! namespace path, by an ordinary program with no special authority beyond what its namespace
-//! was given.
+//! It reaches the same model the bar and the overview drive, through the `/dev/desktop`
+//! namespace path, with no special authority beyond what its namespace was given. The resolve,
+//! send and reply decode are [`librsproto::desktop::Desktop`]'s.
 //!
 //! ## Naming is the interesting verb
 //!
 //! An unnamed desktop disappears when its last window leaves; a named one stays. So `desktop
-//! name` is not cosmetic — it is how a desktop is made to persist, which is
-//! `ui-composition-model.md` §6's "name it if it turns out to matter" turned into the lifecycle
-//! rule itself.
-//!
-//! ## What is no longer here
-//!
-//! **The resolve, the send, the `sys_wait` and the reply decode.** They were this file's until
-//! M10 Part D made `nxfiles` the second client of `/dev/desktop` — a browser asking the shell to
-//! open a file — and they live in [`librsproto::desktop::Desktop`] now. The code is the same
-//! code; what changed is that there is one of it. Even the error type came along, because the
-//! distinction it draws (transport, refusal, and the refusal's `KError`) was learned here and
-//! would have had to be learned again.
+//! name` is how a desktop is made to persist (`ui-composition-model.md` §6).
 //!
 //! ## Positions, not ids
 //!
@@ -54,7 +27,6 @@ use libkern::debug::Line;
 use libkern::{exit, kprint};
 use librsproto::desktop::{Desktop, DesktopError};
 
-/// `alloc` backing.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
@@ -85,10 +57,9 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.answer(VERSION);
     }
 
-    // **Every diagnostic here goes to the debug console as well as to the stage.** A command
-    // run in a windowed terminal writes into that terminal's grid, and the grid renders under
-    // `test-harness` only — so on a release image, which is what `check-login` boots, the
-    // stage's output is invisible and a failure would look like the command never ran.
+    // **Every diagnostic here goes to the debug console as well as to the stage**: a windowed
+    // terminal's grid renders under `test-harness` only, so on the release image `check-login`
+    // boots, the stage's output is invisible. `check-login` matches `desktop: running`.
     kprint(b"desktop: running\n");
     let mut buf = alloc::vec![0u8; libkern::abi::IPC_MSG_SIZE];
     let Ok(mut desktop) = Desktop::connect(ns, &mut buf) else {
@@ -119,7 +90,6 @@ fn parse_index(s: &str) -> Option<u32> {
     (n >= 1).then_some(n)
 }
 
-/// `desktop` with no operands.
 fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i64 {
     use librsproto::desktop::{DesktopList, OP_DESKTOP_LIST};
     let mut out = alloc::vec![0u8; 1024];
@@ -131,12 +101,8 @@ fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i64 {
         stage.diag(b"desktop: the shell's reply did not parse\n");
         return EXIT_FAILURE;
     };
-    // **A `Table` on stdout, with text only when there is no stdout.** This is the one command
-    // in `/bin` whose product is a table, and the first version wrote it to `stage.diag` —
-    // stderr, which `pipeline-stdio.md` calls a *shared diagnostic sink, not a per-adjacency
-    // pipe*. `desktop | sort name` produced nothing, and the listing interleaved with every
-    // other stage's diagnostics on the shared channel (PR #245 review, finding 5). `list` and
-    // `whoami` both branch on `stage.streams.stdout`; so does this now.
+    // **A `Table` on stdout, with text only when there is no stdout**: stderr is a shared
+    // diagnostic sink, not a pipe, so `desktop | sort name` needs the table on stdout.
     let sink: &[u8] = match stage.streams.stdout {
         Some(h) => {
             emit(stage, h, &list);
@@ -164,22 +130,14 @@ fn list(stage: &Stage, desktop: &mut Desktop<'_>) -> i64 {
             b"text"
         }
     };
-    // **Also on the debug console.** A command run in a windowed terminal writes into that
-    // terminal's grid, which renders only under `test-harness` — so a gate booting a release
-    // image can see a stream's *contents* nowhere else. This is the one line that says the
-    // endpoint answered.
-    // **Naming the sink, which is the only way a gate can tell the two apart.** A release
-    // image renders no grid, so the table's bytes are invisible from the host and both branches
-    // otherwise print the identical line — an assertion that would have passed just as well for
-    // the stderr version this replaced. `check-login` matches on `(table)`.
+    // Also on the debug console, naming the sink: a release image renders no grid, so this line
+    // is the only evidence a gate has. `check-login` matches `desktop: listed 3 desktops (table)`.
     Line::new().s(b"desktop: listed ").u(list.count as u64).s(b" desktops (").s(sink).s(b")").end();
     EXIT_OK
 }
 
-/// Emit the listing as `Table<{position: Int, id: Int, name: String, current: Bool}>`.
-///
-/// `position` first because it is what every other operand here means, and `current` as a
-/// column rather than a marker so a pipeline can filter on it.
+/// Emit the listing as `Table<{position: Int, id: Int, name: String, current: Bool}>`; `current`
+/// is a column rather than a marker so a pipeline can filter on it.
 fn emit(stage: &Stage, stdout: u64, list: &librsproto::desktop::DesktopList<'_>) {
     use libkern::abi::IPC_PAYLOAD_SIZE;
     use libstream::channel::{ChannelSink, IpcPort};
@@ -212,7 +170,6 @@ fn emit(stage: &Stage, stdout: u64, list: &librsproto::desktop::DesktopList<'_>)
     }
 }
 
-/// `desktop switch N`.
 fn switch(stage: &Stage, desktop: &mut Desktop<'_>, index: u32) -> i64 {
     use librsproto::desktop::{DesktopIndex, OP_DESKTOP_SWITCH};
     let mut body = [0u8; 4];
@@ -227,7 +184,6 @@ fn switch(stage: &Stage, desktop: &mut Desktop<'_>, index: u32) -> i64 {
     EXIT_OK
 }
 
-/// `desktop name N LABEL...`.
 fn name(stage: &Stage, desktop: &mut Desktop<'_>, index: u32, words: &[&str]) -> i64 {
     use librsproto::desktop::{DesktopIndex, MAX_DESKTOP_NAME, OP_DESKTOP_NAME};
     let mut label = String::new();
@@ -254,12 +210,9 @@ fn name(stage: &Stage, desktop: &mut Desktop<'_>, index: u32, words: &[&str]) ->
     EXIT_OK
 }
 
-/// Report a failed request, and return the exit status for it.
-///
-/// `verb` completes "desktop: could not <verb>". The refusal path names the operand only when
-/// the shell said the operand was the problem: `InvalidArgument` is what its `bad()` sends for
-/// a position that does not exist, and anything else gets its code printed rather than a
-/// diagnosis this command is in no position to make.
+/// Report a failed request and return its exit status. `verb` completes
+/// "desktop: could not <verb>". Only `InvalidArgument`, which the shell sends for a position
+/// that does not exist, names the operand; any other refusal gets its code printed.
 fn fail(stage: &Stage, verb: &[u8], e: DesktopError) -> i64 {
     let mut text = String::from("desktop: ");
     match e {
@@ -279,20 +232,16 @@ fn fail(stage: &Stage, verb: &[u8], e: DesktopError) -> i64 {
         DesktopError::Transport(_) => {
             text.push_str("lost the connection to the graphical session\n");
         }
-        // The request did not fit its buffer — this command's operands are a number and a
-        // bounded name, so it means a bug here rather than anything about the session.
+        // The request did not fit its buffer: a bug here, not the session's.
         DesktopError::Protocol => {
             text.push_str("could not encode that request\n");
         }
     }
     stage.diag(text.as_bytes());
-    // Also on the console: in a windowed terminal a release build renders nothing, so this is
-    // the only place the failure is visible to a gate.
     kprint(text.as_bytes());
     EXIT_FAILURE
 }
 
-/// Append a decimal number.
 fn push_num(s: &mut String, mut n: u32) {
     let mut digits = [0u8; 10];
     let mut i = 0;

@@ -1,35 +1,24 @@
-//! `log` — read a log back: the service log (administration Part E.6), or the kernel's (Phase 6
-//! Part B.7). **The system's log viewer**, a source an option: `--kernel` today, and `--service`
-//! and `--application` when what tells them apart in the service log is designed.
-//!
-//! ```text
-//! with admin log                              # every record the logging service still holds
-//! with admin log view-broker                  # one principal's: the view broker's, its audit too
-//! with admin log --kernel | last 20           # the kernel's log, its last twenty lines
-//! with admin log --kernel | filter message ~= /usb/
-//! ```
+//! `log` — read a log back: the service log, or the kernel's. **The system's log viewer**, a
+//! source an option: `--kernel` today, and `--service` and `--application` when what tells them
+//! apart in the service log is designed.
 //!
 //! **The service log needs the `logs` grant**, which binds the logging service's read endpoint at
-//! `/dev/logs`; a resolve there opens a read session, on which `Log::Read` answers from the
-//! service's ring (`rsproto-log-ops.md`). **The kernel's needs the `kernel-log` grant**, which binds
-//! a snapshot of the kernel's `/dev/log` at the same path, taken as the view is made. Without a
-//! grant its path is not there, and `log` says which grant to ask `with` for.
+//! `/dev/logs` (`rsproto-log-ops.md`). **The kernel's needs the `kernel-log` grant**, which binds
+//! a snapshot of the kernel's log at `/dev/log`. Without a grant its path is not there, and `log`
+//! says which grant to ask `with` for.
 //!
-//! **One table shape for every source**, so a pipeline reads any of them alike:
-//! `Table<{sequence, time, principal, tier, level, message}>`, oldest first. A kernel row is a line
-//! of the kernel's log: its `principal` is `kernel`, its `sequence` its line's place in the log, and
-//! its `time`, `tier` and `level` null, which the kernel's lines do not carry. A service row:
+//! **One table shape for every source**: `Table<{sequence, time, principal, tier, level,
+//! message}>`, oldest first. A kernel row's `principal` is `kernel`, its `sequence` its line's
+//! place in the log, and its `time`, `tier` and `level` null. A service row:
 //! - `sequence` — the logging service's count, which orders the records: `time` can step.
-//! - `time` — the wall clock when the service took the record, in Unix epoch seconds as `list`'s
-//!   `modified` is; null for one taken while the clock was not set.
+//! - `time` — Unix epoch seconds as `list`'s `modified` is; null while the clock was not set.
 //! - `principal` — whose channel it came on, which the emitter cannot choose; a named source
-//!   follows a `.`, as the serial console shows it (`heartbeat.worker`). `PRINCIPAL` keeps one
-//!   principal's records, its named sources' included.
+//!   follows a `.` (`heartbeat.worker`). `PRINCIPAL` keeps one principal's records, its named
+//!   sources' included.
 //! - `tier`, `level`, and `message` — the last two the emitter's claim.
 //!
-//! **What the ring no longer holds is said**, on stderr: it keeps the most recent records, so a
-//! machine up long enough has dropped its first — and a ring busy enough can drop some while `log`
-//! reads it, which is said too (PR #344 review).
+//! **What the ring no longer holds is said**, on stderr: it keeps the most recent records, and
+//! a ring busy enough can drop some while `log` reads it, which is said too.
 
 #![no_std]
 #![no_main]
@@ -50,16 +39,14 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: the replies, the rows and the TSM1 encoder allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Where the `logs` grant binds the logging service's read endpoint.
 const LOGS: &[u8] = b"/dev/logs";
-/// Where the `kernel-log` grant binds a snapshot of the kernel's log (Phase 6 Part B.7).
+/// Where the `kernel-log` grant binds a snapshot of the kernel's log.
 const KERNEL_LOG: &[u8] = b"/dev/log";
 
-/// The options: one source today besides the service log.
 const FLAGS: &[Flag] = &[Flag::long_only("kernel", "read the kernel's log instead of the service log")];
 
 const HELP: &[u8] = b"usage: log [PRINCIPAL]\n\
@@ -124,7 +111,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(code)
 }
 
-/// **The kernel's log, a row a line** (Phase 6 Part B.7), from the snapshot the `kernel-log` grant
+/// **The kernel's log, a row a line**, from the snapshot the `kernel-log` grant
 /// bound, and exit.
 fn kernel(stage: &Stage) -> ! {
     let bytes = match libfs::read_file(stage.namespace, KERNEL_LOG) {
@@ -198,7 +185,6 @@ fn read(stage: &Stage, session: u64, principal: Option<&str>, out: &mut Out) -> 
     }
 }
 
-/// Where the rows go: a table on `stdout`, or lines on the console when there is none.
 enum Out {
     Table(TableWriter<ChannelSink<IpcPort>>),
     Console,
@@ -210,7 +196,7 @@ impl Out {
             return Out::Console;
         };
         let nullable = TypeModifiers::NULLABLE;
-        // `tier` and `level` nullable since Phase 6 Part B.7: a kernel row has neither.
+        // `tier` and `level` are nullable: a kernel row has neither.
         let schema = Schema::new()
             .field("sequence", TypeTag::Int, TypeModifiers::NONE)
             .field("time", TypeTag::Int, nullable)
@@ -282,7 +268,6 @@ impl Out {
         }
     }
 
-    /// End the table.
     fn finish(self, stage: &Stage) {
         let Out::Table(mut tw) = self else { return };
         let flushed = tw.finish_with_status(0).and_then(|()| tw.into_sink().finish());
@@ -293,7 +278,6 @@ impl Out {
     }
 }
 
-/// Bytes as text, a byte that is not UTF-8 shown as the replacement character.
 fn lossy(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }

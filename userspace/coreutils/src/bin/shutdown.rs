@@ -1,9 +1,4 @@
-//! `shutdown` — stop the machine, or restart it (administration Part E.4).
-//!
-//! ```text
-//! with power shutdown            # halt: "It is now safe to turn off your computer."
-//! with power shutdown --reboot   # restart
-//! ```
+//! `shutdown` — stop the machine, or restart it.
 //!
 //! **It asks, and `service-mgr` does the rest.** `shutdown` sends one `Shutdown` on a power session
 //! opened at `/dev/power` (`rsproto-services-ops.md`), and `service-mgr` answers as soon as the
@@ -32,7 +27,6 @@ use libkern::{exit, kprint};
 use librsproto::services::{OP_SERVICES_SHUTDOWN, shutdown_body};
 use libstream::diag::Level;
 
-/// `alloc` backing: the request buffer and the messages allocate.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
@@ -79,7 +73,6 @@ fn say(stage: &Stage, text: &str) {
     say_at(stage, Level::Error, text);
 }
 
-/// [`say`], at `level`.
 fn say_at(stage: &Stage, level: Level, text: &str) {
     if stage.streams.stderr.is_some() {
         stage.diag_at(level, text.as_bytes());

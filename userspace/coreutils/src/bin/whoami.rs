@@ -1,46 +1,23 @@
 //! `whoami` — report the session's user.
 //!
-//! Milestone 2 Part E, and the one that needed a design decision rather than an
-//! implementation (open question B2).
+//! ## Where identity lives
 //!
-//! ```text
-//! whoami          # the user this session was opened for
-//! ```
+//! Nitrox has **no kernel user identity**; authority is held in handles. Identity is a
+//! *session* concept: `session-mgr` authenticates a login and **constructs the session's
+//! namespace**, in which `/session/user` is a readable object holding the name. Asking the
+//! namespace is answer-by-construction, as for `/home`; asking a service would be closer to
+//! ambient lookup than to capabilities.
 //!
-//! ## Where identity lives, and why it is not a syscall
-//!
-//! Nitrox has **no kernel user identity**. Authority is held in handles, not derived from
-//! a UID, so there is nothing for the kernel to report and `/proc/self/*` deliberately
-//! carries none. Identity is a *session* concept: `session-mgr` authenticates a login
-//! against `auth-service` and then **constructs the session's namespace** — binding the
-//! user's home at `/home`, the console at `/dev/console`, and omitting everything else,
-//! because absence is the sandbox.
-//!
-//! So this asks the namespace, which is the mechanism by which a process is *told* about
-//! its world: `/session/user` is a readable object holding the name. That is the same
-//! answer-by-construction the shell already relies on for `/home` — it does not ask
-//! anyone where home is, it simply sees it — and asking a service instead would be closer
-//! to ambient lookup than to capabilities.
-//!
-//! ## Why reading it looks like this, and will not change
-//!
-//! Today `/session/user` is a **direct-handle bind** of a memory object: a snapshot, which
-//! is correct because a session's user is immutable for its lifetime (changing user means
-//! a new session, not a mutated one). Session metadata will grow, and the first genuinely
-//! *mutable* member forces a resource server behind `/session/*` instead.
-//!
-//! That migration does not touch this file. A userspace-server binding answers a resolve
-//! with `OBJECT_KIND_MEMOBJ`, which the kernel cross-context-installs — so `lookup + map +
-//! read` is byte-identical whether the path is a direct handle or a server. The namespace
-//! is precisely what hides the difference. See `docs/rationale/deferred-decisions.md`
-//! (`TODO(session-metadata-server)`).
+//! `/session/user` is a **direct-handle bind** of a memory object, a snapshot: correct because a
+//! session's user is immutable for its lifetime. A userspace server behind `/session/*` would
+//! answer a resolve with `OBJECT_KIND_MEMOBJ` as well, so `lookup + map + read` stays the same.
+//! See `docs/rationale/deferred-decisions.md` (`TODO(session-metadata-server)`).
 //!
 //! ## No session, no answer
 //!
-//! A process spawned outside any session has nothing bound at `/session/user`, and this
-//! says so and exits non-zero. It does not invent a default: reporting `root`, or an empty
-//! name, would be a fabricated fact — the same reason `date` refuses to print 1970 when
-//! the clock is unset.
+//! A process spawned outside any session has nothing bound at `/session/user`: this says so
+//! and exits non-zero, rather than invent a default (`root`, an empty name) — as `date` refuses
+//! to print 1970 when the clock is unset.
 
 #![no_std]
 #![no_main]
@@ -59,16 +36,13 @@ use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-/// `alloc` backing: the TSM1 encoder allocates.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// Where a session publishes its user. See the module docs for why this is a namespace
-/// path rather than a syscall or a service call.
+/// Where a session publishes its user.
 const SESSION_USER: &[u8] = b"/session/user";
 
-/// Longest name accepted from the binding. A session's user name is short; a bound object
-/// is at least a page, so the read must be bounded by something other than the mapping.
+/// Longest name accepted: a bound object is at least a page, so the read needs a bound of its own.
 const NAME_MAX: usize = 256;
 
 const HELP: &[u8] = b"usage: whoami\n\
@@ -118,7 +92,6 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(EXIT_OK)
 }
 
-/// Resolve `/session/user` and read the name out of it, or `None` if it is not bound.
 fn read_session_user(stage: &Stage) -> Option<String> {
     let (st, handle) = libfs::lookup_wait(stage.namespace, SESSION_USER, RIGHT_MAP_READ);
     if st != 0 || handle == 0 {
@@ -146,7 +119,6 @@ fn read_session_user(stage: &Stage) -> Option<String> {
     Some(name)
 }
 
-/// Write the single row as a TSM1 table on the `stdout` stream.
 fn emit(stage: &Stage, stdout: u64, user: &str) {
     let schema = Schema::new().field("user", TypeTag::String, TypeModifiers::NONE);
 
