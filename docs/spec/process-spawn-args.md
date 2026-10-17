@@ -47,7 +47,7 @@ later field kept its offset.)
   returns `TooLarge`).
 - **`move_mask`** — for each `i < handle_count`, bit `i` selects **move** (the
   parent loses access; default) or **duplicate** (the parent keeps its handle).
-- **`arg0`** — an opaque word delivered to the child at entry (in `rdx`). The
+- **`arg0`** — an opaque word delivered to the child at entry (in `rcx`; see the register table below). The
   Phase-1 demo uses it as a role selector.
 - **`handles[i]`** — a handle in the **parent's** table to give the child. Each
   must carry the `TRANSFER` right. Installed in the child with

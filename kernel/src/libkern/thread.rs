@@ -14,7 +14,7 @@
 /// The argument block `sys_thread_create` reads from userspace to start a new thread in the
 /// calling process.
 ///
-/// The new thread begins executing at `entry` (ring 3) with `rsp = user_sp` and `rdx = arg0`.
+/// The new thread begins executing at `entry` (ring 3) with `rsp = user_sp` and `rcx = arg0`.
 /// The caller owns the user stack: it allocates + maps a region and passes the **top** (stacks
 /// grow down) as `user_sp`. Both `entry` and `user_sp` must be canonical user addresses already
 /// mapped (X / W) in the calling process's address space.

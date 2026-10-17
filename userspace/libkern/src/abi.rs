@@ -56,7 +56,7 @@ pub struct ThreadArgs {
     pub entry: u64,
     /// Initial user stack pointer VA — the stack top (offset 8).
     pub user_sp: u64,
-    /// Opaque bootstrap word, delivered to the thread in `rdx` (offset 16).
+    /// Opaque bootstrap word, delivered to the thread in `rcx` (offset 16).
     pub arg0: u64,
     /// Scheduling class: `THREAD_CLASS_TIMESHARED` (`0`, default) or
     /// `THREAD_CLASS_REALTIME` (`1`; requires the `REAL_TIME` syscap) (offset 24).

@@ -38,7 +38,7 @@ pub struct SpawnArgs {
     /// Bit `i` set ⇒ **move** `handles[i]` to the child (the parent loses it); clear ⇒
     /// **duplicate** (the parent keeps its handle) (offset 12).
     pub move_mask: u32,
-    /// Opaque user data handed to the child at entry (in `rdx`) (offset 16).
+    /// Opaque user data handed to the child at entry (in `rcx`) (offset 16).
     pub arg0: u64,
     /// Parent-side handles to install in the child's table (offset 24).
     pub handles: [RawHandle; SPAWN_MAX_HANDLES],
