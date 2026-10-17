@@ -1,18 +1,10 @@
-//! **The filesystem, as the protocol sees it** (Phase 6 Part E.1): what a server's library must do
-//! for the server loop, whatever the filesystem.
+//! **The filesystem, as the protocol sees it**: what a server's library must do for the server
+//! loop, whatever the filesystem; a server hands its [`Volume`] to [`crate::server::run`].
 //!
-//! A server implements [`Volume`] over its library and a device — the read-write [`Disk`], or the
-//! [`ReadOnly`] over it a read-only mount is served through — and hands it to
-//! [`crate::server::run`]. The methods are the calls `fs-server-ext4`'s loop made into its library
-//! before the loop moved here.
-//!
-//! [`Disk`]: crate::disk::Disk
-//! [`ReadOnly`]: crate::ReadOnly
 
 use crate::{BlockRun, FsError};
 
-/// **Why a device cannot be served**, said in place of `Meta::Ready`: its text for a person, and
-/// what it means to a client.
+/// **Why a device cannot be served**, said in place of `Meta::Ready`.
 pub trait Refusal: core::fmt::Display {
     /// The error a client is told.
     fn fs_error(&self) -> FsError;
@@ -27,8 +19,8 @@ pub struct Mapped {
     pub block_size: u32,
     /// How many runs were written to the caller's buffer.
     pub runs: usize,
-    /// **The file's id**, which the kernel keeps one page-cache object per: ext4's inode number.
-    /// `0` is none, and the kernel gives such a file an object of its own, uncached.
+    /// **The file's id**, which the kernel keeps one page-cache object per; `0` is none, and the
+    /// file then gets an object of its own, uncached.
     pub id: u64,
 }
 
@@ -49,14 +41,13 @@ pub struct DirEntry<'a> {
     pub name: &'a [u8],
 }
 
-/// **A filesystem a server serves.** Every path is absolute within the filesystem — `/` and the
-/// suffix the kernel forwarded — and every `now` is the server's own clock, which a client never
-/// supplies. A directory id is what [`Volume::resolve_dir`] answered, and a file id what
-/// [`Volume::map_file`] did.
+/// **A filesystem a server serves.** Every path is absolute within the filesystem, and every
+/// `now` is the server's own clock, which a client never supplies. A directory id is what
+/// [`Volume::resolve_dir`] answered, and a file id what [`Volume::map_file`] did.
 pub trait Volume {
-    /// The server's name, as `Meta::Ready` carries it and its own log lines begin: `fs-server-ext4`.
+    /// The server's name, as `Meta::Ready` carries it: `fs-server-ext4`.
     const NAME: &'static [u8];
-    /// The filesystem's kind, as the server's ready line says it: `ext4`.
+    /// The filesystem's kind, as the ready line says it: `ext4`.
     const KIND: &'static [u8];
     /// Why a device cannot be served.
     type Unservable: Refusal;
@@ -78,15 +69,13 @@ pub trait Volume {
     fn map_file(&self, path: &[u8], runs: &mut [BlockRun]) -> Result<Mapped, FsError>;
     /// Read the whole regular file at `path` into `out`: the eager resolve. Its length.
     fn read_file(&self, path: &[u8], out: &mut [u8]) -> Result<usize, FsError>;
-    /// Read `len` bytes of the file at `path` from `offset` into `out`: `File::ReadRange`. How
-    /// many were read, fewer at the file's end.
+    /// Read `len` bytes of `path` from `offset` into `out` (`File::ReadRange`); fewer at the end.
     fn read_file_range(&self, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Result<usize, FsError>;
-    /// Create the regular file `name` in the directory at `parent`, empty; an existing one is
-    /// left as it is.
+    /// Create the empty regular file `name` in `parent`; an existing one is left as it is.
     fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError>;
     /// Grow the file at `path` to `size` bytes, what it adds reading as zeroes. **The size it had
-    /// before**: everything from there reads as zero, which the server loop tells the kernel
-    /// (Phase 6 Part H.4). A grow to no more than its size changes nothing and answers its size.
+    /// before**: everything from there reads as zero, which the server loop tells the kernel. A
+    /// grow to no more than its size changes nothing and answers its size.
     fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError>;
     /// Shrink the file at `path` to `size` bytes. **A file id to forget and then release**, if the
     /// shrink ended one: the server sends `File::Forget` for it, then calls [`Volume::release`].
@@ -99,8 +88,8 @@ pub trait Volume {
     fn read_dir(&self, dir: u64, cursor: u64, emit: impl FnMut(&DirEntry) -> bool) -> Result<u64, FsError>;
     /// Make the directory `name` in directory `dir`.
     fn mkdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError>;
-    /// Remove the regular file `name` from directory `dir`. **A file id to forget and then
-    /// release**, if that was its last name.
+    /// Remove the file `name` from `dir`. **A file id to forget and then release**, if it was the
+    /// last name.
     fn unlink_at(&self, dir: u64, name: &[u8], now: i64) -> Result<Option<u64>, FsError>;
     /// Remove the empty directory `name` from directory `dir`.
     fn rmdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError>;
@@ -108,12 +97,11 @@ pub trait Volume {
     fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError>;
     /// Rename `old` to `new`, both in directory `dir`.
     fn rename_at(&self, dir: u64, old: &[u8], new: &[u8], now: i64) -> Result<(), FsError>;
-    /// Rename the entry at `old` to `new`, replacing a file there only if `replace`. **A file id
-    /// to forget and then release**, if a replaced file had no other name.
+    /// Rename `old` to `new`, replacing a file there only if `replace`. **A file id to forget and
+    /// then release**, if a replaced file had no other name.
     fn rename_path(&self, old: &[u8], new: &[u8], replace: bool, now: i64) -> Result<Option<u64>, FsError>;
     /// Stamp the file with id `id` modified now: the kernel reporting a write it made.
     fn touch_file(&self, id: u64, now: i64) -> Result<(), FsError>;
-    /// **Free the file with id `id`**, which no name reaches any more, once the kernel has
-    /// forgotten it.
+    /// **Free the file `id`**, which no name reaches any more, once the kernel has forgotten it.
     fn release(&self, id: u64, now: i64) -> Result<(), FsError>;
 }
