@@ -1726,54 +1726,6 @@ audit) — so they are mirrored here.
   `^has_journal`; a crash mid-mutation is not recoverable by replay. Trigger: running on
   media where an unclean shutdown matters.
 
-**`copy` and `remove` are slow on a real disk — `TODO(fs-throughput)`** — closed by Phase 6 Part
-H (2026-10-13); undiagnosed when filed.
-Observed on the laptop, 2026-09-17, copying and then deleting about 180 MB under `/home`:
-both are slower than a 5400 rpm disk accounts for, and both get worse with larger directories
-(maintainer). **This is the first time either has run against real storage** — every previous
-number came from QEMU, where a RAM-backed or host-cached image hides exactly this.
-
-Not diagnosed, and deliberately not guessed at: the honest list of suspects is long and each
-one is separately recorded above. The **quadratic directory scan** predicts the
-worse-with-size half exactly (an insert re-reads a directory's blocks, so N entries cost N²).
-The constant factor has more candidates than that explains: the driver issues **one command at
-a time** with no NCQ; there is **no read-ahead or clustered fill**; the fs-server reads and
-writes metadata **one 4 KiB block per `sys_io_submit`**; and a single file copy is a chain of
-IPC round trips — resolve, create, grow, map, write, sync — none of them batched.
-
-**The measurement comes first**, as it did in Part G, where the plausible explanation was
-wrong: a write-back mapping was blamed for a 45× cost that turned out to be a dropped
-write-combining attribute, and only a number on the real machine settled it. **Trigger**: the
-first time somebody is waiting on it, or the next phase that moves bulk data — which is USB.
-
-> **Scheduled** (2026-10-01): Phase 6 Part H. `nxsh` gains `time`; an ext4 copy and a copy to a
-> stick are timed on the laptop; what dominates is fixed; and only then does the phase's Definition
-> of Done get its number. `fs-server-fat`'s write path batches from its first version, so the new
-> server is not one more suspect.
->
-> **Detailed** (2026-10-08, [`phase-6-usb.md`](../planning/phase-6-usb.md) § *Part H in detail*):
-> `time` and I/O counters, the laptop measured beside Linux on the same machine, and the cost that
-> dominates fixed and measured again — below the syscall surface. Extent trees in `fs-server-ext4`
-> come first (after the PR #370 review), since a directory of the files it copies needs them.
->
-> **Measured** (2026-10-09, Part H.3): 6.7 times Linux's time on the laptop over fifteen runs, 12 to
-> 67 times on its hard drive — device-bound, one 4 KiB command at a time, ext4 spending twelve a
-> block copied. **The first fix** (Part H.4): ext4 allocates and frees a run at a time, eight of
-> those twelve gone. **The second**: what a grow adds is not read back (`UNWRITTEN`). **The third**:
-> each server caches its metadata (`libfsserver::cache`), so a directory is read once — under QEMU
-> the four sets went from about 1,645 s to 186. **Measured again** (2026-10-09): 1,362 s against
-> Linux's 889 over the fifteen runs, 1.53 times; what was left was a big file's bytes, 4 KiB a
-> command. **The fourth**: more than a page a command — fills read ahead, a write-back writes a run
-> of pages an IRP, and ext4's zeroes go 64 KiB a write; under QEMU the four sets went from 186 s to
-> 124. **Measured again** (2026-10-13): 647 s, 0.73 times Linux's 889, a geometric mean of 1.35 over
-> the runs. Left: the zeroes, a big file's bytes written twice, and ext4's metadata written through
-> a file at a time.
->
-> **Closed** (2026-10-13, Part H.5, the maintainer's call): the number is the laptop's run as it
-> stands, written into Phase 6's Definition of Done — copying to the stick within the ratios to
-> Linux measured that day. The two costs left are filed as their own deferrals, below:
-> `TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)`.
-
 **A grow writes zeroes over what it adds — `TODO(grow-zeroes)`.** Both servers zero every block a
 grow allocates, ext4 since administration Part C.1 and FAT from its first version, because a page
 the kernel does not hold used to fill from the device, and a new range must read as zero rather than
@@ -2368,6 +2320,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| `copy` and `remove` slow on a real disk (`fs-throughput`) | 2026-10-13 | **Phase 6 Part H**, measured on the laptop beside Linux on the same machine and fixed until it was not the bottleneck: ext4 allocating and freeing in runs, a grow's blocks not read back, each server caching its metadata, and more than a page a command — 6.7 times Linux's time to 0.73 over fifteen runs. The number went into Phase 6's Definition of Done (Part H.5, the maintainer's call); the two costs left are `TODO(grow-zeroes)` and `TODO(ext4-metadata-writes)`, above. |
 | Extent-tree splitting and index nodes (`fs-server-ext4`) | 2026-10-08 | **Phase 6 Part H.1**, `userspace/fs-server-ext4/src/extent.rs`: a tree appended to, split and deepened as ext4's own appends leave one, cut and folded back into the inode, and freed whole, at any depth; held to `debugfs`' reading of every map and to `e2fsck -fn`. **The trigger arrived on review**: the entry said creating *files* in one directory was unbounded, which held for empty files only — with data, the PR #370 review's probe and its author's stopped at about the 815th, and Part H's tree to copy holds 4,096. Checking it found four more in the same code, fixed with it: a removed file with a tree freed nothing, a failed grow kept every block it took, a 32,768-block extent read as a hole, and an unwritten extent as its blocks' old contents ([`ext4-fs-server-rw.md`](../architecture/ext4-fs-server-rw.md) § *The extent tree*). |
 | Saying why a stick did not mount (`unmounted-why`) | 2026-10-07 | **The storage table's `note` column, Phase 6 Part G** — why a filesystem found is not mounted, in the words of the service's log line, which comes from the same function; `disk --list` shows it. Files does not: its Drives lists mounts, and a stick that needs formatting is formatted with `with admin disk --format`. [`storage.md`](../architecture/storage.md) §9. |
 | Read-write FAT | 2026-10-06 | **`fs-server-fat`, Phase 6 Part E** — FAT12, FAT16 and FAT32 read-write with long names, on `libfsserver`'s protocol beside `fs-server-ext4`. The trigger arrived from another direction than the one the entry named, a USB stick rather than an ESP update (2026-09-10), and the read-only first step was skipped, since a stick is written to. Files are mapped in 512-byte sectors and named by their first cluster; clusters under a page are refused, so no Nitrox ESP is served (`TODO(fat-small-clusters)`); the storage service mounts a FAT on a removable disk alone. [`fat-fs-server.md`](../architecture/fat-fs-server.md). |

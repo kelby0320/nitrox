@@ -10,7 +10,7 @@ type R<T> = Result<T, Box<dyn std::error::Error>>;
 const TARGET_PERCENT: usize = 15;
 
 /// A directory's comment lines against what it may hold: 0.15 of its code, on top of the docs the
-/// rules require — a line for each public item and field, each `TODO(tag)` and each module.
+/// rules require — a line for each public item and field, each `TODO(<tag>)` and each module.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Budget {
     code: usize,
@@ -260,9 +260,11 @@ mod tests {
 
     #[test]
     fn safety_comments_are_not_counted_and_public_items_raise_the_floor() {
-        let b = crate_of(
-            "// SAFETY: the pointer is live.\nunsafe { f() };\n/// A thing.\npub fn a() {}\npub struct S {\n    pub field: u32,\n    private: u32,\n}\npub const C: u32 = 1;\npub const fn d() {}\n// TODO(tag): later.\n",
-        );
+        // The marker is assembled, as `check-deferrals` reads this file's literals for markers.
+        let b = crate_of(concat!(
+            "// SAFETY: the pointer is live.\nunsafe { f() };\n/// A thing.\npub fn a() {}\npub struct S {\n    pub field: u32,\n    private: u32,\n}\npub const C: u32 = 1;\npub const fn d() {}\n// TODO",
+            "(tag): later.\n",
+        ));
         assert_eq!((b.code, b.comments, b.floor), (8, 2, 6));
     }
 
