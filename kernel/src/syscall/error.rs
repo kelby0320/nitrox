@@ -1,22 +1,8 @@
-//! Kernel error space and the syscall return-value encoding.
+//! Kernel error space and the syscall return-value encoding (`docs/spec/syscall-abi.md`).
 //!
-//! Per `docs/spec/syscall-abi.md`, every syscall returns a single `isize`:
-//! a **negative** value is a [`KError`] discriminant; a **non-negative**
-//! value is operation-specific (a byte count, a handle, or `0`). [`KError`]
-//! is `#[repr(i32)]` so the discriminant is exactly what crosses the
-//! boundary (sign-extended into the `isize` return register).
-//!
-//! Only the variants the current slices use are listed; the rest of the
-//! v5.1 error space (`docs/archive/os-design-v5.1.md`) is filled in as
-//! syscalls that need them land. The numeric values are the contract and
-//! must not change once userspace mirrors them.
-//!
-//! **The v5.1 numbering is not the implemented numbering.** That document
-//! reserved `-11` for `AlreadyExists` and put the blocking errors at `-20`;
-//! the implementation instead placed `WouldBlock`/`TimedOut`/`PeerClosed` at
-//! `-11..-13`, so `-11` is taken and `AlreadyExists` is `-14`. Read the
-//! catalogue in `docs/reference/error-codes.md`, not the design doc, before
-//! assigning a new discriminant.
+//! A syscall returns one `isize`: **negative** is a [`KError`] discriminant, **non-negative**
+//! operation-specific. The values are the contract (`docs/reference/error-codes.md`), not those
+//! of `docs/archive/os-design-v5.1.md`: `WouldBlock`/`TimedOut`/`PeerClosed` took `-11..-13`.
 
 use crate::mm::user_access::UserAccessError;
 
@@ -34,32 +20,19 @@ pub enum KError {
     OutOfMemory = -4,
     /// A named resource does not exist.
     NotFound = -10,
-    /// A non-blocking operation could not complete immediately (e.g. a poll —
-    /// `sys_wait` with `deadline == 0` — found nothing signaled).
+    /// A non-blocking operation could not complete at once (a `sys_wait` poll found nothing).
     WouldBlock = -11,
-    /// A blocking operation's deadline elapsed before it completed (e.g.
-    /// `sys_wait` timed out with no handle signaled).
+    /// A blocking operation's deadline elapsed before it completed.
     TimedOut = -12,
-    /// The other end has gone: an IPC channel's peer endpoint has closed, so no
-    /// further messages can be sent or received on this endpoint — or a device
-    /// has departed, so its node's reads, once drained, and its lights writes
-    /// are refused (Phase 6 Part C).
+    /// The other end has gone: an IPC peer endpoint closed, or a device departed (reads, once
+    /// drained, and lights writes are refused).
     PeerClosed = -13,
-    /// The name the operation would create is already taken (`sys_ns_bind` on
-    /// an occupied path; a resource server's create/rename onto an existing
-    /// entry). Distinct from [`InvalidArgument`](Self::InvalidArgument): the
-    /// request was well-formed, the namespace simply already answers to it —
-    /// which is what lets a caller treat it as success (`mkdir --parents`)
-    /// instead of re-deriving the fact with a second round trip.
-    ///
-    /// **`-14`, not the `-11` reserved in the v5.1 design** — see the module
-    /// docs.
+    /// The name to be created is already taken (`sys_ns_bind` on an occupied path; a server's
+    /// create/rename onto an existing entry). Well-formed, unlike `InvalidArgument`, so a
+    /// caller can treat it as success (`mkdir --parents`).
     AlreadyExists = -14,
-    /// A container still has members and the operation requires it to be empty
-    /// (`rmdir` of a populated directory). Its value to a caller is largely in
-    /// the *race*: a recursive remove that emptied a directory and then failed
-    /// to remove it learns that something else added an entry, rather than
-    /// reporting an unexplained failure.
+    /// A container still has members and the operation needs it empty (`rmdir`): a recursive
+    /// remove learns that something else added an entry.
     NotEmpty = -15,
     /// An argument was malformed or out of range.
     InvalidArgument = -30,
@@ -67,7 +40,7 @@ pub enum KError {
     FaultFromUser = -31,
     /// A length/size exceeded the permitted maximum.
     TooLarge = -32,
-    /// A device or medium I/O error (e.g. an ATA task-file error on a read).
+    /// A device or medium I/O error.
     IoError = -40,
     /// The operation is not implemented.
     Unsupported = -52,
@@ -85,21 +58,15 @@ impl KError {
 /// Convert a user-memory-access failure into the syscall error space.
 pub fn from_user_access(e: UserAccessError) -> KError {
     match e {
-        // An unmapped/inaccessible buffer or a fault mid-copy both read as
-        // "the user pointer was not usable".
         UserAccessError::BadAddress | UserAccessError::Fault => KError::FaultFromUser,
-        // Misalignment / missing terminator are malformed arguments.
         UserAccessError::Misaligned | UserAccessError::NoTerminator => KError::InvalidArgument,
     }
 }
 
-/// A syscall handler's result: `Ok(non-negative)` on success, `Err` for a
-/// [`KError`]. Collapsed to the single `isize` the ABI returns by
-/// [`encode`].
+/// A handler's result: `Ok(non-negative)` or `Err(`[`KError`]`)`, collapsed by [`encode`].
 pub type SysResult = Result<isize, KError>;
 
-/// Collapse a [`SysResult`] into the `isize` the ABI returns: the success
-/// value unchanged, or the error's negative discriminant.
+/// Collapse a [`SysResult`] into the `isize` the ABI returns.
 pub fn encode(r: SysResult) -> isize {
     match r {
         Ok(v) => {
@@ -120,9 +87,7 @@ mod tests {
         assert_eq!(KError::WouldBlock.as_isize(), -11);
         assert_eq!(KError::TimedOut.as_isize(), -12);
         assert_eq!(KError::PeerClosed.as_isize(), -13);
-        // -14/-15, *not* the v5.1 document's -11: the blocking errors took the
-        // -11..-13 slots first. Pinned here so the divergence is caught rather
-        // than rediscovered.
+        // Not v5.1's `-11`: the blocking errors took `-11..-13` first.
         assert_eq!(KError::AlreadyExists.as_isize(), -14);
         assert_eq!(KError::NotEmpty.as_isize(), -15);
         assert_eq!(KError::FaultFromUser.as_isize(), -31);

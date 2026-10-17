@@ -1,43 +1,34 @@
 //! The framebuffer console: what COM1 receives, drawn on the screen, for a machine with no
-//! serial port.
-//!
-//! `kprint` writes to COM1 and tees into the log ring, and `/dev/log` can only be read once
-//! userspace runs. The laptop Phase 5 targets has no serial port at all, so a boot that died
-//! before `init` used to be a black screen. This draws the same byte stream — the kernel's own
-//! output and every `sys_kprint` — onto Limine's framebuffer from the first line of
-//! `kernel_main`, before ACPI, PCI or anything else that can fail.
-//!
-//! What it shows is decided in [`text`] and drawn with [`glyphs`]; both are free of the kernel so
-//! the gate that reads the screen back (`cargo xtask check-fbcon`) compiles the same code.
+//! serial port. It draws the kernel's own output and every `sys_kprint` onto Limine's
+//! framebuffer from the first line of `kernel_main`, before anything that can fail. What it
+//! shows is decided in [`text`] and drawn with [`glyphs`]; both are free of the kernel so
+//! `cargo xtask check-fbcon` compiles the same code to read the screen back.
 //!
 //! ## Who owns the screen
 //!
-//! - **The kernel, from boot.** Every write is on the screen before the call that made it
-//!   returns, so the last line a hung boot printed is the last line visible.
+//! - **The kernel, from boot.** Every write is on the screen before the call returns, so the
+//!   last line a hung boot printed is the last line visible.
 //! - **Userspace, from the first `/dev/framebuffer` handout** ([`yield_to_userspace`]). The
-//!   kernel cannot see a frame committed into an aperture mapped straight into a client, but it
-//!   does see the handout, and it happens under this console's lock — so no paint is in flight
-//!   by the time a client holds the handle. Writes still land in the text grid; none is drawn.
-//! - **The kernel again when the machine stops** ([`reclaim_for_stop`], called by
-//!   `stop_the_machine` for a panic and a fatal fault alike). The screen is repainted from the
-//!   grid, whose last rows are the diagnosis just written.
-//! - **The hardware report, before userspace, on a boot that asked for one** ([`hold_for_report`]
-//!   to [`end_report`], Phase 5 Part D.3). Writes still land in the grid and none is drawn: the
-//!   screen shows the page the report put there, so a line printed while a person reads it — an
-//!   AP announcing itself late — cannot scroll the page's top rows away. The end repaints the grid.
+//!   kernel cannot see a frame committed into a client's aperture, but it sees the handout,
+//!   under this console's lock, so no paint is in flight once a client holds the handle.
+//!   Writes still land in the text grid; none is drawn.
+//! - **The kernel again when the machine stops** ([`reclaim_for_stop`], for a panic and a fatal
+//!   fault alike): the screen is repainted from the grid, whose last rows are the diagnosis.
+//! - **The hardware report, before userspace** ([`hold_for_report`] to [`end_report`]). Writes
+//!   land in the grid and none is drawn, so a late line cannot scroll the report page away.
 //!
-//! ## Locking, and the three ways a lock could hang the path that most needs to finish
+//! ## Locking
 //!
-//! One `IrqSpinLock`, ranked beside the log ring ([`LockRank::Fbcon`]) for the same reason: it is
-//! teed from the serial `write_str` with `SERIAL` held.
+//! One `IrqSpinLock`, ranked beside the log ring ([`LockRank::Fbcon`]) because it is teed from
+//! the serial `write_str` with `SERIAL` held. It must not hang the path that most needs to
+//! finish:
 //!
 //! - **A fault inside the console, on this CPU**, whose dump tees straight back here. [`HOLDER`]
 //!   names the CPU inside, and a re-entry returns at once rather than waiting for itself.
 //! - **A machine that has begun stopping**, whose other CPUs may have been halted holding the
-//!   lock. Writes stop at `arch::stopping()`, and the reclaim waits a bounded time, then leaves
-//!   the screen as it is.
-//! - **Neither, but a long repaint on another CPU while a fault dump is being teed.** A bounded
-//!   wait, then that line is dropped — from the screen, never from COM1.
+//!   lock: writes stop at `arch::stopping()`; the reclaim waits a bounded time, then gives up.
+//! - **A long repaint on another CPU while a fault dump is teed**: a bounded wait, then that
+//!   line is dropped from the screen, never from COM1.
 //!
 //! The yield and the report's three calls wait without a bound; [`yield_to_userspace`] says why.
 
@@ -72,9 +63,8 @@ unsafe impl Send for Screen {}
 impl Screen {
     /// Describe the framebuffer at `base`, whose red, green and blue bytes sit at `shifts`.
     ///
-    /// `None` for a geometry the painting below could not honour: a null or misaligned base, a
-    /// pitch narrower than four bytes a pixel or not a multiple of four, or a shift that does
-    /// not leave a whole byte.
+    /// `None` for a geometry the painting could not honour: a null or misaligned base, a pitch
+    /// narrower than four bytes a pixel or not a multiple of four, or a shift past a whole byte.
     ///
     /// # Safety
     ///
@@ -104,10 +94,8 @@ impl Screen {
         }
     }
 
-    /// The same screen, written through another mapping of the same pixels.
-    ///
-    /// For the measurement in `report_framebuffer_cost`: one loop, one geometry, two page-table
-    /// entries, so the difference between the two timings is the mapping and nothing else.
+    /// The same screen through another mapping of the same pixels, for `report_framebuffer_cost`:
+    /// the timing difference is the mapping alone.
     ///
     /// # Safety
     /// `base` must address `pitch * height` writable bytes of the *same* framebuffer, for as long
@@ -129,7 +117,6 @@ impl Screen {
         }
     }
 
-    /// Draw `glyph` into cell (`row`, `col`), background and all.
     fn paint_cell(&self, geometry: Geometry, row: usize, col: usize, glyph: u8) {
         let (cell_w, cell_h, scale) = (geometry.cell_w(), geometry.cell_h(), geometry.scale);
         let (x0, y0) = (col * cell_w, row * cell_h);
@@ -168,8 +155,7 @@ pub struct Console {
     grid: Grid,
     /// The page on screen while [`Owner::Report`] holds it; blank otherwise.
     page: Grid,
-    /// The glyph each on-screen cell shows, `MAX_COLS` to a row — what a paint compares against,
-    /// so a scroll repaints the cells that changed rather than all of them.
+    /// The glyph each on-screen cell shows, so a scroll repaints only the cells that changed.
     shown: [u8; CELLS],
     owner: Owner,
 }
@@ -191,22 +177,11 @@ impl Console {
         Some(geometry)
     }
 
-    /// Fill the whole screen, timed, through the console's own mapping and — when `also` is
-    /// given — through a second mapping of the same pixels; then put the text back (Phase 5
-    /// Part G's measurement).
-    ///
-    /// `None` when the kernel is not the one drawing: the report holds the screen for a person to
-    /// read, and userspace's pixels are not ours to overwrite.
-    ///
-    /// **Two mappings, because the first boot's numbers said the cost is not a property of the
-    /// memory.** A fill through the console's mapping ran at GiB/s on a machine whose range
-    /// registers call that memory uncacheable, which is only possible if the mapping asks for
-    /// something else — so what a *write* costs is a question about a page table, and the honest
-    /// way to ask it is to write the same pixels twice, with the same loop, through the two
-    /// mappings the system actually has.
-    ///
-    /// The fill paints the margins as well as the cells, so putting the text back is a repaint
-    /// of every cell and nothing else.
+    /// Fill the whole screen, timed, through the console's own mapping and, when `also` is given,
+    /// a second mapping of the same pixels; then put the text back. `None` unless the kernel is
+    /// drawing. **Two mappings**: a fill through the console's mapping ran at GiB/s on memory the
+    /// range registers call uncacheable, so a *write*'s cost is a question about a page table.
+    /// The fill paints the margins too, so the text comes back as a full repaint.
     ///
     /// # Safety
     /// `also`, if given, must address `pitch * height` writable bytes of the same framebuffer.
@@ -216,7 +191,6 @@ impl Console {
         }
         let screen = self.screen.as_ref()?;
         let (w, h) = (screen.width, screen.height);
-        // The other mapping first: whatever it paints, the console's own fill paints over.
         let other_ns = match also {
             // SAFETY: forwarded from this function's contract.
             Some(base) => unsafe { screen.with_base(base) }.map(|alt| {
@@ -262,8 +236,7 @@ impl Console {
         had
     }
 
-    /// Hold the screen for the hardware report. `None`, and no change, unless the kernel has the
-    /// screen now: there is no report on a console with no screen, or after userspace took it.
+    /// Hold the screen for the hardware report. `None`, and no change, unless the kernel has it.
     pub fn hold_for_report(&mut self) -> Option<Geometry> {
         self.screen.as_ref()?;
         if self.owner != Owner::Kernel {
@@ -273,9 +246,8 @@ impl Console {
         Some(self.grid.geometry())
     }
 
-    /// Show `page` — which must fit the rows above the last without scrolling ([`text::Pages`]
-    /// cuts it so) — with `prompt` on the last row. Painted only while the report holds the
-    /// screen; the cells that already show the right glyph are left alone.
+    /// Show `page` (which must fit the rows above the last without scrolling, [`text::Pages`])
+    /// with `prompt` on the last row. Painted only while the report holds the screen.
     pub fn show_page(&mut self, page: &[u8], prompt: &[u8]) {
         if self.owner != Owner::Report {
             return;
@@ -286,21 +258,17 @@ impl Console {
         }
         self.page.reset(g);
         self.page.write(page);
-        // To the start of the last row. The page occupies the rows above it at most, so each of
-        // these newlines has a row to move to and none scrolls.
         while self.page.cursor().0 + 1 < g.rows {
             self.page.write(b"\n");
         }
         if self.page.cursor().1 != 0 {
             self.page.write(b"\r");
         }
-        // At most one row of it, cut between characters, so it cannot wrap off the bottom.
         self.page.write(text::Pages::new(prompt, g.cols, 1).next().unwrap_or(&[]));
         self.paint(0, g.rows - 1, false);
     }
 
-    /// The report is over: the kernel draws again, and the screen goes back to the grid — with
-    /// every line written while the report held it.
+    /// The report is over: the kernel draws again, from the grid, late lines included.
     pub fn end_report(&mut self) {
         if self.owner != Owner::Report {
             return;
@@ -313,8 +281,7 @@ impl Console {
         }
     }
 
-    /// Write `last` on a row of its own: after a newline if the cursor is partway along a row, and
-    /// with none after it, so that it is the last line written. Nothing for an empty `last`.
+    /// Write `last` on a row of its own (after a newline if mid-row), none after it.
     pub fn write_last(&mut self, last: &[u8]) {
         if last.is_empty() {
             return;
@@ -325,8 +292,7 @@ impl Console {
         self.write(last);
     }
 
-    /// Paint again. Taken back from userspace, that is every cell and the margins beyond them,
-    /// since nothing about what is on the screen is known any more.
+    /// Paint again. Taken back from userspace, that is every cell and the margins beyond them.
     pub fn reclaim(&mut self) {
         let from = core::mem::replace(&mut self.owner, Owner::Kernel);
         let g = self.grid.geometry();
@@ -343,9 +309,8 @@ impl Console {
         self.paint(0, g.rows - 1, everything);
     }
 
-    /// Paint rows `first..=last` from what the screen should show — the report's page while it
-    /// holds the screen, the grid otherwise — skipping cells [`shown`](Self::shown) says are
-    /// already right unless `everything`.
+    /// Paint rows `first..=last` from the report's page while it holds the screen, else the grid,
+    /// skipping cells [`shown`](Self::shown) says are already right unless `everything`.
     fn paint(&mut self, first: usize, last: usize, everything: bool) {
         let Some(screen) = &self.screen else { return };
         let g = self.grid.geometry();
@@ -371,26 +336,20 @@ impl Default for Console {
 
 static CONSOLE: IrqSpinLock<Console> = IrqSpinLock::new(LockRank::Fbcon, Console::new());
 
-/// One more than the index of the CPU inside [`CONSOLE`], or 0 when none is. Written only by
-/// the holder, so a CPU that reads its own number here is inside already: a fault in the console
-/// whose dump has teed back to it.
+/// One more than the index of the CPU inside [`CONSOLE`], or 0. Written only by the holder, so a
+/// CPU reading its own number is inside already (a fault whose dump teed back).
 static HOLDER: AtomicU32 = AtomicU32::new(0);
 
 /// Set by the first [`reclaim_for_stop`]. Nothing writes after it.
 static RECLAIMED: AtomicBool = AtomicBool::new(false);
 
-/// Spins to wait for the lock before giving up.
-///
-/// Ordinary writers never contend with each other — all of them hold `SERIAL` — so this is spent
-/// only by a fault dump or the reclaim, waiting out a write on another CPU. It is a spin count,
-/// not a time, and no repaint on the laptop has been measured against it; what it bounds is how
-/// long a stuck holder can delay a CPU that is trying to stop.
+/// Spins to wait for the lock before giving up. Ordinary writers never contend (all hold
+/// `SERIAL`), so this is spent by a fault dump or the reclaim waiting out another CPU's write.
+/// A spin count, not a time, and not yet measured against a repaint on the laptop.
 const PATIENCE: u32 = 1 << 22;
 
-/// Take the screen Limine handed over, clear it, and draw from here on.
-///
-/// `None` when there is nothing to draw on: a depth other than 32 bits, or a geometry
-/// [`Screen::new`] refuses.
+/// Take the screen Limine handed over, clear it, and draw from here on. `None` for a depth other
+/// than 32 bits or a geometry [`Screen::new`] refuses.
 ///
 /// # Safety
 ///
@@ -409,8 +368,7 @@ pub unsafe fn init(fb: &Framebuffer) -> Option<Geometry> {
     geometry
 }
 
-/// Tee bytes on their way to COM1. Called with `SERIAL` held, and from the unsynchronised
-/// emergency writer.
+/// Tee bytes on their way to COM1; called with `SERIAL` held and from the emergency writer.
 pub fn push(bytes: &[u8]) {
     if RECLAIMED.load(Ordering::Acquire) || crate::arch::stopping() {
         return;
@@ -419,14 +377,12 @@ pub fn push(bytes: &[u8]) {
 }
 
 /// Hand the screen to userspace: the first `/dev/framebuffer` handout calls this before the
-/// handle exists. Later handouts find it done.
+/// handle exists.
 ///
-/// **Waits as long as it takes**, unlike every other entry here. A yield that gave up would
-/// leave the console drawing over the desktop for the rest of the boot, and none of the hazards
-/// the bounded wait exists for can reach it: it is ordinary syscall context, never inside the
-/// console, and a machine that is stopping halts this CPU whether or not it waits.
+/// **Waits as long as it takes**, unlike every other entry here: a yield that gave up would
+/// leave the console drawing over the desktop, and none of the hazards the bounded wait exists
+/// for can reach it (ordinary syscall context, never inside the console).
 pub fn yield_to_userspace() {
-    // The gate reads the frame the handout would otherwise replace within milliseconds.
     #[cfg(feature = "fbcon-gate")]
     hold_for_gate();
     let me = crate::arch::Smp::current_cpu().wrapping_add(1);
@@ -438,18 +394,16 @@ pub fn yield_to_userspace() {
         yielded
     };
     if yielded {
-        // After the lock is released — this line tees back into the console, which a holder
-        // would refuse — and so, like everything from here on, it is on COM1 and not on screen.
+        // After the lock is released: the line tees back into the console, so it is on COM1 only.
         crate::kprintln!("fbcon: /dev/framebuffer handed out; the console stops drawing");
     }
 }
 
-/// Hold the screen for the hardware report (Phase 5 Part D.3): from here until [`end_report`],
-/// writes reach the grid and are not drawn, and the screen shows what [`show_page`] puts there.
+/// Hold the screen for the hardware report: from here until [`end_report`], writes reach the
+/// grid and are not drawn.
 ///
-/// `None` when there is no console on screen or the kernel no longer has it. Waits for the lock
-/// without a bound, as [`yield_to_userspace`] does and for the same reasons: ordinary thread
-/// context, never inside the console, before userspace.
+/// `None` when there is no console on screen or the kernel no longer has it. Waits for the
+/// lock without a bound, as [`yield_to_userspace`] does.
 pub fn hold_for_report() -> Option<Geometry> {
     let mut geometry = None;
     with_console_waiting(|c| geometry = c.hold_for_report());
@@ -463,7 +417,7 @@ pub fn show_page(page: &[u8], prompt: &[u8]) {
 
 /// What a full-screen fill cost, through one mapping or two.
 pub struct Fills {
-    /// Bytes written per fill — the pixels, not the padding between rows.
+    /// Bytes written per fill: the pixels, not the padding between rows.
     pub bytes: usize,
     /// Through the console's own mapping, the one the bootloader made.
     pub own_ns: u64,
@@ -472,7 +426,7 @@ pub struct Fills {
 }
 
 /// Time a full-screen fill through the console's mapping and optionally a second one, then
-/// repaint the text — see [`Console::time_full_fills`].
+/// repaint the text; see [`Console::time_full_fills`].
 ///
 /// # Safety
 /// `also`, if given, must address the same framebuffer, writable, for the call's duration.
@@ -488,8 +442,7 @@ pub fn end_report() {
     with_console_waiting(|c| c.end_report());
 }
 
-/// Run `f` on the console, waiting for the lock as long as it takes, with [`HOLDER`] naming this
-/// CPU while it runs so a fault inside `f` does not wait for itself.
+/// Run `f` on the console, waiting for the lock, with [`HOLDER`] naming this CPU meanwhile.
 fn with_console_waiting(f: impl FnOnce(&mut Console)) {
     let me = crate::arch::Smp::current_cpu().wrapping_add(1);
     let mut console = CONSOLE.lock();
@@ -498,13 +451,8 @@ fn with_console_waiting(f: impl FnOnce(&mut Console)) {
     HOLDER.store(0, Ordering::Release);
 }
 
-/// **Under the `fbcon-gate` feature only**: keep the screen as it is for a second, so
-/// `cargo xtask check-fbcon` reads this frame on every run rather than when a screendump happens
-/// to land inside it.
-///
-/// Called with no lock held — after the timer is calibrated in `kernel_main`, and before the
-/// first handout yields the screen. The handout's caller is the compositor, and nothing else
-/// prints while it waits: `init` is blocked on the compositor binding `/dev/draw`.
+/// **Under the `fbcon-gate` feature only**: keep the screen as it is for a second so
+/// `cargo xtask check-fbcon` reads this frame on every run.
 #[cfg(feature = "fbcon-gate")]
 pub fn hold_for_gate() {
     use crate::arch::timer::ArchTimer;
@@ -515,19 +463,18 @@ pub fn hold_for_gate() {
     }
 }
 
-/// Take the screen back for a machine that is stopping, repainted with the last rows written.
-/// Once per boot; called by `stop_the_machine` after every other CPU has been told to halt.
+/// Take the screen back for a stopping machine, repainted with the last rows written; once per
+/// boot, from `stop_the_machine` after every other CPU has been told to halt.
 pub fn reclaim_for_stop() {
     reclaim_for_stop_with(b"");
 }
 
-/// [`reclaim_for_stop`], with `last` written as the screen's last line first: a power operation's
-/// *"It is now safe to turn off your computer."* (administration Part E.3). Called in the same
-/// place, once every other CPU has been told to halt, so nothing can print after it.
+/// [`reclaim_for_stop`], with `last` written as the screen's last line first (a power
+/// operation's *"It is now safe to turn off your computer."*).
 ///
-/// **Written here, not through `kprint`**, because [`push`] refuses once the machine is stopping —
-/// which is right for a fault, whose diagnosis nothing should scroll away, and is why the line
-/// can be the last one. It starts a row of its own if the cursor is partway along one.
+/// **Written here, not through `kprint`**, because [`push`] refuses once the machine is
+/// stopping, which is why the line can be the last one. It starts a row of its own if the
+/// cursor is partway along one.
 pub fn reclaim_for_stop_with(last: &[u8]) {
     if RECLAIMED.swap(true, Ordering::AcqRel) {
         return;
@@ -541,10 +488,10 @@ pub fn reclaim_for_stop_with(last: &[u8]) {
 /// Run `f` on the console, unless this CPU is inside it already or the lock does not come free
 /// within [`PATIENCE`]. Returns whether `f` ran.
 ///
-/// **A retried `try_lock` is a wait**, which the rank tracker cannot see — it records each
-/// attempt as an acquisition that did not wait, and orders none of them. That is sound here only
-/// because the retry gives up: it can delay a CPU, never deadlock one. Making it unbounded would
-/// need `lock()` instead (`lockrank` § Only an acquisition that waits is ordered).
+/// **A retried `try_lock` is a wait** the rank tracker cannot see (it records each attempt as
+/// an acquisition that did not wait). That is sound only because the retry gives up: it can
+/// delay a CPU, never deadlock one. An unbounded wait needs `lock()` (`lockrank` § Only an
+/// acquisition that waits is ordered).
 fn with_console(f: impl FnOnce(&mut Console)) -> bool {
     let me = crate::arch::Smp::current_cpu().wrapping_add(1);
     if HOLDER.load(Ordering::Acquire) == me {
@@ -569,7 +516,6 @@ mod tests {
 
     const SHIFTS: [u8; 3] = [16, 8, 0];
 
-    /// A host buffer standing in for a framebuffer, with `pad` extra pixels of pitch per row.
     struct Fake {
         pixels: Vec<u32>,
         width: usize,
@@ -596,8 +542,7 @@ mod tests {
             self.pixels[y * self.stride + x]
         }
 
-        /// Read the screen back into text the way the gate does: every cell must be exactly ink
-        /// and paper, every `scale`×`scale` block one colour, and its bitmap a glyph.
+        /// Read the screen back as the gate does: ink and paper only, `scale`×`scale` blocks.
         fn read(&self, g: Geometry) -> Vec<String> {
             let ink = pack(INK);
             let paper = pack(PAPER);
@@ -611,8 +556,6 @@ mod tests {
                                 for x in 0..g.cell_w() {
                                     let p = self.at(x0 + x, y0 + y);
                                     assert!(p == ink || p == paper, "cell ({row},{col}) has a stray pixel {p:#x}");
-                                    // A block reads as one glyph pixel only if it is one colour:
-                                    // OR-ing it would pass a painter that filled a quarter of it.
                                     let block = self.at(x0 + x / g.scale * g.scale, y0 + y / g.scale * g.scale);
                                     assert_eq!(p, block, "cell ({row},{col}) has a block of two colours");
                                     if p == ink {
@@ -650,8 +593,6 @@ mod tests {
 
     #[test]
     fn what_is_written_is_what_the_screen_reads_back_including_the_padding_and_margins() {
-        // 83×40 at scale 1 is 10×2 cells with a 3-pixel margin right and 8 below, and a padded
-        // pitch; the padding must not be painted and the margins must be cleared.
         let mut fake = Fake::new(83, 40, 5);
         let mut console = Box::new(Console::new());
         let g = console.attach(fake.screen()).unwrap();
@@ -668,8 +609,6 @@ mod tests {
         let mut console = Box::new(Console::new());
         let g = console.attach(fake.screen()).unwrap();
         assert_eq!(g.rows, 4);
-        // Enough to wrap the ring several times, with lines of different lengths so a stale
-        // cell from an earlier, longer line would show.
         for i in 0..23 {
             console.write(format!("{}{i}\n", "x".repeat(i % 7)).as_bytes());
         }
@@ -680,13 +619,9 @@ mod tests {
             })
             .collect();
         assert_eq!(fake.read(g), expect);
-        // Rows 4 and a jump of 1: after the last newline the cursor sits on a cleared bottom row.
         assert_eq!(expect, ["xxxxxx20", "21", "x22", ""], "and the grid holds what was written");
     }
 
-    /// What the `shown` comparison buys: a paint touches only the cells whose glyph changed,
-    /// even inside a row it repaints. Cells that do not change are marked after they were drawn;
-    /// a painter that repainted every cell of a damaged row would paint over the marks.
     #[test]
     fn a_cell_whose_glyph_did_not_change_is_not_repainted() {
         let mut fake = Fake::new(80, 64, 0);
@@ -700,8 +635,6 @@ mod tests {
         console.write(b"ing\n");
         assert_eq!(fake.pixels[0], mark, "appending to row 0 repainted its unchanged `k`");
 
-        // A scroll damages every row. Row 0's last cell is blank before and after, so it is
-        // left alone; its first cell goes from `k` to the next line's first glyph, so it is not.
         fake.pixels[last_col] = mark;
         for _ in 0..g.rows {
             console.write(b"x\n");
@@ -731,8 +664,6 @@ mod tests {
         console.show_page(b"page one\nsecond", "— 1/2 —".as_bytes());
         assert_eq!(fake.read(g), ["page one", "second", "", "— 1/2 —"]);
 
-        // A late kernel line reaches the grid and is not drawn over the page — not even the
-        // scroll it causes.
         console.write(b"late 3\nlate 4\nlate 5\n");
         assert_eq!(fake.read(g), ["page one", "second", "", "— 1/2 —"]);
 
@@ -767,15 +698,12 @@ mod tests {
 
     #[test]
     fn after_the_yield_nothing_is_painted_and_the_reclaim_repaints_everything() {
-        // 102×50 leaves a 6-pixel margin right and 2 below, as 1366×768 does on the laptop: the
-        // reclaim has to clear what userspace drew there too.
         let mut fake = Fake::new(102, 50, 0);
         let mut console = Box::new(Console::new());
         let g = console.attach(fake.screen()).unwrap();
         console.write(b"booting\n");
         assert!(console.yield_screen());
         assert!(!console.yield_screen(), "only the first yield hands anything over");
-        // Userspace draws; the kernel keeps logging.
         fake.pixels.fill(0x0012_3456);
         console.write(b"panic: here\n");
         assert!(fake.pixels.iter().all(|&p| p == 0x0012_3456), "a yielded console paints nothing");
@@ -785,8 +713,7 @@ mod tests {
         assert!(fake.pixels.iter().all(|&p| p == pack(INK) || p == pack(PAPER)), "no userspace pixel survives");
     }
 
-    /// **A power operation's last line is the bottom row, on a row of its own** (administration
-    /// Part E.3), whether or not something left the cursor partway along one.
+    /// **A power operation's last line is the bottom row, on a row of its own.**
     #[test]
     fn the_last_line_is_a_row_of_its_own() {
         const SAFE: &[u8] = b"It is now safe to turn off your computer.";
