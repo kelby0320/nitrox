@@ -17,7 +17,6 @@ impl HmacSha256 {
     /// Key the MAC. Keys longer than the block are hashed down first (RFC 2104);
     /// shorter keys are zero-padded.
     pub fn new(key: &[u8]) -> Self {
-        // Normalise the key to exactly one block.
         let mut k = [0u8; BLOCK_LEN];
         if key.len() > BLOCK_LEN {
             let d = crate::sha256::sha256(key);

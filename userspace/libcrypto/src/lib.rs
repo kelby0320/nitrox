@@ -7,17 +7,9 @@
 //! because it is pure `core`, into host tooling (`tools/xtask` seeds password
 //! hashes into the image with the *same* code path the on-target verifier runs).
 //!
-//! Contents:
-//! - [`sha256`] — SHA-256 (FIPS 180-4), streaming + one-shot.
-//! - [`hmac`] — HMAC-SHA256 (RFC 2104).
-//! - [`pbkdf2`] — PBKDF2-HMAC-SHA256 (RFC 8018), the password KDF.
-//! - [`password`] — the credential helper: derive + constant-time verify.
-//!
 //! Consumers: the **auth-service** (password verification) and, later, the
-//! **audit subsystem** (hash-chained tamper-evident records) — the "build the
-//! hash once, share it" intent recorded in the implementation plan. Under
-//! `cargo test` the crate compiles as host `std` so the published vectors run on
-//! the host. See `docs/architecture/session-and-auth.md`.
+//! **audit subsystem** (hash-chained tamper-evident records). See
+//! `docs/architecture/session-and-auth.md`.
 
 #![cfg_attr(not(test), no_std)]
 
