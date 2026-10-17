@@ -1,19 +1,8 @@
-//! Nitrox kernel entry point.
-//!
-//! Boot path:
-//!   1. UEFI firmware loads Limine from the ESP.
-//!   2. Limine parses our ELF, locates our request statics (the
-//!      `.limine_requests` bracket below), sets up long mode + paging +
-//!      a framebuffer, and jumps to [`_start`].
-//!   3. We verify the bootloader honoured base revision 6, install the kernel's
-//!      GDT/TSS/IDT, put the console on the framebuffer and COM1, and bring the
-//!      machine up in the order `kernel_main` spells out — memory, platform
-//!      discovery, interrupts and timers, devices, the scheduler and the APs —
-//!      before loading `init` from the initramfs as pid 1.
-//!
-//! The boot thread then retires into the idle thread; it does not return to
-//! [`_start`], whose [`arch::Cpu::halt_loop`] is only reached by an early
-//! failure. `docs/architecture/boot-flow.md` is the long form.
+//! Nitrox kernel entry point. Limine (loaded by UEFI) jumps to [`_start`] in long mode with paging
+//! and a framebuffer; we check base revision 6, install the GDT/TSS/IDT, put the console on the
+//! framebuffer and COM1, and bring the machine up in the order `kernel_main` spells out before
+//! loading `init` as pid 1. The boot thread then retires into idle and never returns to [`_start`],
+//! whose `halt_loop` is only for early failure. `docs/architecture/boot-flow.md` is the long form.
 
 #![no_std]
 #![no_main]
@@ -21,10 +10,6 @@
 use core::panic::PanicInfo;
 
 use nitrox_kernel::arch;
-// The arch abstraction's traits are brought into scope module-wide: their methods
-// (`arch::Irq::init()`, `arch::Timer::start_periodic()`, …) are called across the boot
-// functions here (`kernel_main`, `sched_bringup`, `ap_entry`). Method resolution is by
-// receiver type, so importing them together is unambiguous.
 use nitrox_kernel::arch::cpu::ArchCpu;
 use nitrox_kernel::arch::irq::ArchIrq;
 use nitrox_kernel::arch::irq_router::ArchIrqRouter;
@@ -48,18 +33,13 @@ use nitrox_kernel::sched;
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Boot-time self-tests and demos — compiled only under the `selftest` feature. A
-/// normal `cargo xtask qemu` boots straight to userspace; `--selftest` runs them.
+/// Boot-time self-tests and demos, compiled only under the `selftest` feature.
 #[cfg(feature = "selftest")]
 mod boot_selftest;
 
-// --- Limine request statics ---------------------------------------------
-//
-// Each item below lives in `.limine_requests*` so the linker keeps it and
-// Limine can find it by scanning the bracketed region. `#[used]` is
-// belt-and-braces: `KEEP()` in the linker script already prevents GC, but
-// the attribute also stops rustc from inlining the static away before the
-// linker sees it.
+// Each request lives in `.limine_requests*`, kept by the linker script's `KEEP()`, so Limine finds
+// it by scanning the bracketed region.
+// `#[used]` also stops rustc inlining the static away before the linker sees it.
 
 /// The Limine base revision this kernel is written against.
 const BASE_REVISION_WANTED: u64 = 6;
@@ -72,13 +52,8 @@ static BASE_REVISION: BaseRevision = BaseRevision::new(BASE_REVISION_WANTED);
 #[unsafe(link_section = ".limine_requests")]
 static mut FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
-// `static mut`, not `static`: Limine writes to the `response` field
-// after the kernel is loaded but before `_start` runs. With a plain
-// `static`, rustc is allowed to constant-fold reads against the
-// const-initialised null and never observe Limine's write — which
-// silently breaks `init_memory`. The `static mut` here mirrors
-// `FRAMEBUFFER_REQUEST` above; `BASE_REVISION` gets away without it
-// because its `supported()` reads via `ptr::read_volatile`.
+// `static mut`: Limine writes `response` after load, and a plain `static` could be constant-folded
+// to its null initialiser, silently breaking `init_memory`. `BASE_REVISION` reads volatile.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static mut MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
@@ -87,22 +62,17 @@ static mut MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[unsafe(link_section = ".limine_requests")]
 static mut HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
-// The initramfs module (Limine loads `boot/initramfs`, tagged
-// `MEMMAP_KERNEL_AND_MODULES`, mapped in the HHDM). `static mut` for the same
-// reason as `MEMMAP_REQUEST`: Limine writes `response` after load.
+// The initramfs module (`boot/initramfs`, `MEMMAP_KERNEL_AND_MODULES`, mapped in the HHDM).
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static mut MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
-// SMP: Limine starts the APs and parks them; the kernel launches each by writing
-// its `goto_address` (see `bring_up_aps`). `static mut` — Limine writes `response`.
+// SMP: Limine starts and parks the APs; the kernel launches each by writing its `goto_address`.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static mut SMP_REQUEST: SmpRequest = SmpRequest::new();
 
-// The handoff facts a boot reports and nothing else reads (Phase 5 Part D.1): which bootloader,
-// on which firmware, on what date, with which command line. `static mut` — Limine writes
-// `response`.
+// Handoff facts a boot reports and nothing else reads: bootloader, firmware, date, command line.
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static mut BOOTLOADER_INFO_REQUEST: BootloaderInfoRequest = BootloaderInfoRequest::new();
@@ -127,11 +97,8 @@ static REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
 #[unsafe(link_section = ".limine_requests_end")]
 static REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 
-// --- Entry point --------------------------------------------------------
-
-/// ELF entry point. Limine jumps here after setting up long mode, paging,
-/// a 64 KiB stack, and the framebuffer. We never return; the bootloader's
-/// caller frame pushed a zero return address as a tripwire.
+/// ELF entry point. Limine jumps here in long mode on a 64 KiB stack. We never return: the
+/// bootloader's caller frame pushed a zero return address as a tripwire.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     kernel_main();
@@ -140,22 +107,17 @@ pub extern "C" fn _start() -> ! {
 
 fn kernel_main() {
     if !BASE_REVISION.supported() {
-        // Limine refused our protocol revision. No framebuffer is safe to
-        // touch in this state — just halt.
+        // Limine refused our protocol revision, so no framebuffer is safe to touch: just halt.
         return;
     }
 
-    // Install the architecture's CPU control tables (on x86_64: GDT + TSS,
-    // then IDT). The ordering dependency between them lives in the arch
-    // layer, not here. **First**, because it prints nothing and needs nothing, and
-    // everything after it can fault: with the IDT live, a bad framebuffer descriptor below
-    // produces a register dump rather than a silent triple fault (PR #296 review).
+    // Install the CPU control tables (x86_64: GDT + TSS, then IDT; their order lives in the arch
+    // layer). First, because it prints nothing and needs nothing, and with the IDT live a bad
+    // framebuffer descriptor below gives a register dump rather than a silent triple fault.
     arch::Cpu::init_tables();
 
-    // The screen, then serial — both need nothing but what Limine handed over, and
-    // everything after them can report its progress and its failures to both. The screen goes
-    // first so that the first line is on it: on a machine with no serial port it is the only
-    // place a boot that dies from here on can say why (Phase 5 Part B).
+    // The screen, then serial, both needing only what Limine handed over. The screen first, so a
+    // machine with no serial port can still say why a boot died.
     let console = limine_framebuffer().and_then(|fb| {
         // SAFETY: Limine's live descriptor; it maps the framebuffer into the higher half before
         // jumping here and the kernel never unmaps it.
@@ -171,11 +133,10 @@ fn kernel_main() {
     }
     kprintln!("CPU tables installed (GDT/TSS/IDT)");
 
-    // What was handed over and what this processor is (Phase 5 Part D.1), before anything that
-    // can fail on an unfamiliar machine: a boot that stops at the next step has already said
-    // what it stopped on. Both only read — Limine's responses, and CPUID.
-    // **Which build this is** (the laptop polish's Part D): the first thing to know about a machine
-    // that misbehaves, and so the first line of the hardware report's first page.
+    // Say what was handed over and what this processor is before anything that can fail on an
+    // unfamiliar machine, so a boot that stops at the next step has said what it stopped on. Both
+    // only read (Limine's responses, CPUID). The build first: it is the first thing to know about a
+    // machine that misbehaves, and the first line of the hardware report's first page.
     kprintln!("nitrox: built from {}", BUILD_COMMIT);
     let cmdline = log_handoff();
     arch::Cpu::log_identity();
@@ -183,44 +144,31 @@ fn kernel_main() {
     // Kept whole for `/proc/cmdline`: the words this kernel does not act on are userspace's.
     nitrox_kernel::cmdline::record(cmdline);
 
-    // Bring up the physical-memory buddy allocator and the slab on top of
-    // it. This walks Limine's memory map and pokes the allocator — a likely
-    // place for a bug to fault — so the IDT is live before we reach it (as it is
-    // for the framebuffer walk above). Returns false if Limine didn't populate a
-    // required response, in which case there is nothing useful to do.
+    // Buddy allocator and slab. It walks Limine's memory map, a likely place to fault, so the IDT
+    // is live first; false means a required Limine response is missing.
     if !init_memory() {
         kprintln!("init_memory failed — halting");
         return;
     }
     kprintln!("allocators up");
 
-    // One-time paging setup, then a smoke test against Limine's live
-    // tables. `paging_init` enables NX and captures the kernel-half
-    // PML4 template every future `AddressSpace::new` will inherit
-    // from; it must run before any AS is constructed.
+    // Paging setup (NX, and the kernel-half PML4 template every `AddressSpace::new` inherits)
+    // before any address space exists, then a smoke test.
     paging_init();
     #[cfg(feature = "selftest")]
     boot_selftest::paging();
 
-    // Record the Limine-loaded initramfs module (if any) so the `/initramfs`
-    // resource server can serve it. Needs the HHDM (the module's `address` is an
-    // HHDM-virtual pointer); non-fatal if no module was configured.
+    // Record the initramfs module for `/initramfs`. Needs the HHDM; non-fatal if absent.
     init_initramfs();
 
-    // Discover platform hardware from the firmware tables (ACPI on x86_64): the
-    // PCIe ECAM window (for PCI enumeration) and the interrupt-routing topology
-    // (for the IOAPIC bring-up). Reads firmware memory through the HHDM, so it
-    // runs after the allocator/HHDM are up; before the local controller so the
-    // future IOAPIC step can consume the cached routing facts. Missing or
-    // malformed tables are logged, not fatal, and the parser logs its summary.
+    // Platform discovery from firmware tables (ACPI): the ECAM window and the interrupt routing the
+    // IOAPIC step uses. Reads firmware memory through the HHDM; missing tables are logged, not
+    // fatal.
     // SAFETY: ring 0, single CPU, called once during boot after the HHDM is
     // available; reads firmware-owned physical memory, no allocation.
     let _ = unsafe { arch::Platform::init() };
 
-    // Bring up this CPU's local interrupt controller (xAPIC). Interrupts
-    // stay masked (IF=0) for this whole slice — nothing is delivered yet; the
-    // timer source lands with the Timers slice and the spurious/timer IDT
-    // stubs + IF=1 with the preemptive-scheduling slice.
+    // This CPU's local interrupt controller; IF stays 0, so nothing is delivered yet.
     // SAFETY: ring 0, single CPU, called once during boot after CPU
     // feature enablement and after the kernel-vmap allocator is up; IF is
     // 0, so software-enabling the controller delivers nothing.
@@ -230,12 +178,8 @@ fn kernel_main() {
     }
     kprintln!("local APIC up (x2APIC, id {})", arch::Irq::id());
 
-    // Calibrate the monotonic time source (TSC) and the per-CPU timer (LAPIC
-    // timer) against the legacy PIT. Must follow Irq::init — the local
-    // controller's MMIO has to be mapped before its timer can be programmed.
-    // Interrupts stay masked (IF=0): the timer is calibrated and armable, but
-    // fires nothing this slice (the periodic tick lands with preemptive
-    // scheduling, one-shot deadlines with wait queues).
+    // Calibrate the TSC and the per-CPU LAPIC timer against the legacy PIT, after `Irq::init`
+    // brought up the local controller. IF stays 0.
     // SAFETY: ring 0, single CPU, called once during boot after Irq::init
     // mapped the local-controller MMIO; IF=0, so arming delivers nothing.
     unsafe { arch::Timer::init() };
@@ -245,38 +189,30 @@ fn kernel_main() {
         arch::Timer::timer_hz() / 1_000_000,
         arch::Timer::read_ns(),
     );
-    // The first gate hold (`fbcon-gate` only): the lines so far — the first, with its em dash,
-    // through the timer — stay on screen for a second so `check-fbcon` reads them every run.
-    // After the timer, because the hold needs a calibrated clock.
+    // First gate hold (`fbcon-gate`): the lines so far stay on screen for a second so `check-fbcon`
+    // reads them every run; after the timer, which the hold needs.
     #[cfg(feature = "fbcon-gate")]
     fbcon::hold_for_gate();
 
-    // Anchor the wall clock from the hardware RTC, now that the monotonic source
-    // it offsets from is calibrated. Read **once**: every later `CLOCK_REALTIME`
-    // is monotonic + this offset, so time-of-day advances smoothly and cannot
-    // step backwards. A machine with no readable RTC simply leaves the clock
-    // unset — `CLOCK_REALTIME` keeps reporting `Unsupported` rather than
-    // pretending it is 1970.
+    // Anchor the wall clock from the RTC, read once now that the monotonic source it offsets from
+    // is calibrated; every later `CLOCK_REALTIME` is monotonic + this offset. With no readable RTC
+    // the clock stays unset (`Unsupported`).
     match nitrox_kernel::clock::init() {
         Some(epoch) => kprintln!("wall clock: anchored at {} (Unix epoch seconds, UTC)", epoch),
         None => kprintln!("wall clock: no readable RTC — CLOCK_REALTIME stays unsupported"),
     }
 
-    // Reserve the DPC (deferred-procedure-call) queue before any interrupt can
-    // enqueue onto it — the IOAPIC self-test below routes the PIT, whose ISR
-    // queues a DPC, and device IRQs queue DPCs in general. Needs the allocator
-    // (it reserves its backing list once); never allocates again.
+    // Reserve the DPC queue before any interrupt can enqueue: the IOAPIC self-test routes the PIT,
+    // whose ISR queues a DPC. It reserves its list once (needs the allocator) and never allocates
+    // again.
     if dpc::init().is_err() {
         kprintln!("DPC queue init failed — halting");
         return;
     }
 
-    // Bring up the system interrupt router (the IOAPIC) so external device
-    // interrupts can be delivered, then prove the routing path end-to-end with
-    // a brief self-test. This runs while the LAPIC timer is still masked and the
-    // scheduler is not yet running, so the self-test's short interrupt-enabled
-    // window fires only the source it routes (the legacy PIT). The router needs
-    // the local controller (Irq::init) up — routed interrupts land on a LAPIC.
+    // The IOAPIC router, then an end-to-end self-test. After `Irq::init` (routed interrupts land on
+    // a LAPIC); runs with the LAPIC timer masked and the scheduler off, so its interrupt-enabled
+    // window fires only the PIT it routes.
     // SAFETY: ring 0, single CPU, once during boot after Irq/Timer init; the
     // ACPI MADT facts are cached (Platform::init ran).
     if unsafe { arch::IrqRouter::init() }.is_err() {
@@ -286,62 +222,46 @@ fn kernel_main() {
     #[cfg(feature = "selftest")]
     boot_selftest::irq_routing();
 
-    // Seed the entropy subsystem (CSPRNG). Runs after the timer is up (so the
-    // monotonic clock is live for jitter mixing) and before the handle table, so
-    // the table seeds its free-list shuffle from the CSPRNG rather than a fixed
-    // constant. On any CPU with RDSEED/RDRAND this latches `seeded` immediately.
+    // Seed the entropy CSPRNG after the timer (jitter mixing needs the clock) and before the handle
+    // table, which shuffles its free list from it.
     nitrox_kernel::entropy::init();
 
-    // Bring up the single global handle table. It eagerly allocates its
-    // first segment, so the heap must be up (it is — `init_memory` ran); it
-    // must be live before any userspace can issue a handle syscall.
+    // The global handle table allocates eagerly (heap up) and must be live before any handle
+    // syscall.
     if nitrox_kernel::handle::global::init().is_err() {
         kprintln!("global handle table init failed — halting");
         return;
     }
     kprintln!("global handle table up");
 
-    // Enumerate hardware into the device table. Runs after the allocators, the
-    // HHDM, the kvmap, and `Platform::init` (the ECAM regions) — all up by now.
-    // Phase 2 slice 5 Part 1: discovery + `DeviceNode`s only; no driver claims a
-    // node yet.
+    // Enumerate hardware into the device table, after the allocators, HHDM, kvmap and
+    // `Platform::init` (the ECAM regions). Discovery only: no driver claims a node here.
     nitrox_kernel::device::init();
 
-    // Phase 2 slice 5 Part 2: prove the async I/O spine (IRP → DPC →
-    // PendingOperation) and InterruptObject signalling on a RAM-backed device,
-    // before any real driver exists. Needs the DPC queue + scheduler waitables.
+    // Prove the async I/O spine (IRP -> DPC -> PendingOperation) on a RAM-backed device before any
+    // real driver; needs the DPC queue and scheduler waitables.
     #[cfg(feature = "selftest")]
     boot_selftest::irp_spine();
 
-    // Phase 2 slice 5 Part 3: match Tier 1 drivers against the enumerated
-    // devices (the AHCI controller) and bring up any disks, then read sector 0
-    // through the real driver to prove the IRP → controller DMA → IRQ → DPC → PO
-    // path against hardware.
+    // Match Tier 1 drivers to the enumerated devices and bring up disks; the self-test reads sector
+    // 0 through the real driver.
     nitrox_kernel::drivers::probe(&flags);
     #[cfg(feature = "selftest")]
     boot_selftest::storage();
 
-    // Phase 2 slice 9 Part 1: bring up serial console **input** (COM1 RX). Runs
-    // with interrupts masked (its RX self-test polls before RX IRQs are armed);
-    // publishes the console char `DeviceNode` for `/dev/console`.
+    // Serial console input (COM1 RX), with interrupts masked: its RX self-test polls before RX IRQs
+    // are armed. Publishes the console char `DeviceNode` for `/dev/console`.
     nitrox_kernel::drivers::console::init();
 
-    // Milestone 3 Part A: the i8042. Same constraints as the console above and for a
-    // sharper reason — bring-up is polled precisely so every controller response is
-    // consumed here, with interrupts masked, before a byte can reach the scancode decoder.
-    // `0xAA` (self-test passed) is byte-identical to a Left Shift release, so arming first
-    // would deliver a phantom Shift on every boot.
+    // The i8042. Polled bring-up consumes every controller response here, with interrupts masked,
+    // before a byte reaches the scancode decoder: `0xAA` (self-test passed) is byte-identical to a
+    // Left Shift release, so arming first delivers a phantom Shift each boot.
     nitrox_kernel::drivers::ps2::init();
 
-    // Establish the BSP's per-CPU identity (dense logical index 0) **before**
-    // the scheduler starts using `current_cpu()` and — critically — before any
-    // AP is online (`bring_up_aps`), so this runs while the boot thread is still
-    // pinned to the BSP. Doing it later (e.g. from `run_first_userspace`, after
-    // AP bring-up) is unsound: by then the boot thread can migrate onto an AP,
-    // and this `wrmsr(IA32_TSC_AUX, 0)` would overwrite *that* CPU's dense index
-    // with 0, aliasing it onto the BSP's per-CPU scheduler slots (`current[0]` /
-    // `idle[0]`) — a slot-sharing collision. Each AP sets its own index from
-    // hardware in `arch::adopt_dense_index` at bring-up.
+    // Establish the BSP's dense index 0 before the scheduler uses `current_cpu()` and before any AP
+    // is online, while the boot thread is pinned to the BSP. Later it could migrate onto an AP, and
+    // this `wrmsr(IA32_TSC_AUX, 0)` would overwrite that CPU's index, aliasing it onto the BSP's
+    // per-CPU scheduler slots. Each AP sets its own in `arch::adopt_dense_index`.
     arch::Smp::init_this_cpu(0);
     kprintln!(
         "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
@@ -350,74 +270,54 @@ fn kernel_main() {
         arch::MAX_CPUS,
     );
 
-    // Bring up the preemptive scheduler: initialise it and arm preemption (periodic
-    // timer + IF=1). Must precede AP bring-up (APs pull from the runqueue) and any
-    // userspace thread. See `docs/architecture/overview.md` § Scheduling.
+    // Initialise the scheduler and arm preemption (periodic timer, IF=1) before AP bring-up (APs
+    // pull from the runqueue) and any userspace thread. See `docs/architecture/overview.md` §
+    // Scheduling.
     sched_bringup();
 
-    // Boot self-tests (pre-SMP): scheduler round-robin + classes, demand paging, DMA.
     #[cfg(feature = "selftest")]
     boot_selftest::pre_smp();
 
-    // Bring up the application processors (Limine started + parked them). After
-    // this, runnable threads can be scheduled on any CPU; the BSP spawns init
-    // below, and any online CPU may pick it up. Each AP logs `cpu N online (AP)`
-    // from its own entry, proving it executes kernel code on the AP.
+    // Bring up the APs (Limine started and parked them); after this any CPU can pick up a runnable
+    // thread, init included.
     bring_up_aps();
 
-    // **Drivers' work after boot** (Phase 6 Part A.2): the USB hub thread, which enumerates what is
-    // attached. Here, once every CPU is up, rather than before: AP bring-up is the scheduler's most
-    // delicate moment, and the overlap is worth less than staying out of it.
+    // Drivers' work after boot: the USB hub thread. After every CPU is up, because AP bring-up is
+    // the scheduler's most delicate moment and the overlap is worth less than staying out of it.
     nitrox_kernel::drivers::start();
 
-    // Boot self-tests (post-SMP): work distribution across the APs + CPU affinity.
     #[cfg(feature = "selftest")]
     boot_selftest::post_smp();
 
-    // Record the display aperture **before** userspace exists, because
-    // `run_first_userspace` binds `/dev/framebuffer` into init's namespace and init may
-    // look it up as soon as it is scheduled. An earlier version folded this into the boot
-    // screen's drawing, which ran *after* this line — the binding resolved to "no aperture
-    // recorded" every time, and the boot still passed because the demo is non-fatal.
+    // Record the display aperture before userspace exists: `run_first_userspace` binds
+    // `/dev/framebuffer` into init's namespace, and a later recording resolves to "no aperture
+    // recorded" while the boot still passes.
     record_framebuffer();
 
-    // **The hub thread's first round, waited for** — bounded — so the report below lists what is
-    // attached, and — once USB devices are registered, Part A.3 — a device present at boot is in the
-    // registry before `device-mgr` replays it.
+    // Wait, bounded, for the hub thread's first round, so the report below lists what is attached
+    // and a device present at boot is registered before `device-mgr` replays it.
     nitrox_kernel::drivers::settle();
 
-    // The hardware report, on a boot whose command line asked for one (Phase 5 Part D.3): here,
-    // because the drivers have bound, every CPU is up or failed to be, and the framebuffer is
-    // recorded — every fact the report shows exists — and nothing of userspace does yet.
+    // The hardware report, when the command line asked for one: the drivers have bound, every CPU
+    // is up or failed to be, the framebuffer is recorded, and nothing of userspace exists yet.
     if let Some(page_wait_secs) = flags.hwreport {
         nitrox_kernel::report::run(page_wait_secs);
     }
 
     run_first_userspace();
 
-    // Retire the boot thread into the idle thread. We must NOT fall through to `_start`'s
-    // `halt_loop` (it `cli`s, which would freeze preemption): `exit` switches to the idle
-    // thread, which `hlt`s with interrupts enabled so the periodic tick keeps running.
-    //
-    // (A boot screen used to be drawn here, clearing the whole framebuffer with nothing
-    // synchronising it against `display-selftest`'s first frame. The console that replaced it
-    // stops drawing under its own lock when the aperture is handed out, which is that
-    // synchronisation.)
-    //
-    // The boot thread has no owning process; exit with a benign status (no
-    // `ChildExited` is produced for a process-less thread).
+    // Retire the boot thread into idle. Falling through to `_start`'s `halt_loop` would `cli` and
+    // freeze preemption; `exit` switches to the idle thread, which `hlt`s with interrupts enabled
+    // so the tick keeps running. The boot thread has no process, so no `ChildExited` is produced.
     sched::exit_thread(nitrox_kernel::libkern::ExitStatus {
         kind: nitrox_kernel::libkern::ExitKind::Normal as u32,
         code: 0,
     });
 }
 
-/// Bring up the preemptive scheduler: initialise it, then arm preemption (program the
-/// periodic tick and raise IF). Order matters — the period is set before delivery is
-/// enabled; the IDT timer stub (`Cpu::init_tables`) and the calibrated timer
-/// (`Timer::init`) are already live. Must run before `bring_up_aps` (the APs pull from
-/// the runqueue) and before any userspace thread. (The former `run_scheduler_demo`
-/// folded a busy-worker demo into this; that demo now lives in `boot_selftest`.)
+/// Bring up the preemptive scheduler: initialise it, then arm preemption (set the periodic tick,
+/// then raise IF). The IDT timer stub and the calibrated timer are already live. Must run before
+/// `bring_up_aps` (the APs pull from the runqueue) and before any userspace thread.
 fn sched_bringup() {
     if sched::init().is_err() {
         kprintln!("sched: init failed — halting");
@@ -431,71 +331,32 @@ fn sched_bringup() {
     kprintln!("preemption armed (IF=1, {} Hz tick)", 1_000_000_000 / sched::TICK_NS);
 }
 
-/// Count of application processors that have finished bring-up (each AP bumps
-/// this near the end of [`ap_entry`]); the BSP waits on it in [`bring_up_aps`].
+/// APs that have finished bring-up, bumped near the end of [`ap_entry`]; the BSP waits on it.
 static AP_ONLINE: AtomicU32 = AtomicU32::new(0);
 
-/// Entry point for an application processor. Limine jumps each parked AP here
-/// (with a `*const SmpInfo` in `RDI`) once [`bring_up_aps`] writes its
-/// `goto_address`. Runs entirely on the AP: it adopts its dense CPU index by
-/// matching its hardware APIC id against the map the BSP built
-/// ([`arch::adopt_dense_index`]), brings up its per-CPU arch state + timer, then
-/// retires into the scheduler. Never returns.
+/// Entry point for an application processor, jumped to by Limine (`*const SmpInfo` in `RDI`) once
+/// [`bring_up_aps`] writes its `goto_address`. Adopts its dense index by matching its hardware APIC
+/// id ([`arch::adopt_dense_index`]), brings up its per-CPU state and timer, then retires into the
+/// scheduler. Never returns.
 extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
-    // 1. Identity first — the per-CPU GDT/TSS, syscall block, and scheduler slots
-    //    all index off `current_cpu()`. Adopt our dense index by matching our own
-    //    hardware APIC id against the map the BSP populated before launching us
-    //    (not a handed-off value that could be stale/colliding). Unique by
-    //    construction: only the BSP's APIC id maps to 0, and each AP to its own
-    //    non-zero index — so no core can share another's per-CPU slots.
+    // Identity first: the per-CPU GDT/TSS, syscall block and scheduler slots all index off
+    // `current_cpu()`. Match our hardware APIC id against the map the BSP populated before
+    // launching us; unique by construction, so no core shares another's per-CPU slots.
     let idx = match arch::adopt_dense_index() {
         Some(i) => i,
         None => {
-            // Our APIC id was never bound — a bring-up bug, and now a **fatal** one.
+            // Our APIC id was never bound: a bring-up bug, and fatal (`docs/decision-log.md`,
+            // 2026-08-19). The BSP does the stopping, because this core cannot: `ap_cpu_init` has
+            // not run, so it has no local APIC and cannot send an IPI, and with no identity
+            // `this_cpu()` reads the `IA32_TSC_AUX` reset default, **0**, so anything touching
+            // per-CPU state would corrupt the BSP's slots.
             //
-            // Running with a default/guessed index would collide with another core's
-            // GDT/TSS/scheduler slots (the migration hazard), so this core cannot
-            // continue either way. What changed 2026-08-19 is that the machine no
-            // longer continues without it: a CPU we intended to run and failed to
-            // bring up means the topology does not match what the kernel believes,
-            // and the kernel stops rather than running a configuration nobody asked
-            // for. The decision is in `docs/decision-log.md`, 2026-08-19.
-            //
-            // **This core cannot be the one that stops the machine**, for two
-            // reasons, so it only diagnoses and the BSP does the killing:
-            //
-            //   * `ap_cpu_init` has not run, so this core has no local APIC and
-            //     cannot send an IPI;
-            //   * with no identity, `this_cpu()` reads the `IA32_TSC_AUX` reset
-            //     default and reports **0**, so anything touching per-CPU state —
-            //     including `kprintln!`, whose `IrqSpinLock` raises
-            //     `PREEMPT_OFF[this_cpu()]` — would corrupt the *BSP's* slots. That
-            //     is the same collision this branch exists to avoid, reached from
-            //     the other side.
-            //
-            // So: the unsynchronised emergency writer, which is port I/O and touches
-            // neither. Printing at all is new — this branch used to halt silently,
-            // and the only signal was the BSP's spin-timeout roughly two billion
-            // iterations later, by which point the reason was gone.
-            //
-            // **Raw bytes, not `writeln!`.** `<SerialPort as fmt::Write>::write_str`
-            // tees into the kernel log ring *first* — `klog::push` takes `KLOG`, an
-            // `IrqSpinLock`, whose `lockrank::acquired` indexes `FLOOR[cpu]`/`DEPTH[cpu]`
-            // by `this_cpu()`. On this core that is 0, the BSP's slots, and the BSP is
-            // concurrently spinning in `bring_up_aps`. So the formatted writer touches
-            // exactly the per-CPU state this branch exists to stay out of, and the rank
-            // tracker is live in every image the project boots (`cmd_build` builds dev,
-            // not release). `write_byte` is the port I/O on its own.
-            //
-            // This is the same class as PR #198's blocking finding — an unbound AP
-            // reporting index 0 and clobbering the BSP's — which `leave_online` guards
-            // with `identity_bound()`. Found in review of PR #214; the first version of
-            // this branch used `writeln!` and claimed it touched no per-CPU state.
-            //
-            // No APIC id in the message: reading it needs `hw_apic_id`, which is
-            // arch-internal and not on the neutral `ArchSmp` trait, and widening that
-            // trait to name one core in one diagnostic is not the trade. The BSP's panic
-            // says how many failed; this says why one of them did.
+            // That rules out `kprintln!` and `writeln!` too: `write_str` tees into the log ring
+            // first, and `klog::push` takes `KLOG`, whose `lockrank::acquired` indexes
+            // `FLOOR[cpu]`/`DEPTH[cpu]` by `this_cpu()`, again the BSP's slots while it spins in
+            // `bring_up_aps`. So only the unsynchronised emergency writer's raw `write_byte`, which
+            // is port I/O alone. No APIC id in the message: `hw_apic_id` is arch-internal, and
+            // widening `ArchSmp` for one diagnostic is not the trade.
             let w = arch::serial::emergency_writer();
             for &b in b"\nsmp: FATAL - an AP's hardware APIC id has no bound dense index \
 (bring-up bug); halting this core, the BSP will stop the machine\n"
@@ -508,52 +369,37 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
             arch::Cpu::halt_loop();
         }
     };
-    // 2. Per-CPU arch bring-up: GDT/TSS, the shared IDT, NX/SMEP/SMAP, x2APIC, the
-    //    syscall MSRs (`KERNEL_GS_BASE` → this CPU's block).
     arch::ap_cpu_init();
-    // 3. Arm this CPU's periodic tick (the BSP-calibrated frequency; IF still 0).
     // SAFETY: ring 0; this CPU's x2APIC + IDT are now live.
     unsafe {
         arch::Timer::start_periodic(sched::TICK_NS);
     }
-    // 4. Build this CPU's scheduler context — and only then report it online.
-    //
-    // **The order matters.** `ap_init` was inside `ap_run` below, which runs *after* this
-    // increment, so a failure left the BSP counting a CPU that never joined: it would exit
-    // its wait loop, print the online count and boot on. In a `test-harness` build the
-    // panic reaches `debug_exit` and the gate fails, which is the path that was measured —
-    // but in a production build the panic handler prints and halts this one core, and the
-    // machine boots to userspace on one fewer CPU than it was told to use. That is exactly
-    // the "topology nobody chose, silently" this change exists to remove, so the commit
-    // point moved rather than the diagnosis. Found in review of PR #214.
+    // Build this CPU's scheduler context, and only then report it online: a failure after the
+    // increment would leave the BSP counting a CPU that never joined, and in a production build the
+    // panic only halts this core, so the machine would run on one fewer CPU than it was told to
+    // use.
     if sched::ap_init().is_err() {
-        // Out of memory building this CPU's scheduler context. Unlike the identity failure
-        // above, this core can speak for itself: `ap_cpu_init` has run, so it has an
-        // identity, per-CPU state and a local APIC. An allocation this small failing out of
-        // a fresh boot heap says the sizing is wrong, not that memory is tight.
+        // Out of memory building the scheduler context. Unlike the identity failure above, this
+        // core has an identity and a local APIC, so it can speak for itself; an allocation this
+        // small failing says the sizing is wrong.
         panic!("smp: AP scheduler init failed (out of memory building its context)");
     }
-    // **Do not join a machine that is stopping.** `stop_the_machine` targets the *online*
-    // set, which this core is about to enter — so a stop that began while it was still in
-    // bring-up sent it no NMI and would leave it running on a machine whose other cores are
-    // halted wherever they were, several of them possibly holding `SCHED`. That is not
-    // hypothetical: `bring_up_aps`' deadline panic is *about* APs missing from the online
-    // set, so the stop it triggers skips exactly the cores it is complaining about, and a
-    // merely-slow one would arrive here afterwards. Found in review of PR #215.
+    // Do not join a machine that is stopping. `stop_the_machine` targets the online set, which this
+    // core is about to enter: a stop begun during its bring-up sent it no NMI, so it would run on
+    // beside halted cores, some holding `SCHED`. The deadline panic in `bring_up_aps` is about APs
+    // missing from the online set, so its stop skips exactly them.
     if arch::stopping() {
         arch::Cpu::halt_loop();
     }
     AP_ONLINE.fetch_add(1, Ordering::Release);
     kprintln!("smp: cpu {} online (AP)", idx);
 
-    // 5. Retire into the scheduler (enables interrupts; diverges).
     sched::ap_run();
 }
 
-/// Start every application processor Limine reports, assigning each a **dense**
-/// logical index (BSP = 0; APs 1, 2, …, capped at `MAX_CPUS`) passed via
-/// `extra_argument`, then waiting until all are online. No-op if Limine reports no
-/// SMP support. The BSP must already have the scheduler, IDT, APIC, and timer up.
+/// Start every application processor Limine reports, giving each a **dense** logical index (BSP =
+/// 0; APs 1, 2, ..., capped at `MAX_CPUS`), then wait until all are online. No-op if Limine reports
+/// no SMP support. The BSP must already have the scheduler, IDT, APIC and timer up.
 fn bring_up_aps() {
     // SAFETY: `static mut` Limine request; Limine wrote `response` before `_start`,
     // and we read it single-threaded here (no AP is running yet).
@@ -568,10 +414,8 @@ fn bring_up_aps() {
     let bsp = resp.bsp_lapic_id;
     let cap = arch::MAX_CPUS as u32;
 
-    // Bind the BSP's own dense index (0) to its APIC id so the map is complete and
-    // no AP can be assigned index 0. Each core later adopts *its own* index by
-    // matching its hardware APIC id (`arch::adopt_dense_index`), so indices are
-    // unique by construction — a core can never share another's per-CPU slots.
+    // Bind the BSP's dense index (0) to its APIC id so the map is complete and no AP is assigned 0.
+    // Each core adopts its own index by matching its hardware APIC id.
     arch::bind_cpu_identity(0, bsp);
 
     let mut next_idx: u32 = 1; // 0 is the BSP.
@@ -589,12 +433,11 @@ fn bring_up_aps() {
         }
         let idx = next_idx;
         next_idx += 1;
-        // Bind this AP's dense index to its APIC id *before* launching it, so the
-        // AP finds its (own) entry when it adopts its index. The AP no longer
-        // trusts a handed-off `extra_argument`; it derives its index from hardware.
+        // Bind the AP's index before launching it, so it finds its own entry when it adopts its
+        // index from hardware.
         arch::bind_cpu_identity(idx, info.lapic_id);
-        // Launch the parked AP: the release store to `goto_address` makes it jump
-        // to `ap_entry` (and pairs with the AP's acquire of the identity map).
+        // The release store to `goto_address` launches the AP and pairs with its acquire of the
+        // map.
         info.goto_address.store(ap_entry as *const () as u64, Ordering::Release);
     }
 
@@ -602,26 +445,13 @@ fn bring_up_aps() {
     if launched == 0 {
         return;
     }
-    // Wait (bounded) until every launched AP reports online.
-    //
-    // **A wall-clock deadline, not a spin count.** The cap was `2_000_000_000`
-    // iterations, which is not a duration: it means different things on KVM and TCG,
-    // and on a loaded host it outlives the gates. Measured 2026-08-19 by forcing an AP
-    // to fail identity adoption — the count had not expired when `test-qemu`'s 90 s
-    // timeout fired, so the boot reported "likely a hang" and the panic below never
-    // ran. That was tolerable while this was a warning and is not now that it is fatal:
-    // failing fast is the whole point, and a fatal path that never fires is a hang.
-    //
-    // Five seconds is three orders of magnitude above a real bring-up (which is
-    // microseconds of emulated instructions) and well inside every gate's timeout. The
-    // calibrated timer is live here — `sched_bringup` runs before this and says so.
+    // Wait, bounded, until every launched AP reports online. A wall-clock deadline, not a spin
+    // count: iterations mean different things on KVM and TCG, and a count had not expired when
+    // `test-qemu`'s 90 s timeout fired, so the panic below never ran. Five seconds is three orders
+    // of magnitude above a real bring-up and inside every gate's timeout.
     const AP_ONLINE_DEADLINE_NS: u64 = 5_000_000_000;
-    // **The deadline is only a deadline if the clock runs.** `Timer::read_ns` returns a
-    // constant 0 before `Timer::init` (its base and multiplier are zeroed statics), so a boot
-    // reordering that moved calibration after this point would turn the wait into an infinite
-    // spin — back to "TIMED OUT after 90 s, likely a hang", the exact symptom this replaced,
-    // with nothing to notice. The ordering is documented on `sched_bringup`; this makes the
-    // dependency self-checking rather than a comment.
+    // The deadline needs a running clock: `Timer::read_ns` returns 0 before `Timer::init`, so
+    // calibrating later would turn this into an infinite spin.
     debug_assert!(
         arch::Timer::monotonic_hz() != 0,
         "AP wait deadline needs a calibrated timer — Timer::init must run before bring_up_aps"
@@ -630,29 +460,12 @@ fn bring_up_aps() {
     while AP_ONLINE.load(Ordering::Acquire) < launched {
         core::hint::spin_loop();
         if arch::Timer::read_ns() > deadline {
-            // **Fatal, not a warning.** A CPU we launched and that never reported in
-            // means either it faulted before `ap_run` or it never reached our code at
-            // all; both say something is wrong underneath, and neither leaves the
-            // kernel's view of the machine matching the machine. Continuing would run
-            // a topology nobody chose, silently.
-            //
-            // Measured 2026-08-19 by forcing one AP's identity adoption to fail, on
-            // the code this replaces (a `kprintln!` and a `return`):
-            //
-            //   `--kvm`, which is what CI runs:
-            //       smp: WARNING — only 2/3 APs online after wait cap
-            //       xtask: integration tests PASSED (qemu exit 33)
-            //   TCG:
-            //       xtask: integration tests TIMED OUT after 90s (likely a hang)
-            //
-            // So **CI passed with a CPU missing**, and locally the same fault looked
-            // like a hang with no diagnosis — the gate adjudicates on the exit code and
-            // never reads the log.
-            //
-            // The only tolerated shortfall is `MAX_CPUS`, which is handled at launch
-            // time above: those cores are never given a `goto_address`, never enter
-            // our code, and are reported as the supported configuration limit they
-            // are. See `docs/decision-log.md`, 2026-08-19.
+            // Fatal, not a warning. A launched CPU that never reported in either faulted before
+            // `ap_run` or never reached our code, and continuing would run a topology nobody chose.
+            // As a warning, `--kvm` CI passed with a CPU missing and TCG looked like a hang, since
+            // the gate reads the exit code and not the log. The only tolerated shortfall is
+            // `MAX_CPUS`, handled at launch: those cores never get a `goto_address`. See
+            // `docs/decision-log.md`, 2026-08-19.
             panic!(
                 "smp: only {}/{} launched APs came online within {} ms — a CPU we \
                  intended to run failed to start",
@@ -665,21 +478,17 @@ fn bring_up_aps() {
     kprintln!("smp: {} CPU(s) online (1 BSP + {} AP)", launched + 1, launched);
 }
 
-/// **The commit this kernel was built from**, as `xtask` set it: `git rev-parse --short=12 HEAD`,
-/// with `-dirty` for a tree with changes. `unknown` when built some other way.
+/// The commit this kernel was built from, as `xtask` set it (`-dirty` if changed); else `unknown`.
 const BUILD_COMMIT: &str = match option_env!("NITROX_COMMIT") {
     Some(c) => c,
     None => "unknown",
 };
 
-/// Log what Limine handed over, in three lines: the bootloader, its firmware and the base
-/// revision it loaded the kernel under; the HHDM offset, the firmware's date and the boot
-/// entry's command line; and the memory map, summarised by kind.
+/// Log what Limine handed over, in three lines: the bootloader, firmware and base revision; the
+/// HHDM offset, the firmware's date and the command line; and the memory map by kind.
 ///
-/// Reads nothing but Limine's responses, so it runs before the allocators. A response the
-/// bootloader did not provide is said, not skipped — on a new machine an absence is a fact.
-///
-/// Returns the command line's bytes (empty when there is none), for [`parse_cmdline`].
+/// Reads only Limine's responses, so it runs before the allocators; an absent response is said, not
+/// skipped. Returns the command line's bytes (empty if none), for [`parse_cmdline`].
 fn log_handoff() -> &'static [u8] {
     // SAFETY: for every request read below, the statics are written by Limine before `_start` and
     // only read afterwards; reading through a raw-pointer copy stops the optimiser folding the
@@ -770,11 +579,8 @@ const CMDLINE_MAX: usize = 1024;
 fn parse_cmdline(line: &'static [u8]) -> nitrox_kernel::cmdline::Flags {
     use nitrox_kernel::cmdline::{self, Ignored};
     let flags = cmdline::parse(line, |ignored| match ignored {
-        // **Not "ignored": passed on.** The kernel acts on the words it knows and serves the
-        // whole line at `/proc/cmdline`, so a word it does not recognise may still be somebody's
-        // — `install` was `session-mgr`'s from Phase 5 Part H.1 until administration Part G.3.
-        // Saying "ignoring" of a word that might decide what the machine does would be the log
-        // lying about the boot; saying userspace reads it, when nothing does today, would be too.
+        // Not "ignored": passed on. The kernel serves the whole line at `/proc/cmdline`, so a word
+        // it does not recognise may still be userspace's, and "ignoring" it would be the log lying.
         Ignored::Unknown(word) => {
             kprintln!("cmdline: \"{}\" is not a kernel flag; it is served whole at /proc/cmdline", Printable(word))
         }
@@ -796,8 +602,7 @@ fn parse_cmdline(line: &'static [u8]) -> nitrox_kernel::cmdline::Flags {
     flags
 }
 
-/// A command line as a log line shows it: [`Printable`], except that an empty one stays empty
-/// rather than printing `-`, since it is quoted and `""` already says so.
+/// A command line as a log line shows it: [`Printable`], but an empty one stays empty, not `-`.
 struct CmdlineShown<'a>(&'a [u8]);
 
 impl core::fmt::Display for CmdlineShown<'_> {
@@ -830,10 +635,7 @@ fn limine_framebuffer() -> Result<&'static Framebuffer, &'static str> {
 }
 
 /// Whether this CPU has a cache-attribute table, recorded by `paging_init` for
-/// [`record_framebuffer`] to read: without one there is no write-combining to ask for.
-///
-/// A static rather than a second `CPUID` because the answer is the one the boot already acted on —
-/// two reads could disagree only if they disagreed about the same CPU, which would be worse.
+/// [`record_framebuffer`]: without one there is no write-combining to ask for.
 static ATTRIBUTE_TABLE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// See [`ATTRIBUTE_TABLE`].
@@ -841,11 +643,9 @@ fn policy_installed() -> bool {
     ATTRIBUTE_TABLE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Capture Limine's framebuffer as a userspace-mappable aperture.
-///
-/// Must run before `run_first_userspace` binds `/dev/framebuffer`. Requires the HHDM, since
-/// Limine reports the framebuffer at a higher-half virtual address and a `MemoryObject` needs
-/// the physical base.
+/// Capture Limine's framebuffer as a userspace-mappable aperture, before `run_first_userspace`
+/// binds `/dev/framebuffer`. Needs the HHDM: Limine reports a virtual address and a `MemoryObject`
+/// needs the physical base.
 fn record_framebuffer() {
     let fb = match limine_framebuffer() {
         Ok(fb) => fb,
@@ -855,13 +655,10 @@ fn record_framebuffer() {
         }
     };
 
-    // **The aperture is a framebuffer, so it is write-combining** (Phase 5 Part G.3) — said once,
-    // here, and read by everything that maps it: the `MemoryObject` `/dev/framebuffer` mints, and
-    // the measurement below.
-    //
-    // **Unless this CPU has no attribute table to name it in**, in which case the bit that would
-    // select write-combining is reserved, and a mapping that set it would fault rather than run
-    // slowly (PR #306 review, optional 5).
+    // The aperture is write-combining, said once here for everything that maps it (the
+    // `/dev/framebuffer` `MemoryObject`, the measurement below), unless this CPU has no attribute
+    // table: the bit that would select write-combining is then reserved, and a mapping setting it
+    // would fault rather than run slowly.
     let caching = match policy_installed() {
         true => nitrox_kernel::mm::Caching::WriteCombining,
         false => nitrox_kernel::mm::Caching::Normal,
@@ -869,8 +666,7 @@ fn record_framebuffer() {
     // SAFETY: `fb` is Limine's live descriptor and `hhdm_offset()` is the offset Limine
     // reported for this boot, so `address - offset` is the aperture's physical base.
     if unsafe { framebuffer::record_aperture(fb, nitrox_kernel::mm::heap::hhdm_offset(), caching) } {
-        // **The padding, as a number** (Phase 5 Part D.1): the bytes each row carries past its
-        // last pixel. The laptop's is 40, and a reader should not have to subtract to see it.
+        // The padding as a number: the bytes each row carries past its last pixel.
         let padding = fb.pitch as i64 - (fb.width * (fb.bpp as u64).div_ceil(8)) as i64;
         kprintln!(
             "framebuffer: {}x{} pitch {} padding {} bpp {} — /dev/framebuffer available",
@@ -886,23 +682,15 @@ fn record_framebuffer() {
     }
 }
 
-/// What writing to the screen costs on this machine, and why (Phase 5 Part G's measurement).
+/// What writing to the screen costs on this machine, and why: the caching the firmware set for
+/// physical memory, what that makes the framebuffer's address, and a full-screen fill's time
+/// through the console's mapping and through a mapping made as **userspace's** is
+/// (`page_flags_for`).
 ///
-/// **Four facts, and the fourth is the one the first boot did not expect.** What the firmware set
-/// the caching of physical memory to; what that makes the framebuffer's own address; how long a
-/// full-screen fill takes through the mapping the console draws on; and how long the same fill
-/// takes through a mapping made the way **userspace's** is — built by `page_flags_for` from the
-/// aperture's own answer, which is what a `/dev/framebuffer` mapping is built from.
-///
-/// The laptop's first measurement had only the third of those, and it came back at GiB/s over
-/// memory the range registers call uncacheable. That is not possible for an uncached write, so the
-/// cost is not a property of the memory: it is a property of the page table entry, and the two
-/// mappings of this framebuffer did not agree until Part G made them. The pair of timings is what
-/// says so — 54 MiB/s against 2924 before, 2451 against 2931 after.
-///
-/// **A second mapping of device memory with a different type is exactly the aliasing the manuals
-/// warn about.** Since Part G the two agree — the aperture's answer reaches both — so this maps
-/// the same attribute the console's mapping has, holds it for one fill, and unmaps it.
+/// The pair of timings is the evidence: GiB/s over memory the range registers call uncacheable is
+/// impossible for an uncached write, so the cost is the page table entry. A second mapping of
+/// device memory with a different type is the aliasing the manuals warn about, so this maps the
+/// same attribute the console's has, for one fill, then unmaps it.
 fn report_framebuffer_cost(console_virt: u64) {
     // SAFETY: ring 0, during boot, with the console up.
     unsafe { arch::MemoryTypes::log_configuration() };
@@ -921,18 +709,14 @@ fn report_framebuffer_cost(console_virt: u64) {
         None => kprintln!("framebuffer: {:#x} has no memory type of its own; the page table decides", phys.as_u64()),
     }
 
-    // A second mapping of the aperture, made as a `/dev/framebuffer` mapping is: the same
-    // translation, from the same recorded answer. `map_mmio` would not do — it forces uncached, a
-    // third thing neither mapping is.
+    // A second mapping of the aperture as `/dev/framebuffer` maps it; `map_mmio` would force
+    // uncached.
     let bytes = info.pitch as usize * info.height as usize;
     let pages = (bytes as u64).div_ceil(nitrox_kernel::mm::PAGE_SIZE as u64);
     let plain = plain_mapping(phys, pages, caching);
     // SAFETY: `plain`, when mapped, addresses the same framebuffer for the length of the call;
     // the console is the kernel's and no userspace exists yet.
     let measured = unsafe { fbcon::time_full_fills(plain.map(|v| v.as_u64() as *mut u8)) };
-    // **What each mapping asks for**, which is the fact the timings are evidence of. The
-    // bootloader made the console's; `page_flags_for` makes the other's, as it makes every
-    // `/dev/framebuffer` mapping's.
     let asks = |what: &str, virt: u64| {
         // SAFETY: ring 0; walks the active page tables and reads a configuration register.
         match unsafe { arch::MemoryTypes::of_mapping(virt) } {
@@ -944,15 +728,11 @@ fn report_framebuffer_cost(console_virt: u64) {
     if let Some(v) = plain {
         asks("a mapping made as userspace's is", v.as_u64());
     }
+    // Unmapped before the early return below: `time_full_fills` answers `None` when the console has
+    // no screen, and a write-back alias of the whole aperture must not outlive the measurement.
     if let Some(v) = plain {
         // SAFETY: undoing this function's own mapping of pages nothing else refers to. The vmap
         // range is never reused, so the address is not handed out again.
-        //
-        // **Before the early return below**, not after it: `time_full_fills` answers `None` when
-        // the console has no screen — a framebuffer `record_aperture` accepted and `Screen::new`
-        // refused, say — and a write-back alias of the whole aperture left mapped for the life of
-        // the boot is the one thing this measurement must not leave behind (PR #305 review,
-        // optional 5).
         unsafe { unmap_plain(v, pages) };
     }
     let Some(f) = measured else { return };
@@ -973,10 +753,8 @@ fn report_framebuffer_cost(console_virt: u64) {
     }
 }
 
-/// Map `pages` of the framebuffer at `phys` with the flags a `/dev/framebuffer` mapping gets —
-/// which is what makes the second timing worth having: it is not a model of userspace's mapping,
-/// it is one. `None` if the vmap or the page tables refuse, which costs the comparison and
-/// nothing else.
+/// Map `pages` of the framebuffer at `phys` with the flags a `/dev/framebuffer` mapping gets, so
+/// the second timing measures userspace's mapping. `None` if the vmap or page tables refuse.
 fn plain_mapping(
     phys: nitrox_kernel::mm::PhysAddr,
     pages: u64,
@@ -984,10 +762,7 @@ fn plain_mapping(
 ) -> Option<nitrox_kernel::mm::VirtAddr> {
     use nitrox_kernel::mm::vmm::Protection;
     use nitrox_kernel::mm::{PhysAddr, VirtAddr, addr_space, kvmap};
-    // **The flags a `/dev/framebuffer` mapping gets, from the function that gives them to it.**
-    // Not a second copy of that translation: the first version rebuilt the flags here, and a
-    // control that deleted the real translation left this measurement — and the gate reading its
-    // line — perfectly green (PR #306 review, blocking 1).
+    // The flags come from the function that gives them to `/dev/framebuffer`, not a second copy.
     let flags = addr_space::page_flags_for(Protection::WRITE, caching);
     let base = kvmap::vmap_alloc_pages(pages).ok()?;
     let root = arch::Paging::active_root();
@@ -1021,25 +796,9 @@ unsafe fn unmap_plain(base: nitrox_kernel::mm::VirtAddr, pages: u64) {
     }
 }
 
-// --- First userspace process --------------------------------------------
-//
-// Load the embedded `hello` ELF into a fresh address space, wrap it in a
-// Process (pid 1), spawn its main thread, and let the scheduler run it into
-// ring 3. It prints via `sys_kprint`, then `sys_process_exit` routes through
-// the scheduler — the thread is reaped on the next scheduler entry, freeing
-// the Process and its address space. This is the substrate-works milestone.
-
-/// Arm the syscall fast path, then load + launch **init** as pid 1 with a handle
-/// to its own notification channel (`rdi`), a full-rights root-namespace handle
-/// (`rsi`) carrying the boot kernel-server bindings, and the system-control handle
-/// (`rdx`, administration Part E.3). init reads its manifest from
-/// the initramfs, spawns the demo chain (`parent` → `child`), and runs the reaping
-/// loop. This boot thread hands off (via `sched::exit` in `kernel_main`) into init
-/// and then idles; init is the supervisor now (not the kernel). The init ELF is
-/// loaded from the **initramfs** (`/sbin/init`) — the real-OS model (the bootloader
-/// hands the kernel an initramfs; the kernel loads init from it), retiring the former
-/// kernel-embedded copy. Every later program is spawned from a path (see the
-/// path-based-spawn slice).
+/// Arm the syscall fast path, then load and launch **init** from the initramfs (`/sbin/init`) as
+/// pid 1, with `rdi` = its notification-channel handle, `rsi` = a full-rights root-namespace handle
+/// carrying the boot kernel-server bindings, `rdx` = the system-control handle.
 fn run_first_userspace() {
     use mm::addr_space::AddressSpace;
     use mm::elf::load_elf;
@@ -1049,12 +808,9 @@ fn run_first_userspace() {
     use nitrox_kernel::object::kernel_server::KernelServerId;
     use nitrox_kernel::object::{Namespace, NotificationChannel, ObjectRef, Process};
 
-    // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
-    // per-thread (by the scheduler's `thread_enter`), not here.
     arch::init_syscall_entry();
     kprintln!("syscall fast-path armed");
 
-    // Fresh address space (kernel half inherited → loadable), from the init ELF.
     let aspace = match AddressSpace::new() {
         Ok(a) => a,
         Err(_) => {
@@ -1062,8 +818,6 @@ fn run_first_userspace() {
             return;
         }
     };
-    // Load `/sbin/init` from the initramfs CPIO (a contiguous `&[u8]` into the
-    // HHDM-mapped Limine module — `init_initramfs` ran in `kmain` before this).
     let init_bytes =
         match nitrox_kernel::initramfs::blob().and_then(|blob| nitrox_kernel::initramfs::lookup(blob, b"sbin/init")) {
             Some(bytes) => bytes,
@@ -1080,9 +834,8 @@ fn run_first_userspace() {
         }
     };
 
-    // Build the parent process (pid 1 = init; it is the root — no `parent_notif`).
-    // The **capability bootstrap**: init holds the full syscap set, and all authority
-    // in the system traces to this initial kernel grant (docs/architecture/syscaps.md).
+    // Pid 1 is the root. The capability bootstrap: init holds the full syscap set, and all
+    // authority traces to this grant (docs/architecture/syscaps.md).
     let mut proc_box = match Process::try_new_user(1, aspace, nitrox_kernel::libkern::SysCaps::all()) {
         Ok(p) => p,
         Err(_) => {
@@ -1091,9 +844,8 @@ fn run_first_userspace() {
         }
     };
 
-    // The parent's notification channel: the Process owns one reference; a
-    // handle in pid 1's table owns the other (passed to the parent in `rdi` so
-    // it can `sys_wait` / `sys_notif_recv` for its children's `ChildExited`).
+    // The notification channel: the Process owns one reference, and a handle in pid 1's table the
+    // other.
     let chan = match NotificationChannel::try_new() {
         Ok(c) => c,
         Err(_) => {
@@ -1118,10 +870,7 @@ fn run_first_userspace() {
         }
     };
 
-    // The parent's root namespace (the namespace it resolves names against —
-    // `Process::namespace`). The Process owns one reference; a handle in pid 1's
-    // table owns the other, passed to the parent in `rsi` so it can bind into and
-    // look up against its root namespace. Mirrors the notification channel above.
+    // The root namespace, referenced like the channel above (its handle goes in `rsi`).
     let ns = match Namespace::try_new() {
         Ok(n) => n,
         Err(_) => {
@@ -1130,82 +879,53 @@ fn run_first_userspace() {
         }
     };
 
-    // Bind the in-kernel resource servers into pid 1's root namespace (the kernel
-    // is the "supervisor" at boot; userspace servers register via the Ready
-    // handshake instead — slice 7). Children inherit these via namespace
-    // inheritance. `/dev/entropy` is the first Kernel Server: a lookup mints an
-    // `EntropyObject` (see `object::kernel_server`). Its binding rights are the
-    // band `sys_entropy_create` mints (`entropy_rights`): `READ` + the generic
-    // management band, so a full-rights lookup yields exactly that.
+    // Bind the in-kernel resource servers into pid 1's root namespace (the kernel is the supervisor
+    // at boot); children inherit them. `/dev/entropy` mints an `EntropyObject` on lookup; its
+    // rights are the band `sys_entropy_create` mints (`entropy_rights`).
     let entropy_binding_rights = Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, entropy_binding_rights).is_err() {
         kprintln!("init: binding /dev/entropy failed");
         return;
     }
 
-    // `/dev/console` — the serial console (a char `DeviceNode`); the caller reads
-    // keyboard input with `sys_io_submit(Read)`. Input-only in Phase 2, so the
-    // binding grants `READ` + the generic management band (DUPLICATE/INSPECT so a
-    // client can `stat` it; TRANSFER so init can hand it to eshell at spawn).
     let console_binding_rights = Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns.bind_kernel_server(b"/dev/console", KernelServerId::Console, console_binding_rights).is_err() {
         kprintln!("init: binding /dev/console failed");
         return;
     }
 
-    // `/dev/log` — the kernel log ring, served as a read-only `MemoryObject`
-    // snapshot (`cat /dev/log` = dmesg). The caller maps + stats it, so the binding
-    // grants `MAP_READ` + the generic management band (INSPECT for `stat`).
     let log_binding_rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns.bind_kernel_server(b"/dev/log", KernelServerId::Log, log_binding_rights).is_err() {
         kprintln!("init: binding /dev/log failed");
         return;
     }
 
-    // `/dev/framebuffer` — the display aperture, and its `/info` leaf. **Whoever holds
-    // this binding is the compositor**: authority here is the namespace grant, not a
-    // capability bit and not a registration call, exactly as for the fs-server and
-    // profile-server (`docs/design/display-substrate.md` §3).
-    //
-    // `MAP_READ | MAP_WRITE` because a compositor writes pixels; `INSPECT` so it can
-    // `stat` the object's size; `TRANSFER` so init can hand the binding onward to the
-    // process that will actually drive the display. No `READ`/`WRITE` — only the `MAP_*`
-    // band is valid on a `MemoryObject`, and including them would be rejected as
-    // `BadRights`.
+    // `/dev/framebuffer`, the display aperture. Whoever holds this binding is the compositor:
+    // authority is the namespace grant, not a capability bit or a registration call
+    // (`docs/design/display-substrate.md` §3). `MAP_*` only: `READ`/`WRITE` are not valid on a
+    // `MemoryObject` and would be rejected as `BadRights`.
     let framebuffer_binding_rights =
         Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns.bind_kernel_server(b"/dev/framebuffer", KernelServerId::Framebuffer, framebuffer_binding_rights).is_err() {
-        // Non-fatal: a system with no usable framebuffer still boots to a serial
-        // console, and every existing test path is serial. The display arm is the only
-        // consumer.
+        // Non-fatal: a system with no usable framebuffer still boots to a serial console.
         kprintln!("init: binding /dev/framebuffer failed — display unavailable");
     }
 
-    // `/proc/self/*` — self-reference servers. Each binding is just a dispatch id;
-    // the *answer* is the looking-up thread's OWN object, resolved per-caller from
-    // syscall context (no ambient authority — see `kernel_server`). One binding is
-    // therefore shared by all callers/descendants. Per-leaf bindings (not one
-    // `/proc/self` prefix) because the returned types — Process / Thread / Namespace
-    // — carry disjoint principal rights, so each needs its own type-correct cap.
+    // `/proc/self/*`: each binding is a dispatch id; the answer is the looking-up thread's own
+    // object, resolved per caller (no ambient authority). Per leaf, not one prefix, because Process
+    // / Thread / Namespace carry disjoint principal rights.
     let proc_self_principal_rights =
         Rights::SIGNAL | Rights::TERMINATE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    // The namespace view is LOOKUP-only (a resolve view; self already holds a
-    // full-rights root-namespace handle via `rsi`). No BIND — granting self-bind
-    // ambiently would be a capability-escalation smell.
+    // LOOKUP-only, no BIND: granting self-bind ambiently would be a capability escalation.
     let proc_self_namespace_rights = Rights::LOOKUP | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-    // `/proc/self/status` returns a synthesized read-only `MemoryObject` text
-    // snapshot (numeric pid/tid), so its cap is the snapshot-server shape
-    // (`MAP_READ` + the generic band), not a principal-object cap.
     let proc_self_status_rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     let proc_self_binds = [
         (&b"/proc/self/process"[..], KernelServerId::ProcSelfProcess, proc_self_principal_rights),
         (&b"/proc/self/thread"[..], KernelServerId::ProcSelfThread, proc_self_principal_rights),
         (&b"/proc/self/namespace"[..], KernelServerId::ProcSelfNamespace, proc_self_namespace_rights),
         (&b"/proc/self/status"[..], KernelServerId::ProcSelfStatus, proc_self_status_rights),
-        // `/proc/cmdline` — the line this boot was given, as text. Not under `/proc/self`: it is
-        // one fact about the machine, the same for every reader, and a person debugging a boot
-        // wants to see it. (`session-mgr` looked for `install` in it from Phase 5 Part H.1 until
-        // administration Part G.3.)
+        // `/proc/cmdline`: one fact about the machine, the same for every reader, so not
+        // per-process.
         (&b"/proc/cmdline"[..], KernelServerId::ProcCmdline, proc_self_status_rights),
     ];
     for (path, id, rights) in proc_self_binds {
@@ -1215,36 +935,26 @@ fn run_first_userspace() {
         }
     }
 
-    // `/proc/sched/stats` — per-CPU scheduler statistics as a read-only
-    // `MemoryObject` text snapshot (the same shape as `/dev/log`): the caller
-    // maps + stats it, so the binding grants `MAP_READ` + the generic management
-    // band. Reachability is by namespace construction, like all of `/proc` — a
-    // supervisor may omit it from a sandbox's namespace.
+    // `/proc/sched/stats`: a read-only snapshot. Reachability is by namespace construction, so a
+    // supervisor may omit it from a sandbox.
     let sched_stats_binding_rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns.bind_kernel_server(b"/proc/sched/stats", KernelServerId::SchedStats, sched_stats_binding_rights).is_err() {
         kprintln!("init: binding /proc/sched/stats failed");
         return;
     }
 
-    // `/initramfs/<path>` — a subtree server returning a read-only `MemoryObject`
-    // copy of a file from the boot CPIO blob. The caller maps it `MAP_READ`, so
-    // the binding grants `MAP_READ` + the generic management band.
     let initramfs_binding_rights = Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns.bind_kernel_server(b"/initramfs", KernelServerId::Initramfs, initramfs_binding_rights).is_err() {
         kprintln!("init: binding /initramfs failed");
         return;
     }
 
-    // `/dev/blk/<n>` — a subtree server resolving the n-th discovered block device
-    // to a `DeviceNode` handle (the caller `sys_io_submit`s reads on it). Bound
-    // **unconditionally**: the device-table registry carries liveness, so a
-    // lookup of `/dev/blk/0` is `NotFound` if no disk was discovered, harmless.
-    // The binding grants `READ` + `WRITE` (the RW fs-server writes filesystem metadata via
-    // `sys_io_submit` writes; the Model A data path is the kernel's) plus the generic band, and
-    // **`MAP_READ` for the `<n>/info` leaf** (Phase 5 Part H.1): that leaf answers with a
-    // read-only `MemoryObject`, and a lookup attenuates to the binding's rights, so without this
-    // the record resolves and cannot be read. `MAP_READ` on a `DeviceNode` means nothing — a
-    // device is not mappable — so this widens only what the leaf serves.
+    // `/dev/blk/<n>`: a subtree server resolving the n-th block device. Bound unconditionally: the
+    // registry carries liveness, so `/dev/blk/0` is `NotFound` with no disk. `READ` + `WRITE` (the
+    // RW fs-server writes metadata via `sys_io_submit`), and `MAP_READ` for the `<n>/info` leaf: it
+    // answers with a read-only `MemoryObject`, and a lookup attenuates to the binding's rights.
+    // `MAP_READ` means nothing on a `DeviceNode`, which is not mappable, so it widens only the
+    // leaf.
     let block_binding_rights =
         Rights::READ | Rights::WRITE | Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns.bind_kernel_server(b"/dev/blk", KernelServerId::BlockDevice, block_binding_rights).is_err() {
@@ -1252,32 +962,24 @@ fn run_first_userspace() {
         return;
     }
 
-    // `/dev/input/raw/<n>` — the i8042's keyboard and mouse nodes. Read-only (input),
-    // plus the generic management band so a supervisor can `stat` one and hand it to the
-    // input-server at spawn. A lookup is `NotFound` when no such device answered, which is
-    // the normal case on a machine with no i8042.
-    //
-    // **Bound into the root namespace only.** This is the authority to read one input
-    // device unfiltered — a keylogger, if it reaches the wrong process — so no session
-    // namespace should ever project it (`docs/architecture/input-subsystem.md` §5).
+    // `/dev/input/raw/<n>`: the i8042's keyboard and mouse nodes, `NotFound` when none answered.
+    // Root namespace only: it is the authority to read an input device unfiltered, a keylogger if
+    // it reaches the wrong process, so no session namespace should project it
+    // (`docs/architecture/input-subsystem.md` §5).
     let raw_input_binding_rights = Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns.bind_kernel_server(b"/dev/input/raw", KernelServerId::RawInput, raw_input_binding_rights).is_err() {
         kprintln!("init: binding /dev/input/raw failed");
         return;
     }
 
-    // `/dev/registry` — the device table: a snapshot of every node's record, and each node by id
-    // (administration Part B). **The root namespace only**, like `/dev/input/raw`: `<id>` is every
-    // raw device the kernel has, so it is the union of the two subtree bindings' authority —
-    // `/dev/blk`'s rights, whose `MAP_READ` is what lets the snapshot be read.
+    // `/dev/registry`: the device table, a snapshot of every node's record and each node by id.
+    // Root namespace only, like `/dev/input/raw`: it spans every raw device, so `/dev/blk`'s
+    // rights, whose `MAP_READ` lets the snapshot be read.
     if ns.bind_kernel_server(b"/dev/registry", KernelServerId::Registry, block_binding_rights).is_err() {
         kprintln!("init: binding /dev/registry failed");
         return;
     }
 
-    // `/dev/disk/by-partuuid/<uuid>` + `/dev/disk/by-partlabel/<label>` — stable
-    // direct-handle bindings for each GPT partition the drivers discovered (the
-    // content-derived names `init.toml` mount specs reference). Read-only.
     nitrox_kernel::drivers::gpt::bind_partition_names(&ns);
 
     let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
@@ -1286,8 +988,7 @@ fn run_first_userspace() {
     let ns_ref = unsafe { ObjectRef::from_raw(ns_ptr, KObjectType::Namespace) };
     proc_box.set_namespace(ns_ref.clone());
     let (np, nt) = ns_ref.into_raw();
-    // Full namespace rights — kept in sync with `syscall::table::namespace_rights`
-    // (LOOKUP|BIND principals + the UNBIND modifier + the generic band).
+    // Full namespace rights, in sync with `syscall::table::namespace_rights`.
     let ns_rights =
         Rights::LOOKUP | Rights::BIND | Rights::UNBIND | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT;
     let ns_h = match global::get().allocate(1, np, nt, ns_rights) {
@@ -1301,10 +1002,9 @@ fn run_first_userspace() {
         }
     };
 
-    // **The system-control object** (administration Part E.3): the capability to stop the machine,
-    // made once and handed to init in `rdx`. Its handle carries `WRITE` and `INSPECT` and neither
-    // `DUPLICATE` nor `TRANSFER`, so init cannot give it away. A boot without it still runs, but
-    // nothing on it can stop the machine; init says which it has.
+    // The system-control object, the capability to stop the machine, handed to init in `rdx`. Its
+    // handle has `WRITE` and `INSPECT` but not `DUPLICATE` or `TRANSFER`, so init cannot give it
+    // away.
     let system_control_h = match nitrox_kernel::object::SystemControl::try_new() {
         Ok(sc) => {
             let sp = KBox::into_raw(sc).as_ptr() as *mut ();
@@ -1331,8 +1031,6 @@ fn run_first_userspace() {
         unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }
     };
 
-    // Spawn the parent's main thread, seeding `rdi` = its notification handle, `rsi` = its
-    // root-namespace handle and `rdx` = the system-control handle.
     if sched::spawn_user(
         proc_ref,
         info.entry_point.as_u64(),
@@ -1347,8 +1045,7 @@ fn run_first_userspace() {
     kprintln!("init: spawned init (pid 1); handing off to userspace");
 }
 
-/// Record the Limine-loaded initramfs module (the first one) for the
-/// `/initramfs` resource server. Non-fatal if no module was configured.
+/// Record the first Limine module as the `/initramfs` blob; non-fatal if none was configured.
 fn init_initramfs() {
     // SAFETY: `MODULE_REQUEST` lives in `.limine_requests`; Limine wrote its
     // `response` before `_start`. Read through a raw-pointer copy.
@@ -1363,9 +1060,8 @@ fn init_initramfs() {
         kprintln!("initramfs: no module loaded");
         return;
     }
-    // Every module after the first is a disk (Phase 5 Part C — the live image's root). Recorded
-    // here, while the responses are fresh; published by `drivers::probe`, once the device table and
-    // the interrupt table exist.
+    // Every module after the first is a disk (the live image's root), recorded while the responses
+    // are fresh and published by `drivers::probe` once the device and interrupt tables exist.
     for index in 1..resp.module_count as usize {
         // SAFETY: `modules` points at `module_count` non-null `*mut LimineFile`s, in
         // never-reclaimed memory.
@@ -1384,8 +1080,8 @@ fn init_initramfs() {
     // SAFETY: `modules` points at an array of `module_count` `*mut LimineFile`;
     // the first is the initramfs.
     let file = unsafe { &**resp.modules };
-    // **The disk the machine started from** (Phase 6 Part D): the first module came off it, and its
-    // record names the disk's GPT GUID, which the partition pass compares every disk's with.
+    // The disk the machine started from: the first module came off it, and its GPT GUID is what the
+    // partition pass compares every disk's with.
     nitrox_kernel::drivers::partitions::set_boot_disk(file.gpt_disk_uuid);
     match nitrox_kernel::drivers::partitions::boot_disk() {
         Some(guid) => kprintln!(
@@ -1440,31 +1136,22 @@ fn init_memory() -> bool {
 
 /// One-time paging setup that must run before any `AddressSpace::new`:
 ///
-/// 1. Enable every CPU memory-protection feature the kernel depends
-///    on. On x86_64: NX paging extension, SMEP, SMAP. The arch impl
-///    panics if any required feature is missing from the running CPU.
-/// 2. Pre-allocate the kernel-vmap region's intermediate page tables
-///    in the live PML4, so the next step's snapshot captures them and
-///    every future AS inherits the shared sub-tree.
-/// 3. Capture the kernel-half PML4 entries from Limine's live tables
-///    into the boot template every new address space inherits.
+/// 1. Enable every CPU memory-protection feature the kernel depends on (x86_64: NX, SMEP, SMAP).
+/// 2. Pre-allocate the kernel-vmap region's intermediate page tables in the live PML4.
+/// 3. Capture the kernel-half PML4 entries into the template every new address space inherits.
 ///
-/// The ordering matters: `kvmap::init` modifies the live PML4 in ways
-/// the template must see; the template snapshot freezes the kernel
-/// half post-call. See the "Kernel-half PML4 sharing" section in
+/// The order matters: `kvmap::init` modifies the live PML4 in ways the template must see, and the
+/// snapshot freezes the kernel half. See "Kernel-half PML4 sharing" in
 /// `docs/architecture/memory-management.md`.
 fn paging_init() {
     arch::Cpu::init_protections();
     kprintln!("memory protections enabled");
-    // Enable this CPU's FP/SIMD units before any thread is created (a thread's
-    // save area is initialised at construction and restored on its first
-    // switch-in). Each AP repeats this for itself in `ap_cpu_init` — CR0/CR4 and
-    // the extended-state mask are per-CPU registers.
+    // FP/SIMD before any thread is created; per-CPU registers, so each AP repeats it in
+    // `ap_cpu_init`.
     arch::fpu_init_cpu();
-    // **The cache-policy table becomes the kernel's, here** (Phase 5 Part G.1), before this CPU
-    // makes any mapping that names an entry in it. Each AP does the same for itself in
-    // `ap_cpu_init`: the table is per-CPU state, and CPUs that disagreed would give one page
-    // different meanings depending on which core touched it.
+    // The cache-policy table becomes the kernel's before any mapping names an entry in it. Per-CPU,
+    // so each AP repeats it in `ap_cpu_init`: CPUs that disagreed would give a page different
+    // meanings by core.
     //
     // SAFETY: ring 0, on the boot CPU, before `kvmap::init` maps anything.
     let policy = unsafe { arch::MemoryTypes::install_policy() };
@@ -1475,9 +1162,8 @@ fn paging_init() {
             "cache policy: the kernel's table is installed; the bootloader's DIFFERED — mappings \
              it made, including the console's, chose entries from another table"
         ),
-        // Not "differed": there was nothing to differ. Said plainly because the consequence is
-        // real — no attribute table means no write-combining, so the framebuffer below is
-        // recorded as ordinary memory and the desktop pays the uncached price it always did.
+        // Nothing to differ from. With no attribute table there is no write-combining, so the
+        // framebuffer is recorded as ordinary memory.
         Policy::NoTable => kprintln!(
             "cache policy: this CPU has no attribute table — every mapping is what the range \
              registers say, and write-combining is unavailable"
@@ -1501,42 +1187,27 @@ fn paging_init() {
 fn panic(info: &PanicInfo) -> ! {
     use core::fmt::Write;
 
-    // Use the unsynchronised emergency serial path, not `kprintln!`: a
-    // panic can occur while `SERIAL`'s lock is held, and re-locking would
-    // deadlock. Bypassing the lock is sound under Phase 1's single-CPU,
-    // interrupts-masked model — no other context can be driving COM1.
+    // Use the unsynchronised emergency serial path, not `kprintln!`: a panic can occur while
+    // `SERIAL`'s lock is held, and re-locking would deadlock.
     let mut w = arch::serial::emergency_writer();
     let _ = writeln!(w, "\n*** KERNEL PANIC ***");
     if let Some(loc) = info.location() {
         let _ = writeln!(w, "  at {}:{}:{}", loc.file(), loc.line(), loc.column());
     }
     let _ = writeln!(w, "  {}", info.message());
-    // Scan the panicking stack for kernel-text addresses — a poor man's backtrace. The
-    // kernel has no unwind tables, but a `call` leaves its return address behind, so this
-    // recovers the call chain (with stale-slot false positives, hence "candidates").
-    //
-    // **Shared with the exception dump rather than reimplemented**, which is the point: this
-    // used to be its own copy of the loop with no page probe, under a `SAFETY` comment
-    // claiming "reading within the current kernel stack, which is mapped". It is not — a
-    // kernel stack's guard page is at the *bottom*, so scanning **up** 96 words from a
-    // shallow `rsp` runs off the top into unmapped vmap. The `#PF` that follows is taken
-    // *before* `debug_exit` below, so the panic that got here never delivered its verdict and
-    // the run died on the 90 s timeout reporting `likely a hang` — burying the one-line
-    // diagnosis under an unrelated fault dump. A syscall-path assertion is exactly the
-    // shallow-stack case, so the guard added in PR #231 was landing in that hole
-    // (re-review, finding 6).
+    // Scan the panicking stack for kernel-text addresses, a poor man's backtrace (stale slots give
+    // false positives, hence "candidates"). Shared with the exception dump, which probes pages: a
+    // kernel stack's guard page is at the *bottom*, so scanning up from a shallow `rsp` (a
+    // syscall-path assertion) runs off the top into unmapped vmap, and that `#PF`, taken before
+    // `debug_exit` below, buries the diagnosis and ends in the 90 s timeout.
     arch::dump_stack_candidates(&mut w);
-    // Under the integration-test build, a kernel panic is a test failure: end the
-    // QEMU run with the fail verdict so the runner reports it (instead of hanging
-    // until the wall-clock timeout). `0x11` → QEMU exit 35 → the runner maps to fail.
+    // Under the integration-test build a panic is a test failure: end the QEMU run with the fail
+    // verdict (`0x11` -> exit 35) rather than hang until the wall-clock timeout.
     #[cfg(feature = "test-harness")]
     arch::debug_exit(0x11);
-    // **Stop every CPU**, not just this one: a panicked kernel must not run on, and until
-    // 2026-08-19 "must not run on" meant only the panicking core while the rest kept
-    // scheduling on whatever it had been holding. `debug_exit` returns when no
-    // `isa-debug-exit` device is attached, so this runs either way.
-    //
-    // Safe from any core, including one whose APIC is not up yet — `stop_the_machine` checks
-    // and falls back to halting itself, which is the early-boot case `ap_entry` relies on.
+    // Stop every CPU, not just this one: a panicked kernel must not run on while the rest keep
+    // scheduling. `debug_exit` returns when no `isa-debug-exit` device is attached, so this runs
+    // either way. Safe from any core, even one whose APIC is not up: `stop_the_machine` falls back
+    // to halting itself, the early-boot case `ap_entry` uses.
     arch::Cpu::stop_the_machine()
 }

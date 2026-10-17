@@ -1,10 +1,10 @@
-//! **Stopping the machine on purpose** (administration Part E.3): `sys_power`'s halt and reboot.
+//! **Stopping the machine on purpose**: `sys_power`'s halt and reboot.
 //!
 //! The machine stops in three steps:
 //!
-//! 1. **Every disk is flushed**, so that what the filesystems wrote is on the medium and not in a
-//!    drive's cache: `IoOpcode::Flush` — AHCI's `FLUSH CACHE EXT` — sent to each disk at once,
-//!    and waited for until each is done or [`FLUSH_BOUND_NS`] has passed. A partition is skipped,
+//! 1. **Every disk is flushed**, so what the filesystems wrote is on the medium and not in a
+//!    drive's cache: `IoOpcode::Flush` (AHCI's `FLUSH CACHE EXT`) sent to each disk at once, and
+//!    waited for until each is done or [`FLUSH_BOUND_NS`] has passed. A partition is skipped,
 //!    since its flush is its disk's. A disk that does not finish is named on the log and the stop
 //!    goes on: a machine that cannot stop is worse than a drive that took too long.
 //! 2. **Every other processor stops**, by the path a panic takes (`stop_other_cpus`).
@@ -15,13 +15,12 @@
 //! **There is no power-off.** Entering S5 needs AML, which waits for ACPICA
 //! (`docs/rationale/why-phased-acpi.md`).
 //!
-//! **Outside the async-first rule, deliberately.** A blocking operation hands back a
-//! `PendingOperation`, but this never returns, so there would be nothing to hand it to; the flush
-//! waits here, bounded.
+//! **Outside the async-first rule, deliberately.** This never returns, so there would be nothing
+//! to hand a `PendingOperation` to; the flush waits here, bounded.
 //!
 //! What stops the machine is `init`'s alone: the one
-//! [`SystemControl`](crate::object::SystemControl) is made at boot and handed to it, and cannot be
-//! duplicated or transferred. See `docs/architecture/power.md`.
+//! [`SystemControl`](crate::object::SystemControl) is made at boot and handed to it, and cannot
+//! be duplicated or transferred. See `docs/architecture/power.md`.
 
 use core::fmt::Write;
 
@@ -34,11 +33,9 @@ use crate::libkern::power::PowerOp;
 use crate::libkern::{KBox, KVec};
 use crate::object::{DeviceNode, MAX_WAIT_HANDLES, ObjectRef, PendingOperation};
 
-/// How long the flush may take, every disk together.
-///
-/// A drive's own limit for a cache flush is longer, 30 seconds for ATA, but that is for a cache
-/// full of writes; by the time `init` asks, every filesystem has been written back and marked
-/// clean, so a flush here moves little.
+/// How long the flush may take, every disk together. A drive's own limit is longer (30 seconds for
+/// ATA), but that is for a cache full of writes; by the time `init` asks, every filesystem is
+/// written back and marked clean.
 const FLUSH_BOUND_NS: u64 = 10_000_000_000;
 
 /// The line a halt ends on.
@@ -79,14 +76,12 @@ fn last_words(line: &str) {
     crate::fbcon::reclaim_for_stop_with(line.as_bytes());
 }
 
-/// Whether a block device of `kind` is flushed: everything but a partition, whose flush is its
-/// disk's.
+/// Whether a block device of `kind` is flushed: all but a partition, whose flush is its disk's.
 fn flushes(kind: u32) -> bool {
     kind != BlockKind::Partition as u32
 }
 
-/// Flush every disk, waiting until each is done or [`FLUSH_BOUND_NS`] has passed, and log what
-/// each did.
+/// Flush every disk, waiting until each is done or [`FLUSH_BOUND_NS`] has passed, logging each.
 fn flush_every_disk() {
     // `/dev/blk/<n>` and its flush's operation.
     let mut flushing: KVec<(usize, ObjectRef)> = KVec::new();
@@ -162,8 +157,8 @@ fn start_flush(device: &ObjectRef) -> Result<ObjectRef, i32> {
 mod tests {
     use super::*;
 
-    /// **Every block device but a partition is flushed** — a partition's flush goes to its disk,
-    /// which is flushed already — including one whose driver said nothing about what it is.
+    /// **Every block device but a partition is flushed**, including one whose driver said nothing
+    /// about what it is.
     #[test]
     fn every_block_device_but_a_partition_is_flushed() {
         assert!(flushes(BlockKind::Disk as u32));

@@ -1,17 +1,16 @@
-//! The kernel command line: the boot entry's `cmdline:`, read once and parsed into flags
-//! (Phase 5 Part D.2).
+//! The kernel command line: the boot entry's `cmdline:`, read once and parsed into flags.
 //!
 //! **A command line never stops a boot.** A word this kernel does not know is reported and
-//! ignored, and so is a value it cannot read: the line is typed at a boot menu, on a machine
-//! that may have nothing else to say what went wrong, and a typo there should cost the flag,
-//! not the boot.
+//! ignored, and so is a value it cannot read: the line is typed at a boot menu, on a machine that
+//! may have nothing else to say what went wrong, and a typo there should cost the flag, not the
+//! boot.
 //!
 //! Two flags exist:
 //! - `hwreport[=<seconds>]` holds the kernel log on the screen before userspace starts, a page at
 //!   a time (see `main.rs`'s report mode). The seconds bound how long a page waits for a key.
-//! - `usb=off` leaves the USB host controller alone (Phase 6 Part A): the way past a bring-up that
-//!   hangs on a machine the gates have never seen, typed at the live stick's boot menu. `usb=on`
-//!   is the default, and undoes an earlier `off`.
+//! - `usb=off` leaves the USB host controller alone: the way past a bring-up that hangs on a
+//!   machine the gates have never seen, typed at the live stick's boot menu. `usb=on` is the
+//!   default, and undoes an earlier `off`.
 
 /// How long a hardware-report page waits for a key when `hwreport` gives no bound.
 pub const HWREPORT_DEFAULT_SECS: u32 = 120;
@@ -37,13 +36,9 @@ pub enum Ignored<'a> {
     BadSwitch(&'a [u8]),
 }
 
-/// The command line this boot was given, for `/proc/cmdline` to serve.
-///
-/// **Userspace may have its own questions about it.** The kernel reads the words it acts on
-/// ([`Flags`]) and nothing else. Rather than the kernel carrying a list of words it does not use,
-/// the line is served whole and each reader looks for its own. No program looks for one today:
-/// `install`, which selected the installer session from Phase 5 Part H.1, went with that session
-/// in administration Part G.3.
+/// The command line this boot was given, for `/proc/cmdline` to serve whole: the kernel reads only
+/// the words it acts on ([`Flags`]) and each other reader looks for its own. No program looks for
+/// one today.
 static LINE: crate::libkern::SpinLock<&'static [u8]> =
     crate::libkern::SpinLock::new(crate::libkern::lockrank::LockRank::Leaf, &[]);
 

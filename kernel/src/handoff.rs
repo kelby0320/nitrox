@@ -1,9 +1,9 @@
-//! What the bootloader handed over, summarised for the log (Phase 5 Part D.1).
+//! What the bootloader handed over, summarised for the log.
 //!
-//! Every boot says which bootloader loaded it, on what firmware, and what the memory map
-//! holds, so that every transcript is a hardware report of the machine it ran on. `main.rs`
-//! owns the Limine request statics and prints the lines; the pieces here are the ones worth
-//! host-testing — the memory map's tally and the firmware type's name.
+//! Every boot says which bootloader loaded it, on what firmware, and what the memory map holds, so
+//! every transcript is a hardware report of the machine it ran on. `main.rs` owns the Limine
+//! request statics and prints the lines; the pieces here are the ones worth host-testing: the
+//! memory map's tally and the firmware type's name.
 
 use core::fmt;
 

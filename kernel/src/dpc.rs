@@ -1,44 +1,37 @@
-//! Deferred Procedure Calls — the **IRQ > DPC > Thread** deferral mechanism.
+//! Deferred Procedure Calls: the **IRQ > DPC > Thread** deferral mechanism.
 //!
-//! An interrupt service routine does the minimum (ack the device, capture
-//! status) and **queues a `Dpc`**; the deferred completion work — advancing or
-//! completing an IRP, running completion routines, signalling a
-//! `PendingOperation` to wake its waiters — runs later, when the queue is
-//! drained at the interrupt-dispatch tail by [`run_pending`]. DPCs run
-//! non-blocking; a handler may briefly take the scheduler lock (to make a thread
-//! runnable) but must not block. See `docs/architecture/drivers-and-irps.md`.
+//! An interrupt service routine does the minimum (ack the device, capture status) and **queues a
+//! `Dpc`**; the deferred completion work (advancing an IRP, signalling a `PendingOperation`) runs
+//! when [`run_pending`] drains the queue at the interrupt-dispatch tail. A handler may briefly take
+//! the scheduler lock but must not block. See `docs/architecture/drivers-and-irps.md`.
 //!
-//! A [`Dpc`] is embedded **inline** in its owning struct (a future IRP /
-//! `InterruptObject`), so queuing one allocates nothing — the queue is a
-//! pre-reserved list of node pointers.
+//! A [`Dpc`] is embedded **inline** in its owning struct, so queuing one allocates nothing: the
+//! queue is a pre-reserved list of node pointers.
 //!
 //! ## One queue, drained by every CPU
 //!
-//! The queue is global, and every CPU drains it at its interrupt tails — the timer's and a
-//! device's — so a DPC runs on whichever CPU gets to it first. `queued` is cleared before the
-//! handler runs, so a DPC queued again while it runs can run on a second CPU at the same time:
-//! a handler must tolerate a concurrent instance of itself.
+//! The queue is global and every CPU drains it at its interrupt tails (the timer's and a device's),
+//! so a DPC runs on whichever CPU gets to it first. `queued` is cleared before the handler runs, so
+//! a DPC queued again while it runs can run on a second CPU at the same time: a handler must
+//! tolerate a concurrent instance of itself.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libkern::lockrank::LockRank;
 use crate::libkern::{AllocError, IrqSpinLock, KVec};
 
-/// Capacity of the DPC queue. Bounded by the number of distinct `Dpc` objects
-/// (each is queued at most once, via its `queued` flag), so a small fixed
-/// reserve is plenty for Phase 2 (a handful of device IRPs / `InterruptObject`s).
+/// Capacity of the DPC queue. Each `Dpc` is queued at most once (its `queued` flag), so the bound
+/// is the number of distinct `Dpc` objects, and a small fixed reserve is plenty.
 const DPC_RESERVE: usize = 64;
 
 /// A deferred procedure call: `handler(ctx)`, run when the queue is drained.
 ///
-/// Embed it inline in an owning struct and `'static`-place it (or own it within
-/// a heap object that outlives any queued reference). [`Dpc::new`] is `const` so
-/// a `static Dpc` is possible.
+/// Embed it inline in an owning struct and `'static`-place it (or own it within a heap object that
+/// outlives any queued reference); [`Dpc::new`] is `const` so a `static Dpc` is possible.
 pub struct Dpc {
     handler: fn(*mut ()),
     ctx: *mut (),
-    /// Set while queued — dedups a double-`enqueue`; cleared just before the
-    /// handler runs (so a handler may re-`enqueue` the same DPC).
+    /// Set while queued, deduping a double-`enqueue`; cleared just before the handler runs.
     queued: AtomicBool,
 }
 
@@ -56,67 +49,55 @@ impl Dpc {
     }
 }
 
-/// The current CPU's pending-DPC queue (single-CPU stand-in — see the module
-/// docs). A leaf `IrqSpinLock`: only ever held alone (push on enqueue; the drain
-/// snapshots-and-clears under it, then runs handlers with it **released**), so
-/// it never nests with `SCHED`. See `kernel/docs/lock-ordering.md`.
+/// The pending-DPC queue. A leaf `IrqSpinLock`, only ever held alone (push on enqueue; the drain
+/// snapshots-and-clears under it, then runs handlers with it **released**), so it never nests with
+/// `SCHED`. See `kernel/docs/lock-ordering.md`.
 static DPC_QUEUE: IrqSpinLock<KVec<usize>> = IrqSpinLock::new(LockRank::Leaf, KVec::new());
 
-/// Reserve the DPC queue's backing storage. Call once at boot, after the
-/// allocator is up and **before** interrupts are armed (the first ISR may
-/// `enqueue`). The only allocation the queue ever makes — `enqueue` stays within
-/// the reserve, so it never allocates in interrupt context.
+/// Reserve the DPC queue's backing storage, once at boot after the allocator is up and **before**
+/// interrupts are armed (the first ISR may `enqueue`). The only allocation the queue makes:
+/// `enqueue` stays within the reserve, so it never allocates in interrupt context.
 pub fn init() -> Result<(), AllocError> {
-    // Reserve **outside** the queue lock, then move the reserved list in. Reserving under
-    // the lock would allocate (slab, rank 6a) while holding a leaf-ranked lock — an order
-    // inversion the debug tracker correctly rejects (Slice D4 found it here on the first
-    // armed boot). Benign in itself, being once at boot on one CPU with interrupts still
-    // masked, but the lock is only *honestly* a leaf if nothing under it ever allocates —
-    // and that is the property the rest of the DPC path depends on.
+    // Reserve **outside** the queue lock, then move the list in: reserving under it would allocate
+    // (slab, rank 6a) while holding a leaf-ranked lock, an order inversion the debug tracker
+    // rejects. The lock is only honestly a leaf if nothing under it ever allocates.
     let mut reserved = KVec::new();
     reserved.try_reserve(DPC_RESERVE)?;
     *DPC_QUEUE.lock() = reserved;
     Ok(())
 }
 
-/// Queue `dpc` to run at the next [`run_pending`]. Idempotent — a `Dpc` already
-/// queued is not queued twice. Safe to call from IRQ context.
+/// Queue `dpc` to run at the next [`run_pending`]; idempotent. Safe to call from IRQ context.
 pub fn enqueue(dpc: &Dpc) {
     enqueue_into(&DPC_QUEUE, dpc);
 }
 
-/// Run every pending DPC, looping until empty so a DPC that enqueues another is caught. Call at
-/// the interrupt-dispatch tail.
+/// Run every pending DPC, looping until the queue is empty so a DPC that enqueues another is
+/// caught. Call at the interrupt-dispatch tail.
 ///
-/// Runs with IF=0 (interrupt context — the gate masks interrupts), so no nested
-/// IRQ can enqueue mid-drain and no re-entrancy guard is needed. Each handler
-/// may take `SCHED` briefly (the queue lock is released before it runs) but must
-/// not block.
+/// Runs with IF=0 (the gate masks interrupts), so no nested IRQ can enqueue mid-drain and no
+/// re-entrancy guard is needed. A handler may take `SCHED` briefly (the queue lock is released
+/// first) but must not block.
 pub fn run_pending() {
     run_pending_in(&DPC_QUEUE);
 }
 
-// --- Core logic, parameterised over the queue so it is host-testable on a
-//     fresh local queue (the production one is a global static). ---
-
-// The queue stores each `&Dpc` as a `usize` address (a raw `*mut Dpc` is not
-// `Send`, so a `KVec<*mut Dpc>` static would not be `Sync`); this is the same
-// fn-pointer-as-usize idiom the IDT device-handler registry uses.
+// The core logic takes the queue as a parameter so a host test can use a fresh local one. The queue
+// stores each `&Dpc` as a `usize` address: a raw `*mut Dpc` is not `Send`, so a `KVec<*mut Dpc>`
+// static would not be `Sync`.
 fn enqueue_into(queue: &IrqSpinLock<KVec<usize>>, dpc: &Dpc) {
     if dpc.queued.swap(true, Ordering::AcqRel) {
         return; // already queued
     }
     let addr = dpc as *const Dpc as usize;
     let mut q = queue.lock();
-    // The queue is bounded by the number of distinct DPCs (dedup above), so it stays within
-    // the reserve. **Enforced by the push, not by the assertion beside it**: `try_push`
-    // *grows*, and this runs at an interrupt tail, where `kmalloc` under the queue lock is
-    // the forbidden pattern outright. The `debug_assert` would not have caught it — growth
-    // happens first and succeeds, so the assertion never fires (kernel audit C.1(c)).
+    // Bounded by the number of distinct DPCs (dedup above), so it stays within the reserve.
+    // **Enforced by the push, not by the assertion beside it**: `try_push` *grows*, and `kmalloc`
+    // under the queue lock at an interrupt tail is forbidden outright; the `debug_assert` would not
+    // fire, as growth happens first and succeeds.
     debug_assert!(q.len() < q.capacity(), "DPC queue capacity exceeded");
     if q.push_within_capacity(addr).is_err() {
-        // `addr` is a `usize`; there is nothing to leak or drop. Losing a DPC would strand
-        // whatever it was going to complete, so this is fatal rather than silent.
+        // Losing a DPC would strand whatever it was going to complete, so this is fatal.
         panic!("DPC queue reserve exhausted — more distinct DPCs than the queue was sized for");
     }
 }
@@ -176,7 +157,6 @@ mod tests {
         enqueue_into(&q, &d);
         run_pending_in(&q);
         assert_eq!(c.load(Ordering::Relaxed), 1);
-        // Queue is empty afterwards; a second drain is a no-op.
         run_pending_in(&q);
         assert_eq!(c.load(Ordering::Relaxed), 1);
     }
@@ -214,7 +194,6 @@ mod tests {
         let d = dpc_for(&c);
         enqueue_into(&q, &d);
         run_pending_in(&q);
-        // `queued` was cleared during the drain, so it can be queued again.
         enqueue_into(&q, &d);
         run_pending_in(&q);
         assert_eq!(c.load(Ordering::Relaxed), 2);
