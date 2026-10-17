@@ -1,16 +1,6 @@
-//! `libviews` — **the view broker's client**: asking the broker to run a program in a view, and the
-//! channel plumbing that carries the asking (`docs/spec/rsproto-views-ops.md`).
-//!
-//! **Below `with` because the desktop asks too** (administration Part F.3). The request was
-//! `with`'s own until the power menu's Restart and Shut down needed to make it, from `desktop-shell`,
-//! which cannot reach into a coreutil — `userspace/CLAUDE.md`'s rule for a helper with a second
-//! consumer. `with`, `account` and `desktop-shell` use it. The channel plumbing it speaks through
-//! is `libprompt::ipc`, which moved there with the prompts in administration Part G.2.
-//!
-//! **What stays with each caller is how it asks a person.** This crate asks no one: `with` prompts
-//! on its terminal for a password, with `libprompt`. The desktop has no graphical prompt yet (`docs/design/graphical-prompt.md`), so a
-//! policy asking for one is a refusal there, and [`decide`] lets it find that out before it closes
-//! a window.
+//! `libviews`: the view broker's client, below `with`, `account` and `desktop-shell`, which all
+//! ask it. The wire codec is `librsproto::views` (`docs/spec/rsproto-views-ops.md`); this crate
+//! asks no person anything, so a policy wanting a password is a refusal where no caller can prompt.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -29,8 +19,7 @@ use librsproto::views::{
 };
 use librsproto::{OP_TTY_TOKEN, TTY_TOKEN_LEN};
 
-/// The view broker's answer, as the outcome and its reason. An answer that does not read is a
-/// denial saying so.
+/// The broker's answer as outcome and reason; one that does not read is a denial.
 pub fn outcome(body: &[u8]) -> (Outcome, String) {
     match librsproto::views::parse_outcome(body) {
         Some((o, why)) => (o, String::from_utf8_lossy(why).into_owned()),
@@ -44,8 +33,7 @@ pub const BROKER_PATH: &[u8] = b"/dev/views";
 /// The request id [`request`] sends with. A password for the same request is sent with a later one.
 pub const REQUEST_ID: u64 = 1;
 
-/// **The broker, as `ns` reaches it**: a channel of its own at `ns`'s [`BROKER_PATH`], which the
-/// broker ties to the session whose namespace that is. `0` if there is none.
+/// A channel to the broker at `ns`'s [`BROKER_PATH`], tied to `ns`'s session; `0` if none.
 pub fn broker(ns: u64) -> u64 {
     ipc::lookup(ns, BROKER_PATH, RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT)
 }
@@ -57,8 +45,7 @@ pub enum Failed {
     TooLarge,
     /// It could not be sent, or the broker went away or ran past the deadline before answering.
     NoAnswer,
-    /// The broker answered with an error rather than an answer: for a listing, a policy that does
-    /// not read; for anything else, a broker that does not know the op.
+    /// An error answer: for a listing, an unreadable policy; else the broker lacks the op.
     Refused,
     /// The answer did not read.
     Garbled,
@@ -76,8 +63,7 @@ impl Failed {
     }
 }
 
-/// **What a request hands the program**: the namespace the broker builds the view from, and the
-/// program's streams. Each handle present moves to the broker with the request.
+/// The namespace and streams a request hands the program; each handle present moves to the broker.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Handed {
     /// The namespace to build the view from. The broker copies it, and never uses it as it is.
@@ -90,16 +76,12 @@ pub struct Handed {
     pub stderr: Option<u64>,
     /// The terminal the program may prompt on.
     pub terminal: Option<u64>,
-    /// **A `Tty::Token` from the caller's own terminal** ([`token`]), so a password typed there
-    /// can be remembered for it (the laptop polish's Part A). Not a handle: the broker redeems it
-    /// with the terminal server itself, rather than trusting the terminal handle above to say which
-    /// terminal it is.
+    /// A `Tty::Token` ([`token`]); not a handle: the broker redeems it with the terminal server.
     pub token: Option<[u8; TTY_TOKEN_LEN]>,
 }
 
 impl Handed {
-    /// The request's handle bits and its handles **in the order the broker takes them**: the
-    /// namespace, then each stream present, in the order of its bit.
+    /// The handle bits and handles in the order the broker takes them: namespace, then streams.
     pub fn wire(&self) -> (u8, Vec<u64>) {
         let mut bits = 0u8;
         let mut handles = alloc::vec![self.ns];
@@ -118,13 +100,9 @@ impl Handed {
     }
 }
 
-/// **Ask the broker on `ch` to run `program` with `args` in `view`**, handing it `handed`: the
-/// outcome and its reason, or why there was none.
-///
-/// `env` is a serialised record for the program's environment, or empty for none; the broker sets
-/// `view` in it either way. The request goes as [`REQUEST_ID`]. **Every handle in `handed` is gone
-/// when this returns**: sent, the broker's; not sent, closed here. An outcome of
-/// [`Outcome::NeedPassword`] is answered with [`password`], on the same channel.
+/// Ask the broker on `ch` to run `program` in `view`; every handle in `handed` is gone on return
+/// (sent, or closed here). [`Outcome::NeedPassword`] is answered by [`password`]. `env` is a
+/// serialised record or empty; the broker sets `view` in it.
 pub fn request(
     ch: u64,
     view: &str,
@@ -157,13 +135,11 @@ pub fn request(
     }
 }
 
-/// The request id a [`token`] is asked as. A terminal answers by id, and this one is never a read's.
+/// The request id a [`token`] is asked as; a terminal answers by id, and this is never a read's.
 const TOKEN_REQUEST_ID: u64 = 0x544f_4b45;
 
-/// **A one-time token for terminal `term`** (`Tty::Token`): what a request carries so the broker
-/// can learn, from the terminal server and not from this caller, which terminal it came from.
-/// `None` if `term` does not answer one by `deadline` — it may not be a terminal at all — and then
-/// the request is simply asked for a password.
+/// A one-time `Tty::Token` for `term`, so the broker learns the terminal from its server; `None`
+/// if `term` does not answer by `deadline`, and the request then asks for a password.
 pub fn token(term: u64, deadline: u64) -> Option<[u8; TTY_TOKEN_LEN]> {
     if !ipc::send(term, OP_TTY_TOKEN, TOKEN_REQUEST_ID, &[], &[]) {
         return None;
@@ -174,8 +150,7 @@ pub fn token(term: u64, deadline: u64) -> Option<[u8; TTY_TOKEN_LEN]> {
     }
 }
 
-/// **Forget every password the session on `ch` has remembered** (`with --forget`), every
-/// terminal's.
+/// Forget every password, on every terminal, that the session on `ch` has remembered.
 pub fn forget(ch: u64, deadline: u64) -> Result<(), Failed> {
     if !ipc::send(ch, OP_VIEWS_FORGET, REQUEST_ID, &[], &[]) {
         return Err(Failed::NoAnswer);
@@ -187,8 +162,7 @@ pub fn forget(ch: u64, deadline: u64) -> Result<(), Failed> {
     }
 }
 
-/// **A password for the request waiting on `ch`**, sent as `request_id`: the broker's answer, once
-/// it has checked it — after the session's delay, when the last one was wrong.
+/// A password for the request waiting on `ch`: the broker's answer, after the session's delay.
 pub fn password(ch: u64, request_id: u64, pw: &[u8]) -> Result<(Outcome, String), Failed> {
     match ipc::call(ch, OP_VIEWS_PASSWORD, request_id, pw, &[]) {
         Some((false, body)) => Ok(outcome(&body)),
@@ -197,11 +171,10 @@ pub fn password(ch: u64, request_id: u64, pw: &[u8]) -> Result<(Outcome, String)
     }
 }
 
-/// One view a person may use, as the broker lists it: one per view a rule names, in the policy's
-/// order.
+/// One view a person may use, one per view a rule names, in the policy's order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
-    /// The view.
+    /// The view's name.
     pub view: String,
     /// The programs the rule lets them run in it: `*`, or names separated by spaces.
     pub run: String,
@@ -209,7 +182,7 @@ pub struct Row {
     pub password: bool,
 }
 
-/// **The views the person `ch`'s session belongs to may use.**
+/// The views the person `ch`'s session belongs to may use.
 pub fn list(ch: u64, deadline: u64) -> Result<Vec<Row>, Failed> {
     if !ipc::send(ch, OP_VIEWS_LIST, REQUEST_ID, &[], &[]) {
         return Err(Failed::NoAnswer);
@@ -233,13 +206,9 @@ pub fn list(ch: u64, deadline: u64) -> Result<Vec<Row>, Failed> {
     }
 }
 
-/// **What the broker would answer a request for `program` in `view`** — the outcome and its
-/// reason — asked with `Decide`, which runs nothing.
-///
-/// **The broker's own rule, not a reading of `List`.** This was a client applying the rule to the
-/// listing's rows until the PR #346 review found the broker cuts a listing at 2 KiB: a row past the
-/// cut read as "no rule", refusing what the policy allows. A policy changed between this and the
-/// request is the request's to answer: this is a way to know before asking, not a way to ask.
+/// What the broker would answer a request, via `Decide` (runs nothing); not `List`, cut at 2 KiB.
+/// A policy changed between this and the request is the request's to answer: this is a way to
+/// know before asking, not a way to ask.
 pub fn decide(ch: u64, view: &str, program: &str, deadline: u64) -> Result<(Outcome, String), Failed> {
     let mut body = [0u8; 512];
     let Some(n) = build_decide(&mut body, view.as_bytes(), program.as_bytes()) else {
@@ -267,7 +236,6 @@ mod tests {
         // A gap is closed up: the broker counts the bits, not the slots.
         let some = Handed { ns: 1, stdout: Some(3), terminal: Some(5), ..Handed::default() };
         assert_eq!(some.wire(), (REQ_STDOUT | REQ_TERMINAL, alloc::vec![1, 3, 5]));
-        // The desktop's: the namespace alone.
         assert_eq!(Handed { ns: 7, ..Handed::default() }.wire(), (0, alloc::vec![7]));
     }
 
