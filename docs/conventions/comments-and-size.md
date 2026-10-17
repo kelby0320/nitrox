@@ -26,6 +26,13 @@ What was done, when, and in which PR, review, phase or part belongs in the commi
 
 Each failure names the file and line and says how to fix it.
 
+**A crate's whole budget**: `cargo xtask check-comments --ratio DIR` counts the tracked Rust files
+under `DIR` the same way and fails when their comment lines pass 0.15 of their code, or, where it
+is more, a line for each `pub` item and field and each `TODO(tag)` — the doc comments and
+deferrals the rules require. **`cargo xtask check-comments --only-comments [REV]`** fails a commit
+(`HEAD` by default) that changes anything but comments: a file added, removed or not Rust, or a
+Rust file's code once its `//` comments are taken out, a `//` inside a string literal being code.
+
 **The edit hook.** Every Claude Code session in this repository runs
 `tools/target/release/xtask hook-comments` after each `Edit` or `Write` of a Rust file
 (`.claude/settings.json`). When the edit adds more comment lines than it removes, three or more
