@@ -1,12 +1,10 @@
 //! The block I/O core — building and dispatching a block [`Irp`].
 //!
 //! A block [`DeviceNode`](crate::object::DeviceNode) carries a [`BlockBackend`]
-//! (a submit function + context) installed by the driver that claimed it (the
-//! ramdisk here; AHCI in Part 3). [`dispatch_block_irp`] builds an [`Irp`] for a
-//! read/write, wraps it in an owning [`IrpBox`], arms its completion DPC, and
-//! hands it to the backend. The backend completes the IRP asynchronously; the
-//! completion DPC signals the request's `PendingOperation` and hands the box to thread
-//! context for reclamation — it must not free it itself (see [`irp_complete_dpc`]).
+//! (a submit function + context) installed by its driver. [`dispatch_block_irp`]
+//! builds an [`Irp`] in an owning [`IrpBox`], arms its completion DPC and hands
+//! it to the backend; the DPC signals the request's `PendingOperation` and leaves
+//! the box for thread context to free (see [`irp_complete_dpc`]).
 //!
 //! See `docs/architecture/drivers-and-irps.md` and `docs/spec/irp-layout.md`.
 
@@ -20,54 +18,42 @@ use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
 
 /// A block device's I/O entry point, stored on its [`DeviceNode`]. `submit`
-/// receives the in-flight `*mut Irp` and the backend's own `ctx`; it programs the
-/// device (or, for the ramdisk, performs the transfer and queues the IRP's
-/// completion DPC) and returns — it must **not** block.
+/// takes the in-flight `*mut Irp` and the backend's `ctx`, programs the device
+/// (the ramdisk transfers and queues the completion DPC) and returns; it must
+/// **not** block.
 #[derive(Copy, Clone)]
 pub struct BlockBackend {
     /// Submit an IRP to the device.
     pub submit: fn(irp: *mut Irp, ctx: *mut ()),
-    /// Drive the in-flight command to completion by **polling** (no interrupts),
-    /// then run its completion DPC — for synchronous kernel reads at boot, before
-    /// interrupts are enabled (see [`read_blocking`]). A partition delegates to
-    /// its disk's poll; the disk driver polls its hardware.
+    /// Drive the in-flight command to completion by **polling**, then run its
+    /// completion DPC: for synchronous kernel reads at boot, before interrupts
+    /// are enabled (see [`read_blocking`]). A partition delegates to its disk.
     pub poll: fn(ctx: *mut ()),
     /// Device context passed back to `submit`/`poll` (e.g. the controller).
     pub ctx: *mut (),
-    /// The most physical fragments this device can describe in **one** command.
-    ///
-    /// **A device constraint, published by the device**, because only the driver
-    /// knows it: AHCI's is its command table's PRDT capacity, and a ramdisk has
-    /// none. [`dispatch_block_irp`] refuses a transfer that would need more,
-    /// which is what keeps a driver from writing past the structure it programs.
-    ///
-    /// Expressed in fragments rather than bytes on purpose. The hardware limit is
-    /// a *count of descriptors*; converting it to a byte ceiling would need the
-    /// caller to reproduce how a byte range splits into pages, and a second copy
-    /// of that arithmetic is a second thing to get wrong. The exact count is what
-    /// `build_frags` already returns.
+    /// The most physical fragments this device can describe in **one** command:
+    /// a device constraint only the driver knows (AHCI's is its command table's
+    /// PRDT capacity; a ramdisk has none). [`dispatch_block_irp`] refuses a
+    /// transfer needing more, which keeps a driver from writing past the
+    /// structure it programs. Counted in fragments because the hardware limit is
+    /// a descriptor count.
     pub max_frags: u32,
 }
 
 // SAFETY: a `BlockBackend`'s raw `ctx` points at a device structure that lives
-// for the kernel's lifetime. `submit` and `poll` dereference it on **whichever CPU
-// submits** — a root disk takes I/O from the fs-server and from page-cache fills on
-// any CPU — so each device synchronises its own mutable state: AHCI through its port
-// lock and single in-flight slot, the RAM disk through its per-transfer lock, and a
-// partition by being an immutable window onto its disk's backend. (This said "only
-// on the single CPU that services the device" until 2026-09-14, which was never
-// true of AHCI either — PR #298 review.) These impls let a `DeviceNode` holding one
-// be `Send`/`Sync` like the rest of the type-erased object graph.
+// for the kernel's lifetime. `submit` and `poll` dereference it on whichever CPU
+// submits, so each device synchronises its own mutable state: AHCI through its
+// port lock and single in-flight slot, the RAM disk through its per-transfer
+// lock, a partition by being an immutable window onto its disk's backend.
 unsafe impl Send for BlockBackend {}
 // SAFETY: as above.
 unsafe impl Sync for BlockBackend {}
 
-/// The kernel-internal owning wrapper around an in-flight [`Irp`]. `#[repr(C)]`
-/// with `irp` **first**, so `*mut IrpBox` and `*mut Irp` share an address — the
-/// completion DPC recovers the box from the `irp` pointer. The `ObjectRef`s keep
-/// the raw pointers inside `irp` (its PO, buffer frames, device) valid for the
-/// IRP's lifetime; `frags` backs `irp.buffer`. None of this is the hashed `Irp`
-/// layout — a Tier 2 module only ever sees `*mut Irp`.
+/// The owning wrapper around an in-flight [`Irp`]. `#[repr(C)]` with `irp`
+/// **first**, so `*mut IrpBox` and `*mut Irp` share an address and the
+/// completion DPC recovers the box from the `irp` pointer. Its `ObjectRef`s keep
+/// the raw pointers inside `irp` valid; `frags` backs `irp.buffer`. None of this is the
+/// hashed `Irp` layout: a Tier 2 module only ever sees `*mut Irp`.
 #[repr(C)]
 pub(crate) struct IrpBox {
     irp: Irp,
@@ -77,25 +63,21 @@ pub(crate) struct IrpBox {
     _po: ObjectRef,
     _buffer: ObjectRef,
     _device: ObjectRef,
-    /// Intrusive link for [`RECLAIM`], used only between completion and reclamation.
-    ///
-    /// Threading the list through the box itself is what makes the hand-off in
-    /// [`irp_complete_dpc`] allocation-free *and* unbounded: a fixed-capacity parking
-    /// array would have to do something on overflow, and the only thing available would be
-    /// to drop in place — which is the bug this exists to prevent.
+    /// Intrusive link for [`RECLAIM`], used between completion and reclamation.
+    /// It makes the hand-off in [`irp_complete_dpc`] allocation-free and
+    /// unbounded: a fixed parking array would have to drop in place on overflow.
     reclaim_next: *mut IrpBox,
 }
 
-/// Build the fragment list covering the buffer byte range `[buf_offset,
-/// buf_offset + length)` across `frames` (each one page), splitting at page
-/// boundaries — the PRDT-style description of exactly this transfer's region.
-/// The caller has already validated `buf_offset + length <= frames.len() * PAGE`.
+/// Build the PRDT-style fragment list covering `[buf_offset, buf_offset +
+/// length)` across `frames` (a page each), splitting at page boundaries. The
+/// caller has validated the range against `frames.len() * PAGE`.
 fn build_frags(frames: &[PhysAddr], buf_offset: u64, length: u64) -> Result<KVec<PhysFrag>, KError> {
     let mut frags: KVec<PhysFrag> = KVec::new();
     let mut pos = buf_offset;
     let mut remaining = length;
-    // Worst case one fragment per page touched, plus a partial head — reserve
-    // generously so `try_push` never allocates mid-build.
+    // Worst case one fragment per page plus a partial head; reserved up front so
+    // `try_push` never allocates.
     let max_frags = (length / PAGE_SIZE as u64 + 2) as usize;
     frags.try_reserve(max_frags).map_err(|_| KError::OutOfMemory)?;
     while remaining > 0 {
@@ -111,16 +93,14 @@ fn build_frags(frames: &[PhysAddr], buf_offset: u64, length: u64) -> Result<KVec
     Ok(frags)
 }
 
-/// Build a block IRP for `opcode` on the block `device`, transferring `length`
-/// bytes between device offset `dev_offset` and the `buffer` `MemoryObject`'s
-/// byte range `[buf_offset, ...)`, completing `po` when done. The three handles'
-/// types/rights/bounds are the caller's responsibility (the syscall validates
-/// them synchronously; the boot self-test passes valid ones).
+/// Build a block IRP for `opcode` on `device`, moving `length` bytes between
+/// device offset `dev_offset` and the `buffer` `MemoryObject`'s range
+/// `[buf_offset, ...)`, completing `po`. Handle types, rights and bounds are the
+/// caller's responsibility.
 ///
-/// Returns `Err` **before the operation starts**, so the caller rolls back the `po`
-/// handle: `OutOfMemory` if the fragment list or the IRP cannot be allocated,
-/// `Unsupported` if the node carries no block backend, and `InvalidArgument` if the
-/// transfer needs more fragments than the device can describe in one command.
+/// Returns `Err` **before the operation starts**, so the caller rolls back `po`:
+/// `OutOfMemory`, `Unsupported` without a block backend, `InvalidArgument` if
+/// the transfer needs more fragments than the device can describe in one command.
 pub fn dispatch_block_irp(
     device: &ObjectRef,
     buffer: &ObjectRef,
@@ -137,16 +117,14 @@ pub fn dispatch_block_irp(
     // SAFETY: `buffer` pins a live `MemoryObject` (type checked by the caller).
     let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
     let frags = build_frags(mo.frames(), buf_offset, length)?;
-    // **The device's own limit, checked against the exact fragment count.** A
-    // transfer larger than one command can describe is refused here rather than
-    // truncated or split: `sys_io_submit` bounds `buf_offset + length` against the
-    // buffer's size and nothing else, so without this a caller holding a block
-    // device handle could make the driver write PRDT entries past the table it
-    // owns — and the controller would then DMA to whatever addresses followed it.
+    // **The device's own limit, checked against the exact fragment count.**
+    // Refused rather than truncated or split: `sys_io_submit` bounds the range
+    // only against the buffer's size, so a caller holding a block device handle
+    // could otherwise make the driver write PRDT entries past its table and the
+    // controller DMA past it.
     //
-    // Splitting a large transfer across several commands is the better answer and
-    // is not this fix: it needs one `PendingOperation` to outlive several IRPs.
-    // `TODO(block-transfer-split)`.
+    // Splitting across several commands needs one `PendingOperation` to outlive
+    // several IRPs. `TODO(block-transfer-split)`.
     if frags.len() > backend.max_frags as usize {
         return Err(KError::InvalidArgument);
     }
@@ -178,9 +156,8 @@ pub fn dispatch_block_irp(
     .map_err(|_| KError::OutOfMemory)?;
     let bx_ptr = KBox::into_raw(bx).as_ptr();
 
-    // Finish wiring now that the box (and its `frags` buffer) have a stable
-    // address: point `irp.buffer` at `frags`, and arm the completion DPC at the
-    // box. `irp` is the first field, so `bx_ptr` is also the `*mut Irp`.
+    // Finish wiring now that the box has a stable address: point `irp.buffer` at
+    // `frags` and arm the completion DPC at the box (`irp` is first).
     // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned `IrpBox`.
     let irp_ptr = unsafe {
         let bx = &mut *bx_ptr;
@@ -190,34 +167,27 @@ pub fn dispatch_block_irp(
         &mut bx.irp as *mut Irp
     };
 
-    // Hand the IRP to the device. It completes asynchronously: the backend (or,
-    // for real hardware, the completion ISR) queues `irp.dpc`, drained at the
-    // interrupt-dispatch tail.
+    // Completes asynchronously: the backend (or completion ISR) queues `irp.dpc`.
     (backend.submit)(irp_ptr, backend.ctx);
     Ok(())
 }
 
-/// **The most fragments `device` describes in one command** — its
-/// [`max_frags`](BlockBackend::max_frags) — or `None` for a node with no block backend. What
-/// sizes the page cache's runs ([`dispatch_block_irp_into_frames`]).
+/// **The most fragments `device` describes in one command**
+/// ([`max_frags`](BlockBackend::max_frags)), or `None` without a block backend;
+/// it sizes the page cache's runs ([`dispatch_block_irp_into_frames`]).
 pub fn max_frags(device: &ObjectRef) -> Option<u32> {
     // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
     dn.block_backend().map(|b| b.max_frags)
 }
 
-/// Dispatch a block IRP that transfers `length` bytes between device byte offset
-/// `dev_offset` and **physical `frames`**, a page each and in order (page-cache frames),
-/// completing `po`. Unlike [`dispatch_block_irp`] the DMA target is raw frames, not a
-/// `MemoryObject` — the **Model A** page cache's fills and write-backs, zero-copy, and since
-/// Phase 6 Part H.4 a run of a file's pages in one command. `pin` is an owning reference that
-/// keeps the frames' owner (the `FileObject`) alive for the IRP's lifetime — the box holds it in
-/// the `_buffer` slot. `length` must be `≤ frames.len() * PAGE_SIZE`.
-///
-/// `Err` before anything starts, for the caller to roll `po` back: `OutOfMemory` on allocation
-/// failure, `Unsupported` for a node with no block backend, and `InvalidArgument` for more
-/// frames than the device describes in one command — a caller sizes its runs by
-/// [`max_frags`].
+/// Dispatch a block IRP moving `length` bytes between device offset `dev_offset`
+/// and **physical `frames`** (a page each, in order), completing `po`. The DMA
+/// target is raw page-cache frames, not a `MemoryObject`: zero-copy fills and
+/// write-backs, a run of a file's pages in one command. `pin` keeps the frames'
+/// owner (the `FileObject`) alive, held in the box's `_buffer`. `length` must be
+/// `≤ frames.len() * PAGE_SIZE`. Errors as [`dispatch_block_irp`]; a caller sizes
+/// its runs by [`max_frags`].
 pub fn dispatch_block_irp_into_frames(
     device: &ObjectRef,
     frames: &[PhysAddr],
@@ -234,8 +204,7 @@ pub fn dispatch_block_irp_into_frames(
         return Err(KError::InvalidArgument);
     }
 
-    // A page-sized fragment for each frame `[0, length)` covers, refused past the device's limit
-    // as [`dispatch_block_irp`] refuses one.
+    // A page-sized fragment per frame, refused past the device's limit as above.
     let frags = build_frags(frames, 0, length)?;
     if frags.len() > backend.max_frags as usize {
         return Err(KError::InvalidArgument);
@@ -279,18 +248,18 @@ pub fn dispatch_block_irp_into_frames(
     Ok(())
 }
 
-/// Dispatch a **flush** of the block `device`: an IRP with no buffer and no range that
-/// completes `po` once the device has written its volatile cache to its medium
-/// (administration Part C.2). A partition passes it to its disk, a RAM disk completes it at
-/// once, and AHCI issues `FLUSH CACHE EXT`. `Err` before anything starts: `Unsupported` if the
-/// node has no block backend, `OutOfMemory` if the IRP cannot be allocated.
+/// Dispatch a **flush** of the block `device`: an IRP with no buffer and no range
+/// that completes `po` once the device has written its volatile cache to its
+/// medium (a partition passes it to its disk, a RAM disk completes it at once).
+/// `Err` before anything starts: `Unsupported` without a block backend,
+/// `OutOfMemory` if the IRP cannot be allocated.
 pub fn dispatch_block_flush(device: &ObjectRef, po: &ObjectRef) -> Result<(), KError> {
     dispatch_block_control(device, po, IrpOp::Flush)
 }
 
-/// Dispatch an IRP that moves no data — a [`Flush`](IrpOp::Flush), or since Phase 6 Part G a
-/// [`Rescan`](IrpOp::Rescan) of a disk's table — with no buffer and no range, completing `po`.
-/// Errors as [`dispatch_block_flush`]'s.
+/// Dispatch an IRP that moves no data, a [`Flush`](IrpOp::Flush) or a
+/// [`Rescan`](IrpOp::Rescan) of a disk's table, completing `po`. Errors as
+/// [`dispatch_block_flush`]'s.
 pub fn dispatch_block_control(device: &ObjectRef, po: &ObjectRef, op: IrpOp) -> Result<(), KError> {
     // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
@@ -317,10 +286,9 @@ pub fn dispatch_block_control(device: &ObjectRef, po: &ObjectRef, op: IrpOp) -> 
     Ok(())
 }
 
-/// Boxes whose IRP has completed, waiting to be reclaimed in **thread** context.
-///
-/// An `IrqSpinLock` because [`irp_complete_dpc`] pushes from the interrupt-dispatch tail:
-/// masking interrupts is allocation-free, which is the whole constraint here.
+/// Boxes whose IRP has completed, awaiting reclamation in **thread** context. An
+/// `IrqSpinLock` because [`irp_complete_dpc`] pushes from the interrupt-dispatch
+/// tail; masking interrupts is allocation-free.
 static RECLAIM: IrqSpinLock<ReclaimHead> = IrqSpinLock::new(LockRank::Leaf, ReclaimHead(core::ptr::null_mut()));
 
 /// Head of the intrusive reclaim list.
@@ -332,21 +300,14 @@ struct ReclaimHead(*mut IrpBox);
 // above — a raw pointer into memory this module owns for a well-defined interval.
 unsafe impl Send for ReclaimHead {}
 
-/// Drop every completed IRP box. **Thread context only** — this is where the frees that
-/// [`irp_complete_dpc`] must not do actually happen.
-///
-/// Called from `sched::reap_pending`, which is already the home for deferred drops: thread
-/// context, no `SCHED` held, not IRQ context.
-///
-/// **What accumulates between drains is larger than it looks.** Each parked box pins its
-/// `_buffer` — an `ObjectRef` to the transfer's `MemoryObject` — so a machine that never
-/// reaches a drain point holds every completed transfer's buffer object, not merely
-/// `size_of::<IrpBox>()` per completion. Bounded by "completions since the last
-/// `reap_pending`", which `idle_body` keeps small in practice (PR #177 review, finding 7).
+/// Drop every completed IRP box. **Thread context only**: the frees
+/// [`irp_complete_dpc`] must not do happen here, called from
+/// `sched::reap_pending`. Each parked box pins its `_buffer`, so until a drain a
+/// machine holds every completed transfer's buffer object; this is bounded by
+/// completions since the last `reap_pending`, which `idle_body` keeps small.
 pub fn reclaim_completed() {
-    // Take the whole list in one swap, then drop outside the lock — a drop reaches the
-    // allocator, and holding an IRQ-masking lock across it would reintroduce a smaller
-    // version of the same hazard.
+    // Take the whole list in one swap and drop outside the lock: a drop reaches
+    // the allocator, which an IRQ-masking lock must not be held across.
     let mut head = {
         let mut g = RECLAIM.lock();
         core::mem::replace(&mut g.0, core::ptr::null_mut())
@@ -363,8 +324,8 @@ pub fn reclaim_completed() {
     }
 }
 
-/// [`irp_complete_dpc`], for another module's host test to complete an IRP its recording device
-/// took, as the device's completion would.
+/// [`irp_complete_dpc`], for a host test in another module to complete an IRP its
+/// recording device took.
 ///
 /// # Safety
 ///
@@ -374,9 +335,10 @@ pub(crate) unsafe fn complete_for_test(irp: *mut Irp) {
     irp_complete_dpc(irp as *mut ());
 }
 
-/// The IRP completion DPC: signal the request's `PendingOperation` with the IRP's terminal
-/// status (and bytes transferred), then **hand the `IrpBox` to [`reclaim_completed`]** —
-/// it does not drop the box, and must not. `ctx` is the `*mut IrpBox` (== `*mut Irp`).
+/// The IRP completion DPC: signal the request's `PendingOperation` with the
+/// terminal status and bytes transferred, then **hand the `IrpBox` to
+/// [`reclaim_completed`]**; it must not drop it. `ctx` is the `*mut IrpBox`
+/// (== `*mut Irp`).
 fn irp_complete_dpc(ctx: *mut ()) {
     let bx_ptr = ctx as *mut IrpBox;
     // SAFETY: `ctx` is the box pointer armed in `dispatch_block_irp`; the box is
@@ -385,20 +347,15 @@ fn irp_complete_dpc(ctx: *mut ()) {
         let irp = &(*bx_ptr).irp;
         (irp.status, irp.transferred, irp.completion as *mut ())
     };
-    // Deliver the outcome through the PO (result payload = bytes transferred).
     // SAFETY: the box's `_po` pins the `PendingOperation` until thread context reclaims the box.
     unsafe { crate::sched::complete_pending_op(po, status, transferred) };
     // **Hand the box to thread context; do not drop it here.** Dropping releases
-    // `_po`/`_buffer`/`_device` and the `frags` backing, and every one of those reaches
-    // `SlabCache::free`, whose lock is a plain `SpinLock` — preemption off, interrupts on.
-    // This DPC runs at the interrupt-dispatch tail, on top of whatever the CPU was doing,
-    // so if it interrupted a thread that already held that lock the free spins forever on
-    // a lock the frame beneath it can never release, and every other CPU wanting that cache
-    // queues behind it. That is the `test-qemu` hang, confirmed by a stack dump showing
-    // exactly this DPC in `SlabCache::free` while another CPU sat in `SlabCache::alloc` on
-    // the same cache. `kernel/CLAUDE.md` states the rule — "freeing counts as allocating"
-    // — and `wake_entropy_seed_waiters` is the same fix for the entropy path.
-    //
+    // `_po`/`_buffer`/`_device` and `frags`, each of which reaches
+    // `SlabCache::free`, whose lock is a plain `SpinLock` (preemption off,
+    // interrupts on). This DPC runs on top of whatever the CPU was doing, so if it
+    // interrupted a thread already holding that lock the free would spin forever
+    // on a lock the frame beneath it can never release. `kernel/CLAUDE.md`:
+    // "freeing counts as allocating".
     // SAFETY: the box is live and owned by this completion; nothing else references it
     // once the IRP has completed, so writing its link and publishing it is sound.
     unsafe {
@@ -408,13 +365,10 @@ fn irp_complete_dpc(ctx: *mut ()) {
     }
 }
 
-/// Read `count` 512-byte sectors starting at `lba` from the block `device`
-/// **synchronously** into `dst`, by polling — for kernel-internal reads at boot,
+/// Read `count` 512-byte sectors from `lba` of the block `device`
+/// **synchronously** into `dst`, by polling, for kernel-internal reads at boot
 /// before interrupts are enabled (the GPT driver). Returns `false` on any
-/// failure (allocation, bad device, short `dst`, or a device error).
-///
-/// Submits a normal IRP, then drives it to completion via the device's
-/// [`BlockBackend::poll`] (no IRQ needed), and copies the result out.
+/// failure (allocation, bad device, short `dst`, device error).
 pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -> bool {
     // SAFETY: `device` pins a live `DeviceNode`.
     let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
@@ -450,7 +404,6 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
     if dispatch_block_irp(device, &buf_ref, &po_ref, IoOpcode::Read, offset, 0, len as u64).is_err() {
         return false;
     }
-    // Poll the in-flight command to completion + run its DPC (no interrupts).
     (backend.poll)(backend.ctx);
 
     // SAFETY: `po_ref` is a live `PendingOperation` reference held across the call.
@@ -459,7 +412,6 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
         return false;
     }
 
-    // Copy the buffer's frames out through the HHDM.
     // SAFETY: `buf_ref` pins the live `MemoryObject`.
     let mo: &MemoryObject = unsafe { &*(buf_ref.as_ptr() as *const MemoryObject) };
     let hhdm = crate::mm::heap::hhdm_offset();
@@ -477,38 +429,35 @@ pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -
     true
 }
 
-// --- Partitions: the second IRP layer -----------------------------------------
-
 /// A block-device partition: a window `[start_lba, start_lba + block_count)` on a
-/// parent block device. Leaked to `'static` by its creator (a partition lives for
-/// the kernel's lifetime, like a disk) — a USB disk's too, which departs and keeps its
-/// windows with its records (`TODO(usb-departed-records)`).
+/// parent block device, leaked to `'static` for the kernel's lifetime (a USB
+/// disk's departs and keeps its windows, `TODO(usb-departed-records)`).
 pub struct Partition {
     /// The parent disk's backend — where rebased IRPs are forwarded.
     disk: BlockBackend,
     start_lba: u64,
     block_count: u64,
     sector_size: u64,
-    /// **Retired** by a rescan of its disk (Phase 6 Part G): its record departed and a new table
-    /// published in its place, so every IRP is refused `PeerClosed` — a window still forwarding
-    /// after its partition has gone would reach whatever the new table put there.
+    /// **Retired** by a rescan of its disk: its record departed and a new table
+    /// replaced it, so every IRP is refused `PeerClosed`; a window still
+    /// forwarding would reach whatever the new table put there.
     retired: core::sync::atomic::AtomicBool,
-    /// **Submits between the retired check and the forward** (PR #369 review): a rescan retires
-    /// the window, then waits for this to reach zero ([`window_busy`]) before it lets its disk go
-    /// quiet, so no IRP that passed the check reaches the disk after the new table is published.
+    /// **Submits between the retired check and the forward**: a rescan waits for
+    /// this to reach zero ([`window_busy`]) after retiring the window, so no IRP
+    /// that passed the check reaches the disk after the new table is published.
     entering: core::sync::atomic::AtomicU32,
 }
 
-// SAFETY: a `Partition` is set up once and accessed only on the CPU servicing the
-// device; it holds no interior-mutable cross-context state.
+// SAFETY: a `Partition` is immutable after setup but for `retired` and `entering`, which
+// are atomic, and its `disk` backend is `Send + Sync` (its device synchronises itself), so
+// it may be used from whichever CPU submits.
 unsafe impl Send for Partition {}
 // SAFETY: as above.
 unsafe impl Sync for Partition {}
 
-/// [`BlockBackend::submit`] for a partition: bounds-check the partition-relative
-/// request, **rebase** the IRP's offset to disk-absolute, and forward it to the
-/// parent disk's backend. This is the two-layer block IRP stack (partition → disk)
-/// realised by backend delegation. `ctx` is the `*const Partition`.
+/// [`BlockBackend::submit`] for a partition: bounds-check, **rebase** the offset
+/// to disk-absolute and forward to the parent disk's backend. `ctx` is the
+/// `*const Partition`.
 fn partition_submit(irp: *mut Irp, ctx: *mut ()) {
     use core::sync::atomic::Ordering::SeqCst;
     // SAFETY: `ctx` is the live `Partition`; `irp` is the in-flight request.
@@ -532,8 +481,8 @@ fn forward(p: &Partition, irp: *mut Irp) {
         }
         return;
     }
-    // **A flush names no range**: it is the disk's cache, not the partition's blocks, so it
-    // goes down unchanged (administration Part C.2).
+    // **A flush names no range**: it is the disk's cache, not the partition's
+    // blocks, so it goes down unchanged.
     // SAFETY: `irp` is in flight and uniquely owned during submit.
     if unsafe { (*irp).op } == IrpOp::Flush as u32 {
         (p.disk.submit)(irp, p.disk.ctx);
@@ -543,7 +492,6 @@ fn forward(p: &Partition, irp: *mut Irp) {
     let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
     match partition_rebase(offset, length, p.start_lba, p.block_count, p.sector_size) {
         Some(disk_offset) => {
-            // Rebase partition-relative → disk-absolute, then forward down a layer.
             // SAFETY: `irp` is in flight and uniquely owned during submit.
             unsafe {
                 (*irp).offset = disk_offset;
@@ -551,7 +499,6 @@ fn forward(p: &Partition, irp: *mut Irp) {
             }
         }
         None => {
-            // Out of the partition's bounds — complete the IRP with an error.
             // SAFETY: `irp` is in flight; set its status and queue its completion.
             unsafe {
                 (*irp).set_completion(KError::InvalidArgument as i32, 0);
@@ -561,10 +508,11 @@ fn forward(p: &Partition, irp: *mut Irp) {
     }
 }
 
-/// **What a partition's window refuses `op` with**, before anything is forwarded: everything once it
-/// is retired, `PeerClosed`; and a rescan always, `Unsupported` — **a rescan is the disk's alone**:
-/// forwarded, as a flush is, it would let the holder of one partition, as every filesystem server
-/// is, retire its siblings' windows (PR #368 review). `None` to forward it.
+/// **What a partition's window refuses `op` with**, before anything is
+/// forwarded: `PeerClosed` for everything once retired, `Unsupported` for a
+/// rescan always. **A rescan is the disk's alone**: forwarded, it would let the
+/// holder of one partition (every filesystem server) retire its siblings'
+/// windows.
 fn window_refusal(p: &Partition, op: u32) -> Option<KError> {
     if p.retired.load(core::sync::atomic::Ordering::SeqCst) {
         Some(KError::PeerClosed)
@@ -575,9 +523,8 @@ fn window_refusal(p: &Partition, op: u32) -> Option<KError> {
     }
 }
 
-/// Translate a partition-relative byte `offset` (length `length`) into a
-/// disk-absolute offset, or `None` if the request falls outside the partition
-/// `[0, block_count * sector_size)`. The core of the two-layer block stack.
+/// Translate a partition-relative byte `offset` into a disk-absolute one, or
+/// `None` if `[offset, offset + length)` falls outside the partition.
 fn partition_rebase(offset: u64, length: u64, start_lba: u64, block_count: u64, sector_size: u64) -> Option<u64> {
     let span = block_count.checked_mul(sector_size)?;
     let end = offset.checked_add(length)?;
@@ -594,27 +541,23 @@ fn partition_poll(ctx: *mut ()) {
     (p.disk.poll)(p.disk.ctx);
 }
 
-/// Build a [`BlockBackend`] for a partition window over `disk`. The returned
-/// backend borrows `partition` (which must outlive every IRP submitted to it —
-/// it is leaked `'static`).
+/// A [`BlockBackend`] for a partition window; `partition` must outlive every IRP
+/// submitted to it (it is leaked `'static`).
 pub fn partition_backend(partition: &'static Partition) -> BlockBackend {
     BlockBackend {
         submit: partition_submit,
         poll: partition_poll,
         ctx: partition as *const Partition as *mut (),
-        // **Inherited, not restated.** A partition is a window that re-bases an
-        // offset and forwards the same IRP to the same hardware, so it is subject
-        // to exactly the disk's limit — and a partition that published its own
-        // would be a second number free to disagree with the one that matters.
+        // **Inherited, not restated**: a partition forwards the same IRP to the
+        // same hardware, so the disk's limit applies; its own number could disagree.
         max_frags: partition.disk.max_frags,
     }
 }
 
 impl Partition {
-    /// Create a partition window `[start_lba, start_lba + block_count)` over the
-    /// block device `disk` (a `DeviceNode` with a backend). Returns the leaked
-    /// `'static` partition + a backend over it, or `None` if `disk` is not a block
-    /// device. The caller publishes a block `DeviceNode` backed by the backend.
+    /// Create a partition window `[start_lba, start_lba + block_count)` over block
+    /// device `disk`, returning the leaked `'static` partition, or `None` if
+    /// `disk` is not a block device.
     pub fn new(disk: &ObjectRef, start_lba: u64, block_count: u64, sector_size: u64) -> Option<&'static Partition> {
         // SAFETY: `disk` pins a live `DeviceNode`.
         let dn: &DeviceNode = unsafe { &*(disk.as_ptr() as *const DeviceNode) };
@@ -628,7 +571,6 @@ impl Partition {
             entering: core::sync::atomic::AtomicU32::new(0),
         })
         .ok()?;
-        // Leak: the partition persists for the kernel's lifetime.
         // SAFETY: `into_raw` yields a stable, uniquely-owned pointer.
         Some(unsafe { &*KBox::into_raw(boxed).as_ptr() })
     }
@@ -652,19 +594,19 @@ fn window_of(node: &ObjectRef) -> Option<&'static Partition> {
     Some(unsafe { &*(backend.ctx as *const Partition) })
 }
 
-/// **Retire the partition window behind `node`** (Phase 6 Part G): every IRP refused from here, for a
-/// rescan that departs its record. Whether `node` is a partition's: a disk's node is left alone.
-/// **A submit already past the retired check may still be forwarding**: [`window_busy`] says when
-/// none is.
+/// **Retire the partition window behind `node`**: every IRP is refused from
+/// here, for a rescan that departs its record; a disk's node is left alone
+/// (`false`). A submit already past the check may still be forwarding:
+/// [`window_busy`] says when none is.
 pub fn retire_window(node: &ObjectRef) -> bool {
     let Some(p) = window_of(node) else { return false };
     p.retired.store(true, core::sync::atomic::Ordering::SeqCst);
     true
 }
 
-/// **Whether a submit is between `node`'s window's retired check and its forward** (PR #369 review):
-/// what a rescan waits out after [`retire_window`], so every IRP the window let through is at its
-/// disk — queued or in flight, and drained before the table is read — and none arrives after.
+/// **Whether a submit is between `node`'s window's retired check and its
+/// forward**: what a rescan waits out after [`retire_window`], so every IRP the
+/// window let through is at its disk, and none arrives after.
 pub fn window_busy(node: &ObjectRef) -> bool {
     window_of(node).is_some_and(|p| p.entering.load(core::sync::atomic::Ordering::SeqCst) != 0)
 }
@@ -676,25 +618,18 @@ mod tests {
 
     #[test]
     fn partition_rebase_maps_relative_to_absolute() {
-        // A partition starting at LBA 2048 (1 MiB), 1000 sectors, 512-byte blocks.
         let start = 2048u64;
         let count = 1000u64;
         let ss = 512u64;
-        // Partition LBA 0 → disk LBA 2048.
         assert_eq!(partition_rebase(0, 512, start, count, ss), Some(2048 * 512));
-        // Partition byte offset 8192 → disk (2048 * 512) + 8192.
         assert_eq!(partition_rebase(8192, 512, start, count, ss), Some(2048 * 512 + 8192));
-        // The last sector is in bounds.
         assert_eq!(partition_rebase((count - 1) * ss, ss, start, count, ss), Some((start + count - 1) * ss));
-        // One byte past the end is rejected.
         assert_eq!(partition_rebase((count - 1) * ss, ss + 1, start, count, ss), None);
         assert_eq!(partition_rebase(count * ss, ss, start, count, ss), None);
     }
 
-    /// **A partition's window refuses a rescan itself, and a retired one refuses everything**
-    /// (Phase 6 Part G): a read and a flush go down to the disk, a rescan does not — forwarded, a
-    /// holder of one partition could retire its siblings (PR #368 review) — and once the window is
-    /// retired, through [`retire_window`]'s flag, everything is refused `PeerClosed`.
+    /// A window refuses a rescan itself, and once retired refuses everything with
+    /// `PeerClosed`.
     #[test]
     fn a_window_refuses_a_rescan_and_once_retired_everything() {
         use core::sync::atomic::{AtomicBool, Ordering};
@@ -719,12 +654,9 @@ mod tests {
         }
     }
 
-    /// **The window's own submit and retirement, driven** (PR #369 review): a disk node whose backend
-    /// records what reaches it, a partition window over it published as a node of its own, and IRPs
-    /// handed to that node's backend — `partition_submit` itself, not the predicate it consults. A
-    /// read reaches the disk rebased and a rescan does not; [`retire_window`] on the window's node,
-    /// and on nothing else, then refuses everything, with nothing more reaching the disk; and no
-    /// submit is left counted in, so [`window_busy`] says the window is quiet.
+    /// The window's own submit and retirement, driven through `partition_submit`:
+    /// a read reaches the disk rebased and a rescan does not; once retired,
+    /// nothing more reaches the disk and no submit is left counted in.
     #[test]
     fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
         use crate::libkern::block::BlockKind;
@@ -762,8 +694,8 @@ mod tests {
         let part = adopt(
             DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry(100), BlockKind::Partition, b"p", wb).unwrap(),
         );
-        // An IRP through the partition node's backend: its status after the submit, any refusal's
-        // completion run.
+        // An IRP through the partition node's backend; returns its status after
+        // any refusal's completion has run.
         let submit = |op: IrpOp, offset: u64| {
             let mut irp = Irp::new_block(op, core::ptr::null(), offset, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0);
             // SAFETY: `part` pins the node; its backend's context is the leaked window.
@@ -788,10 +720,8 @@ mod tests {
         assert!(!window_busy(&disk));
     }
 
-    /// **Page-cache frames go to the device as one IRP, and more than it takes are refused before
-    /// anything reaches it** (Phase 6 Part H.4): eight frames to a device taking eight fragments
-    /// arrive as one IRP of eight, in order; nine are refused `InvalidArgument`, as is a length past
-    /// the frames given.
+    /// Page-cache frames go to the device as one IRP, in order; more than it takes
+    /// is refused `InvalidArgument` before anything reaches it.
     #[test]
     fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
         use crate::libkern::block::BlockKind;
@@ -862,24 +792,18 @@ mod tests {
     fn frags_split_unaligned_head_and_tail() {
         init_global_heap();
         let frames = [PhysAddr(0x1000), PhysAddr(0x2000)];
-        // 512 bytes starting 256 into the first page: one fragment.
         let frags = build_frags(&frames, 256, 512).unwrap();
         assert_eq!(frags.len(), 1);
         assert_eq!(frags[0], PhysFrag { base: 0x1000 + 256, len: 512 });
-        // A range crossing the page boundary: head to end of page 0, then page 1.
         let frags = build_frags(&frames, PAGE_SIZE as u64 - 100, 200).unwrap();
         assert_eq!(frags.len(), 2);
         assert_eq!(frags[0], PhysFrag { base: 0x1000 + PAGE_SIZE as u64 - 100, len: 100 });
         assert_eq!(frags[1], PhysFrag { base: 0x2000, len: 100 });
     }
 
-    /// One fragment per page, with **no ceiling of its own** — which is why the
-    /// device's ceiling has to be checked by the caller.
-    ///
-    /// This is the half that made the overflow reachable: `build_frags` is a faithful
-    /// description of whatever range it is given, and `sys_io_submit` bounds that range
-    /// only against the buffer's size. Nothing between them knew what the hardware could
-    /// describe.
+    /// One fragment per page, with **no ceiling of its own**, which is why the
+    /// caller must check the device's: `sys_io_submit` bounds the range only
+    /// against the buffer's size.
     #[test]
     fn the_fragment_count_grows_with_the_transfer_and_is_never_clamped() {
         init_global_heap();
@@ -897,13 +821,8 @@ mod tests {
         }
     }
 
-    /// An unaligned start costs **one extra fragment**, so a transfer that fits when
-    /// page-aligned can fail to fit when it is not.
-    ///
-    /// Worth pinning because it is the reason the dispatch check counts *fragments*
-    /// rather than deriving a byte ceiling: the same `length` yields a different count
-    /// depending on where it starts, and a byte limit would have to reproduce that
-    /// arithmetic to be right.
+    /// An unaligned start costs **one extra fragment**: why the dispatch check
+    /// counts *fragments*, not a byte ceiling.
     #[test]
     fn an_unaligned_start_costs_an_extra_fragment() {
         init_global_heap();
