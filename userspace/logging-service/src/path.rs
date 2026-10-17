@@ -33,7 +33,7 @@ pub fn classify(suffix: &str) -> Option<Classified<'_>> {
     let tier = match it.next()? {
         "system" => TIER_SYSTEM,
         "app" => TIER_APP,
-        _ => return None,
+        _ => return None, // unknown tier, or `kernel` (not resolvable)
     };
     let principal = it.next().filter(|p| !p.is_empty())?;
     let source = it.next().filter(|s| !s.is_empty());
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn rejects_unknown_and_kernel_tier() {
         assert!(classify("bogus/x").is_none());
-        assert!(classify("kernel/x").is_none());
+        assert!(classify("kernel/x").is_none()); // kernel rings aren't resolved
         assert!(classify("").is_none());
     }
 }

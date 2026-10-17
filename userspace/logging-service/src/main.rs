@@ -541,7 +541,7 @@ fn render_typed(body: &[u8], principal: &str, tier: u8, chan_label: &Option<Stri
                 log.record(String::from(principal), tier, LEVEL_INFO, format_typed_row(&schema, &values), source);
             }
             Some(Ok(libstream::Item::End(_))) | None => break,
-            Some(Ok(libstream::Item::Error(_))) => continue,
+            Some(Ok(libstream::Item::Error(_))) => continue, // pass over in-stream errors
             Some(Err(_)) => {
                 kprint(b"logging-service: typed decode error (drop rest)\n");
                 break;
@@ -607,7 +607,7 @@ fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
             return true;
         }
         if rc != 0 {
-            break;
+            break; // WouldBlock: drained
         }
         // SAFETY: read payload_len, then a bounded read-only slice over RECV_MSG.
         let body: &[u8] = unsafe {
@@ -624,12 +624,12 @@ fn drain_source(h: u64, sources: &[Source], log: &mut Log) -> bool {
         }
         let la = match parse_append(body) {
             Some(la) => la,
-            None => continue,
+            None => continue, // malformed record: drop
         };
         let message = String::from(core::str::from_utf8(la.message).unwrap_or("<non-utf8>"));
         log.record(principal.clone(), tier, la.level, message, claimed_source(la.source, &chan_label));
     }
-    false
+    false // drained, still live
 }
 
 /// The serve loop: multi-wait on the serving endpoint, the control channel, the read endpoints and

@@ -220,7 +220,7 @@ mod tests {
         {
             // SAFETY: test handle; the mock ignores the value.
             let _h = unsafe { Handle::<Memory, MapReadWrite>::from_raw(RawHandle(5), Rights::empty()) };
-        }
+        } // dropped here
         let (_s, _w, closes) = sys::counts();
         assert_eq!(closes, 1, "Handle::drop must close the raw handle");
     }
@@ -231,7 +231,7 @@ mod tests {
         {
             // SAFETY: test handle; borrow does not take ownership.
             let _h = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(3), Rights::LOOKUP) };
-        }
+        } // dropped here — must NOT close
         let (_s, _w, closes) = sys::counts();
         assert_eq!(closes, 0, "a borrowed Handle must not close on drop");
     }
