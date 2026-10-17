@@ -14,9 +14,6 @@
 //! controller is per-CPU), and lets message-signalled interrupts (MSI/MSI-X)
 //! later unify under "route an external source → CPU+vector" on the router. See
 //! the decision log (2026-06-11) for the long-term rationale.
-//!
-//! The active architecture's implementation is re-exported from `crate::arch`
-//! as `IrqRouter` (see `kernel/src/arch/mod.rs`).
 
 use crate::libkern::AllocError;
 

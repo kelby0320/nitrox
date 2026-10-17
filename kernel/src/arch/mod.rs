@@ -1,4 +1,4 @@
-//! Architecture abstraction. Phase 0 implements only x86_64.
+//! Architecture abstraction. Only x86_64 is implemented.
 //!
 //! ## The arch boundary (read before adding to this module)
 //!
@@ -40,9 +40,7 @@ pub mod user_access;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
-// Neutral data/singleton modules defined at the x86_64 root. (CPU control —
-// init/protections/kernel-stack/halt — now lives on the `Cpu` trait below;
-// paging companions on `Paging`.)
+// Neutral data/singleton modules defined at the x86_64 root.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{abi, ps2, serial};
 
@@ -72,8 +70,7 @@ pub use x86_64::ioapic::X86IoApic as IrqRouter;
 // either of the two ways a PCI function can deliver one (a routed INTx line, or
 // an MSI the device raises itself). A composite over the handler registry, the
 // local controller and the router, so it is its own trait rather than a method
-// on any of them. See `arch/irq_install.rs`; it was a free function until MSI
-// gave the family a second member (Phase 5 Part A).
+// on any of them. See `arch/irq_install.rs`.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::irq_install::X86IrqInstall as IrqInstall;
 // Legacy *ISA* interrupt installation is **not** re-exported neutrally: "ISA" is an
@@ -117,10 +114,9 @@ pub use x86_64::timer::X86Timer as Timer;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::memory_types::X86MemoryTypes as MemoryTypes;
 // The machine's battery-backed wall clock, read **once** at boot to anchor
-// `crate::clock`, and written when the clock is set (administration Part E.5).
-// Neutral names because the concept is portable and the hardware is not: x86 has the
-// CMOS RTC behind ports 0x70/0x71, aarch64 boards a memory-mapped `PL031`. See
-// `arch/rtc.rs`.
+// `crate::clock`, and written when the clock is set. Neutral names because the concept is
+// portable and the hardware is not: x86 has the CMOS RTC behind ports 0x70/0x71, aarch64
+// boards a memory-mapped `PL031`. See `arch/x86_64/rtc.rs`.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::rtc::{set_wall_clock_seconds, wall_clock_seconds};
 #[cfg(target_arch = "x86_64")]
@@ -136,9 +132,7 @@ pub use x86_64::context::{ArchThreadContext, context_switch, fabricate_frame, th
 // Per-thread floating-point / SIMD register state: the opaque save area a
 // [`Thread`](crate::object::Thread) carries, the per-CPU enable, and the swap
 // the scheduler performs on every context switch. Every architecture with a
-// separate FP/SIMD register file needs exactly this shape (aarch64 would map it
-// to the `Q`/`Z` registers plus `FPCR`/`FPSR`), so the names stay neutral —
-// `XSAVE`, `XCR0`, and the format selection live inside the arch layer.
+// separate FP/SIMD register file needs this shape, so the names stay neutral.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::fpu::{
     ArchFpuState, area_bytes as fpu_area_bytes, init_area as fpu_init_area, init_cpu as fpu_init_cpu,

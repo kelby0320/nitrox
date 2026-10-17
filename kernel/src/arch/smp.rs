@@ -1,17 +1,10 @@
 //! Architecture-neutral symmetric-multiprocessing contract.
 //!
-//! Phase 1 is single-CPU; [`ArchSmp`] is a stub that reports one CPU and
-//! refuses inter-processor interrupts. It exists so later code can reference a
-//! stable neutral surface (`cpu_count`/`current_cpu`) instead of hard-coding
-//! `1`/`0`. Phase-3 SMP brings up the real implementation and rewires the
-//! current single-CPU stand-ins — `handle::current_ctx_id()` (the grace-tracker
-//! shim, constant 0 today) and the syscall `CpuLocal` block — onto it.
-//!
-//! The active architecture's implementation is re-exported from
-//! `crate::arch` as `Smp` (see `kernel/src/arch/mod.rs`).
+//! [`ArchSmp`] is the neutral surface for CPU count, CPU identity and
+//! inter-processor interrupts.
 //!
 //! `current_cpu()` is the neutral "which CPU am I" primitive: a **dense** logical
-//! index in `0..cpu_count()`, used to index the per-CPU `CPUS[]` arrays. The
+//! index in `0..MAX_CPUS`, used to index the per-CPU `CPUS[]` arrays. The
 //! mechanism behind it is arch-internal (x86 reads `IA32_TSC_AUX` via `RDTSCP`,
 //! set per CPU by `init_this_cpu`); see `docs/architecture/scheduler.md`
 //! §Per-CPU access.
@@ -23,14 +16,13 @@ pub const MAX_CPUS: usize = 8;
 
 /// Symmetric-multiprocessing queries and operations.
 pub trait ArchSmp {
-    /// Number of CPUs the kernel is driving. Phase 1 / slice 0: always `1`;
-    /// the real count is learned from the bootloader at SMP bring-up (slice 1).
+    /// Number of CPUs the kernel is driving. The x86_64 port still reports `1` on every CPU
+    /// (`TODO(smp-cpu-count)`).
     fn cpu_count() -> usize;
 
-    /// The dense logical index (`0..cpu_count()`) of the CPU this runs on — the
+    /// The dense logical index (`0..MAX_CPUS`) of the CPU this runs on — the
     /// primitive neutral code uses to index per-CPU state (`CPUS[current_cpu()]`).
-    /// Slice 0 has one CPU, so this is `0`, but it is read from the hardware (not
-    /// hard-coded) so it stays correct once APs run.
+    /// Read from the hardware, not hard-coded, so it is correct on every running CPU.
     fn current_cpu() -> u32;
 
     /// Whether [`current_cpu`](ArchSmp::current_cpu) is reporting an identity this CPU
@@ -52,11 +44,10 @@ pub trait ArchSmp {
     /// not the timestamp counter.
     fn init_this_cpu(index: u32);
 
-    /// Send an inter-processor interrupt of `vector` to CPU `target`.
+    /// Send an inter-processor interrupt of `vector` to the CPU whose interrupt-controller id
+    /// is `target` (on x86 its x2APIC id, not its dense index).
     ///
     /// # Safety
-    /// Ring-0 only; valid only on a multi-CPU system (Phase 3). On the
-    /// single-CPU Phase-1 kernel there is no second CPU to target, so calling
-    /// this is a logic error (the stub panics).
+    /// Ring 0, with the local interrupt controller enabled on the calling CPU.
     unsafe fn send_ipi(target: u32, vector: u8);
 }

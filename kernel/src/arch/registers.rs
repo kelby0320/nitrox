@@ -14,8 +14,8 @@
 //! neutral consumer (`sys_thread_get_registers`) names those two and copies the
 //! result to user memory without ever reading an individual register.
 //!
-//! Phase 1 reads registers only; register *writeback* (for the deferred
-//! `ModifyAndResume` exception disposition) joins this trait when it lands.
+//! Reading only: register *writeback* (for the deferred `ModifyAndResume` exception
+//! disposition) is not yet part of this trait.
 
 /// Reads a suspended thread's captured user registers from its exception frame.
 ///

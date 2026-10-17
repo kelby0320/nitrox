@@ -1,14 +1,8 @@
 //! Architecture-neutral paging contract.
 //!
-//! [`ArchPaging`] is the first cross-architecture *trait* in the kernel's
-//! arch layer — `gdt`, `idt`, `regs`, and `serial` are cfg-gated modules
-//! of free functions, not traits. Paging earns a trait because aarch64's
-//! translation-table format genuinely differs from x86_64's, and the
-//! virtual-memory manager (a later item of this slice) is written
-//! against this trait rather than against x86 page-table entries.
-//!
-//! The active architecture's implementation is re-exported from
-//! `crate::arch` as `Paging` (see `kernel/src/arch/mod.rs`).
+//! Paging is a trait because aarch64's translation-table format genuinely
+//! differs from x86_64's, and the virtual-memory manager is written against
+//! this trait rather than against x86 page-table entries.
 
 use crate::mm::{PhysAddr, VirtAddr};
 
@@ -40,7 +34,7 @@ impl PageFlags {
     /// Writes go straight through the cache instead of being written back.
     pub const WRITE_THROUGH: PageFlags = PageFlags(1 << 5);
     /// Writes gathered into bursts, reads uncached: what a framebuffer wants, and the one
-    /// attribute that *raises* a range the firmware calls uncacheable (Phase 5 Part G.2).
+    /// attribute that *raises* a range the firmware calls uncacheable.
     ///
     /// Not combined with [`NO_CACHE`](PageFlags::NO_CACHE) or
     /// [`WRITE_THROUGH`](PageFlags::WRITE_THROUGH) — each names a whole answer, and a mapping
@@ -230,10 +224,9 @@ pub trait ArchPaging {
     /// not mapped. The entries themselves are the architecture's — what a caller can do with this
     /// is compare two mappings, or check one against the table the kernel programs.
     ///
-    /// **This exists so the fix has a testable surface.** Part G's translation from a
+    /// **This exists so the translation has a testable surface.** The translation from a
     /// [`Caching`](crate::mm::Caching) to hardware bits is otherwise only visible on a booted
-    /// machine, and a gate on a boot line proved to pass with the translation deleted
-    /// (PR #306 review).
+    /// machine, and a gate on a boot line proved to pass with the translation deleted.
     ///
     /// # Safety
     /// `root` must be the physical base of a valid top-level page table reachable through the

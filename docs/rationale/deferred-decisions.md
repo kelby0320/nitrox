@@ -2196,6 +2196,14 @@ enumeration is the thing to redo when a new writer appears.
 Trigger: a non-method table access, or a `ctx_id` that stops being the CPU id (the Process
 slice intends `Process::current().ctx_id()`).
 
+**`ArchSmp::cpu_count` reports `1` — `TODO(smp-cpu-count)`.** The x86_64 port returns a
+constant `1` on every CPU, however many bring-up starts: the count was to be learned from Limine's
+SMP response and never was. Its one caller is the boot line `smp: cpu 0 online …, N of max …`,
+printed before any AP starts, which is why nothing noticed. The per-CPU bound everything relies on
+is `MAX_CPUS`, which dense indices never reach, not this. Found cutting the arch layer's comments
+(2026-10-17). Trigger: the first caller that needs the count — a per-CPU structure sized by it, or
+a report of the machine's CPUs.
+
 **Priority inheritance for userspace synchronization.** Userspace mutex/condvar implementations built on `sys_wait` don't initially address priority inversion. Trigger: a real-time workload where priority inversion is a problem.
 
 **Deadline scheduling (EDF) as a fourth scheduler class.** RealTime class uses fixed priority, not EDF. Adding EDF is possible without architectural changes — fourth scheduler class. Trigger: a workload that benefits.

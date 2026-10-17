@@ -10,12 +10,7 @@
 //! because installation spans both plus the handler registry and belongs to
 //! none of them.
 //!
-//! **It became a trait when it acquired a second member.** Through Phase 4 it
-//! had exactly one, a neutral `install_pci_irq` free function, and the project's
-//! rule is to build an abstraction at its second consumer rather than in
-//! anticipation of one. Phase 5 Part A is that second consumer.
-//!
-//! The two members are the two ways a PCI function's interrupt reaches a CPU:
+//! The first two members are the two ways a PCI function's interrupt reaches a CPU:
 //!
 //! - **INTx**, a physical line the system router has to be told about. The line
 //!   number comes from firmware, and that is the part which does not survive
@@ -24,12 +19,12 @@
 //!   interrupt by writing them itself. Nothing routes it, so there is nothing
 //!   for firmware to get wrong, and two devices can never share a vector.
 //!
-//! A third member arrived with Phase 5 Part C, and it is the odd one out:
-//! **a vector no device raises** ([`ArchIrqInstall::install_software`]). A RAM
-//! disk finishes its copy inside `submit`, but its completion must still run
-//! where a device's does — at the device-interrupt tail, which drains the DPC and
-//! reschedules — or every block I/O waits for the timer tick. So it installs a
-//! handler like any driver and raises the vector on itself.
+//! The third is the odd one out: **a vector no device raises**
+//! ([`ArchIrqInstall::install_software`]). A RAM disk finishes its copy inside
+//! `submit`, but its completion must still run where a device's does — at the
+//! device-interrupt tail, which drains the DPC and reschedules — or every block I/O
+//! waits for the timer tick. So it installs a handler like any driver and raises the
+//! vector on itself.
 //!
 //! The message's *contents* are architectural: on x86 the address names a local
 //! APIC and the data names a vector. The PCI capability the message is written
@@ -88,7 +83,7 @@ pub trait ArchIrqInstall {
     ///
     /// For a backend with no hardware of its own whose completions must still run at a
     /// device-interrupt tail — a RAM disk. Without one, a completion DPC waits for the next timer
-    /// tick, which serialises every block I/O on it (Phase 5 Part C, PR #297 review).
+    /// tick, which serialises every block I/O on it.
     ///
     /// # Safety
     /// Ring-0, after the interrupt table is installed. `handler` must stay valid for the kernel's
