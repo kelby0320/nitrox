@@ -117,3 +117,17 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-19	386	f461dffc	15	architecture	optional	unverified	declined		latent while PROGRAM_DIRS has one entry, so no input can tell the paths apart; a comment at the site says a second entry must hand on the found path
 2026-10-19	386	f461dffc	16	architecture	optional	unverified	deferred		TODO(mapped-read-faults) with its deferral entry: no read reports a failed fill as an error
 2026-10-19	386	f461dffc	17	architecture	optional	demonstrated	fixed	4435a43c	title is v1.3
+2026-10-19	387	b1e64890	1	logic+error-paths+architecture	blocking	demonstrated	fixed	095d7676	the search's ESC begins a key only if [ or O came in the same read (readline's rule); the loop moved to nxsh::editor and is host-tested; boot step 19d-4
+2026-10-19	387	b1e64890	2	error-paths+logic	worth-fixing	demonstrated	fixed	095d7676	replacing the line abandons a half-read sequence; Keep no longer leaves one, so Accept's newline cannot be swallowed
+2026-10-19	387	b1e64890	3	error-paths	worth-fixing	demonstrated	fixed	095d7676	tty_write sends in parts of RS_MAX_BODY; boot step 19d-5 writes 4,495 bytes and times out without the fix
+2026-10-19	387	b1e64890	4	tests	worth-fixing	demonstrated	fixed	095d7676	erase and redraw tested, by characters; the three mutations each fail
+2026-10-19	387	b1e64890	5	tests	worth-fixing	demonstrated	fixed	095d7676	six tests, one per mutation (a)-(f); each fails its mutation
+2026-10-19	387	b1e64890	6	logic	optional	demonstrated	fixed	095d7676	replace_around keeps the cursor at or past the last row's start
+2026-10-19	387	b1e64890	7	error-paths	optional	demonstrated	fixed	095d7676	a mid-line completion that would pass LINE_MAX with the tail is refused, writing nothing
+2026-10-19	387	b1e64890	8	architecture	optional	demonstrated	fixed	095d7676	SS3 ends at a byte that cannot end it, which is acted on as before; consuming its final byte is recorded in the decision log
+2026-10-19	387	b1e64890	9	tests	optional	unverified	fixed	095d7676	the handoff is host-tested in nxsh::editor: Left, Home, Delete, SS3, one read and split reads; never feeding the ESC fails a test
+2026-10-19	387	b1e64890	10	tests	optional	demonstrated	fixed	095d7676	LF, a space in the query and the no-match text tested; each mutation fails
+2026-10-19	387	b1e64890	11	tests	optional	demonstrated	fixed	095d7676	ESC O ESC [ D reports Left; the mutation fails
+2026-10-19	387	b1e64890	12	rules-and-docs+architecture	optional	demonstrated	fixed	095d7676	both Status lines advanced to C.2
+2026-10-19	387	b1e64890	13	rules-and-docs	optional	demonstrated	fixed	095d7676	Step::Key's and redraw's doc comments
+2026-10-19	387	b1e64890	14	rules-and-docs	optional	demonstrated	fixed	095d7676	nxsh CLAUDE.md lists search and editor; test-interactive's count is 48, read off a boot (37 was stale before C.2)
