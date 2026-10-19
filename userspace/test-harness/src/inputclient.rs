@@ -372,6 +372,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 WindowEvent::CloseRequested => b"close",
                 WindowEvent::Dismissed => b"dismissed",
                 WindowEvent::Configure { .. } => b"configure",
+                WindowEvent::State(_) => b"state",
             };
             Line::new().s(b"input-testclient: first win event=").s(what).end();
         }
@@ -448,7 +449,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             // **Reported and ignored, deliberately**: a window that vanished when asked politely
             // would end the run.
             WindowEvent::CloseRequested => kprint(b"input-testclient: asked to close, staying\n"),
-            WindowEvent::Dismissed => {}
+            WindowEvent::Dismissed | WindowEvent::State(_) => {}
             // A fixed-size window may decline a resize; this one is 2048×2048 on purpose.
             WindowEvent::Configure { .. } => {}
         }
@@ -482,7 +483,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             WindowEvent::Drop { .. } => kprint(b"input-testclient: a drop arrived\n"),
             // **Reported and ignored, deliberately**, as in the window stage.
             WindowEvent::CloseRequested => kprint(b"input-testclient: asked to close, staying\n"),
-            WindowEvent::Dismissed => {}
+            WindowEvent::Dismissed | WindowEvent::State(_) => {}
             WindowEvent::Configure { .. } => {}
         }
     }

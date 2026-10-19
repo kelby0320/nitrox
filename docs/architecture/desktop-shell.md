@@ -19,7 +19,8 @@ holds neither; **M13 Part C made the overview a translucent `ARGB8888` surface o
 desktop**, replacing the dimmed copy of the wallpaper it used to redraw; **M14 Part H made the
 applications modal list desktop entries** rather than every program in `/bin`; **Phase 5 Part E laid
 it out on the screen it is on** — every bar, the wallpaper, the overview and the placement cascade
-sized from `/dev/draw/screen` rather than a written-down 1280×800 (see
+sized from `/dev/draw/screen` rather than a written-down 1280×800, the cascade wrapping in the work
+area since pre-Phase-7 Part C.3 (see
 [`clipboard.md`](clipboard.md) and `display-arm-plan.md` M12 decision 2); and **the desktop
 refresh's Part C (checked 2026-09-18) gave it the design's panels** — 30 pixels each on the panel
 ground: an Applications *menu* that still filters as you type and a Places menu, replacing the
@@ -80,24 +81,31 @@ been built, and only the drag had ever been gated.
 Every release over a window is also a release over the card holding it; matching the drop first
 would turn "click the window you pressed" into "move it to the desktop it is already on".
 
-Since Milestone 9 the shell is also the **other end of a window's own chrome** (§8's
-"placement", from the other side). A client
-draws its title bar and its buttons, and the two that are not the client's to perform arrive
-here as requests: `Surface::RequestState` becomes a `SetMinimized` or a `Configure` — maximise
-*moves* the window to the work area's origin as well as resizing it, so a maximised window does
-not cover the bars — and a drag becomes `Surface::StartMove`, which the compositor performs
-itself while the shell watches the geometry go by. **Dragging a window's corner** is the same
-division seen from the other side (Part E): the compositor runs the gesture and draws an outline,
-and hands the shell one `DragEnded` at the release — which the shell answers with the `Configure`
-it would have sent anyway, because changing a window's geometry is the manager's and there is one
-path to it rather than two that can disagree. **Snapping** (Part F) is that same event reached a
-different way: the shell registers eight `SnapZone`s computed from the work area — four edges,
-four corners, a 24-pixel band — and re-registers all of them whenever the work area changes,
+Since Milestone 9 the shell is also the **other end of a window's own chrome** (§8's "placement",
+from the other side). A client draws its title bar and its buttons, and the two that are not the
+client's to perform arrive here as requests: `Surface::RequestState` becomes a `SetMinimized` or a
+`Configure` — maximise *moves* the window to the work area's origin as well as resizing it, so a
+maximised window does not cover the bars — and a drag becomes `Surface::StartMove`, which the
+compositor performs itself while the shell watches the geometry go by. **Dragging a window's
+corner** is the same division seen from the other side (Part E): the compositor runs the gesture and
+draws an outline, and hands the shell one `DragEnded` at the release — which the shell answers with
+the `Configure` it would have sent anyway, because changing a window's geometry is the manager's and
+there is one path to it rather than two that can disagree. **Snapping** (Part F) is that same event
+reached a different way: the shell registers eight `SnapZone`s computed from the work area — four
+edges, four corners, a 24-pixel band — and re-registers all of them whenever the work area changes,
 because the zones *are* the work area. A window dropped in one takes that zone's target: half the
-work area for an edge, a quarter for a corner. The compositor previews the target under the
-pointer and matches the table; which region means which rectangle never reaches it. Closing is the pair the milestone added at
-both ends: a client's own close button ends the client, and the window list's middle-click sends
-`Manage::RequestClose` — an *ask*, which a client with unsaved work answers with a dialog.
+work area for an edge, a quarter for a corner, and the whole work area for the top edge, whose band
+and corners reach up over the top bar. The compositor previews the target under the pointer and
+matches the table; which region means which rectangle never reaches it. **A drop at the top
+maximises**, as the button does: the shell keeps the rectangle the window had before the drag to
+restore to, which `DragEnded` carries because the shell has applied the drag's own geometry by the
+time it answers, and tells the window's client with `Manage::SetWindowState`, forwarded as
+`Surface::WindowState`. **A maximise button shows what the shell said**, not what its own click
+asked, so it is right after a drop or a refusal. A plain move ends in a `DragEnded` too, which is
+how the shell learns that a person moved a maximised window, and makes it normal. The decisions are
+`desktop_shell::snap`, host-tested. Closing is the pair the milestone added at both ends: a client's
+own close button ends the client, and the window list's middle-click sends `Manage::RequestClose` —
+an *ask*, which a client with unsaved work answers with a dialog.
 
 **The insist is a second middle-click, not a clock** (M12 Part A). It was `Manage::Close` two
 seconds later, and that was safe for exactly as long as no client could decline: every
@@ -184,13 +192,16 @@ creation-ordered so creating it first puts it under everything. Like the bars it
 It is absent when the theme names no file, which is the shipped default.
 
 **Everything here is sized from the screen, read once** (Phase 5 Part E): `/dev/draw/screen` at
-startup gives the width the bars span, the height the window list sits a bar above, the wallpaper's
-and the overview's full-screen buffers, and the height the placement cascade wraps at. The
-arithmetic — where the window list sits, how many thumbnail columns fit beside the sidebar — is
-`desktop_shell::Screen`, host-tested at every size rather than asserted at one; how many window
-buttons fit beside the switcher is `panel::task_capacity` of the switcher's measured width, since
-the switcher carries the desktop's name (§7). A screen the shell cannot read is fatal: the leaf resolves
-through the same binding its connection just did, and bars sized by a guess are what this replaced.
+startup gives the width the bars span, the height the window list sits a bar above, and the
+wallpaper's and the overview's full-screen buffers. The placement cascade wraps in the work area
+instead, which the compositor reports: a new window goes 24 pixels below the last, and back to the
+first place under the top bar when it would end below the work area's bottom
+(`desktop_shell::cascade`). The arithmetic — where the window list sits, how many thumbnail columns
+fit beside the sidebar — is `desktop_shell::Screen`, host-tested at every size rather than asserted
+at one; how many window buttons fit beside the switcher is `panel::task_capacity` of the switcher's
+measured width, since the switcher carries the desktop's name (§7). A screen the shell cannot read
+is fatal: the leaf resolves through the same binding its connection just did, and bars sized by a
+guess are what this replaced.
 
 **And the overview sits over it.** The overview is a full-screen **`ARGB8888`** window (M13
 Part C) — the one surface this shell creates that is not opaque. Its ground is a single

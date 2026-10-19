@@ -40,7 +40,7 @@ const BUFFERS: usize = 2;
 
 /// The terminal's size in cells at startup; a `Configure` changes it.
 const COLS: usize = 80;
-const ROWS: usize = 24;
+const ROWS: usize = 20;
 
 /// Report and end the run.
 fn fail(msg: &[u8]) -> ! {
@@ -216,6 +216,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         .s(b"px")
         .end();
     let mut app = App::new(COLS, ROWS, metrics);
+    // `check-login` reads this to tell that a maximise grew the grid.
+    libkern::debug::Line::new()
+        .s(b"nxterm: started, grid ")
+        .u(app.grid().cols() as u64)
+        .s(b"x")
+        .u(app.grid().rows() as u64)
+        .end();
 
     let size = app.window_size();
     // SAFETY: `root_ns` is this process's live root namespace.
@@ -806,6 +813,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 // A `normal` window is not dismissed by a press elsewhere — the event is a popup's.
                 WindowEvent::Dismissed => {}
+                WindowEvent::State(s) => app.update(Msg::WindowState(s)),
                 // The shell asking, answered like the close button; `check-login` matches the log
                 // line.
                 WindowEvent::CloseRequested => {

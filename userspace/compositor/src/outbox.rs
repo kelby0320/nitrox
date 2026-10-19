@@ -67,6 +67,13 @@ pub enum Outbound {
         /// Which window is being asked to close.
         window: u32,
     },
+    /// A `Surface::WindowState` — the state the manager put this window in.
+    WindowState {
+        /// Which window.
+        window: u32,
+        /// One of the `WINDOW_STATE_*` values.
+        state: u32,
+    },
     /// A `Surface::Dropped` — a drag ended over this window; nothing could repeat a lost one.
     Dropped {
         /// Which window it landed on.
@@ -97,7 +104,8 @@ impl Outbound {
             | Outbound::Configure { window, .. }
             | Outbound::Dropped { window, .. }
             | Outbound::Dismissed { window }
-            | Outbound::CloseRequested { window } => *window,
+            | Outbound::CloseRequested { window }
+            | Outbound::WindowState { window, .. } => *window,
         }
     }
 
@@ -418,10 +426,10 @@ pub enum MgrEvent {
     /// A client's own rate drives this, so a request for the state the window was last asked to
     /// be in is dropped; else a looping client could push a `Created` off the full queue.
     StateRequest(librsproto::surface::WindowState),
-    /// An interactive gesture ended and asks for this rectangle — `Manage::DragEnded`.
+    /// An interactive gesture ended, asking for a rectangle — `Manage::DragEnded`.
     ///
     /// One per gesture, at the release; never per motion, as this queue does not coalesce.
-    DragEnded(librsproto::surface::ConfigureEvent),
+    DragEnded(librsproto::surface::MgrDragEnded),
 }
 
 /// How many manager events queue before the oldest are discarded.

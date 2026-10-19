@@ -36,8 +36,9 @@ const HOTKEY_MOVE_BASE: u32 = 20;
 const KEY_1: u16 = 2;
 use desktop_shell::ending::{Asked, Closing, Ending, Next, POWER_PROGRAM, POWER_VIEW, Refusal, failed};
 use desktop_shell::panel::{self, BottomMsg, EndingMsg, MenuMsg, RefusalMsg, TopMsg};
+use desktop_shell::snap::RestoreList;
 use desktop_shell::{
-    Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, Screen, ShownDesktop, parse_entry,
+    Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, CASCADE_STEP, Screen, ShownDesktop, parse_entry,
 };
 use librsproto::surface::{
     CreateWindowRequest, Edge, MgrLayout, OP_MGR_QUERY_LAYOUT, OP_MGR_SET_WINDOW_DESKTOP, Role, STICKY_DESKTOP,
@@ -469,7 +470,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // by design): otherwise a person who chose keep editing leaves the window armed for its life,
     // and a later click goes straight to `Manage::Close`.
     let mut asked_to_close: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
-    let mut next_origin = BAR_H as i32 + CASCADE_STEP;
+    let mut next_origin = layout.work_y + CASCADE_STEP;
 
     let mut hotkey_done = manager.is_none();
 
@@ -730,7 +731,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             ];
             let mut fired = alloc::vec::Vec::new();
             let mut states: alloc::vec::Vec<librsproto::surface::WindowState> = alloc::vec::Vec::new();
-            let mut dropped: alloc::vec::Vec<librsproto::surface::ConfigureEvent> = alloc::vec::Vec::new();
+            let mut dropped: alloc::vec::Vec<librsproto::surface::MgrDragEnded> = alloc::vec::Vec::new();
             list_dirty |= place_new_windows(
                 m,
                 &mut next_origin,
@@ -743,63 +744,16 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 &mut dropped,
                 &mut restore,
                 current_desktop,
-                screen,
             );
 
-            for c in dropped {
-                // A window resized or snapped by hand is no longer maximised: drop its restore
-                // rectangle.
-                restore.retain(|(id, _)| *id != c.window);
-                sent_request = true;
-                configure_window(m, c.window, c.x, c.y, c.width, c.height, b"drop");
+            let work = (layout.work_x, layout.work_y, layout.work_w, layout.work_h);
+            for d in dropped {
+                let a = desktop_shell::snap::drag_ended(&d, work, &mut restore);
+                sent_request |= answer(m, d.asked.window, a, b"drop");
             }
-            // What a client asked to be, decided here: only this process can compute a maximised
-            // rectangle.
-            for s in states {
-                use librsproto::surface::{WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL};
-                let Some(e) = entries.iter_mut().find(|e| e.id == s.window) else { continue };
-                match s.state {
-                    WINDOW_STATE_MINIMIZED => {
-                        if minimize_window(m, e) {
-                            sent_request = true;
-                            list_dirty = true;
-                            Line::new().s(b"desktop-shell: client asked to minimize window ").u(s.window as u64).end();
-                        }
-                    }
-                    WINDOW_STATE_MAXIMIZED => {
-                        if e.minimized && raise_window(m, e) {
-                            list_dirty = true;
-                        }
-                        if !restore.iter().any(|(id, _)| *id == s.window) {
-                            restore.push((s.window, (e.origin.0, e.origin.1, e.size.0, e.size.1)));
-                        }
-                        sent_request = true;
-                        // What was asked for, not what happened: a client may decline a
-                        // `Configure`.
-                        configure_window(
-                            m,
-                            s.window,
-                            layout.work_x,
-                            layout.work_y,
-                            layout.work_w,
-                            layout.work_h,
-                            b"maximize",
-                        );
-                    }
-                    WINDOW_STATE_NORMAL => {
-                        if e.minimized && raise_window(m, e) {
-                            sent_request = true;
-                            list_dirty = true;
-                        }
-                        if let Some(i) = restore.iter().position(|(id, _)| *id == s.window) {
-                            let (_, (x, y, w, h)) = restore.remove(i);
-                            sent_request = true;
-                            configure_window(m, s.window, x, y, w, h, b"restore");
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            let (sent, dirty) = answer_states(m, states, &mut entries, &mut restore, work);
+            sent_request |= sent;
+            list_dirty |= dirty;
 
             list_dirty |= normalize_desktops(&mut desktops, &entries, &mut current_desktop, &mut next_desktop_id);
             for id in fired {

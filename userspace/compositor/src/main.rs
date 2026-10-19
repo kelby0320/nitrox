@@ -363,6 +363,9 @@ fn log_route(rec: &Outbound) {
         Outbound::CloseRequested { window } => {
             l.s(b"compositor: close-requested win=").u(*window as u64);
         }
+        Outbound::WindowState { window, state } => {
+            l.s(b"compositor: state win=").u(*window as u64).s(b" state=").u(*state as u64);
+        }
         Outbound::Dismissed { window } => {
             l.s(b"compositor: dismissed win=").u(*window as u64);
         }
@@ -651,7 +654,7 @@ fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
             }
         }
         MgrEvent::DragEnded(g) => {
-            let mut body = [0u8; core::mem::size_of::<ConfigureEvent>()];
+            let mut body = [0u8; core::mem::size_of::<librsproto::surface::MgrDragEnded>()];
             match g.write(&mut body) {
                 Some(n) => send_input(ch, librsproto::surface::OP_MGR_DRAG_ENDED, &body[..n]),
                 None => unserialisable(b"DragEnded"),
@@ -712,6 +715,13 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
             let mut body = [0u8; 4];
             match (librsproto::surface::WindowRef { window: *window }).write(&mut body) {
                 Some(n) => send_input(ch, librsproto::surface::OP_CLOSE_REQUESTED, &body[..n]),
+                None => true,
+            }
+        }
+        Outbound::WindowState { window, state } => {
+            let mut body = [0u8; 8];
+            match (librsproto::surface::WindowState { window: *window, state: *state }).write(&mut body) {
+                Some(n) => send_input(ch, librsproto::surface::OP_WINDOW_STATE, &body[..n]),
                 None => true,
             }
         }
@@ -933,29 +943,30 @@ fn route_one_batch(
                 }
                 // One event for the gesture, at the release; the manager answers with a
                 // `Configure`, so a window's geometry has one path.
-                if let Some((window, rect)) = routed.resized {
+                if let Some(e) = routed.ended {
+                    let (a, f) = (e.asked, e.from);
                     Line::new()
-                        .s(b"compositor: interactive resize of window ")
-                        .u(window as u64)
+                        .s(b"compositor: gesture on window ")
+                        .u(e.window as u64)
                         .s(b" ended at ")
-                        .i(rect.origin.x as i64)
+                        .i(a.origin.x as i64)
                         .s(b",")
-                        .i(rect.origin.y as i64)
+                        .i(a.origin.y as i64)
                         .s(b" ")
-                        .u(rect.size.w as u64)
+                        .u(a.size.w as u64)
                         .s(b"x")
-                        .u(rect.size.h as u64)
+                        .u(a.size.h as u64)
                         .end();
-                    mgr_emit(
-                        srv,
-                        MgrEvent::DragEnded(librsproto::surface::ConfigureEvent {
-                            window,
-                            width: rect.size.w,
-                            height: rect.size.h,
-                            x: rect.origin.x,
-                            y: rect.origin.y,
-                        }),
-                    );
+                    let rect = |r: libdraw::geom::Rect| ConfigureEvent {
+                        window: e.window,
+                        width: r.size.w,
+                        height: r.size.h,
+                        x: r.origin.x,
+                        y: r.origin.y,
+                    };
+                    let flags = if e.moved { librsproto::surface::DRAG_ENDED_MOVED } else { 0 };
+                    let ended = librsproto::surface::MgrDragEnded { asked: rect(a), from: rect(f), flags };
+                    mgr_emit(srv, MgrEvent::DragEnded(ended));
                 }
                 // Drained per event: a chord and the window events it causes must reach the manager
                 // in order.
@@ -1359,9 +1370,7 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
     if op == librsproto::surface::OP_MGR_SET_SCHEME && matches!(mgr_outcome, MgrOutcome::Applied { .. }) {
         Line::new().s(b"compositor: scheme ").s(srv.stack.scheme().as_str().as_bytes()).end();
     }
-    // A manager acting on a window invalidates what it last asked to be: the `RequestState` dedup
-    // sees client requests only and would drop the next identical one as a repeat.
-    if let MgrOutcome::Applied { window: Some(w), .. } | MgrOutcome::Configure { window: w, .. } = mgr_outcome {
+    if let Some(w) = mgr_outcome.acted_on() {
         srv.stack.clear_state_request(w);
     }
     drain_stack_events(srv);
@@ -1378,6 +1387,16 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
                 None => repaint(srv, screen),
             }
             announce_focus(srv);
+            reply_on_session(ch, op, request_id, &[]);
+        }
+        MgrOutcome::State { window, state } => {
+            // To the client only: the compositor keeps no notion of a window's state.
+            let Some(slot) = srv.session_of(window) else {
+                return reply_error_on_session(ch, op, request_id, KError::NotFound);
+            };
+            let rec = Outbound::WindowState { window, state };
+            log_route(&rec);
+            enqueue(srv, slot, rec);
             reply_on_session(ch, op, request_id, &[]);
         }
         MgrOutcome::RegisterZone(z) => {

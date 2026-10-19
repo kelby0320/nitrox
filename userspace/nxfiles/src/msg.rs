@@ -131,6 +131,8 @@ pub enum Msg {
     ResizeWindow(u32),
     /// A title-bar button asking the manager for a window state.
     RequestState(u32),
+    /// The manager put this window in this state: the maximise button follows it, not its click.
+    WindowState(u32),
     /// Somebody wants this window gone — its own close button, or the shell asking.
     Close,
     /// A word on the menu bar was pressed: open that menu, or close it if it was already open.

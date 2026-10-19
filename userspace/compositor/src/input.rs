@@ -34,11 +34,23 @@ pub struct Routed {
     pub consumed: bool,
     /// The outline moved: where it was, and where it is now. See [`Outline`].
     pub outline: Option<Outline>,
-    /// A gesture ended, and this is the rectangle it asks for; the manager applies it, so it
-    /// becomes a `DragEnded`.
-    pub resized: Option<(u32, Rect)>,
+    /// A gesture ended; the manager is told, as a `DragEnded`, and answers it.
+    pub ended: Option<Ended>,
     /// A popup a press landed outside of; the compositor reports, its owner decides to close.
     pub dismissed: Option<u32>,
+}
+
+/// A finished gesture, for the manager: what it asks for, and the window's rectangle when it began.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Ended {
+    /// The window moved or resized.
+    pub window: u32,
+    /// A resize's final rectangle, a snap zone's target, or where a plain move left the window.
+    pub asked: Rect,
+    /// The window's rectangle when the gesture began.
+    pub from: Rect,
+    /// A plain move: the window is already at `asked`.
+    pub moved: bool,
 }
 
 /// Where the resize outline was and where it is now, both to repaint: it is drawn over the stack.
@@ -56,7 +68,13 @@ struct Drag {
     window: u32,
     from: Point,
     origin: Point,
+    /// The pointer has gone [`DRAG_THRESHOLD`] from the press; until then nothing moves.
+    going: bool,
 }
+
+/// How far the pointer travels from a press before a move begins, in pixels: a click with a
+/// tremor in it stays a click, rather than moving a maximised window a pixel and so restoring it.
+pub const DRAG_THRESHOLD: i32 = 4;
 
 /// A drag-and-drop gesture run on a client's behalf; the payload is a path, never a handle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,7 +255,7 @@ impl InputRouter {
 
         // Reconcile after the mirror: it emits, and one batch's records must agree on `buttons`.
         self.reconcile_with(stack, out);
-        let mut ended: Option<(u32, Rect)> = None;
+        let mut ended: Option<Ended> = None;
         let mut outline_gone: Option<Outline> = None;
         // A drag implies a grab, enforced here: `reconcile_with` breaks a grab but cannot reach the
         // drag.
@@ -256,12 +274,12 @@ impl InputRouter {
             Logical::Key { keycode, pressed, modifiers, locks, .. } => {
                 // Before focus routing, and consuming: a copy would type the `2` of `Super+2` too.
                 if self.take_as_hotkey(keycode, pressed, modifiers) {
-                    return Routed { consumed: true, resized: ended, outline: outline_gone, ..Routed::default() };
+                    return Routed { consumed: true, ended, outline: outline_gone, ..Routed::default() };
                 }
                 let Some(window) = stack.focus_candidate() else {
                     // Nothing focusable: dropped, not sent to the pointer's window, or typing would
                     // follow the cursor. A gesture ending on this event still gets out.
-                    return Routed { resized: ended, outline: outline_gone, ..Routed::default() };
+                    return Routed { ended, outline: outline_gone, ..Routed::default() };
                 };
                 // TODO(focus-change-key-balance): a key held across a focus change is delivered
                 // to one window and released to another, or to none. Harmless today because
@@ -271,7 +289,7 @@ impl InputRouter {
                 out.push(Outbound::Key {
                     event: KeyEvent::new(window, keycode, u16::from(pressed), modifiers).with_locks(locks),
                 });
-                Routed { resized: ended, outline: outline_gone, ..Routed::default() }
+                Routed { ended, outline: outline_gone, ..Routed::default() }
             }
 
             Logical::Motion { dx, dy, .. } => {
@@ -290,7 +308,7 @@ impl InputRouter {
                 if let Some(window) = self.target(stack) {
                     self.emit(window, POINTER_MOTION, 0, 0, stack, out);
                 }
-                Routed { moved, outline, resized: ended, ..Routed::default() }
+                Routed { moved, outline, ended, ..Routed::default() }
             }
 
             Logical::Button { button, pressed, buttons, .. } => {
@@ -351,7 +369,7 @@ impl InputRouter {
                     self.grab_broken = false;
                     self.update_crossing(stack, out);
                 }
-                Routed { restacked, resized: ended, outline: outline_gone, dismissed, ..Routed::default() }
+                Routed { restacked, ended, outline: outline_gone, dismissed, ..Routed::default() }
             }
 
             // The wheel goes where the pointer is (the grab holder mid-drag). No crossing pass or
@@ -360,7 +378,7 @@ impl InputRouter {
                 if let Some(window) = self.target(stack) {
                     self.emit_wheel(window, dz, stack, out);
                 }
-                Routed { resized: ended, outline: outline_gone, ..Routed::default() }
+                Routed { ended, outline: outline_gone, ..Routed::default() }
             }
 
             Logical::Dropped { .. } => {
@@ -383,7 +401,7 @@ impl InputRouter {
                 // release.
                 self.consumed.clear();
                 self.held.clear();
-                Routed { resized: ended, outline: outline_gone, ..Routed::default() }
+                Routed { ended, outline: outline_gone, ..Routed::default() }
             }
         }
     }
@@ -455,7 +473,7 @@ impl InputRouter {
         }
         let origin = stack.window(window).ok_or(StackError::NoSuchWindow)?.origin;
         stack.begin_drag(window)?;
-        self.drag = Some(Drag { window, from: self.grab_at, origin });
+        self.drag = Some(Drag { window, from: self.grab_at, origin, going: false });
         // Applied at once: the pointer moved during the round trip. Its damage is returned.
         Ok(self.drag_to_pointer(stack))
     }
@@ -604,7 +622,7 @@ impl InputRouter {
 
     /// Show, or stop showing, the snap target under the pointer during a move; `None` if unchanged.
     fn preview_zone(&mut self) -> Option<Outline> {
-        if self.drag.is_none() {
+        if !self.drag.is_some_and(|d| d.going) {
             // Not a move shows no preview, and anything left over from one goes.
             return self.leave_zone();
         }
@@ -633,7 +651,7 @@ impl InputRouter {
     /// Called wherever the grab ends, like [`stop_drag`](Self::stop_drag). `finished` is true only
     /// for the button coming up: a resize has applied nothing, so reporting from a guessed position
     /// (`Dropped`) would jump the window to a half-chosen size.
-    fn stop_resize(&mut self, stack: &mut WindowStack, finished: bool) -> (Option<(u32, Rect)>, Option<Outline>) {
+    fn stop_resize(&mut self, stack: &mut WindowStack, finished: bool) -> (Option<Ended>, Option<Outline>) {
         let Some(r) = self.resize else { return (None, None) };
         let final_rect = self.outline_now();
         self.resize = None;
@@ -641,30 +659,52 @@ impl InputRouter {
         let gone = self.outline.take().map(|was| Outline { was: Some(was), now: None });
         // A request needs the gesture finished, the window on screen, and the rectangle changed.
         let on_screen = stack.window(r.window).is_some_and(|w| w.visible_on(stack.current_desktop()));
-        let rect = (finished && final_rect != r.rect && on_screen).then_some((r.window, final_rect));
-        (rect, gone)
+        let ended = (finished && final_rect != r.rect && on_screen).then_some(Ended {
+            window: r.window,
+            asked: final_rect,
+            from: r.rect,
+            moved: false,
+        });
+        (ended, gone)
     }
 
     /// End an interactive move, if one is running, wherever the grab ends: a drag outliving it kept
     /// following a pointer with nothing held.
-    fn stop_drag(&mut self, stack: &mut WindowStack, finished: bool) -> (Option<(u32, Rect)>, Option<Outline>) {
+    fn stop_drag(&mut self, stack: &mut WindowStack, finished: bool) -> (Option<Ended>, Option<Outline>) {
         let Some(d) = self.drag.take() else { return (None, None) };
         stack.end_drag();
+        // A second line behind `reconcile_with`; pinned by
+        // `a_gesture_whose_window_has_gone_asks_for_nothing…`.
+        let now = stack.window(d.window).map(|w| w.bounds());
         // The zone it ended in, read from `in_zone` so the rectangle asked for is the one shown.
-        let asked = self
+        let zone = self
             .in_zone
             .filter(|_| finished)
             .and_then(|id| self.zones.iter().find(|z| z.id == id))
-            // A second line behind `reconcile_with`; pinned by
-            // `a_gesture_whose_window_has_gone_asks_for_nothing…`.
-            .filter(|_| stack.window(d.window).is_some())
-            .map(|z| (d.window, Rect::new(z.target_x, z.target_y, z.target_w, z.target_h)));
-        (asked, self.leave_zone())
+            .map(|z| Rect::new(z.target_x, z.target_y, z.target_w, z.target_h));
+        let ended = now.and_then(|now| {
+            let from = Rect::new(d.origin.x, d.origin.y, now.size.w, now.size.h);
+            // Outside a zone, a move reports where it went however it ended, as it is already on
+            // screen: the manager learns a person moved the window, which its own `Place` hides.
+            let (asked, moved) = match zone {
+                Some(target) => (target, false),
+                None => ((now != from).then_some(now)?, true),
+            };
+            Some(Ended { window: d.window, asked, from, moved })
+        });
+        (ended, self.leave_zone())
     }
 
     /// Move the dragged window so it keeps the same point under the pointer.
     fn drag_to_pointer(&mut self, stack: &mut WindowStack) -> Option<Rect> {
-        let d = self.drag?;
+        let pointer = self.pointer;
+        let d = self.drag.as_mut()?;
+        let travel = (pointer.x - d.from.x).abs().max((pointer.y - d.from.y).abs());
+        d.going |= travel >= DRAG_THRESHOLD;
+        if !d.going {
+            return None;
+        }
+        let d = *d;
         let origin = Point::new(d.origin.x + (self.pointer.x - d.from.x), d.origin.y + (self.pointer.y - d.from.y));
         match stack.drag_to(d.window, origin) {
             Ok(damage) => Some(damage.rect()),
@@ -1701,6 +1741,11 @@ mod tests {
         r.route(&ev, s, &mut out)
     }
 
+    /// The window and rectangle a routed event's ended gesture asks for.
+    fn asked(r: Routed) -> Option<(u32, Rect)> {
+        r.ended.map(|e| (e.window, e.asked))
+    }
+
     fn grip(r: &mut InputRouter, s: &mut WindowStack, w: u32, x: i32, y: i32, edges: u32) {
         warp(r, s, x, y);
         go(r, s, button(true));
@@ -1742,14 +1787,10 @@ mod tests {
         let routed = go_routed(&mut r, &mut s, drag(-130, 0));
         let o = routed.outline.expect("the zone is previewed");
         assert_eq!(o.now, Some(Rect::new(0, 0, 320, 480)), "the target, not the trigger");
-        assert!(routed.resized.is_none(), "nothing is asked for until the button comes up");
+        assert!(asked(routed).is_none(), "nothing is asked for until the button comes up");
 
         let routed = go_routed(&mut r, &mut s, button(false));
-        assert_eq!(
-            routed.resized,
-            Some((w, Rect::new(0, 0, 320, 480))),
-            "the drop asks for exactly what was previewed"
-        );
+        assert_eq!(asked(routed), Some((w, Rect::new(0, 0, 320, 480))), "the drop asks for exactly what was previewed");
         assert_eq!(routed.outline.expect("taken down").now, None);
     }
 
@@ -1766,7 +1807,42 @@ mod tests {
         assert_eq!(out.outline.expect("the preview goes with the pointer").now, None);
 
         let routed = go_routed(&mut r, &mut s, button(false));
-        assert!(routed.resized.is_none(), "a drag through a zone asks for nothing");
+        let now = s.window(w).unwrap().bounds();
+        assert_eq!(asked(routed), Some((w, now)), "where the move left it, not the zone's target");
+        assert_eq!(now, Rect::new(170, 200, 100, 80));
+    }
+
+    #[test]
+    fn a_plain_move_reports_where_it_went_and_where_it_came_from() {
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
+        let mut r = InputRouter::new(SCREEN);
+        hold(&mut r, &mut s, w, 240, 240);
+        go(&mut r, &mut s, drag(-50, 30));
+        let e = go_routed(&mut r, &mut s, button(false)).ended.expect("a move that went somewhere is reported");
+        assert_eq!((e.window, e.asked, e.from), (w, Rect::new(150, 230, 100, 80), Rect::new(200, 200, 100, 80)));
+        assert!(e.moved, "already on screen, so nothing is asked");
+    }
+
+    #[test]
+    fn a_click_on_a_title_bar_reports_no_move() {
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
+        let mut r = InputRouter::new(SCREEN);
+        hold(&mut r, &mut s, w, 240, 240);
+        assert_eq!(go_routed(&mut r, &mut s, button(false)).ended, None);
+    }
+
+    #[test]
+    fn a_snap_reports_the_rectangle_from_before_the_drag_not_where_the_pointer_took_it() {
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 200, 200, 100, 80);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_zone(zone(1, (0, 0, 20, 480), (0, 0, 320, 480))).unwrap();
+        hold(&mut r, &mut s, w, 240, 240);
+        go(&mut r, &mut s, drag(-230, 0));
+        let e = go_routed(&mut r, &mut s, button(false)).ended.expect("a drop in a zone");
+        assert_eq!((e.asked, e.from, e.moved), (Rect::new(0, 0, 320, 480), Rect::new(200, 200, 100, 80), false));
     }
 
     #[test]
@@ -1832,7 +1908,7 @@ mod tests {
         assert_eq!(moved.was, Some(Rect::new(0, 0, 320, 480)));
         assert_eq!(moved.now, Some(Rect::new(0, 24, 320, 456)));
         assert_eq!(
-            go_routed(&mut r, &mut s, button(false)).resized,
+            asked(go_routed(&mut r, &mut s, button(false))),
             Some((w, Rect::new(0, 24, 320, 456))),
             "and the drop asks for the rectangle now on screen"
         );
@@ -1854,9 +1930,29 @@ mod tests {
                 s.set_minimized(w, true).expect("put away mid-drag");
                 go_routed(&mut r, &mut s, key(30, true))
             };
-            assert!(routed.resized.is_none(), "loss={interrupted_by_loss}: an unfinished drag asked for a snap");
+            let e = routed.ended.expect("the move itself is on screen, so it is reported");
+            assert!(e.moved, "loss={interrupted_by_loss}: an unfinished drag asked for a snap");
+            assert_eq!(e.asked, Rect::new(-30, 200, 100, 80), "loss={interrupted_by_loss}");
             assert_eq!(routed.outline.expect("the preview is taken down").now, None, "loss={interrupted_by_loss}");
         }
+    }
+
+    #[test]
+    fn a_click_that_shakes_by_less_than_the_threshold_moves_nothing_and_snaps_nothing() {
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 0, 30, 640, 420);
+        let mut r = InputRouter::new(SCREEN);
+        r.register_zone(zone(7, (0, 0, 640, 54), (0, 30, 640, 450))).unwrap();
+        hold(&mut r, &mut s, w, 300, 40);
+        let shaken = go_routed(&mut r, &mut s, drag(DRAG_THRESHOLD - 1, 1));
+        assert_eq!((shaken.moved, shaken.outline), (None, None), "neither the window nor a zone's preview");
+        assert_eq!(go_routed(&mut r, &mut s, button(false)).ended, None);
+        assert_eq!(s.window(w).unwrap().bounds(), Rect::new(0, 30, 640, 420));
+
+        hold(&mut r, &mut s, w, 300, 40);
+        go(&mut r, &mut s, drag(DRAG_THRESHOLD, 0));
+        let e = go_routed(&mut r, &mut s, button(false)).ended.expect("at the threshold it moves");
+        assert_eq!(e.asked, Rect::new(0, 30, 640, 450), "and the zone under the pointer takes it");
     }
 
     #[test]
@@ -1933,7 +2029,7 @@ mod tests {
             "the window itself has not changed at all"
         );
         assert!(routed.moved.is_none(), "and nothing was moved");
-        assert!(routed.resized.is_none(), "nothing is reported until the button comes up");
+        assert!(asked(routed).is_none(), "nothing is reported until the button comes up");
     }
 
     #[test]
@@ -1991,10 +2087,12 @@ mod tests {
 
         let routed = go_routed(&mut r, &mut s, button(false));
         assert_eq!(
-            routed.resized,
+            asked(routed),
             Some((w, Rect::new(100, 100, 240, 130))),
             "one report, carrying where the user let go"
         );
+        assert_eq!(routed.ended.unwrap().from, Rect::new(100, 100, 200, 100), "and where it began");
+        assert!(!routed.ended.unwrap().moved, "a resize applies nothing");
         let o = routed.outline.expect("the outline is taken down");
         assert_eq!(o.now, None);
         assert_eq!(
@@ -2002,7 +2100,7 @@ mod tests {
             Rect::new(100, 100, 200, 100),
             "and the compositor still has not resized the client"
         );
-        assert_eq!(go_routed(&mut r, &mut s, button(false)).resized, None);
+        assert_eq!(asked(go_routed(&mut r, &mut s, button(false))), None);
     }
 
     #[test]
@@ -2011,7 +2109,7 @@ mod tests {
         let w = win(&mut s, Role::Normal, 100, 100, 200, 100);
         let mut r = InputRouter::new(SCREEN);
         grip(&mut r, &mut s, w, 299, 199, RESIZE_RIGHT | RESIZE_BOTTOM);
-        assert_eq!(go_routed(&mut r, &mut s, button(false)).resized, None);
+        assert_eq!(asked(go_routed(&mut r, &mut s, button(false))), None);
     }
 
     #[test]
@@ -2043,7 +2141,7 @@ mod tests {
         go(&mut r, &mut s, drag(40, 0));
         assert_eq!(r.start_resize(w, RESIZE_RIGHT, &mut s), Ok(Some(Rect::new(100, 100, 240, 100))));
         assert_eq!(
-            go_routed(&mut r, &mut s, button(false)).resized,
+            asked(go_routed(&mut r, &mut s, button(false))),
             Some((w, Rect::new(100, 100, 240, 100))),
             "the second request named the drag already running"
         );
@@ -2061,7 +2159,7 @@ mod tests {
         go(&mut r, &mut s, drag(40, 30));
 
         let routed = go_routed(&mut r, &mut s, Logical::Dropped { time_ns: T });
-        assert_eq!(routed.resized, None, "a gesture the user did not finish asks for nothing");
+        assert_eq!(asked(routed), None, "a gesture the user did not finish asks for nothing");
         assert_eq!(routed.outline.expect("taken down").now, None);
         assert!(s.place(w, Point::new(0, 0)).is_ok(), "and the window is a manager's again");
     }
@@ -2096,10 +2194,7 @@ mod tests {
                 None,
                 "{arm}: the outline outlived the gesture"
             );
-            assert!(
-                routed.resized.is_none(),
-                "{arm}: nothing is asked of the shell for a window that is not on screen"
-            );
+            assert!(asked(routed).is_none(), "{arm}: nothing is asked of the shell for a window that is not on screen");
         }
     }
 

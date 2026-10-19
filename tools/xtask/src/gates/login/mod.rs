@@ -249,11 +249,14 @@ fn login_menus_and_buttons(qmp: &mut Qmp, session: &mut Session, size: DisplaySi
 
     click_at(qmp, session, maximise_at.0, maximise_at.1)?;
     // **In any order**: `nxterm` logs after the compositor answers, so the shell's line can lead.
+    // **Told before the next click**: the button follows what the shell says, not its own click.
+    // The client's resize is in the same wait, as it can come between the shell's two lines.
     let maximised = format!("desktop-shell: maximize window {term_id} to {},{} {}x{}", work.0, work.1, work.2, work.3);
-    session.expect_all(&["nxterm: asked the shell for window state 2", &maximised])?;
+    let told = format!("desktop-shell: window {term_id} told state 2");
+    let took = format!("nxterm: resized to {}x{}, grid ", work.2, work.3);
+    session.expect_all(&["nxterm: asked the shell for window state 2", &maximised, &told, &took])?;
     println!("  ok: maximise asked for the work area, not the screen");
 
-    session.expect(&format!("nxterm: resized to {}x{}, grid ", work.2, work.3))?;
     // **The committed geometry, not the client's report**: the window keeps its old size until the
     // next frame is committed, and a click on the first line lands outside it.
     session.expect(&format!("desktop-shell: window {term_id} geometry {},{} {}x{}", work.0, work.1, work.2, work.3))?;
@@ -261,8 +264,9 @@ fn login_menus_and_buttons(qmp: &mut Qmp, session: &mut Session, size: DisplaySi
     session.expect_all(&[
         "nxterm: asked the shell for window state 0",
         &format!("desktop-shell: restore window {term_id} to "),
+        &format!("desktop-shell: window {term_id} told state 0"),
+        &format!("nxterm: resized to {term_w}x{term_h}, grid "),
     ])?;
-    session.expect(&format!("nxterm: resized to {term_w}x{term_h}, grid "))?;
     println!("  ok: and the same button restored it to where it came from");
 
     click_at(qmp, session, minimise_at.0, minimise_at.1)?;

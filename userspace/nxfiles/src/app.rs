@@ -561,11 +561,11 @@ impl App {
                 p.show_hidden = !p.show_hidden;
                 self.goto = Some(self.pane().path.clone());
             }
-            Msg::RequestState(s) => {
+            Msg::RequestState(s) => self.state_requested = Some(s),
+            Msg::WindowState(s) => {
                 if s == WINDOW_STATE_MAXIMIZED || s == WINDOW_STATE_NORMAL {
                     self.maximized = s == WINDOW_STATE_MAXIMIZED;
                 }
-                self.state_requested = Some(s);
             }
         }
     }

@@ -132,3 +132,17 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-19	387	b1e64890	13	rules-and-docs	optional	demonstrated	fixed	095d7676	Step::Key's and redraw's doc comments
 2026-10-19	387	b1e64890	14	rules-and-docs	optional	demonstrated	fixed	095d7676	nxsh CLAUDE.md lists search and editor; test-interactive's count is 48, read off a boot (37 was stale before C.2)
 2026-10-19	387	b1e64890	15	architecture	optional	unverified	fixed	785ce316	the maintainer's call: the discipline moved to libline, below tty-server and nxsh; scaffold 70d47971, move d5d571ab held by check-moves
+2026-10-19	388	c81a8530	1	architecture+error-paths+logic	blocking	demonstrated	fixed	7fcda1ff	DragEnded carries DRAG_ENDED_MOVED; the shell configures what is not on screen instead of comparing with its stale copy; docs state the real order (DragEnded queued first)
+2026-10-19	388	c81a8530	2	logic	worth-fixing	demonstrated	fixed	7fcda1ff	DRAG_THRESHOLD 4 px: nothing moves and no zone previews until the pointer has gone that far
+2026-10-19	388	c81a8530	3	tests	worth-fixing	demonstrated	fixed	7fcda1ff	decode moved to libsurface::events, tested per event; a session test drives WindowState through the fake transport; dropping the dispatch fails 13
+2026-10-19	388	c81a8530	4	logic+architecture	optional	demonstrated	fixed	7fcda1ff	the moved flag: a dialog's plain move is not configured
+2026-10-19	388	c81a8530	5	error-paths+logic	optional	demonstrated	fixed	7fcda1ff	snap::forget drops a destroyed window's restore entry, queued gestures and requests in the drain; the call site in the drain is by reading
+2026-10-19	388	c81a8530	6	error-paths	optional	demonstrated	fixed	7fcda1ff	snap::declined answers a declined or unlisted request with the window's state; the spec makes it a manager's rule; answer_states' call sites are by reading
+2026-10-19	388	c81a8530	7	logic+architecture+error-paths	optional	demonstrated	fixed	7fcda1ff	the state route line goes through the log cap; no gate reads it; check-login passes
+2026-10-19	388	c81a8530	8	error-paths	optional	demonstrated	fixed	7fcda1ff	a plain move is reported however it ends; an unfinished move in a zone reports the plain move, never the snap
+2026-10-19	388	c81a8530	9	tests	optional	demonstrated	fixed	7fcda1ff	MgrOutcome::acted_on, tested; the WindowState encoding is covered by check-login 6l's boot control (an nxterm not applying the state fails round 2)
+2026-10-19	388	c81a8530	10	tests	optional	demonstrated	fixed	7fcda1ff	snap_zones tested on a small odd work area at the screen's top; the three mutations fail
+2026-10-19	388	c81a8530	11	tests	optional	demonstrated	declined		ROWS = 20 is the maintainer's call, recorded in the decision log; what depends on it (the cascade's places) is tested by height; a test restating the constant pins nothing
+2026-10-19	388	c81a8530	12	rules-and-docs	optional	unverified	fixed	7fcda1ff	the history note says the cascade wraps in the work area since C.3
+2026-10-19	388	c81a8530	13	rules-and-docs	optional	unverified	fixed	7fcda1ff	reflowed
+2026-10-19	388	c81a8530	14	rules-and-docs	optional	unverified	fixed	7fcda1ff	RegisterSnapZone: DragEnded asks for the target with the rectangle the window began at; a trigger may lie over a bar

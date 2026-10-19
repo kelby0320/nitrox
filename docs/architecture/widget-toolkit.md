@@ -722,7 +722,8 @@ needed them, so they exist:
 **Both ask and neither acts**, which is not the toolkit's rule but the protocol's:
 minimising and maximising are the manager's operations, so the messages a client emits from
 this bar become `Surface::RequestState`, and the shell decides
-([`desktop-shell.md`](desktop-shell.md)). Close is the exception in both directions — a
+([`desktop-shell.md`](desktop-shell.md)) and says what it decided with `Surface::WindowState`,
+which is what an application's maximise button follows. Close is the exception in both directions — a
 client's own close button ends the client, and it is the *manager* that has to ask a client to
 close, because only the compositor can reach a client's session. The grip's message becomes
 `Surface::StartResize`, after which nothing reaches this client until a `Configure` arrives at the

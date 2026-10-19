@@ -1092,6 +1092,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                 }
                 WindowEvent::Dismissed => {}
+                WindowEvent::State(s) => app.update(Msg::WindowState(s)),
                 // The shell asking, answered as the close button is: the kernel closes this
                 // process's handles and the compositor tears its windows down.
                 WindowEvent::CloseRequested => {
