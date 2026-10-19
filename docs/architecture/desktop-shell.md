@@ -19,7 +19,8 @@ holds neither; **M13 Part C made the overview a translucent `ARGB8888` surface o
 desktop**, replacing the dimmed copy of the wallpaper it used to redraw; **M14 Part H made the
 applications modal list desktop entries** rather than every program in `/bin`; **Phase 5 Part E laid
 it out on the screen it is on** — every bar, the wallpaper, the overview and the placement cascade
-sized from `/dev/draw/screen` rather than a written-down 1280×800 (see
+sized from `/dev/draw/screen` rather than a written-down 1280×800, the cascade wrapping in the work
+area since pre-Phase-7 Part C.3 (see
 [`clipboard.md`](clipboard.md) and `display-arm-plan.md` M12 decision 2); and **the desktop
 refresh's Part C (checked 2026-09-18) gave it the design's panels** — 30 pixels each on the panel
 ground: an Applications *menu* that still filters as you type and a Places menu, replacing the
@@ -97,14 +98,14 @@ work area for an edge, a quarter for a corner, and the whole work area for the t
 and corners reach up over the top bar. The compositor previews the target under the pointer and
 matches the table; which region means which rectangle never reaches it. **A drop at the top
 maximises**, as the button does: the shell keeps the rectangle the window had before the drag to
-restore to, which `DragEnded` carries because the drag's own geometry event overtakes it, and tells
-the window's client with `Manage::SetWindowState`, forwarded as `Surface::WindowState`. **A maximise
-button shows what the shell said**, not what its own click asked, so it is right after a drop or a
-refusal. A plain move ends in a `DragEnded` too, which is how the shell learns that a person moved a
-maximised window, and makes it normal. The decisions are `desktop_shell::snap`, host-tested. Closing
-is the pair the milestone added at both ends: a client's own close button ends the client, and the
-window list's middle-click sends `Manage::RequestClose` — an *ask*, which a client with unsaved work
-answers with a dialog.
+restore to, which `DragEnded` carries because the shell has applied the drag's own geometry by the
+time it answers, and tells the window's client with `Manage::SetWindowState`, forwarded as
+`Surface::WindowState`. **A maximise button shows what the shell said**, not what its own click
+asked, so it is right after a drop or a refusal. A plain move ends in a `DragEnded` too, which is
+how the shell learns that a person moved a maximised window, and makes it normal. The decisions are
+`desktop_shell::snap`, host-tested. Closing is the pair the milestone added at both ends: a client's
+own close button ends the client, and the window list's middle-click sends `Manage::RequestClose` —
+an *ask*, which a client with unsaved work answers with a dialog.
 
 **The insist is a second middle-click, not a clock** (M12 Part A). It was `Manage::Close` two
 seconds later, and that was safe for exactly as long as no client could decline: every

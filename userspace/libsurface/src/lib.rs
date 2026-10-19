@@ -16,14 +16,14 @@ use alloc::vec::Vec;
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::Geometry;
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, FocusEvent, KeyEvent, OP_ATTACH_BUFFER,
-    OP_COMMIT, OP_CONFIGURE, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_FOCUS_EVENT, OP_KEY_EVENT, OP_POINTER_EVENT,
-    OP_RELEASE, PointerEvent, Role, SURFACE_FORMAT_ARGB8888, SURFACE_FORMAT_XRGB8888, build_attach_buffer_request,
-    build_commit_request, build_create_window_request, build_destroy_window_request, parse_create_window_reply,
-    parse_release_event,
+    AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, KeyEvent, OP_ATTACH_BUFFER, OP_COMMIT,
+    OP_CONFIGURE, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_RELEASE, PointerEvent, Role, SURFACE_FORMAT_ARGB8888,
+    SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request, build_create_window_request,
+    build_destroy_window_request, parse_create_window_reply, parse_release_event,
 };
 
 pub mod buffers;
+mod events;
 pub mod ipc;
 pub mod screen;
 
@@ -353,65 +353,6 @@ impl<T: Transport> Session<T> {
                     b.busy = false;
                 }
             }
-            OP_KEY_EVENT => {
-                if let Some(e) = KeyEvent::read(body)
-                    && let Some(i) = self.idx(e.window)
-                {
-                    self.enqueue(i, WindowEvent::Key(e));
-                }
-            }
-            OP_POINTER_EVENT => {
-                if let Some(e) = PointerEvent::read(body)
-                    && let Some(i) = self.idx(e.window)
-                {
-                    self.enqueue(i, WindowEvent::Pointer(e));
-                }
-            }
-            OP_FOCUS_EVENT => {
-                if let Some(e) = FocusEvent::read(body)
-                    && let Some(i) = self.idx(e.window)
-                {
-                    self.enqueue(i, WindowEvent::Focus(e.focused != 0));
-                }
-            }
-            librsproto::surface::OP_DROPPED => {
-                if let Some((e, acceptor, path, name)) = librsproto::surface::DroppedEvent::read(body)
-                    && let Some(i) = self.idx(e.window)
-                {
-                    self.enqueue(
-                        i,
-                        WindowEvent::Drop {
-                            acceptor: alloc::string::String::from(acceptor),
-                            kind: e.kind,
-                            path: alloc::string::String::from(path),
-                            name: alloc::string::String::from(name),
-                            x: e.x,
-                            y: e.y,
-                        },
-                    );
-                }
-            }
-            librsproto::surface::OP_CLOSE_REQUESTED => {
-                if let Some(r) = librsproto::surface::WindowRef::read(body)
-                    && let Some(i) = self.idx(r.window)
-                {
-                    self.enqueue(i, WindowEvent::CloseRequested);
-                }
-            }
-            librsproto::surface::OP_DISMISSED => {
-                if let Some(r) = librsproto::surface::WindowRef::read(body)
-                    && let Some(i) = self.idx(r.window)
-                {
-                    self.enqueue(i, WindowEvent::Dismissed);
-                }
-            }
-            librsproto::surface::OP_WINDOW_STATE => {
-                if let Some(s) = librsproto::surface::WindowState::read(body)
-                    && let Some(i) = self.idx(s.window)
-                {
-                    self.enqueue(i, WindowEvent::State(s.state));
-                }
-            }
             OP_CONFIGURE => {
                 if let Some(e) = ConfigureEvent::read(body)
                     && let Some(i) = self.idx(e.window)
@@ -424,7 +365,13 @@ impl<T: Transport> Session<T> {
                     self.windows[i].mapped = true;
                 }
             }
-            _ => {}
+            _ => {
+                if let Some((window, event)) = events::window_event(op, body)
+                    && let Some(i) = self.idx(window)
+                {
+                    self.enqueue(i, event);
+                }
+            }
         }
     }
 
@@ -685,7 +632,9 @@ fn parent_of(role: Role) -> Option<u32> {
 mod tests {
     use super::*;
     use alloc::vec;
-    use librsproto::surface::{MOD_SHIFT, POINTER_MOTION};
+    use librsproto::surface::{
+        FocusEvent, MOD_SHIFT, OP_FOCUS_EVENT, OP_KEY_EVENT, OP_POINTER_EVENT, OP_WINDOW_STATE, POINTER_MOTION,
+    };
 
     #[derive(Default)]
     struct MockTransport {
@@ -1305,6 +1254,19 @@ mod tests {
         w.pump().expect("pump");
         assert_eq!(w.next_event(), Some(WindowEvent::Focus(true)));
         assert_eq!(w.next_event(), Some(WindowEvent::Focus(false)));
+    }
+
+    #[test]
+    fn the_managers_word_on_a_windows_state_reaches_that_windows_queue() {
+        let mut w = window(2);
+        for (window, state) in [(w.id(), 2u32), (w.id() + 1, 0)] {
+            let mut b = [0u8; 8];
+            librsproto::surface::WindowState { window, state }.write(&mut b).unwrap();
+            w.s.transport.events.insert(0, (OP_WINDOW_STATE, b.to_vec()));
+        }
+        w.pump().expect("pump");
+        assert_eq!(w.next_event(), Some(WindowEvent::State(2)));
+        assert_eq!(w.next_event(), None, "another window's state is not this one's");
     }
 
     #[test]

@@ -1727,7 +1727,11 @@ impl ConfigureEvent {
     }
 }
 
-/// The body of [`DragEnded`](OP_MGR_DRAG_ENDED), 40 bytes: two rectangles of one window.
+/// [`MgrDragEnded::flags`]: a plain move, already on screen where `asked` says.
+pub const DRAG_ENDED_MOVED: u32 = 1 << 0;
+
+/// The body of [`DragEnded`](OP_MGR_DRAG_ENDED), 44 bytes: two rectangles of one window and a
+/// flags word.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct MgrDragEnded {
@@ -1735,18 +1739,27 @@ pub struct MgrDragEnded {
     pub asked: ConfigureEvent,
     /// The window's rectangle when the gesture began, which a manager cannot keep itself.
     pub from: ConfigureEvent,
+    /// [`DRAG_ENDED_MOVED`] for a plain move, which needs no `Configure`.
+    pub flags: u32,
 }
 
 impl MgrDragEnded {
-    /// Serialise into exactly 40 bytes: `asked`, then `from`.
+    /// Serialise into exactly 44 bytes: `asked`, `from`, then `flags`.
     pub fn write(&self, out: &mut [u8]) -> Option<usize> {
-        let n = self.asked.write(out.get_mut(..20)?)?;
-        Some(n + self.from.write(out.get_mut(20..40)?)?)
+        self.asked.write(out.get_mut(..20)?)?;
+        self.from.write(out.get_mut(20..40)?)?;
+        out.get_mut(40..44)?.copy_from_slice(&self.flags.to_le_bytes());
+        Some(44)
     }
 
-    /// Parse from 40 bytes.
+    /// Parse from 44 bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        Some(Self { asked: ConfigureEvent::read(b.get(..20)?)?, from: ConfigureEvent::read(b.get(20..40)?)? })
+        let flags = b.get(40..44)?;
+        Some(Self {
+            asked: ConfigureEvent::read(&b[..20])?,
+            from: ConfigureEvent::read(&b[20..40])?,
+            flags: u32::from_le_bytes([flags[0], flags[1], flags[2], flags[3]]),
+        })
     }
 }
 
@@ -1883,18 +1896,19 @@ mod tests {
     #[test]
     fn a_drag_ended_reads_the_asked_rectangle_then_the_one_it_came_from() {
         // By hand rather than through `write`: a round trip would pass a reader that swapped them.
-        let mut b = [0u8; 40];
-        for (i, v) in [7u32, 1360, 708, 0, 30, 7, 596, 505, 24, 78].iter().enumerate() {
+        let mut b = [0u8; 44];
+        for (i, v) in [7u32, 1360, 708, 0, 30, 7, 596, 505, 24, 78, DRAG_ENDED_MOVED].iter().enumerate() {
             b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
-        let d = MgrDragEnded::read(&b).expect("40 bytes");
+        let d = MgrDragEnded::read(&b).expect("44 bytes");
         assert_eq!(d.asked, ConfigureEvent { window: 7, width: 1360, height: 708, x: 0, y: 30 });
         assert_eq!(d.from, ConfigureEvent { window: 7, width: 596, height: 505, x: 24, y: 78 });
-        assert_eq!(MgrDragEnded::read(&b[..39]), None, "the old 20-byte body, or a short one");
-        let mut out = [0u8; 40];
-        assert_eq!(d.write(&mut out), Some(40));
+        assert_eq!(d.flags, DRAG_ENDED_MOVED);
+        assert_eq!(MgrDragEnded::read(&b[..43]), None, "a 40-byte body, or a short one");
+        let mut out = [0u8; 44];
+        assert_eq!(d.write(&mut out), Some(44));
         assert_eq!(out, b);
-        assert_eq!(d.write(&mut out[..39]), None);
+        assert_eq!(d.write(&mut out[..43]), None);
     }
 
     #[test]

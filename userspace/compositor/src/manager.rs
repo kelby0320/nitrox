@@ -67,6 +67,18 @@ pub enum MgrOutcome {
     },
 }
 
+impl MgrOutcome {
+    /// The window this outcome acted on, which invalidates what it last asked to be: the
+    /// `RequestState` dedup sees client requests only and would drop the next identical one.
+    pub fn acted_on(&self) -> Option<u32> {
+        match *self {
+            MgrOutcome::Applied { window, .. } => window,
+            MgrOutcome::Configure { window, .. } | MgrOutcome::State { window, .. } => Some(window),
+            _ => None,
+        }
+    }
+}
+
 fn refused(e: StackError) -> MgrOutcome {
     MgrOutcome::Failed(match e {
         StackError::NoSuchWindow => SurfaceError::NotFound,
@@ -563,5 +575,16 @@ mod tests {
             dispatch(&mut s, OP_MGR_SET_WINDOW_STATE, &body(ids[0], 0)[..7]),
             MgrOutcome::Failed(SurfaceError::Malformed)
         );
+    }
+
+    #[test]
+    fn a_manager_acting_on_a_window_is_named_so_its_last_request_is_forgotten() {
+        let state = MgrOutcome::State { window: 4, state: WINDOW_STATE_MAXIMIZED };
+        assert_eq!(state.acted_on(), Some(4), "a state told is the manager acting");
+        let configure = MgrOutcome::Configure { window: 5, width: 1, height: 1, origin: Point::new(0, 0) };
+        assert_eq!(configure.acted_on(), Some(5));
+        assert_eq!(MgrOutcome::Applied { window: Some(6), dirty: None }.acted_on(), Some(6));
+        assert_eq!(MgrOutcome::Applied { window: None, dirty: None }.acted_on(), None);
+        assert_eq!(MgrOutcome::Failed(SurfaceError::NotFound).acted_on(), None);
     }
 }

@@ -324,10 +324,10 @@ fn send_lights(srv: &mut Server) {
 }
 
 fn log_route(rec: &Outbound) {
-    // A drop, a dismissal or a state bypasses the cap: one record per gesture, long after it is
-    // spent, and the only evidence the compositor acted (`check-login` waits on `drop win=`,
-    // `dismissed win=`, `state win=`).
-    if !matches!(rec, Outbound::Dropped { .. } | Outbound::Dismissed { .. } | Outbound::WindowState { .. }) {
+    // A drop or a dismissal bypasses the cap: one record per gesture, long after it is spent, and
+    // the only evidence the compositor acted (`check-login` waits on `drop win=`, `dismissed
+    // win=`).
+    if !matches!(rec, Outbound::Dropped { .. } | Outbound::Dismissed { .. }) {
         // SAFETY: single-threaded server; this counter is touched only from the serve loop.
         let n = unsafe { ROUTES_LOGGED };
         if n > MAX_LOGGED_ROUTES {
@@ -964,7 +964,8 @@ fn route_one_batch(
                         x: r.origin.x,
                         y: r.origin.y,
                     };
-                    let ended = librsproto::surface::MgrDragEnded { asked: rect(a), from: rect(f) };
+                    let flags = if e.moved { librsproto::surface::DRAG_ENDED_MOVED } else { 0 };
+                    let ended = librsproto::surface::MgrDragEnded { asked: rect(a), from: rect(f), flags };
                     mgr_emit(srv, MgrEvent::DragEnded(ended));
                 }
                 // Drained per event: a chord and the window events it causes must reach the manager
@@ -1369,12 +1370,7 @@ fn handle_manager_request(ch: u64, srv: &mut Server, screen: &mut Screen<RawFram
     if op == librsproto::surface::OP_MGR_SET_SCHEME && matches!(mgr_outcome, MgrOutcome::Applied { .. }) {
         Line::new().s(b"compositor: scheme ").s(srv.stack.scheme().as_str().as_bytes()).end();
     }
-    // A manager acting on a window invalidates what it last asked to be: the `RequestState` dedup
-    // sees client requests only and would drop the next identical one as a repeat.
-    if let MgrOutcome::Applied { window: Some(w), .. }
-    | MgrOutcome::Configure { window: w, .. }
-    | MgrOutcome::State { window: w, .. } = mgr_outcome
-    {
+    if let Some(w) = mgr_outcome.acted_on() {
         srv.stack.clear_state_request(w);
     }
     drain_stack_events(srv);

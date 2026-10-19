@@ -15,10 +15,10 @@
 "kernel/src/object/thread.rs" = 1047
 "kernel/src/pci/mod.rs" = 1045
 "kernel/src/syscall/table.rs" = 3311
-"userspace/compositor/src/input.rs" = 2594
+"userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
-"userspace/compositor/src/main.rs" = 2333
-"userspace/desktop-shell/src/main.rs" = 1523
+"userspace/compositor/src/main.rs" = 2329
+"userspace/desktop-shell/src/main.rs" = 1498
 "userspace/desktop-shell/src/panel.rs" = 1211
 "userspace/fs-server-ext4/src/ext4.rs" = 2055
 "userspace/fs-server-ext4/src/extent.rs" = 1375
@@ -27,9 +27,9 @@
 "userspace/libdraw/src/compose.rs" = 1510
 "userspace/libdraw/src/theme.rs" = 1086
 "userspace/libfsserver/src/server.rs" = 1046
-"userspace/librsproto/src/surface.rs" = 2553
+"userspace/librsproto/src/surface.rs" = 2567
 "userspace/libsession/src/lib.rs" = 1143
-"userspace/libsurface/src/lib.rs" = 1461
+"userspace/libsurface/src/lib.rs" = 1423
 "userspace/libterm/src/grid.rs" = 1600
 "userspace/libui/src/route.rs" = 1235
 "userspace/libui/src/widget/list_view_tests.rs" = 1042

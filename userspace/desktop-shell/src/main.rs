@@ -748,37 +748,12 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
 
             let work = (layout.work_x, layout.work_y, layout.work_w, layout.work_h);
             for d in dropped {
-                let e = entries.iter().find(|e| e.id == d.asked.window);
-                let now = e.map(|e| (e.origin.0, e.origin.1, e.size.0, e.size.1));
-                let a = desktop_shell::snap::drag_ended(&d, now, work, &mut restore);
+                let a = desktop_shell::snap::drag_ended(&d, work, &mut restore);
                 sent_request |= answer(m, d.asked.window, a, b"drop");
             }
-            // What a client asked to be, decided here: only this process can compute a maximised
-            // rectangle.
-            for s in states {
-                use librsproto::surface::{WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL};
-                let Some(e) = entries.iter_mut().find(|e| e.id == s.window) else { continue };
-                match s.state {
-                    WINDOW_STATE_MINIMIZED => {
-                        if minimize_window(m, e) {
-                            sent_request = true;
-                            list_dirty = true;
-                            Line::new().s(b"desktop-shell: client asked to minimize window ").u(s.window as u64).end();
-                        }
-                    }
-                    WINDOW_STATE_MAXIMIZED | WINDOW_STATE_NORMAL => {
-                        if e.minimized && raise_window(m, e) {
-                            sent_request = true;
-                            list_dirty = true;
-                        }
-                        let now = (e.origin.0, e.origin.1, e.size.0, e.size.1);
-                        let a = desktop_shell::snap::state_requested(s.window, s.state, now, work, &mut restore);
-                        let maximise = s.state == WINDOW_STATE_MAXIMIZED;
-                        sent_request |= answer(m, s.window, a, if maximise { b"maximize" } else { b"restore" });
-                    }
-                    _ => {}
-                }
-            }
+            let (sent, dirty) = answer_states(m, states, &mut entries, &mut restore, work);
+            sent_request |= sent;
+            list_dirty |= dirty;
 
             list_dirty |= normalize_desktops(&mut desktops, &entries, &mut current_desktop, &mut next_desktop_id);
             for id in fired {

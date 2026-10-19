@@ -2,7 +2,8 @@
 //! answers a finished gesture or a window's own request to be maximised or restored.
 
 use librsproto::surface::{
-    ConfigureEvent, MgrDragEnded, MgrLayout, MgrSnapZone, WINDOW_STATE_MAXIMIZED, WINDOW_STATE_NORMAL,
+    ConfigureEvent, DRAG_ENDED_MOVED, MgrDragEnded, MgrLayout, MgrSnapZone, WINDOW_STATE_MAXIMIZED,
+    WINDOW_STATE_NORMAL, WindowState,
 };
 
 /// A rectangle as the shell keeps one: `x`, `y`, width, height.
@@ -60,15 +61,15 @@ fn rect(c: &ConfigureEvent) -> Rect4 {
     (c.x, c.y, c.width, c.height)
 }
 
-/// The answer to a finished gesture on a window the shell knows at `now`: one asking for the whole
-/// work area maximises it, keeping the restore rectangle it had or else the one from before the
-/// drag; any other leaves it normal where it asked.
-pub fn drag_ended(d: &MgrDragEnded, now: Option<Rect4>, work: Rect4, restore: &mut RestoreList) -> Answer {
+/// The answer to a finished gesture: a snap or resize asking for the whole work area maximises the
+/// window, keeping the restore rectangle it had or else the one from before the drag; anything
+/// else leaves it normal where it asked. Only what is not already on screen is configured.
+pub fn drag_ended(d: &MgrDragEnded, work: Rect4, restore: &mut RestoreList) -> Answer {
     let (window, asked) = (d.asked.window, rect(&d.asked));
     let was_maximised = restore.iter().any(|(id, _)| *id == window);
-    // A plain move asks for where the window already is.
-    let configure = (now != Some(asked)).then_some(asked);
-    if asked == work {
+    let moved = d.flags & DRAG_ENDED_MOVED != 0;
+    let configure = (!moved).then_some(asked);
+    if !moved && asked == work {
         if !was_maximised {
             restore.push((window, rect(&d.from)));
         }
@@ -97,6 +98,27 @@ pub fn state_requested(window: u32, state: u32, now: Rect4, work: Rect4, restore
     }
 }
 
+/// The answer to a request the shell does not grant, or for a window it does not list: the state
+/// the window is in. Silence would leave the client's next request for the same state dropped as
+/// a repeat, and its button dead.
+pub fn declined(window: u32, restore: &RestoreList) -> Answer {
+    let maximised = restore.iter().any(|(id, _)| *id == window);
+    Answer { configure: None, tell: Some(if maximised { WINDOW_STATE_MAXIMIZED } else { WINDOW_STATE_NORMAL }) }
+}
+
+/// Forget a destroyed window: its restore rectangle, and any gesture or request of its still to be
+/// answered.
+pub fn forget(
+    window: u32,
+    restore: &mut RestoreList,
+    dropped: &mut alloc::vec::Vec<MgrDragEnded>,
+    states: &mut alloc::vec::Vec<WindowState>,
+) {
+    restore.retain(|(id, _)| *id != window);
+    dropped.retain(|d| d.asked.window != window);
+    states.retain(|s| s.window != window);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,9 +143,15 @@ mod tests {
         (z.target_x, z.target_y, z.target_w, z.target_h)
     }
 
+    /// A snap or a resize: `asked` is not yet on screen.
     fn ended(window: u32, asked: Rect4, from: Rect4) -> MgrDragEnded {
         let c = |r: Rect4| ConfigureEvent { window, x: r.0, y: r.1, width: r.2, height: r.3 };
-        MgrDragEnded { asked: c(asked), from: c(from) }
+        MgrDragEnded { asked: c(asked), from: c(from), flags: 0 }
+    }
+
+    /// A plain move, already where `asked` says.
+    fn moved(window: u32, asked: Rect4, from: Rect4) -> MgrDragEnded {
+        MgrDragEnded { flags: DRAG_ENDED_MOVED, ..ended(window, asked, from) }
     }
 
     #[test]
@@ -153,8 +181,7 @@ mod tests {
     #[test]
     fn a_drop_at_the_top_keeps_the_rectangle_from_before_the_drag() {
         let mut restore = RestoreList::new();
-        // The window's geometry already reads where the drag left it: the same drain carried it.
-        let a = drag_ended(&ended(7, WORK, (24, 78, 596, 505)), Some((300, 20, 596, 505)), WORK, &mut restore);
+        let a = drag_ended(&ended(7, WORK, (24, 78, 596, 505)), WORK, &mut restore);
         assert_eq!(a, Answer { configure: Some(WORK), tell: Some(WINDOW_STATE_MAXIMIZED) });
         assert_eq!(restore, [(7, (24, 78, 596, 505))]);
     }
@@ -162,7 +189,7 @@ mod tests {
     #[test]
     fn a_drop_at_the_top_of_a_maximised_window_keeps_the_restore_rectangle_it_had() {
         let mut restore: RestoreList = alloc::vec![(7, (24, 78, 596, 505))];
-        let a = drag_ended(&ended(7, WORK, (100, 40, 1360, 708)), Some((100, 40, 1360, 708)), WORK, &mut restore);
+        let a = drag_ended(&ended(7, WORK, (100, 40, 1360, 708)), WORK, &mut restore);
         assert_eq!(a, Answer { configure: Some(WORK), tell: None }, "it was maximised already");
         assert_eq!(restore, [(7, (24, 78, 596, 505))]);
     }
@@ -171,13 +198,13 @@ mod tests {
     fn a_maximised_window_moved_or_snapped_elsewhere_is_normal_again() {
         let half = (0, 30, 680, 708);
         let mut restore: RestoreList = alloc::vec![(7, (24, 78, 596, 505))];
-        let a = drag_ended(&ended(7, half, WORK), Some((40, 300, 1360, 708)), WORK, &mut restore);
+        let a = drag_ended(&ended(7, half, WORK), WORK, &mut restore);
         assert_eq!(a, Answer { configure: Some(half), tell: Some(WINDOW_STATE_NORMAL) });
         assert!(restore.is_empty());
 
         let mut restore: RestoreList = alloc::vec![(7, (24, 78, 596, 505))];
-        let moved = (40, 300, 1360, 708);
-        let a = drag_ended(&ended(7, moved, WORK), Some(moved), WORK, &mut restore);
+        let to = (40, 300, 1360, 708);
+        let a = drag_ended(&moved(7, to, WORK), WORK, &mut restore);
         assert_eq!(a, Answer { configure: None, tell: Some(WINDOW_STATE_NORMAL) }, "a plain move is not configured");
         assert!(restore.is_empty());
     }
@@ -185,13 +212,10 @@ mod tests {
     #[test]
     fn a_normal_window_moved_or_resized_is_told_nothing() {
         let mut restore = RestoreList::new();
-        let moved = (40, 300, 596, 505);
-        assert_eq!(
-            drag_ended(&ended(7, moved, (24, 78, 596, 505)), Some(moved), WORK, &mut restore),
-            Answer::default()
-        );
+        let to = (40, 300, 596, 505);
+        assert_eq!(drag_ended(&moved(7, to, (24, 78, 596, 505)), WORK, &mut restore), Answer::default());
         let bigger = (24, 78, 700, 505);
-        let a = drag_ended(&ended(7, bigger, (24, 78, 596, 505)), Some((24, 78, 596, 505)), WORK, &mut restore);
+        let a = drag_ended(&ended(7, bigger, (24, 78, 596, 505)), WORK, &mut restore);
         assert_eq!(a, Answer { configure: Some(bigger), tell: None });
         assert!(restore.is_empty());
     }
@@ -208,5 +232,55 @@ mod tests {
         assert_eq!(a, Answer { configure: Some(was), tell: Some(WINDOW_STATE_NORMAL) }, "the first rectangle");
         let a = state_requested(7, WINDOW_STATE_NORMAL, was, WORK, &mut restore);
         assert_eq!(a, Answer { configure: None, tell: Some(WINDOW_STATE_NORMAL) }, "nothing to restore");
+    }
+
+    #[test]
+    fn a_snap_back_to_where_it_began_is_configured_whatever_the_shell_last_saw() {
+        // Snapped to the left half, dragged off and dropped in the same zone: the window is where
+        // the pointer let go, so the half is asked again, though it is also where it began.
+        let half = (0, 30, 680, 708);
+        let mut restore = RestoreList::new();
+        assert_eq!(drag_ended(&ended(7, half, half), WORK, &mut restore).configure, Some(half));
+        let mut restore: RestoreList = alloc::vec![(7, (24, 78, 596, 505))];
+        let a = drag_ended(&ended(7, WORK, WORK), WORK, &mut restore);
+        assert_eq!(a, Answer { configure: Some(WORK), tell: None }, "a maximised window dropped back at the top");
+    }
+
+    #[test]
+    fn a_plain_move_is_never_configured_and_never_maximises() {
+        let mut restore = RestoreList::new();
+        let dialog = moved(9, (300, 200, 240, 120), (100, 100, 240, 120));
+        assert_eq!(drag_ended(&dialog, WORK, &mut restore), Answer::default(), "a window the shell does not list");
+        assert_eq!(drag_ended(&moved(7, WORK, (0, 40, 1360, 708)), WORK, &mut restore), Answer::default());
+        assert!(restore.is_empty(), "moved onto the work area by hand is not maximised");
+    }
+
+    #[test]
+    fn a_request_the_shell_declines_is_answered_with_the_state_the_window_is_in() {
+        let restore: RestoreList = alloc::vec![(7, (24, 78, 596, 505))];
+        assert_eq!(declined(7, &restore), Answer { configure: None, tell: Some(WINDOW_STATE_MAXIMIZED) });
+        assert_eq!(declined(8, &restore), Answer { configure: None, tell: Some(WINDOW_STATE_NORMAL) });
+    }
+
+    #[test]
+    fn a_destroyed_window_leaves_no_restore_rectangle_and_no_gesture_to_answer() {
+        let mut restore: RestoreList = alloc::vec![(7, (24, 78, 596, 505)), (8, (0, 30, 10, 10))];
+        let mut dropped = alloc::vec![ended(7, WORK, WORK), ended(8, WORK, WORK)];
+        let mut states = alloc::vec![WindowState { window: 7, state: 2 }, WindowState { window: 8, state: 0 }];
+        forget(7, &mut restore, &mut dropped, &mut states);
+        assert_eq!(restore, [(8, (0, 30, 10, 10))]);
+        assert_eq!(dropped, [ended(8, WORK, WORK)]);
+        assert_eq!(states, [WindowState { window: 8, state: 0 }]);
+    }
+
+    #[test]
+    fn the_zones_fit_a_small_odd_work_area_at_the_screen_top() {
+        let tiny = MgrLayout { screen_w: 11, screen_h: 7, work_x: 0, work_y: 0, work_w: 11, work_h: 7 };
+        let z = snap_zones(&tiny);
+        assert!(z.iter().all(|z| z.trigger_w <= 11 && z.trigger_h <= 7), "the band is clamped to the area");
+        assert_eq!((z[6].trigger_y, z[6].trigger_h), (0, 7), "no bar above, so the top band starts at 0");
+        assert_eq!((z[7].target_y, z[7].target_h), (3, 4), "the lower half takes the odd row");
+        let above = MgrLayout { work_y: -5, ..tiny };
+        assert_eq!(snap_zones(&above)[6].trigger_h, 7, "a work area above the screen adds no rows");
     }
 }

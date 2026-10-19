@@ -37,7 +37,7 @@ keystroke rather than displacing it. A client that stalls long enough to overrun
 
 **A client is told the state its manager put its window in** (`SetWindowState`, forwarded as
 `WindowState`), and **`DragEnded` says where the window began and reports a plain move too**, as
-of pre-Phase-7 Part C.3 (2026-10-19): a wire change, its body 20 bytes to 40.
+of pre-Phase-7 Part C.3 (2026-10-19): a wire change, its body 20 bytes to 44.
 
 **A client is now told when its window gains or loses the keyboard** (`FocusEvent`, M4 Part
 B), and **a pointer is drawn on screen** (M4 Part C) — one fixed arrow, composited after the
@@ -789,6 +789,10 @@ gesture holds one grab and is one drag; a second request names the drag that is 
 (This section said the two requests "compute the same offset", which was false in exactly that
 way — corrected 2026-08-27, PR #248 review.)
 
+**Nothing moves until the pointer has gone 4 pixels from the press** (`DRAG_THRESHOLD`), in either
+direction, and no snap zone is previewed: a click with a tremor in it stays a click, where moving a
+maximised window by a pixel would make it normal again.
+
 **A window being moved is not being placed.** While a drag is in flight, `Place` for that window
 is refused with `WouldBlock` — not `InvalidArgument`, because the request is well-formed and will
 be answerable again in a moment. Refusing beats overriding: a `Place` that landed mid-drag would
@@ -839,19 +843,20 @@ gesture. While either is in flight, `Place` for that window is refused with `Wou
 
 <a id="finished-gesture"></a>
 
-**A gesture the user did not finish reports nothing**, and only the button coming up counts as
-finishing. **This applies to every gesture that ends in a [`DragEnded`](#dragended-0x0926)** — a
-resize, a move released in a snap zone, and a plain move. A resize applies nothing, and a snap
-applies nothing: reporting *initiates* a change, and initiating one from an unfinished gesture is
-a window jumping to a half-chosen size, or across the screen, while the user is still holding the
-button. A plain move applies every step as it goes, so its report initiates nothing, but it is
-held to the same rule: a manager is told of the gestures a person finished, and of no others.
+**A gesture the user did not finish asks for nothing**, and only the button coming up counts as
+finishing. **This applies to both gestures that ask for a rectangle in a
+[`DragEnded`](#dragended-0x0926)** — a resize, and a move released in a snap zone. Neither applies
+anything as it goes: reporting *initiates* a change, and initiating one from an unfinished gesture
+is a window jumping to a half-chosen size, or across the screen, while the user is still holding
+the button. **A plain move is reported however it ends**, as where it went is already on screen
+and its report initiates nothing; an unfinished move in a zone is reported as the plain move it
+became, never as the snap.
 
-So no `DragEnded` is sent when the window leaves the screen mid-drag (minimised, or sent to
-another desktop): the rectangle the user was steering by is no longer visible. None is sent when
-the input stream reports a loss — the pointer position is then a guess, which is the last thing to
-derive a new window rectangle from. And none for a gesture that ended where it started, which is
-an ordinary click on a grip or a title bar. In every case the outline is taken down.
+So nothing is asked for when the window leaves the screen mid-drag (minimised, or sent to another
+desktop): the rectangle the user was steering by is no longer visible. Nothing is asked for when the
+input stream reports a loss — the pointer position is then a guess, which is the last thing to
+derive a new window rectangle from. And a gesture that ended where it started, an ordinary click on
+a grip or a title bar, reports nothing at all. In every case the outline is taken down.
 
 ### `RequestState` (`0x090B`)
 
@@ -870,8 +875,11 @@ above `2`.
 
 **The reply says the compositor accepted and forwarded it**, not that anything happened. What a
 manager does with the question is the manager's — a shell that declines to maximise a window is
-behaving correctly. A client learns the answer through `Configure`, for its geometry, and through
-[`WindowState`](#windowstate-0x0932), for the state the manager put it in.
+behaving correctly, **and answers all the same** with [`SetWindowState`](#setwindowstate-0x0929),
+naming the state the window is in. A client learns the answer through `Configure`, for its
+geometry, and through [`WindowState`](#windowstate-0x0932), for its state; a manager that said
+nothing would leave the client's next request for the same state dropped as a repeat (below), and
+a button that follows `WindowState` dead.
 
 **A repeat produces no event.** The compositor remembers the state each window last *asked* for
 and drops a request for the same one. This is the only manager event a client's own rate drives,
@@ -1046,7 +1054,8 @@ the shape that trigger would take.
 Request, 8 bytes: `window` (u32), `state` (u32 — `0` normal, `1` minimised, `2` maximised).
 Forwarded to the window's client as [`WindowState`](#windowstate-0x0932); empty reply body on
 success. **The reverse of [`RequestState`](#requeststate-0x090b)**: a client asks, the manager
-decides, and this is how the client hears what it decided, whether or not it asked.
+decides, and this is how the client hears what it decided, whether or not it asked — **a refusal
+included**, answered with the state the window is in.
 
 It changes nothing on screen — maximising is a `Configure` to the work area, minimising
 `SetMinimized` — and the compositor keeps nothing but clears what the window last asked for, so
@@ -1146,7 +1155,8 @@ Request, 36 bytes: `id` (u32), a **trigger** rectangle (`x`, `y` signed; `w`, `h
 During an interactive [move](#startmove-0x090a) the compositor tests the pointer against this
 table. Inside a trigger, it draws that zone's *target* as the outline — a preview of what letting
 go there would ask for — and if the button comes up inside one it sends
-[`DragEnded`](#dragended-0x0926) carrying that target.
+[`DragEnded`](#dragended-0x0926) asking for that target, with the rectangle the window began at. A
+trigger may lie outside the work area: a shell's top zone reaches up over its top bar.
 
 **The policy is entirely in the numbers.** Which region means which rectangle, how close counts,
 whether a corner is a quarter or something else: all of it is the manager's, computed and
@@ -1281,7 +1291,7 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | `0x091F` | `Hotkey`         | `MgrHotkey`         | A registered chord was **pressed** — see [`RegisterHotkey`](#registerhotkey-0x091e) |
 | `0x0922` | `LayoutChanged`  | `MgrLayout`         | The work area is not what it was — see [`QueryLayout`](#querylayout-0x0921) |
 | `0x0923` | `WindowStateRequest` | `WindowState`   | A client asked to be minimised or maximised — see [`RequestState`](#requeststate-0x090b) |
-| `0x0926` | `DragEnded`      | `MgrDragEnded`      | A finished gesture asks for a rectangle — a resize, a move dropped in a [snap zone](#registersnapzone-0x0927), or a plain move — and says where the window began |
+| `0x0926` | `DragEnded`      | `MgrDragEnded`      | A gesture ended — a resize or a move dropped in a [snap zone](#registersnapzone-0x0927) asking for a rectangle, or a plain move — and says where the window began |
 
 `LayoutChanged` is sent when the work area *differs* from the one last announced, rather than on
 any particular cause. Today the only causes are a panel appearing and a panel going away — a
@@ -1320,9 +1330,10 @@ gaining it. Either may be absent — nothing had focus, or nothing takes it.
 
 ### `DragEnded` (`0x0926`)
 
-**Server → manager. Unsolicited, no reply.** Body, 40 bytes: `MgrDragEnded`, two
+**Server → manager. Unsolicited, no reply.** Body, 44 bytes: `MgrDragEnded`, two
 [`ConfigureEvent`](#configure-0x0908)s of one window — `window`, `width`, `height`, `x`, `y` —
-the rectangle the gesture **asks for**, then the one it **came from**.
+the rectangle the gesture **asks for**, then the one it **came from**, and a `flags` word:
+`DRAG_ENDED_MOVED` (`1`) for a plain move, whose `asked` is already on screen.
 
 **Three gestures produce it and they mean the same thing here.** An interactive resize
 ([`StartResize`](#startresize-0x090d)) asks for the rectangle the user let go at; an interactive
@@ -1334,12 +1345,15 @@ produces it existed.
 
 **A plain move is reported so a manager learns that a person moved a window**: its
 `WindowGeometry` is the same event a manager's own `Place` produces. A maximised window moved by
-hand is no longer maximised, and only this says it was moved by hand.
+hand is no longer maximised, and only this says it was moved by hand. **The flag says which**,
+rather than leaving a manager to compare `asked` with where it last saw the window, which is a
+guess: a snap back into the zone a window began in asks for the very rectangle it came from.
 
-**`from` is where the window was when the gesture began**, which a manager cannot keep itself:
-the move's own `WindowGeometry` reaches it no later than this event and overwrites where it
-thought the window was. A manager that maximises a window dropped at the top of the screen
-restores it to `from`.
+**`from` is where the window was when the gesture began.** This event is queued before the
+`WindowGeometry` its own move produced, but nothing orders their reading: a manager that applies
+geometry as it drains and answers gestures afterwards, as `desktop-shell` does, has overwritten
+where the window began before it answers. A manager that maximises a window dropped at the top of
+the screen restores it to `from`.
 
 **One event for a whole gesture.** Nothing is sent per motion: this queue does not coalesce and
 evicts its oldest when full, so a five-second drag at 100 Hz would push a `WindowCreated` off the
@@ -1348,14 +1362,15 @@ outline the user watches — the resize's rectangle, or the zone's target previe
 pointer — is the compositor's own drawing and crosses no wire.
 
 **`asked` is a `ConfigureEvent` because that is what the manager sends back.** The whole answer
-is `Manage::Configure` with these five numbers, and none for a plain move, which is already there. A manager that decides otherwise is behaving
-correctly — this is a report of what the user did, not an instruction — and a manager that does
-nothing leaves the window as it was, which is also what a client that declines produces.
+is `Manage::Configure` with these five numbers, and none for a plain move, which is already
+there. A manager that decides otherwise is behaving correctly — this is a report of what the user
+did, not an instruction — and a manager that does nothing leaves the window as it was, which is
+also what a client that declines produces.
 
 It does **not** carry which zone the gesture ended in. The rectangle is what a manager acts on,
 and the zone that produced it is derivable from a table the manager itself wrote; a field that is
-always ignored is worse than one that is absent. Sent only for a gesture the user *finished* —
-see [what that excludes and why](#finished-gesture).
+always ignored is worse than one that is absent. A snap or a resize is sent only when the user
+*finished* it — see [what that excludes and why](#finished-gesture).
 
 ## Titles, and the one variable-length body
 

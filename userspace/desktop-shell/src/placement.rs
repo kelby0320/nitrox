@@ -2,7 +2,7 @@
 
 use super::*;
 use desktop_shell::cascade;
-use desktop_shell::snap::{Answer, snap_zones};
+use desktop_shell::snap::{Answer, declined, forget, snap_zones, state_requested};
 
 static mut GEOMETRY_LOGGED: u32 = 0;
 
@@ -39,6 +39,44 @@ pub(super) fn register_snap_zones(mgr: &mut ChannelTransport, work: &MgrLayout) 
             .end();
     }
     all
+}
+
+/// Answer what clients asked to be: decided here, as only this process can compute a maximised
+/// rectangle. Returns whether a request was sent and whether the window list changed.
+pub(super) fn answer_states(
+    m: &mut ChannelTransport,
+    states: alloc::vec::Vec<librsproto::surface::WindowState>,
+    entries: &mut [WinEntry],
+    restore: &mut RestoreList,
+    work: desktop_shell::snap::Rect4,
+) -> (bool, bool) {
+    use librsproto::surface::{WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL};
+    let (mut sent, mut dirty) = (false, false);
+    for s in states {
+        let Some(e) = entries.iter_mut().find(|e| e.id == s.window) else {
+            sent |= answer(m, s.window, declined(s.window, restore), b"decline");
+            continue;
+        };
+        match s.state {
+            WINDOW_STATE_MINIMIZED if minimize_window(m, e) => {
+                sent = true;
+                dirty = true;
+                Line::new().s(b"desktop-shell: client asked to minimize window ").u(s.window as u64).end();
+            }
+            WINDOW_STATE_MAXIMIZED | WINDOW_STATE_NORMAL => {
+                if e.minimized && raise_window(m, e) {
+                    sent = true;
+                    dirty = true;
+                }
+                let now = (e.origin.0, e.origin.1, e.size.0, e.size.1);
+                let a = state_requested(s.window, s.state, now, work, restore);
+                let maximise = s.state == WINDOW_STATE_MAXIMIZED;
+                sent |= answer(m, s.window, a, if maximise { b"maximize" } else { b"restore" });
+            }
+            _ => sent |= answer(m, s.window, declined(s.window, restore), b"decline"),
+        }
+    }
+    (sent, dirty)
 }
 
 /// Send what `desktop_shell::snap` decided for `window`: the `Configure`, logged with `why`, then
@@ -227,7 +265,7 @@ pub(super) fn place_new_windows(
                 // The restore rectangle goes with the window, or a create/maximise/destroy loop
                 // grows this vector.
                 if let Some(r) = MgrWindowRef::read(&buf[..n]) {
-                    restore.retain(|(id, _)| *id != r.window);
+                    forget(r.window, restore, dropped, states);
                     let before = entries.len();
                     entries.retain(|e| e.id != r.window);
                     dirty |= entries.len() != before;
