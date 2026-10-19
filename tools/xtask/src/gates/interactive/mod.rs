@@ -263,6 +263,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 
     steps += interactive_shell_language(s, &open_at_5)?;
     steps += interactive_paths(s)?;
+    steps += interactive_editing(s)?;
     steps += interactive_clipboard_and_completion(s)?;
     steps += interactive_administration(s)?;
     steps += interactive_services_and_relogin(s)?;
@@ -289,6 +290,32 @@ fn write_script(s: &mut Session, body: &str, path: &str, prompt: &str) -> R<()> 
     let txt = format!("{}.txt", path.trim_end_matches(".nx"));
     quietly(s, &format!("{body} | save {txt}"), prompt)?;
     quietly(s, &format!("rename {txt} {path}"), prompt)
+}
+
+/// `test-interactive`'s steps 19d-1 to 19d-3: editing the line being typed, with the keys a serial
+/// terminal sends. Each line only runs `whoami` if its edit worked, so its answer is the assertion.
+fn interactive_editing(s: &mut Session) -> R<usize> {
+    const HOME: &str = "\x1b[H";
+    const RIGHT: &str = "\x1b[C";
+    const LEFT: &str = "\x1b[D";
+    const DELETE: &str = "\x1b[3~";
+    // 19d-1. **Delete and insert mid-line**: `wxhami` loses its `x` and gains its `o`.
+    s.send_raw(&format!("wxhami{HOME}{RIGHT}{DELETE}{RIGHT}o"))?;
+    s.send("\x1b[F")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+    // 19d-2. **Backspace mid-line** takes the character before the cursor, not the last.
+    s.send_raw(&format!("whoaxmi{LEFT}{LEFT}\x7f"))?;
+    s.send("")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+    // 19d-3. **A cursor key ends a search keeping its match**: End takes `whoami` to the line,
+    //        where `ESC` once cancelled the search and its `[F` was typed.
+    s.send_raw("\x12whoa")?;
+    s.send("\x1b[F")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+    Ok(3)
 }
 
 /// `test-interactive`'s steps 19a to 19c-3: the shell's own paths, from a real prompt.

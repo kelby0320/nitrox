@@ -36,6 +36,7 @@ use libstream::channel::{ChannelSink, IpcPort, MsgPort};
 use libstream::setup::{Streams, bootstrap, bootstrap_arg0, pipe, send_setup_full};
 use libstream::wire::ByteSink;
 use nxsh::host::{Host, PipelineRun, StageSpec, StageStatus};
+use nxsh::search::{Search, SearchStep, search_key};
 use nxsh::{Interp, RunMode};
 
 #[global_allocator]
@@ -953,8 +954,11 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Opti
             unsafe { (&raw mut INTERRUPTED).write(false) };
             search = None;
             pending.clear();
+            // Past the rest of the line first, so `^C` lands after it.
+            let mut out = disc.edit(tty_server::Key::End);
+            out.extend_from_slice(b"^C\r\n");
             disc.reset();
-            tty_write(tty, b"^C\r\n");
+            tty_write(tty, &out);
             tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
             continue;
         }
@@ -970,6 +974,14 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Opti
                         out.extend_from_slice(&disc.replace_line(st.original.as_bytes()));
                         tty_write(tty, &out);
                         search = None;
+                    }
+                    SearchStep::Keep => {
+                        let mut out = st.erase();
+                        out.extend_from_slice(&disc.replace_line(st.kept().as_bytes()));
+                        tty_write(tty, &out);
+                        search = None;
+                        // The `ESC` starts what a cursor key sends: the discipline reads the rest.
+                        disc.feed(b);
                     }
                     SearchStep::Accept => {
                         let mut out = st.erase();
@@ -1004,11 +1016,12 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Opti
                 search = Some(st);
                 continue;
             }
-            // Tab completes (§11c), intercepted before the discipline as `Ctrl-R` is.
-            // `nxsh::complete` decides; this writes bytes and redraws, with the continuation prompt
-            // mid-statement.
+            // Tab completes (§11c) what is before the cursor and keeps what follows, intercepted
+            // before the discipline as `Ctrl-R` is. `nxsh::complete` decides; this writes bytes and
+            // redraws, with the continuation prompt mid-statement.
             if b == b'\t' {
-                let line = String::from_utf8_lossy(disc.line()).into_owned();
+                let (before, after) = disc.line().split_at(disc.cursor());
+                let (line, after) = (String::from_utf8_lossy(before).into_owned(), after.to_vec());
                 // The whole statement, not the physical line: `disc` is reset per line while
                 // `pending` accumulates, so completing `line` alone would offer command names
                 // inside an argument list.
@@ -1023,7 +1036,7 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Opti
                         // `strip_prefix` rather than an index: doing nothing beats a corrupted
                         // line.
                         if let Some(new_line) = full.strip_prefix(pending.as_str()) {
-                            let redraw = disc.replace_line(new_line.as_bytes());
+                            let redraw = disc.replace_around(new_line.as_bytes(), &after);
                             tty_write(tty, &redraw);
                         }
                     }
@@ -1037,7 +1050,7 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Opti
                             }
                             false => tty_write(tty, nxsh::repl::continuation_prompt().as_bytes()),
                         }
-                        tty_write(tty, disc.line());
+                        tty_write(tty, &disc.redraw());
                     }
                 }
                 continue;
@@ -1050,6 +1063,10 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Opti
                     let recalled = match k {
                         tty_server::Key::Up => history.older(disc.line()),
                         tty_server::Key::Down => history.newer(),
+                        _ => {
+                            tty_write(tty, &disc.edit(k));
+                            continue;
+                        }
                     };
                     if let Some(text) = recalled {
                         let redraw = disc.replace_line(text.as_bytes());
@@ -1108,91 +1125,6 @@ fn run_and_render(interp: &mut Interp, tty: u64, src: &str) -> Option<i64> {
             tty_write_crlf(tty, &msg);
             None
         }
-    }
-}
-
-/// Reverse-search state: the query, the current match, and what is on screen.
-///
-/// The shell tracks its own display length: `replace_line` erases as many characters as the line
-/// buffer holds, and a search displays more, which leaves debris on a dumb terminal.
-struct Search {
-    query: String,
-    matched: String,
-    at: Option<usize>,
-    original: String,
-    /// How many characters are currently displayed, so they can be erased exactly.
-    shown: usize,
-}
-
-enum SearchStep {
-    None,
-    Redraw,
-    /// Leave the search, restoring the original line.
-    Cancel,
-    /// Take the match and submit it.
-    Accept,
-}
-
-impl Search {
-    fn new(original: String) -> Search {
-        Search { query: String::new(), matched: String::new(), at: None, original, shown: 0 }
-    }
-
-    fn erase(&mut self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.shown * 3);
-        for _ in 0..self.shown {
-            out.extend_from_slice(b"\x08 \x08");
-        }
-        self.shown = 0;
-        out
-    }
-
-    /// Erase and redraw the search line, returning the bytes to write.
-    ///
-    /// The query is quoted and an arrow separates it from the match, so a colon in the query is not
-    /// ambiguous. A query with no match says so, rather than looking like a search in progress.
-    fn redraw(&mut self) -> Vec<u8> {
-        let mut out = self.erase();
-        let text = if self.query.is_empty() {
-            alloc::string::String::from("search '' -> ")
-        } else if self.matched.is_empty() {
-            alloc::format!("search '{}' -> (no match)", self.query)
-        } else {
-            alloc::format!("search '{}' -> {}", self.query, self.matched)
-        };
-        out.extend_from_slice(text.as_bytes());
-        self.shown = text.chars().count();
-        out
-    }
-}
-
-fn search_key(st: &mut Search, b: u8, history: &nxsh::history::History) -> SearchStep {
-    match b {
-        // Ctrl-R again: the next older match.
-        0x12 => {
-            if let Some(i) = history.search_back(&st.query, st.at) {
-                st.at = Some(i);
-                st.matched = String::from(history.get(i).unwrap_or(""));
-            }
-            SearchStep::Redraw
-        }
-        b'\r' | b'\n' => SearchStep::Accept,
-        // Ctrl-G and ESC both abandon the search — the two keys people reach for.
-        0x07 | 0x1b => SearchStep::Cancel,
-        0x08 | 0x7f => {
-            st.query.pop();
-            // Re-search from the newest: a shorter query can match something more recent.
-            st.at = history.search_back(&st.query, None);
-            st.matched = st.at.and_then(|i| history.get(i)).map(String::from).unwrap_or_default();
-            SearchStep::Redraw
-        }
-        0x20..=0x7e => {
-            st.query.push(b as char);
-            st.at = history.search_back(&st.query, None);
-            st.matched = st.at.and_then(|i| history.get(i)).map(String::from).unwrap_or_default();
-            SearchStep::Redraw
-        }
-        _ => SearchStep::None,
     }
 }
 

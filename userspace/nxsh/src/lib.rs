@@ -22,6 +22,7 @@ pub mod parse;
 pub mod paths;
 pub mod regex;
 pub mod repl;
+pub mod search;
 pub mod style;
 pub mod timing;
 pub mod value;

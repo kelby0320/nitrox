@@ -112,12 +112,23 @@ pub(crate) fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     // One character at a time, each waited for: a word injected back to back races the raise and
     // the repaint. The echo wait is the assertion: each went `nxterm` -> `tty-server` -> `nxsh`.
     let mut typed = String::from("/> ");
-    for k in ["w", "h", "o", "a", "m", "i"] {
+    for k in ["w", "h", "o", "m", "i"] {
         qmp.send_key(k, true)?;
         qmp.send_key(k, false)?;
         typed.push_str(k);
         session.expect(&format!("nxterm: grid> {typed}"))?;
     }
+    // **Left twice, then the missing letter**, through `nxterm`'s encoder. Each Left comes back as
+    // the same row, waited for so the letter cannot overtake it.
+    for _ in 0..2 {
+        qmp.send_key("left", true)?;
+        qmp.send_key("left", false)?;
+        session.expect("nxterm: grid> /> whomi")?;
+    }
+    qmp.send_key("a", true)?;
+    qmp.send_key("a", false)?;
+    session.expect("nxterm: grid> /> whoami")?;
+    println!("  ok: Left and a letter edited the line mid-way, through nxterm's encoder");
 
     // `nxterm` does not echo locally, so a matching grid line came back from the shell.
     qmp.send_key("ret", true)?;
