@@ -523,6 +523,8 @@ code, narrated history, and a doc comment longer than its item needs.
 
 - `use "./h3.nx"` resolves against the directory of the file it is in, as C.1 details; an error
   naming a path quotes it, so `"h3.nx "`'s trailing space is visible.
+- A program or a script runs by its path, `./tool` or `./script.nx`, and a script reads its
+  arguments as `$args`.
 - `~` in a path: `cd ~`, `open ~/notes.txt`.
 - Line editing: Left, Right, Home, End and Delete in a line being typed.
 - `nxterm`'s default size, a little shorter.
@@ -551,8 +553,9 @@ two of the shell's own lookups pass on what was typed:
 
 **A program cannot be run by its path at all.** A stage is named by an identifier, which holds no
 `/` or `.` (`lex.rs:722-728`), so `./tool` is a string and `./tool x` does not parse.
-`resolve_program`'s path branch (`main.rs:190`) is unreachable. Running a program by its path
-would be a change to the language, and is not in C.1.
+`resolve_program`'s path branch (`main.rs:190`) is unreachable. **Nor can a script see its
+arguments**: `nxsh SCRIPT` reads `argv[1]` and ignores the rest (`main.rs:804-830`), and the spec
+gives a script no way to read them. The kernel loads only ELF and reads no `#!`.
 
 `open`, `save` and `cd` already resolve against `PWD`, with `resolve_path` (`eval.rs:212`) over
 `librsproto::path::resolve`.
@@ -577,6 +580,27 @@ would be a change to the language, and is not in C.1.
   functions before returning an error (`eval.rs:1158-1168`). Otherwise a `use` that failed would
   be refused, tried again, as already loading.
 - **The script resolves against `PWD`** the same way, before the host reads it.
+- **A path at the head of a statement runs it** (the maintainer's call), as in bash: `./tool x`,
+  `../bin/tool`, `/bin/date`, and `~/bin/x` once `~` expands.
+  - **The parser reads a head word** that starts with `/`, `./`, `../` or `~/` as an external
+    command's name, and the words after it as its arguments, as it already reads a hyphenated head
+    (`command_or_ident`, `parse.rs:885-895`).
+  - **A path anywhere else stays a string**, so `open ./x` and `let p = ./x` do not change. A
+    person sees one change: a path typed alone at the prompt runs, so `/home` answers that it is
+    not a program, where today it prints `/home`.
+  - **The path resolves against `PWD`** before `resolve_program`'s path branch looks it up, and
+    its arguments pass as written, as a `/bin` program's do.
+- **The shell decides what runs** (the maintainer's call), since the kernel loads only ELF:
+  - an ELF file is spawned as any program is;
+  - a file whose first line is `#!` runs the interpreter that line names (a path, or a name in
+    `/bin`), with the file's path and the arguments after it;
+  - any other file runs as an `nxsh` script, in a new `nxsh` process, as bash runs a file with no
+    `#!`. `use` stays the way to load a file into this shell.
+  - **The decision is library code**: a function of the file's first bytes, host-tested, with the
+    host only reading them, as `nxsh/CLAUDE.md` asks of anything that can be a decision.
+- **`$args` is a script's arguments** (the maintainer's call): a `List<String>`, bound as `$env`
+  is. `nxsh SCRIPT ARGS…` and `nxsh -c SOURCE ARGS…` bind what follows the script; at the prompt
+  it is empty.
 - **`~` is `$env.HOME`** (the maintainer's call) where `~` or `~/…` starts an unquoted word.
   - It is read where `cd` with no argument reads `HOME`: the interpreter's record (`env_str`,
     `eval.rs:1328`). Until `bug-bash.md`'s nxsh-1 is fixed, an assignment to `$env.HOME` reaches
@@ -607,7 +631,8 @@ would be a change to the language, and is not in C.1.
     those change with them.
 - **The spec**: §9h says what a relative `use` path is relative to, and that a cycle is refused,
   and the open questions stop listing cycles as undecided (`:1544`). `~` gets a paragraph beside
-  §8c-1's argument words. Neither is in the spec today.
+  §8c-1's argument words. §5b's external programs gain a path at the head, what runs a file, and
+  `$args`. None of it is in the spec today.
 - **Tests**:
   - **`MockHost` takes absolute keys** and the tests set `PWD`, so a test fails if `use` stops
     resolving. Today's `./lib.nx` keys would pass a `use` that resolved nothing.
@@ -618,9 +643,17 @@ would be a change to the language, and is not in C.1.
     - a cycle, and a `use` that failed inside its module, tried again;
     - `~`, `~/x`, `"~"`, `~name`, an unset `HOME`, `a~b`, `~=`, `~` before a newline and before
       `|`, and `~` in a program's argument;
-    - completion after `~/`.
-  - **`test-interactive`** types `cd ~` and checks `PWD` against `HOME`, and runs a script that
-    `use`s its neighbour from another directory.
+    - completion after `~/`;
+    - a path at the head, with arguments, parsed as an external call, and a path elsewhere still
+      a string;
+    - `./tool x` run with `PWD` set, resolved against it, its arguments as written;
+    - the file decision: ELF, `#!` with a path and with a name, and neither;
+    - `$args` in a script, with `-c`, and empty at the prompt.
+  - **`test-interactive`**:
+    - types `cd ~` and checks `PWD` against `HOME`;
+    - runs a script that `use`s its neighbour from another directory;
+    - saves a script and runs it as `./script.nx a b`, checking it printed `$args`;
+    - runs a program by its path.
 - **The `implementer`'s**, from a brief naming those tests. The lexer change is read against
   `nxsh/CLAUDE.md`'s rule that every scanner path advances.
 

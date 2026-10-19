@@ -36411,6 +36411,13 @@ second declined.
   - A quoted `"~"` is literal.
   - Expanding a program's argument is not the path rewriting the shell refuses, since `HOME` is the
     same on both sides.
+- **A path at a statement's head runs it** (the maintainer's call), as in bash. The kernel loads
+  only ELF, so the shell decides what runs:
+  - an ELF file is spawned;
+  - a `#!` line names an interpreter;
+  - any other file runs as an `nxsh` script in a new process.
+
+  A script's arguments are `$args`, which nxsh does not pass on today.
 - **Line editing follows Linux** (the maintainer's call): the cursor keys go into the editing the
   shell links, and canonical mode does not change.
   - The redraw stays a dumb terminal's, Backspace and text, so it needs no terminal width and draws
