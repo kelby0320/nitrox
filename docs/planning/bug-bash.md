@@ -1,6 +1,7 @@
 # The bug bash: findings and their triage
 
-**Status: started 2026-10-14; three findings from Part C's detail pass, untriaged.** Part D of
+**Status: started 2026-10-14; four findings untriaged, three from Part C's detail pass and one
+from its PR's CI.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -53,3 +54,22 @@ was demonstrated: each is read from the source, and is reproduced before it is f
   - `cd a b` goes to `a` and says nothing, against the shell's fail-loud rule.
   - `` `cd` takes one path `` fires only for an argument that is not positional (`:1280`).
   - Unverified: a host test of `cd a b` would settle it. Logic. Low.
+
+### Found on PR #385's CI — main at 226a54f6, 2026-10-19
+
+A gate failed on a branch that changes only docs. It is the gate's own defect.
+
+- [ ] **gate-1** `tools/xtask/src/guest_input.rs:30` — `click_at` counts a press that reached the
+  guest off its exact coordinates as a miss, and discards the transcript, though that press may
+  have hit its target and acted.
+  - Scenario: `check-login --kvm`'s unsaved-buffer step (`gates/login/dialogs.rs:114`):
+    - the press at the dialog's Discard button arrived at x=266 rather than 223, still on the
+      button, and `nxedit` discarded and closed;
+    - `click_at` matches only `press at x=223 y=448` (`:17`), so it called `skip_to_end` (`:30`),
+      which consumed `nxedit: discarding the unsaved buffer`;
+    - it clicked twice more, on the Files window behind;
+    - the step then waited 45 s for the line already consumed (`dialogs.rs:115`).
+  - Its doc comment (`:5-9`) names a retry's hazard for the bar's toggles, not for a button that
+    ends a dialog.
+  - Demonstrated: the transcript of PR #385's CI, run 39291063887, job 118191523426. Tests.
+    Medium: it fails CI on branches that touch none of it.
