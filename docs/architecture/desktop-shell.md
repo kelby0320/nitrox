@@ -184,13 +184,16 @@ creation-ordered so creating it first puts it under everything. Like the bars it
 It is absent when the theme names no file, which is the shipped default.
 
 **Everything here is sized from the screen, read once** (Phase 5 Part E): `/dev/draw/screen` at
-startup gives the width the bars span, the height the window list sits a bar above, the wallpaper's
-and the overview's full-screen buffers, and the height the placement cascade wraps at. The
-arithmetic — where the window list sits, how many thumbnail columns fit beside the sidebar — is
-`desktop_shell::Screen`, host-tested at every size rather than asserted at one; how many window
-buttons fit beside the switcher is `panel::task_capacity` of the switcher's measured width, since
-the switcher carries the desktop's name (§7). A screen the shell cannot read is fatal: the leaf resolves
-through the same binding its connection just did, and bars sized by a guess are what this replaced.
+startup gives the width the bars span, the height the window list sits a bar above, and the
+wallpaper's and the overview's full-screen buffers. The placement cascade wraps in the work area
+instead, which the compositor reports: a new window goes 24 pixels below the last, and back to the
+first place under the top bar when it would end below the work area's bottom
+(`desktop_shell::cascade`). The arithmetic — where the window list sits, how many thumbnail columns
+fit beside the sidebar — is `desktop_shell::Screen`, host-tested at every size rather than asserted
+at one; how many window buttons fit beside the switcher is `panel::task_capacity` of the switcher's
+measured width, since the switcher carries the desktop's name (§7). A screen the shell cannot read
+is fatal: the leaf resolves through the same binding its connection just did, and bars sized by a
+guess are what this replaced.
 
 **And the overview sits over it.** The overview is a full-screen **`ARGB8888`** window (M13
 Part C) — the one surface this shell creates that is not opaque. Its ground is a single

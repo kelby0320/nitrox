@@ -71,6 +71,21 @@ pub struct Screen {
 /// design's; gates that aim at a bar keep their own copy.
 pub const BAR_H: u32 = 30;
 
+/// How far each new window's origin steps from the last, down and, at the first place, in from the
+/// left.
+pub const CASCADE_STEP: i32 = 24;
+
+/// Where a new window `height` high goes in the cascade, and the origin of the next one.
+///
+/// `next` is the origin the last call returned; the window goes there if it ends at or above
+/// `work_bottom`, otherwise at the first place, `work_top + CASCADE_STEP`, which is also where a
+/// window taller than the work area goes. Returns the window's `y` and the next origin.
+pub fn cascade(next: i32, height: u32, work_top: i32, work_bottom: i32) -> (i32, i32) {
+    let fits = i64::from(next) + i64::from(height) <= i64::from(work_bottom);
+    let y = if fits { next } else { work_top + CASCADE_STEP };
+    (y, y + CASCADE_STEP)
+}
+
 /// How wide an overview card is, as a fraction of the screen: the design's 330 on 1440, so the
 /// same three cards fit across at every size `check-resolutions` boots.
 pub const CARD_W_NUM: u32 = 330;
@@ -280,6 +295,43 @@ mod tests {
 
     fn win(id: u32, desktop: u32, minimized: bool, focused: bool) -> Window {
         Window { id, desktop, minimized, focused }
+    }
+
+    /// The y of each window placed in turn, `count` of them, `height` high.
+    fn cascade_ys(height: u32, count: usize, work_top: i32, work_bottom: i32) -> alloc::vec::Vec<i32> {
+        let mut next = work_top + CASCADE_STEP;
+        (0..count)
+            .map(|_| {
+                let (y, n) = cascade(next, height, work_top, work_bottom);
+                next = n;
+                y
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cascade_gives_a_505_high_window_eight_places() {
+        let ys = cascade_ys(505, 10, 30, 738);
+        assert_eq!(ys, [54, 78, 102, 126, 150, 174, 198, 222, 54, 78]);
+    }
+
+    #[test]
+    fn cascade_gives_a_585_high_window_five_places() {
+        let ys = cascade_ys(585, 7, 30, 738);
+        assert_eq!(ys, [54, 78, 102, 126, 150, 54, 78]);
+    }
+
+    #[test]
+    fn a_window_ending_at_the_bottom_fits_and_one_pixel_past_wraps() {
+        assert_eq!(cascade(233, 505, 30, 738), (233, 257), "ends exactly at the bottom");
+        assert_eq!(cascade(234, 505, 30, 738), (54, 78), "one pixel past the bottom");
+    }
+
+    #[test]
+    fn cascade_puts_a_window_taller_than_the_work_area_at_the_first_place() {
+        assert_eq!(cascade(54, 709, 30, 738), (54, 78));
+        assert_eq!(cascade(78, 709, 30, 738), (54, 78));
+        assert_eq!(cascade(54, u32::MAX, 30, 738), (54, 78));
     }
 
     #[test]

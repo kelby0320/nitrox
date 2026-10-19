@@ -184,10 +184,10 @@ pub(crate) fn login_dialogs_and_places(
     // failing run reads as evidence.
     let _ = fs::write(build_cache().join("guest-transcript-check-login.log"), &transcript);
 
-    // **The grid grew, in cells**, read off the client's own line: a grid still 80x24 in a large
-    // window satisfies every pixel assertion. **The reflow**: a rewrap does not create or destroy
-    // lines, so the count either side of every resize must agree; ignoring the soft-wrap flag
-    // collapses them to one line. `libterm`'s own test has the row-level control.
+    // **The grid grew, in cells**, read off the client's own line: a grid still at its start size
+    // in a large window satisfies every pixel assertion. **The reflow**: a rewrap does not create
+    // or destroy lines, so the count either side of every resize must agree; ignoring the soft-wrap
+    // flag collapses them to one line. `libterm`'s own test has the row-level control.
     let reflows = transcript_reflows(&transcript);
     if reflows.is_empty() {
         let path = build_cache().join("guest-transcript-check-login.log");
@@ -215,18 +215,25 @@ pub(crate) fn login_dialogs_and_places(
     }
     println!("  ok: {} reflow(s) kept every line a line", reflows.len());
 
+    let Some(start) = transcript_start_grid(&transcript) else {
+        let path = build_cache().join("guest-transcript-check-login.log");
+        let _ = fs::write(&path, &transcript);
+        return Err("`nxterm: started, grid ` was not seen: without the grid the terminal started with, there \
+                    is nothing to say the maximise grew"
+            .into());
+    };
     match transcript_grid(&transcript) {
-        Some((c, r)) if c > 80 && r > 24 => {
-            println!("  ok: the maximised terminal's grid grew to {c}x{r} cells")
+        Some((c, r)) if c > start.0 && r > start.1 => {
+            println!("  ok: the maximised terminal's grid grew from {}x{} to {c}x{r} cells", start.0, start.1)
         }
         found => {
             let path = build_cache().join("guest-transcript-check-login.log");
             let _ = fs::write(&path, &transcript);
             return Err(format!(
-                "the maximised terminal's grid is {found:?}, not bigger than the 80x24 it starts \
-                 at. `nxterm` must refit the grid to the window it accepted — the window growing \
-                 is Part D's easy half, and a terminal that cannot use the room is the point of \
-                 the reflow"
+                "the maximised terminal's grid is {found:?}, not bigger than the {}x{} it starts \
+                 at, in both columns and rows. `nxterm` must refit the grid to the window it \
+                 accepted: a terminal that cannot use the room is the point of the reflow",
+                start.0, start.1
             )
             .into());
         }

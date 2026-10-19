@@ -1,15 +1,12 @@
 //! Placing, snapping, raising and minimizing windows.
 
 use super::*;
+use desktop_shell::cascade;
 
 static mut GEOMETRY_LOGGED: u32 = 0;
 
 /// How many window-geometry lines to print before going quiet: the event is client-driven.
 const MAX_LOGGED_GEOMETRY: u32 = 16;
-
-/// Where a placed window's top-left goes: below the top bar, cascading so two launches do not
-/// land on top of each other.
-pub(super) const CASCADE_STEP: i32 = 24;
 
 /// How wide the band along each screen edge that triggers a snap is, in pixels: wide enough to
 /// reach by throwing a window at the edge, narrow enough not to fire on a drag that ends near
@@ -224,7 +221,6 @@ pub(super) fn place_new_windows(
     dropped: &mut alloc::vec::Vec<librsproto::surface::ConfigureEvent>,
     restore: &mut RestoreList,
     current: u32,
-    screen: Screen,
 ) -> bool {
     use librsproto::surface::{
         FocusEvent, MgrHotkey, MgrPlace, MgrWindowCreated, MgrWindowRef, OP_MGR_DRAG_ENDED, OP_MGR_HOTKEY,
@@ -409,11 +405,10 @@ pub(super) fn place_new_windows(
             desktop: current,
         });
         dirty = true;
-        let (x, y) = (CASCADE_STEP, *next_origin);
-        *next_origin += CASCADE_STEP;
-        if *next_origin > screen.height as i32 - CASCADE_STEP {
-            *next_origin = BAR_H as i32 + CASCADE_STEP;
-        }
+        let x = CASCADE_STEP;
+        let (y, next) =
+            cascade(*next_origin, created.height, layout.work_y, layout.work_y.saturating_add_unsigned(layout.work_h));
+        *next_origin = next;
         let place = MgrPlace { window: created.window, x, y };
         let mut body = [0u8; 12];
         if place.write(&mut body).is_none() {

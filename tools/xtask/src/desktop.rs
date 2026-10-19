@@ -77,6 +77,14 @@ pub(crate) fn transcript_grid(transcript: &str) -> Option<(u32, u32)> {
         .max()
 }
 
+/// The grid `nxterm` started with, from its `nxterm: started, grid CxR` line.
+pub(crate) fn transcript_start_grid(transcript: &str) -> Option<(u32, u32)> {
+    let tail = transcript.lines().find_map(|l| l.split("nxterm: started, grid ").nth(1))?;
+    let t: String = tail.trim().chars().take_while(|c| c.is_ascii_digit() || *c == 'x').collect();
+    let (c, r) = t.split_once('x')?;
+    Some((c.parse().ok()?, r.parse().ok()?))
+}
+
 /// Read `<x>,<y> <w>x<h>` — the tail of the shell's window-geometry line. Returns `(w, h)`.
 pub(crate) fn parse_geometry(rest: &str) -> Option<(u32, u32)> {
     let mut it = rest.split_whitespace();
@@ -182,4 +190,23 @@ pub(crate) fn move_pointer_to(qmp: &mut Qmp, x: i32, y: i32) -> R<()> {
     }
     qmp.pointer = Some((x, y));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_grid_is_read_from_its_own_line() {
+        let t = "nxterm: up\nnxterm: started, grid 80x20\nnxterm: resized to 1360x708, grid 189x30, lines 3->3, 0 evicted\n";
+        assert_eq!(transcript_start_grid(t), Some((80, 20)));
+        assert_eq!(transcript_grid(t), Some((189, 30)), "the start line joins the max without raising it");
+    }
+
+    #[test]
+    fn start_grid_is_absent_without_its_line() {
+        let t = "nxterm: up\nnxterm: resized to 596x505, grid 80x20, lines 3->3, 0 evicted\n";
+        assert_eq!(transcript_start_grid(t), None);
+        assert_eq!(transcript_start_grid("nxterm: started, grid \n"), None);
+    }
 }

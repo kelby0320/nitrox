@@ -299,7 +299,7 @@ pub(crate) fn login_overview_drags(qmp: &mut Qmp, session: &mut Session, st: &mu
     // downstream of the same apply, so either reaches the console first. **The request and the
     // shell's answer in the same wait**: `nxterm` logs the request after the compositor answers, so
     // the shell's maximise *and its move* can precede it. The client's line says what it came to in
-    // cells: a grid still 80x24 would satisfy the rest.
+    // cells: a grid still at its start size would satisfy the rest.
     let maximised = format!("desktop-shell: maximize window {term_id} to {},{} {}x{}", work.0, work.1, work.2, work.3);
     let moved = format!("desktop-shell: window {term_id} geometry {},{} ", work.0, work.1);
     let took = format!("nxterm: resized to {}x{}, grid ", work.2, work.3);

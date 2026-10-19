@@ -18,7 +18,7 @@
 "userspace/compositor/src/input.rs" = 2541
 "userspace/compositor/src/lib.rs" = 2643
 "userspace/compositor/src/main.rs" = 2310
-"userspace/desktop-shell/src/main.rs" = 1544
+"userspace/desktop-shell/src/main.rs" = 1543
 "userspace/desktop-shell/src/panel.rs" = 1211
 "userspace/fs-server-ext4/src/ext4.rs" = 2055
 "userspace/fs-server-ext4/src/extent.rs" = 1375

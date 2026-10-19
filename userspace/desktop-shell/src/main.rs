@@ -37,7 +37,7 @@ const KEY_1: u16 = 2;
 use desktop_shell::ending::{Asked, Closing, Ending, Next, POWER_PROGRAM, POWER_VIEW, Refusal, failed};
 use desktop_shell::panel::{self, BottomMsg, EndingMsg, MenuMsg, RefusalMsg, TopMsg};
 use desktop_shell::{
-    Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, Screen, ShownDesktop, parse_entry,
+    Application, BAR_H, CARD_BORDER, CARD_CAPTION_GAP, CARD_CAPTION_H, CASCADE_STEP, Screen, ShownDesktop, parse_entry,
 };
 use librsproto::surface::{
     CreateWindowRequest, Edge, MgrLayout, OP_MGR_QUERY_LAYOUT, OP_MGR_SET_WINDOW_DESKTOP, Role, STICKY_DESKTOP,
@@ -469,7 +469,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
     // by design): otherwise a person who chose keep editing leaves the window armed for its life,
     // and a later click goes straight to `Manage::Close`.
     let mut asked_to_close: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
-    let mut next_origin = BAR_H as i32 + CASCADE_STEP;
+    let mut next_origin = layout.work_y + CASCADE_STEP;
 
     let mut hotkey_done = manager.is_none();
 
@@ -743,7 +743,6 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 &mut dropped,
                 &mut restore,
                 current_desktop,
-                screen,
             );
 
             for c in dropped {
