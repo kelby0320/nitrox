@@ -202,8 +202,6 @@ pub(super) fn log_window_list(shown: &[&WinEntry], label: &str, desktops: usize)
     l.end();
 }
 
-pub(super) type RestoreList = alloc::vec::Vec<(u32, (i32, i32, u32, u32))>;
-
 /// The windows as show-desktop sees them — see [`ShownDesktop`].
 pub(super) fn windows_of(entries: &[WinEntry]) -> alloc::vec::Vec<desktop_shell::Window> {
     entries

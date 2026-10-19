@@ -719,9 +719,8 @@ pub const OP_MGR_WINDOW_STATE_REQUEST: u16 = 0x0923;
 
 /// `Manage::DragEnded` — **server → manager. Unsolicited, no reply.**
 ///
-/// Body: a [`ConfigureEvent`] carrying the rectangle a finished gesture asks for: a resize's
-/// final rectangle or a [snap zone](OP_MGR_REGISTER_SNAP_ZONE)'s target. One event per
-/// gesture, none per motion (`rsproto-surface-ops.md` § `DragEnded`).
+/// Body: [`MgrDragEnded`], what a finished gesture asks for and where the window began. One event
+/// per gesture, none per motion (`rsproto-surface-ops.md` § `DragEnded`).
 pub const OP_MGR_DRAG_ENDED: u16 = 0x0926;
 /// `Manage::RegisterHotkey` — route a key chord to the manager instead of the focused window.
 ///
@@ -749,6 +748,10 @@ pub const OP_MGR_SET_CURRENT_DESKTOP: u16 = 0x091D;
 ///
 /// Names no window. See [`MgrScheme`] and `rsproto-surface-ops.md` § `SetScheme`.
 pub const OP_MGR_SET_SCHEME: u16 = 0x0928;
+/// `Manage::SetWindowState` — tell a window's client the state the manager put it in.
+///
+/// Body: [`WindowState`], forwarded as [`Surface::WindowState`](OP_WINDOW_STATE).
+pub const OP_MGR_SET_WINDOW_STATE: u16 = 0x0929;
 /// `Manage::Configure` — ask a window to be a given size and position.
 ///
 /// The manager's half of the [`Configure`](OP_CONFIGURE) a client receives; sent in answer to
@@ -874,6 +877,11 @@ pub const OP_DROPPED: u16 = 0x0930;
 /// *opens* a popup cannot dismiss it; only the topmost popup is told
 /// (`rsproto-surface-ops.md` § `Dismissed`).
 pub const OP_DISMISSED: u16 = 0x0931;
+
+/// `Surface::WindowState` — **server → client. Unsolicited, `request_id` 0, no reply.**
+///
+/// Body: [`WindowState`]; a maximise button shows this, not what its click asked for.
+pub const OP_WINDOW_STATE: u16 = 0x0932;
 
 /// A drop payload that is one file.
 pub const DROP_KIND_FILE: u32 = 1 << 0;
@@ -1160,8 +1168,8 @@ impl WindowRef {
     }
 }
 
-/// A window and a state it is asked to be in — [`RequestState`](OP_REQUEST_STATE) and its forwarded
-/// [`WindowStateRequest`](OP_MGR_WINDOW_STATE_REQUEST).
+/// A window and a state: asked for by [`RequestState`](OP_REQUEST_STATE), or told by
+/// [`SetWindowState`](OP_MGR_SET_WINDOW_STATE).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct WindowState {
@@ -1719,6 +1727,29 @@ impl ConfigureEvent {
     }
 }
 
+/// The body of [`DragEnded`](OP_MGR_DRAG_ENDED), 40 bytes: two rectangles of one window.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct MgrDragEnded {
+    /// What the gesture asks for, as the [`Configure`](OP_MGR_CONFIGURE) that would grant it.
+    pub asked: ConfigureEvent,
+    /// The window's rectangle when the gesture began, which a manager cannot keep itself.
+    pub from: ConfigureEvent,
+}
+
+impl MgrDragEnded {
+    /// Serialise into exactly 40 bytes: `asked`, then `from`.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        let n = self.asked.write(out.get_mut(..20)?)?;
+        Some(n + self.from.write(out.get_mut(20..40)?)?)
+    }
+
+    /// Parse from 40 bytes.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        Some(Self { asked: ConfigureEvent::read(b.get(..20)?)?, from: ConfigureEvent::read(b.get(20..40)?)? })
+    }
+}
+
 const _: () = assert!(core::mem::size_of::<FocusEvent>() == 8);
 
 impl FocusEvent {
@@ -1848,6 +1879,23 @@ impl PointerEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drag_ended_reads_the_asked_rectangle_then_the_one_it_came_from() {
+        // By hand rather than through `write`: a round trip would pass a reader that swapped them.
+        let mut b = [0u8; 40];
+        for (i, v) in [7u32, 1360, 708, 0, 30, 7, 596, 505, 24, 78].iter().enumerate() {
+            b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let d = MgrDragEnded::read(&b).expect("40 bytes");
+        assert_eq!(d.asked, ConfigureEvent { window: 7, width: 1360, height: 708, x: 0, y: 30 });
+        assert_eq!(d.from, ConfigureEvent { window: 7, width: 596, height: 505, x: 24, y: 78 });
+        assert_eq!(MgrDragEnded::read(&b[..39]), None, "the old 20-byte body, or a short one");
+        let mut out = [0u8; 40];
+        assert_eq!(d.write(&mut out), Some(40));
+        assert_eq!(out, b);
+        assert_eq!(d.write(&mut out[..39]), None);
+    }
 
     #[test]
     fn a_panel_discards_an_offset_and_the_other_roles_carry_it() {

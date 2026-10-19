@@ -412,6 +412,8 @@ pub enum Msg {
     ResizeWindow(u32),
     /// A title-bar button asking the manager for a window state.
     RequestState(u32),
+    /// The manager put this window in this state: the maximise button follows it, not its click.
+    WindowState(u32),
     /// Somebody wants this window gone — its own close button, or the shell asking. Over an
     /// unsaved buffer this raises [`App::confirming`]; only [`Msg::Discard`] ends the run.
     Close,
@@ -1020,11 +1022,11 @@ impl App {
                 self.confirming = None;
                 self.status = String::from("still editing — nothing was discarded");
             }
-            Msg::RequestState(s) => {
+            Msg::RequestState(s) => self.state_requested = Some(s),
+            Msg::WindowState(s) => {
                 if s == WINDOW_STATE_MAXIMIZED || s == WINDOW_STATE_NORMAL {
                     self.maximized = s == WINDOW_STATE_MAXIMIZED;
                 }
-                self.state_requested = Some(s);
             }
         }
     }
@@ -3557,6 +3559,40 @@ mod tests {
         check(&mut a, None, &mut tree, "with Edit open and nothing hovered");
         a.update(Msg::MenuBar(1));
         check(&mut a, None, &mut tree, "back to shut");
+    }
+
+    #[test]
+    fn the_maximise_button_asks_and_follows_what_the_manager_says() {
+        let mut a = app();
+        let click = |a: &mut App| {
+            let size = a.window_size();
+            let e = a.view(&UiTheme::default(), None);
+            let l =
+                libui::layout::layout(&e, Rect::new(0, 0, size.w, size.h), &libui::layout::FixedCell { w: 8, h: 16 });
+            let mut tree = libui::diff::Tree::new();
+            tree.update(&e, &l).expect("diffable");
+            let at = libui::layout::locate(&e, &l, libui::widget::TITLE_MAXIMISE_KEY).expect("keyed");
+            let mut r = libui::route::Router::new();
+            for pressed in [true, false] {
+                let ev = librsproto::surface::PointerEvent {
+                    kind: librsproto::surface::POINTER_BUTTON,
+                    button: 0x110,
+                    buttons: u16::from(pressed),
+                    flags: if pressed { librsproto::surface::POINTER_PRESSED } else { 0 },
+                    x: at.origin.x + at.size.w as i32 / 2,
+                    y: at.origin.y + at.size.h as i32 / 2,
+                    ..Default::default()
+                };
+                for m in r.pointer(&tree, &e, &l, ev).0 {
+                    a.update(m);
+                }
+            }
+            a.take_state_request()
+        };
+        assert_eq!(click(&mut a), Some(WINDOW_STATE_MAXIMIZED));
+        assert_eq!(click(&mut a), Some(WINDOW_STATE_MAXIMIZED), "asking changed nothing");
+        a.update(Msg::WindowState(WINDOW_STATE_MAXIMIZED));
+        assert_eq!(click(&mut a), Some(WINDOW_STATE_NORMAL));
     }
 
     /// Save As changes what the buffer is: tab, unsaved marker and next `Ctrl+S` follow.

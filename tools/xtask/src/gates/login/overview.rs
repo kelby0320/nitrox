@@ -303,7 +303,8 @@ pub(crate) fn login_overview_drags(qmp: &mut Qmp, session: &mut Session, st: &mu
     let maximised = format!("desktop-shell: maximize window {term_id} to {},{} {}x{}", work.0, work.1, work.2, work.3);
     let moved = format!("desktop-shell: window {term_id} geometry {},{} ", work.0, work.1);
     let took = format!("nxterm: resized to {}x{}, grid ", work.2, work.3);
-    session.expect_all(&["nxterm: asked the shell for window state 2", &maximised, &moved, &took])?;
+    let told = format!("desktop-shell: window {term_id} told state 2");
+    session.expect_all(&["nxterm: asked the shell for window state 2", &maximised, &moved, &took, &told])?;
     session.expect(&format!("desktop-shell: window {term_id} geometry {},{} {}x{}", work.0, work.1, work.2, work.3))?;
     println!("  ok: maximise moved the window and the client committed the work area exactly");
 
@@ -330,10 +331,7 @@ pub(crate) fn login_overview_drags(qmp: &mut Qmp, session: &mut Session, st: &mu
     expect_after_pointer(
         qmp,
         session,
-        &format!(
-            "compositor: interactive resize of window {term_id} ended at {},{} {resized_w}x{resized_h}",
-            work.0, work.1
-        ),
+        &format!("compositor: gesture on window {term_id} ended at {},{} {resized_w}x{resized_h}", work.0, work.1),
     )?;
     session
         .expect(&format!("desktop-shell: drop window {term_id} to {},{} {resized_w}x{resized_h}", work.0, work.1))?;
@@ -413,6 +411,40 @@ pub(crate) fn login_overview_drags(qmp: &mut Qmp, session: &mut Session, st: &mu
         work.3
     ))?;
     println!("  ok: dropped at the left edge, the terminal took half the work area");
+
+    // 6l. **A window dragged onto the top bar maximises, and its button restores it** to the left
+    //     half it was dragged from. **Twice**: a button flipping on its own clicks, left at restore
+    //     by 6i, passes the first round and asks to be maximised in the second.
+    let half = (work.0, work.1, work.2 / 2, work.3);
+    let full = format!("{},{} {}x{}", work.0, work.1, work.2, work.3);
+    for _ in 0..2 {
+        let press_at = (half.0 + 200, half.1 + chrome::TITLE_Y);
+        move_pointer_to(qmp, press_at.0, press_at.1)?;
+        qmp.pointer = Some(press_at);
+        qmp.send_button("left", true)?;
+        session.expect_all(&["nxterm: dragging its own title bar", "compositor: interactive move of window "])?;
+        for _ in 0..3 {
+            qmp.send_motion(30, -14)?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        qmp.send_button("left", false)?;
+        qmp.pointer = Some((press_at.0 + 90, press_at.1 - 42));
+        expect_after_pointer(qmp, session, &format!("desktop-shell: drop window {term_id} to {full}"))?;
+        session.expect_all(&[
+            &format!("desktop-shell: window {term_id} told state 2"),
+            &format!("nxterm: resized to {}x{}, grid ", work.2, work.3),
+            &format!("desktop-shell: window {term_id} geometry {full}"),
+        ])?;
+        click_at(qmp, session, work.0 + work.2 as i32 - chrome::MAXIMISE_X, work.1 + chrome::TITLE_Y)?;
+        session.expect_all(&[
+            "nxterm: asked the shell for window state 0",
+            &format!("desktop-shell: restore window {term_id} to {},{} {}x{}", half.0, half.1, half.2, half.3),
+            &format!("desktop-shell: window {term_id} told state 0"),
+        ])?;
+        session
+            .expect(&format!("desktop-shell: window {term_id} geometry {},{} {}x{}", half.0, half.1, half.2, half.3))?;
+    }
+    println!("  ok: dropped on the top bar it maximised, and its button put it back where it was");
 
     // 6h. **Movement is not lost while the compositor is busy**: a relative pointer's deltas *are*
     //     its position, so a dropped batch offsets the guest's cursor for good. Injected **against

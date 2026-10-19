@@ -14,7 +14,7 @@ use librsproto::surface::{
     MgrDesktop, MgrHotkey, MgrPlace, MgrScheme, MgrWindowRef, MgrWindowValue, OP_MGR_CLOSE, OP_MGR_CONFIGURE,
     OP_MGR_LOWER, OP_MGR_PLACE, OP_MGR_RAISE, OP_MGR_RAISE_ABOVE, OP_MGR_REGISTER_HOTKEY, OP_MGR_REGISTER_SNAP_ZONE,
     OP_MGR_SET_CURRENT_DESKTOP, OP_MGR_SET_FOCUS, OP_MGR_SET_MINIMIZED, OP_MGR_SET_SCHEME, OP_MGR_SET_WINDOW_DESKTOP,
-    SCHEME_DARK, SCHEME_LIGHT,
+    OP_MGR_SET_WINDOW_STATE, SCHEME_DARK, SCHEME_LIGHT, WINDOW_STATE_MAXIMIZED, WindowState,
 };
 
 use crate::server::SurfaceError;
@@ -56,6 +56,14 @@ pub enum MgrOutcome {
         height: u32,
         /// The suggested origin.
         origin: Point,
+    },
+    /// A state for the caller to tell the window's client; this module holds no channels, and
+    /// keeps no state of its own.
+    State {
+        /// Which window's client to tell.
+        window: u32,
+        /// One of the `WINDOW_STATE_*` values.
+        state: u32,
     },
 }
 
@@ -171,6 +179,15 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 Ok(false) => MgrOutcome::Applied { window: None, dirty: Some(Rect::new(0, 0, 0, 0)) },
                 Err(e) => refused(e),
             }
+        }
+        OP_MGR_SET_WINDOW_STATE => {
+            let Some(req) = WindowState::read(body).filter(|r| r.state <= WINDOW_STATE_MAXIMIZED) else {
+                return MgrOutcome::Failed(SurfaceError::Malformed);
+            };
+            if stack.window(req.window).is_none() {
+                return MgrOutcome::Failed(SurfaceError::NotFound);
+            }
+            MgrOutcome::State { window: req.window, state: req.state }
         }
         OP_MGR_SET_SCHEME => {
             let scheme = match MgrScheme::read(body).map(|r| r.scheme) {
@@ -521,6 +538,30 @@ mod tests {
         assert_eq!(
             dispatch(&mut s, OP_MGR_SET_CURRENT_DESKTOP, &[0u8; 3]),
             MgrOutcome::Failed(SurfaceError::Malformed),
+        );
+    }
+
+    #[test]
+    fn a_state_is_handed_back_for_its_window_and_refused_for_none_or_a_fourth_state() {
+        let (mut s, ids) = stack_with(1);
+        let body = |window, state| {
+            let mut b = [0u8; 8];
+            WindowState { window, state }.write(&mut b).unwrap();
+            b
+        };
+        let told = dispatch(&mut s, OP_MGR_SET_WINDOW_STATE, &body(ids[0], WINDOW_STATE_MAXIMIZED));
+        assert_eq!(told, MgrOutcome::State { window: ids[0], state: WINDOW_STATE_MAXIMIZED });
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_WINDOW_STATE, &body(ids[0] + 1, 0)),
+            MgrOutcome::Failed(SurfaceError::NotFound)
+        );
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_WINDOW_STATE, &body(ids[0], WINDOW_STATE_MAXIMIZED + 1)),
+            MgrOutcome::Failed(SurfaceError::Malformed)
+        );
+        assert_eq!(
+            dispatch(&mut s, OP_MGR_SET_WINDOW_STATE, &body(ids[0], 0)[..7]),
+            MgrOutcome::Failed(SurfaceError::Malformed)
         );
     }
 }

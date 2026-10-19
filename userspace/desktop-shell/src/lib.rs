@@ -7,6 +7,7 @@ extern crate alloc;
 
 pub mod ending;
 pub mod panel;
+pub mod snap;
 
 /// One graphical application, from a desktop entry under `/applications`.
 pub struct Application {
@@ -71,15 +72,11 @@ pub struct Screen {
 /// design's; gates that aim at a bar keep their own copy.
 pub const BAR_H: u32 = 30;
 
-/// How far each new window's origin steps from the last, down and, at the first place, in from the
-/// left.
+/// How far each new window steps from the last.
 pub const CASCADE_STEP: i32 = 24;
 
-/// Where a new window `height` high goes in the cascade, and the origin of the next one.
-///
-/// `next` is the origin the last call returned; the window goes there if it ends at or above
-/// `work_bottom`, otherwise at the first place, `work_top + CASCADE_STEP`, which is also where a
-/// window taller than the work area goes. Returns the window's `y` and the next origin.
+/// The `y` of a new window `height` high, and the next origin: `next` if it ends at or above
+/// `work_bottom`, else the first place, `work_top + CASCADE_STEP`.
 pub fn cascade(next: i32, height: u32, work_top: i32, work_bottom: i32) -> (i32, i32) {
     let fits = i64::from(next) + i64::from(height) <= i64::from(work_bottom);
     let y = if fits { next } else { work_top + CASCADE_STEP };

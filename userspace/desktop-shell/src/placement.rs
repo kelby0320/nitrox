@@ -2,59 +2,27 @@
 
 use super::*;
 use desktop_shell::cascade;
+use desktop_shell::snap::{Answer, snap_zones};
 
 static mut GEOMETRY_LOGGED: u32 = 0;
 
-/// How many window-geometry lines to print before going quiet: the event is client-driven.
-const MAX_LOGGED_GEOMETRY: u32 = 16;
+/// How many window-geometry lines to print before going quiet: the event is client-driven, and
+/// `check-login` reads one after each of its moves, maximises and restores.
+const MAX_LOGGED_GEOMETRY: u32 = 32;
 
-/// How wide the band along each screen edge that triggers a snap is, in pixels: wide enough to
-/// reach by throwing a window at the edge, narrow enough not to fire on a drag that ends near
-/// one. Policy kept here; the compositor knows nothing of edges.
-const SNAP_BAND: u32 = 24;
-
-/// Register the eight snap zones — four edges and four corners — for `work`.
-///
-/// Wholesale each time (registering an existing id replaces it): the zones are the work area, so
-/// a bar appearing or going makes all of them wrong. The targets are the policy: half the work
-/// area for an edge, a quarter for a corner.
+/// Register the eight snap zones for `work`, wholesale each time: the zones are the work area, so a
+/// bar appearing or going makes all of them wrong.
 pub(super) fn register_snap_zones(mgr: &mut ChannelTransport, work: &MgrLayout) -> bool {
-    use librsproto::surface::{MgrSnapZone, OP_MGR_REGISTER_SNAP_ZONE};
+    use librsproto::surface::OP_MGR_REGISTER_SNAP_ZONE;
     let (x, y, w, h) = (work.work_x, work.work_y, work.work_w, work.work_h);
-    let (hw, hh) = (w / 2, h / 2);
-    let band = SNAP_BAND.min(w.max(1)).min(h.max(1));
-    let b = band as i32;
-    // `(id, trigger, target)`. Corners first: they overlap the edges, and the compositor takes
-    // the first match.
-    let zones = [
-        (1u32, (x, y, band, band), (x, y, hw, hh)),
-        (2, (x + w as i32 - b, y, band, band), (x + hw as i32, y, w - hw, hh)),
-        (3, (x, y + h as i32 - b, band, band), (x, y + hh as i32, hw, h - hh)),
-        (4, (x + w as i32 - b, y + h as i32 - b, band, band), (x + hw as i32, y + hh as i32, w - hw, h - hh)),
-        (5, (x, y, band, h), (x, y, hw, h)),
-        (6, (x + w as i32 - b, y, band, h), (x + hw as i32, y, w - hw, h)),
-        (7, (x, y, w, band), (x, y, w, hh)),
-        (8, (x, y + h as i32 - b, w, band), (x, y + hh as i32, w, h - hh)),
-    ];
     let mut all = true;
-    for (id, t, g) in zones {
-        let z = MgrSnapZone {
-            id,
-            trigger_x: t.0,
-            trigger_y: t.1,
-            trigger_w: t.2,
-            trigger_h: t.3,
-            target_x: g.0,
-            target_y: g.1,
-            target_w: g.2,
-            target_h: g.3,
-        };
+    for z in snap_zones(work) {
         let mut body = [0u8; 36];
         let mut reply = [0u8; 8];
         let ok =
             z.write(&mut body).is_some() && mgr.request(OP_MGR_REGISTER_SNAP_ZONE, &body, None, &mut reply).is_ok();
         if !ok {
-            Line::new().s(b"desktop-shell: snap zone ").u(id as u64).s(b" was refused").end();
+            Line::new().s(b"desktop-shell: snap zone ").u(z.id as u64).s(b" was refused").end();
             all = false;
         }
     }
@@ -71,6 +39,28 @@ pub(super) fn register_snap_zones(mgr: &mut ChannelTransport, work: &MgrLayout) 
             .end();
     }
     all
+}
+
+/// Send what `desktop_shell::snap` decided for `window`: the `Configure`, logged with `why`, then
+/// the state its client is told. `true` if anything was sent.
+pub(super) fn answer(mgr: &mut ChannelTransport, window: u32, a: Answer, why: &[u8]) -> bool {
+    use librsproto::surface::{OP_MGR_SET_WINDOW_STATE, WindowState};
+    if let Some((x, y, w, h)) = a.configure {
+        configure_window(mgr, window, x, y, w, h, why);
+    }
+    if let Some(state) = a.tell {
+        let mut body = [0u8; 8];
+        let mut reply = [0u8; 64];
+        let sent = (WindowState { window, state }).write(&mut body).is_some()
+            && mgr.request(OP_MGR_SET_WINDOW_STATE, &body, None, &mut reply).is_ok();
+        Line::new()
+            .s(b"desktop-shell: window ")
+            .u(window as u64)
+            .s(if sent { b" told state " } else { b" could not be told state " })
+            .u(state as u64)
+            .end();
+    }
+    a.configure.is_some() || a.tell.is_some()
 }
 
 /// Ask a window's client to adopt a geometry: `Manage::Configure`. The reply says only that the
@@ -218,7 +208,7 @@ pub(super) fn place_new_windows(
     fired: &mut alloc::vec::Vec<u32>,
     layout: &mut MgrLayout,
     states: &mut alloc::vec::Vec<librsproto::surface::WindowState>,
-    dropped: &mut alloc::vec::Vec<librsproto::surface::ConfigureEvent>,
+    dropped: &mut alloc::vec::Vec<librsproto::surface::MgrDragEnded>,
     restore: &mut RestoreList,
     current: u32,
 ) -> bool {
@@ -268,11 +258,10 @@ pub(super) fn place_new_windows(
                 continue;
             }
             OP_MGR_DRAG_ENDED => {
-                // The one event a whole gesture produces: a resize, or a move released in a snap
-                // zone, both a rectangle somebody asked for, answered with a `Configure` and
-                // collected as a state request is.
-                if let Some(c) = librsproto::surface::ConfigureEvent::read(&buf[..n]) {
-                    dropped.push(c);
+                // The one event a whole gesture produces — a resize, a move, or a move released in a
+                // snap zone — collected as a state request is.
+                if let Some(d) = librsproto::surface::MgrDragEnded::read(&buf[..n]) {
+                    dropped.push(d);
                 }
                 continue;
             }

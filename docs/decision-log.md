@@ -36508,3 +36508,29 @@ second declined.
   the row and the cursor. `test-interactive` edits four lines over the serial console and
   writes one longer than a message, and
   `check-terminal` edits one through `nxterm`'s encoder. Each line runs only if its edit worked.
+
+## 2026-10-19 — Before Phase 7, Part C.3: `nxterm` shorter, and the top edge maximizes, built
+
+- **`nxterm` starts at 80×20**, a 596×505 window: 71 per cent of the laptop's work area where
+  80×24 took 83. It logs the grid it started with, and `check-login` asks a maximised grid to be
+  larger both ways than that, where it compared with a fixed 80×24.
+- **The cascade wraps on the window**: a new window goes where it ends above the work area's
+  bottom, or at the first place again. Eight places fit for a 505-high terminal at 1366×768, where
+  the screen-height wrap put the sixth under the bottom bar. `desktop_shell::cascade`, host-tested.
+- **A drop at the top maximises, and it is a real maximise** (the maintainer's call): the top
+  zone's target is the work area, and its band and the two top corners reach up over the top bar,
+  so a window dragged onto the bar is in one. The zone table, and what the shell answers a drop or
+  a button, are `desktop_shell::snap`, host-tested.
+- **The shell tells a window its state**: `Manage::SetWindowState` (`0x0929`), forwarded as
+  `Surface::WindowState` (`0x0932`), the reverse of `RequestState`. `nxterm`, `nxedit` and
+  `nxfiles` set their maximise button from it and no longer from their own click, so the button
+  is right after a drop or a refusal. The compositor keeps no state; the request clears what the
+  window last asked for, so its next `RequestState` is not dropped as a repeat.
+- **`DragEnded` grows to 40 bytes**: the rectangle asked for, then the one the window came from,
+  which a drop at the top restores to; the shell cannot keep it, as the move's own geometry event
+  overtakes it. **A plain move reports `DragEnded` too**, so the shell learns a person moved a
+  maximised window and makes it normal. A wire change, not a kernel ABI change.
+- **Judged on a boot**: `check-login` drags the terminal onto the top bar and restores it with its
+  own button, twice: a button flipping on its own clicks passes the first round by luck and fails
+  the second, which a boot with that `nxterm` showed. The shell logs up to 32 window geometries
+  where it logged 16, as the gate reads one after each of its moves.

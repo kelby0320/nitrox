@@ -813,6 +813,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
                 // A `normal` window is not dismissed by a press elsewhere — the event is a popup's.
                 WindowEvent::Dismissed => {}
+                WindowEvent::State(s) => app.update(Msg::WindowState(s)),
                 // The shell asking, answered like the close button; `check-login` matches the log
                 // line.
                 WindowEvent::CloseRequested => {

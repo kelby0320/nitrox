@@ -171,6 +171,9 @@ pub enum WindowEvent {
         /// Window-local y.
         y: i32,
     },
+    /// The manager put this window in this state, one of the `WINDOW_STATE_*` values —
+    /// `Surface::WindowState`. A maximise button shows this, not what its own click asked for.
+    State(u32),
 }
 
 /// Per-window state on a [`Session`].
@@ -400,6 +403,13 @@ impl<T: Transport> Session<T> {
                     && let Some(i) = self.idx(r.window)
                 {
                     self.enqueue(i, WindowEvent::Dismissed);
+                }
+            }
+            librsproto::surface::OP_WINDOW_STATE => {
+                if let Some(s) = librsproto::surface::WindowState::read(body)
+                    && let Some(i) = self.idx(s.window)
+                {
+                    self.enqueue(i, WindowEvent::State(s.state));
                 }
             }
             OP_CONFIGURE => {

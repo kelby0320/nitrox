@@ -2260,3 +2260,16 @@ fn the_gate_clicks_the_row_it_means() {
         Item::Separator => panic!("check-login's RENAME_ROW is a rule, not a row"),
     }
 }
+
+#[test]
+fn the_maximise_button_asks_and_follows_what_the_manager_says() {
+    let mut a = app();
+    let click = |a: &mut App| {
+        click_key(a, libui::widget::TITLE_MAXIMISE_KEY);
+        a.take_state_request()
+    };
+    assert_eq!(click(&mut a), Some(WINDOW_STATE_MAXIMIZED));
+    assert_eq!(click(&mut a), Some(WINDOW_STATE_MAXIMIZED), "asking changed nothing");
+    a.update(Msg::WindowState(WINDOW_STATE_MAXIMIZED));
+    assert_eq!(click(&mut a), Some(WINDOW_STATE_NORMAL));
+}

@@ -928,6 +928,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                 }
                 WindowEvent::Dismissed => {}
+                WindowEvent::State(s) => app.update(Msg::WindowState(s)),
                 // `Msg::Close` asks about unsaved work; a logout from the power menu waits on it.
                 WindowEvent::CloseRequested => {
                     kprint(b"nxedit: asked to close\n");

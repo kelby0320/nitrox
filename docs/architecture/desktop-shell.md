@@ -80,24 +80,31 @@ been built, and only the drag had ever been gated.
 Every release over a window is also a release over the card holding it; matching the drop first
 would turn "click the window you pressed" into "move it to the desktop it is already on".
 
-Since Milestone 9 the shell is also the **other end of a window's own chrome** (§8's
-"placement", from the other side). A client
-draws its title bar and its buttons, and the two that are not the client's to perform arrive
-here as requests: `Surface::RequestState` becomes a `SetMinimized` or a `Configure` — maximise
-*moves* the window to the work area's origin as well as resizing it, so a maximised window does
-not cover the bars — and a drag becomes `Surface::StartMove`, which the compositor performs
-itself while the shell watches the geometry go by. **Dragging a window's corner** is the same
-division seen from the other side (Part E): the compositor runs the gesture and draws an outline,
-and hands the shell one `DragEnded` at the release — which the shell answers with the `Configure`
-it would have sent anyway, because changing a window's geometry is the manager's and there is one
-path to it rather than two that can disagree. **Snapping** (Part F) is that same event reached a
-different way: the shell registers eight `SnapZone`s computed from the work area — four edges,
-four corners, a 24-pixel band — and re-registers all of them whenever the work area changes,
+Since Milestone 9 the shell is also the **other end of a window's own chrome** (§8's "placement",
+from the other side). A client draws its title bar and its buttons, and the two that are not the
+client's to perform arrive here as requests: `Surface::RequestState` becomes a `SetMinimized` or a
+`Configure` — maximise *moves* the window to the work area's origin as well as resizing it, so a
+maximised window does not cover the bars — and a drag becomes `Surface::StartMove`, which the
+compositor performs itself while the shell watches the geometry go by. **Dragging a window's
+corner** is the same division seen from the other side (Part E): the compositor runs the gesture and
+draws an outline, and hands the shell one `DragEnded` at the release — which the shell answers with
+the `Configure` it would have sent anyway, because changing a window's geometry is the manager's and
+there is one path to it rather than two that can disagree. **Snapping** (Part F) is that same event
+reached a different way: the shell registers eight `SnapZone`s computed from the work area — four
+edges, four corners, a 24-pixel band — and re-registers all of them whenever the work area changes,
 because the zones *are* the work area. A window dropped in one takes that zone's target: half the
-work area for an edge, a quarter for a corner. The compositor previews the target under the
-pointer and matches the table; which region means which rectangle never reaches it. Closing is the pair the milestone added at
-both ends: a client's own close button ends the client, and the window list's middle-click sends
-`Manage::RequestClose` — an *ask*, which a client with unsaved work answers with a dialog.
+work area for an edge, a quarter for a corner, and the whole work area for the top edge, whose band
+and corners reach up over the top bar. The compositor previews the target under the pointer and
+matches the table; which region means which rectangle never reaches it. **A drop at the top
+maximises**, as the button does: the shell keeps the rectangle the window had before the drag to
+restore to, which `DragEnded` carries because the drag's own geometry event overtakes it, and tells
+the window's client with `Manage::SetWindowState`, forwarded as `Surface::WindowState`. **A maximise
+button shows what the shell said**, not what its own click asked, so it is right after a drop or a
+refusal. A plain move ends in a `DragEnded` too, which is how the shell learns that a person moved a
+maximised window, and makes it normal. The decisions are `desktop_shell::snap`, host-tested. Closing
+is the pair the milestone added at both ends: a client's own close button ends the client, and the
+window list's middle-click sends `Manage::RequestClose` — an *ask*, which a client with unsaved work
+answers with a dialog.
 
 **The insist is a second middle-click, not a clock** (M12 Part A). It was `Manage::Close` two
 seconds later, and that was safe for exactly as long as no client could decline: every

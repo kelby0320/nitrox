@@ -156,6 +156,8 @@ pub enum Msg {
     ResizeWindow(u32),
     /// A title-bar button asking the manager for a window state.
     RequestState(u32),
+    /// The manager put this window in this state: the maximise button follows it, not its click.
+    WindowState(u32),
     /// The pointer did something over the grid — a selection gesture, or motion that is not one.
     GridPointer(PointerEvent),
 }
@@ -573,13 +575,11 @@ impl App {
             Msg::Paste => self.clip_request = Some(ClipRequest::Paste),
             Msg::DragWindow => self.move_requested = true,
             Msg::ResizeWindow(edges) => self.resize_requested = Some(edges),
-            Msg::RequestState(s) => {
-                // The maximise button toggles on what was asked, not what happened; a shell that
-                // ignored it leaves the bit wrong for one click.
+            Msg::RequestState(s) => self.state_requested = Some(s),
+            Msg::WindowState(s) => {
                 if s == WINDOW_STATE_MAXIMIZED || s == WINDOW_STATE_NORMAL {
                     self.maximized = s == WINDOW_STATE_MAXIMIZED;
                 }
-                self.state_requested = Some(s);
             }
             Msg::Close => self.closing = true,
             Msg::Clear => {
@@ -1264,15 +1264,18 @@ mod tests {
     }
 
     #[test]
-    fn the_maximise_button_alternates_between_maximised_and_normal() {
+    fn the_maximise_button_asks_and_follows_what_the_manager_says() {
         let mut a = app();
-        a.update(Msg::RequestState(WINDOW_STATE_MAXIMIZED));
+        click_maximise(&mut a);
         assert_eq!(a.take_state_request(), Some(WINDOW_STATE_MAXIMIZED));
-
+        click_maximise(&mut a);
+        assert_eq!(a.take_state_request(), Some(WINDOW_STATE_MAXIMIZED), "asking changed nothing");
+        a.update(Msg::WindowState(WINDOW_STATE_MAXIMIZED));
         click_maximise(&mut a);
         assert_eq!(a.take_state_request(), Some(WINDOW_STATE_NORMAL));
+        a.update(Msg::WindowState(WINDOW_STATE_NORMAL));
         click_maximise(&mut a);
-        assert_eq!(a.take_state_request(), Some(WINDOW_STATE_MAXIMIZED), "and back again");
+        assert_eq!(a.take_state_request(), Some(WINDOW_STATE_MAXIMIZED), "and back, when the manager says");
     }
 
     #[test]
@@ -1280,7 +1283,8 @@ mod tests {
         // Three buttons, one message type: treating every `RequestState` as about maximisation
         // would flip on a minimise.
         let mut a = app();
-        a.update(Msg::RequestState(WINDOW_STATE_MAXIMIZED));
+        a.update(Msg::WindowState(WINDOW_STATE_MAXIMIZED));
+        a.update(Msg::WindowState(WINDOW_STATE_MINIMIZED));
         a.update(Msg::RequestState(WINDOW_STATE_MINIMIZED));
         let _ = a.take_state_request();
         click_maximise(&mut a);
