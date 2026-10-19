@@ -292,8 +292,9 @@ fn write_script(s: &mut Session, body: &str, path: &str, prompt: &str) -> R<()> 
     quietly(s, &format!("rename {txt} {path}"), prompt)
 }
 
-/// `test-interactive`'s steps 19d-1 to 19d-3: editing the line being typed, with the keys a serial
-/// terminal sends. Each line only runs `whoami` if its edit worked, so its answer is the assertion.
+/// `test-interactive`'s steps 19d-1 to 19d-5: editing the line being typed, with the keys a serial
+/// terminal sends, and a line too long for one write. Each edited line only runs `whoami` if its
+/// edit worked, so its answer is the assertion.
 fn interactive_editing(s: &mut Session) -> R<usize> {
     const HOME: &str = "\x1b[H";
     const RIGHT: &str = "\x1b[C";
@@ -315,7 +316,20 @@ fn interactive_editing(s: &mut Session) -> R<usize> {
     s.send("\x1b[F")?;
     s.expect("alice")?;
     s.expect("/home>")?;
-    Ok(3)
+    // 19d-4. **A bare Esc ends a search and takes no key with it**: the Enter after it runs.
+    s.send_raw("\x12whoa")?;
+    s.send_raw("\x1b")?;
+    s.send("")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+    // 19d-5. **A line longer than one message reaches the screen whole**: 4,495 bytes, where one
+    //        write to the terminal carries at most 3,980.
+    quietly(s, r#"mut long = """#, "/home>")?;
+    quietly(s, r#"for i in 1..900 { long = long ++ "wxyz-" }"#, "/home>")?;
+    s.send(r#"long ++ "END9""#)?;
+    s.expect("wxyz-END9")?;
+    s.expect("/home>")?;
+    Ok(5)
 }
 
 /// `test-interactive`'s steps 19a to 19c-3: the shell's own paths, from a real prompt.

@@ -14,8 +14,9 @@ pub enum Step {
     /// A line is complete. Its bytes (no terminator) are the payload; `echo` is what to
     /// write to move the cursor on, which is empty in no-echo mode.
     Line { bytes: Vec<u8>, echo: Vec<u8> },
-    /// A key this discipline does not act on, reported for the caller to decide: what to
-    /// replace the line with on recall is the shell's business, not the terminal's.
+    /// A key that is not text, reported for the caller to decide: an editing key goes to
+    /// [`Discipline::edit`] or is dropped, and what to replace the line with on recall is the
+    /// shell's business, not the terminal's.
     Key(Key),
     /// End of input — Ctrl-D at an empty line. Distinct from an empty *line* (a bare Enter):
     /// a reader that conflates them either exits on a stray Enter or cannot be exited.
@@ -148,6 +149,11 @@ impl Discipline {
         self.cursor
     }
 
+    /// Whether an escape sequence is half-read, so the next byte belongs to it.
+    pub fn in_escape(&self) -> bool {
+        self.esc != EscState::Ground
+    }
+
     /// Replace the line, the cursor at its end, returning what to write: the old line passed over
     /// and erased, then the new one, cut at a whole character past [`LINE_MAX`], written.
     pub fn replace_line(&mut self, new: &[u8]) -> Vec<u8> {
@@ -155,8 +161,14 @@ impl Discipline {
     }
 
     /// [`replace_line`](Self::replace_line) with `before` then `after`, the cursor between them: a
-    /// completion of what is before the cursor that keeps what follows it.
+    /// completion of what is before the cursor that keeps what follows it. One that would not fit
+    /// in [`LINE_MAX`] with what follows it is refused, writing nothing, rather than cut.
     pub fn replace_around(&mut self, before: &[u8], after: &[u8]) -> Vec<u8> {
+        if !after.is_empty() && before.len() + after.len() > self.max {
+            return Vec::new();
+        }
+        // A sequence half-read when the line is replaced is abandoned with it.
+        self.esc = EscState::Ground;
         let mut out = Vec::new();
         out.extend_from_slice(&self.line[self.cursor..]);
         for _ in 0..chars(&self.line) {
@@ -164,14 +176,16 @@ impl Discipline {
         }
         let mut new = [before, after].concat();
         new.truncate(whole_chars(&new, self.max));
-        self.cursor = before.len().min(new.len());
+        let last_row = new.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        self.cursor = before.len().min(new.len()).max(last_row);
         out.extend_from_slice(&new);
         back(&mut out, chars(&new[self.cursor..]));
         self.line = new;
         if self.echo { out } else { Vec::new() }
     }
 
-    /// The line written and the cursor walked back to its place, after a completion's listing say.
+    /// The line written and the cursor walked back to its place: after a completion's listing,
+    /// for one.
     pub fn redraw(&self) -> Vec<u8> {
         if !self.echo {
             return Vec::new();
@@ -282,11 +296,21 @@ impl Discipline {
                 };
                 return Step::None;
             }
-            // `ESC O` ends at the byte after it, which is never typed.
+            // `ESC O` ends at its final byte, which is never typed. A byte that cannot end it,
+            // Enter say, ends the sequence and is itself acted on.
             EscState::Ss3 => {
-                self.esc = if b == 0x1B { EscState::Esc } else { EscState::Ground };
-                return csi_key(if matches!(b, b'A'..=b'D' | b'H' | b'F') { b } else { 0 }, 0)
-                    .map_or(Step::None, Step::Key);
+                self.esc = EscState::Ground;
+                match b {
+                    0x40..=0x7E => {
+                        return csi_key(if matches!(b, b'A'..=b'D' | b'H' | b'F') { b } else { 0 }, 0)
+                            .map_or(Step::None, Step::Key);
+                    }
+                    0x1B => {
+                        self.esc = EscState::Esc;
+                        return Step::None;
+                    }
+                    _ => {}
+                }
             }
             EscState::Csi { param, done } => {
                 // A CSI ends at its *final* byte, not its first: ending `ESC [ 3 ~` (Delete) at
@@ -880,5 +904,92 @@ mod tests {
         edited(&mut d, b"ab");
         assert_eq!(edited(&mut d, b"\x1b[DX"), b"");
         assert_eq!(d.line(), b"aXb");
+    }
+
+    #[test]
+    fn ctrl_d_ends_input_only_on_an_empty_line_wherever_the_cursor_is() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"ab\x1b[H");
+        assert_eq!(d.feed(0x04), Step::None, "the cursor at the start of a line is not an empty line");
+        assert_eq!(d.line(), b"ab");
+    }
+
+    #[test]
+    fn ctrl_w_takes_the_word_before_the_cursor_not_the_last() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"one two three\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D");
+        edited(&mut d, b"\x17");
+        assert_eq!((d.line(), d.cursor()), (&b"one  three"[..], 4));
+    }
+
+    #[test]
+    fn ctrl_u_on_a_recalled_statement_takes_only_its_last_row() {
+        let mut d = Discipline::new();
+        d.replace_line(b"if x {\n1 }");
+        edited(&mut d, b"\x15");
+        assert_eq!(d.line(), b"if x {\n");
+    }
+
+    #[test]
+    fn a_reset_abandons_a_half_read_sequence() {
+        let mut d = Discipline::new();
+        d.feed(0x1b);
+        d.reset();
+        edited(&mut d, b"x");
+        assert_eq!(d.line(), b"x");
+    }
+
+    #[test]
+    fn a_modifier_after_the_first_parameter_is_read_past() {
+        let mut d = Discipline::new();
+        let got: Vec<Step> = b"\x1b[3;5~".iter().map(|&b| d.feed(b)).filter(|s| *s != Step::None).collect();
+        assert_eq!(got, [Step::Key(Key::Delete)], "Ctrl-Delete is Delete");
+    }
+
+    #[test]
+    fn with_echo_off_a_redraw_shows_nothing() {
+        let mut d = Discipline::new();
+        d.set_echo(false);
+        edited(&mut d, b"secret");
+        assert_eq!(d.redraw(), b"");
+    }
+
+    #[test]
+    fn replace_around_never_leaves_the_cursor_before_the_last_row() {
+        let mut d = Discipline::new();
+        d.replace_around(b"ab", b"c\nd");
+        assert_eq!(d.cursor(), 4);
+        assert_eq!(edited(&mut d, b"\x1b[H"), b"", "Home stays on the last row");
+    }
+
+    #[test]
+    fn a_completion_that_would_pass_line_max_mid_line_is_refused_not_cut() {
+        let mut d = Discipline::new();
+        let line = alloc::vec![b'a'; LINE_MAX];
+        d.replace_line(&line);
+        assert_eq!(d.replace_around(&line[..4], &line[..LINE_MAX]), b"");
+        assert_eq!((d.line().len(), d.cursor()), (LINE_MAX, LINE_MAX), "the line is as it was");
+    }
+
+    #[test]
+    fn replacing_the_line_abandons_a_half_read_sequence() {
+        let mut d = Discipline::new();
+        d.feed(0x1b);
+        d.replace_line(b"date");
+        assert!(matches!(d.feed(b'\n'), Step::Line { .. }), "the Enter is not taken by the `ESC`");
+    }
+
+    #[test]
+    fn a_byte_that_cannot_end_an_ss3_sequence_is_acted_on() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"ab\x1bO");
+        assert!(matches!(d.feed(b'\r'), Step::Line { bytes, .. } if bytes == b"ab"), "Enter still ends the line");
+    }
+
+    #[test]
+    fn an_escape_after_ss3_starts_a_new_sequence() {
+        let mut d = Discipline::new();
+        let got: Vec<Step> = b"\x1bO\x1b[D".iter().map(|&b| d.feed(b)).filter(|s| *s != Step::None).collect();
+        assert_eq!(got, [Step::Key(Key::Left)]);
     }
 }

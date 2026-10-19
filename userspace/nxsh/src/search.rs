@@ -161,4 +161,33 @@ mod tests {
         assert_eq!(st.matched, "dated");
         assert_eq!(search_key(&mut st, b'\r', &h), SearchStep::Accept);
     }
+
+    #[test]
+    fn redraw_erases_exactly_what_it_showed_last() {
+        let h = history(&["caf\u{e9}"]);
+        let mut st = Search::new(String::new());
+        assert_eq!(st.redraw(), b"search '' -> ");
+        search_key(&mut st, b'c', &h);
+        let shown = "search 'c' -> caf\u{e9}";
+        // The query's own redraw erases the 13 characters of the empty one first.
+        assert_eq!(st.redraw(), [b"\x08 \x08".repeat(13), shown.as_bytes().to_vec()].concat());
+        assert_eq!(st.erase(), b"\x08 \x08".repeat(shown.chars().count()), "characters, not bytes");
+        assert_eq!(st.erase(), b"", "nothing is left to erase");
+    }
+
+    #[test]
+    fn a_query_with_no_match_says_so() {
+        let mut st = Search::new(String::new());
+        search_key(&mut st, b'z', &History::new());
+        assert_eq!(st.redraw(), b"search 'z' -> (no match)");
+    }
+
+    #[test]
+    fn a_line_feed_accepts_and_a_space_belongs_to_the_query() {
+        let h = history(&["git status", "gitk"]);
+        let mut st = Search::new(String::new());
+        keys(&mut st, &h, b"git s");
+        assert_eq!(st.matched, "git status");
+        assert_eq!(search_key(&mut st, b'\n', &h), SearchStep::Accept);
+    }
 }

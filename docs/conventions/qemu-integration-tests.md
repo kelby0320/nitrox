@@ -402,7 +402,7 @@ each time.
 | `test-qemu` | `harness` | 125 / 33 | The self-test boot adjudicated whole by `isa-debug-exit`; USB enumeration and hot-plug, a disk written past 2 TiB, the I/O counters, AHCI claimed over MSI. |
 | `check-terminal` | `harness` | 54 | The compositor-to-shell round trip — a click, keys to `nxsh`, the answer rendered — `OSC 7` back to `nxterm`, and the PS/2 locks and lights read from QEMU's trace. |
 | `check-fbcon` | `harness` | 35 | A machine with no serial port: the boot and a panic read off the screen with the kernel's own glyphs. |
-| `test-interactive` | `release` | 120 / 32 | The release image's serial login and shell, its 37 steps through the real `login()` and `tty` layer. |
+| `test-interactive` | `release` | 120 / 32 | The release image's serial login and shell, its 48 steps through the real `login()` and `tty` layer. |
 | `check-login` | `release` | 61 | The graphical greeter on PS/2, then the desktop driven step by step: menus, windows, the overview, Files, the editor, the clipboard, dialogs. |
 | `check-login --usb` | `release` | 70 | The greeter and that session on a machine with no i8042, every key and click USB's. |
 | `check-logout` | `release-live` | 140 / 56 | Ending a session: log out past the editor's question, restart and shut down, in three boots. |
@@ -452,7 +452,7 @@ reads its metadata once. A file the build put there reads back as written in at 
 each fill reading up to 31 pages ahead.
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
-the real prompt over the serial console and matches on what comes back — 37 steps,
+the real prompt over the serial console and matches on what comes back — 48 steps,
 expect-driven rather than sleep-driven. Since Phase 6 Part H.2 one of them is `nxsh`'s `time`: its
 line, of its shape, before the value it passes through.
 

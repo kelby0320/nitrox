@@ -1,6 +1,8 @@
 # Console and TTY
 
-**Status: stages 1–4 built; last checked 2026-10-02**, when a stage's diagnostics gained a level — an error, a warning or a notice, each drawn its own way — and `nxsh --help` started writing to the terminal it was handed rather than to `kprint` (the laptop polish's Part E). On 2026-09-30 a program `with` runs in a view started getting the stage's `stderr` (it had none, so on the laptop it printed nothing). On 2026-09-23 every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
+**Status: stages 1–4 built; last checked 2026-10-19**, when the line discipline gained a cursor and
+the editing keys, which `nxsh` acts on and canonical mode drops (pre-Phase-7 Part C.2). On
+2026-10-02 a stage's diagnostics gained a level — an error, a warning or a notice, each drawn its own way — and `nxsh --help` started writing to the terminal it was handed rather than to `kprint` (the laptop polish's Part E). On 2026-09-30 a program `with` runs in a view started getting the stage's `stderr` (it had none, so on the laptop it printed nothing). On 2026-09-23 every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
 shell against the raw-read op. **Stage 4 — the second backend — landed with Milestone 5
@@ -353,7 +355,8 @@ other. The discipline's host tests cover it either way.
 - **Escape-sequence recognition.** Built: the discipline reads a CSI (`ESC [`) and an SS3
   (`ESC O`) to its final byte, keeping the CSI's first parameter, and reports Up, Down, Left,
   Right, Home, End and Delete (`ESC [ 3 ~`, and the `1~`/`7~` and `4~`/`8~` forms other
-  terminals send). Anything else is consumed and never reaches the line. **Canonical mode drops
+  terminals send). Anything else is consumed and never reaches the line, but for a byte that
+  cannot end an SS3, Enter say, which ends it and is acted on. **Canonical mode drops
   every key**, as Linux's line discipline knows no cursor; `nxsh`, reading raw, acts on them.
 - **A redraw model.** Built: the discipline holds a cursor, where typing, Backspace, Ctrl-U and
   Ctrl-W act, and says what to write for each edit as a dumb terminal draws it, with Backspace

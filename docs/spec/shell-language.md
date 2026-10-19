@@ -4,7 +4,7 @@
 
 **Implemented through Milestone 4** (2026-08-04) — `userspace/nxsh`; `time` since Phase 6 Part H.2
 (2026-10-08), §3; v1.3's paths, `~`, running a file by its path and `$args` since pre-Phase-7
-Part C.1 (2026-10-19). This is the language reference: grammar, operators and semantics. Sections
+Part C.1 (2026-10-19), and its line editing (§11c-1) since Part C.2 (2026-10-19). This is the language reference: grammar, operators and semantics. Sections
 describing `form` and the display integration are **not built** and are tracked in
 [`display-arm-plan.md`](../planning/display-arm-plan.md).
 
@@ -1488,7 +1488,7 @@ The line being typed has a cursor (v1.3), as readline's does. Each key acts at i
 | `Ctrl-W` | Erase the word before it, and the spaces before that. |
 | Up, Down | An older or a newer history entry, the cursor at its end. |
 | Tab | Complete what is before the cursor (§11c), keeping what follows. |
-| `Ctrl-R` | Search back through history. In a search, typing narrows it, `Ctrl-R` steps to an older match, Backspace widens it, Enter runs the match, `Esc` or a cursor key ends it with the match on the line to edit, and `Ctrl-G` restores the line. |
+| `Ctrl-R` | Search back through history. In a search, typing narrows it, `Ctrl-R` steps to an older match, Backspace widens it, Enter runs the match, `Esc` or a cursor key ends it with the match on the line to edit (a bare `Esc` takes no key with it), and `Ctrl-G` restores the line. |
 | Enter | Submit the whole line, wherever the cursor is. |
 | `Ctrl-D` | At an empty line, leave (§11f); mid-line, nothing. |
 | `Ctrl-C` | Discard the line (§11h). |
