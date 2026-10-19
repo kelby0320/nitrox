@@ -3,7 +3,8 @@
 ## Status
 
 **Implemented through Milestone 4** (2026-08-04) — `userspace/nxsh`; `time` since Phase 6 Part H.2
-(2026-10-08), §3. This is the language reference: grammar, operators and semantics. Sections
+(2026-10-08), §3; v1.3's paths, `~`, running a file by its path and `$args` since pre-Phase-7
+Part C.1 (2026-10-19). This is the language reference: grammar, operators and semantics. Sections
 describing `form` and the display integration are **not built** and are tracked in
 [`display-arm-plan.md`](../planning/display-arm-plan.md).
 
@@ -16,6 +17,19 @@ Companion document: `docs/architecture/ui-composition-model.md` (windows/widgets
 window-to-window composition) — graduated to `docs/architecture/` with Milestone 8, upstream of
 this one where they touch
 (e.g. `form`'s mechanics), but this doc stands on its own for shell/language concerns.
+
+### Changes in v1.3 (2026-10-19, the shell's paths)
+
+**These change semantics at the edges.** Every relative path the shell handed the namespace itself
+failed, since the kernel refuses a relative lookup, and a program could not be run by its path at
+all.
+
+- **§9h — a relative `use` path is relative to the file it is written in**, lexically, and to the
+  working directory at the prompt and with `-c`. A cycle is refused.
+- **§8c-2 — `~` is `HOME`** at the start of an unquoted word.
+- **§3 — a path at a statement's or a stage's head runs it**, and the shell decides what runs: an
+  ELF file, a `#!` interpreter, or `nxsh`. A script reads its arguments as `$args`.
+- **An error naming a path quotes it**, so a trailing space shows.
 
 ### Changes in v1.2 (2026-08-04, language-completeness pass)
 
@@ -289,6 +303,24 @@ for scripts that want it.
   PROGRAM ARGS…` runs a program in a view, through the view broker. It is recorded here so that a
   future keyword does not claim the word — `as`, `in` and `use`, the obvious alternatives, are
   keywords already. Should a keyword ever need it anyway, `^with` still reaches the program.
+
+- **A path at a statement's or a stage's head runs it** (v1.3), as in bash: `./tool x`,
+  `../bin/tool`, `/bin/date`, `~/bin/x`, and `^./tool`. The path resolves against `PWD`, after `~`
+  expands (§8c-2), and its arguments pass as written. A path anywhere else is a string, so `open
+  ./x` and `let p = ./x` are unchanged; a path typed alone at the prompt runs rather than printing
+  itself. A bare name is found in `/bin` alone.
+- **What runs is the shell's decision**, since the kernel loads only ELF and reads no `#!`:
+  - an ELF file is spawned;
+  - a file whose first line is `#!` runs the interpreter that line names — a path, or a name in
+    `/bin`, with at most one argument — given the file's path and the arguments after it;
+  - any other file runs as an `nxsh` script in a new `nxsh` process, as bash runs a file with no
+    `#!`.
+
+  An interpreter must itself be ELF, and a directory is not a program. `use` (§9h) is how a file
+  is loaded into this shell instead.
+- **A script's arguments are `$args`** (v1.3), a `List<String>`. `nxsh SCRIPT ARG…` and `nxsh -c
+  SOURCE ARG…` bind what follows the script or the source; at the prompt it is empty. It is bound
+  by the shell, like `$env`, and cannot be assigned.
 
 ## 4. I/O: `save` / `open` replace redirection
 
@@ -663,6 +695,22 @@ Without this paragraph the grammar reads as though computing an argument were im
 already cost once (2026-09-17). Pinned by
 `a_parenthesised_argument_to_an_external_program_is_evaluated` in `userspace/nxsh/src/eval.rs`,
 which asserts both halves: the parenthesised form is evaluated, the bareword beside it is not.
+
+### 8c-2. `~` is `HOME`
+
+`~` and `~/…` at the start of an **unquoted** word are `HOME` (v1.3): `cd ~`, `open ~/notes.txt`,
+`copy ~/a.txt /tmp`. A quoted `"~"` is a literal tilde, a `~` inside a word (`a~b`) is a
+character, and `~=` is still the match operator (§10b).
+
+- **An unset `HOME` is an error**, not a fallback: bash falls back to the password database, and
+  there is no user identity here to fall back on.
+- **`~name` is an error**, where bash leaves it as text: a word that silently means itself is the
+  failure §1 refuses.
+- **It is expanded where a word becomes a string**, so a program's argument arrives expanded, as in
+  bash, and `cd`, `open`, `save` and completion expand it too; an operator's column name does not.
+  That is not rewriting the program's paths, which the shell never does: `HOME` is the same to the
+  shell and to the program.
+- **`HOME` is read from the shell's environment**, where a bare `cd` reads it.
 
 ### 8d. String literals — no interpolation; `format()` instead
 
@@ -1099,6 +1147,19 @@ isn't legal — either name exactly what's being imported, or bind the whole mod
 No wildcard "dump everything into scope" form, for the same reason record patterns don't silently
 ignore fields you didn't ask about (§9f).
 
+**A relative path is relative to the file the `use` is written in** (v1.3), as Python's `import`
+and Node's `require` resolve against the importing file. bash's `source` resolves against the
+working directory instead, which is why bash scripts carry `$(dirname "${BASH_SOURCE[0]}")`.
+
+- **Lexically**: a `use` inside a `def` resolves against the `def`'s file, wherever it is called
+  from.
+- **At the prompt and with `-c`** there is no file, so it resolves against `PWD`, and `.` and `..`
+  mean what they mean everywhere else.
+- **The directory is fixed when the file is read**, so a `cd` in a script moves nothing a `use`
+  sees.
+- **A file already being loaded is refused**, the error naming the chain from the script down. A
+  module that fails leaves the chain on its way out, so a failed `use` can be tried again.
+
 **`pub` for exports, not everything-public-by-default** — the one place reusing a real Rust
 keyword is justified on principle rather than convenience (contrast the `def`-not-`fn` call in
 §9g): the underlying idea — a name crossing a file boundary should be visible at its declaration,
@@ -1128,8 +1189,6 @@ without reading it. Making it load-bearing would be a naming convention pretendi
 system.
 
 **Deliberately left open, not decided here:**
-- Circular imports — needs a rule, but it's closer to an interpreter/loader implementation concern
-  than a grammar one.
 - This is deliberately the small, file-level answer only. A real package system (versioned,
   shared, content-addressed) would naturally build on the NixOS/Guix-store influence already
   referenced elsewhere in the OS design — but that's a system-level concern bigger than shell
@@ -1541,7 +1600,6 @@ Carried forward from v1.1:
   it didn't spawn (§10a) — needs its own design pass.
 - User-definable aliases with baked-in default arguments (§10a) — deferred, distinct from the
   name-only aliasing already settled in §10e.
-- Circular import resolution (§9h) — implementation-level, not yet decided.
 - Package system beyond single-file `use` (§9h) — explicitly deferred, larger than shell grammar.
 - From the earlier session: does "windows/widgets as namespace-resident resources" (see companion
   doc) overload namespace semantics past what they're meant for? Still flagged, not resolved.

@@ -1,7 +1,7 @@
 # The bug bash: findings and their triage
 
-**Status: started 2026-10-14; four findings untriaged, three from Part C's detail pass and one
-from its PR's CI.** Part D of
+**Status: started 2026-10-14; five findings untriaged, three from Part C's detail pass, one from
+its PR's CI and one from building C.1.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -82,3 +82,17 @@ A gate failed on a branch that changes only docs. It is the gate's own defect.
     ends a dialog.
   - Demonstrated: the transcript of PR #385's CI, run 39291063887, job 118191523426. Tests.
     Medium: it fails CI on branches that touch none of it.
+
+### Found building Part C.1 — branch pre-phase-7/part-c1-paths at 2116dbcf, 2026-10-19
+
+One flake on a branch that changed only the shell and `rename`, in a path it does not touch.
+
+- [ ] **usb-1** `tools/xtask/src/usb.rs:120` — a USB keyboard hot-plugged after the hub thread's
+  first round sometimes never enumerates.
+  - Scenario: `test-qemu --kvm` adds `usb-kbd` over QMP as soon as `usb: first round` appears
+    (`usb.rs:58-65`).
+  - In the failing run, every device present at boot enumerated (the registry lists six), but no
+    line for the added keyboard followed, so the guest missed the port's change event, or never
+    acted on it.
+  - Demonstrated: failed once in three local `test-qemu --kvm` runs; the other two passed, with
+    the guest unchanged. Error paths. Medium: a device plugged in later is not seen.

@@ -36447,3 +36447,29 @@ second declined.
   - **nxsh-1**: an assignment to an `$env` field never reaches a program, and the next `cd`
     reverts it;
   - **nxsh-2**: `cd` and `exit` ignore their arguments after the first.
+
+## 2026-10-19 — Before Phase 7, Part C.1: the shell's paths, built
+
+- **What it does**:
+  - `use` resolves against the directory of the file it is written in, lexically, and against
+    `PWD` at the prompt and with `-c`. The script in `nxsh SCRIPT` resolves against `PWD`.
+  - A `use` of a file already being loaded is refused, naming the chain, and the chain unwinds on
+    every exit.
+  - `~` is `HOME` at the start of an unquoted word.
+  - A path at a statement's or a stage's head runs it, and the shell decides what runs from the
+    file's first 256 bytes: ELF, a `#!` interpreter, or `nxsh`. A script reads its arguments as
+    `$args`.
+  - An error naming a path quotes it. The spec is v1.3.
+- **Two more of the same class, found by the gate's new steps and fixed**:
+  - **`rename`** resolved OLD against `PWD` but handed NEW to the kernel as typed, so
+    `rename ./a ./b` failed wherever it ran. Every other coreutil resolves each operand.
+  - **A directory named as a program** looks up as an object that is neither a file nor a memory
+    object, with no size, so it ran as an empty script. Only those two kinds can be images now.
+- **The new code lives in new modules**, `paths.rs`, `exec.rs` and the host's `stage.rs`, because
+  `eval.rs`, `parse.rs` and `main.rs` sit at their size entries. `eval.rs` ends 14 lines shorter.
+  `main.rs` (1,424 to 1,440) and `parse.rs` (1,843 to 1,851) were raised by hand, each raise named
+  in its commit.
+- **Delegated in three briefs**: `use`, `~`, and running by path. Each diff was read whole and
+  each part's controls were rerun, which caught a test that passed against the bug it named.
+- **Found on the way, filed in `bug-bash.md`**: usb-1, a USB keyboard hot-plugged after the hub's
+  first round sometimes never enumerates (`test-qemu --kvm`, once in three).
