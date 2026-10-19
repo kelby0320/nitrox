@@ -36388,9 +36388,9 @@ second declined.
 ## 2026-10-19 — Before Phase 7, Part C detailed: the small fixes, measured
 
 - **Measured on `main` at PR #384's merge**:
-  - Every relative path the shell hands the namespace fails: `use`, a script and a program written
-    as a path. The kernel refuses a relative lookup, and only `open`, `save` and `cd` resolve
-    against `PWD` first.
+  - Every relative path the shell hands the namespace fails: `use` and a script. The kernel
+    refuses a relative lookup, and only `open`, `save` and `cd` resolve against `PWD` first. A
+    program cannot be run by its path at all, since the language names one by an identifier.
   - `~` is a lex error.
   - The line editor has no cursor and keeps no escape parameters.
   - A session's `nxterm` is 596×585 in a 708-high work area.
@@ -36398,7 +36398,8 @@ second declined.
   - An eject sends a stick nothing but a flush, and the storage service reads the stick again at
     every table read.
 - **`use` resolves against the directory of the file it is in** (the maintainer's call).
-  - That is a module import's rule, as Python's `import` and Node's `require` have it.
+  - That is a module import's rule, as Python's `import` and Node's `require` have it, and it is
+    lexical as theirs is: a `use` inside a `def` resolves against the `def`'s file.
   - At the prompt and with `-c` there is no file, so it is the working directory.
   - It is fixed when the file is read.
   - bash's `source` resolves against the working directory instead, which is why bash scripts
@@ -36414,11 +36415,14 @@ second declined.
   shell links, and canonical mode does not change.
   - The redraw stays a dumb terminal's, Backspace and text, so it needs no terminal width and draws
     on `fbcon` too.
-  - A line wider than its row is `TODO(tty-size)`.
+  - A line that fills its row, or is wider, is `TODO(tty-size)`. At exactly a full row,
+    `libterm`'s pending wrap puts a Backspace a column off.
 - **The eject is a fifth `IoOpcode`, `Eject`, not a new syscall.**
   - The stick's driver cannot see an unmount, which happens in userspace, and the last handle
     closing is not an eject.
   - The ABI hash changes.
+  - Any failure of the `Eject` after the unmounts still answers the eject as done, since the data
+    is safe.
   - Whether `START STOP UNIT` alone puts the light out is the laptop's to say.
 - **`nxterm` at 20 rows** (the maintainer's call): a 596×505 window, so eight cascaded windows
   fit above the bottom bar where five did.
@@ -36430,8 +36434,9 @@ second declined.
 - **With them** (agreed by the maintainer):
   - a `use` cycle is refused;
   - the cascade wraps on the window's height;
-  - the script and a program written as a path resolve against `PWD`, as `use` does.
+  - the script resolves against `PWD`, as `use` does.
 - **Found on the way, filed in `bug-bash.md`**:
   - **desk-1**: a jittered press on a maximized window's title bar snaps it;
-  - **nxsh-1**: an `$env` assignment never reaches a program;
-  - **nxsh-2**: `cd` ignores its arguments after the first.
+  - **nxsh-1**: an assignment to an `$env` field never reaches a program, and the next `cd`
+    reverts it;
+  - **nxsh-2**: `cd` and `exit` ignore their arguments after the first.

@@ -4,7 +4,7 @@
 2026-10-14; A.1, A.2 and A.6 built 2026-10-14, and A.3, A.4, A.5 and A.7 the same day — Part A
 built; Part B detailed 2026-10-14; B.1 built 2026-10-15; B.2 built 2026-10-16; B.5 built
 2026-10-16; B.3 built 2026-10-16; B.4 built 2026-10-17, the kernel and xtask over their
-budgets (the maintainer's call) — Part B built; Part C detailed 2026-10-19.** Each other part
+budgets (the maintainer's call) — Part B built; Part C detailed 2026-10-19.** Each later part
 gets its detail pass when it is next. Seven parts, A–G, in the order below. Part E is the
 syscall-surface consolidation, planned separately in [`syscall-surface.md`](syscall-surface.md).
 
@@ -521,8 +521,8 @@ code, narrated history, and a doc comment longer than its item needs.
 
 ## Part C — small fixes
 
-- `use "./h3.nx"` resolves against the working directory, as `open` does; an error naming a path
-  quotes it, so `"h3.nx "`'s trailing space is visible.
+- `use "./h3.nx"` resolves against the directory of the file it is in, as C.1 details; an error
+  naming a path quotes it, so `"h3.nx "`'s trailing space is visible.
 - `~` in a path: `cd ~`, `open ~/notes.txt`.
 - Line editing: Left, Right, Home, End and Delete in a line being typed.
 - `nxterm`'s default size, a little shorter.
@@ -543,12 +543,16 @@ last word.
 
 Measured: **every relative path the shell hands the namespace itself fails**, whatever `PWD` is.
 `sys_ns_lookup` refuses a path that is not absolute (`kernel/src/object/namespace.rs:369`), and
-three of the shell's own lookups pass on what was typed:
+two of the shell's own lookups pass on what was typed:
 
 - `use "./h3.nx"`: `exec_use` (`userspace/nxsh/src/eval.rs:1149`) reads through the host's
   `read_file` (`main.rs:446`). Its host tests pass only because `MockHost` matches the string.
 - The script in `nxsh ./run.nx` (`main.rs:824`).
-- A program written as a path, `./tool` (`resolve_program`, `main.rs:190`).
+
+**A program cannot be run by its path at all.** A stage is named by an identifier, which holds no
+`/` or `.` (`lex.rs:722-728`), so `./tool` is a string and `./tool x` does not parse.
+`resolve_program`'s path branch (`main.rs:190`) is unreachable. Running a program by its path
+would be a change to the language, and is not in C.1.
 
 `open`, `save` and `cd` already resolve against `PWD`, with `resolve_path` (`eval.rs:212`) over
 `librsproto::path::resolve`.
@@ -559,19 +563,24 @@ three of the shell's own lookups pass on what was typed:
   `$(dirname "${BASH_SOURCE[0]}")`.
   - **At the prompt and with `-c`** there is no file, so it is the working directory, and `.` and
     `..` mean what they mean everywhere else.
-  - **The interpreter keeps the directory of the file it is running**: the script's, resolved
-    against `PWD` when it is read. While a module runs it keeps the module's own, so a `use` inside
-    the module resolves against the module's directory.
+  - **Lexical, as theirs is**: a `use` resolves against the directory of the file it is written
+    in, wherever it runs. A `use` inside an exported `def` runs when the `def` is called, perhaps
+    from another file, and still resolves against the `def`'s file. So each `use` carries the
+    directory its file was read from: the script's, resolved against `PWD`, or a module's.
   - **It is fixed when the file is read**, so a `cd` in a script moves nothing `use` sees.
   - `open` and every other path go on resolving against `PWD`.
 - **A file already being loaded is refused**, with the chain named, rather than recursing until
   the shell's stack runs out. `exec_use` has no guard today, and §9h leaves cycles "not yet
   decided" (`docs/spec/shell-language.md:1130`).
-- **The script and a program written as a path resolve against `PWD`** the same way, before the
-  host looks them up. A program's arguments still pass as written, by `nxsh/CLAUDE.md`'s rule. Its
-  own path is the shell's lookup, like `open`'s.
+- **A module load unwinds on every exit from it**, an error included. The chain of files being
+  loaded loses the module whether it ran or failed, as `exec_use` already restores its scope and
+  functions before returning an error (`eval.rs:1158-1168`). Otherwise a `use` that failed would
+  be refused, tried again, as already loading.
+- **The script resolves against `PWD`** the same way, before the host reads it.
 - **`~` is `$env.HOME`** (the maintainer's call) where `~` or `~/…` starts an unquoted word.
-  - It is read where `cd` with no argument reads `HOME` (`env_str`, `eval.rs:1328`).
+  - It is read where `cd` with no argument reads `HOME`: the interpreter's record (`env_str`,
+    `eval.rs:1328`). Until `bug-bash.md`'s nxsh-1 is fixed, an assignment to `$env.HOME` reaches
+    neither.
   - **An unset `HOME` is an error** naming it. There is no fallback like bash's to the password
     database, since there is no user identity to fall back on.
   - **`~name` is an error too**, where bash leaves it as literal text. A quoted `"~"` stays
@@ -579,8 +588,9 @@ three of the shell's own lookups pass on what was typed:
   - **It is the same in a script as at the prompt**: the environment differs, not the mode.
   - **Today `~` is a lex error** wherever it starts the first argument, and literal text after it:
     `parse.rs:901` peeks in expression mode, where `~` alone is no token (`lex.rs:481`).
-  - **The lexer change**: in expression mode, `~` followed by `/`, a space, a closer or the end
-    reads as a path word, beside `/x` and `./x` (`lex.rs:417-424`). `~=` stays the match operator,
+  - **The lexer change**: in expression mode, `~` followed by `/`, or by anything that ends a
+    word (whitespace, a newline, `|`, a closer, the end), reads as a path word, beside `/x` and
+    `./x` (`lex.rs:417-424`). `~=` stays the match operator,
     and a `~` inside a word (`a~b`) stays a character.
   - **It is expanded where a word becomes a string**, which keeps a quoted `"~"` apart:
     - the evaluator's `Expr::Word` (`eval.rs:673`);
@@ -595,16 +605,19 @@ three of the shell's own lookups pass on what was typed:
     `cannot map` (`main.rs:447-499`), and `use`'s parse error (`eval.rs:1153`).
   - `test-interactive` expects two of them as written (`gates/interactive/mod.rs:218`, `:221`), so
     those change with them.
-- **The spec**: §9h says what a relative `use` path is relative to, and that a cycle is refused.
-  `~` gets a paragraph beside §8c-1's argument words. Neither is in the spec today.
+- **The spec**: §9h says what a relative `use` path is relative to, and that a cycle is refused,
+  and the open questions stop listing cycles as undecided (`:1544`). `~` gets a paragraph beside
+  §8c-1's argument words. Neither is in the spec today.
 - **Tests**:
   - **`MockHost` takes absolute keys** and the tests set `PWD`, so a test fails if `use` stops
     resolving. Today's `./lib.nx` keys would pass a `use` that resolved nothing.
   - **Host tests**:
     - a module that `use`s its neighbour, run from another directory;
+    - a `use` inside an exported `def`, called from a script in another directory;
     - a `cd` in a script before a `use`;
-    - a cycle;
-    - `~`, `~/x`, `"~"`, `~name`, an unset `HOME`, `a~b`, `~=`, and `~` in a program's argument;
+    - a cycle, and a `use` that failed inside its module, tried again;
+    - `~`, `~/x`, `"~"`, `~name`, an unset `HOME`, `a~b`, `~=`, `~` before a newline and before
+      `|`, and `~` in a program's argument;
     - completion after `~/`.
   - **`test-interactive`** types `cd ~` and checks `PWD` against `HOME`, and runs a script that
     `use`s its neighbour from another directory.
@@ -632,6 +645,13 @@ The plan:
   - Typing, Backspace, Ctrl-U and Ctrl-W act at it, as readline's do; Ctrl-U and Ctrl-W take what
     is before it.
   - Enter submits the whole line, wherever the cursor is.
+  - **Every way the line is emptied or replaced sets the cursor**: Enter's take
+    (`tty-server/src/lib.rs:162`), `reset`, which Ctrl-C calls (`:89-92`), and `replace_line`. A
+    cursor left behind would insert past the end of an empty line, and `Vec::insert` would panic
+    in the login shell.
+  - **`replace_line` keeps whole characters.** Today it cuts a line at `LINE_MAX` bytes,
+    mid-character if one falls there (`:111`), though `LINE_MAX` says over-long input is refused.
+    It cuts at the last whole character instead.
 - **The escape parser keeps a sequence's parameter** and reports Left, Right, Home, End and Delete
   as it reports Up and Down.
   - It takes the forms other terminals send too: `ESC[1~` and `ESC[7~` for Home, `ESC[4~` and
@@ -644,28 +664,40 @@ The plan:
   - Left writes `\x08`, and Right writes the character it passes.
   - An insertion writes the character and the rest of the line, then backs over that rest.
   - A deletion writes the rest and a space, then backs over both.
-  - So it needs no terminal width, and draws alike in `nxterm`, on a serial terminal and on
-    `fbcon`, which swallows every CSI (`kernel/src/fbcon/text.rs:174`).
+  - So, for a line shorter than its row, it needs no terminal width, and draws alike in
+    `nxterm`, on a serial terminal and on `fbcon`, which swallows every CSI
+    (`kernel/src/fbcon/text.rs:174`).
 - **The cursor moves by character**, though only ASCII can be typed (`lib.rs:234`): a completion
   or a recalled line can hold UTF-8, and `libterm` draws one cell a character.
 - **Every redraw in `nxsh` learns the cursor**:
   - Up, Down and Ctrl-R put it at the end of the line they write.
   - Tab completes what is before it and keeps what is after.
   - Ctrl-C writes the rest of the line first, so `^C` lands after it.
-  - A cursor key during a Ctrl-R search ends the search keeping the match, as readline does. Today
-    the key's `ESC` cancels the search and its `[` and `A` are typed (`main.rs:1160`).
-- **A line longer than its row is not edited across the wrap.** `libterm` and `fbcon` both clamp
-  a Backspace at the row's start (`libterm/src/grid.rs:613`), so moving back across a wrap draws
-  wrong, as Backspace does today.
-  - This is recorded as `TODO(tty-size)` with its deferral entry. The tty protocol carries no
-    size, and `complete.rs:230` wraps its listing at 80 for the same reason. A size is its trigger.
+  - **`ESC` ends a Ctrl-R search keeping the match**, as readline's default does, and the rest of
+    its sequence goes to the `Discipline`'s parser, so a cursor key ends the search and moves the
+    cursor. Ctrl-G stays the cancel. Today `ESC` cancels (`main.rs:1160`), and a cursor key's `[`
+    and `A` are typed. No gate types `ESC` in a search: `test-interactive` cancels with Ctrl-G.
+- **A line that fills its row is not edited right, nor one longer.**
+  - **At exactly a full row**, `libterm` holds the cursor on the last column with a wrap pending,
+    as xterm and Linux's console do, so a Backspace lands a column left of the line's end
+    (`libterm/src/grid.rs:613-616`, `:673-677`). `fbcon` parks past the end and lands right. Today's
+    Backspace already erases the wrong character there.
+  - **Past it**, `libterm` and `fbcon` both clamp a Backspace at the row's start, so moving back
+    across a wrap draws wrong, as Backspace does today.
+  - Both are recorded as `TODO(tty-size)` with its deferral entry. The tty protocol carries no
+    size, and `complete.rs:230` wraps its listing at 80 for the same reason. A size is the
+    trigger: with one, the shell knows when the cursor reaches the last column.
   - A recalled statement of several lines is edited on its last line.
 - **Tests**:
-  - **The `Discipline`'s host tests**: each key, and each edit at the start, the middle and the
-    end; and canonical mode ignoring the keys.
+  - **The `Discipline`'s host tests**:
+    - each key, and each edit at the start, the middle and the end;
+    - Left then Enter, and Left then Ctrl-C, each followed by typing;
+    - a recalled line over `LINE_MAX` ending in a multi-byte character;
+    - canonical mode ignoring the keys.
   - **In `libterm`**: each key is encoded, fed through a `Discipline`, and its echo drawn into a
-    `Grid`, asserting the row and the cursor's column. The redraw is judged on what a screen shows,
-    not on its bytes.
+    `Grid`, asserting the row and the cursor's column. A line one cell short of its row is among
+    them, the longest that draws right. The redraw is judged on what a screen shows, not on its
+    bytes.
   - **`test-interactive`** types a line, moves into it, inserts and deletes, and checks what runs.
   - **`check-terminal`** sends Left and a letter over QMP and reads the grid line: the path through
     `nxterm`'s encoder.
@@ -691,9 +723,10 @@ The plan:
 - **24 rows to 20** (the maintainer's call). The window becomes 596×505: 71 per cent of
   the work area's height, where 585 is 83.
   - Eight cascade places fit above the bottom, where 24 rows allow five. 80 columns stay.
-  - `check-login`'s check that a maximized grid grew compares against a literal 80×24
-    (`tools/xtask/src/gates/login/dialogs.rs:219`). It reads the starting grid from `nxterm`'s
-    log instead.
+  - `check-login`'s check that a maximized grid grew
+    (`tools/xtask/src/gates/login/dialogs.rs:219`) still passes at 20 rows, since its threshold is
+    `c > 80 && r > 24`. But its message calls 80×24 the start (`:226`). It compares with the
+    start read from `nxterm`'s log instead, larger both ways, which is what it says it checks.
   - `check-terminal`'s click at (397, 295) needs ten rows, which 20 keeps.
 - **The cascade wraps on the window, not the screen**: a window goes where it fits above the work
   area's bottom, or at the first place again.
@@ -717,14 +750,24 @@ The plan:
       moved.
     - **The three apps' buttons follow it** rather than their own click. That also mends their
       showing a maximize the shell refused.
-    - **A drop on the top zone keeps** the window's rectangle from before the drag as its restore
-      rectangle.
+    - **A drop on the top zone keeps a restore rectangle**: the one a maximized window already
+      has, as the button keeps it (`desktop-shell/src/main.rs:773-775`), or else the window's
+      rectangle from before the drag.
+    - **`DragEnded` carries that rectangle**, from the compositor's drag. The shell cannot keep it
+      itself: the drag's `WindowGeometry` overwrites the window's origin in the same drain, before
+      the queued `DragEnded` is handled (`placement.rs:303-304`, `main.rs:749`).
+    - **A plain move reports `DragEnded` too**, so the shell learns that a person moved a window.
+      `WindowGeometry` cannot tell that from the shell's own configures.
     - **It is a wire change** in `rsproto-surface-ops.md`, not a change to the kernel ABI.
   - **The fill was the other answer**: the top zone filling the work area as the halves do, a line
     in `placement.rs`, with the button out of step and nothing to restore.
 - **Tests**:
   - `register_snap_zones` takes a channel today and has no host test. Its table becomes a function
     of the work area, with one.
+  - **The shell's drop handling becomes a function of its window list**, with host tests:
+    - a drop at the top of a normal window keeps its rectangle from before the drag;
+    - a drop at the top of a maximized one keeps the restore rectangle it had;
+    - a `DragEnded` and its `WindowGeometry` handled in one drain.
   - The compositor's zone tests stand.
   - `check-login`'s snap step (`gates/login/overview.rs:345-415`) drags a window onto the top
     bar, and asserts the shell's maximize and the window's state, then restores it with the
@@ -760,10 +803,20 @@ The plan:
     never named with `InvalidArgument` (`kernel/src/drivers/ahci.rs:798`).
 - **The stick driver sends `START STOP UNIT`** with LoEj set and Start clear
   (`1B 00 00 00 02 00`), as util-linux's `eject` does, on the no-data path `Flush` uses.
-  - **A stick that answers it `ILLEGAL REQUEST`** completes `Unsupported`, and the eject still
-    succeeds: the unmount is what keeps the data.
-  - **The unit is then ejected**: every later IRP on it is refused `PeerClosed`, as a pulled
-    stick's are, until it is plugged in again and arrives as new.
+  - **A unit that stopped is ejected**: every later IRP on it is refused `PeerClosed`, as a
+    pulled stick's are, until it is plugged in again and arrives as new.
+- **Any failure of the `Eject` still leaves the eject done**: the chain has unmounted everything,
+  and the data is safe. The failures:
+  - a stick that answers `ILLEGAL REQUEST`, completed `Unsupported`;
+  - another sense, or a stalled status, which the driver's recovery completes `IoError`
+    (`storage.rs:1677-1691`);
+  - a reset recovery that fails, which ends the device (`hub.rs:217-221`), or a stick that
+    detaches on LoEj, which departs: either completes the IRP `PeerClosed`.
+
+  In each, `disk --eject` answers with the ejected names, the service marks the disk ejected all
+  the same, and its line says that the stick did not stop and why. An error after everything was
+  unmounted would be the half-done eject the chain's held check exists to prevent
+  (`storage-service/src/main.rs:944-945`).
 - **The storage service submits it** on the disk's node once the chain has unmounted everything,
   as it submits `Rescan`. It marks the disk and its partitions ejected:
   - it reads them no more;
@@ -771,12 +824,15 @@ The plan:
   - a `disk --mount` or `Reread` of one is refused, saying to plug it in again.
 - **Whether the light goes out is the laptop's to say**, as the definition of done has it.
   Sticks differ, and Linux's `udisksctl power-off` also switches the port off. If `START STOP
-  UNIT` leaves it lit, the driver goes on, on the same opcode, to deconfigure the device or switch
-  off its port, decided with the laptop's answer.
+  UNIT` leaves it lit, the driver goes on, on the same opcode, to deconfigure the device
+  (`SET_CONFIGURATION 0`). It does not switch off the port: a port switched off would not see the
+  stick plugged in again.
 - **The gates**: `check-media` and `check-storage` trace QEMU's SCSI commands
   (`-trace scsi_disk_new_request`), a gate's window onto a device as `check-terminal`'s PS/2 trace
   is.
   - **They assert** the `START STOP UNIT` with LoEj, and that no read reaches the stick after it.
+  - **Each assertion is controlled**: run once against a driver that skips the command, and once
+    against a service that reads the stick after it, and seen to fail.
   - **`check-media`'s stick is plugged `removable=on`**, as real sticks report, so QEMU opens its
     tray (`query-block`'s `tray_open`).
   - **Each is checked on CI's QEMU 8.2 first.**
@@ -804,8 +860,8 @@ Neither exists.
   - where the docs start: `docs/architecture/overview.md`;
   - the licence:
     - the project's is MIT;
-    - the fonts in `assets/fonts` keep theirs, DejaVu's and Terminus's (SIL OFL 1.1), and travel
-      with the image;
+    - the fonts in `assets/fonts` keep theirs, DejaVu's (Bitstream Vera's terms) and Terminus's
+      (SIL OFL 1.1), and travel with the image;
     - userspace's crates.io dependencies keep theirs.
 - `check-docs` holds its links and paths.
 - **The author's.**
@@ -816,8 +872,9 @@ The measuring found three defects no sub-part fixes. They are in
 [`bug-bash.md`](bug-bash.md) for Part D to triage:
 
 - a press on a maximized window's title bar that moves at all snaps it;
-- assigning into `$env` changes the binding alone, so a spawned program never sees the assignment;
-- `cd` ignores every argument after its first.
+- assigning to an `$env` field changes the binding alone: a program still gets the old value, and
+  the next `cd` reverts it;
+- `cd` and `exit` ignore every argument after their first.
 
 ## Part D — a bug bash
 

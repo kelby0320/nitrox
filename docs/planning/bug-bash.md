@@ -39,21 +39,30 @@ was demonstrated: each is read from the source, and is reproduced before it is f
   - After Part C's C.3 the top zone maximizes instead, but the corners still quarter the window.
   - Unverified: a press, a one-pixel motion and a release over QMP on a maximized `nxterm` would
     settle it. Logic. Medium.
-- [ ] **nxsh-1** `userspace/nxsh/src/eval.rs:636` — assigning into `$env` changes the `$env`
-  binding alone, so `$env.FOO = "x"` then a program leaves the program without `FOO`.
-  - An assignment updates the binding's slot (`:636-655`).
-  - `cd`, the prompt and every spawned stage read the interpreter's own record instead (`cwd()`
-    `:203`, `env_str` `:1328`, `host.run(…, &self.env)` `:1680`). Only `set_env_entry` (`:230`)
-    updates that record.
+- [ ] **nxsh-1** `userspace/nxsh/src/eval.rs:636` — assigning to an existing `$env` field changes
+  the `$env` binding alone: a spawned program still gets the old value, and the next `cd` reverts
+  the binding.
+  - Scenario, with `PWD=/` and `HOME=/home/a`: after `$env.HOME = "/x"`, `$env.HOME` reads `/x`,
+    but a program then run gets `HOME=/home/a`; after `cd /tmp`, `$env.HOME` reads `/home/a`.
+  - An assignment updates the binding's slot (`:636-655`). `cd`, the prompt and every spawned
+    stage read the interpreter's own record instead (`cwd()` `:203`, `env_str` `:1328`,
+    `host.run(…, &self.env)` `:1680`). Only `set_env_entry` (`:230`) updates that record, and it
+    republishes the record over the binding (`rebind_env`, `:220`).
   - That contradicts `rebind_env`'s promise that "the binding and the record never disagree"
-    (`:219`). `$env.HOME = "/x"` then a bare `cd` goes to the old `HOME`.
-  - Unverified: a host test assigning `$env.FOO`, then running a `MockHost` program that reports
-    its environment, would settle it. Logic. Medium.
-- [ ] **nxsh-2** `userspace/nxsh/src/eval.rs:1268` — `cd` reads its first positional argument
-  and ignores the rest.
-  - `cd a b` goes to `a` and says nothing, against the shell's fail-loud rule.
-  - `` `cd` takes one path `` fires only for an argument that is not positional (`:1280`).
-  - Unverified: a host test of `cd a b` would settle it. Logic. Low.
+    (`:219`), and the field's doc (`:141-144`), which says assigning to `$env` needs nothing beyond
+    field access. A field the record lacks cannot be assigned at all: `$env.FOO = "x"` fails with
+    "record has no field `FOO`" and runs nothing.
+  - Demonstrated by PR #385's review, and again by a temporary host test: `/x` from `$env.HOME`,
+    `HOME=/home/a` in the stage's environment, `/home/a` after a `cd`, and the new field refused.
+    Logic. Medium.
+- [ ] **nxsh-2** `userspace/nxsh/src/eval.rs:1268` — `cd` and `exit` each read their first
+  positional argument and ignore the rest.
+  - `cd a b` goes to `a`, and `exit 1 2` exits with 1, each saying nothing, against the shell's
+    fail-loud rule.
+  - `` `cd` takes one path `` fires only for an argument that is not positional (`:1280`), and so
+    does `exit`'s check (`:1293-1318`).
+  - Demonstrated by a temporary host test: `cd /a /b` left `PWD` at `/a`, and `exit 1 2` exited
+    with 1, neither with an error. Logic. Low.
 
 ### Found on PR #385's CI — main at 226a54f6, 2026-10-19
 
