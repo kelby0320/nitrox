@@ -103,6 +103,7 @@ mod tests {
     fn a_shebang_names_a_program_and_one_argument() {
         assert_eq!(what_runs(b"#!/bin/nxsh\necho hi\n"), Ok(interp("/bin/nxsh", None)));
         assert_eq!(what_runs(b"#! /bin/x -v\n"), Ok(interp("/bin/x", Some("-v"))));
+        assert_eq!(what_runs(b"#!/bin/x   -v\n"), Ok(interp("/bin/x", Some("-v"))));
         assert_eq!(what_runs(b"#!/bin/x -a -b  \r\n"), Ok(interp("/bin/x", Some("-a -b"))));
         assert_eq!(what_runs(b"#!nxsh\n"), Ok(interp("nxsh", None)));
         assert_eq!(what_runs(b"#!/bin/nxsh"), Ok(interp("/bin/nxsh", None)));

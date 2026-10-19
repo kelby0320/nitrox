@@ -132,10 +132,23 @@ fn an_unset_home_is_an_error_naming_it() {
 
 #[test]
 fn a_column_name_is_not_a_path() {
-    let host = MockHost::new();
-    let r = run(host, None, "[{a: 1}] | select ~x");
-    let m = r.err().map(|e| e.message).unwrap_or_default();
-    assert!(!m.contains("HOME"), "{m}");
+    // The operator's own refusal names the column as typed: an expanded `~x` would be refused as
+    // `~name` instead, and an expanded `~/x` would name `/h/x`.
+    for (col, home) in [("~x", None), ("~/x", Some("/h"))] {
+        let r = run(MockHost::new(), home, &format!("[{{a: 1}}] | select {col}"));
+        let m = r.err().map(|e| e.message).unwrap_or_default();
+        assert!(m.contains(&format!("no field `{col}`")), "{m}");
+    }
+}
+
+#[test]
+fn a_quoted_path_to_open_or_save_is_not_expanded() {
+    let host = MockHost::new().with_file("/p/~/n.txt", "quoted\n");
+    let r = run(host, Some("/home/a"), "open \"~/n.txt\" | count").expect("reads `/p/~/n.txt`");
+    assert_eq!(r.render(), "1");
+    let src = "[\"x\"] | save \"~/s.txt\"\nopen /p/~/s.txt | count";
+    let r = run(MockHost::new(), Some("/home/a"), src).expect("wrote `/p/~/s.txt`");
+    assert_eq!(r.render(), "1");
 }
 
 #[test]

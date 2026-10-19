@@ -16,11 +16,14 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
 ## Structure — and the reason for it
 
 - **`src/lib.rs` and friends — the language.** `lex`, `parse`, `ast`, `eval`, `value`,
-  `ops`, `repl`, `regex`, `complete`, and `timing` (`time`'s line, Phase 6 Part H.2). **No
-  syscalls.** Host-tested (`cargo test -p nxsh --lib`) in a second rather than through a
-  90-second boot.
+  `ops`, `repl`, `regex`, `complete`, `timing` (`time`'s line, Phase 6 Part H.2), `paths`
+  (resolving and `~`, where a `use` reads, the chain of files loading) and `exec` (what a file
+  named as a program runs as). **No syscalls.** Host-tested (`cargo test -p nxsh --lib --target
+  x86_64-unknown-linux-gnu`) in a second rather than through a 90-second boot.
 - **`src/main.rs` — the host.** `_start`, spawning stages, wiring pipes, the console
-  reader, the filesystem.
+  reader, the filesystem; and `src/stage.rs`, a stage's image read and decided by `exec`.
+  **`eval.rs`, `parse.rs` and `main.rs` are at their size entries**: new code goes in a module
+  of its own.
 
 The seam is the **`Host` trait**: everything that touches the OS sits behind it, the same
 way the ext4 parser sits behind `BlockReader`. It is worth more here than there — an

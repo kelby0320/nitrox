@@ -1794,7 +1794,7 @@ impl Interp {
         if c.kind != CallKind::External {
             return Ok(None);
         }
-        let mut argv = alloc::vec![c.name.clone()];
+        let mut argv = alloc::vec![self.expand_tilde(&c.name)?.into_owned()];
         for a in &c.args {
             match a {
                 Arg::Positional(e) => argv.push(self.eval(e)?.render()),

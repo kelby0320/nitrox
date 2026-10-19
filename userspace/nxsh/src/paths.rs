@@ -35,6 +35,16 @@ pub fn resolve(cwd: Option<&str>, path: &str) -> core::result::Result<String, St
     Ok(String::from_utf8_lossy(out).into_owned())
 }
 
+/// The program a stage or a `#!` line names: a path is expanded and made absolute against `env`'s
+/// `PWD`, as Linux resolves a relative `#!` against the working directory; a bare name is left for
+/// the host to find in `/bin`.
+pub fn program_path(program: &str, env: &Record) -> core::result::Result<String, String> {
+    if !is_path_head(program) {
+        return Ok(String::from(program));
+    }
+    resolve(pwd_of(env), &expand_home(program, env_field(env, "HOME"))?)
+}
+
 /// `word` with a leading `~` replaced by `home`.
 ///
 /// Only `~` and `~/…` name a home: `~name` is refused rather than left as text, and so is any `~`
@@ -101,10 +111,7 @@ impl Interp {
     /// The program a stage named `name` asks for: a path is expanded and made absolute against
     /// `PWD`, any other name is left for the host to find.
     pub(crate) fn stage_program(&self, name: &str) -> core::result::Result<String, EvalError> {
-        if !is_path_head(name) {
-            return Ok(String::from(name));
-        }
-        self.resolve_path(&self.expand_tilde(name)?)
+        program_path(name, &self.env).map_err(EvalError::new)
     }
 
     /// `self` with `$args` bound to the empty list.
@@ -172,6 +179,30 @@ mod tests {
         assert!(matches!(expand_home("a~b", None).unwrap(), Cow::Borrowed("a~b")));
         assert!(expand_home("~bob/x", Some("/h")).unwrap_err().contains("~bob/x"));
         assert!(expand_home("~", None).unwrap_err().contains("HOME"));
+    }
+
+    #[test]
+    fn a_program_path_is_expanded_and_resolved_and_a_name_is_left_alone() {
+        let env = |pairs: &[(&str, &str)]| {
+            let mut r = Record { schema: libstream::wire::Schema::new(), values: Vec::new() };
+            for (k, v) in pairs {
+                r.schema = r.schema.clone().field(k, libstream::wire::TypeTag::String, Default::default());
+                r.values.push(Value::Str(String::from(*v)));
+            }
+            r
+        };
+        let e = env(&[("PWD", "/p/sub"), ("HOME", "/h")]);
+        for (named, want) in [
+            ("/bin//nxsh", "/bin/nxsh"),
+            ("/bin/./nxsh", "/bin/nxsh"),
+            ("./tool", "/p/sub/tool"),
+            ("../bin/tool", "/p/bin/tool"),
+            ("~/bin/x", "/h/bin/x"),
+            ("nxsh", "nxsh"),
+        ] {
+            assert_eq!(program_path(named, &e).as_deref(), Ok(want), "{named}");
+        }
+        assert!(program_path("./tool", &env(&[])).unwrap_err().contains("no working directory"));
     }
 
     #[test]

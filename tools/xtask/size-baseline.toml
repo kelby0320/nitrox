@@ -40,9 +40,9 @@
 "userspace/nxfiles/src/tests.rs" = 2262
 "userspace/nxsh/src/eval.rs" = 4137
 "userspace/nxsh/src/lex.rs" = 1089
-"userspace/nxsh/src/main.rs" = 1440
+"userspace/nxsh/src/main.rs" = 1445
 "userspace/nxsh/src/ops.rs" = 1079
-"userspace/nxsh/src/parse.rs" = 1851
+"userspace/nxsh/src/parse.rs" = 1867
 "userspace/nxterm/src/lib.rs" = 2337
 "userspace/service-mgr/src/main.rs" = 2315
 "userspace/storage-service/src/lib.rs" = 1082

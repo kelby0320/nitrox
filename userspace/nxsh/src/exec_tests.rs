@@ -100,7 +100,7 @@ fn a_path_head_runs_the_program_at_its_absolute_path() {
 
     let host = MockHost::new().with_program("/home/a/bin/x", None);
     let (program, argv) = spec_of(host, Some("/p"), Some("/home/a"), "~/bin/x");
-    assert_eq!((program.as_str(), argv), ("/home/a/bin/x", strs(&["~/bin/x"])));
+    assert_eq!((program.as_str(), argv), ("/home/a/bin/x", strs(&["/home/a/bin/x"])));
 
     let host = MockHost::new().with_program("/p/bin/tool", None);
     assert_eq!(spec_of(host, Some("/p/sub"), None, "../bin/tool").0, "/p/bin/tool");
@@ -118,7 +118,7 @@ fn a_name_is_handed_to_the_host_as_written() {
 #[test]
 fn a_relative_path_head_with_no_pwd_is_the_resolvers_error() {
     let e = run(MockHost::new(), None, None, "./tool").expect_err("no PWD");
-    assert!(e.message.contains("./tool"), "{}", e.message);
+    assert!(e.message.contains("`./tool`: this is a relative path and no working directory is set"), "{}", e.message);
 }
 
 fn args_of(args: Option<&[&str]>, src: &str) -> Result<Val, EvalError> {
@@ -155,6 +155,45 @@ fn set_args_replaces_the_list() {
     i.set_args(strs(&["a"]));
     i.set_args(strs(&["b", "c"]));
     assert_eq!(i.run(&parse_script("$args | count").expect("parses")).unwrap().render(), "2");
+}
+
+/// Only a statement's, a stage's or a parenthesised expression's first token is a head: a path in
+/// an operand, a record or a keyword's argument is a string, and must not swallow a `{` as a word.
+#[test]
+fn a_path_past_the_first_token_is_never_run() {
+    for src in [
+        "let r = {src: ./deploy.nx}",
+        "let s = \"see \" ++ ./deploy.nx",
+        "\"a\" == ./b",
+        "1 + ./x",
+        "let x = true && ./b",
+        "let y = \"s\" ++ ~/x",
+        "return ./x",
+        "fail ./x",
+        "match 1 { _ => ./y }",
+        "assert (\"./a\" == ./a)",
+        "if \"a\" == ./b { 1 }",
+        "if ./x == \"a\" { 1 }",
+        "let m = match ./x { _ => 1 }",
+        "for f in ./x { }",
+        "while ./x { }",
+    ] {
+        let s = parse_script(src).unwrap_or_else(|e| panic!("`{src}` did not parse: {}", e.message));
+        assert!(!format!("{s:?}").contains("External"), "`{src}` runs a path");
+    }
+    for src in ["./x y", "list | ./x", "(./x | count)", "time ./x"] {
+        let s = parse_script(src).unwrap_or_else(|e| panic!("`{src}` did not parse: {}", e.message));
+        assert!(format!("{s:?}").contains("name: \"./x\", kind: External"), "`{src}` does not run `./x`");
+    }
+}
+
+#[test]
+fn a_path_in_a_record_is_a_value_and_nothing_runs() {
+    let host = MockHost::new().with_program("/p/deploy.nx", None);
+    let log = host.log();
+    let r = run(host, Some("/p"), None, "let r = {src: ./deploy.nx}\nr").expect("runs");
+    assert_eq!(r.render(), "{ src: \"./deploy.nx\" }");
+    assert!(log.borrow().runs.is_empty(), "a program ran");
 }
 
 #[test]

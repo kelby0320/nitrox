@@ -1,4 +1,4 @@
-# Nitrox: Shell Design Notes (v1.2)
+# Nitrox: Shell Design Notes (v1.3)
 
 ## Status
 
@@ -30,6 +30,8 @@ all.
 - **§3 — a path at a statement's or a stage's head runs it**, and the shell decides what runs: an
   ELF file, a `#!` interpreter, or `nxsh`. A script reads its arguments as `$args`.
 - **An error naming a path quotes it**, so a trailing space shows.
+- **§10c/§10d — `rename` takes a path for NEW**, as its program has since it was built, resolved
+  against `PWD` like every other operand. It never copies, so a rename across mounts is an error.
 
 ### Changes in v1.2 (2026-08-04, language-completeness pass)
 
@@ -308,16 +310,19 @@ for scripts that want it.
   `../bin/tool`, `/bin/date`, `~/bin/x`, and `^./tool`. The path resolves against `PWD`, after `~`
   expands (§8c-2), and its arguments pass as written. A path anywhere else is a string, so `open
   ./x` and `let p = ./x` are unchanged; a path typed alone at the prompt runs rather than printing
-  itself. A bare name is found in `/bin` alone.
+  itself. A bare name is found in `/bin` alone. The program's `argv[0]` is its name as typed, with
+  `~` expanded, as bash's is.
 - **What runs is the shell's decision**, since the kernel loads only ELF and reads no `#!`:
   - an ELF file is spawned;
   - a file whose first line is `#!` runs the interpreter that line names — a path, or a name in
-    `/bin`, with at most one argument — given the file's path and the arguments after it;
+    `/bin`, with at most one argument — given the file's path and the arguments after it. The
+    path resolves as a head's does: `~` expands, and a relative one is against `PWD`, as Linux
+    resolves a `#!` against the working directory;
   - any other file runs as an `nxsh` script in a new `nxsh` process, as bash runs a file with no
     `#!`.
 
-  An interpreter must itself be ELF, and a directory is not a program. `use` (§9h) is how a file
-  is loaded into this shell instead.
+  An interpreter must itself be ELF, and a directory is not a program. An empty file runs as an
+  empty script, and does nothing. `use` (§9h) is how a file is loaded into this shell instead.
 - **A script's arguments are `$args`** (v1.3), a `List<String>`. `nxsh SCRIPT ARG…` and `nxsh -c
   SOURCE ARG…` bind what follows the script or the source; at the prompt it is empty. It is bound
   by the shell, like `$env`, and cannot be assigned.
@@ -1357,8 +1362,11 @@ it applies rather than either camp uninspected:**
   this to force a rebuild. `create` would have to either drop that behavior or misdescribe it.
 - **`rename`** — new addition (PowerShell's `Rename-Item` is a real, separate cmdlet from
   `Move-Item`, not folded together). Given a genuinely distinct contract, not just a friendlier
-  label for `move`: **accepts a bare target name only, no path separator; operates strictly within
-  the source's existing directory; a path in the target is a fail-loud error.**
+  label for `move`: **it re-points a name at the same file and never copies**, so a rename across
+  mounts is a fail-loud error where `move` falls back to a copy. NEW is a path, resolved against
+  `PWD` like every operand (v1.3). This was first written as a bare name within the source's
+  directory; the program took a path from the start, and `check-storage` renames across
+  directories with it.
 
 ### 10d. Requirements (behavioral scope only — implementation deferred to build time)
 
@@ -1366,11 +1374,11 @@ it applies rather than either camp uninspected:**
 |---|---|---|
 | `list` | directory (default: cwd) | Emits `Table<{name, size, kind, modified}>`, one row per entry. `--recursive` walks subdirectories (absorbs `find`, §10a). |
 | `copy` | source path(s) → dest | Duplicates file or directory; recursive by nature for directories (no separate recursive flag needed the way `remove` requires one — copying a directory has no destructive-by-default hazard). Fail loud if destination exists, unless `--force`. |
-| `move` | source path(s) → dest | Relocates within or across directories. Destination-is-a-directory moves *into* it; destination-is-a-name renames as a side effect — distinct from `rename`'s stricter single-directory-only contract. |
+| `move` | source path(s) → dest | Relocates within or across directories and mounts. Destination-is-a-directory moves *into* it; destination-is-a-name renames as a side effect — distinct from `rename`, which never copies. |
 | `remove` | path(s) | Deletes. **Requires `--recursive` for non-empty directories** — refusing by default is a deliberate safety rail, not an oversight, consistent with fail-loud elsewhere. |
 | `mkdir` | path | Creates a directory. `--parents` creates intermediate directories. |
 | `touch` | path | Creates an empty file if absent; updates modified-time if present (§10c). |
-| `rename` | path, bare new name | Renames within the source's existing directory only; a path separator in the target argument is a fail-loud error (§10c). |
+| `rename` | path → new path | Re-points the name on the same mount, never copying; across mounts it is a fail-loud error (§10c). Both paths resolve against `PWD`. |
 | `date` | the wall clock | Emits `Table<{unix, year, month, day, hour, minute, second}>`, one row, in UTC; `--unix` narrows it to `unix`. No format spec: there is no timezone database or locale behind one. `--set TIME` first sets the clock and the machine's hardware clock to `TIME` — UTC, exactly as `2026-09-28T14:30:00Z`, from 2000 to 2099 — which needs the `clock` grant (`with admin date --set …`), and then emits the time as read after the set; a hardware clock that did not take the time is said on stderr, since it then lasts until the next boot (administration Part E.5). |
 | `sleep` | duration | Suspends the calling pipeline stage for the given duration; not schema-producing. |
 | `whoami` | — | Emits current user identity as a value. |

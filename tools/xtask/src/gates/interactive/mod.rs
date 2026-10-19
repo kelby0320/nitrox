@@ -269,63 +269,99 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     Ok(steps)
 }
 
-/// `test-interactive`'s steps 19a to 19c-1: the shell's own paths, from a real prompt. A script is
-/// written as text and renamed, since `save` writes only `.txt` and `.tsm`.
+/// Run `command` and wait for `prompt`, refusing any diagnostic in between: a `prompt` alone also
+/// follows a failure, which would then surface steps later. A diagnostic is printed in red; a
+/// child `nxsh`'s plain `nxsh: up` line is not one.
+fn quietly(s: &mut Session, command: &str, prompt: &str) -> R<()> {
+    let from = s.transcript().len();
+    s.send(command)?;
+    s.expect(prompt)?;
+    let said = &s.transcript()[from..];
+    if said.contains("\x1b[91m") {
+        return Err(format!("`{command}` was refused:\n{said}").into());
+    }
+    Ok(())
+}
+
+/// Write the lines `body`, an nxsh list literal, to `path` (`.nx`), as text renamed: `save`
+/// writes only `.txt` and `.tsm`.
+fn write_script(s: &mut Session, body: &str, path: &str, prompt: &str) -> R<()> {
+    let txt = format!("{}.txt", path.trim_end_matches(".nx"));
+    quietly(s, &format!("{body} | save {txt}"), prompt)?;
+    quietly(s, &format!("rename {txt} {path}"), prompt)
+}
+
+/// `test-interactive`'s steps 19a to 19c-3: the shell's own paths, from a real prompt.
 fn interactive_paths(s: &mut Session) -> R<usize> {
+    const AT: &str = "/home/Pictures>";
     // 19a. **`~` is HOME**, reached from another directory.
-    s.send("cd /home/Pictures")?;
-    s.expect("/home/Pictures>")?;
-    s.send("cd ~")?;
-    s.expect("/home>")?;
+    quietly(s, "cd /home/Pictures", AT)?;
+    quietly(s, "cd ~", "/home>")?;
 
     // 19b. **A script runs by its path, with arguments, and `use`s the module beside it.** Run
     //      from a sibling directory, so a `use` resolved against `PWD` reads nothing.
-    s.send("mkdir ./c1")?;
-    s.expect("/home>")?;
-    s.send("mkdir ./c1/lib")?;
-    s.expect("/home>")?;
-    s.send(r#"["pub def twice(n) { n * 2 }"] | save ./c1/lib/m.txt"#)?;
-    s.expect("/home>")?;
-    s.send("rename ./c1/lib/m.txt ./c1/lib/m.nx")?;
-    s.expect("/home>")?;
-    s.send(concat!(
+    quietly(s, "mkdir ./c1", "/home>")?;
+    quietly(s, "mkdir ./c1/lib", "/home>")?;
+    write_script(s, r#"["pub def twice(n) { n * 2 }"]"#, "./c1/lib/m.nx", "/home>")?;
+    let main = concat!(
         r#"["use \"./lib/m.nx\" { twice }", "format(\"twice={} n={} b={}\", twice(21), "#,
-        r#"($args | count), ($args | filter { |a| a == \"b\" } | count)) | display"] | save ./c1/main.txt"#
-    ))?;
-    s.expect("/home>")?;
-    s.send("rename ./c1/main.txt ./c1/main.nx")?;
-    s.expect("/home>")?;
-    s.send("cd /home/Pictures")?;
-    s.expect("/home/Pictures>")?;
+        r#"($args | count), ($args | filter { |a| a == \"b\" } | count)) | display"]"#
+    );
+    write_script(s, main, "./c1/main.nx", "/home>")?;
+    quietly(s, "cd /home/Pictures", AT)?;
     s.send("../c1/main.nx a b")?;
     s.expect("twice=42 n=2 b=1")?;
-    s.expect("/home/Pictures>")?;
+    s.expect(AT)?;
     //      And by `~`, which expands before the path resolves.
     s.send("~/c1/main.nx x")?;
     s.expect("twice=42 n=1 b=0")?;
-    s.expect("/home/Pictures>")?;
+    s.expect(AT)?;
+    //      `-c` binds what follows its source, and a script that `use`s itself is refused.
+    s.send(r#"nxsh -c "format(\"argc={}\", ($args | count)) | display" a b"#)?;
+    s.expect("argc=2")?;
+    s.expect(AT)?;
+    write_script(s, r#"["use \"./self.nx\" as m"]"#, "~/c1/self.nx", AT)?;
+    s.send("~/c1/self.nx")?;
+    s.expect("is already being loaded")?;
+    s.expect(AT)?;
 
-    // 19c. **A `#!` line names the interpreter**: the host spawns `/bin/nxsh` with the file.
-    s.send(r##"["#!/bin/nxsh", "format(\"bang n={}\", ($args | count)) | display"] | save ~/c1/bang.txt"##)?;
-    s.expect("/home/Pictures>")?;
-    s.send("rename ~/c1/bang.txt ~/c1/bang.nx")?;
-    s.expect("/home/Pictures>")?;
+    // 19c. **A `#!` line names the interpreter**: the host spawns `/bin/nxsh` with the file. Its
+    //      path resolves as a head's does, so `//` folds.
+    let bang = r##"["#!/bin//nxsh", "format(\"bang n={}\", ($args | count)) | display"]"##;
+    write_script(s, bang, "~/c1/bang.nx", AT)?;
     s.send("~/c1/bang.nx p q r")?;
     s.expect("bang n=3")?;
-    s.expect("/home/Pictures>")?;
+    s.expect(AT)?;
+    //      Refused: an interpreter that is not ELF, one that is not there, and none at all.
+    write_script(s, r##"["#!/home/c1/lib/m.nx"]"##, "~/c1/nonelf.nx", AT)?;
+    s.send("~/c1/nonelf.nx")?;
+    s.expect("runs `/home/c1/lib/m.nx`, which is not itself a program")?;
+    s.expect(AT)?;
+    write_script(s, r##"["#!/nope/x"]"##, "~/c1/absent.nx", AT)?;
+    s.send("~/c1/absent.nx")?;
+    s.expect("`/nope/x` does not resolve")?;
+    s.expect(AT)?;
+    write_script(s, r##"["#!"]"##, "~/c1/bare.nx", AT)?;
+    s.send("~/c1/bare.nx")?;
+    s.expect("the `#!` line names no interpreter")?;
+    s.expect(AT)?;
 
     // 19c-1. **A program by its path, and a directory is not one.**
     s.send("/bin/whoami")?;
     s.expect("alice")?;
-    s.expect("/home/Pictures>")?;
+    s.expect(AT)?;
     s.send("/home")?;
     s.expect("`/home` is not a program")?;
-    s.expect("/home/Pictures>")?;
-    s.send("cd ~")?;
-    s.expect("/home>")?;
-    s.send("remove -r ./c1")?;
-    s.expect("/home>")?;
-    Ok(4)
+    s.expect(AT)?;
+
+    // 19c-2. **An empty file is an empty script**: it runs, and says nothing.
+    quietly(s, "touch ~/c1/e", AT)?;
+    quietly(s, "~/c1/e", AT)?;
+
+    // 19c-3. Tidied, from home.
+    quietly(s, "cd ~", "/home>")?;
+    quietly(s, "remove -r ./c1", "/home>")?;
+    Ok(6)
 }
 
 /// `test-interactive`'s steps 6 to 19: shell language, history and Ctrl-C. The number of steps run.

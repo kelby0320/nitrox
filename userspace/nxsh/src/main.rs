@@ -190,7 +190,7 @@ impl NitroxHost {
     }
 
     fn resolve_program(&mut self, name: &str) -> Result<u64, String> {
-        if name.starts_with('/') || name.starts_with("./") || name.starts_with("../") {
+        if nxsh::exec::is_path_head(name) {
             return lookup(self.namespace, name.as_bytes()).ok_or_else(|| alloc::format!("`{name}` does not resolve"));
         }
         for dir in PROGRAM_DIRS {
@@ -217,12 +217,12 @@ impl Host for NitroxHost {
         }
         // Resolve every image first: a chain that cannot run must not leave half its stages
         // spawned.
-        let mut images = Vec::with_capacity(stages.len());
+        let mut images = stage::Images(Vec::with_capacity(stages.len()));
         let mut argvs = Vec::with_capacity(stages.len());
         for s in stages {
-            match self.resolve_stage(s) {
+            match self.resolve_stage(s, env) {
                 Ok((img, argv)) => {
-                    images.push(img);
+                    images.0.push(img);
                     argvs.push(argv);
                 }
                 Err(e) => {
@@ -264,12 +264,13 @@ impl Host for NitroxHost {
             // SAFETY: `SPAWN` is our static, filled in immediately before use; this
             // process is single-threaded so spawns are sequential.
             let proc = unsafe {
-                SPAWN.image = images[i];
+                SPAWN.image = images.0[i];
                 SPAWN.handles[0] = setup_stage;
                 SPAWN.arg0 = bootstrap_arg0(true);
                 SPAWN.namespace = 0; // inherit a LOOKUP-only view of ours
                 syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN) as u64)
             };
+            images.release(i);
             if proc < 0 {
                 return Err(alloc::format!("could not spawn `{}`", spec.program));
             }
@@ -457,7 +458,11 @@ impl Host for NitroxHost {
         if r != 0 || info.size == 0 {
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-            return Err(alloc::format!("cannot size `{path}`"));
+            // An empty file has nothing to map, and is no error: it runs as an empty script. A
+            // directory stats with no size too, and is not one.
+            let file =
+                matches!(info.object_type, libkern::handle::KOBJ_FILE_OBJECT | libkern::handle::KOBJ_MEMORY_OBJECT);
+            return if r == 0 && file { Ok(Vec::new()) } else { Err(alloc::format!("cannot size `{path}`")) };
         }
         // SAFETY: mapping a readable file handle for exactly its own length.
         let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, info.size, RIGHT_MAP_READ) };
