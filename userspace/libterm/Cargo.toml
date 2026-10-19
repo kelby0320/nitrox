@@ -39,6 +39,7 @@ libm = { version = "0.2", default-features = false }
 # server into a terminal, and Part C's direction of travel is the reverse of this one.
 [dev-dependencies]
 tty-server = { path = "../tty-server" }
+libline = { path = "../libline" }
 
 [lib]
 name = "libterm"

@@ -328,6 +328,15 @@ pub(crate) fn cmd_test() -> R<()> {
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
+        .arg("libline")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
         .arg("tty-server")
         .arg("--lib")
         .arg("--target")

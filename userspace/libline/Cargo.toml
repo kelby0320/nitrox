@@ -1,0 +1,13 @@
+[package]
+name = "libline"
+version = "0.1.0"
+edition = "2024"
+
+# `libline` — the line discipline. It was `tty-server`'s library half until `nxsh` called more of it
+# than the server did: the server reads canonical lines, and the shell edits its own prompt with a
+# cursor, recall and completion. `alloc` only, and no syscalls, so both link the one copy.
+[dependencies]
+
+[lib]
+name = "libline"
+path = "src/lib.rs"
