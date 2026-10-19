@@ -36384,3 +36384,66 @@ second declined.
   sentence opening with the word that ended the last. A final pass over the branch ran each sweep,
   positive-controlled.
 - **`check-size`'s baseline comes down with the files**, from 62 entries to 50.
+
+## 2026-10-19 — Before Phase 7, Part C detailed: the small fixes, measured
+
+- **Measured on `main` at PR #384's merge**:
+  - Every relative path the shell hands the namespace fails: `use` and a script. The kernel
+    refuses a relative lookup, and only `open`, `save` and `cd` resolve against `PWD` first. A
+    program cannot be run by its path at all, since the language names one by an identifier.
+  - `~` is a lex error.
+  - The line editor has no cursor and keeps no escape parameters.
+  - A session's `nxterm` is 596×585 in a 708-high work area.
+  - The top snap zone halves a window, and its band sits below the bar.
+  - An eject sends a stick nothing but a flush, and the storage service reads the stick again at
+    every table read.
+- **`use` resolves against the directory of the file it is in** (the maintainer's call).
+  - That is a module import's rule, as Python's `import` and Node's `require` have it, and it is
+    lexical as theirs is: a `use` inside a `def` resolves against the `def`'s file.
+  - At the prompt and with `-c` there is no file, so it is the working directory.
+  - It is fixed when the file is read.
+  - bash's `source` resolves against the working directory instead, which is why bash scripts
+    carry `dirname "${BASH_SOURCE[0]}"`.
+- **`~` is `$env.HOME`** at the start of an unquoted word (the maintainer's call).
+  - An unset `HOME` is an error, not bash's fallback to the password database: there is no user
+    identity to fall back on.
+  - `~name` is an error, not bash's literal text: the shell fails loud.
+  - A quoted `"~"` is literal.
+  - Expanding a program's argument is not the path rewriting the shell refuses, since `HOME` is the
+    same on both sides.
+- **A path at a statement's head runs it** (the maintainer's call), as in bash. The kernel loads
+  only ELF, so the shell decides what runs:
+  - an ELF file is spawned;
+  - a `#!` line names an interpreter;
+  - any other file runs as an `nxsh` script in a new process.
+
+  A script's arguments are `$args`, which nxsh does not pass on today.
+- **Line editing follows Linux** (the maintainer's call): the cursor keys go into the editing the
+  shell links, and canonical mode does not change.
+  - The redraw stays a dumb terminal's, Backspace and text, so it needs no terminal width and draws
+    on `fbcon` too.
+  - A line that fills its row, or is wider, is `TODO(tty-size)`. At exactly a full row,
+    `libterm`'s pending wrap puts a Backspace a column off.
+- **The eject is a fifth `IoOpcode`, `Eject`, not a new syscall.**
+  - The stick's driver cannot see an unmount, which happens in userspace, and the last handle
+    closing is not an eject.
+  - The ABI hash changes.
+  - Any failure of the `Eject` after the unmounts still answers the eject as done, since the data
+    is safe.
+  - Whether `START STOP UNIT` alone puts the light out is the laptop's to say.
+- **`nxterm` at 20 rows** (the maintainer's call): a 596×505 window, so eight cascaded windows
+  fit above the bottom bar where five did.
+- **A drop at the top edge is a real maximize** (the maintainer's call).
+  - The shell tells a window its state, a wire change, since a window knows it is maximized
+    only by its own button today.
+  - Filling the work area as the half-screen snaps do was the other answer. It would have left
+    the button out of step and nothing to restore.
+- **With them** (agreed by the maintainer):
+  - a `use` cycle is refused;
+  - the cascade wraps on the window's height;
+  - the script resolves against `PWD`, as `use` does.
+- **Found on the way, filed in `bug-bash.md`**:
+  - **desk-1**: a jittered press on a maximized window's title bar snaps it;
+  - **nxsh-1**: an assignment to an `$env` field never reaches a program, and the next `cd`
+    reverts it;
+  - **nxsh-2**: `cd` and `exit` ignore their arguments after the first.
