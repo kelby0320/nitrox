@@ -6,7 +6,7 @@ use crate::history::History;
 use crate::search::{Search, SearchStep, search_key};
 use alloc::string::String;
 use alloc::vec::Vec;
-use tty_server::{Discipline, Key, Step};
+use libline::{Discipline, Key, Step};
 
 /// What the loop does after a byte, in order.
 #[derive(Debug, PartialEq, Eq)]

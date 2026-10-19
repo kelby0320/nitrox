@@ -5,3 +5,7 @@
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
+
+mod discipline;
+
+pub use discipline::{Discipline, Key, LINE_MAX, Step};

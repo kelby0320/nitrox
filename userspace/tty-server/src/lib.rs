@@ -11,9 +11,7 @@
 
 extern crate alloc;
 
-mod discipline;
-
-pub use discipline::{Discipline, Key, LINE_MAX, Step};
+use libline::{Discipline, Key, Step};
 
 /// Which terminals exist, where each one's bytes go, and who is waiting. No syscalls: every
 /// effect comes back as an [`Act`]. Input goes to the first waiter **on its backend**, `Ctrl-C`

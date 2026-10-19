@@ -6,7 +6,7 @@ use crate::parse::{MAX_PER_BYTE, Op, Parser};
 use alloc::string::String;
 use alloc::vec::Vec;
 use libkern::abi::{KEY_BACKSPACE, KEY_DELETE, KEY_END, KEY_HOME, KEY_LEFT, KEY_RIGHT};
-use tty_server::{Discipline, Step};
+use libline::{Discipline, Step};
 
 /// What is typed: text as its bytes, or a key as `encode` sends it.
 enum In<'a> {

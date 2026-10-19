@@ -199,7 +199,7 @@ mod tests {
     /// ends of the wire are checked against each other, for every key `Discipline::Key` names.
     #[test]
     fn the_cursor_keys_survive_a_round_trip_through_the_line_discipline() {
-        use tty_server::{Discipline, Key, Step};
+        use libline::{Discipline, Key, Step};
 
         for (code, expected) in [
             (KEY_UP, Key::Up),
@@ -226,7 +226,7 @@ mod tests {
     fn no_sequence_this_encodes_leaks_into_a_line() {
         // A key the discipline does not act on must be consumed, not accumulated into the line:
         // the four `~` forms are four bytes, and a `~` once reached the shell as `~list /bin`.
-        use tty_server::{Discipline, Step};
+        use libline::{Discipline, Step};
 
         for key in
             [KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_INSERT, KEY_DELETE, KEY_PAGEUP, KEY_PAGEDOWN]
