@@ -4,7 +4,7 @@
 2026-10-14; A.1, A.2 and A.6 built 2026-10-14, and A.3, A.4, A.5 and A.7 the same day — Part A
 built; Part B detailed 2026-10-14; B.1 built 2026-10-15; B.2 built 2026-10-16; B.5 built
 2026-10-16; B.3 built 2026-10-16; B.4 built 2026-10-17, the kernel and xtask over their
-budgets (the maintainer's call) — Part B built.** Each other part
+budgets (the maintainer's call) — Part B built; Part C detailed 2026-10-19.** Each other part
 gets its detail pass when it is next. Seven parts, A–G, in the order below. Part E is the
 syscall-surface consolidation, planned separately in [`syscall-surface.md`](syscall-surface.md).
 
@@ -530,6 +530,294 @@ code, narrated history, and a doc comment longer than its item needs.
 - A `README.md`, and an MIT `LICENSE`.
 - `disk --eject` of a USB stick stops it (SCSI `START STOP UNIT`), so its light goes out; the
   laptop confirms it.
+
+## Part C in detail
+
+*Detailed 2026-10-19, measured on `main` at PR #384's merge, the maintainer's calls on `use`, `~`,
+line editing, the eject, `nxterm`'s rows and the maximize folded in.* Where the outline above and
+this differ, this is the plan. Five sub-parts, a PR each. C.1 comes before C.2, since both change
+`nxsh`'s `main.rs`; C.3, C.4 and C.5 need none of the others, and C.4 waits on the laptop for its
+last word.
+
+### C.1 The shell's paths
+
+Measured: **every relative path the shell hands the namespace itself fails**, whatever `PWD` is.
+`sys_ns_lookup` refuses a path that is not absolute (`kernel/src/object/namespace.rs:369`), and
+three of the shell's own lookups pass on what was typed:
+
+- `use "./h3.nx"`: `exec_use` (`userspace/nxsh/src/eval.rs:1149`) reads through the host's
+  `read_file` (`main.rs:446`). Its host tests pass only because `MockHost` matches the string.
+- The script in `nxsh ./run.nx` (`main.rs:824`).
+- A program written as a path, `./tool` (`resolve_program`, `main.rs:190`).
+
+`open`, `save` and `cd` already resolve against `PWD`, with `resolve_path` (`eval.rs:212`) over
+`librsproto::path::resolve`.
+
+- **`use` resolves against the directory of the file it is in** (the maintainer's call). That is
+  a module import's rule, the one Python's `import` and Node's `require('./x')` follow. bash's
+  `source` resolves against the working directory instead, which is why scripts carry
+  `$(dirname "${BASH_SOURCE[0]}")`.
+  - **At the prompt and with `-c`** there is no file, so it is the working directory, and `.` and
+    `..` mean what they mean everywhere else.
+  - **The interpreter keeps the directory of the file it is running**: the script's, resolved
+    against `PWD` when it is read. While a module runs it keeps the module's own, so a `use` inside
+    the module resolves against the module's directory.
+  - **It is fixed when the file is read**, so a `cd` in a script moves nothing `use` sees.
+  - `open` and every other path go on resolving against `PWD`.
+- **A file already being loaded is refused**, with the chain named, rather than recursing until
+  the shell's stack runs out. `exec_use` has no guard today, and §9h leaves cycles "not yet
+  decided" (`docs/spec/shell-language.md:1130`).
+- **The script and a program written as a path resolve against `PWD`** the same way, before the
+  host looks them up. A program's arguments still pass as written, by `nxsh/CLAUDE.md`'s rule. Its
+  own path is the shell's lookup, like `open`'s.
+- **`~` is `$env.HOME`** (the maintainer's call) where `~` or `~/…` starts an unquoted word.
+  - It is read where `cd` with no argument reads `HOME` (`env_str`, `eval.rs:1328`).
+  - **An unset `HOME` is an error** naming it. There is no fallback like bash's to the password
+    database, since there is no user identity to fall back on.
+  - **`~name` is an error too**, where bash leaves it as literal text. A quoted `"~"` stays
+    literal.
+  - **It is the same in a script as at the prompt**: the environment differs, not the mode.
+  - **Today `~` is a lex error** wherever it starts the first argument, and literal text after it:
+    `parse.rs:901` peeks in expression mode, where `~` alone is no token (`lex.rs:481`).
+  - **The lexer change**: in expression mode, `~` followed by `/`, a space, a closer or the end
+    reads as a path word, beside `/x` and `./x` (`lex.rs:417-424`). `~=` stays the match operator,
+    and a `~` inside a word (`a~b`) stays a character.
+  - **It is expanded where a word becomes a string**, which keeps a quoted `"~"` apart:
+    - the evaluator's `Expr::Word` (`eval.rs:673`);
+    - `cd`'s argument (`:1270`) and an operator's (`:1397`);
+    - completion's word (`:270`), so `cd ~/Pic` then Tab completes and writes the `~` back.
+  - **A program's argument is expanded before it is passed**, as in bash. That is not the
+    rewriting `nxsh/CLAUDE.md` forbids, which stops a relative path meaning one thing to the shell
+    and another to the stage; `HOME` is the same on both sides. The rule gets a line saying so.
+- **An error naming a path quotes it** in backticks, as most of the shell's errors do already, so
+  `"h3.nx "`'s trailing space shows.
+  - Seven do not today: `cannot open`, `cannot size`, `cannot read`, `cannot create` (twice) and
+    `cannot map` (`main.rs:447-499`), and `use`'s parse error (`eval.rs:1153`).
+  - `test-interactive` expects two of them as written (`gates/interactive/mod.rs:218`, `:221`), so
+    those change with them.
+- **The spec**: §9h says what a relative `use` path is relative to, and that a cycle is refused.
+  `~` gets a paragraph beside §8c-1's argument words. Neither is in the spec today.
+- **Tests**:
+  - **`MockHost` takes absolute keys** and the tests set `PWD`, so a test fails if `use` stops
+    resolving. Today's `./lib.nx` keys would pass a `use` that resolved nothing.
+  - **Host tests**:
+    - a module that `use`s its neighbour, run from another directory;
+    - a `cd` in a script before a `use`;
+    - a cycle;
+    - `~`, `~/x`, `"~"`, `~name`, an unset `HOME`, `a~b`, `~=`, and `~` in a program's argument;
+    - completion after `~/`.
+  - **`test-interactive`** types `cd ~` and checks `PWD` against `HOME`, and runs a script that
+    `use`s its neighbour from another directory.
+- **The `implementer`'s**, from a brief naming those tests. The lexer change is read against
+  `nxsh/CLAUDE.md`'s rule that every scanner path advances.
+
+### C.2 Line editing
+
+Measured: Linux splits line editing between the kernel's line discipline, which knows Backspace,
+Ctrl-U and Ctrl-W, and a shell's own readline, which does the rest. Nitrox splits it the same way.
+
+- **The editing is `tty_server::Discipline`** (`userspace/tty-server/src/lib.rs:53`), which
+  `nxsh` links after turning the server's echo off (`nxsh/src/main.rs:896-901`).
+- **Its line has no cursor**, only an end.
+- **Its escape parser keeps no parameters**, so Delete (`ESC[3~`) cannot be told from Insert. It
+  reports Up and Down alone and drops the rest (`lib.rs:126-153`).
+- **Every redraw in `nxsh` assumes the cursor** at the end of the line, on one row.
+- **The terminal side is ready**: `libterm` sends `ESC[D`, `ESC[C`, `ESC[H`, `ESC[F` and `ESC[3~`
+  for Left, Right, Home, End and Delete (`libterm/src/encode.rs:29-48`), as a serial terminal
+  does.
+
+The plan:
+
+- **The cursor is the `Discipline`'s**: a position in the line.
+  - Typing, Backspace, Ctrl-U and Ctrl-W act at it, as readline's do; Ctrl-U and Ctrl-W take what
+    is before it.
+  - Enter submits the whole line, wherever the cursor is.
+- **The escape parser keeps a sequence's parameter** and reports Left, Right, Home, End and Delete
+  as it reports Up and Down.
+  - It takes the forms other terminals send too: `ESC[1~` and `ESC[7~` for Home, `ESC[4~` and
+    `ESC[8~` for End.
+  - An `ESC O` sequence ends at its final byte. Today that byte is typed (`lib.rs:122-125`).
+- **Canonical mode does not change** (the maintainer's call, as Linux's line discipline does
+  not). It drops the new keys as it drops Up and Down (`lib.rs:497`), so its cursor stays at the
+  end. The login prompt and `with`'s, `account`'s and `nxinstall`'s prompts behave as now.
+- **The redraw stays a dumb terminal's**: Backspace and text, no escape sequences.
+  - Left writes `\x08`, and Right writes the character it passes.
+  - An insertion writes the character and the rest of the line, then backs over that rest.
+  - A deletion writes the rest and a space, then backs over both.
+  - So it needs no terminal width, and draws alike in `nxterm`, on a serial terminal and on
+    `fbcon`, which swallows every CSI (`kernel/src/fbcon/text.rs:174`).
+- **The cursor moves by character**, though only ASCII can be typed (`lib.rs:234`): a completion
+  or a recalled line can hold UTF-8, and `libterm` draws one cell a character.
+- **Every redraw in `nxsh` learns the cursor**:
+  - Up, Down and Ctrl-R put it at the end of the line they write.
+  - Tab completes what is before it and keeps what is after.
+  - Ctrl-C writes the rest of the line first, so `^C` lands after it.
+  - A cursor key during a Ctrl-R search ends the search keeping the match, as readline does. Today
+    the key's `ESC` cancels the search and its `[` and `A` are typed (`main.rs:1160`).
+- **A line longer than its row is not edited across the wrap.** `libterm` and `fbcon` both clamp
+  a Backspace at the row's start (`libterm/src/grid.rs:613`), so moving back across a wrap draws
+  wrong, as Backspace does today.
+  - This is recorded as `TODO(tty-size)` with its deferral entry. The tty protocol carries no
+    size, and `complete.rs:230` wraps its listing at 80 for the same reason. A size is its trigger.
+  - A recalled statement of several lines is edited on its last line.
+- **Tests**:
+  - **The `Discipline`'s host tests**: each key, and each edit at the start, the middle and the
+    end; and canonical mode ignoring the keys.
+  - **In `libterm`**: each key is encoded, fed through a `Discipline`, and its echo drawn into a
+    `Grid`, asserting the row and the cursor's column. The redraw is judged on what a screen shows,
+    not on its bytes.
+  - **`test-interactive`** types a line, moves into it, inserts and deletes, and checks what runs.
+  - **`check-terminal`** sends Left and a letter over QMP and reads the grid line: the path through
+    `nxterm`'s encoder.
+- **Docs**: `console-and-tty.md`, whose passage saying the discipline drops `ESC` (`:352-358`) is
+  stale already, and a key table in `shell-language.md` §11, which has none.
+- **The author's**: the `Discipline` is in every prompt, passwords' included. Reviewed with
+  `/pr-review`.
+
+### C.3 `nxterm` shorter, and the top edge maximizes
+
+Measured at the laptop's 1366×768, which the gates boot as 1360×768. The work area is 708 high,
+between a 30-pixel top bar and a 30-pixel bottom bar.
+
+- **A session's `nxterm` is a 596×585 window**: 80×24 cells of 7×20 at 12 px
+  (`nxterm/src/main.rs:41-43`). 105 of its height is the menu bar, tabs, title bar and padding
+  (`lib.rs:69-80`).
+- **New windows cascade** from (24, 54) in steps of 24, and wrap only past the *screen's* height
+  (`desktop-shell/src/placement.rs:413-416`). So from the sixth window on, a terminal placed there
+  runs under the bottom bar.
+
+The plan:
+
+- **24 rows to 20** (the maintainer's call). The window becomes 596×505: 71 per cent of
+  the work area's height, where 585 is 83.
+  - Eight cascade places fit above the bottom, where 24 rows allow five. 80 columns stay.
+  - `check-login`'s check that a maximized grid grew compares against a literal 80×24
+    (`tools/xtask/src/gates/login/dialogs.rs:219`). It reads the starting grid from `nxterm`'s
+    log instead.
+  - `check-terminal`'s click at (397, 295) needs ten rows, which 20 keeps.
+- **The cascade wraps on the window, not the screen**: a window goes where it fits above the work
+  area's bottom, or at the first place again.
+- **A drag to the top maximizes**: zone 7's target becomes the work area, where today it is the
+  top half (`placement.rs:39`).
+- **Its trigger reaches the screen's top.** The band today is the 24 rows below the bar (rows
+  30–53), so a pointer dragged *onto* the bar, as the outline says, is in no zone and drops an
+  ordinary move. The top zone and the two top corners grow up to row 0.
+- **A real maximize, not a fill** (the maintainer's call).
+  - **Today a window knows it is maximized only by its own button.** Each of `nxterm`, `nxedit`
+    and `nxfiles` flips a flag on the click (`nxterm/src/lib.rs:576-583`), and a `Configure`
+    carries no state (`librsproto/src/surface.rs:1678`).
+  - **The shell also drops a window's restore rectangle on any drop**
+    (`desktop-shell/src/main.rs:749-752`).
+  - **So a window dropped at the top would fill the work area** with its button still offering to
+    maximize, and nothing to restore.
+  - **So the shell tells a window its state**: a manager request that the compositor forwards as
+    an event, the reverse of `RequestState`.
+    - **It says maximized** when the shell maximizes a window.
+    - **It says normal** when the shell restores one, or a window is resized, snapped elsewhere or
+      moved.
+    - **The three apps' buttons follow it** rather than their own click. That also mends their
+      showing a maximize the shell refused.
+    - **A drop on the top zone keeps** the window's rectangle from before the drag as its restore
+      rectangle.
+    - **It is a wire change** in `rsproto-surface-ops.md`, not a change to the kernel ABI.
+  - **The fill was the other answer**: the top zone filling the work area as the halves do, a line
+    in `placement.rs`, with the button out of step and nothing to restore.
+- **Tests**:
+  - `register_snap_zones` takes a channel today and has no host test. Its table becomes a function
+    of the work area, with one.
+  - The compositor's zone tests stand.
+  - `check-login`'s snap step (`gates/login/overview.rs:345-415`) drags a window onto the top
+    bar, and asserts the shell's maximize and the window's state, then restores it with the
+    button.
+- **Docs**: `desktop-shell.md`'s snapping paragraph (`:93`) and the surface spec.
+- **The `implementer`'s for the rows and the cascade; the author's for the state**, which is a
+  wire change.
+
+### C.4 An ejected stick stops
+
+Measured:
+
+- **The eject sends the stick nothing beyond the flush.** `disk --eject` and Files' eject run the
+  unmount chain and its flush, and nothing more reaches the stick
+  (`storage-service/src/main.rs:920-966`). `storage.md` §8a says so (`:339`).
+- **The kernel's stick driver has no `START STOP UNIT`**: its commands are at
+  `kernel/src/drivers/xhci/storage.rs:127-190`.
+- **Nothing tells the kernel a stick was ejected**: unmounting is userspace's.
+- **The storage service keeps reading it.** Each read of its table re-probes every unmounted device
+  (`refresh_unmounted`, `main.rs:776`). So `disk --list`, or Files' refresh after an eject, would
+  wake a stopped stick.
+
+The plan:
+
+- **`IoOpcode::Eject = 4`**, the fifth opcode on `sys_io_submit`, added as `Flush` (administration
+  C.2) and `Rescan` (Phase 6 Part G) were.
+  - It takes no buffer and no range, needs the `WRITE` right, and acts on a block device.
+  - **No new syscall, but the ABI hash changes**, since the opcodes are one of its inputs
+    (`abi-version-hash.md`). `IrpOp`, libkern's constant and `abi-sync-check`'s family follow.
+  - **A partition refuses it `Unsupported`**, as it does `Rescan`. Today a partition rebases an op
+    it does not know and forwards it to its disk (`kernel/src/io/block.rs:491-508`).
+  - **AHCI and the RAM disk refuse it `Unsupported` too**, explicitly. Today AHCI fails an op it
+    never named with `InvalidArgument` (`kernel/src/drivers/ahci.rs:798`).
+- **The stick driver sends `START STOP UNIT`** with LoEj set and Start clear
+  (`1B 00 00 00 02 00`), as util-linux's `eject` does, on the no-data path `Flush` uses.
+  - **A stick that answers it `ILLEGAL REQUEST`** completes `Unsupported`, and the eject still
+    succeeds: the unmount is what keeps the data.
+  - **The unit is then ejected**: every later IRP on it is refused `PeerClosed`, as a pulled
+    stick's are, until it is plugged in again and arrives as new.
+- **The storage service submits it** on the disk's node once the chain has unmounted everything,
+  as it submits `Rescan`. It marks the disk and its partitions ejected:
+  - it reads them no more;
+  - `disk --list` shows them with the note "ejected; remove it";
+  - a `disk --mount` or `Reread` of one is refused, saying to plug it in again.
+- **Whether the light goes out is the laptop's to say**, as the definition of done has it.
+  Sticks differ, and Linux's `udisksctl power-off` also switches the port off. If `START STOP
+  UNIT` leaves it lit, the driver goes on, on the same opcode, to deconfigure the device or switch
+  off its port, decided with the laptop's answer.
+- **The gates**: `check-media` and `check-storage` trace QEMU's SCSI commands
+  (`-trace scsi_disk_new_request`), a gate's window onto a device as `check-terminal`'s PS/2 trace
+  is.
+  - **They assert** the `START STOP UNIT` with LoEj, and that no read reaches the stick after it.
+  - **`check-media`'s stick is plugged `removable=on`**, as real sticks report, so QEMU opens its
+    tray (`query-block`'s `tray_open`).
+  - **Each is checked on CI's QEMU 8.2 first.**
+- **Docs**:
+  - `io-operation.md`, `irp-layout.md` and `abi-version-hash.md`;
+  - `syscall-abi.md`, whose opcode list lacks `Rescan` already (`:197`);
+  - `drivers-and-irps.md`, `usb.md`, and `storage.md` §8a;
+  - `rsproto-storage-ops.md`'s Eject, which says it "sends nothing further to the device"
+    (`:142-143`).
+- **The author's**: a driver and the ABI. Reviewed with `/pr-review`.
+
+### C.5 A README and a licence
+
+Neither exists.
+
+- **`LICENSE`**: the MIT licence, "Copyright (c) 2026 Kelby Madal", the name the commits carry.
+- **`README.md`**, for a person arriving at the repository:
+  - what Nitrox is, and what it rejects;
+  - its state: pre-v0.1, with Phases 0–6 built;
+  - what building needs:
+    - the two pinned toolchains, which rustup installs from the two `rust-toolchain.toml`s;
+    - `qemu-system-x86`, `ovmf`, `gdisk`, `mtools`, `dosfstools` and `e2fsprogs`, as CI installs
+      them;
+  - the commands that build, boot and test it;
+  - where the docs start: `docs/architecture/overview.md`;
+  - the licence:
+    - the project's is MIT;
+    - the fonts in `assets/fonts` keep theirs, DejaVu's and Terminus's (SIL OFL 1.1), and travel
+      with the image;
+    - userspace's crates.io dependencies keep theirs.
+- `check-docs` holds its links and paths.
+- **The author's.**
+
+### Found on the way
+
+The measuring found three defects no sub-part fixes. They are in
+[`bug-bash.md`](bug-bash.md) for Part D to triage:
+
+- a press on a maximized window's title bar that moves at all snaps it;
+- assigning into `$env` changes the binding alone, so a spawned program never sees the assignment;
+- `cd` ignores every argument after its first.
 
 ## Part D — a bug bash
 
