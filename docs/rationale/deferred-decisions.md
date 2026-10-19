@@ -1543,7 +1543,7 @@ missing — `History::search_back` already returns indices and can enumerate eve
 Trigger: the compositor terminal, or any terminal backend that can address the cursor.
 
 **A line that fills its row is edited wrong — `TODO(tty-size)`.**
-The prompt's editing (`tty_server::Discipline`, which `nxsh` links) redraws as a dumb terminal
+The prompt's editing (`libline::Discipline`, which `nxsh` links) redraws as a dumb terminal
 would, with Backspace and text, so it needs no terminal width. That holds for a line shorter than
 its row:
 

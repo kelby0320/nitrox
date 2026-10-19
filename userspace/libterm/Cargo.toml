@@ -19,7 +19,7 @@ edition = "2024"
 # **One crate for both directions of the wire.** The parser turns a program's bytes into grid
 # operations; the encoder turns a person's key events back into bytes. They are the two halves
 # of one protocol, and keeping them together is what lets a test send `encode(Up)` through
-# `tty_server::Discipline` and get `Up` back — two independently-written ends checked against
+# `libline::Discipline` and get `Up` back — two independently-written ends checked against
 # each other rather than each against someone's belief about the other. That test found a
 # four-year-old shape of bug on its first run: the discipline ended a CSI at its first byte.
 [dependencies]
@@ -34,11 +34,10 @@ libkern = { path = "../libkern" }
 # float that has to round *up* or a row of glyphs comes out a pixel short.
 libm = { version = "0.2", default-features = false }
 
-# `tty_server::Discipline` parses the input escape sequences this crate produces, so the two
-# ends of one wire can be checked against each other. A dev-dependency: nothing links the tty
-# server into a terminal, and Part C's direction of travel is the reverse of this one.
+# `libline::Discipline` parses the input escape sequences this crate produces, so the two ends of
+# one wire can be checked against each other, and what it writes for an edit is drawn on this
+# crate's grid. A dev-dependency: nothing links a line discipline into a terminal.
 [dev-dependencies]
-tty-server = { path = "../tty-server" }
 libline = { path = "../libline" }
 
 [lib]

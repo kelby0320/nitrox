@@ -10,9 +10,9 @@ librsproto = { path = "../librsproto" }
 libline = { path = "../libline" }
 
 # A library + binary split (mirroring profile-server): the library holds the
-# host-testable line discipline — the part with all the behaviour and none of the
-# syscalls. `cargo xtask test` runs `cargo test -p tty-server --lib`; the
-# `#![no_main]` bin can't build on host.
+# host-testable routing and tokens — the part with all the behaviour and none of the
+# syscalls — and the line discipline is `libline`'s. `cargo xtask test` runs
+# `cargo test -p tty-server --lib`; the `#![no_main]` bin can't build on host.
 [lib]
 name = "tty_server"
 path = "src/lib.rs"

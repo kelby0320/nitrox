@@ -334,9 +334,10 @@ conclusion Linux reached, for the same reason.
 
 No, and the distinction matters. The three copies we removed were three **implementations**.
 What Linux has is one implementation deployed as a **library**. We already have that: the
-discipline is a crate half with no syscalls in it, precisely so it can be linked rather than
-reimplemented. `nxsh` linking it is not a fourth copy; it is the second *deployment* of the
-first copy.
+discipline is a crate of its own, `libline`, with no syscalls in it, precisely so it can be
+linked rather than reimplemented. `nxsh` linking it is not a fourth copy; it is the second
+*deployment* of the first copy. (It was `tty-server`'s library half until 2026-10-19, when the
+shell came to call more of it than the server does.)
 
 Being honest about the residual cost: two deployments of one implementation can still
 diverge in *use* — canonical mode in the server for simple readers, raw mode in the shell

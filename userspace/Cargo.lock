@@ -330,7 +330,6 @@ dependencies = [
  "libline",
  "libm",
  "librsproto",
- "tty-server",
 ]
 
 [[package]]
@@ -442,7 +441,6 @@ dependencies = [
  "libline",
  "librsproto",
  "libstream",
- "tty-server",
 ]
 
 [[package]]

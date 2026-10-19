@@ -1,11 +1,6 @@
-//! `tty-server` — the line discipline, separated from the syscalls.
-//!
-//! What a byte does to a line buffer, when a line is complete and what gets echoed live here
-//! and host-test; the binary half owns the console device, the IPC channels and the wait loop.
-//!
-//! One implementation behind a testable seam replaces three copies (`eshell`, `session-mgr`'s
-//! login, `nxsh`'s REPL) that disagreed over whether to echo the CR/LF ending a line, which
-//! rendered a password prompt as `alicepassword:`.
+//! `tty-server` — the terminals, separated from the syscalls: which exist, where each one's bytes
+//! go, who is waiting, and the tokens one is handed on with. The binary half owns the console, the
+//! IPC channels and the wait loop; what a byte does to a line is `libline`'s.
 
 #![cfg_attr(not(test), no_std)]
 

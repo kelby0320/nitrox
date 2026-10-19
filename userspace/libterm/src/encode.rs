@@ -59,7 +59,7 @@ pub fn encode(keycode: u16, modifiers: u16, locks: u16, out: &mut [u8]) -> usize
     let mut n = 0;
 
     if let Some(seq) = sequence(keycode) {
-        // Alt does not prefix a sequence that already starts with `ESC`: `tty_server::Discipline`
+        // Alt does not prefix a sequence that already starts with `ESC`: `libline::Discipline`
         // would type `[A` into the line from `ESC ESC [ A`.
         if alt && seq[0] != 0x1b {
             out[n] = 0x1b;
@@ -195,7 +195,7 @@ mod tests {
         }
     }
 
-    /// The round trip: `tty_server::Discipline` parses what a serial terminal sends, so the two
+    /// The round trip: `libline::Discipline` parses what a serial terminal sends, so the two
     /// ends of the wire are checked against each other, for every key `Discipline::Key` names.
     #[test]
     fn the_cursor_keys_survive_a_round_trip_through_the_line_discipline() {

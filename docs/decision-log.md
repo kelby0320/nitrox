@@ -36498,9 +36498,12 @@ second declined.
   next byte arrives in the same read, which is readline's rule too. A bare Esc takes no key
   with it.
 - **The discipline moved to a module of its own first**, a move `check-moves` holds, taking
-  `tty-server`'s `lib.rs` off the size baseline. The search and then the rest of the prompt's
-  editing moved from `nxsh`'s `main.rs` to library modules, `search` and `editor`, where each key
-  is host-tested; the loop reads, writes and runs.
+  `tty-server`'s `lib.rs` off the size baseline. At review it moved again, to a crate of its own,
+  **`libline`**, below `tty-server` and `nxsh` (the maintainer's call): the shell now calls more
+  of it than the server does, and `userspace/CLAUDE.md` puts a helper with two consumers below
+  both. `libterm`'s tests take it in place of the server. The search and then the rest of the
+  prompt's editing moved from `nxsh`'s `main.rs` to library modules, `search` and `editor`, where
+  each key is host-tested; the loop reads, writes and runs.
 - **Judged on a screen**: `libterm`'s tests draw what the discipline writes into a grid and assert
   the row and the cursor. `test-interactive` edits four lines over the serial console and
   writes one longer than a message, and

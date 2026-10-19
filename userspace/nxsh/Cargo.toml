@@ -15,7 +15,6 @@ libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
 # The line discipline, *linked* rather than reimplemented — the shell edits its own
 # input (history needs it) but must not become a fourth copy of backspace and kill.
-tty-server = { path = "../tty-server" }
 libline = { path = "../libline" }
 librsproto = { path = "../librsproto", features = ["io"] }
 # Directory listings, for `cd`'s check and for Tab completion. The *union* of the
