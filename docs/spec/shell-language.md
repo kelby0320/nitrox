@@ -18,7 +18,7 @@ window-to-window composition) — graduated to `docs/architecture/` with Milesto
 this one where they touch
 (e.g. `form`'s mechanics), but this doc stands on its own for shell/language concerns.
 
-### Changes in v1.3 (2026-10-19, the shell's paths)
+### Changes in v1.3 (2026-10-19, the shell's paths and line editing)
 
 **These change semantics at the edges.** Every relative path the shell handed the namespace itself
 failed, since the kernel refuses a relative lookup, and a program could not be run by its path at
@@ -30,6 +30,7 @@ all.
 - **§3 — a path at a statement's or a stage's head runs it**, and the shell decides what runs: an
   ELF file, a `#!` interpreter, or `nxsh`. A script reads its arguments as `$args`.
 - **An error naming a path quotes it**, so a trailing space shows.
+- **§11c-1 — the line being typed has a cursor**, and a table says what each key does.
 - **§10c/§10d — `rename` takes a path for NEW**, as its program has since it was built, resolved
   against `PWD` like every other operand. It never copies, so a rename across mounts is an error.
 
@@ -1472,6 +1473,32 @@ siz<TAB>` → `size`, using an upstream pipeline's known `Table` shape). Plausib
 often statically knowable from ascriptions, but needs real design — does it require speculatively
 executing upstream stages, or only work when ascription made the shape explicit — not solved as a
 side effect here.
+
+### 11c-1. Editing keys
+
+The line being typed has a cursor (v1.3), as readline's does. Each key acts at it:
+
+| Key | Does |
+|---|---|
+| Left, Right | Move the cursor a character. |
+| Home, End | Move it to the line's start or end. Terminals send these several ways (`ESC [ H`, `ESC [ 1 ~`, `ESC [ 7 ~`, `ESC O H`; the `F`, `4~` and `8~` forms for End), and each is read. |
+| Backspace | Erase the character before the cursor. |
+| Delete | Erase the character under it. |
+| `Ctrl-U` | Erase everything before it. |
+| `Ctrl-W` | Erase the word before it, and the spaces before that. |
+| Up, Down | An older or a newer history entry, the cursor at its end. |
+| Tab | Complete what is before the cursor (§11c), keeping what follows. |
+| `Ctrl-R` | Search back through history. In a search, typing narrows it, `Ctrl-R` steps to an older match, Backspace widens it, Enter runs the match, `Esc` or a cursor key ends it with the match on the line to edit, and `Ctrl-G` restores the line. |
+| Enter | Submit the whole line, wherever the cursor is. |
+| `Ctrl-D` | At an empty line, leave (§11f); mid-line, nothing. |
+| `Ctrl-C` | Discard the line (§11h). |
+
+- **A prompt a program asks through has no cursor.** A program's line is read in the terminal
+  server's canonical mode, the login's and `with`'s password among them. Canonical mode keeps
+  only Backspace, `Ctrl-U` and `Ctrl-W`, as Linux's does.
+- **The redraw is Backspace and text**, so it works on any terminal, the framebuffer console's
+  included. A line that fills its row is drawn wrong (`TODO(tty-size)`).
+- **A recalled statement of several lines is edited on its last line.**
 
 ### 11d. `$last` — resolves an ambiguity left open in §2
 

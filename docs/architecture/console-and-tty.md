@@ -235,10 +235,11 @@ console driver is single-reader, and until every client has moved onto this serv
 permanently-outstanding read in the server *steals their input* — the interactive login test
 timed out waiting for a password prompt whose keystrokes the server had swallowed.
 
-So the server submits a console read **only when a terminal is actually waiting for a
-line**. A terminal with no reader competes with nobody, which is what lets clients migrate
-one at a time instead of all at once. That is not a temporary hack: reading on demand is the
-right behaviour anyway.
+So the server submitted a console read **only when a terminal was actually waiting for a
+line**. A terminal with no reader competed with nobody, which is what let clients migrate
+one at a time instead of all at once. Once every client had moved, the read became permanent
+(`userspace/tty-server/src/main.rs`): `Ctrl-C` has to be seen while the shell is busy, when
+nobody is waiting for input, and the server is now the console's only reader.
 
 1. **The server, with the line discipline and a writable path.** ✅ 2026-08-03 `session-mgr` and `nxsh` move
    onto it; the three copies of line editing collapse into one. `eshell` stays on the raw device
@@ -338,7 +339,7 @@ first copy.
 Being honest about the residual cost: two deployments of one implementation can still
 diverge in *use* — canonical mode in the server for simple readers, raw mode in the shell
 for interactive ones — and a bug fixed in one call path is not automatically exercised in the
-other. The 16 host tests cover the discipline itself either way.
+other. The discipline's host tests cover it either way.
 
 ### What it needs
 
@@ -349,13 +350,16 @@ other. The 16 host tests cover the discipline itself either way.
   first proposed: two read ops say the same thing with less state. A client asks for what it
   wants per read, and cannot leave a terminal in a mode some later reader did not expect —
   which is a hazard `termios` has and this does not need to inherit.
-- **Escape-sequence recognition.** `ESC [ A` is three bytes; the discipline currently drops
-  `ESC` as an undefined control byte. This is a small state machine, and it is the first step
-  toward terminal *input* parsing — worth deciding deliberately where that stops rather than
-  letting it grow.
-- **A redraw model.** Reverse-search rewrites the whole visible line repeatedly. Today the
-  discipline only ever appends a character or erases one, so it does not know what is
-  currently displayed. Redrawing needs it to.
+- **Escape-sequence recognition.** Built: the discipline reads a CSI (`ESC [`) and an SS3
+  (`ESC O`) to its final byte, keeping the CSI's first parameter, and reports Up, Down, Left,
+  Right, Home, End and Delete (`ESC [ 3 ~`, and the `1~`/`7~` and `4~`/`8~` forms other
+  terminals send). Anything else is consumed and never reaches the line. **Canonical mode drops
+  every key**, as Linux's line discipline knows no cursor; `nxsh`, reading raw, acts on them.
+- **A redraw model.** Built: the discipline holds a cursor, where typing, Backspace, Ctrl-U and
+  Ctrl-W act, and says what to write for each edit as a dumb terminal draws it, with Backspace
+  and text. Reverse search, history and completion replace the line through it, so it always
+  knows what is shown. A line that fills its row is drawn wrong, as Backspace alone always was
+  there: `TODO(tty-size)`.
 
 ### The cheaper alternative, and why not
 

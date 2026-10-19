@@ -36481,3 +36481,21 @@ second declined.
   each part's controls were rerun, which caught a test that passed against the bug it named.
 - **Found on the way, filed in `bug-bash.md`**: usb-1, a USB keyboard hot-plugged after the hub's
   first round sometimes never enumerates (`test-qemu --kvm`, once in three).
+
+## 2026-10-19 — Before Phase 7, Part C.2: line editing, built
+
+- **The line discipline holds a cursor**, by character, and reports Left, Right, Home, End and
+  Delete as it reports Up and Down, in the forms terminals send them. `nxsh` acts on them;
+  **canonical mode drops them** (the maintainer's call, as Linux's line discipline knows no
+  cursor), so a program's prompts, passwords' among them, are unchanged.
+- **The redraw stays Backspace and text.** A line typed straight through writes exactly the bytes
+  it did, and every old test passes unchanged. A line that fills its row draws wrong, as Backspace
+  alone always did there: `TODO(tty-size)`, whose trigger is a size on the tty protocol.
+- **`ESC` ends a Ctrl-R search keeping its match**, as readline's default does, and Ctrl-G
+  cancels. A cursor key, which starts with `ESC`, therefore ends the search and moves.
+- **The discipline moved to a module of its own first**, a move `check-moves` holds, taking
+  `tty-server`'s `lib.rs` off the size baseline. The search moved from `nxsh`'s `main.rs` to a
+  library module, where each key is host-tested.
+- **Judged on a screen**: `libterm`'s tests draw what the discipline writes into a grid and assert
+  the row and the cursor. `test-interactive` edits three lines over the serial console, and
+  `check-terminal` edits one through `nxterm`'s encoder. Each line runs only if its edit worked.
