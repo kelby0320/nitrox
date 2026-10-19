@@ -131,3 +131,4 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-19	387	b1e64890	12	rules-and-docs+architecture	optional	demonstrated	fixed	095d7676	both Status lines advanced to C.2
 2026-10-19	387	b1e64890	13	rules-and-docs	optional	demonstrated	fixed	095d7676	Step::Key's and redraw's doc comments
 2026-10-19	387	b1e64890	14	rules-and-docs	optional	demonstrated	fixed	095d7676	nxsh CLAUDE.md lists search and editor; test-interactive's count is 48, read off a boot (37 was stale before C.2)
+2026-10-19	387	b1e64890	15	architecture	optional	unverified	fixed	785ce316	the maintainer's call: the discipline moved to libline, below tty-server and nxsh; scaffold 70d47971, move d5d571ab held by check-moves
