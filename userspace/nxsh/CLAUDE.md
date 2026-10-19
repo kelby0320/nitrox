@@ -100,7 +100,9 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
   one line past the cause.
 - **The shell does not rewrite a spawned stage's paths.** It passes `argv` through as
   written and hands over the same `PWD`, so both sides resolve identically. Pre-resolving
-  would reintroduce the split-brain the environment design exists to prevent.
+  would reintroduce the split-brain the environment design exists to prevent. `~` is expansion,
+  not resolution — `HOME` is the same to the shell and the stage — so `~/x` arrives expanded, as
+  in bash.
 
 ## Testing the interactive path
 

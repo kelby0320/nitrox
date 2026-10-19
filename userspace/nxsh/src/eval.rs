@@ -142,7 +142,7 @@ pub struct Interp {
     ///
     /// Also bound as `$env`, so it is an ordinary value: `$env.PWD` and `env.EDITOR = "vi"` need
     /// nothing beyond field access (§6).
-    env: Record,
+    pub(crate) env: Record,
     /// Hoisted `def` bindings, visible from inside any call.
     ///
     /// §5a: a named function captures nothing, but it must still be able to **call** other
@@ -266,12 +266,8 @@ impl Interp {
         }
 
         let (dir, frag) = split_path(w.text);
-        let target = match self.resolve_path(if dir.is_empty() { "." } else { dir }) {
-            Ok(p) => p,
-            // A path that will not resolve has nothing to offer; a Tab that finds nothing does
-            // nothing.
-            Err(_) => return Completion::none(w.start),
-        };
+        // A path that will not resolve has nothing to offer; a Tab that finds nothing does nothing.
+        let Some(target) = self.completion_dir(dir) else { return Completion::none(w.start) };
         let entries = self.host.list_dir(&target);
         Completion { start: w.start, candidates: matching_paths(dir, frag, &entries) }
     }
@@ -669,7 +665,8 @@ impl Interp {
         match e {
             Expr::Int(v) => Ok(Val::int(*v)),
             Expr::Float(v) => Ok(Val::float(*v)),
-            Expr::Str(v) | Expr::Word(v) => Ok(Val::str(v.clone())),
+            Expr::Str(v) => Ok(Val::str(v.clone())),
+            Expr::Word(v) => Ok(Val::str(self.expand_tilde(v)?.into_owned())),
             Expr::Bool(v) => Ok(Val::bool(*v)),
             Expr::Null => Ok(Val::NULL),
             // Inside a keyword stage `_` is the value flowing past (§8c).
@@ -1273,7 +1270,8 @@ impl Interp {
             "cd" => {
                 let target = match c.args.first() {
                     Some(Arg::Positional(e)) => match e {
-                        Expr::Word(w) | Expr::Str(w) | Expr::Ident(w) => w.clone(),
+                        Expr::Word(w) => self.expand_tilde(w)?.into_owned(),
+                        Expr::Str(w) | Expr::Ident(w) => w.clone(),
                         other => self.eval(other)?.render(),
                     },
                     // `cd` with no argument goes home, and says so if there is no home.
@@ -1614,7 +1612,7 @@ impl Interp {
             }
             "save" => {
                 let v = need(operand)?;
-                let Some(path) = field_names.first().cloned() else {
+                let Some(path) = self.path_args(&raw)?.into_iter().next() else {
                     return Err(EvalError::new("`save` needs a path"));
                 };
                 let path = self.resolve_path(&path)?;
@@ -1623,7 +1621,7 @@ impl Interp {
                 Ok(Val::NULL)
             }
             "open" => {
-                let paths = field_names.clone();
+                let paths = self.path_args(&raw)?;
                 if paths.is_empty() {
                     return Err(EvalError::new("`open` needs at least one path"));
                 }

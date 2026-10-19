@@ -38,7 +38,7 @@
 "userspace/nxfiles/src/app.rs" = 1719
 "userspace/nxfiles/src/main.rs" = 1125
 "userspace/nxfiles/src/tests.rs" = 2262
-"userspace/nxsh/src/eval.rs" = 4138
+"userspace/nxsh/src/eval.rs" = 4136
 "userspace/nxsh/src/lex.rs" = 1089
 "userspace/nxsh/src/main.rs" = 1433
 "userspace/nxsh/src/ops.rs" = 1079

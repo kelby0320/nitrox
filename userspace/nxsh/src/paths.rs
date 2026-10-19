@@ -3,16 +3,22 @@
 //! Pure: the host only reads what these name. The kernel refuses a relative path in a namespace
 //! lookup, so every file the shell opens goes through [`resolve`] first.
 
-use crate::ast::Script;
+use crate::ast::{Expr, Script};
 use crate::eval::{EvalError, Interp};
 use crate::parse::{ParseError, Parser};
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::vec::Vec;
 use libstream::wire::Record;
 
 /// The working directory in `env`: its conventional `PWD` entry, if a string.
 pub fn pwd_of(env: &Record) -> Option<&str> {
-    let i = env.schema.fields.iter().position(|f| f.name == "PWD")?;
+    env_field(env, "PWD")
+}
+
+/// The field `name` of `env`, if a string.
+fn env_field<'a>(env: &'a Record, name: &str) -> Option<&'a str> {
+    let i = env.schema.fields.iter().position(|f| f.name == name)?;
     env.values.get(i)?.as_str()
 }
 
@@ -24,6 +30,22 @@ pub fn resolve(cwd: Option<&str>, path: &str) -> core::result::Result<String, St
     let out = librsproto::path::resolve(cwd.map(str::as_bytes), path.as_bytes(), &mut buf)
         .map_err(|e| alloc::format!("`{path}`: {}", e.message()))?;
     Ok(String::from_utf8_lossy(out).into_owned())
+}
+
+/// `word` with a leading `~` replaced by `home`.
+///
+/// Only `~` and `~/…` name a home: `~name` is refused rather than left as text, and so is any `~`
+/// when `home` is unset, since there is no user identity to fall back on. A word that does not
+/// start with `~` comes back borrowed and unchanged.
+pub fn expand_home<'a>(word: &'a str, home: Option<&str>) -> core::result::Result<Cow<'a, str>, String> {
+    let Some(rest) = word.strip_prefix('~') else {
+        return Ok(Cow::Borrowed(word));
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return Err(alloc::format!("`{word}`: only `~` or `~/…` names a home, not `~name`"));
+    }
+    let home = home.ok_or_else(|| String::from("`~` needs HOME, which is not set"))?;
+    Ok(Cow::Owned(alloc::format!("{}{rest}", if rest.is_empty() { home } else { home.trim_end_matches('/') })))
 }
 
 /// The directory of an absolute file path: `/` for a file in the root.
@@ -56,6 +78,35 @@ pub fn cycle_message(typed: &str, chain: &[String], abs: &str) -> String {
 }
 
 impl Interp {
+    /// `word` with a leading `~` expanded from the interpreter's `HOME`.
+    ///
+    /// For an unquoted word only; a quoted string is never passed here.
+    pub(crate) fn expand_tilde<'a>(&self, word: &'a str) -> core::result::Result<Cow<'a, str>, EvalError> {
+        if !word.starts_with('~') {
+            return Ok(Cow::Borrowed(word));
+        }
+        expand_home(word, env_field(&self.env, "HOME")).map_err(EvalError::new)
+    }
+
+    /// The directory `dir`, as typed in the word being completed, resolved to list; a leading `~`
+    /// is expanded here and stays in the candidates, which are written back as typed.
+    pub(crate) fn completion_dir(&self, dir: &str) -> Option<String> {
+        let dir = self.expand_tilde(dir).ok()?;
+        resolve(self.cwd(), if dir.is_empty() { "." } else { &dir }).ok()
+    }
+
+    /// The paths named by `raw` for `open` and `save`: words are tilde-expanded, strings and
+    /// names are taken as written.
+    pub(crate) fn path_args(&self, raw: &[&Expr]) -> core::result::Result<Vec<String>, EvalError> {
+        raw.iter()
+            .filter_map(|e| match e {
+                Expr::Word(w) => Some(self.expand_tilde(w).map(Cow::into_owned)),
+                Expr::Ident(n) | Expr::Str(n) => Some(Ok(n.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Record `abs` as a file being loaded, so a `use` of it from inside is refused.
     pub fn mark_loading(&mut self, abs: &str) {
         self.loading.push(String::from(abs));
@@ -87,6 +138,17 @@ impl Interp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_home_replaces_only_a_leading_tilde() {
+        assert_eq!(expand_home("~", Some("/home/a")).unwrap(), "/home/a");
+        assert_eq!(expand_home("~/x/y", Some("/home/a")).unwrap(), "/home/a/x/y");
+        assert_eq!(expand_home("~/x", Some("/")).unwrap(), "/x");
+        assert_eq!(expand_home("~/x", Some("/h/")).unwrap(), "/h/x");
+        assert!(matches!(expand_home("a~b", None).unwrap(), Cow::Borrowed("a~b")));
+        assert!(expand_home("~bob/x", Some("/h")).unwrap_err().contains("~bob/x"));
+        assert!(expand_home("~", None).unwrap_err().contains("HOME"));
+    }
 
     #[test]
     fn dir_of_keeps_the_root() {

@@ -26,6 +26,8 @@ pub mod timing;
 pub mod value;
 
 #[cfg(test)]
+mod tilde_tests;
+#[cfg(test)]
 mod use_tests;
 
 pub use complete::{Completion, Where, word_at_end};
