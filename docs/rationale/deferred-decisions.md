@@ -1542,6 +1542,23 @@ missing — `History::search_back` already returns indices and can enumerate eve
 
 Trigger: the compositor terminal, or any terminal backend that can address the cursor.
 
+**A line that fills its row is edited wrong — `TODO(tty-size)`.**
+The prompt's editing (`libline::Discipline`, which `nxsh` links) redraws as a dumb terminal
+would, with Backspace and text, so it needs no terminal width. That holds for a line shorter than
+its row:
+
+- **At exactly a full row**, `libterm` holds the cursor on the last column with a wrap pending, as
+  xterm and Linux's console do, so a Backspace lands a column left of the line's end
+  (`userspace/libterm/src/grid.rs`); `fbcon` parks past the end and lands right.
+- **Past a full row**, a Backspace stops at the row's start in both, so moving back across a wrap
+  draws wrong.
+
+Backspace alone was always wrong there; cursor keys make the case reachable mid-line. The
+completion listing is wrapped at 80 columns for the same reason (`userspace/nxsh/src/complete.rs`).
+
+Trigger: a terminal size on the tty protocol. With one, the shell knows when the cursor reaches the
+last column and can step across a wrap.
+
 **A shell reading a file through a mapping is suspended when the fill fails — `TODO(mapped-read-faults)`.**
 `nxsh` reads a file by mapping it: `read_file` for a script, a `use` and `open`, and `read_head`
 for the first bytes of every program it runs (`userspace/nxsh/src/stage.rs`). A fill that fails —

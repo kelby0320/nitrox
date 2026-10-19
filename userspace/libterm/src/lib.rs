@@ -13,3 +13,6 @@ pub mod encode;
 pub mod grid;
 pub mod parse;
 pub mod render;
+
+#[cfg(test)]
+mod editing_tests;

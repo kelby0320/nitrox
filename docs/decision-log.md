@@ -36481,3 +36481,30 @@ second declined.
   each part's controls were rerun, which caught a test that passed against the bug it named.
 - **Found on the way, filed in `bug-bash.md`**: usb-1, a USB keyboard hot-plugged after the hub's
   first round sometimes never enumerates (`test-qemu --kvm`, once in three).
+
+## 2026-10-19 — Before Phase 7, Part C.2: line editing, built
+
+- **The line discipline holds a cursor**, by character, and reports Left, Right, Home, End and
+  Delete as it reports Up and Down, in the forms terminals send them. `nxsh` acts on them;
+  **canonical mode drops them** (the maintainer's call, as Linux's line discipline knows no
+  cursor), so a program's prompts, passwords' among them, are unchanged but for one thing: the
+  final byte of an `ESC O` sequence, which was typed (`ESC O A` put `A` on the line), is consumed,
+  as a CSI's always was. A byte that cannot end one, Enter say, still ends it and is acted on.
+- **The redraw stays Backspace and text.** A line typed straight through writes exactly the bytes
+  it did, and every old test passes unchanged. A line that fills its row draws wrong, as Backspace
+  alone always did there: `TODO(tty-size)`, whose trigger is a size on the tty protocol.
+- **`ESC` ends a Ctrl-R search keeping its match**, as readline's default does, and Ctrl-G
+  cancels. A cursor key, which starts with `ESC`, therefore ends the search and moves, when its
+  next byte arrives in the same read, which is readline's rule too. A bare Esc takes no key
+  with it.
+- **The discipline moved to a module of its own first**, a move `check-moves` holds, taking
+  `tty-server`'s `lib.rs` off the size baseline. At review it moved again, to a crate of its own,
+  **`libline`**, below `tty-server` and `nxsh` (the maintainer's call): the shell now calls more
+  of it than the server does, and `userspace/CLAUDE.md` puts a helper with two consumers below
+  both. `libterm`'s tests take it in place of the server. The search and then the rest of the
+  prompt's editing moved from `nxsh`'s `main.rs` to library modules, `search` and `editor`, where
+  each key is host-tested; the loop reads, writes and runs.
+- **Judged on a screen**: `libterm`'s tests draw what the discipline writes into a grid and assert
+  the row and the cursor. `test-interactive` edits four lines over the serial console and
+  writes one longer than a message, and
+  `check-terminal` edits one through `nxterm`'s encoder. Each line runs only if its edit worked.

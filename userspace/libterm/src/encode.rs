@@ -59,7 +59,7 @@ pub fn encode(keycode: u16, modifiers: u16, locks: u16, out: &mut [u8]) -> usize
     let mut n = 0;
 
     if let Some(seq) = sequence(keycode) {
-        // Alt does not prefix a sequence that already starts with `ESC`: `tty_server::Discipline`
+        // Alt does not prefix a sequence that already starts with `ESC`: `libline::Discipline`
         // would type `[A` into the line from `ESC ESC [ A`.
         if alt && seq[0] != 0x1b {
             out[n] = 0x1b;
@@ -195,14 +195,21 @@ mod tests {
         }
     }
 
-    /// The round trip: `tty_server::Discipline` parses what a serial terminal sends, so the two
-    /// ends of the wire are checked against each other. It reaches only `Up` and `Down`, the
-    /// keys `Discipline::Key` has.
+    /// The round trip: `libline::Discipline` parses what a serial terminal sends, so the two
+    /// ends of the wire are checked against each other, for every key `Discipline::Key` names.
     #[test]
-    fn the_arrows_survive_a_round_trip_through_the_line_discipline() {
-        use tty_server::{Discipline, Key, Step};
+    fn the_cursor_keys_survive_a_round_trip_through_the_line_discipline() {
+        use libline::{Discipline, Key, Step};
 
-        for (code, expected) in [(KEY_UP, Key::Up), (KEY_DOWN, Key::Down)] {
+        for (code, expected) in [
+            (KEY_UP, Key::Up),
+            (KEY_DOWN, Key::Down),
+            (KEY_LEFT, Key::Left),
+            (KEY_RIGHT, Key::Right),
+            (KEY_HOME, Key::Home),
+            (KEY_END, Key::End),
+            (KEY_DELETE, Key::Delete),
+        ] {
             let mut d = Discipline::new();
             let bytes = enc(code, 0);
             let mut got = None;
@@ -219,7 +226,7 @@ mod tests {
     fn no_sequence_this_encodes_leaks_into_a_line() {
         // A key the discipline does not act on must be consumed, not accumulated into the line:
         // the four `~` forms are four bytes, and a `~` once reached the shell as `~list /bin`.
-        use tty_server::{Discipline, Step};
+        use libline::{Discipline, Step};
 
         for key in
             [KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_INSERT, KEY_DELETE, KEY_PAGEUP, KEY_PAGEDOWN]

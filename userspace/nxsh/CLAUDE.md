@@ -17,8 +17,9 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
 
 - **`src/lib.rs` and friends — the language.** `lex`, `parse`, `ast`, `eval`, `value`,
   `ops`, `repl`, `regex`, `complete`, `timing` (`time`'s line, Phase 6 Part H.2), `paths`
-  (resolving and `~`, where a `use` reads, the chain of files loading) and `exec` (what a file
-  named as a program runs as). **No syscalls.** Host-tested (`cargo test -p nxsh --lib --target
+  (resolving and `~`, where a `use` reads, the chain of files loading), `exec` (what a file
+  named as a program runs as), `search` (Ctrl-R) and `editor` (what each byte typed at the prompt
+  writes and runs). **No syscalls.** Host-tested (`cargo test -p nxsh --lib --target
   x86_64-unknown-linux-gnu`) in a second rather than through a 90-second boot.
 - **`src/main.rs` — the host.** `_start`, spawning stages, wiring pipes, the console
   reader, the filesystem; and `src/stage.rs`, a stage's image read and decided by `exec`.
@@ -115,16 +116,18 @@ person at a prompt actually does. **Use it for anything that spans two lines.** 
 before it fed the evaluator a whole script through `run`, which is why three
 interactive-only bugs got in — the stale `cd` guard, `list /`, and `def` hoisting.
 
-What it does *not* cover is the console loop in `main.rs`: byte reading, backspace, Ctrl-D,
-the prompt itself. That needs a driven console, and `cargo xtask test-interactive` is it —
-it boots the release image and types at the real prompt. The deferral that asked for this
-(`nxsh-console-tests`) was resolved that way on 2026-08-03 rather than by extracting the
-loop, and the reasoning is in the Resolved table of `docs/rationale/deferred-decisions.md`.
+What each byte typed does — the line discipline, Ctrl-R, Tab, history — is `editor::Editor`, and
+host-tested since 2026-10-19: a review found a bug in it that its reviewers could probe only by
+copying the loop out of `main.rs`. What is left there is reading, writing and running, and a
+keystroke reaching the shell needs a driven console: `cargo xtask test-interactive` is it — it
+boots the release image and types at the real prompt. The deferral that asked for this
+(`nxsh-console-tests`) was resolved that way on 2026-08-03, and the reasoning is in the Resolved
+table of `docs/rationale/deferred-decisions.md`.
 
 **So anything that can be a decision rather than a byte should be.** A boot is the right
 price for "does a keystroke reach the shell" and much too high for "what does this prefix
 match". `complete` is the worked example: the whole decision table is library code with a
-`MockHost` under it, and the console loop's share is "press Tab, write what it says".
+`MockHost` under it, and the editor's share is "on Tab, write what it says".
 
 ## Forbidden patterns
 

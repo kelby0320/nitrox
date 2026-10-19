@@ -112,6 +112,8 @@ There is **no `librt` crate** — the Go-style fiber scheduler and a standalone 
 
 `libusers` (the user database's format, its rules and its edits) is a third: `core` only, over `libcrypto`. `auth-service`, which must stay free of `alloc`, writes the file with it; so do `xtask`'s seeder and, since Part D.4, `account`'s offline mode (administration Part D.1). The view broker checks a name and a password with its rules before either reaches `auth-service`, a path or a log line (Part D.3).
 
+`libline` (the line discipline: what a byte does to a line being typed, and what to write so the screen keeps up) is a fourth: `alloc` only, depending on nothing. `tty-server` drives it in canonical mode and `nxsh` reads raw and drives it to edit its own prompt. It was `tty-server`'s library half until the shell called more of it than the server did (pre-Phase-7 Part C.2), which is the rule above applied again. `eshell` keeps its own copy: it has no `alloc`.
+
 Application code typically uses `libos` directly for async work (or its `block_on` for sync ergonomics). Reaching down to `libkern` should be rare — that's the raw syscall surface, used by early services and runtime infrastructure, not by ordinary application code.
 
 ## Async-first

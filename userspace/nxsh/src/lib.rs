@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod ast;
 pub mod complete;
+pub mod editor;
 pub mod eval;
 pub mod exec;
 pub mod history;
@@ -22,6 +23,7 @@ pub mod parse;
 pub mod paths;
 pub mod regex;
 pub mod repl;
+pub mod search;
 pub mod style;
 pub mod timing;
 pub mod value;

@@ -253,6 +253,10 @@ name = "libkern"
 version = "0.1.0"
 
 [[package]]
+name = "libline"
+version = "0.1.0"
+
+[[package]]
 name = "liblog"
 version = "0.1.0"
 dependencies = [
@@ -323,9 +327,9 @@ dependencies = [
  "libdraw",
  "libinput",
  "libkern",
+ "libline",
  "libm",
  "librsproto",
- "tty-server",
 ]
 
 [[package]]
@@ -434,9 +438,9 @@ dependencies = [
  "libfs",
  "libheap",
  "libkern",
+ "libline",
  "librsproto",
  "libstream",
- "tty-server",
 ]
 
 [[package]]
@@ -541,6 +545,7 @@ version = "0.1.0"
 dependencies = [
  "libheap",
  "libkern",
+ "libline",
  "librsproto",
 ]
 

@@ -919,17 +919,16 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Opti
     // linked, not reimplemented. Server-side echo goes off because only the shell knows what the
     // screen should show after a recall.
     tty_set_echo(tty, false);
-    let mut disc = tty_server::Discipline::new();
+    let mut editor = nxsh::editor::Editor::new();
 
     tty_write(tty, b"\r\n");
     let banner = alloc::format!("nxsh: interactive shell, Nitrox {BUILD_COMMIT} (Ctrl-D or `exit` to leave)");
     tty_write(tty, nxsh::style::paint(tty != 0, nxsh::style::BANNER, &banner).as_bytes());
     tty_write(tty, b"\r\n");
 
-    let mut pending = String::new();
     let mut history = nxsh::history::History::new();
-    let mut search: Option<Search> = None;
-    tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
+    let prompt = |interp: &Interp| nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0);
+    tty_write(tty, prompt(&interp).as_bytes());
 
     let mut chunk = [0u8; 64];
     loop {
@@ -951,135 +950,24 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record, terminal: Opti
         if unsafe { (&raw const INTERRUPTED).read() } {
             // SAFETY: same.
             unsafe { (&raw mut INTERRUPTED).write(false) };
-            search = None;
-            pending.clear();
-            disc.reset();
-            tty_write(tty, b"^C\r\n");
-            tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
+            tty_write(tty, &editor.interrupt());
+            tty_write(tty, prompt(&interp).as_bytes());
             continue;
         }
-        for &b in &chunk[..n] {
-            if let Some(st) = search.as_mut() {
-                match search_key(st, b, &history) {
-                    SearchStep::Redraw => {
-                        let out = st.redraw();
-                        tty_write(tty, &out);
-                    }
-                    SearchStep::Cancel => {
-                        let mut out = st.erase();
-                        out.extend_from_slice(&disc.replace_line(st.original.as_bytes()));
-                        tty_write(tty, &out);
-                        search = None;
-                    }
-                    SearchStep::Accept => {
-                        let mut out = st.erase();
-                        let chosen = st.matched.clone();
-                        out.extend_from_slice(&disc.replace_line(chosen.as_bytes()));
-                        out.extend_from_slice(b"\r\n");
-                        tty_write(tty, &out);
-                        search = None;
-                        // Submit by feeding the terminator, as a typed line takes.
-                        if let tty_server::Step::Line { bytes, .. } = disc.feed(b'\n') {
-                            let src = String::from_utf8_lossy(&bytes).into_owned();
-                            pending.push_str(&src);
-                            let line = core::mem::take(&mut pending);
-                            history.push(&line);
-                            if let Some(status) = run_and_render(&mut interp, tty, &line) {
-                                return status;
-                            }
+        let read = &chunk[..n];
+        for (i, &b) in read.iter().enumerate() {
+            for out in editor.feed(b, read.get(i + 1).copied(), &mut history, &mut |whole| interp.complete(whole)) {
+                match out {
+                    nxsh::editor::Out::Write(bytes) => tty_write(tty, &bytes),
+                    nxsh::editor::Out::Prompt => tty_write(tty, prompt(&interp).as_bytes()),
+                    nxsh::editor::Out::Continuation => tty_write(tty, nxsh::repl::continuation_prompt().as_bytes()),
+                    nxsh::editor::Out::Run(src) => {
+                        if let Some(status) = run_and_render(&mut interp, tty, &src) {
+                            return status;
                         }
-                        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
+                        tty_write(tty, prompt(&interp).as_bytes());
                     }
-                    SearchStep::None => {}
-                }
-                continue;
-            }
-            if b == 0x12 {
-                let original = String::from_utf8_lossy(disc.line()).into_owned();
-                let cleared = disc.replace_line(b"");
-                let mut st = Search::new(original);
-                let mut out = cleared;
-                out.extend_from_slice(&st.redraw());
-                tty_write(tty, &out);
-                search = Some(st);
-                continue;
-            }
-            // Tab completes (§11c), intercepted before the discipline as `Ctrl-R` is.
-            // `nxsh::complete` decides; this writes bytes and redraws, with the continuation prompt
-            // mid-statement.
-            if b == b'\t' {
-                let line = String::from_utf8_lossy(disc.line()).into_owned();
-                // The whole statement, not the physical line: `disc` is reset per line while
-                // `pending` accumulates, so completing `line` alone would offer command names
-                // inside an argument list.
-                let mut whole = pending.clone();
-                whole.push_str(&line);
-                let c = interp.complete(&whole);
-                // `Nothing` covers both no match and nothing to add; applying the empty common
-                // prefix blindly deleted the word being typed.
-                match c.action(&whole) {
-                    nxsh::complete::Action::Nothing => {}
-                    nxsh::complete::Action::Replace(full) => {
-                        // `strip_prefix` rather than an index: doing nothing beats a corrupted
-                        // line.
-                        if let Some(new_line) = full.strip_prefix(pending.as_str()) {
-                            let redraw = disc.replace_line(new_line.as_bytes());
-                            tty_write(tty, &redraw);
-                        }
-                    }
-                    nxsh::complete::Action::List => {
-                        // The list goes on its own lines, with no cursor addressing, for the serial
-                        // console.
-                        tty_write(tty, &nxsh::complete::listing(&c.candidates));
-                        match pending.is_empty() {
-                            true => {
-                                tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes())
-                            }
-                            false => tty_write(tty, nxsh::repl::continuation_prompt().as_bytes()),
-                        }
-                        tty_write(tty, disc.line());
-                    }
-                }
-                continue;
-            }
-            match disc.feed(b) {
-                tty_server::Step::None => {}
-                tty_server::Step::Echo(e) => tty_write(tty, &e),
-                tty_server::Step::Eof => return EXIT_OK,
-                tty_server::Step::Key(k) => {
-                    let recalled = match k {
-                        tty_server::Key::Up => history.older(disc.line()),
-                        tty_server::Key::Down => history.newer(),
-                    };
-                    if let Some(text) = recalled {
-                        let redraw = disc.replace_line(text.as_bytes());
-                        tty_write(tty, &redraw);
-                    }
-                }
-                tty_server::Step::Line { bytes, echo } => {
-                    tty_write(tty, &echo);
-                    let typed = String::from_utf8_lossy(&bytes).into_owned();
-                    pending.push_str(&typed);
-
-                    if matches!(
-                        nxsh::needs_continuation(&pending),
-                        nxsh::Continue::Unclosed | nxsh::Continue::TrailingPipe
-                    ) {
-                        pending.push('\n');
-                        tty_write(tty, nxsh::repl::continuation_prompt().as_bytes());
-                        continue;
-                    }
-
-                    let src = core::mem::take(&mut pending);
-                    if src.trim().is_empty() {
-                        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
-                        continue;
-                    }
-                    history.push(&src);
-                    if let Some(status) = run_and_render(&mut interp, tty, &src) {
-                        return status;
-                    }
-                    tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/"), tty != 0).as_bytes());
+                    nxsh::editor::Out::Eof => return EXIT_OK,
                 }
             }
         }
@@ -1108,91 +996,6 @@ fn run_and_render(interp: &mut Interp, tty: u64, src: &str) -> Option<i64> {
             tty_write_crlf(tty, &msg);
             None
         }
-    }
-}
-
-/// Reverse-search state: the query, the current match, and what is on screen.
-///
-/// The shell tracks its own display length: `replace_line` erases as many characters as the line
-/// buffer holds, and a search displays more, which leaves debris on a dumb terminal.
-struct Search {
-    query: String,
-    matched: String,
-    at: Option<usize>,
-    original: String,
-    /// How many characters are currently displayed, so they can be erased exactly.
-    shown: usize,
-}
-
-enum SearchStep {
-    None,
-    Redraw,
-    /// Leave the search, restoring the original line.
-    Cancel,
-    /// Take the match and submit it.
-    Accept,
-}
-
-impl Search {
-    fn new(original: String) -> Search {
-        Search { query: String::new(), matched: String::new(), at: None, original, shown: 0 }
-    }
-
-    fn erase(&mut self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.shown * 3);
-        for _ in 0..self.shown {
-            out.extend_from_slice(b"\x08 \x08");
-        }
-        self.shown = 0;
-        out
-    }
-
-    /// Erase and redraw the search line, returning the bytes to write.
-    ///
-    /// The query is quoted and an arrow separates it from the match, so a colon in the query is not
-    /// ambiguous. A query with no match says so, rather than looking like a search in progress.
-    fn redraw(&mut self) -> Vec<u8> {
-        let mut out = self.erase();
-        let text = if self.query.is_empty() {
-            alloc::string::String::from("search '' -> ")
-        } else if self.matched.is_empty() {
-            alloc::format!("search '{}' -> (no match)", self.query)
-        } else {
-            alloc::format!("search '{}' -> {}", self.query, self.matched)
-        };
-        out.extend_from_slice(text.as_bytes());
-        self.shown = text.chars().count();
-        out
-    }
-}
-
-fn search_key(st: &mut Search, b: u8, history: &nxsh::history::History) -> SearchStep {
-    match b {
-        // Ctrl-R again: the next older match.
-        0x12 => {
-            if let Some(i) = history.search_back(&st.query, st.at) {
-                st.at = Some(i);
-                st.matched = String::from(history.get(i).unwrap_or(""));
-            }
-            SearchStep::Redraw
-        }
-        b'\r' | b'\n' => SearchStep::Accept,
-        // Ctrl-G and ESC both abandon the search — the two keys people reach for.
-        0x07 | 0x1b => SearchStep::Cancel,
-        0x08 | 0x7f => {
-            st.query.pop();
-            // Re-search from the newest: a shorter query can match something more recent.
-            st.at = history.search_back(&st.query, None);
-            st.matched = st.at.and_then(|i| history.get(i)).map(String::from).unwrap_or_default();
-            SearchStep::Redraw
-        }
-        0x20..=0x7e => {
-            st.query.push(b as char);
-            st.at = history.search_back(&st.query, None);
-            st.matched = st.at.and_then(|i| history.get(i)).map(String::from).unwrap_or_default();
-            SearchStep::Redraw
-        }
-        _ => SearchStep::None,
     }
 }
 
@@ -1313,7 +1116,10 @@ fn tty_set_echo(ch: u64, on: bool) {
 
 fn tty_write(ch: u64, text: &[u8]) {
     let mut scratch = [0u8; 1];
-    let _ = tty_request(ch, librsproto::OP_TTY_WRITE, text, &mut scratch);
+    // In parts: a body over `RS_MAX_BODY` is refused whole, and the screen and the line part.
+    for part in text.chunks(librsproto::RS_MAX_BODY) {
+        let _ = tty_request(ch, librsproto::OP_TTY_WRITE, part, &mut scratch);
+    }
 }
 
 /// Ask the tty server for another terminal on this one's backend (`Tty::OpenSibling`), for a stage

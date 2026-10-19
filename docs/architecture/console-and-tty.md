@@ -1,6 +1,8 @@
 # Console and TTY
 
-**Status: stages 1–4 built; last checked 2026-10-02**, when a stage's diagnostics gained a level — an error, a warning or a notice, each drawn its own way — and `nxsh --help` started writing to the terminal it was handed rather than to `kprint` (the laptop polish's Part E). On 2026-09-30 a program `with` runs in a view started getting the stage's `stderr` (it had none, so on the laptop it printed nothing). On 2026-09-23 every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
+**Status: stages 1–4 built; last checked 2026-10-19**, when the line discipline gained a cursor and
+the editing keys, which `nxsh` acts on and canonical mode drops (pre-Phase-7 Part C.2). On
+2026-10-02 a stage's diagnostics gained a level — an error, a warning or a notice, each drawn its own way — and `nxsh --help` started writing to the terminal it was handed rather than to `kprint` (the laptop polish's Part E). On 2026-09-30 a program `with` runs in a view started getting the stage's `stderr` (it had none, so on the laptop it printed nothing). On 2026-09-23 every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
 shell against the raw-read op. **Stage 4 — the second backend — landed with Milestone 5
@@ -235,10 +237,11 @@ console driver is single-reader, and until every client has moved onto this serv
 permanently-outstanding read in the server *steals their input* — the interactive login test
 timed out waiting for a password prompt whose keystrokes the server had swallowed.
 
-So the server submits a console read **only when a terminal is actually waiting for a
-line**. A terminal with no reader competes with nobody, which is what lets clients migrate
-one at a time instead of all at once. That is not a temporary hack: reading on demand is the
-right behaviour anyway.
+So the server submitted a console read **only when a terminal was actually waiting for a
+line**. A terminal with no reader competed with nobody, which is what let clients migrate
+one at a time instead of all at once. Once every client had moved, the read became permanent
+(`userspace/tty-server/src/main.rs`): `Ctrl-C` has to be seen while the shell is busy, when
+nobody is waiting for input, and the server is now the console's only reader.
 
 1. **The server, with the line discipline and a writable path.** ✅ 2026-08-03 `session-mgr` and `nxsh` move
    onto it; the three copies of line editing collapse into one. `eshell` stays on the raw device
@@ -331,14 +334,15 @@ conclusion Linux reached, for the same reason.
 
 No, and the distinction matters. The three copies we removed were three **implementations**.
 What Linux has is one implementation deployed as a **library**. We already have that: the
-discipline is a crate half with no syscalls in it, precisely so it can be linked rather than
-reimplemented. `nxsh` linking it is not a fourth copy; it is the second *deployment* of the
-first copy.
+discipline is a crate of its own, `libline`, with no syscalls in it, precisely so it can be
+linked rather than reimplemented. `nxsh` linking it is not a fourth copy; it is the second
+*deployment* of the first copy. (It was `tty-server`'s library half until 2026-10-19, when the
+shell came to call more of it than the server does.)
 
 Being honest about the residual cost: two deployments of one implementation can still
 diverge in *use* — canonical mode in the server for simple readers, raw mode in the shell
 for interactive ones — and a bug fixed in one call path is not automatically exercised in the
-other. The 16 host tests cover the discipline itself either way.
+other. The discipline's host tests cover it either way.
 
 ### What it needs
 
@@ -349,13 +353,17 @@ other. The 16 host tests cover the discipline itself either way.
   first proposed: two read ops say the same thing with less state. A client asks for what it
   wants per read, and cannot leave a terminal in a mode some later reader did not expect —
   which is a hazard `termios` has and this does not need to inherit.
-- **Escape-sequence recognition.** `ESC [ A` is three bytes; the discipline currently drops
-  `ESC` as an undefined control byte. This is a small state machine, and it is the first step
-  toward terminal *input* parsing — worth deciding deliberately where that stops rather than
-  letting it grow.
-- **A redraw model.** Reverse-search rewrites the whole visible line repeatedly. Today the
-  discipline only ever appends a character or erases one, so it does not know what is
-  currently displayed. Redrawing needs it to.
+- **Escape-sequence recognition.** Built: the discipline reads a CSI (`ESC [`) and an SS3
+  (`ESC O`) to its final byte, keeping the CSI's first parameter, and reports Up, Down, Left,
+  Right, Home, End and Delete (`ESC [ 3 ~`, and the `1~`/`7~` and `4~`/`8~` forms other
+  terminals send). Anything else is consumed and never reaches the line, but for a byte that
+  cannot end an SS3, Enter say, which ends it and is acted on. **Canonical mode drops
+  every key**, as Linux's line discipline knows no cursor; `nxsh`, reading raw, acts on them.
+- **A redraw model.** Built: the discipline holds a cursor, where typing, Backspace, Ctrl-U and
+  Ctrl-W act, and says what to write for each edit as a dumb terminal draws it, with Backspace
+  and text. Reverse search, history and completion replace the line through it, so it always
+  knows what is shown. A line that fills its row is drawn wrong, as Backspace alone always was
+  there: `TODO(tty-size)`.
 
 ### The cheaper alternative, and why not
 
