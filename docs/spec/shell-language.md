@@ -1,9 +1,10 @@
-# Nitrox: Shell Design Notes (v1.2)
+# Nitrox: Shell Design Notes (v1.3)
 
 ## Status
 
 **Implemented through Milestone 4** (2026-08-04) — `userspace/nxsh`; `time` since Phase 6 Part H.2
-(2026-10-08), §3. This is the language reference: grammar, operators and semantics. Sections
+(2026-10-08), §3; v1.3's paths, `~`, running a file by its path and `$args` since pre-Phase-7
+Part C.1 (2026-10-19). This is the language reference: grammar, operators and semantics. Sections
 describing `form` and the display integration are **not built** and are tracked in
 [`display-arm-plan.md`](../planning/display-arm-plan.md).
 
@@ -16,6 +17,21 @@ Companion document: `docs/architecture/ui-composition-model.md` (windows/widgets
 window-to-window composition) — graduated to `docs/architecture/` with Milestone 8, upstream of
 this one where they touch
 (e.g. `form`'s mechanics), but this doc stands on its own for shell/language concerns.
+
+### Changes in v1.3 (2026-10-19, the shell's paths)
+
+**These change semantics at the edges.** Every relative path the shell handed the namespace itself
+failed, since the kernel refuses a relative lookup, and a program could not be run by its path at
+all.
+
+- **§9h — a relative `use` path is relative to the file it is written in**, lexically, and to the
+  working directory at the prompt and with `-c`. A cycle is refused.
+- **§8c-2 — `~` is `HOME`** at the start of an unquoted word.
+- **§3 — a path at a statement's or a stage's head runs it**, and the shell decides what runs: an
+  ELF file, a `#!` interpreter, or `nxsh`. A script reads its arguments as `$args`.
+- **An error naming a path quotes it**, so a trailing space shows.
+- **§10c/§10d — `rename` takes a path for NEW**, as its program has since it was built, resolved
+  against `PWD` like every other operand. It never copies, so a rename across mounts is an error.
 
 ### Changes in v1.2 (2026-08-04, language-completeness pass)
 
@@ -289,6 +305,27 @@ for scripts that want it.
   PROGRAM ARGS…` runs a program in a view, through the view broker. It is recorded here so that a
   future keyword does not claim the word — `as`, `in` and `use`, the obvious alternatives, are
   keywords already. Should a keyword ever need it anyway, `^with` still reaches the program.
+
+- **A path at a statement's or a stage's head runs it** (v1.3), as in bash: `./tool x`,
+  `../bin/tool`, `/bin/date`, `~/bin/x`, and `^./tool`. The path resolves against `PWD`, after `~`
+  expands (§8c-2), and its arguments pass as written. A path anywhere else is a string, so `open
+  ./x` and `let p = ./x` are unchanged; a path typed alone at the prompt runs rather than printing
+  itself. A bare name is found in `/bin` alone. The program's `argv[0]` is its name as typed, with
+  `~` expanded, as bash's is.
+- **What runs is the shell's decision**, since the kernel loads only ELF and reads no `#!`:
+  - an ELF file is spawned;
+  - a file whose first line is `#!` runs the interpreter that line names — a path, or a name in
+    `/bin`, with at most one argument — given the file's path and the arguments after it. The
+    path resolves as a head's does: `~` expands, and a relative one is against `PWD`, as Linux
+    resolves a `#!` against the working directory;
+  - any other file runs as an `nxsh` script in a new `nxsh` process, as bash runs a file with no
+    `#!`.
+
+  An interpreter must itself be ELF, and a directory is not a program. An empty file runs as an
+  empty script, and does nothing. `use` (§9h) is how a file is loaded into this shell instead.
+- **A script's arguments are `$args`** (v1.3), a `List<String>`. `nxsh SCRIPT ARG…` and `nxsh -c
+  SOURCE ARG…` bind what follows the script or the source; at the prompt it is empty. It is bound
+  by the shell, like `$env`, and cannot be assigned.
 
 ## 4. I/O: `save` / `open` replace redirection
 
@@ -663,6 +700,22 @@ Without this paragraph the grammar reads as though computing an argument were im
 already cost once (2026-09-17). Pinned by
 `a_parenthesised_argument_to_an_external_program_is_evaluated` in `userspace/nxsh/src/eval.rs`,
 which asserts both halves: the parenthesised form is evaluated, the bareword beside it is not.
+
+### 8c-2. `~` is `HOME`
+
+`~` and `~/…` at the start of an **unquoted** word are `HOME` (v1.3): `cd ~`, `open ~/notes.txt`,
+`copy ~/a.txt /tmp`. A quoted `"~"` is a literal tilde, a `~` inside a word (`a~b`) is a
+character, and `~=` is still the match operator (§10b).
+
+- **An unset `HOME` is an error**, not a fallback: bash falls back to the password database, and
+  there is no user identity here to fall back on.
+- **`~name` is an error**, where bash leaves it as text: a word that silently means itself is the
+  failure §1 refuses.
+- **It is expanded where a word becomes a string**, so a program's argument arrives expanded, as in
+  bash, and `cd`, `open`, `save` and completion expand it too; an operator's column name does not.
+  That is not rewriting the program's paths, which the shell never does: `HOME` is the same to the
+  shell and to the program.
+- **`HOME` is read from the shell's environment**, where a bare `cd` reads it.
 
 ### 8d. String literals — no interpolation; `format()` instead
 
@@ -1099,6 +1152,19 @@ isn't legal — either name exactly what's being imported, or bind the whole mod
 No wildcard "dump everything into scope" form, for the same reason record patterns don't silently
 ignore fields you didn't ask about (§9f).
 
+**A relative path is relative to the file the `use` is written in** (v1.3), as Python's `import`
+and Node's `require` resolve against the importing file. bash's `source` resolves against the
+working directory instead, which is why bash scripts carry `$(dirname "${BASH_SOURCE[0]}")`.
+
+- **Lexically**: a `use` inside a `def` resolves against the `def`'s file, wherever it is called
+  from.
+- **At the prompt and with `-c`** there is no file, so it resolves against `PWD`, and `.` and `..`
+  mean what they mean everywhere else.
+- **The directory is fixed when the file is read**, so a `cd` in a script moves nothing a `use`
+  sees.
+- **A file already being loaded is refused**, the error naming the chain from the script down. A
+  module that fails leaves the chain on its way out, so a failed `use` can be tried again.
+
 **`pub` for exports, not everything-public-by-default** — the one place reusing a real Rust
 keyword is justified on principle rather than convenience (contrast the `def`-not-`fn` call in
 §9g): the underlying idea — a name crossing a file boundary should be visible at its declaration,
@@ -1128,8 +1194,6 @@ without reading it. Making it load-bearing would be a naming convention pretendi
 system.
 
 **Deliberately left open, not decided here:**
-- Circular imports — needs a rule, but it's closer to an interpreter/loader implementation concern
-  than a grammar one.
 - This is deliberately the small, file-level answer only. A real package system (versioned,
   shared, content-addressed) would naturally build on the NixOS/Guix-store influence already
   referenced elsewhere in the OS design — but that's a system-level concern bigger than shell
@@ -1296,10 +1360,13 @@ it applies rather than either camp uninspected:**
   "ensure this file exists and its modification time is now," covering both empty-file creation
   *and* updating mtime on an existing file — load-bearing for build systems that lean on exactly
   this to force a rebuild. `create` would have to either drop that behavior or misdescribe it.
-- **`rename`** — new addition (PowerShell's `Rename-Item` is a real, separate cmdlet from
-  `Move-Item`, not folded together). Given a genuinely distinct contract, not just a friendlier
-  label for `move`: **accepts a bare target name only, no path separator; operates strictly within
-  the source's existing directory; a path in the target is a fail-loud error.**
+- **`rename`** — new addition: Unix's `rename(2)` as a command, `mv` that never copies. OLD and
+  NEW are paths, resolved against `PWD` like every operand, so `rename dir/a.txt dir/b.txt`
+  renames in place and `rename dir/a.txt other/b.txt` moves the file to another directory, on the
+  same mount. **It re-points a name at the same file and never copies**, which is what sets it
+  apart from `move`: across mounts it is a fail-loud error, where `move` falls back to a copy.
+  This was first written after PowerShell's `Rename-Item`, a bare new name in the source's own
+  directory; the program took a path from the start, and the maintainer kept that (v1.3).
 
 ### 10d. Requirements (behavioral scope only — implementation deferred to build time)
 
@@ -1307,11 +1374,11 @@ it applies rather than either camp uninspected:**
 |---|---|---|
 | `list` | directory (default: cwd) | Emits `Table<{name, size, kind, modified}>`, one row per entry. `--recursive` walks subdirectories (absorbs `find`, §10a). |
 | `copy` | source path(s) → dest | Duplicates file or directory; recursive by nature for directories (no separate recursive flag needed the way `remove` requires one — copying a directory has no destructive-by-default hazard). Fail loud if destination exists, unless `--force`. |
-| `move` | source path(s) → dest | Relocates within or across directories. Destination-is-a-directory moves *into* it; destination-is-a-name renames as a side effect — distinct from `rename`'s stricter single-directory-only contract. |
+| `move` | source path(s) → dest | Relocates within or across directories and mounts. Destination-is-a-directory moves *into* it; destination-is-a-name renames as a side effect — distinct from `rename`, which never copies. |
 | `remove` | path(s) | Deletes. **Requires `--recursive` for non-empty directories** — refusing by default is a deliberate safety rail, not an oversight, consistent with fail-loud elsewhere. |
 | `mkdir` | path | Creates a directory. `--parents` creates intermediate directories. |
 | `touch` | path | Creates an empty file if absent; updates modified-time if present (§10c). |
-| `rename` | path, bare new name | Renames within the source's existing directory only; a path separator in the target argument is a fail-loud error (§10c). |
+| `rename` | path → new path | Re-points the name on the same mount, never copying; across mounts it is a fail-loud error (§10c). Both paths resolve against `PWD`. |
 | `date` | the wall clock | Emits `Table<{unix, year, month, day, hour, minute, second}>`, one row, in UTC; `--unix` narrows it to `unix`. No format spec: there is no timezone database or locale behind one. `--set TIME` first sets the clock and the machine's hardware clock to `TIME` — UTC, exactly as `2026-09-28T14:30:00Z`, from 2000 to 2099 — which needs the `clock` grant (`with admin date --set …`), and then emits the time as read after the set; a hardware clock that did not take the time is said on stderr, since it then lasts until the next boot (administration Part E.5). |
 | `sleep` | duration | Suspends the calling pipeline stage for the given duration; not schema-producing. |
 | `whoami` | — | Emits current user identity as a value. |
@@ -1541,7 +1608,6 @@ Carried forward from v1.1:
   it didn't spawn (§10a) — needs its own design pass.
 - User-definable aliases with baked-in default arguments (§10a) — deferred, distinct from the
   name-only aliasing already settled in §10e.
-- Circular import resolution (§9h) — implementation-level, not yet decided.
 - Package system beyond single-file `use` (§9h) — explicitly deferred, larger than shell grammar.
 - From the earlier session: does "windows/widgets as namespace-resident resources" (see companion
   doc) overload namespace semantics past what they're meant for? Still flagged, not resolved.

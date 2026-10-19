@@ -100,3 +100,20 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-19	385	e34a9825	13	tests	optional	unverified	fixed	0c3bd40d	each gate assertion is run against a driver skipping the command and a service reading after it
 2026-10-19	385	e34a9825	14	rules-and-docs+tests	optional	demonstrated	fixed	0c3bd40d	read dialogs.rs:219,226: threshold passes at 20 rows, message names 80x24; compares with the logged start
 2026-10-19	385	e34a9825	15	rules-and-docs	optional	demonstrated	fixed	0c3bd40d	status says each later part; outline use bullet follows C.1
+2026-10-19	386	f461dffc	1	logic+error-paths+architecture	blocking	demonstrated	fixed	4435a43c	reproduced (record ran ./deploy.nx; if/match/for stopped parsing); a path runs only at the head token's offset; without the check 3 tests fail
+2026-10-19	386	f461dffc	2	logic	worth-fixing	demonstrated	fixed	4435a43c	spec rewritten from PowerShell's Rename-Item to the program's Unix-like contract (NEW a path, never copies); the maintainer kept the behaviour
+2026-10-19	386	f461dffc	3	logic+error-paths+tests	worth-fixing	demonstrated	fixed	4435a43c	test asserts the operator's own refusal for ~x and ~/x; the review's mutation now fails it
+2026-10-19	386	f461dffc	4	error-paths+logic+architecture	worth-fixing	unverified	fixed	4435a43c	reproduced on a boot (eject refused after running from the stick); Images guard closes each image; check-storage step passes
+2026-10-19	386	f461dffc	5	tests	worth-fixing	demonstrated	fixed	4435a43c	quoted ~ path to open and save pinned; the review's mutation now fails it
+2026-10-19	386	f461dffc	6	architecture	worth-fixing	unverified	fixed	4435a43c	reproduced (#!/bin//nxsh and #!./x did not resolve); program_path resolves a #! as a head; unit tests and a gate step
+2026-10-19	386	f461dffc	7	logic+error-paths	optional	unverified	fixed	4435a43c	reproduced (cannot size, exit 2); an empty file reads empty and runs as an empty script; gate step
+2026-10-19	386	f461dffc	8	logic	optional	demonstrated	fixed	4435a43c	argv[0] expands ~ as bash does; reverting fails the pinned test
+2026-10-19	386	f461dffc	9	logic	optional	demonstrated	fixed	4435a43c	asserts the resolver's no-PWD text; the review's mutation now fails it
+2026-10-19	386	f461dffc	10	tests	optional	demonstrated	fixed	4435a43c	#!/bin/x   -v case; dropping the trim fails it
+2026-10-19	386	f461dffc	11	tests	optional	unverified	fixed	4435a43c	gate: non-ELF, absent and empty #! interpreters; control boot accepting a non-ELF interpreter fails the step
+2026-10-19	386	f461dffc	12	tests	optional	unverified	fixed	4435a43c	gate: nxsh -c with arguments, and a self-using script; control boot with -c's skip at 2 fails the step
+2026-10-19	386	f461dffc	13	tests	optional	unverified	fixed	4435a43c	gate checks each command for a red diagnostic; control boot with rename's old NEW fails at the first rename
+2026-10-19	386	f461dffc	14	rules-and-docs	optional	demonstrated	fixed	4435a43c	nxsh CLAUDE.md lists paths, exec and stage.rs, and the size-limited files
+2026-10-19	386	f461dffc	15	architecture	optional	unverified	declined		latent while PROGRAM_DIRS has one entry, so no input can tell the paths apart; a comment at the site says a second entry must hand on the found path
+2026-10-19	386	f461dffc	16	architecture	optional	unverified	deferred		TODO(mapped-read-faults) with its deferral entry: no read reports a failed fill as an error
+2026-10-19	386	f461dffc	17	architecture	optional	demonstrated	fixed	4435a43c	title is v1.3

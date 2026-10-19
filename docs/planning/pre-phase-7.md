@@ -4,7 +4,8 @@
 2026-10-14; A.1, A.2 and A.6 built 2026-10-14, and A.3, A.4, A.5 and A.7 the same day — Part A
 built; Part B detailed 2026-10-14; B.1 built 2026-10-15; B.2 built 2026-10-16; B.5 built
 2026-10-16; B.3 built 2026-10-16; B.4 built 2026-10-17, the kernel and xtask over their
-budgets (the maintainer's call) — Part B built; Part C detailed 2026-10-19.** Each later part
+budgets (the maintainer's call) — Part B built; Part C detailed 2026-10-19; C.1 built
+2026-10-19.** Each later part
 gets its detail pass when it is next. Seven parts, A–G, in the order below. Part E is the
 syscall-surface consolidation, planned separately in [`syscall-surface.md`](syscall-surface.md).
 

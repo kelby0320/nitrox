@@ -414,9 +414,9 @@ impl<'a> Lexer<'a> {
         if c == b'/' && self.after_match_op {
             return self.scan_regex(start);
         }
-        // A path in expression position: `/etc/x`, `./x`, `../x`. `/` and `.` are otherwise
-        // strictly infix, so a leading one is unambiguous.
-        if c == b'/' && is_path_char(self.at(start + 1)) {
+        // A path in expression position: `/etc/x`, `./x`, `../x`, `~/x`. `/` and `.` are otherwise
+        // strictly infix, so a leading one is unambiguous; `~` is no operator but `~=`.
+        if (c == b'/' && is_path_char(self.at(start + 1))) || (c == b'~' && self.at(start + 1) != b'=') {
             return Ok(Tok::Word(self.scan_bareword(start)));
         }
         if c == b'.' && (self.at(start + 1) == b'/' || (self.at(start + 1) == b'.' && self.at(start + 2) == b'/')) {

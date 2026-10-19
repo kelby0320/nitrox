@@ -1542,6 +1542,20 @@ missing — `History::search_back` already returns indices and can enumerate eve
 
 Trigger: the compositor terminal, or any terminal backend that can address the cursor.
 
+**A shell reading a file through a mapping is suspended when the fill fails — `TODO(mapped-read-faults)`.**
+`nxsh` reads a file by mapping it: `read_file` for a script, a `use` and `open`, and `read_head`
+for the first bytes of every program it runs (`userspace/nxsh/src/stage.rs`). A fill that fails —
+an I/O error, or a disk gone from under a file that still resolves — is a ring-3 page fault the
+kernel cannot satisfy, which suspends the process with a `SegFault` notification
+([`memory-management.md`](../architecture/memory-management.md)), so the login shell stops where it
+should print an error.
+
+Not built because nothing reads a file and reports a failed fill as an error: files are read
+through mappings, and `File::ReadRange` has no shipping consumer.
+
+Trigger: a read that returns a failed fill as an error, or a fault the process is told of and can
+recover from.
+
 **A log line assembled from several `kprint`s can be torn — `TODO(atomic-log-lines)`.**
 The console is shared and `kprint` is a syscall per call, so a message built from several —
 `kprint(b"… exit "); kprint_u64(n); kprint(b")\n")` — can be split down the middle by any

@@ -215,10 +215,10 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     // the manager as `info/block`, a table name it refuses, rather than as `block`, the
     // subscription that would hand this session every disk. `/dev/registry` is root-only.
     s.send("open /dev/devices/block")?;
-    s.expect("nxsh: cannot open /dev/devices/block")?;
+    s.expect("nxsh: cannot open `/dev/devices/block`")?;
     s.expect("/home>")?;
     s.send("open /dev/registry")?;
-    s.expect("nxsh: cannot open /dev/registry")?;
+    s.expect("nxsh: cannot open `/dev/registry`")?;
     s.expect("/home>")?;
     steps += 1;
 
@@ -262,10 +262,106 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     steps += 1;
 
     steps += interactive_shell_language(s, &open_at_5)?;
+    steps += interactive_paths(s)?;
     steps += interactive_clipboard_and_completion(s)?;
     steps += interactive_administration(s)?;
     steps += interactive_services_and_relogin(s)?;
     Ok(steps)
+}
+
+/// Run `command` and wait for `prompt`, refusing any diagnostic in between: a `prompt` alone also
+/// follows a failure, which would then surface steps later. A diagnostic is printed in red; a
+/// child `nxsh`'s plain `nxsh: up` line is not one.
+fn quietly(s: &mut Session, command: &str, prompt: &str) -> R<()> {
+    let from = s.transcript().len();
+    s.send(command)?;
+    s.expect(prompt)?;
+    let said = &s.transcript()[from..];
+    if said.contains("\x1b[91m") {
+        return Err(format!("`{command}` was refused:\n{said}").into());
+    }
+    Ok(())
+}
+
+/// Write the lines `body`, an nxsh list literal, to `path` (`.nx`), as text renamed: `save`
+/// writes only `.txt` and `.tsm`.
+fn write_script(s: &mut Session, body: &str, path: &str, prompt: &str) -> R<()> {
+    let txt = format!("{}.txt", path.trim_end_matches(".nx"));
+    quietly(s, &format!("{body} | save {txt}"), prompt)?;
+    quietly(s, &format!("rename {txt} {path}"), prompt)
+}
+
+/// `test-interactive`'s steps 19a to 19c-3: the shell's own paths, from a real prompt.
+fn interactive_paths(s: &mut Session) -> R<usize> {
+    const AT: &str = "/home/Pictures>";
+    // 19a. **`~` is HOME**, reached from another directory.
+    quietly(s, "cd /home/Pictures", AT)?;
+    quietly(s, "cd ~", "/home>")?;
+
+    // 19b. **A script runs by its path, with arguments, and `use`s the module beside it.** Run
+    //      from a sibling directory, so a `use` resolved against `PWD` reads nothing.
+    quietly(s, "mkdir ./c1", "/home>")?;
+    quietly(s, "mkdir ./c1/lib", "/home>")?;
+    write_script(s, r#"["pub def twice(n) { n * 2 }"]"#, "./c1/lib/m.nx", "/home>")?;
+    let main = concat!(
+        r#"["use \"./lib/m.nx\" { twice }", "format(\"twice={} n={} b={}\", twice(21), "#,
+        r#"($args | count), ($args | filter { |a| a == \"b\" } | count)) | display"]"#
+    );
+    write_script(s, main, "./c1/main.nx", "/home>")?;
+    quietly(s, "cd /home/Pictures", AT)?;
+    s.send("../c1/main.nx a b")?;
+    s.expect("twice=42 n=2 b=1")?;
+    s.expect(AT)?;
+    //      And by `~`, which expands before the path resolves.
+    s.send("~/c1/main.nx x")?;
+    s.expect("twice=42 n=1 b=0")?;
+    s.expect(AT)?;
+    //      `-c` binds what follows its source, and a script that `use`s itself is refused.
+    s.send(r#"nxsh -c "format(\"argc={}\", ($args | count)) | display" a b"#)?;
+    s.expect("argc=2")?;
+    s.expect(AT)?;
+    write_script(s, r#"["use \"./self.nx\" as m"]"#, "~/c1/self.nx", AT)?;
+    s.send("~/c1/self.nx")?;
+    s.expect("is already being loaded")?;
+    s.expect(AT)?;
+
+    // 19c. **A `#!` line names the interpreter**: the host spawns `/bin/nxsh` with the file. Its
+    //      path resolves as a head's does, so `//` folds.
+    let bang = r##"["#!/bin//nxsh", "format(\"bang n={}\", ($args | count)) | display"]"##;
+    write_script(s, bang, "~/c1/bang.nx", AT)?;
+    s.send("~/c1/bang.nx p q r")?;
+    s.expect("bang n=3")?;
+    s.expect(AT)?;
+    //      Refused: an interpreter that is not ELF, one that is not there, and none at all.
+    write_script(s, r##"["#!/home/c1/lib/m.nx"]"##, "~/c1/nonelf.nx", AT)?;
+    s.send("~/c1/nonelf.nx")?;
+    s.expect("runs `/home/c1/lib/m.nx`, which is not itself a program")?;
+    s.expect(AT)?;
+    write_script(s, r##"["#!/nope/x"]"##, "~/c1/absent.nx", AT)?;
+    s.send("~/c1/absent.nx")?;
+    s.expect("`/nope/x` does not resolve")?;
+    s.expect(AT)?;
+    write_script(s, r##"["#!"]"##, "~/c1/bare.nx", AT)?;
+    s.send("~/c1/bare.nx")?;
+    s.expect("the `#!` line names no interpreter")?;
+    s.expect(AT)?;
+
+    // 19c-1. **A program by its path, and a directory is not one.**
+    s.send("/bin/whoami")?;
+    s.expect("alice")?;
+    s.expect(AT)?;
+    s.send("/home")?;
+    s.expect("`/home` is not a program")?;
+    s.expect(AT)?;
+
+    // 19c-2. **An empty file is an empty script**: it runs, and says nothing.
+    quietly(s, "touch ~/c1/e", AT)?;
+    quietly(s, "~/c1/e", AT)?;
+
+    // 19c-3. Tidied, from home.
+    quietly(s, "cd ~", "/home>")?;
+    quietly(s, "remove -r ./c1", "/home>")?;
+    Ok(6)
 }
 
 /// `test-interactive`'s steps 6 to 19: shell language, history and Ctrl-C. The number of steps run.

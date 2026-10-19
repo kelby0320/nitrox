@@ -133,7 +133,7 @@ pub(crate) fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     println!("  ok: a stage's diagnostic rendered in the grid, not on the kernel log");
 
     type_at_terminal(&mut qmp, "nxsh --help")?;
-    session.expect("nxterm: grid> usage: nxsh [SCRIPT.nx | -c SOURCE]")?;
+    session.expect("nxterm: grid> usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]")?;
     println!("  ok: `nxsh --help` rendered in the grid, not on the kernel log");
 
     // The title follows the shell's current directory; that it changes once, not per prompt, is

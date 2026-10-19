@@ -13,21 +13,31 @@ extern crate alloc;
 pub mod ast;
 pub mod complete;
 pub mod eval;
+pub mod exec;
 pub mod history;
 pub mod host;
 pub mod lex;
 pub mod ops;
 pub mod parse;
+pub mod paths;
 pub mod regex;
 pub mod repl;
 pub mod style;
 pub mod timing;
 pub mod value;
 
+#[cfg(test)]
+mod exec_tests;
+#[cfg(test)]
+mod tilde_tests;
+#[cfg(test)]
+mod use_tests;
+
 pub use complete::{Completion, Where, word_at_end};
 pub use eval::{EvalError, Interp, Mode as RunMode};
 pub use host::{Host, MockHost, MockLog, NullHost, PipelineRun, StageSpec, StageStatus};
 pub use lex::{LexError, Lexer, Mode as LexMode, Tok};
 pub use parse::{ParseError, Parser, parse_script};
+pub use paths::parse_script_in;
 pub use repl::{Continue, needs_continuation};
 pub use value::Val;

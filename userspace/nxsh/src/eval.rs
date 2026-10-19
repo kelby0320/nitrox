@@ -59,7 +59,7 @@ pub const PIPELINE_FAILED: &str = "PipelineFailed";
 pub const INTERRUPTED: &str = "Interrupted";
 
 impl EvalError {
-    fn new(message: impl Into<String>) -> EvalError {
+    pub(crate) fn new(message: impl Into<String>) -> EvalError {
         EvalError::of(ERROR, message)
     }
 
@@ -142,7 +142,7 @@ pub struct Interp {
     ///
     /// Also bound as `$env`, so it is an ordinary value: `$env.PWD` and `env.EDITOR = "vi"` need
     /// nothing beyond field access (§6).
-    env: Record,
+    pub(crate) env: Record,
     /// Hoisted `def` bindings, visible from inside any call.
     ///
     /// §5a: a named function captures nothing, but it must still be able to **call** other
@@ -164,6 +164,8 @@ pub struct Interp {
     /// A field so the guard is **testable in microseconds**; proving it at ten million iterations
     /// would cost more than the whole suite. Not a resource policy.
     iteration_limit: u64,
+    /// Absolute paths of the files being loaded, outermost first, so a `use` cannot recurse.
+    pub(crate) loading: Vec<String>,
 }
 
 impl Default for Interp {
@@ -187,7 +189,9 @@ impl Interp {
             strict: false,
             last_status: None,
             iteration_limit: MAX_ITERATIONS,
+            loading: Vec::new(),
         }
+        .with_empty_args()
     }
 
     /// Install the environment this shell was started with, and bind `$env`.
@@ -201,19 +205,15 @@ impl Interp {
     /// A *conventional* entry, not a distinct field: Unix has two sources of truth, `$PWD` and
     /// `getcwd()`, and the bugs live in the gap. There is no kernel cwd here to disagree.
     pub fn cwd(&self) -> Option<&str> {
-        let i = self.env.schema.fields.iter().position(|f| f.name == "PWD")?;
-        self.env.values.get(i)?.as_str()
+        crate::paths::pwd_of(&self.env)
     }
 
     /// Resolve a path the *shell itself* will use, against `PWD`.
     ///
     /// Only for the shell's own lookups (`open`, `save`, a script path). A spawned stage's
     /// arguments are passed through as written; see [`Host::run`].
-    fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
-        let mut buf = [0u8; 1024];
-        let out = librsproto::path::resolve(self.cwd().map(str::as_bytes), path.as_bytes(), &mut buf)
-            .map_err(|e| EvalError::new(alloc::format!("`{path}`: {}", e.message())))?;
-        Ok(alloc::string::String::from_utf8_lossy(out).into_owned())
+    pub(crate) fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
+        crate::paths::resolve(self.cwd(), path).map_err(EvalError::new)
     }
 
     /// Re-publish `$env` after a change, so the binding and the record never disagree.
@@ -267,12 +267,8 @@ impl Interp {
         }
 
         let (dir, frag) = split_path(w.text);
-        let target = match self.resolve_path(if dir.is_empty() { "." } else { dir }) {
-            Ok(p) => p,
-            // A path that will not resolve has nothing to offer; a Tab that finds nothing does
-            // nothing.
-            Err(_) => return Completion::none(w.start),
-        };
+        // A path that will not resolve has nothing to offer; a Tab that finds nothing does nothing.
+        let Some(target) = self.completion_dir(dir) else { return Completion::none(w.start) };
         let entries = self.host.list_dir(&target);
         Completion { start: w.start, candidates: matching_paths(dir, frag, &entries) }
     }
@@ -373,7 +369,7 @@ impl Interp {
         self.scopes.iter_mut().rev().find_map(|s| s.iter_mut().rev().find(|(n, _)| n == name).map(|(_, slot)| slot))
     }
 
-    fn bind(&mut self, name: &str, val: Val, mutable: bool, constant: bool) -> Result<()> {
+    pub(crate) fn bind(&mut self, name: &str, val: Val, mutable: bool, constant: bool) -> Result<()> {
         let scope = self.scopes.last_mut().expect("a scope is always open");
         if let Some((_, slot)) = scope.iter().find(|(n, _)| n == name)
             && slot.constant
@@ -532,8 +528,8 @@ impl Interp {
                 self.strict = saved;
                 r
             }
-            Stmt::Use { path, names, alias } => {
-                self.exec_use(path, names, alias)?;
+            Stmt::Use { path, names, alias, base } => {
+                self.exec_use(path, names, alias, base.as_deref())?;
                 Ok(Flow::Normal(Val::NULL))
             }
         }
@@ -670,7 +666,8 @@ impl Interp {
         match e {
             Expr::Int(v) => Ok(Val::int(*v)),
             Expr::Float(v) => Ok(Val::float(*v)),
-            Expr::Str(v) | Expr::Word(v) => Ok(Val::str(v.clone())),
+            Expr::Str(v) => Ok(Val::str(v.clone())),
+            Expr::Word(v) => Ok(Val::str(self.expand_tilde(v)?.into_owned())),
             Expr::Bool(v) => Ok(Val::bool(*v)),
             Expr::Null => Ok(Val::NULL),
             // Inside a keyword stage `_` is the value flowing past (§8c).
@@ -1141,16 +1138,23 @@ impl Interp {
         })
     }
 
-    /// `use "./lib/utils.nx" { helper }` / `… as utils`.
+    /// Read, run and import the module at `abs`, which `use` named as `path`; see
+    /// [`exec_use`](Self::exec_use) for where `abs` comes from.
     ///
     /// Explicit relative path only, no search: §9h rejects `PATH`-like resolution for the reason
     /// the system rejects ambient authority, a name crossing a boundary should be visible.
-    fn exec_use(&mut self, path: &str, names: &Option<Vec<String>>, alias: &Option<String>) -> Result<()> {
-        let bytes = self.host.read_file(path).map_err(EvalError::new)?;
+    pub(crate) fn load_module(
+        &mut self,
+        path: &str,
+        abs: &str,
+        names: &Option<Vec<String>>,
+        alias: &Option<String>,
+    ) -> Result<()> {
+        let bytes = self.host.read_file(abs).map_err(EvalError::new)?;
         let src = alloc::string::String::from_utf8(bytes)
             .map_err(|_| EvalError::new(alloc::format!("`{path}` is not valid UTF-8")))?;
-        let module = crate::parse_script(&src)
-            .map_err(|e| EvalError::new(alloc::format!("{path} line {}: {}", e.line, e.message)))?;
+        let module = crate::parse_script_in(&src, Some(crate::paths::dir_of(abs)))
+            .map_err(|e| EvalError::new(alloc::format!("`{path}` line {}: {}", e.line, e.message)))?;
 
         // Run the module in a scope of its own and take only what it exported. Its `def`s land in
         // `functions`, so both are swept; `functions` is snapshotted first so a module cannot
@@ -1267,7 +1271,8 @@ impl Interp {
             "cd" => {
                 let target = match c.args.first() {
                     Some(Arg::Positional(e)) => match e {
-                        Expr::Word(w) | Expr::Str(w) | Expr::Ident(w) => w.clone(),
+                        Expr::Word(w) => self.expand_tilde(w)?.into_owned(),
+                        Expr::Str(w) | Expr::Ident(w) => w.clone(),
                         other => self.eval(other)?.render(),
                     },
                     // `cd` with no argument goes home, and says so if there is no home.
@@ -1608,7 +1613,7 @@ impl Interp {
             }
             "save" => {
                 let v = need(operand)?;
-                let Some(path) = field_names.first().cloned() else {
+                let Some(path) = self.path_args(&raw)?.into_iter().next() else {
                     return Err(EvalError::new("`save` needs a path"));
                 };
                 let path = self.resolve_path(&path)?;
@@ -1617,7 +1622,7 @@ impl Interp {
                 Ok(Val::NULL)
             }
             "open" => {
-                let paths = field_names.clone();
+                let paths = self.path_args(&raw)?;
                 if paths.is_empty() {
                     return Err(EvalError::new("`open` needs at least one path"));
                 }
@@ -1789,7 +1794,7 @@ impl Interp {
         if c.kind != CallKind::External {
             return Ok(None);
         }
-        let mut argv = alloc::vec![c.name.clone()];
+        let mut argv = alloc::vec![self.expand_tilde(&c.name)?.into_owned()];
         for a in &c.args {
             match a {
                 Arg::Positional(e) => argv.push(self.eval(e)?.render()),
@@ -1825,7 +1830,7 @@ impl Interp {
                 }
             }
         }
-        Ok(Some(StageSpec { program: c.name.clone(), argv }))
+        Ok(Some(StageSpec { program: self.stage_program(&c.name)?, argv }))
     }
 
     fn binary(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<Val> {
@@ -3257,25 +3262,6 @@ x"
         assert_eq!(rendered("try { 1 } catch (e) { 2 }"), "1");
         let src = "try { 1 / 0 } catch (e) {\n                   match e { { kind: \"Error\" } => \"handled\"\n _ => \"?\" }\n}";
         assert_eq!(rendered(src), "handled");
-    }
-
-    #[test]
-    fn use_imports_only_what_is_exported() {
-        let host = MockHost::new()
-            .with_file("./lib.nx", "pub def helper(x: Int) -> Int { x + 1 }\ndef hidden() -> Int { 0 }\n");
-        let (r, _l) = run_with(host, "use \"./lib.nx\" { helper }\nhelper(1)");
-        assert_eq!(r.expect("imports").render(), "2");
-
-        let host = MockHost::new().with_file("./lib.nx", "def hidden() -> Int { 0 }\n");
-        let (r, _l) = run_with(host, "use \"./lib.nx\" { hidden }\nhidden()");
-        assert!(r.expect_err("not exported").message.contains("pub"));
-    }
-
-    #[test]
-    fn use_as_binds_a_qualified_name() {
-        let host = MockHost::new().with_file("./lib.nx", "pub def helper(x: Int) -> Int { x * 2 }\n");
-        let (r, _l) = run_with(host, "use \"./lib.nx\" as utils\nutils.helper(4)");
-        assert_eq!(r.expect("imports").render(), "8");
     }
 
     #[test]

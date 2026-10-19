@@ -168,6 +168,8 @@ static mut SPAWN: SpawnArgs = SpawnArgs {
     syscaps: u64::MAX,
 };
 
+mod stage;
+
 struct NitroxHost {
     namespace: u64,
     notif: u64,
@@ -188,7 +190,7 @@ impl NitroxHost {
     }
 
     fn resolve_program(&mut self, name: &str) -> Result<u64, String> {
-        if name.starts_with('/') || name.starts_with("./") || name.starts_with("../") {
+        if nxsh::exec::is_path_head(name) {
             return lookup(self.namespace, name.as_bytes()).ok_or_else(|| alloc::format!("`{name}` does not resolve"));
         }
         for dir in PROGRAM_DIRS {
@@ -215,10 +217,14 @@ impl Host for NitroxHost {
         }
         // Resolve every image first: a chain that cannot run must not leave half its stages
         // spawned.
-        let mut images = Vec::with_capacity(stages.len());
+        let mut images = stage::Images(Vec::with_capacity(stages.len()));
+        let mut argvs = Vec::with_capacity(stages.len());
         for s in stages {
-            match self.resolve_program(&s.program) {
-                Ok(img) => images.push(img),
+            match self.resolve_stage(s, env) {
+                Ok((img, argv)) => {
+                    images.0.push(img);
+                    argvs.push(argv);
+                }
                 Err(e) => {
                     // Said on the debug console too: under `nxterm` errors go to a grid that
                     // renders only under `test-harness`, so an unfound command would fail silently.
@@ -258,12 +264,13 @@ impl Host for NitroxHost {
             // SAFETY: `SPAWN` is our static, filled in immediately before use; this
             // process is single-threaded so spawns are sequential.
             let proc = unsafe {
-                SPAWN.image = images[i];
+                SPAWN.image = images.0[i];
                 SPAWN.handles[0] = setup_stage;
                 SPAWN.arg0 = bootstrap_arg0(true);
                 SPAWN.namespace = 0; // inherit a LOOKUP-only view of ours
                 syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN) as u64)
             };
+            images.release(i);
             if proc < 0 {
                 return Err(alloc::format!("could not spawn `{}`", spec.program));
             }
@@ -292,7 +299,7 @@ impl Host for NitroxHost {
                 // §1: diagnostics bypass the pipe; they go to the shell's shared sink.
                 stderr: (err_dup > 0).then_some(err_dup as u64),
             };
-            let argv: Vec<&str> = spec.argv.iter().map(|s| s.as_str()).collect();
+            let argv: Vec<&str> = argvs[i].iter().map(|s| s.as_str()).collect();
             // A terminal of its own, a sibling on the same window, so a stage that must ask
             // something (`with`, for a password) asks where the person is typing. The shell keeps
             // its own and `Ctrl-C`; `/dev/tty` would mint one on the console.
@@ -444,21 +451,25 @@ impl Host for NitroxHost {
     }
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
-        let h = lookup(self.namespace, path.as_bytes()).ok_or_else(|| alloc::format!("cannot open {path}"))?;
+        let h = lookup(self.namespace, path.as_bytes()).ok_or_else(|| alloc::format!("cannot open `{path}`"))?;
         let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
         // SAFETY: a correctly sized `HandleInfo` out-param for a handle we own.
         let r = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut info) as u64) };
         if r != 0 || info.size == 0 {
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-            return Err(alloc::format!("cannot size {path}"));
+            // An empty file has nothing to map, and is no error: it runs as an empty script. A
+            // directory stats with no size too, and is not one.
+            let file =
+                matches!(info.object_type, libkern::handle::KOBJ_FILE_OBJECT | libkern::handle::KOBJ_MEMORY_OBJECT);
+            return if r == 0 && file { Ok(Vec::new()) } else { Err(alloc::format!("cannot size `{path}`")) };
         }
         // SAFETY: mapping a readable file handle for exactly its own length.
         let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, info.size, RIGHT_MAP_READ) };
         if addr < 0 {
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-            return Err(alloc::format!("cannot read {path}"));
+            return Err(alloc::format!("cannot read `{path}`"));
         }
         // SAFETY: `addr` is a live read-only mapping of `info.size` bytes.
         let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, info.size as usize) }.to_vec();
@@ -485,18 +496,18 @@ impl Host for NitroxHost {
             )
         };
         if po < 0 {
-            return Err(alloc::format!("cannot create {path}"));
+            return Err(alloc::format!("cannot create `{path}`"));
         }
         let (st, fh) = po_wait(po as u64);
         if st != 0 || fh == 0 {
-            return Err(alloc::format!("cannot create {path}"));
+            return Err(alloc::format!("cannot create `{path}`"));
         }
         // SAFETY: mapping our own writable file handle for exactly its length.
         let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, size, RIGHT_MAP_READ | libkern::handle::RIGHT_MAP_WRITE) };
         if addr < 0 {
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
-            return Err(alloc::format!("cannot map {path}"));
+            return Err(alloc::format!("cannot map `{path}`"));
         }
         // SAFETY: `addr` is a live writable mapping of exactly `size` bytes.
         unsafe {
@@ -804,6 +815,7 @@ fn po_wait(po: u64) -> (i32, u64) {
 fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record, terminal: Option<u64>) -> i64 {
     let mut host = NitroxHost { namespace, notif, tty: 0 };
 
+    let mut script_path: Option<String> = None;
     let source = match argv.get(1).map(|s| s.as_str()) {
         Some("-c") => match argv.get(2) {
             Some(src) => src.clone(),
@@ -816,12 +828,16 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
             // On the terminal it was handed: script mode keeps none for the host, and `kprint`
             // reaches nobody on a machine with no serial port.
             match terminal {
-                Some(t) => tty_write_crlf(t, "usage: nxsh [SCRIPT.nx | -c SOURCE]"),
-                None => host.out("usage: nxsh [SCRIPT.nx | -c SOURCE]\n"),
+                Some(t) => tty_write_crlf(t, "usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]"),
+                None => host.out("usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]\n"),
             }
             return EXIT_OK;
         }
-        Some(path) => match host.read_file(path) {
+        Some(path) => match nxsh::paths::resolve(nxsh::paths::pwd_of(&env), path).and_then(|abs| {
+            let bytes = host.read_file(&abs)?;
+            script_path = Some(abs);
+            Ok(bytes)
+        }) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(_) => {
@@ -839,7 +855,8 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
         None => return repl(notif, namespace, env, terminal),
     };
 
-    let script = match nxsh::parse_script(&source) {
+    let base = script_path.as_deref().map(nxsh::paths::dir_of);
+    let script = match nxsh::parse_script_in(&source, base) {
         Ok(s) => s,
         Err(e) => {
             let mut msg = String::from("nxsh: parse error on line ");
@@ -854,6 +871,10 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
 
     let mut interp = Interp::with_host(alloc::boxed::Box::new(host), RunMode::Script);
     interp.set_env(env);
+    interp.set_args(argv.iter().skip(if argv.get(1).is_some_and(|a| a == "-c") { 3 } else { 2 }).cloned().collect());
+    if let Some(abs) = &script_path {
+        interp.mark_loading(abs);
+    }
     match interp.run(&script) {
         Ok(_) => EXIT_OK,
         // §11f: `exit N` sets the script's status; it is not a failure.

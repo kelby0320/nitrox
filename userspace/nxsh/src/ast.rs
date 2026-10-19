@@ -290,6 +290,8 @@ pub enum Stmt {
         /// Named imports, or `None` when the whole module is bound via `as`.
         names: Option<Vec<String>>,
         alias: Option<String>,
+        /// The directory of the file this was read from; `None` for the prompt and `-c`.
+        base: Option<String>,
     },
     /// A bare expression. Auto-displayed in the REPL, discarded in a script (§11e).
     Expr(Expr),

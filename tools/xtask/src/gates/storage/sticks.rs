@@ -289,7 +289,14 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
         "  ok: a directory, a copy to a long Unicode name, a rename and a removal; a file written through a mapping"
     );
 
-    // 7. **Ejected and pulled**: the eject writes back and records the filesystem clean.
+    // 7. **Ejected and pulled**: the eject writes back and records the filesystem clean. First a
+    //    program is run from the stick: the shell closes a stage's image once it is spawned, so
+    //    nothing it ran holds a file there, and the eject is not refused as in use.
+    s.send(&format!("copy /bin/whoami {root}/w"))?;
+    s.expect("/home>")?;
+    s.send(&format!("{root}/w"))?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
     eject_stick(s, &[STICK_FAT_LABEL])?;
     let from = s.transcript().len();
     pull(qmp, "stickfat")?;
@@ -423,6 +430,8 @@ pub(crate) fn check_fat_stick(stick: &Path, work: &Path) -> R<()> {
         format!("{FAT_MADE_DIR}/a copy of {FAT_UNICODE_NAME}"),
         format!("{FAT_MADE_DIR}/{FAT_RENAMED}"),
         FAT_WRITTEN.to_string(),
+        // The program run from the stick before its eject.
+        "w".to_string(),
     ]
     .into_iter()
     .collect();

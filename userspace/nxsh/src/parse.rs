@@ -29,6 +29,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::ast::*;
+use crate::exec::is_path_head;
 use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 
 /// Generic value operators (§3, §5c, §10b). Closed at parse time because it selects the
@@ -103,6 +104,9 @@ pub struct Parser<'a> {
     /// nothing inside an argument list is taken for a command: `sort size --reverse` would
     /// otherwise parse as `sort` applied to the command `size --reverse`.
     head_ok: bool,
+    /// Where the token at a head starts. A path word there runs (§3); anywhere else, an operand or
+    /// a keyword's argument included, it is a string.
+    head_at: Option<usize>,
     /// Nesting depth inside a generic operator's bareword argument list.
     ///
     /// Inside one, a `-` with a space before and none after is a **flag**, not a subtraction (`sort
@@ -118,11 +122,29 @@ pub struct Parser<'a> {
     /// diagnostics parse-time.
     loop_depth: u32,
     probe: u64,
+    /// The directory stamped on every `use`; see [`crate::paths::parse_script_in`].
+    pub(crate) base: Option<String>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str) -> Parser<'a> {
-        Parser { lx: Lexer::new(src), depth: 0, head_ok: true, in_op_args: 0, loop_depth: 0, probe: 0 }
+        Parser {
+            lx: Lexer::new(src),
+            depth: 0,
+            head_ok: true,
+            head_at: Some(0),
+            in_op_args: 0,
+            loop_depth: 0,
+            probe: 0,
+            base: None,
+        }
+    }
+
+    /// Mark the next token as a head: a name there may be a command, and a path there runs.
+    fn set_head(&mut self) -> Result<()> {
+        self.head_ok = true;
+        self.head_at = Some(self.peek_spanned()?.start);
+        Ok(())
     }
 
     /// Parse a loop body: `break`/`continue` are legal inside it.
@@ -245,8 +267,7 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self) -> Result<Stmt> {
         self.enter()?;
-        self.head_ok = true;
-        let s = self.statement_inner();
+        let s = self.set_head().and_then(|()| self.statement_inner());
         self.exit();
         s
     }
@@ -429,7 +450,7 @@ impl<'a> Parser<'a> {
         };
         if self.eat(&Tok::As)? {
             let alias = self.ident("expected a module alias")?;
-            return Ok(Stmt::Use { path, names: None, alias: Some(alias) });
+            return Ok(Stmt::Use { path, names: None, alias: Some(alias), base: self.base.clone() });
         }
         if self.eat(&Tok::LBrace)? {
             let mut names = Vec::new();
@@ -450,7 +471,7 @@ impl<'a> Parser<'a> {
             if names.is_empty() {
                 return self.fail("an import list may not be empty");
             }
-            return Ok(Stmt::Use { path, names: Some(names), alias: None });
+            return Ok(Stmt::Use { path, names: Some(names), alias: None, base: self.base.clone() });
         }
         self.fail("`use` needs `{ names }` or `as alias` — there is no wildcard import")
     }
@@ -498,7 +519,7 @@ impl<'a> Parser<'a> {
         if self.peek()? == Tok::LBrace {
             return self.brace_expr();
         }
-        self.head_ok = true;
+        self.set_head()?;
         self.range_expr()
     }
 
@@ -690,6 +711,9 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 Ok(Expr::Str(v))
             }
+            Tok::Word(v) if self.head_ok && self.head_at == Some(s.start) && is_path_head(&v) => {
+                self.command_or_ident()
+            }
             Tok::Word(v) => {
                 self.bump()?;
                 Ok(Expr::Word(v))
@@ -719,7 +743,7 @@ impl<'a> Parser<'a> {
                 // §3's expression-position escape hatch. A `(` opens a fresh expression, possibly a
                 // pipeline whose first stage is a command: `(list /system | filter …)`. `(count >
                 // 0)` is still a comparison because `count` is nullary and swallows nothing.
-                self.head_ok = true;
+                self.set_head()?;
                 let e = self.expr()?;
                 self.expect(&Tok::RParen, "expected `)`")?;
                 Ok(e)
@@ -767,7 +791,7 @@ impl<'a> Parser<'a> {
                 // **A command head is legal inside the predicate**, so §6's `ls | assert (count >
                 // 0)` applies the operator `count` to the value flowing past. D4 still puts a local
                 // binding first for a bare name, so `assert (n > 0)` over a `let n` is unaffected.
-                self.head_ok = true;
+                self.set_head()?;
                 let e = self.expr()?;
                 self.expect(&Tok::RParen, "expected `)`")?;
                 Ok(Expr::Assert(Box::new(e)))
@@ -885,8 +909,8 @@ impl<'a> Parser<'a> {
         if at_head || forced_external {
             let w = self.lx.peek(crate::lex::Mode::Word)?;
             if let Tok::Word(text) = &w.tok
-                && text.contains('-')
-                && text.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic())
+                && (is_path_head(text)
+                    || text.contains('-') && text.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic()))
             {
                 let name = text.clone();
                 self.lx.bump(crate::lex::Mode::Word)?;
@@ -906,7 +930,7 @@ impl<'a> Parser<'a> {
         // pipeline after it, every stage (`time list /home | count` times both). Alone, or before
         // `=`, it is a name like any other (D9).
         if name == "time" && at_head && !forced_external && self.peek()? != Tok::LParen && self.starts_an_argument()? {
-            self.head_ok = true;
+            self.set_head()?;
             let timed = self.expr()?;
             return Ok(Expr::Time(Box::new(timed)));
         }

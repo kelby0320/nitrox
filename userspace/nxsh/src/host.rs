@@ -367,7 +367,7 @@ impl Host for MockHost {
             .iter()
             .find(|(p, _)| p == path)
             .map(|(_, b)| b.clone())
-            .ok_or_else(|| alloc::format!("no such file: {path}"))
+            .ok_or_else(|| alloc::format!("no such file: `{path}`"))
     }
 
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
