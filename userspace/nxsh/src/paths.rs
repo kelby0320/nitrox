@@ -5,11 +5,14 @@
 
 use crate::ast::{Expr, Script};
 use crate::eval::{EvalError, Interp};
+use crate::exec::is_path_head;
 use crate::parse::{ParseError, Parser};
+use crate::value::Val;
 use alloc::borrow::Cow;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use libstream::wire::Record;
+use libstream::wire::{Record, Value};
 
 /// The working directory in `env`: its conventional `PWD` entry, if a string.
 pub fn pwd_of(env: &Record) -> Option<&str> {
@@ -93,6 +96,27 @@ impl Interp {
     pub(crate) fn completion_dir(&self, dir: &str) -> Option<String> {
         let dir = self.expand_tilde(dir).ok()?;
         resolve(self.cwd(), if dir.is_empty() { "." } else { &dir }).ok()
+    }
+
+    /// The program a stage named `name` asks for: a path is expanded and made absolute against
+    /// `PWD`, any other name is left for the host to find.
+    pub(crate) fn stage_program(&self, name: &str) -> core::result::Result<String, EvalError> {
+        if !is_path_head(name) {
+            return Ok(String::from(name));
+        }
+        self.resolve_path(&self.expand_tilde(name)?)
+    }
+
+    /// `self` with `$args` bound to the empty list.
+    pub(crate) fn with_empty_args(mut self) -> Interp {
+        self.set_args(Vec::new());
+        self
+    }
+
+    /// Bind `$args`, the arguments this shell's script or `-c` source was given.
+    pub fn set_args(&mut self, args: Vec<String>) {
+        let v = Val::Data(Value::List(Arc::from(args.into_iter().map(Value::Str).collect::<Vec<_>>())));
+        let _ = self.bind("$args", v, false, false);
     }
 
     /// The paths named by `raw` for `open` and `save`: words are tilde-expanded, strings and

@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod ast;
 pub mod complete;
 pub mod eval;
+pub mod exec;
 pub mod history;
 pub mod host;
 pub mod lex;
@@ -25,6 +26,8 @@ pub mod style;
 pub mod timing;
 pub mod value;
 
+#[cfg(test)]
+mod exec_tests;
 #[cfg(test)]
 mod tilde_tests;
 #[cfg(test)]

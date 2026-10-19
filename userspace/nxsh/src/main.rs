@@ -168,6 +168,8 @@ static mut SPAWN: SpawnArgs = SpawnArgs {
     syscaps: u64::MAX,
 };
 
+mod stage;
+
 struct NitroxHost {
     namespace: u64,
     notif: u64,
@@ -216,9 +218,13 @@ impl Host for NitroxHost {
         // Resolve every image first: a chain that cannot run must not leave half its stages
         // spawned.
         let mut images = Vec::with_capacity(stages.len());
+        let mut argvs = Vec::with_capacity(stages.len());
         for s in stages {
-            match self.resolve_program(&s.program) {
-                Ok(img) => images.push(img),
+            match self.resolve_stage(s) {
+                Ok((img, argv)) => {
+                    images.push(img);
+                    argvs.push(argv);
+                }
                 Err(e) => {
                     // Said on the debug console too: under `nxterm` errors go to a grid that
                     // renders only under `test-harness`, so an unfound command would fail silently.
@@ -292,7 +298,7 @@ impl Host for NitroxHost {
                 // §1: diagnostics bypass the pipe; they go to the shell's shared sink.
                 stderr: (err_dup > 0).then_some(err_dup as u64),
             };
-            let argv: Vec<&str> = spec.argv.iter().map(|s| s.as_str()).collect();
+            let argv: Vec<&str> = argvs[i].iter().map(|s| s.as_str()).collect();
             // A terminal of its own, a sibling on the same window, so a stage that must ask
             // something (`with`, for a password) asks where the person is typing. The shell keeps
             // its own and `Ctrl-C`; `/dev/tty` would mint one on the console.
@@ -817,8 +823,8 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
             // On the terminal it was handed: script mode keeps none for the host, and `kprint`
             // reaches nobody on a machine with no serial port.
             match terminal {
-                Some(t) => tty_write_crlf(t, "usage: nxsh [SCRIPT.nx | -c SOURCE]"),
-                None => host.out("usage: nxsh [SCRIPT.nx | -c SOURCE]\n"),
+                Some(t) => tty_write_crlf(t, "usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]"),
+                None => host.out("usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]\n"),
             }
             return EXIT_OK;
         }
@@ -860,6 +866,7 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
 
     let mut interp = Interp::with_host(alloc::boxed::Box::new(host), RunMode::Script);
     interp.set_env(env);
+    interp.set_args(argv.iter().skip(if argv.get(1).is_some_and(|a| a == "-c") { 3 } else { 2 }).cloned().collect());
     if let Some(abs) = &script_path {
         interp.mark_loading(abs);
     }

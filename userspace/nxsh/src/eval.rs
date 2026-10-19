@@ -191,6 +191,7 @@ impl Interp {
             iteration_limit: MAX_ITERATIONS,
             loading: Vec::new(),
         }
+        .with_empty_args()
     }
 
     /// Install the environment this shell was started with, and bind `$env`.
@@ -211,7 +212,7 @@ impl Interp {
     ///
     /// Only for the shell's own lookups (`open`, `save`, a script path). A spawned stage's
     /// arguments are passed through as written; see [`Host::run`].
-    fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
+    pub(crate) fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
         crate::paths::resolve(self.cwd(), path).map_err(EvalError::new)
     }
 
@@ -368,7 +369,7 @@ impl Interp {
         self.scopes.iter_mut().rev().find_map(|s| s.iter_mut().rev().find(|(n, _)| n == name).map(|(_, slot)| slot))
     }
 
-    fn bind(&mut self, name: &str, val: Val, mutable: bool, constant: bool) -> Result<()> {
+    pub(crate) fn bind(&mut self, name: &str, val: Val, mutable: bool, constant: bool) -> Result<()> {
         let scope = self.scopes.last_mut().expect("a scope is always open");
         if let Some((_, slot)) = scope.iter().find(|(n, _)| n == name)
             && slot.constant
@@ -1829,7 +1830,7 @@ impl Interp {
                 }
             }
         }
-        Ok(Some(StageSpec { program: c.name.clone(), argv }))
+        Ok(Some(StageSpec { program: self.stage_program(&c.name)?, argv }))
     }
 
     fn binary(&mut self, op: BinOp, a: &Expr, b: &Expr) -> Result<Val> {

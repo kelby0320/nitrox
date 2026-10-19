@@ -29,6 +29,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::ast::*;
+use crate::exec::is_path_head;
 use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 
 /// Generic value operators (§3, §5c, §10b). Closed at parse time because it selects the
@@ -367,6 +368,10 @@ impl<'a> Parser<'a> {
         let name = self.ident("expected a binding name")?;
         let ty = if self.eat(&Tok::Colon)? { Some(self.type_expr()?) } else { None };
         self.expect(&Tok::Eq, "expected `=` in a binding")?;
+        // A path here is a value; only a name is a command.
+        if matches!(self.peek()?, Tok::Word(_)) {
+            self.head_ok = false;
+        }
         let value = self.expr()?;
         Ok(Stmt::Bind { kind, name, ty, value, public })
     }
@@ -692,6 +697,7 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 Ok(Expr::Str(v))
             }
+            Tok::Word(v) if self.head_ok && is_path_head(&v) => self.command_or_ident(),
             Tok::Word(v) => {
                 self.bump()?;
                 Ok(Expr::Word(v))
@@ -887,8 +893,8 @@ impl<'a> Parser<'a> {
         if at_head || forced_external {
             let w = self.lx.peek(crate::lex::Mode::Word)?;
             if let Tok::Word(text) = &w.tok
-                && text.contains('-')
-                && text.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic())
+                && (is_path_head(text)
+                    || text.contains('-') && text.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic()))
             {
                 let name = text.clone();
                 self.lx.bump(crate::lex::Mode::Word)?;

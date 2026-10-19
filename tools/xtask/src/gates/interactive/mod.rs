@@ -262,10 +262,70 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     steps += 1;
 
     steps += interactive_shell_language(s, &open_at_5)?;
+    steps += interactive_paths(s)?;
     steps += interactive_clipboard_and_completion(s)?;
     steps += interactive_administration(s)?;
     steps += interactive_services_and_relogin(s)?;
     Ok(steps)
+}
+
+/// `test-interactive`'s steps 19a to 19c-1: the shell's own paths, from a real prompt. A script is
+/// written as text and renamed, since `save` writes only `.txt` and `.tsm`.
+fn interactive_paths(s: &mut Session) -> R<usize> {
+    // 19a. **`~` is HOME**, reached from another directory.
+    s.send("cd /home/Pictures")?;
+    s.expect("/home/Pictures>")?;
+    s.send("cd ~")?;
+    s.expect("/home>")?;
+
+    // 19b. **A script runs by its path, with arguments, and `use`s the module beside it.** Run
+    //      from a sibling directory, so a `use` resolved against `PWD` reads nothing.
+    s.send("mkdir ./c1")?;
+    s.expect("/home>")?;
+    s.send("mkdir ./c1/lib")?;
+    s.expect("/home>")?;
+    s.send(r#"["pub def twice(n) { n * 2 }"] | save ./c1/lib/m.txt"#)?;
+    s.expect("/home>")?;
+    s.send("rename ./c1/lib/m.txt ./c1/lib/m.nx")?;
+    s.expect("/home>")?;
+    s.send(concat!(
+        r#"["use \"./lib/m.nx\" { twice }", "format(\"twice={} n={} b={}\", twice(21), "#,
+        r#"($args | count), ($args | filter { |a| a == \"b\" } | count)) | display"] | save ./c1/main.txt"#
+    ))?;
+    s.expect("/home>")?;
+    s.send("rename ./c1/main.txt ./c1/main.nx")?;
+    s.expect("/home>")?;
+    s.send("cd /home/Pictures")?;
+    s.expect("/home/Pictures>")?;
+    s.send("../c1/main.nx a b")?;
+    s.expect("twice=42 n=2 b=1")?;
+    s.expect("/home/Pictures>")?;
+    //      And by `~`, which expands before the path resolves.
+    s.send("~/c1/main.nx x")?;
+    s.expect("twice=42 n=1 b=0")?;
+    s.expect("/home/Pictures>")?;
+
+    // 19c. **A `#!` line names the interpreter**: the host spawns `/bin/nxsh` with the file.
+    s.send(r##"["#!/bin/nxsh", "format(\"bang n={}\", ($args | count)) | display"] | save ~/c1/bang.txt"##)?;
+    s.expect("/home/Pictures>")?;
+    s.send("rename ~/c1/bang.txt ~/c1/bang.nx")?;
+    s.expect("/home/Pictures>")?;
+    s.send("~/c1/bang.nx p q r")?;
+    s.expect("bang n=3")?;
+    s.expect("/home/Pictures>")?;
+
+    // 19c-1. **A program by its path, and a directory is not one.**
+    s.send("/bin/whoami")?;
+    s.expect("alice")?;
+    s.expect("/home/Pictures>")?;
+    s.send("/home")?;
+    s.expect("`/home` is not a program")?;
+    s.expect("/home/Pictures>")?;
+    s.send("cd ~")?;
+    s.expect("/home>")?;
+    s.send("remove -r ./c1")?;
+    s.expect("/home>")?;
+    Ok(4)
 }
 
 /// `test-interactive`'s steps 6 to 19: shell language, history and Ctrl-C. The number of steps run.
