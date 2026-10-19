@@ -603,6 +603,17 @@ mod routing_tests {
         assert_eq!(replies_to(&acts, 1), [(OP_TTY_READ_LINE, b"hi".to_vec())]);
     }
 
+    /// Canonical mode knows no cursor, as Linux's line discipline knows none: an editing key is
+    /// dropped, so what is typed after it still goes on the end, and a password prompt behaves as
+    /// it did.
+    #[test]
+    fn a_canonical_read_ignores_the_editing_keys() {
+        let mut r = console_ttys(1);
+        r.read(1, 77, ReadKind::Line);
+        let acts = r.feed(CONSOLE, b"ab\x1b[D\x1b[H\x1b[3~X\r");
+        assert_eq!(replies_to(&acts, 1), [(OP_TTY_READ_LINE, b"abX".to_vec())]);
+    }
+
     #[test]
     fn input_typed_before_anyone_reads_is_kept_not_dropped() {
         let mut r = console_ttys(1);

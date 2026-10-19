@@ -1,3 +1,6 @@
+//! The line discipline: what a byte does to a line being typed, and what to write so the screen
+//! keeps up. Canonical mode drives it from the server; `nxsh` links it to edit its own prompt.
+
 use alloc::vec::Vec;
 
 /// What the caller should do after feeding one byte; the discipline *says* what to write and
@@ -19,27 +22,47 @@ pub enum Step {
     Eof,
 }
 
-/// A key with no meaning to the line discipline itself.
+/// A key the discipline reports rather than acts on: canonical mode drops every one, as Linux's
+/// does, and `nxsh` recalls history with Up and Down and edits through [`Discipline::edit`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Key {
     /// Cursor up (`ESC [ A`).
     Up,
     /// Cursor down (`ESC [ B`).
     Down,
+    /// Cursor left (`ESC [ D`).
+    Left,
+    /// Cursor right (`ESC [ C`).
+    Right,
+    /// To the line's start (`ESC [ H`, or `ESC [ 1 ~` and `ESC [ 7 ~` as other terminals send it).
+    Home,
+    /// To the line's end (`ESC [ F`, `ESC [ 4 ~`, `ESC [ 8 ~`).
+    End,
+    /// Delete the character under the cursor (`ESC [ 3 ~`).
+    Delete,
 }
 
-/// Where the escape-sequence parser is: cursor keys and nothing else, with unknown sequences
-/// discarded, not accumulated.
+/// Where the escape-sequence parser is; a sequence naming no key is discarded, not accumulated.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum EscState {
     Ground,
     Esc,
-    Csi,
+    /// In a CSI (`ESC [`): its first numeric parameter so far, and whether a `;` has ended it.
+    Csi {
+        param: u32,
+        done: bool,
+    },
+    /// After `ESC O` (SS3): one final byte follows.
+    Ss3,
 }
 
-/// One terminal's editing state.
+/// One terminal's editing state. Its redraw is Backspace and text, needing no terminal width; that
+/// holds for a line shorter than its row, and a full or wrapped one draws wrong (`TODO(tty-size)`).
 pub struct Discipline {
     line: Vec<u8>,
+    /// Where typing lands: a character boundary, never before the last row, which Backspace cannot
+    /// climb out of.
+    cursor: usize,
     echo: bool,
     max: usize,
     esc: EscState,
@@ -55,10 +78,46 @@ impl Default for Discipline {
     }
 }
 
+/// How many characters `bytes` holds: a cell each, as `libterm` and `fbcon` draw them.
+fn chars(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b & 0xC0 != 0x80).count()
+}
+
+/// Append `n` backspaces.
+fn back(out: &mut Vec<u8>, n: usize) {
+    out.resize(out.len() + n, 0x08);
+}
+
+/// The longest prefix of `bytes` no longer than `max` that ends on a character boundary.
+fn whole_chars(bytes: &[u8], max: usize) -> usize {
+    if bytes.len() <= max {
+        return bytes.len();
+    }
+    let mut i = max;
+    while i > 0 && bytes[i] & 0xC0 == 0x80 {
+        i -= 1;
+    }
+    i
+}
+
+/// The key a CSI's final byte and first parameter name, if it is one this discipline reports.
+fn csi_key(fin: u8, param: u32) -> Option<Key> {
+    match (fin, param) {
+        (b'A', _) => Some(Key::Up),
+        (b'B', _) => Some(Key::Down),
+        (b'C', _) => Some(Key::Right),
+        (b'D', _) => Some(Key::Left),
+        (b'H', _) | (b'~', 1 | 7) => Some(Key::Home),
+        (b'F', _) | (b'~', 4 | 8) => Some(Key::End),
+        (b'~', 3) => Some(Key::Delete),
+        _ => None,
+    }
+}
+
 impl Discipline {
     /// An empty line with echo on.
     pub fn new() -> Self {
-        Discipline { line: Vec::new(), echo: true, max: LINE_MAX, esc: EscState::Ground }
+        Discipline { line: Vec::new(), cursor: 0, echo: true, max: LINE_MAX, esc: EscState::Ground }
     }
 
     /// Whether typed characters are echoed. Off is how a password is read; it is the server's
@@ -75,6 +134,7 @@ impl Discipline {
     /// Discard a partially typed line, so a new reader inherits none of someone else's input.
     pub fn reset(&mut self) {
         self.line.clear();
+        self.cursor = 0;
         self.esc = EscState::Ground;
     }
 
@@ -83,20 +143,128 @@ impl Discipline {
         &self.line
     }
 
-    /// Replace the whole line, returning what to write so the display matches: only the
-    /// discipline knows what is on screen. Erase-then-write (`\x08 \x08` per character), as a
-    /// dumb terminal needs.
+    /// Where typing lands, as a byte offset into [`line`](Self::line).
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Replace the line, the cursor at its end, returning what to write: the old line passed over
+    /// and erased, then the new one, cut at a whole character past [`LINE_MAX`], written.
     pub fn replace_line(&mut self, new: &[u8]) -> Vec<u8> {
+        self.replace_around(new, b"")
+    }
+
+    /// [`replace_line`](Self::replace_line) with `before` then `after`, the cursor between them: a
+    /// completion of what is before the cursor that keeps what follows it.
+    pub fn replace_around(&mut self, before: &[u8], after: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        if self.echo {
-            for _ in 0..self.line.len() {
-                out.extend_from_slice(b"\x08 \x08");
-            }
-            out.extend_from_slice(new);
+        out.extend_from_slice(&self.line[self.cursor..]);
+        for _ in 0..chars(&self.line) {
+            out.extend_from_slice(b"\x08 \x08");
         }
-        self.line.clear();
-        self.line.extend_from_slice(&new[..new.len().min(self.max)]);
+        let mut new = [before, after].concat();
+        new.truncate(whole_chars(&new, self.max));
+        self.cursor = before.len().min(new.len());
+        out.extend_from_slice(&new);
+        back(&mut out, chars(&new[self.cursor..]));
+        self.line = new;
+        if self.echo { out } else { Vec::new() }
+    }
+
+    /// The line written and the cursor walked back to its place, after a completion's listing say.
+    pub fn redraw(&self) -> Vec<u8> {
+        if !self.echo {
+            return Vec::new();
+        }
+        let mut out = self.line.clone();
+        back(&mut out, chars(&self.line[self.cursor..]));
         out
+    }
+
+    /// Act on an editing key and return what to write; Up and Down are not edits, and do nothing.
+    pub fn edit(&mut self, key: Key) -> Vec<u8> {
+        let mut out = Vec::new();
+        match key {
+            Key::Left if self.cursor > self.row_start() => {
+                self.cursor = self.prev(self.cursor);
+                out.push(0x08);
+            }
+            Key::Right if self.cursor < self.line.len() => {
+                let next = self.next(self.cursor);
+                out.extend_from_slice(&self.line[self.cursor..next]);
+                self.cursor = next;
+            }
+            Key::Home => {
+                let start = self.row_start();
+                back(&mut out, chars(&self.line[start..self.cursor]));
+                self.cursor = start;
+            }
+            Key::End => {
+                out.extend_from_slice(&self.line[self.cursor..]);
+                self.cursor = self.line.len();
+            }
+            Key::Delete if self.cursor < self.line.len() => {
+                let next = self.next(self.cursor);
+                self.line.drain(self.cursor..next);
+                out = self.rewrite_tail(1);
+            }
+            _ => {}
+        }
+        if self.echo { out } else { Vec::new() }
+    }
+
+    /// Where the last row starts: after the last `\n`, which only a recalled statement holds.
+    fn row_start(&self) -> usize {
+        self.line.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)
+    }
+
+    /// The character boundary before `i`.
+    fn prev(&self, i: usize) -> usize {
+        let mut j = i - 1;
+        while j > 0 && self.line[j] & 0xC0 == 0x80 {
+            j -= 1;
+        }
+        j
+    }
+
+    /// The character boundary after `i`.
+    fn next(&self, i: usize) -> usize {
+        let mut j = i + 1;
+        while j < self.line.len() && self.line[j] & 0xC0 == 0x80 {
+            j += 1;
+        }
+        j
+    }
+
+    /// The rest of the line rewritten, `gap` spaces over what is gone, and the cursor walked back.
+    fn rewrite_tail(&self, gap: usize) -> Vec<u8> {
+        let tail = &self.line[self.cursor..];
+        let mut out = tail.to_vec();
+        out.resize(out.len() + gap, b' ');
+        back(&mut out, chars(tail) + gap);
+        out
+    }
+
+    /// What to write once `n` characters before the cursor are gone: at the end `\x08 \x08` each.
+    fn erased_before(&self, n: usize) -> Step {
+        if !self.echo || n == 0 {
+            return Step::None;
+        }
+        if self.cursor == self.line.len() {
+            return Step::Echo(b"\x08 \x08".repeat(n));
+        }
+        let mut out = Vec::new();
+        back(&mut out, n);
+        out.extend(self.rewrite_tail(n));
+        Step::Echo(out)
+    }
+
+    /// Remove the bytes from `from` to the cursor, which is left at `from`, and say what to write.
+    fn remove_before(&mut self, from: usize) -> Step {
+        let n = chars(&self.line[from..self.cursor]);
+        self.line.drain(from..self.cursor);
+        self.cursor = from;
+        self.erased_before(n)
     }
 
     /// Feed one byte from the device.
@@ -107,29 +275,44 @@ impl Discipline {
             // `ESC` is the meta prefix, so the byte after a bare one is consumed, as readline
             // does: `ESC d` is M-d, and an unbound pair is discarded rather than inserted.
             EscState::Esc => {
-                self.esc = if b == b'[' { EscState::Csi } else { EscState::Ground };
+                self.esc = match b {
+                    b'[' => EscState::Csi { param: 0, done: false },
+                    b'O' => EscState::Ss3,
+                    _ => EscState::Ground,
+                };
                 return Step::None;
             }
-            EscState::Csi => {
+            // `ESC O` ends at the byte after it, which is never typed.
+            EscState::Ss3 => {
+                self.esc = if b == 0x1B { EscState::Esc } else { EscState::Ground };
+                return csi_key(if matches!(b, b'A'..=b'D' | b'H' | b'F') { b } else { 0 }, 0)
+                    .map_or(Step::None, Step::Key);
+            }
+            EscState::Csi { param, done } => {
                 // A CSI ends at its *final* byte, not its first: ending `ESC [ 3 ~` (Delete) at
                 // the `3` would let the `~` land on the line as printable text and be echoed.
                 return match b {
-                    // Parameter and intermediate bytes belong to the sequence.
+                    // The first parameter names the key (`ESC [ 3 ~`); a `;` ends it.
+                    b'0'..=b'9' if !done => {
+                        let param = param.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+                        self.esc = EscState::Csi { param, done };
+                        Step::None
+                    }
+                    b';' => {
+                        self.esc = EscState::Csi { param, done: true };
+                        Step::None
+                    }
+                    // Other parameter and intermediate bytes belong to the sequence.
                     0x20..=0x3F => Step::None,
                     // `ESC` restarts, so an interrupted sequence cannot swallow the next one.
                     0x1B => {
                         self.esc = EscState::Esc;
                         Step::None
                     }
-                    // A final byte ends it.
+                    // A final byte ends it; one that names no key leaks nothing into the line.
                     0x40..=0x7E => {
                         self.esc = EscState::Ground;
-                        match b {
-                            b'A' => Step::Key(Key::Up),
-                            b'B' => Step::Key(Key::Down),
-                            // Ended but not acted on, so it cannot leak into the line.
-                            _ => Step::None,
-                        }
+                        csi_key(b, param).map_or(Step::None, Step::Key)
                     }
                     // Malformed: end it rather than swallow the rest of the stream.
                     _ => {
@@ -144,9 +327,11 @@ impl Discipline {
                 self.esc = EscState::Esc;
                 Step::None
             }
-            // CR and LF both end a line; which one a serial line sends is an accident.
+            // CR and LF both end a line, wherever the cursor is; which one a serial line sends is
+            // an accident.
             b'\r' | b'\n' => {
                 let bytes = core::mem::take(&mut self.line);
+                self.cursor = 0;
                 // Echoed because the user typed it: omitting it leaves the next prompt against
                 // their input (`alicepassword:`). In no-echo mode nothing was shown, so the
                 // caller supplies its own newline.
@@ -162,61 +347,44 @@ impl Discipline {
                     Step::None
                 }
             }
-            // Backspace and DEL both erase: terminals disagree about which they send.
+            // Backspace and DEL both erase the character before the cursor: terminals disagree
+            // about which they send.
             0x08 | 0x7f => {
-                if self.line.pop().is_some() && self.echo {
-                    // Back up, overwrite with a space, back up again.
-                    Step::Echo(b"\x08 \x08".to_vec())
-                } else {
-                    // Nothing to erase, or nothing to show.
-                    Step::None
+                if self.cursor == self.row_start() {
+                    return Step::None;
                 }
+                let from = self.prev(self.cursor);
+                self.remove_before(from)
             }
-            // Ctrl-U kills the line, erasing exactly what is on screen: nothing in no-echo mode.
-            0x15 => {
-                let n = self.line.len();
-                self.line.clear();
-                if self.echo && n > 0 {
-                    let mut out = Vec::with_capacity(n * 3);
-                    for _ in 0..n {
-                        out.extend_from_slice(b"\x08 \x08");
-                    }
-                    Step::Echo(out)
-                } else {
-                    Step::None
-                }
-            }
+            // Ctrl-U kills what is before the cursor, erasing exactly what is on screen: nothing in
+            // no-echo mode.
+            0x15 => self.remove_before(self.row_start()),
             // Ctrl-W erases the word before the cursor and the spaces before it, so repeated
             // presses walk back through a command line.
             0x17 => {
-                let before = self.line.len();
-                while self.line.last() == Some(&b' ') {
-                    self.line.pop();
+                let start = self.row_start();
+                let mut i = self.cursor;
+                while i > start && self.line[i - 1] == b' ' {
+                    i -= 1;
                 }
-                while let Some(&c) = self.line.last() {
-                    if c == b' ' {
-                        break;
-                    }
-                    self.line.pop();
+                while i > start && self.line[i - 1] != b' ' {
+                    i -= 1;
                 }
-                let n = before - self.line.len();
-                if self.echo && n > 0 {
-                    let mut out = Vec::with_capacity(n * 3);
-                    for _ in 0..n {
-                        out.extend_from_slice(b"\x08 \x08");
-                    }
-                    Step::Echo(out)
-                } else {
-                    Step::None
-                }
+                self.remove_before(i)
             }
-            // Printable ASCII accumulates.
+            // Printable ASCII goes in at the cursor; mid-line, the rest is redrawn after it.
             0x20..=0x7e => {
                 if self.line.len() >= self.max {
                     return Step::None; // refuse, do not truncate
                 }
-                self.line.push(b);
-                if self.echo { Step::Echo(alloc::vec![b]) } else { Step::None }
+                self.line.insert(self.cursor, b);
+                self.cursor += 1;
+                if !self.echo {
+                    return Step::None;
+                }
+                let mut out = alloc::vec![b];
+                out.extend(self.rewrite_tail(0));
+                Step::Echo(out)
             }
             // Undefined control codes are dropped so a stray byte cannot corrupt a command.
             _ => Step::None,
@@ -511,5 +679,206 @@ mod tests {
         drive(&mut d, "partial");
         d.reset();
         assert_eq!(drive(&mut d, "fresh\n").0, ["fresh"]);
+    }
+
+    /// Feed `bytes` as `nxsh` does, acting on each reported key, and return what was written.
+    fn edited(d: &mut Discipline, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            match d.feed(b) {
+                Step::Echo(e) => out.extend(e),
+                Step::Key(k) => out.extend(d.edit(k)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    const LEFT: &[u8] = b"\x1b[D";
+
+    #[test]
+    fn left_and_right_move_by_a_character_and_stop_at_the_ends() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"ab");
+        assert_eq!(edited(&mut d, LEFT), b"\x08");
+        assert_eq!(d.cursor(), 1);
+        assert_eq!(edited(&mut d, b"\x1b[D\x1b[D"), b"\x08", "the second Left at the start does nothing");
+        assert_eq!(edited(&mut d, b"\x1b[C"), b"a", "Right passes the character by writing it");
+        assert_eq!(edited(&mut d, b"\x1b[C\x1b[C"), b"b");
+        assert_eq!((d.line(), d.cursor()), (&b"ab"[..], 2));
+    }
+
+    #[test]
+    fn home_and_end_walk_the_whole_line() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"abc");
+        assert_eq!(edited(&mut d, b"\x1b[H"), b"\x08\x08\x08");
+        assert_eq!(d.cursor(), 0);
+        assert_eq!(edited(&mut d, b"\x1b[F"), b"abc");
+        assert_eq!(d.cursor(), 3);
+    }
+
+    #[test]
+    fn typing_mid_line_inserts_and_redraws_the_rest() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"ac");
+        edited(&mut d, LEFT);
+        assert_eq!(edited(&mut d, b"b"), b"bc\x08");
+        assert_eq!((d.line(), d.cursor()), (&b"abc"[..], 2));
+        edited(&mut d, b"\x1b[H");
+        assert_eq!(edited(&mut d, b"_"), b"_abc\x08\x08\x08", "at the start");
+        assert_eq!(d.line(), b"_abc");
+    }
+
+    #[test]
+    fn backspace_mid_line_takes_the_character_before_the_cursor() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"abcd");
+        edited(&mut d, b"\x1b[D\x1b[D");
+        assert_eq!(edited(&mut d, b"\x7f"), b"\x08cd \x08\x08\x08");
+        assert_eq!((d.line(), d.cursor()), (&b"acd"[..], 1));
+        edited(&mut d, b"\x1b[H");
+        assert_eq!(edited(&mut d, b"\x7f"), b"", "nothing before the start");
+    }
+
+    #[test]
+    fn delete_takes_the_character_under_the_cursor() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"abc");
+        edited(&mut d, b"\x1b[H");
+        assert_eq!(edited(&mut d, b"\x1b[3~"), b"bc \x08\x08\x08");
+        assert_eq!((d.line(), d.cursor()), (&b"bc"[..], 0));
+        edited(&mut d, b"\x1b[F");
+        assert_eq!(edited(&mut d, b"\x1b[3~"), b"", "nothing under the cursor at the end");
+        assert_eq!(d.line(), b"bc");
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_w_take_only_what_is_before_the_cursor() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"one two");
+        edited(&mut d, b"\x1b[D\x1b[D");
+        // The cursor is before `w`, so the word's part before it, `t`, goes.
+        assert_eq!(edited(&mut d, b"\x17"), b"\x08wo \x08\x08\x08");
+        assert_eq!((d.line(), d.cursor()), (&b"one wo"[..], 4));
+        assert_eq!(edited(&mut d, b"\x15"), b"\x08\x08\x08\x08wo    \x08\x08\x08\x08\x08\x08");
+        assert_eq!((d.line(), d.cursor()), (&b"wo"[..], 0));
+    }
+
+    #[test]
+    fn enter_mid_line_submits_it_all_and_the_next_line_starts_empty() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"abc");
+        edited(&mut d, LEFT);
+        match d.feed(b'\r') {
+            Step::Line { bytes, .. } => assert_eq!(bytes, b"abc"),
+            other => panic!("expected a line, got {other:?}"),
+        }
+        // A cursor left at 2 would insert past the end of the empty line and panic.
+        edited(&mut d, b"x");
+        assert_eq!((d.line(), d.cursor()), (&b"x"[..], 1));
+    }
+
+    #[test]
+    fn a_reset_mid_line_leaves_the_cursor_at_the_start() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"abc");
+        edited(&mut d, LEFT);
+        d.reset();
+        edited(&mut d, b"x");
+        assert_eq!((d.line(), d.cursor()), (&b"x"[..], 1));
+    }
+
+    #[test]
+    fn a_replaced_line_leaves_the_cursor_at_its_end_and_erases_from_there() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"abc");
+        edited(&mut d, b"\x1b[H");
+        // The rest is passed over first, so the erase starts from the end of what is shown.
+        assert_eq!(d.replace_line(b"xy"), b"abc\x08 \x08\x08 \x08\x08 \x08xy");
+        assert_eq!(d.cursor(), 2);
+    }
+
+    #[test]
+    fn replace_around_puts_the_cursor_between_its_halves() {
+        let mut d = Discipline::new();
+        assert_eq!(d.replace_around(b"cd /ho", b" x"), b"cd /ho x\x08\x08");
+        assert_eq!((d.line(), d.cursor()), (&b"cd /ho x"[..], 6));
+        assert_eq!(d.redraw(), b"cd /ho x\x08\x08");
+    }
+
+    #[test]
+    fn a_recalled_line_too_long_is_cut_at_a_whole_character() {
+        let mut d = Discipline::new();
+        let mut recalled = alloc::vec![b'a'; LINE_MAX - 1];
+        recalled.extend_from_slice("\u{e9}".as_bytes());
+        let shown = d.replace_line(&recalled);
+        assert_eq!(d.line().len(), LINE_MAX - 1, "the half of `\u{e9}` that fit is dropped");
+        assert!(core::str::from_utf8(d.line()).is_ok());
+        assert_eq!(shown, d.line(), "only what is kept is written");
+    }
+
+    #[test]
+    fn the_cursor_moves_over_a_character_not_a_byte() {
+        let mut d = Discipline::new();
+        d.replace_line("h\u{e9}llo".as_bytes());
+        edited(&mut d, b"\x1b[H\x1b[C");
+        assert_eq!(d.cursor(), 1);
+        assert_eq!(edited(&mut d, b"\x1b[C"), "\u{e9}".as_bytes());
+        edited(&mut d, LEFT);
+        assert_eq!(edited(&mut d, b"\x1b[3~"), b"llo \x08\x08\x08\x08", "one character, two bytes, gone");
+        assert_eq!(d.line(), b"hllo");
+    }
+
+    #[test]
+    fn a_recalled_statement_of_several_lines_is_edited_on_its_last() {
+        let mut d = Discipline::new();
+        d.replace_line(b"if x {\n1 }");
+        assert_eq!(edited(&mut d, b"\x1b[H"), b"\x08\x08\x08");
+        assert_eq!(d.cursor(), 7);
+        assert_eq!(edited(&mut d, b"\x1b[D\x7f"), b"", "no Left or Backspace past the row's start");
+        assert_eq!(d.line(), b"if x {\n1 }");
+    }
+
+    #[test]
+    fn every_form_of_each_key_is_reported() {
+        for (seq, key) in [
+            (&b"\x1b[D"[..], Key::Left),
+            (b"\x1b[C", Key::Right),
+            (b"\x1b[H", Key::Home),
+            (b"\x1b[1~", Key::Home),
+            (b"\x1b[7~", Key::Home),
+            (b"\x1bOH", Key::Home),
+            (b"\x1b[F", Key::End),
+            (b"\x1b[4~", Key::End),
+            (b"\x1b[8~", Key::End),
+            (b"\x1bOF", Key::End),
+            (b"\x1b[3~", Key::Delete),
+            (b"\x1b[1;5D", Key::Left),
+            (b"\x1bOA", Key::Up),
+        ] {
+            let mut d = Discipline::new();
+            let got: Vec<Step> = seq.iter().map(|&b| d.feed(b)).filter(|s| *s != Step::None).collect();
+            assert_eq!(got, [Step::Key(key)], "{seq:x?}");
+        }
+        // Insert names no key, and leaves nothing.
+        let mut d = Discipline::new();
+        assert_eq!(edited(&mut d, b"\x1b[2~"), b"");
+    }
+
+    #[test]
+    fn an_ss3_sequence_ends_at_its_final_byte_rather_than_typing_it() {
+        let mut d = Discipline::new();
+        edited(&mut d, b"\x1bOxy");
+        assert_eq!(d.line(), b"y");
+    }
+
+    #[test]
+    fn with_echo_off_an_edit_still_moves_the_cursor_but_shows_nothing() {
+        let mut d = Discipline::new();
+        d.set_echo(false);
+        edited(&mut d, b"ab");
+        assert_eq!(edited(&mut d, b"\x1b[DX"), b"");
+        assert_eq!(d.line(), b"aXb");
     }
 }

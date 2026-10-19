@@ -196,13 +196,20 @@ mod tests {
     }
 
     /// The round trip: `tty_server::Discipline` parses what a serial terminal sends, so the two
-    /// ends of the wire are checked against each other. It reaches only `Up` and `Down`, the
-    /// keys `Discipline::Key` has.
+    /// ends of the wire are checked against each other, for every key `Discipline::Key` names.
     #[test]
-    fn the_arrows_survive_a_round_trip_through_the_line_discipline() {
+    fn the_cursor_keys_survive_a_round_trip_through_the_line_discipline() {
         use tty_server::{Discipline, Key, Step};
 
-        for (code, expected) in [(KEY_UP, Key::Up), (KEY_DOWN, Key::Down)] {
+        for (code, expected) in [
+            (KEY_UP, Key::Up),
+            (KEY_DOWN, Key::Down),
+            (KEY_LEFT, Key::Left),
+            (KEY_RIGHT, Key::Right),
+            (KEY_HOME, Key::Home),
+            (KEY_END, Key::End),
+            (KEY_DELETE, Key::Delete),
+        ] {
             let mut d = Discipline::new();
             let bytes = enc(code, 0);
             let mut got = None;
