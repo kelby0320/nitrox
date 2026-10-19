@@ -36465,10 +36465,10 @@ second declined.
     `rename ./a ./b` failed wherever it ran. Every other coreutil resolves each operand.
   - **A directory named as a program** looks up as an object that is neither a file nor a memory
     object, with no size, so it ran as an empty script. Only those two kinds can be images now.
-- **`rename`'s spec said what its program never did**: a bare new name in the source's directory,
-  a path refused. The program has taken a path from the start, and `check-storage` renames across
-  directories with it, so the spec now says so, by the rule that the source wins. Whether to adopt
-  the stricter contract is the maintainer's.
+- **`rename` is Unix-like, as its program has always been** (the maintainer's call): OLD and NEW
+  are paths against `PWD`, and it never copies, so it is `mv` restricted to one mount. Its spec
+  said what the program never did, PowerShell's `Rename-Item` (a bare new name in the source's
+  directory, a path refused), and now says what it does.
 - **The review (PR #386) found a path run past a statement's head**, wherever the parser's head
   flag was still set: `let r = {src: ./x}` ran `./x`. A path runs only where the head's token
   starts now. It also found a stage's image never closed, so a stick a program ran from could not

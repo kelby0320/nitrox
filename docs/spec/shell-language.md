@@ -1360,13 +1360,13 @@ it applies rather than either camp uninspected:**
   "ensure this file exists and its modification time is now," covering both empty-file creation
   *and* updating mtime on an existing file — load-bearing for build systems that lean on exactly
   this to force a rebuild. `create` would have to either drop that behavior or misdescribe it.
-- **`rename`** — new addition (PowerShell's `Rename-Item` is a real, separate cmdlet from
-  `Move-Item`, not folded together). Given a genuinely distinct contract, not just a friendlier
-  label for `move`: **it re-points a name at the same file and never copies**, so a rename across
-  mounts is a fail-loud error where `move` falls back to a copy. NEW is a path, resolved against
-  `PWD` like every operand (v1.3). This was first written as a bare name within the source's
-  directory; the program took a path from the start, and `check-storage` renames across
-  directories with it.
+- **`rename`** — new addition: Unix's `rename(2)` as a command, `mv` that never copies. OLD and
+  NEW are paths, resolved against `PWD` like every operand, so `rename dir/a.txt dir/b.txt`
+  renames in place and `rename dir/a.txt other/b.txt` moves the file to another directory, on the
+  same mount. **It re-points a name at the same file and never copies**, which is what sets it
+  apart from `move`: across mounts it is a fail-loud error, where `move` falls back to a copy.
+  This was first written after PowerShell's `Rename-Item`, a bare new name in the source's own
+  directory; the program took a path from the start, and the maintainer kept that (v1.3).
 
 ### 10d. Requirements (behavioral scope only — implementation deferred to build time)
 

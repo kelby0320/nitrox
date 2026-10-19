@@ -101,7 +101,7 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-19	385	e34a9825	14	rules-and-docs+tests	optional	demonstrated	fixed	0c3bd40d	read dialogs.rs:219,226: threshold passes at 20 rows, message names 80x24; compares with the logged start
 2026-10-19	385	e34a9825	15	rules-and-docs	optional	demonstrated	fixed	0c3bd40d	status says each later part; outline use bullet follows C.1
 2026-10-19	386	f461dffc	1	logic+error-paths+architecture	blocking	demonstrated	fixed	4435a43c	reproduced (record ran ./deploy.nx; if/match/for stopped parsing); a path runs only at the head token's offset; without the check 3 tests fail
-2026-10-19	386	f461dffc	2	logic	worth-fixing	demonstrated	fixed	4435a43c	spec rows rewritten to the program (NEW a path, never copies), source-wins rule; adopting the bare-name contract asked of the maintainer
+2026-10-19	386	f461dffc	2	logic	worth-fixing	demonstrated	fixed	4435a43c	spec rewritten from PowerShell's Rename-Item to the program's Unix-like contract (NEW a path, never copies); the maintainer kept the behaviour
 2026-10-19	386	f461dffc	3	logic+error-paths+tests	worth-fixing	demonstrated	fixed	4435a43c	test asserts the operator's own refusal for ~x and ~/x; the review's mutation now fails it
 2026-10-19	386	f461dffc	4	error-paths+logic+architecture	worth-fixing	unverified	fixed	4435a43c	reproduced on a boot (eject refused after running from the stick); Images guard closes each image; check-storage step passes
 2026-10-19	386	f461dffc	5	tests	worth-fixing	demonstrated	fixed	4435a43c	quoted ~ path to open and save pinned; the review's mutation now fails it
