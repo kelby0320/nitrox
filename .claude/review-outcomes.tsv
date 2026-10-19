@@ -85,3 +85,18 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-16	383	740eb6dd	1	solo	worth-fixing	demonstrated	fixed	924d2def	workflows test holds each QEMU gate's if: group to the matrix; reproduced ('harnes' passed), 4 controls
 2026-10-16	383	740eb6dd	2	solo	worth-fixing	demonstrated	fixed	f1f1268c	both sentences name the column by its heading
 2026-10-16	383	740eb6dd	3	solo	optional	demonstrated	fixed	8236dc56	5.7 min, 147 s, nitrox.hdd, images builds all but check-fbcon's mode; each checked; swept with positive controls
+2026-10-19	385	e34a9825	1	logic	worth-fixing	demonstrated	fixed	0c3bd40d	reproduced: ./tool is a string, ./tool x and ^./tool do not parse; running by path left C.1 and the log
+2026-10-19	385	e34a9825	2	logic+error-paths	worth-fixing	unverified	fixed	0c3bd40d	read: Geometry overwrites origin before the queued DragEnded (placement.rs:303-304, main.rs:749); DragEnded carries the pre-drag rect, a maximized window keeps its own
+2026-10-19	385	e34a9825	3	logic	worth-fixing	demonstrated	fixed	0c3bd40d	reproduced on a 10-column grid: full row erases g and keeps h, one short is right; limit is a full row, under TODO(tty-size)
+2026-10-19	385	e34a9825	4	error-paths	worth-fixing	unverified	fixed	0c3bd40d	read: recover() maps other senses and stalls to IoError, failed reset ends the device; every Eject failure leaves the eject done; no port power-off
+2026-10-19	385	e34a9825	5	logic+error-paths	worth-fixing	demonstrated	fixed	0c3bd40d	reproduced: new field refused, existing field reaches no stage, cd reverts it; nxsh-1 rewritten, C.1 notes ~ reads the record
+2026-10-19	385	e34a9825	6	error-paths	worth-fixing	unverified	fixed	0c3bd40d	plan gap, read against exec_use's cleanup order; module load unwinds on every exit, retry test added, spec :1544 named
+2026-10-19	385	e34a9825	7	logic	optional	demonstrated	fixed	0c3bd40d	reproduced: a use inside a def runs at call time; the rule is lexical, test added
+2026-10-19	385	e34a9825	8	logic	optional	unverified	fixed	0c3bd40d	read main.rs:1160; ESC ends a search keeping the match and passes its sequence on, Ctrl-G cancels; no gate types ESC in a search
+2026-10-19	385	e34a9825	9	logic	optional	unverified	fixed	0c3bd40d	wording: ~ ends at anything that ends a word, newline and | named; tests added
+2026-10-19	385	e34a9825	10	logic	optional	demonstrated	fixed	0c3bd40d	LICENSE-DejaVu.txt says bitstream-vera; C.5 corrected
+2026-10-19	385	e34a9825	11	error-paths	optional	demonstrated	fixed	0c3bd40d	reproduced: replace_line cut at LINE_MAX leaves 0xc3; every reset sets the cursor, whole characters kept, tests added
+2026-10-19	385	e34a9825	12	error-paths	optional	unverified	fixed	0c3bd40d	reproduced: exit 1 2 exits 1 silently; nxsh-2 names exit, now demonstrated
+2026-10-19	385	e34a9825	13	tests	optional	unverified	fixed	0c3bd40d	each gate assertion is run against a driver skipping the command and a service reading after it
+2026-10-19	385	e34a9825	14	rules-and-docs+tests	optional	demonstrated	fixed	0c3bd40d	read dialogs.rs:219,226: threshold passes at 20 rows, message names 80x24; compares with the logged start
+2026-10-19	385	e34a9825	15	rules-and-docs	optional	demonstrated	fixed	0c3bd40d	status says each later part; outline use bullet follows C.1
