@@ -49,6 +49,5 @@
 "userspace/storage-service/src/main.rs" = 1699
 "userspace/test-harness/src/harness.rs" = 3991
 "userspace/test-harness/src/uiclient.rs" = 1265
-"userspace/tty-server/src/lib.rs" = 1322
 "userspace/view-broker/src/lib.rs" = 1646
 "userspace/view-broker/src/main.rs" = 1796
