@@ -444,21 +444,21 @@ impl Host for NitroxHost {
     }
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
-        let h = lookup(self.namespace, path.as_bytes()).ok_or_else(|| alloc::format!("cannot open {path}"))?;
+        let h = lookup(self.namespace, path.as_bytes()).ok_or_else(|| alloc::format!("cannot open `{path}`"))?;
         let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
         // SAFETY: a correctly sized `HandleInfo` out-param for a handle we own.
         let r = unsafe { syscall2(SYS_HANDLE_STAT, h, (&raw mut info) as u64) };
         if r != 0 || info.size == 0 {
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-            return Err(alloc::format!("cannot size {path}"));
+            return Err(alloc::format!("cannot size `{path}`"));
         }
         // SAFETY: mapping a readable file handle for exactly its own length.
         let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, info.size, RIGHT_MAP_READ) };
         if addr < 0 {
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
-            return Err(alloc::format!("cannot read {path}"));
+            return Err(alloc::format!("cannot read `{path}`"));
         }
         // SAFETY: `addr` is a live read-only mapping of `info.size` bytes.
         let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, info.size as usize) }.to_vec();
@@ -485,18 +485,18 @@ impl Host for NitroxHost {
             )
         };
         if po < 0 {
-            return Err(alloc::format!("cannot create {path}"));
+            return Err(alloc::format!("cannot create `{path}`"));
         }
         let (st, fh) = po_wait(po as u64);
         if st != 0 || fh == 0 {
-            return Err(alloc::format!("cannot create {path}"));
+            return Err(alloc::format!("cannot create `{path}`"));
         }
         // SAFETY: mapping our own writable file handle for exactly its length.
         let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, size, RIGHT_MAP_READ | libkern::handle::RIGHT_MAP_WRITE) };
         if addr < 0 {
             // SAFETY: closing our own handle.
             unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
-            return Err(alloc::format!("cannot map {path}"));
+            return Err(alloc::format!("cannot map `{path}`"));
         }
         // SAFETY: `addr` is a live writable mapping of exactly `size` bytes.
         unsafe {
@@ -804,6 +804,7 @@ fn po_wait(po: u64) -> (i32, u64) {
 fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record, terminal: Option<u64>) -> i64 {
     let mut host = NitroxHost { namespace, notif, tty: 0 };
 
+    let mut script_path: Option<String> = None;
     let source = match argv.get(1).map(|s| s.as_str()) {
         Some("-c") => match argv.get(2) {
             Some(src) => src.clone(),
@@ -821,7 +822,11 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
             }
             return EXIT_OK;
         }
-        Some(path) => match host.read_file(path) {
+        Some(path) => match nxsh::paths::resolve(nxsh::paths::pwd_of(&env), path).and_then(|abs| {
+            let bytes = host.read_file(&abs)?;
+            script_path = Some(abs);
+            Ok(bytes)
+        }) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(s) => s,
                 Err(_) => {
@@ -839,7 +844,8 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
         None => return repl(notif, namespace, env, terminal),
     };
 
-    let script = match nxsh::parse_script(&source) {
+    let base = script_path.as_deref().map(nxsh::paths::dir_of);
+    let script = match nxsh::parse_script_in(&source, base) {
         Ok(s) => s,
         Err(e) => {
             let mut msg = String::from("nxsh: parse error on line ");
@@ -854,6 +860,9 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
 
     let mut interp = Interp::with_host(alloc::boxed::Box::new(host), RunMode::Script);
     interp.set_env(env);
+    if let Some(abs) = &script_path {
+        interp.mark_loading(abs);
+    }
     match interp.run(&script) {
         Ok(_) => EXIT_OK,
         // §11f: `exit N` sets the script's status; it is not a failure.

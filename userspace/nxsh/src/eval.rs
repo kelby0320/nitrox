@@ -59,7 +59,7 @@ pub const PIPELINE_FAILED: &str = "PipelineFailed";
 pub const INTERRUPTED: &str = "Interrupted";
 
 impl EvalError {
-    fn new(message: impl Into<String>) -> EvalError {
+    pub(crate) fn new(message: impl Into<String>) -> EvalError {
         EvalError::of(ERROR, message)
     }
 
@@ -164,6 +164,8 @@ pub struct Interp {
     /// A field so the guard is **testable in microseconds**; proving it at ten million iterations
     /// would cost more than the whole suite. Not a resource policy.
     iteration_limit: u64,
+    /// Absolute paths of the files being loaded, outermost first, so a `use` cannot recurse.
+    pub(crate) loading: Vec<String>,
 }
 
 impl Default for Interp {
@@ -187,6 +189,7 @@ impl Interp {
             strict: false,
             last_status: None,
             iteration_limit: MAX_ITERATIONS,
+            loading: Vec::new(),
         }
     }
 
@@ -201,8 +204,7 @@ impl Interp {
     /// A *conventional* entry, not a distinct field: Unix has two sources of truth, `$PWD` and
     /// `getcwd()`, and the bugs live in the gap. There is no kernel cwd here to disagree.
     pub fn cwd(&self) -> Option<&str> {
-        let i = self.env.schema.fields.iter().position(|f| f.name == "PWD")?;
-        self.env.values.get(i)?.as_str()
+        crate::paths::pwd_of(&self.env)
     }
 
     /// Resolve a path the *shell itself* will use, against `PWD`.
@@ -210,10 +212,7 @@ impl Interp {
     /// Only for the shell's own lookups (`open`, `save`, a script path). A spawned stage's
     /// arguments are passed through as written; see [`Host::run`].
     fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
-        let mut buf = [0u8; 1024];
-        let out = librsproto::path::resolve(self.cwd().map(str::as_bytes), path.as_bytes(), &mut buf)
-            .map_err(|e| EvalError::new(alloc::format!("`{path}`: {}", e.message())))?;
-        Ok(alloc::string::String::from_utf8_lossy(out).into_owned())
+        crate::paths::resolve(self.cwd(), path).map_err(EvalError::new)
     }
 
     /// Re-publish `$env` after a change, so the binding and the record never disagree.
@@ -532,8 +531,8 @@ impl Interp {
                 self.strict = saved;
                 r
             }
-            Stmt::Use { path, names, alias } => {
-                self.exec_use(path, names, alias)?;
+            Stmt::Use { path, names, alias, base } => {
+                self.exec_use(path, names, alias, base.as_deref())?;
                 Ok(Flow::Normal(Val::NULL))
             }
         }
@@ -1141,16 +1140,23 @@ impl Interp {
         })
     }
 
-    /// `use "./lib/utils.nx" { helper }` / `… as utils`.
+    /// Read, run and import the module at `abs`, which `use` named as `path`; see
+    /// [`exec_use`](Self::exec_use) for where `abs` comes from.
     ///
     /// Explicit relative path only, no search: §9h rejects `PATH`-like resolution for the reason
     /// the system rejects ambient authority, a name crossing a boundary should be visible.
-    fn exec_use(&mut self, path: &str, names: &Option<Vec<String>>, alias: &Option<String>) -> Result<()> {
-        let bytes = self.host.read_file(path).map_err(EvalError::new)?;
+    pub(crate) fn load_module(
+        &mut self,
+        path: &str,
+        abs: &str,
+        names: &Option<Vec<String>>,
+        alias: &Option<String>,
+    ) -> Result<()> {
+        let bytes = self.host.read_file(abs).map_err(EvalError::new)?;
         let src = alloc::string::String::from_utf8(bytes)
             .map_err(|_| EvalError::new(alloc::format!("`{path}` is not valid UTF-8")))?;
-        let module = crate::parse_script(&src)
-            .map_err(|e| EvalError::new(alloc::format!("{path} line {}: {}", e.line, e.message)))?;
+        let module = crate::parse_script_in(&src, Some(crate::paths::dir_of(abs)))
+            .map_err(|e| EvalError::new(alloc::format!("`{path}` line {}: {}", e.line, e.message)))?;
 
         // Run the module in a scope of its own and take only what it exported. Its `def`s land in
         // `functions`, so both are swept; `functions` is snapshotted first so a module cannot
@@ -3257,25 +3263,6 @@ x"
         assert_eq!(rendered("try { 1 } catch (e) { 2 }"), "1");
         let src = "try { 1 / 0 } catch (e) {\n                   match e { { kind: \"Error\" } => \"handled\"\n _ => \"?\" }\n}";
         assert_eq!(rendered(src), "handled");
-    }
-
-    #[test]
-    fn use_imports_only_what_is_exported() {
-        let host = MockHost::new()
-            .with_file("./lib.nx", "pub def helper(x: Int) -> Int { x + 1 }\ndef hidden() -> Int { 0 }\n");
-        let (r, _l) = run_with(host, "use \"./lib.nx\" { helper }\nhelper(1)");
-        assert_eq!(r.expect("imports").render(), "2");
-
-        let host = MockHost::new().with_file("./lib.nx", "def hidden() -> Int { 0 }\n");
-        let (r, _l) = run_with(host, "use \"./lib.nx\" { hidden }\nhidden()");
-        assert!(r.expect_err("not exported").message.contains("pub"));
-    }
-
-    #[test]
-    fn use_as_binds_a_qualified_name() {
-        let host = MockHost::new().with_file("./lib.nx", "pub def helper(x: Int) -> Int { x * 2 }\n");
-        let (r, _l) = run_with(host, "use \"./lib.nx\" as utils\nutils.helper(4)");
-        assert_eq!(r.expect("imports").render(), "8");
     }
 
     #[test]

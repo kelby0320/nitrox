@@ -118,11 +118,13 @@ pub struct Parser<'a> {
     /// diagnostics parse-time.
     loop_depth: u32,
     probe: u64,
+    /// The directory stamped on every `use`; see [`crate::paths::parse_script_in`].
+    pub(crate) base: Option<String>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str) -> Parser<'a> {
-        Parser { lx: Lexer::new(src), depth: 0, head_ok: true, in_op_args: 0, loop_depth: 0, probe: 0 }
+        Parser { lx: Lexer::new(src), depth: 0, head_ok: true, in_op_args: 0, loop_depth: 0, probe: 0, base: None }
     }
 
     /// Parse a loop body: `break`/`continue` are legal inside it.
@@ -429,7 +431,7 @@ impl<'a> Parser<'a> {
         };
         if self.eat(&Tok::As)? {
             let alias = self.ident("expected a module alias")?;
-            return Ok(Stmt::Use { path, names: None, alias: Some(alias) });
+            return Ok(Stmt::Use { path, names: None, alias: Some(alias), base: self.base.clone() });
         }
         if self.eat(&Tok::LBrace)? {
             let mut names = Vec::new();
@@ -450,7 +452,7 @@ impl<'a> Parser<'a> {
             if names.is_empty() {
                 return self.fail("an import list may not be empty");
             }
-            return Ok(Stmt::Use { path, names: Some(names), alias: None });
+            return Ok(Stmt::Use { path, names: Some(names), alias: None, base: self.base.clone() });
         }
         self.fail("`use` needs `{ names }` or `as alias` — there is no wildcard import")
     }

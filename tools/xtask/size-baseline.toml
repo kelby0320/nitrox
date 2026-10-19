@@ -38,11 +38,11 @@
 "userspace/nxfiles/src/app.rs" = 1719
 "userspace/nxfiles/src/main.rs" = 1125
 "userspace/nxfiles/src/tests.rs" = 2262
-"userspace/nxsh/src/eval.rs" = 4151
+"userspace/nxsh/src/eval.rs" = 4138
 "userspace/nxsh/src/lex.rs" = 1089
-"userspace/nxsh/src/main.rs" = 1424
+"userspace/nxsh/src/main.rs" = 1433
 "userspace/nxsh/src/ops.rs" = 1079
-"userspace/nxsh/src/parse.rs" = 1843
+"userspace/nxsh/src/parse.rs" = 1845
 "userspace/nxterm/src/lib.rs" = 2337
 "userspace/service-mgr/src/main.rs" = 2315
 "userspace/storage-service/src/lib.rs" = 1082

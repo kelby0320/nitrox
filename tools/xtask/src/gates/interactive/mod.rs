@@ -215,10 +215,10 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     // the manager as `info/block`, a table name it refuses, rather than as `block`, the
     // subscription that would hand this session every disk. `/dev/registry` is root-only.
     s.send("open /dev/devices/block")?;
-    s.expect("nxsh: cannot open /dev/devices/block")?;
+    s.expect("nxsh: cannot open `/dev/devices/block`")?;
     s.expect("/home>")?;
     s.send("open /dev/registry")?;
-    s.expect("nxsh: cannot open /dev/registry")?;
+    s.expect("nxsh: cannot open `/dev/registry`")?;
     s.expect("/home>")?;
     steps += 1;
 
