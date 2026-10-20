@@ -126,16 +126,6 @@ pub(super) fn eject_medium(node: u64) -> Result<(), KError> {
     }
 }
 
-/// Why a stick's medium did not stop, in the eject line's words.
-pub(super) fn not_stopped(err: KError) -> &'static [u8] {
-    match err {
-        KError::Unsupported => b"it cannot be stopped",
-        KError::IoError => b"it failed the command",
-        KError::PeerClosed => b"it went away",
-        _ => b"the kernel refused it",
-    }
-}
-
 /// Mount `plan`'s device: spawn a server over it, and build its namespace. The server gets a
 /// duplicate of `node`; this service keeps its own, for the flush and for a later mount.
 pub(super) fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {

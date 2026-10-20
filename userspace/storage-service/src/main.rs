@@ -583,8 +583,7 @@ impl Service {
     /// one place `found` changes after the boot**: the unmount reads the device for its own line
     /// with [`read_found`](Self::read_found), which stores nothing.
     fn refresh(&mut self, id: u32) {
-        // An ejected stick is read no more: a stopped medium wakes for any read.
-        if self.devices.iter().any(|d| d.record.id == id && d.found == Found::Ejected) {
+        if mounts::ejected(&self.devices, id) {
             return;
         }
         let Some(found) = self.read_found(id) else {
@@ -792,22 +791,14 @@ impl Service {
         }
         let said = names.join(", ");
         Line::new().s(b"storage-service: ejected ").untrusted(said.as_bytes()).s(b", safe to remove").end();
-        // **Ejected however the stop goes**: everything on it is unmounted, so its data is safe,
-        // and a refusal now would be the half-done eject the held check exists to prevent.
-        let node = self.nodes.iter().find(|(id, _)| *id == disk).map(|&(_, n)| n);
-        let stopped = node.map_or(Err(KError::NotFound), eject_medium);
-        for d in self.devices.iter_mut().filter(|d| d.record.id == disk || d.record.parent == disk) {
-            d.found = Found::Ejected;
-        }
-        let mut line = Line::new();
-        line.s(b"storage-service: ").untrusted(said.as_bytes());
-        match stopped {
-            Ok(()) => line.s(b" stopped"),
-            Err(err) => line.s(b" did not stop: ").s(not_stopped(err)),
-        };
-        line.end();
+        mounts::mark_ejected(&mut self.devices, disk);
         // The reply names every mount of the drive, a name per line (`rsproto-storage-ops.md`).
+        // **Before the stop**, which a stick that never answers holds for a command's deadline:
+        // the eject is done either way, as everything on it is unmounted.
         let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, names.join("\n").as_bytes(), &[]);
+        let node = self.nodes.iter().find(|(id, _)| *id == disk).map(|&(_, n)| n);
+        let said_stop = mounts::stop_said(node.map_or(Err(KError::NotFound), eject_medium));
+        Line::new().s(b"storage-service: ").untrusted(said.as_bytes()).s(b" ").s(said_stop.as_bytes()).end();
     }
 
     /// A resolve on an admin endpoint, whatever its suffix, gets an admin session. `false` if gone.

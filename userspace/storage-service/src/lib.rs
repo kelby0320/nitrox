@@ -588,6 +588,8 @@ pub mod mounts {
         NotMounted,
         /// What is mounted there is not on a removable disk.
         NotRemovable,
+        /// It is on the disk the system runs from, which an eject would stop whole.
+        SystemDisk,
     }
 
     impl EjectRefusal {
@@ -595,7 +597,7 @@ pub mod mounts {
         pub fn kerror(self) -> libkern::KError {
             match self {
                 EjectRefusal::NotMounted => libkern::KError::NotFound,
-                EjectRefusal::NotRemovable => libkern::KError::NoAccess,
+                EjectRefusal::NotRemovable | EjectRefusal::SystemDisk => libkern::KError::NoAccess,
             }
         }
 
@@ -606,13 +608,16 @@ pub mod mounts {
                 EjectRefusal::NotRemovable => {
                     b"it is not removable: an internal disk is unmounted with the storage grant (with admin disk --unmount)"
                 }
+                EjectRefusal::SystemDisk => {
+                    b"the system runs from its disk: the machine started from it, or init mounted a filesystem on it"
+                }
             }
         }
     }
 
-    /// **A session's eject of the drive holding the mount named `name`**: every mount this service
-    /// made on that disk, in the order made, `name` among them, if `/storage/<name>` is on a
-    /// removable disk. **The drive, not the one filesystem**: a stick is pulled whole, so
+    /// **A session's eject of the drive holding the mount named `name`**: the disk, to be stopped,
+    /// and every mount this service made on it, in the order made, `name` among them, if
+    /// `/storage/<name>` is on a removable disk the system does not run from. **The drive, not the one filesystem**: a stick is pulled whole, so
     /// unmounting one partition would leave the others mounted, their unwritten files lost.
     /// **The name is the mount's** (the table's `mounted` column), never the filesystem's own
     /// label, which two sticks can share and a stick can lack. An internal disk's mount is the
@@ -629,12 +634,39 @@ pub mod mounts {
         let partition = d.record.kind() == libkern::device::DeviceKind::Partition;
         let disk = if partition { d.record.parent } else { d.record.id };
         let on_disk = |id: u32| devices.iter().any(|x| x.record.id == id && (id == disk || x.record.parent == disk));
+        if on_boot_medium(d, devices) || mounted.iter().any(|m| m.by == By::Init && on_disk(m.device)) {
+            return Err(EjectRefusal::SystemDisk);
+        }
         let names = mounted
             .iter()
             .filter(|m| m.by == By::Storage && on_disk(m.device))
             .filter_map(|m| m.at.strip_prefix("/storage/").map(String::from))
             .collect();
         Ok(Ejection { disk, names })
+    }
+
+    /// **Mark `disk` and its partitions ejected**, to be read no more: any read wakes a stopped stick.
+    pub fn mark_ejected(devices: &mut [Device], disk: u32) {
+        for d in devices.iter_mut().filter(|d| d.record.id == disk || d.record.parent == disk) {
+            d.found = Found::Ejected;
+        }
+    }
+
+    /// Whether device `id` is marked ejected.
+    pub fn ejected(devices: &[Device], id: u32) -> bool {
+        devices.iter().any(|d| d.record.id == id && d.found == Found::Ejected)
+    }
+
+    /// How a stick's stop went, in the eject line's words.
+    pub fn stop_said(stopped: Result<(), libkern::KError>) -> &'static str {
+        use libkern::KError;
+        match stopped {
+            Ok(()) => "stopped",
+            Err(KError::Unsupported) => "did not stop: it cannot be stopped",
+            Err(KError::IoError) => "did not stop: it failed the command",
+            Err(KError::PeerClosed) => "did not stop: it went away",
+            Err(_) => "did not stop: the kernel refused it",
+        }
     }
 
     /// What an eject takes: the disk, by registry id, and the mounts to unmount first, by name.

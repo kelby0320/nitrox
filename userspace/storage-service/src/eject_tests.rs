@@ -5,7 +5,9 @@ use std::vec::Vec;
 
 use libkern::device::DeviceKind;
 
-use crate::mounts::{EjectRefusal, Refusal, RereadRefusal, at, automount, eject, explicit, reread};
+use crate::mounts::{
+    EjectRefusal, Refusal, RereadRefusal, at, automount, eject, ejected, explicit, mark_ejected, reread, stop_said,
+};
 use crate::probe::Found;
 use libinittoml::manifest::Mode;
 
@@ -101,4 +103,45 @@ fn an_ejected_stick_is_listed_to_be_removed_and_refused_a_mount_or_a_reread() {
     assert_eq!(reread(&ds, &[], true, "blk-6"), Err(RereadRefusal::Ejected));
     assert_eq!(reread(&ds, &[], true, "blk-5"), Err(RereadRefusal::Ejected));
     assert!(core::str::from_utf8(Refusal::Ejected.why()).unwrap().contains("plug it in again"));
+}
+
+/// **A stick the system runs from is never ejected**, as the whole disk stops: one the machine
+/// started from, or one `init` mounted a filesystem on, a mount of this service's beside it.
+#[test]
+fn a_stick_the_system_runs_from_is_never_ejected() {
+    let ext4 = |l: &str| Found::Ext4 { label: String::from(l), clean: Some(true) };
+    let mut ds = with_a_stick(ext4("SIB"));
+    ds.push(Device { record: rec(22, DeviceKind::Partition, 7, 20, "root", 4_096), found: ext4("ROOT") });
+    let ours = Mounted { device: 21, at: at("SIB"), by: By::Storage, mode: Mode::Rw };
+    assert_eq!(eject(&ds, std::slice::from_ref(&ours), "SIB").map(|e| e.disk), Ok(20), "the control: a stick as any");
+    let inits = Mounted { device: 22, at: String::from("/data"), by: By::Init, mode: Mode::Rw };
+    assert_eq!(eject(&ds, &[inits, ours.clone()], "SIB"), Err(EjectRefusal::SystemDisk), "init's beside it");
+    let disk = ds.iter_mut().find(|d| d.record.id == 20).expect("the stick");
+    disk.record.flags |= libkern::device::BOOT;
+    assert_eq!(eject(&ds, &[ours], "SIB"), Err(EjectRefusal::SystemDisk), "the machine started from it");
+    assert_eq!(EjectRefusal::SystemDisk.kerror(), libkern::KError::NoAccess);
+}
+
+#[test]
+fn an_eject_marks_the_disk_and_its_partitions_and_nothing_else() {
+    let mut ds = with_a_stick(Found::Ext4 { label: String::from("SIB"), clean: Some(true) });
+    let before = ds.clone();
+    mark_ejected(&mut ds, 20);
+    for (d, was) in ds.iter().zip(&before) {
+        let on_it = d.record.id == 20 || d.record.parent == 20;
+        assert_eq!(ejected(&ds, d.record.id), on_it, "blk-{}", d.record.served);
+        if !on_it {
+            assert_eq!(d.found, was.found, "untouched");
+        }
+    }
+}
+
+#[test]
+fn a_stop_is_said_as_it_went() {
+    use libkern::KError;
+    assert_eq!(stop_said(Ok(())), "stopped");
+    assert_eq!(stop_said(Err(KError::Unsupported)), "did not stop: it cannot be stopped");
+    assert_eq!(stop_said(Err(KError::IoError)), "did not stop: it failed the command");
+    assert_eq!(stop_said(Err(KError::PeerClosed)), "did not stop: it went away");
+    assert_eq!(stop_said(Err(KError::NotFound)), "did not stop: the kernel refused it");
 }

@@ -338,13 +338,16 @@ The service waits on each media session, so they take slots in its wait set: **t
 for directory sessions. With both in use a resolve is answered `WouldBlock`, and `disk --eject`
 says to try again. **An ejected stick stays unmounted until it is plugged in again**: a session
 cannot mount one (§12). **And it is stopped**: once the chain has unmounted everything, the service
-submits `IoOpcode::Eject` on the disk's node, which sends the stick `START STOP UNIT` and has the
-kernel refuse it everything after ([`usb.md`](usb.md)). Its disk and partitions are marked
-ejected: the service reads them no more, since any read wakes a stopped stick; `disk --list` notes
-them `ejected; remove it`; and a `disk --mount` or a `Reread` of one is refused, saying to plug it
-in again. **A stop that fails leaves the eject done**: everything on the stick is unmounted and
-written back, so the reply still names the mounts, the disk is marked all the same, and the log
-says why it did not stop — `<names> stopped`, or `<names> did not stop: it cannot be stopped`.
+marks the disk and its partitions ejected, replies, and then submits `IoOpcode::Eject` on the
+disk's node, which sends the stick `START STOP UNIT` and has the kernel refuse it everything after
+([`usb.md`](usb.md)). The reply goes first because a stick that never answers holds the service for
+a command's deadline. Marked, the service reads them no more, since any read wakes a stopped stick;
+`disk --list` notes them `ejected; remove it`; and a `disk --mount` or a `Reread` of one is
+refused, saying to plug it in again. **A stop that fails leaves the eject done**: everything on the
+stick is unmounted and written back, and the log says why it did not stop — `<names> stopped`, or
+`<names> did not stop: it cannot be stopped`. **Since the whole disk stops, the disk the system runs
+from is never ejected**: one the machine started from, or one `init` mounted a filesystem on, is
+refused `NoAccess` before anything is unmounted.
 
 **A watch**, `/dev/storage/watch` (`info/watch`), is a channel the service **only sends on**: a bare
 `Changed`, whenever the names mounted under `/storage` differ after a turn of its loop from before
