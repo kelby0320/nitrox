@@ -436,8 +436,10 @@ service sends once an eject's chain has unmounted everything on the stick ([`sto
 §8a). It goes on the I/O path a flush takes, as `START STOP UNIT` with LoEj set and Start clear
 (`1B 00 00 00 02 00`). **Once the unit answers it is ejected**: every later request on it, a rescan
 included, is refused `PeerClosed`, as a pulled stick's are, until the stick is plugged in again and
-arrives as a new device; the first refused is logged, `ejected, and asked for more`, since nothing
-should ask. **A failure leaves the unit running**: an illegal request is a stick that cannot stop,
+arrives as a new device — those queued behind the eject, and a rescan waiting for the hub thread,
+with it; the first refused is logged, `ejected, and asked for more`, since nothing should ask. **A
+flush completes at once**: a stopped unit has nothing left to write, and a shutdown flushes every
+disk. **A failure leaves the unit running**: an illegal request is a stick that cannot stop,
 completed `Unsupported`; another sense, a stall or a deadline, `IoError` through recovery; a reset
 that fails, or a stick that detaches on LoEj, departs and completes it `PeerClosed`. Another unit of
 the same device runs on. Whether a stick's light goes out is the stick's: one that stays lit is

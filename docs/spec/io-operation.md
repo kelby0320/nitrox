@@ -261,29 +261,31 @@ completes, `result` the number of partitions published, once the new ones are in
 - **Every other disk answers `Unsupported`**: AHCI's and a RAM disk's. An internal disk is
   partitioned by `nxinstall`, which reboots after.
 
+**No new right guards it**: `WRITE`, as for `Flush`. It reaches only a holder of the writable disk,
+who can already overwrite every byte on it, and the storage service sends it — `Reread`
+([`rsproto-storage-ops.md`](rsproto-storage-ops.md)) — once nothing on the disk is mounted.
+
 **`Eject`** *(pre-Phase-7 Part C.4)* **stops a removable disk's medium and ejects it**, once nothing
 on it is mounted: the storage service submits it at the end of an eject's unmount chain. It names no
 buffer and no range, needs `WRITE`, and its PO completes, `result` `0`, once the disk has answered.
 - **A USB disk is sent `START STOP UNIT`** with LoEj set and Start clear (`1B 00 00 00 02 00`), as
   util-linux's `eject` does, and once it answers **every later request on that unit is refused
-  `PeerClosed`**, as a pulled stick's are, until it is plugged in again and arrives as new. A stick
-  that answers `ILLEGAL REQUEST` completes it `Unsupported` and keeps running; another failure,
-  `IoError`; a stick that departs, `PeerClosed`.
+  `PeerClosed`**, as a pulled stick's are, until it is plugged in again and arrives as new: those
+  queued behind the eject and a waiting rescan with it. **A `Flush` completes at once instead**: a
+  stopped unit has nothing left to write, and a shutdown flushes every disk. A stick that answers
+  `ILLEGAL REQUEST` completes it `Unsupported` and keeps running; another failure, `IoError`; a
+  stick that departs, `PeerClosed`.
 - **A partition answers it itself, `Unsupported`**, as it does a rescan, and for the same reason.
 - **Every other disk answers `Unsupported`**: nothing ejects AHCI's or a RAM disk's.
 
-**No new right guards it**: `WRITE`, as for `Flush`. It reaches only a holder of the writable disk,
-who can already overwrite every byte on it, and the storage service sends it — `Reread`
-([`rsproto-storage-ops.md`](rsproto-storage-ops.md)) — once nothing on the disk is mounted.
-
 ## Rights
 
-`Read` requires the `READ` right on `resource`; `Write`, `Flush` and `Rescan` require
-`WRITE` — only a writer has anything to make durable, or a table to have rewritten. A
-block `DeviceNode` bound read-only into a namespace (the Phase 2 default — see
-[`device-node.md`](device-node.md)) therefore rejects `Write` at the lookup-rights
-gate, before any IRP is built. The buffer-side rights (`MAP_READ`/`MAP_WRITE` on
-`buffer`) are checked independently, as above.
+`Read` requires the `READ` right on `resource`; `Write`, `Flush`, `Rescan` and `Eject` require
+`WRITE` — only a writer has anything to make durable, a table to have rewritten, or a medium to
+stop. A block `DeviceNode` bound read-only into a namespace (the Phase 2 default — see
+[`device-node.md`](device-node.md)) therefore rejects `Write` at the lookup-rights gate, before
+any IRP is built. The buffer-side rights (`MAP_READ`/`MAP_WRITE` on `buffer`) are checked
+independently, as above.
 
 ## Relationship to the IRP
 
@@ -296,7 +298,7 @@ returned. The `IoOp` is the **userspace-facing** request; the `Irp` is its
 
 ## Deferred
 
-- Opcodes beyond `Read`/`Write`/`Flush`/`Rescan` — `Trim`/`Discard`, device-specific
+- Opcodes beyond `Read`/`Write`/`Flush`/`Rescan`/`Eject` — `Trim`/`Discard`, device-specific
   control. Added with a consumer (SSD trim). A per-write force-unit-access bit is a
   `flags` modifier, below, not an opcode.
 - The `flags` modifiers (force-unit-access, no-cache).

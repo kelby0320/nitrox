@@ -214,6 +214,7 @@ fn storage_round(x: &Xhci, attached: &mut KVec<Option<Attached>>) {
             continue;
         };
         let Some(dev) = attached[port].as_mut() else { continue };
+        super::storage::drain_stopped(i);
         if let super::storage::Recovered::Ended = super::storage::recover(x, i, &mut dev._mem) {
             crate::kprintln!("usb: port {port}: its storage did not recover from a failed command; it is ended");
             depart(x, port as u8, attached);

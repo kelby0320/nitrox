@@ -377,6 +377,20 @@ impl Queue {
         self.len -= 1;
         e
     }
+
+    /// Take out the first command `want` picks, the rest kept in their order.
+    fn pop_where(&mut self, want: impl Fn(&IrpCmd) -> bool) -> Option<IrpCmd> {
+        let (mut taken, mut kept) = (None, Queue::new());
+        while let Some(c) = self.pop() {
+            if taken.is_none() && want(&c) {
+                taken = Some(c);
+            } else {
+                kept.push(c);
+            }
+        }
+        *self = kept;
+        taken
+    }
 }
 
 /// **What the caller does after a method of [`Disks`]**, with no lock held: complete an IRP, end
@@ -393,6 +407,8 @@ pub enum Action {
     Wake,
     /// Complete `irp` `PeerClosed`, its unit ejected; `said` names it the first time, to log.
     Ejected { irp: *mut Irp, said: Option<(u8, u8)> },
+    /// Complete the eject `irp`, and wake the hub thread to answer what waited on its unit.
+    Stopped { irp: *mut Irp },
 }
 
 /// **The storage devices**, eight slots under an epoch. One static in a boot ([`DISKS`]); a value so
@@ -405,8 +421,8 @@ pub(super) struct Disks {
 
 static DISKS: Disks = Disks::new();
 
-/// **The command for a block IRP**: its CDB, its length in the wrapper, its direction, whether it is
-/// a flush — or the error to refuse it with, when it does not fit `lun`.
+/// **The command for a block IRP**: its CDB, its length in the wrapper and its direction — or the
+/// error to refuse it with, when it does not fit `lun`.
 fn irp_command(op: u32, offset: u64, length: u64, lun: Lun) -> Result<(Cdb, u32, bool), KError> {
     if lun.blocks == 0 {
         return Err(KError::InvalidArgument);
@@ -515,6 +531,16 @@ impl Dev {
         b
     }
 
+    fn ejected(&self, lun: u8) -> bool {
+        self.luns.get(lun as usize).is_some_and(|u| u.ejected)
+    }
+
+    /// **The next queued command to start**: never one for an ejected unit.
+    fn next(&mut self) -> Option<IrpCmd> {
+        let luns = self.luns;
+        self.queue.pop_where(|c| !luns.get(c.lun as usize).is_some_and(|u| u.ejected))
+    }
+
     fn command_for(&self, irp: *mut Irp, lun: u8) -> Result<IrpCmd, KError> {
         let unit = self.luns.get(lun as usize).copied().unwrap_or_default();
         // SAFETY: `irp` is live and owned by its submitter until completed.
@@ -601,14 +627,18 @@ impl Disks {
         let Some(dev) = d.as_mut().filter(|_| self.current(ctx)) else {
             return refuse(KError::PeerClosed);
         };
+        // SAFETY: `irp` is live and owned by its submitter until completed.
+        let op = unsafe { (*irp).op };
         if let Some(u) = dev.luns.get_mut(lun as usize).filter(|u| u.ejected) {
+            if op == IrpOp::Flush as u32 {
+                return Action::Complete { irp, status: 0, transferred: 0 };
+            }
             let said = !core::mem::replace(&mut u.refusal_said, true);
             return Action::Ejected { irp, said: said.then_some((dev.slot, lun)) };
         }
         // **A rescan is the hub thread's**: held for it, and it woken — it reads the table through
         // its own commands once the device is quiet.
-        // SAFETY: `irp` is live and owned by its submitter until completed.
-        if unsafe { (*irp).op } == IrpOp::Rescan as u32 {
+        if op == IrpOp::Rescan as u32 {
             if dev.luns.get(lun as usize).and_then(|u| u.record).is_none() {
                 return refuse(KError::Unsupported);
             }
@@ -690,19 +720,20 @@ impl Disks {
             dev.inflight = None;
             dev.fault = None;
             dev.counted[c.lun as usize % MAX_LUNS].record(c.op, true, c.len as u64, now.saturating_sub(cmd.started));
-            if c.op == IrpOp::Eject as u32
-                && let Some(u) = dev.luns.get_mut(c.lun as usize)
-            {
-                u.ejected = true;
-            }
+            // **Ejected before the next starts**, so nothing queued behind the eject reaches the unit.
+            let stopped = c.op == IrpOp::Eject as u32
+                && dev.luns.get_mut(c.lun as usize).is_some_and(|u| !core::mem::replace(&mut u.ejected, true));
             // **Not while the hub thread holds the device.** A rescan waiting does not hold it: the
             // queue drains for it, and it takes the device once nothing is left.
             if !dev.recovering
-                && let Some(next) = dev.queue.pop()
+                && let Some(next) = dev.next()
             {
                 dev.start(next, false, now);
             }
-            return Some(Action::Complete { irp: c.irp, status: 0, transferred: c.len as u64 });
+            return Some(match stopped {
+                true => Action::Stopped { irp: c.irp },
+                false => Action::Complete { irp: c.irp, status: 0, transferred: c.len as u64 },
+            });
         }
         None
     }
@@ -730,6 +761,10 @@ fn act(a: Action, x: Option<&Xhci>) {
                 );
             }
             complete(irp, KError::PeerClosed as i32, 0);
+        }
+        Action::Stopped { irp } => {
+            complete(irp, 0, 0);
+            act(Action::Wake, x);
         }
         // SAFETY: the hub thread holds `po`'s reference while its command is in flight, waiting on it.
         Action::Hub { po } => unsafe { crate::sched::complete_pending_op(po, 0, 0) },
@@ -1138,7 +1173,8 @@ pub(super) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut DeviceMem) -> Recov
             BeginRescan::Ready { irp, lun, unit } => break (irp, lun, unit),
             BeginRescan::Busy => {
                 // A fault the DPC recorded is recovered first; a device that does not recover is
-                // ended by the caller, and its departure completes the rescan.
+                // ended by the caller, and its departure completes the rescan. An ejected unit's first.
+                drain_stopped(i);
                 if let Recovered::Ended = recover(x, i, mem) {
                     return Recovered::Ended;
                 }
@@ -1333,6 +1369,13 @@ pub(super) fn due(now: u64) -> [Option<u8>; MAX_DEVICES] {
     DISKS.due(now)
 }
 
+/// **Answer what waited on device `i`'s ejected units**, from the hub thread.
+pub(super) fn drain_stopped(i: usize) {
+    while let Some(a) = DISKS.take_stopped(i) {
+        act(a, None);
+    }
+}
+
 /// What [`recover`] did.
 pub(super) enum Recovered {
     /// The command was finished or failed, and the device goes on.
@@ -1399,7 +1442,8 @@ impl Disks {
             {
                 dev.fault = Some(Fault::Deadline);
             }
-            (dev.fault.is_some() || dev.rescan.is_some()).then_some(dev.slot)
+            let stopped = dev.queue.ring.iter().flatten().any(|c| dev.ejected(c.lun));
+            (dev.fault.is_some() || dev.rescan.is_some() || stopped).then_some(dev.slot)
         })
     }
 
@@ -1444,7 +1488,7 @@ impl Disks {
                 dev.recovering = false;
                 if dev.inflight.is_none()
                     && dev.fault.is_none()
-                    && let Some(next) = dev.queue.pop()
+                    && let Some(next) = dev.next()
                 {
                     dev.start(next, false, now);
                 }
@@ -1515,11 +1559,32 @@ impl Disks {
         dev.recovering = false;
         if dev.inflight.is_none()
             && dev.fault.is_none()
-            && let Some(next) = dev.queue.pop()
+            && let Some(next) = dev.next()
         {
             dev.start(next, false, now);
         }
         Action::None
+    }
+
+    /// **One request that waited on an ejected unit of device `i`**, answered as one sent after the
+    /// eject is ([`Disks::submit`]): each queued command, then a rescan held for the unit.
+    fn take_stopped(&self, i: usize) -> Option<Action> {
+        let mut d = self.devs[i].lock();
+        let dev = d.as_mut()?;
+        let luns = dev.luns;
+        let (irp, op, lun) = match dev.queue.pop_where(|c| luns.get(c.lun as usize).is_some_and(|u| u.ejected)) {
+            Some(c) => (c.irp, c.op, c.lun),
+            None => {
+                let (irp, lun) =
+                    dev.rescan.take_if(|&mut (_, lun)| luns.get(lun as usize).is_some_and(|u| u.ejected))?;
+                (irp, IrpOp::Rescan as u32, lun)
+            }
+        };
+        if op == IrpOp::Flush as u32 {
+            return Some(Action::Complete { irp, status: 0, transferred: 0 });
+        }
+        let said = dev.luns.get_mut(lun as usize).is_some_and(|u| !core::mem::replace(&mut u.refusal_said, true));
+        Some(Action::Ejected { irp, said: said.then_some((dev.slot, lun)) })
     }
 
     /// **Give up device `i`'s waiting rescan**: its IRP, for the caller to complete.
@@ -2096,7 +2161,7 @@ mod tests {
         disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
         fake.answer(1, 0);
         let done = disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 2);
-        assert_eq!(done, Some(Action::Complete { irp: &mut eject, status: 0, transferred: 0 }));
+        assert_eq!(done, Some(Action::Stopped { irp: &mut eject }));
 
         let mut read = irp(IrpOp::Read, 0, 512, &[PhysFrag { base: 0x1000, len: 512 }]);
         assert_eq!(disks.submit(&mut read, ctx, 3), Action::Ejected { irp: &mut read, said: Some((5, 0)) });
@@ -2104,6 +2169,43 @@ mod tests {
         assert_eq!(disks.submit(&mut rescan, ctx, 3), Action::Ejected { irp: &mut rescan, said: None }, "said once");
         let mut flush = irp(IrpOp::Flush, 0, 0, &[]);
         assert_eq!(disks.submit(&mut flush, other, 3), Action::None, "the other unit runs on");
+    }
+
+    /// **What waited behind an eject on its unit is never started**, another unit's read starting in
+    /// its place, and the hub thread answers it: a flush done, the rest refused, as after.
+    #[test]
+    fn what_waited_behind_an_eject_is_never_started_and_answered_by_the_hub_thread() {
+        init_global_heap();
+        let disks = Disks::new();
+        let mut fake = Fake::new();
+        let mut dev = fake.dev(5);
+        dev.luns[1] = Lun { blocks: 2048, block_len: 512, record: Some(8), ..Lun::default() };
+        let (i, epoch) = disks.take(dev).unwrap();
+        let (ctx, other) = (context(i, 0, epoch), context(i, 1, epoch));
+        let mut rescan = irp(IrpOp::Rescan, 0, 0, &[]);
+        assert_eq!(disks.submit(&mut rescan, ctx, 0), Action::Wake, "held for the hub thread");
+        let mut eject = irp(IrpOp::Eject, 0, 0, &[]);
+        disks.submit(&mut eject, ctx, 0);
+        let frag = [PhysFrag { base: 0x1000, len: 512 }];
+        let (mut read, mut flush, mut theirs) =
+            (irp(IrpOp::Read, 0, 512, &frag), irp(IrpOp::Flush, 0, 0, &[]), irp(IrpOp::Read, 0, 512, &frag));
+        for (r, c) in [(&mut read, ctx), (&mut flush, ctx), (&mut theirs, other)] {
+            assert_eq!(disks.submit(r, c, 0), Action::None, "queued behind the eject");
+        }
+        disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
+        fake.answer(1, 0);
+        let done = disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 2);
+        assert_eq!(done, Some(Action::Stopped { irp: &mut eject }));
+        let inflight = disks.devs[i].lock().as_ref().unwrap().inflight.unwrap().owner;
+        assert!(matches!(inflight, Owner::Irp { cmd, .. } if core::ptr::eq(cmd.irp, &theirs)), "the other unit's read");
+        assert!(disks.due(2)[i].is_some(), "the hub thread looks at it");
+        assert_eq!(disks.take_stopped(i), Some(Action::Ejected { irp: &mut read, said: Some((5, 0)) }), "said once");
+        assert_eq!(disks.take_stopped(i), Some(Action::Complete { irp: &mut flush, status: 0, transferred: 0 }));
+        assert_eq!(disks.take_stopped(i), Some(Action::Ejected { irp: &mut rescan, said: None }), "the held rescan");
+        assert_eq!(disks.take_stopped(i), None);
+        assert_eq!(disks.begin_rescan(i), BeginRescan::Nothing, "the rescan went with them");
+        let mut after = irp(IrpOp::Flush, 0, 0, &[]);
+        assert_eq!(disks.submit(&mut after, ctx, 3), Action::Complete { irp: &mut after, status: 0, transferred: 0 });
     }
 
     /// **An eject the unit refuses leaves it running**, completed by the hub thread from the sense.

@@ -651,12 +651,8 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, name: &[u8], disk: *mut Ah
 /// [`BlockBackend::submit`] for an AHCI disk: builds a `READ DMA EXT` (or write or flush) against
 /// the IRP's fragments and issues it. Completion arrives via the IRQ or the boot polled fallback.
 fn submit(irp: *mut Irp, ctx: *mut ()) {
-    let disk = ctx as *mut AhciDisk;
-    // SAFETY: `disk` is the live published disk.
-    let d = unsafe { &*disk };
-
-    // **A rescan and an eject are refused**: a SATA disk's table is read once at boot; partitioning
-    // an internal disk is `nxinstall`'s, and a reboot follows.
+    // **A rescan and an eject are refused**, before the disk is touched: a SATA disk's table is read
+    // once at boot; partitioning an internal disk is `nxinstall`'s, and a reboot follows.
     // SAFETY: `irp` is a live block IRP during submit.
     let op = unsafe { (*irp).op };
     if op == crate::io::irp::IrpOp::Rescan as u32 || op == crate::io::irp::IrpOp::Eject as u32 {
@@ -667,6 +663,9 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
         }
         return;
     }
+    let disk = ctx as *mut AhciDisk;
+    // SAFETY: `disk` is the live published disk.
+    let d = unsafe { &*disk };
 
     // **More fragments than one command table can describe: refuse, before the lock.**
     // `dispatch_block_irp` already rejects this against the published `max_frags`; this is the
@@ -964,5 +963,18 @@ mod tests {
     fn an_all_padding_field_comes_back_empty() {
         assert_identity(b"ST1000LM035", b"                    ", b"ST1000LM035");
         assert_identity(b"                                        ", b"", b"");
+    }
+
+    #[test]
+    fn a_rescan_and_an_eject_are_refused_without_touching_a_disk() {
+        use crate::io::irp::{IrpBuffer, IrpOp};
+        crate::mm::test_support::init_global_heap();
+        crate::dpc::init().unwrap();
+        for op in [IrpOp::Rescan, IrpOp::Eject] {
+            let mut irp = Irp::new_block(op, core::ptr::null(), 0, 0, IrpBuffer::NONE, core::ptr::null_mut(), 0);
+            submit(&mut irp, core::ptr::null_mut());
+            crate::dpc::run_pending();
+            assert_eq!(irp.status, crate::syscall::error::KError::Unsupported as i32, "{op:?}");
+        }
     }
 }

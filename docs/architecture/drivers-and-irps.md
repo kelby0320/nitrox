@@ -441,7 +441,7 @@ on it is mounted ([`io-operation.md`](../spec/io-operation.md)): an IRP with no 
 built by `io::block::dispatch_block_control` as a flush and a rescan are.
 - **A USB disk sends `START STOP UNIT`** with LoEj, on the path a flush takes ([`usb.md`](usb.md)
   § *Mass storage*), and refuses every later request on the unit `PeerClosed` until it arrives
-  again.
+  again, those queued behind the eject included; a flush completes at once, with nothing to write.
 - **A partition's window answers it itself, `Unsupported`**, as it does a rescan: forwarded, the
   holder of one partition could stop its siblings' disk.
 - **AHCI and the RAM disk refuse it**, `Unsupported`, as named ops they do not do.
