@@ -468,3 +468,231 @@ and `map_file` rollbacks and writable-count balance, `FileObject::settle` matchi
 `sys_io_submit`'s buffer bound and its `IrpBox._buffer` reference, the `Thread` drop order, the
 scheduler loading the next root before a dying address space drops, and `tlb::shootdown`'s ack
 bitmask. The intermediate page-table frame leak on unmap is a recorded deferral.
+
+### filesystems — main at 510381f4, 2026-10-20
+
+Lenses: logic, error-paths, trust-boundary, tests; returned nothing: none.
+Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates into 19).
+
+- [ ] **fs-1** `userspace/fs-server-ext4/src/ext4.rs:1747` — `rename_at` validates only the new
+  name, so a directory session can rename its own `..` or `.` entry to an ordinary name. A session
+  in a namespace bound with subtree base `/home/alice` renames `..` to `up`. `/home/alice/up` then
+  names `/home`, and repeating it from there reaches `/`, which is a way out of the confined
+  subtree. The directory also loses its `..` record. With `.` it gets an entry pointing at itself
+  and no `.` record. Neither `parse_rename_request` nor `serve_session` (server.rs:681) checks the
+  names. Demonstrated: host tests on an mke2fs fixture. `rename_at(alice, "..", "up")` returned Ok.
+  `resolve_dir("/home/alice/up/bob")` gave Bob's inode. `stat_file` of Bob's file succeeded. A second
+  hop reached `/system`. `e2fsck -fn` reported "Second entry 'up' ... should be '..'" and "'..' in
+  /d is <The NULL inode>". FAT is not affected, because `dir::entries` skips dot entries. Lenses:
+  logic, error-paths, trust-boundary, tests (four reviewers found it independently). high.
+
+- [ ] **fs-2** `userspace/libfsserver/src/server.rs:650` — A directory session is bound to a bare id
+  (an ext4 inode number, a FAT first cluster). `live_dir` rejects only a freed id, not a reused
+  one. A session is open on `/tmp/d`, then `/tmp/d` is rmdir'd. The next mkdir anywhere takes the
+  same id (ext4 takes the lowest free inode; FAT takes the cluster once the allocation hint wraps).
+  The stale session then lists, creates, renames and unlinks inside the new directory, outside its
+  namespace. Demonstrated: on ext4, session id 17 equalled the new `/secret/inner` id, and
+  `mkdir_at(17, "planted")` created `/secret/inner/planted`. Another probe made `mkdir_at(18, ...)`
+  land in `/home/bob/private`. On FAT (16 MiB, 4 KiB clusters), session 4 equalled `/secret/inner`
+  and `read_dir` listed `victim.txt`. `rename_at` and `unlink_at` through the stale id both
+  returned Ok. The existing test `a_removed_directory_is_refused_to_a_session_still_holding_it`
+  covers only the non-reuse case. Lenses: logic, error-paths, tests. high.
+
+- [ ] **fs-3** `userspace/fs-server-ext4/src/ext4.rs:1705` — A rename writes the new name first and
+  deletes the old one second (ext4 `rename_path`; FAT `Fat::rename`, volume.rs:823-848). If the
+  second write is refused or the server crashes between them, the file has two names backed by one
+  ext4 inode (links_count 1) or one FAT chain. Nothing copes with it, and `unlink_at`/`drop_link`
+  treat a count of 1 as the last name. A retry of the same replacing rename, or an unlink of either
+  name, then returns the file as an orphan. The server forgets and releases it while the other
+  name still references it, and the next allocation hands its blocks to another file. Nothing
+  repairs this at mount (TODO(fs-repair)). Demonstrated: ext4 with `Failing::once(img, 1)` failed
+  the first rename with Err(Io). The retry gave Ok(Some(17)) and release Ok, and `e2fsck` reported
+  "Entry 'g' ... has deleted/unused inode 17". After create plus grow, `/d/g` and `/e/other` both
+  mapped inode 17 at lba 12. The unlink-after-half-rename variant did the same. On FAT16 with 4 KiB
+  clusters, with write 1 of 2 refused, the retry gave Ok(Some(2)) and release(2) Ok. `OTHER.TXT` took
+  cluster 2 and `fsck.fat` said "/OTHER.TXT and /G.TXT share clusters". Lens: error-paths. high.
+
+- [ ] **fs-4** `userspace/fs-server-ext4/src/ext4.rs:226` — `parse_superblock` and `check_device`
+  refuse only INCOMPAT_64BIT and blocks over 4 KiB. They accept metadata_csum, an unreplayed
+  journal (needs_recovery), meta_bg and bigalloc, and mount them read-write. An ext4 made with
+  `mke2fs -t ext4 -O ^64bit` on a removable disk is mounted writable. `mark_mounted` writes
+  `s_state` without updating the superblock checksum, so Linux and `e2fsck` refuse the filesystem
+  after the first write. A disk with needs_recovery would have its changes overwritten by a later
+  Linux journal replay. The crate's CLAUDE.md says these are rejected. Demonstrated: `dumpe2fs`
+  showed has_journal and metadata_csum. `check_device` returned Ok, and `create_file` and
+  `grow_file` returned Ok. `e2fsck -fn` then failed with "Superblock checksum does not match
+  superblock". `check_device` also returned Ok with INCOMPAT_RECOVER (0x4) set. Lens: logic. high.
+
+- [ ] **fs-5** `userspace/fs-server-ext4/src/ext4.rs:1075` — `dir_insert` computes `used =
+  round4(8 + name_len)` from the on-disk entry and `rec_len - used` without checking `used <=
+  rec_len`. The three sibling scans (`dir_lookup` 346, `read_dir_inner` 492, `dir_remove` 1366) do
+  carry their bound. A directory entry whose name_len exceeds its rec_len underflows the
+  subtraction. Any create, mkdir or rename into that directory on a crafted or corrupt image (for
+  example a removable disk mounted read-write) then panics the server and every client gets
+  PeerClosed. In release, `232 - 264` wraps, the test passes, and `buf[new_off..]` with new_off
+  4128 panics out of bounds. A shallower entry writes a bogus record in bounds and leaves the
+  directory corrupt. Demonstrated: patching the root `.` entry to name_len=200 and calling
+  `create_file(b"/", b"newfile")` panicked at ext4.rs:1075 with "attempt to subtract with
+  overflow". Release panicked at 1081 with "range start index 4128 out of range for slice of length
+  4096". A shallow crafted entry returned Ok and `e2fsck` reported "directory corrupted". The
+  crate has no hostile-bytes test, unlike FAT's `garbage_in_any_structure_is_an_error_never_a_panic`.
+  Lenses: trust-boundary, tests. high.
+
+- [ ] **fs-6** `userspace/fs-server-ext4/src/ext4.rs:1627` — `dir_repoint` compares `&buf[off + 8..off
+  + 8 + name_len]` without checking `off + 8 + name_len <= bs`, so a crafted directory block makes
+  the server panic. A directory whose first block ends in an 8-byte entry at offset 4088 with
+  name_len 2 and a nonzero inode is moved with `rename_path`. A rename that replaces an existing
+  destination reaches the same code. The server exits and every client of that mount gets
+  PeerClosed. Demonstrated: a host test panicked at ext4.rs:1627:60 with "range end index 4098 out
+  of range for slice of length 4096". Reading the replacing-rename path (the trust-boundary
+  reviewer's finding) is unverified; a host test feeding `rename_path` a crafted destination
+  directory would confirm it. Lenses: logic, trust-boundary. high.
+
+- [ ] **fs-7** `userspace/fs-server-ext4/src/ext4.rs:1665` — `rename_path` does not limit the
+  destination leaf to 255 bytes, and `dir_insert` stores `name.len() as u8`, so a long name is cut
+  mod 256 and the rename reports success. `create_file`, `mkdir_at` and `rename_at` all check. A
+  256-byte name gets name_len 0, so the file vanishes from lookup and listing. A 300-byte name
+  becomes its first 44 bytes, and if an entry of that name exists the directory holds two entries
+  with one name. The kernel's `validate_path` bounds only the whole path, not a component.
+  Demonstrated: `rename_path(/system/f, /system/<256 x 'a'>)` returned Ok(None). `/system` then
+  listed only `.` and `..`, and `read_file` under both names gave NotFound. `e2fsck` reported
+  "Entry '' in /system (13) has a zero-length name". For 300 bytes, `stat_file` of the full name gave
+  NotFound and of the 44-byte prefix gave Ok(12288). FAT is not affected. Lenses: logic,
+  error-paths. high.
+
+- [ ] **fs-8** `userspace/fs-server-ext4/src/ext4.rs:1512` — `unlink_at` and `rename_path` can
+  return Err after the irreversible step, and the orphan they held is lost with the error. In
+  `unlink_at`, the name is removed and `drop_link` has produced the inode when `touch_inode(dir)?`
+  (an mtime stamp) fails. In `rename_path`, the touches and `adjust_links` after `drop_link` fail
+  the same way. The server runs `forget_then_release` only on Ok (server.rs:667), so the inode and
+  all its blocks leak. The client is told the unlink failed although the name is gone, and a retry
+  gets NotFound. Nothing here can run `e2fsck`. Demonstrated: a write-failure sweep of the ext4
+  ops, with closures that use `?` as the server does. "unlink: write 1/9 once: Err(Io): Unattached
+  inode 17" and "rename_path_replace: write 2/10 once: Err(Io): Unattached inode 18". FAT does not
+  have this. Lens: error-paths. medium.
+
+- [ ] **fs-9** `userspace/fs-server-ext4/src/ext4.rs:1115` — If `dir_insert`'s directory growth
+  loses its last write (the inode's new size), nothing undoes it. Once the directory's extent tree
+  has a leaf block (depth 1 or more), the leaf already maps block N past the unchanged i_size.
+  Every later insert that needs a block appends at N again, and `extent::add` refuses it as
+  Corrupt. Files recover through `grow_file_from`, which cuts past-the-end blocks first; directories
+  never do. TODO(ext4-failed-write-undo) records only a cost in free space; this also stops the
+  directory from growing. A full directory of about 115 files with a depth-1 tree has its growth
+  inode write refused once. Every later create, mkdir or rename into it that needs a block fails
+  until an offline `e2fsck`. Demonstrated: `probe_dir_growth_lost_inode_write` lost each of the
+  create's 11 writes in turn. Only write 9 (the directory inode) gave "later creates failing: 30
+  Some(Some(Corrupt))", and `e2fsck` said "end of extent exceeds allowed value (logical block 6,
+  physical block 388, len 1)". Lens: error-paths. medium.
+
+- [ ] **fs-10** `userspace/fs-server-ext4/src/ext4.rs:1692` — The guard against moving a directory
+  into its own subtree is a byte-prefix test, `new_parent_path.starts_with(old_path)`, with no
+  component-boundary check. It refuses a legal move into a sibling whose name starts with the
+  source's name. `libfs::rename` maps the resulting Unsupported to CrossDevice, so callers fall
+  back to a slow, non-atomic copy plus unlink. The reviewer also noted that `rename_path('/ab',
+  '/./ab/x')` would get past the guard, but the kernel's `validate_path` rejects `.` components for
+  bindings and the lookup and rename paths were not checked (unverified). FAT uses the ancestor
+  walk `dir::within`. Demonstrated: `rename_path(/ab, /abc/ab)` and `(/d, /dd/d)` returned
+  Err(Unsupported). The library-level `/ab` to `/./ab/x` call returned Ok(None) and `e2fsck`
+  reported "Entry 'x' in . is a link to '.'". Lenses: logic, error-paths, tests. medium.
+
+- [ ] **fs-11** `userspace/fs-server-ext4/src/extent.rs:163` — `on_device()` bounds an extent only to
+  `[first_data_block, blocks_count)`, so an extent over a group's bitmaps, inode table or GDT, or
+  over another file's blocks, is accepted and then freed by truncate, unlink or release through
+  `free_run`. The metadata blocks are cleared in the bitmap and the allocator hands them out. A
+  crafted stick has a file whose extent points at group 0's inode-table block; after unlink, a
+  later grow or create reuses it and overwrites inodes. Linux's `ext4_inode_block_valid` check is
+  absent. Demonstrated: patching a created file's extent start to the inode-table block (34). Its
+  bitmap bit was 1 before and 0 after `unlink_at` plus `release_inode`. Lens: tests. medium.
+
+- [ ] **fs-12** `userspace/fs-server-fat/src/table.rs:282` — `allocate()` aborts with `?` on a used
+  cluster whose FAT entry is reserved or out of range (Corrupt) after it has marked free clusters.
+  The partial chain is neither freed nor are later clusters tried, and `change()` flushes the cache
+  anyway, so it reaches the disk. On FAT16 with file A at clusters 2-3, cluster 4 free and cluster 5
+  holding 0xFFF1, `grow_file(A)` marks 4 as end-of-chain, hits 5 and returns Corrupt. Cluster 4 is
+  allocated to nobody, and every later grow or mkdir that scans through 5 fails the same way, so
+  one bad entry makes the volume unwritable. Demonstrated: `grow_file(/A.TXT, 10000)` returned
+  Err(Corrupt) and cluster 4's FAT entry afterwards read [255,255], not 0. `hostile_tests` only
+  checks for no panic. Lens: tests. medium.
+
+- [ ] **fs-13** `userspace/libfsserver/src/serve.rs:78` — The MAX_SUFFIX bound in `resolve()` and
+  `serve_read_range()`, and the `.min(content.len())` clamp on the read length, are untested. A
+  suffix of 1025 bytes or more returns TooLarge today. If the bound were lost, `path_buf[1..1+len]`
+  would panic and the server would hang. Adjacent defect: `try_resolve_directory` (server.rs:381)
+  truncates an over-long suffix with `.min(MAX_SUFFIX)` instead of refusing it. A suffix of 1025
+  bytes or more whose first 1024 bytes name a directory therefore opens a session instead of
+  TooLarge. That function is syscall-bound and can only be checked in a boot. Demonstrated:
+  deleting either `req.suffix.len() > MAX_SUFFIX` check, or the `.min(content.len())`, left
+  libfsserver, fs-server-fat and fs-server-ext4 `--lib` all green. The truncation was found by
+  reading. Lens: tests. medium.
+
+- [ ] **fs-14** `userspace/fs-server-fat/src/volume.rs:706` — FAT's `rmdir_at` NotEmpty check, the
+  `is_dir` refusal in `unlink_at`, `names::valid` in `mkdir_at` and in rename, and the `grow_file`
+  "chain shorter than size" check have no test that reaches them. Without NotEmpty, rmdir of a
+  non-empty directory would free its chain and orphan its children's clusters. Without the `is_dir`
+  check, `unlink_at` on a directory frees a live directory chain. Without the name checks, names
+  with `:` or `*` would be written to the volume. Demonstrated: five mutations (each guard deleted)
+  left `cargo test -p fs-server-fat --lib` fully green. No FAT test mentions NotEmpty, though the
+  ext4 rmdir test covers it. Lens: tests. medium.
+
+- [ ] **fs-15** `userspace/fs-server-ext4/src/ext4.rs:804` — The allocator's `start + len <
+  capacity` bound and `.min(gfree)` cap in `alloc_run`, and the `!bit_clear` guard in `free_run`,
+  are untested. Without the first, a short final group's spare bitmap bits can be allocated as
+  blocks past the end of the filesystem. Without the second, the group's free count wraps below
+  zero. Without the third, a double free counts its blocks free twice. An image from another tool
+  with spare bits clear, or a free count that disagrees with its bitmap, would then get an extent
+  off the device. Demonstrated: three mutations, each leaving `cargo test -p fs-server-ext4 --lib`
+  green. Lens: tests. medium.
+
+- [ ] **fs-16** `userspace/libfsserver/src/cache.rs:195` — `MetaCache::forget` has no test for a
+  freed range whose end is not 4 KiB-aligned, and the rounding of the end of the range is
+  unchecked. FAT's data region need not start on a 4 KiB boundary. If a freed cluster ends mid-block
+  and the partial block stays cached, the kernel writes file data there behind the server's back. A
+  later `read_meta` of that block (reused as metadata) then sees stale bytes. Demonstrated:
+  changing `(offset + len).div_ceil(BLOCK)` to `(offset + len) / BLOCK` left libfsserver,
+  fs-server-ext4 and fs-server-fat `--lib` green. Lens: tests. low.
+
+- [ ] **fs-17** `userspace/libfsserver/src/server.rs:329` — `maybe_grow` notes only
+  `FsError::ReadOnly`. Every other create, grow or truncate failure falls through, and the resolve
+  answers success with the file mapped at its old size. The spec says the reply's content_len is
+  the new size, and the kernel installs the reply's size without comparing. On a full disk, a
+  `libfs::write_file` or `copy_file` of a new file gets a create that holds 0 bytes, and the map
+  then fails, so the caller reports InvalidArgument rather than no-space. A FAT create with a
+  forbidden name returns NotFound instead of InvalidArgument. The only silent-success case is
+  ext4 with sub-page blocks, which is the recorded TODO(ext4-subpage-runs). Unverified: boot a
+  full 1 KiB-block ext4 and run `copy_file`; it shows whether the copy is reported as success when
+  short. Lens: error-paths. low.
+
+- [ ] **fs-18** `userspace/libfsserver/src/server.rs:614` — When `reply_dir_handle`'s send fails,
+  `open_dir_session` closes the session and the client endpoint but sends no error reply, while the
+  other failure arms reply WouldBlock or KernelError. A forwarded lookup has no deadline, so the
+  caller's PendingOperation never completes, and a `Dir::open` in Files, nxsh or a libfs walk waits
+  forever with nothing logged. Unverified: injecting a failing `SYS_CHANNEL_SEND` for that reply in
+  a boot shows whether the lookup hangs or completes with an error. No existing gate produces the
+  trigger (a full queue or kernel out of memory). Lens: error-paths. low.
+
+- [ ] **fs-19** `userspace/libfs/src/lib.rs:775` — `copy_tree` has no check that the destination
+  lies inside the source, and its listing helpers pass server-supplied names to `join()`
+  unchecked. (a) `copy_tree(ns, "/a", "/a/b")` creates `/a/b`, then re-lists `/a`, which now holds
+  `b`, and recurses until MAX_TREE_DEPTH (32) fails with TooDeep. That leaves about 32 nested
+  junk directories; coreutils only rejects target == src and nxfiles has no guard. (b) A name
+  containing `/` from a crafted disk goes into `remove_tree` and `copy_tree` unchecked, so they act
+  on a different file in a subdirectory than the one listed. Names `.` and `..` are filtered;
+  embedded `/` is not. Unverified: (a) holds by reading, and `copy -r /dir /dir/sub` in a boot
+  would confirm it. (b) needs a crafted stick with an entry named `a/b`, and whether a server can
+  list such a name is unchecked. libfs has only pure-helper host tests. Lens: tests. low.
+
+What held up: the kernel's `validate_path` rejects `.`, `..`, empty components and paths over 1024
+bytes before they reach a server, so the path-form calls (`rename_path`, create, grow) never see
+dot entries. The ext4 scans `dir_lookup`, `dir_remove` and `read_dir_inner` all bound `name_len`
+against the block. `extent.rs` checks magic, max, depth, order and `on_device`, and depth strictly
+decreases, so a self-referencing tree cannot recurse. `free_run` refuses runs outside the device.
+`read_inode` and `touch_file` check the inode number. A write-failure sweep of ext4 create, mkdir,
+unlink, rename and directory move found no block both free and in use. `create_file`, `mkdir_at`
+and `rename_at` give back what they took when the link fails. A lost final grow write is repaired
+by the next grow. FAT is sound: every chain walk is bounded by the cluster count, `change()`
+refuses read-only mounts and flushes after a failure, `Cache::allocate` gives back what it took,
+`rename` uses the `dir::within` ancestor walk, and long-name ordinals and checksums are checked.
+`MetaCache` writes through or drops cached copies on failure. The cache, the FAT crash-ordering
+test, the long-name checks, the BPB checks, the read-only flag on file-blocks replies, the ext4
+zero-fill on grow, the unlink-directory, rmdir NotEmpty and rename-into-subtree guards, and the
+mount and unmount state bits each failed a test when broken.
