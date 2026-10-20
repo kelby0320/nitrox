@@ -36573,3 +36573,28 @@ second declined.
   fails. Each eject is looked for past the trace's length before it. CI's QEMU 8.2 prints a CDB
   differently from later ones, and the reader takes both; both gates pass on 8.2.
 - **Whether the light goes out is the laptop's to say**, as the definition of done has it.
+
+## 2026-10-20 — Before Phase 7, Part C.5: a README and a licence, built
+
+- **`LICENSE`**: the MIT licence, "Copyright (c) 2026 Kelby Madal". It covers the whole
+  repository but the fonts and the dependencies, **the default wallpaper's photograph included**:
+  the maintainer's call, asked because a root licence would otherwise be read as covering it
+  unsaid.
+- **`README.md`**, for a person arriving: what Nitrox is and what it rejects, where it stands,
+  what building needs, the commands, where the docs start, and the licences. It names the seeded
+  account and where its password is set, not the password. **`check-docs` holds it** as a
+  current-behaviour doc, for its cited source paths, and **every relative link is checked now**,
+  not only those to a `.md`: the README links `LICENSE` and `assets/`, and the docs' 52 such links
+  all resolved already.
+- **The image carries the licences its third-party parts ask for** (the maintainer's call; found
+  writing the README's licence section). Eight crates.io crates linked by the desktop's programs —
+  three under Apache-2.0 alone, two under MIT alone — shipped with no licence text, though
+  `userspace/CLAUDE.md` said a dependency's text ships; and Limine, BSD 2-clause, shipped without
+  its notice. The crates' texts are committed verbatim from each published package under
+  `assets/licenses/<crate>/` and staged at `/system/licenses` beside the project's own; the image
+  build and `cargo xtask test` fail while `userspace/Cargo.lock` names a crate with no texts there,
+  or a directory there names a crate it does not. Limine's licence goes from its release tarball
+  onto every ESP at `/boot/limine/LICENSE`, by `build_esp`, which the release, live and installed
+  ESPs all come through.
+- **`overview.md`'s Status line** still said Phases 0–5 with administration current, where the
+  README sends a reader first; it says Phases 0–6 and the work before Phase 7.
