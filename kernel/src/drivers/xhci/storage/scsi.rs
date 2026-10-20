@@ -36,24 +36,7 @@ pub const fn read_capacity16() -> [u8; 16] {
 pub fn rw16(write: bool, lba: u64, count: u32) -> [u8; 16] {
     let l = lba.to_be_bytes();
     let c = count.to_be_bytes();
-    [
-        if write { 0x8A } else { 0x88 },
-        0,
-        l[0],
-        l[1],
-        l[2],
-        l[3],
-        l[4],
-        l[5],
-        l[6],
-        l[7],
-        c[0],
-        c[1],
-        c[2],
-        c[3],
-        0,
-        0,
-    ]
+    [if write { 0x8A } else { 0x88 }, 0, l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], c[0], c[1], c[2], c[3], 0, 0]
 }
 
 /// `SYNCHRONIZE CACHE(10)` of the whole medium: an LBA and a count of zero.
