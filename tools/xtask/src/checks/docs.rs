@@ -12,7 +12,8 @@ use crate::{R, read_text, repo_root};
 /// follows a dead reference builds a private model, which is one of the ways the docs and the
 /// code came apart.
 ///
-/// 1. **Link integrity.** Every relative `[text](path.md)` link resolves.
+/// 1. **Link integrity.** Every relative `[text](path)` link resolves, to a doc, a source file or
+///    an asset.
 /// 2. **Cited source paths.** A backticked `kernel/…`, `userspace/…` or `tools/…` path in a
 ///    doc that describes *current behaviour* must exist.
 /// 3. **Status lines.** Every `docs/architecture/*.md` carries one, because `CLAUDE.md`
@@ -20,7 +21,7 @@ use crate::{R, read_text, repo_root};
 ///
 /// **Check 2 is deliberately scoped.** It is an *allowlist*: only `docs/spec/`,
 /// `docs/reference/`, `docs/architecture/` and `docs/conventions/` are scanned for cited source
-/// paths (see `describes_current`). Everything else — `design/`, `archive/`, `planning/`,
+/// paths (see `describes_current`), with the root `README.md`. Everything else — `design/`, `archive/`, `planning/`,
 /// `rationale/`, the top-level `docs/*.md`, and the `CLAUDE.md` files — is exempt, because those
 /// either do not describe current behaviour or record what *was* true: a ticked box reading
 /// "Retire `kernel/src/embedded_images.rs` entirely" cites a path absent *because the work
@@ -38,6 +39,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
     let describes_current = |p: &Path| {
         let s = p.to_string_lossy().replace('\\', "/");
         ["/docs/spec/", "/docs/reference/", "/docs/architecture/", "/docs/conventions/"].iter().any(|d| s.contains(d))
+            || p == root.join("README.md")
     };
 
     // Append-only records. Their backticked path mentions describe the world as it was — an entry
@@ -98,7 +100,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
                         anchor_refs.push((path.to_path_buf(), i + 1, target_file, anchor.to_string()));
                     }
                 }
-                if file.is_empty() || !file.ends_with(".md") {
+                if file.is_empty() {
                     continue;
                 }
                 links += 1;
