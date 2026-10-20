@@ -36598,3 +36598,16 @@ second declined.
   ESPs all come through.
 - **`overview.md`'s Status line** still said Phases 0–5 with administration current, where the
   README sends a reader first; it says Phases 0–6 and the work before Phase 7.
+
+## 2026-10-20 — Before Phase 7, Part C complete: the laptop confirms it
+
+**Reinstalled from a live image of `main` at `510381f4`**, the laptop confirmed what the gates
+could not:
+- **an ejected stick's light goes out**, ejected from Files and with `disk --eject`, the last word
+  the definition of done left to it;
+- **line editing** at a prompt in `nxterm`, whose keys the gates reach only as Left on QEMU's
+  PS/2 keyboard and as escape sequences over serial;
+- **a window dragged to the top bar maximizes**, at the laptop's 1366×768.
+
+A stick formatted with `disk --format` mounted and ejected as the gates have it. **Part C is
+complete**, and Part D, the bug bash, is next.

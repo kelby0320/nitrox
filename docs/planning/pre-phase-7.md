@@ -6,8 +6,8 @@ built; Part B detailed 2026-10-14; B.1 built 2026-10-15; B.2 built 2026-10-16; B
 2026-10-16; B.3 built 2026-10-16; B.4 built 2026-10-17, the kernel and xtask over their
 budgets (the maintainer's call) — Part B built; Part C detailed 2026-10-19; C.1 built
 2026-10-19; C.2 built 2026-10-19; C.3 built 2026-10-19; C.4 built 2026-10-19, the light left to
-the laptop; C.5 built 2026-10-20 — Part C built.** Each later part gets its detail pass when it is
-next. Seven parts, A–G, in the order below. Part E is the
+the laptop; C.5 built 2026-10-20 — Part C built; the stick's light confirmed on the laptop
+2026-10-20 — Part C complete.** Each later part gets its detail pass when it is next. Seven parts, A–G, in the order below. Part E is the
 syscall-surface consolidation, planned separately in [`syscall-surface.md`](syscall-surface.md).
 
 ## Why
