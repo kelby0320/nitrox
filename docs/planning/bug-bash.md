@@ -928,3 +928,217 @@ reader field for field, with asserted sizes. No `arch::x86_64` references appear
 io. Nothing frees in a DPC or ISR. The input and console rings keep whole records, and
 `/dev/registry/changes` waiters are capped at 4. The recorded deferrals (gpt-crc,
 usb-departed-records, block-transfer-split) were not reported.
+
+### protocols — main at 510381f4, 2026-10-20
+
+Lenses: logic, error-paths, trust-boundary, tests, architecture; returned nothing: none.
+Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
+
+- [ ] **proto-1** `kernel/src/object/file_object.rs:540` — Read-ahead and write-back overflow
+  u64 on a run that `block_map` accepted. `block_map` (table.rs:2592) checks only that each run's
+  device end in bytes fits a u64, but `begin_fill` computes `first * bs + (n * PAGE_SIZE) as u64`
+  (write-back does the same at line 593). A run ending within a page of u64::MAX bytes passes
+  `block_map` and then overflows. The kernel dev profile has overflow-checks on, so the kernel
+  panics while holding the FileObject lock. A fs server with a block DeviceNode (max_frags >= 2:
+  AHCI, xHCI storage, RAM disk) answers a FILE_BLOCKS resolve with block_size 512, content_len
+  8192 and one run (file_block 0, device_lba u64::MAX/512 - 1, length 1). The first fault on page
+  0 then panics with 'attempt to add with overflow'. The shipped ext4 and FAT servers cannot
+  produce such a run, so this needs a misbehaving server. Demonstrated: a probe appended to
+  `a_block_map_the_page_cache_cannot_use_is_refused` showed the run is accepted. In the
+  file_object tests, `fill_ahead(file_of(&f), 0, 512, 31)` on that run panicked at
+  file_object.rs:540:30 (`cd kernel && cargo test --lib --target x86_64-unknown-linux-gnu`).
+  Probes removed. logic. High.
+- [ ] **proto-2** `kernel/src/syscall/table.rs:2394` — `build_and_install_file_blocks` takes the
+  transferred DeviceNode and drops its rights (`tr.rights`). Whether the file is writable depends
+  only on the server's own FILE_BLOCKS_READ_ONLY flag (line 2433). The sibling arms respect
+  rights: MEMOBJ/CHANNEL attenuate by `pl.requested & tr.rights` (line 2158) and SUBNAMESPACE
+  requires LOOKUP (line 2462). The storage service mounts a stick read-only and hands the server
+  a device handle with READ|TRANSFER|DUPLICATE and no WRITE (mounting.rs:132-136; storage.md
+  line 203). A misbehaving or compromised server answers a MAP_WRITE resolve with
+  OBJECT_KIND_FILE_BLOCKS, its READ-only DeviceNode and flags 0. The kernel installs the file
+  with `pl.requested | INSPECT`. The client maps it, writes and calls `sys_file_sync`, and
+  `FileObject::writeback` (file_object.rs:883-915) issues `IoOpcode::Write` IRPs through
+  `dispatch_block_irp_into_frames`, which checks no rights. `sys_io_submit` would refuse that
+  write (table.rs:1610), so the path amplifies authority. The fill path likewise reads without
+  checking READ. Not the recorded TODO(mount-write-authority), which concerns client binding
+  rights. Unverified: read only, no boot. A host test of `build_and_install_file_blocks` with a
+  READ-only TransferRef and flags 0 should show MAP_WRITE installed. A boot with a ro mount whose
+  server sends flags 0, then a client write plus `sys_file_sync` and a host read of the sector,
+  would show the disk written. Requiring WRITE in `tr.rights` before granting MAP_WRITE should
+  turn it into NoAccess. logic, trust-boundary, architecture. High.
+- [ ] **proto-3** `kernel/src/rsproto.rs:59` — No test covers the `body_len` bound in
+  `reply_body`, `parse_reply` and `parse_read_range_reply`, the only guard between a hostile
+  server's reply and an out-of-range slice panic in the kernel. A reply whose body_len exceeds
+  the IPC payload would make `&msg[28..end]` panic if a check were removed. `reply_body` has no
+  test at all. This is a test gap; the code is correct today. Demonstrated: each of the three
+  checks removed in turn, and all 14 rsproto tests still passed (`cargo test --lib --target
+  x86_64-unknown-linux-gnu rsproto`). Restored. tests. High.
+- [ ] **proto-4** `kernel/src/rsproto.rs:127` — The `BlockRun` stride (24) and index-to-offset
+  arithmetic in `file_blocks_run` are pinned by no test; only run 0 is ever decoded. A wrong
+  stride would make runs 1 and up read the wrong file_block, device_lba and length, so a Model A
+  file with two or more extents fills from, or writes back to, the wrong disk blocks. Test gap;
+  the code is correct today. Demonstrated: `FILE_BLOCKS_PREFIX_LEN + i * BLOCK_RUN_WIRE_LEN`
+  changed to `i * 16`, and the rsproto tests all passed. Restored. tests. High.
+- [ ] **proto-5** `userspace/librsproto/src/namespace.rs:113` — The length checks in
+  `parse_resolve_grow_size`, `parse_resolve_rename` (both the tail+4 and tail+4+dest_len checks)
+  and `file::parse_rename_request` have no test with a truncated or overrunning body. If one
+  were dropped, a client with a namespace handle could send a cut-short RESOLVE_RENAME,
+  RESOLVE_GROW or Rename and the filesystem server (a critical service) would slice out of
+  range and panic. Test gap; the code is correct today. Demonstrated: each check replaced with
+  `if false` individually, and every `cargo test -p librsproto --lib` run still passed.
+  Restored. tests. High.
+- [ ] **proto-6** `userspace/libgpt/src/table.rs:261` — The guards in `read()` on the header_size
+  range, entry_len == 128, count in 1..=1024 and `front.len() < end` are all untested. A disk
+  with a valid-CRC header whose array_lba or count points past the buffer storage-service reads
+  (FRONT_BYTES, about 17 KiB) would panic that critical service in `front[start..end]` if the
+  Truncated check were removed. A header_size over 512 would likewise panic in
+  `scratch[..header_size]`. Test gap; the code is correct today. Demonstrated: `front.len() <
+  end` changed to `if false`, and the header_size range, entry_len check, `count == 0` and
+  `count > 1024` mutated one by one. All 19 libgpt tests passed each time. Restored. tests.
+  High.
+- [ ] **proto-7** `userspace/libstream/src/wire.rs:532` — `read_value` and `read_list` recurse
+  with no depth limit, and so does a Record through `Schema::decode` and `read_row_values`. A
+  List level costs 5 bytes and a Record level 8, and dropping or displaying a decoded value
+  recurses too. The spec says values "may nest arbitrarily", and no deferral covers a depth
+  limit. A pipeline stage's TSM1 output, or a `.tsm` file given to `open` (ops.rs:784), holds
+  one List cell nested 40,000 or more deep (~200 KB, under nxsh's 1 MiB MAX_CAPTURE).
+  nxsh's `decode_output` (eval.rs:1946) calls `Table::decode`, overflows the 8 MiB user stack
+  (DEFAULT_USER_STACK_SIZE), hits the guard and the login shell dies. Demonstrated by five
+  lenses with release host probes decoding on an 8 MiB-stack thread. Depths of 20,000 to 30,000
+  (100 to 150 KB) decoded. Depths of 40,000 (200 KB), 50,000, 100,000 and 200,000 (1 MB) aborted
+  with 'thread has overflowed its stack' (SIGABRT). Probes removed. logic, error-paths,
+  trust-boundary, tests, architecture. Medium.
+- [ ] **proto-8** `userspace/libstream/src/wire.rs:590` — Decoding is not proportional to input.
+  A Null-typed column takes 0 bytes per row and a row is one REC_DATA byte, but
+  `read_row_values` allocates a 32-byte Value per column per row, so decoding allocates
+  columns × rows × 32 bytes. A stage emits N Null columns and M bare REC_DATA bytes. nxsh's
+  `decode_output` (capture capped at 1 MiB) or `open x.tsm` (`ops::decode_from`, no cap) then
+  exhausts the heap and nxsh aborts, which defeats MAX_CAPTURE's purpose. The logging service's
+  `render_typed` (TableReader, row by row) turns one 3,957-byte message (660 Null columns, 1,300
+  rows) into 1,300 log records, ~5.1 MB of formatted text in total, each line kprinted whole
+  under the kernel SERIAL lock; the stall on real serial hardware is not measured.
+  Demonstrated: a release host probe with a counting allocator decoded an 8,017-byte stream
+  (1,000 Null columns, 4,000 rows) to 4,000,000 Values with a 131,219,456-byte heap peak
+  (16,367×). A 64,017-byte stream (4,000 columns, 48,000 rows) aborted with 'memory allocation
+  of 131072 bytes failed' against a 2 GiB cap. A 5,017-byte stream with 1,000 columns and 1,000
+  rows gave ~32 MB. Probes removed. error-paths, trust-boundary, architecture. Medium.
+- [ ] **proto-9** `userspace/libstream/src/channel.rs:234` — `IpcPort::recv` passes `recv_handles`
+  and `count` to SYS_CHANNEL_RECV, which installs every transferred handle in the receiver's
+  table, and never closes or returns them. nxsh's `drain_diagnostics` (main.rs:127-132) and
+  librsproto `session::round_trip` (session.rs:251-262) close the same class, each with a
+  comment saying why. nxsh reads a pipeline tail's stdout through `IpcPort::recv`
+  (main.rs:379-416). A stage sends empty, non-`last` messages with 8 handles each, which never
+  trip MAX_CAPTURE, so nxsh keeps installing handles it cannot name. They pin the stage's
+  objects after it exits and eventually nxsh's spawns and lookups fail with OutOfHandles. The
+  handle table is global with no per-process quota. `clip` reading stdin through
+  ChannelReceiver (clip.rs:215) is said to leak the same way; that claim is unchecked.
+  Unverified: code path confirmed by reading `channel.rs:235-261` and `sys_channel_recv`
+  (table.rs:~2746-2769); no boot. A boot with a stage that sends handles on stdout, then
+  counting nxsh's handles or watching its next spawn, would settle it. logic, error-paths,
+  trust-boundary, architecture. Medium.
+- [ ] **proto-10** `userspace/logging-service/src/main.rs:601` — `drain_source` receives log
+  appends with `recv(h)`, which writes RECV_HANDLES and RECV_COUNT, and never closes them. Only
+  `received()` (main.rs:401-410) closes transferred handles, and it runs on the read-session
+  path. Any holder of a log channel sends appends or TSM1 bodies with 8 handles attached; the
+  service installs and keeps them, and the next recv overwrites the values, so they can never
+  be closed. The handles and the sender's pinned objects outlive the sender, and the service is
+  `essential`, so service-mgr will not restart it to reclaim them. Unverified: read only. A test
+  process sending appends with transferred handles on a log channel, while watching the
+  service's handle count or the global table's live slots, would settle it. error-paths. Medium.
+- [ ] **proto-11** `userspace/libstream/src/wire.rs:573` — The `SCHEMA_FIELD_HINT_CAP` caps on
+  `Vec::with_capacity` in `read_list`, `read_row_values` and `Schema::decode`, the allocation
+  defence against hostile counts, have no test. A peer sending a u32 count of 4,000,000,000
+  followed by a few bytes would make a consumer abort on a gigabyte reservation if a cap were
+  removed. Test gap; the code is correct today. Demonstrated: `.min(SCHEMA_FIELD_HINT_CAP)`
+  removed at each of the three sites in turn, and every libstream host test still passed.
+  Restored. tests. Medium.
+- [ ] **proto-12** `userspace/librsproto/src/file.rs:333` — `DirEntryIter`'s truncated-entry
+  guard (`body.len() < end`) and its `remaining == 0` stop, plus the name-length limits (u8::MAX
+  in the dir-entry writer, u16::MAX in the name and rename encoders), are untested. A Readdir
+  body whose last entry's name_len runs past the body would make the iterator slice out of range
+  and crash the client. An over-long name not refused at encode time is truncated to a u8 or
+  u16 length, so the wire length disagrees with the bytes written. Test gap; the code is correct
+  today. Demonstrated: each guard removed or loosened individually, and every librsproto test
+  still passed. tests. Medium.
+- [ ] **proto-13** `kernel/src/syscall/table.rs:2589` — `block_map` calls
+  `runs.try_reserve(header.run_count as usize)` before the body is checked to hold that many
+  runs. `run_count` is a server-chosen u32, but a reply body carries at most (3980-32)/24 = 164
+  runs. A server answers FILE_BLOCKS with run_count 50,000,000 and a 32-byte body, and the
+  kernel asks for ~1.2 GB before `file_blocks_run` first fails. Two other reviewers judged this
+  harmless, because the buddy allocator's MAX_ORDER=10 caps a request at a transient 4 MiB
+  that fails at once, so the real cost may be nil. Unverified: read only. A host test with a
+  huge run_count, or a look at what `try_reserve` does against kmalloc's cap, would settle it.
+  Bounding run_count by `(body.len() - 32) / 24` first removes the question. logic. Low.
+- [ ] **proto-14** `userspace/libstream/src/wire.rs:668` — `Schema::encode` writes
+  `f.name.len() as u16` without refusing names over u16::MAX, and `WireErrorRecord::encode` does
+  the same for `field_name` (line 733). Encoding reports Ok with a wrapped length, and the
+  reader parses the rest of the name's bytes as the field's type, modifiers and the stream's
+  records. A producer builds a column name from more than 64 KiB of input (say headers of an
+  untrusted file), and the consumer sees a different, shorter schema or an error. Demonstrated:
+  a 65,538-byte crafted name ("ab", 0x02, 0x00, then padding) encoded Ok. `Table::decode` read
+  one field "ab" of type Int and failed with Err(BadRecordTag(122)) on the next name byte
+  (`cargo test -p libstream --lib`). Probe removed. logic. Low.
+- [ ] **proto-15** `userspace/libgpt/src/table.rs:298` — `read()` computes disk_blocks as
+  header[32..40] + 1, which overflows when a valid-CRC header carries backup_lba u64::MAX. A
+  build with overflow checks panics 'attempt to add with overflow' in the storage service or
+  installer. In release, which userspace uses, it wraps to 0, and no production caller reads
+  `disk_blocks` (two other reviewers judged it harmless on that ground). `read()` also does not
+  check that partition LBAs lie within first_usable..=last_usable. Demonstrated: a host test
+  forged the CRC after setting the backup LBA to u64::MAX, and `cargo test -p libgpt --lib`
+  panicked at table.rs:298. The release wrap is by inspection of the profile, not run. Probe
+  removed. tests. Low.
+- [ ] **proto-16** `kernel/src/rsproto.rs:408` — Several kernel codec guards are untested:
+  `forget_request`'s magic check, the u16::MAX suffix limit in `build_resolve_request`,
+  `build_read_range_request` and `build_resolve_request_rename`, and the error-body minimum
+  length in `parse_reply` and `parse_read_range_reply`. Without the suffix limit a suffix over
+  65,535 bytes gets a truncated u16 length while body_len carries the full length, so the server
+  parses a different path than the kernel meant. Without the forget magic check any message with
+  op 0x0607 is a Forget. Test gap; the code is correct today. Demonstrated: each guard removed
+  individually, and the rsproto tests all survived. Restored. tests. Low.
+- [ ] **proto-17** `userspace/libstream/src/setup.rs:93` — The unknown-bit rejection in
+  `Streams::from_bitmap`, and the wrong-op and BadRecordTag handling in `Table::decode`, are
+  untested. A setup bitmap with unknown bits and a matching handle count would have its extra
+  bits ignored and the handles misassigned or leaked. An unknown record tag in `Table::decode`
+  would be accepted as end of table instead of BadRecordTag. Test gap; the code is correct
+  today. Demonstrated: `bitmap & !STREAM_MASK != 0` changed to `if false` and the BadRecordTag
+  arm replaced with a `break`; all libstream tests passed. Restored. tests. Low.
+- [ ] **proto-18** `kernel/src/syscall/table.rs:263` — `sys_file_truncate`, `sys_file_grow` and
+  `sys_file_create` narrow the u64 size register with `a4 as u32` before it reaches the wire
+  (`ResolveOp::Size(a4 as u32, ...)`, table.rs:251, 253, 263). A size of 4 GiB or more is taken
+  modulo 2^32 instead of refused with TooLarge. `sys_file_truncate(ns, path, MAP_READ|MAP_WRITE,
+  0x1_0000_000A)`, meant as "just over 4 GiB", forwards new_size=10 and the server frees
+  everything past byte 10 with a success status. `sys_file_grow(4 GiB + 4096)` grows to 4096
+  bytes. `SYS_FILE_RENAME`'s `a5 as u16` flags are narrowed the same way. libfs caps its own
+  sizes at 8 MiB (MAX_COPY), so only direct syscall users reach this today. Unverified: read
+  only. A host test of the syscall's size argument at 2^32 + n would settle it. architecture.
+  Low.
+
+What held up: all eight kernel `rsproto.rs` parsers (`parse_reply`, `parse_read_range_reply`,
+`reply_body`, `subnamespace_reply`, `file_blocks_reply_header`, `file_blocks_run`,
+`forget_request`, `reply_op`) check every offset and use `checked_add` on `body_len`; 2M random
+inputs with RS_MAGIC set made none panic. About 70 librsproto decoders, their iterators and
+`path::resolve` took 3M to 5M random inputs in debug (overflow checks) and release with no
+panic; a negative control (dropping `parse_name_request`'s length bound) panicked at once.
+`block_map` refuses block sizes that are not a power of two in 512..=4096 and runs whose file,
+device or byte end overflows, and `partition_submit` rebases and bounds every IRP. `continued_path`
+and `continued_dest` validate the consumed count and the joined path, and SUBNAMESPACE needs
+LOOKUP. MEMOBJ and CHANNEL replies are attenuated by the transferred rights. ReadRange fills are
+clamped to a page into a zeroed frame, so a short or lying reply leaks no stale memory.
+`libgpt::read` bounds header_size (92..=512), entry size (128) and count (1..=1024), uses checked
+arithmetic on the array range, verifies both CRCs and refuses more than 8 partitions. `build` and
+`mbr::build` guard range, overlap and size. libstream bounds every `ByteSource` read and caps
+`with_capacity` hints at 64. `SetupPayload::decode` and `IpcPort::recv` are bounded by one IPC
+payload (~4 KiB, about 800 nesting levels, safe on the 8 MiB stack; the same holds for the log
+service's `render_typed` and the view broker's `view_env`). `split_handles` refuses a claimed
+terminal that arrived without a handle. `session::round_trip` closes transferred handles and
+`Dir::read_dir` refuses a cursor that does not advance. Mutation tests killed by the existing
+suite: the libgpt CRC and truncation guards, MAX_PARTITIONS, `build`'s overlap, range and
+DiskTooSmall checks, all eight `mbr::build` guards, the kernel's file-blocks prefix and per-run
+bounds, REPLY-flag and resolve-reply length checks, envelope magic and body_len, and libstream's
+`take()` EOF and setup-length checks. Gap, not a finding: `cargo xtask abi-sync-check` does not
+cover the `kernel/src/rsproto.rs` and librsproto pair, so drift between them would be caught
+only by hand-laid layout tests. The two recorded deferrals (TODO(clipboard-chunking),
+TODO(popup-follows-parent)) were not reported. proto-3 to proto-6, proto-11, proto-12 and
+proto-15 to proto-17 are test gaps in code that is correct today, and by rules.md that is not
+itself a finding. They are listed because the hunt reported them, and the maintainer may
+want to drop them.
