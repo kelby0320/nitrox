@@ -174,8 +174,8 @@ impl RamDisk {
             op if op == IrpOp::Write as u32 => false,
             // A RAM disk's memory is its medium: nothing is cached, so a flush is done.
             op if op == IrpOp::Flush as u32 => return (IrpStatus::Success as i32, 0),
-            // A RAM disk's table is the bootloader's module, read once.
-            op if op == IrpOp::Rescan as u32 => return (KError::Unsupported as i32, 0),
+            // A RAM disk's table is the bootloader's module, read once, and nothing ejects it.
+            op if op == IrpOp::Rescan as u32 || op == IrpOp::Eject as u32 => return (KError::Unsupported as i32, 0),
             _ => return (KError::InvalidArgument as i32, 0),
         };
         let dev_off = irp.offset;
@@ -447,6 +447,7 @@ mod tests {
         let mut unknown = irp(IrpOp::Write, 0, &[frag(&mut out)]);
         unknown.op = 7;
         assert_eq!(rd.transfer(&unknown).0, KError::InvalidArgument as i32);
+        assert_eq!(rd.transfer(&irp(IrpOp::Eject, 0, &[])).0, KError::Unsupported as i32, "nothing ejects it");
         drop(rd);
         assert!(module.iter().all(|&x| x == 7), "nothing written");
     }

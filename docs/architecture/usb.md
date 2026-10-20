@@ -2,8 +2,9 @@
 
 **Status: Phase 6 Part A built (2026-10-02), Part B's keyboards and mice (B.1–B.5, 2026-10-05),
 Part C's arrivals and departures (2026-10-05), Part D's mass storage (D.1–D.6, 2026-10-06),
-Part G's sixteen-byte commands and rescan (2026-10-07), Part H.2's counters (2026-10-08), and
-Part B.7's keyboards read by their report descriptors (2026-10-13)**
+Part G's sixteen-byte commands and rescan (2026-10-07), Part H.2's counters (2026-10-08),
+Part B.7's keyboards read by their report descriptors (2026-10-13), and pre-Phase-7 Part C.4's
+eject (2026-10-19)**
 — the xHCI host controller is claimed and its rings proved (A.1); **a hub thread enumerates what
 is attached**, at boot and after it, logging each device and matching it against the class table
 (A.2); **each device is a `UsbDevice` record in the registry**, which `device-mgr` names
@@ -429,6 +430,19 @@ fails meanwhile is ended**, as a failed recovery's device always is, its departu
 rescan (PR #369 review: it was left recovering, every submit queued for good). **A partition's
 window answers a `Rescan` itself, `Unsupported`**, rather than passing it to its disk
 ([`drivers-and-irps.md`](drivers-and-irps.md)).
+
+**An eject** (pre-Phase-7 Part C.4): `IoOpcode::Eject` on a USB disk's node, what the storage
+service sends once an eject's chain has unmounted everything on the stick ([`storage.md`](storage.md)
+§8a). It goes on the I/O path a flush takes, as `START STOP UNIT` with LoEj set and Start clear
+(`1B 00 00 00 02 00`). **Once the unit answers it is ejected**: every later request on it, a rescan
+included, is refused `PeerClosed`, as a pulled stick's are, until the stick is plugged in again and
+arrives as a new device; the first refused is logged, `ejected, and asked for more`, since nothing
+should ask. **A failure leaves the unit running**: an illegal request is a stick that cannot stop,
+completed `Unsupported`; another sense, a stall or a deadline, `IoError` through recovery; a reset
+that fails, or a stick that detaches on LoEj, departs and completes it `PeerClosed`. Another unit of
+the same device runs on. Whether a stick's light goes out is the stick's: one that stays lit is
+left for a later `SET_CONFIGURATION 0` on the same opcode, not a port switched off, which would
+not see the stick plugged in again.
 
 **A departure**, before the records depart: the device out of the DPC's table, its queue completed
 `PeerClosed`, and any later submit refused so; the command in flight completed `PeerClosed` once the

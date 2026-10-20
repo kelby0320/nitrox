@@ -133,7 +133,7 @@ pub fn dispatch_block_irp(
         IoOpcode::Read => IrpOp::Read,
         IoOpcode::Write => IrpOp::Write,
         // Not transfers: `dispatch_block_control`.
-        IoOpcode::Flush | IoOpcode::Rescan => return Err(KError::InvalidArgument),
+        IoOpcode::Flush | IoOpcode::Rescan | IoOpcode::Eject => return Err(KError::InvalidArgument),
     };
     let irp = Irp::new_block(
         op,
@@ -213,7 +213,7 @@ pub fn dispatch_block_irp_into_frames(
     let op = match opcode {
         IoOpcode::Read => IrpOp::Read,
         IoOpcode::Write => IrpOp::Write,
-        IoOpcode::Flush | IoOpcode::Rescan => return Err(KError::InvalidArgument), // not transfers
+        IoOpcode::Flush | IoOpcode::Rescan | IoOpcode::Eject => return Err(KError::InvalidArgument), // not transfers
     };
     let irp = Irp::new_block(
         op,
@@ -257,8 +257,8 @@ pub fn dispatch_block_flush(device: &ObjectRef, po: &ObjectRef) -> Result<(), KE
     dispatch_block_control(device, po, IrpOp::Flush)
 }
 
-/// Dispatch an IRP that moves no data, a [`Flush`](IrpOp::Flush) or a
-/// [`Rescan`](IrpOp::Rescan) of a disk's table, completing `po`. Errors as
+/// Dispatch an IRP that moves no data — a [`Flush`](IrpOp::Flush), a [`Rescan`](IrpOp::Rescan) of
+/// a disk's table or an [`Eject`](IrpOp::Eject) of its medium — completing `po`. Errors as
 /// [`dispatch_block_flush`]'s.
 pub fn dispatch_block_control(device: &ObjectRef, po: &ObjectRef, op: IrpOp) -> Result<(), KError> {
     // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
@@ -508,15 +508,13 @@ fn forward(p: &Partition, irp: *mut Irp) {
     }
 }
 
-/// **What a partition's window refuses `op` with**, before anything is
-/// forwarded: `PeerClosed` for everything once retired, `Unsupported` for a
-/// rescan always. **A rescan is the disk's alone**: forwarded, it would let the
-/// holder of one partition (every filesystem server) retire its siblings'
-/// windows.
+/// **What a partition's window refuses `op` with**, before anything is forwarded: `PeerClosed`
+/// once retired, and `Unsupported` for a rescan or an eject, the disk's alone, with which one
+/// partition's holder (every filesystem server) could take its siblings away.
 fn window_refusal(p: &Partition, op: u32) -> Option<KError> {
     if p.retired.load(core::sync::atomic::Ordering::SeqCst) {
         Some(KError::PeerClosed)
-    } else if op == IrpOp::Rescan as u32 {
+    } else if op == IrpOp::Rescan as u32 || op == IrpOp::Eject as u32 {
         Some(KError::Unsupported)
     } else {
         None
@@ -648,8 +646,9 @@ mod tests {
         assert_eq!(answer(IrpOp::Write), None);
         assert_eq!(answer(IrpOp::Flush), None, "and a flush");
         assert_eq!(answer(IrpOp::Rescan), Some(KError::Unsupported), "a rescan is the disk's alone");
+        assert_eq!(answer(IrpOp::Eject), Some(KError::Unsupported), "and an eject");
         p.retired.store(true, Ordering::Release);
-        for op in [IrpOp::Read, IrpOp::Write, IrpOp::Flush, IrpOp::Rescan] {
+        for op in [IrpOp::Read, IrpOp::Write, IrpOp::Flush, IrpOp::Rescan, IrpOp::Eject] {
             assert_eq!(answer(op), Some(KError::PeerClosed), "retired: {op:?}");
         }
     }
@@ -708,7 +707,8 @@ mod tests {
         assert_eq!(submit(IrpOp::Read, 512), pending, "forwarded, for the disk to complete");
         assert_eq!(seen.0.borrow().as_slice(), &[(IrpOp::Read as u32, 2049 * 512)], "rebased to the disk");
         assert_eq!(submit(IrpOp::Rescan, 0), KError::Unsupported as i32, "a rescan is the disk's alone");
-        assert_eq!(seen.0.borrow().len(), 1, "and it did not reach the disk");
+        assert_eq!(submit(IrpOp::Eject, 0), KError::Unsupported as i32, "and an eject");
+        assert_eq!(seen.0.borrow().len(), 1, "and neither reached the disk");
 
         assert!(!retire_window(&disk), "a disk's node is no window");
         assert!(retire_window(&part));

@@ -1610,6 +1610,7 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
         IoOpcode::Write => (Rights::WRITE, Rights::MAP_READ),
         IoOpcode::Flush => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Flush),
         IoOpcode::Rescan => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Rescan),
+        IoOpcode::Eject => return submit_control(resource_h, &op, pid, crate::io::irp::IrpOp::Eject),
     };
     let dev_ok = lookup_typed(resource_h, pid, dev_right, KObjectType::DeviceNode)?;
     let buf_ok = lookup_typed(op.buffer, pid, buf_right, KObjectType::MemoryObject)?;
@@ -1684,9 +1685,8 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
 /// Needs `WRITE` on the device and names no buffer and no range, so each of those fields must
 /// be `0`. Not a zero-length transfer, so it never takes that path's pre-signalled no-op.
 ///
-/// **And its rescan**, `irp_op` saying which: a disk's table read again, with the same rules
-/// (`WRITE`: a writer of the disk can have changed its table). A partition and every disk but
-/// a USB one answer `Unsupported`, through the IRP.
+/// **And its rescan and its eject**, `irp_op` saying which, with the same rules (`WRITE`). A
+/// partition and every disk but a USB one answer `Unsupported`, through the IRP.
 fn submit_control(resource_h: u64, op: &IoOp, pid: u32, irp_op: crate::io::irp::IrpOp) -> SysResult {
     if op.buffer != 0 || op.buf_offset != 0 || op.offset != 0 || op.length != 0 {
         return Err(KError::InvalidArgument);

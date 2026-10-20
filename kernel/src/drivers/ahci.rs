@@ -655,10 +655,11 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
     // SAFETY: `disk` is the live published disk.
     let d = unsafe { &*disk };
 
-    // **A rescan is refused**: a SATA disk's table is read once at boot, by polling; partitioning
+    // **A rescan and an eject are refused**: a SATA disk's table is read once at boot; partitioning
     // an internal disk is `nxinstall`'s, and a reboot follows.
     // SAFETY: `irp` is a live block IRP during submit.
-    if unsafe { (*irp).op } == crate::io::irp::IrpOp::Rescan as u32 {
+    let op = unsafe { (*irp).op };
+    if op == crate::io::irp::IrpOp::Rescan as u32 || op == crate::io::irp::IrpOp::Eject as u32 {
         // SAFETY: `irp` is uniquely owned during submit; completing it releases its waiter.
         unsafe {
             (*irp).set_completion(crate::syscall::error::KError::Unsupported as i32, 0);
