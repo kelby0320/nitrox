@@ -696,3 +696,235 @@ refuses read-only mounts and flushes after a failure, `Cache::allocate` gives ba
 test, the long-name checks, the BPB checks, the read-only flag on file-blocks replies, the ext4
 zero-fill on grow, the unlink-directory, rmdir NotEmpty and rename-into-subtree guards, and the
 mount and unmount state bits each failed a test when broken.
+
+### drivers — main at 510381f4, 2026-10-20
+
+Lenses: logic, error-paths, trust-boundary, tests, architecture; returned nothing: none.
+Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct defects).
+
+- [ ] **drv-1** `kernel/src/drivers/xhci/storage.rs:688` — A bulk-only read whose data stage ends
+  SHORT_PACKET has its real residual thrown away: `Disks::on_transfer` never gets the event's
+  residual, so only the CSW residue counts. A stick that moves part of the data, then answers
+  Passed with residue 0, completes the IRP as success with the full length. A malicious or broken
+  stick holds a FAT or ext4 file, and a process faults a page of it. The fill reads 32 pages
+  (READ(10) over the faulting page plus read-ahead). The read-ahead frames come from `buddy_alloc`
+  unzeroed (file_object.rs:503, :546). The stick sends a short packet, then a CSW with Passed and
+  residue 0, and `settle` marks every page Ready on status 0. The reader then sees stale physical
+  memory: other processes' freed pages, kernel heap, and the buddy free-list link in each page's
+  first 8 bytes. Copying the file back onto the stick sends that data out. Demonstrated by two host
+  probes. (1) A 16-fragment 64 KiB read, a SHORT_PACKET event on the first fragment, then a CSW with
+  status 0 and residue 0, gave `Complete { status: 0, transferred: 65536 }`. The existing test
+  `a_reads_status_is_asked_for_when_its_data_ends` (storage/tests.rs:256) pins that behaviour as
+  intended. (2) In file_object.rs, every free frame was dirtied with 0xA5 and freed, then
+  `start_fill` ran with read-ahead on a recording device and the IRP completed as a full success.
+  19 read-ahead pages came back holding the old 0xA5 bytes. AHCI has the same shape, since
+  `retire()` reports `irp.length` and never reads PRDBC; that half is unverified for SATA firmware.
+  Linux keeps the larger of the actual and reported residue. Lenses: error-paths, trust-boundary.
+  High.
+
+- [ ] **drv-2** `kernel/src/drivers/ahci.rs:869` — `poll_complete_inflight` discards
+  `wait_command_polled`'s timeout. `take_retired` then judges the command by TFD.ERR alone, so a
+  command still running (CI bit 0 set, BSY set) retires as Success with the full length, and slot 0
+  is marked idle while the HBA owns it. `identify()` (line 462) has the same flaw: on a timeout it
+  drops its DmaBuffer while the IDENTIFY is outstanding. At boot `gpt::init` reads LBA 0-1 through
+  `read_blocking` and `ahci_poll`. A slow spin-up or a marginal sector takes over `POLL_TIMEOUT_NS`
+  (1 s). `read_blocking` returns true with a zero or partial buffer. The disk then reads as "no
+  table", no partitions are published, and init cannot find `gpt-partlabel:nitrox-root`. A late
+  completion DMAs into freed frames. The next submit rebuilds slot 0 and writes CI=1 under the
+  running command, so a write is reported done and never reaches the disk. Demonstrated by two host
+  probes. With PX_CI=1 and PX_TFD=BSY, `take_retired` then `retire` gave Success and
+  transferred=1024 (512 in the second probe), with CI still 1 and inflight null. A following
+  `submit()` of a Write built its PRDT and CFIS over the busy slot. The timeout itself cannot fire
+  on the host (`Timer::read_ns` is 0), so that half is from reading the code (wait_command_polled
+  :591-606). Its comment claims the IRP completes "with its error status" on a timeout. Lenses:
+  logic, error-paths. High.
+
+- [ ] **drv-3** `kernel/src/drivers/gpt.rs:236` — `/dev/disk/by-partlabel/<label>` goes to the
+  first boot-time disk published, and a later disk with the same label fails to bind
+  (AlreadyBound, one log line). `drivers::probe` registers the AHCI disk before the RAM-disk
+  modules (drivers/mod.rs:28-56), and `gpt::init` walks the table in that order. The BOOT flag is
+  never consulted, and init (init/src/main.rs:322-331) looks up the label with no BOOT check. Boot
+  the live stick on a machine whose internal SATA disk has a GPT partition labelled `nitrox-live`
+  (tools/xtask/src/image.rs:353). The internal partition wins the name, and init mounts it as `/`.
+  Then `/bin/service-mgr` reads `/system/services.toml` from that disk, so the attacker-written disk
+  supplies the live session's services, binaries and user database. check-recovery runs exactly
+  this live-boot-with-internal-disk setup. Demonstrated: a host probe recorded the internal disk's
+  PartEntry and then made the live disk's bind as `bind_one` would. It gave `Err(AlreadyBound)`,
+  and the label named the internal disk, not the live one. The end-to-end mount was not run; it
+  needs a live-image boot with such an AHCI disk. Lenses: trust-boundary, architecture. High.
+
+- [ ] **drv-4** `kernel/src/syscall/table.rs:2393` — A FILE_BLOCKS resolve reply discards the
+  rights of the block DeviceNode handle the server transfers (`tr.rights`). The MEMOBJ path
+  intersects them (`pl.requested & tr.rights`, :2158). Page-cache writeback (file_object.rs:883)
+  dispatches Write IRPs through `dispatch_block_irp_into_frames`, which leaves rights to the caller
+  (block.rs:96-99), so READ and WRITE are never checked. storage-service gives a server of a
+  read-only mount a handle narrowed to READ|TRANSFER|DUPLICATE (mounting.rs:132-136). A buggy or
+  compromised server, say one taken over by a crafted filesystem, answers a resolve with
+  FILE_BLOCKS and no FILE_BLOCKS_READ_ONLY, and supplies block runs of its choosing. A client that
+  maps MAP_WRITE gets a writable FileObject, and its dirty pages are written to a device the
+  server was denied WRITE on, at offsets the server picks. The only write guard is the server's
+  own flag (table.rs:2433-2434). Unverified: it was read, not run. A QEMU test whose fs server
+  holds a READ-only partition handle and replies FILE_BLOCKS without the flag would settle it. The
+  client maps MAP_WRITE, writes and syncs, then the test compares the device bytes. Lens:
+  architecture. High.
+
+- [ ] **drv-5** `kernel/src/drivers/ahci.rs:822` — The AHCI driver has no error recovery and no
+  runtime deadline. The ISR retires slot 0 only when PxCI bit 0 is clear. AHCI 1.3.1 §6.2.2.1 has
+  software clear PxCMD.ST to reset PxCI after a task-file error. `stop_port` and `start_port`
+  (:421-439) run only from init, `issued_at` feeds statistics only, and PX_IE enables only
+  DHRE|TFEE. A SATA disk returns UNC or IDNF, for example a medium error on a bad sector or a read
+  past the disk's end. The driver does not check offset against `sectors`, so any whole-disk handle
+  holder can cause one. TFES fires, the ISR acks PxIS and retires nothing, and the PO never
+  completes. Later IRPs queue in the 32-deep PendingRing and then fail IoError. libfsserver waits
+  with deadline u64::MAX (userspace/libfsserver/src/disk.rs:23), so fs-server-ext4 on the root
+  partition hangs until reboot. QEMU's `ahci_cmd_done` reportedly clears CI even on error, so no
+  gate can show this. Unverified: on a real SATA machine, read an LBA past `sectors` through
+  `/dev/blk/<disk>`, or use a drive with a pending sector, and see whether the PO completes and
+  later I/O proceeds. Lenses: logic, error-paths. High.
+
+- [ ] **drv-6** `kernel/src/drivers/ahci.rs:726` — Nothing refuses a block request whose offset or
+  length is not a multiple of the logical block size, or whose offset is past the device's end,
+  though `docs/spec/io-operation.md` (lines 41-45, 96-102) and device-node.md say both are
+  InvalidArgument synchronously. `sys_io_submit` (table.rs:1620-1660), `dispatch_block_irp` and
+  `partition_rebase` check only the buffer range. AHCI's `issue_locked` truncates:
+  `lba = offset/512`, `count = (length/512) as u16`, LBA bits from 48 up drop, and `retire` reports
+  `transferred = irp.length`. A filesystem server on a partition handle submits Write offset=100,
+  length=256, or a write of the partition's last 256 bytes. The call is accepted and issues WRITE
+  DMA EXT at LBA 0 (or the partition's last LBA) with count 0, which ATA reads as 65,536 sectors,
+  against a 256-byte PRDT. A length of 768 moves one sector and reports 768. Offset 1000, length
+  1000 reads sector 1 only. A whole-disk write at byte offset (2^48+1)*512 lands on LBA 1. QEMU
+  finishes the count-0 command having moved nothing. On real hardware it may overrun into the
+  neighbouring partition or stall the port, which with drv-5 stalls every partition on the disk.
+  That hardware outcome is unverified. The RAM disk also accepts misaligned requests, and xHCI
+  refuses them only through the PO (storage.rs:439-445), not synchronously. Demonstrated by host
+  probes. In ahci tests, `issue_locked` for Read offset=0, length=256 gave `cmd=0x25 lba=0 count=0
+  prdt_bytes=256`, and for Write offset=100, length=256 gave `cmd=0x35 lba=0 count=0`. A Write at
+  offset 1000, length 100 gave count 0, and `retire` reported transferred 100. Through
+  `dispatch_block_irp` under a partition, a Write at offset span-256, length 256 returned Ok and
+  reached the disk at byte 1099520, which AHCI would issue as the partition's last LBA with count
+  0. A past-end offset dispatched Ok and was written to lba48 1. Lenses: logic, error-paths,
+  trust-boundary, tests, architecture (five reports of one defect). Medium.
+
+- [ ] **drv-7** `kernel/src/drivers/xhci/hub.rs:273` — `hub::depart` calls `storage::finish`
+  unconditionally after `release()` returns Kept. That completes the in-flight or stranded IRP
+  PeerClosed while the slot is still enabled and its bulk endpoints may still move the IRP's data.
+  storage.rs:1393-1396 documents `End::Stranded` as "completed once the slot is disabled". A
+  stick's command misses its deadline, and `recover()`'s Reset or Stop Endpoint goes unanswered for
+  1 s. That sets `x.wedged`, so the result is `End::Stranded`, then `Recovered::Ended`, then
+  `depart`. `release()` returns Kept and leaks DeviceMem on purpose, but `finish()` then completes
+  the IRP. Its buffer, a user MemoryObject or page-cache frames (`settle(.., false)` calls
+  `buddy_free`), is released while the controller may still DMA into it. A failed Disable Slot
+  takes the same path. Unverified: inject a Disable Slot failure, or set `x.wedged`, during a USB
+  read and check that the IRP completes while the slot stays enabled. The fix shape is to leak the
+  held IRPs on the Kept path, as the memory is leaked. Lens: error-paths. Medium.
+
+- [ ] **drv-8** `kernel/src/drivers/ahci.rs:321` — `drivers::probe` calls `ahci::init` for every
+  AHCI-class function, but `AHCI.store(disk)` is unconditional and the ISR, `ahci_poll` (which
+  ignores its ctx argument), `poll_complete_inflight` and the DPCs all read that single global. A
+  machine has two AHCI controllers with a disk each. Disk 2 overwrites disk 1, so disk 1's polled
+  boot reads and its interrupts are handled against disk 2's state. Disk 1's `read_blocking` sees
+  inflight null and returns false, its table "did not read", and its IRP stays in flight so later
+  IRPs queue and then fail IoError. If disk 1 holds `nitrox-root`, `/` cannot mount. Unverified:
+  QEMU with two `-device ahci` controllers, each with a drive; check for the "partitions: the table
+  did not read" line. No xtask gate has that configuration. Lens: trust-boundary. Medium.
+
+- [ ] **drv-9** `kernel/src/drivers/partitions.rs:97` — Test gap in untrusted-input guards: the GPT
+  entry-size range check, the `.min(entries)` clamp on the array and the `.min(GPT_ENTRY_BLOCKS_MAX)`
+  cap are each deletable with all 14 partitions tests passing. The `is_multiple_of` half of the size
+  guard is also deletable with nothing failing. The existing test uses only entry size 96, which
+  the divides-a-block check alone rejects. Without the range check, entry size 64 panics slicing
+  `e[56..128]` (partitions.rs:149). Without `.min(entries)`, a header declaring 5 entries with a
+  stale sixth in the block publishes a phantom sixth partition. Without the cap, a header declaring
+  0xFFFFFFFF entries asks `try_reserve` for 512 GiB, so the disk reads as NoMemory instead of its
+  first 128 entries. Demonstrated: temporary tests showed the first two (panic; left 6, right 5),
+  restored by `git checkout`. The third is from reading. Lens: tests. Medium.
+
+- [ ] **drv-10** `kernel/src/io/block.rs:526` — Test gap on the partition sandbox boundary:
+  `partition_rebase`'s three overflow guards (`block_count.checked_mul(sector_size)`,
+  `offset.checked_add(length)` and the final `checked_add` of `start_lba*sector_size`) can each
+  become `wrapping_*` with all 8 io::block tests passing. The one existing test uses small values.
+  If one regresses, a request with offset near u64::MAX and a length that wraps back inside the
+  span passes the bounds check and is forwarded at a wrapped absolute offset, and AHCI truncates
+  the LBA to 48 bits. That could land outside the partition, and CI would not notice. The final
+  `checked_add` alone currently catches one wrap shape, so the guards cover each other and the pair
+  is untested. Demonstrated by per-guard mutation: each left 8/8 passing. Lens: tests. Medium.
+
+- [ ] **drv-11** `kernel/src/drivers/xhci/desc.rs:131` — Test gap: the `len >= 9` guard on
+  interface descriptors in `interfaces()` is not pinned, and removing it passes all 19 desc tests.
+  The `wTotalLength`-versus-`b.len()` bound, the `len<2` check in `descriptors()`, the
+  `(b[0] as usize) < 9` check in `configuration_total` and the first-endpoint-wins check in
+  `hid_interfaces` also survive deletion. With the guard gone, a configuration whose last
+  descriptor is an interface descriptor with bLength 4 at the end of the buffer (config 9 bytes,
+  then `[4,4,0,0]`, wTotalLength 13) makes `interfaces()` index `b[here+4]` and panic (desc.rs:133).
+  That is a kernel panic from a USB device's bytes if the guard regresses. Demonstrated by a
+  temporary test `probe_short_iface` with the guard removed, then restored. Lens: tests. Medium.
+
+- [ ] **drv-12** `kernel/src/io/block.rs:127` — Test gap: `dispatch_block_irp`'s own `max_frags`
+  check, which the code calls the PRDT-overflow protection, has no test. Changing `>` to
+  `> max_frags + 1` passes all io::block tests, and only the `_into_frames` variant is tested.
+  AHCI's backstop in `submit()` would still refuse, but the USB path only clamps
+  (`frags.len().min(MAX_FRAGS)`) and would silently truncate a transfer that the CSW then reports
+  whole. Deleting the storage.rs clamps (in `issue()` and `start()`) also fails no test. Only the
+  boot-time self-test (drivers/mod.rs:147) exercises the limit. Demonstrated by mutation: io::block
+  8 passed, storage 27 passed. Lens: tests. Low.
+
+- [ ] **drv-13** `kernel/src/drivers/hid/descriptor.rs:222` — Test gap: several of `walk()`'s
+  untrusted-input rejections have no test. Each of these mutations passed all 14 descriptor tests:
+  a truncated item at the end, a truncated long item, Pop with nothing pushed (`checked_sub` to
+  `saturating_sub`), a Push past `STACK_MAX` (to modulo), an Input item in a seventeenth report ID,
+  the `done` flag that stops a second mouse or keyboard collection, and the array-already-set check
+  in `take_input` (a second key array). 7 of 13 mutations survived. A regression would read a
+  layout from a corrupt descriptor instead of falling back to the boot protocol: a second
+  collection's fields would overwrite the first's, or a mouse's offsets would come from state a
+  Pop never restored. Demonstrated by mutation. Lens: tests. Low.
+
+- [ ] **drv-14** `kernel/src/pci/mod.rs:195` — Test gap: the multifunction mask in
+  `decode_function` (`header_type_raw(cfg) & 0x7F == 0`) is not pinned, and replacing it with
+  `== 0` passes all 28 pci tests. The I/O BAR address mask (`0xFFFF_FFFC` versus `..F0`) and the
+  low-nibble mask on a 64-bit BAR's low dword are also unpinned. If the multifunction mask
+  regresses, every function of a multifunction device (header type 0x80, such as the ICH9 AHCI at
+  00:1f.2 and many xHCI controllers) gets empty BAR windows. The driver finds no MMIO BAR and
+  silently declines the controller, and only a boot on such hardware would show it. A dropped bit 2
+  in the I/O mask would size 4- or 8-byte I/O BARs wrongly. Demonstrated by mutation. Lens: tests.
+  Low.
+
+- [ ] **drv-15** `kernel/src/drivers/hid/keyboard.rs:132` — Test gap: the key array's
+  `value >= a.logical_min` filter and the `FIRST_KEY` lower bound in `hold()` are not pinned.
+  Replacing the filter with `true` passes all 14 keyboard tests, because every test layout uses
+  `logical_min` 0. A report descriptor with `logical_min` 1 sends 0 in an empty slot. Without the
+  filter `hold()` gets `first + (0 - 1)`, which can land on a real usage and press a phantom key on
+  every report. Demonstrated by mutation. Lens: tests. Low.
+
+- [ ] **drv-16** `kernel/src/power.rs:89` — `flush_every_disk` walks `/dev/blk/<n>` from 0 and
+  stops at the first index `find_block_device` answers None. A departed device's served index is
+  never reused and resolves to None, so the walk ends at the first departed disk or partition and
+  flushes nothing registered after it. Plug in USB stick A, then B (`/dev/blk/k+n`), then unplug A
+  (or rescan it so its partitions depart) and shut down through `sys_power`. The walk ends at A's
+  first gone index, B never gets SYNCHRONIZE CACHE, and the log reports "flushed X of Y disks"
+  counting only the disks before the gap. storage-service and nxinstall/disk flush their own writes
+  first, so this removes the kernel's last backstop, not every flush. Demonstrated: a host probe
+  in device.rs tests with sticks A and B, then A departed, then power.rs's
+  `while let Some(d) = r.block(index)` walk gave `walk visited [(0, false), (1, false), (2, false)];
+  stick B is /dev/blk/Some(4)`. The existing test
+  `a_departed_device_is_found_by_no_path_and_its_index_stays_taken` already asserts that `block(0)`
+  is None while `block(1)` is Some. Lens: architecture. Low.
+
+What held up: the reviewers' mutations on input/ring.rs (6 of 6) and the device.rs registry (4 of 4)
+were all caught, as were 13 of 16 on pci/mod.rs, the partitions.rs end-of-disk, first==0 and
+protective-entry rules, xhci/storage.rs `irp_command` offset, lba+count and zero-block checks, the
+hid/keyboard.rs roll-over and report-id rules, hid/descriptor.rs size overflow and zero-size
+skip, the desc.rs device-descriptor length and bulk-type checks, and the partition-window
+rescan/eject refusal. Read and found sound: `partition_rebase` is overflow-checked and a retired
+window refuses everything with PeerClosed. `dispatch_block_irp` and the `_into_frames` variant
+refuse an over-long fragment list before an IRP exists, and every early Err precedes the IrpBox, so
+the caller's PO rollback is complete. The USB `irp_command` refuses misaligned, empty, past-end
+and >u16 requests. The descriptor walks in xhci/desc.rs and hid/descriptor.rs are bounded by
+`wTotalLength`, each descriptor's length, the 4 KiB report limit and the push/pop depth.
+`string_into` is bounded. The HID decode, the hub config and report reads, and the CSW checks are
+bounded by what was received. The PCI and xHCI capability walks are bounded and cannot loop. The
+GPT/MBR parser uses checked arithmetic, `decode_partlabel` rejects '/' and control bytes, and
+`validate_path` refuses '.' and '..'. The registry and I/O snapshot layouts match the userspace
+reader field for field, with asserted sizes. No `arch::x86_64` references appear in drivers, pci or
+io. Nothing frees in a DPC or ISR. The input and console rings keep whole records, and
+`/dev/registry/changes` waiters are capped at 4. The recorded deferrals (gpt-crc,
+usb-departed-records, block-transfer-split) were not reported.
