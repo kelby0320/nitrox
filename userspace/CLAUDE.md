@@ -39,9 +39,11 @@ Every dependency must clear all of:
   not by reading the crate's `no_std` badge. The first two candidates both needed a
   non-obvious feature flag to work (`ab_glyph` wants `libm`; `fontdue` wants `hashbrown`) and
   both failed with misleading errors without it.
-- **Permissive licence** — MIT, Apache-2.0, BSD, Zlib or similar. Its text ships with the
-  distribution; note that Apache-2.0 §4(d) adds nothing unless the crate ships a `NOTICE`
-  file, and §4(b) bites only if we vendor and patch.
+- **Permissive licence** — MIT, Apache-2.0, BSD, Zlib or similar. **Its text ships with the
+  distribution**: copy the crate's `LICENSE*` files, and any `NOTICE`, into
+  `assets/licenses/<crate>/`, which the image stages at `/system/licenses`; `cargo xtask test`
+  fails while `Cargo.lock` names a crate with none there. Apache-2.0 §4(d) adds a `NOTICE` to
+  that, and §4(b) bites only if we vendor and patch.
 - **Pinned, not floating**, for the same reason the toolchain is: an unpinned version makes
   every build a fresh roll of the dice.
 - **The whole transitive tree clears the same bar.** Count it before agreeing to it — one

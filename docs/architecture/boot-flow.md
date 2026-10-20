@@ -72,10 +72,13 @@ nitrox.hdd (128 MiB raw, GPT — two partitions)
 ├── partition 1 (EFI System, FAT32, 48 MiB, "NITROX_ESP", type ef00)
 │   ├── /EFI/BOOT/BOOTX64.EFI         ← Limine v12.2.0
 │   ├── /boot/limine/limine.conf      ← vendored from boot/limine.conf
+│   ├── /boot/limine/LICENSE          ← Limine's, from its release tarball
 │   ├── /boot/kernel                  ← our ELF
+│   ├── /boot/LICENSE-Terminus.txt    ← the console font's, which the kernel embeds
 │   └── /boot/initramfs               ← cpio; the boot-critical closure
 └── partition 2 (ext4, "nitrox-root", type 8300, rest of disk)
-    └── the root filesystem: /system, /home, /store
+    └── the root filesystem: /system, /home, /store; /system/licenses holds the
+        project's licence and those of the crates its programs link
 ```
 
 **The live image** (`cargo xtask image --live`, Phase 5 Part C) is the same boot with its root in
@@ -87,6 +90,7 @@ nitrox-live.img (GPT — one partition)
 └── partition 1 (EFI System, FAT32, "NITROX_ESP")
     ├── /EFI/BOOT/BOOTX64.EFI, /boot/kernel, /boot/LICENSE-Terminus.txt   ← as above
     ├── /boot/limine/limine.conf      ← the release one, with a menu of three entries
+    ├── /boot/limine/LICENSE          ← as above
     ├── /boot/initramfs               ← the release one, but init.toml names nitrox-live
     ├── /boot/root.img                ← GPT image, one ext4 partition "nitrox-live":
     │                                     the release root, built by the same staging

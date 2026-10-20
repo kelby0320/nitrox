@@ -619,8 +619,8 @@ pub(crate) fn assemble_image(
     Ok(())
 }
 
-/// Build an ESP image of `sectors` sectors: Limine, its configuration, the kernel and its font
-/// licence, the initramfs and any `extra` files. Shared by both image builders so neither forgets a
+/// Build an ESP image of `sectors` sectors: Limine, its configuration and licence, the kernel and its
+/// font licence, the initramfs and any `extra` files. Shared by both image builders so neither forgets a
 /// file.
 pub(crate) fn build_esp(
     esp: &Path,
@@ -646,6 +646,12 @@ pub(crate) fn build_esp(
         .arg("::/boot/limine"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(bootx64).arg("::/EFI/BOOT/BOOTX64.EFI"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(conf).arg("::/boot/limine/limine.conf"))?;
+    // Limine is BSD-2-Clause, whose binary form must reproduce its notice.
+    let limine_licence = limine_dir().join("LICENSE");
+    if !limine_licence.is_file() {
+        return Err(format!("{} is missing: Limine's tarball changed its layout", limine_licence.display()).into());
+    }
+    run(Command::new("mcopy").arg("-i").arg(&espf).arg(&limine_licence).arg("::/boot/limine/LICENSE"))?;
     run(Command::new("mcopy").arg("-i").arg(&espf).arg(kernel).arg("::/boot/kernel"))?;
     // **The kernel carries a font, so its licence travels with it**: the SIL OFL requires each copy
     // of Terminus Font to contain its notice.

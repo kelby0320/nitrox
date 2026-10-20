@@ -157,7 +157,70 @@ pub(crate) fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         }
         println!("xtask: seeded /system/fonts ({} files, {total} bytes)", faces.len());
     }
+
+    // `/system/licenses`: each crates.io crate's licence texts, which ask that a copy of the
+    // software carry them, and the project's own.
+    {
+        let licenses = staging.join("system").join("licenses");
+        let lock = read_text(&repo_root().join("userspace").join("Cargo.lock"))?;
+        let crates = dependency_licences(&lock, &repo_root().join("assets").join("licenses"))?;
+        let mut copies = vec![(repo_root().join("LICENSE"), licenses.join("nitrox"))];
+        for (name, texts) in &crates {
+            copies.extend(texts.iter().map(|t| (t.clone(), licenses.join(name))));
+        }
+        for (from, dir) in &copies {
+            fs::create_dir_all(dir)?;
+            let name = from.file_name().ok_or("a licence with no file name")?;
+            fs::copy(from, dir.join(name)).map_err(|e| format!("stage {}: {e}", from.display()))?;
+        }
+        println!("xtask: seeded /system/licenses (the project's and {} crates')", crates.len());
+    }
     Ok(())
+}
+
+/// **Every crate `lock` takes from a registry or a git source, with its licence texts** in
+/// `dir/<crate>/`. Refused when a crate has none there, or a directory there names a crate the
+/// lockfile no longer does.
+pub(crate) fn dependency_licences(lock: &str, dir: &Path) -> R<Vec<(String, Vec<PathBuf>)>> {
+    let mut crates: Vec<String> = Vec::new();
+    let mut name = None;
+    for line in lock.lines() {
+        if line == "[[package]]" {
+            name = None;
+        } else if let Some(n) = line.strip_prefix("name = \"").and_then(|r| r.strip_suffix('"')) {
+            name = Some(n);
+        } else if line.starts_with("source = ")
+            && let Some(n) = name
+        {
+            crates.push(n.to_string());
+        }
+    }
+    crates.sort();
+    crates.dedup();
+    let mut out = Vec::new();
+    for name in &crates {
+        let mut texts: Vec<PathBuf> = match fs::read_dir(dir.join(name)) {
+            Ok(entries) => entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect(),
+            Err(_) => Vec::new(),
+        };
+        if texts.is_empty() {
+            return Err(format!(
+                "{name} comes from crates.io but {} holds no licence of it: copy its LICENSE files there",
+                dir.join(name).display()
+            )
+            .into());
+        }
+        texts.sort();
+        out.push((name.clone(), texts));
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(n) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if path.is_dir() && !crates.iter().any(|c| c == n) {
+            return Err(format!("{} is for a crate the lockfile no longer names: remove it", path.display()).into());
+        }
+    }
+    Ok(out)
 }
 
 /// Parse `sgdisk -i <n> <disk>` for partition `n`'s first LBA and sector count.
@@ -194,4 +257,41 @@ pub(crate) fn splice_into(dst: &Path, offset: u64, src: &Path) -> R<()> {
     f.seek(SeekFrom::Start(offset))?;
     f.write_all(&data)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOCK: &str = "[[package]]\nname = \"libdraw\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"libm\"\nversion = \"0.2.16\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xtask-licences-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_image_carries_a_licence_for_every_crate_userspace_takes_from_crates_io() {
+        let lock = read_text(&repo_root().join("userspace/Cargo.lock")).unwrap();
+        let crates = dependency_licences(&lock, &repo_root().join("assets/licenses")).unwrap();
+        assert!(crates.iter().any(|(n, t)| n == "ab_glyph" && !t.is_empty()), "{crates:?}");
+    }
+
+    #[test]
+    fn a_crate_with_no_licence_and_a_licence_with_no_crate_are_each_refused() {
+        let d = scratch("missing");
+        let missing = dependency_licences(LOCK, &d).unwrap_err().to_string();
+        assert!(missing.starts_with("libm comes from crates.io"), "{missing}");
+        fs::create_dir_all(d.join("libm")).unwrap();
+        assert!(dependency_licences(LOCK, &d).is_err(), "an empty directory is no licence");
+        fs::write(d.join("libm").join("LICENSE.txt"), "MIT").unwrap();
+        let ok = dependency_licences(LOCK, &d).unwrap();
+        assert_eq!(ok, [(String::from("libm"), vec![d.join("libm").join("LICENSE.txt")])], "a path crate needs none");
+        fs::create_dir_all(d.join("png")).unwrap();
+        let stale = dependency_licences(LOCK, &d).unwrap_err().to_string();
+        assert!(stale.contains("png is for a crate the lockfile no longer names"), "{stale}");
+        fs::remove_dir_all(&d).unwrap();
+    }
 }
