@@ -5,6 +5,7 @@
 //! test-pattern --write PATH   # create PATH, map it writable, fill it, unmap, exit: no sync
 //! test-pattern --check PATH   # read PATH and compare it with the pattern
 //! test-pattern --eject-held PATH NAME   # hold PATH open, and ask for NAME's eject meanwhile
+//! test-pattern --read-device PATH   # read a block of the block device at PATH, and say how it went
 //! ```
 //!
 //! **Why a test program.** No release program lets go of a mapping without a sync (`libfs`,
@@ -15,6 +16,9 @@
 //! **`--eject-held` is a second process a shell cannot be**: `nxsh` has no background jobs, so
 //! nothing at a prompt can hold a file while `disk --eject` runs. This holds `PATH`, sends the
 //! `Eject` itself on a media session, and says the answer — a refusal, a file on it being held.
+//!
+//! **`--read-device` asks an ejected stick for more**, as nothing in a release image does once the
+//! storage service has marked it: the kernel must refuse the read before it reaches the stick.
 //!
 //! **A refusal is named** with the kernel's status; the gate matches `NoAccess` on a read-only
 //! mount rather than a generic "cannot create".
@@ -28,10 +32,12 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use libkern::abi::{IO_OPCODE_READ, IoOp};
 use libkern::debug::Line;
 use libkern::{
-    KError, RIGHT_MAP_READ, RIGHT_MAP_WRITE, SYS_FILE_CREATE, SYS_HANDLE_CLOSE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP,
-    SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4, syscall5,
+    KError, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, SYS_FILE_CREATE, SYS_HANDLE_CLOSE, SYS_IO_SUBMIT,
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4,
+    syscall5,
 };
 
 #[global_allocator]
@@ -48,7 +54,8 @@ fn byte(i: usize) -> u8 {
     ((i >> 12) as u8).wrapping_mul(0x5B) ^ (i as u8) ^ 0xA5
 }
 
-/// Entry point: dispatch `--write`, `--check` or `--eject-held` from the setup message's `argv`.
+/// Entry point: dispatch `--write`, `--check`, `--eject-held` or `--read-device` from the setup
+/// message's `argv`.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let argv: Vec<String> = match libstream::setup::bootstrap(notif, ns, endpoint, arg0).setup() {
@@ -60,8 +67,9 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         [_, "--write", path] => write(ns, path.as_bytes()),
         [_, "--check", path] => check(ns, path.as_bytes()),
         [_, "--eject-held", path, name] => eject_held(ns, path.as_bytes(), name.as_bytes()),
+        [_, "--read-device", path] => read_device(ns, path.as_bytes()),
         _ => {
-            kprint(b"usage: test-pattern --write PATH | --check PATH | --eject-held PATH NAME\n");
+            kprint(b"usage: test-pattern --write PATH | --check PATH | --eject-held PATH NAME | --read-device PATH\n");
             2
         }
     };
@@ -223,6 +231,35 @@ fn eject_held(ns: u64, path: &[u8], name: &[u8]) -> i64 {
             1
         }
     }
+}
+
+/// `--read-device`: the first 4 KiB of the block device at `path`, and how the read went.
+fn read_device(ns: u64, path: &[u8]) -> i64 {
+    const LEN: u64 = 4096;
+    let (st, node) = libfs::lookup_wait(ns, path, RIGHT_READ);
+    // SAFETY: a plain anonymous object of LEN bytes.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, LEN, 0, 0, 0) };
+    let mut l = Line::new();
+    l.s(b"test-pattern: a read of ").untrusted(path).s(b": ");
+    if st != 0 || node == 0 || mem <= 0 {
+        l.s(b"would not open: ").s(status_name(if st != 0 { st } else { mem as i32 }).as_bytes()).end();
+        return 1;
+    }
+    let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: mem as u64, buf_offset: 0, offset: 0, length: LEN };
+    // SAFETY: `node` is a block device handle this call holds with READ; `&op` names a memory object
+    // this call created.
+    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
+    let (status, moved) = if po < 0 { (po as i32, 0) } else { po_wait(po as u64) };
+    // SAFETY: closing the handles this call opened.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, mem as u64);
+        syscall1(SYS_HANDLE_CLOSE, node);
+    }
+    match status {
+        0 => l.s(b"read ").u(moved).s(b" bytes").end(),
+        _ => l.s(b"refused: ").s(status_name(status).as_bytes()).s(b" (").i(status as i64).s(b")").end(),
+    }
+    0
 }
 
 fn po_wait(po: u64) -> (i32, u64) {

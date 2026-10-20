@@ -11,10 +11,15 @@ pub(crate) fn trace_args(cmd: &mut Command, log: &Path) {
     cmd.arg("-trace").arg("scsi_disk_new_request").arg("-trace").arg("scsi_disk_check_condition").arg("-D").arg(log);
 }
 
-/// Where in `text` the first eject is traced, as a byte offset.
-pub(crate) fn eject_traced(text: &str) -> Option<usize> {
-    let mut at = 0;
-    for line in text.split_inclusive('\n') {
+/// How long `log` is now, for [`eject_traced`] to look past: what an eject must come after.
+pub(crate) fn log_len(log: &Path) -> usize {
+    std::fs::metadata(log).map_or(0, |m| m.len() as usize)
+}
+
+/// Where in `text` the first eject at or after byte `from` is traced, as a byte offset.
+pub(crate) fn eject_traced(text: &str, from: usize) -> Option<usize> {
+    let mut at = from;
+    for line in text.get(from..)?.split_inclusive('\n') {
         if line.contains("scsi_disk_new_request") && cdb(line) == EJECT_CDB {
             return Some(at);
         }
@@ -82,22 +87,35 @@ mod tests {
             let log = format!(
                 "scsi_disk_new_request Command: lun=0 tag=0x4 {read}\nscsi_disk_new_request Command: lun=0 tag=0x44 {eject}\n"
             );
-            let at = eject_traced(&log).expect("the eject");
+            let at = eject_traced(&log, 0).expect("the eject");
             assert!(log[at..].contains("tag=0x44"), "the line it is on");
         }
         let tagged = "scsi_disk_new_request Command: lun=0 tag=0x1b data=28 00 00 00 00 01 00 00 01 00";
-        assert_eq!(eject_traced(tagged), None, "a tag is not a command");
+        assert_eq!(eject_traced(tagged, 0), None, "a tag is not a command");
         assert_eq!(
-            eject_traced("scsi_disk_new_request Command: lun=0 tag=0x5 data=1b 00 00 00 01 00"),
+            eject_traced("scsi_disk_new_request Command: lun=0 tag=0x5 data=1b 00 00 00 01 00", 0),
             None,
             "a start"
         );
     }
 
     #[test]
+    fn a_later_eject_is_found_past_an_earlier_one() {
+        let eject = |tag: &str| format!("scsi_disk_new_request Command: lun=0 tag={tag} data=1b 00 00 00 02 00\n");
+        let first = eject("0x44");
+        let log =
+            format!("{first}scsi_disk_new_request Command: lun=0 tag=0x4 data=00 00 00 00 00 00\n{}", eject("0x9"));
+        assert_eq!(eject_traced(&log, 0), Some(0), "the first");
+        let at = eject_traced(&log, first.len()).expect("the second");
+        assert!(log[at..].starts_with("scsi_disk_new_request Command: lun=0 tag=0x9"), "{}", &log[at..]);
+        assert_eq!(eject_traced(&log, at + 1), None, "none after the last");
+        assert_eq!(eject_traced(&log, log.len() + 1), None, "past the end");
+    }
+
+    #[test]
     fn a_command_after_the_eject_is_found_by_its_sense() {
         let log = "scsi_disk_new_request Command: lun=0 tag=0x44 data=1b 00 00 00 02 00\n";
-        let at = eject_traced(log).expect("the eject");
+        let at = eject_traced(log, 0).expect("the eject");
         let after = format!("{log}scsi_disk_check_condition Command complete tag=0x10 sense=2/58/0\n");
         assert!(not_ready_after(&after, at));
         assert!(!not_ready_after(&after, after.len()), "nothing after the end");

@@ -288,7 +288,7 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     let _ = settle_and_capture(qmp, &dump_at)?;
     println!("  ok: the editor saved onto the stick through Save As: Up to /, then storage/{MEDIA_LABEL}");
 
-    let from = s.transcript().len();
+    let from = before_eject(s, work);
     let pressed = click_at(qmp, s, side_x + browser::SIDEBAR_W - button_w / 2, drive_top(1) + browser::ROW_H / 2)?;
     if !pressed.contains(&format!("win={files_id}")) {
         return Err(format!("the click on the eject button reached {pressed:?}, not Files' window {files_id}").into());
@@ -297,7 +297,7 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     s.expect(&format!("storage-service: unmounted {MEDIA_LABEL}, left clean"))?;
     s.expect(&format!("storage-service: ejected {MEDIA_LABEL}, safe to remove"))?;
     s.expect_all(&[&format!("storage-service: {MEDIA_LABEL} stopped"), &format!("nxfiles: {MEDIA_LABEL} ejected")])?;
-    if s.transcript()[from..].contains("password") {
+    if s.transcript()[from.0..].contains("password") {
         return Err("ejecting from Files asked for a password".into());
     }
     // **The row's label, not its button**: the pointer rests where the button was, and the cursor
@@ -318,11 +318,17 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     Ok(())
 }
 
-/// **An ejected stick was stopped and asked nothing after**: its eject traced and its tray open, no
-/// request refused since `from`, and no command answered as a missing medium after the eject.
-pub(crate) fn stopped_and_left_alone(s: &Session, qmp: &mut Qmp, work: &Path, id: &str, from: usize) -> R<()> {
+/// The transcript's length and the SCSI trace's, before an eject.
+pub(crate) fn before_eject(s: &Session, work: &Path) -> (usize, usize) {
+    (s.transcript().len(), crate::scsi_trace::log_len(&work.join("scsi.log")))
+}
+
+/// **An ejected stick was stopped and asked nothing after**: since `from`, its eject traced, its
+/// tray open, no request refused, and no command answered as a missing medium after the eject.
+pub(crate) fn stopped_and_left_alone(s: &Session, qmp: &mut Qmp, work: &Path, id: &str, from: (usize, usize)) -> R<()> {
+    let (from, log_from) = from;
     let log = fs::read_to_string(work.join("scsi.log")).unwrap_or_default();
-    let at = crate::scsi_trace::eject_traced(&log)
+    let at = crate::scsi_trace::eject_traced(&log, log_from)
         .ok_or("no START STOP UNIT with LoEj reached the stick: the kernel did not stop it")?;
     let blocks = qmp.execute(r#"{"execute":"query-block"}"#)?;
     if crate::scsi_trace::tray_open(&blocks, id) != Some(true) {

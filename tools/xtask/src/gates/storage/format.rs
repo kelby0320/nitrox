@@ -75,7 +75,7 @@ pub(crate) fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R
         blank.display()
     ))?;
     let from = s.transcript().len();
-    qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"stickblank","bus":"xhci.0","drive":"stickblank"}}"#)?;
+    qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"stickblank","bus":"xhci.0","drive":"stickblank","removable":true}}"#)?;
     let disk_line = line_after(s, from, "\", 4194304 blocks of 512 bytes, record ")?;
     let port = disk_line
         .strip_prefix("usb: port ")
@@ -163,7 +163,9 @@ pub(crate) fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R
         return Err(format!("`disk --format blk-{part}` wrote while it was mounted").into());
     }
     println!("  ok: the same command, while it is mounted, is refused before anything is written");
+    let ejecting = crate::gates::media::before_eject(s, work);
     eject_stick(s, &["NITROX"])?;
+    crate::gates::media::stopped_and_left_alone(s, qmp, work, "stickblank", ejecting)?;
     let from = s.transcript().len();
     qmp.execute(r#"{"execute":"device_del","arguments":{"id":"stickblank"}}"#)?;
     s.line_since(from, &format!("storage-service: blk-{part} departed"), any, secs(30))?;
