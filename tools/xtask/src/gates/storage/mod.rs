@@ -100,11 +100,12 @@ pub(crate) fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    crate::scsi_trace::trace_args(&mut cmd, &work.join("scsi.log"));
     println!("xtask: storage gate — booting the test live image beside a copy of the release disk…\n");
     let mut session = Session::spawn(cmd, "check-storage")?;
     let result = run_storage_steps(&mut session, &disk, &work).and_then(|()| {
         let mut qmp = Qmp::connect(&qmp_sock)?;
-        run_stick_steps(&mut session, &mut qmp)?;
+        run_stick_steps(&mut session, &mut qmp, &work)?;
         run_format_steps(&mut session, &mut qmp, &work)
     });
     let transcript = session.finish();
@@ -557,7 +558,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
 }
 
 /// **The blank stick `check-storage` partitions and formats**, and the copy of it
-/// taken once its ext4 was ejected, before an MBR replaced the GPT.
+/// taken once its ext4 was unmounted, before an MBR replaced the GPT.
 pub(crate) const BLANK_STICK: &str = "stick-blank.img";
 
 pub(crate) const BLANK_STICK_EXT4: &str = "stick-blank-ext4.img";

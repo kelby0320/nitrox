@@ -260,7 +260,8 @@ since every `--selftest` gate runs it; `test-qemu` holds its line.
 
 **A stick the guest formats is checked twice** (Phase 6 Part G). `check-storage`'s blank stick is
 formatted ext4 whole, then partitioned again and formatted FAT, all in one boot, so the host copies
-the image once the ext4 is ejected — before the MBR replaces its GPT — and checks the copy and the
+the image once the ext4 is unmounted — before the MBR replaces its GPT, and **unmounted, not
+ejected**, since an ejected stick is refused everything until it is plugged in again — and checks the copy and the
 final image after the machine stops, as it checks a stick pulled while mounted. **Which partition
 is the boot stick's is asked of `/dev/devices`** (`filter parent == "blk-<n>"`), not read off the
 report lines: the report gives a partition's reason, and the live stick's ESP's is its clusters, not
@@ -277,6 +278,19 @@ second drive row. Where it aims inside a dialog it does not write down: the edit
 out on the host by `libui`, with the theme the image stages, and the gate clicks where that layout
 puts the Up button. **A cursor is drawn into the screen a gate reads**, so a check for something
 gone looks where the pointer is not.
+
+**What reaches a stick is read off QEMU's SCSI trace** (pre-Phase-7 Part C.4), as `check-terminal`
+reads the keyboard's lights off the PS/2 one. `check-media` and `check-storage` run with
+`-trace scsi_disk_new_request -trace scsi_disk_check_condition` and plug their sticks
+`removable=on`, as real sticks report, so `START STOP UNIT` opens QEMU's tray (`query-block`'s
+`tray_open`). After an eject each asserts **three things, each controlled by a boot that broke it**:
+the command reached the stick and its tray opened (a driver completing the eject unsent fails it);
+no request was refused since, which is the kernel's `ejected, and asked for more` (a service still
+probing the stick fails it); and no command reached it after, which QEMU answers as `NOT READY`,
+`MEDIUM NOT PRESENT` (that service with a driver letting the request through fails it). **The trace
+is not one device's**: every `usb-storage` reports `lun=0`, so a command is told apart by what it
+is, an eject, or by what only an ejected stick answers. **CI's QEMU 8.2 prints a CDB `data= 0x1b
+0x00…`, later ones `data=1b 00…`**, and the reader takes both.
 
 **A gate that boots a test image and types meets `boot-probe` unless it waits for it.** `boot-probe`
 starts once the test harness's chain has finished, and some of its tests change what a session

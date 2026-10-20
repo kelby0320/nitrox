@@ -31,6 +31,7 @@ mod qmp;
 mod render;
 mod rootfs;
 mod screen;
+mod scsi_trace;
 mod session;
 mod shot;
 mod throughput;

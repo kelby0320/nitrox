@@ -15,7 +15,7 @@ use crate::*;
 ///    write-back and the server's marking each come back at once, the dirty file let go, the server
 ///    gone, the label gone, and a command after it runs.
 /// 4. **The same stick plugged in again** is a new disk at a new index, mounted again.
-pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
+pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R<()> {
     let secs = std::time::Duration::from_secs;
     let any = |_: &str| true;
     let line_of = |s: &mut Session, from: usize, pat: &str| -> R<String> {
@@ -35,7 +35,7 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     };
     let plug = |qmp: &mut Qmp, id: &str, node: &str| -> R<()> {
         qmp.execute(&format!(
-            r#"{{"execute":"device_add","arguments":{{"driver":"usb-storage","id":"{id}","bus":"xhci.0","drive":"{node}"}}}}"#
+            r#"{{"execute":"device_add","arguments":{{"driver":"usb-storage","id":"{id}","bus":"xhci.0","drive":"{node}","removable":true}}}}"#
         ))?;
         Ok(())
     };
@@ -134,8 +134,14 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     s.expect("still-mounted=1")?;
     s.expect("/home>")?;
     println!("  ok: an eject of one partition while a file on the other is held is refused, and leaves both mounted");
+    let ejecting = s.transcript().len();
     eject_stick(s, &[STICK_MBR_LABEL, STICK_MBR_LABEL_2])?;
     println!("  ok: written without a sync, and both partitions ejected by one `disk --eject`, no password asked");
+    // **Listed to be removed, and read no more**: the table's read probes every unmounted device.
+    s.send(&format!("disk --list | filter name == \"blk-{index}\" | map {{ |r| format(\"note-is={{}}\", r.note) }}"))?;
+    s.expect("note-is=ejected; remove it")?;
+    s.expect("/home>")?;
+    crate::gates::media::stopped_and_left_alone(s, qmp, work, "stickmbr", ejecting)?;
     let from = s.transcript().len();
     pull(qmp, "stickmbr")?;
     s.line_since(from, &format!("usb: port {port}: disconnected; slot "), any, secs(30))?;
@@ -319,6 +325,7 @@ pub(crate) fn eject_stick(s: &mut Session, names: &[&str]) -> R<()> {
     }
     let all = names.join(", ");
     s.expect(&format!("storage-service: ejected {all}, safe to remove"))?;
+    s.expect(&format!("storage-service: {all} stopped"))?;
     s.expect(&format!("disk: ejected {all}"))?;
     s.expect("/home>")?;
     if s.transcript()[from..].contains("password:") {

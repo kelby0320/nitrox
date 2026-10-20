@@ -36540,3 +36540,29 @@ second declined.
   own button, twice: a button flipping on its own clicks passes the first round by luck and fails
   the second, which a boot with that `nxterm` showed. The shell logs up to 32 window geometries
   where it logged 16, as the gate reads one after each of its moves.
+
+## 2026-10-19 — Before Phase 7, Part C.4: an ejected stick stops, built
+
+- **`IoOpcode::Eject = 4`**, the fifth opcode on `sys_io_submit`, added as `Flush` and `Rescan`
+  were: no buffer, no range, `WRITE` on a disk. **The ABI hash changes**, as the opcodes are one of
+  its inputs; `IrpOp`, libkern's constant and `abi-sync-check`'s family follow. A partition refuses
+  it `Unsupported`, as it does a rescan, and AHCI and the RAM disk refuse it by name.
+- **The USB stick driver sends `START STOP UNIT`** with LoEj set and Start clear, on the path a
+  flush takes. **A unit that answers is ejected**: every later request on it is refused
+  `PeerClosed`, as a pulled stick's are, until it arrives again, and the first refused is logged,
+  since nothing should ask. An illegal request completes it `Unsupported`; another failure
+  `IoError`; a departure `PeerClosed`. A failure leaves the unit running.
+- **The storage service stops the stick** at the end of an eject's chain, and marks its disk and
+  partitions ejected (`Found::Ejected`): read no more, noted `ejected; remove it`, and refused a
+  mount or a `Reread`. A stop that fails leaves the eject done, its line saying why.
+- **`check-storage` unmounts its formatted stick rather than ejecting it** before partitioning it
+  again: an ejected stick is refused everything until it is plugged in again, which the step
+  assumed it was not.
+- **The gates read QEMU's SCSI trace**, as `check-terminal` reads the PS/2 one. `check-media` and
+  `check-storage` plug their sticks `removable=on` and assert the eject reached the stick and
+  opened its tray, that nothing was refused since, and that no command reached it after, **each
+  shown to fail by a boot that broke it**. The plan named two controls; the driver's refusal made a
+  third necessary, since a service reading the stick after the eject meets the refusal and reaches
+  nothing. CI's QEMU 8.2 prints a CDB differently from later ones, and the reader takes both; both
+  gates pass on 8.2.
+- **Whether the light goes out is the laptop's to say**, as the definition of done has it.
