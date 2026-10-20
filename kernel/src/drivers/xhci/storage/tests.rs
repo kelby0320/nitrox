@@ -276,11 +276,7 @@ fn a_reads_status_is_asked_for_when_its_data_ends_and_the_next_starts_at_its_sta
 
     let mut second = irp(IrpOp::Write, 0, 512, &frags[..1]);
     assert_eq!(disks.submit(&mut second, ctx, 0), Action::None, "queued");
-    assert_eq!(
-        disks.on_transfer(9, 4, code::SUCCESS, 0x99, 1),
-        Some(Action::None),
-        "OUT's event is not the data's"
-    );
+    assert_eq!(disks.on_transfer(9, 4, code::SUCCESS, 0x99, 1), Some(Action::None), "OUT's event is not the data's");
     assert_eq!(fake.trb(0, 2), Trb::default(), "so no status yet");
     assert_eq!(
         disks.on_transfer(9, 3, code::SHORT_PACKET, 0x10_000, 1),
@@ -542,11 +538,7 @@ fn a_command_that_goes_wrong_is_left_for_the_hub_thread() {
     let mut a = irp(IrpOp::Flush, 0, 0, &[]);
     disks.submit(&mut a, ctx, 0);
     assert_eq!(fake.trb(1, 0).0[3] & (1 << 5), 1 << 5, "with no data, the command wrapper interrupts");
-    assert_eq!(
-        disks.on_transfer(2, 4, code::SUCCESS, 0, 1),
-        Some(Action::None),
-        "and its event asks for the status"
-    );
+    assert_eq!(disks.on_transfer(2, 4, code::SUCCESS, 0, 1), Some(Action::None), "and its event asks for the status");
     fake.answer(1, 1);
     assert_eq!(disks.on_transfer(2, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Wake));
     assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Status(Status::Failed)));
