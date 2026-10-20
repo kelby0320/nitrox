@@ -6,7 +6,7 @@
 "kernel/src/arch/x86_64/idt.rs" = 1026
 "kernel/src/device.rs" = 1379
 "kernel/src/drivers/xhci/hid.rs" = 1106
-"kernel/src/drivers/xhci/storage.rs" = 2519
+"kernel/src/drivers/xhci/storage.rs" = 1696
 "kernel/src/handle/table.rs" = 1583
 "kernel/src/main.rs" = 1213
 "kernel/src/mm/addr_space.rs" = 1176
@@ -45,8 +45,7 @@
 "userspace/nxsh/src/parse.rs" = 1867
 "userspace/nxterm/src/lib.rs" = 2341
 "userspace/service-mgr/src/main.rs" = 2315
-"userspace/storage-service/src/lib.rs" = 1111
-"userspace/storage-service/src/main.rs" = 1744
+"userspace/storage-service/src/main.rs" = 1538
 "userspace/test-harness/src/harness.rs" = 3991
 "userspace/test-harness/src/uiclient.rs" = 1265
 "userspace/view-broker/src/lib.rs" = 1646
