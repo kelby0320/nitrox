@@ -8,7 +8,7 @@ use libkern::device::{DeviceKind, DeviceRecord, NO_PARENT};
 use libstream::wire::{Table, Value};
 
 use crate::labels;
-use crate::mounts::{EjectRefusal, Plan, Refusal, Server, at, automount, eject, explicit, in_use};
+use crate::mounts::{Plan, Refusal, Server, at, automount, explicit, in_use};
 use crate::probe::{Found, fat_label, probe};
 use crate::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot, partuuid, source_device};
 use crate::suffix::{self, Asked, session_only};
@@ -89,7 +89,7 @@ fn with_sector(sector: &[u8; 512]) -> Image {
     Image(RefCell::new(img))
 }
 
-fn rec(id: u32, kind: DeviceKind, served: u32, parent: u32, name: &str, blocks: u64) -> DeviceRecord {
+pub(crate) fn rec(id: u32, kind: DeviceKind, served: u32, parent: u32, name: &str, blocks: u64) -> DeviceRecord {
     let mut r = DeviceRecord {
         id,
         class: 1,
@@ -287,7 +287,7 @@ fn devices() -> Vec<Device> {
     release_records().into_iter().map(|record| Device { found: found(&record), record }).collect()
 }
 
-fn decode(bytes: &[u8]) -> Table {
+pub(crate) fn decode(bytes: &[u8]) -> Table {
     Table::decode(bytes).unwrap()
 }
 
@@ -635,7 +635,7 @@ fn a_fat_is_read_by_its_servers_own_check() {
     assert_eq!(probe(&served).clean(), Some(false), "the state byte's bit, as fsck.fat reads it");
 }
 
-fn on_usb(mut r: DeviceRecord) -> DeviceRecord {
+pub(crate) fn on_usb(mut r: DeviceRecord) -> DeviceRecord {
     r.driver[..crate::mounts::USB_STORAGE.len()].copy_from_slice(crate::mounts::USB_STORAGE);
     r
 }
@@ -757,7 +757,7 @@ fn a_fat_made_on_a_whole_stick_is_still_served() {
     assert_eq!(probe_record(&lucky, &disk).server(), Some(Server::Fat), "status 0x33 is no entry's");
 }
 
-fn with_a_stick(found: Found) -> Vec<Device> {
+pub(crate) fn with_a_stick(found: Found) -> Vec<Device> {
     let mut ds = devices();
     ds.push(Device { record: on_usb(rec(20, DeviceKind::Disk, 5, 19, "a stick", 614_400)), found: Found::Nothing });
     ds.push(Device { record: rec(21, DeviceKind::Partition, 6, 20, "partition 1 (unlabelled)", 614_000), found });
@@ -773,55 +773,6 @@ fn a_stick_mounts_writable_on_any_boot_and_an_internal_disk_read_only_on_a_live_
     };
     assert_eq!(modes(true), [(8, Mode::Ro), (21, Mode::Rw)], "a live boot: the RAM disk read-only, the stick writable");
     assert_eq!(modes(false), [(8, Mode::Rw), (21, Mode::Rw)]);
-}
-
-/// **A session ejects a stick, by the name it is mounted under**, and nothing else. **The name is
-/// the mount's, not the filesystem's label**: two sticks labelled `DATA` are mounted `DATA` and
-/// `DATA-2`, and each name ejects its own.
-#[test]
-fn a_session_ejects_a_stick_by_its_mount_name_and_nothing_internal() {
-    let fat = |label: &str| Found::Fat { label: String::from(label), clean: Some(true), refused: None };
-    let mut ds = with_a_stick(fat("DATA"));
-    ds.push(Device { record: on_usb(rec(30, DeviceKind::Disk, 7, 29, "another stick", 65_536)), found: fat("DATA") });
-    ds.push(Device { record: on_usb(rec(40, DeviceKind::Disk, 8, 39, "a third", 65_536)), found: fat("") });
-    let init = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
-    let mut mounted: Vec<Mounted> = init.to_vec();
-    for p in automount(&ds, &init, true, true) {
-        mounted.push(Mounted { device: p.device, at: at(&p.label), by: By::Storage, mode: p.mode });
-    }
-    let names: Vec<&str> = mounted.iter().filter_map(|m| m.at.strip_prefix("/storage/")).collect();
-    assert_eq!(names, ["nitrox-live", "DATA", "DATA-2", "blk-8"], "the names the table's `mounted` column holds");
-    let names = |n: &[&str]| -> Result<Vec<String>, EjectRefusal> { Ok(n.iter().map(|s| String::from(*s)).collect()) };
-    assert_eq!(eject(&ds, &mounted, "DATA"), names(&["DATA"]));
-    assert_eq!(eject(&ds, &mounted, "DATA-2"), names(&["DATA-2"]), "the second stick's own name, not its label");
-    assert_eq!(eject(&ds, &mounted, "blk-8"), names(&["blk-8"]), "a stick with no label");
-    assert_eq!(eject(&ds, &mounted, "nitrox-live"), Err(EjectRefusal::NotRemovable), "a RAM disk's partition");
-    assert_eq!(eject(&ds, &mounted, "/"), Err(EjectRefusal::NotMounted), "init's root is not under /storage");
-    assert_eq!(eject(&ds, &mounted, "NXFAT"), Err(EjectRefusal::NotMounted));
-    let by_init = [Mounted { device: 21, at: at("DATA"), by: By::Init, mode: Mode::Rw }];
-    assert_eq!(eject(&ds, &by_init, "DATA"), Err(EjectRefusal::NotMounted), "`init`'s, wherever it put it");
-    assert_eq!(EjectRefusal::NotRemovable.kerror(), libkern::KError::NoAccess);
-    assert!(core::str::from_utf8(EjectRefusal::NotRemovable.why()).unwrap().contains("with admin disk --unmount"));
-}
-
-#[test]
-fn an_eject_takes_every_mount_on_the_stick() {
-    let fat = |label: &str| Found::Fat { label: String::from(label), clean: Some(true), refused: None };
-    let mut ds = with_a_stick(fat("ONE"));
-    let second = rec(22, DeviceKind::Partition, 7, 20, "partition 2 (unlabelled)", 4_096);
-    ds.push(Device { record: second, found: fat("TWO") });
-    ds.push(Device { record: on_usb(rec(30, DeviceKind::Disk, 8, 29, "another stick", 65_536)), found: fat("OTHER") });
-    let init = [Mounted { device: 7, at: String::from("/"), by: By::Init, mode: Mode::Rw }];
-    let mut mounted: Vec<Mounted> = init.to_vec();
-    for p in automount(&ds, &init, true, true) {
-        mounted.push(Mounted { device: p.device, at: at(&p.label), by: By::Storage, mode: p.mode });
-    }
-    let both = Ok(std::vec![String::from("ONE"), String::from("TWO")]);
-    assert_eq!(eject(&ds, &mounted, "ONE"), both);
-    assert_eq!(eject(&ds, &mounted, "TWO"), both, "either partition names the stick");
-    assert_eq!(eject(&ds, &mounted, "OTHER"), Ok(std::vec![String::from("OTHER")]));
-    let without_one: Vec<Mounted> = mounted.iter().filter(|m| m.at != at("ONE")).cloned().collect();
-    assert_eq!(eject(&ds, &without_one, "TWO"), Ok(std::vec![String::from("TWO")]), "what is left of it");
 }
 
 #[test]

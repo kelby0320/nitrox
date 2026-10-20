@@ -9,7 +9,7 @@ use crate::*;
 ///    naming the disk the machine started from.
 /// 1. **A blank 2 GiB stick plugged in, then `disk --format DISK ext4`**: a GPT — the default for
 ///    ext4 — with one partition, which the kernel's rescan publishes, an ext4 in it, mounted
-///    writable, written and ejected. Copied then, for the host to read the GPT and the ext4.
+///    writable, written and unmounted. Copied then, for the host to read the GPT and the ext4.
 /// 2. **`disk --partition DISK`**: an MBR, the GPT's partition departed and a new one arrived,
 ///    holding nothing — the old ext4 at 1 MiB wiped with the table.
 /// 3. **`disk --format PART fat`**: a FAT32, read again and mounted writable, written; the same
@@ -75,7 +75,7 @@ pub(crate) fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R
         blank.display()
     ))?;
     let from = s.transcript().len();
-    qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"stickblank","bus":"xhci.0","drive":"stickblank"}}"#)?;
+    qmp.execute(r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"stickblank","bus":"xhci.0","drive":"stickblank","removable":true}}"#)?;
     let disk_line = line_after(s, from, "\", 4194304 blocks of 512 bytes, record ")?;
     let port = disk_line
         .strip_prefix("usb: port ")
@@ -109,9 +109,14 @@ pub(crate) fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R
     s.send(&format!("test-pattern --write {at}"))?;
     s.expect(&format!("test-pattern: wrote {STORAGE_PATTERN_LEN} bytes to {at} through a mapping, and did not sync"))?;
     s.expect("/home>")?;
-    eject_stick(s, &["nitrox"])?;
+    // **Unmounted, not ejected**: the next step partitions it, and an ejected stick is refused.
+    with_admin_asked(s, "disk --unmount nitrox")?;
+    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
+    s.expect("storage-service: unmounted nitrox, left clean")?;
+    s.expect("disk: unmounted nitrox")?;
+    s.expect("/home>")?;
     fs::copy(&blank, work.join(BLANK_STICK_EXT4))?;
-    println!("  ok: written without a sync, and ejected");
+    println!("  ok: written without a sync, and unmounted");
 
     // 2. Partitioned again, MBR: the GPT's partition goes, and the new one holds nothing.
     let from = s.transcript().len();
@@ -158,7 +163,9 @@ pub(crate) fn run_format_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R
         return Err(format!("`disk --format blk-{part}` wrote while it was mounted").into());
     }
     println!("  ok: the same command, while it is mounted, is refused before anything is written");
+    let ejecting = crate::gates::media::before_eject(s, work);
     eject_stick(s, &["NITROX"])?;
+    crate::gates::media::stopped_and_left_alone(s, qmp, work, "stickblank", ejecting)?;
     let from = s.transcript().len();
     qmp.execute(r#"{"execute":"device_del","arguments":{"id":"stickblank"}}"#)?;
     s.line_since(from, &format!("storage-service: blk-{part} departed"), any, secs(30))?;
@@ -191,7 +198,7 @@ fn carve_sparse(from: &Path, at: u64, len: u64, to: &Path) -> R<()> {
 }
 
 /// **The stick partitioned and formatted in the guest, on the host**:
-/// - **as its ext4 was ejected** (`ext4_copy`): a GPT whose one partition is a Linux filesystem
+/// - **as its ext4 was unmounted** (`ext4_copy`): a GPT whose one partition is a Linux filesystem
 ///   from 1 MiB to the last usable sector, holding an ext4 `e2fsck -fn` finds clean, with the
 ///   pattern `debugfs` reads;
 /// - **as it was pulled** (`stick`): an MBR naming one FAT32 partition from 1 MiB to the end, **no

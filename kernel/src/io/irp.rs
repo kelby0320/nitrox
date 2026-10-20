@@ -80,6 +80,8 @@ pub enum IrpOp {
     Flush = 2,
     /// Read a disk's partition table again. Carries no buffer and no range.
     Rescan = 3,
+    /// Stop a removable disk's medium and eject it. Carries no buffer and no range.
+    Eject = 4,
 }
 
 /// `IrpStatus` — the in-flight sentinel and terminal status. A completed IRP
@@ -210,6 +212,7 @@ mod tests {
         use crate::libkern::io_op::IoOpcode;
         assert_eq!(IrpOp::Flush as u32, IoOpcode::Flush as u32);
         assert_eq!(IrpOp::Rescan as u32, IoOpcode::Rescan as u32);
+        assert_eq!(IrpOp::Eject as u32, IoOpcode::Eject as u32);
         assert_eq!(IrpStatus::Success as i32, 0);
         assert_eq!(IrpStatus::Pending as i32, 1);
     }

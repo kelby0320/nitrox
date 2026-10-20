@@ -124,142 +124,7 @@ pub fn csw(b: &[u8], tag: u32) -> Status {
 }
 
 /// The commands this driver sends, each its CDB's bytes, and the answers it reads.
-pub mod scsi {
-    /// `TEST UNIT READY`.
-    pub const fn test_unit_ready() -> [u8; 6] {
-        [0x00, 0, 0, 0, 0, 0]
-    }
-
-    /// `REQUEST SENSE` for 18 bytes of fixed-format sense data.
-    pub const fn request_sense() -> [u8; 6] {
-        [0x03, 0, 0, 0, SENSE_LEN as u8, 0]
-    }
-
-    /// `INQUIRY` for the standard data's first 36 bytes.
-    pub const fn inquiry() -> [u8; 6] {
-        [0x12, 0, 0, 0, INQUIRY_LEN as u8, 0]
-    }
-
-    /// `READ CAPACITY(10)`.
-    pub const fn read_capacity() -> [u8; 10] {
-        [0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    }
-
-    /// `READ(10)` or `WRITE(10)` of `count` blocks from `lba`, big-endian.
-    pub fn rw10(write: bool, lba: u32, count: u16) -> [u8; 10] {
-        let l = lba.to_be_bytes();
-        let c = count.to_be_bytes();
-        [if write { 0x2A } else { 0x28 }, 0, l[0], l[1], l[2], l[3], 0, c[0], c[1], 0]
-    }
-
-    /// `READ CAPACITY(16)` — `SERVICE ACTION IN(16)`, service action `0x10` — for its answer's
-    /// first [`CAPACITY16_LEN`] bytes: a unit too big for `READ CAPACITY(10)`.
-    pub const fn read_capacity16() -> [u8; 16] {
-        [0x9E, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CAPACITY16_LEN as u8, 0, 0]
-    }
-
-    /// `READ(16)` or `WRITE(16)` of `count` blocks from `lba`, big-endian: a unit of 2³² blocks or
-    /// more.
-    pub fn rw16(write: bool, lba: u64, count: u32) -> [u8; 16] {
-        let l = lba.to_be_bytes();
-        let c = count.to_be_bytes();
-        [
-            if write { 0x8A } else { 0x88 },
-            0,
-            l[0],
-            l[1],
-            l[2],
-            l[3],
-            l[4],
-            l[5],
-            l[6],
-            l[7],
-            c[0],
-            c[1],
-            c[2],
-            c[3],
-            0,
-            0,
-        ]
-    }
-
-    /// `SYNCHRONIZE CACHE(10)` of the whole medium: an LBA and a count of zero.
-    pub const fn synchronize_cache() -> [u8; 10] {
-        [0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    }
-
-    /// Fixed-format sense data's length, as `REQUEST SENSE` asks for it.
-    pub const SENSE_LEN: usize = 18;
-    /// Standard `INQUIRY` data's length, through the product revision.
-    pub const INQUIRY_LEN: usize = 36;
-    /// `READ CAPACITY(10)`'s answer: the last block's address and the block length.
-    pub const CAPACITY_LEN: usize = 8;
-    /// How much of `READ CAPACITY(16)`'s answer is asked for: its parameter data's 32 bytes, of
-    /// which the first twelve are the last block's address and the block length.
-    pub const CAPACITY16_LEN: usize = 32;
-
-    /// Sense key: the unit is not ready — becoming so, or with no medium.
-    pub const NOT_READY: u8 = 0x2;
-    /// Sense key: the command was refused — for a flush, there is no cache to flush.
-    pub const ILLEGAL_REQUEST: u8 = 0x5;
-    /// Sense key: the unit was reset or its medium changed, and says so once.
-    pub const UNIT_ATTENTION: u8 = 0x6;
-    /// The additional sense code for "medium not present", under `NOT_READY`.
-    pub const MEDIUM_NOT_PRESENT: u8 = 0x3A;
-
-    /// What `INQUIRY` says of a unit.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub struct Inquiry {
-        /// A direct-access block device, connected: qualifier 0, type 0.
-        pub direct_access: bool,
-        /// The vendor's identification, space-padded ASCII.
-        pub vendor: [u8; 8],
-        /// The product's identification, space-padded ASCII.
-        pub product: [u8; 16],
-    }
-
-    /// Read `INQUIRY`'s answer, or `None` if it is too short to be one.
-    pub fn inquiry_answer(b: &[u8]) -> Option<Inquiry> {
-        if b.len() < INQUIRY_LEN {
-            return None;
-        }
-        let mut vendor = [0u8; 8];
-        vendor.copy_from_slice(&b[8..16]);
-        let mut product = [0u8; 16];
-        product.copy_from_slice(&b[16..32]);
-        Some(Inquiry { direct_access: b[0] == 0x00, vendor, product })
-    }
-
-    /// **What `READ CAPACITY(10)` says**: the block count and size, or `None` for a unit of 2 TiB or
-    /// more — its last LBA reads `0xFFFFFFFF`, which the ten-byte commands cannot address past.
-    pub fn capacity_answer(b: &[u8]) -> Option<(u64, u32)> {
-        if b.len() < CAPACITY_LEN {
-            return None;
-        }
-        let last = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-        let block = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
-        (last != u32::MAX).then_some((last as u64 + 1, block))
-    }
-
-    /// **What `READ CAPACITY(16)` says**: the block count and size, or `None` for an answer too short
-    /// to hold them, or one naming no block at all.
-    pub fn capacity16_answer(b: &[u8]) -> Option<(u64, u32)> {
-        if b.len() < 12 {
-            return None;
-        }
-        let last = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-        let block = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
-        last.checked_add(1).map(|blocks| (blocks, block))
-    }
-
-    /// Fixed-format sense data's key, additional sense code and qualifier.
-    pub fn sense_answer(b: &[u8]) -> (u8, u8, u8) {
-        if b.len() < 14 {
-            return (0, 0, 0);
-        }
-        (b[2] & 0xF, b[12], b[13])
-    }
-}
+pub mod scsi;
 
 const FREE: u8 = 0;
 const BOUND: u8 = 1;
@@ -388,6 +253,10 @@ struct Lun {
     block_len: u32,
     /// Its disk's registry record, once published: what a rescan departs the partitions of.
     record: Option<u32>,
+    /// **Stopped**: every later request is refused `PeerClosed`, as a pulled stick's are.
+    ejected: bool,
+    /// A refusal since was logged, once: nothing should ask an ejected unit for anything.
+    refusal_said: bool,
 }
 
 /// **A bound storage device.** Its rings, wrapper page and binding buffer are the device's memory,
@@ -474,19 +343,8 @@ struct IrpCmd {
     cdb: Cdb,
     len: u32,
     input: bool,
-    flush: bool,
-}
-
-impl IrpCmd {
-    fn op(&self) -> u32 {
-        if self.flush {
-            IrpOp::Flush as u32
-        } else if self.input {
-            IrpOp::Read as u32
-        } else {
-            IrpOp::Write as u32
-        }
-    }
+    /// The IRP's [`IrpOp`], as a `u32`.
+    op: u32,
 }
 
 #[derive(Debug)]
@@ -519,6 +377,20 @@ impl Queue {
         self.len -= 1;
         e
     }
+
+    /// Take out the first command `want` picks, the rest kept in their order.
+    fn pop_where(&mut self, want: impl Fn(&IrpCmd) -> bool) -> Option<IrpCmd> {
+        let (mut taken, mut kept) = (None, Queue::new());
+        while let Some(c) = self.pop() {
+            if taken.is_none() && want(&c) {
+                taken = Some(c);
+            } else {
+                kept.push(c);
+            }
+        }
+        *self = kept;
+        taken
+    }
 }
 
 /// **What the caller does after a method of [`Disks`]**, with no lock held: complete an IRP, end
@@ -533,6 +405,10 @@ pub enum Action {
     Hub { po: *mut () },
     /// The hub thread has a fault to handle.
     Wake,
+    /// Complete `irp` `PeerClosed`, its unit ejected; `said` names it the first time, to log.
+    Ejected { irp: *mut Irp, said: Option<(u8, u8)> },
+    /// Complete the eject `irp`, and wake the hub thread to answer what waited on its unit.
+    Stopped { irp: *mut Irp },
 }
 
 /// **The storage devices**, eight slots under an epoch. One static in a boot ([`DISKS`]); a value so
@@ -545,14 +421,17 @@ pub(super) struct Disks {
 
 static DISKS: Disks = Disks::new();
 
-/// **The command for a block IRP**: its CDB, its length in the wrapper, its direction, whether it is
-/// a flush — or the error to refuse it with, when it does not fit `lun`.
-fn irp_command(op: u32, offset: u64, length: u64, lun: Lun) -> Result<(Cdb, u32, bool, bool), KError> {
+/// **The command for a block IRP**: its CDB, its length in the wrapper and its direction — or the
+/// error to refuse it with, when it does not fit `lun`.
+fn irp_command(op: u32, offset: u64, length: u64, lun: Lun) -> Result<(Cdb, u32, bool), KError> {
     if lun.blocks == 0 {
         return Err(KError::InvalidArgument);
     }
     if op == IrpOp::Flush as u32 {
-        return Ok((Cdb::of(&scsi::synchronize_cache()), 0, false, true));
+        return Ok((Cdb::of(&scsi::synchronize_cache()), 0, false));
+    }
+    if op == IrpOp::Eject as u32 {
+        return Ok((Cdb::of(&scsi::eject()), 0, false));
     }
     if op != IrpOp::Read as u32 && op != IrpOp::Write as u32 {
         return Err(KError::InvalidArgument);
@@ -566,7 +445,7 @@ fn irp_command(op: u32, offset: u64, length: u64, lun: Lun) -> Result<(Cdb, u32,
         return Err(KError::InvalidArgument);
     }
     let write = op == IrpOp::Write as u32;
-    Ok((rw_cdb(lun.blocks, write, lba, count as u16), length as u32, !write, false))
+    Ok((rw_cdb(lun.blocks, write, lba, count as u16), length as u32, !write))
 }
 
 fn packets(remaining: u64, mps: u16) -> u32 {
@@ -652,12 +531,22 @@ impl Dev {
         b
     }
 
+    fn ejected(&self, lun: u8) -> bool {
+        self.luns.get(lun as usize).is_some_and(|u| u.ejected)
+    }
+
+    /// **The next queued command to start**: never one for an ejected unit.
+    fn next(&mut self) -> Option<IrpCmd> {
+        let luns = self.luns;
+        self.queue.pop_where(|c| !luns.get(c.lun as usize).is_some_and(|u| u.ejected))
+    }
+
     fn command_for(&self, irp: *mut Irp, lun: u8) -> Result<IrpCmd, KError> {
         let unit = self.luns.get(lun as usize).copied().unwrap_or_default();
         // SAFETY: `irp` is live and owned by its submitter until completed.
         let (op, offset, length) = unsafe { ((*irp).op, (*irp).offset, (*irp).length) };
-        let (cdb, len, input, flush) = irp_command(op, offset, length, unit)?;
-        Ok(IrpCmd { irp, lun, cdb, len, input, flush })
+        let (cdb, len, input) = irp_command(op, offset, length, unit)?;
+        Ok(IrpCmd { irp, lun, cdb, len, input, op })
     }
 
     fn start(&mut self, c: IrpCmd, retried: bool, now: u64) {
@@ -738,10 +627,18 @@ impl Disks {
         let Some(dev) = d.as_mut().filter(|_| self.current(ctx)) else {
             return refuse(KError::PeerClosed);
         };
+        // SAFETY: `irp` is live and owned by its submitter until completed.
+        let op = unsafe { (*irp).op };
+        if let Some(u) = dev.luns.get_mut(lun as usize).filter(|u| u.ejected) {
+            if op == IrpOp::Flush as u32 {
+                return Action::Complete { irp, status: 0, transferred: 0 };
+            }
+            let said = !core::mem::replace(&mut u.refusal_said, true);
+            return Action::Ejected { irp, said: said.then_some((dev.slot, lun)) };
+        }
         // **A rescan is the hub thread's**: held for it, and it woken — it reads the table through
         // its own commands once the device is quiet.
-        // SAFETY: `irp` is live and owned by its submitter until completed.
-        if unsafe { (*irp).op } == IrpOp::Rescan as u32 {
+        if op == IrpOp::Rescan as u32 {
             if dev.luns.get(lun as usize).and_then(|u| u.record).is_none() {
                 return refuse(KError::Unsupported);
             }
@@ -822,15 +719,21 @@ impl Disks {
             }
             dev.inflight = None;
             dev.fault = None;
-            dev.counted[c.lun as usize % MAX_LUNS].record(c.op(), true, c.len as u64, now.saturating_sub(cmd.started));
+            dev.counted[c.lun as usize % MAX_LUNS].record(c.op, true, c.len as u64, now.saturating_sub(cmd.started));
+            // **Ejected before the next starts**, so nothing queued behind the eject reaches the unit.
+            let stopped = c.op == IrpOp::Eject as u32
+                && dev.luns.get_mut(c.lun as usize).is_some_and(|u| !core::mem::replace(&mut u.ejected, true));
             // **Not while the hub thread holds the device.** A rescan waiting does not hold it: the
             // queue drains for it, and it takes the device once nothing is left.
             if !dev.recovering
-                && let Some(next) = dev.queue.pop()
+                && let Some(next) = dev.next()
             {
                 dev.start(next, false, now);
             }
-            return Some(Action::Complete { irp: c.irp, status: 0, transferred: c.len as u64 });
+            return Some(match stopped {
+                true => Action::Stopped { irp: c.irp },
+                false => Action::Complete { irp: c.irp, status: 0, transferred: c.len as u64 },
+            });
         }
         None
     }
@@ -851,6 +754,18 @@ fn act(a: Action, x: Option<&Xhci>) {
     match a {
         Action::None => {}
         Action::Complete { irp, status, transferred } => complete(irp, status, transferred),
+        Action::Ejected { irp, said } => {
+            if let Some((slot, lun)) = said {
+                crate::kprintln!(
+                    "usb: slot {slot}: LUN {lun}: ejected, and asked for more; refused until plugged in again"
+                );
+            }
+            complete(irp, KError::PeerClosed as i32, 0);
+        }
+        Action::Stopped { irp } => {
+            complete(irp, 0, 0);
+            act(Action::Wake, x);
+        }
         // SAFETY: the hub thread holds `po`'s reference while its command is in flight, waiting on it.
         Action::Hub { po } => unsafe { crate::sched::complete_pending_op(po, 0, 0) },
         Action::Wake => {
@@ -1137,7 +1052,7 @@ impl Binding<'_> {
         };
         let mut name = [0u8; MAX_DEVICE_NAME];
         let name_len = disk_name(&u.inquiry, self.serial, &mut name);
-        let unit = Lun { blocks: u.blocks, block_len: u.block_len, record: None };
+        let unit = Lun { blocks: u.blocks, block_len: u.block_len, ..Lun::default() };
         {
             let mut d = DISKS.devs[self.i].lock();
             if let Some(dev) = d.as_mut() {
@@ -1258,7 +1173,8 @@ pub(super) fn rescan(x: &Xhci, i: usize, port: u8, mem: &mut DeviceMem) -> Recov
             BeginRescan::Ready { irp, lun, unit } => break (irp, lun, unit),
             BeginRescan::Busy => {
                 // A fault the DPC recorded is recovered first; a device that does not recover is
-                // ended by the caller, and its departure completes the rescan.
+                // ended by the caller, and its departure completes the rescan. An ejected unit's first.
+                drain_stopped(i);
                 if let Recovered::Ended = recover(x, i, mem) {
                     return Recovered::Ended;
                 }
@@ -1453,6 +1369,13 @@ pub(super) fn due(now: u64) -> [Option<u8>; MAX_DEVICES] {
     DISKS.due(now)
 }
 
+/// **Answer what waited on device `i`'s ejected units**, from the hub thread.
+pub(super) fn drain_stopped(i: usize) {
+    while let Some(a) = DISKS.take_stopped(i) {
+        act(a, None);
+    }
+}
+
 /// What [`recover`] did.
 pub(super) enum Recovered {
     /// The command was finished or failed, and the device goes on.
@@ -1519,7 +1442,8 @@ impl Disks {
             {
                 dev.fault = Some(Fault::Deadline);
             }
-            (dev.fault.is_some() || dev.rescan.is_some()).then_some(dev.slot)
+            let stopped = dev.queue.ring.iter().flatten().any(|c| dev.ejected(c.lun));
+            (dev.fault.is_some() || dev.rescan.is_some() || stopped).then_some(dev.slot)
         })
     }
 
@@ -1564,13 +1488,13 @@ impl Disks {
                 dev.recovering = false;
                 if dev.inflight.is_none()
                     && dev.fault.is_none()
-                    && let Some(next) = dev.queue.pop()
+                    && let Some(next) = dev.next()
                 {
                     dev.start(next, false, now);
                 }
                 let transferred = if status == 0 { cmd.len as u64 } else { 0 };
                 // Counted, with none of the recovery's time: that was the hub thread's commands.
-                dev.counted[cmd.lun as usize % MAX_LUNS].record(cmd.op(), status == 0, transferred, 0);
+                dev.counted[cmd.lun as usize % MAX_LUNS].record(cmd.op, status == 0, transferred, 0);
                 Action::Complete { irp: cmd.irp, status, transferred }
             }
         }
@@ -1635,11 +1559,32 @@ impl Disks {
         dev.recovering = false;
         if dev.inflight.is_none()
             && dev.fault.is_none()
-            && let Some(next) = dev.queue.pop()
+            && let Some(next) = dev.next()
         {
             dev.start(next, false, now);
         }
         Action::None
+    }
+
+    /// **One request that waited on an ejected unit of device `i`**, answered as one sent after the
+    /// eject is ([`Disks::submit`]): each queued command, then a rescan held for the unit.
+    fn take_stopped(&self, i: usize) -> Option<Action> {
+        let mut d = self.devs[i].lock();
+        let dev = d.as_mut()?;
+        let luns = dev.luns;
+        let (irp, op, lun) = match dev.queue.pop_where(|c| luns.get(c.lun as usize).is_some_and(|u| u.ejected)) {
+            Some(c) => (c.irp, c.op, c.lun),
+            None => {
+                let (irp, lun) =
+                    dev.rescan.take_if(|&mut (_, lun)| luns.get(lun as usize).is_some_and(|u| u.ejected))?;
+                (irp, IrpOp::Rescan as u32, lun)
+            }
+        };
+        if op == IrpOp::Flush as u32 {
+            return Some(Action::Complete { irp, status: 0, transferred: 0 });
+        }
+        let said = dev.luns.get_mut(lun as usize).is_some_and(|u| !core::mem::replace(&mut u.refusal_said, true));
+        Some(Action::Ejected { irp, said: said.then_some((dev.slot, lun)) })
     }
 
     /// **Give up device `i`'s waiting rescan**: its IRP, for the caller to complete.
@@ -1660,8 +1605,19 @@ impl Disks {
     }
 }
 
+/// **What a failed command's sense key comes to**, or `None` to send it again: an illegal request
+/// to flush is no cache to flush, and one to eject a stick that cannot.
+fn sense_outcome(key: u8, op: u32, retried: bool) -> Option<i32> {
+    match key {
+        scsi::ILLEGAL_REQUEST if op == IrpOp::Flush as u32 => Some(0),
+        scsi::ILLEGAL_REQUEST if op == IrpOp::Eject as u32 => Some(KError::Unsupported as i32),
+        scsi::UNIT_ATTENTION if !retried => None,
+        _ => Some(KError::IoError as i32),
+    }
+}
+
 /// **Recover device `i`**, whose command went wrong (bulk-only §6.7): a failed command's sense
-/// read — an illegal request to flush is no cache to flush, and a unit attention sends the command
+/// read and judged by [`sense_outcome`] — a unit attention sends the command
 /// again once — a data stage's stall cleared and its status read, and reset recovery for anything
 /// else, a deadline included. The command is completed, and the next started. From the hub thread,
 /// with the device's memory.
@@ -1672,16 +1628,7 @@ pub(super) fn recover(x: &Xhci, i: usize, mem: &mut DeviceMem) -> Recovered {
     let mut sense = [0u8; scsi::SENSE_LEN];
     let outcome = match fault {
         Fault::Status(Status::Failed) => match run(x, i, cmd.lun, &scsi::request_sense(), &mut sense, mem) {
-            Ok(Status::Passed { .. }) => {
-                let (key, _, _) = scsi::sense_answer(&sense);
-                if key == scsi::ILLEGAL_REQUEST && cmd.flush {
-                    Ok(Some(0))
-                } else if key == scsi::UNIT_ATTENTION && !retried {
-                    Ok(None)
-                } else {
-                    Ok(Some(KError::IoError as i32))
-                }
-            }
+            Ok(Status::Passed { .. }) => Ok(sense_outcome(scsi::sense_answer(&sense).0, cmd.op, retried)),
             _ => Err(()),
         },
         Fault::Transfer { dci, code: code::STALL }
@@ -1746,690 +1693,4 @@ fn le32(b: &[u8], off: usize) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::io::irp::IrpBuffer;
-    use crate::mm::test_support::init_global_heap;
-
-    #[test]
-    fn a_command_wrapper_is_laid_out_as_bulk_only_says() {
-        let w = cbw(0x1234_5678, 4096, true, 3, &scsi::rw10(false, 0x0102_0304, 8));
-        assert_eq!(&w[0..4], b"USBC");
-        assert_eq!(le32(&w, 4), 0x1234_5678);
-        assert_eq!(le32(&w, 8), 4096);
-        assert_eq!((w[12], w[13], w[14]), (0x80, 3, 10));
-        assert_eq!(&w[15..25], &[0x28, 0, 1, 2, 3, 4, 0, 0, 8, 0]);
-        assert!(w[25..].iter().all(|&b| b == 0));
-        assert_eq!(cbw(1, 0, false, 0, &scsi::test_unit_ready())[12], 0, "OUT, or no data");
-    }
-
-    fn status(sig: &[u8; 4], tag: u32, residue: u32, status: u8) -> [u8; CSW_LEN] {
-        let mut b = [0u8; CSW_LEN];
-        b[0..4].copy_from_slice(sig);
-        b[4..8].copy_from_slice(&tag.to_le_bytes());
-        b[8..12].copy_from_slice(&residue.to_le_bytes());
-        b[12] = status;
-        b
-    }
-
-    #[test]
-    fn a_status_wrapper_is_this_commands_or_invalid() {
-        assert_eq!(csw(&status(b"USBS", 7, 0, 0), 7), Status::Passed { residue: 0 });
-        assert_eq!(csw(&status(b"USBS", 7, 512, 0), 7), Status::Passed { residue: 512 });
-        assert_eq!(csw(&status(b"USBS", 7, 0, 1), 7), Status::Failed);
-        assert_eq!(csw(&status(b"USBS", 7, 0, 2), 7), Status::Phase);
-        assert_eq!(csw(&status(b"USBS", 7, 0, 3), 7), Status::Invalid, "no status 3");
-        assert_eq!(csw(&status(b"USBC", 7, 0, 0), 7), Status::Invalid, "a command's signature");
-        assert_eq!(csw(&status(b"USBS", 8, 0, 0), 7), Status::Invalid, "another command's tag");
-        assert_eq!(csw(&status(b"USBS", 7, 0, 0)[..12], 7), Status::Invalid, "short");
-    }
-
-    #[test]
-    fn each_cdb_is_as_scsi_gives_it() {
-        assert_eq!(scsi::test_unit_ready(), [0; 6]);
-        assert_eq!(scsi::request_sense(), [0x03, 0, 0, 0, 18, 0]);
-        assert_eq!(scsi::inquiry(), [0x12, 0, 0, 0, 36, 0]);
-        assert_eq!(scsi::read_capacity()[0], 0x25);
-        assert_eq!(scsi::rw10(true, 0xAABB_CCDD, 0x0102), [0x2A, 0, 0xAA, 0xBB, 0xCC, 0xDD, 0, 0x01, 0x02, 0]);
-        assert_eq!(scsi::synchronize_cache(), [0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn the_answers_read_as_scsi_gives_them() {
-        let mut inq = [0u8; 36];
-        inq[8..16].copy_from_slice(b"QEMU    ");
-        inq[16..32].copy_from_slice(b"QEMU HARDDISK   ");
-        let a = scsi::inquiry_answer(&inq).unwrap();
-        assert!(a.direct_access);
-        assert_eq!(&a.vendor, b"QEMU    ");
-        inq[0] = 0x05;
-        assert!(!scsi::inquiry_answer(&inq).unwrap().direct_access, "a CD-ROM");
-        inq[0] = 0x20;
-        assert!(!scsi::inquiry_answer(&inq).unwrap().direct_access, "qualifier 1: not connected");
-        assert_eq!(scsi::inquiry_answer(&inq[..35]), None);
-
-        assert_eq!(scsi::capacity_answer(&[0, 0, 0x7F, 0xFF, 0, 0, 2, 0]), Some((0x8000, 512)));
-        assert_eq!(scsi::capacity_answer(&[0xFF, 0xFF, 0xFF, 0xFE, 0, 0, 2, 0]), Some((0xFFFF_FFFF, 512)));
-        assert_eq!(scsi::capacity_answer(&[0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 2, 0]), None, "2 TiB or more");
-
-        let mut sense = [0u8; 18];
-        sense[2] = 0x06;
-        sense[12] = 0x28;
-        assert_eq!(scsi::sense_answer(&sense), (scsi::UNIT_ATTENTION, 0x28, 0));
-    }
-
-    #[test]
-    fn an_irp_fits_its_unit_or_is_refused() {
-        let unit = Lun { blocks: 1024, block_len: 512, record: None };
-        let r = IrpOp::Read as u32;
-        let (cdb, len, input, flush) = irp_command(r, 4096, 8192, unit).unwrap();
-        assert_eq!((cdb, len, input, flush), (Cdb::of(&scsi::rw10(false, 8, 16)), 8192, true, false));
-        assert_eq!(irp_command(IrpOp::Rescan as u32, 0, 0, unit), Err(KError::InvalidArgument), "not a command");
-        assert!(!irp_command(IrpOp::Write as u32, 0, 512, unit).unwrap().2, "a write moves out");
-        assert_eq!(irp_command(r, 100, 512, unit), Err(KError::InvalidArgument), "unaligned");
-        assert_eq!(irp_command(r, 0, 0, unit), Err(KError::InvalidArgument), "empty");
-        assert!(irp_command(r, 1023 * 512, 512, unit).is_ok(), "the last block");
-        assert_eq!(irp_command(r, 1023 * 512, 1024, unit), Err(KError::InvalidArgument), "past the end");
-        assert!(irp_command(IrpOp::Flush as u32, 0, 0, unit).unwrap().3);
-        assert_eq!(irp_command(IrpOp::Flush as u32, 0, 0, Lun::default()), Err(KError::InvalidArgument));
-    }
-
-    #[test]
-    fn the_sixteen_byte_commands_are_as_scsi_gives_them() {
-        assert_eq!(scsi::read_capacity16(), [0x9E, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0]);
-        assert_eq!(
-            scsi::rw16(true, 0x0102_0304_0506_0708, 0x0A0B_0C0D),
-            [0x8A, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0x0A, 0x0B, 0x0C, 0x0D, 0, 0]
-        );
-        assert_eq!(scsi::rw16(false, 0, 1)[0], 0x88);
-        let blocks: u64 = 3 << 31; // 3 TiB of 512-byte blocks
-        let mut answer = [0u8; scsi::CAPACITY16_LEN];
-        answer[..8].copy_from_slice(&(blocks - 1).to_be_bytes());
-        answer[8..12].copy_from_slice(&512u32.to_be_bytes());
-        assert_eq!(scsi::capacity16_answer(&answer), Some((blocks, 512)));
-        assert_eq!(scsi::capacity16_answer(&answer[..11]), None, "too short");
-        let mut ten = [0u8; scsi::CAPACITY_LEN];
-        ten[..4].copy_from_slice(&u32::MAX.to_be_bytes());
-        ten[4..].copy_from_slice(&512u32.to_be_bytes());
-        assert_eq!(scsi::capacity_answer(&ten), None, "what sends a unit to READ CAPACITY(16)");
-    }
-
-    /// At exactly 2³² blocks the last block still fits in 32 bits, so it is a `READ(10)`.
-    #[test]
-    fn a_unit_past_two_to_the_thirty_two_blocks_is_read_with_the_sixteen_byte_commands() {
-        let r = IrpOp::Read as u32;
-        let at = |blocks: u64| Lun { blocks, block_len: 512, record: None };
-        let last = (1u64 << 32) - 1;
-        assert_eq!(irp_command(r, last * 512, 512, at(1 << 32)).unwrap().0, Cdb::of(&scsi::rw10(false, u32::MAX, 1)));
-        assert_eq!(irp_command(r, 0, 512, at((1 << 32) + 1)).unwrap().0, Cdb::of(&scsi::rw16(false, 0, 1)));
-        let past = 1u64 << 32;
-        assert_eq!(irp_command(r, past * 512, 512, at((1 << 32) + 1)).unwrap().0, Cdb::of(&scsi::rw16(false, past, 1)));
-        let beyond = irp_command(r, (past + 1) * 512, 512, at((1 << 32) + 1));
-        assert_eq!(beyond, Err(KError::InvalidArgument), "past its end");
-        assert_eq!(rw_cdb(3 << 31, true, 5, 8).as_slice(), &scsi::rw16(true, 5, 8));
-    }
-
-    #[test]
-    fn a_td_size_counts_the_packets_left() {
-        assert_eq!(packets(0, 512), 0);
-        assert_eq!(packets(4096, 512), 8);
-        assert_eq!(packets(4097, 512), 9);
-        assert_eq!(packets(1 << 20, 512), 31);
-    }
-
-    #[test]
-    fn a_usb_disk_is_named_by_its_model_and_serial() {
-        let inq = scsi::Inquiry { direct_access: true, vendor: *b"QEMU    ", product: *b"QEMU HARDDISK   " };
-        let mut out = [0u8; MAX_DEVICE_NAME];
-        let n = disk_name(&inq, b"1-0000:00:04.0-1", &mut out);
-        assert_eq!(&out[..n], b"QEMU QEMU HARDDISK (1-0000:00:04.0-1)");
-        let n = disk_name(&inq, b"", &mut out);
-        assert_eq!(&out[..n], b"QEMU QEMU HARDDISK");
-    }
-
-    /// Heap memory standing in for a device's rings, wrapper page, binding buffer and the doorbell
-    /// array: its "physical" addresses are its virtual ones.
-    struct Fake {
-        rings: [crate::libkern::KVec<u64>; 2],
-        wrap: crate::libkern::KVec<u64>,
-        data: crate::libkern::KVec<u64>,
-        db: crate::libkern::KVec<u32>,
-    }
-
-    fn zeroed<T: Copy + Default>(n: usize) -> crate::libkern::KVec<T> {
-        let mut v = crate::libkern::KVec::new();
-        v.try_reserve(n).unwrap();
-        while v.len() < n {
-            v.try_push(T::default()).unwrap();
-        }
-        v
-    }
-
-    impl Fake {
-        fn new() -> Fake {
-            Fake {
-                rings: [zeroed(RING_TRBS * 2), zeroed(RING_TRBS * 2)],
-                wrap: zeroed(512),
-                data: zeroed(BIND_DATA / 8),
-                db: zeroed(32),
-            }
-        }
-
-        fn dev(&mut self, slot: u8) -> Dev {
-            let ring = |v: &mut crate::libkern::KVec<u64>| {
-                let at = v.as_mut_ptr() as u64;
-                Ring { producer: Producer::new(&mut RawSlots(at), at), virt: at, phys: at }
-            };
-            let (r0, r1) = self.rings.split_at_mut(1);
-            let wrap = self.wrap.as_mut_ptr() as u64;
-            let data = self.data.as_mut_ptr() as u64;
-            Dev {
-                slot,
-                interface: 0,
-                in_dci: 3,
-                out_dci: 4,
-                in_address: 0x81,
-                out_address: 0x02,
-                in_mps: 512,
-                out_mps: 512,
-                bulk_in: ring(&mut r0[0]),
-                bulk_out: ring(&mut r1[0]),
-                wrap_virt: wrap,
-                wrap_phys: wrap,
-                data_virt: data,
-                data_phys: data,
-                db: self.db.as_mut_ptr() as u64,
-                tag: 0,
-                luns: {
-                    let mut l = [Lun::default(); MAX_LUNS];
-                    l[0] = Lun { blocks: 2048, block_len: 512, record: Some(7) };
-                    l
-                },
-                inflight: None,
-                fault: None,
-                hub_result: None,
-                recovering: false,
-                stranded: None,
-                rescan: None,
-                queue: Queue::new(),
-                counted: [const { Counted::new() }; MAX_LUNS],
-            }
-        }
-
-        fn answer(&mut self, tag: u32, status_byte: u8) {
-            let b = status(b"USBS", tag, 0, status_byte);
-            let w = self.wrap.as_mut_ptr() as *mut u8;
-            for (k, v) in b.iter().enumerate() {
-                // SAFETY: the fake wrapper page is 4 KiB.
-                unsafe { w.add(CSW_AT as usize + k).write(*v) };
-            }
-        }
-
-        fn trb(&self, r: usize, i: usize) -> Trb {
-            RawSlots(self.rings[r].as_ptr() as u64).read(i)
-        }
-    }
-
-    fn irp(op: IrpOp, offset: u64, length: u64, frags: &[PhysFrag]) -> Irp {
-        let buffer = if frags.is_empty() {
-            IrpBuffer::NONE
-        } else {
-            IrpBuffer { kind: crate::io::irp::IRP_BUF_FRAGS, count: frags.len() as u32, frags: frags.as_ptr() as u64 }
-        };
-        Irp::new_block(op, core::ptr::null(), offset, length, buffer, core::ptr::null_mut(), 0)
-    }
-
-    fn csw_trb(d: &Disks, i: usize) -> u64 {
-        match d.devs[i].lock().as_ref().unwrap().inflight.unwrap().stage {
-            Stage::Status { csw_trb } => csw_trb,
-            s => panic!("the status is not asked for yet: {s:?}"),
-        }
-    }
-
-    /// **A read's status is asked for when its data stage ends, and it completes at its status
-    /// wrapper**; the IRP queued meanwhile starts when the first completes.
-    #[test]
-    fn a_reads_status_is_asked_for_when_its_data_ends_and_the_next_starts_at_its_status() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(9)).unwrap();
-        let ctx = context(i, 0, epoch);
-        let frags = [PhysFrag { base: 0x10_000, len: 4096 }, PhysFrag { base: 0x20_000, len: 4096 }];
-        let mut first = irp(IrpOp::Read, 8 * 512, 8192, &frags);
-        assert_eq!(disks.submit(&mut first, ctx, 0), Action::None);
-        let cbw_trb = fake.trb(1, 0);
-        assert_eq!(cbw_trb.0[2] & 0x1_FFFF, CBW_LEN as u32, "the command wrapper on OUT");
-        assert_eq!((fake.trb(0, 0).0[0], fake.trb(0, 1).0[0]), (0x10_000, 0x20_000), "the data on IN");
-        assert_ne!(fake.trb(0, 0).0[3] & (1 << 4), 0, "chained to the next fragment");
-        assert_eq!(fake.trb(0, 1).0[3] & (1 << 5), 1 << 5, "the last interrupts");
-        assert_eq!(fake.trb(0, 2), Trb::default(), "and nothing behind it yet");
-        assert_eq!(fake.db[9], 3, "the last doorbell rung was IN's");
-        let w = fake.wrap.as_ptr() as *const u8;
-        // SAFETY: the fake wrapper page.
-        let wrapper: [u8; CBW_LEN] = core::array::from_fn(|k| unsafe { w.add(k).read() });
-        assert_eq!(&wrapper[15..25], &scsi::rw10(false, 8, 16));
-
-        let mut second = irp(IrpOp::Write, 0, 512, &frags[..1]);
-        assert_eq!(disks.submit(&mut second, ctx, 0), Action::None, "queued");
-        assert_eq!(
-            disks.on_transfer(9, 4, code::SUCCESS, 0x99, 1),
-            Some(Action::None),
-            "OUT's event is not the data's"
-        );
-        assert_eq!(fake.trb(0, 2), Trb::default(), "so no status yet");
-        assert_eq!(
-            disks.on_transfer(9, 3, code::SHORT_PACKET, 0x10_000, 1),
-            Some(Action::None),
-            "the data stage ends short"
-        );
-        assert_eq!(fake.trb(0, 2).0[2] & 0x1_FFFF, CSW_LEN as u32, "and the status is asked for");
-        fake.answer(1, 0);
-        let at = csw_trb(&disks, i);
-        assert_eq!(
-            disks.on_transfer(9, 3, code::SUCCESS, at, 1),
-            Some(Action::Complete { irp: &mut first, status: 0, transferred: 8192 })
-        );
-        assert_eq!(fake.trb(1, 1).0[2] & 0x1_FFFF, CBW_LEN as u32, "the next command's wrapper");
-        assert_eq!(fake.trb(1, 2).0[0], 0x10_000, "and its data, on OUT for a write");
-        assert_eq!(disks.on_transfer(8, 3, code::SUCCESS, at, 1), None, "another slot's event is not this driver's");
-    }
-
-    /// A queued write is timed from when it starts, not from its submit; a recovered error counts
-    /// with none of the recovery's time.
-    #[test]
-    fn each_command_is_counted_on_its_disk_with_its_time_on_the_device() {
-        static FIRST: crate::io::stats::IoStats = crate::io::stats::IoStats::new();
-        static OTHER: crate::io::stats::IoStats = crate::io::stats::IoStats::new();
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(9)).unwrap();
-        disks.devs[i].lock().as_ref().unwrap().counted[0].attach_static(&FIRST);
-        let ctx = context(i, 0, epoch);
-        let frags = [PhysFrag { base: 0x10_000, len: 4096 }, PhysFrag { base: 0x20_000, len: 4096 }];
-        let mut read = irp(IrpOp::Read, 0, 8192, &frags);
-        disks.submit(&mut read, ctx, 100);
-        let mut write = irp(IrpOp::Write, 0, 512, &frags[..1]);
-        disks.submit(&mut write, ctx, 150);
-        disks.on_transfer(9, 3, code::SUCCESS, 0x20_000, 300);
-        fake.answer(1, 0);
-        let done = disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 400);
-        assert!(matches!(done, Some(Action::Complete { status: 0, .. })));
-        let r = FIRST.record_for(0, 0);
-        assert_eq!((r.reads, r.read_bytes, r.busy_ns), (1, 8192, 300), "issued at 100, its status at 400");
-        // The write started at 400, as the read completed: its 600 are from there, not from 150.
-        disks.on_transfer(9, 4, code::SUCCESS, 0x10_000, 700);
-        fake.answer(2, 0);
-        disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 1000);
-        let r = FIRST.record_for(0, 0);
-        assert_eq!((r.writes, r.written_bytes, r.busy_ns), (1, 512, 300 + 600));
-
-        let mut flush = irp(IrpOp::Flush, 0, 0, &[]);
-        disks.submit(&mut flush, ctx, 2000);
-        disks.on_transfer(9, 4, code::SUCCESS, 0, 2100);
-        fake.answer(3, 1);
-        assert_eq!(disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 2200), Some(Action::Wake));
-        assert_eq!(FIRST.record_for(0, 0).errors, 0, "not yet: the hub thread has it");
-        let (_, cmd, _) = disks.begin_recovery(i).unwrap();
-        disks.end_recovery(i, cmd, End::Complete(KError::IoError as i32), 9000);
-        let r = FIRST.record_for(0, 0);
-        assert_eq!((r.flushes, r.errors, r.busy_ns), (0, 1, 900), "an error, and no recovery time");
-
-        let (j, e2) = disks.take(fake.dev(3)).unwrap();
-        disks.devs[j].lock().as_ref().unwrap().counted[0].attach_static(&OTHER);
-        let mut other = irp(IrpOp::Flush, 0, 0, &[]);
-        disks.submit(&mut other, context(j, 0, e2), 10_000);
-        disks.on_transfer(3, 4, code::SUCCESS, 0, 10_050);
-        fake.answer(1, 0);
-        disks.on_transfer(3, 3, code::SUCCESS, csw_trb(&disks, j), 10_100);
-        assert_eq!((OTHER.record_for(0, 0).flushes, OTHER.record_for(0, 0).busy_ns), (1, 100));
-        assert_eq!(FIRST.record_for(0, 0).flushes, 0);
-    }
-
-    /// **A rescan is held for the hub thread**: it wakes the thread rather than going on the rings,
-    /// and **while it waits the device runs as ever**, so what the disk's windows forwarded before
-    /// they were retired reaches the disk at the old table's offsets, never after the new table.
-    #[test]
-    fn a_rescan_takes_the_device_only_once_its_queue_has_drained() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
-        let ctx = context(i, 0, epoch);
-        let frags = [PhysFrag { base: 0x10_000, len: 512 }];
-        let mut first = irp(IrpOp::Read, 0, 512, &frags);
-        assert_eq!(disks.submit(&mut first, ctx, 0), Action::None, "started");
-        let mut later = irp(IrpOp::Write, 512, 512, &frags);
-        assert_eq!(disks.submit(&mut later, ctx, 0), Action::None, "queued behind the read");
-        let mut rescan = irp(IrpOp::Rescan, 0, 0, &[]);
-        assert_eq!(disks.submit(&mut rescan, ctx, 0), Action::Wake, "held, and the hub thread woken");
-        assert_eq!(disks.due(1)[i], Some(5), "the hub thread's to look at");
-        let mut again = irp(IrpOp::Rescan, 0, 0, &[]);
-        assert_eq!(
-            disks.submit(&mut again, ctx, 0),
-            Action::Complete { irp: &mut again, status: KError::WouldBlock as i32, transferred: 0 }
-        );
-        assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "a command in flight, and one queued");
-        disks.on_transfer(5, 3, code::SUCCESS, 0x10_000, 1);
-        fake.answer(1, 0);
-        let at = csw_trb(&disks, i);
-        let ended = disks.on_transfer(5, 3, code::SUCCESS, at, 1);
-        assert_eq!(ended, Some(Action::Complete { irp: &mut first, status: 0, transferred: 512 }));
-        {
-            let d = disks.devs[i].lock();
-            let dev = d.as_ref().unwrap();
-            assert!(dev.inflight.is_some() && dev.queue.len == 0, "the queued write started while the rescan waits");
-        }
-        assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "the write is in flight");
-        disks.on_transfer(5, 4, code::SUCCESS, 0x10_000, 2);
-        fake.answer(2, 0);
-        let at = csw_trb(&disks, i);
-        let ended = disks.on_transfer(5, 3, code::SUCCESS, at, 2);
-        assert_eq!(ended, Some(Action::Complete { irp: &mut later, status: 0, transferred: 512 }));
-        // **A command queued keeps it waiting by itself**, with nothing in flight: no path here leaves
-        // one so, and a rescan taking the device over it would issue it after the new table.
-        let mut stuck = irp(IrpOp::Read, 2048, 512, &frags);
-        {
-            let mut d = disks.devs[i].lock();
-            let dev = d.as_mut().unwrap();
-            let c = dev.command_for(&mut stuck, 0).unwrap();
-            assert!(dev.queue.push(c));
-        }
-        assert_eq!(disks.begin_rescan(i), BeginRescan::Busy, "a command queued, nothing in flight");
-        assert!(disks.devs[i].lock().as_mut().unwrap().queue.pop().is_some());
-        let unit = Lun { blocks: 2048, block_len: 512, record: Some(7) };
-        assert_eq!(disks.rescan_unit(i), Some(unit), "the unit the hub thread retires the windows of");
-        assert_eq!(disks.begin_rescan(i), BeginRescan::Ready { irp: &mut rescan, lun: 0, unit });
-        assert!(disks.devs[i].lock().as_ref().unwrap().recovering, "the device is held");
-        assert_eq!(disks.begin_rescan(i), BeginRescan::Nothing, "taken");
-        let mut held = irp(IrpOp::Read, 1024, 512, &frags);
-        assert_eq!(disks.submit(&mut held, ctx, 3), Action::None);
-        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "queued while the rescan runs");
-        assert_eq!(disks.end_rescan(i, 4), Action::None);
-        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_some(), "and started at its end");
-        let mut stray = irp(IrpOp::Rescan, 0, 0, &[]);
-        assert_eq!(
-            disks.submit(&mut stray, context(i, 1, epoch), 0),
-            Action::Complete { irp: &mut stray, status: KError::Unsupported as i32, transferred: 0 }
-        );
-        let mut waiting = irp(IrpOp::Rescan, 0, 0, &[]);
-        disks.submit(&mut waiting, ctx, 0);
-        let (_, held) = disks.depart(i);
-        assert_eq!(held[2], Some(&mut waiting as *mut Irp));
-    }
-
-    /// A rescan waiting on a device a failed recovery stranded ends the device.
-    #[test]
-    fn a_rescan_on_a_stranded_device_ends_it() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
-        let ctx = context(i, 0, epoch);
-        let frags = [PhysFrag { base: 0x10_000, len: 512 }];
-        let mut read = irp(IrpOp::Read, 0, 512, &frags);
-        disks.submit(&mut read, ctx, 0);
-        let mut rescan = irp(IrpOp::Rescan, 0, 0, &[]);
-        assert_eq!(disks.submit(&mut rescan, ctx, 0), Action::Wake);
-        // The command wrapper stalls, and reset recovery fails.
-        assert_eq!(disks.on_transfer(5, 4, code::STALL, 0, 1), Some(Action::Wake));
-        let (_, cmd, _) = disks.begin_recovery(i).unwrap();
-        assert_eq!(disks.end_recovery(i, cmd, End::Stranded, 2), Action::None);
-        assert_eq!(disks.begin_rescan(i), BeginRescan::Ended, "to be ended, not waited for");
-        let (_, held) = disks.depart(i);
-        assert_eq!(held[1], Some(&mut read as *mut Irp), "the departure completes the stranded read");
-        assert_eq!(held[2], Some(&mut rescan as *mut Irp), "and the rescan");
-    }
-
-    #[test]
-    fn a_command_that_goes_wrong_is_left_for_the_hub_thread() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(2)).unwrap();
-        let ctx = context(i, 0, epoch);
-        let mut a = irp(IrpOp::Flush, 0, 0, &[]);
-        disks.submit(&mut a, ctx, 0);
-        assert_eq!(fake.trb(1, 0).0[3] & (1 << 5), 1 << 5, "with no data, the command wrapper interrupts");
-        assert_eq!(
-            disks.on_transfer(2, 4, code::SUCCESS, 0, 1),
-            Some(Action::None),
-            "and its event asks for the status"
-        );
-        fake.answer(1, 1);
-        assert_eq!(disks.on_transfer(2, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Wake));
-        assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Status(Status::Failed)));
-        let mut b = irp(IrpOp::Flush, 0, 0, &[]);
-        assert_eq!(disks.submit(&mut b, ctx, 0), Action::None);
-        assert_eq!(disks.devs[i].lock().as_ref().unwrap().queue.len, 1, "waits behind the recovery");
-
-        {
-            let mut d = disks.devs[i].lock();
-            let dev = d.as_mut().unwrap();
-            dev.fault = None;
-            dev.inflight = None;
-            dev.recovering = true;
-        }
-        let mut during = irp(IrpOp::Flush, 0, 0, &[]);
-        assert_eq!(disks.submit(&mut during, ctx, 0), Action::None);
-        assert_eq!(disks.devs[i].lock().as_ref().unwrap().queue.len, 2, "queued, not started under the recovery");
-        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none());
-
-        let (j, e2) = disks.take(fake.dev(3)).unwrap();
-        let mut c = irp(IrpOp::Read, 0, 512, &[PhysFrag { base: 0x1000, len: 512 }]);
-        disks.submit(&mut c, context(j, 0, e2), 0);
-        assert_eq!(disks.on_transfer(3, 4, code::STALL, 0, 1), Some(Action::Wake), "a stall on the command wrapper");
-        assert_eq!(disks.devs[j].lock().as_ref().unwrap().fault, Some(Fault::Transfer { dci: 4, code: code::STALL }));
-    }
-
-    #[test]
-    fn the_hub_thread_sleeps_no_longer_than_a_deadline_while_a_disk_is_bound() {
-        init_global_heap();
-        let disks = Disks::new();
-        let (mut fake, mut other) = (Fake::new(), Fake::new());
-        assert_eq!(disks.bound(0), None, "no disk: no bound");
-        let (i, ei) = disks.take(fake.dev(5)).unwrap();
-        let slept = 100;
-        let until = disks.bound(slept);
-        assert_eq!(until, Some(slept + DEADLINE_NS), "idle: a deadline's length");
-
-        let mut a = irp(IrpOp::Flush, 0, 0, &[]);
-        assert_eq!(disks.submit(&mut a, context(i, 0, ei), 150), Action::None, "no wake");
-        let woke = until.unwrap();
-        assert!(woke <= 150 + DEADLINE_NS, "the thread wakes before the command is due");
-        assert_eq!(disks.due(woke)[i], None, "and finds it not yet due");
-        assert_eq!(disks.bound(woke), Some(150 + DEADLINE_NS), "so sleeps until its deadline");
-        assert_eq!(disks.due(150 + DEADLINE_NS + 1)[i], Some(5), "and marks it then");
-
-        let (j, ej) = disks.take(other.dev(6)).unwrap();
-        let mut b = irp(IrpOp::Flush, 0, 0, &[]);
-        disks.submit(&mut b, context(j, 0, ej), 120);
-        assert_eq!(disks.bound(130), Some(120 + DEADLINE_NS), "the earliest command's deadline");
-    }
-
-    #[test]
-    fn a_deadline_marked_as_its_command_ends_is_not_charged_to_the_next() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
-        let ctx = context(i, 0, epoch);
-        let (mut a, mut b) = (irp(IrpOp::Flush, 0, 0, &[]), irp(IrpOp::Flush, 0, 0, &[]));
-        disks.submit(&mut a, ctx, 0);
-        disks.submit(&mut b, ctx, 0);
-        assert_eq!(disks.due(DEADLINE_NS + 1)[i], Some(5), "past its deadline: marked");
-        assert_eq!(disks.on_transfer(5, 4, code::SUCCESS, 0, DEADLINE_NS + 2), Some(Action::None));
-        fake.answer(1, 0);
-        let done = disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), DEADLINE_NS + 2);
-        assert_eq!(done, Some(Action::Complete { irp: &mut a, status: 0, transferred: 0 }), "it made it");
-        assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, None, "the mark went with it");
-        assert!(disks.begin_recovery(i).is_none(), "nothing for the hub thread to recover");
-        let running = disks.devs[i].lock().as_ref().unwrap().inflight.map(|c| c.owner);
-        let b_ptr = &mut b as *mut Irp;
-        assert!(matches!(running, Some(Owner::Irp { cmd, .. }) if cmd.irp == b_ptr), "the next left running");
-        assert_eq!(disks.due(DEADLINE_NS + 3)[i], None, "inside its own deadline");
-    }
-
-    #[test]
-    fn a_command_left_for_the_hub_thread_ignores_its_later_events() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
-        let mut r = irp(IrpOp::Read, 0, 512, &[PhysFrag { base: 0x1000, len: 512 }]);
-        disks.submit(&mut r, context(i, 0, epoch), 0);
-        assert_eq!(disks.on_transfer(5, 4, code::STALL, 0, 1), Some(Action::Wake), "the command wrapper stalls");
-        let data_trb = fake.rings[0].as_ptr() as u64;
-        assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, data_trb, 1), Some(Action::None), "the data's, ignored");
-        assert_eq!(fake.trb(0, 1), Trb::default(), "no status asked for");
-        assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Transfer { dci: 4, code: code::STALL }));
-    }
-
-    #[test]
-    fn a_retry_is_in_flight_with_the_submit_that_waited_behind_it() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
-        let ctx = context(i, 0, epoch);
-        let mut a = irp(IrpOp::Flush, 0, 0, &[]);
-        disks.submit(&mut a, ctx, 0);
-        disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
-        fake.answer(1, 1);
-        assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Wake));
-        let (fault, cmd, retried) = disks.begin_recovery(i).unwrap();
-        assert_eq!((fault, cmd.irp, retried), (Fault::Status(Status::Failed), &mut a as *mut Irp, false));
-        let mut b = irp(IrpOp::Flush, 0, 0, &[]);
-        assert_eq!(disks.submit(&mut b, ctx, 2), Action::None);
-        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "it waits behind the recovery");
-        assert_eq!(disks.end_recovery(i, cmd, End::Retry, 3), Action::None);
-        let running = disks.devs[i].lock().as_ref().unwrap().inflight.map(|c| c.owner);
-        let a_ptr = &mut a as *mut Irp;
-        assert!(matches!(running, Some(Owner::Irp { cmd, retried: true }) if cmd.irp == a_ptr), "the retry runs");
-        let (q, held) = disks.depart(i);
-        assert_eq!((q[0], q[1]), (Some(&mut b as *mut Irp), None), "the one that waited, handed back");
-        assert_eq!(held, [Some(&mut a as *mut Irp), None, None], "and the retry");
-    }
-
-    #[test]
-    fn a_stranded_command_waits_for_the_departure() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(5)).unwrap();
-        let ctx = context(i, 0, epoch);
-        let mut a = irp(IrpOp::Read, 0, 512, &[PhysFrag { base: 0x1000, len: 512 }]);
-        disks.submit(&mut a, ctx, 0);
-        disks.due(DEADLINE_NS + 1);
-        let (fault, cmd, _) = disks.begin_recovery(i).unwrap();
-        assert_eq!(fault, Fault::Deadline);
-        assert_eq!(disks.end_recovery(i, cmd, End::Stranded, DEADLINE_NS + 2), Action::None, "not completed");
-        let mut b = irp(IrpOp::Flush, 0, 0, &[]);
-        disks.submit(&mut b, ctx, DEADLINE_NS + 3);
-        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none(), "nothing starts on a device being ended");
-        let (q, held) = disks.depart(i);
-        assert_eq!(q[0], Some(&mut b as *mut Irp));
-        let want = [None, Some(&mut a as *mut Irp), None];
-        assert_eq!(held, want, "the stranded command, for after the slot is disabled");
-    }
-
-    #[test]
-    fn a_hub_command_the_dpc_reached_is_waited_for() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, _) = disks.take(fake.dev(5)).unwrap();
-        let po = 0x1234 as *mut ();
-        assert!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0));
-        assert_eq!(disks.take_back(i), TakeBack::Taken, "before the DPC reached it");
-        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_none());
-        assert!(disks.issue_hub(i, po, 0, &scsi::test_unit_ready(), 0, false, 0));
-        disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
-        fake.answer(2, 0);
-        assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Hub { po }));
-        assert_eq!(disks.take_back(i), TakeBack::OnItsWay, "after it: its completion is on its way");
-        let result = disks.devs[i].lock().as_ref().unwrap().hub_result;
-        assert_eq!(result, Some(HubResult::Status(Status::Passed { residue: 0 })));
-    }
-
-    #[test]
-    fn a_transfer_that_would_straddle_the_link_goes_after_it() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let mut dev = fake.dev(5);
-        while dev.bulk_in.producer.room_before_link(RING_TRBS) > 2 {
-            dev.bulk_in.producer.push(&mut RawSlots(dev.bulk_in.virt), Trb::no_op());
-        }
-        let before = dev.bulk_in.producer.next_slot();
-        let (i, epoch) = disks.take(dev).unwrap();
-        let frags = [0x1000, 0x2000, 0x3000].map(|base| PhysFrag { base, len: 512 });
-        let mut r = irp(IrpOp::Read, 0, 1536, &frags);
-        disks.submit(&mut r, context(i, 0, epoch), 0);
-        assert_eq!((fake.trb(0, before).kind(), fake.trb(0, before + 1).kind()), (kind::NO_OP, kind::NO_OP), "padding");
-        assert_eq!([0, 1, 2].map(|k| fake.trb(0, k).0[0]), [0x1000, 0x2000, 0x3000], "the read, whole, after the Link");
-        assert_ne!(fake.trb(0, 0).cycle(), fake.trb(0, before).cycle(), "on the ring's next pass");
-    }
-
-    /// **The status is its wrapper's own event**: a read whose first TRB comes up short raises an
-    /// event there and another at its last TRB, which arrives on IN once the status is asked for
-    /// and is not the status.
-    #[test]
-    fn a_short_reads_last_data_event_is_not_its_status() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let (i, epoch) = disks.take(fake.dev(9)).unwrap();
-        let frags = [PhysFrag { base: 0x10_000, len: 4096 }, PhysFrag { base: 0x20_000, len: 4096 }];
-        let mut r = irp(IrpOp::Read, 0, 8192, &frags);
-        disks.submit(&mut r, context(i, 0, epoch), 0);
-        let in_ring = fake.rings[0].as_ptr() as u64;
-        assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, in_ring, 1), Some(Action::None), "short at the first");
-        fake.answer(1, 0);
-        let last = in_ring + 16;
-        assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, last, 1), Some(Action::None), "the last TRB's own");
-        assert!(matches!(disks.devs[i].lock().as_ref().unwrap().inflight.map(|c| c.stage), Some(Stage::Status { .. })));
-        let done = disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 1);
-        assert_eq!(done, Some(Action::Complete { irp: &mut r, status: 0, transferred: 8192 }), "the status wrapper's");
-    }
-
-    #[test]
-    fn a_departed_devices_node_is_refused_and_its_slot_reused_under_a_new_epoch() {
-        init_global_heap();
-        let disks = Disks::new();
-        let mut fake = Fake::new();
-        let mut taken = [(0, 0); MAX_DEVICES];
-        for (k, t) in taken.iter_mut().enumerate() {
-            *t = disks.take(fake.dev(10 + k as u8)).unwrap();
-        }
-        assert!(disks.take(fake.dev(99)).is_none(), "every slot bound");
-        let (i, old_epoch) = taken[4];
-        let old = context(i, 0, old_epoch);
-        let mut inflight = irp(IrpOp::Flush, 0, 0, &[]);
-        let mut queued = irp(IrpOp::Flush, 0, 0, &[]);
-        disks.submit(&mut inflight, old, 0);
-        disks.submit(&mut queued, old, 0);
-        let (q, f) = disks.depart(disks.slot_of(14).unwrap());
-        assert_eq!(q[0], Some(&mut queued as *mut Irp), "the queue handed back");
-        assert_eq!(f, [Some(&mut inflight as *mut Irp), None, None], "and the command in flight");
-        let mut late = irp(IrpOp::Flush, 0, 0, &[]);
-        assert_eq!(
-            disks.submit(&mut late, old, 0),
-            Action::Complete { irp: &mut late, status: KError::PeerClosed as i32, transferred: 0 }
-        );
-
-        let (again, new_epoch) = disks.take(fake.dev(50)).unwrap();
-        assert_eq!(again, i, "the departed device's slot");
-        assert_ne!(new_epoch, old_epoch, "under a new epoch");
-        let mut stale = irp(IrpOp::Flush, 0, 0, &[]);
-        assert_eq!(
-            disks.submit(&mut stale, old, 0),
-            Action::Complete { irp: &mut stale, status: KError::PeerClosed as i32, transferred: 0 },
-            "the old node reaches nothing of the new device"
-        );
-        let mut fresh = irp(IrpOp::Flush, 0, 0, &[]);
-        assert_eq!(disks.submit(&mut fresh, context(i, 0, new_epoch), 0), Action::None, "the new node is served");
-        assert!(disks.devs[i].lock().as_ref().unwrap().inflight.is_some());
-    }
-}
+mod tests;

@@ -64,6 +64,7 @@ pub(crate) fn cmd_check_media(accel: Accel, size: DisplaySize) -> R<()> {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
+    crate::scsi_trace::trace_args(&mut cmd, &work.join("scsi.log"));
     println!("xtask: media gate — booting the live image beside a copy of the release disk…\n");
     let mut session = Session::spawn(cmd, "check-media")?;
     let result = Qmp::connect(&qmp_sock).and_then(|mut qmp| {
@@ -198,7 +199,7 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     ))?;
     let from = s.transcript().len();
     qmp.execute(
-        r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"media","bus":"xhci.0","drive":"media"}}"#,
+        r#"{"execute":"device_add","arguments":{"driver":"usb-storage","id":"media","bus":"xhci.0","drive":"media","removable":true}}"#,
     )?;
     // No "left clean" on a writable mount's line: the mount has marked it in use.
     s.line_since(from, &format!("fat '{MEDIA_LABEL}'; mounted at /storage/{MEDIA_LABEL} (rw)"), any, secs(60))?;
@@ -287,7 +288,7 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     let _ = settle_and_capture(qmp, &dump_at)?;
     println!("  ok: the editor saved onto the stick through Save As: Up to /, then storage/{MEDIA_LABEL}");
 
-    let from = s.transcript().len();
+    let from = before_eject(s, work);
     let pressed = click_at(qmp, s, side_x + browser::SIDEBAR_W - button_w / 2, drive_top(1) + browser::ROW_H / 2)?;
     if !pressed.contains(&format!("win={files_id}")) {
         return Err(format!("the click on the eject button reached {pressed:?}, not Files' window {files_id}").into());
@@ -295,8 +296,8 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
     s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
     s.expect(&format!("storage-service: unmounted {MEDIA_LABEL}, left clean"))?;
     s.expect(&format!("storage-service: ejected {MEDIA_LABEL}, safe to remove"))?;
-    s.expect(&format!("nxfiles: {MEDIA_LABEL} ejected"))?;
-    if s.transcript()[from..].contains("password") {
+    s.expect_all(&[&format!("storage-service: {MEDIA_LABEL} stopped"), &format!("nxfiles: {MEDIA_LABEL} ejected")])?;
+    if s.transcript()[from.0..].contains("password") {
         return Err("ejecting from Files asked for a password".into());
     }
     // **The row's label, not its button**: the pointer rests where the button was, and the cursor
@@ -308,10 +309,38 @@ fn run_media_steps(s: &mut Session, qmp: &mut Qmp, stick: &Path, work: &Path, si
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+    // **Stopped, and asked nothing after**, now that Files has read the table again without it.
+    stopped_and_left_alone(s, qmp, work, "media", from)?;
     let from = s.transcript().len();
     qmp.execute(r#"{"execute":"device_del","arguments":{"id":"media"}}"#)?;
     s.line_since(from, "storage-service: blk-", |rest: &str| rest.ends_with(" departed"), secs(30))?;
     println!("  ok: ejected from Files with no password, recorded clean, its row gone, and pulled");
+    Ok(())
+}
+
+/// The transcript's length and the SCSI trace's, before an eject.
+pub(crate) fn before_eject(s: &Session, work: &Path) -> (usize, usize) {
+    (s.transcript().len(), crate::scsi_trace::log_len(&work.join("scsi.log")))
+}
+
+/// **An ejected stick was stopped and asked nothing after**: since `from`, its eject traced, its
+/// tray open, no request refused, and no command answered as a missing medium after the eject.
+pub(crate) fn stopped_and_left_alone(s: &Session, qmp: &mut Qmp, work: &Path, id: &str, from: (usize, usize)) -> R<()> {
+    let (from, log_from) = from;
+    let log = fs::read_to_string(work.join("scsi.log")).unwrap_or_default();
+    let at = crate::scsi_trace::eject_traced(&log, log_from)
+        .ok_or("no START STOP UNIT with LoEj reached the stick: the kernel did not stop it")?;
+    let blocks = qmp.execute(r#"{"execute":"query-block"}"#)?;
+    if crate::scsi_trace::tray_open(&blocks, id) != Some(true) {
+        return Err(format!("the stick's tray is not open after the eject: {blocks}").into());
+    }
+    if s.transcript()[from..].contains("ejected, and asked for more") {
+        return Err("something asked the ejected stick for more: the service read it after the eject".into());
+    }
+    if crate::scsi_trace::not_ready_after(&log, at) {
+        return Err("a command reached the ejected stick: the kernel let a request through after the eject".into());
+    }
+    println!("  ok: the stick was sent START STOP UNIT and its tray opened, and nothing asked it for more");
     Ok(())
 }
 

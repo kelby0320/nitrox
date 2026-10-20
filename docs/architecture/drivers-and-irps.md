@@ -29,7 +29,8 @@ original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 > as the fallback. § "Interrupts" and the ramdisk re-checked 2026-09-14, when Phase 5 Part C
 > made a Limine module a block device and gave it a completion interrupt of its own; § "Device
 > discovery" the same day, when Part D made drivers report what they did with each function.
-> § "Flush" added 2026-09-24, with administration Part C.2. § "Module tiers" corrected 2026-10-02
+> § "Flush" added 2026-09-24, with administration Part C.2; § "Eject" 2026-10-19, with pre-Phase-7
+> Part C.4. § "Module tiers" corrected 2026-10-02
 > (PR #353 review): its rule still made hot-pluggable drivers Tier 2, which Phase 6's decisions
 > reversed. § "A kernel thread that waits" added the same day, with Phase 6 Part A.2's hub thread.
 > § "A block driver behind a bus" added 2026-10-06, with Phase 6 Part D's USB disks. § "What a disk
@@ -433,8 +434,20 @@ which builds both.
 - **AHCI and the RAM disk refuse it**, `Unsupported`, as named ops they do not do: an internal
   disk is partitioned by `nxinstall`, which reboots after.
 
-**A retired window refuses everything**, `PeerClosed`, at its own submit: a read, a write, a flush
-or a rescan. A window is a start and a length over its disk (`io::block::Partition`), so one left
+### Eject
+
+*(Pre-Phase-7 Part C.4, 2026-10-19.)* `IoOpcode::Eject` stops a removable disk's medium once nothing
+on it is mounted ([`io-operation.md`](../spec/io-operation.md)): an IRP with no buffer and no range,
+built by `io::block::dispatch_block_control` as a flush and a rescan are.
+- **A USB disk sends `START STOP UNIT`** with LoEj, on the path a flush takes ([`usb.md`](usb.md)
+  § *Mass storage*), and refuses every later request on the unit `PeerClosed` until it arrives
+  again, those queued behind the eject included; a flush completes at once, with nothing to write.
+- **A partition's window answers it itself, `Unsupported`**, as it does a rescan: forwarded, the
+  holder of one partition could stop its siblings' disk.
+- **AHCI and the RAM disk refuse it**, `Unsupported`, as named ops they do not do.
+
+**A retired window refuses everything**, `PeerClosed`, at its own submit: a read, a write, a flush,
+a rescan or an eject. A window is a start and a length over its disk (`io::block::Partition`), so one left
 forwarding after its table changed would read and write where the old table said, which on a
 repartitioned stick is the middle of the new partition. Retiring is a flag the window checks before
 it forwards (`io::block::retire_window`); a handle to it stays valid, and answers nothing. The

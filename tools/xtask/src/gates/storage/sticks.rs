@@ -10,12 +10,13 @@ use crate::*;
 /// 2. **An MBR stick plugged in**: its disk and partition read in the kernel, the partition's ext4
 ///    auto-mounted **writable**, on a live boot too, and written through a mapping without
 ///    a sync. **An eject while a file on it is held is refused**, and `disk --eject` then ejects it
-///    with no password. Pulled then, its records depart and the service drops it.
+///    with no password, and a read of it is refused by the kernel. Pulled then, its records depart
+///    and the service drops it.
 /// 3. **A whole-disk stick pulled while mounted** writable, with a file left dirty: the teardown's
 ///    write-back and the server's marking each come back at once, the dirty file let go, the server
 ///    gone, the label gone, and a command after it runs.
 /// 4. **The same stick plugged in again** is a new disk at a new index, mounted again.
-pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
+pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp, work: &Path) -> R<()> {
     let secs = std::time::Duration::from_secs;
     let any = |_: &str| true;
     let line_of = |s: &mut Session, from: usize, pat: &str| -> R<String> {
@@ -35,7 +36,7 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     };
     let plug = |qmp: &mut Qmp, id: &str, node: &str| -> R<()> {
         qmp.execute(&format!(
-            r#"{{"execute":"device_add","arguments":{{"driver":"usb-storage","id":"{id}","bus":"xhci.0","drive":"{node}"}}}}"#
+            r#"{{"execute":"device_add","arguments":{{"driver":"usb-storage","id":"{id}","bus":"xhci.0","drive":"{node}","removable":true}}}}"#
         ))?;
         Ok(())
     };
@@ -134,8 +135,27 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     s.expect("still-mounted=1")?;
     s.expect("/home>")?;
     println!("  ok: an eject of one partition while a file on the other is held is refused, and leaves both mounted");
+    let ejecting = crate::gates::media::before_eject(s, work);
     eject_stick(s, &[STICK_MBR_LABEL, STICK_MBR_LABEL_2])?;
     println!("  ok: written without a sync, and both partitions ejected by one `disk --eject`, no password asked");
+    // **Listed to be removed, and read no more**: the table's read probes every unmounted device.
+    s.send(&format!("disk --list | filter name == \"blk-{index}\" | map {{ |r| format(\"note-is={{}}\", r.note) }}"))?;
+    s.expect("note-is=ejected; remove it")?;
+    s.expect("/home>")?;
+    crate::gates::media::stopped_and_left_alone(s, qmp, work, "stickmbr", ejecting)?;
+    // **And the kernel refuses what does ask**, as the service asks nothing.
+    crate::gates::interactive::with_admin_asked(s, &format!("test-pattern --read-device /dev/blk/{index}"))?;
+    s.expect_all(&[
+        "ejected, and asked for more; refused until plugged in again",
+        &format!("test-pattern: a read of /dev/blk/{index}: refused: PeerClosed"),
+    ])?;
+    s.expect("/home>")?;
+    let log = fs::read_to_string(work.join("scsi.log")).unwrap_or_default();
+    let eject = crate::scsi_trace::eject_traced(&log, ejecting.1).ok_or("the stick's eject is no longer traced")?;
+    if crate::scsi_trace::not_ready_after(&log, eject) {
+        return Err("the read reached the ejected stick: the kernel let it through".into());
+    }
+    println!("  ok: a read of the ejected stick is refused, and nothing reached it");
     let from = s.transcript().len();
     pull(qmp, "stickmbr")?;
     s.line_since(from, &format!("usb: port {port}: disconnected; slot "), any, secs(30))?;
@@ -297,7 +317,9 @@ pub(crate) fn run_stick_steps(s: &mut Session, qmp: &mut Qmp) -> R<()> {
     s.send(&format!("{root}/w"))?;
     s.expect("alice")?;
     s.expect("/home>")?;
+    let ejecting = crate::gates::media::before_eject(s, work);
     eject_stick(s, &[STICK_FAT_LABEL])?;
+    crate::gates::media::stopped_and_left_alone(s, qmp, work, "stickfat", ejecting)?;
     let from = s.transcript().len();
     pull(qmp, "stickfat")?;
     s.line_since(from, &format!("storage-service: blk-{fat} departed"), any, secs(30))?;
@@ -319,8 +341,8 @@ pub(crate) fn eject_stick(s: &mut Session, names: &[&str]) -> R<()> {
     }
     let all = names.join(", ");
     s.expect(&format!("storage-service: ejected {all}, safe to remove"))?;
-    s.expect(&format!("disk: ejected {all}"))?;
-    s.expect("/home>")?;
+    // **In either order**: the service replies before it stops the stick.
+    s.expect_all(&[&format!("storage-service: {all} stopped"), &format!("disk: ejected {all}"), "/home>"])?;
     if s.transcript()[from..].contains("password:") {
         return Err(format!("`disk --eject {}` asked for a password", names[0]).into());
     }

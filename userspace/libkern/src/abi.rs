@@ -317,6 +317,9 @@ pub const IO_OPCODE_FLUSH: u32 = 2;
 /// old partitions departed, the new ones arriving. No buffer and no range, as for a flush, and
 /// needs `WRITE` on the disk. A partition, and every disk but a USB one, answers `Unsupported`.
 pub const IO_OPCODE_RESCAN: u32 = 3;
+/// `IoOpcode::Eject` — stop a removable disk's medium; every later request on it is refused
+/// `PeerClosed` until it is plugged in again. As for a rescan: no buffer, no range, `WRITE`.
+pub const IO_OPCODE_EJECT: u32 = 4;
 
 /// The `sys_io_submit` operation descriptor — the userspace mirror of the
 /// kernel's `IoOp` (`docs/spec/io-operation.md`). 40 bytes, 8-byte aligned.

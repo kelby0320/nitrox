@@ -260,7 +260,8 @@ since every `--selftest` gate runs it; `test-qemu` holds its line.
 
 **A stick the guest formats is checked twice** (Phase 6 Part G). `check-storage`'s blank stick is
 formatted ext4 whole, then partitioned again and formatted FAT, all in one boot, so the host copies
-the image once the ext4 is ejected — before the MBR replaces its GPT — and checks the copy and the
+the image once the ext4 is unmounted — before the MBR replaces its GPT, and **unmounted, not
+ejected**, since an ejected stick is refused everything until it is plugged in again — and checks the copy and the
 final image after the machine stops, as it checks a stick pulled while mounted. **Which partition
 is the boot stick's is asked of `/dev/devices`** (`filter parent == "blk-<n>"`), not read off the
 report lines: the report gives a partition's reason, and the live stick's ESP's is its clusters, not
@@ -277,6 +278,23 @@ second drive row. Where it aims inside a dialog it does not write down: the edit
 out on the host by `libui`, with the theme the image stages, and the gate clicks where that layout
 puts the Up button. **A cursor is drawn into the screen a gate reads**, so a check for something
 gone looks where the pointer is not.
+
+**What reaches a stick is read off QEMU's SCSI trace** (pre-Phase-7 Part C.4), as `check-terminal`
+reads the keyboard's lights off the PS/2 one. `check-media` and `check-storage` run with
+`-trace scsi_disk_new_request -trace scsi_disk_check_condition` and plug their sticks
+`removable=on`, as real sticks report, so `START STOP UNIT` opens QEMU's tray (`query-block`'s
+`tray_open`). After every eject — `check-storage`'s three sticks, `check-media`'s one — each asserts
+**three things, each controlled by a boot that broke it**: the command reached the stick and its
+tray opened (a driver completing the eject unsent fails it); no request was refused since, which is
+the kernel's `ejected, and asked for more` (a service still probing the stick fails it); and no
+command reached it after, which QEMU answers as `NOT READY`, `MEDIUM NOT PRESENT`. **Since the
+service asks nothing, the last needs something that asks**: `check-storage` then reads the MBR stick
+itself, `with admin test-pattern --read-device`, and expects the kernel's `PeerClosed` and nothing
+in the trace (a driver letting the request through fails it, the service untouched). **The trace is
+not one device's**: every `usb-storage` reports `lun=0`, so a command is told apart by what it is,
+an eject, or by what only an ejected stick answers, and each eject is looked for past the trace's
+length before it. **CI's QEMU 8.2 prints a CDB `data= 0x1b 0x00…`, later ones `data=1b 00…`**, and
+the reader takes both.
 
 **A gate that boots a test image and types meets `boot-probe` unless it waits for it.** `boot-probe`
 starts once the test harness's chain has finished, and some of its tests change what a session
@@ -595,8 +613,8 @@ pattern, read with `debugfs` rather than the library that wrote it. **Since Phas
 sticks in over QMP** after that: the boot stick passed over; an MBR stick with two ext4 partitions,
 each auto-mounted **writable** (Part F) and written without a sync, an eject of the first refused
 while `test-pattern --eject-held` holds a file on the second, both left mounted, then both ejected
-by one `disk --eject` with no password, and pulled; a
-whole-disk ext4 stick **pulled while mounted**, whose teardown's I/O must all come back at once —
+by one `disk --eject` with no password, a read of it refused by the kernel (`test-pattern
+--read-device`), and pulled; a whole-disk ext4 stick **pulled while mounted**, whose teardown's I/O must all come back at once —
 the kernel letting the dirty file go, the server unable to record the filesystem clean, the label
 gone and the shell still answering; and that stick again, at a new index. The host then carves the
 first's partitions out by its MBR and requires each clean with its pattern, and finds the second —

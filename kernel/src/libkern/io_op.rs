@@ -32,6 +32,8 @@ pub const IO_OPCODE_WRITE: u32 = 1;
 pub const IO_OPCODE_FLUSH: u32 = 2;
 /// [`IoOpcode::Rescan`]'s value.
 pub const IO_OPCODE_RESCAN: u32 = 3;
+/// [`IoOpcode::Eject`]'s value.
+pub const IO_OPCODE_EJECT: u32 = 4;
 
 /// The operation selector. `#[repr(u32)]`; part of the ABI version hash. Each value is stated
 /// once, above, and the variants take it.
@@ -52,6 +54,10 @@ pub enum IoOpcode {
     /// **A partition answers `Unsupported`**, as does a disk whose driver cannot read its table
     /// again — today every one but a USB disk.
     Rescan = IO_OPCODE_RESCAN,
+    /// **Stop a removable disk's medium and eject it**: every later request on it is refused
+    /// `PeerClosed` until it is plugged in again. No buffer and no range, `WRITE` on the disk; a
+    /// partition, and every disk but a USB one, answers `Unsupported`.
+    Eject = IO_OPCODE_EJECT,
 }
 
 impl IoOpcode {
@@ -62,6 +68,7 @@ impl IoOpcode {
             IO_OPCODE_WRITE => Some(Self::Write),
             IO_OPCODE_FLUSH => Some(Self::Flush),
             IO_OPCODE_RESCAN => Some(Self::Rescan),
+            IO_OPCODE_EJECT => Some(Self::Eject),
             _ => None,
         }
     }
@@ -89,6 +96,7 @@ mod tests {
         assert_eq!(IoOpcode::from_u32(1), Some(IoOpcode::Write));
         assert_eq!(IoOpcode::from_u32(2), Some(IoOpcode::Flush));
         assert_eq!(IoOpcode::from_u32(3), Some(IoOpcode::Rescan));
-        assert_eq!(IoOpcode::from_u32(4), None, "the first value no opcode has");
+        assert_eq!(IoOpcode::from_u32(4), Some(IoOpcode::Eject));
+        assert_eq!(IoOpcode::from_u32(5), None, "the first value no opcode has");
     }
 }

@@ -146,3 +146,14 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-10-19	388	c81a8530	12	rules-and-docs	optional	unverified	fixed	7fcda1ff	the history note says the cascade wraps in the work area since C.3
 2026-10-19	388	c81a8530	13	rules-and-docs	optional	unverified	fixed	7fcda1ff	reflowed
 2026-10-19	388	c81a8530	14	rules-and-docs	optional	unverified	fixed	7fcda1ff	RegisterSnapZone: DragEnded asks for the target with the rectangle the window began at; a trigger may lie over a bar
+2026-10-20	389	fd36b099	1	logic+error-paths+architecture	blocking	demonstrated	fixed	c853e8c8	eject refuses a disk the machine started from or one init mounted on (NoAccess) before unmounting; init_known needs no guard, as no Storage mount exists without it (tests.rs:428, :549)
+2026-10-20	389	fd36b099	2	logic+error-paths+architecture+tests+rules-and-docs	worth-fixing	demonstrated	fixed	e3dc6de0	Dev::next skips an ejected unit at all three pops; the hub thread answers what waited (drain_stopped), a held rescan refused; Action kept small
+2026-10-20	389	fd36b099	3	logic+rules-and-docs+architecture	worth-fixing	demonstrated	fixed	e3dc6de0	Rescan's paragraph back under Rescan; Eject in Rights and Deferred
+2026-10-20	389	fd36b099	4	tests	worth-fixing	demonstrated	fixed	c853e8c8	marking, the refresh check and the stop's words moved to lib.rs and tested; the refresh guard's call site boot-controlled by check-storage
+2026-10-20	389	fd36b099	5	tests	worth-fixing	demonstrated	fixed	991f196f	check-storage reads the ejected stick (test-pattern --read-device) and expects PeerClosed; the driver refusal removed alone now fails it
+2026-10-20	389	fd36b099	6	rules-and-docs	worth-fixing	demonstrated	fixed	eab1518e	five pure moves (check-moves) take all three files under main's entries; entries lowered; no raise kept
+2026-10-20	389	fd36b099	7	architecture	optional	demonstrated	fixed	e3dc6de0	a flush on an ejected unit completes 0, queued behind the eject or sent after
+2026-10-20	389	fd36b099	8	tests	optional	unverified	fixed	991f196f	eject_traced takes a start; every eject checked; a FAT stick left running but said stopped fails it
+2026-10-20	389	fd36b099	9	tests	optional	unverified	fixed	e3dc6de0	AHCI refuses before touching its disk, host-tested with none; abi-sync-check fails on a wrong libkern IO_OPCODE_EJECT (run in C.4)
+2026-10-20	389	fd36b099	10	rules-and-docs	optional	demonstrated	fixed	e3dc6de0	irp_command's doc here; mounts::eject's in c853e8c8
+2026-10-20	389	fd36b099	11	architecture	optional	unverified	fixed	c853e8c8	mark, reply, then stop; the gate takes the stop line and the reply in either order, and saw the reply first

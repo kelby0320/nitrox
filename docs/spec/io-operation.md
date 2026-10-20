@@ -8,8 +8,8 @@ layouts").
 
 **Status:** Pre-stabilization. Introduced with the storage slice (Phase 2
 slice 5). The layout below is the Phase 2 form. `Flush` joined `Read`/`Write` with
-administration Part C.2 (2026-09-24), and `Rescan` with Phase 6 Part G (2026-10-07); other opcodes
-are reserved (see § Deferred).
+administration Part C.2 (2026-09-24), `Rescan` with Phase 6 Part G (2026-10-07), and `Eject` with
+pre-Phase-7 Part C.4 (2026-10-19); other opcodes are reserved (see § Deferred).
 
 ## The async I/O core
 
@@ -29,7 +29,7 @@ fn sys_io_cancel(pending: RawHandle) -> isize
 
 `resource` is the handle the operation targets. In Phase 2 this is a **block
 [`DeviceNode`](device-node.md)** (a whole disk, or — slice 6 — a partition); the
-opcode set is block read, write, flush and rescan. The descriptor and syscall are deliberately
+opcode set is block read, write, flush, rescan and eject. The descriptor and syscall are deliberately
 resource-agnostic so future resource kinds (char devices, sockets) reuse them.
 
 - **Returns** a `PendingOperation` handle (a positive value) on a successfully
@@ -80,7 +80,7 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   `InvalidArgument`. It covers the whole device, and a descriptor that seemed to
   cover less would promise something it does not do. It is not a zero-length
   transfer, so the pre-signalled no-op below does not apply to it. **Nor does a
-  `Rescan`**, for the same reason.
+  `Rescan` or an `Eject`**, for the same reason.
 - **`flags`** — reserved for per-operation modifiers (e.g. a future
   force-unit-access / no-cache bit). No flag is defined yet, so any set bit
   returns `InvalidArgument`.
@@ -229,6 +229,7 @@ pub enum IoOpcode {
     Write = 1,   // buffer → device
     Flush = 2,   // the device's volatile write cache → its medium
     Rescan = 3,  // a disk's partition table, read again (Phase 6 Part G)
+    Eject = 4,   // a removable disk's medium stopped and ejected (pre-Phase-7 Part C.4)
 }
 ```
 
@@ -264,14 +265,27 @@ completes, `result` the number of partitions published, once the new ones are in
 who can already overwrite every byte on it, and the storage service sends it — `Reread`
 ([`rsproto-storage-ops.md`](rsproto-storage-ops.md)) — once nothing on the disk is mounted.
 
+**`Eject`** *(pre-Phase-7 Part C.4)* **stops a removable disk's medium and ejects it**, once nothing
+on it is mounted: the storage service submits it at the end of an eject's unmount chain. It names no
+buffer and no range, needs `WRITE`, and its PO completes, `result` `0`, once the disk has answered.
+- **A USB disk is sent `START STOP UNIT`** with LoEj set and Start clear (`1B 00 00 00 02 00`), as
+  util-linux's `eject` does, and once it answers **every later request on that unit is refused
+  `PeerClosed`**, as a pulled stick's are, until it is plugged in again and arrives as new: those
+  queued behind the eject and a waiting rescan with it. **A `Flush` completes at once instead**: a
+  stopped unit has nothing left to write, and a shutdown flushes every disk. A stick that answers
+  `ILLEGAL REQUEST` completes it `Unsupported` and keeps running; another failure, `IoError`; a
+  stick that departs, `PeerClosed`.
+- **A partition answers it itself, `Unsupported`**, as it does a rescan, and for the same reason.
+- **Every other disk answers `Unsupported`**: nothing ejects AHCI's or a RAM disk's.
+
 ## Rights
 
-`Read` requires the `READ` right on `resource`; `Write`, `Flush` and `Rescan` require
-`WRITE` — only a writer has anything to make durable, or a table to have rewritten. A
-block `DeviceNode` bound read-only into a namespace (the Phase 2 default — see
-[`device-node.md`](device-node.md)) therefore rejects `Write` at the lookup-rights
-gate, before any IRP is built. The buffer-side rights (`MAP_READ`/`MAP_WRITE` on
-`buffer`) are checked independently, as above.
+`Read` requires the `READ` right on `resource`; `Write`, `Flush`, `Rescan` and `Eject` require
+`WRITE` — only a writer has anything to make durable, a table to have rewritten, or a medium to
+stop. A block `DeviceNode` bound read-only into a namespace (the Phase 2 default — see
+[`device-node.md`](device-node.md)) therefore rejects `Write` at the lookup-rights gate, before
+any IRP is built. The buffer-side rights (`MAP_READ`/`MAP_WRITE` on `buffer`) are checked
+independently, as above.
 
 ## Relationship to the IRP
 
@@ -284,7 +298,7 @@ returned. The `IoOp` is the **userspace-facing** request; the `Irp` is its
 
 ## Deferred
 
-- Opcodes beyond `Read`/`Write`/`Flush`/`Rescan` — `Trim`/`Discard`, device-specific
+- Opcodes beyond `Read`/`Write`/`Flush`/`Rescan`/`Eject` — `Trim`/`Discard`, device-specific
   control. Added with a consumer (SSD trim). A per-write force-unit-access bit is a
   `flags` modifier, below, not an opcode.
 - The `flags` modifiers (force-unit-access, no-cache).

@@ -2,15 +2,15 @@
 
 **Status: normative for what is built (2026-09-25; `InUse` and the boot medium 2026-10-06; the media
 session, `Eject`, the watch and `Changed` 2026-10-07; `Reread`, and `Changed` for the devices too,
-2026-10-07).** `Mount`, `Unmount` and `InUse` are
-implemented in `userspace/storage-service/` and encoded by `userspace/librsproto/src/storage.rs`
-(administration Part C.5c). The view broker's `storage` grant binds the admin endpoint into a view
-(C.6), and `disk --mount` and `disk --unmount` speak these requests there (C.7). **`Eject` and
-`Changed`** (Phase 6 Part F) are a session's: `disk --eject` and Files speak them through the
-session endpoint every login binds. **`Reread`** (Phase 6 Part G) is the admin session's again:
-`disk --partition` and `disk --format` send it once they have written a device. See
-[`storage.md`](../architecture/storage.md) for the service,
-and [`administration.md`](../planning/administration.md) § *Part C in detail* for the design and its
+2026-10-07; an ejected stick stopped, and refused a mount or a reread, 2026-10-19).** `Mount`,
+`Unmount` and `InUse` are implemented in `userspace/storage-service/` and encoded by
+`userspace/librsproto/src/storage.rs` (administration Part C.5c). The view broker's `storage` grant
+binds the admin endpoint into a view (C.6), and `disk --mount` and `disk --unmount` speak these
+requests there (C.7). **`Eject` and `Changed`** (Phase 6 Part F) are a session's: `disk --eject` and
+Files speak them through the session endpoint every login binds. **`Reread`** (Phase 6 Part G) is
+the admin session's again: `disk --partition` and `disk --format` send it once they have written a
+device. See [`storage.md`](../architecture/storage.md) for the service, and
+[`administration.md`](../planning/administration.md) § *Part C in detail* for the design and its
 reasons.
 
 ## The shape
@@ -75,7 +75,7 @@ read-only because nobody chose it; an administrator's mount is a choice.
 |---|---|
 | `NotFound` | no block device has that name |
 | `AlreadyExists` | it is mounted already, by `init` or by the service; or another mount has that label |
-| `Unsupported` | it holds no filesystem the service can serve: nothing, or a FAT its server would refuse (Phase 6 Part E) |
+| `Unsupported` | it holds no filesystem the service can serve: nothing, or a FAT its server would refuse (Phase 6 Part E); or its stick was ejected, and must be plugged in again (pre-Phase-7 Part C.4) |
 | `InvalidArgument` | the label is not a valid one ([`storage.md`](../architecture/storage.md) §6), or the body is malformed |
 | `WouldBlock` | every mount slot is in use |
 | `IoError` | the filesystem's server did not come up; the reason says how |
@@ -139,13 +139,16 @@ unmounted**, so a file held on one partition refuses the eject with every partit
 Then each runs `Unmount`'s chain; a file opened between the check and its chain refuses there,
 leaving the ones before it unmounted, and the refusal still says the stick cannot be pulled. The
 disk must be **removable** — behind USB mass storage, or a partition of one
-([`storage.md`](../architecture/storage.md) §6). Eject sends nothing further to the device: the
-chain's flush is what a stick needs.
+([`storage.md`](../architecture/storage.md) §6) — and **not the one the system runs from**: not
+the disk the machine started from, nor one `init` mounted a filesystem on, since the whole disk
+stops. **Then the stick is stopped** (`IoOpcode::Eject`, pre-Phase-7 Part C.4), after the reply,
+and every later request on it refused until it is plugged in again; a stop that fails still leaves
+the eject done, as everything on it is unmounted.
 
 | Refusal | When |
 |---|---|
 | `NotFound` | nothing the service mounted has that name — `init`'s mounts included, wherever they are |
-| `NoAccess` | the disk is not removable: an internal disk's mount is `Unmount`'s, on an admin session (`with admin disk --unmount`) |
+| `NoAccess` | the disk is not removable: an internal disk's mount is `Unmount`'s, on an admin session (`with admin disk --unmount`); or the system runs from it: the machine started from it, or `init` mounted a filesystem on it |
 | `WouldBlock` | a file on any filesystem of the stick is still open or mapped |
 | `IoError` | as for `Unmount` |
 | `Unsupported` | any other request on a media session |
@@ -181,6 +184,6 @@ under**, one per line — `Eject`'s form — and empty for none.
 | `NotFound` | no block device has that name |
 | `WouldBlock` | the partition is mounted; or, for a disk, anything on it is, since its partitions are about to be replaced. A partition beside a mounted sibling is read again |
 | `NoAccess` | it is on the disk the machine started from — asked after `WouldBlock`, so the disk holding `init`'s root says it is mounted; or `init`'s mounts are not all known |
-| `Unsupported` | the kernel cannot rescan the disk: every disk but a USB one's |
+| `Unsupported` | the kernel cannot rescan the disk: every disk but a USB one's; or its stick was ejected, and must be plugged in again |
 | `InvalidArgument` | the name is not UTF-8 |
 | `IoError` | the rescan failed: the disk never went quiet, or its table would not read |

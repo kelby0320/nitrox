@@ -39,7 +39,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use fs_server_ext4::{BlockReader, FsError};
 use libinittoml::manifest::{self, Mode};
-use libkern::abi::{IO_OPCODE_FLUSH, IO_OPCODE_READ, IoOp};
+use libkern::abi::{IO_OPCODE_EJECT, IO_OPCODE_FLUSH, IO_OPCODE_READ, IoOp};
 use libkern::debug::Line;
 use libkern::device::{DeviceKind, DeviceRecord};
 use libkern::*;
@@ -61,6 +61,9 @@ use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, ini
 use storage_service::suffix::{self, Asked, session_only};
 use storage_service::table::{self, By, Device, Mounted};
 use storage_service::watch::{Sent, Watches};
+
+mod mounting;
+use mounting::*;
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -534,182 +537,6 @@ fn reply_subnamespace(serve_end: u64, request_id: u64, ns: u64, consumed: usize)
     reply_with_handle(serve_end, request_id, &body[..n], dup as u64);
 }
 
-struct Mount {
-    /// Its device's registry id.
-    device: u32,
-    label: String,
-    mode: Mode,
-    /// A namespace of its own, with the server bound at `/`: what a `SUBNAMESPACE` reply hands on.
-    ns: u64,
-    /// The server's control channel: kept, for the unmount it will carry, and waited on, since
-    /// its closing means the server has gone.
-    control: u64,
-    /// The server's process handle.
-    process: u64,
-}
-
-/// Spawn `path` with `control_end` moved into it; on `None` it is closed, a failed spawn moving
-/// nothing.
-fn spawn(root_ns: u64, path: &[u8], control_end: u64) -> Option<u64> {
-    let (st, image) = lookup(root_ns, path, RIGHT_MAP_READ);
-    if st != 0 || image == 0 {
-        close(control_end);
-        return None;
-    }
-    let args = SpawnArgs {
-        image,
-        handle_count: 1,
-        move_mask: 1, // move the control endpoint to the child
-        arg0: 0,
-        handles: [control_end, 0, 0, 0],
-        rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
-        namespace: 0,
-        syscaps: 0, // a resource server holds no ambient capabilities
-    };
-    // SAFETY: `args` is a valid `SpawnArgs` naming handles this process holds.
-    let h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&args as *const SpawnArgs) as u64) };
-    close(image);
-    if h <= 0 {
-        close(control_end);
-        return None;
-    }
-    Some(h as u64)
-}
-
-/// Send a filesystem server its **setup message**: the device in `handles[0]`, and one flags byte.
-/// Not rsproto-framed — it precedes everything else on the channel (`rsproto-wire-format.md`).
-fn send_setup(control: u64, device: u64, flags: u8) -> bool {
-    // SAFETY: REPLY_MSG/REPLY_HANDLES are valid buffers; single-threaded.
-    unsafe {
-        let Some(n) = fs_setup(&mut REPLY_MSG[PAYLOAD_OFF..], flags) else {
-            return false;
-        };
-        REPLY_MSG[4..8].copy_from_slice(&(n as u32).to_le_bytes());
-        REPLY_MSG[8] = 1;
-        REPLY_HANDLES[0] = device;
-        syscall5(
-            SYS_CHANNEL_SEND,
-            control,
-            (&raw const REPLY_MSG) as u64,
-            (&raw const REPLY_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        ) == 0
-    }
-}
-
-/// Wait, bounded, for a server's `Meta::Ready` and take its endpoint; `Err` says what came instead.
-fn wait_ready(control: u64) -> Result<u64, &'static [u8]> {
-    if !wait_until(control, now_ns().saturating_add(READY_TIMEOUT_NS)) {
-        return Err(b"it sent no Ready in time");
-    }
-    let m = match recv(control) {
-        Ok(Some(m)) => m,
-        Ok(None) => return Err(b"what it sent was not a message"),
-        Err(()) => return Err(b"it exited before Ready"),
-    };
-    match (m.op, m.flags & RS_FLAG_ERROR != 0, m.handles.as_slice()) {
-        (librsproto::OP_READY, false, &[endpoint]) => Ok(endpoint),
-        (librsproto::OP_READY, true, _) => {
-            m.handles.iter().for_each(|&h| close(h));
-            Err(b"it refused the device")
-        }
-        _ => {
-            m.handles.iter().for_each(|&h| close(h));
-            Err(b"it sent something other than Ready")
-        }
-    }
-}
-
-/// **Flush the drive's volatile write cache** (`IoOpcode::Flush`; `drivers-and-irps.md` § Flush):
-/// `true` once it completes. Needs `WRITE` on the node, which the manager's duplicate carries.
-fn flush(node: u64) -> bool {
-    let op = IoOp { opcode: IO_OPCODE_FLUSH, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
-    // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
-    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
-    po >= 0 && po_wait(po as u64).0 == 0
-}
-
-/// **Have the kernel read a disk's partition table again** (`IoOpcode::Rescan`): its partitions
-/// depart and the table's are published, as arrivals read from the subscription after. How many
-/// were published, or the kernel's refusal (`Unsupported` for every disk but a USB disk's).
-fn rescan(node: u64) -> Result<u64, KError> {
-    let op = IoOp { opcode: IO_OPCODE_RESCAN, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
-    // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
-    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
-    if po < 0 {
-        return Err(KError::from_i32(po as i32));
-    }
-    match po_wait(po as u64) {
-        (0, published) => Ok(published),
-        (status, _) => Err(KError::from_i32(status as i32)),
-    }
-}
-
-/// Mount `plan`'s device: spawn a server over it, and build its namespace. The server gets a
-/// duplicate of `node`; this service keeps its own, for the flush and for a later mount.
-fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
-    // **The server's handle, narrowed to the mode**: a read-only mount's server cannot write the
-    // device even if it tried, whatever `ReadOnly` does above it.
-    let write = if plan.mode == Mode::Rw { RIGHT_WRITE } else { 0 };
-    // SAFETY: duplicating a node this process holds with DUPLICATE, narrowed.
-    let device = unsafe { syscall2(SYS_HANDLE_DUPLICATE, node, RIGHT_READ | write | RIGHT_TRANSFER | RIGHT_DUPLICATE) };
-    if device <= 0 {
-        return Err(b"its node would not duplicate");
-    }
-    let device = device as u64;
-    let Some((control, server_end)) = make_channel(4) else {
-        close(device);
-        return Err(b"no control channel");
-    };
-    let Some(process) = spawn(root_ns, plan.server.path(), server_end) else {
-        close(device);
-        close(control);
-        return Err(b"its server would not spawn");
-    };
-    // **From here a failure lets the server go**: its control channel and handle closed. **That,
-    // not the terminate, ends it**, a request neither filesystem server reads: a server that had
-    // not answered `Ready` finds its control channel closed and exits; one that had exits when its
-    // forwarding endpoint loses its peer. The terminate stays, for a server that does listen.
-    let abandon = |control: u64| {
-        close(control);
-        // SAFETY: the Process handle the spawn returned, with SIGNAL.
-        unsafe { syscall1(SYS_PROCESS_TERMINATE, process) };
-        close(process);
-    };
-    let flags = if plan.mode == Mode::Ro { FS_SETUP_READ_ONLY } else { 0 };
-    if !send_setup(control, device, flags) {
-        close(device);
-        abandon(control);
-        return Err(b"the device could not be handed to its server");
-    }
-    let endpoint = match wait_ready(control) {
-        Ok(e) => e,
-        Err(why) => {
-            abandon(control);
-            return Err(why);
-        }
-    };
-    // SAFETY: register-only syscall; returns a fresh namespace handle with every right.
-    let ns = unsafe { syscall0(SYS_NS_CREATE) };
-    if ns <= 0 {
-        close(endpoint);
-        abandon(control);
-        return Err(b"no namespace for it");
-    }
-    let ns = ns as u64;
-    // SAFETY: a namespace this process created, a valid path, and an endpoint it holds.
-    let bound = unsafe { syscall4(SYS_NS_BIND, ns, b"/".as_ptr() as u64, 1, endpoint) };
-    // The binding holds its own reference to the endpoint.
-    close(endpoint);
-    if bound != 0 {
-        close(ns);
-        abandon(control);
-        return Err(b"its server would not bind into its namespace");
-    }
-    Ok(Mount { device: plan.device, label: plan.label.clone(), mode: plan.mode, ns, control, process })
-}
-
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Listing {
     Tables,
@@ -756,6 +583,9 @@ impl Service {
     /// one place `found` changes after the boot**: the unmount reads the device for its own line
     /// with [`read_found`](Self::read_found), which stores nothing.
     fn refresh(&mut self, id: u32) {
+        if mounts::ejected(&self.devices, id) {
+            return;
+        }
         let Some(found) = self.read_found(id) else {
             return;
         };
@@ -937,8 +767,8 @@ impl Service {
         let Ok(name) = core::str::from_utf8(&m.body) else {
             return refuse(KError::InvalidArgument, b"a name that is not UTF-8");
         };
-        let names = match storage_service::mounts::eject(&self.devices, &self.all_mounts(), name) {
-            Ok(names) => names,
+        let (disk, names) = match storage_service::mounts::eject(&self.devices, &self.all_mounts(), name) {
+            Ok(e) => (e.disk, e.names),
             Err(r) => return refuse(r.kerror(), r.why()),
         };
         // **The whole stick or none of it**: every mount is synced and asked whether a file is
@@ -961,8 +791,14 @@ impl Service {
         }
         let said = names.join(", ");
         Line::new().s(b"storage-service: ejected ").untrusted(said.as_bytes()).s(b", safe to remove").end();
+        mounts::mark_ejected(&mut self.devices, disk);
         // The reply names every mount of the drive, a name per line (`rsproto-storage-ops.md`).
+        // **Before the stop**, which a stick that never answers holds for a command's deadline:
+        // the eject is done either way, as everything on it is unmounted.
         let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, names.join("\n").as_bytes(), &[]);
+        let node = self.nodes.iter().find(|(id, _)| *id == disk).map(|&(_, n)| n);
+        let said_stop = mounts::stop_said(node.map_or(Err(KError::NotFound), eject_medium));
+        Line::new().s(b"storage-service: ").untrusted(said.as_bytes()).s(b" ").s(said_stop.as_bytes()).end();
     }
 
     /// A resolve on an admin endpoint, whatever its suffix, gets an admin session. `false` if gone.
@@ -1448,6 +1284,9 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
         }
         Found::Nothing => {
             line.s(b"no filesystem");
+        }
+        Found::Ejected => {
+            line.s(b"ejected");
         }
     }
     if let Some(m) = mount {

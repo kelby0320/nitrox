@@ -91,11 +91,12 @@ pub enum IrpOp {
     Write = 1,
     Flush = 2,   // no buffer, no range: the device's cache to its medium
     Rescan = 3,  // no buffer, no range: a disk's partition table, read again (Phase 6 Part G)
+    Eject = 4,   // no buffer, no range: a removable disk's medium stopped (pre-Phase-7 Part C.4)
 }
 ```
 
 The set mirrors [`IoOpcode`](io-operation.md#ioopcode) (the two are kept
-numerically aligned for a trivial translation). `Flush` and `Rescan` carry an empty
+numerically aligned for a trivial translation). `Flush`, `Rescan` and `Eject` carry an empty
 buffer (`count` `0`, a null `frags`), which a driver turns into an empty slice rather
 than one built from the null pointer. **A driver names every op it handles** and
 refuses the rest; one that read "a write, else a read" would take a flush for a read.
