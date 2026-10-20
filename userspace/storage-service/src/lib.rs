@@ -41,6 +41,8 @@ pub mod probe {
         },
         /// Nothing this service recognises.
         Nothing,
+        /// **Ejected**, with the rest of its disk: read no more, as any read wakes a stopped stick.
+        Ejected,
     }
 
     impl Found {
@@ -49,7 +51,7 @@ pub mod probe {
             match self {
                 Found::Ext4 { .. } => Some("ext4"),
                 Found::Fat { .. } => Some("fat"),
-                Found::Nothing => None,
+                Found::Nothing | Found::Ejected => None,
             }
         }
 
@@ -65,7 +67,7 @@ pub mod probe {
         pub fn clean(&self) -> Option<bool> {
             match self {
                 Found::Ext4 { clean, .. } | Found::Fat { clean, .. } => *clean,
-                Found::Nothing => None,
+                Found::Nothing | Found::Ejected => None,
             }
         }
 
@@ -578,6 +580,8 @@ pub mod mounts {
         /// `init`'s mounts are not all known ([`init_known`](crate::sources::init_known)), so the
         /// device could be `init`'s root.
         InitUnknown,
+        /// It was ejected, with the rest of its disk.
+        Ejected,
     }
 
     impl Refusal {
@@ -587,7 +591,7 @@ pub mod mounts {
             match self {
                 Refusal::NoSuchDevice => KError::NotFound,
                 Refusal::AlreadyMounted | Refusal::LabelTaken => KError::AlreadyExists,
-                Refusal::NothingToServe => KError::Unsupported,
+                Refusal::NothingToServe | Refusal::Ejected => KError::Unsupported,
                 Refusal::BadLabel => KError::InvalidArgument,
                 Refusal::Full => KError::WouldBlock,
                 Refusal::InitUnknown => KError::NoAccess,
@@ -606,6 +610,7 @@ pub mod mounts {
                 Refusal::InitUnknown => {
                     b"init's mounts are not all known, so this service mounts nothing: the device could be init's root"
                 }
+                Refusal::Ejected => b"it was ejected: plug it in again",
             }
         }
     }
@@ -630,6 +635,9 @@ pub mod mounts {
         let d = devices.iter().find(|d| crate::table::name(&d.record) == name).ok_or(Refusal::NoSuchDevice)?;
         if mounted.iter().any(|m| m.device == d.record.id) {
             return Err(Refusal::AlreadyMounted);
+        }
+        if d.found == Found::Ejected {
+            return Err(Refusal::Ejected);
         }
         let server = d.found.server().ok_or(Refusal::NothingToServe)?;
         let label = if label.is_empty() {
@@ -770,7 +778,7 @@ pub mod mounts {
     /// **The name is the mount's** (the table's `mounted` column), never the filesystem's own
     /// label, which two sticks can share and a stick can lack. An internal disk's mount is the
     /// `storage` grant's to unmount; `init`'s mounts are not this service's.
-    pub fn eject(devices: &[Device], mounted: &[Mounted], name: &str) -> Result<Vec<String>, EjectRefusal> {
+    pub fn eject(devices: &[Device], mounted: &[Mounted], name: &str) -> Result<Ejection, EjectRefusal> {
         use crate::table::By;
         let want = at(name);
         let m = mounted.iter().find(|m| m.by == By::Storage && m.at == want).ok_or(EjectRefusal::NotMounted)?;
@@ -782,11 +790,21 @@ pub mod mounts {
         let partition = d.record.kind() == libkern::device::DeviceKind::Partition;
         let disk = if partition { d.record.parent } else { d.record.id };
         let on_disk = |id: u32| devices.iter().any(|x| x.record.id == id && (id == disk || x.record.parent == disk));
-        Ok(mounted
+        let names = mounted
             .iter()
             .filter(|m| m.by == By::Storage && on_disk(m.device))
             .filter_map(|m| m.at.strip_prefix("/storage/").map(String::from))
-            .collect())
+            .collect();
+        Ok(Ejection { disk, names })
+    }
+
+    /// What an eject takes: the disk, by registry id, and the mounts to unmount first, by name.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Ejection {
+        /// The disk the medium is stopped on, once nothing on it is mounted.
+        pub disk: u32,
+        /// Every mount this service made on it, in the order made.
+        pub names: Vec<String>,
     }
 
     /// **What a `Reread` reads again**, by registry id: a partition, probed again, or a disk, which
@@ -812,6 +830,8 @@ pub mod mounts {
         BootDisk,
         /// The kernel cannot rescan the disk: the binary's, from the kernel's `Unsupported`.
         CannotRescan,
+        /// It was ejected, with the rest of its disk.
+        Ejected,
     }
 
     impl RereadRefusal {
@@ -822,7 +842,7 @@ pub mod mounts {
                 RereadRefusal::InitUnknown | RereadRefusal::BootDisk => KError::NoAccess,
                 RereadRefusal::NoSuchDevice => KError::NotFound,
                 RereadRefusal::Mounted => KError::WouldBlock,
-                RereadRefusal::CannotRescan => KError::Unsupported,
+                RereadRefusal::CannotRescan | RereadRefusal::Ejected => KError::Unsupported,
             }
         }
 
@@ -836,6 +856,7 @@ pub mod mounts {
                 RereadRefusal::CannotRescan => {
                     b"its partitions cannot be read again: only a USB disk's can, and an internal disk is partitioned by nxinstall"
                 }
+                RereadRefusal::Ejected => Refusal::Ejected.why(),
             }
         }
     }
@@ -863,6 +884,9 @@ pub mod mounts {
         };
         if mounted.iter().any(on_it) {
             return Err(RereadRefusal::Mounted);
+        }
+        if d.found == Found::Ejected {
+            return Err(RereadRefusal::Ejected);
         }
         if on_boot_medium(d, devices) {
             return Err(RereadRefusal::BootDisk);
@@ -892,6 +916,9 @@ pub mod mounts {
     /// **The table's `note`**: [`unmounted_why`] for a filesystem found and not mounted; `None` for
     /// a mounted one, and for a device holding nothing, whose row says so already.
     pub fn note(d: &Device, all: &[Device], mount: Option<&Mounted>) -> Option<String> {
+        if d.found == Found::Ejected {
+            return Some(String::from("ejected; remove it"));
+        }
         if mount.is_some() || d.found.filesystem().is_none() {
             return None;
         }
@@ -1078,5 +1105,7 @@ pub mod watch {
     }
 }
 
+#[cfg(test)]
+mod eject_tests;
 #[cfg(test)]
 mod tests;

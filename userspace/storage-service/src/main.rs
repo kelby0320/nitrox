@@ -39,7 +39,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use fs_server_ext4::{BlockReader, FsError};
 use libinittoml::manifest::{self, Mode};
-use libkern::abi::{IO_OPCODE_FLUSH, IO_OPCODE_READ, IoOp};
+use libkern::abi::{IO_OPCODE_EJECT, IO_OPCODE_FLUSH, IO_OPCODE_READ, IoOp};
 use libkern::debug::Line;
 use libkern::device::{DeviceKind, DeviceRecord};
 use libkern::*;
@@ -646,6 +646,30 @@ fn rescan(node: u64) -> Result<u64, KError> {
     }
 }
 
+/// **Stop a stick's medium** (`IoOpcode::Eject`); the kernel's error otherwise.
+fn eject_medium(node: u64) -> Result<(), KError> {
+    let op = IoOp { opcode: IO_OPCODE_EJECT, flags: 0, buffer: 0, buf_offset: 0, offset: 0, length: 0 };
+    // SAFETY: `node` is a block device handle this process holds; `&op` is a valid `IoOp`.
+    let po = unsafe { syscall2(SYS_IO_SUBMIT, node, (&op as *const IoOp) as u64) };
+    if po < 0 {
+        return Err(KError::from_i32(po as i32));
+    }
+    match po_wait(po as u64).0 {
+        0 => Ok(()),
+        status => Err(KError::from_i32(status as i32)),
+    }
+}
+
+/// Why a stick's medium did not stop, in the eject line's words.
+fn not_stopped(err: KError) -> &'static [u8] {
+    match err {
+        KError::Unsupported => b"it cannot be stopped",
+        KError::IoError => b"it failed the command",
+        KError::PeerClosed => b"it went away",
+        _ => b"the kernel refused it",
+    }
+}
+
 /// Mount `plan`'s device: spawn a server over it, and build its namespace. The server gets a
 /// duplicate of `node`; this service keeps its own, for the flush and for a later mount.
 fn mount(root_ns: u64, plan: &Plan, node: u64) -> Result<Mount, &'static [u8]> {
@@ -756,6 +780,10 @@ impl Service {
     /// one place `found` changes after the boot**: the unmount reads the device for its own line
     /// with [`read_found`](Self::read_found), which stores nothing.
     fn refresh(&mut self, id: u32) {
+        // An ejected stick is read no more: a stopped medium wakes for any read.
+        if self.devices.iter().any(|d| d.record.id == id && d.found == Found::Ejected) {
+            return;
+        }
         let Some(found) = self.read_found(id) else {
             return;
         };
@@ -937,8 +965,8 @@ impl Service {
         let Ok(name) = core::str::from_utf8(&m.body) else {
             return refuse(KError::InvalidArgument, b"a name that is not UTF-8");
         };
-        let names = match storage_service::mounts::eject(&self.devices, &self.all_mounts(), name) {
-            Ok(names) => names,
+        let (disk, names) = match storage_service::mounts::eject(&self.devices, &self.all_mounts(), name) {
+            Ok(e) => (e.disk, e.names),
             Err(r) => return refuse(r.kerror(), r.why()),
         };
         // **The whole stick or none of it**: every mount is synced and asked whether a file is
@@ -961,6 +989,20 @@ impl Service {
         }
         let said = names.join(", ");
         Line::new().s(b"storage-service: ejected ").untrusted(said.as_bytes()).s(b", safe to remove").end();
+        // **Ejected however the stop goes**: everything on it is unmounted, so its data is safe,
+        // and a refusal now would be the half-done eject the held check exists to prevent.
+        let node = self.nodes.iter().find(|(id, _)| *id == disk).map(|&(_, n)| n);
+        let stopped = node.map_or(Err(KError::NotFound), eject_medium);
+        for d in self.devices.iter_mut().filter(|d| d.record.id == disk || d.record.parent == disk) {
+            d.found = Found::Ejected;
+        }
+        let mut line = Line::new();
+        line.s(b"storage-service: ").untrusted(said.as_bytes());
+        match stopped {
+            Ok(()) => line.s(b" stopped"),
+            Err(err) => line.s(b" did not stop: ").s(not_stopped(err)),
+        };
+        line.end();
         // The reply names every mount of the drive, a name per line (`rsproto-storage-ops.md`).
         let _ = send(ch, m.op, m.request_id, RS_FLAG_REPLY, names.join("\n").as_bytes(), &[]);
     }
@@ -1448,6 +1490,9 @@ fn report(d: &Device, mounts: &[Mounted], all: &[Device]) {
         }
         Found::Nothing => {
             line.s(b"no filesystem");
+        }
+        Found::Ejected => {
+            line.s(b"ejected");
         }
     }
     if let Some(m) = mount {
