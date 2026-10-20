@@ -1373,3 +1373,142 @@ held on every path read. Auth-service's install order (truncate, create, map, un
 rename, then memory) and its admin versus oracle routing held. The client environment decoder is
 bounded by the 4 KiB message against an 8 MiB stack. All host suites pass at 510381f4. Every
 probe was restored.
+
+### scheduler — main at 510381f4, 2026-10-20
+
+Lenses: logic, error-paths, trust-boundary, tests; returned nothing: none, but the architecture lens's report was cut off before any findings came back, so its empty list is not a clean result and the hunt is incomplete until it is rerun.
+Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplicates).
+
+- [ ] **sched-1** `kernel/src/object/timer.rs:206` — Destroying a Timer never removes its deadline-heap
+  entry. The heap holds a raw pointer with no reference, and neither `Timer::drop` nor
+  `dispatch_destroy` calls `deadline::remove`. Any process, with no rights needed, runs
+  `sys_timer_create`, `sys_timer_set(t, now+X, 0)`, then `sys_handle_close(t)` or exits. When X
+  passes, `fire_expired_deadlines` runs in IRQ context under SCHED and writes the freed slab slot
+  (`set_in_heap`, `take_waiters`, `interval`, `set_armed`; `sched/timers.rs:54-59`). If the slot now
+  holds another Timer, that timer is disarmed early and its own heap entry is orphaned. A periodic
+  timer re-pushes itself and writes the freed slot every interval. The test image hits this on
+  every boot (`userspace/hello` closes an armed 10 s timer), and `sleep 30` stopped with Ctrl-C
+  does too. Demonstrated: four host probes in `sched/tests.rs`, each since removed. In the main
+  one, timer A is armed for t=1000 and its only ref dropped (`timer_destroys == 1`). Timer B then
+  reuses A's slot and is armed for 1e9. `fire_expired_deadlines(2000)` leaves B with `deadline=0`
+  and `in_heap=false`, and the heap names the freed A. A control that disarmed A before the drop
+  left no entry. logic, error-paths, trust-boundary, tests. high.
+
+- [ ] **sched-2** `kernel/src/sched/wait.rs:53` — A wake panics the kernel when every
+  affinity-permitted run queue is at `READY_RESERVE` (32). `make_runnable` (and `resume_suspended`,
+  `exit.rs:379`) has no refusal path, although spawn refuses at a full queue. A process uses
+  `sys_thread_create` with `cpu_affinity=1` (TimeShared, no capability) to make 32 busy threads on
+  CPU 0, and has one more thread pinned to CPU 0 blocked on a timer. When the timer fires,
+  `pick_target_cpu` returns CPU 0 again, `place_thread` fails and the timer IRQ panics, although
+  other CPUs' queues are empty. On a 1-CPU machine 32 runnable threads suffice with no pinning. The
+  `READY_RESERVE` wake cap is not among the recorded deferrals (only `REAP_RESERVE` is).
+  Demonstrated: a host probe (removed) with 2 CPUs online filled `ready[0]` with 32 mask=1 threads
+  and called the real `make_runnable` on a blocked mask=1 thread. CPU 1 had room, and the call
+  panicked at `wait.rs:71` with 'wake placement: no ready queue would take the thread'. logic.
+  high.
+
+- [ ] **sched-3** `kernel/src/sched/wait.rs:29` — Blocking has no capacity check, and the 64-entry
+  global `blocked` list panics when full. `wait_on` goes straight to `block_current_and_switch`,
+  which calls `push_reserved`. The 64-entry `suspended` list (`exit.rs:322`) does the same. The doc
+  at `sched.rs:98-102` says blocking beyond the reserve "is refused". One process makes threads
+  with `sys_thread_create` (no per-process limit), each calling `sys_wait` on a handle that never
+  signals. Resource servers already occupy many slots, so fewer than 64 may be needed. The next
+  `sys_wait` by any thread panics with 'blocked list: reserve exhausted'. 65 threads that each
+  fault in ring 3 overflow `suspended` the same way. `TODO(unsupervised-fault)` records only the
+  leak, not this panic. Demonstrated: a host probe (removed) on a test `SchedState` measured
+  blocked cap=64, suspended cap=64, heap cap=16, ready cap=32. The 65th `push_reserved(&mut
+  st.blocked, ..)` panicked with 'blocked list: reserve exhausted'. `git show aec52d83` shows an
+  earlier `debug_assert` plus `try_push` was turned into this panic. logic, error-paths. high.
+
+- [ ] **sched-4** `kernel/src/sched/exit.rs:59` — `reap_matching` assumes ready threads "register on
+  no wait objects". That is false for a thread a waker just moved blocked to ready: it stays on the
+  other wait objects' waiter lists and on the deadline heap until `wait_on`'s resume path runs.
+  Thread A of process P calls `sys_wait([X, T], finite deadline)`, X signals, and A sits in ready
+  for up to a quantum, since syscall return does not reschedule. Sibling B calls
+  `sys_process_exit`, and `exit_process` reaps A from ready and frees it. T's waiter list and the
+  heap's Thread entry still name A. When T or the deadline fires, `wait_try_wake` and
+  `wait_mark_signaled` run on freed memory. If a new Thread reused the slot, an unrelated thread
+  wakes early with a wrong result. Demonstrated: a host probe (removed) registers inert thread A
+  (pid 7) on timers t1 and t2 with a deadline entry and parks it in `blocked`. Firing t1 moves A
+  to `ready[0]`, and `reap_matching(ready[0], reap[0], 7)` reaps it. After the reap list dropped,
+  A was freed, was still a t2 waiter and still had a heap Thread entry. error-paths. high.
+
+- [ ] **sched-5** `kernel/src/sched/exit.rs:86` — When `exit_process` reaps a sibling blocked in
+  `sys_wait` (or woken but not yet resumed), the sibling is never resumed. `sys_wait`'s on-stack
+  `refs: [Option<ObjectRef>; 32]` never drop, so each waited-on object leaks one reference. Thread
+  A of a process waits on IPC endpoint E while thread B calls `sys_process_exit`. A's stack
+  reference keeps E alive forever, so `IpcChannel::drop` and `ipc_endpoint_closing` never run and
+  the peer never sees `PeerClosed` (at most `MAX_WAIT_HANDLES-1` objects per thread leak). Timers
+  and POs leak the same way. Demonstrated: a probe on the `test-qemu` image (since restored). A
+  child holds one end of a channel and the parent waits on the peer. Control: the child alone
+  calls `process_exit` and the parent's wait returns 1. Test: the child first starts a second
+  thread blocked in `sys_wait` on that endpoint, then calls `process_exit`. The parent's wait
+  times out (-12) after 2 s. error-paths. medium.
+
+- [ ] **sched-6** `kernel/src/sched/deadline.rs:31` — The deadline heap is one global reserve of 16
+  entries (`HEAP_RESERVE`, `spawn.rs:32`), shared by every armed timer, finite-deadline `sys_wait`
+  and BlockBounded send, with no per-process bound. Because of sched-1, closing or exiting does not
+  give the slots back. A process arms far-future timers until refused, and may then exit. From then
+  on every `sys_timer_set` returns OutOfMemory, and every finite-deadline `sys_wait` that finds
+  nothing ready returns OutOfMemory at once. service-mgr (`main.rs:1392`) and session-mgr
+  (`main.rs:79`) spin instead of sleeping. storage-service's `park` (`main.rs:147`) ignores the
+  failed `sys_timer_set` and waits `u64::MAX` on an unarmed timer, so an eject with held files
+  hangs. Demonstrated: a probe on the `test-qemu` image (since restored). 11 far-future timers
+  armed (the other 5 slots were in use), then OutOfMemory (-4). After closing all 11 and waiting
+  50 ms, a fresh `sys_timer_set` still returned -4, and a finite-deadline `sys_wait` on an
+  unsignalled timer returned -4 immediately. logic, error-paths, tests. medium.
+
+- [ ] **sched-7** `kernel/src/sched/timers.rs:97` — `fire_timer` disarms a one-shot timer
+  (`set_armed(0,0)`) when it fires even if no thread waits, and `Timer::already_signaled` requires
+  `deadline_ns != 0`, so an elapsed timer never reads as signaled again. storage-service `park(5
+  ms)` does `sys_timer_set(now+5ms)` then `sys_wait(timer, u64::MAX)`. If it is preempted between
+  the two for at least 5 ms, a tick fires and disarms the timer with no waiter. The later wait
+  then blocks forever with no heap entry and hangs the storage service during an eject with held
+  files. A deadline-0 poll returns WouldBlock for an elapsed timer too. `coreutils sleep` has the
+  same window, but Ctrl-C recovers it. Demonstrated: a host probe (removed) armed a one-shot at
+  100. `already_signaled(150)` was true, and after `fire_expired_deadlines(st, 120)` it was false
+  and the timer was no longer scheduled. A second probe armed 1000, fired at 2000 with no waiters,
+  and `already_signaled(3000)` failed. error-paths, tests. medium.
+
+- [ ] **sched-8** `kernel/src/sched/exit.rs:181` — When the last thread of a process ends through
+  `exit_thread` (`sys_thread_exit`, or a supervisor's Terminate after a fault), `set_process_ended`
+  runs but the pid is never pushed to `ended_pids` and the reaper is not woken, although the
+  comment there says it is deferred to the reaper. `exit_process` does both (`exit.rs:237-240`).
+  Only the per-CPU `reap_pending` sweep closes the handle table. On a CPU kept busy by TimeShared
+  threads, `on_timer_tick` never calls `reap_pending`, so the table stays open and peers wait
+  indefinitely for `PeerClosed`. Demonstrated: a probe on the `test-qemu` image (since restored).
+  With 12 spinning TimeShared threads, a child whose sole thread ended via `sys_thread_exit` never
+  delivered `PeerClosed`, and the parent's wait timed out (-12) after 3 s. With the spinners
+  stopped, the same wait returned 1. Control under the same load: a child using `sys_process_exit`
+  closed promptly (wait=1). error-paths. low.
+
+- [ ] **sched-9** `kernel/src/sched/deadline.rs:84` — Test gap: the sift-up branch of
+  `deadline::remove`, taken when the entry swapped into the hole is smaller than its new parent, is
+  uncovered. Breaking it could leave a later deadline above an earlier one, so
+  `fire_expired_deadlines` (which stops at the first entry later than `now`) would delay wakes.
+  Demonstrated: a mutation collapsing the if/else to `sift_down(h, i)` still passed all 986 host
+  tests; restored. tests. low.
+
+- [ ] **sched-10** `kernel/src/sched/timers.rs:50` — Test gap: nothing on the host exercises
+  `fire_expired_deadlines`, `fire_timer`, `timer_arm` or `wait_on`, and sched-1 and sched-7 sit in
+  exactly this code. Six mutations each passed the 986 host tests: `wrapping_add` instead of
+  `saturating_add` for the periodic next deadline; treating a deadline as expired early;
+  periodic re-arm disabled; `timer_arm` pushing for `deadline_ns == 0`; `wait_on`'s deadline==0
+  poll path removed; `has_deadline` forced false. Unverified: the mutation runs were not repeated
+  by the verifier. The boot probes for sched-5, sched-6 and sched-8 did show those paths run only
+  under a QEMU gate. tests. low.
+
+What held up: `sys_wait` registration and blocking share one SCHED hold, so no lost wakeup, and a
+partial registration is fully unwound. The `wait_try_wake` CAS plus `make_runnable`'s not-in-blocked
+check catch a second waker. The `on_cpu` switch-out guard holds in `switch_into`, `stealable_to` and
+the reap paths. A 1 ns periodic timer cannot livelock the drain, and deadline arithmetic saturates.
+Affinity masks cannot overflow and an empty mask is refused. A mask naming only parked CPUs falls
+back through `pick_target_cpu`. Spawn placement refuses at `READY_RESERVE` and drops the ref outside
+SCHED. `preempt_enable` saturates and replays only on the 1 to 0 transition. `PendingSend` and
+Thread deadline entries are removed on every exit, so they cannot dangle. `clock.rs` arithmetic is
+checked and an unset clock returns None. The DPC queue dedups by `queued` and clears it before the
+handler. `sys_wait` bounds its count and copies out only `k<=count` records. Mutations were caught
+for dropping the `online_mask` check, ignoring affinity, breaking vruntime order, clearing DPC
+`queued` late, and notification overflow eviction. One thing was seen but not raised: `fire_timer`'s
+periodic re-push swallows a full-heap error with `let _`, so the timer silently stops. It shares
+sched-6's sizing cause.
