@@ -1142,3 +1142,234 @@ TODO(popup-follows-parent)) were not reported. proto-3 to proto-6, proto-11, pro
 proto-15 to proto-17 are test gaps in code that is correct today, and by rules.md that is not
 itself a finding. They are listed because the hunt reported them, and the maintainer may
 want to drop them.
+
+### security — main at 510381f4, 2026-10-20
+
+Lenses: logic, error-paths, trust-boundary, tests; returned nothing: none.
+Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
+
+- [ ] **sec-1** `kernel/src/syscall/table.rs:1943` — `sys_channel_send` copies the sender's whole
+  4096-byte buffer and never zeroes the payload past `payload_len`, and `sys_channel_recv`
+  (line 2771) copies all 4096 bytes back out. `docs/spec/ipc-message-format.md` lines 81 and 144
+  say the kernel zero-fills those bytes. tty-server sends every reply from one static
+  `REPLY_MSG` (`tty-server/src/main.rs:247`) and never scrubs it. A `READ_LINE` reply carrying a
+  typed password therefore stays at bytes 52 onward of every later short reply (the `SET_MODE`
+  and `WRITE` acks have empty bodies and rewrite only bytes 24 to 51). Scenario: Bob types his
+  password at the serial login, or at `with` or passwd through libprompt. Any process holding
+  `/dev/tty`, which both session kinds bind (a GUI app in Alice's session, for example), sends
+  `OP_TTY_WRITE` or `OP_TTY_SET_MODE` and reads the raw 4 KiB reply, which has Bob's password at
+  bytes 52 onward. That lets it log in as Bob or pass `with admin`. The view broker's static
+  `REPLY_MSG` (`view-broker/src/main.rs:63`) carries the tail of earlier replies (a `Show`
+  policy text, other sessions' denial reasons) to any client in the same way. Demonstrated by
+  host probes, all restored. A kernel test in `object/ipc_channel.rs` pushed a message with
+  `payload_len` 28 and `hunter2` at `payload[28..35]`, and the bytes arrived at the peer. With
+  the spec's zero-fill added as a control, the same test failed. A librsproto test encoded a
+  `READ_LINE` reply with `hunter2` and then an empty `SET_MODE` reply into one buffer, and
+  `msg[52..59]` was still `hunter2`. The end-to-end read of one process's password by another
+  was not booted. error-paths, trust-boundary. High.
+
+- [ ] **sec-2** `userspace/view-broker/src/main.rs:615` — `end_session` unbinds only the storage,
+  policy and accounts grants and the block devices. The services (`/dev/services/admin`), power
+  (`/dev/power`), logs (`/dev/logs`) and kernel-log (`/dev/log`) grants stay bound in the view.
+  `rsproto-views-ops.md` says CloseSession "unbinds their grants", and the forcible-kill entry
+  in `deferred-decisions.md` relies on that so that nothing new can be resolved through them.
+  Scenario: Alice runs `with admin <program>`, and the program or a child sharing its namespace
+  ignores `TerminateRequested`. She logs out and session-mgr sends CloseSession. The program can
+  still resolve `/dev/services/admin` to stop or start services, `/dev/power` to shut down, and
+  `/dev/logs` to read every service's records and the broker's audit, after the login that
+  authorized it has ended. A related gap, not run: `pair_exits` closes `view_ns` when the
+  elevated program exits (main.rs:1586) without unbinding, so its descendants keep every grant,
+  and CloseSession neither unbinds those grants nor asks those processes to stop. Demonstrated
+  by reading the code, not by a boot. `start()` binds `SERVICES_GRANT` (1343), `POWER_GRANT`
+  (1357), `LOGS_GRANT` (1371) and the kernel-log snapshot (1389). The file's only `SYS_NS_UNBIND`
+  is the loop at 615-617 over `[STORAGE_GRANT, POLICY_GRANT, ACCOUNTS_GRANT]`, plus
+  `unbind_block_devices`. `git log -S` shows that list came with D.3 (58a54d42) and was not
+  extended by E.2b, E.4d or E.6. The unbind does reach a running program, because a spawned
+  child shares its parent's namespace object (`kernel/src/syscall/table.rs:412-427`). A QEMU
+  gate (`with admin` on a program that ignores terminate, log out, resolve
+  `/dev/services/admin`) would confirm it end to end. logic, error-paths, trust-boundary.
+  Medium.
+
+- [ ] **sec-3** `userspace/view-broker/src/main.rs:919` — A request's grants are decided against
+  `/system/views.toml` when the Request arrives and stored in `Pending`. `check()` then calls
+  `start()`, which spawns with `p.grants` (line 1304) without reading the policy again. Nothing
+  times out a `State::Password`. Scenario: bob sends `with admin nxsh`, the broker answers
+  NeedPassword, and bob leaves the prompt open. An administrator installs a policy without bob's
+  admin rule. bob then types his password, and the broker binds disks, storage, services, views
+  and accounts and spawns nxsh with admin grants the policy no longer gives him. The file's own
+  rule at main.rs:57 says the policy is "Read for every request: it is small, and a stale copy
+  is a bug." Demonstrated by reading the path. `request()` reads the policy and decides at 919
+  and stores `grants` in `Pending` (about 925). `password()` (956) only queues the password.
+  `check()` (983) authenticates and calls `start()` (1012), which loops over `p.grants` (1304)
+  and never calls `read_policy` or `decide` again. Only three failures, `client_gone` or
+  `end_session` end a `State::Password`. Not run. error-paths. Medium.
+
+- [ ] **sec-4** `userspace/view-broker/src/main.rs:531` — `serve_resolve` admits a client channel
+  only by the broker's global wait-set load, with no per-session limit. Idle client channels
+  are never reaped, and `end_session` leaves them in place. Scenario: a GUI app in any session
+  resolves `/dev/views` 13 times (14 slots in all, 13 once the two login supervisors hold
+  theirs) and holds the channels open, sending nothing. Every other session's `with` and
+  `account`, and the desktop's Restart and Shut down through libviews, then get WouldBlock on
+  resolving `/dev/views`. Elevation and the power button are gone for every user until that
+  process closes its channels, even after its own session ends. The `deferred-decisions.md`
+  availability entry (604-612) covers only root-namespace holders on `/svc/auth` and says
+  sessions are not on that boundary. Demonstrated by reading the code and by running
+  `cargo test -p view-broker --lib a_client_is_admitted_only_with_room`, which passes. It
+  asserts that 14 clients fill `MAX_WAIT_HANDLES` = 32 (FIXED 3 + 2 each). An idle client counts
+  as two slots in `load()` (1601-1613). `end_session` (598-646) touches only Running, Password
+  and Changing clients. The exhaustion itself was not booted. trust-boundary. Medium.
+
+- [ ] **sec-5** `userspace/session-mgr/src/main.rs:376` — `tty_request` takes the first message on
+  the login terminal if its op matches, and never steps over tty-server's unsolicited
+  `OP_TTY_INTERRUPT` (request id 0). A Ctrl-C at the serial login prompt then puts every later
+  request one reply behind for the rest of `login()`. Scenario: at `nitrox login:` the person
+  presses Ctrl-C. tty-server sends INTERRUPT (rid 0) and then the `READ_LINE`'s empty reply.
+  session-mgr reads the INTERRUPT (op mismatch, so an empty name), and each later request takes
+  the previous request's reply. The password read returns at once with nothing typed. The next
+  attempt's reads return WouldBlock without waiting, because tty-server still holds a
+  `READ_LINE` nobody consumes. `login incorrect` prints for attempts nobody made. Echo is
+  switched back on while the stray read is outstanding, so a password typed at the `password:`
+  prompt is echoed in clear. Recovery comes only when `login()` gives up after three attempts
+  and reopens the terminal. Demonstrated by a temporary probe in `tty-server/src/lib.rs`
+  (reverted). It drove the real `routing::Registry` with a model of `tty_request` (first
+  message taken, op and error checked, request id ignored) through `login()`'s step sequence,
+  with Ctrl-C during the username read. Buggy: every step returned Mismatch and none blocked for
+  input. Typing `hunter2\r` after the second `password: ` wrote it to the console. Control (the
+  same model skipping rid-0 messages, as `libprompt::tty` does): the resumed user read got an
+  empty line, then password write Ok, echo off Ok, password read Blocked, and nothing echoed.
+  logic. Medium.
+
+- [ ] **sec-6** `userspace/auth-service/src/main.rs:379` — auth-service never closes handles that
+  arrive with a message. `serve_resolve` (312) and `serve_session` (381) receive into
+  `RECV_HANDLES` and `RECV_COUNT`, and nothing closes them. The comment "an Authenticate
+  carries no transferred handles" describes well-behaved senders, not something enforced.
+  view-broker's `serve_client` closes handles on every op but Request. Scenario: any process
+  (`/svc/auth` is reachable by all, per the recorded TODO, which covers reachability but not
+  this leak) opens a session channel and sends Authenticate messages, or resolve requests, each
+  with up to 8 handles. Every received handle is installed in auth-service's table and never
+  closed. Repeating this grows the table until it fails, after which the essential service
+  cannot accept sessions or create channels, and nobody can log in. Verified by grep: the only
+  uses of `RECV_HANDLES` and `RECV_COUNT` are the declaration and the two recv call sites. No
+  per-process handle quota was found. Not run to exhaustion. A boot gate that sends a 3-handle
+  message on an oracle session many times and checks that the handle count stays flat would
+  settle it. tests. Medium.
+
+- [ ] **sec-7** `userspace/libcrypto/src/lib.rs:36` — No test fails if `ct_eq` compares only the
+  last byte. `ct_eq_basic` is the only test, and every unequal pair in it differs in the last
+  byte or in length. Scenario: changing `diff |= a[i] ^ b[i]` to `diff = a[i] ^ b[i]` leaves
+  `cargo test -p libcrypto --lib` at 17 passed, 0 failed. With that break, `password::verify`
+  accepts any password whose 32-byte PBKDF2 output ends in the stored verifier's last byte,
+  about 1 guess in 256. The libusers and auth-service tests use real PBKDF2 and also pass,
+  since a random wrong password differs in the last byte 255 times in 256. Demonstrated by
+  mutation, restored. tests. Medium.
+
+- [ ] **sec-8** `userspace/auth-service/src/lib.rs:50` — No test fails if `authenticate` accepts an
+  empty password. Nothing logs in through `authenticate` or `serve_authenticate` with a wrong
+  or empty password against a user that exists, and `wrong_password_denied` sends only
+  `b"wrong"`. Scenario: changing the guard to `Some(rec) if rec.verifies(password) ||
+  password.is_empty()` leaves auth-service's 10 tests passing, and every existing account then
+  logs in with an empty password. libusers asserts `!r.verifies(b"")`, but that checks the
+  record, not the service's decision. Demonstrated by mutation, restored. tests. Medium.
+
+- [ ] **sec-9** `userspace/libcrypto/src/sha256.rs:98` — The padding boundary at 55 and 56 buffered
+  bytes is untested, and so is the HMAC key-length boundary. The vectors are the empty string,
+  `abc`, a 56-byte message and 1000 `a`s. The 56-byte message leaves `buf_len` 0 after the
+  first block, so it never reaches the `rem <= 56` branch. `PASSWORD_MAX` lets passwords of 65
+  to 128 bytes take the hashed-down key path, and 64 versus 65 bytes is untested. Scenario:
+  `rem <= 56` changed to `rem < 56` in `finalize` leaves 17 passed. `key.len() > BLOCK_LEN`
+  changed to `> BLOCK_LEN + 1` in `hmac.rs` also leaves 17 passed. A 55-byte message hash, or
+  the verifier of a 65-byte password, would then be wrong, locking out or colliding every
+  account with such a password. Demonstrated by mutation, restored. The reviewers' hand check
+  of the 55/56/63-byte tails found the code correct as it stands. tests. Medium.
+
+- [ ] **sec-10** `userspace/view-broker/src/main.rs:1322` — Each endpoint grant's bind treats any
+  non-zero `SYS_NS_BIND` result as "not there to grant". The view is a copy of the caller's
+  namespace, and a caller already in a view has those paths bound, so the kernel answers
+  AlreadyBound. Only the kernel-log grant tolerates AlreadyExists (1394). Scenario: in a shell
+  from `with admin nxsh`, the person runs `with admin disk --unmount x` or `with power
+  shutdown --reboot`, both allowed by policy. The broker checks the password (or uses the grace
+  window), then `start()` fails at the first endpoint grant with "the storage service is not
+  there to grant" or "service-mgr's power endpoint is not there to grant". Both reasons are
+  false, and the audit records "could not start". Demonstrated by a boot. A temporary
+  test-interactive probe (restored) logged in as alice, ran `with admin nxsh`, then `with power
+  shutdown --help`. The audit read `view: alice power shutdown — could not start: service-mgr's
+  power endpoint is not there to grant`. The pattern `bound = endpoint != 0 && SYS_NS_BIND(..)
+  == 0` is at Storage 1322-1335, Services 1341-1349, Power 1355-1363 and Logs 1369-1377, and
+  `bind_endpoint` for views and accounts (1411, 1418) works the same way. `with.rs:277` sends
+  `sys_ns_derive` of its own namespace unpruned. logic, trust-boundary. Low.
+
+- [ ] **sec-11** `userspace/view-broker/src/main.rs:1086` — A wrong current password on
+  ChangePassword delays the session's next check but does not forget the session's
+  remembered-password windows. `check()` (1020-1023) does both, `pacing.failed` and
+  `grace.forget()`. `check_change()` (1084-1089) calls only `pacing.failed`. The spec
+  (`rsproto-views-ops.md` 97-98) says "A refused password forgets every window of the session",
+  but its ChangePassword text says only "a failure like any other: it holds the next check", so
+  whether the forget is required there is ambiguous. Scenario: alice's correct password for
+  `with admin` at terminal T opens a 5-minute window. A program in her session sends
+  ChangePassword with a wrong current password. The answer is Denied "wrong password", but the
+  window stays open and the next `with admin` from T starts without asking. After a wrong
+  `with` password the window would have been forgotten. The divergence is real by reading the
+  code. Unverified: not run, and the intended behaviour needs the maintainer's ruling. logic.
+  Low.
+
+- [ ] **sec-12** `userspace/session-mgr/src/main.rs:236` — When the session namespace fails to
+  build after a successful login, the loop `continue`s without `tty_close`. The success path
+  (264-266) and the denied path (286-288) both close the terminal. Scenario: a login whose
+  namespace build fails (`sys_ns_create` out of memory, or an account home in `/system/users`
+  that is not a valid subtree base, such as one with a trailing `/`) leaks one terminal. A new
+  `tty_open` runs at 199. tty-server keeps every terminal in its one wait set of 32, so after
+  about 30 such logins `tty_open` fails, and the serial console loops on "no terminal for
+  login" until reboot. Demonstrated by reading the code. Unverified: forcing the namespace
+  failure was not run. logic. Low.
+
+- [ ] **sec-13** `userspace/auth-service/src/main.rs:580` — `install()` discards the status of the
+  `SYS_FILE_TRUNCATE` that clears a leftover `/system/users.new`, then creates the file with
+  `SYS_FILE_CREATE`, which only grows. If the leftover is longer than the new database and the
+  truncate failed, its tail survives and is renamed into `/system/users`. `libfs::write_file`
+  (lib.rs:215-221) checks for this by truncating and then comparing the file size.
+  `auth-service` does not (line 582, `let (_, h) = po_wait(po as u64);`). Scenario: an earlier
+  admin write failed after create (at map, sync or rename), leaving `users.new` with S1 bytes.
+  A later write produces a shorter database of n bytes (removing the account on the file's last
+  line, for example), and its truncate fails. The users file is then n new bytes followed by
+  bytes n to S1 of the stale copy. Memory holds the n bytes, so the running system looks right,
+  but the next boot's `load_db` reads the whole file and the stale records, such as the removed
+  account, come back. Unverified: it needs a fault injected into `SYS_FILE_TRUNCATE` after a
+  failed install, then a boot-time reload. error-paths. Low.
+
+- [ ] **sec-14** `userspace/libusers/src/lib.rs:374` — Three parser bounds on user-database input
+  have no test: odd-length hex, u32 overflow in the iterations field, and an empty home field.
+  Scenario: (a) removing the odd-length check in `hex_decode` leaves 18 passed, so a salt field
+  with an odd digit count decodes with its last nibble dropped, and a corrupt record
+  authenticates under a salt different from the one written. (b) Replacing the
+  `checked_mul`/`checked_add` in `parse_u32` with wrapping ops leaves 18 passed, so an
+  iterations field of 4294967297 reads as 1, a trivially weak cost. (c) Dropping `||
+  home.is_empty()` from `Record::parse` leaves 18 passed, so a record with no home is accepted
+  and the empty home is returned to the caller. Demonstrated by three mutations, each restored.
+  tests. Low.
+
+- [ ] **sec-15** `userspace/libprompt/src/lib.rs:119` — No test would notice if the password
+  scrubbing in `confirm` or `ask_password_then` were removed. `confirm` consumes its Vecs, so a
+  host test cannot observe them afterwards. Scenario: removing `scrub(&mut second);` in
+  `confirm` leaves `cargo test -p libprompt --lib` at 1 passed, and the second typed copy of a
+  new password would then remain in freed heap memory, which the module says it prevents
+  ("every buffer here is zeroed"). The same holds for `scrub` in `ipc::send` and `ipc::recv`,
+  which touch only syscalls. Demonstrated by mutation, restored. The impact is unverified; a
+  test that hands `confirm` a buffer it can still inspect, such as one read through a test
+  allocator after the drop, would settle it. tests. Low.
+
+What held up: authentication cost does not reveal which names exist, since an unknown user runs
+a dummy PBKDF2 at `DEFAULT_ITERATIONS`, which equals `libusers::ITERATIONS`, and the verifier is
+compared with `ct_eq` over the whole digest. The libcrypto RFC vectors catch the PBKDF2
+iteration handling. The libusers `MAX_FILE` splice bound, the name and password-length rules
+and the verifier length were each caught by a named test. The view-broker policy module's
+mutations (the `rule.views` match in `decide`, the wildcard-with-others check, comment-in-string,
+bare-name `..`, pacing, grace windows, slot admission, `Suffix::parse`, `Exits::closed` dedupe,
+`refuse_removal`, session id increment) were each caught, as was the auth-service admin list
+behaviour. The librsproto auth and views decoders are overflow-checked and exact, and `handles[0]`
+cannot go out of bounds. Broker handles are closed on every non-Request op and deny path. The
+kernel rejects `.` and `..`, so a session cannot forge another session's `s/<id>`, `policy/<id>`
+or `accounts/<id>`. Password scrubbing in the broker, libsession, libprompt and auth-service
+held on every path read. Auth-service's install order (truncate, create, map, unmap, sync,
+rename, then memory) and its admin versus oracle routing held. The client environment decoder is
+bounded by the 4 KiB message against an 8 MiB stack. All host suites pass at 510381f4. Every
+probe was restored.
