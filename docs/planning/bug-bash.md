@@ -1512,3 +1512,203 @@ for dropping the `online_mask` check, ignoring affinity, breaking vruntime order
 `queued` late, and notification overflow eviction. One thing was seen but not raised: `fire_timer`'s
 periodic re-push swallows a full-heap error with `let _`, so the timer silently stops. It shares
 sched-6's sizing cause.
+
+### supervision — main at 510381f4, 2026-10-20
+
+Lenses: logic, error-paths, trust-boundary, tests; returned nothing: none.
+Found 21, refuted by a boot 0, reported 16.
+
+- [ ] **sup-1** `userspace/storage-service/src/main.rs:1437` — storage-service sends `Meta::Ready`
+  only after it has probed every device and auto-mounted every filesystem, but service-mgr gives
+  the whole startup the same 30 s (`READY_TIMEOUT_NS`, counted from spawn). A slow disk or
+  fs-server therefore makes service-mgr fail the storage service for the whole boot. A USB stick
+  that answers slowly is present at boot. `read_table` and `probe_record` block in `po_wait`
+  (`u64::MAX`, no deadline). Each `mount()` can wait 30 s for its fs-server's Ready
+  (mounting.rs:69). The kernel's USB command deadline is also 30 s. service-mgr's deadline
+  (main.rs:1302) passes first: it logs "sent no Ready within 30 s" and calls `failed_to_start`.
+  When the late Ready arrives, `channel_peer_closed` (main.rs:2273-2304) drains it and closes the
+  endpoint it carried. storage-service then sees its `serve_end` peerless, logs "forwarding
+  endpoint closed" and exits 1 without its unmount chain. No `/svc/storage` is available for the
+  rest of the boot (every declaration is policy=never). Sessions get no `/storage`. There is no
+  InUse, so the broker refuses `disks`. The `block` class is released. The auto-mounted ext4
+  filesystems stay marked not clean. Demonstrated: with `send_ready` delayed 35 s (probe
+  restored), `cargo xtask check-storage` printed "sent no Ready within 30 s", "did not come up;
+  going on without it", "unexpected message on a control channel (dropped, and 1 handle(s) it
+  carried closed)" and "forwarding endpoint closed", and the gate failed. A natural 30 s stall
+  from a real stick rests on the code-read USB deadline and was not booted. Lenses: logic,
+  error-paths, trust-boundary (three reviewers found it independently). High.
+
+- [ ] **sup-2** `userspace/storage-service/src/lib.rs:95` — the `gpt-partuuid` matching in
+  `source_device` reads the disk's table through libgpt and compares libgpt's entry name with the
+  kernel's record name. The two read a GPT differently, so a partuuid root that init mounts is
+  left unmatched. `init_known` then goes false, nothing is auto-mounted, and every admin Mount,
+  Reread and InUse is refused. The view broker refuses the `disks` grant. Five cases: (1) an
+  unlabelled root (the kernel names it "partition 2 (unlabelled)", kernel gpt.rs:153; libgpt gives
+  an empty name); (2) a non-ASCII, `/` or control-character label (the kernel says unlabelled;
+  libgpt gives `?`, table.rs:321); (3) more than 8 partitions (libgpt `MAX_PARTITIONS`, so
+  `read_table` yields nothing, main.rs:462); (4) an entry size other than 128; (5) a bad CRC (the
+  kernel still binds `by-partuuid`). Demonstrated: temporary host tests in storage-service's
+  tests.rs built a real GPT with `libgpt::table::build` and read it as `read_table` does. The
+  unlabelled root printed `source_device = None` and `init_known = false`. A nine-partition disk
+  printed `read_table = None`. Run with `cargo test -p storage-service --lib probe_ --
+  --nocapture`; the probe was removed. Lens: trust-boundary. Medium.
+
+- [ ] **sup-3** `userspace/service-mgr/src/main.rs:160` — `compute_backoff`'s exponential arm uses
+  `initial_ns.checked_shl(attempts)`, which fails only for shifts of 64 or more. Bits shifted out
+  wrap silently, so the backoff becomes 0 for attempts 55-63 (56-63 for a 100 ms initial). A
+  service with `backoff = "exponential"` and the default unlimited `max_attempts` that keeps
+  failing gets 9 back-to-back restarts after about 4.5 hours at the 5 min cap. It does not wait
+  `backoff_max`, as the schema says. No shipped declaration reaches it. The function lives in
+  main.rs, so no host test can reach it. Demonstrated: the expression compiled verbatim in
+  standalone programs. At 1 s/5 min, attempt 54 gives 300000000000, attempts 55/56/60/63 give 0,
+  and attempt 64 gives 300000000000. 200 ms/2 s also gives 0 at 55 and 63. Fix: saturating
+  multiply, or clamp the shift. Lenses: logic, trust-boundary, tests (three reviewers; severity
+  rated low, low and medium). Medium.
+
+- [ ] **sup-4** `userspace/service-mgr/src/main.rs:1192` — `serve_resolves` loops `recv_serve`
+  per route until the ring is empty, with no per-pass bound. `serve_services` does the same for
+  the root (1846-1856) and the session endpoint (1861-1863). A client that issues forwarded
+  resolves faster than service-mgr answers keeps it inside the loop. A session app (or two) on
+  another CPU loops async `sys_ns_lookup` on a path behind a route, such as `/dev/tty/x` or
+  `/dev/clipboard/x`, and keeps the 64-deep ring refilled. During that time no child exit is
+  reaped and no restart fires. No admin or power request is answered (Shutdown included), and no
+  Ready deadline is acted on. storage-service and device-mgr take one message per handle per
+  pass. Unverified: a two-thread flood client on `/dev/tty` while `service --stop` is issued would
+  show whether the stop is answered before the flood ends. Lens: logic. Medium.
+
+- [ ] **sup-5** `userspace/storage-service/src/main.rs:642` — every resolve of `info/<name>.tsm`,
+  including any session's `/dev/storage/all.tsm`, calls `refresh_unmounted`. That re-probes every
+  unmounted device synchronously on the service's only thread, and each read is a `po_wait` with
+  no deadline. One slow device with no filesystem (so it is never mounted) costs about 3-4
+  commands per probe. While storage-service is in that probe, every `/storage` and `/dev/storage`
+  resolve waits, because forwarded resolves have no deadline. desktop-shell's per-launch
+  `/storage` check (apps.rs:194, `u64::MAX`) freezes. Any client can repeat the stall. A
+  `CTRL_OP_SHUTDOWN` goes unread during it, so service-mgr gives up after storage's 60 s
+  `stop_timeout`, and writable auto-mounts are never synced or marked clean. Only Ejected devices
+  are skipped (main.rs:586). Unverified: time `cat /dev/storage/all.tsm` on a throttled QEMU
+  usb-storage stick with no filesystem, and run `ls /storage` meanwhile. Lens: trust-boundary.
+  Medium.
+
+- [ ] **sup-6** `userspace/storage-service/src/main.rs:704` — media sessions
+  (`MAX_MEDIA_SESSIONS` = 2) and directory sessions (`MAX_DIRS` = 9) are one pool shared by every
+  session on the machine. There is no per-client bound and nothing reclaims an unused session; a
+  slot is freed only on `PeerClosed` (serve_media 750-760, serve_dir 1094-1104). Every app has
+  `/dev/storage` (`session_only` lets Media and Directory through, lib.rs:899-904). One app that
+  resolves `/dev/storage/media` twice and `/storage` nine times and holds the channels makes
+  every other user's eject get WouldBlock (`open_media_session`) and every listing get WouldBlock
+  (`open_dir`, main.rs:1080). The user cannot eject and pulls the stick unsynced. device-mgr has
+  the same shape for `/dev/devices` directory sessions (main.rs:55, 389). Unverified: a
+  boot-probe client that holds two media sessions should get WouldBlock on a third resolve.
+  Lens: trust-boundary. Medium.
+
+- [ ] **sup-7** `userspace/storage-service/src/main.rs:483` — storage-service reads `init.toml`
+  differently from init. It stops at the first NUL and maps the object's whole size. Init
+  (init/src/main.rs:182, 191) maps exactly one page and trims only trailing NULs. This breaks
+  `userspace/init/CLAUDE.md`'s rule that it "must read the file exactly as init does". A NUL
+  (for example in a comment) between two `[[mount]]` entries makes init mount `/` and `/data`,
+  while storage-service sees only `/`. `init_known` stays true, so automount treats `/data`'s
+  partition as free and mounts it a second time with its own fs-server-ext4. Two writers then
+  share one ext4. A manifest over 4 KiB is likewise cut by init at one page but read whole by
+  storage-service. Demonstrated: a temporary libinittoml test, since removed, put a manifest with
+  a NUL in a comment between two mounts into a 4096-byte page and sliced it with each rule. It
+  printed `init mounts ["/", "/data"]` and `storage mounts ["/"]`. Lens: logic. Low.
+
+- [ ] **sup-8** `userspace/service-mgr/src/main.rs:280` — `skipped_critical` counts every skipped
+  declaration that says `critical = true`, including a Duplicate (or a NoExecutable re-entered
+  block) of a critical server that was already read in full. `bringup::unfit` then reports "a
+  critical declaration could not be read". service-mgr starts nothing and asks init for the
+  emergency shell (main.rs:694-697). A second `[service.auth-service]` block with
+  `critical = true`, whether a whole duplicate or an appended block, boots to eshell although
+  every critical server was parsed, and the parser documents that a repeated name is "skipped,
+  not re-emitted". Demonstrated: a temporary service_toml.rs test fed `parse_all_reporting`
+  through main.rs's Entry mapping and `skipped.iter().any(|s| s.critical)` into `unfit`. It
+  printed `Skipped { name: "auth-service", why: Duplicate, critical: true }` and
+  `unfit = Some("a critical declaration could not be read")`. The appended block gave
+  `NoExecutable` and the same result. The probe was removed. Lens: error-paths. Low.
+
+- [ ] **sup-9** `userspace/service-mgr/src/main.rs:1231` — bring-up's `Step::Start` calls
+  `start(i, true)` without checking `running`. An admin Start of a declaration bring-up has not
+  reached (`start_asked` via `decide`, main.rs:2121-2123) spawns it early. Bring-up later spawns a
+  second instance, and `start` overwrites `proc_h` and `ctrl` (1297-1300). The first instance's
+  handles leak. Its exit is no longer attributed and lands in `codes` as unattributed. `Stop` and
+  shutdown reach only the second. A server's second Ready rebinds the registry and closes the
+  first's endpoint. The window is narrow: bring-up waiting on an `after` (up to 20 s) or a
+  server's Ready (up to 30 s) while an admin session issues Start for a later declaration, as
+  with nxterm `after = ["display-selftest"]` in the test image. Unverified: `service --start
+  nxterm` during that wait, then count nxterm processes or "starting service" lines. Lenses:
+  logic, error-paths (same defect). Low.
+
+- [ ] **sup-10** `userspace/service-mgr/src/main.rs:1374` — `wait_codes` is meant to wait up to
+  `CODE_GRACE_NS` for a dead service's exit code, but it returns false when any route wakes the
+  wait, because `wait_serving` returns Some only if notif itself is ready. `poll()`'s `while
+  dead.len() > codes.len() && self.wait_codes(until)` then stops, and the death is reaped with
+  code unknown. `sys_process_exit` closes the control channel before it queues `ChildExited`. A
+  resolve reaching any route in that gap makes an on-failure service that exited 0 look like -1,
+  so it is restarted and shown as "failed". The real code is logged later as an unsupervised
+  child's, or taken as the next death's. `lookup_serving` loops to its deadline; this does not.
+  Unverified: on SMP, a server that exits 0 before its Ready while another process resolves
+  through a route in a tight loop; look for `code=unknown` followed by "unsupervised child
+  exited code=0". Fix: loop until `until`. Lens: error-paths. Low.
+
+- [ ] **sup-11** `userspace/service-mgr/src/main.rs:2202` — login supervisors get their route
+  copies once, at login-chain start (574-576, 600-602), and only for servers live then
+  (`route_copy` requires `r.live`, 1549). If storage-service or device-mgr misses its Ready at
+  boot (sup-1, say), session-mgr and desktop-session-mgr get an empty slot. A later
+  `service --start storage-service` creates the route and the session-endpoint route, but nothing
+  re-sends them, so every current and future login lacks `/storage`, `/dev/storage` or
+  `/dev/devices` until reboot. Routes exist so that a restart reaches every session. Unverified:
+  boot with storage-service failing its Ready, start it from an admin session, log in, and
+  resolve `/storage`. Lens: trust-boundary. Low.
+
+- [ ] **sup-12** `userspace/storage-service/src/probe.rs:125` — `partition_entries`, which decides
+  whether a whole disk's own filesystem is ignored, has conditions no test pins: the 0xAA half of
+  the signature, `e[4] != 0`, `first != 0`, `count != 0` and the bound `end <= blocks`. The
+  `RamDisk` arm of `whole` is also unpinned. A regression would treat a disk with a stale sector 0
+  as partitioned (a FAT or ext4 that should mount is reported as Nothing), or mount a partitioned
+  disk whole over its partitions. Demonstrated: each mutation alone passed `cargo test -p
+  storage-service --lib` (5 survivors, plus the `RamDisk` removal). Lens: tests. Low.
+
+- [ ] **sup-13** `userspace/storage-service/src/probe.rs:150` — `fat_label`'s FAT12/16 branch
+  (the `0x29` extended signature at 0x26 and the FAT string at 0x36) and the sector-size
+  allow-list lack negative tests. Removing the `sector[0x26] == 0x29` check, or accepting 0 as a
+  sector size, passed all storage-service tests. A non-FAT sector carrying those bytes would be
+  probed as FAT and offered for mounting. Demonstrated: the two mutations passed the suite; the
+  FAT32 branch equivalents were killed. Lens: tests. Low.
+
+- [ ] **sup-14** `userspace/init/src/unmount.rs:42` — `unmount::answer` has no test for a wrong
+  `RS_MAGIC`. Reducing the check to the length test passes all of init's tests, so a non-rsproto
+  payload with the right bytes at offsets 6 and 16 would be accepted as a clean unmount
+  (`Answer::Done`). The `reply_id` is also not matched to the request. Demonstrated: the
+  mutation passed `cargo test -p init --lib`; `anything_else_is_unexpected` covers wrong op,
+  not-a-reply and truncation only. Lens: tests. Low.
+
+- [ ] **sup-15** `userspace/service-mgr/src/service_toml.rs:418` — an unrecognised or malformed
+  restart `policy` falls back to `Never`, but no test pins it. Changing the fallback to `Always`
+  passed `cargo test -p service-mgr --lib`, so a regression would make every mistyped
+  declaration (`policy = "on-failur"`) restart forever. `parse_duration_ns`'s overflow behaviour
+  is untested too. Demonstrated by the surviving mutation. Lens: tests. Low.
+
+- [ ] **sup-16** `userspace/libinittoml/src/toml_lite.rs:257` — `parse_value` accepts a string
+  with an interior quote: `key = "a"b"` parses as the value `a"b` instead of
+  `UnterminatedString`. The `body.contains('"')` rejection is untested. Replacing it with
+  `false` passed all 19 libinittoml tests. The manifest is trusted initramfs data, so the impact
+  is limited. Demonstrated by that mutation. Lens: tests. Low.
+
+What held up: about 105 single-line mutations across storage-service, the service-mgr lib,
+libinittoml, device-mgr and init were killed by the tests, apart from the survivors above and
+some equivalent mutants. The kills covered eject, reread, label validation, watch-list capacity,
+endpoint narrowing, bring-up ordering, `service_toml` first-wins, manifest validation and
+device-mgr Owners. Sound on reading:
+- libinittoml has no panic path on any input.
+- init's `ready.rs` and `unmount.rs` parsers handle lying lengths with `checked_add` and `get`,
+  and `handles_to_close` caps a bogus count.
+- Handles that arrive unasked are closed in every receive path.
+- service-mgr's wait budget is 32, held requests are refused on shutdown, and a route cannot be
+  walked out of through `..`.
+- Session and info-only endpoints cannot mint admin, session or class endpoints.
+- storage-service's partition-table and superblock parsers (GPT, MBR, FAT, ext4) have checked
+  divisors and bounded slices, and `DeviceIo::read_at` fails with `Err(Io)` rather than reading
+  past its mapping.
+- Eject refuses the boot medium, a non-removable disk and any disk init mounts.
+- device-mgr's subscription depth is capped and Departed goes only to an owner that was handed
+  the device.
