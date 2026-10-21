@@ -1888,3 +1888,131 @@ restores IF, and the #PF gate is an interrupt gate, so the race in kmem-20 needs
 arch boundary holds: nothing in `mm/`, `tlb.rs`, `memory_object.rs` or `file_object.rs` names
 `arch::x86_64` or uses CR3/invlpg/PML4 jargon. Every probe was restored and `git status` was
 clean at 510381f4.
+
+### scheduler, architecture lens re-run — main at 510381f4, 2026-10-20
+
+Lenses: architecture; returned nothing: none.
+Found 7, refuted by a boot 0, reported 7. This adds to the earlier scheduler section, whose
+architecture lens returned no findings.
+
+- [ ] **sched-11** `kernel/src/object/timer.rs:206` — Destroying a Timer never removes its entry
+  from the global deadline heap, so the heap keeps a raw pointer to freed memory. A process arms a
+  timer with `sys_timer_set`, then closes its only handle or exits. When the deadline passes, the
+  tick's `fire_expired_deadlines` calls `set_in_heap`, `take_waiters` and `set_armed` on freed or
+  reused slab memory, under SCHED. A periodic timer is never popped for good, so the stale entry
+  fires every interval and permanently holds one of the 16 heap slots. Demonstrated: a host probe
+  (since removed) called the real `timer_arm` on the global SCHED, then dropped the ObjectRef.
+  `timer_destroys` was 1, yet the heap still held 1 entry naming the freed address. The next Timer
+  allocated landed on the freed slot ("slot reused by the next Timer: true"). The stale fire then
+  disarmed that unrelated live timer (deadline=0, in_heap=false) and left its own heap entry
+  orphaned. Neither `Timer::drop` nor `dispatch_destroy`'s Timer arm touches the heap.
+  architecture. high.
+- [ ] **sched-12** `kernel/src/sched/exit.rs:57` — `reap_matching` assumes threads in the ready
+  queues are registered on no wait objects. A sibling woken from `sys_wait` but not yet run is
+  still on its other wait objects' waiter lists and in the deadline heap. `exit_process` reaps and
+  frees it, leaving those pointers dangling. Thread A of process P waits on handles X and Y with a
+  finite deadline. X signals and A moves to ready, but A has not run its unregister code. Sibling
+  B calls `sys_process_exit` first, which is likely on one CPU since syscall return does not
+  reschedule. A is reaped and freed while Y's waiter list and the heap still name it. A later
+  signal on Y, or the deadline firing, writes into freed memory and can wake whatever Thread now
+  occupies that slot. Demonstrated: a host probe (since removed) used the real `signal_channel`,
+  `reap_matching` and `fire_expired_deadlines` on a test SchedState. Output: "c2 waiters after
+  reap: 1 (first == freed A: true); heap still names A: true", "next Thread took the freed slot:
+  true", "B blocked=0 ready=1 (c3 never signalled)". An unrelated thread from another process,
+  blocked with no deadline on an object that never signalled, was moved to ready by A's stale
+  deadline. architecture. high.
+- [ ] **sched-13** `kernel/src/sched/wait.rs:29` — `block_current_and_switch` pushes onto the
+  global blocked list (64 entries for the whole system) with `push_reserved` and no capacity check,
+  so the 65th blocked thread panics the kernel. `suspend_with_fault` has the same unchecked push
+  onto the suspended list, which also holds 64. `BLOCKED_RESERVE`'s doc comment says blocking past
+  the limit is "refused", but it is not. Threads blocked in `sys_wait` across all processes reach
+  64. Long-lived servers already account for many of them, and `sys_thread_create` has no
+  per-process limit. The next `sys_wait` that has to block panics with "blocked list: reserve
+  exhausted". `wait_on` (wait.rs:102-167) checks only the per-object and heap reserves. Faulted
+  threads stay suspended for the whole boot (TODO(unsupervised-fault)), so the 65th one panics
+  too. That consequence is not in the recorded deferral, and the deferred-decisions entry covers
+  REAP_RESERVE only. Demonstrated: a host probe printed blocked capacity 64, and `push_reserved` at
+  capacity panicked with "blocked list: reserve exhausted — this list is sized so that cannot
+  happen". architecture. high.
+- [ ] **sched-14** `kernel/src/sched/timers.rs:118` — A one-shot timer fired by the tick with no
+  waiters is disarmed (deadline 0), so `Timer::already_signaled` becomes false. A `sys_wait` that
+  arrives after that tick finds nothing signalled and no heap entry, and blocks with nothing to
+  wake it. Whether a wait on an expired timer returns depends on whether some CPU's tick ran
+  first. A program arms a one-shot timer, then is delayed (for example preempted for a quantum)
+  before its `sys_wait` registers. Any CPU's tick at or after the deadline fires and disarms the
+  timer, since the heap is global. The later wait blocks. storage-service's `park()`
+  (`sys_timer_set` of now+5ms, then `sys_wait` with `u64::MAX`, userspace/storage-service/src/main.rs:140-150)
+  would hang its unmount/held-files path for good. coreutils `sleep`
+  (userspace/coreutils/src/bin/sleep.rs:94-118) would hang until Ctrl-C. session-mgr's `sleep_ms`
+  only loses its 1 s backstop. Demonstrated: a host probe armed a timer at 5000. `already_signaled(6000)`
+  was true before `fire_expired_deadlines(6000)` and false after, with the heap empty. architecture.
+  high.
+- [ ] **sched-15** `kernel/src/sched/exit.rs:111` — When `exit_process` reaps a sibling blocked in
+  `sys_wait`, the thread's kernel stack is freed without `sys_wait`'s `refs` array being dropped,
+  so every object it waited on leaks one reference. An IPC endpoint pinned this way never runs
+  `IpcChannel::drop`, so its peer never gets PeerClosed. Thread A of process P waits on endpoint E
+  and thread B calls `sys_process_exit`. It closes P's handle table, and `reap_blocked_matching`
+  unregisters and reaps A. A's stack-held ObjectRef on E is never released, so E's refcount stays
+  at 1 or more, and the server on E's peer keeps that client's session state. The SAFETY comment at
+  exit.rs:111-112 says the wait objects are kept alive by the thread's `sys_wait` refs, "released
+  only when it unblocks". A reaped thread never unblocks: the refs live in `sys_wait`'s frame
+  (syscall/table.rs:1752-1767), and `KernelStack`'s Drop frees the frames without unwinding.
+  Demonstrated: a boot probe on 510381f4 patched the `sleep` coreutil so its main thread started a
+  sibling blocked in `sys_wait` on the stdout pipe endpoint, then called process exit. The harness
+  read the pipe's other end, expecting PeerClosed. The sibling was confirmed blocked (it printed
+  "waiter running" and never returned from the wait). `test-qemu` then hung after "probe5: exiting
+  with sibling blocked": PeerClosed never arrived and the demo chain did not finish. The control
+  was the same probe with the sibling faulting on a bad stack, so it never blocked in `sys_wait`.
+  There the pipe closed and the child's exit was reaped in 313 ms, matching the 300 ms sleep.
+  Probes reverted; git status clean. architecture. medium.
+- [ ] **sched-16** `kernel/src/sched/deadline.rs:31` — The deadline heap is a single global
+  16-entry reserve with no per-process accounting, and closed armed timers (sched-11) hold their
+  slots for good. An unprivileged process, needing no syscap for `sys_timer_create` or
+  `sys_timer_set`, creates 16 timers and arms them far in the future. From then on every
+  finite-deadline `sys_wait` in the system returns OutOfMemory, every `sys_timer_set` fails, and
+  BlockBounded sends silently lose their timeout. service-mgr's main loop (main.rs:1140-1150)
+  ignores `sys_wait`'s result and busy-spins until its pending deadline passes by the clock.
+  session-mgr's `sleep_ms` (its re-prompt pause after a denied login) returns immediately.
+  Unverified: `wait_on` (wait.rs:143-163) returns OutOfMemory when `deadline::push` fails,
+  `timer_arm` returns Err the same way, and `ipc_send_push_blocking` (ipc.rs:376-387) discards the
+  push failure. The existing test `heap_push_refuses_over_reserve` shows the refusal. Each
+  consumer's handling was read, not run. A test that arms 16 timers from one process, then calls
+  `sys_wait` with a deadline from another, would settle it. architecture. medium.
+- [ ] **sched-17** `kernel/src/sched/exit.rs:181` — `exit_thread`'s last-thread branch marks the
+  process ended but never queues its pid in `ended_pids` or wakes the reaper, though the comment
+  says this is "deferred to the reaper". The handle table is closed only when this CPU next runs
+  `reap_pending`. A process's last thread leaves through `sys_thread_exit`, or a supervisor
+  terminates a faulted thread via `sys_exception_resume`. If that CPU stays busy, with always
+  another ready thread and no idle, yield or exit there, the process's handles stay open. Peers
+  waiting for PeerClosed wait as long as the load lasts. This is the failure the reaper thread was
+  added to fix for `exit_process`, which pushes `ended_pids` and calls `wake_reaper`
+  (exit.rs:237-240) where `exit_thread` (exit.rs:181-187) does neither. `reap_pending` drains only
+  this CPU's reap list (exit.rs:415-427). Demonstrated: a boot probe on 510381f4 patched `sleep` to
+  call `sys_thread_exit` as the process's only thread, with the harness reading the pipe's other
+  end for PeerClosed. Without spinners, PeerClosed arrived in 15 ms. With one user-mode busy-loop
+  thread pinned to each CPU (affinity bits 0 to 7, 8 `thread_create` calls succeeded), it arrived
+  in 2993 ms, exactly when the spinners' 3 s limit ended and they exited, which runs
+  `reap_pending`. The reaper thread was never woken. It is bounded by CPU load, and the path is
+  rare, since most exits go through `exit_process`. Probes reverted; git status clean.
+  architecture. low.
+
+What held up: `sys_wait` registers and blocks under one SCHED hold, and `wait_try_wake`'s CAS plus
+`make_runnable`'s blocked-list lookup absorb a second waker. `reap_blocked_matching` unregisters
+blocked siblings from their wait objects and the deadline heap before reaping them.
+BlockBounded PendingSend deadlines are removed both when the send is promoted and in
+`ipc_endpoint_closing`, so a fired entry never names a freed endpoint. Placement falls back to a
+CPU that accepts work when a mask names none, and tests pin the parked-CPU asymmetry (`cpu_online`
+vs `online_mask`). The on_cpu guard holds: `switch_into` raises it under SCHED before release and
+spins on the incoming thread's guard, and `stealable_to` and `reap_matching` respect it.
+`push_reserved` never grows a list under SCHED, and the blocked list's capacity is exactly 64.
+dpc.rs keeps one queued instance per DPC (dedup via `queued`), its drain buffer matches the
+reserve, and its queue lock is a leaf that never nests with SCHED. In timer.rs, `elapsed_ns`
+saturates on a lagging AP's TSC, `ns_to_ticks` clamps, and the u128 math cannot overflow. A
+periodic re-arm uses `now.saturating_add(interval)` and is strictly greater than now, so a 1 ns
+interval cannot loop the drain, and the re-push always has room because its own entry was just
+popped. `sys_thread_create` and `sys_thread_set_affinity` mask bits above MAX_CPUS and reject an
+empty mask, RealTime is gated on the REAL_TIME syscap, and the ThreadArgs layout is asserted on
+both sides. `close_all_owned_by` drops refs outside the handle-table lock, and IpcChannel's Drop
+takes SCHED only from that lock-free context. Not reported, already recorded: the running-sibling
+SMP gap in `exit_process` (smp.md § Deferred), REAP_RESERVE (deferred-decisions),
+TODO(unsupervised-fault) and TODO(smp-cpu-count).
