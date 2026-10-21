@@ -1712,3 +1712,179 @@ device-mgr Owners. Sound on reading:
 - Eject refuses the boot medium, a non-removable disk and any disk init mounts.
 - device-mgr's subscription depth is capped and Departed goes only to an owner that was handed
   the device.
+
+### kernel-memory, architecture lens re-run — main at 510381f4, 2026-10-20
+
+Lenses: architecture; returned nothing: none.
+Found 11, refuted by a boot 0, reported 11.
+
+- [ ] **kmem-20** `kernel/src/mm/addr_space.rs:274` — `AddressSpace::fault_in` treats
+  `ArchMapError::AlreadyMapped` on an anonymous lazy page as impossible and calls `unreachable!()`,
+  but on SMP two threads can take not-present faults on the same page, and the second finds the PTE
+  the first installed. Any process: two threads on different CPUs touch the same untouched page of
+  a lazily mapped anonymous VMA. The 8 MiB initial stack is lazy, and `sys_thread_create` (no
+  privilege needed) accepts a `user_sp` inside it, so two threads can be pointed at one fresh
+  stack page. CPU A takes the AS lock and maps the page. CPU B then takes the lock, finds the VMA,
+  allocates a frame, gets `AlreadyMapped` from `map_page` and panics the kernel. Demonstrated: a
+  host probe in the `addr_space` tests did `map_vma_lazy`, then `fault_in(PAGE*5, Write)` twice,
+  the second call standing in for CPU B's late fault. The first returned `Mapped`; the second
+  panicked at `addr_space.rs:274` with "entered unreachable code: fault_in: map_page rejected a
+  fresh page-aligned not-present mapping". The race itself is read from the code: the #PF gate is
+  an interrupt gate (`idt.rs:63`, 0x8E), so on one CPU it cannot happen, but nothing serialises
+  two CPUs between the hardware fault and the AS lock. The sibling `map_file_page` already treats
+  `AlreadyMapped` as success. Architecture. High.
+- [ ] **kmem-21** `kernel/src/mm/buddy.rs:163` — any kernel allocation over 4 MiB panics. `kmalloc`
+  sends it to the slab's `large_alloc` (`slab.rs:402`), which computes a buddy order above
+  `MAX_ORDER` (10) and calls `buddy_alloc`, whose `debug_assert!(order <= MAX_ORDER)` fires. The
+  kernel ships in the dev profile (xtask runs `cargo build` with no `--release`), so debug
+  assertions are on in real images. Any process: `sys_memory_create(5 MiB)` (`MAX_SIZE` is
+  16 MiB), then `sys_process_spawn` with that handle as the image. `MemoryObject::copy_to_kvec`
+  calls `buf.try_reserve(5 MiB)` (`memory_object.rs:193`), which reaches `large_alloc` at order 11
+  and panics the kernel. The same panic follows from spawning any `FileObject` over 4 MiB
+  (`read_to_kvec`, `file_object.rs:1017`), such as a large file run from a stick; from
+  `sys_memory_unmap` of a FileBacked VMA over about 512K pages (a mapped file of 2 GiB or more),
+  since `frames.try_reserve(pages)` at `table.rs:938` reserves 8 bytes per page that a FileBacked
+  unmap never pushes; and from `block_map`'s `run_count` (kmem-24). Any `KVec` that doubles past
+  about 2 MiB hits it too. Demonstrated: a host probe in the `memory_object` tests,
+  `MemoryObject::try_new(5 MiB)` succeeded, then `copy_to_kvec()` panicked at `buddy.rs:163` with
+  "buddy: alloc order 11 > MAX_ORDER". Fix the class in `large_alloc` (return null when
+  order > `MAX_ORDER`), not at each caller. Architecture. High.
+- [ ] **kmem-22** `kernel/src/mm/elf.rs:182` — `parse_phdr` computes `off + ELF64_PHDR_SIZE` with
+  unchecked addition on `e_phoff`, which comes straight from the ELF. The kernel is built with
+  `overflow-checks = true` (profile.dev), so an `e_phoff` near `u64::MAX` panics instead of
+  returning `Truncated`. Any process writes an ELF header with `e_phoff = u64::MAX - 8` and
+  `e_phnum >= 1` into a MemoryObject from `sys_memory_create` (full rights, MAP_READ included) and
+  passes it to `sys_process_spawn`; `load_elf` then `parse_phdr` hits "attempt to add with
+  overflow" and the kernel panics. Demonstrated: a host probe in the `elf` tests, an `ElfBuilder`
+  with one PT_LOAD and bytes 32..40 set to `u64::MAX-8`; `load_elf` panicked at `elf.rs:182:22`
+  with "attempt to add with overflow". Architecture. High.
+- [ ] **kmem-23** `kernel/src/mm/elf.rs:128` — `load_elf` returns `e_entry` from the untrusted ELF
+  without checking that it is a canonical user-half address. `enter_user` starts the thread with
+  `iretq`, and an `iretq` to a non-canonical RIP raises #GP while still at CPL 0;
+  `exception_dispatch` then sees a kernel-mode fault and calls `dump_and_halt`. Any process builds
+  an ELF with `e_entry = 0x0000_8000_0000_0000` in a MemoryObject and calls `sys_process_spawn`.
+  The load succeeds, `spawn_user` queues the child thread, and its first entry to ring 3 halts the
+  machine. `sys_thread_create` cannot be used this way, because it puts `entry` through
+  `UserPtr::new` (< `USER_VIRT_END`); the ELF path has no such check. Demonstrated: a host probe,
+  `load_elf` with `entry(0x0000_8000_0000_0000)`, returned `Ok(EntryInfo { entry_point:
+  VirtAddr(140737488355328), .. })`. Boot verified: with a probe making `load_elf` return that
+  entry, `cargo xtask test-qemu --kvm` spawned init and its first `enter_user` `iretq` raised
+  vector 13 (#GP) in ring 0. The dump shows CPU#0 `idt::vec13` -> `enter_user+0x3d` ->
+  `thread_enter`, "stopping every CPU", then a test timeout. Under TCG, QEMU reports the `iretq` as
+  a ring-3 segfault ("unhandled ring-3 fault, pid 1"), so the halt shows on KVM only, as it would
+  on real hardware. A child from `sys_process_spawn` takes the same path. Architecture. High.
+- [ ] **kmem-24** `kernel/src/syscall/table.rs:2589` — `block_map` trusts the reply's `run_count`:
+  it reserves `run_count` `BlockRun`s (24 bytes each) before checking that the body holds that
+  many, and a 4 KiB message fits about 170. A filesystem server's Model A resolve reply claims
+  `run_count = 200000` while carrying one run. `runs.try_reserve(200000)` asks `kmalloc` for about
+  4.8 MiB, which reaches the buddy at order 11 and panics via the assert in kmem-21. With that
+  fixed it still tries to allocate up to about 96 GiB before the body-length check rejects the
+  reply. Block sizes and run ends in these replies are otherwise validated. Demonstrated: a host
+  probe in the `syscall::table` tests, a body of 32 + 24 bytes with block_size 512, `run_count`
+  200000 and one valid run; `block_map` panicked with "buddy: alloc order 11 > MAX_ORDER". Fix:
+  bound `run_count` by `(body.len() - 32) / 24` before reserving. Architecture. Medium.
+- [ ] **kmem-25** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_* bits
+  named in `rights`, yet always installs a user-readable mapping (prot starts at
+  `Protection::USER`, and x86 has no read bit). A request with `rights = 0`, or MAP_WRITE alone,
+  maps a MemoryObject or FileObject readable without MAP_READ, which elsewhere is the authority to
+  read contents (spawn image, io Write buffer). A process attenuates a MemoryObject handle to
+  MAP_WRITE | TRANSFER (or TRANSFER | INSPECT) with `sys_handle_restrict` and sends it to a server.
+  MAP_WRITE alone is meaningful: `sys_io_submit` Read requires exactly that on its destination
+  buffer. The server calls `sys_memory_map(h, 0, size, 0)`; `required` is empty, `lookup`'s subset
+  check passes (`handle/table.rs` step 11), and it gets a readable mapping of memory it was denied
+  MAP_READ on. Unverified: not run end to end, and no in-tree issuer hands out such a handle
+  today. By the code, `req & MAP_*` is empty when `rights == 0`, `HandleTable::lookup` accepts the
+  empty set, and `page_flags_for` sets USER on a present leaf. `syscall-abi.md` says "the handle
+  must carry every requested MAP_* bit", and nothing makes reading require MAP_READ. A host test
+  that restricts a handle to MAP_WRITE and maps with `rights = 0` would settle it. Fix: always
+  require MAP_READ for any mapping. Architecture. Medium.
+- [ ] **kmem-26** `kernel/src/mm/kvmap.rs:55` — kernel-stack virtual addresses are never reclaimed:
+  `vmap` is a bump allocator and `KernelStack::Drop` unmaps only the leaves. Thread churn
+  therefore (a) retains a page-table frame for every 2 MiB of vmap (about 102 stacks) forever, and
+  (b) after about 26.8M stacks crosses the one PML4 slot whose PDPT is shared via the kernel
+  template, so new stacks are mapped only in the creating address space. Any process loops on
+  `sys_thread_create` plus thread exit (ambient, no syscap). Each cycle permanently uses 20 KiB of
+  vmap and about 40 bytes of physical page-table memory; on a 256 MiB machine a few million cycles
+  exhaust RAM. On a machine with more than about 1 GiB, after about 26.8M cycles a new user
+  thread's `KernelStack` lands at 0xffffc08000000000 under a PML4 entry that exists only in that
+  process's root. The first switch away loads another CR3 while still on that stack and faults,
+  and `sys_process_spawn`'s `fabricate_frame` writes the child's stack from the parent's CR3.
+  Either way the kernel crashes. `memory-management.md` lists "no freelist, negligible churn" and
+  "No production consumer today"; both premises are stale now that `sys_thread_create` exists, and
+  the page-table frame leak is not mentioned. Demonstrated: a host probe in the `kstack` tests
+  built a boot root with `kvmap::init`'s PDPT and snapshotted it as the template. An early stack
+  was visible in a second AddressSpace (true). After bumping `VMAP_NEXT` to the 512 GiB edge, a
+  stack at 0xffffc08000000000 was mapped in its own AS (true) but not in a fresh AS (false); the
+  count needed to get there was 26843545 stacks. Architecture. Medium.
+- [ ] **kmem-27** `kernel/src/mm/elf.rs:241` — PT_LOAD `p_memsz` has no cap: `map_load_segment`
+  eagerly allocates and zeroes a frame for every page with `map_vma`, under the AS spinlock,
+  inside `sys_process_spawn`, which runs with IF masked. This is the unpreemptable zeroing loop
+  that `MemoryObject::MAX_SIZE` exists to prevent on `sys_memory_create`, and the ELF path
+  bypasses that guard. Any process spawns an ELF whose PT_LOAD has `p_memsz` = 64 TiB; `map_vma`
+  keeps calling `buddy_alloc` and zeroing until RAM is exhausted, then rolls back. For the whole
+  loop (seconds on a large machine) that CPU takes no interrupts, so other CPUs' TLB shootdowns
+  stall waiting for its ack, and every other allocation fails: concurrent page faults return Oom
+  and kill their threads, and driver allocations fail. The rlimits deferral names `MAX_SIZE` as
+  the stand-in for accounting, and this path has none. Demonstrated by code and by boot: there is
+  no size check in `load_elf` or `map_load_segment`. A probe inflated a writable PT_LOAD's
+  `p_memsz` to 1 TiB for init under `cargo xtask test-qemu --kvm`: "PROBE map_vma of 1024 GiB:
+  ok=false cycles=89568028", then "init: ELF load failed: OutOfMemory". The loop ran under the AS
+  lock in the spawn path (SFMASK clears IF on syscall entry). The ~90M cycles is on a small-RAM
+  guest and grows with RAM. The TLB-ack stall and OOM faults in other processes were not measured.
+  Architecture. Medium.
+- [ ] **kmem-28** `kernel/src/arch/x86_64/idt.rs:250` — `pf_dispatch` checks the user-copy
+  recovery table before demand paging, so a kernel copy that touches a valid but not-yet-faulted
+  page (a lazy anonymous page or any FileBacked page) fails with `UserAccessError::Fault` instead
+  of faulting it in. A process maps a file with `sys_memory_map` (FileBacked VMAs are always lazy)
+  and passes a pointer into an untouched page as a syscall's source buffer, e.g. a message
+  payload; `copy_from_user` faults, the recovery entry turns that into `Fault`, and the syscall
+  fails on memory the process can read. In-tree code avoids this by touching mapped pages first,
+  and stack probes keep the lazy stack touched, so the impact today is limited. The comment at
+  `idt.rs:282` cites `deferred-decisions.md` for this, but there is no such entry (grepped).
+  Unverified: by the code, `lookup_recovery(f.rip)` returns the recovery PC before the
+  `is_user_fault` / `try_fault_in` branch, `try_fault_in` runs only for ring-3 faults, and
+  `mm/user_access.rs` has no pre-fault; `user-memory-access.md` line 162 still describes the
+  pre-scheduler state. To settle it, boot a test-image program that maps a file (or lazy anonymous
+  memory) and passes an untouched page as the source buffer of `sys_debug_kprint`, and check for
+  `Fault`. Architecture. Low.
+- [ ] **kmem-29** `kernel/src/syscall/table.rs:878` — `sys_memory_map(hint = 0)` picks its range
+  with `find_free_range` under one AS-lock hold and maps it under another, so two threads mapping
+  concurrently can pick the same range. The loser gets `MapError::Overlap`, which reaches the
+  caller as InvalidArgument. Two threads of one process each call
+  `sys_memory_map(obj, 0, PAGE, MAP_READ)` at the same time, e.g. two allocators growing their
+  arenas; both searches return the same window, and the second map fails with a valid request
+  refused and an error code nobody would retry on. Demonstrated: a host probe had two
+  `find_free_range(PAGE)` calls return the same range (true); `map_object` of the first returned
+  `Ok(())`, the second `Err(Overlap)`. Fix: search and insert under one hold. Architecture. Low.
+- [ ] **kmem-30** `kernel/src/syscall/table.rs:2188` — `sys_file_sync` is a per-kind verb: its name
+  and `lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)` bind it to
+  FileObject, beside `sys_ns_sync` and the per-kind memory calls, where the project prefers a few
+  object-generic calls. Any other object that will need a durability point (a block device, a
+  future writable MemoryObject backing) needs another syscall number instead of one sync over
+  handles. A design note rather than a failure, worth listing in the syscall-surface work.
+  Unverified: nothing to run; the maintainer's call on whether the syscall-surface work takes it
+  up. Architecture. Low.
+
+What held up: `user_access.rs` copy primitives check `addr+len` with `checked_add` against
+`USER_VIRT_END` (equal to the canonical boundary), handle zero-sized `T`, bound `copy_cstr` by the
+buffer, and the arch asm clears DF and closes the SMAP window on both the recovery and success
+paths. The hinted path of `sys_memory_map` checks alignment, overflow, the `USER_VIRT_END` bound
+and the stack guard gap, bounds size by the object, and cannot amplify MAP_WRITE or MAP_EXEC.
+`sys_memory_unmap` frees anonymous frames only after `shootdown_all`, drops the VMA (and
+last-ref object frames) after it, and reserves capacity outside the AS lock with a retry.
+`map_file_page` re-checks under the AS lock that the VMA still covers the address and belongs to
+the same object, and treats `AlreadyMapped` as success (the concurrent-fault panic in kmem-20 hits
+only the anonymous path). `block_map` rejects bad block sizes and run ends that overflow;
+`FileObject::settle` matches by PO, so a resize during a fill cannot mark a re-reserved page
+Ready; retired frames are freed only at Drop; in Model B a failed send (Full or PeerClosed)
+withdraws the pending fill first, so a late reply cannot land in a freed frame. The ELF loader
+checks `p_vaddr`/`p_offset` congruence, `filesz <= memsz`, `v_end` and `aligned_end` with checked
+arithmetic, the `file_end` bound and segment/stack overlap via the VMA tree; only `e_phoff` and
+`e_entry` are unchecked (kmem-22, kmem-23). Borrowed (framebuffer) MemoryObjects never hand their
+frames to the buddy; `AddressSpace::Drop` uses `get_mut`, so dropping a VMA does not nest
+same-rank locks; the scheduler always loads `next_root`, so no CPU keeps a dead process's PML4
+loaded. TLB shootdown: `wait_satisfied`'s host test passes, an initiator holds no other lock and
+restores IF, and the #PF gate is an interrupt gate, so the race in kmem-20 needs two CPUs. The
+arch boundary holds: nothing in `mm/`, `tlb.rs`, `memory_object.rs` or `file_object.rs` names
+`arch::x86_64` or uses CR3/invlpg/PML4 jargon. Every probe was restored and `git status` was
+clean at 510381f4.
