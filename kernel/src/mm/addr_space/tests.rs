@@ -142,9 +142,8 @@ fn map_rejects_kernel_half_range() {
     init_global_heap();
     let asp = AddressSpace::new().expect("new must succeed");
     let r = VAddrRange::new(va(USER_VIRT_END - PAGE), va(USER_VIRT_END + PAGE)).unwrap();
-    let err = asp
-        .map_vma(anon_box(r, Protection::WRITE | Protection::USER))
-        .expect_err("kernel-half range must be rejected");
+    let err =
+        asp.map_vma(anon_box(r, Protection::WRITE | Protection::USER)).expect_err("kernel-half range must be rejected");
     assert!(matches!(err.1, MapError::NotUserHalf | MapError::NotCanonical));
 }
 

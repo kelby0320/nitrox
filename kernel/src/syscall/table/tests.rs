@@ -35,16 +35,9 @@ fn a_block_map_the_page_cache_cannot_use_is_refused() {
         true
     };
     let ok_run = [(0, 2048, 8)];
-    for (bs, taken) in [
-        (0, false),
-        (256, false),
-        (511, false),
-        (512, true),
-        (1024, true),
-        (3000, false),
-        (4096, true),
-        (8192, false),
-    ] {
+    for (bs, taken) in
+        [(0, false), (256, false), (511, false), (512, true), (1024, true), (3000, false), (4096, true), (8192, false)]
+    {
         assert_eq!(used(&body(bs, &ok_run)), taken, "block size {bs}");
     }
     let top = u64::MAX;
@@ -59,11 +52,7 @@ fn a_block_map_the_page_cache_cannot_use_is_refused() {
     ] {
         assert_eq!(used(&body(512, &[run])), taken, "{what}");
     }
-    assert_eq!(
-        block_map(&body(512, &[(0, 2048, 8)])[..32 + 23]).err(),
-        Some(KError::KernelError),
-        "a run cut short"
-    );
+    assert_eq!(block_map(&body(512, &[(0, 2048, 8)])[..32 + 23]).err(), Some(KError::KernelError), "a run cut short");
 }
 
 #[test]
