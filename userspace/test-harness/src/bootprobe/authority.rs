@@ -85,6 +85,63 @@ pub(super) fn clock_set_refused_test() -> bool {
     true
 }
 
+/// **A spawn copies a handle to the child only with `DUPLICATE`**: a grant in duplicate mode
+/// leaves the parent its handle and gives the child another, so without the right it is refused
+/// `NoAccess`, as `sys_handle_duplicate` refuses. The same handle moved is taken.
+pub(super) fn spawn_copy_needs_duplicate_test(root_ns: u64) -> bool {
+    use libkern::abi::SpawnArgs;
+    use libkern::{KError, RIGHT_INSPECT, SYS_PROCESS_SPAWN};
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: spawn grant FAIL: ").s(why).end();
+        false
+    };
+    let (st, img) = ns_lookup(root_ns, b"/bin/test-stage", RIGHT_MAP_READ);
+    // SAFETY: register-only syscall; it creates an object and touches no memory of ours.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if st != 0 || img == 0 || mem <= 0 {
+        return fail(b"no /bin/test-stage or memory object");
+    }
+    // SAFETY: register-only syscall on a handle this process holds.
+    let kept = unsafe { syscall2(SYS_HANDLE_DUPLICATE, mem as u64, RIGHT_INSPECT | RIGHT_TRANSFER) };
+    close(mem as u64);
+    if kept <= 0 {
+        close(img);
+        return fail(b"no handle without DUPLICATE");
+    }
+    let spawn = |move_mask: u32| {
+        let args = SpawnArgs {
+            image: img,
+            handle_count: 1,
+            move_mask,
+            arg0: 0, // test-stage exits at once
+            handles: [kept as u64, 0, 0, 0],
+            rights: [u64::MAX; 4],
+            namespace: 0,
+            syscaps: 0,
+        };
+        // SAFETY: a valid argument block naming handles this process holds.
+        let p = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const args) as u64) };
+        if p > 0 {
+            close(p as u64);
+        }
+        p
+    };
+    let refused = spawn(0) == KError::NoAccess.as_i32() as i64;
+    let taken = spawn(1) > 0;
+    if !taken {
+        close(kept as u64);
+    }
+    close(img);
+    if !refused {
+        return fail(b"a copy without DUPLICATE was not refused NoAccess");
+    }
+    if !taken {
+        return fail(b"the same handle moved was not taken");
+    }
+    kprint(b"boot-probe: a spawn copies a handle only with DUPLICATE, and moves it without ok\n");
+    true
+}
+
 /// **A send's handle list may not name a handle twice, nor the endpoint the message is for**:
 /// the first would copy a handle its holder cannot duplicate, the second leave that endpoint
 /// holding itself in its own ring, never freed. A list with neither is taken.

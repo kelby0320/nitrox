@@ -47,7 +47,9 @@ later field kept its offset.)
   returns `TooLarge`). A handle listed twice is refused `InvalidArgument`: moved, it would
   arrive as two.
 - **`move_mask`** — for each `i < handle_count`, bit `i` selects **move** (the
-  parent loses access; default) or **duplicate** (the parent keeps its handle).
+  parent loses access; default) or **duplicate** (the parent keeps its handle). A duplicate is
+  a copy, so it needs `DUPLICATE` on the parent's handle as well as `TRANSFER`, as
+  `sys_handle_duplicate` does; without it the spawn is refused `NoAccess`.
 - **`arg0`** — an opaque word delivered to the child at entry (in `rcx`; see the register table below). The
   Phase-1 demo uses it as a role selector.
 - **`handles[i]`** — a handle in the **parent's** table to give the child. Each
@@ -70,7 +72,7 @@ later field kept its offset.)
 ## Handle install semantics
 
 For each `i < handle_count` the kernel looks up `handles[i]` in the parent's
-table (requiring `TRANSFER`), and installs a handle to the same object in the
+table (requiring `TRANSFER`, and `DUPLICATE` too for a duplicate), and installs a handle to the same object in the
 child's table with the attenuated rights. **Duplicate** keeps the parent's
 handle; **move** closes it once the spawn commits. The install is atomic-or-fail:
 any failure before the child's first thread is enqueued rolls back every

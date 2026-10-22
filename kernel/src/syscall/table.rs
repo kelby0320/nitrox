@@ -447,7 +447,9 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
 
     let mut installed = [RawHandle::NULL; SPAWN_MAX_HANDLES];
     for i in 0..count {
-        let ok = match global::get().lookup(args.handles[i], parent_pid, Rights::TRANSFER) {
+        // A grant not moved is a copy, and a copy needs DUPLICATE, as `sys_handle_duplicate` does.
+        let copy = if args.move_mask & (1 << i) == 0 { Rights::DUPLICATE } else { Rights::empty() };
+        let ok = match global::get().lookup(args.handles[i], parent_pid, Rights::TRANSFER | copy) {
             Ok(ok) => ok,
             Err(e) => {
                 spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..i]);
