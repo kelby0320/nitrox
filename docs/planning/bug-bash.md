@@ -189,8 +189,11 @@ Found 24, refuted by a boot 0, reported 13.
   from short-lived processes exhausts kernel memory. Demonstrated: a host probe pushed
   `send_push(a, msg, [b])` and dropped both creation references. It asserted two destroys and
   got 1 (left 1, right 2). error-paths. Medium. **Fix.**
-  Fixed in `ff52c1b0`; fails without it: `a_send_carrying_the_endpoint_it_delivers_to_is_caught`,
-  and boot-probe's transfer check under `test-qemu`.
+  Fixed in `ff52c1b0`, its own endpoint, and in `f8c3bc43`, an endpoint already holding one, which
+  PR #391's review found the first left open through two channels; fails without them:
+  `a_send_that_could_close_a_cycle_of_endpoints_is_refused`,
+  `an_endpoint_holding_another_in_a_held_send_is_refused_too`, and boot-probe's transfer check
+  under `test-qemu`. A cycle through a namespace binding remains: `TODO(ipc-handle-cycles)`.
 - [ ] **kobj-7** `kernel/src/syscall/table.rs:1620` — `sys_io_submit` on a block device does not
   check that offset and length are multiples of the block size, or that offset+length lies
   within the device. `device-node.md` and `io-operation.md` require a synchronous
@@ -228,7 +231,8 @@ Found 24, refuted by a boot 0, reported 13.
   loopback channel. Send returned 0, and recv returned 0 with count 2. error-paths, tests. Low.
   **Fix.**
   Fixed in `ff52c1b0`; fails without it: `a_handle_listed_twice_is_refused_by_a_send_and_a_spawn`,
-  and boot-probe's transfer check under `test-qemu`.
+  and boot-probe's transfer check under `test-qemu`. A spawn's duplicate grant without `DUPLICATE`,
+  which PR #391's review found copied a handle too, in `ddfe3b4b`: boot-probe's spawn-grant check.
 - [ ] **kobj-10** `kernel/src/sched/ipc.rs:453` — When a userspace server's endpoint dies,
   `ipc_endpoint_closing` and `us_reg_detach` drain only the registration's pending lookups,
   never its pending fills (`File::ReadRange`, Model B). A thread faulting a lazy
@@ -1563,7 +1567,8 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   100. `already_signaled(150)` was true, and after `fire_expired_deadlines(st, 120)` it was false
   and the timer was no longer scheduled. A second probe armed 1000, fired at 2000 with no waiters,
   and `already_signaled(3000)` failed. error-paths, tests. medium. **Fix.**
-  Fixed in `1b6ee7ea`; fails without it:
+  Fixed in `1b6ee7ea`, and in `76e0dddd` for a waiter whose clock was read before the fire, which
+  PR #391's review found; fails without them:
   `a_one_shot_timer_fired_with_no_waiter_still_reads_signaled`.
 
 - [ ] **sched-8** `kernel/src/sched/exit.rs:181` — When the last thread of a process ends through
@@ -2079,7 +2084,8 @@ architecture lens returned no findings.
   only loses its 1 s backstop. Demonstrated: a host probe armed a timer at 5000. `already_signaled(6000)`
   was true before `fire_expired_deadlines(6000)` and false after, with the heap empty. architecture.
   high. **Fix**, as sched-7.
-  Fixed in `1b6ee7ea`; fails without it:
+  Fixed in `1b6ee7ea`, and in `76e0dddd` for a waiter whose clock was read before the fire, which
+  PR #391's review found; fails without them:
   `a_one_shot_timer_fired_with_no_waiter_still_reads_signaled`.
 - [ ] **sched-15** `kernel/src/sched/exit.rs:111` — When `exit_process` reaps a sibling blocked in
   `sys_wait`, the thread's kernel stack is freed without `sys_wait`'s `refs` array being dropped,
