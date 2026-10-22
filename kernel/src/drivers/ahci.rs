@@ -756,9 +756,8 @@ unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool, moved: u32) {
     }
 }
 
-/// A retired command's status and the bytes it moved. An error moved nothing, and so did a command
-/// whose byte count, which the HBA writes back, falls short of its length: a read that stopped early
-/// would leave the rest of its pages to be read as data, holding whatever they held before.
+/// A retired command's status and the bytes it moved: nothing on an error, or when the byte count
+/// the HBA wrote back falls short, since the pages a read did not fill would be read as data.
 fn completion(err: bool, length: u64, moved: u32) -> (i32, u64) {
     match err || u64::from(moved) < length {
         true => (crate::syscall::error::KError::IoError as i32, 0),

@@ -741,10 +741,8 @@ fn a_short_reads_last_data_event_is_not_its_status() {
     assert_eq!(fault, Some(Fault::Status(Status::Passed { residue: 4096 })));
 }
 
-/// **A short read is not made whole by a status that says it was.** A stick that moves part of
-/// a read and then answers Passed with no residue would leave the rest of the pages as they were,
-/// read as the file; the read fails instead. A hub command's data, an answer shorter than asked
-/// for, is the device's to cut short.
+/// **A short read fails, whatever its status says**: the pages it did not fill would read as the
+/// file. A hub command's answer shorter than asked for is the device's to give.
 #[test]
 fn a_short_read_whose_status_says_nothing_is_missing_fails() {
     init_global_heap();

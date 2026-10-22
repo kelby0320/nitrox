@@ -156,8 +156,7 @@ enum Owner {
 enum Stage {
     /// Waiting for the event of the stage's last TRB, on endpoint `dci`, which interrupts.
     Data { dci: u8 },
-    /// Waiting for the status wrapper's TRB at this physical address, after a data stage that
-    /// came up `short` or did not.
+    /// Waiting for the status wrapper's TRB at this physical address; `short` if the data was.
     Status { csw_trb: u64, short: bool },
 }
 
