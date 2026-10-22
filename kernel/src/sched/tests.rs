@@ -634,7 +634,6 @@ fn removing_an_entry_whose_replacement_is_smaller_than_its_parent_keeps_the_heap
     init_global_heap();
     let mut h: KVec<deadline::Entry> = KVec::new();
     h.try_reserve(deadline::HEAP_RESERVE).unwrap();
-    // Pushed in this order, each lands where it is: 7, the last, sits under 5.
     for (i, d) in [1u64, 10, 5, 11, 12, 6, 7].into_iter().enumerate() {
         deadline::push(&mut h, entry(d, i)).unwrap();
     }
@@ -653,7 +652,6 @@ fn new_timer() -> ObjectRef {
     unsafe { ObjectRef::from_raw(obj, KObjectType::Timer) }
 }
 
-/// A heap with `timer` armed in it, as `timer_arm` leaves the global one.
 fn heap_with(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> SchedState {
     let mut st = test_state();
     st.deadlines.try_reserve(deadline::HEAP_RESERVE).unwrap();
@@ -679,7 +677,6 @@ fn a_timer_fires_at_its_deadline_and_not_before() {
     assert!(!unsafe { Timer::in_heap(t.as_ptr()) });
 }
 
-/// A wait can arrive after the tick, if its thread was preempted between arming and waiting.
 #[test]
 fn a_one_shot_timer_fired_with_no_waiter_still_reads_signaled() {
     init_global_heap();
@@ -713,8 +710,7 @@ fn a_periodic_timer_whose_next_fire_would_wrap_waits_for_ever_instead() {
     assert_eq!(deadline::peek(&st.deadlines).map(|e| e.deadline_ns), Some(u64::MAX));
 }
 
-/// The global heap reserved as `init` reserves it at boot: `timer_arm` and `Timer::drop` take
-/// the global `SCHED`, which no host test initialises.
+/// `timer_arm` and `Timer::drop` take the global `SCHED`, whose heap only `init` reserves.
 fn reserve_global_deadlines() {
     let mut h: KVec<deadline::Entry> = KVec::new();
     h.try_reserve(deadline::HEAP_RESERVE).unwrap();

@@ -149,9 +149,8 @@ pub unsafe fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> R
     Ok(())
 }
 
-/// A timer is being destroyed: drop its heap entry, which names it by address and holds no
-/// reference, so a fire after the free would write freed memory. Called only from
-/// [`Timer::drop`](crate::object::Timer), which, like a channel's, runs outside `SCHED`.
+/// A timer is being destroyed: drop its heap entry, which names it by address without a
+/// reference. Called only from [`Timer::drop`](crate::object::Timer), outside `SCHED`.
 ///
 /// # Safety
 ///
