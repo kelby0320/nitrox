@@ -65,7 +65,8 @@ servers speak one protocol and a fix to it is a fix to both:
 
 ## Capability discipline
 
-A server receives a read-write block-device handle and a control channel at spawn, and nothing
-else; it hands the kernel a `READ | TRANSFER` duplicate of the device for the Model A data path. It
-never holds `BIND_NAMESPACE`: its supervisor binds its endpoint
-(`docs/rationale/why-supervisor-registration.md`).
+A server receives a block-device handle — `WRITE` only for a read-write mount — and a control
+channel at spawn, and nothing else; it hands the kernel a duplicate of the device for the Model A
+data path, with `READ | TRANSFER` and its own `WRITE`, if it has one. The kernel writes a file
+back only through a device that carries `WRITE`. It never holds `BIND_NAMESPACE`: its supervisor
+binds its endpoint (`docs/rationale/why-supervisor-registration.md`).

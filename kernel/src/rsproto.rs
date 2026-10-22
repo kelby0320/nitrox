@@ -12,9 +12,10 @@
 //!
 //! Only the **server-bound request** (encode) and the **reply** (decode) exist: the kernel is
 //! purely the *client* of the forwarded Resolve. All multi-byte integers are little-endian.
-//! multi-byte integers are little-endian.
 
 #![allow(dead_code, reason = "the constants document the wire format; not all are read")]
+
+use crate::libkern::handle::Rights;
 
 /// Protocol magic: ASCII `"RSMG"`. Every message begins with it.
 const RS_MAGIC: u32 = 0x5253_4D47;
@@ -106,6 +107,21 @@ pub struct FileBlocksHeader {
 /// [`FileBlocksHeader::flags`]: the file may not be written (a read-only mount's). The kernel
 /// installs such a file without `MAP_WRITE`.
 pub const FILE_BLOCKS_READ_ONLY: u32 = 1 << 0;
+
+/// The rights a Model A reply's file is installed with: those asked for and `INSPECT`, less
+/// `MAP_WRITE` unless the server holds `WRITE` on the device it sent and has not marked the file
+/// read-only, since the kernel writes the file back to that device. `None` if the server cannot
+/// read the device, which the kernel fills the file from.
+pub fn file_blocks_rights(requested: Rights, flags: u32, device: Rights) -> Option<Rights> {
+    if !device.contains(Rights::READ) {
+        return None;
+    }
+    let mut rights = requested | Rights::INSPECT;
+    if flags & FILE_BLOCKS_READ_ONLY != 0 || !device.contains(Rights::WRITE) {
+        rights = rights.difference(Rights::MAP_WRITE);
+    }
+    Some(rights)
+}
 
 /// Parse a Model A resolve reply body's header, or `None` if `body` is short of it or of the
 /// `run_count` runs it says follow. `body` is the rsproto message body (after the envelope
@@ -778,6 +794,18 @@ mod tests {
             assert!(parse_reply(msg).is_none());
             assert!(parse_read_range_reply(msg).is_none());
         }
+    }
+
+    #[test]
+    fn a_file_blocks_file_is_writable_only_as_far_as_its_server_may_write_the_device() {
+        let rw = Rights::READ | Rights::WRITE;
+        let asked = Rights::MAP_READ | Rights::MAP_WRITE;
+        let with = |flags, device| file_blocks_rights(asked, flags, device).map(|r| r.contains(Rights::MAP_WRITE));
+        assert_eq!(with(0, rw), Some(true));
+        assert_eq!(with(FILE_BLOCKS_READ_ONLY, rw), Some(false));
+        assert_eq!(with(0, Rights::READ), Some(false));
+        assert_eq!(with(0, Rights::WRITE), None, "no READ, nothing to fill the file from");
+        assert!(file_blocks_rights(Rights::MAP_READ, 0, rw).is_some_and(|r| !r.contains(Rights::MAP_WRITE)));
     }
 
     /// **A forget is read at the offsets a server writes**, laid out by hand since the writer is

@@ -526,3 +526,65 @@ fn full_mem_rights_are_allocatable_on_a_memory_object() {
     // SAFETY: the table's reference, which `close` handed back.
     drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
 }
+
+/// A file-blocks reply's file is as writable as its server's hold on the device it sent: the
+/// kernel writes the file back to that device, and the server may not have been let write it.
+#[test]
+fn a_file_blocks_reply_installs_a_file_no_more_writable_than_its_server_holds_its_device() {
+    use crate::object::device_node::{BlockGeometry, DeviceClass, ResourceDescriptor};
+    use crate::object::userspace_server::{ForwardOp, LOOKUP_SUFFIX_MAX, PendingLookup};
+    use crate::object::{DeviceNode, IpcChannel, PendingOperation, UserspaceServerReg};
+    init_global_heap();
+    global::init_for_tests();
+    // SAFETY: each pointer is a fresh `into_raw`, carrying its single creation reference.
+    let adopt = |p: *mut (), t| unsafe { ObjectRef::from_raw(p, t) };
+    let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+    drop(adopt(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel));
+    let ep = adopt(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel);
+    let reg = adopt(
+        KBox::into_raw(UserspaceServerReg::try_new(ep).unwrap()).as_ptr() as *mut (),
+        KObjectType::UserspaceServerReg,
+    );
+    // An envelope and a body: 512-byte blocks, file id 0 (uncached), one run of a page.
+    let mut msg = std::vec![0u8; 28 + 32 + 24];
+    msg[20..24].copy_from_slice(&56u32.to_le_bytes());
+    msg[28 + 8..28 + 12].copy_from_slice(&512u32.to_le_bytes());
+    msg[28 + 12..28 + 16].copy_from_slice(&1u32.to_le_bytes());
+    msg[28 + 32 + 8..28 + 32 + 16].copy_from_slice(&100u64.to_le_bytes());
+    msg[28 + 32 + 16..28 + 32 + 20].copy_from_slice(&8u32.to_le_bytes());
+    const PID: u32 = 4242;
+    let rw = Rights::READ | Rights::WRITE | Rights::TRANSFER;
+    for (device, writable) in [(rw, Some(true)), (Rights::READ | Rights::TRANSFER, Some(false)), (Rights::WRITE, None)]
+    {
+        let dev = DeviceNode::try_new(DeviceClass::Other, ResourceDescriptor::ZERO, BlockGeometry::ZERO).unwrap();
+        let dev = adopt(KBox::into_raw(dev).as_ptr() as *mut (), KObjectType::DeviceNode);
+        let po = adopt(
+            KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
+            KObjectType::PendingOperation,
+        );
+        let pl = PendingLookup {
+            request_id: 1,
+            po,
+            owner_pid: PID,
+            requested: Rights::MAP_READ | Rights::MAP_WRITE,
+            suffix: [0; LOOKUP_SUFFIX_MAX],
+            suffix_len: 0,
+            op: ForwardOp::Plain,
+            dest: [0; LOOKUP_SUFFIX_MAX],
+            dest_len: 0,
+            depth: 0,
+        };
+        let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        transfers[0] = Some(TransferRef { obj: dev, rights: device });
+        let (status, h) = build_and_install_file_blocks(&reg, &pl, 4096, &msg, &mut transfers);
+        match writable {
+            None => assert_eq!(status, KError::NoAccess as i32, "a server without READ on its device"),
+            Some(w) => {
+                assert_eq!(status, 0);
+                let write = global::get().lookup(RawHandle(h), PID, Rights::MAP_WRITE).is_ok();
+                assert_eq!(write, w, "device rights {:?}", device);
+                close_and_release(RawHandle(h), PID);
+            }
+        }
+    }
+}

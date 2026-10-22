@@ -2408,10 +2408,10 @@ fn build_and_install_file_blocks(
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
 ) -> (i32, u64) {
     use crate::object::FileObject;
-    use crate::rsproto::{FILE_BLOCKS_READ_ONLY, reply_body};
+    use crate::rsproto::{file_blocks_rights, reply_body};
 
-    let device = match transfers[0].take() {
-        Some(tr) if tr.obj.object_type() == KObjectType::DeviceNode => tr.obj,
+    let (device, device_rights) = match transfers[0].take() {
+        Some(tr) if tr.obj.object_type() == KObjectType::DeviceNode => (tr.obj, tr.rights),
         Some(tr) => {
             drop(tr.obj);
             return (KError::Unsupported as i32, 0);
@@ -2424,6 +2424,9 @@ fn build_and_install_file_blocks(
     let (header, runs) = match block_map(body) {
         Ok(m) => m,
         Err(e) => return (e as i32, 0),
+    };
+    let Some(rights) = file_blocks_rights(pl.requested, header.flags, device_rights) else {
+        return (KError::NoAccess as i32, 0);
     };
 
     let reg_ref = reg.clone();
@@ -2448,11 +2451,6 @@ fn build_and_install_file_blocks(
     drop(reg_ref);
 
     let (op, ot) = fref.into_raw();
-    // `INSPECT` as above. A read-only mount's file is never writable, whatever was asked for.
-    let mut rights = pl.requested | Rights::INSPECT;
-    if header.flags & FILE_BLOCKS_READ_ONLY != 0 {
-        rights = rights.difference(Rights::MAP_WRITE);
-    }
     match global::get().allocate(pl.owner_pid, op, ot, rights) {
         Ok(h) => (0, h.bits()),
         Err(e) => {

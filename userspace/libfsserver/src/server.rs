@@ -970,8 +970,8 @@ fn handle_forwarded_resolve<V: Volume>(vol: &V, serve_end: u64, device: u64) {
             }
         },
         Served::LazyBlocks { reply_len } => {
-            // SAFETY: `device` is our block-device handle (READ | TRANSFER | DUPLICATE).
-            let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, device, RIGHT_READ | RIGHT_TRANSFER) };
+            // SAFETY: our device handle, holding DUPLICATE. The copy has WRITE only if ours does.
+            let dup = unsafe { syscall2(SYS_HANDLE_DUPLICATE, device, RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER) };
             if dup < 0 {
                 // The device cannot be shared: degrade to an error reply.
                 // SAFETY: disjoint static; reply region as above.
