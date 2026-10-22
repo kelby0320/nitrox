@@ -42,7 +42,7 @@ pub struct ResolveRequest {
 |---|---|---|
 | `RESOLVE_FILE_AS_MEMOBJ` | `1 << 0` | Slice-7 mode: a regular file resolves to a read-only `MemoryObject` holding its content, materialised eagerly. |
 | `RESOLVE_FILE_LAZY` | `1 << 1` | Slice-8 mode: a regular file resolves to a lazily page-cache-filled `File` (`OBJECT_KIND_FILE`); the reply carries the file **size**, not its bytes, and the kernel fills pages on demand via `File::ReadRange` ([rsproto-file-ops.md](rsproto-file-ops.md)). |
-| `RESOLVE_GROW` | `1 << 2` | **Grow** the file to the `new_size` appended after the suffix (allocate blocks, extend the extent tree) before replying its map. For `sys_file_grow`. |
+| `RESOLVE_GROW` | `1 << 2` | **Grow** the file to the `new_size` appended after the suffix (allocate blocks, extend the extent tree) before replying its map. For `sys_file_grow`. `new_size` is 32 bits on the wire: the syscall refuses a larger size `TooLarge` rather than send it cut down, as for create and truncate. |
 | `RESOLVE_CREATE` | `1 << 3` | **Create** the file in its parent directory if absent, before growing. Combined with `RESOLVE_GROW`. For `sys_file_create`. |
 | `RESOLVE_TRUNCATE` | `1 << 4` | **Shrink** the file to the `new_size` appended after the suffix, freeing the blocks past the new end, before replying its map. For `sys_file_truncate`. |
 | `RESOLVE_RENAME` | `1 << 5` | **Rename** the resolved path to a second path carried after the suffix, and reply status-only (`OBJECT_KIND_NONE`) rather than an object. For `sys_file_rename`. |

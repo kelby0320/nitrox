@@ -240,6 +240,11 @@ fn channel_create_rejects_bad_pointer_and_oversize_depth() {
 #[test]
 fn channel_send_rejects_mode_and_oversize_count_before_pointers() {
     assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 99, 0), Err(KError::InvalidArgument),);
+    assert_eq!(
+        sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 1 << 32 | 1, 0),
+        Err(KError::InvalidArgument),
+        "NoBlock, high bits set"
+    );
     assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, (IPC_HANDLE_MAX + 1) as u64, 1, 0), Err(KError::TooLarge),);
 }
 
@@ -652,4 +657,20 @@ fn a_forwarded_reply_for_a_client_that_exited_pins_nothing() {
     // SAFETY: `po` pins it; completed, it is stable, and no other thread reaches it.
     assert_eq!(unsafe { PendingOperation::status(po.as_ptr()) }, KError::PeerClosed as i32);
     assert_eq!(test_probe::memory_object_destroys(), 1, "the object pinned by a handle nothing will close");
+}
+
+/// The wire carries a size in 32 bits and rename flags in 16: one past either is refused, before
+/// anything is looked up, never cut to fit.
+#[test]
+fn a_file_size_or_rename_flags_past_what_the_wire_carries_are_refused() {
+    let size = |n: u64| ResolveOp::Size(n, SizeChange::Truncate).forward_op();
+    assert!(matches!(size(u32::MAX as u64), Ok(ForwardOp::Size(u32::MAX, _))));
+    assert_eq!(size(1 << 32).err(), Some(KError::TooLarge));
+    let rename = |f: u64| ResolveOp::Rename { dest_ptr: 0, dest_len: 0, flags: f }.forward_op();
+    assert!(matches!(rename(u16::MAX as u64), Ok(ForwardOp::Rename { flags: u16::MAX })));
+    assert_eq!(rename(1 << 16).err(), Some(KError::InvalidArgument));
+    let path = b"/f";
+    let just_over_4_gib = 0x1_0000_000A;
+    let truncate = dispatch(SYS_FILE_TRUNCATE, 0xDEAD, path.as_ptr() as u64, 2, 0, just_over_4_gib, 0);
+    assert_eq!(truncate, KError::TooLarge.as_isize(), "taken as 10 bytes, it would free the rest");
 }
