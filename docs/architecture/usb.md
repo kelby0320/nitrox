@@ -386,15 +386,18 @@ interrupts. **The status wrapper is asked for when that stage ends**, not queued
 stage and never answers it — a `READ(10)`, whose data QEMU reads asynchronously, hung that way in
 `test-qemu` while `INQUIRY`, answered at once, did not. The DPC completes the IRP at the status
 wrapper's event, when its signature, tag and status read and its residue is zero, and starts the
-next. One command moves at most 64 fragments, 256 KiB, the most any client submits.
+next. **A read whose data stage came up short fails, whatever its residue says**: a stick that sent
+less and answered that nothing was missing would leave the pages it did not fill to be read as the
+file, holding what they held before; the bulk-only residue is the stick's word, the short packet
+the controller's. One command moves at most 64 fragments, 256 KiB, the most any client submits.
 
 **Everything off that path is the hub thread's**, following bulk-only §6.7: status 1 read through
 `REQUEST SENSE` (an illegal request to `SYNCHRONIZE CACHE` is no cache to flush, and the flush
 completes; a unit attention retries the command once); a data stage's stall cleared — *Reset
 Endpoint*, or *Stop Endpoint* for one still running, *Set TR Dequeue Pointer* past what is queued,
 then `CLEAR_FEATURE(ENDPOINT_HALT)` — and the status read; and reset recovery, the class's reset
-request and both endpoints cleared, for a phase error, a bad wrapper, a stalled command wrapper or a
-command past its **thirty-second deadline**. The hub thread keeps that deadline, sleeping until the
+request and both endpoints cleared, for a phase error, a bad wrapper, a residue or a short read, a
+stalled command wrapper or a command past its **thirty-second deadline**. The hub thread keeps that deadline, sleeping until the
 earliest one while a command is in flight; it is what bounds a stick that stops answering. **While
 any disk is bound it never sleeps longer than a deadline's length**, so a command started while it
 sleeps, whose deadline is at least that far off, is seen by its deadline with nothing waking the

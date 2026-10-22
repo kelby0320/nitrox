@@ -156,8 +156,9 @@ enum Owner {
 enum Stage {
     /// Waiting for the event of the stage's last TRB, on endpoint `dci`, which interrupts.
     Data { dci: u8 },
-    /// Waiting for the status wrapper's TRB at this physical address.
-    Status { csw_trb: u64 },
+    /// Waiting for the status wrapper's TRB at this physical address, after a data stage that
+    /// came up `short` or did not.
+    Status { csw_trb: u64, short: bool },
 }
 
 /// A command in flight: whose, its tag, where it is, its deadline, and when it was issued.
@@ -179,6 +180,9 @@ pub enum Fault {
     Status(Status),
     /// The deadline passed.
     Deadline,
+    /// A read's data stage came up short, yet its status said nothing was missing: the pages it
+    /// did not fill would be read as the file, holding whatever they held before.
+    Short,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -505,12 +509,12 @@ impl Dev {
     }
 
     /// **Ask for the status wrapper**, the command's data stage over: on bulk IN, interrupting.
-    fn ask_status(&mut self) {
+    fn ask_status(&mut self, short: bool) {
         let mut csw_trb = 0;
         let trb = Trb::bulk(self.wrap_phys + CSW_AT, CSW_LEN as u32, false, true, true, 0);
         self.bulk_in.push_td(&[trb], |_, at| csw_trb = at);
         if let Some(c) = self.inflight.as_mut() {
-            c.stage = Stage::Status { csw_trb };
+            c.stage = Stage::Status { csw_trb, short };
         }
         self.ring(self.in_dci);
     }
@@ -686,11 +690,11 @@ impl Disks {
                 // **The data stage is over**, whole or short — a short one ends at the TRB that came
                 // up short, which the status wrapper's residue then says — so the status is asked for.
                 Stage::Data { dci: data } if ok && dci == data => {
-                    dev.ask_status();
+                    dev.ask_status(code == code::SHORT_PACKET);
                     return Some(Action::None);
                 }
                 Stage::Data { .. } => false,
-                Stage::Status { csw_trb } => dci == dev.in_dci && pointer == csw_trb,
+                Stage::Status { csw_trb, .. } => dci == dev.in_dci && pointer == csw_trb,
             };
             if ok && !at_csw {
                 return Some(Action::None);
@@ -698,7 +702,9 @@ impl Disks {
             let fault = if !ok {
                 Some(Fault::Transfer { dci, code })
             } else {
+                let short = matches!((cmd.stage, cmd.owner), (Stage::Status { short: true, .. }, Owner::Irp { .. }));
                 match csw(&dev.read_csw(), cmd.tag) {
+                    Status::Passed { residue: 0 } if short => Some(Fault::Short),
                     Status::Passed { residue: 0 } => None,
                     s => Some(Fault::Status(s)),
                 }
@@ -1513,7 +1519,7 @@ impl Disks {
             let tag = dev.tag;
             dev.inflight =
                 Some(Command { owner, tag, stage: Stage::Data { dci: 0 }, deadline: now + BIND_NS, started: now });
-            dev.ask_status();
+            dev.ask_status(false);
         } else {
             let frags = [PhysFrag { base: dev.data_phys, len: len as u64 }];
             let frags = if len == 0 { &frags[..0] } else { &frags[..] };

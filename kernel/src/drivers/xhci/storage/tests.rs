@@ -221,7 +221,11 @@ impl Fake {
     }
 
     fn answer(&mut self, tag: u32, status_byte: u8) {
-        let b = status(b"USBS", tag, 0, status_byte);
+        self.answer_short(tag, 0, status_byte);
+    }
+
+    fn answer_short(&mut self, tag: u32, residue: u32, status_byte: u8) {
+        let b = status(b"USBS", tag, residue, status_byte);
         let w = self.wrap.as_mut_ptr() as *mut u8;
         for (k, v) in b.iter().enumerate() {
             // SAFETY: the fake wrapper page is 4 KiB.
@@ -245,7 +249,7 @@ fn irp(op: IrpOp, offset: u64, length: u64, frags: &[PhysFrag]) -> Irp {
 
 fn csw_trb(d: &Disks, i: usize) -> u64 {
     match d.devs[i].lock().as_ref().unwrap().inflight.unwrap().stage {
-        Stage::Status { csw_trb } => csw_trb,
+        Stage::Status { csw_trb, .. } => csw_trb,
         s => panic!("the status is not asked for yet: {s:?}"),
     }
 }
@@ -278,11 +282,7 @@ fn a_reads_status_is_asked_for_when_its_data_ends_and_the_next_starts_at_its_sta
     assert_eq!(disks.submit(&mut second, ctx, 0), Action::None, "queued");
     assert_eq!(disks.on_transfer(9, 4, code::SUCCESS, 0x99, 1), Some(Action::None), "OUT's event is not the data's");
     assert_eq!(fake.trb(0, 2), Trb::default(), "so no status yet");
-    assert_eq!(
-        disks.on_transfer(9, 3, code::SHORT_PACKET, 0x10_000, 1),
-        Some(Action::None),
-        "the data stage ends short"
-    );
+    assert_eq!(disks.on_transfer(9, 3, code::SUCCESS, 0x10_000, 1), Some(Action::None), "the data stage ends");
     assert_eq!(fake.trb(0, 2).0[2] & 0x1_FFFF, CSW_LEN as u32, "and the status is asked for");
     fake.answer(1, 0);
     let at = csw_trb(&disks, i);
@@ -728,12 +728,47 @@ fn a_short_reads_last_data_event_is_not_its_status() {
     disks.submit(&mut r, context(i, 0, epoch), 0);
     let in_ring = fake.rings[0].as_ptr() as u64;
     assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, in_ring, 1), Some(Action::None), "short at the first");
-    fake.answer(1, 0);
+    fake.answer_short(1, 4096, 0);
     let last = in_ring + 16;
     assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, last, 1), Some(Action::None), "the last TRB's own");
     assert!(matches!(disks.devs[i].lock().as_ref().unwrap().inflight.map(|c| c.stage), Some(Stage::Status { .. })));
-    let done = disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 1);
-    assert_eq!(done, Some(Action::Complete { irp: &mut r, status: 0, transferred: 8192 }), "the status wrapper's");
+    assert_eq!(
+        disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 1),
+        Some(Action::Wake),
+        "the status wrapper's"
+    );
+    let fault = disks.devs[i].lock().as_ref().unwrap().fault;
+    assert_eq!(fault, Some(Fault::Status(Status::Passed { residue: 4096 })));
+}
+
+/// **A short read is not made whole by a status that says it was.** A stick that moves part of
+/// a read and then answers Passed with no residue would leave the rest of the pages as they were,
+/// read as the file; the read fails instead. A hub command's data, an answer shorter than asked
+/// for, is the device's to cut short.
+#[test]
+fn a_short_read_whose_status_says_nothing_is_missing_fails() {
+    init_global_heap();
+    let disks = Disks::new();
+    let mut fake = Fake::new();
+    let (i, epoch) = disks.take(fake.dev(9)).unwrap();
+    let frags = [PhysFrag { base: 0x10_000, len: 4096 }, PhysFrag { base: 0x20_000, len: 4096 }];
+    let mut r = irp(IrpOp::Read, 0, 8192, &frags);
+    disks.submit(&mut r, context(i, 0, epoch), 0);
+    let in_ring = fake.rings[0].as_ptr() as u64;
+    assert_eq!(disks.on_transfer(9, 3, code::SHORT_PACKET, in_ring, 1), Some(Action::None));
+    fake.answer(1, 0);
+    assert_eq!(disks.on_transfer(9, 3, code::SUCCESS, csw_trb(&disks, i), 1), Some(Action::Wake));
+    assert_eq!(disks.devs[i].lock().as_ref().unwrap().fault, Some(Fault::Short), "left for reset recovery");
+
+    let (j, _) = disks.take(fake.dev(5)).unwrap();
+    let po = 0x1234 as *mut ();
+    assert!(disks.issue_hub(j, po, 0, &scsi::inquiry(), 36, false, 0));
+    disks.on_transfer(5, 4, code::SUCCESS, 0, 1);
+    assert_eq!(disks.on_transfer(5, 3, code::SHORT_PACKET, 0, 1), Some(Action::None));
+    fake.answer(1, 0);
+    assert_eq!(disks.on_transfer(5, 3, code::SUCCESS, csw_trb(&disks, j), 1), Some(Action::Hub { po }));
+    let result = disks.devs[j].lock().as_ref().unwrap().hub_result;
+    assert_eq!(result, Some(HubResult::Status(Status::Passed { residue: 0 })));
 }
 
 #[test]
