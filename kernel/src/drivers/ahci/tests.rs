@@ -95,3 +95,17 @@ fn a_rescan_and_an_eject_are_refused_without_touching_a_disk() {
         assert_eq!(irp.status, crate::syscall::error::KError::Unsupported as i32, "{op:?}");
     }
 }
+
+/// A command the HBA says moved less than its length fails, and its pages count as nothing moved:
+/// one byte short is a failure, the whole length a success, and a flush moves nothing and asks for
+/// nothing.
+#[test]
+fn a_command_that_moved_less_than_its_length_fails() {
+    let io_error = crate::syscall::error::KError::IoError as i32;
+    let ok = IrpStatus::Success as i32;
+    assert_eq!(completion(false, 8192, 8192), (ok, 8192));
+    assert_eq!(completion(false, 8192, 8191), (io_error, 0), "a read stopped a byte early");
+    assert_eq!(completion(false, 8192, 0), (io_error, 0));
+    assert_eq!(completion(false, 0, 0), (ok, 0), "a flush");
+    assert_eq!(completion(true, 8192, 8192), (io_error, 0), "the drive's error, whatever moved");
+}

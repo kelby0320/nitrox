@@ -148,7 +148,7 @@ pub struct AhciDisk {
     abar: u64,      // mapped ABAR kernel-virtual base
     port_base: u64, // abar + 0x100 + port*0x80
     port: u32,
-    _cmd_list: DmaBuffer, // 1 KiB command list (kept mapped/owned)
+    cmd_list: DmaBuffer,  // 1 KiB command list; slot 0's header first
     _fis: DmaBuffer,      // 256 B received-FIS area
     cmd_table: DmaBuffer, // CFIS + PRDT for slot 0
     sectors: u64,
@@ -303,7 +303,7 @@ pub fn init(controller: &ObjectRef) -> Outcome {
         abar,
         port_base,
         port,
-        _cmd_list: cmd_list,
+        cmd_list,
         _fis: fis,
         cmd_table,
         sectors: 0,
@@ -571,7 +571,7 @@ fn build_command(disk: &AhciDisk, command: u8, lba: u64, count: u16, frags: &[Ph
         }
     }
 
-    let cl = disk._cmd_list.virt() as *mut u32;
+    let cl = disk.cmd_list.virt() as *mut u32;
     // DW0: CFL = 5 dwords (H2D FIS), W bit, PRDTL = frag count.
     let dw0 = 5u32 | ((write as u32) << 6) | ((frags.len() as u32) << 16);
     // SAFETY: `cl` addresses the 1 KiB command list; slot 0 is its first 32 bytes.
@@ -745,28 +745,40 @@ unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) -> bool {
 /// # Safety
 /// `irp` is the IRP [`take_retired`] just took out of flight: live, and uniquely this driver's
 /// until its DPC runs.
-unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool) {
+unsafe fn retire(d: &AhciDisk, irp: *mut Irp, err: bool, moved: u32) {
     let ns = crate::arch::Timer::read_ns().saturating_sub(d.issued_at.load(Ordering::Relaxed));
     // SAFETY: as the contract says.
     unsafe {
-        let status = if err { crate::syscall::error::KError::IoError as i32 } else { IrpStatus::Success as i32 };
-        let transferred = if err { 0 } else { (*irp).length };
-        d.counted.record((*irp).op, !err, transferred, ns);
+        let (status, transferred) = completion(err, (*irp).length, moved);
+        d.counted.record((*irp).op, status == IrpStatus::Success as i32, transferred, ns);
         (*irp).set_completion(status, transferred);
         crate::dpc::enqueue(&(*irp).dpc);
     }
 }
 
+/// A retired command's status and the bytes it moved. An error moved nothing, and so did a command
+/// whose byte count, which the HBA writes back, falls short of its length: a read that stopped early
+/// would leave the rest of its pages to be read as data, holding whatever they held before.
+fn completion(err: bool, length: u64, moved: u32) -> (i32, u64) {
+    match err || u64::from(moved) < length {
+        true => (crate::syscall::error::KError::IoError as i32, 0),
+        false => (IrpStatus::Success as i32, length),
+    }
+}
+
 /// Slot 0 has retired: under the port lock, take the completed IRP out of flight (capturing its
-/// error status) and mark the slot idle. Returns the IRP (`null` if already idle) and whether it
-/// errored. Does **not** issue the next command: [`drain_queue`] does, from a DPC, so a fast
+/// error status and the bytes it moved) and mark the slot idle. Returns the IRP (`null` if already
+/// idle), whether it errored, and its header's byte count. Does **not** issue the next command: [`drain_queue`] does, from a DPC, so a fast
 /// pipelined completion cannot race the interrupt ack. The caller completes the IRP outside any
 /// lock.
-fn take_retired(d: &AhciDisk) -> (*mut Irp, bool) {
+fn take_retired(d: &AhciDisk) -> (*mut Irp, bool, u32) {
     let _q = d.pending.lock();
     let retired = d.inflight.swap(core::ptr::null_mut(), Ordering::AcqRel);
     let err = read32(d.port_base, PX_TFD) & TFD_ERR != 0;
-    (retired, err)
+    // SAFETY: the command list is this disk's, mapped while it lives, and slot 0's header DW1 is
+    // only rewritten by `build_command` for the next command, which cannot start under this lock.
+    let moved = unsafe { (d.cmd_list.virt() as *const u32).add(1).read_volatile() };
+    (retired, err, moved)
 }
 
 /// If slot 0 is idle, issue the next queued IRP. Called from the completion DPC and the boot poll
@@ -820,10 +832,10 @@ extern "C" fn isr() {
 
     // If slot 0 has retired, complete the IRP and queue the drain DPC for the next waiting command.
     if read32(d.port_base, PX_CI) & 1 == 0 {
-        let (irp, err) = take_retired(d);
+        let (irp, err, moved) = take_retired(d);
         if !irp.is_null() {
             // SAFETY: `irp` is the retired request; set status + queue its DPC.
-            unsafe { retire(d, irp, err) };
+            unsafe { retire(d, irp, err, moved) };
             crate::dpc::enqueue(&AHCI_DRAIN_DPC);
         }
     }
@@ -867,12 +879,12 @@ pub fn poll_complete_inflight() -> bool {
     // error status, so its waiter is not left stuck. Boot polling is synchronous: issue the next
     // directly.
     let _ = wait_command_polled(d);
-    let (irp, err) = take_retired(d);
+    let (irp, err, moved) = take_retired(d);
     if irp.is_null() {
         return false;
     }
     // SAFETY: `irp` is the retired request.
-    unsafe { retire(d, irp, err) };
+    unsafe { retire(d, irp, err, moved) };
     drain_queue(d);
     crate::dpc::run_pending();
     true
