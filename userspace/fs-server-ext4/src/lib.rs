@@ -466,7 +466,7 @@ mod tests {
             ext4::release_inode(self, ino, now)
         }
         fn rmdir_at(&self, dir: u32, name: &[u8], now: i64) -> Result<(), FsError> {
-            ext4::rmdir_at(self, dir, name, now)
+            ext4::rmdir_at(self, dir, name, now).map(|_| ())
         }
         fn rename_path(&self, from: &[u8], to: &[u8], now: i64) -> Result<(), FsError> {
             ext4::rename_path(self, from, to, false, now).map(drop)
@@ -1565,7 +1565,7 @@ mod tests {
         let sys = dir_ino(&rw, b"/system");
         ext4::mkdir_at(&rw, sys, b"gone", TEST_NOW).unwrap();
         let gone = dir_ino(&rw, b"/system/gone");
-        ext4::rmdir_at(&rw, sys, b"gone", TEST_NOW).unwrap();
+        assert_eq!(ext4::rmdir_at(&rw, sys, b"gone", TEST_NOW), Ok(gone), "the id a session holds");
         assert_eq!(ext4::mkdir_at(&rw, gone, b"x", TEST_NOW), Err(FsError::NotFound));
         assert_eq!(ext4::touch_at(&rw, gone, b".", TEST_NOW), Err(FsError::NotFound));
         assert_eq!(ext4::unlink_at(&rw, gone, b"x", TEST_NOW), Err(FsError::NotFound));

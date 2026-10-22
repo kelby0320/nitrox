@@ -91,8 +91,9 @@ pub trait Volume {
     /// Remove the file `name` from `dir`. **A file id to forget and then release**, if it was the
     /// last name.
     fn unlink_at(&self, dir: u64, name: &[u8], now: i64) -> Result<Option<u64>, FsError>;
-    /// Remove the empty directory `name` from directory `dir`.
-    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError>;
+    /// Remove the empty directory `name` from directory `dir`. **Its id**, which a session on it
+    /// holds, and which the next directory made may be given.
+    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<u64, FsError>;
     /// Stamp `name` in directory `dir` modified now.
     fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError>;
     /// Rename `old` to `new`, both in directory `dir`.

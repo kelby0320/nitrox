@@ -16,7 +16,9 @@ directory sessions, `File::Forget` and `File::Touch`, `Meta::Unmount`, and `Read
 `fs-server-fat` ([`fat-fs-server.md`](fat-fs-server.md)); this crate is ext4 as a `Volume` and a
 `_start`, and keeps its 4 KiB `Disk`. PR #365's review (2026-10-07): **a removed directory is
 refused to a session still holding its inode**, since a removal keeps the inode's mode and extent
-and zeroes only its link count; every operation by inode now asks for a link counted. And a server
+and zeroes only its link count; every operation by inode now asks for a link counted. That
+cannot see the inode reused, since the next directory made takes the lowest free one, so `rmdir`
+returns the inode and the protocol ends every session holding it. And a server
 that panics exits, rather than spinning with resolves waiting on it. Phase 6 Part G (2026-10-07):
 **its formatter has a second caller**, `disk --format DEVICE ext4` — § *Making one*. Phase 6 Part
 H.1 (2026-10-08): **extent trees** — written, cut and freed at any depth; an extent's length as

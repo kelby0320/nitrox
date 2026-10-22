@@ -111,8 +111,8 @@ impl<R: BlockReader + BlockWriter> Volume for Ext4<'_, R> {
         ext4::unlink_at(self.0, ino(dir)?, name, now).map(|orphan| orphan.map(u64::from))
     }
 
-    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
-        ext4::rmdir_at(self.0, ino(dir)?, name, now)
+    fn rmdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<u64, FsError> {
+        ext4::rmdir_at(self.0, ino(dir)?, name, now).map(u64::from)
     }
 
     fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {

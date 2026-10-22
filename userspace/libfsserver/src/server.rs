@@ -548,6 +548,17 @@ fn free_session_at(slot: usize) {
     }
 }
 
+/// **End every session on directory `id`**, just removed: a session keeps a bare id, which the
+/// filesystem may give the next directory made, and the session would then reach into that one.
+fn end_sessions_on(id: u64) {
+    for slot in 0..MAX_SESSIONS {
+        // SAFETY: single-threaded; `slot < MAX_SESSIONS`.
+        if unsafe { SESSION_CH[slot] != 0 && SESSION_DIR[slot] == id } {
+            free_session_at(slot);
+        }
+    }
+}
+
 fn reply_resolve_error(serve_end: u64, request_id: u64, kerror: i32) {
     reply_resolve_error_why(serve_end, request_id, kerror, b"");
 }
@@ -670,7 +681,7 @@ fn serve_session<V: Volume>(vol: &V, session_ch: u64, serve_end: u64) {
                                 forget_then_release(vol, serve_end, id);
                             }
                         }),
-                        OP_FILE_RMDIR => vol.rmdir_at(dir, name, now_secs()),
+                        OP_FILE_RMDIR => vol.rmdir_at(dir, name, now_secs()).map(end_sessions_on),
                         _ => vol.touch_at(dir, name, now_secs()),
                     },
                     None => Err(FsError::Unsupported),

@@ -252,7 +252,7 @@ fn a_long_name_too_long_for_a_listing_is_listed_short_and_reached_by_either() {
     let id = fat.unlink_at(d, long.as_bytes(), NOW).unwrap().unwrap();
     fat.release(id, NOW).unwrap();
     let root = fat.resolve_dir(b"/").unwrap();
-    assert_eq!(fat.rmdir_at(root, b"d", NOW), Ok(()), "empty once the file is gone");
+    assert_eq!(fat.rmdir_at(root, b"d", NOW), Ok(d), "empty once the file is gone, and its id");
 }
 
 /// **A directory removed is no directory to a session still holding its id**: a FAT

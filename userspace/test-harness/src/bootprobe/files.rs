@@ -359,6 +359,84 @@ pub(super) fn dot_entries_test(root_ns: u64) -> bool {
     }
 }
 
+/// **A session ends with its directory**: it holds a bare id, and the next directory made can take
+/// the removed one's inode, which the session then reached into. Directories are made until one
+/// takes it, so the test reaches the reuse it is about; the old session is then refused, and the
+/// new directory holds nothing it made.
+pub(super) fn removed_dir_session_test(root_ns: u64) -> bool {
+    use librsproto::session::Dir;
+    fn inode_of(dir: &mut Dir<'_>, name: &[u8]) -> u32 {
+        let mut inode = 0;
+        let _ = dir.read_dir(|e| {
+            if e.name == name {
+                inode = e.inode;
+            }
+            true
+        });
+        inode
+    }
+    let fail = |why: &[u8]| {
+        Line::new().s(b"boot-probe: removed-directory session FAIL: ").s(why).end();
+        false
+    };
+    let mut sys_buf = [0u8; 4096];
+    let Ok(mut sys) = Dir::open(root_ns, b"/system", &mut sys_buf) else {
+        return fail(b"/system does not open");
+    };
+    let gone = match sys.mkdir(b"probe-gone") {
+        Ok(()) => inode_of(&mut sys, b"probe-gone"),
+        Err(_) => 0,
+    };
+    let mut stale_buf = [0u8; 4096];
+    let stale = Dir::open(root_ns, b"/system/probe-gone", &mut stale_buf);
+    let removed = sys.rmdir(b"probe-gone").is_ok();
+    let mut name = *b"probe-new-0";
+    let mut made = 0u8;
+    let mut reused = None;
+    while removed && reused.is_none() && made < 10 && sys.mkdir(&name).is_ok() {
+        made += 1;
+        if inode_of(&mut sys, &name) == gone {
+            reused = Some(name);
+        }
+        name[10] += 1;
+    }
+    let planted = match stale {
+        Ok(mut d) => {
+            let planted = d.mkdir(b"planted").is_ok();
+            d.close();
+            planted
+        }
+        Err(_) => false,
+    };
+    let mut held = false;
+    if let Some(path) = reused.map(|n| {
+        let mut p = *b"/system/probe-new-0";
+        p[8..].copy_from_slice(&n);
+        p
+    }) {
+        let mut buf = [0u8; 4096];
+        if let Ok(mut d) = Dir::open(root_ns, &path, &mut buf) {
+            held = inode_of(&mut d, b"planted") != 0;
+            let _ = d.rmdir(b"planted");
+            d.close();
+        }
+    }
+    for k in 0..made {
+        name[10] = b'0' + k;
+        let _ = sys.rmdir(&name);
+    }
+    sys.close();
+    match (gone != 0 && removed, reused.is_some(), planted || held) {
+        (true, true, false) => {
+            kprint(b"boot-probe: a session on a removed directory is ended before its id is reused ok\n");
+            true
+        }
+        (false, ..) => fail(b"the directory was not made and removed"),
+        (_, false, _) => fail(b"no new directory took the removed one's inode: the test saw no reuse"),
+        _ => fail(b"the removed directory's session made an entry in the directory given its id"),
+    }
+}
+
 /// **A flush of the root disk completes.** `IoOpcode::Flush` on the root partition goes down to
 /// its disk (AHCI's `FLUSH CACHE EXT` in `test-qemu`) and its `PendingOperation` completes with
 /// status `0`. Two refusals alongside, which a flush path that ignored its descriptor would

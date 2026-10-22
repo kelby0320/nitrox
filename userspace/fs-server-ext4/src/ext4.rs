@@ -1559,7 +1559,7 @@ pub fn release_inode<RW: BlockReader + BlockWriter>(rw: &RW, ino: u32, now: i64)
 /// Remove the **empty subdirectory** `name` from directory inode `dir_ino`: verify it holds only
 /// `.`/`..`, unlink it, free its block and inode, and decrement the parent's link count. `NotFound`
 /// if absent; `Unsupported` if not a directory (use [`unlink_at`]); `NotEmpty` if it has entries.
-pub fn rmdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8], now: i64) -> Result<(), FsError> {
+pub fn rmdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8], now: i64) -> Result<u32, FsError> {
     if name == b"." || name == b".." {
         return Err(FsError::Unsupported);
     }
@@ -1588,7 +1588,7 @@ pub fn rmdir_at<RW: BlockReader + BlockWriter>(rw: &RW, dir_ino: u32, name: &[u8
     free_inode(rw, &sb, sub_ino, true, now)?;
     adjust_links(rw, &sb, dir_ino, -1)?; // the subdir's `..` no longer links the parent
     touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;
-    free_inode_blocks(rw, &sb, &sub)
+    free_inode_blocks(rw, &sb, &sub).map(|()| sub_ino)
 }
 
 /// Point the existing entry `name` in `dir_inode` at a different inode, in place.

@@ -153,6 +153,10 @@ a display decision, not a protocol one.
 Request body: `name_len: u16` followed by the name bytes. Success is an empty-body
 reply; failure is the standard error reply.
 
+**An `Rmdir` ends every session on the directory it removes**: a session holds the directory's id,
+which the next directory made may be given. The channel of each closes, and its client's next
+request meets `PeerClosed`.
+
 **A name is one entry of the session's directory**: 1 to 255 bytes, no `/`, and never `.` or
 `..`. Those two are listed, but they name the directory and its parent, and a session that could
 rename or touch `..` would reach past the directory it is confined to. A server refuses them in
