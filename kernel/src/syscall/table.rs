@@ -1958,9 +1958,7 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64, 
     // in place — a stack temporary here would be 4 KiB on every send.
     let mut bounce = unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
     copy_slice_from_user(bounce.as_bytes_mut(), mptr).map_err(from_user_access)?;
-    if bounce.header.payload_len as usize > IPC_PAYLOAD_SIZE {
-        return Err(KError::InvalidArgument);
-    }
+    bounce.seal().ok_or(KError::InvalidArgument)?;
     bounce.header.sender_pid = pid;
     bounce.header.timestamp = Timer::read_ns();
     bounce.header.handle_count = count as u8;

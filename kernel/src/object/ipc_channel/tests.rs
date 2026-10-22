@@ -388,3 +388,16 @@ fn recv_sweeps_cancelled_then_promotes_the_live_send() {
     drop_endpoint(a);
     drop_endpoint(b);
 }
+
+#[test]
+fn a_sealed_message_carries_nothing_past_its_payload() {
+    let mut m = StoredMsg::zeroed();
+    m.payload.fill(0xA5);
+    m.header.payload_len = 28;
+    assert_eq!(m.seal(), Some(28));
+    assert!(m.payload[..28].iter().all(|&b| b == 0xA5) && m.payload[28..].iter().all(|&b| b == 0));
+    m.header.payload_len = IPC_PAYLOAD_SIZE as u32;
+    assert_eq!(m.seal(), Some(IPC_PAYLOAD_SIZE));
+    m.header.payload_len = IPC_PAYLOAD_SIZE as u32 + 1;
+    assert_eq!(m.seal(), None);
+}
