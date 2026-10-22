@@ -537,7 +537,7 @@ impl FileObject {
         let mut n = 1;
         while n <= ahead && resident & (1 << (n - 1)) == 0 {
             let block = fill_block_in(&g.runs, first_block(index + n), per_page);
-            if block * bs != first * bs + (n * PAGE_SIZE) as u64 || g.pages.try_reserve(1).is_err() {
+            if Some(block * bs) != (first * bs).checked_add((n * PAGE_SIZE) as u64) || g.pages.try_reserve(1).is_err() {
                 break;
             }
             let Some(f) = heap::buddy_alloc(0) else { break };
@@ -590,7 +590,7 @@ impl FileObject {
         while frames.len() < max {
             let k = frames.len();
             match target(&g, start + k, at + 1) {
-                Some((next, frame, block)) if block * bs == first * bs + (k * PAGE_SIZE) as u64 => {
+                Some((next, frame, block)) if Some(block * bs) == (first * bs).checked_add((k * PAGE_SIZE) as u64) => {
                     let _ = frames.try_push(frame);
                     at = next;
                 }
@@ -1886,6 +1886,19 @@ mod tests {
             f.settle(index + k, &fill_po, true);
         }
         (step, frames.to_vec())
+    }
+
+    /// A run's end in bytes fits a `u64`, but where the page after it would lie need not.
+    #[test]
+    fn a_page_that_would_lie_past_the_top_of_the_device_ends_a_run() {
+        init_global_heap();
+        let reg = registration();
+        let d = u64::MAX / 512 - 10;
+        let map = [(0, d, 8), (8, d + 8, 1), (16, 7000, 8)];
+        let (f, _) = mapped_file(&reg, 7, 3, 512, &map, 0..0);
+        assert_eq!(fill_ahead(file_of(&f), 0, 512, 31).0, ReadStep::Go(d, 2));
+        let (g, _) = mapped_file(&reg, 8, 3, 512, &map, 0..3);
+        assert!(matches!(file_of(&g).begin_write(0, 512, 3, &mut KVec::new()), WriteStep::Go(at, 2) if at == d));
     }
 
     #[test]
