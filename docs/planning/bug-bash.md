@@ -6,7 +6,8 @@ is one, 68 to fix in Part D, 60 later (4 in Part E, 56 in Part H) and 1 not. The
 the five found before the bash, the trials' unchecked test gaps and doc claims, and the laptop's
 two bugs, five to fix, one already fixed and three later. Group A fixed 2026-10-22, with sched-7
 and kobj-9 from groups E and B and the test gaps that ride with them; sched-10 stays open for one
-mutation. Group B fixed 2026-10-22: the twelve capability and rights leaks.** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
+mutation. Group B fixed 2026-10-22: the twelve capability and rights leaks, and the test gap that
+rides with them, kmem-11.** Part D of [`pre-phase-7.md`](pre-phase-7.md) fills it: the two bugs found on the
 laptop, what PR #365's two trial reviews found that `main` still has, and each `/bug-bash` run, a
 section a subsystem.
 
@@ -399,7 +400,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   Fixed in `338d744f`; fails without it:
   `a_cpu_beaten_to_an_empty_slot_takes_the_table_linked_first`, deterministic by a test-only hook
   between the read and the link.
-- [ ] **kmem-7** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_* bits
+- [x] **kmem-7** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_* bits
   the caller asks for (`required = req & MAP_*`) but always installs a present, user-readable
   mapping. With `rights = 0`, or only MAP_WRITE or MAP_EXEC, a MemoryObject or FileObject handle
   with no MAP_READ (INSPECT|TRANSFER after `sys_handle_restrict`, a write-only spawn grant, a
@@ -411,6 +412,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   with INSPECT|TRANSFER. `lookup` with an empty requirement succeeded, and `map_object` with
   `Protection::USER` left `Paging::translate` returning Some. The syscall wrapper itself cannot
   run on the host. Lenses: logic, error-paths, trust-boundary, tests. Medium. **Fix**, as kobj-8.
+  Fixed in `48cecf0b`, as kobj-8; fails without it: boot-probe's `map_needs_read_test`.
 - [x] **kmem-8** `kernel/src/mm/elf.rs:223` — A PT_LOAD's `p_memsz` is bounded only by
   `USER_VIRT_END`, and `map_vma` commits it eagerly, allocating and zeroing a frame per page under
   the AS lock in an IF-masked syscall. `MemoryObject::MAX_SIZE` (16 MiB) exists to prevent
@@ -450,13 +452,16 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   then the server end dropped, gave "lookup signalled=true, fill signalled=false". Only
   `take_pending_fill_matching` ever takes `pending_fill`. A boot with a Model B test server was
   not run. Lenses: logic, error-paths. Medium. **Later**, as kobj-10.
-- [ ] **kmem-11** `kernel/src/mm/addr_space.rs:631` — No test pins `page_flags_for`'s WRITABLE,
+- [x] **kmem-11** `kernel/src/mm/addr_space.rs:631` — No test pins `page_flags_for`'s WRITABLE,
   NO_EXECUTE and USER translation, and this function builds every user PTE. A regression that
   drops NX, makes read-only mappings writable or marks kernel mappings user-accessible would
   silently remove W^X and read-only protection, and boot gates probably would not notice.
   Demonstrated: three mutations in `mm::addr_space` all survived, namely the EXEC test forced to
   `false`, the WRITE branch forced on, and the USER branch forced on. Only the WRITE_COMBINING
   branch was killed. Lens: tests. Medium. **Fix**, with kobj-8.
+  Fixed in `48cecf0b`; fails without it:
+  `a_page_is_writable_executable_and_user_only_as_its_protection_says`, each of the three mutations
+  applied in turn.
 - [x] **kmem-12** `kernel/src/mm/addr_space.rs:574` — No test catches a leaked or double-freed frame
   on unmap. A regression could leak an Anonymous frame per page, or collect Object and FileBacked
   frames into `frames`, so `sys_memory_unmap` would `buddy_free` frames a MemoryObject or the page
@@ -853,7 +858,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   `a_name_two_partitions_carry_is_the_boot_mediums`, and check-storage, whose disk gains a decoy
   `nitrox-live`.
 
-- [ ] **drv-4** `kernel/src/syscall/table.rs:2393` — A FILE_BLOCKS resolve reply discards the
+- [x] **drv-4** `kernel/src/syscall/table.rs:2393` — A FILE_BLOCKS resolve reply discards the
   rights of the block DeviceNode handle the server transfers (`tr.rights`). The MEMOBJ path
   intersects them (`pl.requested & tr.rights`, :2158). Page-cache writeback (file_object.rs:883)
   dispatches Write IRPs through `dispatch_block_irp_into_frames`, which leaves rights to the caller
@@ -867,6 +872,9 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   holds a READ-only partition handle and replies FILE_BLOCKS without the flag would settle it. The
   client maps MAP_WRITE, writes and syncs, then the test compares the device bytes. Lens:
   architecture. High. **Fix**, as kobj-2.
+  Fixed in `4043ae92`, as kobj-2; fails without it:
+  `a_file_blocks_file_is_writable_only_as_far_as_its_server_may_write_the_device` and
+  `a_file_blocks_reply_installs_a_file_no_more_writable_than_its_server_holds_its_device`.
 
 - [ ] **drv-5** `kernel/src/drivers/ahci.rs:822` — The AHCI driver has no error recovery and no
   runtime deadline. The ISR retires slot 0 only when PxCI bit 0 is clear. AHCI 1.3.1 §6.2.2.1 has
@@ -1052,7 +1060,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   Probes removed. logic. High. **Fix**, as kmem-16.
   Fixed in `655de0b6`; fails without it:
   `a_page_that_would_lie_past_the_top_of_the_device_ends_a_run`, each sum unchecked in turn.
-- [ ] **proto-2** `kernel/src/syscall/table.rs:2394` — `build_and_install_file_blocks` takes the
+- [x] **proto-2** `kernel/src/syscall/table.rs:2394` — `build_and_install_file_blocks` takes the
   transferred DeviceNode and drops its rights (`tr.rights`). Whether the file is writable depends
   only on the server's own FILE_BLOCKS_READ_ONLY flag (line 2433). The sibling arms respect
   rights: MEMOBJ/CHANNEL attenuate by `pl.requested & tr.rights` (line 2158) and SUBNAMESPACE
@@ -1070,6 +1078,9 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   server sends flags 0, then a client write plus `sys_file_sync` and a host read of the sector,
   would show the disk written. Requiring WRITE in `tr.rights` before granting MAP_WRITE should
   turn it into NoAccess. logic, trust-boundary, architecture. High. **Fix**, as kobj-2.
+  Fixed in `4043ae92`, as kobj-2; fails without it:
+  `a_file_blocks_file_is_writable_only_as_far_as_its_server_may_write_the_device` and
+  `a_file_blocks_reply_installs_a_file_no_more_writable_than_its_server_holds_its_device`.
 - [x] **proto-3** `kernel/src/rsproto.rs:59` — No test covers the `body_len` bound in
   `reply_body`, `parse_reply` and `parse_read_range_reply`, the only guard between a hostile
   server's reply and an out-of-range slice panic in the kernel. A reply whose body_len exceeds
@@ -1953,7 +1964,7 @@ Found 11, refuted by a boot 0, reported 11.
   `a_file_blocks_header_claiming_more_runs_than_its_body_holds_is_refused` and
   `a_block_map_the_page_cache_cannot_use_is_refused`; the channel depth falls to 512, the deepest
   whose ring fits.
-- [ ] **kmem-25** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_* bits
+- [x] **kmem-25** `kernel/src/syscall/table.rs:855` — `sys_memory_map` requires only the MAP_* bits
   named in `rights`, yet always installs a user-readable mapping (prot starts at
   `Protection::USER`, and x86 has no read bit). A request with `rights = 0`, or MAP_WRITE alone,
   maps a MemoryObject or FileObject readable without MAP_READ, which elsewhere is the authority to
@@ -1968,6 +1979,7 @@ Found 11, refuted by a boot 0, reported 11.
   must carry every requested MAP_* bit", and nothing makes reading require MAP_READ. A host test
   that restricts a handle to MAP_WRITE and maps with `rights = 0` would settle it. Fix: always
   require MAP_READ for any mapping. Architecture. Medium. **Fix**, as kobj-8.
+  Fixed in `48cecf0b`, as kobj-8; fails without it: boot-probe's `map_needs_read_test`.
 - [ ] **kmem-26** `kernel/src/mm/kvmap.rs:55` — kernel-stack virtual addresses are never reclaimed:
   `vmap` is a bump allocator and `KernelStack::Drop` unmaps only the leaves. Thread churn
   therefore (a) retains a page-table frame for every 2 MiB of vmap (about 102 stacks) forever, and
