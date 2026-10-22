@@ -868,8 +868,8 @@ pub fn sys_memory_create(size: u64, flags: u64) -> SysResult {
 /// otherwise `hint` is the requested page-aligned base. Returns the mapped base address.
 pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResult {
     let req = Rights::from_bits_truncate(rights);
-    // The handle must carry the `MAP_*` bits being installed; amplification is `NoAccess`.
-    let required = req & (Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC);
+    // The handle must carry the `MAP_*` bits installed, and `MAP_READ` always: every mapping reads.
+    let required = (req & (Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC)) | Rights::MAP_READ;
 
     let pid = crate::sched::current_owner_pid();
     let proc_ref = crate::sched::current_process().ok_or(KError::KernelError)?;

@@ -85,6 +85,52 @@ pub(super) fn clock_set_refused_test() -> bool {
     true
 }
 
+/// **Every mapping needs `MAP_READ`**, since a mapped page reads whatever bits were asked: a
+/// handle without it, mapped asking for none, is refused `NoAccess`; with it, mapped.
+pub(super) fn map_needs_read_test() -> bool {
+    use libkern::{KError, RIGHT_INSPECT};
+    // SAFETY: register-only syscall; it creates an object and touches no memory of ours.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if mem <= 0 {
+        Line::new().s(b"boot-probe: map FAIL: no memory object").end();
+        return false;
+    }
+    // SAFETY: register-only syscall on a handle this process holds.
+    let blind = unsafe { syscall2(SYS_HANDLE_DUPLICATE, mem as u64, RIGHT_INSPECT | RIGHT_TRANSFER) };
+    if blind <= 0 {
+        close(mem as u64);
+        Line::new().s(b"boot-probe: map FAIL: no handle without MAP_READ").end();
+        return false;
+    }
+    // SAFETY: register-only syscalls on handles this process holds; nothing is read through them.
+    let (refused, mapped) = unsafe {
+        (
+            syscall4(SYS_MEMORY_MAP, blind as u64, 0, PAGE, 0),
+            syscall4(SYS_MEMORY_MAP, mem as u64, 0, PAGE, RIGHT_MAP_READ),
+        )
+    };
+    if mapped > 0 {
+        // SAFETY: unmapping the page this call mapped.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, mapped as u64, PAGE) };
+    }
+    if refused > 0 {
+        // SAFETY: as above.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, refused as u64, PAGE) };
+    }
+    close(blind as u64);
+    close(mem as u64);
+    if refused != KError::NoAccess.as_i32() as i64 {
+        Line::new().s(b"boot-probe: map FAIL: a handle without MAP_READ was mapped").end();
+        return false;
+    }
+    if mapped <= 0 {
+        Line::new().s(b"boot-probe: map FAIL: a handle with MAP_READ was not mapped").end();
+        return false;
+    }
+    kprint(b"boot-probe: every mapping needs MAP_READ ok\n");
+    true
+}
+
 /// **A message carries nothing past its payload**: the kernel zeroes the rest, so a buffer a
 /// sender reuses cannot hand the receiver its stale bytes, a typed password among them.
 pub(super) fn payload_sealed_test() -> bool {
