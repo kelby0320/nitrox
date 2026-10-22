@@ -157,7 +157,7 @@ fn sys_channel_create(
 ) -> isize
 ```
 
-Creates an IPC channel with two endpoint handles, returned via `*end0` and `*end1`. The channel has separate queues in each direction; sending from `end0` enqueues to `end1`'s receive queue, and vice versa. Each direction has `queue_depth` slots (default 16; max 1024 — TBD).
+Creates an IPC channel with two endpoint handles, returned via `*end0` and `*end1`. The channel has separate queues in each direction; sending from `end0` enqueues to `end1`'s receive queue, and vice versa. Each direction has `queue_depth` slots (default 16; max 512, the deepest whose ring fits the kernel's largest single allocation).
 
 Each endpoint has full rights initially: `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. The creator typically attenuates rights (via `sys_handle_restrict` or by transferring with reduced rights) when handing endpoints to other parties.
 

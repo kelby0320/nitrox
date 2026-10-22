@@ -53,6 +53,10 @@ fn a_block_map_the_page_cache_cannot_use_is_refused() {
         assert_eq!(used(&body(512, &[run])), taken, "{what}");
     }
     assert_eq!(block_map(&body(512, &[(0, 2048, 8)])[..32 + 23]).err(), Some(KError::KernelError), "a run cut short");
+    // 200,000 runs is 4.8 MB, past the buddy's largest block: refused before it is reserved.
+    let mut claims_more = body(512, &[(0, 2048, 8)]);
+    claims_more[12..16].copy_from_slice(&200_000u32.to_le_bytes());
+    assert_eq!(block_map(&claims_more).err(), Some(KError::KernelError), "a count past the body");
 }
 
 #[test]

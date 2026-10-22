@@ -79,6 +79,13 @@ struct RingSlot {
     transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
 }
 
+// A ring is one allocation: at the deepest queue it must fit the buddy's largest block, less
+// a page for the slab's descriptor, or every channel that deep is refused.
+const _: () = assert!(
+    IPC_MAX_QUEUE_DEPTH as usize * core::mem::size_of::<RingSlot>()
+        <= (crate::mm::PAGE_SIZE << crate::mm::buddy::MAX_ORDER) - crate::mm::PAGE_SIZE
+);
+
 impl RingSlot {
     fn empty() -> Self {
         RingSlot { msg: StoredMsg::zeroed(), transfers: core::array::from_fn(|_| None) }

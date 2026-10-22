@@ -521,8 +521,11 @@ impl AddressSpace {
         frames: &mut KVec<PhysAddr>,
     ) -> Result<Option<KBox<Vma>>, u64> {
         let mut guard = self.inner.lock();
+        // Only an anonymous mapping's frames come back; reserving for a mapped 2 GiB file would
+        // ask for more than the largest allocation and refuse the unmap.
         let pages = match guard.vma_tree.find_covering(addr) {
-            Some(v) => v.range.pages(),
+            Some(v) if matches!(v.mapping, MappingKind::Anonymous) => v.range.pages(),
+            Some(_) => 0,
             None => return Ok(None),
         };
         if ((frames.capacity() - frames.len()) as u64) < pages {

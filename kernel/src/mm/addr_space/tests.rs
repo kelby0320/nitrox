@@ -184,6 +184,18 @@ fn uprot() -> Protection {
 }
 
 #[test]
+fn unmapping_an_object_needs_no_room_for_frames_and_an_anonymous_mapping_does() {
+    init_global_heap();
+    let asp = AddressSpace::new().unwrap();
+    let obj = into_obj(MemoryObject::try_new(PAGE as usize * 3).unwrap());
+    asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj).unwrap();
+    asp.map_vma(anon_box(range(PAGE * 16, PAGE * 18), uprot())).unwrap();
+    let mut none = KVec::new();
+    assert!(matches!(asp.unmap_covering_deferred(va(PAGE * 5), &mut none), Ok(Some(_))));
+    assert_eq!(asp.unmap_covering_deferred(va(PAGE * 16), &mut none).err(), Some(2));
+}
+
+#[test]
 fn map_object_points_ptes_at_object_frames() {
     init_global_heap();
     let asp = AddressSpace::new().unwrap();

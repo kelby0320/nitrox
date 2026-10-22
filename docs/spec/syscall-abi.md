@@ -528,7 +528,7 @@ fn sys_channel_create(
     queue_depth: u32,
 ) -> isize
 ```
-Creates a new IPC channel with the specified queue depth (`0` → default 16; `> 1024` → `InvalidArgument`). Writes the two endpoint handles to `*end0` and `*end1`, each carrying `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. (Syscall number `12`.)
+Creates a new IPC channel with the specified queue depth (`0` → default 16; `> 512` → `InvalidArgument`). Writes the two endpoint handles to `*end0` and `*end1`, each carrying `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. (Syscall number `12`.)
 
 ```rust
 fn sys_channel_send(

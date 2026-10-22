@@ -107,15 +107,21 @@ pub struct FileBlocksHeader {
 /// installs such a file without `MAP_WRITE`.
 pub const FILE_BLOCKS_READ_ONLY: u32 = 1 << 0;
 
-/// Parse a Model A resolve reply body's header, or `None` if short. `body` is the rsproto
-/// message body (after the envelope header).
+/// Parse a Model A resolve reply body's header, or `None` if `body` is short of it or of the
+/// `run_count` runs it says follow. `body` is the rsproto message body (after the envelope
+/// header).
 pub fn file_blocks_reply_header(body: &[u8]) -> Option<FileBlocksHeader> {
     if body.len() < FILE_BLOCKS_PREFIX_LEN {
         return None;
     }
+    let run_count = get_u32(body, 12);
+    let runs_end = (run_count as usize).checked_mul(BLOCK_RUN_WIRE_LEN)?.checked_add(FILE_BLOCKS_PREFIX_LEN)?;
+    if body.len() < runs_end {
+        return None;
+    }
     Some(FileBlocksHeader {
         block_size: get_u32(body, 8),
-        run_count: get_u32(body, 12),
+        run_count,
         file_id: get_u64(body, 16),
         flags: get_u32(body, 24),
     })
@@ -141,8 +147,8 @@ pub fn subnamespace_reply(body: &[u8]) -> Option<(u16, &[u8])> {
 /// Read the `i`-th `BlockRun` from a Model A resolve reply body as
 /// `(file_block, device_lba, length, flags)`, or `None` if it would run past `body`.
 pub fn file_blocks_run(body: &[u8], i: usize) -> Option<(u64, u64, u32, u32)> {
-    let off = FILE_BLOCKS_PREFIX_LEN + i * BLOCK_RUN_WIRE_LEN;
-    if body.len() < off + BLOCK_RUN_WIRE_LEN {
+    let off = i.checked_mul(BLOCK_RUN_WIRE_LEN)?.checked_add(FILE_BLOCKS_PREFIX_LEN)?;
+    if body.len() < off.checked_add(BLOCK_RUN_WIRE_LEN)? {
         return None;
     }
     Some((get_u64(body, off), get_u64(body, off + 8), get_u32(body, off + 16), get_u32(body, off + 20)))
@@ -721,6 +727,57 @@ mod tests {
         assert_eq!(file_blocks_run(&body, 0), Some((0, 777, 2, 0)));
         assert_eq!(file_blocks_run(&body, 1), None, "one run, not two");
         assert_eq!(file_blocks_reply_header(&body[..31]), None, "a prefix a byte short");
+    }
+
+    #[test]
+    fn each_block_run_is_read_at_its_own_offset() {
+        let mut body = [0u8; 32 + 3 * 24];
+        put_u32(&mut body, 12, 3);
+        for i in 0..3u64 {
+            let off = 32 + 24 * i as usize;
+            put_u64(&mut body, off, 10 + i);
+            put_u64(&mut body, off + 8, 1000 + i);
+            put_u32(&mut body, off + 16, 20 + i as u32);
+            put_u32(&mut body, off + 20, 30 + i as u32);
+        }
+        for i in 0..3u64 {
+            let want = (10 + i, 1000 + i, 20 + i as u32, 30 + i as u32);
+            assert_eq!(file_blocks_run(&body, i as usize), Some(want));
+        }
+        assert_eq!(file_blocks_run(&body, usize::MAX), None);
+    }
+
+    #[test]
+    fn a_file_blocks_header_claiming_more_runs_than_its_body_holds_is_refused() {
+        let mut body = [0u8; 32 + 2 * 24];
+        put_u32(&mut body, 8, 4096);
+        put_u32(&mut body, 12, 2);
+        assert_eq!(file_blocks_reply_header(&body).map(|h| h.run_count), Some(2));
+        put_u32(&mut body, 12, 3);
+        assert_eq!(file_blocks_reply_header(&body), None);
+        put_u32(&mut body, 12, u32::MAX);
+        assert_eq!(file_blocks_reply_header(&body), None);
+    }
+
+    #[test]
+    fn a_reply_body_may_not_run_past_its_message() {
+        let mut body = [0u8; 16];
+        put_u32(&mut body, 0, (-10i32) as u32);
+        for flags in [RS_FLAG_REPLY, RS_FLAG_REPLY | RS_FLAG_ERROR] {
+            let mut buf = make_reply(9, flags, &body);
+            let msg = &mut buf[..RS_HEADER_LEN + 16];
+            assert_eq!(reply_body(msg).map(<[u8]>::len), Some(16));
+            assert!(parse_reply(msg).is_some());
+            assert!(parse_read_range_reply(msg).is_some());
+            put_u32(msg, 20, 17);
+            assert_eq!(reply_body(msg), None);
+            assert!(parse_reply(msg).is_none());
+            assert!(parse_read_range_reply(msg).is_none());
+            put_u32(msg, 20, u32::MAX);
+            assert_eq!(reply_body(msg), None);
+            assert!(parse_reply(msg).is_none());
+            assert!(parse_read_range_reply(msg).is_none());
+        }
     }
 
     /// **A forget is read at the offsets a server writes**, laid out by hand since the writer is

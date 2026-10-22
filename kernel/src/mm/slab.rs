@@ -641,6 +641,14 @@ mod tests {
     }
 
     #[test]
+    fn a_large_alloc_past_the_largest_block_is_refused() {
+        let (_mem, pager) = make_world(PAGE_SIZE * 64);
+        let header = core::mem::size_of::<SlabDescriptor>();
+        assert!(large_alloc((PAGE_SIZE << crate::mm::buddy::MAX_ORDER) - header + 1, 8, &pager).is_null());
+        assert!(large_alloc(usize::MAX / 2, 8, &pager).is_null());
+    }
+
+    #[test]
     fn large_alloc_round_trip_via_kfree_routing() {
         let (_mem, pager) = make_world(PAGE_SIZE * 64);
         let p = large_alloc(3000, 8, &pager);

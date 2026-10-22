@@ -186,8 +186,9 @@ impl MemoryObject {
     }
 
     /// Copy the object into a fresh contiguous heap buffer (page-rounded [`size`](Self::size)
-    /// bytes): `sys_process_spawn` needs one slice for the ELF loader. Mapping the frames into a
-    /// temporary kernel VMA would avoid the copy; see `docs/rationale/deferred-decisions.md`.
+    /// bytes): `sys_process_spawn` needs one slice for the ELF loader. One over the buddy's largest
+    /// block, 4 MiB, is refused. Mapping the frames into a temporary kernel VMA would avoid the
+    /// copy; see `docs/rationale/deferred-decisions.md`.
     pub fn copy_to_kvec(&self) -> Result<KVec<u8>, AllocError> {
         let mut buf = KVec::new();
         buf.try_reserve(self.size)?;
@@ -362,6 +363,13 @@ mod tests {
         assert_eq!(test_probe::memory_object_destroys(), 0);
         drop(r);
         assert_eq!(test_probe::memory_object_destroys(), 1);
+    }
+
+    #[test]
+    fn copying_an_image_past_the_largest_block_is_refused() {
+        init_global_heap();
+        let big = MemoryObject::try_new((PAGE_SIZE << crate::mm::buddy::MAX_ORDER) + PAGE_SIZE).unwrap();
+        assert!(big.copy_to_kvec().is_err());
     }
 
     #[test]

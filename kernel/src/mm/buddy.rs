@@ -158,9 +158,9 @@ impl BuddyAllocator {
         alloc
     }
 
-    /// Allocate `2^order` contiguous pages; `None` if none can be served.
+    /// Allocate `2^order` contiguous pages; `None` if none can be served, or if `order` is past
+    /// [`MAX_ORDER`]: a size a caller took from user input is refused, not a kernel bug.
     pub fn alloc(&mut self, order: usize) -> Option<PhysAddr> {
-        debug_assert!(order <= MAX_ORDER, "buddy: alloc order {order} > MAX_ORDER");
         if order > MAX_ORDER {
             return None;
         }
@@ -432,6 +432,13 @@ mod tests {
         let (_mem, mut a) = make_alloc(PAGE_SIZE * 64);
         let p = a.alloc(0).expect("first order-0 alloc should succeed");
         assert!(p.is_page_aligned());
+    }
+
+    #[test]
+    fn an_order_past_the_largest_block_is_refused() {
+        let (_mem, mut a) = make_alloc(PAGE_SIZE * 64);
+        assert!(a.alloc(MAX_ORDER + 1).is_none());
+        assert!(a.alloc(usize::MAX).is_none());
     }
 
     #[test]
