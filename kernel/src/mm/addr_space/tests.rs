@@ -1,4 +1,5 @@
 use super::*;
+use crate::arch::abi::USER_VIRT_END;
 
 #[test]
 fn the_mapping_window_stops_below_the_guard_gap() {
@@ -135,6 +136,22 @@ fn map_rejects_overlap_with_existing_vma() {
     // SAFETY: `asp`'s root is the live page table this test built.
     assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 9)) }.is_none());
     assert_eq!(asp.len(), 1);
+}
+
+#[test]
+fn no_way_of_mapping_reaches_the_top_page_of_the_user_half() {
+    init_global_heap();
+    let top = USER_VIRT_END - PAGE;
+    let below = range(top - PAGE, top);
+    let last = range(top, USER_VIRT_END);
+    let asp = AddressSpace::new().unwrap();
+    assert!(matches!(asp.map_vma(anon_box(last, uprot())), Err((_, MapError::NotUserHalf))));
+    assert!(matches!(asp.map_vma_lazy(anon_box(last, uprot())), Err((_, MapError::NotUserHalf))));
+    let obj = into_obj(MemoryObject::try_new(PAGE as usize).unwrap());
+    assert!(matches!(asp.map_object(last, uprot(), obj.clone()), Err((_, MapError::NotUserHalf))));
+    let file = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
+    assert!(matches!(asp.map_file(last, uprot(), file), Err((_, MapError::NotUserHalf))));
+    assert!(asp.map_object(below, uprot(), obj).is_ok());
 }
 
 #[test]

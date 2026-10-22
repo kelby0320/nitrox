@@ -15,7 +15,7 @@
 use core::ptr;
 
 use crate::arch::Paging;
-use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_STACK_GUARD_SIZE, USER_VIRT_END};
+use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_MAP_END, USER_STACK_GUARD_SIZE};
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::lockrank::LockRank;
@@ -44,7 +44,7 @@ const MMAP_MAX: u64 = USER_STACK_GUARD_BOTTOM;
 pub enum MapError {
     /// A range endpoint was not canonical.
     NotCanonical,
-    /// The range falls outside the user half (`[0, USER_VIRT_END)`).
+    /// The range falls outside what a user mapping may cover, `[0, USER_MAP_END)`.
     NotUserHalf,
     /// The range overlaps an existing VMA in this address space.
     Overlap,
@@ -125,7 +125,7 @@ impl AddressSpace {
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((boxed, MapError::NotCanonical));
         }
-        if range.end().as_u64() > USER_VIRT_END {
+        if range.end().as_u64() > USER_MAP_END {
             return Err((boxed, MapError::NotUserHalf));
         }
 
@@ -201,7 +201,7 @@ impl AddressSpace {
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((boxed, MapError::NotCanonical));
         }
-        if range.end().as_u64() > USER_VIRT_END {
+        if range.end().as_u64() > USER_MAP_END {
             return Err((boxed, MapError::NotUserHalf));
         }
 
@@ -306,7 +306,7 @@ impl AddressSpace {
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((object, MapError::NotCanonical));
         }
-        if range.end().as_u64() > USER_VIRT_END {
+        if range.end().as_u64() > USER_MAP_END {
             return Err((object, MapError::NotUserHalf));
         }
 
@@ -392,7 +392,7 @@ impl AddressSpace {
         if !range.start().is_canonical() || !last_byte.is_canonical() {
             return Err((object, MapError::NotCanonical));
         }
-        if range.end().as_u64() > USER_VIRT_END {
+        if range.end().as_u64() > USER_MAP_END {
             return Err((object, MapError::NotUserHalf));
         }
         let mut boxed = match KBox::try_new(Vma::new(range, prot, MappingKind::FileBacked)) {
