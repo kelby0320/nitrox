@@ -268,10 +268,7 @@ fn blocking_send_to_ring_with_space_delivers_immediately() {
     // SAFETY: live endpoints/PO; single-threaded test stands in for SCHED.
     unsafe {
         let mut t = empty_xfer();
-        assert_eq!(
-            IpcChannel::send_or_queue(a, &a_msg(7, 1), &mut t, &po),
-            BlockSendOutcome::Sent { woke_edge: true }
-        );
+        assert_eq!(IpcChannel::send_or_queue(a, &a_msg(7, 1), &mut t, &po), BlockSendOutcome::Sent { woke_edge: true });
         let mut d = a_msg(0, 0);
         assert!(pop_no_xfer(b, &mut d));
         assert_eq!(d.payload[0], 7);
