@@ -186,9 +186,9 @@ impl MemoryObject {
     }
 
     /// Copy the object into a fresh contiguous heap buffer (page-rounded [`size`](Self::size)
-    /// bytes): `sys_process_spawn` needs one slice for the ELF loader. One over the buddy's largest
-    /// block, 4 MiB, is refused. Mapping the frames into a temporary kernel VMA would avoid the
-    /// copy; see `docs/rationale/deferred-decisions.md`.
+    /// bytes): `sys_process_spawn` needs one slice for the ELF loader, so the largest is
+    /// [`MAX_IMAGE_BYTES`](crate::mm::elf::MAX_IMAGE_BYTES), 4 MiB less a page. Mapping the frames
+    /// into a temporary kernel VMA would avoid the copy; see `docs/rationale/deferred-decisions.md`.
     pub fn copy_to_kvec(&self) -> Result<KVec<u8>, AllocError> {
         let mut buf = KVec::new();
         buf.try_reserve(self.size)?;

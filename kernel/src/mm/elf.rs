@@ -53,6 +53,10 @@ const PF_W: u32 = 1 << 1;
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
 
+/// The largest image spawn can copy into one allocation: 4 MiB, the buddy's largest block, less a
+/// page, since the slab's descriptor shares the block.
+pub const MAX_IMAGE_BYTES: usize = (PAGE_SIZE << crate::mm::buddy::MAX_ORDER) - PAGE_SIZE;
+
 /// The most an image's `PT_LOAD`s may claim in all: each page is allocated and zeroed at load,
 /// under the address-space lock with interrupts off, which `MAX_SIZE` bounds for a memory object.
 const MAX_LOAD_BYTES: u64 = MemoryObject::MAX_SIZE as u64;

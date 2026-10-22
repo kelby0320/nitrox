@@ -260,6 +260,12 @@ fn a_handle_listed_twice_is_refused_by_a_send_and_a_spawn() {
 }
 
 #[test]
+fn an_image_too_large_for_one_allocation_is_too_large_not_out_of_memory() {
+    assert_eq!(image_fits(MAX_IMAGE_BYTES), Ok(()));
+    assert_eq!(image_fits(MAX_IMAGE_BYTES + 1), Err(KError::TooLarge));
+}
+
+#[test]
 fn channel_send_rejects_bad_message_pointer() {
     assert_eq!(sys_channel_send(0xDEAD, USER_VIRT_END, 0, 0, 1, 0), Err(KError::FaultFromUser),);
 }

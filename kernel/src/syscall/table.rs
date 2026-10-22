@@ -3,7 +3,7 @@
 //! (`docs/spec/syscall-abi.md`) count up from `0`; the **debug** syscalls sit in a high,
 //! non-stable range.
 
-use super::error::{KError, SysResult, encode, from_user_access};
+use super::error::{KError, SysResult, encode, from_elf_load, from_user_access};
 use crate::arch::Paging;
 use crate::arch::Timer;
 use crate::arch::abi::USER_VIRT_END;
@@ -33,7 +33,7 @@ use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE
 use crate::libkern::spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
 use crate::libkern::{ExitKind, ExitStatus, IoResult, KBox, MemFlags, Notification, SendMode, ThreadArgs, TimerFlags};
 use crate::mm::addr_space::{AddressSpace, MapError};
-use crate::mm::elf::load_elf;
+use crate::mm::elf::{MAX_IMAGE_BYTES, load_elf};
 use crate::mm::user_access::{
     UserMutPtr, UserPtr, copy_from_user, copy_slice_from_user, copy_slice_to_user, copy_to_user,
 };
@@ -358,10 +358,16 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     let img_bytes = match img.object.object_type() {
         KObjectType::MemoryObject => {
             // SAFETY: type checked above; `img.object` pins it live.
-            unsafe { &*(img.object.as_ptr() as *const MemoryObject) }.copy_to_kvec().map_err(|_| KError::OutOfMemory)?
+            let mo = unsafe { &*(img.object.as_ptr() as *const MemoryObject) };
+            image_fits(mo.size())?;
+            mo.copy_to_kvec().map_err(|_| KError::OutOfMemory)?
         }
         // Blocks on each fill — sound on the syscall thread, which holds no AS/cache lock.
-        KObjectType::FileObject => FileObject::read_to_kvec(&img.object).map_err(|_| KError::OutOfMemory)?,
+        KObjectType::FileObject => {
+            // SAFETY: type checked above; `img.object` pins it live.
+            image_fits(unsafe { &*(img.object.as_ptr() as *const FileObject) }.size())?;
+            FileObject::read_to_kvec(&img.object).map_err(|_| KError::OutOfMemory)?
+        }
         _ => return Err(KError::InvalidArgument),
     };
     spawn_stats::record(
@@ -372,7 +378,7 @@ fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
 
     let asp = AddressSpace::new().map_err(|_| KError::OutOfMemory)?;
     // A spawner's ELF is untrusted input: the loader bounds-checks every offset.
-    let info = load_elf(&asp, &img_bytes).map_err(|_| KError::InvalidArgument)?;
+    let info = load_elf(&asp, &img_bytes).map_err(from_elf_load)?;
     drop(img);
     let child_pid = crate::sched::alloc_pid();
 
@@ -810,6 +816,12 @@ fn map_mem_map_err(e: MapError) -> KError {
         MapError::Overlap | MapError::NotCanonical | MapError::NotUserHalf => KError::InvalidArgument,
         MapError::OutOfMemory => KError::OutOfMemory,
     }
+}
+
+/// Spawn copies an image into one allocation, so one larger than [`MAX_IMAGE_BYTES`] is refused
+/// `TooLarge`: no retry would help, where `OutOfMemory` says one might.
+fn image_fits(len: usize) -> Result<(), KError> {
+    if len > MAX_IMAGE_BYTES { Err(KError::TooLarge) } else { Ok(()) }
 }
 
 fn round_up_page(n: u64) -> u64 {

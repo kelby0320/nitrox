@@ -380,9 +380,10 @@ program text (the CoW/`MAP_PRIVATE` file mapping in the process-memory-model bun
 most of what read-ahead would buy here and is the thing to do first. **New trigger for
 read-ahead: after demand-paged program text lands**, when what remains is genuinely fill cost.
 **New trigger for that:** it is now the largest single line in the boot profile, so it wants
-scheduling rather than a trigger. **The copy also caps an image at 4 MiB** (2026-10-22): it is one
-kernel allocation, the buddy's largest block is 4 MiB, and a larger image is refused
-`OutOfMemory`, where it once stopped the kernel. The shipped binaries are 176–539 KB.
+scheduling rather than a trigger. **The copy also caps an image at 4 MiB less a page** (2026-10-22,
+`MAX_IMAGE_BYTES`): it is one kernel allocation, the buddy's largest block is 4 MiB and the slab's
+descriptor shares it, and a larger image is refused `TooLarge`, where it once stopped the kernel.
+The shipped binaries are 176–539 KB.
 
 > **Implemented for Model A** (2026-10-09, Phase 6 Part H.4), on Part H's measurement rather than
 > boot's: a copy of a 256 MiB file on the laptop read it a page a command, 65,536 of them. A fault
